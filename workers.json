@@ -1,0 +1,6 @@
+{
+  "workers": [ "http://10.77.0.12:8000" ],
+  "judge_url": "",
+  "judge_model": "stub",
+  "timeout_s": 60
+}

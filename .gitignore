@@ -1,0 +1,53 @@
+# ============================================================
+# Council — .gitignore
+# ============================================================
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environment
+venv/
+.venv/
+env/
+.env/
+
+# Environment / secrets
+.env
+.env.*
+*.secret
+api_keys.*
+
+# Vault — all private analysis data, logs, model outputs
+# Ideas are exported to the tracked ideas/ folder instead
+vault/
+
+# Temp / OS
+*.tmp
+*.bak
+*.swp
+*.swo
+~$*
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Private / local folders
+_norton_/
+.claude/
+.idea/
+.vscode/
+
+# Large model artefacts
+*.gguf
+*.ggml
+*.bin
+*.safetensors

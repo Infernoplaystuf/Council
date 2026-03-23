@@ -1,0 +1,8878 @@
+# ============================================================
+# council_gui_engine.py  —  v2
+# ============================================================
+# Conda env:
+#   conda create -n council python=3.11 -y
+#   conda activate council
+# Optional (SSH): pip install paramiko
+# Optional (Phase 3 STT mic): pip install sounddevice soundfile
+# Optional (Phase 3 transcription): pip install faster-whisper
+# ============================================================
+
+from __future__ import annotations
+
+import json as _json
+import os
+import queue
+import re as _re
+import subprocess
+import sys
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import tkinter as tk
+from tkinter import ttk, messagebox, simpledialog
+
+import council_engine as ce
+import apothecary_engine as ae
+
+# ── Agent modules (graceful optional imports) ─────────────────
+try:
+    import techpriest_agent as tpa
+    _TECHPRIEST_AGENT_OK = True
+except (ImportError, OSError):
+    _TECHPRIEST_AGENT_OK = False
+
+try:
+    import intern_agent as ia
+    _INTERN_AGENT_OK = True
+except (ImportError, OSError):
+    _INTERN_AGENT_OK = False
+
+try:
+    import vault_agent as va
+    _VAULT_AGENT_OK = True
+except (ImportError, OSError):
+    va = None
+    _VAULT_AGENT_OK = False
+
+try:
+    import video_processor as vp
+    _VIDEO_OK = True
+except (ImportError, OSError):
+    vp = None
+    _VIDEO_OK = False
+
+try:
+    import sage_agent as sa
+    _SAGE_OK = True
+except (ImportError, OSError):
+    sa = None
+    _SAGE_OK = False
+
+try:
+    import vault_scraper as vs
+    _SCRAPER_OK = True
+except (ImportError, OSError):
+    vs = None
+    _SCRAPER_OK = False
+
+try:
+    import dream3d_primer as d3p
+    _DREAM3D_OK = True
+except (ImportError, OSError):
+    _DREAM3D_OK = False
+
+try:
+    import dream3d_council_patch as d3d_patch
+    _D3D_PATCH_OK = True
+except (ImportError, OSError):
+    _D3D_PATCH_OK = False
+
+try:
+    import vault_rag as vr
+    _RAG_OK = True
+except (ImportError, OSError):
+    _RAG_OK = False
+
+try:
+    import music_blocks as mb
+    import music_renderer as mr
+    import composer_personality as cp
+    _COMPOSER_OK = True
+except (ImportError, OSError):
+    _COMPOSER_OK = False
+
+try:
+    import graph_data as gd
+    import graph_engine as ge
+    import graph_personality as gp
+    _GRAPHER_OK = True
+except (ImportError, OSError):
+    _GRAPHER_OK = False
+
+try:
+    import tkinterweb
+    _TKWEB_OK = True
+except (ImportError, OSError):
+    _TKWEB_OK = False
+
+try:
+    from tab_ideas import IdeaTabMixin
+    _IDEAS_TAB_OK = True
+except (ImportError, OSError):
+    _IDEAS_TAB_OK = False
+    class IdeaTabMixin:          # noqa: F811  — stub so CouncilConsole base list works
+        def _build_ideas_tab(self): pass
+
+
+# ============================================================
+# Agent event types
+# ============================================================
+
+@dataclass
+class AgentEvent:
+    who: str
+    kind: str   # "thought" | "action" | "observation" | "final" | "token" | "phase"
+    text: str
+
+
+@dataclass
+class AgentContext:
+    user_text: str
+    shared: Dict[str, Any] = field(default_factory=dict)
+
+
+ToolFn = Callable[[Dict[str, Any]], Tuple[bool, str, Dict[str, Any]]]
+_TOOL_JSON_RE = _re.compile(r"\{.*\}", _re.DOTALL)
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def _extract_tool_calls(text: str) -> List[Dict[str, Any]]:
+    calls: List[Dict[str, Any]] = []
+    for m in _TOOL_JSON_RE.finditer(text):
+        blob = m.group(0).strip()
+        try:
+            obj = _json.loads(blob)
+        except Exception:
+            continue
+        if isinstance(obj, dict) and "tool" in obj:
+            calls.append({"tool": obj.get("tool"), "args": obj.get("args", {})})
+        elif isinstance(obj, dict) and "tool_calls" in obj and isinstance(obj["tool_calls"], list):
+            for tc in obj["tool_calls"]:
+                if isinstance(tc, dict) and "tool" in tc:
+                    calls.append({"tool": tc.get("tool"), "args": tc.get("args", {})})
+    return calls
+
+
+def _extract_code_block(text: str) -> str:
+    m = _re.search(r"```(?:python)?\s*(.*?)```", text, flags=_re.DOTALL | _re.IGNORECASE)
+    return m.group(1).strip() if m else ""
+
+
+def _safe_script_basename(name: str) -> str:
+    name = (name or "").strip()
+    name = _re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._-")
+    if not name:
+        name = "script"
+    if len(name) > 60:
+        name = name[:60]
+    if name.lower().endswith(".py"):
+        name = name[:-3]
+    return name
+
+
+def _parse_script_json(text: str) -> Tuple[str, str]:
+    m = _re.search(r"\{.*\}", text, flags=_re.DOTALL)
+    if not m:
+        return "", ""
+    try:
+        obj = _json.loads(m.group(0))
+    except Exception:
+        return "", ""
+    fn = str(obj.get("filename", "")).strip()
+    code = str(obj.get("code", "")).strip()
+    return fn, code
+
+
+# ── Route → (panel, synth) mapping ──────────────────────────────────────────
+# Maps the judge's route decision to the most appropriate council panel.
+# Coding tasks frontload TechPriest + Intern + Skeptic (production hardening).
+# Writing/explanation tasks frontload Writer + Intern + Artist.
+# Design tasks frontload Artist. Fallback: broad general panel.
+_PANEL_FOR_ROUTE: Dict[str, tuple] = {
+    "chat":       (["writer",     "peasant"],             "writer"),  # pure conversation
+    "writer":     (["writer",     "intern",  "peasant"],  "writer"),  # research/docs
+    "ide":        (["techpriest", "intern",  "skeptic"],  "writer"),  # code tasks
+    "artist":     (["artist",     "writer",  "intern" ],  "writer"),  # visual/UI
+    "intern":     (["intern",     "writer",  "peasant"],  "writer"),  # planning
+    "techpriest": (["techpriest", "intern",  "skeptic"],  "writer"),  # architecture
+    "peasant":    (["writer",     "peasant"           ],  "writer"),  # simple explain
+    "sage":       (["sage",       "writer",  "peasant"],  "writer"),  # domain knowledge
+    "strategist": (["strategist", "techpriest", "skeptic"], "writer"), # planning/strategy
+    "musician":   (["musician",   "writer"],               "writer"),  # music direction
+    "content":    (["content",    "writer",  "strategist"], "writer"),  # content creation
+    "director":   (["director",   "writer",  "content"],   "writer"),  # style analysis + scripting
+    "_default":   (["writer",     "intern",  "peasant"],   "writer"),  # fallback
+}
+
+
+# ── Code-block filter for conversational responses ───────────────────────────
+import re as _re
+
+_CODE_REQUEST_SIGNALS = {
+    "write", "create", "make", "build", "generate", "implement",
+    "modify", "edit", "update", "fix", "refactor", "patch", "change",
+    "script", "function", "class", "program", "code", ".py", ".sh",
+    ".bat", "def ", "import ", "```",
+}
+
+def _user_wants_code(query: str) -> bool:
+    """Return True only if the user explicitly asked for code."""
+    q = query.lower()
+    # Must have at least one action word AND one code-context word together
+    action_words  = {"write", "create", "make", "build", "generate", "implement",
+                     "modify", "edit", "update", "fix", "refactor", "patch"}
+    code_words    = {"script", "function", "class", "program", "code", "file",
+                     ".py", ".sh", ".bat", "def ", "import "}
+    has_action = any(w in q for w in action_words)
+    has_code   = any(w in q for w in code_words)
+    # Also treat explicit technical markers as code requests
+    explicit = any(m in query for m in ("```", "def ", "import ", ".py", ".sh", ".bat"))
+    return (has_action and has_code) or explicit
+
+
+def _strip_code_blocks(text: str) -> str:
+    """Remove all fenced code blocks from a response."""
+    # Remove triple-backtick blocks (with or without language tag)
+    cleaned = _re.sub(r"```[\w]*\n?[\s\S]*?```", "", text, flags=_re.MULTILINE)
+    # Remove lines that are just indented code (4-space indent used as code)
+    # Only remove if 3+ consecutive indented lines (a real code block, not a quote)
+    lines = cleaned.split("\n")
+    out, run = [], 0
+    for line in lines:
+        if line.startswith("    ") and line.strip():
+            run += 1
+        else:
+            if run >= 3:
+                # drop the accumulated indented block
+                for _ in range(run):
+                    if out:
+                        out.pop()
+            run = 0
+            out.append(line)
+    if run < 3:
+        pass  # trailing indented block was short, already in out via append
+    cleaned = "\n".join(out)
+    # Collapse 3+ blank lines to 2
+    cleaned = _re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
+
+_CODE_ROUTES = {"ide", "techpriest", "intern"}
+
+def _filter_final(text: str, route: str, user_query: str) -> str:
+    """
+    Strip code blocks from the council's final answer if:
+    - The route is not a code route, AND
+    - The user did not explicitly ask for code.
+    Applied after Writer synthesis, before the result reaches the UI.
+    """
+    if route in _CODE_ROUTES:
+        return text                          # always allow code on code routes
+    if _user_wants_code(user_query):
+        return text                          # user asked for code explicitly
+    stripped = _strip_code_blocks(text)
+    if stripped != text:
+        # Append a soft note so the user knows they can ask for code
+        stripped = stripped.rstrip() + (
+            "\n\n*(Ask me to write or modify a script if you need code.)*"
+            if len(text) - len(stripped) > 80 else ""
+        )
+    return stripped
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _detect_latex_request(text: str) -> bool:
+    """Return True if the user explicitly requested LaTeX output."""
+    t = text.lower()
+    _latex_phrases = [
+        "in latex", "as latex", "latex document", "latex format",
+        "write latex", "write in latex", "using latex", "latex output",
+        "as a latex", "latex file", "tex file", "write a latex",
+        "latex report", "latex essay", "latex paper",
+    ]
+    return any(ph in t for ph in _latex_phrases)
+
+
+def _wrap_latex(title: str, body: str) -> str:
+    """Wrap plain text content in a minimal LaTeX document."""
+    import re as _re
+    # Escape common LaTeX special chars in the body
+    _escapes = {
+        "&": "\&", "%": "\%", "$": "\$", "#": "\#",
+        "_": "\_", "{": "\{", "}": "\}", "~": "\textasciitilde{}",
+        "^": "\textasciicircum{}",
+    }
+    safe = body
+    for ch, esc in _escapes.items():
+        safe = safe.replace(ch, esc)
+    # Convert markdown-ish bold **text** → \textbf{text}
+    safe = _re.sub(r"\*\*(.+?)\*\*", r"\\textbf{\1}", safe)
+    # Preserve line breaks as paragraph breaks
+    safe = safe.replace("\n\n", "\n\n\\medskip\n\n")
+
+    return (
+        "\\documentclass[12pt,a4paper]{article}\n"
+        "\\usepackage[utf8]{inputenc}\n"
+        "\\usepackage[T1]{fontenc}\n"
+        "\\usepackage{lmodern}\n"
+        "\\usepackage{microtype}\n"
+        "\\usepackage[margin=2.5cm]{geometry}\n"
+        "\\usepackage{parskip}\n"
+        "\\title{" + title + "}\n"
+        "\\author{Council AI}\n"
+        "\\date{\\today}\n"
+        "\\begin{document}\n"
+        "\\maketitle\n\n"
+        + safe + "\n\n"
+        "\\end{document}\n"
+    )
+
+
+def _detect_user_question(text: str) -> str:
+    """
+    Check if a personality response contains a direct question aimed at the user
+    (not rhetorical, not Peasant-style cross-examination).
+    Returns the question sentence if found, empty string otherwise.
+    """
+    import re as _re
+    # Look for lines that end with ? and contain user-directed phrasing
+    _user_markers = [
+        "could you", "can you", "would you", "do you", "what is your",
+        "what are your", "please clarify", "please provide", "i need to know",
+        "could you clarify", "could you provide", "could you tell",
+        "what do you mean", "what exactly", "which do you prefer",
+        "which would you", "how do you want", "what would you like",
+        "do you have", "do you want", "are you looking for",
+    ]
+    sentences = _re.split(r"(?<=[.!?])\s+", text)
+    for s in sentences:
+        s_low = s.lower().strip()
+        if s.strip().endswith("?") and any(m in s_low for m in _user_markers):
+            return s.strip()
+    return ""
+
+
+def _panel_for_route(route: str) -> tuple:
+    """Return (panel_list, synth_role) for the given judge route."""
+    return _PANEL_FOR_ROUTE.get(route, _PANEL_FOR_ROUTE["_default"])
+
+
+def peasant_cross_exam(
+    peasant_model,
+    *,
+    candidate_role: str,
+    candidate_text: str,
+    user_text: str,
+    prior_qa: Optional[List[Dict[str, str]]] = None,
+    query_mode: str = "",
+) -> str:
+    """
+    Cross-examine a candidate response as the Peasant.
+
+    Passes the code/answer as extra_context so the full Peasant system
+    prompt applies — meaning questions are specific to THIS code, not generic.
+
+    prior_qa is a list of {"q": "...", "a": "..."} dicts accumulated across
+    all earlier Peasant turns in this deliberation.  When present they are
+    injected as a hard DO-NOT-REPEAT block so the Peasant cannot recycle
+    questions that have already been asked and answered.
+    """
+    has_code = any(marker in candidate_text for marker in
+                   ["def ", "class ", "import ", "```", "for ", "while ", "if "])
+    content_label = "CODE" if has_code else "RESPONSE"
+
+    parts = [
+        f"ORIGINAL REQUEST:\n{user_text}\n",
+        f"{candidate_role.upper()} {content_label} TO REVIEW:\n{candidate_text}\n",
+    ]
+
+    if prior_qa:
+        lines = [
+            "━━━ QUESTIONS YOU HAVE ALREADY ASKED THIS SESSION ━━━",
+            "Do NOT ask any of these again, even in paraphrased form.",
+            "Do NOT ask questions whose answers are already contained below.",
+            "",
+        ]
+        for i, item in enumerate(prior_qa, 1):
+            lines.append(f"[{i}] Q: {item['q']}")
+            if item.get("a"):
+                lines.append(f"    A: {item['a']}")
+            lines.append("")
+        lines.append("━━━ END OF PRIOR Q&A ━━━")
+        parts.append("\n".join(lines))
+
+    _mode_instruction = ""
+    if query_mode == "conversational":
+        _mode_instruction = (
+            "⚠ CONVERSATIONAL MODE: The user asked a conversational question, not for code.\n"
+            "Do NOT ask about error handling, imports, types, or code structure.\n"
+            "Ask whether the explanation is accurate, clear, complete, and actually answers "
+            "what the user asked.\n\n"
+        )
+    elif query_mode == "technical":
+        _mode_instruction = (
+            "⚠ TECHNICAL MODE: Focus on code correctness, edge cases, and robustness.\n\n"
+        )
+    if _mode_instruction:
+        parts.append(_mode_instruction)
+
+    parts.append(
+        "Your task: identify NEW specific problems, edge cases, or dangerous assumptions "
+        "in the above that have NOT already been raised. Ask questions tied to specific "
+        "lines, variable names, or behaviours you can see in this exact code — "
+        "not generic questions, and not anything already covered above."
+    )
+
+    extra_context = "\n\n".join(parts)
+
+    prompt = (
+        f"Review the {candidate_role} {content_label.lower()} above and ask your NEW questions now. "
+        "Every question must reference something specific you can see in that code, "
+        "and must not duplicate any question from the prior Q&A list above."
+    )
+
+    return peasant_model.respond(prompt, extra_context=extra_context)
+
+
+def _looks_like_two_questions(text: str) -> bool:
+    """
+    Returns True if the Peasant response looks like it followed the format.
+    Accepts either the old Q1/Q2 format or the new format with DANGEROUS ASSUMPTION.
+    """
+    t = text.lower()
+    has_questions = ("q1:" in t) and ("q2:" in t)
+    # Also accept if model gave specific feedback even without strict Q1/Q2 labels
+    has_question_marks = t.count("?") >= 2
+    return has_questions or (has_question_marks and len(text) > 80)
+
+
+def _peasant_quality_score(
+    text: str,
+    candidate_text: str,
+    prior_qa: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
+    """
+    Score Peasant output on four axes; return dict with 0-4 total.
+
+    Axes:
+      questions  -- at least 2 question marks present
+      length     -- at least 80 chars
+      specific   -- references at least 3 words from the candidate text
+      non_repeat -- no prior question shares >60% 4-gram overlap
+    """
+    import re as _re
+    scores: Dict[str, bool] = {}
+
+    scores["questions"] = text.count("?") >= 2
+    scores["length"]    = len(text.strip()) >= 80
+
+    cand_words = set(w.lower() for w in _re.findall(r"\w{4,}", candidate_text))
+    resp_words = set(w.lower() for w in _re.findall(r"\w{4,}", text))
+    scores["specific"] = len(cand_words & resp_words) >= 3
+
+    if prior_qa:
+        def _ngrams(s: str, n: int = 4) -> set:
+            ws = s.lower().split()
+            return set(tuple(ws[i:i+n]) for i in range(len(ws) - n + 1))
+        resp_ng = _ngrams(text)
+        overlap_ok = True
+        for qa in prior_qa:
+            prev_ng = _ngrams(qa.get("q", ""))
+            if prev_ng and resp_ng:
+                overlap = len(resp_ng & prev_ng) / max(len(prev_ng), 1)
+                if overlap > 0.6:
+                    overlap_ok = False
+                    break
+        scores["non_repeat"] = overlap_ok
+    else:
+        scores["non_repeat"] = True
+
+    total = sum(scores.values())
+    return {"total": total, "max": 4, "axes": scores}
+
+
+# ============================================================
+# ModelAgent  (with streaming token callback)
+# ============================================================
+
+class ModelAgent:
+    def __init__(
+        self,
+        display_name: str,
+        personality_model: Any,
+        *,
+        tools: Dict[str, ToolFn] | None = None,
+        enable_tools: bool = False,
+        max_tool_steps: int = 3,
+        token_callback: Optional[Callable[[str, str], None]] = None,
+    ):
+        self.display_name = display_name
+        self.model = personality_model
+        self.tools = tools or {}
+        self.enable_tools = enable_tools
+        self.max_tool_steps = max_tool_steps
+        # token_callback(who, token) — called for each streamed token
+        self.token_callback = token_callback
+
+    def _compose_prompt(self, ctx: AgentContext) -> str:
+        parts: List[str] = []
+
+        # Inject query mode so every personality knows what type of response to give.
+        # This overrides the code-centric defaults baked into each system prompt.
+        _mode = ctx.shared.get("query_mode", "")
+        if _mode == "conversational":
+            parts.append(
+                "QUERY MODE: CONVERSATIONAL\n"
+                "The user is having a conversation — NOT asking for code.\n"
+                "Respond entirely in natural prose. Do NOT write code, scripts, or "
+                "technical implementations unless the user explicitly asked for them.\n"
+                "Focus on explaining, discussing, or answering the question directly."
+            )
+        elif _mode == "technical":
+            parts.append(
+                "QUERY MODE: TECHNICAL\n"
+                "The user wants working code or a technical solution.\n"
+                "Prioritise correctness, completeness, and runnability."
+            )
+
+        cands = ctx.shared.get("candidates", {})
+        rank = ctx.shared.get("judge_ranking", "")
+        critique = ctx.shared.get("judge_critique", "")
+        tool_payloads = ctx.shared.get("tool_payloads", {})
+        discussion = ctx.shared.get("discussion_transcript", "")
+
+        if cands:
+            parts.append("CANDIDATE ANSWERS + PEASANT QUESTIONS + REBUTTALS:")
+            for role, data in cands.items():
+                parts.append(f"--- {role} ---")
+                parts.append("ANSWER:")
+                parts.append(data.get("answer", ""))
+                if pq := data.get("peasant_q", ""):
+                    parts.append(f"PEASANT QUESTIONS:\n{pq}")
+                if rb := data.get("rebuttal", ""):
+                    parts.append(f"REBUTTAL:\n{rb}")
+                if disc := data.get("discussion", ""):
+                    parts.append(f"DISCUSSION LOG:\n{disc}")
+                parts.append("")
+
+        if discussion:
+            parts.append(f"FULL DISCUSSION (condensed):\n{discussion}\n")
+        if rank:
+            # Inject explicit winner label — models respond far better to a clear
+            # directive than to having to parse the winner out of embedded JSON.
+            try:
+                import json as _cjson
+                _robj = _cjson.loads(rank) if isinstance(rank, str) else rank
+                _winner = _robj.get("winner", "")
+                if _winner and _winner != "unknown":
+                    parts.append(f"WINNING CANDIDATE: {_winner} — synthesise primarily from this answer.")
+            except Exception:
+                pass
+            parts.append(f"JUDGE RANKING (JSON):\n{rank}\n")
+        if critique:
+            parts.append(f"JUDGE CRITIQUE:\n{critique}\n")
+        required_changes = ctx.shared.get("required_changes", [])
+        if required_changes:
+            parts.append("REQUIRED CHANGES -- YOU MUST ADDRESS EVERY ITEM BELOW:")
+            for _rc in required_changes:
+                parts.append("  - " + _rc)
+            parts.append("")
+        adv_challenge = ctx.shared.get("adversarial_challenge", "")
+        if adv_challenge:
+            parts.append(
+                "ADVERSARIAL CHALLENGE (you MUST explicitly rebut this in your answer):\n"
+                + adv_challenge + "\n"
+            )
+        if tool_payloads:
+            parts.append("PRIOR TOOL OUTPUTS:")
+            for k, v in tool_payloads.items():
+                parts.append(f"- {k}: {str(v)[:900]}")
+            parts.append("")
+
+        # Repeat mode reminder as the LAST thing before user request.
+        # Models anchor to recency — the instruction at the bottom wins over code seen above.
+        _mode_bottom = ctx.shared.get("query_mode", "")
+        if _mode_bottom == "conversational":
+            parts.append(
+                "⚠ REMINDER: This is a CONVERSATIONAL query. "
+                "Do NOT write code. Respond in prose only. "
+                "Ignore any code in the candidate answers above — it should not have been there."
+            )
+        elif _mode_bottom == "technical":
+            parts.append(
+                "⚠ REMINDER: This is a TECHNICAL query. "
+                "Prioritise working, complete code."
+            )
+
+        parts.append(f"USER REQUEST:\n{ctx.user_text}")
+
+        if self.enable_tools and self.tools:
+            tool_list = ", ".join(sorted(self.tools.keys()))
+            parts += [
+                "",
+                f"TOOLS AVAILABLE: {tool_list}",
+                "To use a tool, output ONLY JSON: {\"tool\":\"name\",\"args\":{...}}",
+                "Otherwise write a normal answer.",
+            ]
+        return "\n".join(parts)
+
+    def _make_token_cb(self) -> Optional[Callable[[str], None]]:
+        if self.token_callback is None:
+            return None
+        who = self.display_name
+        cb = self.token_callback
+        def _cb(token: str):
+            cb(who, token)
+        return _cb
+
+    def act(self, ctx: AgentContext) -> List[AgentEvent]:
+        events: List[AgentEvent] = []
+        prompt = self._compose_prompt(ctx)
+
+        if not (self.enable_tools and self.tools):
+            events.append(AgentEvent(self.display_name, "thought", "Generating response…"))
+            text = self.model.respond(prompt, token_callback=self._make_token_cb())
+            return [AgentEvent(self.display_name, "final", text)]
+
+        events.append(AgentEvent(self.display_name, "thought", "Calling model backend…"))
+        text = self.model.respond(prompt, token_callback=self._make_token_cb())
+
+        for _ in range(self.max_tool_steps):
+            calls = _extract_tool_calls(text)
+            if not calls:
+                events.append(AgentEvent(self.display_name, "final", text))
+                return events
+
+            events.append(AgentEvent(self.display_name, "action", f"Tool calls requested ({len(calls)})."))
+            obs_lines: List[str] = []
+            payloads: Dict[str, Any] = {}
+
+            for i, call in enumerate(calls, start=1):
+                tool_name = str(call.get("tool", "")).strip()
+                args = call.get("args", {})
+                if tool_name not in self.tools:
+                    obs_lines.append(f"[{i}] ERROR: unknown tool '{tool_name}'")
+                    continue
+                if not isinstance(args, dict):
+                    obs_lines.append(f"[{i}] ERROR: args must be a dict")
+                    continue
+                ok, msg, payload = self.tools[tool_name](args)
+                obs_lines.append(f"[{i}] {tool_name}: {'OK' if ok else 'FAIL'}\n{msg}")
+                if payload:
+                    payloads[f"{tool_name}_{i}"] = payload
+
+            ctx.shared.setdefault("tool_payloads", {}).update(payloads)
+            obs_text = "\n\n".join(obs_lines).strip() or "(no tool output)"
+            events.append(AgentEvent(self.display_name, "observation", obs_text))
+
+            followup = (
+                f"TOOL RESULTS:\n{obs_text}\n\n"
+                "Now produce the best possible answer (no tool JSON unless more tools needed)."
+            )
+            events.append(AgentEvent(self.display_name, "thought", "Calling model (post-tool)…"))
+            text = self.model.respond(followup, token_callback=self._make_token_cb())
+
+        events.append(AgentEvent(self.display_name, "final", text))
+        return events
+
+
+# ============================================================
+# DeliberationOrchestrator  (yields events live via callback)
+# ============================================================
+
+class DeliberationOrchestrator:
+    """
+    Runs the full deliberation loop and emits events live through
+    an `event_callback(AgentEvent)` as they occur.
+    """
+
+    def __init__(
+        self,
+        *,
+        judge_model: Any,
+        agents: Dict[str, ModelAgent],
+        max_rounds: int = 2,
+        debate_turns: int = 2,
+        event_callback: Optional[Callable[[AgentEvent], None]] = None,
+        clarification_cb: Optional[Callable[[str, str], None]] = None,
+        pause_event: Optional[threading.Event] = None,
+        answer_getter: Optional[Callable[[], str]] = None,
+    ):
+        self.judge = judge_model
+        self.agents = agents
+        self.max_rounds = max_rounds
+        self.debate_turns = max(1, int(debate_turns))
+        self.event_callback = event_callback or (lambda e: None)
+        # Clarification pause support
+        self._clarification_cb = clarification_cb   # fn(who, question) → shows UI
+        self._pause_event      = pause_event         # threading.Event to wait on
+        self._answer_getter    = answer_getter        # fn() → str answer
+
+    def _emit(self, event: AgentEvent) -> None:
+        self.event_callback(event)
+
+    def _phase(self, label: str) -> None:
+        self._emit(AgentEvent("Orchestrator", "phase", f"▶ {label}"))
+
+    def run(self, user_text: str, *, panel: List[str], synth: str = "writer",
+            extra_ctx: Optional[Dict[str, Any]] = None) -> List[AgentEvent]:
+        ctx = AgentContext(user_text=user_text)
+        if extra_ctx:
+            ctx.shared.update(extra_ctx)
+        all_events: List[AgentEvent] = []
+
+        # Guard: synth must exist in agents — fall back to writer or first panel member
+        if synth not in self.agents:
+            synth = "writer" if "writer" in self.agents else (panel[0] if panel else synth)
+
+        # Accumulates every Peasant question across all rounds and cross-fire
+        # turns so the model is never shown a blank slate and cannot re-ask
+        # something already covered.  Each entry: {"q": <text>, "a": ""}
+        _peasant_qa_log: List[Dict[str, str]] = []
+
+        def _log_peasant_questions(qtxt: str) -> None:
+            import re as _re
+            parts = _re.split(r"(?:^|\n)(?:Q\d+[:.)]|\d+[.)]\ +|\[\d+\]\ *)", qtxt)
+            questions = [p.strip() for p in parts if p.strip() and "?" in p]
+            if not questions:
+                questions = [p.strip() for p in qtxt.split("\n\n") if "?" in p]
+            if not questions:
+                questions = [qtxt.strip()]
+            for q in questions:
+                _peasant_qa_log.append({"q": q, "a": ""})
+
+        def emit(ev: AgentEvent):
+            all_events.append(ev)
+            self._emit(ev)
+
+        for r in range(self.max_rounds):
+            # ── Check pause at start of each round ──────────────────
+            # If a clarification is pending, wait here before any
+            # new model calls fire. This ensures the whole round
+            # waits, not just the individual candidate step.
+            if self._pause_event and not self._pause_event.is_set():
+                self._pause_event.wait(timeout=300)
+
+            self._phase(f"Round {r+1}/{self.max_rounds} — Candidate generation")
+
+            candidates: Dict[str, Dict[str, str]] = {}
+            discussion_lines: List[str] = []
+
+            # 1) Candidates + Peasant cross-exam
+            for key in panel:
+                self._phase(f"{key.capitalize()} — drafting answer")
+                evs = self.agents[key].act(ctx)
+                for ev in evs:
+                    emit(ev)
+                answer = next((e.text for e in reversed(evs) if e.kind == "final"), "")
+                # Strip code from candidate answers on conversational routes
+                # so they don't contaminate what other panel members read.
+                _qmode = ctx.shared.get("query_mode", "")
+                _stored_answer = answer
+                if _qmode == "conversational":
+                    _stored_answer = _strip_code_blocks(answer)
+                # ── #8 Self-reported confidence ─────────────────────────────
+                # Ask each candidate to rate their own confidence 1-10.
+                # A single cheap token call — models are usually well-calibrated
+                # at distinguishing "I'm guessing" from "I'm certain".
+                _self_conf = 5  # default if call fails
+                try:
+                    _conf_raw = self.agents[key].model.respond(
+                        "Rate your confidence in the answer you just gave, 1–10. "
+                        "Reply with ONLY the single digit — no words, no punctuation.\n\n"
+                        f"YOUR ANSWER (first 400 chars):\n{answer[:400]}",
+                        max_tokens=5,
+                    ).strip()
+                    _self_conf = int(_conf_raw[0]) if _conf_raw and _conf_raw[0].isdigit() else 5
+                    _self_conf = max(1, min(10, _self_conf))
+                except Exception:
+                    pass
+                candidates[key] = {
+                    "answer": _stored_answer,
+                    "peasant_q": "", "rebuttal": "", "discussion": "",
+                    "self_confidence": _self_conf,
+                }
+                if _self_conf <= 4:
+                    emit(AgentEvent(key.capitalize(), "observation",
+                                   f"⚠ Self-confidence: {_self_conf}/10 — answer may be weak"))
+                else:
+                    emit(AgentEvent(key.capitalize(), "observation",
+                                   f"Confidence: {_self_conf}/10"))
+                discussion_lines.append(f"{key.upper()} CANDIDATE [conf:{_self_conf}/10]:\n{_stored_answer}\n")
+
+                # ── Clarification pause ──────────────────────────────
+                # If a non-Peasant personality asked the user a direct question,
+                # pause deliberation and wait for the user to answer.
+                if key != "peasant" and self._clarification_cb and self._pause_event:
+                    _q = _detect_user_question(_stored_answer)
+                    if _q:
+                        self._pause_event.clear()  # pause
+                        self._clarification_cb(key.capitalize(), _q)
+                        # Block the worker thread until user answers (5 min max)
+                        self._pause_event.wait(timeout=300)
+                        _user_answer = self._answer_getter() if self._answer_getter else ""
+                        if _user_answer and not _user_answer.startswith("[User skipped"):
+                            _clarif_note = (f"\n\nUSER CLARIFICATION for {key}:\n"
+                                           f"  Q: {_q}\n  A: {_user_answer}\n")
+                            user_text = user_text + _clarif_note
+                            ctx.user_text = user_text
+                            discussion_lines.append(_clarif_note)
+
+                if key != "peasant" and "peasant" in self.agents:
+                    self._phase(f"Peasant — cross-examining {key}")
+                    _pexam_mode = ctx.shared.get("query_mode", "")
+                    qtxt = peasant_cross_exam(
+                        self.agents["peasant"].model,
+                        candidate_role=key, candidate_text=answer, user_text=user_text,
+                        prior_qa=_peasant_qa_log if _peasant_qa_log else None,
+                        query_mode=_pexam_mode,
+                    )
+                    _pq_score = _peasant_quality_score(qtxt, answer, _peasant_qa_log)
+                    if not _looks_like_two_questions(qtxt):
+                        # Reformat existing answer rather than full regeneration — cheaper
+                        _reformat_prompt = (
+                            "Your response below is good but needs exactly two questions "
+                            "labelled Q1: and Q2:. Reformat it now — keep the same ideas, "
+                            "just add Q1: and Q2: labels and make sure each ends with '?'.\n\n"
+                            f"YOUR RESPONSE:\n{qtxt}"
+                        )
+                        qtxt = self.agents["peasant"].model.respond(
+                            _reformat_prompt, max_tokens=300)
+                        _pq_score = _peasant_quality_score(qtxt, answer, _peasant_qa_log)
+                        if not _looks_like_two_questions(qtxt):
+                            _axes = ", ".join(
+                                k + ("=✓" if v else "=✗")
+                                for k, v in _pq_score["axes"].items()
+                            )
+                            emit(AgentEvent("Peasant", "observation",
+                                "⚠ Quality low after reformat ("
+                                + str(_pq_score["total"]) + "/4: " + _axes + ")"))
+                    _log_peasant_questions(qtxt)
+                    candidates[key]["peasant_q"] = qtxt
+                    _stag = " [q:" + str(_pq_score["total"]) + "/4]"
+                    ev = AgentEvent("Peasant", "observation",
+                                   f"Questions about {key}" + _stag + ":\n" + qtxt)
+                    emit(ev)
+                    discussion_lines.append(f"PEASANT → {key}:\n{qtxt}\n")
+
+                ctx.shared["candidates"] = candidates
+                ctx.shared["discussion_transcript"] = "\n".join(discussion_lines[-40:])
+
+            # 2) Rebuttals
+            if self._pause_event and not self._pause_event.is_set():
+                self._pause_event.wait(timeout=300)
+            self._phase("Rebuttal round")
+            for key in panel:
+                if key == "peasant" or key not in candidates:
+                    continue
+                other_roles = [r for r in candidates if r != key]
+                debate_lines = [
+                    "DEBATE CONTEXT:",
+                    f"User request:\n{user_text}\n",
+                    f"Your original answer ({key}):\n{candidates[key].get('answer','')}\n",
+                ]
+                if my_pq := candidates[key].get("peasant_q", ""):
+                    debate_lines.append(f"Peasant questions about YOUR answer:\n{my_pq}\n")
+                for rr in other_roles:
+                    debate_lines.append(f"Other candidate ({rr}):\n{candidates[rr].get('answer','')}\n")
+                    if pq := candidates[rr].get("peasant_q", ""):
+                        debate_lines.append(f"Peasant questions about {rr}:\n{pq}\n")
+                _rb_mode = ctx.shared.get("query_mode", "")
+                _rb_mode_line = (
+                    "⚠ MODE: CONVERSATIONAL — rebuttal must be in prose only, no code.\n"
+                    if _rb_mode == "conversational" else
+                    "⚠ MODE: TECHNICAL — focus on code correctness and completeness.\n"
+                    if _rb_mode == "technical" else ""
+                )
+                debate_lines += [
+                    _rb_mode_line,
+                    "INSTRUCTIONS:",
+                    "- Write a rebuttal/improvement note.",
+                    "- Explicitly state disagreements.",
+                    "- Address Peasant questions.",
+                    "- Propose concrete fixes.",
+                    "- Keep under 12 bullet points.",
+                    "- Do NOT introduce code unless this is a TECHNICAL query.",
+                ]
+                extra_context = "\n".join(debate_lines)
+                self._phase(f"{key.capitalize()} — rebuttal")
+                rebuttal_text = self.agents[key].model.respond(
+                    "Produce your rebuttal now.", extra_context=extra_context,
+                    token_callback=self.agents[key]._make_token_cb(),
+                    max_tokens=600,  # rebuttals must be concise bullets, not essays
+                )
+                candidates[key]["rebuttal"] = rebuttal_text
+                ev = AgentEvent(key.capitalize(), "observation", f"Rebuttal:\n{rebuttal_text}")
+                emit(ev)
+                discussion_lines.append(f"{key.upper()} REBUTTAL:\n{rebuttal_text}\n")
+
+                # ── Back-fill Peasant QA answers (Change 8) ────────────
+                # The candidate's rebuttal IS their answer to Peasant's questions.
+                # Fill the "a" slot in _peasant_qa_log so that in cross-fire,
+                # Peasant sees what was already answered and can go deeper.
+                if _peasant_qa_log:
+                    peasant_qs_for_key = candidates[key].get("peasant_q", "")
+                    for qa_entry in _peasant_qa_log:
+                        if not qa_entry.get("a") and qa_entry["q"][:60] in peasant_qs_for_key:
+                            qa_entry["a"] = rebuttal_text[:400].strip()
+                ctx.shared["candidates"] = candidates
+                ctx.shared["discussion_transcript"] = "\n".join(discussion_lines[-60:])
+
+            # 3) Cross-fire
+            if self._pause_event and not self._pause_event.is_set():
+                self._pause_event.wait(timeout=300)
+            self._phase(f"Cross-fire — {self.debate_turns} turns")
+            for turn in range(1, self.debate_turns + 1):
+                for key in panel:
+                    if key == "peasant" or key not in candidates:
+                        continue
+                    _cf_mode = ctx.shared.get("query_mode", "")
+                    _cf_mode_note = (
+                        "⚠ CONVERSATIONAL mode: respond in prose only, no code.\n"
+                        if _cf_mode == "conversational" else
+                        "⚠ TECHNICAL mode: focus on code quality and correctness.\n"
+                        if _cf_mode == "technical" else ""
+                    )
+                    extra_context = (
+                        f"CROSS-FIRE CONTEXT — Turn {turn}/{self.debate_turns}\n\n"
+                        + _cf_mode_note +
+                        "Rules:\n"
+                        "- Write ONE short message.\n"
+                        "- Include: AGREE: ... | DISAGREE: ... | ADD: ...\n"
+                        "- Address Peasant questions about your answer.\n"
+                        "- Keep under 10 lines.\n\n"
+                        f"Discussion so far:\n{ctx.shared.get('discussion_transcript','')}\n"
+                    )
+                    self._phase(f"{key.capitalize()} — cross-fire T{turn}")
+                    msg = self.agents[key].model.respond(
+                        "Post your cross-fire message now.", extra_context=extra_context,
+                        token_callback=self.agents[key]._make_token_cb(),
+                        max_tokens=400,  # cross-fire must be tight — 10 lines max
+                    )
+                    candidates[key]["discussion"] = (
+                        candidates[key].get("discussion", "") + f"\nTURN {turn}:\n{msg}\n"
+                    ).strip()
+                    ev = AgentEvent(key.capitalize(), "observation", f"Cross-fire T{turn}:\n{msg}")
+                    emit(ev)
+                    discussion_lines.append(f"{key.upper()} CROSS-FIRE T{turn}:\n{msg}\n")
+
+                    if "peasant" in self.agents:
+                        self._phase(f"Peasant — questions after {key} T{turn}")
+                        _cf_pmode = ctx.shared.get("query_mode", "")
+                        pq = peasant_cross_exam(
+                            self.agents["peasant"].model,
+                            candidate_role=f"{key} (T{turn})", candidate_text=msg, user_text=user_text,
+                            prior_qa=_peasant_qa_log if _peasant_qa_log else None,
+                            query_mode=_cf_pmode,
+                        )
+                        _cf_score = _peasant_quality_score(pq, msg, _peasant_qa_log)
+                        if not _looks_like_two_questions(pq):
+                            # Reformat rather than regenerate — same ideas, proper labels
+                            _cf_reformat = (
+                                "Your response below is good but needs exactly two questions "
+                                "labelled Q1: and Q2:. Reformat it now — keep the same ideas, "
+                                "just add Q1: and Q2: labels and make sure each ends with '?'.\n\n"
+                                f"YOUR RESPONSE:\n{pq}"
+                            )
+                            pq = self.agents["peasant"].model.respond(
+                                _cf_reformat, max_tokens=300)
+                            _cf_score = _peasant_quality_score(pq, msg, _peasant_qa_log)
+                            if not _looks_like_two_questions(pq):
+                                _axes = ", ".join(
+                                    k + ("=✓" if v else "=✗")
+                                    for k, v in _cf_score["axes"].items()
+                                )
+                                emit(AgentEvent("Peasant", "observation",
+                                    "⚠ CF quality low after reformat ("
+                                    + str(_cf_score["total"]) + "/4: " + _axes + ")"))
+                        _log_peasant_questions(pq)
+                        _cftag = " [q:" + str(_cf_score["total"]) + "/4]"
+                        pev = AgentEvent("Peasant", "observation",
+                                        f"Cross-fire questions after {key} T{turn}" + _cftag + ":\n" + pq)
+                        emit(pev)
+                        discussion_lines.append(f"PEASANT → {key} T{turn}:\n{pq}\n")
+
+                    ctx.shared["candidates"] = candidates
+                    ctx.shared["discussion_transcript"] = "\n".join(discussion_lines[-80:])
+
+            # 4) Judge ranks
+            self._phase("Judge — ranking candidates")
+            rank_json = self.judge.rank_candidates(user_text, candidates)
+            ctx.shared["judge_ranking"] = rank_json
+            try:
+                import json as _rj
+                ctx.shared["judge_confidence"] = int(_rj.loads(rank_json).get("confidence", 0))
+            except Exception:
+                ctx.shared["judge_confidence"] = 0
+            ev = AgentEvent("Judge", "observation", f"Ranking:\n{rank_json}")
+            emit(ev)
+
+            # 4a) Low-confidence gap logging ─────────────────────────────────
+            # Roles that reported self-confidence ≤4 are flagged so the
+            # Librarian wishlist captures what vault data would have helped.
+            for _lc_role, _lc_data in candidates.items():
+                if _lc_data.get("self_confidence", 10) <= 4:
+                    try:
+                        _lc_topic = f"{_lc_role} answer to: {user_text[:80]}"
+                        _lc_reason = (
+                            f"{_lc_role} self-reported confidence "
+                            f"{_lc_data['self_confidence']}/10 — vault data on this topic "
+                            "would have strengthened the answer"
+                        )
+                        ctx.shared.setdefault("_low_conf_gaps", []).append(
+                            {"who": _lc_role, "topic": _lc_topic, "reason": _lc_reason}
+                        )
+                    except Exception:
+                        pass
+
+            # 4b) Peasant adversarial challenge (optional)
+            _adversarial_challenge = ""
+            if (ctx.shared.get("peasant_adversarial", False)
+                    and "peasant" in self.agents):
+                try:
+                    import json as _aj
+                    _robj = _aj.loads(rank_json)
+                    _winner_role = _robj.get("winner", "")
+                    _winner_ans = candidates.get(_winner_role, {}).get("answer", "")
+                except Exception:
+                    _winner_role, _winner_ans = "", ""
+                if _winner_role and _winner_ans:
+                    self._phase("Peasant — adversarial challenge")
+                    _adv_ctx = (
+                        "USER REQUEST:\n" + user_text + "\n\n"
+                        "WINNING CANDIDATE: " + _winner_role + "\n"
+                        "WINNING ANSWER:\n" + _winner_ans + "\n\n"
+                        "Your task: argue AGAINST this answer. Identify the single most\n"
+                        "dangerous flaw, edge case, or false assumption.\n"
+                        "Be specific and adversarial. Do NOT offer improvements.\n"
+                        "Format: CHALLENGE: <your strongest objection in 3-6 sentences>"
+                    )
+                    _adversarial_challenge = self.agents["peasant"].model.respond(
+                        "State your adversarial challenge now.",
+                        extra_context=_adv_ctx,
+                        max_tokens=300,
+                    )
+                    ctx.shared["adversarial_challenge"] = _adversarial_challenge
+                    ctx.shared["adversarial_target"] = _winner_role
+                    emit(AgentEvent("Peasant", "observation",
+                                   "Adversarial: " + _adversarial_challenge))
+
+            # 5) Writer synthesizes
+            self._phase("Writer — synthesizing final answer")
+            synth_evs = self.agents[synth].act(ctx)
+            for ev in synth_evs:
+                emit(ev)
+            synth_final = next((e.text for e in reversed(synth_evs) if e.kind == "final"), "")
+            # T1-D: Track per-round Writer output, emit unified diff on round 2+
+            _round_outputs = ctx.shared.setdefault("_round_outputs", [])
+            _round_outputs.append(synth_final)
+            if len(_round_outputs) >= 2:
+                import difflib as _dl
+                _prev_r = len(_round_outputs) - 1
+                _curr_r = len(_round_outputs)
+                _prev_lines = _round_outputs[-2].splitlines(keepends=True)
+                _curr_lines = _round_outputs[-1].splitlines(keepends=True)
+                _diff_lines = list(_dl.unified_diff(
+                    _prev_lines, _curr_lines,
+                    fromfile="round_" + str(_prev_r),
+                    tofile="round_" + str(_curr_r),
+                    lineterm="",
+                ))
+                if _diff_lines:
+                    _diff_text = "".join(_diff_lines[:80])
+                    _diff_label = "r" + str(_prev_r) + " -> r" + str(_curr_r)
+                    _diff_msg = "Round diff (" + _diff_label + "):\n" + _diff_text
+                    emit(AgentEvent("Orchestrator", "observation", _diff_msg))
+
+
+            # 6) Judge critiques
+            self._phase("Judge — critiquing synthesis")
+            critique = self.judge.critique(user_text, synth_final, extra_context=f"Ranking:\n{rank_json}", query_mode=ctx.shared.get("query_mode", ""))
+            ctx.shared["judge_critique"] = critique
+            ev = AgentEvent("Judge", "observation", critique)
+            emit(ev)
+
+            if "Verdict: PASS" in critique:
+                self._phase("✓ Verdict: PASS — deliberation complete")
+                break
+
+            # ── Confidence-gated early exit ──────────────────────────────
+            # Even on NEEDS_WORK, if Judge confidence is very high (≥8/10)
+            # and this is the final round, skip re-deliberation — the answer
+            # is probably good enough and more rounds won't help much.
+            _conf = ctx.shared.get("judge_confidence", 0)
+            _is_last_round = (r == self.max_rounds - 1)
+            if _conf >= 8 and _is_last_round:
+                self._phase(
+                    f"✓ High confidence ({_conf}/10) — accepting answer despite NEEDS_WORK"
+                )
+                break
+
+            # ── Confidence-gated extra round ─────────────────────────────
+            # If confidence is very low (≤2/10) on round 1, allow an extra
+            # round beyond max_rounds — the answer needs more work.
+            if _conf <= 2 and r == 0 and self.max_rounds < 3:
+                self._phase(
+                    f"⚠ Low confidence ({_conf}/10) — adding extra deliberation round"
+                )
+                self.max_rounds = 3
+
+            else:
+                # T2-C: Parse REQUIRED_CHANGES for targeted round-2 Writer brief
+                _changes = self.judge.__class__.parse_required_changes(critique)
+                if _changes:
+                    ctx.shared["required_changes"] = _changes
+                    _chg_txt = "\n".join("- " + c for c in _changes)
+                    emit(AgentEvent("Judge", "observation",
+                                   "Required changes for next round:\n" + _chg_txt))
+
+        # Expose shared context so caller can retrieve low-confidence gaps etc.
+        self._last_ctx = ctx
+        return all_events
+
+
+# ============================================================
+# Vault search tool
+# ============================================================
+
+def _librarian_brief(
+    rag,
+    query: str,
+    *,
+    log_cb=None,
+    max_chars: int = 5500,
+) -> dict:
+    """
+    Run a multi-angle vault search before deliberation and return a structured
+    briefing dict for injecting into Council personality prompts.
+
+    Returns:
+        raw     — full briefing text for most roles
+        peasant — shorter targeted briefing for the Peasant role
+        summary — one-line summary of what was found
+        sources — list of filenames that contributed context
+        found   — True if any relevant content was found
+    """
+    empty = {"raw": "", "peasant": "", "summary": "", "sources": [], "found": False}
+    q = (query or "").strip()
+    if not q:
+        return empty
+
+    import re as _re
+    stop = {"what", "when", "where", "who", "why", "how", "is", "are", "the",
+            "a", "an", "in", "on", "of", "to", "do", "does", "can", "i",
+            "my", "me", "for", "and", "or", "with", "this", "that"}
+    keywords = [w for w in _re.findall(r"[a-zA-Z]{3,}", q.lower()) if w not in stop]
+    angles = [q] + keywords[:3]
+
+    all_matches: list = []
+    sources_seen: set = set()
+
+    for angle in angles:
+        if log_cb:
+            log_cb("RAG search: " + repr(angle))
+        try:
+            if hasattr(rag, "search"):
+                results = rag.search(angle, n_results=4)
+                # RAGResult may be a custom object, not a plain list.
+                # Normalise to a list of dicts regardless of return type.
+                if results is None:
+                    rows = []
+                elif isinstance(results, (list, tuple)):
+                    rows = list(results)
+                elif hasattr(results, "documents"):
+                    # ChromaDB QueryResult style: .documents, .metadatas, .ids
+                    docs  = results.documents  or [[]]
+                    metas = results.metadatas  or [[]]
+                    ids   = results.ids        or [[]]
+                    # ChromaDB returns list-of-lists (one per query)
+                    docs  = docs[0]  if docs  and isinstance(docs[0],  list) else docs
+                    metas = metas[0] if metas and isinstance(metas[0], list) else metas
+                    ids   = ids[0]   if ids   and isinstance(ids[0],   list) else ids
+                    rows  = [
+                        {"text": d, "file": (m or {}).get("source", i)}
+                        for d, m, i in zip(docs, metas, ids)
+                    ]
+                elif hasattr(results, "__iter__"):
+                    rows = list(results)
+                else:
+                    # Unknown RAGResult type — try treating as single result
+                    rows = [results]
+
+                for r in rows:
+                    if isinstance(r, dict):
+                        fname = r.get("file") or r.get("source") or r.get("id") or "unknown"
+                        text  = r.get("text") or r.get("document") or r.get("content") or ""
+                    elif hasattr(r, "__dict__"):
+                        d     = vars(r)
+                        fname = d.get("file") or d.get("source") or d.get("id") or "unknown"
+                        text  = d.get("text") or d.get("document") or d.get("content") or ""
+                    else:
+                        fname, text = "unknown", str(r)[:500]
+                    if text and fname not in sources_seen:
+                        sources_seen.add(fname)
+                        all_matches.append({"file": fname, "excerpt": text[:500]})
+            else:
+                vault_dir = getattr(rag, "vault_dir", None)
+                if vault_dir:
+                    from pathlib import Path as _Path
+                    res = _vault_search_impl(_Path(vault_dir), angle)
+                    for m in res.get("matches", []):
+                        if m["file"] not in sources_seen:
+                            sources_seen.add(m["file"])
+                            all_matches.append(m)
+        except Exception as e:
+            if log_cb:
+                log_cb("RAG angle error (" + repr(angle) + "): " + str(e))
+
+    if not all_matches:
+        return empty
+
+    sections = []
+    for m in all_matches[:8]:
+        fname   = m.get("file", "?")
+        excerpt = (m.get("excerpt") or m.get("text") or "").strip()
+        if excerpt:
+            sections.append("[" + fname + "]\n" + excerpt)
+
+    raw = "VAULT CONTEXT:\n" + "\n\n".join(sections)
+    if len(raw) > max_chars:
+        raw = raw[:max_chars] + "\n...[truncated]"
+
+    peasant_sections = sections[:3]
+    peasant = (
+        "VAULT CONTEXT (use to ask targeted follow-up questions):\n"
+        + "\n\n".join(peasant_sections)
+    )
+    if len(peasant) > max_chars // 2:
+        peasant = peasant[:max_chars // 2] + "\n...[truncated]"
+
+    summary = "Found " + str(len(all_matches)) + " relevant vault excerpt(s) from: " + ", ".join(list(sources_seen)[:4])
+
+    return {
+        "raw":     raw,
+        "peasant": peasant,
+        "summary": summary,
+        "sources": sorted(sources_seen),
+        "found":   True,
+    }
+
+def _vault_search_impl(vault_dir: Path, query: str, *, max_files: int = 80) -> Dict[str, Any]:
+    q = (query or "").strip()
+    if not q:
+        return {"query": q, "matches": []}
+    qlow = q.lower()
+    matches = []
+    files = sorted(vault_dir.iterdir(), key=lambda p: p.name.lower())
+    scanned = 0
+    for p in files:
+        if scanned >= max_files or not p.is_file():
+            continue
+        scanned += 1
+        try:
+            if p.stat().st_size > 250_000:
+                continue
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        tlow = text.lower()
+        idx = tlow.find(qlow)
+        if idx == -1:
+            continue
+        start = max(0, idx - 140)
+        end = min(len(text), idx + 260)
+        excerpt = text[start:end].replace("\n", " ")
+        matches.append({"file": p.name, "excerpt": excerpt})
+        if len(matches) >= 12:
+            break
+    return {"query": q, "matches": matches, "scanned": scanned}
+
+
+def _make_tools(runner: ce.LocalRunner, librarian: ce.Librarian, vault_dir: Path) -> Dict[str, ToolFn]:
+    def run_python(args: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+        code = str(args.get("code", "")).strip()
+        if not code:
+            return False, "No code provided.", {}
+        rc, out, err, path = runner.run_code(code, filename_hint=str(args.get("filename", "scratch.py")), timeout_s=int(args.get("timeout_s", 120)))
+        return True, f"rc={rc}\n--- stdout ---\n{out}\n--- stderr ---\n{err}\nfile={path}", {"rc": rc, "stdout": out, "stderr": err, "path": str(path)}
+
+    def vault_save(args: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+        name = str(args.get("name", "note.txt")).strip() or "note.txt"
+        content = str(args.get("content", ""))
+        if not content:
+            return False, "No content provided.", {}
+        p = librarian.save_text(name, content)
+        return True, f"Saved to vault as '{p.name}'.", {"path": str(p)}
+
+    def vault_list(args: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+        items = librarian.list_items()
+        return True, "\n".join(items) if items else "(empty)", {"items": items}
+
+    def vault_read(args: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+        name = str(args.get("name", "")).strip()
+        if not name:
+            return False, "Provide {'name': 'file.txt'}", {}
+        txt = librarian.read_text(name)
+        return True, txt, {"name": name}
+
+    def vault_search(args: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+        res = _vault_search_impl(vault_dir, str(args.get("query", "")))
+        lines = [f"Vault search: {res.get('query','')}"]
+        for m in res.get("matches", []):
+            lines.append(f"- {m['file']}: {m['excerpt']}")
+        if not res.get("matches"):
+            lines.append("(no matches)")
+        return True, "\n".join(lines), res
+
+    return {"run_python": run_python, "vault_save": vault_save,
+            "vault_list": vault_list, "vault_read": vault_read, "vault_search": vault_search}
+
+
+# ============================================================
+# App paths / config
+# ============================================================
+
+STORE_PASSWORDS = True
+
+APP_DIR = Path.home() / ".council"
+APP_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ── Vault Git clone helper (used by Vault Manager tab) ────────────────────────
+
+def _vmgr_clone_repo(
+    url: str,
+    *,
+    vault_dir: Path,
+    subfolder: str | None = None,
+    branch: str | None = None,
+    depth: int = 1,
+    log_cb=None,
+) -> Path:
+    """
+    Clone or update a GitHub repo and copy indexable files into vault_dir.
+    log_cb(msg) is called with progress strings for the GUI log.
+    Returns the destination vault subfolder Path.
+    """
+    import re as _re
+    import shutil as _shutil
+    import subprocess as _sp
+
+    def _log(m):
+        if log_cb:
+            log_cb(m)
+        else:
+            print(m)
+
+    INDEXABLE = {
+        ".py", ".md", ".txt", ".json", ".yaml", ".yml",
+        ".html", ".rst", ".csv", ".log", ".toml", ".ini",
+    }
+    SKIP_DIRS  = {".git", ".github", "__pycache__", "node_modules",
+                  ".tox", "dist", "build", ".venv", "venv", "env",
+                  ".eggs", ".mypy_cache", ".pytest_cache"}
+    SKIP_FILES = {".gitignore", ".gitattributes", ".gitmodules",
+                  "poetry.lock", "package-lock.json", "yarn.lock",
+                  "Pipfile.lock", ".DS_Store"}
+    MAX_BYTES  = 500_000
+
+    if not subfolder:
+        name = url.rstrip("/").rstrip(".git").rsplit("/", 1)[-1]
+        subfolder = _re.sub(r"[^A-Za-z0-9._-]", "_", name) or "repo"
+
+    clone_dir = vault_dir / ".git_clones" / subfolder
+    dest_dir  = vault_dir / subfolder
+
+    if clone_dir.exists():
+        _log(f"Updating existing clone: {subfolder}")
+        r = _sp.run(["git", "pull"], cwd=str(clone_dir),
+                    capture_output=True, text=True)
+        _log(r.stdout.strip() or r.stderr.strip() or "Already up to date.")
+    else:
+        clone_dir.parent.mkdir(parents=True, exist_ok=True)
+        cmd = ["git", "clone", f"--depth={depth}"]
+        if branch:
+            cmd += ["--branch", branch]
+        cmd += [url, str(clone_dir)]
+        _log(f"Cloning {url} …")
+        r = _sp.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.strip() or "git clone failed")
+        _log(f"Cloned to {clone_dir.name}")
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    copied = skipped = 0
+    for src in clone_dir.rglob("*"):
+        if not src.is_file():
+            continue
+        parts = set(src.relative_to(clone_dir).parts)
+        if parts & SKIP_DIRS or src.name in SKIP_FILES:
+            skipped += 1
+            continue
+        if src.suffix.lower() not in INDEXABLE:
+            skipped += 1
+            continue
+        try:
+            if src.stat().st_size > MAX_BYTES:
+                skipped += 1
+                continue
+        except OSError:
+            skipped += 1
+            continue
+        dst = dest_dir / src.relative_to(clone_dir)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        _shutil.copy2(src, dst)
+        copied += 1
+
+    _log(f"Copied {copied} files → vault/{subfolder}  ({skipped} skipped)")
+    return dest_dir
+
+
+def _vmgr_extract_zip(
+    zip_path: Path,
+    *,
+    vault_dir: Path,
+    subfolder: str | None = None,
+    log_cb=None,
+) -> tuple:
+    """
+    Extract a zip archive into a vault subfolder, keeping only indexable files.
+    Returns (dest_dir, copied_count, skipped_count).
+    """
+    import zipfile
+    import shutil as _shutil
+    import re as _re
+
+    def _log(m):
+        if log_cb: log_cb(m)
+        else: print(m)
+
+    INDEXABLE = {
+        ".py", ".md", ".txt", ".json", ".yaml", ".yml",
+        ".html", ".rst", ".csv", ".log", ".toml", ".ini",
+        ".xml", ".cfg", ".conf", ".tex", ".r", ".m", ".ipynb",
+    }
+    SKIP_DIRS = {"__pycache__", "node_modules", ".git", ".venv", "venv",
+                 "dist", "build", ".eggs", ".tox"}
+    MAX_BYTES = 500_000
+
+    if not subfolder:
+        subfolder = zip_path.stem
+    subfolder = _re.sub(r"[^A-Za-z0-9._-]", "_", subfolder) or "import"
+    dest_dir = vault_dir / subfolder
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    if not zipfile.is_zipfile(zip_path):
+        raise ValueError(f"{zip_path.name} is not a valid zip file")
+
+    copied = skipped = 0
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        members = [m for m in zf.infolist() if not m.filename.endswith("/")]
+        _log(f"  {len(members)} files in archive")
+
+        # Detect common top-level prefix to strip (e.g. "repo-main/")
+        all_parts = [Path(m.filename).parts for m in members]
+        strip_prefix = ""
+        if all_parts and len(set(p[0] for p in all_parts if p)) == 1:
+            strip_prefix = all_parts[0][0]
+
+        for member in members:
+            parts = Path(member.filename).parts
+            if any(p in SKIP_DIRS for p in parts): skipped += 1; continue
+            if any(p.startswith(".") for p in parts): skipped += 1; continue
+            if Path(member.filename).suffix.lower() not in INDEXABLE: skipped += 1; continue
+            if member.file_size > MAX_BYTES:
+                _log(f"  SKIP (too large {member.file_size//1024}KB): {member.filename}")
+                skipped += 1; continue
+
+            # Strip the common prefix so files land at vault/subfolder/file, not vault/subfolder/repo-main/file
+            rel_parts = parts[1:] if (strip_prefix and parts and parts[0] == strip_prefix) else parts
+            if not rel_parts:
+                rel_parts = (Path(member.filename).name,)
+            dest_file = dest_dir / Path(*rel_parts)
+            dest_file.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(member) as src, open(dest_file, "wb") as dst:
+                _shutil.copyfileobj(src, dst)
+            copied += 1
+
+    return dest_dir, copied, skipped
+
+
+def _vmgr_copy_folder(
+    src: Path,
+    *,
+    vault_dir: Path,
+    subfolder: str | None = None,
+    log_cb=None,
+) -> tuple:
+    """
+    Copy a local folder into the vault, keeping only indexable files.
+    Returns (dest_dir, copied_count, skipped_count).
+    """
+    import shutil as _shutil
+    import re as _re
+
+    def _log(m):
+        if log_cb: log_cb(m)
+        else: print(m)
+
+    INDEXABLE = {
+        ".py", ".md", ".txt", ".json", ".yaml", ".yml",
+        ".html", ".rst", ".csv", ".log", ".toml", ".ini",
+        ".xml", ".cfg", ".conf", ".tex", ".r", ".m", ".ipynb",
+    }
+    SKIP_DIRS = {"__pycache__", "node_modules", ".git", ".venv", "venv",
+                 "dist", "build", ".eggs", ".tox", ".idea", ".vscode"}
+    MAX_BYTES = 500_000
+
+    if not subfolder:
+        subfolder = src.name
+    subfolder = _re.sub(r"[^A-Za-z0-9._-]", "_", subfolder) or "import"
+    dest_dir = vault_dir / subfolder
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    copied = skipped = 0
+    for src_file in src.rglob("*"):
+        if not src_file.is_file(): continue
+        rel = src_file.relative_to(src)
+        if any(p in SKIP_DIRS for p in rel.parts): skipped += 1; continue
+        if any(p.startswith(".") for p in rel.parts): skipped += 1; continue
+        if src_file.suffix.lower() not in INDEXABLE: skipped += 1; continue
+        try:
+            if src_file.stat().st_size > MAX_BYTES: skipped += 1; continue
+        except OSError:
+            skipped += 1; continue
+        dest_file = dest_dir / rel
+        dest_file.parent.mkdir(parents=True, exist_ok=True)
+        _shutil.copy2(src_file, dest_file)
+        copied += 1
+
+    _log(f"  Copied {copied} files from {src.name}")
+    return dest_dir, copied, skipped
+
+
+# ── All persistent data lives under VAULT_DIR ─────────────────
+# ~/.council/vault/
+#   conversations/     ← per-session chat history
+#   memory/            ← per-role persistent memory
+#   logs/              ← council.log and session logs
+#   workspace/         ← code runner scratch files
+#   music_output/      ← composer renders
+#   graph_output/      ← grapher exports
+#   dream3d_docs/      ← scraped Dream3D documentation
+#   .chromadb/         ← ChromaDB vector index
+#   .git_clones/       ← raw git clones (not indexed directly)
+#   node_registry.json ← SSH node registry
+#   personality_backends.json ← model pins
+VAULT_DIR            = APP_DIR / "vault"
+VERDICT_HISTORY_PATH = VAULT_DIR / "verdict_history.jsonl"
+VAULT_DIR.mkdir(parents=True, exist_ok=True)
+
+LOG_PATH      = VAULT_DIR / "logs" / "council.log"
+WORKSPACE_DIR = VAULT_DIR / "workspace"
+TMP_DIR       = VAULT_DIR / "tmp"
+REGISTRY_PATH = VAULT_DIR / "node_registry.json"
+PINS_PATH            = VAULT_DIR / "personality_backends.json"
+INSTRUCTIONS_PATH    = VAULT_DIR / "council_instructions.json"
+CONTENT_STYLE_PATH   = VAULT_DIR / "content_style.json"
+
+# Ensure subdirs exist on startup
+for _d in (LOG_PATH.parent, WORKSPACE_DIR, TMP_DIR):
+    _d.mkdir(parents=True, exist_ok=True)
+
+
+def _migrate_old_paths_to_vault() -> None:
+    """
+    One-time migration: move data from old scattered locations into vault.
+    Safe to run repeatedly — skips anything already moved.
+    """
+    import shutil
+
+    migrations = [
+        # (old_path,                          new_path,           is_dir)
+        (APP_DIR / "council.log",             LOG_PATH,           False),
+        (APP_DIR / "node_registry.json",      REGISTRY_PATH,      False),
+        (APP_DIR / "personality_backends.json", PINS_PATH,        False),
+        (APP_DIR / "workspace",               WORKSPACE_DIR,      True),
+        (APP_DIR / "music_output",            VAULT_DIR / "music_output", True),
+        (APP_DIR / "graph_output",            VAULT_DIR / "graph_output", True),
+        (APP_DIR / ".chromadb",               VAULT_DIR / ".chromadb",    True),
+        # dream3d docs scraped next to the script
+        (Path(__file__).parent / "vault" / "dream3d_docs",
+         VAULT_DIR / "dream3d_docs", True),
+    ]
+
+    moved = []
+    for old, new, is_dir in migrations:
+        if not old.exists() or old == new:
+            continue
+        if new.exists():
+            # destination already has content — don't overwrite
+            continue
+        try:
+            new.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(old), str(new))
+            moved.append(f"  {old.name} → vault/{new.relative_to(VAULT_DIR)}")
+        except Exception as e:
+            print(f"[Migration] Could not move {old.name}: {e}")
+
+    if moved:
+        print("[Migration] Moved old data into vault:")
+        for m in moved:
+            print(m)
+
+
+# Run migration silently on startup
+try:
+    _migrate_old_paths_to_vault()
+except Exception:
+    pass
+
+
+# ============================================================
+# Colour / tag constants for the transcript
+# ============================================================
+
+ROLE_COLORS = {
+    "User":        "#4fc3f7",   # light blue
+    "Judge":       "#ef9a9a",   # red-ish
+    "Writer":      "#a5d6a7",   # green
+    "Tech-Priest": "#ce93d8",   # purple
+    "Intern":      "#ffe082",   # yellow
+    "Peasant":     "#ffcc80",   # orange
+    "Artist":      "#f48fb1",   # pink
+    "Orchestrator":"#b0bec5",   # grey
+    "Librarian":   "#80cbc4",   # teal
+    "Apothecary":  "#bcaaa4",   # brown-ish
+}
+
+PHASE_COLOR   = "#78909c"
+TOKEN_COLOR   = "#e0e0e0"
+DEFAULT_COLOR = "#cfd8dc"
+
+
+# ============================================================
+# CouncilConsole  (main GUI)
+# ============================================================
+
+# ============================================================
+# Council Instruction Manager
+# ============================================================
+# Persists a list of named instructions to vault/council_instructions.json
+# Each entry: {"id": str, "name": str, "text": str, "active": bool}
+# ============================================================
+
+# ============================================================
+# Content Style Manager
+# ============================================================
+# Persists cross-session learning for the Content Creator:
+#   - What hooks/structures worked for this creator
+#   - Audience and tone preferences
+#   - Script templates for different video types
+# Stored in vault/content_style.json
+# ============================================================
+
+# Built-in script templates — saved to vault on first run if missing
+DEFAULT_SCRIPT_TEMPLATES = {
+    "explainer": {
+        "name": "Explainer / Educational",
+        "description": "Teaching the viewer something clearly",
+        "structure": [
+            "HOOK (0:00-0:30): Lead with the surprising fact or the payoff — why should they care?",
+            "SETUP (0:30-1:30): Define the problem or concept in plain language.",
+            "SECTION 1 (1:30-4:00): Core concept — one main idea, explained with an example.",
+            "SECTION 2 (4:00-6:30): Deeper dive or second angle — add nuance or a complication.",
+            "SECTION 3 (6:30-8:30): Practical application — what does the viewer do with this?",
+            "RECAP (8:30-9:30): Summarise the 3 key points in one sentence each.",
+            "CTA/OUTRO (9:30-10:00): Call to action. Natural, not forced.",
+        ]
+    },
+    "comedy_retrospective": {
+        "name": "Comedy / Retrospective",
+        "description": "Looking back at something with humour and self-awareness",
+        "structure": [
+            "HOOK (0:00-0:30): Most absurd or funniest moment first — then 'let me explain'.",
+            "CONTEXT (0:30-1:30): Set the scene. Who were you, why did this exist?",
+            "THE THING (1:30-5:00): Walk through it with running commentary. Lean into the absurdity.",
+            "TURNING POINT (5:00-7:00): The moment you realise how unhinged it was.",
+            "REFLECTION (7:00-9:00): What you'd do differently / what it says about that time.",
+            "CALLBACK (9:00-9:45): Return to the opening hook with new context.",
+            "OUTRO (9:45-10:00): Short, punchy. Leave them on a laugh.",
+        ]
+    },
+    "project_showcase": {
+        "name": "Project Showcase / Build Log",
+        "description": "Showing off something you built",
+        "structure": [
+            "HOOK (0:00-0:30): Show the final result first. Make them want to know how.",
+            "THE PROBLEM (0:30-1:30): Why did you build this? What was broken or missing?",
+            "THE APPROACH (1:30-3:00): How you decided to solve it — options you considered.",
+            "BUILD SECTION 1 (3:00-5:30): First major step — keep it visual, show don't tell.",
+            "BUILD SECTION 2 (5:30-8:00): Second step — include a failure or pivot if there was one.",
+            "RESULT (8:00-9:00): Show it working. Be honest about limitations.",
+            "WHAT I LEARNED (9:00-9:45): One or two genuine takeaways.",
+            "OUTRO (9:45-10:00): What's next. CTA.",
+        ]
+    },
+    "powerpoint_roast": {
+        "name": "PowerPoint / Document Roast",
+        "description": "Revisiting old work with comedic commentary",
+        "structure": [
+            "HOOK (0:00-0:30): Title slide reveal — just let the title land.",
+            "INTRO (0:30-1:30): What was this, when did you make it, why does it exist?",
+            "SLIDE BY SLIDE (1:30-7:30): Work through it. Commentary on each slide. Don't rush.",
+            "HIGHLIGHT (7:30-8:30): The single most unhinged moment. Give it space.",
+            "VERDICT (8:30-9:30): Would past-you have been proud? Were you right?",
+            "OUTRO (9:30-10:00): Tease the next one or invite viewers to share their worst.",
+        ]
+    },
+    "tutorial": {
+        "name": "Tutorial / How-To",
+        "description": "Teaching the viewer to do something step by step",
+        "structure": [
+            "HOOK (0:00-0:30): Show the finished result — what they'll be able to do.",
+            "REQUIREMENTS (0:30-1:30): What they need before starting. Be specific.",
+            "STEP 1 (1:30-3:30): First step — clear, slow, no assumptions.",
+            "STEP 2 (3:30-5:30): Second step — mention common mistakes here.",
+            "STEP 3 (5:30-7:30): Third step — most tutorials lose people here, be extra clear.",
+            "TROUBLESHOOTING (7:30-8:30): Top 2-3 things that go wrong and how to fix them.",
+            "RESULT (8:30-9:30): Show the working result. Recap the steps briefly.",
+            "OUTRO (9:30-10:00): Where to go next. CTA.",
+        ]
+    },
+}
+
+
+class ContentStyleManager:
+    """
+    Persists cross-session learning for the Content Creator personality.
+    Stores style preferences, what worked, audience notes, and script templates.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._data: Dict = {}
+        self._load()
+        self._ensure_templates()
+
+    def _load(self) -> None:
+        try:
+            if self.path.exists():
+                self._data = json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            self._data = {}
+
+    def _save(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(
+                json.dumps(self._data, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def _ensure_templates(self) -> None:
+        """Write default templates to vault if not already present."""
+        if "templates" not in self._data:
+            self._data["templates"] = DEFAULT_SCRIPT_TEMPLATES
+            self._save()
+
+    # ── Style memory ─────────────────────────────────────────────────────
+
+    def add_style_note(self, note: str, category: str = "general") -> None:
+        """Record something that worked or a style preference."""
+        notes = self._data.setdefault("style_notes", [])
+        notes.append({
+            "note": note.strip(),
+            "category": category,
+            "ts": __import__("datetime").datetime.now().isoformat(timespec="seconds"),
+        })
+        # Keep last 50 notes
+        self._data["style_notes"] = notes[-50:]
+        self._save()
+
+    def set_audience(self, description: str) -> None:
+        self._data["audience"] = description.strip()
+        self._save()
+
+    def set_tone(self, description: str) -> None:
+        self._data["tone"] = description.strip()
+        self._save()
+
+    def get_style_notes(self, category: str = "") -> List[Dict]:
+        notes = self._data.get("style_notes", [])
+        if category:
+            notes = [n for n in notes if n.get("category") == category]
+        return notes
+
+    # ── Templates ────────────────────────────────────────────────────────
+
+    def get_templates(self) -> Dict:
+        return self._data.get("templates", DEFAULT_SCRIPT_TEMPLATES)
+
+    def add_template(self, key: str, name: str, description: str,
+                     structure: List[str]) -> None:
+        templates = self._data.setdefault("templates", {})
+        templates[key] = {"name": name, "description": description, "structure": structure}
+        self._save()
+
+    def best_template_for(self, query: str) -> Optional[Dict]:
+        """Return the most relevant template based on query keywords."""
+        q = query.lower()
+        templates = self.get_templates()
+        _signals = {
+            "powerpoint_roast":    ["powerpoint", "ppt", "slides", "presentation", "college", "roast"],
+            "comedy_retrospective":["funny", "unhinged", "comedy", "absurd", "joke", "old", "past"],
+            "project_showcase":    ["project", "build", "built", "made", "showcase", "raspberry", "council", "ai"],
+            "tutorial":            ["tutorial", "how to", "how do", "step by step", "guide"],
+            "explainer":           ["explain", "what is", "why does", "overview", "introduction"],
+        }
+        best_key = None
+        best_score = 0
+        for key, signals in _signals.items():
+            score = sum(1 for s in signals if s in q)
+            if score > best_score and key in templates:
+                best_score = score
+                best_key = key
+        if best_key:
+            return {"key": best_key, **templates[best_key]}
+        return None
+
+    # ── Context block for injection ──────────────────────────────────────
+
+    def build_context_block(self, query: str) -> str:
+        """Build a context string to prepend to the Content Creator's prompt."""
+        parts: List[str] = []
+
+        audience = self._data.get("audience", "")
+        tone     = self._data.get("tone", "")
+        if audience or tone:
+            aud_lines = []
+            if audience:
+                aud_lines.append(f"  Audience: {audience}")
+            if tone:
+                aud_lines.append(f"  Tone: {tone}")
+            parts.append("CREATOR PROFILE:\n" + "\n".join(aud_lines))
+
+        notes = self.get_style_notes()
+        if notes:
+            note_lines = [f"  • [{n['category']}] {n['note']}" for n in notes[-10:]]
+            parts.append("CONTENT STYLE MEMORY (what has worked for this creator):\n"
+                         + "\n".join(note_lines))
+
+        template = self.best_template_for(query)
+        if template:
+            struct_lines = ["  " + s for s in template.get("structure", [])]
+            parts.append(
+                f"SCRIPT TEMPLATE — {template['name']} ({template['description']}):\n"
+                + "\n".join(struct_lines)
+                + "\n\nUse this structure as your scaffold. Adapt timing to actual content length."
+            )
+
+        return "\n\n".join(parts) if parts else ""
+
+
+class InstructionManager:
+    """Persistent, toggleable list of council-wide instructions."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self._instructions: List[Dict] = []
+        self._load()
+
+    def _load(self) -> None:
+        try:
+            if self.path.exists():
+                data = json.loads(self.path.read_text(encoding="utf-8"))
+                self._instructions = data if isinstance(data, list) else []
+        except Exception:
+            self._instructions = []
+
+    def _save(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(
+                json.dumps(self._instructions, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def add(self, name: str, text: str) -> Dict:
+        import uuid as _uuid
+        entry = {
+            "id":     _uuid.uuid4().hex[:8],
+            "name":   name.strip() or text[:40].strip(),
+            "text":   text.strip(),
+            "active": True,
+        }
+        self._instructions.append(entry)
+        self._save()
+        return entry
+
+    def toggle(self, entry_id: str) -> bool:
+        """Flip active state. Returns new state."""
+        for e in self._instructions:
+            if e["id"] == entry_id:
+                e["active"] = not e["active"]
+                self._save()
+                return e["active"]
+        return False
+
+    def remove(self, entry_id: str) -> None:
+        self._instructions = [e for e in self._instructions if e["id"] != entry_id]
+        self._save()
+
+    def update_text(self, entry_id: str, new_text: str) -> None:
+        for e in self._instructions:
+            if e["id"] == entry_id:
+                e["text"] = new_text.strip()
+                self._save()
+                return
+
+    def all(self) -> List[Dict]:
+        return list(self._instructions)
+
+    def active_text(self) -> str:
+        """Return all active instructions joined, ready to inject into context."""
+        parts = [e["text"] for e in self._instructions if e.get("active")]
+        return "\n".join(parts)
+
+    def active_count(self) -> int:
+        return sum(1 for e in self._instructions if e.get("active"))
+
+
+class CouncilConsole(IdeaTabMixin, tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Council Console  v3  •  LOCAL + Pi + Agents")
+        self.geometry("1150x820")
+        self.configure(bg="#1e1e2e")
+
+        self.ui_q: queue.Queue = queue.Queue()
+        # Pause/resume for personality clarification requests
+        self._pause_event = threading.Event()
+        self._pause_event.set()  # starts unpaused
+        self._clarification_answer: str = ""
+
+        self.vault_dir = VAULT_DIR    # expose for tab mixins (IdeaTabMixin, etc.)
+        self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.prior_session_id: Optional[str] = None
+        self.convo_store = ce.ConversationStore(VAULT_DIR / "conversations")
+        self.librarian = ce.Librarian(VAULT_DIR, LOG_PATH)
+        self.runner = ce.LocalRunner(WORKSPACE_DIR)
+        self.speech = ce.SpeechToText(model_size="base")
+        self.dispatcher = ce.build_dispatcher()
+
+        pins = ce.load_personality_pins(PINS_PATH)
+        # Persistent council-wide instructions — managed as a list
+        self._instr_mgr       = InstructionManager(INSTRUCTIONS_PATH)
+        self._video_proc      = (vp.VideoProcessor(VAULT_DIR, TMP_DIR,
+                                  ollama_host=ce.DEFAULT_OLLAMA_HOST)
+                                if _VIDEO_OK else None)
+        self._video_cancelled  = False
+        self._content_style  = ContentStyleManager(CONTENT_STYLE_PATH)
+
+        self.personalities = ce.build_personalities(
+            pins=pins, vault_dir=VAULT_DIR, session_id=self.session_id,
+            trace=True, dispatcher=self.dispatcher,
+            prior_session_id=self.prior_session_id,
+        )
+        self._unpack_personalities()
+
+        # ── Sage agent (vault knowledge + gap detection) ────────────
+        self.sage_agent_obj = None
+        if _SAGE_OK and self.sage is not None:
+            _sage_kb = sa.SageKnowledge(VAULT_DIR / "sage_knowledge")
+            self.sage_agent_obj = sa.SageAgent(
+                model=self.sage,
+                knowledge=_sage_kb,
+                on_gap=lambda q, r: self.ui_q.put((
+                    "agent_phase", "sage_gap",
+                    f"⚠ Sage gap: {q[:80]} — {r}"
+                )) if hasattr(self, "ui_q") else None,
+            )
+            # Inject Sage system prompt
+            self.sage.system_prompt = sa.SAGE_SYSTEM_PROMPT
+
+        # ── Composer personality ───────────────────────────────
+        self.composer_personality = None
+        self.block_library        = None
+        if _COMPOSER_OK:
+            try:
+                music_dir = VAULT_DIR / "music_blocks"
+                self.block_library = mb.BlockLibrary(music_dir)
+                if not (music_dir / "progression_blocks.json").exists():
+                    self.block_library.seed_defaults()
+                self.composer_personality = cp.ComposerPersonality(
+                    personality_model=self.writer,
+                    library=self.block_library,
+                    event_callback=lambda phase, msg: self.ui_q.put(("agent_phase", phase, msg)),
+                )
+                cp.patch_routing(ce)
+                print("[Composer] Ready")
+            except Exception as e:
+                print(f"[Composer] Init failed: {e}")
+
+        # ── Dream3D primer injection ───────────────────────────
+        if _DREAM3D_OK:
+            try:
+                d3p.inject_dream3d_context(self.personalities)
+            except Exception as e:
+                print(f"[Dream3D] Primer injection failed: {e}")
+
+        # ── Dream3D domain patch ───────────────────────────────
+        if _D3D_PATCH_OK:
+            d3d_patch.patch_personalities(self.personalities, VAULT_DIR)
+        else:
+            print("[Council] dream3d_council_patch.py not found — Dream3D expertise not injected")
+
+        self.apoth = ae.Apothecary(
+            registry_path=str(REGISTRY_PATH), store_passwords=STORE_PASSWORDS
+        )
+
+        self.current_script_name = "script"
+        self._stream_buffers: Dict[str, str] = {}  # role -> partial streamed text
+        self._node_refresh_id = None
+
+        # ── Agents ────────────────────────────────────────────
+        def _agent_event_cb(phase: str, msg: str):
+            self.ui_q.put(("agent_phase", phase, msg))
+
+        if _TECHPRIEST_AGENT_OK:
+            self.techpriest_agent = tpa.TechPriestAgent(
+                personality_model=self.techpriest,
+                runner=self.runner,
+                max_attempts=8,
+                event_callback=_agent_event_cb,
+            )
+        else:
+            self.techpriest_agent = None
+
+        if _INTERN_AGENT_OK:
+            self.intern_agent = ia.InternAgent(
+                personality_model=self.intern,
+                event_callback=_agent_event_cb,
+                max_research_pages=3,
+            )
+        else:
+            self.intern_agent = None
+
+        # ── RAG ───────────────────────────────────────────────
+        if _RAG_OK:
+            self.rag = vr.VaultRAG(
+                vault_dir=VAULT_DIR,
+                chroma_dir=VAULT_DIR / ".chromadb",
+            )
+            # Index in background so startup isn't blocked
+            threading.Thread(target=self._init_rag_index, daemon=True).start()
+        else:
+            self.rag = None
+
+        self._build_ui()
+        self._apply_dark_theme()
+        self.after(100, self._poll_ui_queue)
+        self.after(2000, self._refresh_nodes_async)   # initial node probe
+        self._start_config_watcher()                   # T1-E: hot-reload pins.json
+
+    def _unpack_personalities(self):
+        self.judge      = self.personalities["judge"]
+        self.writer               = self.personalities["writer"]
+        self.peasant              = self.personalities["peasant"]
+        self.intern               = self.personalities["intern"]
+        self.techpriest           = self.personalities["techpriest"]
+        self.artist               = self.personalities["artist"]
+        self.skeptic              = self.personalities.get("skeptic")
+        self.sage                 = self.personalities.get("sage")
+        self.strategist           = self.personalities.get("strategist")
+        self.musician             = self.personalities.get("musician")
+        # Librarian personality — interprets vault search results for other agents
+        self.librarian_personality = self.personalities.get("librarian")
+        self.content              = self.personalities.get("content")
+        self.director             = self.personalities.get("director")
+        self.eye                  = self.personalities.get("eye")
+        self.cutter               = self.personalities.get("cutter")
+        self.algorithm            = self.personalities.get("algorithm")
+        self.coach                = self.personalities.get("coach")
+        self.ideator              = self.personalities.get("ideator")
+        self.pitcher              = self.personalities.get("pitcher")
+
+    # ============================
+    # Dark theme
+    # ============================
+
+    def _apply_dark_theme(self):
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        bg, fg, sel = "#1e1e2e", "#cdd6f4", "#313244"
+        abg = "#181825"  # frame/widget bg
+        style.configure(".", background=bg, foreground=fg, fieldbackground=abg,
+                         insertcolor=fg, troughcolor=abg, bordercolor=sel)
+        style.configure("TNotebook", background=bg, borderwidth=0)
+        style.configure("TNotebook.Tab", background=sel, foreground=fg, padding=[10, 4])
+        style.map("TNotebook.Tab", background=[("selected", "#45475a")])
+        style.configure("TFrame", background=bg)
+        style.configure("TLabel", background=bg, foreground=fg)
+        style.configure("TButton", background="#313244", foreground=fg, relief="flat", padding=4)
+        style.map("TButton", background=[("active", "#45475a")])
+        style.configure("TCheckbutton", background=bg, foreground=fg)
+        style.configure("TEntry", fieldbackground=abg, foreground=fg, insertcolor=fg)
+        style.configure("TScrollbar", background=sel, troughcolor=abg)
+        style.configure("Treeview", background=abg, foreground=fg, fieldbackground=abg,
+                         rowheight=24)
+        style.map("Treeview", background=[("selected", "#585b70")])
+        style.configure("Treeview.Heading", background=sel, foreground=fg)
+        self.configure(bg=bg)
+
+    def _make_text(self, parent, **kwargs) -> tk.Text:
+        defaults = dict(
+            bg="#181825", fg="#cdd6f4", insertbackground="#cdd6f4",
+            selectbackground="#585b70", relief="flat", bd=0,
+            font=("Consolas", 10),
+        )
+        defaults.update(kwargs)
+        return tk.Text(parent, **defaults)
+
+    # ============================
+    # UI construction
+    # ============================
+
+    def _init_rag_index(self):
+        """Run vault indexing in background thread at startup."""
+        try:
+            if self.rag:
+                stats = self.rag.index()
+                self.ui_q.put(("agent_phase", "rag_index",
+                               f"Vault indexed: {stats.total_files} files, "
+                               f"{stats.total_chunks} chunks ({stats.backend})"))
+        except Exception as e:
+            self.ui_q.put(("agent_phase", "rag_index", f"RAG index error: {e}"))
+
+    def _build_ui(self):
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=6, pady=6)
+
+        self._build_council_tab()
+        self._build_ide_tab()
+        self._build_librarian_tab()
+        self._build_sessions_tab()
+        self._build_nodes_tab()
+        self._build_agents_tab()
+        self._build_composer_tab()
+        self._build_grapher_tab()
+        self._build_vault_manager_tab()
+        self._build_speech_tab()
+        self._build_video_tab()
+        self._build_ideas_tab()
+        self._build_apoth_tab()
+        self._build_lens_tab()
+        self._build_vault_health_tab()
+
+    # ---- Council tab ----
+
+    def _build_council_tab(self):
+        self.tab_council = ttk.Frame(self.nb)
+        self.nb.add(self.tab_council, text="⚖ Council")
+
+        # Main paned window: transcript | judge panel
+        paned = tk.PanedWindow(self.tab_council, orient="horizontal",
+                               bg="#1e1e2e", sashwidth=6, sashrelief="flat")
+        paned.pack(fill="both", expand=True, padx=6, pady=6)
+
+        # Left: transcript
+        left = ttk.Frame(paned)
+        paned.add(left, minsize=500)
+
+        ttk.Label(left, text="Transcript").pack(anchor="w")
+        self.transcript = self._make_text(left, wrap="word", state="disabled")
+        self._register_transcript_tags()
+        sb = ttk.Scrollbar(left, command=self.transcript.yview)
+        self.transcript.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.transcript.pack(fill="both", expand=True)
+
+        # Right: judge + live stream preview
+        right = ttk.Frame(paned)
+        paned.add(right, minsize=280)
+
+        ttk.Label(right, text="Judge Panel").pack(anchor="w")
+        self.judge_box = self._make_text(right, wrap="word", width=40, state="disabled", height=14)
+        self.judge_box.pack(fill="both", expand=True)
+
+        # ── Verdict feedback bar (shown after each deliberation) ────────────
+        self._vfb_frame = ttk.Frame(right)
+        self._vfb_frame.pack(fill="x", pady=(4, 0))
+        self._vfb_frame.pack_forget()  # hidden until verdict arrives
+
+        _vfb_lbl = ttk.Label(self._vfb_frame, text="Do you agree with the verdict?",
+                             foreground="#cdd6f4")
+        _vfb_lbl.pack(side="left", padx=(0, 6))
+
+        self._vfb_agree_btn = ttk.Button(
+            self._vfb_frame, text="✓ Agree",
+            command=self._verdict_agree,
+        )
+        self._vfb_agree_btn.pack(side="left", padx=2)
+
+        self._vfb_disagree_btn = ttk.Button(
+            self._vfb_frame, text="✗ Disagree",
+            command=self._verdict_disagree_open,
+        )
+        self._vfb_disagree_btn.pack(side="left", padx=2)
+
+        # ── Disagree detail panel (hidden until Disagree clicked) ────────────
+        self._vfb_detail = ttk.Frame(right)
+        self._vfb_detail.pack(fill="x", pady=(2, 0))
+        self._vfb_detail.pack_forget()
+
+        ttk.Label(self._vfb_detail,
+                  text="Your objection (the council will re-deliberate with it):",
+                  foreground="#fab387").pack(anchor="w")
+        self._vfb_text = self._make_text(self._vfb_detail, height=3, wrap="word")
+        self._vfb_text.pack(fill="x")
+        self._vfb_text.bind("<Control-Return>", lambda e: self._verdict_disagree_submit())
+
+        _vfb_sub_row = ttk.Frame(self._vfb_detail)
+        _vfb_sub_row.pack(fill="x", pady=(2, 0))
+        ttk.Button(_vfb_sub_row, text="↩ Re-deliberate with objection",
+                   command=self._verdict_disagree_submit).pack(side="left")
+        ttk.Button(_vfb_sub_row, text="Cancel",
+                   command=self._verdict_disagree_cancel).pack(side="left", padx=6)
+        ttk.Label(_vfb_sub_row, text="Ctrl+Enter to submit",
+                  foreground="#6c7086").pack(side="left")
+
+        ttk.Label(right, text="Live Token Stream").pack(anchor="w", pady=(8, 0))
+        self.stream_box = self._make_text(right, wrap="word", width=40, height=10, state="disabled")
+        self.stream_box.pack(fill="both", expand=True)
+
+        # Bottom input area
+        bottom = ttk.Frame(self.tab_council)
+        bottom.pack(fill="x", padx=6, pady=(0, 6))
+
+        ttk.Label(bottom, text="Input").pack(anchor="w")
+        self.input = self._make_text(bottom, wrap="word", height=4)
+        self.input.pack(fill="x")
+        self.input.bind("<Control-Return>", lambda e: self._send())
+
+        btns = ttk.Frame(bottom)
+        btns.pack(fill="x", pady=(4, 0))
+
+        ttk.Button(btns, text="Send  [Ctrl+Enter]", command=self._send).pack(side="left")
+        ttk.Button(btns, text="Clear", command=lambda: self._set_text(self.input, "")).pack(side="left", padx=6)
+
+        self.var_deliberate      = tk.BooleanVar(value=True)
+        self.var_tools           = tk.BooleanVar(value=False)
+        self.var_fill_ide        = tk.BooleanVar(value=True)
+        self.var_stream          = tk.BooleanVar(value=True)
+        self.var_adversarial     = tk.BooleanVar(value=False)  # T2-B: adversarial Peasant
+        self.var_judge_panel     = tk.BooleanVar(value=False)  # Judge model picks panel
+        self.var_robust_voices   = tk.BooleanVar(value=False)  # Robust personality voices
+
+        # Wire voice toggle to apply/remove voices immediately on change
+        self.var_robust_voices.trace_add("write", self._on_voice_toggle)
+
+        # ── Toolbar row 1: core toggles ───────────────────────────────
+        ttk.Checkbutton(btns, text="Deliberation",    variable=self.var_deliberate).pack(side="left", padx=4)
+        ttk.Checkbutton(btns, text="Tools",           variable=self.var_tools).pack(side="left", padx=4)
+        ttk.Checkbutton(btns, text="Fill IDE",        variable=self.var_fill_ide).pack(side="left", padx=4)
+        ttk.Checkbutton(btns, text="Stream tokens",   variable=self.var_stream).pack(side="left", padx=4)
+        ttk.Checkbutton(btns, text="Adversarial",     variable=self.var_adversarial).pack(side="left", padx=4)
+        ttk.Checkbutton(btns, text="Judge panel ✦",   variable=self.var_judge_panel).pack(side="left", padx=4)
+
+        # ── Toolbar row 2: personality controls ──────────────────────
+        btns2 = ttk.Frame(bottom)
+        btns2.pack(fill="x", pady=(2, 0))
+        ttk.Label(btns2, text="Personalities:", foreground="#6c7086").pack(side="left", padx=(4,2))
+        ttk.Checkbutton(btns2, text="Robust voices ✦",
+                        variable=self.var_robust_voices).pack(side="left", padx=4)
+        ttk.Label(btns2,
+                  text="(gives each personality a distinct character and tone)",
+                  foreground="#6c7086", font=("", 8)).pack(side="left", padx=4)
+
+        # ── Council instructions bar ─────────────────────────────
+        inst_row = ttk.Frame(bottom)
+        inst_row.pack(fill="x", pady=(2, 0))
+        ttk.Label(inst_row, text="⚡ Instruction:",
+                  foreground="#fab387").pack(side="left", padx=(4, 2))
+        self._inst_var  = tk.StringVar()
+        self._inst_name = tk.StringVar()
+        ttk.Entry(inst_row, textvariable=self._inst_name, width=18,
+                  ).pack(side="left", padx=2)
+        ttk.Label(inst_row, text="Name (optional)",
+                  foreground="#6c7086", font=("", 8)).pack(side="left")
+        inst_entry = ttk.Entry(inst_row, textvariable=self._inst_var, width=44)
+        inst_entry.pack(side="left", padx=4, fill="x", expand=True)
+        inst_entry.bind("<Return>", lambda e: self._apply_council_instruction())
+        ttk.Button(inst_row, text="Add  [Enter]",
+                   command=self._apply_council_instruction).pack(side="left", padx=2)
+        ttk.Button(inst_row, text="Manage…",
+                   command=self._open_instruction_manager).pack(side="left", padx=2)
+        ttk.Button(inst_row, text="Content Style…",
+                   command=self._open_content_style).pack(side="left", padx=2)
+        self._inst_active_lbl = ttk.Label(inst_row, text="",
+                                           foreground="#a6e3a1", font=("", 8))
+        self._inst_active_lbl.pack(side="left", padx=6)
+
+        # ── Save output panel (hidden until deliberation completes) ──────────
+        self._save_frame = ttk.Frame(bottom)
+        # not packed until output is ready
+        self._last_final_text = ""
+        self._last_query_text = ""
+        self._last_route      = ""
+
+        _save_hdr = ttk.Frame(self._save_frame)
+        _save_hdr.pack(fill="x", pady=(4, 2))
+        ttk.Label(_save_hdr, text="💾 Save output as:",
+                  foreground="#89b4fa", font=("", 9, "bold")).pack(side="left", padx=4)
+        ttk.Button(_save_hdr, text="📄 Text file (.txt)",
+                   command=self._save_output_txt).pack(side="left", padx=4)
+        ttk.Button(_save_hdr, text="📝 Markdown (.md)",
+                   command=self._save_output_md).pack(side="left", padx=4)
+        ttk.Button(_save_hdr, text="📐 LaTeX (.tex)",
+                   command=self._save_output_latex).pack(side="left", padx=4)
+        ttk.Button(_save_hdr, text="✕",
+                   command=self._hide_save_buttons).pack(side="right", padx=4)
+
+        # ── Clarification panel (hidden until a personality asks a question) ──
+        self._clarif_frame = ttk.Frame(bottom)
+        # Not packed yet — shown only when needed
+
+        _clarif_hdr = ttk.Frame(self._clarif_frame)
+        _clarif_hdr.pack(fill="x")
+        ttk.Label(_clarif_hdr, text="🤔 A personality needs your input:",
+                  foreground="#fab387", font=("", 9, "bold")).pack(side="left", padx=4)
+        self._clarif_question_lbl = ttk.Label(
+            self._clarif_frame, text="", foreground="#cdd6f4",
+            wraplength=700, justify="left")
+        self._clarif_question_lbl.pack(anchor="w", padx=8, pady=(2, 4))
+
+        _clarif_input_row = ttk.Frame(self._clarif_frame)
+        _clarif_input_row.pack(fill="x", padx=4)
+        self._clarif_var = tk.StringVar()
+        _clarif_entry = ttk.Entry(_clarif_input_row, textvariable=self._clarif_var, width=60)
+        _clarif_entry.pack(side="left", padx=2, fill="x", expand=True)
+        _clarif_entry.bind("<Return>", lambda e: self._submit_clarification())
+        ttk.Button(_clarif_input_row, text="Answer  [Enter]",
+                   command=self._submit_clarification).pack(side="left", padx=4)
+        ttk.Button(_clarif_input_row, text="Skip",
+                   command=lambda: self._submit_clarification(skip=True)).pack(side="left")
+
+        self.status = ttk.Label(btns, text="● idle", foreground="#a6e3a1")
+        self.status.pack(side="right")
+        self.tps_label = ttk.Label(btns, text="", foreground="#89b4fa")
+        self.tps_label.pack(side="right", padx=(0, 8))
+        self._agent_label = ttk.Label(btns, text="", foreground="#a6e3a1")
+        self._agent_label.pack(side="right", padx=(0, 6))
+
+        # T2-D: Per-query model override dropdowns
+        override_row = ttk.Frame(bottom)
+        override_row.pack(fill="x", pady=(2, 0))
+        ttk.Label(override_row, text="Override: ", foreground="#6c7086").pack(side="left")
+        _backend_opts = [
+            "(default)", "local_general_primary", "local_general_alt",
+            "local_coder_primary", "local_coder_fast",
+            "local_judge_fast", "local_peasant_fast", "local_fast",
+        ]
+        self._query_overrides: Dict[str, tk.StringVar] = {}
+        for _role in ("writer", "techpriest", "intern", "skeptic", "artist"):
+            ttk.Label(override_row, text=_role[:4] + ":", foreground="#6c7086").pack(side="left")
+            _v = tk.StringVar(value="(default)")
+            self._query_overrides[_role] = _v
+            ttk.Combobox(override_row, textvariable=_v, values=_backend_opts,
+                         width=16, state="readonly").pack(side="left", padx=(0, 6))
+
+    def _register_transcript_tags(self):
+        self.transcript.tag_configure("phase",   foreground=PHASE_COLOR,   font=("Consolas", 9, "italic"))
+        self.transcript.tag_configure("token",   foreground=TOKEN_COLOR)
+        for role, color in ROLE_COLORS.items():
+            tag = f"who_{role.lower().replace('-','_').replace(' ','_')}"
+            self.transcript.tag_configure(tag, foreground=color, font=("Consolas", 10, "bold"))
+        self.transcript.tag_configure("who_default", foreground=DEFAULT_COLOR, font=("Consolas", 10, "bold"))
+        self.transcript.tag_configure("error", foreground="#f38ba8")
+
+    # ---- IDE tab ----
+
+    def _build_ide_tab(self):
+        self.tab_ide = ttk.Frame(self.nb)
+        self.nb.add(self.tab_ide, text="💻 IDE / Runner")
+
+        # Script name bar
+        name_row = ttk.Frame(self.tab_ide)
+        name_row.pack(fill="x", padx=10, pady=(8, 2))
+        ttk.Label(name_row, text="Script:").pack(side="left")
+        self.script_name_var = tk.StringVar(value=self.current_script_name)
+        ttk.Entry(name_row, textvariable=self.script_name_var, width=40).pack(side="left", padx=6)
+        ttk.Button(name_row, text="Apply", command=self._apply_script_name).pack(side="left")
+        ttk.Button(name_row, text="Clear Code", command=lambda: self._set_text(self.ide_code, "")).pack(side="left", padx=6)
+
+        paned = tk.PanedWindow(self.tab_ide, orient="horizontal", bg="#1e1e2e", sashwidth=6)
+        paned.pack(fill="both", expand=True, padx=10, pady=4)
+
+        left = ttk.Frame(paned)
+        paned.add(left, minsize=400)
+
+        ttk.Label(left, text="Code").pack(anchor="w")
+        self.ide_code = self._make_text(left, wrap="none", font=("Consolas", 11))
+        self.ide_code.pack(fill="both", expand=True)
+
+        right = ttk.Frame(paned)
+        paned.add(right, minsize=300)
+
+        ttk.Label(right, text="Output").pack(anchor="w")
+        self.ide_out = self._make_text(right, wrap="word", state="disabled")
+        self.ide_out.tag_configure("stderr", foreground="#f38ba8")
+        self.ide_out.tag_configure("info",   foreground="#89b4fa")
+        self.ide_out.pack(fill="both", expand=True)
+
+        btns = ttk.Frame(self.tab_ide)
+        btns.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Button(btns, text="▶  Run (streaming)", command=self._ide_run_stream).pack(side="left")
+        ttk.Button(btns, text="Run (blocking)",     command=self._ide_run).pack(side="left", padx=6)
+        ttk.Button(btns, text="Snapshot to Vault",  command=self._ide_snapshot).pack(side="left")
+        ttk.Button(btns, text="Clear Output",
+                   command=lambda: self._set_text(self.ide_out, "")).pack(side="left", padx=6)
+
+    # ---- Librarian tab ----
+
+    def _build_librarian_tab(self):
+        self.tab_lib = ttk.Frame(self.nb)
+        self.nb.add(self.tab_lib, text="📚 Librarian")
+
+        top = ttk.Frame(self.tab_lib)
+        top.pack(fill="both", expand=True, padx=10, pady=10)
+
+        left = ttk.Frame(top)
+        left.pack(side="left", fill="both", expand=True)
+
+        ttk.Label(left, text=f"Vault: {VAULT_DIR}").pack(anchor="w")
+
+        self.vault_lb = tk.Listbox(left, bg="#181825", fg="#cdd6f4",
+                                   selectbackground="#585b70", relief="flat",
+                                   font=("Consolas", 10))
+        self.vault_lb.pack(fill="both", expand=True, pady=4)
+        self.vault_lb.bind("<Double-Button-1>", lambda e: self._lib_preview())
+
+        right = ttk.Frame(top)
+        right.pack(side="right", fill="y", padx=(10, 0))
+
+        ttk.Button(right, text="Refresh",       command=self._lib_refresh).pack(fill="x")
+        ttk.Button(right, text="Preview",       command=self._lib_preview).pack(fill="x", pady=4)
+        ttk.Button(right, text="Commit to Git", command=self._lib_commit).pack(fill="x")
+        ttk.Button(right, text="Open Folder",   command=self._lib_open_vault).pack(fill="x", pady=4)
+
+        self._lib_refresh()
+
+    # ---- Sessions tab ----
+
+    def _build_sessions_tab(self):
+        self.tab_sessions = ttk.Frame(self.nb)
+        self.nb.add(self.tab_sessions, text="🕓 Sessions")
+
+        top = ttk.Frame(self.tab_sessions)
+        top.pack(fill="both", expand=True, padx=10, pady=10)
+
+        left = ttk.Frame(top)
+        left.pack(side="left", fill="both", expand=True)
+
+        ttk.Label(left, text="Past Sessions (double-click to load as prior context)").pack(anchor="w")
+        _sf = ttk.Frame(left)
+        _sf.pack(fill="x", pady=(2, 0))
+        ttk.Label(_sf, text="🔍", foreground="#6c7086").pack(side="left")
+        self._session_filter_var = tk.StringVar()
+        self._session_filter_var.trace_add("write", lambda *_: self._sessions_refresh())
+        ttk.Entry(_sf, textvariable=self._session_filter_var).pack(
+            side="left", fill="x", expand=True, padx=(4, 0))
+        self.session_lb = tk.Listbox(left, bg="#181825", fg="#cdd6f4",
+                                     selectbackground="#585b70", relief="flat",
+                                     font=("Consolas", 10))
+        self.session_lb.pack(fill="both", expand=True, pady=4)
+        self.session_lb.bind("<Double-Button-1>", lambda e: self._sessions_load_prior())
+
+        right = ttk.Frame(top)
+        right.pack(side="right", fill="y", padx=(10, 0))
+
+        ttk.Button(right, text="Refresh",           command=self._sessions_refresh).pack(fill="x")
+        ttk.Button(right, text="Load as Prior",     command=self._sessions_load_prior).pack(fill="x", pady=4)
+        ttk.Button(right, text="Preview Session",   command=self._sessions_preview).pack(fill="x")
+        ttk.Button(right, text="Clear Prior",       command=self._sessions_clear_prior).pack(fill="x", pady=4)
+        ttk.Button(right, text="Verdict History",   command=self._show_verdict_history).pack(fill="x", pady=(8,0))
+        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=8)
+        ttk.Button(right, text="📊 Analyse Trends", command=self._sessions_analyse_trends).pack(fill="x")
+
+        self.prior_label = ttk.Label(right, text="Prior: none", wraplength=180)
+        self.prior_label.pack(anchor="w", pady=4)
+
+        ttk.Label(top, text="Session Preview").pack(anchor="w")
+        self.session_preview = self._make_text(self.tab_sessions, wrap="word", height=12, state="disabled")
+        self.session_preview.pack(fill="x", padx=10, pady=(0, 10))
+
+        self._sessions_refresh()
+
+    # ---- Nodes tab ----
+
+    def _build_nodes_tab(self):
+        self.tab_nodes = ttk.Frame(self.nb)
+        self.nb.add(self.tab_nodes, text="🖥 Nodes")
+
+        top = ttk.Frame(self.tab_nodes)
+        top.pack(fill="both", expand=True, padx=10, pady=10)
+
+        ttk.Label(top, text="Ollama Node Status  (auto-refreshes every 15s)").pack(anchor="w")
+
+        cols = ("host", "status", "latency", "active_models", "installed")
+        self.nodes_tree = ttk.Treeview(top, columns=cols, show="headings", height=8)
+        self.nodes_tree.heading("host",          text="Host")
+        self.nodes_tree.heading("status",        text="Status")
+        self.nodes_tree.heading("latency",       text="Latency")
+        self.nodes_tree.heading("active_models", text="Active Models")
+        self.nodes_tree.heading("installed",     text="Installed Models")
+        self.nodes_tree.column("host",          width=220)
+        self.nodes_tree.column("status",        width=80)
+        self.nodes_tree.column("latency",       width=80)
+        self.nodes_tree.column("active_models", width=140)
+        self.nodes_tree.column("installed",     width=400)
+        self.nodes_tree.pack(fill="both", expand=True, pady=4)
+
+        self.nodes_tree.tag_configure("up",   foreground="#a6e3a1")
+        self.nodes_tree.tag_configure("down", foreground="#f38ba8")
+
+        btns = ttk.Frame(top)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Refresh Now", command=self._refresh_nodes_async).pack(side="left")
+        self.nodes_status_label = ttk.Label(btns, text="")
+        self.nodes_status_label.pack(side="left", padx=10)
+
+        # Dispatcher hosts config
+        ttk.Separator(top, orient="horizontal").pack(fill="x", pady=10)
+        hrow = ttk.Frame(top)
+        hrow.pack(fill="x")
+        ttk.Label(hrow, text="Pi hosts (comma-separated URLs):").pack(side="left")
+        self.pi_hosts_var = tk.StringVar(value=", ".join(ce.DEFAULT_PI_HOSTS))
+        ttk.Entry(hrow, textvariable=self.pi_hosts_var, width=50).pack(side="left", padx=6)
+        ttk.Button(hrow, text="Apply & Rebuild Dispatcher",
+                   command=self._apply_pi_hosts).pack(side="left")
+
+    # ---- Agents tab ----
+
+    def _build_agents_tab(self):
+        self.tab_agents = ttk.Frame(self.nb)
+        self.nb.add(self.tab_agents, text="🤖 Agents")
+
+        top = ttk.Frame(self.tab_agents)
+        top.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Status panel
+        status_frame = ttk.LabelFrame(top, text="Agent Status")
+        status_frame.pack(fill="x", pady=(0, 10))
+
+        self.agent_status_vars = {}
+        for name, available in [
+            ("TechPriest Agent (LangGraph loop)", _TECHPRIEST_AGENT_OK),
+            ("Intern Agent (web research)",        _INTERN_AGENT_OK),
+            ("Vault Agent (file tasks, sandboxed)",_VAULT_AGENT_OK),
+            ("Sage (tunable domain expert)",          _SAGE_OK),
+            ("Vault Scraper (web → vault pipeline)",   _SCRAPER_OK),
+            ("Vault RAG (ChromaDB)",               _RAG_OK),
+            ("Dream3D-NX Domain Patch",            _D3D_PATCH_OK),
+            ("Dream3D simplnx Primer",                _DREAM3D_OK),
+        ]:
+            row = ttk.Frame(status_frame)
+            row.pack(fill="x", padx=6, pady=2)
+            color = "#a6e3a1" if available else "#f38ba8"
+            icon = "✓" if available else "✗"
+            ttk.Label(row, text=f"{icon} {name}", foreground=color).pack(side="left")
+
+        # Controls
+        ctrl_frame = ttk.LabelFrame(top, text="Controls")
+        ctrl_frame.pack(fill="x", pady=(0, 10))
+
+        self.var_use_techpriest_agent = tk.BooleanVar(value=_TECHPRIEST_AGENT_OK)
+        self.var_use_intern_agent     = tk.BooleanVar(value=_INTERN_AGENT_OK)
+        self.var_use_rag              = tk.BooleanVar(value=_RAG_OK)
+
+        ttk.Checkbutton(ctrl_frame, text="Use TechPriest coding agent (self-correcting loop)",
+                        variable=self.var_use_techpriest_agent,
+                        state="normal" if _TECHPRIEST_AGENT_OK else "disabled").pack(anchor="w", padx=6, pady=2)
+        ttk.Checkbutton(ctrl_frame, text="Use Intern web research agent",
+                        variable=self.var_use_intern_agent,
+                        state="normal" if _INTERN_AGENT_OK else "disabled").pack(anchor="w", padx=6, pady=2)
+        ttk.Checkbutton(ctrl_frame, text="Use RAG context for Writer",
+                        variable=self.var_use_rag,
+                        state="normal" if _RAG_OK else "disabled").pack(anchor="w", padx=6, pady=2)
+
+        btns = ttk.Frame(ctrl_frame)
+        btns.pack(fill="x", padx=6, pady=4)
+        ttk.Button(btns, text="Re-index Vault Now",
+                   command=lambda: threading.Thread(target=self._init_rag_index, daemon=True).start()
+                   ).pack(side="left")
+
+        if _RAG_OK:
+            self.rag_count_label = ttk.Label(btns, text="")
+            self.rag_count_label.pack(side="left", padx=10)
+            self._update_rag_count_label()
+        
+        # Install instructions
+        install_frame = ttk.LabelFrame(top, text="Install missing dependencies")
+        install_frame.pack(fill="x", pady=(0, 10))
+        
+        install_text = (
+            "pip install langgraph langchain-ollama          # TechPriest agent\n"
+            "pip install crawl4ai && crawl4ai-setup          # Intern web research\n"
+            "pip install chromadb sentence-transformers      # Vault RAG\n"
+        )
+        lbl = tk.Text(install_frame, height=4, wrap="none", font=("Consolas", 10))
+        lbl.insert("1.0", install_text)
+        lbl.configure(state="disabled", bg="#181825", fg="#89b4fa",
+                      relief="flat", bd=0)
+        lbl.pack(fill="x", padx=6, pady=4)
+
+        # Live agent log
+        ttk.Label(top, text="Agent Event Log").pack(anchor="w")
+        self.agent_log = self._make_text(top, wrap="word", height=8, state="disabled")
+        self.agent_log.tag_configure("phase",   foreground="#89b4fa")
+        self.agent_log.tag_configure("result",  foreground="#a6e3a1")
+        self.agent_log.tag_configure("fail",    foreground="#f38ba8")
+        self.agent_log.pack(fill="x")
+
+        # ── Sage Tuning panel ──────────────────────────────────
+        ttk.Separator(self.tab_agents, orient="horizontal").pack(fill="x", padx=8, pady=6)
+        if _SAGE_OK and getattr(self, "sage_agent_obj", None) is not None:
+            sage_panel = sa.SageTuningPanel(
+                self.tab_agents,
+                sage_agent=self.sage_agent_obj,
+                refresh_cb=None,
+            )
+            sage_panel.pack(fill="x", padx=6, pady=(0,4))
+        elif not _SAGE_OK:
+            ttk.Label(self.tab_agents,
+                text="🧙 Sage not available — place sage_agent.py next to council_gui_engine.py",
+                foreground="#6c7086",
+            ).pack(padx=10, pady=4, anchor="w")
+
+        # ── Vault Agent panel ──────────────────────────────────
+        ttk.Separator(self.tab_agents, orient="horizontal").pack(fill="x", padx=8, pady=6)
+        if _VAULT_AGENT_OK:
+            def _get_personality(role: str):
+                pm_map = {
+                    "writer":     getattr(self, "writer",     None),
+                    "techpriest": getattr(self, "techpriest", None),
+                    "judge":      getattr(self, "judge",      None),
+                    "intern":     getattr(self, "intern",     None),
+                    "peasant":    getattr(self, "peasant",    None),
+                }
+                return pm_map.get(role)
+            vault_panel = va.VaultAgentPanel(
+                self.tab_agents,
+                get_personality_fn=_get_personality,
+                vault_dir=VAULT_DIR,
+            )
+            vault_panel.pack(fill="both", expand=True)
+        else:
+            ttk.Label(self.tab_agents,
+                text="🗂  Vault Agent not available — place vault_agent.py next to council_gui_engine.py",
+                foreground="#6c7086",
+            ).pack(padx=10, pady=10, anchor="w")
+
+    def _update_rag_count_label(self):
+        if self.rag and hasattr(self, "rag_count_label"):
+            count = self.rag.collection_count()
+            self.rag_count_label.configure(text=f"Chunks indexed: {count}")
+
+    def _agent_log_append(self, phase: str, msg: str):
+        self.agent_log.configure(state="normal")
+        tag = "result" if "PASS" in msg or "✓" in msg else ("fail" if "FAIL" in msg or "error" in msg.lower() else "phase")
+        self.agent_log.insert("end", f"[{phase}] {msg}\n", tag)
+        self.agent_log.see("end")
+        self.agent_log.configure(state="disabled")
+
+    # ---- Composer tab ----
+
+    def _build_composer_tab(self):
+        self.tab_composer = ttk.Frame(self.nb)
+        self.nb.add(self.tab_composer, text="🎵 Composer")
+
+        # ── Top controls ──────────────────────────────────────
+        ctrl = ttk.Frame(self.tab_composer)
+        ctrl.pack(fill="x", padx=10, pady=8)
+
+        # Status label
+        status_color = "#a6e3a1" if _COMPOSER_OK else "#f38ba8"
+        status_text  = "✓ Composer ready" if _COMPOSER_OK else "✗ music_blocks.py / mido / music21 not found"
+        ttk.Label(ctrl, text=status_text, foreground=status_color).pack(anchor="w")
+
+        if not _COMPOSER_OK:
+            ttk.Label(ctrl,
+                text="Install: pip install mido music21\n"
+                     "Then place music_blocks.py, music_renderer.py, composer_personality.py alongside council_engine.py",
+                foreground="#89b4fa").pack(anchor="w", pady=4)
+
+        # Prompt row
+        prompt_row = ttk.Frame(self.tab_composer)
+        prompt_row.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(prompt_row, text="Prompt:").pack(side="left")
+        self.composer_prompt = tk.Text(prompt_row, height=3, wrap="word",
+                                       font=("Consolas", 11),
+                                       bg="#1e1e2e", fg="#cdd6f4",
+                                       insertbackground="#cdd6f4")
+        self.composer_prompt.pack(side="left", fill="x", expand=True, padx=(6, 0))
+        self.composer_prompt.insert("1.0", "dark jazz ballad, slow tempo, minor key, moody")
+
+        # Button row
+        btn_row = ttk.Frame(self.tab_composer)
+        btn_row.pack(fill="x", padx=10, pady=(0, 8))
+        ttk.Button(btn_row, text="🎼 Compose",
+                   command=self._composer_compose).pack(side="left")
+        ttk.Button(btn_row, text="💾 Export MIDI",
+                   command=self._composer_export_midi).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="🎵 Export MusicXML",
+                   command=self._composer_export_xml).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="🔊 Render WAV",
+                   command=self._composer_render_wav).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="🗂 Open Output Folder",
+                   command=self._composer_open_folder).pack(side="left", padx=4)
+
+        # Main paned area
+        paned = tk.PanedWindow(self.tab_composer, orient="horizontal",
+                               bg="#1e1e2e", sashwidth=6)
+        paned.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        # Left: block library browser
+        lib_frame = ttk.LabelFrame(paned, text="Block Library")
+        paned.add(lib_frame, width=280)
+
+        self.block_tree = ttk.Treeview(lib_frame, show="tree headings",
+                                       selectmode="browse")
+        self.block_tree.pack(fill="both", expand=True, padx=4, pady=4)
+        self._refresh_block_tree()
+
+        # Right: composition plan + log
+        right = ttk.Frame(paned)
+        paned.add(right)
+
+        ttk.Label(right, text="Composition Plan (JSON)").pack(anchor="w")
+        self.composer_plan_box = self._make_text(right, height=18, wrap="none")
+        self.composer_plan_box.pack(fill="both", expand=True)
+
+        ttk.Label(right, text="Composer Log").pack(anchor="w", pady=(6, 0))
+        self.composer_log = self._make_text(right, height=6, wrap="word",
+                                            state="disabled")
+        self.composer_log.tag_configure("ok",    foreground="#a6e3a1")
+        self.composer_log.tag_configure("err",   foreground="#f38ba8")
+        self.composer_log.tag_configure("info",  foreground="#89b4fa")
+        self.composer_log.pack(fill="x")
+
+        # State
+        self._current_plan: Optional[Any] = None
+        self._composer_output_dir = VAULT_DIR / "music_output"
+
+    def _composer_log_append(self, msg: str, tag: str = "info"):
+        self.composer_log.configure(state="normal")
+        self.composer_log.insert("end", msg + "\n", tag)
+        self.composer_log.see("end")
+        self.composer_log.configure(state="disabled")
+
+    def _refresh_block_tree(self):
+        if not _COMPOSER_OK or self.block_library is None:
+            return
+        self.block_tree.delete(*self.block_tree.get_children())
+        catalogue = self.block_library.list_blocks()
+        for btype, names in catalogue.items():
+            parent = self.block_tree.insert("", "end", text=btype.upper(),
+                                             open=True)
+            for name in names:
+                self.block_tree.insert(parent, "end", text=name)
+
+    def _composer_compose(self):
+        if not _COMPOSER_OK or self.composer_personality is None:
+            self._composer_log_append("Composer not available.", "err")
+            return
+        prompt = self.composer_prompt.get("1.0", "end").strip()
+        if not prompt:
+            return
+
+        self._composer_log_append(f"Composing: {prompt[:60]}…", "info")
+        self.composer_plan_box.delete("1.0", "end")
+
+        def worker():
+            try:
+                result = self.composer_personality.compose(prompt)
+                self.ui_q.put(("composer_result", result))
+            except Exception as e:
+                self.ui_q.put(("composer_error", str(e)))
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _composer_export_midi(self):
+        if self._current_plan is None:
+            self._composer_log_append("No plan — compose first.", "err")
+            return
+        if not _COMPOSER_OK:
+            return
+        try:
+            self._composer_output_dir.mkdir(parents=True, exist_ok=True)
+            renderer = mr.MidiRenderer()
+            safe = "".join(c if c.isalnum() or c in "_ -" else "_"
+                           for c in self._current_plan.title)[:50]
+            path = self._composer_output_dir / f"{safe}.mid"
+            renderer.render(self._current_plan, path)
+            self._composer_log_append(f"✓ MIDI saved: {path}", "ok")
+        except Exception as e:
+            self._composer_log_append(f"✗ MIDI export failed: {e}", "err")
+
+    def _composer_export_xml(self):
+        if self._current_plan is None:
+            self._composer_log_append("No plan — compose first.", "err")
+            return
+        if not _COMPOSER_OK:
+            return
+        try:
+            self._composer_output_dir.mkdir(parents=True, exist_ok=True)
+            renderer = mr.MusicXMLRenderer()
+            safe = "".join(c if c.isalnum() or c in "_ -" else "_"
+                           for c in self._current_plan.title)[:50]
+            path = self._composer_output_dir / f"{safe}.musicxml"
+            renderer.render(self._current_plan, path)
+            self._composer_log_append(f"✓ MusicXML saved: {path}", "ok")
+        except Exception as e:
+            self._composer_log_append(f"✗ MusicXML export failed: {e}", "err")
+
+    def _composer_render_wav(self):
+        if self._current_plan is None:
+            self._composer_log_append("No plan — compose first.", "err")
+            return
+        if not _COMPOSER_OK:
+            return
+        self._composer_log_append("Rendering WAV (exporting MIDI first)…", "info")
+        try:
+            self._composer_output_dir.mkdir(parents=True, exist_ok=True)
+            wav_r = mr.WavRenderer()
+            if not wav_r.available():
+                self._composer_log_append(
+                    f"⚠ WAV unavailable: {wav_r.soundfont_status()}\n"
+                    "Download a free .sf2 soundfont and place at:\n"
+                    "  C:/soundfonts/GeneralUser_GS.sf2", "err")
+                return
+            midi_r = mr.MidiRenderer()
+            safe = "".join(c if c.isalnum() or c in "_ -" else "_"
+                           for c in self._current_plan.title)[:50]
+            midi_path = self._composer_output_dir / f"{safe}.mid"
+            midi_r.render(self._current_plan, midi_path)
+            wav_path = self._composer_output_dir / f"{safe}.wav"
+            wav_r.render(midi_path, wav_path)
+            self._composer_log_append(f"✓ WAV saved: {wav_path}", "ok")
+        except Exception as e:
+            self._composer_log_append(f"✗ WAV render failed: {e}", "err")
+
+    def _composer_open_folder(self):
+        import subprocess, sys
+        folder = self._composer_output_dir
+        folder.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", str(folder)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(folder)])
+        else:
+            subprocess.Popen(["xdg-open", str(folder)])
+
+    # ---- Grapher tab ----
+
+    def _build_grapher_tab(self):
+        import tkinter as tk
+        self.tab_grapher = ttk.Frame(self.nb)
+        self.nb.add(self.tab_grapher, text="\U0001f4ca Grapher")
+        self._grapher_live_reload_var = tk.BooleanVar(value=False)  # #8 live-reload
+
+        # State
+        self._grapher_dataset      = None
+        self._grapher_spec         = None
+        self._analyst_personality  = None
+        self._grapher_file_paths   = []
+        self._last_html_path       = None
+        self._grapher_output_dir   = VAULT_DIR / "graph_output"
+        self._grapher_plot_history  = []          # [(label, Path), ...]  — #1 history/pin
+        self._grapher_transforms    = []          # [{"op":..,"cols":[],"params":{}}]  — #4
+        self._grapher_live_job      = None        # after() id for live-reload  — #8
+        self._grapher_overlay_ds    = None        # second DataSet for overlay  — #10
+        self._grapher_overlay_paths = []          # overlay file path list  — #10
+
+        if _GRAPHER_OK:
+            try:
+                self._analyst_personality = gp.AnalystPersonality(
+                    personality_model=self.writer,
+                    event_callback=lambda ph, msg: self.ui_q.put(("grapher_event", ph, msg)),
+                )
+                gp.patch_routing(ce)
+            except Exception as e:
+                print(f"[Grapher] Analyst init failed: {e}")
+
+        # ── Outer horizontal split ────────────────────────────────────────────
+        main_pane = tk.PanedWindow(self.tab_grapher, orient="horizontal",
+                                   bg="#1e1e2e", sashwidth=6)
+        main_pane.pack(fill="both", expand=True, padx=6, pady=6)
+
+        # ─────────────────────────────────────────────────────────────────────
+        # LEFT: file browser + scrollable settings
+        # ─────────────────────────────────────────────────────────────────────
+        left_outer = ttk.Frame(main_pane)
+        main_pane.add(left_outer, width=340)
+
+        # ── File browser ──────────────────────────────────────────────────────
+        fb = ttk.LabelFrame(left_outer, text="Data File")
+        fb.pack(fill="x", padx=4, pady=(4, 4))
+
+        fl1 = ttk.Frame(fb)
+        fl1.pack(fill="x", padx=6, pady=(4, 2))
+        ttk.Label(fl1, text="Vault:", width=6).pack(side="left")
+        self._grapher_file_var = tk.StringVar()
+        self._grapher_file_cb  = ttk.Combobox(
+            fl1, textvariable=self._grapher_file_var, width=28, state="readonly")
+        self._grapher_file_cb.pack(side="left", padx=4, fill="x", expand=True)
+        self._grapher_file_cb.bind("<<ComboboxSelected>>", self._grapher_load_file)
+        ttk.Button(fl1, text="\u27f3", width=2,
+                   command=self._grapher_refresh_files).pack(side="left")
+
+        fl2 = ttk.Frame(fb)
+        fl2.pack(fill="x", padx=6, pady=(0, 2))
+        ttk.Button(fl2, text="\U0001f4c2 Browse\u2026",
+                   command=self._grapher_browse_file).pack(side="left")
+        ttk.Label(fl2, text="Sheet:", foreground="#a6adc8").pack(side="left", padx=(10, 2))
+        self._grapher_sheet_var = tk.StringVar()
+        self._grapher_sheet_cb  = ttk.Combobox(
+            fl2, textvariable=self._grapher_sheet_var, width=12, state="readonly")
+        self._grapher_sheet_cb.pack(side="left")
+        self._grapher_sheet_cb.bind("<<ComboboxSelected>>", self._grapher_reload_sheet)
+
+        self._grapher_status_var = tk.StringVar(value="No file loaded")
+        ttk.Label(fb, textvariable=self._grapher_status_var,
+                  foreground="#89b4fa", wraplength=300,
+                  justify="left").pack(anchor="w", padx=6, pady=(0, 4))
+
+        # ── Live-reload (#8) + overlay file (#10) ─────────────────────────────
+        fl3 = ttk.Frame(fb)
+        fl3.pack(fill="x", padx=6, pady=(0, 2))
+        ttk.Checkbutton(
+            fl3, text="\U0001f504 Live reload",
+            variable=self._grapher_live_reload_var,
+            command=self._grapher_live_toggle,
+        ).pack(side="left")
+        self._grapher_live_interval_var = tk.IntVar(value=5)
+        ttk.Spinbox(fl3, from_=1, to=120, textvariable=self._grapher_live_interval_var,
+                    width=4).pack(side="left", padx=2)
+        ttk.Label(fl3, text="s", foreground="#a6adc8").pack(side="left")
+
+        fl4 = ttk.Frame(fb)
+        fl4.pack(fill="x", padx=6, pady=(0, 6))
+        ttk.Label(fl4, text="Overlay:", foreground="#a6adc8", width=7).pack(side="left")
+        self._grapher_overlay_var = tk.StringVar(value="(none)")
+        self._grapher_overlay_cb  = ttk.Combobox(
+            fl4, textvariable=self._grapher_overlay_var, width=20, state="readonly")
+        self._grapher_overlay_cb.pack(side="left", padx=4, fill="x", expand=True)
+        self._grapher_overlay_cb.bind("<<ComboboxSelected>>", self._grapher_overlay_load)
+        ttk.Button(fl4, text="\U0001f4c2", width=2,
+                   command=self._grapher_overlay_browse).pack(side="left")
+
+        # ── Scrollable settings ───────────────────────────────────────────────
+        ctrl_frame = ttk.Frame(left_outer)
+        ctrl_frame.pack(fill="both", expand=True, padx=4)
+
+        ctrl_canvas = tk.Canvas(ctrl_frame, bg="#1e1e2e", highlightthickness=0)
+        ctrl_scroll  = ttk.Scrollbar(ctrl_frame, orient="vertical",
+                                      command=ctrl_canvas.yview)
+        self._ctrl_inner = ttk.Frame(ctrl_canvas)
+        self._ctrl_inner.bind(
+            "<Configure>",
+            lambda e: ctrl_canvas.configure(scrollregion=ctrl_canvas.bbox("all")))
+        ctrl_canvas.create_window((0, 0), window=self._ctrl_inner, anchor="nw")
+        ctrl_canvas.configure(yscrollcommand=ctrl_scroll.set)
+        ctrl_scroll.pack(side="right", fill="y")
+        ctrl_canvas.pack(side="left", fill="both", expand=True)
+
+        def _mw_enter(e):
+            ctrl_canvas.bind_all(
+                "<MouseWheel>",
+                lambda ev: ctrl_canvas.yview_scroll(-1 * (ev.delta // 120), "units"))
+        def _mw_leave(e):
+            ctrl_canvas.unbind_all("<MouseWheel>")
+        ctrl_canvas.bind("<Enter>", _mw_enter)
+        ctrl_canvas.bind("<Leave>", _mw_leave)
+
+        ci = self._ctrl_inner
+
+        # ── Plot type ─────────────────────────────────────────────────────────
+        ttk.Label(ci, text="Plot Type",
+                  font=("", 10, "bold")).pack(anchor="w", pady=(8, 2), padx=6)
+
+        PLOT_GROUPS = {
+            "Basic":       ["line", "bar", "scatter", "histogram", "pie", "area"],
+            "Statistical": ["box", "violin", "heatmap", "correlation",
+                            "distribution", "density_2d", "parallel_coords"],
+            "Scientific":  ["fft", "spectrogram", "polar", "contour",
+                            "surface_3d", "scatter_3d"],
+            "Time Series": ["timeseries", "rolling_mean", "trend", "anomaly"],
+            "Dimensional": ["pca"],
+        }
+        self._plot_type_var = tk.StringVar(value="line")
+        for group, types in PLOT_GROUPS.items():
+            ttk.Label(ci, text=group, foreground="#89b4fa",
+                      font=("", 9, "bold")).pack(anchor="w", padx=8, pady=(4, 0))
+            fr = ttk.Frame(ci)
+            fr.pack(fill="x", padx=8)
+            for col_n, pt in enumerate(types):
+                ttk.Radiobutton(
+                    fr, text=pt, value=pt,
+                    variable=self._plot_type_var,
+                    command=self._grapher_update_controls,
+                ).grid(row=col_n // 2, column=col_n % 2, sticky="w", padx=2)
+
+        ttk.Separator(ci, orient="horizontal").pack(fill="x", padx=6, pady=6)
+
+        # ── Column selectors ──────────────────────────────────────────────────
+        ttk.Label(ci, text="Columns",
+                  font=("", 10, "bold")).pack(anchor="w", padx=6, pady=(0, 2))
+
+        def _col_row(parent, label, var_name):
+            fr = ttk.Frame(parent)
+            fr.pack(fill="x", padx=6, pady=1)
+            ttk.Label(fr, text=label, width=10).pack(side="left")
+            var = tk.StringVar(value="\u2014")
+            cb  = ttk.Combobox(fr, textvariable=var, width=18, state="readonly")
+            cb.pack(side="left", padx=4)
+            setattr(self, var_name + "_var", var)
+            setattr(self, var_name + "_cb",  cb)
+
+        _col_row(ci, "X axis:",    "_gx")
+        _col_row(ci, "Y axis:",    "_gy")
+        _col_row(ci, "Z axis:",    "_gz")
+        _col_row(ci, "Color by:",  "_gc")
+        _col_row(ci, "Size by:",   "_gs")
+        # ── Faceting (#6) ────────────────────────────────────────────────────
+        _col_row(ci, "Facet col:", "_gfacet_col")
+        _col_row(ci, "Facet row:", "_gfacet_row")
+
+        ttk.Label(ci, text="Multi-column (Ctrl+click):",
+                  foreground="#a6adc8").pack(anchor="w", padx=6, pady=(6, 0))
+        self._gcols_lb = tk.Listbox(
+            ci, selectmode="multiple", height=5,
+            bg="#313244", fg="#cdd6f4",
+            selectbackground="#585b70", exportselection=False)
+        self._gcols_lb.pack(fill="x", padx=6)
+
+        ttk.Separator(ci, orient="horizontal").pack(fill="x", padx=6, pady=6)
+
+        # ── Options ───────────────────────────────────────────────────────────
+        ttk.Label(ci, text="Options",
+                  font=("", 10, "bold")).pack(anchor="w", padx=6, pady=(0, 2))
+
+        def _spin_row(parent, label, var_name, from_, to_, default):
+            fr = ttk.Frame(parent)
+            fr.pack(fill="x", padx=6, pady=1)
+            ttk.Label(fr, text=label, width=16).pack(side="left")
+            var = tk.IntVar(value=default)
+            ttk.Spinbox(fr, from_=from_, to=to_, textvariable=var, width=8).pack(side="left")
+            setattr(self, var_name, var)
+
+        def _float_row(parent, label, var_name, default):
+            fr = ttk.Frame(parent)
+            fr.pack(fill="x", padx=6, pady=1)
+            ttk.Label(fr, text=label, width=16).pack(side="left")
+            var = tk.StringVar(value=str(default))
+            ttk.Entry(fr, textvariable=var, width=10).pack(side="left")
+            setattr(self, var_name, var)
+
+        def _combo_row(parent, label, var_name, values, default):
+            fr = ttk.Frame(parent)
+            fr.pack(fill="x", padx=6, pady=1)
+            ttk.Label(fr, text=label, width=16).pack(side="left")
+            var = tk.StringVar(value=default)
+            ttk.Combobox(fr, textvariable=var, values=values,
+                         width=14, state="readonly").pack(side="left")
+            setattr(self, var_name, var)
+
+        _spin_row(ci,  "Histogram bins:",  "_gopt_bins",        5,   500,  30)
+        _spin_row(ci,  "Rolling window:",  "_gopt_window",      2,  1000,  10)
+        _spin_row(ci,  "Trend degree:",    "_gopt_trend",       1,     6,   1)
+        _float_row(ci, "Anomaly \u03c3:",  "_gopt_sigma",                    3.0)
+        _float_row(ci, "Sample rate Hz:",  "_gopt_samplerate",               1.0)
+        _spin_row(ci,  "Marker size:",     "_gopt_marker",      1,    30,   6)
+        _spin_row(ci,  "Line width:",      "_gopt_lw",          1,    10,   2)
+        _float_row(ci, "Opacity:",         "_gopt_opacity",                  0.85)
+
+        _combo_row(ci, "Colour scheme:", "_gopt_cscheme",
+                   ["viridis", "plasma", "inferno", "magma", "Blues", "Reds",
+                    "RdBu_r", "RdYlGn", "spectral", "YlOrRd", "Greens"],
+                   "viridis")
+        _combo_row(ci, "Plotly theme:", "_gopt_theme",
+                   ["plotly_dark", "plotly", "ggplot2", "seaborn",
+                    "simple_white", "presentation"],
+                   "plotly_dark")
+        _float_row(ci, "Title:", "_gopt_title", "")
+
+        ttk.Separator(ci, orient="horizontal").pack(fill="x", padx=6, pady=6)
+
+        # ── Transform pipeline (#4) ───────────────────────────────────────────
+        ttk.Label(ci, text="Transforms",
+                  font=("", 10, "bold")).pack(anchor="w", padx=6, pady=(0, 2))
+        self._gtransform_lb = tk.Listbox(
+            ci, height=3, bg="#313244", fg="#a6e3a1",
+            selectbackground="#585b70", exportselection=False)
+        self._gtransform_lb.pack(fill="x", padx=6)
+        tf_btn_fr = ttk.Frame(ci)
+        tf_btn_fr.pack(fill="x", padx=6, pady=(2, 0))
+        for _op in ("normalize", "log", "standardize", "clip"):
+            ttk.Button(
+                tf_btn_fr, text=_op,
+                command=lambda o=_op: self._grapher_transform_add(o),
+            ).pack(side="left", padx=1)
+        ttk.Button(tf_btn_fr, text="✕ clear",
+                   command=self._grapher_transform_clear).pack(side="right")
+
+        ttk.Separator(ci, orient="horizontal").pack(fill="x", padx=6, pady=6)
+
+        # ── Plot / export buttons ─────────────────────────────────────────────
+        ttk.Button(ci, text="\u25b6  Plot (Interactive)",
+                   command=self._grapher_plot_interactive).pack(fill="x", padx=6, pady=2)
+
+        btn_row2 = ttk.Frame(ci)
+        btn_row2.pack(fill="x", padx=6, pady=2)
+        ttk.Button(btn_row2, text="\U0001f4cc Pin plot",
+                   command=self._grapher_pin_plot).pack(side="left", expand=True, fill="x")
+        ttk.Button(btn_row2, text="\U0001f3a4 Narrate",
+                   command=self._grapher_narrate).pack(side="left", padx=2)
+
+        btn_exp = ttk.Frame(ci)
+        btn_exp.pack(fill="x", padx=6, pady=2)
+        ttk.Button(btn_exp, text="\U0001f5bc Export PNG",
+                   command=lambda: self._grapher_export("png")).pack(
+                       side="left", expand=True, fill="x")
+        ttk.Button(btn_exp, text="PDF",
+                   command=lambda: self._grapher_export("pdf")).pack(side="left", padx=2)
+        ttk.Button(btn_exp, text="SVG",
+                   command=lambda: self._grapher_export("svg")).pack(side="left")
+
+        ttk.Separator(ci, orient="horizontal").pack(fill="x", padx=6, pady=6)
+
+        # ── AI Assist ─────────────────────────────────────────────────────────
+        ttk.Label(ci, text="AI Assist",
+                  font=("", 10, "bold")).pack(anchor="w", padx=6)
+        ttk.Label(ci, text="Describe what you want to visualise:",
+                  foreground="#a6adc8", font=("", 9)).pack(anchor="w", padx=6)
+
+        self._gai_prompt = tk.Text(
+            ci, height=3, wrap="word",
+            font=("Consolas", 10), bg="#1e1e2e", fg="#cdd6f4",
+            insertbackground="#cdd6f4")
+        self._gai_prompt.pack(fill="x", padx=6, pady=(2, 4))
+        self._gai_prompt.insert("1.0", "Show me the distribution of all numeric columns")
+
+        mode_fr = ttk.Frame(ci)
+        mode_fr.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(mode_fr, text="Mode:", width=6).pack(side="left")
+        self._gai_mode_var = tk.StringVar(value="analyst")
+        ttk.Radiobutton(mode_fr, text="Analyst (fast)",
+                        value="analyst",
+                        variable=self._gai_mode_var).pack(side="left", padx=4)
+        ttk.Radiobutton(mode_fr, text="Full Council",
+                        value="council",
+                        variable=self._gai_mode_var).pack(side="left", padx=4)
+
+        ttk.Button(ci, text="\U0001f916 Ask AI to plot",
+                   command=self._grapher_ai_plot).pack(fill="x", padx=6, pady=2)
+        ttk.Button(ci, text="\U0001f4ca Quick stats summary",
+                   command=self._grapher_quick_stats).pack(fill="x", padx=6, pady=2)
+        ttk.Button(ci, text="\U0001f4ca Plot council table",
+                   command=self._grapher_plot_council_table).pack(fill="x", padx=6, pady=2)
+
+        ttk.Separator(ci, orient="horizontal").pack(fill="x", padx=6, pady=6)
+
+        # ── Presets (#2) ──────────────────────────────────────────────────────
+        ttk.Label(ci, text="Presets",
+                  font=("", 10, "bold")).pack(anchor="w", padx=6, pady=(0, 2))
+        pr_fr = ttk.Frame(ci)
+        pr_fr.pack(fill="x", padx=6, pady=(0, 2))
+        self._gpreset_var = tk.StringVar(value="")
+        self._gpreset_cb  = ttk.Combobox(
+            pr_fr, textvariable=self._gpreset_var, width=18, state="readonly")
+        self._gpreset_cb.pack(side="left", fill="x", expand=True)
+        ttk.Button(pr_fr, text="\U0001f4be Save",
+                   command=self._grapher_save_preset).pack(side="left", padx=2)
+        ttk.Button(pr_fr, text="\U0001f4c2 Load",
+                   command=self._grapher_load_preset).pack(side="left")
+        self._grapher_refresh_presets()
+
+        # ─────────────────────────────────────────────────────────────────────
+        # RIGHT: plot view + stats/AI output
+        # ─────────────────────────────────────────────────────────────────────
+        right_pane = tk.PanedWindow(main_pane, orient="vertical",
+                                    bg="#1e1e2e", sashwidth=5)
+        main_pane.add(right_pane)
+
+        plot_frame = ttk.Frame(right_pane)
+        right_pane.add(plot_frame, height=480)
+
+        self._grapher_plot_label_var = tk.StringVar(value="")
+        ttk.Label(plot_frame, textvariable=self._grapher_plot_label_var,
+                  foreground="#a6e3a1").pack(anchor="w", padx=4)
+
+        self._grapher_web_frame = None
+        if _TKWEB_OK:
+            try:
+                self._grapher_web_frame = tkinterweb.HtmlFrame(
+                    plot_frame, messages_enabled=False)
+                self._grapher_web_frame.pack(fill="both", expand=True)
+            except Exception:
+                self._grapher_web_frame = None
+
+        if self._grapher_web_frame is None:
+            ttk.Label(
+                plot_frame,
+                text="Interactive plots open in your browser.\n"
+                     "Install tkinterweb for embedded view:\n"
+                     "  pip install tkinterweb",
+                foreground="#89b4fa", font=("", 11),
+            ).pack(expand=True)
+            ttk.Button(
+                plot_frame, text="\U0001f310 Open last plot in browser",
+                command=self._grapher_open_in_browser,
+            ).pack(pady=8)
+
+        stats_frame = ttk.LabelFrame(right_pane, text="Stats & AI Analysis")
+        right_pane.add(stats_frame, height=180)
+        self._grapher_stats = self._make_text(
+            stats_frame, height=8, wrap="word", state="disabled")
+        self._grapher_stats.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # ── Plot history (#1) ─────────────────────────────────────────────────
+        hist_frame = ttk.LabelFrame(right_pane, text="\U0001f4cc Plot History")
+        right_pane.add(hist_frame, height=120)
+        hist_top = ttk.Frame(hist_frame)
+        hist_top.pack(fill="x", padx=4, pady=2)
+        ttk.Button(hist_top, text="\U0001f5c2 Open",
+                   command=self._grapher_history_open).pack(side="left")
+        ttk.Button(hist_top, text="\u2715 Clear history",
+                   command=self._grapher_history_clear).pack(side="left", padx=4)
+        self._grapher_history_lb = tk.Listbox(
+            hist_frame, height=4, bg="#313244", fg="#cdd6f4",
+            selectbackground="#585b70", exportselection=False)
+        self._grapher_history_lb.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        self._grapher_history_lb.bind("<Double-Button-1>", lambda e: self._grapher_history_open())
+
+        # ── Correlation drill (#9) ────────────────────────────────────────────
+        corr_frame = ttk.LabelFrame(right_pane, text="\U0001f50e Correlation Drill")
+        right_pane.add(corr_frame, height=80)
+        corr_row = ttk.Frame(corr_frame)
+        corr_row.pack(fill="x", padx=4, pady=4)
+        ttk.Label(corr_row, text="Col A:", width=7).pack(side="left")
+        self._gcorr_a_var = tk.StringVar(value="\u2014")
+        self._gcorr_a_cb  = ttk.Combobox(corr_row, textvariable=self._gcorr_a_var,
+                                          width=12, state="readonly")
+        self._gcorr_a_cb.pack(side="left", padx=2)
+        ttk.Label(corr_row, text="Col B:", width=6).pack(side="left", padx=(8, 0))
+        self._gcorr_b_var = tk.StringVar(value="\u2014")
+        self._gcorr_b_cb  = ttk.Combobox(corr_row, textvariable=self._gcorr_b_var,
+                                          width=12, state="readonly")
+        self._gcorr_b_cb.pack(side="left", padx=2)
+        ttk.Button(corr_row, text="\U0001f50d Drill",
+                   command=self._grapher_corr_drill).pack(side="left", padx=6)
+
+        self._grapher_refresh_files()
+
+    # ── Grapher helpers ───────────────────────────────────────────────────────
+
+    def _grapher_refresh_files(self):
+        if not _GRAPHER_OK:
+            return
+        files  = gd.scan_vault_for_data(VAULT_DIR)
+        labels = [str(p.relative_to(VAULT_DIR)) for p in files]
+        self._grapher_file_cb["values"] = labels
+        self._grapher_file_paths        = files
+        n = len(files)
+        self._grapher_status_var.set(
+            f"{n} data file{'s' if n != 1 else ''} in vault")
+
+    def _grapher_browse_file(self):
+        import tkinter.filedialog as fd
+        path_str = fd.askopenfilename(
+            title="Open data file",
+            filetypes=[
+                ("All supported",
+                 "*.csv *.tsv *.xlsx *.xls *.json *.npy *.npz *.txt *.log"),
+                ("CSV/TSV",  "*.csv *.tsv"),
+                ("Excel",    "*.xlsx *.xls"),
+                ("JSON",     "*.json"),
+                ("NumPy",    "*.npy *.npz"),
+                ("Text/Log", "*.txt *.log"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path_str:
+            return
+        p = Path(path_str)
+        label    = str(p)
+        existing = list(self._grapher_file_cb["values"])
+        if label not in existing:
+            existing.append(label)
+            self._grapher_file_cb["values"] = existing
+            self._grapher_file_paths.append(p)
+        self._grapher_file_var.set(label)
+        self._grapher_do_load(p)
+
+    def _grapher_load_file(self, event=None):
+        if not _GRAPHER_OK:
+            return
+        sel = self._grapher_file_var.get()
+        if not sel:
+            return
+        for p in self._grapher_file_paths:
+            try:
+                rel = str(p.relative_to(VAULT_DIR))
+            except ValueError:
+                rel = str(p)
+            if rel == sel or p.name == sel or str(p) == sel:
+                self._grapher_do_load(p)
+                return
+
+    def _grapher_do_load(self, path: Path):
+        if not _GRAPHER_OK:
+            return
+        self._grapher_status_var.set(f"Loading {path.name}\u2026")
+        ds = gd.DataLoader.load(path)
+        self._grapher_dataset = ds
+
+        if ds.load_error:
+            self._grapher_status_var.set(f"\u2717 {ds.load_error}")
+            return
+
+        rows, cols = ds.shape
+        self._grapher_status_var.set(
+            f"\u2713 {path.name} \u2014 {rows:,} rows \u00d7 {cols} cols  [{ds.format}]")
+
+        all_cols = ["\u2014"] + ds.all_columns
+        num_cols = ["\u2014"] + ds.numeric_columns
+        cat_cols = ["\u2014"] + ds.categorical_columns
+
+        for attr, choices in [
+            ("_gx", all_cols), ("_gy", num_cols),
+            ("_gz", num_cols), ("_gc", all_cols), ("_gs", num_cols),
+            ("_gfacet_col", cat_cols), ("_gfacet_row", cat_cols),  # #6 faceting
+        ]:
+            if hasattr(self, attr + "_cb"):
+                getattr(self, attr + "_cb")["values"] = choices
+                getattr(self, attr + "_var").set(
+                    choices[0])  # default to "—"
+
+        # Set sensible defaults for x/y
+        if len(all_cols) > 1:
+            self._gx_var.set(all_cols[1])
+        if len(num_cols) > 1:
+            self._gy_var.set(num_cols[1])
+
+        self._gcols_lb.delete(0, "end")
+        for col in ds.all_columns:
+            self._gcols_lb.insert("end", col)
+        for i, col in enumerate(ds.all_columns):
+            if col in ds.numeric_columns:
+                self._gcols_lb.selection_set(i)
+
+        # ── Correlation drill column lists (#9)
+        if hasattr(self, "_gcorr_a_cb"):
+            self._gcorr_a_cb["values"] = num_cols
+            self._gcorr_b_cb["values"] = num_cols
+            self._gcorr_a_var.set(num_cols[1] if len(num_cols) > 1 else "\u2014")
+            self._gcorr_b_var.set(num_cols[2] if len(num_cols) > 2 else "\u2014")
+
+        # ── Overlay file column picker (#10): populate with vault files
+        if hasattr(self, "_grapher_overlay_cb"):
+            vault_labels = ["(none)"] + list(self._grapher_file_cb["values"])
+            self._grapher_overlay_cb["values"] = vault_labels
+            self._grapher_overlay_var.set("(none)")
+
+        if ds.metadata.get("sheets"):
+            sheets = ds.metadata["sheets"]
+            self._grapher_sheet_cb["values"] = sheets
+            self._grapher_sheet_var.set(
+                ds.metadata.get("active_sheet", sheets[0]))
+        else:
+            self._grapher_sheet_cb["values"] = []
+            self._grapher_sheet_var.set("")
+
+        self._grapher_show_stats(ds.summary())
+
+        # ── Auto-suggest (#3): ask analyst for a quick suggestion after load
+        if self._analyst_personality and _GRAPHER_OK:
+            def _auto_suggest(ds=ds):
+                try:
+                    suggestion = self._analyst_personality.analyse(
+                        "What is the best single plot to explore this dataset? "
+                        "Pick the most revealing visualisation.", ds)
+                    hint = (f"\U0001f4a1 Auto-suggestion: {suggestion.spec.plot_type if suggestion.spec else '?'}"
+                            f"\n{suggestion.analysis[:300]}" if suggestion.analysis else "")
+                    self.ui_q.put(("grapher_autosuggest", hint, suggestion))
+                except Exception:
+                    pass
+            import threading
+            threading.Thread(target=_auto_suggest, daemon=True).start()
+
+    def _grapher_reload_sheet(self, event=None):
+        if not _GRAPHER_OK or self._grapher_dataset is None:
+            return
+        if self._grapher_sheet_var.get():
+            self._grapher_do_load(self._grapher_dataset.source_path)
+
+    def _grapher_update_controls(self):
+        pass  # all controls visible; irrelevant ones silently ignored
+
+    def _grapher_apply_spec_to_controls(self, spec):
+        # Sync every UI control to match an AI-returned PlotSpec so the user
+        # sees exactly what the AI chose and can tweak before re-plotting.
+        if spec is None:
+            return
+        try:
+            if getattr(spec, "plot_type", None):
+                self._plot_type_var.set(spec.plot_type)
+
+            ds = self._grapher_dataset
+
+            def _try_set(attr, val):
+                if not val:
+                    return
+                cb  = getattr(self, attr + "_cb",  None)
+                var = getattr(self, attr + "_var", None)
+                if cb is None or var is None:
+                    return
+                if val in list(cb["values"]):
+                    var.set(val)
+
+            _try_set("_gx", getattr(spec, "x_col",     None))
+            _try_set("_gy", getattr(spec, "y_col",     None))
+            _try_set("_gz", getattr(spec, "z_col",     None))
+            _try_set("_gc", getattr(spec, "color_col", None))
+            _try_set("_gs", getattr(spec, "size_col",  None))
+
+            if getattr(spec, "columns", None) and ds:
+                self._gcols_lb.selection_clear(0, "end")
+                for i, col in enumerate(ds.all_columns):
+                    if col in spec.columns:
+                        self._gcols_lb.selection_set(i)
+
+            if getattr(spec, "bins",              None): self._gopt_bins.set(int(spec.bins))
+            if getattr(spec, "window",            None): self._gopt_window.set(int(spec.window))
+            if getattr(spec, "trend_degree",      None): self._gopt_trend.set(int(spec.trend_degree))
+            if getattr(spec, "anomaly_threshold", None): self._gopt_sigma.set(str(spec.anomaly_threshold))
+            if getattr(spec, "fft_sample_rate",   None): self._gopt_samplerate.set(str(spec.fft_sample_rate))
+            if getattr(spec, "marker_size",       None): self._gopt_marker.set(int(spec.marker_size))
+            if getattr(spec, "line_width",        None): self._gopt_lw.set(int(spec.line_width))
+            if getattr(spec, "opacity",           None): self._gopt_opacity.set(str(spec.opacity))
+            if getattr(spec, "color_scheme",      None): self._gopt_cscheme.set(spec.color_scheme)
+            if getattr(spec, "theme",             None): self._gopt_theme.set(spec.theme)
+            if getattr(spec, "title",             None): self._gopt_title.set(spec.title)
+
+        except Exception as e:
+            print(f"[Grapher] apply_spec_to_controls: {e}")
+
+    def _grapher_build_spec(self):
+        if not _GRAPHER_OK:
+            return None
+
+        def _col(attr):
+            v = getattr(self, attr + "_var").get()
+            return v if v and v != "\u2014" else None
+
+        ds  = self._grapher_dataset
+        sel = self._gcols_lb.curselection()
+        multi_cols = ([ds.all_columns[i] for i in sel
+                       if i < len(ds.all_columns)] if ds else [])
+
+        try:
+            sigma     = float(self._gopt_sigma.get())
+            opacity   = float(self._gopt_opacity.get())
+            sr        = float(self._gopt_samplerate.get())
+            title_str = self._gopt_title.get()
+        except Exception:
+            sigma, opacity, sr, title_str = 3.0, 0.85, 1.0, ""
+
+        return ge.PlotSpec(
+            plot_type         = self._plot_type_var.get(),
+            x_col             = _col("_gx"),
+            y_col             = _col("_gy"),
+            z_col             = _col("_gz"),
+            color_col         = _col("_gc"),
+            size_col          = _col("_gs"),
+            columns           = multi_cols,
+            title             = title_str,
+            color_scheme      = self._gopt_cscheme.get(),
+            theme             = self._gopt_theme.get(),
+            bins              = self._gopt_bins.get(),
+            window            = self._gopt_window.get(),
+            trend_degree      = self._gopt_trend.get(),
+            anomaly_threshold = sigma,
+            fft_sample_rate   = sr,
+            marker_size       = self._gopt_marker.get(),
+            line_width        = self._gopt_lw.get(),
+            opacity           = opacity,
+            renderer          = "plotly",
+            facet_col         = _col("_gfacet_col"),   # #6 faceting
+            facet_row         = _col("_gfacet_row"),   # #6 faceting
+        )
+
+    def _grapher_plot_interactive(self):
+        if not _GRAPHER_OK:
+            return
+        if self._grapher_dataset is None:
+            self._grapher_show_stats("No file loaded. Select a file first.")
+            return
+        spec = self._grapher_build_spec()
+        if spec:
+            self._grapher_render_plotly(spec, self._grapher_dataset)
+
+    def _grapher_render_plotly(self, spec, ds):
+        if not _GRAPHER_OK:
+            return
+
+        # ── Apply transforms (#4) ─────────────────────────────────────────────
+        working_ds = ds
+        if self._grapher_transforms and ds.df is not None:
+            import copy
+            working_ds = copy.copy(ds)
+            working_ds.df, tf_log = ge.apply_transforms(ds.df, self._grapher_transforms)
+            if hasattr(self, "_gtransform_lb"):
+                self._gtransform_lb.delete(0, "end")
+                for msg in tf_log:
+                    self._gtransform_lb.insert("end", msg)
+
+        # ── Multi-file overlay (#10) ──────────────────────────────────────────
+        if (self._grapher_overlay_ds is not None
+                and self._grapher_overlay_ds.df is not None
+                and spec.y_col and spec.plot_type in ("line", "timeseries", "scatter", "area")):
+            try:
+                import copy
+                import plotly.express as px
+                import plotly.graph_objects as go
+                ods = self._grapher_overlay_ds
+                renderer_base = ge.PlotlyRenderer()
+                html = renderer_base._overlay_render(spec, working_ds, ods)
+            except Exception as e:
+                renderer_base = ge.PlotlyRenderer()
+                html = renderer_base.render(spec, working_ds)
+        else:
+            renderer_base = ge.PlotlyRenderer()
+            html = renderer_base.render(spec, working_ds)
+
+        label = f"{spec.plot_type.replace('_', ' ').title()} \u2014 {ds.name}"
+        self._grapher_plot_label_var.set(label)
+        self._grapher_spec = spec
+
+        # ── Save to history (#1) ──────────────────────────────────────────────
+        self._grapher_output_dir.mkdir(parents=True, exist_ok=True)
+        ts    = datetime.now().strftime("%H%M%S")
+        hpath = self._grapher_output_dir / f"plot_{ts}_{spec.plot_type}.html"
+        hpath.write_text(html, encoding="utf-8")
+        self._last_html_path = hpath
+        entry_label = f"{ts} — {spec.plot_type} — {ds.name}"
+        self._grapher_plot_history.append((entry_label, hpath))
+        if hasattr(self, "_grapher_history_lb"):
+            self._grapher_history_lb.insert("end", entry_label)
+            self._grapher_history_lb.see("end")
+
+        if self._grapher_web_frame is not None:
+            self._grapher_web_frame.load_html(html)
+        else:
+            import webbrowser
+            webbrowser.open(hpath.as_uri())
+            self._grapher_show_stats(
+                f"Plot opened in browser: {hpath}\n\n"
+                + ge.DataAnalyser.describe(ds)[:800])
+
+    def _grapher_open_in_browser(self):
+        if self._last_html_path and self._last_html_path.exists():
+            import webbrowser
+            webbrowser.open(self._last_html_path.as_uri())
+
+    def _grapher_export(self, fmt: str):
+        if not _GRAPHER_OK:
+            return
+        if self._grapher_dataset is None:
+            self._grapher_show_stats("No file loaded.")
+            return
+        spec = self._grapher_build_spec()
+        spec.renderer = "matplotlib"
+        import tkinter.filedialog as fd
+        ds           = self._grapher_dataset
+        default_name = f"{ds.name}_{spec.plot_type}.{fmt}"
+        path_str     = fd.asksaveasfilename(
+            title=f"Export {fmt.upper()}",
+            defaultextension=f".{fmt}",
+            initialfile=default_name,
+            filetypes=[(fmt.upper(), f"*.{fmt}"), ("All files", "*.*")],
+        )
+        if not path_str:
+            return
+        mpl_r = ge.MatplotlibRenderer()
+        fig   = mpl_r.render(spec, ds)
+        if fig:
+            saved = mpl_r.save(fig, Path(path_str))
+            self._grapher_show_stats(f"\u2713 Exported: {saved}")
+        else:
+            self._grapher_show_stats(
+                "\u2717 Export failed \u2014 matplotlib could not render this plot type.")
+
+    def _grapher_ai_plot(self):
+        if not _GRAPHER_OK:
+            self._grapher_show_stats("Grapher module not available.")
+            return
+        if self._grapher_dataset is None:
+            self._grapher_show_stats("Load a data file first.")
+            return
+        prompt = self._gai_prompt.get("1.0", "end").strip()
+        if not prompt:
+            return
+
+        mode = getattr(self, "_gai_mode_var", None)
+        mode = mode.get() if mode else "analyst"
+        ds   = self._grapher_dataset
+
+        if mode == "council":
+            valid_types = (
+                "line, bar, scatter, histogram, pie, area, box, violin, heatmap, "
+                "correlation, distribution, density_2d, parallel_coords, fft, "
+                "spectrogram, polar, contour, surface_3d, scatter_3d, "
+                "timeseries, rolling_mean, trend, anomaly, pca"
+            )
+            council_prompt = "\n".join([
+                "You are helping choose and configure a data visualisation.",
+                "",
+                f"Dataset: {ds.name}  ({ds.shape[0]:,} rows x {ds.shape[1]} columns)",
+                f"Numeric columns: {', '.join(ds.numeric_columns)}",
+                f"Categorical columns: {', '.join(ds.categorical_columns)}",
+                "",
+                f"User request: {prompt}",
+                "",
+                "Respond with:",
+                "1. A short explanation of what this plot will show and why it suits the data.",
+                "2. A JSON block (fenced with ```json) with these PlotSpec keys:",
+                "   plot_type, x_col, y_col, columns (list), title, color_scheme, theme,",
+                "   bins, window, trend_degree, anomaly_threshold, opacity",
+                f"Valid plot_type values: {valid_types}",
+                "Only use column names that exist in the dataset above.",
+                "Set unused keys to null.",
+            ])
+            self._grapher_show_stats("Sending to council\u2026")
+
+            def council_worker():
+                import re, json as _json
+                try:
+                    response = self.writer.respond(
+                        council_prompt,
+                        extra_context="DATASET SUMMARY:\n" + ds.summary(),
+                    )
+                    m = re.search(r"```json\s*(.*?)\s*```", response, re.DOTALL)
+                    if not m:
+                        m = re.search(r'\{[^{}]*"plot_type"[^{}]*\}', response, re.DOTALL)
+                    spec      = None
+                    parse_err = ""
+                    if m:
+                        raw = m.group(1) if m.lastindex and m.lastindex >= 1 else m.group(0)
+                        try:
+                            d = _json.loads(raw)
+                            if hasattr(ge.PlotSpec, "__dataclass_fields__"):
+                                valid_f = set(ge.PlotSpec.__dataclass_fields__)
+                                d = {k: v for k, v in d.items() if k in valid_f}
+                            spec = ge.PlotSpec(**d)
+                        except Exception as pe:
+                            parse_err = str(pe)
+                    else:
+                        parse_err = "No JSON block found in council response"
+
+                    class _R:
+                        pass
+                    r             = _R()
+                    r.spec        = spec
+                    r.analysis    = response
+                    r.parse_error = parse_err
+                    r.raw_json    = m.group(0) if m else ""
+                    self.ui_q.put(("grapher_ai_result", r))
+                except Exception as e:
+                    self.ui_q.put(("grapher_event", "error", str(e)))
+
+            import threading
+            threading.Thread(target=council_worker, daemon=True).start()
+
+        else:
+            if self._analyst_personality is None:
+                self._grapher_show_stats("Analyst not initialised.")
+                return
+            self._grapher_show_stats("Asking analyst AI\u2026")
+
+            def analyst_worker():
+                try:
+                    result = self._analyst_personality.analyse(prompt, ds)
+                    self.ui_q.put(("grapher_ai_result", result))
+                except Exception as e:
+                    self.ui_q.put(("grapher_event", "error", str(e)))
+
+            import threading
+            threading.Thread(target=analyst_worker, daemon=True).start()
+
+    def _grapher_quick_stats(self):
+        if not _GRAPHER_OK or self._grapher_dataset is None:
+            self._grapher_show_stats("Load a file first.")
+            return
+        ds = self._grapher_dataset
+
+        def worker():
+            try:
+                if self._analyst_personality:
+                    text = self._analyst_personality.quick_analysis(ds)
+                else:
+                    text = ge.DataAnalyser.describe(ds)
+                self.ui_q.put(("grapher_stats", text))
+            except Exception as e:
+                self.ui_q.put(("grapher_stats", f"Error: {e}"))
+
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _grapher_show_stats(self, text: str):
+        self._grapher_stats.configure(state="normal")
+        self._grapher_stats.delete("1.0", "end")
+        self._grapher_stats.insert("1.0", text)
+        self._grapher_stats.configure(state="disabled")
+
+    # ── Plot history helpers (#1) ─────────────────────────────────────────────
+
+    def _grapher_pin_plot(self):
+        """Save the current plot to a timestamped file and add to history."""
+        if self._last_html_path and self._last_html_path.exists():
+            self._grapher_show_stats(f"\U0001f4cc Pinned: {self._last_html_path.name}")
+        else:
+            self._grapher_show_stats("No plot to pin — plot something first.")
+
+    def _grapher_history_open(self):
+        """Open the selected history entry in the browser."""
+        if not hasattr(self, "_grapher_history_lb"):
+            return
+        sel = self._grapher_history_lb.curselection()
+        if not sel:
+            # open last
+            if self._grapher_plot_history:
+                _, path = self._grapher_plot_history[-1]
+                import webbrowser; webbrowser.open(path.as_uri())
+            return
+        idx = sel[0]
+        if idx < len(self._grapher_plot_history):
+            _, path = self._grapher_plot_history[idx]
+            if path.exists():
+                import webbrowser; webbrowser.open(path.as_uri())
+            else:
+                self._grapher_show_stats(f"\u2717 File no longer exists: {path}")
+
+    def _grapher_history_clear(self):
+        """Clear the plot history list."""
+        self._grapher_plot_history.clear()
+        if hasattr(self, "_grapher_history_lb"):
+            self._grapher_history_lb.delete(0, "end")
+
+    # ── Transform pipeline helpers (#4) ──────────────────────────────────────
+
+    def _grapher_transform_add(self, op: str):
+        """Add a named transform step to the pipeline."""
+        step = {"op": op, "cols": [], "params": {}}
+        if op == "clip":
+            step["op"]    = "clip_outliers"
+            step["params"] = {"sigma": 3.0}
+        self._grapher_transforms.append(step)
+        if hasattr(self, "_gtransform_lb"):
+            self._gtransform_lb.insert("end", op)
+
+    def _grapher_transform_clear(self):
+        """Remove all transform steps."""
+        self._grapher_transforms.clear()
+        if hasattr(self, "_gtransform_lb"):
+            self._gtransform_lb.delete(0, "end")
+
+    # ── Preset helpers (#2) ───────────────────────────────────────────────────
+
+    def _grapher_preset_file(self) -> Path:
+        return VAULT_DIR / "graph_presets.json"
+
+    def _grapher_refresh_presets(self):
+        """Load preset names from file and populate the combobox."""
+        if not hasattr(self, "_gpreset_cb"):
+            return
+        try:
+            pf = self._grapher_preset_file()
+            if pf.exists():
+                data = _json.loads(pf.read_text(encoding="utf-8"))
+                self._gpreset_cb["values"] = list(data.keys())
+        except Exception:
+            pass
+
+    def _grapher_save_preset(self):
+        """Save current spec settings as a named preset."""
+        name = simpledialog.askstring("Save Preset", "Preset name:", parent=self.root)
+        if not name:
+            return
+        try:
+            spec = self._grapher_build_spec()
+            if spec is None:
+                return
+            preset_dict = spec.to_dict()
+            pf = self._grapher_preset_file()
+            data = {}
+            if pf.exists():
+                try:
+                    data = _json.loads(pf.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            data[name] = preset_dict
+            pf.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+            self._grapher_refresh_presets()
+            self._gpreset_var.set(name)
+            self._grapher_show_stats(f"\u2713 Preset '{name}' saved.")
+        except Exception as e:
+            self._grapher_show_stats(f"\u2717 Save preset error: {e}")
+
+    def _grapher_load_preset(self):
+        """Load selected preset and apply it to controls."""
+        name = self._gpreset_var.get()
+        if not name:
+            return
+        try:
+            pf = self._grapher_preset_file()
+            data = _json.loads(pf.read_text(encoding="utf-8"))
+            if name not in data:
+                self._grapher_show_stats(f"\u2717 Preset '{name}' not found.")
+                return
+            spec = ge.PlotSpec.from_dict(data[name])
+            self._grapher_apply_spec_to_controls(spec)
+            self._grapher_show_stats(f"\u2713 Preset '{name}' loaded.")
+        except Exception as e:
+            self._grapher_show_stats(f"\u2717 Load preset error: {e}")
+
+    # ── Narration helper (#5) ─────────────────────────────────────────────────
+
+    def _grapher_narrate(self):
+        """Ask the Writer/Director to narrate the current plot in plain English."""
+        if not _GRAPHER_OK or self._grapher_dataset is None:
+            self._grapher_show_stats("No data loaded.")
+            return
+        spec = self._grapher_spec or self._grapher_build_spec()
+        if spec is None:
+            return
+        ds   = self._grapher_dataset
+        self._grapher_show_stats("Generating narration\u2026")
+
+        def _worker():
+            try:
+                prompt = (
+                    f"Narrate the following data plot in clear plain English for a non-technical audience.\n"
+                    f"Dataset: {ds.name}  ({ds.shape[0]:,} rows \u00d7 {ds.shape[1]} cols)\n"
+                    f"Plot type: {spec.plot_type}\n"
+                    f"X axis: {spec.x_col or 'index'}  |  Y axis: {spec.y_col or '(multi)'}\n"
+                    f"Color: {spec.color_col or 'none'}  |  Facet: {spec.facet_col or 'none'}\n"
+                    f"Numeric columns: {', '.join(ds.numeric_columns[:6])}\n\n"
+                    f"Dataset summary:\n{ds.summary()[:600]}\n\n"
+                    f"Give a 3–5 sentence narration of what this chart shows, any key insights, "
+                    f"and one follow-up question worth investigating."
+                )
+                text = self.writer.respond(prompt)
+                self.ui_q.put(("grapher_stats", f"\U0001f3a4 Narration:\n\n{text}"))
+            except Exception as e:
+                self.ui_q.put(("grapher_stats", f"\u2717 Narration error: {e}"))
+
+        import threading
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ── Live reload helpers (#8) ──────────────────────────────────────────────
+
+    def _grapher_live_toggle(self):
+        """Toggle live-reload mode on/off."""
+        if self._grapher_live_reload_var.get():
+            self._grapher_live_schedule()
+        else:
+            if self._grapher_live_job is not None:
+                self.root.after_cancel(self._grapher_live_job)
+                self._grapher_live_job = None
+
+    def _grapher_live_schedule(self):
+        """Schedule the next live-reload tick."""
+        if not self._grapher_live_reload_var.get():
+            return
+        try:
+            interval_ms = int(self._grapher_live_interval_var.get()) * 1000
+        except Exception:
+            interval_ms = 5000
+        self._grapher_live_job = self.root.after(interval_ms, self._grapher_live_tick)
+
+    def _grapher_live_tick(self):
+        """Reload the current file and re-render if changed."""
+        self._grapher_live_job = None
+        if not self._grapher_live_reload_var.get():
+            return
+        ds = self._grapher_dataset
+        if ds and ds.source_path.exists():
+            new_ds = gd.DataLoader.load(ds.source_path)
+            if not new_ds.load_error and new_ds.shape != ds.shape:
+                self._grapher_dataset = new_ds
+                spec = self._grapher_spec or self._grapher_build_spec()
+                if spec:
+                    self._grapher_render_plotly(spec, new_ds)
+        self._grapher_live_schedule()
+
+    # ── Overlay helpers (#10) ─────────────────────────────────────────────────
+
+    def _grapher_overlay_load(self, event=None):
+        """Load the selected overlay file."""
+        if not _GRAPHER_OK:
+            return
+        label = self._grapher_overlay_var.get()
+        if not label or label == "(none)":
+            self._grapher_overlay_ds = None
+            return
+        # Find path
+        for p in self._grapher_file_paths:
+            try:
+                rel = str(p.relative_to(VAULT_DIR))
+            except ValueError:
+                rel = str(p)
+            if rel == label or str(p) == label:
+                self._grapher_overlay_ds = gd.DataLoader.load(p)
+                self._grapher_show_stats(
+                    f"\U0001f4ce Overlay loaded: {p.name}  "
+                    f"({self._grapher_overlay_ds.shape[0]:,} rows)")
+                return
+
+    def _grapher_overlay_browse(self):
+        """Browse for an overlay file."""
+        import tkinter.filedialog as fd
+        path_str = fd.askopenfilename(
+            title="Open overlay file",
+            filetypes=[("All supported",
+                        "*.csv *.tsv *.xlsx *.xls *.json *.npy *.npz *.txt"),
+                       ("All files", "*.*")],
+        )
+        if not path_str:
+            return
+        p = Path(path_str)
+        self._grapher_overlay_ds = gd.DataLoader.load(p)
+        label = str(p)
+        existing = list(self._grapher_overlay_cb["values"])
+        if label not in existing:
+            existing.append(label)
+            self._grapher_overlay_cb["values"] = existing
+            self._grapher_overlay_paths.append(p)
+        self._grapher_overlay_var.set(label)
+        self._grapher_show_stats(
+            f"\U0001f4ce Overlay loaded: {p.name}  "
+            f"({self._grapher_overlay_ds.shape[0]:,} rows)")
+
+    # ── Correlation drill helpers (#9) ────────────────────────────────────────
+
+    def _grapher_corr_drill(self):
+        """Run correlation drill: scatter + Pearson r for two chosen columns."""
+        if not _GRAPHER_OK or self._grapher_dataset is None:
+            self._grapher_show_stats("Load a file first.")
+            return
+        col_a = self._gcorr_a_var.get()
+        col_b = self._gcorr_b_var.get()
+        ds    = self._grapher_dataset
+        if col_a == "\u2014" or col_b == "\u2014" or col_a == col_b:
+            self._grapher_show_stats("Select two different numeric columns for drill.")
+            return
+        if col_a not in ds.df.columns or col_b not in ds.df.columns:
+            self._grapher_show_stats(f"Columns not found: {col_a}, {col_b}")
+            return
+        # Build scatter spec for these two columns
+        spec = ge.PlotSpec(
+            plot_type  = "scatter",
+            x_col      = col_a,
+            y_col      = col_b,
+            title      = f"Correlation: {col_a} vs {col_b}",
+            color_scheme = self._gopt_cscheme.get() if hasattr(self, "_gopt_cscheme") else "viridis",
+            theme        = self._gopt_theme.get()   if hasattr(self, "_gopt_theme")   else "plotly_dark",
+            trend_degree = 1,
+            renderer   = "plotly",
+        )
+        self._grapher_render_plotly(spec, ds)
+        # Compute Pearson r
+        try:
+            import pandas as pd
+            clean = ds.df[[col_a, col_b]].dropna()
+            r = clean[col_a].corr(clean[col_b])
+            n = len(clean)
+            self._grapher_show_stats(
+                f"\U0001f50e Correlation Drill: {col_a} vs {col_b}\n"
+                f"Pearson r = {r:.4f}  |  n = {n:,}\n"
+                f"{'Strong' if abs(r) > 0.7 else 'Moderate' if abs(r) > 0.4 else 'Weak'} "
+                f"{'positive' if r > 0 else 'negative'} correlation\n\n"
+                + ge.DataAnalyser.describe(ds)[:400]
+            )
+        except Exception as e:
+            self._grapher_show_stats(f"Correlation error: {e}")
+
+    # ── Plot council table (#7) ───────────────────────────────────────────────
+
+    def _grapher_plot_council_table(self):
+        """
+        Detect a markdown table in the last council answer and plot it.
+        Parses the table into a DataFrame, then runs an AI auto-suggest.
+        """
+        if not _GRAPHER_OK:
+            return
+        text = getattr(self, "_last_final_text", "").strip()
+        if not text:
+            self._grapher_show_stats("No council answer yet — ask the council something first.")
+            return
+        # Look for markdown table
+        import re as _re_local
+        table_match = _re_local.search(
+            r"(\|.+\|\s*\n\|[-| :]+\|\s*\n(?:\|.+\|\s*\n?)+)", text)
+        if not table_match:
+            self._grapher_show_stats(
+                "\u2717 No markdown table found in last council answer.\n\n"
+                "Ask the council to format data as a Markdown table first.")
+            return
+        raw_table = table_match.group(1)
+        try:
+            import pandas as pd
+            import io as _io
+            lines = [l.strip() for l in raw_table.strip().splitlines() if l.strip()]
+            # Remove separator row
+            lines = [l for l in lines if not _re_local.match(r"^\|[-| :]+\|$", l)]
+            # Parse
+            rows = []
+            for line in lines:
+                cells = [c.strip() for c in line.strip("|").split("|")]
+                rows.append(cells)
+            if len(rows) < 2:
+                raise ValueError("Not enough rows")
+            headers = rows[0]
+            data    = rows[1:]
+            df = pd.DataFrame(data, columns=headers)
+            # Try to coerce to numeric
+            for col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce").fillna(df[col])
+        except Exception as e:
+            self._grapher_show_stats(f"\u2717 Table parse error: {e}")
+            return
+
+        from pathlib import Path as _Path
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False,
+                                         mode="w", encoding="utf-8") as f:
+            df.to_csv(f, index=False)
+            tmp_path = _Path(f.name)
+
+        ds = gd.DataLoader.load(tmp_path)
+        ds.name = "council_table"
+        if ds.load_error:
+            self._grapher_show_stats(f"\u2717 Could not load table: {ds.load_error}")
+            return
+        self._grapher_dataset = ds
+        self._grapher_show_stats(
+            f"\u2713 Council table loaded: {ds.shape[0]} rows \u00d7 {ds.shape[1]} cols\n"
+            + ds.summary())
+        # Auto-suggest a plot
+        if self._analyst_personality:
+            def _worker(ds=ds):
+                try:
+                    result = self._analyst_personality.analyse(
+                        "What is the best plot for this data from a council response?", ds)
+                    self.ui_q.put(("grapher_ai_result", result))
+                except Exception:
+                    pass
+            import threading
+            threading.Thread(target=_worker, daemon=True).start()
+
+        # ---- Vault Manager tab ----
+
+    def _build_vault_manager_tab(self):
+        import tkinter as tk
+        self.tab_vmgr = ttk.Frame(self.nb)
+        self.nb.add(self.tab_vmgr, text="🗄 Vault")
+
+        # ── Top bar ───────────────────────────────────────────
+        top = ttk.Frame(self.tab_vmgr)
+        top.pack(fill="x", padx=10, pady=(8, 4))
+
+        ttk.Label(top, text="Vault:", font=("", 9, "bold")).pack(side="left")
+        ttk.Label(top, text=str(VAULT_DIR),
+                  foreground="#89b4fa").pack(side="left", padx=6)
+        ttk.Button(top, text="📂 Open Folder",
+                   command=self._vmgr_open_folder).pack(side="right")
+        ttk.Button(top, text="⟳ Refresh",
+                   command=self._vmgr_refresh_tree).pack(side="right", padx=4)
+        ttk.Button(top, text="RAG Misses",
+                   command=self._show_rag_misses).pack(side="right", padx=4)
+
+        # ── Main pane ─────────────────────────────────────────
+        main = tk.PanedWindow(self.tab_vmgr, orient="horizontal",
+                              bg="#1e1e2e", sashwidth=6)
+        main.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+
+        # ── LEFT: vault tree + controls ───────────────────────
+        left = ttk.Frame(main)
+        main.add(left, width=420)
+
+        # ── Clone section ─────────────────────────────────────
+        clone_lf = ttk.LabelFrame(left, text="Add GitHub Repo to Vault")
+        clone_lf.pack(fill="x", padx=4, pady=(4, 6))
+
+        r1 = ttk.Frame(clone_lf)
+        r1.pack(fill="x", padx=6, pady=(4, 2))
+        ttk.Label(r1, text="URL:", width=10).pack(side="left")
+        self._vmgr_url_var = tk.StringVar()
+        ttk.Entry(r1, textvariable=self._vmgr_url_var, width=40).pack(side="left", padx=4)
+
+        r2 = ttk.Frame(clone_lf)
+        r2.pack(fill="x", padx=6, pady=2)
+        ttk.Label(r2, text="Subfolder:", width=10).pack(side="left")
+        self._vmgr_subfolder_var = tk.StringVar()
+        ttk.Entry(r2, textvariable=self._vmgr_subfolder_var,
+                  width=20).pack(side="left", padx=4)
+        ttk.Label(r2, text="Branch:", width=7).pack(side="left", padx=(10, 0))
+        self._vmgr_branch_var = tk.StringVar()
+        ttk.Entry(r2, textvariable=self._vmgr_branch_var,
+                  width=12).pack(side="left", padx=4)
+
+        r3 = ttk.Frame(clone_lf)
+        r3.pack(fill="x", padx=6, pady=(2, 6))
+        ttk.Button(r3, text="⬇  Clone Repo",
+                   command=self._vmgr_clone).pack(side="left")
+        ttk.Button(r3, text="🔄 Pull Updates",
+                   command=self._vmgr_pull).pack(side="left", padx=6)
+
+        # ── Import section ────────────────────────────────────
+        import_lf = ttk.LabelFrame(left, text="Import Files into Vault")
+        import_lf.pack(fill="x", padx=4, pady=(0, 6))
+
+        # Row 1 — zip import
+        zi1 = ttk.Frame(import_lf)
+        zi1.pack(fill="x", padx=6, pady=(4, 2))
+        ttk.Label(zi1, text="Zip file:", width=10).pack(side="left")
+        self._vmgr_zip_var = tk.StringVar()
+        ttk.Entry(zi1, textvariable=self._vmgr_zip_var,
+                  width=32).pack(side="left", padx=4)
+        ttk.Button(zi1, text="📂 Browse",
+                   command=self._vmgr_browse_zip).pack(side="left")
+
+        # Row 2 — zip subfolder + action
+        zi2 = ttk.Frame(import_lf)
+        zi2.pack(fill="x", padx=6, pady=(2, 2))
+        ttk.Label(zi2, text="Subfolder:", width=10).pack(side="left")
+        self._vmgr_zip_subfolder_var = tk.StringVar()
+        ttk.Entry(zi2, textvariable=self._vmgr_zip_subfolder_var,
+                  width=20).pack(side="left", padx=4)
+        ttk.Label(zi2, text="(blank = zip name)", foreground="#585b70").pack(side="left")
+
+        zi3 = ttk.Frame(import_lf)
+        zi3.pack(fill="x", padx=6, pady=(2, 6))
+        ttk.Button(zi3, text="📦 Extract Zip to Vault",
+                   command=self._vmgr_import_zip).pack(side="left")
+
+        # Row — folder import
+        fi1 = ttk.Frame(import_lf)
+        fi1.pack(fill="x", padx=6, pady=(2, 2))
+        ttk.Label(fi1, text="Folder:", width=10).pack(side="left")
+        self._vmgr_folder_var = tk.StringVar()
+        ttk.Entry(fi1, textvariable=self._vmgr_folder_var,
+                  width=32).pack(side="left", padx=4)
+        ttk.Button(fi1, text="📂 Browse",
+                   command=self._vmgr_browse_folder).pack(side="left")
+
+        fi2 = ttk.Frame(import_lf)
+        fi2.pack(fill="x", padx=6, pady=(2, 6))
+        ttk.Button(fi2, text="📁 Copy Folder to Vault",
+                   command=self._vmgr_import_folder).pack(side="left")
+
+        # ── Scraper section ───────────────────────────────────
+        scrape_lf = ttk.LabelFrame(left, text="🌐 Web Scraper")
+        scrape_lf.pack(fill="x", padx=4, pady=(0, 6))
+
+        if not _SCRAPER_OK:
+            ttk.Label(scrape_lf,
+                text="vault_scraper.py not found — place it next to council_gui_engine.py",
+                foreground="#6c7086").pack(padx=6, pady=4, anchor="w")
+        else:
+            # Source selector
+            sc_r1 = ttk.Frame(scrape_lf)
+            sc_r1.pack(fill="x", padx=6, pady=(4, 2))
+            ttk.Label(sc_r1, text="Source:", width=9).pack(side="left")
+            self._scraper_source_var = tk.StringVar(value="All default sources")
+
+            def _build_source_names():
+                try:
+                    names  = ["All default sources",
+                               "All large sources",
+                               "All sitemap sources"]
+                    names += [lbl for lbl, *_ in vs.DEFAULT_SOURCES]
+                    names += ["── Large sites (slow) ──"]
+                    names += [lbl for lbl, *_ in vs.LARGE_SOURCES]
+                    names += ["── Sitemap crawls ──"]
+                    names += [lbl for lbl, *_ in vs.SITEMAP_SOURCES]
+                    names += ["── GitHub raw files ──"]
+                    names += [lbl for lbl, _ in vs.GITHUB_RAW_FILES]
+                    return names
+                except Exception:
+                    return ["All default sources", "All large sources",
+                            "All sitemap sources"]
+
+            _source_names = _build_source_names()
+            self._scraper_source_cb = ttk.Combobox(
+                sc_r1, textvariable=self._scraper_source_var,
+                values=_source_names, state="readonly", width=34)
+            self._scraper_source_cb.pack(side="left", padx=4)
+
+            def _refresh_sources():
+                self._scraper_source_cb["values"] = _build_source_names()
+            self.after(300, _refresh_sources)
+            self.after(1500, _refresh_sources)
+
+            # Custom URL row
+            sc_r2 = ttk.Frame(scrape_lf)
+            sc_r2.pack(fill="x", padx=6, pady=2)
+            ttk.Label(sc_r2, text="Custom URL:", width=9).pack(side="left")
+            self._scraper_url_var = tk.StringVar()
+            ttk.Entry(sc_r2, textvariable=self._scraper_url_var,
+                      width=34).pack(side="left", padx=4)
+
+            # Label + depth row
+            sc_r3 = ttk.Frame(scrape_lf)
+            sc_r3.pack(fill="x", padx=6, pady=2)
+            ttk.Label(sc_r3, text="Label:", width=9).pack(side="left")
+            self._scraper_label_var = tk.StringVar(value="custom")
+            ttk.Entry(sc_r3, textvariable=self._scraper_label_var,
+                      width=14).pack(side="left", padx=4)
+            ttk.Label(sc_r3, text="Max pages:").pack(side="left", padx=(10, 2))
+            self._scraper_max_var = tk.StringVar(value="30")
+            ttk.Entry(sc_r3, textvariable=self._scraper_max_var,
+                      width=5).pack(side="left")
+
+            # Options row
+            sc_r4 = ttk.Frame(scrape_lf)
+            sc_r4.pack(fill="x", padx=6, pady=2)
+            self._scraper_skip_existing = tk.BooleanVar(value=True)
+            self._scraper_dry_run       = tk.BooleanVar(value=False)
+            self._scraper_no_github     = tk.BooleanVar(value=False)
+            ttk.Checkbutton(sc_r4, text="Skip existing",
+                variable=self._scraper_skip_existing).pack(side="left")
+            ttk.Checkbutton(sc_r4, text="Dry run",
+                variable=self._scraper_dry_run).pack(side="left", padx=6)
+            ttk.Checkbutton(sc_r4, text="Skip GitHub files",
+                variable=self._scraper_no_github).pack(side="left")
+
+            # Action buttons + stop
+            sc_r5 = ttk.Frame(scrape_lf)
+            sc_r5.pack(fill="x", padx=6, pady=(4, 6))
+            self._scraper_run_btn = ttk.Button(
+                sc_r5, text="▶  Scrape", command=self._scraper_run)
+            self._scraper_run_btn.pack(side="left")
+            self._scraper_stop_btn = ttk.Button(
+                sc_r5, text="■  Stop", command=self._scraper_stop,
+                state="disabled")
+            self._scraper_stop_btn.pack(side="left", padx=6)
+            self._scraper_status = ttk.Label(
+                sc_r5, text="idle", foreground="#6c7086")
+            self._scraper_status.pack(side="left")
+
+            self._scraper_running = False
+            self._scraper_abort   = False
+
+            def _on_source_change(event=None):
+                sel = self._scraper_source_var.get()
+                try:
+                    _large_labels = (
+                        {lbl for lbl, *_ in vs.LARGE_SOURCES}
+                        | {lbl for lbl, *_ in vs.SITEMAP_SOURCES}
+                        | {"All large sources", "All sitemap sources"}
+                    )
+                except Exception:
+                    _large_labels = {"All large sources", "All sitemap sources"}
+                if sel in _large_labels:
+                    self._scraper_status.configure(
+                        text="⚠ large crawl — may take 5–30 min",
+                        foreground="#fab387")
+                elif sel.startswith("──"):
+                    self._scraper_status.configure(text="(separator)", foreground="#6c7086")
+                else:
+                    self._scraper_status.configure(text="idle", foreground="#6c7086")
+            self._scraper_source_cb.bind("<<ComboboxSelected>>", _on_source_change)
+
+        # ── Vault tree ────────────────────────────────────────
+        ttk.Label(left, text="Vault Contents",
+                  font=("", 9, "bold")).pack(anchor="w", padx=4, pady=(4, 0))
+
+        tree_frame = ttk.Frame(left)
+        tree_frame.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self._vmgr_tree = ttk.Treeview(tree_frame, columns=("size", "type"),
+                                        show="tree headings", selectmode="browse")
+        self._vmgr_tree.heading("#0",    text="Name")
+        self._vmgr_tree.heading("size",  text="Size")
+        self._vmgr_tree.heading("type",  text="Type")
+        self._vmgr_tree.column("#0",    width=220)
+        self._vmgr_tree.column("size",  width=70,  anchor="e")
+        self._vmgr_tree.column("type",  width=60,  anchor="center")
+
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical",
+                            command=self._vmgr_tree.yview)
+        self._vmgr_tree.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._vmgr_tree.pack(fill="both", expand=True)
+        self._vmgr_tree.bind("<<TreeviewSelect>>", self._vmgr_on_select)
+
+        # Tree action buttons
+        tb = ttk.Frame(left)
+        tb.pack(fill="x", padx=4, pady=(0, 4))
+        ttk.Button(tb, text="👁 Preview",
+                   command=self._vmgr_preview).pack(side="left")
+        ttk.Button(tb, text="🗑 Delete Item",
+                   command=self._vmgr_delete).pack(side="left", padx=4)
+        ttk.Button(tb, text="📋 Copy Path",
+                   command=self._vmgr_copy_path).pack(side="left")
+
+        # ── RIGHT: preview + log ──────────────────────────────
+        right = tk.PanedWindow(main, orient="vertical",
+                               bg="#1e1e2e", sashwidth=5)
+        main.add(right)
+
+        # File preview
+        prev_frame = ttk.LabelFrame(right, text="Preview")
+        right.add(prev_frame, height=340)
+        self._vmgr_preview_text = self._make_text(
+            prev_frame, wrap="word", height=16, state="disabled")
+        self._vmgr_preview_text.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # Activity log
+        log_frame = ttk.LabelFrame(right, text="Activity Log")
+        right.add(log_frame, height=180)
+        self._vmgr_log = self._make_text(
+            log_frame, wrap="word", height=8, state="disabled")
+        self._vmgr_log.pack(fill="both", expand=True, padx=4, pady=4)
+        self._vmgr_log.tag_config("ok",   foreground="#a6e3a1")
+        self._vmgr_log.tag_config("err",  foreground="#f38ba8")
+        self._vmgr_log.tag_config("info", foreground="#89b4fa")
+
+        # Populate tree
+        self._vmgr_refresh_tree()
+
+    # ── Vault Scraper helpers ──────────────────────────────────────────────
+
+    def _scraper_log(self, msg: str, tag: str = "info"):
+        """Write a line to the vault activity log from the scraper."""
+        self._vmgr_append(msg, tag)
+
+    def _scraper_status_set(self, text: str, color: str = "#6c7086"):
+        try:
+            self._scraper_status.configure(text=text, foreground=color)
+        except Exception:
+            pass
+
+    def _scraper_stop(self):
+        self._scraper_abort = True
+        self._scraper_status_set("stopping…", "#fab387")
+
+    def _scraper_run(self):
+        if not _SCRAPER_OK:
+            return
+        if self._scraper_running:
+            return
+
+        source_sel  = self._scraper_source_var.get()
+        custom_url  = self._scraper_url_var.get().strip()
+        if custom_url and not custom_url.startswith(("http://", "https://")):
+            custom_url = "https://" + custom_url
+        label       = self._scraper_label_var.get().strip() or "custom"
+        skip_exist  = self._scraper_skip_existing.get()
+        dry_run     = self._scraper_dry_run.get()
+        no_github   = self._scraper_no_github.get()
+        try:
+            max_pages = int(self._scraper_max_var.get())
+        except ValueError:
+            max_pages = 30
+
+        self._scraper_running = True
+        self._scraper_abort   = False
+        self._scraper_run_btn.configure(state="disabled")
+        self._scraper_stop_btn.configure(state="normal")
+        self._scraper_status_set("running…", "#a6e3a1")
+
+        vault_dir = VAULT_DIR
+
+        def _progress(msg: str, error: bool = False):
+            """Called from worker thread — marshal to UI thread."""
+            tag = "err" if error else ("ok" if "✓" in msg else "info")
+            self.after(0, lambda m=msg, t=tag: self._scraper_log(m, t))
+
+        def _worker():
+            import time as _time
+            total = 0
+            try:
+                index = vs._load_index(vault_dir)
+
+                # ── Single custom URL ────────────────────────────
+                if custom_url:
+                    _progress(f"Fetching: {custom_url}")
+                    # Try to give a reason on failure
+                    try:
+                        robots_ok = vs._can_fetch(custom_url)
+                        if not robots_ok:
+                            _progress(f"  ✗ Blocked by robots.txt: {custom_url}", True)
+                        else:
+                            html = vs._fetch(custom_url)
+                            if html is None:
+                                _progress(f"  ✗ Could not fetch (network error or bad URL): {custom_url}", True)
+                            else:
+                                text = vs._extract_text(html, custom_url)
+                                if len(text) < 100:
+                                    _progress(f"  ✗ Too little content extracted ({len(text)} chars): {custom_url}", True)
+                                else:
+                                    path = vs._write_vault(vault_dir, label, custom_url, text, index)
+                                    _progress(f"  ✓ {len(text):,} chars → {path.name}")
+                                    total += 1
+                    except Exception as _fe:
+                        _progress(f"  ✗ Error: {_fe}", True)
+                    vs._save_index(vault_dir, index)
+
+                else:
+                    # Determine which tiers to run
+                    _sep = source_sel.startswith("──")
+                    if _sep:
+                        _progress("Select a real source, not a separator line.", True)
+                        return
+                    _all_default = source_sel == "All default sources"
+                    _all_large   = source_sel == "All large sources"
+                    _all_sitemap = source_sel == "All sitemap sources"
+                    _all_github  = source_sel == "All default sources"  # github included in default
+                    _run_single  = not (_all_default or _all_large or _all_sitemap)
+
+                    # ── GitHub raw files ──────────────────────────
+                    if not no_github:
+                        for gh_label, gh_url in vs.GITHUB_RAW_FILES:
+                            if self._scraper_abort:
+                                break
+                            if not _all_default and not (_run_single and gh_label == source_sel):
+                                continue
+                            if skip_exist and gh_url in index:
+                                _progress(f"[skip] {gh_label}")
+                                continue
+                            _progress(f"GitHub: {gh_label}")
+                            ok = vs.fetch_single(
+                                gh_label, gh_url, vault_dir, index,
+                                raw=True, dry_run=dry_run, verbose=False,
+                            )
+                            _progress(f"  {'✓' if ok else '✗'} {gh_label}", not ok)
+                            total += int(ok)
+                            _time.sleep(0.4)
+
+                    # ── Default doc site crawls ───────────────────
+                    for src_label, seed, src_max, prefix in vs.DEFAULT_SOURCES:
+                        if self._scraper_abort:
+                            break
+                        if not _all_default and not (_run_single and src_label == source_sel):
+                            continue
+                        if skip_exist and seed in index:
+                            _progress(f"[skip] {src_label}")
+                            continue
+                        _progress(f"Crawling: {src_label}  ({seed})", False)
+                        self.after(0, lambda l=src_label:
+                            self._scraper_status_set(f"scraping {l}…", "#89b4fa"))
+                        n = vs.crawl(
+                            src_label, seed, prefix, vault_dir, index,
+                            max_pages=max_pages or src_max,
+                            delay=0.8, dry_run=dry_run, verbose=False,
+                            progress_cb=_progress,
+                            abort_cb=lambda: self._scraper_abort,
+                        )
+                        total += n
+                        _progress(f"  ✓ {src_label}: {n} pages saved")
+                        vs._save_index(vault_dir, index)
+                        if self._scraper_abort:
+                            break
+
+                    # ── Large site crawls ─────────────────────────
+                    for src_label, seed, src_max, prefix in vs.LARGE_SOURCES:
+                        if self._scraper_abort:
+                            break
+                        if not _all_large and not (_run_single and src_label == source_sel):
+                            continue
+                        if skip_exist and seed in index:
+                            _progress(f"[skip] {src_label}")
+                            continue
+                        _progress(f"Large crawl: {src_label}  ({seed})", False)
+                        self.after(0, lambda l=src_label:
+                            self._scraper_status_set(f"large: {l}…", "#fab387"))
+                        n = vs.crawl(
+                            src_label, seed, prefix, vault_dir, index,
+                            max_pages=max_pages or src_max,
+                            delay=0.7, dry_run=dry_run, verbose=False,
+                            progress_cb=_progress,
+                            abort_cb=lambda: self._scraper_abort,
+                        )
+                        total += n
+                        _progress(f"  ✓ {src_label}: {n} pages saved")
+                        vs._save_index(vault_dir, index)
+                        if self._scraper_abort:
+                            break
+
+                    # ── Sitemap crawls ────────────────────────────
+                    for src_label, sitemap_url, src_max in vs.SITEMAP_SOURCES:
+                        if self._scraper_abort:
+                            break
+                        if not _all_sitemap and not (_run_single and src_label == source_sel):
+                            continue
+                        if skip_exist and sitemap_url in index:
+                            _progress(f"[skip] {src_label}")
+                            continue
+                        _progress(f"Sitemap crawl: {src_label}", False)
+                        self.after(0, lambda l=src_label:
+                            self._scraper_status_set(f"sitemap: {l}…", "#cba6f7"))
+                        n = vs.crawl_sitemap(
+                            src_label, sitemap_url, vault_dir, index,
+                            max_pages=max_pages or src_max,
+                            delay=0.7, dry_run=dry_run, verbose=False,
+                            progress_cb=_progress,
+                            abort_cb=lambda: self._scraper_abort,
+                        )
+                        total += n
+                        _progress(f"  ✓ {src_label}: {n} pages saved")
+                        vs._save_index(vault_dir, index)
+                        if self._scraper_abort:
+                            break
+
+                vs._save_index(vault_dir, index)
+
+            except Exception as e:
+                import traceback
+                _progress(f"✗ Scraper error: {e}", True)
+                _progress(traceback.format_exc(), True)
+            finally:
+                def _done():
+                    self._scraper_running = False
+                    self._scraper_abort   = False
+                    self._scraper_run_btn.configure(state="normal")
+                    self._scraper_stop_btn.configure(state="disabled")
+                    status = "stopped" if self._scraper_abort else (
+                        "dry-run complete" if dry_run else f"done — {total} pages"
+                    )
+                    self._scraper_status_set(status, "#a6e3a1")
+                    self._vmgr_refresh_tree()
+                self.after(0, _done)
+
+        import threading
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ── Vault Manager helpers ─────────────────────────────────
+
+    def _vmgr_append(self, msg: str, tag: str = "info"):
+        """Append a line to the vault manager log."""
+        self._vmgr_log.configure(state="normal")
+        if tag == "info" and msg.startswith("✓"):
+            tag = "ok"
+        elif tag == "info" and (msg.startswith("✗") or "error" in msg.lower() or "fail" in msg.lower()):
+            tag = "err"
+        self._vmgr_log.insert("end", msg.rstrip() + "\n", tag)
+        self._vmgr_log.see("end")
+        self._vmgr_log.configure(state="disabled")
+
+    def _show_rag_misses(self):
+        """Popup: vault_rag_misses.txt — queries that found no vault context."""
+        miss_path = VAULT_DIR / "vault_rag_misses.txt"
+        win = tk.Toplevel(self)
+        win.title("RAG Miss Log — Vault Gaps")
+        win.configure(bg="#1e1e2e")
+        win.geometry("740x420")
+        if not miss_path.exists():
+            ttk.Label(win, text="No RAG misses recorded yet.\n"
+                           "Misses are logged when RAG finds no relevant vault context.",
+                      wraplength=600).pack(padx=20, pady=20)
+            return
+        try:
+            lines = miss_path.read_text(encoding="utf-8").splitlines()
+        except Exception as e:
+            ttk.Label(win, text="Error reading miss log: " + str(e)).pack(padx=20, pady=20)
+            return
+        ttk.Label(win,
+                  text=str(len(lines)) + " missed queries — these topics are not covered by your vault.",
+                  foreground="#f38ba8").pack(anchor="w", padx=10, pady=(8, 2))
+        ttk.Separator(win, orient="horizontal").pack(fill="x", padx=10, pady=4)
+        box = self._make_text(win, height=18, wrap="word", state="normal")
+        box.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+        for ln in reversed(lines):
+            parts = ln.split("\t", 1)
+            ts    = parts[0] if len(parts) > 0 else ""
+            query = parts[1] if len(parts) > 1 else ln
+            box.insert("end", ts[:16] + "  ", "dim")
+            box.insert("end", query + "\n")
+        box.tag_configure("dim", foreground="#6c7086")
+        box.configure(state="disabled")
+        def _clear():
+            try:
+                miss_path.write_text("", encoding="utf-8")
+                box.configure(state="normal")
+                box.delete("1.0", "end")
+                box.configure(state="disabled")
+            except Exception:
+                pass
+        ttk.Button(win, text="Clear Miss Log", command=_clear).pack(
+            anchor="e", padx=10, pady=(0, 8))
+
+    def _vmgr_refresh_tree(self):
+        """Rebuild the vault tree view."""
+        self._vmgr_tree.delete(*self._vmgr_tree.get_children())
+        if not VAULT_DIR.exists():
+            return
+
+        def _fmt_size(p):
+            try:
+                b = p.stat().st_size
+                for unit in ("B", "KB", "MB"):
+                    if b < 1024:
+                        return f"{b:.0f} {unit}"
+                    b /= 1024
+                return f"{b:.1f} MB"
+            except Exception:
+                return ""
+
+        # Insert top-level items
+        for item in sorted(VAULT_DIR.iterdir(),
+                           key=lambda p: (p.is_file(), p.name.lower())):
+            if item.name.startswith("."):
+                continue
+            if item.is_dir():
+                node = self._vmgr_tree.insert(
+                    "", "end", iid=str(item),
+                    text=f"📁 {item.name}", values=("", "folder"), open=False)
+                # Insert children (one level deep)
+                for child in sorted(item.iterdir(),
+                                    key=lambda p: (p.is_file(), p.name.lower())):
+                    if child.name.startswith("."):
+                        continue
+                    if child.is_file():
+                        self._vmgr_tree.insert(
+                            node, "end", iid=str(child),
+                            text=f"  {child.name}",
+                            values=(_fmt_size(child), child.suffix or "file"))
+                    elif child.is_dir():
+                        sub = self._vmgr_tree.insert(
+                            node, "end", iid=str(child),
+                            text=f"  📁 {child.name}", values=("", "folder"))
+                        for f in sorted(child.iterdir())[:30]:
+                            if f.is_file() and not f.name.startswith("."):
+                                self._vmgr_tree.insert(
+                                    sub, "end", iid=str(f),
+                                    text=f"    {f.name}",
+                                    values=(_fmt_size(f), f.suffix or "file"))
+            else:
+                self._vmgr_tree.insert(
+                    "", "end", iid=str(item),
+                    text=item.name,
+                    values=(_fmt_size(item), item.suffix or "file"))
+
+    def _vmgr_on_select(self, event=None):
+        sel = self._vmgr_tree.selection()
+        if not sel:
+            return
+        p = Path(sel[0])
+        if p.is_file() and p.stat().st_size < 200_000:
+            self._vmgr_show_preview(p)
+
+    def _vmgr_show_preview(self, path: Path):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            text = f"Cannot read file: {e}"
+        self._vmgr_preview_text.configure(state="normal")
+        self._vmgr_preview_text.delete("1.0", "end")
+        self._vmgr_preview_text.insert("1.0", text[:8000])
+        if len(text) > 8000:
+            self._vmgr_preview_text.insert("end", "\n\n[truncated…]")
+        self._vmgr_preview_text.configure(state="disabled")
+
+    def _vmgr_preview(self):
+        sel = self._vmgr_tree.selection()
+        if not sel:
+            return
+        p = Path(sel[0])
+        if p.is_file():
+            self._vmgr_show_preview(p)
+
+    def _vmgr_delete(self):
+        import tkinter.messagebox as mb
+        sel = self._vmgr_tree.selection()
+        if not sel:
+            return
+        p = Path(sel[0])
+        what = "folder and all its contents" if p.is_dir() else "file"
+        if mb.askyesno("Confirm Delete", f"Delete {what}:\n{p.name}?"):
+            try:
+                import shutil
+                if p.is_dir():
+                    shutil.rmtree(p)
+                else:
+                    p.unlink()
+                self._vmgr_append(f"✓ Deleted: {p.name}")
+                self._vmgr_refresh_tree()
+            except Exception as e:
+                self._vmgr_append(f"✗ Delete failed: {e}")
+
+    def _vmgr_copy_path(self):
+        sel = self._vmgr_tree.selection()
+        if not sel:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(sel[0])
+        self._vmgr_append(f"Copied path: {sel[0]}", "info")
+
+    def _vmgr_open_folder(self):
+        import subprocess as sp
+        sp.Popen(["explorer", str(VAULT_DIR)])
+
+    def _vmgr_clone(self):
+        """Clone a GitHub repo into the vault in a background thread."""
+        import threading
+        url       = self._vmgr_url_var.get().strip()
+        subfolder = self._vmgr_subfolder_var.get().strip() or None
+        branch    = self._vmgr_branch_var.get().strip() or None
+
+        if not url:
+            self._vmgr_append("✗ Please enter a GitHub URL.", "err")
+            return
+        if not url.startswith("http"):
+            self._vmgr_append("✗ URL must start with https://", "err")
+            return
+
+        self._vmgr_append(f"Cloning {url} …", "info")
+
+        def worker():
+            try:
+                dest = _vmgr_clone_repo(
+                    url,
+                    vault_dir=VAULT_DIR,
+                    subfolder=subfolder,
+                    branch=branch,
+                    log_cb=lambda m: self.ui_q.put(("vault_mgr_log", m)),
+                )
+                self.ui_q.put(("vault_mgr_log", f"✓ Done → {dest.name}"))
+                self.ui_q.put(("vault_mgr_refresh", None))
+            except Exception as e:
+                self.ui_q.put(("vault_mgr_log", f"✗ Clone failed: {e}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _vmgr_pull(self):
+        """Pull updates for the selected vault folder."""
+        import threading
+        sel = self._vmgr_tree.selection()
+        if not sel:
+            self._vmgr_append("✗ Select a repo folder in the tree first.", "err")
+            return
+        p = Path(sel[0])
+        if not p.is_dir():
+            p = p.parent
+        subfolder = p.name
+        clone_dir = VAULT_DIR / ".git_clones" / subfolder
+        if not clone_dir.exists():
+            self._vmgr_append(
+                f"✗ No git clone found for '{subfolder}'. "
+                "Use Clone Repo first.", "err")
+            return
+
+        self._vmgr_append(f"Pulling updates for {subfolder} …", "info")
+
+        def worker():
+            try:
+                import subprocess
+                r = subprocess.run(
+                    ["git", "pull"], cwd=str(clone_dir),
+                    capture_output=True, text=True)
+                msg = r.stdout.strip() or r.stderr.strip() or "Done."
+                self.ui_q.put(("vault_mgr_log", f"git pull: {msg}"))
+                # Re-copy updated files
+                rc2, url, _ = (lambda r2: (r2.returncode, r2.stdout.strip(), ""))(
+                    subprocess.run(["git", "remote", "get-url", "origin"],
+                                   cwd=str(clone_dir),
+                                   capture_output=True, text=True))
+                if rc2 == 0 and url:
+                    _vmgr_clone_repo(
+                        url, vault_dir=VAULT_DIR, subfolder=subfolder,
+                        log_cb=lambda m: self.ui_q.put(("vault_mgr_log", m)),
+                    )
+                self.ui_q.put(("vault_mgr_log", f"✓ {subfolder} updated"))
+                self.ui_q.put(("vault_mgr_refresh", None))
+            except Exception as e:
+                self.ui_q.put(("vault_mgr_log", f"✗ Pull failed: {e}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ── Vault Manager — zip / folder import ─────────────────────
+
+    def _vmgr_browse_zip(self):
+        """Open file dialog to select a zip file."""
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Select zip file",
+            filetypes=[("Zip files", "*.zip"), ("All files", "*.*")],
+        )
+        if path:
+            self._vmgr_zip_var.set(path)
+            # Auto-fill subfolder from zip name if blank
+            if not self._vmgr_zip_subfolder_var.get().strip():
+                stem = Path(path).stem
+                self._vmgr_zip_subfolder_var.set(stem)
+
+    def _vmgr_browse_folder(self):
+        """Open directory dialog to select a folder to copy."""
+        from tkinter import filedialog
+        path = filedialog.askdirectory(title="Select folder to import into vault")
+        if path:
+            self._vmgr_folder_var.set(path)
+
+    def _vmgr_import_zip(self):
+        """Extract a zip file into a vault subfolder, keeping only indexable files."""
+        import threading
+        zip_path  = self._vmgr_zip_var.get().strip()
+        subfolder = self._vmgr_zip_subfolder_var.get().strip()
+
+        if not zip_path:
+            self._vmgr_append("✗ Please select a zip file first.", "err")
+            return
+        if not Path(zip_path).exists():
+            self._vmgr_append(f"✗ File not found: {zip_path}", "err")
+            return
+
+        if not subfolder:
+            subfolder = Path(zip_path).stem
+
+        self._vmgr_append(f"Extracting {Path(zip_path).name} → vault/{subfolder} …", "info")
+
+        def worker():
+            try:
+                dest, copied, skipped = _vmgr_extract_zip(
+                    Path(zip_path),
+                    vault_dir=VAULT_DIR,
+                    subfolder=subfolder,
+                    log_cb=lambda m: self.ui_q.put(("vault_mgr_log", m)),
+                )
+                self.ui_q.put(("vault_mgr_log",
+                    f"✓ Extracted {copied} files → vault/{dest.name}  ({skipped} skipped)"))
+                self.ui_q.put(("vault_mgr_refresh", None))
+                # Clear fields
+                self._vmgr_zip_var.set("")
+                self._vmgr_zip_subfolder_var.set("")
+            except Exception as e:
+                self.ui_q.put(("vault_mgr_log", f"✗ Extraction failed: {e}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _vmgr_import_folder(self):
+        """Copy a local folder into the vault, keeping only indexable files."""
+        import threading
+        folder_path = self._vmgr_folder_var.get().strip()
+
+        if not folder_path:
+            self._vmgr_append("✗ Please select a folder first.", "err")
+            return
+        src = Path(folder_path)
+        if not src.exists() or not src.is_dir():
+            self._vmgr_append(f"✗ Folder not found: {folder_path}", "err")
+            return
+
+        subfolder = src.name
+        self._vmgr_append(f"Copying {src.name} → vault/{subfolder} …", "info")
+
+        def worker():
+            try:
+                dest, copied, skipped = _vmgr_copy_folder(
+                    src,
+                    vault_dir=VAULT_DIR,
+                    subfolder=subfolder,
+                    log_cb=lambda m: self.ui_q.put(("vault_mgr_log", m)),
+                )
+                self.ui_q.put(("vault_mgr_log",
+                    f"✓ Copied {copied} files → vault/{dest.name}  ({skipped} skipped)"))
+                self.ui_q.put(("vault_mgr_refresh", None))
+                self._vmgr_folder_var.set("")
+            except Exception as e:
+                self.ui_q.put(("vault_mgr_log", f"✗ Copy failed: {e}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---- Council Lens tab (#7) ----
+
+    def _build_lens_tab(self):
+        self.tab_lens = ttk.Frame(self.nb)
+        self.nb.add(self.tab_lens, text="🔍 Lens")
+
+        hdr = ttk.Frame(self.tab_lens)
+        hdr.pack(fill="x", padx=10, pady=(8, 4))
+        ttk.Label(hdr, text="Council Lens",
+                  foreground="#89b4fa", font=("", 11, "bold")).pack(side="left")
+        ttk.Label(hdr,
+                  text="  Paste any content — get simultaneous parallel critique from all relevant roles",
+                  foreground="#6c7086").pack(side="left")
+
+        # Role selector
+        roles_frame = ttk.LabelFrame(self.tab_lens, text="Roles to include")
+        roles_frame.pack(fill="x", padx=10, pady=(0, 6))
+        self._lens_role_vars: dict = {}
+        _lens_defaults = {
+            "writer": True, "techpriest": True, "sage": True,
+            "peasant": True, "strategist": True, "director": True,
+            "artist": False, "intern": False, "skeptic": False,
+            "content": True, "musician": False,
+        }
+        _rf_row = ttk.Frame(roles_frame)
+        _rf_row.pack(fill="x", padx=8, pady=4)
+        for _rname, _default in _lens_defaults.items():
+            v = tk.BooleanVar(value=_default)
+            self._lens_role_vars[_rname] = v
+            ttk.Checkbutton(_rf_row, text=_rname.capitalize(), variable=v).pack(side="left", padx=4)
+
+        # Input area
+        in_frame = ttk.LabelFrame(self.tab_lens, text="Content to review")
+        in_frame.pack(fill="x", padx=10, pady=(0, 6))
+        self._lens_input = self._make_text(in_frame, wrap="word", height=8)
+        self._lens_input.pack(fill="both", expand=True, padx=6, pady=6)
+
+        # Controls
+        ctrl_row = ttk.Frame(self.tab_lens)
+        ctrl_row.pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Button(ctrl_row, text="▶ Run Lens",  command=self._lens_run).pack(side="left")
+        ttk.Button(ctrl_row, text="Clear All",   command=self._lens_clear).pack(side="left", padx=6)
+        self._lens_status = ttk.Label(ctrl_row, text="", foreground="#6c7086")
+        self._lens_status.pack(side="left", padx=6)
+
+        # Output area
+        out_frame = ttk.LabelFrame(self.tab_lens, text="Role critiques")
+        out_frame.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+        self._lens_output = self._make_text(out_frame, wrap="word", state="disabled")
+        self._lens_output.pack(fill="both", expand=True, padx=6, pady=6)
+
+    def _lens_clear(self):
+        self._set_text(self._lens_input, "")
+        self._lens_output.configure(state="normal")
+        self._lens_output.delete("1.0", "end")
+        self._lens_output.configure(state="disabled")
+
+    def _lens_run(self):
+        content = self._lens_input.get("1.0", "end").strip()
+        if not content:
+            return
+        selected_roles = [r for r, v in self._lens_role_vars.items() if v.get()]
+        if not selected_roles:
+            messagebox.showinfo("Lens", "Select at least one role.")
+            return
+
+        self._lens_output.configure(state="normal")
+        self._lens_output.delete("1.0", "end")
+        self._lens_output.configure(state="disabled")
+        self._lens_status.configure(text=f"Running {len(selected_roles)} roles in parallel…")
+
+        def worker():
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            results: dict = {}
+            prompt = (
+                "Review the following content from your specific lens.\n"
+                "Give your honest, role-specific critique — 150-250 words.\n"
+                "Do NOT synthesise or defer to other roles.\n"
+                "Lead with what you specifically notice, good or bad.\n\n"
+                f"CONTENT:\n{content[:3000]}"
+            )
+
+            def run_role(role_name: str) -> tuple:
+                model = getattr(self, role_name, None)
+                if model is None:
+                    return role_name, "(Role not loaded)"
+                try:
+                    return role_name, model.respond(prompt, max_tokens=350)
+                except Exception as e:
+                    return role_name, f"(Error: {e})"
+
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = {pool.submit(run_role, r): r for r in selected_roles}
+                for fut in as_completed(futures):
+                    role_name, response = fut.result()
+                    self.ui_q.put(("lens_result", role_name, response))
+
+            self.ui_q.put(("lens_done", len(selected_roles)))
+
+        import threading as _t
+        _t.Thread(target=worker, daemon=True).start()
+
+    # ---- Vault Health Dashboard tab (#11) ----
+
+    def _build_vault_health_tab(self):
+        self.tab_vault_health = ttk.Frame(self.nb)
+        self.nb.add(self.tab_vault_health, text="🗄 Vault Health")
+
+        hdr = ttk.Frame(self.tab_vault_health)
+        hdr.pack(fill="x", padx=10, pady=(8, 4))
+        ttk.Label(hdr, text="Vault Health Dashboard",
+                  foreground="#89b4fa", font=("", 11, "bold")).pack(side="left")
+
+        ctrl_row = ttk.Frame(self.tab_vault_health)
+        ctrl_row.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Button(ctrl_row, text="↺ Refresh",      command=self._vault_health_refresh).pack(side="left")
+        ttk.Button(ctrl_row, text="📂 Open Vault",   command=self._lib_open_vault).pack(side="left", padx=6)
+        ttk.Button(ctrl_row, text="📋 Open Wishlist", command=self._vault_health_open_wishlist).pack(side="left")
+
+        # ── Three-panel layout ─────────────────────────────────────
+        pw = tk.PanedWindow(self.tab_vault_health, orient="horizontal",
+                            bg="#1e1e2e", sashwidth=5, sashrelief="flat")
+        pw.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        # Left: memory files per personality
+        left = ttk.LabelFrame(pw, text="Personality Memory Files")
+        pw.add(left, minsize=200)
+        cols_mem = ("role", "size", "updated")
+        self._vh_mem_tree = ttk.Treeview(left, columns=cols_mem, show="headings", height=14)
+        self._vh_mem_tree.heading("role",    text="Role")
+        self._vh_mem_tree.heading("size",    text="Size")
+        self._vh_mem_tree.heading("updated", text="Last Updated")
+        self._vh_mem_tree.column("role",    width=100)
+        self._vh_mem_tree.column("size",    width=70)
+        self._vh_mem_tree.column("updated", width=130)
+        self._vh_mem_tree.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # Middle: vault files
+        mid = ttk.LabelFrame(pw, text="Vault Files")
+        pw.add(mid, minsize=240)
+        cols_vf = ("name", "size", "modified")
+        self._vh_vault_tree = ttk.Treeview(mid, columns=cols_vf, show="headings", height=14)
+        self._vh_vault_tree.heading("name",     text="File")
+        self._vh_vault_tree.heading("size",     text="Size")
+        self._vh_vault_tree.heading("modified", text="Modified")
+        self._vh_vault_tree.column("name",     width=180)
+        self._vh_vault_tree.column("size",     width=70)
+        self._vh_vault_tree.column("modified", width=130)
+        self._vh_vault_tree.pack(fill="both", expand=True, padx=4, pady=4)
+
+        # Right: wishlist stats + project context summary
+        right = ttk.LabelFrame(pw, text="Wishlist & Project Context")
+        pw.add(right, minsize=200)
+        self._vh_stats_box = self._make_text(right, wrap="word", state="disabled")
+        self._vh_stats_box.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self._vault_health_refresh()
+
+    def _vault_health_refresh(self):
+        """Populate all three panels of the vault health dashboard."""
+        import os as _os
+
+        # ── Memory files ──────────────────────────────────────────
+        self._vh_mem_tree.delete(*self._vh_mem_tree.get_children())
+        all_roles = ("judge", "writer", "techpriest", "intern", "peasant", "artist",
+                     "sage", "strategist", "librarian", "musician", "content", "director",
+                     "eye", "cutter", "algorithm",
+                     "_project")
+        try:
+            memmgr = self.writer.memory_manager
+            for role in all_roles:
+                p = memmgr.path_for(role)
+                if p.exists():
+                    sz = p.stat().st_size
+                    mtime = datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                    label = role if role != "_project" else "⬡ project"
+                    self._vh_mem_tree.insert("", "end",
+                        values=(label, _fmt_bytes(sz), mtime))
+        except Exception:
+            pass
+
+        # ── Vault files ───────────────────────────────────────────
+        self._vh_vault_tree.delete(*self._vh_vault_tree.get_children())
+        try:
+            _skip_dirs = {"conversations", "memory", ".git"}
+            for item in sorted(VAULT_DIR.iterdir()):
+                if item.name.startswith(".") or item.name in _skip_dirs:
+                    continue
+                if item.is_file():
+                    sz = item.stat().st_size
+                    mtime = datetime.fromtimestamp(item.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                    self._vh_vault_tree.insert("", "end",
+                        values=(item.name, _fmt_bytes(sz), mtime))
+        except Exception:
+            pass
+
+        # ── Wishlist + project context stats ──────────────────────
+        self._vh_stats_box.configure(state="normal")
+        self._vh_stats_box.delete("1.0", "end")
+        try:
+            wl_raw = self.librarian.get_wishlist()
+            total   = sum(1 for ln in wl_raw.splitlines() if "- [" in ln)
+            pending = sum(1 for ln in wl_raw.splitlines() if "- [ ]" in ln)
+            filled  = sum(1 for ln in wl_raw.splitlines() if "- [x]" in ln)
+            stats = (
+                f"WISHLIST\n"
+                f"  Total items : {total}\n"
+                f"  Pending     : {pending}\n"
+                f"  Filled      : {filled}\n\n"
+            )
+            # Project context
+            memmgr = self.writer.memory_manager
+            proj_path = memmgr.path_for("_project")
+            if proj_path.exists():
+                proj_sz = proj_path.stat().st_size
+                proj_lines = len(proj_path.read_text(encoding="utf-8").splitlines())
+                stats += f"PROJECT CONTEXT\n  {proj_lines} lines / {_fmt_bytes(proj_sz)}\n\n"
+            else:
+                stats += "PROJECT CONTEXT\n  (not yet generated)\n\n"
+            # Trends
+            trends_path = VAULT_DIR / "trends.md"
+            if trends_path.exists():
+                mtime = datetime.fromtimestamp(trends_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                stats += f"TRENDS FILE\n  Last updated: {mtime}\n"
+            else:
+                stats += "TRENDS FILE\n  (not yet generated)\n"
+            self._vh_stats_box.insert("1.0", stats)
+        except Exception as e:
+            self._vh_stats_box.insert("1.0", f"(Error loading stats: {e})")
+        self._vh_stats_box.configure(state="disabled")
+
+    def _vault_health_open_wishlist(self):
+        """Open the wishlist file in the default text editor."""
+        try:
+            wl_path = self.librarian.wishlist_path
+            if not wl_path.exists():
+                messagebox.showinfo("Wishlist", "No wishlist file yet.")
+                return
+            if sys.platform.startswith("win"):
+                os.startfile(str(wl_path))  # type: ignore
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(wl_path)], check=False)
+            else:
+                subprocess.run(["xdg-open", str(wl_path)], check=False)
+        except Exception as e:
+            messagebox.showerror("Wishlist", str(e))
+
+    # ---- Speech tab ----
+
+    def _build_speech_tab(self):
+        self.tab_speech = ttk.Frame(self.nb)
+        self.nb.add(self.tab_speech, text="🎙 Speech")
+
+        top = ttk.Frame(self.tab_speech)
+        top.pack(fill="both", expand=True, padx=10, pady=10)
+
+        btns = ttk.Frame(top)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Record 5s",       command=self._stt_record).pack(side="left")
+        ttk.Button(btns, text="Transcribe",      command=self._stt_transcribe).pack(side="left", padx=6)
+        ttk.Button(btns, text="Send to Council", command=self._stt_send_to_council).pack(side="left")
+
+        # ── #10 TTS controls ─────────────────────────────────────────────
+        ttk.Separator(btns, orient="vertical").pack(side="left", fill="y", padx=10)
+        ttk.Button(btns, text="🔊 Speak Last Answer",
+                   command=self._tts_speak_last).pack(side="left")
+        ttk.Button(btns, text="⏹ Stop",
+                   command=self._tts_stop).pack(side="left", padx=4)
+        self.var_tts_auto = tk.BooleanVar(value=False)
+        ttk.Checkbutton(btns, text="Auto-speak answers",
+                        variable=self.var_tts_auto).pack(side="left", padx=4)
+        ttk.Label(btns, text="Rate:", foreground="#6c7086").pack(side="left", padx=(8, 2))
+        self._tts_rate_var = tk.StringVar(value="175")
+        ttk.Spinbox(btns, textvariable=self._tts_rate_var,
+                    from_=80, to=300, increment=10, width=5).pack(side="left")
+
+        ttk.Label(top, text="Transcription").pack(anchor="w", pady=(10, 0))
+        self.stt_out = self._make_text(top, wrap="word")
+        self.stt_out.pack(fill="both", expand=True)
+        self._tts_engine = None  # lazy init
+
+    # ---- Video Analysis tab ----
+
+    def _build_video_tab(self):
+        self.tab_video = ttk.Frame(self.nb)
+        self.nb.add(self.tab_video, text="🎬 Video")
+
+        # ── Header ────────────────────────────────────────────────
+        hdr = ttk.Frame(self.tab_video)
+        hdr.pack(fill="x", padx=10, pady=(8, 4))
+        ttk.Label(hdr, text="Video Analyser",
+                  foreground="#89b4fa", font=("", 11, "bold")).pack(side="left")
+        ttk.Label(hdr,
+                  text="  Transcribe, describe, and learn your creator vibe",
+                  foreground="#6c7086").pack(side="left")
+
+        if not _VIDEO_OK:
+            ttk.Label(self.tab_video,
+                      text="video_processor.py not found — place it in your council folder.",
+                      foreground="#f38ba8").pack(padx=12, pady=20)
+            return
+
+        # ── File picker ───────────────────────────────────────────
+        file_frame = ttk.LabelFrame(self.tab_video, text="Video File")
+        file_frame.pack(fill="x", padx=10, pady=(0, 6))
+
+        self._video_path_var = tk.StringVar()
+        file_row = ttk.Frame(file_frame)
+        file_row.pack(fill="x", padx=8, pady=6)
+        ttk.Entry(file_row, textvariable=self._video_path_var, width=60).pack(side="left", fill="x", expand=True)
+        ttk.Button(file_row, text="Browse…", command=self._video_browse).pack(side="left", padx=6)
+
+        # ── Options ───────────────────────────────────────────────
+        opt_frame = ttk.LabelFrame(self.tab_video, text="Options")
+        opt_frame.pack(fill="x", padx=10, pady=(0, 6))
+
+        opt_row1 = ttk.Frame(opt_frame)
+        opt_row1.pack(fill="x", padx=8, pady=(6, 2))
+
+        ttk.Label(opt_row1, text="Whisper model:").pack(side="left")
+        self._whisper_model_var = tk.StringVar(value="base")
+        ttk.Combobox(opt_row1, textvariable=self._whisper_model_var,
+                     values=["tiny", "base", "small", "medium", "large-v2"],
+                     state="readonly", width=10).pack(side="left", padx=6)
+        ttk.Label(opt_row1, text="  Device:").pack(side="left")
+        self._whisper_device_var = tk.StringVar(value="cuda")
+        ttk.Combobox(opt_row1, textvariable=self._whisper_device_var,
+                     values=["cuda", "cpu"], state="readonly", width=6).pack(side="left", padx=6)
+
+        opt_row2 = ttk.Frame(opt_frame)
+        opt_row2.pack(fill="x", padx=8, pady=(2, 6))
+
+        self._do_frames_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_row2, text="Extract frames",
+                        variable=self._do_frames_var).pack(side="left")
+        ttk.Label(opt_row2, text="  every").pack(side="left", padx=(6, 2))
+        self._frame_interval_var = tk.StringVar(value="10")
+        ttk.Spinbox(opt_row2, textvariable=self._frame_interval_var,
+                    from_=5, to=60, increment=5, width=5).pack(side="left")
+        ttk.Label(opt_row2, text="s  max").pack(side="left", padx=(4, 2))
+        self._max_frames_var = tk.StringVar(value="20")
+        ttk.Spinbox(opt_row2, textvariable=self._max_frames_var,
+                    from_=5, to=60, increment=5, width=5).pack(side="left")
+        ttk.Label(opt_row2, text="frames").pack(side="left", padx=(4, 0))
+
+        opt_row3 = ttk.Frame(opt_frame)
+        opt_row3.pack(fill="x", padx=8, pady=(0, 6))
+        ttk.Label(opt_row3, text="Vision model:").pack(side="left")
+        self._vision_model_var = tk.StringVar(value="llava:7b")
+        self._vision_cb = ttk.Combobox(opt_row3, textvariable=self._vision_model_var,
+                                        values=["llava:7b", "moondream", "llava-phi3",
+                                                "llava-llama3", "minicpm-v"],
+                                        width=18)
+        self._vision_cb.pack(side="left", padx=6)
+        ttk.Button(opt_row3, text="↺ Detect installed",
+                   command=self._video_detect_vision_models).pack(side="left", padx=4)
+
+        self._do_vibe_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_row3, text="Run vibe analysis (saves to Content Style)",
+                        variable=self._do_vibe_var).pack(side="left", padx=12)
+
+        opt_row4 = ttk.Frame(opt_frame)
+        opt_row4.pack(fill="x", padx=8, pady=(2, 4))
+        self._do_audio_quality_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_row4, text="🎚 Audio quality (noise/loudness/silence)",
+                        variable=self._do_audio_quality_var).pack(side="left")
+        self._do_energy_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_row4, text="  ⚡ Energy profile",
+                        variable=self._do_energy_var).pack(side="left", padx=4)
+        self._do_visual_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_row4, text="  🖼 Visual issues",
+                        variable=self._do_visual_var).pack(side="left", padx=4)
+
+        opt_row5 = ttk.Frame(opt_frame)
+        opt_row5.pack(fill="x", padx=8, pady=(0, 6))
+        self._do_roast_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_row5, text="🔥 Peasant Roast (brutal content critique)",
+                        variable=self._do_roast_var).pack(side="left")
+        ttk.Label(opt_row5, text="   Roast model:",
+                  foreground="#6c7086").pack(side="left", padx=(10, 2))
+        self._roast_model_var = tk.StringVar(value="writer")
+        ttk.Combobox(opt_row5, textvariable=self._roast_model_var,
+                     values=["writer", "director", "content", "cutter",
+                             "algorithm", "coach", "sage"],
+                     state="readonly", width=10).pack(side="left")
+        ttk.Label(opt_row5, text="  Sage logic critique:",
+                  foreground="#6c7086").pack(side="left", padx=(10, 2))
+        self._do_sage_logic_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_row5, variable=self._do_sage_logic_var).pack(side="left")
+        ttk.Label(opt_row5,
+                  text="  (Sage adds a separate logic/clarity pass on top of the roast)",
+                  foreground="#45475a", font=("", 9)).pack(side="left", padx=4)
+
+        opt_row6 = ttk.Frame(opt_frame)
+        opt_row6.pack(fill="x", padx=8, pady=(2, 6))
+        self._do_algorithm_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_row6, text="📦 Algorithm (retention, hook, packaging)",
+                        variable=self._do_algorithm_var).pack(side="left")
+        self._do_coach_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_row6, text="  🎙 Coach (delivery, pacing, vocal habits)",
+                        variable=self._do_coach_var).pack(side="left", padx=12)
+
+        # ── Action bar ────────────────────────────────────────────
+        act_frame = ttk.Frame(self.tab_video)
+        act_frame.pack(fill="x", padx=10, pady=(0, 6))
+        self._video_run_btn = ttk.Button(act_frame, text="▶  Analyse Video",
+                                          command=self._video_run)
+        self._video_run_btn.pack(side="left")
+        ttk.Button(act_frame, text="■  Stop",
+                   command=self._video_stop).pack(side="left", padx=6)
+        ttk.Button(act_frame, text="➕  Add to Queue",
+                   command=self._queue_add_current).pack(side="left", padx=6)
+        ttk.Button(act_frame, text="📂  Past Analyses",
+                   command=self._video_show_history).pack(side="left", padx=6)
+        ttk.Button(act_frame, text="Send transcript to Council",
+                   command=self._video_send_transcript).pack(side="left", padx=6)
+        ttk.Button(act_frame, text="📋  Edit Suggestions",
+                   command=self._video_show_edit_suggestions).pack(side="left", padx=6)
+        ttk.Button(act_frame, text="🔥  Show Roast",
+                   command=self._video_show_roast).pack(side="left", padx=6)
+        ttk.Button(act_frame, text="📦  Algorithm Notes",
+                   command=self._video_show_algorithm_notes).pack(side="left", padx=6)
+        ttk.Button(act_frame, text="🎙  Coach Notes",
+                   command=self._video_show_coach_notes).pack(side="left", padx=6)
+
+        # ── Progress log ──────────────────────────────────────────
+        ttk.Label(self.tab_video, text="Progress:").pack(anchor="w", padx=10)
+        log_frame = ttk.Frame(self.tab_video)
+        log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+        self._video_log = tk.Text(
+            log_frame, bg="#11111b", fg="#cdd6f4",
+            font=("Consolas", 9), state="disabled", relief="flat", wrap="word",
+        )
+        log_sb = ttk.Scrollbar(log_frame, command=self._video_log.yview)
+        self._video_log.configure(yscrollcommand=log_sb.set)
+        log_sb.pack(side="right", fill="y")
+        self._video_log.pack(fill="both", expand=True)
+        self._video_log.tag_config("ok",   foreground="#a6e3a1")
+        self._video_log.tag_config("err",  foreground="#f38ba8")
+        self._video_log.tag_config("warn", foreground="#fab387")
+        self._video_log.tag_config("hdr",  foreground="#89b4fa", font=("Consolas", 9, "bold"))
+
+        # Store last analysis result for transcript sending
+        self._last_video_analysis = None
+
+        # ── Video Queue ───────────────────────────────────────────
+        self._video_queue_items = []   # list of vp.VideoQueueItem
+        self._queue_running      = False
+        self._queue_paused       = False
+        self._queue_stop_flag    = False
+        self._queue_current_idx  = -1
+
+        q_frame = ttk.LabelFrame(self.tab_video, text="📋 Analysis Queue")
+        q_frame.pack(fill="x", padx=10, pady=(4, 6))
+
+        # ── Queue treeview ────────────────────────────────────────
+        q_tv_frame = ttk.Frame(q_frame)
+        q_tv_frame.pack(fill="x", padx=6, pady=(4, 0))
+
+        cols = ("#", "File", "Type", "Status", "Duration")
+        self._queue_tv = ttk.Treeview(
+            q_tv_frame, columns=cols, show="headings", height=6,
+            selectmode="browse",
+        )
+        self._queue_tv.heading("#",        text="#",       anchor="center")
+        self._queue_tv.heading("File",     text="File",    anchor="w")
+        self._queue_tv.heading("Type",     text="Type",    anchor="center")
+        self._queue_tv.heading("Status",   text="Status",  anchor="center")
+        self._queue_tv.heading("Duration", text="Duration",anchor="center")
+        self._queue_tv.column("#",        width=28,  stretch=False, anchor="center")
+        self._queue_tv.column("File",     width=320, stretch=True,  anchor="w")
+        self._queue_tv.column("Type",     width=80,  stretch=False, anchor="center")
+        self._queue_tv.column("Status",   width=110, stretch=False, anchor="center")
+        self._queue_tv.column("Duration", width=80,  stretch=False, anchor="center")
+
+        self._queue_tv.tag_configure("queued",     foreground="#a6adc8")
+        self._queue_tv.tag_configure("processing", foreground="#89b4fa",
+                                      font=("", 9, "bold"))
+        self._queue_tv.tag_configure("done",       foreground="#a6e3a1")
+        self._queue_tv.tag_configure("error",      foreground="#f38ba8")
+        self._queue_tv.tag_configure("skipped",    foreground="#585b70")
+
+        q_sb = ttk.Scrollbar(q_tv_frame, orient="vertical",
+                             command=self._queue_tv.yview)
+        self._queue_tv.configure(yscrollcommand=q_sb.set)
+        q_sb.pack(side="right", fill="y")
+        self._queue_tv.pack(fill="x", expand=True)
+        self._queue_tv.bind("<Double-Button-1>", self._queue_show_result)
+
+        # ── Queue add controls ─────────────────────────────────────
+        q_add_row = ttk.Frame(q_frame)
+        q_add_row.pack(fill="x", padx=6, pady=(4, 2))
+
+        ttk.Button(q_add_row, text="➕ Add Files…",
+                   command=self._queue_browse_add).pack(side="left")
+        ttk.Label(q_add_row, text="  Type:", foreground="#6c7086").pack(
+            side="left", padx=(10, 2))
+        self._queue_type_var = tk.StringVar(value="raw")
+        ttk.Combobox(q_add_row, textvariable=self._queue_type_var,
+                     values=["raw", "edited", "custom"],
+                     state="readonly", width=8).pack(side="left")
+        ttk.Label(
+            q_add_row,
+            text="  raw=full analysis+roast  ·  edited=QC+loudness only  ·  custom=use options panel",
+            foreground="#45475a", font=("", 9),
+        ).pack(side="left", padx=6)
+
+        # ── Queue management buttons ───────────────────────────────
+        q_mgmt_row = ttk.Frame(q_frame)
+        q_mgmt_row.pack(fill="x", padx=6, pady=(0, 2))
+        ttk.Button(q_mgmt_row, text="▲",        width=3,
+                   command=self._queue_move_up).pack(side="left")
+        ttk.Button(q_mgmt_row, text="▼",        width=3,
+                   command=self._queue_move_down).pack(side="left", padx=2)
+        ttk.Button(q_mgmt_row, text="🗑 Remove", command=self._queue_remove).pack(
+            side="left", padx=4)
+        ttk.Button(q_mgmt_row, text="Change Type",
+                   command=self._queue_change_type).pack(side="left", padx=4)
+        ttk.Button(q_mgmt_row, text="Clear Done",
+                   command=self._queue_clear_done).pack(side="left", padx=4)
+        ttk.Button(q_mgmt_row, text="Clear All",
+                   command=self._queue_clear_all).pack(side="left", padx=4)
+        ttk.Separator(q_mgmt_row, orient="vertical").pack(
+            side="left", fill="y", padx=8)
+        ttk.Button(q_mgmt_row, text="💾 Save Queue",
+                   command=self._queue_save).pack(side="left", padx=2)
+        ttk.Button(q_mgmt_row, text="📂 Load Queue",
+                   command=self._queue_load).pack(side="left", padx=2)
+
+        # ── Queue run controls ─────────────────────────────────────
+        q_run_row = ttk.Frame(q_frame)
+        q_run_row.pack(fill="x", padx=6, pady=(4, 6))
+        self._queue_run_btn = ttk.Button(q_run_row, text="▶  Run Queue",
+                                          command=self._queue_run)
+        self._queue_run_btn.pack(side="left")
+        self._queue_pause_btn = ttk.Button(q_run_row, text="⏸  Pause",
+                                            command=self._queue_pause,
+                                            state="disabled")
+        self._queue_pause_btn.pack(side="left", padx=6)
+        ttk.Button(q_run_row, text="■  Stop Queue",
+                   command=self._queue_stop).pack(side="left")
+
+        self._queue_status_var = tk.StringVar(value="Queue empty")
+        ttk.Label(q_run_row, textvariable=self._queue_status_var,
+                  foreground="#89b4fa").pack(side="left", padx=12)
+
+        # Auto-load persisted queue if it exists
+        self._queue_autoload()
+
+    # ---- Video tab methods ----
+
+    def _video_log_append(self, msg: str):
+        """Append a line to the video progress log (thread-safe via after)."""
+        def _do():
+            self._video_log.configure(state="normal")
+            tag = ("ok"   if "✓" in msg else
+                   "err"  if "✗" in msg else
+                   "warn" if "⚠" in msg else
+                   "hdr"  if msg.startswith("▶") else "")
+            self._video_log.insert("end", msg + "\n", tag)
+            self._video_log.see("end")
+            self._video_log.configure(state="disabled")
+        self.after(0, _do)
+
+    def _video_browse(self):
+        from tkinter import filedialog as _fd
+        path = _fd.askopenfilename(
+            title="Select video file",
+            filetypes=[
+                ("Video files", "*.mp4 *.mov *.avi *.mkv *.webm *.m4v *.flv *.wmv"),
+                ("All files", "*.*"),
+            ],
+        )
+        if path:
+            self._video_path_var.set(path)
+
+    def _video_detect_vision_models(self):
+        if not self._video_proc:
+            return
+        models = self._video_proc.available_vision_models()
+        if models:
+            self._vision_cb.configure(values=models)
+            self._vision_model_var.set(models[0])
+            self._video_log_append(f"✓ Found vision models: {', '.join(models)}")
+        else:
+            self._video_log_append(
+                "⚠ No vision models found. Install one with:\n  ollama pull llava:7b\n  ollama pull moondream"
+            )
+
+    def _video_run(self):
+        if not self._video_proc:
+            messagebox.showwarning("Video", "video_processor.py not available.", parent=self)
+            return
+        path = self._video_path_var.get().strip()
+        if not path:
+            messagebox.showwarning("Video", "Select a video file first.", parent=self)
+            return
+
+        # Clear log
+        self._video_log.configure(state="normal")
+        self._video_log.delete("1.0", "end")
+        self._video_log.configure(state="disabled")
+
+        self._video_cancelled = False
+        self._video_run_btn.configure(state="disabled")
+
+        # Resolve models
+        _roast_role      = self._roast_model_var.get() if hasattr(self, "_roast_model_var") else "writer"
+        personality      = (getattr(self, _roast_role, None)
+                            or getattr(self, "director", None)
+                            or getattr(self, "content", None)
+                            or getattr(self, "writer", None))
+        sage_model       = (getattr(self, "sage", None)
+                            if getattr(self, "_do_sage_logic_var", tk.BooleanVar()).get() else None)
+        algorithm_model  = (getattr(self, "algorithm", None)
+                            if getattr(self, "_do_algorithm_var", tk.BooleanVar(value=True)).get() else None)
+        coach_model      = (getattr(self, "coach", None)
+                            if getattr(self, "_do_coach_var", tk.BooleanVar(value=True)).get() else None)
+        style_mgr        = getattr(self, "_content_style", None)
+
+        def worker():
+            try:
+                result = self._video_proc.process(
+                    path,
+                    whisper_model=self._whisper_model_var.get(),
+                    whisper_device=self._whisper_device_var.get(),
+                    do_frames=bool(self._do_frames_var.get()),
+                    frame_interval_s=int(self._frame_interval_var.get() or 10),
+                    max_frames=int(self._max_frames_var.get() or 20),
+                    vision_model=self._vision_model_var.get(),
+                    personality_model=personality if self._do_vibe_var.get() else None,
+                    content_style_manager=style_mgr if self._do_vibe_var.get() else None,
+                    sage_model=sage_model,
+                    algorithm_model=algorithm_model,
+                    coach_model=coach_model,
+                    do_audio_analysis=bool(getattr(self, "_do_audio_quality_var",
+                                                    tk.BooleanVar(value=True)).get()),
+                    do_energy_profile=bool(getattr(self, "_do_energy_var",
+                                                   tk.BooleanVar(value=True)).get()),
+                    do_visual_analysis=bool(getattr(self, "_do_visual_var",
+                                                    tk.BooleanVar(value=True)).get()),
+                    do_edit_suggestions=True,
+                    do_roast=bool(getattr(self, "_do_roast_var",
+                                          tk.BooleanVar(value=True)).get()),
+                    progress_cb=self._video_log_append,
+                    cancelled=lambda: self._video_cancelled,
+                )
+                self._last_video_analysis = result
+
+                # ── Build rich summary for Council transcript ──────────
+                summary_parts = [f"✓ Processed: {Path(path).name}"]
+
+                if result.transcript:
+                    summary_parts.append(
+                        f"📝 Transcript: {len(result.transcript)} segments")
+
+                if result.audio_quality:
+                    aq = result.audio_quality
+                    aq_flags = []
+                    if aq.has_clipping:            aq_flags.append("⚠ CLIPPING")
+                    if aq.is_too_quiet:            aq_flags.append("⚠ Too quiet")
+                    if aq.is_normalisation_needed: aq_flags.append("⚠ Needs loudness normalisation")
+                    if aq.longest_silence_s > 3:   aq_flags.append(
+                        f"⚠ Longest silence: {aq.longest_silence_s:.1f}s")
+                    flags_txt = "  " + "  ".join(aq_flags) if aq_flags else "  ✓ Clean"
+                    summary_parts.append(
+                        f"🎚 Audio: {aq.integrated_lufs:.1f} LUFS  "
+                        f"RMS {aq.rms_db:.1f} dB  "
+                        f"{aq.silence_count} silence gaps\n{flags_txt}")
+
+                if result.energy_profile:
+                    dead  = sum(1 for e in result.energy_profile if e.label == "dead")
+                    low   = sum(1 for e in result.energy_profile if e.label == "low")
+                    high  = sum(1 for e in result.energy_profile if e.label == "high")
+                    summary_parts.append(
+                        f"⚡ Energy: {high} high / {low} low / {dead} dead windows")
+                    dead_segs = [e for e in result.energy_profile if e.label == "dead"]
+                    if dead_segs:
+                        summary_parts.append(
+                            "  Dead air at: " +
+                            ", ".join(e.timecode() for e in dead_segs[:4]))
+
+                if result.visual_issues:
+                    by_type: dict = {}
+                    for vi in result.visual_issues:
+                        by_type[vi.issue_type] = by_type.get(vi.issue_type, 0) + 1
+                    vis_txt = "  ".join(f"{k}: {v}" for k, v in by_type.items())
+                    summary_parts.append(f"🖼 Visual issues: {vis_txt}")
+
+                if result.edit_suggestions:
+                    high_p = [s for s in result.edit_suggestions if s.priority == "high"]
+                    summary_parts.append(
+                        f"📋 Edit suggestions: {len(result.edit_suggestions)} total "
+                        f"({len(high_p)} high priority) — click 'Edit Suggestions' to view")
+
+                if result.roast:
+                    summary_parts.append(
+                        f"\n🔥 PEASANT GRADE: {result.roast.grade}\n"
+                        + result.roast.roast_text[:600]
+                        + ("\n..." if len(result.roast.roast_text) > 600 else "")
+                        + "\n\n(Full roast available via 'Show Roast' button)")
+
+                if result.vibe_summary:
+                    summary_parts.append(
+                        f"\n📊 VIBE:\n{result.vibe_summary}\n\n"
+                        f"PACING:\n{result.pacing_notes}")
+
+                _summary = "\n\n".join(summary_parts)
+                _name    = Path(path).name
+                self.after(0, lambda n=_name, s=_summary: self._append_transcript(
+                    "Video Analyser", s, "final"))
+
+            except Exception as e:
+                import traceback
+                self._video_log_append(f"✗ Fatal error: {e}")
+                self._video_log_append(traceback.format_exc()[:500])
+            finally:
+                self.after(0, lambda: self._video_run_btn.configure(state="normal"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _video_stop(self):
+        self._video_cancelled = True
+        self._video_log_append("⚠ Stop requested — will halt after current step completes.")
+
+    def _video_show_edit_suggestions(self):
+        """Popup showing all edit suggestions with FFmpeg snippets."""
+        a = self._last_video_analysis
+        if not a or not a.edit_suggestions:
+            messagebox.showinfo("Edit Suggestions",
+                                "No edit suggestions yet. Run an analysis first.",
+                                parent=self)
+            return
+
+        win = tk.Toplevel(self)
+        win.title("📋 Edit Suggestions")
+        win.configure(bg="#1e1e2e")
+        win.geometry("800x560")
+
+        ttk.Label(win,
+                  text=f"Edit suggestions for: {Path(a.video_path).name}",
+                  foreground="#89b4fa", font=("", 10, "bold")).pack(
+                      anchor="w", padx=12, pady=(8, 4))
+
+        fr = ttk.Frame(win)
+        fr.pack(fill="both", expand=True, padx=10, pady=4)
+        txt = tk.Text(fr, bg="#11111b", fg="#cdd6f4", font=("Consolas", 9),
+                      relief="flat", wrap="word", state="normal")
+        sb  = ttk.Scrollbar(fr, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(fill="both", expand=True)
+        txt.tag_config("high",   foreground="#f38ba8", font=("Consolas", 9, "bold"))
+        txt.tag_config("medium", foreground="#f9e2af", font=("Consolas", 9, "bold"))
+        txt.tag_config("low",    foreground="#a6e3a1", font=("Consolas", 9, "bold"))
+        txt.tag_config("cmd",    foreground="#89dceb", background="#181825",
+                                  font=("Consolas", 9))
+        txt.tag_config("header", foreground="#cba6f7", font=("Consolas", 10, "bold"))
+
+        # Audio quality summary
+        if a.audio_quality:
+            aq = a.audio_quality
+            txt.insert("end", "── AUDIO QUALITY REPORT ─────────────────────────\n",
+                       "header")
+            txt.insert("end",
+                       f"  RMS: {aq.rms_db:.1f} dB  |  Peak: {aq.peak_db:.1f} dB  |  "
+                       f"DR: {aq.dynamic_range_db:.1f} dB\n"
+                       f"  Integrated: {aq.integrated_lufs:.1f} LUFS  |  "
+                       f"LRA: {aq.loudness_range_lu:.1f} LU  |  "
+                       f"TruePeak: {aq.true_peak_dbtp:.1f} dBTP\n"
+                       f"  Clipping: {'⚠ YES' if aq.has_clipping else 'No'}  |  "
+                       f"Too quiet: {'⚠ YES' if aq.is_too_quiet else 'No'}  |  "
+                       f"Needs normalisation: {'⚠ YES' if aq.is_normalisation_needed else 'No'}\n"
+                       f"  Silence gaps: {aq.silence_count}  "
+                       f"({aq.total_silence_s:.1f}s total, "
+                       f"longest {aq.longest_silence_s:.1f}s)\n\n")
+
+        # Energy profile summary
+        if a.energy_profile:
+            txt.insert("end", "── ENERGY PROFILE ───────────────────────────────\n",
+                       "header")
+            for ep in a.energy_profile:
+                tag = ("high" if ep.label == "high" else
+                       "medium" if ep.label == "normal" else
+                       "low")
+                bar = "█" * int(ep.score * 20)
+                txt.insert("end",
+                           f"  {ep.timecode():22s}  {ep.label:6s}  "
+                           f"{ep.wps:.1f} wps  [{bar:<20}]\n", tag)
+                if ep.note:
+                    txt.insert("end", f"            {ep.note}\n")
+            txt.insert("end", "\n")
+
+        # Edit suggestions
+        txt.insert("end", "── EDIT SUGGESTIONS ─────────────────────────────\n",
+                   "header")
+        for i, s in enumerate(a.edit_suggestions, 1):
+            pri_tag = s.priority if s.priority in ("high", "medium", "low") else "low"
+            txt.insert("end",
+                       f"[{i}] [{s.priority.upper()}] {s.suggestion_type}\n",
+                       pri_tag)
+            if s.timecode:
+                txt.insert("end", f"    Timecode: {s.timecode}\n")
+            txt.insert("end", f"    {s.description}\n")
+            if s.ffmpeg_snippet:
+                txt.insert("end", f"    $ {s.ffmpeg_snippet}\n", "cmd")
+            txt.insert("end", "\n")
+
+        txt.configure(state="disabled")
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=6)
+
+    def _video_show_roast(self):
+        """Popup showing the full Peasant Roast critique."""
+        a = self._last_video_analysis
+        if not a or not a.roast:
+            messagebox.showinfo("Peasant Roast",
+                                "No roast available. Run analysis with Roast enabled.",
+                                parent=self)
+            return
+
+        roast = a.roast
+        win   = tk.Toplevel(self)
+        win.title("🔥 Peasant Roast")
+        win.configure(bg="#1e1e2e")
+        win.geometry("820x620")
+
+        grade_colour = {
+            "A": "#a6e3a1", "B": "#94e2d5",
+            "C": "#f9e2af", "D": "#fab387", "F": "#f38ba8",
+        }.get(roast.grade[:1], "#cdd6f4")
+
+        hdr = ttk.Frame(win)
+        hdr.pack(fill="x", padx=12, pady=(8, 4))
+        ttk.Label(hdr, text="🔥 Peasant Roast",
+                  foreground="#f38ba8", font=("", 12, "bold")).pack(side="left")
+        ttk.Label(hdr, text=f"  Grade: {roast.grade}",
+                  foreground=grade_colour,
+                  font=("", 14, "bold")).pack(side="left", padx=8)
+        ttk.Label(hdr, text=f"  {Path(a.video_path).name}",
+                  foreground="#6c7086").pack(side="left")
+        # Show detected content context
+        if getattr(a, "video_context", None) and a.video_context.content_type != "unknown":
+            vc = a.video_context
+            ctx_lbl = (f"  [{vc.content_type.upper()}]"
+                       + (f"  {vc.topic[:70]}" if vc.topic else "")
+                       + (f"  (detected by {vc.detected_by})" if vc.detected_by else ""))
+            ttk.Label(hdr, text=ctx_lbl,
+                      foreground="#89b4fa", font=("", 9)).pack(side="left", padx=6)
+
+
+        # Filler word summary
+        if roast.filler_word_hits:
+            top = list(roast.filler_word_hits.items())[:6]
+            filler_txt = "  Worst filler words: " + "  ".join(
+                f"'{w}' ×{n}" for w, n in top)
+            ttk.Label(win, text=filler_txt,
+                      foreground="#f9e2af", font=("", 9)).pack(
+                          anchor="w", padx=12)
+
+        fr = ttk.Frame(win)
+        fr.pack(fill="both", expand=True, padx=10, pady=4)
+        txt = tk.Text(fr, bg="#11111b", fg="#cdd6f4", font=("Consolas", 9),
+                      relief="flat", wrap="word", state="normal")
+        sb  = ttk.Scrollbar(fr, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(fill="both", expand=True)
+        txt.tag_config("section", foreground="#cba6f7",
+                        font=("Consolas", 10, "bold"))
+        txt.tag_config("pos",     foreground="#a6e3a1")
+        txt.tag_config("neg",     foreground="#f38ba8")
+        txt.tag_config("warn",    foreground="#f9e2af")
+
+        def _section(header, content, tag=""):
+            if not content:
+                return
+            txt.insert("end", f"\n── {header} ─────────────────\n", "section")
+            txt.insert("end", content + "\n", tag)
+
+        _section("THE ROAST", roast.roast_text, "neg")
+
+        if roast.boring_sections:
+            txt.insert("end", "\n── BORING PATCHES ──────────────────\n", "section")
+            for tc, reason in roast.boring_sections:
+                txt.insert("end", f"  {tc}  {reason}\n", "warn")
+
+        if roast.logic_issues:
+            txt.insert("end", "\n── LOGIC / CLARITY ISSUES ──────────\n", "section")
+            for issue in roast.logic_issues:
+                txt.insert("end", f"  • {issue}\n", "warn")
+
+        if roast.clarity_issues:
+            txt.insert("end", "\n── MUST FIX ─────────────────────────\n", "section")
+            for c in roast.clarity_issues:
+                txt.insert("end", f"  ✗ {c}\n", "neg")
+
+        if roast.positive_notes:
+            txt.insert("end", "\n── WHAT ACTUALLY WORKED ─────────────\n", "section")
+            for p in roast.positive_notes:
+                txt.insert("end", f"  ✓ {p}\n", "pos")
+
+        txt.configure(state="disabled")
+
+        bf = ttk.Frame(win)
+        bf.pack(fill="x", padx=10, pady=6)
+        ttk.Button(bf, text="Send roast to Council",
+                   command=lambda: (
+                       self._set_text(self.input,
+                                      f"Roast Grade: {roast.grade}\n\n"
+                                      + roast.roast_text),
+                       self.nb.select(self.tab_council),
+                       win.destroy()
+                   )).pack(side="left")
+        ttk.Button(bf, text="Close", command=win.destroy).pack(side="right")
+
+    def _video_show_algorithm_notes(self):
+        """Popup showing the Algorithm retention / packaging analysis."""
+        a = self._last_video_analysis
+        notes = getattr(a, "algorithm_notes", "") if a else ""
+        if not notes:
+            messagebox.showinfo("Algorithm Notes",
+                                "No Algorithm notes available.\n"
+                                "Run analysis with '📦 Algorithm' enabled.",
+                                parent=self)
+            return
+        self._video_text_popup("📦 Algorithm — Retention & Packaging", notes,
+                               Path(a.video_path).name)
+
+    def _video_show_coach_notes(self):
+        """Popup showing the Coach delivery / pacing analysis."""
+        a = self._last_video_analysis
+        notes = getattr(a, "coach_notes", "") if a else ""
+        if not notes:
+            messagebox.showinfo("Coach Notes",
+                                "No Coach notes available.\n"
+                                "Run analysis with '🎙 Coach' enabled.",
+                                parent=self)
+            return
+        self._video_text_popup("🎙 Coach — Delivery & Pacing", notes,
+                               Path(a.video_path).name)
+
+    def _video_text_popup(self, title: str, text: str, subtitle: str = ""):
+        """Generic read-only text popup for algorithm/coach notes."""
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.configure(bg="#1e1e2e")
+        win.geometry("860x600")
+
+        hdr = ttk.Frame(win)
+        hdr.pack(fill="x", padx=12, pady=(8, 4))
+        ttk.Label(hdr, text=title, foreground="#89b4fa",
+                  font=("", 12, "bold")).pack(side="left")
+        if subtitle:
+            ttk.Label(hdr, text=f"  {subtitle}",
+                      foreground="#6c7086").pack(side="left")
+
+        txt_frame = ttk.Frame(win)
+        txt_frame.pack(fill="both", expand=True, padx=10, pady=4)
+        txt = self._make_text(txt_frame, wrap="word", state="normal")
+        sb  = ttk.Scrollbar(txt_frame, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(fill="both", expand=True)
+
+        # Colour-code key section headers
+        txt.tag_config("hdr",  foreground="#89b4fa", font=("Consolas", 9, "bold"))
+        txt.tag_config("pos",  foreground="#a6e3a1")
+        txt.tag_config("warn", foreground="#fab387")
+        txt.tag_config("neg",  foreground="#f38ba8")
+
+        for line in text.splitlines():
+            upper = line.upper().strip()
+            if any(upper.startswith(h) for h in (
+                "HOOK", "RETENTION", "PACING", "ENERGY", "CLARITY",
+                "CONFIDENCE", "WORST", "DRILL", "TITLE", "DESCRIPTION",
+                "OPEN LOOP", "PATTERN", "ALGORITHM", "DELIVERY GRADE",
+                "WHAT'S WORKING",
+            )):
+                txt.insert("end", line + "\n", "hdr")
+            elif "✓" in line or "WORKING" in line.upper():
+                txt.insert("end", line + "\n", "pos")
+            elif any(w in line.upper() for w in ("WEAK", "MISSING", "FAILS", "BAD", "WORST")):
+                txt.insert("end", line + "\n", "neg")
+            elif line.startswith("-") or line.startswith("•"):
+                txt.insert("end", line + "\n", "warn")
+            else:
+                txt.insert("end", line + "\n")
+
+        txt.configure(state="disabled")
+
+        bf = ttk.Frame(win)
+        bf.pack(fill="x", padx=10, pady=6)
+        ttk.Button(bf, text="Send to Council",
+                   command=lambda: (
+                       self._set_text(self.input, text),
+                       self.nb.select(self.tab_council),
+                       win.destroy(),
+                   )).pack(side="left")
+        ttk.Button(bf, text="Close", command=win.destroy).pack(side="right")
+
+    # =========================================================
+    # Video Queue — management helpers
+    # =========================================================
+
+    def _queue_file(self) -> Path:
+        return VAULT_DIR / "video_queue.json"
+
+    def _queue_tv_refresh(self):
+        """Redraw the entire treeview from self._video_queue_items."""
+        self._queue_tv.delete(*self._queue_tv.get_children())
+        for i, item in enumerate(self._video_queue_items):
+            dur = (f"{int(item.duration_s//60)}:{int(item.duration_s%60):02d}"
+                   if item.duration_s > 0 else "—")
+            self._queue_tv.insert(
+                "", "end",
+                iid=str(i),
+                values=(i + 1, item.label, item.type_icon,
+                        f"{item.status_icon} {item.status}", dur),
+                tags=(item.status,),
+            )
+        n      = len(self._video_queue_items)
+        done   = sum(1 for x in self._video_queue_items if x.status == "done")
+        errors = sum(1 for x in self._video_queue_items if x.status == "error")
+        self._queue_status_var.set(
+            f"{n} items  ·  {done} done  ·  {errors} errors"
+            if n else "Queue empty")
+
+    def _queue_selected_idx(self) -> Optional[int]:
+        sel = self._queue_tv.selection()
+        return int(sel[0]) if sel else None
+
+    def _queue_add_current(self):
+        """Add the currently selected file-picker file to the queue."""
+        path = self._video_path_var.get().strip()
+        if not path:
+            messagebox.showwarning("Queue", "Select a video file first.", parent=self)
+            return
+        self._queue_enqueue(Path(path), self._queue_type_var.get())
+
+    def _queue_browse_add(self):
+        """Browse and add one or more files directly to the queue."""
+        from tkinter import filedialog as _fd
+        paths = _fd.askopenfilenames(
+            title="Add videos to queue",
+            filetypes=[
+                ("Video files", "*.mp4 *.mov *.avi *.mkv *.webm *.m4v *.flv *.wmv"),
+                ("All files", "*.*"),
+            ],
+        )
+        for p in paths:
+            self._queue_enqueue(Path(p), self._queue_type_var.get())
+
+    def _queue_enqueue(self, path: Path, video_type: str = "raw"):
+        """Append a single path to the queue."""
+        if not _VIDEO_OK:
+            return
+        item = vp.VideoQueueItem(path=str(path), video_type=video_type)
+        self._video_queue_items.append(item)
+        self._queue_tv_refresh()
+        self._queue_save()
+        self._video_log_append(f"  ➕ Queued [{item.type_icon}]: {item.label}")
+
+    def _queue_remove(self):
+        idx = self._queue_selected_idx()
+        if idx is None:
+            return
+        item = self._video_queue_items[idx]
+        if item.status == "processing":
+            messagebox.showwarning("Queue",
+                                    "Cannot remove an item currently being processed.",
+                                    parent=self)
+            return
+        self._video_queue_items.pop(idx)
+        self._queue_tv_refresh()
+        self._queue_save()
+
+    def _queue_move_up(self):
+        idx = self._queue_selected_idx()
+        if idx is None or idx == 0:
+            return
+        q = self._video_queue_items
+        q[idx - 1], q[idx] = q[idx], q[idx - 1]
+        self._queue_tv_refresh()
+        self._queue_tv.selection_set(str(idx - 1))
+        self._queue_save()
+
+    def _queue_move_down(self):
+        idx = self._queue_selected_idx()
+        if idx is None or idx >= len(self._video_queue_items) - 1:
+            return
+        q = self._video_queue_items
+        q[idx + 1], q[idx] = q[idx], q[idx + 1]
+        self._queue_tv_refresh()
+        self._queue_tv.selection_set(str(idx + 1))
+        self._queue_save()
+
+    def _queue_change_type(self):
+        """Change the video_type of the selected item."""
+        idx = self._queue_selected_idx()
+        if idx is None:
+            return
+        item = self._video_queue_items[idx]
+        if item.status == "processing":
+            return
+        new_type = self._queue_type_var.get()
+        item.video_type = new_type
+        self._queue_tv_refresh()
+        self._queue_save()
+
+    def _queue_clear_done(self):
+        self._video_queue_items = [
+            x for x in self._video_queue_items
+            if x.status not in ("done", "error", "skipped")
+        ]
+        self._queue_tv_refresh()
+        self._queue_save()
+
+    def _queue_clear_all(self):
+        if self._queue_running:
+            messagebox.showwarning("Queue",
+                                    "Stop the queue first before clearing.",
+                                    parent=self)
+            return
+        self._video_queue_items.clear()
+        self._queue_tv_refresh()
+        self._queue_save()
+
+    # =========================================================
+    # Video Queue — persistence
+    # =========================================================
+
+    def _queue_save(self):
+        """Save the current queue to vault/video_queue.json."""
+        if not _VIDEO_OK:
+            return
+        try:
+            data = [item.to_dict() for item in self._video_queue_items]
+            self._queue_file().write_text(
+                _json.dumps(data, indent=2, ensure_ascii=False),
+                encoding="utf-8")
+        except Exception as e:
+            pass  # non-fatal
+
+    def _queue_load(self):
+        """Load queue from vault/video_queue.json (prompts if non-empty)."""
+        if not _VIDEO_OK:
+            return
+        qf = self._queue_file()
+        if not qf.exists():
+            messagebox.showinfo("Queue", "No saved queue found.", parent=self)
+            return
+        if self._video_queue_items:
+            if not messagebox.askyesno(
+                    "Queue", "Replace current queue with saved queue?",
+                    parent=self):
+                return
+        try:
+            data = _json.loads(qf.read_text(encoding="utf-8"))
+            self._video_queue_items = [vp.VideoQueueItem.from_dict(d) for d in data]
+            # Reset in-progress items back to queued
+            for item in self._video_queue_items:
+                if item.status == "processing":
+                    item.status = "queued"
+            self._queue_tv_refresh()
+            self._video_log_append(
+                f"✓ Loaded queue: {len(self._video_queue_items)} items")
+        except Exception as e:
+            messagebox.showerror("Queue", f"Load error: {e}", parent=self)
+
+    def _queue_autoload(self):
+        """Silently load queue on startup if a saved file exists."""
+        if not _VIDEO_OK:
+            return
+        try:
+            qf = self._queue_file()
+            if qf.exists():
+                data = _json.loads(qf.read_text(encoding="utf-8"))
+                items = [vp.VideoQueueItem.from_dict(d) for d in data]
+                for item in items:
+                    if item.status == "processing":
+                        item.status = "queued"
+                self._video_queue_items = items
+                self._queue_tv_refresh()
+        except Exception:
+            pass
+
+    # =========================================================
+    # Video Queue — runner
+    # =========================================================
+
+    def _queue_run(self):
+        """Start or resume processing the queue."""
+        if not _VIDEO_OK:
+            return
+        pending = [x for x in self._video_queue_items
+                   if x.status == "queued"]
+        if not pending:
+            messagebox.showinfo("Queue",
+                                 "No queued items to process.",
+                                 parent=self)
+            return
+        if self._queue_running:
+            return
+
+        self._queue_running     = True
+        self._queue_paused      = False
+        self._queue_stop_flag   = False
+        self._queue_run_btn.configure(state="disabled")
+        self._queue_pause_btn.configure(state="normal")
+        self._video_log_append(
+            f"▶ Queue started — {len(pending)} item(s) to process")
+
+        def _runner():
+            for idx, item in enumerate(self._video_queue_items):
+                if item.status != "queued":
+                    continue
+                if self._queue_stop_flag:
+                    break
+
+                # Wait if paused
+                while self._queue_paused and not self._queue_stop_flag:
+                    import time as _t; _t.sleep(0.5)
+                if self._queue_stop_flag:
+                    break
+
+                self._queue_current_idx = idx
+                item.status = "processing"
+                self.after(0, self._queue_tv_refresh)
+                self._video_log_append(
+                    f"\n▶▶ Queue [{idx+1}/{len(self._video_queue_items)}]: "
+                    f"{item.label}  [{item.type_icon}]")
+
+                try:
+                    flags = self._queue_flags_for(item)
+                    result = self._video_proc.process(
+                        item.path,
+                        **flags,
+                        progress_cb=self._video_log_append,
+                        cancelled=lambda: self._queue_stop_flag,
+                    )
+                    self._last_video_analysis = result
+                    item.status     = "done"
+                    item.duration_s = result.duration_s
+                    # Find the saved JSON path
+                    saved = self._video_proc.list_analyses()
+                    if saved:
+                        item.result_path = str(saved[0])
+                    self._video_log_append(
+                        f"  ✓ Queue item done: {item.label}"
+                        + (f"  Grade: {result.roast.grade}"
+                           if result.roast else ""))
+                    # Post rich summary if roast available
+                    if result.vibe_summary or result.roast:
+                        self._queue_post_summary(item, result)
+
+                except Exception as e:
+                    import traceback as _tb
+                    item.status   = "error"
+                    item.error_msg= str(e)
+                    self._video_log_append(f"  ✗ Queue error [{item.label}]: {e}")
+                    self._video_log_append(_tb.format_exc()[:300])
+
+                self.after(0, self._queue_tv_refresh)
+                self._queue_save()
+
+            # Runner finished
+            self._queue_running   = False
+            self._queue_stop_flag = False
+            done   = sum(1 for x in self._video_queue_items if x.status == "done")
+            errors = sum(1 for x in self._video_queue_items if x.status == "error")
+            self._video_log_append(
+                f"\n✓ Queue finished — {done} done, {errors} errors")
+            self.after(0, lambda: (
+                self._queue_run_btn.configure(state="normal"),
+                self._queue_pause_btn.configure(state="disabled"),
+                self._queue_tv_refresh(),
+            ))
+
+        threading.Thread(target=_runner, daemon=True).start()
+
+    def _queue_pause(self):
+        if not self._queue_running:
+            return
+        self._queue_paused = not self._queue_paused
+        lbl = "▶  Resume" if self._queue_paused else "⏸  Pause"
+        self._queue_pause_btn.configure(text=lbl)
+        self._video_log_append(
+            "⏸ Queue paused — will stop after current item finishes."
+            if self._queue_paused else
+            "▶  Queue resumed.")
+
+    def _queue_stop(self):
+        if not self._queue_running:
+            return
+        self._queue_stop_flag = True
+        self._queue_paused    = False
+        self._video_log_append("■ Queue stop requested — finishing current item…")
+
+    def _queue_flags_for(self, item) -> dict:
+        """
+        Return VideoProcessor.process() keyword arguments for this item.
+        raw    → full analysis preset
+        edited → QC-only preset
+        custom → mirrors the GUI options panel
+        """
+        if not _VIDEO_OK:
+            return {}
+        preset = vp.VIDEO_TYPE_PRESETS.get(item.video_type,
+                                            vp.VIDEO_TYPE_PRESETS["raw"]).copy()
+
+        # Resolve models
+        _roast_role  = getattr(self, "_roast_model_var",
+                                tk.StringVar(value="writer")).get()
+        personality  = (getattr(self, _roast_role, None)
+                        or getattr(self, "director", None)
+                        or getattr(self, "writer", None))
+        sage_m       = (getattr(self, "sage", None)
+                        if getattr(self, "_do_sage_logic_var",
+                                   tk.BooleanVar()).get() else None)
+        style_mgr    = getattr(self, "_content_style", None)
+
+        base = {
+            "whisper_model":       self._whisper_model_var.get(),
+            "whisper_device":      self._whisper_device_var.get(),
+            "vision_model":        self._vision_model_var.get(),
+            "personality_model":   personality,
+            "content_style_manager": style_mgr,
+            "sage_model":          sage_m,
+            "algorithm_model":     getattr(self, "algorithm", None),
+            "coach_model":         getattr(self, "coach", None),
+        }
+
+        if item.video_type == "custom":
+            # Override with current GUI option panel values
+            base.update({
+                "do_frames":           bool(self._do_frames_var.get()),
+                "frame_interval_s":    int(self._frame_interval_var.get() or 10),
+                "max_frames":          int(self._max_frames_var.get() or 20),
+                "do_audio_analysis":   bool(getattr(self, "_do_audio_quality_var",
+                                                     tk.BooleanVar(value=True)).get()),
+                "do_energy_profile":   bool(getattr(self, "_do_energy_var",
+                                                     tk.BooleanVar(value=True)).get()),
+                "do_visual_analysis":  bool(getattr(self, "_do_visual_var",
+                                                     tk.BooleanVar(value=True)).get()),
+                "do_edit_suggestions": True,
+                "do_roast":            bool(getattr(self, "_do_roast_var",
+                                                     tk.BooleanVar(value=True)).get()),
+            })
+        else:
+            base.update(preset)
+            # For edited videos: still run Algorithm (packaging matters)
+            # but disable Coach (delivery coaching is pre-edit only) and roast
+            if item.video_type == "edited":
+                base["do_roast"]           = False
+                base["do_edit_suggestions"]= False
+                base["coach_model"]        = None   # delivery coaching = pre-edit only
+
+        return base
+
+    def _queue_post_summary(self, item, result):
+        """Post a summary of a completed queue item to the Council transcript."""
+        parts = [f"✓ Queue: {item.label}  [{item.type_icon}]"]
+        if result.roast:
+            parts.append(f"🔥 Grade: {result.roast.grade}")
+            fillers = sum(result.roast.filler_word_hits.values())
+            if fillers:
+                parts.append(f"   Filler words: {fillers}")
+            if result.roast.boring_sections:
+                parts.append(
+                    f"   Boring patches: {len(result.roast.boring_sections)}")
+        if result.edit_suggestions:
+            high = [s for s in result.edit_suggestions if s.priority == "high"]
+            parts.append(
+                f"📋 {len(result.edit_suggestions)} edit suggestions "
+                f"({len(high)} high priority)")
+        if result.audio_quality and result.audio_quality.has_clipping:
+            parts.append("⚠ CLIPPING detected in audio")
+        if getattr(result, "algorithm_notes", "") and result.algorithm_notes:
+            # Pull just the hook verdict line for the summary
+            import re as _re2
+            hm = _re2.search(r"HOOK VERDICT:\s*(.+)", result.algorithm_notes, _re2.IGNORECASE)
+            if hm:
+                parts.append(f"📦 Algorithm hook: {hm.group(1).strip()[:80]}")
+        if getattr(result, "coach_notes", "") and result.coach_notes:
+            import re as _re3
+            gm = _re3.search(r"DELIVERY GRADE:\s*([A-F][+-]?)", result.coach_notes, _re3.IGNORECASE)
+            if gm:
+                parts.append(f"🎙 Coach delivery grade: {gm.group(1)}")
+        if result.vibe_summary:
+            parts.append(f"\n{result.vibe_summary[:200]}")
+        _summary = "\n".join(parts)
+        self.after(0, lambda s=_summary: self._append_transcript(
+            "Video Queue", s, "final"))
+
+    def _queue_show_result(self, event=None):
+        """Double-click: show edit suggestions / roast for the selected queue item."""
+        idx = self._queue_selected_idx()
+        if idx is None:
+            return
+        item = self._video_queue_items[idx]
+        if item.status == "error":
+            messagebox.showerror("Queue Error",
+                                  f"{item.label}\n\n{item.error_msg}",
+                                  parent=self)
+            return
+        if item.status != "done":
+            messagebox.showinfo("Queue",
+                                 f"{item.label} — status: {item.status}",
+                                 parent=self)
+            return
+        # Try to load the saved analysis
+        if item.result_path and Path(item.result_path).exists() and self._video_proc:
+            a = self._video_proc.load_analysis(Path(item.result_path))
+            if a:
+                self._last_video_analysis = a
+                self._video_show_edit_suggestions()
+                return
+        messagebox.showinfo("Queue",
+                             f"{item.label} — done but result file not found.\n"
+                             f"Expected: {item.result_path}",
+                             parent=self)
+
+    def _video_send_transcript(self):
+        """Send the last transcript to the Council input."""
+        if not self._last_video_analysis or not self._last_video_analysis.transcript:
+            messagebox.showinfo("Video", "No transcript available. Run analysis first.")
+            return
+        txt = self._last_video_analysis.full_transcript_text
+        # Truncate to avoid overwhelming the input
+        if len(txt) > 3000:
+            txt = txt[:3000] + "\n\n[... transcript truncated \u2014 full version in vault ...]"
+        self._set_text(self.input, txt)
+        self.nb.select(self.tab_council)
+
+    def _video_show_history(self):
+        if not self._video_proc:
+            return
+        analyses = self._video_proc.list_analyses()
+        if not analyses:
+            messagebox.showinfo("Video", "No past analyses found.")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Past Video Analyses")
+        win.configure(bg="#1e1e2e")
+        win.geometry("680x480")
+
+        ttk.Label(win, text="Past analyses — double-click to view",
+                  foreground="#6c7086").pack(anchor="w", padx=12, pady=(8, 4))
+
+        lb_frame = ttk.Frame(win)
+        lb_frame.pack(fill="both", expand=True, padx=12, pady=(0, 4))
+        lb = tk.Listbox(lb_frame, bg="#11111b", fg="#cdd6f4",
+                        font=("Consolas", 9), selectmode="single")
+        lb_sb = ttk.Scrollbar(lb_frame, command=lb.yview)
+        lb.configure(yscrollcommand=lb_sb.set)
+        lb_sb.pack(side="right", fill="y")
+        lb.pack(fill="both", expand=True)
+
+        for p in analyses:
+            lb.insert("end", p.name)
+
+        detail = tk.Text(win, height=10, bg="#11111b", fg="#cdd6f4",
+                         font=("Consolas", 9), state="disabled", relief="flat", wrap="word")
+        detail.pack(fill="x", padx=12, pady=(0, 4))
+
+        def _on_select(event=None):
+            sel = lb.curselection()
+            if not sel:
+                return
+            p = analyses[sel[0]]
+            a = self._video_proc.load_analysis(p)
+            if not a:
+                return
+            detail.configure(state="normal")
+            detail.delete("1.0", "end")
+            detail.insert("end", "File: " + Path(a.video_path).name + "\n")
+            detail.insert("end", "Processed: " + a.processed_at + "\n")
+            detail.insert("end", "Segments: " + str(len(a.transcript)) + "  Frames: " + str(len(a.frame_descriptions)) + "\n")
+            if getattr(a, "audio_quality", None):
+                aq = a.audio_quality
+                detail.insert("end",
+                    f"Audio: {aq.integrated_lufs:.1f} LUFS  RMS {aq.rms_db:.1f} dB"
+                    + ("  ⚠ CLIPPING" if aq.has_clipping else "")
+                    + ("  ⚠ Too quiet" if aq.is_too_quiet else "")
+                    + "\n")
+            if getattr(a, "roast", None):
+                detail.insert("end", f"Roast grade: {a.roast.grade}  "
+                              f"Filler words: {sum(a.roast.filler_word_hits.values())}\n")
+            if getattr(a, "edit_suggestions", None):
+                detail.insert("end", f"Edit suggestions: {len(a.edit_suggestions)}\n")
+            detail.insert("end", "\n")
+            if a.vibe_summary:
+                detail.insert("end", "VIBE:\n" + a.vibe_summary + "\n\n")
+            if a.pacing_notes:
+                detail.insert("end", "PACING:\n" + a.pacing_notes + "\n")
+            if getattr(a, "roast", None) and a.roast.roast_text:
+                detail.insert("end", f"\nROAST EXCERPT:\n{a.roast.roast_text[:400]}...\n")
+            detail.configure(state="disabled")
+
+        def _load_selected():
+            sel = lb.curselection()
+            if not sel:
+                return
+            p = analyses[sel[0]]
+            a = self._video_proc.load_analysis(p)
+            if a:
+                self._last_video_analysis = a
+                self._video_log_append(f"✓ Loaded analysis: {p.name}")
+                win.destroy()
+
+        lb.bind("<<ListboxSelect>>", _on_select)
+        lb.bind("<Double-1>", lambda e: _load_selected())
+
+        bf = ttk.Frame(win)
+        bf.pack(fill="x", padx=12, pady=(0, 8))
+        ttk.Button(bf, text="Load Selected", command=_load_selected).pack(side="left")
+        ttk.Button(bf, text="Close", command=win.destroy).pack(side="right")
+
+    # ---- Apothecary tab ----
+
+    def _build_apoth_tab(self):
+        self.tab_apoth = ttk.Frame(self.nb)
+        self.nb.add(self.tab_apoth, text="🔧 Apothecary")
+        self.apoth_console = ae.ApothecaryConsole(self.tab_apoth, self.apoth, ui_queue=self.ui_q)
+        self.apoth_console.pack(fill="both", expand=True)
+
+    # ============================
+    # Transcript helpers
+    # ============================
+
+    def _role_tag(self, who: str) -> str:
+        key = who.lower().replace("-", "_").replace(" ", "_")
+        tag = f"who_{key}"
+        if tag in ROLE_COLORS or who in ROLE_COLORS:
+            return tag
+        return "who_default"
+
+    def _set_text(self, widget: tk.Text, text: str):
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text)
+        if widget not in (self.input, self.ide_code, self.stt_out, self.session_preview):
+            widget.configure(state="disabled")
+
+    def _append_transcript(self, who: str, text: str, kind: str = "final"):
+        self.transcript.configure(state="normal")
+        tag = self._role_tag(who)
+        if kind == "phase":
+            self.transcript.insert("end", f"  {text}\n", "phase")
+        elif kind == "token":
+            self.transcript.insert("end", text, "token")
+        else:
+            self.transcript.insert("end", f"\n{who}:\n", tag)
+            self.transcript.insert("end", text.strip() + "\n")
+        self.transcript.see("end")
+        self.transcript.configure(state="disabled")
+
+        if kind not in ("token", "phase", "thought"):
+            self.librarian.log_event(who, text)
+            self.convo_store.append(self.session_id, {"ts": now_iso(), "who": who, "text": text})
+
+    def _append_stream_box(self, who: str, token: str):
+        """Append a single token to the live stream preview box."""
+        self.stream_box.configure(state="normal")
+        if who not in self._stream_buffers:
+            # New speaker — add header
+            self._stream_buffers[who] = ""
+            self.stream_box.insert("end", f"\n{who}: ", self._role_tag(who))
+        self._stream_buffers[who] += token
+        self.stream_box.insert("end", token)
+        self.stream_box.see("end")
+        self.stream_box.configure(state="disabled")
+
+    def _clear_stream_box(self):
+        self._stream_buffers.clear()
+        self.stream_box.configure(state="normal")
+        self.stream_box.delete("1.0", "end")
+        self.stream_box.configure(state="disabled")
+
+    # ── Verdict feedback ──────────────────────────────────────────────────────
+
+    def _vfb_show(self):
+        """Show the agree/disagree bar after a verdict arrives."""
+        if not hasattr(self, "_vfb_frame"):
+            return
+        # Reset state
+        self._vfb_detail.pack_forget()
+        self._vfb_frame.pack(fill="x", pady=(4, 0))
+        self._vfb_agree_btn.configure(state="normal")
+        self._vfb_disagree_btn.configure(state="normal")
+
+    # ── Council instructions ─────────────────────────────────────────────
+
+    def _apply_council_instruction(self):
+        """Add a new instruction to the persistent list."""
+        text = self._inst_var.get().strip()
+        if not text:
+            return
+        name = self._inst_name.get().strip()
+        entry = self._instr_mgr.add(name, text)
+        self._inst_var.set("")
+        self._inst_name.set("")
+        self._update_inst_label()
+        self._append_transcript("Council",
+            f"⚡ Instruction added: [{entry['name']}] {text[:80]}", "observation")
+
+    def _update_inst_label(self):
+        """Refresh the active-count label next to the instruction bar."""
+        n = self._instr_mgr.active_count()
+        total = len(self._instr_mgr.all())
+        if total == 0:
+            self._inst_active_lbl.configure(text="")
+        else:
+            self._inst_active_lbl.configure(
+                text=f"{n}/{total} active",
+                foreground="#a6e3a1" if n > 0 else "#6c7086")
+
+    def _open_instruction_manager(self):
+        """Open the instruction list manager window."""
+        win = tk.Toplevel(self)
+        win.title("Council Instructions")
+        win.configure(bg="#1e1e2e")
+        win.geometry("680x460")
+        win.resizable(True, True)
+
+        ttk.Label(win,
+            text="Instructions are injected into every personality on every call.",
+            foreground="#6c7086").pack(anchor="w", padx=12, pady=(8, 2))
+
+        # ── List ──────────────────────────────────────────────────
+        list_frame = ttk.Frame(win)
+        list_frame.pack(fill="both", expand=True, padx=12, pady=4)
+
+        cols = ("active", "name", "text")
+        tree = ttk.Treeview(list_frame, columns=cols, show="headings", height=10)
+        tree.heading("active", text="On")
+        tree.heading("name",   text="Name")
+        tree.heading("text",   text="Instruction text")
+        tree.column("active", width=40,  anchor="center", stretch=False)
+        tree.column("name",   width=140, stretch=False)
+        tree.column("text",   width=460)
+        sb = ttk.Scrollbar(list_frame, command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        tree.pack(fill="both", expand=True)
+
+        def _refresh():
+            tree.delete(*tree.get_children())
+            for e in self._instr_mgr.all():
+                icon = "✓" if e["active"] else "○"
+                tree.insert("", "end", iid=e["id"],
+                            values=(icon, e["name"], e["text"]))
+
+        _refresh()
+
+        # ── Buttons ───────────────────────────────────────────────
+        bf = ttk.Frame(win)
+        bf.pack(fill="x", padx=12, pady=(0, 10))
+
+        def _toggle():
+            sel = tree.selection()
+            if not sel:
+                return
+            for iid in sel:
+                self._instr_mgr.toggle(iid)
+            _refresh()
+            self._update_inst_label()
+
+        def _delete():
+            sel = tree.selection()
+            if not sel:
+                return
+            for iid in sel:
+                self._instr_mgr.remove(iid)
+            _refresh()
+            self._update_inst_label()
+            self._append_transcript("Council", "⚡ Instruction(s) removed.", "observation")
+
+        def _edit():
+            sel = tree.selection()
+            if not sel:
+                return
+            iid = sel[0]
+            entries = {e["id"]: e for e in self._instr_mgr.all()}
+            entry = entries.get(iid)
+            if not entry:
+                return
+            edit_win = tk.Toplevel(win)
+            edit_win.title("Edit Instruction")
+            edit_win.configure(bg="#1e1e2e")
+            edit_win.geometry("540x200")
+
+            ttk.Label(edit_win, text="Name:").pack(anchor="w", padx=12, pady=(10,2))
+            name_v = tk.StringVar(value=entry["name"])
+            ttk.Entry(edit_win, textvariable=name_v, width=50).pack(anchor="w", padx=12)
+
+            ttk.Label(edit_win, text="Instruction text:").pack(anchor="w", padx=12, pady=(8,2))
+            text_box = tk.Text(edit_win, height=4, wrap="word",
+                               bg="#11111b", fg="#cdd6f4", font=("Consolas", 9))
+            text_box.insert("1.0", entry["text"])
+            text_box.pack(fill="x", padx=12)
+
+            def _save_edit():
+                new_text = text_box.get("1.0", "end").strip()
+                new_name = name_v.get().strip()
+                if new_text:
+                    self._instr_mgr.update_text(iid, new_text)
+                    for e in self._instr_mgr.all():
+                        if e["id"] == iid:
+                            e["name"] = new_name or new_text[:40]
+                    self._instr_mgr._save()
+                edit_win.destroy()
+                _refresh()
+
+            ttk.Button(edit_win, text="Save", command=_save_edit).pack(pady=8)
+
+        def _toggle_all_on():
+            for e in self._instr_mgr.all():
+                if not e["active"]:
+                    self._instr_mgr.toggle(e["id"])
+            _refresh()
+            self._update_inst_label()
+
+        def _toggle_all_off():
+            for e in self._instr_mgr.all():
+                if e["active"]:
+                    self._instr_mgr.toggle(e["id"])
+            _refresh()
+            self._update_inst_label()
+
+        ttk.Button(bf, text="Toggle On/Off", command=_toggle).pack(side="left")
+        ttk.Button(bf, text="Edit",          command=_edit).pack(side="left", padx=4)
+        ttk.Button(bf, text="Delete",        command=_delete).pack(side="left")
+        ttk.Separator(bf, orient="vertical").pack(side="left", fill="y", padx=8)
+        ttk.Button(bf, text="All On",  command=_toggle_all_on).pack(side="left")
+        ttk.Button(bf, text="All Off", command=_toggle_all_off).pack(side="left", padx=4)
+        ttk.Button(bf, text="Close",   command=win.destroy).pack(side="right")
+
+        # Double-click to toggle
+        tree.bind("<Double-1>", lambda e: _toggle())
+
+    # ── Clarification pause/resume ────────────────────────────────────────────
+
+    def _show_clarification(self, who: str, question: str):
+        """Show the clarification panel with the personality's question."""
+        self._clarif_question_lbl.configure(
+            text=f"{who} asks: {question}"
+        )
+        self._clarif_var.set("")
+        self._clarif_frame.pack(fill="x", pady=(4, 0))
+        self._set_status("⏸ Waiting for your answer…", "#fab387")
+
+    def _hide_clarification(self):
+        """Hide the clarification panel."""
+        self._clarif_frame.pack_forget()
+
+    def _submit_clarification(self, skip: bool = False):
+        """User answered the personality's question — resume deliberation."""
+        if skip:
+            self._clarification_answer = "[User skipped — continue without this information]"
+        else:
+            ans = self._clarif_var.get().strip()
+            self._clarification_answer = ans if ans else "[No answer provided]"
+        # Store answer and log BEFORE resuming worker so answer_getter sees it
+        ans_display = self._clarification_answer
+        self._hide_clarification()
+        self._append_transcript("You", ans_display, "final")
+        self._pause_event.set()  # Resume the worker thread
+
+    def _open_content_style(self):
+        """Open the content style manager for cross-session creator learning."""
+        if not hasattr(self, "_content_style"):
+            messagebox.showinfo("Not available", "Content style manager not initialised.", parent=self)
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Content Style & Templates")
+        win.configure(bg="#1e1e2e")
+        win.geometry("700x560")
+        win.resizable(True, True)
+
+        nb = ttk.Notebook(win)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # ── Style Preferences tab ─────────────────────────────────
+        pref_tab = ttk.Frame(nb)
+        nb.add(pref_tab, text="Style Preferences")
+
+        ttk.Label(pref_tab, text="Audience description:",
+                  foreground="#89b4fa").pack(anchor="w", padx=12, pady=(10,2))
+        aud_v = tk.StringVar(value=self._content_style._data.get("audience", ""))
+        ttk.Entry(pref_tab, textvariable=aud_v, width=60).pack(anchor="w", padx=12)
+
+        ttk.Label(pref_tab, text="Channel tone / style:",
+                  foreground="#89b4fa").pack(anchor="w", padx=12, pady=(8,2))
+        tone_v = tk.StringVar(value=self._content_style._data.get("tone", ""))
+        ttk.Entry(pref_tab, textvariable=tone_v, width=60).pack(anchor="w", padx=12)
+
+        ttk.Label(pref_tab, text="Add style note (what worked, what to avoid, etc.):",
+                  foreground="#89b4fa").pack(anchor="w", padx=12, pady=(8,2))
+        _note_row = ttk.Frame(pref_tab)
+        _note_row.pack(fill="x", padx=12)
+        note_v    = tk.StringVar()
+        note_cat  = tk.StringVar(value="general")
+        ttk.Entry(_note_row, textvariable=note_v, width=44).pack(side="left")
+        ttk.Combobox(_note_row, textvariable=note_cat, width=12,
+                     values=["general","hook","pacing","tone","structure","cta"],
+                     state="readonly").pack(side="left", padx=4)
+        ttk.Button(_note_row, text="Add Note",
+                   command=lambda: _add_note()).pack(side="left", padx=4)
+
+        ttk.Label(pref_tab, text="Existing style notes:",
+                  foreground="#6c7086").pack(anchor="w", padx=12, pady=(8,2))
+        notes_box = tk.Text(pref_tab, height=8, bg="#11111b", fg="#cdd6f4",
+                            font=("Consolas", 9), state="disabled", relief="flat", wrap="word")
+        notes_box.pack(fill="both", expand=True, padx=12, pady=(0,8))
+
+        def _refresh_notes():
+            notes_box.configure(state="normal")
+            notes_box.delete("1.0", "end")
+            for n in reversed(self._content_style.get_style_notes()[-20:]):
+                notes_box.insert("end", "[" + n["category"] + "] " + n["note"] + "\n")
+            notes_box.configure(state="disabled")
+
+        def _add_note():
+            txt = note_v.get().strip()
+            if txt:
+                self._content_style.add_style_note(txt, note_cat.get())
+                note_v.set("")
+                _refresh_notes()
+
+        _refresh_notes()
+
+        def _save_prefs():
+            if aud_v.get().strip():
+                self._content_style.set_audience(aud_v.get())
+            if tone_v.get().strip():
+                self._content_style.set_tone(tone_v.get())
+            messagebox.showinfo("Saved", "Style preferences saved.", parent=win)
+
+        ttk.Button(pref_tab, text="Save Preferences", command=_save_prefs).pack(pady=4)
+
+        # ── Templates tab ─────────────────────────────────────────
+        tmpl_tab = ttk.Frame(nb)
+        nb.add(tmpl_tab, text="Script Templates")
+
+        ttk.Label(tmpl_tab,
+                  text="Templates are automatically selected based on your video type request.",
+                  foreground="#6c7086").pack(anchor="w", padx=12, pady=(8,2))
+
+        tmpl_list = tk.Text(tmpl_tab, height=22, bg="#11111b", fg="#cdd6f4",
+                            font=("Consolas", 9), state="disabled", relief="flat", wrap="word")
+        tmpl_sb = ttk.Scrollbar(tmpl_tab, command=tmpl_list.yview)
+        tmpl_list.configure(yscrollcommand=tmpl_sb.set)
+        tmpl_sb.pack(side="right", fill="y", padx=(0,8))
+        tmpl_list.pack(fill="both", expand=True, padx=(12,0), pady=(0,8))
+
+        tmpl_list.configure(state="normal")
+        for key, tmpl in self._content_style.get_templates().items():
+            tmpl_list.insert("end", "▶ " + tmpl["name"] + "\n", "hdr")
+            tmpl_list.insert("end", "  " + tmpl["description"] + "\n", "desc")
+            for step in tmpl.get("structure", []):
+                tmpl_list.insert("end", "    " + step + "\n")
+            tmpl_list.insert("end", "\n")
+        tmpl_list.tag_config("hdr",  foreground="#fab387", font=("Consolas", 9, "bold"))
+        tmpl_list.tag_config("desc", foreground="#6c7086")
+        tmpl_list.configure(state="disabled")
+
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(0,8))
+
+    def _on_voice_toggle(self, *_):
+        """Called whenever the Robust Voices toggle changes."""
+        enabled = bool(self.var_robust_voices.get())
+        ce.set_voice_mode(self.personalities, enabled)
+        state = "ON — each personality now has its own voice" if enabled else "OFF — neutral mode"
+        self._set_status(f"● Robust voices: {state}", "#cba6f7" if enabled else "#a6e3a1")
+
+    def _vfb_hide(self):
+        """Hide the feedback bar and detail panel."""
+        if hasattr(self, "_vfb_frame"):
+            self._vfb_frame.pack_forget()
+        if hasattr(self, "_vfb_detail"):
+            self._vfb_detail.pack_forget()
+
+    def _verdict_agree(self):
+        """User agrees — log it and dismiss the bar."""
+        self._append_transcript("You", "✓ Agreed with verdict.", "observation")
+        # Record agreement in verdict history if the last record exists
+        try:
+            import json
+            path = VAULT_DIR / "verdict_history.jsonl"
+            if path.exists():
+                lines = path.read_text(encoding="utf-8").strip().splitlines()
+                if lines:
+                    last = json.loads(lines[-1])
+                    last["user_agreed"] = True
+                    lines[-1] = json.dumps(last)
+                    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+        self._vfb_hide()
+
+    def _verdict_disagree_open(self):
+        """Open the objection text box."""
+        self._vfb_agree_btn.configure(state="disabled")
+        self._vfb_disagree_btn.configure(state="disabled")
+        self._vfb_text.delete("1.0", "end")
+        self._vfb_detail.pack(fill="x", pady=(2, 0))
+        self._vfb_text.focus_set()
+
+    def _verdict_disagree_cancel(self):
+        """Cancel and re-enable the buttons."""
+        self._vfb_detail.pack_forget()
+        self._vfb_agree_btn.configure(state="normal")
+        self._vfb_disagree_btn.configure(state="normal")
+
+    def _verdict_disagree_submit(self):
+        """
+        Take the user's objection and re-run the last query with it prepended.
+        The council sees the original question plus the user's critique of the
+        previous answer — forcing a fresh deliberation that addresses the objection.
+        """
+        objection = self._vfb_text.get("1.0", "end").strip()
+        if not objection:
+            return
+
+        # Recover last query from transcript
+        last_query = getattr(self, "_last_sent_query", "")
+
+        # Record disagreement in verdict history
+        try:
+            import json
+            path = VAULT_DIR / "verdict_history.jsonl"
+            if path.exists():
+                lines_vrd = path.read_text(encoding="utf-8").strip().splitlines()
+                if lines_vrd:
+                    last_vrd = json.loads(lines_vrd[-1])
+                    last_vrd["user_agreed"]   = False
+                    last_vrd["user_objection"] = objection
+                    lines_vrd[-1] = json.dumps(last_vrd)
+                    path.write_text("\n".join(lines_vrd) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+
+        self._vfb_hide()
+
+        # Build the re-run query with objection prepended
+        if last_query:
+            rerun_text = (
+                f"[USER OBJECTION TO PREVIOUS ANSWER]\n"
+                f"{objection}\n\n"
+                f"[ORIGINAL QUESTION — please re-answer addressing the objection above]\n"
+                f"{last_query}"
+            )
+        else:
+            rerun_text = (
+                f"[USER OBJECTION]\n{objection}\n\n"
+                "Please re-examine your previous answer and address this objection directly."
+            )
+
+        self._append_transcript("You", f"✗ Disagreed: {objection}", "observation")
+        self._set_text(self.input, rerun_text)
+        self._send()
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _set_judge(self, text: str):
+        self.judge_box.configure(state="normal")
+        self.judge_box.delete("1.0", "end")
+        self.judge_box.insert("1.0", text)
+        self.judge_box.configure(state="disabled")
+
+    def _ide_print(self, text: str, tag: str = ""):
+        self.ide_out.configure(state="normal")
+        if tag:
+            self.ide_out.insert("end", text, tag)
+        else:
+            self.ide_out.insert("end", text)
+        self.ide_out.see("end")
+        self.ide_out.configure(state="disabled")
+
+    def _update_tps(self, who: str, tps: float):
+        """Show live tokens/s in the status bar. Keeps a rolling history."""
+        if not hasattr(self, "_tps_history"):
+            self._tps_history = {}
+        self._tps_history[who] = tps
+        if hasattr(self, "tps_label") and self.tps_label.winfo_exists():
+            # Show the most recent role + its speed
+            parts = [k[:4] + ":" + str(v) for k, v in list(self._tps_history.items())[-3:]]
+            self.tps_label.configure(text=" | ".join(parts) + " t/s")
+
+    def _set_status(self, text: str, color: str = "#a6e3a1"):
+        self.status.configure(text=text, foreground=color)
+
+    # ============================
+    # Main send logic
+    # ============================
+
+    def _send(self):
+        # Hide verdict feedback bar on new query
+        self._vfb_hide()
+        user_text = self.input.get("1.0", "end").strip()
+        if not user_text:
+            return
+        self._last_sent_query = user_text   # saved for verdict disagree re-run
+        self._set_text(self.input, "")
+        self._append_transcript("User", user_text)
+        self._clear_stream_box()
+
+        # ── Phase 1: Route (keyword-based, instant) ───────────────────────
+        route = self.judge.route(user_text)
+        self._set_judge(f"Route: {route}\n")
+        self._set_status(f"● {route}…", "#fab387")
+
+        if route == "apothecary":
+            self._append_transcript("Judge", "Routing to Apothecary tab.", "final")
+            self.nb.select(self.tab_apoth)
+            self._set_status("● idle")
+            return
+        if route == "speech":
+            self._append_transcript("Judge", "Routing to Speech tab.", "final")
+            self.nb.select(self.tab_speech)
+            self._set_status("● idle")
+            return
+        if route == "librarian":
+            self._append_transcript("Judge", "Routing to Librarian tab.", "final")
+            self.nb.select(self.tab_lib)
+            self._set_status("● idle")
+            return
+        if route == "ide":
+            self.nb.select(self.tab_ide)
+
+        # ── Phase 2: Panel selection (before worker spawns) ────────────
+        # Resolve the panel HERE in the main thread so the worker can gate
+        # which agent objects it builds — no more TechPriest on "What is the sun?"
+        _keyword_panel, _synth_role = _panel_for_route(route)
+
+        if self.var_judge_panel.get():
+            # Judge model picks roles — brief synchronous call in main thread.
+            # We show a status update so the user sees something is happening.
+            self._set_status("● judge routing…", "#cba6f7")
+            try:
+                _judge_chosen = self.judge.choose_panel(user_text)
+                if _judge_chosen:
+                    _keyword_panel = _judge_chosen
+                    self._set_judge(f"Judge panel: {_judge_chosen}\n")
+                    self._set_status(f"● panel: {_judge_chosen}…", "#fab387")
+            except Exception as _jpe:
+                self._set_judge(f"Judge panel failed ({_jpe}), using keyword panel\n")
+
+        # ── Personality-lead override ────────────────────────────
+        # If the user names a specific personality ("with the writer as lead",
+        # "focus on techpriest", "have the sage take the lead"), reorder the
+        # panel so that personality goes first and becomes the synth role.
+        _LEAD_ALIASES = {
+            "writer":     "writer",
+            "techpriest": "techpriest", "tech priest": "techpriest", "tech-priest": "techpriest",
+            "intern":     "intern",
+            "peasant":    "peasant",
+            "artist":     "artist",
+            "skeptic":    "skeptic",
+            "sage":       "sage",
+            "strategist": "strategist",
+            "librarian":  "librarian",
+            "musician":   "musician",
+            "content":    "content",  "content creator": "content",
+            "director":   "director",
+        }
+        _lead_role = None
+        _t_lower = user_text.lower()
+        _lead_phrases = [
+            "as the lead", "as lead", "take the lead", "as main", "as the main",
+            "as focus", "focus on", "with the", "have the", "personality as",
+            "personality to", "personality taking",
+        ]
+        if any(ph in _t_lower for ph in _lead_phrases):
+            for alias, role in _LEAD_ALIASES.items():
+                if alias in _t_lower:
+                    _lead_role = role
+                    break
+
+        if _lead_role and _lead_role in self.personalities:
+            # Put lead role first, keep others, set as synth
+            _others = [r for r in _keyword_panel if r != _lead_role]
+            _keyword_panel = [_lead_role] + _others
+            _synth_role = _lead_role
+            self._set_judge("Lead role override: " + _lead_role + "\n")
+
+        # _resolved_panel is a closure variable — the worker reads it directly.
+        # It is set once here and never mutated inside the worker.
+        _resolved_panel: list = _keyword_panel
+        _resolved_synth: str  = _synth_role
+
+        use_stream = bool(self.var_stream.get())
+
+        def _token_cb(who: str, token: str):
+            """Called from the worker thread — post to UI queue."""
+            if token.startswith("\x00tps:"):
+                # T3-C: timing sentinel from done packet
+                try:
+                    _tps_val = float(token[5:])
+                    self.ui_q.put(("tps_update", who, _tps_val))
+                except Exception:
+                    pass
+                return
+            if use_stream:
+                self.ui_q.put(("stream_token", who, token))
+
+        def worker():
+            try:
+                use_deliberation  = bool(self.var_deliberate.get())  if hasattr(self, "var_deliberate")  else True
+                use_adversarial   = bool(self.var_adversarial.get()) if hasattr(self, "var_adversarial") else False
+
+                # ── Fast path: Deliberation toggle OFF ─────────────────
+                # Skips the full orchestrator → direct Writer response.
+                # Useful for quick Q&A or when speed matters more than depth.
+                if not use_deliberation:
+                    self.ui_q.put(("agent_phase", "direct", "▶ Direct mode (deliberation off)"))
+                    answer = self.writer.respond(user_text)
+                    ev = AgentEvent("Writer", "final", answer)
+                    self.ui_q.put(("live_event", ev))
+                    self.ui_q.put(("judge_final", ""))
+                    self.ui_q.put(("done", None))
+                    return
+
+                enable_tools = bool(self.var_tools.get())
+                use_tp_agent  = bool(self.var_use_techpriest_agent.get()) if hasattr(self, "var_use_techpriest_agent") else False
+                use_in_agent  = bool(self.var_use_intern_agent.get())     if hasattr(self, "var_use_intern_agent")     else False
+                use_rag       = bool(self.var_use_rag.get())              if hasattr(self, "var_use_rag")              else False
+                tools = _make_tools(self.runner, self.librarian, VAULT_DIR) if enable_tools else {}
+
+                # ── Librarian proactive briefing ───────────────────
+                # Searches vault on multiple angles BEFORE deliberation
+                # so every personality gets relevant context, not just Writer.
+                lib_brief = {"raw": "", "peasant": "", "summary": "", "sources": [], "found": False}
+                rag_context = ""
+                if use_rag and self.rag:
+                    try:
+                        lib_brief = _librarian_brief(
+                            self.rag,
+                            user_text,
+                            log_cb=lambda m: self.ui_q.put(("agent_phase", "rag_search", m)),
+                            max_chars=5500,  # desktop: 8K context window allows larger briefing
+                        )
+                        rag_context = lib_brief["raw"]
+                        if lib_brief["found"]:
+                            self.ui_q.put(("agent_phase", "rag_search",
+                                           f"RAG retrieved context ({len(rag_context)} chars)"))
+                        else:
+                            self.ui_q.put(("agent_phase", "rag_search",
+                                           "RAG: no relevant vault context found"))
+                    except Exception as e:
+                        self.ui_q.put(("agent_phase", "rag_search", f"RAG error: {e}"))
+
+                # Log queries that returned no vault context
+                if use_rag and not lib_brief.get("found", True):
+                    try:
+                        _miss_path = VAULT_DIR / "vault_rag_misses.txt"
+                        with open(_miss_path, "a", encoding="utf-8") as _mf:
+                            _mf.write(now_iso() + "\t" + user_text[:200].replace("\n", " ") + "\n")
+                    except Exception:
+                        pass
+
+                # ── TechPriest agent wrapper ───────────────────────
+                class _TechPriestWrapper:
+                    """Makes TechPriestAgent look like a ModelAgent for the orchestrator."""
+                    display_name = "Tech-Priest"
+                    def __init__(self_, agent):
+                        self_.agent = agent
+                        # Expose .model so orchestrator rebuttal/cross-fire can call .model.respond()
+                        self_.model = agent.model
+                    def _make_token_cb(self_):
+                        return None
+                    def act(self_, ctx):
+                        state = self_.agent.run(ctx.user_text)
+                        evs = [AgentEvent("Tech-Priest", "final",
+                                          f"{state.final_code}\n\n{state.explanation}")]
+                        if state.passed:
+                            evs.insert(0, AgentEvent("Tech-Priest", "observation",
+                                                     f"✓ Passed in {state.attempt} attempt(s)"))
+                        else:
+                            evs.insert(0, AgentEvent("Tech-Priest", "observation",
+                                                     f"⚠ Best effort after {state.attempt} attempts"))
+                        ctx.shared.setdefault("techpriest_code", state.final_code)
+                        return evs
+
+                # ── Intern agent wrapper ───────────────────────────
+                class _InternWrapper:
+                    """Makes InternAgent look like a ModelAgent for the orchestrator."""
+                    display_name = "Intern"
+                    def __init__(self_, agent):
+                        self_.agent = agent
+                        # Expose .model so orchestrator rebuttal/cross-fire can call .model.respond()
+                        self_.model = agent.model
+                    def _make_token_cb(self_):
+                        return None
+                    def act(self_, ctx):
+                        draft = self_.agent.run(ctx.user_text)
+                        evs = [AgentEvent("Intern", "final", draft.draft)]
+                        if draft.needed_research and draft.research:
+                            evs.insert(0, AgentEvent("Intern", "observation",
+                                                     f"🔎 Researched: {draft.research.query}\n"
+                                                     f"Sources: {', '.join(draft.research.urls_tried[:3])}"))
+                        return evs
+
+                # ── Build agents dict ──────────────────────────────
+                # Gate agent wrappers by resolved panel membership.
+                # If techpriest/intern are not in the panel, build them as plain
+                # ModelAgents — no Dream3D static analyser, no web research loop.
+                # This is the critical guard: "What is the sun?" will never build
+                # a TechPriestWrapper because "techpriest" won't be in _resolved_panel.
+                _tp_in_panel = "techpriest" in _resolved_panel
+                _in_in_panel = "intern"     in _resolved_panel
+
+                if use_tp_agent and self.techpriest_agent and _tp_in_panel:
+                    techpriest_slot = _TechPriestWrapper(self.techpriest_agent)
+                else:
+                    techpriest_slot = ModelAgent("Tech-Priest", self.techpriest,
+                                                 tools=tools, enable_tools=enable_tools,
+                                                 token_callback=_token_cb)
+
+                if use_in_agent and self.intern_agent and _in_in_panel:
+                    intern_slot = _InternWrapper(self.intern_agent)
+                else:
+                    intern_slot = ModelAgent("Intern", self.intern,
+                                            tools=tools, enable_tools=enable_tools,
+                                            token_callback=_token_cb)
+
+                # ── Inject Librarian briefing into every personality ──
+                # Each role gets context appropriate to its job:
+                #   Writer / TechPriest / Intern / Artist → full vault briefing
+                #   Peasant → targeted briefing that guides specific questions
+                #
+                # We patch .respond() on each model for the duration of this
+                # request, then restore originals after deliberation.
+                _patched_models = {}
+
+                # Prepend any active council-wide instructions to every patch
+                _ci = self._instr_mgr.active_text()
+
+                def _patch_model(model, extra: str, role_name: str):
+                    """Wrap model.respond to prepend vault context for this request."""
+                    if not extra:
+                        return
+                    orig = model.respond
+                    _patched_models[role_name] = orig
+                    def _patched(prompt, **kwargs):
+                        existing = kwargs.get("extra_context", "")
+                        _ci_block = ("COUNCIL INSTRUCTIONS:\n" + _ci + "\n\n") if _ci else ""
+                        kwargs["extra_context"] = (_ci_block + extra + "\n\n" + existing).strip()
+                        return orig(prompt, **kwargs)
+                    model.respond = _patched
+
+                # Always apply council instructions even if no vault context
+                if _ci and not lib_brief["found"]:
+                    _ci_block = "COUNCIL INSTRUCTIONS:\n" + _ci
+                    for _pm in [self.writer, self.techpriest, self.intern,
+                                self.artist, self.sage, self.strategist,
+                                self.musician, self.content, self.director]:
+                        if _pm is not None:
+                            _patch_model(_pm, _ci_block, "ci_only")
+                    if self.skeptic is not None:
+                        _patch_model(self.skeptic, _ci_block, "ci_only")
+
+                if lib_brief["found"]:
+                    # ── Run Librarian personality over raw RAG results ──────────
+                    # The Librarian interprets the raw vault context, ranks it,
+                    # produces a structured ACCESS LIST for all personalities,
+                    # and emits WISHLIST_ENTRY lines for any gaps it finds.
+                    _lib_personality = getattr(self, "librarian_personality", None)
+                    _librarian_briefing = lib_brief["raw"]  # fallback: raw context
+                    if _lib_personality is not None:
+                        try:
+                            # Inject current wishlist so Librarian avoids duplicate entries
+                            _current_wishlist = self.librarian.get_wishlist()
+                            _lib_query = (
+                                f"VAULT QUERY: {user_text[:300]}\n\n"
+                                f"RAW VAULT RESULTS:\n{lib_brief['raw'][:3000]}\n\n"
+                                f"VAULT WISHLIST (already logged — avoid duplicates):\n"
+                                f"{_current_wishlist[:1000]}"
+                            )
+                            _lib_response = _lib_personality.respond(_lib_query)
+
+                            # Parse and persist any WISHLIST_ENTRY lines the Librarian emitted
+                            for _wline in _lib_response.splitlines():
+                                if _wline.strip().startswith("WISHLIST_ENTRY"):
+                                    # Format: WISHLIST_ENTRY | <who> | <topic> | <reason>
+                                    _parts = [p.strip() for p in _wline.split("|")]
+                                    if len(_parts) >= 4:
+                                        self.librarian.log_gap(
+                                            who=_parts[1],
+                                            topic=_parts[2],
+                                            reason=_parts[3],
+                                        )
+
+                            # Strip WISHLIST_ENTRY and PANEL_ADD lines before
+                            # sending the briefing to other models — those are
+                            # system-level directives, not council context.
+                            _panel_additions: list = []
+                            _clean_lines = []
+                            for _ln in _lib_response.splitlines():
+                                _stripped = _ln.strip()
+                                if _stripped.startswith("WISHLIST_ENTRY"):
+                                    pass  # already handled above
+                                elif _stripped.startswith("PANEL_ADD:"):
+                                    # ── #6 Dynamic panel expansion ──────────
+                                    _suggested = _stripped.split(":", 1)[-1].strip().lower()
+                                    _valid_addable = {
+                                        "writer", "techpriest", "intern", "sage",
+                                        "strategist", "artist", "musician",
+                                        "content", "director", "peasant",
+                                    }
+                                    if (_suggested in _valid_addable
+                                            and _suggested not in _resolved_panel
+                                            and getattr(self, _suggested, None) is not None):
+                                        _panel_additions.append(_suggested)
+                                else:
+                                    _clean_lines.append(_ln)
+                            _clean_response = "\n".join(_clean_lines)
+                            # Use Librarian's structured output as the briefing
+                            _librarian_briefing = (
+                                "LIBRARIAN ACCESS LIST:\n"
+                                + _clean_response
+                            )
+                            if _panel_additions:
+                                self.ui_q.put(("agent_phase", "librarian",
+                                               f"Panel expanded: +{', '.join(_panel_additions)}"))
+                            self.ui_q.put(("agent_phase", "librarian",
+                                           f"Librarian indexed {len(lib_brief['sources'])} sources"))
+                        except Exception as _le:
+                            self.ui_q.put(("agent_phase", "librarian",
+                                           f"Librarian indexing failed ({_le}), using raw context"))
+
+                    # Inject Librarian briefing only into roles that actually use vault.
+                    # Roles with use_vault="none" would discard it immediately in respond() —
+                    # skipping them avoids constructing context that gets thrown away.
+                    _full_vault_roles  = ("writer", "techpriest", "sage", "strategist",
+                                          "content", "director", "librarian")
+                    _lite_vault_roles  = ("peasant",)   # gets targeted briefing below
+                    # intern, artist, musician, skeptic → use_vault="none", skip entirely
+
+                    for _role_name in _full_vault_roles:
+                        _pm = getattr(self, _role_name, None)
+                        if _pm is not None:
+                            _patch_model(_pm, _librarian_briefing, _role_name)
+                    # Peasant gets the shorter targeted briefing
+                    _patch_model(self.peasant, lib_brief["peasant"], "peasant")
+
+                    # Also patch underlying models in agent wrappers
+                    if hasattr(techpriest_slot, "model") and techpriest_slot.model is not self.techpriest:
+                        _patch_model(techpriest_slot.model, _librarian_briefing, "techpriest_agent_model")
+                    if hasattr(intern_slot, "model") and intern_slot.model is not self.intern:
+                        _patch_model(intern_slot.model, _librarian_briefing, "intern_agent_model")
+
+                agents = {
+                    "writer":     ModelAgent("Writer",   self.writer,  enable_tools=False, token_callback=_token_cb),
+                    "peasant":    ModelAgent("Peasant",  self.peasant, enable_tools=False, token_callback=_token_cb),
+                    "intern":     intern_slot,
+                    "techpriest": techpriest_slot,
+                    "artist":     ModelAgent("Artist",   self.artist,  enable_tools=False, token_callback=_token_cb),
+                }
+                if self.skeptic is not None:
+                    agents["skeptic"] = ModelAgent("Skeptic", self.skeptic, enable_tools=False, token_callback=_token_cb)
+                # Sage: use SageAgent wrapper if available so it gets knowledge injection
+                if getattr(self, "sage_agent_obj", None) is not None:
+                    agents["sage"] = ModelAgent("Sage", self.sage_agent_obj.model,
+                                                enable_tools=False, token_callback=_token_cb)
+                elif self.sage is not None:
+                    agents["sage"] = ModelAgent("Sage", self.sage, enable_tools=False, token_callback=_token_cb)
+                # Strategist, Musician — add if personality models are initialised
+                if getattr(self, "strategist", None) is not None:
+                    agents["strategist"] = ModelAgent("Strategist", self.strategist, enable_tools=False, token_callback=_token_cb)
+                if getattr(self, "musician", None) is not None:
+                    agents["musician"] = ModelAgent("Musician", self.musician, enable_tools=False, token_callback=_token_cb)
+                if getattr(self, "content", None) is not None:
+                    agents["content"] = ModelAgent("Content", self.content, enable_tools=False, token_callback=_token_cb)
+                if getattr(self, "director", None) is not None:
+                    agents["director"] = ModelAgent("Director", self.director, enable_tools=False, token_callback=_token_cb)
+
+                # T2-D: Apply per-query model overrides
+                _override_map = {
+                    "writer": self.writer, "techpriest": self.techpriest,
+                    "intern": self.intern, "artist": self.artist,
+                    "skeptic": self.skeptic,
+                }
+                _override_restores = {}
+                if hasattr(self, "_query_overrides"):
+                    for _orole, _ovar in self._query_overrides.items():
+                        _oval = _ovar.get()
+                        if _oval != "(default)" and _orole in _override_map:
+                            _model = _override_map[_orole]
+                            if _model is not None:
+                                _override_restores[_orole] = _model.backend_key
+                                _model.backend_key = _oval
+
+                def _ev_cb(ev: AgentEvent):
+                    self.ui_q.put(("live_event", ev))
+
+                # Panel was resolved in the main thread before this worker started.
+                # Use it directly — but add any Librarian-recommended expansions.
+                _lib_expanded = _resolved_panel + locals().get("_panel_additions", [])
+                panel      = [p for p in _lib_expanded if p in agents]
+                synth_role = _resolved_synth
+                if not panel:
+                    panel = ["writer", "peasant"]  # safe minimum fallback
+
+                def _clarif_cb(who: str, question: str):
+                    self.ui_q.put(("clarification_needed", who, question))
+
+                def _answer_getter() -> str:
+                    ans = self._clarification_answer
+                    self._clarification_answer = ""
+                    return ans
+
+                orch = DeliberationOrchestrator(
+                    judge_model=self.judge, agents=agents,
+                    max_rounds=1, debate_turns=1,
+                    # Adaptive gates in the orchestrator handle the rest:
+                    #   confidence ≥8 on round 0 → accepts NEEDS_WORK, exits early
+                    #   confidence ≤2 on round 0 → escalates max_rounds to 2
+                    #   Verdict: PASS always exits immediately
+                    event_callback=_ev_cb,
+                    clarification_cb=_clarif_cb,
+                    pause_event=self._pause_event,
+                    answer_getter=_answer_getter,
+                )
+                _code_routes = {"ide", "techpriest", "intern"}
+                _content_routes = {"content", "writer", "chat", "musician"}
+                _query_mode  = "technical" if route in _code_routes else "conversational"
+                _latex_mode  = _detect_latex_request(user_text)
+                # Inject content style memory and templates for content routes
+                if route in ("content", "director") and getattr(self, "_content_style", None):
+                    _style_ctx = self._content_style.build_context_block(user_text)
+                    if _style_ctx:
+                        for _style_role in ("content", "director"):
+                            _style_pm = getattr(self, _style_role, None)
+                            if _style_pm is not None:
+                                _patch_model(_style_pm, _style_ctx, f"{_style_role}_style")
+                        self.ui_q.put(("agent_phase", "content_style",
+                                       "Content style memory + template injected"))
+                # ── #5 Per-route temperature adaptation ──────────────────────────
+                # Temperatures are fixed per role at build time but routes have very
+                # different needs. Save originals, apply overrides, restore in finally.
+                _temp_overrides = ce._ROUTE_TEMP_OVERRIDES.get(route, {})
+                _temp_restores: dict = {}
+                for _tr_role, _tr_temp in _temp_overrides.items():
+                    _tr_model = getattr(self, _tr_role, None)
+                    if _tr_model is not None and _tr_role in panel:
+                        _temp_restores[_tr_role] = _tr_model.temperature
+                        _tr_model.temperature = _tr_temp
+
+                _orch_extra  = {
+                    "peasant_adversarial": use_adversarial,
+                    "query_mode":          _query_mode,
+                    "latex_mode":          _latex_mode,
+                }
+                # If LaTeX requested, prepend instruction to writer context
+                if _latex_mode and self.writer:
+                    _latex_inst = (
+                        "LATEX MODE: The user has requested LaTeX output.\n"
+                        "Write your response as clean prose — do NOT include LaTeX markup.\n"
+                        "The system will automatically wrap your content in a LaTeX document.\n"
+                        "Focus on well-structured content: clear sections, proper paragraphs.\n"
+                        "Do not use markdown headers or bullet points — use prose paragraphs.\n"
+                    )
+                    _patch_model(self.writer, _latex_inst, "writer_latex")
+
+                # ── #4 Director→Writer style-locked pipeline ─────────────────────
+                # When the director route is active AND the user is asking for a
+                # script/draft, run Director first for a style brief, then inject
+                # that brief into Writer before the deliberation begins.
+                # This means Writer gets an authoritative style fingerprint to lock
+                # onto, not just generic content memory — the result sounds like the
+                # user because it IS structured around their patterns.
+                _script_keywords = {
+                    "script", "write", "draft", "narrate", "narration",
+                    "intro", "outro", "hook", "voiceover", "voice over",
+                    "episode", "video", "youtube", "short",
+                }
+                _is_script_request = (
+                    route == "director"
+                    and getattr(self, "director", None) is not None
+                    and self.writer is not None
+                    and any(kw in user_text.lower() for kw in _script_keywords)
+                )
+                if _is_script_request:
+                    try:
+                        self.ui_q.put(("agent_phase", "director",
+                                       "Director analysing style for script lock…"))
+                        _style_brief_prompt = (
+                            "DIRECTOR STYLE BRIEF — pre-deliberation pass.\n\n"
+                            "The Writer is about to draft a script based on the user's request below.\n"
+                            "Your job: produce a concise STYLE BRIEF (150–250 words) the Writer can\n"
+                            "use as a hard constraint. Cover:\n"
+                            "  • Sentence length and rhythm (short punchy? long flowing?)\n"
+                            "  • Energy arc (how does this creator open / build / close?)\n"
+                            "  • Verbal tics, phrases, or transitions they use\n"
+                            "  • Humour style and register (dry, self-deprecating, enthusiastic?)\n"
+                            "  • Anything the Writer must NOT do to stay in voice\n\n"
+                            "Draw on your style memory. Be specific — cite patterns, not generalities.\n"
+                            "End with: STYLE LOCKED.\n\n"
+                            f"USER REQUEST:\n{user_text}"
+                        )
+                        _director_brief = self.director.respond(
+                            _style_brief_prompt, max_tokens=350
+                        )
+                        if _director_brief.strip():
+                            _brief_injection = (
+                                "DIRECTOR STYLE BRIEF (apply as hard constraint):\n"
+                                + _director_brief.strip()
+                            )
+                            _patch_model(self.writer, _brief_injection, "director_style_brief")
+                            self.ui_q.put(("agent_phase", "director",
+                                           "Style brief injected into Writer"))
+                    except Exception as _dsb_e:
+                        self.ui_q.put(("agent_phase", "director",
+                                       f"Style brief skipped ({_dsb_e})"))
+
+                events = orch.run(user_text, panel=panel, synth=synth_role,
+                                  extra_ctx=_orch_extra)
+
+                # Extract final and critique
+                final_text = next((e.text for e in reversed(events) if e.who == "Writer" and e.kind == "final"), "")
+                # Strip code blocks from conversational responses
+                final_text = _filter_final(final_text, route, user_text)
+                last_critique = next((e.text for e in reversed(events) if e.who == "Judge" and e.kind == "observation"), "")
+
+                # IDE fill — prefer TechPriest agent code if available
+                if route == "ide" and self.var_fill_ide.get():
+                    # Check if TechPriest agent produced code directly
+                    tp_code = None
+                    for ev in reversed(events):
+                        if ev.who == "Tech-Priest" and ev.kind == "final":
+                            extracted = _extract_code_block(ev.text)
+                            if extracted:
+                                tp_code = extracted
+                            break
+
+                    if tp_code:
+                        code = tp_code
+                        base = _safe_script_basename(user_text.splitlines()[0][:60])
+                    else:
+                        json_prompt = (
+                            "Return JSON ONLY — keys: filename, code.\n"
+                            "filename: short descriptive snake_case name ending in .py\n"
+                            "code: complete runnable python script\n\n"
+                            f"USER REQUEST:\n{user_text}\n\n"
+                            f"PROPOSAL:\n{final_text}\n"
+                        )
+                        json_resp = self.writer.respond(json_prompt)
+                        fn, code = _parse_script_json(json_resp)
+                        if not code:
+                            code = _extract_code_block(final_text) or final_text
+                        base = _safe_script_basename(fn) if fn else _safe_script_basename(user_text.splitlines()[0][:60])
+
+                    self.ui_q.put(("set_script_name", base))
+                    self.ui_q.put(("ide_fill", code))
+
+                # Memory update -- always, not just on PASS.
+                # Failed deliberations teach roles what to avoid.
+                _deliberation_passed = "Verdict: PASS" in (last_critique or "")
+                # Harvest low-confidence gaps from orchestrator shared context
+                _low_conf_gaps = getattr(getattr(orch, "_last_ctx", None), "shared", {}).get("_low_conf_gaps", [])
+                self.ui_q.put(("memory_update", user_text, final_text, last_critique,
+                               _deliberation_passed, _low_conf_gaps))
+
+                # Persist verdict record for history dashboard
+                _conf = 0  # will be updated below; initialised here in case of early exit
+                self.ui_q.put(("verdict_record", {
+                    "ts":         now_iso(),
+                    "session_id": self.session_id,
+                    "route":      route,
+                    "query":      user_text[:120],
+                    "confidence": _conf,
+                    "passed":     _deliberation_passed,
+                    "rounds":     sum(1 for e in events
+                                     if e.who == "Judge" and e.kind == "observation"
+                                     and "Verdict:" in e.text),
+                }))
+
+                # T1-B: Session naming
+                try:
+                    _sname = self.judge.name_session(user_text, last_critique or "")
+                    if _sname:
+                        self.ui_q.put(("session_rename", _sname))
+                except Exception:
+                    pass
+
+                # T1-C: Confidence score
+                _conf = 0
+                for _ev in reversed(events):
+                    if _ev.who == "Judge" and _ev.kind == "observation" and "confidence" in _ev.text:
+                        try:
+                            import json as _cj
+                            _cobj = _cj.loads(_ev.text.split("Ranking:\n", 1)[-1].strip())
+                            _conf = int(_cobj.get("confidence", 0))
+                        except Exception:
+                            pass
+                        break
+                self.ui_q.put(("verdict_confidence", _conf))
+
+                self.ui_q.put(("judge_final", last_critique))
+                self.ui_q.put(("save_output_ready", final_text, user_text, route))
+                self.ui_q.put(("done", None))
+
+            except Exception as e:
+                import traceback
+                self.ui_q.put(("error", traceback.format_exc()))
+            finally:
+                # Always restore patched model.respond — even on exception.
+                _restore_map = {
+                    "writer":    self.writer,   "techpriest": self.techpriest,
+                    "intern":    self.intern,   "artist":     self.artist,
+                    "peasant":   self.peasant,  "skeptic":    self.skeptic,
+                    "director":  getattr(self, "director",   None),
+                    "content":   getattr(self, "content",    None),
+                    "eye":       getattr(self, "eye",        None),
+                    "cutter":    getattr(self, "cutter",     None),
+                    "algorithm": getattr(self, "algorithm",  None),
+                    # Style brief patch key — director pre-pass injects into writer
+                    "director_style_brief": self.writer,
+                    "techpriest_agent_model": getattr(locals().get("techpriest_slot"), "model", None),
+                    "intern_agent_model":     getattr(locals().get("intern_slot"),     "model", None),
+                }
+                for _rname, _orig_fn in locals().get("_patched_models", {}).items():
+                    _rm = _restore_map.get(_rname)
+                    if _rm is not None:
+                        try: _rm.respond = _orig_fn
+                        except Exception: pass
+                for _orole, _orig_key in locals().get("_override_restores", {}).items():
+                    _om = locals().get("_override_map", {}).get(_orole)
+                    if _om is not None:
+                        try: _om.backend_key = _orig_key
+                        except Exception: pass
+                # Restore per-route temperature adjustments
+                for _tr_role, _orig_temp in locals().get("_temp_restores", {}).items():
+                    _tr_m = getattr(self, _tr_role, None)
+                    if _tr_m is not None:
+                        try: _tr_m.temperature = _orig_temp
+                        except Exception: pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ============================
+    # Queue polling
+    # ============================
+
+    def _poll_ui_queue(self):
+        try:
+            while True:
+                item = self.ui_q.get_nowait()
+                kind = item[0]
+
+                if kind == "live_event":
+                    _, ev = item
+                    if ev.kind == "phase":
+                        self._append_transcript(ev.who, ev.text, "phase")
+                        # Clear stream box so each agent shows cleanly
+                        self._clear_stream_box()
+                        # Update active-agent indicator in toolbar
+                        if hasattr(self, "_agent_label"):
+                            _skip = {"Orchestrator", "Librarian", ""}
+                            _atext = ("▶ " + ev.who) if ev.who not in _skip else ""
+                            self._agent_label.configure(text=_atext)
+                    elif ev.kind == "final":
+                        # Finalised — clear stream buffer for this speaker
+                        self._stream_buffers.pop(ev.who, None)
+                        self._append_transcript(ev.who, ev.text, "final")
+                    elif ev.kind in ("observation", "action"):
+                        self._append_transcript(ev.who, ev.text, ev.kind)
+                    # "thought" and "token" events are lightweight; skip transcript
+
+                elif kind == "stream_token":
+                    _, who, token = item
+                    self._append_stream_box(who, token)
+
+                elif kind == "tps_update":
+                    _, who, tps = item
+                    self._update_tps(who, tps)
+
+                elif kind == "judge_final":
+                    _, txt = item
+                    if txt:
+                        self._set_judge(txt)
+                        # T3-B: highlight required changes if present
+                        import council_engine as _ce
+                        _changes = _ce.JudgeModel.parse_required_changes(txt)
+                        if _changes:
+                            _chg_block = ("\n" + "─" * 32 + "\n"
+                                          + "REQUIRED CHANGES:\n"
+                                          + "\n".join("  • " + c for c in _changes)
+                                          + "\n")
+                            self._set_judge(txt + _chg_block)
+
+                elif kind == "ide_fill":
+                    _, code = item
+                    self.ide_code.delete("1.0", "end")
+                    self.ide_code.insert("1.0", code)
+
+                elif kind == "set_script_name":
+                    _, base = item
+                    base = _safe_script_basename(base)
+                    self.current_script_name = base
+                    self.script_name_var.set(base)
+                    self._append_transcript("Librarian", f"Script named: {base}.py", "final")
+
+                elif kind == "memory_update":
+                    _, user_text, final_text, critique, *_rest = item
+                    _passed_flag  = _rest[0] if len(_rest) > 0 else True
+                    _lc_gaps      = _rest[1] if len(_rest) > 1 else []
+                    self._do_memory_update(user_text, final_text, critique,
+                                           passed=_passed_flag, low_conf_gaps=_lc_gaps)
+
+                elif kind == "agent_phase":
+                    _, phase, msg = item
+                    self._agent_log_append(phase, msg)
+                    # Also echo notable events to transcript
+                    if any(x in msg for x in ("✓", "✗", "⚠", "Researched", "RAG")):
+                        self._append_transcript("Agent", msg, "observation")
+                    if hasattr(self, "rag_count_label"):
+                        self._update_rag_count_label()
+                    # Forward compose events to composer log too
+                    if hasattr(self, "composer_log") and phase.startswith("compose"):
+                        self._composer_log_append(msg, "ok" if "✓" in msg else "info")
+
+                elif kind == "composer_result":
+                    _, result = item
+                    self._current_plan = result.plan
+                    if result.plan:
+                        pretty = result.plan.to_json()
+                        self.composer_plan_box.delete("1.0", "end")
+                        self.composer_plan_box.insert("1.0", pretty)
+                        self._composer_log_append(
+                            f"✓ {result.plan.title} — {len(result.plan.sections)} sections, "
+                            f"{result.plan.tempo} BPM, {result.plan.key} {result.plan.mode}", "ok")
+                        self._append_transcript("Composer", result.plan.description or result.plan.title, "final")
+                    else:
+                        self._composer_log_append(
+                            f"✗ Parse failed: {result.parse_error}\nRaw: {result.raw_json[:300]}", "err")
+
+                elif kind == "composer_error":
+                    _, msg = item
+                    self._composer_log_append(f"✗ Error: {msg}", "err")
+
+                elif kind == "grapher_event":
+                    _, phase, msg = item
+                    if hasattr(self, "_grapher_stats"):
+                        self._grapher_show_stats(f"[{phase}] {msg}")
+
+                elif kind == "grapher_stats":
+                    _, text = item
+                    if hasattr(self, "_grapher_stats"):
+                        self._grapher_show_stats(text)
+
+                elif kind == "grapher_ai_result":
+                    _, result = item
+                    if not hasattr(self, "_grapher_stats"):
+                        pass
+                    elif result.parse_error:
+                        self._grapher_show_stats(
+                            f"✗ AI parse error: {result.parse_error}\n\n"
+                            + getattr(result, "analysis", ""))
+                    else:
+                        if result.analysis:
+                            self._grapher_show_stats(result.analysis)
+                        if result.spec and self._grapher_dataset:
+                            self._grapher_apply_spec_to_controls(result.spec)
+                            self._grapher_render_plotly(result.spec, self._grapher_dataset)
+
+                elif kind == "grapher_autosuggest":
+                    # #3 auto-suggest after file load
+                    _, hint, suggestion = item
+                    if hasattr(self, "_grapher_stats") and hint:
+                        self._grapher_show_stats(hint)
+                    if (suggestion and getattr(suggestion, "spec", None)
+                            and self._grapher_dataset):
+                        self._grapher_apply_spec_to_controls(suggestion.spec)
+
+                elif kind == "vault_mgr_log":
+                    _, msg = item
+                    if hasattr(self, "_vmgr_log"):
+                        self._vmgr_append(msg)
+
+                elif kind == "vault_mgr_refresh":
+                    if hasattr(self, "_vmgr_tree"):
+                        self._vmgr_refresh_tree()
+
+                elif kind == "apoth_out":
+                    _, text = item
+                    self._append_transcript("Apothecary", text, "final")
+
+                elif kind == "ide_stdout":
+                    _, text = item
+                    self._ide_print(text)
+
+                elif kind == "ide_stderr":
+                    _, text = item
+                    self._ide_print(text, "stderr")
+
+                elif kind == "ide_info":
+                    _, text = item
+                    self._ide_print(text, "info")
+
+                elif kind == "nodes_result":
+                    _, statuses = item
+                    self._populate_nodes_tree(statuses)
+                    self.nodes_status_label.configure(text=f"Last updated: {now_iso()}")
+                    # Schedule next auto-refresh
+                    if self._node_refresh_id:
+                        self.after_cancel(self._node_refresh_id)
+                    self._node_refresh_id = self.after(15_000, self._refresh_nodes_async)
+
+                elif kind == "stt_out":
+                    _, text = item
+                    self.stt_out.delete("1.0", "end")
+                    self.stt_out.insert("1.0", text)
+
+                elif kind == "verdict_confidence":
+                    _, conf = item
+                    self._last_confidence = conf
+                    _bar = "█" * conf + "░" * (10 - conf)
+                    _lbl = "HIGH" if conf >= 7 else "MED" if conf >= 4 else "LOW"
+                    self._set_judge("Confidence: " + str(conf) + "/10  [" + _bar + "]  " + _lbl + "\n")
+
+                elif kind == "verdict_record":
+                    _, record = item
+                    self._save_verdict_record(record)
+
+                elif kind == "session_rename":
+                    _, new_name = item
+                    self._rename_session(new_name)
+
+                elif kind == "trend_result":
+                    _, trend_text = item
+                    # Show trends in a popup
+                    _tw = tk.Toplevel(self)
+                    _tw.title("Cross-Session Trends")
+                    _tw.configure(bg="#1e1e2e")
+                    _tw.geometry("700x400")
+                    _trend_box = self._make_text(_tw, wrap="word")
+                    _trend_box.pack(fill="both", expand=True, padx=10, pady=10)
+                    _trend_box.insert("1.0", trend_text)
+                    _trend_box.configure(state="disabled")
+                    self._append_transcript("Librarian",
+                        "Cross-session trends generated → saved to vault/trends.md", "final")
+
+                elif kind == "lens_result":
+                    _, role_name, response = item
+                    if hasattr(self, "_lens_output"):
+                        self._lens_output.configure(state="normal")
+                        sep = "─" * 40
+                        self._lens_output.insert("end",
+                            f"\n{sep}\n🔍 {role_name.upper()}\n{sep}\n{response}\n")
+                        self._lens_output.configure(state="disabled")
+                        self._lens_output.see("end")
+
+                elif kind == "lens_done":
+                    _, count = item
+                    if hasattr(self, "_lens_status"):
+                        self._lens_status.configure(text=f"Done — {count} roles responded.")
+
+                elif kind == "clarification_needed":
+                    _, who, question = item
+                    self._pause_event.clear()  # pause the worker
+                    self._show_clarification(who, question)
+
+                elif kind == "save_output_ready":
+                    _, _final, _query, _route = item
+                    self._last_final_text  = _final
+                    self._last_query_text  = _query
+                    self._last_route       = _route
+                    # Auto-save if LaTeX was requested
+                    if _detect_latex_request(_query):
+                        self._auto_save_latex(_final, _query)
+                    # Show save buttons in transcript
+                    self._show_save_buttons()
+
+                elif kind == "done":
+                    self._set_status("● idle")
+                    if hasattr(self, "_agent_label"):
+                        self._agent_label.configure(text="")
+                    # Show verdict feedback bar
+                    self._vfb_show()
+                    # Auto-speak if enabled (#10)
+                    _final_for_tts = getattr(self, "_last_final_text", "")
+                    if _final_for_tts:
+                        self._tts_auto_speak(_final_for_tts)
+
+                elif kind == "error":
+                    _, msg = item
+                    self._append_transcript("ERROR", msg, "final")
+                    self.transcript.tag_add("error", "end-2l", "end")
+                    self._set_status("● error", "#f38ba8")
+
+        except queue.Empty:
+            pass
+        self.after(50, self._poll_ui_queue)
+
+    # ============================
+    # Actions
+    # ============================
+
+    def _apply_script_name(self):
+        nm = _safe_script_basename(self.script_name_var.get())
+        self.current_script_name = nm
+        self.script_name_var.set(nm)
+        self._append_transcript("Librarian", f"Script name: {nm}.py", "final")
+
+    def _new_session(self):
+        self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self._append_transcript("Librarian", f"New session started: {self.session_id}", "final")
+        self._sessions_refresh()
+
+    def _save_verdict_record(self, record: dict):
+        """Append one verdict record to the persistent history file."""
+        import json as _j
+        try:
+            VERDICT_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(VERDICT_HISTORY_PATH, "a", encoding="utf-8") as _f:
+                _f.write(_j.dumps(record, ensure_ascii=False) + "\n")
+        except Exception as e:
+            self._append_transcript("Librarian", "Verdict history write failed: " + str(e), "final")
+
+    def _load_verdict_history(self, last_n: int = 200) -> list:
+        """Load the last N verdict records from the history file."""
+        import json as _j
+        if not VERDICT_HISTORY_PATH.exists():
+            return []
+        records = []
+        try:
+            lines = VERDICT_HISTORY_PATH.read_text(encoding="utf-8").splitlines()
+            for ln in lines[-last_n:]:
+                try:
+                    records.append(_j.loads(ln))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return records
+
+    # ── Output save methods ──────────────────────────────────────────────────
+
+    def _show_save_buttons(self):
+        """Show the save-output panel below the input area."""
+        if hasattr(self, "_save_frame"):
+            self._save_frame.pack(fill="x", pady=(4, 0))
+
+    def _hide_save_buttons(self):
+        if hasattr(self, "_save_frame"):
+            self._save_frame.pack_forget()
+
+    def _get_save_filename(self, ext: str) -> Optional[str]:
+        """Prompt user for a filename stem, return full name with ext."""
+        from tkinter import simpledialog as _sd
+        # Suggest a name from the query
+        _raw = self._last_query_text[:40].strip()
+        _raw = __import__("re").sub(r"[^\w\s-]", "", _raw).strip()
+        _suggested = __import__("re").sub(r"\s+", "_", _raw).lower() or "council_output"
+        name = _sd.askstring(
+            "Save output",
+            f"Filename (without extension):",
+            initialvalue=_suggested,
+            parent=self,
+        )
+        if not name:
+            return None
+        name = name.strip().rstrip(".")
+        if not name:
+            return None
+        return name + ext
+
+    def _save_output_txt(self):
+        """Save the last Writer output as a plain .txt file to the vault."""
+        if not self._last_final_text:
+            self._append_transcript("Librarian", "No output to save yet.", "observation")
+            return
+        fname = self._get_save_filename(".txt")
+        if not fname:
+            return
+        # Strip any markdown formatting for plain text
+        import re as _re
+        plain = _re.sub(r"\*\*(.+?)\*\*", r"\1", self._last_final_text)
+        plain = _re.sub(r"\*(.+?)\*",   r"\1", plain)
+        plain = _re.sub(r"^#{1,6}\s+",   "",     plain, flags=_re.MULTILINE)
+        plain = _re.sub(r"`{1,3}",        "",     plain)
+        saved = self.librarian.save_text(fname, plain)
+        self._append_transcript(
+            "Librarian",
+            f"✓ Saved as {fname} ({len(plain)} chars) → vault",
+            "final"
+        )
+        self._offer_disk_save(fname, plain)
+
+    def _save_output_md(self):
+        """Save the last Writer output as a .md file to the vault."""
+        if not self._last_final_text:
+            self._append_transcript("Librarian", "No output to save yet.", "observation")
+            return
+        fname = self._get_save_filename(".md")
+        if not fname:
+            return
+        md = f"# {self._last_query_text[:80]}\n\n{self._last_final_text}"
+        self.librarian.save_text(fname, md)
+        self._append_transcript("Librarian", f"✓ Saved as {fname} → vault", "final")
+        self._offer_disk_save(fname, md)
+
+    def _save_output_latex(self):
+        """Wrap the last output in a LaTeX document and save as .tex."""
+        if not self._last_final_text:
+            self._append_transcript("Librarian", "No output to save yet.", "observation")
+            return
+        fname = self._get_save_filename(".tex")
+        if not fname:
+            return
+        title = self._last_query_text[:60].strip() or "Council Output"
+        tex = _wrap_latex(title, self._last_final_text)
+        self.librarian.save_text(fname, tex)
+        self._append_transcript(
+            "Librarian",
+            f"✓ Saved as {fname} (LaTeX document) → vault",
+            "final"
+        )
+        self._offer_disk_save(fname, tex)
+
+    def _auto_save_latex(self, text: str, query: str):
+        """Automatically save as LaTeX when user explicitly requested it."""
+        import re as _re
+        _raw = _re.sub(r"[^\w\s-]", "", query[:40]).strip()
+        fname = _re.sub(r"\s+", "_", _raw).lower() or "council_latex"
+        fname = fname + ".tex"
+        title = query[:60].strip()
+        tex = _wrap_latex(title, text)
+        self.librarian.save_text(fname, tex)
+        self._append_transcript(
+            "Librarian",
+            f"✓ Auto-saved LaTeX: {fname} → vault  (click 📐 to save to disk)",
+            "final"
+        )
+
+    def _offer_disk_save(self, vault_name: str, content: str):
+        """Ask user if they want to also save to a location on disk."""
+        from tkinter import filedialog as _fd
+        if not messagebox.askyesno(
+            "Also save to disk?",
+            f"Saved to vault as {vault_name}.\n\nAlso save a copy somewhere on disk?",
+            parent=self,
+        ):
+            return
+        ext = "." + vault_name.rsplit(".", 1)[-1] if "." in vault_name else ".txt"
+        _filetypes = {
+            ".txt":  [("Text files", "*.txt"), ("All files", "*.*")],
+            ".md":   [("Markdown files", "*.md"), ("All files", "*.*")],
+            ".tex":  [("LaTeX files", "*.tex"), ("All files", "*.*")],
+        }
+        path = _fd.asksaveasfilename(
+            parent=self,
+            title="Save output to disk",
+            defaultextension=ext,
+            initialfile=vault_name,
+            filetypes=_filetypes.get(ext, [("All files", "*.*")]),
+        )
+        if path:
+            try:
+                with open(path, "w", encoding="utf-8") as _f:
+                    _f.write(content)
+                self._append_transcript(
+                    "Librarian", f"✓ Also saved to: {path}", "observation"
+                )
+            except Exception as _e:
+                self._append_transcript(
+                    "Librarian", f"✗ Disk save failed: {_e}", "observation"
+                )
+
+    def _export_session_md(self):
+        """
+        Render the current session from ConversationStore into a Markdown file
+        and save it to the vault. Covers all stored turns (up to 200).
+        """
+        turns = self.convo_store.load_last(self.session_id, n=200)
+        if not turns:
+            self._append_transcript("Librarian", "Nothing to export — session is empty.", "final")
+            return
+
+        lines = [
+            "# Council Deliberation Export",
+            "",
+            "**Session:** " + self.session_id,
+            "**Exported:** " + __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "",
+            "---",
+            "",
+        ]
+
+        _section_roles = {"Judge", "Orchestrator"}
+        _peasant_roles = {"Peasant"}  # Q&A block formatting
+        _phase_marker = "\u25b6"  # the triangle used by _phase()
+
+        for turn in turns:
+            who  = turn.get("who", "?")
+            text = turn.get("text", "").strip()
+            ts   = turn.get("ts", "")
+            if not text:
+                continue
+            # Phase lines get lighter formatting
+            if text.startswith(_phase_marker):
+                lines.append("> " + text)
+                lines.append("")
+            elif who in _section_roles:
+                lines.append("## " + who)
+                if ts:
+                    lines.append("*" + ts + "*")
+                lines.append("")
+                lines.append(text)
+                lines.append("")
+                lines.append("---")
+                lines.append("")
+            elif who in _peasant_roles:
+                lines.append("### Peasant Q&A")
+                if ts:
+                    lines.append("*" + ts + "*")
+                lines.append("")
+                for ln in text.splitlines():
+                    stripped = ln.strip()
+                    if stripped.startswith("[q:") or stripped.startswith("⚠"):
+                        lines.append("> " + stripped)
+                    elif "?" in stripped and stripped:
+                        lines.append("**" + stripped + "**")
+                    elif stripped:
+                        lines.append(stripped)
+                lines.append("")
+            else:
+                lines.append("### " + who)
+                if ts:
+                    lines.append("*" + ts + "*")
+                lines.append("")
+                lines.append(text)
+                lines.append("")
+
+        md_text = "\n".join(lines)
+        filename = "export_" + self.session_id + ".md"
+        saved_path = self.librarian.save_text(filename, md_text)
+        self._append_transcript(
+            "Librarian",
+            "Session exported: " + filename + " (" + str(len(turns)) + " turns, "
+            + str(len(md_text)) + " chars)",
+            "final"
+        )
+
+    def _rename_session(self, new_name: str):
+        """Rename the current session if it still has a raw timestamp ID."""
+        import re as _re
+        if not _re.match(r"^\d{8}_\d{6}$", self.session_id):
+            return
+        ok = self.convo_store.rename_session(self.session_id, new_name)
+        if ok:
+            old = self.session_id
+            self.session_id = new_name
+            for model in self.personalities.values():
+                if hasattr(model, "session_id") and model.session_id == old:
+                    model.session_id = new_name
+            self._append_transcript("Librarian", "Session named: " + new_name, "final")
+            self._sessions_refresh()
+
+    # ── Background deliberation queue (T2-A) ─────────────────────────────
+
+    def _show_bg_queue(self):
+        """Open/raise the background deliberation queue window."""
+        if hasattr(self, "_bg_win") and self._bg_win.winfo_exists():
+            self._bg_win.lift()
+            return
+        win = tk.Toplevel(self)
+        win.title("Background Deliberation Queue")
+        win.configure(bg="#1e1e2e")
+        win.geometry("620x440")
+        self._bg_win = win
+        if not hasattr(self, "_bg_queue"):
+            self._bg_queue = []
+        ttk.Label(win, text="Queue items (one prompt per line or load from vault):").pack(anchor="w", padx=8, pady=(8,2))
+        self._bg_input = self._make_text(win, height=6, wrap="word")
+        self._bg_input.pack(fill="x", padx=8)
+        btn_row = ttk.Frame(win)
+        btn_row.pack(fill="x", padx=8, pady=4)
+        ttk.Button(btn_row, text="Add to Queue",     command=self._bg_queue_add).pack(side="left")
+        ttk.Button(btn_row, text="Load Vault Items", command=self._bg_queue_from_vault).pack(side="left", padx=6)
+        ttk.Button(btn_row, text="Run Queue Now",    command=self._bg_queue_run).pack(side="left", padx=6)
+        ttk.Button(btn_row, text="Clear",            command=self._bg_queue_clear).pack(side="left")
+        # Options row: full council toggle + repeat interval
+        opt_row = ttk.Frame(win)
+        opt_row.pack(fill="x", padx=8, pady=(0,2))
+        if not hasattr(self, "_bg_full_council"):
+            self._bg_full_council = tk.BooleanVar(value=True)
+        if not hasattr(self, "_bg_repeat_mins"):
+            self._bg_repeat_mins = tk.StringVar(value="0")
+        ttk.Checkbutton(opt_row, text="Full council deliberation",
+                         variable=self._bg_full_council).pack(side="left")
+        ttk.Label(opt_row, text="  Repeat every (mins, 0=off):", foreground="#6c7086").pack(side="left")
+        ttk.Entry(opt_row, textvariable=self._bg_repeat_mins, width=5).pack(side="left", padx=(2,0))
+        ttk.Label(win, text="Queue & Results:").pack(anchor="w", padx=8)
+        self._bg_log = self._make_text(win, height=12, wrap="word", state="disabled")
+        self._bg_log.pack(fill="both", expand=True, padx=8, pady=(0,8))
+        self._bg_log_append("Queue ready. Items: " + str(len(self._bg_queue)))
+
+    def _bg_log_append(self, msg: str):
+        if not hasattr(self, "_bg_log") or not self._bg_log.winfo_exists():
+            return
+        self._bg_log.configure(state="normal")
+        self._bg_log.insert("end", msg + "\n")
+        self._bg_log.see("end")
+        self._bg_log.configure(state="disabled")
+
+    def _bg_queue_add(self):
+        if not hasattr(self, "_bg_queue"):
+            self._bg_queue = []
+        text = self._bg_input.get("1.0", "end").strip()
+        if not text:
+            return
+        items = [l.strip() for l in text.splitlines() if l.strip()]
+        self._bg_queue.extend(items)
+        self._bg_log_append("Added " + str(len(items)) + " item(s). Total: " + str(len(self._bg_queue)))
+        self._bg_input.delete("1.0", "end")
+
+    def _bg_queue_from_vault(self):
+        """Load vault .md/.txt items as queue prompts."""
+        if not hasattr(self, "_bg_queue"):
+            self._bg_queue = []
+        added = 0
+        for name in self.librarian.list_items():
+            if name.endswith((".md", ".txt")):
+                try:
+                    text = self.librarian.read_text(name).strip()
+                    if text:
+                        self._bg_queue.append("Review vault item: " + name + "\n\n" + text[:800])
+                        added += 1
+                except Exception:
+                    pass
+        self._bg_log_append("Loaded " + str(added) + " vault item(s) into queue.")
+
+    def _bg_queue_clear(self):
+        if hasattr(self, "_bg_queue"):
+            self._bg_queue.clear()
+        self._bg_log_append("Queue cleared.")
+
+    def _bg_queue_run(self):
+        """Run all queued items sequentially in a daemon thread.
+        When full council mode is on, runs the real DeliberationOrchestrator
+        (no UI streaming -- results saved directly to vault).
+        Falls back to writer.respond() if full council is off.
+        Results are saved to vault and surfaced in the BG log.
+        Repeat-every-N-minutes: reloads vault items and re-runs on a timer.
+        """
+        if not hasattr(self, "_bg_queue") or not self._bg_queue:
+            self._bg_log_append("Queue is empty.")
+            return
+        import threading as _th, time as _t, re as _re
+        import json as _bj
+        full_council = getattr(self, "_bg_full_council", None)
+        use_full = bool(full_council.get()) if full_council is not None else True
+        repeat_var = getattr(self, "_bg_repeat_mins", None)
+        try:
+            repeat_mins = float(repeat_var.get()) if repeat_var else 0
+        except Exception:
+            repeat_mins = 0
+        items = list(self._bg_queue)
+        self._bg_queue.clear()
+        mode_label = "full council" if use_full else "writer-only"
+        self._bg_log_append("Starting BG run (" + mode_label + "): " + str(len(items)) + " item(s)...")
+
+        def _run_one(prompt: str, idx: int, total: int, run_id: str) -> str:
+            """Run a single prompt; returns the result text."""
+            if not use_full:
+                return self.writer.respond(prompt)
+            # Full deliberation -- no token streaming, no UI updates mid-flight
+            route = self.judge.route(prompt)
+            panel, synth_role = _panel_for_route(route)
+            agents = {
+                "writer":     ModelAgent("Writer",     self.writer,     enable_tools=False),
+                "peasant":    ModelAgent("Peasant",    self.peasant,    enable_tools=False),
+                "intern":     ModelAgent("Intern",     self.intern,     enable_tools=False),
+                "techpriest": ModelAgent("TechPriest", self.techpriest, enable_tools=False),
+                "artist":     ModelAgent("Artist",     self.artist,     enable_tools=False),
+            }
+            if self.skeptic is not None:
+                agents["skeptic"] = ModelAgent("Skeptic", self.skeptic, enable_tools=False)
+            panel = [p for p in panel if p in agents] or ["intern", "techpriest", "artist"]
+            orch = DeliberationOrchestrator(
+                judge_model=self.judge, agents=agents,
+                max_rounds=2, debate_turns=1,  # leaner for background -- 1 cross-fire turn
+            )
+            events = orch.run(prompt, panel=panel, synth=synth_role)
+            result = next((e.text for e in reversed(events)
+                           if e.who == "Writer" and e.kind == "final"), "")
+            critique = next((e.text for e in reversed(events)
+                             if e.who == "Judge" and e.kind == "observation"), "")
+            verdict = "PASS" if "Verdict: PASS" in critique else "NEEDS_WORK"
+            conf = 0
+            try:
+                rank_raw = next((e.text.split("Ranking:\n", 1)[-1].strip()
+                    for e in reversed(events)
+                    if e.who == "Judge" and "confidence" in e.text), "")
+                if rank_raw:
+                    conf = int(_bj.loads(rank_raw).get("confidence", 0))
+            except Exception:
+                pass
+            return result + "\n\n---\nVerdict: " + verdict + " | Confidence: " + str(conf) + "/10"
+
+        def _run_bg(items_to_run):
+            total = len(items_to_run)
+            for i, prompt in enumerate(items_to_run, 1):
+                run_id = "bg_" + _re.sub(r"[^\w_]", "", prompt[:30].replace(" ", "_"))
+                self.after(0, lambda i=i, t=total, p=prompt: self._bg_log_append(
+                    "[" + str(i) + "/" + str(t) + "] " + p[:60] + "..."
+                ))
+                try:
+                    result = _run_one(prompt, i, total, run_id)
+                    import time as _ti
+                    stamp = str(int(_ti.time()))
+                    fname = run_id + "_" + stamp + ".md"
+                    self.librarian.save_text(fname,
+                        "# BG Deliberation\n"
+                        "## Prompt\n" + prompt + "\n\n"
+                        "## Result\n" + result
+                    )
+                    self.after(0, lambda fn=fname: self._bg_log_append("  Saved: " + fn))
+                except Exception as e:
+                    self.after(0, lambda i=i, e=e: self._bg_log_append(
+                        "  ERROR item " + str(i) + ": " + str(e)))
+            self.after(0, lambda: self._bg_log_append("Run complete (" + mode_label + ")."))
+
+        def _scheduler_loop():
+            """Run once immediately, then repeat every repeat_mins if > 0."""
+            _run_bg(items)
+            if repeat_mins > 0:
+                import time as _t2
+                self.after(0, lambda: self._bg_log_append(
+                    "Repeating in " + str(repeat_mins) + " min(s). Close the BG window to cancel."))
+                _t2.sleep(repeat_mins * 60)
+                # On repeat: reload vault items fresh
+                repeat_items = []
+                for name in self.librarian.list_items():
+                    if name.endswith((".md", ".txt")) and not name.startswith("bg_"):
+                        try:
+                            text = self.librarian.read_text(name).strip()
+                            if text:
+                                repeat_items.append("Review and update vault item: " + name + "\n\n" + text[:600])
+                        except Exception:
+                            pass
+                if repeat_items:
+                    _run_bg(repeat_items)
+
+        _th.Thread(target=_scheduler_loop, daemon=True, name="bg-deliberation").start()
+
+    def _start_config_watcher(self):
+        """Daemon thread: watches pins.json and hot-reloads on change."""
+        import threading as _th, time as _t
+        _last_mtime = [0.0]
+        def _watch():
+            while True:
+                try:
+                    if PINS_PATH.exists():
+                        mtime = PINS_PATH.stat().st_mtime
+                        if mtime != _last_mtime[0]:
+                            if _last_mtime[0] != 0.0:
+                                self.after(0, self._hot_reload_pins)
+                            _last_mtime[0] = mtime
+                except Exception:
+                    pass
+                _t.sleep(2.0)
+        _th.Thread(target=_watch, daemon=True, name="config-watcher").start()
+
+    def _hot_reload_pins(self):
+        """Called on UI thread when pins.json changes -- rebuilds personalities.
+        _reloading_pins lock prevents concurrent rebuilds on rapid saves.
+        """
+        if getattr(self, "_reloading_pins", False):
+            return
+        self._reloading_pins = True
+        try:
+            pins = ce.load_personality_pins(PINS_PATH)
+            self.personalities = ce.build_personalities(
+                pins=pins, vault_dir=VAULT_DIR, session_id=self.session_id,
+                trace=True, dispatcher=self.dispatcher,
+                prior_session_id=self.prior_session_id,
+            )
+            self._unpack_personalities()
+            self._append_transcript("Librarian", "pins.json changed -- personalities hot-reloaded.", "final")
+        except Exception as e:
+            self._append_transcript("Librarian", "Hot-reload failed: " + str(e), "final")
+        finally:
+            self._reloading_pins = False
+
+    def _edit_pins(self):
+        current = "{}"
+        try:
+            if PINS_PATH.exists():
+                current = PINS_PATH.read_text(encoding="utf-8")
+        except Exception:
+            pass
+        new = simpledialog.askstring(
+            "Personality Pins JSON",
+            "Pin personalities to backend keys.\n\n"
+            "Valid keys: local_general_primary, local_general_alt, local_coder_primary,\n"
+            "local_coder_fast, local_judge_fast, local_peasant_fast\n\n"
+            "Example:\n{\"techpriest\":\"local_coder_primary\",\"writer\":\"local_general_primary\"}",
+            initialvalue=current, parent=self,
+        )
+        if new is None:
+            return
+        try:
+            obj = _json.loads(new)
+            if not isinstance(obj, dict):
+                raise ValueError("Pins must be a JSON object.")
+            PINS_PATH.write_text(_json.dumps(obj, indent=2), encoding="utf-8")
+            pins = ce.load_personality_pins(PINS_PATH)
+            self.personalities = ce.build_personalities(
+                pins=pins, vault_dir=VAULT_DIR, session_id=self.session_id,
+                trace=True, dispatcher=self.dispatcher, prior_session_id=self.prior_session_id,
+            )
+            self._unpack_personalities()
+            self._append_transcript("Librarian", f"Pins updated: {PINS_PATH}", "final")
+        except Exception as e:
+            messagebox.showerror("Invalid JSON", str(e))
+
+    def _do_memory_update(self, user_text: str, final_text: str, critique: str,
+                          passed: bool = True, low_conf_gaps: list = None):
+        try:
+            memmgr = self.writer.memory_manager
+            if memmgr is None:
+                return
+            outcome = "PASS" if passed else "NEEDS_WORK/max-rounds"
+            roles = [
+                ("intern",      self.intern),
+                ("techpriest",  self.techpriest),
+                ("peasant",     self.peasant),
+                ("artist",      self.artist),
+                ("writer",      self.writer),
+                ("judge",       self.judge),
+            ]
+            # Add optional personalities if they exist
+            for _opt_role in ("skeptic", "sage", "strategist", "musician", "content",
+                              "director", "eye", "cutter", "algorithm"):
+                _opt_model = getattr(self, _opt_role, None)
+                if _opt_model is not None:
+                    roles.append((_opt_role, _opt_model))
+            for role_name, role_model in roles:
+                ce.update_role_memory_after_pass(
+                    role_name=role_name, role_model=role_model,
+                    memory_manager=memmgr, user_text=user_text,
+                    final_answer=final_text, judge_critique=critique,
+                    passed=passed,
+                )
+
+            # ── #1 Shared project memory: observer roles write cross-session facts ──
+            # Runs after role memory so observers can reference their fresh role memory.
+            # Uses only one observer role per deliberation (first available in priority order).
+            _observer_priority = ["techpriest", "sage", "strategist", "director"]
+            for _obs_name in _observer_priority:
+                _obs_model = getattr(self, _obs_name, None)
+                if _obs_model is not None:
+                    try:
+                        ce.update_project_memory_after_pass(
+                            role_name=_obs_name, role_model=_obs_model,
+                            memory_manager=memmgr, user_text=user_text,
+                            final_answer=final_text, judge_critique=critique,
+                            passed=passed,
+                        )
+                    except Exception:
+                        pass
+                    break  # one observer per deliberation is enough
+
+            self._append_transcript("Librarian", f"Role memories updated ({outcome}).", "final")
+
+            # ── #3 Proactive wishlist surfacing ───────────────────────────────────
+            # After every memory update, check for open wishlist items and surface
+            # the top items so the user knows what data to hunt down.
+            try:
+                _wishlist_raw = self.librarian.get_wishlist()
+                _pending = [
+                    ln.strip() for ln in _wishlist_raw.splitlines()
+                    if ln.strip().startswith("- [ ]")
+                ]
+                if _pending:
+                    _top = _pending[:5]
+                    _wl_msg = (
+                        "📋 **Vault wishlist — top items still missing:**\n"
+                        + "\n".join(_top)
+                        + (f"\n…and {len(_pending) - len(_top)} more." if len(_pending) > 5 else "")
+                    )
+                    self._append_transcript("Librarian", _wl_msg, "final")
+            except Exception:
+                pass
+
+            # ── #8 Low-confidence gap logging ─────────────────────────────────
+            # Roles that self-reported low confidence get their gaps persisted
+            # to the wishlist so the user knows what vault data would help them.
+            if low_conf_gaps:
+                for _gap in low_conf_gaps:
+                    try:
+                        self.librarian.log_gap(
+                            who=_gap.get("who", "?"),
+                            topic=_gap.get("topic", "unknown"),
+                            reason=_gap.get("reason", "low self-reported confidence"),
+                        )
+                    except Exception:
+                        pass
+
+        except Exception as e:
+            self._append_transcript("Librarian", f"Memory update failed: {e}", "final")
+
+    # ---- IDE actions ----
+
+    def _ide_run(self):
+        code = self.ide_code.get("1.0", "end")
+        if not code.strip():
+            return
+
+        def worker():
+            fname = f"{_safe_script_basename(self.current_script_name)}.py"
+            self.ui_q.put(("ide_info", f"[{fname}] Running…\n"))
+            try:
+                rc, out, err, path = self.runner.run_code(code, filename_hint=fname, timeout_s=120)
+                self.ui_q.put(("ide_info", f"[rc={rc}]\n"))
+                if out:
+                    self.ui_q.put(("ide_stdout", out))
+                if err:
+                    self.ui_q.put(("ide_stderr", err))
+            except Exception as e:
+                self.ui_q.put(("ide_stderr", f"Runner error: {e}\n"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _ide_run_stream(self):
+        code = self.ide_code.get("1.0", "end")
+        if not code.strip():
+            return
+
+        def worker():
+            fname = f"{_safe_script_basename(self.current_script_name)}.py"
+            self.ui_q.put(("ide_info", f"[{fname}] Running (streaming)…\n"))
+            try:
+                rc, path = self.runner.run_code_streaming(
+                    code, filename_hint=fname, timeout_s=120,
+                    stdout_callback=lambda l: self.ui_q.put(("ide_stdout", l)),
+                    stderr_callback=lambda l: self.ui_q.put(("ide_stderr", l)),
+                )
+                self.ui_q.put(("ide_info", f"\n[{path.name}] Exited rc={rc}\n"))
+            except Exception as e:
+                self.ui_q.put(("ide_stderr", f"Runner error: {e}\n"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _ide_snapshot(self):
+        code = self.ide_code.get("1.0", "end")
+        if not code.strip():
+            return
+        label = _safe_script_basename(self.current_script_name)
+        path = self.librarian.snapshot_code(code, label=label)
+        self._append_transcript("Librarian", f"Snapshot saved: {path}", "final")
+        self._lib_refresh()
+
+    # ---- Librarian actions ----
+
+    def _lib_refresh(self):
+        self.vault_lb.delete(0, "end")
+        for name in self.librarian.list_items():
+            self.vault_lb.insert("end", name)
+
+    def _lib_preview(self):
+        sel = self.vault_lb.curselection()
+        if not sel:
+            return
+        name = self.vault_lb.get(sel[0])
+        try:
+            txt = self.librarian.read_text(name)
+            win = tk.Toplevel(self)
+            win.title(f"Vault: {name}")
+            win.geometry("800x600")
+            t = self._make_text(win, wrap="word")
+            t.insert("1.0", txt)
+            t.configure(state="disabled")
+            t.pack(fill="both", expand=True, padx=6, pady=6)
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def _lib_commit(self):
+        msg = simpledialog.askstring("Commit Message", "Message:", parent=self)
+        if not msg:
+            return
+        ok, out = self.librarian.git_commit_all(msg)
+        self._append_transcript("Librarian", f"{'OK' if ok else 'FAIL'}: {out}", "final")
+
+    def _lib_open_vault(self):
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(VAULT_DIR))   # type: ignore
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(VAULT_DIR)], check=False)
+            else:
+                subprocess.run(["xdg-open", str(VAULT_DIR)], check=False)
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    # ---- Sessions actions ----
+
+    def _sessions_refresh(self):
+        self.session_lb.delete(0, "end")
+        _vh_lookup: dict = {}
+        for r in self._load_verdict_history(last_n=500):
+            sid = r.get("session_id", "")
+            if sid:
+                existing = _vh_lookup.get(sid)
+                if existing is None or r.get("confidence", 0) > existing.get("confidence", 0):
+                    _vh_lookup[sid] = r
+        _filter = getattr(self, "_session_filter_var", None)
+        _ftext  = _filter.get().strip().lower() if _filter else ""
+        for sid in self.convo_store.list_sessions():
+            if _ftext and _ftext not in sid.lower():
+                continue
+            record = _vh_lookup.get(sid)
+            if record:
+                conf  = record.get("confidence", 0)
+                badge = "✓" if record.get("passed") else "✗"
+                label = f"{sid:<30}  [{conf}/10 {badge}]"
+            else:
+                label = sid
+            self.session_lb.insert("end", label)
+
+    def _sessions_load_prior(self):
+        sel = self.session_lb.curselection()
+        if not sel:
+            return
+        sid = self.session_lb.get(sel[0]).split("  [")[0].strip()
+        self.prior_session_id = sid
+        self.prior_label.configure(text=f"Prior: {sid}")
+
+        # ── #2 Session-end summary: generate once, reuse forever ────────────────
+        # If no generated summary exists for this session yet, create one now
+        # using the writer model. Subsequent loads hit the cached .summary.md file.
+        # We use a background thread so the UI doesn't block.
+        def _maybe_generate_summary():
+            try:
+                convo_store = self.writer.conversation_store
+                if convo_store is None:
+                    return
+                existing = convo_store.load_generated_summary(sid)
+                if existing:
+                    return  # already generated
+                turns = convo_store.load_last(sid, n=40)
+                if not turns:
+                    return
+                # Build a raw transcript excerpt for the writer to compress
+                raw_lines = []
+                for t in turns:
+                    who = t.get("who", "?")
+                    text = t.get("text", "")[:600]
+                    raw_lines.append(f"{who}: {text}")
+                raw_excerpt = "\n".join(raw_lines)
+                summary_prompt = (
+                    f"Summarise this past council session in 200–350 words.\n"
+                    f"Focus on: what the user was trying to achieve, key decisions made, "
+                    f"what worked, what was unresolved, and anything worth remembering for "
+                    f"future sessions.\n"
+                    f"Write in plain prose — no bullet points, no headers.\n\n"
+                    f"SESSION TRANSCRIPT (most recent {len(turns)} turns):\n"
+                    f"{raw_excerpt}"
+                )
+                summary_text = self.writer.respond(summary_prompt, max_tokens=450)
+                if summary_text.strip():
+                    convo_store.save_session_summary(sid, summary_text)
+                    self._append_transcript(
+                        "Librarian", f"Session summary generated for '{sid}'.", "final"
+                    )
+            except Exception as _se:
+                self._append_transcript(
+                    "Librarian", f"Summary generation skipped: {_se}", "final"
+                )
+
+        import threading as _threading
+        _threading.Thread(target=_maybe_generate_summary, daemon=True).start()
+
+        # Rebuild personalities with new prior context
+        pins = ce.load_personality_pins(PINS_PATH)
+        self.personalities = ce.build_personalities(
+            pins=pins, vault_dir=VAULT_DIR, session_id=self.session_id,
+            trace=True, dispatcher=self.dispatcher, prior_session_id=sid,
+        )
+        self._unpack_personalities()
+        self._append_transcript("Librarian", f"Prior session loaded: {sid}", "final")
+
+    def _sessions_clear_prior(self):
+        self.prior_session_id = None
+        self.prior_label.configure(text="Prior: none")
+        pins = ce.load_personality_pins(PINS_PATH)
+        self.personalities = ce.build_personalities(
+            pins=pins, vault_dir=VAULT_DIR, session_id=self.session_id,
+            trace=True, dispatcher=self.dispatcher, prior_session_id=None,
+        )
+        self._unpack_personalities()
+        self._append_transcript("Librarian", "Prior session cleared.", "final")
+
+    def _sessions_analyse_trends(self):
+        """Run cross-session trend analysis using Sage (or Writer as fallback)."""
+        trend_model = getattr(self, "sage", None) or self.writer
+        if trend_model is None:
+            messagebox.showinfo("Trends", "No model available for trend analysis.")
+            return
+        self._append_transcript("Librarian", "Analysing cross-session trends…", "phase")
+
+        def worker():
+            try:
+                memmgr = self.writer.memory_manager
+                if memmgr is None:
+                    self.ui_q.put(("agent_phase", "sage", "Trend analysis: no memory manager"))
+                    return
+                result = ce.generate_cross_session_trends(
+                    trend_model=trend_model,
+                    memory_manager=memmgr,
+                    vault_dir=VAULT_DIR,
+                )
+                self.ui_q.put(("trend_result", result))
+            except Exception as e:
+                self.ui_q.put(("trend_result", f"(Error: {e})"))
+
+        import threading as _t
+        _t.Thread(target=worker, daemon=True).start()
+
+    def _show_verdict_history(self):
+        """Popup: summary table of all past verdicts from verdict_history.jsonl."""
+        records = self._load_verdict_history()
+        win = tk.Toplevel(self)
+        win.title("Verdict History")
+        win.configure(bg="#1e1e2e")
+        win.geometry("900x500")
+        if records:
+            total    = len(records)
+            passed   = sum(1 for r in records if r.get("passed"))
+            avg_conf = round(sum(r.get("confidence", 0) for r in records) / total, 1)
+            by_route = {}
+            for r in records:
+                rt = r.get("route", "?")
+                by_route.setdefault(rt, {"total": 0, "passed": 0, "conf": []})
+                by_route[rt]["total"]  += 1
+                by_route[rt]["passed"] += int(r.get("passed", False))
+                by_route[rt]["conf"].append(r.get("confidence", 0))
+            route_parts = [
+                rt + ":" + str(v["passed"]) + "/" + str(v["total"])
+                + " (conf " + str(round(sum(v["conf"])/len(v["conf"]), 1)) + ")"
+                for rt, v in sorted(by_route.items())
+            ]
+            summary = (
+                str(total) + " deliberations  |  "
+                + str(passed) + " passed (" + str(round(passed/total*100)) + "%)  |  "
+                + "avg confidence " + str(avg_conf) + "/10\n"
+                + "By route:  " + "   ".join(route_parts)
+            )
+        else:
+            summary = "No verdict history yet. Run a deliberation to start tracking."
+        ttk.Label(win, text=summary, wraplength=860, justify="left").pack(
+            anchor="w", padx=10, pady=(8, 4))
+        ttk.Separator(win, orient="horizontal").pack(fill="x", padx=10, pady=4)
+        cols = ("ts", "session", "route", "conf", "passed", "rounds", "query")
+        tree = ttk.Treeview(win, columns=cols, show="headings", height=18)
+        for col, hdr, w in [
+            ("ts","Time",140), ("session","Session",180), ("route","Route",80),
+            ("conf","Conf",50), ("passed","Pass",45), ("rounds","Rds",35), ("query","Query",340),
+        ]:
+            tree.heading(col, text=hdr)
+            tree.column(col, width=w, stretch=(col == "query"))
+        tree.tag_configure("pass", foreground="#a6e3a1")
+        tree.tag_configure("fail", foreground="#f38ba8")
+        tree.tag_configure("med",  foreground="#fab387")
+        for r in reversed(records):
+            _pass = r.get("passed", False)
+            _conf = r.get("confidence", 0)
+            tag   = "pass" if _pass else ("med" if _conf >= 4 else "fail")
+            tree.insert("", "end", values=(
+                r.get("ts","")[:16], r.get("session_id","")[:22],
+                r.get("route",""), str(_conf)+"/10",
+                "✓" if _pass else "✗",
+                str(r.get("rounds", 0)), r.get("query","")[:80],
+            ), tags=(tag,))
+        sb = ttk.Scrollbar(win, command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        tree.pack(fill="both", expand=True, padx=(10,0), pady=(0,10))
+
+    def _sessions_preview(self):
+        sel = self.session_lb.curselection()
+        if not sel:
+            return
+        sid = self.session_lb.get(sel[0]).split("  [")[0].strip()
+        summary = self.convo_store.load_session_summary(sid, max_turns=20)
+        self._set_text(self.session_preview, summary or "(empty session)")
+
+    # ---- Node status ----
+
+    def _refresh_nodes_async(self):
+        def worker():
+            statuses = self.dispatcher.probe_all()
+            self.ui_q.put(("nodes_result", statuses))
+        threading.Thread(target=worker, daemon=True).start()
+        self.nodes_status_label.configure(text="Probing…")
+
+    def _populate_nodes_tree(self, statuses: List[ce.NodeStatus]):
+        for row in self.nodes_tree.get_children():
+            self.nodes_tree.delete(row)
+        for s in statuses:
+            status_str = "● up" if s.reachable else "✕ down"
+            latency_str = f"{s.latency_ms:.0f} ms" if s.reachable else "—"
+            active_str = ", ".join(s.active_model_names) if s.active_model_names else ("none" if s.reachable else "—")
+            installed_str = ", ".join(s.installed_models[:6]) if s.installed_models else "—"
+            if len(s.installed_models) > 6:
+                installed_str += f" (+{len(s.installed_models)-6} more)"
+            tag = "up" if s.reachable else "down"
+            self.nodes_tree.insert("", "end",
+                values=(s.host, status_str, latency_str, active_str, installed_str),
+                tags=(tag,))
+
+    def _apply_pi_hosts(self):
+        raw = self.pi_hosts_var.get()
+        hosts = [h.strip() for h in raw.split(",") if h.strip()]
+        self.dispatcher = ce.build_dispatcher(extra_hosts=hosts)
+        pins = ce.load_personality_pins(PINS_PATH)
+        self.personalities = ce.build_personalities(
+            pins=pins, vault_dir=VAULT_DIR, session_id=self.session_id,
+            trace=True, dispatcher=self.dispatcher, prior_session_id=self.prior_session_id,
+        )
+        self._unpack_personalities()
+        self._append_transcript("Librarian", f"Dispatcher rebuilt with hosts: {hosts}", "final")
+        self._refresh_nodes_async()
+
+    # ---- Speech actions ----
+
+    def _stt_record(self):
+        ok, msg = self.speech.ready()
+        if not ok:
+            messagebox.showwarning("Speech→Text", msg)
+            return
+        wav_path = TMP_DIR / "latest.wav"
+
+        def worker():
+            try:
+                ok2, msg2 = self.speech.record_wav(wav_path, seconds=5)
+                self.ui_q.put(("stt_out", msg2 if ok2 else f"ERROR: {msg2}"))
+            except Exception as e:
+                self.ui_q.put(("error", str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _stt_transcribe(self):
+        wav_path = TMP_DIR / "latest.wav"
+        if not wav_path.exists():
+            messagebox.showwarning("Speech→Text", "No recording found. Record first.")
+            return
+
+        def worker():
+            try:
+                ok, text = self.speech.transcribe(wav_path)
+                self.ui_q.put(("stt_out", text if ok else f"ERROR: {text}"))
+            except Exception as e:
+                self.ui_q.put(("error", str(e)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _stt_send_to_council(self):
+        text = self.stt_out.get("1.0", "end").strip()
+        if not text:
+            return
+        self._set_text(self.input, text)
+        self.nb.select(self.tab_council)
+        self._send()
+
+    # ---- TTS actions (#10) ----
+
+    def _tts_get_engine(self):
+        """Lazily initialise pyttsx3 TTS engine. Returns None if unavailable."""
+        if self._tts_engine is not None:
+            return self._tts_engine
+        try:
+            import pyttsx3 as _pyttsx3
+            eng = _pyttsx3.init()
+            self._tts_engine = eng
+            return eng
+        except Exception:
+            return None
+
+    def _tts_speak_last(self):
+        """Speak the last Writer final answer in a background thread."""
+        text = getattr(self, "_last_final_text", "").strip()
+        if not text:
+            self._append_transcript("Librarian", "Nothing to speak yet.", "final")
+            return
+        def worker():
+            eng = self._tts_get_engine()
+            if eng is None:
+                self.ui_q.put(("agent_phase", "speech",
+                               "TTS unavailable — install pyttsx3 (pip install pyttsx3)"))
+                return
+            try:
+                rate = int(getattr(self, "_tts_rate_var", None) and self._tts_rate_var.get() or 175)
+                eng.setProperty("rate", rate)
+                eng.say(text[:4000])  # cap at 4000 chars for sane length
+                eng.runAndWait()
+            except Exception as _te:
+                self.ui_q.put(("agent_phase", "speech", f"TTS error: {_te}"))
+        import threading as _t
+        _t.Thread(target=worker, daemon=True).start()
+
+    def _tts_stop(self):
+        """Stop TTS playback."""
+        eng = getattr(self, "_tts_engine", None)
+        if eng is not None:
+            try:
+                eng.stop()
+            except Exception:
+                pass
+
+    def _tts_auto_speak(self, text: str):
+        """Called after each deliberation if auto-speak is enabled."""
+        if not getattr(self, "var_tts_auto", None) or not self.var_tts_auto.get():
+            return
+        def worker():
+            eng = self._tts_get_engine()
+            if eng is None:
+                return
+            try:
+                rate = int(self._tts_rate_var.get()) if hasattr(self, "_tts_rate_var") else 175
+                eng.setProperty("rate", rate)
+                eng.say(text[:4000])
+                eng.runAndWait()
+            except Exception:
+                pass
+        import threading as _t
+        _t.Thread(target=worker, daemon=True).start()
+
+
+# ============================================================
+# Utilities
+# ============================================================
+
+def now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _fmt_bytes(n: int) -> str:
+    """Human-readable byte size."""
+    for unit in ("B", "KB", "MB"):
+        if n < 1024:
+            return f"{n}{unit}"
+        n //= 1024
+    return f"{n}MB"
+
+
+def main():
+    app = CouncilConsole()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    print("=" * 60)
+    print(" Council AI — Desktop Build")
+    print(" Profile: RTX 5080 (16 GB VRAM) / 64 GB RAM")
+    print(" Models:  qwen2.5:32b-instruct-q4_K_M (writer/sage/musician)")
+    print("          qwen2.5:14b-instruct-q4_K_M (strategist/librarian)")
+    print("          qwen2.5-coder:14b-instruct-q4_K_M (techpriest)")
+    print("          phi4 (judge / peasant / intern)")
+    print(" Context: 8192 tokens  |  Max loaded models: 2")
+    print("=" * 60)
+    print()
+    main()

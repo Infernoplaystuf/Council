@@ -1,0 +1,1084 @@
+# ============================================================
+# tab_ideas.py  —  Overnight Video Idea Generator tab
+# ============================================================
+# Usage modes:
+#   1. Mixin inside CouncilConsole: call _build_ideas_tab()
+#   2. Standalone: python tab_ideas.py [--vault PATH] [--no-ai]
+# ============================================================
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+import threading
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+from council_modules import StandaloneHost, PALETTE
+from idea_engine import (
+    IdeaItem, IdeationSettings, IdeaStore, IdeationLoop,
+)
+
+try:
+    import council_engine as ce
+    _CE_OK = True
+except ImportError:
+    _CE_OK = False
+
+
+def _idea_slug(item: "IdeaItem") -> str:
+    """Generate a safe filename for an idea's Markdown file."""
+    title_part = re.sub(r"[^a-z0-9]+", "-", item.display_title.lower())[:50].strip("-")
+    date_part  = item.generated_at[:10]
+    return f"{date_part}_{item.id}_{title_part}.md"
+
+
+# ============================================================
+# IdeaTabMixin
+# ============================================================
+
+class IdeaTabMixin:
+    """
+    Mixin that adds the Idea Generator tab.
+
+    Expected on self (CouncilConsole or StandaloneHost):
+      self.vault_dir
+      self.after(ms, fn)
+      self._make_text(parent)
+      self._append_transcript(who, text, kind)
+      # Optional:
+      self.nb, self.tab_council, self.input
+      self.ideator, self.pitcher      — PersonalityModel instances
+      self._content_style             — optional ContentStyleManager
+    """
+
+    # =========================================================
+    # Build
+    # =========================================================
+
+    def _build_ideas_tab(self, parent=None):
+        """
+        Build the Idea Generator tab.
+
+        parent=None → council mode (creates Frame and adds to self.nb)
+        parent=Frame → standalone mode (builds into given frame)
+        """
+        if parent is None:
+            self.tab_ideas = ttk.Frame(self.nb)
+            self.nb.add(self.tab_ideas, text="💡 Ideas")
+            _root = self.tab_ideas
+        else:
+            _root = parent
+
+        # ── State ─────────────────────────────────────────────
+        self._idea_store    = IdeaStore(self.vault_dir)
+        self._idea_loop:    Optional[IdeationLoop] = None
+        self._idea_settings = self._load_idea_settings()
+        self._idea_cache:   list = []   # list of index dicts for fast display
+
+        # ── Header ────────────────────────────────────────────
+        hdr = ttk.Frame(_root)
+        hdr.pack(fill="x", padx=10, pady=(8, 4))
+        ttk.Label(hdr, text="Overnight Idea Generator",
+                  foreground=PALETTE["blue"],
+                  font=("", 11, "bold")).pack(side="left")
+        ttk.Label(hdr, text="  Continuous ideation — run it, sleep, wake up to a list",
+                  foreground=PALETTE["overlay"]).pack(side="left")
+
+        # ── Two-column layout ─────────────────────────────────
+        body = ttk.Frame(_root)
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        body.columnconfigure(0, weight=3)
+        body.columnconfigure(1, weight=2)
+        body.rowconfigure(0, weight=1)
+
+        left  = ttk.Frame(body)
+        right = ttk.Frame(body)
+        left.grid( row=0, column=0, sticky="nsew", padx=(0, 4))
+        right.grid(row=0, column=1, sticky="nsew")
+
+        # ── Left: settings + controls + log ───────────────────
+        self._build_ideas_settings(left)
+        self._build_ideas_controls(left)
+        self._build_ideas_log(left)
+
+        # ── Right: idea list + detail ─────────────────────────
+        self._build_ideas_list(right)
+        self._build_ideas_detail(right)
+
+        # ── GitHub panel (bottom of left column) ──────────────
+        self._build_ideas_github(left)
+
+        # ── Load existing ideas ───────────────────────────────
+        self._ideas_list_refresh()
+
+    # ── Settings panel ────────────────────────────────────────
+
+    def _build_ideas_settings(self, parent):
+        sf = ttk.LabelFrame(parent, text="Settings")
+        sf.pack(fill="x", pady=(0, 4))
+
+        # Seeds
+        ttk.Label(sf, text="Niche / seed topics:",
+                  foreground=PALETTE["subtext"]).pack(anchor="w", padx=8, pady=(6, 0))
+        self._idea_seeds_var = tk.StringVar(value=self._idea_settings.seeds)
+        seeds_entry = ttk.Entry(sf, textvariable=self._idea_seeds_var)
+        seeds_entry.pack(fill="x", padx=8, pady=(2, 4))
+        ttk.Label(sf, text="  e.g. gaming, productivity, AI tutorials, vlog",
+                  foreground="#45475a", font=("", 9)).pack(anchor="w", padx=8)
+
+        row1 = ttk.Frame(sf)
+        row1.pack(fill="x", padx=8, pady=(4, 2))
+
+        # Style preference
+        ttk.Label(row1, text="Style:").pack(side="left")
+        self._idea_style_var = tk.StringVar(value=self._idea_settings.style)
+        ttk.Combobox(row1, textvariable=self._idea_style_var,
+                     values=["any", "educational", "entertainment",
+                             "commentary", "tutorial", "vlog", "essay", "experiment"],
+                     state="readonly", width=14).pack(side="left", padx=6)
+
+        # Interval
+        ttk.Label(row1, text="  Interval:").pack(side="left", padx=(8, 2))
+        self._idea_interval_var = tk.StringVar(value=str(self._idea_settings.interval_s))
+        ttk.Spinbox(row1, textvariable=self._idea_interval_var,
+                    from_=30, to=600, increment=30, width=6).pack(side="left")
+        ttk.Label(row1, text="s").pack(side="left", padx=(2, 0))
+
+        row2 = ttk.Frame(sf)
+        row2.pack(fill="x", padx=8, pady=(2, 6))
+
+        # Max per session
+        ttk.Label(row2, text="Max ideas:").pack(side="left")
+        self._idea_max_var = tk.StringVar(value=str(self._idea_settings.max_per_session))
+        ttk.Spinbox(row2, textvariable=self._idea_max_var,
+                    from_=1, to=500, increment=10, width=6).pack(side="left", padx=6)
+
+        # Checkboxes
+        self._idea_use_style_var = tk.BooleanVar(value=self._idea_settings.use_content_style)
+        ttk.Checkbutton(row2,
+                        text="Use content style context",
+                        variable=self._idea_use_style_var).pack(side="left", padx=(10, 0))
+
+    # ── Controls ──────────────────────────────────────────────
+
+    def _build_ideas_controls(self, parent):
+        cf = ttk.Frame(parent)
+        cf.pack(fill="x", pady=(0, 4))
+
+        self._idea_start_btn = ttk.Button(cf, text="▶  Start Loop",
+                                           command=self._ideas_start)
+        self._idea_start_btn.pack(side="left")
+
+        self._idea_pause_btn = ttk.Button(cf, text="⏸  Pause",
+                                           command=self._ideas_pause,
+                                           state="disabled")
+        self._idea_pause_btn.pack(side="left", padx=4)
+
+        ttk.Button(cf, text="■  Stop",
+                   command=self._ideas_stop).pack(side="left")
+
+        ttk.Separator(cf, orient="vertical").pack(side="left", fill="y", padx=8)
+
+        ttk.Button(cf, text="💡  Generate One Now",
+                   command=self._ideas_generate_one).pack(side="left")
+
+        self._idea_status_var = tk.StringVar(value="Idle")
+        self._idea_status_lbl = ttk.Label(cf, textvariable=self._idea_status_var,
+                                           foreground=PALETTE["blue"])
+        self._idea_status_lbl.pack(side="left", padx=10)
+
+    # ── Progress log ──────────────────────────────────────────
+
+    def _build_ideas_log(self, parent):
+        ttk.Label(parent, text="Progress:").pack(anchor="w")
+        lf = ttk.Frame(parent)
+        lf.pack(fill="both", expand=True, pady=(0, 4))
+        self._idea_log = tk.Text(
+            lf,
+            bg="#11111b", fg=PALETTE["text"],
+            font=("Consolas", 9), state="disabled",
+            relief="flat", wrap="word", height=8,
+        )
+        log_sb = ttk.Scrollbar(lf, command=self._idea_log.yview)
+        self._idea_log.configure(yscrollcommand=log_sb.set)
+        log_sb.pack(side="right", fill="y")
+        self._idea_log.pack(fill="both", expand=True)
+        self._idea_log.tag_config("ok",   foreground=PALETTE["green"])
+        self._idea_log.tag_config("err",  foreground=PALETTE["red"])
+        self._idea_log.tag_config("warn", foreground=PALETTE["yellow"])
+        self._idea_log.tag_config("hdr",  foreground=PALETTE["blue"],
+                                   font=("Consolas", 9, "bold"))
+
+    # ── Idea list (right panel top) ───────────────────────────
+
+    # ── GitHub panel ──────────────────────────────────────────
+
+    def _build_ideas_github(self, parent):
+        gf = ttk.LabelFrame(parent, text="🐙 GitHub Sync")
+        gf.pack(fill="x", pady=(4, 0))
+
+        row1 = ttk.Frame(gf)
+        row1.pack(fill="x", padx=8, pady=(6, 2))
+        ttk.Label(row1, text="Remote URL:").pack(side="left")
+        git_cfg = self._load_git_config()
+        self._git_remote_var = tk.StringVar(
+            value=git_cfg.get("remote", "https://github.com/Infernoplaystuf/Council.git"))
+        ttk.Entry(row1, textvariable=self._git_remote_var,
+                  width=50).pack(side="left", padx=6, fill="x", expand=True)
+
+        row2 = ttk.Frame(gf)
+        row2.pack(fill="x", padx=8, pady=(0, 2))
+        ttk.Label(row2, text="Branch:").pack(side="left")
+        self._git_branch_var = tk.StringVar(
+            value=git_cfg.get("branch", "main"))
+        ttk.Entry(row2, textvariable=self._git_branch_var,
+                  width=12).pack(side="left", padx=6)
+
+        ttk.Label(row2, text="  Push:").pack(side="left", padx=(8, 2))
+        self._git_filter_var = tk.StringVar(
+            value=git_cfg.get("filter", "saved+"))
+        ttk.Combobox(row2, textvariable=self._git_filter_var,
+                     values=["all", "saved+", "in-production"],
+                     state="readonly", width=14).pack(side="left")
+        ttk.Label(row2,
+                  text="  (saved+ = saved & in-production)",
+                  foreground="#45475a", font=("", 9)).pack(side="left", padx=4)
+
+        row3 = ttk.Frame(gf)
+        row3.pack(fill="x", padx=8, pady=(2, 6))
+        ttk.Button(row3, text="🐙 Push ideas to GitHub",
+                   command=self._ideas_git_push).pack(side="left")
+        ttk.Button(row3, text="Save config",
+                   command=self._ideas_git_save_config).pack(side="left", padx=6)
+        self._git_status_var = tk.StringVar(value="")
+        ttk.Label(row3, textvariable=self._git_status_var,
+                  foreground=PALETTE["blue"]).pack(side="left", padx=6)
+
+    def _build_ideas_list(self, parent):
+        lf = ttk.LabelFrame(parent, text="Generated Ideas")
+        lf.pack(fill="x", pady=(0, 4))
+
+        # Filter bar
+        frow = ttk.Frame(lf)
+        frow.pack(fill="x", padx=6, pady=(4, 2))
+        ttk.Label(frow, text="Filter:").pack(side="left")
+        self._idea_filter_var = tk.StringVar()
+        self._idea_filter_var.trace_add("write", lambda *_: self._ideas_list_refresh())
+        ttk.Entry(frow, textvariable=self._idea_filter_var,
+                  width=20).pack(side="left", padx=4)
+        ttk.Label(frow, text="Status:").pack(side="left", padx=(6, 2))
+        self._idea_status_filter_var = tk.StringVar(value="all")
+        ttk.Combobox(frow, textvariable=self._idea_status_filter_var,
+                     values=["all", "new", "saved", "archived", "in-production"],
+                     state="readonly", width=14).pack(side="left")
+        self._idea_status_filter_var.trace_add(
+            "write", lambda *_: self._ideas_list_refresh())
+
+        # Treeview
+        tv_frame = ttk.Frame(lf)
+        tv_frame.pack(fill="x", padx=6, pady=(0, 4))
+
+        cols = ("Title", "Difficulty", "Status", "Rating", "When")
+        self._ideas_tv = ttk.Treeview(
+            tv_frame, columns=cols, show="headings",
+            height=8, selectmode="browse",
+        )
+        self._ideas_tv.heading("Title",      text="Title",      anchor="w")
+        self._ideas_tv.heading("Difficulty", text="Diff",       anchor="center")
+        self._ideas_tv.heading("Status",     text="Status",     anchor="center")
+        self._ideas_tv.heading("Rating",     text="★",          anchor="center")
+        self._ideas_tv.heading("When",       text="When",       anchor="center")
+        self._ideas_tv.column("Title",      width=240, stretch=True,  anchor="w")
+        self._ideas_tv.column("Difficulty", width=50,  stretch=False, anchor="center")
+        self._ideas_tv.column("Status",     width=80,  stretch=False, anchor="center")
+        self._ideas_tv.column("Rating",     width=40,  stretch=False, anchor="center")
+        self._ideas_tv.column("When",       width=90,  stretch=False, anchor="center")
+
+        self._ideas_tv.tag_configure("new",          foreground=PALETTE["text"])
+        self._ideas_tv.tag_configure("saved",        foreground=PALETTE["green"])
+        self._ideas_tv.tag_configure("archived",     foreground=PALETTE["overlay"])
+        self._ideas_tv.tag_configure("in-production",foreground=PALETTE["blue"],
+                                      font=("", 9, "bold"))
+
+        tv_sb = ttk.Scrollbar(tv_frame, orient="vertical",
+                               command=self._ideas_tv.yview)
+        self._ideas_tv.configure(yscrollcommand=tv_sb.set)
+        tv_sb.pack(side="right", fill="y")
+        self._ideas_tv.pack(fill="x", expand=True)
+        self._ideas_tv.bind("<<TreeviewSelect>>", self._ideas_on_select)
+
+        # Action row
+        act_row = ttk.Frame(lf)
+        act_row.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Button(act_row, text="⭐ Save",
+                   command=lambda: self._ideas_set_status("saved")).pack(side="left")
+        ttk.Button(act_row, text="🎬 In Production",
+                   command=lambda: self._ideas_set_status("in-production")).pack(
+                       side="left", padx=4)
+        ttk.Button(act_row, text="📦 Archive",
+                   command=lambda: self._ideas_set_status("archived")).pack(
+                       side="left")
+        ttk.Button(act_row, text="🗑 Delete",
+                   command=self._ideas_delete).pack(side="left", padx=(10, 0))
+        ttk.Separator(act_row, orient="vertical").pack(
+            side="left", fill="y", padx=8)
+
+        # Star rating
+        ttk.Label(act_row, text="Rate:").pack(side="left")
+        for star in range(1, 6):
+            ttk.Button(act_row, text=str(star), width=2,
+                       command=lambda s=star: self._ideas_set_rating(s)).pack(
+                           side="left")
+
+        # Export / GitHub
+        ttk.Separator(act_row, orient="vertical").pack(
+            side="left", fill="y", padx=8)
+        ttk.Button(act_row, text="📋 Export MD",
+                   command=self._ideas_export).pack(side="left")
+        ttk.Button(act_row, text="🐙 Push to GitHub",
+                   command=self._ideas_git_push).pack(side="left", padx=4)
+        ttk.Button(act_row, text="Send to Council",
+                   command=self._ideas_send_to_council).pack(side="left", padx=4)
+
+    # ── Idea detail panel ─────────────────────────────────────
+
+    def _build_ideas_detail(self, parent):
+        df = ttk.LabelFrame(parent, text="Idea Detail")
+        df.pack(fill="both", expand=True, pady=(0, 4))
+
+        txt_frame = ttk.Frame(df)
+        txt_frame.pack(fill="both", expand=True, padx=6, pady=4)
+        self._idea_detail = self._make_text(
+            txt_frame, wrap="word", state="disabled", height=18)
+        d_sb = ttk.Scrollbar(txt_frame, command=self._idea_detail.yview)
+        self._idea_detail.configure(yscrollcommand=d_sb.set)
+        d_sb.pack(side="right", fill="y")
+        self._idea_detail.pack(fill="both", expand=True)
+
+        # Colour tags for the detail view
+        self._idea_detail.tag_config(
+            "section", foreground=PALETTE["blue"],
+            font=("Consolas", 9, "bold"))
+        self._idea_detail.tag_config("pos",  foreground=PALETTE["green"])
+        self._idea_detail.tag_config("warn", foreground=PALETTE["yellow"])
+        self._idea_detail.tag_config("meta", foreground=PALETTE["subtext"],
+                                      font=("Consolas", 8))
+
+        # Notes field below detail
+        note_row = ttk.Frame(df)
+        note_row.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(note_row, text="Your notes:",
+                  foreground=PALETTE["subtext"]).pack(side="left")
+        self._idea_notes_var = tk.StringVar()
+        ttk.Entry(note_row, textvariable=self._idea_notes_var,
+                  width=40).pack(side="left", padx=6, fill="x", expand=True)
+        ttk.Button(note_row, text="Save note",
+                   command=self._ideas_save_note).pack(side="left")
+
+    # =========================================================
+    # Ideation controls
+    # =========================================================
+
+    def _ideas_get_settings(self) -> IdeationSettings:
+        """Read current settings from the UI."""
+        return IdeationSettings(
+            seeds             = self._idea_seeds_var.get().strip(),
+            style             = self._idea_style_var.get(),
+            interval_s        = max(30, int(self._idea_interval_var.get() or 90)),
+            max_per_session   = max(1, int(self._idea_max_var.get() or 50)),
+            use_content_style = bool(self._idea_use_style_var.get()),
+        )
+
+    def _ideas_make_loop(self) -> Optional[IdeationLoop]:
+        """Build an IdeationLoop from current models and settings."""
+        ideator_m = getattr(self, "ideator", None)
+        pitcher_m = getattr(self, "pitcher", None)
+        if not ideator_m or not pitcher_m:
+            messagebox.showwarning(
+                "Ideas",
+                "Ideator and/or Pitcher models are not available.\n"
+                "Make sure council_engine is running and both roles are built.",
+                parent=self.winfo_toplevel())
+            return None
+
+        settings = self._ideas_get_settings()
+        self._save_idea_settings(settings)
+        style_mgr = getattr(self, "_content_style", None)
+
+        return IdeationLoop(
+            ideator_model        = ideator_m,
+            pitcher_model        = pitcher_m,
+            store                = self._idea_store,
+            settings             = settings,
+            progress_cb          = self._ideas_log_append,
+            idea_cb              = self._on_new_idea,
+            content_style_manager= style_mgr,
+        )
+
+    def _ideas_start(self):
+        if self._idea_loop and self._idea_loop.running:
+            return
+        loop = self._ideas_make_loop()
+        if loop is None:
+            return
+        self._idea_loop = loop
+        self._idea_loop.start()
+        self._idea_start_btn.configure(state="disabled")
+        self._idea_pause_btn.configure(state="normal")
+        self._idea_status_var.set("Running…")
+
+    def _ideas_pause(self):
+        if not self._idea_loop:
+            return
+        self._idea_loop.pause()
+        lbl = "▶  Resume" if self._idea_loop.paused else "⏸  Pause"
+        self._idea_pause_btn.configure(text=lbl)
+        self._idea_status_var.set(
+            "Paused" if self._idea_loop.paused else "Running…")
+
+    def _ideas_stop(self):
+        if self._idea_loop:
+            self._idea_loop.stop()
+        # Wait for thread to finish then re-enable start
+        def _check():
+            if self._idea_loop and self._idea_loop.running:
+                self.after(300, _check)
+            else:
+                self._idea_start_btn.configure(state="normal")
+                self._idea_pause_btn.configure(state="disabled",
+                                                text="⏸  Pause")
+                self._idea_status_var.set("Stopped")
+        self.after(300, _check)
+
+    def _ideas_generate_one(self):
+        """Generate one idea right now, outside the loop (synchronous in a thread)."""
+        ideator_m = getattr(self, "ideator", None)
+        pitcher_m = getattr(self, "pitcher", None)
+        if not ideator_m or not pitcher_m:
+            messagebox.showwarning(
+                "Ideas",
+                "Ideator and Pitcher models required.",
+                parent=self.winfo_toplevel())
+            return
+
+        settings  = self._ideas_get_settings()
+        style_mgr = getattr(self, "_content_style", None)
+        loop = IdeationLoop(
+            ideator_model        = ideator_m,
+            pitcher_model        = pitcher_m,
+            store                = self._idea_store,
+            settings             = settings,
+            progress_cb          = self._ideas_log_append,
+            idea_cb              = self._on_new_idea,
+            content_style_manager= style_mgr,
+        )
+        self._ideas_log_append("▶ Generating one idea…")
+        threading.Thread(target=loop.run_one_now, daemon=True).start()
+
+    # ── Callback from IdeationLoop (called from background thread) ─
+
+    def _on_new_idea(self, item: IdeaItem):
+        """Called by IdeationLoop when a new idea is ready."""
+        self.after(0, lambda i=item: self._on_new_idea_ui(i))
+
+    def _on_new_idea_ui(self, item: IdeaItem):
+        """UI-thread callback — refresh list and update status."""
+        self._ideas_list_refresh()
+        count = self._idea_store.count()
+        self._idea_status_var.set(
+            f"Running…  {count} ideas total"
+            + (f"  (this session: {self._idea_loop.count})"
+               if self._idea_loop else ""))
+
+    # =========================================================
+    # Log
+    # =========================================================
+
+    def _ideas_log_append(self, msg: str):
+        def _do():
+            self._idea_log.configure(state="normal")
+            tag = ("ok"   if "✓" in msg else
+                   "err"  if "✗" in msg else
+                   "warn" if "⚠" in msg else
+                   "hdr"  if msg.startswith("▶") or msg.startswith("■") else "")
+            self._idea_log.insert("end", msg + "\n", tag)
+            self._idea_log.see("end")
+            self._idea_log.configure(state="disabled")
+        self.after(0, _do)
+
+    # =========================================================
+    # Idea list
+    # =========================================================
+
+    def _ideas_list_refresh(self):
+        """Redraw the treeview from the store index."""
+        self._ideas_tv.delete(*self._ideas_tv.get_children())
+        index   = self._idea_store.list_index()
+        ftext   = self._idea_filter_var.get().lower()
+        fstatus = self._idea_status_filter_var.get()
+
+        shown = []
+        for entry in index:
+            if fstatus != "all" and entry.get("status") != fstatus:
+                continue
+            if ftext and ftext not in entry.get("title", "").lower():
+                continue
+            shown.append(entry)
+
+        self._idea_cache = shown
+        for entry in shown:
+            ts    = entry.get("generated_at", "")[:16].replace("T", " ")
+            stars = "★" * entry.get("rating", 0) if entry.get("rating", 0) else "·"
+            diff  = entry.get("difficulty", "")
+            diff_icon = {"easy": "🟢", "medium": "🟡", "hard": "🔴"}.get(
+                diff.split()[0].lower() if diff else "", "⚪")
+            status = entry.get("status", "new")
+            self._ideas_tv.insert(
+                "", "end",
+                iid=entry["id"],
+                values=(entry.get("title", "?"), diff_icon,
+                        f"{entry.get('status','new')}", stars, ts),
+                tags=(status,),
+            )
+
+        count = self._idea_store.count()
+        ttk.Label  # just ensure module is available
+        # Update status label
+        self._idea_status_var.set(
+            f"{count} ideas total  ({len(shown)} shown)"
+            + (f"  |  Loop: {'running' if self._idea_loop and self._idea_loop.running else 'idle'}")
+        )
+
+    def _ideas_selected_id(self) -> Optional[str]:
+        sel = self._ideas_tv.selection()
+        return sel[0] if sel else None
+
+    def _ideas_on_select(self, event=None):
+        idea_id = self._ideas_selected_id()
+        if not idea_id:
+            return
+        item = self._idea_store.load(idea_id)
+        if item:
+            self._ideas_show_detail(item)
+            self._idea_notes_var.set(item.notes or "")
+
+    def _ideas_show_detail(self, item: IdeaItem):
+        """Populate the detail text panel with a colour-coded idea card."""
+        txt = self._idea_detail
+        txt.configure(state="normal")
+        txt.delete("1.0", "end")
+
+        def _sec(header: str, content: str, tag: str = ""):
+            if not content:
+                return
+            txt.insert("end", f"\n{header}\n", "section")
+            txt.insert("end", content.strip() + "\n", tag)
+
+        def _list(header: str, items: list):
+            if not items:
+                return
+            txt.insert("end", f"\n{header}\n", "section")
+            for it in items:
+                txt.insert("end", f"  • {it}\n", "warn")
+
+        # Meta line
+        txt.insert("end",
+                   f"ID: {item.id}  |  {item.generated_at[:16]}  |  "
+                   f"{item.status_icon} {item.status}  |  "
+                   f"★ {item.rating or '–'}  |  "
+                   f"{item.difficulty_icon} {item.difficulty or '–'}\n",
+                   "meta")
+
+        _sec("TITLE:", item.title)
+        _sec("HOOK ANGLE (raw idea):", item.hook_angle, "pos")
+        _sec("HOOK (production):", item.hook)
+        _sec("EMOTIONAL TRIGGER:", item.emotional_trigger, "warn")
+        _sec("FORMAT:", item.format_suggestion)
+        _sec("PREMISE:", item.premise)
+
+        if item.outline:
+            txt.insert("end", "\nOUTLINE:\n", "section")
+            for line in item.outline:
+                txt.insert("end", f"  {line}\n")
+
+        _sec("THUMBNAIL CONCEPT:", item.thumbnail_concept, "pos")
+        _sec("TARGET AUDIENCE:", item.target_audience)
+        _sec("WHY IT WORKS:", item.why_it_works)
+
+        _list("TITLE VARIANTS:", item.title_variants)
+
+        if item.tags:
+            txt.insert("end", "\nTAGS:\n", "section")
+            txt.insert("end", "  " + ", ".join(item.tags) + "\n", "meta")
+
+        _sec("ESTIMATED LENGTH:", item.estimated_length)
+        _sec("PRODUCTION NOTES:", item.production_notes)
+
+        if item.niche_seed:
+            txt.insert("end", f"\nSEED USED: {item.niche_seed}\n", "meta")
+        if item.notes:
+            txt.insert("end", f"\nYOUR NOTES:\n{item.notes}\n", "warn")
+
+        txt.configure(state="disabled")
+
+    # =========================================================
+    # Per-idea actions
+    # =========================================================
+
+    def _ideas_set_status(self, new_status: str):
+        idea_id = self._ideas_selected_id()
+        if not idea_id:
+            return
+        item = self._idea_store.load(idea_id)
+        if not item:
+            return
+        item.status = new_status
+        self._idea_store.save(item)
+        self._ideas_list_refresh()
+        self._ideas_show_detail(item)
+
+    def _ideas_set_rating(self, stars: int):
+        idea_id = self._ideas_selected_id()
+        if not idea_id:
+            return
+        item = self._idea_store.load(idea_id)
+        if not item:
+            return
+        item.rating = stars
+        self._idea_store.save(item)
+        self._ideas_list_refresh()
+
+    def _ideas_save_note(self):
+        idea_id = self._ideas_selected_id()
+        if not idea_id:
+            return
+        item = self._idea_store.load(idea_id)
+        if not item:
+            return
+        item.notes = self._idea_notes_var.get().strip()
+        self._idea_store.save(item)
+        self._ideas_log_append(f"✓ Note saved for: {item.display_title}")
+
+    def _ideas_delete(self):
+        idea_id = self._ideas_selected_id()
+        if not idea_id:
+            return
+        item = self._idea_store.load(idea_id)
+        if not item:
+            return
+        if not messagebox.askyesno(
+                "Delete Idea",
+                f"Permanently delete:\n{item.display_title}?",
+                parent=self.winfo_toplevel()):
+            return
+        self._idea_store.delete(idea_id)
+        self._idea_detail.configure(state="normal")
+        self._idea_detail.delete("1.0", "end")
+        self._idea_detail.configure(state="disabled")
+        self._ideas_list_refresh()
+
+    def _ideas_export(self):
+        """Export all ideas (or filtered view) to a Markdown file."""
+        index = self._idea_store.list_index()
+        if not index:
+            messagebox.showinfo("Export", "No ideas to export.",
+                                parent=self.winfo_toplevel())
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export ideas",
+            defaultextension=".md",
+            filetypes=[("Markdown", "*.md"), ("Text", "*.txt"), ("All", "*.*")],
+            initialfile="ideas_export.md",
+        )
+        if not path:
+            return
+        lines = ["# Video Ideas Export\n",
+                 f"Exported: {__import__('datetime').datetime.now():%Y-%m-%d %H:%M}\n",
+                 f"Total: {len(index)} ideas\n\n---\n"]
+        for entry in index:
+            item = self._idea_store.load(entry["id"])
+            if not item:
+                continue
+            lines.append(f"\n## {item.display_title}")
+            lines.append(f"*{item.generated_at[:16]}  |  "
+                         f"{item.status}  |  ★ {item.rating}  |  "
+                         f"{item.difficulty}*\n")
+            if item.hook_angle:
+                lines.append(f"**Hook angle:** {item.hook_angle}\n")
+            if item.premise:
+                lines.append(f"**Premise:**\n{item.premise}\n")
+            if item.outline:
+                lines.append("**Outline:**")
+                for pt in item.outline:
+                    lines.append(f"- {pt}")
+                lines.append("")
+            if item.thumbnail_concept:
+                lines.append(f"**Thumbnail:** {item.thumbnail_concept}\n")
+            if item.title_variants:
+                lines.append("**Title variants:** " +
+                              " / ".join(item.title_variants) + "\n")
+            if item.notes:
+                lines.append(f"**Notes:** {item.notes}\n")
+            lines.append("\n---")
+
+        Path(path).write_text("\n".join(lines), encoding="utf-8")
+        self._ideas_log_append(f"✓ Exported {len(index)} ideas to {Path(path).name}")
+        messagebox.showinfo("Export",
+                             f"Exported {len(index)} ideas to:\n{path}",
+                             parent=self.winfo_toplevel())
+
+    def _ideas_send_to_council(self):
+        """Send the selected idea's full pitch to the Council input (or clipboard)."""
+        idea_id = self._ideas_selected_id()
+        if not idea_id:
+            messagebox.showinfo("Ideas", "Select an idea first.",
+                                parent=self.winfo_toplevel())
+            return
+        item = self._idea_store.load(idea_id)
+        if not item:
+            return
+
+        lines = [f"VIDEO IDEA: {item.display_title}"]
+        if item.hook_angle:
+            lines.append(f"\nHOOK ANGLE: {item.hook_angle}")
+        if item.premise:
+            lines.append(f"\nPREMISE:\n{item.premise}")
+        if item.outline:
+            lines.append("\nOUTLINE:")
+            for pt in item.outline:
+                lines.append(f"  {pt}")
+        if item.why_it_works:
+            lines.append(f"\nWHY IT WORKS: {item.why_it_works}")
+        if item.title_variants:
+            lines.append("\nTITLE VARIANTS: " + " / ".join(item.title_variants))
+        text = "\n".join(lines)
+
+        if hasattr(self, "nb") and self.nb is not None:
+            self._set_text(self.input, text)
+            self.nb.select(self.tab_council)
+        else:
+            # Standalone: copy to clipboard
+            self.winfo_toplevel().clipboard_clear()
+            self.winfo_toplevel().clipboard_append(text)
+            messagebox.showinfo("Copied",
+                                 "Idea pitch copied to clipboard.",
+                                 parent=self.winfo_toplevel())
+
+    # =========================================================
+    # GitHub / git integration
+    # =========================================================
+
+    def _git_config_file(self) -> Path:
+        return self.vault_dir / "idea_git_config.json"
+
+    def _load_git_config(self) -> dict:
+        try:
+            f = self._git_config_file()
+            if f.exists():
+                return json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {
+            "remote": "https://github.com/Infernoplaystuf/Council.git",
+            "branch": "main",
+            "filter": "saved+",
+        }
+
+    def _ideas_git_save_config(self):
+        cfg = {
+            "remote": self._git_remote_var.get().strip(),
+            "branch": self._git_branch_var.get().strip() or "main",
+            "filter": self._git_filter_var.get(),
+        }
+        try:
+            self._git_config_file().write_text(
+                json.dumps(cfg, indent=2), encoding="utf-8")
+            self._git_status_var.set("Config saved.")
+            self._ideas_log_append("✓ GitHub config saved.")
+        except Exception as e:
+            self._ideas_log_append(f"✗ Config save failed: {e}")
+
+    def _idea_to_markdown(self, item: IdeaItem) -> str:
+        """Render a single IdeaItem as a Markdown document."""
+        stars = "★" * item.rating if item.rating else "not rated"
+        lines = [
+            f"# {item.display_title}",
+            "",
+            f"**Generated:** {item.generated_at[:16]}  ",
+            f"**Status:** {item.status}  ",
+            f"**Rating:** {stars}  ",
+            f"**Difficulty:** {item.difficulty or '—'}  ",
+            f"**Estimated length:** {item.estimated_length or '—'}  ",
+            f"**Seed / niche:** {item.niche_seed or '—'}  ",
+            "",
+        ]
+        if item.hook_angle:
+            lines += ["## Hook Angle", "", item.hook_angle, ""]
+        if item.emotional_trigger:
+            lines += ["## Emotional Trigger", "", item.emotional_trigger, ""]
+        if item.format_suggestion:
+            lines += ["## Format", "", item.format_suggestion, ""]
+        if item.hook:
+            lines += ["## Hook (first 30 seconds)", "", item.hook, ""]
+        if item.premise:
+            lines += ["## Premise", "", item.premise, ""]
+        if item.outline:
+            lines += ["## Outline", ""]
+            for pt in item.outline:
+                lines.append(f"- {pt}")
+            lines.append("")
+        if item.thumbnail_concept:
+            lines += ["## Thumbnail Concept", "", item.thumbnail_concept, ""]
+        if item.target_audience:
+            lines += ["## Target Audience", "", item.target_audience, ""]
+        if item.why_it_works:
+            lines += ["## Why It Works", "", item.why_it_works, ""]
+        if item.title_variants:
+            lines += ["## Title Variants", ""]
+            for t in item.title_variants:
+                lines.append(f"- {t}")
+            lines.append("")
+        if item.tags:
+            lines += ["## Tags", "", ", ".join(item.tags), ""]
+        if item.production_notes:
+            lines += ["## Production Notes", "", item.production_notes, ""]
+        if item.notes:
+            lines += ["## My Notes", "", item.notes, ""]
+        lines += [
+            "---",
+            f"*ID: {item.id} · Generated by Council Ideator/Pitcher*",
+        ]
+        return "\n".join(lines)
+
+    def _ideas_to_readme(self, items: List[IdeaItem]) -> str:
+        """Generate an index README.md for the ideas folder."""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        lines = [
+            "# Council — Video Ideas",
+            "",
+            f"*Auto-generated by the Council Ideation Engine · Last sync: {now}*",
+            "",
+            f"**Total ideas:** {len(items)}",
+            "",
+            "| # | Title | Difficulty | Status | Rating | Date |",
+            "|---|-------|-----------|--------|--------|------|",
+        ]
+        for i, item in enumerate(items, 1):
+            slug = _idea_slug(item)
+            date = item.generated_at[:10]
+            diff = item.difficulty.split()[0] if item.difficulty else "—"
+            stars = "★" * item.rating if item.rating else "·"
+            title_link = f"[{item.display_title}](./{slug})"
+            lines.append(
+                f"| {i} | {title_link} | {diff} | {item.status} | {stars} | {date} |")
+        return "\n".join(lines) + "\n"
+
+    def _ideas_git_push(self):
+        """Export filtered ideas to ideas/ folder and push to GitHub."""
+        remote = self._git_remote_var.get().strip()
+        branch = self._git_branch_var.get().strip() or "main"
+        filt   = self._git_filter_var.get()
+
+        if not remote:
+            messagebox.showwarning("GitHub",
+                                    "Enter a GitHub remote URL first.",
+                                    parent=self.winfo_toplevel())
+            return
+
+        self._ideas_git_save_config()
+        self._git_status_var.set("Pushing…")
+        self._ideas_log_append(
+            f"▶ Preparing GitHub push  filter={filt!r}  branch={branch!r}")
+
+        def _worker():
+            try:
+                self._ideas_git_push_worker(remote, branch, filt)
+            except Exception as e:
+                import traceback
+                self._ideas_log_append(f"✗ Push failed: {e}")
+                self._ideas_log_append(traceback.format_exc()[:400])
+                self.after(0, lambda: self._git_status_var.set("Push failed"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _ideas_git_push_worker(self, remote: str, branch: str, filt: str):
+        """Background thread: write Markdown files, git add/commit/push."""
+        repo_root = Path(__file__).parent
+        ideas_dir = repo_root / "ideas"
+        ideas_dir.mkdir(exist_ok=True)
+
+        # ── Filter ideas ──────────────────────────────────────
+        index = self._idea_store.list_index()
+        if filt == "in-production":
+            keep = {"in-production"}
+        elif filt == "saved+":
+            keep = {"saved", "in-production"}
+        else:
+            keep = {"new", "saved", "archived", "in-production"}
+
+        filtered_entries = [e for e in index if e.get("status") in keep]
+        if not filtered_entries:
+            self._ideas_log_append("⚠ No ideas match the selected filter — nothing to push.")
+            self.after(0, lambda: self._git_status_var.set("Nothing to push"))
+            return
+
+        self._ideas_log_append(
+            f"  Writing {len(filtered_entries)} idea files to ideas/…")
+
+        # ── Write Markdown files ──────────────────────────────
+        items_written: List[IdeaItem] = []
+        for entry in filtered_entries:
+            item = self._idea_store.load(entry["id"])
+            if not item:
+                continue
+            slug     = _idea_slug(item)
+            md_path  = ideas_dir / slug
+            md_path.write_text(self._idea_to_markdown(item), encoding="utf-8")
+            items_written.append(item)
+
+        # ── Write README index ────────────────────────────────
+        readme_path = ideas_dir / "README.md"
+        readme_path.write_text(self._ideas_to_readme(items_written), encoding="utf-8")
+        self._ideas_log_append(f"  ✓ {len(items_written)} Markdown files + README written")
+
+        # ── Git operations ────────────────────────────────────
+        def _git(*args) -> str:
+            result = subprocess.run(
+                ["git"] + list(args),
+                cwd=str(repo_root),
+                capture_output=True, text=True,
+            )
+            out = (result.stdout + result.stderr).strip()
+            if out:
+                self._ideas_log_append(f"  git {args[0]}: {out[:200]}")
+            return result.returncode, out
+
+        # Init repo if needed
+        if not (repo_root / ".git").exists():
+            self._ideas_log_append("  Initialising git repo…")
+            _git("init", "-b", branch)
+            _git("remote", "add", "origin", remote)
+        else:
+            # Ensure remote is set correctly
+            rc, _ = _git("remote", "get-url", "origin")
+            if rc != 0:
+                _git("remote", "add", "origin", remote)
+            else:
+                _git("remote", "set-url", "origin", remote)
+
+        # Stage ideas/
+        _git("add", "ideas/")
+
+        # Check if there's anything to commit
+        rc, diff_out = _git("diff", "--cached", "--name-only")
+        if not diff_out.strip():
+            self._ideas_log_append("  Nothing new to commit — ideas already up to date.")
+            self.after(0, lambda: self._git_status_var.set("Already up to date"))
+            return
+
+        # Commit
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        msg = f"ideas: sync {len(items_written)} ideas [{now_str}]"
+        rc, _ = _git("commit", "-m", msg)
+        if rc != 0:
+            self._ideas_log_append("✗ Commit failed — see above.")
+            self.after(0, lambda: self._git_status_var.set("Commit failed"))
+            return
+
+        # Push
+        self._ideas_log_append(f"  Pushing to {remote} ({branch})…")
+        rc, push_out = _git("push", "-u", "origin", branch)
+        if rc == 0:
+            self._ideas_log_append(
+                f"✓ Pushed {len(items_written)} ideas to GitHub ({branch})")
+            self.after(0, lambda n=len(items_written):
+                       self._git_status_var.set(f"Pushed {n} ideas"))
+        else:
+            # Likely needs auth — give helpful guidance
+            self._ideas_log_append(
+                "✗ Push rejected. If this is your first push you may need to:\n"
+                "  1. Create the repo on GitHub if it doesn't exist\n"
+                "  2. Authenticate: run  gh auth login  or configure a PAT\n"
+                "  3. If branch doesn't exist: git push -u origin main\n"
+                f"  Error: {push_out[:300]}")
+            self.after(0, lambda: self._git_status_var.set("Auth needed — see log"))
+
+    # =========================================================
+    # Settings persistence
+    # =========================================================
+
+    def _settings_file(self) -> Path:
+        return self.vault_dir / "idea_settings.json"
+
+    def _load_idea_settings(self) -> IdeationSettings:
+        try:
+            f = self._settings_file()
+            if f.exists():
+                data = json.loads(f.read_text(encoding="utf-8"))
+                return IdeationSettings.from_dict(data)
+        except Exception:
+            pass
+        return IdeationSettings()
+
+    def _save_idea_settings(self, settings: IdeationSettings):
+        try:
+            self._settings_file().write_text(
+                json.dumps(settings.to_dict(), indent=2, ensure_ascii=False),
+                encoding="utf-8")
+        except Exception:
+            pass
+
+
+# ============================================================
+# IdeaApp — standalone runner
+# ============================================================
+
+class IdeaApp(StandaloneHost, IdeaTabMixin):
+    """
+    Full Idea Generator running as its own window.
+
+        python tab_ideas.py [--vault PATH] [--no-ai]
+    """
+
+    def __init__(self, vault_dir: Optional[Path] = None, no_ai: bool = False):
+        StandaloneHost.__init__(
+            self,
+            vault_dir = vault_dir,
+            title     = "Council — Overnight Idea Generator",
+            geometry  = "1300x840",
+        )
+
+        if not no_ai:
+            self._init_models()
+
+        self._build_ideas_tab(parent=self.root)
+
+    def _poll_queue(self):
+        self.root.after(80, self._poll_queue)
+
+
+def run_standalone():
+    import argparse
+    ap = argparse.ArgumentParser(
+        description="Council Overnight Idea Generator — standalone")
+    ap.add_argument("--vault", metavar="PATH",
+                    help="Path to vault directory (default: ~/council_vault)")
+    ap.add_argument("--no-ai", action="store_true",
+                    help="Disable AI (opens UI without models for testing)")
+    args = ap.parse_args()
+
+    app = IdeaApp(
+        vault_dir = Path(args.vault) if args.vault else None,
+        no_ai     = args.no_ai,
+    )
+    app.run()
+
+
+if __name__ == "__main__":
+    run_standalone()
