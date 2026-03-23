@@ -242,22 +242,38 @@ class IdeaTabMixin:
 
         ttk.Label(row2, text="  Push:").pack(side="left", padx=(8, 2))
         self._git_filter_var = tk.StringVar(
-            value=git_cfg.get("filter", "saved+"))
+            value=git_cfg.get("filter", "all"))
         ttk.Combobox(row2, textvariable=self._git_filter_var,
                      values=["all", "saved+", "in-production"],
                      state="readonly", width=14).pack(side="left")
         ttk.Label(row2,
-                  text="  (saved+ = saved & in-production)",
+                  text="  all=everything  saved+=curated only",
                   foreground="#45475a", font=("", 9)).pack(side="left", padx=4)
 
+        # Auto-push row
         row3 = ttk.Frame(gf)
-        row3.pack(fill="x", padx=8, pady=(2, 6))
-        ttk.Button(row3, text="🐙 Push ideas to GitHub",
+        row3.pack(fill="x", padx=8, pady=(2, 2))
+        self._git_autopush_var = tk.BooleanVar(
+            value=git_cfg.get("auto_push", False))
+        ttk.Checkbutton(row3, text="Auto-push every",
+                        variable=self._git_autopush_var).pack(side="left")
+        self._git_autopush_every_var = tk.StringVar(
+            value=str(git_cfg.get("auto_push_every", 5)))
+        ttk.Spinbox(row3, textvariable=self._git_autopush_every_var,
+                    from_=1, to=100, increment=1, width=4).pack(side="left", padx=4)
+        ttk.Label(row3,
+                  text="ideas  — pushes silently while the loop runs",
+                  foreground=PALETTE["subtext"]).pack(side="left")
+
+        # Manual push row
+        row4 = ttk.Frame(gf)
+        row4.pack(fill="x", padx=8, pady=(2, 6))
+        ttk.Button(row4, text="🐙 Push now",
                    command=self._ideas_git_push).pack(side="left")
-        ttk.Button(row3, text="Save config",
+        ttk.Button(row4, text="Save config",
                    command=self._ideas_git_save_config).pack(side="left", padx=6)
         self._git_status_var = tk.StringVar(value="")
-        ttk.Label(row3, textvariable=self._git_status_var,
+        ttk.Label(row4, textvariable=self._git_status_var,
                   foreground=PALETTE["blue"]).pack(side="left", padx=6)
 
     def _build_ideas_list(self, parent):
@@ -488,13 +504,33 @@ class IdeaTabMixin:
         self.after(0, lambda i=item: self._on_new_idea_ui(i))
 
     def _on_new_idea_ui(self, item: IdeaItem):
-        """UI-thread callback — refresh list and update status."""
+        """UI-thread callback — refresh list, update status, auto-push if due."""
         self._ideas_list_refresh()
-        count = self._idea_store.count()
+        session_count = self._idea_loop.count if self._idea_loop else 0
+        total_count   = self._idea_store.count()
         self._idea_status_var.set(
-            f"Running…  {count} ideas total"
-            + (f"  (this session: {self._idea_loop.count})"
-               if self._idea_loop else ""))
+            f"Running…  {total_count} ideas total"
+            + (f"  (this session: {session_count})" if self._idea_loop else ""))
+
+        # Auto-push check
+        if (self._git_autopush_var.get()
+                and session_count > 0
+                and self._git_remote_var.get().strip()):
+            every = max(1, int(self._git_autopush_every_var.get() or 5))
+            if session_count % every == 0:
+                self._ideas_log_append(
+                    f"  🐙 Auto-push triggered (every {every} ideas, "
+                    f"session count: {session_count})")
+                # Run in background thread so it doesn't block the UI
+                threading.Thread(
+                    target=self._ideas_git_push_worker,
+                    args=(
+                        self._git_remote_var.get().strip(),
+                        self._git_branch_var.get().strip() or "main",
+                        self._git_filter_var.get(),
+                    ),
+                    daemon=True,
+                ).start()
 
     # =========================================================
     # Log
@@ -785,16 +821,20 @@ class IdeaTabMixin:
         except Exception:
             pass
         return {
-            "remote": "https://github.com/Infernoplaystuf/Council.git",
-            "branch": "main",
-            "filter": "saved+",
+            "remote":          "https://github.com/Infernoplaystuf/Council.git",
+            "branch":          "main",
+            "filter":          "all",      # auto-push sends everything; manual can filter
+            "auto_push":       False,
+            "auto_push_every": 5,
         }
 
     def _ideas_git_save_config(self):
         cfg = {
-            "remote": self._git_remote_var.get().strip(),
-            "branch": self._git_branch_var.get().strip() or "main",
-            "filter": self._git_filter_var.get(),
+            "remote":          self._git_remote_var.get().strip(),
+            "branch":          self._git_branch_var.get().strip() or "main",
+            "filter":          self._git_filter_var.get(),
+            "auto_push":       bool(self._git_autopush_var.get()),
+            "auto_push_every": max(1, int(self._git_autopush_every_var.get() or 5)),
         }
         try:
             self._git_config_file().write_text(
