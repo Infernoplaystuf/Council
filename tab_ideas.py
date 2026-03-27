@@ -159,12 +159,12 @@ class IdeaTabMixin:
                              "presentation"],
                      state="readonly", width=14).pack(side="left", padx=6)
 
-        # Interval
-        ttk.Label(row1, text="  Interval:").pack(side="left", padx=(8, 2))
+        # Cooldown between ideas — models always run to full completion first
+        ttk.Label(row1, text="  Cooldown:").pack(side="left", padx=(8, 2))
         self._idea_interval_var = tk.StringVar(value=str(self._idea_settings.interval_s))
         ttk.Spinbox(row1, textvariable=self._idea_interval_var,
-                    from_=30, to=600, increment=30, width=6).pack(side="left")
-        ttk.Label(row1, text="s").pack(side="left", padx=(2, 0))
+                    from_=0, to=600, increment=30, width=6).pack(side="left")
+        ttk.Label(row1, text="s between ideas").pack(side="left", padx=(2, 0))
 
         row2 = ttk.Frame(sf)
         row2.pack(fill="x", padx=8, pady=(2, 4))

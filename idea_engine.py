@@ -136,7 +136,8 @@ class IdeationSettings:
     seeds:                str        = ""
     # Video style preference
     style:                str        = "any"
-    # Interval between idea cycles (sleep time AFTER a cycle completes)
+    # Cooldown AFTER a cycle finishes before starting the next one.
+    # The models always run to full completion regardless of this value.
     interval_s:           int        = 90
     # Hard cap per session (prevents runaway overnight loops)
     max_per_session:      int        = 50
@@ -360,6 +361,86 @@ def _build_pitcher_prompt(raw_idea_text: str, seeds: str = "") -> str:
         f"Develop this into a full pitch. Follow your output format exactly. "
         f"Every section must be genuinely complete — no placeholders."
     )
+
+
+def _build_pitcher_completion_prompt(
+    partial_response: str,
+    missing_fields: List[str],
+    seeds: str = "",
+) -> str:
+    """
+    Retry prompt sent to pitcher when it missed required sections.
+    Asks it to complete ONLY the missing parts.
+    """
+    niche_line = f"(Creator niche: {seeds.strip()})\n\n" if seeds.strip() else ""
+    fields_str = ", ".join(missing_fields)
+    return (
+        f"{niche_line}"
+        f"Your previous pitch was INCOMPLETE. "
+        f"The following required sections were missing or too short: {fields_str}\n\n"
+        f"Your partial output so far:\n{partial_response.strip()}\n\n"
+        f"Output ONLY the missing sections using their exact headers. "
+        f"Do not repeat or summarise sections that are already complete. "
+        f"Be thorough — every section must be fully written, not a placeholder."
+    )
+
+
+# Fields the pitcher MUST produce for an idea to be accepted.
+# Any idea missing these is retried or discarded.
+_REQUIRED_PITCHER_FIELDS: List[str] = [
+    "title", "hook", "premise", "outline",
+    "thumbnail_concept", "target_audience", "why_it_works",
+    "title_variants", "difficulty", "estimated_length",
+]
+
+# Minimum content thresholds (field → min length / min count)
+_FIELD_MIN: Dict[str, int] = {
+    "title":             5,
+    "hook":              20,
+    "premise":           40,
+    "outline":           3,   # min 3 outline items
+    "thumbnail_concept": 15,
+    "target_audience":   10,
+    "why_it_works":      30,
+    "title_variants":    2,   # min 2 variants
+    "difficulty":        2,
+    "estimated_length":  2,
+}
+
+# How many times the pitcher is allowed to retry filling missing sections
+_MAX_PITCHER_RETRIES = 2
+
+
+def _missing_pitcher_fields(fields: Dict[str, Any]) -> List[str]:
+    """
+    Return the HEADER names of any pitcher sections that are absent or too short.
+    Used both to decide whether to retry and to build the retry prompt.
+    """
+    header_map = {
+        "title":             "TITLE",
+        "hook":              "HOOK",
+        "premise":           "PREMISE",
+        "outline":           "OUTLINE",
+        "thumbnail_concept": "THUMBNAIL CONCEPT",
+        "target_audience":   "TARGET AUDIENCE",
+        "why_it_works":      "WHY IT WORKS",
+        "title_variants":    "TITLE VARIANTS",
+        "difficulty":        "DIFFICULTY",
+        "estimated_length":  "ESTIMATED LENGTH",
+    }
+    missing = []
+    for key, header in header_map.items():
+        val = fields.get(key)
+        min_threshold = _FIELD_MIN.get(key, 1)
+        if val is None:
+            missing.append(header)
+        elif isinstance(val, list):
+            if len(val) < min_threshold:
+                missing.append(header)
+        elif isinstance(val, str):
+            if len(val.strip()) < min_threshold:
+                missing.append(header)
+    return missing
 
 
 # ============================================================
@@ -639,11 +720,35 @@ class IdeationLoop:
 
         raw_idea_text = raw_response  # full ideator output passed to pitcher
 
-        # ── 4. Pitcher pass ───────────────────────────────────
-        self.progress_cb("  … Pitcher developing pitch…")
+        # ── 4. Pitcher pass (with completeness retries) ───────
+        self.progress_cb("  … Pitcher developing full pitch…")
         pitcher_prompt   = _build_pitcher_prompt(raw_idea_text, self.settings.seeds)
         pitched_response = self.pitcher_model.respond(pitcher_prompt)
         pitcher_fields   = _parse_pitcher_response(pitched_response)
+
+        missing = _missing_pitcher_fields(pitcher_fields)
+        attempt = 0
+        while missing and attempt < _MAX_PITCHER_RETRIES:
+            attempt += 1
+            self.progress_cb(
+                f"  ⚠ Pitcher incomplete (missing: {', '.join(missing)}) "
+                f"— retry {attempt}/{_MAX_PITCHER_RETRIES}…")
+            retry_prompt      = _build_pitcher_completion_prompt(
+                pitched_response, missing, self.settings.seeds)
+            completion        = self.pitcher_model.respond(retry_prompt)
+            # Merge completion into the original response so re-parsing
+            # sees both the original content and the newly filled sections
+            pitched_response  = pitched_response + "\n" + completion
+            pitcher_fields    = _parse_pitcher_response(pitched_response)
+            missing           = _missing_pitcher_fields(pitcher_fields)
+
+        if missing:
+            self.progress_cb(
+                f"  ✗ Idea discarded — pitcher still missing {missing} "
+                f"after {_MAX_PITCHER_RETRIES} retries. Moving to next cycle.")
+            return None
+
+        self.progress_cb("  ✓ Pitcher: all sections complete.")
 
         # ── 5. Assemble IdeaItem ──────────────────────────────
         item = IdeaItem(
