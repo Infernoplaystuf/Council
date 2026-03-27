@@ -32,6 +32,18 @@ try:
 except ImportError:
     _CE_OK = False
 
+try:
+    from PIL import Image as _PILImage, ImageTk as _ImageTk
+    _PIL_OK = True
+except ImportError:
+    _PIL_OK = False
+
+try:
+    from image_engine import ThumbnailGenerator
+    _IMG_OK = True
+except ImportError:
+    _IMG_OK = False
+
 
 def _idea_slug(item: "IdeaItem") -> str:
     """Generate a safe filename for an idea's Markdown file."""
@@ -474,6 +486,10 @@ class IdeaTabMixin:
             side="left", fill="y", padx=8)
         ttk.Button(act_row, text="✨ Refine",
                    command=self._ideas_refine_selected).pack(side="left")
+        ttk.Button(act_row, text="🖼 Thumbnail",
+                   command=self._ideas_thumbnail_selected).pack(side="left", padx=(4, 0))
+        ttk.Button(act_row, text="🖼 All 4★+",
+                   command=self._ideas_thumbnail_batch).pack(side="left", padx=(4, 0))
 
         # Export / GitHub
         ttk.Separator(act_row, orient="vertical").pack(
@@ -519,6 +535,18 @@ class IdeaTabMixin:
                   width=40).pack(side="left", padx=6, fill="x", expand=True)
         ttk.Button(note_row, text="Save note",
                    command=self._ideas_save_note).pack(side="left")
+
+        # Thumbnail preview (hidden until an image exists)
+        self._thumb_frame = ttk.LabelFrame(df, text="Thumbnail Preview")
+        # Initially not packed — shown only when an image is available
+        self._thumb_canvas = tk.Canvas(
+            self._thumb_frame,
+            width=384, height=216,       # 1280×720 scaled to 30%
+            bg=PALETTE.get("surface", "#1e1e2e"),
+            highlightthickness=0,
+        )
+        self._thumb_canvas.pack(padx=6, pady=6)
+        self._thumb_img_ref = None   # keep reference to prevent GC
 
     # =========================================================
     # Ideation controls
@@ -834,6 +862,40 @@ class IdeaTabMixin:
 
         txt.configure(state="disabled")
 
+        # Show thumbnail preview if an image has been generated
+        self._ideas_load_thumbnail(item)
+
+    def _ideas_load_thumbnail(self, item: IdeaItem):
+        """Show the generated thumbnail image in the preview canvas, or hide it."""
+        if not item.thumbnail_image_path:
+            self._thumb_frame.pack_forget()
+            return
+        img_path = self._idea_store.ideas_dir.parent / "idea_images" / item.thumbnail_image_path
+        if not img_path.exists():
+            self._thumb_frame.pack_forget()
+            return
+        try:
+            if _PIL_OK:
+                pil_img = _PILImage.open(img_path)
+                pil_img.thumbnail((384, 216), _PILImage.LANCZOS)
+                photo = _ImageTk.PhotoImage(pil_img)
+            else:
+                # tk.PhotoImage only supports GIF/PNG natively
+                photo = tk.PhotoImage(file=str(img_path))
+                # Scale down if needed (PhotoImage subsample)
+                w, h = photo.width(), photo.height()
+                if w > 384:
+                    factor = max(1, w // 384)
+                    photo = photo.subsample(factor, factor)
+            self._thumb_img_ref = photo
+            self._thumb_canvas.configure(
+                width=photo.width(), height=photo.height())
+            self._thumb_canvas.delete("all")
+            self._thumb_canvas.create_image(0, 0, anchor="nw", image=photo)
+            self._thumb_frame.pack(fill="x", padx=6, pady=(0, 4))
+        except Exception:
+            self._thumb_frame.pack_forget()
+
     # =========================================================
     # Per-idea actions
     # =========================================================
@@ -890,6 +952,136 @@ class IdeaTabMixin:
         self._idea_detail.delete("1.0", "end")
         self._idea_detail.configure(state="disabled")
         self._ideas_list_refresh()
+
+    # =========================================================
+    # Thumbnail generation
+    # =========================================================
+
+    def _thumb_gen(self) -> Optional["ThumbnailGenerator"]:
+        """Return a cached ThumbnailGenerator, or None if image_engine unavailable."""
+        if not _IMG_OK:
+            return None
+        if not hasattr(self, "_thumbnail_generator"):
+            self._thumbnail_generator = ThumbnailGenerator(
+                Path(self.vault_dir))
+        return self._thumbnail_generator
+
+    def _ideas_thumbnail_selected(self):
+        """Generate a thumbnail for the currently selected idea (must be 4+ stars)."""
+        idea_id = self._ideas_selected_id()
+        if not idea_id:
+            messagebox.showinfo("Thumbnail",
+                "Select an idea first.", parent=self.winfo_toplevel())
+            return
+        item = self._idea_store.load(idea_id)
+        if not item:
+            return
+        if item.rating < 4:
+            messagebox.showinfo("Thumbnail",
+                f"Thumbnails are only generated for ideas rated 4 stars or above.\n"
+                f"This idea is rated {item.rating or 0} star(s).\n"
+                f"Rate it 4 or 5 stars first.",
+                parent=self.winfo_toplevel())
+            return
+        gen = self._thumb_gen()
+        if not gen:
+            messagebox.showwarning("Thumbnail",
+                "image_engine.py not found — cannot generate thumbnails.",
+                parent=self.winfo_toplevel())
+            return
+        if not gen.available:
+            messagebox.showwarning("Thumbnail",
+                "No image backend detected.\n\n"
+                "Start ComfyUI (localhost:8188) or Automatic1111 (localhost:7860) "
+                "then try again.",
+                parent=self.winfo_toplevel())
+            return
+        if not item.thumbnail_concept:
+            messagebox.showinfo("Thumbnail",
+                "This idea has no thumbnail concept text to generate from.",
+                parent=self.winfo_toplevel())
+            return
+        self._ideas_log_append(
+            f"  🖼 Generating thumbnail for: {item.display_title} "
+            f"[{gen.backend_label}]…")
+        threading.Thread(
+            target=self._thumb_worker,
+            args=([item],),
+            daemon=True,
+        ).start()
+
+    def _ideas_thumbnail_batch(self):
+        """Generate thumbnails for all 4+ star ideas that don't have one yet."""
+        gen = self._thumb_gen()
+        if not gen:
+            messagebox.showwarning("Thumbnail",
+                "image_engine.py not found.", parent=self.winfo_toplevel())
+            return
+        if not gen.available:
+            messagebox.showwarning("Thumbnail",
+                "No image backend detected.\n\n"
+                "Start ComfyUI (localhost:8188) or Automatic1111 (localhost:7860) "
+                "then try again.",
+                parent=self.winfo_toplevel())
+            return
+        all_items = self._idea_store.list_all()
+        candidates = [
+            i for i in all_items
+            if i.rating >= 4
+            and i.thumbnail_concept
+            and not i.thumbnail_image_path
+        ]
+        if not candidates:
+            messagebox.showinfo("Thumbnail",
+                "No 4+ star ideas without thumbnails found.\n"
+                "(Either none are rated 4+ yet, or all already have images.)",
+                parent=self.winfo_toplevel())
+            return
+        if not messagebox.askyesno(
+                "Generate Thumbnails",
+                f"Generate thumbnails for {len(candidates)} idea(s) rated 4+ stars?\n"
+                f"Backend: {gen.backend_label}\n\n"
+                f"This may take several minutes. The council will log progress.",
+                parent=self.winfo_toplevel()):
+            return
+        self._ideas_log_append(
+            f"  🖼 Batch thumbnail generation: {len(candidates)} idea(s) "
+            f"[{gen.backend_label}]…")
+        threading.Thread(
+            target=self._thumb_worker,
+            args=(candidates,),
+            daemon=True,
+        ).start()
+
+    def _thumb_worker(self, items: list):
+        """Background thread: generate thumbnails for a list of IdeaItems."""
+        gen = self._thumb_gen()
+        if not gen:
+            return
+        done = 0
+        for item in items:
+            try:
+                path = gen.generate(item.thumbnail_concept, item.id)
+                if path:
+                    item.thumbnail_image_path = path.name
+                    self._idea_store.save(item)
+                    done += 1
+                    self.after(0, lambda i=item: self._on_thumbnail_ready(i))
+                    self.after(0, lambda t=item.display_title: self._ideas_log_append(
+                        f"  ✓ Thumbnail saved: {t}"))
+                else:
+                    self.after(0, lambda t=item.display_title: self._ideas_log_append(
+                        f"  ✗ Thumbnail failed: {t}"))
+            except Exception as e:
+                self.after(0, lambda t=item.display_title, err=e:
+                    self._ideas_log_append(f"  ✗ Thumbnail error ({t}): {err}"))
+        self.after(0, lambda: self._ideas_log_append(
+            f"  🖼 Thumbnail batch complete: {done}/{len(items)} generated."))
+
+    def _on_thumbnail_ready(self, item: IdeaItem):
+        """Called on UI thread when a thumbnail finishes — refresh if it's selected."""
+        if self._ideas_selected_id() == item.id:
+            self._ideas_load_thumbnail(item)
 
     def _ideas_purge_incomplete(self):
         """Delete every stored idea that is missing required pitcher sections."""

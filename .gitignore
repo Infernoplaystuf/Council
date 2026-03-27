@@ -51,3 +51,11 @@ _norton_/
 *.ggml
 *.bin
 *.safetensors
+
+# Generated thumbnail images — local only, never pushed
+# (vault/ is already ignored above; these patterns are an extra safety net)
+*.png
+*.jpg
+*.jpeg
+*.webp
+idea_images/

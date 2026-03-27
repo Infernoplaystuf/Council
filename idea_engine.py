@@ -64,6 +64,10 @@ class IdeaItem:
     # Refinement tracking
     refined_from:      str   = ""       # ID of the original idea this was refined from
 
+    # Thumbnail image (local only — never pushed to git)
+    # Stores the filename only (relative to vault/idea_images/)
+    thumbnail_image_path: str = ""
+
     # ── Derived ───────────────────────────────────────────────
 
     @property
@@ -114,6 +118,7 @@ class IdeaItem:
             "status":            self.status,
             "notes":             self.notes,
             "refined_from":      self.refined_from,
+            "thumbnail_image_path": self.thumbnail_image_path,
         }
 
     @classmethod
