@@ -22,6 +22,7 @@ from tkinter import ttk, messagebox, filedialog
 from council_modules import StandaloneHost, PALETTE
 from idea_engine import (
     IdeaItem, IdeationSettings, IdeaStore, IdeationLoop,
+    _missing_pitcher_fields,
 )
 
 try:
@@ -426,11 +427,16 @@ class IdeaTabMixin:
         self._ideas_tv.column("Rating",     width=40,  stretch=False, anchor="center")
         self._ideas_tv.column("When",       width=90,  stretch=False, anchor="center")
 
+        # Status → foreground colour
         self._ideas_tv.tag_configure("new",          foreground=PALETTE["text"])
         self._ideas_tv.tag_configure("saved",        foreground=PALETTE["green"])
         self._ideas_tv.tag_configure("archived",     foreground=PALETTE["overlay"])
         self._ideas_tv.tag_configure("in-production",foreground=PALETTE["blue"],
                                       font=("", 9, "bold"))
+        # Difficulty → subtle background tint (does NOT conflict with status foreground)
+        self._ideas_tv.tag_configure("diff_easy",   background="#1a3028")
+        self._ideas_tv.tag_configure("diff_medium", background="#2e2410")
+        self._ideas_tv.tag_configure("diff_hard",   background="#2e1212")
 
         tv_sb = ttk.Scrollbar(tv_frame, orient="vertical",
                                command=self._ideas_tv.yview)
@@ -452,6 +458,8 @@ class IdeaTabMixin:
                        side="left")
         ttk.Button(act_row, text="🗑 Delete",
                    command=self._ideas_delete).pack(side="left", padx=(10, 0))
+        ttk.Button(act_row, text="🧹 Purge incomplete",
+                   command=self._ideas_purge_incomplete).pack(side="left", padx=(4, 0))
         ttk.Separator(act_row, orient="vertical").pack(
             side="left", fill="y", padx=8)
 
@@ -461,6 +469,11 @@ class IdeaTabMixin:
             ttk.Button(act_row, text=str(star), width=2,
                        command=lambda s=star: self._ideas_set_rating(s)).pack(
                            side="left")
+
+        ttk.Separator(act_row, orient="vertical").pack(
+            side="left", fill="y", padx=8)
+        ttk.Button(act_row, text="✨ Refine",
+                   command=self._ideas_refine_selected).pack(side="left")
 
         # Export / GitHub
         ttk.Separator(act_row, orient="vertical").pack(
@@ -708,15 +721,19 @@ class IdeaTabMixin:
             ts    = entry.get("generated_at", "")[:16].replace("T", " ")
             stars = "★" * entry.get("rating", 0) if entry.get("rating", 0) else "·"
             diff  = entry.get("difficulty", "")
-            diff_icon = {"easy": "🟢", "medium": "🟡", "hard": "🔴"}.get(
-                diff.split()[0].lower() if diff else "", "⚪")
+            diff_key = diff.split()[0].lower() if diff else ""
+            diff_label = {"easy": "easy", "medium": "med", "hard": "hard"}.get(
+                diff_key, "—")
+            diff_tag = {"easy": "diff_easy", "medium": "diff_medium",
+                        "hard": "diff_hard"}.get(diff_key, "")
             status = entry.get("status", "new")
+            row_tags = (status, diff_tag) if diff_tag else (status,)
             self._ideas_tv.insert(
                 "", "end",
                 iid=entry["id"],
-                values=(entry.get("title", "?"), diff_icon,
+                values=(entry.get("title", "?"), diff_label,
                         f"{entry.get('status','new')}", stars, ts),
-                tags=(status,),
+                tags=row_tags,
             )
 
         count = self._idea_store.count()
@@ -735,10 +752,26 @@ class IdeaTabMixin:
         idea_id = self._ideas_selected_id()
         if not idea_id:
             return
+
+        # Auto-save notes for the previously shown idea before switching
+        prev_id = getattr(self, "_idea_currently_shown_id", None)
+        if prev_id and prev_id != idea_id:
+            typed = self._idea_notes_var.get().strip()
+            prev_loaded = getattr(self, "_idea_loaded_notes", "")
+            if typed != prev_loaded:
+                prev_item = self._idea_store.load(prev_id)
+                if prev_item:
+                    prev_item.notes = typed
+                    self._idea_store.save(prev_item)
+                    self._ideas_log_append(
+                        f"  ✓ Notes auto-saved for: {prev_item.display_title}")
+
         item = self._idea_store.load(idea_id)
         if item:
+            self._idea_currently_shown_id = idea_id
+            self._idea_loaded_notes = item.notes or ""
             self._ideas_show_detail(item)
-            self._idea_notes_var.set(item.notes or "")
+            self._idea_notes_var.set(self._idea_loaded_notes)
 
     def _ideas_show_detail(self, item: IdeaItem):
         """Populate the detail text panel with a colour-coded idea card."""
@@ -760,11 +793,13 @@ class IdeaTabMixin:
                 txt.insert("end", f"  • {it}\n", "warn")
 
         # Meta line
+        refined_badge = f"  |  ✨ refined from {item.refined_from}" if item.refined_from else ""
         txt.insert("end",
                    f"ID: {item.id}  |  {item.generated_at[:16]}  |  "
                    f"{item.status_icon} {item.status}  |  "
                    f"★ {item.rating or '–'}  |  "
-                   f"{item.difficulty_icon} {item.difficulty or '–'}\n",
+                   f"{item.difficulty or '–'}"
+                   f"{refined_badge}\n",
                    "meta")
 
         _sec("TITLE:", item.title)
@@ -835,6 +870,7 @@ class IdeaTabMixin:
             return
         item.notes = self._idea_notes_var.get().strip()
         self._idea_store.save(item)
+        self._idea_loaded_notes = item.notes   # keep tracker in sync
         self._ideas_log_append(f"✓ Note saved for: {item.display_title}")
 
     def _ideas_delete(self):
@@ -854,6 +890,126 @@ class IdeaTabMixin:
         self._idea_detail.delete("1.0", "end")
         self._idea_detail.configure(state="disabled")
         self._ideas_list_refresh()
+
+    def _ideas_purge_incomplete(self):
+        """Delete every stored idea that is missing required pitcher sections."""
+        all_entries = self._idea_store.list_index()
+        to_delete = []
+        for entry in all_entries:
+            item = self._idea_store.load(entry["id"])
+            if item is None:
+                to_delete.append(entry["id"])
+                continue
+            fields = {
+                "title":             item.title,
+                "hook":              item.hook,
+                "premise":           item.premise,
+                "outline":           item.outline,
+                "thumbnail_concept": item.thumbnail_concept,
+                "target_audience":   item.target_audience,
+                "why_it_works":      item.why_it_works,
+                "title_variants":    item.title_variants,
+                "difficulty":        item.difficulty,
+                "estimated_length":  item.estimated_length,
+            }
+            if _missing_pitcher_fields(fields):
+                to_delete.append(entry["id"])
+
+        if not to_delete:
+            messagebox.showinfo("Purge Incomplete",
+                                "No incomplete ideas found — nothing to delete.",
+                                parent=self.winfo_toplevel())
+            return
+
+        if not messagebox.askyesno(
+                "Purge Incomplete",
+                f"Permanently delete {len(to_delete)} incomplete idea(s)?\n"
+                f"(Missing required sections like title, outline, thumbnail, etc.)",
+                parent=self.winfo_toplevel()):
+            return
+
+        for idea_id in to_delete:
+            self._idea_store.delete(idea_id)
+
+        self._idea_detail.configure(state="normal")
+        self._idea_detail.delete("1.0", "end")
+        self._idea_detail.configure(state="disabled")
+        self._ideas_list_refresh()
+        self._ideas_log_append(
+            f"🧹 Purged {len(to_delete)} incomplete idea(s).")
+
+    def _ideas_refine_selected(self):
+        """Run a refinement pass on the selected idea using the pitcher model."""
+        idea_id = self._ideas_selected_id()
+        if not idea_id:
+            messagebox.showinfo("Refine", "Select an idea first.",
+                                parent=self.winfo_toplevel())
+            return
+        item = self._idea_store.load(idea_id)
+        if not item:
+            return
+        pitcher = getattr(self, "pitcher", None)
+        ideator = getattr(self, "ideator", None)
+        if not pitcher:
+            messagebox.showwarning("Refine",
+                "Pitcher model not available — start the council first.",
+                parent=self.winfo_toplevel())
+            return
+        self._ideas_log_append(
+            f"  ✨ Refining: {item.display_title}…")
+        threading.Thread(
+            target=self._ideas_refine_worker,
+            args=(item, pitcher, ideator),
+            daemon=True,
+        ).start()
+
+    def _ideas_refine_worker(self, item: IdeaItem, pitcher, ideator):
+        """Background thread: re-pitch an idea, incorporating user notes."""
+        try:
+            from idea_engine import _build_refinement_prompt, _parse_pitcher_response
+            prompt   = _build_refinement_prompt(item)
+            response = pitcher.respond(prompt)
+            fields   = _parse_pitcher_response(response)
+
+            # Build a new IdeaItem that is the refined version
+            from idea_engine import IdeaItem as _IdeaItem
+            refined = _IdeaItem(
+                # Keep raw ideator fields from the original
+                raw_idea          = item.raw_idea,
+                hook_angle        = item.hook_angle,
+                emotional_trigger = item.emotional_trigger,
+                format_suggestion = item.format_suggestion,
+                seed_used         = item.seed_used,
+                niche_seed        = item.niche_seed,
+                # Overwrite pitcher fields with refined version
+                title             = fields.get("title") or item.title,
+                hook              = fields.get("hook") or item.hook,
+                premise           = fields.get("premise") or item.premise,
+                outline           = fields.get("outline") or item.outline,
+                thumbnail_concept = fields.get("thumbnail_concept") or item.thumbnail_concept,
+                target_audience   = fields.get("target_audience") or item.target_audience,
+                why_it_works      = fields.get("why_it_works") or item.why_it_works,
+                title_variants    = fields.get("title_variants") or item.title_variants,
+                tags              = fields.get("tags") or item.tags,
+                difficulty        = fields.get("difficulty") or item.difficulty,
+                estimated_length  = fields.get("estimated_length") or item.estimated_length,
+                production_notes  = fields.get("production_notes") or item.production_notes,
+                ideator_model     = item.ideator_model,
+                pitcher_model     = getattr(pitcher, "name", "pitcher"),
+                # Carry over user state
+                rating            = item.rating,
+                status            = item.status,
+                notes             = item.notes,
+                refined_from      = item.id,
+            )
+            self._idea_store.save(refined)
+            self.after(0, lambda: self._ideas_list_refresh())
+            self.after(0, lambda: self._ideas_log_append(
+                f"  ✓ Refined idea saved: {refined.display_title}"))
+        except Exception as e:
+            import traceback
+            self.after(0, lambda: self._ideas_log_append(
+                f"  ✗ Refinement error: {e}\n{traceback.format_exc()[:200]}"))
 
     def _ideas_export(self):
         """Export all ideas (or filtered view) to a Markdown file."""

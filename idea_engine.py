@@ -61,6 +61,9 @@ class IdeaItem:
     status:            str   = "new"    # new / saved / archived / in-production
     notes:             str   = ""       # user's own notes on the idea
 
+    # Refinement tracking
+    refined_from:      str   = ""       # ID of the original idea this was refined from
+
     # ── Derived ───────────────────────────────────────────────
 
     @property
@@ -110,6 +113,7 @@ class IdeaItem:
             "rating":            self.rating,
             "status":            self.status,
             "notes":             self.notes,
+            "refined_from":      self.refined_from,
         }
 
     @classmethod
@@ -153,6 +157,11 @@ class IdeationSettings:
         "writer", "strategist", "director", "content", "algorithm", "sage",
     ])
 
+    # Auto-refinement: every N new ideas, pick one 3+ star idea and refine it
+    refine_starred:       bool       = True
+    refine_min_rating:    int        = 3    # minimum star rating to qualify
+    refine_every_n:       int        = 5    # refine one starred idea every N cycles
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "seeds":                self.seeds,
@@ -163,6 +172,9 @@ class IdeationSettings:
             "use_video_analyses":   self.use_video_analyses,
             "anti_repeat_lookback": self.anti_repeat_lookback,
             "brainstorm_roles":     self.brainstorm_roles,
+            "refine_starred":       self.refine_starred,
+            "refine_min_rating":    self.refine_min_rating,
+            "refine_every_n":       self.refine_every_n,
         }
 
     @classmethod
@@ -360,6 +372,46 @@ def _build_pitcher_prompt(raw_idea_text: str, seeds: str = "") -> str:
         f"{raw_idea_text.strip()}\n\n"
         f"Develop this into a full pitch. Follow your output format exactly. "
         f"Every section must be genuinely complete — no placeholders."
+    )
+
+
+def _build_refinement_prompt(item: "IdeaItem") -> str:
+    """
+    Prompt sent to the pitcher when refining an existing 3+ star idea.
+    Incorporates user notes, keeps the original concept but improves every section.
+    """
+    notes_block = (
+        f"\nCREATOR'S NOTES ON THIS IDEA:\n{item.notes.strip()}\n"
+        if item.notes and item.notes.strip()
+        else ""
+    )
+    existing = (
+        f"TITLE: {item.title}\n"
+        f"HOOK: {item.hook}\n"
+        f"PREMISE: {item.premise}\n"
+        f"OUTLINE:\n" + "\n".join(f"  {i+1}. {s}" for i, s in enumerate(item.outline)) + "\n"
+        f"THUMBNAIL CONCEPT: {item.thumbnail_concept}\n"
+        f"TARGET AUDIENCE: {item.target_audience}\n"
+        f"WHY IT WORKS: {item.why_it_works}\n"
+        f"TITLE VARIANTS:\n" + "\n".join(f"  - {v}" for v in item.title_variants) + "\n"
+        f"DIFFICULTY: {item.difficulty}\n"
+        f"ESTIMATED LENGTH: {item.estimated_length}\n"
+        f"PRODUCTION NOTES: {item.production_notes}\n"
+    )
+    return (
+        f"This is a REFINEMENT pass — the creator has rated this idea highly "
+        f"and wants it made even stronger.\n"
+        f"{notes_block}\n"
+        f"EXISTING PITCH TO IMPROVE:\n{existing}\n\n"
+        f"Your task:\n"
+        f"1. Sharpen the TITLE — make it more specific, clickable, and differentiated.\n"
+        f"2. Strengthen the HOOK — it should create immediate tension or curiosity.\n"
+        f"3. Improve the OUTLINE — add concrete specifics, cut vague filler sections.\n"
+        f"4. Upgrade THUMBNAIL CONCEPT — more visual, more scroll-stopping.\n"
+        f"5. Incorporate the creator's notes if provided.\n"
+        f"6. Keep the core concept — do not replace the idea, make it the best version of itself.\n\n"
+        f"Output the full improved pitch using your standard format. "
+        f"Every section must be noticeably better than the version above."
     )
 
 
@@ -655,6 +707,15 @@ class IdeationLoop:
                     self.progress_cb(f"  ✗ Cycle error: {e}")
                     self.progress_cb(traceback.format_exc()[:300])
 
+                # Auto-refinement: every N cycles refine a top-rated idea
+                if (self.settings.refine_starred
+                        and self._count > 0
+                        and self._count % self.settings.refine_every_n == 0):
+                    try:
+                        self._run_refinement_cycle()
+                    except Exception as e:
+                        self.progress_cb(f"  ⚠ Refinement pass error: {e}")
+
                 if self._stop_flag:
                     break
 
@@ -775,6 +836,70 @@ class IdeationLoop:
             pitcher_model     = getattr(self.pitcher_model, "name", "pitcher"),
         )
         return item
+
+    def _run_refinement_cycle(self):
+        """
+        Pick the highest-rated unrefined idea and run a pitcher refinement pass.
+        The refined version is saved as a NEW IdeaItem (refined_from = original id).
+        """
+        min_rating = self.settings.refine_min_rating
+        all_items  = self.store.list_all()
+
+        # IDs that are already refined versions of something
+        refined_ids = {i.refined_from for i in all_items if i.refined_from}
+
+        # Candidates: rated >= min, not already refined, not already a refinement
+        candidates = [
+            i for i in all_items
+            if i.rating >= min_rating
+            and i.id not in refined_ids
+            and not i.refined_from
+        ]
+        if not candidates:
+            self.progress_cb(
+                f"  ✨ No unrefined {min_rating}+ star ideas to refine yet.")
+            return
+
+        # Pick the highest-rated (break ties by most recent)
+        target = max(candidates, key=lambda i: (i.rating, i.generated_at))
+        self.progress_cb(
+            f"  ✨ Auto-refining: {target.display_title} "
+            f"({'★' * target.rating}) …")
+
+        prompt   = _build_refinement_prompt(target)
+        response = self.pitcher_model.respond(prompt)
+        fields   = _parse_pitcher_response(response)
+
+        refined = IdeaItem(
+            raw_idea          = target.raw_idea,
+            hook_angle        = target.hook_angle,
+            emotional_trigger = target.emotional_trigger,
+            format_suggestion = target.format_suggestion,
+            seed_used         = target.seed_used,
+            niche_seed        = target.niche_seed,
+            title             = fields.get("title") or target.title,
+            hook              = fields.get("hook") or target.hook,
+            premise           = fields.get("premise") or target.premise,
+            outline           = fields.get("outline") or target.outline,
+            thumbnail_concept = fields.get("thumbnail_concept") or target.thumbnail_concept,
+            target_audience   = fields.get("target_audience") or target.target_audience,
+            why_it_works      = fields.get("why_it_works") or target.why_it_works,
+            title_variants    = fields.get("title_variants") or target.title_variants,
+            tags              = fields.get("tags") or target.tags,
+            difficulty        = fields.get("difficulty") or target.difficulty,
+            estimated_length  = fields.get("estimated_length") or target.estimated_length,
+            production_notes  = fields.get("production_notes") or target.production_notes,
+            ideator_model     = target.ideator_model,
+            pitcher_model     = getattr(self.pitcher_model, "name", "pitcher"),
+            rating            = target.rating,
+            status            = target.status,
+            notes             = target.notes,
+            refined_from      = target.id,
+        )
+        self.store.save(refined)
+        self.idea_cb(refined)
+        self.progress_cb(
+            f"  ✓ Refined idea saved: {refined.display_title}")
 
     def run_one_now(self) -> Optional["IdeaItem"]:
         """
