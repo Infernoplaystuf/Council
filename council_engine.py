@@ -3061,6 +3061,27 @@ def build_registry(dispatcher: Optional[LoadAwareDispatcher] = None) -> BackendR
     return reg
 
 
+# Human-readable size labels keyed by backend_key.
+# Used by the UI to show which model tier each role is running on.
+BACKEND_SIZE_LABELS: Dict[str, str] = {
+    "local_general_primary": "32B",
+    "local_general_alt":     "14B",
+    "local_coder_primary":   "14B coder",
+    "local_coder_fast":      "phi4",
+    "local_judge_fast":      "phi4",
+    "local_peasant_fast":    "phi4",
+    "local_fast":            "14B",
+    "pi_heavy":              "14B (Pi)",
+    "pi_fast":               "phi4 (Pi)",
+}
+
+
+def get_model_size_label(model: "PersonalityModel") -> str:
+    """Return a human-readable size string for a PersonalityModel, e.g. '32B'."""
+    bk = getattr(model, "backend_key", None) or ""
+    return BACKEND_SIZE_LABELS.get(bk, bk or "?")
+
+
 def build_personalities(
     *,
     pins: Dict[str, str],
@@ -3190,6 +3211,25 @@ def build_personalities(
     for role, default_key in defaults.items():
         if role not in pins:
             models[role].backend_key = default_key
+
+    # ── Token budget overrides ────────────────────────────────────────
+    # Roles that produce long structured output get a larger budget.
+    # The default 1400 is fine for most roles; pitcher/sage/writer need more.
+    token_budgets = {
+        "pitcher":   3200,   # full pitch: title, hook, premise, 6-8 outline sections,
+                             # thumbnail, audience, why-it-works, variants, tags, notes
+        "ideator":   1000,   # raw idea only — 5 short fields, no bloat needed
+        "writer":    2400,   # long-form synthesis and essays
+        "sage":      2400,   # detailed knowledge responses
+        "director":  2000,   # script outlines and style breakdowns
+        "content":   1800,   # packaging writeups
+        "strategist":1600,   # strategic plans
+        "coach":     1800,   # delivery breakdowns with drill sections
+        "algorithm": 1600,   # retention analysis
+    }
+    for role, budget in token_budgets.items():
+        if role in models:
+            models[role].max_output_tokens = budget
 
     return models
 

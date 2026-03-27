@@ -14,7 +14,7 @@ import subprocess
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -26,6 +26,7 @@ from idea_engine import (
 
 try:
     import council_engine as ce
+    from council_engine import get_model_size_label as _get_model_size_label
     _CE_OK = True
 except ImportError:
     _CE_OK = False
@@ -220,12 +221,18 @@ class IdeaTabMixin:
 
         # Wire quality label updates
         def _update_quality_labels(*_):
-            ir = self._idea_ideator_role_var.get()
-            pr = self._idea_pitcher_role_var.get()
-            self._idea_ideator_quality_var.set(
-                self._MODEL_QUALITY.get(ir, "custom model"))
-            self._idea_pitcher_quality_var.set(
-                self._MODEL_QUALITY.get(pr, "custom model"))
+            personalities = getattr(self, "personalities", {})
+
+            def _label(role):
+                desc = self._MODEL_QUALITY.get(role, "custom model")
+                model = personalities.get(role)
+                if model and _CE_OK:
+                    size = _get_model_size_label(model)
+                    return f"[{size}]  {desc}"
+                return desc
+
+            self._idea_ideator_quality_var.set(_label(self._idea_ideator_role_var.get()))
+            self._idea_pitcher_quality_var.set(_label(self._idea_pitcher_role_var.get()))
 
         self._idea_ideator_role_var.trace_add("write", _update_quality_labels)
         self._idea_pitcher_role_var.trace_add("write", _update_quality_labels)
