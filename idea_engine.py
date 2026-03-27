@@ -447,6 +447,7 @@ class IdeationLoop:
         self._pause_flag: bool = False
         self._count:      int  = 0   # ideas generated this session
         self._running:    bool = False
+        self._session_id: str  = ""   # set in start()
 
     # ── Control ───────────────────────────────────────────────
 
@@ -462,9 +463,16 @@ class IdeationLoop:
     def count(self) -> int:
         return self._count
 
+    @property
+    def session_id(self) -> str:
+        """Folder-safe timestamp set when the loop starts, e.g. '3_27_26_16_00_00'."""
+        return self._session_id
+
     def start(self):
         if self._running:
             return
+        now = datetime.now()
+        self._session_id = f"{now.month}_{now.day}_{now.strftime('%y_%H_%M_%S')}"
         self._stop_flag  = False
         self._pause_flag = False
         self._count      = 0
@@ -474,7 +482,8 @@ class IdeationLoop:
         self.progress_cb(
             f"▶ Ideation loop started "
             f"(interval: {self.settings.interval_s}s, "
-            f"max: {self.settings.max_per_session} ideas)")
+            f"max: {self.settings.max_per_session} ideas, "
+            f"session: {self._session_id})")
 
     def stop(self):
         self._stop_flag  = True

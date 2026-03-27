@@ -119,6 +119,20 @@ class IdeaTabMixin:
 
     # ── Settings panel ────────────────────────────────────────
 
+    # Quality descriptions shown next to the model dropdowns
+    _MODEL_QUALITY = {
+        "ideator":    "standard creative model — built for this role",
+        "pitcher":    "standard pitch model — built for this role",
+        "sage":       "deep reasoning — slower, most fleshed-out ideas",
+        "strategist": "analytical framing — strong on structure & positioning",
+        "director":   "production-aware — detailed outlines & shooting notes",
+        "writer":     "narrative focus — strong hook writing & flow",
+        "content":    "packaging focus — best title/thumbnail concepts",
+        "algorithm":  "retention-optimised — hook mechanics & CTR framing",
+        "judge":      "critical — will reject weak ideas, fewer but sharper",
+        "chat":       "fast / light — quick ideas, least detail",
+    }
+
     def _build_ideas_settings(self, parent):
         sf = ttk.LabelFrame(parent, text="Settings")
         sf.pack(fill="x", pady=(0, 4))
@@ -140,7 +154,8 @@ class IdeaTabMixin:
         self._idea_style_var = tk.StringVar(value=self._idea_settings.style)
         ttk.Combobox(row1, textvariable=self._idea_style_var,
                      values=["any", "educational", "entertainment",
-                             "commentary", "tutorial", "vlog", "essay", "experiment"],
+                             "commentary", "tutorial", "vlog", "essay", "experiment",
+                             "presentation"],
                      state="readonly", width=14).pack(side="left", padx=6)
 
         # Interval
@@ -151,7 +166,7 @@ class IdeaTabMixin:
         ttk.Label(row1, text="s").pack(side="left", padx=(2, 0))
 
         row2 = ttk.Frame(sf)
-        row2.pack(fill="x", padx=8, pady=(2, 6))
+        row2.pack(fill="x", padx=8, pady=(2, 4))
 
         # Max per session
         ttk.Label(row2, text="Max ideas:").pack(side="left")
@@ -164,6 +179,57 @@ class IdeaTabMixin:
         ttk.Checkbutton(row2,
                         text="Use content style context",
                         variable=self._idea_use_style_var).pack(side="left", padx=(10, 0))
+
+        # ── Model selection ────────────────────────────────────
+        mf = ttk.LabelFrame(sf, text="Models  (affects idea detail)")
+        mf.pack(fill="x", padx=8, pady=(4, 6))
+
+        # Determine available role names from self.personalities (or fallback)
+        _available = sorted(
+            getattr(self, "personalities", {}).keys()
+        ) or ["ideator", "pitcher", "sage", "writer", "strategist",
+              "director", "content", "algorithm", "chat"]
+
+        saved_cfg = self._load_idea_model_config()
+
+        mrow1 = ttk.Frame(mf)
+        mrow1.pack(fill="x", padx=6, pady=(4, 2))
+        ttk.Label(mrow1, text="Ideator:", width=8).pack(side="left")
+        self._idea_ideator_role_var = tk.StringVar(
+            value=saved_cfg.get("ideator_role", "ideator"))
+        ideator_cb = ttk.Combobox(
+            mrow1, textvariable=self._idea_ideator_role_var,
+            values=_available, state="readonly", width=14)
+        ideator_cb.pack(side="left", padx=4)
+        self._idea_ideator_quality_var = tk.StringVar()
+        ttk.Label(mrow1, textvariable=self._idea_ideator_quality_var,
+                  foreground=PALETTE["subtext"], font=("", 9)).pack(side="left", padx=4)
+
+        mrow2 = ttk.Frame(mf)
+        mrow2.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(mrow2, text="Pitcher:", width=8).pack(side="left")
+        self._idea_pitcher_role_var = tk.StringVar(
+            value=saved_cfg.get("pitcher_role", "pitcher"))
+        pitcher_cb = ttk.Combobox(
+            mrow2, textvariable=self._idea_pitcher_role_var,
+            values=_available, state="readonly", width=14)
+        pitcher_cb.pack(side="left", padx=4)
+        self._idea_pitcher_quality_var = tk.StringVar()
+        ttk.Label(mrow2, textvariable=self._idea_pitcher_quality_var,
+                  foreground=PALETTE["subtext"], font=("", 9)).pack(side="left", padx=4)
+
+        # Wire quality label updates
+        def _update_quality_labels(*_):
+            ir = self._idea_ideator_role_var.get()
+            pr = self._idea_pitcher_role_var.get()
+            self._idea_ideator_quality_var.set(
+                self._MODEL_QUALITY.get(ir, "custom model"))
+            self._idea_pitcher_quality_var.set(
+                self._MODEL_QUALITY.get(pr, "custom model"))
+
+        self._idea_ideator_role_var.trace_add("write", _update_quality_labels)
+        self._idea_pitcher_role_var.trace_add("write", _update_quality_labels)
+        _update_quality_labels()  # set initial labels
 
     # ── Controls ──────────────────────────────────────────────
 
@@ -411,10 +477,20 @@ class IdeaTabMixin:
             use_content_style = bool(self._idea_use_style_var.get()),
         )
 
+    def _ideas_resolve_models(self):
+        """Return (ideator_model, pitcher_model) from the selected roles."""
+        personalities = getattr(self, "personalities", {})
+        ir = getattr(self, "_idea_ideator_role_var", None)
+        pr = getattr(self, "_idea_pitcher_role_var", None)
+        ideator_role = ir.get() if ir else "ideator"
+        pitcher_role = pr.get() if pr else "pitcher"
+        ideator_m = personalities.get(ideator_role) or getattr(self, ideator_role, None)
+        pitcher_m = personalities.get(pitcher_role) or getattr(self, pitcher_role, None)
+        return ideator_m, pitcher_m
+
     def _ideas_make_loop(self) -> Optional[IdeationLoop]:
         """Build an IdeationLoop from current models and settings."""
-        ideator_m = getattr(self, "ideator", None)
-        pitcher_m = getattr(self, "pitcher", None)
+        ideator_m, pitcher_m = self._ideas_resolve_models()
         if not ideator_m or not pitcher_m:
             messagebox.showwarning(
                 "Ideas",
@@ -443,6 +519,7 @@ class IdeaTabMixin:
         loop = self._ideas_make_loop()
         if loop is None:
             return
+        self._save_idea_model_config()
         self._idea_loop = loop
         self._idea_loop.start()
         self._idea_start_btn.configure(state="disabled")
@@ -474,8 +551,7 @@ class IdeaTabMixin:
 
     def _ideas_generate_one(self):
         """Generate one idea right now, outside the loop (synchronous in a thread)."""
-        ideator_m = getattr(self, "ideator", None)
-        pitcher_m = getattr(self, "pitcher", None)
+        ideator_m, pitcher_m = self._ideas_resolve_models()
         if not ideator_m or not pitcher_m:
             messagebox.showwarning(
                 "Ideas",
@@ -522,12 +598,14 @@ class IdeaTabMixin:
                     f"  🐙 Auto-push triggered (every {every} ideas, "
                     f"session count: {session_count})")
                 # Run in background thread so it doesn't block the UI
+                sid = self._idea_loop.session_id if self._idea_loop else ""
                 threading.Thread(
                     target=self._ideas_git_push_worker,
                     args=(
                         self._git_remote_var.get().strip(),
                         self._git_branch_var.get().strip() or "main",
                         self._git_filter_var.get(),
+                        sid,
                     ),
                     daemon=True,
                 ).start()
@@ -896,15 +974,16 @@ class IdeaTabMixin:
         ]
         return "\n".join(lines)
 
-    def _ideas_to_readme(self, items: List[IdeaItem]) -> str:
-        """Generate an index README.md for the ideas folder."""
+    def _ideas_to_readme(self, items: List[IdeaItem], session_id: str = "") -> str:
+        """Generate an index README.md for a session subfolder."""
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        header = f"Session: `{session_id}`" if session_id else "Ideas"
         lines = [
-            "# Council — Video Ideas",
+            f"# Council — {header}",
             "",
             f"*Auto-generated by the Council Ideation Engine · Last sync: {now}*",
             "",
-            f"**Total ideas:** {len(items)}",
+            f"**Ideas in this session:** {len(items)}",
             "",
             "| # | Title | Difficulty | Status | Rating | Date |",
             "|---|-------|-----------|--------|--------|------|",
@@ -917,6 +996,37 @@ class IdeaTabMixin:
             title_link = f"[{item.display_title}](./{slug})"
             lines.append(
                 f"| {i} | {title_link} | {diff} | {item.status} | {stars} | {date} |")
+        return "\n".join(lines) + "\n"
+
+    def _ideas_top_readme(self, ideas_root: Path) -> str:
+        """Generate the root ideas/README.md that indexes all session subfolders."""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+        lines = [
+            "# Council — Ideas Index",
+            "",
+            f"*Last updated: {now}*",
+            "",
+            "Each subfolder is one ideation session. "
+            "Folder names are `month_day_year_hour_minute_second`.",
+            "",
+            "| Session | Ideas | Link |",
+            "|---------|-------|------|",
+        ]
+        # Enumerate session dirs (exclude hidden dirs and non-directories)
+        sessions = sorted(
+            [d for d in ideas_root.iterdir()
+             if d.is_dir() and not d.name.startswith(".")],
+            reverse=True  # newest first
+        )
+        for sd in sessions:
+            md_files = [f for f in sd.iterdir()
+                        if f.suffix == ".md" and f.name != "README.md"]
+            count = len(md_files)
+            lines.append(f"| `{sd.name}` | {count} | [Browse](./{sd.name}/) |")
+
+        if not sessions:
+            lines.append("| — | — | *No sessions yet* |")
+
         return "\n".join(lines) + "\n"
 
     def _ideas_git_push(self):
@@ -947,11 +1057,22 @@ class IdeaTabMixin:
 
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _ideas_git_push_worker(self, remote: str, branch: str, filt: str):
-        """Background thread: write Markdown files, git add/commit/push."""
+    def _ideas_git_push_worker(self, remote: str, branch: str, filt: str,
+                                session_id: str = ""):
+        """Background thread: write Markdown files into a session subfolder, then push."""
         repo_root = Path(__file__).parent
-        ideas_dir = repo_root / "ideas"
-        ideas_dir.mkdir(exist_ok=True)
+        ideas_root = repo_root / "ideas"
+        ideas_root.mkdir(exist_ok=True)
+
+        # ── Determine session folder ───────────────────────────
+        # Auto-push during a loop uses the loop's session_id.
+        # Manual push groups ideas by the date of their generated_at timestamp.
+        if not session_id:
+            now = datetime.now()
+            session_id = f"manual_{now.month}_{now.day}_{now.strftime('%y_%H_%M_%S')}"
+
+        session_dir = ideas_root / session_id
+        session_dir.mkdir(exist_ok=True)
 
         # ── Filter ideas ──────────────────────────────────────
         index = self._idea_store.list_index()
@@ -969,23 +1090,33 @@ class IdeaTabMixin:
             return
 
         self._ideas_log_append(
-            f"  Writing {len(filtered_entries)} idea files to ideas/…")
+            f"  Writing {len(filtered_entries)} idea files to ideas/{session_id}/…")
 
-        # ── Write Markdown files ──────────────────────────────
+        # ── Write Markdown files into session subfolder ────────
         items_written: List[IdeaItem] = []
         for entry in filtered_entries:
             item = self._idea_store.load(entry["id"])
             if not item:
                 continue
-            slug     = _idea_slug(item)
-            md_path  = ideas_dir / slug
+            slug    = _idea_slug(item)
+            md_path = session_dir / slug
             md_path.write_text(self._idea_to_markdown(item), encoding="utf-8")
             items_written.append(item)
 
-        # ── Write README index ────────────────────────────────
-        readme_path = ideas_dir / "README.md"
-        readme_path.write_text(self._ideas_to_readme(items_written), encoding="utf-8")
-        self._ideas_log_append(f"  ✓ {len(items_written)} Markdown files + README written")
+        # ── Session README ────────────────────────────────────
+        session_readme = session_dir / "README.md"
+        session_readme.write_text(
+            self._ideas_to_readme(items_written, session_id=session_id),
+            encoding="utf-8")
+
+        # ── Top-level index README ─────────────────────────────
+        # Enumerate all session folders so the root README links to each one.
+        top_readme = ideas_root / "README.md"
+        top_readme.write_text(
+            self._ideas_top_readme(ideas_root), encoding="utf-8")
+
+        self._ideas_log_append(
+            f"  ✓ {len(items_written)} Markdown files in {session_id}/ + index updated")
 
         # ── Git operations ────────────────────────────────────
         def _git(*args) -> str:
@@ -1005,7 +1136,6 @@ class IdeaTabMixin:
             _git("init", "-b", branch)
             _git("remote", "add", "origin", remote)
         else:
-            # Ensure remote is set correctly
             rc, _ = _git("remote", "get-url", "origin")
             if rc != 0:
                 _git("remote", "add", "origin", remote)
@@ -1024,7 +1154,7 @@ class IdeaTabMixin:
 
         # Commit
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-        msg = f"ideas: sync {len(items_written)} ideas [{now_str}]"
+        msg = f"ideas: sync {len(items_written)} ideas [{now_str}] session={session_id}"
         rc, _ = _git("commit", "-m", msg)
         if rc != 0:
             self._ideas_log_append("✗ Commit failed — see above.")
@@ -1040,7 +1170,6 @@ class IdeaTabMixin:
             self.after(0, lambda n=len(items_written):
                        self._git_status_var.set(f"Pushed {n} ideas"))
         else:
-            # Likely needs auth — give helpful guidance
             self._ideas_log_append(
                 "✗ Push rejected. If this is your first push you may need to:\n"
                 "  1. Create the repo on GitHub if it doesn't exist\n"
@@ -1071,6 +1200,29 @@ class IdeaTabMixin:
             self._settings_file().write_text(
                 json.dumps(settings.to_dict(), indent=2, ensure_ascii=False),
                 encoding="utf-8")
+        except Exception:
+            pass
+
+    def _model_config_file(self) -> Path:
+        return self.vault_dir / "idea_model_config.json"
+
+    def _load_idea_model_config(self) -> dict:
+        try:
+            f = self._model_config_file()
+            if f.exists():
+                return json.loads(f.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+        return {"ideator_role": "ideator", "pitcher_role": "pitcher"}
+
+    def _save_idea_model_config(self):
+        try:
+            cfg = {
+                "ideator_role": self._idea_ideator_role_var.get(),
+                "pitcher_role": self._idea_pitcher_role_var.get(),
+            }
+            self._model_config_file().write_text(
+                json.dumps(cfg, indent=2), encoding="utf-8")
         except Exception:
             pass
 
