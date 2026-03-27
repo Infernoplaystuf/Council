@@ -121,24 +121,36 @@ class IdeaItem:
 # IdeationSettings
 # ============================================================
 
+# Roles that should never participate in brainstorming — too specialised,
+# delivery/technical focused, or too generic to produce useful video concepts.
+BRAINSTORM_EXCLUDED = frozenset({
+    "eye", "cutter", "coach", "chat", "ideator", "pitcher", "judge",
+})
+
+
 @dataclass
 class IdeationSettings:
     """Configuration for an ideation session."""
 
     # Seed topics/niche — free text, comma-separated or newline-separated
-    seeds:                str   = ""
+    seeds:                str        = ""
     # Video style preference
-    style:                str   = "any"    # any / educational / entertainment / commentary / tutorial / vlog / essay
-    # Interval between idea cycles
-    interval_s:           int   = 90       # seconds between each idea (min ~30 to avoid hammering)
+    style:                str        = "any"
+    # Interval between idea cycles (sleep time AFTER a cycle completes)
+    interval_s:           int        = 90
     # Hard cap per session (prevents runaway overnight loops)
-    max_per_session:      int   = 50
+    max_per_session:      int        = 50
     # Inject ContentStyleManager context into prompts
-    use_content_style:    bool  = True
+    use_content_style:    bool       = True
     # Reference recent video analyses from vault
-    use_video_analyses:   bool  = True
+    use_video_analyses:   bool       = True
     # Number of past ideas to inject as "do not repeat" context
-    anti_repeat_lookback: int   = 20
+    anti_repeat_lookback: int        = 20
+    # Roles that contribute a quick proposal before the ideator evaluates them.
+    # Empty list = no brainstorm phase (ideator generates alone).
+    brainstorm_roles:     List[str]  = field(default_factory=lambda: [
+        "writer", "strategist", "director", "content", "algorithm", "sage",
+    ])
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -149,6 +161,7 @@ class IdeationSettings:
             "use_content_style":    self.use_content_style,
             "use_video_analyses":   self.use_video_analyses,
             "anti_repeat_lookback": self.anti_repeat_lookback,
+            "brainstorm_roles":     self.brainstorm_roles,
         }
 
     @classmethod
@@ -270,11 +283,26 @@ class IdeaStore:
 # Prompt builders
 # ============================================================
 
+def _build_brainstorm_prompt(settings: IdeationSettings) -> str:
+    """Short prompt sent to each brainstorm contributor for a quick raw proposal."""
+    seeds_line  = f"\nNiche / seed topics: {settings.seeds.strip()}" if settings.seeds.strip() else ""
+    style_line  = f"\nPreferred style: {settings.style}" if settings.style and settings.style != "any" else ""
+    return (
+        f"You are contributing one raw video concept to a brainstorm for a solo creator.{seeds_line}{style_line}\n\n"
+        f"Write 1-3 sentences — the concept only, no headers, no bullet points.\n"
+        f"Frame it as what the video IS or investigates, not as a story about a character.\n"
+        f"Do NOT start with 'A [person/creator/expert] does/creates/builds/assembles'.\n"
+        f"Think: punchy question, experiment, ranking, investigation, or counter-intuitive take.\n"
+        f"One concept. Make it count."
+    )
+
+
 def _build_ideator_prompt(
     settings: IdeationSettings,
     recent_titles: List[str],
     content_style_text: str = "",
     video_context_text: str = "",
+    brainstorm_proposals: Optional[List[tuple]] = None,  # [(role, text), ...]
 ) -> str:
     """Build the user-turn prompt sent to the ideator model."""
     parts = []
@@ -300,8 +328,24 @@ def _build_ideator_prompt(
             f"IDEAS ALREADY GENERATED THIS SESSION (do NOT repeat these "
             f"— find a fresh angle):\n{titles_txt}")
 
-    parts.append(
-        "Generate ONE raw video idea. Follow your output format exactly.")
+    if brainstorm_proposals:
+        prop_lines = []
+        for role, text in brainstorm_proposals:
+            prop_lines.append(f"[{role.upper()}]: {text.strip()}")
+        parts.append(
+            "COUNCIL BRAINSTORM PROPOSALS — other models have each thrown in a raw concept.\n"
+            "Your job: identify the strongest foundation (or synthesise the best elements\n"
+            "from multiple proposals) into ONE compelling raw idea. You may discard weak\n"
+            "proposals entirely. Do not feel bound to any single proposal — use them as\n"
+            "creative fuel, not a brief.\n\n"
+            + "\n\n".join(prop_lines))
+        parts.append(
+            "Evaluate the proposals above, then produce your own RAW IDEA output "
+            "following your format exactly. The final idea must be better than any single "
+            "proposal on its own.")
+    else:
+        parts.append(
+            "Generate ONE raw video idea. Follow your output format exactly.")
 
     return "\n\n".join(parts)
 
@@ -432,15 +476,17 @@ class IdeationLoop:
         settings: IdeationSettings,
         progress_cb: Callable[[str], None] = print,
         idea_cb: Callable[["IdeaItem"], None] = lambda _: None,
-        content_style_manager=None,  # optional ContentStyleManager
+        content_style_manager=None,   # optional ContentStyleManager
+        brainstorm_models: Optional[Dict[str, Any]] = None,  # {role: model}
     ):
-        self.ideator_model       = ideator_model
-        self.pitcher_model       = pitcher_model
-        self.store               = store
-        self.settings            = settings
-        self.progress_cb         = progress_cb
-        self.idea_cb             = idea_cb
+        self.ideator_model         = ideator_model
+        self.pitcher_model         = pitcher_model
+        self.store                 = store
+        self.settings              = settings
+        self.progress_cb           = progress_cb
+        self.idea_cb               = idea_cb
         self.content_style_manager = content_style_manager
+        self.brainstorm_models     = brainstorm_models or {}
 
         self._thread:     Optional[threading.Thread] = None
         self._stop_flag:  bool = False
@@ -547,9 +593,9 @@ class IdeationLoop:
                 f"Total ideas this session: {self._count}")
 
     def _run_one_cycle(self) -> Optional[IdeaItem]:
-        """Run one ideator → pitcher cycle and return an IdeaItem."""
+        """Run one brainstorm → ideator → pitcher cycle and return an IdeaItem."""
 
-        # ── 1. Build ideator context ───────────────────────────
+        # ── 1. Build shared context ────────────────────────────
         content_style_text = ""
         if self.settings.use_content_style and self.content_style_manager:
             try:
@@ -559,26 +605,47 @@ class IdeationLoop:
 
         recent_titles = self.store.recent_titles(self.settings.anti_repeat_lookback)
 
+        # ── 2. Brainstorm phase ───────────────────────────────
+        # Each enabled model throws in a quick raw concept; ideator evaluates them.
+        brainstorm_proposals: List[tuple] = []
+        active_brainstorm = {
+            role: model for role, model in self.brainstorm_models.items()
+            if role in (self.settings.brainstorm_roles or [])
+        }
+        if active_brainstorm:
+            brainstorm_prompt = _build_brainstorm_prompt(self.settings)
+            self.progress_cb(
+                f"  … Brainstorm round ({len(active_brainstorm)} contributors)…")
+            for role, model in active_brainstorm.items():
+                try:
+                    proposal = model.respond(brainstorm_prompt)
+                    brainstorm_proposals.append((role, proposal.strip()))
+                    self.progress_cb(f"    ↳ {role} contributed a concept")
+                except Exception as e:
+                    self.progress_cb(f"    ↳ {role} skipped ({e})")
+
+        # ── 3. Ideator pass ───────────────────────────────────
         ideator_prompt = _build_ideator_prompt(
-            settings           = self.settings,
-            recent_titles      = recent_titles,
-            content_style_text = content_style_text,
+            settings             = self.settings,
+            recent_titles        = recent_titles,
+            content_style_text   = content_style_text,
+            brainstorm_proposals = brainstorm_proposals or None,
         )
 
-        # ── 2. Ideator pass ───────────────────────────────────
-        self.progress_cb("  … Ideator generating raw idea…")
-        raw_response = self.ideator_model.respond(ideator_prompt)
+        self.progress_cb("  … Ideator evaluating and selecting raw idea…"
+                         if brainstorm_proposals else "  … Ideator generating raw idea…")
+        raw_response   = self.ideator_model.respond(ideator_prompt)
         ideator_fields = _parse_ideator_response(raw_response)
 
         raw_idea_text = raw_response  # full ideator output passed to pitcher
 
-        # ── 3. Pitcher pass ───────────────────────────────────
+        # ── 4. Pitcher pass ───────────────────────────────────
         self.progress_cb("  … Pitcher developing pitch…")
         pitcher_prompt   = _build_pitcher_prompt(raw_idea_text, self.settings.seeds)
         pitched_response = self.pitcher_model.respond(pitcher_prompt)
         pitcher_fields   = _parse_pitcher_response(pitched_response)
 
-        # ── 4. Assemble IdeaItem ──────────────────────────────
+        # ── 5. Assemble IdeaItem ──────────────────────────────
         item = IdeaItem(
             raw_idea          = ideator_fields.get("raw_idea", ""),
             hook_angle        = ideator_fields.get("hook_angle", ""),

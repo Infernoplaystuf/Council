@@ -1466,6 +1466,12 @@ Rules:
 - The creator must be able to make this ALONE with a camera and an edit.
   BANNED phrases in ideas: "assembles", "brings together", "invites experts",
   "gathers a panel", "group of people", "team of", "I asked several".
+- NEVER open RAW IDEA with "A [adjective] [person/creator/enthusiast] does/creates/
+  builds/discovers/explores/assembles." That is a story about a fictional character,
+  not a video concept. The idea is FOR the creator reading it, not about someone else.
+  Write it as: what the VIDEO is, what it investigates, what it argues, what it tests —
+  not who does it. Bad: "A passionate gamer attempts to…" Good: "Which crime TV show
+  would have fans most likely to get away with an actual crime?"
 - Vary format and emotional register across ideas — do not always use the same hook type.
 - If you have nothing genuinely interesting given the current seeds, say so plainly and
   explain what additional context you need.

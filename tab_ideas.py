@@ -231,6 +231,43 @@ class IdeaTabMixin:
         self._idea_pitcher_role_var.trace_add("write", _update_quality_labels)
         _update_quality_labels()  # set initial labels
 
+        # ── Brainstorm contributors ────────────────────────────
+        bf = ttk.LabelFrame(sf, text="Brainstorm contributors  (propose ideas before ideator evaluates)")
+        bf.pack(fill="x", padx=8, pady=(0, 6))
+
+        ttk.Label(bf,
+                  text="Each ticked model throws in a raw concept. "
+                       "Ideator picks the best foundation.",
+                  foreground=PALETTE["subtext"], font=("", 9)).pack(
+                      anchor="w", padx=8, pady=(4, 2))
+
+        saved_brainstorm = saved_cfg.get("brainstorm_roles",
+                                         ["writer", "strategist", "director",
+                                          "content", "algorithm", "sage"])
+        self._brainstorm_vars: Dict[str, tk.BooleanVar] = {}
+
+        # Only show roles that are useful for brainstorming
+        _brainstorm_candidates = [
+            r for r in _available
+            if r not in {"eye", "cutter", "coach", "chat", "ideator", "pitcher", "judge"}
+        ]
+        # Fall back to defaults if no personalities loaded yet
+        if not _brainstorm_candidates:
+            _brainstorm_candidates = ["writer", "strategist", "director",
+                                       "content", "algorithm", "sage"]
+
+        # Two-column grid of checkboxes
+        cb_frame = ttk.Frame(bf)
+        cb_frame.pack(fill="x", padx=8, pady=(0, 6))
+        for idx, role in enumerate(_brainstorm_candidates):
+            var = tk.BooleanVar(value=(role in saved_brainstorm))
+            self._brainstorm_vars[role] = var
+            ttk.Checkbutton(
+                cb_frame,
+                text=f"{role}  — {self._MODEL_QUALITY.get(role, 'custom')}",
+                variable=var,
+            ).grid(row=idx // 2, column=idx % 2, sticky="w", padx=4, pady=1)
+
     # ── Controls ──────────────────────────────────────────────
 
     def _build_ideas_controls(self, parent):
@@ -469,12 +506,17 @@ class IdeaTabMixin:
 
     def _ideas_get_settings(self) -> IdeationSettings:
         """Read current settings from the UI."""
+        brainstorm_roles = [
+            role for role, var in getattr(self, "_brainstorm_vars", {}).items()
+            if var.get()
+        ]
         return IdeationSettings(
             seeds             = self._idea_seeds_var.get().strip(),
             style             = self._idea_style_var.get(),
             interval_s        = max(30, int(self._idea_interval_var.get() or 90)),
             max_per_session   = max(1, int(self._idea_max_var.get() or 50)),
             use_content_style = bool(self._idea_use_style_var.get()),
+            brainstorm_roles  = brainstorm_roles,
         )
 
     def _ideas_resolve_models(self):
@@ -501,7 +543,15 @@ class IdeaTabMixin:
 
         settings = self._ideas_get_settings()
         self._save_idea_settings(settings)
-        style_mgr = getattr(self, "_content_style", None)
+        style_mgr    = getattr(self, "_content_style", None)
+        personalities = getattr(self, "personalities", {})
+
+        # Resolve brainstorm models — only roles that exist and aren't excluded
+        brainstorm_models = {
+            role: personalities[role]
+            for role in settings.brainstorm_roles
+            if role in personalities
+        }
 
         return IdeationLoop(
             ideator_model        = ideator_m,
@@ -511,6 +561,7 @@ class IdeaTabMixin:
             progress_cb          = self._ideas_log_append,
             idea_cb              = self._on_new_idea,
             content_style_manager= style_mgr,
+            brainstorm_models    = brainstorm_models,
         )
 
     def _ideas_start(self):
@@ -1218,8 +1269,12 @@ class IdeaTabMixin:
     def _save_idea_model_config(self):
         try:
             cfg = {
-                "ideator_role": self._idea_ideator_role_var.get(),
-                "pitcher_role": self._idea_pitcher_role_var.get(),
+                "ideator_role":    self._idea_ideator_role_var.get(),
+                "pitcher_role":    self._idea_pitcher_role_var.get(),
+                "brainstorm_roles": [
+                    role for role, var in getattr(self, "_brainstorm_vars", {}).items()
+                    if var.get()
+                ],
             }
             self._model_config_file().write_text(
                 json.dumps(cfg, indent=2), encoding="utf-8")
