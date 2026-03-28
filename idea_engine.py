@@ -376,7 +376,124 @@ def _build_pitcher_prompt(raw_idea_text: str, seeds: str = "") -> str:
         f"RAW IDEA FROM IDEATOR:\n"
         f"{raw_idea_text.strip()}\n\n"
         f"Develop this into a full pitch. Follow your output format exactly. "
-        f"Every section must be genuinely complete — no placeholders."
+        f"Every section must be genuinely complete — no placeholders.\n\n"
+        f"After completing all sections, add a final block:\n"
+        f"GAPS:\n"
+        f"List any sections you consider WEAK, VAGUE, or UNDERDEVELOPED — even if technically "
+        f"present. Use one line per gap in the format:\n"
+        f"- SECTION NAME: one sentence explaining exactly what is missing or insufficient.\n"
+        f"If every section is strong, write: GAPS: none\n"
+        f"Be honest — other models will use this list to improve the weak sections."
+    )
+
+
+def _parse_pitcher_gaps(text: str) -> Dict[str, str]:
+    """
+    Parse the pitcher's GAPS: block.
+    Returns {section_name_upper: reason_text} for each flagged gap.
+    Returns {} if the pitcher wrote 'none' or the block is absent.
+    """
+    m = re.search(r"GAPS:\s*\n(.*?)(?=\n[A-Z][A-Z ]+:|$)", text,
+                  re.DOTALL | re.IGNORECASE)
+    if not m:
+        return {}
+    block = m.group(1).strip()
+    if block.lower() in ("none", "none.", "n/a", ""):
+        return {}
+    gaps: Dict[str, str] = {}
+    for line in block.splitlines():
+        line = line.strip().lstrip("-• ").strip()
+        if not line:
+            continue
+        if ":" in line:
+            sec, _, reason = line.partition(":")
+            sec = sec.strip().upper()
+            reason = reason.strip()
+            if sec:
+                gaps[sec] = reason
+        else:
+            # No colon — just treat the whole line as a gap name
+            sec = line.strip().upper()
+            if sec:
+                gaps[sec] = "flagged as weak by pitcher"
+    return gaps
+
+
+# Maps section names to ordered list of preferred specialist roles.
+# The first role in the list that is available in brainstorm_models is used.
+_GAP_ROLE_MAP: Dict[str, List[str]] = {
+    "TITLE":             ["writer", "content", "director"],
+    "HOOK":              ["writer", "content", "director"],
+    "PREMISE":           ["writer", "sage", "strategist"],
+    "OUTLINE":           ["strategist", "writer", "director"],
+    "THUMBNAIL CONCEPT": ["director", "artist", "content"],
+    "TARGET AUDIENCE":   ["algorithm", "strategist", "content"],
+    "WHY IT WORKS":      ["algorithm", "strategist", "sage"],
+    "TITLE VARIANTS":    ["writer", "content", "algorithm"],
+    "PRODUCTION NOTES":  ["director", "writer", "strategist"],
+    "TAGS":              ["algorithm", "content", "writer"],
+    "DIFFICULTY":        ["strategist", "director", "writer"],
+    "ESTIMATED LENGTH":  ["director", "strategist", "writer"],
+}
+
+
+def _build_gap_filler_prompt(
+    section: str,
+    reason: str,
+    full_pitch_so_far: str,
+    raw_idea: str,
+    seeds: str = "",
+) -> str:
+    """
+    Prompt sent to a specialist to fill one specific weak/missing section
+    from the pitcher's first pass.
+    """
+    niche_line = f"Creator niche: {seeds.strip()}\n\n" if seeds.strip() else ""
+    return (
+        f"{niche_line}"
+        f"You are helping complete a video idea pitch. The pitcher has developed most of "
+        f"the pitch but flagged one section as weak or missing.\n\n"
+        f"ORIGINAL RAW IDEA:\n{raw_idea.strip()}\n\n"
+        f"PITCHER'S CURRENT PITCH:\n{full_pitch_so_far.strip()}\n\n"
+        f"SECTION NEEDED: {section}\n"
+        f"ISSUE FLAGGED: {reason}\n\n"
+        f"Write ONLY the {section} section — nothing else, no preamble.\n"
+        f"Start your response with the header exactly: {section}:\n"
+        f"Make it specific, concrete, and genuinely strong — not a placeholder.\n"
+        f"Do not repeat or rephrase what the pitcher already wrote well. "
+        f"Fix the specific issue flagged above."
+    )
+
+
+def _build_pitcher_merge_prompt(
+    original_pitch: str,
+    gap_fills: List[tuple],   # [(section, role, fill_text), ...]
+    seeds: str = "",
+) -> str:
+    """
+    Prompt for the pitcher's final synthesis pass.
+    Merges specialist gap fills into the original pitch to produce a complete, coherent output.
+    """
+    niche_line = f"(Creator niche: {seeds.strip()})\n\n" if seeds.strip() else ""
+    fills_block = "\n\n".join(
+        f"[{role.upper()} filled {section}]:\n{text.strip()}"
+        for section, role, text in gap_fills
+    )
+    return (
+        f"{niche_line}"
+        f"You produced an initial pitch and flagged some sections as weak. "
+        f"Other specialist models have filled those gaps. "
+        f"Your job is to produce the FINAL MERGED PITCH.\n\n"
+        f"YOUR ORIGINAL PITCH:\n{original_pitch.strip()}\n\n"
+        f"SPECIALIST GAP FILLS:\n{fills_block}\n\n"
+        f"Instructions:\n"
+        f"- Output the complete pitch using your standard format\n"
+        f"- For each section the specialists improved: use their version if it is stronger, "
+        f"or blend the best elements from both\n"
+        f"- Keep every section that was already strong in your original\n"
+        f"- The final output must be coherent — no contradictions between sections\n"
+        f"- Do NOT include a GAPS: block in this final output\n"
+        f"- Every section must be fully written — no placeholders"
     )
 
 
@@ -786,35 +903,97 @@ class IdeationLoop:
 
         raw_idea_text = raw_response  # full ideator output passed to pitcher
 
-        # ── 4. Pitcher pass (with completeness retries) ───────
+        # ── 4. Pitcher first pass ─────────────────────────────
         self.progress_cb("  … Pitcher developing full pitch…")
         pitcher_prompt   = _build_pitcher_prompt(raw_idea_text, self.settings.seeds)
         pitched_response = self.pitcher_model.respond(pitcher_prompt)
         pitcher_fields   = _parse_pitcher_response(pitched_response)
 
+        # ── 4b. Gap-filling pass ──────────────────────────────
+        # The pitcher flags weak/missing sections in its GAPS: block.
+        # We also check for structurally missing fields.
+        # Specialists fill each gap, then the pitcher merges everything.
+        pitcher_gaps   = _parse_pitcher_gaps(pitched_response)
+        missing_fields = _missing_pitcher_fields(pitcher_fields)
+
+        # Build the combined gap set: section_name → reason
+        all_gaps: Dict[str, str] = {}
+        for sec in missing_fields:
+            all_gaps[sec] = all_gaps.get(sec, "section missing or too short")
+        for sec, reason in pitcher_gaps.items():
+            # Only add if we don't already have it, or reason is more informative
+            if sec not in all_gaps or all_gaps[sec] == "section missing or too short":
+                all_gaps[sec] = reason
+
+        if all_gaps:
+            gap_names = ", ".join(all_gaps.keys())
+            self.progress_cb(
+                f"  ⚠ Pitcher flagged gaps: {gap_names} — routing to specialists…")
+
+            gap_fills: List[tuple] = []   # (section, role, fill_text)
+            available_specialists  = {
+                role: model for role, model in self.brainstorm_models.items()
+                if role in (self.settings.brainstorm_roles or [])
+            }
+
+            for section, reason in all_gaps.items():
+                preferred = _GAP_ROLE_MAP.get(section, ["writer", "strategist", "content"])
+                chosen_role  = None
+                chosen_model = None
+                for r in preferred:
+                    if r in available_specialists:
+                        chosen_role  = r
+                        chosen_model = available_specialists[r]
+                        break
+
+                if not chosen_model:
+                    self.progress_cb(
+                        f"    ↳ No specialist available for {section} — pitcher will retry")
+                    continue
+
+                self.progress_cb(f"    ↳ {chosen_role} filling {section}…")
+                try:
+                    fill_prompt = _build_gap_filler_prompt(
+                        section, reason, pitched_response,
+                        raw_idea_text, self.settings.seeds)
+                    fill_text = chosen_model.respond(fill_prompt)
+                    gap_fills.append((section, chosen_role, fill_text))
+                    self.progress_cb(f"    ✓ {chosen_role} completed {section}")
+                except Exception as e:
+                    self.progress_cb(f"    ✗ {chosen_role} failed on {section}: {e}")
+
+            # ── 4c. Pitcher merge pass ────────────────────────
+            if gap_fills:
+                self.progress_cb(
+                    f"  … Pitcher merging {len(gap_fills)} specialist contribution(s)…")
+                merge_prompt     = _build_pitcher_merge_prompt(
+                    pitched_response, gap_fills, self.settings.seeds)
+                pitched_response = self.pitcher_model.respond(merge_prompt)
+                pitcher_fields   = _parse_pitcher_response(pitched_response)
+
+        # ── 4d. Final safety net: pitcher-only retries ────────
+        # Used only if gaps remain after the specialist pass.
         missing = _missing_pitcher_fields(pitcher_fields)
         attempt = 0
         while missing and attempt < _MAX_PITCHER_RETRIES:
             attempt += 1
             self.progress_cb(
-                f"  ⚠ Pitcher incomplete (missing: {', '.join(missing)}) "
-                f"— retry {attempt}/{_MAX_PITCHER_RETRIES}…")
+                f"  ⚠ Still missing after specialist pass: {', '.join(missing)} "
+                f"— pitcher retry {attempt}/{_MAX_PITCHER_RETRIES}…")
             retry_prompt      = _build_pitcher_completion_prompt(
                 pitched_response, missing, self.settings.seeds)
             completion        = self.pitcher_model.respond(retry_prompt)
-            # Merge completion into the original response so re-parsing
-            # sees both the original content and the newly filled sections
             pitched_response  = pitched_response + "\n" + completion
             pitcher_fields    = _parse_pitcher_response(pitched_response)
             missing           = _missing_pitcher_fields(pitcher_fields)
 
         if missing:
             self.progress_cb(
-                f"  ✗ Idea discarded — pitcher still missing {missing} "
-                f"after {_MAX_PITCHER_RETRIES} retries. Moving to next cycle.")
+                f"  ✗ Idea discarded — still missing {missing} after all passes. "
+                f"Moving to next cycle.")
             return None
 
-        self.progress_cb("  ✓ Pitcher: all sections complete.")
+        self.progress_cb("  ✓ Pitch complete — all sections filled and merged.")
 
         # ── 5. Assemble IdeaItem ──────────────────────────────
         item = IdeaItem(
