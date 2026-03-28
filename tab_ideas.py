@@ -151,14 +151,39 @@ class IdeaTabMixin:
         sf = ttk.LabelFrame(parent, text="Settings")
         sf.pack(fill="x", pady=(0, 4))
 
-        # Seeds
-        ttk.Label(sf, text="Niche / seed topics:",
-                  foreground=PALETTE["subtext"]).pack(anchor="w", padx=8, pady=(6, 0))
-        self._idea_seeds_var = tk.StringVar(value=self._idea_settings.seeds)
-        seeds_entry = ttk.Entry(sf, textvariable=self._idea_seeds_var)
-        seeds_entry.pack(fill="x", padx=8, pady=(2, 4))
-        ttk.Label(sf, text="  e.g. gaming, productivity, AI tutorials, vlog",
+        # Seeds — multi-line with calibration button
+        seed_hdr = ttk.Frame(sf)
+        seed_hdr.pack(fill="x", padx=8, pady=(6, 0))
+        ttk.Label(seed_hdr, text="Niche / seed topics:",
+                  foreground=PALETTE["subtext"]).pack(side="left")
+        ttk.Button(seed_hdr, text="🎯 Calibrate with AI",
+                   command=self._ideas_calibrate_seed).pack(side="right")
+
+        seed_frame = ttk.Frame(sf)
+        seed_frame.pack(fill="x", padx=8, pady=(2, 2))
+        self._idea_seeds_text = tk.Text(
+            seed_frame, height=4, wrap="word",
+            bg=PALETTE.get("surface", "#1e1e2e"),
+            fg=PALETTE.get("text", "#cdd6f4"),
+            insertbackground=PALETTE.get("text", "#cdd6f4"),
+            font=("Consolas", 9), relief="flat",
+        )
+        seeds_sb = ttk.Scrollbar(seed_frame, command=self._idea_seeds_text.yview)
+        self._idea_seeds_text.configure(yscrollcommand=seeds_sb.set)
+        seeds_sb.pack(side="right", fill="y")
+        self._idea_seeds_text.pack(fill="x", expand=True)
+        self._idea_seeds_text.insert("1.0", self._idea_settings.seeds)
+        ttk.Label(sf,
+                  text="  Describe the vibe, format, and what to avoid — or click 🎯 to chat with the model",
                   foreground="#45475a", font=("", 9)).pack(anchor="w", padx=8)
+
+        # Keep a StringVar alias so existing code that reads seeds still works
+        self._idea_seeds_var = tk.StringVar()
+        def _sync_seeds_var(*_):
+            self._idea_seeds_var.set(
+                self._idea_seeds_text.get("1.0", "end").strip())
+        self._idea_seeds_text.bind("<<Modified>>", _sync_seeds_var)
+        self._idea_seeds_text.bind("<KeyRelease>", _sync_seeds_var)
 
         row1 = ttk.Frame(sf)
         row1.pack(fill="x", padx=8, pady=(4, 2))
@@ -558,8 +583,13 @@ class IdeaTabMixin:
             role for role, var in getattr(self, "_brainstorm_vars", {}).items()
             if var.get()
         ]
+        seeds_raw = (
+            self._idea_seeds_text.get("1.0", "end").strip()
+            if hasattr(self, "_idea_seeds_text")
+            else self._idea_seeds_var.get().strip()
+        )
         return IdeationSettings(
-            seeds             = self._idea_seeds_var.get().strip(),
+            seeds             = seeds_raw,
             style             = self._idea_style_var.get(),
             interval_s        = max(30, int(self._idea_interval_var.get() or 90)),
             max_per_session   = max(1, int(self._idea_max_var.get() or 50)),
@@ -1082,6 +1112,207 @@ class IdeaTabMixin:
         """Called on UI thread when a thumbnail finishes — refresh if it's selected."""
         if self._ideas_selected_id() == item.id:
             self._ideas_load_thumbnail(item)
+
+    # =========================================================
+    # Seed calibration chat
+    # =========================================================
+
+    _SEED_CALIBRATOR_PROMPT = """\
+You are a seed calibrator for a video idea generator. Your job is to understand
+exactly what kind of video concepts a creator wants, then produce a precise seed
+description the generator will use to stay on-topic.
+
+CONVERSATION GOAL:
+Ask focused questions to nail down:
+1. The specific tone and format (parody, mock-academic, ranked list, essay, etc.)
+2. Examples of content the creator loves — titles, shows, channels, jokes they like
+3. What the generator keeps getting WRONG — common misinterpretations to correct
+
+Ask one or two targeted questions at a time. Do not dump a list of 10 questions.
+Once you understand the vibe clearly (usually 2-4 exchanges), produce the result.
+
+WHEN READY, output EXACTLY this format — nothing after it:
+───────────────────────────────
+REFINED SEED:
+[3-6 sentences describing the seed in enough detail that even wrong-footed models
+will stay in the right lane. Include: tone, format, what the humour comes from,
+what to avoid, and 1-2 concrete example titles that fit the seed perfectly.]
+
+WHAT THIS WILL GENERATE:
+[One sentence summary of the kind of ideas this will produce.]
+───────────────────────────────
+
+Do NOT produce the REFINED SEED block until you genuinely understand what the
+creator wants. It is better to ask one more question than to produce a wrong seed.
+"""
+
+    def _ideas_calibrate_seed(self):
+        """Open a chat window to calibrate the seed with the AI."""
+        personalities = getattr(self, "personalities", {})
+        model = (
+            personalities.get("ideator")
+            or personalities.get("writer")
+            or personalities.get("sage")
+        )
+        if not model and not _CE_OK:
+            messagebox.showinfo(
+                "Calibrate Seed",
+                "AI not available — type your seed description directly in the box.",
+                parent=self.winfo_toplevel())
+            return
+
+        win = tk.Toplevel(self.winfo_toplevel())
+        win.title("🎯 Calibrate Seed — Chat with the Model")
+        win.geometry("700x560")
+        win.configure(bg=PALETTE.get("base", "#1e1e2e"))
+        win.grab_set()
+
+        # Header
+        hdr = ttk.Label(win,
+            text="Describe what you're going for — the model will ask questions "
+                 "until it understands, then produce a refined seed.",
+            wraplength=660, font=("", 9), foreground=PALETTE["subtext"])
+        hdr.pack(fill="x", padx=10, pady=(8, 4))
+
+        # Chat log
+        log_frame = ttk.Frame(win)
+        log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+        log = tk.Text(log_frame, wrap="word", state="disabled",
+                      bg=PALETTE.get("mantle", "#181825"),
+                      fg=PALETTE.get("text", "#cdd6f4"),
+                      font=("Consolas", 9), relief="flat")
+        log_sb = ttk.Scrollbar(log_frame, command=log.yview)
+        log.configure(yscrollcommand=log_sb.set)
+        log_sb.pack(side="right", fill="y")
+        log.pack(fill="both", expand=True)
+        log.tag_config("you",   foreground=PALETTE["blue"],  font=("Consolas", 9, "bold"))
+        log.tag_config("model", foreground=PALETTE["green"], font=("Consolas", 9))
+        log.tag_config("seed",  foreground=PALETTE["yellow"],font=("Consolas", 9, "bold"))
+        log.tag_config("meta",  foreground=PALETTE["subtext"],font=("Consolas", 8, "italic"))
+
+        # Current seed as context
+        current_seed = self._idea_seeds_text.get("1.0", "end").strip()
+
+        # Input row
+        inp_frame = ttk.Frame(win)
+        inp_frame.pack(fill="x", padx=10, pady=(0, 4))
+        inp_var = tk.StringVar()
+        inp = ttk.Entry(inp_frame, textvariable=inp_var, font=("Consolas", 10))
+        inp.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        send_btn = ttk.Button(inp_frame, text="Send ↵", width=8)
+        inp.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        # Accept-seed row (hidden until model produces REFINED SEED)
+        accept_frame = ttk.Frame(win)
+        self._calib_refined_seed = ""
+        accept_lbl = ttk.Label(accept_frame,
+            text="Model produced a refined seed ↑",
+            foreground=PALETTE["yellow"])
+        accept_lbl.pack(side="left")
+        accept_btn = ttk.Button(accept_frame, text="✓ Use this seed",
+            command=lambda: self._calib_accept_seed(win))
+        accept_btn.pack(side="right")
+
+        # Conversation history fed to the model
+        history: list = []
+
+        def _log_append(who: str, text: str, tag: str):
+            log.configure(state="normal")
+            log.insert("end", f"\n{who}:\n", tag)
+            # If the text contains REFINED SEED, colour it specially
+            if "REFINED SEED:" in text:
+                parts = text.split("REFINED SEED:")
+                log.insert("end", parts[0])
+                log.insert("end", "REFINED SEED:" + parts[1], "seed")
+            else:
+                log.insert("end", text + "\n", tag)
+            log.configure(state="disabled")
+            log.see("end")
+
+        def _model_reply(user_msg: str):
+            history.append({"role": "user", "content": user_msg})
+            # Build context string
+            ctx = ""
+            if current_seed:
+                ctx = f"CURRENT SEED (what the creator has so far):\n{current_seed}\n\n"
+            ctx += "\n".join(
+                f"{'Creator' if m['role']=='user' else 'You'}: {m['content']}"
+                for m in history
+            )
+            send_btn.configure(state="disabled")
+            inp.configure(state="disabled")
+
+            def _run():
+                try:
+                    if model:
+                        # Temporarily override system prompt for calibration
+                        import copy
+                        cal_model = copy.copy(model)
+                        cal_model.system_prompt = self._SEED_CALIBRATOR_PROMPT
+                        reply = cal_model.respond(ctx)
+                    else:
+                        reply = ("I don't have a model available. "
+                                 "Please type your seed directly in the settings box.")
+                except Exception as e:
+                    reply = f"[Error: {e}]"
+                history.append({"role": "assistant", "content": reply})
+                win.after(0, lambda: _on_reply(reply))
+
+            threading.Thread(target=_run, daemon=True).start()
+
+        def _on_reply(reply: str):
+            _log_append("Model", reply, "model")
+            send_btn.configure(state="normal")
+            inp.configure(state="normal")
+            inp.focus_set()
+            # Check if model produced REFINED SEED
+            if "REFINED SEED:" in reply:
+                m = re.search(
+                    r"REFINED SEED:\s*\n(.*?)(?=\nWHAT THIS WILL GENERATE:|$)",
+                    reply, re.DOTALL)
+                if m:
+                    self._calib_refined_seed = m.group(1).strip()
+                    accept_frame.pack(fill="x", padx=10, pady=(0, 8))
+
+        def _send(*_):
+            msg = inp_var.get().strip()
+            if not msg:
+                return
+            inp_var.set("")
+            _log_append("You", msg, "you")
+            threading.Thread(
+                target=_model_reply, args=(msg,), daemon=True).start()
+
+        send_btn.configure(command=_send)
+        inp.bind("<Return>", _send)
+
+        # Kick off with a greeting from the model based on current seed
+        _log_append("", "← Type what you're going for. The model will ask questions "
+                    "until it understands, then produce a refined seed.", "meta")
+        if current_seed:
+            # Prime the model by showing it the current seed
+            threading.Thread(
+                target=_model_reply,
+                args=(f"Here is my current seed: {current_seed}\n\n"
+                      "What questions do you have to better understand what I want?",),
+                daemon=True,
+            ).start()
+        else:
+            threading.Thread(
+                target=_model_reply,
+                args=("I haven't set a seed yet. "
+                      "Ask me what I'm going for.",),
+                daemon=True,
+            ).start()
+
+        inp.focus_set()
+
+    def _calib_accept_seed(self, win: tk.Toplevel):
+        """Paste the refined seed back into the seeds text box and close the dialog."""
+        if self._calib_refined_seed:
+            self._idea_seeds_text.delete("1.0", "end")
+            self._idea_seeds_text.insert("1.0", self._calib_refined_seed)
+        win.destroy()
 
     def _ideas_purge_incomplete(self):
         """Delete every stored idea that is missing required pitcher sections."""
