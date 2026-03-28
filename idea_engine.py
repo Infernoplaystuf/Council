@@ -377,13 +377,15 @@ def _build_pitcher_prompt(raw_idea_text: str, seeds: str = "") -> str:
         f"{raw_idea_text.strip()}\n\n"
         f"Develop this into a full pitch. Follow your output format exactly. "
         f"Every section must be genuinely complete — no placeholders.\n\n"
-        f"After completing all sections, add a final block:\n"
+        f"After completing ALL sections, add this block — be STRICT about what counts as weak:\n"
         f"GAPS:\n"
-        f"List any sections you consider WEAK, VAGUE, or UNDERDEVELOPED — even if technically "
-        f"present. Use one line per gap in the format:\n"
-        f"- SECTION NAME: one sentence explaining exactly what is missing or insufficient.\n"
-        f"If every section is strong, write: GAPS: none\n"
-        f"Be honest — other models will use this list to improve the weak sections."
+        f"List ONLY sections that are genuinely underdeveloped — too vague, too short, "
+        f"or missing specific actionable content. Do NOT flag a section just because it "
+        f"could theoretically be better. Only flag it if a specialist would meaningfully "
+        f"improve it. Use one bullet per gap:\n"
+        f"- SECTION NAME: one sentence on what specifically is missing.\n"
+        f"If all sections are solid, write: GAPS: none\n"
+        f"Aim for 0-2 gaps, not a full list — most sections should be complete."
     )
 
 
@@ -465,6 +467,32 @@ def _build_gap_filler_prompt(
     )
 
 
+_PITCHER_FORMAT_REMINDER = """\
+Output the complete pitch using EXACTLY these headers and no others:
+TITLE: [title]
+HOOK: [hook]
+PREMISE:
+[premise]
+OUTLINE:
+  1. [section]
+  ...
+THUMBNAIL CONCEPT:
+[concept]
+TARGET AUDIENCE:
+[audience]
+WHY IT WORKS:
+[reasoning]
+TITLE VARIANTS:
+  - [alt]
+  - [alt]
+TAGS: [comma-separated tags]
+DIFFICULTY: [easy/medium/hard — biggest challenge]
+ESTIMATED LENGTH: [X-Y minutes — why]
+PRODUCTION NOTES:
+[notes]
+"""
+
+
 def _build_pitcher_merge_prompt(
     original_pitch: str,
     gap_fills: List[tuple],   # [(section, role, fill_text), ...]
@@ -473,27 +501,29 @@ def _build_pitcher_merge_prompt(
     """
     Prompt for the pitcher's final synthesis pass.
     Merges specialist gap fills into the original pitch to produce a complete, coherent output.
+    Includes an explicit format reminder so the model doesn't produce prose instead of headers.
     """
     niche_line = f"(Creator niche: {seeds.strip()})\n\n" if seeds.strip() else ""
+    # Summarise gap fills compactly — just section + first 300 chars of fill
     fills_block = "\n\n".join(
-        f"[{role.upper()} filled {section}]:\n{text.strip()}"
+        f"[{section} — improved by {role}]:\n{text.strip()[:300]}"
+        + ("…" if len(text.strip()) > 300 else "")
         for section, role, text in gap_fills
     )
     return (
         f"{niche_line}"
-        f"You produced an initial pitch and flagged some sections as weak. "
-        f"Other specialist models have filled those gaps. "
-        f"Your job is to produce the FINAL MERGED PITCH.\n\n"
-        f"YOUR ORIGINAL PITCH:\n{original_pitch.strip()}\n\n"
-        f"SPECIALIST GAP FILLS:\n{fills_block}\n\n"
-        f"Instructions:\n"
-        f"- Output the complete pitch using your standard format\n"
-        f"- For each section the specialists improved: use their version if it is stronger, "
-        f"or blend the best elements from both\n"
-        f"- Keep every section that was already strong in your original\n"
-        f"- The final output must be coherent — no contradictions between sections\n"
-        f"- Do NOT include a GAPS: block in this final output\n"
-        f"- Every section must be fully written — no placeholders"
+        f"You produced an initial pitch and flagged some weak sections. "
+        f"Specialist models have rewritten those sections. "
+        f"Produce the FINAL MERGED PITCH — take the best version of each section.\n\n"
+        f"YOUR ORIGINAL PITCH (keep strong sections as-is):\n"
+        f"---\n{original_pitch.strip()[:2000]}\n---\n\n"
+        f"SPECIALIST IMPROVEMENTS (use these for the flagged sections):\n"
+        f"---\n{fills_block}\n---\n\n"
+        f"{_PITCHER_FORMAT_REMINDER}\n"
+        f"Rules:\n"
+        f"- Use the specialist version for improved sections, your original for the rest\n"
+        f"- No GAPS: block in the final output\n"
+        f"- Every section fully written — no placeholders"
     )
 
 
@@ -641,38 +671,61 @@ def _parse_ideator_response(text: str) -> Dict[str, str]:
     return result
 
 
+def _normalize_pitcher_text(text: str) -> str:
+    """
+    Normalise LLM output before parsing:
+    - Strip markdown bold/italic around headers  (**TITLE:** → TITLE:)
+    - Strip markdown heading markers              (### TITLE: → TITLE:)
+    - Remove [ROLE filled SECTION]: merge markers
+    - Strip GAPS: block entirely (we parse it separately; don't let it
+      bleed into section content via the lookahead)
+    """
+    # Remove markdown bold/italic wrapping headers
+    text = re.sub(r'\*{1,3}([A-Z][A-Z ]+:)', r'\1', text)
+    # Remove markdown heading markers
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # Remove merge-pass role attribution lines
+    text = re.sub(r'^\[.*?(?:filled|improved).*?\]:\s*', '', text,
+                  flags=re.MULTILINE | re.IGNORECASE)
+    # Strip everything from GAPS: onward so it doesn't interfere with parsing
+    text = re.sub(r'\nGAPS:.*', '', text, flags=re.DOTALL | re.IGNORECASE)
+    return text
+
+
 def _parse_pitcher_response(text: str) -> Dict[str, Any]:
     """Extract structured fields from the pitcher's response."""
+    text   = _normalize_pitcher_text(text)
     result: Dict[str, Any] = {}
 
-    def _extract(label: str, next_labels: List[str]) -> str:
-        alts = "|".join(re.escape(l) for l in [label] + next_labels)
-        # Build a pattern that stops at the next labelled section
-        stop = r"(?=\n(?:" + "|".join(
-            re.escape(l) for l in [
-                "HOOK:", "PREMISE:", "OUTLINE:", "THUMBNAIL CONCEPT:",
-                "TARGET AUDIENCE:", "WHY IT WORKS:", "TITLE VARIANTS:",
-                "TAGS:", "DIFFICULTY:", "ESTIMATED LENGTH:", "PRODUCTION NOTES:",
-            ]
-        ) + r"))"
+    # All known section headers — used to build stop lookaheads
+    _ALL_HEADERS = [
+        "HOOK:", "PREMISE:", "OUTLINE:", "THUMBNAIL CONCEPT:",
+        "TARGET AUDIENCE:", "WHY IT WORKS:", "TITLE VARIANTS:",
+        "TAGS:", "DIFFICULTY:", "ESTIMATED LENGTH:", "PRODUCTION NOTES:",
+        "GAPS:",    # safety net — already stripped above but keep here too
+    ]
+
+    _stop = r"(?=\n(?:" + "|".join(re.escape(h) for h in _ALL_HEADERS) + r")|\Z)"
+
+    def _extract(label: str) -> str:
         m = re.search(
-            label + r"\s*(.+?)" + stop,
+            re.escape(label) + r"[ \t]*(.+?)" + _stop,
             text, re.DOTALL | re.IGNORECASE)
         return m.group(1).strip() if m else ""
 
-    result["title"]             = _extract("TITLE:",             [])
-    result["hook"]              = _extract("HOOK:",              [])
-    result["premise"]           = _extract("PREMISE:",           [])
-    result["thumbnail_concept"] = _extract("THUMBNAIL CONCEPT:", [])
-    result["target_audience"]   = _extract("TARGET AUDIENCE:",   [])
-    result["why_it_works"]      = _extract("WHY IT WORKS:",      [])
-    result["difficulty"]        = _extract("DIFFICULTY:",        [])
-    result["estimated_length"]  = _extract("ESTIMATED LENGTH:",  [])
-    result["production_notes"]  = _extract("PRODUCTION NOTES:",  [])
+    result["title"]             = _extract("TITLE:")
+    result["hook"]              = _extract("HOOK:")
+    result["premise"]           = _extract("PREMISE:")
+    result["thumbnail_concept"] = _extract("THUMBNAIL CONCEPT:")
+    result["target_audience"]   = _extract("TARGET AUDIENCE:")
+    result["why_it_works"]      = _extract("WHY IT WORKS:")
+    result["difficulty"]        = _extract("DIFFICULTY:")
+    result["estimated_length"]  = _extract("ESTIMATED LENGTH:")
+    result["production_notes"]  = _extract("PRODUCTION NOTES:")
 
-    # Outline — numbered list
+    # Outline — numbered list (stop at THUMBNAIL CONCEPT or any known header)
     outline_m = re.search(
-        r"OUTLINE:\s*(.+?)(?=\nTHUMBNAIL CONCEPT:|\nTARGET AUDIENCE:|$)",
+        r"OUTLINE:[ \t]*(.+?)" + _stop,
         text, re.DOTALL | re.IGNORECASE)
     if outline_m:
         raw_outline = outline_m.group(1).strip()
@@ -684,7 +737,7 @@ def _parse_pitcher_response(text: str) -> Dict[str, Any]:
 
     # Title variants — bullet list
     tv_m = re.search(
-        r"TITLE VARIANTS:\s*(.+?)(?=\nTAGS:|\nDIFFICULTY:|$)",
+        r"TITLE VARIANTS:[ \t]*(.+?)" + _stop,
         text, re.DOTALL | re.IGNORECASE)
     if tv_m:
         result["title_variants"] = [
@@ -695,7 +748,7 @@ def _parse_pitcher_response(text: str) -> Dict[str, Any]:
 
     # Tags — comma-separated line
     tags_m = re.search(
-        r"TAGS:\s*(.+?)(?=\nDIFFICULTY:|\nESTIMATED LENGTH:|$)",
+        r"TAGS:[ \t]*(.+?)" + _stop,
         text, re.DOTALL | re.IGNORECASE)
     if tags_m:
         result["tags"] = [
