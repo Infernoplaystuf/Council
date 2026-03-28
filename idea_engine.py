@@ -296,17 +296,81 @@ class IdeaStore:
     def count(self) -> int:
         return len(self._index)
 
+    def get_taste_context(
+        self,
+        max_positive: int = 8,
+        max_negative: int = 5,
+        min_positive_rating: int = 3,
+    ) -> str:
+        """
+        Build a taste-profile block from rated ideas with notes.
+        Returned as a ready-to-inject prompt string, or "" if nothing rated yet.
+
+        - Positive examples: rated >= min_positive_rating, sorted highest first
+        - Negative examples: rated 1-2, sorted lowest first
+        - Notes are included inline — they are the most valuable signal
+        - Unrated ideas (rating=0) are excluded
+        """
+        # Quick check via index before loading full files
+        if not any(e.get("rating", 0) for e in self.list_index()):
+            return ""
+
+        all_items = self.list_all()
+        rated = [i for i in all_items if i.rating and i.rating > 0]
+        if not rated:
+            return ""
+
+        positive = sorted(
+            [i for i in rated if i.rating >= min_positive_rating],
+            key=lambda x: (-x.rating, x.generated_at),
+        )[:max_positive]
+
+        negative = sorted(
+            [i for i in rated if i.rating < min_positive_rating],
+            key=lambda x: (x.rating, x.generated_at),
+        )[:max_negative]
+
+        if not positive and not negative:
+            return ""
+
+        stars = lambda n: "★" * n + "☆" * (5 - n)
+        lines = ["CREATOR'S TASTE PROFILE (learned from their ratings and notes):"]
+
+        if positive:
+            lines.append("\nIDEAS THE CREATOR RATED HIGHLY — aim for this quality and style:")
+            for item in positive:
+                line = f"  {stars(item.rating)}  \"{item.title or item.display_title}\""
+                if item.notes and item.notes.strip():
+                    line += f"\n      Note: {item.notes.strip()}"
+                lines.append(line)
+
+        if negative:
+            lines.append("\nIDEAS THE CREATOR RATED POORLY — avoid these patterns:")
+            for item in negative:
+                line = f"  {stars(item.rating)}  \"{item.title or item.display_title}\""
+                if item.notes and item.notes.strip():
+                    line += f"\n      Note: {item.notes.strip()}"
+                lines.append(line)
+
+        lines.append(
+            "\nUse the high-rated examples to calibrate tone, format, and premise quality. "
+            "Use the low-rated examples (especially with notes) to avoid the same mistakes."
+        )
+        return "\n".join(lines)
+
 
 # ============================================================
 # Prompt builders
 # ============================================================
 
-def _build_brainstorm_prompt(settings: IdeationSettings) -> str:
+def _build_brainstorm_prompt(settings: IdeationSettings, taste_context: str = "") -> str:
     """Short prompt sent to each brainstorm contributor for a quick raw proposal."""
     seeds_line  = f"\nNiche / seed topics: {settings.seeds.strip()}" if settings.seeds.strip() else ""
     style_line  = f"\nPreferred style: {settings.style}" if settings.style and settings.style != "any" else ""
+    taste_block = f"\n\n{taste_context.strip()}" if taste_context.strip() else ""
     return (
-        f"You are contributing one raw video concept to a brainstorm for a solo creator.{seeds_line}{style_line}\n\n"
+        f"You are contributing one raw video concept to a brainstorm for a solo creator."
+        f"{seeds_line}{style_line}{taste_block}\n\n"
         f"Write 1-3 sentences — the concept only, no headers, no bullet points.\n"
         f"Frame it as what the video IS or investigates, not as a story about a character.\n"
         f"Do NOT start with 'A [person/creator/expert] does/creates/builds/assembles'.\n"
@@ -321,6 +385,7 @@ def _build_ideator_prompt(
     content_style_text: str = "",
     video_context_text: str = "",
     brainstorm_proposals: Optional[List[tuple]] = None,  # [(role, text), ...]
+    taste_context: str = "",
 ) -> str:
     """Build the user-turn prompt sent to the ideator model."""
     parts = []
@@ -330,6 +395,10 @@ def _build_ideator_prompt(
 
     if settings.style and settings.style != "any":
         parts.append(f"PREFERRED FORMAT STYLE: {settings.style}")
+
+    # Taste profile — injected early so it shapes generation before anti-repeat
+    if taste_context.strip():
+        parts.append(taste_context.strip())
 
     if content_style_text.strip():
         parts.append(
@@ -922,6 +991,13 @@ class IdeationLoop:
 
         recent_titles = self.store.recent_titles(self.settings.anti_repeat_lookback)
 
+        # Taste profile — built once per cycle, injected into both brainstorm and ideator
+        taste_context = self.store.get_taste_context()
+        if taste_context:
+            self.progress_cb(
+                f"  … Taste profile loaded "
+                f"(rated ideas: {len([i for i in self.store.list_index() if i.get('rating',0)])})")
+
         # ── 2. Brainstorm phase ───────────────────────────────
         # Each enabled model throws in a quick raw concept; ideator evaluates them.
         brainstorm_proposals: List[tuple] = []
@@ -930,7 +1006,7 @@ class IdeationLoop:
             if role in (self.settings.brainstorm_roles or [])
         }
         if active_brainstorm:
-            brainstorm_prompt = _build_brainstorm_prompt(self.settings)
+            brainstorm_prompt = _build_brainstorm_prompt(self.settings, taste_context)
             self.progress_cb(
                 f"  … Brainstorm round ({len(active_brainstorm)} contributors)…")
             for role, model in active_brainstorm.items():
@@ -947,6 +1023,7 @@ class IdeationLoop:
             recent_titles        = recent_titles,
             content_style_text   = content_style_text,
             brainstorm_proposals = brainstorm_proposals or None,
+            taste_context        = taste_context,
         )
 
         self.progress_cb("  … Ideator evaluating and selecting raw idea…"

@@ -12,6 +12,7 @@ import json
 import re
 import subprocess
 import threading
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -1146,6 +1147,82 @@ Do NOT produce the REFINED SEED block until you genuinely understand what the
 creator wants. It is better to ask one more question than to produce a wrong seed.
 """
 
+    # ── Seed calibration vault helpers ────────────────────────
+
+    def _calib_history_path(self) -> Path:
+        return Path(self.vault_dir) / "seed_calibration_history.json"
+
+    def _calib_load_history(self) -> list:
+        """Load all saved calibration sessions from vault."""
+        p = self._calib_history_path()
+        if not p.exists():
+            return []
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+
+    def _calib_save_session(
+        self,
+        original_seed: str,
+        refined_seed:  str,
+        summary:       str,
+        turns:         list,
+    ):
+        """Append a completed calibration session to the vault history file."""
+        history = self._calib_load_history()
+        history.append({
+            "id":            str(uuid.uuid4())[:8],
+            "timestamp":     datetime.now().isoformat(timespec="seconds"),
+            "original_seed": original_seed,
+            "refined_seed":  refined_seed,
+            "summary":       summary,
+            "turns":         turns,
+        })
+        # Keep the last 20 sessions — older ones are less useful as context
+        history = history[-20:]
+        try:
+            self._calib_history_path().write_text(
+                json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _calib_prior_context(self, max_sessions: int = 4) -> str:
+        """
+        Build a short context block from the most recent calibration sessions.
+        Injected into the calibrator's system prompt so it knows what you've
+        already worked out and doesn't start from scratch.
+        """
+        history = self._calib_load_history()
+        if not history:
+            return ""
+        recent = history[-max_sessions:]
+        lines = [
+            "PREVIOUS SEED CALIBRATIONS — context on what this creator has "
+            "already established:\n"
+        ]
+        for i, s in enumerate(reversed(recent), 1):
+            ts = s.get("timestamp", "")[:10]
+            refined = s.get("refined_seed", "").strip()
+            summary = s.get("summary", "").strip()
+            if not refined:
+                continue
+            lines.append(f"[{i}] {ts}")
+            lines.append(f"    Refined seed: {refined[:300]}"
+                         + ("…" if len(refined) > 300 else ""))
+            if summary:
+                lines.append(f"    Generates:    {summary[:150]}"
+                             + ("…" if len(summary) > 150 else ""))
+            lines.append("")
+        if len(lines) <= 1:
+            return ""
+        lines.append(
+            "Build on what has already been established. Do not re-ask questions "
+            "the creator has already answered in a previous session.")
+        return "\n".join(lines)
+
+    # ── Calibration dialog ─────────────────────────────────────
+
     def _ideas_calibrate_seed(self):
         """Open a chat window to calibrate the seed with the AI."""
         personalities = getattr(self, "personalities", {})
@@ -1163,7 +1240,7 @@ creator wants. It is better to ask one more question than to produce a wrong see
 
         win = tk.Toplevel(self.winfo_toplevel())
         win.title("🎯 Calibrate Seed — Chat with the Model")
-        win.geometry("700x560")
+        win.geometry("720x640")
         win.configure(bg=PALETTE.get("base", "#1e1e2e"))
         win.grab_set()
 
@@ -1171,8 +1248,19 @@ creator wants. It is better to ask one more question than to produce a wrong see
         hdr = ttk.Label(win,
             text="Describe what you're going for — the model will ask questions "
                  "until it understands, then produce a refined seed.",
-            wraplength=660, font=("", 9), foreground=PALETTE["subtext"])
-        hdr.pack(fill="x", padx=10, pady=(8, 4))
+            wraplength=700, font=("", 9), foreground=PALETTE["subtext"])
+        hdr.pack(fill="x", padx=10, pady=(8, 2))
+
+        # Prior sessions summary bar
+        prior_history = self._calib_load_history()
+        if prior_history:
+            last = prior_history[-1]
+            ts   = last.get("timestamp", "")[:16].replace("T", " ")
+            ph_text = (f"📚 {len(prior_history)} previous calibration(s) loaded as context "
+                       f"— last: {ts}")
+            ttk.Label(win, text=ph_text,
+                      foreground=PALETTE["blue"],
+                      font=("", 8)).pack(fill="x", padx=10, pady=(0, 4))
 
         # Chat log
         log_frame = ttk.Frame(win)
@@ -1213,8 +1301,10 @@ creator wants. It is better to ask one more question than to produce a wrong see
             command=lambda: self._calib_accept_seed(win))
         accept_btn.pack(side="right")
 
-        # Conversation history fed to the model
+        # Conversation history fed to the model — also stored on self for save-on-accept
         history: list = []
+        self._calib_history_turns  = history
+        self._calib_original_seed  = current_seed
 
         def _log_append(who: str, text: str, tag: str):
             log.configure(state="normal")
@@ -1229,9 +1319,16 @@ creator wants. It is better to ask one more question than to produce a wrong see
             log.configure(state="disabled")
             log.see("end")
 
+        # Build the calibrator system prompt — base + prior session context
+        prior_ctx        = self._calib_prior_context()
+        calibrator_sysprompt = self._SEED_CALIBRATOR_PROMPT
+        if prior_ctx:
+            calibrator_sysprompt = (
+                self._SEED_CALIBRATOR_PROMPT.rstrip() + "\n\n" + prior_ctx)
+
         def _model_reply(user_msg: str):
             history.append({"role": "user", "content": user_msg})
-            # Build context string
+            # Build context string — running conversation + current seed
             ctx = ""
             if current_seed:
                 ctx = f"CURRENT SEED (what the creator has so far):\n{current_seed}\n\n"
@@ -1245,10 +1342,9 @@ creator wants. It is better to ask one more question than to produce a wrong see
             def _run():
                 try:
                     if model:
-                        # Temporarily override system prompt for calibration
                         import copy
                         cal_model = copy.copy(model)
-                        cal_model.system_prompt = self._SEED_CALIBRATOR_PROMPT
+                        cal_model.system_prompt = calibrator_sysprompt
                         reply = cal_model.respond(ctx)
                     else:
                         reply = ("I don't have a model available. "
@@ -1308,10 +1404,30 @@ creator wants. It is better to ask one more question than to produce a wrong see
         inp.focus_set()
 
     def _calib_accept_seed(self, win: tk.Toplevel):
-        """Paste the refined seed back into the seeds text box and close the dialog."""
+        """Paste the refined seed back into the seeds text box, save to vault, close."""
         if self._calib_refined_seed:
             self._idea_seeds_text.delete("1.0", "end")
             self._idea_seeds_text.insert("1.0", self._calib_refined_seed)
+
+            # Persist to vault — extract summary from last assistant message
+            summary = ""
+            for turn in reversed(getattr(self, "_calib_history_turns", [])):
+                if turn.get("role") == "assistant":
+                    m = re.search(
+                        r"WHAT THIS WILL GENERATE:\s*(.+?)(?:\n|$)",
+                        turn.get("content", ""), re.DOTALL)
+                    if m:
+                        summary = m.group(1).strip()
+                    break
+
+            self._calib_save_session(
+                original_seed = getattr(self, "_calib_original_seed", ""),
+                refined_seed  = self._calib_refined_seed,
+                summary       = summary,
+                turns         = getattr(self, "_calib_history_turns", []),
+            )
+            self._ideas_log_append(
+                "✓ Seed calibration saved to vault — will inform future sessions.")
         win.destroy()
 
     def _ideas_purge_incomplete(self):
