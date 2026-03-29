@@ -2171,6 +2171,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
         self._build_vault_manager_tab()
         self._build_speech_tab()
         self._build_video_tab()
+        self._build_pptx_tab()
         self._build_ideas_tab()
         self._build_apoth_tab()
         self._build_lens_tab()
@@ -6424,6 +6425,279 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
         bf.pack(fill="x", padx=12, pady=(0, 8))
         ttk.Button(bf, text="Load Selected", command=_load_selected).pack(side="left")
         ttk.Button(bf, text="Close", command=win.destroy).pack(side="right")
+
+    # ============================================================
+    # PPTX / Presentation Script tab
+    # ============================================================
+
+    def _build_pptx_tab(self):
+        self.tab_pptx = ttk.Frame(self.nb)
+        self.nb.add(self.tab_pptx, text="📊 Script")
+
+        # ── Header ──────────────────────────────────────────────
+        hdr = ttk.Frame(self.tab_pptx)
+        hdr.pack(fill="x", padx=10, pady=(8, 4))
+        ttk.Label(hdr, text="Presentation Script Generator",
+                  foreground="#89b4fa", font=("", 11, "bold")).pack(side="left")
+        ttk.Label(hdr, text="  Feed a PDF of your slides — get a full spoken script",
+                  foreground="#6c7086").pack(side="left")
+
+        # ── File picker ─────────────────────────────────────────
+        ff = ttk.LabelFrame(self.tab_pptx, text="Presentation PDF")
+        ff.pack(fill="x", padx=10, pady=(0, 6))
+        frow = ttk.Frame(ff)
+        frow.pack(fill="x", padx=8, pady=6)
+        self._pptx_path_var = tk.StringVar()
+        ttk.Entry(frow, textvariable=self._pptx_path_var,
+                  width=60).pack(side="left", fill="x", expand=True)
+        ttk.Button(frow, text="Browse…",
+                   command=self._pptx_browse).pack(side="left", padx=(6, 0))
+        ttk.Button(frow, text="🔍 Preview Slides",
+                   command=self._pptx_preview).pack(side="left", padx=(6, 0))
+
+        # ── Options ─────────────────────────────────────────────
+        opt = ttk.LabelFrame(self.tab_pptx, text="Script Options")
+        opt.pack(fill="x", padx=10, pady=(0, 6))
+
+        row1 = ttk.Frame(opt)
+        row1.pack(fill="x", padx=8, pady=(6, 2))
+        ttk.Label(row1, text="Tone:").pack(side="left")
+        self._pptx_tone_var = tk.StringVar(value="conversational")
+        ttk.Combobox(row1, textvariable=self._pptx_tone_var,
+                     values=["conversational", "comedic / dry", "mock-academic",
+                             "hype / energetic", "formal / professional",
+                             "storytelling / narrative"],
+                     state="readonly", width=22).pack(side="left", padx=6)
+
+        ttk.Label(row1, text="  Writer:").pack(side="left", padx=(12, 0))
+        self._pptx_writer_var = tk.StringVar(value="writer")
+        ttk.Combobox(row1, textvariable=self._pptx_writer_var,
+                     values=["writer", "director", "content", "pitcher", "sage"],
+                     state="readonly", width=12).pack(side="left", padx=6)
+
+        ttk.Label(row1, text="  Use my style:").pack(side="left", padx=(12, 0))
+        self._pptx_use_style_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row1, variable=self._pptx_use_style_var).pack(side="left")
+        ttk.Label(row1, text="(Director's content style profile)",
+                  foreground="#6c7086", font=("", 8)).pack(side="left")
+
+        row2 = ttk.Frame(opt)
+        row2.pack(fill="x", padx=8, pady=(2, 6))
+        ttk.Label(row2, text="Extra notes for the model:").pack(side="left")
+        self._pptx_notes_var = tk.StringVar()
+        ttk.Entry(row2, textvariable=self._pptx_notes_var,
+                  width=60).pack(side="left", padx=6, fill="x", expand=True)
+
+        # ── Action bar ─────────────────────────────────────────
+        act = ttk.Frame(self.tab_pptx)
+        act.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Button(act, text="✍ Generate Script",
+                   command=self._pptx_generate).pack(side="left")
+        ttk.Button(act, text="📋 Copy Script",
+                   command=self._pptx_copy).pack(side="left", padx=6)
+        ttk.Button(act, text="💾 Save Script…",
+                   command=self._pptx_save).pack(side="left")
+        self._pptx_status_var = tk.StringVar(value="")
+        ttk.Label(act, textvariable=self._pptx_status_var,
+                  foreground="#89b4fa").pack(side="left", padx=12)
+
+        # ── Slide preview + Script panes ────────────────────────
+        panes = ttk.PanedWindow(self.tab_pptx, orient="horizontal")
+        panes.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+
+        # Left — slide content preview
+        lf = ttk.LabelFrame(panes, text="Slide Content (extracted)")
+        self._pptx_preview_text = self._make_text(lf, width=36, height=20)
+        self._pptx_preview_text.pack(fill="both", expand=True, padx=4, pady=4)
+        panes.add(lf, weight=1)
+
+        # Right — generated script
+        rf = ttk.LabelFrame(panes, text="Generated Script")
+        self._pptx_script_text = self._make_text(rf, width=60, height=20)
+        self._pptx_script_text.pack(fill="both", expand=True, padx=4, pady=4)
+        panes.add(rf, weight=2)
+
+    # ── Helpers ────────────────────────────────────────────────
+
+    def _pptx_browse(self):
+        import tkinter.filedialog as _fd
+        path = _fd.askopenfilename(
+            title="Open Presentation PDF",
+            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")])
+        if path:
+            self._pptx_path_var.set(path)
+
+    def _pptx_extract_slides(self, pdf_path: str) -> list:
+        """
+        Extract text from each page of a PDF.
+        Returns a list of dicts: [{page: N, text: str}, ...]
+        Tries pdfplumber first (better layout), falls back to pypdf.
+        """
+        slides = []
+        try:
+            import pdfplumber
+            with pdfplumber.open(pdf_path) as pdf:
+                for i, page in enumerate(pdf.pages, 1):
+                    text = (page.extract_text() or "").strip()
+                    slides.append({"page": i, "text": text})
+            return slides
+        except ImportError:
+            pass
+        try:
+            import pypdf
+            reader = pypdf.PdfReader(pdf_path)
+            for i, page in enumerate(reader.pages, 1):
+                text = (page.extract_text() or "").strip()
+                slides.append({"page": i, "text": text})
+            return slides
+        except ImportError:
+            pass
+        # Last resort — no PDF library available
+        raise RuntimeError(
+            "No PDF library found.\n"
+            "Install one with:  pip install pdfplumber\n"
+            "or:                pip install pypdf")
+
+    def _pptx_preview(self):
+        """Extract and display slide content in the preview pane."""
+        path = self._pptx_path_var.get().strip()
+        if not path:
+            messagebox.showinfo("Script", "Select a PDF file first.",
+                                parent=self)
+            return
+        try:
+            slides = self._pptx_extract_slides(path)
+        except Exception as e:
+            messagebox.showerror("Extract Error", str(e), parent=self)
+            return
+
+        self._set_text(self._pptx_preview_text,
+                       self._pptx_format_preview(slides))
+        self._pptx_status_var.set(f"{len(slides)} slide(s) loaded.")
+
+    def _pptx_format_preview(self, slides: list) -> str:
+        lines = []
+        for s in slides:
+            lines.append(f"── Slide {s['page']} ──────────────────")
+            lines.append(s["text"] if s["text"] else "(no text extracted)")
+            lines.append("")
+        return "\n".join(lines)
+
+    def _pptx_build_prompt(self, slides: list) -> str:
+        """Build the script-generation prompt from extracted slides."""
+        tone        = self._pptx_tone_var.get()
+        extra_notes = self._pptx_notes_var.get().strip()
+
+        slide_block = "\n\n".join(
+            f"SLIDE {s['page']}:\n{s['text'] or '(no text)'}"
+            for s in slides
+        )
+
+        style_block = ""
+        if self._pptx_use_style_var.get():
+            director = getattr(self, "director", None)
+            if director:
+                try:
+                    from council_engine import ContentStyleManager
+                    csm = ContentStyleManager(
+                        VAULT_DIR / "style_profiles")
+                    style_summary = str(csm)
+                    if style_summary.strip():
+                        style_block = (
+                            f"\nCREATOR CONTENT STYLE (match this voice):\n"
+                            f"{style_summary[:600]}\n")
+                except Exception:
+                    pass
+
+        notes_block = (f"\nADDITIONAL NOTES FROM CREATOR:\n{extra_notes}\n"
+                       if extra_notes else "")
+
+        return (
+            f"Generate a complete spoken script for the following presentation.\n\n"
+            f"TONE: {tone}\n"
+            f"{style_block}"
+            f"{notes_block}\n"
+            f"SLIDES:\n{slide_block}\n\n"
+            f"SCRIPT REQUIREMENTS:\n"
+            f"- Write natural spoken language, not bullet recitation\n"
+            f"- Include a clear transition line between each slide "
+            f"(e.g. 'Moving to slide 3...' or a natural topic bridge)\n"
+            f"- Expand on each slide's content — do not just read the bullets verbatim\n"
+            f"- Estimate a rough speaking time for each slide in parentheses\n"
+            f"- Open with something that grabs attention before going into slide 1\n"
+            f"- Close with a strong final line, not just 'that's it'\n"
+            f"- Keep the tone consistent throughout: {tone}\n\n"
+            f"Format each slide section as:\n"
+            f"[SLIDE N — ~X min]\n"
+            f"<spoken script for that slide>\n\n"
+            f"[TRANSITION]\n"
+            f"<transition line to next slide>\n"
+        )
+
+    def _pptx_generate(self):
+        """Extract slides, build prompt, generate script in background thread."""
+        path = self._pptx_path_var.get().strip()
+        if not path:
+            messagebox.showinfo("Script", "Select a PDF file first.", parent=self)
+            return
+
+        writer_role = self._pptx_writer_var.get()
+        model = getattr(self, writer_role, None) or getattr(self, "writer", None)
+        if not model:
+            messagebox.showwarning("Script",
+                "No AI model available — council not loaded.", parent=self)
+            return
+
+        try:
+            slides = self._pptx_extract_slides(path)
+        except Exception as e:
+            messagebox.showerror("Extract Error", str(e), parent=self)
+            return
+
+        self._set_text(self._pptx_preview_text,
+                       self._pptx_format_preview(slides))
+        self._set_text(self._pptx_script_text, "Generating script…")
+        self._pptx_status_var.set(
+            f"Generating… ({len(slides)} slides, model: {writer_role})")
+
+        prompt = self._pptx_build_prompt(slides)
+
+        def _run():
+            try:
+                script = model.respond(prompt, max_tokens=4000)
+            except Exception as e:
+                script = f"[Error generating script: {e}]"
+            self.after(0, lambda: self._pptx_on_done(script))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _pptx_on_done(self, script: str):
+        self._set_text(self._pptx_script_text, script)
+        self._pptx_status_var.set("✓ Script generated.")
+        self._pptx_cached_script = script
+
+    def _pptx_copy(self):
+        script = getattr(self, "_pptx_cached_script",
+                         self._pptx_script_text.get("1.0", "end").strip())
+        if script:
+            self.clipboard_clear()
+            self.clipboard_append(script)
+            self._pptx_status_var.set("Copied to clipboard.")
+
+    def _pptx_save(self):
+        import tkinter.filedialog as _fd
+        script = getattr(self, "_pptx_cached_script",
+                         self._pptx_script_text.get("1.0", "end").strip())
+        if not script:
+            return
+        path = _fd.asksaveasfilename(
+            title="Save Script",
+            defaultextension=".txt",
+            filetypes=[("Text file", "*.txt"), ("Markdown", "*.md")])
+        if path:
+            import pathlib
+            pathlib.Path(path).write_text(script, encoding="utf-8")
+            self._pptx_status_var.set(f"Saved → {pathlib.Path(path).name}")
 
     # ---- Apothecary tab ----
 
