@@ -5308,6 +5308,9 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
         self._do_coach_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(opt_row6, text="  🎙 Coach (delivery, pacing, vocal habits)",
                         variable=self._do_coach_var).pack(side="left", padx=12)
+        self._do_cutter_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt_row6, text="  ✂ Cutter (timecoded edit decisions)",
+                        variable=self._do_cutter_var).pack(side="left", padx=12)
 
         # ── Action bar ────────────────────────────────────────────
         act_frame = ttk.Frame(self.tab_video)
@@ -5331,6 +5334,10 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                    command=self._video_show_algorithm_notes).pack(side="left", padx=6)
         ttk.Button(act_frame, text="🎙  Coach Notes",
                    command=self._video_show_coach_notes).pack(side="left", padx=6)
+        ttk.Button(act_frame, text="✂  Cutter Notes",
+                   command=self._video_show_cutter_notes).pack(side="left", padx=6)
+        ttk.Button(act_frame, text="✂  Auto-Edit…",
+                   command=self._video_auto_edit_panel).pack(side="left", padx=6)
 
         # ── Progress log ──────────────────────────────────────────
         ttk.Label(self.tab_video, text="Progress:").pack(anchor="w", padx=10)
@@ -5525,6 +5532,8 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                             if getattr(self, "_do_algorithm_var", tk.BooleanVar(value=True)).get() else None)
         coach_model      = (getattr(self, "coach", None)
                             if getattr(self, "_do_coach_var", tk.BooleanVar(value=True)).get() else None)
+        cutter_model     = (getattr(self, "cutter", None)
+                            if getattr(self, "_do_cutter_var", tk.BooleanVar(value=True)).get() else None)
         style_mgr        = getattr(self, "_content_style", None)
 
         def worker():
@@ -5542,6 +5551,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                     sage_model=sage_model,
                     algorithm_model=algorithm_model,
                     coach_model=coach_model,
+                    cutter_model=cutter_model,
                     do_audio_analysis=bool(getattr(self, "_do_audio_quality_var",
                                                     tk.BooleanVar(value=True)).get()),
                     do_energy_profile=bool(getattr(self, "_do_energy_var",
@@ -5847,6 +5857,193 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
             return
         self._video_text_popup("🎙 Coach — Delivery & Pacing", notes,
                                Path(a.video_path).name)
+
+    def _video_show_cutter_notes(self):
+        """Popup showing the Cutter timecoded edit analysis."""
+        a = self._last_video_analysis
+        notes = getattr(a, "cutter_notes", "") if a else ""
+        if not notes:
+            messagebox.showinfo("Cutter Notes",
+                                "No Cutter notes available.\n"
+                                "Run analysis with '✂ Cutter' enabled.",
+                                parent=self)
+            return
+        self._video_text_popup("✂ Cutter — Edit Decisions", notes,
+                               Path(a.video_path).name)
+
+    def _video_auto_edit_panel(self):
+        """
+        Show the Auto-Edit panel — a checklist of actions parsed from Cutter notes
+        that the user can toggle and then apply via FFmpeg.
+        """
+        try:
+            from video_editor import (
+                parse_edit_actions, VideoEditor, ffmpeg_available, ffmpeg_version,
+                EditAction,
+            )
+            _VE_OK = True
+        except ImportError:
+            messagebox.showerror("Auto-Edit",
+                "video_editor.py not found.", parent=self)
+            return
+
+        a = self._last_video_analysis
+        if not a:
+            messagebox.showinfo("Auto-Edit",
+                "Run a video analysis first.", parent=self)
+            return
+
+        cutter_notes = getattr(a, "cutter_notes", "")
+        if not cutter_notes:
+            messagebox.showinfo("Auto-Edit",
+                "No Cutter notes found.\n"
+                "Run analysis with '✂ Cutter' enabled first.",
+                parent=self)
+            return
+
+        actions = parse_edit_actions(cutter_notes, a.duration_s)
+        if not actions:
+            messagebox.showinfo("Auto-Edit",
+                "Cutter didn't produce any machine-readable edit actions.\n"
+                "Check Cutter Notes for the prose analysis.",
+                parent=self)
+            return
+
+        # ── Build window ────────────────────────────────────────
+        win = tk.Toplevel(self)
+        win.title("✂ Auto-Edit — Apply Cutter Decisions")
+        win.geometry("800x580")
+        win.configure(bg="#1e1e2e")
+
+        ffmpeg_ok = ffmpeg_available()
+        ffmpeg_lbl = ffmpeg_version() if ffmpeg_ok else "FFmpeg not found — install: winget install Gyan.FFmpeg"
+
+        # Header
+        hdr = ttk.Label(win,
+            text=f"FFmpeg: {ffmpeg_lbl}" if ffmpeg_ok
+                 else f"⚠ {ffmpeg_lbl}",
+            foreground="#89b4fa" if ffmpeg_ok else "#f38ba8",
+            font=("", 9))
+        hdr.pack(fill="x", padx=10, pady=(8, 2))
+
+        ttk.Label(win,
+            text=f"Source: {Path(a.video_path).name}  "
+                 f"({int(a.duration_s//60)}m {int(a.duration_s%60)}s)",
+            foreground="#6c7086", font=("", 9)).pack(anchor="w", padx=10)
+
+        # Actions checklist
+        lf = ttk.LabelFrame(win, text=f"Proposed Edits ({len(actions)} action(s))")
+        lf.pack(fill="both", expand=True, padx=10, pady=(6, 4))
+
+        canvas = tk.Canvas(lf, bg="#181825", highlightthickness=0)
+        vsb    = ttk.Scrollbar(lf, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(fill="both", expand=True)
+        inner  = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        check_vars = []
+        for action in actions:
+            var = tk.BooleanVar(value=action.enabled)
+            check_vars.append((action, var))
+            row = ttk.Frame(inner)
+            row.pack(fill="x", padx=6, pady=2)
+            ttk.Checkbutton(row, variable=var,
+                            text=f"{action.icon}  {action.label}").pack(
+                                side="left", anchor="w")
+
+        # Output path row
+        out_frame = ttk.Frame(win)
+        out_frame.pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Label(out_frame, text="Output:").pack(side="left")
+        default_out = str(
+            Path(a.video_path).with_stem(
+                Path(a.video_path).stem + "_edited"))
+        out_var = tk.StringVar(value=default_out)
+        ttk.Entry(out_frame, textvariable=out_var,
+                  width=55).pack(side="left", padx=6, fill="x", expand=True)
+        def _browse_out():
+            import tkinter.filedialog as _fd
+            p = _fd.asksaveasfilename(
+                title="Save edited video as",
+                initialfile=Path(default_out).name,
+                filetypes=[("MP4", "*.mp4"), ("All", "*.*")])
+            if p:
+                out_var.set(p)
+        ttk.Button(out_frame, text="…", width=3,
+                   command=_browse_out).pack(side="left")
+
+        # Progress log
+        log_frame = ttk.Frame(win)
+        log_frame.pack(fill="x", padx=10, pady=(0, 4))
+        edit_log = tk.Text(log_frame, height=5, state="disabled",
+                           bg="#181825", fg="#cdd6f4",
+                           font=("Consolas", 8), relief="flat")
+        edit_log.pack(fill="x")
+
+        def _log(msg: str):
+            def _do():
+                edit_log.configure(state="normal")
+                edit_log.insert("end", msg + "\n")
+                edit_log.see("end")
+                edit_log.configure(state="disabled")
+            win.after(0, _do)
+
+        # Apply button
+        btn_row = ttk.Frame(win)
+        btn_row.pack(fill="x", padx=10, pady=(0, 8))
+        apply_btn = ttk.Button(btn_row, text="✂ Apply Selected Edits")
+        apply_btn.pack(side="left")
+        ttk.Button(btn_row, text="Close",
+                   command=win.destroy).pack(side="right")
+
+        def _apply():
+            if not ffmpeg_ok:
+                messagebox.showerror("FFmpeg Required",
+                    "Install FFmpeg first:\n  winget install Gyan.FFmpeg\n\n"
+                    "Then restart the council.", parent=win)
+                return
+            # Apply enable state from checkboxes
+            for action, var in check_vars:
+                action.enabled = var.get()
+            enabled = [a for a, v in check_vars if v.get()]
+            if not enabled:
+                messagebox.showinfo("Auto-Edit",
+                    "No actions selected.", parent=win)
+                return
+            out_path = out_var.get().strip()
+            if not out_path:
+                messagebox.showinfo("Auto-Edit",
+                    "Set an output file path.", parent=win)
+                return
+            apply_btn.configure(state="disabled", text="Editing…")
+            _log(f"Starting edit: {len(enabled)} action(s) → {Path(out_path).name}")
+
+            def _run():
+                editor = VideoEditor()
+                ok = editor.apply(
+                    input_path  = a.video_path,
+                    actions     = [act for act, var in check_vars if var.get()],
+                    output_path = out_path,
+                    progress_cb = _log,
+                )
+                win.after(0, lambda: _on_done(ok, out_path))
+
+            threading.Thread(target=_run, daemon=True).start()
+
+        def _on_done(ok: bool, out_path: str):
+            apply_btn.configure(state="normal", text="✂ Apply Selected Edits")
+            if ok:
+                _log(f"✓ Done. Saved to: {out_path}")
+                messagebox.showinfo("Auto-Edit Complete",
+                    f"Edited video saved:\n{out_path}", parent=win)
+            else:
+                _log("✗ Edit failed — see log above.")
+
+        apply_btn.configure(command=_apply)
 
     def _video_text_popup(self, title: str, text: str, subtitle: str = ""):
         """Generic read-only text popup for algorithm/coach notes."""

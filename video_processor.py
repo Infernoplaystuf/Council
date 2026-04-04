@@ -557,6 +557,7 @@ class VideoAnalysis:
     video_context:    Optional[VideoContext]        = None   # detected content type/topic
     algorithm_notes:  str                           = ""     # Algorithm retention/packaging critique
     coach_notes:      str                           = ""     # Coach delivery/pacing critique
+    cutter_notes:     str                           = ""     # Cutter timecoded edit decisions
 
     @property
     def full_transcript_text(self) -> str:
@@ -2063,6 +2064,105 @@ def _run_coach_pass(
     return analysis
 
 
+def _run_cutter_pass(
+    analysis:     VideoAnalysis,
+    cutter_model: Any,
+    progress_cb:  Optional[Callable[[str], None]] = None,
+    video_context: Optional[VideoContext]          = None,
+) -> VideoAnalysis:
+    """
+    Have the Cutter model produce timecoded edit decisions from the transcript.
+    Stores prose analysis in cutter_notes and also appends to edit_suggestions.
+    The EDIT ACTIONS: block in the output is machine-parseable by video_editor.
+    """
+    def _log(m): progress_cb(m) if progress_cb else None
+
+    timed = analysis.full_transcript_text
+    dur   = timedelta(seconds=int(analysis.duration_s))
+
+    # Build silence context from audio quality report
+    silence_ctx = ""
+    if analysis.audio_quality and analysis.audio_quality.silence_gaps:
+        gaps = analysis.audio_quality.silence_gaps[:8]
+        silence_ctx = "\n\nDETECTED SILENCE GAPS (from audio analysis):\n" + "".join(
+            f"  {_fmt_time(g[0])} → {_fmt_time(g[1])}  ({g[2]:.1f}s)\n"
+            for g in gaps if len(g) >= 3)
+
+    # Low-energy windows
+    dead_segs = [e for e in analysis.energy_profile if e.label in ("dead", "low")]
+    energy_ctx = ""
+    if dead_segs:
+        energy_ctx = "\n\nLOW-ENERGY / DEAD WINDOWS:\n" + "".join(
+            f"  {e.timecode()} — {e.label}\n" for e in dead_segs[:10])
+
+    sample = timed[:6000]
+    if len(timed) > 6000:
+        sample += "\n\n[... transcript continues ...]"
+
+    _ctx_preamble = (video_context.preamble + "\n\n") if video_context and video_context.preamble else ""
+
+    prompt = (
+        f"{_ctx_preamble}"
+        f"You are reviewing a video transcript as an editor. "
+        f"Your job is to identify every section that should be cut or cleaned up.\n"
+        f"Duration: {dur}\n"
+        f"{silence_ctx}{energy_ctx}\n\n"
+        f"TRANSCRIPT (with timestamps):\n{sample}\n\n"
+        f"Produce your edit analysis using this EXACT format:\n\n"
+        f"OVERALL PACING VERDICT: tight | slightly loose | needs significant cutting\n\n"
+        f"ESTIMATED CUT LIST:\n"
+        f"- [HH:MM:SS → HH:MM:SS] <reason: dead air / rambling / repeated point / mistake>\n\n"
+        f"JUMP CUT OPPORTUNITIES:\n"
+        f"- [HH:MM:SS → HH:MM:SS] <slow patch that could be speed-ramped or cut>\n\n"
+        f"AUDIO NOTES:\n"
+        f"<note any level inconsistency, background noise, or clipping>\n\n"
+        f"BEST CLIP FOR SHORT/TEASER:\n"
+        f"[HH:MM:SS → HH:MM:SS] <why this is the most shareable moment>\n\n"
+        f"Then output a machine-readable block — EXACTLY this format, no deviations:\n\n"
+        f"EDIT ACTIONS:\n"
+        f"[CUT] HH:MM:SS → HH:MM:SS | <one-line reason>\n"
+        f"[NORMALIZE] | <one-line reason>  (only if audio levels are inconsistent)\n"
+        f"[DENOISE] | <one-line reason>    (only if background noise is audible)\n"
+        f"[CROP] 9:16 | <one-line reason>  (only if short-form repost is suitable)\n\n"
+        f"List every cut from ESTIMATED CUT LIST and JUMP CUT OPPORTUNITIES in "
+        f"the EDIT ACTIONS block. Be precise with timestamps. "
+        f"Only include NORMALIZE/DENOISE/CROP if genuinely warranted."
+    )
+
+    _log("  ✂ Running Cutter pass…")
+    try:
+        resp = cutter_model.respond(prompt)
+        analysis.cutter_notes = resp
+
+        # Extract cuts from EDIT ACTIONS block and add to edit_suggestions
+        from video_editor import parse_edit_actions
+        actions = parse_edit_actions(resp, analysis.duration_s)
+        cut_count = sum(1 for a in actions if a.type == "cut")
+        for action in actions:
+            if action.type == "cut":
+                analysis.edit_suggestions.append(EditSuggestion(
+                    suggestion_type="cut_section",
+                    priority="high",
+                    timecode=f"{_fmt_time(action.start_s)} → {_fmt_time(action.end_s)}",
+                    description=f"Cutter: {action.reason[:200]}",
+                    ffmpeg_snippet=(
+                        f"# Remove {_fmt_time(action.start_s)}→{_fmt_time(action.end_s)}: "
+                        f"use council ✂ Auto-Edit panel"),
+                ))
+
+        _log(f"  ✓ Cutter pass complete — {cut_count} cut(s) identified")
+    except Exception as e:
+        analysis.cutter_notes = f"Cutter pass failed: {e}"
+        _log(f"  ✗ Cutter pass error: {e}")
+
+    return analysis
+
+
+def _fmt_time(seconds: float) -> str:
+    from datetime import timedelta
+    return str(timedelta(seconds=int(seconds))).zfill(8)
+
+
 # ============================================================
 # Main pipeline
 # ============================================================
@@ -2122,6 +2222,7 @@ class VideoProcessor:
         do_roast: bool = True,                 # run Peasant Roast critique
         algorithm_model: Any = None,           # Algorithm — retention/hook/packaging pass
         coach_model: Any = None,               # Coach — delivery/pacing/vocal habits pass
+        cutter_model: Any = None,              # Cutter — timecoded edit decisions
         progress_cb: Optional[Callable[[str], None]] = None,
         cancelled: Optional[Callable[[], bool]] = None,
     ) -> VideoAnalysis:
@@ -2404,6 +2505,22 @@ class VideoProcessor:
         else:
             reason = "no transcript" if not analysis.transcript else "no coach model"
             _log(f"  Step 8b — Coach pass skipped ({reason})")
+
+        if _cancelled():
+            return analysis
+
+        # ── Step 8c: Cutter edit decisions ────────────────────────
+        if cutter_model and analysis.transcript:
+            _log("▶ Step 8c — ✂ Cutter timecoded edit pass")
+            analysis = _run_cutter_pass(
+                analysis,
+                cutter_model=cutter_model,
+                progress_cb=_log,
+                video_context=analysis.video_context,
+            )
+        else:
+            reason = "no transcript" if not analysis.transcript else "no cutter model"
+            _log(f"  Step 8c — Cutter pass skipped ({reason})")
 
         if _cancelled():
             return analysis
