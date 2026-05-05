@@ -3,7 +3,7 @@
 # ============================================================
 # Defines the interface that every tab mixin expects from its host.
 #
-# Each tab module (tab_video.py, tab_grapher.py, …) is a mixin
+# Each tab module (tab_grapher.py, …) is a mixin
 # class. When running inside the full council the host is
 # CouncilConsole. When running standalone the host is a minimal
 # StandaloneHost that fulfils the same interface.

@@ -1,12 +1,11 @@
 # ============================================================
-# council_gui_engine.py  —  v2
+# council_gui_engine.py  —  Council main GUI
 # ============================================================
-# Conda env:
-#   conda create -n council python=3.11 -y
-#   conda activate council
-# Optional (SSH): pip install paramiko
-# Optional (Phase 3 STT mic): pip install sounddevice soundfile
-# Optional (Phase 3 transcription): pip install faster-whisper
+# Optional dependencies:
+#   pip install paramiko        # SSH support for remote nodes
+#   pip install sounddevice soundfile   # microphone STT input
+#   pip install faster-whisper  # local speech-to-text
+#   pip install pyttsx3         # text-to-speech playback
 # ============================================================
 
 from __future__ import annotations
@@ -31,93 +30,69 @@ import apothecary_engine as ae
 
 # ── Agent modules (graceful optional imports) ─────────────────
 try:
-    import coder_agent as tpa
+    import coder_agent as ca
     _CODER_AGENT_OK = True
-except (ImportError, OSError):
+except Exception:
     _CODER_AGENT_OK = False
 
 try:
     import intern_agent as ia
     _INTERN_AGENT_OK = True
-except (ImportError, OSError):
+except Exception:
     _INTERN_AGENT_OK = False
 
 try:
     import vault_agent as va
     _VAULT_AGENT_OK = True
-except (ImportError, OSError):
+except Exception:
     va = None
     _VAULT_AGENT_OK = False
 
 try:
-    import video_processor as vp
-    _VIDEO_OK = True
-except (ImportError, OSError):
-    vp = None
-    _VIDEO_OK = False
-
-try:
     import sage_agent as sa
     _SAGE_OK = True
-except (ImportError, OSError):
+except Exception:
     sa = None
     _SAGE_OK = False
 
 try:
     import vault_scraper as vs
     _SCRAPER_OK = True
-except (ImportError, OSError):
+except Exception:
     vs = None
     _SCRAPER_OK = False
 
 try:
     import dream3d_primer as d3p
     _DREAM3D_OK = True
-except (ImportError, OSError):
+except Exception:
     _DREAM3D_OK = False
 
 try:
     import dream3d_council_patch as d3d_patch
     _D3D_PATCH_OK = True
-except (ImportError, OSError):
+except Exception:
     _D3D_PATCH_OK = False
 
 try:
     import vault_rag as vr
     _RAG_OK = True
-except (ImportError, OSError):
+except Exception:
     _RAG_OK = False
-
-try:
-    import music_blocks as mb
-    import music_renderer as mr
-    import composer_personality as cp
-    _COMPOSER_OK = True
-except (ImportError, OSError):
-    _COMPOSER_OK = False
 
 try:
     import graph_data as gd
     import graph_engine as ge
     import graph_personality as gp
     _GRAPHER_OK = True
-except (ImportError, OSError):
+except Exception:
     _GRAPHER_OK = False
 
 try:
     import tkinterweb
     _TKWEB_OK = True
-except (ImportError, OSError):
+except Exception:
     _TKWEB_OK = False
-
-try:
-    from tab_ideas import IdeaTabMixin
-    _IDEAS_TAB_OK = True
-except (ImportError, OSError):
-    _IDEAS_TAB_OK = False
-    class IdeaTabMixin:          # noqa: F811  — stub so CouncilConsole base list works
-        def _build_ideas_tab(self): pass
-
 
 # ============================================================
 # Agent event types
@@ -206,7 +181,6 @@ _PANEL_FOR_ROUTE: Dict[str, tuple] = {
     "peasant":    (["writer",     "peasant"           ],  "writer"),  # simple explain
     "sage":       (["sage",       "writer",  "peasant"],  "writer"),  # domain knowledge
     "strategist": (["strategist", "coder", "skeptic"], "writer"), # planning/strategy
-    "musician":   (["musician",   "writer"],               "writer"),  # music direction
     "content":    (["content",    "writer",  "strategist"], "writer"),  # content creation
     "director":   (["director",   "writer",  "content"],   "writer"),  # style analysis + scripting
     "_default":   (["writer",     "intern",  "peasant"],   "writer"),  # fallback
@@ -1393,7 +1367,7 @@ def _vmgr_clone_repo(
     if clone_dir.exists():
         _log(f"Updating existing clone: {subfolder}")
         r = _sp.run(["git", "pull"], cwd=str(clone_dir),
-                    capture_output=True, text=True)
+                    capture_output=True, text=True, timeout=120)
         _log(r.stdout.strip() or r.stderr.strip() or "Already up to date.")
     else:
         clone_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -1402,7 +1376,7 @@ def _vmgr_clone_repo(
             cmd += ["--branch", branch]
         cmd += [url, str(clone_dir)]
         _log(f"Cloning {url} …")
-        r = _sp.run(cmd, capture_output=True, text=True)
+        r = _sp.run(cmd, capture_output=True, text=True, timeout=300)
         if r.returncode != 0:
             raise RuntimeError(r.stderr.strip() or "git clone failed")
         _log(f"Cloned to {clone_dir.name}")
@@ -1560,17 +1534,15 @@ def _vmgr_copy_folder(
 
 # ── All persistent data lives under VAULT_DIR ─────────────────
 # ~/.council/vault/
-#   conversations/     ← per-session chat history
-#   memory/            ← per-role persistent memory
-#   logs/              ← council.log and session logs
-#   workspace/         ← code runner scratch files
-#   music_output/      ← composer renders
-#   graph_output/      ← grapher exports
-#   dream3d_docs/      ← scraped Dream3D documentation
-#   .chromadb/         ← ChromaDB vector index
-#   .git_clones/       ← raw git clones (not indexed directly)
-#   node_registry.json ← SSH node registry
-#   personality_backends.json ← model pins
+#   conversations/             ← per-session chat history
+#   memory/                    ← per-role persistent memory
+#   logs/                      ← council.log and session logs
+#   workspace/                 ← code runner scratch files
+#   graph_output/              ← grapher exports
+#   .chromadb/                 ← ChromaDB vector index
+#   .git_clones/               ← cloned reference repos
+#   node_registry.json         ← SSH node registry
+#   personality_backends.json  ← model pins
 VAULT_DIR            = APP_DIR / "vault"
 VERDICT_HISTORY_PATH = VAULT_DIR / "verdict_history.jsonl"
 VAULT_DIR.mkdir(parents=True, exist_ok=True)
@@ -1601,7 +1573,6 @@ def _migrate_old_paths_to_vault() -> None:
         (APP_DIR / "node_registry.json",      REGISTRY_PATH,      False),
         (APP_DIR / "personality_backends.json", PINS_PATH,        False),
         (APP_DIR / "workspace",               WORKSPACE_DIR,      True),
-        (APP_DIR / "music_output",            VAULT_DIR / "music_output", True),
         (APP_DIR / "graph_output",            VAULT_DIR / "graph_output", True),
         (APP_DIR / ".chromadb",               VAULT_DIR / ".chromadb",    True),
         # dream3d docs scraped next to the script
@@ -1950,10 +1921,10 @@ class InstructionManager:
         return sum(1 for e in self._instructions if e.get("active"))
 
 
-class CouncilConsole(IdeaTabMixin, tk.Tk):
+class CouncilConsole(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Council Console  v3  •  LOCAL + Pi + Agents")
+        self.title("Council")
         self.geometry("1150x820")
         self.configure(bg="#1e1e2e")
 
@@ -1963,7 +1934,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
         self._pause_event.set()  # starts unpaused
         self._clarification_answer: str = ""
 
-        self.vault_dir = VAULT_DIR    # expose for tab mixins (IdeaTabMixin, etc.)
+        self.vault_dir = VAULT_DIR
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.prior_session_id: Optional[str] = None
         self.convo_store = ce.ConversationStore(VAULT_DIR / "conversations")
@@ -1975,10 +1946,6 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
         pins = ce.load_personality_pins(PINS_PATH)
         # Persistent council-wide instructions — managed as a list
         self._instr_mgr       = InstructionManager(INSTRUCTIONS_PATH)
-        self._video_proc      = (vp.VideoProcessor(VAULT_DIR, TMP_DIR,
-                                  ollama_host=ce.DEFAULT_OLLAMA_HOST)
-                                if _VIDEO_OK else None)
-        self._video_cancelled  = False
         self._content_style  = ContentStyleManager(CONTENT_STYLE_PATH)
 
         self.personalities = ce.build_personalities(
@@ -2002,25 +1969,6 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
             )
             # Inject Sage system prompt
             self.sage.system_prompt = sa.SAGE_SYSTEM_PROMPT
-
-        # ── Composer personality ───────────────────────────────
-        self.composer_personality = None
-        self.block_library        = None
-        if _COMPOSER_OK:
-            try:
-                music_dir = VAULT_DIR / "music_blocks"
-                self.block_library = mb.BlockLibrary(music_dir)
-                if not (music_dir / "progression_blocks.json").exists():
-                    self.block_library.seed_defaults()
-                self.composer_personality = cp.ComposerPersonality(
-                    personality_model=self.writer,
-                    library=self.block_library,
-                    event_callback=lambda phase, msg: self.ui_q.put(("agent_phase", phase, msg)),
-                )
-                cp.patch_routing(ce)
-                print("[Composer] Ready")
-            except Exception as e:
-                print(f"[Composer] Init failed: {e}")
 
         # ── Dream3D primer injection ───────────────────────────
         if _DREAM3D_OK:
@@ -2048,7 +1996,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
             self.ui_q.put(("agent_phase", phase, msg))
 
         if _CODER_AGENT_OK:
-            self.coder_agent = tpa.CoderAgent(
+            self.coder_agent = ca.CoderAgent(
                 personality_model=self.coder,
                 runner=self.runner,
                 max_attempts=8,
@@ -2084,26 +2032,29 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
         self._start_config_watcher()                   # T1-E: hot-reload pins.json
 
     def _unpack_personalities(self):
-        self.judge      = self.personalities["judge"]
+        # Required core personalities — missing any of these is a config error
+        _required = ("judge", "writer", "peasant", "intern", "coder", "artist")
+        _missing = [r for r in _required if r not in self.personalities]
+        if _missing:
+            raise RuntimeError(
+                f"Missing required personalities: {', '.join(_missing)}. "
+                f"Check personality_config.yaml and personality_backends.json."
+            )
+        self.judge                = self.personalities["judge"]
         self.writer               = self.personalities["writer"]
         self.peasant              = self.personalities["peasant"]
         self.intern               = self.personalities["intern"]
-        self.coder           = self.personalities["coder"]
+        self.coder                = self.personalities["coder"]
         self.artist               = self.personalities["artist"]
         self.skeptic              = self.personalities.get("skeptic")
         self.sage                 = self.personalities.get("sage")
         self.strategist           = self.personalities.get("strategist")
-        self.musician             = self.personalities.get("musician")
         # Librarian personality — interprets vault search results for other agents
         self.librarian_personality = self.personalities.get("librarian")
         self.content              = self.personalities.get("content")
         self.director             = self.personalities.get("director")
-        self.eye                  = self.personalities.get("eye")
-        self.cutter               = self.personalities.get("cutter")
         self.algorithm            = self.personalities.get("algorithm")
         self.coach                = self.personalities.get("coach")
-        self.ideator              = self.personalities.get("ideator")
-        self.pitcher              = self.personalities.get("pitcher")
 
     # ============================
     # Dark theme
@@ -2166,13 +2117,9 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
         self._build_sessions_tab()
         self._build_nodes_tab()
         self._build_agents_tab()
-        self._build_composer_tab()
         self._build_grapher_tab()
         self._build_vault_manager_tab()
         self._build_speech_tab()
-        self._build_video_tab()
-        self._build_pptx_tab()
-        self._build_ideas_tab()
         self._build_apoth_tab()
         self._build_lens_tab()
         self._build_vault_health_tab()
@@ -2693,196 +2640,6 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
         self.agent_log.insert("end", f"[{phase}] {msg}\n", tag)
         self.agent_log.see("end")
         self.agent_log.configure(state="disabled")
-
-    # ---- Composer tab ----
-
-    def _build_composer_tab(self):
-        self.tab_composer = ttk.Frame(self.nb)
-        self.nb.add(self.tab_composer, text="🎵 Composer")
-
-        # ── Top controls ──────────────────────────────────────
-        ctrl = ttk.Frame(self.tab_composer)
-        ctrl.pack(fill="x", padx=10, pady=8)
-
-        # Status label
-        status_color = "#a6e3a1" if _COMPOSER_OK else "#f38ba8"
-        status_text  = "✓ Composer ready" if _COMPOSER_OK else "✗ music_blocks.py / mido / music21 not found"
-        ttk.Label(ctrl, text=status_text, foreground=status_color).pack(anchor="w")
-
-        if not _COMPOSER_OK:
-            ttk.Label(ctrl,
-                text="Install: pip install mido music21\n"
-                     "Then place music_blocks.py, music_renderer.py, composer_personality.py alongside council_engine.py",
-                foreground="#89b4fa").pack(anchor="w", pady=4)
-
-        # Prompt row
-        prompt_row = ttk.Frame(self.tab_composer)
-        prompt_row.pack(fill="x", padx=10, pady=(0, 6))
-        ttk.Label(prompt_row, text="Prompt:").pack(side="left")
-        self.composer_prompt = tk.Text(prompt_row, height=3, wrap="word",
-                                       font=("Consolas", 11),
-                                       bg="#1e1e2e", fg="#cdd6f4",
-                                       insertbackground="#cdd6f4")
-        self.composer_prompt.pack(side="left", fill="x", expand=True, padx=(6, 0))
-        self.composer_prompt.insert("1.0", "dark jazz ballad, slow tempo, minor key, moody")
-
-        # Button row
-        btn_row = ttk.Frame(self.tab_composer)
-        btn_row.pack(fill="x", padx=10, pady=(0, 8))
-        ttk.Button(btn_row, text="🎼 Compose",
-                   command=self._composer_compose).pack(side="left")
-        ttk.Button(btn_row, text="💾 Export MIDI",
-                   command=self._composer_export_midi).pack(side="left", padx=4)
-        ttk.Button(btn_row, text="🎵 Export MusicXML",
-                   command=self._composer_export_xml).pack(side="left", padx=4)
-        ttk.Button(btn_row, text="🔊 Render WAV",
-                   command=self._composer_render_wav).pack(side="left", padx=4)
-        ttk.Button(btn_row, text="🗂 Open Output Folder",
-                   command=self._composer_open_folder).pack(side="left", padx=4)
-
-        # Main paned area
-        paned = tk.PanedWindow(self.tab_composer, orient="horizontal",
-                               bg="#1e1e2e", sashwidth=6)
-        paned.pack(fill="both", expand=True, padx=10, pady=(0, 10))
-
-        # Left: block library browser
-        lib_frame = ttk.LabelFrame(paned, text="Block Library")
-        paned.add(lib_frame, width=280)
-
-        self.block_tree = ttk.Treeview(lib_frame, show="tree headings",
-                                       selectmode="browse")
-        self.block_tree.pack(fill="both", expand=True, padx=4, pady=4)
-        self._refresh_block_tree()
-
-        # Right: composition plan + log
-        right = ttk.Frame(paned)
-        paned.add(right)
-
-        ttk.Label(right, text="Composition Plan (JSON)").pack(anchor="w")
-        self.composer_plan_box = self._make_text(right, height=18, wrap="none")
-        self.composer_plan_box.pack(fill="both", expand=True)
-
-        ttk.Label(right, text="Composer Log").pack(anchor="w", pady=(6, 0))
-        self.composer_log = self._make_text(right, height=6, wrap="word",
-                                            state="disabled")
-        self.composer_log.tag_configure("ok",    foreground="#a6e3a1")
-        self.composer_log.tag_configure("err",   foreground="#f38ba8")
-        self.composer_log.tag_configure("info",  foreground="#89b4fa")
-        self.composer_log.pack(fill="x")
-
-        # State
-        self._current_plan: Optional[Any] = None
-        self._composer_output_dir = VAULT_DIR / "music_output"
-
-    def _composer_log_append(self, msg: str, tag: str = "info"):
-        self.composer_log.configure(state="normal")
-        self.composer_log.insert("end", msg + "\n", tag)
-        self.composer_log.see("end")
-        self.composer_log.configure(state="disabled")
-
-    def _refresh_block_tree(self):
-        if not _COMPOSER_OK or self.block_library is None:
-            return
-        self.block_tree.delete(*self.block_tree.get_children())
-        catalogue = self.block_library.list_blocks()
-        for btype, names in catalogue.items():
-            parent = self.block_tree.insert("", "end", text=btype.upper(),
-                                             open=True)
-            for name in names:
-                self.block_tree.insert(parent, "end", text=name)
-
-    def _composer_compose(self):
-        if not _COMPOSER_OK or self.composer_personality is None:
-            self._composer_log_append("Composer not available.", "err")
-            return
-        prompt = self.composer_prompt.get("1.0", "end").strip()
-        if not prompt:
-            return
-
-        self._composer_log_append(f"Composing: {prompt[:60]}…", "info")
-        self.composer_plan_box.delete("1.0", "end")
-
-        def worker():
-            try:
-                result = self.composer_personality.compose(prompt)
-                self.ui_q.put(("composer_result", result))
-            except Exception as e:
-                self.ui_q.put(("composer_error", str(e)))
-
-        import threading
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _composer_export_midi(self):
-        if self._current_plan is None:
-            self._composer_log_append("No plan — compose first.", "err")
-            return
-        if not _COMPOSER_OK:
-            return
-        try:
-            self._composer_output_dir.mkdir(parents=True, exist_ok=True)
-            renderer = mr.MidiRenderer()
-            safe = "".join(c if c.isalnum() or c in "_ -" else "_"
-                           for c in self._current_plan.title)[:50]
-            path = self._composer_output_dir / f"{safe}.mid"
-            renderer.render(self._current_plan, path)
-            self._composer_log_append(f"✓ MIDI saved: {path}", "ok")
-        except Exception as e:
-            self._composer_log_append(f"✗ MIDI export failed: {e}", "err")
-
-    def _composer_export_xml(self):
-        if self._current_plan is None:
-            self._composer_log_append("No plan — compose first.", "err")
-            return
-        if not _COMPOSER_OK:
-            return
-        try:
-            self._composer_output_dir.mkdir(parents=True, exist_ok=True)
-            renderer = mr.MusicXMLRenderer()
-            safe = "".join(c if c.isalnum() or c in "_ -" else "_"
-                           for c in self._current_plan.title)[:50]
-            path = self._composer_output_dir / f"{safe}.musicxml"
-            renderer.render(self._current_plan, path)
-            self._composer_log_append(f"✓ MusicXML saved: {path}", "ok")
-        except Exception as e:
-            self._composer_log_append(f"✗ MusicXML export failed: {e}", "err")
-
-    def _composer_render_wav(self):
-        if self._current_plan is None:
-            self._composer_log_append("No plan — compose first.", "err")
-            return
-        if not _COMPOSER_OK:
-            return
-        self._composer_log_append("Rendering WAV (exporting MIDI first)…", "info")
-        try:
-            self._composer_output_dir.mkdir(parents=True, exist_ok=True)
-            wav_r = mr.WavRenderer()
-            if not wav_r.available():
-                self._composer_log_append(
-                    f"⚠ WAV unavailable: {wav_r.soundfont_status()}\n"
-                    "Download a free .sf2 soundfont and place at:\n"
-                    "  C:/soundfonts/GeneralUser_GS.sf2", "err")
-                return
-            midi_r = mr.MidiRenderer()
-            safe = "".join(c if c.isalnum() or c in "_ -" else "_"
-                           for c in self._current_plan.title)[:50]
-            midi_path = self._composer_output_dir / f"{safe}.mid"
-            midi_r.render(self._current_plan, midi_path)
-            wav_path = self._composer_output_dir / f"{safe}.wav"
-            wav_r.render(midi_path, wav_path)
-            self._composer_log_append(f"✓ WAV saved: {wav_path}", "ok")
-        except Exception as e:
-            self._composer_log_append(f"✗ WAV render failed: {e}", "err")
-
-    def _composer_open_folder(self):
-        import subprocess, sys
-        folder = self._composer_output_dir
-        folder.mkdir(parents=True, exist_ok=True)
-        if sys.platform == "win32":
-            subprocess.Popen(["explorer", str(folder)])
-        elif sys.platform == "darwin":
-            subprocess.Popen(["open", str(folder)])
-        else:
-            subprocess.Popen(["xdg-open", str(folder)])
 
     # ---- Grapher tab ----
 
@@ -3945,7 +3702,11 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
             except ValueError:
                 rel = str(p)
             if rel == label or str(p) == label:
-                self._grapher_overlay_ds = gd.DataLoader.load(p)
+                try:
+                    self._grapher_overlay_ds = gd.DataLoader.load(p)
+                except Exception as e:
+                    self._grapher_show_stats(f"✗ Could not load overlay {p.name}: {e}")
+                    return
                 self._grapher_show_stats(
                     f"\U0001f4ce Overlay loaded: {p.name}  "
                     f"({self._grapher_overlay_ds.shape[0]:,} rows)")
@@ -3963,7 +3724,11 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
         if not path_str:
             return
         p = Path(path_str)
-        self._grapher_overlay_ds = gd.DataLoader.load(p)
+        try:
+            self._grapher_overlay_ds = gd.DataLoader.load(p)
+        except Exception as e:
+            self._grapher_show_stats(f"✗ Could not load overlay {p.name}: {e}")
+            return
         label = str(p)
         existing = list(self._grapher_overlay_cb["values"])
         if label not in existing:
@@ -4794,14 +4559,14 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                 import subprocess
                 r = subprocess.run(
                     ["git", "pull"], cwd=str(clone_dir),
-                    capture_output=True, text=True)
+                    capture_output=True, text=True, timeout=120)
                 msg = r.stdout.strip() or r.stderr.strip() or "Done."
                 self.ui_q.put(("vault_mgr_log", f"git pull: {msg}"))
                 # Re-copy updated files
                 rc2, url, _ = (lambda r2: (r2.returncode, r2.stdout.strip(), ""))(
                     subprocess.run(["git", "remote", "get-url", "origin"],
                                    cwd=str(clone_dir),
-                                   capture_output=True, text=True))
+                                   capture_output=True, text=True, timeout=15))
                 if rc2 == 0 and url:
                     _vmgr_clone_repo(
                         url, vault_dir=VAULT_DIR, subfolder=subfolder,
@@ -5187,1714 +4952,6 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
         self.stt_out = self._make_text(top, wrap="word")
         self.stt_out.pack(fill="both", expand=True)
         self._tts_engine = None  # lazy init
-
-    # ---- Video Analysis tab ----
-
-    def _build_video_tab(self):
-        self.tab_video = ttk.Frame(self.nb)
-        self.nb.add(self.tab_video, text="🎬 Video")
-
-        # ── Header ────────────────────────────────────────────────
-        hdr = ttk.Frame(self.tab_video)
-        hdr.pack(fill="x", padx=10, pady=(8, 4))
-        ttk.Label(hdr, text="Video Analyser",
-                  foreground="#89b4fa", font=("", 11, "bold")).pack(side="left")
-        ttk.Label(hdr,
-                  text="  Transcribe, describe, and learn your creator vibe",
-                  foreground="#6c7086").pack(side="left")
-
-        if not _VIDEO_OK:
-            ttk.Label(self.tab_video,
-                      text="video_processor.py not found — place it in your council folder.",
-                      foreground="#f38ba8").pack(padx=12, pady=20)
-            return
-
-        # ── File picker ───────────────────────────────────────────
-        file_frame = ttk.LabelFrame(self.tab_video, text="Video File")
-        file_frame.pack(fill="x", padx=10, pady=(0, 6))
-
-        self._video_path_var = tk.StringVar()
-        file_row = ttk.Frame(file_frame)
-        file_row.pack(fill="x", padx=8, pady=6)
-        ttk.Entry(file_row, textvariable=self._video_path_var, width=60).pack(side="left", fill="x", expand=True)
-        ttk.Button(file_row, text="Browse…", command=self._video_browse).pack(side="left", padx=6)
-
-        # ── Options ───────────────────────────────────────────────
-        opt_frame = ttk.LabelFrame(self.tab_video, text="Options")
-        opt_frame.pack(fill="x", padx=10, pady=(0, 6))
-
-        opt_row1 = ttk.Frame(opt_frame)
-        opt_row1.pack(fill="x", padx=8, pady=(6, 2))
-
-        ttk.Label(opt_row1, text="Whisper model:").pack(side="left")
-        self._whisper_model_var = tk.StringVar(value="base")
-        ttk.Combobox(opt_row1, textvariable=self._whisper_model_var,
-                     values=["tiny", "base", "small", "medium", "large-v2"],
-                     state="readonly", width=10).pack(side="left", padx=6)
-        ttk.Label(opt_row1, text="  Device:").pack(side="left")
-        self._whisper_device_var = tk.StringVar(value="cuda")
-        ttk.Combobox(opt_row1, textvariable=self._whisper_device_var,
-                     values=["cuda", "cpu"], state="readonly", width=6).pack(side="left", padx=6)
-
-        opt_row2 = ttk.Frame(opt_frame)
-        opt_row2.pack(fill="x", padx=8, pady=(2, 6))
-
-        self._do_frames_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opt_row2, text="Extract frames",
-                        variable=self._do_frames_var).pack(side="left")
-        ttk.Label(opt_row2, text="  every").pack(side="left", padx=(6, 2))
-        self._frame_interval_var = tk.StringVar(value="10")
-        ttk.Spinbox(opt_row2, textvariable=self._frame_interval_var,
-                    from_=5, to=60, increment=5, width=5).pack(side="left")
-        ttk.Label(opt_row2, text="s  max").pack(side="left", padx=(4, 2))
-        self._max_frames_var = tk.StringVar(value="20")
-        ttk.Spinbox(opt_row2, textvariable=self._max_frames_var,
-                    from_=5, to=60, increment=5, width=5).pack(side="left")
-        ttk.Label(opt_row2, text="frames").pack(side="left", padx=(4, 0))
-
-        opt_row3 = ttk.Frame(opt_frame)
-        opt_row3.pack(fill="x", padx=8, pady=(0, 6))
-        ttk.Label(opt_row3, text="Vision model:").pack(side="left")
-        self._vision_model_var = tk.StringVar(value="llava:7b")
-        self._vision_cb = ttk.Combobox(opt_row3, textvariable=self._vision_model_var,
-                                        values=["llava:7b", "moondream", "llava-phi3",
-                                                "llava-llama3", "minicpm-v"],
-                                        width=18)
-        self._vision_cb.pack(side="left", padx=6)
-        ttk.Button(opt_row3, text="↺ Detect installed",
-                   command=self._video_detect_vision_models).pack(side="left", padx=4)
-
-        self._do_vibe_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opt_row3, text="Run vibe analysis (saves to Content Style)",
-                        variable=self._do_vibe_var).pack(side="left", padx=12)
-
-        opt_row4 = ttk.Frame(opt_frame)
-        opt_row4.pack(fill="x", padx=8, pady=(2, 4))
-        self._do_audio_quality_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opt_row4, text="🎚 Audio quality (noise/loudness/silence)",
-                        variable=self._do_audio_quality_var).pack(side="left")
-        self._do_energy_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opt_row4, text="  ⚡ Energy profile",
-                        variable=self._do_energy_var).pack(side="left", padx=4)
-        self._do_visual_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opt_row4, text="  🖼 Visual issues",
-                        variable=self._do_visual_var).pack(side="left", padx=4)
-
-        opt_row5 = ttk.Frame(opt_frame)
-        opt_row5.pack(fill="x", padx=8, pady=(0, 6))
-        self._do_roast_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opt_row5, text="🔥 Peasant Roast (brutal content critique)",
-                        variable=self._do_roast_var).pack(side="left")
-        ttk.Label(opt_row5, text="   Roast model:",
-                  foreground="#6c7086").pack(side="left", padx=(10, 2))
-        self._roast_model_var = tk.StringVar(value="writer")
-        ttk.Combobox(opt_row5, textvariable=self._roast_model_var,
-                     values=["writer", "director", "content", "cutter",
-                             "algorithm", "coach", "sage"],
-                     state="readonly", width=10).pack(side="left")
-        ttk.Label(opt_row5, text="  Sage logic critique:",
-                  foreground="#6c7086").pack(side="left", padx=(10, 2))
-        self._do_sage_logic_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opt_row5, variable=self._do_sage_logic_var).pack(side="left")
-        ttk.Label(opt_row5,
-                  text="  (Sage adds a separate logic/clarity pass on top of the roast)",
-                  foreground="#45475a", font=("", 9)).pack(side="left", padx=4)
-
-        opt_row6 = ttk.Frame(opt_frame)
-        opt_row6.pack(fill="x", padx=8, pady=(2, 6))
-        self._do_algorithm_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opt_row6, text="📦 Algorithm (retention, hook, packaging)",
-                        variable=self._do_algorithm_var).pack(side="left")
-        self._do_coach_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opt_row6, text="  🎙 Coach (delivery, pacing, vocal habits)",
-                        variable=self._do_coach_var).pack(side="left", padx=12)
-        self._do_cutter_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(opt_row6, text="  ✂ Cutter (timecoded edit decisions)",
-                        variable=self._do_cutter_var).pack(side="left", padx=12)
-
-        # ── Action bar ────────────────────────────────────────────
-        act_frame = ttk.Frame(self.tab_video)
-        act_frame.pack(fill="x", padx=10, pady=(0, 6))
-        self._video_run_btn = ttk.Button(act_frame, text="▶  Analyse Video",
-                                          command=self._video_run)
-        self._video_run_btn.pack(side="left")
-        ttk.Button(act_frame, text="■  Stop",
-                   command=self._video_stop).pack(side="left", padx=6)
-        ttk.Button(act_frame, text="➕  Add to Queue",
-                   command=self._queue_add_current).pack(side="left", padx=6)
-        ttk.Button(act_frame, text="📂  Past Analyses",
-                   command=self._video_show_history).pack(side="left", padx=6)
-        ttk.Button(act_frame, text="Send transcript to Council",
-                   command=self._video_send_transcript).pack(side="left", padx=6)
-        ttk.Button(act_frame, text="📋  Edit Suggestions",
-                   command=self._video_show_edit_suggestions).pack(side="left", padx=6)
-        ttk.Button(act_frame, text="🔥  Show Roast",
-                   command=self._video_show_roast).pack(side="left", padx=6)
-        ttk.Button(act_frame, text="📦  Algorithm Notes",
-                   command=self._video_show_algorithm_notes).pack(side="left", padx=6)
-        ttk.Button(act_frame, text="🎙  Coach Notes",
-                   command=self._video_show_coach_notes).pack(side="left", padx=6)
-        ttk.Button(act_frame, text="✂  Cutter Notes",
-                   command=self._video_show_cutter_notes).pack(side="left", padx=6)
-        ttk.Button(act_frame, text="✂  Auto-Edit…",
-                   command=self._video_auto_edit_panel).pack(side="left", padx=6)
-
-        # ── Progress log ──────────────────────────────────────────
-        ttk.Label(self.tab_video, text="Progress:").pack(anchor="w", padx=10)
-        log_frame = ttk.Frame(self.tab_video)
-        log_frame.pack(fill="both", expand=True, padx=10, pady=(0, 4))
-        self._video_log = tk.Text(
-            log_frame, bg="#11111b", fg="#cdd6f4",
-            font=("Consolas", 9), state="disabled", relief="flat", wrap="word",
-        )
-        log_sb = ttk.Scrollbar(log_frame, command=self._video_log.yview)
-        self._video_log.configure(yscrollcommand=log_sb.set)
-        log_sb.pack(side="right", fill="y")
-        self._video_log.pack(fill="both", expand=True)
-        self._video_log.tag_config("ok",   foreground="#a6e3a1")
-        self._video_log.tag_config("err",  foreground="#f38ba8")
-        self._video_log.tag_config("warn", foreground="#fab387")
-        self._video_log.tag_config("hdr",  foreground="#89b4fa", font=("Consolas", 9, "bold"))
-
-        # Store last analysis result for transcript sending
-        self._last_video_analysis = None
-
-        # ── Video Queue ───────────────────────────────────────────
-        self._video_queue_items = []   # list of vp.VideoQueueItem
-        self._queue_running      = False
-        self._queue_paused       = False
-        self._queue_stop_flag    = False
-        self._queue_current_idx  = -1
-
-        q_frame = ttk.LabelFrame(self.tab_video, text="📋 Analysis Queue")
-        q_frame.pack(fill="x", padx=10, pady=(4, 6))
-
-        # ── Queue treeview ────────────────────────────────────────
-        q_tv_frame = ttk.Frame(q_frame)
-        q_tv_frame.pack(fill="x", padx=6, pady=(4, 0))
-
-        cols = ("#", "File", "Type", "Status", "Duration")
-        self._queue_tv = ttk.Treeview(
-            q_tv_frame, columns=cols, show="headings", height=6,
-            selectmode="browse",
-        )
-        self._queue_tv.heading("#",        text="#",       anchor="center")
-        self._queue_tv.heading("File",     text="File",    anchor="w")
-        self._queue_tv.heading("Type",     text="Type",    anchor="center")
-        self._queue_tv.heading("Status",   text="Status",  anchor="center")
-        self._queue_tv.heading("Duration", text="Duration",anchor="center")
-        self._queue_tv.column("#",        width=28,  stretch=False, anchor="center")
-        self._queue_tv.column("File",     width=320, stretch=True,  anchor="w")
-        self._queue_tv.column("Type",     width=80,  stretch=False, anchor="center")
-        self._queue_tv.column("Status",   width=110, stretch=False, anchor="center")
-        self._queue_tv.column("Duration", width=80,  stretch=False, anchor="center")
-
-        self._queue_tv.tag_configure("queued",     foreground="#a6adc8")
-        self._queue_tv.tag_configure("processing", foreground="#89b4fa",
-                                      font=("", 9, "bold"))
-        self._queue_tv.tag_configure("done",       foreground="#a6e3a1")
-        self._queue_tv.tag_configure("error",      foreground="#f38ba8")
-        self._queue_tv.tag_configure("skipped",    foreground="#585b70")
-
-        q_sb = ttk.Scrollbar(q_tv_frame, orient="vertical",
-                             command=self._queue_tv.yview)
-        self._queue_tv.configure(yscrollcommand=q_sb.set)
-        q_sb.pack(side="right", fill="y")
-        self._queue_tv.pack(fill="x", expand=True)
-        self._queue_tv.bind("<Double-Button-1>", self._queue_show_result)
-
-        # ── Queue add controls ─────────────────────────────────────
-        q_add_row = ttk.Frame(q_frame)
-        q_add_row.pack(fill="x", padx=6, pady=(4, 2))
-
-        ttk.Button(q_add_row, text="➕ Add Files…",
-                   command=self._queue_browse_add).pack(side="left")
-        ttk.Label(q_add_row, text="  Type:", foreground="#6c7086").pack(
-            side="left", padx=(10, 2))
-        self._queue_type_var = tk.StringVar(value="raw")
-        ttk.Combobox(q_add_row, textvariable=self._queue_type_var,
-                     values=["raw", "edited", "custom"],
-                     state="readonly", width=8).pack(side="left")
-        ttk.Label(
-            q_add_row,
-            text="  raw=full analysis+roast  ·  edited=QC+loudness only  ·  custom=use options panel",
-            foreground="#45475a", font=("", 9),
-        ).pack(side="left", padx=6)
-
-        # ── Queue management buttons ───────────────────────────────
-        q_mgmt_row = ttk.Frame(q_frame)
-        q_mgmt_row.pack(fill="x", padx=6, pady=(0, 2))
-        ttk.Button(q_mgmt_row, text="▲",        width=3,
-                   command=self._queue_move_up).pack(side="left")
-        ttk.Button(q_mgmt_row, text="▼",        width=3,
-                   command=self._queue_move_down).pack(side="left", padx=2)
-        ttk.Button(q_mgmt_row, text="🗑 Remove", command=self._queue_remove).pack(
-            side="left", padx=4)
-        ttk.Button(q_mgmt_row, text="Change Type",
-                   command=self._queue_change_type).pack(side="left", padx=4)
-        ttk.Button(q_mgmt_row, text="Clear Done",
-                   command=self._queue_clear_done).pack(side="left", padx=4)
-        ttk.Button(q_mgmt_row, text="Clear All",
-                   command=self._queue_clear_all).pack(side="left", padx=4)
-        ttk.Separator(q_mgmt_row, orient="vertical").pack(
-            side="left", fill="y", padx=8)
-        ttk.Button(q_mgmt_row, text="💾 Save Queue",
-                   command=self._queue_save).pack(side="left", padx=2)
-        ttk.Button(q_mgmt_row, text="📂 Load Queue",
-                   command=self._queue_load).pack(side="left", padx=2)
-
-        # ── Queue run controls ─────────────────────────────────────
-        q_run_row = ttk.Frame(q_frame)
-        q_run_row.pack(fill="x", padx=6, pady=(4, 6))
-        self._queue_run_btn = ttk.Button(q_run_row, text="▶  Run Queue",
-                                          command=self._queue_run)
-        self._queue_run_btn.pack(side="left")
-        self._queue_pause_btn = ttk.Button(q_run_row, text="⏸  Pause",
-                                            command=self._queue_pause,
-                                            state="disabled")
-        self._queue_pause_btn.pack(side="left", padx=6)
-        ttk.Button(q_run_row, text="■  Stop Queue",
-                   command=self._queue_stop).pack(side="left")
-
-        self._queue_status_var = tk.StringVar(value="Queue empty")
-        ttk.Label(q_run_row, textvariable=self._queue_status_var,
-                  foreground="#89b4fa").pack(side="left", padx=12)
-
-        # Auto-load persisted queue if it exists
-        self._queue_autoload()
-
-    # ---- Video tab methods ----
-
-    def _video_log_append(self, msg: str):
-        """Append a line to the video progress log (thread-safe via after)."""
-        def _do():
-            self._video_log.configure(state="normal")
-            tag = ("ok"   if "✓" in msg else
-                   "err"  if "✗" in msg else
-                   "warn" if "⚠" in msg else
-                   "hdr"  if msg.startswith("▶") else "")
-            self._video_log.insert("end", msg + "\n", tag)
-            self._video_log.see("end")
-            self._video_log.configure(state="disabled")
-        self.after(0, _do)
-
-    def _video_browse(self):
-        from tkinter import filedialog as _fd
-        path = _fd.askopenfilename(
-            title="Select video file",
-            filetypes=[
-                ("Video files", "*.mp4 *.mov *.avi *.mkv *.webm *.m4v *.flv *.wmv"),
-                ("All files", "*.*"),
-            ],
-        )
-        if path:
-            self._video_path_var.set(path)
-
-    def _video_detect_vision_models(self):
-        if not self._video_proc:
-            return
-        models = self._video_proc.available_vision_models()
-        if models:
-            self._vision_cb.configure(values=models)
-            self._vision_model_var.set(models[0])
-            self._video_log_append(f"✓ Found vision models: {', '.join(models)}")
-        else:
-            self._video_log_append(
-                "⚠ No vision models found. Install one with:\n  ollama pull llava:7b\n  ollama pull moondream"
-            )
-
-    def _video_run(self):
-        if not self._video_proc:
-            messagebox.showwarning("Video", "video_processor.py not available.", parent=self)
-            return
-        path = self._video_path_var.get().strip()
-        if not path:
-            messagebox.showwarning("Video", "Select a video file first.", parent=self)
-            return
-
-        # Clear log
-        self._video_log.configure(state="normal")
-        self._video_log.delete("1.0", "end")
-        self._video_log.configure(state="disabled")
-
-        self._video_cancelled = False
-        self._video_run_btn.configure(state="disabled")
-
-        # Resolve models
-        _roast_role      = self._roast_model_var.get() if hasattr(self, "_roast_model_var") else "writer"
-        personality      = (getattr(self, _roast_role, None)
-                            or getattr(self, "director", None)
-                            or getattr(self, "content", None)
-                            or getattr(self, "writer", None))
-        sage_model       = (getattr(self, "sage", None)
-                            if getattr(self, "_do_sage_logic_var", tk.BooleanVar()).get() else None)
-        algorithm_model  = (getattr(self, "algorithm", None)
-                            if getattr(self, "_do_algorithm_var", tk.BooleanVar(value=True)).get() else None)
-        coach_model      = (getattr(self, "coach", None)
-                            if getattr(self, "_do_coach_var", tk.BooleanVar(value=True)).get() else None)
-        cutter_model     = (getattr(self, "cutter", None)
-                            if getattr(self, "_do_cutter_var", tk.BooleanVar(value=True)).get() else None)
-        style_mgr        = getattr(self, "_content_style", None)
-
-        def worker():
-            try:
-                result = self._video_proc.process(
-                    path,
-                    whisper_model=self._whisper_model_var.get(),
-                    whisper_device=self._whisper_device_var.get(),
-                    do_frames=bool(self._do_frames_var.get()),
-                    frame_interval_s=int(self._frame_interval_var.get() or 10),
-                    max_frames=int(self._max_frames_var.get() or 20),
-                    vision_model=self._vision_model_var.get(),
-                    personality_model=personality if self._do_vibe_var.get() else None,
-                    content_style_manager=style_mgr if self._do_vibe_var.get() else None,
-                    sage_model=sage_model,
-                    algorithm_model=algorithm_model,
-                    coach_model=coach_model,
-                    cutter_model=cutter_model,
-                    do_audio_analysis=bool(getattr(self, "_do_audio_quality_var",
-                                                    tk.BooleanVar(value=True)).get()),
-                    do_energy_profile=bool(getattr(self, "_do_energy_var",
-                                                   tk.BooleanVar(value=True)).get()),
-                    do_visual_analysis=bool(getattr(self, "_do_visual_var",
-                                                    tk.BooleanVar(value=True)).get()),
-                    do_edit_suggestions=True,
-                    do_roast=bool(getattr(self, "_do_roast_var",
-                                          tk.BooleanVar(value=True)).get()),
-                    progress_cb=self._video_log_append,
-                    cancelled=lambda: self._video_cancelled,
-                )
-                self._last_video_analysis = result
-
-                # ── Build rich summary for Council transcript ──────────
-                summary_parts = [f"✓ Processed: {Path(path).name}"]
-
-                if result.transcript:
-                    summary_parts.append(
-                        f"📝 Transcript: {len(result.transcript)} segments")
-
-                if result.audio_quality:
-                    aq = result.audio_quality
-                    aq_flags = []
-                    if aq.has_clipping:            aq_flags.append("⚠ CLIPPING")
-                    if aq.is_too_quiet:            aq_flags.append("⚠ Too quiet")
-                    if aq.is_normalisation_needed: aq_flags.append("⚠ Needs loudness normalisation")
-                    if aq.longest_silence_s > 3:   aq_flags.append(
-                        f"⚠ Longest silence: {aq.longest_silence_s:.1f}s")
-                    flags_txt = "  " + "  ".join(aq_flags) if aq_flags else "  ✓ Clean"
-                    summary_parts.append(
-                        f"🎚 Audio: {aq.integrated_lufs:.1f} LUFS  "
-                        f"RMS {aq.rms_db:.1f} dB  "
-                        f"{aq.silence_count} silence gaps\n{flags_txt}")
-
-                if result.energy_profile:
-                    dead  = sum(1 for e in result.energy_profile if e.label == "dead")
-                    low   = sum(1 for e in result.energy_profile if e.label == "low")
-                    high  = sum(1 for e in result.energy_profile if e.label == "high")
-                    summary_parts.append(
-                        f"⚡ Energy: {high} high / {low} low / {dead} dead windows")
-                    dead_segs = [e for e in result.energy_profile if e.label == "dead"]
-                    if dead_segs:
-                        summary_parts.append(
-                            "  Dead air at: " +
-                            ", ".join(e.timecode() for e in dead_segs[:4]))
-
-                if result.visual_issues:
-                    by_type: dict = {}
-                    for vi in result.visual_issues:
-                        by_type[vi.issue_type] = by_type.get(vi.issue_type, 0) + 1
-                    vis_txt = "  ".join(f"{k}: {v}" for k, v in by_type.items())
-                    summary_parts.append(f"🖼 Visual issues: {vis_txt}")
-
-                if result.edit_suggestions:
-                    high_p = [s for s in result.edit_suggestions if s.priority == "high"]
-                    summary_parts.append(
-                        f"📋 Edit suggestions: {len(result.edit_suggestions)} total "
-                        f"({len(high_p)} high priority) — click 'Edit Suggestions' to view")
-
-                if result.roast:
-                    summary_parts.append(
-                        f"\n🔥 PEASANT GRADE: {result.roast.grade}\n"
-                        + result.roast.roast_text[:600]
-                        + ("\n..." if len(result.roast.roast_text) > 600 else "")
-                        + "\n\n(Full roast available via 'Show Roast' button)")
-
-                if result.vibe_summary:
-                    summary_parts.append(
-                        f"\n📊 VIBE:\n{result.vibe_summary}\n\n"
-                        f"PACING:\n{result.pacing_notes}")
-
-                _summary = "\n\n".join(summary_parts)
-                _name    = Path(path).name
-                self.after(0, lambda n=_name, s=_summary: self._append_transcript(
-                    "Video Analyser", s, "final"))
-
-            except Exception as e:
-                import traceback
-                self._video_log_append(f"✗ Fatal error: {e}")
-                self._video_log_append(traceback.format_exc()[:500])
-            finally:
-                self.after(0, lambda: self._video_run_btn.configure(state="normal"))
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _video_stop(self):
-        self._video_cancelled = True
-        self._video_log_append("⚠ Stop requested — will halt after current step completes.")
-
-    def _video_show_edit_suggestions(self):
-        """Popup showing all edit suggestions with FFmpeg snippets."""
-        a = self._last_video_analysis
-        if not a or not a.edit_suggestions:
-            messagebox.showinfo("Edit Suggestions",
-                                "No edit suggestions yet. Run an analysis first.",
-                                parent=self)
-            return
-
-        win = tk.Toplevel(self)
-        win.title("📋 Edit Suggestions")
-        win.configure(bg="#1e1e2e")
-        win.geometry("800x560")
-
-        ttk.Label(win,
-                  text=f"Edit suggestions for: {Path(a.video_path).name}",
-                  foreground="#89b4fa", font=("", 10, "bold")).pack(
-                      anchor="w", padx=12, pady=(8, 4))
-
-        fr = ttk.Frame(win)
-        fr.pack(fill="both", expand=True, padx=10, pady=4)
-        txt = tk.Text(fr, bg="#11111b", fg="#cdd6f4", font=("Consolas", 9),
-                      relief="flat", wrap="word", state="normal")
-        sb  = ttk.Scrollbar(fr, command=txt.yview)
-        txt.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        txt.pack(fill="both", expand=True)
-        txt.tag_config("high",   foreground="#f38ba8", font=("Consolas", 9, "bold"))
-        txt.tag_config("medium", foreground="#f9e2af", font=("Consolas", 9, "bold"))
-        txt.tag_config("low",    foreground="#a6e3a1", font=("Consolas", 9, "bold"))
-        txt.tag_config("cmd",    foreground="#89dceb", background="#181825",
-                                  font=("Consolas", 9))
-        txt.tag_config("header", foreground="#cba6f7", font=("Consolas", 10, "bold"))
-
-        # Audio quality summary
-        if a.audio_quality:
-            aq = a.audio_quality
-            txt.insert("end", "── AUDIO QUALITY REPORT ─────────────────────────\n",
-                       "header")
-            txt.insert("end",
-                       f"  RMS: {aq.rms_db:.1f} dB  |  Peak: {aq.peak_db:.1f} dB  |  "
-                       f"DR: {aq.dynamic_range_db:.1f} dB\n"
-                       f"  Integrated: {aq.integrated_lufs:.1f} LUFS  |  "
-                       f"LRA: {aq.loudness_range_lu:.1f} LU  |  "
-                       f"TruePeak: {aq.true_peak_dbtp:.1f} dBTP\n"
-                       f"  Clipping: {'⚠ YES' if aq.has_clipping else 'No'}  |  "
-                       f"Too quiet: {'⚠ YES' if aq.is_too_quiet else 'No'}  |  "
-                       f"Needs normalisation: {'⚠ YES' if aq.is_normalisation_needed else 'No'}\n"
-                       f"  Silence gaps: {aq.silence_count}  "
-                       f"({aq.total_silence_s:.1f}s total, "
-                       f"longest {aq.longest_silence_s:.1f}s)\n\n")
-
-        # Energy profile summary
-        if a.energy_profile:
-            txt.insert("end", "── ENERGY PROFILE ───────────────────────────────\n",
-                       "header")
-            for ep in a.energy_profile:
-                tag = ("high" if ep.label == "high" else
-                       "medium" if ep.label == "normal" else
-                       "low")
-                bar = "█" * int(ep.score * 20)
-                txt.insert("end",
-                           f"  {ep.timecode():22s}  {ep.label:6s}  "
-                           f"{ep.wps:.1f} wps  [{bar:<20}]\n", tag)
-                if ep.note:
-                    txt.insert("end", f"            {ep.note}\n")
-            txt.insert("end", "\n")
-
-        # Edit suggestions
-        txt.insert("end", "── EDIT SUGGESTIONS ─────────────────────────────\n",
-                   "header")
-        for i, s in enumerate(a.edit_suggestions, 1):
-            pri_tag = s.priority if s.priority in ("high", "medium", "low") else "low"
-            txt.insert("end",
-                       f"[{i}] [{s.priority.upper()}] {s.suggestion_type}\n",
-                       pri_tag)
-            if s.timecode:
-                txt.insert("end", f"    Timecode: {s.timecode}\n")
-            txt.insert("end", f"    {s.description}\n")
-            if s.ffmpeg_snippet:
-                txt.insert("end", f"    $ {s.ffmpeg_snippet}\n", "cmd")
-            txt.insert("end", "\n")
-
-        txt.configure(state="disabled")
-        ttk.Button(win, text="Close", command=win.destroy).pack(pady=6)
-
-    def _video_show_roast(self):
-        """Popup showing the full Peasant Roast critique."""
-        a = self._last_video_analysis
-        if not a or not a.roast:
-            messagebox.showinfo("Peasant Roast",
-                                "No roast available. Run analysis with Roast enabled.",
-                                parent=self)
-            return
-
-        roast = a.roast
-        win   = tk.Toplevel(self)
-        win.title("🔥 Peasant Roast")
-        win.configure(bg="#1e1e2e")
-        win.geometry("820x620")
-
-        grade_colour = {
-            "A": "#a6e3a1", "B": "#94e2d5",
-            "C": "#f9e2af", "D": "#fab387", "F": "#f38ba8",
-        }.get(roast.grade[:1], "#cdd6f4")
-
-        hdr = ttk.Frame(win)
-        hdr.pack(fill="x", padx=12, pady=(8, 4))
-        ttk.Label(hdr, text="🔥 Peasant Roast",
-                  foreground="#f38ba8", font=("", 12, "bold")).pack(side="left")
-        ttk.Label(hdr, text=f"  Grade: {roast.grade}",
-                  foreground=grade_colour,
-                  font=("", 14, "bold")).pack(side="left", padx=8)
-        ttk.Label(hdr, text=f"  {Path(a.video_path).name}",
-                  foreground="#6c7086").pack(side="left")
-        # Show detected content context
-        if getattr(a, "video_context", None) and a.video_context.content_type != "unknown":
-            vc = a.video_context
-            ctx_lbl = (f"  [{vc.content_type.upper()}]"
-                       + (f"  {vc.topic[:70]}" if vc.topic else "")
-                       + (f"  (detected by {vc.detected_by})" if vc.detected_by else ""))
-            ttk.Label(hdr, text=ctx_lbl,
-                      foreground="#89b4fa", font=("", 9)).pack(side="left", padx=6)
-
-
-        # Filler word summary
-        if roast.filler_word_hits:
-            top = list(roast.filler_word_hits.items())[:6]
-            filler_txt = "  Worst filler words: " + "  ".join(
-                f"'{w}' ×{n}" for w, n in top)
-            ttk.Label(win, text=filler_txt,
-                      foreground="#f9e2af", font=("", 9)).pack(
-                          anchor="w", padx=12)
-
-        fr = ttk.Frame(win)
-        fr.pack(fill="both", expand=True, padx=10, pady=4)
-        txt = tk.Text(fr, bg="#11111b", fg="#cdd6f4", font=("Consolas", 9),
-                      relief="flat", wrap="word", state="normal")
-        sb  = ttk.Scrollbar(fr, command=txt.yview)
-        txt.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        txt.pack(fill="both", expand=True)
-        txt.tag_config("section", foreground="#cba6f7",
-                        font=("Consolas", 10, "bold"))
-        txt.tag_config("pos",     foreground="#a6e3a1")
-        txt.tag_config("neg",     foreground="#f38ba8")
-        txt.tag_config("warn",    foreground="#f9e2af")
-
-        def _section(header, content, tag=""):
-            if not content:
-                return
-            txt.insert("end", f"\n── {header} ─────────────────\n", "section")
-            txt.insert("end", content + "\n", tag)
-
-        _section("THE ROAST", roast.roast_text, "neg")
-
-        if roast.boring_sections:
-            txt.insert("end", "\n── BORING PATCHES ──────────────────\n", "section")
-            for tc, reason in roast.boring_sections:
-                txt.insert("end", f"  {tc}  {reason}\n", "warn")
-
-        if roast.logic_issues:
-            txt.insert("end", "\n── LOGIC / CLARITY ISSUES ──────────\n", "section")
-            for issue in roast.logic_issues:
-                txt.insert("end", f"  • {issue}\n", "warn")
-
-        if roast.clarity_issues:
-            txt.insert("end", "\n── MUST FIX ─────────────────────────\n", "section")
-            for c in roast.clarity_issues:
-                txt.insert("end", f"  ✗ {c}\n", "neg")
-
-        if roast.positive_notes:
-            txt.insert("end", "\n── WHAT ACTUALLY WORKED ─────────────\n", "section")
-            for p in roast.positive_notes:
-                txt.insert("end", f"  ✓ {p}\n", "pos")
-
-        txt.configure(state="disabled")
-
-        bf = ttk.Frame(win)
-        bf.pack(fill="x", padx=10, pady=6)
-        ttk.Button(bf, text="Send roast to Council",
-                   command=lambda: (
-                       self._set_text(self.input,
-                                      f"Roast Grade: {roast.grade}\n\n"
-                                      + roast.roast_text),
-                       self.nb.select(self.tab_council),
-                       win.destroy()
-                   )).pack(side="left")
-        ttk.Button(bf, text="Close", command=win.destroy).pack(side="right")
-
-    def _video_show_algorithm_notes(self):
-        """Popup showing the Algorithm retention / packaging analysis."""
-        a = self._last_video_analysis
-        notes = getattr(a, "algorithm_notes", "") if a else ""
-        if not notes:
-            messagebox.showinfo("Algorithm Notes",
-                                "No Algorithm notes available.\n"
-                                "Run analysis with '📦 Algorithm' enabled.",
-                                parent=self)
-            return
-        self._video_text_popup("📦 Algorithm — Retention & Packaging", notes,
-                               Path(a.video_path).name)
-
-    def _video_show_coach_notes(self):
-        """Popup showing the Coach delivery / pacing analysis."""
-        a = self._last_video_analysis
-        notes = getattr(a, "coach_notes", "") if a else ""
-        if not notes:
-            messagebox.showinfo("Coach Notes",
-                                "No Coach notes available.\n"
-                                "Run analysis with '🎙 Coach' enabled.",
-                                parent=self)
-            return
-        self._video_text_popup("🎙 Coach — Delivery & Pacing", notes,
-                               Path(a.video_path).name)
-
-    def _video_show_cutter_notes(self):
-        """Popup showing the Cutter timecoded edit analysis."""
-        a = self._last_video_analysis
-        notes = getattr(a, "cutter_notes", "") if a else ""
-        if not notes:
-            messagebox.showinfo("Cutter Notes",
-                                "No Cutter notes available.\n"
-                                "Run analysis with '✂ Cutter' enabled.",
-                                parent=self)
-            return
-        self._video_text_popup("✂ Cutter — Edit Decisions", notes,
-                               Path(a.video_path).name)
-
-    def _video_auto_edit_panel(self):
-        """
-        Show the Auto-Edit panel — a checklist of actions parsed from Cutter notes
-        that the user can toggle and then apply via FFmpeg.
-        """
-        try:
-            from video_editor import (
-                parse_edit_actions, VideoEditor, ffmpeg_available, ffmpeg_version,
-                EditAction,
-            )
-            _VE_OK = True
-        except ImportError:
-            messagebox.showerror("Auto-Edit",
-                "video_editor.py not found.", parent=self)
-            return
-
-        a = self._last_video_analysis
-        if not a:
-            messagebox.showinfo("Auto-Edit",
-                "Run a video analysis first.", parent=self)
-            return
-
-        cutter_notes = getattr(a, "cutter_notes", "")
-        if not cutter_notes:
-            messagebox.showinfo("Auto-Edit",
-                "No Cutter notes found.\n"
-                "Run analysis with '✂ Cutter' enabled first.",
-                parent=self)
-            return
-
-        actions = parse_edit_actions(cutter_notes, a.duration_s)
-        if not actions:
-            messagebox.showinfo("Auto-Edit",
-                "Cutter didn't produce any machine-readable edit actions.\n"
-                "Check Cutter Notes for the prose analysis.",
-                parent=self)
-            return
-
-        # ── Build window ────────────────────────────────────────
-        win = tk.Toplevel(self)
-        win.title("✂ Auto-Edit — Apply Cutter Decisions")
-        win.geometry("800x580")
-        win.configure(bg="#1e1e2e")
-
-        ffmpeg_ok = ffmpeg_available()
-        ffmpeg_lbl = ffmpeg_version() if ffmpeg_ok else "FFmpeg not found — install: winget install Gyan.FFmpeg"
-
-        # Header
-        hdr = ttk.Label(win,
-            text=f"FFmpeg: {ffmpeg_lbl}" if ffmpeg_ok
-                 else f"⚠ {ffmpeg_lbl}",
-            foreground="#89b4fa" if ffmpeg_ok else "#f38ba8",
-            font=("", 9))
-        hdr.pack(fill="x", padx=10, pady=(8, 2))
-
-        ttk.Label(win,
-            text=f"Source: {Path(a.video_path).name}  "
-                 f"({int(a.duration_s//60)}m {int(a.duration_s%60)}s)",
-            foreground="#6c7086", font=("", 9)).pack(anchor="w", padx=10)
-
-        # Actions checklist
-        lf = ttk.LabelFrame(win, text=f"Proposed Edits ({len(actions)} action(s))")
-        lf.pack(fill="both", expand=True, padx=10, pady=(6, 4))
-
-        canvas = tk.Canvas(lf, bg="#181825", highlightthickness=0)
-        vsb    = ttk.Scrollbar(lf, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(fill="both", expand=True)
-        inner  = ttk.Frame(canvas)
-        canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>",
-                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-
-        check_vars = []
-        for action in actions:
-            var = tk.BooleanVar(value=action.enabled)
-            check_vars.append((action, var))
-            row = ttk.Frame(inner)
-            row.pack(fill="x", padx=6, pady=2)
-            ttk.Checkbutton(row, variable=var,
-                            text=f"{action.icon}  {action.label}").pack(
-                                side="left", anchor="w")
-
-        # Output path row
-        out_frame = ttk.Frame(win)
-        out_frame.pack(fill="x", padx=10, pady=(0, 4))
-        ttk.Label(out_frame, text="Output:").pack(side="left")
-        default_out = str(
-            Path(a.video_path).with_stem(
-                Path(a.video_path).stem + "_edited"))
-        out_var = tk.StringVar(value=default_out)
-        ttk.Entry(out_frame, textvariable=out_var,
-                  width=55).pack(side="left", padx=6, fill="x", expand=True)
-        def _browse_out():
-            import tkinter.filedialog as _fd
-            p = _fd.asksaveasfilename(
-                title="Save edited video as",
-                initialfile=Path(default_out).name,
-                filetypes=[("MP4", "*.mp4"), ("All", "*.*")])
-            if p:
-                out_var.set(p)
-        ttk.Button(out_frame, text="…", width=3,
-                   command=_browse_out).pack(side="left")
-
-        # Progress log
-        log_frame = ttk.Frame(win)
-        log_frame.pack(fill="x", padx=10, pady=(0, 4))
-        edit_log = tk.Text(log_frame, height=5, state="disabled",
-                           bg="#181825", fg="#cdd6f4",
-                           font=("Consolas", 8), relief="flat")
-        edit_log.pack(fill="x")
-
-        def _log(msg: str):
-            def _do():
-                edit_log.configure(state="normal")
-                edit_log.insert("end", msg + "\n")
-                edit_log.see("end")
-                edit_log.configure(state="disabled")
-            win.after(0, _do)
-
-        # Apply button
-        btn_row = ttk.Frame(win)
-        btn_row.pack(fill="x", padx=10, pady=(0, 8))
-        apply_btn = ttk.Button(btn_row, text="✂ Apply Selected Edits")
-        apply_btn.pack(side="left")
-        ttk.Button(btn_row, text="Close",
-                   command=win.destroy).pack(side="right")
-
-        def _apply():
-            if not ffmpeg_ok:
-                messagebox.showerror("FFmpeg Required",
-                    "Install FFmpeg first:\n  winget install Gyan.FFmpeg\n\n"
-                    "Then restart the council.", parent=win)
-                return
-            # Apply enable state from checkboxes
-            for action, var in check_vars:
-                action.enabled = var.get()
-            enabled = [a for a, v in check_vars if v.get()]
-            if not enabled:
-                messagebox.showinfo("Auto-Edit",
-                    "No actions selected.", parent=win)
-                return
-            out_path = out_var.get().strip()
-            if not out_path:
-                messagebox.showinfo("Auto-Edit",
-                    "Set an output file path.", parent=win)
-                return
-            apply_btn.configure(state="disabled", text="Editing…")
-            _log(f"Starting edit: {len(enabled)} action(s) → {Path(out_path).name}")
-
-            def _run():
-                editor = VideoEditor()
-                ok = editor.apply(
-                    input_path  = a.video_path,
-                    actions     = [act for act, var in check_vars if var.get()],
-                    output_path = out_path,
-                    progress_cb = _log,
-                )
-                win.after(0, lambda: _on_done(ok, out_path))
-
-            threading.Thread(target=_run, daemon=True).start()
-
-        def _on_done(ok: bool, out_path: str):
-            apply_btn.configure(state="normal", text="✂ Apply Selected Edits")
-            if ok:
-                _log(f"✓ Done. Saved to: {out_path}")
-                messagebox.showinfo("Auto-Edit Complete",
-                    f"Edited video saved:\n{out_path}", parent=win)
-            else:
-                _log("✗ Edit failed — see log above.")
-
-        apply_btn.configure(command=_apply)
-
-    def _video_text_popup(self, title: str, text: str, subtitle: str = ""):
-        """Generic read-only text popup for algorithm/coach notes."""
-        win = tk.Toplevel(self)
-        win.title(title)
-        win.configure(bg="#1e1e2e")
-        win.geometry("860x600")
-
-        hdr = ttk.Frame(win)
-        hdr.pack(fill="x", padx=12, pady=(8, 4))
-        ttk.Label(hdr, text=title, foreground="#89b4fa",
-                  font=("", 12, "bold")).pack(side="left")
-        if subtitle:
-            ttk.Label(hdr, text=f"  {subtitle}",
-                      foreground="#6c7086").pack(side="left")
-
-        txt_frame = ttk.Frame(win)
-        txt_frame.pack(fill="both", expand=True, padx=10, pady=4)
-        txt = self._make_text(txt_frame, wrap="word", state="normal")
-        sb  = ttk.Scrollbar(txt_frame, command=txt.yview)
-        txt.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        txt.pack(fill="both", expand=True)
-
-        # Colour-code key section headers
-        txt.tag_config("hdr",  foreground="#89b4fa", font=("Consolas", 9, "bold"))
-        txt.tag_config("pos",  foreground="#a6e3a1")
-        txt.tag_config("warn", foreground="#fab387")
-        txt.tag_config("neg",  foreground="#f38ba8")
-
-        for line in text.splitlines():
-            upper = line.upper().strip()
-            if any(upper.startswith(h) for h in (
-                "HOOK", "RETENTION", "PACING", "ENERGY", "CLARITY",
-                "CONFIDENCE", "WORST", "DRILL", "TITLE", "DESCRIPTION",
-                "OPEN LOOP", "PATTERN", "ALGORITHM", "DELIVERY GRADE",
-                "WHAT'S WORKING",
-            )):
-                txt.insert("end", line + "\n", "hdr")
-            elif "✓" in line or "WORKING" in line.upper():
-                txt.insert("end", line + "\n", "pos")
-            elif any(w in line.upper() for w in ("WEAK", "MISSING", "FAILS", "BAD", "WORST")):
-                txt.insert("end", line + "\n", "neg")
-            elif line.startswith("-") or line.startswith("•"):
-                txt.insert("end", line + "\n", "warn")
-            else:
-                txt.insert("end", line + "\n")
-
-        txt.configure(state="disabled")
-
-        bf = ttk.Frame(win)
-        bf.pack(fill="x", padx=10, pady=6)
-        ttk.Button(bf, text="Send to Council",
-                   command=lambda: (
-                       self._set_text(self.input, text),
-                       self.nb.select(self.tab_council),
-                       win.destroy(),
-                   )).pack(side="left")
-        ttk.Button(bf, text="Close", command=win.destroy).pack(side="right")
-
-    # =========================================================
-    # Video Queue — management helpers
-    # =========================================================
-
-    def _queue_file(self) -> Path:
-        return VAULT_DIR / "video_queue.json"
-
-    def _queue_tv_refresh(self):
-        """Redraw the entire treeview from self._video_queue_items."""
-        self._queue_tv.delete(*self._queue_tv.get_children())
-        for i, item in enumerate(self._video_queue_items):
-            dur = (f"{int(item.duration_s//60)}:{int(item.duration_s%60):02d}"
-                   if item.duration_s > 0 else "—")
-            self._queue_tv.insert(
-                "", "end",
-                iid=str(i),
-                values=(i + 1, item.label, item.type_icon,
-                        f"{item.status_icon} {item.status}", dur),
-                tags=(item.status,),
-            )
-        n      = len(self._video_queue_items)
-        done   = sum(1 for x in self._video_queue_items if x.status == "done")
-        errors = sum(1 for x in self._video_queue_items if x.status == "error")
-        self._queue_status_var.set(
-            f"{n} items  ·  {done} done  ·  {errors} errors"
-            if n else "Queue empty")
-
-    def _queue_selected_idx(self) -> Optional[int]:
-        sel = self._queue_tv.selection()
-        return int(sel[0]) if sel else None
-
-    def _queue_add_current(self):
-        """Add the currently selected file-picker file to the queue."""
-        path = self._video_path_var.get().strip()
-        if not path:
-            messagebox.showwarning("Queue", "Select a video file first.", parent=self)
-            return
-        self._queue_enqueue(Path(path), self._queue_type_var.get())
-
-    def _queue_browse_add(self):
-        """Browse and add one or more files directly to the queue."""
-        from tkinter import filedialog as _fd
-        paths = _fd.askopenfilenames(
-            title="Add videos to queue",
-            filetypes=[
-                ("Video files", "*.mp4 *.mov *.avi *.mkv *.webm *.m4v *.flv *.wmv"),
-                ("All files", "*.*"),
-            ],
-        )
-        for p in paths:
-            self._queue_enqueue(Path(p), self._queue_type_var.get())
-
-    def _queue_enqueue(self, path: Path, video_type: str = "raw"):
-        """Append a single path to the queue."""
-        if not _VIDEO_OK:
-            return
-        item = vp.VideoQueueItem(path=str(path), video_type=video_type)
-        self._video_queue_items.append(item)
-        self._queue_tv_refresh()
-        self._queue_save()
-        self._video_log_append(f"  ➕ Queued [{item.type_icon}]: {item.label}")
-
-    def _queue_remove(self):
-        idx = self._queue_selected_idx()
-        if idx is None:
-            return
-        item = self._video_queue_items[idx]
-        if item.status == "processing":
-            messagebox.showwarning("Queue",
-                                    "Cannot remove an item currently being processed.",
-                                    parent=self)
-            return
-        self._video_queue_items.pop(idx)
-        self._queue_tv_refresh()
-        self._queue_save()
-
-    def _queue_move_up(self):
-        idx = self._queue_selected_idx()
-        if idx is None or idx == 0:
-            return
-        q = self._video_queue_items
-        q[idx - 1], q[idx] = q[idx], q[idx - 1]
-        self._queue_tv_refresh()
-        self._queue_tv.selection_set(str(idx - 1))
-        self._queue_save()
-
-    def _queue_move_down(self):
-        idx = self._queue_selected_idx()
-        if idx is None or idx >= len(self._video_queue_items) - 1:
-            return
-        q = self._video_queue_items
-        q[idx + 1], q[idx] = q[idx], q[idx + 1]
-        self._queue_tv_refresh()
-        self._queue_tv.selection_set(str(idx + 1))
-        self._queue_save()
-
-    def _queue_change_type(self):
-        """Change the video_type of the selected item."""
-        idx = self._queue_selected_idx()
-        if idx is None:
-            return
-        item = self._video_queue_items[idx]
-        if item.status == "processing":
-            return
-        new_type = self._queue_type_var.get()
-        item.video_type = new_type
-        self._queue_tv_refresh()
-        self._queue_save()
-
-    def _queue_clear_done(self):
-        self._video_queue_items = [
-            x for x in self._video_queue_items
-            if x.status not in ("done", "error", "skipped")
-        ]
-        self._queue_tv_refresh()
-        self._queue_save()
-
-    def _queue_clear_all(self):
-        if self._queue_running:
-            messagebox.showwarning("Queue",
-                                    "Stop the queue first before clearing.",
-                                    parent=self)
-            return
-        self._video_queue_items.clear()
-        self._queue_tv_refresh()
-        self._queue_save()
-
-    # =========================================================
-    # Video Queue — persistence
-    # =========================================================
-
-    def _queue_save(self):
-        """Save the current queue to vault/video_queue.json."""
-        if not _VIDEO_OK:
-            return
-        try:
-            data = [item.to_dict() for item in self._video_queue_items]
-            self._queue_file().write_text(
-                _json.dumps(data, indent=2, ensure_ascii=False),
-                encoding="utf-8")
-        except Exception as e:
-            pass  # non-fatal
-
-    def _queue_load(self):
-        """Load queue from vault/video_queue.json (prompts if non-empty)."""
-        if not _VIDEO_OK:
-            return
-        qf = self._queue_file()
-        if not qf.exists():
-            messagebox.showinfo("Queue", "No saved queue found.", parent=self)
-            return
-        if self._video_queue_items:
-            if not messagebox.askyesno(
-                    "Queue", "Replace current queue with saved queue?",
-                    parent=self):
-                return
-        try:
-            data = _json.loads(qf.read_text(encoding="utf-8"))
-            self._video_queue_items = [vp.VideoQueueItem.from_dict(d) for d in data]
-            # Reset in-progress items back to queued
-            for item in self._video_queue_items:
-                if item.status == "processing":
-                    item.status = "queued"
-            self._queue_tv_refresh()
-            self._video_log_append(
-                f"✓ Loaded queue: {len(self._video_queue_items)} items")
-        except Exception as e:
-            messagebox.showerror("Queue", f"Load error: {e}", parent=self)
-
-    def _queue_autoload(self):
-        """Silently load queue on startup if a saved file exists."""
-        if not _VIDEO_OK:
-            return
-        try:
-            qf = self._queue_file()
-            if qf.exists():
-                data = _json.loads(qf.read_text(encoding="utf-8"))
-                items = [vp.VideoQueueItem.from_dict(d) for d in data]
-                for item in items:
-                    if item.status == "processing":
-                        item.status = "queued"
-                self._video_queue_items = items
-                self._queue_tv_refresh()
-        except Exception:
-            pass
-
-    # =========================================================
-    # Video Queue — runner
-    # =========================================================
-
-    def _queue_run(self):
-        """Start or resume processing the queue."""
-        if not _VIDEO_OK:
-            return
-        pending = [x for x in self._video_queue_items
-                   if x.status == "queued"]
-        if not pending:
-            messagebox.showinfo("Queue",
-                                 "No queued items to process.",
-                                 parent=self)
-            return
-        if self._queue_running:
-            return
-
-        self._queue_running     = True
-        self._queue_paused      = False
-        self._queue_stop_flag   = False
-        self._queue_run_btn.configure(state="disabled")
-        self._queue_pause_btn.configure(state="normal")
-        self._video_log_append(
-            f"▶ Queue started — {len(pending)} item(s) to process")
-
-        def _runner():
-            for idx, item in enumerate(self._video_queue_items):
-                if item.status != "queued":
-                    continue
-                if self._queue_stop_flag:
-                    break
-
-                # Wait if paused
-                while self._queue_paused and not self._queue_stop_flag:
-                    import time as _t; _t.sleep(0.5)
-                if self._queue_stop_flag:
-                    break
-
-                self._queue_current_idx = idx
-                item.status = "processing"
-                self.after(0, self._queue_tv_refresh)
-                self._video_log_append(
-                    f"\n▶▶ Queue [{idx+1}/{len(self._video_queue_items)}]: "
-                    f"{item.label}  [{item.type_icon}]")
-
-                try:
-                    flags = self._queue_flags_for(item)
-                    result = self._video_proc.process(
-                        item.path,
-                        **flags,
-                        progress_cb=self._video_log_append,
-                        cancelled=lambda: self._queue_stop_flag,
-                    )
-                    self._last_video_analysis = result
-                    item.status     = "done"
-                    item.duration_s = result.duration_s
-                    # Find the saved JSON path
-                    saved = self._video_proc.list_analyses()
-                    if saved:
-                        item.result_path = str(saved[0])
-                    self._video_log_append(
-                        f"  ✓ Queue item done: {item.label}"
-                        + (f"  Grade: {result.roast.grade}"
-                           if result.roast else ""))
-                    # Post rich summary if roast available
-                    if result.vibe_summary or result.roast:
-                        self._queue_post_summary(item, result)
-
-                except Exception as e:
-                    import traceback as _tb
-                    item.status   = "error"
-                    item.error_msg= str(e)
-                    self._video_log_append(f"  ✗ Queue error [{item.label}]: {e}")
-                    self._video_log_append(_tb.format_exc()[:300])
-
-                self.after(0, self._queue_tv_refresh)
-                self._queue_save()
-
-            # Runner finished
-            self._queue_running   = False
-            self._queue_stop_flag = False
-            done   = sum(1 for x in self._video_queue_items if x.status == "done")
-            errors = sum(1 for x in self._video_queue_items if x.status == "error")
-            self._video_log_append(
-                f"\n✓ Queue finished — {done} done, {errors} errors")
-            self.after(0, lambda: (
-                self._queue_run_btn.configure(state="normal"),
-                self._queue_pause_btn.configure(state="disabled"),
-                self._queue_tv_refresh(),
-            ))
-
-        threading.Thread(target=_runner, daemon=True).start()
-
-    def _queue_pause(self):
-        if not self._queue_running:
-            return
-        self._queue_paused = not self._queue_paused
-        lbl = "▶  Resume" if self._queue_paused else "⏸  Pause"
-        self._queue_pause_btn.configure(text=lbl)
-        self._video_log_append(
-            "⏸ Queue paused — will stop after current item finishes."
-            if self._queue_paused else
-            "▶  Queue resumed.")
-
-    def _queue_stop(self):
-        if not self._queue_running:
-            return
-        self._queue_stop_flag = True
-        self._queue_paused    = False
-        self._video_log_append("■ Queue stop requested — finishing current item…")
-
-    def _queue_flags_for(self, item) -> dict:
-        """
-        Return VideoProcessor.process() keyword arguments for this item.
-        raw    → full analysis preset
-        edited → QC-only preset
-        custom → mirrors the GUI options panel
-        """
-        if not _VIDEO_OK:
-            return {}
-        preset = vp.VIDEO_TYPE_PRESETS.get(item.video_type,
-                                            vp.VIDEO_TYPE_PRESETS["raw"]).copy()
-
-        # Resolve models
-        _roast_role  = getattr(self, "_roast_model_var",
-                                tk.StringVar(value="writer")).get()
-        personality  = (getattr(self, _roast_role, None)
-                        or getattr(self, "director", None)
-                        or getattr(self, "writer", None))
-        sage_m       = (getattr(self, "sage", None)
-                        if getattr(self, "_do_sage_logic_var",
-                                   tk.BooleanVar()).get() else None)
-        style_mgr    = getattr(self, "_content_style", None)
-
-        base = {
-            "whisper_model":       self._whisper_model_var.get(),
-            "whisper_device":      self._whisper_device_var.get(),
-            "vision_model":        self._vision_model_var.get(),
-            "personality_model":   personality,
-            "content_style_manager": style_mgr,
-            "sage_model":          sage_m,
-            "algorithm_model":     getattr(self, "algorithm", None),
-            "coach_model":         getattr(self, "coach", None),
-        }
-
-        if item.video_type == "custom":
-            # Override with current GUI option panel values
-            base.update({
-                "do_frames":           bool(self._do_frames_var.get()),
-                "frame_interval_s":    int(self._frame_interval_var.get() or 10),
-                "max_frames":          int(self._max_frames_var.get() or 20),
-                "do_audio_analysis":   bool(getattr(self, "_do_audio_quality_var",
-                                                     tk.BooleanVar(value=True)).get()),
-                "do_energy_profile":   bool(getattr(self, "_do_energy_var",
-                                                     tk.BooleanVar(value=True)).get()),
-                "do_visual_analysis":  bool(getattr(self, "_do_visual_var",
-                                                     tk.BooleanVar(value=True)).get()),
-                "do_edit_suggestions": True,
-                "do_roast":            bool(getattr(self, "_do_roast_var",
-                                                     tk.BooleanVar(value=True)).get()),
-            })
-        else:
-            base.update(preset)
-            # For edited videos: still run Algorithm (packaging matters)
-            # but disable Coach (delivery coaching is pre-edit only) and roast
-            if item.video_type == "edited":
-                base["do_roast"]           = False
-                base["do_edit_suggestions"]= False
-                base["coach_model"]        = None   # delivery coaching = pre-edit only
-
-        return base
-
-    def _queue_post_summary(self, item, result):
-        """Post a summary of a completed queue item to the Council transcript."""
-        parts = [f"✓ Queue: {item.label}  [{item.type_icon}]"]
-        if result.roast:
-            parts.append(f"🔥 Grade: {result.roast.grade}")
-            fillers = sum(result.roast.filler_word_hits.values())
-            if fillers:
-                parts.append(f"   Filler words: {fillers}")
-            if result.roast.boring_sections:
-                parts.append(
-                    f"   Boring patches: {len(result.roast.boring_sections)}")
-        if result.edit_suggestions:
-            high = [s for s in result.edit_suggestions if s.priority == "high"]
-            parts.append(
-                f"📋 {len(result.edit_suggestions)} edit suggestions "
-                f"({len(high)} high priority)")
-        if result.audio_quality and result.audio_quality.has_clipping:
-            parts.append("⚠ CLIPPING detected in audio")
-        if getattr(result, "algorithm_notes", "") and result.algorithm_notes:
-            # Pull just the hook verdict line for the summary
-            import re as _re2
-            hm = _re2.search(r"HOOK VERDICT:\s*(.+)", result.algorithm_notes, _re2.IGNORECASE)
-            if hm:
-                parts.append(f"📦 Algorithm hook: {hm.group(1).strip()[:80]}")
-        if getattr(result, "coach_notes", "") and result.coach_notes:
-            import re as _re3
-            gm = _re3.search(r"DELIVERY GRADE:\s*([A-F][+-]?)", result.coach_notes, _re3.IGNORECASE)
-            if gm:
-                parts.append(f"🎙 Coach delivery grade: {gm.group(1)}")
-        if result.vibe_summary:
-            parts.append(f"\n{result.vibe_summary[:200]}")
-        _summary = "\n".join(parts)
-        self.after(0, lambda s=_summary: self._append_transcript(
-            "Video Queue", s, "final"))
-
-    def _queue_show_result(self, event=None):
-        """Double-click: show edit suggestions / roast for the selected queue item."""
-        idx = self._queue_selected_idx()
-        if idx is None:
-            return
-        item = self._video_queue_items[idx]
-        if item.status == "error":
-            messagebox.showerror("Queue Error",
-                                  f"{item.label}\n\n{item.error_msg}",
-                                  parent=self)
-            return
-        if item.status != "done":
-            messagebox.showinfo("Queue",
-                                 f"{item.label} — status: {item.status}",
-                                 parent=self)
-            return
-        # Try to load the saved analysis
-        if item.result_path and Path(item.result_path).exists() and self._video_proc:
-            a = self._video_proc.load_analysis(Path(item.result_path))
-            if a:
-                self._last_video_analysis = a
-                self._video_show_edit_suggestions()
-                return
-        messagebox.showinfo("Queue",
-                             f"{item.label} — done but result file not found.\n"
-                             f"Expected: {item.result_path}",
-                             parent=self)
-
-    def _video_send_transcript(self):
-        """Send the last transcript to the Council input."""
-        if not self._last_video_analysis or not self._last_video_analysis.transcript:
-            messagebox.showinfo("Video", "No transcript available. Run analysis first.")
-            return
-        txt = self._last_video_analysis.full_transcript_text
-        # Truncate to avoid overwhelming the input
-        if len(txt) > 3000:
-            txt = txt[:3000] + "\n\n[... transcript truncated \u2014 full version in vault ...]"
-        self._set_text(self.input, txt)
-        self.nb.select(self.tab_council)
-
-    def _video_show_history(self):
-        if not self._video_proc:
-            return
-        analyses = self._video_proc.list_analyses()
-        if not analyses:
-            messagebox.showinfo("Video", "No past analyses found.")
-            return
-
-        win = tk.Toplevel(self)
-        win.title("Past Video Analyses")
-        win.configure(bg="#1e1e2e")
-        win.geometry("680x480")
-
-        ttk.Label(win, text="Past analyses — double-click to view",
-                  foreground="#6c7086").pack(anchor="w", padx=12, pady=(8, 4))
-
-        lb_frame = ttk.Frame(win)
-        lb_frame.pack(fill="both", expand=True, padx=12, pady=(0, 4))
-        lb = tk.Listbox(lb_frame, bg="#11111b", fg="#cdd6f4",
-                        font=("Consolas", 9), selectmode="single")
-        lb_sb = ttk.Scrollbar(lb_frame, command=lb.yview)
-        lb.configure(yscrollcommand=lb_sb.set)
-        lb_sb.pack(side="right", fill="y")
-        lb.pack(fill="both", expand=True)
-
-        for p in analyses:
-            lb.insert("end", p.name)
-
-        detail = tk.Text(win, height=10, bg="#11111b", fg="#cdd6f4",
-                         font=("Consolas", 9), state="disabled", relief="flat", wrap="word")
-        detail.pack(fill="x", padx=12, pady=(0, 4))
-
-        def _on_select(event=None):
-            sel = lb.curselection()
-            if not sel:
-                return
-            p = analyses[sel[0]]
-            a = self._video_proc.load_analysis(p)
-            if not a:
-                return
-            detail.configure(state="normal")
-            detail.delete("1.0", "end")
-            detail.insert("end", "File: " + Path(a.video_path).name + "\n")
-            detail.insert("end", "Processed: " + a.processed_at + "\n")
-            detail.insert("end", "Segments: " + str(len(a.transcript)) + "  Frames: " + str(len(a.frame_descriptions)) + "\n")
-            if getattr(a, "audio_quality", None):
-                aq = a.audio_quality
-                detail.insert("end",
-                    f"Audio: {aq.integrated_lufs:.1f} LUFS  RMS {aq.rms_db:.1f} dB"
-                    + ("  ⚠ CLIPPING" if aq.has_clipping else "")
-                    + ("  ⚠ Too quiet" if aq.is_too_quiet else "")
-                    + "\n")
-            if getattr(a, "roast", None):
-                detail.insert("end", f"Roast grade: {a.roast.grade}  "
-                              f"Filler words: {sum(a.roast.filler_word_hits.values())}\n")
-            if getattr(a, "edit_suggestions", None):
-                detail.insert("end", f"Edit suggestions: {len(a.edit_suggestions)}\n")
-            detail.insert("end", "\n")
-            if a.vibe_summary:
-                detail.insert("end", "VIBE:\n" + a.vibe_summary + "\n\n")
-            if a.pacing_notes:
-                detail.insert("end", "PACING:\n" + a.pacing_notes + "\n")
-            if getattr(a, "roast", None) and a.roast.roast_text:
-                detail.insert("end", f"\nROAST EXCERPT:\n{a.roast.roast_text[:400]}...\n")
-            detail.configure(state="disabled")
-
-        def _load_selected():
-            sel = lb.curselection()
-            if not sel:
-                return
-            p = analyses[sel[0]]
-            a = self._video_proc.load_analysis(p)
-            if a:
-                self._last_video_analysis = a
-                self._video_log_append(f"✓ Loaded analysis: {p.name}")
-                win.destroy()
-
-        lb.bind("<<ListboxSelect>>", _on_select)
-        lb.bind("<Double-1>", lambda e: _load_selected())
-
-        bf = ttk.Frame(win)
-        bf.pack(fill="x", padx=12, pady=(0, 8))
-        ttk.Button(bf, text="Load Selected", command=_load_selected).pack(side="left")
-        ttk.Button(bf, text="Close", command=win.destroy).pack(side="right")
-
-    # ============================================================
-    # PPTX / Presentation Script tab
-    # ============================================================
-
-    def _build_pptx_tab(self):
-        self.tab_pptx = ttk.Frame(self.nb)
-        self.nb.add(self.tab_pptx, text="📊 Script")
-
-        # ── Header ──────────────────────────────────────────────
-        hdr = ttk.Frame(self.tab_pptx)
-        hdr.pack(fill="x", padx=10, pady=(8, 4))
-        ttk.Label(hdr, text="Presentation Script Generator",
-                  foreground="#89b4fa", font=("", 11, "bold")).pack(side="left")
-        ttk.Label(hdr, text="  Feed a PDF of your slides — get a full spoken script",
-                  foreground="#6c7086").pack(side="left")
-
-        # ── File picker ─────────────────────────────────────────
-        ff = ttk.LabelFrame(self.tab_pptx, text="Presentation PDF")
-        ff.pack(fill="x", padx=10, pady=(0, 6))
-        frow = ttk.Frame(ff)
-        frow.pack(fill="x", padx=8, pady=6)
-        self._pptx_path_var = tk.StringVar()
-        ttk.Entry(frow, textvariable=self._pptx_path_var,
-                  width=60).pack(side="left", fill="x", expand=True)
-        ttk.Button(frow, text="Browse…",
-                   command=self._pptx_browse).pack(side="left", padx=(6, 0))
-        ttk.Button(frow, text="🔍 Preview Slides",
-                   command=self._pptx_preview).pack(side="left", padx=(6, 0))
-
-        # ── Options ─────────────────────────────────────────────
-        opt = ttk.LabelFrame(self.tab_pptx, text="Script Options")
-        opt.pack(fill="x", padx=10, pady=(0, 6))
-
-        row1 = ttk.Frame(opt)
-        row1.pack(fill="x", padx=8, pady=(6, 2))
-        ttk.Label(row1, text="Tone:").pack(side="left")
-        self._pptx_tone_var = tk.StringVar(value="conversational")
-        ttk.Combobox(row1, textvariable=self._pptx_tone_var,
-                     values=["conversational", "comedic / dry", "mock-academic",
-                             "hype / energetic", "formal / professional",
-                             "storytelling / narrative"],
-                     state="readonly", width=22).pack(side="left", padx=6)
-
-        ttk.Label(row1, text="  Writer:").pack(side="left", padx=(12, 0))
-        self._pptx_writer_var = tk.StringVar(value="writer")
-        ttk.Combobox(row1, textvariable=self._pptx_writer_var,
-                     values=["writer", "director", "content", "pitcher", "sage"],
-                     state="readonly", width=12).pack(side="left", padx=6)
-
-        ttk.Label(row1, text="  Use my style:").pack(side="left", padx=(12, 0))
-        self._pptx_use_style_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row1, variable=self._pptx_use_style_var).pack(side="left")
-        ttk.Label(row1, text="(Director's content style profile)",
-                  foreground="#6c7086", font=("", 8)).pack(side="left")
-
-        row2 = ttk.Frame(opt)
-        row2.pack(fill="x", padx=8, pady=(2, 6))
-        ttk.Label(row2, text="Extra notes for the model:").pack(side="left")
-        self._pptx_notes_var = tk.StringVar()
-        ttk.Entry(row2, textvariable=self._pptx_notes_var,
-                  width=60).pack(side="left", padx=6, fill="x", expand=True)
-
-        # ── Action bar ─────────────────────────────────────────
-        act = ttk.Frame(self.tab_pptx)
-        act.pack(fill="x", padx=10, pady=(0, 6))
-        ttk.Button(act, text="✍ Generate Script",
-                   command=self._pptx_generate).pack(side="left")
-        ttk.Button(act, text="📋 Copy Script",
-                   command=self._pptx_copy).pack(side="left", padx=6)
-        ttk.Button(act, text="💾 Save Script…",
-                   command=self._pptx_save).pack(side="left")
-        self._pptx_status_var = tk.StringVar(value="")
-        ttk.Label(act, textvariable=self._pptx_status_var,
-                  foreground="#89b4fa").pack(side="left", padx=12)
-
-        # ── Slide preview + Script panes ────────────────────────
-        panes = ttk.PanedWindow(self.tab_pptx, orient="horizontal")
-        panes.pack(fill="both", expand=True, padx=10, pady=(0, 8))
-
-        # Left — slide content preview
-        lf = ttk.LabelFrame(panes, text="Slide Content (extracted)")
-        self._pptx_preview_text = self._make_text(lf, width=36, height=20)
-        self._pptx_preview_text.pack(fill="both", expand=True, padx=4, pady=4)
-        panes.add(lf, weight=1)
-
-        # Right — generated script
-        rf = ttk.LabelFrame(panes, text="Generated Script")
-        self._pptx_script_text = self._make_text(rf, width=60, height=20)
-        self._pptx_script_text.pack(fill="both", expand=True, padx=4, pady=4)
-        panes.add(rf, weight=2)
-
-    # ── Helpers ────────────────────────────────────────────────
-
-    def _pptx_browse(self):
-        import tkinter.filedialog as _fd
-        path = _fd.askopenfilename(
-            title="Open Presentation PDF",
-            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")])
-        if path:
-            self._pptx_path_var.set(path)
-
-    def _pptx_extract_slides(self, pdf_path: str) -> list:
-        """
-        Extract text from each page of a PDF.
-        Returns a list of dicts: [{page: N, text: str}, ...]
-        Tries pdfplumber first (better layout), falls back to pypdf.
-        """
-        slides = []
-        try:
-            import pdfplumber
-            with pdfplumber.open(pdf_path) as pdf:
-                for i, page in enumerate(pdf.pages, 1):
-                    text = (page.extract_text() or "").strip()
-                    slides.append({"page": i, "text": text})
-            return slides
-        except ImportError:
-            pass
-        try:
-            import pypdf
-            reader = pypdf.PdfReader(pdf_path)
-            for i, page in enumerate(reader.pages, 1):
-                text = (page.extract_text() or "").strip()
-                slides.append({"page": i, "text": text})
-            return slides
-        except ImportError:
-            pass
-        # Last resort — no PDF library available
-        raise RuntimeError(
-            "No PDF library found.\n"
-            "Install one with:  pip install pdfplumber\n"
-            "or:                pip install pypdf")
-
-    def _pptx_preview(self):
-        """Extract and display slide content in the preview pane."""
-        path = self._pptx_path_var.get().strip()
-        if not path:
-            messagebox.showinfo("Script", "Select a PDF file first.",
-                                parent=self)
-            return
-        try:
-            slides = self._pptx_extract_slides(path)
-        except Exception as e:
-            messagebox.showerror("Extract Error", str(e), parent=self)
-            return
-
-        self._set_text(self._pptx_preview_text,
-                       self._pptx_format_preview(slides))
-        self._pptx_status_var.set(f"{len(slides)} slide(s) loaded.")
-
-    def _pptx_format_preview(self, slides: list) -> str:
-        lines = []
-        for s in slides:
-            lines.append(f"── Slide {s['page']} ──────────────────")
-            lines.append(s["text"] if s["text"] else "(no text extracted)")
-            lines.append("")
-        return "\n".join(lines)
-
-    def _pptx_build_prompt(self, slides: list) -> str:
-        """Build the script-generation prompt from extracted slides."""
-        tone        = self._pptx_tone_var.get()
-        extra_notes = self._pptx_notes_var.get().strip()
-
-        slide_block = "\n\n".join(
-            f"SLIDE {s['page']}:\n{s['text'] or '(no text)'}"
-            for s in slides
-        )
-
-        style_block = ""
-        if self._pptx_use_style_var.get():
-            director = getattr(self, "director", None)
-            if director:
-                try:
-                    from council_engine import ContentStyleManager
-                    csm = ContentStyleManager(
-                        VAULT_DIR / "style_profiles")
-                    style_summary = str(csm)
-                    if style_summary.strip():
-                        style_block = (
-                            f"\nCREATOR CONTENT STYLE (match this voice):\n"
-                            f"{style_summary[:600]}\n")
-                except Exception:
-                    pass
-
-        notes_block = (f"\nADDITIONAL NOTES FROM CREATOR:\n{extra_notes}\n"
-                       if extra_notes else "")
-
-        return (
-            f"Generate a complete spoken script for the following presentation.\n\n"
-            f"TONE: {tone}\n"
-            f"{style_block}"
-            f"{notes_block}\n"
-            f"SLIDES:\n{slide_block}\n\n"
-            f"SCRIPT REQUIREMENTS:\n"
-            f"- Write natural spoken language, not bullet recitation\n"
-            f"- Include a clear transition line between each slide "
-            f"(e.g. 'Moving to slide 3...' or a natural topic bridge)\n"
-            f"- Expand on each slide's content — do not just read the bullets verbatim\n"
-            f"- Estimate a rough speaking time for each slide in parentheses\n"
-            f"- Open with something that grabs attention before going into slide 1\n"
-            f"- Close with a strong final line, not just 'that's it'\n"
-            f"- Keep the tone consistent throughout: {tone}\n\n"
-            f"Format each slide section as:\n"
-            f"[SLIDE N — ~X min]\n"
-            f"<spoken script for that slide>\n\n"
-            f"[TRANSITION]\n"
-            f"<transition line to next slide>\n"
-        )
-
-    def _pptx_generate(self):
-        """Extract slides, build prompt, generate script in background thread."""
-        path = self._pptx_path_var.get().strip()
-        if not path:
-            messagebox.showinfo("Script", "Select a PDF file first.", parent=self)
-            return
-
-        writer_role = self._pptx_writer_var.get()
-        model = getattr(self, writer_role, None) or getattr(self, "writer", None)
-        if not model:
-            messagebox.showwarning("Script",
-                "No AI model available — council not loaded.", parent=self)
-            return
-
-        try:
-            slides = self._pptx_extract_slides(path)
-        except Exception as e:
-            messagebox.showerror("Extract Error", str(e), parent=self)
-            return
-
-        self._set_text(self._pptx_preview_text,
-                       self._pptx_format_preview(slides))
-        self._set_text(self._pptx_script_text, "Generating script…")
-        self._pptx_status_var.set(
-            f"Generating… ({len(slides)} slides, model: {writer_role})")
-
-        prompt = self._pptx_build_prompt(slides)
-
-        def _run():
-            try:
-                script = model.respond(prompt, max_tokens=4000)
-            except Exception as e:
-                script = f"[Error generating script: {e}]"
-            self.after(0, lambda: self._pptx_on_done(script))
-
-        threading.Thread(target=_run, daemon=True).start()
-
-    def _pptx_on_done(self, script: str):
-        self._set_text(self._pptx_script_text, script)
-        self._pptx_status_var.set("✓ Script generated.")
-        self._pptx_cached_script = script
-
-    def _pptx_copy(self):
-        script = getattr(self, "_pptx_cached_script",
-                         self._pptx_script_text.get("1.0", "end").strip())
-        if script:
-            self.clipboard_clear()
-            self.clipboard_append(script)
-            self._pptx_status_var.set("Copied to clipboard.")
-
-    def _pptx_save(self):
-        import tkinter.filedialog as _fd
-        script = getattr(self, "_pptx_cached_script",
-                         self._pptx_script_text.get("1.0", "end").strip())
-        if not script:
-            return
-        path = _fd.asksaveasfilename(
-            title="Save Script",
-            defaultextension=".txt",
-            filetypes=[("Text file", "*.txt"), ("Markdown", "*.md")])
-        if path:
-            import pathlib
-            pathlib.Path(path).write_text(script, encoding="utf-8")
-            self._pptx_status_var.set(f"Saved → {pathlib.Path(path).name}")
 
     # ---- Apothecary tab ----
 
@@ -7620,10 +5677,12 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
 
                 def _patch_model(model, extra: str, role_name: str):
                     """Wrap model.respond to prepend vault context for this request."""
-                    if not extra:
+                    if model is None or not extra:
                         return
                     orig = model.respond
-                    _patched_models[role_name] = orig
+                    # Store (model, original_fn) so the finally block can restore
+                    # without needing to re-resolve the model by role name.
+                    _patched_models[role_name] = (model, orig)
                     def _patched(prompt, **kwargs):
                         existing = kwargs.get("extra_context", "")
                         _ci_block = ("COUNCIL INSTRUCTIONS:\n" + _ci + "\n\n") if _ci else ""
@@ -7636,7 +5695,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                     _ci_block = "COUNCIL INSTRUCTIONS:\n" + _ci
                     for _pm in [self.writer, self.coder, self.intern,
                                 self.artist, self.sage, self.strategist,
-                                self.musician, self.content, self.director]:
+                                self.content, self.director]:
                         if _pm is not None:
                             _patch_model(_pm, _ci_block, "ci_only")
                     if self.skeptic is not None:
@@ -7747,11 +5806,9 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                                                 enable_tools=False, token_callback=_token_cb)
                 elif self.sage is not None:
                     agents["sage"] = ModelAgent("Sage", self.sage, enable_tools=False, token_callback=_token_cb)
-                # Strategist, Musician — add if personality models are initialised
+                # Strategist — add if personality model is initialised
                 if getattr(self, "strategist", None) is not None:
                     agents["strategist"] = ModelAgent("Strategist", self.strategist, enable_tools=False, token_callback=_token_cb)
-                if getattr(self, "musician", None) is not None:
-                    agents["musician"] = ModelAgent("Musician", self.musician, enable_tools=False, token_callback=_token_cb)
                 if getattr(self, "content", None) is not None:
                     agents["content"] = ModelAgent("Content", self.content, enable_tools=False, token_callback=_token_cb)
                 if getattr(self, "director", None) is not None:
@@ -7944,8 +6001,19 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                 self.ui_q.put(("memory_update", user_text, final_text, last_critique,
                                _deliberation_passed, _low_conf_gaps))
 
-                # Persist verdict record for history dashboard
-                _conf = 0  # will be updated below; initialised here in case of early exit
+                # T1-C: Confidence score — compute first so the persisted record has it
+                _conf = 0
+                for _ev in reversed(events):
+                    if _ev.who == "Judge" and _ev.kind == "observation" and "confidence" in _ev.text:
+                        try:
+                            import json as _cj
+                            _cobj = _cj.loads(_ev.text.split("Ranking:\n", 1)[-1].strip())
+                            _conf = int(_cobj.get("confidence", 0))
+                        except Exception:
+                            pass
+                        break
+
+                # Persist verdict record for history dashboard (now with real confidence)
                 self.ui_q.put(("verdict_record", {
                     "ts":         now_iso(),
                     "session_id": self.session_id,
@@ -7966,17 +6034,6 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                 except Exception:
                     pass
 
-                # T1-C: Confidence score
-                _conf = 0
-                for _ev in reversed(events):
-                    if _ev.who == "Judge" and _ev.kind == "observation" and "confidence" in _ev.text:
-                        try:
-                            import json as _cj
-                            _cobj = _cj.loads(_ev.text.split("Ranking:\n", 1)[-1].strip())
-                            _conf = int(_cobj.get("confidence", 0))
-                        except Exception:
-                            pass
-                        break
                 self.ui_q.put(("verdict_confidence", _conf))
 
                 self.ui_q.put(("judge_final", last_critique))
@@ -7988,24 +6045,15 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                 self.ui_q.put(("error", traceback.format_exc()))
             finally:
                 # Always restore patched model.respond — even on exception.
-                _restore_map = {
-                    "writer":    self.writer,   "coder": self.coder,
-                    "intern":    self.intern,   "artist":     self.artist,
-                    "peasant":   self.peasant,  "skeptic":    self.skeptic,
-                    "director":  getattr(self, "director",   None),
-                    "content":   getattr(self, "content",    None),
-                    "eye":       getattr(self, "eye",        None),
-                    "cutter":    getattr(self, "cutter",     None),
-                    "algorithm": getattr(self, "algorithm",  None),
-                    # Style brief patch key — director pre-pass injects into writer
-                    "director_style_brief": self.writer,
-                    "coder_agent_model": getattr(locals().get("coder_slot"), "model", None),
-                    "intern_agent_model":     getattr(locals().get("intern_slot"),     "model", None),
-                }
-                for _rname, _orig_fn in locals().get("_patched_models", {}).items():
-                    _rm = _restore_map.get(_rname)
-                    if _rm is not None:
-                        try: _rm.respond = _orig_fn
+                # _patched_models now stores (model, original_fn) directly, so
+                # restoration is unconditional and doesn't rely on lookup maps.
+                for _rname, _entry in locals().get("_patched_models", {}).items():
+                    try:
+                        _model, _orig_fn = _entry
+                    except (TypeError, ValueError):
+                        continue   # legacy single-fn entry — skip rather than crash
+                    if _model is not None:
+                        try: _model.respond = _orig_fn
                         except Exception: pass
                 for _orole, _orig_key in locals().get("_override_restores", {}).items():
                     _om = locals().get("_override_map", {}).get(_orole)
@@ -8099,28 +6147,6 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                         self._append_transcript("Agent", msg, "observation")
                     if hasattr(self, "rag_count_label"):
                         self._update_rag_count_label()
-                    # Forward compose events to composer log too
-                    if hasattr(self, "composer_log") and phase.startswith("compose"):
-                        self._composer_log_append(msg, "ok" if "✓" in msg else "info")
-
-                elif kind == "composer_result":
-                    _, result = item
-                    self._current_plan = result.plan
-                    if result.plan:
-                        pretty = result.plan.to_json()
-                        self.composer_plan_box.delete("1.0", "end")
-                        self.composer_plan_box.insert("1.0", pretty)
-                        self._composer_log_append(
-                            f"✓ {result.plan.title} — {len(result.plan.sections)} sections, "
-                            f"{result.plan.tempo} BPM, {result.plan.key} {result.plan.mode}", "ok")
-                        self._append_transcript("Composer", result.plan.description or result.plan.title, "final")
-                    else:
-                        self._composer_log_append(
-                            f"✗ Parse failed: {result.parse_error}\nRaw: {result.raw_json[:300]}", "err")
-
-                elif kind == "composer_error":
-                    _, msg = item
-                    self._composer_log_append(f"✗ Error: {msg}", "err")
 
                 elif kind == "grapher_event":
                     _, phase, msg = item
@@ -8184,7 +6210,12 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                 elif kind == "nodes_result":
                     _, statuses = item
                     self._populate_nodes_tree(statuses)
-                    self.nodes_status_label.configure(text=f"Last updated: {now_iso()}")
+                    if hasattr(self, "nodes_status_label"):
+                        try:
+                            self.nodes_status_label.configure(
+                                text=f"Last updated: {now_iso()}")
+                        except tk.TclError:
+                            pass  # widget destroyed mid-callback
                     # Schedule next auto-refresh
                     if self._node_refresh_id:
                         self.after_cancel(self._node_refresh_id)
@@ -9276,7 +7307,14 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                                "TTS unavailable — install pyttsx3 (pip install pyttsx3)"))
                 return
             try:
-                rate = int(getattr(self, "_tts_rate_var", None) and self._tts_rate_var.get() or 175)
+                # Robust rate lookup: tolerates missing var or non-numeric content
+                rate = 175
+                rv = getattr(self, "_tts_rate_var", None)
+                if rv is not None:
+                    try:
+                        rate = int(rv.get())
+                    except (TypeError, ValueError):
+                        rate = 175
                 eng.setProperty("rate", rate)
                 eng.say(text[:4000])  # cap at 4000 chars for sane length
                 eng.runAndWait()
