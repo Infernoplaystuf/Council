@@ -82,7 +82,7 @@ class StandaloneHost:
 
         # Personality models — set to None; override in _init_models()
         for role in ("writer", "director", "content", "sage", "strategist",
-                     "techpriest", "artist", "musician", "peasant", "intern",
+                     "coder", "artist", "musician", "peasant", "intern",
                      "eye", "cutter", "algorithm", "coach"):
             setattr(self, role, None)
 

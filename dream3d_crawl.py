@@ -178,7 +178,7 @@ def _write_primer():
     """
     Write a single condensed primer file combining the most important
     structural knowledge about simplnx pipelines. This is what the
-    Tech-Priest and Writer will almost always retrieve first.
+    Coder and Writer will almost always retrieve first.
     """
     primer_path = VAULT_DIR / "_primer_simplnx_api.md"
 

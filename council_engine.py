@@ -627,7 +627,7 @@ ROUTING
 ═══════════════════════════════════════════
 When routing, silently classify the query then output EXACTLY one route word.
 
-Route targets: writer | techpriest | intern | peasant | artist | apothecary | speech | librarian | ide | chat | strategist | sage | eye | cutter | algorithm
+Route targets: writer | coder | intern | peasant | artist | apothecary | speech | librarian | ide | chat | strategist | sage | eye | cutter | algorithm
 
 Classification → Route:
   CONVERSATIONAL (opinion, explanation, memory, discussion) + short (≤12 words) → chat
@@ -713,8 +713,8 @@ SYNTHESIS RULES (always apply)
 - Aim for the shortest response that fully answers the question. If in doubt, cut it.
 """,
 
-    "techpriest": """\
-You are the TECH-PRIEST of the Council — the engineer who makes things robust.
+    "coder": """\
+You are the CODER of the Council — the engineer who makes things robust.
 You think in systems, failure modes, and long-term maintainability.
 
 For every answer you give, you MUST consider:
@@ -790,7 +790,7 @@ Rules:
 - Every question must reference something SPECIFIC in the task or code.
 - If you find yourself writing a generic question, go back and find the actual specific issue.
 - Use plain language — no jargon.
-- You are encouraged to disagree with TechPriest or Intern if their approach has a flaw.
+- You are encouraged to disagree with Coder or Intern if their approach has a flaw.
 - If the code is genuinely solid, say so briefly and ask one stretch question instead.
 """,
 
@@ -920,7 +920,7 @@ Rules:
 - Be opinionated. Give a recommendation, not a menu of equal options.
 - Phases should be ordered by dependency, not by importance.
 - If the question is too vague to plan, say what needs to be clarified first.
-- Do NOT include implementation code. That is TechPriest and Intern territory.
+- Do NOT include implementation code. That is Coder and Intern territory.
 """,
 
     "librarian": """\
@@ -996,7 +996,7 @@ in the default panel, you may recommend adding one:
 
 PANEL_ADD: <role>
 
-Valid roles to add: writer, techpriest, intern, sage, strategist, artist, musician,
+Valid roles to add: writer, coder, intern, sage, strategist, artist, musician,
 content, director, peasant, eye, cutter, algorithm.
 Only emit this if you are confident the vault material directly maps to that role's
 domain. One PANEL_ADD per response maximum. Do not add roles already in the panel.
@@ -1628,7 +1628,7 @@ ROLE_CONTEXT_PROFILES: Dict[str, Dict] = {
     "sage":       {"history_turns": 12, "use_prior": True,  "use_vault": "full"},
     # Planners — vault yes, full chat history unnecessary
     "strategist": {"history_turns": 6,  "use_prior": False, "use_vault": "full"},
-    "techpriest": {"history_turns": 6,  "use_prior": False, "use_vault": "full"},
+    "coder": {"history_turns": 6,  "use_prior": False, "use_vault": "full"},
     "content":    {"history_turns": 6,  "use_prior": False, "use_vault": "lite"},
     # Fast drafters — lean context, vault is noise for them
     "intern":     {"history_turns": 4,  "use_prior": False, "use_vault": "none"},
@@ -1816,7 +1816,7 @@ has a funny angle, you can find it without losing the thread. You are the one wh
 makes the deliberation's mess sound inevitable. You cut filler the way a copyeditor
 cuts adverbs — on instinct, without mercy, for the reader's sake.""",
 
-    "techpriest": """VOICE: You have looked directly at production incidents that were not supposed
+    "coder": """VOICE: You have looked directly at production incidents that were not supposed
 to happen, and you know exactly how they happened. You speak with the measured calm
 of someone who has been proven right in the worst possible way — not with smugness,
 with exhaustion. You are not alarmist; alarmism is imprecise. You are specific.
@@ -1832,7 +1832,7 @@ happens when people skip the error handling.""",
 the correct architectural approach, you have already run the code and it almost
 works. You are genuinely enthusiastic, unafraid of being wrong in public, and
 occasionally more confident than the situation strictly warrants — and you know
-it, and you don't care, because the alternative is being paralyzed by TechPriest's
+it, and you don't care, because the alternative is being paralyzed by Coder's
 concern list until the deadline. You celebrate getting it working before worrying
 about whether it's elegant. You add usage examples because you actually ran the
 thing. You say "I'll just try it and see" while everyone else is still in the
@@ -2008,7 +2008,7 @@ does not serve anyone.""",
 # Read-only roles receive their memory injected by the Librarian / system
 # but cannot accumulate new lessons of their own.
 MEMORY_WRITE_ROLES: set = {
-    "techpriest",
+    "coder",
     "intern",
     "peasant",
     "sage",
@@ -2029,7 +2029,7 @@ MEMORY_WRITE_ROLES: set = {
 # These roles are best positioned to notice cross-session project-level patterns.
 # The project context is a single shared file all roles can read.
 PROJECT_OBSERVER_ROLES: set = {
-    "techpriest", "sage", "strategist", "director",
+    "coder", "sage", "strategist", "director",
     "algorithm",  # algorithm tracks channel-level patterns across sessions
 }
 
@@ -2039,7 +2039,7 @@ _PROJECT_MEMORY_KEY = "_project"
 # What each write-capable role should focus on when distilling a memory update.
 # Two categories are always expected: user/project observations and reasoning patterns.
 ROLE_MEMORY_FOCUS: Dict[str, str] = {
-    "techpriest": (
+    "coder": (
         "USER/PROJECT: patterns in this user's codebase and tech stack, recurring security "
         "or performance issues, preferred libraries and solutions, known architectural "
         "constraints, and decisions already committed to that affect future work.\n"
@@ -2295,7 +2295,7 @@ _ROUTE_PATTERNS: List[Tuple[str, List[str], int]] = [
                      "full pitch", "build out this idea", "make a pitch", "pitch deck",
                      "production plan", "production notes", "develop the concept",
                      "script outline for", "full outline", "turn the idea into"],               9),
-    ("techpriest",  ["robust", "secure", "architecture", "design pattern", "engineer",
+    ("coder",  ["robust", "secure", "architecture", "design pattern", "engineer",
                      "scalab", "production", "best practice", "maintainab"],                     5),
     ("writer",      [],                                                                           1),  # default
 ]
@@ -2307,8 +2307,8 @@ _ROUTE_PATTERNS: List[Tuple[str, List[str], int]] = [
 # These are ABSOLUTE values, not deltas — set them to reflect the task character.
 _ROUTE_TEMP_OVERRIDES: Dict[str, Dict[str, float]] = {
     # Precision routes: coding and architecture benefit from deterministic outputs
-    "ide":        {"techpriest": 0.05, "intern": 0.20, "writer": 0.15},
-    "techpriest": {"techpriest": 0.05, "intern": 0.20, "writer": 0.15},
+    "ide":        {"coder": 0.05, "intern": 0.20, "writer": 0.15},
+    "coder": {"coder": 0.05, "intern": 0.20, "writer": 0.15},
     # Creative routes: loosen writer and content-adjacent roles for authentic voice
     "content":    {"writer": 0.55, "content": 0.65, "artist": 0.68},
     "director":   {"writer": 0.55, "director": 0.55, "content": 0.62},
@@ -2463,7 +2463,7 @@ def route_message(user_text: str) -> str:
     )
     if _negation_before_code and scores.get("ide", 0) <= 6:
         scores.pop("ide", None)
-        scores.pop("techpriest", None)
+        scores.pop("coder", None)
 
     if not scores:
         return "writer"
@@ -2503,14 +2503,14 @@ class JudgeModel(PersonalityModel):
     def choose_panel(self, user_text: str) -> List[str]:
         """
         Ask the Judge model which council roles would actually help with this query.
-        Returns a list of role keys from: writer, techpriest, intern, artist, peasant, skeptic.
+        Returns a list of role keys from: writer, coder, intern, artist, peasant, skeptic.
         Falls back to route_message-derived panel on any failure.
         """
         prompt = (
             "You are routing a user query to the right council members.\n"
             "Available roles:\n"
             "  writer     — prose, synthesis, explanation, analysis, opinion, conversation\n"
-            "  techpriest — code architecture, robust systems, engineering decisions\n"
+            "  coder — code architecture, robust systems, engineering decisions\n"
             "  intern     — quick drafts, research, structured outlines, first attempts\n"
             "  artist     — UI/UX, diagrams, visual structure, layout critique\n"
             "  peasant    — devil's advocate, challenging assumptions, probing questions\n"
@@ -2520,8 +2520,8 @@ class JudgeModel(PersonalityModel):
             "Respond with ONLY a JSON array of 2-3 role names that would genuinely help.\n"
             "Examples:\n"
             "  Conversational/opinion:  [\"writer\", \"peasant\"]\n"
-            "  Code task:               [\"techpriest\", \"intern\", \"skeptic\"]\n"
-            "  Multi-step planning:     [\"strategist\", \"techpriest\", \"skeptic\"]\n"
+            "  Code task:               [\"coder\", \"intern\", \"skeptic\"]\n"
+            "  Multi-step planning:     [\"strategist\", \"coder\", \"skeptic\"]\n"
             "  Research/fact-check:     [\"sage\", \"writer\", \"peasant\"]\n"
             "  UI/visual:               [\"artist\", \"writer\", \"peasant\"]\n\n"
             f"User query: {user_text[:300]}\n\n"
@@ -2533,7 +2533,7 @@ class JudgeModel(PersonalityModel):
             m = _r.search(r"\[.*?\]", raw, _r.DOTALL)
             if m:
                 panel = _j.loads(m.group(0))
-                valid = {"writer", "techpriest", "intern", "artist", "peasant", "skeptic", "sage", "strategist", "librarian", "musician", "content", "director"}
+                valid = {"writer", "coder", "intern", "artist", "peasant", "skeptic", "sage", "strategist", "librarian", "musician", "content", "director"}
                 panel = [r for r in panel if r in valid]
                 if 1 <= len(panel) <= 4:
                     return panel
@@ -2544,13 +2544,13 @@ class JudgeModel(PersonalityModel):
         fallback_map = {
             "chat":        ["writer", "peasant"],
             "writer":      ["writer", "peasant"],
-            "ide":         ["techpriest", "intern", "skeptic"],
-            "techpriest":  ["techpriest", "intern", "skeptic"],
+            "ide":         ["coder", "intern", "skeptic"],
+            "coder":  ["coder", "intern", "skeptic"],
             "intern":      ["intern", "writer", "peasant"],
             "artist":      ["artist", "writer", "peasant"],
             "peasant":     ["writer", "peasant"],
             "sage":        ["sage", "writer", "peasant"],
-            "strategist":  ["strategist", "techpriest", "skeptic"],
+            "strategist":  ["strategist", "coder", "skeptic"],
             # librarian is handled as an early-return route in the GUI and never
             # reaches deliberation — this entry is kept only as a documentation aid.
             "librarian":   ["writer"],
@@ -2930,9 +2930,9 @@ DEFAULT_PI_HOSTS: List[str] = [h.strip() for h in _PI_HOSTS_RAW.split(",") if h.
 # ── Desktop model selection (RTX 5080, 16 GB VRAM) ────────────────────────────
 # Layout:
 #   32B Q4_K_M  ≈ 19–20 GB — single-model slot; used for Writer (synthesis) and Sage (knowledge).
-#   14B Q4_K_M  ≈  9 GB — two coexist in 16 GB; used for TechPriest, Skeptic, Strategist.
+#   14B Q4_K_M  ≈  9 GB — two coexist in 16 GB; used for Coder, Skeptic, Strategist.
 #   phi4        ≈  9 GB — fast, high-reasoning; Judge, Peasant, Intern.
-#   coder 14B   ≈  9 GB — dedicated code specialist for TechPriest/Intern.
+#   coder 14B   ≈  9 GB — dedicated code specialist for Coder/Intern.
 #
 # Pi node roles (set COUNCIL_PI_HOSTS=http://<pi1>:11434,http://<pi2>:11434):
 #   Pi 5 16GB  → heavy roles: Sage, Strategist (qwen2.5:14b or 32b depending on Pi RAM)
@@ -3036,7 +3036,7 @@ def build_registry(dispatcher: Optional[LoadAwareDispatcher] = None) -> BackendR
     # 14B dual-slot: Strategist, Skeptic, general reasoning
     reg.register(_spec("local_general_alt", "general_alt",
         {"general": 0.85, "reasoning": 0.85, "coding": 0.65, "latency": 0.85}, 0.45, 1800))
-    # 14B coder: TechPriest primary
+    # 14B coder: Coder primary
     reg.register(_spec("local_coder_primary", "coder_primary",
         {"general": 0.65, "reasoning": 0.85, "coding": 1.0, "latency": 0.5}, 0.18, 2400))
     # phi4 fast: Intern, Artist
@@ -3098,7 +3098,7 @@ def build_personalities(
     weights = {
         "judge":      {"reasoning": 0.9, "latency": 0.1},
         "writer":     {"general": 0.7, "reasoning": 0.3},
-        "techpriest": {"coding": 0.7, "reasoning": 0.3},
+        "coder": {"coding": 0.7, "reasoning": 0.3},
         "intern":     {"coding": 0.5, "latency": 0.5},
         "peasant":    {"general": 0.5, "reasoning": 0.3, "latency": 0.2},
         "artist":     {"general": 0.7, "reasoning": 0.3},
@@ -3120,13 +3120,13 @@ def build_personalities(
     }
 
     # ── Per-role temperature diversity ─────────────────────────────────
-    # Precision roles (Writer, TechPriest, Sage, Judge) run cold for consistency.
+    # Precision roles (Writer, Coder, Sage, Judge) run cold for consistency.
     # Generative roles (Intern, Content, Artist, Musician) run warm for divergence.
     # The spread between Intern (0.55) and Writer (0.25) ensures their candidates
     # are genuinely different — making deliberation worth doing.
     role_temperatures = {
         "judge":      0.08,   # coldest — verdicts must be reproducible
-        "techpriest": 0.15,   # code correctness — determinism matters
+        "coder": 0.15,   # code correctness — determinism matters
         "sage":       0.20,   # facts — accuracy before creativity
         "librarian":  0.20,   # indexing — precision
         "writer":     0.25,   # synthesis — precise but not robotic
@@ -3148,7 +3148,7 @@ def build_personalities(
 
     models: Dict[str, PersonalityModel] = {}
 
-    for name in ("writer", "peasant", "intern", "techpriest", "artist", "skeptic",
+    for name in ("writer", "peasant", "intern", "coder", "artist", "skeptic",
                  "sage", "strategist", "librarian", "musician", "content", "director",
                  "eye", "cutter", "algorithm", "coach", "ideator", "pitcher"):
         models[name] = PersonalityModel(
@@ -3184,13 +3184,13 @@ def build_personalities(
     # Pi node strategy:
     #   Pi 5 16GB (pi_heavy) → Sage, Strategist: heavyweight reasoning offloaded to Pi
     #   Pi 5  8GB (pi_fast)  → Peasant, Intern, Artist: fast/lightweight roles on 8GB Pi
-    #   Desktop              → Writer (32B synthesis), TechPriest (14B coder), Judge (phi4)
+    #   Desktop              → Writer (32B synthesis), Coder (14B coder), Judge (phi4)
     #
     # To use Pi backends, set COUNCIL_PI_HOSTS env var and run with dispatcher enabled.
     # Pi backends auto-fallback to desktop if Pi is unreachable.
     defaults = {
         "writer":     "local_general_primary",   # Desktop 32B — synthesis quality matters most
-        "techpriest": "local_coder_primary",      # Desktop 14B coder
+        "coder": "local_coder_primary",      # Desktop 14B coder
         "intern":     "local_coder_fast",         # Desktop phi4 / Pi 8GB fast
         "peasant":    "local_peasant_fast",       # Desktop phi4 / Pi 8GB fast
         "artist":     "local_general_alt",        # Desktop 14B / Pi 8GB fast
@@ -3299,7 +3299,7 @@ def update_project_memory_after_pass(
     """
     Update the shared project context after a deliberation round.
 
-    Only PROJECT_OBSERVER_ROLES write to this file (techpriest, sage, strategist,
+    Only PROJECT_OBSERVER_ROLES write to this file (coder, sage, strategist,
     director). All roles can read it. The file accumulates cross-session project
     facts: architecture decisions, recurring constraints, confirmed domain truth,
     and deployment patterns — things that are useful to every role, not just one.
@@ -3359,7 +3359,7 @@ def generate_cross_session_trends(
     """
     all_memory_blocks: List[str] = []
 
-    for role in ("techpriest", "intern", "sage", "strategist", "peasant",
+    for role in ("coder", "intern", "sage", "strategist", "peasant",
                  "artist", "writer", "content", "director", "musician"):
         p = memory_manager.path_for(role)
         if p.exists():

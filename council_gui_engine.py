@@ -31,10 +31,10 @@ import apothecary_engine as ae
 
 # ── Agent modules (graceful optional imports) ─────────────────
 try:
-    import techpriest_agent as tpa
-    _TECHPRIEST_AGENT_OK = True
+    import coder_agent as tpa
+    _CODER_AGENT_OK = True
 except (ImportError, OSError):
-    _TECHPRIEST_AGENT_OK = False
+    _CODER_AGENT_OK = False
 
 try:
     import intern_agent as ia
@@ -193,19 +193,19 @@ def _parse_script_json(text: str) -> Tuple[str, str]:
 
 # ── Route → (panel, synth) mapping ──────────────────────────────────────────
 # Maps the judge's route decision to the most appropriate council panel.
-# Coding tasks frontload TechPriest + Intern + Skeptic (production hardening).
+# Coding tasks frontload Coder + Intern + Skeptic (production hardening).
 # Writing/explanation tasks frontload Writer + Intern + Artist.
 # Design tasks frontload Artist. Fallback: broad general panel.
 _PANEL_FOR_ROUTE: Dict[str, tuple] = {
     "chat":       (["writer",     "peasant"],             "writer"),  # pure conversation
     "writer":     (["writer",     "intern",  "peasant"],  "writer"),  # research/docs
-    "ide":        (["techpriest", "intern",  "skeptic"],  "writer"),  # code tasks
+    "ide":        (["coder", "intern",  "skeptic"],  "writer"),  # code tasks
     "artist":     (["artist",     "writer",  "intern" ],  "writer"),  # visual/UI
     "intern":     (["intern",     "writer",  "peasant"],  "writer"),  # planning
-    "techpriest": (["techpriest", "intern",  "skeptic"],  "writer"),  # architecture
+    "coder": (["coder", "intern",  "skeptic"],  "writer"),  # architecture
     "peasant":    (["writer",     "peasant"           ],  "writer"),  # simple explain
     "sage":       (["sage",       "writer",  "peasant"],  "writer"),  # domain knowledge
-    "strategist": (["strategist", "techpriest", "skeptic"], "writer"), # planning/strategy
+    "strategist": (["strategist", "coder", "skeptic"], "writer"), # planning/strategy
     "musician":   (["musician",   "writer"],               "writer"),  # music direction
     "content":    (["content",    "writer",  "strategist"], "writer"),  # content creation
     "director":   (["director",   "writer",  "content"],   "writer"),  # style analysis + scripting
@@ -265,7 +265,7 @@ def _strip_code_blocks(text: str) -> str:
     return cleaned
 
 
-_CODE_ROUTES = {"ide", "techpriest", "intern"}
+_CODE_ROUTES = {"ide", "coder", "intern"}
 
 def _filter_final(text: str, route: str, user_query: str) -> str:
     """
@@ -1644,7 +1644,7 @@ ROLE_COLORS = {
     "User":        "#4fc3f7",   # light blue
     "Judge":       "#ef9a9a",   # red-ish
     "Writer":      "#a5d6a7",   # green
-    "Tech-Priest": "#ce93d8",   # purple
+    "Coder": "#ce93d8",   # purple
     "Intern":      "#ffe082",   # yellow
     "Peasant":     "#ffcc80",   # orange
     "Artist":      "#f48fb1",   # pink
@@ -2047,15 +2047,15 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
         def _agent_event_cb(phase: str, msg: str):
             self.ui_q.put(("agent_phase", phase, msg))
 
-        if _TECHPRIEST_AGENT_OK:
-            self.techpriest_agent = tpa.TechPriestAgent(
-                personality_model=self.techpriest,
+        if _CODER_AGENT_OK:
+            self.coder_agent = tpa.CoderAgent(
+                personality_model=self.coder,
                 runner=self.runner,
                 max_attempts=8,
                 event_callback=_agent_event_cb,
             )
         else:
-            self.techpriest_agent = None
+            self.coder_agent = None
 
         if _INTERN_AGENT_OK:
             self.intern_agent = ia.InternAgent(
@@ -2088,7 +2088,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
         self.writer               = self.personalities["writer"]
         self.peasant              = self.personalities["peasant"]
         self.intern               = self.personalities["intern"]
-        self.techpriest           = self.personalities["techpriest"]
+        self.coder           = self.personalities["coder"]
         self.artist               = self.personalities["artist"]
         self.skeptic              = self.personalities.get("skeptic")
         self.sage                 = self.personalities.get("sage")
@@ -2383,7 +2383,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
             "local_judge_fast", "local_peasant_fast", "local_fast",
         ]
         self._query_overrides: Dict[str, tk.StringVar] = {}
-        for _role in ("writer", "techpriest", "intern", "skeptic", "artist"):
+        for _role in ("writer", "coder", "intern", "skeptic", "artist"):
             ttk.Label(override_row, text=_role[:4] + ":", foreground="#6c7086").pack(side="left")
             _v = tk.StringVar(value="(default)")
             self._query_overrides[_role] = _v
@@ -2576,7 +2576,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
 
         self.agent_status_vars = {}
         for name, available in [
-            ("TechPriest Agent (LangGraph loop)", _TECHPRIEST_AGENT_OK),
+            ("Coder Agent (LangGraph loop)", _CODER_AGENT_OK),
             ("Intern Agent (web research)",        _INTERN_AGENT_OK),
             ("Vault Agent (file tasks, sandboxed)",_VAULT_AGENT_OK),
             ("Sage (tunable domain expert)",          _SAGE_OK),
@@ -2595,13 +2595,13 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
         ctrl_frame = ttk.LabelFrame(top, text="Controls")
         ctrl_frame.pack(fill="x", pady=(0, 10))
 
-        self.var_use_techpriest_agent = tk.BooleanVar(value=_TECHPRIEST_AGENT_OK)
+        self.var_use_coder_agent = tk.BooleanVar(value=_CODER_AGENT_OK)
         self.var_use_intern_agent     = tk.BooleanVar(value=_INTERN_AGENT_OK)
         self.var_use_rag              = tk.BooleanVar(value=_RAG_OK)
 
-        ttk.Checkbutton(ctrl_frame, text="Use TechPriest coding agent (self-correcting loop)",
-                        variable=self.var_use_techpriest_agent,
-                        state="normal" if _TECHPRIEST_AGENT_OK else "disabled").pack(anchor="w", padx=6, pady=2)
+        ttk.Checkbutton(ctrl_frame, text="Use Coder coding agent (self-correcting loop)",
+                        variable=self.var_use_coder_agent,
+                        state="normal" if _CODER_AGENT_OK else "disabled").pack(anchor="w", padx=6, pady=2)
         ttk.Checkbutton(ctrl_frame, text="Use Intern web research agent",
                         variable=self.var_use_intern_agent,
                         state="normal" if _INTERN_AGENT_OK else "disabled").pack(anchor="w", padx=6, pady=2)
@@ -2625,7 +2625,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
         install_frame.pack(fill="x", pady=(0, 10))
         
         install_text = (
-            "pip install langgraph langchain-ollama          # TechPriest agent\n"
+            "pip install langgraph langchain-ollama          # Coder agent\n"
             "pip install crawl4ai && crawl4ai-setup          # Intern web research\n"
             "pip install chromadb sentence-transformers      # Vault RAG\n"
         )
@@ -2664,7 +2664,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
             def _get_personality(role: str):
                 pm_map = {
                     "writer":     getattr(self, "writer",     None),
-                    "techpriest": getattr(self, "techpriest", None),
+                    "coder": getattr(self, "coder", None),
                     "judge":      getattr(self, "judge",      None),
                     "intern":     getattr(self, "intern",     None),
                     "peasant":    getattr(self, "peasant",    None),
@@ -4926,7 +4926,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
         roles_frame.pack(fill="x", padx=10, pady=(0, 6))
         self._lens_role_vars: dict = {}
         _lens_defaults = {
-            "writer": True, "techpriest": True, "sage": True,
+            "writer": True, "coder": True, "sage": True,
             "peasant": True, "strategist": True, "director": True,
             "artist": False, "intern": False, "skeptic": False,
             "content": True, "musician": False,
@@ -5071,7 +5071,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
 
         # ── Memory files ──────────────────────────────────────────
         self._vh_mem_tree.delete(*self._vh_mem_tree.get_children())
-        all_roles = ("judge", "writer", "techpriest", "intern", "peasant", "artist",
+        all_roles = ("judge", "writer", "coder", "intern", "peasant", "artist",
                      "sage", "strategist", "librarian", "musician", "content", "director",
                      "eye", "cutter", "algorithm",
                      "_project")
@@ -7412,7 +7412,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
 
         # ── Phase 2: Panel selection (before worker spawns) ────────────
         # Resolve the panel HERE in the main thread so the worker can gate
-        # which agent objects it builds — no more TechPriest on "What is the sun?"
+        # which agent objects it builds — no more Coder on "What is the sun?"
         _keyword_panel, _synth_role = _panel_for_route(route)
 
         if self.var_judge_panel.get():
@@ -7430,11 +7430,11 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
 
         # ── Personality-lead override ────────────────────────────
         # If the user names a specific personality ("with the writer as lead",
-        # "focus on techpriest", "have the sage take the lead"), reorder the
+        # "focus on coder", "have the sage take the lead"), reorder the
         # panel so that personality goes first and becomes the synth role.
         _LEAD_ALIASES = {
             "writer":     "writer",
-            "techpriest": "techpriest", "tech priest": "techpriest", "tech-priest": "techpriest",
+            "coder": "coder",
             "intern":     "intern",
             "peasant":    "peasant",
             "artist":     "artist",
@@ -7504,7 +7504,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                     return
 
                 enable_tools = bool(self.var_tools.get())
-                use_tp_agent  = bool(self.var_use_techpriest_agent.get()) if hasattr(self, "var_use_techpriest_agent") else False
+                use_tp_agent  = bool(self.var_use_coder_agent.get()) if hasattr(self, "var_use_coder_agent") else False
                 use_in_agent  = bool(self.var_use_intern_agent.get())     if hasattr(self, "var_use_intern_agent")     else False
                 use_rag       = bool(self.var_use_rag.get())              if hasattr(self, "var_use_rag")              else False
                 tools = _make_tools(self.runner, self.librarian, VAULT_DIR) if enable_tools else {}
@@ -7541,10 +7541,10 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                     except Exception:
                         pass
 
-                # ── TechPriest agent wrapper ───────────────────────
-                class _TechPriestWrapper:
-                    """Makes TechPriestAgent look like a ModelAgent for the orchestrator."""
-                    display_name = "Tech-Priest"
+                # ── Coder agent wrapper ───────────────────────
+                class _CoderWrapper:
+                    """Makes CoderAgent look like a ModelAgent for the orchestrator."""
+                    display_name = "Coder"
                     def __init__(self_, agent):
                         self_.agent = agent
                         # Expose .model so orchestrator rebuttal/cross-fire can call .model.respond()
@@ -7553,15 +7553,15 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                         return None
                     def act(self_, ctx):
                         state = self_.agent.run(ctx.user_text)
-                        evs = [AgentEvent("Tech-Priest", "final",
+                        evs = [AgentEvent("Coder", "final",
                                           f"{state.final_code}\n\n{state.explanation}")]
                         if state.passed:
-                            evs.insert(0, AgentEvent("Tech-Priest", "observation",
+                            evs.insert(0, AgentEvent("Coder", "observation",
                                                      f"✓ Passed in {state.attempt} attempt(s)"))
                         else:
-                            evs.insert(0, AgentEvent("Tech-Priest", "observation",
+                            evs.insert(0, AgentEvent("Coder", "observation",
                                                      f"⚠ Best effort after {state.attempt} attempts"))
-                        ctx.shared.setdefault("techpriest_code", state.final_code)
+                        ctx.shared.setdefault("coder_code", state.final_code)
                         return evs
 
                 # ── Intern agent wrapper ───────────────────────────
@@ -7585,17 +7585,17 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
 
                 # ── Build agents dict ──────────────────────────────
                 # Gate agent wrappers by resolved panel membership.
-                # If techpriest/intern are not in the panel, build them as plain
+                # If coder/intern are not in the panel, build them as plain
                 # ModelAgents — no Dream3D static analyser, no web research loop.
                 # This is the critical guard: "What is the sun?" will never build
-                # a TechPriestWrapper because "techpriest" won't be in _resolved_panel.
-                _tp_in_panel = "techpriest" in _resolved_panel
+                # a CoderWrapper because "coder" won't be in _resolved_panel.
+                _tp_in_panel = "coder" in _resolved_panel
                 _in_in_panel = "intern"     in _resolved_panel
 
-                if use_tp_agent and self.techpriest_agent and _tp_in_panel:
-                    techpriest_slot = _TechPriestWrapper(self.techpriest_agent)
+                if use_tp_agent and self.coder_agent and _tp_in_panel:
+                    coder_slot = _CoderWrapper(self.coder_agent)
                 else:
-                    techpriest_slot = ModelAgent("Tech-Priest", self.techpriest,
+                    coder_slot = ModelAgent("Coder", self.coder,
                                                  tools=tools, enable_tools=enable_tools,
                                                  token_callback=_token_cb)
 
@@ -7608,7 +7608,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
 
                 # ── Inject Librarian briefing into every personality ──
                 # Each role gets context appropriate to its job:
-                #   Writer / TechPriest / Intern / Artist → full vault briefing
+                #   Writer / Coder / Intern / Artist → full vault briefing
                 #   Peasant → targeted briefing that guides specific questions
                 #
                 # We patch .respond() on each model for the duration of this
@@ -7634,7 +7634,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                 # Always apply council instructions even if no vault context
                 if _ci and not lib_brief["found"]:
                     _ci_block = "COUNCIL INSTRUCTIONS:\n" + _ci
-                    for _pm in [self.writer, self.techpriest, self.intern,
+                    for _pm in [self.writer, self.coder, self.intern,
                                 self.artist, self.sage, self.strategist,
                                 self.musician, self.content, self.director]:
                         if _pm is not None:
@@ -7686,7 +7686,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                                     # ── #6 Dynamic panel expansion ──────────
                                     _suggested = _stripped.split(":", 1)[-1].strip().lower()
                                     _valid_addable = {
-                                        "writer", "techpriest", "intern", "sage",
+                                        "writer", "coder", "intern", "sage",
                                         "strategist", "artist", "musician",
                                         "content", "director", "peasant",
                                     }
@@ -7714,7 +7714,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                     # Inject Librarian briefing only into roles that actually use vault.
                     # Roles with use_vault="none" would discard it immediately in respond() —
                     # skipping them avoids constructing context that gets thrown away.
-                    _full_vault_roles  = ("writer", "techpriest", "sage", "strategist",
+                    _full_vault_roles  = ("writer", "coder", "sage", "strategist",
                                           "content", "director", "librarian")
                     _lite_vault_roles  = ("peasant",)   # gets targeted briefing below
                     # intern, artist, musician, skeptic → use_vault="none", skip entirely
@@ -7727,8 +7727,8 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                     _patch_model(self.peasant, lib_brief["peasant"], "peasant")
 
                     # Also patch underlying models in agent wrappers
-                    if hasattr(techpriest_slot, "model") and techpriest_slot.model is not self.techpriest:
-                        _patch_model(techpriest_slot.model, _librarian_briefing, "techpriest_agent_model")
+                    if hasattr(coder_slot, "model") and coder_slot.model is not self.coder:
+                        _patch_model(coder_slot.model, _librarian_briefing, "coder_agent_model")
                     if hasattr(intern_slot, "model") and intern_slot.model is not self.intern:
                         _patch_model(intern_slot.model, _librarian_briefing, "intern_agent_model")
 
@@ -7736,7 +7736,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                     "writer":     ModelAgent("Writer",   self.writer,  enable_tools=False, token_callback=_token_cb),
                     "peasant":    ModelAgent("Peasant",  self.peasant, enable_tools=False, token_callback=_token_cb),
                     "intern":     intern_slot,
-                    "techpriest": techpriest_slot,
+                    "coder": coder_slot,
                     "artist":     ModelAgent("Artist",   self.artist,  enable_tools=False, token_callback=_token_cb),
                 }
                 if self.skeptic is not None:
@@ -7759,7 +7759,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
 
                 # T2-D: Apply per-query model overrides
                 _override_map = {
-                    "writer": self.writer, "techpriest": self.techpriest,
+                    "writer": self.writer, "coder": self.coder,
                     "intern": self.intern, "artist": self.artist,
                     "skeptic": self.skeptic,
                 }
@@ -7804,7 +7804,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                     pause_event=self._pause_event,
                     answer_getter=_answer_getter,
                 )
-                _code_routes = {"ide", "techpriest", "intern"}
+                _code_routes = {"ide", "coder", "intern"}
                 _content_routes = {"content", "writer", "chat", "musician"}
                 _query_mode  = "technical" if route in _code_routes else "conversational"
                 _latex_mode  = _detect_latex_request(user_text)
@@ -7905,12 +7905,12 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                 final_text = _filter_final(final_text, route, user_text)
                 last_critique = next((e.text for e in reversed(events) if e.who == "Judge" and e.kind == "observation"), "")
 
-                # IDE fill — prefer TechPriest agent code if available
+                # IDE fill — prefer Coder agent code if available
                 if route == "ide" and self.var_fill_ide.get():
-                    # Check if TechPriest agent produced code directly
+                    # Check if Coder agent produced code directly
                     tp_code = None
                     for ev in reversed(events):
-                        if ev.who == "Tech-Priest" and ev.kind == "final":
+                        if ev.who == "Coder" and ev.kind == "final":
                             extracted = _extract_code_block(ev.text)
                             if extracted:
                                 tp_code = extracted
@@ -7989,7 +7989,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
             finally:
                 # Always restore patched model.respond — even on exception.
                 _restore_map = {
-                    "writer":    self.writer,   "techpriest": self.techpriest,
+                    "writer":    self.writer,   "coder": self.coder,
                     "intern":    self.intern,   "artist":     self.artist,
                     "peasant":   self.peasant,  "skeptic":    self.skeptic,
                     "director":  getattr(self, "director",   None),
@@ -7999,7 +7999,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                     "algorithm": getattr(self, "algorithm",  None),
                     # Style brief patch key — director pre-pass injects into writer
                     "director_style_brief": self.writer,
-                    "techpriest_agent_model": getattr(locals().get("techpriest_slot"), "model", None),
+                    "coder_agent_model": getattr(locals().get("coder_slot"), "model", None),
                     "intern_agent_model":     getattr(locals().get("intern_slot"),     "model", None),
                 }
                 for _rname, _orig_fn in locals().get("_patched_models", {}).items():
@@ -8656,12 +8656,12 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
                 "writer":     ModelAgent("Writer",     self.writer,     enable_tools=False),
                 "peasant":    ModelAgent("Peasant",    self.peasant,    enable_tools=False),
                 "intern":     ModelAgent("Intern",     self.intern,     enable_tools=False),
-                "techpriest": ModelAgent("TechPriest", self.techpriest, enable_tools=False),
+                "coder": ModelAgent("Coder", self.coder, enable_tools=False),
                 "artist":     ModelAgent("Artist",     self.artist,     enable_tools=False),
             }
             if self.skeptic is not None:
                 agents["skeptic"] = ModelAgent("Skeptic", self.skeptic, enable_tools=False)
-            panel = [p for p in panel if p in agents] or ["intern", "techpriest", "artist"]
+            panel = [p for p in panel if p in agents] or ["intern", "coder", "artist"]
             orch = DeliberationOrchestrator(
                 judge_model=self.judge, agents=agents,
                 max_rounds=2, debate_turns=1,  # leaner for background -- 1 cross-fire turn
@@ -8780,7 +8780,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
             "Pin personalities to backend keys.\n\n"
             "Valid keys: local_general_primary, local_general_alt, local_coder_primary,\n"
             "local_coder_fast, local_judge_fast, local_peasant_fast\n\n"
-            "Example:\n{\"techpriest\":\"local_coder_primary\",\"writer\":\"local_general_primary\"}",
+            "Example:\n{\"coder\":\"local_coder_primary\",\"writer\":\"local_general_primary\"}",
             initialvalue=current, parent=self,
         )
         if new is None:
@@ -8809,7 +8809,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
             outcome = "PASS" if passed else "NEEDS_WORK/max-rounds"
             roles = [
                 ("intern",      self.intern),
-                ("techpriest",  self.techpriest),
+                ("coder",  self.coder),
                 ("peasant",     self.peasant),
                 ("artist",      self.artist),
                 ("writer",      self.writer),
@@ -8832,7 +8832,7 @@ class CouncilConsole(IdeaTabMixin, tk.Tk):
             # ── #1 Shared project memory: observer roles write cross-session facts ──
             # Runs after role memory so observers can reference their fresh role memory.
             # Uses only one observer role per deliberation (first available in priority order).
-            _observer_priority = ["techpriest", "sage", "strategist", "director"]
+            _observer_priority = ["coder", "sage", "strategist", "director"]
             for _obs_name in _observer_priority:
                 _obs_model = getattr(self, _obs_name, None)
                 if _obs_model is not None:
@@ -9341,7 +9341,7 @@ if __name__ == "__main__":
     print(" Profile: RTX 5080 (16 GB VRAM) / 64 GB RAM")
     print(" Models:  qwen2.5:32b-instruct-q4_K_M (writer/sage/musician)")
     print("          qwen2.5:14b-instruct-q4_K_M (strategist/librarian)")
-    print("          qwen2.5-coder:14b-instruct-q4_K_M (techpriest)")
+    print("          qwen2.5-coder:14b-instruct-q4_K_M (coder)")
     print("          phi4 (judge / peasant / intern)")
     print(" Context: 8192 tokens  |  Max loaded models: 2")
     print("=" * 60)

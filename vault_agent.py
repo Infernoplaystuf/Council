@@ -6,7 +6,7 @@
 # or access anything outside VAULT_DIR — the sandbox is
 # enforced on every operation regardless of what the model says.
 #
-# Uses the same PersonalityModel interface as TechPriest/Intern
+# Uses the same PersonalityModel interface as Coder/Intern
 # so it runs on whatever local models Council already has loaded.
 # No external API calls, no internet access, no subprocess.
 #
@@ -605,7 +605,7 @@ if _TK_OK:
             self._model_var = tk.StringVar(value="writer")
             model_cb = ttk.Combobox(mf, textvariable=self._model_var, width=14,
                                     state="readonly",
-                                    values=["writer", "techpriest", "judge",
+                                    values=["writer", "coder", "judge",
                                             "intern", "peasant"])
             model_cb.pack(side="left", padx=4)
 

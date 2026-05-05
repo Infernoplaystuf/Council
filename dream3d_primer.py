@@ -1,7 +1,7 @@
 # ============================================================
 # dream3d_primer.py  —  Dream3D/simplnx context for the council
 # ============================================================
-# Injects Dream3D-specific knowledge into Tech-Priest and Writer
+# Injects Dream3D-specific knowledge into Coder and Writer
 # system prompts so the models have the right baseline API
 # understanding even before RAG retrieves specific filter docs.
 #
@@ -14,7 +14,7 @@ from __future__ import annotations
 from typing import Any, Dict
 
 # ── Core API primer ───────────────────────────────────────────
-# This is injected into Tech-Priest and Writer's extra_context.
+# This is injected into Coder and Writer's extra_context.
 # Covers: imports, DataStructure, filter execution pattern,
 # result checking, pipeline construction, common pitfalls.
 
@@ -182,21 +182,21 @@ result checking is present after every filter, DataPaths are properly formed.
 
 def inject_dream3d_context(personalities: Dict[str, Any]) -> None:
     """
-    Inject the Dream3D primer into Tech-Priest and Writer's
+    Inject the Dream3D primer into Coder and Writer's
     extra_context so every response is Dream3D-aware.
 
     Call this after build_personalities():
         personalities = ce.build_personalities(...)
         inject_dream3d_context(personalities)
     """
-    tech_priest = personalities.get("techpriest")
+    coder = personalities.get("coder")
     writer      = personalities.get("writer")
     intern_     = personalities.get("intern")
 
-    if tech_priest is not None:
-        existing = getattr(tech_priest, "extra_context", "") or ""
-        tech_priest.extra_context = (SIMPLNX_PRIMER + "\n\n" + existing).strip()
-        print("[Dream3D] Injected simplnx primer into Tech-Priest")
+    if coder is not None:
+        existing = getattr(coder, "extra_context", "") or ""
+        coder.extra_context = (SIMPLNX_PRIMER + "\n\n" + existing).strip()
+        print("[Dream3D] Injected simplnx primer into Coder")
 
     if writer is not None:
         existing = getattr(writer, "extra_context", "") or ""
@@ -215,7 +215,7 @@ def inject_dream3d_context(personalities: Dict[str, Any]) -> None:
 class PipelineValidator:
     """
     Static analysis checks for Dream3D pipeline scripts.
-    Runs BEFORE execution in the TechPriest agent loop to catch
+    Runs BEFORE execution in the Coder agent loop to catch
     common structural errors early and give the model better
     feedback than a raw Python traceback.
     """

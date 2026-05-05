@@ -1,7 +1,7 @@
 # ============================================================
-# techpriest_agent.py  —  Self-correcting coding agent
+# coder_agent.py  —  Self-correcting coding agent
 # ============================================================
-# Replaces the single-shot Tech-Priest with a ReAct loop:
+# Replaces the single-shot Coder with a ReAct loop:
 #   write code → execute → read error → reflect → fix → repeat
 #   Up to MAX_ATTEMPTS before giving up.
 #
@@ -35,8 +35,8 @@ try:
 except (ImportError, OSError) as _e:
     # OSError on Windows = DLL load failure (usually torch/CUDA mismatch)
     if isinstance(_e, OSError):
-        print(f"[TechPriest] LangGraph skipped — DLL load error: {_e}")
-        print("[TechPriest] Tip: run  pip uninstall torch torchvision torchaudio -y")
+        print(f"[Coder] LangGraph skipped — DLL load error: {_e}")
+        print("[Coder] Tip: run  pip uninstall torch torchvision torchaudio -y")
         print("             then reinstall matching your CUDA version, or use CPU-only:")
         print("             pip install torch --index-url https://download.pytorch.org/whl/cpu")
 
@@ -74,7 +74,7 @@ class AgentState:
 # ============================================================
 
 SYSTEM_PROMPT = """\
-You are the TECH-PRIEST — an elite software engineer focused on robust, production-quality code.
+You are the CODER — an elite software engineer focused on robust, production-quality code.
 
 Rules:
 1. Output ONLY a fenced Python code block. No prose before it, no prose after.
@@ -423,9 +423,9 @@ def _run_fallback_loop(
 # Public API
 # ============================================================
 
-class TechPriestAgent:
+class CoderAgent:
     """
-    Drop-in replacement for the single-shot Tech-Priest ModelAgent.
+    Drop-in replacement for the single-shot Coder ModelAgent.
     Uses LangGraph if available, falls back to a pure-Python ReAct loop.
     """
 
@@ -454,11 +454,11 @@ class TechPriestAgent:
                     max_attempts=max_attempts,
                     event_callback=event_callback,
                 )
-                print("[TechPriestAgent] Using LangGraph backend")
+                print("[CoderAgent] Using LangGraph backend")
             except Exception as e:
-                print(f"[TechPriestAgent] LangGraph init failed ({e}), using fallback loop")
+                print(f"[CoderAgent] LangGraph init failed ({e}), using fallback loop")
         else:
-            print("[TechPriestAgent] langgraph not installed — using fallback ReAct loop")
+            print("[CoderAgent] langgraph not installed — using fallback ReAct loop")
 
     @property
     def uses_langgraph(self) -> bool:

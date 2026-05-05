@@ -75,7 +75,7 @@ def build_agents(*, runner: ce.LocalRunner, librarian: ce.Librarian, enable_tool
     }
 
     # Under "Enable Tools", only empower the agents that should actually poke reality.
-    # Writer stays mostly synth; TechPriest and Intern are your primary operators.
+    # Writer stays mostly synth; Coder and Intern are your primary operators.
     writer = ModelAgent("writer", ce.WriterModel(), enable_tools=False)
     peasant = ModelAgent("peasant", ce.PeasantModel(), enable_tools=False)
     artist = ModelAgent("artist", ce.ArtistModel(), enable_tools=False)
@@ -87,9 +87,9 @@ def build_agents(*, runner: ce.LocalRunner, librarian: ce.Librarian, enable_tool
         enable_tools=enable_tools,
         max_tool_steps=3,
     )
-    techpriest = ModelAgent(
-        "techpriest",
-        ce.TechPriestModel(),
+    coder = ModelAgent(
+        "coder",
+        ce.CoderModel(),
         tools=tools,
         enable_tools=enable_tools,
         max_tool_steps=3,
@@ -99,6 +99,6 @@ def build_agents(*, runner: ce.LocalRunner, librarian: ce.Librarian, enable_tool
         "writer": writer,
         "peasant": peasant,
         "intern": intern,
-        "techpriest": techpriest,
+        "coder": coder,
         "artist": artist,
     }

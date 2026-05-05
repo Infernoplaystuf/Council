@@ -3,6 +3,6 @@ personalities:
   judge:   openai_gpt4o_mini
   writer:  openai_gpt4o
   intern:  ollama_qwen_coder
-  techpriest: ollama_qwen_coder
+  coder: ollama_qwen_coder
   peasant: openai_gpt4o_mini
   artist:  openai_gpt4o_mini

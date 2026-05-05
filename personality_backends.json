@@ -1,6 +1,6 @@
 {
   "writer": "local_general_primary",
-  "techpriest": "local_coder_primary",
+  "coder": "local_coder_primary",
   "intern": "local_coder_fast",
   "judge": "local_judge_fast",
   "peasant": "local_peasant_fast",
