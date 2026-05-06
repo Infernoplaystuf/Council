@@ -27,6 +27,8 @@ from tkinter import ttk, messagebox, simpledialog
 
 import council_engine as ce
 import apothecary_engine as ae
+import branding
+import onboarding
 
 # ── Agent modules (graceful optional imports) ─────────────────
 try:
@@ -279,9 +281,9 @@ def _wrap_latex(title: str, body: str) -> str:
     import re as _re
     # Escape common LaTeX special chars in the body
     _escapes = {
-        "&": "\&", "%": "\%", "$": "\$", "#": "\#",
-        "_": "\_", "{": "\{", "}": "\}", "~": "\textasciitilde{}",
-        "^": "\textasciicircum{}",
+        "&": r"\&", "%": r"\%", "$": r"\$", "#": r"\#",
+        "_": r"\_", "{": r"\{", "}": r"\}", "~": r"\textasciitilde{}",
+        "^": r"\textasciicircum{}",
     }
     safe = body
     for ch, esc in _escapes.items():
@@ -1924,7 +1926,8 @@ class InstructionManager:
 class CouncilConsole(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Council")
+        self.title(branding.window_title())
+        branding.apply_window_icon(self)
         self.geometry("1150x820")
         self.configure(bg="#1e1e2e")
 
@@ -2030,6 +2033,12 @@ class CouncilConsole(tk.Tk):
         self.after(100, self._poll_ui_queue)
         self.after(2000, self._refresh_nodes_async)   # initial node probe
         self._start_config_watcher()                   # T1-E: hot-reload pins.json
+        # Show onboarding wizard on first launch, then check crash recovery.
+        # 500ms delay lets the main window draw before the modal appears.
+        self.after(500, lambda: onboarding.run_if_needed(
+            self, VAULT_DIR,
+            on_complete=lambda _ok: self.after(800, self._check_crash_recovery),
+        ))
 
     def _unpack_personalities(self):
         # Required core personalities — missing any of these is a config error
@@ -2055,6 +2064,65 @@ class CouncilConsole(tk.Tk):
         self.director             = self.personalities.get("director")
         self.algorithm            = self.personalities.get("algorithm")
         self.coach                = self.personalities.get("coach")
+
+    # ============================
+    # Crash recovery
+    # ============================
+
+    def _check_crash_recovery(self):
+        """
+        On startup, check for sessions that were in-flight when the app last
+        exited (sentinel `.active` file present). Offer to resume the most
+        recent one. Older orphans are cleared silently.
+        """
+        try:
+            orphans = self.convo_store.find_orphaned_sessions()
+        except Exception:
+            return
+        if not orphans:
+            return
+
+        # Most recent orphan is candidate; older ones get cleared.
+        target = orphans[0]
+        for stale in orphans[1:]:
+            try:
+                self.convo_store.clear_orphan(stale.get("session_id", ""))
+            except Exception:
+                pass
+
+        sid = target.get("session_id", "")
+        query = target.get("query", "") or "(no query recorded)"
+        started = target.get("started_at", "")
+
+        from tkinter import messagebox
+        choice = messagebox.askyesnocancel(
+            "Recover unfinished session?",
+            f"Council appears to have closed during a deliberation.\n\n"
+            f"Started:  {started}\n"
+            f"Question: {query[:160]}\n\n"
+            f"Yes  → Load that session and continue\n"
+            f"No   → Discard the unfinished work\n"
+            f"Cancel → Decide later (will ask again next launch)",
+            parent=self,
+        )
+        if choice is True:
+            # Load the orphaned session as the active one
+            try:
+                self.session_id = sid
+                if hasattr(self, "_load_session_into_transcript"):
+                    self._load_session_into_transcript(sid)
+                self._append_transcript(
+                    "Council",
+                    f"⏪ Resumed session {sid}. Re-send your last question if "
+                    f"you want the panel to continue.",
+                    "observation",
+                )
+            except Exception as e:
+                print(f"[CrashRecovery] Failed to resume {sid}: {e}")
+                self.convo_store.clear_orphan(sid)
+        elif choice is False:
+            self.convo_store.clear_orphan(sid)
+        # Cancel → leave sentinel; next launch asks again.
 
     # ============================
     # Dark theme
@@ -5544,6 +5612,14 @@ class CouncilConsole(tk.Tk):
                 self.ui_q.put(("stream_token", who, token))
 
         def worker():
+            # ── Crash-recovery sentinel ─────────────────────────────
+            # Mark this session as in-flight; clear on clean exit. If the
+            # app crashes between these two calls, find_orphaned_sessions()
+            # will surface it on next launch so the user can resume.
+            try:
+                self.convo_store.mark_session_active(self.session_id, user_text)
+            except Exception:
+                pass
             try:
                 use_deliberation  = bool(self.var_deliberate.get())  if hasattr(self, "var_deliberate")  else True
                 use_adversarial   = bool(self.var_adversarial.get()) if hasattr(self, "var_adversarial") else False
@@ -6066,6 +6142,12 @@ class CouncilConsole(tk.Tk):
                     if _tr_m is not None:
                         try: _tr_m.temperature = _orig_temp
                         except Exception: pass
+                # Clear crash-recovery sentinel — deliberation reached its
+                # finally block, so by definition the app didn't crash mid-flight.
+                try:
+                    self.convo_store.mark_session_done(self.session_id)
+                except Exception:
+                    pass
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -6919,9 +7001,86 @@ class CouncilConsole(tk.Tk):
 
     # ---- IDE actions ----
 
+    # Patterns flagged before code execution. If any match, the user must
+    # explicitly approve via the trust gate. Generated by an LLM, executed
+    # blindly is the #1 risk in agentic dev tools.
+    _IDE_RISKY_PATTERNS = [
+        (r'\bos\.system\b',                "shell command execution"),
+        (r'\bsubprocess\.\w+',             "subprocess calls"),
+        (r'\bshutil\.(rmtree|move)\b',     "directory delete/move"),
+        (r'\bos\.(remove|unlink|rmdir)\b', "file/directory deletion"),
+        (r'\.unlink\(\)',                  "Path.unlink (file deletion)"),
+        (r'\beval\s*\(',                   "dynamic code evaluation"),
+        (r'\bexec\s*\(',                   "dynamic code execution"),
+        (r'\b__import__\s*\(',             "dynamic imports"),
+        (r'\brequests\.(get|post|put|delete|patch)\b', "outbound HTTP"),
+        (r'\burllib\.(request|urlopen)',   "outbound HTTP"),
+        (r'\bsocket\.(socket|connect)',    "raw socket access"),
+        (r'\bos\.environ\[',               "environment variable access"),
+        (r'\bpickle\.(load|loads)\b',      "pickle deserialisation (RCE risk)"),
+    ]
+
+    def _ide_scan_risky(self, code: str):
+        """Return list of (pattern_label, line_number) for any risky pattern hits."""
+        import re as _re
+        hits = []
+        for line_no, line in enumerate(code.splitlines(), start=1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            for pat, label in self._IDE_RISKY_PATTERNS:
+                if _re.search(pat, line):
+                    hits.append((label, line_no, stripped[:120]))
+                    break  # one flag per line is enough
+        return hits
+
+    def _ide_trust_gate(self, code: str) -> bool:
+        """
+        Show a confirmation dialog if code contains risky patterns. Trust
+        decisions are session-scoped (hashed code is remembered until restart).
+        Returns True if execution should proceed.
+        """
+        import hashlib
+        # Initialise per-session trust set
+        if not hasattr(self, "_ide_trusted_hashes"):
+            self._ide_trusted_hashes: set = set()
+        h = hashlib.sha256(code.encode("utf-8", errors="replace")).hexdigest()
+        if h in self._ide_trusted_hashes:
+            return True
+
+        hits = self._ide_scan_risky(code)
+        if not hits:
+            return True   # no risky patterns — run freely
+
+        # Build a clear, scannable message
+        lines = ["This script contains operations that can affect your system:\n"]
+        for label, ln, snippet in hits[:10]:
+            lines.append(f"  • Line {ln}: {label}")
+            lines.append(f"      {snippet}")
+        if len(hits) > 10:
+            lines.append(f"  …and {len(hits) - 10} more")
+        lines.append("\nReview the script carefully before running.")
+        lines.append("\nRun this script anyway?")
+
+        from tkinter import messagebox
+        choice = messagebox.askyesno(
+            "Confirm code execution",
+            "\n".join(lines),
+            parent=self,
+            icon="warning",
+            default="no",
+        )
+        if choice:
+            self._ide_trusted_hashes.add(h)
+            return True
+        return False
+
     def _ide_run(self):
         code = self.ide_code.get("1.0", "end")
         if not code.strip():
+            return
+        if not self._ide_trust_gate(code):
+            self.ui_q.put(("ide_info", "[Cancelled by user]\n"))
             return
 
         def worker():
@@ -6942,6 +7101,9 @@ class CouncilConsole(tk.Tk):
     def _ide_run_stream(self):
         code = self.ide_code.get("1.0", "end")
         if not code.strip():
+            return
+        if not self._ide_trust_gate(code):
+            self.ui_q.put(("ide_info", "[Cancelled by user]\n"))
             return
 
         def worker():
@@ -7375,13 +7537,8 @@ def main():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print(" Council AI — Desktop Build")
-    print(" Profile: RTX 5080 (16 GB VRAM) / 64 GB RAM")
-    print(" Models:  qwen2.5:32b-instruct-q4_K_M (writer/sage/musician)")
-    print("          qwen2.5:14b-instruct-q4_K_M (strategist/librarian)")
-    print("          qwen2.5-coder:14b-instruct-q4_K_M (coder)")
-    print("          phi4 (judge / peasant / intern)")
-    print(" Context: 8192 tokens  |  Max loaded models: 2")
+    print(f" {branding.PRODUCT_NAME} v{branding.VERSION}")
+    print(f" {branding.PRODUCT_TAGLINE}")
     print("=" * 60)
     print()
     main()

@@ -1,0 +1,44 @@
+# Council — runtime dependencies
+# ============================================================
+# Install with:  pip install -r requirements.txt
+# Python 3.11 is required.
+# ============================================================
+
+# ---- Core (always required) ----
+PyYAML>=6.0
+requests>=2.31
+
+# ---- Data ingestion / display ----
+numpy>=1.24
+pandas>=2.0
+openpyxl>=3.1            # XLSX support
+xlrd>=2.0                # legacy XLS support
+pyarrow>=14.0            # fast parquet/feather (optional but recommended)
+
+# ---- Plotting (Grapher tab) ----
+matplotlib>=3.7
+plotly>=5.17
+tkinterweb>=3.24         # Plotly HTML viewer inside Tk
+
+# ---- AI backends ----
+ollama>=0.1.7
+
+# ---- RAG (vault search) — optional but installed by default ----
+chromadb>=0.4
+sentence-transformers>=2.2
+
+# ---- Web crawler for reference docs (vault scraper) ----
+beautifulsoup4>=4.12
+lxml>=4.9
+
+# ---- Speech (optional) ----
+pyttsx3>=2.90
+faster-whisper>=0.10     # offline transcription
+sounddevice>=0.4         # mic input
+soundfile>=0.12
+
+# ---- SSH compute nodes (optional) ----
+paramiko>=3.3
+
+# ---- Build tooling (only needed to ship binaries) ----
+# pyinstaller>=6.0       # uncomment when building

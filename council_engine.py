@@ -528,6 +528,60 @@ class ConversationStore:
             return ""
         return p.read_text(encoding="utf-8", errors="replace").strip()
 
+    # ── Crash-recovery sentinel ────────────────────────────────
+    # A session writes an `.active` sentinel when it starts deliberating,
+    # and removes it on clean shutdown. On startup, any remaining sentinel
+    # indicates a crash mid-deliberation — the orphaned session can be
+    # offered for resume.
+
+    def _active_sentinel(self, session_id: str) -> Path:
+        return self.base_dir / f"{safe_name(session_id, 64)}.active"
+
+    def mark_session_active(self, session_id: str, query: str = "") -> None:
+        """Mark the session as in-flight. Safe to call repeatedly."""
+        p = self._active_sentinel(session_id)
+        try:
+            p.write_text(json.dumps({
+                "session_id": session_id,
+                "started_at": now_iso(),
+                "query":      query[:200],
+            }), encoding="utf-8")
+        except Exception:
+            pass  # never let a sentinel write block deliberation
+
+    def mark_session_done(self, session_id: str) -> None:
+        """Remove the in-flight sentinel after a clean deliberation."""
+        p = self._active_sentinel(session_id)
+        try:
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+
+    def find_orphaned_sessions(self) -> List[Dict[str, Any]]:
+        """
+        Return metadata for any sessions that have an `.active` sentinel
+        without a matching clean shutdown. Used at startup to offer resume.
+        """
+        orphans: List[Dict[str, Any]] = []
+        for p in self.base_dir.glob("*.active"):
+            try:
+                meta = json.loads(p.read_text(encoding="utf-8"))
+                # Only surface orphans whose .jsonl actually exists
+                if self.session_path(meta.get("session_id", "")).exists():
+                    orphans.append(meta)
+            except Exception:
+                # Malformed sentinel — best-effort cleanup
+                try: p.unlink()
+                except Exception: pass
+        # Newest first
+        orphans.sort(key=lambda m: m.get("started_at", ""), reverse=True)
+        return orphans
+
+    def clear_orphan(self, session_id: str) -> None:
+        """Discard an orphan's sentinel (user chose not to resume)."""
+        self.mark_session_done(session_id)
+
     def load_session_summary(self, session_id: str, max_turns: int = 6) -> str:
         """
         Return a condensed text summary of a past session suitable for
