@@ -40,12 +40,13 @@ hidden = [
 ]
 
 # ---- Data files to ship alongside the executable ----
+# `assets/` contains icons, splash, and `sample_data/` (3 demo CSVs).
 datas = [
-    ("assets",                   "assets"),
-    ("personality_config.yaml",  "."),
+    ("assets",                    "assets"),
+    ("personality_config.yaml",   "."),
     ("personality_backends.json", "."),
-    ("README.md",                "."),
-    ("USER_GUIDE.md",            "."),
+    ("README.md",                 "."),
+    ("USER_GUIDE.md",             "."),
 ]
 
 # ---- Modules to deliberately exclude (slim down the bundle) ----
@@ -81,7 +82,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="Council",
+    name="DatasInferno",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -98,5 +99,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="Council",
+    name="DatasInferno",
 )

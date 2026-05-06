@@ -1,30 +1,33 @@
-# Council — User Guide
+# Data's Inferno — User Guide
 
-The README covers install and a high-level tour. This guide goes one layer deeper so you can actually be productive.
+The README covers install and the value pitch. This guide goes deeper so you can actually be productive with your own data on day one.
 
 ---
 
-## How to ask a good question
+## How to ask a question that gets a useful answer
 
-Council answers in proportion to the structure of your question. There are three patterns that work consistently well:
+Data's Inferno answers in proportion to the structure of your question. Three patterns work consistently well:
 
-### Pattern A — Pose a problem, not a task
-> "I keep getting timeouts when I open a 200MB CSV in Excel. What are my options?"
+### Pattern A — Point at a file, then ask
+> "Looking at orders.csv from this month, what changed compared to last month?"
 
-The Judge will route this to a planning panel (intern + writer + peasant), each will draft an answer, the Peasant will press for specifics, and you'll get a ranked list of options with trade-offs.
+The panel will route to data-comparison logic. The Coder pulls the rows, the Analyst computes the deltas, the Writer explains them.
 
-### Pattern B — Show, then ask
-Paste a chunk of text, code, or data, then ask. Council reads what you paste as primary context.
+### Pattern B — Show a sample, then ask
+Paste a few rows of data into the input, then ask:
 > ```
-> [your data here]
+> customer_id, last_order, total_spend
+> A123,        2026-04-15, 4200
+> A124,        2026-01-02, 850
+> A125,        2026-04-30, 12100
 >
-> What does this tell me about Q3?
+> What's a sensible "high-value-but-dormant" threshold for follow-up?
 > ```
 
 ### Pattern C — Specify the deliverable
-> "Write me a single-paragraph summary I can paste into Slack."
+> "Give me a one-paragraph summary I can paste into an email to my supplier."
 
-The Writer will format strictly to the deliverable. If you ask for "code that runs as-is", the Coder will avoid pseudocode.
+The Writer will format strictly to that. If you ask for "a SQL query that runs on Postgres", the Coder respects the dialect.
 
 ---
 
@@ -34,179 +37,187 @@ The Writer will format strictly to the deliverable. If you ask for "code that ru
 ┌────────────────────────────────────────────────────────┐
 │ Transcript                          │ Judge panel      │
 │ ─────────────                       │ ─────────────    │
-│ [User]    What is X?                │ Route: writer    │
-│ [Writer]  X is …                    │ Panel:           │
-│ [Intern]  Counterpoint …            │   • writer       │
-│ [Peasant] But how does …            │   • intern       │
-│ [Judge]   Verdict: PASS (87%)       │   • peasant      │
-│                                      │ Confidence: 87%  │
-│                                      │ Rounds: 2        │
+│ [User]    Top 5 dormant customers?  │ Route: data      │
+│ [Coder]   SELECT * FROM ...         │ Panel:           │
+│ [Analyst] Here's a chart of …       │   • coder        │
+│ [Peasant] Why is X above the cut?   │   • analyst      │
+│ [Judge]   Verdict: PASS (91%)       │   • peasant      │
+│                                      │ Confidence: 91%  │
+│                                      │ Rounds: 1        │
 └────────────────────────────────────────────────────────┘
 ```
 
-- **Transcript** (left): live, append-only. You can scroll back, copy any line, save the entire session.
-- **Judge panel** (right): which route was chosen, which personalities were summoned, the live confidence score, and the round counter. If you see "Round 4+" the Council is struggling — usually means the question is genuinely ambiguous.
+- **Transcript** (left): live, append-only. Scroll back, copy any line, save the entire session.
+- **Judge panel** (right): which route was chosen, who's on the panel, the live confidence score, and the round counter. If you see "Round 4+", the question is genuinely ambiguous.
 
 ### What the verdicts mean
 
-- **PASS** — The Judge accepted the lead personality's draft.
-- **RETRY** — The draft was rejected; the panel will iterate.
-- **CHANGE** — A different personality's draft won out.
+- **PASS** — The Judge accepted the lead answer.
+- **RETRY** — The draft was rejected; the panel iterates.
+- **CHANGE** — A different specialist's draft won out.
 
 ### Pausing for clarification
 
-When a personality asks a clarifying question mid-deliberation, the Council pauses and shows a yellow "Awaiting your answer…" banner. Type your answer in the input box and press Enter to resume.
+When a panel member needs a clarifying detail, the Council pauses and shows a yellow "Awaiting your answer…" banner. Type your reply and press Enter to resume.
 
 ---
 
-## Personalities — what each one is good for
+## The AI panel — who's on it and when
+
+You don't pick the panel — the Judge does, based on what you asked. Here's the matching logic:
 
 | Role | Voice | Best for |
 |------|-------|----------|
-| **Judge** | Neutral, decisive, terse | Routing & final verdicts. Always present. |
-| **Writer** | Crisp, organised | Documents, summaries, plain explanations |
-| **Coder** | Systematic, defensive | Production code, refactors, bug hunts |
-| **Intern** | Eager, fast, broad | First-pass scaffolding, brainstorms |
-| **Peasant** | Skeptical, plain-spoken | Cross-examination — "why is this true?" |
-| **Artist** | Visual, evocative | UI copy, naming, visual descriptions |
-| **Sage** | Knowledgeable, calm | Domain knowledge, RAG-assisted answers |
-| **Strategist** | Long-horizon, structured | Plans, sequencing, options analysis |
-| **Skeptic** | Adversarial | Find flaws in a proposed answer |
-| **Director** | Editorial | Style consistency across long output |
-| **Content** | Audience-aware | Tone, framing for a specific reader |
-| **Algorithm** | Pattern-aware | Observation about distribution & systems |
-| **Coach** | Performance-focused | Delivery, pacing, presentation polish |
+| **Judge** | Decisive, terse | Routing & final verdicts. Always present. |
+| **Writer** | Crisp, organised | Plain-English summaries, narrative reports |
+| **Coder** | Systematic, defensive | Pandas/SQL queries, calculations, joins |
+| **Intern** | Eager, fast | First-pass scans, rough sketches |
+| **Peasant** | Skeptical, plain-spoken | Cross-examination — "why does that follow?" |
+| **Sage** | Knowledgeable | Historical context from your indexed files |
+| **Strategist** | Long-horizon | Trends, projections, what-to-watch |
+| **Skeptic** | Adversarial | Find flaws in the proposed answer |
+| **Artist** | Visual | Chart styling, dashboard layout suggestions |
+| **Director** | Editorial | Style consistency for reports going out |
+| **Content** | Audience-aware | Tone for customer-facing language |
+| **Algorithm** | Pattern-aware | Distribution shape, outliers, clustering |
+| **Coach** | Performance-focused | Pacing, simplification, what to drop |
 
-You don't pick the personalities — the Judge does. But you can override on the **Lens** tab.
-
----
-
-## The IDE / Runner tab
-
-Anything the Coder produces lands here. You can:
-
-1. **Edit it inline.** The Council picks up your edits as the new working version.
-2. **Run it.** Click ▶ Run. Output (stdout + stderr) streams to the Council transcript so the panel can react.
-3. **Send back to Council.** Output becomes part of the next deliberation's context.
-
-The runner is sandboxed to `vault/workspace/`. Files written outside that directory are blocked unless you explicitly approve.
-
-### Workflow: build something iteratively
-
-```
-You    : "Build me a script that finds duplicate files by hash"
-Coder  : (writes draft into IDE)
-You    : ▶ Run on your dataset
-Output : Found 217 duplicate clusters
-You    : "Now group them by extension and write a CSV"
-Coder  : (edits in place — only the diff)
-```
-
-This back-and-forth is how Council expects you to use it. Don't try to one-shot complex code in a single prompt.
+You can override the Judge's choice on the **🔍 Lens** tab.
 
 ---
 
-## The Grapher tab
+## The Grapher tab — your starting point for any new dataset
 
-Drop a file → get charts.
+This is usually where a session begins.
 
 ### Supported formats
-CSV · TSV · XLSX · XLS · JSON · NPY · NPZ · plain TXT (whitespace-delimited)
+CSV · TSV · XLSX · XLS · JSON · NPY · NPZ · whitespace-delimited TXT
 
-### Built-in workflow
-1. **Load** your file (Browse or drag-drop).
-2. The schema panel auto-detects column types (numeric / date / categorical / text).
-3. **Pick a chart type** — bar, line, scatter, pie, histogram, box.
-4. **Pick X and Y columns.** Aggregations available: sum, mean, count, min, max.
-5. The chart renders in the right pane.
+### The flow
+1. **Drag a file** onto the Grapher tab (or use Browse).
+2. The schema panel auto-detects column types: numeric · date · category · text.
+3. **Pick a chart type** — bar, line, scatter, pie, histogram, box, heatmap.
+4. **Pick X / Y / colour columns.** Aggregations: sum, mean, count, min, max.
+5. The chart renders in the right pane with light interactivity.
 
 ### The Analyst AI
-A specialist personality that lives only in the Grapher tab. Click 🧠 Ask Analyst and it will:
-- Suggest the most informative chart for your data
-- Identify outliers or distribution issues
-- Propose transforms (log scale, normalise, drop nulls)
-- Explain what the chart actually shows in plain English
+Click **🧠 Ask Analyst** and it will:
+- Suggest the most informative chart for *this* shape of data
+- Spot outliers, missing values, suspicious distributions
+- Propose transforms (log scale, normalise, drop nulls, group)
+- Explain what the chart actually says in plain English
+
+Most users start a session by dropping their file into the Grapher and asking the Analyst "what should I be looking at here?". The Analyst's first read is usually the right starting point.
 
 ### Live reload
-Toggle 🔄 Live Reload — the chart re-renders whenever the source file changes on disk. Useful if you're piping data from another tool.
+Toggle 🔄 Live Reload — the chart re-renders whenever the source file changes. Useful if you're piping data from another tool or editing a CSV.
 
 ### Overlay
-Load a second dataset to overlay on the same chart axes. Useful for before/after comparisons.
+Load a second dataset to overlay on the same axes. Perfect for **before / after** comparisons (this month vs. last month, with promo vs. without).
+
+### Sample datasets
+First time on the Grapher? Click **📦 Load Sample** to drop in a synthetic but realistic purchase-orders dataset. Useful for trying the tool without exposing your real data.
 
 ---
 
-## The Vault tab
+## The Vault tab — your data warehouse for the panel
 
-Two purposes:
+The vault is where all your indexed files live. Two purposes:
 
-1. **Tree-view your vault.** See every file the Council has stored across sessions. Click any to preview.
-2. **Clone external repositories.** Paste a git URL → choose a target subfolder → Clone. The clone is added to the RAG index so all personalities can reference it.
+1. **See what the AI panel knows.** Tree view of every file you've added. Click any to preview.
+2. **Add files for the panel to learn from.** Drop in:
+   - A folder of monthly export CSVs
+   - Your supplier price-list PDF
+   - A folder of reference documents (e.g. "policy.md", "glossary.md")
+   - Cloned git repos (your codebase, vendor docs)
 
-### What to clone
-- Your own project repos (so the Coder can reason about your codebase)
-- Documentation repos (e.g. a library's official docs)
-- Reference papers or datasets
+### What the panel does with vault files
+The **Sage** personality has access to a search index over everything in the vault. When you ask about your data, the Sage retrieves the most relevant rows or paragraphs and feeds them into the deliberation as context.
 
-### What NOT to clone
-- Anything with secrets — RAG will index everything indiscriminately
-- Massive monorepos — slow to clone, slow to index, low signal
+### What to put in the vault
+- Recent orders/inventory exports
+- Customer master file
+- Product catalogue
+- Supplier contact list
+- Anything you'd reference yourself in a meeting
+
+### What NOT to put in the vault
+- Raw secrets (passwords, API keys) — RAG indexes everything indiscriminately
+- Multi-GB log files — slow to index, low signal
 
 ---
 
-## The Lens tab
+## The IDE / Runner tab — for power users
 
-When the Council reaches a verdict you don't trust, paste the verdict into the Lens, pick which personalities should review it, and run.
+Anything the Coder writes ends up here. You can:
 
-Each picked personality reviews the text **in parallel** and gives an independent take. No deliberation, no consensus — just N opinions side-by-side.
+1. **Edit it inline.** The panel picks up your edits as the new working version.
+2. **Run it.** Click ▶ Run. Output streams back to the Council transcript.
+3. **Snapshot it.** 📸 Save it to the vault for re-use later.
+
+⚠ **Trust gate**: When the Coder produces code that touches files, calls subprocesses, makes network calls, or evaluates dynamic code, you'll see a confirmation dialog listing exactly what's risky and which lines. Review and approve before it runs. Trust decisions are session-scoped — restart the app and you'll be asked again.
+
+The runner is sandboxed to `vault/workspace/`. Files written outside that directory require approval.
+
+### When you'd use this
+You normally won't — the panel handles queries internally. The IDE is for when you want to:
+- Hand the Coder's script to a colleague
+- Modify the analysis (e.g. tweak a threshold)
+- Re-run the same script against next week's data
+
+---
+
+## The Lens tab — second opinions
+
+When the Council reaches a verdict you don't trust, paste the verdict into the Lens, pick which specialists should review it, and run.
+
+Each picked specialist reviews **in parallel** and gives an independent take. No deliberation, no consensus — just N opinions side-by-side.
 
 Common patterns:
-- **Code review**: Coder + Intern + Skeptic
-- **Pitch review**: Writer + Content + Strategist + Peasant
-- **Plan review**: Strategist + Skeptic + Sage
+- **Number-check**: Coder + Algorithm + Skeptic
+- **Story-check**: Writer + Content + Peasant
+- **Plan-check**: Strategist + Skeptic + Sage
+
+---
+
+## The Sessions tab — every past analysis
+
+Every conversation is auto-saved. The Sessions tab shows them newest-first with a search bar. Click any session to:
+- See the full transcript
+- Re-run the same question against fresh data
+- Export to PDF/Markdown
+- Continue from where you left off
+
+When the panel finishes a deliberation, it writes a one-paragraph summary too — that's what you see in the session list.
+
+### Crash recovery
+If Data's Inferno closes mid-deliberation (power blip, crash, accidental quit), the next launch offers to **resume the session** so you don't lose the in-flight analysis. You can also discard it and start fresh.
 
 ---
 
 ## The Vault Health tab
 
-Your council gets smarter the more you use it. Vault Health shows you what's been learned and what's missing.
+Your panel gets smarter the more you use it. Vault Health shows you what's been learned and what's missing.
 
-Three sections:
+**Memory snapshots** — what each AI specialist has stored as long-term notes about your business. Click a role to see its memory file. Edit if a stored note is outdated.
 
-**Memory snapshots** — what each personality has stored as long-term notes. Click any role to see its memory file. Edit if you want to correct an outdated note.
+**Knowledge gaps** — questions the Sage couldn't fully answer. Over time these become a wishlist of files you should add to the vault to fill the gap.
 
-**Knowledge gaps** — questions the Sage couldn't answer well. The Sage flags these automatically; over time they become a wishlist of things you should feed the Council (via the Vault tab — clone a relevant repo or drop a doc into `vault/`).
-
-**Wishlist** — manually-added topics. If you're working in a domain the Council doesn't know yet, add it here so it'll surface during deliberations.
+**Wishlist** — manually-add topics. If you're working in a domain Data's Inferno doesn't know yet, add it here so it gets surfaced during deliberations.
 
 ---
 
 ## The Speech tab
 
 **Record → Transcribe → Council**
-Click 🎙 Record, speak, click ⏹ Stop. The audio is transcribed locally (faster-whisper, no internet) and the transcript appears as your next message to the Council.
+Click 🎙 Record, speak, click ⏹ Stop. The audio is transcribed locally (offline, no internet) and the transcript becomes your next message.
 
 **TTS playback**
-Any text in the Council transcript can be played back via 🔊 Speak. Uses local pyttsx3 — works offline.
+Any text in the Council transcript can be played back aloud. Local TTS, works offline.
 
 Useful for:
-- Hands-free brainstorming (drive, walk, cook)
-- Reviewing a long deliberation while doing something else
-
----
-
-## The Nodes tab (advanced)
-
-Council can offload work to remote machines over SSH if you have, for example, a beefier desktop or a homelab GPU.
-
-### Setup
-1. The remote machine runs Ollama on an internal IP.
-2. On the Nodes tab → Add Node → fill in name, host, user, key path, model.
-3. The Council will probe it; if reachable, it appears with a green dot.
-
-### Routing
-Pin specific personalities to specific nodes. Heavy reasoning (Coder, Sage) on the remote 70B box; fast personalities (Judge, Peasant) local.
-
-The pin lives in `vault/personality_backends.json` and respects backend keys like `pi_heavy` / `desktop_70b` that you define yourself.
+- Hands-free review while driving / cooking / walking
+- Reading long deliberations aloud during commute
 
 ---
 
@@ -215,12 +226,26 @@ The pin lives in `vault/personality_backends.json` and respects backend keys lik
 Maintenance console. Useful commands:
 
 - **Cache flush** — clears `vault/.cache/`
-- **Log tail** — follows `vault/logs/council.log`
-- **RAG re-index** — rebuilds the ChromaDB index from `vault/`
-- **Personality reload** — reloads `personality_backends.json` without restart
+- **Log tail** — follows the application log
+- **RAG re-index** — rebuilds the vault search index from scratch
+- **Personality reload** — picks up edits to backends config without restart
 - **Backup vault** — zips the current vault for archival
 
 If anything misbehaves, this tab is your first stop.
+
+---
+
+## The Nodes tab (advanced)
+
+Data's Inferno can offload heavy reasoning to a remote machine over SSH if you have, for example, a beefier desktop or a homelab GPU sitting idle.
+
+### Setup
+1. The remote machine runs Ollama on its internal IP.
+2. Nodes tab → Add Node → fill in name, host, user, key path, model.
+3. Data's Inferno probes it; if reachable, it appears with a green dot.
+4. Pin specific specialists to specific nodes — heavy reasoning (Sage, Strategist) on the remote box, fast roles (Judge, Peasant) local.
+
+Most users never need this. If your laptop is enough, leave it alone.
 
 ---
 
@@ -238,29 +263,40 @@ If anything misbehaves, this tab is your first stop.
 
 ---
 
-## A typical session
+## A typical end-to-end session
 
 ```
-1. Launch     →  Council opens to the ⚖ tab
-2. Type      →  "I have a CSV of customer support tickets,
-                I need to find which categories are growing fastest"
-3. Watch     →  Judge routes to data analysis. Intern + Writer + Peasant
-                deliberate. They suggest the Grapher tab.
-4. Switch    →  📊 Grapher → Load your CSV → Ask Analyst
-5. Iterate   →  Analyst proposes a "category by week" stacked bar chart
-6. Discuss   →  Back to ⚖ Council, paste the chart's findings, ask
-                "what should I tell my support manager"
-7. Save      →  The whole session is auto-saved in 🕓 Sessions
+1. Launch          → Data's Inferno opens to the Grapher tab
+2. Drop file       → orders_april.csv → schema auto-detects 12 columns
+3. 🧠 Ask Analyst  → "highest-revenue category was Tools, but order count
+                     was actually flat — average order value rose 22%"
+4. Switch tab      → ⚖ Council
+5. Type            → "Show me which specific Tools SKUs drove the AOV bump"
+6. Watch panel     → Coder pulls rows, Analyst groups, Writer explains
+7. Verdict         → 89% confidence — top 3 SKUs are 60% of the lift
+8. 🔍 Lens         → Skeptic reviews: "is 60% statistically meaningful with
+                     this sample size?" — caveat noted
+9. Save            → 📚 Librarian → Save Session as PDF, email to team
 ```
 
-Most useful sessions move between 2-3 tabs as the task evolves.
+Most useful sessions move between 2–3 tabs as the task evolves.
 
 ---
 
 ## When things go wrong
 
-- **The Council seems stuck on Round 5+** — your question is too ambiguous. Cancel (Esc), refine the question, restart.
+- **The panel seems stuck on Round 5+** — the question is too ambiguous. Cancel (Esc), refine, restart.
 - **Same answer regardless of question** — restart Ollama. A model can wedge.
-- **Grapher chart is empty** — your column types weren't detected correctly. Check the schema panel, manually override types if needed.
-- **High GPU memory usage** — the heaviest models stay in memory between calls. Use Apothecary → Unload to free.
-- **The Sage doesn't know things it should** — feed it. Clone the relevant repo into the vault, then run a deliberation that asks about that topic. The RAG will pick it up automatically.
+- **Grapher chart is empty** — the column types weren't detected correctly. Schema panel → manually override types.
+- **High RAM usage** — heavy models stay loaded between calls. Apothecary → Unload to free.
+- **Sage doesn't know your data** — feed it. Vault tab → drop your most relevant files there, then re-run the question. RAG picks up new files within a minute.
+
+---
+
+## Pro tips
+
+- **Type slower, not faster.** The first message of a session sets the tone. Spend a sentence telling the Judge what you want ("explain like I'm new to my own data" / "give me numbers I can put in a quarterly report" / "review this critically").
+- **Drop files early.** The panel is *much* sharper when it has actual data to look at. Don't describe your data — show it.
+- **Use Lens for second opinions.** Whenever a verdict has business consequences, paste it into Lens. Skeptic will catch what the main panel missed.
+- **Check Vault Health weekly.** Adding the files it asks for pays dividends — your panel gets noticeably smarter every time you do.
+- **Don't fight the Judge's routing.** If it routes a chart question to the Grapher, follow. The panel knows which tab is best for which kind of question.

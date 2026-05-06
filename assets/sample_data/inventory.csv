@@ -1,0 +1,118 @@
+sku,product_name,category,qty_on_hand,reorder_point,unit_cost,holding_cost_monthly,last_sold_date,supplier
+TOO-100,Hammer,Tools,30,20,191.64,19.16,2025-12-09,Hilltop Ind.
+TOO-101,Hammer,Tools,12,50,207.05,8.28,2026-01-13,BoltCo
+TOO-102,Drill,Tools,5,50,206.18,3.44,2025-06-03,BoltCo
+TOO-103,Drill,Tools,30,100,104.17,10.42,2025-12-08,Acme Supply
+TOO-104,Drill,Tools,12,20,208.23,8.33,2026-03-20,Hilltop Ind.
+TOO-105,Drill,Tools,75,10,105.5,26.38,2025-11-26,TradeWorks
+TOO-106,Wrench Set,Tools,30,50,173.38,17.34,2026-02-18,Hilltop Ind.
+TOO-107,Wrench Set,Tools,30,50,44.71,4.47,2025-11-27,TradeWorks
+TOO-108,Saw,Tools,150,20,172.64,86.32,2025-12-20,TradeWorks
+TOO-109,Saw,Tools,300,100,173.32,173.32,2025-11-16,Acme Supply
+TOO-110,Saw,Tools,75,100,12.54,3.13,2026-04-14,Hilltop Ind.
+TOO-111,Screwdriver Pack,Tools,30,50,12.73,1.27,2025-10-30,Acme Supply
+TOO-112,Screwdriver Pack,Tools,75,20,147.73,36.93,2026-04-17,BoltCo
+TOO-113,Pliers,Tools,5,50,237.3,3.96,2025-12-08,Hilltop Ind.
+TOO-114,Pliers,Tools,75,20,127.22,31.81,2025-06-22,Hilltop Ind.
+TOO-115,Tape Measure,Tools,30,20,241.14,24.11,2026-03-14,Acme Supply
+TOO-116,Tape Measure,Tools,300,10,231.21,231.21,2026-04-27,Northbridge
+HAR-117,"Bolts 1/4""",Hardware,75,20,111.04,27.76,2025-12-13,BoltCo
+HAR-118,"Bolts 1/4""",Hardware,300,100,55.14,55.14,2025-11-25,BoltCo
+HAR-119,"Bolts 1/4""",Hardware,5,10,130.89,2.18,2026-01-28,BoltCo
+HAR-120,"Bolts 1/4""",Hardware,30,10,22.4,2.24,2026-02-03,BoltCo
+HAR-121,"Bolts 3/8""",Hardware,30,50,172.39,17.24,2025-12-24,Hilltop Ind.
+HAR-122,"Bolts 3/8""",Hardware,30,100,48.82,4.88,2025-06-23,Northbridge
+HAR-123,"Bolts 3/8""",Hardware,150,50,46.47,23.23,2026-03-02,Acme Supply
+HAR-124,"Bolts 3/8""",Hardware,30,10,31.57,3.16,2026-04-23,Hilltop Ind.
+HAR-125,"Bolts 3/8""",Hardware,300,20,18.05,18.05,2026-01-22,TradeWorks
+HAR-126,Nuts M8,Hardware,5,100,181.85,3.03,2026-04-28,Hilltop Ind.
+HAR-127,Nuts M8,Hardware,30,100,90.31,9.03,2026-02-08,Northbridge
+HAR-128,Nuts M8,Hardware,30,20,192.46,19.25,2025-12-31,Northbridge
+HAR-129,Nuts M8,Hardware,30,20,9.37,0.94,2025-11-14,Northbridge
+HAR-130,Nuts M8,Hardware,75,20,96.89,24.22,2025-12-06,BoltCo
+HAR-131,Washers,Hardware,75,100,198.6,49.65,2026-04-15,Northbridge
+HAR-132,Washers,Hardware,30,50,136.52,13.65,2026-03-15,Hilltop Ind.
+HAR-133,Bracket,Hardware,300,10,247.7,247.7,2025-11-27,Northbridge
+HAR-134,Bracket,Hardware,30,100,111.75,11.17,2025-05-12,Hilltop Ind.
+HAR-135,Hinge,Hardware,150,20,123.89,61.95,2026-04-29,Northbridge
+HAR-136,Hinge,Hardware,30,10,143.08,14.31,2026-03-18,Hilltop Ind.
+HAR-137,Hinge,Hardware,30,100,141.44,14.14,2025-11-11,Northbridge
+HAR-138,Hinge,Hardware,12,100,155.0,6.2,2026-01-08,BoltCo
+OFF-139,Stapler,Office,0,10,33.79,0.0,2026-03-26,Acme Supply
+OFF-140,Stapler,Office,75,50,96.38,24.09,2026-01-27,Northbridge
+OFF-141,Notebook 100pg,Office,5,20,63.41,1.06,2026-03-28,Acme Supply
+OFF-142,Notebook 100pg,Office,150,10,217.5,108.75,2025-12-10,Acme Supply
+OFF-143,Notebook 100pg,Office,30,10,116.31,11.63,2026-03-22,Hilltop Ind.
+OFF-144,Notebook 100pg,Office,150,50,7.06,3.53,2025-11-02,BoltCo
+OFF-145,Pen 12-pack,Office,30,50,143.99,14.4,2025-11-22,TradeWorks
+OFF-146,Pen 12-pack,Office,12,50,43.32,1.73,2026-02-16,TradeWorks
+OFF-147,Pen 12-pack,Office,30,10,210.41,21.04,2026-01-09,BoltCo
+OFF-148,Pen 12-pack,Office,5,100,201.54,3.36,2025-11-20,Hilltop Ind.
+OFF-149,Pen 12-pack,Office,5,50,69.79,1.16,2026-03-12,Northbridge
+OFF-150,Tape Roll,Office,12,10,163.58,6.54,2026-01-12,Northbridge
+OFF-151,Tape Roll,Office,30,50,51.62,5.16,2026-04-05,Hilltop Ind.
+OFF-152,Tape Roll,Office,30,20,220.46,22.05,2026-03-09,TradeWorks
+OFF-153,Tape Roll,Office,30,20,165.88,16.59,2026-02-24,BoltCo
+OFF-154,Tape Roll,Office,150,100,233.79,116.89,2025-11-12,Hilltop Ind.
+OFF-155,Folder Set,Office,12,20,61.61,2.46,2026-01-12,Northbridge
+OFF-156,Folder Set,Office,30,10,159.21,15.92,2026-01-04,BoltCo
+OFF-157,Folder Set,Office,30,50,172.34,17.23,2025-12-28,Acme Supply
+OFF-158,Marker,Office,12,20,199.67,7.99,2026-03-01,Hilltop Ind.
+OFF-159,Marker,Office,800,100,162.44,433.17,2025-05-11,BoltCo
+OFF-160,Marker,Office,5,50,197.84,3.3,2026-03-17,TradeWorks
+CLE-161,Disinfectant,Cleaning,300,100,195.99,195.99,2025-06-27,Acme Supply
+CLE-162,Disinfectant,Cleaning,12,50,217.06,8.68,2026-02-09,BoltCo
+CLE-163,Mop,Cleaning,30,20,60.54,6.05,2026-03-05,Acme Supply
+CLE-164,Mop,Cleaning,30,50,125.12,12.51,2026-03-30,Acme Supply
+CLE-165,Cloth Pack,Cleaning,12,100,201.85,8.07,2026-02-13,TradeWorks
+CLE-166,Cloth Pack,Cleaning,5,20,55.1,0.92,2026-02-09,BoltCo
+CLE-167,Cloth Pack,Cleaning,150,10,123.61,61.8,2025-11-25,BoltCo
+CLE-168,Cloth Pack,Cleaning,30,100,171.32,17.13,2025-12-04,BoltCo
+CLE-169,Trash Bags,Cleaning,75,50,7.23,1.81,2026-04-01,Acme Supply
+CLE-170,Trash Bags,Cleaning,75,10,173.29,43.32,2025-12-28,BoltCo
+CLE-171,Trash Bags,Cleaning,30,50,160.46,16.05,2026-04-21,Acme Supply
+CLE-172,Trash Bags,Cleaning,30,20,214.7,21.47,2026-02-05,BoltCo
+CLE-173,Trash Bags,Cleaning,12,20,75.76,3.03,2025-12-08,Northbridge
+CLE-174,Glove Box,Cleaning,150,100,197.75,98.88,2025-11-17,Northbridge
+CLE-175,Glove Box,Cleaning,30,100,231.77,23.18,2026-02-13,Acme Supply
+CLE-176,Glove Box,Cleaning,75,50,127.57,31.89,2026-03-31,Hilltop Ind.
+CLE-177,Glove Box,Cleaning,75,100,174.41,43.6,2026-04-10,TradeWorks
+SAF-178,Hardhat,Safety Gear,75,20,2.76,0.69,2026-01-14,BoltCo
+SAF-179,Hardhat,Safety Gear,30,10,41.14,4.11,2026-04-12,TradeWorks
+SAF-180,Hardhat,Safety Gear,75,100,198.58,49.65,2026-02-27,TradeWorks
+SAF-181,Hardhat,Safety Gear,12,50,200.28,8.01,2026-02-11,BoltCo
+SAF-182,Hardhat,Safety Gear,12,100,236.3,9.45,2025-12-24,Acme Supply
+SAF-183,Safety Glasses,Safety Gear,150,20,226.9,113.45,2025-12-17,BoltCo
+SAF-184,Safety Glasses,Safety Gear,75,20,14.35,3.59,2026-03-30,BoltCo
+SAF-185,Hi-Vis Vest,Safety Gear,5,50,44.19,0.74,2025-10-31,Hilltop Ind.
+SAF-186,Hi-Vis Vest,Safety Gear,30,100,207.16,20.72,2025-12-24,TradeWorks
+SAF-187,Hi-Vis Vest,Safety Gear,12,50,73.41,2.94,2025-11-30,Northbridge
+SAF-188,Earplugs,Safety Gear,30,50,182.22,18.22,2025-12-13,Northbridge
+SAF-189,Earplugs,Safety Gear,75,10,73.97,18.49,2026-04-04,Northbridge
+SAF-190,Earplugs,Safety Gear,150,50,146.56,73.28,2025-11-18,Acme Supply
+SAF-191,Boots,Safety Gear,5,50,243.65,4.06,2025-12-21,Northbridge
+SAF-192,Boots,Safety Gear,75,50,20.12,5.03,2025-11-10,BoltCo
+SAF-193,Boots,Safety Gear,150,100,227.24,113.62,2026-04-17,Hilltop Ind.
+SAF-194,Boots,Safety Gear,75,10,3.33,0.83,2026-02-02,BoltCo
+SAF-195,Boots,Safety Gear,300,50,34.8,34.8,2025-11-07,Hilltop Ind.
+SAF-196,Mask Pack,Safety Gear,12,100,232.72,9.31,2025-11-30,Acme Supply
+SAF-197,Mask Pack,Safety Gear,12,100,37.17,1.49,2025-11-08,TradeWorks
+SAF-198,Mask Pack,Safety Gear,30,50,187.46,18.75,2026-01-08,BoltCo
+ELE-199,Extension Cord,Electrical,30,100,223.38,22.34,2026-03-02,TradeWorks
+ELE-200,Extension Cord,Electrical,30,100,15.2,1.52,2025-12-25,TradeWorks
+ELE-201,Extension Cord,Electrical,5,50,42.56,0.71,2025-11-26,Northbridge
+ELE-202,Extension Cord,Electrical,5,50,247.23,4.12,2026-02-22,Northbridge
+ELE-203,Power Strip,Electrical,75,20,32.67,8.17,2026-01-08,TradeWorks
+ELE-204,Power Strip,Electrical,75,50,141.69,35.42,2025-12-21,Hilltop Ind.
+ELE-205,Drill Bits,Electrical,30,20,105.27,10.53,2025-06-19,Northbridge
+ELE-206,Drill Bits,Electrical,75,50,8.44,2.11,2026-04-20,Acme Supply
+ELE-207,LED Bulb 4-pk,Electrical,30,10,209.57,20.96,2025-11-17,Northbridge
+ELE-208,LED Bulb 4-pk,Electrical,75,100,114.61,28.65,2026-03-29,Acme Supply
+ELE-209,LED Bulb 4-pk,Electrical,12,10,164.73,6.59,2026-01-19,Hilltop Ind.
+ELE-210,LED Bulb 4-pk,Electrical,5,10,200.79,3.35,2025-11-11,Acme Supply
+ELE-211,LED Bulb 4-pk,Electrical,30,100,24.95,2.5,2025-12-28,Northbridge
+ELE-212,Cable Reel,Electrical,0,20,42.41,0.0,2026-01-08,TradeWorks
+ELE-213,Cable Reel,Electrical,5,100,200.67,3.34,2026-01-15,Hilltop Ind.
+ELE-214,Surge Protector,Electrical,12,10,208.35,8.33,2026-03-02,Northbridge
+ELE-215,Surge Protector,Electrical,150,100,68.58,34.29,2025-11-20,Northbridge
+ELE-216,Surge Protector,Electrical,75,20,109.66,27.42,2025-11-07,Hilltop Ind.

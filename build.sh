@@ -24,10 +24,10 @@ python -m PyInstaller council.spec --noconfirm --clean
 
 echo
 echo "=== Build complete ==="
-echo "Bundle location: $(pwd)/dist/Council"
+echo "Bundle location: $(pwd)/dist/DatasInferno"
 case "$(uname)" in
-    Darwin) echo "Executable:      $(pwd)/dist/Council/Council" ;;
-    Linux)  echo "Executable:      $(pwd)/dist/Council/Council" ;;
+    Darwin) echo "Executable:      $(pwd)/dist/DatasInferno/DatasInferno" ;;
+    Linux)  echo "Executable:      $(pwd)/dist/DatasInferno/DatasInferno" ;;
 esac
 
 echo

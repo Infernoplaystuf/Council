@@ -1,152 +1,145 @@
-# Council
+# Data's Inferno
 
-A multi-personality AI workspace that runs entirely on your own machine. Pose a question, get a structured deliberation between specialised AI roles (writer, coder, intern, peasant, judge, etc.), and walk away with a verdict you can trust because every step is visible.
+**A panel of AI specialists that reviews, charts, and explains your business data — running entirely on your computer.**
 
-Council is built for solo professionals, small teams, and anyone who wants the speed of "just ask an AI" without giving up auditability or sending data off-machine.
+Drop in a CSV of purchase orders, an inventory export, or a customer list. Ask questions in plain English. A panel of AI analysts deliberates, ranks the answers, and gives you a verdict you can trust because every step is visible. Your data never leaves the machine.
+
+---
+
+## What it's for
+
+Built for small businesses, solo operators, and analysts who have data but no time (or budget) for a BI consultant.
+
+Common questions Data's Inferno answers well:
+
+- *"Which customers haven't ordered in 90+ days?"*
+- *"What products are sitting in inventory longest?"*
+- *"Are my repeat customers spending more or less than they did last quarter?"*
+- *"Which supplier delivered late most often this year?"*
+- *"Show me revenue trend by category for the last 12 months."*
+- *"Which employees process the most orders?"*
+
+You drop the file. The AI panel reads it, picks the right chart, runs the math, and explains what it sees in language you'd use in a board meeting — not jargon.
+
+---
+
+## Why it's different
+
+| | Cloud AI tools | Spreadsheets | Data's Inferno |
+|---|---|---|---|
+| Your data leaves the machine | ✗ | ✓ | ✓ |
+| Works offline | ✗ | ✓ | ✓ |
+| Plain-English questions | ✓ | ✗ | ✓ |
+| Multiple AI perspectives, not one | ✗ | — | ✓ |
+| Auto-suggests the right chart | partial | ✗ | ✓ |
+| Catches its own mistakes | ✗ | ✗ | ✓ (panel cross-examines) |
+| Monthly fee | ✓ | — | ✗ (one-time) |
+
+The "panel of AI specialists" is the core differentiator. A single AI gives you one answer, confidently, even when wrong. Data's Inferno runs three or four AIs against the same question and a Judge ranks them. You see the disagreements. That's how you know what to trust.
 
 ---
 
 ## Quick start
 
-### 1. Install Python 3.11
+### 1. Install
 
-The recommended path is [Anaconda](https://www.anaconda.com/) or `miniconda`:
+Download the latest release for your platform from the website (or run from source — see `requirements.txt`). Run the installer.
 
-```bash
-conda create -n council python=3.11 -y
-conda activate council
-```
+On first launch, a setup wizard walks you through:
+- Confirming you have ~15 GB free for AI models
+- Installing [Ollama](https://ollama.com) (the local AI engine)
+- Pulling a starter model
 
-### 2. Install dependencies
+The whole setup takes about three minutes. Models download once, then everything runs offline.
 
-```bash
-pip install -r requirements.txt
-```
+### 2. Drop in your data
 
-Optional extras:
+Switch to the **📊 Grapher** tab and drag any of these onto it:
 
-| Feature                | Install                                   |
-|------------------------|-------------------------------------------|
-| SSH compute nodes      | `pip install paramiko`                    |
-| Microphone input       | `pip install sounddevice soundfile`       |
-| Local speech-to-text   | `pip install faster-whisper`              |
-| Text-to-speech         | `pip install pyttsx3`                     |
-| Vault search (RAG)     | `pip install chromadb sentence-transformers` |
+- CSV / TSV (most common — what every accounting tool exports)
+- Excel `.xlsx` / `.xls`
+- JSON
 
-### 3. Install [Ollama](https://ollama.com) and pull a model
+The schema panel auto-detects which columns are dates, numbers, and categories.
 
-```bash
-ollama pull qwen2.5:14b
-ollama pull qwen2.5-coder:14b
-```
+### 3. Ask a question
 
-The defaults in `personality_backends.json` expect Ollama on `localhost:11434`. You can change which model each personality uses in that file.
+Switch to the **⚖ Council** tab and type something like:
 
-### 4. Launch
+> *"Looking at the orders.csv, which products had the biggest revenue drop between Q1 and Q2?"*
 
-```bash
-python council_gui_engine.py
-```
+The panel deliberates. Watch each AI draft its answer. The Judge ranks them. You get a verdict with confidence score and the reasoning behind it.
 
-The first launch creates `vault/` next to the script — that's where every piece of data lives. Nothing is ever sent off-machine unless you explicitly enable a remote node.
+If the answer needs a chart, the panel will route you to the Grapher and the **Analyst** AI will pick an appropriate visualisation.
 
 ---
 
-## How the Council works
+## Sample workflows
 
-When you ask a question, the **Judge** personality first decides which "route" the question belongs to (chat, code, planning, content, etc.). It then convenes a small panel of three or four specialists from the available personalities, each of whom drafts an answer. The Judge ranks them, the **Peasant** cross-examines weak points, and the panel iterates until either consensus is reached or a maximum number of rounds is hit. The transcript of the entire deliberation is shown live in the **⚖ Council** tab.
+### Find your dormant customers
+1. Drop your `customers.csv` into Grapher
+2. Council tab: *"Which customers haven't placed an order in 90+ days?"*
+3. The panel suggests a date-grouped chart and produces the dormant list
+4. Click 📚 Librarian → Save → email the list to your sales lead
 
-You see:
-- Every personality's individual draft
-- The Judge's ranking and reasoning
-- Peasant follow-up questions
-- The final verdict (PASS / RETRY / CHANGE)
-- Confidence score (0-100)
+### Spot inventory dead weight
+1. Drop your `inventory.csv` into Grapher
+2. Ask: *"Which SKUs have moved fewer than 2 units this quarter but cost the most to hold?"*
+3. The Analyst suggests a scatter (units sold × holding cost)
+4. Outliers in the top-left of the chart are your dead weight
 
-Every session is saved automatically.
-
----
-
-## The tabs
-
-| Tab | What it's for |
-|-----|---------------|
-| **⚖ Council** | Main chat. Type a question → watch the panel deliberate → get a verdict. |
-| **💻 IDE / Runner** | A built-in Python editor. The coder personality writes code here; you can edit and run it. Output streams back into the Council. |
-| **📚 Librarian** | Browse the vault, see what files have been saved from past sessions, commit recent work to a git repo. |
-| **🕓 Sessions** | Every prior conversation, searchable. Click one to load its full transcript. |
-| **🖥 Nodes** | Optional: register remote machines (over SSH) that can run heavier models. The Council will offload work to them when configured. |
-| **🤖 Agents** | Live status of the autonomous agents (Coder, Intern, Vault, Sage, RAG). Pause, resume, or watch their event stream. |
-| **📊 Grapher** | Drop in any CSV / XLSX / JSON / NPY file and chart it. Includes a built-in **Analyst** AI that suggests appropriate plots, transforms, and explains the data in plain English. |
-| **🗄 Vault** | Tree view of the vault directory. Clone external git repos into the vault for the RAG to learn from. |
-| **🔍 Lens** | Pick any subset of personalities and have them all critique the same piece of text in parallel. Use it for second opinions. |
-| **🗄 Vault Health** | Inspect what each personality "remembers", what knowledge gaps the Sage has flagged, and the wishlist of topics the Council wants to learn. |
-| **🎙 Speech** | Record audio → transcribe → feed into the Council. Also reads any text aloud via local TTS. |
-| **🔧 Apothecary** | Utility console: cache management, log inspection, model health checks, pin overrides. |
+### Track client retention month-over-month
+1. Drop your `orders.csv` (with customer_id and order_date)
+2. Ask: *"Calculate the cohort retention rate for customers acquired in each of the last 6 months"*
+3. The Coder writes the cohort calculation, the Analyst plots it as a heatmap
+4. Save the chart for your monthly review
 
 ---
 
-## Configuring personalities
+## How the panel works
 
-Each personality (writer, coder, intern, judge, peasant, artist, …) is bound to a model backend. Two files control the bindings:
+When you ask a question, here's what happens:
 
-### `personality_backends.json`
-Maps each role to a backend key:
-```json
-{
-  "writer":  "local_general_primary",
-  "coder":   "local_coder_primary",
-  "intern":  "local_coder_fast",
-  "judge":   "local_judge_fast",
-  "peasant": "local_peasant_fast",
-  "artist":  "local_general_alt"
-}
-```
+1. **Judge** decides what kind of question it is (data lookup, calculation, chart, opinion, etc.)
+2. **Convenes a panel** — usually three or four specialists from the available AI roles:
+   - **Writer** — explains data in clear prose
+   - **Coder** — writes Pandas/SQL queries
+   - **Sage** — knows your historical data via the vault index
+   - **Strategist** — looks at trends and projections
+   - **Skeptic** — challenges weak assumptions
+   - **Peasant** — asks plain-language follow-up questions
+3. **Each drafts an answer** — you see all of them in the transcript
+4. **Judge ranks them** — picks the best, or asks for a retry
+5. **Verdict** — final answer with a confidence score
 
-### `personality_config.yaml`
-A higher-level mapping:
-```yaml
-personalities:
-  judge:   openai_gpt4o_mini
-  writer:  openai_gpt4o
-  intern:  ollama_qwen_coder
-  coder:   ollama_qwen_coder
-  peasant: openai_gpt4o_mini
-  artist:  openai_gpt4o_mini
-```
-
-You can mix-and-match local and cloud backends per personality. Settings are hot-reloaded — edit the file while the Council is running and the next deliberation picks up the changes.
+The whole process is transparent. No black boxes — you see every model's reasoning.
 
 ---
 
-## The vault
+## Privacy guarantee
 
-Everything Council learns or generates lives under `vault/`:
+This product was built privacy-first. Specifically:
 
-```
-vault/
-├── conversations/          one JSON file per session
-├── memory/                 per-personality persistent notes
-├── logs/                   council.log + per-session logs
-├── workspace/              code-runner scratch files
-├── graph_output/           Grapher exports
-├── .chromadb/              vector index (RAG memory)
-├── .git_clones/            cloned reference repos
-├── node_registry.json      SSH compute node list
-└── personality_backends.json   model pins
-```
+- **Your data never leaves this machine.** No telemetry, no analytics, no "model improvement" uploads.
+- **Models run locally** via Ollama. We never call OpenAI, Anthropic, or any cloud AI.
+- **No accounts.** No login. No "free tier" that secretly logs you.
+- **Your vault is yours.** The local database (`vault/`) contains all your conversations and indexed files. Delete it any time.
 
-The vault is git-ignored by default. You can change that in `.gitignore` if you want to track conversation history, but be careful — these files often contain things you don't want public.
+If you optionally enable cloud backends (e.g. you point a personality at OpenAI yourself), you'll get a warning every time. The default is fully local.
 
 ---
 
-## Tips
+## System requirements
 
-- **Type slower, not faster.** The first message of a session sets the tone. Spend a sentence telling the Judge what kind of help you need ("explain like I'm new" / "write production code" / "review this critically").
-- **Use the IDE tab as a scratch pad.** When the coder produces something, edit it inline before running. The Council learns from edits.
-- **Check Vault Health weekly.** It surfaces topics the Sage has flagged as gaps in the council's knowledge — feeding it more reference material there pays dividends.
-- **The Lens is for second opinions.** When the main council reaches a verdict you're unsure about, paste the answer into the Lens and have a different combination of personalities tear it apart.
-- **Pin your judge.** The Judge is the personality you'll notice most. Pin it to your most reliable backend in `personality_backends.json`.
+| | Minimum | Recommended |
+|---|---|---|
+| OS | Windows 10, macOS 12, Ubuntu 22 | Windows 11, macOS 14, Ubuntu 24 |
+| RAM | 16 GB | 32 GB |
+| Disk free | 20 GB | 40 GB |
+| GPU | Optional (CPU works) | NVIDIA 8 GB+ for big models |
+| Python | (bundled in installer) | — |
+
+A modern laptop runs the recommended starter model (`qwen2.5:14b`) at usable speed. Bigger models (32B+) want a desktop with a GPU.
 
 ---
 
@@ -154,27 +147,25 @@ The vault is git-ignored by default. You can change that in `.gitignore` if you 
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| App won't start | Missing required personality in config | Check `personality_backends.json` includes all six required roles: judge, writer, peasant, intern, coder, artist |
-| Models time out | Ollama not running, or model not pulled | `ollama list` to verify; `ollama pull <model>` if missing |
-| `git pull` hangs | Remote unreachable | Cancel and check the Nodes tab; pulls have a 2-min timeout but a stuck repo will retry |
-| Empty Vault Health | First-run or vault was deleted | Run a few deliberations and the memory will populate |
-| RAG returns nothing | ChromaDB not installed | `pip install chromadb sentence-transformers` |
+| App won't start | Personality config corrupted | Delete `vault/.onboarded` and re-run setup |
+| AI panel times out | Ollama not running | Start Ollama from the system tray |
+| "Model not found" | First-time model still downloading | Wait, or check Apothecary tab → Pull Model |
+| Chart looks empty | Column types wrong | Schema panel → manually set the X column to "date" |
+| Slow on a big file | RAM limit | Open the file in chunks, or use a smaller starter model |
 
 ---
 
-## What's not in this release
+## What you get for the price
 
-This is the focused commercial release. The following experimental features are not included; they live on a separate development branch:
+One-time purchase. No subscription, no usage limits, no per-question fees, no "tokens".
 
-- Music composer (prompt → MIDI/MusicXML)
-- Video analysis & auto-edit pipeline
-- Presentation script generator
-- Continuous overnight idea generator with thumbnail rendering
-
-These were removed to keep the install small, the dependency list short, and the UI focused.
+- Full Data's Inferno application (Windows / macOS / Linux)
+- Free updates within the major version
+- Email support
+- Right to use on as many of your own machines as you want (one user)
 
 ---
 
 ## License
 
-See `LICENSE` for terms. Council bundles no third-party model weights — you bring your own via Ollama or your preferred backend.
+See `LICENSE`. Data's Inferno bundles no third-party model weights — those are downloaded from Ollama's open model library on first run.

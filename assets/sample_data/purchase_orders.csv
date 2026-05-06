@@ -1,0 +1,801 @@
+order_id,order_date,customer_id,category,product_sku,quantity,unit_price,total,payment_method,status
+PO-20000,2026-03-24,C3008,Tools,TOO-125,2,127.04,254.08,card,completed
+PO-20001,2025-06-14,C1025,Safety Gear,SAF-532,1,36.87,36.87,card,completed
+PO-20002,2026-03-29,C3002,Electrical,ELE-658,1,218.67,218.67,card,completed
+PO-20003,2026-04-23,C1012,Cleaning,CLE-448,1,17.63,17.63,ach,completed
+PO-20004,2025-10-31,C3006,Office,OFF-718,1,12.87,12.87,card,completed
+PO-20005,2025-06-10,C1008,Safety Gear,SAF-400,3,131.33,393.99,ach,completed
+PO-20006,2025-05-24,C2014,Electrical,ELE-333,2,443.79,887.58,ach,completed
+PO-20007,2026-03-22,C2019,Office,OFF-266,1,31.46,31.46,card,completed
+PO-20008,2026-03-22,C3003,Hardware,HAR-646,2,23.11,46.22,card,completed
+PO-20009,2026-04-16,C2002,Office,OFF-963,2,14.27,28.54,ach,completed
+PO-20010,2025-08-17,C2008,Safety Gear,SAF-997,2,58.27,116.54,card,completed
+PO-20011,2025-07-11,C2007,Hardware,HAR-862,1,29.87,29.87,card,completed
+PO-20012,2025-07-10,C1054,Safety Gear,SAF-605,1,28.48,28.48,card,completed
+PO-20013,2026-03-02,C3000,Tools,TOO-494,1,378.7,378.7,card,completed
+PO-20014,2026-04-14,C2009,Electrical,ELE-217,2,255.53,511.06,card,completed
+PO-20015,2025-05-02,C3004,Electrical,ELE-996,2,438.19,876.38,ach,completed
+PO-20016,2026-03-24,C3000,Safety Gear,SAF-723,1,87.3,87.3,card,cancelled
+PO-20017,2026-03-03,C1030,Office,OFF-600,1,112.06,112.06,ach,completed
+PO-20018,2026-02-15,C3002,Tools,TOO-187,2,318.37,636.74,invoice,completed
+PO-20019,2026-04-03,C3003,Cleaning,CLE-662,1,34.49,34.49,card,completed
+PO-20020,2026-05-01,C2007,Office,OFF-508,10,80.79,807.9,card,completed
+PO-20021,2025-08-24,C1080,Tools,TOO-446,1,230.56,230.56,card,completed
+PO-20022,2025-05-31,C1062,Hardware,HAR-169,5,70.46,352.3,card,completed
+PO-20023,2025-08-18,C3006,Safety Gear,SAF-235,2,178.83,357.66,card,completed
+PO-20024,2025-08-06,C1083,Tools,TOO-199,2,163.69,327.38,card,refunded
+PO-20025,2026-03-27,C1068,Tools,TOO-162,1,158.67,158.67,ach,completed
+PO-20026,2025-08-02,C1083,Office,OFF-573,1,111.41,111.41,card,completed
+PO-20027,2026-02-01,C2012,Tools,TOO-195,5,329.31,1646.55,card,completed
+PO-20028,2025-05-31,C1071,Hardware,HAR-488,1,38.55,38.55,invoice,completed
+PO-20029,2026-04-04,C3000,Electrical,ELE-598,1,154.62,154.62,invoice,completed
+PO-20030,2025-10-08,C1065,Tools,TOO-151,1,213.45,213.45,ach,completed
+PO-20031,2025-06-11,C3009,Hardware,HAR-170,1,57.91,57.91,card,completed
+PO-20032,2025-09-04,C2008,Safety Gear,SAF-708,1,34.76,34.76,card,completed
+PO-20033,2025-08-13,C1040,Electrical,ELE-833,1,141.56,141.56,card,completed
+PO-20034,2025-06-07,C1033,Tools,TOO-569,2,233.6,467.2,card,completed
+PO-20035,2025-07-07,C3009,Office,OFF-170,3,49.39,148.17,card,completed
+PO-20036,2026-03-31,C3002,Safety Gear,SAF-108,2,119.83,239.66,invoice,completed
+PO-20037,2025-09-13,C3003,Tools,TOO-209,2,97.08,194.16,card,completed
+PO-20038,2026-04-17,C1054,Electrical,ELE-973,1,235.18,235.18,invoice,completed
+PO-20039,2025-09-19,C3008,Tools,TOO-103,1,88.82,88.82,invoice,completed
+PO-20040,2026-04-27,C2011,Cleaning,CLE-674,1,10.06,10.06,ach,completed
+PO-20041,2026-02-23,C3003,Safety Gear,SAF-251,1,27.53,27.53,card,completed
+PO-20042,2026-04-15,C3002,Hardware,HAR-782,1,65.05,65.05,ach,completed
+PO-20043,2025-08-30,C3006,Hardware,HAR-919,3,71.94,215.82,card,refunded
+PO-20044,2026-04-08,C3007,Electrical,ELE-930,1,96.86,96.86,ach,completed
+PO-20045,2025-08-22,C1084,Hardware,HAR-936,5,35.78,178.9,ach,completed
+PO-20046,2025-08-07,C2012,Cleaning,CLE-436,1,9.75,9.75,ach,completed
+PO-20047,2026-04-13,C2008,Safety Gear,SAF-439,5,40.76,203.8,invoice,completed
+PO-20048,2025-05-20,C3001,Tools,TOO-710,1,289.06,289.06,card,completed
+PO-20049,2025-11-14,C3003,Hardware,HAR-360,1,41.65,41.65,card,completed
+PO-20050,2025-11-03,C2021,Electrical,ELE-438,2,308.62,617.24,card,completed
+PO-20051,2025-09-29,C3009,Safety Gear,SAF-230,1,139.69,139.69,card,refunded
+PO-20052,2026-02-16,C3009,Office,OFF-515,1,8.05,8.05,card,completed
+PO-20053,2026-04-01,C1010,Office,OFF-576,1,83.67,83.67,card,refunded
+PO-20054,2025-09-23,C1039,Safety Gear,SAF-779,2,80.33,160.66,ach,cancelled
+PO-20055,2025-08-24,C1053,Hardware,HAR-250,1,28.65,28.65,card,cancelled
+PO-20056,2026-03-19,C3000,Safety Gear,SAF-299,2,89.12,178.24,card,completed
+PO-20057,2025-06-24,C2003,Cleaning,CLE-324,1,57.73,57.73,card,completed
+PO-20058,2025-12-24,C2023,Electrical,ELE-643,10,280.09,2800.9,invoice,completed
+PO-20059,2026-01-14,C2024,Cleaning,CLE-950,5,30.08,150.4,card,completed
+PO-20060,2025-09-04,C2022,Electrical,ELE-383,2,248.95,497.9,card,completed
+PO-20061,2025-09-24,C1019,Hardware,HAR-378,1,72.73,72.73,card,completed
+PO-20062,2026-04-27,C1053,Hardware,HAR-165,1,34.5,34.5,card,completed
+PO-20063,2025-11-16,C1045,Safety Gear,SAF-812,1,178.52,178.52,card,completed
+PO-20064,2025-09-30,C2019,Cleaning,CLE-973,3,51.13,153.39,card,refunded
+PO-20065,2025-08-21,C3006,Cleaning,CLE-324,1,32.22,32.22,card,completed
+PO-20066,2025-07-24,C2000,Cleaning,CLE-230,10,34.84,348.4,invoice,completed
+PO-20067,2025-06-12,C2014,Electrical,ELE-538,1,223.91,223.91,card,completed
+PO-20068,2025-10-15,C1010,Office,OFF-879,3,39.16,117.48,invoice,completed
+PO-20069,2025-05-27,C1031,Office,OFF-329,2,95.5,191.0,card,cancelled
+PO-20070,2025-08-11,C3007,Tools,TOO-736,1,87.28,87.28,card,completed
+PO-20071,2026-04-24,C1020,Office,OFF-885,1,75.86,75.86,invoice,completed
+PO-20072,2025-10-07,C2022,Tools,TOO-692,1,149.51,149.51,card,completed
+PO-20073,2025-08-10,C2021,Tools,TOO-706,2,255.13,510.26,card,cancelled
+PO-20074,2026-03-04,C3001,Tools,TOO-915,10,307.18,3071.8,card,completed
+PO-20075,2026-01-15,C3007,Electrical,ELE-449,1,206.42,206.42,card,completed
+PO-20076,2026-04-28,C3008,Hardware,HAR-545,1,47.48,47.48,card,completed
+PO-20077,2026-01-03,C3001,Cleaning,CLE-546,3,37.99,113.97,card,completed
+PO-20078,2025-09-20,C1041,Cleaning,CLE-349,2,36.77,73.54,card,completed
+PO-20079,2025-08-02,C3004,Cleaning,CLE-317,1,19.95,19.95,card,completed
+PO-20080,2026-02-09,C2007,Tools,TOO-629,5,73.68,368.4,ach,completed
+PO-20081,2026-04-19,C1031,Cleaning,CLE-761,2,30.2,60.4,card,completed
+PO-20082,2025-10-04,C2011,Electrical,ELE-695,1,262.46,262.46,card,refunded
+PO-20083,2026-04-25,C1068,Cleaning,CLE-377,1,18.45,18.45,ach,completed
+PO-20084,2026-04-19,C2009,Hardware,HAR-296,1,44.93,44.93,ach,cancelled
+PO-20085,2025-06-21,C1005,Hardware,HAR-403,1,24.2,24.2,card,completed
+PO-20086,2025-05-28,C1001,Safety Gear,SAF-399,2,42.73,85.46,ach,completed
+PO-20087,2026-02-18,C3007,Office,OFF-580,1,46.16,46.16,invoice,completed
+PO-20088,2025-06-28,C1072,Tools,TOO-510,1,238.3,238.3,card,completed
+PO-20089,2025-10-03,C1066,Tools,TOO-354,1,301.09,301.09,card,completed
+PO-20090,2025-11-11,C1012,Cleaning,CLE-404,3,59.46,178.38,card,completed
+PO-20091,2025-08-15,C1000,Electrical,ELE-316,1,64.1,64.1,card,completed
+PO-20092,2025-11-26,C3001,Safety Gear,SAF-581,1,61.67,61.67,ach,completed
+PO-20093,2026-04-17,C2017,Hardware,HAR-370,2,54.5,109.0,card,completed
+PO-20094,2025-08-24,C3009,Electrical,ELE-252,5,377.19,1885.95,card,completed
+PO-20095,2026-02-16,C2015,Office,OFF-549,1,85.13,85.13,card,completed
+PO-20096,2025-05-21,C3009,Cleaning,CLE-852,1,19.52,19.52,card,completed
+PO-20097,2026-02-25,C1066,Tools,TOO-883,2,135.29,270.58,card,cancelled
+PO-20098,2026-03-30,C3007,Cleaning,CLE-384,1,37.61,37.61,card,completed
+PO-20099,2025-10-26,C3004,Cleaning,CLE-441,1,11.65,11.65,card,completed
+PO-20100,2026-04-05,C2024,Cleaning,CLE-933,2,7.98,15.96,card,completed
+PO-20101,2025-11-23,C2024,Tools,TOO-773,3,199.76,599.28,card,completed
+PO-20102,2026-01-11,C2022,Electrical,ELE-552,2,115.49,230.98,card,completed
+PO-20103,2026-01-04,C2000,Tools,TOO-129,10,248.97,2489.7,card,completed
+PO-20104,2026-02-07,C2004,Cleaning,CLE-195,1,51.44,51.44,card,completed
+PO-20105,2026-01-11,C1070,Electrical,ELE-398,1,144.84,144.84,ach,completed
+PO-20106,2025-07-14,C1053,Cleaning,CLE-295,5,33.45,167.25,ach,completed
+PO-20107,2025-10-22,C2021,Safety Gear,SAF-373,3,70.91,212.73,card,completed
+PO-20108,2026-01-06,C2010,Hardware,HAR-557,1,35.47,35.47,card,completed
+PO-20109,2025-08-05,C2015,Electrical,ELE-344,1,128.1,128.1,ach,completed
+PO-20110,2026-04-27,C2001,Cleaning,CLE-495,10,48.79,487.9,card,completed
+PO-20111,2025-07-04,C2014,Safety Gear,SAF-704,1,38.07,38.07,ach,completed
+PO-20112,2025-05-08,C3004,Electrical,ELE-247,1,305.01,305.01,card,completed
+PO-20113,2025-10-21,C3006,Safety Gear,SAF-809,1,34.46,34.46,card,completed
+PO-20114,2025-10-10,C1080,Electrical,ELE-835,3,234.94,704.82,card,completed
+PO-20115,2026-04-16,C3001,Office,OFF-332,2,56.6,113.2,card,completed
+PO-20116,2025-10-01,C1067,Tools,TOO-147,1,63.8,63.8,card,completed
+PO-20117,2025-11-27,C1074,Hardware,HAR-274,1,53.45,53.45,card,completed
+PO-20118,2025-07-13,C3008,Hardware,HAR-572,2,43.25,86.5,card,completed
+PO-20119,2025-07-20,C3007,Tools,TOO-552,5,375.86,1879.3,card,completed
+PO-20120,2025-10-02,C2022,Hardware,HAR-493,3,19.25,57.75,card,completed
+PO-20121,2025-09-29,C3000,Tools,TOO-949,2,136.95,273.9,card,completed
+PO-20122,2026-03-07,C2011,Electrical,ELE-608,3,409.23,1227.69,ach,completed
+PO-20123,2025-08-21,C3002,Electrical,ELE-294,2,314.66,629.32,ach,completed
+PO-20124,2026-03-18,C2004,Tools,TOO-742,2,148.49,296.98,card,completed
+PO-20125,2025-06-16,C3005,Office,OFF-434,2,27.67,55.34,card,completed
+PO-20126,2026-01-27,C3004,Safety Gear,SAF-379,3,66.25,198.75,ach,completed
+PO-20127,2025-10-21,C3006,Tools,TOO-579,5,92.15,460.75,invoice,completed
+PO-20128,2026-02-10,C2023,Office,OFF-192,2,9.56,19.12,card,completed
+PO-20129,2026-04-10,C1003,Office,OFF-698,1,79.52,79.52,card,completed
+PO-20130,2026-03-14,C3004,Safety Gear,SAF-435,5,59.85,299.25,card,completed
+PO-20131,2026-03-29,C1030,Cleaning,CLE-219,1,57.1,57.1,card,completed
+PO-20132,2026-01-31,C2023,Hardware,HAR-497,1,57.59,57.59,ach,completed
+PO-20133,2025-07-19,C1047,Cleaning,CLE-770,1,32.42,32.42,card,completed
+PO-20134,2025-08-20,C2020,Cleaning,CLE-555,5,52.19,260.95,card,completed
+PO-20135,2025-10-31,C1027,Tools,TOO-507,1,369.35,369.35,invoice,completed
+PO-20136,2026-03-25,C3003,Electrical,ELE-711,10,51.24,512.4,card,completed
+PO-20137,2025-06-05,C1076,Safety Gear,SAF-312,1,166.35,166.35,card,cancelled
+PO-20138,2025-05-02,C1003,Office,OFF-979,10,118.6,1186.0,card,completed
+PO-20139,2025-07-07,C1016,Tools,TOO-466,2,124.71,249.42,card,completed
+PO-20140,2025-12-02,C2007,Electrical,ELE-165,1,356.77,356.77,card,completed
+PO-20141,2026-03-11,C2000,Tools,TOO-844,2,335.44,670.88,card,completed
+PO-20142,2025-06-01,C1010,Cleaning,CLE-967,1,43.05,43.05,card,completed
+PO-20143,2025-10-12,C3006,Safety Gear,SAF-251,1,69.5,69.5,card,completed
+PO-20144,2026-03-02,C1083,Safety Gear,SAF-401,1,128.98,128.98,card,completed
+PO-20145,2026-03-30,C2014,Safety Gear,SAF-838,3,97.41,292.23,ach,completed
+PO-20146,2025-11-21,C3007,Tools,TOO-420,1,267.81,267.81,card,completed
+PO-20147,2025-06-04,C3008,Tools,TOO-951,1,189.68,189.68,ach,completed
+PO-20148,2025-05-31,C3006,Safety Gear,SAF-675,1,140.6,140.6,card,completed
+PO-20149,2025-05-27,C3003,Office,OFF-714,1,19.6,19.6,card,completed
+PO-20150,2025-06-25,C3008,Office,OFF-965,1,20.87,20.87,card,completed
+PO-20151,2026-03-15,C1023,Safety Gear,SAF-791,2,24.73,49.46,invoice,completed
+PO-20152,2025-09-17,C2012,Electrical,ELE-880,1,172.73,172.73,card,completed
+PO-20153,2025-06-05,C2014,Hardware,HAR-858,2,14.08,28.16,ach,completed
+PO-20154,2025-10-22,C1006,Hardware,HAR-478,1,34.06,34.06,invoice,completed
+PO-20155,2025-07-19,C2019,Hardware,HAR-872,2,57.83,115.66,card,completed
+PO-20156,2025-12-13,C3007,Hardware,HAR-873,1,35.47,35.47,card,completed
+PO-20157,2026-01-25,C1027,Electrical,ELE-415,1,196.01,196.01,card,completed
+PO-20158,2025-07-10,C1068,Office,OFF-396,1,8.87,8.87,ach,completed
+PO-20159,2026-04-26,C3000,Hardware,HAR-612,1,57.43,57.43,card,completed
+PO-20160,2025-06-09,C1002,Office,OFF-689,1,53.3,53.3,card,completed
+PO-20161,2025-10-14,C1013,Hardware,HAR-920,5,43.29,216.45,card,completed
+PO-20162,2025-09-02,C2010,Cleaning,CLE-703,1,10.25,10.25,ach,refunded
+PO-20163,2025-07-26,C2023,Tools,TOO-622,2,222.75,445.5,card,cancelled
+PO-20164,2026-03-27,C3001,Hardware,HAR-341,1,29.41,29.41,card,completed
+PO-20165,2025-07-30,C3009,Electrical,ELE-605,1,266.77,266.77,card,completed
+PO-20166,2026-03-26,C1056,Electrical,ELE-739,1,437.81,437.81,card,completed
+PO-20167,2026-03-20,C2001,Office,OFF-915,1,14.29,14.29,card,completed
+PO-20168,2025-05-30,C2016,Office,OFF-951,1,80.2,80.2,invoice,completed
+PO-20169,2025-11-13,C3005,Safety Gear,SAF-910,2,27.38,54.76,invoice,completed
+PO-20170,2026-03-06,C3001,Cleaning,CLE-613,1,9.34,9.34,card,completed
+PO-20171,2026-01-14,C2005,Electrical,ELE-276,1,327.2,327.2,invoice,completed
+PO-20172,2025-09-22,C2002,Cleaning,CLE-518,2,42.66,85.32,card,completed
+PO-20173,2025-10-16,C3009,Tools,TOO-671,2,140.19,280.38,ach,completed
+PO-20174,2025-07-16,C3006,Office,OFF-183,1,23.84,23.84,card,completed
+PO-20175,2025-07-06,C3008,Safety Gear,SAF-825,5,75.72,378.6,card,completed
+PO-20176,2025-06-17,C3005,Electrical,ELE-786,1,181.97,181.97,card,completed
+PO-20177,2026-01-04,C2017,Hardware,HAR-331,10,22.54,225.4,card,completed
+PO-20178,2026-01-25,C1023,Tools,TOO-777,1,301.71,301.71,card,completed
+PO-20179,2026-04-20,C3003,Safety Gear,SAF-928,5,149.81,749.05,card,completed
+PO-20180,2025-12-14,C3003,Electrical,ELE-902,1,254.28,254.28,card,completed
+PO-20181,2025-11-05,C2005,Safety Gear,SAF-551,1,70.72,70.72,card,completed
+PO-20182,2025-08-11,C2003,Safety Gear,SAF-241,3,29.39,88.17,card,completed
+PO-20183,2026-04-30,C3002,Safety Gear,SAF-971,1,35.1,35.1,card,completed
+PO-20184,2025-08-22,C1010,Cleaning,CLE-457,5,28.4,142.0,card,completed
+PO-20185,2025-10-11,C1060,Tools,TOO-959,2,157.32,314.64,card,completed
+PO-20186,2026-04-22,C1027,Hardware,HAR-877,2,42.5,85.0,card,completed
+PO-20187,2025-07-16,C2001,Safety Gear,SAF-844,2,96.19,192.38,ach,completed
+PO-20188,2025-08-31,C2000,Cleaning,CLE-754,2,30.68,61.36,card,completed
+PO-20189,2026-03-20,C2018,Safety Gear,SAF-688,1,45.84,45.84,card,completed
+PO-20190,2025-06-13,C2012,Safety Gear,SAF-469,1,114.69,114.69,card,completed
+PO-20191,2025-11-15,C3001,Office,OFF-359,2,47.99,95.98,card,completed
+PO-20192,2026-02-22,C1059,Electrical,ELE-874,1,48.62,48.62,card,completed
+PO-20193,2026-04-22,C1025,Cleaning,CLE-746,1,13.28,13.28,ach,completed
+PO-20194,2025-05-23,C2001,Hardware,HAR-142,1,33.09,33.09,card,completed
+PO-20195,2026-03-28,C1047,Hardware,HAR-392,1,65.1,65.1,ach,completed
+PO-20196,2025-12-10,C3005,Electrical,ELE-550,3,192.39,577.17,invoice,completed
+PO-20197,2026-01-21,C2010,Office,OFF-920,1,55.54,55.54,card,completed
+PO-20198,2025-06-22,C1056,Tools,TOO-435,2,147.68,295.36,card,completed
+PO-20199,2025-10-27,C1007,Cleaning,CLE-143,2,55.23,110.46,card,completed
+PO-20200,2025-06-08,C3002,Electrical,ELE-752,1,245.5,245.5,ach,completed
+PO-20201,2026-03-08,C2012,Electrical,ELE-900,1,83.02,83.02,card,completed
+PO-20202,2026-02-15,C3009,Tools,TOO-719,1,195.72,195.72,card,completed
+PO-20203,2025-07-10,C1023,Safety Gear,SAF-475,1,136.92,136.92,card,completed
+PO-20204,2026-01-11,C2019,Safety Gear,SAF-496,5,41.2,206.0,ach,completed
+PO-20205,2025-09-24,C3007,Electrical,ELE-602,1,87.01,87.01,card,completed
+PO-20206,2025-06-14,C2009,Electrical,ELE-965,10,310.49,3104.9,ach,completed
+PO-20207,2025-07-20,C1025,Electrical,ELE-826,5,297.83,1489.15,ach,completed
+PO-20208,2025-07-11,C3008,Hardware,HAR-909,1,36.54,36.54,card,completed
+PO-20209,2025-07-06,C2024,Safety Gear,SAF-188,1,91.67,91.67,ach,completed
+PO-20210,2025-11-26,C2004,Tools,TOO-228,10,260.18,2601.8,card,completed
+PO-20211,2026-02-07,C3008,Electrical,ELE-701,1,435.83,435.83,card,completed
+PO-20212,2025-07-18,C3001,Office,OFF-268,1,112.69,112.69,card,completed
+PO-20213,2025-09-06,C2016,Hardware,HAR-750,5,30.66,153.3,card,completed
+PO-20214,2026-03-25,C3005,Hardware,HAR-706,5,22.49,112.45,card,refunded
+PO-20215,2026-02-13,C2020,Tools,TOO-945,3,72.21,216.63,invoice,cancelled
+PO-20216,2025-08-16,C1038,Safety Gear,SAF-526,2,25.45,50.9,ach,completed
+PO-20217,2026-01-03,C1056,Hardware,HAR-924,3,39.61,118.83,card,completed
+PO-20218,2025-11-29,C3005,Hardware,HAR-448,2,33.26,66.52,ach,refunded
+PO-20219,2025-11-06,C1012,Safety Gear,SAF-675,1,63.51,63.51,card,completed
+PO-20220,2025-05-26,C3009,Office,OFF-493,3,54.83,164.49,invoice,completed
+PO-20221,2025-10-08,C2002,Hardware,HAR-881,1,79.73,79.73,card,completed
+PO-20222,2025-11-18,C3007,Hardware,HAR-320,1,15.31,15.31,card,completed
+PO-20223,2025-09-24,C2012,Safety Gear,SAF-108,3,97.57,292.71,ach,refunded
+PO-20224,2025-05-27,C2017,Safety Gear,SAF-675,1,119.58,119.58,card,completed
+PO-20225,2025-09-21,C3005,Safety Gear,SAF-796,2,43.16,86.32,card,completed
+PO-20226,2026-02-10,C1017,Office,OFF-873,1,75.48,75.48,card,completed
+PO-20227,2026-05-01,C1078,Office,OFF-923,1,59.18,59.18,card,completed
+PO-20228,2025-10-11,C2016,Hardware,HAR-502,10,62.27,622.7,card,completed
+PO-20229,2026-01-28,C3006,Cleaning,CLE-825,1,31.64,31.64,card,completed
+PO-20230,2026-02-23,C2020,Office,OFF-915,3,105.68,317.04,card,completed
+PO-20231,2026-02-21,C3006,Safety Gear,SAF-333,2,125.03,250.06,card,completed
+PO-20232,2025-07-15,C2013,Electrical,ELE-348,1,428.25,428.25,card,completed
+PO-20233,2025-07-17,C3000,Cleaning,CLE-807,1,33.1,33.1,card,completed
+PO-20234,2026-04-27,C2005,Hardware,HAR-631,1,34.1,34.1,card,completed
+PO-20235,2025-12-22,C3004,Office,OFF-659,1,94.46,94.46,ach,completed
+PO-20236,2026-03-09,C3003,Cleaning,CLE-296,5,21.07,105.35,card,completed
+PO-20237,2026-04-19,C1015,Electrical,ELE-600,1,176.5,176.5,invoice,refunded
+PO-20238,2026-02-18,C3004,Electrical,ELE-656,1,441.67,441.67,ach,cancelled
+PO-20239,2025-05-22,C2006,Office,OFF-831,1,111.49,111.49,card,refunded
+PO-20240,2026-01-31,C1006,Office,OFF-675,2,23.37,46.74,card,completed
+PO-20241,2026-04-08,C2021,Safety Gear,SAF-331,2,29.45,58.9,card,completed
+PO-20242,2025-07-10,C2006,Tools,TOO-663,10,97.91,979.1,card,completed
+PO-20243,2025-09-25,C1004,Office,OFF-392,2,109.69,219.38,card,completed
+PO-20244,2025-07-29,C3002,Cleaning,CLE-957,1,55.66,55.66,invoice,completed
+PO-20245,2025-09-26,C1082,Tools,TOO-109,1,246.93,246.93,invoice,completed
+PO-20246,2026-02-03,C1014,Safety Gear,SAF-605,3,44.16,132.48,card,completed
+PO-20247,2025-10-17,C2009,Hardware,HAR-848,1,29.49,29.49,card,refunded
+PO-20248,2026-02-15,C3008,Electrical,ELE-875,1,286.6,286.6,card,completed
+PO-20249,2025-10-15,C3000,Tools,TOO-510,2,106.9,213.8,card,completed
+PO-20250,2025-09-11,C3000,Cleaning,CLE-341,1,20.42,20.42,card,completed
+PO-20251,2025-09-11,C1064,Electrical,ELE-468,2,56.09,112.18,card,completed
+PO-20252,2026-04-26,C1017,Office,OFF-806,1,110.61,110.61,card,completed
+PO-20253,2025-11-08,C3003,Cleaning,CLE-818,1,31.42,31.42,card,completed
+PO-20254,2026-04-14,C1072,Safety Gear,SAF-994,2,114.59,229.18,card,completed
+PO-20255,2025-06-27,C1066,Tools,TOO-948,1,214.34,214.34,card,completed
+PO-20256,2025-08-14,C2016,Electrical,ELE-697,1,407.53,407.53,card,completed
+PO-20257,2025-11-29,C1000,Tools,TOO-672,1,315.32,315.32,ach,completed
+PO-20258,2025-08-20,C3001,Safety Gear,SAF-174,1,82.02,82.02,card,completed
+PO-20259,2025-11-26,C2012,Hardware,HAR-887,1,55.62,55.62,ach,completed
+PO-20260,2025-12-16,C3005,Cleaning,CLE-484,1,58.06,58.06,ach,completed
+PO-20261,2025-06-30,C3004,Hardware,HAR-650,1,20.66,20.66,invoice,completed
+PO-20262,2025-12-24,C1024,Safety Gear,SAF-534,1,168.2,168.2,card,completed
+PO-20263,2025-06-27,C1008,Tools,TOO-928,2,251.0,502.0,invoice,completed
+PO-20264,2025-06-21,C3006,Safety Gear,SAF-134,1,140.96,140.96,ach,completed
+PO-20265,2025-08-20,C2018,Tools,TOO-243,1,141.9,141.9,ach,refunded
+PO-20266,2026-03-03,C2013,Electrical,ELE-938,1,156.74,156.74,card,completed
+PO-20267,2025-10-01,C2013,Office,OFF-162,1,74.27,74.27,ach,completed
+PO-20268,2026-02-09,C2013,Cleaning,CLE-148,10,56.85,568.5,card,completed
+PO-20269,2025-11-09,C1059,Hardware,HAR-872,1,28.39,28.39,card,completed
+PO-20270,2025-05-30,C1042,Safety Gear,SAF-522,5,120.31,601.55,card,completed
+PO-20271,2026-03-28,C1048,Tools,TOO-560,3,75.98,227.94,ach,completed
+PO-20272,2026-04-10,C3008,Safety Gear,SAF-717,1,33.1,33.1,ach,completed
+PO-20273,2025-08-20,C1024,Cleaning,CLE-313,3,23.98,71.94,invoice,completed
+PO-20274,2025-06-30,C2007,Electrical,ELE-872,1,131.89,131.89,card,completed
+PO-20275,2026-02-07,C1065,Office,OFF-894,1,60.22,60.22,card,completed
+PO-20276,2026-01-10,C3005,Cleaning,CLE-200,3,45.01,135.03,ach,completed
+PO-20277,2025-10-08,C2018,Cleaning,CLE-146,1,17.95,17.95,card,completed
+PO-20278,2026-02-21,C3007,Electrical,ELE-527,1,112.4,112.4,card,completed
+PO-20279,2026-02-06,C2015,Electrical,ELE-801,1,350.61,350.61,card,refunded
+PO-20280,2025-10-28,C3000,Hardware,HAR-243,2,45.21,90.42,invoice,completed
+PO-20281,2026-01-24,C1017,Tools,TOO-959,3,361.64,1084.92,card,cancelled
+PO-20282,2026-03-19,C1081,Hardware,HAR-169,2,12.62,25.24,card,completed
+PO-20283,2026-04-07,C1067,Safety Gear,SAF-594,2,22.83,45.66,card,completed
+PO-20284,2025-09-18,C1012,Safety Gear,SAF-393,1,166.37,166.37,card,completed
+PO-20285,2026-01-24,C3001,Hardware,HAR-346,1,47.8,47.8,ach,completed
+PO-20286,2025-11-08,C3000,Cleaning,CLE-678,1,43.65,43.65,card,completed
+PO-20287,2025-06-17,C1063,Cleaning,CLE-488,1,31.7,31.7,card,completed
+PO-20288,2025-12-09,C1072,Office,OFF-679,10,117.07,1170.7,ach,completed
+PO-20289,2025-06-08,C1026,Electrical,ELE-387,3,266.67,800.01,card,completed
+PO-20290,2026-02-25,C1030,Hardware,HAR-870,3,67.82,203.46,invoice,completed
+PO-20291,2026-02-15,C3001,Cleaning,CLE-793,3,23.91,71.73,ach,completed
+PO-20292,2026-01-12,C2019,Electrical,ELE-454,1,213.58,213.58,ach,completed
+PO-20293,2026-03-01,C2011,Cleaning,CLE-892,1,40.24,40.24,ach,completed
+PO-20294,2026-02-08,C2007,Cleaning,CLE-542,1,37.64,37.64,card,cancelled
+PO-20295,2026-05-01,C3005,Tools,TOO-184,1,172.3,172.3,ach,completed
+PO-20296,2025-05-03,C2017,Office,OFF-555,1,38.21,38.21,card,completed
+PO-20297,2026-02-09,C2010,Safety Gear,SAF-517,1,36.13,36.13,card,completed
+PO-20298,2025-11-28,C2005,Cleaning,CLE-897,1,54.66,54.66,invoice,completed
+PO-20299,2026-04-16,C1035,Cleaning,CLE-273,1,22.26,22.26,card,completed
+PO-20300,2025-06-09,C1013,Office,OFF-357,5,88.74,443.7,card,completed
+PO-20301,2025-07-09,C2013,Office,OFF-106,5,45.21,226.05,card,completed
+PO-20302,2026-03-30,C2012,Safety Gear,SAF-239,1,128.58,128.58,card,completed
+PO-20303,2025-10-11,C2008,Office,OFF-852,2,62.99,125.98,card,completed
+PO-20304,2025-08-11,C2022,Safety Gear,SAF-658,1,158.17,158.17,card,refunded
+PO-20305,2025-08-16,C3002,Cleaning,CLE-916,1,43.41,43.41,ach,completed
+PO-20306,2026-03-21,C1076,Office,OFF-347,1,25.26,25.26,card,completed
+PO-20307,2026-01-01,C2011,Safety Gear,SAF-510,1,186.23,186.23,ach,completed
+PO-20308,2026-04-25,C3002,Safety Gear,SAF-708,2,35.3,70.6,ach,completed
+PO-20309,2026-03-28,C2013,Safety Gear,SAF-145,1,136.11,136.11,card,cancelled
+PO-20310,2025-06-24,C3003,Tools,TOO-200,1,216.08,216.08,card,completed
+PO-20311,2025-12-24,C1053,Electrical,ELE-702,2,93.31,186.62,invoice,completed
+PO-20312,2025-06-13,C3008,Tools,TOO-951,5,92.46,462.3,card,completed
+PO-20313,2026-01-03,C2022,Office,OFF-587,1,88.86,88.86,card,completed
+PO-20314,2025-06-28,C1022,Tools,TOO-969,1,81.64,81.64,ach,refunded
+PO-20315,2026-02-07,C2005,Hardware,HAR-438,1,77.18,77.18,card,completed
+PO-20316,2026-03-24,C2012,Electrical,ELE-542,1,339.7,339.7,ach,completed
+PO-20317,2025-05-03,C2017,Electrical,ELE-319,1,345.98,345.98,ach,completed
+PO-20318,2025-08-04,C2020,Office,OFF-433,1,20.76,20.76,card,completed
+PO-20319,2025-10-08,C2021,Safety Gear,SAF-497,2,125.66,251.32,card,completed
+PO-20320,2026-04-27,C2005,Office,OFF-729,1,83.28,83.28,card,completed
+PO-20321,2025-11-08,C2017,Safety Gear,SAF-497,1,44.82,44.82,card,completed
+PO-20322,2026-04-21,C3009,Electrical,ELE-277,1,235.65,235.65,card,completed
+PO-20323,2025-05-28,C2015,Office,OFF-109,1,29.85,29.85,card,completed
+PO-20324,2025-11-26,C3003,Cleaning,CLE-827,3,32.39,97.17,card,completed
+PO-20325,2025-09-27,C3007,Tools,TOO-381,1,141.7,141.7,ach,completed
+PO-20326,2026-02-06,C2024,Safety Gear,SAF-215,1,68.22,68.22,card,completed
+PO-20327,2025-05-22,C3004,Electrical,ELE-551,1,445.71,445.71,card,completed
+PO-20328,2025-05-17,C3003,Cleaning,CLE-369,1,50.1,50.1,card,completed
+PO-20329,2025-08-16,C1017,Electrical,ELE-702,2,391.64,783.28,card,completed
+PO-20330,2025-08-14,C1037,Hardware,HAR-924,1,35.86,35.86,card,completed
+PO-20331,2025-09-26,C1052,Safety Gear,SAF-373,5,112.59,562.95,invoice,completed
+PO-20332,2025-05-31,C3003,Office,OFF-987,2,86.56,173.12,card,completed
+PO-20333,2026-04-12,C2020,Cleaning,CLE-601,1,40.15,40.15,card,completed
+PO-20334,2025-06-17,C3005,Cleaning,CLE-627,2,43.51,87.02,ach,completed
+PO-20335,2026-02-22,C2022,Tools,TOO-989,2,290.46,580.92,ach,completed
+PO-20336,2025-10-31,C2010,Tools,TOO-914,1,117.97,117.97,card,completed
+PO-20337,2025-09-23,C3000,Office,OFF-660,1,71.41,71.41,card,completed
+PO-20338,2025-05-24,C2000,Tools,TOO-741,2,198.96,397.92,card,completed
+PO-20339,2025-07-07,C2002,Electrical,ELE-409,1,421.74,421.74,card,completed
+PO-20340,2025-11-07,C1083,Electrical,ELE-269,1,292.75,292.75,ach,cancelled
+PO-20341,2025-06-16,C2014,Electrical,ELE-197,1,230.26,230.26,card,completed
+PO-20342,2025-05-05,C1009,Tools,TOO-812,1,85.4,85.4,ach,completed
+PO-20343,2025-08-26,C1017,Cleaning,CLE-191,2,11.53,23.06,card,completed
+PO-20344,2026-03-25,C2023,Electrical,ELE-246,1,266.58,266.58,card,completed
+PO-20345,2025-08-18,C1012,Electrical,ELE-866,1,202.92,202.92,card,completed
+PO-20346,2025-07-11,C1082,Tools,TOO-703,2,162.76,325.52,card,completed
+PO-20347,2025-06-13,C1084,Hardware,HAR-666,2,61.04,122.08,card,completed
+PO-20348,2025-10-02,C1030,Hardware,HAR-630,2,24.83,49.66,card,completed
+PO-20349,2026-01-09,C3005,Cleaning,CLE-215,1,40.46,40.46,card,completed
+PO-20350,2025-07-07,C3001,Cleaning,CLE-981,3,28.73,86.19,card,completed
+PO-20351,2025-05-09,C2020,Safety Gear,SAF-169,1,58.83,58.83,invoice,completed
+PO-20352,2026-04-30,C2004,Safety Gear,SAF-885,1,146.33,146.33,card,completed
+PO-20353,2025-09-20,C2012,Tools,TOO-417,1,353.51,353.51,invoice,completed
+PO-20354,2026-02-25,C2007,Electrical,ELE-881,3,316.04,948.12,card,completed
+PO-20355,2025-05-30,C2023,Hardware,HAR-188,5,19.89,99.45,card,completed
+PO-20356,2026-04-02,C2011,Electrical,ELE-279,1,327.32,327.32,ach,completed
+PO-20357,2026-01-23,C3004,Safety Gear,SAF-901,3,66.66,199.98,card,refunded
+PO-20358,2025-06-30,C3001,Tools,TOO-443,3,136.11,408.33,card,completed
+PO-20359,2026-01-10,C1013,Cleaning,CLE-623,1,32.98,32.98,card,completed
+PO-20360,2026-02-18,C1060,Electrical,ELE-840,1,341.13,341.13,card,completed
+PO-20361,2025-07-16,C2010,Hardware,HAR-978,1,66.61,66.61,ach,completed
+PO-20362,2025-09-05,C2001,Cleaning,CLE-837,1,50.6,50.6,card,completed
+PO-20363,2025-07-31,C3004,Hardware,HAR-923,1,15.12,15.12,card,completed
+PO-20364,2025-10-15,C3003,Tools,TOO-666,1,168.59,168.59,card,completed
+PO-20365,2026-01-08,C3000,Hardware,HAR-850,5,63.71,318.55,card,completed
+PO-20366,2025-08-28,C1084,Safety Gear,SAF-454,2,144.82,289.64,card,completed
+PO-20367,2025-11-09,C3002,Electrical,ELE-414,1,252.52,252.52,card,completed
+PO-20368,2026-04-30,C3005,Office,OFF-195,1,33.92,33.92,ach,completed
+PO-20369,2025-12-21,C2001,Tools,TOO-694,1,89.73,89.73,ach,completed
+PO-20370,2025-12-09,C3005,Hardware,HAR-342,1,69.86,69.86,invoice,completed
+PO-20371,2025-10-10,C2004,Cleaning,CLE-378,1,56.95,56.95,card,cancelled
+PO-20372,2025-06-24,C1039,Hardware,HAR-560,1,39.64,39.64,card,cancelled
+PO-20373,2025-07-01,C1041,Tools,TOO-261,3,146.91,440.73,ach,completed
+PO-20374,2025-07-15,C1022,Tools,TOO-828,1,164.17,164.17,card,completed
+PO-20375,2025-05-16,C1017,Cleaning,CLE-975,1,46.4,46.4,card,completed
+PO-20376,2025-07-02,C2020,Tools,TOO-163,3,374.16,1122.48,card,completed
+PO-20377,2026-03-27,C1082,Tools,TOO-696,1,352.34,352.34,card,completed
+PO-20378,2025-12-14,C1073,Tools,TOO-967,3,156.07,468.21,card,completed
+PO-20379,2025-12-08,C3004,Cleaning,CLE-608,1,42.89,42.89,card,completed
+PO-20380,2025-09-21,C2017,Cleaning,CLE-252,1,39.44,39.44,card,completed
+PO-20381,2026-01-01,C1069,Tools,TOO-189,1,90.97,90.97,card,completed
+PO-20382,2025-05-10,C3008,Cleaning,CLE-900,2,31.9,63.8,ach,completed
+PO-20383,2025-10-12,C1060,Cleaning,CLE-376,1,23.22,23.22,card,cancelled
+PO-20384,2026-01-27,C3004,Office,OFF-885,1,34.07,34.07,card,completed
+PO-20385,2026-01-29,C2005,Electrical,ELE-157,2,428.08,856.16,card,completed
+PO-20386,2025-07-30,C1045,Hardware,HAR-706,1,62.19,62.19,card,completed
+PO-20387,2026-02-15,C2005,Safety Gear,SAF-245,1,53.88,53.88,invoice,completed
+PO-20388,2026-01-07,C1078,Tools,TOO-192,1,246.56,246.56,card,completed
+PO-20389,2025-08-12,C1018,Hardware,HAR-448,2,74.48,148.96,ach,completed
+PO-20390,2026-02-25,C2021,Electrical,ELE-245,2,385.52,771.04,ach,completed
+PO-20391,2025-11-19,C3007,Office,OFF-409,1,117.3,117.3,ach,completed
+PO-20392,2026-03-29,C3003,Office,OFF-278,2,70.94,141.88,ach,completed
+PO-20393,2026-04-06,C1000,Safety Gear,SAF-934,1,75.23,75.23,card,completed
+PO-20394,2026-04-25,C2019,Safety Gear,SAF-500,3,158.75,476.25,card,completed
+PO-20395,2025-08-22,C1040,Electrical,ELE-679,1,238.4,238.4,card,completed
+PO-20396,2025-07-25,C2008,Electrical,ELE-190,3,311.41,934.23,ach,completed
+PO-20397,2025-08-16,C1056,Hardware,HAR-809,1,29.45,29.45,card,completed
+PO-20398,2025-12-01,C3009,Cleaning,CLE-604,3,24.97,74.91,card,completed
+PO-20399,2026-03-30,C1033,Electrical,ELE-330,1,60.96,60.96,ach,completed
+PO-20400,2025-06-23,C3001,Tools,TOO-450,1,170.78,170.78,ach,completed
+PO-20401,2025-10-21,C1055,Safety Gear,SAF-728,3,146.81,440.43,card,completed
+PO-20402,2025-07-20,C3008,Tools,TOO-203,1,371.42,371.42,card,completed
+PO-20403,2025-09-13,C3002,Electrical,ELE-388,1,70.28,70.28,card,completed
+PO-20404,2025-05-28,C2003,Office,OFF-103,1,40.99,40.99,card,completed
+PO-20405,2025-05-14,C2012,Hardware,HAR-274,2,78.44,156.88,card,completed
+PO-20406,2025-12-28,C2014,Electrical,ELE-371,1,258.53,258.53,card,completed
+PO-20407,2025-05-23,C1012,Office,OFF-550,1,33.34,33.34,card,completed
+PO-20408,2025-06-13,C2012,Electrical,ELE-452,3,203.87,611.61,ach,completed
+PO-20409,2026-01-23,C2002,Cleaning,CLE-648,2,56.56,113.12,card,completed
+PO-20410,2025-11-19,C3002,Electrical,ELE-135,1,408.19,408.19,ach,completed
+PO-20411,2025-07-01,C1054,Cleaning,CLE-277,5,15.03,75.15,card,completed
+PO-20412,2025-06-10,C1008,Electrical,ELE-545,1,375.48,375.48,card,completed
+PO-20413,2025-06-14,C3000,Cleaning,CLE-669,1,23.61,23.61,card,completed
+PO-20414,2026-04-24,C2018,Safety Gear,SAF-701,1,95.53,95.53,card,completed
+PO-20415,2025-06-21,C3004,Tools,TOO-676,2,308.22,616.44,ach,completed
+PO-20416,2025-11-13,C2022,Safety Gear,SAF-723,1,51.0,51.0,card,completed
+PO-20417,2025-10-17,C1038,Electrical,ELE-343,1,229.59,229.59,card,completed
+PO-20418,2025-10-07,C1056,Office,OFF-963,1,85.97,85.97,card,completed
+PO-20419,2025-10-12,C3006,Office,OFF-846,1,80.3,80.3,card,completed
+PO-20420,2026-01-04,C2016,Safety Gear,SAF-988,1,30.12,30.12,ach,completed
+PO-20421,2026-01-24,C1058,Safety Gear,SAF-129,1,177.53,177.53,card,completed
+PO-20422,2025-05-26,C2003,Office,OFF-821,1,49.26,49.26,card,completed
+PO-20423,2026-04-14,C2011,Tools,TOO-347,1,244.0,244.0,card,completed
+PO-20424,2025-10-24,C1006,Hardware,HAR-957,3,62.93,188.79,card,completed
+PO-20425,2025-07-23,C1083,Safety Gear,SAF-898,5,174.28,871.4,card,completed
+PO-20426,2025-11-26,C1077,Electrical,ELE-109,1,85.57,85.57,card,completed
+PO-20427,2025-10-04,C2006,Electrical,ELE-826,2,208.0,416.0,card,completed
+PO-20428,2026-01-22,C2019,Safety Gear,SAF-506,1,21.32,21.32,invoice,completed
+PO-20429,2026-03-08,C2008,Office,OFF-405,2,61.95,123.9,card,completed
+PO-20430,2025-09-11,C3000,Electrical,ELE-828,5,303.62,1518.1,card,completed
+PO-20431,2026-03-04,C3004,Cleaning,CLE-776,1,13.56,13.56,card,completed
+PO-20432,2025-12-01,C3003,Electrical,ELE-136,1,447.8,447.8,ach,completed
+PO-20433,2026-04-17,C2005,Safety Gear,SAF-753,2,183.17,366.34,card,completed
+PO-20434,2026-04-02,C3002,Safety Gear,SAF-285,1,104.74,104.74,ach,refunded
+PO-20435,2026-04-14,C2010,Office,OFF-770,1,47.79,47.79,ach,completed
+PO-20436,2025-09-28,C3001,Cleaning,CLE-971,1,8.9,8.9,card,completed
+PO-20437,2025-12-28,C3002,Safety Gear,SAF-222,3,88.7,266.1,card,completed
+PO-20438,2025-07-10,C1023,Hardware,HAR-450,1,50.72,50.72,invoice,completed
+PO-20439,2025-06-11,C2006,Cleaning,CLE-440,2,15.55,31.1,card,completed
+PO-20440,2025-07-26,C2020,Safety Gear,SAF-882,1,161.34,161.34,ach,completed
+PO-20441,2025-12-06,C3008,Cleaning,CLE-492,1,34.82,34.82,ach,completed
+PO-20442,2025-08-06,C2003,Tools,TOO-792,1,290.76,290.76,card,completed
+PO-20443,2025-11-13,C3009,Office,OFF-271,1,13.12,13.12,invoice,completed
+PO-20444,2026-01-24,C2006,Office,OFF-544,3,119.49,358.47,card,completed
+PO-20445,2025-07-24,C1064,Cleaning,CLE-119,1,45.27,45.27,card,refunded
+PO-20446,2025-07-26,C1068,Tools,TOO-475,2,310.36,620.72,card,completed
+PO-20447,2026-03-16,C1014,Tools,TOO-708,10,266.76,2667.6,card,completed
+PO-20448,2025-11-30,C2009,Tools,TOO-660,1,280.13,280.13,card,completed
+PO-20449,2025-12-02,C2019,Electrical,ELE-632,1,284.37,284.37,card,completed
+PO-20450,2025-06-30,C1066,Office,OFF-216,2,63.75,127.5,card,cancelled
+PO-20451,2025-08-12,C3007,Office,OFF-820,1,25.96,25.96,card,completed
+PO-20452,2025-10-17,C3002,Hardware,HAR-102,1,18.05,18.05,card,completed
+PO-20453,2025-06-16,C2009,Safety Gear,SAF-176,2,38.23,76.46,card,completed
+PO-20454,2025-09-13,C2021,Cleaning,CLE-151,1,15.43,15.43,card,completed
+PO-20455,2025-10-08,C3002,Cleaning,CLE-856,1,51.97,51.97,ach,completed
+PO-20456,2025-10-16,C3002,Office,OFF-548,5,38.05,190.25,ach,completed
+PO-20457,2025-06-28,C3002,Cleaning,CLE-509,5,20.68,103.4,card,completed
+PO-20458,2025-06-27,C2018,Hardware,HAR-812,2,78.75,157.5,ach,completed
+PO-20459,2026-01-03,C1016,Safety Gear,SAF-794,1,130.04,130.04,ach,completed
+PO-20460,2026-01-03,C2022,Cleaning,CLE-215,3,29.8,89.4,card,completed
+PO-20461,2026-04-13,C3008,Safety Gear,SAF-885,2,150.28,300.56,card,completed
+PO-20462,2026-01-23,C2021,Electrical,ELE-817,2,211.8,423.6,ach,completed
+PO-20463,2026-03-25,C1020,Cleaning,CLE-252,3,36.15,108.45,invoice,completed
+PO-20464,2026-01-14,C1035,Cleaning,CLE-972,1,14.93,14.93,ach,completed
+PO-20465,2025-05-26,C2018,Safety Gear,SAF-328,1,88.15,88.15,ach,completed
+PO-20466,2026-01-11,C2001,Cleaning,CLE-423,1,32.86,32.86,card,completed
+PO-20467,2026-02-10,C2016,Safety Gear,SAF-100,3,162.52,487.56,invoice,completed
+PO-20468,2026-02-12,C3007,Hardware,HAR-770,2,76.62,153.24,card,completed
+PO-20469,2025-10-17,C2003,Safety Gear,SAF-885,2,105.16,210.32,card,completed
+PO-20470,2026-04-03,C2011,Hardware,HAR-102,1,68.43,68.43,invoice,completed
+PO-20471,2026-04-25,C3001,Tools,TOO-146,3,209.96,629.88,ach,refunded
+PO-20472,2025-09-08,C3003,Safety Gear,SAF-300,1,187.44,187.44,card,completed
+PO-20473,2025-10-21,C1057,Tools,TOO-875,1,355.42,355.42,ach,completed
+PO-20474,2025-12-21,C3009,Safety Gear,SAF-237,5,20.78,103.9,ach,completed
+PO-20475,2026-01-03,C3001,Safety Gear,SAF-899,5,51.9,259.5,card,refunded
+PO-20476,2025-11-15,C3004,Safety Gear,SAF-429,1,89.24,89.24,invoice,completed
+PO-20477,2025-11-20,C2022,Office,OFF-563,3,23.48,70.44,card,refunded
+PO-20478,2026-02-05,C2009,Office,OFF-828,2,70.0,140.0,card,completed
+PO-20479,2026-04-17,C2022,Office,OFF-788,1,87.56,87.56,invoice,completed
+PO-20480,2026-03-23,C3006,Office,OFF-827,1,47.45,47.45,card,completed
+PO-20481,2026-04-11,C2000,Electrical,ELE-961,1,398.54,398.54,card,completed
+PO-20482,2025-05-29,C1007,Hardware,HAR-373,2,22.94,45.88,card,completed
+PO-20483,2026-04-19,C2021,Office,OFF-308,2,11.62,23.24,ach,completed
+PO-20484,2026-02-12,C1006,Hardware,HAR-860,2,38.44,76.88,card,completed
+PO-20485,2025-10-08,C3007,Safety Gear,SAF-155,1,65.24,65.24,card,cancelled
+PO-20486,2025-08-24,C2024,Electrical,ELE-821,2,184.45,368.9,card,refunded
+PO-20487,2025-08-08,C3001,Office,OFF-559,1,84.46,84.46,card,completed
+PO-20488,2025-09-20,C2004,Safety Gear,SAF-370,1,125.12,125.12,card,completed
+PO-20489,2025-05-21,C2018,Hardware,HAR-430,1,64.61,64.61,card,completed
+PO-20490,2026-02-06,C2016,Office,OFF-174,2,43.6,87.2,card,completed
+PO-20491,2025-07-21,C3005,Cleaning,CLE-656,1,10.97,10.97,card,completed
+PO-20492,2025-12-30,C2020,Safety Gear,SAF-943,2,136.87,273.74,card,completed
+PO-20493,2026-03-11,C2017,Safety Gear,SAF-349,5,142.86,714.3,card,completed
+PO-20494,2025-09-22,C2009,Tools,TOO-629,3,170.61,511.83,ach,completed
+PO-20495,2026-03-30,C2000,Hardware,HAR-428,1,76.48,76.48,card,cancelled
+PO-20496,2026-03-17,C3003,Tools,TOO-315,2,304.15,608.3,ach,completed
+PO-20497,2026-01-31,C3002,Electrical,ELE-999,10,355.59,3555.9,card,completed
+PO-20498,2025-05-13,C2018,Cleaning,CLE-834,1,10.73,10.73,card,completed
+PO-20499,2025-08-25,C2003,Office,OFF-517,1,78.58,78.58,card,completed
+PO-20500,2026-01-29,C3001,Tools,TOO-756,2,66.18,132.36,ach,completed
+PO-20501,2025-10-31,C3007,Safety Gear,SAF-208,1,143.46,143.46,card,completed
+PO-20502,2025-05-16,C1081,Cleaning,CLE-260,1,13.36,13.36,card,completed
+PO-20503,2025-07-13,C2000,Office,OFF-793,3,116.12,348.36,ach,completed
+PO-20504,2026-02-08,C2002,Safety Gear,SAF-244,1,20.91,20.91,card,completed
+PO-20505,2025-10-04,C3002,Hardware,HAR-866,2,61.36,122.72,card,completed
+PO-20506,2025-07-22,C3000,Hardware,HAR-326,2,29.19,58.38,card,completed
+PO-20507,2026-02-06,C1074,Cleaning,CLE-760,1,21.7,21.7,card,completed
+PO-20508,2026-01-05,C1024,Office,OFF-465,1,81.41,81.41,card,completed
+PO-20509,2025-10-10,C2011,Cleaning,CLE-561,1,41.61,41.61,card,completed
+PO-20510,2025-10-09,C2008,Cleaning,CLE-272,1,19.29,19.29,card,refunded
+PO-20511,2025-10-17,C1077,Cleaning,CLE-573,1,47.84,47.84,card,completed
+PO-20512,2025-06-11,C3001,Office,OFF-979,3,107.83,323.49,card,refunded
+PO-20513,2025-06-08,C3003,Tools,TOO-969,1,55.45,55.45,card,completed
+PO-20514,2025-05-19,C1050,Safety Gear,SAF-366,1,199.77,199.77,card,cancelled
+PO-20515,2025-08-23,C2016,Safety Gear,SAF-850,3,44.1,132.3,card,completed
+PO-20516,2025-05-06,C3002,Electrical,ELE-344,3,368.75,1106.25,card,completed
+PO-20517,2025-07-14,C1033,Electrical,ELE-849,1,180.69,180.69,card,completed
+PO-20518,2025-08-14,C1083,Safety Gear,SAF-910,1,104.54,104.54,card,completed
+PO-20519,2025-10-13,C1069,Tools,TOO-820,5,257.24,1286.2,card,refunded
+PO-20520,2026-02-16,C2012,Hardware,HAR-485,2,36.84,73.68,card,completed
+PO-20521,2025-08-23,C3000,Safety Gear,SAF-515,1,176.19,176.19,card,completed
+PO-20522,2026-01-12,C1020,Hardware,HAR-550,1,17.24,17.24,card,completed
+PO-20523,2025-11-02,C3007,Tools,TOO-776,1,316.74,316.74,ach,completed
+PO-20524,2025-08-16,C2005,Safety Gear,SAF-265,2,93.96,187.92,card,completed
+PO-20525,2025-07-08,C3008,Electrical,ELE-624,1,270.35,270.35,card,completed
+PO-20526,2025-11-24,C3003,Safety Gear,SAF-752,1,149.52,149.52,card,completed
+PO-20527,2025-12-16,C3002,Cleaning,CLE-988,1,17.85,17.85,card,completed
+PO-20528,2026-03-16,C2002,Electrical,ELE-623,1,334.16,334.16,card,completed
+PO-20529,2025-08-26,C3002,Cleaning,CLE-494,1,6.89,6.89,card,completed
+PO-20530,2026-03-07,C2003,Tools,TOO-281,1,250.94,250.94,card,completed
+PO-20531,2025-06-17,C3006,Cleaning,CLE-775,1,38.59,38.59,ach,cancelled
+PO-20532,2026-01-23,C3006,Cleaning,CLE-479,3,43.67,131.01,card,completed
+PO-20533,2025-10-27,C2008,Safety Gear,SAF-923,2,157.08,314.16,card,completed
+PO-20534,2025-12-31,C3000,Tools,TOO-390,1,227.15,227.15,card,completed
+PO-20535,2026-02-20,C2003,Safety Gear,SAF-220,1,87.51,87.51,card,completed
+PO-20536,2025-07-19,C2008,Cleaning,CLE-767,1,20.11,20.11,card,completed
+PO-20537,2026-04-14,C2017,Cleaning,CLE-873,1,35.81,35.81,card,completed
+PO-20538,2026-01-03,C3001,Office,OFF-414,1,94.71,94.71,card,completed
+PO-20539,2025-08-26,C3008,Cleaning,CLE-901,2,14.74,29.48,card,completed
+PO-20540,2026-03-11,C3002,Electrical,ELE-800,2,97.51,195.02,invoice,completed
+PO-20541,2025-12-28,C3006,Cleaning,CLE-190,1,17.98,17.98,card,completed
+PO-20542,2026-03-11,C3007,Electrical,ELE-633,1,434.68,434.68,card,cancelled
+PO-20543,2026-01-21,C2021,Office,OFF-299,1,75.15,75.15,card,completed
+PO-20544,2025-05-19,C3005,Office,OFF-344,2,117.27,234.54,card,completed
+PO-20545,2026-04-08,C3008,Cleaning,CLE-515,1,33.96,33.96,ach,completed
+PO-20546,2025-09-23,C1024,Electrical,ELE-949,1,274.83,274.83,card,completed
+PO-20547,2025-12-19,C2010,Safety Gear,SAF-104,1,93.28,93.28,card,completed
+PO-20548,2025-06-29,C2012,Safety Gear,SAF-363,3,166.37,499.11,card,completed
+PO-20549,2026-02-13,C2018,Cleaning,CLE-888,1,24.34,24.34,ach,completed
+PO-20550,2025-05-15,C3003,Cleaning,CLE-219,1,26.66,26.66,ach,completed
+PO-20551,2025-10-09,C1051,Cleaning,CLE-461,1,6.53,6.53,ach,completed
+PO-20552,2026-04-10,C2018,Electrical,ELE-940,1,262.91,262.91,card,completed
+PO-20553,2025-09-15,C1030,Hardware,HAR-864,2,73.88,147.76,card,completed
+PO-20554,2025-09-13,C3001,Hardware,HAR-334,1,28.98,28.98,card,completed
+PO-20555,2025-06-10,C3005,Electrical,ELE-779,1,32.78,32.78,ach,completed
+PO-20556,2026-03-14,C2024,Office,OFF-604,3,106.67,320.01,card,completed
+PO-20557,2026-01-17,C2017,Office,OFF-507,1,72.59,72.59,card,completed
+PO-20558,2025-05-17,C3007,Safety Gear,SAF-455,1,143.54,143.54,card,completed
+PO-20559,2025-10-09,C2008,Electrical,ELE-108,1,118.52,118.52,card,completed
+PO-20560,2025-08-04,C1054,Safety Gear,SAF-369,1,104.84,104.84,card,completed
+PO-20561,2025-08-16,C1016,Cleaning,CLE-817,2,25.71,51.42,card,completed
+PO-20562,2026-02-19,C2012,Electrical,ELE-334,3,332.74,998.22,ach,completed
+PO-20563,2025-08-09,C2004,Hardware,HAR-919,5,22.17,110.85,ach,completed
+PO-20564,2026-03-19,C3000,Safety Gear,SAF-646,2,161.36,322.72,card,completed
+PO-20565,2025-07-23,C3004,Tools,TOO-320,3,204.64,613.92,card,completed
+PO-20566,2025-09-09,C1073,Office,OFF-120,1,47.32,47.32,card,completed
+PO-20567,2026-03-29,C2024,Electrical,ELE-651,1,357.73,357.73,card,completed
+PO-20568,2025-12-15,C2010,Cleaning,CLE-728,1,40.11,40.11,card,completed
+PO-20569,2025-12-02,C2020,Safety Gear,SAF-514,3,32.84,98.52,card,completed
+PO-20570,2025-09-27,C3005,Electrical,ELE-373,2,196.09,392.18,ach,cancelled
+PO-20571,2026-02-25,C1032,Safety Gear,SAF-561,1,53.1,53.1,card,refunded
+PO-20572,2026-04-24,C2000,Electrical,ELE-181,1,196.76,196.76,card,completed
+PO-20573,2025-11-20,C2007,Tools,TOO-206,1,97.02,97.02,card,completed
+PO-20574,2025-09-23,C3005,Cleaning,CLE-741,1,34.44,34.44,card,completed
+PO-20575,2025-12-30,C1076,Safety Gear,SAF-378,1,44.32,44.32,invoice,completed
+PO-20576,2025-12-20,C3007,Electrical,ELE-998,1,249.85,249.85,card,completed
+PO-20577,2026-02-01,C2000,Hardware,HAR-924,1,32.94,32.94,card,completed
+PO-20578,2026-01-23,C3007,Hardware,HAR-452,1,48.39,48.39,card,completed
+PO-20579,2025-10-01,C2006,Tools,TOO-884,1,143.13,143.13,card,completed
+PO-20580,2025-11-27,C1010,Cleaning,CLE-504,1,44.61,44.61,card,completed
+PO-20581,2025-12-03,C1068,Safety Gear,SAF-882,2,130.38,260.76,card,completed
+PO-20582,2025-09-15,C2014,Cleaning,CLE-292,3,15.85,47.55,card,completed
+PO-20583,2025-09-17,C1013,Electrical,ELE-737,1,164.67,164.67,card,completed
+PO-20584,2025-09-22,C1027,Office,OFF-228,2,89.44,178.88,card,completed
+PO-20585,2025-10-23,C3005,Cleaning,CLE-419,2,32.91,65.82,card,completed
+PO-20586,2025-06-11,C1032,Hardware,HAR-157,1,38.68,38.68,card,completed
+PO-20587,2025-11-12,C3000,Tools,TOO-886,2,173.91,347.82,invoice,completed
+PO-20588,2025-08-10,C2009,Cleaning,CLE-852,2,34.14,68.28,invoice,completed
+PO-20589,2025-10-13,C1081,Hardware,HAR-744,2,62.64,125.28,card,completed
+PO-20590,2025-09-30,C1055,Hardware,HAR-469,3,70.73,212.19,card,completed
+PO-20591,2025-10-14,C1005,Tools,TOO-271,2,240.87,481.74,card,completed
+PO-20592,2026-02-22,C1011,Electrical,ELE-586,2,95.1,190.2,ach,completed
+PO-20593,2026-04-17,C2004,Safety Gear,SAF-446,5,199.46,997.3,card,completed
+PO-20594,2026-04-25,C3005,Safety Gear,SAF-910,1,107.81,107.81,card,completed
+PO-20595,2025-12-11,C2014,Tools,TOO-805,1,287.67,287.67,card,completed
+PO-20596,2026-02-11,C2014,Office,OFF-655,2,29.25,58.5,card,completed
+PO-20597,2025-09-18,C3008,Safety Gear,SAF-981,1,32.4,32.4,card,completed
+PO-20598,2025-11-04,C3003,Electrical,ELE-618,1,107.92,107.92,card,completed
+PO-20599,2025-10-12,C3008,Electrical,ELE-164,2,256.36,512.72,card,completed
+PO-20600,2025-07-18,C3000,Safety Gear,SAF-389,1,135.36,135.36,card,completed
+PO-20601,2025-07-06,C2012,Hardware,HAR-994,1,19.28,19.28,card,completed
+PO-20602,2026-04-02,C2002,Cleaning,CLE-638,2,37.88,75.76,card,completed
+PO-20603,2025-05-07,C1071,Hardware,HAR-771,1,72.5,72.5,card,completed
+PO-20604,2025-11-29,C3001,Electrical,ELE-159,3,141.64,424.92,card,completed
+PO-20605,2025-08-19,C2007,Safety Gear,SAF-199,1,61.58,61.58,card,completed
+PO-20606,2026-02-16,C2011,Electrical,ELE-283,1,264.42,264.42,ach,cancelled
+PO-20607,2026-04-11,C2016,Cleaning,CLE-819,2,53.67,107.34,card,completed
+PO-20608,2025-10-20,C2010,Electrical,ELE-261,1,281.96,281.96,invoice,completed
+PO-20609,2025-11-07,C1070,Electrical,ELE-540,3,165.85,497.55,card,completed
+PO-20610,2025-09-08,C2016,Office,OFF-563,1,52.47,52.47,ach,completed
+PO-20611,2025-07-09,C3004,Office,OFF-106,1,32.85,32.85,ach,completed
+PO-20612,2026-02-08,C2004,Safety Gear,SAF-669,1,122.89,122.89,card,completed
+PO-20613,2025-09-13,C2006,Office,OFF-696,1,36.7,36.7,card,completed
+PO-20614,2025-06-09,C3001,Electrical,ELE-432,2,102.62,205.24,ach,completed
+PO-20615,2026-03-01,C1042,Electrical,ELE-407,1,369.5,369.5,card,cancelled
+PO-20616,2025-10-26,C3009,Cleaning,CLE-526,5,12.51,62.55,ach,refunded
+PO-20617,2025-05-06,C2004,Electrical,ELE-896,2,52.73,105.46,card,completed
+PO-20618,2025-10-15,C3009,Safety Gear,SAF-814,1,29.09,29.09,ach,completed
+PO-20619,2026-02-19,C2015,Safety Gear,SAF-192,1,72.16,72.16,card,completed
+PO-20620,2026-02-17,C3002,Electrical,ELE-150,1,140.27,140.27,card,completed
+PO-20621,2025-07-09,C2023,Cleaning,CLE-672,1,27.35,27.35,card,completed
+PO-20622,2026-01-24,C1052,Hardware,HAR-348,1,64.82,64.82,card,completed
+PO-20623,2025-08-06,C2014,Office,OFF-452,1,10.71,10.71,card,completed
+PO-20624,2026-03-16,C1010,Hardware,HAR-551,1,67.64,67.64,card,completed
+PO-20625,2025-06-27,C1014,Electrical,ELE-155,1,290.82,290.82,card,completed
+PO-20626,2025-10-04,C2024,Cleaning,CLE-582,1,17.29,17.29,card,completed
+PO-20627,2025-09-10,C1074,Safety Gear,SAF-594,2,198.61,397.22,card,completed
+PO-20628,2026-04-05,C2001,Safety Gear,SAF-144,1,30.82,30.82,card,completed
+PO-20629,2025-12-25,C2003,Tools,TOO-168,1,135.89,135.89,ach,completed
+PO-20630,2025-05-10,C3001,Office,OFF-988,3,51.29,153.87,invoice,completed
+PO-20631,2025-10-09,C2022,Cleaning,CLE-987,1,10.75,10.75,card,completed
+PO-20632,2025-05-12,C1044,Tools,TOO-353,5,147.15,735.75,card,refunded
+PO-20633,2026-04-16,C1007,Office,OFF-463,2,34.45,68.9,invoice,completed
+PO-20634,2026-03-17,C3003,Office,OFF-999,1,119.99,119.99,invoice,completed
+PO-20635,2025-07-17,C2020,Office,OFF-502,2,17.83,35.66,card,completed
+PO-20636,2026-04-17,C2017,Hardware,HAR-527,1,22.39,22.39,invoice,completed
+PO-20637,2025-07-07,C2022,Hardware,HAR-768,1,48.81,48.81,ach,completed
+PO-20638,2026-01-24,C3005,Hardware,HAR-540,10,78.35,783.5,card,completed
+PO-20639,2025-06-04,C3005,Safety Gear,SAF-645,5,41.31,206.55,card,completed
+PO-20640,2025-11-28,C1024,Office,OFF-553,2,100.03,200.06,card,refunded
+PO-20641,2025-06-24,C2007,Hardware,HAR-289,1,79.04,79.04,card,completed
+PO-20642,2026-03-02,C1077,Hardware,HAR-336,2,36.43,72.86,card,completed
+PO-20643,2025-12-27,C1052,Office,OFF-288,3,63.04,189.12,card,completed
+PO-20644,2025-05-08,C1056,Office,OFF-522,1,83.19,83.19,card,completed
+PO-20645,2026-03-12,C3009,Cleaning,CLE-804,1,30.71,30.71,card,completed
+PO-20646,2025-11-11,C3000,Cleaning,CLE-726,5,36.88,184.4,card,completed
+PO-20647,2026-01-22,C2012,Tools,TOO-562,1,339.05,339.05,ach,completed
+PO-20648,2025-05-21,C2009,Safety Gear,SAF-496,1,133.52,133.52,card,completed
+PO-20649,2025-09-24,C3007,Cleaning,CLE-270,1,39.11,39.11,card,completed
+PO-20650,2026-03-27,C2012,Cleaning,CLE-192,2,12.11,24.22,ach,completed
+PO-20651,2025-05-13,C1041,Hardware,HAR-564,1,60.46,60.46,card,completed
+PO-20652,2026-04-20,C3005,Electrical,ELE-828,2,331.72,663.44,card,completed
+PO-20653,2025-06-13,C2012,Safety Gear,SAF-824,1,162.39,162.39,card,completed
+PO-20654,2025-05-23,C1006,Hardware,HAR-443,1,56.85,56.85,card,completed
+PO-20655,2025-12-15,C2008,Office,OFF-741,1,108.64,108.64,invoice,completed
+PO-20656,2025-05-07,C1075,Cleaning,CLE-609,3,35.35,106.05,card,completed
+PO-20657,2026-04-03,C3004,Cleaning,CLE-564,1,10.29,10.29,card,completed
+PO-20658,2026-03-14,C3000,Electrical,ELE-670,3,117.21,351.63,card,completed
+PO-20659,2025-07-14,C1053,Tools,TOO-783,1,247.1,247.1,card,completed
+PO-20660,2025-07-31,C3002,Hardware,HAR-788,1,56.94,56.94,card,completed
+PO-20661,2025-12-20,C3006,Office,OFF-136,1,41.52,41.52,card,completed
+PO-20662,2026-02-06,C2016,Tools,TOO-399,1,85.88,85.88,ach,completed
+PO-20663,2025-08-16,C2002,Electrical,ELE-314,2,75.91,151.82,ach,completed
+PO-20664,2026-01-03,C2010,Electrical,ELE-805,2,361.04,722.08,ach,completed
+PO-20665,2025-09-10,C2023,Safety Gear,SAF-688,10,83.69,836.9,card,completed
+PO-20666,2026-03-20,C3000,Cleaning,CLE-604,3,53.72,161.16,card,completed
+PO-20667,2025-06-30,C3006,Tools,TOO-576,2,84.51,169.02,ach,completed
+PO-20668,2025-05-24,C3004,Office,OFF-458,1,79.4,79.4,card,completed
+PO-20669,2025-06-04,C2012,Office,OFF-407,1,44.28,44.28,card,completed
+PO-20670,2026-02-16,C2015,Safety Gear,SAF-129,3,54.92,164.76,ach,completed
+PO-20671,2025-05-19,C3007,Electrical,ELE-239,1,293.42,293.42,ach,completed
+PO-20672,2025-11-28,C2006,Tools,TOO-955,1,234.26,234.26,card,completed
+PO-20673,2026-02-20,C1003,Electrical,ELE-439,2,402.97,805.94,card,completed
+PO-20674,2025-10-21,C2024,Cleaning,CLE-741,1,14.96,14.96,card,completed
+PO-20675,2025-10-05,C3005,Electrical,ELE-978,1,43.28,43.28,card,completed
+PO-20676,2025-12-18,C3001,Office,OFF-321,1,27.6,27.6,card,completed
+PO-20677,2025-12-14,C2010,Cleaning,CLE-612,1,24.37,24.37,card,completed
+PO-20678,2025-07-13,C3007,Tools,TOO-941,10,217.91,2179.1,invoice,completed
+PO-20679,2025-11-15,C3005,Safety Gear,SAF-218,1,187.82,187.82,card,completed
+PO-20680,2025-12-26,C2006,Tools,TOO-633,2,294.76,589.52,card,cancelled
+PO-20681,2025-10-12,C1019,Hardware,HAR-297,1,48.19,48.19,ach,completed
+PO-20682,2025-07-20,C2017,Office,OFF-217,1,77.77,77.77,card,completed
+PO-20683,2025-10-11,C1078,Office,OFF-244,5,98.05,490.25,card,completed
+PO-20684,2025-10-21,C1006,Safety Gear,SAF-554,1,25.22,25.22,invoice,completed
+PO-20685,2025-06-14,C3009,Cleaning,CLE-501,1,38.19,38.19,card,completed
+PO-20686,2025-10-30,C1059,Office,OFF-440,3,87.84,263.52,card,completed
+PO-20687,2026-02-15,C2020,Hardware,HAR-195,3,74.54,223.62,card,completed
+PO-20688,2026-04-29,C1046,Cleaning,CLE-581,1,18.08,18.08,ach,completed
+PO-20689,2025-10-17,C2005,Office,OFF-564,1,15.32,15.32,card,completed
+PO-20690,2025-09-22,C3005,Office,OFF-718,1,64.89,64.89,card,completed
+PO-20691,2026-02-09,C1031,Electrical,ELE-172,2,253.75,507.5,card,completed
+PO-20692,2026-02-05,C2013,Hardware,HAR-593,1,35.17,35.17,ach,completed
+PO-20693,2026-02-15,C3009,Office,OFF-657,2,27.39,54.78,card,refunded
+PO-20694,2026-01-05,C1051,Tools,TOO-706,1,154.0,154.0,card,completed
+PO-20695,2025-06-05,C2021,Safety Gear,SAF-211,2,127.35,254.7,ach,completed
+PO-20696,2025-06-01,C3002,Tools,TOO-322,3,342.23,1026.69,invoice,completed
+PO-20697,2026-04-04,C1040,Hardware,HAR-563,1,38.52,38.52,card,completed
+PO-20698,2025-10-01,C3005,Safety Gear,SAF-913,5,74.82,374.1,invoice,completed
+PO-20699,2025-06-15,C1070,Safety Gear,SAF-108,2,111.88,223.76,ach,completed
+PO-20700,2025-05-28,C3003,Tools,TOO-820,1,372.86,372.86,card,completed
+PO-20701,2025-12-08,C1022,Cleaning,CLE-740,1,26.67,26.67,card,completed
+PO-20702,2025-11-13,C1009,Office,OFF-960,1,40.31,40.31,ach,completed
+PO-20703,2026-03-28,C1082,Tools,TOO-247,2,208.04,416.08,card,completed
+PO-20704,2025-11-29,C2014,Electrical,ELE-718,5,291.76,1458.8,card,completed
+PO-20705,2025-08-04,C2013,Cleaning,CLE-719,1,32.9,32.9,ach,completed
+PO-20706,2026-02-04,C1061,Safety Gear,SAF-475,1,26.82,26.82,card,completed
+PO-20707,2026-04-19,C3007,Tools,TOO-245,2,221.35,442.7,ach,cancelled
+PO-20708,2026-01-20,C3001,Tools,TOO-635,3,74.63,223.89,card,refunded
+PO-20709,2026-04-16,C2000,Electrical,ELE-652,2,161.25,322.5,card,completed
+PO-20710,2025-12-27,C1004,Cleaning,CLE-687,2,28.73,57.46,invoice,completed
+PO-20711,2026-04-21,C2005,Safety Gear,SAF-867,1,161.3,161.3,card,completed
+PO-20712,2026-02-18,C2004,Tools,TOO-772,10,315.98,3159.8,card,completed
+PO-20713,2026-01-14,C3000,Tools,TOO-971,2,129.44,258.88,card,completed
+PO-20714,2025-06-27,C3004,Safety Gear,SAF-278,5,153.01,765.05,card,completed
+PO-20715,2026-04-24,C3009,Hardware,HAR-596,1,47.86,47.86,card,completed
+PO-20716,2025-07-18,C3002,Cleaning,CLE-870,10,47.6,476.0,card,completed
+PO-20717,2025-08-16,C1059,Safety Gear,SAF-851,3,29.78,89.34,card,completed
+PO-20718,2025-11-21,C3007,Cleaning,CLE-864,5,55.81,279.05,card,completed
+PO-20719,2025-09-12,C2010,Hardware,HAR-643,3,12.81,38.43,invoice,completed
+PO-20720,2026-01-27,C2020,Electrical,ELE-142,1,253.14,253.14,card,completed
+PO-20721,2025-09-17,C2021,Office,OFF-376,1,19.01,19.01,card,completed
+PO-20722,2025-09-01,C3005,Electrical,ELE-788,1,111.87,111.87,card,completed
+PO-20723,2026-02-05,C1057,Tools,TOO-788,1,67.76,67.76,card,completed
+PO-20724,2025-10-27,C1076,Hardware,HAR-842,1,25.13,25.13,card,completed
+PO-20725,2026-04-02,C1084,Hardware,HAR-713,2,60.15,120.3,card,completed
+PO-20726,2026-03-28,C1084,Safety Gear,SAF-922,5,181.28,906.4,card,completed
+PO-20727,2025-06-08,C3005,Electrical,ELE-564,5,146.08,730.4,card,completed
+PO-20728,2025-09-09,C3004,Hardware,HAR-899,1,64.84,64.84,card,completed
+PO-20729,2025-09-13,C1062,Hardware,HAR-551,1,78.6,78.6,card,completed
+PO-20730,2025-06-25,C3001,Hardware,HAR-653,2,26.85,53.7,card,completed
+PO-20731,2025-05-18,C1081,Tools,TOO-172,1,128.95,128.95,card,completed
+PO-20732,2025-05-01,C2016,Tools,TOO-780,1,95.79,95.79,card,completed
+PO-20733,2026-04-28,C2000,Cleaning,CLE-589,1,51.58,51.58,ach,completed
+PO-20734,2025-11-13,C2001,Cleaning,CLE-224,1,56.49,56.49,card,completed
+PO-20735,2026-03-20,C3004,Electrical,ELE-192,1,388.4,388.4,card,completed
+PO-20736,2026-03-28,C3001,Hardware,HAR-280,1,77.79,77.79,card,completed
+PO-20737,2026-03-19,C1024,Electrical,ELE-467,1,401.79,401.79,card,completed
+PO-20738,2025-05-13,C2017,Electrical,ELE-707,1,193.28,193.28,ach,completed
+PO-20739,2025-12-17,C1083,Tools,TOO-137,1,158.14,158.14,ach,completed
+PO-20740,2026-04-07,C2002,Safety Gear,SAF-569,5,176.64,883.2,card,refunded
+PO-20741,2025-05-19,C1083,Electrical,ELE-244,1,38.01,38.01,invoice,completed
+PO-20742,2025-07-06,C2005,Tools,TOO-276,2,348.06,696.12,ach,completed
+PO-20743,2026-02-27,C1025,Tools,TOO-937,3,83.25,249.75,card,completed
+PO-20744,2025-11-22,C3009,Office,OFF-223,10,72.51,725.1,card,completed
+PO-20745,2025-07-28,C2005,Office,OFF-164,1,23.82,23.82,card,completed
+PO-20746,2025-05-21,C1062,Hardware,HAR-202,2,54.99,109.98,card,completed
+PO-20747,2025-06-11,C2024,Tools,TOO-107,1,74.86,74.86,card,completed
+PO-20748,2025-12-30,C2001,Hardware,HAR-246,2,47.57,95.14,card,completed
+PO-20749,2026-03-02,C2000,Hardware,HAR-834,1,76.62,76.62,card,completed
+PO-20750,2026-02-10,C3008,Hardware,HAR-296,1,48.05,48.05,card,completed
+PO-20751,2026-01-15,C1019,Hardware,HAR-575,2,56.83,113.66,card,completed
+PO-20752,2026-04-16,C2006,Cleaning,CLE-609,1,42.19,42.19,card,completed
+PO-20753,2025-12-19,C2003,Tools,TOO-206,2,354.83,709.66,card,completed
+PO-20754,2025-06-06,C3005,Hardware,HAR-838,1,51.42,51.42,card,refunded
+PO-20755,2025-08-26,C2007,Tools,TOO-433,1,124.43,124.43,card,completed
+PO-20756,2025-06-07,C2012,Cleaning,CLE-699,1,54.09,54.09,card,completed
+PO-20757,2025-08-08,C2008,Electrical,ELE-467,10,114.93,1149.3,card,completed
+PO-20758,2025-07-09,C3009,Tools,TOO-972,1,185.1,185.1,ach,completed
+PO-20759,2025-07-20,C1066,Electrical,ELE-726,5,272.81,1364.05,card,completed
+PO-20760,2026-01-06,C3003,Hardware,HAR-705,1,43.47,43.47,card,completed
+PO-20761,2025-09-04,C3000,Office,OFF-544,1,107.88,107.88,card,completed
+PO-20762,2025-11-30,C2022,Tools,TOO-581,2,213.91,427.82,card,completed
+PO-20763,2025-06-20,C2006,Cleaning,CLE-607,1,36.16,36.16,card,refunded
+PO-20764,2025-07-07,C2022,Office,OFF-402,1,119.88,119.88,card,completed
+PO-20765,2025-12-22,C2011,Electrical,ELE-697,1,221.03,221.03,ach,completed
+PO-20766,2026-03-17,C2001,Cleaning,CLE-820,2,52.46,104.92,card,completed
+PO-20767,2025-09-29,C3001,Cleaning,CLE-870,1,57.09,57.09,card,completed
+PO-20768,2026-03-14,C3001,Office,OFF-853,5,65.65,328.25,invoice,completed
+PO-20769,2025-05-21,C3002,Office,OFF-475,1,70.58,70.58,card,completed
+PO-20770,2025-10-19,C3003,Hardware,HAR-652,1,44.54,44.54,invoice,completed
+PO-20771,2025-08-24,C1044,Office,OFF-461,3,64.4,193.2,card,completed
+PO-20772,2025-12-18,C3007,Safety Gear,SAF-949,1,147.77,147.77,card,completed
+PO-20773,2026-03-14,C1058,Office,OFF-919,2,85.64,171.28,invoice,completed
+PO-20774,2025-06-14,C1014,Tools,TOO-500,3,141.6,424.8,invoice,completed
+PO-20775,2026-04-22,C1069,Hardware,HAR-608,1,25.89,25.89,invoice,completed
+PO-20776,2025-07-07,C1029,Cleaning,CLE-455,1,45.84,45.84,card,completed
+PO-20777,2026-01-22,C2021,Electrical,ELE-443,1,173.97,173.97,card,completed
+PO-20778,2026-04-22,C1033,Safety Gear,SAF-962,1,102.44,102.44,card,completed
+PO-20779,2025-08-25,C1021,Cleaning,CLE-480,10,47.57,475.7,card,completed
+PO-20780,2026-03-13,C3002,Hardware,HAR-828,1,24.4,24.4,card,completed
+PO-20781,2025-07-22,C2006,Hardware,HAR-219,1,33.53,33.53,card,completed
+PO-20782,2026-02-12,C2005,Electrical,ELE-135,2,440.77,881.54,card,completed
+PO-20783,2026-01-29,C3005,Office,OFF-224,5,53.31,266.55,card,completed
+PO-20784,2025-07-19,C2009,Tools,TOO-856,1,214.98,214.98,card,completed
+PO-20785,2026-02-18,C3007,Electrical,ELE-250,2,335.99,671.98,invoice,completed
+PO-20786,2025-05-21,C2002,Hardware,HAR-794,1,32.95,32.95,card,completed
+PO-20787,2025-10-15,C1002,Tools,TOO-722,2,240.45,480.9,card,cancelled
+PO-20788,2025-06-12,C2015,Safety Gear,SAF-969,1,140.88,140.88,card,completed
+PO-20789,2025-10-10,C1054,Safety Gear,SAF-719,1,30.09,30.09,card,completed
+PO-20790,2025-05-07,C1056,Office,OFF-453,1,117.48,117.48,ach,completed
+PO-20791,2025-11-29,C1075,Office,OFF-267,3,116.68,350.04,card,completed
+PO-20792,2026-03-03,C1075,Tools,TOO-247,1,204.0,204.0,ach,completed
+PO-20793,2025-11-26,C3003,Electrical,ELE-379,1,263.44,263.44,ach,cancelled
+PO-20794,2025-08-04,C2017,Cleaning,CLE-396,1,8.28,8.28,ach,completed
+PO-20795,2025-05-02,C3004,Hardware,HAR-368,1,55.56,55.56,card,completed
+PO-20796,2025-09-03,C3009,Tools,TOO-222,2,210.17,420.34,invoice,completed
+PO-20797,2026-01-02,C3005,Safety Gear,SAF-546,3,133.04,399.12,card,completed
+PO-20798,2026-01-18,C2022,Electrical,ELE-689,1,139.01,139.01,card,completed
+PO-20799,2025-07-09,C1037,Office,OFF-267,1,48.45,48.45,card,completed

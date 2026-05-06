@@ -97,6 +97,19 @@ except Exception:
     _TKWEB_OK = False
 
 # ============================================================
+# Mode flags
+# ============================================================
+# Advanced mode exposes power-user tabs (IDE, Agents, Nodes, Apothecary,
+# Vault Health, Librarian snapshots). Enabled via:
+#   • CLI flag:    python council_gui_engine.py --advanced
+#   • Env var:     COUNCIL_ADVANCED=1
+# Off by default for the polished customer experience.
+_ADVANCED_MODE = (
+    os.environ.get("COUNCIL_ADVANCED", "").lower() in ("1", "true", "yes")
+    or "--advanced" in sys.argv
+)
+
+# ============================================================
 # Agent event types
 # ============================================================
 
@@ -2179,18 +2192,32 @@ class CouncilConsole(tk.Tk):
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, padx=6, pady=6)
 
-        self._build_council_tab()
-        self._build_ide_tab()
-        self._build_librarian_tab()
-        self._build_sessions_tab()
-        self._build_nodes_tab()
-        self._build_agents_tab()
+        # ── Customer-facing flow (in order of how a session naturally goes) ──
+        # 1) Bring data in    → Grapher (primary entrypoint for new sessions)
+        # 2) Ask about it     → Council (deliberation)
+        # 3) Second opinion   → Lens
+        # 4) Re-visit         → Sessions
+        # 5) Manage data      → Vault
+        # 6) Speech I/O       → Speech
         self._build_grapher_tab()
+        self._build_council_tab()
+        self._build_lens_tab()
+        self._build_sessions_tab()
         self._build_vault_manager_tab()
         self._build_speech_tab()
-        self._build_apoth_tab()
-        self._build_lens_tab()
-        self._build_vault_health_tab()
+
+        # ── Advanced / admin tabs ──
+        # Hidden by default unless explicitly enabled. Power users and
+        # support staff can launch with --advanced or set
+        # COUNCIL_ADVANCED=1 to expose the IDE, Agents panel, Librarian
+        # snapshots, Nodes, Vault Health, and Apothecary tabs.
+        if _ADVANCED_MODE:
+            self._build_ide_tab()
+            self._build_librarian_tab()
+            self._build_agents_tab()
+            self._build_nodes_tab()
+            self._build_vault_health_tab()
+            self._build_apoth_tab()
 
     # ---- Council tab ----
 
@@ -2770,6 +2797,8 @@ class CouncilConsole(tk.Tk):
         fl2.pack(fill="x", padx=6, pady=(0, 2))
         ttk.Button(fl2, text="\U0001f4c2 Browse\u2026",
                    command=self._grapher_browse_file).pack(side="left")
+        ttk.Button(fl2, text="\U0001f4e6 Sample",
+                   command=self._grapher_load_sample).pack(side="left", padx=(4, 0))
         ttk.Label(fl2, text="Sheet:", foreground="#a6adc8").pack(side="left", padx=(10, 2))
         self._grapher_sheet_var = tk.StringVar()
         self._grapher_sheet_cb  = ttk.Combobox(
@@ -3150,6 +3179,79 @@ class CouncilConsole(tk.Tk):
             self._grapher_file_paths.append(p)
         self._grapher_file_var.set(label)
         self._grapher_do_load(p)
+
+    def _grapher_load_sample(self):
+        """Show a small picker for the bundled sample datasets, then load."""
+        from tkinter import simpledialog, messagebox
+        sample_dir = Path(__file__).parent / "assets" / "sample_data"
+        if not sample_dir.exists():
+            messagebox.showinfo(
+                "Sample data unavailable",
+                "Bundled sample datasets were not found at:\n"
+                f"{sample_dir}\n\n"
+                "If you're running from source, make sure assets/sample_data/ "
+                "exists. In a packaged build this should be present alongside "
+                "the executable.",
+                parent=self,
+            )
+            return
+
+        samples = sorted(sample_dir.glob("*.csv"))
+        if not samples:
+            messagebox.showinfo("Sample data unavailable",
+                                "No sample CSV files found.", parent=self)
+            return
+
+        # Tiny chooser dialog — radio list of sample names with friendly descriptions.
+        descriptions = {
+            "purchase_orders.csv": "800 orders across 12 months — try revenue, seasonality, AOV questions",
+            "inventory.csv":       "117 SKUs with stock + holding cost — try dead-stock, supplier questions",
+            "customers.csv":       "120 customers w/ segments & lifetime spend — try churn, LTV questions",
+        }
+        win = tk.Toplevel(self)
+        win.title("Load sample dataset")
+        win.geometry("520x320")
+        win.transient(self)
+        win.grab_set()
+        try: branding.apply_window_icon(win)
+        except Exception: pass
+
+        ttk.Label(win, text="Pick a sample dataset to load into the Grapher:",
+                  font=("Segoe UI", 11)).pack(anchor="w", padx=14, pady=(14, 8))
+        ttk.Label(win,
+                  text="These are synthetic CSVs that ship with Data's Inferno. "
+                       "Use them to try the tool before loading your real data.",
+                  foreground="#7f849c", wraplength=480, justify="left",
+                  ).pack(anchor="w", padx=14, pady=(0, 10))
+
+        choice = tk.StringVar(value=samples[0].name)
+        for sp in samples:
+            row = ttk.Frame(win)
+            row.pack(fill="x", padx=14, pady=2)
+            ttk.Radiobutton(row, text=sp.name, variable=choice, value=sp.name
+                            ).pack(side="left")
+            desc = descriptions.get(sp.name, "")
+            if desc:
+                ttk.Label(row, text=f"— {desc}", foreground="#a6adc8",
+                          font=("Segoe UI", 9)
+                          ).pack(side="left", padx=8)
+
+        def _do_load():
+            picked = sample_dir / choice.get()
+            win.destroy()
+            label = str(picked)
+            existing = list(self._grapher_file_cb["values"])
+            if label not in existing:
+                existing.append(label)
+                self._grapher_file_cb["values"] = existing
+                self._grapher_file_paths.append(picked)
+            self._grapher_file_var.set(label)
+            self._grapher_do_load(picked)
+
+        bf = ttk.Frame(win)
+        bf.pack(fill="x", padx=14, pady=(16, 12), side="bottom")
+        ttk.Button(bf, text="Load",   command=_do_load).pack(side="right")
+        ttk.Button(bf, text="Cancel", command=win.destroy).pack(side="right", padx=6)
 
     def _grapher_load_file(self, event=None):
         if not _GRAPHER_OK:
@@ -5517,23 +5619,29 @@ class CouncilConsole(tk.Tk):
         self._set_judge(f"Route: {route}\n")
         self._set_status(f"● {route}…", "#fab387")
 
+        # Tabs only present in advanced mode — fall through to deliberation
+        # if the user is on the consumer build (no exposed admin tabs).
         if route == "apothecary":
-            self._append_transcript("Judge", "Routing to Apothecary tab.", "final")
-            self.nb.select(self.tab_apoth)
-            self._set_status("● idle")
-            return
+            if hasattr(self, "tab_apoth"):
+                self._append_transcript("Judge", "Routing to Apothecary tab.", "final")
+                self.nb.select(self.tab_apoth)
+                self._set_status("● idle")
+                return
+            # else: deliberation handles maintenance question conversationally
         if route == "speech":
             self._append_transcript("Judge", "Routing to Speech tab.", "final")
             self.nb.select(self.tab_speech)
             self._set_status("● idle")
             return
         if route == "librarian":
-            self._append_transcript("Judge", "Routing to Librarian tab.", "final")
-            self.nb.select(self.tab_lib)
-            self._set_status("● idle")
-            return
+            if hasattr(self, "tab_lib"):
+                self._append_transcript("Judge", "Routing to Librarian tab.", "final")
+                self.nb.select(self.tab_lib)
+                self._set_status("● idle")
+                return
         if route == "ide":
-            self.nb.select(self.tab_ide)
+            if hasattr(self, "tab_ide"):
+                self.nb.select(self.tab_ide)
 
         # ── Phase 2: Panel selection (before worker spawns) ────────────
         # Resolve the panel HERE in the main thread so the worker can gate

@@ -15,9 +15,18 @@ from typing import Dict
 
 # ---- Identity ----------------------------------------------------------------
 
-PRODUCT_NAME    = os.environ.get("COUNCIL_PRODUCT_NAME", "Council")
-PRODUCT_TAGLINE = os.environ.get("COUNCIL_TAGLINE",
-                                 "Multi-AI deliberation. On your machine.")
+PRODUCT_NAME    = os.environ.get("COUNCIL_PRODUCT_NAME", "Data's Inferno")
+PRODUCT_SHORT   = os.environ.get("COUNCIL_PRODUCT_SHORT", "Data's Inferno")
+PRODUCT_TAGLINE = os.environ.get(
+    "COUNCIL_TAGLINE",
+    "A panel of AI specialists that reviews, charts, and explains your business data."
+)
+PRODUCT_PITCH   = os.environ.get(
+    "COUNCIL_PITCH",
+    "Drop in your sales, inventory, or customer data. Ask questions in plain English. "
+    "Get charts, summaries, and insights from a panel of AI analysts that runs entirely "
+    "on your computer — your data never leaves the machine."
+)
 VERSION         = "1.0.0-rc1"
 COPYRIGHT       = "© 2026"
 SUPPORT_EMAIL   = os.environ.get("COUNCIL_SUPPORT_EMAIL", "")

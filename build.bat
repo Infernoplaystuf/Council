@@ -35,10 +35,10 @@ if errorlevel 1 (
 
 echo.
 echo === Build complete ===
-echo Bundle location: %CD%\dist\Council
-echo Executable:      %CD%\dist\Council\Council.exe
+echo Bundle location: %CD%\dist\DatasInferno
+echo Executable:      %CD%\dist\DatasInferno\DatasInferno.exe
 echo.
 echo To create a distributable installer, run an installer builder
-echo like Inno Setup or NSIS against dist\Council.
+echo like Inno Setup or NSIS against dist\DatasInferno.
 
 endlocal

@@ -174,10 +174,12 @@ class OnboardingWizard(tk.Toplevel):
     # Step 1: welcome
     def _render_welcome(self):
         self._heading(f"Welcome to {branding.PRODUCT_NAME}.")
-        self._label(branding.PRODUCT_TAGLINE, font=("Segoe UI", 12), pady=(0, 16))
+        self._label(branding.PRODUCT_TAGLINE, font=("Segoe UI", 12), pady=(0, 14))
         self._label(
-            f"{branding.PRODUCT_NAME} runs an AI panel on your own computer. "
-            "Your conversations, files, and project data never leave this machine.\n\n"
+            "Drop in your sales, inventory, or customer data. Ask questions in "
+            "plain English. A panel of AI specialists deliberates and gives you "
+            "an answer you can trust because every step is visible — and your "
+            "data never leaves this computer.\n\n"
             "This setup takes about three minutes. We'll:\n"
             "   • Confirm you have enough disk space\n"
             "   • Detect or help install Ollama (the local AI engine)\n"
@@ -349,12 +351,16 @@ class OnboardingWizard(tk.Toplevel):
     def _render_ready(self):
         self._heading("You're all set.")
         self._label(
-            f"{branding.PRODUCT_NAME} is ready to use. A few tips:\n\n"
-            "   • Type a question in the Council tab — the panel will deliberate.\n"
-            "   • Drop a CSV into the Grapher tab to chart your data.\n"
-            "   • Visit the Apothecary tab if anything misbehaves.\n\n"
+            f"{branding.PRODUCT_NAME} is ready to use. Three ways to start:\n\n"
+            "   1. Drop a CSV onto the Grapher tab — the Analyst will pick a "
+            "chart and tell you what it sees.\n"
+            "   2. Click Load Sample on the Grapher to try the tool on a "
+            "synthetic purchase-orders dataset first.\n"
+            "   3. Switch to the Council tab and ask a question about your "
+            "data in plain English — the panel will deliberate and answer.\n\n"
+            "If anything misbehaves, the Apothecary tab is your first stop.\n\n"
             "Click Finish to start using the application.",
-            pady=(0, 16),
+            pady=(0, 14),
         )
 
     # ---- Navigation -------------------------------------------------
