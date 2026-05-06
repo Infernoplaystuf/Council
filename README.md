@@ -144,6 +144,7 @@ This product was built privacy-first. Specifically:
 - **Models run locally** via Ollama. We never call OpenAI, Anthropic, or any cloud AI.
 - **No accounts.** No login. No "free tier" that secretly logs you.
 - **Your vault is yours.** The local database (`vault/`) contains all your conversations and indexed files. Delete it any time.
+- **Crash reports stay local.** When something crashes, a redacted log (stack trace, OS info, app version — no message content, no data values) is saved to `vault/logs/crashes/`. Nothing is sent automatically. If you want to email a log to support, you click ✉ Email and your default mail client opens with a draft you review before sending.
 
 If you optionally enable cloud backends (e.g. you point a personality at OpenAI yourself), you'll get a warning every time. The default is fully local.
 

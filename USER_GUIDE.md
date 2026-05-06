@@ -120,6 +120,57 @@ First time on the Grapher? Click **📦 Load Sample** to drop in a synthetic but
 
 ---
 
+## Model configuration — one model vs many
+
+By default, **every AI personality runs on the same Ollama model**. This is intentional:
+
+> Switching models is the silent killer of perceived speed. If the Writer uses model A and the Coder uses model B, every time the panel rotates between them Ollama has to swap models in and out of memory. On a laptop, that turns a 3-second answer into a 30-second one.
+
+The default `personality_backends.json` ships with all six core roles pinned to `local_general_alt` (the 14B starter model the onboarding wizard pulls). Changing roles always feels instant because no model swap happens.
+
+### When to use multiple models
+
+There are two cases where pinning a role to a different model genuinely helps, and the speed cost is worth it:
+
+1. **You have a powerful desktop with 32+ GB RAM** that can hold two models in memory simultaneously. Then the swap penalty disappears and you can put the Coder on a code-specialist model (`qwen2.5-coder:14b`).
+2. **You're using a remote node** (Nodes tab) for heavy reasoning. The local laptop runs the Judge and Peasant on the small fast model; the desktop or homelab GPU runs the Writer/Sage on a 32B. The swap is between machines, not within one machine, so it's parallelisable.
+
+For everyone else: leave the defaults alone. One model is fast and the AI panel is still meaningfully smarter than any single AI alone — because it deliberates with itself.
+
+### How to override
+
+Edit `vault/personality_backends.json`:
+
+```json
+{
+  "writer":  "local_general_alt",
+  "coder":   "local_coder_primary",
+  "intern":  "local_general_alt",
+  "judge":   "local_general_alt",
+  "peasant": "local_general_alt",
+  "artist":  "local_general_alt"
+}
+```
+
+Hot-reloads — no restart needed.
+
+Available backend keys:
+
+| Key | Default model | When to use |
+|---|---|---|
+| `local_general_alt` | qwen2.5:14b | The default. Use this for everything unless you have a reason. |
+| `local_general_primary` | qwen2.5:32b | Heavy synthesis (Writer/Sage). Needs ~24 GB RAM. |
+| `local_coder_primary` | qwen2.5-coder:14b | Coder role specifically — code-tuned. |
+| `local_coder_fast` | phi4 | Tiny + fast. Good for Intern. |
+| `local_judge_fast` | phi4 | Tiny + fast. Good for Judge. |
+| `local_peasant_fast` | phi4 | Tiny + fast. Good for Peasant. |
+| `pi_heavy` | qwen2.5:14b on Pi | Remote 14B on a Raspberry Pi 16GB. |
+| `pi_fast` | phi4 on Pi | Remote phi4 on a Pi 8GB. |
+
+You can also override the actual model name behind any backend key via environment variables — see the comments at the top of `personality_backends.json` for the full list.
+
+---
+
 ## The Personal Specialists tab
 
 Specialists are **named lenses** that the AI panel can wear when answering your questions. They are pure config — no separate data folders, no fine-tuned models. The vault is the shared knowledge pool; specialists just tell the AI *how to look at it*.

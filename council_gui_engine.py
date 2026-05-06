@@ -30,6 +30,7 @@ import apothecary_engine as ae
 import branding
 import onboarding
 import specialists as _spec
+import crash_reporter
 
 # ── Agent modules (graceful optional imports) ─────────────────
 try:
@@ -8405,7 +8406,20 @@ def _fmt_bytes(n: int) -> str:
 
 
 def main():
+    # Install system-level crash hooks BEFORE the GUI exists so any error
+    # during startup is captured. Tk hook gets wired after the root window
+    # is created (inside CouncilConsole.__init__).
+    def _on_crash(crash_path):
+        # Defer dialog to the Tk main loop — show_dialog needs a parent.
+        try:
+            if app and app.winfo_exists():
+                app.after(0, lambda: crash_reporter.show_dialog(app, crash_path))
+        except Exception:
+            pass
+    crash_reporter.install(VAULT_DIR, on_crash=_on_crash)
+
     app = CouncilConsole()
+    crash_reporter.install_tk_hook(app, VAULT_DIR, on_crash=_on_crash)
     app.mainloop()
 
 

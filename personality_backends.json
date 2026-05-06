@@ -1,8 +1,8 @@
 {
-  "writer": "local_general_primary",
-  "coder": "local_coder_primary",
-  "intern": "local_coder_fast",
-  "judge": "local_judge_fast",
-  "peasant": "local_peasant_fast",
-  "artist": "local_general_alt"
+  "writer":  "local_general_alt",
+  "coder":   "local_general_alt",
+  "intern":  "local_general_alt",
+  "judge":   "local_general_alt",
+  "peasant": "local_general_alt",
+  "artist":  "local_general_alt"
 }

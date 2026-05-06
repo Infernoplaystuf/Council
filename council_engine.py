@@ -3025,10 +3025,17 @@ DEFAULT_MODELS = {
 
 
 def load_personality_pins(path: Path) -> Dict[str, str]:
+    """
+    Read personality → backend_key mapping from JSON. Filters out keys
+    starting with '_' so users can document the file with `_comment`-
+    style entries without polluting the personality registry.
+    """
     try:
         if path.exists():
             obj = json.loads(path.read_text(encoding="utf-8"))
-            return obj if isinstance(obj, dict) else {}
+            if isinstance(obj, dict):
+                return {k: v for k, v in obj.items()
+                        if isinstance(k, str) and not k.startswith("_")}
     except Exception:
         pass
     return {}

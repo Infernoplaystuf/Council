@@ -27,14 +27,15 @@ from typing import Callable, List, Optional
 import branding
 
 
-# Default model the wizard offers to pull. Chosen for: free, runs on a
-# 16GB-RAM laptop, decent quality, English-first.
-DEFAULT_MODEL = "qwen2.5:14b"
-DEFAULT_MODEL_ALT = "llama3.2:3b"   # tiny fallback for very modest hardware
+# Default model the wizard offers to pull. The exact tag matters — the
+# Council's backend layer expects this specific quantization.
+# Chosen for: free, runs on a 16GB-RAM laptop, decent quality, English-first.
+DEFAULT_MODEL     = "qwen2.5:14b-instruct-q4_K_M"
+DEFAULT_MODEL_ALT = "qwen2.5:7b-instruct-q4_K_M"   # smaller fallback, same family
 
 # Estimated download size we surface to the user up front.
 DEFAULT_MODEL_GB = 9
-ALT_MODEL_GB     = 2
+ALT_MODEL_GB     = 5
 
 
 # ============================================================
