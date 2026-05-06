@@ -2193,14 +2193,14 @@ class CouncilConsole(tk.Tk):
         self.nb.pack(fill="both", expand=True, padx=6, pady=6)
 
         # ── Customer-facing flow (in order of how a session naturally goes) ──
-        # 1) Bring data in    → Grapher (primary entrypoint for new sessions)
-        # 2) Ask about it     → Council (deliberation)
+        # 1) Ask a question   → Council (entrypoint — most users start here)
+        # 2) See the data     → Grapher (Council pulls relevant files in)
         # 3) Second opinion   → Lens
         # 4) Re-visit         → Sessions
         # 5) Manage data      → Vault
         # 6) Speech I/O       → Speech
-        self._build_grapher_tab()
         self._build_council_tab()
+        self._build_grapher_tab()
         self._build_lens_tab()
         self._build_sessions_tab()
         self._build_vault_manager_tab()
@@ -2309,6 +2309,9 @@ class CouncilConsole(tk.Tk):
         btns.pack(fill="x", pady=(4, 0))
 
         ttk.Button(btns, text="Send  [Ctrl+Enter]", command=self._send).pack(side="left")
+        ttk.Button(btns, text="\U0001f4ca Find & Chart",
+                   command=self._council_find_and_chart_button
+                   ).pack(side="left", padx=6)
         ttk.Button(btns, text="Clear", command=lambda: self._set_text(self.input, "")).pack(side="left", padx=6)
 
         self.var_deliberate      = tk.BooleanVar(value=True)
@@ -5600,6 +5603,222 @@ class CouncilConsole(tk.Tk):
         self.status.configure(text=text, foreground=color)
 
     # ============================
+    # Find-relevant-data → Grapher → Analyst
+    # ============================
+    # When the user asks a chart-shaped question in the Council, we don't
+    # want them to hunt for the right CSV manually. This helper scans the
+    # vault and the bundled sample data for files that look relevant to
+    # the query, hands them to the Grapher, and asks the Analyst to plot.
+
+    # Lower-case stop-words removed from queries before scoring filenames.
+    _DATA_QUERY_STOPS = {
+        "show", "me", "the", "a", "an", "of", "for", "by", "in", "on", "at",
+        "and", "or", "to", "with", "what", "which", "how", "many", "much",
+        "do", "does", "is", "are", "was", "were", "have", "has", "had",
+        "graph", "chart", "plot", "visualize", "visualise", "see", "find",
+        "tell", "give", "from", "this", "that", "these", "those", "all",
+        "make", "create", "draw", "produce", "us", "our", "i", "my", "your",
+    }
+
+    # Substrings that signal the user wants a chart pulled together.
+    # Matched case-insensitively in the raw query.
+    _DATA_QUERY_TRIGGERS = (
+        "graph", "chart", "plot", "visualiz", "visualis",
+        "show me", "show the", "trend", "by month", "by year",
+        "by week", "by day", "by category", "compare", "histogram",
+    )
+
+    def _looks_like_data_question(self, query: str) -> bool:
+        ql = query.lower()
+        return any(t in ql for t in self._DATA_QUERY_TRIGGERS)
+
+    def _query_keywords(self, query: str):
+        """Strip punctuation + stop words, return content terms (length > 2)."""
+        terms = [t.strip(".,!?;:()[]\"'").lower() for t in query.split()]
+        return [t for t in terms if t and len(t) > 2 and t not in self._DATA_QUERY_STOPS]
+
+    def _vault_data_files(self):
+        """All loadable data files in the vault and bundled sample data."""
+        exts = {".csv", ".tsv", ".xlsx", ".xls", ".json", ".npy", ".npz"}
+        roots = [VAULT_DIR, Path(__file__).parent / "assets" / "sample_data"]
+        files = []
+        seen = set()
+        for root in roots:
+            if not root.exists():
+                continue
+            for p in root.rglob("*"):
+                if not p.is_file() or p.suffix.lower() not in exts:
+                    continue
+                # Skip vault internals
+                s = str(p).replace("\\", "/")
+                if "/.git/" in s or "/.chromadb/" in s or "/.cache/" in s:
+                    continue
+                if p in seen:
+                    continue
+                seen.add(p)
+                files.append(p)
+        return files
+
+    # Business synonyms — when a user types "revenue" the file probably has
+    # "total" or "amount", not "revenue". Each entry is one term and the
+    # column-name aliases that should also count as a hit for it.
+    _SYNONYMS = {
+        "revenue":  ("total", "amount", "sales", "price", "value"),
+        "sales":    ("total", "amount", "revenue", "order", "value"),
+        "income":   ("total", "amount", "revenue", "sales"),
+        "spend":    ("total", "amount", "spent", "purchase", "lifetime"),
+        "spending": ("total", "amount", "spent", "purchase"),
+        "purchase": ("order", "po", "buy", "transaction"),
+        "order":    ("po", "purchase", "transaction"),
+        "client":   ("customer", "buyer", "account"),
+        "customer": ("client", "buyer", "account"),
+        "stock":    ("inventory", "qty", "quantity", "on_hand"),
+        "inventory": ("stock", "qty", "quantity", "sku"),
+        "product":  ("sku", "item", "name"),
+        "category": ("type", "group", "class", "segment"),
+        "supplier": ("vendor", "source"),
+        "monthly":  ("month", "date", "ts", "timestamp"),
+        "yearly":   ("year", "date", "ts", "annual"),
+        "weekly":   ("week", "date", "ts"),
+        "daily":    ("day", "date", "ts"),
+        "trend":    ("date", "time", "ts"),
+        "retention": ("last", "first", "ltv", "churn", "active"),
+        "dormant":  ("last_order", "last_activity", "inactive", "churn"),
+    }
+
+    def _score_file_for_query(self, path: Path, terms) -> float:
+        """
+        Filename hit (×2) + header hit (×1) + synonym header hit (×0.6).
+        Quick and tolerant of natural-language vs column-name vocabulary.
+        """
+        score = 0.0
+        name = path.stem.lower()
+        for t in terms:
+            if t in name:
+                score += 2.0
+
+        if path.suffix.lower() in (".csv", ".tsv"):
+            try:
+                with path.open("r", encoding="utf-8", errors="replace") as f:
+                    header = f.readline().lower()
+            except Exception:
+                return score
+            for t in terms:
+                if t in header:
+                    score += 1.0
+                # Synonym fallback — only if the term itself didn't already hit
+                else:
+                    for alt in self._SYNONYMS.get(t, ()):
+                        if alt in header:
+                            score += 0.6
+                            break
+        return score
+
+    def _find_data_files_for_query(self, query: str, top_n: int = 3):
+        terms = self._query_keywords(query)
+        if not terms:
+            return []
+        scored = []
+        for p in self._vault_data_files():
+            s = self._score_file_for_query(p, terms)
+            if s > 0:
+                scored.append((s, p))
+        scored.sort(key=lambda r: r[0], reverse=True)
+        return [p for _, p in scored[:top_n]]
+
+    def _council_find_and_chart_button(self):
+        """Button handler — explicit user trigger; consumes the input like _send."""
+        query = self.input.get("1.0", "end").strip()
+        if not query:
+            return
+        self._set_text(self.input, "")
+        self._append_transcript("User", query)
+        self._council_find_and_chart(query)
+
+    def _council_find_and_chart(self, query: str = "") -> bool:
+        """
+        Find data files relevant to `query`, switch to the Grapher, load the
+        top match, populate the AI-plot prompt with the original query, and
+        ask the Analyst to chart it. Returns True if a file was found.
+        """
+        if not query:
+            query = self.input.get("1.0", "end").strip()
+        if not query:
+            return False
+
+        files = self._find_data_files_for_query(query, top_n=3)
+        if not files:
+            self._append_transcript(
+                "Council",
+                "I couldn't find any data files in the vault that match that "
+                "question. Try the Vault tab to add a CSV, or use Grapher → "
+                "Sample to explore with the bundled demo data first.",
+                "final",
+            )
+            return False
+
+        # Echo what we found into the transcript so the user can see the trail
+        bullet_list = "\n  • ".join(p.name for p in files)
+        self._append_transcript(
+            "Council",
+            f"Found {len(files)} relevant data file"
+            f"{'s' if len(files) != 1 else ''}:\n  • {bullet_list}\n\n"
+            f"Loading the top match into the Grapher…",
+            "observation",
+        )
+
+        # Switch to Grapher and queue the work after the tab is realised
+        if hasattr(self, "tab_grapher"):
+            self.nb.select(self.tab_grapher)
+        self.after(150, lambda fs=files, q=query: self._grapher_load_and_ask(fs, q))
+        return True
+
+    def _grapher_load_and_ask(self, files, query: str):
+        """
+        Helper: register `files` in the Grapher's combobox, load the first,
+        and prompt the Analyst with `query`.
+        """
+        if not _GRAPHER_OK:
+            self._append_transcript(
+                "Council",
+                "The Grapher module isn't available — install matplotlib + plotly "
+                "to enable chart generation.", "final")
+            return
+
+        # Register all candidate files in the file dropdown so the user can
+        # switch between them with one click if the top pick wasn't right.
+        existing = list(getattr(self, "_grapher_file_cb", None) and
+                        self._grapher_file_cb["values"] or [])
+        for f in files:
+            label = str(f)
+            if label not in existing:
+                existing.append(label)
+                self._grapher_file_paths.append(f)
+        if hasattr(self, "_grapher_file_cb"):
+            self._grapher_file_cb["values"] = existing
+
+        top = files[0]
+        self._grapher_file_var.set(str(top))
+        self._grapher_do_load(top)
+
+        # Populate the AI-plot input with the user's question and run the
+        # Analyst. We give the dataset a moment to finish loading first.
+        def _ask_analyst():
+            try:
+                self._gai_prompt.delete("1.0", "end")
+                self._gai_prompt.insert("1.0", query)
+                # Force the analyst path (not the heavier "council" mode)
+                if hasattr(self, "_gai_mode_var"):
+                    try: self._gai_mode_var.set("analyst")
+                    except Exception: pass
+                self._grapher_ai_plot()
+            except Exception as e:
+                self._append_transcript("Council",
+                    f"Analyst couldn't process the query: {e}", "final")
+
+        self.after(400, _ask_analyst)
+
+    # ============================
     # Main send logic
     # ============================
 
@@ -5613,6 +5832,17 @@ class CouncilConsole(tk.Tk):
         self._set_text(self.input, "")
         self._append_transcript("User", user_text)
         self._clear_stream_box()
+
+        # ── Fast path: chart-shaped questions go straight to the Grapher ──
+        # Detection is heuristic (chart/graph/plot/show me/by month/etc.).
+        # If the user wants the regular deliberation instead they can phrase
+        # the question without those keywords or use the explicit toggle.
+        if self._looks_like_data_question(user_text):
+            handled = self._council_find_and_chart(user_text)
+            if handled:
+                self._set_status("● grapher", "#a6e3a1")
+                return
+            # else fall through to regular deliberation
 
         # ── Phase 1: Route (keyword-based, instant) ───────────────────────
         route = self.judge.route(user_text)
