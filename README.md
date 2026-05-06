@@ -96,6 +96,26 @@ If the answer needs a chart, the panel will route you to the Grapher and the **A
 
 ---
 
+## Personal Specialists — your own AI experts
+
+Out of the box, Data's Inferno ships with three pre-built **Personal Specialists**:
+
+- **💰 Sales Specialist** — revenue trends, customer behaviour, retention, AOV
+- **📦 Inventory Specialist** — stock levels, turnover, dead inventory, supplier risk
+- **🤝 Customer Specialist** — loyalty, dormancy, churn risk, segmentation
+
+A specialist isn't a separate AI — it's a **named lens** on top of your data. The vault is shared by every specialist. When you ask a question that mentions one of their domain keywords (e.g. *"churn"* triggers the Customer Specialist), they're automatically summoned and their lens is applied to the answer.
+
+Cross-domain questions are answered by **multiple specialists at the same time**:
+
+> *"Based on previous years' sales what should be purchased to ensure enough stock for predicted demand?"*
+
+This question contains "sales" and "stock" → both the Sales and Inventory Specialists are summoned. They each draft an answer from their lens, looking at the same shared vault data. The Judge then synthesises one combined recommendation that reconciles both views.
+
+You can also create your own specialists — name, icon, description, domain keywords, and a system-prompt overlay that tells the underlying AI how to think about questions in that domain. The **🎓 Specialists** tab walks you through it.
+
+---
+
 ## How the panel works
 
 When you ask a question, here's what happens:

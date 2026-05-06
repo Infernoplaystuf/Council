@@ -120,6 +120,58 @@ First time on the Grapher? Click **📦 Load Sample** to drop in a synthetic but
 
 ---
 
+## The Personal Specialists tab
+
+Specialists are **named lenses** that the AI panel can wear when answering your questions. They are pure config — no separate data folders, no fine-tuned models. The vault is the shared knowledge pool; specialists just tell the AI *how to look at it*.
+
+### What ships out of the box
+
+- **💰 Sales Specialist** — revenue, customer behaviour, retention, AOV
+- **📦 Inventory Specialist** — stock levels, turnover, dead stock, supplier risk
+- **🤝 Customer Specialist** — loyalty, dormancy, churn, segmentation
+
+You can edit, disable, or delete any of them. Or click **➕ New** to create your own.
+
+### The four pieces of a specialist
+
+When you select a specialist on the left of the tab, you'll see four editable fields on the right:
+
+1. **Description** — one-line summary of what they're good at. Shown in lists.
+2. **Domain keywords** — words that, when they appear in your question, automatically summon this specialist. Comma-separated.
+3. **Lens / system-prompt overlay** — extra context injected before the AI answers. Tell it *how* to think about questions in this domain. Be specific about output style ("cite SKUs", "translate to actions", "use plain language").
+4. **Base personality** — which existing AI role (writer / sage / strategist / coder / etc.) wears this lens.
+
+The **🧪 Test** button at the bottom lets you try a question against the specialist before saving — useful for tuning the prompt.
+
+### Auto vs manual summoning
+
+| | When it fires |
+|---|---|
+| **Auto** (default) | Council scans your question for any specialist's domain keywords. Up to 3 most-relevant specialists get summoned in parallel. |
+| **Manual** | Council action bar has an **Ask: [specialist ▾]** dropdown. Pick a specific specialist to force on every question until you switch back to "Auto". |
+
+When the panel is consulting a specialist, you'll see a line in the transcript:
+
+> *Council  Consulting: 💰 Sales Specialist, 📦 Inventory Specialist*
+
+### Multi-specialist deliberation
+
+When two or more specialists match a question, **all of them** are summoned. The model sees a "MULTI-SPECIALIST DELIBERATION" header that tells it to apply each lens, reconcile when they conflict, and be explicit about which lens each part of the answer comes from.
+
+This is the core power of Personal Specialists for cross-domain questions. *"Should I order more inventory based on last year's sales trend?"* gets a Sales lens AND an Inventory lens — and the answer ties both perspectives together.
+
+### What about training a custom model?
+
+Personal Specialists are **RAG-backed lenses**, not fine-tuned models. They cite your data; they don't replace the underlying AI's reasoning. This is intentional:
+
+- True fine-tuning needs a GPU, hours of compute, and labelled training data — not realistic for a desktop product.
+- Lens overlays + shared RAG cover ~90% of the practical benefit at zero training time.
+- You can iterate on a specialist's prompt in seconds and see the result immediately via the **🧪 Test** button.
+
+If you genuinely need a fine-tuned model later, Data's Inferno's `personality_backends.json` lets you point any specialist's base personality at an external model endpoint (OpenAI, your own Ollama-hosted fine-tune, etc.). The lens overlay still applies.
+
+---
+
 ## The Vault tab — your data warehouse for the panel
 
 The vault is where all your indexed files live. Two purposes:

@@ -29,6 +29,7 @@ import council_engine as ce
 import apothecary_engine as ae
 import branding
 import onboarding
+import specialists as _spec
 
 # ── Agent modules (graceful optional imports) ─────────────────
 try:
@@ -1954,6 +1955,9 @@ class CouncilConsole(tk.Tk):
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.prior_session_id: Optional[str] = None
         self.convo_store = ce.ConversationStore(VAULT_DIR / "conversations")
+        # Personal Specialists — config-only registry, persists to vault/specialists.json
+        # Seeds 3 defaults (Sales / Inventory / Customer) on first run.
+        self.specialists = _spec.SpecialistRegistry(VAULT_DIR)
         self.librarian = ce.Librarian(VAULT_DIR, LOG_PATH)
         self.runner = ce.LocalRunner(WORKSPACE_DIR)
         self.speech = ce.SpeechToText(model_size="base")
@@ -2193,14 +2197,16 @@ class CouncilConsole(tk.Tk):
         self.nb.pack(fill="both", expand=True, padx=6, pady=6)
 
         # ── Customer-facing flow (in order of how a session naturally goes) ──
-        # 1) Ask a question   → Council (entrypoint — most users start here)
-        # 2) See the data     → Grapher (Council pulls relevant files in)
-        # 3) Second opinion   → Lens
-        # 4) Re-visit         → Sessions
-        # 5) Manage data      → Vault
-        # 6) Speech I/O       → Speech
+        # 1) Ask a question     → Council (entrypoint — most users start here)
+        # 2) See the data       → Grapher (Council pulls relevant files in)
+        # 3) Tune the experts   → Personal Specialists
+        # 4) Second opinion     → Lens
+        # 5) Re-visit           → Sessions
+        # 6) Manage data        → Vault
+        # 7) Speech I/O         → Speech
         self._build_council_tab()
         self._build_grapher_tab()
+        self._build_specialists_tab()
         self._build_lens_tab()
         self._build_sessions_tab()
         self._build_vault_manager_tab()
@@ -2313,6 +2319,21 @@ class CouncilConsole(tk.Tk):
                    command=self._council_find_and_chart_button
                    ).pack(side="left", padx=6)
         ttk.Button(btns, text="Clear", command=lambda: self._set_text(self.input, "")).pack(side="left", padx=6)
+
+        # Manual specialist override — set to a specialist's id to force it
+        # onto every query until the user picks "Auto" again.
+        self._forced_specialist_id = None
+        ttk.Label(btns, text="  Ask:", foreground="#7f849c").pack(side="left", padx=(10, 2))
+        self._spec_pin_var = tk.StringVar(value="Auto")
+        self._spec_pin_cb  = ttk.Combobox(
+            btns, textvariable=self._spec_pin_var,
+            state="readonly", width=22,
+        )
+        self._spec_pin_cb.pack(side="left")
+        self._spec_pin_cb.bind("<<ComboboxSelected>>",
+                               lambda _e: self._spec_pin_changed())
+        # Populate now and refresh whenever the registry changes
+        self._spec_pin_refresh()
 
         self.var_deliberate      = tk.BooleanVar(value=True)
         self.var_tools           = tk.BooleanVar(value=False)
@@ -2738,6 +2759,394 @@ class CouncilConsole(tk.Tk):
         self.agent_log.insert("end", f"[{phase}] {msg}\n", tag)
         self.agent_log.see("end")
         self.agent_log.configure(state="disabled")
+
+    # ============================================================
+    # Personal Specialists tab
+    # ============================================================
+    # A list view of the user's specialists with create / edit / delete
+    # / test actions. Specialists are pure config — there is no per-
+    # specialist data folder. The shared knowledge pool is the vault.
+
+    def _build_specialists_tab(self):
+        self.tab_specialists = ttk.Frame(self.nb)
+        self.nb.add(self.tab_specialists, text="\U0001f393 Specialists")
+
+        # ── Header ──────────────────────────────────────────────
+        hdr = ttk.Frame(self.tab_specialists)
+        hdr.pack(fill="x", padx=10, pady=(8, 4))
+        ttk.Label(hdr, text="Personal Specialists",
+                  font=("Segoe UI", 14, "bold")).pack(side="left")
+        ttk.Label(hdr,
+                  text="  Named lenses on your shared data. Auto-summoned when "
+                       "your question matches their domain.",
+                  foreground="#7f849c", font=("Segoe UI", 9)
+                  ).pack(side="left", padx=8)
+
+        # ── Two-pane layout: list (left) | detail (right) ───────
+        body = ttk.PanedWindow(self.tab_specialists, orient="horizontal")
+        body.pack(fill="both", expand=True, padx=10, pady=(4, 8))
+
+        # LEFT: scrollable list of specialists
+        left = ttk.Frame(body, width=260)
+        body.add(left, weight=1)
+
+        list_lbl = ttk.Frame(left)
+        list_lbl.pack(fill="x", pady=(2, 2))
+        ttk.Label(list_lbl, text="Active specialists",
+                  font=("Segoe UI", 10, "bold")).pack(side="left")
+        ttk.Button(list_lbl, text="➕ New",
+                   command=self._spec_new_dialog).pack(side="right")
+
+        list_frame = ttk.Frame(left)
+        list_frame.pack(fill="both", expand=True)
+        sb = ttk.Scrollbar(list_frame, orient="vertical")
+        self._spec_listbox = tk.Listbox(
+            list_frame, yscrollcommand=sb.set,
+            bg="#181825", fg="#cdd6f4",
+            selectbackground="#585b70", relief="flat",
+            font=("Segoe UI", 11), activestyle="none",
+        )
+        sb.configure(command=self._spec_listbox.yview)
+        self._spec_listbox.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self._spec_listbox.bind("<<ListboxSelect>>",
+                                 lambda _e: self._spec_show_selected())
+
+        # RIGHT: detail pane (editable form)
+        right = ttk.Frame(body)
+        body.add(right, weight=2)
+
+        self._spec_detail_frame = ttk.Frame(right)
+        self._spec_detail_frame.pack(fill="both", expand=True, padx=8, pady=4)
+
+        # ── Footer: shared knowledge pool stats ─────────────────
+        foot = ttk.LabelFrame(self.tab_specialists,
+                              text="Shared knowledge pool")
+        foot.pack(fill="x", padx=10, pady=(0, 8))
+        self._spec_pool_stats = tk.StringVar(value="Counting…")
+        ttk.Label(foot, textvariable=self._spec_pool_stats,
+                  foreground="#a6adc8", font=("Segoe UI", 10),
+                  ).pack(anchor="w", padx=10, pady=4)
+        btnrow = ttk.Frame(foot)
+        btnrow.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Button(btnrow, text="\U0001f4c2 Manage files (Vault tab)",
+                   command=lambda: self.nb.select(self.tab_vmgr)
+                                    if hasattr(self, "tab_vmgr") else None
+                   ).pack(side="left")
+
+        # Initial population
+        self._spec_refresh_list()
+        self._spec_refresh_pool_stats()
+
+    # ---- Specialist list helpers ----
+
+    def _spec_refresh_list(self):
+        """Repopulate the listbox from the registry. Preserves selection by id."""
+        if not hasattr(self, "_spec_listbox"):
+            return
+        prev_id = None
+        sel = self._spec_listbox.curselection()
+        if sel:
+            idx = sel[0]
+            items = self.specialists.all()
+            if 0 <= idx < len(items):
+                prev_id = items[idx].id
+
+        self._spec_listbox.delete(0, "end")
+        items = self.specialists.all()
+        for s in items:
+            tag = "  ✓" if s.enabled else "  (off)"
+            self._spec_listbox.insert("end", f"{s.icon}  {s.name}{tag}")
+
+        # Restore selection
+        if prev_id:
+            for i, s in enumerate(items):
+                if s.id == prev_id:
+                    self._spec_listbox.selection_set(i)
+                    self._spec_listbox.activate(i)
+                    break
+        elif items:
+            self._spec_listbox.selection_set(0)
+            self._spec_listbox.activate(0)
+        self._spec_show_selected()
+
+    def _spec_refresh_pool_stats(self):
+        """Show how many files are in the vault knowledge pool."""
+        try:
+            files = self._vault_data_files()
+            n = len(files)
+            self._spec_pool_stats.set(
+                f"{n} file{'s' if n != 1 else ''} in vault and bundled samples. "
+                f"All specialists see the same data."
+            )
+        except Exception:
+            self._spec_pool_stats.set(
+                "Knowledge pool stats unavailable.")
+
+    def _spec_selected(self):
+        sel = self._spec_listbox.curselection()
+        if not sel:
+            return None
+        items = self.specialists.all()
+        idx = sel[0]
+        return items[idx] if 0 <= idx < len(items) else None
+
+    # ---- Detail pane ----
+
+    def _spec_clear_detail(self):
+        for w in self._spec_detail_frame.winfo_children():
+            w.destroy()
+
+    def _spec_show_selected(self):
+        spec = self._spec_selected()
+        self._spec_clear_detail()
+        if spec is None:
+            ttk.Label(self._spec_detail_frame,
+                      text="Select a specialist on the left, "
+                           "or click ➕ New to create one.",
+                      foreground="#7f849c"
+                      ).pack(anchor="nw", padx=8, pady=20)
+            return
+        self._spec_render_detail(spec, editable=True)
+
+    def _spec_render_detail(self, spec, *, editable: bool):
+        f = self._spec_detail_frame
+        # Header
+        head = ttk.Frame(f)
+        head.pack(fill="x")
+        ttk.Label(head, text=f"{spec.icon}  {spec.name}",
+                  font=("Segoe UI", 14, "bold")
+                  ).pack(side="left")
+        # Enabled toggle
+        en_var = tk.BooleanVar(value=spec.enabled)
+        def _toggle_enabled():
+            spec.enabled = bool(en_var.get())
+            self.specialists.add(spec)
+            self._spec_refresh_list()
+            self._spec_pin_refresh()
+        ttk.Checkbutton(head, text="Enabled", variable=en_var,
+                        command=_toggle_enabled).pack(side="right")
+
+        ttk.Separator(f, orient="horizontal").pack(fill="x", pady=8)
+
+        # Description
+        ttk.Label(f, text="Description", font=("Segoe UI", 10, "bold")
+                  ).pack(anchor="w")
+        desc_var = tk.StringVar(value=spec.description)
+        ttk.Entry(f, textvariable=desc_var, width=70
+                  ).pack(fill="x", pady=(2, 8))
+
+        # Domain keywords
+        ttk.Label(f, text="Domain keywords  (comma-separated)",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(f,
+                  text="Used to auto-summon this specialist when a question "
+                       "mentions one of these terms.",
+                  foreground="#7f849c", font=("Segoe UI", 9), wraplength=600,
+                  justify="left").pack(anchor="w")
+        kw_var = tk.StringVar(value=", ".join(spec.domain_keywords))
+        ttk.Entry(f, textvariable=kw_var
+                  ).pack(fill="x", pady=(2, 8))
+
+        # System prompt overlay
+        ttk.Label(f, text="Lens / system prompt overlay",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(f,
+                  text="Injected as extra context before the personality "
+                       "answers. Tell it how to think, not what to know.",
+                  foreground="#7f849c", font=("Segoe UI", 9), wraplength=600,
+                  justify="left").pack(anchor="w")
+        prompt_box = self._make_text(f, height=8)
+        prompt_box.pack(fill="both", expand=True, pady=(2, 8))
+        prompt_box.insert("1.0", spec.system_prompt_overlay)
+
+        # Base personality
+        bp_row = ttk.Frame(f)
+        bp_row.pack(fill="x", pady=(0, 8))
+        ttk.Label(bp_row, text="Base personality:",
+                  font=("Segoe UI", 10, "bold")).pack(side="left")
+        bp_var = tk.StringVar(value=spec.base_personality)
+        ttk.Combobox(bp_row, textvariable=bp_var,
+                     values=["writer", "sage", "strategist",
+                             "intern", "coder", "content"],
+                     state="readonly", width=14
+                     ).pack(side="left", padx=8)
+        ttk.Label(bp_row,
+                  text="  (which personality wears this lens)",
+                  foreground="#7f849c", font=("Segoe UI", 9)
+                  ).pack(side="left")
+
+        # Action buttons
+        btns = ttk.Frame(f)
+        btns.pack(fill="x", pady=(8, 0), side="bottom")
+
+        def _save():
+            spec.description = desc_var.get().strip()
+            spec.domain_keywords = [
+                k.strip() for k in kw_var.get().split(",") if k.strip()
+            ]
+            spec.system_prompt_overlay = prompt_box.get("1.0", "end").strip()
+            spec.base_personality = bp_var.get().strip() or "writer"
+            spec.enabled = bool(en_var.get())
+            self.specialists.add(spec)
+            self._spec_refresh_list()
+            self._spec_pin_refresh()
+            self._set_status("● specialist saved", "#a6e3a1")
+            self.after(1500, lambda: self._set_status("● idle"))
+
+        def _delete():
+            from tkinter import messagebox
+            if not messagebox.askyesno(
+                "Delete specialist?",
+                f"Delete '{spec.name}'?\n\n"
+                f"This removes the lens but does not touch any of your data "
+                f"in the vault.",
+                parent=self):
+                return
+            self.specialists.remove(spec.id)
+            self._spec_refresh_list()
+            self._spec_pin_refresh()
+
+        def _test():
+            self._spec_test_dialog(spec)
+
+        ttk.Button(btns, text="\U0001f4be Save", command=_save
+                   ).pack(side="left")
+        ttk.Button(btns, text="\U0001f9ea Test", command=_test
+                   ).pack(side="left", padx=6)
+        ttk.Button(btns, text="\U0001f5d1 Delete", command=_delete
+                   ).pack(side="right")
+
+    # ---- Create / test dialogs ----
+
+    def _spec_new_dialog(self):
+        """Quick create dialog — name + description + base; rest editable after."""
+        win = tk.Toplevel(self)
+        win.title("New specialist")
+        win.geometry("440x280")
+        win.transient(self); win.grab_set()
+        try: branding.apply_window_icon(win)
+        except Exception: pass
+
+        ttk.Label(win, text="Create a new Personal Specialist",
+                  font=("Segoe UI", 12, "bold")
+                  ).pack(anchor="w", padx=16, pady=(14, 8))
+
+        form = ttk.Frame(win); form.pack(fill="x", padx=16)
+        ttk.Label(form, text="Name").grid(row=0, column=0, sticky="w", pady=4)
+        name_var = tk.StringVar(value="")
+        ttk.Entry(form, textvariable=name_var, width=32
+                  ).grid(row=0, column=1, sticky="we", pady=4)
+        ttk.Label(form, text="Icon (emoji)").grid(row=1, column=0, sticky="w", pady=4)
+        icon_var = tk.StringVar(value="🎓")
+        ttk.Entry(form, textvariable=icon_var, width=4
+                  ).grid(row=1, column=1, sticky="w", pady=4)
+        ttk.Label(form, text="Description").grid(row=2, column=0, sticky="w", pady=4)
+        desc_var = tk.StringVar()
+        ttk.Entry(form, textvariable=desc_var, width=32
+                  ).grid(row=2, column=1, sticky="we", pady=4)
+        form.columnconfigure(1, weight=1)
+
+        msg_var = tk.StringVar(value="")
+        ttk.Label(win, textvariable=msg_var, foreground="#f38ba8"
+                  ).pack(anchor="w", padx=16, pady=4)
+
+        def _create():
+            name = name_var.get().strip()
+            if not name:
+                msg_var.set("Name is required.")
+                return
+            sid = _spec.slugify(name)
+            if self.specialists.get(sid):
+                msg_var.set(f"A specialist with id '{sid}' already exists.")
+                return
+            new_spec = _spec.Specialist(
+                id=sid,
+                name=name,
+                icon=icon_var.get().strip() or "🎓",
+                description=desc_var.get().strip(),
+                domain_keywords=[],
+                system_prompt_overlay=(
+                    f"You are a {name.lower()}. Apply your domain expertise "
+                    f"to whatever question is asked. Be specific and actionable."),
+                base_personality="writer",
+                enabled=True,
+            )
+            self.specialists.add(new_spec)
+            self._spec_refresh_list()
+            # Select the new one
+            items = self.specialists.all()
+            for i, s in enumerate(items):
+                if s.id == sid:
+                    self._spec_listbox.selection_clear(0, "end")
+                    self._spec_listbox.selection_set(i)
+                    self._spec_show_selected()
+                    break
+            win.destroy()
+
+        bf = ttk.Frame(win); bf.pack(fill="x", padx=16, pady=(8, 14), side="bottom")
+        ttk.Button(bf, text="Create", command=_create).pack(side="right")
+        ttk.Button(bf, text="Cancel", command=win.destroy
+                   ).pack(side="right", padx=6)
+
+    def _spec_test_dialog(self, spec):
+        """Pop a small dialog to try the specialist on a sample question."""
+        win = tk.Toplevel(self)
+        win.title(f"Test {spec.name}")
+        win.geometry("620x420")
+        win.transient(self)
+        try: branding.apply_window_icon(win)
+        except Exception: pass
+
+        ttk.Label(win, text=f"Try {spec.icon} {spec.name} on a question",
+                  font=("Segoe UI", 11, "bold")
+                  ).pack(anchor="w", padx=14, pady=(12, 4))
+
+        ttk.Label(win, text="Question:").pack(anchor="w", padx=14, pady=(4, 0))
+        q_box = self._make_text(win, height=3)
+        q_box.pack(fill="x", padx=14, pady=4)
+        q_box.insert("1.0", "What's a good first question to ask you?")
+
+        ttk.Label(win, text="Response:").pack(anchor="w", padx=14, pady=(8, 0))
+        a_box = self._make_text(win, height=10)
+        a_box.pack(fill="both", expand=True, padx=14, pady=4)
+        a_box.configure(state="disabled")
+
+        def _run():
+            q = q_box.get("1.0", "end").strip()
+            if not q:
+                return
+            run_btn.configure(state="disabled", text="Thinking…")
+            a_box.configure(state="normal")
+            a_box.delete("1.0", "end")
+            a_box.insert("1.0", "(running…)")
+            a_box.configure(state="disabled")
+
+            def worker():
+                try:
+                    base = self.personalities.get(spec.base_personality) or self.writer
+                    if base is None:
+                        text = "(No base personality available — check your config)"
+                    else:
+                        text = base.respond(q, extra_context=spec.context_block())
+                except Exception as e:
+                    text = f"Error: {e}"
+                self.after(0, lambda t=text: _show(t))
+
+            def _show(text):
+                a_box.configure(state="normal")
+                a_box.delete("1.0", "end")
+                a_box.insert("1.0", text)
+                a_box.configure(state="disabled")
+                run_btn.configure(state="normal", text="▶ Run")
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        bf = ttk.Frame(win); bf.pack(fill="x", padx=14, pady=(0, 12), side="bottom")
+        run_btn = ttk.Button(bf, text="▶ Run", command=_run)
+        run_btn.pack(side="right")
+        ttk.Button(bf, text="Close", command=win.destroy
+                   ).pack(side="right", padx=6)
 
     # ---- Grapher tab ----
 
@@ -5718,9 +6127,26 @@ class CouncilConsole(tk.Tk):
         terms = self._query_keywords(query)
         if not terms:
             return []
+
+        # Boost: any file scored against the same query also benefits from
+        # the active specialists' domain keywords. So if the user has a
+        # Sales Specialist active, files that mention "revenue" get a
+        # small extra weight even when the user typed only "monthly".
+        spec_terms = []
+        try:
+            specs = self._resolve_active_specialists(query)
+            for s in specs:
+                spec_terms.extend(s.domain_keywords[:8])  # cap per specialist
+        except Exception:
+            specs = []
+
         scored = []
         for p in self._vault_data_files():
             s = self._score_file_for_query(p, terms)
+            if spec_terms:
+                # Add half-weight contributions from specialist keywords
+                bonus = self._score_file_for_query(p, spec_terms) * 0.5
+                s += bonus
             if s > 0:
                 scored.append((s, p))
         scored.sort(key=lambda r: r[0], reverse=True)
@@ -5772,6 +6198,77 @@ class CouncilConsole(tk.Tk):
             self.nb.select(self.tab_grapher)
         self.after(150, lambda fs=files, q=query: self._grapher_load_and_ask(fs, q))
         return True
+
+    # ============================
+    # Personal Specialists — runtime resolution
+    # ============================
+
+    def _spec_pin_refresh(self):
+        """Repopulate the Ask: combobox values from the current registry."""
+        if not hasattr(self, "_spec_pin_cb"):
+            return
+        items = self.specialists.all(enabled_only=True)
+        values = ["Auto"] + [f"{s.icon} {s.name}" for s in items]
+        self._spec_pin_cb["values"] = values
+        # Keep current selection if still valid; otherwise reset to Auto
+        if self._spec_pin_var.get() not in values:
+            self._spec_pin_var.set("Auto")
+            self._forced_specialist_id = None
+
+    def _spec_pin_changed(self):
+        """Handler for the Ask: dropdown."""
+        choice = self._spec_pin_var.get()
+        if choice == "Auto" or not choice:
+            self._forced_specialist_id = None
+            return
+        # Find the matching specialist by display label
+        for s in self.specialists.all():
+            if f"{s.icon} {s.name}" == choice:
+                self._forced_specialist_id = s.id
+                return
+        # Fallback — unknown choice, revert to auto
+        self._forced_specialist_id = None
+        self._spec_pin_var.set("Auto")
+
+    def _resolve_active_specialists(self, query: str):
+        """
+        Decide which specialists are active for `query`. Returns a list of
+        Specialist objects (may be empty). Logic:
+          • If the user pinned a specialist via the manual dropdown, that
+            takes precedence.
+          • Otherwise, match keywords against the registry and return up to
+            3 most relevant.
+        """
+        # Manual override
+        forced_id = getattr(self, "_forced_specialist_id", None)
+        if forced_id:
+            spec = self.specialists.get(forced_id)
+            return [spec] if spec else []
+
+        # Auto-match — list of (specialist, score) tuples, already ranked
+        matches = self.specialists.match(query, max_specialists=3)
+        return [s for (s, _score) in matches]
+
+    def _build_specialist_overlay(self, specs) -> str:
+        """
+        Compose context blocks from one or more specialists into a single
+        injection string. Multi-specialist queries get a "you are
+        deliberating with N specialists" header so the model knows it
+        should reconcile perspectives rather than only adopting one.
+        """
+        if not specs:
+            return ""
+        if len(specs) == 1:
+            return specs[0].context_block()
+        header = (
+            f"MULTI-SPECIALIST DELIBERATION  ({len(specs)} lenses active)\n"
+            f"Apply each lens to the question; reconcile when they conflict.\n"
+            f"Be explicit about which lens each part of the answer comes from.\n"
+        )
+        body = "\n\n──────────────────────────\n\n".join(
+            s.context_block() for s in specs
+        )
+        return header + "\n" + body
 
     def _grapher_load_and_ask(self, files, query: str):
         """
@@ -5843,6 +6340,20 @@ class CouncilConsole(tk.Tk):
                 self._set_status("● grapher", "#a6e3a1")
                 return
             # else fall through to regular deliberation
+
+        # ── Personal Specialists: detect which (if any) to summon ──────
+        # Auto-match by domain keywords. Manual override (UI dropdown) wins
+        # if set. Active specialists are stored on self for the worker to
+        # pick up; their overlays get injected into the lead role's
+        # extra_context via the existing _patch_model machinery.
+        self._active_specialists = self._resolve_active_specialists(user_text)
+        if self._active_specialists:
+            names = ", ".join(f"{s.icon} {s.name}" for s in self._active_specialists)
+            self._append_transcript(
+                "Council",
+                f"Consulting: {names}",
+                "observation",
+            )
 
         # ── Phase 1: Route (keyword-based, instant) ───────────────────────
         route = self.judge.route(user_text)
@@ -6114,6 +6625,24 @@ class CouncilConsole(tk.Tk):
                             _patch_model(_pm, _ci_block, "ci_only")
                     if self.skeptic is not None:
                         _patch_model(self.skeptic, _ci_block, "ci_only")
+
+                # Personal Specialists — patch the lens overlay onto each
+                # specialist's base personality. If two specialists share a
+                # base (e.g. both default to "writer"), they both end up in
+                # the overlay and the model is told to reconcile them.
+                _active_specs = list(getattr(self, "_active_specialists", []) or [])
+                if _active_specs:
+                    # Group by base personality so each model gets a single
+                    # combined overlay rather than being patched repeatedly.
+                    by_base = {}
+                    for sp in _active_specs:
+                        by_base.setdefault(sp.base_personality or "writer", []).append(sp)
+                    for base_role, sp_list in by_base.items():
+                        target_model = self.personalities.get(base_role) or self.writer
+                        overlay = self._build_specialist_overlay(sp_list)
+                        if target_model is not None and overlay:
+                            _patch_model(target_model, overlay,
+                                          f"specialist_{base_role}")
 
                 if lib_brief["found"]:
                     # ── Run Librarian personality over raw RAG results ──────────
@@ -6484,6 +7013,13 @@ class CouncilConsole(tk.Tk):
                 # finally block, so by definition the app didn't crash mid-flight.
                 try:
                     self.convo_store.mark_session_done(self.session_id)
+                except Exception:
+                    pass
+                # Clear per-query specialist state so it doesn't leak into
+                # the next deliberation. Manual pin (_forced_specialist_id)
+                # is intentionally NOT cleared — the user explicitly chose it.
+                try:
+                    self._active_specialists = []
                 except Exception:
                     pass
 
