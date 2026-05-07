@@ -2102,7 +2102,9 @@ class CouncilConsole(tk.Tk):
         check run.
         """
         try:
-            status = licensing.get_status(VAULT_DIR)
+            import device_fingerprint
+            fp = device_fingerprint.compute(VAULT_DIR)
+            status = licensing.get_status(VAULT_DIR, fingerprint=fp)
         except Exception as e:
             print(f"[License] Status check failed: {e}")
             self.after(400, self._check_crash_recovery)
@@ -2116,7 +2118,8 @@ class CouncilConsole(tk.Tk):
 
         if status["status"] in (licensing.STATUS_TRIAL_EXPIRED,
                                 licensing.STATUS_LICENSE_EXPIRED,
-                                licensing.STATUS_INVALID_LICENSE):
+                                licensing.STATUS_INVALID_LICENSE,
+                                licensing.STATUS_NEEDS_ACTIVATION):
             # Modal blocker — user must activate or pick read-only
             activation_dialog.open_activation_dialog(
                 self, VAULT_DIR,

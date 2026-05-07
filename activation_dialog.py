@@ -23,6 +23,7 @@ from tkinter import messagebox, ttk
 from typing import Callable, Optional
 
 import branding
+import device_fingerprint
 import licensing
 
 
@@ -98,7 +99,9 @@ class ActivationDialog(tk.Toplevel):
 
     def _build_ui(self):
         t = self._t
-        self._status = licensing.get_status(self.vault_dir)
+        self._fingerprint = device_fingerprint.compute(self.vault_dir)
+        self._status = licensing.get_status(self.vault_dir,
+                                             fingerprint=self._fingerprint)
 
         # Header bar
         head = tk.Frame(self, bg=t["panel_bg"])
@@ -143,6 +146,10 @@ class ActivationDialog(tk.Toplevel):
         if self._status.get("expires_at") and self._status["plan"] != licensing.PLAN_LIFETIME:
             self._kv(body, "Expires",
                      self._status["expires_at"].split("T")[0])
+        if self._status.get("device_index") and self._status.get("max_devices"):
+            self._kv(body, "This device",
+                     f"{self._status['device_index']} of "
+                     f"{self._status['max_devices']}")
 
         # Separator
         ttk.Separator(body, orient="horizontal").pack(fill="x", pady=10)
@@ -218,12 +225,26 @@ class ActivationDialog(tk.Toplevel):
         if not blob:
             self._error_var.set("Paste the license blob first.")
             return
-        new_status = licensing.activate(self.vault_dir, blob)
+
+        # Disable UI during the network call so users don't double-click
+        self._error_var.set("Contacting activation server…")
+        self.update_idletasks()
+
+        server = licensing.make_activation_server()
+        new_status = licensing.activate(
+            self.vault_dir, blob,
+            fingerprint=self._fingerprint,
+            activation_server=server,
+        )
         if new_status["status"] == licensing.STATUS_LICENSED:
             messagebox.showinfo(
                 "Activation successful",
                 f"Welcome, {new_status.get('email','')}!\n\n"
-                f"{new_status['message']}",
+                f"{new_status['message']}\n\n"
+                "This computer is now activated. You can use the app "
+                "fully offline from here on — internet is only needed "
+                "if you want to install updates or activate another "
+                "computer.",
                 parent=self,
             )
             if self._cb_status:
@@ -235,15 +256,29 @@ class ActivationDialog(tk.Toplevel):
 
     def _deactivate(self):
         if not messagebox.askyesno(
-            "Deactivate license?",
-            "This removes the license from this computer. You'll need to "
-            "re-paste your key if you want to use new deliberations again.\n\n"
-            "Useful when moving to a new machine.\n\n"
+            "Deactivate this device?",
+            "This removes the license + activation from this computer "
+            "and frees the device slot on the server so you can activate "
+            "on another machine.\n\n"
+            "If the server is unreachable right now, the local copy will "
+            "still be removed but the server may keep this device "
+            "claimed until you re-activate from here or contact support.\n\n"
             "Continue?",
             parent=self):
             return
-        licensing.deactivate(self.vault_dir)
-        new_status = licensing.get_status(self.vault_dir)
+
+        server = licensing.make_activation_server()
+        result = licensing.deactivate(self.vault_dir,
+                                       fingerprint=self._fingerprint,
+                                       activation_server=server)
+        if result.get("server_message"):
+            messagebox.showwarning(
+                "Local deactivation complete",
+                "The license was removed from this computer.\n\n"
+                f"Server note: {result['server_message']}",
+                parent=self)
+        new_status = licensing.get_status(self.vault_dir,
+                                           fingerprint=self._fingerprint)
         if self._cb_status:
             try: self._cb_status(new_status)
             except Exception: pass

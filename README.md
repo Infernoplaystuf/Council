@@ -187,7 +187,25 @@ One-time purchase. No subscription, no usage limits, no per-question fees, no "t
 
 ## How licensing works
 
-When you buy a license, you receive a single line of text by email — the **license blob**. Paste it into **Help → Activate License** in the app. Activation is offline — Data's Inferno never contacts a license server, so your license cannot stop working because something at our end is down.
+When you buy a license, you receive a single line of text by email — the **license blob**. Paste it into **Help → Activate License** in the app.
+
+### One-time activation, then fully offline
+
+The first time you activate on a machine, Data's Inferno makes a single HTTPS call to the activation server. The server checks your license is valid, records that this is one of your devices, and returns a signed **activation token** that's saved locally.
+
+From then on, every launch validates the saved token offline — the app never needs the internet again to keep running. **Lose your wifi, work on a plane, sit in a basement — Data's Inferno keeps working.**
+
+### Two devices per license
+
+Your license activates on up to **two devices** at a time (typically a desktop + laptop). The server is the source of truth for the device count.
+
+If you want to move to a third machine:
+
+1. Open **Help → Activate License** on the device you want to retire
+2. Click **Deactivate this device** — that frees up a slot
+3. Activate on the new machine
+
+If a device is permanently lost or stolen, contact support with your email address and we'll free the slot for you.
 
 ### 7-day free trial
 
@@ -201,9 +219,7 @@ You don't lose anything either way — the vault is yours.
 
 ### Moving to another computer
 
-Open the activation dialog and click **Deactivate this machine**. The license blob still works — paste it on the new computer and it'll activate there.
-
-There's no per-machine limit enforced. We trust you to use it on machines you own.
+Open the activation dialog and click **Deactivate this device**. This frees the slot on the server. Then activate on the new machine.
 
 ## How updates work
 

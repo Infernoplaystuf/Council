@@ -41,6 +41,15 @@ UPDATE_MANIFEST_URL = os.environ.get(
     "",   # disabled by default until you have a hosting URL
 )
 
+# URL of the activation server (the small Flask service in
+# tools/license_server.py that you'll deploy somewhere). Empty falls
+# back to LocalActivationServer (mints tokens locally — useful for
+# development; no device-limit enforcement).
+ACTIVATION_SERVER_URL = os.environ.get(
+    "DI_ACTIVATION_SERVER_URL",
+    "",   # set to e.g. "https://activate.datas-inferno.app" at build time
+)
+
 
 # ---- Asset paths -------------------------------------------------------------
 
