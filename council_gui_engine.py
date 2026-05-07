@@ -34,6 +34,7 @@ import crash_reporter
 import licensing
 import activation_dialog
 import updater
+import splash
 
 # ── Agent modules (graceful optional imports) ─────────────────
 try:
@@ -1947,7 +1948,7 @@ class CouncilConsole(tk.Tk):
         self.title(branding.window_title())
         branding.apply_window_icon(self)
         self.geometry("1150x820")
-        self.configure(bg="#1e1e2e")
+        self.configure(bg="#1a1414")
 
         self.ui_q: queue.Queue = queue.Queue()
         # Pause/resume for personality clarification requests
@@ -2252,32 +2253,56 @@ class CouncilConsole(tk.Tk):
     # ============================
 
     def _apply_dark_theme(self):
+        """
+        Apply the active theme palette from branding.get_theme(). Pulls
+        every value from the central palette so a recolour is a one-file
+        edit.
+        """
+        t = branding.get_theme("dark")
+        bg       = t["bg"]
+        fg       = t["fg"]
+        abg      = t["panel_bg"]      # frame / widget bg
+        ibg      = t["input_bg"]      # text-entry bg
+        sel      = t["selection_bg"]
+        bord     = t["border"]
+        accent   = t["accent"]
+        # Expose to the rest of the GUI for inline tk.Frame / canvas
+        # widgets that aren't ttk-styled.
+        self._theme = t
+
         style = ttk.Style(self)
         style.theme_use("clam")
-        bg, fg, sel = "#1e1e2e", "#cdd6f4", "#313244"
-        abg = "#181825"  # frame/widget bg
-        style.configure(".", background=bg, foreground=fg, fieldbackground=abg,
-                         insertcolor=fg, troughcolor=abg, bordercolor=sel)
+        style.configure(".", background=bg, foreground=fg, fieldbackground=ibg,
+                         insertcolor=fg, troughcolor=abg, bordercolor=bord)
         style.configure("TNotebook", background=bg, borderwidth=0)
-        style.configure("TNotebook.Tab", background=sel, foreground=fg, padding=[10, 4])
-        style.map("TNotebook.Tab", background=[("selected", "#45475a")])
+        style.configure("TNotebook.Tab", background=abg, foreground=fg, padding=[10, 4])
+        style.map("TNotebook.Tab",
+                  background=[("selected", sel)],
+                  foreground=[("selected", fg)])
         style.configure("TFrame", background=bg)
         style.configure("TLabel", background=bg, foreground=fg)
-        style.configure("TButton", background="#313244", foreground=fg, relief="flat", padding=4)
-        style.map("TButton", background=[("active", "#45475a")])
+        style.configure("TLabelframe", background=bg, foreground=fg, bordercolor=bord)
+        style.configure("TLabelframe.Label", background=bg, foreground=fg)
+        style.configure("TButton", background=abg, foreground=fg, relief="flat",
+                        padding=4, bordercolor=bord)
+        style.map("TButton",
+                  background=[("active", sel), ("pressed", accent)])
         style.configure("TCheckbutton", background=bg, foreground=fg)
-        style.configure("TEntry", fieldbackground=abg, foreground=fg, insertcolor=fg)
-        style.configure("TScrollbar", background=sel, troughcolor=abg)
-        style.configure("Treeview", background=abg, foreground=fg, fieldbackground=abg,
-                         rowheight=24)
-        style.map("Treeview", background=[("selected", "#585b70")])
-        style.configure("Treeview.Heading", background=sel, foreground=fg)
+        style.configure("TRadiobutton",  background=bg, foreground=fg)
+        style.configure("TEntry",  fieldbackground=ibg, foreground=fg, insertcolor=fg)
+        style.configure("TCombobox", fieldbackground=ibg, foreground=fg)
+        style.configure("TScrollbar", background=abg, troughcolor=ibg, bordercolor=bord)
+        style.configure("Treeview", background=ibg, foreground=fg, fieldbackground=ibg,
+                         rowheight=24, bordercolor=bord)
+        style.map("Treeview", background=[("selected", sel)])
+        style.configure("Treeview.Heading", background=abg, foreground=fg,
+                        bordercolor=bord)
         self.configure(bg=bg)
 
     def _make_text(self, parent, **kwargs) -> tk.Text:
         defaults = dict(
-            bg="#181825", fg="#cdd6f4", insertbackground="#cdd6f4",
-            selectbackground="#585b70", relief="flat", bd=0,
+            bg="#231a1a", fg="#d4d4d4", insertbackground="#d4d4d4",
+            selectbackground="#5a3030", relief="flat", bd=0,
             font=("Consolas", 10),
         )
         defaults.update(kwargs)
@@ -2339,7 +2364,7 @@ class CouncilConsole(tk.Tk):
 
         # Main paned window: transcript | judge panel
         paned = tk.PanedWindow(self.tab_council, orient="horizontal",
-                               bg="#1e1e2e", sashwidth=6, sashrelief="flat")
+                               bg="#1a1414", sashwidth=6, sashrelief="flat")
         paned.pack(fill="both", expand=True, padx=6, pady=6)
 
         # Left: transcript
@@ -2368,7 +2393,7 @@ class CouncilConsole(tk.Tk):
         self._vfb_frame.pack_forget()  # hidden until verdict arrives
 
         _vfb_lbl = ttk.Label(self._vfb_frame, text="Do you agree with the verdict?",
-                             foreground="#cdd6f4")
+                             foreground="#d4d4d4")
         _vfb_lbl.pack(side="left", padx=(0, 6))
 
         self._vfb_agree_btn = ttk.Button(
@@ -2434,7 +2459,7 @@ class CouncilConsole(tk.Tk):
             license_btn = tk.Button(
                 btns, textvariable=self._license_badge_var,
                 relief="flat", borderwidth=0, padx=8, pady=2,
-                bg="#181825", fg="#a6e3a1", activebackground="#313244",
+                bg="#231a1a", fg="#a6e3a1", activebackground="#3a2828",
                 font=("Segoe UI", 9, "bold"), cursor="hand2",
                 command=lambda: activation_dialog.open_activation_dialog(
                     self, VAULT_DIR,
@@ -2447,7 +2472,7 @@ class CouncilConsole(tk.Tk):
         # Manual specialist override — set to a specialist's id to force it
         # onto every query until the user picks "Auto" again.
         self._forced_specialist_id = None
-        ttk.Label(btns, text="  Ask:", foreground="#7f849c").pack(side="left", padx=(10, 2))
+        ttk.Label(btns, text="  Ask:", foreground="#7a7575").pack(side="left", padx=(10, 2))
         self._spec_pin_var = tk.StringVar(value="Auto")
         self._spec_pin_cb  = ttk.Combobox(
             btns, textvariable=self._spec_pin_var,
@@ -2522,7 +2547,7 @@ class CouncilConsole(tk.Tk):
         _save_hdr = ttk.Frame(self._save_frame)
         _save_hdr.pack(fill="x", pady=(4, 2))
         ttk.Label(_save_hdr, text="💾 Save output as:",
-                  foreground="#89b4fa", font=("", 9, "bold")).pack(side="left", padx=4)
+                  foreground="#d32f2f", font=("", 9, "bold")).pack(side="left", padx=4)
         ttk.Button(_save_hdr, text="📄 Text file (.txt)",
                    command=self._save_output_txt).pack(side="left", padx=4)
         ttk.Button(_save_hdr, text="📝 Markdown (.md)",
@@ -2541,7 +2566,7 @@ class CouncilConsole(tk.Tk):
         ttk.Label(_clarif_hdr, text="🤔 A personality needs your input:",
                   foreground="#fab387", font=("", 9, "bold")).pack(side="left", padx=4)
         self._clarif_question_lbl = ttk.Label(
-            self._clarif_frame, text="", foreground="#cdd6f4",
+            self._clarif_frame, text="", foreground="#d4d4d4",
             wraplength=700, justify="left")
         self._clarif_question_lbl.pack(anchor="w", padx=8, pady=(2, 4))
 
@@ -2558,7 +2583,7 @@ class CouncilConsole(tk.Tk):
 
         self.status = ttk.Label(btns, text="● idle", foreground="#a6e3a1")
         self.status.pack(side="right")
-        self.tps_label = ttk.Label(btns, text="", foreground="#89b4fa")
+        self.tps_label = ttk.Label(btns, text="", foreground="#d32f2f")
         self.tps_label.pack(side="right", padx=(0, 8))
         self._agent_label = ttk.Label(btns, text="", foreground="#a6e3a1")
         self._agent_label.pack(side="right", padx=(0, 6))
@@ -2604,7 +2629,7 @@ class CouncilConsole(tk.Tk):
         ttk.Button(name_row, text="Apply", command=self._apply_script_name).pack(side="left")
         ttk.Button(name_row, text="Clear Code", command=lambda: self._set_text(self.ide_code, "")).pack(side="left", padx=6)
 
-        paned = tk.PanedWindow(self.tab_ide, orient="horizontal", bg="#1e1e2e", sashwidth=6)
+        paned = tk.PanedWindow(self.tab_ide, orient="horizontal", bg="#1a1414", sashwidth=6)
         paned.pack(fill="both", expand=True, padx=10, pady=4)
 
         left = ttk.Frame(paned)
@@ -2620,7 +2645,7 @@ class CouncilConsole(tk.Tk):
         ttk.Label(right, text="Output").pack(anchor="w")
         self.ide_out = self._make_text(right, wrap="word", state="disabled")
         self.ide_out.tag_configure("stderr", foreground="#f38ba8")
-        self.ide_out.tag_configure("info",   foreground="#89b4fa")
+        self.ide_out.tag_configure("info",   foreground="#d32f2f")
         self.ide_out.pack(fill="both", expand=True)
 
         btns = ttk.Frame(self.tab_ide)
@@ -2645,8 +2670,8 @@ class CouncilConsole(tk.Tk):
 
         ttk.Label(left, text=f"Vault: {VAULT_DIR}").pack(anchor="w")
 
-        self.vault_lb = tk.Listbox(left, bg="#181825", fg="#cdd6f4",
-                                   selectbackground="#585b70", relief="flat",
+        self.vault_lb = tk.Listbox(left, bg="#231a1a", fg="#d4d4d4",
+                                   selectbackground="#5a3030", relief="flat",
                                    font=("Consolas", 10))
         self.vault_lb.pack(fill="both", expand=True, pady=4)
         self.vault_lb.bind("<Double-Button-1>", lambda e: self._lib_preview())
@@ -2681,8 +2706,8 @@ class CouncilConsole(tk.Tk):
         self._session_filter_var.trace_add("write", lambda *_: self._sessions_refresh())
         ttk.Entry(_sf, textvariable=self._session_filter_var).pack(
             side="left", fill="x", expand=True, padx=(4, 0))
-        self.session_lb = tk.Listbox(left, bg="#181825", fg="#cdd6f4",
-                                     selectbackground="#585b70", relief="flat",
+        self.session_lb = tk.Listbox(left, bg="#231a1a", fg="#d4d4d4",
+                                     selectbackground="#5a3030", relief="flat",
                                      font=("Consolas", 10))
         self.session_lb.pack(fill="both", expand=True, pady=4)
         self.session_lb.bind("<Double-Button-1>", lambda e: self._sessions_load_prior())
@@ -2821,14 +2846,14 @@ class CouncilConsole(tk.Tk):
         )
         lbl = tk.Text(install_frame, height=4, wrap="none", font=("Consolas", 10))
         lbl.insert("1.0", install_text)
-        lbl.configure(state="disabled", bg="#181825", fg="#89b4fa",
+        lbl.configure(state="disabled", bg="#231a1a", fg="#d32f2f",
                       relief="flat", bd=0)
         lbl.pack(fill="x", padx=6, pady=4)
 
         # Live agent log
         ttk.Label(top, text="Agent Event Log").pack(anchor="w")
         self.agent_log = self._make_text(top, wrap="word", height=8, state="disabled")
-        self.agent_log.tag_configure("phase",   foreground="#89b4fa")
+        self.agent_log.tag_configure("phase",   foreground="#d32f2f")
         self.agent_log.tag_configure("result",  foreground="#a6e3a1")
         self.agent_log.tag_configure("fail",    foreground="#f38ba8")
         self.agent_log.pack(fill="x")
@@ -2903,7 +2928,7 @@ class CouncilConsole(tk.Tk):
         ttk.Label(hdr,
                   text="  Named lenses on your shared data. Auto-summoned when "
                        "your question matches their domain.",
-                  foreground="#7f849c", font=("Segoe UI", 9)
+                  foreground="#7a7575", font=("Segoe UI", 9)
                   ).pack(side="left", padx=8)
 
         # ── Two-pane layout: list (left) | detail (right) ───────
@@ -2926,8 +2951,8 @@ class CouncilConsole(tk.Tk):
         sb = ttk.Scrollbar(list_frame, orient="vertical")
         self._spec_listbox = tk.Listbox(
             list_frame, yscrollcommand=sb.set,
-            bg="#181825", fg="#cdd6f4",
-            selectbackground="#585b70", relief="flat",
+            bg="#231a1a", fg="#d4d4d4",
+            selectbackground="#5a3030", relief="flat",
             font=("Segoe UI", 11), activestyle="none",
         )
         sb.configure(command=self._spec_listbox.yview)
@@ -2949,7 +2974,7 @@ class CouncilConsole(tk.Tk):
         foot.pack(fill="x", padx=10, pady=(0, 8))
         self._spec_pool_stats = tk.StringVar(value="Counting…")
         ttk.Label(foot, textvariable=self._spec_pool_stats,
-                  foreground="#a6adc8", font=("Segoe UI", 10),
+                  foreground="#a98a8a", font=("Segoe UI", 10),
                   ).pack(anchor="w", padx=10, pady=4)
         btnrow = ttk.Frame(foot)
         btnrow.pack(fill="x", padx=10, pady=(0, 6))
@@ -3028,7 +3053,7 @@ class CouncilConsole(tk.Tk):
             ttk.Label(self._spec_detail_frame,
                       text="Select a specialist on the left, "
                            "or click ➕ New to create one.",
-                      foreground="#7f849c"
+                      foreground="#7a7575"
                       ).pack(anchor="nw", padx=8, pady=20)
             return
         self._spec_render_detail(spec, editable=True)
@@ -3066,7 +3091,7 @@ class CouncilConsole(tk.Tk):
         ttk.Label(f,
                   text="Used to auto-summon this specialist when a question "
                        "mentions one of these terms.",
-                  foreground="#7f849c", font=("Segoe UI", 9), wraplength=600,
+                  foreground="#7a7575", font=("Segoe UI", 9), wraplength=600,
                   justify="left").pack(anchor="w")
         kw_var = tk.StringVar(value=", ".join(spec.domain_keywords))
         ttk.Entry(f, textvariable=kw_var
@@ -3078,7 +3103,7 @@ class CouncilConsole(tk.Tk):
         ttk.Label(f,
                   text="Injected as extra context before the personality "
                        "answers. Tell it how to think, not what to know.",
-                  foreground="#7f849c", font=("Segoe UI", 9), wraplength=600,
+                  foreground="#7a7575", font=("Segoe UI", 9), wraplength=600,
                   justify="left").pack(anchor="w")
         prompt_box = self._make_text(f, height=8)
         prompt_box.pack(fill="both", expand=True, pady=(2, 8))
@@ -3097,7 +3122,7 @@ class CouncilConsole(tk.Tk):
                      ).pack(side="left", padx=8)
         ttk.Label(bp_row,
                   text="  (which personality wears this lens)",
-                  foreground="#7f849c", font=("Segoe UI", 9)
+                  foreground="#7a7575", font=("Segoe UI", 9)
                   ).pack(side="left")
 
         # Action buttons
@@ -3305,7 +3330,7 @@ class CouncilConsole(tk.Tk):
 
         # ── Outer horizontal split ────────────────────────────────────────────
         main_pane = tk.PanedWindow(self.tab_grapher, orient="horizontal",
-                                   bg="#1e1e2e", sashwidth=6)
+                                   bg="#1a1414", sashwidth=6)
         main_pane.pack(fill="both", expand=True, padx=6, pady=6)
 
         # ─────────────────────────────────────────────────────────────────────
@@ -3335,7 +3360,7 @@ class CouncilConsole(tk.Tk):
                    command=self._grapher_browse_file).pack(side="left")
         ttk.Button(fl2, text="\U0001f4e6 Sample",
                    command=self._grapher_load_sample).pack(side="left", padx=(4, 0))
-        ttk.Label(fl2, text="Sheet:", foreground="#a6adc8").pack(side="left", padx=(10, 2))
+        ttk.Label(fl2, text="Sheet:", foreground="#a98a8a").pack(side="left", padx=(10, 2))
         self._grapher_sheet_var = tk.StringVar()
         self._grapher_sheet_cb  = ttk.Combobox(
             fl2, textvariable=self._grapher_sheet_var, width=12, state="readonly")
@@ -3344,7 +3369,7 @@ class CouncilConsole(tk.Tk):
 
         self._grapher_status_var = tk.StringVar(value="No file loaded")
         ttk.Label(fb, textvariable=self._grapher_status_var,
-                  foreground="#89b4fa", wraplength=300,
+                  foreground="#d32f2f", wraplength=300,
                   justify="left").pack(anchor="w", padx=6, pady=(0, 4))
 
         # ── Live-reload (#8) + overlay file (#10) ─────────────────────────────
@@ -3358,11 +3383,11 @@ class CouncilConsole(tk.Tk):
         self._grapher_live_interval_var = tk.IntVar(value=5)
         ttk.Spinbox(fl3, from_=1, to=120, textvariable=self._grapher_live_interval_var,
                     width=4).pack(side="left", padx=2)
-        ttk.Label(fl3, text="s", foreground="#a6adc8").pack(side="left")
+        ttk.Label(fl3, text="s", foreground="#a98a8a").pack(side="left")
 
         fl4 = ttk.Frame(fb)
         fl4.pack(fill="x", padx=6, pady=(0, 6))
-        ttk.Label(fl4, text="Overlay:", foreground="#a6adc8", width=7).pack(side="left")
+        ttk.Label(fl4, text="Overlay:", foreground="#a98a8a", width=7).pack(side="left")
         self._grapher_overlay_var = tk.StringVar(value="(none)")
         self._grapher_overlay_cb  = ttk.Combobox(
             fl4, textvariable=self._grapher_overlay_var, width=20, state="readonly")
@@ -3375,7 +3400,7 @@ class CouncilConsole(tk.Tk):
         ctrl_frame = ttk.Frame(left_outer)
         ctrl_frame.pack(fill="both", expand=True, padx=4)
 
-        ctrl_canvas = tk.Canvas(ctrl_frame, bg="#1e1e2e", highlightthickness=0)
+        ctrl_canvas = tk.Canvas(ctrl_frame, bg="#1a1414", highlightthickness=0)
         ctrl_scroll  = ttk.Scrollbar(ctrl_frame, orient="vertical",
                                       command=ctrl_canvas.yview)
         self._ctrl_inner = ttk.Frame(ctrl_canvas)
@@ -3413,7 +3438,7 @@ class CouncilConsole(tk.Tk):
         }
         self._plot_type_var = tk.StringVar(value="line")
         for group, types in PLOT_GROUPS.items():
-            ttk.Label(ci, text=group, foreground="#89b4fa",
+            ttk.Label(ci, text=group, foreground="#d32f2f",
                       font=("", 9, "bold")).pack(anchor="w", padx=8, pady=(4, 0))
             fr = ttk.Frame(ci)
             fr.pack(fill="x", padx=8)
@@ -3450,11 +3475,11 @@ class CouncilConsole(tk.Tk):
         _col_row(ci, "Facet row:", "_gfacet_row")
 
         ttk.Label(ci, text="Multi-column (Ctrl+click):",
-                  foreground="#a6adc8").pack(anchor="w", padx=6, pady=(6, 0))
+                  foreground="#a98a8a").pack(anchor="w", padx=6, pady=(6, 0))
         self._gcols_lb = tk.Listbox(
             ci, selectmode="multiple", height=5,
-            bg="#313244", fg="#cdd6f4",
-            selectbackground="#585b70", exportselection=False)
+            bg="#3a2828", fg="#d4d4d4",
+            selectbackground="#5a3030", exportselection=False)
         self._gcols_lb.pack(fill="x", padx=6)
 
         ttk.Separator(ci, orient="horizontal").pack(fill="x", padx=6, pady=6)
@@ -3513,8 +3538,8 @@ class CouncilConsole(tk.Tk):
         ttk.Label(ci, text="Transforms",
                   font=("", 10, "bold")).pack(anchor="w", padx=6, pady=(0, 2))
         self._gtransform_lb = tk.Listbox(
-            ci, height=3, bg="#313244", fg="#a6e3a1",
-            selectbackground="#585b70", exportselection=False)
+            ci, height=3, bg="#3a2828", fg="#a6e3a1",
+            selectbackground="#5a3030", exportselection=False)
         self._gtransform_lb.pack(fill="x", padx=6)
         tf_btn_fr = ttk.Frame(ci)
         tf_btn_fr.pack(fill="x", padx=6, pady=(2, 0))
@@ -3555,12 +3580,12 @@ class CouncilConsole(tk.Tk):
         ttk.Label(ci, text="AI Assist",
                   font=("", 10, "bold")).pack(anchor="w", padx=6)
         ttk.Label(ci, text="Describe what you want to visualise:",
-                  foreground="#a6adc8", font=("", 9)).pack(anchor="w", padx=6)
+                  foreground="#a98a8a", font=("", 9)).pack(anchor="w", padx=6)
 
         self._gai_prompt = tk.Text(
             ci, height=3, wrap="word",
-            font=("Consolas", 10), bg="#1e1e2e", fg="#cdd6f4",
-            insertbackground="#cdd6f4")
+            font=("Consolas", 10), bg="#1a1414", fg="#d4d4d4",
+            insertbackground="#d4d4d4")
         self._gai_prompt.pack(fill="x", padx=6, pady=(2, 4))
         self._gai_prompt.insert("1.0", "Show me the distribution of all numeric columns")
 
@@ -3603,7 +3628,7 @@ class CouncilConsole(tk.Tk):
         # RIGHT: plot view + stats/AI output
         # ─────────────────────────────────────────────────────────────────────
         right_pane = tk.PanedWindow(main_pane, orient="vertical",
-                                    bg="#1e1e2e", sashwidth=5)
+                                    bg="#1a1414", sashwidth=5)
         main_pane.add(right_pane)
 
         plot_frame = ttk.Frame(right_pane)
@@ -3628,7 +3653,7 @@ class CouncilConsole(tk.Tk):
                 text="Interactive plots open in your browser.\n"
                      "Install tkinterweb for embedded view:\n"
                      "  pip install tkinterweb",
-                foreground="#89b4fa", font=("", 11),
+                foreground="#d32f2f", font=("", 11),
             ).pack(expand=True)
             ttk.Button(
                 plot_frame, text="\U0001f310 Open last plot in browser",
@@ -3651,8 +3676,8 @@ class CouncilConsole(tk.Tk):
         ttk.Button(hist_top, text="\u2715 Clear history",
                    command=self._grapher_history_clear).pack(side="left", padx=4)
         self._grapher_history_lb = tk.Listbox(
-            hist_frame, height=4, bg="#313244", fg="#cdd6f4",
-            selectbackground="#585b70", exportselection=False)
+            hist_frame, height=4, bg="#3a2828", fg="#d4d4d4",
+            selectbackground="#5a3030", exportselection=False)
         self._grapher_history_lb.pack(fill="both", expand=True, padx=4, pady=(0, 4))
         self._grapher_history_lb.bind("<Double-Button-1>", lambda e: self._grapher_history_open())
 
@@ -3757,7 +3782,7 @@ class CouncilConsole(tk.Tk):
         ttk.Label(win,
                   text="These are synthetic CSVs that ship with Data's Inferno. "
                        "Use them to try the tool before loading your real data.",
-                  foreground="#7f849c", wraplength=480, justify="left",
+                  foreground="#7a7575", wraplength=480, justify="left",
                   ).pack(anchor="w", padx=14, pady=(0, 10))
 
         choice = tk.StringVar(value=samples[0].name)
@@ -3768,7 +3793,7 @@ class CouncilConsole(tk.Tk):
                             ).pack(side="left")
             desc = descriptions.get(sp.name, "")
             if desc:
-                ttk.Label(row, text=f"— {desc}", foreground="#a6adc8",
+                ttk.Label(row, text=f"— {desc}", foreground="#a98a8a",
                           font=("Segoe UI", 9)
                           ).pack(side="left", padx=8)
 
@@ -4577,7 +4602,7 @@ class CouncilConsole(tk.Tk):
 
         ttk.Label(top, text="Vault:", font=("", 9, "bold")).pack(side="left")
         ttk.Label(top, text=str(VAULT_DIR),
-                  foreground="#89b4fa").pack(side="left", padx=6)
+                  foreground="#d32f2f").pack(side="left", padx=6)
         ttk.Button(top, text="📂 Open Folder",
                    command=self._vmgr_open_folder).pack(side="right")
         ttk.Button(top, text="⟳ Refresh",
@@ -4587,7 +4612,7 @@ class CouncilConsole(tk.Tk):
 
         # ── Main pane ─────────────────────────────────────────
         main = tk.PanedWindow(self.tab_vmgr, orient="horizontal",
-                              bg="#1e1e2e", sashwidth=6)
+                              bg="#1a1414", sashwidth=6)
         main.pack(fill="both", expand=True, padx=10, pady=(0, 6))
 
         # ── LEFT: vault tree + controls ───────────────────────
@@ -4643,7 +4668,7 @@ class CouncilConsole(tk.Tk):
         self._vmgr_zip_subfolder_var = tk.StringVar()
         ttk.Entry(zi2, textvariable=self._vmgr_zip_subfolder_var,
                   width=20).pack(side="left", padx=4)
-        ttk.Label(zi2, text="(blank = zip name)", foreground="#585b70").pack(side="left")
+        ttk.Label(zi2, text="(blank = zip name)", foreground="#5a3030").pack(side="left")
 
         zi3 = ttk.Frame(import_lf)
         zi3.pack(fill="x", padx=6, pady=(2, 6))
@@ -4813,7 +4838,7 @@ class CouncilConsole(tk.Tk):
 
         # ── RIGHT: preview + log ──────────────────────────────
         right = tk.PanedWindow(main, orient="vertical",
-                               bg="#1e1e2e", sashwidth=5)
+                               bg="#1a1414", sashwidth=5)
         main.add(right)
 
         # File preview
@@ -4831,7 +4856,7 @@ class CouncilConsole(tk.Tk):
         self._vmgr_log.pack(fill="both", expand=True, padx=4, pady=4)
         self._vmgr_log.tag_config("ok",   foreground="#a6e3a1")
         self._vmgr_log.tag_config("err",  foreground="#f38ba8")
-        self._vmgr_log.tag_config("info", foreground="#89b4fa")
+        self._vmgr_log.tag_config("info", foreground="#d32f2f")
 
         # Populate tree
         self._vmgr_refresh_tree()
@@ -4956,7 +4981,7 @@ class CouncilConsole(tk.Tk):
                             continue
                         _progress(f"Crawling: {src_label}  ({seed})", False)
                         self.after(0, lambda l=src_label:
-                            self._scraper_status_set(f"scraping {l}…", "#89b4fa"))
+                            self._scraper_status_set(f"scraping {l}…", "#d32f2f"))
                         n = vs.crawl(
                             src_label, seed, prefix, vault_dir, index,
                             max_pages=max_pages or src_max,
@@ -5060,7 +5085,7 @@ class CouncilConsole(tk.Tk):
         miss_path = VAULT_DIR / "vault_rag_misses.txt"
         win = tk.Toplevel(self)
         win.title("RAG Miss Log — Vault Gaps")
-        win.configure(bg="#1e1e2e")
+        win.configure(bg="#1a1414")
         win.geometry("740x420")
         if not miss_path.exists():
             ttk.Label(win, text="No RAG misses recorded yet.\n"
@@ -5387,7 +5412,7 @@ class CouncilConsole(tk.Tk):
         hdr = ttk.Frame(self.tab_lens)
         hdr.pack(fill="x", padx=10, pady=(8, 4))
         ttk.Label(hdr, text="Council Lens",
-                  foreground="#89b4fa", font=("", 11, "bold")).pack(side="left")
+                  foreground="#d32f2f", font=("", 11, "bold")).pack(side="left")
         ttk.Label(hdr,
                   text="  Paste any content — get simultaneous parallel critique from all relevant roles",
                   foreground="#6c7086").pack(side="left")
@@ -5489,7 +5514,7 @@ class CouncilConsole(tk.Tk):
         hdr = ttk.Frame(self.tab_vault_health)
         hdr.pack(fill="x", padx=10, pady=(8, 4))
         ttk.Label(hdr, text="Vault Health Dashboard",
-                  foreground="#89b4fa", font=("", 11, "bold")).pack(side="left")
+                  foreground="#d32f2f", font=("", 11, "bold")).pack(side="left")
 
         ctrl_row = ttk.Frame(self.tab_vault_health)
         ctrl_row.pack(fill="x", padx=10, pady=(0, 6))
@@ -5499,7 +5524,7 @@ class CouncilConsole(tk.Tk):
 
         # ── Three-panel layout ─────────────────────────────────────
         pw = tk.PanedWindow(self.tab_vault_health, orient="horizontal",
-                            bg="#1e1e2e", sashwidth=5, sashrelief="flat")
+                            bg="#1a1414", sashwidth=5, sashrelief="flat")
         pw.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
         # Left: memory files per personality
@@ -5762,7 +5787,7 @@ class CouncilConsole(tk.Tk):
         """Open the instruction list manager window."""
         win = tk.Toplevel(self)
         win.title("Council Instructions")
-        win.configure(bg="#1e1e2e")
+        win.configure(bg="#1a1414")
         win.geometry("680x460")
         win.resizable(True, True)
 
@@ -5830,7 +5855,7 @@ class CouncilConsole(tk.Tk):
                 return
             edit_win = tk.Toplevel(win)
             edit_win.title("Edit Instruction")
-            edit_win.configure(bg="#1e1e2e")
+            edit_win.configure(bg="#1a1414")
             edit_win.geometry("540x200")
 
             ttk.Label(edit_win, text="Name:").pack(anchor="w", padx=12, pady=(10,2))
@@ -5839,7 +5864,7 @@ class CouncilConsole(tk.Tk):
 
             ttk.Label(edit_win, text="Instruction text:").pack(anchor="w", padx=12, pady=(8,2))
             text_box = tk.Text(edit_win, height=4, wrap="word",
-                               bg="#11111b", fg="#cdd6f4", font=("Consolas", 9))
+                               bg="#0f0c0c", fg="#d4d4d4", font=("Consolas", 9))
             text_box.insert("1.0", entry["text"])
             text_box.pack(fill="x", padx=12)
 
@@ -5918,7 +5943,7 @@ class CouncilConsole(tk.Tk):
 
         win = tk.Toplevel(self)
         win.title("Content Style & Templates")
-        win.configure(bg="#1e1e2e")
+        win.configure(bg="#1a1414")
         win.geometry("700x560")
         win.resizable(True, True)
 
@@ -5930,17 +5955,17 @@ class CouncilConsole(tk.Tk):
         nb.add(pref_tab, text="Style Preferences")
 
         ttk.Label(pref_tab, text="Audience description:",
-                  foreground="#89b4fa").pack(anchor="w", padx=12, pady=(10,2))
+                  foreground="#d32f2f").pack(anchor="w", padx=12, pady=(10,2))
         aud_v = tk.StringVar(value=self._content_style._data.get("audience", ""))
         ttk.Entry(pref_tab, textvariable=aud_v, width=60).pack(anchor="w", padx=12)
 
         ttk.Label(pref_tab, text="Channel tone / style:",
-                  foreground="#89b4fa").pack(anchor="w", padx=12, pady=(8,2))
+                  foreground="#d32f2f").pack(anchor="w", padx=12, pady=(8,2))
         tone_v = tk.StringVar(value=self._content_style._data.get("tone", ""))
         ttk.Entry(pref_tab, textvariable=tone_v, width=60).pack(anchor="w", padx=12)
 
         ttk.Label(pref_tab, text="Add style note (what worked, what to avoid, etc.):",
-                  foreground="#89b4fa").pack(anchor="w", padx=12, pady=(8,2))
+                  foreground="#d32f2f").pack(anchor="w", padx=12, pady=(8,2))
         _note_row = ttk.Frame(pref_tab)
         _note_row.pack(fill="x", padx=12)
         note_v    = tk.StringVar()
@@ -5954,7 +5979,7 @@ class CouncilConsole(tk.Tk):
 
         ttk.Label(pref_tab, text="Existing style notes:",
                   foreground="#6c7086").pack(anchor="w", padx=12, pady=(8,2))
-        notes_box = tk.Text(pref_tab, height=8, bg="#11111b", fg="#cdd6f4",
+        notes_box = tk.Text(pref_tab, height=8, bg="#0f0c0c", fg="#d4d4d4",
                             font=("Consolas", 9), state="disabled", relief="flat", wrap="word")
         notes_box.pack(fill="both", expand=True, padx=12, pady=(0,8))
 
@@ -5991,7 +6016,7 @@ class CouncilConsole(tk.Tk):
                   text="Templates are automatically selected based on your video type request.",
                   foreground="#6c7086").pack(anchor="w", padx=12, pady=(8,2))
 
-        tmpl_list = tk.Text(tmpl_tab, height=22, bg="#11111b", fg="#cdd6f4",
+        tmpl_list = tk.Text(tmpl_tab, height=22, bg="#0f0c0c", fg="#d4d4d4",
                             font=("Consolas", 9), state="disabled", relief="flat", wrap="word")
         tmpl_sb = ttk.Scrollbar(tmpl_tab, command=tmpl_list.yview)
         tmpl_list.configure(yscrollcommand=tmpl_sb.set)
@@ -7347,7 +7372,7 @@ class CouncilConsole(tk.Tk):
                     # Show trends in a popup
                     _tw = tk.Toplevel(self)
                     _tw.title("Cross-Session Trends")
-                    _tw.configure(bg="#1e1e2e")
+                    _tw.configure(bg="#1a1414")
                     _tw.geometry("700x400")
                     _trend_box = self._make_text(_tw, wrap="word")
                     _trend_box.pack(fill="both", expand=True, padx=10, pady=10)
@@ -7682,7 +7707,7 @@ class CouncilConsole(tk.Tk):
             return
         win = tk.Toplevel(self)
         win.title("Background Deliberation Queue")
-        win.configure(bg="#1e1e2e")
+        win.configure(bg="#1a1414")
         win.geometry("620x440")
         self._bg_win = win
         if not hasattr(self, "_bg_queue"):
@@ -8320,7 +8345,7 @@ class CouncilConsole(tk.Tk):
         records = self._load_verdict_history()
         win = tk.Toplevel(self)
         win.title("Verdict History")
-        win.configure(bg="#1e1e2e")
+        win.configure(bg="#1a1414")
         win.geometry("900x500")
         if records:
             total    = len(records)
@@ -8564,6 +8589,25 @@ def main():
 
     app = CouncilConsole()
     crash_reporter.install_tk_hook(app, VAULT_DIR, on_crash=_on_crash)
+
+    # Splash: hide the main window briefly, run the spinning-cog
+    # animation, then reveal. If the splash fails (e.g. on a stripped-down
+    # tk build), the app still launches normally.
+    try:
+        app.withdraw()
+        def _reveal():
+            try:
+                app.deiconify()
+                app.lift()
+                app.focus_force()
+            except Exception:
+                pass
+        splash.show_splash(app, duration_ms=1800, on_done=_reveal)
+    except Exception as e:
+        print(f"[Splash] Skipping animation: {e}")
+        try: app.deiconify()
+        except Exception: pass
+
     app.mainloop()
 
 

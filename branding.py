@@ -75,36 +75,37 @@ SPLASH_PNG = ASSETS_DIR / "splash.png"
 
 DARK_THEME: Dict[str, str] = {
     "name":             "dark",
-    "bg":               "#1e1e2e",   # window background
-    "fg":               "#cdd6f4",   # primary text
-    "muted_fg":         "#7f849c",   # secondary text
-    "panel_bg":         "#181825",   # darker panel/frame bg
-    "input_bg":         "#11111b",   # input/text widget bg
-    "border":           "#313244",
-    "selection_bg":     "#45475a",
-    "accent":           "#89b4fa",   # primary accent (links, focus)
-    "accent_hover":     "#b4befe",
-    "success":          "#a6e3a1",
-    "warning":          "#fab387",
-    "error":            "#f38ba8",
-    "info":             "#94e2d5",
+    # Inferno red-and-grey palette
+    "bg":               "#1a1414",   # near-black with a faint warm tint
+    "fg":               "#d4d4d4",   # primary text — neutral light grey
+    "muted_fg":         "#7a7575",   # secondary text — warm grey
+    "panel_bg":         "#231a1a",   # darker panel/frame bg
+    "input_bg":         "#0f0c0c",   # input/text widget bg — deepest
+    "border":           "#3a2828",
+    "selection_bg":     "#4a2626",
+    "accent":           "#d32f2f",   # primary accent — Mars red
+    "accent_hover":     "#ff5252",   # hover — bright cherry red
+    "success":          "#7ea16d",   # muted desaturated green
+    "warning":          "#e0884a",   # ember orange
+    "error":            "#ff5252",
+    "info":             "#a98a8a",   # warm grey for informational text
 }
 
 LIGHT_THEME: Dict[str, str] = {
     "name":             "light",
-    "bg":               "#fafafa",
-    "fg":               "#1e1e2e",
-    "muted_fg":         "#6c7086",
+    "bg":               "#f4f1f1",
+    "fg":               "#1a1414",
+    "muted_fg":         "#6a5b5b",
     "panel_bg":         "#ffffff",
     "input_bg":         "#ffffff",
-    "border":           "#cdd6f4",
-    "selection_bg":     "#bac2de",
-    "accent":           "#1e66f5",
-    "accent_hover":     "#7287fd",
-    "success":          "#40a02b",
-    "warning":          "#df8e1d",
-    "error":            "#d20f39",
-    "info":             "#179299",
+    "border":           "#d8c8c8",
+    "selection_bg":     "#f0c8c8",
+    "accent":           "#b71c1c",
+    "accent_hover":     "#d32f2f",
+    "success":          "#5a7d4a",
+    "warning":          "#b06a2a",
+    "error":            "#b71c1c",
+    "info":             "#6a5b5b",
 }
 
 THEMES: Dict[str, Dict[str, str]] = {
