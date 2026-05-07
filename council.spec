@@ -30,6 +30,11 @@ hidden = [
     # Anything imported lazily inside try/except blocks
     "ssl",
     "json",
+    "urllib.request",
+    "urllib.parse",
+    "hmac",
+    "hashlib",
+    "base64",
     # Third-party that may be present
     "yaml",
     "chromadb",

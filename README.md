@@ -185,6 +185,36 @@ One-time purchase. No subscription, no usage limits, no per-question fees, no "t
 - Email support
 - Right to use on as many of your own machines as you want (one user)
 
+## How licensing works
+
+When you buy a license, you receive a single line of text by email — the **license blob**. Paste it into **Help → Activate License** in the app. Activation is offline — Data's Inferno never contacts a license server, so your license cannot stop working because something at our end is down.
+
+### 7-day free trial
+
+The first time you launch the app, a 7-day trial begins automatically. No card required. You get the full feature set during the trial — that's the only honest way to evaluate the product.
+
+When the trial ends, you can either:
+- **Activate** with a license blob (continue normally)
+- **Continue read-only** (your past sessions remain accessible; no new deliberations)
+
+You don't lose anything either way — the vault is yours.
+
+### Moving to another computer
+
+Open the activation dialog and click **Deactivate this machine**. The license blob still works — paste it on the new computer and it'll activate there.
+
+There's no per-machine limit enforced. We trust you to use it on machines you own.
+
+## How updates work
+
+Data's Inferno **must work without internet** — that's a hard requirement. So updates are designed to be optional and non-intrusive:
+
+- On startup, the app makes one quiet HTTPS request to check for a newer version
+- If a newer version exists, you see a dialog: *"Update available — open download page / skip this version / remind me later"*
+- **Nothing is ever auto-downloaded or auto-replaced.** You click the link, your browser opens, you choose whether to install.
+- If you have no internet, the check fails silently and the app launches normally.
+- You can disable update checks entirely by setting `DI_UPDATE_MANIFEST_URL=""` before launching.
+
 ---
 
 ## License

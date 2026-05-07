@@ -386,6 +386,53 @@ Most useful sessions move between 2–3 tabs as the task evolves.
 
 ---
 
+## Licensing & activation
+
+### The trial
+
+First launch opens a 7-day full-feature trial automatically. There's a small badge in the Council action bar showing how many days remain. Click it any time to:
+- Paste a license blob and activate
+- Open the buy page
+- View your current status
+
+### Activating a paid license
+
+Click the trial badge (or use **Help → Activate License**). Paste the license blob you received by email — it's a single long string. Click **Activate**. Done.
+
+### Read-only mode after expiry
+
+If the trial ends before you've bought (or your subscription expires), the app drops to **read-only mode**:
+- You can browse all past sessions in the Sessions tab
+- You can review charts you saved in Grapher
+- You **cannot** run new deliberations until you activate
+
+This is intentional — your data stays accessible no matter what happens to your license.
+
+### Moving to a new machine
+
+In the activation dialog, click **Deactivate this machine**. The same blob will work on the new machine. There's no enforced device limit; we trust you not to share license blobs with strangers.
+
+---
+
+## Updates
+
+The auto-updater checks for new versions on launch. It only **notifies** — it never downloads or installs anything automatically. Three reasons for this design:
+
+1. The app must work entirely offline. A failed update check should be invisible.
+2. You should always know what's running on your machine.
+3. Antivirus and corporate IT policies can interfere with auto-replacement; manual installs avoid that whole class of problems.
+
+When an update is available, you'll see a dialog at startup with three options:
+- **Yes** — open the download page in your browser
+- **No** — skip this version (you won't be reminded again about this specific version)
+- **Cancel** — remind me again next launch
+
+If you have no internet, no dialog appears. The app starts normally.
+
+To disable update checks entirely (e.g. on an air-gapped machine), set the environment variable `DI_UPDATE_MANIFEST_URL=""` before launching.
+
+---
+
 ## When things go wrong
 
 - **The panel seems stuck on Round 5+** — the question is too ambiguous. Cancel (Esc), refine, restart.

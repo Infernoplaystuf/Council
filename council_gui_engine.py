@@ -31,6 +31,9 @@ import branding
 import onboarding
 import specialists as _spec
 import crash_reporter
+import licensing
+import activation_dialog
+import updater
 
 # ── Agent modules (graceful optional imports) ─────────────────
 try:
@@ -2051,11 +2054,15 @@ class CouncilConsole(tk.Tk):
         self.after(100, self._poll_ui_queue)
         self.after(2000, self._refresh_nodes_async)   # initial node probe
         self._start_config_watcher()                   # T1-E: hot-reload pins.json
-        # Show onboarding wizard on first launch, then check crash recovery.
-        # 500ms delay lets the main window draw before the modal appears.
+        # Startup chain (sequenced so dialogs don't pile up):
+        #   1) Onboarding wizard (first launch only)
+        #   2) Licensing check (every launch — opens activation dialog if
+        #      trial expired and no license)
+        #   3) Crash recovery prompt (if the previous run died mid-flight)
+        # 500ms delay lets the main window draw before the first modal.
         self.after(500, lambda: onboarding.run_if_needed(
             self, VAULT_DIR,
-            on_complete=lambda _ok: self.after(800, self._check_crash_recovery),
+            on_complete=lambda _ok: self.after(400, self._check_license_status),
         ))
 
     def _unpack_personalities(self):
@@ -2082,6 +2089,99 @@ class CouncilConsole(tk.Tk):
         self.director             = self.personalities.get("director")
         self.algorithm            = self.personalities.get("algorithm")
         self.coach                = self.personalities.get("coach")
+
+    # ============================
+    # Licensing & trial gate
+    # ============================
+
+    def _check_license_status(self):
+        """
+        Check trial / license status on every launch. If the trial has
+        expired and there's no license, the activation dialog opens
+        modally. After the licensing pass, crash-recovery and update
+        check run.
+        """
+        try:
+            status = licensing.get_status(VAULT_DIR)
+        except Exception as e:
+            print(f"[License] Status check failed: {e}")
+            self.after(400, self._check_crash_recovery)
+            self.after(2000, self._kick_update_check)
+            return
+
+        self._license_status = status
+
+        # Update the badge in the UI if the Council action bar already exists
+        self._refresh_license_badge()
+
+        if status["status"] in (licensing.STATUS_TRIAL_EXPIRED,
+                                licensing.STATUS_LICENSE_EXPIRED,
+                                licensing.STATUS_INVALID_LICENSE):
+            # Modal blocker — user must activate or pick read-only
+            activation_dialog.open_activation_dialog(
+                self, VAULT_DIR,
+                on_status_change=self._on_license_status_change,
+                blocking=True,
+            )
+        # Crash recovery runs whether or not the user activated
+        self.after(400, self._check_crash_recovery)
+        # Update check runs in the background — never blocks startup
+        self.after(2000, self._kick_update_check)
+
+    def _kick_update_check(self):
+        """Spawn a background update check. Notification fires later if needed."""
+        def _on_update(info: dict):
+            # Bounce to UI thread
+            self.after(0, lambda i=info: self._show_update_notification(i))
+        try:
+            updater.check_async(VAULT_DIR, _on_update, delay_seconds=2.0)
+        except Exception as e:
+            print(f"[Updater] Check failed silently: {e}")
+
+    def _show_update_notification(self, info: dict):
+        """Non-blocking update toast — user can act on it any time."""
+        from tkinter import messagebox
+        version = info.get("version", "(unknown)")
+        notes_url = info.get("release_notes_url", "")
+        choice = messagebox.askyesnocancel(
+            "Update available",
+            f"{branding.PRODUCT_NAME} {version} is available "
+            f"(you're on {branding.VERSION}).\n\n"
+            f"Yes  — open the download page in your browser\n"
+            f"No   — skip this version (you'll be reminded for the next)\n"
+            f"Cancel — remind me again next launch\n\n"
+            f"Note: {branding.PRODUCT_NAME} works fully offline. Updates "
+            f"are optional.",
+            parent=self,
+        )
+        if choice is True:
+            target = info.get("platform_url") or info.get("download_url") or notes_url
+            try:
+                import webbrowser
+                webbrowser.open(target)
+            except Exception:
+                pass
+        elif choice is False:
+            updater.skip_version(VAULT_DIR, version)
+
+    def _on_license_status_change(self, new_status: dict):
+        """Callback after the user activates/deactivates from the dialog."""
+        self._license_status = new_status
+        self._refresh_license_badge()
+
+    def _refresh_license_badge(self):
+        """Update the small status indicator in the Council action bar."""
+        if not hasattr(self, "_license_badge_var"):
+            return
+        st = getattr(self, "_license_status", None) or {}
+        self._license_badge_var.set(st.get("message", ""))
+
+    def _can_run_deliberation(self) -> bool:
+        """Gate: returns True when new deliberations are permitted."""
+        st = getattr(self, "_license_status", None)
+        if not st:
+            return True   # status not yet computed — fail-open during startup
+        return bool(st.get("can_use_full_features", True))
 
     # ============================
     # Crash recovery
@@ -2320,6 +2420,21 @@ class CouncilConsole(tk.Tk):
                    command=self._council_find_and_chart_button
                    ).pack(side="left", padx=6)
         ttk.Button(btns, text="Clear", command=lambda: self._set_text(self.input, "")).pack(side="left", padx=6)
+
+        # License / trial badge — clickable to open activation dialog
+        self._license_badge_var = tk.StringVar(value="")
+        license_btn = tk.Button(
+            btns, textvariable=self._license_badge_var,
+            relief="flat", borderwidth=0, padx=8, pady=2,
+            bg="#181825", fg="#a6e3a1", activebackground="#313244",
+            font=("Segoe UI", 9, "bold"), cursor="hand2",
+            command=lambda: activation_dialog.open_activation_dialog(
+                self, VAULT_DIR,
+                on_status_change=self._on_license_status_change,
+                blocking=False,
+            ),
+        )
+        license_btn.pack(side="right", padx=(0, 6))
 
         # Manual specialist override — set to a specialist's id to force it
         # onto every query until the user picks "Auto" again.
@@ -6321,6 +6436,25 @@ class CouncilConsole(tk.Tk):
     # ============================
 
     def _send(self):
+        # Licensing gate — block new deliberations when trial expired
+        # and no license active. Past sessions are still readable.
+        if not self._can_run_deliberation():
+            from tkinter import messagebox
+            choice = messagebox.askyesno(
+                "Activation required",
+                f"{getattr(self, '_license_status', {}).get('message', 'License required')}\n\n"
+                "You can still view your past sessions. To run new "
+                "deliberations, activate a license now?",
+                parent=self,
+            )
+            if choice:
+                activation_dialog.open_activation_dialog(
+                    self, VAULT_DIR,
+                    on_status_change=self._on_license_status_change,
+                    blocking=False,
+                )
+            return
+
         # Hide verdict feedback bar on new query
         self._vfb_hide()
         user_text = self.input.get("1.0", "end").strip()

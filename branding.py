@@ -32,6 +32,15 @@ COPYRIGHT       = "© 2026"
 SUPPORT_EMAIL   = os.environ.get("COUNCIL_SUPPORT_EMAIL", "")
 WEBSITE         = os.environ.get("COUNCIL_WEBSITE",       "")
 
+# URL of the JSON manifest used by the auto-updater. Empty disables
+# update checks entirely. Override via DI_UPDATE_MANIFEST_URL env var
+# at build time (so different release channels can point at different
+# manifests without rebuilding).
+UPDATE_MANIFEST_URL = os.environ.get(
+    "DI_UPDATE_MANIFEST_URL",
+    "",   # disabled by default until you have a hosting URL
+)
+
 
 # ---- Asset paths -------------------------------------------------------------
 
