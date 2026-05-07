@@ -1,37 +1,35 @@
-# Data's Inferno — User Guide
+# Data's Inferno — guide
 
-The README covers install and the value pitch. This guide goes deeper so you can actually be productive with your own data on day one.
+The README covers setup. This goes a layer deeper into how to actually use it.
 
 ---
 
 ## How to ask a question that gets a useful answer
 
-Data's Inferno answers in proportion to the structure of your question. Three patterns work consistently well:
+The Council answers in proportion to the structure of your question. Three patterns work consistently:
 
-### Pattern A — Point at a file, then ask
+**Pattern A — Point at a file, then ask**
 > "Looking at orders.csv from this month, what changed compared to last month?"
 
-The panel will route to data-comparison logic. The Coder pulls the rows, the Analyst computes the deltas, the Writer explains them.
-
-### Pattern B — Show a sample, then ask
+**Pattern B — Show a sample, then ask**
 Paste a few rows of data into the input, then ask:
-> ```
-> customer_id, last_order, total_spend
-> A123,        2026-04-15, 4200
-> A124,        2026-01-02, 850
-> A125,        2026-04-30, 12100
->
-> What's a sensible "high-value-but-dormant" threshold for follow-up?
-> ```
+```
+customer_id, last_order, total_spend
+A123,        2026-04-15, 4200
+A124,        2026-01-02, 850
+A125,        2026-04-30, 12100
 
-### Pattern C — Specify the deliverable
-> "Give me a one-paragraph summary I can paste into an email to my supplier."
+What's a sensible "high-value-but-dormant" threshold for follow-up?
+```
 
-The Writer will format strictly to that. If you ask for "a SQL query that runs on Postgres", the Coder respects the dialect.
+**Pattern C — Specify the deliverable**
+> "Give me a one-paragraph summary I can paste into Slack."
+
+The Writer formats strictly to that. If you want code that runs as-is, ask for that.
 
 ---
 
-## The Council tab — anatomy
+## The Council tab — what you're seeing
 
 ```
 ┌────────────────────────────────────────────────────────┐
@@ -47,104 +45,137 @@ The Writer will format strictly to that. If you ask for "a SQL query that runs o
 └────────────────────────────────────────────────────────┘
 ```
 
-- **Transcript** (left): live, append-only. Scroll back, copy any line, save the entire session.
-- **Judge panel** (right): which route was chosen, who's on the panel, the live confidence score, and the round counter. If you see "Round 4+", the question is genuinely ambiguous.
+- **Transcript** (left): live, append-only. Scroll back, copy lines, save the whole session.
+- **Judge panel** (right): which route was chosen, who's on the panel, confidence, round counter.
 
-### What the verdicts mean
+If you see Round 4+, the question is genuinely ambiguous — cancel, rephrase, restart.
 
-- **PASS** — The Judge accepted the lead answer.
-- **RETRY** — The draft was rejected; the panel iterates.
-- **CHANGE** — A different specialist's draft won out.
+### Verdicts
 
-### Pausing for clarification
+- **PASS** — Judge accepted the lead answer.
+- **RETRY** — Draft rejected; panel iterates.
+- **CHANGE** — A different role's draft won out.
 
-When a panel member needs a clarifying detail, the Council pauses and shows a yellow "Awaiting your answer…" banner. Type your reply and press Enter to resume.
+When a panel member needs a clarifying detail, the Council pauses with a yellow banner. Reply and it resumes.
 
 ---
 
-## The AI panel — who's on it and when
+## The AI panel
 
-You don't pick the panel — the Judge does, based on what you asked. Here's the matching logic:
+You don't pick the panel — the Judge does, based on what you asked.
 
 | Role | Voice | Best for |
-|------|-------|----------|
-| **Judge** | Decisive, terse | Routing & final verdicts. Always present. |
-| **Writer** | Crisp, organised | Plain-English summaries, narrative reports |
-| **Coder** | Systematic, defensive | Pandas/SQL queries, calculations, joins |
-| **Intern** | Eager, fast | First-pass scans, rough sketches |
-| **Peasant** | Skeptical, plain-spoken | Cross-examination — "why does that follow?" |
-| **Sage** | Knowledgeable | Historical context from your indexed files |
-| **Strategist** | Long-horizon | Trends, projections, what-to-watch |
-| **Skeptic** | Adversarial | Find flaws in the proposed answer |
-| **Artist** | Visual | Chart styling, dashboard layout suggestions |
-| **Director** | Editorial | Style consistency for reports going out |
-| **Content** | Audience-aware | Tone for customer-facing language |
-| **Algorithm** | Pattern-aware | Distribution shape, outliers, clustering |
-| **Coach** | Performance-focused | Pacing, simplification, what to drop |
+|---|---|---|
+| **Judge** | Decisive, terse | Always present. Routes + final verdict. |
+| **Writer** | Crisp, organised | Plain-English summaries |
+| **Coder** | Systematic, defensive | Pandas/SQL queries, calculations |
+| **Intern** | Eager, fast | First-pass scans |
+| **Peasant** | Skeptical | "Why does that follow?" |
+| **Sage** | Knowledgeable | Historical context from indexed files |
+| **Strategist** | Long-horizon | Trends, projections |
+| **Skeptic** | Adversarial | Find flaws |
+| **Artist** | Visual | Chart styling, layout suggestions |
 
-You can override the Judge's choice on the **🔍 Lens** tab.
+You can override on the **🔍 Lens** tab.
 
 ---
 
-## The Grapher tab — your starting point for any new dataset
+## The Grapher
 
-This is usually where a session begins.
+Where most sessions start.
 
-### Supported formats
-CSV · TSV · XLSX · XLS · JSON · NPY · NPZ · whitespace-delimited TXT
+**Supported formats:** CSV · TSV · XLSX · XLS · JSON · NPY · NPZ · whitespace TXT
 
-### The flow
-1. **Drag a file** onto the Grapher tab (or use Browse).
-2. The schema panel auto-detects column types: numeric · date · category · text.
-3. **Pick a chart type** — bar, line, scatter, pie, histogram, box, heatmap.
-4. **Pick X / Y / colour columns.** Aggregations: sum, mean, count, min, max.
-5. The chart renders in the right pane with light interactivity.
+**The flow:**
+1. Drag a file in (or use Browse, or 📦 Sample for the bundled fake data)
+2. Schema panel auto-detects column types
+3. Pick chart type + axes + aggregation
+4. Renders in the right pane
 
-### The Analyst AI
-Click **🧠 Ask Analyst** and it will:
-- Suggest the most informative chart for *this* shape of data
-- Spot outliers, missing values, suspicious distributions
-- Propose transforms (log scale, normalise, drop nulls, group)
-- Explain what the chart actually says in plain English
+**🧠 Ask Analyst** is the move. It will:
+- Suggest the most informative chart for *this* shape
+- Spot outliers, missing values, weird distributions
+- Propose transforms (log, normalise, drop nulls)
+- Explain what the chart actually says
 
-Most users start a session by dropping their file into the Grapher and asking the Analyst "what should I be looking at here?". The Analyst's first read is usually the right starting point.
+**🔄 Live Reload** re-renders the chart whenever the file changes on disk. Handy if I'm editing the CSV in another tool.
 
-### Live reload
-Toggle 🔄 Live Reload — the chart re-renders whenever the source file changes. Useful if you're piping data from another tool or editing a CSV.
-
-### Overlay
-Load a second dataset to overlay on the same axes. Perfect for **before / after** comparisons (this month vs. last month, with promo vs. without).
-
-### Sample datasets
-First time on the Grapher? Click **📦 Load Sample** to drop in a synthetic but realistic purchase-orders dataset. Useful for trying the tool without exposing your real data.
+**Overlay** loads a second dataset on the same axes — before/after comparisons.
 
 ---
 
-## Model configuration — one model vs many
+## Find & Chart (the ask-first flow)
 
-By default, **every AI personality runs on the same Ollama model**. This is intentional:
+When you ask the Council a chart-shaped question — "show me monthly revenue", "graph yearly sales", "plot inventory dormant for 6 months" — the Council scans the vault and bundled samples for relevant files, registers them all in the Grapher's dropdown, loads the top match, and asks the Analyst for a chart, all in one go.
 
-> Switching models is the silent killer of perceived speed. If the Writer uses model A and the Coder uses model B, every time the panel rotates between them Ollama has to swap models in and out of memory. On a laptop, that turns a 3-second answer into a 30-second one.
+Two triggers:
 
-The default `personality_backends.json` ships with all six core roles pinned to `local_general_alt` (the 14B starter model the onboarding wizard pulls). Changing roles always feels instant because no model swap happens.
+- **Auto** — type a question with chart keywords (graph/chart/plot/show me/by month/trend/...) and press Send.
+- **Explicit** — click the 📊 *Find & Chart* button next to Send.
 
-### When to use multiple models
+The synonym map covers the gap between business words and CSV columns: "revenue" matches files that have `total/amount/sales`; "inventory" matches `stock/qty/sku`; "monthly" matches `date/month`. Mostly fine. Occasionally finds the wrong file first — the dropdown lets you swap in one click.
 
-There are two cases where pinning a role to a different model genuinely helps, and the speed cost is worth it:
+---
 
-1. **You have a powerful desktop with 32+ GB RAM** that can hold two models in memory simultaneously. Then the swap penalty disappears and you can put the Coder on a code-specialist model (`qwen2.5-coder:14b`).
-2. **You're using a remote node** (Nodes tab) for heavy reasoning. The local laptop runs the Judge and Peasant on the small fast model; the desktop or homelab GPU runs the Writer/Sage on a 32B. The swap is between machines, not within one machine, so it's parallelisable.
+## The Vault
 
-For everyone else: leave the defaults alone. One model is fast and the AI panel is still meaningfully smarter than any single AI alone — because it deliberates with itself.
+Two things:
 
-### How to override
+1. **See what the panel knows.** Tree view of every file you've added.
+2. **Add files.** Drop in:
+   - Recent CSV exports
+   - Reference docs
+   - Cloned git repos (your codebase, vendor docs)
 
-Edit `vault/personality_backends.json`:
+The Sage has a search index over everything in the vault. It pulls relevant rows or paragraphs into the deliberation as context.
+
+Don't drop secrets in here — RAG indexes everything indiscriminately.
+
+---
+
+## Personal Specialists
+
+Each is a *named lens* on the same shared vault. There's no per-specialist data folder; everything lives in the vault.
+
+**Three pre-built:**
+- **💰 Sales Specialist** — revenue, AOV, retention, churn
+- **📦 Inventory Specialist** — stock, turnover, dead stock, suppliers
+- **🤝 Customer Specialist** — loyalty, dormancy, segmentation
+
+**Auto-summon vs manual:**
+
+| | Auto | Manual |
+|---|---|---|
+| Trigger | Question contains a domain keyword | Pick from "Ask: [specialist ▾]" in Council |
+| When | Default | When keywords didn't catch what I want |
+
+When the panel is consulting a specialist, you'll see in the transcript:
+> *Council  Consulting: 💰 Sales Specialist, 📦 Inventory Specialist*
+
+**Multi-specialist deliberation:** if 2+ specialists match, all of them are summoned. The model sees a "MULTI-SPECIALIST DELIBERATION" header telling it to apply each lens and reconcile when they conflict.
+
+This is the answer to questions like *"Should I order more inventory based on last year's sales trend?"* — Sales lens AND Inventory lens, reconciled.
+
+**Editing a specialist:** four fields in the detail pane:
+1. Description
+2. Domain keywords (comma-separated)
+3. Lens / system-prompt overlay
+4. Base personality (writer / sage / strategist / coder / etc.)
+
+The 🧪 *Test* button runs a sample question with the lens applied — useful for tuning the prompt.
+
+---
+
+## Model configuration
+
+By default every personality runs on the **same** Ollama model. Switching models is what makes the panel feel slow — Ollama swaps models in/out of memory between calls. With one shared model, rotation between roles is free.
+
+Override per role in `vault/personality_backends.json`:
 
 ```json
 {
   "writer":  "local_general_alt",
-  "coder":   "local_coder_primary",
+  "coder":   "local_coder_primary",   ← if you want a code-tuned model
   "intern":  "local_general_alt",
   "judge":   "local_general_alt",
   "peasant": "local_general_alt",
@@ -152,129 +183,27 @@ Edit `vault/personality_backends.json`:
 }
 ```
 
-Hot-reloads — no restart needed.
+Hot-reloads — no restart needed. Backend keys map to actual Ollama model names; see `council_engine.py` for the table.
 
-Available backend keys:
-
-| Key | Default model | When to use |
-|---|---|---|
-| `local_general_alt` | qwen2.5:14b | The default. Use this for everything unless you have a reason. |
-| `local_general_primary` | qwen2.5:32b | Heavy synthesis (Writer/Sage). Needs ~24 GB RAM. |
-| `local_coder_primary` | qwen2.5-coder:14b | Coder role specifically — code-tuned. |
-| `local_coder_fast` | phi4 | Tiny + fast. Good for Intern. |
-| `local_judge_fast` | phi4 | Tiny + fast. Good for Judge. |
-| `local_peasant_fast` | phi4 | Tiny + fast. Good for Peasant. |
-| `pi_heavy` | qwen2.5:14b on Pi | Remote 14B on a Raspberry Pi 16GB. |
-| `pi_fast` | phi4 on Pi | Remote phi4 on a Pi 8GB. |
-
-You can also override the actual model name behind any backend key via environment variables — see the comments at the top of `personality_backends.json` for the full list.
+Only worth doing if you have 32+ GB RAM (so two models can stay hot) or you're using a remote node.
 
 ---
 
-## The Personal Specialists tab
+## The IDE / Runner
 
-Specialists are **named lenses** that the AI panel can wear when answering your questions. They are pure config — no separate data folders, no fine-tuned models. The vault is the shared knowledge pool; specialists just tell the AI *how to look at it*.
+Anything the Coder writes lands here. Edit, click ▶ Run, output streams into the Council.
 
-### What ships out of the box
+⚠ **Trust gate**: if the Coder produces code that touches files, runs subprocess, makes network calls, or evaluates dynamic code, you'll see a confirmation dialog listing what's risky. Trust decisions are session-scoped (SHA-256 of script body); restart and you'll be asked again.
 
-- **💰 Sales Specialist** — revenue, customer behaviour, retention, AOV
-- **📦 Inventory Specialist** — stock levels, turnover, dead stock, supplier risk
-- **🤝 Customer Specialist** — loyalty, dormancy, churn, segmentation
+The runner is sandboxed to `vault/workspace/`.
 
-You can edit, disable, or delete any of them. Or click **➕ New** to create your own.
-
-### The four pieces of a specialist
-
-When you select a specialist on the left of the tab, you'll see four editable fields on the right:
-
-1. **Description** — one-line summary of what they're good at. Shown in lists.
-2. **Domain keywords** — words that, when they appear in your question, automatically summon this specialist. Comma-separated.
-3. **Lens / system-prompt overlay** — extra context injected before the AI answers. Tell it *how* to think about questions in this domain. Be specific about output style ("cite SKUs", "translate to actions", "use plain language").
-4. **Base personality** — which existing AI role (writer / sage / strategist / coder / etc.) wears this lens.
-
-The **🧪 Test** button at the bottom lets you try a question against the specialist before saving — useful for tuning the prompt.
-
-### Auto vs manual summoning
-
-| | When it fires |
-|---|---|
-| **Auto** (default) | Council scans your question for any specialist's domain keywords. Up to 3 most-relevant specialists get summoned in parallel. |
-| **Manual** | Council action bar has an **Ask: [specialist ▾]** dropdown. Pick a specific specialist to force on every question until you switch back to "Auto". |
-
-When the panel is consulting a specialist, you'll see a line in the transcript:
-
-> *Council  Consulting: 💰 Sales Specialist, 📦 Inventory Specialist*
-
-### Multi-specialist deliberation
-
-When two or more specialists match a question, **all of them** are summoned. The model sees a "MULTI-SPECIALIST DELIBERATION" header that tells it to apply each lens, reconcile when they conflict, and be explicit about which lens each part of the answer comes from.
-
-This is the core power of Personal Specialists for cross-domain questions. *"Should I order more inventory based on last year's sales trend?"* gets a Sales lens AND an Inventory lens — and the answer ties both perspectives together.
-
-### What about training a custom model?
-
-Personal Specialists are **RAG-backed lenses**, not fine-tuned models. They cite your data; they don't replace the underlying AI's reasoning. This is intentional:
-
-- True fine-tuning needs a GPU, hours of compute, and labelled training data — not realistic for a desktop product.
-- Lens overlays + shared RAG cover ~90% of the practical benefit at zero training time.
-- You can iterate on a specialist's prompt in seconds and see the result immediately via the **🧪 Test** button.
-
-If you genuinely need a fine-tuned model later, Data's Inferno's `personality_backends.json` lets you point any specialist's base personality at an external model endpoint (OpenAI, your own Ollama-hosted fine-tune, etc.). The lens overlay still applies.
+This tab is hidden by default — set `COUNCIL_ADVANCED=1` before launching to see it.
 
 ---
 
-## The Vault tab — your data warehouse for the panel
+## The Lens
 
-The vault is where all your indexed files live. Two purposes:
-
-1. **See what the AI panel knows.** Tree view of every file you've added. Click any to preview.
-2. **Add files for the panel to learn from.** Drop in:
-   - A folder of monthly export CSVs
-   - Your supplier price-list PDF
-   - A folder of reference documents (e.g. "policy.md", "glossary.md")
-   - Cloned git repos (your codebase, vendor docs)
-
-### What the panel does with vault files
-The **Sage** personality has access to a search index over everything in the vault. When you ask about your data, the Sage retrieves the most relevant rows or paragraphs and feeds them into the deliberation as context.
-
-### What to put in the vault
-- Recent orders/inventory exports
-- Customer master file
-- Product catalogue
-- Supplier contact list
-- Anything you'd reference yourself in a meeting
-
-### What NOT to put in the vault
-- Raw secrets (passwords, API keys) — RAG indexes everything indiscriminately
-- Multi-GB log files — slow to index, low signal
-
----
-
-## The IDE / Runner tab — for power users
-
-Anything the Coder writes ends up here. You can:
-
-1. **Edit it inline.** The panel picks up your edits as the new working version.
-2. **Run it.** Click ▶ Run. Output streams back to the Council transcript.
-3. **Snapshot it.** 📸 Save it to the vault for re-use later.
-
-⚠ **Trust gate**: When the Coder produces code that touches files, calls subprocesses, makes network calls, or evaluates dynamic code, you'll see a confirmation dialog listing exactly what's risky and which lines. Review and approve before it runs. Trust decisions are session-scoped — restart the app and you'll be asked again.
-
-The runner is sandboxed to `vault/workspace/`. Files written outside that directory require approval.
-
-### When you'd use this
-You normally won't — the panel handles queries internally. The IDE is for when you want to:
-- Hand the Coder's script to a colleague
-- Modify the analysis (e.g. tweak a threshold)
-- Re-run the same script against next week's data
-
----
-
-## The Lens tab — second opinions
-
-When the Council reaches a verdict you don't trust, paste the verdict into the Lens, pick which specialists should review it, and run.
-
-Each picked specialist reviews **in parallel** and gives an independent take. No deliberation, no consensus — just N opinions side-by-side.
+Pick any subset of personalities and have them all critique the same text in parallel. No deliberation, no consensus — just N opinions side-by-side.
 
 Common patterns:
 - **Number-check**: Coder + Algorithm + Skeptic
@@ -283,79 +212,26 @@ Common patterns:
 
 ---
 
-## The Sessions tab — every past analysis
+## Sessions
 
-Every conversation is auto-saved. The Sessions tab shows them newest-first with a search bar. Click any session to:
-- See the full transcript
-- Re-run the same question against fresh data
-- Export to PDF/Markdown
-- Continue from where you left off
+Every conversation auto-saves. Newest-first. Click any to load the full transcript.
 
-When the panel finishes a deliberation, it writes a one-paragraph summary too — that's what you see in the session list.
-
-### Crash recovery
-If Data's Inferno closes mid-deliberation (power blip, crash, accidental quit), the next launch offers to **resume the session** so you don't lose the in-flight analysis. You can also discard it and start fresh.
+**Crash recovery:** if the app dies mid-deliberation, next launch offers to resume the orphaned session.
 
 ---
 
-## The Vault Health tab
+## Speech
 
-Your panel gets smarter the more you use it. Vault Health shows you what's been learned and what's missing.
+Record → transcribe (faster-whisper, local) → feed to Council. TTS playback works offline via pyttsx3.
 
-**Memory snapshots** — what each AI specialist has stored as long-term notes about your business. Click a role to see its memory file. Edit if a stored note is outdated.
-
-**Knowledge gaps** — questions the Sage couldn't fully answer. Over time these become a wishlist of files you should add to the vault to fill the gap.
-
-**Wishlist** — manually-add topics. If you're working in a domain Data's Inferno doesn't know yet, add it here so it gets surfaced during deliberations.
-
----
-
-## The Speech tab
-
-**Record → Transcribe → Council**
-Click 🎙 Record, speak, click ⏹ Stop. The audio is transcribed locally (offline, no internet) and the transcript becomes your next message.
-
-**TTS playback**
-Any text in the Council transcript can be played back aloud. Local TTS, works offline.
-
-Useful for:
-- Hands-free review while driving / cooking / walking
-- Reading long deliberations aloud during commute
-
----
-
-## The Apothecary tab
-
-Maintenance console. Useful commands:
-
-- **Cache flush** — clears `vault/.cache/`
-- **Log tail** — follows the application log
-- **RAG re-index** — rebuilds the vault search index from scratch
-- **Personality reload** — picks up edits to backends config without restart
-- **Backup vault** — zips the current vault for archival
-
-If anything misbehaves, this tab is your first stop.
-
----
-
-## The Nodes tab (advanced)
-
-Data's Inferno can offload heavy reasoning to a remote machine over SSH if you have, for example, a beefier desktop or a homelab GPU sitting idle.
-
-### Setup
-1. The remote machine runs Ollama on its internal IP.
-2. Nodes tab → Add Node → fill in name, host, user, key path, model.
-3. Data's Inferno probes it; if reachable, it appears with a green dot.
-4. Pin specific specialists to specific nodes — heavy reasoning (Sage, Strategist) on the remote box, fast roles (Judge, Peasant) local.
-
-Most users never need this. If your laptop is enough, leave it alone.
+Useful for hands-free brainstorming.
 
 ---
 
 ## Keyboard shortcuts
 
 | Action | Shortcut |
-|--------|----------|
+|---|---|
 | Send message | `Enter` (in input field) |
 | Newline in input | `Shift+Enter` |
 | Cancel deliberation | `Esc` |
@@ -369,84 +245,25 @@ Most users never need this. If your laptop is enough, leave it alone.
 ## A typical end-to-end session
 
 ```
-1. Launch          → Data's Inferno opens to the Grapher tab
-2. Drop file       → orders_april.csv → schema auto-detects 12 columns
-3. 🧠 Ask Analyst  → "highest-revenue category was Tools, but order count
-                     was actually flat — average order value rose 22%"
-4. Switch tab      → ⚖ Council
-5. Type            → "Show me which specific Tools SKUs drove the AOV bump"
-6. Watch panel     → Coder pulls rows, Analyst groups, Writer explains
-7. Verdict         → 89% confidence — top 3 SKUs are 60% of the lift
-8. 🔍 Lens         → Skeptic reviews: "is 60% statistically meaningful with
-                     this sample size?" — caveat noted
-9. Save            → 📚 Librarian → Save Session as PDF, email to team
+1. Launch          → Council tab
+2. Type            → "Show me which Tools SKUs drove last month's AOV bump"
+3. Watch           → Sales + Inventory specialists auto-summon. Council
+                     finds orders.csv, loads it, asks Analyst.
+4. Get a chart     → Top 3 SKUs are 60% of the lift
+5. 🔍 Lens         → Paste verdict, Skeptic reviews: "is 60% statistically
+                     meaningful with this sample size?"
+6. Save            → Auto-saved in 🕓 Sessions
 ```
 
 Most useful sessions move between 2–3 tabs as the task evolves.
 
 ---
 
-## Licensing & activation
-
-### The trial
-
-First launch opens a 7-day full-feature trial automatically. There's a small badge in the Council action bar showing how many days remain. Click it any time to:
-- Paste a license blob and activate
-- Open the buy page
-- View your current status
-
-### Activating a paid license
-
-Click the trial badge (or use **Help → Activate License**). Paste the license blob you received by email — it's a single long string. Click **Activate**. Done.
-
-### Read-only mode after expiry
-
-If the trial ends before you've bought (or your subscription expires), the app drops to **read-only mode**:
-- You can browse all past sessions in the Sessions tab
-- You can review charts you saved in Grapher
-- You **cannot** run new deliberations until you activate
-
-This is intentional — your data stays accessible no matter what happens to your license.
-
-### Moving to a new machine
-
-In the activation dialog, click **Deactivate this machine**. The same blob will work on the new machine. There's no enforced device limit; we trust you not to share license blobs with strangers.
-
----
-
-## Updates
-
-The auto-updater checks for new versions on launch. It only **notifies** — it never downloads or installs anything automatically. Three reasons for this design:
-
-1. The app must work entirely offline. A failed update check should be invisible.
-2. You should always know what's running on your machine.
-3. Antivirus and corporate IT policies can interfere with auto-replacement; manual installs avoid that whole class of problems.
-
-When an update is available, you'll see a dialog at startup with three options:
-- **Yes** — open the download page in your browser
-- **No** — skip this version (you won't be reminded again about this specific version)
-- **Cancel** — remind me again next launch
-
-If you have no internet, no dialog appears. The app starts normally.
-
-To disable update checks entirely (e.g. on an air-gapped machine), set the environment variable `DI_UPDATE_MANIFEST_URL=""` before launching.
-
----
-
 ## When things go wrong
 
-- **The panel seems stuck on Round 5+** — the question is too ambiguous. Cancel (Esc), refine, restart.
+- **Council stuck on Round 5+** — question is too ambiguous. Esc, refine, restart.
 - **Same answer regardless of question** — restart Ollama. A model can wedge.
-- **Grapher chart is empty** — the column types weren't detected correctly. Schema panel → manually override types.
-- **High RAM usage** — heavy models stay loaded between calls. Apothecary → Unload to free.
-- **Sage doesn't know your data** — feed it. Vault tab → drop your most relevant files there, then re-run the question. RAG picks up new files within a minute.
-
----
-
-## Pro tips
-
-- **Type slower, not faster.** The first message of a session sets the tone. Spend a sentence telling the Judge what you want ("explain like I'm new to my own data" / "give me numbers I can put in a quarterly report" / "review this critically").
-- **Drop files early.** The panel is *much* sharper when it has actual data to look at. Don't describe your data — show it.
-- **Use Lens for second opinions.** Whenever a verdict has business consequences, paste it into Lens. Skeptic will catch what the main panel missed.
-- **Check Vault Health weekly.** Adding the files it asks for pays dividends — your panel gets noticeably smarter every time you do.
-- **Don't fight the Judge's routing.** If it routes a chart question to the Grapher, follow. The panel knows which tab is best for which kind of question.
+- **Empty Grapher chart** — column types weren't detected. Manually override in the schema panel.
+- **High RAM** — heavy models stay loaded. Apothecary tab → Unload (set `COUNCIL_ADVANCED=1` first).
+- **Sage doesn't know your data** — feed it. Vault tab → drop relevant files. RAG re-indexes within a minute.
+- **Crash log appears** — check `vault/logs/crashes/` for the trace.

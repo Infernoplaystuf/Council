@@ -2096,10 +2096,10 @@ class CouncilConsole(tk.Tk):
 
     def _check_license_status(self):
         """
-        Check trial / license status on every launch. If the trial has
-        expired and there's no license, the activation dialog opens
-        modally. After the licensing pass, crash-recovery and update
-        check run.
+        Status check at startup. In DEMO_MODE this short-circuits to
+        "personal use — no gates"; in product mode it can open a
+        modal activation dialog. Crash recovery + update check run
+        either way.
         """
         try:
             import device_fingerprint
@@ -2116,19 +2116,21 @@ class CouncilConsole(tk.Tk):
         # Update the badge in the UI if the Council action bar already exists
         self._refresh_license_badge()
 
-        if status["status"] in (licensing.STATUS_TRIAL_EXPIRED,
-                                licensing.STATUS_LICENSE_EXPIRED,
-                                licensing.STATUS_INVALID_LICENSE,
-                                licensing.STATUS_NEEDS_ACTIVATION):
-            # Modal blocker — user must activate or pick read-only
-            activation_dialog.open_activation_dialog(
-                self, VAULT_DIR,
-                on_status_change=self._on_license_status_change,
-                blocking=True,
-            )
+        # DEMO_MODE: never block, never show the activation dialog.
+        if not getattr(branding, "DEMO_MODE", False):
+            if status["status"] in (licensing.STATUS_TRIAL_EXPIRED,
+                                    licensing.STATUS_LICENSE_EXPIRED,
+                                    licensing.STATUS_INVALID_LICENSE,
+                                    licensing.STATUS_NEEDS_ACTIVATION):
+                activation_dialog.open_activation_dialog(
+                    self, VAULT_DIR,
+                    on_status_change=self._on_license_status_change,
+                    blocking=True,
+                )
         # Crash recovery runs whether or not the user activated
         self.after(400, self._check_crash_recovery)
-        # Update check runs in the background — never blocks startup
+        # Update check runs in the background — never blocks startup.
+        # DEMO_MODE forces the manifest URL empty so this is a fast no-op.
         self.after(2000, self._kick_update_check)
 
     def _kick_update_check(self):
@@ -2424,20 +2426,23 @@ class CouncilConsole(tk.Tk):
                    ).pack(side="left", padx=6)
         ttk.Button(btns, text="Clear", command=lambda: self._set_text(self.input, "")).pack(side="left", padx=6)
 
-        # License / trial badge — clickable to open activation dialog
+        # License / trial badge — clickable to open activation dialog.
+        # In DEMO_MODE the whole element is hidden since there's no
+        # licensing surface to show.
         self._license_badge_var = tk.StringVar(value="")
-        license_btn = tk.Button(
-            btns, textvariable=self._license_badge_var,
-            relief="flat", borderwidth=0, padx=8, pady=2,
-            bg="#181825", fg="#a6e3a1", activebackground="#313244",
-            font=("Segoe UI", 9, "bold"), cursor="hand2",
-            command=lambda: activation_dialog.open_activation_dialog(
-                self, VAULT_DIR,
-                on_status_change=self._on_license_status_change,
-                blocking=False,
-            ),
-        )
-        license_btn.pack(side="right", padx=(0, 6))
+        if not getattr(branding, "DEMO_MODE", False):
+            license_btn = tk.Button(
+                btns, textvariable=self._license_badge_var,
+                relief="flat", borderwidth=0, padx=8, pady=2,
+                bg="#181825", fg="#a6e3a1", activebackground="#313244",
+                font=("Segoe UI", 9, "bold"), cursor="hand2",
+                command=lambda: activation_dialog.open_activation_dialog(
+                    self, VAULT_DIR,
+                    on_status_change=self._on_license_status_change,
+                    blocking=False,
+                ),
+            )
+            license_btn.pack(side="right", padx=(0, 6))
 
         # Manual specialist override — set to a specialist's id to force it
         # onto every query until the user picks "Auto" again.
@@ -6439,9 +6444,11 @@ class CouncilConsole(tk.Tk):
     # ============================
 
     def _send(self):
-        # Licensing gate — block new deliberations when trial expired
-        # and no license active. Past sessions are still readable.
-        if not self._can_run_deliberation():
+        # Licensing gate — skipped entirely in DEMO_MODE. In product
+        # builds, this blocks new deliberations when trial expired and
+        # no license active; past sessions are still readable.
+        if (not getattr(branding, "DEMO_MODE", False)
+                and not self._can_run_deliberation()):
             from tkinter import messagebox
             choice = messagebox.askyesno(
                 "Activation required",

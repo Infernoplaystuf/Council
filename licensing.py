@@ -371,6 +371,25 @@ def get_status(vault_dir: Path,
     binding is not checked — useful for rare cases where the app needs
     license info without a fingerprint.
     """
+    # DEMO_MODE: home build, no licensing/activation/trial — always granted
+    try:
+        import branding as _b
+        if getattr(_b, "DEMO_MODE", False):
+            return {
+                "status": STATUS_LICENSED,
+                "plan": PLAN_LIFETIME,
+                "expires_at": None,
+                "days_remaining": None,
+                "email": None,
+                "message": "Personal build — no license required.",
+                "can_use_full_features": True,
+                "can_view_existing": True,
+                "device_index": None,
+                "max_devices":  None,
+            }
+    except Exception:
+        pass
+
     # 1) Real license takes priority
     lic = load_license(vault_dir)
     if lic is not None:

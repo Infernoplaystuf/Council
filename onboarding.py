@@ -174,18 +174,15 @@ class OnboardingWizard(tk.Toplevel):
 
     # Step 1: welcome
     def _render_welcome(self):
-        self._heading(f"Welcome to {branding.PRODUCT_NAME}.")
+        self._heading(f"{branding.PRODUCT_NAME} — first launch")
         self._label(branding.PRODUCT_TAGLINE, font=("Segoe UI", 12), pady=(0, 14))
         self._label(
-            "Drop in your sales, inventory, or customer data. Ask questions in "
-            "plain English. A panel of AI specialists deliberates and gives you "
-            "an answer you can trust because every step is visible — and your "
-            "data never leaves this computer.\n\n"
-            "This setup takes about three minutes. We'll:\n"
-            "   • Confirm you have enough disk space\n"
+            "Quick walkthrough — about three minutes. We'll:\n"
+            "   • Confirm there's enough disk space for an AI model\n"
             "   • Detect or help install Ollama (the local AI engine)\n"
-            "   • Make sure a usable model is available\n\n"
-            "You can skip setup and configure manually later."
+            "   • Pull a usable model so the panel can answer\n\n"
+            "Everything runs locally; nothing leaves this machine.\n\n"
+            "Skip if you'd rather configure things by hand."
         )
 
     # Step 2: disk space warning
@@ -350,17 +347,16 @@ class OnboardingWizard(tk.Toplevel):
 
     # Step 5: ready
     def _render_ready(self):
-        self._heading("You're all set.")
+        self._heading("Ready.")
         self._label(
-            f"{branding.PRODUCT_NAME} is ready to use. Three ways to start:\n\n"
-            "   1. Drop a CSV onto the Grapher tab — the Analyst will pick a "
-            "chart and tell you what it sees.\n"
-            "   2. Click Load Sample on the Grapher to try the tool on a "
-            "synthetic purchase-orders dataset first.\n"
-            "   3. Switch to the Council tab and ask a question about your "
-            "data in plain English — the panel will deliberate and answer.\n\n"
-            "If anything misbehaves, the Apothecary tab is your first stop.\n\n"
-            "Click Finish to start using the application.",
+            "Three ways to start poking at it:\n\n"
+            "   1. Drop a CSV onto the Grapher tab — the Analyst suggests a "
+            "chart and tells you what it sees.\n"
+            "   2. Click 📦 Sample on the Grapher for some bundled fake data "
+            "if you don't have a file handy.\n"
+            "   3. Council tab → ask a question in plain English. The panel "
+            "deliberates and gives you an answer.\n\n"
+            "Click Finish.",
             pady=(0, 14),
         )
 

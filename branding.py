@@ -13,41 +13,50 @@ from pathlib import Path
 from typing import Dict
 
 
+# ---- Mode --------------------------------------------------------------------
+# DEMO_MODE switches off everything customer-product-flavoured:
+#   • Licensing / trial / activation gates (all calls return "personal use")
+#   • Auto-update check (server URL is forced empty)
+#   • "Buy"/"Activate" entry points in the UI
+#   • Crash reporter "Email to support" button (keeps the local save option)
+#
+# When this branch lives at home, leave it on. When you flip a build into
+# the commercial channel, set DI_DEMO_MODE=0.
+DEMO_MODE = os.environ.get("DI_DEMO_MODE", "1").lower() not in ("0", "false", "no")
+
+
 # ---- Identity ----------------------------------------------------------------
 
 PRODUCT_NAME    = os.environ.get("COUNCIL_PRODUCT_NAME", "Data's Inferno")
 PRODUCT_SHORT   = os.environ.get("COUNCIL_PRODUCT_SHORT", "Data's Inferno")
 PRODUCT_TAGLINE = os.environ.get(
     "COUNCIL_TAGLINE",
-    "A panel of AI specialists that reviews, charts, and explains your business data."
+    "An AI panel for poking at my own data."
 )
 PRODUCT_PITCH   = os.environ.get(
     "COUNCIL_PITCH",
-    "Drop in your sales, inventory, or customer data. Ask questions in plain English. "
-    "Get charts, summaries, and insights from a panel of AI analysts that runs entirely "
-    "on your computer — your data never leaves the machine."
+    "Drop in a CSV, ask a question. A panel of AI specialists deliberates "
+    "and gives you an answer you can poke at because every step is visible. "
+    "Runs locally — your data stays on this machine."
 )
-VERSION         = "1.0.0-rc1"
+VERSION         = "1.0.0-home"
 COPYRIGHT       = "© 2026"
 SUPPORT_EMAIL   = os.environ.get("COUNCIL_SUPPORT_EMAIL", "")
 WEBSITE         = os.environ.get("COUNCIL_WEBSITE",       "")
 
 # URL of the JSON manifest used by the auto-updater. Empty disables
-# update checks entirely. Override via DI_UPDATE_MANIFEST_URL env var
-# at build time (so different release channels can point at different
-# manifests without rebuilding).
-UPDATE_MANIFEST_URL = os.environ.get(
-    "DI_UPDATE_MANIFEST_URL",
-    "",   # disabled by default until you have a hosting URL
+# update checks entirely. Forced empty in DEMO_MODE so a home build
+# never phones home.
+UPDATE_MANIFEST_URL = "" if DEMO_MODE else os.environ.get(
+    "DI_UPDATE_MANIFEST_URL", "",
 )
 
 # URL of the activation server (the small Flask service in
-# tools/license_server.py that you'll deploy somewhere). Empty falls
-# back to LocalActivationServer (mints tokens locally — useful for
-# development; no device-limit enforcement).
-ACTIVATION_SERVER_URL = os.environ.get(
-    "DI_ACTIVATION_SERVER_URL",
-    "",   # set to e.g. "https://activate.datas-inferno.app" at build time
+# tools/license_server.py). Empty falls back to LocalActivationServer
+# (mints tokens locally — fine for personal use). Forced empty in
+# DEMO_MODE so a home build never reaches out.
+ACTIVATION_SERVER_URL = "" if DEMO_MODE else os.environ.get(
+    "DI_ACTIVATION_SERVER_URL", "",
 )
 
 

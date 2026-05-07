@@ -233,10 +233,24 @@ def show_dialog(parent, crash_path: Path) -> None:
 
     body = tk.Frame(win, bg=win["bg"])
     body.pack(fill="both", expand=True, padx=14, pady=8)
-    tk.Label(body,
-             text="The crash log has been saved on this machine. "
-                  "Nothing has been sent. You can review the log below "
-                  "and choose to save a copy or email it to support.",
+
+    # Body text differs between demo and product builds
+    try:
+        import branding as _b
+        is_demo = bool(getattr(_b, "DEMO_MODE", False))
+    except Exception:
+        is_demo = False
+
+    body_text = (
+        "The crash log has been saved on this machine. "
+        "Open the folder to inspect the trace, or save a copy elsewhere "
+        "if you want to dig in later."
+        if is_demo else
+        "The crash log has been saved on this machine. "
+        "Nothing has been sent. You can review the log below "
+        "and choose to save a copy or email it to support."
+    )
+    tk.Label(body, text=body_text,
              bg=win["bg"], fg=muted, wraplength=600,
              justify="left").pack(anchor="w", pady=(0, 8))
 
@@ -310,5 +324,6 @@ def show_dialog(parent, crash_path: Path) -> None:
 
     ttk.Button(btns, text="📁 Open folder",   command=_open_folder).pack(side="left")
     ttk.Button(btns, text="💾 Save copy…",     command=_save_copy ).pack(side="left", padx=6)
-    ttk.Button(btns, text="✉ Email to support", command=_email_support).pack(side="left", padx=6)
+    if not is_demo:
+        ttk.Button(btns, text="✉ Email to support", command=_email_support).pack(side="left", padx=6)
     ttk.Button(btns, text="Dismiss",           command=win.destroy).pack(side="right")
