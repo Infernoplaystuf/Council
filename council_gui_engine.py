@@ -2903,11 +2903,23 @@ class CouncilConsole(tk.Tk):
             self.rag_count_label.configure(text=f"Chunks indexed: {count}")
 
     def _agent_log_append(self, phase: str, msg: str):
-        self.agent_log.configure(state="normal")
-        tag = "result" if "PASS" in msg or "✓" in msg else ("fail" if "FAIL" in msg or "error" in msg.lower() else "phase")
-        self.agent_log.insert("end", f"[{phase}] {msg}\n", tag)
-        self.agent_log.see("end")
-        self.agent_log.configure(state="disabled")
+        # The agent log only exists when the Agents tab is built (advanced
+        # mode). In the consumer build the widget is absent, so silently
+        # skip — the events still go to the transcript via the normal
+        # routing in _poll_ui_queue.
+        if not hasattr(self, "agent_log"):
+            return
+        try:
+            self.agent_log.configure(state="normal")
+            tag = ("result" if "PASS" in msg or "✓" in msg
+                   else ("fail" if "FAIL" in msg or "error" in msg.lower()
+                         else "phase"))
+            self.agent_log.insert("end", f"[{phase}] {msg}\n", tag)
+            self.agent_log.see("end")
+            self.agent_log.configure(state="disabled")
+        except tk.TclError:
+            # Widget was destroyed mid-callback
+            pass
 
     # ============================================================
     # Personal Specialists tab
@@ -5707,7 +5719,15 @@ class CouncilConsole(tk.Tk):
         widget.configure(state="normal")
         widget.delete("1.0", "end")
         widget.insert("1.0", text)
-        if widget not in (self.input, self.ide_code, self.stt_out, self.session_preview):
+        # Editable widgets stay editable. Build the tuple from attributes
+        # that actually exist — ide_code is advanced-only and missing in
+        # the consumer build.
+        editable = []
+        for attr in ("input", "ide_code", "stt_out", "session_preview"):
+            w = getattr(self, attr, None)
+            if w is not None:
+                editable.append(w)
+        if widget not in editable:
             widget.configure(state="disabled")
 
     def _append_transcript(self, who: str, text: str, kind: str = "final"):
@@ -7247,15 +7267,23 @@ class CouncilConsole(tk.Tk):
                             self._set_judge(txt + _chg_block)
 
                 elif kind == "ide_fill":
-                    _, code = item
-                    self.ide_code.delete("1.0", "end")
-                    self.ide_code.insert("1.0", code)
+                    # IDE tab is advanced-only; ignore the fill event in
+                    # consumer builds. Code still appears in the transcript.
+                    if hasattr(self, "ide_code"):
+                        _, code = item
+                        try:
+                            self.ide_code.delete("1.0", "end")
+                            self.ide_code.insert("1.0", code)
+                        except tk.TclError:
+                            pass
 
                 elif kind == "set_script_name":
                     _, base = item
                     base = _safe_script_basename(base)
                     self.current_script_name = base
-                    self.script_name_var.set(base)
+                    if hasattr(self, "script_name_var"):
+                        try: self.script_name_var.set(base)
+                        except tk.TclError: pass
                     self._append_transcript("Librarian", f"Script named: {base}.py", "final")
 
                 elif kind == "memory_update":
@@ -8411,13 +8439,26 @@ class CouncilConsole(tk.Tk):
     # ---- Node status ----
 
     def _refresh_nodes_async(self):
+        # The Nodes tab only exists in advanced mode. In the consumer
+        # build the dispatcher still works, but there's no UI to update —
+        # so skip the probe entirely. This is also called on startup
+        # (self.after(2000, ...)) so the guard is critical.
+        if not hasattr(self, "tab_nodes"):
+            return
         def worker():
             statuses = self.dispatcher.probe_all()
             self.ui_q.put(("nodes_result", statuses))
         threading.Thread(target=worker, daemon=True).start()
-        self.nodes_status_label.configure(text="Probing…")
+        if hasattr(self, "nodes_status_label"):
+            try:
+                self.nodes_status_label.configure(text="Probing…")
+            except tk.TclError:
+                pass
 
     def _populate_nodes_tree(self, statuses: List[ce.NodeStatus]):
+        # No-op when the Nodes tab isn't built (consumer mode)
+        if not hasattr(self, "nodes_tree"):
+            return
         for row in self.nodes_tree.get_children():
             self.nodes_tree.delete(row)
         for s in statuses:
