@@ -2,20 +2,31 @@
 # data_index.py  —  cross-file value/column/relationship search
 # ============================================================
 # A small in-memory index over every loadable data file in the
-# vault and the bundled samples. Built lazily on first use, then
+# configured input folders. Built lazily on first use, then
 # refreshed on demand.
 #
-# What it does:
-#   • Profile each file: columns, types, row count, sample values
+# Read/write separation (the safety guarantee):
+#   • Reads happen ONLY from configured input paths — typically
+#     vault/data_in/ and assets/sample_data/.
+#   • Writes (derived data, exports, joined tables) go ONLY to
+#     vault/data_out/ via safe_write_path().
+#   • The two never overlap. The DataIndex constructor validates
+#     this at startup and refuses to instantiate if they do.
+#
+# What this module does:
+#   • Profile each input file: columns, types, row count, sample
+#     values per column
 #   • Find a value across all files (full-text scan with column hits)
 #   • Find files that share a column name (relationship detection)
 #   • Cross-reference: given (file, key_col, key_value), pull rows
 #     from OTHER files where any column matches that value
 #
-# What it doesn't do:
-#   • Run actual SQL joins (the cross-reference returns rows; it's the
-#     Council's job to interpret them)
-#   • Index XLSX/JSON robustly — best-effort, CSV/TSV is the primary
+# What this module does NOT do:
+#   • Modify any input file (impossible by construction — the index
+#     never opens an input file in write mode)
+#   • Run actual SQL joins (we surface matching rows; the Council
+#     interprets them)
+#   • Index XLSX robustly — best-effort, CSV/TSV/JSON is the primary
 #     target
 # ============================================================
 
@@ -23,11 +34,156 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+
+# ============================================================
+# Folder constants — the read/write contract
+# ============================================================
+# These are subfolder *names*; resolve them against a vault root via
+# input_dirs(vault) / output_dir(vault) below.
+
+INPUT_SUBFOLDER  = "data_in"     # user puts CSVs here, app NEVER writes
+OUTPUT_SUBFOLDER = "data_out"    # app writes here, never reads for index
+
+# README content written into each folder so the user understands the
+# split when they open them in a file browser.
+_README_INPUT = """\
+data_in/  —  read-only by Data's Inferno
+==========================================
+
+Drop your CSV / TSV / JSON files in here. The app reads them but will
+NEVER overwrite, rename, or delete them. They're yours.
+
+Supported formats:
+  • .csv  (most common — what every accounting tool exports)
+  • .tsv  (tab-separated)
+  • .json (list-of-objects shape)
+
+Files dropped here become searchable in the Council:
+  • Cross-file value lookup ("find C1234")
+  • Foreign-key style relationship detection (columns shared by 2+ files)
+  • Auto-charting via the Grapher tab
+
+Anything Data's Inferno produces from these files (charts, exports,
+joined tables) goes to ../data_out/ — never back into this folder.
+"""
+
+_README_OUTPUT = """\
+data_out/  —  app-managed output folder
+==========================================
+
+This is where Data's Inferno writes anything derived from your input
+data:
+
+  • charts/      — exported chart images
+  • exports/     — CSV exports from the Grapher
+  • joined/      — derived datasets when you join multiple inputs
+
+You can clean this folder out any time without losing original data.
+The originals live in ../data_in/ and are never touched.
+"""
+
+
+# ============================================================
+# Folder-API helpers
+# ============================================================
+
+def input_dir(vault_dir: Path) -> Path:
+    """The user's read-only input folder under the vault."""
+    return Path(vault_dir) / INPUT_SUBFOLDER
+
+
+def output_dir(vault_dir: Path) -> Path:
+    """The app's write-only output folder under the vault."""
+    return Path(vault_dir) / OUTPUT_SUBFOLDER
+
+
+def bundled_samples_dir() -> Path:
+    """The read-only sample-data folder shipped alongside the app."""
+    return Path(__file__).parent / "assets" / "sample_data"
+
+
+def init_data_dirs(vault_dir: Path) -> None:
+    """
+    Create vault/data_in/ and vault/data_out/ on first launch and drop
+    a README in each so the user understands the split. Idempotent —
+    safe to call on every start-up.
+    """
+    in_d  = input_dir(vault_dir)
+    out_d = output_dir(vault_dir)
+    in_d.mkdir(parents=True, exist_ok=True)
+    out_d.mkdir(parents=True, exist_ok=True)
+    # Common subfolders the app may write to
+    (out_d / "charts").mkdir(exist_ok=True)
+    (out_d / "exports").mkdir(exist_ok=True)
+    # Write README only if not present (don't clobber user edits)
+    rd_in  = in_d  / "README.txt"
+    rd_out = out_d / "README.txt"
+    if not rd_in.exists():
+        try: rd_in.write_text(_README_INPUT, encoding="utf-8")
+        except Exception: pass
+    if not rd_out.exists():
+        try: rd_out.write_text(_README_OUTPUT, encoding="utf-8")
+        except Exception: pass
+
+
+def is_under(child: Path, parent: Path) -> bool:
+    """True if `child` is the same as `parent` or nested inside it."""
+    try:
+        c = Path(child).resolve()
+        p = Path(parent).resolve()
+    except OSError:
+        return False
+    try:
+        c.relative_to(p)
+        return True
+    except ValueError:
+        return False
+
+
+def migrate_loose_vault_files(vault_dir: Path,
+                               extensions: Iterable[str] = (".csv", ".tsv", ".json"),
+                               *, copy_only: bool = True) -> List[Path]:
+    """
+    Find any data files at the vault root (NOT inside any subfolder)
+    and put them into vault/data_in/ so the new pipeline can see them.
+
+    `copy_only=True` (the default) preserves originals at vault root —
+    we never silently move user data. The caller can choose to clean up
+    after confirming with the user.
+
+    Returns the list of files migrated.
+    """
+    vault = Path(vault_dir)
+    in_d  = input_dir(vault)
+    in_d.mkdir(parents=True, exist_ok=True)
+    moved: List[Path] = []
+    if not vault.exists():
+        return moved
+    for p in vault.iterdir():
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in {e.lower() for e in extensions}:
+            continue
+        dest = in_d / p.name
+        if dest.exists():
+            continue   # don't overwrite anything already in data_in/
+        try:
+            if copy_only:
+                import shutil
+                shutil.copy2(p, dest)
+            else:
+                p.rename(dest)
+            moved.append(p)
+        except Exception:
+            pass
+    return moved
 
 
 # ============================================================
@@ -78,9 +234,89 @@ class DataIndex:
     _RX_DATE  = re.compile(r"^\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}(:\d{2})?)?$")
     _RX_BOOL  = re.compile(r"^(true|false|yes|no|y|n|1|0)$", re.IGNORECASE)
 
-    def __init__(self, search_roots: Iterable[Path]):
-        self.search_roots = [Path(r) for r in search_roots]
+    def __init__(self, search_roots: Iterable[Path],
+                 *, write_root: Optional[Path] = None):
+        """
+        Construct the index.
+
+          search_roots — folders to read from (read-only by contract)
+          write_root   — folder for derived outputs. Used by safe_write_path()
+                          and validated against search_roots so a misconfig
+                          cannot cause writes into the input area.
+
+        Raises ValueError if any search root overlaps with the write root.
+        That's the safety guarantee — there is no way to construct an
+        index that could write back over a configured input.
+        """
+        self.search_roots: List[Path] = [Path(r) for r in search_roots]
+        self.write_root: Optional[Path] = Path(write_root) if write_root else None
+
+        # Enforce: no input root may sit underneath the write root, and
+        # the write root may not sit underneath any input root.
+        if self.write_root is not None:
+            for r in self.search_roots:
+                if is_under(r, self.write_root):
+                    raise ValueError(
+                        f"DataIndex misconfig: input root {r} is inside "
+                        f"the write root {self.write_root} — input data "
+                        f"could be overwritten by the app.")
+                if is_under(self.write_root, r):
+                    raise ValueError(
+                        f"DataIndex misconfig: write root {self.write_root} "
+                        f"is inside input root {r} — derived outputs would "
+                        f"be picked up as inputs on the next refresh.")
+
         self._profiles: Dict[Path, FileProfile] = {}
+
+    # ---- Read-only path validator ----------------------------------
+
+    def is_input_path(self, path: Path) -> bool:
+        """True if `path` is inside any configured input root."""
+        for r in self.search_roots:
+            if is_under(path, r):
+                return True
+        return False
+
+    def safe_write_path(self, filename: str, *, subfolder: str = "") -> Path:
+        """
+        Return a fully-qualified path under the write root. Refuses to
+        produce a path that would land inside any input root, and refuses
+        traversal sequences in `filename`.
+
+        Use for any derived output (joined CSVs, exports, etc.):
+            out = idx.safe_write_path("orders_with_returns.csv",
+                                       subfolder="joined")
+            out.write_text(...)
+        """
+        if self.write_root is None:
+            raise RuntimeError(
+                "DataIndex has no write_root configured — pass one to "
+                "the constructor before calling safe_write_path().")
+        # Normalise filename: only the basename allowed
+        basename = os.path.basename(filename or "").strip()
+        if not basename or basename in (".", ".."):
+            raise ValueError(f"Invalid output filename: {filename!r}")
+        # Subfolder may be a single name or a/b — but never an absolute
+        # path or one with traversal segments
+        sub = (subfolder or "").strip()
+        if sub:
+            sub_parts = [seg for seg in Path(sub).parts
+                         if seg and seg not in (".", "..", "/", "\\")]
+            target_dir = self.write_root.joinpath(*sub_parts)
+        else:
+            target_dir = self.write_root
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target = target_dir / basename
+        # Triple-check: the resolved path must be under write_root and
+        # not under any input root.
+        if not is_under(target, self.write_root):
+            raise RuntimeError(
+                f"safe_write_path resolved outside write_root — refusing.")
+        if self.is_input_path(target):
+            raise RuntimeError(
+                f"safe_write_path resolved inside an input root — refusing "
+                f"to overwrite input data.")
+        return target
 
     # ---- Discovery + loading ---------------------------------------
 

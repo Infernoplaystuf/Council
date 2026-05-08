@@ -1964,14 +1964,31 @@ class CouncilConsole(tk.Tk):
         # Personal Specialists — config-only registry, persists to vault/specialists.json
         # Seeds 3 defaults (Sales / Inventory / Customer) on first run.
         self.specialists = _spec.SpecialistRegistry(VAULT_DIR)
-        # Cross-file data index — profiles every CSV/JSON in the vault and
-        # bundled samples; supports value search, column lookup, and
-        # foreign-key style relationship detection. Built lazily on first
-        # query so it doesn't slow startup.
-        self.data_index = data_index.DataIndex([
-            VAULT_DIR,
-            Path(__file__).parent / "assets" / "sample_data",
-        ])
+
+        # ── Read/write split for user data ─────────────────────────
+        # Inputs land in vault/data_in/ (read-only by the app — it
+        # never overwrites or deletes anything in there). Derived
+        # outputs go to vault/data_out/. The DataIndex constructor
+        # validates the two never overlap.
+        data_index.init_data_dirs(VAULT_DIR)
+        # One-time migration: copy any loose CSV/JSON at the vault
+        # root into data_in/ so they're discoverable. Originals stay
+        # put — we never silently move user data.
+        try:
+            migrated = data_index.migrate_loose_vault_files(VAULT_DIR)
+            if migrated:
+                print(f"[DataIndex] Copied {len(migrated)} loose data file(s) "
+                      f"from vault root into data_in/")
+        except Exception as e:
+            print(f"[DataIndex] Migration skipped: {e}")
+
+        self.data_index = data_index.DataIndex(
+            search_roots=[
+                data_index.input_dir(VAULT_DIR),
+                data_index.bundled_samples_dir(),
+            ],
+            write_root=data_index.output_dir(VAULT_DIR),
+        )
         self.librarian = ce.Librarian(VAULT_DIR, LOG_PATH)
         self.runner = ce.LocalRunner(WORKSPACE_DIR)
         self.speech = ce.SpeechToText(model_size="base")
@@ -3002,10 +3019,12 @@ class CouncilConsole(tk.Tk):
                   ).pack(anchor="w", padx=10, pady=4)
         btnrow = ttk.Frame(foot)
         btnrow.pack(fill="x", padx=10, pady=(0, 6))
-        ttk.Button(btnrow, text="\U0001f4c2 Manage files (Vault tab)",
-                   command=lambda: self.nb.select(self.tab_vmgr)
-                                    if hasattr(self, "tab_vmgr") else None
+        ttk.Button(btnrow, text="\U0001f4c2 Open data_in folder",
+                   command=self._open_data_in_folder
                    ).pack(side="left")
+        ttk.Button(btnrow, text="\U0001f4e4 Open data_out folder",
+                   command=self._open_data_out_folder
+                   ).pack(side="left", padx=4)
 
         # Initial population
         self._spec_refresh_list()
@@ -3043,14 +3062,40 @@ class CouncilConsole(tk.Tk):
             self._spec_listbox.activate(0)
         self._spec_show_selected()
 
+    def _open_data_in_folder(self):
+        """Open the user's read-only input folder in the OS file manager."""
+        self._open_in_filemanager(data_index.input_dir(VAULT_DIR))
+
+    def _open_data_out_folder(self):
+        """Open the app's output folder in the OS file manager."""
+        self._open_in_filemanager(data_index.output_dir(VAULT_DIR))
+
+    def _open_in_filemanager(self, path):
+        """Cross-platform 'reveal in file manager'. Best-effort, never raises."""
+        try:
+            from pathlib import Path as _P
+            target = _P(path)
+            target.mkdir(parents=True, exist_ok=True)
+            import subprocess, sys as _sys
+            if _sys.platform == "win32":
+                subprocess.Popen(["explorer", str(target)])
+            elif _sys.platform == "darwin":
+                subprocess.Popen(["open", str(target)])
+            else:
+                subprocess.Popen(["xdg-open", str(target)])
+        except Exception as e:
+            print(f"[OpenFolder] Could not open {path}: {e}")
+
     def _spec_refresh_pool_stats(self):
         """Show how many files are in the vault knowledge pool."""
         try:
             files = self._vault_data_files()
             n = len(files)
             self._spec_pool_stats.set(
-                f"{n} file{'s' if n != 1 else ''} in vault and bundled samples. "
-                f"All specialists see the same data."
+                f"{n} file{'s' if n != 1 else ''} readable.  Inputs come from "
+                f"data_in/ and bundled samples (read-only).  Anything the "
+                f"app produces lands in data_out/ — originals are never "
+                f"overwritten."
             )
         except Exception:
             self._spec_pool_stats.set(
@@ -6245,9 +6290,17 @@ class CouncilConsole(tk.Tk):
         return [t for t in terms if t and len(t) > 2 and t not in self._DATA_QUERY_STOPS]
 
     def _vault_data_files(self):
-        """All loadable data files in the vault and bundled sample data."""
+        """
+        All loadable data files we're allowed to read. Strict read scope:
+        only vault/data_in/ and the bundled samples — not the rest of
+        vault/ where the app's internal state lives. This keeps inputs
+        cleanly separated from anything the app might overwrite.
+        """
         exts = {".csv", ".tsv", ".xlsx", ".xls", ".json", ".npy", ".npz"}
-        roots = [VAULT_DIR, Path(__file__).parent / "assets" / "sample_data"]
+        roots = [
+            data_index.input_dir(VAULT_DIR),
+            data_index.bundled_samples_dir(),
+        ]
         files = []
         seen = set()
         for root in roots:
@@ -6255,10 +6308,6 @@ class CouncilConsole(tk.Tk):
                 continue
             for p in root.rglob("*"):
                 if not p.is_file() or p.suffix.lower() not in exts:
-                    continue
-                # Skip vault internals
-                s = str(p).replace("\\", "/")
-                if "/.git/" in s or "/.chromadb/" in s or "/.cache/" in s:
                     continue
                 if p in seen:
                     continue

@@ -103,17 +103,42 @@ You can edit them in the 🎓 Specialists tab. Each one is just config: name, ic
 
 ```
 vault/
-├── conversations/          one JSONL per session
-├── memory/                 per-personality persistent notes
+├── data_in/                ← MY DATA  (read-only by the app)
+│   └── *.csv / *.json      drop input files here
+├── data_out/               ← APP OUTPUTS  (charts, exports, joins)
+│   ├── charts/
+│   └── exports/
+├── conversations/          one JSONL per session  (app internal)
+├── memory/                 per-personality persistent notes (app internal)
 ├── logs/                   council.log + crash logs
 ├── workspace/              code-runner scratch files
-├── graph_output/           Grapher exports
 ├── .chromadb/              vector index (RAG memory)
 ├── .git_clones/            cloned reference repos
 └── specialists.json        the specialist registry
 ```
 
-All gitignored. Delete the folder to reset.
+The hard rule: **input data is never overwritten**.
+
+- `data_in/` is the single read source for the data search / lookup /
+  Find-and-Chart pipeline. The app reads from here and never writes
+  back. Drop your CSVs in this folder.
+- `data_out/` is the only place those features write to. Every chart
+  export, joined dataset, or derived CSV lands here. You can wipe it
+  any time without losing originals.
+- `bundled samples` (`assets/sample_data/`) are also read as inputs —
+  same read-only contract, but they live with the app rather than in
+  the vault.
+
+The split is enforced in code: the `DataIndex` constructor refuses to
+instantiate if its read paths overlap with its write path, and
+`safe_write_path()` refuses to produce a path that would land inside
+`data_in/`.
+
+All of `vault/` is gitignored. Delete the folder to reset.
+
+The 🎓 Specialists tab has **📂 Open data_in folder** and **📤 Open
+data_out folder** buttons that pop the OS file manager so I never have
+to hunt for them.
 
 ---
 
