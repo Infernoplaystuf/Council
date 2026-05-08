@@ -240,18 +240,27 @@ def show_dialog(parent, crash_path: Path) -> None:
              bg=win["bg"], fg=muted, wraplength=600,
              justify="left").pack(anchor="w", pady=(0, 8))
 
-    # Log viewer (read-only)
-    txt = tk.Text(body, wrap="none", height=14,
-                  bg="#11111b", fg=fg, insertbackground=fg,
+    # Log viewer (read-only). The text + scrollbars live in their own
+    # subframe that uses grid; the surrounding `body` uses pack. Mixing
+    # pack and grid in the same parent throws TclError.
+    log_frame = tk.Frame(body, bg=body["bg"])
+    log_frame.pack(fill="both", expand=True)
+    try:
+        import branding as _b
+        ibg = _b.get_theme("dark")["input_bg"]
+    except Exception:
+        ibg = "#0f0c0c"
+    txt = tk.Text(log_frame, wrap="none", height=14,
+                  bg=ibg, fg=fg, insertbackground=fg,
                   relief="flat", font=("Consolas", 9))
-    sb_y = ttk.Scrollbar(body, orient="vertical", command=txt.yview)
-    sb_x = ttk.Scrollbar(body, orient="horizontal", command=txt.xview)
+    sb_y = ttk.Scrollbar(log_frame, orient="vertical", command=txt.yview)
+    sb_x = ttk.Scrollbar(log_frame, orient="horizontal", command=txt.xview)
     txt.configure(yscrollcommand=sb_y.set, xscrollcommand=sb_x.set)
     txt.grid(row=0, column=0, sticky="nsew")
     sb_y.grid(row=0, column=1, sticky="ns")
     sb_x.grid(row=1, column=0, sticky="ew")
-    body.rowconfigure(0, weight=1)
-    body.columnconfigure(0, weight=1)
+    log_frame.rowconfigure(0, weight=1)
+    log_frame.columnconfigure(0, weight=1)
     txt.insert("1.0", text)
     txt.configure(state="disabled")
 
