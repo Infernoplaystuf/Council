@@ -142,6 +142,18 @@ to hunt for them.
 
 ---
 
+## If something seems stuck after a `git pull`
+
+Python caches compiled bytecode in `__pycache__/`. If the cache somehow ends up newer than the source (rare, but happens with certain git operations or editor mtime quirks), Python uses the cached bytecode and your fix doesn't take effect. The launcher auto-purges stale caches on startup — but if you want to force-clean:
+
+```bash
+python clean.py
+```
+
+Then relaunch.
+
+---
+
 ## Things to know
 
 - Models swap = slow. By default every personality runs on the same Ollama model so the GPU/RAM keeps one model hot. If you have 32 GB+ and want to mix in a code-specialist model for the Coder role, edit `vault/personality_backends.json`.

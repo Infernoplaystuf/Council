@@ -8901,7 +8901,51 @@ def main():
     app.mainloop()
 
 
+def _purge_stale_pycache():
+    """
+    Defensive clean-up against a Python gotcha: if a .pyc file ends up
+    NEWER than its .py source (can happen after some git operations,
+    file-system mtime resets, or editor weirdness), Python keeps using
+    the stale bytecode and a fix won't take effect.
+
+    On launch, scan our own folder for any pyc/py pairs where the pyc is
+    newer, and delete the offending pyc. The next import recompiles.
+    Costs ~50 ms; saves an entire debugging session when something
+    goes weird.
+
+    Note: by the time this runs, council_gui_engine.pyc itself has
+    already been loaded — so we can't unstick our own module from
+    here. But every other module imported by main() benefits, AND
+    deleting our stale .pyc means the user's NEXT launch is correct
+    even if THIS one isn't.
+    """
+    try:
+        from pathlib import Path as _P
+        root = _P(__file__).resolve().parent
+        cache_root = root / "__pycache__"
+        if not cache_root.exists():
+            return
+        cleared = 0
+        for pyc in cache_root.glob("*.pyc"):
+            stem = pyc.stem.split(".cpython")[0]
+            src = root / f"{stem}.py"
+            if not src.exists():
+                continue
+            try:
+                if pyc.stat().st_mtime > src.stat().st_mtime + 0.5:
+                    pyc.unlink()
+                    cleared += 1
+            except OSError:
+                pass
+        if cleared:
+            print(f"[Cache] Cleared {cleared} stale .pyc file(s) — "
+                  f"if a fix still seems missing, restart once more.")
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
+    _purge_stale_pycache()
     print("=" * 60)
     print(f" {branding.PRODUCT_NAME} v{branding.VERSION}")
     print(f" {branding.PRODUCT_TAGLINE}")
