@@ -1,0 +1,6 @@
+supplier_name,contact_email,phone,country,lead_time_days,on_time_rate,active_since,credit_terms
+Acme Supply,orders@acmesupply.example,+1-555-679-3950,US,10,0.74,2022-02-22,COD
+BoltCo,orders@boltco.example,+1-555-799-4945,Canada,30,0.76,2022-08-02,Net 45
+Hilltop Ind.,orders@hilltopind.example,+1-555-570-5183,Vietnam,7,0.95,2022-08-10,Net 45
+Northbridge,orders@northbridge.example,+1-555-793-9955,US,7,0.83,2021-12-08,COD
+TradeWorks,orders@tradeworks.example,+1-555-406-7951,Vietnam,14,0.84,2021-09-10,Net 30

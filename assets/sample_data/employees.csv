@@ -1,0 +1,15 @@
+employee_id,name,role,hire_date,region,email,salary
+E100,Drew Patel,Sales Rep,2021-05-13,Midwest,drew.patel@inferno.example,51074
+E101,Taylor Garcia,Sales Rep,2022-01-02,Northeast,taylor.garcia@inferno.example,51033
+E102,Drew Diaz,Sales Rep,2024-04-12,Central,drew.diaz@inferno.example,45712
+E103,Riley Chen,Senior Sales Rep,2021-05-23,Southeast,riley.chen@inferno.example,65767
+E104,Taylor Murphy,Senior Sales Rep,2024-08-06,Central,taylor.murphy@inferno.example,65217
+E105,Taylor Diaz,Account Manager,2024-11-12,Central,taylor.diaz@inferno.example,77745
+E106,Riley Garcia,Account Manager,2023-09-28,Midwest,riley.garcia@inferno.example,76827
+E107,Skyler Brooks,Warehouse,2021-04-05,Southeast,skyler.brooks@inferno.example,45216
+E108,Sage Singh,Warehouse,2023-02-17,Southeast,sage.singh@inferno.example,41276
+E109,Taylor Sanchez,Warehouse,2023-02-10,Northeast,taylor.sanchez@inferno.example,39837
+E110,Riley Patel,Owner,2023-03-28,Midwest,riley.patel@inferno.example,113942
+E111,Reese Park,Admin,2021-06-19,West,reese.park@inferno.example,57977
+E112,Quinn Patel,Support,2023-05-07,Central,quinn.patel@inferno.example,47645
+E113,Casey Brooks,Support,2024-09-30,Midwest,casey.brooks@inferno.example,52066

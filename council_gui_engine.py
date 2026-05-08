@@ -35,6 +35,7 @@ import licensing
 import activation_dialog
 import updater
 import splash
+import data_index
 
 # ── Agent modules (graceful optional imports) ─────────────────
 try:
@@ -1963,6 +1964,14 @@ class CouncilConsole(tk.Tk):
         # Personal Specialists — config-only registry, persists to vault/specialists.json
         # Seeds 3 defaults (Sales / Inventory / Customer) on first run.
         self.specialists = _spec.SpecialistRegistry(VAULT_DIR)
+        # Cross-file data index — profiles every CSV/JSON in the vault and
+        # bundled samples; supports value search, column lookup, and
+        # foreign-key style relationship detection. Built lazily on first
+        # query so it doesn't slow startup.
+        self.data_index = data_index.DataIndex([
+            VAULT_DIR,
+            Path(__file__).parent / "assets" / "sample_data",
+        ])
         self.librarian = ce.Librarian(VAULT_DIR, LOG_PATH)
         self.runner = ce.LocalRunner(WORKSPACE_DIR)
         self.speech = ce.SpeechToText(model_size="base")
@@ -2448,6 +2457,9 @@ class CouncilConsole(tk.Tk):
         ttk.Button(btns, text="Send  [Ctrl+Enter]", command=self._send).pack(side="left")
         ttk.Button(btns, text="\U0001f4ca Find & Chart",
                    command=self._council_find_and_chart_button
+                   ).pack(side="left", padx=6)
+        ttk.Button(btns, text="\U0001f50d Look Up",
+                   command=self._council_lookup_button
                    ).pack(side="left", padx=6)
         ttk.Button(btns, text="Clear", command=lambda: self._set_text(self.input, "")).pack(side="left", padx=6)
 
@@ -6206,6 +6218,23 @@ class CouncilConsole(tk.Tk):
         "by week", "by day", "by category", "compare", "histogram",
     )
 
+    # Substrings that signal the user is asking for a value lookup or
+    # a connection between files — handled by the data index instead of
+    # the deliberation. Faster, deterministic, no LLM round-trip.
+    _LOOKUP_QUERY_TRIGGERS = (
+        "look up", "lookup", "find ", "search ", "search for",
+        "where is", "who is", "who are", "whose ", "which file",
+        "across files", "linked to", "connection between",
+        "tell me about", "what about",
+    )
+
+    def _looks_like_lookup_question(self, query: str) -> bool:
+        ql = query.lower()
+        # Don't trigger lookup if it's clearly chart-shaped
+        if self._looks_like_data_question(query):
+            return False
+        return any(t in ql for t in self._LOOKUP_QUERY_TRIGGERS)
+
     def _looks_like_data_question(self, query: str) -> bool:
         ql = query.lower()
         return any(t in ql for t in self._DATA_QUERY_TRIGGERS)
@@ -6329,6 +6358,169 @@ class CouncilConsole(tk.Tk):
         self._set_text(self.input, "")
         self._append_transcript("User", query)
         self._council_find_and_chart(query)
+
+    # ============================
+    # Look Up — cross-file value/column search
+    # ============================
+    # Treat the input as either a literal value (lookup) or a column
+    # name (column membership) and surface every file that mentions it,
+    # including cross-references between files. The Council itself isn't
+    # invoked — this is a deterministic scan of indexed data, useful for
+    # answers that don't need a deliberation.
+
+    def _council_lookup_button(self):
+        """Button handler — runs the lookup against the input box value."""
+        query = self.input.get("1.0", "end").strip()
+        if not query:
+            return
+        self._set_text(self.input, "")
+        self._append_transcript("User", query)
+        self._council_run_lookup(query)
+
+    def _council_run_lookup(self, query: str):
+        """Execute the lookup, post results to transcript, and pop a results window."""
+        # Refresh the index lazily — picks up new files that arrived in
+        # the vault since startup (e.g. user just dropped a CSV in).
+        self._append_transcript("Council",
+            "Looking up across indexed files…", "observation")
+        try:
+            self.data_index.refresh()
+        except Exception as e:
+            self._append_transcript("Council",
+                f"Could not refresh data index: {e}", "final")
+            return
+
+        # Two queries in parallel — value search and column-name search.
+        # The popup shows both; the more useful set bubbles to the top.
+        value_hits  = self.data_index.search_value(query, max_per_file=25)
+        col_hits    = self.data_index.find_files_with_column(query)
+        relationships = self.data_index.find_relationships()
+
+        if not value_hits and not col_hits:
+            self._append_transcript("Council",
+                f"No matches for {query!r} in any indexed file. "
+                "Try the Vault tab to add the data first, or use Grapher → "
+                "Sample to explore the bundled demo CSVs.", "final")
+            return
+
+        # Summarise into the transcript — one line per hit
+        lines: list = []
+        if value_hits:
+            lines.append("Value matches:")
+            for h in value_hits[:6]:
+                cols = ", ".join(h["column_hits"][:4])
+                lines.append(f"  • {h['file']} — {h['matched_count']} row(s)  (in: {cols})")
+        if col_hits:
+            lines.append("Files with that column:")
+            for prof, exact in col_hits[:6]:
+                lines.append(f"  • {prof.name} — column “{exact}”")
+        self._append_transcript("Council", "\n".join(lines), "observation")
+
+        # Open the detailed results window
+        self._lookup_show_window(query, value_hits, col_hits, relationships)
+
+    def _lookup_show_window(self, query, value_hits, col_hits, relationships):
+        """Detailed read-only window showing matches + connection map."""
+        win = tk.Toplevel(self)
+        win.title(f"Look Up — {query}")
+        win.geometry("780x520")
+        try: branding.apply_window_icon(win)
+        except Exception: pass
+        try:
+            t = branding.get_theme("dark")
+            win.configure(bg=t["bg"])
+            fg, bg, abg, mfg = t["fg"], t["bg"], t["panel_bg"], t["muted_fg"]
+        except Exception:
+            fg, bg, abg, mfg = "#d4d4d4", "#1a1414", "#231a1a", "#7a7575"
+
+        # Header
+        head = tk.Frame(win, bg=abg)
+        head.pack(fill="x")
+        tk.Label(head, text=f"\U0001f50d  Look Up", font=("Segoe UI", 14, "bold"),
+                 bg=abg, fg=fg).pack(side="left", padx=14, pady=10)
+        tk.Label(head, text=f"query: {query}",
+                 bg=abg, fg=mfg, font=("Consolas", 10)).pack(side="left", padx=8)
+
+        # Tabs: Matches | Files with column | Relationships
+        nb = ttk.Notebook(win)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # ---- Matches tab ---------------------------------------
+        matches_tab = ttk.Frame(nb)
+        nb.add(matches_tab, text=f"Matches  ({sum(h['matched_count'] for h in value_hits)})")
+        if not value_hits:
+            tk.Label(matches_tab,
+                     text=f"No rows contain the value {query!r} in any indexed file.",
+                     bg=bg, fg=mfg, wraplength=720, justify="left",
+                     ).pack(anchor="w", padx=12, pady=12)
+        else:
+            txt = self._make_text(matches_tab, height=24, wrap="none")
+            txt.pack(fill="both", expand=True, padx=8, pady=8)
+            for h in value_hits:
+                txt.insert("end",
+                    f"━━ {h['file']}  ({h['matched_count']} row(s) "
+                    f"of {h['row_count']:,} match in: "
+                    f"{', '.join(h['column_hits'])}) ━━\n")
+                # Render up to 5 rows per file
+                for row in h["rows"][:5]:
+                    parts = "  |  ".join(
+                        f"{k}={v}" for k, v in row.items() if v
+                    )
+                    txt.insert("end", "  " + parts[:240] + "\n")
+                if len(h["rows"]) > 5:
+                    txt.insert("end",
+                        f"  …and {h['matched_count'] - 5} more (raise max_per_file to see all)\n")
+                txt.insert("end", "\n")
+            txt.configure(state="disabled")
+
+        # ---- Column tab ----------------------------------------
+        col_tab = ttk.Frame(nb)
+        nb.add(col_tab, text=f"Column Match  ({len(col_hits)})")
+        if not col_hits:
+            tk.Label(col_tab, text=f"No file has a column named like {query!r}.",
+                     bg=bg, fg=mfg, wraplength=720, justify="left",
+                     ).pack(anchor="w", padx=12, pady=12)
+        else:
+            txt = self._make_text(col_tab, height=24)
+            txt.pack(fill="both", expand=True, padx=8, pady=8)
+            for prof, exact in col_hits:
+                col = next((c for c in prof.columns if c.name == exact), None)
+                samples = ", ".join(col.sample_values[:6]) if col else ""
+                txt.insert("end",
+                    f"• {prof.name}\n"
+                    f"    column:    {exact}  ({col.inferred_type if col else 'text'})\n"
+                    f"    samples:   {samples}\n"
+                    f"    distinct:  {col.distinct_count if col else 0}\n\n")
+            txt.configure(state="disabled")
+
+        # ---- Relationships tab --------------------------------
+        rel_tab = ttk.Frame(nb)
+        nb.add(rel_tab, text=f"Connections  ({len(relationships)})")
+        if not relationships:
+            tk.Label(rel_tab,
+                     text="No cross-file column matches detected. Add more "
+                          "data files to the vault to enable relationship "
+                          "detection.",
+                     bg=bg, fg=mfg, wraplength=720, justify="left",
+                     ).pack(anchor="w", padx=12, pady=12)
+        else:
+            txt = self._make_text(rel_tab, height=24)
+            txt.pack(fill="both", expand=True, padx=8, pady=8)
+            txt.insert("end",
+                "Columns that appear in 2+ files — likely foreign-key links:\n\n")
+            for r in relationships:
+                files = " · ".join(f["name"] for f in r["files"])
+                examples = ", ".join(r["examples"][:4])
+                txt.insert("end",
+                    f"• {r['column']}\n"
+                    f"    files:    {files}\n"
+                    f"    examples: {examples}\n\n")
+            txt.configure(state="disabled")
+
+        # Footer — close
+        bf = ttk.Frame(win)
+        bf.pack(fill="x", padx=8, pady=(0, 8), side="bottom")
+        ttk.Button(bf, text="Close", command=win.destroy).pack(side="right")
 
     def _council_find_and_chart(self, query: str = "") -> bool:
         """
@@ -6530,6 +6722,14 @@ class CouncilConsole(tk.Tk):
                 self._set_status("● grapher", "#a6e3a1")
                 return
             # else fall through to regular deliberation
+
+        # Look-up shaped questions skip the deliberation in favour of a
+        # fast deterministic search across the data index. The Council
+        # learned a long time ago not to wake the panel for "find X".
+        if self._looks_like_lookup_question(user_text):
+            self._council_run_lookup(user_text)
+            self._set_status("● lookup", "#a6e3a1")
+            return
 
         # ── Personal Specialists: detect which (if any) to summon ──────
         # Auto-match by domain keywords. Manual override (UI dropdown) wins
