@@ -1971,9 +1971,21 @@ class CouncilConsole(tk.Tk):
         # outputs go to vault/data_out/. The DataIndex constructor
         # validates the two never overlap.
         data_index.init_data_dirs(VAULT_DIR)
-        # One-time migration: copy any loose CSV/JSON at the vault
+        # Sweep: an earlier version of the migration helper copied
+        # app-internal config files (specialists.json, node_registry.json,
+        # etc.) into data_in/. Clean them out here so the dropdown stays
+        # showing only real user data.
+        try:
+            cleaned = data_index.cleanup_misplaced_internals(VAULT_DIR)
+            if cleaned:
+                print(f"[DataIndex] Removed {len(cleaned)} stray app-config "
+                      f"file(s) from data_in/")
+        except Exception as e:
+            print(f"[DataIndex] Cleanup skipped: {e}")
+        # One-time migration: copy any loose user CSV/JSON at the vault
         # root into data_in/ so they're discoverable. Originals stay
-        # put — we never silently move user data.
+        # put — we never silently move user data. App-internal config
+        # filenames are excluded.
         try:
             migrated = data_index.migrate_loose_vault_files(VAULT_DIR)
             if migrated:
@@ -2405,9 +2417,15 @@ class CouncilConsole(tk.Tk):
         sb.pack(side="right", fill="y")
         self.transcript.pack(fill="both", expand=True)
 
-        # Right: judge + live stream preview
+        # Right: judge + live stream preview.
+        # In DEMO_MODE the chat is a single-personality Q&A — no panel,
+        # no verdicts — so the right pane isn't useful to show. We still
+        # CREATE the widgets so downstream code that calls _set_judge or
+        # _vfb_show stays safe; we just don't add the pane to the layout.
+        _demo = bool(getattr(branding, "DEMO_MODE", False))
         right = ttk.Frame(paned)
-        paned.add(right, minsize=280)
+        if not _demo:
+            paned.add(right, minsize=280)
 
         ttk.Label(right, text="Judge Panel").pack(anchor="w")
         self.judge_box = self._make_text(right, wrap="word", width=40, state="disabled", height=14)
@@ -2513,7 +2531,12 @@ class CouncilConsole(tk.Tk):
         # Populate now and refresh whenever the registry changes
         self._spec_pin_refresh()
 
-        self.var_deliberate      = tk.BooleanVar(value=True)
+        # In DEMO_MODE the chat is single-personality (Writer wears any
+        # active specialist lens). The deliberation toggle is forced off
+        # at run-time anyway (see _send), but defaulting it here keeps
+        # the hidden state consistent should any code peek at it.
+        _demo = bool(getattr(branding, "DEMO_MODE", False))
+        self.var_deliberate      = tk.BooleanVar(value=not _demo)
         self.var_tools           = tk.BooleanVar(value=False)
         self.var_fill_ide        = tk.BooleanVar(value=True)
         self.var_stream          = tk.BooleanVar(value=True)
@@ -2525,22 +2548,31 @@ class CouncilConsole(tk.Tk):
         self.var_robust_voices.trace_add("write", self._on_voice_toggle)
 
         # ── Toolbar row 1: core toggles ───────────────────────────────
-        ttk.Checkbutton(btns, text="Deliberation",    variable=self.var_deliberate).pack(side="left", padx=4)
+        # Deliberation/Adversarial/Judge-panel only make sense for the
+        # multi-personality build. Hidden in DEMO_MODE for a clean
+        # ask-a-question UX.
+        if not _demo:
+            ttk.Checkbutton(btns, text="Deliberation",    variable=self.var_deliberate).pack(side="left", padx=4)
         ttk.Checkbutton(btns, text="Tools",           variable=self.var_tools).pack(side="left", padx=4)
         ttk.Checkbutton(btns, text="Fill IDE",        variable=self.var_fill_ide).pack(side="left", padx=4)
         ttk.Checkbutton(btns, text="Stream tokens",   variable=self.var_stream).pack(side="left", padx=4)
-        ttk.Checkbutton(btns, text="Adversarial",     variable=self.var_adversarial).pack(side="left", padx=4)
-        ttk.Checkbutton(btns, text="Judge panel ✦",   variable=self.var_judge_panel).pack(side="left", padx=4)
+        if not _demo:
+            ttk.Checkbutton(btns, text="Adversarial",     variable=self.var_adversarial).pack(side="left", padx=4)
+            ttk.Checkbutton(btns, text="Judge panel ✦",   variable=self.var_judge_panel).pack(side="left", padx=4)
 
         # ── Toolbar row 2: personality controls ──────────────────────
-        btns2 = ttk.Frame(bottom)
-        btns2.pack(fill="x", pady=(2, 0))
-        ttk.Label(btns2, text="Personalities:", foreground="#6c7086").pack(side="left", padx=(4,2))
-        ttk.Checkbutton(btns2, text="Robust voices ✦",
-                        variable=self.var_robust_voices).pack(side="left", padx=4)
-        ttk.Label(btns2,
-                  text="(gives each personality a distinct character and tone)",
-                  foreground="#6c7086", font=("", 8)).pack(side="left", padx=4)
+        # Robust-voices switch makes the panel members sound distinct —
+        # not relevant when there's only one personality answering, so
+        # it's hidden in DEMO_MODE.
+        if not _demo:
+            btns2 = ttk.Frame(bottom)
+            btns2.pack(fill="x", pady=(2, 0))
+            ttk.Label(btns2, text="Personalities:", foreground="#6c7086").pack(side="left", padx=(4,2))
+            ttk.Checkbutton(btns2, text="Robust voices ✦",
+                            variable=self.var_robust_voices).pack(side="left", padx=4)
+            ttk.Label(btns2,
+                      text="(gives each personality a distinct character and tone)",
+                      foreground="#6c7086", font=("", 8)).pack(side="left", padx=4)
 
         # ── Council instructions bar ─────────────────────────────
         inst_row = ttk.Frame(bottom)
@@ -3380,7 +3412,11 @@ class CouncilConsole(tk.Tk):
         self._analyst_personality  = None
         self._grapher_file_paths   = []
         self._last_html_path       = None
-        self._grapher_output_dir   = VAULT_DIR / "graph_output"
+        # Charts and exports land in vault/data_out/charts/ — the
+        # write-only output area. Keep the legacy graph_output path
+        # NO LONGER as the default; data_out is the single sanctioned
+        # output destination per the read/write split.
+        self._grapher_output_dir   = data_index.output_dir(VAULT_DIR) / "charts"
         self._grapher_plot_history  = []          # [(label, Path), ...]  — #1 history/pin
         self._grapher_transforms    = []          # [{"op":..,"cols":[],"params":{}}]  — #4
         self._grapher_live_job      = None        # after() id for live-reload  — #8
@@ -3773,20 +3809,59 @@ class CouncilConsole(tk.Tk):
     # ── Grapher helpers ───────────────────────────────────────────────────────
 
     def _grapher_refresh_files(self):
+        """
+        Populate the file dropdown from the read-only data_in/ folder.
+        Used to show every CSV anywhere under VAULT_DIR; that scope was
+        wide enough to pick up app-internal state files. Now restricted
+        to the same input scope as the data index — vault/data_in/ —
+        so the dropdown only ever shows files the user dropped in
+        themselves.
+
+        We bypass gd.scan_vault_for_data because that helper filters out
+        paths whose parents start with "." — which excludes everything
+        under ~/.council where the vault actually lives. We do our own
+        walk to find loadable files inside data_in.
+        """
         if not _GRAPHER_OK:
             return
-        files  = gd.scan_vault_for_data(VAULT_DIR)
-        labels = [str(p.relative_to(VAULT_DIR)) for p in files]
+        in_dir = data_index.input_dir(VAULT_DIR)
+        in_dir.mkdir(parents=True, exist_ok=True)
+        files = []
+        # Hide our own folder explainer — it's not a data file the
+        # user wants to load.
+        _hidden_names = {"README.txt", "README.md"}
+        for p in in_dir.rglob("*"):
+            if not p.is_file():
+                continue
+            if p.name in _hidden_names:
+                continue
+            try:
+                if gd.DataLoader.can_load(p):
+                    files.append(p)
+            except Exception:
+                continue
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        labels = []
+        for p in files:
+            try:
+                labels.append(str(p.relative_to(in_dir)))
+            except ValueError:
+                labels.append(str(p))
         self._grapher_file_cb["values"] = labels
         self._grapher_file_paths        = files
         n = len(files)
         self._grapher_status_var.set(
-            f"{n} data file{'s' if n != 1 else ''} in vault")
+            f"{n} file{'s' if n != 1 else ''} in data_in/  "
+            f"(read-only — drop CSVs there)")
 
     def _grapher_browse_file(self):
         import tkinter.filedialog as fd
+        # Default to vault/data_in/ — that's the user's input folder
+        in_dir = data_index.input_dir(VAULT_DIR)
+        in_dir.mkdir(parents=True, exist_ok=True)
         path_str = fd.askopenfilename(
             title="Open data file",
+            initialdir=str(in_dir),
             filetypes=[
                 ("All supported",
                  "*.csv *.tsv *.xlsx *.xls *.json *.npy *.npz *.txt *.log"),
@@ -3889,12 +3964,19 @@ class CouncilConsole(tk.Tk):
         sel = self._grapher_file_var.get()
         if not sel:
             return
+        in_dir = data_index.input_dir(VAULT_DIR)
         for p in self._grapher_file_paths:
+            # Match against the file relative to data_in/, the bare name,
+            # or the full path — supports labels coming from any origin.
             try:
-                rel = str(p.relative_to(VAULT_DIR))
+                rel_in = str(p.relative_to(in_dir))
             except ValueError:
-                rel = str(p)
-            if rel == sel or p.name == sel or str(p) == sel:
+                rel_in = ""
+            try:
+                rel_vault = str(p.relative_to(VAULT_DIR))
+            except ValueError:
+                rel_vault = ""
+            if sel in (rel_in, rel_vault, p.name, str(p)):
                 self._grapher_do_load(p)
                 return
 
@@ -4165,9 +4247,13 @@ class CouncilConsole(tk.Tk):
         import tkinter.filedialog as fd
         ds           = self._grapher_dataset
         default_name = f"{ds.name}_{spec.plot_type}.{fmt}"
+        # Default destination: data_out/charts/ (the app's write area).
+        out_dir = data_index.output_dir(VAULT_DIR) / "charts"
+        out_dir.mkdir(parents=True, exist_ok=True)
         path_str     = fd.asksaveasfilename(
             title=f"Export {fmt.upper()}",
             defaultextension=f".{fmt}",
+            initialdir=str(out_dir),
             initialfile=default_name,
             filetypes=[(fmt.upper(), f"*.{fmt}"), ("All files", "*.*")],
         )
@@ -4515,8 +4601,11 @@ class CouncilConsole(tk.Tk):
     def _grapher_overlay_browse(self):
         """Browse for an overlay file."""
         import tkinter.filedialog as fd
+        in_dir = data_index.input_dir(VAULT_DIR)
+        in_dir.mkdir(parents=True, exist_ok=True)
         path_str = fd.askopenfilename(
             title="Open overlay file",
+            initialdir=str(in_dir),
             filetypes=[("All supported",
                         "*.csv *.tsv *.xlsx *.xls *.json *.npy *.npz *.txt"),
                        ("All files", "*.*")],
@@ -6912,12 +7001,27 @@ class CouncilConsole(tk.Tk):
                 use_deliberation  = bool(self.var_deliberate.get())  if hasattr(self, "var_deliberate")  else True
                 use_adversarial   = bool(self.var_adversarial.get()) if hasattr(self, "var_adversarial") else False
 
+                # DEMO_MODE forces single-personality direct mode regardless
+                # of the toggle — the home build is "ask a question, get an
+                # answer", not a multi-AI deliberation.
+                if getattr(branding, "DEMO_MODE", False):
+                    use_deliberation = False
+
                 # ── Fast path: Deliberation toggle OFF ─────────────────
-                # Skips the full orchestrator → direct Writer response.
-                # Useful for quick Q&A or when speed matters more than depth.
+                # Skips the full orchestrator → direct Writer response with
+                # any active Personal Specialist lens applied as extra
+                # context. Quick Q&A, no panel debate.
                 if not use_deliberation:
-                    self.ui_q.put(("agent_phase", "direct", "▶ Direct mode (deliberation off)"))
-                    answer = self.writer.respond(user_text)
+                    self.ui_q.put(("agent_phase", "direct",
+                                   "▶ Direct mode"))
+                    extra = ""
+                    active_specs = list(getattr(self, "_active_specialists", []) or [])
+                    if active_specs:
+                        try:
+                            extra = self._build_specialist_overlay(active_specs)
+                        except Exception:
+                            extra = ""
+                    answer = self.writer.respond(user_text, extra_context=extra)
                     ev = AgentEvent("Writer", "final", answer)
                     self.ui_q.put(("live_event", ev))
                     self.ui_q.put(("judge_final", ""))

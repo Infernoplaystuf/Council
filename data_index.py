@@ -147,12 +147,32 @@ def is_under(child: Path, parent: Path) -> bool:
         return False
 
 
+# Filenames that are app-internal config and should never be migrated
+# into the user's data_in/ folder, even though their extension matches
+# the data-file extensions we look for (.json especially).
+_APP_INTERNAL_FILENAMES = {
+    "specialists.json",
+    "license.json",
+    "activation.json",
+    "node_registry.json",
+    "personality_backends.json",
+    "council_instructions.json",
+    "content_style.json",
+    "idea_settings.json",
+    "idea_model_config.json",
+    "verdict_history.jsonl",
+}
+
+
 def migrate_loose_vault_files(vault_dir: Path,
                                extensions: Iterable[str] = (".csv", ".tsv", ".json"),
                                *, copy_only: bool = True) -> List[Path]:
     """
-    Find any data files at the vault root (NOT inside any subfolder)
+    Find any user data files at the vault root (NOT inside any subfolder)
     and put them into vault/data_in/ so the new pipeline can see them.
+
+    Skips files whose name matches a known app-internal config so we
+    don't pollute data_in/ with state like specialists.json.
 
     `copy_only=True` (the default) preserves originals at vault root —
     we never silently move user data. The caller can choose to clean up
@@ -171,6 +191,8 @@ def migrate_loose_vault_files(vault_dir: Path,
             continue
         if p.suffix.lower() not in {e.lower() for e in extensions}:
             continue
+        if p.name in _APP_INTERNAL_FILENAMES:
+            continue
         dest = in_d / p.name
         if dest.exists():
             continue   # don't overwrite anything already in data_in/
@@ -184,6 +206,32 @@ def migrate_loose_vault_files(vault_dir: Path,
         except Exception:
             pass
     return moved
+
+
+def cleanup_misplaced_internals(vault_dir: Path) -> List[Path]:
+    """
+    A previous version of migrate_loose_vault_files copied app-internal
+    config files (specialists.json, node_registry.json, etc.) into
+    data_in/. This helper removes them from data_in/ — they're already
+    living at the proper place under vault/, so deleting the data_in/
+    copy is safe.
+
+    Returns the list of removed paths.
+    """
+    in_d = input_dir(Path(vault_dir))
+    if not in_d.exists():
+        return []
+    removed: List[Path] = []
+    for name in _APP_INTERNAL_FILENAMES:
+        p = in_d / name
+        if not p.exists():
+            continue
+        try:
+            p.unlink()
+            removed.append(p)
+        except Exception:
+            pass
+    return removed
 
 
 # ============================================================
