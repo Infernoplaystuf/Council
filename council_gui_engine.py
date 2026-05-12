@@ -12,6 +12,17 @@ from __future__ import annotations
 
 import json as _json
 import os
+# Demo siloing: prevent the council from pulling cross-session memory into prompts.
+# Memory files stay on disk; they just are not injected during the demo.
+os.environ.setdefault('COUNCIL_DEMO_SILO', '1')
+# Single-voice mode: only the Writer speaks. No specialists, no multi-role
+# panel deliberation surfaced to the user. The Writer still gets every piece
+# of injected context (files, vault matches, analyst results).
+os.environ.setdefault('COUNCIL_SINGLE_VOICE', '1')
+
+
+def _single_voice_mode():
+    return os.environ.get('COUNCIL_SINGLE_VOICE', '').strip().lower() in ('1', 'true', 'yes', 'on')
 import queue
 import re as _re
 import subprocess
@@ -225,7 +236,7 @@ def _user_wants_code(query: str) -> bool:
     # Must have at least one action word AND one code-context word together
     action_words  = {"write", "create", "make", "build", "generate", "implement",
                      "modify", "edit", "update", "fix", "refactor", "patch"}
-    code_words    = {"script", "function", "class", "program", "code", "file",
+    code_words    = {"script", "function", "class", "program", "code",
                      ".py", ".sh", ".bat", "def ", "import "}
     has_action = any(w in q for w in action_words)
     has_code   = any(w in q for w in code_words)
@@ -261,6 +272,266 @@ def _strip_code_blocks(text: str) -> str:
     return cleaned
 
 
+
+# ---- File injection -------------------------------------------------------
+# Detects file paths in the user message, reads them, and prepends their
+# contents so every council member sees the actual data rather than
+# hallucinating about it.
+
+_FILE_PATH_RE = _re.compile(r'[a-zA-Z]:[/\\]\S+|/\S+')
+_FILE_READ_CHAR_LIMIT = 12000  # total chars per file in the injected block
+
+
+def _read_file_for_injection(path_str):
+    """Read a file into a compact prompt block. CSVs get headers + sample
+    rows; large rows are abbreviated so the header line always survives the
+    model's context window."""
+    try:
+        import csv as _csv_fi
+        p = Path(path_str.strip())
+        if not p.exists() or not p.is_file():
+            return None
+        suffix = p.suffix.lower()
+        if suffix == '.csv':
+            with open(p, newline='', encoding='utf-8', errors='replace') as fh:
+                reader = _csv_fi.reader(fh)
+                rows = list(reader)
+            if not rows:
+                return None
+            header = rows[0]
+            data_rows = rows[1:]
+            total_rows = len(data_rows)
+
+            lines = ['Columns (' + str(len(header)) + '): ' + ', '.join(header)]
+            lines.append('Total data rows: ' + str(total_rows))
+            sample_n = min(20, total_rows)
+            if sample_n:
+                lines.append('Sample rows (first ' + str(sample_n) + '):')
+                for r in data_rows[:sample_n]:
+                    cells = []
+                    for c in r:
+                        c = str(c).replace('\n', ' ').strip()
+                        if len(c) > 80:
+                            c = c[:77] + '...'
+                        cells.append(c)
+                    lines.append(' | '.join(cells))
+            content = '\n'.join(lines)
+            if len(content) > _FILE_READ_CHAR_LIMIT:
+                content = content[:_FILE_READ_CHAR_LIMIT] + '\n... (truncated)'
+        else:
+            with open(p, encoding='utf-8', errors='replace') as fh:
+                content = fh.read(_FILE_READ_CHAR_LIMIT)
+            if len(content) == _FILE_READ_CHAR_LIMIT:
+                content += '\n... (truncated)'
+        if not content.strip():
+            return None
+        return '[FILE: ' + p.name + ']\n' + content + '\n[END FILE]'
+    except Exception:
+        return None
+
+
+def _extract_file_paths(text):
+    import unicodedata as _ud
+    clean_chars = []
+    for ch in text:
+        if ch in ('\\', '/', '.', '~', ':'):
+            clean_chars.append(ch)
+        elif _ud.category(ch) in ('Pi', 'Pf', 'Po', 'Ps', 'Pe') or ch in ('<', '>'):
+            clean_chars.append(' ')
+        else:
+            clean_chars.append(ch)
+    clean = ''.join(clean_chars)
+    paths = []
+    seen = set()
+    for m in _FILE_PATH_RE.finditer(clean):
+        candidate = m.group(0).strip()
+        while candidate and not (candidate[-1].isalnum() or candidate[-1] in '\\/'):
+            candidate = candidate[:-1]
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            paths.append(candidate)
+    return paths
+
+
+def _inject_file_contents(user_text):
+    """Augment the user message with file/vault context before deliberation.
+
+    Returns (augmented_text, fuzzy_matches) where fuzzy_matches is a dict
+    mapping each unmatched query token to the list of (suggestion, score)
+    tuples used to expand the search. Caller can surface these to the UI
+    for review.
+    """
+    import sys as _sys_dbg
+    print('[DEBUG inject] called with: ' + repr(user_text[:80]), file=_sys_dbg.stderr)
+
+    explicit_paths = _extract_file_paths(user_text)
+    print('[DEBUG inject] explicit paths: ' + str(explicit_paths), file=_sys_dbg.stderr)
+
+    injections = []
+    fuzzy_matches = {}
+    for path_str in explicit_paths:
+        snippet = _read_file_for_injection(path_str)
+        if snippet:
+            injections.append(snippet)
+
+    folder_scope = _detect_folder_scope(user_text)
+    do_vault_search = (
+        not explicit_paths
+        or folder_scope is not None
+        or _vault_search_keywords(user_text)
+    )
+    if do_vault_search:
+        idx = _get_vault_index()
+        if idx is not None:
+            try:
+                idx.rebuild()
+                hits, fuzzy_matches = idx.search(user_text, k=5, folder=folder_scope)
+                print('[DEBUG inject] vault hits: '
+                      + str([(round(s, 2), h.get("name")) for s, h in hits]),
+                      file=_sys_dbg.stderr)
+                if fuzzy_matches:
+                    print('[DEBUG inject] fuzzy: ' + repr(fuzzy_matches),
+                          file=_sys_dbg.stderr)
+                for _score, rec in hits:
+                    if rec.get("path") in explicit_paths:
+                        continue
+                    injections.append(idx.summary_block(rec))
+            except Exception as _e:
+                print('[DEBUG inject] vault search failed: ' + repr(_e),
+                      file=_sys_dbg.stderr)
+
+    if not injections:
+        return user_text, fuzzy_matches
+    return '\n\n'.join(injections) + '\n\n' + user_text, fuzzy_matches
+
+
+_FOLDER_RE = _re.compile(
+    r"(?:in(?:side)?|under|within|from)\s+(?:my|the)?\s*"
+    r"(?:folder|directory|dir|subfolder)\s+"
+    r"['\"]?([A-Za-z0-9_\-./\\]+)['\"]?",
+    _re.IGNORECASE,
+)
+_FOLDER_KEYWORD_RE = _re.compile(
+    r"\bfolder[: ]+['\"]?([A-Za-z0-9_\-./\\]+)['\"]?",
+    _re.IGNORECASE,
+)
+
+
+def _detect_folder_scope(text):
+    """If the user references a folder by name, return that folder substring."""
+    for rx in (_FOLDER_KEYWORD_RE, _FOLDER_RE):
+        m = rx.search(text or "")
+        if m:
+            cand = m.group(1).strip().strip("'\"`")
+            if "." not in Path(cand).name or Path(cand).suffix == "":
+                return cand
+    return None
+
+
+_VAULT_TRIGGER_PHRASES = (
+    "look through", "search through", "find files", "find every", "find any",
+    "every file", "any file with", "all files", "across files",
+    "in my vault", "in the vault", "from the vault",
+    "files that contain", "files with", "which files",
+    "list files", "list of files", "scan", "index",
+)
+
+
+def _vault_search_keywords(text):
+    t = (text or "").lower()
+    return any(p in t for p in _VAULT_TRIGGER_PHRASES)
+
+
+_VAULT_INDEX_INSTANCE = None
+
+
+def _get_vault_index():
+    """Lazy-init the vault index. Returns None on import/setup failure."""
+    global _VAULT_INDEX_INSTANCE
+    if _VAULT_INDEX_INSTANCE is not None:
+        return _VAULT_INDEX_INSTANCE
+    try:
+        import vault_index as _vi
+        _VAULT_INDEX_INSTANCE = _vi.VaultIndex(VAULT_DIR)
+    except Exception as _e:
+        import sys as _sys_dbg
+        print('[VaultIndex] init failed: ' + repr(_e), file=_sys_dbg.stderr)
+        _VAULT_INDEX_INSTANCE = None
+    return _VAULT_INDEX_INSTANCE
+
+
+# ---- Data analyst step ----------------------------------------------------
+# Computational questions ("how many", "what percentage", "average X") deserve
+# real numbers, not the model's best guess from a sample. This step asks a
+# local model to write pandas code calling our helpers, executes it in a
+# locked-down sandbox, and returns the result as text the Writer can quote.
+
+def _run_analyst_step(query):
+    """If `query` looks computational, generate pandas code via a local model
+    and execute it sandboxed against the vault's data_in/ folder.
+
+    Returns a formatted [ANALYST RESULT] block, or None if the query isn't
+    computational / the model couldn't generate code / execution failed.
+    """
+    import sys as _sys_dbg
+    try:
+        import vault_analyst as _va
+    except Exception as _e:
+        print('[analyst] import failed: ' + repr(_e), file=_sys_dbg.stderr)
+        return None
+
+    if not _va.looks_computational(query):
+        return None
+
+    try:
+        allowed_folders = [data_index.input_dir(VAULT_DIR)]
+    except Exception:
+        allowed_folders = [VAULT_DIR]
+
+    inventory = _va.preview_csv_inventory(allowed_folders, max_files=15, max_cols=30)
+    prompt = _va.build_pandas_code_prompt(query, allowed_folders, inventory)
+
+    try:
+        import council_engine as _ce
+        coder_model = (_ce.DEFAULT_MODELS.get('coder_primary')
+                       or _ce.DEFAULT_MODELS.get('general_primary')
+                       or _ce.DEFAULT_MODELS.get('coder_fast'))
+        if not coder_model:
+            print('[analyst] no local model available', file=_sys_dbg.stderr)
+            return None
+        raw = _ce._ollama_chat(
+            host=_ce.DEFAULT_OLLAMA_HOST,
+            model=coder_model,
+            messages=[{'role': 'user', 'content': prompt}],
+            temperature=0.0,
+            num_predict=600,
+            timeout=90,
+        )
+    except Exception as _e:
+        print('[analyst] code generation failed: ' + repr(_e), file=_sys_dbg.stderr)
+        return None
+
+    code = _va.extract_python_code(raw)
+    if not code.strip():
+        print('[analyst] empty code from model', file=_sys_dbg.stderr)
+        return None
+    print('[analyst] generated code (first 300):\n' + code[:300], file=_sys_dbg.stderr)
+
+    result_df, log = _va.execute_pandas_code(code, allowed_folders)
+    if result_df is None:
+        print('[analyst] exec failed: ' + log[:400], file=_sys_dbg.stderr)
+        return None
+
+    table_text = _va.format_result_for_prompt(result_df, max_rows=30, max_chars=4000)
+    block = (
+        '[ANALYST RESULT — computed from real CSV data]\n'
+        + 'pandas code:\n' + code.strip() + '\n\n'
+        + 'output:\n' + table_text + '\n'
+        + '[END ANALYST]'
+    )
+    return block
+
+
 _CODE_ROUTES = {"ide", "coder", "intern"}
 
 def _filter_final(text: str, route: str, user_query: str) -> str:
@@ -270,8 +541,6 @@ def _filter_final(text: str, route: str, user_query: str) -> str:
     - The user did not explicitly ask for code.
     Applied after Writer synthesis, before the result reaches the UI.
     """
-    if route in _CODE_ROUTES:
-        return text                          # always allow code on code routes
     if _user_wants_code(user_query):
         return text                          # user asked for code explicitly
     stripped = _strip_code_blocks(text)
@@ -6849,44 +7118,113 @@ class CouncilConsole(tk.Tk):
         self._set_text(self.input, "")
         self._append_transcript("User", user_text)
         self._clear_stream_box()
+        # ── 'forget X' command: reject prior fuzzy matches ─────────────
+        # User can type "forget rockstar" or "forget rockstar, witcher" to
+        # exclude those tokens from future fuzzy expansion. Persists per-vault.
+        _forget_match = _re.match(r"^\s*forget\s+(.+)$", user_text, _re.IGNORECASE)
+        if _forget_match:
+            tokens = [t.strip() for t in _re.split(r"[,\s]+", _forget_match.group(1)) if t.strip()]
+            idx = _get_vault_index()
+            if idx is not None and tokens:
+                added = idx.add_to_fuzzy_denylist(tokens)
+                if added:
+                    self._append_transcript(
+                        "Council",
+                        "OK — these will no longer be used as fuzzy matches: "
+                        + ", ".join(added),
+                        "observation",
+                    )
+                else:
+                    self._append_transcript(
+                        "Council",
+                        "(Those terms were already on the fuzzy denylist.)",
+                        "observation",
+                    )
+            else:
+                self._append_transcript(
+                    "Council",
+                    "(Vault index unavailable — could not record fuzzy rejection.)",
+                    "observation",
+                )
+            self._set_status("● idle")
+            return
+
+        # Inject file contents before routing so every council member sees the data.
+        # Keep the ORIGINAL text for trigger detection — the augmented version
+        # contains injected CSV/JSON content whose values can spuriously match
+        # routing triggers (e.g. "plot" appearing in a game description sends
+        # everything to the Grapher).
+        original_user_text = user_text
+        augmented, fuzzy_matches = _inject_file_contents(user_text)
+        was_injected = augmented != user_text
+        if was_injected:
+            injected_names = [Path(p).name for p in _extract_file_paths(user_text)]
+            if injected_names:
+                self._append_transcript("Council", "Reading: " + ", ".join(injected_names), "observation")
+            else:
+                self._append_transcript("Council", "Reviewing matching vault files...", "observation")
+        if fuzzy_matches:
+            _lines = ["Fuzzy matches used (treated as your spelling):"]
+            for orig, suggestions in fuzzy_matches.items():
+                pairs = ", ".join(f"{m} ({r:.2f})" for m, r in suggestions)
+                _lines.append(f"  • {orig} → {pairs}")
+            _lines.append(
+                "If any are wrong, type:  forget WORD  "
+                "(comma-separated for multiple) — they won't be used again."
+            )
+            self._append_transcript("Council", "\n".join(_lines), "observation")
+        user_text = augmented
+
+        # ── Analyst step: compute real numbers for "how many / what %" queries
+        # The Writer will then quote the actual count instead of guessing.
+        _analyst_block = _run_analyst_step(original_user_text)
+        if _analyst_block:
+            self._append_transcript("Council", "Computing from data...", "observation")
+            user_text = _analyst_block + "\n\n" + user_text
 
         # ── Fast path: chart-shaped questions go straight to the Grapher ──
-        # Detection is heuristic (chart/graph/plot/show me/by month/etc.).
-        # If the user wants the regular deliberation instead they can phrase
-        # the question without those keywords or use the explicit toggle.
-        if self._looks_like_data_question(user_text):
-            handled = self._council_find_and_chart(user_text)
+        # Skip this entirely when we just injected vault context — the user is
+        # asking the council to reason about the data, not graph it.
+        if not was_injected and self._looks_like_data_question(original_user_text):
+            handled = self._council_find_and_chart(original_user_text)
             if handled:
                 self._set_status("● grapher", "#a6e3a1")
                 return
             # else fall through to regular deliberation
 
         # Look-up shaped questions skip the deliberation in favour of a
-        # fast deterministic search across the data index. The Council
-        # learned a long time ago not to wake the panel for "find X".
-        if self._looks_like_lookup_question(user_text):
-            self._council_run_lookup(user_text)
+        # fast deterministic search across the data index. Skipped when we
+        # already injected vault context for the same reason as above.
+        if not was_injected and self._looks_like_lookup_question(original_user_text):
+            self._council_run_lookup(original_user_text)
             self._set_status("● lookup", "#a6e3a1")
             return
 
         # ── Personal Specialists: detect which (if any) to summon ──────
-        # Auto-match by domain keywords. Manual override (UI dropdown) wins
-        # if set. Active specialists are stored on self for the worker to
-        # pick up; their overlays get injected into the lead role's
-        # extra_context via the existing _patch_model machinery.
-        self._active_specialists = self._resolve_active_specialists(user_text)
-        if self._active_specialists:
-            names = ", ".join(f"{s.icon} {s.name}" for s in self._active_specialists)
-            self._append_transcript(
-                "Council",
-                f"Consulting: {names}",
-                "observation",
-            )
+        # In single-voice mode we skip specialists entirely — only the Writer
+        # is heard, and the Writer already has every piece of injected context.
+        if _single_voice_mode():
+            self._active_specialists = []
+        else:
+            self._active_specialists = self._resolve_active_specialists(original_user_text)
+            if self._active_specialists:
+                names = ", ".join(f"{s.icon} {s.name}" for s in self._active_specialists)
+                self._append_transcript(
+                    "Council",
+                    f"Consulting: {names}",
+                    "observation",
+                )
 
         # ── Phase 1: Route (keyword-based, instant) ───────────────────────
-        route = self.judge.route(user_text)
-        self._set_judge(f"Route: {route}\n")
-        self._set_status(f"● {route}…", "#fab387")
+        # In single-voice mode, force the writer route and don't surface the
+        # judge's routing decision to the user.
+        if _single_voice_mode():
+            route = "writer"
+            self._set_status("● writer…", "#fab387")
+        else:
+            route = self.judge.route(user_text)
+            self._set_judge(f"Route: {route}\n")
+            self._set_status(f"● {route}…", "#fab387")
 
         # Tabs only present in advanced mode — fall through to deliberation
         # if the user is on the consumer build (no exposed admin tabs).
@@ -6913,22 +7251,23 @@ class CouncilConsole(tk.Tk):
                 self.nb.select(self.tab_ide)
 
         # ── Phase 2: Panel selection (before worker spawns) ────────────
-        # Resolve the panel HERE in the main thread so the worker can gate
-        # which agent objects it builds — no more Coder on "What is the sun?"
-        _keyword_panel, _synth_role = _panel_for_route(route)
-
-        if self.var_judge_panel.get():
-            # Judge model picks roles — brief synchronous call in main thread.
-            # We show a status update so the user sees something is happening.
-            self._set_status("● judge routing…", "#cba6f7")
-            try:
-                _judge_chosen = self.judge.choose_panel(user_text)
-                if _judge_chosen:
-                    _keyword_panel = _judge_chosen
-                    self._set_judge(f"Judge panel: {_judge_chosen}\n")
-                    self._set_status(f"● panel: {_judge_chosen}…", "#fab387")
-            except Exception as _jpe:
-                self._set_judge(f"Judge panel failed ({_jpe}), using keyword panel\n")
+        # In single-voice mode the panel is just the Writer — no other roles
+        # deliberate, the Writer synthesizes directly from the injected context.
+        if _single_voice_mode():
+            _keyword_panel, _synth_role = ["writer"], "writer"
+        else:
+            _keyword_panel, _synth_role = _panel_for_route(route)
+            if self.var_judge_panel.get():
+                # Judge model picks roles — brief synchronous call in main thread.
+                self._set_status("● judge routing…", "#cba6f7")
+                try:
+                    _judge_chosen = self.judge.choose_panel(user_text)
+                    if _judge_chosen:
+                        _keyword_panel = _judge_chosen
+                        self._set_judge(f"Judge panel: {_judge_chosen}\n")
+                        self._set_status(f"● panel: {_judge_chosen}…", "#fab387")
+                except Exception as _jpe:
+                    self._set_judge(f"Judge panel failed ({_jpe}), using keyword panel\n")
 
         # ── Personality-lead override ────────────────────────────
         # If the user names a specific personality ("with the writer as lead",

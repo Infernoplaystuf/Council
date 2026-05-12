@@ -7,8 +7,10 @@
 from __future__ import annotations
 
 from typing import Dict, Any, Tuple
+import csv
 import json
 import textwrap
+from pathlib import Path
 
 import council_engine as ce
 from agent_core import ModelAgent, ToolFn
@@ -31,6 +33,39 @@ def make_run_python_tool(runner: ce.LocalRunner) -> ToolFn:
         payload = {"rc": rc, "stdout": out, "stderr": err, "path": str(path)}
         return True, msg, payload
 
+    return _tool
+
+
+def make_read_file_tool() -> ToolFn:
+    def _tool(args: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+        path_str = str(args.get("path", "")).strip()
+        if not path_str:
+            return False, "Provide {'path': '/absolute/path/to/file'}", {}
+        p = Path(path_str)
+        if not p.exists():
+            return False, f"File not found: {path_str}", {}
+        if not p.is_file():
+            return False, f"Not a file: {path_str}", {}
+        try:
+            suffix = p.suffix.lower()
+            if suffix == ".csv":
+                rows = []
+                with open(p, newline="", encoding="utf-8", errors="replace") as fh:
+                    reader = csv.reader(fh)
+                    for i, row in enumerate(reader):
+                        rows.append(", ".join(row))
+                        if i >= 200:
+                            rows.append("… (truncated after 200 rows)")
+                            break
+                content = "\n".join(rows)
+            else:
+                with open(p, encoding="utf-8", errors="replace") as fh:
+                    content = fh.read(40_000)
+                if len(content) == 40_000:
+                    content += "\n… (truncated)"
+            return True, content, {"path": str(p), "bytes": p.stat().st_size}
+        except Exception as exc:
+            return False, f"Error reading file: {exc}", {}
     return _tool
 
 
@@ -69,6 +104,7 @@ def make_vault_read_tool(librarian: ce.Librarian) -> ToolFn:
 def build_agents(*, runner: ce.LocalRunner, librarian: ce.Librarian, enable_tools: bool) -> Dict[str, ModelAgent]:
     tools = {
         "run_python": make_run_python_tool(runner),
+        "read_file":  make_read_file_tool(),
         "vault_save": make_vault_save_tool(librarian),
         "vault_list": make_vault_list_tool(librarian),
         "vault_read": make_vault_read_tool(librarian),

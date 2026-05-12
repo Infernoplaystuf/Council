@@ -1,4 +1,4 @@
-# ============================================================
+﻿# ============================================================
 # council_engine.py  —  v2  [DESKTOP BUILD: RTX 5080 16GB / 32GB+ RAM]
 # ============================================================
 # Conda env:
@@ -686,7 +686,8 @@ Route targets: writer | coder | intern | peasant | artist | apothecary | speech 
 Classification → Route:
   CONVERSATIONAL (opinion, explanation, memory, discussion) + short (≤12 words) → chat
   CONVERSATIONAL + needs synthesis/nuance                                         → writer
-  TECHNICAL (code, scripts, debugging, architecture)                              → ide
+  TECHNICAL + user explicitly asks for code/script/function                      → ide
+  TECHNICAL explanation (how things work, debugging theory, architecture discuss)   → sage
   PLANNING (multi-step strategy, project breakdown, decision frameworks)          → strategist
   DOMAIN (fact-check, knowledge base, verified expertise)                         → sage
   CREATIVE (visual, UX, layout, design)                                           → artist
@@ -733,6 +734,12 @@ You are the WRITER of the Council — the voice the user actually hears.
 Your job is to synthesize the deliberation into a single, authoritative response.
 You do not summarize what others said. You own the answer.
 
+PRIMARY ROLE: data analyst over the user’s vault. When a [FILE: ...] block is
+present in the user message, treat it as ground truth. Read the actual contents.
+Describe what is THERE — real column names, real row counts, real values.
+NEVER invent fields, NEVER guess at what a file contains, NEVER fall back to generic
+examples. If a file block is missing or empty, say so plainly and ask for the path.
+
 ═══════════════════════════════════════════
 READ THE QUERY TYPE FIRST
 ═══════════════════════════════════════════
@@ -741,10 +748,11 @@ CONVERSATIONAL (opinion, explanation, chat, memory):
 - Write in natural, confident prose. No bullet lists unless they genuinely help.
 - Be warm and direct — like a knowledgeable colleague, not a documentation bot.
 - Take a position. If council members disagreed, pick the best-supported view and say so.
+- NEVER write code, scripts, or code blocks. Describe data and concepts in prose.
 - Do NOT invent code or scripts that were not asked for.
 - Length: a few sentences to two paragraphs. Concise beats exhaustive.
 
-TECHNICAL (code, scripts, debugging, systems):
+CODE (ONLY when user message explicitly uses words like "write", "create", "script", "function", "code"):
 - Include ONE complete, runnable code block. No partial snippets.
 - Brief intro (1-2 sentences) → code → brief closing note if needed.
 - If a filename is needed: short safe snake_case ending in .py
@@ -1804,6 +1812,13 @@ class PersonalityModel:
         if self.memory_manager is not None:
             proj_mem = self.memory_manager.read(_PROJECT_MEMORY_KEY)
 
+        # Demo silo: keep memory files on disk, but skip cross-session injection.
+        if os.environ.get('COUNCIL_DEMO_SILO', '').strip().lower() in ('1', 'true', 'yes', 'on'):
+            mem = ''
+            proj_mem = ''
+            prior_txt = ''
+            history_txt = ''
+
         prefix_parts = []
         if mem.strip():
             prefix_parts.append("ROLE MEMORY (maintain consistency):\n" + mem.strip())
@@ -2539,7 +2554,7 @@ def _parse_ranking_json(raw: str) -> Dict[str, Any]:
             text = text.strip()
     # Find the first {...} blob
     import re as _re
-    m = _re.search(r"\{.*\}", text, _re.DOTALL)
+    m = re.search(r"\{.*\}", text, _re.DOTALL)
     if m:
         try:
             return _json.loads(m.group(0))
@@ -2664,7 +2679,7 @@ class JudgeModel(PersonalityModel):
         import re as _re
         if "Verdict: PASS" in critique:
             return []
-        m = _re.search(
+        m = re.search(
             r"REQUIRED_CHANGES:\s*\n((?:\s*-\s*.+\n?)+)",
             critique,
         )
@@ -3006,22 +3021,93 @@ DEFAULT_PI_HOSTS: List[str] = [h.strip() for h in _PI_HOSTS_RAW.split(",") if h.
 #   ollama pull qwen2.5:7b-instruct-q4_K_M
 #
 # Override any model via environment variable (see names below).
-DEFAULT_MODELS = {
-    # Desktop — primary synthesis/knowledge roles (32B, single-slot)
-    "general_primary":   os.environ.get("COUNCIL_MODEL_GENERAL_PRIMARY",   "qwen2.5:32b-instruct-q4_K_M"),
-    # Desktop — reasoning/analysis roles (14B, dual-slot)
-    "general_alt":       os.environ.get("COUNCIL_MODEL_GENERAL_ALT",       "qwen2.5:14b-instruct-q4_K_M"),
-    # Desktop — code specialist
-    "coder_primary":     os.environ.get("COUNCIL_MODEL_CODER_PRIMARY",     "qwen2.5-coder:14b-instruct-q4_K_M"),
-    # Desktop — fast roles (phi4: judge, peasant, intern)
-    "coder_fast":        os.environ.get("COUNCIL_MODEL_CODER_FAST",        "phi4"),
-    "judge_fast":        os.environ.get("COUNCIL_MODEL_JUDGE_FAST",        "phi4"),
-    "peasant_fast":      os.environ.get("COUNCIL_MODEL_PEASANT_FAST",      "phi4"),
-    # Pi 5 16GB — runs 14B comfortably for Sage/Strategist offload
-    "pi_heavy":          os.environ.get("COUNCIL_MODEL_PI_HEAVY",          "qwen2.5:14b-instruct-q4_K_M"),
-    # Pi 5 8GB — fast lightweight roles
-    "pi_fast":           os.environ.get("COUNCIL_MODEL_PI_FAST",           "phi4"),
-}
+def _detect_ollama_models(host: str) -> List[str]:
+    """Return list of model names currently installed on the Ollama host."""
+    try:
+        url = host.rstrip("/") + "/api/tags"
+        with urllib.request.urlopen(url, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        return [m["name"] for m in data.get("models", [])]
+    except Exception:
+        return []
+
+
+def _model_param_count(name: str) -> float:
+    """
+    Estimate parameter count (in billions) from a model name string.
+    Returns 0 if not detectable. Used only for sorting, not for matching.
+    e.g. "qwen2.5:14b-instruct-q4_K_M" → 14.0, "llama3.2:3b" → 3.0
+    """
+    m = re.search(r"[:\-_](\d+(?:\.\d+)?)[bB]", name)
+    if m:
+        return float(m.group(1))
+    # check for plain leading number like "7b" in base name
+    m = re.search(r"(\d+(?:\.\d+)?)[bB]", name)
+    return float(m.group(1)) if m else 0.0
+
+
+def _is_coder_model(name: str) -> bool:
+    return any(kw in name.lower() for kw in ("coder", "code", "codellama", "deepseek-coder", "starcoder"))
+
+
+def _assign_models(available: List[str]) -> Dict[str, str]:
+    """
+    Assign role slots to available models purely by size and type,
+    with no hardwired model names. Env var overrides still apply on top.
+
+    Slots:
+      general_primary  — heaviest model available (synthesis/knowledge)
+      general_alt      — second-heaviest general model (reasoning/analysis)
+      coder_primary    — heaviest coder model, else heaviest general
+      fast             — lightest model (judge/peasant/intern speed roles)
+    """
+    if not available:
+        return {}
+
+    # Split into coder-specialised and general pools, sorted largest→smallest
+    coder_models   = sorted([m for m in available if _is_coder_model(m)],
+                             key=_model_param_count, reverse=True)
+    general_models = sorted([m for m in available if not _is_coder_model(m)],
+                             key=_model_param_count, reverse=True)
+    all_by_size    = sorted(available, key=_model_param_count, reverse=True)
+    all_by_size_asc = list(reversed(all_by_size))
+
+    general_primary = general_models[0] if general_models else all_by_size[0]
+    general_alt     = (general_models[1] if len(general_models) > 1
+                       else general_models[0] if general_models else all_by_size[0])
+    coder_primary   = coder_models[0] if coder_models else general_primary
+    fast            = all_by_size_asc[0] if all_by_size_asc else all_by_size[0]
+
+    return {
+        "general_primary": general_primary,
+        "general_alt":     general_alt,
+        "coder_primary":   coder_primary,
+        "fast":            fast,
+    }
+
+
+def _build_default_models(host: str) -> Dict[str, str]:
+    available = _detect_ollama_models(host)
+    assigned  = _assign_models(available)
+
+    def _slot(env_var: str, slot: str, hardcoded_fallback: str) -> str:
+        return (os.environ.get(env_var)
+                or assigned.get(slot)
+                or hardcoded_fallback)
+
+    return {
+        "general_primary": _slot("COUNCIL_MODEL_GENERAL_PRIMARY", "general_primary", "qwen2.5:32b-instruct-q4_K_M"),
+        "general_alt":     _slot("COUNCIL_MODEL_GENERAL_ALT",     "general_alt",     "qwen2.5:14b-instruct-q4_K_M"),
+        "coder_primary":   _slot("COUNCIL_MODEL_CODER_PRIMARY",   "coder_primary",   "qwen2.5-coder:14b-instruct-q4_K_M"),
+        "coder_fast":      _slot("COUNCIL_MODEL_CODER_FAST",      "fast",            "phi4"),
+        "judge_fast":      _slot("COUNCIL_MODEL_JUDGE_FAST",      "fast",            "phi4"),
+        "peasant_fast":    _slot("COUNCIL_MODEL_PEASANT_FAST",    "fast",            "phi4"),
+        "pi_heavy":        _slot("COUNCIL_MODEL_PI_HEAVY",        "general_alt",     "qwen2.5:14b-instruct-q4_K_M"),
+        "pi_fast":         _slot("COUNCIL_MODEL_PI_FAST",         "fast",            "phi4"),
+    }
+
+
+DEFAULT_MODELS = _build_default_models(DEFAULT_OLLAMA_HOST)
 
 
 def load_personality_pins(path: Path) -> Dict[str, str]:
