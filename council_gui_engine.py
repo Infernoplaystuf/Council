@@ -493,15 +493,8 @@ def _run_analyst_step(query):
 
     try:
         import council_engine as _ce
-        coder_model = (_ce.DEFAULT_MODELS.get('coder_primary')
-                       or _ce.DEFAULT_MODELS.get('general_primary')
-                       or _ce.DEFAULT_MODELS.get('coder_fast'))
-        if not coder_model:
-            print('[analyst] no local model available', file=_sys_dbg.stderr)
-            return None
-        raw = _ce._ollama_chat(
-            host=_ce.DEFAULT_OLLAMA_HOST,
-            model=coder_model,
+        # Backend-agnostic helper — works in both Ollama and GGUF modes.
+        raw = _ce.local_chat(
             messages=[{'role': 'user', 'content': prompt}],
             temperature=0.0,
             num_predict=600,

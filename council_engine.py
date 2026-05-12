@@ -1,4 +1,4 @@
-﻿# ============================================================
+# ============================================================
 # council_engine.py  —  v2  [DESKTOP BUILD: RTX 5080 16GB / 32GB+ RAM]
 # ============================================================
 # Conda env:
@@ -89,6 +89,144 @@ def _ensure_localhost(url: str, *, allow_remote: bool = False) -> None:
             f"Refusing non-local model endpoint: {url}\n"
             "Pass allow_remote=True to LocalBackendSpec to enable Pi/remote hosts."
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Backend selection (Ollama vs. direct GGUF via llama-cpp-python)
+#
+# Default: Ollama. Set COUNCIL_BACKEND=gguf to load a GGUF file directly
+# (no Ollama daemon needed) — useful for air-gapped machines where a user
+# transfers a Hugging Face .gguf onto disk and points the council at it.
+#
+# Required env vars in GGUF mode:
+#   COUNCIL_BACKEND=gguf
+#   COUNCIL_GGUF_PATH=C:\path\to\model.gguf
+# Optional:
+#   COUNCIL_GGUF_N_CTX=4096            context window
+#   COUNCIL_GGUF_N_THREADS=8           CPU threads (defaults to os.cpu_count())
+#   COUNCIL_GGUF_GPU_LAYERS=0          0 = CPU only; 99 = all layers on GPU
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _council_backend() -> str:
+    """Return the active backend name: 'ollama' (default) or 'gguf'."""
+    return os.environ.get("COUNCIL_BACKEND", "ollama").strip().lower() or "ollama"
+
+
+_GGUF_MODEL_INSTANCE = None
+
+
+def _get_gguf_model():
+    """Lazy-load the GGUF model singleton. Raises with a helpful message on
+    misconfiguration so the user knows what env var to set."""
+    global _GGUF_MODEL_INSTANCE
+    if _GGUF_MODEL_INSTANCE is not None:
+        return _GGUF_MODEL_INSTANCE
+
+    path_str = os.environ.get("COUNCIL_GGUF_PATH", "").strip()
+    if not path_str:
+        raise RuntimeError(
+            "COUNCIL_BACKEND=gguf but COUNCIL_GGUF_PATH is not set.\n"
+            "Set it to the absolute path of a .gguf model file."
+        )
+    p = Path(path_str)
+    if not p.exists() or not p.is_file():
+        raise RuntimeError(f"GGUF model not found at: {path_str}")
+
+    try:
+        from llama_cpp import Llama
+    except ImportError as exc:
+        raise RuntimeError(
+            "llama-cpp-python is not installed. Install with:\n"
+            "  conda install -c conda-forge llama-cpp-python\n"
+            "or\n"
+            "  pip install llama-cpp-python"
+        ) from exc
+
+    n_ctx = int(os.environ.get("COUNCIL_GGUF_N_CTX", "4096"))
+    n_threads = int(os.environ.get("COUNCIL_GGUF_N_THREADS",
+                                    str(max(1, (os.cpu_count() or 4)))))
+    n_gpu_layers = int(os.environ.get("COUNCIL_GGUF_GPU_LAYERS", "0"))
+
+    print(f"[GGUF] Loading {p.name} (n_ctx={n_ctx}, n_threads={n_threads}, "
+          f"n_gpu_layers={n_gpu_layers})", flush=True)
+    _GGUF_MODEL_INSTANCE = Llama(
+        model_path=str(p),
+        n_ctx=n_ctx,
+        n_threads=n_threads,
+        n_gpu_layers=n_gpu_layers,
+        verbose=False,
+    )
+    return _GGUF_MODEL_INSTANCE
+
+
+def _gguf_chat(
+    messages: List[Dict[str, str]],
+    *,
+    temperature: float,
+    num_predict: int,
+) -> str:
+    """Blocking GGUF chat completion using the loaded llama-cpp model."""
+    llm = _get_gguf_model()
+    result = llm.create_chat_completion(
+        messages=messages,
+        temperature=float(temperature),
+        max_tokens=int(num_predict),
+    )
+    try:
+        return str(result["choices"][0]["message"]["content"]).strip()
+    except Exception:
+        return str(result).strip()
+
+
+def _gguf_chat_stream(
+    messages: List[Dict[str, str]],
+    *,
+    temperature: float,
+    num_predict: int,
+    token_callback: Optional[Callable[[str], None]],
+) -> str:
+    """Streaming GGUF chat completion — emits each token via token_callback."""
+    llm = _get_gguf_model()
+    pieces: list[str] = []
+    for chunk in llm.create_chat_completion(
+        messages=messages,
+        temperature=float(temperature),
+        max_tokens=int(num_predict),
+        stream=True,
+    ):
+        try:
+            delta = chunk["choices"][0]["delta"].get("content", "")
+        except Exception:
+            delta = ""
+        if delta:
+            pieces.append(delta)
+            if token_callback:
+                token_callback(delta)
+    return "".join(pieces)
+
+
+def local_chat(
+    messages: List[Dict[str, str]],
+    *,
+    temperature: float = 0.2,
+    num_predict: int = 600,
+    model: Optional[str] = None,
+    host: Optional[str] = None,
+    timeout: int = 120,
+) -> str:
+    """Backend-agnostic blocking chat call. Picks Ollama or GGUF based on
+    COUNCIL_BACKEND. Use this for one-shot tool calls (e.g. the analyst step)
+    where you don't need streaming or the full LocalBackendSpec machinery."""
+    if _council_backend() == "gguf":
+        return _gguf_chat(messages, temperature=temperature, num_predict=num_predict)
+    return _ollama_chat(
+        host=host or DEFAULT_OLLAMA_HOST,
+        model=model or DEFAULT_MODELS.get("coder_primary") or DEFAULT_MODELS.get("general_primary") or "qwen2.5:7b-instruct-q4_K_M",
+        messages=messages,
+        temperature=temperature,
+        num_predict=num_predict,
+        timeout=timeout,
+    )
 
 
 def _ollama_chat(
@@ -303,6 +441,21 @@ class LocalBackendSpec:
             {"role": "system", "content": developer_instructions},
             {"role": "user", "content": user_text},
         ]
+
+        # ── GGUF backend (direct llama-cpp-python; no Ollama daemon) ───────
+        # Same loaded model serves every role; per-spec `model` field is
+        # ignored. Designed for air-gapped machines with a single GGUF on disk.
+        if _council_backend() == "gguf":
+            if token_callback is not None:
+                return _gguf_chat_stream(
+                    messages,
+                    temperature=temp, num_predict=mtok,
+                    token_callback=token_callback,
+                )
+            return _gguf_chat(
+                messages,
+                temperature=temp, num_predict=mtok,
+            )
 
         if token_callback is not None:
             return _ollama_chat_stream(
@@ -3107,7 +3260,33 @@ def _build_default_models(host: str) -> Dict[str, str]:
     }
 
 
-DEFAULT_MODELS = _build_default_models(DEFAULT_OLLAMA_HOST)
+def _gguf_model_label() -> str:
+    """Display name for the loaded GGUF — uses the filename so logs are
+    readable. Same string fills every role slot."""
+    path_str = os.environ.get("COUNCIL_GGUF_PATH", "").strip()
+    if path_str:
+        return f"gguf:{Path(path_str).name}"
+    return "gguf:unset"
+
+
+if _council_backend() == "gguf":
+    # In GGUF mode, every role slot uses the same loaded model — the
+    # `model` field is informational only (used in trace logs); the actual
+    # inference goes through _gguf_chat which ignores it.
+    _label = _gguf_model_label()
+    DEFAULT_MODELS = {
+        "general_primary": _label,
+        "general_alt":     _label,
+        "coder_primary":   _label,
+        "coder_fast":      _label,
+        "judge_fast":      _label,
+        "peasant_fast":    _label,
+        "pi_heavy":        _label,
+        "pi_fast":         _label,
+    }
+    print(f"[council] backend=gguf, model={_label}", flush=True)
+else:
+    DEFAULT_MODELS = _build_default_models(DEFAULT_OLLAMA_HOST)
 
 
 def load_personality_pins(path: Path) -> Dict[str, str]:
