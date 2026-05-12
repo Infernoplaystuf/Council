@@ -3269,24 +3269,46 @@ def _gguf_model_label() -> str:
     return "gguf:unset"
 
 
-if _council_backend() == "gguf":
-    # In GGUF mode, every role slot uses the same loaded model — the
-    # `model` field is informational only (used in trace logs); the actual
-    # inference goes through _gguf_chat which ignores it.
-    _label = _gguf_model_label()
-    DEFAULT_MODELS = {
-        "general_primary": _label,
-        "general_alt":     _label,
-        "coder_primary":   _label,
-        "coder_fast":      _label,
-        "judge_fast":      _label,
-        "peasant_fast":    _label,
-        "pi_heavy":        _label,
-        "pi_fast":         _label,
-    }
-    print(f"[council] backend=gguf, model={_label}", flush=True)
-else:
-    DEFAULT_MODELS = _build_default_models(DEFAULT_OLLAMA_HOST)
+_ROLE_SLOTS = (
+    "general_primary", "general_alt", "coder_primary", "coder_fast",
+    "judge_fast", "peasant_fast", "pi_heavy", "pi_fast",
+)
+
+
+def _populate_default_models() -> Dict[str, str]:
+    """Build the DEFAULT_MODELS map based on current backend env vars."""
+    if _council_backend() == "gguf":
+        label = _gguf_model_label()
+        return {slot: label for slot in _ROLE_SLOTS}
+    return _build_default_models(DEFAULT_OLLAMA_HOST)
+
+
+DEFAULT_MODELS = _populate_default_models()
+print(f"[council] backend={_council_backend()}, "
+      f"primary={DEFAULT_MODELS.get('general_primary')}", flush=True)
+
+
+def refresh_backend_config() -> Dict[str, str]:
+    """Re-evaluate backend env vars and rebuild DEFAULT_MODELS in place.
+
+    Call this after the GUI mutates COUNCIL_BACKEND, COUNCIL_GGUF_PATH,
+    or any COUNCIL_MODEL_* override so subsequent inference picks up the
+    new settings. Also clears the cached GGUF singleton so the next chat
+    call reloads from disk if the GGUF path changed.
+    """
+    global DEFAULT_MODELS, _GGUF_MODEL_INSTANCE
+    _GGUF_MODEL_INSTANCE = None
+    DEFAULT_MODELS.clear()
+    DEFAULT_MODELS.update(_populate_default_models())
+    print(f"[council] backend refreshed: {_council_backend()}, "
+          f"primary={DEFAULT_MODELS.get('general_primary')}", flush=True)
+    return dict(DEFAULT_MODELS)
+
+
+def detect_ollama_models() -> List[str]:
+    """List of Ollama models installed on the local daemon. Empty list if
+    Ollama isn't reachable. Public helper for the GUI dropdown."""
+    return _detect_ollama_models(DEFAULT_OLLAMA_HOST)
 
 
 def load_personality_pins(path: Path) -> Dict[str, str]:

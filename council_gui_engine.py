@@ -2223,6 +2223,14 @@ class CouncilConsole(tk.Tk):
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.prior_session_id: Optional[str] = None
         self.convo_store = ce.ConversationStore(VAULT_DIR / "conversations")
+        # Load persisted backend selection (Ollama vs. GGUF, model choice)
+        # BEFORE the engine builds its model dispatcher. Applies to env vars
+        # so council_engine.DEFAULT_MODELS picks the right values.
+        self._load_backend_settings()
+        try:
+            ce.refresh_backend_config()
+        except Exception:
+            pass
         # Personal Specialists — config-only registry, persists to vault/specialists.json
         # Seeds 3 defaults (Sales / Inventory / Customer) on first run.
         self.specialists = _spec.SpecialistRegistry(VAULT_DIR)
@@ -2656,11 +2664,189 @@ class CouncilConsole(tk.Tk):
             self._build_vault_health_tab()
             self._build_apoth_tab()
 
+    # ---- Backend strip (model backend selector) ----
+
+    _BACKEND_SETTINGS_FILENAME = "backend_settings.json"
+
+    def _backend_settings_path(self):
+        return VAULT_DIR / self._BACKEND_SETTINGS_FILENAME
+
+    def _load_backend_settings(self):
+        """Read persisted backend selection from vault and apply to env.
+
+        Returns the loaded settings dict (empty if none/unreadable). Called
+        once at app startup, before the backend strip is built.
+        """
+        p = self._backend_settings_path()
+        if not p.exists():
+            return {}
+        try:
+            import json as _j
+            data = _j.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        # Apply to env so council_engine picks it up.
+        if data.get("backend"):
+            os.environ["COUNCIL_BACKEND"] = str(data["backend"])
+        if data.get("gguf_path"):
+            os.environ["COUNCIL_GGUF_PATH"] = str(data["gguf_path"])
+        if data.get("ollama_model"):
+            os.environ["COUNCIL_MODEL_GENERAL_PRIMARY"] = str(data["ollama_model"])
+            os.environ["COUNCIL_MODEL_CODER_PRIMARY"]   = str(data["ollama_model"])
+        return data
+
+    def _save_backend_settings(self):
+        import json as _j
+        data = {
+            "backend":       self._backend_var.get(),
+            "ollama_model":  self._ollama_model_var.get(),
+            "gguf_path":     self._gguf_path_var.get(),
+        }
+        try:
+            self._backend_settings_path().write_text(
+                _j.dumps(data, indent=2), encoding="utf-8",
+            )
+        except Exception as _e:
+            print(f"[backend strip] could not save settings: {_e}")
+
+    def _build_backend_strip(self, parent):
+        """Top-of-tab row: Backend toggle + Model selector + Browse button."""
+        strip = ttk.Frame(parent)
+        strip.pack(fill="x", padx=6, pady=(6, 0))
+
+        # Backend toggle (Ollama / GGUF)
+        ttk.Label(strip, text="Backend:").pack(side="left", padx=(0, 4))
+        self._backend_var = tk.StringVar(
+            value=os.environ.get("COUNCIL_BACKEND", "ollama").strip().lower() or "ollama"
+        )
+        backend_cb = ttk.Combobox(
+            strip, textvariable=self._backend_var,
+            values=["ollama", "gguf"], width=8, state="readonly",
+        )
+        backend_cb.pack(side="left", padx=(0, 10))
+        backend_cb.bind("<<ComboboxSelected>>", lambda _e: self._on_backend_changed())
+
+        # Ollama model dropdown
+        ttk.Label(strip, text="Ollama model:").pack(side="left", padx=(0, 4))
+        self._ollama_model_var = tk.StringVar(
+            value=os.environ.get("COUNCIL_MODEL_GENERAL_PRIMARY", "")
+        )
+        self._ollama_model_cb = ttk.Combobox(
+            strip, textvariable=self._ollama_model_var,
+            values=[], width=32, state="readonly",
+        )
+        self._ollama_model_cb.pack(side="left", padx=(0, 4))
+        self._ollama_model_cb.bind("<<ComboboxSelected>>",
+                                   lambda _e: self._on_ollama_model_changed())
+
+        ttk.Button(strip, text="↻", width=3,
+                   command=self._refresh_ollama_models).pack(side="left", padx=(0, 10))
+
+        # GGUF model picker
+        ttk.Label(strip, text="GGUF file:").pack(side="left", padx=(0, 4))
+        self._gguf_path_var = tk.StringVar(
+            value=os.environ.get("COUNCIL_GGUF_PATH", "")
+        )
+        self._gguf_path_label = ttk.Label(
+            strip, textvariable=self._gguf_path_var, foreground="#888",
+            width=40, anchor="w",
+        )
+        self._gguf_path_label.pack(side="left", padx=(0, 4))
+        ttk.Button(strip, text="Browse...",
+                   command=self._browse_gguf_file).pack(side="left")
+
+        # Initialize Ollama dropdown contents and widget enabled-states.
+        self._refresh_ollama_models()
+        self._apply_backend_enabled_states()
+
+    def _apply_backend_enabled_states(self):
+        """Grey out the controls that don't apply to the current backend."""
+        backend = self._backend_var.get()
+        if backend == "ollama":
+            self._ollama_model_cb.configure(state="readonly")
+        else:
+            self._ollama_model_cb.configure(state="disabled")
+
+    def _refresh_ollama_models(self):
+        try:
+            import council_engine as _ce
+            models = _ce.detect_ollama_models()
+        except Exception as _e:
+            models = []
+            print(f"[backend strip] ollama list failed: {_e}")
+        self._ollama_model_cb["values"] = models
+        cur = self._ollama_model_var.get()
+        if cur not in models and models:
+            self._ollama_model_var.set(models[0])
+            self._on_ollama_model_changed()
+
+    def _on_backend_changed(self):
+        os.environ["COUNCIL_BACKEND"] = self._backend_var.get()
+        self._apply_backend_enabled_states()
+        try:
+            import council_engine as _ce
+            _ce.refresh_backend_config()
+        except Exception as _e:
+            print(f"[backend strip] refresh failed: {_e}")
+        self._save_backend_settings()
+        self._append_transcript(
+            "Council",
+            f"Backend switched to: {self._backend_var.get()}",
+            "observation",
+        )
+
+    def _on_ollama_model_changed(self):
+        m = self._ollama_model_var.get().strip()
+        if not m:
+            return
+        # Override the primary slots so every role uses the picked model.
+        os.environ["COUNCIL_MODEL_GENERAL_PRIMARY"] = m
+        os.environ["COUNCIL_MODEL_CODER_PRIMARY"]   = m
+        os.environ["COUNCIL_MODEL_GENERAL_ALT"]     = m
+        try:
+            import council_engine as _ce
+            _ce.refresh_backend_config()
+        except Exception as _e:
+            print(f"[backend strip] refresh failed: {_e}")
+        self._save_backend_settings()
+
+    def _browse_gguf_file(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Select a .gguf model file",
+            filetypes=[("GGUF model files", "*.gguf"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self._gguf_path_var.set(path)
+        os.environ["COUNCIL_GGUF_PATH"] = path
+        # Switching the GGUF only makes sense in GGUF mode — flip if needed.
+        self._backend_var.set("gguf")
+        os.environ["COUNCIL_BACKEND"] = "gguf"
+        self._apply_backend_enabled_states()
+        try:
+            import council_engine as _ce
+            _ce.refresh_backend_config()
+        except Exception as _e:
+            print(f"[backend strip] refresh failed: {_e}")
+        self._save_backend_settings()
+        self._append_transcript(
+            "Council",
+            f"GGUF model set: {Path(path).name} (backend switched to gguf)",
+            "observation",
+        )
+
     # ---- Council tab ----
 
     def _build_council_tab(self):
         self.tab_council = ttk.Frame(self.nb)
         self.nb.add(self.tab_council, text="⚖ Council")
+
+        # ── Backend strip ───────────────────────────────────────────────
+        # Lets the user switch between Ollama and a locally-loaded GGUF
+        # file without restarting the app. Settings persist to
+        # vault/backend_settings.json.
+        self._build_backend_strip(self.tab_council)
 
         # Main paned window: transcript | judge panel
         paned = tk.PanedWindow(self.tab_council, orient="horizontal",
