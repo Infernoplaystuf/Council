@@ -3509,6 +3509,12 @@ class CouncilConsole(tk.Tk):
         r"documentation)\s+(?:for\s+|of\s+)?(.+?)\s*[.!?]?\s*$",
         _re.IGNORECASE,
     )
+    _QUALITY_RE = _re.compile(
+        r"^\s*(?:quality\s+check|check\s+(?:data\s+)?quality|"
+        r"data\s+quality(?:\s+check)?|"
+        r"audit\s+(?:data\s+)?(?:quality\s+of\s+)?)\s*(.*?)\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
 
     def _handle_vault_tools_intent(self, user_text: str) -> bool:
         if not user_text:
@@ -3558,7 +3564,85 @@ class CouncilConsole(tk.Tk):
             self._schema_doc_response(m.group(1).strip().strip("'\"`"))
             return True
 
+        m = self._QUALITY_RE.match(single_line)
+        if m:
+            target = (m.group(1) or "").strip().strip("'\"`")
+            self._quality_check_response(target)
+            return True
+
         return False
+
+    def _quality_check_response(self, target: str):
+        """Run detect_data_quality_issues against a CSV (specific file) or
+        every CSV in the vault (when target is empty)."""
+        import vault_analyst as _va
+        if not target:
+            # Whole-vault sweep
+            issues = _va.detect_data_quality_issues_per_csv(VAULT_DIR)
+            if issues.empty:
+                self._append_transcript(
+                    "Writer",
+                    "No quality issues detected across the vault's CSV files.",
+                    "final",
+                )
+            else:
+                lines = [f"Found {len(issues)} issue(s) across vault CSVs:"]
+                for _, row in issues.head(40).iterrows():
+                    lines.append(
+                        f"  [{row.get('severity','?')}] "
+                        f"{row.get('csv','?')} :: "
+                        f"{row.get('column','')} :: "
+                        f"{row.get('kind','?')} — {row.get('message','')}"
+                    )
+                if len(issues) > 40:
+                    lines.append(f"  ... ({len(issues) - 40} more)")
+                self._append_transcript("Writer", "\n".join(lines), "final")
+            self._set_status("● idle")
+            return
+
+        # Single file
+        p = Path(target).expanduser()
+        if not p.is_file():
+            from vault_analyst import list_csv_files
+            try:
+                matches = [c for c in list_csv_files(VAULT_DIR)
+                           if target.lower() in c.name.lower()]
+            except Exception:
+                matches = []
+            if matches:
+                p = matches[0]
+        if not p.is_file():
+            self._append_transcript(
+                "Writer", f"No file found for '{target}'.", "final",
+            )
+            self._set_status("● idle")
+            return
+        try:
+            import pandas as _pd
+            df = _va.read_table(p)
+            issues = _va.detect_data_quality_issues(df)
+        except Exception as exc:
+            self._append_transcript(
+                "Writer", f"Quality check failed: {exc!r}", "final",
+            )
+            self._set_status("● idle")
+            return
+        if issues.empty:
+            self._append_transcript(
+                "Writer", f"{p.name}: no quality issues detected.", "final",
+            )
+        else:
+            lines = [f"{p.name}: {len(issues)} issue(s) found:"]
+            for _, row in issues.head(30).iterrows():
+                lines.append(
+                    f"  [{row.get('severity','?')}] "
+                    f"{row.get('column','')} :: "
+                    f"{row.get('kind','?')} — {row.get('message','')}"
+                )
+            if len(issues) > 30:
+                lines.append(f"  ... ({len(issues) - 30} more)")
+            self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
 
     def _export_transcript_response(self):
         import vault_tools as _vt

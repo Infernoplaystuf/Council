@@ -856,6 +856,190 @@ def schema_doc_from_csv(path: Any) -> str:
     return "\n".join(md)
 
 
+# ============================================================
+# Data-quality checks
+# ============================================================
+
+def detect_data_quality_issues(df: pd.DataFrame) -> pd.DataFrame:
+    """Run a battery of common data-quality checks against `df` and
+    return a one-row-per-issue DataFrame.
+
+    Checks performed:
+      - duplicate rows
+      - all-null columns
+      - mixed dtypes within a single column (object cols where >5% of
+        non-null values fail to coerce to numeric while others succeed)
+      - leading/trailing whitespace in string columns
+      - suspiciously round numeric columns (mean/std all integer)
+      - encoding artifacts (presence of Unicode replacement char U+FFFD)
+      - inconsistent date formats in date-like columns
+    """
+    rows: list[dict[str, Any]] = []
+
+    def _issue(severity, where, kind, message):
+        rows.append({
+            "severity": severity, "column": where, "kind": kind,
+            "message": message,
+        })
+
+    if df is None or df.empty:
+        _issue("info", "(table)", "empty", "DataFrame is empty")
+        return pd.DataFrame(rows)
+
+    # 1. Duplicate rows
+    try:
+        dup = int(df.duplicated().sum())
+        if dup > 0:
+            _issue("warning", "(rows)", "duplicate_rows",
+                   f"{dup} duplicate row(s)")
+    except Exception:
+        pass
+
+    for col in df.columns:
+        s = df[col]
+        # 2. All-null column
+        if s.notna().sum() == 0:
+            _issue("warning", str(col), "all_null", "every value is null")
+            continue
+
+        # 3. Mixed numeric / non-numeric within object column
+        if s.dtype == "object":
+            non_null = s.dropna()
+            if not non_null.empty:
+                coerced = pd.to_numeric(non_null, errors="coerce")
+                num_ok = coerced.notna().sum()
+                num_total = len(non_null)
+                if 0 < num_ok < num_total and num_ok / num_total > 0.05:
+                    _issue("warning", str(col), "mixed_types",
+                           f"{num_ok}/{num_total} values parse as numeric — "
+                           f"column may have mixed numeric/text entries")
+
+        # 4. Leading / trailing whitespace
+        if s.dtype == "object":
+            try:
+                trimmable = s.dropna().astype(str).map(
+                    lambda x: x != x.strip()
+                ).sum()
+                if trimmable > 0:
+                    _issue("info", str(col), "whitespace",
+                           f"{trimmable} value(s) have leading/trailing whitespace")
+            except Exception:
+                pass
+
+        # 5. Encoding artifacts (U+FFFD)
+        if s.dtype == "object":
+            try:
+                bad = s.dropna().astype(str).str.contains("�").sum()
+                if bad > 0:
+                    _issue("warning", str(col), "encoding",
+                           f"{bad} value(s) contain U+FFFD (replacement char) — "
+                           f"likely a decoding issue upstream")
+            except Exception:
+                pass
+
+        # 6. Suspiciously round numerics (entire column = integers stored as float)
+        if pd.api.types.is_float_dtype(s):
+            non_null = s.dropna()
+            if not non_null.empty and (non_null == non_null.astype(int)).all():
+                _issue("info", str(col), "float_with_no_decimals",
+                       "all values are whole numbers — consider an int dtype")
+
+    # 7. Date columns with inconsistent formats — detect on object cols
+    #    whose values include common date separators but parse to >2 distinct
+    #    inferred formats.
+    for col in df.columns:
+        s = df[col]
+        if s.dtype != "object":
+            continue
+        sample = s.dropna().astype(str).head(50)
+        if sample.empty:
+            continue
+        looks_dateish = sample.str.contains(r"\d{2,4}[-/.\\]\d{1,2}").sum()
+        if looks_dateish < max(3, len(sample) // 4):
+            continue
+        formats = set()
+        for v in sample:
+            # crude format inference — replace digits with 'd' so we group by shape
+            formats.add(re.sub(r"\d", "d", v))
+            if len(formats) > 5:
+                break
+        if len(formats) > 2:
+            _issue("warning", str(col), "mixed_date_format",
+                   f"date-like column shows {len(formats)} distinct value shapes")
+
+    return pd.DataFrame(rows)
+
+
+def detect_data_quality_issues_per_csv(
+    data_folder: Any,
+    *,
+    recursive: bool = True,
+) -> pd.DataFrame:
+    """Run detect_data_quality_issues across every CSV in the folder.
+    Returns a long frame with a leading `csv` column."""
+    folders = normalize_data_folders(data_folder)
+    frames: list[pd.DataFrame] = []
+    for csv_path in list_csv_files(folders, recursive=recursive):
+        try:
+            df = pd.read_csv(csv_path)
+            issues = detect_data_quality_issues(df)
+            if not issues.empty:
+                issues.insert(0, "csv", csv_path.name)
+                frames.append(issues)
+        except Exception as exc:
+            frames.append(pd.DataFrame([{
+                "csv": csv_path.name,
+                "severity": "error",
+                "column": "",
+                "kind": "read_error",
+                "message": str(exc),
+            }]))
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+# ============================================================
+# CSV splitter
+# ============================================================
+
+def split_csv_by_column(
+    path: Any,
+    column: str,
+    output_dir: Any,
+    *,
+    sanitize: bool = True,
+) -> pd.DataFrame:
+    """Split a CSV into per-value files. For each distinct value in
+    `column`, writes <output_dir>/<stem>_<value>.csv with only the
+    matching rows. Returns a summary DataFrame (one row per output)."""
+    p = Path(path)
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    df = pd.read_csv(p)
+    col = column if column in df.columns else find_column_case_insensitive(df, column)
+    if col is None:
+        return pd.DataFrame([{"status": f"missing column: {column}"}])
+
+    summary: list[dict[str, Any]] = []
+    for value, sub in df.groupby(col, dropna=False):
+        vname = str(value)
+        if sanitize:
+            vname = re.sub(r"[^A-Za-z0-9._-]+", "_", vname).strip("_") or "blank"
+        out_path = out_dir / f"{p.stem}_{vname}.csv"
+        n = 2
+        while out_path.exists():
+            out_path = out_dir / f"{p.stem}_{vname}_v{n}.csv"
+            n += 1
+        sub.to_csv(out_path, index=False)
+        summary.append({
+            "value":     str(value),
+            "rows":      int(len(sub)),
+            "output":    str(out_path),
+        })
+    return pd.DataFrame(summary)
+
+
 def pivot_per_csv(
     data_folder: Any,
     index_col: str,
@@ -1348,6 +1532,10 @@ def execute_pandas_code(
         "extract_dates":          extract_dates,
         "top_n_per_csv":          top_n_per_csv,
         "schema_doc_from_csv":    schema_doc_from_csv,
+        # Data quality + splitter
+        "detect_data_quality_issues":         detect_data_quality_issues,
+        "detect_data_quality_issues_per_csv": detect_data_quality_issues_per_csv,
+        "split_csv_by_column":                split_csv_by_column,
     }
     if np is not None:
         globals_dict["np"] = np
@@ -1464,6 +1652,14 @@ Text + dates + value counts + schema doc:
   extract_dates(df, column, new_column=None, errors="coerce")
   top_n_per_csv(data_folder, column, n=10)     # value_counts per file
   schema_doc_from_csv(path)                    # -> markdown string
+
+Data quality + splitter:
+  detect_data_quality_issues(df)
+    issues table: duplicates, all-null cols, mixed types, whitespace,
+    encoding artifacts, suspicious round numerics, mixed date formats
+  detect_data_quality_issues_per_csv(folder)
+  split_csv_by_column(path, column, output_dir)
+    writes one CSV per distinct value of `column`
 
 Rules:
 - Assign the final answer to a DataFrame named `result_df`.
