@@ -322,6 +322,37 @@ def _read_file_for_injection(path_str):
             content = '\n'.join(lines)
             if len(content) > _FILE_READ_CHAR_LIMIT:
                 content = content[:_FILE_READ_CHAR_LIMIT] + '\n... (truncated)'
+        elif suffix in ('.xlsx', '.xls', '.xlsm'):
+            # Excel workbook — list sheets with their columns and a few rows
+            # so the model sees the structure of every tab without ingesting
+            # the whole file.
+            import pandas as _pd_fi
+            xl = _pd_fi.ExcelFile(str(p))
+            lines = [f'Workbook with {len(xl.sheet_names)} sheet(s)']
+            sample_per_sheet = 10
+            for sname in xl.sheet_names[:8]:
+                try:
+                    df = xl.parse(sname, nrows=sample_per_sheet * 2)
+                except Exception as _ex:
+                    lines.append(f'  Sheet "{sname}": read error: {_ex}')
+                    continue
+                headers = [str(c) for c in df.columns]
+                lines.append(f'Sheet "{sname}" — '
+                             f'{len(df)} rows shown, '
+                             f'{len(headers)} columns: '
+                             + ', '.join(headers))
+                lines.append('  Sample rows:')
+                for _, row in df.head(sample_per_sheet).iterrows():
+                    cells = []
+                    for v in row.tolist():
+                        cv = str(v).replace('\n', ' ').strip()
+                        if len(cv) > 80:
+                            cv = cv[:77] + '...'
+                        cells.append(cv)
+                    lines.append('    ' + ' | '.join(cells))
+            content = '\n'.join(lines)
+            if len(content) > _FILE_READ_CHAR_LIMIT:
+                content = content[:_FILE_READ_CHAR_LIMIT] + '\n... (truncated)'
         else:
             with open(p, encoding='utf-8', errors='replace') as fh:
                 content = fh.read(_FILE_READ_CHAR_LIMIT)

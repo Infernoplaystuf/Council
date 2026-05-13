@@ -164,7 +164,8 @@ _TEXT_SUFFIXES = {
     ".txt", ".md", ".log", ".rst", ".yaml", ".yml",
     ".ini", ".cfg", ".toml", ".html", ".htm",
 }
-_PARSEABLE = {".csv", ".json"} | _TEXT_SUFFIXES
+_EXCEL_SUFFIXES = {".xlsx", ".xls", ".xlsm"}
+_PARSEABLE = {".csv", ".json"} | _TEXT_SUFFIXES | _EXCEL_SUFFIXES
 
 
 def _parse_csv(p: Path) -> Dict[str, Any]:
@@ -257,6 +258,57 @@ def _parse_json(p: Path) -> Dict[str, Any]:
     }
 
 
+def _parse_excel(p: Path) -> Dict[str, Any]:
+    """Index an Excel workbook — sheet names + per-sheet headers + a few
+    sample values. Each sheet's content contributes to the keyword set."""
+    sheets_meta: List[Dict[str, Any]] = []
+    sample_rows: List[str] = []
+    keywords: Set[str] = set()
+    try:
+        import pandas as _pd
+        xl = _pd.ExcelFile(str(p))
+        sheet_names = list(xl.sheet_names)[:8]  # cap to avoid heavy workbooks
+        keywords.update(_tokenize(" ".join(sheet_names)))
+        for sname in sheet_names:
+            try:
+                df = xl.parse(sname, nrows=50)
+            except Exception:
+                continue
+            headers = [str(c).strip() for c in df.columns]
+            keywords.update(_tokenize(" ".join(headers)))
+            for _, row in df.head(40).iterrows():
+                for cell in row.values.tolist():
+                    cv = str(cell).strip()
+                    if not cv or len(cv) > 1000:
+                        continue
+                    if cv.startswith("http://") or cv.startswith("https://"):
+                        continue
+                    for part in re.split(r"[|;,/]", cv):
+                        part = part.strip()
+                        if 2 <= len(part) <= 80:
+                            keywords.update(_tokenize(part))
+            sheets_meta.append({
+                "sheet":   sname,
+                "headers": headers,
+                "rows":    int(len(df)),
+            })
+            # one sample line per sheet
+            if len(df):
+                sample_rows.append(f"[{sname}] " + ", ".join(
+                    str(v) for v in df.iloc[0].tolist()
+                )[:240])
+            if len(keywords) > 8000:
+                break
+    except Exception:
+        pass
+    return {
+        "type":        "excel",
+        "sheets":      sheets_meta,
+        "sample_rows": sample_rows,
+        "keywords":    sorted(keywords)[:5000],
+    }
+
+
 def _parse_text(p: Path, suffix: str) -> Dict[str, Any]:
     text = ""
     try:
@@ -277,6 +329,8 @@ def _index_file(p: Path) -> Optional[Dict[str, Any]]:
         rec = _parse_csv(p)
     elif suffix == ".json":
         rec = _parse_json(p)
+    elif suffix in _EXCEL_SUFFIXES:
+        rec = _parse_excel(p)
     elif suffix in _TEXT_SUFFIXES:
         rec = _parse_text(p, suffix)
     else:
@@ -538,7 +592,11 @@ class VaultIndex:
         for _spath, rec in cand:
             kws = set(rec.get("keywords", []))
             stems_kw = {_stem(w) for w in kws}
+            # Flatten CSV `headers` and Excel `sheets[*].headers` into one list
             headers_lc = [(h or "").lower() for h in rec.get("headers", [])]
+            for s in rec.get("sheets", []) or []:
+                for h in s.get("headers", []) or []:
+                    headers_lc.append(str(h).lower())
             keys_lc = [str(k).lower() for k in rec.get("keys", [])]
             name_tokens = set(_tokenize(rec.get("name", "")))
             name_stems = {_stem(t) for t in name_tokens}
@@ -693,6 +751,17 @@ class VaultIndex:
             if rec.get("sample_text"):
                 lines.append("preview:")
                 lines.append(rec["sample_text"][:600])
+        elif rtype == "excel":
+            lines.append("type: excel")
+            sheets = rec.get("sheets", []) or []
+            lines.append(f"sheets ({len(sheets)}):")
+            for s in sheets[:6]:
+                cols = ", ".join(map(str, s.get("headers", [])[:15]))
+                lines.append(f"  - {s.get('sheet','?')} ({s.get('rows', 0)} rows): {cols}")
+            if rec.get("sample_rows"):
+                lines.append("samples:")
+                for r in rec["sample_rows"][:3]:
+                    lines.append(f"  {r}")
         else:
             lines.append(f"type: {rtype}")
             if rec.get("sample_text"):

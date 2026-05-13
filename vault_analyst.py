@@ -123,6 +123,103 @@ def list_csv_files(data_folder: Any, recursive: bool = True) -> List[Path]:
     return sorted(deduped.values())
 
 
+_EXCEL_GLOBS = ("*.xlsx", "*.xls", "*.xlsm")
+
+
+def list_excel_files(data_folder: Any, recursive: bool = True) -> List[Path]:
+    """All Excel workbooks under the given folder(s), deduped."""
+    folders = normalize_data_folders(data_folder)
+    out: List[Path] = []
+    for folder in folders:
+        for pattern in _EXCEL_GLOBS:
+            if recursive:
+                out.extend(sorted(folder.rglob(pattern)))
+            else:
+                out.extend(sorted(folder.glob(pattern)))
+    deduped: dict[str, Path] = {}
+    for path in out:
+        try:
+            deduped[str(path.resolve()).lower()] = path.resolve()
+        except Exception:
+            pass
+    return sorted(deduped.values())
+
+
+def list_data_files(data_folder: Any, recursive: bool = True) -> List[Path]:
+    """CSV + Excel files combined — for helpers that want either."""
+    return sorted(set(list_csv_files(data_folder, recursive=recursive))
+                  | set(list_excel_files(data_folder, recursive=recursive)))
+
+
+def read_table(path: Any, *, sheet: Optional[str] = None) -> pd.DataFrame:
+    """Read a CSV or Excel file into a DataFrame. For Excel, `sheet`
+    picks which tab; default is the first sheet. Used by helpers and
+    available in the sandbox."""
+    p = Path(path)
+    suf = p.suffix.lower()
+    if suf in (".xlsx", ".xls", ".xlsm"):
+        return pd.read_excel(p, sheet_name=sheet if sheet else 0)
+    return pd.read_csv(p)
+
+
+def read_excel_sheets(path: Any) -> Dict[str, pd.DataFrame]:
+    """Read every sheet of an Excel workbook into a dict {sheet_name: df}."""
+    p = Path(path)
+    return pd.read_excel(p, sheet_name=None)
+
+
+def excel_inventory(
+    data_folder: Any,
+    recursive: bool = True,
+    max_files: Optional[int] = None,
+) -> pd.DataFrame:
+    """One row per (workbook, sheet): sheet name, row count, column count,
+    column-list preview. Mirrors csv_inventory for Excel."""
+    folders = normalize_data_folders(data_folder)
+    rows: list[dict[str, Any]] = []
+    xls = list_excel_files(folders, recursive=recursive)
+    if max_files is not None:
+        xls = xls[:max_files]
+    for p in xls:
+        root = first_matching_root(p, folders)
+        try:
+            xl = pd.ExcelFile(str(p))
+        except Exception as exc:
+            rows.append({
+                "workbook":      p.name,
+                "relative_path": safe_relative_path(p, root),
+                "sheet":         "",
+                "status":        f"open error: {exc}",
+                "columns":       "",
+                "column_count":  None,
+                "row_count":     None,
+            })
+            continue
+        for sname in xl.sheet_names:
+            try:
+                df = xl.parse(sname, nrows=5)
+                rows.append({
+                    "workbook":      p.name,
+                    "relative_path": safe_relative_path(p, root),
+                    "sheet":         sname,
+                    "status":        "ok",
+                    "columns":       ", ".join(map(str, df.columns)),
+                    "column_count":  len(df.columns),
+                    "row_count":     None,  # nrows=5 only; full count via separate helper
+                })
+            except Exception as exc:
+                rows.append({
+                    "workbook":      p.name,
+                    "relative_path": safe_relative_path(p, root),
+                    "sheet":         sname,
+                    "status":        f"sheet read error: {exc}",
+                    "columns":       "",
+                    "column_count":  None,
+                    "row_count":     None,
+                })
+    return pd.DataFrame(rows)
+
+
 # ============================================================
 # Column resolution (case- and substring-tolerant)
 # ============================================================
@@ -933,6 +1030,12 @@ def execute_pandas_code(
         "time_series_resample":   time_series_resample,
         "join_csvs_on_column":    join_csvs_on_column,
         "compare_two_csvs":       compare_two_csvs,
+        # Excel + CSV-or-Excel helpers
+        "list_excel_files":       list_excel_files,
+        "list_data_files":        list_data_files,
+        "read_table":             read_table,
+        "read_excel_sheets":      read_excel_sheets,
+        "excel_inventory":        excel_inventory,
     }
     if np is not None:
         globals_dict["np"] = np
@@ -1026,6 +1129,14 @@ case-insensitive column matching, NaN/zero filtering, and multi-CSV scans):
   time_series_resample(df, date_col, value_col, freq="M", agg="sum")
   join_csvs_on_column(left_path, right_path, on, how="inner")
   compare_two_csvs(a_path, b_path, on=None)   # row-level diff snapshot
+
+Excel support:
+  list_excel_files(data_folder, recursive=True)
+  list_data_files(data_folder, recursive=True)  # CSV + Excel combined
+  read_table(path, sheet=None)                  # CSV or Excel -> df
+  read_excel_sheets(path)                       # all sheets -> {name: df}
+  excel_inventory(data_folder, recursive=True)
+  pd.read_excel is also available directly.
 
 Rules:
 - Assign the final answer to a DataFrame named `result_df`.
