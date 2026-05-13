@@ -2736,6 +2736,149 @@ class CouncilConsole(tk.Tk):
             "observation",
         )
 
+    # ---- Pipeline intent handler ----
+
+    # Patterns matched against the user's first message line.
+    _PIPELINE_SHOW_RE = _re.compile(
+        r"^\s*(?:show|display|view|render|render\s+the|view\s+the)"
+        r"(?:\s+(?:me|the))?\s+pipelines?\s+(.+?)\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
+    _PIPELINE_LIST_RE = _re.compile(
+        r"^\s*(?:list|show|what)\s+(?:are\s+)?"
+        r"(?:my\s+|the\s+)?(?:available\s+)?pipelines?\??\s*$",
+        _re.IGNORECASE,
+    )
+    _PIPELINE_MODIFY_RE = _re.compile(
+        r"^\s*(?:modify|edit|change|update|tweak)"
+        r"(?:\s+(?:the|my))?\s+pipelines?\s+(.+?)\s+(?:to|so\s+that|so|with|by|using)\s+(.+?)\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
+
+    def _handle_pipeline_intent(self, user_text: str) -> bool:
+        """Detect and handle pipeline show/list/modify intents.
+
+        Returns True if the message was a pipeline command (in which case
+        the normal council flow is skipped). Returns False otherwise — the
+        message falls through to the regular deliberation.
+        """
+        if not user_text:
+            return False
+        single_line = user_text.split("\n", 1)[0]
+
+        # List
+        if self._PIPELINE_LIST_RE.match(single_line):
+            self._pipeline_list_response()
+            return True
+
+        # Show / display
+        m = self._PIPELINE_SHOW_RE.match(single_line)
+        if m:
+            name = m.group(1).strip().strip("'\"`")
+            self._pipeline_show_response(name)
+            return True
+
+        # Modify
+        m = self._PIPELINE_MODIFY_RE.match(single_line)
+        if m:
+            name = m.group(1).strip().strip("'\"`")
+            change = m.group(2).strip().strip("'\"`.")
+            self._pipeline_modify_response(name, change, user_text)
+            return True
+
+        return False
+
+    def _pipeline_list_response(self):
+        import pipeline_scanner as _ps
+        in_dir = _ps.vault_pipelines_in_dir(VAULT_DIR)
+        pipelines = _ps.scan_pipelines(in_dir)
+        if not pipelines:
+            self._append_transcript(
+                "Writer",
+                f"No pipelines found in {in_dir}. Drop .py simplnx scripts or "
+                ".dream3d files in there and I'll see them.",
+                "final",
+            )
+            return
+        lines = [f"Found {len(pipelines)} pipeline"
+                 f"{'s' if len(pipelines) != 1 else ''} in vault/pipelines/in/:"]
+        for pl in pipelines:
+            note = f" ({pl.format}, {len(pl.steps)} step{'s' if len(pl.steps)!=1 else ''})"
+            lines.append(f"  • {pl.name}{note}")
+        self._append_transcript("Writer", "\n".join(lines), "final")
+
+    def _pipeline_show_response(self, name: str):
+        import pipeline_scanner as _ps
+        pl = _ps.find_pipeline_by_name(VAULT_DIR, name)
+        if not pl:
+            self._append_transcript(
+                "Writer",
+                f"No pipeline matching '{name}' under vault/pipelines/in/. "
+                f"Type 'list pipelines' to see what's available.",
+                "final",
+            )
+            return
+        rendered = _ps.render_pipeline(pl)
+        self._append_transcript("Writer", rendered, "final")
+
+    def _pipeline_modify_response(self, name: str, change: str, full_request: str):
+        import pipeline_scanner as _ps
+        import pipeline_editor as _pe
+
+        pl = _ps.find_pipeline_by_name(VAULT_DIR, name)
+        if not pl:
+            self._append_transcript(
+                "Writer",
+                f"No pipeline matching '{name}' to modify. Type 'list "
+                f"pipelines' to see what's available.",
+                "final",
+            )
+            return
+
+        self._append_transcript(
+            "Council",
+            f"Modifying {pl.name}: {change}",
+            "observation",
+        )
+        # Show the original first so the user sees what they're starting from
+        self._append_transcript("Writer", _ps.render_pipeline(pl), "observation")
+
+        # Hand to model + apply + save (synchronous; this can take a few sec)
+        self._set_status("● editing pipeline…", "#fab387")
+        try:
+            result = _pe.modify_pipeline_by_request(pl.path, full_request, VAULT_DIR)
+        except Exception as exc:
+            self._append_transcript(
+                "Writer",
+                f"Pipeline edit failed: {exc!r}",
+                "final",
+            )
+            return
+
+        if not result.success:
+            self._append_transcript(
+                "Writer",
+                f"Couldn't apply that change:\n  {result.error}",
+                "final",
+            )
+            if result.log:
+                self._append_transcript(
+                    "Council",
+                    "Partial log:\n  " + "\n  ".join(result.log),
+                    "observation",
+                )
+            return
+
+        try:
+            rel = result.new_path.relative_to(VAULT_DIR)
+        except Exception:
+            rel = result.new_path
+
+        log_lines = [f"Saved new version: {rel}", "", "Edits applied:"]
+        for line in result.log:
+            log_lines.append(f"  • {line}")
+        self._append_transcript("Writer", "\n".join(log_lines), "final")
+
     # ---- Council tab ----
 
     def _build_council_tab(self):
@@ -7197,6 +7340,13 @@ class CouncilConsole(tk.Tk):
         self._set_text(self.input, "")
         self._append_transcript("User", user_text)
         self._clear_stream_box()
+        # ── Pipeline intents (show / modify a Dream3D pipeline) ─────────
+        # "show pipeline X"      -> render the pipeline with [inputs]/(outputs)
+        # "modify pipeline X to ..."  -> run the editor flow, save to out/
+        if self._handle_pipeline_intent(user_text):
+            self._set_status("● idle")
+            return
+
         # ── 'forget X' command: reject prior fuzzy matches ─────────────
         # User can type "forget rockstar" or "forget rockstar, witcher" to
         # exclude those tokens from future fuzzy expansion. Persists per-vault.
