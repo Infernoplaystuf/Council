@@ -2644,6 +2644,7 @@ class CouncilConsole(tk.Tk):
         # 6) Manage data        → Vault
         # 7) Speech I/O         → Speech
         self._build_council_tab()
+        self._build_dream3d_tab()
         self._build_grapher_tab()
         self._build_specialists_tab()
         self._build_lens_tab()
@@ -3236,6 +3237,173 @@ class CouncilConsole(tk.Tk):
             self.transcript.tag_configure(tag, foreground=color, font=("Consolas", 10, "bold"))
         self.transcript.tag_configure("who_default", foreground=DEFAULT_COLOR, font=("Consolas", 10, "bold"))
         self.transcript.tag_configure("error", foreground="#f38ba8")
+
+    # ---- Dream3D tab ----
+    # A split view: chat mirror on the left, pipeline visualization on the
+    # right. The transcript here mirrors the Council transcript via
+    # _append_transcript (which writes to both widgets when present). The
+    # input box uses the same _send pipeline so all existing intent
+    # handlers (show / modify / run workflow) work from this tab too.
+
+    def _build_dream3d_tab(self):
+        self.tab_dream3d = ttk.Frame(self.nb)
+        self.nb.add(self.tab_dream3d, text="🧪 Dream3D")
+
+        paned = tk.PanedWindow(self.tab_dream3d, orient="horizontal",
+                               bg="#1a1414", sashwidth=6, sashrelief="flat")
+        paned.pack(fill="both", expand=True, padx=6, pady=6)
+
+        # ── Left: mirrored chat ──────────────────────────────────────
+        left = ttk.Frame(paned)
+        paned.add(left, minsize=420)
+
+        ttk.Label(left, text="Chat (mirrors Council)").pack(anchor="w")
+        self.dream3d_transcript = self._make_text(left, wrap="word", state="disabled")
+        # Reuse the same role-tag config the Council transcript uses
+        try:
+            for tag in self.transcript.tag_names():
+                cfg = self.transcript.tag_cget(tag, "foreground")
+                if cfg:
+                    self.dream3d_transcript.tag_configure(tag, foreground=cfg,
+                                                          font=("Consolas", 10, "bold"))
+        except Exception:
+            pass
+
+        d3d_sb = ttk.Scrollbar(left, command=self.dream3d_transcript.yview)
+        self.dream3d_transcript.configure(yscrollcommand=d3d_sb.set)
+        d3d_sb.pack(side="right", fill="y")
+        self.dream3d_transcript.pack(fill="both", expand=True)
+
+        d3d_input_frame = ttk.Frame(left)
+        d3d_input_frame.pack(fill="x", pady=(6, 0))
+        self.dream3d_input = self._make_text(d3d_input_frame, wrap="word", height=3)
+        self.dream3d_input.pack(fill="x")
+        self.dream3d_input.bind("<Control-Return>",
+                                lambda e: self._dream3d_send_from_input())
+        btns = ttk.Frame(left)
+        btns.pack(fill="x", pady=(4, 0))
+        ttk.Button(btns, text="Send", command=self._dream3d_send_from_input).pack(side="left")
+        ttk.Label(btns, text="  (Ctrl+Enter)", foreground="#7a7575").pack(side="left")
+
+        # ── Right: pipeline picker + step viewer ─────────────────────
+        right = ttk.Frame(paned)
+        paned.add(right, minsize=360)
+
+        ttk.Label(right, text="Pipelines in vault/pipelines/in/").pack(anchor="w")
+
+        list_row = ttk.Frame(right)
+        list_row.pack(fill="x", pady=(2, 0))
+
+        self.dream3d_pipeline_list = tk.Listbox(list_row, height=8, exportselection=False)
+        self.dream3d_pipeline_list.pack(side="left", fill="x", expand=True)
+        plist_sb = ttk.Scrollbar(list_row, command=self.dream3d_pipeline_list.yview)
+        self.dream3d_pipeline_list.configure(yscrollcommand=plist_sb.set)
+        plist_sb.pack(side="left", fill="y")
+        self.dream3d_pipeline_list.bind("<<ListboxSelect>>",
+                                        lambda _e: self._dream3d_show_selected())
+        self.dream3d_pipeline_list.bind("<Double-Button-1>",
+                                        lambda _e: self._dream3d_show_selected())
+
+        list_btns = ttk.Frame(right)
+        list_btns.pack(fill="x", pady=(2, 4))
+        ttk.Button(list_btns, text="↻ Refresh",
+                   command=self._dream3d_refresh_pipelines).pack(side="left")
+        ttk.Button(list_btns, text="Open in/ folder",
+                   command=self._dream3d_open_in_folder).pack(side="left", padx=4)
+        ttk.Button(list_btns, text="Open out/ folder",
+                   command=self._dream3d_open_out_folder).pack(side="left", padx=4)
+
+        ttk.Label(right, text="Pipeline visualization").pack(anchor="w", pady=(6, 0))
+        self.dream3d_view = self._make_text(right, wrap="word", state="disabled")
+        d3d_view_sb = ttk.Scrollbar(right, command=self.dream3d_view.yview)
+        self.dream3d_view.configure(yscrollcommand=d3d_view_sb.set)
+        d3d_view_sb.pack(side="right", fill="y")
+        self.dream3d_view.pack(fill="both", expand=True)
+
+        # Initial population
+        self._dream3d_refresh_pipelines()
+
+    def _dream3d_refresh_pipelines(self):
+        """Re-scan vault/pipelines/in/ and populate the listbox."""
+        try:
+            import pipeline_scanner as _ps
+            in_dir = _ps.vault_pipelines_in_dir(VAULT_DIR)
+            pipelines = _ps.scan_pipelines(in_dir)
+        except Exception as exc:
+            self._dream3d_set_view(f"Pipeline scan failed: {exc!r}")
+            return
+
+        self._dream3d_pipelines_cache = pipelines
+        self.dream3d_pipeline_list.delete(0, "end")
+        if not pipelines:
+            self.dream3d_pipeline_list.insert("end", "(none — drop .py / .dream3d files here)")
+            self._dream3d_set_view(
+                "No pipelines found.\n\n"
+                "Add simplnx .py scripts or .dream3d files to:\n"
+                f"  {in_dir}\n\n"
+                "Then click ↻ Refresh."
+            )
+            return
+        for pl in pipelines:
+            note = f"  ({pl.format}, {len(pl.steps)} step{'s' if len(pl.steps)!=1 else ''})"
+            self.dream3d_pipeline_list.insert("end", pl.name + note)
+
+    def _dream3d_show_selected(self):
+        sel = self.dream3d_pipeline_list.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        cache = getattr(self, "_dream3d_pipelines_cache", [])
+        if idx < 0 or idx >= len(cache):
+            return
+        pl = cache[idx]
+        try:
+            import pipeline_scanner as _ps
+            rendered = _ps.render_pipeline(pl)
+        except Exception as exc:
+            rendered = f"render failed: {exc!r}"
+        self._dream3d_set_view(rendered)
+
+    def _dream3d_set_view(self, text: str):
+        self.dream3d_view.configure(state="normal")
+        self.dream3d_view.delete("1.0", "end")
+        self.dream3d_view.insert("1.0", text)
+        self.dream3d_view.configure(state="disabled")
+
+    def _dream3d_open_in_folder(self):
+        import pipeline_scanner as _ps
+        self._open_in_explorer(_ps.vault_pipelines_in_dir(VAULT_DIR))
+
+    def _dream3d_open_out_folder(self):
+        import pipeline_scanner as _ps
+        self._open_in_explorer(_ps.vault_pipelines_out_dir(VAULT_DIR))
+
+    def _open_in_explorer(self, path: Path):
+        try:
+            os.startfile(str(path))  # Windows
+        except Exception:
+            try:
+                import subprocess as _sp
+                _sp.Popen(["explorer", str(path)])  # fallback
+            except Exception:
+                self._append_transcript(
+                    "Council", f"Couldn't open folder: {path}", "observation",
+                )
+
+    def _dream3d_send_from_input(self):
+        """Route the Dream3D tab's input through the Council _send flow."""
+        text = self.dream3d_input.get("1.0", "end").strip()
+        if not text:
+            return
+        # Push into the Council input widget and trigger _send so all the
+        # existing intent handlers (show / modify / run workflow / chat)
+        # apply uniformly.
+        self._set_text(self.input, text)
+        self._set_text(self.dream3d_input, "")
+        self._send()
+        # Refresh the pipeline list after — modifying a pipeline produces
+        # a new file in out/, but in/ is unchanged. Keep refresh available
+        # via the button.
 
     # ---- IDE tab ----
 
@@ -6439,17 +6607,24 @@ class CouncilConsole(tk.Tk):
             widget.configure(state="disabled")
 
     def _append_transcript(self, who: str, text: str, kind: str = "final"):
-        self.transcript.configure(state="normal")
-        tag = self._role_tag(who)
-        if kind == "phase":
-            self.transcript.insert("end", f"  {text}\n", "phase")
-        elif kind == "token":
-            self.transcript.insert("end", text, "token")
-        else:
-            self.transcript.insert("end", f"\n{who}:\n", tag)
-            self.transcript.insert("end", text.strip() + "\n")
-        self.transcript.see("end")
-        self.transcript.configure(state="disabled")
+        for widget in (getattr(self, "transcript", None),
+                       getattr(self, "dream3d_transcript", None)):
+            if widget is None:
+                continue
+            try:
+                widget.configure(state="normal")
+                tag = self._role_tag(who)
+                if kind == "phase":
+                    widget.insert("end", f"  {text}\n", "phase")
+                elif kind == "token":
+                    widget.insert("end", text, "token")
+                else:
+                    widget.insert("end", f"\n{who}:\n", tag)
+                    widget.insert("end", text.strip() + "\n")
+                widget.see("end")
+                widget.configure(state="disabled")
+            except tk.TclError:
+                pass  # widget may have been destroyed
 
         if kind not in ("token", "phase", "thought"):
             self.librarian.log_event(who, text)
