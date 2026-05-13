@@ -2879,6 +2879,77 @@ class CouncilConsole(tk.Tk):
             log_lines.append(f"  • {line}")
         self._append_transcript("Writer", "\n".join(log_lines), "final")
 
+    # ---- Workflow intent handler ----
+
+    _WORKFLOW_RE = _re.compile(
+        r"^\s*run\s+(?:the\s+)?workflow\b", _re.IGNORECASE,
+    )
+
+    def _handle_workflow_intent(self, user_text: str) -> bool:
+        """Detect 'run workflow ...' commands and execute them in a worker."""
+        if not user_text:
+            return False
+        single_line = user_text.split("\n", 1)[0]
+        if not self._WORKFLOW_RE.match(single_line):
+            return False
+
+        import workflow_runner as _wr
+        spec = _wr.parse_workflow_request(single_line, VAULT_DIR)
+        if not spec.pipeline_paths:
+            self._append_transcript(
+                "Writer",
+                "I couldn't resolve any pipelines from that workflow. Try "
+                "`list pipelines` to see what's available, then `run "
+                "workflow <name1>, <name2>, ...`",
+                "final",
+            )
+            return True
+
+        mode_label = {
+            "linear":   "linear (each pipeline once)",
+            "per_file": f"per-file over {spec.input_dir} (pattern: {spec.pattern})",
+            "per_step": f"per-step over {spec.input_dir} (pattern: {spec.pattern})",
+        }.get(spec.mode, spec.mode)
+
+        names = "\n  ".join(p.name for p in spec.pipeline_paths)
+        self._append_transcript(
+            "Council",
+            f"Starting workflow ({mode_label})\n  {names}",
+            "observation",
+        )
+        self._set_status("● workflow…", "#fab387")
+
+        def _post_transcript(who: str, text: str, tag: str) -> None:
+            # Tk widget calls must happen on the main thread.
+            self.after(0, lambda: self._append_transcript(who, text, tag))
+
+        def _post_status(label: str, color: Optional[str] = None) -> None:
+            self.after(0, lambda: self._set_status(label, color))
+
+        def worker():
+            def on_step(step: "_wr.StepResult") -> None:
+                if step.success:
+                    msg = (f"  [ok ]  #{step.step_index} {step.pipeline_name} "
+                           f"({step.input_label}) — {step.duration_s:.1f}s")
+                else:
+                    msg = (f"  [FAIL]  #{step.step_index} {step.pipeline_name} "
+                           f"({step.input_label}) — {step.error or 'failed'}")
+                _post_transcript("Workflow", msg, "observation")
+
+            try:
+                result = _wr.run_workflow(spec, on_step=on_step)
+            except Exception as exc:
+                _post_transcript("Writer", f"Workflow runner crashed: {exc!r}", "final")
+                _post_status("● idle", None)
+                return
+
+            _post_transcript("Writer", result.summary(), "final")
+            _post_status("● idle", None)
+
+        import threading as _th
+        _th.Thread(target=worker, daemon=True).start()
+        return True
+
     # ---- Council tab ----
 
     def _build_council_tab(self):
@@ -7346,6 +7417,11 @@ class CouncilConsole(tk.Tk):
         if self._handle_pipeline_intent(user_text):
             self._set_status("● idle")
             return
+
+        # ── Workflow intents (run a sequence of pipelines) ──────────────
+        # "run workflow A, B, C [on <dir> [per-file|per-step]]"
+        if self._handle_workflow_intent(user_text):
+            return  # status set inside (worker thread keeps status updated)
 
         # ── 'forget X' command: reject prior fuzzy matches ─────────────
         # User can type "forget rockstar" or "forget rockstar, witcher" to
