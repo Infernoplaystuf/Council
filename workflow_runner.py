@@ -225,11 +225,14 @@ def _stage_per_input_pipeline(
     replace the value of the first parameter named `substitution_param` on
     the first ReadDREAM3DFilter / ReadCSVFile / Import* filter.
     """
-    from pipeline_editor import apply_edits
+    from pipeline_editor import apply_edits, _value_text_end
 
     source = pipeline_path.read_text(encoding="utf-8", errors="replace")
 
-    # Find the first occurrence of `<substitution_param>="..."` or `=...`
+    # Find the first occurrence of `<substitution_param> [whitespace] = [whitespace] <value>`.
+    # We capture the EXACT matched prefix (including any spaces around `=`)
+    # so the apply_edits find-string matches the real source text — building
+    # a synthetic prefix with bare `=` misses `param = "value"` style.
     import re as _re
     pat = _re.compile(rf"\b{_re.escape(substitution_param)}\s*=\s*", _re.MULTILINE)
     m = pat.search(source)
@@ -239,18 +242,16 @@ def _stage_per_input_pipeline(
         target.write_text(source, encoding="utf-8")
         return target
 
-    # Build a replace_text edit so apply_edits validates the result with AST.
-    # We need to identify the old value text. Use a tiny scan of the value.
-    from pipeline_editor import _value_text_end
+    matched_prefix = m.group(0)              # e.g. 'file_path = '
     start = m.end()
     end = _value_text_end(source, start)
-    old_value = source[start:end]
-    new_value = repr(str(input_file))
+    old_value_text = source[start:end]
+    new_value_text = repr(str(input_file))   # repr handles backslashes safely
 
     result = apply_edits(source, [{
         "op": "replace_text",
-        "find": f"{substitution_param}={old_value}",
-        "replace": f"{substitution_param}={new_value}",
+        "find": matched_prefix + old_value_text,
+        "replace": matched_prefix + new_value_text,
         "max_count": 1,
     }])
     if not result.succeeded:
@@ -269,6 +270,26 @@ def _stage_per_input_pipeline(
     return target
 
 
+def _default_stage_dir() -> Path:
+    """Return a fresh staging directory under the system temp area.
+
+    Each invocation gets its own subdirectory so concurrent runs don't
+    stomp on each other. The caller is expected to clean it up.
+    """
+    import tempfile, uuid
+    base = Path(tempfile.gettempdir()) / "council_wf_stage" / uuid.uuid4().hex[:12]
+    base.mkdir(parents=True, exist_ok=True)
+    return base
+
+
+def _cleanup_stage_dir(stage_dir: Path) -> None:
+    try:
+        if stage_dir.exists():
+            shutil.rmtree(stage_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+
 def run_per_file(
     pipelines: List[Path],
     input_dir: Path,
@@ -283,8 +304,9 @@ def run_per_file(
     """For each input file in directory: run the whole pipeline list."""
     overall_start = time.monotonic()
     inputs = _list_directory_inputs(input_dir, pattern=pattern, recursive=recursive)
+    owned_stage = stage_dir is None
     if stage_dir is None:
-        stage_dir = input_dir.parent / "_wf_stage"
+        stage_dir = _default_stage_dir()
     stage_dir.mkdir(parents=True, exist_ok=True)
 
     total_steps = len(pipelines) * len(inputs)
@@ -294,34 +316,40 @@ def run_per_file(
         result.success = False
         result.error = f"no input files matched {pattern!r} under {input_dir}"
         result.duration_s = time.monotonic() - overall_start
+        if owned_stage:
+            _cleanup_stage_dir(stage_dir)
         return result
 
     step_counter = 0
-    for input_file in inputs:
-        file_stage = stage_dir / input_file.stem
-        file_stage.mkdir(parents=True, exist_ok=True)
-        for j, pipeline_path in enumerate(pipelines, start=1):
-            step_counter += 1
-            staged = _stage_per_input_pipeline(
-                pipeline_path, input_file, file_stage,
-                substitution_param=substitution_param,
-            )
-            step = _run_pipeline_subprocess(staged, timeout_s=timeout_s)
-            step.step_index = step_counter
-            step.input_label = input_file.name
-            result.step_results.append(step)
-            result.steps_run += 1
-            if on_step:
-                try:
-                    on_step(step)
-                except Exception:
-                    pass
-            if not step.success:
-                result.success = False
-                result.error = (f"step #{step_counter} ({pipeline_path.name}) "
-                                f"failed on input {input_file.name}")
-                result.duration_s = time.monotonic() - overall_start
-                return result
+    try:
+        for input_file in inputs:
+            file_stage = stage_dir / input_file.stem
+            file_stage.mkdir(parents=True, exist_ok=True)
+            for j, pipeline_path in enumerate(pipelines, start=1):
+                step_counter += 1
+                staged = _stage_per_input_pipeline(
+                    pipeline_path, input_file, file_stage,
+                    substitution_param=substitution_param,
+                )
+                step = _run_pipeline_subprocess(staged, timeout_s=timeout_s)
+                step.step_index = step_counter
+                step.input_label = input_file.name
+                result.step_results.append(step)
+                result.steps_run += 1
+                if on_step:
+                    try:
+                        on_step(step)
+                    except Exception:
+                        pass
+                if not step.success:
+                    result.success = False
+                    result.error = (f"step #{step_counter} ({pipeline_path.name}) "
+                                    f"failed on input {input_file.name}")
+                    result.duration_s = time.monotonic() - overall_start
+                    return result
+    finally:
+        if owned_stage:
+            _cleanup_stage_dir(stage_dir)
     result.duration_s = time.monotonic() - overall_start
     return result
 
@@ -344,8 +372,9 @@ def run_per_step(
     """For each pipeline: run it on every input file. Then move to next pipeline."""
     overall_start = time.monotonic()
     inputs = _list_directory_inputs(input_dir, pattern=pattern, recursive=recursive)
+    owned_stage = stage_dir is None
     if stage_dir is None:
-        stage_dir = input_dir.parent / "_wf_stage"
+        stage_dir = _default_stage_dir()
     stage_dir.mkdir(parents=True, exist_ok=True)
 
     total_steps = len(pipelines) * len(inputs)
@@ -355,35 +384,41 @@ def run_per_step(
         result.success = False
         result.error = f"no input files matched {pattern!r} under {input_dir}"
         result.duration_s = time.monotonic() - overall_start
+        if owned_stage:
+            _cleanup_stage_dir(stage_dir)
         return result
 
     step_counter = 0
-    for j, pipeline_path in enumerate(pipelines, start=1):
-        for input_file in inputs:
-            step_counter += 1
-            file_stage = stage_dir / input_file.stem
-            file_stage.mkdir(parents=True, exist_ok=True)
-            staged = _stage_per_input_pipeline(
-                pipeline_path, input_file, file_stage,
-                substitution_param=substitution_param,
-            )
-            step = _run_pipeline_subprocess(staged, timeout_s=timeout_s)
-            step.step_index = step_counter
-            step.input_label = f"{pipeline_path.name} <- {input_file.name}"
-            result.step_results.append(step)
-            result.steps_run += 1
-            if on_step:
-                try:
-                    on_step(step)
-                except Exception:
-                    pass
-            if not step.success:
-                result.success = False
-                result.error = (f"step #{step_counter}: pipeline "
-                                f"{pipeline_path.name} failed on "
-                                f"input {input_file.name}")
-                result.duration_s = time.monotonic() - overall_start
-                return result
+    try:
+        for j, pipeline_path in enumerate(pipelines, start=1):
+            for input_file in inputs:
+                step_counter += 1
+                file_stage = stage_dir / input_file.stem
+                file_stage.mkdir(parents=True, exist_ok=True)
+                staged = _stage_per_input_pipeline(
+                    pipeline_path, input_file, file_stage,
+                    substitution_param=substitution_param,
+                )
+                step = _run_pipeline_subprocess(staged, timeout_s=timeout_s)
+                step.step_index = step_counter
+                step.input_label = f"{pipeline_path.name} <- {input_file.name}"
+                result.step_results.append(step)
+                result.steps_run += 1
+                if on_step:
+                    try:
+                        on_step(step)
+                    except Exception:
+                        pass
+                if not step.success:
+                    result.success = False
+                    result.error = (f"step #{step_counter}: pipeline "
+                                    f"{pipeline_path.name} failed on "
+                                    f"input {input_file.name}")
+                    result.duration_s = time.monotonic() - overall_start
+                    return result
+    finally:
+        if owned_stage:
+            _cleanup_stage_dir(stage_dir)
     result.duration_s = time.monotonic() - overall_start
     return result
 

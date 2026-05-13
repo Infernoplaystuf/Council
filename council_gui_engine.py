@@ -39,6 +39,10 @@ from tkinter import ttk, messagebox, simpledialog
 import council_engine as ce
 import apothecary_engine as ae
 import branding
+# Set the Windows AppUserModelID *before* any Tk root is constructed, so the
+# taskbar uses our cog+flame icon instead of the host (Spyder/python.exe)
+# icon. No-op on macOS / Linux.
+branding.set_app_user_model_id()
 import onboarding
 import specialists as _spec
 import crash_reporter
@@ -2800,13 +2804,14 @@ class CouncilConsole(tk.Tk):
                 ".dream3d files in there and I'll see them.",
                 "final",
             )
-            return
-        lines = [f"Found {len(pipelines)} pipeline"
-                 f"{'s' if len(pipelines) != 1 else ''} in vault/pipelines/in/:"]
-        for pl in pipelines:
-            note = f" ({pl.format}, {len(pl.steps)} step{'s' if len(pl.steps)!=1 else ''})"
-            lines.append(f"  • {pl.name}{note}")
-        self._append_transcript("Writer", "\n".join(lines), "final")
+        else:
+            lines = [f"Found {len(pipelines)} pipeline"
+                     f"{'s' if len(pipelines) != 1 else ''} in vault/pipelines/in/:"]
+            for pl in pipelines:
+                note = f" ({pl.format}, {len(pl.steps)} step{'s' if len(pl.steps)!=1 else ''})"
+                lines.append(f"  • {pl.name}{note}")
+            self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
 
     def _pipeline_show_response(self, name: str):
         import pipeline_scanner as _ps
@@ -2818,13 +2823,13 @@ class CouncilConsole(tk.Tk):
                 f"Type 'list pipelines' to see what's available.",
                 "final",
             )
-            return
-        rendered = _ps.render_pipeline(pl)
-        self._append_transcript("Writer", rendered, "final")
+        else:
+            rendered = _ps.render_pipeline(pl)
+            self._append_transcript("Writer", rendered, "final")
+        self._set_status("● idle")
 
     def _pipeline_modify_response(self, name: str, change: str, full_request: str):
         import pipeline_scanner as _ps
-        import pipeline_editor as _pe
 
         pl = _ps.find_pipeline_by_name(VAULT_DIR, name)
         if not pl:
@@ -2837,25 +2842,35 @@ class CouncilConsole(tk.Tk):
             return
 
         self._append_transcript(
-            "Council",
-            f"Modifying {pl.name}: {change}",
-            "observation",
+            "Council", f"Modifying {pl.name}: {change}", "observation",
         )
         # Show the original first so the user sees what they're starting from
         self._append_transcript("Writer", _ps.render_pipeline(pl), "observation")
-
-        # Hand to model + apply + save (synchronous; this can take a few sec)
         self._set_status("● editing pipeline…", "#fab387")
-        try:
-            result = _pe.modify_pipeline_by_request(pl.path, full_request, VAULT_DIR)
-        except Exception as exc:
-            self._append_transcript(
-                "Writer",
-                f"Pipeline edit failed: {exc!r}",
-                "final",
-            )
-            return
 
+        # Run the model call + edit application in a worker so the UI
+        # stays responsive. The model can take 10+ seconds on slower GGUFs.
+        def _worker(pl=pl, full_request=full_request):
+            try:
+                import pipeline_editor as _pe_w
+                result = _pe_w.modify_pipeline_by_request(
+                    pl.path, full_request, VAULT_DIR,
+                )
+            except Exception as exc:
+                self.after(0, lambda: (
+                    self._append_transcript("Writer",
+                                            f"Pipeline edit failed: {exc!r}",
+                                            "final"),
+                    self._set_status("● idle"),
+                ))
+                return
+            self.after(0, lambda: self._pipeline_modify_finish(result))
+
+        import threading as _th
+        _th.Thread(target=_worker, daemon=True).start()
+
+    def _pipeline_modify_finish(self, result):
+        """Main-thread continuation after a pipeline modification worker finishes."""
         if not result.success:
             self._append_transcript(
                 "Writer",
@@ -2868,6 +2883,7 @@ class CouncilConsole(tk.Tk):
                     "Partial log:\n  " + "\n  ".join(result.log),
                     "observation",
                 )
+            self._set_status("● idle")
             return
 
         try:
@@ -2879,6 +2895,13 @@ class CouncilConsole(tk.Tk):
         for line in result.log:
             log_lines.append(f"  • {line}")
         self._append_transcript("Writer", "\n".join(log_lines), "final")
+        # Refresh the Dream3D pipeline list if the tab is built.
+        if hasattr(self, "_dream3d_refresh_pipelines"):
+            try:
+                self._dream3d_refresh_pipelines()
+            except Exception:
+                pass
+        self._set_status("● idle")
 
     # ---- Workflow intent handler ----
 
@@ -7587,10 +7610,10 @@ class CouncilConsole(tk.Tk):
         self._append_transcript("User", user_text)
         self._clear_stream_box()
         # ── Pipeline intents (show / modify a Dream3D pipeline) ─────────
-        # "show pipeline X"      -> render the pipeline with [inputs]/(outputs)
-        # "modify pipeline X to ..."  -> run the editor flow, save to out/
+        # The handlers manage their own status: list/show are synchronous
+        # (they set idle themselves on completion); modify is async (it
+        # leaves status on "editing…" until the worker finishes).
         if self._handle_pipeline_intent(user_text):
-            self._set_status("● idle")
             return
 
         # ── Workflow intents (run a sequence of pipelines) ──────────────

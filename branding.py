@@ -128,18 +128,55 @@ def window_title(subtitle: str = "") -> str:
     return PRODUCT_NAME
 
 
+APP_USER_MODEL_ID = "Infernoplaystuf.Council.Demo.1"
+
+
+def set_app_user_model_id(app_id: str = APP_USER_MODEL_ID) -> None:
+    """Tell Windows our process is its own app, not a child of python.exe.
+
+    Without this, the taskbar groups our window under whatever launched it
+    (Spyder, IDLE, plain python.exe) and uses that host's icon. Setting an
+    explicit AppUserModelID makes Windows treat the running interpreter as
+    a distinct app and the iconbitmap/iconphoto we set on the Tk window
+    actually shows up in the taskbar.
+
+    Must be called BEFORE the Tk root is created. Safe to call on non-
+    Windows platforms (no-op).
+    """
+    import sys
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except Exception:
+        pass  # AppUserModelID is cosmetic; never block startup
+
+
 def apply_window_icon(window) -> None:
     """
     Set the platform-appropriate window icon, no-op on failure.
     Called by the GUI on startup and by every Toplevel popup.
+
+    On Windows, also calls iconphoto with both the .ico and the PNG (in
+    that order) — Spyder's PYTHONUNBUFFERED Python kernel sometimes
+    ignores iconbitmap so the PNG path is a belt-and-suspenders fallback.
     """
     try:
         if ICON_ICO.exists():
-            window.iconbitmap(default=str(ICON_ICO))
-            return
+            try:
+                window.iconbitmap(default=str(ICON_ICO))
+            except Exception:
+                pass
         if ICON_PNG.exists():
             import tkinter as tk
-            img = tk.PhotoImage(file=str(ICON_PNG))
-            window.iconphoto(True, img)
+            try:
+                img = tk.PhotoImage(file=str(ICON_PNG))
+                # Keep a reference on the window so the image isn't GC'd
+                # (Tk PhotoImage requires a live Python reference).
+                window._council_icon_image = img
+                window.iconphoto(True, img)
+            except Exception:
+                pass
     except Exception:
         pass  # icon is cosmetic, never block startup
