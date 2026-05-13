@@ -469,18 +469,28 @@ class VaultIndex:
         seen: Set[str] = set()
         n_updated = 0
 
+        # Protected subdirs the model must NEVER index/read.
+        # conversation_logs is the human-only debugging log; pipelines/out
+        # is the modified-version dump that shouldn't leak as context.
+        try:
+            from conversation_logger import is_protected_path as _is_protected
+        except Exception:
+            _is_protected = lambda *_a, **_k: False
+
         for p in root.rglob("*"):
             if not p.is_file():
                 continue
             if p.name == INDEX_FILENAME:
                 continue
+            # HARD GUARD — conversation logs and other protected vault
+            # subfolders. Checked first so nothing under them can slip
+            # through any of the other filters.
+            if _is_protected(p, self.vault_dir):
+                continue
             # Skip pipelines/out/ — modified pipeline versions live there
-            # and must not leak back into the model's context when it
-            # generates new Dream3D scripts.
+            # and must not leak back into the model's context.
             parts = {part.lower() for part in p.parts}
             if "out" in parts and "pipelines" in parts:
-                # Only skip when the path is actually `.../pipelines/out/...`,
-                # not when "out" happens to appear elsewhere.
                 lower_str = str(p).lower().replace("\\", "/")
                 if "/pipelines/out/" in lower_str or lower_str.endswith("/pipelines/out"):
                     continue

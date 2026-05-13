@@ -289,12 +289,24 @@ _FILE_READ_CHAR_LIMIT = 12000  # total chars per file in the injected block
 def _read_file_for_injection(path_str):
     """Read a file into a compact prompt block. CSVs get headers + sample
     rows; large rows are abbreviated so the header line always survives the
-    model's context window."""
+    model's context window.
+
+    HARD GUARD: refuses to read anything under a protected vault subdir
+    (conversation_logs, etc.). The model must never see those files.
+    """
     try:
         import csv as _csv_fi
         p = Path(path_str.strip())
         if not p.exists() or not p.is_file():
             return None
+        # Defense-in-depth: even if the user pastes a path inside
+        # conversation_logs/, we refuse to inject it.
+        try:
+            import conversation_logger as _cl
+            if _cl.is_protected_path(p, VAULT_DIR):
+                return None
+        except Exception:
+            pass
         suffix = p.suffix.lower()
         if suffix == '.csv':
             with open(p, newline='', encoding='utf-8', errors='replace') as fh:
@@ -366,6 +378,8 @@ def _read_file_for_injection(path_str):
 
 
 def _extract_file_paths(text):
+    """Find file paths in the user message. Protected paths (conversation
+    logs) are filtered before they reach injection — see PROTECTED_SUBDIRS."""
     import unicodedata as _ud
     clean_chars = []
     for ch in text:
@@ -385,6 +399,14 @@ def _extract_file_paths(text):
         if candidate and candidate not in seen:
             seen.add(candidate)
             paths.append(candidate)
+    # HARD GUARD — drop any path under a protected vault subdir before
+    # it can reach the injection layer. The model must never see files
+    # under conversation_logs/.
+    try:
+        import conversation_logger as _cl
+        paths = [p for p in paths if not _cl.is_protected_path(p, VAULT_DIR)]
+    except Exception:
+        pass
     return paths
 
 
@@ -2258,6 +2280,19 @@ class CouncilConsole(tk.Tk):
         self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.prior_session_id: Optional[str] = None
         self.convo_store = ce.ConversationStore(VAULT_DIR / "conversations")
+        # Per-session debug log under vault/conversation_logs/.
+        # CRITICAL: this folder is in PROTECTED_SUBDIRS and is never read
+        # by the model — see conversation_logger.py for the full guarantee.
+        import conversation_logger as _cl
+        self.conv_logger = _cl.ConversationLogger(VAULT_DIR)
+        try:
+            self.conv_logger.start_session(self.session_id)
+        except Exception as _e:
+            print(f"[ConvLogger] start_session failed: {_e!r}")
+        # Window-close handler so the log gets a clean session_end marker.
+        self.protocol("WM_DELETE_WINDOW", self._on_app_close)
+        # Periodic background flush so logs survive crashes mid-session.
+        self.after(30_000, self._periodic_log_flush)
         # Load persisted backend selection (Ollama vs. GGUF, model choice)
         # BEFORE the engine builds its model dispatcher. Applies to env vars
         # so council_engine.DEFAULT_MODELS picks the right values.
@@ -7085,7 +7120,43 @@ class CouncilConsole(tk.Tk):
         if widget not in editable:
             widget.configure(state="disabled")
 
+    def _on_app_close(self):
+        """Flush conversation logs before the window closes."""
+        try:
+            if hasattr(self, "conv_logger") and self.conv_logger:
+                self.conv_logger.end_session("user_close")
+        except Exception:
+            pass
+        try:
+            self.destroy()
+        except Exception:
+            pass
+
+    def _periodic_log_flush(self):
+        """Drain the conversation logger every 30s so crashes don't lose logs."""
+        try:
+            if hasattr(self, "conv_logger") and self.conv_logger:
+                self.conv_logger.flush()
+        except Exception:
+            pass
+        try:
+            self.after(30_000, self._periodic_log_flush)
+        except Exception:
+            pass
+
     def _append_transcript(self, who: str, text: str, kind: str = "final"):
+        # Mirror to the per-session debug log first (write-only — the model
+        # never reads conversation_logs/). This runs before the UI write
+        # so even if rendering fails we still capture the event.
+        try:
+            if hasattr(self, "conv_logger") and self.conv_logger and kind not in ("token",):
+                self.conv_logger.log_event(
+                    kind=kind, who=who, text=text,
+                    meta={"session": getattr(self, "session_id", "")},
+                )
+        except Exception:
+            pass
+
         for widget in (getattr(self, "transcript", None),
                        getattr(self, "dream3d_transcript", None)):
             if widget is None:

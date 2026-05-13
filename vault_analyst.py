@@ -104,8 +104,28 @@ def safe_relative_path(path: Path, root: Optional[Path]) -> str:
     return str(Path(path).resolve())
 
 
+def _drop_protected(paths: List[Path], data_folder: Any) -> List[Path]:
+    """Filter out any file under a protected vault subdir (conversation_logs etc.)."""
+    try:
+        from conversation_logger import is_protected_path
+    except Exception:
+        return paths
+    folders = normalize_data_folders(data_folder)
+    out: List[Path] = []
+    for p in paths:
+        protected = False
+        for vd in folders:
+            if is_protected_path(p, vd):
+                protected = True
+                break
+        if not protected:
+            out.append(p)
+    return out
+
+
 def list_csv_files(data_folder: Any, recursive: bool = True) -> List[Path]:
-    """All CSVs under the given folder(s), deduped."""
+    """All CSVs under the given folder(s), deduped. Protected subdirs
+    (conversation logs) are excluded — they're for the user only."""
     folders = normalize_data_folders(data_folder)
     out: List[Path] = []
     for folder in folders:
@@ -120,7 +140,7 @@ def list_csv_files(data_folder: Any, recursive: bool = True) -> List[Path]:
             deduped[str(path.resolve()).lower()] = path.resolve()
         except Exception:
             pass
-    return sorted(deduped.values())
+    return _drop_protected(sorted(deduped.values()), folders)
 
 
 _EXCEL_GLOBS = ("*.xlsx", "*.xls", "*.xlsm")
@@ -142,7 +162,7 @@ def list_excel_files(data_folder: Any, recursive: bool = True) -> List[Path]:
             deduped[str(path.resolve()).lower()] = path.resolve()
         except Exception:
             pass
-    return sorted(deduped.values())
+    return _drop_protected(sorted(deduped.values()), folders)
 
 
 def list_data_files(data_folder: Any, recursive: bool = True) -> List[Path]:
