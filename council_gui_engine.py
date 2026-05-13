@@ -3499,6 +3499,16 @@ class CouncilConsole(tk.Tk):
         r"(?:index|descriptions?|summaries)\s*[.!?]?\s*$",
         _re.IGNORECASE,
     )
+    _EXPORT_TRANSCRIPT_RE = _re.compile(
+        r"^\s*(?:export|save)\s+(?:the\s+)?(?:current\s+)?transcript"
+        r"(?:\s+as\s+(?:markdown|md))?\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
+    _SCHEMA_DOC_RE = _re.compile(
+        r"^\s*(?:generate|build|make|export)\s+(?:a\s+)?schema\s+(?:doc(?:ument)?|"
+        r"documentation)\s+(?:for\s+|of\s+)?(.+?)\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
 
     def _handle_vault_tools_intent(self, user_text: str) -> bool:
         if not user_text:
@@ -3539,7 +3549,83 @@ class CouncilConsole(tk.Tk):
             self._build_semantic_index_response()
             return True
 
+        if self._EXPORT_TRANSCRIPT_RE.match(single_line):
+            self._export_transcript_response()
+            return True
+
+        m = self._SCHEMA_DOC_RE.match(single_line)
+        if m:
+            self._schema_doc_response(m.group(1).strip().strip("'\"`"))
+            return True
+
         return False
+
+    def _export_transcript_response(self):
+        import vault_tools as _vt
+        try:
+            out = _vt.export_transcript_as_markdown(VAULT_DIR, self.session_id)
+        except Exception as exc:
+            self._append_transcript("Writer", f"Export failed: {exc!r}", "final")
+            self._set_status("● idle")
+            return
+        if not out:
+            self._append_transcript(
+                "Writer",
+                "Nothing to export yet — this session has no recorded turns.",
+                "final",
+            )
+        else:
+            try:
+                rel = out.relative_to(VAULT_DIR)
+            except Exception:
+                rel = out
+            self._append_transcript(
+                "Writer", f"Transcript exported to {rel}", "final",
+            )
+        self._set_status("● idle")
+
+    def _schema_doc_response(self, target: str):
+        """Generate a schema doc for a CSV (path or name). Saves to data_out."""
+        p = Path(target).expanduser()
+        if not p.is_file():
+            from vault_analyst import list_csv_files
+            try:
+                matches = [c for c in list_csv_files(VAULT_DIR)
+                           if target.lower() in c.name.lower()]
+            except Exception:
+                matches = []
+            if matches:
+                p = matches[0]
+        if not p.is_file() or p.suffix.lower() != ".csv":
+            self._append_transcript(
+                "Writer",
+                f"Could not find a CSV matching '{target}'.",
+                "final",
+            )
+            self._set_status("● idle")
+            return
+        try:
+            import vault_analyst as _va
+            md = _va.schema_doc_from_csv(p)
+            out_dir = data_index.output_dir(VAULT_DIR)
+            out_path = out_dir / f"schema_{p.stem}.md"
+            n = 2
+            while out_path.exists():
+                out_path = out_dir / f"schema_{p.stem}_v{n}.md"
+                n += 1
+            out_path.write_text(md, encoding="utf-8")
+        except Exception as exc:
+            self._append_transcript("Writer", f"Schema doc failed: {exc!r}", "final")
+            self._set_status("● idle")
+            return
+        try:
+            rel = out_path.relative_to(VAULT_DIR)
+        except Exception:
+            rel = out_path
+        self._append_transcript(
+            "Writer", f"Schema doc for {p.name} -> {rel}", "final",
+        )
+        self._set_status("● idle")
 
     def _build_semantic_index_response(self):
         """Kick off the LLM description pass over the vault index."""

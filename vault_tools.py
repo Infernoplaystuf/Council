@@ -268,6 +268,73 @@ def recent_queries(
     return user_turns[:n]
 
 
+def export_transcript_as_markdown(
+    vault_dir: Path,
+    session_id: str,
+    *,
+    output_dir: Optional[Path] = None,
+) -> Optional[Path]:
+    """Render a session's conversation as a Markdown file.
+
+    Reads from vault/conversations/<session_id>.jsonl (the user-visible
+    transcript stream, NOT the protected conversation_logs/ folder).
+    Writes to vault/data_out/transcript_<session_id>.md by default.
+    Returns the output path on success, None if the session file is
+    missing or empty.
+    """
+    src = Path(vault_dir) / _HISTORY_SUBDIR / f"{session_id}.jsonl"
+    if not src.exists():
+        # Some ConversationStore variants use .json
+        src = src.with_suffix(".json")
+        if not src.exists():
+            return None
+
+    turns: List[Dict[str, Any]] = []
+    try:
+        for line in src.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                t = json.loads(line)
+                if isinstance(t, dict):
+                    turns.append(t)
+            except Exception:
+                continue
+    except Exception:
+        return None
+
+    if not turns:
+        return None
+
+    lines: List[str] = [f"# Session {session_id}", ""]
+    last_who = None
+    for t in turns:
+        who = str(t.get("who", "")).strip() or "unknown"
+        ts  = str(t.get("ts", "")).strip()
+        text = str(t.get("text", "")).rstrip()
+        if who != last_who:
+            lines.append(f"## {who}")
+            lines.append("")
+            last_who = who
+        if ts:
+            lines.append(f"_[{ts}]_")
+        lines.append("")
+        lines.append(text)
+        lines.append("")
+
+    if output_dir is None:
+        output_dir = Path(vault_dir) / "data_out"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / f"transcript_{session_id}.md"
+    n = 2
+    while out_path.exists():
+        out_path = output_dir / f"transcript_{session_id}_v{n}.md"
+        n += 1
+    out_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return out_path
+
+
 def format_history_hits(hits: List[Dict[str, Any]]) -> str:
     if not hits:
         return "No matches found in past conversations."

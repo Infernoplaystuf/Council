@@ -695,6 +695,167 @@ def groupby_mean_per_csv(
     return pd.concat(frames, ignore_index=True)
 
 
+# ============================================================
+# Text cleaning + date extraction
+# ============================================================
+
+def clean_string_column(
+    df: pd.DataFrame,
+    column: str,
+    *,
+    lowercase: bool = True,
+    strip: bool = True,
+    collapse_whitespace: bool = True,
+    nfkc: bool = True,
+) -> pd.DataFrame:
+    """Normalize a string column in place: optional lowercase, strip
+    whitespace, collapse runs of internal whitespace, and apply NFKC
+    Unicode normalization. Returns the same df with the column updated."""
+    col = column if column in df.columns else find_column_case_insensitive(df, column)
+    if col is None:
+        return df
+    s = df[col].astype(str)
+    if nfkc:
+        import unicodedata as _ud
+        s = s.map(lambda x: _ud.normalize("NFKC", x))
+    if strip:
+        s = s.str.strip()
+    if collapse_whitespace:
+        s = s.str.replace(r"\s+", " ", regex=True)
+    if lowercase:
+        s = s.str.lower()
+    df[col] = s
+    return df
+
+
+def extract_dates(
+    df: pd.DataFrame,
+    column: str,
+    *,
+    new_column: Optional[str] = None,
+    errors: str = "coerce",
+) -> pd.DataFrame:
+    """Parse a string column into pandas datetimes. By default writes
+    the parsed value back into `column`; pass `new_column` to keep the
+    original. Unparseable values become NaT."""
+    col = column if column in df.columns else find_column_case_insensitive(df, column)
+    if col is None:
+        return df
+    parsed = pd.to_datetime(df[col], errors=errors)
+    target = new_column or col
+    df[target] = parsed
+    return df
+
+
+# ============================================================
+# Top-N / value-counts wrapper
+# ============================================================
+
+def top_n_per_csv(
+    data_folder: Any,
+    column: str,
+    *,
+    n: int = 10,
+    recursive: bool = True,
+) -> pd.DataFrame:
+    """Top-N value counts for `column` in each CSV. Returns one long
+    frame: csv, relative_path, rank, value, count."""
+    folders = normalize_data_folders(data_folder)
+    rows: list[dict[str, Any]] = []
+    for csv_path in list_csv_files(folders, recursive=recursive):
+        root = first_matching_root(csv_path, folders)
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as exc:
+            rows.append({
+                "csv": csv_path.name,
+                "relative_path": safe_relative_path(csv_path, root),
+                "status": f"read error: {exc}",
+            })
+            continue
+        col = find_column_case_insensitive(df, column)
+        if col is None:
+            rows.append({
+                "csv": csv_path.name,
+                "relative_path": safe_relative_path(csv_path, root),
+                "status": f"missing column: {column}",
+            })
+            continue
+        vc = df[col].astype(str).value_counts(dropna=False).head(int(n))
+        for rank, (value, count) in enumerate(vc.items(), start=1):
+            rows.append({
+                "csv": csv_path.name,
+                "relative_path": safe_relative_path(csv_path, root),
+                "rank": rank,
+                "value": str(value),
+                "count": int(count),
+            })
+    return pd.DataFrame(rows)
+
+
+# ============================================================
+# Schema documentation
+# ============================================================
+
+def schema_doc_from_csv(path: Any) -> str:
+    """Generate a Markdown schema doc from summarize_csv output.
+
+    Useful for onboarding teammates onto a new dataset without writing
+    docs by hand. Returns a Markdown string the caller can save."""
+    p = Path(path)
+    try:
+        prof = summarize_csv(p)
+    except Exception as exc:
+        return f"# {p.name}\n\nCould not profile file: {exc}\n"
+    if prof.empty:
+        return f"# {p.name}\n\nEmpty or unreadable.\n"
+
+    try:
+        full_df = pd.read_csv(p, nrows=1)  # for total-column count, not values
+        n_cols = len(full_df.columns)
+    except Exception:
+        n_cols = len(prof)
+    try:
+        nrows_total = int(prof["non_null"].max() + prof["null_pct"].max() / 100 * prof["non_null"].max())
+    except Exception:
+        nrows_total = None
+
+    md: list[str] = [
+        f"# {p.name}",
+        "",
+        f"_Schema documentation, auto-generated from `summarize_csv`._",
+        "",
+        f"- Path: `{p}`",
+        f"- Columns: {n_cols}",
+    ]
+    if nrows_total:
+        md.append(f"- Approx rows: {nrows_total}")
+    md.append("")
+    md.append("| Column | Type | Non-null | Null % | Unique | Notes |")
+    md.append("|---|---|---:|---:|---:|---|")
+    for _, row in prof.iterrows():
+        notes_parts = []
+        if row.get("mean") is not None:
+            try:
+                notes_parts.append(f"mean={float(row['mean']):.2f}")
+                notes_parts.append(f"min={row['min']}")
+                notes_parts.append(f"max={row['max']}")
+            except Exception:
+                pass
+        elif row.get("top_values"):
+            notes_parts.append("top: " + str(row["top_values"]))
+        md.append("| `{c}` | {dt} | {nn} | {npct} | {u} | {notes} |".format(
+            c=row["column"],
+            dt=row["dtype"],
+            nn=row["non_null"],
+            npct=row["null_pct"],
+            u=row["unique"],
+            notes=", ".join(notes_parts),
+        ))
+    md.append("")
+    return "\n".join(md)
+
+
 def pivot_per_csv(
     data_folder: Any,
     index_col: str,
@@ -1182,6 +1343,11 @@ def execute_pandas_code(
         "list_sqlite_tables":     list_sqlite_tables,
         "read_sqlite_table":      read_sqlite_table,
         "pivot_per_csv":          pivot_per_csv,
+        # Text cleaning + top-N + schema doc
+        "clean_string_column":    clean_string_column,
+        "extract_dates":          extract_dates,
+        "top_n_per_csv":          top_n_per_csv,
+        "schema_doc_from_csv":    schema_doc_from_csv,
     }
     if np is not None:
         globals_dict["np"] = np
@@ -1292,6 +1458,12 @@ Parquet + SQLite:
 
 Pivot tables:
   pivot_per_csv(data_folder, index_col, columns_col, value_col, agg="sum")
+
+Text + dates + value counts + schema doc:
+  clean_string_column(df, column, lowercase=True, strip=True, ...)
+  extract_dates(df, column, new_column=None, errors="coerce")
+  top_n_per_csv(data_folder, column, n=10)     # value_counts per file
+  schema_doc_from_csv(path)                    # -> markdown string
 
 Rules:
 - Assign the final answer to a DataFrame named `result_df`.
