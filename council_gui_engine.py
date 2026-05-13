@@ -2903,6 +2903,63 @@ class CouncilConsole(tk.Tk):
                 pass
         self._set_status("● idle")
 
+    # ---- Vault ergonomic intent handler ----
+
+    _STATS_RE = _re.compile(
+        r"^\s*(?:vault\s+stats|stats|show\s+(?:vault\s+)?stats|"
+        r"what'?s\s+in\s+(?:my|the)\s+vault)\s*\??\s*$", _re.IGNORECASE,
+    )
+    _DUPES_RE = _re.compile(
+        r"^\s*(?:find|show|list)?\s*(?:duplicate(?:s)?|duplicates?)\b",
+        _re.IGNORECASE,
+    )
+    _HISTORY_SEARCH_RE = _re.compile(
+        r"^\s*(?:search|find\s+in)\s+history\s+(?:for\s+)?['\"]?(.+?)['\"]?\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
+    _RECENT_QUERIES_RE = _re.compile(
+        r"^\s*(?:recent\s+(?:queries|questions)|"
+        r"what\s+have\s+i\s+asked|"
+        r"my\s+recent\s+(?:queries|questions))\s*\??\s*$", _re.IGNORECASE,
+    )
+
+    def _handle_vault_tools_intent(self, user_text: str) -> bool:
+        if not user_text:
+            return False
+        single_line = user_text.split("\n", 1)[0]
+        import vault_tools as _vt
+
+        if self._STATS_RE.match(single_line):
+            stats = _vt.vault_stats(VAULT_DIR)
+            self._append_transcript("Writer", _vt.format_vault_stats(stats), "final")
+            return True
+
+        if self._DUPES_RE.match(single_line):
+            groups = _vt.find_duplicate_files(VAULT_DIR)
+            self._append_transcript("Writer", _vt.format_duplicates(groups), "final")
+            return True
+
+        m = self._HISTORY_SEARCH_RE.match(single_line)
+        if m:
+            query = m.group(1).strip()
+            hits = _vt.query_history_search(VAULT_DIR, query, limit=10)
+            self._append_transcript("Writer", _vt.format_history_hits(hits), "final")
+            return True
+
+        if self._RECENT_QUERIES_RE.match(single_line):
+            hits = _vt.recent_queries(VAULT_DIR, n=10)
+            if not hits:
+                self._append_transcript("Writer", "No past queries found.", "final")
+            else:
+                lines = [f"Last {len(hits)} user queries:"]
+                for h in hits:
+                    snippet = h["text"][:140].replace("\n", " ")
+                    lines.append(f"  [{h['ts']}]  {snippet}")
+                self._append_transcript("Writer", "\n".join(lines), "final")
+            return True
+
+        return False
+
     # ---- Workflow intent handler ----
 
     _WORKFLOW_RE = _re.compile(
@@ -7620,6 +7677,11 @@ class CouncilConsole(tk.Tk):
         # "run workflow A, B, C [on <dir> [per-file|per-step]]"
         if self._handle_workflow_intent(user_text):
             return  # status set inside (worker thread keeps status updated)
+
+        # ── Vault ergonomic intents (stats, dupes, history) ─────────────
+        if self._handle_vault_tools_intent(user_text):
+            self._set_status("● idle")
+            return
 
         # ── 'forget X' command: reject prior fuzzy matches ─────────────
         # User can type "forget rockstar" or "forget rockstar, witcher" to
