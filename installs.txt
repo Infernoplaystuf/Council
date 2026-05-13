@@ -1,17 +1,17 @@
 # ============================================================
-#  Council AI — Install Reference
-#  Two install paths:
-#    A) Ollama backend (default, easiest, faster on GPU)
-#    B) Direct GGUF backend (air-gapped / no Ollama daemon)
-#  You can install both and switch at runtime via COUNCIL_BACKEND.
+#  Council AI — Install Reference (GGUF-only build)
+#
+#  The council loads a single Hugging Face .gguf model from disk via
+#  llama-cpp-python. Ollama is no longer used. Designed for air-gapped
+#  machines where the user transfers a .gguf onto disk and runs the
+#  app fully offline.
 # ============================================================
 
 # ─────────────────────────────────────────────────────────────
 #  STEP 1 — Conda environment
 # ─────────────────────────────────────────────────────────────
-# Python 3.11 is required for torch/CUDA + llama-cpp wheel compatibility.
-# `spyder-kernels=2.5` makes the env usable from Spyder's IPython console
-# (skip it if you're not using Spyder).
+# Python 3.11 is required for torch + llama-cpp wheel compatibility.
+# `spyder-kernels=2.5` is only needed if you'll run the app from Spyder.
 conda create -n council python=3.11 spyder-kernels=2.5 -c conda-forge -y
 conda activate council
 
@@ -26,7 +26,7 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 # pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 
 # ─────────────────────────────────────────────────────────────
-#  STEP 3 — Core dependencies (always required)
+#  STEP 3 — Core dependencies
 # ─────────────────────────────────────────────────────────────
 pip install \
     beautifulsoup4 \
@@ -35,7 +35,6 @@ pip install \
     html2text \
     kaleido \
     langchain-core \
-    langchain-ollama \
     langgraph \
     matplotlib \
     mido \
@@ -52,7 +51,7 @@ pip install \
     sentence-transformers
 
 # ─────────────────────────────────────────────────────────────
-#  STEP 4 — File parsing helpers (for vault analyst / RAG over PDFs/DOCX)
+#  STEP 4 — File parsing helpers (for the vault analyst over PDFs/DOCX)
 # ─────────────────────────────────────────────────────────────
 conda install -c conda-forge pypdf python-docx huggingface_hub -y
 
@@ -62,54 +61,41 @@ conda install -c conda-forge pypdf python-docx huggingface_hub -y
 pip install tkinterweb faster-whisper sounddevice soundfile
 
 # ─────────────────────────────────────────────────────────────
-#  STEP 6 — Crawl4AI browser setup (downloads Chromium ~150 MB)
+#  STEP 6 — Crawl4AI browser setup (downloads Chromium ~150 MB; skip if offline)
 # ─────────────────────────────────────────────────────────────
 crawl4ai-setup
 
 # ─────────────────────────────────────────────────────────────
-#  STEP 7 — Backend A: Ollama
+#  STEP 7 — Local GGUF inference backend (llama-cpp-python)
 # ─────────────────────────────────────────────────────────────
-# Install Ollama from https://ollama.com/download
-# Then pull the models you want:
-ollama pull qwen2.5:14b-instruct-q4_K_M
-ollama pull qwen2.5-coder:14b-instruct-q4_K_M
-ollama pull phi4
-# (laptop / 8GB VRAM users — pull 7b instead:)
-# ollama pull qwen2.5:7b-instruct-q4_K_M
-# ollama pull qwen2.5-coder:7b-instruct-q4_K_M
-# ollama pull phi3.5
-
-# ─────────────────────────────────────────────────────────────
-#  STEP 8 — Backend B: Direct GGUF (no Ollama; works offline / air-gapped)
-# ─────────────────────────────────────────────────────────────
-# `llama-cpp-python` lets the council load a .gguf file directly so you can:
-#   - Transfer a GGUF onto an offline machine and just point at it
-#   - Use any Hugging Face GGUF without going through an Ollama Modelfile
-#
 # CPU-only build:
 conda install -c conda-forge llama-cpp-python -y
 #
-# GPU build (CUDA — much faster generation; requires CUDA toolkit installed):
+# GPU build (CUDA — much faster):
 # pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124
-#
-# Downloading a GGUF from Hugging Face (one-time, on a machine WITH internet):
-# huggingface-cli download Qwen/Qwen2.5-7B-Instruct-GGUF qwen2.5-7b-instruct-q4_k_m.gguf --local-dir ./models
-# Then copy the .gguf to your offline machine.
 
 # ─────────────────────────────────────────────────────────────
-#  STEP 9 — Choose the backend at runtime (env vars)
+#  STEP 8 — Download a GGUF model
 # ─────────────────────────────────────────────────────────────
-# Default (Ollama) — no env vars needed.
+# Recommended US-licensed picks:
+#   Laptop  (8 GB VRAM):  bartowski/granite-3.0-8b-instruct-GGUF (Q4_K_M)
+#   Desktop (16 GB VRAM): bartowski/phi-4-GGUF (Q4_K_M)
 #
-# To use a local GGUF instead:
-#   set COUNCIL_BACKEND=gguf
-#   set COUNCIL_GGUF_PATH=C:\path\to\model.gguf
-# Optional GGUF tuning:
+# One-time download on a machine with internet:
+# huggingface-cli download bartowski/granite-3.0-8b-instruct-GGUF granite-3.0-8b-instruct-Q4_K_M.gguf --local-dir C:\models
+#
+# Transfer the .gguf to your offline machine, then open the app and
+# click "Browse..." in the GGUF model picker at the top of the Council tab.
+
+# ─────────────────────────────────────────────────────────────
+#  STEP 9 — Optional environment variable overrides
+# ─────────────────────────────────────────────────────────────
+# These can be set instead of (or in addition to) the in-app picker:
+#   set COUNCIL_GGUF_PATH=C:\models\granite-3.0-8b-instruct-Q4_K_M.gguf
 #   set COUNCIL_GGUF_N_CTX=4096          (context window)
 #   set COUNCIL_GGUF_N_THREADS=8         (CPU threads; defaults to all cores)
-#   set COUNCIL_GGUF_GPU_LAYERS=0        (0 = CPU only, 99 = all on GPU)
-#
-# (PowerShell uses $env:NAME="value" instead of set NAME=value)
+#   set COUNCIL_GGUF_GPU_LAYERS=99       (0 = CPU only, 99 = all on GPU)
+# (PowerShell: use $env:NAME="value")
 
 # ─────────────────────────────────────────────────────────────
 #  STEP 10 — Verify install
@@ -119,37 +105,24 @@ python -c "
 import importlib
 for p in ['torch','pandas','numpy','scipy','sklearn','matplotlib','plotly',
           'chromadb','sentence_transformers','mido','music21','langgraph',
-          'langchain_ollama','crawl4ai','bs4','html2text','tkinterweb',
+          'crawl4ai','bs4','html2text','tkinterweb',
           'pypdf','docx','huggingface_hub','llama_cpp']:
     try: importlib.import_module(p); print(f'  OK       {p}')
     except Exception as e: print(f'  MISSING  {p}: {e}')
 "
 
 # ============================================================
-#  KEY DIFFERENCES — Desktop (RTX 5080 / 16 GB) vs Laptop (RTX 4070 / 8 GB)
+#  Hardware tier guidance
 # ============================================================
+#  Laptop (RTX 4070, 8 GB VRAM):
+#    - 7-8B Q4_K_M GGUF fits with 4-8K context
+#    - COUNCIL_GGUF_N_CTX=4096, COUNCIL_GGUF_GPU_LAYERS=99
 #
-#  Model tier:
-#    Laptop : qwen2.5:7b-instruct-q4_K_M   (~4.7 GB)
-#    Desktop: qwen2.5:14b-instruct-q4_K_M  (~9.0 GB)
+#  Desktop (RTX 5080, 16 GB VRAM):
+#    - 14B Q4_K_M GGUF fits with 8K context (Phi-4 is a strong pick)
+#    - COUNCIL_GGUF_N_CTX=8192, COUNCIL_GGUF_GPU_LAYERS=99
 #
-#  Fast/judge/peasant model:
-#    Laptop : phi3.5
-#    Desktop: phi4
-#
-#  Context window (num_ctx):
-#    Laptop : 4096
-#    Desktop: 8192
-#
-#  Concurrent models in VRAM (OLLAMA_MAX_LOADED_MODELS):
-#    Laptop : 1   (swap between roles)
-#    Desktop: 2   (writer + coder simultaneously)
-#
-#  CUDA PyTorch wheel:
-#    Laptop : cu121
-#    Desktop: cu124  (Blackwell sm_120)
-#
-#  Timeouts:
-#    Laptop : blocking=360s, streaming=420s
-#    Desktop: blocking=120s, streaming=150s
+#  CPU-only:
+#    - Use a 7B Q4 model; set COUNCIL_GGUF_GPU_LAYERS=0
+#    - Set COUNCIL_GGUF_N_THREADS to your core count
 # ============================================================

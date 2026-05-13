@@ -20,13 +20,9 @@ matplotlib>=3.7
 plotly>=5.17
 tkinterweb>=3.24         # Plotly HTML viewer inside Tk
 
-# ---- AI backends ----
-# Pick one (or both):
-#   Ollama backend — needs the Ollama daemon running.
-ollama>=0.1.7
-#   Direct GGUF backend — loads a .gguf file from disk, no daemon needed.
-#   Useful for air-gapped machines. Set COUNCIL_BACKEND=gguf and
-#   COUNCIL_GGUF_PATH=/path/to/model.gguf to enable.
+# ---- AI backend ----
+# GGUF-only — point COUNCIL_GGUF_PATH at a .gguf file from Hugging Face,
+# or pick one via the in-app Browse button. Ollama is not used.
 llama-cpp-python>=0.2.79
 
 # ---- RAG (vault search) — optional but installed by default ----

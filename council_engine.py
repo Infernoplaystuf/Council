@@ -108,8 +108,9 @@ def _ensure_localhost(url: str, *, allow_remote: bool = False) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _council_backend() -> str:
-    """Return the active backend name: 'ollama' (default) or 'gguf'."""
-    return os.environ.get("COUNCIL_BACKEND", "ollama").strip().lower() or "ollama"
+    """Always 'gguf' — Ollama was removed. Kept as a function for any
+    leftover call sites; returns the fixed string."""
+    return "gguf"
 
 
 _GGUF_MODEL_INSTANCE = None
@@ -214,19 +215,10 @@ def local_chat(
     host: Optional[str] = None,
     timeout: int = 120,
 ) -> str:
-    """Backend-agnostic blocking chat call. Picks Ollama or GGUF based on
-    COUNCIL_BACKEND. Use this for one-shot tool calls (e.g. the analyst step)
-    where you don't need streaming or the full LocalBackendSpec machinery."""
-    if _council_backend() == "gguf":
-        return _gguf_chat(messages, temperature=temperature, num_predict=num_predict)
-    return _ollama_chat(
-        host=host or DEFAULT_OLLAMA_HOST,
-        model=model or DEFAULT_MODELS.get("coder_primary") or DEFAULT_MODELS.get("general_primary") or "qwen2.5:7b-instruct-q4_K_M",
-        messages=messages,
-        temperature=temperature,
-        num_predict=num_predict,
-        timeout=timeout,
-    )
+    """Blocking chat call against the loaded GGUF. `model`, `host`, `timeout`
+    accepted for caller compatibility but ignored — every role uses the
+    single GGUF singleton."""
+    return _gguf_chat(messages, temperature=temperature, num_predict=num_predict)
 
 
 def _ollama_chat(
@@ -442,32 +434,17 @@ class LocalBackendSpec:
             {"role": "user", "content": user_text},
         ]
 
-        # ── GGUF backend (direct llama-cpp-python; no Ollama daemon) ───────
-        # Same loaded model serves every role; per-spec `model` field is
-        # ignored. Designed for air-gapped machines with a single GGUF on disk.
-        if _council_backend() == "gguf":
-            if token_callback is not None:
-                return _gguf_chat_stream(
-                    messages,
-                    temperature=temp, num_predict=mtok,
-                    token_callback=token_callback,
-                )
-            return _gguf_chat(
+        # Single GGUF singleton serves every role. `model`, `host`,
+        # `allow_remote` retained for trace/registry compatibility only.
+        if token_callback is not None:
+            return _gguf_chat_stream(
                 messages,
                 temperature=temp, num_predict=mtok,
-            )
-
-        if token_callback is not None:
-            return _ollama_chat_stream(
-                self.host, self.model, messages,
-                temperature=temp, num_predict=mtok,
-                allow_remote=self.allow_remote,
                 token_callback=token_callback,
             )
-        return _ollama_chat(
-            self.host, self.model, messages,
+        return _gguf_chat(
+            messages,
             temperature=temp, num_predict=mtok,
-            allow_remote=self.allow_remote,
         )
 
 
@@ -3276,11 +3253,9 @@ _ROLE_SLOTS = (
 
 
 def _populate_default_models() -> Dict[str, str]:
-    """Build the DEFAULT_MODELS map based on current backend env vars."""
-    if _council_backend() == "gguf":
-        label = _gguf_model_label()
-        return {slot: label for slot in _ROLE_SLOTS}
-    return _build_default_models(DEFAULT_OLLAMA_HOST)
+    """All roles map to the single loaded GGUF — return the same label everywhere."""
+    label = _gguf_model_label()
+    return {slot: label for slot in _ROLE_SLOTS}
 
 
 DEFAULT_MODELS = _populate_default_models()
@@ -3306,9 +3281,8 @@ def refresh_backend_config() -> Dict[str, str]:
 
 
 def detect_ollama_models() -> List[str]:
-    """List of Ollama models installed on the local daemon. Empty list if
-    Ollama isn't reachable. Public helper for the GUI dropdown."""
-    return _detect_ollama_models(DEFAULT_OLLAMA_HOST)
+    """Deprecated — Ollama was removed. Always returns []."""
+    return []
 
 
 def load_personality_pins(path: Path) -> Dict[str, str]:
