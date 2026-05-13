@@ -33,6 +33,7 @@ huggingface_hub>=0.20    # for huggingface-cli download of GGUF models
 # ---- File parsing for vault analyst / RAG over docs ----
 pypdf>=4.0
 python-docx>=1.1
+h5py>=3.10               # for reading .dream3d HDF5 pipelines
 
 # ---- IDE integration (optional — only needed if running from Spyder) ----
 # spyder-kernels>=2.5    # uncomment if you use Spyder; matches conda env

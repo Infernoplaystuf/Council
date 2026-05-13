@@ -395,6 +395,16 @@ class VaultIndex:
                 continue
             if p.name == INDEX_FILENAME:
                 continue
+            # Skip pipelines/out/ — modified pipeline versions live there
+            # and must not leak back into the model's context when it
+            # generates new Dream3D scripts.
+            parts = {part.lower() for part in p.parts}
+            if "out" in parts and "pipelines" in parts:
+                # Only skip when the path is actually `.../pipelines/out/...`,
+                # not when "out" happens to appear elsewhere.
+                lower_str = str(p).lower().replace("\\", "/")
+                if "/pipelines/out/" in lower_str or lower_str.endswith("/pipelines/out"):
+                    continue
             if p.suffix.lower() not in _PARSEABLE:
                 continue
             spath = str(p)

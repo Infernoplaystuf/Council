@@ -53,7 +53,7 @@ pip install \
 # ─────────────────────────────────────────────────────────────
 #  STEP 4 — File parsing helpers (for the vault analyst over PDFs/DOCX)
 # ─────────────────────────────────────────────────────────────
-conda install -c conda-forge pypdf python-docx huggingface_hub -y
+conda install -c conda-forge pypdf python-docx huggingface_hub h5py -y
 
 # ─────────────────────────────────────────────────────────────
 #  STEP 5 — Optional packages
