@@ -131,52 +131,127 @@ def window_title(subtitle: str = "") -> str:
 APP_USER_MODEL_ID = "Infernoplaystuf.Council.Demo.1"
 
 
-def set_app_user_model_id(app_id: str = APP_USER_MODEL_ID) -> None:
+def set_app_user_model_id(app_id: str = APP_USER_MODEL_ID) -> bool:
     """Tell Windows our process is its own app, not a child of python.exe.
 
     Without this, the taskbar groups our window under whatever launched it
     (Spyder, IDLE, plain python.exe) and uses that host's icon. Setting an
-    explicit AppUserModelID makes Windows treat the running interpreter as
-    a distinct app and the iconbitmap/iconphoto we set on the Tk window
-    actually shows up in the taskbar.
+    explicit AppUserModelID makes Windows treat the running interpreter
+    as a distinct app and the iconbitmap/iconphoto we set on the Tk
+    window actually shows up in the taskbar.
 
-    Must be called BEFORE the Tk root is created. Safe to call on non-
-    Windows platforms (no-op).
+    Must be called BEFORE the Tk root is created. Returns True on
+    success. Prints a one-line diagnostic so issues are visible at
+    startup instead of being silently swallowed.
     """
     import sys
     if sys.platform != "win32":
-        return
+        return False
     try:
         import ctypes
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
-    except Exception:
-        pass  # AppUserModelID is cosmetic; never block startup
+        # SetCurrentProcessExplicitAppUserModelID returns an HRESULT.
+        # 0 = S_OK. Non-zero = failure.
+        hr = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+        if hr == 0:
+            print(f"[branding] AppUserModelID set: {app_id}")
+            return True
+        print(f"[branding] AppUserModelID FAILED: hr=0x{hr & 0xFFFFFFFF:08X}")
+        return False
+    except Exception as e:
+        print(f"[branding] AppUserModelID exception: {e!r}")
+        return False
+
+
+def _force_win32_icon(window, ico_path):
+    """Last-resort: send WM_SETICON via Win32 so even if Tk's iconbitmap
+    didn't take, Windows uses our icon for the taskbar entry. Loads the
+    .ico at both small (16x16) and large (32x32) sizes."""
+    import sys
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        # Get the HWND of the Tk window
+        hwnd = int(window.wm_frame(), 16) if hasattr(window, "wm_frame") else None
+        # wm_frame returns "0x..." string; convert to int
+        if not hwnd:
+            return False
+
+        # LoadImageW signature: HINSTANCE, LPCWSTR name, UINT type, int cx,
+        #                       int cy, UINT flags
+        IMAGE_ICON   = 1
+        LR_LOADFROMFILE = 0x00000010
+        LR_DEFAULTSIZE  = 0x00000040
+        WM_SETICON   = 0x0080
+        ICON_SMALL   = 0
+        ICON_BIG     = 1
+
+        user32.LoadImageW.restype  = wintypes.HANDLE
+        user32.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR,
+                                       wintypes.UINT, ctypes.c_int,
+                                       ctypes.c_int, wintypes.UINT]
+        user32.SendMessageW.restype = ctypes.c_long
+
+        small = user32.LoadImageW(None, str(ico_path), IMAGE_ICON, 16, 16,
+                                  LR_LOADFROMFILE)
+        big   = user32.LoadImageW(None, str(ico_path), IMAGE_ICON, 32, 32,
+                                  LR_LOADFROMFILE)
+        if small:
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small)
+        if big:
+            user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG,   big)
+        return bool(small or big)
+    except Exception as e:
+        print(f"[branding] Win32 icon fallback exception: {e!r}")
+        return False
 
 
 def apply_window_icon(window) -> None:
-    """
-    Set the platform-appropriate window icon, no-op on failure.
-    Called by the GUI on startup and by every Toplevel popup.
+    """Set the platform-appropriate window icon, with diagnostics so any
+    failure is visible instead of silently swallowed.
 
-    On Windows, also calls iconphoto with both the .ico and the PNG (in
-    that order) — Spyder's PYTHONUNBUFFERED Python kernel sometimes
-    ignores iconbitmap so the PNG path is a belt-and-suspenders fallback.
+    Tries (in order):
+      1. window.iconbitmap(default=...) with the .ico
+      2. window.iconphoto(True, ...) with the .png as a separate fallback
+      3. WM_SETICON via Win32 so the taskbar always picks something up,
+         even if Tk's iconbitmap was ignored by the host (Spyder kernel).
     """
-    try:
-        if ICON_ICO.exists():
+    import sys
+
+    if not ICON_ICO.exists() and not ICON_PNG.exists():
+        print(f"[branding] no icon assets at {ICON_ICO} or {ICON_PNG}")
+        return
+
+    if ICON_ICO.exists():
+        try:
+            window.iconbitmap(default=str(ICON_ICO))
+        except Exception as e:
+            print(f"[branding] iconbitmap(default=...) failed: {e!r}")
+        try:
+            window.iconbitmap(str(ICON_ICO))   # also set for THIS window
+        except Exception:
+            pass
+
+    if ICON_PNG.exists():
+        import tkinter as tk
+        try:
+            img = tk.PhotoImage(file=str(ICON_PNG))
+            window._council_icon_image = img    # keep a live ref so GC won't kill it
+            window.iconphoto(True, img)
+        except Exception as e:
+            print(f"[branding] iconphoto failed: {e!r}")
+
+    # Win32 fallback — defer until the window is mapped so wm_frame works.
+    if sys.platform == "win32" and ICON_ICO.exists():
+        def _later():
             try:
-                window.iconbitmap(default=str(ICON_ICO))
+                _force_win32_icon(window, ICON_ICO)
             except Exception:
                 pass
-        if ICON_PNG.exists():
-            import tkinter as tk
-            try:
-                img = tk.PhotoImage(file=str(ICON_PNG))
-                # Keep a reference on the window so the image isn't GC'd
-                # (Tk PhotoImage requires a live Python reference).
-                window._council_icon_image = img
-                window.iconphoto(True, img)
-            except Exception:
-                pass
-    except Exception:
-        pass  # icon is cosmetic, never block startup
+        try:
+            window.after(50, _later)
+        except Exception:
+            pass
