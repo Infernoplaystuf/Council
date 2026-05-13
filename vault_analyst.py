@@ -562,6 +562,221 @@ def correlation_per_csv(
     return pd.DataFrame(rows)
 
 
+# ============================================================
+# CSV-level helpers (single file)
+# ============================================================
+
+def summarize_csv(path: Any) -> pd.DataFrame:
+    """One-call profile of a single CSV.
+
+    Returns a DataFrame with one row per column: dtype, null %, unique
+    count, top values (for categoricals), mean/std/min/max (for numerics).
+    Saves the model from hand-rolling 15 lines of pandas.
+    """
+    p = Path(path)
+    df = pd.read_csv(p)
+    rows: List[Dict[str, Any]] = []
+    total = max(1, len(df))
+    for col in df.columns:
+        s = df[col]
+        nulls = int(s.isna().sum())
+        rec: Dict[str, Any] = {
+            "csv":          p.name,
+            "column":       str(col),
+            "dtype":        str(s.dtype),
+            "non_null":     int(s.count()),
+            "null_pct":     round(100 * nulls / total, 2),
+            "unique":       int(s.nunique(dropna=True)),
+        }
+        # Try numeric coercion to see if we have aggregatable values
+        coerced = pd.to_numeric(s, errors="coerce")
+        if coerced.notna().sum() >= max(3, total * 0.5):
+            valid = coerced.dropna()
+            rec["mean"]   = float(valid.mean())
+            rec["std"]    = float(valid.std()) if valid.size >= 2 else None
+            rec["min"]    = float(valid.min())
+            rec["max"]    = float(valid.max())
+            rec["median"] = float(valid.median())
+            rec["top_values"] = ""
+        else:
+            # Categorical / text — show top values
+            try:
+                vc = s.astype(str).value_counts(dropna=True).head(5)
+                rec["top_values"] = ", ".join(
+                    f"{idx}({cnt})" for idx, cnt in vc.items()
+                )
+            except Exception:
+                rec["top_values"] = ""
+            rec["mean"] = rec["std"] = rec["min"] = rec["max"] = rec["median"] = None
+        rows.append(rec)
+    return pd.DataFrame(rows)
+
+
+def detect_outliers(
+    df: pd.DataFrame,
+    column: str,
+    *,
+    method: str = "iqr",
+    threshold: float = 1.5,
+) -> pd.DataFrame:
+    """Return rows where `column` is an outlier.
+
+    method='iqr'  — value outside [Q1 - k*IQR, Q3 + k*IQR] with k=threshold
+    method='zscore' — |z| > threshold
+    Adds an `outlier_score` column showing how far out the value is.
+    """
+    if column not in df.columns:
+        actual = find_column_case_insensitive(df, column)
+        if actual is None:
+            return pd.DataFrame()
+        column = actual
+    values = pd.to_numeric(df[column], errors="coerce")
+    work = df.loc[values.notna()].copy()
+    work[column] = values[values.notna()]
+    if work.empty:
+        return work
+
+    method = (method or "iqr").lower()
+    if method == "zscore":
+        mu = work[column].mean()
+        sd = work[column].std() or 1.0
+        z = (work[column] - mu) / sd
+        mask = z.abs() > threshold
+        work["outlier_score"] = z.abs()
+    else:  # iqr
+        q1 = work[column].quantile(0.25)
+        q3 = work[column].quantile(0.75)
+        iqr = q3 - q1
+        lower = q1 - threshold * iqr
+        upper = q3 + threshold * iqr
+        mask = (work[column] < lower) | (work[column] > upper)
+        work["outlier_score"] = work[column].apply(
+            lambda v: max(lower - v, v - upper) / max(iqr, 1e-9)
+        )
+    return work.loc[mask].sort_values("outlier_score", ascending=False)
+
+
+def time_series_resample(
+    df: pd.DataFrame,
+    date_col: str,
+    value_col: str,
+    *,
+    freq: str = "M",
+    agg: str = "sum",
+) -> pd.DataFrame:
+    """Aggregate `value_col` over `date_col` at the given frequency.
+
+    freq follows pandas offset aliases: 'D' (day), 'W' (week), 'M'
+    (month), 'Q' (quarter), 'Y' (year). `agg` is any pandas agg name
+    ('sum', 'mean', 'min', 'max', 'count', 'median').
+    """
+    dc = date_col if date_col in df.columns else find_column_case_insensitive(df, date_col)
+    vc = value_col if value_col in df.columns else find_column_case_insensitive(df, value_col)
+    if dc is None or vc is None:
+        return pd.DataFrame()
+    work = df.copy()
+    work[dc] = pd.to_datetime(work[dc], errors="coerce")
+    work[vc] = pd.to_numeric(work[vc], errors="coerce")
+    work = work[work[dc].notna() & work[vc].notna()]
+    if work.empty:
+        return work
+    grouped = work.set_index(dc)[vc].resample(freq).agg(agg)
+    out = grouped.reset_index()
+    out.columns = [dc, f"{vc}_{agg}"]
+    return out
+
+
+# ============================================================
+# Cross-CSV helpers
+# ============================================================
+
+def join_csvs_on_column(
+    left: Any,
+    right: Any,
+    on: str,
+    *,
+    how: str = "inner",
+    suffixes: tuple = ("_left", "_right"),
+) -> pd.DataFrame:
+    """Read two CSVs and join them on a column.
+
+    `left` and `right` are CSV paths. `on` is the column name (case-
+    insensitive). `how` is any pandas join kind: 'inner', 'left',
+    'right', 'outer'.
+    """
+    df_l = pd.read_csv(left) if not isinstance(left, pd.DataFrame) else left
+    df_r = pd.read_csv(right) if not isinstance(right, pd.DataFrame) else right
+    col_l = on if on in df_l.columns else find_column_case_insensitive(df_l, on)
+    col_r = on if on in df_r.columns else find_column_case_insensitive(df_r, on)
+    if col_l is None or col_r is None:
+        return pd.DataFrame()
+    # Rename to a common column name so merge works cleanly
+    df_l = df_l.rename(columns={col_l: on})
+    df_r = df_r.rename(columns={col_r: on})
+    return pd.merge(df_l, df_r, on=on, how=how, suffixes=suffixes)
+
+
+def compare_two_csvs(
+    a: Any,
+    b: Any,
+    *,
+    on: Optional[str] = None,
+) -> pd.DataFrame:
+    """Row-level diff between two CSV snapshots.
+
+    With `on`: rows are matched by that key column. Result has a `status`
+    column with 'added' / 'removed' / 'changed' / 'same' and per-column
+    columns showing left/right values where they differ.
+
+    Without `on`: returns rows present in exactly one CSV (treats every
+    row as a fingerprint). Faster but less informative.
+    """
+    df_a = pd.read_csv(a) if not isinstance(a, pd.DataFrame) else a
+    df_b = pd.read_csv(b) if not isinstance(b, pd.DataFrame) else b
+
+    if on:
+        col_a = on if on in df_a.columns else find_column_case_insensitive(df_a, on)
+        col_b = on if on in df_b.columns else find_column_case_insensitive(df_b, on)
+        if col_a is None or col_b is None:
+            return pd.DataFrame([{"status": "error",
+                                  "message": f"join column {on!r} missing"}])
+        df_a = df_a.rename(columns={col_a: on}).set_index(on)
+        df_b = df_b.rename(columns={col_b: on}).set_index(on)
+        all_keys = df_a.index.union(df_b.index)
+        rows: List[Dict[str, Any]] = []
+        common_cols = [c for c in df_a.columns if c in df_b.columns]
+        for k in all_keys:
+            in_a = k in df_a.index
+            in_b = k in df_b.index
+            if in_a and not in_b:
+                rows.append({on: k, "status": "removed"})
+            elif in_b and not in_a:
+                rows.append({on: k, "status": "added"})
+            else:
+                ra = df_a.loc[k]
+                rb = df_b.loc[k]
+                diffs = {}
+                for c in common_cols:
+                    va = ra[c] if not isinstance(ra, pd.DataFrame) else ra[c].iloc[0]
+                    vb = rb[c] if not isinstance(rb, pd.DataFrame) else rb[c].iloc[0]
+                    if pd.isna(va) and pd.isna(vb):
+                        continue
+                    if va != vb:
+                        diffs[f"{c}_a"] = va
+                        diffs[f"{c}_b"] = vb
+                rec = {on: k, "status": "changed" if diffs else "same"}
+                rec.update(diffs)
+                rows.append(rec)
+        return pd.DataFrame(rows)
+    # No key — set-style diff
+    sa = set(map(tuple, df_a.astype(str).values.tolist()))
+    sb = set(map(tuple, df_b.astype(str).values.tolist()))
+    added   = [list(t) + ["added"]   for t in sb - sa]
+    removed = [list(t) + ["removed"] for t in sa - sb]
+    cols = list(df_a.columns) + ["status"]
+    return pd.DataFrame(added + removed, columns=cols)
+
+
 def preview_csv_inventory(folders: Any, max_files: int = 25, max_cols: int = 30) -> str:
     """Compact, prompt-friendly listing of CSVs and their columns."""
     normalized = normalize_data_folders(folders)
@@ -712,6 +927,12 @@ def execute_pandas_code(
         "filter_rows_across_csvs": filter_rows_across_csvs,
         "groupby_mean_per_csv": groupby_mean_per_csv,
         "correlation_per_csv": correlation_per_csv,
+        # Newer single-file + cross-file helpers
+        "summarize_csv":          summarize_csv,
+        "detect_outliers":        detect_outliers,
+        "time_series_resample":   time_series_resample,
+        "join_csvs_on_column":    join_csvs_on_column,
+        "compare_two_csvs":       compare_two_csvs,
     }
     if np is not None:
         globals_dict["np"] = np
@@ -800,6 +1021,11 @@ case-insensitive column matching, NaN/zero filtering, and multi-CSV scans):
                           case_sensitive=False, max_rows_per_csv=None)
   groupby_mean_per_csv(data_folder, group_col, value_col, exclude_zero=False)
   correlation_per_csv(data_folder, x_col, y_col, exclude_zero=False)
+  summarize_csv(path)                          # one-row-per-column profile
+  detect_outliers(df, column, method="iqr", threshold=1.5)
+  time_series_resample(df, date_col, value_col, freq="M", agg="sum")
+  join_csvs_on_column(left_path, right_path, on, how="inner")
+  compare_two_csvs(a_path, b_path, on=None)   # row-level diff snapshot
 
 Rules:
 - Assign the final answer to a DataFrame named `result_df`.
