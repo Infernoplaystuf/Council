@@ -3095,6 +3095,12 @@ class CouncilConsole(tk.Tk):
         r"what\s+have\s+i\s+asked|"
         r"my\s+recent\s+(?:queries|questions))\s*\??\s*$", _re.IGNORECASE,
     )
+    _BUILD_SEMANTIC_RE = _re.compile(
+        r"^\s*(?:build|generate|refresh)\s+(?:the\s+)?"
+        r"(?:semantic\s+|llm\s+|description\s+|smart\s+)?(?:vault\s+)?"
+        r"(?:index|descriptions?|summaries)\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
 
     def _handle_vault_tools_intent(self, user_text: str) -> bool:
         if not user_text:
@@ -3131,7 +3137,72 @@ class CouncilConsole(tk.Tk):
                 self._append_transcript("Writer", "\n".join(lines), "final")
             return True
 
+        if self._BUILD_SEMANTIC_RE.match(single_line):
+            self._build_semantic_index_response()
+            return True
+
         return False
+
+    def _build_semantic_index_response(self):
+        """Kick off the LLM description pass over the vault index."""
+        idx = _get_vault_index()
+        if idx is None:
+            self._append_transcript(
+                "Writer", "Vault index is unavailable.", "final",
+            )
+            return
+        # Ensure the keyword index is up-to-date first
+        try:
+            idx.rebuild()
+        except Exception:
+            pass
+        pending = sum(1 for r in idx.records.values()
+                      if not r.get("description"))
+        if pending == 0:
+            self._append_transcript(
+                "Writer",
+                f"All {len(idx.records)} indexed files already have semantic "
+                f"descriptions. (Type 'refresh descriptions' to regenerate.)",
+                "final",
+            )
+            self._set_status("● idle")
+            return
+        self._append_transcript(
+            "Council",
+            f"Building semantic descriptions for {pending} files. This runs "
+            f"in the background; the chat stays usable. Each file takes "
+            f"~3-10 seconds.",
+            "observation",
+        )
+        self._set_status("● indexing…", "#cba6f7")
+
+        def _worker():
+            def _progress(i, total, name):
+                if i % 5 == 0 or i == total:
+                    self.after(0, lambda: self._set_status(
+                        f"● indexing {i}/{total}…", "#cba6f7"
+                    ))
+            try:
+                n = idx.generate_descriptions(on_progress=_progress)
+            except Exception as exc:
+                self.after(0, lambda: (
+                    self._append_transcript("Writer",
+                                            f"semantic index failed: {exc!r}",
+                                            "final"),
+                    self._set_status("● idle"),
+                ))
+                return
+            self.after(0, lambda: (
+                self._append_transcript(
+                    "Writer",
+                    f"Semantic index complete — {n} files described.",
+                    "final",
+                ),
+                self._set_status("● idle"),
+            ))
+
+        import threading as _th
+        _th.Thread(target=_worker, daemon=True).start()
 
     # ---- Workflow intent handler ----
 

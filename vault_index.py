@@ -112,6 +112,31 @@ def _expand(term: str) -> Set[str]:
     return out
 
 
+def _split_summary_and_topics(text: str) -> Tuple[str, List[str]]:
+    """Parse a model response into (summary_paragraph, [topic, ...]).
+
+    Looks for a 'TOPICS:' line; if absent, returns the whole text as
+    summary with an empty topics list.
+    """
+    text = (text or "").strip()
+    if not text:
+        return "", []
+    m = re.search(r"\n\s*topics?\s*[:\-]\s*(.+?)\s*$",
+                  text, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return text, []
+    summary = text[: m.start()].strip()
+    topics_blob = m.group(1)
+    # Topics can be separated by commas or newlines
+    raw = re.split(r"[,\n]+", topics_blob)
+    topics = []
+    for t in raw:
+        tok = t.strip().lower().strip(".'\"`-*#")
+        if 2 <= len(tok) <= 40 and tok:
+            topics.append(tok)
+    return summary, topics
+
+
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
 _HEX_RE = re.compile(r"^[0-9a-f]+$", re.IGNORECASE)
 
@@ -518,6 +543,10 @@ class VaultIndex:
             name_tokens = set(_tokenize(rec.get("name", "")))
             name_stems = {_stem(t) for t in name_tokens}
             sample_blob = (rec.get("sample_text", "") or "").lower()
+            # LLM-generated layer (may be empty if generate_descriptions
+            # hasn't run yet)
+            desc_blob = (rec.get("description", "") or "").lower()
+            topic_set = {str(t).lower() for t in rec.get("topics", []) or []}
 
             score = 0.0
             for term in expanded:
@@ -532,11 +561,109 @@ class VaultIndex:
                     score += 3.0 * w
                 if term in sample_blob:
                     score += 0.4 * w
+                # Semantic layer — topics are high-precision, description
+                # is broader but lower-weight per token.
+                if term in topic_set:
+                    score += 2.0 * w
+                if term in desc_blob:
+                    score += 0.6 * w
             if score > 0:
                 results.append((score, rec))
 
         results.sort(key=lambda r: r[0], reverse=True)
         return results[:k], fuzzy_matches
+
+    # ---- LLM semantic-description layer ----
+    # Each record gains an optional `description` (one-paragraph English
+    # summary from the local GGUF) and `topics` (3-5 short keywords).
+    # Generated lazily — index_file leaves these as empty strings, and
+    # generate_descriptions() walks the index filling them in. Cached on
+    # disk via save() so subsequent launches don't pay the cost.
+
+    def generate_descriptions(
+        self,
+        *,
+        max_files: Optional[int] = None,
+        force: bool = False,
+        on_progress: Optional[Any] = None,
+    ) -> int:
+        """Fill in description + topics for every record that doesn't have
+        them yet. Returns the count of records updated.
+
+        - max_files caps how many we touch this call (useful from the GUI
+          to do background work in small batches).
+        - force=True regenerates even records that already have a desc.
+        - on_progress(i, total, name) callable runs once per record.
+        """
+        import council_engine as ce
+
+        candidates: List[Tuple[str, Dict[str, Any]]] = []
+        for spath, rec in self.records.items():
+            if force or not rec.get("description"):
+                candidates.append((spath, rec))
+        if max_files:
+            candidates = candidates[:int(max_files)]
+
+        updated = 0
+        for i, (spath, rec) in enumerate(candidates, start=1):
+            try:
+                desc, topics = self._describe_record(ce, rec)
+            except Exception as exc:
+                desc = ""
+                topics = []
+                rec["_describe_error"] = repr(exc)
+            rec["description"] = (desc or "")[:800]
+            rec["topics"] = topics[:6]
+            updated += 1
+            if on_progress:
+                try:
+                    on_progress(i, len(candidates), rec.get("name", spath))
+                except Exception:
+                    pass
+        if updated:
+            self.save()
+            self._vocab_cache = None  # description tokens can extend vocab
+        return updated
+
+    def _describe_record(self, ce_mod, rec: Dict[str, Any]) -> Tuple[str, List[str]]:
+        """Build the prompt for one record and call the local model."""
+        name = rec.get("name", "?")
+        rtype = rec.get("type", "text")
+
+        body_lines: List[str] = [f"File: {name}", f"Type: {rtype}"]
+        if rtype == "csv":
+            headers = rec.get("headers", []) or []
+            body_lines.append("Columns: " + ", ".join(map(str, headers[:30])))
+            for row in (rec.get("sample_rows", []) or [])[:3]:
+                body_lines.append("  sample: " + str(row)[:200])
+        elif rtype == "json":
+            keys = rec.get("keys", []) or []
+            body_lines.append("Top-level keys: " + ", ".join(map(str, keys[:30])))
+            preview = (rec.get("sample_text", "") or "")[:600]
+            if preview:
+                body_lines.append("Sample:")
+                body_lines.append(preview)
+        else:
+            preview = (rec.get("sample_text", "") or "")[:600]
+            if preview:
+                body_lines.append("Sample:")
+                body_lines.append(preview)
+
+        prompt = (
+            "Summarize this file in one short paragraph (1-3 sentences). "
+            "Focus on what the file represents and what could be answered "
+            "from it. Then on a new line write 'TOPICS:' followed by "
+            "3-5 lowercase keywords separated by commas.\n\n"
+            + "\n".join(body_lines)
+            + "\n\nSummary:"
+        )
+        raw = ce_mod.local_chat(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.15,
+            num_predict=200,
+            timeout=120,
+        )
+        return _split_summary_and_topics(raw or "")
 
     # ---- prompt formatting ----
     def summary_block(self, rec: Dict[str, Any], max_chars: int = 1500) -> str:
@@ -545,6 +672,12 @@ class VaultIndex:
             f"[VAULT MATCH: {rec.get('name', '?')}]",
             f"path: {rec.get('path', '')}",
         ]
+        desc = rec.get("description", "")
+        if desc:
+            lines.append("summary: " + desc.replace("\n", " ").strip())
+        topics = rec.get("topics", [])
+        if topics:
+            lines.append("topics: " + ", ".join(map(str, topics)))
         rtype = rec.get("type", "text")
         if rtype == "csv":
             lines.append("type: csv")
