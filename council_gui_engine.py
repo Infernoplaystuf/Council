@@ -286,6 +286,85 @@ _FILE_PATH_RE = _re.compile(r'[a-zA-Z]:[/\\]\S+|/\S+')
 _FILE_READ_CHAR_LIMIT = 12000  # total chars per file in the injected block
 
 
+def _render_dataframe_block(kind_label, df, max_rows=20):
+    """Render a small DataFrame as a CSV-shaped text block. Used by the
+    injection layer for TSV / Parquet / gzipped CSV so the model sees
+    the same structure regardless of source format."""
+    headers = [str(c) for c in df.columns]
+    lines = [
+        f"({kind_label} — already parsed into plain text below. "
+        f"Read each row as if it were a CSV row.)",
+        f"Columns ({len(headers)}): " + ', '.join(headers),
+        f"Total rows shown: {min(len(df), max_rows)}"
+        + (f" (of {len(df)} loaded)" if len(df) > max_rows else ""),
+        "Sample rows:",
+    ]
+    for _, row in df.head(max_rows).iterrows():
+        cells = []
+        for v in row.tolist():
+            cv = str(v).replace('\n', ' ').strip()
+            if len(cv) > 80:
+                cv = cv[:77] + '...'
+            cells.append(cv)
+        lines.append('  ' + ' | '.join(cells))
+    return '\n'.join(lines)
+
+
+def _render_sqlite_block(p):
+    """Render a SQLite database as table name + columns + row count + a
+    small sample from each table. Read-only connection."""
+    import sqlite3 as _sq
+    lines = [
+        "(SQLite database — already parsed into plain text below. "
+        "Each table is shown with its columns and a few sample rows.)",
+    ]
+    try:
+        con = _sq.connect(f"file:{p}?mode=ro", uri=True)
+        try:
+            cur = con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "ORDER BY name LIMIT 20"
+            )
+            names = [r[0] for r in cur.fetchall() if r and r[0]]
+            lines.append(f"Tables ({len(names)}): " + ', '.join(names))
+            lines.append("")
+            for tname in names[:10]:
+                qname = '"' + tname.replace('"', '""') + '"'
+                try:
+                    cur = con.execute(f"PRAGMA table_info({qname})")
+                    cols = [r[1] for r in cur.fetchall() if r and r[1]]
+                except Exception:
+                    cols = []
+                try:
+                    cur = con.execute(f"SELECT COUNT(*) FROM {qname}")
+                    nrows = cur.fetchone()[0]
+                except Exception:
+                    nrows = None
+                lines.append(f'Table "{tname}" ({nrows if nrows is not None else "?"} rows):')
+                lines.append("  columns: " + ', '.join(cols))
+                try:
+                    cur = con.execute(f"SELECT * FROM {qname} LIMIT 5")
+                    sample = cur.fetchall()
+                    if sample:
+                        lines.append("  rows:")
+                        for r in sample:
+                            cells = []
+                            for v in r:
+                                cv = str(v).replace('\n', ' ').strip()
+                                if len(cv) > 80:
+                                    cv = cv[:77] + '...'
+                                cells.append(cv)
+                            lines.append('    ' + ' | '.join(cells))
+                except Exception:
+                    pass
+                lines.append("")
+        finally:
+            con.close()
+    except Exception as exc:
+        lines.append(f"(could not open database: {exc!r})")
+    return '\n'.join(lines).rstrip()
+
+
 def _read_file_for_injection(path_str):
     """Read a file into a compact prompt block. CSVs get headers + sample
     rows; large rows are abbreviated so the header line always survives the
@@ -334,6 +413,25 @@ def _read_file_for_injection(path_str):
             content = '\n'.join(lines)
             if len(content) > _FILE_READ_CHAR_LIMIT:
                 content = content[:_FILE_READ_CHAR_LIMIT] + '\n... (truncated)'
+        elif suffix in ('.tsv',):
+            # TSV — same rendering as CSV, just tab-separated
+            import pandas as _pd_fi
+            df = _pd_fi.read_csv(p, sep='\t', nrows=200, on_bad_lines='skip')
+            content = _render_dataframe_block('TSV', df)
+        elif suffix == '.parquet':
+            try:
+                import pandas as _pd_fi
+                df = _pd_fi.read_parquet(p).head(200)
+                content = _render_dataframe_block('Parquet', df)
+            except Exception as _ex:
+                content = (f"(Parquet file — could not read: {_ex!r}. "
+                           f"Install pyarrow with `pip install pyarrow`.)")
+        elif suffix == '.gz' and p.stem.lower().endswith('.csv'):
+            import pandas as _pd_fi
+            df = _pd_fi.read_csv(p, nrows=200, on_bad_lines='skip', compression='infer')
+            content = _render_dataframe_block('Gzipped CSV', df)
+        elif suffix in ('.db', '.sqlite', '.sqlite3'):
+            content = _render_sqlite_block(p)
         elif suffix in ('.xlsx', '.xls', '.xlsm'):
             # Excel workbook — already parsed into plain text below. The
             # model should treat each sheet exactly like a CSV table; the
@@ -2863,6 +2961,14 @@ class CouncilConsole(tk.Tk):
         r"([A-Za-z0-9_\-./]+)\s+(\S+\.gguf)\s*[.!?]?\s*$",
         _re.IGNORECASE,
     )
+    _PEEK_FILE_RE = _re.compile(
+        r"^\s*(?:peek|preview|peek\s+at|preview\s+of)\s+(.+?)\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
+    _COMPARE_PIPELINES_RE = _re.compile(
+        r"^\s*(?:compare|diff)\s+pipelines?\s+(.+?)\s+(?:and|vs\.?|versus|to|with)\s+(.+?)\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
 
     def _handle_pipeline_intent(self, user_text: str) -> bool:
         """Detect and handle pipeline show/list/modify intents.
@@ -2934,7 +3040,101 @@ class CouncilConsole(tk.Tk):
             self._hf_download_response(repo, filename)
             return True
 
+        # Peek at a file — preview WITHOUT injecting into the model prompt
+        m = self._PEEK_FILE_RE.match(single_line)
+        if m:
+            self._peek_file_response(m.group(1).strip().strip("'\"`"))
+            return True
+
+        # Compare two pipelines
+        m = self._COMPARE_PIPELINES_RE.match(single_line)
+        if m:
+            self._compare_pipelines_response(
+                m.group(1).strip().strip("'\"`"),
+                m.group(2).strip().strip("'\"`"),
+            )
+            return True
+
         return False
+
+    def _peek_file_response(self, target: str):
+        """Show file contents in the transcript ONLY — never injected into
+        a model prompt. Lets the user verify a file's structure for free."""
+        # Resolve the target: explicit path, then vault search
+        p = Path(target).expanduser()
+        if not p.is_file():
+            # Try to find under vault by name
+            import pipeline_scanner as _ps  # piggy-back on its scan helpers
+            from vault_analyst import list_data_files, list_parquet_files
+            try:
+                candidates = list(list_data_files(VAULT_DIR)) \
+                           + list(list_parquet_files(VAULT_DIR))
+            except Exception:
+                candidates = []
+            q = target.lower()
+            matches = [c for c in candidates if q in c.name.lower()]
+            if matches:
+                p = matches[0]
+        if not p.is_file():
+            self._append_transcript(
+                "Writer", f"No file found for '{target}'.", "final",
+            )
+            self._set_status("● idle")
+            return
+
+        # Defense-in-depth: never peek into protected paths
+        try:
+            import conversation_logger as _cl
+            if _cl.is_protected_path(p, VAULT_DIR):
+                self._append_transcript(
+                    "Writer",
+                    f"'{p.name}' is in a protected vault folder — "
+                    f"not viewable.",
+                    "final",
+                )
+                self._set_status("● idle")
+                return
+        except Exception:
+            pass
+
+        block = _read_file_for_injection(str(p))
+        if not block:
+            self._append_transcript(
+                "Writer",
+                f"Couldn't preview {p.name} — unsupported format or read error.",
+                "final",
+            )
+        else:
+            # Strip the [FILE: ...] / [END FILE] wrapper — that exists to
+            # mark prompt injection; for a transcript preview it's noise.
+            inner = block
+            if inner.startswith("[FILE:"):
+                inner = inner.split("\n", 1)[1] if "\n" in inner else inner
+            if inner.endswith("[END FILE]"):
+                inner = inner.rsplit("\n", 1)[0]
+            self._append_transcript(
+                "Writer",
+                f"Preview of {p.name} (not sent to the model):\n\n{inner}",
+                "final",
+            )
+        self._set_status("● idle")
+
+    def _compare_pipelines_response(self, a_name: str, b_name: str):
+        import pipeline_scanner as _ps
+        a = _ps.find_pipeline_by_name(VAULT_DIR, a_name)
+        b = _ps.find_pipeline_by_name(VAULT_DIR, b_name)
+        if not a or not b:
+            missing = [n for n, pl in [(a_name, a), (b_name, b)] if pl is None]
+            self._append_transcript(
+                "Writer",
+                f"Could not find: {', '.join(missing)}. Type 'list pipelines'.",
+                "final",
+            )
+            self._set_status("● idle")
+            return
+        diff = _ps.compare_pipelines(a, b)
+        self._append_transcript("Writer", diff, "final")
+        self._set_status("● idle")
 
     def _pipeline_export_markdown(self, name: str):
         import pipeline_scanner as _ps

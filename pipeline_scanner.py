@@ -492,6 +492,72 @@ def _truncate(s: str, n: int = 100) -> str:
 # Vault integration helpers
 # ============================================================
 
+def compare_pipelines(a: Pipeline, b: Pipeline) -> str:
+    """Filter-by-filter diff between two pipelines.
+
+    Pairs steps positionally (step 1 of A vs step 1 of B, etc.). For each
+    position, shows the filter name and per-parameter changes. Surfaces
+    added/removed steps when one pipeline is longer than the other.
+    """
+    a_steps = list(a.steps)
+    b_steps = list(b.steps)
+    out: List[str] = [
+        f"Comparing pipelines:",
+        f"  A: {a.name} ({len(a_steps)} steps)",
+        f"  B: {b.name} ({len(b_steps)} steps)",
+        "",
+    ]
+    n = max(len(a_steps), len(b_steps))
+    diffs = 0
+    for i in range(n):
+        a_step = a_steps[i] if i < len(a_steps) else None
+        b_step = b_steps[i] if i < len(b_steps) else None
+
+        if a_step and not b_step:
+            out.append(f"Step {i+1}: REMOVED in B  (A: {a_step.filter_name})")
+            diffs += 1
+            continue
+        if b_step and not a_step:
+            out.append(f"Step {i+1}: ADDED in B    (B: {b_step.filter_name})")
+            diffs += 1
+            continue
+
+        if a_step.filter_name != b_step.filter_name:
+            out.append(f"Step {i+1}: filter changed   "
+                       f"{a_step.filter_name} -> {b_step.filter_name}")
+            diffs += 1
+            continue
+
+        a_params = {p: v for p, v in (a_step.inputs + a_step.outputs + a_step.configs)}
+        b_params = {p: v for p, v in (b_step.inputs + b_step.outputs + b_step.configs)}
+        keys = sorted(set(a_params) | set(b_params))
+        step_diffs: List[str] = []
+        for k in keys:
+            av = a_params.get(k)
+            bv = b_params.get(k)
+            if av == bv:
+                continue
+            if av is None:
+                step_diffs.append(f"    + {k} = {bv}     (added in B)")
+            elif bv is None:
+                step_diffs.append(f"    - {k} = {av}     (removed in B)")
+            else:
+                step_diffs.append(f"    ~ {k}: {av}  ->  {bv}")
+        if step_diffs:
+            out.append(f"Step {i+1}: {a_step.filter_name}  (params differ)")
+            out.extend(step_diffs)
+            diffs += len(step_diffs)
+        else:
+            out.append(f"Step {i+1}: {a_step.filter_name}  (identical)")
+
+    out.append("")
+    if diffs == 0:
+        out.append("No differences detected.")
+    else:
+        out.append(f"{diffs} difference(s) total.")
+    return "\n".join(out)
+
+
 def export_pipeline_to_markdown(pipeline: Pipeline) -> str:
     """Render a parsed pipeline as a Markdown doc — headings, inputs in
     backtick code, outputs in **bold**. Drops into vault/data_out/ or

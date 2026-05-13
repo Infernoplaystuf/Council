@@ -172,14 +172,81 @@ def list_data_files(data_folder: Any, recursive: bool = True) -> List[Path]:
 
 
 def read_table(path: Any, *, sheet: Optional[str] = None) -> pd.DataFrame:
-    """Read a CSV or Excel file into a DataFrame. For Excel, `sheet`
-    picks which tab; default is the first sheet. Used by helpers and
-    available in the sandbox."""
+    """Read a tabular file into a DataFrame. Supported formats:
+       .csv / .tsv / .csv.gz / .xlsx / .xls / .xlsm / .parquet
+    For Excel, `sheet` picks which tab (default = first sheet)."""
     p = Path(path)
+    name = p.name.lower()
     suf = p.suffix.lower()
     if suf in (".xlsx", ".xls", ".xlsm"):
         return pd.read_excel(p, sheet_name=sheet if sheet else 0)
+    if suf == ".tsv":
+        return pd.read_csv(p, sep="\t")
+    if suf == ".parquet":
+        return pd.read_parquet(p)
+    if name.endswith(".csv.gz") or (suf == ".gz" and p.stem.lower().endswith(".csv")):
+        return pd.read_csv(p, compression="infer")
     return pd.read_csv(p)
+
+
+def list_sqlite_files(data_folder: Any, recursive: bool = True) -> List[Path]:
+    """All SQLite database files under the given folder(s), deduped."""
+    folders = normalize_data_folders(data_folder)
+    out: List[Path] = []
+    patterns = ("*.db", "*.sqlite", "*.sqlite3")
+    for folder in folders:
+        for pat in patterns:
+            if recursive:
+                out.extend(sorted(folder.rglob(pat)))
+            else:
+                out.extend(sorted(folder.glob(pat)))
+    deduped: dict[str, Path] = {}
+    for path in out:
+        try:
+            deduped[str(path.resolve()).lower()] = path.resolve()
+        except Exception:
+            pass
+    return _drop_protected(sorted(deduped.values()), folders)
+
+
+def list_sqlite_tables(path: Any) -> List[str]:
+    """Return the list of table names in a SQLite database (read-only)."""
+    import sqlite3
+    con = sqlite3.connect(f"file:{Path(path)}?mode=ro", uri=True)
+    try:
+        cur = con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        )
+        return [r[0] for r in cur.fetchall() if r and r[0]]
+    finally:
+        con.close()
+
+
+def read_sqlite_table(path: Any, table: str, *, limit: Optional[int] = None) -> pd.DataFrame:
+    """Read a SQLite table into a DataFrame. Read-only connection so the
+    analyst sandbox can never write back."""
+    import sqlite3
+    qname = '"' + str(table).replace('"', '""') + '"'
+    sql = f"SELECT * FROM {qname}"
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    con = sqlite3.connect(f"file:{Path(path)}?mode=ro", uri=True)
+    try:
+        return pd.read_sql_query(sql, con)
+    finally:
+        con.close()
+
+
+def list_parquet_files(data_folder: Any, recursive: bool = True) -> List[Path]:
+    """All Parquet files under the given folder(s), deduped."""
+    folders = normalize_data_folders(data_folder)
+    out: List[Path] = []
+    for folder in folders:
+        if recursive:
+            out.extend(sorted(folder.rglob("*.parquet")))
+        else:
+            out.extend(sorted(folder.glob("*.parquet")))
+    return _drop_protected(sorted({p.resolve() for p in out}), folders)
 
 
 def read_excel_sheets(path: Any) -> Dict[str, pd.DataFrame]:
@@ -628,6 +695,59 @@ def groupby_mean_per_csv(
     return pd.concat(frames, ignore_index=True)
 
 
+def pivot_per_csv(
+    data_folder: Any,
+    index_col: str,
+    columns_col: str,
+    value_col: str,
+    *,
+    agg: str = "sum",
+    recursive: bool = True,
+) -> pd.DataFrame:
+    """Pivot each CSV in the folder: rows=index_col, cols=columns_col,
+    values=value_col aggregated by `agg`. Returns one long frame with
+    a leading `csv` column distinguishing rows from different files."""
+    folders = normalize_data_folders(data_folder)
+    frames: list[pd.DataFrame] = []
+    for csv_path in list_csv_files(folders, recursive=recursive):
+        root = first_matching_root(csv_path, folders)
+        try:
+            df = pd.read_csv(csv_path)
+            ix = find_column_case_insensitive(df, index_col)
+            cx = find_column_case_insensitive(df, columns_col)
+            vx = find_column_case_insensitive(df, value_col)
+            if not (ix and cx and vx):
+                frames.append(pd.DataFrame([{
+                    "csv": csv_path.name,
+                    "status": f"missing column(s): index={index_col}, "
+                              f"columns={columns_col}, values={value_col}",
+                }]))
+                continue
+            df[vx] = pd.to_numeric(df[vx], errors="coerce")
+            df = df[df[vx].notna()]
+            if df.empty:
+                frames.append(pd.DataFrame([{
+                    "csv": csv_path.name,
+                    "status": "no numeric values to pivot",
+                }]))
+                continue
+            piv = (df.pivot_table(
+                       index=ix, columns=cx, values=vx, aggfunc=agg,
+                       fill_value=0)
+                     .reset_index())
+            piv.insert(0, "csv", csv_path.name)
+            piv.insert(1, "relative_path", safe_relative_path(csv_path, root))
+            frames.append(piv)
+        except Exception as exc:
+            frames.append(pd.DataFrame([{
+                "csv": csv_path.name,
+                "status": f"error: {exc}",
+            }]))
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
 def correlation_per_csv(
     data_folder: Any,
     x_col: str,
@@ -1056,6 +1176,12 @@ def execute_pandas_code(
         "read_table":             read_table,
         "read_excel_sheets":      read_excel_sheets,
         "excel_inventory":        excel_inventory,
+        # Parquet / SQLite + pivot
+        "list_parquet_files":     list_parquet_files,
+        "list_sqlite_files":      list_sqlite_files,
+        "list_sqlite_tables":     list_sqlite_tables,
+        "read_sqlite_table":      read_sqlite_table,
+        "pivot_per_csv":          pivot_per_csv,
     }
     if np is not None:
         globals_dict["np"] = np
@@ -1150,13 +1276,22 @@ case-insensitive column matching, NaN/zero filtering, and multi-CSV scans):
   join_csvs_on_column(left_path, right_path, on, how="inner")
   compare_two_csvs(a_path, b_path, on=None)   # row-level diff snapshot
 
-Excel support:
+Excel + cross-format support:
   list_excel_files(data_folder, recursive=True)
   list_data_files(data_folder, recursive=True)  # CSV + Excel combined
-  read_table(path, sheet=None)                  # CSV or Excel -> df
+  read_table(path, sheet=None)                  # CSV, TSV, .csv.gz,
+                                                # XLSX, Parquet -> df
   read_excel_sheets(path)                       # all sheets -> {name: df}
   excel_inventory(data_folder, recursive=True)
-  pd.read_excel is also available directly.
+
+Parquet + SQLite:
+  list_parquet_files(data_folder, recursive=True)
+  list_sqlite_files(data_folder, recursive=True)
+  list_sqlite_tables(path)                      # list[str] of table names
+  read_sqlite_table(path, table, limit=None)    # df from a SQLite table
+
+Pivot tables:
+  pivot_per_csv(data_folder, index_col, columns_col, value_col, agg="sum")
 
 Rules:
 - Assign the final answer to a DataFrame named `result_df`.

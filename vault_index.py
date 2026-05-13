@@ -165,7 +165,16 @@ _TEXT_SUFFIXES = {
     ".ini", ".cfg", ".toml", ".html", ".htm",
 }
 _EXCEL_SUFFIXES = {".xlsx", ".xls", ".xlsm"}
-_PARSEABLE = {".csv", ".json"} | _TEXT_SUFFIXES | _EXCEL_SUFFIXES
+_TABULAR_EXTRA  = {".tsv", ".parquet"}     # parquet needs pyarrow at runtime
+# SQLite databases (.db / .sqlite / .sqlite3) — indexed at the table level
+_SQLITE_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
+_PARSEABLE = ({".csv", ".json"} | _TEXT_SUFFIXES | _EXCEL_SUFFIXES
+              | _TABULAR_EXTRA | _SQLITE_SUFFIXES)
+
+
+def _is_gz_csv(p: Path) -> bool:
+    """`.csv.gz` style: .gz with a sibling implication that it's a CSV."""
+    return p.suffix.lower() == ".gz" and p.stem.lower().endswith(".csv")
 
 
 def _parse_csv(p: Path) -> Dict[str, Any]:
@@ -309,6 +318,120 @@ def _parse_excel(p: Path) -> Dict[str, Any]:
     }
 
 
+def _parse_tabular_df(p: Path, df, *, kind: str) -> Dict[str, Any]:
+    """Shared CSV/TSV/Parquet/gz indexing — takes a loaded DataFrame and
+    extracts headers, sample rows, and keyword tokens with the same rules
+    as _parse_csv (URL skip, multi-value split, hex filter)."""
+    headers: List[str] = [str(c).strip() for c in df.columns]
+    sample_rows: List[str] = []
+    keywords: Set[str] = set(_tokenize(" ".join(headers)))
+    # First 6 rows for the prompt-time sample block
+    for _, row in df.head(6).iterrows():
+        sample_rows.append(", ".join(str(v) for v in row.values))
+    # Up to 500 rows for keyword indexing, same value-handling as _parse_csv
+    sub = df.head(500)
+    for _, row in sub.iterrows():
+        for cell in row.values:
+            cv = str(cell).strip()
+            if not cv or len(cv) > 1000:
+                continue
+            if cv.startswith("http://") or cv.startswith("https://"):
+                continue
+            for part in re.split(r"[|;,/]", cv):
+                part = part.strip()
+                if 2 <= len(part) <= 80:
+                    keywords.update(_tokenize(part))
+        if len(keywords) > 8000:
+            break
+    return {
+        "type":        kind,
+        "headers":     headers,
+        "sample_rows": sample_rows,
+        "keywords":    sorted(keywords)[:5000],
+    }
+
+
+def _parse_tsv(p: Path) -> Dict[str, Any]:
+    try:
+        import pandas as _pd
+        df = _pd.read_csv(p, sep="\t", nrows=500, on_bad_lines="skip")
+        return _parse_tabular_df(p, df, kind="tsv")
+    except Exception:
+        return {"type": "tsv", "headers": [], "sample_rows": [], "keywords": []}
+
+
+def _parse_csv_gz(p: Path) -> Dict[str, Any]:
+    """Gzipped CSV — pandas auto-detects compression by extension."""
+    try:
+        import pandas as _pd
+        df = _pd.read_csv(p, nrows=500, on_bad_lines="skip", compression="infer")
+        return _parse_tabular_df(p, df, kind="csv.gz")
+    except Exception:
+        return {"type": "csv.gz", "headers": [], "sample_rows": [], "keywords": []}
+
+
+def _parse_parquet(p: Path) -> Dict[str, Any]:
+    """Parquet — needs pyarrow or fastparquet. Degrades gracefully."""
+    try:
+        import pandas as _pd
+        df = _pd.read_parquet(p)
+        return _parse_tabular_df(p, df.head(500), kind="parquet")
+    except Exception as exc:
+        return {
+            "type":        "parquet",
+            "headers":     [],
+            "sample_rows": [],
+            "keywords":    [],
+            "_note":       f"install pyarrow to enable parquet: {exc!r}",
+        }
+
+
+def _parse_sqlite(p: Path) -> Dict[str, Any]:
+    """SQLite database — index table names + per-table column names so
+    questions like 'what tables are in foo.db?' work via vault search."""
+    import sqlite3
+    tables: List[Dict[str, Any]] = []
+    keywords: Set[str] = set()
+    try:
+        con = sqlite3.connect(f"file:{p}?mode=ro", uri=True)
+        try:
+            cur = con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "ORDER BY name LIMIT 50"
+            )
+            names = [r[0] for r in cur.fetchall() if r and r[0]]
+            keywords.update(_tokenize(" ".join(names)))
+            for tname in names[:30]:
+                try:
+                    cur = con.execute(f"PRAGMA table_info({_sql_quote(tname)})")
+                    cols = [r[1] for r in cur.fetchall() if r and r[1]]
+                except Exception:
+                    cols = []
+                keywords.update(_tokenize(" ".join(cols)))
+                try:
+                    cur = con.execute(
+                        f"SELECT COUNT(*) FROM {_sql_quote(tname)}"
+                    )
+                    nrows = cur.fetchone()[0]
+                except Exception:
+                    nrows = None
+                tables.append({"table": tname, "columns": cols, "rows": nrows})
+        finally:
+            con.close()
+    except Exception:
+        pass
+    return {
+        "type":      "sqlite",
+        "tables":    tables,
+        "keywords":  sorted(keywords)[:2000],
+    }
+
+
+def _sql_quote(name: str) -> str:
+    """Quote a SQLite identifier safely for PRAGMA/SELECT."""
+    return '"' + name.replace('"', '""') + '"'
+
+
 def _parse_text(p: Path, suffix: str) -> Dict[str, Any]:
     text = ""
     try:
@@ -327,10 +450,18 @@ def _index_file(p: Path) -> Optional[Dict[str, Any]]:
     suffix = p.suffix.lower()
     if suffix == ".csv":
         rec = _parse_csv(p)
+    elif suffix == ".tsv":
+        rec = _parse_tsv(p)
+    elif suffix == ".parquet":
+        rec = _parse_parquet(p)
+    elif suffix == ".gz" and _is_gz_csv(p):
+        rec = _parse_csv_gz(p)
     elif suffix == ".json":
         rec = _parse_json(p)
     elif suffix in _EXCEL_SUFFIXES:
         rec = _parse_excel(p)
+    elif suffix in _SQLITE_SUFFIXES:
+        rec = _parse_sqlite(p)
     elif suffix in _TEXT_SUFFIXES:
         rec = _parse_text(p, suffix)
     else:
@@ -494,7 +625,8 @@ class VaultIndex:
                 lower_str = str(p).lower().replace("\\", "/")
                 if "/pipelines/out/" in lower_str or lower_str.endswith("/pipelines/out"):
                     continue
-            if p.suffix.lower() not in _PARSEABLE:
+            suf = p.suffix.lower()
+            if suf not in _PARSEABLE and not (suf == ".gz" and _is_gz_csv(p)):
                 continue
             spath = str(p)
             seen.add(spath)
@@ -747,13 +879,22 @@ class VaultIndex:
         if topics:
             lines.append("topics: " + ", ".join(map(str, topics)))
         rtype = rec.get("type", "text")
-        if rtype == "csv":
-            lines.append("type: csv")
+        if rtype in ("csv", "tsv", "csv.gz", "parquet"):
+            lines.append(f"type: {rtype}")
             if rec.get("headers"):
                 lines.append("columns: " + ", ".join(rec["headers"]))
             if rec.get("sample_rows"):
                 lines.append("sample rows:")
                 lines.extend(rec["sample_rows"][:3])
+        elif rtype == "sqlite":
+            lines.append("type: sqlite")
+            tables = rec.get("tables", []) or []
+            lines.append(f"tables ({len(tables)}):")
+            for t in tables[:8]:
+                cols = ", ".join(t.get("columns", [])[:15])
+                nrows = t.get("rows")
+                lines.append(f"  - {t.get('table','?')} "
+                             f"({nrows if nrows is not None else '?'} rows): {cols}")
         elif rtype == "json":
             lines.append("type: json")
             if rec.get("keys"):
