@@ -492,6 +492,60 @@ def _truncate(s: str, n: int = 100) -> str:
 # Vault integration helpers
 # ============================================================
 
+def export_pipeline_to_markdown(pipeline: Pipeline) -> str:
+    """Render a parsed pipeline as a Markdown doc — headings, inputs in
+    backtick code, outputs in **bold**. Drops into vault/data_out/ or
+    can be saved by the caller. Useful for sharing pipelines or pasting
+    into a README."""
+    out: List[str] = [
+        f"# {pipeline.name}",
+        "",
+        f"_Format: {pipeline.format} — {len(pipeline.steps)} steps_",
+        f"_Path: `{pipeline.path}`_",
+        "",
+    ]
+    if pipeline.notes:
+        for n in pipeline.notes:
+            out.append(f"> {n}")
+        out.append("")
+
+    if pipeline.input_summary:
+        out.append("## Pipeline inputs")
+        out.append("")
+        for v in pipeline.input_summary:
+            out.append(f"- `{v}`")
+        out.append("")
+
+    if pipeline.output_summary:
+        out.append("## Pipeline outputs")
+        out.append("")
+        for v in pipeline.output_summary:
+            out.append(f"- **`{v}`**")
+        out.append("")
+
+    out.append("## Steps")
+    out.append("")
+    for s in pipeline.steps:
+        out.append(f"### Step {s.index}: `{s.filter_name}`")
+        out.append("")
+        if s.inputs:
+            out.append("Inputs:")
+            for pn, vv in s.inputs:
+                out.append(f"  - `{pn}` = `{vv}`")
+            out.append("")
+        if s.outputs:
+            out.append("Outputs:")
+            for pn, vv in s.outputs:
+                out.append(f"  - **`{pn}`** = **`{vv}`**")
+            out.append("")
+        if s.configs:
+            out.append("Config:")
+            for pn, vv in s.configs:
+                out.append(f"  - `{pn}` = `{vv}`")
+            out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
 def vault_pipelines_in_dir(vault_dir: Path) -> Path:
     """Standard input pipeline location under the vault."""
     p = Path(vault_dir) / "pipelines" / "in"

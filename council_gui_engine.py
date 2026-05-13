@@ -2779,6 +2779,16 @@ class CouncilConsole(tk.Tk):
         r"(?:\s+(?:me|a))?\s+(?:new\s+)?pipelines?\s+(?:that\s+|to\s+|which\s+)?(.+?)\s*[.!?]?\s*$",
         _re.IGNORECASE,
     )
+    _PIPELINE_EXPORT_RE = _re.compile(
+        r"^\s*(?:export|save)\s+pipelines?\s+(.+?)\s+(?:as|to)\s+"
+        r"(?:markdown|md|a\s+markdown\s+file)\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
+    _DOWNLOAD_HF_RE = _re.compile(
+        r"^\s*(?:download|fetch|pull)\s+(?:from\s+)?(?:huggingface\s+|hf\s+)?"
+        r"([A-Za-z0-9_\-./]+)\s+(\S+\.gguf)\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
 
     def _handle_pipeline_intent(self, user_text: str) -> bool:
         """Detect and handle pipeline show/list/modify intents.
@@ -2836,7 +2846,121 @@ class CouncilConsole(tk.Tk):
             self._pipeline_create_response(description, user_text)
             return True
 
+        # Export to markdown
+        m = self._PIPELINE_EXPORT_RE.match(single_line)
+        if m:
+            self._pipeline_export_markdown(m.group(1).strip().strip("'\"`"))
+            return True
+
+        # HF download (handled here since it's chat-driven and Dream3D-related
+        # in spirit — pulling a GGUF model)
+        m = self._DOWNLOAD_HF_RE.match(single_line)
+        if m:
+            repo, filename = m.group(1).strip(), m.group(2).strip()
+            self._hf_download_response(repo, filename)
+            return True
+
         return False
+
+    def _pipeline_export_markdown(self, name: str):
+        import pipeline_scanner as _ps
+        pl = _ps.find_pipeline_by_name(VAULT_DIR, name)
+        if not pl:
+            self._append_transcript(
+                "Writer", f"No pipeline matching '{name}'.", "final",
+            )
+            self._set_status("● idle")
+            return
+        try:
+            md = _ps.export_pipeline_to_markdown(pl)
+            out_dir = data_index.output_dir(VAULT_DIR)
+            out_path = out_dir / f"{Path(pl.name).stem}.md"
+            n = 2
+            while out_path.exists():
+                out_path = out_dir / f"{Path(pl.name).stem}_v{n}.md"
+                n += 1
+            out_path.write_text(md, encoding="utf-8")
+        except Exception as exc:
+            self._append_transcript(
+                "Writer", f"Markdown export failed: {exc!r}", "final",
+            )
+            self._set_status("● idle")
+            return
+        try:
+            rel = out_path.relative_to(VAULT_DIR)
+        except Exception:
+            rel = out_path
+        self._append_transcript(
+            "Writer", f"Exported {pl.name} -> {rel}", "final",
+        )
+        self._set_status("● idle")
+
+    def _hf_download_response(self, repo: str, filename: str):
+        """Download a GGUF model from Hugging Face in a worker thread."""
+        try:
+            import hf_download as _hf
+        except Exception as exc:
+            self._append_transcript(
+                "Writer", f"hf_download module failed to import: {exc!r}", "final",
+            )
+            return
+        if not _hf.hf_cli_available():
+            self._append_transcript(
+                "Writer",
+                "huggingface_hub is not available. Install with:\n"
+                "  pip install huggingface_hub\n"
+                "(or `conda install -c conda-forge huggingface_hub`).",
+                "final",
+            )
+            return
+
+        dest = VAULT_DIR / "models"
+        self._append_transcript(
+            "Council",
+            f"Downloading {filename} from {repo} into {dest} ...",
+            "observation",
+        )
+        self._set_status("● downloading…", "#cba6f7")
+
+        def _progress(line: str):
+            # Filter noisy progress-bar updates — keep only meaningful lines
+            if any(s in line.lower() for s in ("downloading", "to ", "error", "%")):
+                self.after(0, lambda l=line: self._append_transcript(
+                    "Workflow", "  " + l[:200], "observation",
+                ))
+
+        def _worker():
+            try:
+                ok, msg, path = _hf.download_gguf(
+                    repo, filename, dest_dir=dest, on_progress=_progress,
+                )
+            except Exception as exc:
+                self.after(0, lambda: (
+                    self._append_transcript("Writer",
+                                            f"Download crashed: {exc!r}", "final"),
+                    self._set_status("● idle"),
+                ))
+                return
+
+            def _done():
+                if ok and path:
+                    self._append_transcript(
+                        "Writer",
+                        f"{msg}\n\nClick 'Browse...' at the top of the Council "
+                        f"tab to point the model loader at this file, or run:\n"
+                        f"  set COUNCIL_GGUF_PATH={path}",
+                        "final",
+                    )
+                elif ok:
+                    self._append_transcript("Writer", msg, "final")
+                else:
+                    self._append_transcript("Writer",
+                                            f"Download failed: {msg}", "final")
+                self._set_status("● idle")
+            self.after(0, _done)
+
+        import threading as _th
+        _th.Thread(target=_worker, daemon=True).start()
 
     def _pipeline_explain_response(self, name: str):
         import pipeline_scanner as _ps
