@@ -400,6 +400,132 @@ def request_edits_from_model(
 # End-to-end orchestrator
 # ============================================================
 
+# ============================================================
+# Natural-language description of a pipeline
+# ============================================================
+
+def pipeline_to_natural_language(pipeline: Pipeline, *, num_predict: int = 500) -> str:
+    """Ask the model to describe what the pipeline does in plain English.
+
+    Useful when the user inherits a long .py or has just converted a
+    .dream3d and wants a quick read on what it actually accomplishes.
+    """
+    from pipeline_scanner import Pipeline as _PL  # for typing only
+    import council_engine as ce
+
+    if not pipeline.steps:
+        return ("(no parsed steps — file may not be a simplnx pipeline or "
+                "uses an unrecognized call style)")
+
+    step_lines: List[str] = []
+    for s in pipeline.steps:
+        step_lines.append(f"Step {s.index}: {s.filter_name}")
+        for pn, vv in s.inputs:
+            step_lines.append(f"  in:  {pn} = {vv}")
+        for pn, vv in s.outputs:
+            step_lines.append(f"  out: {pn} = {vv}")
+    steps_text = "\n".join(step_lines)
+
+    prompt = f"""Describe what this Dream3D / simplnx pipeline does in
+plain English. Be concise — one paragraph at most. Mention the input
+data, what transformations happen, and what the pipeline produces.
+Do NOT output code. Do NOT repeat the parameter values verbatim.
+
+Pipeline name: {pipeline.name}
+
+Parsed steps (inputs are pre-existing data; outputs are newly created):
+{steps_text}
+
+Plain-English description:"""
+
+    try:
+        raw = ce.local_chat(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.15,
+            num_predict=num_predict,
+            timeout=120,
+        )
+    except Exception as exc:
+        return f"(could not generate description: {exc!r})"
+    return (raw or "").strip() or "(model returned an empty description)"
+
+
+# ============================================================
+# Pipeline generation from a natural-language description
+# ============================================================
+
+_PIPELINE_GEN_PROMPT = """You are writing a Dream3D / simplnx Python
+pipeline from a user request. Output ONLY Python code — no markdown
+fences, no commentary outside the code.
+
+User request:
+{request}
+
+Required structure:
+  - import simplnx as nx
+  - create one DataStructure
+  - one or more nx.<Filter>.execute(...) calls
+  - check result.valid() after each filter
+  - save final state with nx.WriteDREAM3DFilter if the user wants output
+
+Use the simplnx API patterns you know. Be precise with parameter names
+(snake_case) and DataPath usage. The script must be self-contained and
+runnable.
+
+Now write the pipeline. Output only code."""
+
+
+def generate_pipeline_from_description(
+    description: str,
+    vault_dir: Path,
+    *,
+    suggested_name: Optional[str] = None,
+    num_predict: int = 1200,
+) -> Tuple[Optional[Path], str]:
+    """Ask the model to write a brand-new pipeline. Saves to
+    vault/pipelines/in/<name>.py and returns (path, generation_log).
+
+    The generation log surfaces any problem (model unreachable, code
+    syntax error, etc.) so the GUI can show a helpful failure message.
+    """
+    import council_engine as ce
+    from pipeline_scanner import vault_pipelines_in_dir
+
+    if not (description or "").strip():
+        return None, "empty request"
+
+    prompt = _PIPELINE_GEN_PROMPT.format(request=description.strip())
+    try:
+        raw = ce.local_chat(
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.10,
+            num_predict=num_predict,
+            timeout=240,
+        )
+    except Exception as exc:
+        return None, f"model call failed: {exc!r}"
+
+    code = extract_python_code(raw or "")
+    if not code.strip():
+        return None, "model returned empty output"
+
+    try:
+        ast.parse(code)
+    except SyntaxError as exc:
+        return None, f"generated code has syntax error: {exc.msg} at line {exc.lineno}"
+
+    # Build a non-clobbering filename
+    base = safe_suffix(suggested_name or "generated_pipeline", max_len=50)
+    in_dir = vault_pipelines_in_dir(vault_dir)
+    target = in_dir / f"{base}.py"
+    n = 2
+    while target.exists():
+        target = in_dir / f"{base}_v{n}.py"
+        n += 1
+    target.write_text(code, encoding="utf-8")
+    return target, f"ok: {target.relative_to(vault_dir) if vault_dir in target.parents else target}"
+
+
 @dataclass
 class ModifyResult:
     success: bool

@@ -2759,6 +2759,26 @@ class CouncilConsole(tk.Tk):
         r"(?:\s+(?:the|my))?\s+pipelines?\s+(.+?)\s+(?:to|so\s+that|so|with|by|using)\s+(.+?)\s*[.!?]?\s*$",
         _re.IGNORECASE,
     )
+    _PIPELINE_EXPLAIN_RE = _re.compile(
+        r"^\s*(?:explain|describe|what\s+does)"
+        r"(?:\s+(?:the|my))?\s+pipelines?\s+(.+?)\s*(?:do)?\s*[.?!]?\s*$",
+        _re.IGNORECASE,
+    )
+    _PIPELINE_VALIDATE_RE = _re.compile(
+        r"^\s*(?:validate|check|verify)"
+        r"(?:\s+(?:the|my))?\s+pipelines?\s+(.+?)\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
+    _PIPELINE_GRAPH_RE = _re.compile(
+        r"^\s*(?:graph|data\s*flow|dependencies\s+of)"
+        r"(?:\s+(?:the|my|for))?\s+pipelines?\s+(.+?)\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
+    _PIPELINE_CREATE_RE = _re.compile(
+        r"^\s*(?:create|generate|make|write)"
+        r"(?:\s+(?:me|a))?\s+(?:new\s+)?pipelines?\s+(?:that\s+|to\s+|which\s+)?(.+?)\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
 
     def _handle_pipeline_intent(self, user_text: str) -> bool:
         """Detect and handle pipeline show/list/modify intents.
@@ -2791,7 +2811,160 @@ class CouncilConsole(tk.Tk):
             self._pipeline_modify_response(name, change, user_text)
             return True
 
+        # Explain
+        m = self._PIPELINE_EXPLAIN_RE.match(single_line)
+        if m:
+            self._pipeline_explain_response(m.group(1).strip().strip("'\"`"))
+            return True
+
+        # Validate
+        m = self._PIPELINE_VALIDATE_RE.match(single_line)
+        if m:
+            self._pipeline_validate_response(m.group(1).strip().strip("'\"`"))
+            return True
+
+        # Dependency graph
+        m = self._PIPELINE_GRAPH_RE.match(single_line)
+        if m:
+            self._pipeline_graph_response(m.group(1).strip().strip("'\"`"))
+            return True
+
+        # Create (generation)
+        m = self._PIPELINE_CREATE_RE.match(single_line)
+        if m:
+            description = m.group(1).strip().strip("'\"`.")
+            self._pipeline_create_response(description, user_text)
+            return True
+
         return False
+
+    def _pipeline_explain_response(self, name: str):
+        import pipeline_scanner as _ps
+        import pipeline_editor as _pe
+        pl = _ps.find_pipeline_by_name(VAULT_DIR, name)
+        if not pl:
+            self._append_transcript(
+                "Writer",
+                f"No pipeline matching '{name}'. Type 'list pipelines'.",
+                "final",
+            )
+            self._set_status("● idle")
+            return
+        self._append_transcript(
+            "Council", f"Asking model to describe {pl.name}…", "observation",
+        )
+        self._set_status("● describing…", "#fab387")
+
+        def _worker():
+            try:
+                desc = _pe.pipeline_to_natural_language(pl)
+            except Exception as exc:
+                self.after(0, lambda: (
+                    self._append_transcript("Writer", f"description failed: {exc!r}", "final"),
+                    self._set_status("● idle"),
+                ))
+                return
+            self.after(0, lambda: (
+                self._append_transcript("Writer",
+                                        f"{pl.name}:\n\n{desc}", "final"),
+                self._set_status("● idle"),
+            ))
+
+        import threading as _th
+        _th.Thread(target=_worker, daemon=True).start()
+
+    def _pipeline_validate_response(self, name: str):
+        import pipeline_scanner as _ps
+        pl = _ps.find_pipeline_by_name(VAULT_DIR, name)
+        if not pl:
+            self._append_transcript(
+                "Writer", f"No pipeline matching '{name}'.", "final",
+            )
+            self._set_status("● idle")
+            return
+        issues = _ps.validate_pipeline_params(pl)
+        if not issues:
+            self._append_transcript(
+                "Writer",
+                f"{pl.name}: no issues found in {len(pl.steps)} step"
+                f"{'s' if len(pl.steps)!=1 else ''} (against known simplnx schema).",
+                "final",
+            )
+        else:
+            lines = [f"{pl.name}: {len(issues)} issue(s):"]
+            for i in issues:
+                lines.append(f"  • {i}")
+            self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
+    def _pipeline_graph_response(self, name: str):
+        import pipeline_scanner as _ps
+        pl = _ps.find_pipeline_by_name(VAULT_DIR, name)
+        if not pl:
+            self._append_transcript(
+                "Writer", f"No pipeline matching '{name}'.", "final",
+            )
+            self._set_status("● idle")
+            return
+        text = _ps.pipeline_dependency_graph(pl)
+        self._append_transcript("Writer", text, "final")
+        self._set_status("● idle")
+
+    def _pipeline_create_response(self, description: str, full_request: str):
+        import pipeline_editor as _pe
+
+        self._append_transcript(
+            "Council",
+            f"Generating new pipeline from: {description}",
+            "observation",
+        )
+        self._set_status("● generating…", "#fab387")
+
+        # Suggest a filename — pull the first 3-4 content tokens
+        tokens = [t for t in _re.split(r"\W+", description) if len(t) >= 3][:4]
+        suggested = "_".join(t.lower() for t in tokens) or "generated_pipeline"
+
+        def _worker():
+            try:
+                path, log = _pe.generate_pipeline_from_description(
+                    description, VAULT_DIR, suggested_name=suggested,
+                )
+            except Exception as exc:
+                self.after(0, lambda: (
+                    self._append_transcript("Writer",
+                                            f"generation failed: {exc!r}",
+                                            "final"),
+                    self._set_status("● idle"),
+                ))
+                return
+            if not path:
+                self.after(0, lambda: (
+                    self._append_transcript("Writer",
+                                            f"couldn't generate pipeline: {log}",
+                                            "final"),
+                    self._set_status("● idle"),
+                ))
+                return
+            try:
+                rel = path.relative_to(VAULT_DIR)
+            except Exception:
+                rel = path
+
+            def _done():
+                self._append_transcript(
+                    "Writer",
+                    f"Saved new pipeline: {rel}\n\nReview with: "
+                    f"show pipeline {path.name}",
+                    "final",
+                )
+                if hasattr(self, "_dream3d_refresh_pipelines"):
+                    try: self._dream3d_refresh_pipelines()
+                    except Exception: pass
+                self._set_status("● idle")
+            self.after(0, _done)
+
+        import threading as _th
+        _th.Thread(target=_worker, daemon=True).start()
 
     def _pipeline_list_response(self):
         import pipeline_scanner as _ps

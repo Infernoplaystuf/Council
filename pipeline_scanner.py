@@ -28,6 +28,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -45,9 +46,13 @@ except Exception:
 # ============================================================
 
 # Filter-name prefixes that typically CREATE objects. When a filter starts
-# with one of these, ambiguous path parameters get flagged as outputs.
+# with one of these, ambiguous `*_path` parameters get flagged as outputs.
+# Kept conservative — Find*/Identify*/Threshold* often CONSUME existing
+# paths (e.g. Find uses feature_ids_path as input) and produce their
+# result via an explicit output_*_path param, which the EXPLICIT_OUTPUT
+# keyword rules catch on their own.
 _CREATE_PREFIXES = (
-    "Create", "Generate", "Initialize", "Compute", "Map",
+    "Create", "Generate", "Initialize", "Compute", "Map", "Segment",
 )
 # Filter-name prefixes that READ from disk. The file_path param on these
 # is an input.
@@ -499,6 +504,113 @@ def vault_pipelines_out_dir(vault_dir: Path) -> Path:
     p = Path(vault_dir) / "pipelines" / "out"
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+# ============================================================
+# Validation
+# ============================================================
+
+# Known required parameters for common simplnx filters. The list isn't
+# exhaustive — it covers the filters most users hit. Filters not listed
+# fall through with no errors, only warnings about unrecognized params.
+_REQUIRED_PARAMS: Dict[str, set] = {
+    "CreateDataArrayFilter": {
+        "data_structure", "numeric_type", "num_comps", "tuple_dims",
+        "output_array_path",
+    },
+    "CreateImageGeometryFilter": {
+        "data_structure", "geometry_path", "dimensions", "origin",
+        "spacing", "cell_attribute_matrix_name",
+    },
+    "CreateDataGroupFilter": {
+        "data_structure", "data_object_path",
+    },
+    "ReadDREAM3DFilter": {
+        "data_structure", "import_file_data",
+    },
+    "WriteDREAM3DFilter": {
+        "data_structure", "export_file_path",
+    },
+    "ReadCSVFile": {
+        "data_structure",
+    },
+}
+
+
+def validate_pipeline_params(pipeline: Pipeline) -> List[str]:
+    """Static checks against the simplnx schema we know about.
+
+    Returns a list of human-readable issues. Empty list = pipeline looks
+    well-formed against our partial schema. Issues are tagged 'error:'
+    for missing required params and 'warning:' for less critical things
+    like duplicate output paths.
+    """
+    issues: List[str] = []
+    seen_outputs: Dict[str, int] = {}
+    for s in pipeline.steps:
+        # Required-param check
+        required = _REQUIRED_PARAMS.get(s.filter_name)
+        if required:
+            present = {p for p, _ in s.inputs} | {p for p, _ in s.outputs} \
+                      | {p for p, _ in s.configs}
+            missing = required - present
+            if missing:
+                issues.append(
+                    f"error: step {s.index} {s.filter_name} missing required "
+                    f"parameter(s): {', '.join(sorted(missing))}"
+                )
+        # Duplicate output detection (e.g., two filters writing to the
+        # same DataPath — usually a copy-paste bug).
+        for pname, vrep in s.outputs:
+            key = vrep.strip()
+            if not key:
+                continue
+            if key in seen_outputs:
+                issues.append(
+                    f"warning: step {s.index} {s.filter_name} ({pname}={vrep}) "
+                    f"overwrites the output of step {seen_outputs[key]}"
+                )
+            seen_outputs[key] = s.index
+    return issues
+
+
+# ============================================================
+# Dependency graph
+# ============================================================
+
+def pipeline_dependency_graph(pipeline: Pipeline) -> str:
+    """Render which filter's outputs feed which other filter's inputs.
+
+    Returns a text-tree showing data flow per the parsed pipeline.
+    Uses the value text (e.g. nx.DataPath("Features")) as the matching
+    token; same value across steps = a dependency edge.
+    """
+    if not pipeline.steps:
+        return "(no steps to graph)"
+
+    # Build value -> producer step index, and consumer index -> [values]
+    producer: Dict[str, int] = {}
+    consumers: Dict[int, List[Tuple[str, int]]] = defaultdict(list)
+    for s in pipeline.steps:
+        for _, vrep in s.outputs:
+            key = vrep.strip()
+            if key:
+                producer.setdefault(key, s.index)
+        for pname, vrep in s.inputs:
+            key = vrep.strip()
+            if key and key in producer and producer[key] != s.index:
+                consumers[s.index].append((key, producer[key]))
+
+    lines = [f"Data flow for {pipeline.name}:"]
+    for s in pipeline.steps:
+        deps = consumers.get(s.index, [])
+        if deps:
+            lines.append(f"  Step {s.index} {s.filter_name}")
+            for key, src in deps:
+                lines.append(f"    <- step {src}: {_truncate(key, 60)}")
+        else:
+            lines.append(f"  Step {s.index} {s.filter_name}  (no upstream deps)")
+    return "\n".join(lines)
 
 
 def find_pipeline_by_name(vault_dir: Path, query: str) -> Optional[Pipeline]:
