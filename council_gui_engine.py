@@ -2391,6 +2391,11 @@ class CouncilConsole(tk.Tk):
         # by the model — see conversation_logger.py for the full guarantee.
         import conversation_logger as _cl
         self.conv_logger = _cl.ConversationLogger(VAULT_DIR)
+        # Provenance tracker — in-memory record of injected file content
+        # per turn so we can answer "where did this value come from?" with
+        # an exact row reference (or flag it as hallucinated).
+        import provenance as _prov
+        self.provenance = _prov.ProvenanceTracker(max_turns=20)
         try:
             self.conv_logger.start_session(self.session_id)
         except Exception as _e:
@@ -3515,6 +3520,23 @@ class CouncilConsole(tk.Tk):
         r"audit\s+(?:data\s+)?(?:quality\s+of\s+)?)\s*(.*?)\s*[.!?]?\s*$",
         _re.IGNORECASE,
     )
+    _WHERE_VALUE_RE = _re.compile(
+        r"^\s*(?:where\s+(?:did|does|is)|trace|verify|cite|find\s+the\s+source\s+of)"
+        r"\s+(?:that\s+|the\s+)?(?:value\s+)?['\"]?(.+?)['\"]?"
+        r"(?:\s+(?:come\s+)?from|\s+in\s+(?:the\s+)?data)?\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
+    _SHOW_CONTEXT_RE = _re.compile(
+        r"^\s*(?:show|what(?:'s| is)?)\s+(?:last\s+|the\s+last\s+|recent\s+)?"
+        r"(?:context|injection|injected\s+(?:data|content)|what\s+(?:you|the\s+model)\s+saw)"
+        r"\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+    _VERIFY_LAST_RE = _re.compile(
+        r"^\s*(?:verify|check|audit)\s+(?:the\s+)?(?:last|previous|that)\s+"
+        r"(?:answer|response|reply)\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
 
     def _handle_vault_tools_intent(self, user_text: str) -> bool:
         if not user_text:
@@ -3570,7 +3592,126 @@ class CouncilConsole(tk.Tk):
             self._quality_check_response(target)
             return True
 
+        # Provenance / verification intents — these consult the in-session
+        # ProvenanceTracker, not the model. Fast and authoritative.
+        if self._SHOW_CONTEXT_RE.match(single_line):
+            self._show_last_context_response()
+            return True
+
+        if self._VERIFY_LAST_RE.match(single_line):
+            self._verify_last_answer_response()
+            return True
+
+        m = self._WHERE_VALUE_RE.match(single_line)
+        if m:
+            value = m.group(1).strip().strip("'\"`")
+            self._where_value_response(value)
+            return True
+
         return False
+
+    def _show_last_context_response(self):
+        """Print the [FILE: ...] blocks the model saw in the last turn."""
+        prov = getattr(self, "provenance", None)
+        if not prov:
+            self._append_transcript("Writer", "Provenance is not initialized.", "final")
+            self._set_status("● idle")
+            return
+        turn = prov.last_turn()
+        if not turn:
+            self._append_transcript(
+                "Writer", "No previous turn recorded yet.", "final",
+            )
+            self._set_status("● idle")
+            return
+        if not turn.injected_files:
+            self._append_transcript(
+                "Writer",
+                f"Turn #{turn.turn_id} had NO injected files — the model was "
+                f"answering from its own training, not from your data.",
+                "final",
+            )
+            self._set_status("● idle")
+            return
+        lines = [f"Context from turn #{turn.turn_id} ({turn.timestamp}):"]
+        for ib in turn.injected_files:
+            lines.append("")
+            lines.append(f"--- {ib.file_name} ({ib.file_path}) ---")
+            # Cap rendering so the transcript doesn't explode
+            block = ib.block
+            if len(block) > 3000:
+                block = block[:3000] + "\n... (truncated)"
+            lines.append(block)
+        self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
+    def _verify_last_answer_response(self):
+        """Extract numeric values from the most recent model reply and
+        check each against the injection. Flags any that aren't found —
+        those are the most likely hallucinations."""
+        prov = getattr(self, "provenance", None)
+        if not prov or not prov.last_turn():
+            self._append_transcript("Writer", "No previous answer to verify.", "final")
+            self._set_status("● idle")
+            return
+        report = prov.verify_response("")
+        if not report["checked"]:
+            self._append_transcript(
+                "Writer",
+                "No numeric values found in the last answer to verify.",
+                "final",
+            )
+            self._set_status("● idle")
+            return
+        lines = [f"Verifying {len(report['checked'])} numeric value(s) "
+                 f"from the last answer:"]
+        for hit in report["found"]:
+            w = hit["where"]
+            lines.append(
+                f"  ✓ {hit['value']} — found in {w['file_name']}, "
+                f"line {w['line_index']+1}"
+            )
+        for v in report["missing"]:
+            lines.append(
+                f"  ✗ {v} — NOT FOUND in the injected files. "
+                f"Likely hallucinated or computed indirectly."
+            )
+        self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
+    def _where_value_response(self, value: str):
+        prov = getattr(self, "provenance", None)
+        if not prov:
+            self._append_transcript("Writer", "Provenance is not initialized.", "final")
+            self._set_status("● idle")
+            return
+        hits = prov.search_value(value, max_turns_back=5, max_hits=8)
+        if not hits:
+            self._append_transcript(
+                "Writer",
+                f"No match for {value!r} in the last 5 turns of injected "
+                f"context.\n\nThat usually means one of three things:\n"
+                f"  1. The value was computed by the model from numbers in "
+                f"the file (so the literal string isn't there).\n"
+                f"  2. The value was hallucinated — the model produced it "
+                f"without any source.\n"
+                f"  3. The file is in the vault but wasn't injected this "
+                f"session (try 'show pipeline <path>' or pass the path "
+                f"explicitly to bring it into context).",
+                "final",
+            )
+            self._set_status("● idle")
+            return
+        lines = [f"Found {len(hits)} occurrence(s) of {value!r}:"]
+        for h in hits:
+            lines.append("")
+            lines.append(f"  Turn #{h['turn_id']} — {h['file_name']} "
+                         f"(line {h['line_index']+1}, {h['match_kind']} match)")
+            lines.append("  Context:")
+            for snip_line in h["context_snippet"].split("\n"):
+                lines.append("    " + snip_line)
+        self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
 
     def _quality_check_response(self, target: str):
         """Run detect_data_quality_issues against a CSV (specific file) or
@@ -7535,6 +7676,17 @@ class CouncilConsole(tk.Tk):
         except Exception:
             pass
 
+        # Provenance: capture model responses (not the user's own message,
+        # not phase/token streams) so "where did X come from" can scan
+        # them later.
+        try:
+            if (hasattr(self, "provenance") and self.provenance
+                    and kind in ("final", "observation")
+                    and who not in ("User",)):
+                self.provenance.add_response(who, text)
+        except Exception:
+            pass
+
         for widget in (getattr(self, "transcript", None),
                        getattr(self, "dream3d_transcript", None)):
             if widget is None:
@@ -8594,6 +8746,36 @@ class CouncilConsole(tk.Tk):
         if _analyst_block:
             self._append_transcript("Council", "Computing from data...", "observation")
             user_text = _analyst_block + "\n\n" + user_text
+
+        # ── Provenance: remember what we showed the model this turn ──
+        # Lets the user ask "where did $5,000 come from?" after the reply.
+        try:
+            if hasattr(self, "provenance"):
+                import provenance as _prov_mod
+                injected_records = []
+                # Recorded file paths (explicit user-given paths)
+                for p_str in _extract_file_paths(original_user_text):
+                    block = _read_file_for_injection(p_str)
+                    if block:
+                        injected_records.append(_prov_mod.InjectedBlock(
+                            file_name=Path(p_str).name,
+                            file_path=p_str,
+                            block=block,
+                        ))
+                # If the analyst step ran, treat its result as another source
+                if _analyst_block:
+                    injected_records.append(_prov_mod.InjectedBlock(
+                        file_name="(analyst result)",
+                        file_path="(in-session)",
+                        block=_analyst_block,
+                    ))
+                self.provenance.record_turn(
+                    user_text=original_user_text,
+                    augmented_text=user_text,
+                    injected_files=injected_records,
+                )
+        except Exception as _e:
+            print(f"[Provenance] record failed: {_e!r}")
 
         # ── Fast path: chart-shaped questions go straight to the Grapher ──
         # Skip this entirely when we just injected vault context — the user is
