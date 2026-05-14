@@ -383,13 +383,27 @@ def _populate_steps_from_dream3d_json(pipeline: Pipeline, data: Any) -> None:
         steps_iter = [s for s in data if isinstance(s, dict)]
 
     for i, step in enumerate(steps_iter, start=1):
-        filter_name = (
-            step.get("name")
-            or step.get("filter_name")
-            or step.get("Filter_Name")
-            or step.get("FilterName")
-            or "UnknownFilter"
-        )
+        # Filter name lives in different places per schema version:
+        #   .d3dpipeline:    step["filter"]["name"]   (nx::core::FooFilter)
+        #   legacy embedded: step["name"] / step["filter_name"]
+        filter_name = None
+        sub = step.get("filter")
+        if isinstance(sub, dict):
+            filter_name = sub.get("name") or sub.get("filter_name")
+        if not filter_name:
+            filter_name = (
+                step.get("name")
+                or step.get("filter_name")
+                or step.get("Filter_Name")
+                or step.get("FilterName")
+                or "UnknownFilter"
+            )
+        # Strip the C++ namespace prefix Dream3D-NX uses
+        # ("nx::core::CreateGeometryFilter" -> "CreateGeometryFilter") so
+        # validation rules and the dependency-graph renderer don't have to
+        # carry the prefix.
+        if isinstance(filter_name, str) and "::" in filter_name:
+            filter_name = filter_name.rsplit("::", 1)[-1]
         params = (
             step.get("args")
             or step.get("parameters")
@@ -419,6 +433,26 @@ def _populate_steps_from_dream3d_json(pipeline: Pipeline, data: Any) -> None:
 # Folder scan + render
 # ============================================================
 
+def parse_d3dpipeline(path: Path) -> Pipeline:
+    """Parse a `.d3dpipeline` JSON file (the plain-JSON pipeline format
+    Dream3D-NX exports alongside the HDF5 `.dream3d` files).
+
+    Schema differs from the embedded-in-HDF5 form:
+      { "pipeline": [
+          { "filter": { "name": "nx::core::CreateGeometryFilter", "uuid": "..." },
+            "args": { ... }, "comments": "", "isDisabled": false }, ... ],
+        "name": "...", "version": ... }
+    """
+    pipeline = Pipeline(path=path, name=path.name, format="d3dpipeline")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception as exc:
+        pipeline.notes.append(f"JSON parse failed: {exc}")
+        return pipeline
+    _populate_steps_from_dream3d_json(pipeline, data)
+    return pipeline
+
+
 def parse_pipeline_file(path: Path) -> Pipeline:
     """Dispatch on file extension."""
     suffix = path.suffix.lower()
@@ -426,12 +460,14 @@ def parse_pipeline_file(path: Path) -> Pipeline:
         return parse_py_pipeline(path)
     if suffix == ".dream3d":
         return parse_dream3d_pipeline(path)
+    if suffix == ".d3dpipeline":
+        return parse_d3dpipeline(path)
     return Pipeline(path=path, name=path.name, format="unknown",
                     notes=["unsupported extension"])
 
 
 def scan_pipelines(folder: Path) -> List[Pipeline]:
-    """Walk a folder (recursively) and parse every .py and .dream3d file."""
+    """Walk a folder (recursively) and parse every .py / .dream3d / .d3dpipeline file."""
     folder = Path(folder)
     if not folder.exists():
         return []
@@ -439,7 +475,7 @@ def scan_pipelines(folder: Path) -> List[Pipeline]:
     for p in folder.rglob("*"):
         if not p.is_file():
             continue
-        if p.suffix.lower() not in (".py", ".dream3d"):
+        if p.suffix.lower() not in (".py", ".dream3d", ".d3dpipeline"):
             continue
         pipelines.append(parse_pipeline_file(p))
     pipelines.sort(key=lambda pl: pl.name.lower())
@@ -664,23 +700,30 @@ def validate_pipeline_params(pipeline: Pipeline) -> List[str]:
     well-formed against our partial schema. Issues are tagged 'error:'
     for missing required params and 'warning:' for less critical things
     like duplicate output paths.
+
+    The required-params check only applies to `.py` (simplnx Python) files
+    because the .dream3d/.d3dpipeline JSON formats use a different
+    parameter naming convention (snake_case args without the data_structure
+    placeholder). Duplicate-output detection runs on every format.
     """
     issues: List[str] = []
     seen_outputs: Dict[str, int] = {}
+    is_python = pipeline.format == "py"
     for s in pipeline.steps:
-        # Required-param check
-        required = _REQUIRED_PARAMS.get(s.filter_name)
-        if required:
-            present = {p for p, _ in s.inputs} | {p for p, _ in s.outputs} \
-                      | {p for p, _ in s.configs}
-            missing = required - present
-            if missing:
-                issues.append(
-                    f"error: step {s.index} {s.filter_name} missing required "
-                    f"parameter(s): {', '.join(sorted(missing))}"
-                )
+        # Required-param check — Python-source pipelines only.
+        if is_python:
+            required = _REQUIRED_PARAMS.get(s.filter_name)
+            if required:
+                present = {p for p, _ in s.inputs} | {p for p, _ in s.outputs} \
+                          | {p for p, _ in s.configs}
+                missing = required - present
+                if missing:
+                    issues.append(
+                        f"error: step {s.index} {s.filter_name} missing required "
+                        f"parameter(s): {', '.join(sorted(missing))}"
+                    )
         # Duplicate output detection (e.g., two filters writing to the
-        # same DataPath — usually a copy-paste bug).
+        # same DataPath — usually a copy-paste bug). Format-agnostic.
         for pname, vrep in s.outputs:
             key = vrep.strip()
             if not key:
