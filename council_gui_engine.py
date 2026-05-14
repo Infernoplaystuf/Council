@@ -478,6 +478,111 @@ def _render_excel_block(p, char_limit):
     return content
 
 
+def _render_folder_for_injection(folder, max_files=40, max_chars=12000):
+    """Build a comprehensive [FOLDER: ...] injection block listing every
+    file in the folder. For tabular files, include headers + first 3
+    rows so the model sees the SHAPE of every file, not just top-5
+    vault-search hits.
+
+    Honors PROTECTED_SUBDIRS: files under conversation_logs/ /
+    conversations/ are never included.
+    """
+    folder = Path(folder)
+    if not folder.exists() or not folder.is_dir():
+        return None
+    try:
+        import conversation_logger as _cl
+    except Exception:
+        _cl = None
+
+    lines = [f"[FOLDER: {folder}]"]
+    lines.append("(All files in this folder are listed below — already "
+                 "scanned. Treat this as the COMPLETE inventory of what's "
+                 "available; do not invent files that aren't shown here.)")
+    lines.append("")
+
+    # Collect files (recursive, skip hidden/build/protected)
+    SKIP_DIRS = {"__pycache__", ".git", ".venv", "venv", "node_modules"}
+    files = []
+    for p in folder.rglob("*"):
+        if not p.is_file():
+            continue
+        if any(part in SKIP_DIRS or part.startswith(".")
+               for part in p.relative_to(folder).parts[:-1]):
+            continue
+        if _cl is not None:
+            try:
+                if _cl.is_protected_path(p, folder.parent):
+                    continue
+            except Exception:
+                pass
+        try:
+            size = p.stat().st_size
+        except Exception:
+            continue
+        files.append((p, size))
+    files.sort(key=lambda fs: (fs[0].suffix.lower(), fs[0].name.lower()))
+
+    if not files:
+        lines.append("(folder is empty)")
+        return "\n".join(lines)
+
+    # Truncate if too many
+    truncated_n = max(0, len(files) - max_files)
+    files_shown = files[:max_files]
+    lines.append(f"Total files: {len(files)}"
+                 + (f" (showing first {max_files})" if truncated_n else ""))
+    lines.append("")
+
+    # Per-file summary — short for tabular, name-only for binary
+    for p, size in files_shown:
+        rel = p.relative_to(folder)
+        suf = p.suffix.lower()
+        size_kb = size / 1024
+        size_str = f"{size_kb:>8.1f} KB" if size_kb < 1024 else f"{size_kb/1024:>7.1f} MB"
+        head = f"  {size_str}  {rel}"
+        try:
+            if suf == ".csv":
+                import pandas as _pd
+                df = _pd.read_csv(p, nrows=3)
+                cols = ", ".join(str(c) for c in df.columns[:12])
+                more = "" if len(df.columns) <= 12 else f" + {len(df.columns)-12} more"
+                lines.append(head + "  columns: " + cols + more)
+            elif suf in (".xlsx", ".xls", ".xlsm"):
+                import pandas as _pd
+                xl = _pd.ExcelFile(p)
+                lines.append(head + f"  sheets: {', '.join(xl.sheet_names[:5])}"
+                             + (f" (+{len(xl.sheet_names)-5})" if len(xl.sheet_names) > 5 else ""))
+            elif suf == ".json":
+                import json as _json
+                try:
+                    obj = _json.loads(p.read_text(encoding="utf-8", errors="replace")[:2048] + "}")
+                except Exception:
+                    obj = None
+                if isinstance(obj, dict):
+                    keys = ", ".join(str(k) for k in list(obj.keys())[:8])
+                    lines.append(head + f"  keys: {keys}")
+                else:
+                    lines.append(head)
+            elif suf in (".txt", ".md", ".rst", ".log", ".yaml", ".yml", ".toml", ".ini"):
+                snippet = p.read_text(encoding="utf-8", errors="replace")[:80].replace("\n", " ")
+                lines.append(head + f"  preview: {snippet}...")
+            else:
+                lines.append(head)
+        except Exception:
+            lines.append(head)
+
+        if sum(len(ln) for ln in lines) > max_chars:
+            lines.append("  ... (folder listing truncated)")
+            break
+
+    if truncated_n:
+        lines.append(f"  ... ({truncated_n} additional files not shown — "
+                     f"ask about specific files or subfolders to see them)")
+    lines.append("[END FOLDER]")
+    return "\n".join(lines)
+
+
 def _render_duckdb_block(p):
     """DuckDB database — read-only listing of tables + columns + samples."""
     lines = [
@@ -709,15 +814,22 @@ def _inject_file_contents(user_text):
     fuzzy_matches = {}
     missing_paths: list = []
     for path_str in explicit_paths:
+        p_check = Path(path_str.strip())
+        # Directory? Render a listing + per-file summary block instead of
+        # treating the path as "missing". This is critical because the
+        # user often says "look at files in <folder>" with a literal
+        # path — previously we silently dropped it and the model
+        # refused, or worse, hallucinated from training data.
+        if p_check.is_dir():
+            folder_block = _render_folder_for_injection(p_check)
+            if folder_block:
+                injections.append(folder_block)
+            continue
         snippet = _read_file_for_injection(path_str)
         if snippet:
             injections.append(snippet)
         else:
-            # The user referenced a file path that we COULD NOT read on
-            # this machine. Track it so we can tell the model explicitly,
-            # otherwise small GGUFs see the filename in the query and
-            # confabulate values from training-data familiarity with
-            # public datasets of the same name.
+            # File path that genuinely doesn't exist on this machine.
             missing_paths.append(path_str)
 
     folder_scope = _detect_folder_scope(user_text)
@@ -3789,6 +3901,24 @@ class CouncilConsole(tk.Tk):
         r"(?:the\s+)?(.+?))?\s*\??\s*$",
         _re.IGNORECASE,
     )
+    _LIST_FILES_RE = _re.compile(
+        # "list files in X" / "show files in X" / "what files are in X"
+        # Captures <where> as group 1.
+        r"^\s*(?:list|show|what)\s+"
+        r"(?:me\s+|are\s+)?(?:the\s+|all\s+(?:of\s+)?(?:the\s+)?)?"
+        r"files?"
+        r"(?:\s+(?:are\s+)?(?:in|of|under|inside|within)\s+"
+        r"(?:the\s+)?(.+?))?\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+    _LOOK_AT_FILES_RE = _re.compile(
+        # "look at (all) (the) files in X" — triggers the full folder
+        # injection so the model sees a per-file summary.
+        r"^\s*(?:look\s+at|inspect|scan|read)\s+"
+        r"(?:all\s+(?:of\s+)?(?:the\s+)?|the\s+)?files?"
+        r"(?:\s+(?:in|under|inside|within)\s+(?:the\s+)?(.+?))?\s*\??\s*$",
+        _re.IGNORECASE,
+    )
     # Trailing-noise words to strip from the captured target — users say
     # things like "data_in folder within the vault" and we only want
     # "data_in".
@@ -3890,6 +4020,18 @@ class CouncilConsole(tk.Tk):
             # Strip trailing filler ("X folder within the vault" -> "X")
             target = self._FOLDER_NOISE_RE.sub("", target).strip()
             self._list_folders_response(target)
+            return True
+
+        m = self._LIST_FILES_RE.match(single_line)
+        if m:
+            target = self._FOLDER_NOISE_RE.sub("", (m.group(1) or "").strip().strip("'\"`")).strip()
+            self._list_files_response(target)
+            return True
+
+        m = self._LOOK_AT_FILES_RE.match(single_line)
+        if m:
+            target = self._FOLDER_NOISE_RE.sub("", (m.group(1) or "").strip().strip("'\"`")).strip()
+            self._look_at_files_response(target)
             return True
 
         m = self._ELEMENT_RANKING_RE.match(single_line)
@@ -4540,6 +4682,80 @@ class CouncilConsole(tk.Tk):
 
         import threading as _th
         _th.Thread(target=_worker, daemon=True).start()
+
+    def _list_files_response(self, target: str):
+        """Deterministic file listing — every file in <folder> + size,
+        recursive. No model involvement; no risk of hallucination."""
+        root = self._resolve_folder_target(target)
+        if not root.exists() or not root.is_dir():
+            self._append_transcript("Writer", f"Folder not found: {root}", "final")
+            self._set_status("● idle")
+            return
+        try:
+            import conversation_logger as _cl
+        except Exception:
+            _cl = None
+        SKIP_DIRS = {"__pycache__", ".git", ".venv", "venv", "node_modules"}
+        files = []
+        for p in root.rglob("*"):
+            if not p.is_file():
+                continue
+            if any(part in SKIP_DIRS or part.startswith(".")
+                   for part in p.relative_to(root).parts[:-1]):
+                continue
+            if _cl is not None:
+                try:
+                    if _cl.is_protected_path(p, root.parent):
+                        continue
+                except Exception:
+                    pass
+            try:
+                files.append((p, p.stat().st_size))
+            except Exception:
+                continue
+        files.sort(key=lambda fs: str(fs[0]).lower())
+        if not files:
+            self._append_transcript("Writer",
+                                    f"{root}/ contains no files.", "final")
+        else:
+            lines = [f"Files in {root}/ ({len(files)} total):"]
+            for p, size in files[:200]:
+                rel = p.relative_to(root)
+                size_kb = size / 1024
+                size_str = (f"{size_kb:>8.1f} KB" if size_kb < 1024
+                            else f"{size_kb/1024:>7.1f} MB")
+                lines.append(f"  {size_str}  {rel}")
+            if len(files) > 200:
+                lines.append(f"  ... ({len(files) - 200} more — refine with a "
+                             f"subfolder or 'look at files in <subfolder>')")
+            self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
+    def _look_at_files_response(self, target: str):
+        """Inject the folder block then let the Writer answer the user's
+        question with full visibility into every file's columns/sheets."""
+        root = self._resolve_folder_target(target)
+        if not root.exists() or not root.is_dir():
+            self._append_transcript("Writer", f"Folder not found: {root}", "final")
+            self._set_status("● idle")
+            return
+        block = _render_folder_for_injection(root)
+        if not block:
+            self._append_transcript("Writer",
+                                    f"Could not inspect {root}.", "final")
+            self._set_status("● idle")
+            return
+        # For the no-model case, just render it directly to the transcript.
+        # Strip the wrapper since [FOLDER:] tags are prompt-injection-only.
+        text = block
+        if text.startswith("[FOLDER:"):
+            text = text.split("\n", 1)[1] if "\n" in text else text
+        if text.endswith("[END FOLDER]"):
+            text = text.rsplit("\n", 1)[0]
+        self._append_transcript("Writer",
+                                f"Inspection of {root}/ (no model used):\n\n{text}",
+                                "final")
+        self._set_status("● idle")
 
     def _list_folders_response(self, target: str):
         """Resolve `target` (a path, a vault-relative folder name, or
