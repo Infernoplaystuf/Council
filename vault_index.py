@@ -172,9 +172,13 @@ _SQLITE_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
 _DUCKDB_SUFFIXES = {".duckdb"}
 # MongoDB dump format (.bson — binary JSON, one or more documents)
 _BSON_SUFFIXES = {".bson"}
+# Dream3D pipeline JSON sidecar (same content as embedded HDF5; treated
+# like .json for keyword indexing so 'show pipeline X' / vault search
+# both pick them up).
+_D3DPIPELINE_SUFFIXES = {".d3dpipeline"}
 _PARSEABLE = ({".csv", ".json"} | _TEXT_SUFFIXES | _EXCEL_SUFFIXES
               | _TABULAR_EXTRA | _SQLITE_SUFFIXES
-              | _DUCKDB_SUFFIXES | _BSON_SUFFIXES)
+              | _DUCKDB_SUFFIXES | _BSON_SUFFIXES | _D3DPIPELINE_SUFFIXES)
 
 
 def _is_gz_csv(p: Path) -> bool:
@@ -595,8 +599,10 @@ def _index_file(p: Path) -> Optional[Dict[str, Any]]:
         rec = _parse_parquet(p)
     elif suffix == ".gz" and _is_gz_csv(p):
         rec = _parse_csv_gz(p)
-    elif suffix == ".json":
+    elif suffix == ".json" or suffix in _D3DPIPELINE_SUFFIXES:
         rec = _parse_json(p)
+        if suffix in _D3DPIPELINE_SUFFIXES:
+            rec["type"] = "d3dpipeline"
     elif suffix in _EXCEL_SUFFIXES:
         rec = _parse_excel(p)
     elif suffix in _SQLITE_SUFFIXES:
