@@ -707,10 +707,18 @@ def _inject_file_contents(user_text):
 
     injections = []
     fuzzy_matches = {}
+    missing_paths: list = []
     for path_str in explicit_paths:
         snippet = _read_file_for_injection(path_str)
         if snippet:
             injections.append(snippet)
+        else:
+            # The user referenced a file path that we COULD NOT read on
+            # this machine. Track it so we can tell the model explicitly,
+            # otherwise small GGUFs see the filename in the query and
+            # confabulate values from training-data familiarity with
+            # public datasets of the same name.
+            missing_paths.append(path_str)
 
     folder_scope = _detect_folder_scope(user_text)
     do_vault_search = (
@@ -737,6 +745,26 @@ def _inject_file_contents(user_text):
             except Exception as _e:
                 print('[DEBUG inject] vault search failed: ' + repr(_e),
                       file=_sys_dbg.stderr)
+
+    # Prepend an explicit "missing data" marker when paths the user
+    # mentioned couldn't be read. This is critical defense against the
+    # cross-machine hallucination case where the file existed on
+    # Computer A but not on Computer B — the model would otherwise
+    # silently invent values from training-data memory of similarly-
+    # named public datasets.
+    if missing_paths:
+        miss_block = (
+            "[NO DATA AVAILABLE — the user's message referenced these "
+            "file paths, but they do NOT exist on this machine:]"
+        )
+        for mp in missing_paths:
+            miss_block += "\n  - " + str(mp)
+        miss_block += (
+            "\n[Refuse to give specific values for these files. Tell "
+            "the user the file is not present on this machine. Do NOT "
+            "invent column names, row counts, or values from memory.]"
+        )
+        injections.insert(0, miss_block)
 
     if not injections:
         return user_text, fuzzy_matches

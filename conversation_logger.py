@@ -41,6 +41,14 @@ from typing import Any, Dict, List, Optional
 
 PROTECTED_SUBDIRS: tuple = (
     "conversation_logs",
+    # Past Q&A from earlier sessions. Was readable by query_history_search
+    # (a chat intent) but ALSO indexed by vault_index — that meant the
+    # model could see its own old answers as "context" in a new session,
+    # leading to cross-machine value hallucinations when an older session
+    # mentioned data that doesn't exist on the current machine.
+    # query_history_search bypasses vault_index (reads conversations/
+    # directly), so excluding the folder here doesn't break that feature.
+    "conversations",
 )
 
 
