@@ -3690,6 +3690,40 @@ class CouncilConsole(tk.Tk):
         r"(?:index|cache|embeddings?)?\s*[.!?]?\s*$",
         _re.IGNORECASE,
     )
+    _TREE_RE = _re.compile(
+        r"^\s*(?:tree|show\s+tree|folder\s+tree|directory\s+tree)"
+        r"(?:\s+(?:of|in|for)\s+(.+?))?\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+    _GREP_RE = _re.compile(
+        r"^\s*(?:grep|search\s+files|find\s+text|find\s+in\s+files)"
+        r"\s+(?:for\s+)?['\"]?(.+?)['\"]?"
+        r"(?:\s+(?:in|under|inside|within)\s+(.+?))?\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
+    _FIND_COLUMN_RE = _re.compile(
+        r"^\s*(?:find|which|what)\s+(?:files\s+(?:have|contain|with)|"
+        r"(?:csvs?|files?)\s+(?:have|with))\s+(?:a\s+|the\s+)?"
+        r"['\"]?(.+?)['\"]?\s+column\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+    _RECENT_FILES_RE = _re.compile(
+        r"^\s*(?:recent\s+files|what(?:'s|\s+is)\s+new|"
+        r"files?\s+(?:changed|modified)\s+(?:recently|in\s+the\s+last))"
+        r"(?:\s+(?:in|under)\s+(.+?))?\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+    _ROMAN_RE = _re.compile(
+        r"^\s*(?:find|list|show|count)\s+(?:roman\s+numerals?|roman)"
+        r"(?:\s+(?:in|under|inside|within)\s+(.+?))?\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+    _MONEY_RE_CHAT = _re.compile(
+        r"^\s*(?:find|list|show)\s+(?:money|currency|prices?|amounts?|dollar\s+amounts?)"
+        r"(?:\s+(?:in|under|inside|within)\s+(.+?))?\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+
     _ELEMENT_RANKING_RE = _re.compile(
         # Matches phrasings like:
         #   what is the most common (atomic) element [in <where>]
@@ -3827,6 +3861,38 @@ class CouncilConsole(tk.Tk):
             target = (m.group(2) or "").strip().strip("'\"`")
             target = self._FOLDER_NOISE_RE.sub("", target).strip()
             self._element_ranking_response(target, top_n=n)
+            return True
+
+        # Filesystem helpers — tree, grep, column search, recent
+        m = self._TREE_RE.match(single_line)
+        if m:
+            target = self._FOLDER_NOISE_RE.sub("", (m.group(1) or "").strip().strip("'\"`")).strip()
+            self._tree_response(target)
+            return True
+        m = self._GREP_RE.match(single_line)
+        if m:
+            self._grep_response(m.group(1).strip().strip("'\"`"),
+                                 (m.group(2) or "").strip().strip("'\"`"))
+            return True
+        m = self._FIND_COLUMN_RE.match(single_line)
+        if m:
+            self._find_column_response(m.group(1).strip().strip("'\"`"))
+            return True
+        m = self._RECENT_FILES_RE.match(single_line)
+        if m:
+            target = self._FOLDER_NOISE_RE.sub("", (m.group(1) or "").strip().strip("'\"`")).strip()
+            self._recent_files_response(target)
+            return True
+        # Pattern searches — roman, money
+        m = self._ROMAN_RE.match(single_line)
+        if m:
+            target = self._FOLDER_NOISE_RE.sub("", (m.group(1) or "").strip().strip("'\"`")).strip()
+            self._roman_response(target)
+            return True
+        m = self._MONEY_RE_CHAT.match(single_line)
+        if m:
+            target = self._FOLDER_NOISE_RE.sub("", (m.group(1) or "").strip().strip("'\"`")).strip()
+            self._money_response(target)
             return True
 
         if self._EXPORT_TRANSCRIPT_RE.match(single_line):
@@ -4150,6 +4216,123 @@ class CouncilConsole(tk.Tk):
         self._append_transcript(
             "Writer", f"Schema doc for {p.name} -> {rel}", "final",
         )
+        self._set_status("● idle")
+
+    def _resolve_folder_target(self, target: str) -> Path:
+        """Shared resolver — explicit absolute path, vault-relative path,
+        or empty -> data_in/. Used by tree / grep / recent / roman / money
+        / element-ranking / list-subfolders handlers."""
+        if not target:
+            try:
+                import data_index
+                return data_index.input_dir(VAULT_DIR)
+            except Exception:
+                return VAULT_DIR / "data_in"
+        p = Path(target).expanduser()
+        if p.is_absolute() and p.exists():
+            return p
+        candidate = VAULT_DIR / target
+        return candidate if candidate.exists() else p
+
+    def _tree_response(self, target: str):
+        import vault_tools as _vt
+        root = self._resolve_folder_target(target)
+        if not root.exists() or not root.is_dir():
+            self._append_transcript("Writer", f"Folder not found: {root}", "final")
+        else:
+            text = _vt.tree(root, max_depth=3, show_files=False)
+            self._append_transcript("Writer", text, "final")
+        self._set_status("● idle")
+
+    def _grep_response(self, query: str, target: str):
+        import vault_tools as _vt
+        root = self._resolve_folder_target(target) if target else VAULT_DIR
+        if not root.exists():
+            self._append_transcript("Writer", f"Folder not found: {root}", "final")
+            self._set_status("● idle")
+            return
+        hits = _vt.find_files_containing_text(root, query, max_hits=50)
+        if not hits:
+            self._append_transcript(
+                "Writer",
+                f"No matches for {query!r} in any text file under {root.name}/.",
+                "final",
+            )
+        else:
+            lines = [f"Found {len(hits)} match(es) for {query!r}:"]
+            for h in hits:
+                lines.append(f"  {h['path']}:{h['line']}  →  {h['context'][:120]}")
+            self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
+    def _find_column_response(self, column: str):
+        import vault_tools as _vt
+        hits = _vt.find_files_with_column(VAULT_DIR, column)
+        if not hits:
+            self._append_transcript(
+                "Writer", f"No CSV/Excel file under the vault has a column matching {column!r}.",
+                "final",
+            )
+        else:
+            lines = [f"{len(hits)} file(s)/sheet(s) have a {column!r} column:"]
+            for h in hits:
+                where = h['path']
+                if h.get('sheet'):
+                    where += f"  (sheet: {h['sheet']})"
+                cols = ", ".join(h['matched_columns'])
+                lines.append(f"  {where}  →  {cols}")
+            self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
+    def _recent_files_response(self, target: str):
+        import vault_tools as _vt
+        root = self._resolve_folder_target(target) if target else VAULT_DIR
+        files = _vt.recent_files(root, since_days=7, limit=20)
+        if not files:
+            self._append_transcript(
+                "Writer", f"No files modified in the last 7 days under {root.name}/.",
+                "final",
+            )
+        else:
+            lines = [f"Files modified in the last 7 days ({len(files)} shown):"]
+            for f in files:
+                size_kb = f['size'] / 1024
+                lines.append(f"  {f['iso']}  {size_kb:>8.1f} KB  {f['path']}")
+            self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
+    def _roman_response(self, target: str):
+        import vault_tools as _vt
+        root = self._resolve_folder_target(target)
+        df = _vt.find_roman_numerals(root, top_n=20)
+        if df is None or len(df) == 0:
+            self._append_transcript(
+                "Writer", f"No Roman numerals (length ≥ 2) found under {root.name}/.", "final",
+            )
+        else:
+            lines = [f"Top {len(df)} Roman numerals under {root.name}/ (single-letter skipped):"]
+            lines.append(f"  {'roman':<8}{'integer':>8}{'count':>8}{'files':>8}")
+            for _, r in df.iterrows():
+                lines.append(f"  {r['roman']:<8}{int(r['integer']):>8}"
+                             f"{int(r['count']):>8}{int(r['files']):>8}")
+            self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
+    def _money_response(self, target: str):
+        import vault_tools as _vt
+        root = self._resolve_folder_target(target)
+        hits = _vt.find_money_amounts(root, max_hits=50)
+        if not hits:
+            self._append_transcript(
+                "Writer", f"No currency amounts found in text files under {root.name}/.", "final",
+            )
+        else:
+            lines = [f"Found {len(hits)} currency amount(s):"]
+            for h in hits[:30]:
+                lines.append(f"  {h['amount']:<20}  {h['path']}")
+            if len(hits) > 30:
+                lines.append(f"  ... ({len(hits)-30} more)")
+            self._append_transcript("Writer", "\n".join(lines), "final")
         self._set_status("● idle")
 
     def _element_ranking_response(self, target: str, *, top_n: int = 10):

@@ -108,6 +108,415 @@ def format_subfolder_listing(
 
 
 # ============================================================
+# Filesystem helpers — tree, grep across files, schema lookup, recent
+# ============================================================
+
+def tree(
+    root: Path,
+    *,
+    max_depth: int = 3,
+    show_files: bool = False,
+    file_limit_per_dir: int = 20,
+) -> str:
+    """Visual hierarchy of a folder.
+
+    `max_depth` limits recursion. `show_files` includes file names
+    under each folder (capped by `file_limit_per_dir`). Skips
+    hidden/build directories.
+    """
+    root = Path(root)
+    SKIP = {"__pycache__", ".git", ".venv", "venv", "node_modules",
+            ".idea", ".vscode", ".DS_Store"}
+    lines: list[str] = [f"{root.name}/"]
+
+    def _walk(p: Path, prefix: str, depth: int):
+        if depth > max_depth:
+            return
+        try:
+            kids = sorted(p.iterdir(), key=lambda c: (not c.is_dir(), c.name.lower()))
+        except Exception:
+            return
+        # Filter
+        kids = [k for k in kids if k.name not in SKIP and not k.name.startswith(".")]
+        if not show_files:
+            kids = [k for k in kids if k.is_dir()]
+        elif len(kids) > file_limit_per_dir:
+            kids = kids[:file_limit_per_dir] + ["__more__"]
+        for i, k in enumerate(kids):
+            last = (i == len(kids) - 1)
+            branch = "└── " if last else "├── "
+            if k == "__more__":
+                lines.append(prefix + branch + f"... ({file_limit_per_dir}+ more)")
+                continue
+            label = k.name + ("/" if k.is_dir() else "")
+            lines.append(prefix + branch + label)
+            if k.is_dir():
+                new_prefix = prefix + ("    " if last else "│   ")
+                _walk(k, new_prefix, depth + 1)
+    _walk(root, "", 1)
+    return "\n".join(lines)
+
+
+# Text-like file types that participate in grep / pattern searches.
+_GREPPABLE_SUFFIXES = {
+    ".csv", ".tsv", ".txt", ".md", ".markdown", ".json", ".jsonl",
+    ".xml", ".html", ".htm", ".yaml", ".yml", ".toml", ".ini",
+    ".log", ".rst", ".ang", ".d3dpipeline", ".py", ".sh", ".bat",
+    ".sql", ".cfg",
+}
+
+
+def find_files_containing_text(
+    folder: Any,
+    query: str,
+    *,
+    case_sensitive: bool = False,
+    max_hits: int = 100,
+    context_chars: int = 60,
+) -> List[Dict[str, Any]]:
+    """Grep-style search across every text-like file under `folder`.
+
+    Returns up to `max_hits` matches with file path, line number, and
+    a ±context_chars window around the hit. Honors protected-paths
+    (conversation_logs/ never gets scanned).
+    """
+    folder = Path(folder)
+    if not folder.exists() or not query.strip():
+        return []
+    flags = 0 if case_sensitive else re.IGNORECASE
+    rx = re.compile(re.escape(query), flags)
+    out: List[Dict[str, Any]] = []
+    for p in folder.rglob("*"):
+        if not p.is_file():
+            continue
+        if p.suffix.lower() not in _GREPPABLE_SUFFIXES:
+            continue
+        try:
+            if is_protected_path(p, folder.parent):
+                continue
+        except Exception:
+            pass
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            m = rx.search(line)
+            if not m:
+                continue
+            start = max(0, m.start() - context_chars)
+            end = min(len(line), m.end() + context_chars)
+            out.append({
+                "path":    str(p.relative_to(folder)),
+                "line":    lineno,
+                "context": line[start:end].strip(),
+            })
+            if len(out) >= max_hits:
+                return out
+    return out
+
+
+def find_files_with_column(
+    folder: Any,
+    column_name: str,
+    *,
+    fuzzy: bool = True,
+) -> List[Dict[str, Any]]:
+    """Find every CSV / Excel sheet under `folder` that has a column
+    matching `column_name`. Case-insensitive substring match by default.
+
+    For Excel files with multiple sheets, each matching sheet is its
+    own result row.
+    """
+    folder = Path(folder)
+    if not folder.exists():
+        return []
+    needle = column_name.strip().lower()
+    out: List[Dict[str, Any]] = []
+    for p in folder.rglob("*"):
+        if not p.is_file():
+            continue
+        suf = p.suffix.lower()
+        try:
+            if suf == ".csv":
+                try:
+                    import pandas as _pd
+                    df = _pd.read_csv(p, nrows=0)   # header only — fast
+                    cols = [str(c) for c in df.columns]
+                except Exception:
+                    continue
+                matches = [c for c in cols
+                           if (needle in c.lower()) if fuzzy
+                           else c.lower() == needle]
+                if matches:
+                    out.append({
+                        "path": str(p.relative_to(folder)),
+                        "sheet": "",
+                        "matched_columns": matches,
+                    })
+            elif suf in (".xlsx", ".xls", ".xlsm"):
+                try:
+                    import pandas as _pd
+                    xl = _pd.ExcelFile(p)
+                    for sname in xl.sheet_names:
+                        df = xl.parse(sname, nrows=0)
+                        cols = [str(c) for c in df.columns]
+                        matches = [c for c in cols
+                                   if (needle in c.lower()) if fuzzy
+                                   else c.lower() == needle]
+                        if matches:
+                            out.append({
+                                "path": str(p.relative_to(folder)),
+                                "sheet": sname,
+                                "matched_columns": matches,
+                            })
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return out
+
+
+def recent_files(
+    folder: Any,
+    *,
+    since_days: int = 7,
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """Return files modified within the last `since_days` days,
+    newest first, up to `limit` entries."""
+    import time as _t
+    folder = Path(folder)
+    if not folder.exists():
+        return []
+    cutoff = _t.time() - since_days * 86400
+    rows: List[Dict[str, Any]] = []
+    for p in folder.rglob("*"):
+        if not p.is_file():
+            continue
+        try:
+            st = p.stat()
+        except Exception:
+            continue
+        if st.st_mtime < cutoff:
+            continue
+        try:
+            if is_protected_path(p, folder.parent):
+                continue
+        except Exception:
+            pass
+        rows.append({
+            "path":  str(p.relative_to(folder)),
+            "mtime": st.st_mtime,
+            "iso":   _t.strftime("%Y-%m-%d %H:%M:%S", _t.localtime(st.st_mtime)),
+            "size":  st.st_size,
+        })
+    rows.sort(key=lambda r: r["mtime"], reverse=True)
+    return rows[:limit]
+
+
+# ============================================================
+# Pattern-search families — roman numerals, dates, money, emails,
+# phone numbers, URLs, version strings
+# ============================================================
+
+# Standard Roman numeral validation regex (1 .. 3999). Word-bounded.
+# Uppercase by default because mixed-case "Mxx" is rarely intentional
+# and lowercase 'i'/'v'/'x' appears too often in regular text.
+_ROMAN_NUMERAL_RE = re.compile(
+    r"\b(M{1,3}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3}))\b"
+)
+
+
+def _roman_to_int(s: str) -> int:
+    table = {"I":1,"V":5,"X":10,"L":50,"C":100,"D":500,"M":1000}
+    total = 0
+    prev = 0
+    for ch in reversed(s):
+        v = table.get(ch, 0)
+        if v < prev: total -= v
+        else: total += v; prev = v
+    return total
+
+
+def find_roman_numerals(
+    folder: Any,
+    *,
+    min_length: int = 2,
+    top_n: int = 20,
+) -> "Any":
+    """Tally Roman numerals across vault text files. Skips single-letter
+    matches by default (`min_length=2`) because "I" / "V" / "X" / "L" /
+    "C" / "D" / "M" as standalone letters cause overwhelming false
+    positives ("I think...", "section X", "Plan B revision V").
+
+    Returns a DataFrame: roman, integer, count, files.
+    """
+    folder = Path(folder)
+    if not folder.exists():
+        import pandas as pd
+        return pd.DataFrame()
+    counts: Dict[str, int] = {}
+    file_sets: Dict[str, set] = {}
+    for p in folder.rglob("*"):
+        if not p.is_file() or p.suffix.lower() not in _GREPPABLE_SUFFIXES:
+            continue
+        try:
+            if is_protected_path(p, folder.parent):
+                continue
+        except Exception:
+            pass
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for m in _ROMAN_NUMERAL_RE.finditer(text):
+            tok = m.group(1)
+            if len(tok) < min_length:
+                continue
+            counts[tok] = counts.get(tok, 0) + 1
+            file_sets.setdefault(tok, set()).add(p.name)
+    import pandas as pd
+    if not counts:
+        return pd.DataFrame()
+    rows = [{"roman": r, "integer": _roman_to_int(r),
+             "count": c, "files": len(file_sets[r])}
+            for r, c in counts.items()]
+    df = pd.DataFrame(rows).sort_values("count", ascending=False).reset_index(drop=True)
+    return df.head(top_n)
+
+
+# Date extraction — common formats. Tags each match with the format
+# that matched so the caller can audit.
+_DATE_PATTERNS = [
+    ("YYYY-MM-DD",   re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")),
+    ("MM/DD/YYYY",   re.compile(r"\b(\d{1,2}/\d{1,2}/\d{4})\b")),
+    ("DD/MM/YYYY",   re.compile(r"\b(\d{1,2}/\d{1,2}/\d{4})\b")),   # same regex, different interp
+    ("DD.MM.YYYY",   re.compile(r"\b(\d{1,2}\.\d{1,2}\.\d{4})\b")),
+    ("Month DD, YYYY", re.compile(
+        r"\b((?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|"
+        r"Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|"
+        r"Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2},\s+\d{4})\b",
+        re.IGNORECASE,
+    )),
+    ("YYYY-MM-DD hh:mm", re.compile(r"\b(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})")),
+]
+
+
+def find_dates_in_text(text: str, *, dedupe: bool = True) -> List[Dict[str, str]]:
+    """Extract dates from `text` in common formats. Each match returns
+    {date_string, format}. With dedupe=True (default), each unique
+    (string, format) pair appears only once."""
+    seen: set = set()
+    out: List[Dict[str, str]] = []
+    for fmt, rx in _DATE_PATTERNS:
+        # Only run the first MM/DD/YYYY regex once (avoid duplicate hits)
+        if fmt == "DD/MM/YYYY":
+            continue
+        for m in rx.finditer(text):
+            s = m.group(1)
+            key = (s, fmt) if dedupe else (s, fmt, m.start())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"date": s, "format": fmt})
+    return out
+
+
+_MONEY_RE = re.compile(
+    # $1,234.56  €500  £42.10  ¥1000  JPY 100  USD 50.00
+    r"(?<![\w])("
+    r"[\$€£¥₹]\s?\d{1,3}(?:[,\s]\d{3})*(?:\.\d{1,2})?"
+    r"|(?:USD|EUR|GBP|JPY|CNY|INR|CAD|AUD|CHF)\s+\d{1,3}(?:[,\s]\d{3})*(?:\.\d{1,2})?"
+    r")\b"
+)
+
+
+def find_money_amounts(folder: Any, *, max_hits: int = 200) -> List[Dict[str, Any]]:
+    """Find currency amounts in text files."""
+    folder = Path(folder)
+    if not folder.exists():
+        return []
+    out: List[Dict[str, Any]] = []
+    for p in folder.rglob("*"):
+        if not p.is_file() or p.suffix.lower() not in _GREPPABLE_SUFFIXES:
+            continue
+        try:
+            if is_protected_path(p, folder.parent):
+                continue
+        except Exception:
+            pass
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for m in _MONEY_RE.finditer(text):
+            out.append({"path": str(p.relative_to(folder)),
+                        "amount": m.group(1).strip()})
+            if len(out) >= max_hits:
+                return out
+    return out
+
+
+_EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+_URL_RE   = re.compile(r"\bhttps?://[^\s\"'<>)]+", re.IGNORECASE)
+_PHONE_RE = re.compile(
+    r"(?<!\d)("
+    r"\+?\d{1,3}[\s.-]?\(?\d{2,4}\)?[\s.-]?\d{3,4}[\s.-]?\d{3,4}"
+    r"|\(\d{3}\)\s?\d{3}[\s.-]?\d{4}"
+    r"|\d{3}[\s.-]\d{3}[\s.-]\d{4}"
+    r")(?!\d)"
+)
+_VERSION_RE = re.compile(
+    r"\b(v?\d+\.\d+(?:\.\d+)?(?:[-+][A-Za-z0-9.]+)?)\b"
+)
+
+
+def _pattern_scan(folder: Path, pattern: "re.Pattern",
+                  max_hits: int = 200) -> List[Dict[str, Any]]:
+    """Generic pattern-walker used by find_emails / find_phone_numbers /
+    find_urls / find_versions."""
+    out: List[Dict[str, Any]] = []
+    folder = Path(folder)
+    if not folder.exists():
+        return out
+    for p in folder.rglob("*"):
+        if not p.is_file() or p.suffix.lower() not in _GREPPABLE_SUFFIXES:
+            continue
+        try:
+            if is_protected_path(p, folder.parent):
+                continue
+        except Exception:
+            pass
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        for m in pattern.finditer(text):
+            out.append({"path": str(p.relative_to(folder)),
+                        "match": m.group(0).strip()})
+            if len(out) >= max_hits:
+                return out
+    return out
+
+
+def find_emails(folder: Any, *, max_hits: int = 200) -> List[Dict[str, Any]]:
+    return _pattern_scan(Path(folder), _EMAIL_RE, max_hits=max_hits)
+
+
+def find_phone_numbers(folder: Any, *, max_hits: int = 200) -> List[Dict[str, Any]]:
+    return _pattern_scan(Path(folder), _PHONE_RE, max_hits=max_hits)
+
+
+def find_urls(folder: Any, *, max_hits: int = 200) -> List[Dict[str, Any]]:
+    return _pattern_scan(Path(folder), _URL_RE, max_hits=max_hits)
+
+
+def find_versions(folder: Any, *, max_hits: int = 200) -> List[Dict[str, Any]]:
+    return _pattern_scan(Path(folder), _VERSION_RE, max_hits=max_hits)
+
+
+# ============================================================
 # Atomic-element search (periodic-table tally over vault content)
 # ============================================================
 
