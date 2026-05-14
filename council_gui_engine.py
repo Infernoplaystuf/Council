@@ -3718,6 +3718,15 @@ class CouncilConsole(tk.Tk):
         r"(?:\s+(?:in|under|inside|within)\s+(.+?))?\s*\??\s*$",
         _re.IGNORECASE,
     )
+    _COMPARE_SCHEMAS_RE = _re.compile(
+        r"^\s*(?:compare|diff)\s+schemas?\s+(?:of\s+)?(.+?)\s+(?:and|vs\.?|versus|to|with)\s+(.+?)\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
+    _COLUMN_TYPES_RE = _re.compile(
+        r"^\s*(?:infer|detect|show|what\s+are)\s+(?:the\s+)?(?:column\s+)?types?"
+        r"(?:\s+(?:in|of|for)\s+(.+?))?\s*\??\s*$",
+        _re.IGNORECASE,
+    )
     _MONEY_RE_CHAT = _re.compile(
         r"^\s*(?:find|list|show)\s+(?:money|currency|prices?|amounts?|dollar\s+amounts?)"
         r"(?:\s+(?:in|under|inside|within)\s+(.+?))?\s*\??\s*$",
@@ -3893,6 +3902,18 @@ class CouncilConsole(tk.Tk):
         if m:
             target = self._FOLDER_NOISE_RE.sub("", (m.group(1) or "").strip().strip("'\"`")).strip()
             self._money_response(target)
+            return True
+        m = self._COMPARE_SCHEMAS_RE.match(single_line)
+        if m:
+            self._compare_schemas_response(
+                m.group(1).strip().strip("'\"`"),
+                m.group(2).strip().strip("'\"`"),
+            )
+            return True
+        m = self._COLUMN_TYPES_RE.match(single_line)
+        if m:
+            target = (m.group(1) or "").strip().strip("'\"`")
+            self._column_types_response(target)
             return True
 
         if self._EXPORT_TRANSCRIPT_RE.match(single_line):
@@ -4309,13 +4330,117 @@ class CouncilConsole(tk.Tk):
             self._append_transcript(
                 "Writer", f"No Roman numerals (length ≥ 2) found under {root.name}/.", "final",
             )
-        else:
-            lines = [f"Top {len(df)} Roman numerals under {root.name}/ (single-letter skipped):"]
+            self._set_status("● idle")
+            return
+        # Split into confident vs ambiguous-English-abbreviation
+        confident = df[df['count'] > 0]
+        ambiguous = df[df['ambiguous_count'] > 0]
+        lines = [f"Roman numerals under {root.name}/ (single-letter matches skipped):"]
+        if len(confident):
+            lines.append("")
+            lines.append("Confident matches:")
             lines.append(f"  {'roman':<8}{'integer':>8}{'count':>8}{'files':>8}")
-            for _, r in df.iterrows():
+            for _, r in confident.iterrows():
                 lines.append(f"  {r['roman']:<8}{int(r['integer']):>8}"
                              f"{int(r['count']):>8}{int(r['files']):>8}")
-            self._append_transcript("Writer", "\n".join(lines), "final")
+        else:
+            lines.append("  (no non-ambiguous Roman numerals found)")
+        if len(ambiguous):
+            lines.append("")
+            lines.append("Likely false positives (common English abbreviations):")
+            lines.append(f"  {'token':<8}{'as roman':>10}{'count':>8}{'note':<25}")
+            notes = {
+                "ML":"machine learning", "MD":"M.D./Maryland", "MC":"Master of Ceremonies",
+                "MV":"music video", "MI":"Michigan", "DC":"Washington DC",
+                "DI":"digital input", "DL":"download/driver licence",
+                "LI":"Long Island", "LV":"Las Vegas", "CL":"chlorine",
+                "CM":"centimeter", "CD":"compact disc", "XL":"extra large",
+            }
+            for _, r in ambiguous.iterrows():
+                lines.append(f"  {r['roman']:<8}{int(r['integer']):>10}"
+                             f"{int(r['ambiguous_count']):>8}"
+                             f"  {notes.get(r['roman'], '')}")
+        self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
+    def _resolve_file_target(self, target: str) -> Optional[Path]:
+        """Resolve target string to an existing CSV/Excel file."""
+        p = Path(target).expanduser()
+        if p.is_absolute() and p.is_file():
+            return p
+        try:
+            import vault_analyst as _va
+            matches = []
+            for c in _va.list_csv_files(VAULT_DIR) + _va.list_excel_files(VAULT_DIR):
+                if target.lower() in c.name.lower():
+                    matches.append(c)
+            if matches:
+                return matches[0]
+        except Exception:
+            pass
+        candidate = VAULT_DIR / target
+        return candidate if candidate.is_file() else None
+
+    def _compare_schemas_response(self, a: str, b: str):
+        import vault_analyst as _va
+        pa = self._resolve_file_target(a)
+        pb = self._resolve_file_target(b)
+        if not pa or not pb:
+            missing = [n for n, p in [(a, pa), (b, pb)] if p is None]
+            self._append_transcript(
+                "Writer", f"Could not resolve: {', '.join(missing)}",
+                "final",
+            )
+            self._set_status("● idle")
+            return
+        try:
+            df = _va.compare_schemas(pa, pb)
+        except Exception as exc:
+            self._append_transcript("Writer",
+                                    f"Schema compare failed: {exc!r}", "final")
+            self._set_status("● idle")
+            return
+        lines = [f"Schema diff: {pa.name}  vs  {pb.name}"]
+        for _, row in df.iterrows():
+            tag = {
+                "in_both":      "  =", "only_in_a":   "- A",
+                "only_in_b":    "+ B", "type_changed": "  ~",
+            }.get(row['status'], "  ?")
+            extra = ""
+            if row['status'] == 'type_changed':
+                extra = f"  ({row['dtype_a']} -> {row['dtype_b']})"
+            lines.append(f"  {tag}  {row['column']}{extra}")
+        self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
+    def _column_types_response(self, target: str):
+        import vault_analyst as _va
+        p = self._resolve_file_target(target) if target else None
+        if not p:
+            self._append_transcript(
+                "Writer",
+                f"Could not resolve a file from {target!r}.", "final",
+            )
+            self._set_status("● idle")
+            return
+        try:
+            df = _va.column_type_inferences(p)
+        except Exception as exc:
+            self._append_transcript("Writer",
+                                    f"Type inference failed: {exc!r}", "final")
+            self._set_status("● idle")
+            return
+        lines = [f"Inferred column types for {p.name}:"]
+        lines.append(f"  {'column':<35}{'dtype':<12}{'inferred kind':<25}"
+                     f"{'non-null':>10}{'unique':>10}")
+        for _, row in df.iterrows():
+            lines.append(
+                f"  {str(row['column'])[:34]:<35}{str(row['dtype'])[:11]:<12}"
+                f"{str(row['inferred_kind'])[:24]:<25}"
+                f"{int(row['non_null']):>10}"
+                f"{int(row['unique']):>10}"
+            )
+        self._append_transcript("Writer", "\n".join(lines), "final")
         self._set_status("● idle")
 
     def _money_response(self, target: str):

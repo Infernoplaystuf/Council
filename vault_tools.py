@@ -327,6 +327,26 @@ _ROMAN_NUMERAL_RE = re.compile(
     r"\b(M{1,3}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3}))\b"
 )
 
+# Short letter pairs that ARE valid Roman numerals but ALSO common
+# English abbreviations. Counts in this set go to ambiguous_count
+# rather than the primary count.
+_AMBIGUOUS_ROMAN = {
+    "ML",   # machine learning / milliliter (1050)
+    "MD",   # M.D., Maryland (1500)
+    "MC",   # Master of Ceremonies (1100)
+    "MV",   # music video, megavolt (1005)
+    "MI",   # Michigan, Marketing Insights (1001)
+    "DC",   # Washington DC (600)
+    "DI",   # digital input, drive-in (501)
+    "DL",   # download, driver license (550)
+    "LI",   # Long Island (51)
+    "LV",   # Las Vegas (55)
+    "CL",   # chlorine (also the element, 150)
+    "CM",   # centimeter (900)
+    "CD",   # compact disc (400)
+    "XL",   # extra large (40)
+}
+
 
 def _roman_to_int(s: str) -> int:
     table = {"I":1,"V":5,"X":10,"L":50,"C":100,"D":500,"M":1000}
@@ -357,6 +377,7 @@ def find_roman_numerals(
         import pandas as pd
         return pd.DataFrame()
     counts: Dict[str, int] = {}
+    amb_counts: Dict[str, int] = {}
     file_sets: Dict[str, set] = {}
     for p in folder.rglob("*"):
         if not p.is_file() or p.suffix.lower() not in _GREPPABLE_SUFFIXES:
@@ -374,14 +395,23 @@ def find_roman_numerals(
             tok = m.group(1)
             if len(tok) < min_length:
                 continue
-            counts[tok] = counts.get(tok, 0) + 1
             file_sets.setdefault(tok, set()).add(p.name)
+            if tok in _AMBIGUOUS_ROMAN:
+                amb_counts[tok] = amb_counts.get(tok, 0) + 1
+            else:
+                counts[tok] = counts.get(tok, 0) + 1
     import pandas as pd
-    if not counts:
+    if not counts and not amb_counts:
         return pd.DataFrame()
-    rows = [{"roman": r, "integer": _roman_to_int(r),
-             "count": c, "files": len(file_sets[r])}
-            for r, c in counts.items()]
+    rows = []
+    for r in set(counts) | set(amb_counts):
+        rows.append({
+            "roman":           r,
+            "integer":         _roman_to_int(r),
+            "count":           counts.get(r, 0),
+            "ambiguous_count": amb_counts.get(r, 0),
+            "files":           len(file_sets[r]),
+        })
     df = pd.DataFrame(rows).sort_values("count", ascending=False).reset_index(drop=True)
     return df.head(top_n)
 

@@ -1405,6 +1405,156 @@ def top_n_per_csv(
 # Schema documentation
 # ============================================================
 
+def compare_schemas(file_a: Any, file_b: Any) -> pd.DataFrame:
+    """Diff the column schemas of two CSV / Excel files.
+
+    Returns a DataFrame with one row per column showing whether it's
+    `only_in_a`, `only_in_b`, or `in_both`, plus the dtypes from each
+    side when present. Useful for spotting renamed columns,
+    dropped columns, or type drift between snapshots.
+    """
+    def _headers_and_types(path: Any):
+        p = Path(path)
+        suf = p.suffix.lower()
+        try:
+            if suf in (".xlsx", ".xls", ".xlsm"):
+                df = pd.read_excel(p, nrows=50)
+            else:
+                df = read_table(p)
+                df = df.head(50)
+        except Exception:
+            return [], {}
+        return list(df.columns), {str(c): str(df[c].dtype) for c in df.columns}
+
+    cols_a, types_a = _headers_and_types(file_a)
+    cols_b, types_b = _headers_and_types(file_b)
+    set_a = {str(c) for c in cols_a}
+    set_b = {str(c) for c in cols_b}
+    rows: List[Dict[str, Any]] = []
+    for col in sorted(set_a | set_b):
+        in_a = col in set_a
+        in_b = col in set_b
+        if in_a and in_b:
+            status = ("type_changed" if types_a.get(col) != types_b.get(col)
+                      else "in_both")
+        elif in_a:
+            status = "only_in_a"
+        else:
+            status = "only_in_b"
+        rows.append({
+            "column":  col,
+            "status":  status,
+            "dtype_a": types_a.get(col, ""),
+            "dtype_b": types_b.get(col, ""),
+        })
+    return pd.DataFrame(rows)
+
+
+# Type-inference patterns (beyond pandas's literal dtype).
+_DATE_HINT_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}|^\d{1,2}/\d{1,2}/\d{2,4}|^\d{1,2}\.\d{1,2}\.\d{2,4}"
+)
+_DATETIME_HINT_RE = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}")
+_PERCENT_HINT_RE = re.compile(r"^-?\d+(?:\.\d+)?%$")
+_CURRENCY_HINT_RE = re.compile(r"^[\$€£¥₹]\s?\d|^\d+(?:[,\d]+)?(?:\.\d+)?\s?(?:USD|EUR|GBP)")
+_BOOL_HINT_RE = re.compile(r"^(true|false|yes|no|y|n|1|0)$", re.IGNORECASE)
+_EMAIL_HINT_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+_URL_HINT_RE = re.compile(r"^https?://", re.IGNORECASE)
+_PHONE_HINT_RE = re.compile(r"^\+?\d[\d\s().-]{6,}\d$")
+_UUID_HINT_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+def _infer_column_kind(s: pd.Series, *, sample_size: int = 200) -> str:
+    """Return a richer "kind" label for a column beyond its raw dtype.
+
+    Categories: date, datetime, percent, currency, boolean, email, url,
+    phone, uuid, integer, float, categorical, text.
+    """
+    sample = s.dropna().astype(str).head(sample_size)
+    if sample.empty:
+        return "empty"
+
+    if pd.api.types.is_bool_dtype(s):
+        return "boolean"
+    if pd.api.types.is_integer_dtype(s):
+        return "integer"
+    if pd.api.types.is_float_dtype(s):
+        coerced = pd.to_numeric(s.dropna(), errors="coerce")
+        if not coerced.empty and (coerced == coerced.astype("Int64")).all():
+            return "integer (stored as float)"
+        return "float"
+    if pd.api.types.is_datetime64_any_dtype(s):
+        return "datetime"
+
+    n = len(sample)
+
+    def _frac_matching(pat) -> float:
+        return sum(1 for v in sample if pat.match(v.strip())) / n
+
+    if _frac_matching(_DATETIME_HINT_RE) > 0.7:
+        return "datetime"
+    if _frac_matching(_DATE_HINT_RE) > 0.7:
+        return "date"
+    if _frac_matching(_PERCENT_HINT_RE) > 0.7:
+        return "percent"
+    if _frac_matching(_CURRENCY_HINT_RE) > 0.7:
+        return "currency"
+    if _frac_matching(_EMAIL_HINT_RE) > 0.7:
+        return "email"
+    if _frac_matching(_URL_HINT_RE) > 0.7:
+        return "url"
+    if _frac_matching(_PHONE_HINT_RE) > 0.7:
+        return "phone"
+    if _frac_matching(_UUID_HINT_RE) > 0.7:
+        return "uuid"
+    if _frac_matching(_BOOL_HINT_RE) > 0.95:
+        return "boolean"
+    # Try numeric coercion
+    coerced = pd.to_numeric(sample, errors="coerce")
+    if coerced.notna().mean() > 0.9:
+        if (coerced.dropna() == coerced.dropna().astype("Int64")).all():
+            return "integer (text-encoded)"
+        return "float (text-encoded)"
+    # Categorical if low cardinality
+    nunique = s.nunique(dropna=True)
+    if 1 < nunique <= max(20, int(len(s) * 0.05)):
+        return "categorical"
+    return "text"
+
+
+def column_type_inferences(path: Any) -> pd.DataFrame:
+    """Infer a richer type label for every column in a CSV/Excel.
+
+    Returns a DataFrame with: column, dtype, inferred_kind, non_null,
+    null_pct, unique. The inferred_kind goes beyond pandas's dtype to
+    label date/datetime/percent/currency/boolean/email/url/phone/uuid/
+    integer/float/categorical/text — useful for deciding which helper
+    to apply next or for catching encoding mistakes (a column showing
+    `object` dtype but `email` kind, etc.).
+    """
+    p = Path(path)
+    try:
+        df = read_table(p)
+    except Exception as exc:
+        return pd.DataFrame([{"column": "", "error": str(exc)}])
+    rows: List[Dict[str, Any]] = []
+    total = max(1, len(df))
+    for col in df.columns:
+        s = df[col]
+        rows.append({
+            "column":         str(col),
+            "dtype":          str(s.dtype),
+            "inferred_kind":  _infer_column_kind(s),
+            "non_null":       int(s.count()),
+            "null_pct":       round(100 * int(s.isna().sum()) / total, 2),
+            "unique":         int(s.nunique(dropna=True)),
+        })
+    return pd.DataFrame(rows)
+
+
 def schema_doc_from_csv(path: Any) -> str:
     """Generate a Markdown schema doc from summarize_csv output.
 
@@ -2137,6 +2287,9 @@ def execute_pandas_code(
         "read_excel_all_tables":  read_excel_all_tables,
         "strip_summary_rows":     strip_summary_rows,
         "unpivot_year_columns":   unpivot_year_columns,
+        # Schema diff + smart type inference
+        "compare_schemas":        compare_schemas,
+        "column_type_inferences": column_type_inferences,
         # Parquet / SQLite + pivot
         "list_parquet_files":     list_parquet_files,
         "list_sqlite_files":      list_sqlite_files,
