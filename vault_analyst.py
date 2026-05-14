@@ -171,6 +171,306 @@ def list_data_files(data_folder: Any, recursive: bool = True) -> List[Path]:
                   | set(list_excel_files(data_folder, recursive=recursive)))
 
 
+# ============================================================
+# Messy-data helpers — robust CSV / multi-table Excel / reshape
+# ============================================================
+
+_ENCODING_CANDIDATES = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
+_SEPARATOR_CANDIDATES = (",", ";", "\t", "|")
+
+
+def _sniff_csv_separator(sample: str) -> str:
+    """Pick the separator that gives the most consistent column count."""
+    best_sep, best_consistency = ",", 0
+    for sep in _SEPARATOR_CANDIDATES:
+        lines = [ln for ln in sample.splitlines() if ln.strip()][:50]
+        if len(lines) < 2:
+            continue
+        counts = [ln.count(sep) for ln in lines]
+        if not counts or max(counts) == 0:
+            continue
+        # Pick the separator where the mode column count repeats most
+        from collections import Counter as _C
+        mode_count, mode_freq = _C(counts).most_common(1)[0]
+        if mode_count > 0 and mode_freq > best_consistency:
+            best_sep, best_consistency = sep, mode_freq
+    return best_sep
+
+
+def _detect_header_row(path: Path, encoding: str, sep: str,
+                       max_check: int = 20) -> int:
+    """Find the first row that looks like a real CSV header.
+
+    Heuristic: scan up to `max_check` rows; the header is the first row
+    whose column count matches the *modal* column count of the rows
+    that follow it. Skips title/banner rows where row 1 is a single
+    cell of text and the real data starts at row 3 or 4.
+    """
+    try:
+        with open(path, encoding=encoding, errors="replace", newline="") as fh:
+            rows: list[list[str]] = []
+            import csv as _csv
+            reader = _csv.reader(fh, delimiter=sep)
+            for i, row in enumerate(reader):
+                rows.append(row)
+                if i >= max_check + 10:
+                    break
+    except Exception:
+        return 0
+    if not rows:
+        return 0
+    # Median column count of the bottom half (data rows are usually
+    # consistent; title rows are 1-cell anomalies).
+    from statistics import median as _median
+    later_lens = [len(r) for r in rows[max_check:max_check + 20]] or \
+                 [len(r) for r in rows[max(0, len(rows)//2):]]
+    target = int(_median(later_lens)) if later_lens else 1
+    for i, row in enumerate(rows[:max_check]):
+        if len(row) == target and any(c.strip() for c in row):
+            return i
+    return 0
+
+
+def read_csv_robust(path: Any) -> tuple[pd.DataFrame, dict]:
+    """Read a CSV that may have any of: a non-utf-8 encoding, a separator
+    other than comma, a title/banner row before the headers, or trailing
+    summary rows.
+
+    Returns (df, diagnostics) where diagnostics has keys:
+      encoding, separator, header_row_index, footer_rows_stripped.
+    """
+    p = Path(path)
+    diag: dict = {"encoding": None, "separator": None,
+                  "header_row_index": 0, "footer_rows_stripped": 0}
+    # 1. Encoding sniff — read first 8 KB
+    raw = b""
+    try:
+        with open(p, "rb") as fh:
+            raw = fh.read(8192)
+    except Exception:
+        return pd.DataFrame(), diag
+    encoding = "utf-8"
+    for enc in _ENCODING_CANDIDATES:
+        try:
+            raw.decode(enc)
+            encoding = enc
+            break
+        except UnicodeDecodeError:
+            continue
+    diag["encoding"] = encoding
+    # 2. Separator sniff on a decoded sample
+    sample = raw.decode(encoding, errors="replace")
+    sep = _sniff_csv_separator(sample)
+    diag["separator"] = sep
+    # 3. Header-row detect
+    header_row = _detect_header_row(p, encoding, sep)
+    diag["header_row_index"] = header_row
+    # 4. Read with the determined params
+    try:
+        df = pd.read_csv(p, encoding=encoding, sep=sep,
+                         skiprows=header_row, on_bad_lines="skip")
+    except Exception:
+        return pd.DataFrame(), diag
+    # 5. Strip trailing summary rows
+    df, n_stripped = _strip_summary_rows_inplace(df)
+    diag["footer_rows_stripped"] = n_stripped
+    return df, diag
+
+
+_SUMMARY_PATTERNS = (
+    "total", "grand total", "sub total", "subtotal", "sum",
+    "average", "avg", "mean", "count",
+)
+
+
+def _strip_summary_rows_inplace(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """Drop trailing rows whose first non-null column matches a summary
+    word. Returns (cleaned_df, rows_dropped)."""
+    if df is None or df.empty:
+        return df, 0
+    n_dropped = 0
+    # Walk from the bottom up
+    for _ in range(min(10, len(df))):
+        last = df.iloc[-1]
+        try:
+            first_val = next((str(v) for v in last.values
+                              if v is not None and str(v).strip()),
+                             "")
+        except Exception:
+            break
+        if first_val.strip().lower() in _SUMMARY_PATTERNS or \
+           any(p in first_val.strip().lower() for p in _SUMMARY_PATTERNS):
+            df = df.iloc[:-1]
+            n_dropped += 1
+        else:
+            break
+    return df.reset_index(drop=True), n_dropped
+
+
+def strip_summary_rows(
+    df: pd.DataFrame,
+    *,
+    patterns: tuple = _SUMMARY_PATTERNS,
+) -> pd.DataFrame:
+    """Public wrapper — drop trailing summary rows. Use custom patterns
+    if your data uses different terminology."""
+    global _SUMMARY_PATTERNS
+    saved = _SUMMARY_PATTERNS
+    try:
+        _SUMMARY_PATTERNS = tuple(p.lower() for p in patterns)
+        df2, _ = _strip_summary_rows_inplace(df)
+        return df2
+    finally:
+        _SUMMARY_PATTERNS = saved
+
+
+def find_data_block(path_or_df: Any) -> dict:
+    """Locate the actual tabular data region in a messy CSV/Excel sheet.
+
+    For a file: reads it, detects header row + extent of consistent rows.
+    For a DataFrame: scans for the bounding box of non-null cells.
+
+    Returns a dict with: start_row, end_row, start_col, end_col, n_rows,
+    n_cols. Rows/cols are 0-based.
+    """
+    if isinstance(path_or_df, pd.DataFrame):
+        df = path_or_df
+    else:
+        p = Path(path_or_df)
+        if p.suffix.lower() == ".csv":
+            df, _ = read_csv_robust(p)
+        elif p.suffix.lower() in (".xlsx", ".xls", ".xlsm"):
+            df = pd.read_excel(p)
+        else:
+            return {"error": "unsupported file type"}
+    if df is None or df.empty:
+        return {"start_row": 0, "end_row": 0, "start_col": 0, "end_col": 0,
+                "n_rows": 0, "n_cols": 0}
+    non_null = df.notna()
+    rows_with_data = non_null.any(axis=1)
+    cols_with_data = non_null.any(axis=0)
+    if not rows_with_data.any() or not cols_with_data.any():
+        return {"start_row": 0, "end_row": 0, "start_col": 0, "end_col": 0,
+                "n_rows": 0, "n_cols": 0}
+    start_row = int(rows_with_data.idxmax())
+    end_row = int(rows_with_data[::-1].idxmax())
+    col_indices = [i for i, has in enumerate(cols_with_data) if has]
+    start_col = col_indices[0]
+    end_col = col_indices[-1]
+    return {
+        "start_row": start_row, "end_row": end_row,
+        "start_col": start_col, "end_col": end_col,
+        "n_rows": end_row - start_row + 1,
+        "n_cols": end_col - start_col + 1,
+    }
+
+
+def read_excel_all_tables(path: Any, sheet: Any = 0) -> List[pd.DataFrame]:
+    """Find every separate tabular block in one Excel sheet.
+
+    Many workbooks stack multiple small tables on one sheet separated by
+    blank rows. This function returns each block as its own DataFrame
+    with its detected header row. Useful when `pd.read_excel` only gives
+    you the first table.
+    """
+    p = Path(path)
+    try:
+        import openpyxl as _oxl
+        wb = _oxl.load_workbook(p, read_only=True, data_only=True)
+    except Exception:
+        return [pd.read_excel(p, sheet_name=sheet)]
+    try:
+        if isinstance(sheet, int) and 0 <= sheet < len(wb.worksheets):
+            ws = wb.worksheets[sheet]
+        elif isinstance(sheet, str) and sheet in wb.sheetnames:
+            ws = wb[sheet]
+        else:
+            ws = wb.worksheets[0]
+
+        # Build a 2D occupancy grid: row_idx -> set of col indices
+        # where cells have values.
+        rows_with_data: list[set] = []
+        for row in ws.iter_rows(values_only=True):
+            cells = {i for i, v in enumerate(row)
+                     if v is not None and str(v).strip()}
+            rows_with_data.append(cells)
+
+        # Find contiguous runs of non-empty rows separated by 1+ blank rows.
+        runs: list[tuple[int, int]] = []   # (start_row, end_row) 0-based
+        i = 0
+        while i < len(rows_with_data):
+            if rows_with_data[i]:
+                start = i
+                while i < len(rows_with_data) and rows_with_data[i]:
+                    i += 1
+                runs.append((start, i - 1))
+            else:
+                i += 1
+    finally:
+        try: wb.close()
+        except Exception: pass
+
+    # For each run, read that slice with pandas and treat the first row
+    # as the header.
+    out: list[pd.DataFrame] = []
+    for (r_start, r_end) in runs:
+        if r_end - r_start < 1:
+            continue   # 1-row "table" is probably a title, not data
+        try:
+            df = pd.read_excel(
+                p, sheet_name=sheet, header=r_start,
+                nrows=r_end - r_start,
+            )
+            # Drop fully-empty columns
+            df = df.dropna(axis=1, how="all")
+            if not df.empty:
+                out.append(df)
+        except Exception:
+            continue
+    return out or [pd.read_excel(p, sheet_name=sheet)]
+
+
+def unpivot_year_columns(
+    df: pd.DataFrame,
+    id_cols: Optional[List[str]] = None,
+    *,
+    year_min: int = 1900,
+    year_max: int = 2100,
+    value_name: str = "value",
+) -> pd.DataFrame:
+    """Convert a wide-form DataFrame with year columns into long form.
+
+    Auto-detects which columns are years (4-digit integers in
+    [year_min, year_max]). Non-year columns are treated as id_vars
+    unless explicit `id_cols` is provided.
+
+    Example:
+      country | 2020 | 2021 | 2022
+      US      | 100  | 120  | 140
+
+    Becomes:
+      country | year | value
+      US      | 2020 | 100
+      US      | 2021 | 120
+      US      | 2022 | 140
+    """
+    if df is None or df.empty:
+        return df
+    year_cols: list[str] = []
+    for c in df.columns:
+        cs = str(c).strip()
+        if cs.isdigit() and year_min <= int(cs) <= year_max:
+            year_cols.append(c)
+    if not year_cols:
+        return df  # nothing to unpivot
+    if id_cols is None:
+        id_cols = [c for c in df.columns if c not in year_cols]
+    melted = df.melt(id_vars=id_cols, value_vars=year_cols,
+                     var_name="year", value_name=value_name)
+    melted["year"] = pd.to_numeric(melted["year"], errors="coerce").astype("Int64")
+    return melted
+
+
 def read_table(path: Any, *, sheet: Optional[str] = None) -> pd.DataFrame:
     """Read a tabular file into a DataFrame. Supported formats:
        .csv / .tsv / .csv.gz / .xlsx / .xls / .xlsm / .parquet
@@ -1831,6 +2131,12 @@ def execute_pandas_code(
         "excel_inventory":        excel_inventory,
         "detect_excel_header_rows":      detect_excel_header_rows,
         "read_excel_with_merged_headers": read_excel_with_merged_headers,
+        # Messy-data helpers
+        "read_csv_robust":        read_csv_robust,
+        "find_data_block":        find_data_block,
+        "read_excel_all_tables":  read_excel_all_tables,
+        "strip_summary_rows":     strip_summary_rows,
+        "unpivot_year_columns":   unpivot_year_columns,
         # Parquet / SQLite + pivot
         "list_parquet_files":     list_parquet_files,
         "list_sqlite_files":      list_sqlite_files,
@@ -1963,6 +2269,21 @@ Excel + cross-format support:
   excel_inventory(data_folder, recursive=True)
   detect_excel_header_rows(path, sheet=None)    # auto-detect merged headers
   read_excel_with_merged_headers(path, sheet=0, header_rows=None, flatten=True)
+
+Messy data — when CSV / Excel files don't follow the "row 1 is headers,
+rest is data" convention:
+  read_csv_robust(path)                # auto-detect encoding + separator,
+                                       # skip title/banner rows, strip
+                                       # trailing summary rows. Returns
+                                       # (df, diagnostics).
+  find_data_block(path_or_df)          # bounding box of the actual data
+                                       # region (start_row, end_row,
+                                       # start_col, end_col).
+  read_excel_all_tables(path, sheet)   # return EVERY table on the sheet
+                                       # when multiple are stacked.
+  strip_summary_rows(df, patterns=...) # drop trailing "Total" rows.
+  unpivot_year_columns(df, id_cols)    # wide-form (..., 2020, 2021, 2022)
+                                       # -> long form (country, year, value).
     USE THIS for workbooks where the top row(s) are merged group headers
     above the real column-name row (e.g. "Site A | Site B | Site C" merged
     over rows of "energy, voltage, current" sub-columns). Without it,
