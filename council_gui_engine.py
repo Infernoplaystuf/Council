@@ -365,6 +365,114 @@ def _render_sqlite_block(p):
     return '\n'.join(lines).rstrip()
 
 
+def _detect_excel_header_rows(p, sheet_name, max_check=3):
+    """Look at the first `max_check` rows of `sheet_name` via openpyxl
+    and detect whether the workbook uses MERGED CELLS in the top rows
+    (the common "group headers above sub-headers" pattern). Returns
+    the integer number of header rows to feed pandas' header= parameter.
+
+    Returns 1 (single-row header) when no merging is detected. Returns
+    2 when row 1 has any merged cells spanning multiple columns
+    (interpreted as a group-header row above the actual column names).
+    Returns 3 if rows 1 AND 2 both have merging.
+    """
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(p, read_only=False, data_only=True)
+    except Exception:
+        return 1
+    try:
+        ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.worksheets[0]
+        merged_rows = set()
+        for rng in ws.merged_cells.ranges:
+            if rng.max_col - rng.min_col >= 1:  # spans multiple columns
+                for r in range(rng.min_row, min(rng.max_row, max_check) + 1):
+                    merged_rows.add(r)
+        if not merged_rows:
+            return 1
+        # If row 1 is merged, we have at least 2 header rows (the merged
+        # group + the column-name row below). Extend if row 2 also has
+        # merges that span columns.
+        max_merged = max(merged_rows)
+        return max(2, min(max_merged + 1, max_check))
+    finally:
+        try: wb.close()
+        except Exception: pass
+
+
+def _flatten_multi_header(df, sep=" / "):
+    """Collapse a MultiIndex column header into single strings.
+
+    pandas read_excel(header=[0,1]) yields tuples like ("Site A", "energy");
+    we render them as "Site A / energy" for the prompt and as a single
+    column name for the analyst. Empty group labels (Unnamed: 0_level_0)
+    get cleaned up.
+    """
+    import pandas as _pd_fi
+    if not isinstance(df.columns, _pd_fi.MultiIndex):
+        return df
+    new_cols = []
+    for tup in df.columns:
+        parts = [str(x) for x in tup
+                 if x is not None and not str(x).startswith("Unnamed:")]
+        new_cols.append(sep.join(parts) if parts else "(unnamed)")
+    df = df.copy()
+    df.columns = new_cols
+    return df
+
+
+def _render_excel_block(p, char_limit):
+    """Render an .xlsx/.xls workbook with awareness of merged-cell
+    headers — the common 'top row groups, second row sub-columns'
+    layout. Without this, pandas mangles the columns to 'Unnamed: N'
+    and the model can't tell what each value represents.
+    """
+    import pandas as _pd_fi
+    xl = _pd_fi.ExcelFile(str(p))
+    lines = [
+        "(Excel workbook — already parsed into plain text below. "
+        "Read each sheet as if it were a CSV table. Merged-cell group "
+        "headers are joined with ' / ' so each column has a unique name.)",
+        "Total sheets: " + str(len(xl.sheet_names)),
+        "",
+    ]
+    sample_per_sheet = 10
+    for sname in xl.sheet_names[:8]:
+        header_rows = _detect_excel_header_rows(p, sname)
+        try:
+            if header_rows >= 2:
+                df = xl.parse(sname, header=list(range(header_rows)),
+                              nrows=sample_per_sheet * 2)
+                df = _flatten_multi_header(df)
+                merged_note = (f" (DETECTED {header_rows} header rows — "
+                               f"top rows have merged cells, joined with ' / ')")
+            else:
+                df = xl.parse(sname, nrows=sample_per_sheet * 2)
+                merged_note = ""
+        except Exception as _ex:
+            lines.append(f'Sheet "{sname}": read error: {_ex}')
+            lines.append("")
+            continue
+        headers = [str(c) for c in df.columns]
+        lines.append(f'Sheet "{sname}"{merged_note} '
+                     f'({len(df)} rows shown, {len(headers)} columns):')
+        lines.append('  columns: ' + ', '.join(headers))
+        lines.append('  rows:')
+        for _, row in df.head(sample_per_sheet).iterrows():
+            cells = []
+            for v in row.tolist():
+                cv = str(v).replace('\n', ' ').strip()
+                if len(cv) > 80:
+                    cv = cv[:77] + '...'
+                cells.append(cv)
+            lines.append('    ' + ' | '.join(cells))
+        lines.append("")
+    content = '\n'.join(lines).rstrip()
+    if len(content) > char_limit:
+        content = content[:char_limit] + '\n... (truncated)'
+    return content
+
+
 def _render_duckdb_block(p):
     """DuckDB database — read-only listing of tables + columns + samples."""
     lines = [
@@ -532,44 +640,7 @@ def _read_file_for_injection(path_str):
         elif suffix == '.bson':
             content = _render_bson_block(p)
         elif suffix in ('.xlsx', '.xls', '.xlsm'):
-            # Excel workbook — already parsed into plain text below. The
-            # model should treat each sheet exactly like a CSV table; the
-            # explicit "parsed" framing is here because some smaller GGUFs
-            # otherwise pattern-match the .xlsx extension to "binary
-            # format I can't read" and refuse to engage.
-            import pandas as _pd_fi
-            xl = _pd_fi.ExcelFile(str(p))
-            lines = [
-                "(Excel workbook — already parsed into plain text below. "
-                "Read each sheet as if it were a CSV table.)",
-                "Total sheets: " + str(len(xl.sheet_names)),
-                "",
-            ]
-            sample_per_sheet = 10
-            for sname in xl.sheet_names[:8]:
-                try:
-                    df = xl.parse(sname, nrows=sample_per_sheet * 2)
-                except Exception as _ex:
-                    lines.append(f'Sheet "{sname}": read error: {_ex}')
-                    lines.append("")
-                    continue
-                headers = [str(c) for c in df.columns]
-                lines.append(f'Sheet "{sname}" ({len(df)} rows shown, '
-                             f'{len(headers)} columns):')
-                lines.append('  columns: ' + ', '.join(headers))
-                lines.append('  rows:')
-                for _, row in df.head(sample_per_sheet).iterrows():
-                    cells = []
-                    for v in row.tolist():
-                        cv = str(v).replace('\n', ' ').strip()
-                        if len(cv) > 80:
-                            cv = cv[:77] + '...'
-                        cells.append(cv)
-                    lines.append('    ' + ' | '.join(cells))
-                lines.append("")
-            content = '\n'.join(lines).rstrip()
-            if len(content) > _FILE_READ_CHAR_LIMIT:
-                content = content[:_FILE_READ_CHAR_LIMIT] + '\n... (truncated)'
+            content = _render_excel_block(p, _FILE_READ_CHAR_LIMIT)
         else:
             with open(p, encoding='utf-8', errors='replace') as fh:
                 content = fh.read(_FILE_READ_CHAR_LIMIT)
@@ -6844,6 +6915,35 @@ class CouncilConsole(tk.Tk):
         ttk.Button(fi2, text="📁 Copy Folder to Vault",
                    command=self._vmgr_import_folder).pack(side="left")
 
+        # ── Index & Vectorize section ─────────────────────────
+        idx_lf = ttk.LabelFrame(left, text="🔎 Index & Vectorize")
+        idx_lf.pack(fill="x", padx=4, pady=(0, 6))
+
+        ttk.Label(
+            idx_lf,
+            text=("Builds three retrieval layers. Run them in order:\n"
+                  "  1. Keyword — fast file walk; required for search.\n"
+                  "  2. Descriptions — LLM summaries; better semantics.\n"
+                  "  3. Vectors — embedding model; best for fuzzy queries.\n"),
+            justify="left", foreground="#9a9a9a"
+        ).pack(anchor="w", padx=6, pady=(4, 0))
+
+        self._idx_status_var = tk.StringVar(value="")
+        ttk.Label(idx_lf, textvariable=self._idx_status_var,
+                  foreground="#cba6f7").pack(anchor="w", padx=6)
+
+        idx_btns = ttk.Frame(idx_lf)
+        idx_btns.pack(fill="x", padx=6, pady=(2, 6))
+        ttk.Button(idx_btns, text="1. Build Keyword Index",
+                   command=self._vmgr_build_keyword_index
+                   ).pack(side="left", padx=2)
+        ttk.Button(idx_btns, text="2. Build Descriptions",
+                   command=self._vmgr_build_descriptions
+                   ).pack(side="left", padx=2)
+        ttk.Button(idx_btns, text="3. Build Vector Embeddings",
+                   command=self._vmgr_build_embeddings
+                   ).pack(side="left", padx=2)
+
         # ── Scraper section ───────────────────────────────────
         scrape_lf = ttk.LabelFrame(left, text="🌐 Web Scraper")
         scrape_lf.pack(fill="x", padx=4, pady=(0, 6))
@@ -7386,6 +7486,105 @@ class CouncilConsole(tk.Tk):
     def _vmgr_open_folder(self):
         import subprocess as sp
         sp.Popen(["explorer", str(VAULT_DIR)])
+
+    # ---- Index & Vectorize button handlers ----
+
+    def _vmgr_build_keyword_index(self):
+        """Walk the vault and (re)build the keyword index. Fast — no LLM."""
+        idx = _get_vault_index()
+        if idx is None:
+            self._idx_status_var.set("Vault index unavailable.")
+            return
+        self._idx_status_var.set("Walking vault…")
+
+        def _worker():
+            try:
+                n = idx.rebuild()
+            except Exception as exc:
+                self.after(0, lambda: self._idx_status_var.set(
+                    f"Keyword index failed: {exc!r}"))
+                return
+            self.after(0, lambda: self._idx_status_var.set(
+                f"Keyword index built — {n} files (re)indexed, "
+                f"{len(idx.records)} total."))
+
+        import threading as _th
+        _th.Thread(target=_worker, daemon=True).start()
+
+    def _vmgr_build_descriptions(self):
+        """Generate per-file LLM descriptions for every record without one.
+        Requires the keyword index to exist; takes ~3-10s per file on a 7B GGUF."""
+        idx = _get_vault_index()
+        if idx is None:
+            self._idx_status_var.set("Vault index unavailable.")
+            return
+        try:
+            idx.rebuild()
+        except Exception:
+            pass
+        pending = sum(1 for r in idx.records.values()
+                      if not r.get("description"))
+        if pending == 0:
+            self._idx_status_var.set(
+                f"All {len(idx.records)} files already have descriptions.")
+            return
+        self._idx_status_var.set(
+            f"Generating descriptions for {pending} files… (each ~3-10s)")
+
+        def _worker():
+            def _progress(i, total, name):
+                if i % 3 == 0 or i == total:
+                    self.after(0, lambda: self._idx_status_var.set(
+                        f"Descriptions: {i}/{total}…"))
+            try:
+                n = idx.generate_descriptions(on_progress=_progress)
+            except Exception as exc:
+                self.after(0, lambda: self._idx_status_var.set(
+                    f"Description build failed: {exc!r}"))
+                return
+            self.after(0, lambda: self._idx_status_var.set(
+                f"Descriptions complete — {n} files summarized."))
+
+        import threading as _th
+        _th.Thread(target=_worker, daemon=True).start()
+
+    def _vmgr_build_embeddings(self):
+        """Build vector embeddings for every record (one-time, then mtime-incremental).
+        Downloads sentence-transformers model on first run (~80 MB)."""
+        idx = _get_vault_index()
+        if idx is None:
+            self._idx_status_var.set("Vault index unavailable.")
+            return
+        try:
+            idx.rebuild()
+        except Exception:
+            pass
+        emb = idx.embeddings()
+        if emb is None:
+            self._idx_status_var.set(
+                "sentence-transformers not available — pip install it first.")
+            return
+        self._idx_status_var.set(
+            f"Embedding {len(idx.records)} files (model: {emb.model_name})…")
+
+        def _worker():
+            def _progress(i, total, name):
+                if i % 10 == 0 or i == total:
+                    self.after(0, lambda: self._idx_status_var.set(
+                        f"Embeddings: {i}/{total}…"))
+            try:
+                n = idx.build_embeddings(on_progress=_progress)
+            except Exception as exc:
+                self.after(0, lambda: self._idx_status_var.set(
+                    f"Embedding build failed: {exc!r}"))
+                return
+            stats = emb.stats()
+            self.after(0, lambda: self._idx_status_var.set(
+                f"Vectors ready — {stats['vectors']} files "
+                f"({stats['dim']}-dim, {stats['size_kb']} KB on disk)."))
+
+        import threading as _th
+        _th.Thread(target=_worker, daemon=True).start()
 
     def _vmgr_clone(self):
         """Clone a GitHub repo into the vault in a background thread."""

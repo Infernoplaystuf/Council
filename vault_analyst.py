@@ -443,6 +443,75 @@ def read_excel_sheets(path: Any) -> Dict[str, pd.DataFrame]:
     return pd.read_excel(p, sheet_name=None)
 
 
+def detect_excel_header_rows(path: Any, sheet: Optional[str] = None) -> int:
+    """Auto-detect how many header rows an Excel sheet has by inspecting
+    merged-cell ranges via openpyxl. Returns 1 for plain CSV-style
+    headers, 2 when row 1 has merged groups + row 2 has sub-columns,
+    3 for two levels of grouping. Used by read_excel_with_merged_headers."""
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(Path(path), read_only=False, data_only=True)
+    except Exception:
+        return 1
+    try:
+        ws = wb[sheet] if sheet and sheet in wb.sheetnames else wb.worksheets[0]
+        merged_rows: set = set()
+        for rng in ws.merged_cells.ranges:
+            if rng.max_col - rng.min_col >= 1:
+                for r in range(rng.min_row, min(rng.max_row, 3) + 1):
+                    merged_rows.add(r)
+        if not merged_rows:
+            return 1
+        return max(2, min(max(merged_rows) + 1, 3))
+    finally:
+        try: wb.close()
+        except Exception: pass
+
+
+def read_excel_with_merged_headers(
+    path: Any,
+    sheet: Any = 0,
+    *,
+    header_rows: Optional[int] = None,
+    flatten: bool = True,
+    sep: str = " / ",
+) -> pd.DataFrame:
+    """Read an Excel sheet where the top row(s) are merged GROUP headers
+    above the real column-name row.
+
+    Without this helper, `pd.read_excel(path)` collapses such files
+    into useless 'Unnamed: 0', 'Unnamed: 1' columns. With it, each
+    output column is named like 'Site A / energy' so the model can
+    find "the highest value in each energy column" by filtering on
+    the suffix.
+
+    Args:
+      path:         workbook path
+      sheet:        sheet name or 0-based index (default: first sheet)
+      header_rows:  number of header rows to consume; auto-detected
+                    via openpyxl merged-cell ranges when None
+      flatten:      if True (default), MultiIndex columns are joined
+                    with `sep` into single strings
+      sep:          separator for flattened multi-headers
+    """
+    p = Path(path)
+    sname = sheet if isinstance(sheet, str) else None
+    if header_rows is None:
+        header_rows = detect_excel_header_rows(p, sname)
+    if header_rows <= 1:
+        return pd.read_excel(p, sheet_name=sheet)
+    df = pd.read_excel(p, sheet_name=sheet, header=list(range(header_rows)))
+    if not flatten or not isinstance(df.columns, pd.MultiIndex):
+        return df
+    new_cols = []
+    for tup in df.columns:
+        parts = [str(x) for x in tup
+                 if x is not None and not str(x).startswith("Unnamed:")]
+        new_cols.append(sep.join(parts) if parts else "(unnamed)")
+    df.columns = new_cols
+    return df
+
+
 def excel_inventory(
     data_folder: Any,
     recursive: bool = True,
@@ -1709,6 +1778,8 @@ def execute_pandas_code(
         "read_table":             read_table,
         "read_excel_sheets":      read_excel_sheets,
         "excel_inventory":        excel_inventory,
+        "detect_excel_header_rows":      detect_excel_header_rows,
+        "read_excel_with_merged_headers": read_excel_with_merged_headers,
         # Parquet / SQLite + pivot
         "list_parquet_files":     list_parquet_files,
         "list_sqlite_files":      list_sqlite_files,
@@ -1839,6 +1910,15 @@ Excel + cross-format support:
                                                 # XLSX, Parquet -> df
   read_excel_sheets(path)                       # all sheets -> {name: df}
   excel_inventory(data_folder, recursive=True)
+  detect_excel_header_rows(path, sheet=None)    # auto-detect merged headers
+  read_excel_with_merged_headers(path, sheet=0, header_rows=None, flatten=True)
+    USE THIS for workbooks where the top row(s) are merged group headers
+    above the real column-name row (e.g. "Site A | Site B | Site C" merged
+    over rows of "energy, voltage, current" sub-columns). Without it,
+    pd.read_excel produces "Unnamed: 0", "Unnamed: 1" columns and the
+    data is unusable. With it, you get columns named "Site A / energy",
+    "Site B / energy", etc. — filter by the suffix to operate on each
+    sub-column across groups.
 
 Parquet + SQLite:
   list_parquet_files(data_folder, recursive=True)
@@ -1915,6 +1995,17 @@ result_df = pd.concat([ps, xb], ignore_index=True)
 Q: Show all rows where the developer is Rockstar Games.
 result_df = filter_rows_across_csvs(DATA_FOLDERS, column_name="developers",
                                     contains="Rockstar Games", max_rows_per_csv=50)
+
+Q: What is the highest value in each "energy" column of merged_sites.xlsx?
+# Merged-header workbook — top row has groups "Site A", "Site B", ...,
+# row 2 has "energy, voltage, current" under each. Use the merged-aware
+# reader so columns become "Site A / energy", "Site B / energy", etc.
+df = read_excel_with_merged_headers("merged_sites.xlsx", sheet=0)
+energy_cols = [c for c in df.columns if c.lower().endswith("/ energy")]
+result_df = pd.DataFrame({
+    "column": energy_cols,
+    "max":    [pd.to_numeric(df[c], errors="coerce").max() for c in energy_cols],
+})
 
 Q: What is the correlation between metacritic and user_rating?
 result_df = correlation_per_csv(DATA_FOLDERS, x_col="metacritic", y_col="user_rating")
