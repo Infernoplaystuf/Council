@@ -20,6 +20,93 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 # Vault stats
 # ============================================================
 
+def list_subfolders(
+    root: Path,
+    *,
+    max_depth: int = 1,
+    include_counts: bool = True,
+) -> List[Dict[str, Any]]:
+    """List the subfolders of `root` with optional per-folder file counts.
+
+    `max_depth=1` lists only immediate children. Bigger numbers descend
+    recursively up to that depth. Hidden folders (`.git`, `__pycache__`,
+    `.venv`, etc.) are skipped — they're rarely what the user means.
+    """
+    root = Path(root)
+    if not root.exists():
+        return []
+    SKIP = {"__pycache__", ".git", ".venv", "venv", ".idea", ".vscode",
+            "node_modules", ".DS_Store"}
+    out: List[Dict[str, Any]] = []
+
+    def _walk(p: Path, depth: int):
+        if depth > max_depth:
+            return
+        for child in sorted(p.iterdir()):
+            if not child.is_dir():
+                continue
+            if child.name in SKIP or child.name.startswith("."):
+                continue
+            entry: Dict[str, Any] = {
+                "name": child.name,
+                "path": str(child),
+                "depth": depth,
+                "relative_path": str(child.relative_to(root)),
+            }
+            if include_counts:
+                try:
+                    entry["files"] = sum(
+                        1 for c in child.rglob("*") if c.is_file()
+                    )
+                    entry["subfolders"] = sum(
+                        1 for c in child.iterdir() if c.is_dir()
+                    )
+                except Exception:
+                    entry["files"] = None
+                    entry["subfolders"] = None
+            out.append(entry)
+            _walk(child, depth + 1)
+
+    _walk(root, 1)
+    return out
+
+
+def format_subfolder_listing(
+    root: Path,
+    folders: List[Dict[str, Any]],
+    *,
+    show_root_files: bool = True,
+) -> str:
+    """Pretty-print a folder listing in tree form."""
+    root = Path(root)
+    lines = [f"Folder: {root}"]
+    if not folders:
+        lines.append("  (no subfolders)")
+    else:
+        for f in folders:
+            indent = "  " * f.get("depth", 1)
+            counts = ""
+            if f.get("files") is not None:
+                counts = f" — {f['files']} files"
+                if f.get("subfolders"):
+                    counts += f", {f['subfolders']} subfolders"
+            lines.append(f"{indent}{f['name']}/{counts}")
+    if show_root_files and root.exists():
+        try:
+            top_files = sorted(p.name for p in root.iterdir()
+                               if p.is_file() and not p.name.startswith("."))
+            if top_files:
+                lines.append("")
+                lines.append(f"Top-level files in {root.name}/:")
+                for n in top_files[:20]:
+                    lines.append(f"  {n}")
+                if len(top_files) > 20:
+                    lines.append(f"  ... ({len(top_files) - 20} more)")
+        except Exception:
+            pass
+    return "\n".join(lines)
+
+
 def vault_stats(vault_dir: Path) -> Dict[str, Any]:
     """Return a snapshot of the vault: per-extension counts and sizes,
     last-modified timestamp, total file count, total size.

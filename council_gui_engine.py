@@ -3690,6 +3690,31 @@ class CouncilConsole(tk.Tk):
         r"(?:index|cache|embeddings?)?\s*[.!?]?\s*$",
         _re.IGNORECASE,
     )
+    _LIST_FOLDERS_RE = _re.compile(
+        # Matches phrasings like:
+        #   list (the) subfolders [in <where>]
+        #   list the subfolders in the data_in folder within the vault
+        #   show (me) folders (in|of|under|inside|within) <where>
+        #   what folders are in <where>?
+        #   what (are) (the) subfolders
+        # Captures <where> as group 1 (may be None when no location given).
+        r"^\s*(?:list|show|what)\s+"
+        r"(?:me\s+|are\s+)?(?:the\s+)?"
+        r"(?:sub)?(?:folders?|directories|dirs)"
+        r"(?:\s+(?:are\s+)?(?:in|of|under|inside|within)\s+"
+        r"(?:the\s+)?(.+?))?\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+    # Trailing-noise words to strip from the captured target — users say
+    # things like "data_in folder within the vault" and we only want
+    # "data_in".
+    _FOLDER_NOISE_RE = _re.compile(
+        r"\s+(?:folder|directory|subfolder|subdirectory|"
+        r"within\s+(?:the\s+)?vault|inside\s+(?:the\s+)?vault|"
+        r"of\s+(?:the\s+)?vault|in\s+(?:the\s+)?vault|"
+        r"the\s+vault|vault)\b.*$",
+        _re.IGNORECASE,
+    )
     _EXPORT_TRANSCRIPT_RE = _re.compile(
         r"^\s*(?:export|save)\s+(?:the\s+)?(?:current\s+)?transcript"
         r"(?:\s+as\s+(?:markdown|md))?\s*[.!?]?\s*$",
@@ -3773,6 +3798,14 @@ class CouncilConsole(tk.Tk):
 
         if self._BUILD_EMBEDDINGS_RE.match(single_line):
             self._build_embeddings_response()
+            return True
+
+        m = self._LIST_FOLDERS_RE.match(single_line)
+        if m:
+            target = (m.group(1) or "").strip().strip("'\"`")
+            # Strip trailing filler ("X folder within the vault" -> "X")
+            target = self._FOLDER_NOISE_RE.sub("", target).strip()
+            self._list_folders_response(target)
             return True
 
         if self._EXPORT_TRANSCRIPT_RE.match(single_line):
@@ -4096,6 +4129,40 @@ class CouncilConsole(tk.Tk):
         self._append_transcript(
             "Writer", f"Schema doc for {p.name} -> {rel}", "final",
         )
+        self._set_status("● idle")
+
+    def _list_folders_response(self, target: str):
+        """Resolve `target` (a path, a vault-relative folder name, or
+        empty for `data_in/`) and list its immediate subfolders."""
+        import vault_tools as _vt
+        if not target:
+            # Default: data_in/ — the canonical user-data scope
+            try:
+                import data_index
+                root = data_index.input_dir(VAULT_DIR)
+            except Exception:
+                root = VAULT_DIR / "data_in"
+        else:
+            p = Path(target).expanduser()
+            if p.is_absolute() and p.exists():
+                root = p
+            else:
+                # Try interpreting as a vault-relative path
+                candidate = VAULT_DIR / target
+                root = candidate if candidate.exists() else p
+
+        if not root.exists() or not root.is_dir():
+            self._append_transcript(
+                "Writer",
+                f"Folder not found: {root}",
+                "final",
+            )
+            self._set_status("● idle")
+            return
+
+        folders = _vt.list_subfolders(root, max_depth=2)
+        text = _vt.format_subfolder_listing(root, folders)
+        self._append_transcript("Writer", text, "final")
         self._set_status("● idle")
 
     def _build_embeddings_response(self):
