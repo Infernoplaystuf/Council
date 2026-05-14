@@ -4206,6 +4206,40 @@ class CouncilConsole(tk.Tk):
         r"(?:\s+(?:in|under|inside|within)\s+(?:the\s+)?(.+?))?\s*\??\s*$",
         _re.IGNORECASE,
     )
+    # Permissive "listing intent" detector — catches any phrasing that
+    # asks for a list of files/contents/items in a folder, even if it
+    # doesn't strictly match _LIST_FILES_RE. Used as a SAFETY NET so the
+    # model never gets a chance to paraphrase a folder listing — the
+    # deterministic `_list_files_response` always wins when this fires.
+    # The pattern is intentionally loose; we cross-check with an actual
+    # folder path before bypassing the model, so false-positives are
+    # harmless.
+    _LISTING_INTENT_RE = _re.compile(
+        r"(?:"
+            # Strict listing verbs only — these unambiguously ask for a
+            # bulleted file list, not a summary or analysis.
+            r"\b(?:list|enumerate|dump)\b"
+            # "show / display / print (files|everything|contents)" —
+            # only listing when the object is itself listing-shaped.
+            r"|\b(?:show|display|print)\s+"
+            r"(?:me\s+|all\s+(?:of\s+)?(?:the\s+)?|the\s+|every\s+|each\s+)?"
+            r"(?:files?|folders?|directories|subfolders?|"
+            r"contents|everything|every\s+file)\b"
+            # "give me a (list|listing|rundown|inventory) of..."
+            r"|\bgive\s+me\s+(?:a|the)\s+"
+            r"(?:list|listing|rundown|inventory)\b"
+            # "what's in / what is in / whats in" (anchored)
+            r"|\b(?:what(?:'s|\s+is)|whats)\s+(?:in|inside|within|under)\b"
+            # "what files / what folders / what subfolders"
+            r"|\bwhat\s+(?:files?|folders?|directories|subfolders?)\b"
+            # polite wrappers — only for strict listing verbs
+            r"|\b(?:can|could|would|will)\s+you\s+"
+            r"(?:please\s+)?(?:list|enumerate|dump)\b"
+            r"|\bplease\s+(?:list|enumerate|dump)\b"
+        r")",
+        _re.IGNORECASE,
+    )
+
     # Trailing-noise words to strip from the captured target — users say
     # things like "data_in folder within the vault" and we only want
     # "data_in".
@@ -10363,6 +10397,29 @@ class CouncilConsole(tk.Tk):
         if self._handle_vault_tools_intent(user_text):
             self._set_status("● idle")
             return
+
+        # ── File-listing SAFETY NET ──────────────────────────────────────
+        # When the user asks for a list of files in a folder — in ANY
+        # phrasing — and the folder is a real path on disk, bypass the
+        # model entirely and use the deterministic `_list_files_response`.
+        # Background: `_LIST_FILES_RE` only catches strict phrasings like
+        # "list files in X". Looser phrasings ("what's in X", "give me a
+        # list of files in X", "can you show me everything in X") fell
+        # through to the model, which would inject a [FOLDER:] block and
+        # then paraphrase it — adding, dropping, or inventing files. The
+        # deterministic handler cannot hallucinate.
+        if self._LISTING_INTENT_RE.search(user_text):
+            for _p_str in _extract_file_paths(user_text):
+                try:
+                    _pp = Path(_p_str.strip())
+                except Exception:
+                    continue
+                if _pp.is_dir():
+                    # Found a real directory mentioned in a listing-shaped
+                    # question. Route to the deterministic handler.
+                    self._list_files_response(str(_pp))
+                    self._set_status("● idle")
+                    return
 
         # ── 'forget X' command: reject prior fuzzy matches ─────────────
         # User can type "forget rockstar" or "forget rockstar, witcher" to
