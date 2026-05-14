@@ -281,23 +281,29 @@ class EmbeddingIndex:
             qvec = qvec.tolist()
         qarr = _np.asarray(qvec, dtype=_np.float32)
 
-        cand_paths = list(candidates) if candidates is not None \
-                     else list(self._vectors.keys())
-        if not cand_paths:
+        raw_paths = list(candidates) if candidates is not None \
+                    else list(self._vectors.keys())
+        if not raw_paths:
             return []
-        # Stack into a matrix for vectorised dot product
-        mat = _np.asarray([self._vectors[p] for p in cand_paths if p in self._vectors],
-                          dtype=_np.float32)
-        if mat.size == 0:
+        # Build aligned (path, vector) pairs so the matrix row order matches
+        # the path list. Skipping a path with `if p in self._vectors` in the
+        # matrix-only comprehension would leave cand_paths longer than the
+        # matrix and misalign every score.
+        aligned: List[Tuple[str, List[float]]] = [
+            (p, self._vectors[p]) for p in raw_paths if p in self._vectors
+        ]
+        if not aligned:
             return []
+        mat_paths = [p for p, _ in aligned]
+        mat = _np.asarray([v for _, v in aligned], dtype=_np.float32)
         sims = mat @ qarr  # both already L2-normalised
         order = _np.argsort(-sims)[: max(k, 1)]
         out: List[Tuple[float, str]] = []
         for idx in order:
-            score = float(sims[idx])
+            score = float(sims[int(idx)])
             if score < min_score:
                 continue
-            out.append((score, cand_paths[idx]))
+            out.append((score, mat_paths[int(idx)]))
         return out
 
     # ---- inspection ----

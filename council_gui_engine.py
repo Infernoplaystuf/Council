@@ -382,7 +382,12 @@ def _detect_excel_header_rows(p, sheet_name, max_check=3):
     except Exception:
         return 1
     try:
-        ws = wb[sheet_name] if sheet_name in wb.sheetnames else wb.worksheets[0]
+        if isinstance(sheet_name, int) and 0 <= sheet_name < len(wb.worksheets):
+            ws = wb.worksheets[sheet_name]
+        elif isinstance(sheet_name, str) and sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+        else:
+            ws = wb.worksheets[0]
         merged_rows = set()
         for rng in ws.merged_cells.ranges:
             if rng.max_col - rng.min_col >= 1:  # spans multiple columns

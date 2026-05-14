@@ -277,9 +277,33 @@ def list_bson_files(data_folder: Any, recursive: bool = True) -> List[Path]:
 # DuckDB helpers
 # ============================================================
 
+def _import_duckdb():
+    try:
+        import duckdb
+        return duckdb
+    except ImportError as exc:
+        raise RuntimeError(
+            "DuckDB support needs the `duckdb` package. Install with: "
+            f"`pip install duckdb` (original: {exc})"
+        ) from exc
+
+
+def _import_sqlalchemy():
+    try:
+        import sqlalchemy
+        return sqlalchemy
+    except ImportError as exc:
+        raise RuntimeError(
+            "Remote SQL connections need SQLAlchemy. Install with: "
+            f"`pip install sqlalchemy` (original: {exc}). For specific "
+            "databases also install the matching driver: psycopg2-binary "
+            "(Postgres), PyMySQL (MySQL), or pyodbc (MSSQL)."
+        ) from exc
+
+
 def list_duckdb_tables(path: Any) -> List[str]:
     """Return all table names in a DuckDB database (read-only)."""
-    import duckdb
+    duckdb = _import_duckdb()
     con = duckdb.connect(str(Path(path)), read_only=True)
     try:
         return [r[0] for r in con.execute(
@@ -291,7 +315,7 @@ def list_duckdb_tables(path: Any) -> List[str]:
 
 def read_duckdb_table(path: Any, table: str, *, limit: Optional[int] = None) -> pd.DataFrame:
     """Read a DuckDB table as a DataFrame (read-only)."""
-    import duckdb
+    duckdb = _import_duckdb()
     qname = '"' + str(table).replace('"', '""') + '"'
     sql = f"SELECT * FROM {qname}"
     if limit:
@@ -310,7 +334,7 @@ def duckdb_query(path: Any, sql: str) -> pd.DataFrame:
     files with `read_csv('path')` / `read_parquet('path')` inside the
     SQL, so this single helper unlocks SQL queries over your vault.
     """
-    import duckdb
+    duckdb = _import_duckdb()
     con = duckdb.connect(str(Path(path)), read_only=True)
     try:
         return con.execute(sql).fetch_df()
@@ -323,9 +347,25 @@ def duckdb_query(path: Any, sql: str) -> pd.DataFrame:
 # ============================================================
 
 def read_bson_documents(path: Any) -> List[Dict[str, Any]]:
-    """Decode a .bson file into a list of documents (dicts)."""
-    import bson
-    with open(Path(path), "rb") as fh:
+    """Decode a .bson file into a list of documents (dicts).
+
+    Raises RuntimeError with an install hint when pymongo (the source
+    of the `bson` module) isn't available, so users don't get a
+    misleading 'No module named bson' that they might misread as a
+    file-corruption error.
+    """
+    try:
+        import bson
+    except ImportError as exc:
+        raise RuntimeError(
+            "Reading .bson files needs pymongo (provides the `bson` "
+            "module). Install with: `pip install pymongo` "
+            f"(original: {exc})"
+        ) from exc
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"BSON file not found: {p}")
+    with open(p, "rb") as fh:
         data = fh.read()
     return list(bson.decode_all(data))
 
@@ -392,7 +432,7 @@ def _resolve_sql_url(url: str) -> str:
 
 def list_sql_tables(vault_dir: Any, conn_name: str) -> List[str]:
     """Inspect a named connection and return its table names."""
-    import sqlalchemy
+    sqlalchemy = _import_sqlalchemy()
     urls = list_sql_connections(vault_dir)
     if conn_name not in urls:
         raise KeyError(f"unknown SQL connection: {conn_name}")
@@ -409,7 +449,7 @@ def read_sql_table(
     vault_dir: Any, conn_name: str, table: str, *, limit: Optional[int] = None,
 ) -> pd.DataFrame:
     """Pull a remote SQL table into a DataFrame using a saved connection."""
-    import sqlalchemy
+    sqlalchemy = _import_sqlalchemy()
     urls = list_sql_connections(vault_dir)
     if conn_name not in urls:
         raise KeyError(f"unknown SQL connection: {conn_name}")
@@ -426,7 +466,7 @@ def read_sql_table(
 
 def sql_query(vault_dir: Any, conn_name: str, sql: str) -> pd.DataFrame:
     """Run an arbitrary SQL query through a saved connection."""
-    import sqlalchemy
+    sqlalchemy = _import_sqlalchemy()
     urls = list_sql_connections(vault_dir)
     if conn_name not in urls:
         raise KeyError(f"unknown SQL connection: {conn_name}")
@@ -443,18 +483,28 @@ def read_excel_sheets(path: Any) -> Dict[str, pd.DataFrame]:
     return pd.read_excel(p, sheet_name=None)
 
 
-def detect_excel_header_rows(path: Any, sheet: Optional[str] = None) -> int:
+def detect_excel_header_rows(path: Any, sheet: Any = None) -> int:
     """Auto-detect how many header rows an Excel sheet has by inspecting
     merged-cell ranges via openpyxl. Returns 1 for plain CSV-style
     headers, 2 when row 1 has merged groups + row 2 has sub-columns,
-    3 for two levels of grouping. Used by read_excel_with_merged_headers."""
+    3 for two levels of grouping.
+
+    `sheet` accepts a sheet NAME (str) or 0-based INDEX (int). When None
+    or out of range, falls back to the first sheet.
+    """
     try:
         import openpyxl
         wb = openpyxl.load_workbook(Path(path), read_only=False, data_only=True)
     except Exception:
         return 1
     try:
-        ws = wb[sheet] if sheet and sheet in wb.sheetnames else wb.worksheets[0]
+        ws = None
+        if isinstance(sheet, int) and 0 <= sheet < len(wb.worksheets):
+            ws = wb.worksheets[sheet]
+        elif isinstance(sheet, str) and sheet in wb.sheetnames:
+            ws = wb[sheet]
+        else:
+            ws = wb.worksheets[0]
         merged_rows: set = set()
         for rng in ws.merged_cells.ranges:
             if rng.max_col - rng.min_col >= 1:
@@ -495,9 +545,10 @@ def read_excel_with_merged_headers(
       sep:          separator for flattened multi-headers
     """
     p = Path(path)
-    sname = sheet if isinstance(sheet, str) else None
     if header_rows is None:
-        header_rows = detect_excel_header_rows(p, sname)
+        # Pass the sheet identifier through verbatim — detect_excel_header_rows
+        # accepts both string names and integer indexes.
+        header_rows = detect_excel_header_rows(p, sheet)
     if header_rows <= 1:
         return pd.read_excel(p, sheet_name=sheet)
     df = pd.read_excel(p, sheet_name=sheet, header=list(range(header_rows)))
