@@ -246,8 +246,8 @@ def find_files_with_column(
                 except Exception:
                     continue
                 matches = [c for c in cols
-                           if (needle in c.lower()) if fuzzy
-                           else c.lower() == needle]
+                           if (needle in c.lower() if fuzzy
+                               else c.lower() == needle)]
                 if matches:
                     out.append({
                         "path": str(p.relative_to(folder)),
