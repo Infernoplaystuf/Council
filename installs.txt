@@ -5,29 +5,30 @@
 #    cu124 wheel = RTX 5080 / 5090 / 4090 / Ada+ (Blackwell sm_120 OK)
 #    cu121 wheel = RTX 4070 / 3090 / older Ampere
 #    cpu wheel   = no NVIDIA GPU (slow but works)
-#  Replace the torch line below with whichever index URL matches.
+#  Replace the torch line in step 4 with whichever index URL matches.
 # ============================================================
 
-# 1. Create env (Python 3.11, conda-forge baseline + Spyder kernel)
-conda create -n council python=3.11 spyder-kernels=2.5 -c conda-forge -y && conda activate council
+# 1. Conda channel order (Dream3D-NX requires this exact config)
+conda config --add channels conda-forge && conda config --set channel_priority strict
 
-# 2. PyTorch — pick ONE based on your GPU
+# 2. Create env (Python 3.12 — required by dream3dnx)
+conda create -n council python=3.12 -y && conda activate council
+
+# 3. Dream3D-NX (provides simplnx + dream3dnx + standard plugins)
+conda install -c bluequartzsoftware dream3dnx -y
+
+# 4. PyTorch — pick ONE based on your GPU
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 # pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 # pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 
-# 3. All required + optional packages in one pip call
+# 5. All required + optional packages in one pip call
 pip install beautifulsoup4 chromadb crawl4ai duckdb faster-whisper h5py html2text huggingface_hub kaleido langchain-core langgraph llama-cpp-python matplotlib mido music21 numpy openpyxl pandas paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb
 
-# 4. Dream3D-NX (simplnx) — official BlueQuartz channel; pip fallback below
-conda install -c bluequartz simplnx -y || pip install simplnx
-# Optional simplnx plugins (orientation analysis, ITK image processing):
-# conda install -c bluequartz orientationanalysis itkimageprocessing -y
+# 6. Optional: Spyder IDE support + Crawl4AI Chromium cache (~150 MB)
+pip install spyder-kernels && crawl4ai-setup
 
-# 5. Crawl4AI browser cache (downloads Chromium ~150 MB; skip if air-gapped)
-crawl4ai-setup
-
-# 6. Verify
+# 7. Verify
 python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print('all imports OK')"
 
 
