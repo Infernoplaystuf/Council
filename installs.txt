@@ -29,11 +29,17 @@ python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pa
 
 # ============================================================
 #  SECTION B — NVIDIA Ampere / Turing / Older  (PyTorch cu121)
-#  Cards in this group:
-#    RTX 30-series:   3050, 3060, 3060 Ti, 3070, 3070 Ti, 3080, 3080 Ti, 3090, 3090 Ti
-#    RTX 20-series:   2060, 2070, 2080 (and Super/Ti variants)
-#    GTX 16-series:   1660, 1660 Ti, 1660 Super
-#    Workstation:     A4000, A5000, A6000, A40, A100
+#  Cards in this group (desktop AND laptop variants share the same
+#  architecture/sm_XX so the same wheel covers both):
+#    RTX 30-series desktop:   3050, 3060, 3060 Ti, 3070, 3070 Ti, 3080, 3080 Ti, 3090, 3090 Ti
+#    RTX 30-series laptop:    3050/3050 Ti Laptop, 3060 Laptop, 3070/3070 Ti Laptop,
+#                              3080/3080 Ti Laptop  (all "Laptop GPU" SKUs)
+#    RTX 20-series:           2060, 2070, 2080 (desktop + Mobile/Max-Q + Super/Ti)
+#    GTX 16-series:           1660, 1660 Ti, 1660 Super (desktop + Max-Q laptop)
+#    MX-series (ultralight):  MX450, MX550 (Turing TU117 sm_75)
+#    Workstation desktop:     A4000, A5000, A6000, A40, A100
+#    Workstation mobile:      RTX A1000/A2000/A3000/A4000/A5000 Laptop GPU,
+#                              Quadro RTX 3000/4000/5000 Mobile
 # ============================================================
 conda config --add channels conda-forge && conda config --set channel_priority strict
 conda create -n council python=3.12 -y && conda activate council
@@ -47,9 +53,15 @@ python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pa
 
 # ============================================================
 #  SECTION C — NVIDIA Ada / Hopper  (PyTorch cu124)
-#  Cards in this group:
-#    RTX 40-series:   4060, 4060 Ti, 4070, 4070 Ti / Super, 4080, 4080 Super, 4090
-#    Workstation:     RTX 6000 Ada, L4, L40, H100
+#  Cards in this group (Ada sm_89 / Hopper sm_90):
+#    RTX 40-series desktop:   4060, 4060 Ti, 4070, 4070 Super, 4070 Ti, 4070 Ti Super,
+#                              4080, 4080 Super, 4090
+#    RTX 40-series laptop:    4050 Laptop GPU, 4060 Laptop GPU, 4070 Laptop GPU,
+#                              4080 Laptop GPU, 4090 Laptop GPU
+#    Workstation desktop:     RTX 6000 Ada Generation, L4, L40, L40S, H100, H200
+#    Workstation mobile:      RTX 5000 Ada Laptop GPU, RTX 4000 Ada Laptop GPU,
+#                              RTX 3500 Ada Laptop GPU, RTX 3000 Ada Laptop GPU,
+#                              RTX 2000 Ada Laptop GPU, RTX 1000 Ada Laptop GPU
 # ============================================================
 conda config --add channels conda-forge && conda config --set channel_priority strict
 conda create -n council python=3.12 -y && conda activate council
@@ -63,9 +75,11 @@ python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pa
 
 # ============================================================
 #  SECTION D — NVIDIA Blackwell / RTX 50-series  (PyTorch nightly cu128)
-#  Cards in this group:
-#    RTX 50-series:   5070, 5070 Ti, 5080, 5090
-#    Workstation:     RTX PRO 6000 Blackwell
+#  Cards in this group (Blackwell sm_120):
+#    RTX 50-series desktop:   5070, 5070 Ti, 5080, 5090
+#    RTX 50-series laptop:    5070 Laptop GPU, 5080 Laptop GPU, 5090 Laptop GPU
+#    Workstation desktop:     RTX PRO 6000 Blackwell, B100, B200
+#    Workstation mobile:      RTX PRO Blackwell Laptop GPU series
 #
 #  Why a separate section: stable PyTorch's cu124 wheel was compiled
 #  before Blackwell's sm_120 compute capability existed. It runs on
