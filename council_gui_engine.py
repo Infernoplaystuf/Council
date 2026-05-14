@@ -3690,6 +3690,19 @@ class CouncilConsole(tk.Tk):
         r"(?:index|cache|embeddings?)?\s*[.!?]?\s*$",
         _re.IGNORECASE,
     )
+    _ELEMENT_RANKING_RE = _re.compile(
+        # Matches phrasings like:
+        #   what is the most common (atomic) element [in <where>]
+        #   most common element(s) in data_in
+        #   top atomic elements in vault
+        #   rank atomic elements
+        r"^\s*(?:what\s+(?:is|are)\s+(?:the\s+)?)?"
+        r"(?:most\s+common|top|rank|list\s+(?:top\s+)?)\s+"
+        r"(?:(\d+)\s+)?"                              # optional count
+        r"(?:atomic\s+|chemical\s+)?elements?"
+        r"(?:\s+(?:in|of|under|inside|within)\s+(.+?))?\s*\??\s*$",
+        _re.IGNORECASE,
+    )
     _LIST_FOLDERS_RE = _re.compile(
         # Matches phrasings like:
         #   list (the) subfolders [in <where>]
@@ -3806,6 +3819,14 @@ class CouncilConsole(tk.Tk):
             # Strip trailing filler ("X folder within the vault" -> "X")
             target = self._FOLDER_NOISE_RE.sub("", target).strip()
             self._list_folders_response(target)
+            return True
+
+        m = self._ELEMENT_RANKING_RE.match(single_line)
+        if m:
+            n = int(m.group(1)) if m.group(1) else 10
+            target = (m.group(2) or "").strip().strip("'\"`")
+            target = self._FOLDER_NOISE_RE.sub("", target).strip()
+            self._element_ranking_response(target, top_n=n)
             return True
 
         if self._EXPORT_TRANSCRIPT_RE.match(single_line):
@@ -4130,6 +4151,59 @@ class CouncilConsole(tk.Tk):
             "Writer", f"Schema doc for {p.name} -> {rel}", "final",
         )
         self._set_status("● idle")
+
+    def _element_ranking_response(self, target: str, *, top_n: int = 10):
+        """Resolve `target` to a folder, tally atomic elements found in
+        every text/Excel file under it, and report the top N."""
+        import vault_tools as _vt
+        if not target:
+            try:
+                import data_index
+                root = data_index.input_dir(VAULT_DIR)
+            except Exception:
+                root = VAULT_DIR / "data_in"
+        else:
+            p = Path(target).expanduser()
+            if p.is_absolute() and p.exists():
+                root = p
+            else:
+                candidate = VAULT_DIR / target
+                root = candidate if candidate.exists() else p
+
+        if not root.exists() or not root.is_dir():
+            self._append_transcript(
+                "Writer", f"Folder not found: {root}", "final",
+            )
+            self._set_status("● idle")
+            return
+
+        self._append_transcript(
+            "Council",
+            f"Scanning {root} for atomic-element mentions "
+            f"(proper names + case-sensitive symbols)...",
+            "observation",
+        )
+        self._set_status("● scanning…", "#cba6f7")
+
+        def _worker():
+            try:
+                df = _vt.find_atomic_elements_in_folder(root)
+            except Exception as exc:
+                self.after(0, lambda: (
+                    self._append_transcript("Writer",
+                                            f"element scan failed: {exc!r}",
+                                            "final"),
+                    self._set_status("● idle"),
+                ))
+                return
+            text = _vt.format_element_ranking(df, top_n=top_n)
+            self.after(0, lambda: (
+                self._append_transcript("Writer", text, "final"),
+                self._set_status("● idle"),
+            ))
+
+        import threading as _th
+        _th.Thread(target=_worker, daemon=True).start()
 
     def _list_folders_response(self, target: str):
         """Resolve `target` (a path, a vault-relative folder name, or

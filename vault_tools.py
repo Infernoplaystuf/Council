@@ -107,6 +107,309 @@ def format_subfolder_listing(
     return "\n".join(lines)
 
 
+# ============================================================
+# Atomic-element search (periodic-table tally over vault content)
+# ============================================================
+
+# Canonical periodic table, lowercase name -> exact symbol (1..118).
+_ELEMENTS: Dict[str, str] = {
+    "hydrogen":"H", "helium":"He", "lithium":"Li", "beryllium":"Be",
+    "boron":"B", "carbon":"C", "nitrogen":"N", "oxygen":"O", "fluorine":"F",
+    "neon":"Ne", "sodium":"Na", "magnesium":"Mg", "aluminum":"Al",
+    "aluminium":"Al", "silicon":"Si", "phosphorus":"P", "sulfur":"S",
+    "sulphur":"S", "chlorine":"Cl", "argon":"Ar", "potassium":"K",
+    "calcium":"Ca", "scandium":"Sc", "titanium":"Ti", "vanadium":"V",
+    "chromium":"Cr", "manganese":"Mn", "iron":"Fe", "cobalt":"Co",
+    "nickel":"Ni", "copper":"Cu", "zinc":"Zn", "gallium":"Ga",
+    "germanium":"Ge", "arsenic":"As", "selenium":"Se", "bromine":"Br",
+    "krypton":"Kr", "rubidium":"Rb", "strontium":"Sr", "yttrium":"Y",
+    "zirconium":"Zr", "niobium":"Nb", "molybdenum":"Mo", "technetium":"Tc",
+    "ruthenium":"Ru", "rhodium":"Rh", "palladium":"Pd", "silver":"Ag",
+    "cadmium":"Cd", "indium":"In", "tin":"Sn", "antimony":"Sb",
+    "tellurium":"Te", "iodine":"I", "xenon":"Xe", "cesium":"Cs",
+    "caesium":"Cs", "barium":"Ba", "lanthanum":"La", "cerium":"Ce",
+    "praseodymium":"Pr", "neodymium":"Nd", "promethium":"Pm", "samarium":"Sm",
+    "europium":"Eu", "gadolinium":"Gd", "terbium":"Tb", "dysprosium":"Dy",
+    "holmium":"Ho", "erbium":"Er", "thulium":"Tm", "ytterbium":"Yb",
+    "lutetium":"Lu", "hafnium":"Hf", "tantalum":"Ta", "tungsten":"W",
+    "wolfram":"W", "rhenium":"Re", "osmium":"Os", "iridium":"Ir",
+    "platinum":"Pt", "gold":"Au", "mercury":"Hg", "thallium":"Tl",
+    "lead":"Pb", "bismuth":"Bi", "polonium":"Po", "astatine":"At",
+    "radon":"Rn", "francium":"Fr", "radium":"Ra", "actinium":"Ac",
+    "thorium":"Th", "protactinium":"Pa", "uranium":"U", "neptunium":"Np",
+    "plutonium":"Pu", "americium":"Am", "curium":"Cm", "berkelium":"Bk",
+    "californium":"Cf", "einsteinium":"Es", "fermium":"Fm", "mendelevium":"Md",
+    "nobelium":"No", "lawrencium":"Lr", "rutherfordium":"Rf", "dubnium":"Db",
+    "seaborgium":"Sg", "bohrium":"Bh", "hassium":"Hs", "meitnerium":"Mt",
+    "darmstadtium":"Ds", "roentgenium":"Rg", "copernicium":"Cn", "nihonium":"Nh",
+    "flerovium":"Fl", "moscovium":"Mc", "livermorium":"Lv", "tennessine":"Ts",
+    "oganesson":"Og",
+}
+
+# Reverse map (symbol -> canonical lowercase name). Where multiple
+# common names share a symbol (aluminum/aluminium, sulfur/sulphur,
+# wolfram/tungsten), the first definition wins as the "canonical" key.
+_SYMBOL_TO_NAME: Dict[str, str] = {}
+for _name, _sym in _ELEMENTS.items():
+    _SYMBOL_TO_NAME.setdefault(_sym, _name)
+
+# Precompiled regexes.
+# Names: case-insensitive, word boundaries.
+_NAME_RE = re.compile(
+    r"\b(" + "|".join(sorted(_ELEMENTS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+# Symbols: case-sensitive, word boundaries, longest first so "Si" is
+# preferred over "S" + "i" and "Fe" over "F" + "e".
+_SYMBOL_RE = re.compile(
+    r"\b(" + "|".join(
+        re.escape(s) for s in sorted(_SYMBOL_TO_NAME, key=len, reverse=True)
+    ) + r")\b"
+)
+
+# Single-letter symbols are extremely prone to false positives in
+# regular text ("plan B", "vitamin C", "section H"). We still report
+# them but in a separate column so the caller can decide whether to
+# trust them.
+_SINGLE_LETTER_SYMS = {s for s in _SYMBOL_TO_NAME if len(s) == 1}
+
+# Two-letter symbols that ARE common English words. Case-sensitive
+# regex with word boundaries doesn't help here — they're real words
+# spelled exactly like the symbols. Hits attributed to these go in
+# the `ambiguous_hits` column and are excluded from the default rank.
+_AMBIGUOUS_SYMS = {
+    "In",   # preposition
+    "As",   # conjunction
+    "He",   # pronoun
+    "No",   # negative
+    "At",   # preposition
+    "Be",   # verb
+    "Co",   # "Smith & Co.", "Co-op"
+    "Si",   # Italian / Spanish "yes"; common as variable name in code
+    "Md",   # "M.D." medical doctor
+    "Pa",   # "pa" (informal for father), "Pa." (Pennsylvania abbr.)
+}
+
+# Element NAMES that are also common English words. Their `name` hits
+# go into the `ambiguous_hits` column too, since "team lead", "iron
+# out", "gold standard", "silver lining" etc. inflate the count.
+_AMBIGUOUS_NAMES = {
+    "lead", "tin", "iron", "gold", "silver", "copper", "nickel",
+    "mercury", "neon", "argon",
+}
+
+
+def _scan_text_for_elements(text: str) -> Dict[str, Dict[str, int]]:
+    """Return per-element counts found in `text`.
+
+    Output: { canonical_name: {"name", "symbol", "single_letter",
+                               "ambiguous_name", "ambiguous_symbol"} }
+    The `ambiguous_*` buckets isolate hits where the token is also a
+    common English word and likely a false positive.
+    """
+    counts: Dict[str, Dict[str, int]] = {}
+
+    def _entry(nm: str) -> Dict[str, int]:
+        return counts.setdefault(nm, {
+            "name": 0, "symbol": 0, "single_letter": 0,
+            "ambiguous_name": 0, "ambiguous_symbol": 0,
+        })
+
+    # Names (case-insensitive)
+    for m in _NAME_RE.finditer(text):
+        matched = m.group(1).lower()
+        sym = _ELEMENTS[matched]
+        name = _SYMBOL_TO_NAME[sym]
+        e = _entry(name)
+        if matched in _AMBIGUOUS_NAMES:
+            e["ambiguous_name"] += 1
+        else:
+            e["name"] += 1
+    # Symbols (case-sensitive)
+    for m in _SYMBOL_RE.finditer(text):
+        sym = m.group(1)
+        name = _SYMBOL_TO_NAME[sym]
+        e = _entry(name)
+        if sym in _AMBIGUOUS_SYMS:
+            e["ambiguous_symbol"] += 1
+        else:
+            e["symbol"] += 1
+        if len(sym) == 1:
+            e["single_letter"] += 1
+    return counts
+
+
+# File types we'll scan as plain text. BSON / xlsx need special handling.
+_ELEMENT_SCAN_TEXT_SUFFIXES = {
+    ".csv", ".tsv", ".txt", ".md", ".markdown", ".json", ".jsonl",
+    ".xml", ".html", ".htm", ".yaml", ".yml", ".toml", ".ini",
+    ".log", ".rst", ".ang",            # EBSD .ang files are plain text
+    ".d3dpipeline",
+}
+_ELEMENT_SCAN_EXCEL_SUFFIXES = {".xlsx", ".xls", ".xlsm"}
+
+
+def find_atomic_elements_in_folder(
+    folder: Any,
+    *,
+    recursive: bool = True,
+    discount_single_letter: bool = True,
+) -> "Any":
+    """Walk `folder` and tally how often each atomic element appears,
+    broken out by detection method (proper name vs. symbol).
+
+    Returns a pandas DataFrame with columns:
+      element, symbol, name_hits, symbol_hits, single_letter_hits,
+      total, total_excluding_single_letter, files
+    sorted by `total_excluding_single_letter` descending (this is the
+    more reliable ranking — single-letter symbols are prone to false
+    positives like "vitamin C" or "plan B").
+
+    `discount_single_letter` controls which "total" is the primary
+    sort key. Set False to rank by raw total instead.
+    """
+    folder = Path(folder)
+    if not folder.exists():
+        import pandas as pd
+        return pd.DataFrame()
+
+    # name -> aggregated counts + set of files mentioning it
+    total: Dict[str, Dict[str, int]] = {}
+    file_sets: Dict[str, set] = {}
+
+    def _accumulate(per_text: Dict[str, Dict[str, int]], source_name: str):
+        for nm, c in per_text.items():
+            agg = total.setdefault(nm, {
+                "name": 0, "symbol": 0, "single_letter": 0,
+                "ambiguous_name": 0, "ambiguous_symbol": 0,
+            })
+            for k in ("name", "symbol", "single_letter",
+                      "ambiguous_name", "ambiguous_symbol"):
+                agg[k] += c[k]
+            file_sets.setdefault(nm, set()).add(source_name)
+
+    walker = folder.rglob("*") if recursive else folder.glob("*")
+    for p in walker:
+        if not p.is_file():
+            continue
+        suf = p.suffix.lower()
+        # Skip protected paths so conversation logs don't leak into results
+        try:
+            if is_protected_path(p, folder.parent):
+                continue
+        except Exception:
+            pass
+
+        if suf in _ELEMENT_SCAN_TEXT_SUFFIXES:
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            counts = _scan_text_for_elements(text)
+            if counts:
+                _accumulate(counts, p.name)
+
+        elif suf in _ELEMENT_SCAN_EXCEL_SUFFIXES:
+            try:
+                import openpyxl as _oxl
+                wb = _oxl.load_workbook(p, read_only=True, data_only=True)
+            except Exception:
+                continue
+            try:
+                file_text_parts: List[str] = []
+                for ws in wb.worksheets:
+                    # Use first ~5000 rows; bigger workbooks rarely need more
+                    for row in ws.iter_rows(values_only=True, max_row=5000):
+                        for v in row:
+                            if v is None:
+                                continue
+                            file_text_parts.append(str(v))
+                blob = " ".join(file_text_parts)
+                counts = _scan_text_for_elements(blob)
+                if counts:
+                    _accumulate(counts, p.name)
+            finally:
+                try: wb.close()
+                except Exception: pass
+
+    if not total:
+        import pandas as pd
+        return pd.DataFrame()
+
+    import pandas as pd
+    rows: List[Dict[str, Any]] = []
+    for name, c in total.items():
+        confident = c["name"] + c["symbol"] - c["single_letter"]
+        rows.append({
+            "element":              name.capitalize(),
+            "symbol":               _ELEMENTS[name],
+            "name_hits":            c["name"],
+            "symbol_hits":          c["symbol"],
+            "single_letter_hits":   c["single_letter"],
+            "ambiguous_name_hits":  c["ambiguous_name"],
+            "ambiguous_symbol_hits": c["ambiguous_symbol"],
+            "confident_total":      confident,
+            "raw_total":            c["name"] + c["symbol"]
+                                    + c["ambiguous_name"]
+                                    + c["ambiguous_symbol"],
+            "files":                len(file_sets.get(name, ())),
+        })
+    df = pd.DataFrame(rows)
+    sort_col = "confident_total" if discount_single_letter else "raw_total"
+    df = df.sort_values(sort_col, ascending=False).reset_index(drop=True)
+    return df
+
+
+def format_element_ranking(df, *, top_n: int = 10) -> str:
+    """Pretty-print the element tally with the false-positive caveat."""
+    if df is None or len(df) == 0:
+        return "No atomic-element mentions found."
+    top = df.head(top_n)
+    lines = [f"Top {len(top)} atomic elements (ranked by confident hits):"]
+    lines.append(
+        "  Confident = name + multi-letter symbol, EXCLUDING:"
+    )
+    lines.append(
+        "    - single-letter symbols (H, C, N, O, B, F, P, S, K, V, I, U, W, Y)"
+    )
+    lines.append(
+        "    - common-English-word symbols (In, As, He, No, At, Be, Co, Si, ...)"
+    )
+    lines.append(
+        "    - common-English-word names (lead, tin, iron, gold, silver, ...)"
+    )
+    lines.append("")
+    lines.append(
+        f"  {'#':<3}{'element':<13}{'sym':<5}"
+        f"{'name':>7}{'sym':>6}{'amb-n':>7}{'amb-s':>7}"
+        f"{'confident':>11}{'files':>7}"
+    )
+    for i, row in top.iterrows():
+        lines.append(
+            f"  {i+1:<3}{row['element']:<13}{row['symbol']:<5}"
+            f"{int(row['name_hits']):>7}"
+            f"{int(row['symbol_hits']):>6}"
+            f"{int(row['ambiguous_name_hits']):>7}"
+            f"{int(row['ambiguous_symbol_hits']):>7}"
+            f"{int(row['confident_total']):>11}"
+            f"{int(row['files']):>7}"
+        )
+    # Top-ambiguous summary so user can see which counts were filtered out
+    amb_rows = df[(df['ambiguous_name_hits'] > 0)
+                  | (df['ambiguous_symbol_hits'] > 0)].head(5)
+    if len(amb_rows):
+        lines.append("")
+        lines.append("Filtered (likely false positives — common English tokens):")
+        for _, r in amb_rows.iterrows():
+            parts = []
+            if r['ambiguous_name_hits']:
+                parts.append(f"name '{r['element'].lower()}' = {int(r['ambiguous_name_hits'])}")
+            if r['ambiguous_symbol_hits']:
+                parts.append(f"symbol '{r['symbol']}' = {int(r['ambiguous_symbol_hits'])}")
+            lines.append(f"  {r['element']:<12} ({', '.join(parts)})")
+    return "\n".join(lines)
+
+
 def vault_stats(vault_dir: Path) -> Dict[str, Any]:
     """Return a snapshot of the vault: per-extension counts and sizes,
     last-modified timestamp, total file count, total size.
