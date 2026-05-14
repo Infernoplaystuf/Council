@@ -2532,13 +2532,30 @@ def execute_pandas_code(
     if np is not None:
         globals_dict["np"] = np
 
-    locals_dict: dict[str, Any] = {}
+    # CRITICAL: pass `globals_dict` as BOTH globals and locals. When
+    # exec(code, globals, locals) is called with *different* dicts, Python
+    # treats the top-level code as if it were inside a class body. That
+    # scoping rule means dict/list comprehensions and nested functions
+    # CANNOT see top-level variables (free-var lookup in nested function
+    # scopes skips the class-like enclosing scope, per PEP 227 / 3104).
+    #
+    # In practice this surfaces as confusing `NameError: name '<x>' is not
+    # defined` whenever the model writes the very natural pattern:
+    #
+    #     name = "rating"
+    #     non_zero = [v for v in df[name] if v != 0]
+    #     result_df = pd.DataFrame({"avg": [sum(non_zero)/len(non_zero)]})
+    #
+    # The iterable `df[name]` evaluates fine in the enclosing class-scope,
+    # but a body reference to `name` inside the comprehension fails. We
+    # use a single namespace so the model's hand-rolled pandas snippets
+    # behave the same as if they ran in a normal module.
     stdout_buf = io.StringIO()
     stderr_buf = io.StringIO()
 
     try:
         with redirect_stdout(stdout_buf), redirect_stderr(stderr_buf):
-            exec(code, globals_dict, locals_dict)
+            exec(code, globals_dict)
     except Exception:
         log = "EXECUTION ERROR:\n" + traceback.format_exc()
         if stdout_buf.getvalue():
@@ -2547,7 +2564,7 @@ def execute_pandas_code(
             log += "\nSTDERR:\n" + stderr_buf.getvalue()
         return None, log
 
-    result_df = locals_dict.get("result_df", globals_dict.get("result_df"))
+    result_df = globals_dict.get("result_df")
 
     log_parts: list[str] = []
     if stdout_buf.getvalue():
