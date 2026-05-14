@@ -286,27 +286,172 @@ _FILE_PATH_RE = _re.compile(r'[a-zA-Z]:[/\\]\S+|/\S+')
 _FILE_READ_CHAR_LIMIT = 12000  # total chars per file in the injected block
 
 
+# ----- Token-aware injection helpers ---------------------------------------
+# These exist because llama-cpp-python silently clips any prompt that exceeds
+# `n_ctx`, which is the #1 cause of "the model hallucinated even though I gave
+# it the file." Instead of letting the runtime do silent truncation, we:
+#   • tag every block with its token cost so the model sees what it's getting
+#   • cap each block at n_ctx/8 tokens (head + tail with a visible marker)
+#   • drop the lowest-priority blocks (vault matches) when the assembled
+#     prompt would still exceed the safe input budget
+# All callers go through `_inject_file_contents`, which orchestrates this.
+
+_BLOCK_HEADER_RE = _re.compile(r"\s*~[\d,]+\s+tokens\s*")
+
+
+def _estimate_block_tokens(block_text: str) -> int:
+    """Cheap token estimator — uses the loaded llama tokenizer when
+    available, falls back to chars/4. Never raises."""
+    try:
+        import council_engine as _ce
+        return _ce.estimate_tokens(block_text or "")
+    except Exception:
+        return max(1, (len(block_text or "") + 3) // 4)
+
+
+def _tag_block_header(block_text: str, token_count: int) -> str:
+    """Stamp `  ~N tokens` into the [LABEL: ...] header on the first line so
+    the model — and the user, via `context info` — can see how many tokens
+    each injection costs. Idempotent: re-tagging strips any prior tag first.
+
+    Recognises both `[LABEL]` and `[LABEL: name]` openings. If the first
+    line isn't bracketed, we synthesize an `[INJECTION ~N tokens]` header.
+    """
+    if not block_text:
+        return block_text
+    nl = block_text.find('\n')
+    first = block_text[:nl] if nl >= 0 else block_text
+    rest = block_text[nl:] if nl >= 0 else ''
+    tag = f"  ~{token_count:,} tokens"
+    if first.lstrip().startswith('[') and ']' in first:
+        cleaned = _BLOCK_HEADER_RE.sub("", first, count=1)
+        close = cleaned.find(']')
+        if close > 0:
+            tagged = cleaned[:close] + tag + cleaned[close:]
+        else:
+            tagged = cleaned + tag
+    else:
+        tagged = f"[INJECTION{tag}]\n" + first
+    return tagged + rest
+
+
+def _smart_truncate_text(text: str, max_chars: int) -> tuple:
+    """Trim long text to head + tail with a visible elision marker.
+
+    Returns (trimmed, was_truncated). The marker tells the model what
+    fraction is missing so it doesn't pretend it saw the whole file —
+    that's the whole point vs llama-cpp's silent tail-clip.
+    """
+    if not text or len(text) <= max_chars:
+        return text, False
+    half = max(200, (max_chars - 120) // 2)
+    head = text[:half]
+    tail = text[-half:]
+    skipped = len(text) - len(head) - len(tail)
+    marker = (
+        f"\n... [truncated: {skipped:,} characters elided from the middle — "
+        f"ask for specific lines or use the analyst for exact answers] ...\n"
+    )
+    return head + marker + tail, True
+
+
+def _smart_truncate_block_to_tokens(block_text: str, max_tokens: int) -> str:
+    """Truncate a rendered injection block to fit a per-block token cap.
+
+    Uses `estimate_tokens` and falls back to char-budget trimming. Always
+    leaves a visible marker so the model knows content was elided.
+    """
+    cur = _estimate_block_tokens(block_text)
+    if cur <= max_tokens:
+        return block_text
+    # ~4 chars/token works for English; over-estimate a touch by using 4.
+    target_chars = max(800, max_tokens * 4)
+    trimmed, _ = _smart_truncate_text(block_text, target_chars)
+    return trimmed
+
+
+def _sample_rows_head_mid_tail(rows: list, max_rows: int) -> tuple:
+    """Sample a long row list into head + middle + tail slices.
+
+    Used by CSV / TSV / Parquet / Excel renderers so the model sees the
+    SHAPE of all three regions (a CSV where column dtypes change after
+    row 5,000 is now visible) instead of just the first N rows.
+
+    Returns (head_rows, mid_rows, tail_rows, skipped_before_mid,
+    skipped_between_mid_and_tail). Each slice is roughly max_rows/3 long.
+    """
+    n = len(rows)
+    if n <= max_rows:
+        return rows, [], [], 0, 0
+    slice_size = max(3, max_rows // 3)
+    head = rows[:slice_size]
+    tail = rows[-slice_size:]
+    mid_center = n // 2
+    mid_start = max(slice_size, mid_center - slice_size // 2)
+    mid_end = min(n - slice_size, mid_start + slice_size)
+    mid = rows[mid_start:mid_end]
+    skipped_before_mid = mid_start - len(head)
+    skipped_between = (n - len(tail)) - mid_end
+    return head, mid, tail, skipped_before_mid, skipped_between
+
+
 def _render_dataframe_block(kind_label, df, max_rows=20):
     """Render a small DataFrame as a CSV-shaped text block. Used by the
     injection layer for TSV / Parquet / gzipped CSV so the model sees
-    the same structure regardless of source format."""
+    the same structure regardless of source format.
+
+    When the frame has more than `max_rows` rows, samples HEAD + MIDDLE +
+    TAIL (with explicit skip markers) so the model sees the SHAPE of the
+    full file — not just the top rows. This matters for files where
+    column dtypes change deep in the data, or where the last rows hold
+    totals/summaries.
+    """
     headers = [str(c) for c in df.columns]
-    lines = [
-        f"({kind_label} — already parsed into plain text below. "
-        f"Read each row as if it were a CSV row.)",
-        f"Columns ({len(headers)}): " + ', '.join(headers),
-        f"Total rows shown: {min(len(df), max_rows)}"
-        + (f" (of {len(df)} loaded)" if len(df) > max_rows else ""),
-        "Sample rows:",
-    ]
-    for _, row in df.head(max_rows).iterrows():
+    total = len(df)
+    rows = [r.tolist() for _, r in df.iterrows()]
+
+    def _fmt(r):
         cells = []
-        for v in row.tolist():
+        for v in r:
             cv = str(v).replace('\n', ' ').strip()
             if len(cv) > 80:
                 cv = cv[:77] + '...'
             cells.append(cv)
-        lines.append('  ' + ' | '.join(cells))
+        return '  ' + ' | '.join(cells)
+
+    lines = [
+        f"({kind_label} — already parsed into plain text below. "
+        f"Read each row as if it were a CSV row.)",
+        f"Columns ({len(headers)}): " + ', '.join(headers),
+    ]
+    if total <= max_rows:
+        # Note: `total` is the count this renderer received — callers often
+        # pass a .head(200)'d slice of a larger source, so we don't claim
+        # this is the "full file." Just report what we can see.
+        lines.append(f"Total rows shown: {total} (of {total} loaded)")
+        lines.append("Sample rows:")
+        for r in rows:
+            lines.append(_fmt(r))
+    else:
+        head, mid, tail, sk_b, sk_a = _sample_rows_head_mid_tail(rows, max_rows)
+        shown = len(head) + len(mid) + len(tail)
+        lines.append(
+            f"Total rows shown: {shown} of {total} loaded "
+            f"(HEAD + MIDDLE + TAIL sampled — middle rows elided)"
+        )
+        lines.append("Sample rows (head):")
+        for r in head:
+            lines.append(_fmt(r))
+        if mid:
+            lines.append(f"  ... [skipped {sk_b:,} rows] ...")
+            lines.append("Sample rows (middle):")
+            for r in mid:
+                lines.append(_fmt(r))
+        if tail:
+            lines.append(f"  ... [skipped {sk_a:,} rows] ...")
+            lines.append("Sample rows (tail):")
+            for r in tail:
+                lines.append(_fmt(r))
     return '\n'.join(lines)
 
 
@@ -473,8 +618,10 @@ def _render_excel_block(p, char_limit):
             lines.append('    ' + ' | '.join(cells))
         lines.append("")
     content = '\n'.join(lines).rstrip()
+    # Visible head+tail trim so the model sees the start AND end of the
+    # workbook listing rather than silently losing the last sheets.
     if len(content) > char_limit:
-        content = content[:char_limit] + '\n... (truncated)'
+        content, _ = _smart_truncate_text(content, char_limit)
     return content
 
 
@@ -712,20 +859,47 @@ def _read_file_for_injection(path_str):
 
             lines = ['Columns (' + str(len(header)) + '): ' + ', '.join(header)]
             lines.append('Total data rows: ' + str(total_rows))
-            sample_n = min(20, total_rows)
-            if sample_n:
-                lines.append('Sample rows (first ' + str(sample_n) + '):')
-                for r in data_rows[:sample_n]:
-                    cells = []
-                    for c in r:
-                        c = str(c).replace('\n', ' ').strip()
-                        if len(c) > 80:
-                            c = c[:77] + '...'
-                        cells.append(c)
-                    lines.append(' | '.join(cells))
+
+            def _fmt(r):
+                cells = []
+                for c in r:
+                    c = str(c).replace('\n', ' ').strip()
+                    if len(c) > 80:
+                        c = c[:77] + '...'
+                    cells.append(c)
+                return ' | '.join(cells)
+
+            sample_target = 24
+            if total_rows <= sample_target:
+                if total_rows:
+                    lines.append(f'Sample rows ({total_rows}, full file):')
+                    for r in data_rows:
+                        lines.append(_fmt(r))
+            else:
+                head, mid, tail, sk_b, sk_a = _sample_rows_head_mid_tail(
+                    data_rows, sample_target,
+                )
+                shown = len(head) + len(mid) + len(tail)
+                lines.append(
+                    f'Sample rows ({shown} of {total_rows} — HEAD + MIDDLE + '
+                    f'TAIL sampled; middle rows elided):'
+                )
+                lines.append('--- head ---')
+                for r in head:
+                    lines.append(_fmt(r))
+                if mid:
+                    lines.append(f'... [skipped {sk_b:,} rows] ...')
+                    lines.append('--- middle ---')
+                    for r in mid:
+                        lines.append(_fmt(r))
+                if tail:
+                    lines.append(f'... [skipped {sk_a:,} rows] ...')
+                    lines.append('--- tail ---')
+                    for r in tail:
+                        lines.append(_fmt(r))
             content = '\n'.join(lines)
             if len(content) > _FILE_READ_CHAR_LIMIT:
-                content = content[:_FILE_READ_CHAR_LIMIT] + '\n... (truncated)'
+                content, _ = _smart_truncate_text(content, _FILE_READ_CHAR_LIMIT)
         elif suffix in ('.tsv',):
             # TSV — same rendering as CSV, just tab-separated
             import pandas as _pd_fi
@@ -752,10 +926,15 @@ def _read_file_for_injection(path_str):
         elif suffix in ('.xlsx', '.xls', '.xlsm'):
             content = _render_excel_block(p, _FILE_READ_CHAR_LIMIT)
         else:
+            # Read up to 2× the budget so we can show head + tail with a
+            # visible elision marker (silent tail-clip caused the model
+            # to invent the "missing" portion).
             with open(p, encoding='utf-8', errors='replace') as fh:
-                content = fh.read(_FILE_READ_CHAR_LIMIT)
-            if len(content) == _FILE_READ_CHAR_LIMIT:
-                content += '\n... (truncated)'
+                raw = fh.read(_FILE_READ_CHAR_LIMIT * 2)
+            if len(raw) > _FILE_READ_CHAR_LIMIT:
+                content, _ = _smart_truncate_text(raw, _FILE_READ_CHAR_LIMIT)
+            else:
+                content = raw
         if not content.strip():
             return None
         return '[FILE: ' + p.name + ']\n' + content + '\n[END FILE]'
@@ -796,54 +975,107 @@ def _extract_file_paths(text):
     return paths
 
 
-def _inject_file_contents(user_text):
+def _inject_file_contents(user_text, analyst_block=None, n_ctx=None):
     """Augment the user message with file/vault context before deliberation.
 
-    Returns (augmented_text, fuzzy_matches) where fuzzy_matches is a dict
-    mapping each unmatched query token to the list of (suggestion, score)
-    tuples used to expand the search. Caller can surface these to the UI
-    for review.
+    Returns ``(augmented_text, fuzzy_matches, breakdown)`` where:
+      • ``breakdown["costs"]`` — list of ``(label, token_cost)`` for each
+        block that made it into the assembled prompt (in order).
+      • ``breakdown["dropped"]`` — list of ``(label, token_cost)`` for
+        blocks that exceeded the cumulative budget. Only droppable-class
+        blocks (vault matches) ever appear here.
+      • ``breakdown["n_ctx"]`` / ``["remaining"]`` — the window the
+        assembly was sized against.
+
+    Priority order (lower number = higher priority; ties impossible):
+      0. ``[NO DATA AVAILABLE]`` marker (must always surface)
+      1. ``[ANALYST RESULT]`` — the computed answer
+      2. ``[FILE: ...]`` — explicit user-pasted paths
+      3. ``[FOLDER: ...]`` — explicit user-pasted directory paths
+      4. ``[VAULT MATCH: ...]`` — speculative search hits (droppable)
+
+    Per-block cap: each block is head/tail-trimmed to roughly ``n_ctx//8``
+    tokens before assembly. Cumulative cap: vault-match blocks stop being
+    added once the running total would exceed the safe input budget
+    (``n_ctx`` minus ``max(256, n_ctx*0.25)`` reply reserve, minus the
+    typed user text and a 500-token writer-prompt overhead).
+
+    ``analyst_block`` is optional and injected at priority 2 when given.
+    When explicit paths are present, the vault search is skipped entirely
+    (#4 — explicit paths take precedence; the user can re-ask without a
+    path if they want fuzzy vault matches).
     """
     import sys as _sys_dbg
     print('[DEBUG inject] called with: ' + repr(user_text[:80]), file=_sys_dbg.stderr)
 
+    # -- Budgets ------------------------------------------------------------
+    try:
+        import council_engine as _ce
+        n_ctx = int(n_ctx if n_ctx is not None else _ce.get_n_ctx())
+    except Exception:
+        n_ctx = int(n_ctx or 4096)
+    # Per-block cap is a *safety net* against pathological inputs (e.g. a
+    # 1MB file that slipped past the renderer's own char-limit). The
+    # renderers already cap themselves at ~12KB (~3,000 tokens), so the
+    # cap floor of 2048 tokens means well-behaved blocks pass through
+    # untouched while a runaway block still gets trimmed.
+    per_block_cap = max(2048, n_ctx // 4)
+    reply_reserve = max(256, int(n_ctx * 0.25))
+    safe_input = max(1, n_ctx - reply_reserve)
+    user_cost = _estimate_block_tokens(user_text)
+    writer_overhead = 500   # rough Writer system prompt allowance
+    remaining = max(256, safe_input - user_cost - writer_overhead)
+
+    # Priority bands — lower = higher priority
+    PRIO_NODATA, PRIO_ANALYST, PRIO_EXPLICIT, PRIO_FOLDER, PRIO_VAULT = 0, 1, 2, 3, 4
+    DROPPABLE_FROM = PRIO_VAULT   # only vault matches are droppable
+
     explicit_paths = _extract_file_paths(user_text)
     print('[DEBUG inject] explicit paths: ' + str(explicit_paths), file=_sys_dbg.stderr)
 
-    injections = []
+    candidates = []   # list of (priority, label, content)
     fuzzy_matches = {}
-    missing_paths: list = []
+    missing_paths = []
+
+    # -- Analyst result (priority 2) ----------------------------------------
+    if analyst_block:
+        candidates.append((PRIO_ANALYST, "[ANALYST RESULT]", analyst_block))
+
+    # -- Explicit paths (priority 3 or 4) -----------------------------------
     for path_str in explicit_paths:
         p_check = Path(path_str.strip())
-        # Directory? Render a listing + per-file summary block instead of
-        # treating the path as "missing". This is critical because the
-        # user often says "look at files in <folder>" with a literal
-        # path — previously we silently dropped it and the model
-        # refused, or worse, hallucinated from training data.
+        # Directory → folder listing block (priority 4, not droppable).
         if p_check.is_dir():
             folder_block = _render_folder_for_injection(p_check)
             if folder_block:
-                injections.append(folder_block)
+                candidates.append((
+                    PRIO_FOLDER, f"[FOLDER: {p_check.name or path_str}]",
+                    folder_block,
+                ))
             continue
         snippet = _read_file_for_injection(path_str)
         if snippet:
-            injections.append(snippet)
+            candidates.append((
+                PRIO_EXPLICIT, f"[FILE: {p_check.name or path_str}]", snippet,
+            ))
         else:
-            # File path that genuinely doesn't exist on this machine.
             missing_paths.append(path_str)
 
+    # -- Vault search (priority 5, droppable) -------------------------------
+    # #4: when the user pasted explicit paths, trust them and skip vault
+    # search entirely. The vault hits competed with the explicit file for
+    # budget and frequently caused the explicit file to get truncated.
     folder_scope = _detect_folder_scope(user_text)
-    do_vault_search = (
-        not explicit_paths
-        or folder_scope is not None
-        or _vault_search_keywords(user_text)
-    )
-    if do_vault_search:
+    if not explicit_paths:
         idx = _get_vault_index()
         if idx is not None:
             try:
                 idx.rebuild()
-                hits, fuzzy_matches = idx.search(user_text, k=5, folder=folder_scope)
+                # When analyst already answered (#7), reduce the vault-match
+                # pull from 5 to 1 — the analyst's CSV is the authoritative
+                # source and 5 fuzzy matches just consume budget.
+                k = 1 if analyst_block else 5
+                hits, fuzzy_matches = idx.search(user_text, k=k, folder=folder_scope)
                 print('[DEBUG inject] vault hits: '
                       + str([(round(s, 2), h.get("name")) for s, h in hits]),
                       file=_sys_dbg.stderr)
@@ -853,17 +1085,17 @@ def _inject_file_contents(user_text):
                 for _score, rec in hits:
                     if rec.get("path") in explicit_paths:
                         continue
-                    injections.append(idx.summary_block(rec))
+                    vblock = idx.summary_block(rec)
+                    name = rec.get("name") or "?"
+                    candidates.append((PRIO_VAULT, f"[VAULT MATCH: {name}]", vblock))
             except Exception as _e:
                 print('[DEBUG inject] vault search failed: ' + repr(_e),
                       file=_sys_dbg.stderr)
 
-    # Prepend an explicit "missing data" marker when paths the user
-    # mentioned couldn't be read. This is critical defense against the
-    # cross-machine hallucination case where the file existed on
-    # Computer A but not on Computer B — the model would otherwise
-    # silently invent values from training-data memory of similarly-
-    # named public datasets.
+    # -- NO DATA marker (priority 1, never dropped) -------------------------
+    # Critical defense against cross-machine hallucination: when the user
+    # mentioned a path that doesn't exist locally, surface the gap loudly
+    # so the Writer's ABSOLUTE RULE clause kicks in and refuses values.
     if missing_paths:
         miss_block = (
             "[NO DATA AVAILABLE — the user's message referenced these "
@@ -876,11 +1108,53 @@ def _inject_file_contents(user_text):
             "the user the file is not present on this machine. Do NOT "
             "invent column names, row counts, or values from memory.]"
         )
-        injections.insert(0, miss_block)
+        candidates.append((PRIO_NODATA, "[NO DATA AVAILABLE]", miss_block))
 
-    if not injections:
-        return user_text, fuzzy_matches
-    return '\n\n'.join(injections) + '\n\n' + user_text, fuzzy_matches
+    # -- Assemble: priority sort, per-block cap, cumulative cap, tag --------
+    candidates.sort(key=lambda t: t[0])
+
+    final_blocks = []
+    per_block_costs = []
+    dropped = []
+    running = 0
+    # NO_DATA and ANALYST results are already curated (NO_DATA is tiny;
+    # analyst output is pre-capped at ~4000 chars by format_result_for_prompt).
+    # Trimming them risks deleting the answer the user actually asked for,
+    # so they are exempt from the per-block cap. EXPLICIT/FOLDER/VAULT are
+    # still capped because they can be arbitrarily large (a pasted 1GB CSV).
+    UNCAPPED_PRIOS = {PRIO_NODATA, PRIO_ANALYST}
+    for (prio, label, content) in candidates:
+        if prio in UNCAPPED_PRIOS:
+            capped = content
+        else:
+            capped = _smart_truncate_block_to_tokens(content, per_block_cap)
+        cost = _estimate_block_tokens(capped)
+        # Cumulative cap — only blocks at DROPPABLE_FROM or below are
+        # eligible for dropping. The NO_DATA marker, analyst result, and
+        # explicit user paths are always included even if budget is tight
+        # (the warning system will tell the user the prompt overflowed).
+        if prio >= DROPPABLE_FROM and running + cost > remaining:
+            dropped.append((label, cost))
+            continue
+        tagged = _tag_block_header(capped, cost)
+        final_blocks.append(tagged)
+        per_block_costs.append((label, cost))
+        running += cost
+
+    breakdown = {
+        "costs":    per_block_costs,
+        "dropped":  dropped,
+        "n_ctx":    n_ctx,
+        "remaining": remaining,
+        "per_block_cap": per_block_cap,
+        "running":  running,
+        "user_text_tokens": user_cost,
+    }
+
+    if not final_blocks:
+        return user_text, fuzzy_matches, breakdown
+    return ('\n\n'.join(final_blocks) + '\n\n' + user_text,
+            fuzzy_matches, breakdown)
 
 
 _FOLDER_RE = _re.compile(
@@ -3872,6 +4146,19 @@ class CouncilConsole(tk.Tk):
         r"(?:\s+(?:in|under|inside|within)\s+(.+?))?\s*\??\s*$",
         _re.IGNORECASE,
     )
+    _CONTEXT_INFO_RE = _re.compile(
+        # Matches: "context info", "context window", "show context", "n_ctx",
+        # "token budget", "how big is the context", "what is the context window"
+        r"^\s*(?:"
+        r"context\s+(?:info|window|size|budget|status)"
+        r"|show\s+context(?:\s+window|\s+info)?"
+        r"|n[_\s]?ctx"
+        r"|token\s+budget"
+        r"|how\s+(?:big|large)\s+is\s+(?:the\s+)?context(?:\s+window)?"
+        r"|what(?:'s|\s+is)\s+(?:the\s+)?context(?:\s+window|\s+size)?"
+        r")\s*\??\s*$",
+        _re.IGNORECASE,
+    )
 
     _ELEMENT_RANKING_RE = _re.compile(
         # Matches phrasings like:
@@ -3980,6 +4267,10 @@ class CouncilConsole(tk.Tk):
         if self._STATS_RE.match(single_line):
             stats = _vt.vault_stats(VAULT_DIR)
             self._append_transcript("Writer", _vt.format_vault_stats(stats), "final")
+            return True
+
+        if self._CONTEXT_INFO_RE.match(single_line):
+            self._context_info_response()
             return True
 
         if self._DUPES_RE.match(single_line):
@@ -4790,6 +5081,103 @@ class CouncilConsole(tk.Tk):
         text = _vt.format_subfolder_listing(root, folders)
         self._append_transcript("Writer", text, "final")
         self._set_status("● idle")
+
+    def _context_info_response(self):
+        """Report current context-window configuration and last-query usage.
+
+        Helps the user decide whether to raise `COUNCIL_GGUF_N_CTX`. We
+        report:
+          • current n_ctx (env var)
+          • model's advertised maximum (from GGUF metadata if loaded)
+          • last assembled prompt's token count (if any has been sent)
+          • a one-line "safe input" budget (n_ctx minus the reply reserve)
+          • the recommended way to raise the cap
+
+        This is a Writer-final message so it doesn't trigger the council
+        deliberation pipeline — the user just wants to see the numbers.
+        """
+        try:
+            import council_engine as _ce
+            n_ctx = _ce.get_n_ctx()
+            max_ctx = _ce.get_model_max_context()
+            loaded = (max_ctx is not None)
+        except Exception as exc:
+            self._append_transcript(
+                "Writer",
+                f"Could not read context info: {exc!r}",
+                "final",
+            )
+            return
+
+        lines: list[str] = ["Context-window status"]
+        lines.append(f"  • Configured n_ctx:   {n_ctx:,} tokens "
+                     f"(set via COUNCIL_GGUF_N_CTX)")
+        if max_ctx:
+            lines.append(f"  • Model advertises:   {max_ctx:,} tokens max")
+            if max_ctx > n_ctx:
+                head = max_ctx - n_ctx
+                lines.append(f"    → You have {head:,} tokens of headroom "
+                             f"to raise the cap.")
+        else:
+            lines.append("  • Model advertises:   (unknown — model not "
+                         "loaded yet, ask any question first)")
+
+        # Reply reserve mirrors context_budget_report()
+        reply_reserve = max(256, int(n_ctx * 0.25))
+        safe_input = max(1, n_ctx - reply_reserve)
+        lines.append(f"  • Reply reserve:      ~{reply_reserve:,} tokens "
+                     f"(25% of n_ctx, floor 256)")
+        lines.append(f"  • Safe input budget:  ~{safe_input:,} tokens "
+                     f"before the reply gets squeezed")
+
+        last = getattr(self, "_last_context_budget", None)
+        if isinstance(last, dict) and last.get("input_tokens"):
+            used = last["input_tokens"]
+            pct = last.get("pct_of_window", 0.0)
+            tag = "exact" if last.get("tokenizer") == "exact" else "estimated"
+            lines.append("")
+            lines.append(f"Last query: ~{used:,} tokens ({tag}, "
+                         f"{pct:.0f}% of window)")
+            if last.get("over_window"):
+                lines.append("  ⚠ Exceeded n_ctx — the tail was silently "
+                             "truncated. Raise the cap and try again.")
+            elif last.get("over_safe"):
+                lines.append("  ⚠ Ate into the reply reserve — answers will "
+                             "be short.")
+
+        # Per-injection-block breakdown — shows where the budget went last
+        # turn. Lets the user see e.g. "the CSV ate 3,200 tokens; the vault
+        # match was only 400" and decide whether to raise n_ctx or use a
+        # smaller subset of the data.
+        bd = getattr(self, "_last_injection_breakdown", None)
+        if isinstance(bd, dict) and (bd.get("costs") or bd.get("dropped")):
+            lines.append("")
+            lines.append("Last injection breakdown:")
+            ut = bd.get("user_text_tokens") or 0
+            cap = bd.get("per_block_cap") or 0
+            running = bd.get("running") or 0
+            remaining = bd.get("remaining") or 0
+            lines.append(f"  per-block cap: ~{cap:,} tokens  ·  "
+                         f"injection budget: ~{remaining:,} tokens  ·  "
+                         f"typed text: ~{ut:,} tokens")
+            for label, cost in bd.get("costs") or []:
+                lines.append(f"    {label}  ~{cost:,} tokens")
+            lines.append(f"  total injected: ~{running:,} tokens")
+            if bd.get("dropped"):
+                lines.append("  dropped (budget exceeded):")
+                for label, cost in bd["dropped"]:
+                    lines.append(f"    {label}  ~{cost:,} tokens  (dropped)")
+
+        lines.append("")
+        lines.append("To raise the cap before launch:")
+        lines.append("  set COUNCIL_GGUF_N_CTX=16384   (Windows cmd)")
+        lines.append("  $env:COUNCIL_GGUF_N_CTX=\"16384\"  (PowerShell)")
+        lines.append("  export COUNCIL_GGUF_N_CTX=16384  (bash)")
+        lines.append("Doubling n_ctx roughly doubles KV-cache RAM. If the "
+                     "GPU runs out, drop COUNCIL_GGUF_GPU_LAYERS to spill "
+                     "to CPU.")
+
+        self._append_transcript("Writer", "\n".join(lines), "final")
 
     def _build_embeddings_response(self):
         """Kick off the vector embedding build over the vault index.
@@ -10013,14 +10401,56 @@ class CouncilConsole(tk.Tk):
         # routing triggers (e.g. "plot" appearing in a game description sends
         # everything to the Grapher).
         original_user_text = user_text
-        augmented, fuzzy_matches = _inject_file_contents(user_text)
-        was_injected = augmented != user_text
+
+        # ── Analyst step first ────────────────────────────────────────────
+        # The analyst computes deterministic answers from data ("how many",
+        # "what's the sum"); when it succeeds, the injection layer reduces
+        # vault-match candidates from 5 to 1 (#7) so the answer doesn't
+        # fight for budget with speculative matches.
+        _analyst_block = _run_analyst_step(original_user_text)
+        if _analyst_block:
+            self._append_transcript("Council", "Computing from data...", "observation")
+
+        # ── Inject file/folder/vault context with token-aware caps ────────
+        # The new pipeline (a) tags each block with its token cost, (b) caps
+        # each block at n_ctx/8 tokens with a visible head+tail trim marker,
+        # (c) drops the lowest-priority blocks (vault matches) when the
+        # cumulative cost would exceed the safe input budget. The breakdown
+        # dict is stashed for the `context info` chat intent.
+        try:
+            _n_ctx = ce.get_n_ctx()
+        except Exception:
+            _n_ctx = 4096
+        augmented, fuzzy_matches, _injection_breakdown = _inject_file_contents(
+            user_text, analyst_block=_analyst_block, n_ctx=_n_ctx,
+        )
+        self._last_injection_breakdown = _injection_breakdown
+        # ``was_injected`` is the legacy gate that suppresses the fast-path
+        # chart/lookup handlers below. The OLD pipeline only injected vault
+        # hits + explicit files (analyst was a separate post-step), so this
+        # flag meant "the model is being asked to reason about ALREADY
+        # FETCHED data — don't divert to the chart path." Now that analyst
+        # is folded into the injection pipeline, we have to recompute the
+        # flag to EXCLUDE analyst-only injections, otherwise a plain "how
+        # many X" question would block the chart fast path even though no
+        # vault context exists yet.
+        _labels = [lbl for lbl, _ in _injection_breakdown.get("costs", [])]
+        _has_vault = any(lbl.startswith("[VAULT MATCH") for lbl in _labels)
+        _has_file = any(lbl.startswith("[FILE:") for lbl in _labels)
+        _has_folder = any(lbl.startswith("[FOLDER:") for lbl in _labels)
+        _has_nodata = any(lbl.startswith("[NO DATA AVAILABLE") for lbl in _labels)
+        was_injected = bool(_has_vault or _has_file or _has_folder or _has_nodata)
         if was_injected:
-            injected_names = [Path(p).name for p in _extract_file_paths(user_text)]
+            # Filter out empty names (Path("/").name == "" etc) so we don't
+            # render "Reading: , , " on edge-case paths.
+            injected_names = [n for n in (Path(p).name for p in _extract_file_paths(user_text)) if n]
             if injected_names:
                 self._append_transcript("Council", "Reading: " + ", ".join(injected_names), "observation")
-            else:
+            elif _has_vault:
                 self._append_transcript("Council", "Reviewing matching vault files...", "observation")
+            # If only [ANALYST RESULT] was injected, the earlier "Computing
+            # from data..." line already informed the user — no extra
+            # transcript noise needed.
         if fuzzy_matches:
             _lines = ["Fuzzy matches used (treated as your spelling):"]
             for orig, suggestions in fuzzy_matches.items():
@@ -10031,14 +10461,66 @@ class CouncilConsole(tk.Tk):
                 "(comma-separated for multiple) — they won't be used again."
             )
             self._append_transcript("Council", "\n".join(_lines), "observation")
+        # Surface dropped blocks so the user knows what got cut to fit budget.
+        _dropped = _injection_breakdown.get("dropped") or []
+        if _dropped:
+            _msg_lines = [
+                f"⚠ Dropped {len(_dropped)} lower-priority block"
+                f"{'s' if len(_dropped) != 1 else ''} to fit n_ctx="
+                f"{_injection_breakdown.get('n_ctx', 0):,}:"
+            ]
+            for _label, _cost in _dropped:
+                _msg_lines.append(f"  • {_label}  (~{_cost:,} tokens)")
+            _msg_lines.append(
+                "(Analyst result and your explicit files are never dropped. "
+                "Type 'context info' for the full token breakdown.)"
+            )
+            self._append_transcript("Council", "\n".join(_msg_lines), "observation")
         user_text = augmented
 
-        # ── Analyst step: compute real numbers for "how many / what %" queries
-        # The Writer will then quote the actual count instead of guessing.
-        _analyst_block = _run_analyst_step(original_user_text)
-        if _analyst_block:
-            self._append_transcript("Council", "Computing from data...", "observation")
-            user_text = _analyst_block + "\n\n" + user_text
+        # ── Context-window check ──────────────────────────────────────────
+        # llama-cpp-python silently truncates any prompt that doesn't fit in
+        # `n_ctx` — it clips the tail and proceeds, which is the #1 cause of
+        # "the model hallucinated even though I gave it the file." Warn the
+        # user as soon as we cross 80% of the configured window so they can
+        # raise COUNCIL_GGUF_N_CTX before sending another query. We don't
+        # block the request — the warning goes to the transcript and the
+        # call still goes through (truncated output is still useful for
+        # diagnosing what got clipped).
+        try:
+            _budget = ce.context_budget_report(user_text)
+            self._last_context_budget = _budget
+            _used = _budget["input_tokens"]
+            _ctx  = _budget["n_ctx"]
+            _safe = _budget["safe_input"]
+            if _budget["over_window"]:
+                _maxh = _budget.get("model_max_ctx") or 0
+                _hint = (
+                    f" The model supports up to {_maxh} tokens — raising "
+                    f"COUNCIL_GGUF_N_CTX to {min(max(16384, _ctx * 4), _maxh)} "
+                    f"would fit this prompt."
+                ) if _maxh and _maxh > _ctx else (
+                    " Raise COUNCIL_GGUF_N_CTX (e.g. to 16384 or 32768) "
+                    "before launch."
+                )
+                self._append_transcript(
+                    "Council",
+                    f"⚠ Prompt is ~{_used:,} tokens but n_ctx is only {_ctx:,}. "
+                    f"The model will silently truncate the tail and may miss "
+                    f"the injected file/analyst data.{_hint}",
+                    "observation",
+                )
+            elif _used > _safe:
+                _pct = _budget["pct_of_window"]
+                self._append_transcript(
+                    "Council",
+                    f"⚠ Prompt is ~{_used:,} tokens ({_pct:.0f}% of "
+                    f"n_ctx={_ctx:,}). Reply space is tight — consider "
+                    f"raising COUNCIL_GGUF_N_CTX for fuller answers.",
+                    "observation",
+                )
+        except Exception as _e:
+            print(f"[ContextBudget] check failed: {_e!r}")
 
         # ── Provenance: remember what we showed the model this turn ──
         # Lets the user ask "where did $5,000 come from?" after the reply.

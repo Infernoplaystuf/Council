@@ -157,7 +157,139 @@ def _get_gguf_model():
         n_gpu_layers=n_gpu_layers,
         verbose=False,
     )
+    # Surface the model's advertised max context so the user knows the headroom
+    # they have before raising COUNCIL_GGUF_N_CTX. This is a no-op when the
+    # GGUF metadata doesn't include the field.
+    try:
+        _max = get_model_max_context()
+        if _max and _max > n_ctx:
+            print(
+                f"[GGUF] Model advertises max context {_max} tokens — you may "
+                f"raise COUNCIL_GGUF_N_CTX (currently {n_ctx}) up to {_max} "
+                f"if your VRAM allows. Doubling n_ctx roughly doubles KV-cache RAM.",
+                flush=True,
+            )
+    except Exception:
+        pass
     return _GGUF_MODEL_INSTANCE
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Context-window helpers
+#
+# llama-cpp-python silently truncates any prompt larger than `n_ctx` — it just
+# clips the tail and keeps going, which is the #1 cause of "the model
+# hallucinated even though I gave it the file" reports. These helpers let the
+# GUI estimate the prompt size *before* the call and warn the user when they
+# are near the limit. They also expose the configured limit so a chat intent
+# can report it.
+#
+# Granite 3.0 8B (and most modern GGUFs) advertise their true max context in
+# the GGUF metadata. We surface that too so the user knows how high they can
+# safely raise `COUNCIL_GGUF_N_CTX`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_n_ctx() -> int:
+    """Return the configured context window (tokens). Reads
+    `COUNCIL_GGUF_N_CTX` so a launch-time override is reflected immediately."""
+    try:
+        return int(os.environ.get("COUNCIL_GGUF_N_CTX", "4096"))
+    except Exception:
+        return 4096
+
+
+def estimate_tokens(text: str) -> int:
+    """Estimate the token count of `text`.
+
+    Prefers the loaded llama tokenizer (exact); falls back to ~4 chars/token
+    when no model is loaded yet (close enough for warning thresholds).
+
+    Never raises — returns 0 on empty input. Used purely for context-budget
+    diagnostics, so over-estimating slightly is fine (and safer).
+    """
+    if not text:
+        return 0
+    # Try the loaded model's tokenizer for an exact count.
+    try:
+        llm = _GGUF_MODEL_INSTANCE  # don't trigger a load just for an estimate
+        if llm is not None and hasattr(llm, "tokenize"):
+            try:
+                toks = llm.tokenize(text.encode("utf-8", errors="ignore"))
+                return len(toks)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Heuristic fallback: English averages ~4 chars per token. Round up so we
+    # over-estimate slightly rather than miss a real overflow.
+    return max(1, (len(text) + 3) // 4)
+
+
+def get_model_max_context() -> Optional[int]:
+    """Return the GGUF's advertised max context (from metadata), or None if
+    the model isn't loaded or the field is missing. Granite 3.0 reports
+    128K here even when n_ctx is set lower."""
+    llm = _GGUF_MODEL_INSTANCE
+    if llm is None:
+        return None
+    # llama-cpp-python exposes metadata in a couple of shapes across versions.
+    try:
+        md = getattr(llm, "metadata", None)
+        if isinstance(md, dict):
+            for key in (
+                "general.context_length",
+                "llama.context_length",
+                "granite.context_length",
+                "qwen2.context_length",
+                "mistral.context_length",
+            ):
+                if key in md:
+                    try:
+                        return int(md[key])
+                    except Exception:
+                        continue
+            # Some versions namespace it as "{arch}.context_length"
+            for k, v in md.items():
+                if isinstance(k, str) and k.endswith(".context_length"):
+                    try:
+                        return int(v)
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    # As a last resort, llama-cpp exposes n_ctx_train() on the raw context.
+    try:
+        return int(llm.n_ctx_train())
+    except Exception:
+        pass
+    return None
+
+
+def context_budget_report(prompt_text: str) -> Dict[str, Any]:
+    """Build a dict describing how a candidate prompt fits in the window.
+
+    Used by the auto-warning in the GUI and by the `context info` chat
+    intent. Fields are stable so the GUI can format them however it wants.
+    """
+    n_ctx = get_n_ctx()
+    used = estimate_tokens(prompt_text or "")
+    # Reserve roughly 25% of the window for the model's reply. Anything that
+    # eats into that reservation is what triggers truncation in practice.
+    reply_reserve = max(256, int(n_ctx * 0.25))
+    safe_input = max(1, n_ctx - reply_reserve)
+    pct_of_window = (used / n_ctx * 100.0) if n_ctx else 0.0
+    return {
+        "input_tokens":   used,
+        "n_ctx":          n_ctx,
+        "reply_reserve":  reply_reserve,
+        "safe_input":     safe_input,
+        "pct_of_window":  pct_of_window,
+        "over_safe":      used > safe_input,
+        "over_window":    used > n_ctx,
+        "model_max_ctx":  get_model_max_context(),
+        "loaded":         _GGUF_MODEL_INSTANCE is not None,
+        "tokenizer":      "exact" if _GGUF_MODEL_INSTANCE is not None else "estimate (chars/4)",
+    }
 
 
 def _gguf_chat(
