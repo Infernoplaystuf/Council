@@ -2166,6 +2166,10 @@ def _vmgr_copy_folder(
 #   node_registry.json         ← SSH node registry
 #   personality_backends.json  ← model pins
 VAULT_DIR            = APP_DIR / "vault"
+# Repo root — directory holding this file (council_gui_engine.py).
+# Used by the Changelog tab to invoke `git log`/`git show` against the
+# actual checkout the user is running, regardless of CWD.
+_REPO_ROOT           = Path(__file__).resolve().parent
 VERDICT_HISTORY_PATH = VAULT_DIR / "verdict_history.jsonl"
 VAULT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -3007,6 +3011,7 @@ class CouncilConsole(tk.Tk):
         self._build_sessions_tab()
         self._build_vault_manager_tab()
         self._build_speech_tab()
+        self._build_changelog_tab()
 
         # ── Advanced / admin tabs ──
         # Hidden by default unless explicitly enabled. Power users and
@@ -8009,6 +8014,164 @@ class CouncilConsole(tk.Tk):
             messagebox.showerror("Wishlist", str(e))
 
     # ---- Speech tab ----
+
+    # ---- Changelog tab ----
+    # Reads `git log` and `git show` from the repo root so users can see
+    # exactly what shipped between launches. Runs git as a subprocess so a
+    # broken Git install is just a status message, not a tab failure.
+
+    def _build_changelog_tab(self):
+        self.tab_changelog = ttk.Frame(self.nb)
+        self.nb.add(self.tab_changelog, text="📜 Changelog")
+
+        bar = ttk.Frame(self.tab_changelog)
+        bar.pack(fill="x", padx=6, pady=(6, 4))
+        ttk.Button(bar, text="⟳ Refresh",
+                   command=self._changelog_refresh).pack(side="left")
+        ttk.Button(bar, text="📂 Open repo folder",
+                   command=lambda: self._open_in_explorer(_REPO_ROOT)).pack(side="left", padx=4)
+        ttk.Label(bar, text="Filter:").pack(side="left", padx=(12, 4))
+        self._changelog_filter_var = tk.StringVar()
+        ent = ttk.Entry(bar, textvariable=self._changelog_filter_var, width=30)
+        ent.pack(side="left")
+        ent.bind("<KeyRelease>", lambda _e: self._changelog_apply_filter())
+        self._changelog_status_var = tk.StringVar(
+            value="Click ⟳ Refresh to load commits."
+        )
+        ttk.Label(bar, textvariable=self._changelog_status_var,
+                  foreground="#9a9a9a").pack(side="right")
+
+        pane = tk.PanedWindow(self.tab_changelog, orient="horizontal",
+                              bg="#1a1414", sashwidth=6)
+        pane.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # Left: scrollable commit list
+        left = ttk.Frame(pane)
+        pane.add(left, width=520)
+        ttk.Label(left, text="Commits (newest first)").pack(anchor="w")
+        list_row = ttk.Frame(left)
+        list_row.pack(fill="both", expand=True)
+        self._changelog_listbox = tk.Listbox(list_row, exportselection=False,
+                                              font=("Consolas", 9))
+        self._changelog_listbox.pack(side="left", fill="both", expand=True)
+        lb_sb = ttk.Scrollbar(list_row, command=self._changelog_listbox.yview)
+        self._changelog_listbox.configure(yscrollcommand=lb_sb.set)
+        lb_sb.pack(side="left", fill="y")
+        self._changelog_listbox.bind("<<ListboxSelect>>",
+                                     lambda _e: self._changelog_show_selected())
+
+        # Right: commit detail (subject + full message + file stat + diff)
+        right = ttk.Frame(pane)
+        pane.add(right)
+        ttk.Label(right, text="Commit detail").pack(anchor="w")
+        self._changelog_detail = self._make_text(
+            right, wrap="word", state="disabled", font=("Consolas", 9),
+        )
+        det_sb = ttk.Scrollbar(right, command=self._changelog_detail.yview)
+        self._changelog_detail.configure(yscrollcommand=det_sb.set)
+        det_sb.pack(side="right", fill="y")
+        self._changelog_detail.pack(fill="both", expand=True)
+
+        # Internal caches
+        self._changelog_all_commits = []   # [(full_hash, short, date, subject), ...]
+        self._changelog_listbox_index = [] # full_hashes currently visible
+
+        # Auto-load on first build so the tab isn't blank
+        self.after(200, self._changelog_refresh)
+
+    def _changelog_refresh(self):
+        """Fetch the last 100 commits and populate the listbox."""
+        import subprocess
+        self._changelog_status_var.set("Loading…")
+        try:
+            result = subprocess.run(
+                ["git", "log",
+                 "--pretty=format:%H|%h|%ai|%s", "-100"],
+                cwd=str(_REPO_ROOT),
+                capture_output=True, text=True, timeout=15,
+                creationflags=(subprocess.CREATE_NO_WINDOW
+                               if sys.platform == "win32"
+                               and hasattr(subprocess, "CREATE_NO_WINDOW") else 0),
+            )
+        except FileNotFoundError:
+            self._changelog_status_var.set(
+                "git is not on PATH. Install Git for Windows from git-scm.com."
+            )
+            return
+        except Exception as exc:
+            self._changelog_status_var.set(f"git log failed: {exc!r}")
+            return
+        if result.returncode != 0:
+            self._changelog_status_var.set(
+                f"git log returned {result.returncode}: "
+                f"{(result.stderr or '').strip()[:160]}"
+            )
+            return
+        self._changelog_all_commits = []
+        for line in (result.stdout or "").split("\n"):
+            if "|" not in line:
+                continue
+            parts = line.split("|", 3)
+            if len(parts) == 4:
+                self._changelog_all_commits.append(tuple(parts))
+        self._changelog_apply_filter()
+        self._changelog_status_var.set(
+            f"Loaded {len(self._changelog_all_commits)} commits."
+        )
+
+    def _changelog_apply_filter(self):
+        """Rebuild the visible list based on the filter box (substring,
+        case-insensitive against short hash + date + subject)."""
+        q = (self._changelog_filter_var.get() or "").strip().lower()
+        self._changelog_listbox.delete(0, "end")
+        self._changelog_listbox_index = []
+        for full, short, date, subject in self._changelog_all_commits:
+            hay = f"{short} {date[:10]} {subject}".lower()
+            if q and q not in hay:
+                continue
+            self._changelog_listbox_index.append(full)
+            self._changelog_listbox.insert(
+                "end", f"{short}  {date[:10]}  {subject[:80]}"
+            )
+        if self._changelog_listbox_index:
+            self._changelog_listbox.selection_set(0)
+            self._changelog_show_selected()
+        else:
+            self._changelog_set_detail("(no commits match the filter)")
+
+    def _changelog_show_selected(self):
+        sel = self._changelog_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        if idx >= len(self._changelog_listbox_index):
+            return
+        full_hash = self._changelog_listbox_index[idx]
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["git", "show", "--stat", "--patch", "--no-color", full_hash],
+                cwd=str(_REPO_ROOT),
+                capture_output=True, text=True, timeout=30,
+                creationflags=(subprocess.CREATE_NO_WINDOW
+                               if sys.platform == "win32"
+                               and hasattr(subprocess, "CREATE_NO_WINDOW") else 0),
+            )
+            text = result.stdout if result.returncode == 0 else (
+                f"git show failed: {result.stderr.strip()}"
+            )
+        except Exception as exc:
+            text = f"git show error: {exc!r}"
+        # Cap massive diffs so the widget stays responsive
+        if len(text) > 200_000:
+            text = text[:200_000] + "\n\n... (diff truncated)"
+        self._changelog_set_detail(text)
+
+    def _changelog_set_detail(self, text: str):
+        self._changelog_detail.configure(state="normal")
+        self._changelog_detail.delete("1.0", "end")
+        self._changelog_detail.insert("1.0", text)
+        self._changelog_detail.configure(state="disabled")
 
     def _build_speech_tab(self):
         self.tab_speech = ttk.Frame(self.nb)
