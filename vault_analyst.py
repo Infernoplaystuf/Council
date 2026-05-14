@@ -249,6 +249,194 @@ def list_parquet_files(data_folder: Any, recursive: bool = True) -> List[Path]:
     return _drop_protected(sorted({p.resolve() for p in out}), folders)
 
 
+def list_duckdb_files(data_folder: Any, recursive: bool = True) -> List[Path]:
+    """All DuckDB databases under the given folder(s), deduped."""
+    folders = normalize_data_folders(data_folder)
+    out: List[Path] = []
+    for folder in folders:
+        if recursive:
+            out.extend(sorted(folder.rglob("*.duckdb")))
+        else:
+            out.extend(sorted(folder.glob("*.duckdb")))
+    return _drop_protected(sorted({p.resolve() for p in out}), folders)
+
+
+def list_bson_files(data_folder: Any, recursive: bool = True) -> List[Path]:
+    """All BSON (MongoDB) files under the given folder(s), deduped."""
+    folders = normalize_data_folders(data_folder)
+    out: List[Path] = []
+    for folder in folders:
+        if recursive:
+            out.extend(sorted(folder.rglob("*.bson")))
+        else:
+            out.extend(sorted(folder.glob("*.bson")))
+    return _drop_protected(sorted({p.resolve() for p in out}), folders)
+
+
+# ============================================================
+# DuckDB helpers
+# ============================================================
+
+def list_duckdb_tables(path: Any) -> List[str]:
+    """Return all table names in a DuckDB database (read-only)."""
+    import duckdb
+    con = duckdb.connect(str(Path(path)), read_only=True)
+    try:
+        return [r[0] for r in con.execute(
+            "SELECT table_name FROM duckdb_tables() ORDER BY table_name"
+        ).fetchall() if r and r[0]]
+    finally:
+        con.close()
+
+
+def read_duckdb_table(path: Any, table: str, *, limit: Optional[int] = None) -> pd.DataFrame:
+    """Read a DuckDB table as a DataFrame (read-only)."""
+    import duckdb
+    qname = '"' + str(table).replace('"', '""') + '"'
+    sql = f"SELECT * FROM {qname}"
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    con = duckdb.connect(str(Path(path)), read_only=True)
+    try:
+        return con.execute(sql).fetch_df()
+    finally:
+        con.close()
+
+
+def duckdb_query(path: Any, sql: str) -> pd.DataFrame:
+    """Run an arbitrary read-only SQL query against a DuckDB file.
+
+    DuckDB shines here — it can SELECT directly from CSV/Parquet/JSON
+    files with `read_csv('path')` / `read_parquet('path')` inside the
+    SQL, so this single helper unlocks SQL queries over your vault.
+    """
+    import duckdb
+    con = duckdb.connect(str(Path(path)), read_only=True)
+    try:
+        return con.execute(sql).fetch_df()
+    finally:
+        con.close()
+
+
+# ============================================================
+# BSON helpers (MongoDB)
+# ============================================================
+
+def read_bson_documents(path: Any) -> List[Dict[str, Any]]:
+    """Decode a .bson file into a list of documents (dicts)."""
+    import bson
+    with open(Path(path), "rb") as fh:
+        data = fh.read()
+    return list(bson.decode_all(data))
+
+
+def read_bson_as_df(path: Any) -> pd.DataFrame:
+    """Decode a .bson file into a flat DataFrame. Nested fields stay
+    as their native Python types in each column."""
+    docs = read_bson_documents(path)
+    return pd.json_normalize(docs) if docs else pd.DataFrame()
+
+
+# ============================================================
+# SQLAlchemy bridge — remote SQL databases (Postgres / MySQL / MSSQL / etc.)
+# ============================================================
+
+# Connection registry persists in vault/sql_connections.json. Plain JSON
+# so the user can edit it by hand. NEVER stores raw passwords — users
+# put credentials in env vars and reference them like
+# `postgresql://user:${PGPASS}@host/db`.
+
+import json as _json
+
+_SQL_CONN_FILENAME = "sql_connections.json"
+
+
+def _sql_conn_path(vault_dir: Any) -> Path:
+    return Path(vault_dir) / _SQL_CONN_FILENAME
+
+
+def list_sql_connections(vault_dir: Any) -> Dict[str, str]:
+    """Return the saved {name: url} mapping (empty if none)."""
+    p = _sql_conn_path(vault_dir)
+    if not p.exists():
+        return {}
+    try:
+        data = _json.loads(p.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items()}
+    except Exception:
+        return {}
+    return {}
+
+
+def save_sql_connection(vault_dir: Any, name: str, url: str) -> None:
+    """Save a named SQLAlchemy connection URL.
+
+    The URL is stored verbatim — put `${PG_PASS}`-style placeholders in
+    it and the resolver will substitute env vars at connect time.
+    """
+    p = _sql_conn_path(vault_dir)
+    existing = list_sql_connections(vault_dir)
+    existing[str(name)] = str(url)
+    p.write_text(_json.dumps(existing, indent=2), encoding="utf-8")
+
+
+def _resolve_sql_url(url: str) -> str:
+    """Expand ${ENV_VAR} placeholders against os.environ."""
+    import os as _os
+    import re as _re
+    def _sub(m):
+        return _os.environ.get(m.group(1), m.group(0))
+    return _re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", _sub, url)
+
+
+def list_sql_tables(vault_dir: Any, conn_name: str) -> List[str]:
+    """Inspect a named connection and return its table names."""
+    import sqlalchemy
+    urls = list_sql_connections(vault_dir)
+    if conn_name not in urls:
+        raise KeyError(f"unknown SQL connection: {conn_name}")
+    eng = sqlalchemy.create_engine(_resolve_sql_url(urls[conn_name]))
+    insp = sqlalchemy.inspect(eng)
+    try:
+        names = list(insp.get_table_names())
+    finally:
+        eng.dispose()
+    return sorted(names)
+
+
+def read_sql_table(
+    vault_dir: Any, conn_name: str, table: str, *, limit: Optional[int] = None,
+) -> pd.DataFrame:
+    """Pull a remote SQL table into a DataFrame using a saved connection."""
+    import sqlalchemy
+    urls = list_sql_connections(vault_dir)
+    if conn_name not in urls:
+        raise KeyError(f"unknown SQL connection: {conn_name}")
+    eng = sqlalchemy.create_engine(_resolve_sql_url(urls[conn_name]))
+    qname = '"' + str(table).replace('"', '""') + '"'
+    sql = f"SELECT * FROM {qname}"
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    try:
+        return pd.read_sql_query(sql, eng)
+    finally:
+        eng.dispose()
+
+
+def sql_query(vault_dir: Any, conn_name: str, sql: str) -> pd.DataFrame:
+    """Run an arbitrary SQL query through a saved connection."""
+    import sqlalchemy
+    urls = list_sql_connections(vault_dir)
+    if conn_name not in urls:
+        raise KeyError(f"unknown SQL connection: {conn_name}")
+    eng = sqlalchemy.create_engine(_resolve_sql_url(urls[conn_name]))
+    try:
+        return pd.read_sql_query(sql, eng)
+    finally:
+        eng.dispose()
+
+
 def read_excel_sheets(path: Any) -> Dict[str, pd.DataFrame]:
     """Read every sheet of an Excel workbook into a dict {sheet_name: df}."""
     p = Path(path)
@@ -1536,6 +1724,20 @@ def execute_pandas_code(
         "detect_data_quality_issues":         detect_data_quality_issues,
         "detect_data_quality_issues_per_csv": detect_data_quality_issues_per_csv,
         "split_csv_by_column":                split_csv_by_column,
+        # DuckDB
+        "list_duckdb_files":   list_duckdb_files,
+        "list_duckdb_tables":  list_duckdb_tables,
+        "read_duckdb_table":   read_duckdb_table,
+        "duckdb_query":        duckdb_query,
+        # BSON / MongoDB
+        "list_bson_files":     list_bson_files,
+        "read_bson_documents": read_bson_documents,
+        "read_bson_as_df":     read_bson_as_df,
+        # SQLAlchemy bridge
+        "list_sql_connections": list_sql_connections,
+        "list_sql_tables":      list_sql_tables,
+        "read_sql_table":       read_sql_table,
+        "sql_query":            sql_query,
     }
     if np is not None:
         globals_dict["np"] = np
@@ -1660,6 +1862,28 @@ Data quality + splitter:
   detect_data_quality_issues_per_csv(folder)
   split_csv_by_column(path, column, output_dir)
     writes one CSV per distinct value of `column`
+
+DuckDB (file-based analytical SQL):
+  list_duckdb_files(folder, recursive=True)
+  list_duckdb_tables(path)
+  read_duckdb_table(path, table, limit=None)
+  duckdb_query(path, sql)
+    DuckDB can SELECT directly from CSV/Parquet/JSON files inside the
+    SQL — e.g. duckdb_query(db, "SELECT * FROM read_csv('data.csv')").
+
+BSON / MongoDB:
+  list_bson_files(folder, recursive=True)
+  read_bson_documents(path)    # -> list[dict]
+  read_bson_as_df(path)        # -> DataFrame (pd.json_normalize)
+
+Remote SQL via SQLAlchemy:
+  list_sql_connections(vault_dir)    # -> {name: url}
+  list_sql_tables(vault_dir, conn_name)
+  read_sql_table(vault_dir, conn_name, table, limit=None)
+  sql_query(vault_dir, conn_name, sql)
+  Connections saved to vault/sql_connections.json. URLs can use
+  ${ENV_VAR} placeholders resolved at connect time — keeps passwords
+  out of the JSON file.
 
 Rules:
 - Assign the final answer to a DataFrame named `result_df`.

@@ -168,8 +168,13 @@ _EXCEL_SUFFIXES = {".xlsx", ".xls", ".xlsm"}
 _TABULAR_EXTRA  = {".tsv", ".parquet"}     # parquet needs pyarrow at runtime
 # SQLite databases (.db / .sqlite / .sqlite3) — indexed at the table level
 _SQLITE_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
+# DuckDB (`.duckdb`) is parsed via the optional duckdb package
+_DUCKDB_SUFFIXES = {".duckdb"}
+# MongoDB dump format (.bson — binary JSON, one or more documents)
+_BSON_SUFFIXES = {".bson"}
 _PARSEABLE = ({".csv", ".json"} | _TEXT_SUFFIXES | _EXCEL_SUFFIXES
-              | _TABULAR_EXTRA | _SQLITE_SUFFIXES)
+              | _TABULAR_EXTRA | _SQLITE_SUFFIXES
+              | _DUCKDB_SUFFIXES | _BSON_SUFFIXES)
 
 
 def _is_gz_csv(p: Path) -> bool:
@@ -432,6 +437,140 @@ def _sql_quote(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
+def _parse_bson(p: Path) -> Dict[str, Any]:
+    """Parse a MongoDB .bson file — concatenated binary BSON documents.
+
+    Treats each document as a row. Extracts top-level field names (akin
+    to columns) and a sample of values for keyword indexing. Needs the
+    `bson` package (ships with `pymongo`); gracefully degrades when
+    missing.
+    """
+    keys: Set[str] = set()
+    sample_docs: List[str] = []
+    keywords: Set[str] = set()
+    total_docs = 0
+    try:
+        try:
+            import bson as _bson
+        except Exception as exc:
+            return {
+                "type": "bson",
+                "keys": [],
+                "sample_text": "",
+                "keywords": [],
+                "_note": f"install pymongo to enable BSON parsing: {exc!r}",
+            }
+
+        with open(p, "rb") as fh:
+            data = fh.read()
+        try:
+            docs = list(_bson.decode_all(data))
+        except Exception as exc:
+            return {
+                "type": "bson",
+                "keys": [],
+                "sample_text": "",
+                "keywords": [],
+                "_note": f"could not decode BSON: {exc!r}",
+            }
+        total_docs = len(docs)
+
+        def _walk(node, depth=0):
+            if depth > 4:
+                return
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    keys.add(str(k))
+                    _walk(v, depth + 1)
+            elif isinstance(node, list):
+                for item in node[:25]:
+                    _walk(item, depth + 1)
+            elif isinstance(node, str):
+                if 1 <= len(node) < 80:
+                    keywords.update(_tokenize(node))
+
+        for i, doc in enumerate(docs[:500]):
+            _walk(doc)
+            if i < 5:
+                try:
+                    sample_docs.append(
+                        json.dumps(doc, default=str, ensure_ascii=False)[:200]
+                    )
+                except Exception:
+                    sample_docs.append(repr(doc)[:200])
+            if len(keywords) > 5000:
+                break
+        keywords.update(_tokenize(" ".join(keys)))
+    except Exception as exc:
+        return {
+            "type": "bson",
+            "keys": [],
+            "sample_text": "",
+            "keywords": [],
+            "_note": f"bson read failed: {exc!r}",
+        }
+    return {
+        "type":        "bson",
+        "keys":        sorted(keys)[:120],
+        "doc_count":   total_docs,
+        "sample_text": "\n".join(sample_docs)[:1200],
+        "keywords":    sorted(keywords)[:300],
+    }
+
+
+def _parse_duckdb(p: Path) -> Dict[str, Any]:
+    """Parse a DuckDB database file — read-only.
+
+    Indexes table names + per-table column names. Mirrors _parse_sqlite
+    so search treats both the same.
+    """
+    tables: List[Dict[str, Any]] = []
+    keywords: Set[str] = set()
+    try:
+        try:
+            import duckdb as _duckdb
+        except Exception as exc:
+            return {
+                "type":     "duckdb",
+                "tables":   [],
+                "keywords": [],
+                "_note":    f"install duckdb to enable: {exc!r}",
+            }
+        con = _duckdb.connect(str(p), read_only=True)
+        try:
+            tnames = [r[0] for r in con.execute(
+                "SELECT table_name FROM duckdb_tables() "
+                "ORDER BY table_name LIMIT 50"
+            ).fetchall() if r and r[0]]
+            keywords.update(_tokenize(" ".join(tnames)))
+            for tname in tnames[:30]:
+                qname = '"' + tname.replace('"', '""') + '"'
+                try:
+                    cols = [r[1] for r in con.execute(
+                        f"DESCRIBE {qname}"
+                    ).fetchall() if r and r[1]]
+                except Exception:
+                    cols = []
+                keywords.update(_tokenize(" ".join(cols)))
+                try:
+                    nrows = con.execute(f"SELECT COUNT(*) FROM {qname}").fetchone()[0]
+                except Exception:
+                    nrows = None
+                tables.append({"table": tname, "columns": cols, "rows": nrows})
+        finally:
+            con.close()
+    except Exception as exc:
+        return {
+            "type": "duckdb", "tables": [], "keywords": [],
+            "_note": f"duckdb read failed: {exc!r}",
+        }
+    return {
+        "type":     "duckdb",
+        "tables":   tables,
+        "keywords": sorted(keywords)[:2000],
+    }
+
+
 def _parse_text(p: Path, suffix: str) -> Dict[str, Any]:
     text = ""
     try:
@@ -462,6 +601,10 @@ def _index_file(p: Path) -> Optional[Dict[str, Any]]:
         rec = _parse_excel(p)
     elif suffix in _SQLITE_SUFFIXES:
         rec = _parse_sqlite(p)
+    elif suffix in _DUCKDB_SUFFIXES:
+        rec = _parse_duckdb(p)
+    elif suffix in _BSON_SUFFIXES:
+        rec = _parse_bson(p)
     elif suffix in _TEXT_SUFFIXES:
         rec = _parse_text(p, suffix)
     else:
@@ -957,8 +1100,8 @@ class VaultIndex:
             if rec.get("sample_rows"):
                 lines.append("sample rows:")
                 lines.extend(rec["sample_rows"][:3])
-        elif rtype == "sqlite":
-            lines.append("type: sqlite")
+        elif rtype in ("sqlite", "duckdb"):
+            lines.append(f"type: {rtype}")
             tables = rec.get("tables", []) or []
             lines.append(f"tables ({len(tables)}):")
             for t in tables[:8]:
@@ -966,6 +1109,15 @@ class VaultIndex:
                 nrows = t.get("rows")
                 lines.append(f"  - {t.get('table','?')} "
                              f"({nrows if nrows is not None else '?'} rows): {cols}")
+        elif rtype == "bson":
+            lines.append("type: bson (MongoDB)")
+            if rec.get("doc_count") is not None:
+                lines.append(f"documents: {rec['doc_count']}")
+            if rec.get("keys"):
+                lines.append("fields: " + ", ".join(map(str, rec["keys"][:30])))
+            if rec.get("sample_text"):
+                lines.append("sample:")
+                lines.append(rec["sample_text"][:600])
         elif rtype == "json":
             lines.append("type: json")
             if rec.get("keys"):

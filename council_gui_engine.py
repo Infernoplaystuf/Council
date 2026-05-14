@@ -365,6 +365,101 @@ def _render_sqlite_block(p):
     return '\n'.join(lines).rstrip()
 
 
+def _render_duckdb_block(p):
+    """DuckDB database — read-only listing of tables + columns + samples."""
+    lines = [
+        "(DuckDB database — already parsed into plain text below. "
+        "Each table is shown with its columns and a few sample rows.)",
+    ]
+    try:
+        import duckdb as _duckdb
+    except Exception as exc:
+        return ("(DuckDB file — install duckdb with `pip install duckdb` "
+                f"to view: {exc!r})")
+    try:
+        con = _duckdb.connect(str(p), read_only=True)
+        try:
+            tnames = [r[0] for r in con.execute(
+                "SELECT table_name FROM duckdb_tables() "
+                "ORDER BY table_name LIMIT 20"
+            ).fetchall() if r and r[0]]
+            lines.append(f"Tables ({len(tnames)}): " + ', '.join(tnames))
+            lines.append("")
+            for tname in tnames[:10]:
+                qname = '"' + tname.replace('"', '""') + '"'
+                try:
+                    rows = con.execute(f"DESCRIBE {qname}").fetchall()
+                    cols = [r[1] for r in rows if r and r[1]]
+                except Exception:
+                    cols = []
+                try:
+                    nrows = con.execute(f"SELECT COUNT(*) FROM {qname}").fetchone()[0]
+                except Exception:
+                    nrows = None
+                lines.append(f'Table "{tname}" ({nrows if nrows is not None else "?"} rows):')
+                lines.append("  columns: " + ', '.join(cols))
+                try:
+                    sample = con.execute(
+                        f"SELECT * FROM {qname} LIMIT 5"
+                    ).fetchall()
+                    if sample:
+                        lines.append("  rows:")
+                        for r in sample:
+                            cells = []
+                            for v in r:
+                                cv = str(v).replace('\n', ' ').strip()
+                                if len(cv) > 80:
+                                    cv = cv[:77] + '...'
+                                cells.append(cv)
+                            lines.append('    ' + ' | '.join(cells))
+                except Exception:
+                    pass
+                lines.append("")
+        finally:
+            con.close()
+    except Exception as exc:
+        lines.append(f"(could not open database: {exc!r})")
+    return '\n'.join(lines).rstrip()
+
+
+def _render_bson_block(p):
+    """MongoDB BSON dump — list field names and a few sample documents."""
+    lines = [
+        "(MongoDB BSON file — already parsed into plain text below. "
+        "Each line below is one document.)",
+    ]
+    try:
+        import bson as _bson
+    except Exception as exc:
+        return ("(BSON file — install pymongo with `pip install pymongo` "
+                f"to view: {exc!r})")
+    try:
+        with open(p, "rb") as fh:
+            data = fh.read()
+        docs = _bson.decode_all(data)
+    except Exception as exc:
+        return f"(BSON read failed: {exc!r})"
+    lines.append(f"Total documents: {len(docs)}")
+    # Field-name summary
+    keys = set()
+    for d in docs[:200]:
+        if isinstance(d, dict):
+            keys.update(d.keys())
+    lines.append("Fields: " + ", ".join(sorted(map(str, keys))[:30]))
+    lines.append("")
+    lines.append("Sample documents:")
+    import json as _j
+    for i, d in enumerate(docs[:10]):
+        try:
+            line = _j.dumps(d, default=str, ensure_ascii=False)
+        except Exception:
+            line = repr(d)
+        if len(line) > 300:
+            line = line[:297] + "..."
+        lines.append(f"  {i+1}. {line}")
+    return '\n'.join(lines)
+
+
 def _read_file_for_injection(path_str):
     """Read a file into a compact prompt block. CSVs get headers + sample
     rows; large rows are abbreviated so the header line always survives the
@@ -432,6 +527,10 @@ def _read_file_for_injection(path_str):
             content = _render_dataframe_block('Gzipped CSV', df)
         elif suffix in ('.db', '.sqlite', '.sqlite3'):
             content = _render_sqlite_block(p)
+        elif suffix == '.duckdb':
+            content = _render_duckdb_block(p)
+        elif suffix == '.bson':
+            content = _render_bson_block(p)
         elif suffix in ('.xlsx', '.xls', '.xlsm'):
             # Excel workbook — already parsed into plain text below. The
             # model should treat each sheet exactly like a CSV table; the
@@ -3543,6 +3642,14 @@ class CouncilConsole(tk.Tk):
         r"(?:answer|response|reply)\s*[.!?]?\s*$",
         _re.IGNORECASE,
     )
+    _LIST_SQL_CONNS_RE = _re.compile(
+        r"^\s*(?:list|show)\s+(?:my\s+|the\s+)?sql\s+connections?\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+    _ADD_SQL_CONN_RE = _re.compile(
+        r"^\s*(?:add|save|register)\s+sql\s+connection\s+(\S+)\s+(\S+)\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
 
     def _handle_vault_tools_intent(self, user_text: str) -> bool:
         if not user_text:
@@ -3618,7 +3725,55 @@ class CouncilConsole(tk.Tk):
             self._where_value_response(value)
             return True
 
+        if self._LIST_SQL_CONNS_RE.match(single_line):
+            self._list_sql_connections_response()
+            return True
+
+        m = self._ADD_SQL_CONN_RE.match(single_line)
+        if m:
+            self._add_sql_connection_response(m.group(1), m.group(2))
+            return True
+
         return False
+
+    def _list_sql_connections_response(self):
+        import vault_analyst as _va
+        conns = _va.list_sql_connections(VAULT_DIR)
+        if not conns:
+            self._append_transcript(
+                "Writer",
+                "No saved SQL connections.\nAdd one with:\n"
+                "  add sql connection myname postgresql://user:${PGPASS}@host/db",
+                "final",
+            )
+        else:
+            lines = [f"{len(conns)} saved SQL connection(s):"]
+            for name, url in sorted(conns.items()):
+                # Mask anything that looks like a password in the URL preview
+                masked = _re.sub(r"://[^/@:]+:([^@]+)@", "://USER:***@", url)
+                lines.append(f"  • {name}  ->  {masked}")
+            self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
+    def _add_sql_connection_response(self, name: str, url: str):
+        import vault_analyst as _va
+        try:
+            _va.save_sql_connection(VAULT_DIR, name, url)
+        except Exception as exc:
+            self._append_transcript(
+                "Writer", f"Couldn't save connection: {exc!r}", "final",
+            )
+            self._set_status("● idle")
+            return
+        masked = _re.sub(r"://[^/@:]+:([^@]+)@", "://USER:***@", url)
+        self._append_transcript(
+            "Writer",
+            f"Saved SQL connection '{name}' = {masked}\n"
+            f"Use it from the analyst with read_sql_table(vault, "
+            f"'{name}', 'tablename') or sql_query(vault, '{name}', 'SELECT ...').",
+            "final",
+        )
+        self._set_status("● idle")
 
     def _show_last_context_response(self):
         """Print the [FILE: ...] blocks the model saw in the last turn."""
