@@ -1482,9 +1482,14 @@ def _infer_column_kind(s: pd.Series, *, sample_size: int = 200) -> str:
     if pd.api.types.is_integer_dtype(s):
         return "integer"
     if pd.api.types.is_float_dtype(s):
-        coerced = pd.to_numeric(s.dropna(), errors="coerce")
-        if not coerced.empty and (coerced == coerced.astype("Int64")).all():
-            return "integer (stored as float)"
+        non_null = s.dropna()
+        if not non_null.empty:
+            try:
+                # Safe whole-number check — % 1 == 0 works for any float
+                if ((non_null % 1) == 0).all():
+                    return "integer (stored as float)"
+            except Exception:
+                pass
         return "float"
     if pd.api.types.is_datetime64_any_dtype(s):
         return "datetime"
@@ -1515,8 +1520,12 @@ def _infer_column_kind(s: pd.Series, *, sample_size: int = 200) -> str:
     # Try numeric coercion
     coerced = pd.to_numeric(sample, errors="coerce")
     if coerced.notna().mean() > 0.9:
-        if (coerced.dropna() == coerced.dropna().astype("Int64")).all():
-            return "integer (text-encoded)"
+        valid = coerced.dropna()
+        try:
+            if not valid.empty and ((valid % 1) == 0).all():
+                return "integer (text-encoded)"
+        except Exception:
+            pass
         return "float (text-encoded)"
     # Categorical if low cardinality
     nunique = s.nunique(dropna=True)
