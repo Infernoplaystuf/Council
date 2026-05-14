@@ -262,8 +262,8 @@ def find_files_with_column(
                         df = xl.parse(sname, nrows=0)
                         cols = [str(c) for c in df.columns]
                         matches = [c for c in cols
-                                   if (needle in c.lower()) if fuzzy
-                                   else c.lower() == needle]
+                                   if (needle in c.lower() if fuzzy
+                                       else c.lower() == needle)]
                         if matches:
                             out.append({
                                 "path": str(p.relative_to(folder)),
