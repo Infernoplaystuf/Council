@@ -1222,36 +1222,91 @@ def _run_analyst_step(query):
     """If `query` looks computational, generate pandas code via a local model
     and execute it sandboxed against the vault's data_in/ folder.
 
-    Returns ``(block, error_msg)``:
-      • ``(None, None)``           — query isn't computational; no analyst.
-      • ``(success_block, None)``  — code executed; block holds the result.
-      • ``(failure_block, msg)``   — analyst was attempted but failed.
-        ``failure_block`` is still safe to inject — it tells the model to
-        REFUSE to invent values for the failed computation, and ``msg`` is
-        a one-line summary the caller can show in the transcript so the
-        user knows the analyst tried and got blocked.
-
-    The failure-block path is critical: without it the analyst silently
-    falls back to model freeform when its sandbox raises, and the model
-    then invents numbers from training-data memory.
+    Returns ``(block, error_msg, notices)``:
+      • ``(None, None, [])``             — query isn't computational.
+      • ``(success_block, None, [n…])``  — code executed; notices is a
+        list of short human-friendly strings about how the analyst
+        resolved filename / subfolder references (so the user can spot
+        wrong matches: "I asked about sales.csv but the analyst picked
+        Sales_Q3_2024.csv").
+      • ``(failure_block, msg, [n…])``   — analyst was attempted but
+        failed. The failure block carries an explicit refusal directive
+        so the Writer doesn't invent a number; ``msg`` is a one-line
+        summary the caller posts to the transcript.
     """
     import sys as _sys_dbg
+    notices: list = []
     try:
         import vault_analyst as _va
     except Exception as _e:
         print('[analyst] import failed: ' + repr(_e), file=_sys_dbg.stderr)
-        return None, None
+        return None, None, notices
 
     if not _va.looks_computational(query):
-        return None, None
+        return None, None, notices
 
     try:
         allowed_folders = [data_index.input_dir(VAULT_DIR)]
     except Exception:
         allowed_folders = [VAULT_DIR]
 
+    # ── Upgrade A+B: pre-resolve filename + subfolder hints ──────────
+    # Before sending the prompt to the model, look for explicit
+    # filename references ("sales.csv", quoted strings) and folder
+    # references ("in the test_data folder") in the user's question.
+    # Resolve them against the actual on-disk inventory so the model
+    # sees the real paths instead of guessing — guesses are how
+    # FileNotFoundError / wrong-file-grabbed failures used to creep in.
+    base_folder = allowed_folders[0] if allowed_folders else None
+    scope_folder = None
+    if base_folder is not None:
+        try:
+            scope_folder = _va.resolve_subfolder_hint(query, base_folder)
+        except Exception as _e:
+            print('[analyst] subfolder resolve failed: ' + repr(_e),
+                  file=_sys_dbg.stderr)
+    if scope_folder is not None:
+        allowed_folders = [scope_folder]
+        try:
+            rel = scope_folder.relative_to(base_folder) if base_folder else scope_folder
+        except Exception:
+            rel = scope_folder
+        notices.append(f"Analyst scoped to subfolder: {rel}")
+        print('[analyst] scope restricted to: ' + str(scope_folder),
+              file=_sys_dbg.stderr)
+
+    filename_hints_pairs = []
+    try:
+        filename_hints_pairs = _va.resolve_filename_hints(query, allowed_folders)
+    except Exception as _e:
+        print('[analyst] filename hint resolve failed: ' + repr(_e),
+              file=_sys_dbg.stderr)
+    filename_hints_text = ""
+    if filename_hints_pairs:
+        # Build a one-line summary for the transcript so the user can spot
+        # a wrong match before reading the answer. Multiple resolutions
+        # are joined with "; " — typically there are 1-3.
+        bits: list = []
+        for tok, resolved in filename_hints_pairs:
+            if resolved is None:
+                bits.append(f"'{tok}' → no match")
+            else:
+                bits.append(f"'{tok}' → {resolved.name}")
+        notices.append("Filename hints: " + "; ".join(bits))
+
+        filename_hints_text = _va.format_filename_hints(
+            filename_hints_pairs,
+            base_folder=allowed_folders[0] if allowed_folders else None,
+        )
+        print('[analyst] filename hints:\n' + filename_hints_text,
+              file=_sys_dbg.stderr)
+
     inventory = _va.preview_csv_inventory(allowed_folders, max_files=15, max_cols=30)
-    prompt = _va.build_pandas_code_prompt(query, allowed_folders, inventory)
+    prompt = _va.build_pandas_code_prompt(
+        query, allowed_folders, inventory,
+        filename_hints=filename_hints_text or None,
+        subfolder_scope=scope_folder,
+    )
 
     try:
         import council_engine as _ce
@@ -1265,13 +1320,13 @@ def _run_analyst_step(query):
     except Exception as _e:
         msg = f"code generation failed: {_e!r}"
         print('[analyst] ' + msg, file=_sys_dbg.stderr)
-        return _build_analyst_failure_block("(no code generated)", msg), msg
+        return _build_analyst_failure_block("(no code generated)", msg), msg, notices
 
     code = _va.extract_python_code(raw)
     if not code.strip():
         msg = "the model produced no executable pandas code"
         print('[analyst] empty code from model', file=_sys_dbg.stderr)
-        return _build_analyst_failure_block("(empty)", msg), msg
+        return _build_analyst_failure_block("(empty)", msg), msg, notices
     print('[analyst] generated code (first 300):\n' + code[:300], file=_sys_dbg.stderr)
 
     result_df, log = _va.execute_pandas_code(code, allowed_folders)
@@ -1280,7 +1335,7 @@ def _run_analyst_step(query):
         # The full log keeps the entire traceback for debugging in the block.
         first_err = _summarise_analyst_error(log)
         print('[analyst] exec failed: ' + log[:400], file=_sys_dbg.stderr)
-        return _build_analyst_failure_block(code, log), first_err
+        return _build_analyst_failure_block(code, log), first_err, notices
 
     table_text = _va.format_result_for_prompt(result_df, max_rows=30, max_chars=4000)
     block = (
@@ -1289,7 +1344,7 @@ def _run_analyst_step(query):
         + 'output:\n' + table_text + '\n'
         + '[END ANALYST]'
     )
-    return block, None
+    return block, None, notices
 
 
 def _summarise_analyst_error(log: str) -> str:
@@ -10533,7 +10588,12 @@ class CouncilConsole(tk.Tk):
         # explicitly refuses any invented numeric answer instead of falling
         # back to model freeform — that's how the cross-machine
         # hallucination used to creep back in.
-        _analyst_block, _analyst_err = _run_analyst_step(original_user_text)
+        _analyst_block, _analyst_err, _analyst_notices = _run_analyst_step(original_user_text)
+        # Surface resolver notices FIRST so the user sees what the analyst
+        # interpreted before the result / error message — that order makes
+        # it obvious when the analyst grabbed the wrong file or scope.
+        for _note in (_analyst_notices or []):
+            self._append_transcript("Council", _note, "observation")
         if _analyst_block and not _analyst_err:
             self._append_transcript("Council", "Computing from data...", "observation")
         elif _analyst_err:

@@ -2593,15 +2593,37 @@ def execute_pandas_code(
 # Code generation prompt
 # ============================================================
 
-def build_pandas_code_prompt(question: str, data_folders: List[Path], inventory: str) -> str:
+def build_pandas_code_prompt(
+    question: str,
+    data_folders: List[Path],
+    inventory: str,
+    filename_hints: Optional[str] = None,
+    subfolder_scope: Optional[Path] = None,
+) -> str:
     folder_lines = "\n".join(f"- {p}" for p in data_folders)
+    # When the analyst pre-resolved filename references or restricted the
+    # search scope, surface that context to the model BEFORE the inventory
+    # so a fuzzy reference like "sales report" is mapped to the real file
+    # and the model never gets a chance to invent a wrong path.
+    scope_note = ""
+    if subfolder_scope is not None:
+        scope_note = (
+            "\nSCOPE — The user mentioned a subfolder. The analyst has "
+            "restricted DATA_FOLDERS to:\n"
+            f"  {subfolder_scope}\n"
+            "Read files from this scope only. Do NOT scan the broader "
+            "vault.\n"
+        )
+    hint_note = ""
+    if filename_hints:
+        hint_note = "\n" + filename_hints + "\n"
     return f"""You are writing a single pandas snippet that answers the user's question
 about CSV files in their vault. Output ONLY executable Python code — no
 markdown fences, no commentary, no explanation.
 
 User question:
 {question}
-
+{scope_note}{hint_note}
 Available data folders:
 {folder_lines}
 
@@ -2802,6 +2824,331 @@ def looks_computational(query: str) -> bool:
     """Heuristic: does the user's question want a numeric/aggregate answer?"""
     q = (query or "").lower()
     return any(kw in q for kw in _COMPUTE_KEYWORDS)
+
+
+# ============================================================
+# Filename + subfolder hint resolution
+# ============================================================
+# Two helpers used by the analyst step BEFORE it builds the model
+# prompt:
+#
+#   resolve_subfolder_hint(query, base_folder) — if the user said
+#       something like "in the test_data folder" / "inside projects/"
+#       and a real subfolder matches, return its path so the analyst
+#       restricts its scope. The inventory the model sees becomes
+#       smaller and more relevant, eliminating cross-folder accidents
+#       where the model grabs an unrelated CSV by name match.
+#
+#   resolve_filename_hints(query, allowed_folders) — extract any
+#       filename-shaped or filename-like tokens from the user's
+#       question and fuzzy-match each against the actual file listing.
+#       Returns (user_token → resolved_path) pairs so the prompt
+#       builder can tell the model "the user said 'sales report' but
+#       the actual file is 'Sales_Q3_2024.csv'."
+#
+# Both are intentionally cheap and dependency-free (regex + difflib
+# only) — they run on every analyst call and must not slow the
+# pipeline down.
+
+import difflib as _difflib
+import re as _re_va
+
+
+# Tokens that look like real English words rather than file references —
+# excluded from fuzzy filename matching so "average" / "column" / etc.
+# don't accidentally resolve to a similarly-spelled CSV.
+_COMMON_WORD_DENYLIST = frozenset({
+    "average", "column", "columns", "value", "values", "data",
+    "table", "tables", "row", "rows", "file", "files", "folder",
+    "folders", "vault", "report", "reports", "summary", "summaries",
+    "result", "results", "answer", "calculate", "compute", "find",
+    "show", "list", "give", "tell", "what", "where", "which", "many",
+    "much", "total", "count", "average", "sum", "mean", "median",
+    "min", "max", "the", "this", "that", "these", "those", "and",
+    "but", "with", "without", "from", "into", "onto", "over", "under",
+    "above", "below", "near", "containing", "contains", "include",
+    "includes", "exclude", "excludes", "excluding", "including",
+    "specific", "general", "across", "every", "each", "all", "any",
+    "have", "has", "are", "was", "were", "been", "being", "for",
+})
+
+_FILENAME_TOKEN_RE = _re_va.compile(
+    # Tokens that look like filenames: word chars / dashes / underscores
+    # / dots, with a recognised data-file extension.
+    r"\b([\w\-\.]+\.(?:csv|tsv|xlsx?|xlsm|parquet|json|sqlite3?|db|"
+    r"duckdb|bson|h5|hdf5|d3dpipeline|gz))\b",
+    _re_va.IGNORECASE,
+)
+
+_QUOTED_TOKEN_RE = _re_va.compile(
+    # Anything in single, double, or backtick quotes — these are usually
+    # the user trying to refer to a specific file by name.
+    r"""['"`]([^'"`\n]{2,80})['"`]""",
+)
+
+_SUBFOLDER_HINT_RE = _re_va.compile(
+    # "(in|inside|under|within|from) [the] [<noun>] <name>"
+    # where <noun> is folder/directory/subfolder/subdirectory (optional).
+    r"\b(?:in|inside|under|within|from)\s+"
+    r"(?:my\s+|the\s+|our\s+)?"
+    r"(?:folder\s+|directory\s+|dir\s+|subfolder\s+|subdirectory\s+)?"
+    # Capture group: a path-like token, no spaces, allowed chars are
+    # word chars, dot, dash, slash, backslash. Length-bounded to avoid
+    # eating most of the sentence.
+    r"([A-Za-z0-9_][A-Za-z0-9_\-./\\]{0,80})"
+    r"(?:\s+(?:folder|directory|subfolder|subdirectory))?\b",
+    _re_va.IGNORECASE,
+)
+
+
+def _extract_candidate_filename_tokens(query: str) -> List[str]:
+    """Pull every plausible filename reference out of the user's text.
+
+    Returns a list of strings in the order they appear, deduplicated
+    case-insensitively. Catches:
+      • Explicit filenames with extensions (sales.csv, Q3_data.xlsx)
+      • Quoted strings ("Sales Report", 'Q3-2024')
+    Strips trailing punctuation. Common English words are filtered out.
+    """
+    if not query:
+        return []
+    seen: set = set()
+    out: list = []
+
+    # 1) Explicit filename-with-extension matches
+    for m in _FILENAME_TOKEN_RE.finditer(query):
+        tok = m.group(1).strip(".,;:!?)(\"' `")
+        key = tok.lower()
+        if key and key not in seen and key not in _COMMON_WORD_DENYLIST:
+            seen.add(key)
+            out.append(tok)
+
+    # 2) Quoted strings — could be a filename without an extension, or
+    #    a multi-word reference like "Q3 sales"
+    for m in _QUOTED_TOKEN_RE.finditer(query):
+        tok = m.group(1).strip()
+        # Strip likely sentence punctuation but preserve internal dots
+        tok = tok.strip(",;:!?)(`")
+        key = tok.lower()
+        if (key and key not in seen
+                and key not in _COMMON_WORD_DENYLIST
+                and len(key) >= 3):
+            seen.add(key)
+            out.append(tok)
+
+    return out
+
+
+def _fuzzy_match_filename(token: str, candidates: List[Path],
+                          cutoff: float = 0.55) -> Optional[Path]:
+    """Pick the best fuzzy match of `token` against `candidates` paths.
+
+    Matches against each candidate's filename (with AND without
+    extension) and picks the highest similarity score above the cutoff.
+    Returns None if no candidate clears the bar — better to surface
+    "no match" to the user than to confidently pick a wrong file.
+    """
+    if not token or not candidates:
+        return None
+    token_lc = token.lower()
+    # Exact substring match wins immediately — most natural user
+    # behaviour ("sales.csv" should always pick the file containing
+    # 'sales.csv' even if difflib quirks would prefer something else).
+    for p in candidates:
+        if token_lc == p.name.lower() or token_lc == p.stem.lower():
+            return p
+    for p in candidates:
+        if token_lc in p.name.lower():
+            return p
+
+    # Fall back to difflib ratio against both .name and .stem forms.
+    best_score = 0.0
+    best_path: Optional[Path] = None
+    for p in candidates:
+        for cand in (p.name.lower(), p.stem.lower()):
+            ratio = _difflib.SequenceMatcher(None, token_lc, cand).ratio()
+            if ratio > best_score:
+                best_score = ratio
+                best_path = p
+    return best_path if best_score >= cutoff else None
+
+
+def resolve_filename_hints(query: str, allowed_folders: List[Path]
+                           ) -> List[Tuple[str, Optional[Path]]]:
+    """Extract candidate filename tokens from `query` and fuzzy-resolve
+    each one against the data inventory of `allowed_folders`.
+
+    Returns a list of ``(user_token, resolved_path_or_None)`` in input
+    order. ``resolved_path`` is None when no file cleared the fuzzy
+    cutoff — the caller passes this through to the prompt so the model
+    is *told* the user's reference didn't match anything and refrains
+    from inventing a file.
+    """
+    tokens = _extract_candidate_filename_tokens(query)
+    if not tokens:
+        return []
+    # Build the inventory once — every supported data-file type.
+    inventory: list = []
+    try:
+        inventory.extend(list_data_files(allowed_folders, recursive=True))
+    except Exception:
+        pass
+    try:
+        inventory.extend(list_parquet_files(allowed_folders, recursive=True))
+    except Exception:
+        pass
+    try:
+        inventory.extend(list_sqlite_files(allowed_folders, recursive=True))
+    except Exception:
+        pass
+    try:
+        inventory.extend(list_duckdb_files(allowed_folders, recursive=True))
+    except Exception:
+        pass
+    try:
+        inventory.extend(list_bson_files(allowed_folders, recursive=True))
+    except Exception:
+        pass
+    # Dedupe by resolved path
+    seen_paths: set = set()
+    unique_inv: list = []
+    for p in inventory:
+        try:
+            key = str(p.resolve()).lower()
+        except Exception:
+            key = str(p).lower()
+        if key not in seen_paths:
+            seen_paths.add(key)
+            unique_inv.append(p)
+    return [(tok, _fuzzy_match_filename(tok, unique_inv)) for tok in tokens]
+
+
+def resolve_subfolder_hint(query: str, base_folder: Path
+                           ) -> Optional[Path]:
+    """If the user mentioned a subfolder name and it exists under
+    `base_folder`, return the resolved path. Otherwise None.
+
+    Matches phrases like "in the projects folder" / "inside test_data"
+    / "from Q3_2024/" against the actual immediate-child directories
+    of `base_folder` (case-insensitive, dash/underscore-tolerant).
+    Falls back to fuzzy matching when no exact match exists, with a
+    higher cutoff (0.7) than filenames — folder names are typically
+    short and a sloppy match here would scope the analyst to the wrong
+    data entirely.
+    """
+    if not query or not base_folder:
+        return None
+    try:
+        base_folder = Path(base_folder)
+        if not base_folder.is_dir():
+            return None
+    except Exception:
+        return None
+
+    # Build the candidate list: every directory under base_folder, up to
+    # 2 levels deep. We recurse so "in the Q3 folder" matches both
+    # `data_in/Q3/` and `data_in/projects/Q3/`.
+    children: list = []
+    try:
+        for p in base_folder.iterdir():
+            if p.is_dir():
+                children.append(p)
+                # One more level
+                try:
+                    for q in p.iterdir():
+                        if q.is_dir():
+                            children.append(q)
+                except Exception:
+                    pass
+    except Exception:
+        return None
+    if not children:
+        return None
+
+    def _norm(s: str) -> str:
+        return s.lower().replace("-", "_").replace(" ", "_")
+
+    # Try each match position in the query and resolve to a real folder
+    for m in _SUBFOLDER_HINT_RE.finditer(query):
+        cand = m.group(1).strip().strip("/\\").strip("'\"`")
+        if not cand or cand.lower() in _COMMON_WORD_DENYLIST:
+            continue
+        # Skip tokens that look like filenames (they have data-file extensions)
+        if "." in cand and cand.rsplit(".", 1)[1].lower() in (
+            "csv", "tsv", "xlsx", "xls", "xlsm", "parquet", "json",
+            "sqlite", "sqlite3", "db", "duckdb", "bson", "h5", "hdf5",
+        ):
+            continue
+        cand_norm = _norm(cand)
+
+        # Exact-name match first
+        for child in children:
+            if _norm(child.name) == cand_norm:
+                return child
+
+        # Path-prefix match ("projects/Q3" → data_in/projects/Q3)
+        if "/" in cand or "\\" in cand:
+            sub = base_folder
+            for part in _re_va.split(r"[/\\]", cand):
+                if not part:
+                    continue
+                next_match = None
+                try:
+                    for child in sub.iterdir():
+                        if child.is_dir() and _norm(child.name) == _norm(part):
+                            next_match = child
+                            break
+                except Exception:
+                    break
+                if not next_match:
+                    sub = None
+                    break
+                sub = next_match
+            if sub is not None and sub.is_dir() and sub != base_folder:
+                return sub
+
+        # Fuzzy fallback — higher cutoff than filenames (folder
+        # mismatches are more costly than file mismatches).
+        best_score = 0.0
+        best_dir: Optional[Path] = None
+        for child in children:
+            ratio = _difflib.SequenceMatcher(
+                None, cand_norm, _norm(child.name)
+            ).ratio()
+            if ratio > best_score:
+                best_score = ratio
+                best_dir = child
+        if best_score >= 0.7 and best_dir is not None:
+            return best_dir
+
+    return None
+
+
+def format_filename_hints(hints: List[Tuple[str, Optional[Path]]],
+                          base_folder: Optional[Path] = None) -> str:
+    """Render filename-hint pairs into a short block for the prompt.
+
+    The block is appended to `build_pandas_code_prompt` output so the
+    model uses the resolved filenames instead of guessing.
+    """
+    if not hints:
+        return ""
+    lines = ["NOTE — Resolved file references from the user's question:"]
+    for tok, resolved in hints:
+        if resolved is None:
+            lines.append(
+                f'  • "{tok}"  → NO MATCH in inventory. Do NOT invent '
+                f'a path for this; if the question requires it, the '
+                f'computation cannot proceed.'
+            )
+        else:
+            try:
+                rel = (resolved.relative_to(base_folder)
+                       if base_folder else resolved)
+            except Exception:
+                rel = resolved
+            lines.append(f'  • "{tok}"  → "{rel}"')
+    return "\n".join(lines)
 
 
 # ============================================================
