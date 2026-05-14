@@ -365,6 +365,205 @@ def find_data_block(path_or_df: Any) -> dict:
     }
 
 
+def read_excel_smart_tables(
+    path: Any,
+    sheet: Any = 0,
+    *,
+    gap_tolerance: int = 1,
+    min_cells: int = 4,
+    expand_merged: bool = True,
+) -> List[Dict[str, Any]]:
+    """Robust multi-table reader for messy spreadsheets.
+
+    Handles: multiple tables stacked vertically OR side-by-side, gaps
+    inside tables, merged cells (expanded so each underlying cell gets
+    the top-left value), inconsistent row widths (short rows padded),
+    leading/trailing blank rows/cols (trimmed), and header rows that
+    don't start at row 1 (auto-detected per block).
+
+    `gap_tolerance` is how many consecutive blank rows OR columns are
+    treated as "still part of the same table". 1 means single-cell
+    blanks won't split a table; 0 means any blank breaks it.
+
+    `min_cells` filters out tiny noise blocks (a stray label in a
+    corner won't be returned as its own "table").
+
+    Returns a list of dicts:
+      {
+        "df":        pandas DataFrame,
+        "top_left":  (row, col)  — 0-based cell coords in the sheet,
+        "n_rows":    int,
+        "n_cols":    int,
+        "header_row": row offset within the block,
+      }
+    """
+    p = Path(path)
+    try:
+        import openpyxl as _oxl
+        wb = _oxl.load_workbook(p, read_only=False, data_only=True)
+    except Exception:
+        # Fall back to pandas's all-in-one read
+        return [{"df": pd.read_excel(p, sheet_name=sheet),
+                 "top_left": (0, 0), "n_rows": 0, "n_cols": 0,
+                 "header_row": 0}]
+    try:
+        if isinstance(sheet, int) and 0 <= sheet < len(wb.worksheets):
+            ws = wb.worksheets[sheet]
+        elif isinstance(sheet, str) and sheet in wb.sheetnames:
+            ws = wb[sheet]
+        else:
+            ws = wb.worksheets[0]
+
+        max_row = ws.max_row or 0
+        max_col = ws.max_column or 0
+        if max_row == 0 or max_col == 0:
+            return []
+
+        # Materialize the cell grid as a 2D list of values, expanding
+        # merged ranges so every cell in the merged region holds the
+        # top-left value (otherwise only one cell has a value).
+        grid: List[List[Any]] = [
+            [None] * max_col for _ in range(max_row)
+        ]
+        for r in range(1, max_row + 1):
+            for c in range(1, max_col + 1):
+                cell = ws.cell(row=r, column=c)
+                grid[r - 1][c - 1] = cell.value
+
+        if expand_merged:
+            for rng in ws.merged_cells.ranges:
+                anchor = grid[rng.min_row - 1][rng.min_col - 1]
+                for r in range(rng.min_row, rng.max_row + 1):
+                    for c in range(rng.min_col, rng.max_col + 1):
+                        if r - 1 < max_row and c - 1 < max_col:
+                            if grid[r - 1][c - 1] in (None, "", " "):
+                                grid[r - 1][c - 1] = anchor
+    finally:
+        try: wb.close()
+        except Exception: pass
+
+    # Build occupancy mask
+    occ = [
+        [(v is not None and str(v).strip() != "") for v in row]
+        for row in grid
+    ]
+
+    # Flood-fill connected components with gap tolerance.
+    # We dilate the occupancy mask by `gap_tolerance` cells so blanks
+    # smaller than the tolerance get bridged.
+    R, C = len(occ), (len(occ[0]) if occ else 0)
+    if R == 0 or C == 0:
+        return []
+    dilated = [[False] * C for _ in range(R)]
+    g = max(0, int(gap_tolerance))
+    for r in range(R):
+        for c in range(C):
+            if occ[r][c]:
+                for dr in range(-g, g + 1):
+                    for dc in range(-g, g + 1):
+                        rr, cc = r + dr, c + dc
+                        if 0 <= rr < R and 0 <= cc < C:
+                            dilated[rr][cc] = True
+
+    # 8-connectivity flood-fill on the dilated mask to find clusters
+    visited = [[False] * C for _ in range(R)]
+    clusters: List[List[Tuple[int, int]]] = []
+    for r in range(R):
+        for c in range(C):
+            if not dilated[r][c] or visited[r][c]:
+                continue
+            stack = [(r, c)]
+            cluster: List[Tuple[int, int]] = []
+            while stack:
+                rr, cc = stack.pop()
+                if not (0 <= rr < R and 0 <= cc < C):
+                    continue
+                if visited[rr][cc] or not dilated[rr][cc]:
+                    continue
+                visited[rr][cc] = True
+                if occ[rr][cc]:                    # only the real cells count
+                    cluster.append((rr, cc))
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        if dr == 0 and dc == 0:
+                            continue
+                        stack.append((rr + dr, cc + dc))
+            if len(cluster) >= min_cells:
+                clusters.append(cluster)
+
+    out: List[Dict[str, Any]] = []
+    for cluster in clusters:
+        rows = [p[0] for p in cluster]
+        cols = [p[1] for p in cluster]
+        r0, r1 = min(rows), max(rows)
+        c0, c1 = min(cols), max(cols)
+
+        # Slice the grid; pad to a rectangle.
+        sub: List[List[Any]] = []
+        for r in range(r0, r1 + 1):
+            row_slice = grid[r][c0:c1 + 1]
+            # Pad short rows with None to keep rectangular
+            if len(row_slice) < (c1 - c0 + 1):
+                row_slice = row_slice + [None] * (c1 - c0 + 1 - len(row_slice))
+            sub.append(row_slice)
+
+        # Header-row detection within the cluster: pick the FIRST row
+        # whose filled-cell count equals the modal filled-cell count
+        # of rows below it. That's typically the header.
+        fill_counts = [sum(1 for v in row if v not in (None, "", " "))
+                       for row in sub]
+        if len(fill_counts) > 1:
+            tail_mode = max(set(fill_counts[1:]), key=fill_counts[1:].count)
+            header_idx = 0
+            for i, fc in enumerate(fill_counts):
+                if fc == tail_mode and any(
+                    v is not None and str(v).strip() for v in sub[i]
+                ):
+                    header_idx = i
+                    break
+        else:
+            header_idx = 0
+
+        # Build DataFrame
+        try:
+            header = [
+                str(v).strip() if v is not None else f"col_{i}"
+                for i, v in enumerate(sub[header_idx])
+            ]
+            # Dedupe column names (Excel allows duplicates; pandas doesn't)
+            seen: Dict[str, int] = {}
+            unique_header: List[str] = []
+            for h in header:
+                base = h if h else "(blank)"
+                if base in seen:
+                    seen[base] += 1
+                    unique_header.append(f"{base}.{seen[base]}")
+                else:
+                    seen[base] = 0
+                    unique_header.append(base)
+
+            body = sub[header_idx + 1:]
+            df = pd.DataFrame(body, columns=unique_header)
+            # Trim entirely empty trailing rows / cols inside the block
+            df = df.dropna(axis=1, how="all")
+            df = df.dropna(axis=0, how="all").reset_index(drop=True)
+            if df.empty:
+                continue
+            out.append({
+                "df":         df,
+                "top_left":   (r0, c0),
+                "n_rows":     len(df),
+                "n_cols":     len(df.columns),
+                "header_row": header_idx,
+            })
+        except Exception:
+            continue
+
+    # Order clusters top-to-bottom, then left-to-right
+    out.sort(key=lambda d: (d["top_left"][0], d["top_left"][1]))
+    return out
+
+
 def read_excel_all_tables(path: Any, sheet: Any = 0) -> List[pd.DataFrame]:
     """Find every separate tabular block in one Excel sheet.
 
@@ -2294,6 +2493,7 @@ def execute_pandas_code(
         "read_csv_robust":        read_csv_robust,
         "find_data_block":        find_data_block,
         "read_excel_all_tables":  read_excel_all_tables,
+        "read_excel_smart_tables": read_excel_smart_tables,
         "strip_summary_rows":     strip_summary_rows,
         "unpivot_year_columns":   unpivot_year_columns,
         # Schema diff + smart type inference
@@ -2441,8 +2641,15 @@ rest is data" convention:
   find_data_block(path_or_df)          # bounding box of the actual data
                                        # region (start_row, end_row,
                                        # start_col, end_col).
-  read_excel_all_tables(path, sheet)   # return EVERY table on the sheet
-                                       # when multiple are stacked.
+  read_excel_all_tables(path, sheet)   # simple multi-table reader
+                                       # (blank-row separation only)
+  read_excel_smart_tables(path, sheet, gap_tolerance=1, min_cells=4)
+    Robust version. Use this when read_excel_all_tables misses
+    tables. Handles: vertical AND horizontal gaps between tables,
+    merged cells in the body (expanded), inconsistent row widths
+    (short rows padded), title/note rows above the real header
+    (auto-detected per cluster). Returns a list of
+    {df, top_left, n_rows, n_cols, header_row} dicts.
   strip_summary_rows(df, patterns=...) # drop trailing "Total" rows.
   unpivot_year_columns(df, id_cols)    # wide-form (..., 2020, 2021, 2022)
                                        # -> long form (country, year, value).
