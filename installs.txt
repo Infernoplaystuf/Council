@@ -1,42 +1,64 @@
 # ============================================================
-#  Council AI — Quick Install (single-environment, GGUF-only)
-#
-#  Hardware notes:
-#    cu124 wheel = RTX 5080 / 5090 / 4090 / Ada+ (Blackwell sm_120 OK)
-#    cu121 wheel = RTX 4070 / 3090 / older Ampere
-#    cpu wheel   = no NVIDIA GPU (slow but works)
-#  Replace the torch line in step 4 with whichever index URL matches.
+#  Council AI — Quick Install
+#  Pick ONE of the sections below based on your hardware, then run
+#  every line in that section in order. Each section is self-contained.
 # ============================================================
 
-# 1. Conda channel order (Dream3D-NX requires this exact config)
+
+# ============================================================
+#  SECTION A — CPU only (no NVIDIA GPU)
+#  Slowest path. GGUF inference falls back to CPU; works but expect
+#  several seconds per response on a 7B/8B model.
+# ============================================================
 conda config --add channels conda-forge && conda config --set channel_priority strict
-
-# 2. Create env (Python 3.12 — required by dream3dnx)
 conda create -n council python=3.12 -y && conda activate council
-
-# 3. Dream3D-NX (provides simplnx + dream3dnx + standard plugins)
 conda install -c bluequartzsoftware dream3dnx -y
-
-# 4. PyTorch — pick ONE based on your GPU
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
-# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
-
-# 5. All required + optional packages in one pip call
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 pip install beautifulsoup4 chromadb crawl4ai duckdb faster-whisper h5py html2text huggingface_hub kaleido langchain-core langgraph llama-cpp-python matplotlib mido music21 numpy openpyxl pandas paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb
-
-# 6. Optional: Spyder IDE support + Crawl4AI Chromium cache (~150 MB)
 pip install spyder-kernels && crawl4ai-setup
+python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print('all imports OK')"
 
-# 7. Verify
+
+# ============================================================
+#  SECTION B — NVIDIA Ampere / Turing  (PyTorch cu121)
+#  Cards in this group:
+#    RTX 30-series:   3050, 3060, 3060 Ti, 3070, 3070 Ti, 3080, 3080 Ti, 3090, 3090 Ti
+#    RTX 20-series:   2060, 2070, 2080 (and Super/Ti variants)
+#    GTX 16-series:   1660 (Ti / Super)
+#    Workstation:     A4000, A5000, A6000, A40, A100
+# ============================================================
+conda config --add channels conda-forge && conda config --set channel_priority strict
+conda create -n council python=3.12 -y && conda activate council
+conda install -c bluequartzsoftware dream3dnx -y
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip install beautifulsoup4 chromadb crawl4ai duckdb faster-whisper h5py html2text huggingface_hub kaleido langchain-core langgraph llama-cpp-python matplotlib mido music21 numpy openpyxl pandas paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb
+pip install spyder-kernels && crawl4ai-setup
+python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print('all imports OK')"
+
+
+# ============================================================
+#  SECTION C — NVIDIA Ada / Blackwell  (PyTorch cu124)
+#  Cards in this group:
+#    RTX 40-series:   4060, 4060 Ti, 4070, 4070 Ti / Super, 4080, 4080 Super, 4090
+#    RTX 50-series:   5070, 5070 Ti, 5080, 5090
+#    Workstation:     RTX 6000 Ada, L4, L40, H100
+# ============================================================
+conda config --add channels conda-forge && conda config --set channel_priority strict
+conda create -n council python=3.12 -y && conda activate council
+conda install -c bluequartzsoftware dream3dnx -y
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pip install beautifulsoup4 chromadb crawl4ai duckdb faster-whisper h5py html2text huggingface_hub kaleido langchain-core langgraph llama-cpp-python matplotlib mido music21 numpy openpyxl pandas paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb
+pip install spyder-kernels && crawl4ai-setup
 python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print('all imports OK')"
 
 
 # ─────────────────────────────────────────────────────────────
-#  GGUF model — drop a .gguf into the app via Browse... button
-#  in the Council tab. Recommended US-licensed picks:
+#  After install — GGUF model + optional extras (any section)
+# ─────────────────────────────────────────────────────────────
+#  Recommended GGUF picks (drop into app via Browse... button):
 #    Laptop  (8 GB VRAM):  bartowski/granite-3.0-8b-instruct-GGUF  (Q4_K_M)
 #    Desktop (16 GB VRAM): bartowski/phi-4-GGUF                    (Q4_K_M)
+#    CPU only:             bartowski/Llama-3.2-3B-Instruct-GGUF    (Q4_K_M)
 #
 #  Optional env-var overrides (no UI needed):
 #    set COUNCIL_GGUF_PATH=C:\models\phi-4-Q4_K_M.gguf
@@ -47,4 +69,7 @@ python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pa
 #    pip install psycopg2-binary   # PostgreSQL
 #    pip install PyMySQL           # MySQL / MariaDB
 #    pip install pyodbc            # MSSQL via ODBC
+#
+#  Optional simplnx plugins (orientation/EBSD, ITK image processing):
+#    conda install -c bluequartzsoftware orientationanalysis itkimageprocessing -y
 # ─────────────────────────────────────────────────────────────
