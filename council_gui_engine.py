@@ -1222,18 +1222,28 @@ def _run_analyst_step(query):
     """If `query` looks computational, generate pandas code via a local model
     and execute it sandboxed against the vault's data_in/ folder.
 
-    Returns a formatted [ANALYST RESULT] block, or None if the query isn't
-    computational / the model couldn't generate code / execution failed.
+    Returns ``(block, error_msg)``:
+      • ``(None, None)``           — query isn't computational; no analyst.
+      • ``(success_block, None)``  — code executed; block holds the result.
+      • ``(failure_block, msg)``   — analyst was attempted but failed.
+        ``failure_block`` is still safe to inject — it tells the model to
+        REFUSE to invent values for the failed computation, and ``msg`` is
+        a one-line summary the caller can show in the transcript so the
+        user knows the analyst tried and got blocked.
+
+    The failure-block path is critical: without it the analyst silently
+    falls back to model freeform when its sandbox raises, and the model
+    then invents numbers from training-data memory.
     """
     import sys as _sys_dbg
     try:
         import vault_analyst as _va
     except Exception as _e:
         print('[analyst] import failed: ' + repr(_e), file=_sys_dbg.stderr)
-        return None
+        return None, None
 
     if not _va.looks_computational(query):
-        return None
+        return None, None
 
     try:
         allowed_folders = [data_index.input_dir(VAULT_DIR)]
@@ -1253,19 +1263,24 @@ def _run_analyst_step(query):
             timeout=90,
         )
     except Exception as _e:
-        print('[analyst] code generation failed: ' + repr(_e), file=_sys_dbg.stderr)
-        return None
+        msg = f"code generation failed: {_e!r}"
+        print('[analyst] ' + msg, file=_sys_dbg.stderr)
+        return _build_analyst_failure_block("(no code generated)", msg), msg
 
     code = _va.extract_python_code(raw)
     if not code.strip():
+        msg = "the model produced no executable pandas code"
         print('[analyst] empty code from model', file=_sys_dbg.stderr)
-        return None
+        return _build_analyst_failure_block("(empty)", msg), msg
     print('[analyst] generated code (first 300):\n' + code[:300], file=_sys_dbg.stderr)
 
     result_df, log = _va.execute_pandas_code(code, allowed_folders)
     if result_df is None:
+        # Extract the first traceback line for a concise transcript message.
+        # The full log keeps the entire traceback for debugging in the block.
+        first_err = _summarise_analyst_error(log)
         print('[analyst] exec failed: ' + log[:400], file=_sys_dbg.stderr)
-        return None
+        return _build_analyst_failure_block(code, log), first_err
 
     table_text = _va.format_result_for_prompt(result_df, max_rows=30, max_chars=4000)
     block = (
@@ -1274,7 +1289,57 @@ def _run_analyst_step(query):
         + 'output:\n' + table_text + '\n'
         + '[END ANALYST]'
     )
-    return block
+    return block, None
+
+
+def _summarise_analyst_error(log: str) -> str:
+    """Extract a short human-readable summary from a Python traceback.
+
+    Returns the last `ExceptionType: message` line if present (most
+    useful for the user), else the first 200 chars of the log.
+    """
+    if not log:
+        return "analyst execution failed"
+    # Find the final "ExceptionType: message" line in the traceback.
+    last = None
+    for line in log.splitlines():
+        line = line.strip()
+        if line and ":" in line and not line.startswith(("File ", "  ", "Traceback")):
+            # Plausible exception line — keep the latest one.
+            last = line
+    if last:
+        return last[:200]
+    return log.strip().splitlines()[0][:200] if log.strip() else "analyst failed"
+
+
+def _build_analyst_failure_block(code: str, error_log: str) -> str:
+    """Build an [ANALYST RESULT — FAILED] block that tells the model the
+    computation was attempted but failed, and explicitly refuses any
+    invented numeric answer. This is the critical anti-hallucination
+    fallback: without it, the model would silently produce a freeform
+    answer that looks confident but invents numbers from training data.
+    """
+    code_part = code.strip() or "(no code)"
+    err_part = (error_log or "").strip() or "(no traceback captured)"
+    if len(err_part) > 1200:
+        err_part = err_part[:1200] + "\n... (truncated)"
+    return (
+        "[ANALYST RESULT — COMPUTATION FAILED]\n"
+        "The analyst attempted a deterministic pandas calculation but the "
+        "sandbox raised an error. The numeric answer the user asked for "
+        "is NOT AVAILABLE.\n\n"
+        "pandas code attempted:\n"
+        + code_part + "\n\n"
+        "error:\n"
+        + err_part + "\n\n"
+        "[INSTRUCTION TO THE WRITER: Do NOT invent a numeric answer to "
+        "compensate. Tell the user the deterministic computation failed, "
+        "quote the error type briefly, and suggest they rephrase the "
+        "question or check that the file/column they mentioned exists. "
+        "Do NOT pull values from training-data memory of similarly-named "
+        "datasets.]\n"
+        "[END ANALYST]"
+    )
 
 
 _CODE_ROUTES = {"ide", "coder", "intern"}
@@ -10463,10 +10528,23 @@ class CouncilConsole(tk.Tk):
         # The analyst computes deterministic answers from data ("how many",
         # "what's the sum"); when it succeeds, the injection layer reduces
         # vault-match candidates from 5 to 1 (#7) so the answer doesn't
-        # fight for budget with speculative matches.
-        _analyst_block = _run_analyst_step(original_user_text)
-        if _analyst_block:
+        # fight for budget with speculative matches. When it FAILS (e.g.
+        # NameError in the generated code), we inject a failure block that
+        # explicitly refuses any invented numeric answer instead of falling
+        # back to model freeform — that's how the cross-machine
+        # hallucination used to creep back in.
+        _analyst_block, _analyst_err = _run_analyst_step(original_user_text)
+        if _analyst_block and not _analyst_err:
             self._append_transcript("Council", "Computing from data...", "observation")
+        elif _analyst_err:
+            self._append_transcript(
+                "Council",
+                f"⚠ Analyst tried to compute the answer but failed: "
+                f"{_analyst_err}\n"
+                f"The model will be told to refuse inventing a number; "
+                f"try rephrasing or check the file/column name.",
+                "observation",
+            )
 
         # ── Inject file/folder/vault context with token-aware caps ────────
         # The new pipeline (a) tags each block with its token cost, (b) caps
