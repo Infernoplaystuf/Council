@@ -489,7 +489,44 @@ class VaultIndex:
         self.records: Dict[str, Dict[str, Any]] = {}
         self._vocab_cache: Optional[Set[str]] = None
         self._denylist_cache: Optional[Set[str]] = None
+        # Lazy embedding layer — only loads sentence-transformers on first use.
+        self._emb_index = None
         self.load()
+
+    # ---- embedding sub-index (semantic vector search) ----
+    def embeddings(self):
+        """Return (and lazy-instantiate) the EmbeddingIndex companion."""
+        if self._emb_index is not None:
+            return self._emb_index
+        try:
+            from vault_embeddings import EmbeddingIndex as _EI
+            self._emb_index = _EI(self.vault_dir)
+        except Exception as exc:
+            import sys as _sys
+            print(f"[VaultIndex] embedding layer unavailable: {exc!r}",
+                  file=_sys.stderr)
+            self._emb_index = None
+        return self._emb_index
+
+    def build_embeddings(
+        self,
+        *,
+        force: bool = False,
+        on_progress=None,
+    ) -> int:
+        """Refresh the vector cache for every changed record. Returns the
+        count of records re-embedded this call."""
+        emb = self.embeddings()
+        if emb is None:
+            return 0
+        try:
+            n = emb.build(self.records, force=force, on_progress=on_progress)
+        except Exception as exc:
+            import sys as _sys
+            print(f"[VaultIndex] embedding build failed: {exc!r}",
+                  file=_sys.stderr)
+            return 0
+        return n
 
     # ---- fuzzy denylist (user-rejected fuzzy matches) ----
     def fuzzy_denylist(self) -> Set[str]:
@@ -769,6 +806,40 @@ class VaultIndex:
                     score += 0.6 * w
             if score > 0:
                 results.append((score, rec))
+
+        # ── Embedding pass — blend in semantic similarity ───────────────
+        # Only does work if the embedding index is available AND has been
+        # built. Adds a bounded boost so embeddings can't overwhelm exact
+        # keyword matches but can pull in semantically-relevant files
+        # that the keyword pass missed entirely.
+        try:
+            emb = self.embeddings()
+        except Exception:
+            emb = None
+        if emb is not None and len(emb) > 0:
+            cand_paths = {spath for spath, _rec in cand}
+            try:
+                emb_hits = emb.search(query, k=max(k * 3, 10),
+                                      candidates=cand_paths)
+            except Exception:
+                emb_hits = []
+            if emb_hits:
+                # Build a quick path -> existing-result lookup
+                by_path: Dict[str, List[float]] = {}
+                for i, (sc, rec) in enumerate(results):
+                    by_path[rec.get("path", "")] = [float(sc), i]
+                # Add a capped boost per embedding hit (max ~4 points,
+                # scaled by cosine score)
+                for cos, p in emb_hits:
+                    boost = float(cos) * 4.0
+                    if p in by_path:
+                        old_sc, idx = by_path[p]
+                        results[int(idx)] = (old_sc + boost, results[int(idx)][1])
+                    else:
+                        # New path the keyword pass missed
+                        rec = self.records.get(p)
+                        if rec:
+                            results.append((boost, rec))
 
         results.sort(key=lambda r: r[0], reverse=True)
         return results[:k], fuzzy_matches

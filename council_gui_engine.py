@@ -3504,6 +3504,12 @@ class CouncilConsole(tk.Tk):
         r"(?:index|descriptions?|summaries)\s*[.!?]?\s*$",
         _re.IGNORECASE,
     )
+    _BUILD_EMBEDDINGS_RE = _re.compile(
+        r"^\s*(?:build|generate|refresh|rebuild)\s+(?:the\s+)?"
+        r"(?:vector\s+|embedding|embeddings|semantic\s+vector)\s*"
+        r"(?:index|cache|embeddings?)?\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
     _EXPORT_TRANSCRIPT_RE = _re.compile(
         r"^\s*(?:export|save)\s+(?:the\s+)?(?:current\s+)?transcript"
         r"(?:\s+as\s+(?:markdown|md))?\s*[.!?]?\s*$",
@@ -3575,6 +3581,10 @@ class CouncilConsole(tk.Tk):
 
         if self._BUILD_SEMANTIC_RE.match(single_line):
             self._build_semantic_index_response()
+            return True
+
+        if self._BUILD_EMBEDDINGS_RE.match(single_line):
+            self._build_embeddings_response()
             return True
 
         if self._EXPORT_TRANSCRIPT_RE.match(single_line):
@@ -3851,6 +3861,74 @@ class CouncilConsole(tk.Tk):
             "Writer", f"Schema doc for {p.name} -> {rel}", "final",
         )
         self._set_status("● idle")
+
+    def _build_embeddings_response(self):
+        """Kick off the vector embedding build over the vault index.
+
+        Uses a sentence-transformer (~80 MB) to make retrieval semantic
+        rather than keyword-only. First call may take a moment to load
+        the model; subsequent builds reuse the cached vectors and only
+        re-embed records whose mtime changed.
+        """
+        idx = _get_vault_index()
+        if idx is None:
+            self._append_transcript(
+                "Writer", "Vault index unavailable.", "final",
+            )
+            return
+        try:
+            idx.rebuild()
+        except Exception:
+            pass
+        emb = idx.embeddings()
+        if emb is None:
+            self._append_transcript(
+                "Writer",
+                "sentence-transformers is not available. Install with:\n"
+                "  pip install sentence-transformers\n"
+                "Then re-run 'build embeddings'.",
+                "final",
+            )
+            return
+        self._append_transcript(
+            "Council",
+            f"Embedding {len(idx.records)} files with model "
+            f"{emb.model_name}. First run may download the model "
+            f"(~80 MB). Subsequent rebuilds only touch changed files.",
+            "observation",
+        )
+        self._set_status("● embedding…", "#cba6f7")
+
+        def _worker():
+            def _progress(i, total, name):
+                if i % 10 == 0 or i == total:
+                    self.after(0, lambda: self._set_status(
+                        f"● embedding {i}/{total}…", "#cba6f7"
+                    ))
+            try:
+                n = idx.build_embeddings(on_progress=_progress)
+            except Exception as exc:
+                self.after(0, lambda: (
+                    self._append_transcript("Writer",
+                                            f"embedding build failed: {exc!r}",
+                                            "final"),
+                    self._set_status("● idle"),
+                ))
+                return
+            stats = emb.stats()
+            self.after(0, lambda: (
+                self._append_transcript(
+                    "Writer",
+                    f"Vector index ready — {stats['vectors']} files embedded "
+                    f"({stats['dim']}-dim, {stats['size_kb']} KB on disk). "
+                    f"Semantic search will now blend into vault queries.",
+                    "final",
+                ),
+                self._set_status("● idle"),
+            ))
+
+        import threading as _th
+        _th.Thread(target=_worker, daemon=True).start()
 
     def _build_semantic_index_response(self):
         """Kick off the LLM description pass over the vault index."""

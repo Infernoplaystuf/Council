@@ -27,7 +27,9 @@ llama-cpp-python>=0.2.79
 
 # ---- RAG (vault search) — optional but installed by default ----
 chromadb>=0.4
-sentence-transformers>=2.2
+sentence-transformers>=2.2    # also used by vault_embeddings.py for the
+                              # vector retrieval layer (default model:
+                              # all-MiniLM-L6-v2, ~80 MB)
 huggingface_hub>=0.20    # for huggingface-cli download of GGUF models
 
 # ---- File parsing for vault analyst / RAG over docs ----
