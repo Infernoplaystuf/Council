@@ -19,10 +19,10 @@
 # ============================================================
 conda config --add channels conda-forge && conda config --set channel_priority strict
 conda create -n council python=3.12 -y && conda activate council
-conda install -c bluequartzsoftware dream3dnx -y
+conda install -c bluequartzsoftware dream3dnx -y && conda install -c conda-forge h5py "numpy<2.3" -y
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 pip install llama-cpp-python
-pip install beautifulsoup4 chromadb crawl4ai duckdb faster-whisper h5py html2text huggingface_hub kaleido langchain-core langgraph matplotlib mido music21 numpy openpyxl pandas paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb
+pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper html2text huggingface_hub kaleido langchain-core langgraph matplotlib mido music21 openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb "pandas<2.3"
 pip install spyder-kernels && crawl4ai-setup
 python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print('all imports OK')"
 
@@ -43,10 +43,10 @@ python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pa
 # ============================================================
 conda config --add channels conda-forge && conda config --set channel_priority strict
 conda create -n council python=3.12 -y && conda activate council
-conda install -c bluequartzsoftware dream3dnx -y
+conda install -c bluequartzsoftware dream3dnx -y && conda install -c conda-forge h5py "numpy<2.3" -y
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121 --force-reinstall --no-cache-dir
-pip install beautifulsoup4 chromadb crawl4ai duckdb faster-whisper h5py html2text huggingface_hub kaleido langchain-core langgraph matplotlib mido music21 numpy openpyxl pandas paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb
+pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper html2text huggingface_hub kaleido langchain-core langgraph matplotlib mido music21 openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb "pandas<2.3"
 pip install spyder-kernels && crawl4ai-setup
 python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print('all imports OK')"
 
@@ -65,10 +65,10 @@ python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pa
 # ============================================================
 conda config --add channels conda-forge && conda config --set channel_priority strict
 conda create -n council python=3.12 -y && conda activate council
-conda install -c bluequartzsoftware dream3dnx -y
+conda install -c bluequartzsoftware dream3dnx -y && conda install -c conda-forge h5py "numpy<2.3" -y
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 --force-reinstall --no-cache-dir
-pip install beautifulsoup4 chromadb crawl4ai duckdb faster-whisper h5py html2text huggingface_hub kaleido langchain-core langgraph matplotlib mido music21 numpy openpyxl pandas paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb
+pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper html2text huggingface_hub kaleido langchain-core langgraph matplotlib mido music21 openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb "pandas<2.3"
 pip install spyder-kernels && crawl4ai-setup
 python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print('all imports OK')"
 
@@ -91,10 +91,10 @@ python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pa
 # ============================================================
 conda config --add channels conda-forge && conda config --set channel_priority strict
 conda create -n council python=3.12 -y && conda activate council
-conda install -c bluequartzsoftware dream3dnx -y
+conda install -c bluequartzsoftware dream3dnx -y && conda install -c conda-forge h5py "numpy<2.3" -y
 pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 --force-reinstall --no-cache-dir
-pip install beautifulsoup4 chromadb crawl4ai duckdb faster-whisper h5py html2text huggingface_hub kaleido langchain-core langgraph matplotlib mido music21 numpy openpyxl pandas paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb
+pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper html2text huggingface_hub kaleido langchain-core langgraph matplotlib mido music21 openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb "pandas<2.3"
 pip install spyder-kernels && crawl4ai-setup
 python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'); print('all imports OK')"
 
@@ -126,4 +126,27 @@ python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pa
 #    If n_gpu_layers=0 even on a GPU machine, llama-cpp-python was
 #    installed without CUDA — rerun your section's `pip install
 #    llama-cpp-python --extra-index-url ...` line.
+#
+#  ─────────────────────────────────────────────────────────────
+#  Common conda+pip conflicts (and how to fix them)
+#  ─────────────────────────────────────────────────────────────
+#  Symptom: `import simplnx` fails with `_ARRAY_API not found` or
+#           `numpy.dtype size changed`.
+#  Cause:   pip upgraded numpy to 2.x; dream3dnx was built against 1.x.
+#  Fix:     conda install -c conda-forge "numpy<2.3" -y
+#
+#  Symptom: `import simplnx` crashes with `HDF5 library version
+#           mismatched error`.
+#  Cause:   PyPI h5py and conda dream3dnx loaded different HDF5 DLLs.
+#  Fix:     pip uninstall h5py -y && conda install -c conda-forge h5py -y
+#
+#  Symptom: Random `OMP: Error #15: Initializing libiomp5md.dll`.
+#  Cause:   Two OpenMP runtimes loaded into one process.
+#  Fix:     set KMP_DUPLICATE_LIB_OK=TRUE   (last-resort workaround)
+#           or reinstall scipy/numpy from conda-forge to use MKL OpenMP.
+#
+#  Symptom: `DLL load failed while importing simplnx` (Windows).
+#  Cause:   MSVC runtime mismatch between conda dream3dnx and a pip wheel.
+#  Fix:     Microsoft Visual C++ 2015-2022 Redistributable — install
+#           the x64 version from microsoft.com.
 # ─────────────────────────────────────────────────────────────
