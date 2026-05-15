@@ -1,0 +1,171 @@
+# ============================================================
+# Build the standalone Windows bundle (DatasInferno.exe)
+# ============================================================
+# Two trigger modes:
+#
+#   1) workflow_dispatch — manually fire a build from the Actions
+#      tab. The resulting .zip is attached to the workflow run as a
+#      downloadable artifact (retained 30 days). Use this whenever
+#      you want a fresh build off the current branch.
+#
+#   2) push to a tag matching v* (v1.0.0, v0.9.0-rc1, …) — the
+#      build is published as a GitHub Release with the .zip as a
+#      release asset. Users can download from the Releases page.
+#      Stable distribution channel.
+#
+# Bundle contents (matches council.spec):
+#   • Python 3.11 + Tkinter + every dep from requirements.txt
+#   • llama-cpp-python (CPU wheel — see notes at bottom for GPU)
+#   • Pre-resolved native DLLs for pandas / numpy / openpyxl / pyarrow
+#   • Sentence-Transformers + huggingface_hub Python files (model
+#     weights download on first use; not bundled)
+#   • Assets / personality YAML / docs
+#
+# What is NOT bundled (intentional):
+#   • The GGUF model file (users provide their own)
+#   • The vault folder (created at %USERPROFILE%\.council\ at first run)
+# ============================================================
+
+name: Build Windows bundle
+
+# IMPORTANT — repository layout:
+#   • `main` is the full feature track (presentation script, video
+#     auto-edit, seed calibration, …). NOT what gets distributed.
+#   • `Work-Build-App` is the refined "Datas Inferno" subset that
+#     ships as the standalone .exe. Has council.spec, requirements.txt,
+#     and build.bat. THIS is what the workflow always builds by
+#     default.
+#
+# This file lives on the default branch (`main`) so GitHub's "Run
+# workflow" button is visible in the Actions tab — workflow_dispatch
+# triggers only show up for workflows present on the default branch.
+# A dormant copy on Work-Build-App stays in sync so merges between
+# the two branches never conflict on this file.
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to build (default: Work-Build-App)'
+        required: false
+        default: 'Work-Build-App'
+  push:
+    tags: ['v*']
+
+permissions:
+  # Required so the tag-push branch can write to GitHub Releases.
+  # workflow_dispatch builds only upload artifacts and need only the
+  # default read permission, but granting `contents: write` doesn't
+  # widen anything (artifacts use a separate scope).
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout the build target branch
+        uses: actions/checkout@v4
+        with:
+          # workflow_dispatch: use the user-supplied input (defaults to
+          # Work-Build-App via the input's `default:` field above).
+          # Tag push: github.event.inputs.branch is empty, so this falls
+          # through to github.ref — which is the tagged commit. Tags
+          # for release should be created on Work-Build-App, e.g.:
+          #     git checkout Work-Build-App
+          #     git tag v1.0.0
+          #     git push origin v1.0.0
+          ref: ${{ github.event.inputs.branch || github.ref }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      # ------------------------------------------------------------
+      # Install CPU-only PyTorch BEFORE the rest of the deps.
+      #
+      # Why: sentence-transformers transitively depends on torch.
+      # The default `pip install torch` pulls the CUDA-enabled wheel
+      # (~2 GB) — overkill for distribution and bloats the bundle
+      # past the GitHub Release 2 GB per-file limit. CPU torch is
+      # ~200 MB and works fine on any machine (sentence-transformers
+      # auto-detects CPU vs GPU at runtime).
+      #
+      # End users who want GPU embeddings can pip-upgrade torch
+      # inside the bundle's _internal/ folder, or install the GPU
+      # variant fresh in their own Python env.
+      # ------------------------------------------------------------
+      - name: Install CPU-only PyTorch (keeps bundle small)
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install runtime dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller
+
+      - name: Verify critical deps are importable
+        # Fail fast: if any of these import fails, the bundle would
+        # have crashed on first launch anyway. Better to surface
+        # the missing wheel here in 10 seconds than 15 minutes
+        # into the PyInstaller analysis pass.
+        run: python -c "import llama_cpp, pandas, numpy, openpyxl, tkinter, yaml, requests, sentence_transformers, huggingface_hub, pyarrow, duckdb, bson; print('All critical deps OK')"
+
+      - name: Build the bundle (PyInstaller)
+        run: python -m PyInstaller council.spec --noconfirm --clean
+
+      - name: Report bundle size
+        shell: pwsh
+        run: |
+          $size = (Get-ChildItem -Path dist\DatasInferno -Recurse -File `
+                   | Measure-Object -Property Length -Sum).Sum
+          $sizeMB = [math]::Round($size / 1MB, 1)
+          echo "Bundle size on disk: $sizeMB MB"
+
+      - name: Compress bundle to .zip
+        shell: pwsh
+        # Compress-Archive is built-in to Windows runners. For a
+        # ~1.5 GB bundle this takes 3-5 minutes and produces a
+        # ~500-700 MB zip. If we ever outgrow Compress-Archive's
+        # 4 GB limit, switch to 7-Zip (also pre-installed at
+        # 'C:\Program Files\7-Zip\7z.exe').
+        run: |
+          $archive = "DatasInferno-windows-x64.zip"
+          Compress-Archive -Path dist\DatasInferno\* `
+                           -DestinationPath $archive `
+                           -CompressionLevel Optimal
+          $zipMB = [math]::Round((Get-Item $archive).Length / 1MB, 1)
+          echo "Zip size: $zipMB MB"
+
+      - name: Upload as workflow artifact (always)
+        # Always attach the bundle to the workflow run so manual
+        # builds are downloadable. Tag-push builds also get a
+        # Release in the next step, but having the artifact too
+        # is convenient for debugging if the Release step fails.
+        uses: actions/upload-artifact@v4
+        with:
+          name: DatasInferno-windows-x64
+          path: DatasInferno-windows-x64.zip
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        # Uses the pre-installed `gh` CLI on the runner. The
+        # release title is "Datas Inferno <tag>" and the body is
+        # auto-generated from the commit history since the previous
+        # tag (--generate-notes).
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            DatasInferno-windows-x64.zip `
+            --title "Datas Inferno $env:GITHUB_REF_NAME" `
+            --generate-notes
