@@ -37,7 +37,12 @@ import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 
 import council_engine as ce
-import apothecary_engine as ae
+# apothecary_engine is lazily imported inside _build_apoth_tab so
+# consumer builds (no --advanced / COUNCIL_ADVANCED=1) never load
+# the SSH provisioning code or its dependencies. Keep `ae` as None
+# at module scope so any stray reference fails loudly in dev rather
+# than silently working only in advanced mode.
+ae = None  # type: ignore[assignment]
 import branding
 # Set the Windows AppUserModelID *before* any Tk root is constructed, so the
 # taskbar uses our cog+flame icon instead of the host (Spyder/python.exe)
@@ -3331,9 +3336,11 @@ class CouncilConsole(tk.Tk):
         else:
             print("[Council] dream3d_council_patch.py not found — Dream3D expertise not injected")
 
-        self.apoth = ae.Apothecary(
-            registry_path=str(REGISTRY_PATH), store_passwords=STORE_PASSWORDS
-        )
+        # NOTE: self.apoth is no longer initialised here — it moved into
+        # _build_apoth_tab so that consumer builds (which don't build the
+        # tab) never pay the import or init cost for the Apothecary
+        # engine. The advanced-mode branch in _build_ui calls
+        # _build_apoth_tab which sets self.apoth before the tab is added.
 
         self.current_script_name = "script"
         self._stream_buffers: Dict[str, str] = {}  # role -> partial streamed text
@@ -9563,12 +9570,38 @@ class CouncilConsole(tk.Tk):
         self.stt_out.pack(fill="both", expand=True)
         self._tts_engine = None  # lazy init
 
-    # ---- Apothecary tab ----
+    # ---- Apothecary tab (advanced mode only) ----
 
     def _build_apoth_tab(self):
+        """Lazily import apothecary_engine and build the Apothecary tab.
+
+        This is only called from _build_ui when _ADVANCED_MODE is True.
+        Consumer builds skip this entirely — the import never happens,
+        the SSH provisioning code never loads, and the Ollama-flavoured
+        UI strings the Apothecary still contains never appear anywhere
+        in the bundled .exe.
+        """
+        global ae
+        if ae is None:
+            try:
+                import apothecary_engine as _ae_mod
+                ae = _ae_mod
+            except Exception as exc:
+                print(f"[Apothecary] failed to import: {exc!r}")
+                return
+        # Apothecary engine init — also lazy. Was previously created in
+        # __init__ unconditionally; moved here so consumer mode pays
+        # nothing for an engine it'll never expose.
+        if not hasattr(self, "apoth"):
+            self.apoth = ae.Apothecary(
+                registry_path=str(REGISTRY_PATH),
+                store_passwords=STORE_PASSWORDS,
+            )
         self.tab_apoth = ttk.Frame(self.nb)
         self.nb.add(self.tab_apoth, text="🔧 Apothecary")
-        self.apoth_console = ae.ApothecaryConsole(self.tab_apoth, self.apoth, ui_queue=self.ui_q)
+        self.apoth_console = ae.ApothecaryConsole(
+            self.tab_apoth, self.apoth, ui_queue=self.ui_q,
+        )
         self.apoth_console.pack(fill="both", expand=True)
 
     # ============================
