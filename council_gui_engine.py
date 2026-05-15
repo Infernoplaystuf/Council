@@ -648,10 +648,23 @@ def _render_folder_for_injection(folder, max_files=40, max_chars=12000):
                  "available; do not invent files that aren't shown here.)")
     lines.append("")
 
-    # Collect files (recursive, skip hidden/build/protected)
+    # Collect files (recursive, skip hidden/build/protected).
+    # Bound the walk: previously `for p in folder.rglob("*")` traversed
+    # the entire tree even on folders with 50k+ entries (the user only
+    # ever sees 40). On corporate file shares this is multi-second
+    # latency for nothing. SCAN_LIMIT caps the walk; if hit, we tell
+    # the model the listing is partial so it doesn't claim to have
+    # seen everything.
     SKIP_DIRS = {"__pycache__", ".git", ".venv", "venv", "node_modules"}
+    SCAN_LIMIT = 5000   # entries walked, not files kept
     files = []
+    scanned = 0
+    walk_truncated = False
     for p in folder.rglob("*"):
+        scanned += 1
+        if scanned > SCAN_LIMIT:
+            walk_truncated = True
+            break
         if not p.is_file():
             continue
         if any(part in SKIP_DIRS or part.startswith(".")
@@ -677,8 +690,14 @@ def _render_folder_for_injection(folder, max_files=40, max_chars=12000):
     # Truncate if too many
     truncated_n = max(0, len(files) - max_files)
     files_shown = files[:max_files]
-    lines.append(f"Total files: {len(files)}"
-                 + (f" (showing first {max_files})" if truncated_n else ""))
+    total_label = f"{len(files)}" + ("+ " if walk_truncated else "")
+    suffix = ""
+    if walk_truncated:
+        suffix = (f" — walked first {SCAN_LIMIT:,} entries; the folder "
+                  f"contains more files not scanned")
+    elif truncated_n:
+        suffix = f" (showing first {max_files})"
+    lines.append(f"Total files: {total_label}{suffix}")
     lines.append("")
 
     # Per-file summary — short for tabular, name-only for binary
@@ -848,17 +867,45 @@ def _read_file_for_injection(path_str):
             pass
         suffix = p.suffix.lower()
         if suffix == '.csv':
-            with open(p, newline='', encoding='utf-8', errors='replace') as fh:
-                reader = _csv_fi.reader(fh)
-                rows = list(reader)
+            # Bound the read: previously this did `list(reader)` of the
+            # entire file, which on a 500MB / 5M-row CSV materialises
+            # hundreds of MB of Python tuples and can OOM the GUI. The
+            # injection only needs ~24 rows (head + middle + tail), so
+            # we cap reading at 50k rows. For larger files the model
+            # sees the shape of the first 50k rows and is told the
+            # actual file is bigger — the analyst is the right tool
+            # for anything that needs full-file counts.
+            import itertools as _it
+            CSV_ROW_HARD_CAP = 50_000
+            rows: list = []
+            csv_truncated = False
+            try:
+                with open(p, newline='', encoding='utf-8', errors='replace') as fh:
+                    reader = _csv_fi.reader(fh)
+                    # Read up to cap + 1 so we can detect overflow
+                    for i, row in enumerate(_it.islice(reader, CSV_ROW_HARD_CAP + 1)):
+                        if i >= CSV_ROW_HARD_CAP:
+                            csv_truncated = True
+                            break
+                        rows.append(row)
+            except Exception:
+                # Fall through with whatever we managed to read
+                pass
             if not rows:
                 return None
             header = rows[0]
             data_rows = rows[1:]
             total_rows = len(data_rows)
+            if csv_truncated:
+                # Surface the cap to the model — without this it would
+                # report "total rows: 49,999" as if that were the file's
+                # actual size, which is a subtle hallucination.
+                total_rows_str = f"{total_rows:,}+ (file exceeds the {CSV_ROW_HARD_CAP:,}-row injection cap; ask the analyst for exact full-file counts)"
+            else:
+                total_rows_str = f"{total_rows:,}"
 
             lines = ['Columns (' + str(len(header)) + '): ' + ', '.join(header)]
-            lines.append('Total data rows: ' + str(total_rows))
+            lines.append('Total data rows: ' + total_rows_str)
 
             def _fmt(r):
                 cells = []
@@ -976,6 +1023,54 @@ def _extract_file_paths(text):
 
 
 def _inject_file_contents(user_text, analyst_block=None, n_ctx=None):
+    """Public entry point — wraps `_inject_file_contents_impl` in a
+    defensive try/except so unexpected exceptions during injection
+    (vault index corruption, network-share disconnect mid-walk,
+    broken pdf parser, etc.) degrade to "no injection" rather than
+    crashing `_send` and leaving the transcript hung on the user's
+    last typed line.
+    """
+    try:
+        return _inject_file_contents_impl(
+            user_text, analyst_block=analyst_block, n_ctx=n_ctx,
+        )
+    except Exception as _top_e:
+        import sys as _sys_dbg
+        import traceback as _tb
+        print(f"[inject] unexpected top-level exception: {_top_e!r}",
+              file=_sys_dbg.stderr)
+        _tb.print_exc(file=_sys_dbg.stderr)
+        # Build a minimal breakdown so the caller doesn't crash on
+        # `_injection_breakdown.get("costs", [])`.
+        try:
+            import council_engine as _ce_safe
+            n_ctx_safe = int(n_ctx if n_ctx is not None else _ce_safe.get_n_ctx())
+        except Exception:
+            n_ctx_safe = int(n_ctx or 4096)
+        breakdown = {
+            "costs": [],
+            "dropped": [],
+            "n_ctx": n_ctx_safe,
+            "remaining": n_ctx_safe,
+            "per_block_cap": 2048,
+            "running": 0,
+            "user_text_tokens": 0,
+            "injection_error": repr(_top_e),
+        }
+        # Optionally surface the failure as a synthetic NO_DATA-style
+        # block so the model is told context retrieval failed and
+        # refuses to invent values from training memory.
+        warn = (
+            "[INJECTION FAILURE — the vault / file readers raised an "
+            "unexpected error while gathering context for this query.]\n"
+            f"  error: {_top_e!r}\n"
+            "[Treat this turn as if NO data has been provided. Do NOT "
+            "invent specific values, file names, or row counts.]"
+        )
+        return (warn + "\n\n" + (user_text or "")), {}, breakdown
+
+
+def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None):
     """Augment the user message with file/vault context before deliberation.
 
     Returns ``(augmented_text, fuzzy_matches, breakdown)`` where:
@@ -1219,6 +1314,24 @@ def _get_vault_index():
 # locked-down sandbox, and returns the result as text the Writer can quote.
 
 def _run_analyst_step(query):
+    """Public entry point — wraps `_run_analyst_step_impl` in a defensive
+    try/except so that any unexpected exception (network share dropped
+    mid-call, malformed vault state, OOM mid-tokenize, etc.) degrades
+    cleanly to "no analyst" rather than crashing `_send`. The caller's
+    transcript stays interactive instead of hanging on "computing…".
+    """
+    try:
+        return _run_analyst_step_impl(query)
+    except Exception as _top_e:
+        import sys as _sys_dbg
+        import traceback as _tb
+        print(f"[analyst] unexpected top-level exception: {_top_e!r}",
+              file=_sys_dbg.stderr)
+        _tb.print_exc(file=_sys_dbg.stderr)
+        return None, None, []
+
+
+def _run_analyst_step_impl(query):
     """If `query` looks computational, generate pandas code via a local model
     and execute it sandboxed against the vault's data_in/ folder.
 
@@ -1284,15 +1397,23 @@ def _run_analyst_step(query):
     filename_hints_text = ""
     if filename_hints_pairs:
         # Build a one-line summary for the transcript so the user can spot
-        # a wrong match before reading the answer. Multiple resolutions
-        # are joined with "; " — typically there are 1-3.
+        # a wrong match before reading the answer. Suppress trivial
+        # resolutions where the token == filename — those look like
+        # typos to the user ("Filename hints: 'sales.csv' → sales.csv")
+        # and add no information. Only surface non-trivial resolutions
+        # and "no match" cases.
         bits: list = []
         for tok, resolved in filename_hints_pairs:
             if resolved is None:
                 bits.append(f"'{tok}' → no match")
-            else:
+            elif tok.lower() != resolved.name.lower():
+                # Non-trivial resolution — the user said one thing, the
+                # resolver picked something different. This is the case
+                # they need to see.
                 bits.append(f"'{tok}' → {resolved.name}")
-        notices.append("Filename hints: " + "; ".join(bits))
+            # else: exact match between user token and filename → silent
+        if bits:
+            notices.append("Filename hints: " + "; ".join(bits))
 
         filename_hints_text = _va.format_filename_hints(
             filename_hints_pairs,
@@ -10620,6 +10741,21 @@ class CouncilConsole(tk.Tk):
             user_text, analyst_block=_analyst_block, n_ctx=_n_ctx,
         )
         self._last_injection_breakdown = _injection_breakdown
+        # Surface defensive-wrapper failures to the transcript. When the
+        # injection pipeline's top-level try/except fires, the breakdown
+        # carries an `injection_error` field — without surfacing it, the
+        # user just sees a generic answer and has no idea context
+        # retrieval failed silently.
+        _inj_err = _injection_breakdown.get("injection_error") if isinstance(_injection_breakdown, dict) else None
+        if _inj_err:
+            self._append_transcript(
+                "Council",
+                f"⚠ Context retrieval failed with an unexpected error: "
+                f"{_inj_err}\n"
+                f"The model has been told to treat this turn as no-data-"
+                f"provided and will refuse to invent specific values.",
+                "observation",
+            )
         # ``was_injected`` is the legacy gate that suppresses the fast-path
         # chart/lookup handlers below. The OLD pipeline only injected vault
         # hits + explicit files (analyst was a separate post-step), so this
