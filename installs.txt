@@ -22,7 +22,7 @@ conda create -n council python=3.12 -y && conda activate council
 conda install -c bluequartzsoftware dream3dnx -y && conda install -c conda-forge h5py "numpy<2.3" -y
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 pip install llama-cpp-python
-pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper html2text huggingface_hub kaleido langchain-core langgraph matplotlib mido music21 openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb "pandas<2.3"
+pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper html2text huggingface_hub kaleido matplotlib mido music21 openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb "pandas<2.3"
 pip install spyder-kernels && crawl4ai-setup
 python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print('all imports OK')"
 
@@ -46,7 +46,7 @@ conda create -n council python=3.12 -y && conda activate council
 conda install -c bluequartzsoftware dream3dnx -y && conda install -c conda-forge h5py "numpy<2.3" -y
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121 --force-reinstall --no-cache-dir
-pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper html2text huggingface_hub kaleido langchain-core langgraph matplotlib mido music21 openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb "pandas<2.3"
+pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper html2text huggingface_hub kaleido matplotlib mido music21 openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb "pandas<2.3"
 pip install spyder-kernels && crawl4ai-setup
 python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print('all imports OK')"
 
@@ -68,7 +68,7 @@ conda create -n council python=3.12 -y && conda activate council
 conda install -c bluequartzsoftware dream3dnx -y && conda install -c conda-forge h5py "numpy<2.3" -y
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 --force-reinstall --no-cache-dir
-pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper html2text huggingface_hub kaleido langchain-core langgraph matplotlib mido music21 openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb "pandas<2.3"
+pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper html2text huggingface_hub kaleido matplotlib mido music21 openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb "pandas<2.3"
 pip install spyder-kernels && crawl4ai-setup
 python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print('all imports OK')"
 
@@ -94,7 +94,7 @@ conda create -n council python=3.12 -y && conda activate council
 conda install -c bluequartzsoftware dream3dnx -y && conda install -c conda-forge h5py "numpy<2.3" -y
 pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 --force-reinstall --no-cache-dir
-pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper html2text huggingface_hub kaleido langchain-core langgraph matplotlib mido music21 openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb "pandas<2.3"
+pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper html2text huggingface_hub kaleido matplotlib mido music21 openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb "pandas<2.3"
 pip install spyder-kernels && crawl4ai-setup
 python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'); print('all imports OK')"
 
