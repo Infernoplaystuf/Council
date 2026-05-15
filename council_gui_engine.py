@@ -648,10 +648,23 @@ def _render_folder_for_injection(folder, max_files=40, max_chars=12000):
                  "available; do not invent files that aren't shown here.)")
     lines.append("")
 
-    # Collect files (recursive, skip hidden/build/protected)
+    # Collect files (recursive, skip hidden/build/protected).
+    # Bound the walk: previously `for p in folder.rglob("*")` traversed
+    # the entire tree even on folders with 50k+ entries (the user only
+    # ever sees 40). On corporate file shares this is multi-second
+    # latency for nothing. SCAN_LIMIT caps the walk; if hit, we tell
+    # the model the listing is partial so it doesn't claim to have
+    # seen everything.
     SKIP_DIRS = {"__pycache__", ".git", ".venv", "venv", "node_modules"}
+    SCAN_LIMIT = 5000   # entries walked, not files kept
     files = []
+    scanned = 0
+    walk_truncated = False
     for p in folder.rglob("*"):
+        scanned += 1
+        if scanned > SCAN_LIMIT:
+            walk_truncated = True
+            break
         if not p.is_file():
             continue
         if any(part in SKIP_DIRS or part.startswith(".")
@@ -677,8 +690,14 @@ def _render_folder_for_injection(folder, max_files=40, max_chars=12000):
     # Truncate if too many
     truncated_n = max(0, len(files) - max_files)
     files_shown = files[:max_files]
-    lines.append(f"Total files: {len(files)}"
-                 + (f" (showing first {max_files})" if truncated_n else ""))
+    total_label = f"{len(files)}" + ("+ " if walk_truncated else "")
+    suffix = ""
+    if walk_truncated:
+        suffix = (f" — walked first {SCAN_LIMIT:,} entries; the folder "
+                  f"contains more files not scanned")
+    elif truncated_n:
+        suffix = f" (showing first {max_files})"
+    lines.append(f"Total files: {total_label}{suffix}")
     lines.append("")
 
     # Per-file summary — short for tabular, name-only for binary
@@ -848,17 +867,45 @@ def _read_file_for_injection(path_str):
             pass
         suffix = p.suffix.lower()
         if suffix == '.csv':
-            with open(p, newline='', encoding='utf-8', errors='replace') as fh:
-                reader = _csv_fi.reader(fh)
-                rows = list(reader)
+            # Bound the read: previously this did `list(reader)` of the
+            # entire file, which on a 500MB / 5M-row CSV materialises
+            # hundreds of MB of Python tuples and can OOM the GUI. The
+            # injection only needs ~24 rows (head + middle + tail), so
+            # we cap reading at 50k rows. For larger files the model
+            # sees the shape of the first 50k rows and is told the
+            # actual file is bigger — the analyst is the right tool
+            # for anything that needs full-file counts.
+            import itertools as _it
+            CSV_ROW_HARD_CAP = 50_000
+            rows: list = []
+            csv_truncated = False
+            try:
+                with open(p, newline='', encoding='utf-8', errors='replace') as fh:
+                    reader = _csv_fi.reader(fh)
+                    # Read up to cap + 1 so we can detect overflow
+                    for i, row in enumerate(_it.islice(reader, CSV_ROW_HARD_CAP + 1)):
+                        if i >= CSV_ROW_HARD_CAP:
+                            csv_truncated = True
+                            break
+                        rows.append(row)
+            except Exception:
+                # Fall through with whatever we managed to read
+                pass
             if not rows:
                 return None
             header = rows[0]
             data_rows = rows[1:]
             total_rows = len(data_rows)
+            if csv_truncated:
+                # Surface the cap to the model — without this it would
+                # report "total rows: 49,999" as if that were the file's
+                # actual size, which is a subtle hallucination.
+                total_rows_str = f"{total_rows:,}+ (file exceeds the {CSV_ROW_HARD_CAP:,}-row injection cap; ask the analyst for exact full-file counts)"
+            else:
+                total_rows_str = f"{total_rows:,}"
 
             lines = ['Columns (' + str(len(header)) + '): ' + ', '.join(header)]
-            lines.append('Total data rows: ' + str(total_rows))
+            lines.append('Total data rows: ' + total_rows_str)
 
             def _fmt(r):
                 cells = []
