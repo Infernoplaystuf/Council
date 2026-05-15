@@ -28,10 +28,27 @@
 
 name: Build Windows bundle
 
+# IMPORTANT — repository layout:
+#   • `main` is the full feature track (presentation script, video
+#     auto-edit, seed calibration, …). NOT what gets distributed.
+#   • `Work-Build-App` is the refined "Datas Inferno" subset that
+#     ships as the standalone .exe. Has council.spec, requirements.txt,
+#     and build.bat. THIS is what the workflow always builds by
+#     default.
+#
+# This file lives on the default branch (`main`) so GitHub's "Run
+# workflow" button is visible in the Actions tab — workflow_dispatch
+# triggers only show up for workflows present on the default branch.
+# A dormant copy on Work-Build-App stays in sync so merges between
+# the two branches never conflict on this file.
+
 on:
   workflow_dispatch:
-    # Manual trigger — no inputs needed; just hit "Run workflow"
-    # from the Actions tab.
+    inputs:
+      branch:
+        description: 'Branch to build (default: Work-Build-App)'
+        required: false
+        default: 'Work-Build-App'
   push:
     tags: ['v*']
 
@@ -48,8 +65,18 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - name: Checkout repo
+      - name: Checkout the build target branch
         uses: actions/checkout@v4
+        with:
+          # workflow_dispatch: use the user-supplied input (defaults to
+          # Work-Build-App via the input's `default:` field above).
+          # Tag push: github.event.inputs.branch is empty, so this falls
+          # through to github.ref — which is the tagged commit. Tags
+          # for release should be created on Work-Build-App, e.g.:
+          #     git checkout Work-Build-App
+          #     git tag v1.0.0
+          #     git push origin v1.0.0
+          ref: ${{ github.event.inputs.branch || github.ref }}
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
