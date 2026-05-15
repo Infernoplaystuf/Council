@@ -1023,6 +1023,54 @@ def _extract_file_paths(text):
 
 
 def _inject_file_contents(user_text, analyst_block=None, n_ctx=None):
+    """Public entry point — wraps `_inject_file_contents_impl` in a
+    defensive try/except so unexpected exceptions during injection
+    (vault index corruption, network-share disconnect mid-walk,
+    broken pdf parser, etc.) degrade to "no injection" rather than
+    crashing `_send` and leaving the transcript hung on the user's
+    last typed line.
+    """
+    try:
+        return _inject_file_contents_impl(
+            user_text, analyst_block=analyst_block, n_ctx=n_ctx,
+        )
+    except Exception as _top_e:
+        import sys as _sys_dbg
+        import traceback as _tb
+        print(f"[inject] unexpected top-level exception: {_top_e!r}",
+              file=_sys_dbg.stderr)
+        _tb.print_exc(file=_sys_dbg.stderr)
+        # Build a minimal breakdown so the caller doesn't crash on
+        # `_injection_breakdown.get("costs", [])`.
+        try:
+            import council_engine as _ce_safe
+            n_ctx_safe = int(n_ctx if n_ctx is not None else _ce_safe.get_n_ctx())
+        except Exception:
+            n_ctx_safe = int(n_ctx or 4096)
+        breakdown = {
+            "costs": [],
+            "dropped": [],
+            "n_ctx": n_ctx_safe,
+            "remaining": n_ctx_safe,
+            "per_block_cap": 2048,
+            "running": 0,
+            "user_text_tokens": 0,
+            "injection_error": repr(_top_e),
+        }
+        # Optionally surface the failure as a synthetic NO_DATA-style
+        # block so the model is told context retrieval failed and
+        # refuses to invent values from training memory.
+        warn = (
+            "[INJECTION FAILURE — the vault / file readers raised an "
+            "unexpected error while gathering context for this query.]\n"
+            f"  error: {_top_e!r}\n"
+            "[Treat this turn as if NO data has been provided. Do NOT "
+            "invent specific values, file names, or row counts.]"
+        )
+        return (warn + "\n\n" + (user_text or "")), {}, breakdown
+
+
+def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None):
     """Augment the user message with file/vault context before deliberation.
 
     Returns ``(augmented_text, fuzzy_matches, breakdown)`` where:
@@ -1266,6 +1314,24 @@ def _get_vault_index():
 # locked-down sandbox, and returns the result as text the Writer can quote.
 
 def _run_analyst_step(query):
+    """Public entry point — wraps `_run_analyst_step_impl` in a defensive
+    try/except so that any unexpected exception (network share dropped
+    mid-call, malformed vault state, OOM mid-tokenize, etc.) degrades
+    cleanly to "no analyst" rather than crashing `_send`. The caller's
+    transcript stays interactive instead of hanging on "computing…".
+    """
+    try:
+        return _run_analyst_step_impl(query)
+    except Exception as _top_e:
+        import sys as _sys_dbg
+        import traceback as _tb
+        print(f"[analyst] unexpected top-level exception: {_top_e!r}",
+              file=_sys_dbg.stderr)
+        _tb.print_exc(file=_sys_dbg.stderr)
+        return None, None, []
+
+
+def _run_analyst_step_impl(query):
     """If `query` looks computational, generate pandas code via a local model
     and execute it sandboxed against the vault's data_in/ folder.
 
