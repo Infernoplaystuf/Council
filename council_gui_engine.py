@@ -1397,15 +1397,23 @@ def _run_analyst_step_impl(query):
     filename_hints_text = ""
     if filename_hints_pairs:
         # Build a one-line summary for the transcript so the user can spot
-        # a wrong match before reading the answer. Multiple resolutions
-        # are joined with "; " — typically there are 1-3.
+        # a wrong match before reading the answer. Suppress trivial
+        # resolutions where the token == filename — those look like
+        # typos to the user ("Filename hints: 'sales.csv' → sales.csv")
+        # and add no information. Only surface non-trivial resolutions
+        # and "no match" cases.
         bits: list = []
         for tok, resolved in filename_hints_pairs:
             if resolved is None:
                 bits.append(f"'{tok}' → no match")
-            else:
+            elif tok.lower() != resolved.name.lower():
+                # Non-trivial resolution — the user said one thing, the
+                # resolver picked something different. This is the case
+                # they need to see.
                 bits.append(f"'{tok}' → {resolved.name}")
-        notices.append("Filename hints: " + "; ".join(bits))
+            # else: exact match between user token and filename → silent
+        if bits:
+            notices.append("Filename hints: " + "; ".join(bits))
 
         filename_hints_text = _va.format_filename_hints(
             filename_hints_pairs,
@@ -10733,6 +10741,21 @@ class CouncilConsole(tk.Tk):
             user_text, analyst_block=_analyst_block, n_ctx=_n_ctx,
         )
         self._last_injection_breakdown = _injection_breakdown
+        # Surface defensive-wrapper failures to the transcript. When the
+        # injection pipeline's top-level try/except fires, the breakdown
+        # carries an `injection_error` field — without surfacing it, the
+        # user just sees a generic answer and has no idea context
+        # retrieval failed silently.
+        _inj_err = _injection_breakdown.get("injection_error") if isinstance(_injection_breakdown, dict) else None
+        if _inj_err:
+            self._append_transcript(
+                "Council",
+                f"⚠ Context retrieval failed with an unexpected error: "
+                f"{_inj_err}\n"
+                f"The model has been told to treat this turn as no-data-"
+                f"provided and will refuse to invent specific values.",
+                "observation",
+            )
         # ``was_injected`` is the legacy gate that suppresses the fast-path
         # chart/lookup handlers below. The OLD pipeline only injected vault
         # hits + explicit files (analyst was a separate post-step), so this
