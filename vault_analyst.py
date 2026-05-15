@@ -2892,10 +2892,13 @@ _SUBFOLDER_HINT_RE = _re_va.compile(
     r"\b(?:in|inside|under|within|from)\s+"
     r"(?:my\s+|the\s+|our\s+)?"
     r"(?:folder\s+|directory\s+|dir\s+|subfolder\s+|subdirectory\s+)?"
-    # Capture group: a path-like token, no spaces, allowed chars are
-    # word chars, dot, dash, slash, backslash. Length-bounded to avoid
-    # eating most of the sentence.
-    r"([A-Za-z0-9_][A-Za-z0-9_\-./\\]{0,80})"
+    # Capture group: a path-like token. Allowed chars cover:
+    #   word chars, dot, dash, slash, backslash — plus ':' so Windows
+    #   absolute paths ("C:\Users\...") and '~' for home shortcuts
+    #   ("~/data") are captured intact instead of being chopped at the
+    #   first colon/tilde. Length-bounded so we don't swallow the whole
+    #   sentence on edge cases.
+    r"([A-Za-z0-9_~][A-Za-z0-9_\-./\\:~]{0,120})"
     r"(?:\s+(?:folder|directory|subfolder|subdirectory))?\b",
     _re_va.IGNORECASE,
 )
@@ -2947,6 +2950,12 @@ def _fuzzy_match_filename(token: str, candidates: List[Path],
     extension) and picks the highest similarity score above the cutoff.
     Returns None if no candidate clears the bar — better to surface
     "no match" to the user than to confidently pick a wrong file.
+
+    For very short tokens (< 6 chars, like "a.csv" or "x") the
+    SequenceMatcher ratio is too noisy — "a.csv" vs "b.csv" yields
+    0.8 by character overlap alone, which would silently grab the
+    wrong file. We raise the cutoff to 0.85 for tokens of length 5
+    and require exact/substring match for tokens of length ≤ 4.
     """
     if not token or not candidates:
         return None
@@ -2961,6 +2970,13 @@ def _fuzzy_match_filename(token: str, candidates: List[Path],
         if token_lc in p.name.lower():
             return p
 
+    # Very short tokens: refuse to fuzzy-match. The ratio is too noisy
+    # and a wrong silent pick is worse than no pick.
+    if len(token_lc) <= 4:
+        return None
+    # Short-but-not-tiny tokens (5 chars): demand a higher confidence.
+    effective_cutoff = max(cutoff, 0.85) if len(token_lc) == 5 else cutoff
+
     # Fall back to difflib ratio against both .name and .stem forms.
     best_score = 0.0
     best_path: Optional[Path] = None
@@ -2970,7 +2986,7 @@ def _fuzzy_match_filename(token: str, candidates: List[Path],
             if ratio > best_score:
                 best_score = ratio
                 best_path = p
-    return best_path if best_score >= cutoff else None
+    return best_path if best_score >= effective_cutoff else None
 
 
 def resolve_filename_hints(query: str, allowed_folders: List[Path]
@@ -3070,15 +3086,41 @@ def resolve_subfolder_hint(query: str, base_folder: Path
 
     # Try each match position in the query and resolve to a real folder
     for m in _SUBFOLDER_HINT_RE.finditer(query):
-        cand = m.group(1).strip().strip("/\\").strip("'\"`")
+        cand = m.group(1).strip().strip("'\"`")
+        # Don't strip leading slashes from absolute paths ("/home/...") but
+        # do strip path separators that snuck in via the regex tail.
+        if cand and not cand.startswith(("/", "\\")) and not (
+            len(cand) >= 2 and cand[1] == ":"
+        ):
+            cand = cand.strip("/\\")
         if not cand or cand.lower() in _COMMON_WORD_DENYLIST:
             continue
         # Skip tokens that look like filenames (they have data-file extensions)
         if "." in cand and cand.rsplit(".", 1)[1].lower() in (
             "csv", "tsv", "xlsx", "xls", "xlsm", "parquet", "json",
             "sqlite", "sqlite3", "db", "duckdb", "bson", "h5", "hdf5",
+            "d3dpipeline", "gz",
         ):
             continue
+
+        # Absolute / home-relative paths: if the user pasted a full path
+        # AND it lives under base_folder AND it's a real directory,
+        # return it directly. Without this, "in C:\Users\me\.council\
+        # vault\data_in\Q3" silently fell through to fuzzy matching
+        # against immediate children of data_in/, which never resolves.
+        try:
+            abs_cand = Path(cand).expanduser()
+        except Exception:
+            abs_cand = None
+        if abs_cand is not None and abs_cand.is_absolute() and abs_cand.is_dir():
+            try:
+                abs_cand.resolve().relative_to(base_folder.resolve())
+                return abs_cand.resolve()
+            except (ValueError, OSError):
+                # Outside base_folder — don't expose paths the analyst
+                # has no business reading.
+                pass
+
         cand_norm = _norm(cand)
 
         # Exact-name match first
@@ -3086,12 +3128,16 @@ def resolve_subfolder_hint(query: str, base_folder: Path
             if _norm(child.name) == cand_norm:
                 return child
 
-        # Path-prefix match ("projects/Q3" → data_in/projects/Q3)
+        # Path-prefix match ("projects/Q3" → data_in/projects/Q3).
+        # Strip the absolute-path prefix if the user gave one inside
+        # base_folder but we somehow missed the abs-path branch above.
         if "/" in cand or "\\" in cand:
+            walk_parts = [p for p in _re_va.split(r"[/\\]", cand) if p]
+            # Skip Windows drive letter ("C:") if present
+            if walk_parts and len(walk_parts[0]) == 2 and walk_parts[0][1] == ":":
+                walk_parts = walk_parts[1:]
             sub = base_folder
-            for part in _re_va.split(r"[/\\]", cand):
-                if not part:
-                    continue
+            for part in walk_parts:
                 next_match = None
                 try:
                     for child in sub.iterdir():
@@ -3125,16 +3171,22 @@ def resolve_subfolder_hint(query: str, base_folder: Path
 
 
 def format_filename_hints(hints: List[Tuple[str, Optional[Path]]],
-                          base_folder: Optional[Path] = None) -> str:
+                          base_folder: Optional[Path] = None,
+                          max_hints: int = 8) -> str:
     """Render filename-hint pairs into a short block for the prompt.
 
     The block is appended to `build_pandas_code_prompt` output so the
     model uses the resolved filenames instead of guessing.
+
+    Cap the number of hints rendered at `max_hints` so a verbose
+    question with 20 quoted phrases doesn't blow the prompt budget.
+    Excess hints are summarised in a single trailer line.
     """
     if not hints:
         return ""
     lines = ["NOTE — Resolved file references from the user's question:"]
-    for tok, resolved in hints:
+    rendered = hints[:max_hints]
+    for tok, resolved in rendered:
         if resolved is None:
             lines.append(
                 f'  • "{tok}"  → NO MATCH in inventory. Do NOT invent '
@@ -3148,6 +3200,12 @@ def format_filename_hints(hints: List[Tuple[str, Optional[Path]]],
             except Exception:
                 rel = resolved
             lines.append(f'  • "{tok}"  → "{rel}"')
+    if len(hints) > max_hints:
+        extra = len(hints) - max_hints
+        lines.append(
+            f"  ... ({extra} more file reference{'s' if extra != 1 else ''} "
+            f"not shown — use the resolved names above, refuse to invent.)"
+        )
     return "\n".join(lines)
 
 
