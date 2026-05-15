@@ -223,23 +223,87 @@ present in `dist/DatasInferno/`.
 
 ---
 
-## 7. CI / automated builds
+## 7. CI / automated builds — `.github/workflows/build.yml`
 
-The build is fully scriptable. A minimal GitHub Actions job:
+A ready-to-use GitHub Actions workflow lives at
+`.github/workflows/build.yml`. It builds a Windows bundle on
+GitHub-hosted runners, so you can download a working
+`DatasInferno.exe` without setting up a Python environment on
+your own machine.
 
-```yaml
-- uses: actions/setup-python@v5
-  with: { python-version: "3.11" }
-- run: pip install -r requirements.txt pyinstaller
-- run: pyinstaller council.spec --noconfirm --clean
-- uses: actions/upload-artifact@v4
-  with:
-    name: DatasInferno-${{ runner.os }}
-    path: dist/DatasInferno/
+### How to trigger it
+
+**Manual build** — for whenever you want a fresh `.exe` of the
+current branch state:
+
+1. Push your changes to GitHub.
+2. Open the repo on github.com → **Actions** tab.
+3. Pick **"Build Windows bundle"** in the left sidebar.
+4. Click **"Run workflow"** in the top right, select the branch
+   (e.g. `Work-Build-App`), confirm.
+5. Wait ~15–20 minutes for the runner to install deps and pack
+   the bundle. Status spinner is live.
+6. When the run shows ✅, scroll to the **Artifacts** section at
+   the bottom of the run page and download
+   `DatasInferno-windows-x64.zip`.
+
+The artifact is retained for 30 days. The .zip extracts to a
+self-contained `DatasInferno/` folder with `DatasInferno.exe`
+inside; run that — no Python install needed.
+
+**Release build** — for tagged versions that should show up on
+the Releases page:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
 ```
 
-Use the `windows-latest`, `macos-latest`, `ubuntu-latest` runners
-to produce all three platform bundles in parallel. CUDA support
-on Linux/Windows runners requires either a self-hosted runner with
-a GPU **or** building the CPU variant of `llama-cpp-python` for
-distribution and letting end users replace it locally.
+The same workflow fires, plus an extra step at the end that
+publishes a **GitHub Release** with the .zip as a release asset
+and auto-generated release notes from the commits since the
+previous tag. Anyone visiting your repo's Releases page can grab
+the latest stable build.
+
+### What the workflow does
+
+1. Checks out the repo on a Windows runner.
+2. Sets up Python 3.11.
+3. Installs the **CPU-only** PyTorch wheel from
+   `download.pytorch.org/whl/cpu` (avoids pulling the 2 GB CUDA
+   wheel that sentence-transformers would otherwise drag in).
+4. `pip install -r requirements.txt` for the rest of the deps.
+5. `pip install pyinstaller`.
+6. Probe-imports the critical packages so a missing wheel fails
+   fast (10 seconds) instead of 15 minutes into PyInstaller.
+7. Runs `pyinstaller council.spec --noconfirm --clean`.
+8. Reports bundle size, then `Compress-Archive` into
+   `DatasInferno-windows-x64.zip`.
+9. Uploads the .zip as a workflow artifact (always).
+10. If the trigger was a tag push, publishes a Release with the
+    .zip attached and `--generate-notes`.
+
+### Limitations to be aware of
+
+- **CPU only.** GitHub-hosted runners don't have GPUs, so the
+  bundled `llama-cpp-python` is the CPU wheel. End users with
+  GPUs need to manually replace `_internal/llama_cpp/*.dll`
+  with the CUDA variant matching their driver (see `installs.txt`
+  for the exact wheel index URLs), **or** install the GPU
+  variant fresh in their own Python env. The CPU bundle works
+  fine for inference on modern x86_64 — just slower than GPU.
+
+- **macOS / Linux not built.** Only `windows-latest` is wired up.
+  Adding cross-platform builds is a matter of duplicating the
+  job with `runs-on: macos-latest` / `ubuntu-latest`. Each
+  platform produces its own .zip / .dmg / .AppImage.
+
+- **No code signing.** First-launch SmartScreen warnings are
+  expected. See §5 for signing details.
+
+- **Bundle size on Releases.** GitHub allows up to 2 GB per
+  release asset. The CPU-torch bundle compresses to ~600 MB,
+  well under the limit. If you add heavier deps in the future
+  and exceed 2 GB compressed, switch to attaching the asset via
+  `gh release upload --clobber` (which uses the LFS-style
+  blob upload that allows larger files).
