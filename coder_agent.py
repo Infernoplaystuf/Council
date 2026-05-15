@@ -5,10 +5,13 @@
 #   write code → execute → read error → reflect → fix → repeat
 #   Up to MAX_ATTEMPTS before giving up.
 #
-# Install:
-#   pip install langgraph langchain-ollama
-#
-# Falls back gracefully to single-shot if langgraph not installed.
+# Backend: GGUF only, via council_engine.PersonalityModel.respond().
+# No LangGraph / langchain_ollama dependency — those used to provide
+# an alternate Ollama-backed path but the app is GGUF-only now, and
+# carrying the langchain stack just to wrap our existing loop in a
+# state machine wasn't worth the import-time cost (or the silent
+# DLL-load failures on Windows when transitive torch wheels mismatch
+# the CUDA toolkit). The ReAct loop below is the only path.
 # ============================================================
 
 from __future__ import annotations
@@ -16,37 +19,15 @@ from __future__ import annotations
 import re
 import sys
 import subprocess
-import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-# ── LangGraph (optional) ─────────────────────────────────────
-# Catch OSError/ImportError broadly — on Windows, torch DLL load
-# failures surface as OSError even though the import chain starts
-# with langchain_ollama. The council doesn't need torch at all;
-# this is a transitive dependency in langchain_core.
-_LANGGRAPH_OK = False
-try:
-    from langgraph.graph import StateGraph, END
-    from langchain_ollama import ChatOllama
-    from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
-    _LANGGRAPH_OK = True
-except (ImportError, OSError) as _e:
-    # OSError on Windows = DLL load failure (usually torch/CUDA mismatch)
-    if isinstance(_e, OSError):
-        print(f"[Coder] LangGraph skipped — DLL load error: {_e}")
-        print("[Coder] Tip: run  pip uninstall torch torchvision torchaudio -y")
-        print("             then reinstall matching your CUDA version, or use CPU-only:")
-        print("             pip install torch --index-url https://download.pytorch.org/whl/cpu")
-
-
-# ── Fallback: use council_engine directly ────────────────────
 import council_engine as ce
 
 
 # ============================================================
-# State schema (works without LangGraph too)
+# State schema
 # ============================================================
 
 @dataclass
@@ -195,140 +176,10 @@ def _run_code(code: str, filename: str, workspace: Path, timeout: int = 30) -> T
 
 
 # ============================================================
-# LangGraph agent (when available)
+# Self-correcting ReAct loop (the only path now)
 # ============================================================
 
-def _build_langgraph_agent(
-    host: str,
-    model: str,
-    workspace: Path,
-    max_attempts: int = 8,
-    event_callback: Optional[Callable[[str, str], None]] = None,
-) -> Any:
-    """
-    Build a LangGraph StateGraph for the coding agent.
-    event_callback(phase, message) fires on each state transition.
-    """
-    if not _LANGGRAPH_OK:
-        raise RuntimeError("langgraph not installed")
-
-    llm = ChatOllama(model=model, base_url=host, temperature=0.15, num_predict=3000)
-
-    def _emit(phase: str, msg: str):
-        if event_callback:
-            event_callback(phase, msg)
-
-    # ── Node: generate (first attempt) ──────────────────────
-    def node_generate(state: dict) -> dict:
-        task = state["task"]
-        attempt = state.get("attempt", 0) + 1
-        _emit("generate", f"Attempt {attempt}/{max_attempts} — writing code…")
-
-        if attempt == 1:
-            prompt = FIRST_ATTEMPT_PROMPT.format(task=task)
-        else:
-            prompt = FIX_PROMPT_TEMPLATE.format(
-                task=task,
-                attempt=attempt - 1,
-                max_attempts=max_attempts,
-                code=state.get("code", ""),
-                returncode=state.get("returncode", -1),
-                stdout=state.get("stdout", "")[:1500],
-                stderr=state.get("stderr", "")[:1500],
-            )
-
-        messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
-        response = llm.invoke(messages)
-        code = _extract_code(response.content)
-        filename = _make_filename(task) + f"_v{attempt}.py"
-
-        history = state.get("history", [])
-        history.append({"attempt": attempt, "code": code})
-
-        return {**state, "code": code, "filename": filename,
-                "attempt": attempt, "history": history}
-
-    # ── Node: execute ────────────────────────────────────────
-    def node_execute(state: dict) -> dict:
-        attempt = state["attempt"]
-        _emit("execute", f"Attempt {attempt} — running code…")
-
-        # Dream3D static validation before execution
-        try:
-            from dream3d_primer import PipelineValidator
-            valid, issues = PipelineValidator.validate(state["code"])
-            if not valid:
-                feedback = PipelineValidator.format_feedback(issues)
-                _emit("validate", f"Static analysis issues:\n{feedback}")
-                # Return as failed so generate node fixes it
-                return {**state, "returncode": -2, "stdout": "",
-                        "stderr": feedback, "passed": False}
-        except ImportError:
-            pass
-
-        rc, stdout, stderr = _run_code(state["code"], state["filename"], workspace)
-        passed = rc == 0
-
-        status = "✓ PASSED" if passed else f"✗ FAILED (rc={rc})"
-        _emit("result", f"Attempt {attempt} {status}\nstdout: {stdout[:300]}\nstderr: {stderr[:300]}")
-
-        return {**state, "returncode": rc, "stdout": stdout,
-                "stderr": stderr, "passed": passed}
-
-    # ── Node: explain ────────────────────────────────────────
-    def node_explain(state: dict) -> dict:
-        _emit("explain", "Generating explanation…")
-        prompt = EXPLAIN_PROMPT.format(task=state["task"], code=state["code"])
-        messages = [HumanMessage(content=prompt)]
-        response = llm.invoke(messages)
-        return {**state, "final_code": state["code"], "explanation": response.content}
-
-    # ── Node: give_up ────────────────────────────────────────
-    def node_give_up(state: dict) -> dict:
-        _emit("give_up", f"Exhausted {max_attempts} attempts. Returning best effort.")
-        # Pick the attempt with lowest returncode, fallback to last
-        best = state.get("code", "")
-        for h in state.get("history", []):
-            if h.get("passed"):
-                best = h["code"]
-                break
-        return {**state, "final_code": best, "explanation":
-                f"Could not produce passing code in {max_attempts} attempts. "
-                "Returning last generated version — review stderr for details."}
-
-    # ── Routing ──────────────────────────────────────────────
-    def should_continue(state: dict) -> str:
-        if state.get("passed"):
-            return "explain"
-        if state.get("attempt", 0) >= max_attempts:
-            return "give_up"
-        return "generate"
-
-    # ── Build graph ──────────────────────────────────────────
-    graph = StateGraph(dict)
-    graph.add_node("generate", node_generate)
-    graph.add_node("execute",  node_execute)
-    graph.add_node("explain",  node_explain)
-    graph.add_node("give_up",  node_give_up)
-
-    graph.set_entry_point("generate")
-    graph.add_edge("generate", "execute")
-    graph.add_conditional_edges("execute", should_continue, {
-        "generate": "generate",
-        "explain":  "explain",
-        "give_up":  "give_up",
-    })
-    graph.add_edge("explain",  END)
-    graph.add_edge("give_up",  END)
-
-    return graph.compile()
-
-
-# ============================================================
-# Fallback: pure-Python ReAct loop (no LangGraph)
-# ============================================================
-
-def _run_fallback_loop(
+def _run_react_loop(
     task: str,
     personality_model: Any,          # ce.PersonalityModel
     runner: ce.LocalRunner,
@@ -336,8 +187,11 @@ def _run_fallback_loop(
     event_callback: Optional[Callable[[str, str], None]] = None,
 ) -> AgentState:
     """
-    Self-correcting loop using council_engine directly.
-    No LangGraph required.
+    Write → execute → reflect → fix loop, backed by the GGUF runtime
+    via council_engine.PersonalityModel.respond().
+
+    event_callback(phase, message) fires on every state transition so
+    the GUI can stream status into a live log panel.
     """
     def _emit(phase: str, msg: str):
         if event_callback:
@@ -349,7 +203,9 @@ def _run_fallback_loop(
     for attempt in range(1, max_attempts + 1):
         state.attempt = attempt
 
-        # Build prompt
+        # Build prompt — first attempt uses a fresh template; subsequent
+        # attempts include the failed code + stderr so the model can
+        # reason about the failure mode.
         if attempt == 1:
             prompt = FIRST_ATTEMPT_PROMPT.format(task=task)
         else:
@@ -371,13 +227,15 @@ def _run_fallback_loop(
         # Execute
         _emit("execute", f"Attempt {attempt} — running…")
 
-        # Dream3D static validation before execution
+        # Dream3D static validation before execution — catches pipeline
+        # mistakes that would otherwise burn a full execute attempt on
+        # a deterministic-fail script.
         try:
             from dream3d_primer import PipelineValidator
             valid, issues = PipelineValidator.validate(state.code)
             if not valid:
                 feedback = PipelineValidator.format_feedback(issues)
-                _emit("validate", f"Static validation issues found")
+                _emit("validate", "Static validation issues found")
                 state.returncode = -2
                 state.stdout     = ""
                 state.stderr     = feedback
@@ -385,6 +243,8 @@ def _run_fallback_loop(
                 _emit("result", f"Attempt {attempt} ✗ STATIC FAIL\n{feedback[:400]}")
                 continue
         except ImportError:
+            # dream3d_primer isn't always present — that's fine, just
+            # skip static validation and rely on runtime execution.
             pass
 
         rc, stdout, stderr = _run_code(
@@ -409,7 +269,7 @@ def _run_fallback_loop(
             state.final_code = state.code
             return state
 
-    # Exhausted
+    # Exhausted all attempts — return the last attempt as best effort.
     _emit("give_up", f"Exhausted {max_attempts} attempts. Returning best effort.")
     state.final_code = state.code
     state.explanation = (
@@ -426,7 +286,7 @@ def _run_fallback_loop(
 class CoderAgent:
     """
     Drop-in replacement for the single-shot Coder ModelAgent.
-    Uses LangGraph if available, falls back to a pure-Python ReAct loop.
+    Runs a self-correcting ReAct loop on the GGUF backend.
     """
 
     def __init__(
@@ -440,61 +300,24 @@ class CoderAgent:
         self.runner = runner
         self.max_attempts = max_attempts
         self.event_callback = event_callback
-        self._langgraph_agent = None
-
-        if _LANGGRAPH_OK:
-            try:
-                spec = personality_model.registry.get(
-                    personality_model.backend_key or "local_coder_primary"
-                )
-                self._langgraph_agent = _build_langgraph_agent(
-                    host=spec.host,
-                    model=spec.model,
-                    workspace=runner.workspace,
-                    max_attempts=max_attempts,
-                    event_callback=event_callback,
-                )
-                print("[CoderAgent] Using LangGraph backend")
-            except Exception as e:
-                print(f"[CoderAgent] LangGraph init failed ({e}), using fallback loop")
-        else:
-            print("[CoderAgent] langgraph not installed — using fallback ReAct loop")
+        print("[CoderAgent] Ready (GGUF ReAct loop, max_attempts="
+              f"{max_attempts})")
 
     @property
     def uses_langgraph(self) -> bool:
-        return self._langgraph_agent is not None
+        # Kept for backwards compatibility with any caller that asks —
+        # always False now that LangGraph has been removed.
+        return False
 
     def run(self, task: str) -> AgentState:
         """
         Run the coding agent on a task.
         Returns AgentState with .final_code, .explanation, .passed, .event_log
         """
-        if self._langgraph_agent is not None:
-            result = self._langgraph_agent.invoke({
-                "task": task,
-                "attempt": 0,
-                "max_attempts": self.max_attempts,
-                "history": [],
-                "passed": False,
-                "code": "", "filename": "", "stdout": "", "stderr": "",
-                "returncode": -1, "final_code": "", "explanation": "",
-                "event_log": [],
-            })
-            state = AgentState(task=task, max_attempts=self.max_attempts)
-            state.final_code  = result.get("final_code", "")
-            state.explanation = result.get("explanation", "")
-            state.passed      = result.get("passed", False)
-            state.attempt     = result.get("attempt", 0)
-            state.code        = result.get("code", "")
-            state.stdout      = result.get("stdout", "")
-            state.stderr      = result.get("stderr", "")
-            state.history     = result.get("history", [])
-            return state
-        else:
-            return _run_fallback_loop(
-                task=task,
-                personality_model=self.model,
-                runner=self.runner,
-                max_attempts=self.max_attempts,
-                event_callback=self.event_callback,
-            )
+        return _run_react_loop(
+            task=task,
+            personality_model=self.model,
+            runner=self.runner,
+            max_attempts=self.max_attempts,
+            event_callback=self.event_callback,
+        )

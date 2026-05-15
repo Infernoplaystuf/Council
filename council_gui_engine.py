@@ -6334,7 +6334,9 @@ class CouncilConsole(tk.Tk):
         install_frame.pack(fill="x", pady=(0, 10))
         
         install_text = (
-            "pip install langgraph langchain-ollama          # Coder agent\n"
+            # The Coder agent runs on the GGUF backend — no extra
+            # install needed. LangGraph + langchain-ollama were the old
+            # path; they're gone.
             "pip install crawl4ai && crawl4ai-setup          # Intern web research\n"
             "pip install chromadb sentence-transformers      # Vault RAG\n"
         )
