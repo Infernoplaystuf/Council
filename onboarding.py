@@ -1,13 +1,17 @@
 # ============================================================
 # onboarding.py  —  First-run wizard
 # ============================================================
-# Walks a new user through the four things they need before their
+# Walks a new user through the three things they need before their
 # first deliberation can succeed:
 #
 #   1. Acknowledgement of disk-space requirements
-#   2. Ollama detection (or guidance to install)
-#   3. Model availability (or pull a default)
-#   4. Personality config sanity check
+#   2. Point the app at a GGUF model file (or show download links)
+#   3. Confirm ready-to-go
+#
+# The app is GGUF-only — Ollama is not used. The wizard writes the
+# chosen path to vault/backend_settings.json (same file the in-app
+# Browse button on the Council tab uses), so the picker stays in
+# sync across launches.
 #
 # Marker file: vault/.onboarded — its presence skips the wizard.
 # Delete the file to re-run onboarding.
@@ -17,54 +21,114 @@ from __future__ import annotations
 
 import json
 import platform
-import subprocess
-import threading
 import tkinter as tk
 from pathlib import Path
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from typing import Callable, List, Optional
 
 import branding
 
-
-# Default model the wizard offers to pull. The exact tag matters — the
-# Council's backend layer expects this specific quantization.
-# Chosen for: free, runs on a 16GB-RAM laptop, decent quality, English-first.
-DEFAULT_MODEL     = "qwen2.5:14b-instruct-q4_K_M"
-DEFAULT_MODEL_ALT = "qwen2.5:7b-instruct-q4_K_M"   # smaller fallback, same family
-
-# Estimated download size we surface to the user up front.
-DEFAULT_MODEL_GB = 9
-ALT_MODEL_GB     = 5
+import os as _os
 
 
 # ============================================================
-# Detection helpers
+# Recommended GGUF models — surfaced as download buttons in the
+# model step. All US-made (Microsoft, Meta, IBM) per the runtime
+# defaults the app's documentation recommends.
 # ============================================================
 
-def ollama_available(host: str = "http://127.0.0.1:11434") -> bool:
-    """Return True if a local Ollama daemon is reachable."""
+RECOMMENDED_MODELS = [
+    {
+        "name":  "Phi-4 14B (Q4_K_M)",
+        "size":  "~9 GB",
+        "ctx":   "16K context",
+        "url":   "https://huggingface.co/bartowski/phi-4-GGUF",
+        "blurb": "Microsoft. Best reasoning at this size. Recommended for "
+                 "tabular / data tasks on 16 GB VRAM.",
+    },
+    {
+        "name":  "Llama 3.1 8B Instruct (Q5_K_M)",
+        "size":  "~6 GB",
+        "ctx":   "128K context",
+        "url":   "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+        "blurb": "Meta. Longest context window — best when injecting big "
+                 "folders / multi-CSV dumps.",
+    },
+    {
+        "name":  "Granite 3.1 8B Instruct (Q4_K_M)",
+        "size":  "~5 GB",
+        "ctx":   "128K context",
+        "url":   "https://huggingface.co/ibm-granite/granite-3.1-8b-instruct-GGUF",
+        "blurb": "IBM. Solid baseline; conservative refusal behaviour. "
+                 "Original Council baseline.",
+    },
+]
+
+
+# ============================================================
+# Persistence — shared with the in-app Browse button on the
+# Council tab. Keep the filename and JSON key in sync with
+# council_gui_engine._backend_settings_path / _save_backend_settings.
+# ============================================================
+
+_BACKEND_SETTINGS_FILENAME = "backend_settings.json"
+
+
+def _backend_settings_path(vault_dir: Path) -> Path:
+    return vault_dir / _BACKEND_SETTINGS_FILENAME
+
+
+def load_gguf_path(vault_dir: Path) -> str:
+    """Return the persisted GGUF model path, or empty string if none.
+
+    Reads COUNCIL_GGUF_PATH from the environment first (a launch-time
+    override always wins), then falls back to vault/backend_settings.json.
+    """
+    env = _os.environ.get("COUNCIL_GGUF_PATH", "").strip()
+    if env:
+        return env
+    p = _backend_settings_path(vault_dir)
+    if not p.exists():
+        return ""
     try:
-        import urllib.request as _u
-        with _u.urlopen(host + "/api/tags", timeout=2) as r:
-            return r.status == 200
+        data = json.loads(p.read_text(encoding="utf-8"))
     except Exception:
-        return False
+        return ""
+    return str(data.get("gguf_path", "")).strip()
 
 
-def ollama_models(host: str = "http://127.0.0.1:11434") -> List[str]:
-    """Return list of installed model names. Empty list on failure."""
+def save_gguf_path(vault_dir: Path, path: str) -> None:
+    """Persist the GGUF model path so the next launch picks it up.
+
+    Also sets COUNCIL_GGUF_PATH in os.environ for the current process so
+    the wizard's choice is live immediately — no app restart needed.
+    """
     try:
-        import urllib.request as _u
-        with _u.urlopen(host + "/api/tags", timeout=3) as r:
-            data = json.loads(r.read().decode("utf-8"))
-        return [m.get("name", "") for m in data.get("models", []) if m.get("name")]
+        _backend_settings_path(vault_dir).write_text(
+            json.dumps({"gguf_path": path}, indent=2),
+            encoding="utf-8",
+        )
+        _os.environ["COUNCIL_GGUF_PATH"] = path
     except Exception:
-        return []
+        pass
 
 
-def ollama_install_url() -> str:
-    return "https://ollama.com/download"
+def gguf_file_status(path: str) -> tuple:
+    """Inspect a candidate .gguf path. Returns (ok: bool, message: str)."""
+    if not path:
+        return False, "(no model selected)"
+    p = Path(path)
+    if not p.exists():
+        return False, f"✗ File does not exist: {p}"
+    if not p.is_file():
+        return False, f"✗ Not a file: {p}"
+    if p.suffix.lower() != ".gguf":
+        return False, f"⚠ Not a .gguf extension: {p.name}"
+    try:
+        size_gb = p.stat().st_size / (1024 ** 3)
+    except Exception:
+        return True, f"✓ {p.name}"
+    return True, f"✓ {p.name} ({size_gb:.1f} GB)"
 
 
 # ============================================================
@@ -95,8 +159,10 @@ class OnboardingWizard(tk.Toplevel):
         self.transient(parent)
         self.grab_set()
 
-        # Step-by-step state
-        self._steps = ["welcome", "disk", "ollama", "model", "ready"]
+        # Step list — dropped "ollama" step (the app is GGUF-only;
+        # no daemon to detect or service to install). The model step
+        # now does GGUF file selection directly.
+        self._steps = ["welcome", "disk", "model", "ready"]
         self._step_idx = 0
 
         self._build_ui()
@@ -177,12 +243,13 @@ class OnboardingWizard(tk.Toplevel):
         self._heading(f"{branding.PRODUCT_NAME} — first launch")
         self._label(branding.PRODUCT_TAGLINE, font=("Segoe UI", 12), pady=(0, 14))
         self._label(
-            "Quick walkthrough — about three minutes. We'll:\n"
+            "Quick walkthrough — about two minutes. We'll:\n"
             "   • Confirm there's enough disk space for an AI model\n"
-            "   • Detect or help install Ollama (the local AI engine)\n"
-            "   • Pull a usable model so the panel can answer\n\n"
-            "Everything runs locally; nothing leaves this machine.\n\n"
-            "Skip if you'd rather configure things by hand."
+            "   • Point the app at a GGUF model file (we'll suggest a few)\n\n"
+            "Everything runs locally; nothing leaves this machine.\n"
+            "The model never sends your data to the cloud.\n\n"
+            "Skip if you'd rather configure things by hand "
+            f"(set COUNCIL_GGUF_PATH=<path-to-.gguf> in your environment)."
         )
 
     # Step 2: disk space warning
@@ -192,162 +259,150 @@ class OnboardingWizard(tk.Toplevel):
         try:
             import shutil as _sh
             free_bytes = _sh.disk_usage(str(self.vault_dir)).free
-            free_gb = free_bytes / (1024**3)
+            free_gb = free_bytes / (1024 ** 3)
             free_str = f"{free_gb:.1f} GB free"
         except Exception:
             free_gb = None
             free_str = "(could not detect)"
 
         self._label(
-            f"AI models are large. The recommended starter model is "
-            f"{DEFAULT_MODEL_GB} GB.\n\n"
+            "GGUF models vary in size depending on the chosen quantization:\n"
+            "   • 7-8B models at Q4-Q5 are typically 5-7 GB\n"
+            "   • 14B models at Q4 are around 9 GB\n"
+            "   • 70B models at Q4 are 40+ GB (only if you have a beefy GPU)\n\n"
             f"Detected free space on this drive: {free_str}",
             pady=(0, 12),
         )
-        if free_gb is not None and free_gb < DEFAULT_MODEL_GB + 5:
+        if free_gb is not None and free_gb < 10:
             self._label(
-                "⚠ Less than 14 GB free — you may want to clear some space, "
-                "or pick the smaller fallback model on the next step.",
+                "⚠ Less than 10 GB free — you may want to clear some space, "
+                "or pick a smaller 7-8B Q4 model on the next step.",
                 fg=self._theme()["warning"],
             )
-        else:
-            self._label("✓ You have enough space for the default model.",
-                        fg=self._theme()["success"])
-
-    # Step 3: Ollama detection
-    def _render_ollama(self):
-        self._heading("AI engine — Ollama")
-
-        self._ollama_status_var = tk.StringVar(value="Checking…")
-        self._label("", pady=2)  # spacer
-        tk.Label(self.body, textvariable=self._ollama_status_var,
-                 bg=self._theme()["bg"], fg=self._theme()["fg"],
-                 font=("Segoe UI", 11), wraplength=580, justify="left", anchor="w"
-                 ).pack(fill="x", pady=4)
-
-        instr = tk.Frame(self.body, bg=self._theme()["bg"])
-        instr.pack(fill="x", pady=12)
-
-        ttk.Button(instr, text="🔄 Re-check",
-                   command=self._refresh_ollama).pack(side="left")
-        ttk.Button(instr, text="🌐 Open Ollama download page",
-                   command=lambda: self._open_url(ollama_install_url())
-                   ).pack(side="left", padx=8)
-
-        self._refresh_ollama()
-
-    def _refresh_ollama(self):
-        ok = ollama_available()
-        if ok:
-            self._ollama_status_var.set("✓ Ollama is running on this machine.")
-            self._ollama_ok = True
-        else:
-            self._ollama_status_var.set(
-                "✗ Ollama not detected at 127.0.0.1:11434.\n\n"
-                "1) Download and install Ollama from ollama.com\n"
-                "2) Launch it (it runs in the background)\n"
-                "3) Click Re-check above"
-            )
-            self._ollama_ok = False
-
-    # Step 4: Model
-    def _render_model(self):
-        self._heading("Choose a model")
-
-        if not ollama_available():
-            self._label("Ollama isn't running yet — go back one step to install it first.",
-                        fg=self._theme()["warning"])
-            return
-
-        installed = ollama_models()
-        if installed:
-            self._label("Models already installed on your machine:")
-            for m in installed[:8]:
-                self._label(f"   ✓ {m}", font=("Consolas", 10), pady=1,
-                            fg=self._theme()["success"])
+        elif free_gb is not None:
             self._label(
-                "\nYou're good to go. You can pull additional models later "
-                "from the Apothecary tab.",
-                pady=(12, 0),
+                "✓ You have enough space for any recommended model.",
+                fg=self._theme()["success"],
             )
-            return
+
+    # Step 3: Model selection (GGUF file picker)
+    def _render_model(self):
+        self._heading("Choose a GGUF model")
 
         self._label(
-            "No models installed yet. Pick one to download now:",
-            pady=(0, 10),
+            "The app loads models via .gguf files (the standard local-LLM "
+            "format from the llama.cpp project). You can:\n"
+            "   • Pick a .gguf file already on this machine\n"
+            "   • Download a recommended one from Hugging Face\n",
+            pady=(0, 12),
         )
 
-        choice_frame = tk.Frame(self.body, bg=self._theme()["bg"])
-        choice_frame.pack(fill="x")
-        self._model_choice = tk.StringVar(value=DEFAULT_MODEL)
+        # Current path status
+        self._gguf_path_var = tk.StringVar(value=load_gguf_path(self.vault_dir))
+        self._gguf_status_var = tk.StringVar(value="")
+        self._refresh_gguf_status()
 
-        for name, gb, desc in [
-            (DEFAULT_MODEL,     DEFAULT_MODEL_GB, "Recommended  •  Balanced quality and speed"),
-            (DEFAULT_MODEL_ALT, ALT_MODEL_GB,     "Lightweight  •  For modest hardware (8 GB RAM)"),
-        ]:
-            f = tk.Frame(choice_frame, bg=self._theme()["bg"])
-            f.pack(fill="x", pady=4)
-            tk.Radiobutton(f, text=f"  {name}  ({gb} GB)",
-                           variable=self._model_choice, value=name,
-                           bg=self._theme()["bg"], fg=self._theme()["fg"],
-                           selectcolor=self._theme()["panel_bg"],
-                           activebackground=self._theme()["bg"],
-                           activeforeground=self._theme()["fg"],
-                           font=("Segoe UI", 11)
-                           ).pack(side="left")
-            tk.Label(f, text=desc, font=("Segoe UI", 9),
+        path_frame = tk.Frame(self.body, bg=self._theme()["bg"])
+        path_frame.pack(fill="x", pady=(0, 4))
+        tk.Label(path_frame, text="Current model:", font=("Segoe UI", 10),
+                 bg=self._theme()["bg"], fg=self._theme()["muted_fg"]
+                 ).pack(side="left", padx=(0, 6))
+        tk.Label(path_frame, textvariable=self._gguf_status_var,
+                 font=("Consolas", 10),
+                 bg=self._theme()["bg"], fg=self._theme()["fg"]
+                 ).pack(side="left", fill="x", expand=True)
+
+        # Browse button
+        btn_frame = tk.Frame(self.body, bg=self._theme()["bg"])
+        btn_frame.pack(fill="x", pady=8)
+        ttk.Button(btn_frame, text="📁 Browse for .gguf file…",
+                   command=self._browse_gguf).pack(side="left")
+        ttk.Button(btn_frame, text="🔄 Re-check",
+                   command=self._refresh_gguf_status).pack(side="left", padx=8)
+
+        # Recommended models list
+        sep = tk.Frame(self.body, bg=self._theme()["muted_fg"], height=1)
+        sep.pack(fill="x", pady=12)
+        self._label("Recommended models — click to open the Hugging Face "
+                    "download page in your browser. After downloading, come "
+                    "back and use Browse… to select the .gguf file.",
+                    font=("Segoe UI", 10), fg=self._theme()["muted_fg"],
+                    pady=(0, 8))
+
+        for m in RECOMMENDED_MODELS:
+            row = tk.Frame(self.body, bg=self._theme()["bg"])
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=f"  {m['name']}",
+                     font=("Segoe UI", 10, "bold"),
+                     bg=self._theme()["bg"], fg=self._theme()["fg"]
+                     ).pack(side="left")
+            tk.Label(row, text=f"  ·  {m['size']}  ·  {m['ctx']}",
+                     font=("Segoe UI", 9),
                      bg=self._theme()["bg"], fg=self._theme()["muted_fg"]
-                     ).pack(side="left", padx=8)
+                     ).pack(side="left")
+            ttk.Button(row, text="🌐 Open",
+                       command=lambda u=m["url"]: self._open_url(u)
+                       ).pack(side="right")
 
-        self._pull_status_var = tk.StringVar(value="")
-        tk.Label(self.body, textvariable=self._pull_status_var,
-                 bg=self._theme()["bg"], fg=self._theme()["info"],
-                 font=("Consolas", 9), wraplength=580, justify="left", anchor="w"
-                 ).pack(fill="x", pady=(16, 4))
-
-        self._pull_btn = ttk.Button(self.body, text="⬇  Download selected model",
-                                     command=self._pull_model)
-        self._pull_btn.pack(pady=8)
-
-    def _pull_model(self):
-        model = self._model_choice.get()
-        self._pull_btn.configure(state="disabled", text="Downloading…")
-        self._pull_status_var.set(f"Pulling {model}. This is a one-time download "
-                                  f"(several GB). The window will stay responsive.")
-
-        def worker():
+    def _browse_gguf(self):
+        """Open a file dialog to pick a .gguf file; persist on selection."""
+        start_dir = ""
+        cur = self._gguf_path_var.get().strip()
+        if cur:
             try:
-                proc = subprocess.Popen(
-                    ["ollama", "pull", model],
-                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    text=True, bufsize=1, shell=False,
-                )
-                last_line = ""
-                for line in proc.stdout:
-                    last_line = line.strip()
-                    if last_line:
-                        self.after(0, lambda s=last_line: self._pull_status_var.set(s))
-                proc.wait()
-                if proc.returncode == 0:
-                    self.after(0, lambda: self._pull_status_var.set(
-                        f"✓ {model} downloaded successfully."))
-                else:
-                    self.after(0, lambda: self._pull_status_var.set(
-                        f"✗ Pull exited with code {proc.returncode}: {last_line}"))
-            except FileNotFoundError:
-                self.after(0, lambda: self._pull_status_var.set(
-                    "✗ `ollama` command not found on PATH. Install Ollama first."))
-            except Exception as e:
-                self.after(0, lambda: self._pull_status_var.set(f"✗ {e}"))
-            finally:
-                self.after(0, lambda: self._pull_btn.configure(
-                    state="normal", text="⬇  Download selected model"))
+                start_dir = str(Path(cur).parent)
+            except Exception:
+                start_dir = ""
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="Select GGUF model file",
+            initialdir=start_dir or None,
+            filetypes=[("GGUF model files", "*.gguf"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self._gguf_path_var.set(path)
+        save_gguf_path(self.vault_dir, path)
+        # Refresh the model loader so subsequent in-app queries pick up
+        # the new path without an app restart.
+        try:
+            import council_engine as _ce
+            _ce.refresh_backend_config()
+        except Exception:
+            # If council_engine isn't fully loaded yet (or doesn't expose
+            # refresh_backend_config in this build), the env-var change
+            # alone is sufficient — the singleton model loader picks it
+            # up lazily on next inference call.
+            pass
+        self._refresh_gguf_status()
 
-        threading.Thread(target=worker, daemon=True).start()
+    def _refresh_gguf_status(self):
+        path = self._gguf_path_var.get().strip()
+        ok, msg = gguf_file_status(path)
+        # Use the existing variable if present; otherwise this is called
+        # before the label is built (e.g. step re-render). Render-safe.
+        if hasattr(self, "_gguf_status_var"):
+            self._gguf_status_var.set(msg)
+        self._gguf_ok = ok
 
-    # Step 5: ready
+    # Step 4: ready
     def _render_ready(self):
         self._heading("Ready.")
+        # Show what we settled on so the user knows the chosen model
+        # name without having to scroll back.
+        path = load_gguf_path(self.vault_dir)
+        ok, msg = gguf_file_status(path)
+        if ok:
+            self._label(f"GGUF model:  {msg}", font=("Consolas", 10),
+                        fg=self._theme()["success"], pady=(0, 12))
+        else:
+            self._label(
+                "No GGUF model selected. The app will start, but you'll "
+                "need to set COUNCIL_GGUF_PATH or use the Browse… button "
+                "on the Council tab before any query can be answered.",
+                fg=self._theme()["warning"], pady=(0, 12),
+            )
+
         self._label(
             "Three ways to start poking at it:\n\n"
             "   1. Drop a CSV onto the Grapher tab — the Analyst suggests a "
@@ -356,6 +411,9 @@ class OnboardingWizard(tk.Toplevel):
             "if you don't have a file handy.\n"
             "   3. Council tab → ask a question in plain English. The panel "
             "deliberates and gives you an answer.\n\n"
+            "Tip: type 'context info' in the Council tab to see the model's "
+            "current context-window budget and tune COUNCIL_GGUF_N_CTX if "
+            "needed.\n\n"
             "Click Finish.",
             pady=(0, 14),
         )
@@ -378,8 +436,9 @@ class OnboardingWizard(tk.Toplevel):
     def _on_skip(self):
         if not messagebox.askyesno(
             "Skip setup?",
-            "Skipping means you'll need to configure Ollama and a model "
-            "manually before deliberations work. Continue?",
+            "Skipping means you'll need to set COUNCIL_GGUF_PATH manually "
+            "(or use the Browse… button on the Council tab) before any "
+            "query can be answered. Continue?",
             parent=self,
         ):
             return
