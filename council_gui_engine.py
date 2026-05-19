@@ -49,6 +49,7 @@ import branding
 # icon. No-op on macOS / Linux.
 branding.set_app_user_model_id()
 import onboarding
+import task_memory as _task_memory_mod
 import specialists as _spec
 import crash_reporter
 import licensing
@@ -1027,7 +1028,8 @@ def _extract_file_paths(text):
     return paths
 
 
-def _inject_file_contents(user_text, analyst_block=None, n_ctx=None):
+def _inject_file_contents(user_text, analyst_block=None, n_ctx=None,
+                           task_memo_block=None):
     """Public entry point — wraps `_inject_file_contents_impl` in a
     defensive try/except so unexpected exceptions during injection
     (vault index corruption, network-share disconnect mid-walk,
@@ -1038,6 +1040,7 @@ def _inject_file_contents(user_text, analyst_block=None, n_ctx=None):
     try:
         return _inject_file_contents_impl(
             user_text, analyst_block=analyst_block, n_ctx=n_ctx,
+            task_memo_block=task_memo_block,
         )
     except Exception as _top_e:
         import sys as _sys_dbg
@@ -1075,7 +1078,8 @@ def _inject_file_contents(user_text, analyst_block=None, n_ctx=None):
         return (warn + "\n\n" + (user_text or "")), {}, breakdown
 
 
-def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None):
+def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
+                                task_memo_block=None):
     """Augment the user message with file/vault context before deliberation.
 
     Returns ``(augmented_text, fuzzy_matches, breakdown)`` where:
@@ -1089,10 +1093,13 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None):
 
     Priority order (lower number = higher priority; ties impossible):
       0. ``[NO DATA AVAILABLE]`` marker (must always surface)
-      1. ``[ANALYST RESULT]`` — the computed answer
-      2. ``[FILE: ...]`` — explicit user-pasted paths
-      3. ``[FOLDER: ...]`` — explicit user-pasted directory paths
-      4. ``[VAULT MATCH: ...]`` — speculative search hits (droppable)
+      1. ``[TASK MEMO]`` — RAM-resident sticky note (goal/constraints/
+         forbidden) so small models don't forget the original question
+         once the context window fills up with file blocks
+      2. ``[ANALYST RESULT]`` — the computed answer
+      3. ``[FILE: ...]`` — explicit user-pasted paths
+      4. ``[FOLDER: ...]`` — explicit user-pasted directory paths
+      5. ``[VAULT MATCH: ...]`` — speculative search hits (droppable)
 
     Per-block cap: each block is head/tail-trimmed to roughly ``n_ctx//8``
     tokens before assembly. Cumulative cap: vault-match blocks stop being
@@ -1127,7 +1134,8 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None):
     remaining = max(256, safe_input - user_cost - writer_overhead)
 
     # Priority bands — lower = higher priority
-    PRIO_NODATA, PRIO_ANALYST, PRIO_EXPLICIT, PRIO_FOLDER, PRIO_VAULT = 0, 1, 2, 3, 4
+    (PRIO_NODATA, PRIO_TASK_MEMO, PRIO_ANALYST,
+     PRIO_EXPLICIT, PRIO_FOLDER, PRIO_VAULT) = 0, 1, 2, 3, 4, 5
     DROPPABLE_FROM = PRIO_VAULT   # only vault matches are droppable
 
     explicit_paths = _extract_file_paths(user_text)
@@ -1136,6 +1144,14 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None):
     candidates = []   # list of (priority, label, content)
     fuzzy_matches = {}
     missing_paths = []
+
+    # -- Task memo (priority 1) ----------------------------------------------
+    # A short RAM-resident sticky note carrying the user's original goal +
+    # constraints + forbidden actions. Re-injected on every turn so even
+    # if later context blocks push the user's typed message past the
+    # window's tail, the model still sees what was asked. ~60-100 tokens.
+    if task_memo_block:
+        candidates.append((PRIO_TASK_MEMO, "[TASK MEMO]", task_memo_block))
 
     # -- Analyst result (priority 2) ----------------------------------------
     if analyst_block:
@@ -1222,7 +1238,13 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None):
     # Trimming them risks deleting the answer the user actually asked for,
     # so they are exempt from the per-block cap. EXPLICIT/FOLDER/VAULT are
     # still capped because they can be arbitrarily large (a pasted 1GB CSV).
-    UNCAPPED_PRIOS = {PRIO_NODATA, PRIO_ANALYST}
+    # NO_DATA, TASK_MEMO, and ANALYST blocks are exempt from the per-block
+    # cap. NO_DATA is tiny by construction. The task memo is intentionally
+    # short (~80 tokens) and trimming it would defeat the "remember the
+    # original question" guarantee. The analyst block is already capped at
+    # ~4KB by format_result_for_prompt; trimming further could elide the
+    # answer the user asked for.
+    UNCAPPED_PRIOS = {PRIO_NODATA, PRIO_TASK_MEMO, PRIO_ANALYST}
     for (prio, label, content) in candidates:
         if prio in UNCAPPED_PRIOS:
             capped = content
@@ -3342,6 +3364,14 @@ class CouncilConsole(tk.Tk):
         # engine. The advanced-mode branch in _build_ui calls
         # _build_apoth_tab which sets self.apoth before the tab is added.
 
+        # RAM-resident "task memo" — a short sticky note carrying the
+        # user's original goal + constraints + forbidden actions across
+        # every turn this session. Re-injected at the TOP of the prompt
+        # on every query so small models (4K-8K context) don't forget
+        # what was asked once vault/file context pushes the user message
+        # past the window's tail. See task_memory.py for the design.
+        self.task_memory = _task_memory_mod.TaskMemory()
+
         self.current_script_name = "script"
         self._stream_buffers: Dict[str, str] = {}  # role -> partial streamed text
         self._node_refresh_id = None
@@ -4408,6 +4438,33 @@ class CouncilConsole(tk.Tk):
         _re.IGNORECASE,
     )
 
+    # ── Task-memo meta-commands ───────────────────────────────────────
+    # "show memo" / "what's the task memo" — render the current memo
+    # without re-condensing (useful for debugging a misread intent).
+    # "reset memo" / "forget memo" / "new task" — drop the memo entirely
+    # so the NEXT user query starts fresh instead of inheriting the
+    # previous goal/constraints.
+    _SHOW_MEMO_RE = _re.compile(
+        r"^\s*(?:"
+        r"show\s+(?:task\s+)?memo"
+        r"|(?:task\s+)?memo\s+status"
+        r"|what(?:'s|\s+is)\s+(?:the\s+)?(?:task\s+)?memo"
+        r"|display\s+(?:task\s+)?memo"
+        r")\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+    _RESET_MEMO_RE = _re.compile(
+        r"^\s*(?:"
+        r"reset\s+(?:task\s+)?memo"
+        r"|forget\s+(?:task\s+)?memo"
+        r"|clear\s+(?:task\s+)?memo"
+        r"|new\s+task"
+        r"|new\s+question"
+        r"|start\s+over"
+        r")\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
+
     _ELEMENT_RANKING_RE = _re.compile(
         # Matches phrasings like:
         #   what is the most common (atomic) element [in <where>]
@@ -4553,6 +4610,14 @@ class CouncilConsole(tk.Tk):
 
         if self._CONTEXT_INFO_RE.match(single_line):
             self._context_info_response()
+            return True
+
+        if self._SHOW_MEMO_RE.match(single_line):
+            self._show_task_memo_response()
+            return True
+
+        if self._RESET_MEMO_RE.match(single_line):
+            self._reset_task_memo_response()
             return True
 
         if self._DUPES_RE.match(single_line):
@@ -5364,6 +5429,66 @@ class CouncilConsole(tk.Tk):
         self._append_transcript("Writer", text, "final")
         self._set_status("● idle")
 
+    def _show_task_memo_response(self):
+        """Print the current task memo to the transcript without
+        re-condensing or modifying it. Useful when the user wants to
+        spot-check the condenser's interpretation of an earlier query.
+        """
+        memo = self.task_memory.current()
+        if memo is None or memo.is_empty():
+            self._append_transcript(
+                "Writer",
+                "No task memo set yet. The next non-meta question will "
+                "create one. Type 'reset memo' any time to clear it.",
+                "final",
+            )
+            return
+        lines: list = [
+            "Current task memo",
+            "─────────────────",
+            f"goal: {memo.goal}",
+        ]
+        if memo.constraints:
+            lines.append("constraints:")
+            for c in memo.constraints:
+                lines.append(f"  • {c}")
+        if memo.forbidden:
+            lines.append("forbidden:")
+            for f in memo.forbidden:
+                lines.append(f"  • {f}")
+        lines.append("")
+        lines.append(
+            "Source query: " + (memo.raw_query[:160]
+                                + ("…" if len(memo.raw_query) > 160 else ""))
+        )
+        if memo.is_extension:
+            lines.append("(This memo extended a previous one — constraints "
+                         "inherited from the prior turn.)")
+        lines.append("")
+        lines.append(
+            "Type 'reset memo' to start fresh on the next question."
+        )
+        self._append_transcript("Writer", "\n".join(lines), "final")
+
+    def _reset_task_memo_response(self):
+        """Drop the current task memo. Next user query starts fresh —
+        no constraints / forbidden are inherited."""
+        had_memo = not self.task_memory.current().is_empty()
+        self.task_memory.reset()
+        if had_memo:
+            self._append_transcript(
+                "Writer",
+                "Task memo cleared. The next question will start a new "
+                "memo from scratch — no constraints carried over.",
+                "final",
+            )
+        else:
+            self._append_transcript(
+                "Writer",
+                "No task memo to clear.",
+                "final",
+            )
+
     def _context_info_response(self):
         """Report current context-window configuration and last-query usage.
 
@@ -5449,6 +5574,28 @@ class CouncilConsole(tk.Tk):
                 lines.append("  dropped (budget exceeded):")
                 for label, cost in bd["dropped"]:
                     lines.append(f"    {label}  ~{cost:,} tokens  (dropped)")
+
+        # Task-memo status — show whether the RAM-resident sticky note
+        # is active so the user sees what's being re-injected on every
+        # turn (and can `reset memo` if they want to start fresh).
+        try:
+            memo = self.task_memory.current()
+        except Exception:
+            memo = None
+        if memo is not None and not memo.is_empty():
+            lines.append("")
+            lines.append("Task memo (re-injected every turn):")
+            lines.append(f"  goal: {memo.goal[:120]}"
+                         + ("…" if len(memo.goal) > 120 else ""))
+            if memo.constraints:
+                lines.append(f"  constraints: {len(memo.constraints)} "
+                             f"({'; '.join(memo.constraints[:2])}"
+                             + ('; …' if len(memo.constraints) > 2 else '')
+                             + ')')
+            if memo.forbidden:
+                lines.append(f"  forbidden:   {len(memo.forbidden)}")
+            lines.append("  (Type 'show memo' for full text, "
+                         "'reset memo' to clear.)")
 
         lines.append("")
         lines.append("To raise the cap before launch:")
@@ -10735,7 +10882,35 @@ class CouncilConsole(tk.Tk):
         # everything to the Grapher).
         original_user_text = user_text
 
-        # ── Analyst step first ────────────────────────────────────────────
+        # ── Task-memo condense (runs FIRST, very fast) ─────────────────────
+        # Re-condense the per-session memo from this turn's question so
+        # the writer always sees a fresh goal+constraints+forbidden block
+        # at the TOP of its context, even when the rest of the window is
+        # eaten by file dumps. Post the result to the transcript so the
+        # user can spot a misread before the model answers.
+        try:
+            def _condense_call(prompt: str) -> str:
+                # Small fast call; temperature 0 for stable extraction.
+                import council_engine as _ce
+                return _ce.local_chat(
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    num_predict=240,
+                    timeout=45,
+                )
+            _memo = self.task_memory.update(original_user_text, llm_call=_condense_call)
+        except Exception as _memo_exc:
+            print(f"[TaskMemory] update failed: {_memo_exc!r}")
+            _memo = self.task_memory.current()
+        if _memo and not _memo.is_empty():
+            self._append_transcript(
+                "Council",
+                self.task_memory.render_transcript_line(),
+                "observation",
+            )
+        _task_memo_block = self.task_memory.render_injection_block() or None
+
+        # ── Analyst step ────────────────────────────────────────────────
         # The analyst computes deterministic answers from data ("how many",
         # "what's the sum"); when it succeeds, the injection layer reduces
         # vault-match candidates from 5 to 1 (#7) so the answer doesn't
@@ -10774,6 +10949,7 @@ class CouncilConsole(tk.Tk):
             _n_ctx = 4096
         augmented, fuzzy_matches, _injection_breakdown = _inject_file_contents(
             user_text, analyst_block=_analyst_block, n_ctx=_n_ctx,
+            task_memo_block=_task_memo_block,
         )
         self._last_injection_breakdown = _injection_breakdown
         # Surface defensive-wrapper failures to the transcript. When the
