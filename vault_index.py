@@ -460,6 +460,7 @@ def _parse_csv(p: Path) -> Dict[str, Any]:
     headers: List[str] = []
     sample_rows: List[str] = []
     keywords: Set[str] = set()
+    total_rows = 0
     try:
         with open(p, newline="", encoding="utf-8", errors="replace") as fh:
             reader = csv.reader(fh)
@@ -468,6 +469,13 @@ def _parse_csv(p: Path) -> Dict[str, Any]:
                     headers = [c.strip() for c in row]
                     keywords.update(_tokenize(" ".join(headers)))
                     continue
+                # We tokenise + sample only the first 500 rows; beyond
+                # that, just count rows. Counting is cheap (no list
+                # append, no token regex) so we can finish in a single
+                # pass instead of opening the file twice. The total
+                # surfaces in the schema-based description as
+                # "with N rows" instead of the previous "? rows".
+                total_rows = i
                 if i < 6:
                     sample_rows.append(", ".join(row))
                 if i < 500:
@@ -499,6 +507,7 @@ def _parse_csv(p: Path) -> Dict[str, Any]:
         "type": "csv",
         "headers": headers,
         "sample_rows": sample_rows,
+        "rows": total_rows,
         "keywords": sorted(keywords)[:5000],
     }
 
@@ -1089,6 +1098,57 @@ def _parse_text(p: Path, suffix: str) -> Dict[str, Any]:
     }
 
 
+def _record_has_content(rec: Dict[str, Any]) -> bool:
+    """True iff a parsed record has the kind of indexing surface its
+    declared file type SHOULD have. Type-aware: a .json record is only
+    accepted when the parser actually extracted JSON structure (keys
+    or string-value keywords), not just because errors="replace"
+    decoded some random bytes to English-looking text.
+
+    The user-reported "model says no access to that folder/file" bug
+    came from corrupted/empty files whose parse stubs nonetheless
+    surfaced through vault search via their filename. The model saw
+    a [VAULT MATCH] block with no real content and concluded the file
+    was inaccessible — the structural check below prevents those
+    stubs from reaching the index at all.
+    """
+    if not isinstance(rec, dict):
+        return False
+    rtype = rec.get("type", "")
+
+    # Structured data — must have STRUCTURE, not just decoded bytes.
+    # broken.json (binary garbage) tokenises to {garbage, not, json}
+    # via errors="replace" decode; that passed a "≥3 tokens" rule
+    # but yielded 0 real keys, so we'd inject an empty-content match.
+    if rtype in ("json", "d3dpipeline", "bson"):
+        return bool(rec.get("keys") or rec.get("keywords"))
+
+    if rtype in ("csv", "tsv", "csv.gz", "parquet"):
+        return bool(rec.get("headers")
+                    or rec.get("sample_rows")
+                    or rec.get("keywords"))
+
+    if rtype == "excel":
+        return bool(rec.get("sheets") or rec.get("keywords"))
+
+    if rtype in ("sqlite", "duckdb"):
+        return bool(rec.get("tables") or rec.get("keywords"))
+
+    # Plain text / yaml / md / cfg / log / etc. — keyword extraction
+    # is the main surface. Require either real keywords OR ≥3 tokenised
+    # words from the sample. Tightens the previous "any non-empty
+    # sample_text" rule which let through 1-character files.
+    if rec.get("keywords"):
+        if len(rec["keywords"]) >= 2:
+            return True
+        # Single-keyword stubs (e.g. a .txt file containing just "a")
+        # are essentially empty for search purposes — fall through.
+    sample = (rec.get("sample_text") or "").strip()
+    if sample and len(_tokenize(sample)) >= 3:
+        return True
+    return False
+
+
 def _index_file(p: Path) -> Optional[Dict[str, Any]]:
     suffix = p.suffix.lower()
     if suffix == ".csv":
@@ -1114,6 +1174,13 @@ def _index_file(p: Path) -> Optional[Dict[str, Any]]:
     elif suffix in _TEXT_SUFFIXES:
         rec = _parse_text(p, suffix)
     else:
+        return None
+    # Skip records that parsed but yielded nothing useful. See
+    # _record_has_content above for why — these stubs cause the
+    # "model says no access to the file" hallucination because vault
+    # search can still surface them via filename token match while the
+    # model sees an empty [VAULT MATCH] block.
+    if not _record_has_content(rec):
         return None
     try:
         st = p.stat()
@@ -1673,6 +1740,14 @@ the vocabulary list. Lowercase only. Single line only.
         cand: List[Tuple[str, Dict[str, Any]]] = []
         for spath, rec in self.records.items():
             if folder and folder.lower() not in spath.lower():
+                continue
+            # Defense-in-depth: skip records with no indexing surface.
+            # _index_file now drops these at build time, but old index
+            # JSONs from previous app versions may still contain stub
+            # records. Surfacing them as [VAULT MATCH] blocks with
+            # empty content was the original "model says no access"
+            # bug — guard at the search layer too.
+            if not _record_has_content(rec):
                 continue
             cand.append((spath, rec))
         if not cand:
