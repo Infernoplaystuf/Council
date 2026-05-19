@@ -33,11 +33,45 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Generator, Iterator, List, Optional, Tuple
 import urllib.request
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Inference lock — serializes ALL calls to the single loaded Llama instance.
+#
+# llama-cpp-python's `Llama.create_chat_completion` mutates internal KV-cache
+# state during inference. Two overlapping calls on the same instance can:
+#   • corrupt the KV cache (garbage outputs on subsequent calls)
+#   • return nonsensical or empty text
+#   • crash the python process in native code
+#   • deadlock when the two calls try to write the same llama_context
+#
+# The app legitimately runs multiple model calls concurrently in practice:
+#   • The chat send path on the GUI thread (writer / synthesizer)
+#   • The analyst step (pandas code generation)
+#   • The task-memo condenser
+#   • Semantic vault-search expansion ("which of these are metals?")
+#   • The description-build worker (long-running background daemon)
+#
+# Without serialization, if the description worker is mid-call and the user
+# sends a chat message, both threads enter create_chat_completion on the
+# same Llama instance simultaneously → corruption.
+#
+# Holding one lock around every inference call serializes them safely. The
+# blocking time is acceptable because:
+#   • Foreground calls are typically 1-5s on CPU
+#   • The description-build worker can wait — it's a background batch job
+#   • llama-cpp can't actually run two inferences in parallel anyway (the
+#     Llama instance owns the model weights); the lock just makes the
+#     ordering deterministic instead of racing native code.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_INFERENCE_LOCK = threading.Lock()
 import urllib.error
 
 
@@ -144,15 +178,18 @@ def _get_gguf_model():
         ) from exc
 
     n_ctx = int(os.environ.get("COUNCIL_GGUF_N_CTX", "4096"))
-    # Default n_threads to PHYSICAL cores when possible.
-    # Reasoning: llama.cpp inference is compute-bound and memory-bandwidth-
-    # bound. On a CPU with SMT/hyperthreading, two logical threads share
-    # the same physical execution units and memory channels — running on
-    # logical-count threads typically PESSIMISES throughput by 10-30%
-    # compared to physical-count threads. psutil's cpu_count(logical=False)
-    # gives the right answer cross-platform; if psutil isn't installed
-    # we fall back to a divisor heuristic (x86 usually 2 threads/core,
-    # ARM usually 1).
+    # Default n_threads: prefer PHYSICAL cores when we can read them,
+    # otherwise fall back to logical-count (os.cpu_count()) which is
+    # what the app used historically. Note we deliberately do NOT use a
+    # "divide logical by 2" heuristic — it correctly handles classic
+    # x86 hyperthreading but undercounts on:
+    #   • Non-hyperthreaded x86 (older Athlon, Atom, some Xeons)
+    #   • Apple Silicon (no SMT — physical == logical)
+    #   • Intel 12th-gen+ hybrid CPUs (P+E cores; logical != 2×physical)
+    # When psutil isn't installed, defaulting to logical count is slower
+    # than optimal on hyperthreaded CPUs (~10-30%) but never crashes or
+    # undercounts. Users who care about peak performance can install
+    # psutil OR set COUNCIL_GGUF_N_THREADS explicitly.
     def _default_n_threads() -> int:
         try:
             import psutil as _ps   # type: ignore[import]
@@ -161,16 +198,7 @@ def _get_gguf_model():
                 return int(n)
         except Exception:
             pass
-        logical = os.cpu_count() or 4
-        # Apple Silicon has no SMT; raw count is correct.
-        if sys.platform == "darwin" and "arm" in (os.uname().machine
-                                                  if hasattr(os, "uname")
-                                                  else "").lower():
-            return max(1, logical)
-        # x86 with even logical count >= 4 is almost certainly hyperthreaded.
-        if logical >= 4 and logical % 2 == 0:
-            return max(1, logical // 2)
-        return max(1, logical)
+        return max(1, os.cpu_count() or 4)
 
     n_threads = int(os.environ.get("COUNCIL_GGUF_N_THREADS",
                                     str(_default_n_threads())))
@@ -238,14 +266,22 @@ def estimate_tokens(text: str) -> int:
     if not text:
         return 0
     # Try the loaded model's tokenizer for an exact count.
+    # Acquire the inference lock NON-blockingly: if a real inference is
+    # already in progress we don't want to wait — token estimation is
+    # purely diagnostic and the chars/4 fallback below is fine. Without
+    # the guard, calling tokenize while another thread is mid-inference
+    # can race on llama-cpp's internal state and crash the process.
     try:
         llm = _GGUF_MODEL_INSTANCE  # don't trigger a load just for an estimate
         if llm is not None and hasattr(llm, "tokenize"):
-            try:
-                toks = llm.tokenize(text.encode("utf-8", errors="ignore"))
-                return len(toks)
-            except Exception:
-                pass
+            if _INFERENCE_LOCK.acquire(blocking=False):
+                try:
+                    toks = llm.tokenize(text.encode("utf-8", errors="ignore"))
+                    return len(toks)
+                except Exception:
+                    pass
+                finally:
+                    _INFERENCE_LOCK.release()
     except Exception:
         pass
     # Heuristic fallback: English averages ~4 chars per token. Round up so we
@@ -328,11 +364,14 @@ def _gguf_chat(
 ) -> str:
     """Blocking GGUF chat completion using the loaded llama-cpp model."""
     llm = _get_gguf_model()
-    result = llm.create_chat_completion(
-        messages=messages,
-        temperature=float(temperature),
-        max_tokens=int(num_predict),
-    )
+    # Serialize against every other inference call on the same Llama
+    # instance — see _INFERENCE_LOCK docstring at module top for why.
+    with _INFERENCE_LOCK:
+        result = llm.create_chat_completion(
+            messages=messages,
+            temperature=float(temperature),
+            max_tokens=int(num_predict),
+        )
     try:
         return str(result["choices"][0]["message"]["content"]).strip()
     except Exception:
@@ -349,20 +388,26 @@ def _gguf_chat_stream(
     """Streaming GGUF chat completion — emits each token via token_callback."""
     llm = _get_gguf_model()
     pieces: list[str] = []
-    for chunk in llm.create_chat_completion(
-        messages=messages,
-        temperature=float(temperature),
-        max_tokens=int(num_predict),
-        stream=True,
-    ):
-        try:
-            delta = chunk["choices"][0]["delta"].get("content", "")
-        except Exception:
-            delta = ""
-        if delta:
-            pieces.append(delta)
-            if token_callback:
-                token_callback(delta)
+    # Hold the inference lock for the entire stream. Releasing between
+    # chunks would let another call slip in and corrupt the in-progress
+    # KV cache. token_callback fires INSIDE the lock — callbacks should
+    # be fast (queue.put_nowait or a buffer append) and must NOT call
+    # back into local_chat (would deadlock).
+    with _INFERENCE_LOCK:
+        for chunk in llm.create_chat_completion(
+            messages=messages,
+            temperature=float(temperature),
+            max_tokens=int(num_predict),
+            stream=True,
+        ):
+            try:
+                delta = chunk["choices"][0]["delta"].get("content", "")
+            except Exception:
+                delta = ""
+            if delta:
+                pieces.append(delta)
+                if token_callback:
+                    token_callback(delta)
     return "".join(pieces)
 
 
