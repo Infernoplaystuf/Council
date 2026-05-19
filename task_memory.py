@@ -99,6 +99,38 @@ _INTENT_TAGS: list = [
                 r"containing)\b", re.I),
      {"constraints": ["Apply the filter exactly as stated; "
                       "don't broaden or narrow it."]}),
+
+    # Search-shape queries ("find builds with Iron Fist", "which builds
+    # contain promethium", "show entries that use Heat Vision", "search
+    # for files containing uridium") — common phrasing for content
+    # search across JSON/CSV records. The filter-shape pattern above
+    # misses these because it requires the word "rows" or "filter".
+    # This pattern catches verb-of-search + noun + connector shapes.
+    (re.compile(
+        r"\b(?:find|which|show|list|search\s+for)\s+"
+        r"(?:[\w\-]+\s+)?"             # optional adjective like "all"
+        r"(?:builds?|entries|records|items|files?|configs?|"
+        r"loadouts?|recipes?|results?|matches?)\b"
+        # Connector word that introduces the search target. Either a
+        # preposition immediately after the noun (with / containing /
+        # using / matching / mentioning) OR a verb that means "has /
+        # contains / uses" — covers "which builds CONTAIN promethium"
+        # and "show entries THAT USE Heat Vision" alike.
+        r"\s+(?:"
+        r"with|contains?|containing|using|uses|"
+        r"includes?|including|references?|referencing|"
+        r"matching|matches|mentioning|mentions|having|has|have|"
+        r"that\s+(?:use[s]?|have|has|contain[s]?|include[s]?|"
+        r"reference[s]?|mention[s]?)"
+        r")\b",
+        re.I),
+     {"constraints": [
+         "Return only items where the named attribute actually appears "
+         "in the file — don't include items that merely match the "
+         "query word in an unrelated field.",
+         "Quote item identifiers (names, IDs) verbatim from the "
+         "source — don't paraphrase or guess.",
+     ]}),
 ]
 
 
@@ -249,6 +281,34 @@ def _lexical_overlap(a: str, b: str) -> float:
     return len(sa & sb) / len(sa | sb)
 
 
+# Follow-up markers — when the user's message OPENS with one of these,
+# treat the query as an extension of the previous task even if the
+# lexical overlap is below threshold. Examples that should be caught:
+#   "also exclude null customers"
+#   "and now for sales2.csv"
+#   "what about excluding the last row"
+#   "actually, sum instead of average"
+# Without this, the lexical-overlap fallback (Jaccard ≥ 0.30) misses
+# rewordings like "csv" vs "sales.csv" or "exclude" vs "excluding"
+# and the previous memo's constraints get silently dropped.
+_FOLLOWUP_MARKER_RE = re.compile(
+    r"^\s*(?:"
+    r"also|and|now|next|then|"
+    r"actually|additionally|furthermore|moreover|"
+    r"what\s+about|how\s+about|"
+    r"instead|otherwise|alternatively|"
+    r"more\s+specifically|on\s+top\s+of\s+that|"
+    r"plus|with\s+the\s+same"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_likely_followup(user_text: str) -> bool:
+    """True when the message opens with a follow-up marker."""
+    return bool(_FOLLOWUP_MARKER_RE.match(user_text or ""))
+
+
 _KIND_RE        = re.compile(r"(?im)^\s*KIND\s*:\s*(\w+)")
 _GOAL_RE        = re.compile(r"(?im)^\s*GOAL\s*:\s*(.+?)\s*$")
 _SECTION_RE     = re.compile(r"(?im)^\s*(CONSTRAINTS|FORBIDDEN)\s*:\s*$")
@@ -347,11 +407,18 @@ def condense_query(
         except Exception:
             parsed = None
 
-    # Topic-shift signal: rely on either the parsed KIND or lexical
-    # overlap with the previous goal.
+    # Topic-shift signal: prefer the strongest source first.
+    #   1. Follow-up markers in the user's text ("also", "and now",
+    #      "what about", …) — these are unambiguous "this builds on
+    #      the previous question" signals and override everything.
+    #   2. KIND field from the LLM condenser, if it ran.
+    #   3. Jaccard similarity with the previous query, when neither
+    #      of the above is available.
     is_extension = False
     if previous_memo is not None and not previous_memo.is_empty():
-        if parsed is not None and parsed["kind"] == "extension":
+        if _is_likely_followup(user_text):
+            is_extension = True
+        elif parsed is not None and parsed["kind"] == "extension":
             is_extension = True
         elif parsed is None:
             # Fall back to lexical similarity when the LLM didn't speak

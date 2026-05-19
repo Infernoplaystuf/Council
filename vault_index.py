@@ -174,6 +174,31 @@ def _tokenize(text: str) -> List[str]:
             if _is_useful_token(t.lower())]
 
 
+def _select_top_keywords(kw_set: Set[str], cap: int) -> List[str]:
+    """Pick at most ``cap`` keywords from ``kw_set``, prioritizing the
+    most distinctive (longest) tokens. Plain alphabetical sort + slice
+    used to bias toward the start of the alphabet — for a file with
+    thousands of tokens, "0000".."99999" / "a" / "all" / "and" / etc.
+    would fill the cap before any 8+ char domain term reached it.
+
+    Sort order: length descending, then lexicographic. The final list
+    is alphabetized for deterministic storage / readable diffs. Net
+    effect: long domain words like ``promethium``, ``stoneskin``,
+    ``ironfist`` survive the cap before short generic tokens.
+    """
+    if not kw_set:
+        return []
+    # `numeric_filler` like "1", "12", "2024" are usually low-value for
+    # find-by-keyword search. Push them to the bottom of the priority
+    # list so domain words win the cap fight.
+    def _priority_key(tok: str):
+        is_numeric = tok.isdigit()
+        return (0 if not is_numeric else 1, -len(tok), tok)
+    sorted_by_priority = sorted(kw_set, key=_priority_key)
+    kept = sorted_by_priority[:cap]
+    return sorted(kept)
+
+
 # ---------- file parsers ----------------------------------------------------
 
 _TEXT_SUFFIXES = {
@@ -400,13 +425,18 @@ def _parse_json_full(p: Path) -> Dict[str, Any]:
 
     keywords: Set[str] = set()
     keywords.update(_tokenize(" ".join(keys)))
-    keywords.update(_tokenize(" ".join(list(string_values)[:200])))
+    # Tokenize ALL string values, not an arbitrary subset. Slicing a set
+    # via list(...)[:N] picks a random N entries (sets are unordered),
+    # which used to mean that high-cardinality files (e.g. 1000 build
+    # entries with unique names) would saturate string_values with build
+    # names and leave no room for powers/materials in the keyword index.
+    keywords.update(_tokenize(" ".join(string_values)))
 
     return {
         "type": "json",
         "keys": sorted(keys)[:120],
         "sample_text": sample_text[:1200],
-        "keywords": sorted(keywords)[:300],
+        "keywords": _select_top_keywords(keywords, 1500),
     }
 
 
@@ -439,13 +469,15 @@ def _parse_json_regex_full(p: Path, size: int) -> Dict[str, Any]:
 
     keywords: Set[str] = set()
     keywords.update(_tokenize(" ".join(keys)))
-    keywords.update(_tokenize(" ".join(list(string_values)[:500])))
+    # Tokenize the whole string_values set — see the comment in
+    # _parse_json_full for why the previous [:500] slice was a bug.
+    keywords.update(_tokenize(" ".join(string_values)))
 
     rec = {
         "type": "json",
         "keys": sorted(keys)[:120],
         "sample_text": sample_text[:1200],
-        "keywords": sorted(keywords)[:300],
+        "keywords": _select_top_keywords(keywords, 1500),
         "indexing_tier": "regex_full",
         "indexed_bytes": size,
     }
@@ -494,14 +526,16 @@ def _parse_json_sampled(p: Path, size: int) -> Dict[str, Any]:
 
     keywords: Set[str] = set()
     keywords.update(_tokenize(" ".join(keys)))
-    keywords.update(_tokenize(" ".join(list(string_values)[:500])))
+    # Tokenize the whole string_values set — see the comment in
+    # _parse_json_full for why the previous [:500] slice was a bug.
+    keywords.update(_tokenize(" ".join(string_values)))
 
     sampled_mb = (_JSON_SAMPLE_HEAD_BYTES + _JSON_SAMPLE_TAIL_BYTES) / (1024 * 1024)
     return {
         "type": "json",
         "keys": sorted(keys)[:120],
         "sample_text": sample_text[:1200],
-        "keywords": sorted(keywords)[:300],
+        "keywords": _select_top_keywords(keywords, 1500),
         "indexing_tier": "sampled_head_tail",
         "indexed_bytes": int(_JSON_SAMPLE_HEAD_BYTES + _JSON_SAMPLE_TAIL_BYTES),
         "indexing_note": (
