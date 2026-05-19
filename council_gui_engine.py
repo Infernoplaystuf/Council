@@ -3722,6 +3722,7 @@ class CouncilConsole(tk.Tk):
         self._build_vault_manager_tab()
         self._build_speech_tab()
         self._build_changelog_tab()
+        self._build_diagnostics_tab()
 
         # ── Advanced / admin tabs ──
         # Hidden by default unless explicitly enabled. Power users and
@@ -4522,6 +4523,27 @@ class CouncilConsole(tk.Tk):
         _re.IGNORECASE,
     )
 
+    # Dependency / diagnostics chat intent — same info the Diagnostics
+    # tab shows, available via chat for users who prefer to type. Useful
+    # for sharing the full system snapshot when reporting a bug
+    # (the chat output goes into the transcript export).
+    _DIAGNOSTICS_RE = _re.compile(
+        r"^\s*(?:"
+        r"check\s+dependencies"
+        r"|check\s+deps"
+        r"|what(?:'s|\s+is)\s+missing"
+        r"|missing\s+dependencies"
+        r"|missing\s+features"
+        r"|system\s+status"
+        r"|system\s+diagnostics"
+        r"|diagnose"
+        r"|run\s+diagnostics"
+        r"|show\s+(?:dependencies|deps|diagnostics)"
+        r"|what\s+optional\s+(?:packages|features|dependencies)"
+        r")\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+
     _ELEMENT_RANKING_RE = _re.compile(
         # Matches phrasings like:
         #   what is the most common (atomic) element [in <where>]
@@ -4683,6 +4705,10 @@ class CouncilConsole(tk.Tk):
 
         if self._CLEAR_LEARNED_RE.match(single_line):
             self._clear_learned_synonyms_response()
+            return True
+
+        if self._DIAGNOSTICS_RE.match(single_line):
+            self._diagnostics_chat_response()
             return True
 
         if self._DUPES_RE.match(single_line):
@@ -5538,6 +5564,19 @@ class CouncilConsole(tk.Tk):
             "Type 'reset memo' to start fresh on the next question."
         )
         self._append_transcript("Writer", "\n".join(lines), "final")
+
+    def _diagnostics_chat_response(self):
+        """Render the dependency-check report into the transcript as a
+        Writer-final message. Same content as the Diagnostics tab —
+        useful for sharing in bug reports because chat output flows
+        into the transcript export.
+        """
+        try:
+            import dependency_check as _dc
+            text = _dc.render_as_text()
+        except Exception as exc:
+            text = f"dependency_check failed: {exc!r}"
+        self._append_transcript("Writer", text, "final")
 
     def _show_learned_synonyms_response(self):
         """Render every (term -> [tokens-from-vault]) pair the semantic
@@ -9770,6 +9809,160 @@ class CouncilConsole(tk.Tk):
     # Reads `git log` and `git show` from the repo root so users can see
     # exactly what shipped between launches. Runs git as a subprocess so a
     # broken Git install is just a status message, not a tab failure.
+
+    # ============================
+    # Diagnostics tab — system + optional-dependency status
+    # ============================
+    # Surfaces every optional dependency the app might use plus the
+    # core environment (Python version, n_ctx, physical cores). Lets a
+    # user see at a glance whether speech / embeddings / PDF / etc. are
+    # available, and exactly what pip command would install each
+    # missing feature. The actual install is deliberately the user's
+    # job — running pip from inside a packaged .exe is dangerous (it
+    # might write to the wrong python).
+
+    def _build_diagnostics_tab(self):
+        self.tab_diagnostics = ttk.Frame(self.nb)
+        self.nb.add(self.tab_diagnostics, text="🔧 Diagnostics")
+
+        # Top bar — refresh + status summary
+        bar = ttk.Frame(self.tab_diagnostics)
+        bar.pack(fill="x", padx=6, pady=(6, 4))
+        ttk.Button(bar, text="⟳ Re-check",
+                   command=self._diagnostics_refresh).pack(side="left")
+        ttk.Button(bar, text="📋 Copy report",
+                   command=self._diagnostics_copy_to_clipboard
+                   ).pack(side="left", padx=4)
+        self._diagnostics_status_var = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=self._diagnostics_status_var,
+                  foreground="#9a9a9a").pack(side="right")
+
+        # Scrollable text widget for the full report
+        text_frame = ttk.Frame(self.tab_diagnostics)
+        text_frame.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        vsb = ttk.Scrollbar(text_frame, orient="vertical")
+        vsb.pack(side="right", fill="y")
+        self._diagnostics_text = tk.Text(
+            text_frame, wrap="word",
+            font=("Consolas", 10),
+            yscrollcommand=vsb.set,
+            bg="#1a1414", fg="#e6e6e6",
+            insertbackground="#e6e6e6",
+        )
+        self._diagnostics_text.pack(fill="both", expand=True)
+        vsb.config(command=self._diagnostics_text.yview)
+
+        # Colour tags for the report — green for available, red for
+        # missing, dim for the descriptive lines.
+        self._diagnostics_text.tag_config("ok",       foreground="#a6e3a1")
+        self._diagnostics_text.tag_config("missing",  foreground="#f38ba8")
+        self._diagnostics_text.tag_config("dim",      foreground="#9a9a9a")
+        self._diagnostics_text.tag_config("install",  foreground="#89b4fa")
+        self._diagnostics_text.tag_config("section",
+                                          font=("Consolas", 10, "bold"))
+
+        # Render on first show
+        self._diagnostics_refresh()
+
+    def _diagnostics_refresh(self):
+        """Re-run the dependency check and repaint the report."""
+        try:
+            import dependency_check as _dc
+        except Exception as exc:
+            self._diagnostics_text.configure(state="normal")
+            self._diagnostics_text.delete("1.0", "end")
+            self._diagnostics_text.insert("1.0",
+                f"Could not load dependency_check module: {exc!r}")
+            self._diagnostics_text.configure(state="disabled")
+            return
+
+        statuses = _dc.check_all()
+        ok_count = sum(1 for s in statuses if s.ok)
+        missing  = [s for s in statuses if not s.ok]
+
+        self._diagnostics_text.configure(state="normal")
+        self._diagnostics_text.delete("1.0", "end")
+
+        # System summary
+        self._diagnostics_text.insert("end", "System summary\n", "section")
+        self._diagnostics_text.insert("end", "─" * 60 + "\n", "dim")
+        for line in _dc.system_summary():
+            self._diagnostics_text.insert("end", f"  {line}\n")
+        self._diagnostics_text.insert("end", "\n")
+
+        # Missing features grouped by impact — most actionable info up top
+        if missing:
+            self._diagnostics_text.insert(
+                "end",
+                f"Missing optional dependencies ({len(missing)})\n",
+                "section",
+            )
+            self._diagnostics_text.insert("end", "─" * 60 + "\n", "dim")
+            by_impact = {"high": [], "med": [], "low": []}
+            for s in missing:
+                by_impact.setdefault(s.spec.impact, []).append(s)
+            for impact_key, label in (("high", "High impact"),
+                                       ("med",  "Medium impact"),
+                                       ("low",  "Low impact")):
+                bucket = by_impact.get(impact_key, [])
+                if not bucket:
+                    continue
+                self._diagnostics_text.insert("end", f"\n  {label}\n", "section")
+                for s in bucket:
+                    self._diagnostics_text.insert("end", f"    ✗ ", "missing")
+                    self._diagnostics_text.insert("end", f"{s.spec.name}\n")
+                    self._diagnostics_text.insert("end",
+                        f"        {s.spec.description}\n", "dim")
+                    self._diagnostics_text.insert("end",
+                        f"        Missing: {', '.join(s.missing)}\n", "dim")
+                    self._diagnostics_text.insert("end", "        Install: ", "dim")
+                    self._diagnostics_text.insert("end",
+                        f"{s.spec.install}\n", "install")
+            self._diagnostics_text.insert("end", "\n")
+        else:
+            self._diagnostics_text.insert("end",
+                "All optional dependencies are installed.\n\n", "ok")
+
+        # Available features
+        available = [s for s in statuses if s.ok]
+        if available:
+            self._diagnostics_text.insert(
+                "end",
+                f"Available optional features ({ok_count})\n",
+                "section",
+            )
+            self._diagnostics_text.insert("end", "─" * 60 + "\n", "dim")
+            for s in available:
+                self._diagnostics_text.insert("end", "  ✓ ", "ok")
+                self._diagnostics_text.insert("end", f"{s.spec.name}\n")
+            self._diagnostics_text.insert("end", "\n")
+
+        # Footer
+        self._diagnostics_text.insert("end",
+            "To install missing features, run their pip commands in the "
+            "same Python environment that runs this app. Restart the "
+            "app afterward to pick up the changes.\n", "dim")
+
+        self._diagnostics_text.configure(state="disabled")
+        self._diagnostics_status_var.set(
+            f"✓ {ok_count} available  ·  ✗ {len(missing)} missing"
+        )
+
+    def _diagnostics_copy_to_clipboard(self):
+        """Put the full plain-text report on the clipboard so users can
+        paste it into a bug report or share it on Discord/email."""
+        try:
+            import dependency_check as _dc
+            report = _dc.render_as_text()
+        except Exception as exc:
+            report = f"dependency_check unavailable: {exc!r}"
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(report)
+            self.update()
+            self._diagnostics_status_var.set("✓ Copied to clipboard")
+        except Exception as exc:
+            self._diagnostics_status_var.set(f"copy failed: {exc!r}")
 
     def _build_changelog_tab(self):
         self.tab_changelog = ttk.Frame(self.nb)
