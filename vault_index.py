@@ -277,8 +277,19 @@ def _parse_csv(p: Path) -> Dict[str, Any]:
 
 _JSON_FULL_PARSE_MAX_BYTES = 5  * 1024 * 1024     # 5 MB
 _JSON_REGEX_FULL_MAX_BYTES = 200 * 1024 * 1024    # 200 MB
-_JSON_SAMPLE_HEAD_BYTES    = 1  * 1024 * 1024     # 1 MB head sample
-_JSON_SAMPLE_TAIL_BYTES    = 1  * 1024 * 1024     # 1 MB tail sample
+# Tier-3 (>200 MB) sample windows. 5 MB head + 5 MB tail = 10 MB total
+# scanned per huge file, up from the original 2 MB. Concretely:
+#   • For a 500 MB array of builds, the head sample now captures the
+#     first ~5,000-20,000 build entries (depending on size) and the
+#     tail sample captures the last ~5,000-20,000.
+#   • Search coverage on huge files jumps from ~0.4% of the document
+#     to ~2% — a 5x improvement in hit rate.
+#   • Per-file indexing time on tier 3 goes from ~1 s to ~3-5 s,
+#     still negligible compared to the original full-parse hour+.
+# Keep these as module-level constants so they're easy to bump
+# further if your files are even bigger.
+_JSON_SAMPLE_HEAD_BYTES    = 5 * 1024 * 1024     # 5 MB head sample
+_JSON_SAMPLE_TAIL_BYTES    = 5 * 1024 * 1024     # 5 MB tail sample
 
 _JSON_WALK_DICT_CAP   = 5000
 _JSON_WALK_LIST_CAP   = 25
