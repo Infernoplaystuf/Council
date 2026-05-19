@@ -9020,8 +9020,15 @@ class CouncilConsole(tk.Tk):
         self._idx_status_var.set("Walking vault…")
 
         def _worker():
+            def _on_progress(done: int, total: int, name: str):
+                # Trim very long filenames so the status bar doesn't
+                # wrap or look ugly. Bounce to the UI thread via
+                # self.after — Tk widgets are not thread-safe.
+                short = name if len(name) <= 48 else name[:45] + "…"
+                self.after(0, lambda: self._idx_status_var.set(
+                    f"Indexing {done}/{total} — {short}"))
             try:
-                n = idx.rebuild()
+                n = idx.rebuild(progress=_on_progress)
             except Exception as exc:
                 self.after(0, lambda: self._idx_status_var.set(
                     f"Keyword index failed: {exc!r}"))
