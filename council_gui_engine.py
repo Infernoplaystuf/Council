@@ -1191,7 +1191,25 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                 # pull from 5 to 1 — the analyst's CSV is the authoritative
                 # source and 5 fuzzy matches just consume budget.
                 k = 1 if analyst_block else 5
-                hits, fuzzy_matches = idx.search(user_text, k=k, folder=folder_scope)
+                # Semantic expansion via the local model: when a query
+                # term isn't in the vault's vocab, the index calls the
+                # model to ask "which of these vocab tokens belong in
+                # the queried category?" The model decides per-vault
+                # (so "metals" returns "promethium" only if it's
+                # actually in this user's files). Cached on disk; one
+                # call per novel concept ever.
+                def _semantic_llm_call(prompt: str) -> str:
+                    import council_engine as _ce_sem
+                    return _ce_sem.local_chat(
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.0,
+                        num_predict=180,
+                        timeout=45,
+                    )
+                hits, fuzzy_matches = idx.search(
+                    user_text, k=k, folder=folder_scope,
+                    llm_call=_semantic_llm_call,
+                )
                 print('[DEBUG inject] vault hits: '
                       + str([(round(s, 2), h.get("name")) for s, h in hits]),
                       file=_sys_dbg.stderr)
@@ -4465,6 +4483,33 @@ class CouncilConsole(tk.Tk):
         _re.IGNORECASE,
     )
 
+    # ── Learned-synonym cache inspection / reset ─────────────────────
+    # The vault index caches every semantic expansion the model
+    # produced ("metals" -> ["promethium", "adamantium"]) in
+    # vault/semantic_cache.json. These chat intents let the user see
+    # what the model learned about their vault, and reset the cache
+    # if they want to start over (e.g. they corrected the model's
+    # interpretation and want it re-run with different vocab).
+    _SHOW_LEARNED_RE = _re.compile(
+        r"^\s*(?:"
+        r"show\s+learned\s+(?:synonyms?|categories?)"
+        r"|(?:learned\s+)?synonyms?(?:\s+status)?"
+        r"|show\s+(?:vault\s+)?categories?"
+        r"|what\s+has\s+the\s+model\s+learned"
+        r")\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+    _CLEAR_LEARNED_RE = _re.compile(
+        r"^\s*(?:"
+        r"clear\s+learned\s+(?:synonyms?|categories?|cache)"
+        r"|reset\s+learned\s+(?:synonyms?|categories?|cache)"
+        r"|forget\s+learned\s+(?:synonyms?|categories?)"
+        r"|clear\s+semantic\s+cache"
+        r"|reset\s+semantic\s+cache"
+        r")\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
+
     _ELEMENT_RANKING_RE = _re.compile(
         # Matches phrasings like:
         #   what is the most common (atomic) element [in <where>]
@@ -4618,6 +4663,14 @@ class CouncilConsole(tk.Tk):
 
         if self._RESET_MEMO_RE.match(single_line):
             self._reset_task_memo_response()
+            return True
+
+        if self._SHOW_LEARNED_RE.match(single_line):
+            self._show_learned_synonyms_response()
+            return True
+
+        if self._CLEAR_LEARNED_RE.match(single_line):
+            self._clear_learned_synonyms_response()
             return True
 
         if self._DUPES_RE.match(single_line):
@@ -5469,6 +5522,99 @@ class CouncilConsole(tk.Tk):
             "Type 'reset memo' to start fresh on the next question."
         )
         self._append_transcript("Writer", "\n".join(lines), "final")
+
+    def _show_learned_synonyms_response(self):
+        """Render every (term -> [tokens-from-vault]) pair the semantic
+        expansion layer has cached so far. Lets the user spot bad
+        categorizations ("ah, the model thinks 'denim' is a metal —
+        let me clear that").
+        """
+        idx = _get_vault_index()
+        if idx is None:
+            self._append_transcript(
+                "Writer", "Vault index unavailable.", "final",
+            )
+            return
+        try:
+            cache = idx._load_semantic_cache()
+        except Exception as exc:
+            self._append_transcript(
+                "Writer", f"Could not read learned synonyms: {exc!r}", "final",
+            )
+            return
+        entries = cache.get("entries", {}) if isinstance(cache, dict) else {}
+        if not entries:
+            self._append_transcript(
+                "Writer",
+                "No learned synonyms yet. The model builds these "
+                "automatically the first time you search for a category "
+                "word that isn't literally in your files "
+                "(e.g. 'metals', 'fabrics', 'weapons'). After the first "
+                "such search the result is cached on disk.\n\n"
+                "Cache file: vault/semantic_cache.json",
+                "final",
+            )
+            return
+        lines: list = [
+            "Learned semantic categories",
+            "───────────────────────────",
+            "(The model decided which of your vault's actual tokens "
+            "belong in each category. Cached per-vault on disk.)",
+            "",
+        ]
+        for term in sorted(entries):
+            expansions = entries[term] or []
+            if expansions:
+                preview = ", ".join(expansions[:10])
+                if len(expansions) > 10:
+                    preview += f", … (+{len(expansions) - 10} more)"
+                lines.append(f"  {term}  ->  {preview}")
+            else:
+                lines.append(f"  {term}  ->  (no matches in this vault)")
+        lines.append("")
+        lines.append(
+            f"Vocab hash: {cache.get('vocab_hash', '(unknown)')}"
+        )
+        lines.append(
+            "Type 'clear learned synonyms' to wipe the cache. The "
+            "next category search will recompute against the current vocab."
+        )
+        self._append_transcript("Writer", "\n".join(lines), "final")
+
+    def _clear_learned_synonyms_response(self):
+        """Wipe the semantic-expansion cache file. The next category
+        query will recompute fresh against the current vocab."""
+        idx = _get_vault_index()
+        if idx is None:
+            self._append_transcript(
+                "Writer", "Vault index unavailable.", "final",
+            )
+            return
+        try:
+            cache_path = idx._semantic_cache_path()
+        except Exception:
+            self._append_transcript(
+                "Writer", "Could not locate semantic cache file.", "final",
+            )
+            return
+        if cache_path.exists():
+            try:
+                cache_path.unlink()
+                self._append_transcript(
+                    "Writer",
+                    "Learned synonyms cleared. The next category-shaped "
+                    "search will ask the model fresh.",
+                    "final",
+                )
+                return
+            except Exception as exc:
+                self._append_transcript(
+                    "Writer", f"Could not delete cache: {exc!r}", "final",
+                )
+                return
+        self._append_transcript(
+            "Writer", "No learned-synonym cache to clear.", "final",
+        )
 
     def _reset_task_memo_response(self):
         """Drop the current task memo. Next user query starts fresh —

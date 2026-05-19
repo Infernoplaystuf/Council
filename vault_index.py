@@ -38,6 +38,20 @@ except Exception:
 
 INDEX_FILENAME = "vault_index.json"
 DENYLIST_FILENAME = "fuzzy_denylist.json"
+SEMANTIC_CACHE_FILENAME = "semantic_cache.json"
+
+# Bookkeeping files we write to the vault root. The rebuild walk MUST
+# skip these — indexing them would feed our own JSON keys back into the
+# vocabulary, causing self-reference bugs (e.g. "metals" appearing in
+# the vocab just because it's a key in the semantic cache, defeating the
+# whole point of semantic expansion).
+_BOOKKEEPING_FILENAMES = {
+    INDEX_FILENAME,
+    DENYLIST_FILENAME,
+    SEMANTIC_CACHE_FILENAME,
+    "backend_settings.json",   # GGUF model path; not user data
+    ".onboarded",              # onboarding marker
+}
 
 # Fuzzy match defaults — Levenshtein-style ratio via difflib.
 FUZZY_CUTOFF = 0.82           # similarity threshold (0..1)
@@ -1004,6 +1018,181 @@ class VaultIndex:
         self._vocab_cache = vocab
         return vocab
 
+    # ---- semantic expansion (model-driven, data-agnostic) ----
+    #
+    # When the user queries a category word that doesn't appear literally
+    # in any file ("metals", "energy units", "weapons", "fabrics"), the
+    # keyword index misses every relevant file. Hardcoding "promethium is
+    # a metal" would corrupt the app for users whose vaults are about
+    # something else entirely. Instead we let the model decide WHICH of
+    # the user's actual vocabulary tokens belong in the queried category.
+    #
+    # Lifecycle:
+    #   • semantic_expand(term, llm_call) runs on demand, only when the
+    #     search query has at least one term that's not in the vault's
+    #     vocabulary.
+    #   • Each (term -> expansions) lookup is cached in
+    #     vault/semantic_cache.json so a novel concept costs one model
+    #     call ever for the lifetime of that vault.
+    #   • The cache is invalidated automatically when the vocabulary
+    #     changes (new files, removed files) — we hash the sorted vocab
+    #     and bust entries built against a stale hash.
+    #   • If the model isn't available (llm_call=None), returns []. The
+    #     existing fuzzy-match layer remains the fallback.
+
+    _SEMANTIC_CACHE_FILENAME = SEMANTIC_CACHE_FILENAME
+    _SEMANTIC_PROMPT = """\
+You are categorizing vocabulary tokens from a user's data vault. Decide
+which of the LISTED tokens belong in the QUERIED category.
+
+QUERIED CATEGORY: {term}
+
+USER'S VAULT VOCABULARY (these are real strings from the user's files;
+return ONLY tokens from this list — do not invent any new words):
+{vocab}
+
+Output the matching tokens as a comma-separated list on a single line.
+If NONE of the listed tokens belong in the category, output the single
+word: NONE
+Do not explain, do not add prose, do not include tokens that are not in
+the vocabulary list. Lowercase only. Single line only.
+"""
+
+    def _semantic_cache_path(self) -> Path:
+        return self.vault_dir / self._SEMANTIC_CACHE_FILENAME
+
+    def _load_semantic_cache(self) -> Dict[str, Any]:
+        """Cache layout:
+            { "vocab_hash": "<sha256>",
+              "entries":    { "<term>": ["expansion1", "expansion2", ...] } }
+        Returns {} on any error."""
+        p = self._semantic_cache_path()
+        if not p.exists():
+            return {}
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {}
+            return data
+        except Exception:
+            return {}
+
+    def _save_semantic_cache(self, cache: Dict[str, Any]) -> None:
+        try:
+            self._semantic_cache_path().write_text(
+                json.dumps(cache, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def _vocab_hash(self) -> str:
+        """Stable hash of the current vocab. Used to invalidate the
+        semantic cache when the vault contents have meaningfully
+        changed."""
+        import hashlib as _h
+        vocab = sorted(self._global_vocab())
+        return _h.sha256("\n".join(vocab).encode("utf-8")).hexdigest()[:16]
+
+    def semantic_expand(
+        self,
+        term: str,
+        llm_call: Optional[Callable[[str], str]] = None,
+        *,
+        max_vocab_in_prompt: int = 400,
+    ) -> List[str]:
+        """Return vocab tokens semantically related to ``term``.
+
+        Asks the local model "which of these user-vocabulary tokens
+        belong in the QUERIED category". The model decides whether
+        ``"promethium"`` is a metal, whether ``"denim"`` is a fabric,
+        whether ``"glock"`` is a weapon — based on its own knowledge of
+        each domain, NOT a hardcoded mapping. Results are filtered to
+        tokens that actually exist in the user's vault (so the model
+        can't hallucinate words that aren't there).
+
+        Cached in vault/semantic_cache.json. Cache is invalidated when
+        the global vocab hash changes (new/removed/changed files).
+
+        Returns an empty list when:
+          • llm_call is None (no model loaded)
+          • The model says "NONE"
+          • The model output can't be parsed
+          • The term is too short or empty
+        """
+        t = (term or "").lower().strip()
+        if len(t) < 3 or llm_call is None:
+            return []
+
+        vocab = self._global_vocab()
+        if not vocab:
+            return []
+
+        # Skip the model call if the term itself is in the vocab — there's
+        # nothing semantic to do; literal search will find it.
+        if t in vocab:
+            return []
+
+        cache = self._load_semantic_cache()
+        current_hash = self._vocab_hash()
+
+        # Drop the entries dict on hash change — the user's vault has
+        # shifted under us and old expansions may include vocab that no
+        # longer exists.
+        if cache.get("vocab_hash") != current_hash:
+            cache = {"vocab_hash": current_hash, "entries": {}}
+
+        entries = cache.setdefault("entries", {})
+        if t in entries:
+            cached = entries[t]
+            # Defensive: filter against the current vocab in case partial
+            # invalidation slipped through.
+            return [w for w in cached if w in vocab][:50]
+
+        # Build the prompt. Bound vocab size so the call stays fast even
+        # on large vaults. Prefer long tokens (more likely to be domain
+        # words rather than numeric noise) and avoid showing the model
+        # tokens it would never categorize usefully.
+        def _vocab_priority(tok: str) -> tuple:
+            return (1 if tok.isdigit() else 0, -len(tok), tok)
+        prioritized = sorted(vocab, key=_vocab_priority)
+        vocab_sample = prioritized[:max_vocab_in_prompt]
+
+        prompt = self._SEMANTIC_PROMPT.format(
+            term=t, vocab=", ".join(vocab_sample),
+        )
+
+        try:
+            raw = llm_call(prompt)
+        except Exception:
+            entries[t] = []
+            self._save_semantic_cache(cache)
+            return []
+
+        # Parse: lowercase, split on commas, strip, keep only tokens that
+        # are actually in the vocab. NONE / "(none)" / empty all map to [].
+        expansions: List[str] = []
+        if raw:
+            cleaned = raw.strip().lower()
+            if cleaned and cleaned != "none" and not cleaned.startswith("none"):
+                seen: Set[str] = set()
+                for piece in cleaned.replace("\n", ",").split(","):
+                    w = piece.strip().strip(".'\"`")
+                    # The model occasionally wraps tokens in quotes or
+                    # adds a leading "- " bullet. Strip those.
+                    w = w.lstrip("-* \t")
+                    if not w or w == "none":
+                        continue
+                    if w in vocab and w not in seen and w != t:
+                        seen.add(w)
+                        expansions.append(w)
+                    if len(expansions) >= 50:
+                        break
+
+        entries[t] = expansions
+        self._save_semantic_cache(cache)
+        return expansions
+
     def _fuzzy_expand_term(
         self, term: str, *, denylist: Optional[Set[str]] = None,
         cutoff: float = FUZZY_CUTOFF, n: int = FUZZY_MAX_PER_TERM,
@@ -1085,7 +1274,11 @@ class VaultIndex:
         for p in root.rglob("*"):
             if not p.is_file():
                 continue
-            if p.name == INDEX_FILENAME:
+            # Skip our own bookkeeping files (index, denylist, semantic
+            # cache, backend settings, onboarding marker). Indexing them
+            # would feed JSON-shaped keys back into the vocab and break
+            # semantic expansion.
+            if p.name in _BOOKKEEPING_FILENAMES:
                 continue
             if _is_protected(p, self.vault_dir):
                 continue
@@ -1176,6 +1369,7 @@ class VaultIndex:
         *,
         folder: Optional[str] = None,
         use_fuzzy: bool = True,
+        llm_call: Optional[Callable[[str], str]] = None,
     ) -> Tuple[List[Tuple[float, Dict[str, Any]]], Dict[str, List[Tuple[str, float]]]]:
         """Return (top-k results, fuzzy_matches) for a free-text query.
 
@@ -1186,6 +1380,16 @@ class VaultIndex:
         list of (suggested_token, similarity) tuples that were used to
         expand the search. The caller can surface this to the user so
         misspellings can be reviewed and rejected.
+
+        `llm_call` is an optional callable that does a one-shot model
+        inference for **semantic expansion**: when a query token isn't in
+        the vault's vocab AND isn't fuzzy-matchable, we ask the model
+        "which of these user-vocabulary tokens belong in the category
+        <term>?" The model's answer is filtered to the user's actual
+        vocab (no inventions), cached on disk, and added to the search
+        terms. Lets queries like "metals" surface "promethium" / "iron"
+        / "steel" entries WITHOUT any hardcoded domain mapping in the
+        index — the model decides per-vault based on the actual data.
         """
         terms = _tokenize(query)
         fuzzy_matches: Dict[str, List[Tuple[str, float]]] = {}
@@ -1208,6 +1412,38 @@ class VaultIndex:
                     fuzzy_matches[t] = close
                     for matched, _ratio in close:
                         expanded |= _expand(matched)
+
+        # Semantic expansion via the model. Only runs for query terms
+        # that are NOT in the vocab AND not already typo-fixed by the
+        # fuzzy layer. The model decides what belongs in each category
+        # using ONLY tokens that exist in the user's vault — so a query
+        # for "metals" against a textile vault returns nothing rather
+        # than something invented. Cached per-vault on disk; one model
+        # call per novel concept across the vault's lifetime.
+        if llm_call is not None:
+            vocab = self._global_vocab()
+            for t in terms:
+                if t in vocab:
+                    continue
+                if t in fuzzy_matches:
+                    continue                # fuzzy already handled it
+                if len(t) < 3:
+                    continue
+                try:
+                    expansions = self.semantic_expand(t, llm_call=llm_call)
+                except Exception:
+                    expansions = []
+                if expansions:
+                    # Reuse the fuzzy_matches map so the existing UI path
+                    # that surfaces "treated as your spelling" matches
+                    # also covers semantic expansions. The score is 1.0
+                    # to mark a confident model match vs the fuzzy
+                    # ratios that are typically 0.8-0.95.
+                    fuzzy_matches.setdefault(t, []).extend(
+                        (w, 1.0) for w in expansions
+                    )
+                    for w in expansions:
+                        expanded |= _expand(w)
 
         # Strip trivial stop-tokens that explode match counts
         _stop = {"the", "a", "an", "of", "in", "on", "for", "to", "is", "are",
