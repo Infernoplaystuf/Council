@@ -144,8 +144,36 @@ def _get_gguf_model():
         ) from exc
 
     n_ctx = int(os.environ.get("COUNCIL_GGUF_N_CTX", "4096"))
+    # Default n_threads to PHYSICAL cores when possible.
+    # Reasoning: llama.cpp inference is compute-bound and memory-bandwidth-
+    # bound. On a CPU with SMT/hyperthreading, two logical threads share
+    # the same physical execution units and memory channels — running on
+    # logical-count threads typically PESSIMISES throughput by 10-30%
+    # compared to physical-count threads. psutil's cpu_count(logical=False)
+    # gives the right answer cross-platform; if psutil isn't installed
+    # we fall back to a divisor heuristic (x86 usually 2 threads/core,
+    # ARM usually 1).
+    def _default_n_threads() -> int:
+        try:
+            import psutil as _ps   # type: ignore[import]
+            n = _ps.cpu_count(logical=False)
+            if n and n >= 1:
+                return int(n)
+        except Exception:
+            pass
+        logical = os.cpu_count() or 4
+        # Apple Silicon has no SMT; raw count is correct.
+        if sys.platform == "darwin" and "arm" in (os.uname().machine
+                                                  if hasattr(os, "uname")
+                                                  else "").lower():
+            return max(1, logical)
+        # x86 with even logical count >= 4 is almost certainly hyperthreaded.
+        if logical >= 4 and logical % 2 == 0:
+            return max(1, logical // 2)
+        return max(1, logical)
+
     n_threads = int(os.environ.get("COUNCIL_GGUF_N_THREADS",
-                                    str(max(1, (os.cpu_count() or 4)))))
+                                    str(_default_n_threads())))
     n_gpu_layers = int(os.environ.get("COUNCIL_GGUF_GPU_LAYERS", "0"))
 
     print(f"[GGUF] Loading {p.name} (n_ctx={n_ctx}, n_threads={n_threads}, "

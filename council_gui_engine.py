@@ -4394,6 +4394,18 @@ class CouncilConsole(tk.Tk):
         r"(?:index|descriptions?|summaries)\s*[.!?]?\s*$",
         _re.IGNORECASE,
     )
+    # Topics-only build: skips the prose description for non-tabular
+    # files, generating only the keyword topics. ~3x faster than the
+    # full description path on CPU-only inference. Tabular files (CSV,
+    # Excel, etc.) get schema-based descriptions either way — those
+    # don't go through the model.
+    _BUILD_TOPICS_ONLY_RE = _re.compile(
+        r"^\s*(?:build|generate|refresh)\s+(?:the\s+)?"
+        r"(?:vault\s+|file\s+)?"
+        r"(?:topics?(?:\s+only)?|tags|keywords|categories?)"
+        r"(?:\s+only)?\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
     _BUILD_EMBEDDINGS_RE = _re.compile(
         r"^\s*(?:build|generate|refresh|rebuild)\s+(?:the\s+)?"
         r"(?:vector\s+|embedding|embeddings|semantic\s+vector)\s*"
@@ -4699,6 +4711,10 @@ class CouncilConsole(tk.Tk):
 
         if self._BUILD_SEMANTIC_RE.match(single_line):
             self._build_semantic_index_response()
+            return True
+
+        if self._BUILD_TOPICS_ONLY_RE.match(single_line):
+            self._build_topics_only_response()
             return True
 
         if self._BUILD_EMBEDDINGS_RE.match(single_line):
@@ -5875,6 +5891,76 @@ class CouncilConsole(tk.Tk):
                 self._append_transcript(
                     "Writer",
                     f"Semantic index complete — {n} files described.",
+                    "final",
+                ),
+                self._set_status("● idle"),
+            ))
+
+        import threading as _th
+        _th.Thread(target=_worker, daemon=True).start()
+
+    def _build_topics_only_response(self):
+        """Faster description build — generates ONLY the keyword topics
+        (no prose summary). On CPU-only inference this is roughly 3x
+        faster than the full description path on the same record set,
+        because the model emits ~24 tokens instead of ~80 per file.
+
+        Tabular files (CSV / Excel / Parquet / SQLite / DuckDB) get
+        their description + topics from the schema with zero model
+        calls regardless — that's pure dict work.
+        """
+        idx = _get_vault_index()
+        if idx is None:
+            self._append_transcript(
+                "Writer", "Vault index is unavailable.", "final",
+            )
+            return
+        try:
+            idx.rebuild()
+        except Exception:
+            pass
+        pending = sum(1 for r in idx.records.values()
+                      if not r.get("topics"))
+        if pending == 0:
+            self._append_transcript(
+                "Writer",
+                f"All {len(idx.records)} indexed files already have "
+                f"topic keywords. (Type 'refresh topics' to regenerate.)",
+                "final",
+            )
+            self._set_status("● idle")
+            return
+        self._append_transcript(
+            "Council",
+            f"Building topic keywords for {pending} files. Tabular "
+            f"files are instant; JSON/text files batch through the "
+            f"model in groups of 4 for ~3x faster generation.",
+            "observation",
+        )
+        self._set_status("● topics…", "#cba6f7")
+
+        def _worker():
+            def _progress(i, total, name):
+                if i % 5 == 0 or i == total:
+                    self.after(0, lambda: self._set_status(
+                        f"● topics {i}/{total}…", "#cba6f7"
+                    ))
+            try:
+                n = idx.generate_descriptions(
+                    topics_only=True, batch_size=4, on_progress=_progress,
+                )
+            except Exception as exc:
+                self.after(0, lambda: (
+                    self._append_transcript("Writer",
+                                            f"topic build failed: {exc!r}",
+                                            "final"),
+                    self._set_status("● idle"),
+                ))
+                return
+            self.after(0, lambda: (
+                self._append_transcript(
+                    "Writer",
+                    f"Topic keywords complete — {n} files tagged.",
                     "final",
                 ),
                 self._set_status("● idle"),

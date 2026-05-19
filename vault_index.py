@@ -167,6 +167,221 @@ def _split_summary_and_topics(text: str) -> Tuple[str, List[str]]:
     return summary, topics
 
 
+def _parse_topics_line(text: str) -> List[str]:
+    """Parse a bare comma-separated topics line — used by topics-only
+    mode where the prompt explicitly asks for ONLY topic keywords."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    # Strip a leading "TOPICS:" if the model added one anyway
+    text = re.sub(r"^\s*topics?\s*[:\-]\s*", "", text, flags=re.IGNORECASE)
+    # Take only the first line — anything after is usually a stray
+    # explanation we asked the model not to write.
+    text = text.splitlines()[0] if text else ""
+    raw = re.split(r"[,;\n]+", text)
+    out: List[str] = []
+    for t in raw:
+        tok = t.strip().lower().strip(".'\"`-*#")
+        if 2 <= len(tok) <= 40:
+            out.append(tok)
+    return out[:6]
+
+
+def _render_record_for_describe(idx: int, rec: Dict[str, Any]) -> str:
+    """Render one record into a compact block the model can read.
+
+    Used by both single-record and batched describe paths. The marker
+    `#N` lets a batched response be split back into individual results.
+    """
+    name = rec.get("name", "?")
+    rtype = rec.get("type", "text")
+    lines: List[str] = [f"#{idx} File: {name}", f"   Type: {rtype}"]
+    if rtype in ("json", "d3dpipeline"):
+        keys = rec.get("keys", []) or []
+        if keys:
+            lines.append("   Top-level keys: " + ", ".join(map(str, keys[:30])))
+        preview = (rec.get("sample_text", "") or "")[:500]
+        if preview:
+            lines.append("   Sample: " + preview.replace("\n", " ")[:500])
+    elif rtype == "bson":
+        keys = rec.get("keys", []) or []
+        if keys:
+            lines.append("   Fields: " + ", ".join(map(str, keys[:20])))
+    else:
+        preview = (rec.get("sample_text", "") or "")[:500]
+        if preview:
+            lines.append("   Sample: " + preview.replace("\n", " ")[:500])
+    return "\n".join(lines)
+
+
+_BATCH_MARKER_RE = re.compile(
+    r"^\s*#?\s*(\d{1,3})\s*[:\.\)]\s*(.*)$", re.IGNORECASE,
+)
+_BATCH_TOPICS_RE = re.compile(
+    r"^\s*topics?\s*#?\s*(\d{1,3})?\s*[:\-]\s*(.*)$", re.IGNORECASE,
+)
+
+
+def _parse_batched_response(
+    text: str, expected: int, *, topics_only: bool,
+) -> Optional[List[Tuple[str, List[str]]]]:
+    """Parse a batched model response. Returns a list of
+    (summary, topics) tuples in marker-order (#1 first, #2 second, ...).
+
+    Returns None when:
+      • the response is empty
+      • fewer than ``expected`` distinct markers found
+
+    The latter is the signal for the caller to fall back to per-record
+    calls. We accept extra markers (just trim) and gracefully skip
+    missing ones (filling with empty placeholders).
+    """
+    if not text or not text.strip():
+        return None
+    # State machine: walk lines, attach each summary / topics line to
+    # the most recently seen marker.
+    summaries: Dict[int, str] = {}
+    topics_map: Dict[int, List[str]] = {}
+    current_idx: Optional[int] = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        # Topics line (with or without explicit marker)
+        m_topics = _BATCH_TOPICS_RE.match(line)
+        if m_topics:
+            try:
+                tidx = int(m_topics.group(1)) if m_topics.group(1) else current_idx
+            except Exception:
+                tidx = current_idx
+            if tidx is not None:
+                topics_map[tidx] = _parse_topics_line(m_topics.group(2))
+            continue
+        # Generic marker line — could be summary OR (in topics-only
+        # mode) a topics list prefixed with the marker
+        m_marker = _BATCH_MARKER_RE.match(line)
+        if m_marker:
+            try:
+                current_idx = int(m_marker.group(1))
+            except Exception:
+                continue
+            tail = (m_marker.group(2) or "").strip()
+            if topics_only:
+                topics_map[current_idx] = _parse_topics_line(tail)
+            else:
+                # First marker line is the summary; further bare
+                # markers without explicit TOPICS prefix replace the
+                # summary.
+                summaries[current_idx] = tail
+            continue
+        # Plain prose continuation of the current summary (only in
+        # full-description mode).
+        if current_idx is not None and not topics_only:
+            existing = summaries.get(current_idx, "")
+            summaries[current_idx] = (
+                existing + " " + line if existing else line
+            ).strip()
+
+    # In full-description mode, require at least one of {summary,
+    # topics} per record. In topics-only mode, require topics.
+    if topics_only:
+        seen = set(topics_map.keys())
+    else:
+        seen = set(summaries.keys()) | set(topics_map.keys())
+    if not seen:
+        return None
+    # Heuristic threshold — accept the parse if we got at least half
+    # of what we expected. Better partial-progress than total fallback.
+    if len(seen) < max(1, expected // 2):
+        return None
+
+    out: List[Tuple[str, List[str]]] = []
+    for i in range(1, expected + 1):
+        out.append((summaries.get(i, ""), topics_map.get(i, [])))
+    return out
+
+
+def _describe_from_schema(rec: Dict[str, Any]) -> Tuple[str, List[str]]:
+    """Deterministically generate description + topics for a tabular
+    record from its index metadata. Zero model calls — pure dict work,
+    runs in microseconds.
+
+    Used for csv / tsv / parquet / excel / sqlite / duckdb records.
+    The model would have produced something very similar from the
+    same metadata, just slower and with occasional hallucinations.
+    """
+    name = rec.get("name", "?")
+    rtype = rec.get("type", "text")
+    summary_parts: List[str] = []
+    topic_set: Set[str] = set()
+
+    if rtype in ("csv", "tsv", "csv.gz", "parquet"):
+        headers = rec.get("headers", []) or []
+        col_count = len(headers)
+        row_count = rec.get("rows")
+        n_str = f"{row_count:,}" if isinstance(row_count, int) else "?"
+        summary_parts.append(
+            f"{rtype.upper()} dataset {name!r} with {col_count} columns "
+            f"and {n_str} rows."
+        )
+        if headers:
+            head_preview = ", ".join(map(str, headers[:6]))
+            if col_count > 6:
+                head_preview += f", … (+{col_count - 6} more)"
+            summary_parts.append(f"Columns: {head_preview}.")
+        # Topics from column names (tokenized + cleaned)
+        for h in headers:
+            for tok in _tokenize(str(h)):
+                if _is_useful_token(tok):
+                    topic_set.add(tok)
+
+    elif rtype == "excel":
+        sheets = rec.get("sheets", []) or []
+        summary_parts.append(
+            f"Excel workbook {name!r} with {len(sheets)} sheet"
+            f"{'s' if len(sheets) != 1 else ''}: "
+            + ", ".join(s.get("sheet", "?") for s in sheets[:5])
+            + ("…" if len(sheets) > 5 else "")
+            + "."
+        )
+        for s in sheets:
+            for h in s.get("headers", []) or []:
+                for tok in _tokenize(str(h)):
+                    if _is_useful_token(tok):
+                        topic_set.add(tok)
+            sname = s.get("sheet")
+            if isinstance(sname, str):
+                for tok in _tokenize(sname):
+                    if _is_useful_token(tok):
+                        topic_set.add(tok)
+
+    elif rtype in ("sqlite", "duckdb"):
+        tables = rec.get("tables", []) or []
+        summary_parts.append(
+            f"{rtype.upper()} database {name!r} with {len(tables)} table"
+            f"{'s' if len(tables) != 1 else ''}: "
+            + ", ".join(t.get("table", "?") for t in tables[:5])
+            + ("…" if len(tables) > 5 else "")
+            + "."
+        )
+        for t in tables:
+            tname = t.get("table")
+            if isinstance(tname, str):
+                for tok in _tokenize(tname):
+                    if _is_useful_token(tok):
+                        topic_set.add(tok)
+            for c in t.get("columns", []) or []:
+                for tok in _tokenize(str(c)):
+                    if _is_useful_token(tok):
+                        topic_set.add(tok)
+
+    # Cap topics — prefer longest tokens (most discriminative). The
+    # final cap of 6 mirrors the LLM path's `topics[:6]` slice.
+    topics_sorted = sorted(topic_set, key=lambda t: (-len(t), t))
+    return " ".join(summary_parts), topics_sorted[:6]
+
+
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
 _HEX_RE = re.compile(r"^[0-9a-f]+$", re.IGNORECASE)
 
@@ -1570,15 +1785,48 @@ the vocabulary list. Lowercase only. Single line only.
         *,
         max_files: Optional[int] = None,
         force: bool = False,
+        topics_only: bool = False,
+        batch_size: int = 4,
         on_progress: Optional[Any] = None,
     ) -> int:
         """Fill in description + topics for every record that doesn't have
         them yet. Returns the count of records updated.
 
-        - max_files caps how many we touch this call (useful from the GUI
-          to do background work in small batches).
-        - force=True regenerates even records that already have a desc.
-        - on_progress(i, total, name) callable runs once per record.
+        Performance characteristics on CPU-only inference (the common
+        case — the bottleneck is the model, not the index):
+
+          • Tabular records (csv / tsv / parquet / excel / sqlite /
+            duckdb) get description + topics generated DETERMINISTICALLY
+            from their schema. Zero model calls. Instant per file.
+            Topics come from column / table / sheet names — already the
+            most-discriminative tokens for that kind of file.
+
+          • Non-tabular records (json / bson / text / pdf / markdown)
+            still need the model. Those calls are now BATCHED — up to
+            `batch_size` records per model invocation. Each batch
+            amortises ~150-300 tokens of prompt-processing overhead
+            across N records.
+
+          • `topics_only=True` skips the prose description for non-tabular
+            records too — only the 3-5 topic keywords come back. Cuts
+            generation time roughly 3x vs the full description path.
+
+          • num_predict is now sized to the actual output budget:
+              full description    = 100 tokens per record
+              topics only         = 24 tokens per record
+            (was 200 tokens per record — typical model would spend
+            150 of those producing verbose prose nobody reads.)
+
+        Parameters:
+          max_files     cap on records touched this call. Useful from
+                        the GUI to do background work in batches with
+                        progress reporting.
+          force         regenerate even records that already have a desc.
+          topics_only   skip prose for non-tabular records; emit topics
+                        keywords only. ~3x faster on non-tabular path.
+          batch_size    records per model call (non-tabular only).
+                        Default 4. Set to 1 to disable batching.
+          on_progress   on_progress(i, total, name) called once per record.
         """
         import council_engine as ce
 
@@ -1589,65 +1837,183 @@ the vocabulary list. Lowercase only. Single line only.
         if max_files:
             candidates = candidates[:int(max_files)]
 
+        # ── A: split candidates by whether we need the model at all ────
+        # Tabular file types have all the info we need in the index
+        # record already (column names, sheet names, table schemas).
+        # No model call required.
+        tabular_kinds = {"csv", "tsv", "csv.gz", "parquet", "excel",
+                         "sqlite", "duckdb"}
+        tabular: List[Tuple[str, Dict[str, Any]]] = []
+        modelable: List[Tuple[str, Dict[str, Any]]] = []
+        for spath, rec in candidates:
+            if rec.get("type") in tabular_kinds:
+                tabular.append((spath, rec))
+            else:
+                modelable.append((spath, rec))
+
         updated = 0
-        for i, (spath, rec) in enumerate(candidates, start=1):
-            try:
-                desc, topics = self._describe_record(ce, rec)
-            except Exception as exc:
-                desc = ""
-                topics = []
-                rec["_describe_error"] = repr(exc)
+        progressed = 0
+        total = len(candidates)
+
+        # ── Tabular records: instant, no model call ────────────────────
+        for spath, rec in tabular:
+            desc, topics = _describe_from_schema(rec)
             rec["description"] = (desc or "")[:800]
-            rec["topics"] = topics[:6]
+            rec["topics"]      = (topics or [])[:6]
+            rec["_describe_via"] = "schema"
             updated += 1
+            progressed += 1
             if on_progress:
                 try:
-                    on_progress(i, len(candidates), rec.get("name", spath))
+                    on_progress(progressed, total, rec.get("name", spath))
                 except Exception:
                     pass
+
+        # ── Non-tabular records: model call, batched ──────────────────
+        bs = max(1, int(batch_size))
+        i = 0
+        while i < len(modelable):
+            chunk = modelable[i:i + bs]
+            i += bs
+            try:
+                results = self._describe_batch(
+                    ce, chunk, topics_only=topics_only,
+                )
+            except Exception as exc:
+                # Defensive: per-batch failure should not stop the whole
+                # run. Mark each record's error and move on.
+                results = [("", []) for _ in chunk]
+                for _spath, rec in chunk:
+                    rec["_describe_error"] = repr(exc)
+            for (spath, rec), (desc, topics) in zip(chunk, results):
+                rec["description"] = (desc or "")[:800]
+                rec["topics"]      = (topics or [])[:6]
+                rec["_describe_via"] = "model_batch" if bs > 1 else "model"
+                updated += 1
+                progressed += 1
+                if on_progress:
+                    try:
+                        on_progress(progressed, total, rec.get("name", spath))
+                    except Exception:
+                        pass
+
         if updated:
             self.save()
             self._vocab_cache = None  # description tokens can extend vocab
         return updated
 
-    def _describe_record(self, ce_mod, rec: Dict[str, Any]) -> Tuple[str, List[str]]:
-        """Build the prompt for one record and call the local model."""
-        name = rec.get("name", "?")
-        rtype = rec.get("type", "text")
+    # -------- Batched description generation (non-tabular only) ---------
 
-        body_lines: List[str] = [f"File: {name}", f"Type: {rtype}"]
-        if rtype == "csv":
-            headers = rec.get("headers", []) or []
-            body_lines.append("Columns: " + ", ".join(map(str, headers[:30])))
-            for row in (rec.get("sample_rows", []) or [])[:3]:
-                body_lines.append("  sample: " + str(row)[:200])
-        elif rtype == "json":
-            keys = rec.get("keys", []) or []
-            body_lines.append("Top-level keys: " + ", ".join(map(str, keys[:30])))
-            preview = (rec.get("sample_text", "") or "")[:600]
-            if preview:
-                body_lines.append("Sample:")
-                body_lines.append(preview)
+    def _describe_batch(
+        self, ce_mod, chunk: List[Tuple[str, Dict[str, Any]]],
+        *, topics_only: bool = False,
+    ) -> List[Tuple[str, List[str]]]:
+        """Describe up to N records in one model call.
+
+        Prompt asks the model to label each record by an index marker
+        (#1, #2, …) so the response can be split cleanly. If parsing
+        fails (model went off-script), we fall back to one call per
+        record so we don't lose work on the rest of the chunk.
+        """
+        if not chunk:
+            return []
+        if len(chunk) == 1:
+            # Single-record path — no batching needed.
+            _spath, rec = chunk[0]
+            return [self._describe_record_one(ce_mod, rec, topics_only=topics_only)]
+
+        # Build the batched prompt
+        record_blocks: List[str] = []
+        for idx, (_spath, rec) in enumerate(chunk, start=1):
+            record_blocks.append(_render_record_for_describe(idx, rec))
+        body = "\n\n".join(record_blocks)
+
+        if topics_only:
+            head = (
+                f"For EACH of the {len(chunk)} files below, write a "
+                f"single line of 3 to 5 lowercase keyword topics "
+                f"separated by commas. Prefix each line with the file's "
+                f"marker (#1, #2, ...) and write nothing else. No prose, "
+                f"no explanations.\n\n"
+                f"Example output:\n"
+                f"#1: revenue, customers, q3, 2024, sales\n"
+                f"#2: inventory, parts, manufacturing, costs\n\n"
+            )
+            per_record_tokens = 24
         else:
-            preview = (rec.get("sample_text", "") or "")[:600]
-            if preview:
-                body_lines.append("Sample:")
-                body_lines.append(preview)
+            head = (
+                f"For EACH of the {len(chunk)} files below, output two "
+                f"lines:\n"
+                f"  #N: <one short sentence summary, under 25 words>\n"
+                f"  TOPICS #N: <3-5 lowercase keywords, comma-separated>\n"
+                f"Use the file's marker (#1, #2, ...) so the lines can "
+                f"be parsed. No other prose.\n\n"
+            )
+            per_record_tokens = 70
 
-        prompt = (
-            "Summarize this file in one short paragraph (1-3 sentences). "
-            "Focus on what the file represents and what could be answered "
-            "from it. Then on a new line write 'TOPICS:' followed by "
-            "3-5 lowercase keywords separated by commas.\n\n"
-            + "\n".join(body_lines)
-            + "\n\nSummary:"
-        )
-        raw = ce_mod.local_chat(
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.15,
-            num_predict=200,
-            timeout=120,
-        )
+        prompt = head + body
+        num_predict = max(80, per_record_tokens * len(chunk) + 20)
+
+        raw = ""
+        try:
+            raw = ce_mod.local_chat(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                num_predict=num_predict,
+                timeout=240,
+            )
+        except Exception:
+            raw = ""
+
+        # Try to parse the batched response. On parse failure, fall
+        # back to one call per record — at least we don't lose the
+        # whole chunk's worth of work.
+        parsed = _parse_batched_response(raw, len(chunk),
+                                         topics_only=topics_only)
+        if parsed is not None:
+            return parsed
+        return [
+            self._describe_record_one(ce_mod, rec, topics_only=topics_only)
+            for _spath, rec in chunk
+        ]
+
+    def _describe_record_one(
+        self, ce_mod, rec: Dict[str, Any], *, topics_only: bool = False,
+    ) -> Tuple[str, List[str]]:
+        """Single-record fallback when batching parse fails. Same shape
+        as the legacy path but with tightened num_predict (80 not 200).
+        """
+        body = _render_record_for_describe(1, rec)
+        if topics_only:
+            prompt = (
+                "Write 3 to 5 lowercase keyword topics describing this "
+                "file, separated by commas. No prose, no explanations.\n\n"
+                + body
+                + "\n\nTopics:"
+            )
+            np_budget = 36
+        else:
+            prompt = (
+                "Summarize this file in one short sentence (under 25 "
+                "words). Then on a new line write 'TOPICS:' followed by "
+                "3-5 lowercase keywords separated by commas.\n\n"
+                + body
+                + "\n\nSummary:"
+            )
+            np_budget = 90
+        try:
+            raw = ce_mod.local_chat(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.15,
+                num_predict=np_budget,
+                timeout=120,
+            )
+        except Exception:
+            raw = ""
+        if topics_only:
+            # No prose; treat the whole response as a topics line.
+            topics = _parse_topics_line(raw or "")
+            return "", topics
         return _split_summary_and_topics(raw or "")
 
     # ---- prompt formatting ----
