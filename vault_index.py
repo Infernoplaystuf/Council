@@ -257,17 +257,22 @@ def _parse_csv(p: Path) -> Dict[str, Any]:
 #                            Yields the richest extraction (keys + string
 #                            values at depth ≤ 5).
 #
-#   Tier 2  (5 - 200 MB)     Read whole text BUT skip json.loads. Use regex
-#                            to extract keys and string values directly from
-#                            the raw text. Same downstream keyword tokens as
-#                            tier 1 but ~30x faster — no Python object tree
-#                            built.
+#   Tier 2  (5 MB - 1 GB)    Read whole text BUT skip json.loads. Use regex
+#                            to extract keys and ALL quoted strings (object
+#                            values + array elements) directly from raw
+#                            text. Same downstream keyword tokens as tier 1
+#                            but ~30x faster — no Python object tree built.
+#                            ~100% coverage of the file's string surface
+#                            (capped at 5,000 unique strings per file).
 #
-#   Tier 3  (> 200 MB)       Stream-sample head + tail (1 MB each) by seek;
+#   Tier 3  (> 1 GB)         Stream-sample head + tail (5 MB each) by seek;
 #                            never load the full file. Regex-extract from
-#                            the sample. The keyword surface is smaller but
+#                            the sample. The keyword surface is partial
+#                            (~2% of a 500 MB file, less for bigger) but
 #                            indexing completes in seconds rather than an
-#                            hour. Adequate for hit/miss vault retrieval.
+#                            hour. Adequate for hit/miss vault retrieval;
+#                            for full-content search use the filesystem
+#                            grep chat intent or the analyst.
 #
 # Walk caps in tier 1 protect against pathological wide-and-deep trees:
 #   • per-dict iter cap = 5000 keys (very wide objects are sampled)
@@ -275,9 +280,21 @@ def _parse_csv(p: Path) -> Dict[str, Any]:
 #   • global node visit budget = 50,000 (recursion bails when hit)
 # ---------------------------------------------------------------------------
 
-_JSON_FULL_PARSE_MAX_BYTES = 5  * 1024 * 1024     # 5 MB
-_JSON_REGEX_FULL_MAX_BYTES = 200 * 1024 * 1024    # 200 MB
-# Tier-3 (>200 MB) sample windows. 5 MB head + 5 MB tail = 10 MB total
+_JSON_FULL_PARSE_MAX_BYTES = 5    * 1024 * 1024     # 5 MB
+_JSON_REGEX_FULL_MAX_BYTES = 1024 * 1024 * 1024     # 1 GB
+# Why 1 GB for the tier-2 ceiling:
+#   • A regex pass over 1 GB of raw text takes ~30-60 s on a modern
+#     CPU (release-build cpython re module, single-threaded). That's
+#     a one-time cost per file (the mtime gate skips it on rebuild).
+#   • Peak RAM during indexing a 1 GB JSON: ~2-3 GB (the text string
+#     plus the regex's internal state). Fine on a 16 GB+ machine.
+#   • Coverage on files up to 1 GB jumps from tier 3's ~2% (10 MB
+#     sample) to ~100% (every quoted string in the file gets
+#     indexed up to the per-file 5,000-unique caps).
+#   • Files larger than 1 GB still fall to tier 3 sampling. If your
+#     vault has many >1 GB JSONs, bump this further — there's no
+#     hard ceiling, just memory and patience.
+# Tier-3 (>1 GB) sample windows. 5 MB head + 5 MB tail = 10 MB total
 # scanned per huge file, up from the original 2 MB. Concretely:
 #   • For a 500 MB array of builds, the head sample now captures the
 #     first ~5,000-20,000 build entries (depending on size) and the
