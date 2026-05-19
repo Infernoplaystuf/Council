@@ -289,8 +289,22 @@ _JSON_WALK_NODE_LIMIT = 50_000
 # bounded by what the keyword index actually consumes (1-80 chars; no
 # embedded escapes — we deliberately skip strings with escaped quotes to
 # keep the pattern simple and the matches clean).
+#
+# Three patterns, intentional split:
+#   _JSON_KEY_RE          — strings followed by ':', i.e. object keys.
+#                           Used to populate the `keys` field, which
+#                           summary_block surfaces as "keys: ..." for
+#                           the model.
+#   _JSON_ANY_STRING_RE   — every quoted string in the file, regardless
+#                           of context. Catches keys, object values, AND
+#                           array-element strings ["a","b","c"]. Critical
+#                           for build/loadout JSONs where powers and
+#                           materials are typically array elements, not
+#                           object values — without it, the tier-2/3
+#                           index could miss every power name in a file.
+#                           Goes into the `string_values` set.
 _JSON_KEY_RE        = re.compile(r'"([^"\\\n]{1,80})"\s*:')
-_JSON_STRING_VAL_RE = re.compile(r':\s*"([^"\\\n]{1,80})"')
+_JSON_ANY_STRING_RE = re.compile(r'"([^"\\\n]{1,80})"')
 
 
 def _parse_json(p: Path) -> Dict[str, Any]:
@@ -386,7 +400,7 @@ def _parse_json_regex_full(p: Path, size: int) -> Dict[str, Any]:
             keys.add(m.group(1))
             if len(keys) >= 5000:
                 break
-        for m in _JSON_STRING_VAL_RE.finditer(text):
+        for m in _JSON_ANY_STRING_RE.finditer(text):
             v = m.group(1)
             if 1 <= len(v) < 80:
                 string_values.add(v)
@@ -441,7 +455,7 @@ def _parse_json_sampled(p: Path, size: int) -> Dict[str, Any]:
                 keys.add(m.group(1))
                 if len(keys) >= 5000:
                     break
-            for m in _JSON_STRING_VAL_RE.finditer(chunk):
+            for m in _JSON_ANY_STRING_RE.finditer(chunk):
                 v = m.group(1)
                 if 1 <= len(v) < 80:
                     string_values.add(v)
