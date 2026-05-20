@@ -4564,7 +4564,12 @@ class CouncilConsole(tk.Tk):
         r"what'?s\s+in\s+(?:my|the)\s+vault)\s*\??\s*$", _re.IGNORECASE,
     )
     _DUPES_RE = _re.compile(
-        r"^\s*(?:find|show|list)?\s*(?:duplicate(?:s)?|duplicates?)\b",
+        # Match the vault-duplicate-finder intent. End-anchored so that
+        # "duplicate this" or "make a duplicate of X" do NOT trigger the
+        # duplicates report — those are unrelated requests that happen
+        # to start with the word. Accept "duplicate" + (s) optional,
+        # optionally followed by "file" / "files".
+        r"^\s*(?:find|show|list)?\s*duplicate(?:s|\s+files?)?\s*[.!?]?\s*$",
         _re.IGNORECASE,
     )
     _HISTORY_SEARCH_RE = _re.compile(
@@ -4737,8 +4742,12 @@ class CouncilConsole(tk.Tk):
         #   most common element(s) in data_in
         #   top atomic elements in vault
         #   rank atomic elements
+        #   list top 5 elements
+        # Trailing \s+ is inside each verb branch (rather than after the
+        # alternation) so "list top 5 elements" doesn't need a double
+        # space between "top" and "5".
         r"^\s*(?:what\s+(?:is|are)\s+(?:the\s+)?)?"
-        r"(?:most\s+common|top|rank|list\s+(?:top\s+)?)\s+"
+        r"(?:most\s+common\s+|top\s+|rank\s+|list\s+(?:top\s+)?)"
         r"(?:(\d+)\s+)?"                              # optional count
         r"(?:atomic\s+|chemical\s+)?elements?"
         r"(?:\s+(?:in|of|under|inside|within)\s+(.+?))?\s*\??\s*$",

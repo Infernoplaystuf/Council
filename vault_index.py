@@ -40,6 +40,52 @@ INDEX_FILENAME = "vault_index.json"
 DENYLIST_FILENAME = "fuzzy_denylist.json"
 SEMANTIC_CACHE_FILENAME = "semantic_cache.json"
 
+# Common English stop-tokens. Used in two places at search time:
+#   1. To gate semantic_expand calls — without this, "find / the / all /
+#      average / across / excluding / ..." each trigger a separate model
+#      call for category-expansion, adding 15-20+ seconds of CPU
+#      inference overhead per query for zero benefit (stop words have
+#      no semantic category).
+#   2. To filter the final expanded term set before scoring, so
+#      stop-word matches don't inflate result scores.
+_SEARCH_STOP_TOKENS = frozenset({
+    "the", "a", "an", "of", "in", "on", "for", "to", "is", "are",
+    "with", "and", "or", "any", "all", "every", "this", "that",
+    "what", "which", "find", "show", "list", "look", "through",
+    "files", "file", "folder", "folders", "data",
+    # Lowercase file extensions / format names — plural and singular.
+    # Users commonly say "all the csvs" / "all the jsons" — without
+    # the plural entry, each plural triggers a semantic-expansion
+    # model call.
+    "csv", "csvs", "tsv", "tsvs", "json", "jsons", "xlsx", "xls",
+    "parquet", "parquets", "txt", "md", "yaml", "yml",
+    # Common verbs and adverbs that surfaced in real chat queries —
+    # adding these stops them from triggering semantic-expansion calls
+    # against the LLM (each call is 2-5s on CPU).
+    "average", "averages", "mean", "median", "sum", "count", "total",
+    "across", "from", "into", "between", "among", "by", "per",
+    "exclude", "excluding", "excluded", "include", "including",
+    "only", "just", "also",
+    "give", "tell", "make", "compute", "calculate", "computing",
+    "have", "has", "had", "being", "been",
+    "more", "less", "most", "least", "some", "many", "much",
+    "than", "as", "if", "when", "where", "why", "how",
+    # Comparison prepositions / relations — common in filter queries
+    "over", "under", "above", "below", "around", "near",
+    "before", "after", "during", "since", "until",
+    # Containment / membership verbs
+    "contain", "contains", "containing", "contained",
+    "use", "uses", "using", "used",
+    "reference", "references", "referencing",
+    "mention", "mentions", "mentioning",
+    "match", "matches", "matching",
+    # Generic noun forms — appear with search verbs but carry no
+    # semantic category of their own
+    "row", "rows", "entry", "entries", "record", "records",
+    "item", "items", "thing", "things", "result", "results",
+    "column", "columns", "field", "fields", "value", "values",
+})
+
 # Bookkeeping files we write to the vault root. The rebuild walk MUST
 # skip these — indexing them would feed our own JSON keys back into the
 # vocabulary, causing self-reference bugs (e.g. "metals" appearing in
@@ -1711,6 +1757,15 @@ the vocabulary list. Lowercase only. Single line only.
                     continue                # fuzzy already handled it
                 if len(t) < 3:
                     continue
+                # Don't burn CPU asking the model to find semantic
+                # categories for common English stop words ("find",
+                # "the", "all", "average", "across", "excluding", …).
+                # Without this gate each query fires 5-10+ extra model
+                # calls — 15-30s of CPU overhead on a typical machine
+                # for zero ranking benefit (the expanded tokens get
+                # filtered out by _SEARCH_STOP_TOKENS later anyway).
+                if t in _SEARCH_STOP_TOKENS:
+                    continue
                 try:
                     expansions = self.semantic_expand(t, llm_call=llm_call)
                 except Exception:
@@ -1728,11 +1783,13 @@ the vocabulary list. Lowercase only. Single line only.
                         expanded |= _expand(w)
 
         # Strip trivial stop-tokens that explode match counts
-        _stop = {"the", "a", "an", "of", "in", "on", "for", "to", "is", "are",
-                 "with", "and", "or", "any", "all", "every", "this", "that",
-                 "what", "which", "find", "show", "list", "look", "through",
-                 "files", "file", "folder", "data", "csv", "json"}
-        expanded = {t for t in expanded if t and t not in _stop and len(t) > 1}
+        # Module-level _SEARCH_STOP_TOKENS — same set used to gate the
+        # semantic_expand call earlier in this method, so we don't
+        # spend CPU on stop-word expansions whose tokens we'd just
+        # filter out here anyway.
+        expanded = {t for t in expanded if t
+                    and t not in _SEARCH_STOP_TOKENS
+                    and len(t) > 1}
         if not expanded:
             return [], fuzzy_matches
 
