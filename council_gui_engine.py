@@ -1134,9 +1134,16 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
     remaining = max(256, safe_input - user_cost - writer_overhead)
 
     # Priority bands — lower = higher priority
+    # VAULT_SUMMARY lists EVERY matching file by name (with brief
+    # metadata: type, row count, topics) so the model knows the full
+    # set even when individual VAULT MATCH content blocks get dropped
+    # to fit the budget. Slotted ABOVE individual matches so the
+    # filename list always reaches the model. Not droppable; tiny in
+    # tokens (~15/file × ~50 files = ~750 tokens worst case).
     (PRIO_NODATA, PRIO_TASK_MEMO, PRIO_ANALYST,
-     PRIO_EXPLICIT, PRIO_FOLDER, PRIO_VAULT) = 0, 1, 2, 3, 4, 5
-    DROPPABLE_FROM = PRIO_VAULT   # only vault matches are droppable
+     PRIO_EXPLICIT, PRIO_FOLDER,
+     PRIO_VAULT_SUMMARY, PRIO_VAULT) = 0, 1, 2, 3, 4, 5, 6
+    DROPPABLE_FROM = PRIO_VAULT   # only individual vault matches are droppable
 
     explicit_paths = _extract_file_paths(user_text)
     print('[DEBUG inject] explicit paths: ' + str(explicit_paths), file=_sys_dbg.stderr)
@@ -1206,22 +1213,58 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                         num_predict=180,
                         timeout=45,
                     )
-                hits, fuzzy_matches = idx.search(
-                    user_text, k=k, folder=folder_scope,
+                # We pull k + TAIL_K total hits. The top-k get FULL
+                # [VAULT MATCH] content blocks; the rest go into a
+                # single compact [VAULT SEARCH SUMMARY] block that
+                # lists every matching file by name + brief metadata.
+                # This is the fix for the "model only sees 5 files
+                # even though 47 match" failure mode: the summary is
+                # ~15 tokens per file, so 50 files cost ~750 tokens
+                # vs ~2000 tokens for 5 full blocks. The model now
+                # KNOWS the full set of matching files even when only
+                # a few get full content.
+                TAIL_K = 45
+                all_hits, fuzzy_matches = idx.search(
+                    user_text, k=k + TAIL_K, folder=folder_scope,
                     llm_call=_semantic_llm_call,
                 )
-                print('[DEBUG inject] vault hits: '
-                      + str([(round(s, 2), h.get("name")) for s, h in hits]),
+                # Drop any hit that's already explicit (won't happen
+                # in practice — we skip vault search entirely when
+                # explicit_paths is non-empty — but safe to keep the
+                # filter for future call sites).
+                all_hits = [(s, r) for s, r in all_hits
+                            if r.get("path") not in explicit_paths]
+                full_hits = all_hits[:k]
+                tail_hits = all_hits[k:]
+
+                print('[DEBUG inject] vault hits: total='
+                      + str(len(all_hits))
+                      + ' full=' + str(len(full_hits))
+                      + ' tail=' + str(len(tail_hits)),
                       file=_sys_dbg.stderr)
                 if fuzzy_matches:
                     print('[DEBUG inject] fuzzy: ' + repr(fuzzy_matches),
                           file=_sys_dbg.stderr)
-                for _score, rec in hits:
-                    if rec.get("path") in explicit_paths:
-                        continue
+
+                # Full-content matches first — same as before.
+                for _score, rec in full_hits:
                     vblock = idx.summary_block(rec)
                     name = rec.get("name") or "?"
                     candidates.append((PRIO_VAULT, f"[VAULT MATCH: {name}]", vblock))
+
+                # Summary block — only when there's a tail to surface.
+                # If the search returned ≤k hits the model already sees
+                # everything; adding a redundant summary would just be
+                # noise.
+                if tail_hits:
+                    summary_block = _build_vault_search_summary(
+                        all_hits, full_count=len(full_hits),
+                    )
+                    candidates.append((
+                        PRIO_VAULT_SUMMARY,
+                        "[VAULT SEARCH SUMMARY]",
+                        summary_block,
+                    ))
             except Exception as _e:
                 print('[DEBUG inject] vault search failed: ' + repr(_e),
                       file=_sys_dbg.stderr)
@@ -1262,7 +1305,8 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
     # original question" guarantee. The analyst block is already capped at
     # ~4KB by format_result_for_prompt; trimming further could elide the
     # answer the user asked for.
-    UNCAPPED_PRIOS = {PRIO_NODATA, PRIO_TASK_MEMO, PRIO_ANALYST}
+    UNCAPPED_PRIOS = {PRIO_NODATA, PRIO_TASK_MEMO, PRIO_ANALYST,
+                      PRIO_VAULT_SUMMARY}
     for (prio, label, content) in candidates:
         if prio in UNCAPPED_PRIOS:
             capped = content
@@ -1307,6 +1351,79 @@ _FOLDER_KEYWORD_RE = _re.compile(
     r"\bfolder[: ]+['\"]?([A-Za-z0-9_\-./\\]+)['\"]?",
     _re.IGNORECASE,
 )
+
+
+def _build_vault_search_summary(all_hits, full_count: int) -> str:
+    """Format a compact [VAULT SEARCH SUMMARY] block listing every
+    matching file by name + brief metadata. ``full_count`` is how many
+    of the hits also got an individual [VAULT MATCH] block above this
+    one — so the summary can say "showing full content for the top N".
+
+    Per-row format (keeps total cost ~15 tokens per file):
+        N.  <name>   [type, R rows]   topics: t1, t2, t3
+    or for non-tabular:
+        N.  <name>   [type, K keys]   topics: ...
+
+    The block always carries the TOTAL count and a hint that the
+    user can ask about a specific file to get its full content.
+    """
+    total = len(all_hits)
+    lines: list = ["[VAULT SEARCH SUMMARY]"]
+    lines.append(f"Total files matching the query: {total}")
+    if full_count > 0:
+        lines.append(
+            f"Full content for the top {full_count} match"
+            f"{'es' if full_count != 1 else ''} is shown in the "
+            f"[VAULT MATCH] blocks below. The remaining "
+            f"{total - full_count} match"
+            f"{'es are' if total - full_count != 1 else ' is'} "
+            f"listed by filename only — ask about a specific file "
+            f"by name to see its content."
+        )
+    else:
+        lines.append("Each entry is listed by filename only — ask "
+                     "about a specific file by name to see its content.")
+    lines.append("")
+    lines.append("Files matched (relevance-ordered):")
+
+    for i, (_score, rec) in enumerate(all_hits, start=1):
+        name = rec.get("name") or "?"
+        rtype = rec.get("type") or "?"
+        # Compact metadata that varies by type.
+        meta_bits: list = [rtype]
+        if rtype in ("csv", "tsv", "csv.gz", "parquet"):
+            rows = rec.get("rows")
+            if isinstance(rows, int):
+                meta_bits.append(f"{rows:,} rows")
+            n_cols = len(rec.get("headers") or [])
+            if n_cols:
+                meta_bits.append(f"{n_cols} cols")
+        elif rtype == "excel":
+            sheets = rec.get("sheets") or []
+            meta_bits.append(f"{len(sheets)} sheets")
+        elif rtype in ("sqlite", "duckdb"):
+            tables = rec.get("tables") or []
+            meta_bits.append(f"{len(tables)} tables")
+        elif rtype in ("json", "d3dpipeline", "bson"):
+            keys = rec.get("keys") or []
+            if keys:
+                meta_bits.append(f"{len(keys)} keys")
+            if rec.get("indexing_tier") == "sampled_head_tail":
+                meta_bits.append("sampled")
+
+        topics = rec.get("topics") or []
+        topic_str = ""
+        if topics:
+            preview = ", ".join(str(t) for t in topics[:5])
+            if len(topics) > 5:
+                preview += f", +{len(topics) - 5}"
+            topic_str = f"  topics: {preview}"
+
+        meta = ", ".join(meta_bits)
+        lines.append(f"  {i:>3}. {name}   [{meta}]{topic_str}")
+
+    lines.append("[END VAULT SEARCH SUMMARY]")
+    return "\n".join(lines)
 
 
 def _detect_folder_scope(text):
