@@ -1620,7 +1620,77 @@ def _run_analyst_step_impl(query):
         print('[analyst] exec failed: ' + log[:400], file=_sys_dbg.stderr)
         return _build_analyst_failure_block(code, log), first_err, notices
 
-    table_text = _va.format_result_for_prompt(result_df, max_rows=30, max_chars=4000)
+    # Old caps (30 rows / 4000 chars) silently truncated wide analyses —
+    # asking "average column X across all CSVs in folder Y" on a 100-file
+    # vault returned a DataFrame with 100 rows but the model only saw 30.
+    # Bump the in-prompt cap to 250 rows / 12,000 chars so the model can
+    # see most or all of a per-file aggregation result. The analyst
+    # block is exempt from the per-block cap (UNCAPPED_PRIOS) and below
+    # DROPPABLE_FROM, so even at this size it never competes with vault
+    # matches for budget.
+    table_text = _va.format_result_for_prompt(
+        result_df, max_rows=250, max_chars=12000,
+    )
+
+    # Build a separate USER-FACING render of the full result (or as
+    # much as fits in a transcript box) AND save the complete DataFrame
+    # to vault/analyst_results/ so nothing is ever silently lost. The
+    # caller posts the transcript render to the chat AND mentions the
+    # saved-file path so the user can re-open the result later.
+    user_table_lines: list = []
+    full_table_path = None
+    try:
+        nrows = len(result_df)
+        ncols = len(result_df.columns)
+        user_table_lines.append(
+            f"Analyst result: {nrows:,} row{'s' if nrows != 1 else ''} "
+            f"× {ncols} column{'s' if ncols != 1 else ''}"
+        )
+        # Render up to 500 rows directly into the transcript. Beyond
+        # that, save a CSV and tell the user where it is — Tk text
+        # widgets get sluggish above a few thousand rows of text.
+        TRANSCRIPT_DISPLAY_ROWS = 500
+        if nrows <= TRANSCRIPT_DISPLAY_ROWS:
+            user_table_lines.append(
+                result_df.to_string(index=False, max_colwidth=80)
+            )
+        else:
+            user_table_lines.append(
+                result_df.head(TRANSCRIPT_DISPLAY_ROWS)
+                          .to_string(index=False, max_colwidth=80)
+            )
+            user_table_lines.append(
+                f"\n... ({nrows - TRANSCRIPT_DISPLAY_ROWS:,} more rows "
+                f"omitted from this transcript view; full table saved "
+                f"to file — see path below.)"
+            )
+
+        # Save the complete DataFrame as CSV under
+        # vault/analyst_results/<timestamp>_<rows>x<cols>.csv. Users
+        # can open it from disk to verify or share the full data.
+        try:
+            from datetime import datetime as _dt
+            stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
+            results_dir = VAULT_DIR / "analyst_results"
+            results_dir.mkdir(parents=True, exist_ok=True)
+            full_table_path = results_dir / f"{stamp}_{nrows}x{ncols}.csv"
+            result_df.to_csv(full_table_path, index=False)
+            user_table_lines.append(
+                f"\nFull table saved to: {full_table_path}"
+            )
+        except Exception as _save_exc:
+            print(f"[analyst] could not save full table: {_save_exc!r}",
+                  file=_sys_dbg.stderr)
+            full_table_path = None
+    except Exception as _render_exc:
+        print(f"[analyst] could not build user-facing table: "
+              f"{_render_exc!r}", file=_sys_dbg.stderr)
+        user_table_lines = []
+    user_table = "\n".join(user_table_lines) if user_table_lines else ""
+
+    if user_table:
+        notices.append("__ANALYST_TABLE__:" + user_table)
+
     block = (
         '[ANALYST RESULT — computed from real CSV data]\n'
         + 'pandas code:\n' + code.strip() + '\n\n'
@@ -11472,8 +11542,23 @@ class CouncilConsole(tk.Tk):
         # Surface resolver notices FIRST so the user sees what the analyst
         # interpreted before the result / error message — that order makes
         # it obvious when the analyst grabbed the wrong file or scope.
+        # Notices include two kinds:
+        #   • Plain observation strings (resolver hints, scope notes, etc.)
+        #   • A special "__ANALYST_TABLE__:<...>" payload carrying the
+        #     user-facing rendering of the analyst's full DataFrame. We
+        #     surface that as an "observation" too but with a clear
+        #     "Analyst result table:" header so the user sees the
+        #     actual numbers, not just the model's prose summary.
         for _note in (_analyst_notices or []):
-            self._append_transcript("Council", _note, "observation")
+            if isinstance(_note, str) and _note.startswith("__ANALYST_TABLE__:"):
+                _table = _note[len("__ANALYST_TABLE__:"):]
+                self._append_transcript(
+                    "Council",
+                    "Analyst result table:\n" + _table,
+                    "observation",
+                )
+            else:
+                self._append_transcript("Council", _note, "observation")
         if _analyst_block and not _analyst_err:
             self._append_transcript("Council", "Computing from data...", "observation")
         elif _analyst_err:
