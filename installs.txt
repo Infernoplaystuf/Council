@@ -128,6 +128,134 @@ python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pa
 #    llama-cpp-python --extra-index-url ...` line.
 #
 #  ─────────────────────────────────────────────────────────────
+#  No CUDA drivers? Here's how to check, install, or skip
+#  ─────────────────────────────────────────────────────────────
+#  Sections B / C / D above all assume you have a working NVIDIA
+#  driver. If you don't (or aren't sure), this section walks you
+#  through the check, the install, and how to verify it's working.
+#
+#  KEY THING TO KNOW: you only need the NVIDIA DRIVER, not the
+#  "CUDA Toolkit" or "CUDA SDK". PyTorch's and llama-cpp's CUDA
+#  wheels bundle their own CUDA runtime libraries; the driver is
+#  the only NVIDIA piece you have to install.
+#
+#  ── STEP 1: Check what you have ───────────────────────────────
+#  Open a fresh terminal (cmd / PowerShell on Windows, bash on
+#  Linux/WSL) and run:
+#
+#      nvidia-smi
+#
+#  Three possible outcomes:
+#
+#  (a) Command not found / "is not recognized as an internal or
+#      external command"
+#      → You have no driver installed OR no NVIDIA GPU. Go to
+#        STEP 2.
+#
+#  (b) A table prints showing your GPU model and a "CUDA Version:
+#      XX.Y" entry in the top-right
+#      → Driver is installed. The "CUDA Version" line is the
+#        MAXIMUM CUDA toolkit version your driver supports. Use it
+#        to pick the section in STEP 3.
+#
+#  (c) Command exists but says "no devices found" / "couldn't
+#      communicate with the driver"
+#      → Driver is corrupted or doesn't match your GPU. Reinstall
+#        the driver per STEP 2.
+#
+#  ── STEP 2: Decide what to install ────────────────────────────
+#  If you have no NVIDIA GPU at all (Apple Silicon, AMD, Intel
+#  integrated only) → use SECTION A (CPU only) above and ignore
+#  the rest of this block. The app still works on CPU — just
+#  slower inference.
+#
+#  If you have an NVIDIA GPU but no driver, install the driver
+#  for your card from:
+#
+#      https://www.nvidia.com/Download/index.aspx
+#
+#  Pick "Game Ready Driver" (or "Studio Driver" — either works,
+#  Studio is just slower-cadence and more stable). Choose your
+#  exact GPU model + your OS + 64-bit. Download, run installer,
+#  reboot. Then re-run `nvidia-smi` to verify the table prints.
+#
+#  Linux users: prefer your distro's package manager when possible
+#  (e.g. `sudo apt install nvidia-driver-550` on Ubuntu 22.04+)
+#  rather than the .run installer — apt-managed drivers survive
+#  kernel updates cleanly.
+#
+#  ── STEP 3: Map your driver to a CUDA wheel section ───────────
+#  Once `nvidia-smi` prints, look at the "CUDA Version: XX.Y"
+#  number in the top-right of its output. This is the MAX CUDA
+#  your driver supports, NOT the version you "have" — you can
+#  always use a LOWER CUDA wheel than your driver supports.
+#
+#      Driver shows CUDA ≥ 12.1   → use SECTION B (cu121) for any
+#                                   RTX 20/30-series / GTX 16xx /
+#                                   MX450/550
+#      Driver shows CUDA ≥ 12.4   → use SECTION C (cu124) for any
+#                                   RTX 40-series / Ada workstation
+#      Driver shows CUDA ≥ 12.8   → use SECTION D (cu128 nightly)
+#                                   for RTX 50-series Blackwell
+#
+#  Driver version → "CUDA Version" line cheat sheet
+#  (the number is the MAX CUDA supported, not the installed one):
+#      Driver 525.xx → CUDA 12.1   → Section B
+#      Driver 545.xx → CUDA 12.4   → Section C works
+#      Driver 555.xx → CUDA 12.5   → Section C works
+#      Driver 565.xx → CUDA 12.6   → Section C works (D when stable
+#                                    cu128 wheels are available)
+#      Driver 570.xx → CUDA 12.8   → Section D
+#
+#  Driver too old? Update it from the NVIDIA Download page above.
+#  Updating the driver is a download + installer + reboot —
+#  doesn't touch anything in your conda env.
+#
+#  ── STEP 4: Verify after install ──────────────────────────────
+#  After running your chosen Section (B / C / D), the final
+#  `python -c "import torch ..."` line in that section prints:
+#
+#      CUDA: True
+#      all imports OK
+#
+#  If you see `CUDA: False`, something is off. Common causes:
+#
+#  - Driver not installed yet → see STEP 1 / 2.
+#  - Driver too old for the wheel you picked → see STEP 3 chart.
+#  - Wrong PyTorch wheel for your driver → uninstall + reinstall
+#    with the right --index-url for your CUDA version:
+#
+#        pip uninstall torch torchvision torchaudio -y
+#        pip install torch torchvision torchaudio --index-url \
+#            https://download.pytorch.org/whl/cu121   (or cu124, cu128)
+#
+#  ── STEP 5: Verify llama-cpp is using GPU at runtime ──────────
+#  When the app loads a GGUF model, look at the console for:
+#
+#      [GGUF] Loading <model>.gguf (n_ctx=..., n_threads=...,
+#                                    n_gpu_layers=99)
+#
+#  If `n_gpu_layers=0` on a machine where `torch.cuda.is_available()`
+#  is True, that means PyTorch found the GPU but llama-cpp didn't.
+#  Cause: llama-cpp-python was installed as the CPU build (the bare
+#  PyPI version). Fix by re-running ONLY the CUDA-specific
+#  llama-cpp install line from your section:
+#
+#      pip install llama-cpp-python --extra-index-url \
+#          https://abetlen.github.io/llama-cpp-python/whl/cu121 \
+#          --force-reinstall --no-cache-dir
+#
+#  (Use cu121 / cu124 — whichever matches your section.)
+#
+#  ── STEP 6: I just want it to work without a GPU ──────────────
+#  Skip everything above and use SECTION A. The app is fully
+#  functional on CPU — every feature works, just slower inference
+#  (~1-5 tokens/sec on a 7-8B model vs 30-60 tokens/sec on a
+#  modern GPU). On CPU, pick a smaller GGUF — the Llama-3.2-3B-
+#  Instruct Q4_K_M model recommended in the "After install" block
+#  below is a good first choice.
+#
+#  ─────────────────────────────────────────────────────────────
 #  Common conda+pip conflicts (and how to fix them)
 #  ─────────────────────────────────────────────────────────────
 #  Symptom: `import simplnx` fails with `_ARRAY_API not found` or
