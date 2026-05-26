@@ -14,7 +14,7 @@
 #      Stable distribution channel.
 #
 # Bundle contents (matches council.spec):
-#   • Python 3.12 + Tkinter + every dep from requirements.txt
+#   • Python 3.11 + Tkinter + every dep from requirements.txt
 #   • llama-cpp-python CPU wheel (installed explicitly — not in
 #     requirements.txt; see notes below)
 #   • Pre-resolved native DLLs for pandas / numpy / openpyxl / pyarrow
@@ -22,12 +22,23 @@
 #     weights download on first use; not bundled)
 #   • Assets / personality YAML / docs
 #
+# Why Python 3.11 (not 3.12) for the bundle:
+#   The dream3dnx / SIMPLNX conda package requires 3.12 — but
+#   dream3dnx isn't in the bundle (it's conda-only, has no PyPI
+#   wheel). Without that constraint we use 3.11 because every other
+#   dep has had more time to ship cp311 wheels, the resolver picks
+#   stable releases instead of dropping to fallbacks, and 3.11 has
+#   the broadest wheel coverage for the heavy native packages here
+#   (chromadb, sentence-transformers' torch chain, pyttsx3, etc.).
+#   Users who need Dream3D pipeline features should run from a conda
+#   3.12 env per installs.txt, not from this bundle.
+#
 # What is NOT bundled (intentional):
 #   • The GGUF model file (users provide their own)
 #   • The vault folder (created at %USERPROFILE%\.council\ at first run)
-#   • dream3dnx / simplnx (conda-only package; Dream3D pipeline features
-#     silently degrade on the bundled .exe — users who need them should
-#     run from a conda env per installs.txt)
+#   • dream3dnx / simplnx (conda-only package; Dream3D pipeline
+#     features silently degrade on the bundled .exe — users who need
+#     them should run from a conda env per installs.txt)
 # ============================================================
 
 name: Build Windows bundle
@@ -82,16 +93,17 @@ jobs:
           #     git push origin v1.0.0
           ref: ${{ github.event.inputs.branch || github.ref }}
 
-      - name: Set up Python 3.12
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          # 3.12 matches what requirements.txt and installs.txt now
-          # specify. Previously 3.11; bumped because dream3dnx moved
-          # to 3.12-only builds and the rest of the stack followed.
-          # The bundle itself doesn't ship dream3dnx (conda-only), but
-          # we keep the interpreter in sync so behaviour matches the
-          # supported install path.
-          python-version: '3.12'
+          # 3.11 (not 3.12) — the conda-installed dream3dnx requires
+          # 3.12, but it's NOT in the bundle (no PyPI wheel exists).
+          # Without that constraint, 3.11 is the better target for a
+          # PyInstaller bundle: every pip dep has had more time to
+          # ship stable cp311 wheels, so the resolver finds well-
+          # tested releases instead of newer "first cp312 build"
+          # versions that sometimes have packaging regressions.
+          python-version: '3.11'
           cache: pip
           cache-dependency-path: requirements.txt
 
