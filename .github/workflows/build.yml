@@ -14,8 +14,9 @@
 #      Stable distribution channel.
 #
 # Bundle contents (matches council.spec):
-#   • Python 3.11 + Tkinter + every dep from requirements.txt
-#   • llama-cpp-python (CPU wheel — see notes at bottom for GPU)
+#   • Python 3.12 + Tkinter + every dep from requirements.txt
+#   • llama-cpp-python CPU wheel (installed explicitly — not in
+#     requirements.txt; see notes below)
 #   • Pre-resolved native DLLs for pandas / numpy / openpyxl / pyarrow
 #   • Sentence-Transformers + huggingface_hub Python files (model
 #     weights download on first use; not bundled)
@@ -24,6 +25,9 @@
 # What is NOT bundled (intentional):
 #   • The GGUF model file (users provide their own)
 #   • The vault folder (created at %USERPROFILE%\.council\ at first run)
+#   • dream3dnx / simplnx (conda-only package; Dream3D pipeline features
+#     silently degrade on the bundled .exe — users who need them should
+#     run from a conda env per installs.txt)
 # ============================================================
 
 name: Build Windows bundle
@@ -78,10 +82,16 @@ jobs:
           #     git push origin v1.0.0
           ref: ${{ github.event.inputs.branch || github.ref }}
 
-      - name: Set up Python 3.11
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          # 3.12 matches what requirements.txt and installs.txt now
+          # specify. Previously 3.11; bumped because dream3dnx moved
+          # to 3.12-only builds and the rest of the stack followed.
+          # The bundle itself doesn't ship dream3dnx (conda-only), but
+          # we keep the interpreter in sync so behaviour matches the
+          # supported install path.
+          python-version: '3.12'
           cache: pip
           cache-dependency-path: requirements.txt
 
@@ -106,6 +116,21 @@ jobs:
 
       - name: Install runtime dependencies
         run: pip install -r requirements.txt
+
+      - name: Install llama-cpp-python (CPU wheel)
+        # Why this is a separate step (not in requirements.txt):
+        #   The bare `pip install llama-cpp-python` from PyPI installs
+        #   the CPU-only build. That's what we want for the bundle —
+        #   a portable .exe that runs on any machine without expecting
+        #   CUDA. But that same default would silently give GPU-machine
+        #   users CPU-only inference if they tried to use the local
+        #   requirements.txt for their own setup (the in-app
+        #   `n_gpu_layers` would stay at 0 even with COUNCIL_GGUF_GPU_
+        #   LAYERS=99 set). So requirements.txt now intentionally
+        #   omits llama-cpp-python and points users at installs.txt's
+        #   --extra-index-url CUDA wheels. The CI build (here) needs
+        #   the CPU build specifically, so we install it explicitly.
+        run: pip install llama-cpp-python
 
       - name: Install PyInstaller
         run: pip install pyinstaller
