@@ -99,6 +99,122 @@ pip install spyder-kernels && crawl4ai-setup
 python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'); print('all imports OK')"
 
 
+# ============================================================
+#  SECTION E — Linux with NVIDIA GPU  (Ubuntu / Debian / Fedora / WSL2)
+#  Sections B / C / D above describe the same Python + pip + conda
+#  install that works on Windows AND Linux — the conda env creation
+#  and the pip install lines are platform-agnostic. What CHANGES
+#  on Linux is how you install the NVIDIA driver. This section
+#  walks through the Linux-specific driver install and then sends
+#  you to whichever of B / C / D matches your GPU architecture.
+#
+#  Why Linux is easier than Windows for GPU work:
+#  - No hybrid-graphics MUX nonsense; the dGPU is just there.
+#  - No "TF GPU is stuck on Python 3.10" lock — TensorFlow's
+#    Linux GPU builds track current Python.
+#  - llama-cpp-python's CUDA wheels are smaller (no MSVC redist).
+#  - nvidia-smi works without extra setup.
+#  - WSL2 inherits the host Windows driver — you don't reinstall
+#    anything Linux-side; just enable it in WSL.
+#
+#  Supported distros (anything with apt or dnf and a recent kernel):
+#    Ubuntu 22.04 LTS, 24.04 LTS
+#    Debian 12 (Bookworm)
+#    Fedora 39 / 40
+#    Pop!_OS 22.04
+#    WSL2 with Ubuntu 22.04+ on Windows 10 build 19044+ / 11
+# ============================================================
+#
+#  ── STEP 1: Install the NVIDIA driver (native Linux ONLY) ──
+#  Skip this entire step on WSL2 — WSL inherits the Windows-side
+#  driver. You only install the driver INSIDE Linux when Linux is
+#  the OS booted directly on the hardware.
+#
+#  Ubuntu / Debian / Pop!_OS (recommended path — apt-managed
+#  drivers survive kernel updates cleanly):
+#      sudo apt update
+#      ubuntu-drivers devices                     # shows recommended driver
+#      sudo apt install nvidia-driver-550         # or whatever is recommended
+#      sudo reboot
+#      nvidia-smi                                  # should print the GPU table
+#
+#  Fedora:
+#      sudo dnf install akmod-nvidia xorg-x11-drv-nvidia-cuda
+#      sudo reboot
+#      nvidia-smi
+#
+#  Arch:
+#      sudo pacman -S nvidia nvidia-utils
+#      sudo reboot
+#      nvidia-smi
+#
+#  If nvidia-smi reports a CUDA version that's TOO OLD for the
+#  section you want (e.g. you want cu124 but the driver only
+#  supports CUDA 12.1), upgrade the driver per the cheat sheet in
+#  the "No CUDA drivers?" troubleshooting block below.
+#
+#  ── STEP 2: WSL2 ONLY — enable GPU passthrough ──
+#  On Windows host, make sure WSL2 is up to date:
+#      wsl --update
+#  Inside WSL (Ubuntu shell):
+#      nvidia-smi
+#  If the table prints, GPU passthrough works and you can skip
+#  any Linux driver install — the Windows host driver covers it.
+#  If "nvidia-smi: command not found", install JUST the CUDA
+#  user-space tools (NOT a Linux driver):
+#      sudo apt install nvidia-cuda-toolkit-gcc   # optional, helps tooling
+#
+#  ── STEP 3: Install conda (if not already) ──
+#  Miniforge is the lightest path (conda + conda-forge by default):
+#      wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
+#      bash Miniforge3-Linux-x86_64.sh
+#      source ~/.bashrc
+#  Or Miniconda is fine too (then `conda config --add channels conda-forge`).
+#
+#  ── STEP 4: Run the matching Windows section, verbatim ──
+#  Find your GPU model in the lists at the top of Section B / C / D
+#  above and run THAT section's `conda create` + `pip install` lines
+#  unchanged. The conda commands and pip URLs are identical between
+#  Windows and Linux. Most users want:
+#
+#      RTX 20/30-series, GTX 16, MX450/550:  Section B (cu121)
+#      RTX 40-series, RTX 6000 Ada:          Section C (cu124)
+#      RTX 50-series Blackwell:              Section D (cu128 nightly)
+#
+#  ── STEP 5: Verify (mirror of Sections B/C/D's last line) ──
+#      python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'); print('all imports OK')"
+#
+#  Should print:
+#      CUDA: True
+#      NVIDIA GeForce RTX <your-card>
+#      all imports OK
+#
+#  ── Linux-specific gotchas ──
+#  - "OSError: libcuda.so.1: cannot open shared object file"
+#      The NVIDIA driver isn't installed or the user-space libraries
+#      aren't on LD_LIBRARY_PATH. Re-run STEP 1, then reboot.
+#      On WSL2 it usually means the Windows host driver is too old
+#      or `wsl --update` hasn't been run since the GPU was added.
+#
+#  - "RuntimeError: CUDA driver version is insufficient for CUDA
+#      runtime version"
+#      Driver is older than the CUDA wheel needs. See the driver
+#      version → CUDA cheat sheet in the troubleshooting block below.
+#
+#  - sounddevice/portaudio fails to install
+#      Linux distros don't ship libportaudio by default. Run:
+#          sudo apt install libportaudio2 libportaudiocpp0 portaudio19-dev
+#          # OR (Fedora): sudo dnf install portaudio-devel
+#      then re-run the pip install line. WSL2 has no audio hardware
+#      passthrough — sounddevice imports fine but `sd.rec()` won't
+#      hear anything. The speech tab is effectively read-only in WSL.
+#
+#  - Conda env activation in scripts
+#      Bash scripts that `conda activate council` need `source
+#      ~/miniconda3/etc/profile.d/conda.sh` first (or set
+#      $CONDA_SHLVL beforehand). Not needed in interactive shells.
+
+
 # ─────────────────────────────────────────────────────────────
 #  After install — GGUF model + optional extras (any section)
 # ─────────────────────────────────────────────────────────────

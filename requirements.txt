@@ -1,7 +1,18 @@
 # Council — runtime dependencies
 # ============================================================
 # Install with:  pip install -r requirements.txt
-# Python 3.11 is required.
+#
+# IMPORTANT: this file is the BARE-MINIMUM pip-only install.
+# For a real working setup — especially if you have an NVIDIA GPU —
+# follow installs.txt instead. installs.txt sets up a conda env
+# with the right CUDA wheels for torch + llama-cpp-python, pins
+# numpy / pandas / h5py through conda-forge to avoid ABI breaks
+# with dream3dnx, and matches the install order pip alone can't
+# guarantee.
+#
+# Python 3.12 is required. (Earlier versions of this file said 3.11;
+# dream3dnx moved to 3.12-only builds and dragged the whole stack
+# forward.)
 # ============================================================
 
 # ---- Core (always required) ----
@@ -9,11 +20,24 @@ PyYAML>=6.0
 requests>=2.31
 
 # ---- Data ingestion / display ----
-numpy>=1.24
-pandas>=2.0
+#
+# numpy / pandas pinned BELOW 2.3 because dream3dnx (BlueQuartz
+# Software's SIMPLNX bindings, installed via conda) was built
+# against numpy < 2.x and pandas < 2.3 ABIs. Without these caps,
+# pip can pull numpy 2.3+ and silently break `import simplnx`
+# with "numpy.dtype size changed" / "_ARRAY_API not found".
+numpy>=1.24,<2.3
+pandas>=2.0,<2.3
 openpyxl>=3.1            # XLSX support
 xlrd>=2.0                # legacy XLS support
-pyarrow>=14.0            # fast parquet/feather (optional but recommended)
+pyarrow>=15.0            # fast parquet/feather (optional but recommended)
+
+# h5py is installed via conda-forge in installs.txt (NOT here).
+# Reason: dream3dnx ships its own HDF5 .dll/.so and pip's h5py
+# wheel ships a DIFFERENT HDF5 — running both ends with the
+# "HDF5 library version mismatched" crash on `import simplnx`.
+# Don't add h5py to this file even if you think you need it.
+# h5py>=3.10               # see comment above — conda-only
 
 # ---- Plotting (Grapher tab) ----
 matplotlib>=3.7
@@ -23,7 +47,15 @@ tkinterweb>=3.24         # Plotly HTML viewer inside Tk
 # ---- AI backend ----
 # GGUF-only — point COUNCIL_GGUF_PATH at a .gguf file from Hugging Face,
 # or pick one via the in-app Browse button. Ollama is not used.
-llama-cpp-python>=0.2.79
+#
+# llama-cpp-python is intentionally NOT listed here. The PyPI wheel
+# is CPU-only; on a GPU machine it silently runs inference on the
+# CPU even when torch.cuda.is_available() is True (the app's
+# startup log shows `n_gpu_layers=0`). installs.txt installs the
+# CUDA wheel via --extra-index-url for sections B / C / D. The
+# Section A (CPU-only) path in installs.txt is the one place
+# llama-cpp-python from PyPI is the right answer.
+# llama-cpp-python>=0.2.79
 
 # ---- RAG (vault search) — optional but installed by default ----
 chromadb>=0.4
@@ -35,12 +67,12 @@ huggingface_hub>=0.20    # for huggingface-cli download of GGUF models
 # ---- File parsing for vault analyst / RAG over docs ----
 pypdf>=4.0
 python-docx>=1.1
-h5py>=3.10               # for reading .dream3d HDF5 pipelines
-pyarrow>=15.0            # for .parquet support (optional)
 duckdb>=0.10             # file-based analytical SQL — .duckdb files
                          # + SELECT-over-CSV/parquet without loading
 pymongo>=4.6             # provides the `bson` module for .bson dumps
-SQLAlchemy>=2.0          # remote SQL bridge (Postgres / MySQL / MSSQL / ...)
+SQLAlchemy>=2.0,<3.0     # remote SQL bridge (Postgres / MySQL / MSSQL / ...)
+                         # pinned <3.0 because the SQL code paths use
+                         # 2.x-style `text()` + `connection.execute()`
 # Optional SQL drivers — install the one you need:
 # psycopg2-binary>=2.9   # PostgreSQL
 # PyMySQL>=1.1           # MySQL / MariaDB
@@ -52,6 +84,7 @@ SQLAlchemy>=2.0          # remote SQL bridge (Postgres / MySQL / MSSQL / ...)
 # ---- Web crawler for reference docs (vault scraper) ----
 beautifulsoup4>=4.12
 lxml>=4.9
+html2text>=2024.2        # used by dream3d_crawl.py to convert HTML
 
 # ---- Speech (optional) ----
 pyttsx3>=2.90
