@@ -18,10 +18,86 @@ import math
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+# ---------------------------------------------------------------------------
+# Optional fast-path JSON parser. `orjson` is a Rust-backed parser that runs
+# 3-5x faster than the stdlib json module on the small-file path. If it's not
+# installed we fall back to stdlib transparently — the index is unchanged,
+# just slower to build. Already in some installs.txt environments; never
+# required.
+# ---------------------------------------------------------------------------
+try:
+    import orjson as _orjson  # type: ignore[import]
+    def _fast_json_loads(text: str) -> Any:
+        # orjson takes bytes; encode UTF-8 once. Slightly more allocation
+        # but the parser is so fast that's still a net 3-5x win.
+        return _orjson.loads(text.encode("utf-8", errors="replace"))
+except Exception:
+    _fast_json_loads = json.loads
 
 INDEX_FILENAME = "vault_index.json"
 DENYLIST_FILENAME = "fuzzy_denylist.json"
+SEMANTIC_CACHE_FILENAME = "semantic_cache.json"
+
+# Common English stop-tokens. Used in two places at search time:
+#   1. To gate semantic_expand calls — without this, "find / the / all /
+#      average / across / excluding / ..." each trigger a separate model
+#      call for category-expansion, adding 15-20+ seconds of CPU
+#      inference overhead per query for zero benefit (stop words have
+#      no semantic category).
+#   2. To filter the final expanded term set before scoring, so
+#      stop-word matches don't inflate result scores.
+_SEARCH_STOP_TOKENS = frozenset({
+    "the", "a", "an", "of", "in", "on", "for", "to", "is", "are",
+    "with", "and", "or", "any", "all", "every", "this", "that",
+    "what", "which", "find", "show", "list", "look", "through",
+    "files", "file", "folder", "folders", "data",
+    # Lowercase file extensions / format names — plural and singular.
+    # Users commonly say "all the csvs" / "all the jsons" — without
+    # the plural entry, each plural triggers a semantic-expansion
+    # model call.
+    "csv", "csvs", "tsv", "tsvs", "json", "jsons", "xlsx", "xls",
+    "parquet", "parquets", "txt", "md", "yaml", "yml",
+    # Common verbs and adverbs that surfaced in real chat queries —
+    # adding these stops them from triggering semantic-expansion calls
+    # against the LLM (each call is 2-5s on CPU).
+    "average", "averages", "mean", "median", "sum", "count", "total",
+    "across", "from", "into", "between", "among", "by", "per",
+    "exclude", "excluding", "excluded", "include", "including",
+    "only", "just", "also",
+    "give", "tell", "make", "compute", "calculate", "computing",
+    "have", "has", "had", "being", "been",
+    "more", "less", "most", "least", "some", "many", "much",
+    "than", "as", "if", "when", "where", "why", "how",
+    # Comparison prepositions / relations — common in filter queries
+    "over", "under", "above", "below", "around", "near",
+    "before", "after", "during", "since", "until",
+    # Containment / membership verbs
+    "contain", "contains", "containing", "contained",
+    "use", "uses", "using", "used",
+    "reference", "references", "referencing",
+    "mention", "mentions", "mentioning",
+    "match", "matches", "matching",
+    # Generic noun forms — appear with search verbs but carry no
+    # semantic category of their own
+    "row", "rows", "entry", "entries", "record", "records",
+    "item", "items", "thing", "things", "result", "results",
+    "column", "columns", "field", "fields", "value", "values",
+})
+
+# Bookkeeping files we write to the vault root. The rebuild walk MUST
+# skip these — indexing them would feed our own JSON keys back into the
+# vocabulary, causing self-reference bugs (e.g. "metals" appearing in
+# the vocab just because it's a key in the semantic cache, defeating the
+# whole point of semantic expansion).
+_BOOKKEEPING_FILENAMES = {
+    INDEX_FILENAME,
+    DENYLIST_FILENAME,
+    SEMANTIC_CACHE_FILENAME,
+    "backend_settings.json",   # GGUF model path; not user data
+    ".onboarded",              # onboarding marker
+}
 
 # Fuzzy match defaults — Levenshtein-style ratio via difflib.
 FUZZY_CUTOFF = 0.82           # similarity threshold (0..1)
@@ -137,6 +213,221 @@ def _split_summary_and_topics(text: str) -> Tuple[str, List[str]]:
     return summary, topics
 
 
+def _parse_topics_line(text: str) -> List[str]:
+    """Parse a bare comma-separated topics line — used by topics-only
+    mode where the prompt explicitly asks for ONLY topic keywords."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    # Strip a leading "TOPICS:" if the model added one anyway
+    text = re.sub(r"^\s*topics?\s*[:\-]\s*", "", text, flags=re.IGNORECASE)
+    # Take only the first line — anything after is usually a stray
+    # explanation we asked the model not to write.
+    text = text.splitlines()[0] if text else ""
+    raw = re.split(r"[,;\n]+", text)
+    out: List[str] = []
+    for t in raw:
+        tok = t.strip().lower().strip(".'\"`-*#")
+        if 2 <= len(tok) <= 40:
+            out.append(tok)
+    return out[:6]
+
+
+def _render_record_for_describe(idx: int, rec: Dict[str, Any]) -> str:
+    """Render one record into a compact block the model can read.
+
+    Used by both single-record and batched describe paths. The marker
+    `#N` lets a batched response be split back into individual results.
+    """
+    name = rec.get("name", "?")
+    rtype = rec.get("type", "text")
+    lines: List[str] = [f"#{idx} File: {name}", f"   Type: {rtype}"]
+    if rtype in ("json", "d3dpipeline"):
+        keys = rec.get("keys", []) or []
+        if keys:
+            lines.append("   Top-level keys: " + ", ".join(map(str, keys[:30])))
+        preview = (rec.get("sample_text", "") or "")[:500]
+        if preview:
+            lines.append("   Sample: " + preview.replace("\n", " ")[:500])
+    elif rtype == "bson":
+        keys = rec.get("keys", []) or []
+        if keys:
+            lines.append("   Fields: " + ", ".join(map(str, keys[:20])))
+    else:
+        preview = (rec.get("sample_text", "") or "")[:500]
+        if preview:
+            lines.append("   Sample: " + preview.replace("\n", " ")[:500])
+    return "\n".join(lines)
+
+
+_BATCH_MARKER_RE = re.compile(
+    r"^\s*#?\s*(\d{1,3})\s*[:\.\)]\s*(.*)$", re.IGNORECASE,
+)
+_BATCH_TOPICS_RE = re.compile(
+    r"^\s*topics?\s*#?\s*(\d{1,3})?\s*[:\-]\s*(.*)$", re.IGNORECASE,
+)
+
+
+def _parse_batched_response(
+    text: str, expected: int, *, topics_only: bool,
+) -> Optional[List[Tuple[str, List[str]]]]:
+    """Parse a batched model response. Returns a list of
+    (summary, topics) tuples in marker-order (#1 first, #2 second, ...).
+
+    Returns None when:
+      • the response is empty
+      • fewer than ``expected`` distinct markers found
+
+    The latter is the signal for the caller to fall back to per-record
+    calls. We accept extra markers (just trim) and gracefully skip
+    missing ones (filling with empty placeholders).
+    """
+    if not text or not text.strip():
+        return None
+    # State machine: walk lines, attach each summary / topics line to
+    # the most recently seen marker.
+    summaries: Dict[int, str] = {}
+    topics_map: Dict[int, List[str]] = {}
+    current_idx: Optional[int] = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        # Topics line (with or without explicit marker)
+        m_topics = _BATCH_TOPICS_RE.match(line)
+        if m_topics:
+            try:
+                tidx = int(m_topics.group(1)) if m_topics.group(1) else current_idx
+            except Exception:
+                tidx = current_idx
+            if tidx is not None:
+                topics_map[tidx] = _parse_topics_line(m_topics.group(2))
+            continue
+        # Generic marker line — could be summary OR (in topics-only
+        # mode) a topics list prefixed with the marker
+        m_marker = _BATCH_MARKER_RE.match(line)
+        if m_marker:
+            try:
+                current_idx = int(m_marker.group(1))
+            except Exception:
+                continue
+            tail = (m_marker.group(2) or "").strip()
+            if topics_only:
+                topics_map[current_idx] = _parse_topics_line(tail)
+            else:
+                # First marker line is the summary; further bare
+                # markers without explicit TOPICS prefix replace the
+                # summary.
+                summaries[current_idx] = tail
+            continue
+        # Plain prose continuation of the current summary (only in
+        # full-description mode).
+        if current_idx is not None and not topics_only:
+            existing = summaries.get(current_idx, "")
+            summaries[current_idx] = (
+                existing + " " + line if existing else line
+            ).strip()
+
+    # In full-description mode, require at least one of {summary,
+    # topics} per record. In topics-only mode, require topics.
+    if topics_only:
+        seen = set(topics_map.keys())
+    else:
+        seen = set(summaries.keys()) | set(topics_map.keys())
+    if not seen:
+        return None
+    # Heuristic threshold — accept the parse if we got at least half
+    # of what we expected. Better partial-progress than total fallback.
+    if len(seen) < max(1, expected // 2):
+        return None
+
+    out: List[Tuple[str, List[str]]] = []
+    for i in range(1, expected + 1):
+        out.append((summaries.get(i, ""), topics_map.get(i, [])))
+    return out
+
+
+def _describe_from_schema(rec: Dict[str, Any]) -> Tuple[str, List[str]]:
+    """Deterministically generate description + topics for a tabular
+    record from its index metadata. Zero model calls — pure dict work,
+    runs in microseconds.
+
+    Used for csv / tsv / parquet / excel / sqlite / duckdb records.
+    The model would have produced something very similar from the
+    same metadata, just slower and with occasional hallucinations.
+    """
+    name = rec.get("name", "?")
+    rtype = rec.get("type", "text")
+    summary_parts: List[str] = []
+    topic_set: Set[str] = set()
+
+    if rtype in ("csv", "tsv", "csv.gz", "parquet"):
+        headers = rec.get("headers", []) or []
+        col_count = len(headers)
+        row_count = rec.get("rows")
+        n_str = f"{row_count:,}" if isinstance(row_count, int) else "?"
+        summary_parts.append(
+            f"{rtype.upper()} dataset {name!r} with {col_count} columns "
+            f"and {n_str} rows."
+        )
+        if headers:
+            head_preview = ", ".join(map(str, headers[:6]))
+            if col_count > 6:
+                head_preview += f", … (+{col_count - 6} more)"
+            summary_parts.append(f"Columns: {head_preview}.")
+        # Topics from column names (tokenized + cleaned)
+        for h in headers:
+            for tok in _tokenize(str(h)):
+                if _is_useful_token(tok):
+                    topic_set.add(tok)
+
+    elif rtype == "excel":
+        sheets = rec.get("sheets", []) or []
+        summary_parts.append(
+            f"Excel workbook {name!r} with {len(sheets)} sheet"
+            f"{'s' if len(sheets) != 1 else ''}: "
+            + ", ".join(s.get("sheet", "?") for s in sheets[:5])
+            + ("…" if len(sheets) > 5 else "")
+            + "."
+        )
+        for s in sheets:
+            for h in s.get("headers", []) or []:
+                for tok in _tokenize(str(h)):
+                    if _is_useful_token(tok):
+                        topic_set.add(tok)
+            sname = s.get("sheet")
+            if isinstance(sname, str):
+                for tok in _tokenize(sname):
+                    if _is_useful_token(tok):
+                        topic_set.add(tok)
+
+    elif rtype in ("sqlite", "duckdb"):
+        tables = rec.get("tables", []) or []
+        summary_parts.append(
+            f"{rtype.upper()} database {name!r} with {len(tables)} table"
+            f"{'s' if len(tables) != 1 else ''}: "
+            + ", ".join(t.get("table", "?") for t in tables[:5])
+            + ("…" if len(tables) > 5 else "")
+            + "."
+        )
+        for t in tables:
+            tname = t.get("table")
+            if isinstance(tname, str):
+                for tok in _tokenize(tname):
+                    if _is_useful_token(tok):
+                        topic_set.add(tok)
+            for c in t.get("columns", []) or []:
+                for tok in _tokenize(str(c)):
+                    if _is_useful_token(tok):
+                        topic_set.add(tok)
+
+    # Cap topics — prefer longest tokens (most discriminative). The
+    # final cap of 6 mirrors the LLM path's `topics[:6]` slice.
+    topics_sorted = sorted(topic_set, key=lambda t: (-len(t), t))
+    return " ".join(summary_parts), topics_sorted[:6]
+
+
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
 _HEX_RE = re.compile(r"^[0-9a-f]+$", re.IGNORECASE)
 
@@ -156,6 +447,31 @@ def _tokenize(text: str) -> List[str]:
     Filters hex hashes and overly long tokens that pollute the keyword set."""
     return [t.lower() for t in _TOKEN_RE.findall(text or "")
             if _is_useful_token(t.lower())]
+
+
+def _select_top_keywords(kw_set: Set[str], cap: int) -> List[str]:
+    """Pick at most ``cap`` keywords from ``kw_set``, prioritizing the
+    most distinctive (longest) tokens. Plain alphabetical sort + slice
+    used to bias toward the start of the alphabet — for a file with
+    thousands of tokens, "0000".."99999" / "a" / "all" / "and" / etc.
+    would fill the cap before any 8+ char domain term reached it.
+
+    Sort order: length descending, then lexicographic. The final list
+    is alphabetized for deterministic storage / readable diffs. Net
+    effect: long domain words like ``promethium``, ``stoneskin``,
+    ``ironfist`` survive the cap before short generic tokens.
+    """
+    if not kw_set:
+        return []
+    # `numeric_filler` like "1", "12", "2024" are usually low-value for
+    # find-by-keyword search. Push them to the bottom of the priority
+    # list so domain words win the cap fight.
+    def _priority_key(tok: str):
+        is_numeric = tok.isdigit()
+        return (0 if not is_numeric else 1, -len(tok), tok)
+    sorted_by_priority = sorted(kw_set, key=_priority_key)
+    kept = sorted_by_priority[:cap]
+    return sorted(kept)
 
 
 # ---------- file parsers ----------------------------------------------------
@@ -190,6 +506,7 @@ def _parse_csv(p: Path) -> Dict[str, Any]:
     headers: List[str] = []
     sample_rows: List[str] = []
     keywords: Set[str] = set()
+    total_rows = 0
     try:
         with open(p, newline="", encoding="utf-8", errors="replace") as fh:
             reader = csv.reader(fh)
@@ -198,6 +515,13 @@ def _parse_csv(p: Path) -> Dict[str, Any]:
                     headers = [c.strip() for c in row]
                     keywords.update(_tokenize(" ".join(headers)))
                     continue
+                # We tokenise + sample only the first 500 rows; beyond
+                # that, just count rows. Counting is cheap (no list
+                # append, no token regex) so we can finish in a single
+                # pass instead of opening the file twice. The total
+                # surfaces in the schema-based description as
+                # "with N rows" instead of the previous "? rows".
+                total_rows = i
                 if i < 6:
                     sample_rows.append(", ".join(row))
                 if i < 500:
@@ -229,11 +553,118 @@ def _parse_csv(p: Path) -> Dict[str, Any]:
         "type": "csv",
         "headers": headers,
         "sample_rows": sample_rows,
+        "rows": total_rows,
         "keywords": sorted(keywords)[:5000],
     }
 
 
+# ---------------------------------------------------------------------------
+# JSON parsing — size-tiered to handle multi-hundred-MB files without freezing
+# the indexer for an hour.
+#
+#   Tier 1  (< 5 MB)         Full json.loads + recursive walk.
+#                            Yields the richest extraction (keys + string
+#                            values at depth ≤ 5).
+#
+#   Tier 2  (5 MB - 1 GB)    Read whole text BUT skip json.loads. Use regex
+#                            to extract keys and ALL quoted strings (object
+#                            values + array elements) directly from raw
+#                            text. Same downstream keyword tokens as tier 1
+#                            but ~30x faster — no Python object tree built.
+#                            ~100% coverage of the file's string surface
+#                            (capped at 5,000 unique strings per file).
+#
+#   Tier 3  (> 1 GB)         Stream-sample head + tail (5 MB each) by seek;
+#                            never load the full file. Regex-extract from
+#                            the sample. The keyword surface is partial
+#                            (~2% of a 500 MB file, less for bigger) but
+#                            indexing completes in seconds rather than an
+#                            hour. Adequate for hit/miss vault retrieval;
+#                            for full-content search use the filesystem
+#                            grep chat intent or the analyst.
+#
+# Walk caps in tier 1 protect against pathological wide-and-deep trees:
+#   • per-dict iter cap = 5000 keys (very wide objects are sampled)
+#   • per-list iter cap = 25 entries (unchanged from original)
+#   • global node visit budget = 50,000 (recursion bails when hit)
+# ---------------------------------------------------------------------------
+
+_JSON_FULL_PARSE_MAX_BYTES = 5    * 1024 * 1024     # 5 MB
+_JSON_REGEX_FULL_MAX_BYTES = 1024 * 1024 * 1024     # 1 GB
+# Why 1 GB for the tier-2 ceiling:
+#   • A regex pass over 1 GB of raw text takes ~30-60 s on a modern
+#     CPU (release-build cpython re module, single-threaded). That's
+#     a one-time cost per file (the mtime gate skips it on rebuild).
+#   • Peak RAM during indexing a 1 GB JSON: ~2-3 GB (the text string
+#     plus the regex's internal state). Fine on a 16 GB+ machine.
+#   • Coverage on files up to 1 GB jumps from tier 3's ~2% (10 MB
+#     sample) to ~100% (every quoted string in the file gets
+#     indexed up to the per-file 5,000-unique caps).
+#   • Files larger than 1 GB still fall to tier 3 sampling. If your
+#     vault has many >1 GB JSONs, bump this further — there's no
+#     hard ceiling, just memory and patience.
+# Tier-3 (>1 GB) sample windows. 5 MB head + 5 MB tail = 10 MB total
+# scanned per huge file, up from the original 2 MB. Concretely:
+#   • For a 500 MB array of builds, the head sample now captures the
+#     first ~5,000-20,000 build entries (depending on size) and the
+#     tail sample captures the last ~5,000-20,000.
+#   • Search coverage on huge files jumps from ~0.4% of the document
+#     to ~2% — a 5x improvement in hit rate.
+#   • Per-file indexing time on tier 3 goes from ~1 s to ~3-5 s,
+#     still negligible compared to the original full-parse hour+.
+# Keep these as module-level constants so they're easy to bump
+# further if your files are even bigger.
+_JSON_SAMPLE_HEAD_BYTES    = 5 * 1024 * 1024     # 5 MB head sample
+_JSON_SAMPLE_TAIL_BYTES    = 5 * 1024 * 1024     # 5 MB tail sample
+
+_JSON_WALK_DICT_CAP   = 5000
+_JSON_WALK_LIST_CAP   = 25
+_JSON_WALK_NODE_LIMIT = 50_000
+
+# Regex used by tier 2 / tier 3 to pull keys + values from raw text without
+# building a Python object tree. Matches JSON-ish double-quoted strings
+# bounded by what the keyword index actually consumes (1-80 chars; no
+# embedded escapes — we deliberately skip strings with escaped quotes to
+# keep the pattern simple and the matches clean).
+#
+# Three patterns, intentional split:
+#   _JSON_KEY_RE          — strings followed by ':', i.e. object keys.
+#                           Used to populate the `keys` field, which
+#                           summary_block surfaces as "keys: ..." for
+#                           the model.
+#   _JSON_ANY_STRING_RE   — every quoted string in the file, regardless
+#                           of context. Catches keys, object values, AND
+#                           array-element strings ["a","b","c"]. Critical
+#                           for build/loadout JSONs where powers and
+#                           materials are typically array elements, not
+#                           object values — without it, the tier-2/3
+#                           index could miss every power name in a file.
+#                           Goes into the `string_values` set.
+_JSON_KEY_RE        = re.compile(r'"([^"\\\n]{1,80})"\s*:')
+_JSON_ANY_STRING_RE = re.compile(r'"([^"\\\n]{1,80})"')
+
+
 def _parse_json(p: Path) -> Dict[str, Any]:
+    """Index a JSON file. Size-tiered so huge files don't freeze indexing."""
+    try:
+        size = p.stat().st_size
+    except Exception:
+        size = 0
+
+    # ── Tier 3: huge file → sample head + tail only ────────────────────
+    if size > _JSON_REGEX_FULL_MAX_BYTES:
+        return _parse_json_sampled(p, size)
+
+    # ── Tier 2: medium → regex over the full text (no parse step) ──────
+    if size > _JSON_FULL_PARSE_MAX_BYTES:
+        return _parse_json_regex_full(p, size)
+
+    # ── Tier 1: small → full parse + tree walk (richest extraction) ────
+    return _parse_json_full(p)
+
+
+def _parse_json_full(p: Path) -> Dict[str, Any]:
+    """Tier 1: small files. Build full object tree, walk with caps."""
     keys: Set[str] = set()
     string_values: Set[str] = set()
     sample_text = ""
@@ -241,19 +672,31 @@ def _parse_json(p: Path) -> Dict[str, Any]:
         text = p.read_text(encoding="utf-8", errors="replace")
         sample_text = text[:2000]
         try:
-            data = json.loads(text)
+            data = _fast_json_loads(text)
         except Exception:
             data = None
 
+        # Use a list as a single-element mutable counter so the inner
+        # closure can update it. Python 3 supports `nonlocal` for this
+        # but the existing module style avoids it.
+        visited = [0]
+
         def walk(node: Any, depth: int = 0) -> None:
-            if depth > 5:
+            if depth > 5 or visited[0] >= _JSON_WALK_NODE_LIMIT:
                 return
+            visited[0] += 1
             if isinstance(node, dict):
-                for k, v in node.items():
+                # Wide dicts get sampled — the first N keys are visited
+                # in iteration order, the rest are skipped. Most schema
+                # info appears at the top of a dict literal, and the
+                # cap keeps walk time bounded.
+                for i, (k, v) in enumerate(node.items()):
+                    if i >= _JSON_WALK_DICT_CAP:
+                        break
                     keys.add(str(k))
                     walk(v, depth + 1)
             elif isinstance(node, list):
-                for item in node[:25]:
+                for item in node[:_JSON_WALK_LIST_CAP]:
                     walk(item, depth + 1)
             elif isinstance(node, str):
                 if 1 <= len(node) < 80:
@@ -266,13 +709,125 @@ def _parse_json(p: Path) -> Dict[str, Any]:
 
     keywords: Set[str] = set()
     keywords.update(_tokenize(" ".join(keys)))
-    keywords.update(_tokenize(" ".join(list(string_values)[:200])))
+    # Tokenize ALL string values, not an arbitrary subset. Slicing a set
+    # via list(...)[:N] picks a random N entries (sets are unordered),
+    # which used to mean that high-cardinality files (e.g. 1000 build
+    # entries with unique names) would saturate string_values with build
+    # names and leave no room for powers/materials in the keyword index.
+    keywords.update(_tokenize(" ".join(string_values)))
 
     return {
         "type": "json",
         "keys": sorted(keys)[:120],
         "sample_text": sample_text[:1200],
-        "keywords": sorted(keywords)[:300],
+        "keywords": _select_top_keywords(keywords, 1500),
+    }
+
+
+def _parse_json_regex_full(p: Path, size: int) -> Dict[str, Any]:
+    """Tier 2: medium files. Read full text but skip json.loads entirely —
+    regex-extract keys and string values from the raw text. ~30x faster
+    than tier 1 on the same file because we never build a Python object
+    tree. Returns the same record shape as tier 1.
+    """
+    keys: Set[str]          = set()
+    string_values: Set[str] = set()
+    sample_text             = ""
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+        sample_text = text[:2000]
+        # Cap each match list so a 10M-entry array of "name" objects can't
+        # blow memory. 5000 of each is plenty for keyword index purposes.
+        for m in _JSON_KEY_RE.finditer(text):
+            keys.add(m.group(1))
+            if len(keys) >= 5000:
+                break
+        for m in _JSON_ANY_STRING_RE.finditer(text):
+            v = m.group(1)
+            if 1 <= len(v) < 80:
+                string_values.add(v)
+            if len(string_values) >= 5000:
+                break
+    except Exception:
+        pass
+
+    keywords: Set[str] = set()
+    keywords.update(_tokenize(" ".join(keys)))
+    # Tokenize the whole string_values set — see the comment in
+    # _parse_json_full for why the previous [:500] slice was a bug.
+    keywords.update(_tokenize(" ".join(string_values)))
+
+    rec = {
+        "type": "json",
+        "keys": sorted(keys)[:120],
+        "sample_text": sample_text[:1200],
+        "keywords": _select_top_keywords(keywords, 1500),
+        "indexing_tier": "regex_full",
+        "indexed_bytes": size,
+    }
+    return rec
+
+
+def _parse_json_sampled(p: Path, size: int) -> Dict[str, Any]:
+    """Tier 3: huge files (> 200 MB). Stream-sample head + tail only,
+    never load the full file. Adequate keyword surface for vault hit/miss
+    retrieval; the user can still query the file by name and use the
+    analyst to compute over its contents — the index just doesn't have
+    every key in it.
+    """
+    keys: Set[str]          = set()
+    string_values: Set[str] = set()
+    sample_text             = ""
+    head_text = ""
+    tail_text = ""
+    try:
+        with open(p, "rb") as fh:
+            head_bytes = fh.read(_JSON_SAMPLE_HEAD_BYTES)
+            head_text = head_bytes.decode("utf-8", errors="replace")
+            sample_text = head_text[:2000]
+            # Seek to (file_size - tail_bytes) for the tail sample.
+            tail_start = max(_JSON_SAMPLE_HEAD_BYTES, size - _JSON_SAMPLE_TAIL_BYTES)
+            try:
+                fh.seek(tail_start)
+                tail_bytes = fh.read(_JSON_SAMPLE_TAIL_BYTES)
+                tail_text = tail_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                tail_text = ""
+
+        for chunk in (head_text, tail_text):
+            for m in _JSON_KEY_RE.finditer(chunk):
+                keys.add(m.group(1))
+                if len(keys) >= 5000:
+                    break
+            for m in _JSON_ANY_STRING_RE.finditer(chunk):
+                v = m.group(1)
+                if 1 <= len(v) < 80:
+                    string_values.add(v)
+                if len(string_values) >= 5000:
+                    break
+    except Exception:
+        pass
+
+    keywords: Set[str] = set()
+    keywords.update(_tokenize(" ".join(keys)))
+    # Tokenize the whole string_values set — see the comment in
+    # _parse_json_full for why the previous [:500] slice was a bug.
+    keywords.update(_tokenize(" ".join(string_values)))
+
+    sampled_mb = (_JSON_SAMPLE_HEAD_BYTES + _JSON_SAMPLE_TAIL_BYTES) / (1024 * 1024)
+    return {
+        "type": "json",
+        "keys": sorted(keys)[:120],
+        "sample_text": sample_text[:1200],
+        "keywords": _select_top_keywords(keywords, 1500),
+        "indexing_tier": "sampled_head_tail",
+        "indexed_bytes": int(_JSON_SAMPLE_HEAD_BYTES + _JSON_SAMPLE_TAIL_BYTES),
+        "indexing_note": (
+            f"Large JSON ({size / (1024**2):.1f} MB) indexed via "
+            f"~{sampled_mb:.0f} MB head + tail sample. Some keys deep "
+            f"in the file may not be in the keyword surface."
+        ),
+        "total_bytes": size,
     }
 
 
@@ -589,6 +1144,57 @@ def _parse_text(p: Path, suffix: str) -> Dict[str, Any]:
     }
 
 
+def _record_has_content(rec: Dict[str, Any]) -> bool:
+    """True iff a parsed record has the kind of indexing surface its
+    declared file type SHOULD have. Type-aware: a .json record is only
+    accepted when the parser actually extracted JSON structure (keys
+    or string-value keywords), not just because errors="replace"
+    decoded some random bytes to English-looking text.
+
+    The user-reported "model says no access to that folder/file" bug
+    came from corrupted/empty files whose parse stubs nonetheless
+    surfaced through vault search via their filename. The model saw
+    a [VAULT MATCH] block with no real content and concluded the file
+    was inaccessible — the structural check below prevents those
+    stubs from reaching the index at all.
+    """
+    if not isinstance(rec, dict):
+        return False
+    rtype = rec.get("type", "")
+
+    # Structured data — must have STRUCTURE, not just decoded bytes.
+    # broken.json (binary garbage) tokenises to {garbage, not, json}
+    # via errors="replace" decode; that passed a "≥3 tokens" rule
+    # but yielded 0 real keys, so we'd inject an empty-content match.
+    if rtype in ("json", "d3dpipeline", "bson"):
+        return bool(rec.get("keys") or rec.get("keywords"))
+
+    if rtype in ("csv", "tsv", "csv.gz", "parquet"):
+        return bool(rec.get("headers")
+                    or rec.get("sample_rows")
+                    or rec.get("keywords"))
+
+    if rtype == "excel":
+        return bool(rec.get("sheets") or rec.get("keywords"))
+
+    if rtype in ("sqlite", "duckdb"):
+        return bool(rec.get("tables") or rec.get("keywords"))
+
+    # Plain text / yaml / md / cfg / log / etc. — keyword extraction
+    # is the main surface. Require either real keywords OR ≥3 tokenised
+    # words from the sample. Tightens the previous "any non-empty
+    # sample_text" rule which let through 1-character files.
+    if rec.get("keywords"):
+        if len(rec["keywords"]) >= 2:
+            return True
+        # Single-keyword stubs (e.g. a .txt file containing just "a")
+        # are essentially empty for search purposes — fall through.
+    sample = (rec.get("sample_text") or "").strip()
+    if sample and len(_tokenize(sample)) >= 3:
+        return True
+    return False
+
+
 def _index_file(p: Path) -> Optional[Dict[str, Any]]:
     suffix = p.suffix.lower()
     if suffix == ".csv":
@@ -614,6 +1220,13 @@ def _index_file(p: Path) -> Optional[Dict[str, Any]]:
     elif suffix in _TEXT_SUFFIXES:
         rec = _parse_text(p, suffix)
     else:
+        return None
+    # Skip records that parsed but yielded nothing useful. See
+    # _record_has_content above for why — these stubs cause the
+    # "model says no access to the file" hallucination because vault
+    # search can still surface them via filename token match while the
+    # model sees an empty [VAULT MATCH] block.
+    if not _record_has_content(rec):
         return None
     try:
         st = p.stat()
@@ -733,6 +1346,181 @@ class VaultIndex:
         self._vocab_cache = vocab
         return vocab
 
+    # ---- semantic expansion (model-driven, data-agnostic) ----
+    #
+    # When the user queries a category word that doesn't appear literally
+    # in any file ("metals", "energy units", "weapons", "fabrics"), the
+    # keyword index misses every relevant file. Hardcoding "promethium is
+    # a metal" would corrupt the app for users whose vaults are about
+    # something else entirely. Instead we let the model decide WHICH of
+    # the user's actual vocabulary tokens belong in the queried category.
+    #
+    # Lifecycle:
+    #   • semantic_expand(term, llm_call) runs on demand, only when the
+    #     search query has at least one term that's not in the vault's
+    #     vocabulary.
+    #   • Each (term -> expansions) lookup is cached in
+    #     vault/semantic_cache.json so a novel concept costs one model
+    #     call ever for the lifetime of that vault.
+    #   • The cache is invalidated automatically when the vocabulary
+    #     changes (new files, removed files) — we hash the sorted vocab
+    #     and bust entries built against a stale hash.
+    #   • If the model isn't available (llm_call=None), returns []. The
+    #     existing fuzzy-match layer remains the fallback.
+
+    _SEMANTIC_CACHE_FILENAME = SEMANTIC_CACHE_FILENAME
+    _SEMANTIC_PROMPT = """\
+You are categorizing vocabulary tokens from a user's data vault. Decide
+which of the LISTED tokens belong in the QUERIED category.
+
+QUERIED CATEGORY: {term}
+
+USER'S VAULT VOCABULARY (these are real strings from the user's files;
+return ONLY tokens from this list — do not invent any new words):
+{vocab}
+
+Output the matching tokens as a comma-separated list on a single line.
+If NONE of the listed tokens belong in the category, output the single
+word: NONE
+Do not explain, do not add prose, do not include tokens that are not in
+the vocabulary list. Lowercase only. Single line only.
+"""
+
+    def _semantic_cache_path(self) -> Path:
+        return self.vault_dir / self._SEMANTIC_CACHE_FILENAME
+
+    def _load_semantic_cache(self) -> Dict[str, Any]:
+        """Cache layout:
+            { "vocab_hash": "<sha256>",
+              "entries":    { "<term>": ["expansion1", "expansion2", ...] } }
+        Returns {} on any error."""
+        p = self._semantic_cache_path()
+        if not p.exists():
+            return {}
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {}
+            return data
+        except Exception:
+            return {}
+
+    def _save_semantic_cache(self, cache: Dict[str, Any]) -> None:
+        try:
+            self._semantic_cache_path().write_text(
+                json.dumps(cache, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def _vocab_hash(self) -> str:
+        """Stable hash of the current vocab. Used to invalidate the
+        semantic cache when the vault contents have meaningfully
+        changed."""
+        import hashlib as _h
+        vocab = sorted(self._global_vocab())
+        return _h.sha256("\n".join(vocab).encode("utf-8")).hexdigest()[:16]
+
+    def semantic_expand(
+        self,
+        term: str,
+        llm_call: Optional[Callable[[str], str]] = None,
+        *,
+        max_vocab_in_prompt: int = 400,
+    ) -> List[str]:
+        """Return vocab tokens semantically related to ``term``.
+
+        Asks the local model "which of these user-vocabulary tokens
+        belong in the QUERIED category". The model decides whether
+        ``"promethium"`` is a metal, whether ``"denim"`` is a fabric,
+        whether ``"glock"`` is a weapon — based on its own knowledge of
+        each domain, NOT a hardcoded mapping. Results are filtered to
+        tokens that actually exist in the user's vault (so the model
+        can't hallucinate words that aren't there).
+
+        Cached in vault/semantic_cache.json. Cache is invalidated when
+        the global vocab hash changes (new/removed/changed files).
+
+        Returns an empty list when:
+          • llm_call is None (no model loaded)
+          • The model says "NONE"
+          • The model output can't be parsed
+          • The term is too short or empty
+        """
+        t = (term or "").lower().strip()
+        if len(t) < 3 or llm_call is None:
+            return []
+
+        vocab = self._global_vocab()
+        if not vocab:
+            return []
+
+        # Skip the model call if the term itself is in the vocab — there's
+        # nothing semantic to do; literal search will find it.
+        if t in vocab:
+            return []
+
+        cache = self._load_semantic_cache()
+        current_hash = self._vocab_hash()
+
+        # Drop the entries dict on hash change — the user's vault has
+        # shifted under us and old expansions may include vocab that no
+        # longer exists.
+        if cache.get("vocab_hash") != current_hash:
+            cache = {"vocab_hash": current_hash, "entries": {}}
+
+        entries = cache.setdefault("entries", {})
+        if t in entries:
+            cached = entries[t]
+            # Defensive: filter against the current vocab in case partial
+            # invalidation slipped through.
+            return [w for w in cached if w in vocab][:50]
+
+        # Build the prompt. Bound vocab size so the call stays fast even
+        # on large vaults. Prefer long tokens (more likely to be domain
+        # words rather than numeric noise) and avoid showing the model
+        # tokens it would never categorize usefully.
+        def _vocab_priority(tok: str) -> tuple:
+            return (1 if tok.isdigit() else 0, -len(tok), tok)
+        prioritized = sorted(vocab, key=_vocab_priority)
+        vocab_sample = prioritized[:max_vocab_in_prompt]
+
+        prompt = self._SEMANTIC_PROMPT.format(
+            term=t, vocab=", ".join(vocab_sample),
+        )
+
+        try:
+            raw = llm_call(prompt)
+        except Exception:
+            entries[t] = []
+            self._save_semantic_cache(cache)
+            return []
+
+        # Parse: lowercase, split on commas, strip, keep only tokens that
+        # are actually in the vocab. NONE / "(none)" / empty all map to [].
+        expansions: List[str] = []
+        if raw:
+            cleaned = raw.strip().lower()
+            if cleaned and cleaned != "none" and not cleaned.startswith("none"):
+                seen: Set[str] = set()
+                for piece in cleaned.replace("\n", ",").split(","):
+                    w = piece.strip().strip(".'\"`")
+                    # The model occasionally wraps tokens in quotes or
+                    # adds a leading "- " bullet. Strip those.
+                    w = w.lstrip("-* \t")
+                    if not w or w == "none":
+                        continue
+                    if w in vocab and w not in seen and w != t:
+                        seen.add(w)
+                        expansions.append(w)
+                    if len(expansions) >= 50:
+                        break
+
+        entries[t] = expansions
+        self._save_semantic_cache(cache)
+        return expansions
+
     def _fuzzy_expand_term(
         self, term: str, *, denylist: Optional[Set[str]] = None,
         cutoff: float = FUZZY_CUTOFF, n: int = FUZZY_MAX_PER_TERM,
@@ -774,17 +1562,27 @@ class VaultIndex:
             pass
 
     # ---- build ----
-    def rebuild(self, *, scope: Optional[Path] = None) -> int:
+    def rebuild(self, *, scope: Optional[Path] = None,
+                progress: Optional[Callable[[int, int, str], None]] = None,
+                max_workers: Optional[int] = None) -> int:
         """Walk the vault (or a subfolder), reindex changed/new files.
 
         Returns count of files (re)indexed in this pass.
+
+        ``progress`` is an optional callback ``progress(done, total, name)``
+        fired on each file that is reindexed (skipped-because-unchanged
+        files don't fire it — they're effectively instant). The GUI uses
+        this to keep the user informed during long index builds.
+
+        ``max_workers`` controls the ThreadPoolExecutor parallelism.
+        Defaults to ``min(8, os.cpu_count() or 4)``. File parsing is
+        CPU-bound but I/O dominated; threading still helps because the
+        OS interleaves disk reads while a worker thread is parsing.
+        Set to 1 to force serial behaviour (useful for debugging).
         """
         root = Path(scope) if scope else self.vault_dir
         if not root.exists():
             return 0
-
-        seen: Set[str] = set()
-        n_updated = 0
 
         # Protected subdirs the model must NEVER index/read.
         # conversation_logs is the human-only debugging log; pipelines/out
@@ -794,18 +1592,24 @@ class VaultIndex:
         except Exception:
             _is_protected = lambda *_a, **_k: False
 
+        # ── Phase 1: enumerate candidate files, skip up-to-date ones ──────
+        # The walk itself is fast; parsing is the slow part. So we first
+        # collect every (path, mtime) tuple that needs work, THEN parse
+        # in parallel. This lets the progress callback emit an accurate
+        # total at the start instead of counting up forever.
+        to_index: List[Tuple[Path, float]] = []
+        seen: Set[str] = set()
         for p in root.rglob("*"):
             if not p.is_file():
                 continue
-            if p.name == INDEX_FILENAME:
+            # Skip our own bookkeeping files (index, denylist, semantic
+            # cache, backend settings, onboarding marker). Indexing them
+            # would feed JSON-shaped keys back into the vocab and break
+            # semantic expansion.
+            if p.name in _BOOKKEEPING_FILENAMES:
                 continue
-            # HARD GUARD — conversation logs and other protected vault
-            # subfolders. Checked first so nothing under them can slip
-            # through any of the other filters.
             if _is_protected(p, self.vault_dir):
                 continue
-            # Skip pipelines/out/ — modified pipeline versions live there
-            # and must not leak back into the model's context.
             parts = {part.lower() for part in p.parts}
             if "out" in parts and "pipelines" in parts:
                 lower_str = str(p).lower().replace("\\", "/")
@@ -822,11 +1626,57 @@ class VaultIndex:
                 continue
             existing = self.records.get(spath)
             if existing and existing.get("mtime") == mtime:
-                continue
-            rec = _index_file(p)
-            if rec:
-                self.records[spath] = rec
-                n_updated += 1
+                continue   # unchanged since last index, skip
+            to_index.append((p, mtime))
+
+        # ── Phase 2: parse in parallel ────────────────────────────────────
+        n_updated = 0
+        total = len(to_index)
+        if total == 0:
+            # No work to do — still need the stale-record sweep below.
+            pass
+        elif total == 1 or (max_workers is not None and max_workers <= 1):
+            # Serial fallback. Useful for very small batches (threading
+            # overhead would dwarf the work) and for debugging.
+            for i, (p, _mtime) in enumerate(to_index, 1):
+                spath = str(p)
+                if progress is not None:
+                    try:
+                        progress(i, total, p.name)
+                    except Exception:
+                        pass
+                rec = _index_file(p)
+                if rec:
+                    self.records[spath] = rec
+                    n_updated += 1
+        else:
+            # Parallel. Even though CPython's GIL serialises pure-Python
+            # work, json.loads + file I/O release the GIL frequently
+            # enough to give a real ~2-3x speedup on multi-core boxes.
+            import os as _os
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            workers = max_workers if max_workers is not None else \
+                min(8, (_os.cpu_count() or 4))
+            done = 0
+            with ThreadPoolExecutor(max_workers=workers,
+                                    thread_name_prefix="vault-index") as ex:
+                futures = {ex.submit(_index_file, p): p for p, _ in to_index}
+                for fut in as_completed(futures):
+                    done += 1
+                    p = futures[fut]
+                    spath = str(p)
+                    if progress is not None:
+                        try:
+                            progress(done, total, p.name)
+                        except Exception:
+                            pass
+                    try:
+                        rec = fut.result()
+                    except Exception:
+                        rec = None
+                    if rec:
+                        self.records[spath] = rec
+                        n_updated += 1
 
         # Drop stale records for files that have been removed (only on full-tree walks)
         if scope is None or Path(scope) == self.vault_dir:
@@ -847,6 +1697,7 @@ class VaultIndex:
         *,
         folder: Optional[str] = None,
         use_fuzzy: bool = True,
+        llm_call: Optional[Callable[[str], str]] = None,
     ) -> Tuple[List[Tuple[float, Dict[str, Any]]], Dict[str, List[Tuple[str, float]]]]:
         """Return (top-k results, fuzzy_matches) for a free-text query.
 
@@ -857,6 +1708,16 @@ class VaultIndex:
         list of (suggested_token, similarity) tuples that were used to
         expand the search. The caller can surface this to the user so
         misspellings can be reviewed and rejected.
+
+        `llm_call` is an optional callable that does a one-shot model
+        inference for **semantic expansion**: when a query token isn't in
+        the vault's vocab AND isn't fuzzy-matchable, we ask the model
+        "which of these user-vocabulary tokens belong in the category
+        <term>?" The model's answer is filtered to the user's actual
+        vocab (no inventions), cached on disk, and added to the search
+        terms. Lets queries like "metals" surface "promethium" / "iron"
+        / "steel" entries WITHOUT any hardcoded domain mapping in the
+        index — the model decides per-vault based on the actual data.
         """
         terms = _tokenize(query)
         fuzzy_matches: Dict[str, List[Tuple[str, float]]] = {}
@@ -880,12 +1741,55 @@ class VaultIndex:
                     for matched, _ratio in close:
                         expanded |= _expand(matched)
 
+        # Semantic expansion via the model. Only runs for query terms
+        # that are NOT in the vocab AND not already typo-fixed by the
+        # fuzzy layer. The model decides what belongs in each category
+        # using ONLY tokens that exist in the user's vault — so a query
+        # for "metals" against a textile vault returns nothing rather
+        # than something invented. Cached per-vault on disk; one model
+        # call per novel concept across the vault's lifetime.
+        if llm_call is not None:
+            vocab = self._global_vocab()
+            for t in terms:
+                if t in vocab:
+                    continue
+                if t in fuzzy_matches:
+                    continue                # fuzzy already handled it
+                if len(t) < 3:
+                    continue
+                # Don't burn CPU asking the model to find semantic
+                # categories for common English stop words ("find",
+                # "the", "all", "average", "across", "excluding", …).
+                # Without this gate each query fires 5-10+ extra model
+                # calls — 15-30s of CPU overhead on a typical machine
+                # for zero ranking benefit (the expanded tokens get
+                # filtered out by _SEARCH_STOP_TOKENS later anyway).
+                if t in _SEARCH_STOP_TOKENS:
+                    continue
+                try:
+                    expansions = self.semantic_expand(t, llm_call=llm_call)
+                except Exception:
+                    expansions = []
+                if expansions:
+                    # Reuse the fuzzy_matches map so the existing UI path
+                    # that surfaces "treated as your spelling" matches
+                    # also covers semantic expansions. The score is 1.0
+                    # to mark a confident model match vs the fuzzy
+                    # ratios that are typically 0.8-0.95.
+                    fuzzy_matches.setdefault(t, []).extend(
+                        (w, 1.0) for w in expansions
+                    )
+                    for w in expansions:
+                        expanded |= _expand(w)
+
         # Strip trivial stop-tokens that explode match counts
-        _stop = {"the", "a", "an", "of", "in", "on", "for", "to", "is", "are",
-                 "with", "and", "or", "any", "all", "every", "this", "that",
-                 "what", "which", "find", "show", "list", "look", "through",
-                 "files", "file", "folder", "data", "csv", "json"}
-        expanded = {t for t in expanded if t and t not in _stop and len(t) > 1}
+        # Module-level _SEARCH_STOP_TOKENS — same set used to gate the
+        # semantic_expand call earlier in this method, so we don't
+        # spend CPU on stop-word expansions whose tokens we'd just
+        # filter out here anyway.
+        expanded = {t for t in expanded if t
+                    and t not in _SEARCH_STOP_TOKENS
+                    and len(t) > 1}
         if not expanded:
             return [], fuzzy_matches
 
@@ -893,6 +1797,14 @@ class VaultIndex:
         cand: List[Tuple[str, Dict[str, Any]]] = []
         for spath, rec in self.records.items():
             if folder and folder.lower() not in spath.lower():
+                continue
+            # Defense-in-depth: skip records with no indexing surface.
+            # _index_file now drops these at build time, but old index
+            # JSONs from previous app versions may still contain stub
+            # records. Surfacing them as [VAULT MATCH] blocks with
+            # empty content was the original "model says no access"
+            # bug — guard at the search layer too.
+            if not _record_has_content(rec):
                 continue
             cand.append((spath, rec))
         if not cand:
@@ -1005,15 +1917,48 @@ class VaultIndex:
         *,
         max_files: Optional[int] = None,
         force: bool = False,
+        topics_only: bool = False,
+        batch_size: int = 4,
         on_progress: Optional[Any] = None,
     ) -> int:
         """Fill in description + topics for every record that doesn't have
         them yet. Returns the count of records updated.
 
-        - max_files caps how many we touch this call (useful from the GUI
-          to do background work in small batches).
-        - force=True regenerates even records that already have a desc.
-        - on_progress(i, total, name) callable runs once per record.
+        Performance characteristics on CPU-only inference (the common
+        case — the bottleneck is the model, not the index):
+
+          • Tabular records (csv / tsv / parquet / excel / sqlite /
+            duckdb) get description + topics generated DETERMINISTICALLY
+            from their schema. Zero model calls. Instant per file.
+            Topics come from column / table / sheet names — already the
+            most-discriminative tokens for that kind of file.
+
+          • Non-tabular records (json / bson / text / pdf / markdown)
+            still need the model. Those calls are now BATCHED — up to
+            `batch_size` records per model invocation. Each batch
+            amortises ~150-300 tokens of prompt-processing overhead
+            across N records.
+
+          • `topics_only=True` skips the prose description for non-tabular
+            records too — only the 3-5 topic keywords come back. Cuts
+            generation time roughly 3x vs the full description path.
+
+          • num_predict is now sized to the actual output budget:
+              full description    = 100 tokens per record
+              topics only         = 24 tokens per record
+            (was 200 tokens per record — typical model would spend
+            150 of those producing verbose prose nobody reads.)
+
+        Parameters:
+          max_files     cap on records touched this call. Useful from
+                        the GUI to do background work in batches with
+                        progress reporting.
+          force         regenerate even records that already have a desc.
+          topics_only   skip prose for non-tabular records; emit topics
+                        keywords only. ~3x faster on non-tabular path.
+          batch_size    records per model call (non-tabular only).
+                        Default 4. Set to 1 to disable batching.
+          on_progress   on_progress(i, total, name) called once per record.
         """
         import council_engine as ce
 
@@ -1024,65 +1969,183 @@ class VaultIndex:
         if max_files:
             candidates = candidates[:int(max_files)]
 
+        # ── A: split candidates by whether we need the model at all ────
+        # Tabular file types have all the info we need in the index
+        # record already (column names, sheet names, table schemas).
+        # No model call required.
+        tabular_kinds = {"csv", "tsv", "csv.gz", "parquet", "excel",
+                         "sqlite", "duckdb"}
+        tabular: List[Tuple[str, Dict[str, Any]]] = []
+        modelable: List[Tuple[str, Dict[str, Any]]] = []
+        for spath, rec in candidates:
+            if rec.get("type") in tabular_kinds:
+                tabular.append((spath, rec))
+            else:
+                modelable.append((spath, rec))
+
         updated = 0
-        for i, (spath, rec) in enumerate(candidates, start=1):
-            try:
-                desc, topics = self._describe_record(ce, rec)
-            except Exception as exc:
-                desc = ""
-                topics = []
-                rec["_describe_error"] = repr(exc)
+        progressed = 0
+        total = len(candidates)
+
+        # ── Tabular records: instant, no model call ────────────────────
+        for spath, rec in tabular:
+            desc, topics = _describe_from_schema(rec)
             rec["description"] = (desc or "")[:800]
-            rec["topics"] = topics[:6]
+            rec["topics"]      = (topics or [])[:6]
+            rec["_describe_via"] = "schema"
             updated += 1
+            progressed += 1
             if on_progress:
                 try:
-                    on_progress(i, len(candidates), rec.get("name", spath))
+                    on_progress(progressed, total, rec.get("name", spath))
                 except Exception:
                     pass
+
+        # ── Non-tabular records: model call, batched ──────────────────
+        bs = max(1, int(batch_size))
+        i = 0
+        while i < len(modelable):
+            chunk = modelable[i:i + bs]
+            i += bs
+            try:
+                results = self._describe_batch(
+                    ce, chunk, topics_only=topics_only,
+                )
+            except Exception as exc:
+                # Defensive: per-batch failure should not stop the whole
+                # run. Mark each record's error and move on.
+                results = [("", []) for _ in chunk]
+                for _spath, rec in chunk:
+                    rec["_describe_error"] = repr(exc)
+            for (spath, rec), (desc, topics) in zip(chunk, results):
+                rec["description"] = (desc or "")[:800]
+                rec["topics"]      = (topics or [])[:6]
+                rec["_describe_via"] = "model_batch" if bs > 1 else "model"
+                updated += 1
+                progressed += 1
+                if on_progress:
+                    try:
+                        on_progress(progressed, total, rec.get("name", spath))
+                    except Exception:
+                        pass
+
         if updated:
             self.save()
             self._vocab_cache = None  # description tokens can extend vocab
         return updated
 
-    def _describe_record(self, ce_mod, rec: Dict[str, Any]) -> Tuple[str, List[str]]:
-        """Build the prompt for one record and call the local model."""
-        name = rec.get("name", "?")
-        rtype = rec.get("type", "text")
+    # -------- Batched description generation (non-tabular only) ---------
 
-        body_lines: List[str] = [f"File: {name}", f"Type: {rtype}"]
-        if rtype == "csv":
-            headers = rec.get("headers", []) or []
-            body_lines.append("Columns: " + ", ".join(map(str, headers[:30])))
-            for row in (rec.get("sample_rows", []) or [])[:3]:
-                body_lines.append("  sample: " + str(row)[:200])
-        elif rtype == "json":
-            keys = rec.get("keys", []) or []
-            body_lines.append("Top-level keys: " + ", ".join(map(str, keys[:30])))
-            preview = (rec.get("sample_text", "") or "")[:600]
-            if preview:
-                body_lines.append("Sample:")
-                body_lines.append(preview)
+    def _describe_batch(
+        self, ce_mod, chunk: List[Tuple[str, Dict[str, Any]]],
+        *, topics_only: bool = False,
+    ) -> List[Tuple[str, List[str]]]:
+        """Describe up to N records in one model call.
+
+        Prompt asks the model to label each record by an index marker
+        (#1, #2, …) so the response can be split cleanly. If parsing
+        fails (model went off-script), we fall back to one call per
+        record so we don't lose work on the rest of the chunk.
+        """
+        if not chunk:
+            return []
+        if len(chunk) == 1:
+            # Single-record path — no batching needed.
+            _spath, rec = chunk[0]
+            return [self._describe_record_one(ce_mod, rec, topics_only=topics_only)]
+
+        # Build the batched prompt
+        record_blocks: List[str] = []
+        for idx, (_spath, rec) in enumerate(chunk, start=1):
+            record_blocks.append(_render_record_for_describe(idx, rec))
+        body = "\n\n".join(record_blocks)
+
+        if topics_only:
+            head = (
+                f"For EACH of the {len(chunk)} files below, write a "
+                f"single line of 3 to 5 lowercase keyword topics "
+                f"separated by commas. Prefix each line with the file's "
+                f"marker (#1, #2, ...) and write nothing else. No prose, "
+                f"no explanations.\n\n"
+                f"Example output:\n"
+                f"#1: revenue, customers, q3, 2024, sales\n"
+                f"#2: inventory, parts, manufacturing, costs\n\n"
+            )
+            per_record_tokens = 24
         else:
-            preview = (rec.get("sample_text", "") or "")[:600]
-            if preview:
-                body_lines.append("Sample:")
-                body_lines.append(preview)
+            head = (
+                f"For EACH of the {len(chunk)} files below, output two "
+                f"lines:\n"
+                f"  #N: <one short sentence summary, under 25 words>\n"
+                f"  TOPICS #N: <3-5 lowercase keywords, comma-separated>\n"
+                f"Use the file's marker (#1, #2, ...) so the lines can "
+                f"be parsed. No other prose.\n\n"
+            )
+            per_record_tokens = 70
 
-        prompt = (
-            "Summarize this file in one short paragraph (1-3 sentences). "
-            "Focus on what the file represents and what could be answered "
-            "from it. Then on a new line write 'TOPICS:' followed by "
-            "3-5 lowercase keywords separated by commas.\n\n"
-            + "\n".join(body_lines)
-            + "\n\nSummary:"
-        )
-        raw = ce_mod.local_chat(
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.15,
-            num_predict=200,
-            timeout=120,
-        )
+        prompt = head + body
+        num_predict = max(80, per_record_tokens * len(chunk) + 20)
+
+        raw = ""
+        try:
+            raw = ce_mod.local_chat(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                num_predict=num_predict,
+                timeout=240,
+            )
+        except Exception:
+            raw = ""
+
+        # Try to parse the batched response. On parse failure, fall
+        # back to one call per record — at least we don't lose the
+        # whole chunk's worth of work.
+        parsed = _parse_batched_response(raw, len(chunk),
+                                         topics_only=topics_only)
+        if parsed is not None:
+            return parsed
+        return [
+            self._describe_record_one(ce_mod, rec, topics_only=topics_only)
+            for _spath, rec in chunk
+        ]
+
+    def _describe_record_one(
+        self, ce_mod, rec: Dict[str, Any], *, topics_only: bool = False,
+    ) -> Tuple[str, List[str]]:
+        """Single-record fallback when batching parse fails. Same shape
+        as the legacy path but with tightened num_predict (80 not 200).
+        """
+        body = _render_record_for_describe(1, rec)
+        if topics_only:
+            prompt = (
+                "Write 3 to 5 lowercase keyword topics describing this "
+                "file, separated by commas. No prose, no explanations.\n\n"
+                + body
+                + "\n\nTopics:"
+            )
+            np_budget = 36
+        else:
+            prompt = (
+                "Summarize this file in one short sentence (under 25 "
+                "words). Then on a new line write 'TOPICS:' followed by "
+                "3-5 lowercase keywords separated by commas.\n\n"
+                + body
+                + "\n\nSummary:"
+            )
+            np_budget = 90
+        try:
+            raw = ce_mod.local_chat(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.15,
+                num_predict=np_budget,
+                timeout=120,
+            )
+        except Exception:
+            raw = ""
+        if topics_only:
+            # No prose; treat the whole response as a topics line.
+            topics = _parse_topics_line(raw or "")
+            return "", topics
         return _split_summary_and_topics(raw or "")
 
     # ---- prompt formatting ----
@@ -1128,6 +2191,14 @@ class VaultIndex:
             lines.append("type: json")
             if rec.get("keys"):
                 lines.append("keys: " + ", ".join(rec["keys"][:30]))
+            # Surface the sampled-indexing note so the writer knows
+            # the keyword surface is partial for very large JSONs.
+            # Prevents the model from confidently asserting "this file
+            # does not contain X" when the index only covered the
+            # head and tail of the file.
+            if rec.get("indexing_tier") in ("sampled_head_tail",):
+                lines.append("indexing: head+tail sample only — some keys "
+                             "deep in the file may not appear in the index")
             if rec.get("sample_text"):
                 lines.append("preview:")
                 lines.append(rec["sample_text"][:600])

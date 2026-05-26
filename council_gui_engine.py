@@ -49,6 +49,7 @@ import branding
 # icon. No-op on macOS / Linux.
 branding.set_app_user_model_id()
 import onboarding
+import task_memory as _task_memory_mod
 import specialists as _spec
 import crash_reporter
 import licensing
@@ -1027,7 +1028,8 @@ def _extract_file_paths(text):
     return paths
 
 
-def _inject_file_contents(user_text, analyst_block=None, n_ctx=None):
+def _inject_file_contents(user_text, analyst_block=None, n_ctx=None,
+                           task_memo_block=None):
     """Public entry point — wraps `_inject_file_contents_impl` in a
     defensive try/except so unexpected exceptions during injection
     (vault index corruption, network-share disconnect mid-walk,
@@ -1038,6 +1040,7 @@ def _inject_file_contents(user_text, analyst_block=None, n_ctx=None):
     try:
         return _inject_file_contents_impl(
             user_text, analyst_block=analyst_block, n_ctx=n_ctx,
+            task_memo_block=task_memo_block,
         )
     except Exception as _top_e:
         import sys as _sys_dbg
@@ -1075,7 +1078,8 @@ def _inject_file_contents(user_text, analyst_block=None, n_ctx=None):
         return (warn + "\n\n" + (user_text or "")), {}, breakdown
 
 
-def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None):
+def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
+                                task_memo_block=None):
     """Augment the user message with file/vault context before deliberation.
 
     Returns ``(augmented_text, fuzzy_matches, breakdown)`` where:
@@ -1089,10 +1093,13 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None):
 
     Priority order (lower number = higher priority; ties impossible):
       0. ``[NO DATA AVAILABLE]`` marker (must always surface)
-      1. ``[ANALYST RESULT]`` — the computed answer
-      2. ``[FILE: ...]`` — explicit user-pasted paths
-      3. ``[FOLDER: ...]`` — explicit user-pasted directory paths
-      4. ``[VAULT MATCH: ...]`` — speculative search hits (droppable)
+      1. ``[TASK MEMO]`` — RAM-resident sticky note (goal/constraints/
+         forbidden) so small models don't forget the original question
+         once the context window fills up with file blocks
+      2. ``[ANALYST RESULT]`` — the computed answer
+      3. ``[FILE: ...]`` — explicit user-pasted paths
+      4. ``[FOLDER: ...]`` — explicit user-pasted directory paths
+      5. ``[VAULT MATCH: ...]`` — speculative search hits (droppable)
 
     Per-block cap: each block is head/tail-trimmed to roughly ``n_ctx//8``
     tokens before assembly. Cumulative cap: vault-match blocks stop being
@@ -1127,8 +1134,16 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None):
     remaining = max(256, safe_input - user_cost - writer_overhead)
 
     # Priority bands — lower = higher priority
-    PRIO_NODATA, PRIO_ANALYST, PRIO_EXPLICIT, PRIO_FOLDER, PRIO_VAULT = 0, 1, 2, 3, 4
-    DROPPABLE_FROM = PRIO_VAULT   # only vault matches are droppable
+    # VAULT_SUMMARY lists EVERY matching file by name (with brief
+    # metadata: type, row count, topics) so the model knows the full
+    # set even when individual VAULT MATCH content blocks get dropped
+    # to fit the budget. Slotted ABOVE individual matches so the
+    # filename list always reaches the model. Not droppable; tiny in
+    # tokens (~15/file × ~50 files = ~750 tokens worst case).
+    (PRIO_NODATA, PRIO_TASK_MEMO, PRIO_ANALYST,
+     PRIO_EXPLICIT, PRIO_FOLDER,
+     PRIO_VAULT_SUMMARY, PRIO_VAULT) = 0, 1, 2, 3, 4, 5, 6
+    DROPPABLE_FROM = PRIO_VAULT   # only individual vault matches are droppable
 
     explicit_paths = _extract_file_paths(user_text)
     print('[DEBUG inject] explicit paths: ' + str(explicit_paths), file=_sys_dbg.stderr)
@@ -1136,6 +1151,14 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None):
     candidates = []   # list of (priority, label, content)
     fuzzy_matches = {}
     missing_paths = []
+
+    # -- Task memo (priority 1) ----------------------------------------------
+    # A short RAM-resident sticky note carrying the user's original goal +
+    # constraints + forbidden actions. Re-injected on every turn so even
+    # if later context blocks push the user's typed message past the
+    # window's tail, the model still sees what was asked. ~60-100 tokens.
+    if task_memo_block:
+        candidates.append((PRIO_TASK_MEMO, "[TASK MEMO]", task_memo_block))
 
     # -- Analyst result (priority 2) ----------------------------------------
     if analyst_block:
@@ -1175,19 +1198,73 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None):
                 # pull from 5 to 1 — the analyst's CSV is the authoritative
                 # source and 5 fuzzy matches just consume budget.
                 k = 1 if analyst_block else 5
-                hits, fuzzy_matches = idx.search(user_text, k=k, folder=folder_scope)
-                print('[DEBUG inject] vault hits: '
-                      + str([(round(s, 2), h.get("name")) for s, h in hits]),
+                # Semantic expansion via the local model: when a query
+                # term isn't in the vault's vocab, the index calls the
+                # model to ask "which of these vocab tokens belong in
+                # the queried category?" The model decides per-vault
+                # (so "metals" returns "promethium" only if it's
+                # actually in this user's files). Cached on disk; one
+                # call per novel concept ever.
+                def _semantic_llm_call(prompt: str) -> str:
+                    import council_engine as _ce_sem
+                    return _ce_sem.local_chat(
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.0,
+                        num_predict=180,
+                        timeout=45,
+                    )
+                # We pull k + TAIL_K total hits. The top-k get FULL
+                # [VAULT MATCH] content blocks; the rest go into a
+                # single compact [VAULT SEARCH SUMMARY] block that
+                # lists every matching file by name + brief metadata.
+                # This is the fix for the "model only sees 5 files
+                # even though 47 match" failure mode: the summary is
+                # ~15 tokens per file, so 50 files cost ~750 tokens
+                # vs ~2000 tokens for 5 full blocks. The model now
+                # KNOWS the full set of matching files even when only
+                # a few get full content.
+                TAIL_K = 45
+                all_hits, fuzzy_matches = idx.search(
+                    user_text, k=k + TAIL_K, folder=folder_scope,
+                    llm_call=_semantic_llm_call,
+                )
+                # Drop any hit that's already explicit (won't happen
+                # in practice — we skip vault search entirely when
+                # explicit_paths is non-empty — but safe to keep the
+                # filter for future call sites).
+                all_hits = [(s, r) for s, r in all_hits
+                            if r.get("path") not in explicit_paths]
+                full_hits = all_hits[:k]
+                tail_hits = all_hits[k:]
+
+                print('[DEBUG inject] vault hits: total='
+                      + str(len(all_hits))
+                      + ' full=' + str(len(full_hits))
+                      + ' tail=' + str(len(tail_hits)),
                       file=_sys_dbg.stderr)
                 if fuzzy_matches:
                     print('[DEBUG inject] fuzzy: ' + repr(fuzzy_matches),
                           file=_sys_dbg.stderr)
-                for _score, rec in hits:
-                    if rec.get("path") in explicit_paths:
-                        continue
+
+                # Full-content matches first — same as before.
+                for _score, rec in full_hits:
                     vblock = idx.summary_block(rec)
                     name = rec.get("name") or "?"
                     candidates.append((PRIO_VAULT, f"[VAULT MATCH: {name}]", vblock))
+
+                # Summary block — only when there's a tail to surface.
+                # If the search returned ≤k hits the model already sees
+                # everything; adding a redundant summary would just be
+                # noise.
+                if tail_hits:
+                    summary_block = _build_vault_search_summary(
+                        all_hits, full_count=len(full_hits),
+                    )
+                    candidates.append((
+                        PRIO_VAULT_SUMMARY,
+                        "[VAULT SEARCH SUMMARY]",
+                        summary_block,
+                    ))
             except Exception as _e:
                 print('[DEBUG inject] vault search failed: ' + repr(_e),
                       file=_sys_dbg.stderr)
@@ -1222,7 +1299,14 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None):
     # Trimming them risks deleting the answer the user actually asked for,
     # so they are exempt from the per-block cap. EXPLICIT/FOLDER/VAULT are
     # still capped because they can be arbitrarily large (a pasted 1GB CSV).
-    UNCAPPED_PRIOS = {PRIO_NODATA, PRIO_ANALYST}
+    # NO_DATA, TASK_MEMO, and ANALYST blocks are exempt from the per-block
+    # cap. NO_DATA is tiny by construction. The task memo is intentionally
+    # short (~80 tokens) and trimming it would defeat the "remember the
+    # original question" guarantee. The analyst block is already capped at
+    # ~4KB by format_result_for_prompt; trimming further could elide the
+    # answer the user asked for.
+    UNCAPPED_PRIOS = {PRIO_NODATA, PRIO_TASK_MEMO, PRIO_ANALYST,
+                      PRIO_VAULT_SUMMARY}
     for (prio, label, content) in candidates:
         if prio in UNCAPPED_PRIOS:
             capped = content
@@ -1267,6 +1351,79 @@ _FOLDER_KEYWORD_RE = _re.compile(
     r"\bfolder[: ]+['\"]?([A-Za-z0-9_\-./\\]+)['\"]?",
     _re.IGNORECASE,
 )
+
+
+def _build_vault_search_summary(all_hits, full_count: int) -> str:
+    """Format a compact [VAULT SEARCH SUMMARY] block listing every
+    matching file by name + brief metadata. ``full_count`` is how many
+    of the hits also got an individual [VAULT MATCH] block above this
+    one — so the summary can say "showing full content for the top N".
+
+    Per-row format (keeps total cost ~15 tokens per file):
+        N.  <name>   [type, R rows]   topics: t1, t2, t3
+    or for non-tabular:
+        N.  <name>   [type, K keys]   topics: ...
+
+    The block always carries the TOTAL count and a hint that the
+    user can ask about a specific file to get its full content.
+    """
+    total = len(all_hits)
+    lines: list = ["[VAULT SEARCH SUMMARY]"]
+    lines.append(f"Total files matching the query: {total}")
+    if full_count > 0:
+        lines.append(
+            f"Full content for the top {full_count} match"
+            f"{'es' if full_count != 1 else ''} is shown in the "
+            f"[VAULT MATCH] blocks below. The remaining "
+            f"{total - full_count} match"
+            f"{'es are' if total - full_count != 1 else ' is'} "
+            f"listed by filename only — ask about a specific file "
+            f"by name to see its content."
+        )
+    else:
+        lines.append("Each entry is listed by filename only — ask "
+                     "about a specific file by name to see its content.")
+    lines.append("")
+    lines.append("Files matched (relevance-ordered):")
+
+    for i, (_score, rec) in enumerate(all_hits, start=1):
+        name = rec.get("name") or "?"
+        rtype = rec.get("type") or "?"
+        # Compact metadata that varies by type.
+        meta_bits: list = [rtype]
+        if rtype in ("csv", "tsv", "csv.gz", "parquet"):
+            rows = rec.get("rows")
+            if isinstance(rows, int):
+                meta_bits.append(f"{rows:,} rows")
+            n_cols = len(rec.get("headers") or [])
+            if n_cols:
+                meta_bits.append(f"{n_cols} cols")
+        elif rtype == "excel":
+            sheets = rec.get("sheets") or []
+            meta_bits.append(f"{len(sheets)} sheets")
+        elif rtype in ("sqlite", "duckdb"):
+            tables = rec.get("tables") or []
+            meta_bits.append(f"{len(tables)} tables")
+        elif rtype in ("json", "d3dpipeline", "bson"):
+            keys = rec.get("keys") or []
+            if keys:
+                meta_bits.append(f"{len(keys)} keys")
+            if rec.get("indexing_tier") == "sampled_head_tail":
+                meta_bits.append("sampled")
+
+        topics = rec.get("topics") or []
+        topic_str = ""
+        if topics:
+            preview = ", ".join(str(t) for t in topics[:5])
+            if len(topics) > 5:
+                preview += f", +{len(topics) - 5}"
+            topic_str = f"  topics: {preview}"
+
+        meta = ", ".join(meta_bits)
+        lines.append(f"  {i:>3}. {name}   [{meta}]{topic_str}")
+
+    lines.append("[END VAULT SEARCH SUMMARY]")
+    return "\n".join(lines)
 
 
 def _detect_folder_scope(text):
@@ -1463,7 +1620,77 @@ def _run_analyst_step_impl(query):
         print('[analyst] exec failed: ' + log[:400], file=_sys_dbg.stderr)
         return _build_analyst_failure_block(code, log), first_err, notices
 
-    table_text = _va.format_result_for_prompt(result_df, max_rows=30, max_chars=4000)
+    # Old caps (30 rows / 4000 chars) silently truncated wide analyses —
+    # asking "average column X across all CSVs in folder Y" on a 100-file
+    # vault returned a DataFrame with 100 rows but the model only saw 30.
+    # Bump the in-prompt cap to 250 rows / 12,000 chars so the model can
+    # see most or all of a per-file aggregation result. The analyst
+    # block is exempt from the per-block cap (UNCAPPED_PRIOS) and below
+    # DROPPABLE_FROM, so even at this size it never competes with vault
+    # matches for budget.
+    table_text = _va.format_result_for_prompt(
+        result_df, max_rows=250, max_chars=12000,
+    )
+
+    # Build a separate USER-FACING render of the full result (or as
+    # much as fits in a transcript box) AND save the complete DataFrame
+    # to vault/analyst_results/ so nothing is ever silently lost. The
+    # caller posts the transcript render to the chat AND mentions the
+    # saved-file path so the user can re-open the result later.
+    user_table_lines: list = []
+    full_table_path = None
+    try:
+        nrows = len(result_df)
+        ncols = len(result_df.columns)
+        user_table_lines.append(
+            f"Analyst result: {nrows:,} row{'s' if nrows != 1 else ''} "
+            f"× {ncols} column{'s' if ncols != 1 else ''}"
+        )
+        # Render up to 500 rows directly into the transcript. Beyond
+        # that, save a CSV and tell the user where it is — Tk text
+        # widgets get sluggish above a few thousand rows of text.
+        TRANSCRIPT_DISPLAY_ROWS = 500
+        if nrows <= TRANSCRIPT_DISPLAY_ROWS:
+            user_table_lines.append(
+                result_df.to_string(index=False, max_colwidth=80)
+            )
+        else:
+            user_table_lines.append(
+                result_df.head(TRANSCRIPT_DISPLAY_ROWS)
+                          .to_string(index=False, max_colwidth=80)
+            )
+            user_table_lines.append(
+                f"\n... ({nrows - TRANSCRIPT_DISPLAY_ROWS:,} more rows "
+                f"omitted from this transcript view; full table saved "
+                f"to file — see path below.)"
+            )
+
+        # Save the complete DataFrame as CSV under
+        # vault/analyst_results/<timestamp>_<rows>x<cols>.csv. Users
+        # can open it from disk to verify or share the full data.
+        try:
+            from datetime import datetime as _dt
+            stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
+            results_dir = VAULT_DIR / "analyst_results"
+            results_dir.mkdir(parents=True, exist_ok=True)
+            full_table_path = results_dir / f"{stamp}_{nrows}x{ncols}.csv"
+            result_df.to_csv(full_table_path, index=False)
+            user_table_lines.append(
+                f"\nFull table saved to: {full_table_path}"
+            )
+        except Exception as _save_exc:
+            print(f"[analyst] could not save full table: {_save_exc!r}",
+                  file=_sys_dbg.stderr)
+            full_table_path = None
+    except Exception as _render_exc:
+        print(f"[analyst] could not build user-facing table: "
+              f"{_render_exc!r}", file=_sys_dbg.stderr)
+        user_table_lines = []
+    user_table = "\n".join(user_table_lines) if user_table_lines else ""
+
+    if user_table:
+        notices.append("__ANALYST_TABLE__:" + user_table)
+
     block = (
         '[ANALYST RESULT — computed from real CSV data]\n'
         + 'pandas code:\n' + code.strip() + '\n\n'
@@ -3342,6 +3569,14 @@ class CouncilConsole(tk.Tk):
         # engine. The advanced-mode branch in _build_ui calls
         # _build_apoth_tab which sets self.apoth before the tab is added.
 
+        # RAM-resident "task memo" — a short sticky note carrying the
+        # user's original goal + constraints + forbidden actions across
+        # every turn this session. Re-injected at the TOP of the prompt
+        # on every query so small models (4K-8K context) don't forget
+        # what was asked once vault/file context pushes the user message
+        # past the window's tail. See task_memory.py for the design.
+        self.task_memory = _task_memory_mod.TaskMemory()
+
         self.current_script_name = "script"
         self._stream_buffers: Dict[str, str] = {}  # role -> partial streamed text
         self._node_refresh_id = None
@@ -3674,6 +3909,7 @@ class CouncilConsole(tk.Tk):
         self._build_vault_manager_tab()
         self._build_speech_tab()
         self._build_changelog_tab()
+        self._build_diagnostics_tab()
 
         # ── Advanced / admin tabs ──
         # Hidden by default unless explicitly enabled. Power users and
@@ -4328,7 +4564,12 @@ class CouncilConsole(tk.Tk):
         r"what'?s\s+in\s+(?:my|the)\s+vault)\s*\??\s*$", _re.IGNORECASE,
     )
     _DUPES_RE = _re.compile(
-        r"^\s*(?:find|show|list)?\s*(?:duplicate(?:s)?|duplicates?)\b",
+        # Match the vault-duplicate-finder intent. End-anchored so that
+        # "duplicate this" or "make a duplicate of X" do NOT trigger the
+        # duplicates report — those are unrelated requests that happen
+        # to start with the word. Accept "duplicate" + (s) optional,
+        # optionally followed by "file" / "files".
+        r"^\s*(?:find|show|list)?\s*duplicate(?:s|\s+files?)?\s*[.!?]?\s*$",
         _re.IGNORECASE,
     )
     _HISTORY_SEARCH_RE = _re.compile(
@@ -4344,6 +4585,18 @@ class CouncilConsole(tk.Tk):
         r"^\s*(?:build|generate|refresh)\s+(?:the\s+)?"
         r"(?:semantic\s+|llm\s+|description\s+|smart\s+)?(?:vault\s+)?"
         r"(?:index|descriptions?|summaries)\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
+    # Topics-only build: skips the prose description for non-tabular
+    # files, generating only the keyword topics. ~3x faster than the
+    # full description path on CPU-only inference. Tabular files (CSV,
+    # Excel, etc.) get schema-based descriptions either way — those
+    # don't go through the model.
+    _BUILD_TOPICS_ONLY_RE = _re.compile(
+        r"^\s*(?:build|generate|refresh)\s+(?:the\s+)?"
+        r"(?:vault\s+|file\s+)?"
+        r"(?:topics?(?:\s+only)?|tags|keywords|categories?)"
+        r"(?:\s+only)?\s*[.!?]?\s*$",
         _re.IGNORECASE,
     )
     _BUILD_EMBEDDINGS_RE = _re.compile(
@@ -4408,14 +4661,93 @@ class CouncilConsole(tk.Tk):
         _re.IGNORECASE,
     )
 
+    # ── Task-memo meta-commands ───────────────────────────────────────
+    # "show memo" / "what's the task memo" — render the current memo
+    # without re-condensing (useful for debugging a misread intent).
+    # "reset memo" / "forget memo" / "new task" — drop the memo entirely
+    # so the NEXT user query starts fresh instead of inheriting the
+    # previous goal/constraints.
+    _SHOW_MEMO_RE = _re.compile(
+        r"^\s*(?:"
+        r"show\s+(?:task\s+)?memo"
+        r"|(?:task\s+)?memo\s+status"
+        r"|what(?:'s|\s+is)\s+(?:the\s+)?(?:task\s+)?memo"
+        r"|display\s+(?:task\s+)?memo"
+        r")\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+    _RESET_MEMO_RE = _re.compile(
+        r"^\s*(?:"
+        r"reset\s+(?:task\s+)?memo"
+        r"|forget\s+(?:task\s+)?memo"
+        r"|clear\s+(?:task\s+)?memo"
+        r"|new\s+task"
+        r"|new\s+question"
+        r"|start\s+over"
+        r")\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
+
+    # ── Learned-synonym cache inspection / reset ─────────────────────
+    # The vault index caches every semantic expansion the model
+    # produced ("metals" -> ["promethium", "adamantium"]) in
+    # vault/semantic_cache.json. These chat intents let the user see
+    # what the model learned about their vault, and reset the cache
+    # if they want to start over (e.g. they corrected the model's
+    # interpretation and want it re-run with different vocab).
+    _SHOW_LEARNED_RE = _re.compile(
+        r"^\s*(?:"
+        r"show\s+learned\s+(?:synonyms?|categories?)"
+        r"|(?:learned\s+)?synonyms?(?:\s+status)?"
+        r"|show\s+(?:vault\s+)?categories?"
+        r"|what\s+has\s+the\s+model\s+learned"
+        r")\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+    _CLEAR_LEARNED_RE = _re.compile(
+        r"^\s*(?:"
+        r"clear\s+learned\s+(?:synonyms?|categories?|cache)"
+        r"|reset\s+learned\s+(?:synonyms?|categories?|cache)"
+        r"|forget\s+learned\s+(?:synonyms?|categories?)"
+        r"|clear\s+semantic\s+cache"
+        r"|reset\s+semantic\s+cache"
+        r")\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
+
+    # Dependency / diagnostics chat intent — same info the Diagnostics
+    # tab shows, available via chat for users who prefer to type. Useful
+    # for sharing the full system snapshot when reporting a bug
+    # (the chat output goes into the transcript export).
+    _DIAGNOSTICS_RE = _re.compile(
+        r"^\s*(?:"
+        r"check\s+dependencies"
+        r"|check\s+deps"
+        r"|what(?:'s|\s+is)\s+missing"
+        r"|missing\s+dependencies"
+        r"|missing\s+features"
+        r"|system\s+status"
+        r"|system\s+diagnostics"
+        r"|diagnose"
+        r"|run\s+diagnostics"
+        r"|show\s+(?:dependencies|deps|diagnostics)"
+        r"|what\s+optional\s+(?:packages|features|dependencies)"
+        r")\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+
     _ELEMENT_RANKING_RE = _re.compile(
         # Matches phrasings like:
         #   what is the most common (atomic) element [in <where>]
         #   most common element(s) in data_in
         #   top atomic elements in vault
         #   rank atomic elements
+        #   list top 5 elements
+        # Trailing \s+ is inside each verb branch (rather than after the
+        # alternation) so "list top 5 elements" doesn't need a double
+        # space between "top" and "5".
         r"^\s*(?:what\s+(?:is|are)\s+(?:the\s+)?)?"
-        r"(?:most\s+common|top|rank|list\s+(?:top\s+)?)\s+"
+        r"(?:most\s+common\s+|top\s+|rank\s+|list\s+(?:top\s+)?)"
         r"(?:(\d+)\s+)?"                              # optional count
         r"(?:atomic\s+|chemical\s+)?elements?"
         r"(?:\s+(?:in|of|under|inside|within)\s+(.+?))?\s*\??\s*$",
@@ -4555,6 +4887,26 @@ class CouncilConsole(tk.Tk):
             self._context_info_response()
             return True
 
+        if self._SHOW_MEMO_RE.match(single_line):
+            self._show_task_memo_response()
+            return True
+
+        if self._RESET_MEMO_RE.match(single_line):
+            self._reset_task_memo_response()
+            return True
+
+        if self._SHOW_LEARNED_RE.match(single_line):
+            self._show_learned_synonyms_response()
+            return True
+
+        if self._CLEAR_LEARNED_RE.match(single_line):
+            self._clear_learned_synonyms_response()
+            return True
+
+        if self._DIAGNOSTICS_RE.match(single_line):
+            self._diagnostics_chat_response()
+            return True
+
         if self._DUPES_RE.match(single_line):
             groups = _vt.find_duplicate_files(VAULT_DIR)
             self._append_transcript("Writer", _vt.format_duplicates(groups), "final")
@@ -4581,6 +4933,10 @@ class CouncilConsole(tk.Tk):
 
         if self._BUILD_SEMANTIC_RE.match(single_line):
             self._build_semantic_index_response()
+            return True
+
+        if self._BUILD_TOPICS_ONLY_RE.match(single_line):
+            self._build_topics_only_response()
             return True
 
         if self._BUILD_EMBEDDINGS_RE.match(single_line):
@@ -5364,6 +5720,172 @@ class CouncilConsole(tk.Tk):
         self._append_transcript("Writer", text, "final")
         self._set_status("● idle")
 
+    def _show_task_memo_response(self):
+        """Print the current task memo to the transcript without
+        re-condensing or modifying it. Useful when the user wants to
+        spot-check the condenser's interpretation of an earlier query.
+        """
+        memo = self.task_memory.current()
+        if memo is None or memo.is_empty():
+            self._append_transcript(
+                "Writer",
+                "No task memo set yet. The next non-meta question will "
+                "create one. Type 'reset memo' any time to clear it.",
+                "final",
+            )
+            return
+        lines: list = [
+            "Current task memo",
+            "─────────────────",
+            f"goal: {memo.goal}",
+        ]
+        if memo.constraints:
+            lines.append("constraints:")
+            for c in memo.constraints:
+                lines.append(f"  • {c}")
+        if memo.forbidden:
+            lines.append("forbidden:")
+            for f in memo.forbidden:
+                lines.append(f"  • {f}")
+        lines.append("")
+        lines.append(
+            "Source query: " + (memo.raw_query[:160]
+                                + ("…" if len(memo.raw_query) > 160 else ""))
+        )
+        if memo.is_extension:
+            lines.append("(This memo extended a previous one — constraints "
+                         "inherited from the prior turn.)")
+        lines.append("")
+        lines.append(
+            "Type 'reset memo' to start fresh on the next question."
+        )
+        self._append_transcript("Writer", "\n".join(lines), "final")
+
+    def _diagnostics_chat_response(self):
+        """Render the dependency-check report into the transcript as a
+        Writer-final message. Same content as the Diagnostics tab —
+        useful for sharing in bug reports because chat output flows
+        into the transcript export.
+        """
+        try:
+            import dependency_check as _dc
+            text = _dc.render_as_text()
+        except Exception as exc:
+            text = f"dependency_check failed: {exc!r}"
+        self._append_transcript("Writer", text, "final")
+
+    def _show_learned_synonyms_response(self):
+        """Render every (term -> [tokens-from-vault]) pair the semantic
+        expansion layer has cached so far. Lets the user spot bad
+        categorizations ("ah, the model thinks 'denim' is a metal —
+        let me clear that").
+        """
+        idx = _get_vault_index()
+        if idx is None:
+            self._append_transcript(
+                "Writer", "Vault index unavailable.", "final",
+            )
+            return
+        try:
+            cache = idx._load_semantic_cache()
+        except Exception as exc:
+            self._append_transcript(
+                "Writer", f"Could not read learned synonyms: {exc!r}", "final",
+            )
+            return
+        entries = cache.get("entries", {}) if isinstance(cache, dict) else {}
+        if not entries:
+            self._append_transcript(
+                "Writer",
+                "No learned synonyms yet. The model builds these "
+                "automatically the first time you search for a category "
+                "word that isn't literally in your files "
+                "(e.g. 'metals', 'fabrics', 'weapons'). After the first "
+                "such search the result is cached on disk.\n\n"
+                "Cache file: vault/semantic_cache.json",
+                "final",
+            )
+            return
+        lines: list = [
+            "Learned semantic categories",
+            "───────────────────────────",
+            "(The model decided which of your vault's actual tokens "
+            "belong in each category. Cached per-vault on disk.)",
+            "",
+        ]
+        for term in sorted(entries):
+            expansions = entries[term] or []
+            if expansions:
+                preview = ", ".join(expansions[:10])
+                if len(expansions) > 10:
+                    preview += f", … (+{len(expansions) - 10} more)"
+                lines.append(f"  {term}  ->  {preview}")
+            else:
+                lines.append(f"  {term}  ->  (no matches in this vault)")
+        lines.append("")
+        lines.append(
+            f"Vocab hash: {cache.get('vocab_hash', '(unknown)')}"
+        )
+        lines.append(
+            "Type 'clear learned synonyms' to wipe the cache. The "
+            "next category search will recompute against the current vocab."
+        )
+        self._append_transcript("Writer", "\n".join(lines), "final")
+
+    def _clear_learned_synonyms_response(self):
+        """Wipe the semantic-expansion cache file. The next category
+        query will recompute fresh against the current vocab."""
+        idx = _get_vault_index()
+        if idx is None:
+            self._append_transcript(
+                "Writer", "Vault index unavailable.", "final",
+            )
+            return
+        try:
+            cache_path = idx._semantic_cache_path()
+        except Exception:
+            self._append_transcript(
+                "Writer", "Could not locate semantic cache file.", "final",
+            )
+            return
+        if cache_path.exists():
+            try:
+                cache_path.unlink()
+                self._append_transcript(
+                    "Writer",
+                    "Learned synonyms cleared. The next category-shaped "
+                    "search will ask the model fresh.",
+                    "final",
+                )
+                return
+            except Exception as exc:
+                self._append_transcript(
+                    "Writer", f"Could not delete cache: {exc!r}", "final",
+                )
+                return
+        self._append_transcript(
+            "Writer", "No learned-synonym cache to clear.", "final",
+        )
+
+    def _reset_task_memo_response(self):
+        """Drop the current task memo. Next user query starts fresh —
+        no constraints / forbidden are inherited."""
+        had_memo = not self.task_memory.current().is_empty()
+        self.task_memory.reset()
+        if had_memo:
+            self._append_transcript(
+                "Writer",
+                "Task memo cleared. The next question will start a new "
+                "memo from scratch — no constraints carried over.",
+                "final",
+            )
+        else:
+            self._append_transcript(
+                "Writer",
+                "No task memo to clear.",
+                "final",
+            )
+
     def _context_info_response(self):
         """Report current context-window configuration and last-query usage.
 
@@ -5449,6 +5971,28 @@ class CouncilConsole(tk.Tk):
                 lines.append("  dropped (budget exceeded):")
                 for label, cost in bd["dropped"]:
                     lines.append(f"    {label}  ~{cost:,} tokens  (dropped)")
+
+        # Task-memo status — show whether the RAM-resident sticky note
+        # is active so the user sees what's being re-injected on every
+        # turn (and can `reset memo` if they want to start fresh).
+        try:
+            memo = self.task_memory.current()
+        except Exception:
+            memo = None
+        if memo is not None and not memo.is_empty():
+            lines.append("")
+            lines.append("Task memo (re-injected every turn):")
+            lines.append(f"  goal: {memo.goal[:120]}"
+                         + ("…" if len(memo.goal) > 120 else ""))
+            if memo.constraints:
+                lines.append(f"  constraints: {len(memo.constraints)} "
+                             f"({'; '.join(memo.constraints[:2])}"
+                             + ('; …' if len(memo.constraints) > 2 else '')
+                             + ')')
+            if memo.forbidden:
+                lines.append(f"  forbidden:   {len(memo.forbidden)}")
+            lines.append("  (Type 'show memo' for full text, "
+                         "'reset memo' to clear.)")
 
         lines.append("")
         lines.append("To raise the cap before launch:")
@@ -5582,6 +6126,76 @@ class CouncilConsole(tk.Tk):
                 self._append_transcript(
                     "Writer",
                     f"Semantic index complete — {n} files described.",
+                    "final",
+                ),
+                self._set_status("● idle"),
+            ))
+
+        import threading as _th
+        _th.Thread(target=_worker, daemon=True).start()
+
+    def _build_topics_only_response(self):
+        """Faster description build — generates ONLY the keyword topics
+        (no prose summary). On CPU-only inference this is roughly 3x
+        faster than the full description path on the same record set,
+        because the model emits ~24 tokens instead of ~80 per file.
+
+        Tabular files (CSV / Excel / Parquet / SQLite / DuckDB) get
+        their description + topics from the schema with zero model
+        calls regardless — that's pure dict work.
+        """
+        idx = _get_vault_index()
+        if idx is None:
+            self._append_transcript(
+                "Writer", "Vault index is unavailable.", "final",
+            )
+            return
+        try:
+            idx.rebuild()
+        except Exception:
+            pass
+        pending = sum(1 for r in idx.records.values()
+                      if not r.get("topics"))
+        if pending == 0:
+            self._append_transcript(
+                "Writer",
+                f"All {len(idx.records)} indexed files already have "
+                f"topic keywords. (Type 'refresh topics' to regenerate.)",
+                "final",
+            )
+            self._set_status("● idle")
+            return
+        self._append_transcript(
+            "Council",
+            f"Building topic keywords for {pending} files. Tabular "
+            f"files are instant; JSON/text files batch through the "
+            f"model in groups of 4 for ~3x faster generation.",
+            "observation",
+        )
+        self._set_status("● topics…", "#cba6f7")
+
+        def _worker():
+            def _progress(i, total, name):
+                if i % 5 == 0 or i == total:
+                    self.after(0, lambda: self._set_status(
+                        f"● topics {i}/{total}…", "#cba6f7"
+                    ))
+            try:
+                n = idx.generate_descriptions(
+                    topics_only=True, batch_size=4, on_progress=_progress,
+                )
+            except Exception as exc:
+                self.after(0, lambda: (
+                    self._append_transcript("Writer",
+                                            f"topic build failed: {exc!r}",
+                                            "final"),
+                    self._set_status("● idle"),
+                ))
+                return
+            self.after(0, lambda: (
+                self._append_transcript(
+                    "Writer",
+                    f"Topic keywords complete — {n} files tagged.",
                     "final",
                 ),
                 self._set_status("● idle"),
@@ -8873,8 +9487,15 @@ class CouncilConsole(tk.Tk):
         self._idx_status_var.set("Walking vault…")
 
         def _worker():
+            def _on_progress(done: int, total: int, name: str):
+                # Trim very long filenames so the status bar doesn't
+                # wrap or look ugly. Bounce to the UI thread via
+                # self.after — Tk widgets are not thread-safe.
+                short = name if len(name) <= 48 else name[:45] + "…"
+                self.after(0, lambda: self._idx_status_var.set(
+                    f"Indexing {done}/{total} — {short}"))
             try:
-                n = idx.rebuild()
+                n = idx.rebuild(progress=_on_progress)
             except Exception as exc:
                 self.after(0, lambda: self._idx_status_var.set(
                     f"Keyword index failed: {exc!r}"))
@@ -9384,6 +10005,160 @@ class CouncilConsole(tk.Tk):
     # Reads `git log` and `git show` from the repo root so users can see
     # exactly what shipped between launches. Runs git as a subprocess so a
     # broken Git install is just a status message, not a tab failure.
+
+    # ============================
+    # Diagnostics tab — system + optional-dependency status
+    # ============================
+    # Surfaces every optional dependency the app might use plus the
+    # core environment (Python version, n_ctx, physical cores). Lets a
+    # user see at a glance whether speech / embeddings / PDF / etc. are
+    # available, and exactly what pip command would install each
+    # missing feature. The actual install is deliberately the user's
+    # job — running pip from inside a packaged .exe is dangerous (it
+    # might write to the wrong python).
+
+    def _build_diagnostics_tab(self):
+        self.tab_diagnostics = ttk.Frame(self.nb)
+        self.nb.add(self.tab_diagnostics, text="🔧 Diagnostics")
+
+        # Top bar — refresh + status summary
+        bar = ttk.Frame(self.tab_diagnostics)
+        bar.pack(fill="x", padx=6, pady=(6, 4))
+        ttk.Button(bar, text="⟳ Re-check",
+                   command=self._diagnostics_refresh).pack(side="left")
+        ttk.Button(bar, text="📋 Copy report",
+                   command=self._diagnostics_copy_to_clipboard
+                   ).pack(side="left", padx=4)
+        self._diagnostics_status_var = tk.StringVar(value="")
+        ttk.Label(bar, textvariable=self._diagnostics_status_var,
+                  foreground="#9a9a9a").pack(side="right")
+
+        # Scrollable text widget for the full report
+        text_frame = ttk.Frame(self.tab_diagnostics)
+        text_frame.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        vsb = ttk.Scrollbar(text_frame, orient="vertical")
+        vsb.pack(side="right", fill="y")
+        self._diagnostics_text = tk.Text(
+            text_frame, wrap="word",
+            font=("Consolas", 10),
+            yscrollcommand=vsb.set,
+            bg="#1a1414", fg="#e6e6e6",
+            insertbackground="#e6e6e6",
+        )
+        self._diagnostics_text.pack(fill="both", expand=True)
+        vsb.config(command=self._diagnostics_text.yview)
+
+        # Colour tags for the report — green for available, red for
+        # missing, dim for the descriptive lines.
+        self._diagnostics_text.tag_config("ok",       foreground="#a6e3a1")
+        self._diagnostics_text.tag_config("missing",  foreground="#f38ba8")
+        self._diagnostics_text.tag_config("dim",      foreground="#9a9a9a")
+        self._diagnostics_text.tag_config("install",  foreground="#89b4fa")
+        self._diagnostics_text.tag_config("section",
+                                          font=("Consolas", 10, "bold"))
+
+        # Render on first show
+        self._diagnostics_refresh()
+
+    def _diagnostics_refresh(self):
+        """Re-run the dependency check and repaint the report."""
+        try:
+            import dependency_check as _dc
+        except Exception as exc:
+            self._diagnostics_text.configure(state="normal")
+            self._diagnostics_text.delete("1.0", "end")
+            self._diagnostics_text.insert("1.0",
+                f"Could not load dependency_check module: {exc!r}")
+            self._diagnostics_text.configure(state="disabled")
+            return
+
+        statuses = _dc.check_all()
+        ok_count = sum(1 for s in statuses if s.ok)
+        missing  = [s for s in statuses if not s.ok]
+
+        self._diagnostics_text.configure(state="normal")
+        self._diagnostics_text.delete("1.0", "end")
+
+        # System summary
+        self._diagnostics_text.insert("end", "System summary\n", "section")
+        self._diagnostics_text.insert("end", "─" * 60 + "\n", "dim")
+        for line in _dc.system_summary():
+            self._diagnostics_text.insert("end", f"  {line}\n")
+        self._diagnostics_text.insert("end", "\n")
+
+        # Missing features grouped by impact — most actionable info up top
+        if missing:
+            self._diagnostics_text.insert(
+                "end",
+                f"Missing optional dependencies ({len(missing)})\n",
+                "section",
+            )
+            self._diagnostics_text.insert("end", "─" * 60 + "\n", "dim")
+            by_impact = {"high": [], "med": [], "low": []}
+            for s in missing:
+                by_impact.setdefault(s.spec.impact, []).append(s)
+            for impact_key, label in (("high", "High impact"),
+                                       ("med",  "Medium impact"),
+                                       ("low",  "Low impact")):
+                bucket = by_impact.get(impact_key, [])
+                if not bucket:
+                    continue
+                self._diagnostics_text.insert("end", f"\n  {label}\n", "section")
+                for s in bucket:
+                    self._diagnostics_text.insert("end", f"    ✗ ", "missing")
+                    self._diagnostics_text.insert("end", f"{s.spec.name}\n")
+                    self._diagnostics_text.insert("end",
+                        f"        {s.spec.description}\n", "dim")
+                    self._diagnostics_text.insert("end",
+                        f"        Missing: {', '.join(s.missing)}\n", "dim")
+                    self._diagnostics_text.insert("end", "        Install: ", "dim")
+                    self._diagnostics_text.insert("end",
+                        f"{s.spec.install}\n", "install")
+            self._diagnostics_text.insert("end", "\n")
+        else:
+            self._diagnostics_text.insert("end",
+                "All optional dependencies are installed.\n\n", "ok")
+
+        # Available features
+        available = [s for s in statuses if s.ok]
+        if available:
+            self._diagnostics_text.insert(
+                "end",
+                f"Available optional features ({ok_count})\n",
+                "section",
+            )
+            self._diagnostics_text.insert("end", "─" * 60 + "\n", "dim")
+            for s in available:
+                self._diagnostics_text.insert("end", "  ✓ ", "ok")
+                self._diagnostics_text.insert("end", f"{s.spec.name}\n")
+            self._diagnostics_text.insert("end", "\n")
+
+        # Footer
+        self._diagnostics_text.insert("end",
+            "To install missing features, run their pip commands in the "
+            "same Python environment that runs this app. Restart the "
+            "app afterward to pick up the changes.\n", "dim")
+
+        self._diagnostics_text.configure(state="disabled")
+        self._diagnostics_status_var.set(
+            f"✓ {ok_count} available  ·  ✗ {len(missing)} missing"
+        )
+
+    def _diagnostics_copy_to_clipboard(self):
+        """Put the full plain-text report on the clipboard so users can
+        paste it into a bug report or share it on Discord/email."""
+        try:
+            import dependency_check as _dc
+            report = _dc.render_as_text()
+        except Exception as exc:
+            report = f"dependency_check unavailable: {exc!r}"
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(report)
+            self.update()
+            self._diagnostics_status_var.set("✓ Copied to clipboard")
+        except Exception as exc:
+            self._diagnostics_status_var.set(f"copy failed: {exc!r}")
 
     def _build_changelog_tab(self):
         self.tab_changelog = ttk.Frame(self.nb)
@@ -10735,7 +11510,35 @@ class CouncilConsole(tk.Tk):
         # everything to the Grapher).
         original_user_text = user_text
 
-        # ── Analyst step first ────────────────────────────────────────────
+        # ── Task-memo condense (runs FIRST, very fast) ─────────────────────
+        # Re-condense the per-session memo from this turn's question so
+        # the writer always sees a fresh goal+constraints+forbidden block
+        # at the TOP of its context, even when the rest of the window is
+        # eaten by file dumps. Post the result to the transcript so the
+        # user can spot a misread before the model answers.
+        try:
+            def _condense_call(prompt: str) -> str:
+                # Small fast call; temperature 0 for stable extraction.
+                import council_engine as _ce
+                return _ce.local_chat(
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.0,
+                    num_predict=240,
+                    timeout=45,
+                )
+            _memo = self.task_memory.update(original_user_text, llm_call=_condense_call)
+        except Exception as _memo_exc:
+            print(f"[TaskMemory] update failed: {_memo_exc!r}")
+            _memo = self.task_memory.current()
+        if _memo and not _memo.is_empty():
+            self._append_transcript(
+                "Council",
+                self.task_memory.render_transcript_line(),
+                "observation",
+            )
+        _task_memo_block = self.task_memory.render_injection_block() or None
+
+        # ── Analyst step ────────────────────────────────────────────────
         # The analyst computes deterministic answers from data ("how many",
         # "what's the sum"); when it succeeds, the injection layer reduces
         # vault-match candidates from 5 to 1 (#7) so the answer doesn't
@@ -10748,8 +11551,23 @@ class CouncilConsole(tk.Tk):
         # Surface resolver notices FIRST so the user sees what the analyst
         # interpreted before the result / error message — that order makes
         # it obvious when the analyst grabbed the wrong file or scope.
+        # Notices include two kinds:
+        #   • Plain observation strings (resolver hints, scope notes, etc.)
+        #   • A special "__ANALYST_TABLE__:<...>" payload carrying the
+        #     user-facing rendering of the analyst's full DataFrame. We
+        #     surface that as an "observation" too but with a clear
+        #     "Analyst result table:" header so the user sees the
+        #     actual numbers, not just the model's prose summary.
         for _note in (_analyst_notices or []):
-            self._append_transcript("Council", _note, "observation")
+            if isinstance(_note, str) and _note.startswith("__ANALYST_TABLE__:"):
+                _table = _note[len("__ANALYST_TABLE__:"):]
+                self._append_transcript(
+                    "Council",
+                    "Analyst result table:\n" + _table,
+                    "observation",
+                )
+            else:
+                self._append_transcript("Council", _note, "observation")
         if _analyst_block and not _analyst_err:
             self._append_transcript("Council", "Computing from data...", "observation")
         elif _analyst_err:
@@ -10774,6 +11592,7 @@ class CouncilConsole(tk.Tk):
             _n_ctx = 4096
         augmented, fuzzy_matches, _injection_breakdown = _inject_file_contents(
             user_text, analyst_block=_analyst_block, n_ctx=_n_ctx,
+            task_memo_block=_task_memo_block,
         )
         self._last_injection_breakdown = _injection_breakdown
         # Surface defensive-wrapper failures to the transcript. When the
