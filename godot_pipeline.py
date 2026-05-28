@@ -178,8 +178,21 @@ def parse_scene(path: Any) -> ParsedScene:
 _SCRIPT_CLASS_NAME_RE = re.compile(r'^\s*class_name\s+([A-Za-z_][A-Za-z0-9_]*)')
 _SCRIPT_EXTENDS_RE   = re.compile(r'^\s*extends\s+([A-Za-z_][A-Za-z0-9_.]*)')
 _SCRIPT_SIGNAL_RE    = re.compile(r'^\s*signal\s+([A-Za-z_][A-Za-z0-9_]*)\s*(\(.*\))?')
-_SCRIPT_FUNC_RE      = re.compile(r'^\s*func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)')
-_SCRIPT_EXPORT_RE    = re.compile(r'^\s*@export\s+var\s+([A-Za-z_][A-Za-z0-9_]*)')
+# ``static func`` is the common variant we used to miss. ``@rpc`` etc.
+# live on the line above the func declaration so they don't need to
+# be in this regex.
+_SCRIPT_FUNC_RE      = re.compile(
+    r'^\s*(?:static\s+)?func\s+([A-Za-z_][A-Za-z0-9_]*)\s*\((.*?)\)'
+)
+# GDScript 4 exports come in many flavours: ``@export``,
+# ``@export_range(0, 100)``, ``@export_enum("a", "b")``, ``@export_file``,
+# ``@export_node_path``, ``@export_multiline``, etc. They all share the
+# ``@export[_suffix](optional_args)? var name`` shape. The previous regex
+# only caught the bare ``@export``; this generalises to every variant.
+_SCRIPT_EXPORT_RE    = re.compile(
+    r'^\s*@export(?:_[A-Za-z_]+)?(?:\s*\([^)]*\))?\s+var\s+'
+    r'([A-Za-z_][A-Za-z0-9_]*)'
+)
 
 
 @dataclass
