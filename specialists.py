@@ -185,8 +185,8 @@ def default_specialists() -> List[Specialist]:
 
     Game-development focused. The previous data-analyst trio (Sales /
     Inventory / Customer) lived here on Work-Build; on the game-dev
-    branch we seed a single Game Designer lens. Genre Analyst and
-    Steam Market Analyst land in later phases.
+    branch we seed a Game Designer, Genre Analyst, and Steam Market
+    Analyst as the default specialist roster.
     Users can edit, disable, or delete freely in the Specialists tab.
     """
     return [
@@ -225,6 +225,69 @@ def default_specialists() -> List[Specialist]:
                 "existing game by name, make sure it actually exists "
                 "and is well-known enough that the user has heard of "
                 "it; otherwise say 'a game in the style of …' instead."
+            ),
+            base_personality="writer",
+        ),
+        Specialist(
+            id="genre_analyst",
+            name="Genre Analyst",
+            icon="🎭",
+            description=(
+                "Tropes, conventions, comparable titles, market "
+                "positioning — what makes a genre identifiable."
+            ),
+            domain_keywords=[
+                "genre", "sub-genre", "trope", "convention",
+                "comparable", "comparables", "comp", "comps",
+                "similar to", "like", "positioning", "audience",
+                "platformer", "metroidvania", "roguelike", "roguelite",
+                "shooter", "fps", "rpg", "jrpg", "puzzle",
+                "visual novel", "vn", "deck builder", "deckbuilder",
+                "city builder", "survival", "horror", "walking sim",
+                "rhythm", "racing", "sports", "strategy", "4x",
+                "tactics", "bullet hell", "twin-stick",
+            ],
+            system_prompt_overlay=(
+                "You are a games genre analyst. When asked about a "
+                "concept, identify which sub-genre it lands in, name "
+                "three to five comparable titles that actually exist "
+                "(do not invent fake names — if you're unsure, say "
+                "'in the style of X' instead), and call out which "
+                "expected conventions of that sub-genre the concept "
+                "satisfies, subverts, or omits. End every answer with "
+                "one sentence on positioning: who buys this genre and "
+                "what makes them choose one game over another."
+            ),
+            base_personality="writer",
+        ),
+        Specialist(
+            id="steam_market_analyst",
+            name="Steam Market Analyst",
+            icon="📈",
+            description=(
+                "Reads cached Steam data to answer market questions "
+                "with citations — never invents numbers."
+            ),
+            domain_keywords=[
+                "steam", "steamspy", "steamcharts", "ccu",
+                "concurrent players", "owners", "owned",
+                "revenue", "sales", "earnings", "market",
+                "trending", "top sellers", "top selling",
+                "what sells", "what's hot", "what is hot",
+                "comparable revenue", "indie revenue",
+            ],
+            system_prompt_overlay=(
+                "You are a Steam-market analyst. ABSOLUTE RULE: never "
+                "invent specific numeric values (player counts, owners, "
+                "revenue, prices). If a Steam Analyst Result block is "
+                "in your context, base your answer on those computed "
+                "values and cite them. If no analyst block is present, "
+                "tell the user 'I have no fresh cache for this — open "
+                "the 📈 Steam Market tab and pull current data' rather "
+                "than guessing. When discussing trends, distinguish "
+                "between 'currently popular' (CCU snapshot), 'recently "
+                "trending' (2-week deltas), and 'all-time strong' "
+                "(lifetime owners) — they answer different questions."
             ),
             base_personality="writer",
         ),

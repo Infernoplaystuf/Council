@@ -3715,6 +3715,7 @@ class CouncilConsole(tk.Tk):
         self._build_council_tab()
         self._build_godot_workspace_tab()   # Anvil — phase C-lite, customer-facing
         self._build_game_concepts_tab()     # Anvil — phase B,     customer-facing
+        self._build_steam_market_tab()      # Anvil — phase D,     customer-facing
         self._build_dream3d_tab()
         self._build_grapher_tab()
         self._build_specialists_tab()
@@ -3737,14 +3738,9 @@ class CouncilConsole(tk.Tk):
             self._build_vault_health_tab()
             self._build_apoth_tab()
 
-        # ── Anvil game-dev placeholder tabs ──
-        # Steam Market is still a stub (phase D) so it stays hidden
-        # behind COUNCIL_ADVANCED=1 — the "coming soon" pane would
-        # otherwise mislead the customer flow. Promoted to the
-        # always-on flow as it lands.
-        # Godot Workspace + Game Concepts were promoted above.
-        if _ADVANCED_MODE:
-            self._build_steam_market_tab()
+        # ── All Anvil game-dev tabs (Godot Workspace, Game Concepts,
+        # Steam Market) are now in the customer-facing flow above.
+        # No phase-A/B/C/D/E stubs left behind COUNCIL_ADVANCED=1.
 
     # ---- Backend strip (model backend selector) ----
 
@@ -10907,21 +10903,260 @@ class CouncilConsole(tk.Tk):
         except Exception as exc:
             print(f"[Game Concepts] stage to council failed: {exc!r}")
 
+    # ---- Steam Market tab (phase D) ----
+
     def _build_steam_market_tab(self):
-        """Steam Market — Phase D lands SteamSpy/SteamCharts/Web-API
-        ingestion + the Steam Market Analyst. Stub for now."""
+        """Steam Market — pull cached Steam data and ask the
+        Steam Market Analyst computed-not-invented questions.
+
+        Network policy:
+          • All HTTP via urllib (stdlib)
+          • Strict opt-in: every Pull button confirms before
+            making requests
+          • Cache lives under vault/steam/ (protected from the
+            council — the analyst is the only reader)
+        """
         import steam_ingest, steam_analyst  # noqa: F401
-        self._add_coming_soon_tab(
-            "tab_steam_market",
-            "📈 Steam Market",
-            "Steam Market",
-            "Phase D",
-            "Pull current Steam data (SteamSpy + SteamCharts, or your "
-            "own Steam Web API key) into vault/steam/. The Steam "
-            "Market Analyst is the only thing that reads the raw "
-            "cache — it surfaces deterministic answers with "
-            "citations, never invented numbers.",
+        self.tab_steam_market = ttk.Frame(self.nb)
+        self.nb.add(self.tab_steam_market, text="📈 Steam Market")
+
+        self._sm_busy = False
+
+        # Top strip — pull controls
+        strip = ttk.Frame(self.tab_steam_market)
+        strip.pack(fill="x", padx=6, pady=(6, 4))
+        ttk.Label(strip, text="Pull current data:").pack(side="left")
+        self._sm_pull_top_btn = ttk.Button(
+            strip, text="🌐 Top sellers (SteamSpy + Charts)",
+            command=lambda: self._sm_pull("top"),
         )
+        self._sm_pull_top_btn.pack(side="left", padx=(8, 4))
+        ttk.Label(strip, text="Genre:").pack(side="left", padx=(8, 2))
+        self._sm_genre_var = tk.StringVar()
+        ttk.Entry(strip, textvariable=self._sm_genre_var, width=18).pack(
+            side="left", padx=(0, 4))
+        self._sm_pull_genre_btn = ttk.Button(
+            strip, text="🌐 Pull genre",
+            command=lambda: self._sm_pull("genre"),
+        )
+        self._sm_pull_genre_btn.pack(side="left")
+        self._sm_status_var = tk.StringVar(value="(no recent pulls)")
+        ttk.Label(strip, textvariable=self._sm_status_var,
+                  foreground="#a98a8a").pack(side="right")
+
+        # Body — horizontal pane: cache list | Q&A panel
+        body = tk.PanedWindow(self.tab_steam_market, orient="horizontal",
+                              bg="#1a1414", sashwidth=6)
+        body.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # Left — cache file list
+        left = ttk.Frame(body)
+        body.add(left, width=320, minsize=240)
+        ttk.Label(left, text="Cached pulls (newest first)").pack(
+            anchor="w", padx=2, pady=(0, 2))
+        cache_row = ttk.Frame(left)
+        cache_row.pack(fill="both", expand=True)
+        self._sm_cache_box = tk.Listbox(
+            cache_row, bg="#0f0c0c", fg="#d4d4d4",
+            selectbackground="#4a2626", selectforeground="#d4d4d4",
+            font=("Consolas", 9), activestyle="none",
+        )
+        clsb = ttk.Scrollbar(cache_row, orient="vertical",
+                              command=self._sm_cache_box.yview)
+        self._sm_cache_box.configure(yscrollcommand=clsb.set)
+        self._sm_cache_box.pack(side="left", fill="both", expand=True)
+        clsb.pack(side="right", fill="y")
+        cache_actions = ttk.Frame(left)
+        cache_actions.pack(fill="x", pady=(4, 0))
+        ttk.Button(cache_actions, text="⟳ Refresh",
+                   command=self._sm_refresh_cache).pack(side="left")
+        ttk.Button(cache_actions, text="📂 Open cache folder",
+                   command=lambda: self._open_in_explorer(
+                       VAULT_DIR / "steam")).pack(side="left", padx=4)
+
+        # Right — Q&A panel
+        right = ttk.Frame(body)
+        body.add(right, minsize=420)
+        ttk.Label(right, text="Ask the Steam Market Analyst").pack(
+            anchor="w", padx=2, pady=(0, 2))
+        q_row = ttk.Frame(right)
+        q_row.pack(fill="x", pady=(0, 4))
+        self._sm_question_var = tk.StringVar()
+        q_entry = ttk.Entry(q_row, textvariable=self._sm_question_var)
+        q_entry.pack(side="left", fill="x", expand=True)
+        q_entry.bind("<Return>", lambda e: self._sm_ask())
+        ttk.Button(q_row, text="📊 Compute",
+                   command=self._sm_ask).pack(side="left", padx=(4, 0))
+
+        # Answer pane
+        ans_row = ttk.Frame(right)
+        ans_row.pack(fill="both", expand=True)
+        self._sm_answer = tk.Text(
+            ans_row, wrap="word",
+            bg="#0a0808", fg="#d4d4d4", font=("Consolas", 10),
+            state="disabled",
+        )
+        asb = ttk.Scrollbar(ans_row, orient="vertical",
+                             command=self._sm_answer.yview)
+        self._sm_answer.configure(yscrollcommand=asb.set)
+        self._sm_answer.pack(side="left", fill="both", expand=True)
+        asb.pack(side="right", fill="y")
+        self._sm_answer.tag_configure("h1", font=("Segoe UI", 11, "bold"),
+                                       foreground="#e0884a")
+        self._sm_answer.tag_configure("muted", foreground="#7a7575")
+        self._sm_answer.tag_configure("err", foreground="#ff5252")
+
+        # Send to Council button
+        send_row = ttk.Frame(right)
+        send_row.pack(fill="x", pady=(4, 0))
+        ttk.Button(send_row, text="⚖ Send this computation to the Council",
+                   command=self._sm_send_to_council).pack(side="left")
+
+        self._sm_refresh_cache()
+
+    # ── Pull ────────────────────────────────────────────────────────
+
+    def _sm_pull(self, kind: str) -> None:
+        from tkinter import messagebox
+        if self._sm_busy:
+            return
+        if kind == "top":
+            hosts = "steamspy.com, steamcharts.com, api.steampowered.com"
+            label = "top sellers"
+        else:
+            genre = self._sm_genre_var.get().strip()
+            if not genre:
+                messagebox.showinfo(
+                    "Genre needed",
+                    "Type a genre in the Genre box first (e.g. Puzzle, Roguelike).",
+                    parent=self,
+                )
+                return
+            hosts = "steamspy.com"
+            label = f"genre {genre!r}"
+        if not messagebox.askyesno(
+            "Network request",
+            f"Anvil will make HTTP requests to {hosts} to pull {label} "
+            f"into vault/steam/. Continue?",
+            parent=self,
+        ):
+            return
+        self._sm_busy = True
+        self._sm_pull_top_btn.configure(state="disabled")
+        self._sm_pull_genre_btn.configure(state="disabled")
+        self._sm_status_var.set("Pulling… (network)")
+
+        def _worker():
+            import steam_ingest as _si
+            results = []
+            try:
+                if kind == "top":
+                    results = _si.ingest_top_sellers(VAULT_DIR)
+                else:
+                    genre = self._sm_genre_var.get().strip()
+                    results = [_si.ingest_steamspy_genre(VAULT_DIR, genre)]
+            except Exception as exc:
+                print(f"[Steam Market] pull crashed: {exc!r}")
+                results = []
+
+            def _done():
+                self._sm_busy = False
+                self._sm_pull_top_btn.configure(state="normal")
+                self._sm_pull_genre_btn.configure(state="normal")
+                ok_count = sum(1 for r in results if r.ok)
+                if not results:
+                    self._sm_status_var.set("Pull crashed — see console.")
+                    return
+                if ok_count == 0:
+                    msgs = "; ".join(f"{r.source}: {r.error}" for r in results)
+                    self._sm_status_var.set(f"All pulls failed — {msgs}")
+                else:
+                    summary = ", ".join(
+                        f"{r.source}={r.record_count}" for r in results if r.ok
+                    )
+                    failed = [r for r in results if not r.ok]
+                    msg = f"Pulled {ok_count} source(s) — {summary}"
+                    if failed:
+                        msg += " (partial: " + "; ".join(
+                            f"{r.source}: {r.error}" for r in failed
+                        ) + ")"
+                    self._sm_status_var.set(msg)
+                self._sm_refresh_cache()
+            self.after(0, _done)
+
+        threading.Thread(target=_worker, daemon=True,
+                          name="steam-pull").start()
+
+    # ── Cache list ──────────────────────────────────────────────────
+
+    def _sm_refresh_cache(self) -> None:
+        import steam_analyst as _sa
+        self._sm_cache_box.delete(0, "end")
+        files = _sa.list_cached_pulls(VAULT_DIR)
+        for p in files:
+            try:
+                n_lines = sum(1 for _ in open(p, "r", encoding="utf-8"))
+            except Exception:
+                n_lines = 0
+            self._sm_cache_box.insert(
+                "end", f"  {p.name}   ({n_lines} rows)"
+            )
+        if not files:
+            self._sm_cache_box.insert("end",
+                "  (no pulls yet — click a 🌐 button above)")
+
+    # ── Q&A ─────────────────────────────────────────────────────────
+
+    def _sm_ask(self) -> None:
+        import steam_analyst as _sa
+        q = self._sm_question_var.get().strip()
+        if not q:
+            return
+        result = _sa.answer_question(q, VAULT_DIR)
+        self._sm_last_result = result
+        self._sm_render_answer(q, result)
+
+    def _sm_render_answer(self, question: str, result) -> None:
+        d = self._sm_answer
+        d.configure(state="normal")
+        d.delete("1.0", "end")
+        d.insert("end", f"Q: {question}\n\n", ("h1",))
+        d.insert("end", f"confidence: {result.confidence}\n", ("muted",))
+        if result.error:
+            d.insert("end", f"\nERROR: {result.error}\n", ("err",))
+        if result.answer:
+            d.insert("end", "\n" + result.answer + "\n")
+        if result.computed_values:
+            d.insert("end", "\ncomputed:\n", ("muted",))
+            for k, v in result.computed_values.items():
+                d.insert("end", f"  {k}: {v}\n", ("muted",))
+        if result.sources:
+            d.insert("end", "\nsources:\n", ("muted",))
+            for s in result.sources:
+                d.insert("end", f"  - {s.name}\n", ("muted",))
+        d.configure(state="disabled")
+
+    def _sm_send_to_council(self) -> None:
+        """Drop the last analyst result + the question into the Council
+        input box, so the council members read a computed result block
+        (citations included) rather than inventing numbers."""
+        result = getattr(self, "_sm_last_result", None)
+        question = self._sm_question_var.get().strip()
+        if result is None or not question:
+            return
+        body = (
+            f"{question}\n\n"
+            + result.to_injection_block()
+        )
+        try:
+            inp = getattr(self, "input", None)
+            if inp is not None:
+                inp.delete("1.0", "end")
+                inp.insert("1.0", body)
+            if hasattr(self, "tab_council"):
+                self.nb.select(self.tab_council)
+        except Exception as exc:
+            print(f"[Steam Market] stage to council failed: {exc!r}")
 
     # ============================
     # Transcript helpers
