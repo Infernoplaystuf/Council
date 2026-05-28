@@ -181,74 +181,50 @@ class SpecialistRegistry:
 # ============================================================
 
 def default_specialists() -> List[Specialist]:
-    """
-    Three pre-built specialists shipped with the product. Most small
-    businesses recognise themselves in at least one of these on day one.
-    Users can edit, disable, or delete them freely.
+    """Pre-built specialists shipped with Anvil.
+
+    Game-development focused. The previous data-analyst trio (Sales /
+    Inventory / Customer) lived here on Work-Build; on the game-dev
+    branch we seed a single Game Designer lens. Genre Analyst and
+    Steam Market Analyst land in later phases.
+    Users can edit, disable, or delete freely in the Specialists tab.
     """
     return [
         Specialist(
-            id="sales",
-            name="Sales Specialist",
-            icon="💰",
-            description="Revenue trends, customer behaviour, retention, AOV.",
-            domain_keywords=[
-                "sales", "revenue", "income", "earnings", "deal", "deals",
-                "customer", "client", "buyer", "order", "orders",
-                "retention", "churn", "ltv", "lifetime", "repeat",
-                "aov", "conversion", "cohort", "segment", "segmentation",
-            ],
-            system_prompt_overlay=(
-                "You are a sales analyst. Focus on revenue patterns, "
-                "customer lifetime value, segmentation, and retention. "
-                "Cite specific rows or columns when answering. Translate "
-                "every finding into one concrete action a small-business "
-                "owner could take in the next week. Avoid jargon — write "
-                "the way you would explain it to the owner over coffee."
+            id="game_designer",
+            name="Game Designer",
+            icon="🎮",
+            description=(
+                "Mechanics, core loops, pacing, balance, level design, "
+                "player psychology."
             ),
-            base_personality="writer",
-        ),
-        Specialist(
-            id="inventory",
-            name="Inventory Specialist",
-            icon="📦",
-            description="Stock levels, turnover, dead inventory, supplier risk.",
             domain_keywords=[
-                "stock", "inventory", "warehouse", "sku", "skus",
-                "qty", "quantity", "on_hand", "on hand",
-                "reorder", "restock", "supplier", "vendor",
-                "turnover", "holding", "dead", "obsolete", "stale",
-                "shortage", "overstock", "depletion", "demand",
+                # Mechanics + loops
+                "mechanic", "mechanics", "loop", "core loop", "gameplay",
+                "balance", "tuning", "difficulty", "pacing",
+                # Level + content
+                "level", "level design", "boss", "puzzle", "encounter",
+                "enemy", "enemies", "weapon", "ability", "skill",
+                # Player-side
+                "player", "controls", "feel", "juice", "feedback",
+                "tutorial", "onboarding", "progression",
+                # Game-design vocabulary
+                "design", "playtest", "iteration", "prototype",
+                "fun", "flow", "challenge", "reward",
             ],
             system_prompt_overlay=(
-                "You are an inventory analyst. Focus on stock levels, "
-                "turnover ratios, holding cost, dead-stock identification, "
-                "and supplier reliability. Always reference SKU codes when "
-                "discussing specific items. When the answer involves a "
-                "decision (reorder, write off, rebalance), state the "
-                "recommended quantity or threshold explicitly."
-            ),
-            base_personality="writer",
-        ),
-        Specialist(
-            id="customer",
-            name="Customer Specialist",
-            icon="🤝",
-            description="Customer profiles, loyalty patterns, churn risk, dormancy.",
-            domain_keywords=[
-                "customer", "client", "buyer", "account", "accounts",
-                "loyal", "loyalty", "dormant", "inactive", "churn",
-                "first_order", "last_order", "first order", "last order",
-                "segment", "tier", "vip", "lifetime", "ltv",
-                "demographic", "city", "state", "region",
-            ],
-            system_prompt_overlay=(
-                "You are a customer-relationship analyst. Focus on customer "
-                "profiles, loyalty tiers, dormancy patterns, and churn risk. "
-                "When identifying customers for action (e.g. re-engagement, "
-                "VIP outreach), include the customer ID or name and one line "
-                "explaining why they were selected. Be careful with privacy "
-                "— never speculate about individuals' personal traits."
+                "You are a senior game designer. When the user asks "
+                "about a mechanic, level, or balance question, work in "
+                "concrete terms: numbers, tunable parameters, named "
+                "comparable titles. Never hand-wave with 'make it feel "
+                "good' — specify what *good* means (target time-to-kill, "
+                "damage curves, jump arcs, etc.). Translate every "
+                "recommendation into something the user can change in "
+                "Godot today: an exported variable, a node tree, a "
+                "signal connection, an autoload. When you reference an "
+                "existing game by name, make sure it actually exists "
+                "and is well-known enough that the user has heard of "
+                "it; otherwise say 'a game in the style of …' instead."
             ),
             base_personality="writer",
         ),

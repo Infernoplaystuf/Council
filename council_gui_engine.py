@@ -3714,6 +3714,7 @@ class CouncilConsole(tk.Tk):
         # 7) Speech I/O         → Speech
         self._build_council_tab()
         self._build_godot_workspace_tab()   # Anvil — phase C-lite, customer-facing
+        self._build_game_concepts_tab()     # Anvil — phase B,     customer-facing
         self._build_dream3d_tab()
         self._build_grapher_tab()
         self._build_specialists_tab()
@@ -3737,13 +3738,12 @@ class CouncilConsole(tk.Tk):
             self._build_apoth_tab()
 
         # ── Anvil game-dev placeholder tabs ──
-        # Game Concepts and Steam Market are still stubs (phase B and D
-        # respectively) so they stay hidden behind COUNCIL_ADVANCED=1
-        # — the "coming soon" pane would otherwise mislead the customer
-        # flow. Each gets promoted to the always-on flow as it lands.
-        # Godot Workspace was promoted to the customer flow above.
+        # Steam Market is still a stub (phase D) so it stays hidden
+        # behind COUNCIL_ADVANCED=1 — the "coming soon" pane would
+        # otherwise mislead the customer flow. Promoted to the
+        # always-on flow as it lands.
+        # Godot Workspace + Game Concepts were promoted above.
         if _ADVANCED_MODE:
-            self._build_game_concepts_tab()
             self._build_steam_market_tab()
 
     # ---- Backend strip (model backend selector) ----
@@ -10241,21 +10241,336 @@ class CouncilConsole(tk.Tk):
             self._gw_console_write("stderr",
                 f"[Anvil] could not stage Council question: {exc!r}")
 
+    # ---- Game Concepts tab (phase B) ----
+
     def _build_game_concepts_tab(self):
-        """Game Concepts — Phase B lands the retargeted idea_engine
-        front-end. Stub for now."""
-        import idea_engine  # noqa: F401
-        self._add_coming_soon_tab(
-            "tab_game_concepts",
-            "💡 Game Concepts",
-            "Game Concepts",
-            "Phase B",
-            "Brainstorm game concepts (genre, hook, mechanics, "
-            "target audience, comparable titles). The Game Designer "
-            "specialist will auto-summon. \"Send to Godot Workspace\" "
-            "ships the concept into a scaffolded project via "
-            "demo_builder.",
+        """Game Concepts — brainstorm + browse game concepts.
+
+        Left pane: list of saved concepts with seed + Generate button.
+        Right pane: detail view of the selected concept with editable
+        notes / rating / status, and a "Send to Godot Workspace" button
+        that hands the concept off to demo_builder (phase E land-site).
+        """
+        import game_concept as _gc
+        self.tab_game_concepts = ttk.Frame(self.nb)
+        self.nb.add(self.tab_game_concepts, text="💡 Game Concepts")
+
+        self._gc_store = _gc.GameConceptStore(VAULT_DIR)
+        self._gc_current_id: Optional[str] = None
+        self._gc_generating = False
+
+        # Top strip — seed input + Generate + count badge
+        strip = ttk.Frame(self.tab_game_concepts)
+        strip.pack(fill="x", padx=6, pady=(6, 4))
+        ttk.Label(strip, text="Seed:").pack(side="left")
+        self._gc_seed_var = tk.StringVar()
+        seed_entry = ttk.Entry(strip, textvariable=self._gc_seed_var)
+        seed_entry.pack(side="left", padx=(4, 4), fill="x", expand=True)
+        ttk.Label(strip, text="N:").pack(side="left")
+        self._gc_n_var = tk.IntVar(value=3)
+        ttk.Spinbox(strip, from_=1, to=6, width=3,
+                     textvariable=self._gc_n_var).pack(side="left", padx=(2, 4))
+        self._gc_generate_btn = ttk.Button(
+            strip, text="✨ Generate", command=self._gc_generate,
         )
+        self._gc_generate_btn.pack(side="left")
+        self._gc_status_var = tk.StringVar(
+            value=f"{self._gc_store.count()} concept(s) saved",
+        )
+        ttk.Label(strip, textvariable=self._gc_status_var,
+                  foreground="#a98a8a").pack(side="right")
+
+        # Body — horizontal pane: list on left, detail on right
+        body = tk.PanedWindow(self.tab_game_concepts, orient="horizontal",
+                               bg="#1a1414", sashwidth=6)
+        body.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # Left — listbox of concepts
+        left = ttk.Frame(body)
+        body.add(left, width=320, minsize=240)
+        ttk.Label(left, text="Concepts (newest first)").pack(anchor="w",
+                                                              padx=2, pady=(0, 2))
+        list_row = ttk.Frame(left)
+        list_row.pack(fill="both", expand=True)
+        self._gc_listbox = tk.Listbox(
+            list_row, bg="#0f0c0c", fg="#d4d4d4",
+            selectbackground="#4a2626", selectforeground="#d4d4d4",
+            font=("Segoe UI", 10), activestyle="none",
+        )
+        lsb = ttk.Scrollbar(list_row, orient="vertical",
+                             command=self._gc_listbox.yview)
+        self._gc_listbox.configure(yscrollcommand=lsb.set)
+        self._gc_listbox.pack(side="left", fill="both", expand=True)
+        lsb.pack(side="right", fill="y")
+        self._gc_listbox.bind("<<ListboxSelect>>", self._gc_on_select)
+
+        # Left bottom — list actions
+        list_actions = ttk.Frame(left)
+        list_actions.pack(fill="x", pady=(4, 0))
+        ttk.Button(list_actions, text="⟳ Refresh",
+                   command=self._gc_refresh_list).pack(side="left")
+        ttk.Button(list_actions, text="🗑 Delete",
+                   command=self._gc_delete_selected).pack(side="left", padx=4)
+
+        # Right — detail pane
+        right = ttk.Frame(body)
+        body.add(right, minsize=420)
+        # Scrollable detail body
+        det_row = ttk.Frame(right)
+        det_row.pack(fill="both", expand=True)
+        self._gc_detail = tk.Text(
+            det_row, wrap="word", bg="#0f0c0c", fg="#d4d4d4",
+            insertbackground="#d4d4d4", font=("Segoe UI", 10),
+            state="disabled",
+        )
+        dsb = ttk.Scrollbar(det_row, orient="vertical",
+                             command=self._gc_detail.yview)
+        self._gc_detail.configure(yscrollcommand=dsb.set)
+        self._gc_detail.pack(side="left", fill="both", expand=True)
+        dsb.pack(side="right", fill="y")
+        # Headline tag for big bold titles inside the detail pane
+        self._gc_detail.tag_configure("h1", font=("Segoe UI", 14, "bold"),
+                                       foreground="#e0884a", spacing3=4)
+        self._gc_detail.tag_configure("h2", font=("Segoe UI", 11, "bold"),
+                                       foreground="#a98a8a", spacing1=8,
+                                       spacing3=2)
+        self._gc_detail.tag_configure("muted", foreground="#7a7575")
+
+        # Right bottom — concept actions
+        det_actions = ttk.Frame(right)
+        det_actions.pack(fill="x", pady=(4, 0))
+        ttk.Button(det_actions, text="🛠 Send to Godot Workspace",
+                   command=self._gc_send_to_workspace).pack(side="left")
+        ttk.Button(det_actions, text="⚖ Ask Council about this concept",
+                   command=self._gc_send_to_council).pack(side="left", padx=4)
+
+        self._gc_refresh_list()
+
+    # ── List + selection ────────────────────────────────────────────
+
+    def _gc_refresh_list(self) -> None:
+        self._gc_listbox.delete(0, "end")
+        for entry in self._gc_store.list_index():
+            stars = "★" * int(entry.get("rating", 0) or 0)
+            line = (f"  {entry.get('title', '?')}"
+                    + (f"   [{entry.get('genre', '')}]"
+                       if entry.get("genre") else "")
+                    + (f"   {stars}" if stars else ""))
+            self._gc_listbox.insert("end", line)
+        self._gc_status_var.set(f"{self._gc_store.count()} concept(s) saved")
+
+    def _gc_on_select(self, _event=None) -> None:
+        sel = self._gc_listbox.curselection()
+        if not sel:
+            return
+        entry = self._gc_store.list_index()[sel[0]]
+        cid = entry.get("id")
+        if not cid:
+            return
+        concept = self._gc_store.load(cid)
+        if concept is None:
+            return
+        self._gc_current_id = cid
+        self._gc_render_detail(concept)
+
+    def _gc_delete_selected(self) -> None:
+        from tkinter import messagebox
+        if not self._gc_current_id:
+            return
+        if not messagebox.askyesno(
+            "Delete concept?",
+            "This permanently removes the concept JSON. Continue?",
+            parent=self,
+        ):
+            return
+        self._gc_store.delete(self._gc_current_id)
+        self._gc_current_id = None
+        self._gc_refresh_list()
+        self._gc_render_detail(None)
+
+    # ── Detail rendering ────────────────────────────────────────────
+
+    def _gc_render_detail(self, concept) -> None:
+        d = self._gc_detail
+        d.configure(state="normal")
+        d.delete("1.0", "end")
+        if concept is None:
+            d.insert("end", "(no concept selected)\n", ("muted",))
+            d.configure(state="disabled")
+            return
+
+        d.insert("end", f"{concept.display_title}\n", ("h1",))
+        meta = f"{concept.status_icon} {concept.status}"
+        if concept.genre:
+            meta += f"  •  {concept.genre}"
+        if concept.engine:
+            meta += f"  •  {concept.engine}"
+        d.insert("end", meta + "\n", ("muted",))
+
+        def _section(title, body):
+            if not body:
+                return
+            d.insert("end", title + "\n", ("h2",))
+            if isinstance(body, list):
+                for item in body:
+                    if item:
+                        d.insert("end", f"  • {item}\n")
+            else:
+                d.insert("end", str(body).strip() + "\n")
+
+        _section("Hook", concept.hook)
+        _section("Premise", concept.premise)
+        _section("Core loop", concept.core_loop)
+        _section("Mechanics", concept.mechanics)
+        _section("Sub-genres", concept.sub_genres)
+        _section("Art style", concept.art_style)
+        _section("Play length", concept.play_length)
+        _section("Players", concept.player_count)
+        _section("Target audience", concept.target_audience)
+        _section("Comparable titles", concept.comparable_titles)
+        _section("What sets it apart", concept.differentiator)
+        _section("Why it works", concept.why_it_works)
+        _section("Progression", concept.progression)
+        _section("Win / loss", concept.win_loss)
+        _section("Monetization", concept.monetization)
+        _section("Estimated dev time", concept.estimated_dev_time)
+        if concept.seed_used:
+            _section("Seed used", concept.seed_used)
+        if concept.notes:
+            _section("Notes", concept.notes)
+
+        d.configure(state="disabled")
+
+    # ── Generation ──────────────────────────────────────────────────
+
+    def _gc_generate(self) -> None:
+        if self._gc_generating:
+            return
+        seed = self._gc_seed_var.get().strip()
+        n = int(self._gc_n_var.get() or 3)
+        if not seed:
+            seed = "any indie-scale Godot game"
+        self._gc_generating = True
+        self._gc_generate_btn.configure(state="disabled", text="… brainstorming")
+        self._gc_status_var.set(f"Brainstorming {n} concept(s)…")
+        # Run on a background thread — the model call blocks for
+        # ~10–30s on small models and would freeze the GUI otherwise.
+        threading.Thread(
+            target=self._gc_generate_worker,
+            args=(seed, n),
+            daemon=True,
+            name="game-concept-brainstorm",
+        ).start()
+
+    def _gc_generate_worker(self, seed: str, n: int) -> None:
+        import game_concept as _gc
+        concepts = []
+        try:
+            # The Game Designer specialist's overlay is the right voice
+            # for brainstorming — pull it via the registry and prepend.
+            extra = ""
+            try:
+                gd = self.specialists.get("game_designer")
+                if gd is not None:
+                    extra = gd.context_block()
+            except Exception:
+                pass
+            concepts = _gc.brainstorm_concepts(
+                seed, self.writer, n=n, extra_context=extra,
+            )
+        except Exception as exc:
+            print(f"[Game Concepts] brainstorm failed: {exc!r}")
+
+        def _on_done():
+            self._gc_generating = False
+            self._gc_generate_btn.configure(state="normal", text="✨ Generate")
+            if not concepts:
+                self._gc_status_var.set(
+                    "No parseable concepts from the model — try a "
+                    "tighter seed or a stronger model."
+                )
+                return
+            for c in concepts:
+                self._gc_store.save(c)
+            self._gc_refresh_list()
+            self._gc_status_var.set(
+                f"Generated {len(concepts)} concept(s) — saved."
+            )
+            # Auto-select the first new one
+            try:
+                self._gc_listbox.selection_clear(0, "end")
+                self._gc_listbox.selection_set(0)
+                self._gc_listbox.event_generate("<<ListboxSelect>>")
+            except Exception:
+                pass
+
+        self.after(0, _on_done)
+
+    # ── Outbound actions ────────────────────────────────────────────
+
+    def _gc_send_to_workspace(self) -> None:
+        """Hand the selected concept to demo_builder, which scaffolds a
+        Godot project. PHASE E lands the real build — for now we show
+        the user what would happen and dump the concept to the
+        Workspace console."""
+        from tkinter import messagebox
+        if not self._gc_current_id:
+            messagebox.showinfo(
+                "No concept selected",
+                "Pick a concept first.",
+                parent=self,
+            )
+            return
+        concept = self._gc_store.load(self._gc_current_id)
+        if concept is None:
+            return
+        # Phase E will replace this with demo_builder.build_demo(...).
+        if hasattr(self, "tab_godot_workspace"):
+            self.nb.select(self.tab_godot_workspace)
+        self._gw_console_write("info",
+            f"[Anvil] Concept staged for demo build: {concept.display_title}")
+        self._gw_console_write("info",
+            "[Anvil] (Phase E will scaffold this into a Godot project "
+            "under vault/projects/<slug>/ via demo_builder.build_demo.)")
+        if hasattr(self, "_gw_console_write"):
+            self._gw_console_write("info",
+                f"  genre: {concept.genre or '?'}")
+            self._gw_console_write("info",
+                f"  hook:  {concept.hook}")
+            if concept.mechanics:
+                self._gw_console_write("info",
+                    f"  mechanics: {', '.join(concept.mechanics[:6])}")
+
+    def _gc_send_to_council(self) -> None:
+        """Drop a critique-this-concept prompt into the Council input."""
+        if not self._gc_current_id:
+            return
+        concept = self._gc_store.load(self._gc_current_id)
+        if concept is None:
+            return
+        body_lines = [
+            f"Critique this game concept and suggest improvements:",
+            "",
+            f"TITLE: {concept.display_title}",
+            f"GENRE: {concept.genre}" if concept.genre else "",
+            f"HOOK: {concept.hook}" if concept.hook else "",
+            f"PREMISE: {concept.premise}" if concept.premise else "",
+            f"CORE LOOP: {concept.core_loop}" if concept.core_loop else "",
+        ]
+        if concept.mechanics:
+            body_lines.append("MECHANICS: " + ", ".join(concept.mechanics))
+        if concept.comparable_titles:
+            body_lines.append("COMPS: " + ", ".join(concept.comparable_titles))
+        body = "\n".join(l for l in body_lines if l)
+        try:
+            inp = getattr(self, "input", None)
+            if inp is not None:
+                inp.delete("1.0", "end")
+                inp.insert("1.0", body)
+            if hasattr(self, "tab_council"):
+                self.nb.select(self.tab_council)
+        except Exception as exc:
+            print(f"[Game Concepts] stage to council failed: {exc!r}")
 
     def _build_steam_market_tab(self):
         """Steam Market — Phase D lands SteamSpy/SteamCharts/Web-API
