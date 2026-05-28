@@ -150,6 +150,12 @@ class AgentEvent:
 @dataclass
 class AgentContext:
     user_text: str
+    # One-line distillation of what the user is actually asking. Set once
+    # per turn by the dispatch site and re-injected at the top + bottom
+    # of every agent prompt so small models don't lose the thread when
+    # the augmented user_text is dominated by injected file/vault data.
+    # Empty string means "no anchor available — fall back to user_text".
+    goal: str = ""
     shared: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -1780,6 +1786,23 @@ class ModelAgent:
     def _compose_prompt(self, ctx: AgentContext) -> str:
         parts: List[str] = []
 
+        # Goal anchor — primacy slot. The user's distilled goal goes at the
+        # very top of every agent prompt so small models (8B-ish) anchor on
+        # the actual task before they get buried in injected file/analyst
+        # context. The same anchor is repeated near the bottom (recency
+        # slot) just before USER REQUEST. Empty string when no goal is set.
+        _goal = getattr(ctx, "goal", "") or ""
+        if _goal:
+            try:
+                import goal_anchor as _ga
+                _hdr = _ga.format_goal_header(_goal)
+                if _hdr:
+                    parts.append(_hdr)
+            except Exception:
+                # goal_anchor is a tiny helper module; if importing it fails
+                # somehow, degrade silently rather than blocking the prompt.
+                parts.append(f"[USER GOAL]\n  {_goal}")
+
         # Inject query mode so every personality knows what type of response to give.
         # This overrides the code-centric defaults baked into each system prompt.
         _mode = ctx.shared.get("query_mode", "")
@@ -1866,6 +1889,19 @@ class ModelAgent:
                 "⚠ REMINDER: This is a TECHNICAL query. "
                 "Prioritise working, complete code."
             )
+
+        # Goal anchor — recency slot. Repeat the distilled goal right
+        # before USER REQUEST so that even if the augmented user_text is
+        # dominated by ~3K tokens of CSV / vault data, the model still
+        # sees the actual ask at the highest-attention position.
+        if _goal:
+            try:
+                import goal_anchor as _ga
+                _rem = _ga.format_goal_reminder(_goal)
+                if _rem:
+                    parts.append(_rem)
+            except Exception:
+                parts.append(f"⚑ REMEMBER — the user's goal is: {_goal}")
 
         parts.append(f"USER REQUEST:\n{ctx.user_text}")
 
@@ -1978,8 +2014,9 @@ class DeliberationOrchestrator:
         self._emit(AgentEvent("Orchestrator", "phase", f"▶ {label}"))
 
     def run(self, user_text: str, *, panel: List[str], synth: str = "writer",
-            extra_ctx: Optional[Dict[str, Any]] = None) -> List[AgentEvent]:
-        ctx = AgentContext(user_text=user_text)
+            extra_ctx: Optional[Dict[str, Any]] = None,
+            goal: str = "") -> List[AgentEvent]:
+        ctx = AgentContext(user_text=user_text, goal=goal)
         if extra_ctx:
             ctx.shared.update(extra_ctx)
         all_events: List[AgentEvent] = []
@@ -3235,10 +3272,20 @@ class CouncilConsole(tk.Tk):
         # an exact row reference (or flag it as hallucinated).
         import provenance as _prov
         self.provenance = _prov.ProvenanceTracker(max_turns=20)
+        # Per-session record of distilled user goals so follow-up turns
+        # ("now do that for last quarter") can resolve their back-reference
+        # against earlier intents. Shares the same PROTECTED_SUBDIRS
+        # guarantee as conv_logger — the model never reads this file.
+        import goal_cache as _gc
+        self.goal_cache = _gc.GoalCache(VAULT_DIR)
         try:
             self.conv_logger.start_session(self.session_id)
         except Exception as _e:
             print(f"[ConvLogger] start_session failed: {_e!r}")
+        try:
+            self.goal_cache.start_session(self.session_id)
+        except Exception as _e:
+            print(f"[GoalCache] start_session failed: {_e!r}")
         # Window-close handler so the log gets a clean session_end marker.
         self.protocol("WM_DELETE_WINDOW", self._on_app_close)
         # Periodic background flush so logs survive crashes mid-session.
@@ -9638,6 +9685,11 @@ class CouncilConsole(tk.Tk):
         except Exception:
             pass
         try:
+            if hasattr(self, "goal_cache") and self.goal_cache:
+                self.goal_cache.end_session()
+        except Exception:
+            pass
+        try:
             self.destroy()
         except Exception:
             pass
@@ -9647,6 +9699,11 @@ class CouncilConsole(tk.Tk):
         try:
             if hasattr(self, "conv_logger") and self.conv_logger:
                 self.conv_logger.flush()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "goal_cache") and self.goal_cache:
+                self.goal_cache.flush()
         except Exception:
             pass
         try:
@@ -10627,6 +10684,13 @@ class CouncilConsole(tk.Tk):
     # ============================
 
     def _send(self):
+        # Clear the goal anchor from the prior turn before doing anything
+        # else. `_send` has many early-exit paths (licensing gate, empty
+        # input, fast-path handlers) above the distillation block; without
+        # this reset, an orch.run() call later in the same turn could read
+        # a stale goal from a prior turn via getattr(self, "_last_goal_anchor").
+        self._last_goal_anchor = ""
+
         # Licensing gate — skipped entirely in DEMO_MODE. In product
         # builds, this blocks new deliberations when trial expired and
         # no license active; past sessions are still readable.
@@ -10761,6 +10825,55 @@ class CouncilConsole(tk.Tk):
                 f"try rephrasing or check the file/column name.",
                 "observation",
             )
+
+        # ── Distill the user's goal BEFORE injection ──────────────────────
+        # On small local models (8B-ish) the post-injection prompt is often
+        # dominated by ~3K tokens of CSV / vault / analyst data with the
+        # actual question stuck at the tail. We compute a one-line goal
+        # anchor here so it can be:
+        #   1. re-injected at the top + bottom of every agent prompt
+        #      (primacy + recency slots — see _compose_prompt),
+        #   2. used to score rows during file-injection slicing (phase 3),
+        #   3. persisted to GoalCache so follow-up turns ("now do that for
+        #      last quarter") can chain against earlier intents.
+        # Hybrid strategy: heuristic strip first; if the result is short
+        # enough, no LLM call. Otherwise one cheap call to the judge model
+        # (max ~60 tokens out). Never raises — falls back to truncation.
+        _goal = ""
+        try:
+            import goal_anchor as _ga
+            _goal_model = getattr(self, "judge", None)
+            _goal = _ga.distill_goal(original_user_text, model=_goal_model)
+            # Follow-up turns: prepend prior goals so the model can resolve
+            # back-references ("the same thing", "again but with X").
+            if _ga.looks_like_followup(original_user_text) and hasattr(self, "goal_cache"):
+                try:
+                    _prev = self.goal_cache.recent_goal_strings(n=3)
+                    if _prev:
+                        _goal = _ga.format_followup_goal(_goal, _prev)
+                except Exception:
+                    pass
+        except Exception as _ge:
+            print(f"[goal_anchor] distillation failed: {_ge!r}")
+            _goal = (original_user_text or "")[:160]
+        # Stash for the orchestrator + transcript surfacing.
+        self._last_goal_anchor = _goal
+        if _goal:
+            try:
+                self.goal_cache.record(original_user_text, _goal)
+            except Exception:
+                pass
+            # Surface the goal so the user can sanity-check what the
+            # model is actually anchored on for this turn.
+            try:
+                _goal_line = _goal.replace("\n", " ").strip()
+                if len(_goal_line) > 200:
+                    _goal_line = _goal_line[:197] + "…"
+                self._append_transcript(
+                    "Council", f"Goal: {_goal_line}", "observation",
+                )
+            except Exception:
+                pass
 
         # ── Inject file/folder/vault context with token-aware caps ────────
         # The new pipeline (a) tags each block with its token cost, (b) caps
@@ -11152,7 +11265,14 @@ class CouncilConsole(tk.Tk):
                     def _make_token_cb(self_):
                         return None
                     def act(self_, ctx):
-                        state = self_.agent.run(ctx.user_text)
+                        # Pass the distilled goal so the ReAct retry loop
+                        # keeps the user's intent anchored across attempts,
+                        # even when the FIX prompt is dominated by failed
+                        # code + stderr.
+                        state = self_.agent.run(
+                            ctx.user_text,
+                            goal=getattr(ctx, "goal", "") or "",
+                        )
                         evs = [AgentEvent("Coder", "final",
                                           f"{state.final_code}\n\n{state.explanation}")]
                         if state.passed:
@@ -11515,7 +11635,8 @@ class CouncilConsole(tk.Tk):
                                        f"Style brief skipped ({_dsb_e})"))
 
                 events = orch.run(user_text, panel=panel, synth=synth_role,
-                                  extra_ctx=_orch_extra)
+                                  extra_ctx=_orch_extra,
+                                  goal=getattr(self, "_last_goal_anchor", ""))
 
                 # Extract final and critique
                 final_text = next((e.text for e in reversed(events) if e.who == "Writer" and e.kind == "final"), "")
@@ -12279,7 +12400,17 @@ class CouncilConsole(tk.Tk):
                 judge_model=self.judge, agents=agents,
                 max_rounds=2, debate_turns=1,  # leaner for background -- 1 cross-fire turn
             )
-            events = orch.run(prompt, panel=panel, synth=synth_role)
+            # Background queue runs without the foreground goal_anchor —
+            # distill heuristically (no LLM call) so the bg path still
+            # gets a top-of-prompt anchor without slowing down the queue.
+            _bg_goal = ""
+            try:
+                import goal_anchor as _ga_bg
+                _bg_goal = _ga_bg.distill_goal(prompt, model=None)
+            except Exception:
+                pass
+            events = orch.run(prompt, panel=panel, synth=synth_role,
+                              goal=_bg_goal)
             result = next((e.text for e in reversed(events)
                            if e.who == "Writer" and e.kind == "final"), "")
             critique = next((e.text for e in reversed(events)

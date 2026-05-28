@@ -71,7 +71,7 @@ Output format — STRICTLY:
 """
 
 FIX_PROMPT_TEMPLATE = """\
-Your previous attempt failed. Fix it.
+{goal_header}Your previous attempt failed. Fix it.
 
 ORIGINAL TASK:
 {task}
@@ -93,22 +93,22 @@ REFLECTION:
 - What is the root cause?
 - What is the minimal fix?
 
-Now output the corrected code. ONLY a fenced Python code block. No other text.
+{goal_reminder}Now output the corrected code. ONLY a fenced Python code block. No other text.
 ```python
 """
 
 FIRST_ATTEMPT_PROMPT = """\
-Write a Python script that solves the following task completely.
+{goal_header}Write a Python script that solves the following task completely.
 
 TASK:
 {task}
 
-Output ONLY a fenced Python code block. No explanations, no prose.
+{goal_reminder}Output ONLY a fenced Python code block. No explanations, no prose.
 ```python
 """
 
 EXPLAIN_PROMPT = """\
-The following Python code solves this task:
+{goal_header}The following Python code solves this task:
 
 TASK:
 {task}
@@ -121,6 +121,22 @@ CODE:
 Write a brief (3-5 sentence) explanation of how the code works and any important design decisions.
 Do NOT repeat the code. Plain prose only.
 """
+
+
+def _goal_header(goal: str) -> str:
+    """Top-of-prompt goal anchor. Empty string when no goal is set."""
+    if not goal:
+        return ""
+    return (
+        f"[USER GOAL — your single objective for this turn]\n  {goal}\n\n"
+    )
+
+
+def _goal_reminder(goal: str) -> str:
+    """Bottom-of-prompt goal reminder. Empty string when no goal is set."""
+    if not goal:
+        return ""
+    return f"⚑ REMEMBER — the user's goal is: {goal}\n\n"
 
 
 # ============================================================
@@ -185,6 +201,7 @@ def _run_react_loop(
     runner: ce.LocalRunner,
     max_attempts: int = 8,
     event_callback: Optional[Callable[[str, str], None]] = None,
+    goal: str = "",
 ) -> AgentState:
     """
     Write → execute → reflect → fix loop, backed by the GGUF runtime
@@ -207,7 +224,11 @@ def _run_react_loop(
         # attempts include the failed code + stderr so the model can
         # reason about the failure mode.
         if attempt == 1:
-            prompt = FIRST_ATTEMPT_PROMPT.format(task=task)
+            prompt = FIRST_ATTEMPT_PROMPT.format(
+                task=task,
+                goal_header=_goal_header(goal),
+                goal_reminder=_goal_reminder(goal),
+            )
         else:
             prompt = FIX_PROMPT_TEMPLATE.format(
                 task=task,
@@ -217,6 +238,8 @@ def _run_react_loop(
                 returncode=state.returncode,
                 stdout=state.stdout[:1500],
                 stderr=state.stderr[:1500],
+                goal_header=_goal_header(goal),
+                goal_reminder=_goal_reminder(goal),
             )
 
         _emit("generate", f"Attempt {attempt}/{max_attempts} — writing code…")
@@ -264,7 +287,10 @@ def _run_react_loop(
 
         if state.passed:
             _emit("explain", "Generating explanation…")
-            explain_prompt = EXPLAIN_PROMPT.format(task=task, code=state.code)
+            explain_prompt = EXPLAIN_PROMPT.format(
+                task=task, code=state.code,
+                goal_header=_goal_header(goal),
+            )
             state.explanation = personality_model.respond(explain_prompt)
             state.final_code = state.code
             return state
@@ -309,9 +335,16 @@ class CoderAgent:
         # always False now that LangGraph has been removed.
         return False
 
-    def run(self, task: str) -> AgentState:
+    def run(self, task: str, goal: str = "") -> AgentState:
         """
         Run the coding agent on a task.
+
+        ``goal`` is the optional one-line user-goal anchor for this turn.
+        When provided it is rendered at the top + bottom of every retry
+        prompt so the model doesn't drift across attempts (the FIX prompt
+        contains the failed code + stderr, which can dominate attention
+        on small models and shove the actual ask out of focus).
+
         Returns AgentState with .final_code, .explanation, .passed, .event_log
         """
         return _run_react_loop(
@@ -320,4 +353,5 @@ class CoderAgent:
             runner=self.runner,
             max_attempts=self.max_attempts,
             event_callback=self.event_callback,
+            goal=goal,
         )
