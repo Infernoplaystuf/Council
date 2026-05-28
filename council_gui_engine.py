@@ -10828,10 +10828,8 @@ class CouncilConsole(tk.Tk):
     # ── Outbound actions ────────────────────────────────────────────
 
     def _gc_send_to_workspace(self) -> None:
-        """Hand the selected concept to demo_builder, which scaffolds a
-        Godot project. PHASE E lands the real build — for now we show
-        the user what would happen and dump the concept to the
-        Workspace console."""
+        """Scaffold a Godot project from the selected concept via
+        demo_builder, then open it in the Workspace tab."""
         from tkinter import messagebox
         if not self._gc_current_id:
             messagebox.showinfo(
@@ -10843,22 +10841,40 @@ class CouncilConsole(tk.Tk):
         concept = self._gc_store.load(self._gc_current_id)
         if concept is None:
             return
-        # Phase E will replace this with demo_builder.build_demo(...).
+
+        import demo_builder as _db
+        # First attempt without overwrite. If the project already exists
+        # we ask the user whether to overwrite.
+        result = _db.build_demo(concept, VAULT_DIR, overwrite=False)
+        if result.error and "already exists" in result.error:
+            if messagebox.askyesno(
+                "Project exists",
+                f"{result.project_path.name} already exists in "
+                f"vault/projects/. Overwrite it?",
+                parent=self,
+            ):
+                result = _db.build_demo(concept, VAULT_DIR, overwrite=True)
+        if result.error:
+            messagebox.showerror(
+                "Build failed", result.error, parent=self,
+            )
+            return
+
+        # Switch to Workspace + auto-open the new project
         if hasattr(self, "tab_godot_workspace"):
             self.nb.select(self.tab_godot_workspace)
+        try:
+            self._gw_open_project(result.project_path)
+            self._gw_save_settings_kv(godot_project=str(result.project_path))
+        except Exception as exc:
+            print(f"[Game Concepts] auto-open failed: {exc!r}")
         self._gw_console_write("info",
-            f"[Anvil] Concept staged for demo build: {concept.display_title}")
+            f"[Anvil] ✨ Demo scaffolded at {result.project_path}")
+        for note in result.notes:
+            self._gw_console_write("info", f"  • {note}")
         self._gw_console_write("info",
-            "[Anvil] (Phase E will scaffold this into a Godot project "
-            "under vault/projects/<slug>/ via demo_builder.build_demo.)")
-        if hasattr(self, "_gw_console_write"):
-            self._gw_console_write("info",
-                f"  genre: {concept.genre or '?'}")
-            self._gw_console_write("info",
-                f"  hook:  {concept.hook}")
-            if concept.mechanics:
-                self._gw_console_write("info",
-                    f"  mechanics: {', '.join(concept.mechanics[:6])}")
+            "[Anvil] Hit ▶ Run to see it move, then use 🤖 Ask Coder "
+            "to flesh out the mechanics from the concept's TODO list.")
 
     def _gc_send_to_council(self) -> None:
         """Drop a critique-this-concept prompt into the Council input."""
