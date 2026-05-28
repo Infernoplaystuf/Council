@@ -154,62 +154,91 @@ def _looks_like_top_question(q: str) -> bool:
                           q, re.IGNORECASE))
 
 
+# Curated genre vocabulary. The router accepts a genre scope ONLY if
+# the question contains one of these tokens, OR explicitly names a
+# genre via ``genre: X`` syntax. This is an *affirmative* gate rather
+# than a "matched a loose pattern AND didn't hit a junk word" filter,
+# which was prone to mis-scoping (e.g. "popular survival games"
+# returning "popular" when survival was missing from the vocab).
+#
+# Tokens are stored in their canonical lowercase form. The matcher
+# tolerates both hyphenated and space-separated variants ("co-op" /
+# "co op"), as well as common pluralisations of the noun form.
 _GENRE_VOCAB = {
+    # Action / shooter
     "platformer", "metroidvania", "roguelike", "roguelite",
-    "shooter", "fps", "rpg", "jrpg", "puzzle", "deck-builder",
-    "deckbuilder", "visual-novel", "vn", "city-builder",
-    "survival", "horror", "walking-sim", "rhythm", "racing",
-    "sports", "strategy", "tactics", "bullet-hell", "twin-stick",
-    "rts", "4x", "moba", "fighting", "stealth", "co-op",
-    "couch-co-op", "soulslike", "souls-like", "tower-defense",
-    "open-world", "sandbox", "crafting", "management", "sim",
+    "soulslike", "souls-like",
+    "shooter", "fps", "twin-stick", "bullet-hell", "shmup",
+    "beat-em-up", "fighting", "hack-and-slash",
+    # RPG family
+    "rpg", "jrpg", "crpg", "action-rpg", "tactics",
+    # Puzzle / cerebral
+    "puzzle", "puzzle-platformer", "match-3", "logic",
+    "deck-builder", "deckbuilder", "card-game",
+    # Strategy
+    "strategy", "rts", "4x", "grand-strategy", "auto-battler",
+    # Survival / crafting / management
+    "survival", "crafting", "sandbox", "open-world",
+    "management", "sim", "city-builder", "tycoon",
+    "colony-sim", "farming-sim",
+    # Story / atmospheric
+    "visual-novel", "vn", "narrative", "walking-sim",
+    "interactive-fiction", "adventure", "point-and-click",
+    "horror", "psychological-horror", "survival-horror",
+    "stealth",
+    # Multiplayer
+    "moba", "battle-royale", "co-op", "couch-co-op",
+    "asymmetric", "party-game",
+    # Reflex / rhythm / casual
+    "rhythm", "music", "racing", "sports", "arcade",
+    "idle", "clicker", "incremental",
+    # Tower / wave
+    "tower-defense", "wave-defense",
 }
+
+# Explicit "genre: X" / "in the X genre" — accept the user's own
+# genre declaration even if it's not in the vocab.
+_GENRE_EXPLICIT_RE = re.compile(
+    r"\bgenre[:\s]+([A-Za-z][\w\-\s]{2,30})",
+    re.IGNORECASE,
+)
 
 
 def _looks_like_genre_question(q: str) -> Optional[str]:
     """Return the genre substring referenced in the question, if any.
 
-    Prefer matching a known genre vocabulary word (case-insensitive,
-    hyphen-tolerant). Falls back to ``"X games"`` / ``"genre: X"`` /
-    ``"for X games"`` heuristics for genres not in the vocab.
+    Affirmative gate: requires either
+      (a) a token from ``_GENRE_VOCAB`` appearing as a whole word, or
+      (b) an explicit ``genre: X`` / ``genre X`` declaration.
+
+    Returns the canonical title-cased form of the genre for cache
+    lookup. The old "any X games" fallback regex was removed because
+    it produced false positives on common phrasings like
+    "popular survival games" (when survival wasn't in the vocab) →
+    returning "popular" as the genre.
     """
     if not q:
         return None
-    # Vocabulary match — strongest signal
-    ql = q.lower().replace("_", "-")
+    # Vocabulary match — strongest signal. Tolerate hyphenated vs
+    # space-separated forms by checking both.
+    ql = q.lower()
     for token in _GENRE_VOCAB:
-        # Match the genre as a whole word, hyphenated or not
-        pat = r"\b" + re.escape(token.replace("-", " ")) + r"\b"
-        if re.search(pat, ql) or re.search(
-            r"\b" + re.escape(token) + r"\b", ql,
-        ):
-            # Return the matched form in title case for the cache lookup
-            return token.replace("-", " ").title()
+        # Build alternation: either the exact token or its space-form
+        candidates = {token}
+        if "-" in token:
+            candidates.add(token.replace("-", " "))
+        for cand in candidates:
+            pat = r"\b" + re.escape(cand) + r"\b"
+            if re.search(pat, ql):
+                # Canonical form for cache lookup: title case with spaces
+                return token.replace("-", " ").title()
 
-    # Fallback patterns — for genres we haven't enumerated.
-    fallback_pats = [
-        r"\b(?:for|in|of)\s+([A-Za-z][\w\-]{2,20})\s+(?:games?|titles?)\b",
-        r"\b([A-Za-z][\w\-]{2,20})\s+games?\b",
-        r"\bgenre[: ]+([A-Za-z][\w\-\s]{2,20})",
-    ]
-    for pat in fallback_pats:
-        m = re.search(pat, q, re.IGNORECASE)
-        if m:
-            g = m.group(1).strip()
-            # Filter common false positives — demonstratives, generic
-            # descriptors, and broad-category words that aren't a real
-            # genre to scope a SteamSpy pull against.
-            if g.lower() in {
-                "good", "current", "recent", "top", "played", "popular",
-                "buy", "indie", "any", "all", "video", "computer",
-                "these", "those", "this", "that", "such", "the",
-                "many", "most", "some", "new", "old", "best",
-                "your", "their", "my", "our", "his", "her",
-                "online", "offline", "mobile", "console", "pc",
-            }:
-                continue
-            if 3 <= len(g) <= 30:
-                return g
+    # Explicit "genre: X" — accept the user's declaration verbatim
+    m = _GENRE_EXPLICIT_RE.search(q)
+    if m:
+        g = m.group(1).strip()
+        if 3 <= len(g) <= 30:
+            return g
     return None
 
 

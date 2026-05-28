@@ -27,8 +27,17 @@ Safety:
     caller is expected to confirm-overwrite with the user before
     invoking on an existing file. ``run()`` will refuse paths that
     escape the project root.
-  • If validation fails on the last attempt, the previous file content
-    is restored (the agent keeps a backup of the original bytes).
+  • Atomic in-place updates: every attempt writes to a sibling
+    ``<target>.anvil_tmp`` first and then ``os.replace()``-es it
+    into the real path, so a crash mid-attempt leaves either the
+    old or new full file content — never a partial. Note that
+    full pre-validation isolation (write-validate-then-swap) is
+    NOT possible because ``godot --check-only`` validates the
+    project, not a single file; the real path must be in place
+    while Godot reads it. The backup-and-restore path covers the
+    "validation failed" case.
+  • If validation fails on the last attempt, the previous file
+    content is restored via the same atomic ``os.replace`` swap.
 """
 
 from __future__ import annotations
@@ -47,7 +56,15 @@ from typing import Any, Callable, List, Optional
 
 @dataclass
 class GodotAgentState:
-    """ReAct loop state for GDScript generation."""
+    """ReAct loop state for GDScript generation.
+
+    ``history`` accumulates a record per attempt with ``code`` and
+    ``stderr_summary`` so the FIX prompt can show the model a
+    compressed "tried-and-failed" log. Without that, small models
+    oscillate between two bad fixes — they don't know their own
+    history. Default ``max_attempts`` is 3 to match the small-model
+    regime; raise it for ≥14B models if you want.
+    """
     task:          str
     goal:          str = ""               # distilled user-intent anchor
     target_path:   Optional[Path] = None  # where the script will be written
@@ -56,7 +73,7 @@ class GodotAgentState:
     stderr:        str = ""
     returncode:    int = -1
     attempt:       int = 0
-    max_attempts:  int = 6
+    max_attempts:  int = 3
     passed:        bool = False
     history:       List[dict] = field(default_factory=list)
     final_code:    str = ""
@@ -107,12 +124,12 @@ Output ONLY a fenced GDScript code block. No explanations, no prose.
 
 FIX_PROMPT_TEMPLATE = """\
 {goal_header}Your previous attempt did not parse cleanly under Godot.
-Fix it.
+Fix it — but DO NOT retry an approach that has already failed below.
 
 ORIGINAL TASK:
 {task}
 
-YOUR PREVIOUS CODE (attempt {attempt}/{max_attempts}):
+YOUR MOST RECENT CODE (attempt {attempt}/{max_attempts}):
 ```gdscript
 {code}
 ```
@@ -121,9 +138,12 @@ GODOT --check-only OUTPUT (rc={returncode}):
 stderr:
 {stderr}
 
+{history_block}\
 REFLECTION:
-- What did Godot complain about?
-- What is the minimal fix?
+- What did Godot complain about THIS time?
+- Which of your previous fix directions also failed (see above)?
+  Do not repeat them.
+- What is a different minimal fix?
 - Keep type hints; do not drop features unless the task itself was
   ambiguous.
 
@@ -179,6 +199,40 @@ def _extract_code(text: str) -> str:
     if start >= 0:
         return "\n".join(lines[start:]).strip()
     return text.strip()
+
+
+# ============================================================
+# Stderr summarisation — compress a Godot --check-only stderr
+# block into one line for the retry-history log.
+# ============================================================
+
+# Patterns that look like the actually useful error line in a Godot
+# stderr dump. We try each in order and keep the first match.
+_STDERR_INTEREST_PATTERNS = (
+    re.compile(r"Parse Error:[^\n]+"),
+    re.compile(r"Invalid get index[^\n]+"),
+    re.compile(r"Cannot find type[^\n]+"),
+    re.compile(r"ERROR:[^\n]+"),
+    re.compile(r"SCRIPT ERROR:[^\n]+"),
+    re.compile(r"Compile Error:[^\n]+"),
+)
+
+
+def _summarise_stderr(stderr: str) -> str:
+    """Compress a Godot stderr dump into a single representative line
+    for the retry-history log. Falls back to the first non-empty line."""
+    if not stderr:
+        return "(no stderr)"
+    for pat in _STDERR_INTEREST_PATTERNS:
+        m = pat.search(stderr)
+        if m:
+            return m.group(0).strip()[:200]
+    # Fallback: first non-empty line
+    for line in stderr.splitlines():
+        line = line.strip()
+        if line:
+            return line[:200]
+    return "(no stderr)"
 
 
 # ============================================================
@@ -253,7 +307,7 @@ class GodotCoder:
         project_root: Any,
         *,
         godot_binary: str = "godot",
-        max_attempts: int = 6,
+        max_attempts: int = 3,
         event_callback: Optional[Callable[[str, str], None]] = None,
     ):
         self.model = personality_model
@@ -281,6 +335,60 @@ class GodotCoder:
                 f"target_path {t} escapes project_root {self.project_root}"
             ) from exc
         return t
+
+    @staticmethod
+    def _atomic_write(target: Path, content: str) -> None:
+        """Write ``content`` to ``target`` atomically.
+
+        We write to ``<target>.anvil_tmp``, fsync, then ``os.replace``
+        the temp into place. On POSIX and Windows (same drive) the
+        replace is atomic — readers see either the old file or the
+        new file, never a half-written one. A crash mid-attempt
+        leaves the original target intact because the temp file is
+        the one that may end up orphaned.
+        """
+        tmp = target.with_suffix(target.suffix + ".anvil_tmp")
+        try:
+            data = content.encode("utf-8")
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except Exception:
+                    # fsync isn't supported on every fs; the os.replace
+                    # below is still atomic, just less crash-durable.
+                    pass
+            os.replace(tmp, target)
+        finally:
+            # Clean up the orphan tmp if os.replace didn't get to it
+            # (e.g. write raised before replace).
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _atomic_restore(target: Path, backup_bytes: bytes) -> None:
+        """Restore ``target`` from ``backup_bytes`` atomically. Same
+        write-tmp-then-os.replace pattern as ``_atomic_write``."""
+        tmp = target.with_suffix(target.suffix + ".anvil_bak")
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(backup_bytes)
+                fh.flush()
+                try:
+                    os.fsync(fh.fileno())
+                except Exception:
+                    pass
+            os.replace(tmp, target)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except Exception:
+                pass
 
     # ----------------------------------------------------------------
 
@@ -329,6 +437,26 @@ class GodotCoder:
                     goal_reminder=_goal_reminder(goal),
                 )
             else:
+                # Build a compressed retry-history block so the model
+                # can see which directions have already failed without
+                # blowing the context budget on full failed code dumps.
+                # The most recent attempt's full code is in {code};
+                # everything earlier is a one-line "we tried X, got Y".
+                history_lines = []
+                for h in state.history[:-1]:
+                    summary = (h.get("stderr_summary") or "(no stderr)")[:200]
+                    history_lines.append(
+                        f"  • attempt {h['attempt']}: {summary}"
+                    )
+                if history_lines:
+                    history_block = (
+                        "EARLIER ATTEMPTS (all failed — do not retry these "
+                        "fixes):\n"
+                        + "\n".join(history_lines)
+                        + "\n\n"
+                    )
+                else:
+                    history_block = ""
                 prompt = FIX_PROMPT_TEMPLATE.format(
                     task=task,
                     attempt=attempt - 1,
@@ -336,6 +464,7 @@ class GodotCoder:
                     code=state.code,
                     returncode=state.returncode,
                     stderr=(state.stderr or "")[:2000],
+                    history_block=history_block,
                     goal_header=_goal_header(goal),
                     goal_reminder=_goal_reminder(goal),
                 )
@@ -346,21 +475,34 @@ class GodotCoder:
                 raw = self.model.respond(prompt)
             except Exception as exc:
                 state.stderr = f"model.respond crashed: {exc!r}"
+                state.history.append({
+                    "attempt": attempt, "code": "",
+                    "stderr_summary": f"model.respond crashed: {exc!r}",
+                })
                 self._emit("result", f"Attempt {attempt} ✗ MODEL ERROR")
                 continue
 
             state.code = _extract_code(raw)
-            state.history.append({"attempt": attempt, "code": state.code})
 
             if not state.code.strip():
                 state.stderr = "model returned empty code"
+                state.history.append({
+                    "attempt": attempt, "code": "",
+                    "stderr_summary": "empty model output",
+                })
                 self._emit("result", f"Attempt {attempt} ✗ EMPTY")
                 continue
 
+            # Atomic write: write to <target>.anvil_tmp + os.replace.
+            # A crash mid-write leaves the original file intact.
             try:
-                target.write_text(state.code, encoding="utf-8")
+                self._atomic_write(target, state.code)
             except Exception as exc:
                 state.stderr = f"could not write target: {exc!r}"
+                state.history.append({
+                    "attempt": attempt, "code": state.code,
+                    "stderr_summary": f"write failed: {exc!r}",
+                })
                 self._emit("result", f"Attempt {attempt} ✗ WRITE FAIL")
                 continue
 
@@ -371,6 +513,13 @@ class GodotCoder:
             state.stdout = out
             state.stderr = err
             state.passed = (rc == 0)
+            # Compress this attempt's stderr into a single-line summary
+            # for the next iteration's history block.
+            stderr_summary = _summarise_stderr(err)
+            state.history.append({
+                "attempt": attempt, "code": state.code,
+                "stderr_summary": stderr_summary,
+            })
             self._emit(
                 "result",
                 f"Attempt {attempt} {'✓ PASSED' if state.passed else '✗ FAILED'} "
@@ -380,10 +529,10 @@ class GodotCoder:
                 state.final_code = state.code
                 return state
 
-        # ── All attempts failed — roll back ───────────────────
+        # ── All attempts failed — atomic roll back ────────────
         try:
             if existed and state.backup is not None:
-                target.write_bytes(state.backup)
+                self._atomic_restore(target, state.backup)
                 self._emit("rollback",
                            "All attempts failed — restored original file.")
             elif not existed and target.exists():

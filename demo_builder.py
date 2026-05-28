@@ -374,7 +374,67 @@ def _tpl_vn(concept) -> List[Tuple[str, str]]:
             ("main.gd", main_gd)]
 
 
+# Per-genre TODO suggestions stamped into the generic skeleton when we
+# fall through (no dedicated template for this genre). The Coder agent
+# uses these as concrete next-step hooks. Keep the lists short — the
+# user is going to read all of them.
+_GENERIC_TODOS_BY_GENRE: Dict[str, List[str]] = {
+    "rhythm": [
+        "load a beatmap (JSON: array of {time_ms, lane}) into _ready()",
+        "spawn note nodes that travel a fixed lane over N seconds",
+        "score press timing against a hit window (e.g. ±80ms perfect, ±150ms ok)",
+    ],
+    "deck builder": [
+        "represent the player deck as Array[Resource] of Card",
+        "draw N cards into the hand container per turn",
+        "implement a single resolve-card-effect dispatcher",
+    ],
+    "racing": [
+        "use VehicleBody3D or a simple kinematic 2D car body",
+        "lap-counter via Area2D start-line trigger",
+        "store best lap time in user://lap_records.json",
+    ],
+    "horror": [
+        "first-person Camera3D in a Node3D rig (or Camera2D for 2D)",
+        "stamina + flashlight battery as exported floats with timers",
+        "an enemy AI Node with patrol / chase / lose-sight states",
+    ],
+    "stealth": [
+        "guard FOV via raycasts in a SightCone Node2D",
+        "alert level int exported per-guard; broadcast on detection",
+        "noise events as signals routed through an Autoload",
+    ],
+    "sandbox": [
+        "tile-grid world via TileMap with an inventory autoload",
+        "place / break tile actions on left/right click",
+        "save the world to a JSON in user://worlds/",
+    ],
+}
+
+
+def _generic_todos_for(genre: str) -> List[str]:
+    """Pick the right TODO bullet-list for a genre that didn't get a
+    dedicated template. Falls back to a small "any game" list."""
+    g = (genre or "").lower()
+    for key, todos in _GENERIC_TODOS_BY_GENRE.items():
+        if key in g:
+            return todos
+    return [
+        "decide what the player does in 30 seconds, then in 5 minutes",
+        "wire ONE input action that produces ONE visible effect",
+        "add a Game Manager Autoload for shared state",
+    ]
+
+
 def _tpl_generic(concept) -> List[Tuple[str, str]]:
+    # Stamp the detected genre into the script so:
+    #   • The user sees it at the top of main.gd
+    #   • The Coder agent has an unambiguous hook for "fill this in"
+    # The TODOs below are genre-aware so even a "generic" scaffold
+    # points the user toward the next concrete step rather than
+    # leaving them at a blank Node2D.
+    detected_genre = concept.genre or "(unspecified)"
+    todos = _generic_todos_for(detected_genre)
     main_tscn = (
         '[gd_scene load_steps=2 format=3]\n'
         '\n'
@@ -390,17 +450,27 @@ def _tpl_generic(concept) -> List[Tuple[str, str]]:
         'offset_bottom = 100.0\n'
         f'text = "{concept.display_title}"\n'
     )
-    main_gd = (
-        '# main.gd — Generic skeleton\n'
-        f'# Concept: {concept.display_title}\n'
-        f'# Genre:   {concept.genre or "(unspecified)"}\n'
-        f'# Hook:    {concept.hook}\n'
-        '\n'
-        'extends Node2D\n'
-        '\n'
-        'func _ready() -> void:\n'
-        f'\tprint("[main] {concept.display_title} ready")\n'
-    )
+    main_gd_lines = [
+        '# main.gd — Generic skeleton',
+        f'# ANVIL_GENRE: {detected_genre}',
+        f'# Concept: {concept.display_title}',
+        f'# Hook:    {concept.hook}',
+        '#',
+        f'# Anvil does not yet ship a dedicated template for '
+        f'{detected_genre!r}.',
+        '# The TODO list below is a concrete starting point — ask the',
+        '# Coder agent ("🤖 Ask Coder") to flesh out any one of these:',
+    ]
+    for t in todos:
+        main_gd_lines.append(f"#   - {t}")
+    main_gd_lines += [
+        "",
+        "extends Node2D",
+        "",
+        "func _ready() -> void:",
+        f"\tprint(\"[main] {concept.display_title} ready\")",
+    ]
+    main_gd = "\n".join(main_gd_lines)
     return [("project.godot", "__main_scene__"),
             ("main.tscn", main_tscn),
             ("main.gd", main_gd)]
@@ -445,6 +515,26 @@ def _render_readme(concept, template_name: str) -> str:
         _section("Comparable titles", concept.comparable_titles),
         _section("What sets it apart", concept.differentiator),
         _section("Why it works", concept.why_it_works),
+    ]
+    # If we fell through to the generic template, surface the
+    # genre-aware TODO list explicitly in the README so the user
+    # knows what's NOT in the scaffold yet.
+    if template_name == "generic":
+        todos = _generic_todos_for(concept.genre or "")
+        parts.append(
+            "## Anvil notes\n\n"
+            f"This scaffold uses the **generic** skeleton — Anvil does "
+            f"not yet ship a dedicated template for "
+            f"`{concept.genre or '(unspecified)'}`. The script just "
+            f"prints a ready message and shows the title; the next "
+            f"layer is up to you (or the Coder agent).\n\n"
+            f"Concrete next steps for a `{concept.genre or 'game'}`:\n\n"
+            + "\n".join(f"- {t}" for t in todos)
+            + "\n\n"
+            "Each one is a one-shot request for 🤖 Ask Coder. Pick "
+            "the smallest and ship it before the next.\n\n"
+        )
+    parts += [
         "## Next steps\n\n",
         "- Open this folder in the Godot Workspace and hit ▶ Run.\n",
         "- Use 🤖 Ask Coder to flesh out one mechanic at a time.\n",
