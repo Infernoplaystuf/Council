@@ -21,22 +21,26 @@ requests>=2.31
 
 # ---- Data ingestion / display ----
 #
-# numpy / pandas pinned BELOW 2.3 because dream3dnx (BlueQuartz
-# Software's SIMPLNX bindings, installed via conda) was built
-# against numpy < 2.x and pandas < 2.3 ABIs. Without these caps,
-# pip can pull numpy 2.3+ and silently break `import simplnx`
-# with "numpy.dtype size changed" / "_ARRAY_API not found".
-numpy>=1.24,<2.3
-pandas>=2.0,<2.3
+# numpy / pandas pinned BELOW 2.3 ONLY when dream3dnx is also in
+# the env (Section E in installs.txt — Linux). Sections A/B/C/D
+# (Windows) deliberately exclude dream3dnx, so this file allows
+# whatever numpy/pandas the resolver picks for those installs.
+# The pip-only path that bundles into the .exe also uses these
+# without the upper caps because it never has dream3dnx loaded.
+numpy>=1.24
+pandas>=2.0
 openpyxl>=3.1            # XLSX support
 xlrd>=2.0                # legacy XLS support
 pyarrow>=15.0            # fast parquet/feather (optional but recommended)
 
-# h5py is installed via conda-forge in installs.txt (NOT here).
-# Reason: dream3dnx ships its own HDF5 .dll/.so and pip's h5py
-# wheel ships a DIFFERENT HDF5 — running both ends with the
-# "HDF5 library version mismatched" crash on `import simplnx`.
-# Don't add h5py to this file even if you think you need it.
+# h5py — read .dream3d HDF5 files for keyword indexing. Safe to
+# install from PyPI on Windows (sections A/B/C/D) because
+# dream3dnx is NOT in those envs — without dream3dnx there's no
+# HDF5 .dll conflict to worry about. Section E (Linux + dream3dnx)
+# deliberately installs h5py via conda-forge BEFORE pip runs;
+# pip's --upgrade-strategy only-if-needed preserves the conda
+# h5py instead of overwriting it with the PyPI version.
+h5py>=3.10
 # h5py>=3.10               # see comment above — conda-only
 
 # ---- Plotting (Grapher tab) ----

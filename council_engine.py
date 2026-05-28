@@ -150,6 +150,153 @@ def _council_backend() -> str:
 _GGUF_MODEL_INSTANCE = None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# GGUF metadata reader — peek at the model's advertised max context
+# WITHOUT loading the weights.
+#
+# llama-cpp-python's Llama() constructor allocates the KV cache during load,
+# which means n_ctx has to be decided BEFORE we know what the model
+# actually supports. By pre-parsing the GGUF header we can pick a sensible
+# default automatically — typically the model's full training context up
+# to a safe cap — instead of always defaulting to 4096.
+#
+# GGUF file format (v2/v3 — the only versions in the wild):
+#   magic       : 4 bytes  "GGUF"
+#   version     : uint32   (LE)
+#   tensor_count: uint64   (LE)
+#   metadata_kv : uint64   (LE)  count of metadata key-value pairs
+#   kv pairs    : each:
+#       key_len  uint64
+#       key      bytes (utf-8, length = key_len)
+#       value_t  uint32  (type tag)
+#       value    bytes (length and shape depend on value_t)
+#   tensor metadata follows, then padding, then tensor data
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Value type tags per the GGUF spec
+_GGUF_VAL_TYPES = {
+    0:  ("u8",  1, "<B"),
+    1:  ("i8",  1, "<b"),
+    2:  ("u16", 2, "<H"),
+    3:  ("i16", 2, "<h"),
+    4:  ("u32", 4, "<I"),
+    5:  ("i32", 4, "<i"),
+    6:  ("f32", 4, "<f"),
+    7:  ("bool", 1, "<?"),
+    # 8 = string (handled specially)
+    # 9 = array  (handled specially)
+    10: ("u64", 8, "<Q"),
+    11: ("i64", 8, "<q"),
+    12: ("f64", 8, "<d"),
+}
+
+
+def _read_gguf_value(fh, val_type: int) -> Any:
+    """Read one GGUF value from an open binary file handle. Used by the
+    metadata pre-scan. Returns the parsed value, or raises on a bad type.
+    Arrays are recursively parsed but their items are returned as a list
+    only when small (≤ 32 items); larger arrays return ``[]`` to keep the
+    pre-scan fast — we never need the array contents for n_ctx anyway."""
+    import struct
+    if val_type == 8:
+        # string
+        (slen,) = struct.unpack("<Q", fh.read(8))
+        return fh.read(slen).decode("utf-8", errors="replace")
+    if val_type == 9:
+        # array — read element type + length, then elements
+        (elem_t,) = struct.unpack("<I", fh.read(4))
+        (alen,)   = struct.unpack("<Q", fh.read(8))
+        # Skip array bodies — we don't need them for n_ctx detection,
+        # and some arrays (vocab token lists) can be hundreds of MB.
+        # Compute the element byte-size and seek past.
+        if elem_t in _GGUF_VAL_TYPES:
+            elem_size = _GGUF_VAL_TYPES[elem_t][1]
+            fh.seek(elem_size * alen, 1)  # 1 = SEEK_CUR
+            return []
+        if elem_t == 8:
+            # array of strings — must read each to get past it (variable size)
+            for _ in range(alen):
+                (slen,) = struct.unpack("<Q", fh.read(8))
+                fh.seek(slen, 1)
+            return []
+        # Unknown element type — bail
+        return None
+    if val_type in _GGUF_VAL_TYPES:
+        _name, size, fmt = _GGUF_VAL_TYPES[val_type]
+        (v,) = struct.unpack(fmt, fh.read(size))
+        return v
+    # Unknown type — return None and let the caller bail
+    return None
+
+
+def read_gguf_metadata(path: Any, max_kv: int = 4096) -> Dict[str, Any]:
+    """Open a GGUF file, parse the header KV section, return a dict of
+    metadata. Never loads weights or allocates the KV cache.
+
+    Returns an empty dict on any error — callers fall back to env-var
+    defaults if the reader can't pin down the model's advertised context.
+    The `max_kv` cap protects against malformed files claiming millions
+    of KV entries.
+    """
+    import struct
+    out: Dict[str, Any] = {}
+    try:
+        with open(str(path), "rb") as fh:
+            magic = fh.read(4)
+            if magic != b"GGUF":
+                return {}
+            (version,) = struct.unpack("<I", fh.read(4))
+            if version not in (2, 3):
+                # Old v1 GGUF (very early) used a different layout; not
+                # worth supporting — any current model is v2 or v3.
+                return {}
+            # tensor_count (unused), metadata KV count
+            fh.read(8)
+            (kv_count,) = struct.unpack("<Q", fh.read(8))
+            if kv_count > max_kv:
+                return {}
+            for _ in range(kv_count):
+                (key_len,) = struct.unpack("<Q", fh.read(8))
+                key = fh.read(key_len).decode("utf-8", errors="replace")
+                (val_type,) = struct.unpack("<I", fh.read(4))
+                value = _read_gguf_value(fh, val_type)
+                out[key] = value
+    except Exception:
+        pass
+    return out
+
+
+def _gguf_max_context_from_metadata(metadata: Dict[str, Any]) -> Optional[int]:
+    """Extract the model's training context length from a parsed GGUF
+    metadata dict. The key name is namespaced per architecture
+    (``llama.context_length``, ``qwen2.context_length``, etc.), so we
+    look for anything ending in ``.context_length``.
+
+    Returns None when the field is missing or not an int — caller falls
+    back to env-var default.
+    """
+    if not metadata:
+        return None
+    # Common explicit keys first (faster than scanning all metadata).
+    for k in (
+        "general.context_length",
+        "llama.context_length", "qwen2.context_length",
+        "mistral.context_length", "granite.context_length",
+        "phi.context_length", "phi3.context_length", "phi4.context_length",
+        "gemma.context_length", "gemma2.context_length",
+        "deepseek.context_length", "qwen.context_length",
+    ):
+        v = metadata.get(k)
+        if isinstance(v, int) and v > 0:
+            return v
+    # Fallback: any *.context_length field
+    for k, v in metadata.items():
+        if isinstance(k, str) and k.endswith(".context_length"):
+            if isinstance(v, int) and v > 0:
+                return v
+    return None
+
+
 def _get_gguf_model():
     """Lazy-load the GGUF model singleton. Raises with a helpful message on
     misconfiguration so the user knows what env var to set."""
@@ -177,7 +324,51 @@ def _get_gguf_model():
             "  pip install llama-cpp-python"
         ) from exc
 
-    n_ctx = int(os.environ.get("COUNCIL_GGUF_N_CTX", "4096"))
+    # ── Auto-detect n_ctx from GGUF metadata when not explicitly set ──
+    #
+    # Three layers of precedence, highest first:
+    #   1. COUNCIL_GGUF_N_CTX env var — user override, always wins.
+    #   2. GGUF model's advertised training context_length, capped at
+    #      COUNCIL_GGUF_N_CTX_MAX (default 32768) to protect VRAM on
+    #      models that advertise 128K+ contexts when the user's GPU
+    #      can't hold the KV cache for that.
+    #   3. Conservative fallback of 4096 if the metadata can't be read
+    #      (very old GGUF or a parser failure).
+    #
+    # The cap exists because:
+    #   - Llama 3.1 8B advertises 131,072 max context
+    #   - KV cache at 131,072 context = ~16 GB just for the cache
+    #   - That blows VRAM on any 16 GB GPU (model weights also need room)
+    # 32K (the default cap) is a sweet spot: large enough for most
+    # workflows (long-document summarisation, multi-file injection),
+    # small enough to fit comfortably on a 16 GB GPU alongside an 8B
+    # Q4 or 14B Q4 model. Users with bigger GPUs can raise the cap
+    # via COUNCIL_GGUF_N_CTX_MAX (or just pin n_ctx with
+    # COUNCIL_GGUF_N_CTX directly).
+    env_n_ctx = os.environ.get("COUNCIL_GGUF_N_CTX", "").strip()
+    if env_n_ctx:
+        # Explicit user override.
+        n_ctx = int(env_n_ctx)
+        n_ctx_source = "env var COUNCIL_GGUF_N_CTX"
+    else:
+        try:
+            n_ctx_cap = int(os.environ.get("COUNCIL_GGUF_N_CTX_MAX", "32768"))
+        except Exception:
+            n_ctx_cap = 32768
+        try:
+            metadata = read_gguf_metadata(p)
+            model_max = _gguf_max_context_from_metadata(metadata)
+        except Exception:
+            model_max = None
+        if model_max and model_max > 0:
+            n_ctx = min(model_max, n_ctx_cap)
+            n_ctx_source = (f"auto from GGUF metadata "
+                            f"(model advertises {model_max:,}, "
+                            f"capped at {n_ctx_cap:,})")
+        else:
+            n_ctx = 4096
+            n_ctx_source = "fallback default (couldn't read metadata)"
+    print(f"[GGUF] n_ctx = {n_ctx:,}  (source: {n_ctx_source})", flush=True)
     # Default n_threads: prefer PHYSICAL cores when we can read them,
     # otherwise fall back to logical-count (os.cpu_count()) which is
     # what the app used historically. Note we deliberately do NOT use a
