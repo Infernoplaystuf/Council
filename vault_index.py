@@ -1848,8 +1848,13 @@ the vocabulary list. Lowercase only. Single line only.
         expanded = {t for t in expanded if t
                     and t not in _SEARCH_STOP_TOKENS
                     and len(t) > 1}
-        if not expanded:
-            return [], fuzzy_matches
+        # Note: we deliberately do NOT early-return when `expanded` is
+        # empty. The keyword pass below will simply produce no scored
+        # results, and the embedding pass at the end can still surface
+        # the closest semantic matches (e.g. for a query like "what
+        # pipeline does X" where every word is a stop-word). That's
+        # what makes "show me the closest script even if nothing's an
+        # exact match" work.
 
         # candidate set (folder-scoped if requested)
         cand: List[Tuple[str, Dict[str, Any]]] = []
