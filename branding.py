@@ -27,19 +27,20 @@ DEMO_MODE = os.environ.get("DI_DEMO_MODE", "1").lower() not in ("0", "false", "n
 
 # ---- Identity ----------------------------------------------------------------
 
-PRODUCT_NAME    = os.environ.get("COUNCIL_PRODUCT_NAME", "Data's Inferno")
-PRODUCT_SHORT   = os.environ.get("COUNCIL_PRODUCT_SHORT", "Data's Inferno")
+PRODUCT_NAME    = os.environ.get("COUNCIL_PRODUCT_NAME", "Anvil")
+PRODUCT_SHORT   = os.environ.get("COUNCIL_PRODUCT_SHORT", "Anvil")
 PRODUCT_TAGLINE = os.environ.get(
     "COUNCIL_TAGLINE",
-    "An AI panel for poking at my own data."
+    "An AI workshop for forging Godot games."
 )
 PRODUCT_PITCH   = os.environ.get(
     "COUNCIL_PITCH",
-    "Drop in a CSV, ask a question. A panel of AI specialists deliberates "
-    "and gives you an answer you can poke at because every step is visible. "
-    "Runs locally — your data stays on this machine."
+    "Open a Godot project. Ask a panel of AI specialists for a scene, a "
+    "mechanic, a market read. They deliberate; you watch every step; you "
+    "hit Run and see it in Godot a second later. Runs locally — your code "
+    "and your concepts stay on this machine."
 )
-VERSION         = "1.0.0-home"
+VERSION         = "0.1.0-anvil"
 COPYRIGHT       = "© 2026"
 SUPPORT_EMAIL   = os.environ.get("COUNCIL_SUPPORT_EMAIL", "")
 WEBSITE         = os.environ.get("COUNCIL_WEBSITE",       "")
@@ -128,7 +129,7 @@ def window_title(subtitle: str = "") -> str:
     return PRODUCT_NAME
 
 
-APP_USER_MODEL_ID = "Infernoplaystuf.Council.Demo.1"
+APP_USER_MODEL_ID = "Infernoplaystuf.Anvil.1"
 
 
 def set_app_user_model_id(app_id: str = APP_USER_MODEL_ID) -> bool:

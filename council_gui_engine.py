@@ -3735,6 +3735,18 @@ class CouncilConsole(tk.Tk):
             self._build_vault_health_tab()
             self._build_apoth_tab()
 
+        # ── Anvil game-dev tabs (phase A scaffold) ──
+        # Currently behind _ADVANCED_MODE so the placeholder "coming
+        # soon" panes don't confuse the customer-facing flow before
+        # they actually do anything. Phase C-lite promotes the Godot
+        # Workspace tab to the always-on customer flow once the Run
+        # loop is functional; Phase B does the same for Game Concepts;
+        # Phase D for Steam Market.
+        if _ADVANCED_MODE:
+            self._build_godot_workspace_tab()
+            self._build_game_concepts_tab()
+            self._build_steam_market_tab()
+
     # ---- Backend strip (model backend selector) ----
 
     _BACKEND_SETTINGS_FILENAME = "backend_settings.json"
@@ -9650,6 +9662,89 @@ class CouncilConsole(tk.Tk):
             self.tab_apoth, self.apoth, ui_queue=self.ui_q,
         )
         self.apoth_console.pack(fill="both", expand=True)
+
+    # ---- Anvil game-dev tabs (phase A scaffold) ----
+    #
+    # These are stub tabs reserving the slot + import-time wiring for the
+    # phase B / C-lite / D / E features. Each shows a "phase X — coming
+    # soon" placeholder pane until the matching phase implements it.
+    #
+    # The pattern (matching _build_apoth_tab above): lazy import of the
+    # backing module, build a tk.Frame, attach a placeholder label,
+    # leave a structural TODO comment pointing at what lands next.
+
+    _COMING_SOON_BG = "#1a1414"
+    _COMING_SOON_FG = "#9a8a8a"
+
+    def _add_coming_soon_tab(self, attr: str, label: str,
+                              title: str, phase: str, description: str):
+        """Build a uniform "coming soon" placeholder Frame and add it as
+        a Notebook tab. Used by all phase-A stub tabs."""
+        frame = ttk.Frame(self.nb)
+        setattr(self, attr, frame)
+        self.nb.add(frame, text=label)
+        # Centered headline + small body. Nothing fancy — meant to be
+        # replaced by the real builder when the phase lands.
+        wrap = ttk.Frame(frame)
+        wrap.place(relx=0.5, rely=0.4, anchor="center")
+        ttk.Label(wrap, text=title,
+                  font=("Segoe UI", 16, "bold"),
+                  foreground=self._COMING_SOON_FG).pack(pady=(0, 6))
+        ttk.Label(wrap, text=f"{phase} — not yet implemented",
+                  foreground=self._COMING_SOON_FG).pack()
+        body = ttk.Label(wrap, text=description, justify="center",
+                         foreground=self._COMING_SOON_FG, wraplength=520)
+        body.pack(pady=(10, 0))
+
+    def _build_godot_workspace_tab(self):
+        """Godot Workspace — the IDE tab. Phase C-lite lands the file
+        tree, GDScript editor, Run/Validate buttons, and console panel.
+        Stub for now."""
+        # Module is imported eagerly so a missing godot_workspace.py
+        # surfaces at startup, not the first time you click the tab.
+        import godot_workspace  # noqa: F401
+        self._add_coming_soon_tab(
+            "tab_godot_workspace",
+            "🛠 Godot Workspace",
+            "Godot Workspace",
+            "Phase C-lite",
+            "File tree, GDScript editor, scene-tree view, Run / "
+            "Validate buttons, and stderr-to-Council console will "
+            "live here. Project detection + GodotRunner subprocess "
+            "are the next pieces to land.",
+        )
+
+    def _build_game_concepts_tab(self):
+        """Game Concepts — Phase B lands the retargeted idea_engine
+        front-end. Stub for now."""
+        import idea_engine  # noqa: F401
+        self._add_coming_soon_tab(
+            "tab_game_concepts",
+            "💡 Game Concepts",
+            "Game Concepts",
+            "Phase B",
+            "Brainstorm game concepts (genre, hook, mechanics, "
+            "target audience, comparable titles). The Game Designer "
+            "specialist will auto-summon. \"Send to Godot Workspace\" "
+            "ships the concept into a scaffolded project via "
+            "demo_builder.",
+        )
+
+    def _build_steam_market_tab(self):
+        """Steam Market — Phase D lands SteamSpy/SteamCharts/Web-API
+        ingestion + the Steam Market Analyst. Stub for now."""
+        import steam_ingest, steam_analyst  # noqa: F401
+        self._add_coming_soon_tab(
+            "tab_steam_market",
+            "📈 Steam Market",
+            "Steam Market",
+            "Phase D",
+            "Pull current Steam data (SteamSpy + SteamCharts, or your "
+            "own Steam Web API key) into vault/steam/. The Steam "
+            "Market Analyst is the only thing that reads the raw "
+            "cache — it surfaces deterministic answers with "
+            "citations, never invented numbers.",
+        )
 
     # ============================
     # Transcript helpers

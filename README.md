@@ -1,47 +1,47 @@
-# Data's Inferno
+# Anvil
 
-A little workspace I built so I can ask AI questions about my own data.
+An AI workshop for forging Godot games.
 
-Drop a CSV on the Grapher. Ask the Council a question. A panel of AI specialists deliberates and tells you what they see — every step is visible so you can poke at the reasoning. Nothing leaves the machine.
+Open a Godot project. Ask a panel of AI specialists for a scene, a mechanic, a market read. They deliberate; you watch every step; you hit Run and see it in Godot a second later. Runs locally — your code and your concepts stay on this machine.
 
 This is the home build. No licensing, no trials, no telemetry, no phone-home. If you got a copy from me, just run it.
 
 ---
 
-## What it does well
+## What it's for
 
-- **Q&A on your data.** "Which customers haven't ordered in 90 days?" — point it at a CSV, get an answer with citations.
-- **Auto-charts.** Drop a file in the Grapher, click *Ask Analyst*, get a sensible chart for the data you have.
-- **Cross-file lookups.** "Find C1234" or "Tell me about Sarah Smith" — scans every CSV/JSON in the vault, surfaces matching rows from each file, and detects which files share columns (so you can spot foreign-key links automatically). Click 🔍 *Look Up* in the Council, or just type a lookup-shaped question.
-- **Multi-AI deliberation.** Several AI personalities argue in front of you so you see disagreement, not a single confident answer that might be wrong.
-- **Domain lenses.** I made *Personal Specialists* — Sales, Inventory, Customer — that get auto-summoned when a question matches their area. They share the same data pool so cross-domain questions work.
+- **Godot, end to end.** Anvil is the editor and the brain; Godot stays the runtime and visualiser. Edit a `.gd` script, hit Run, watch it in Godot's window without leaving Anvil.
+- **A council of AI specialists, not one assistant.** When you ask "what's broken about this jump curve?" several personalities argue in front of you so you see disagreement, not a single confident answer.
+- **Game-concept generation.** Brainstorm concepts (genre, hook, mechanics, comparable titles), then ship them into a Godot skeleton you can prototype the same afternoon.
+- **Steam market signal.** Pull current Steam data and ask the Market Analyst "what couch-co-op puzzle games are doing well right now" — the analyst computes from cached data, never invents numbers.
+- **Goal-anchored agents.** Small local models (8B-ish) stay locked on what you actually asked even when long files are in context. See `goal_anchor.py`.
 
-## What it's bad at
+## What it's bad at (today)
 
-- Anything that needs the latest internet info (it's offline by design).
-- Truly massive datasets — the in-memory Grapher chokes past a few hundred thousand rows.
-- Models smaller than ~7B can be quite literal; bump up to 14B if a laptop will tolerate it.
+- It's early. Several of the tabs listed below are still scaffolding.
+- It expects Godot to be installed separately. Anvil shells out to the `godot` binary — it doesn't bundle the engine.
+- Models smaller than ~7B can be very literal; bump up if your machine tolerates it.
 
 ---
 
 ## How to run it
 
-You'll need Python 3.11 and [Ollama](https://ollama.com).
+You'll need Python 3.11 and Godot 4.x.
 
 ```bash
 # 1. Set up a Python env
-conda create -n council python=3.11 -y
-conda activate council
+conda create -n anvil python=3.11 -y
+conda activate anvil
 pip install -r requirements.txt
 
-# 2. Install Ollama (https://ollama.com), then pull a model
-ollama pull qwen2.5:14b-instruct-q4_K_M
+# 2. Get a GGUF model file from Hugging Face (qwen2.5-coder, granite-code,
+#    etc.) and remember where you saved it.
 
 # 3. Launch
 python council_gui_engine.py
 ```
 
-First launch shows a small setup wizard that confirms Ollama is running and points at the right model. After that you're done.
+First launch shows a small setup wizard that confirms a GGUF model is selected and asks where your Godot binary lives. After that you're done.
 
 If you want the bundled `.exe` instead of running from source:
 
@@ -49,7 +49,7 @@ If you want the bundled `.exe` instead of running from source:
 pip install pyinstaller
 build.bat        # Windows
 ./build.sh       # macOS / Linux
-# Look in dist/DatasInferno/
+# Look in dist/Anvil/
 ```
 
 ---
@@ -59,14 +59,15 @@ build.bat        # Windows
 | Tab | What it's for |
 |---|---|
 | **⚖ Council** | The chat. Ask anything. The Judge picks a panel and they deliberate. |
-| **📊 Grapher** | Drop a file, get charts. Auto-detects column types. The 📦 *Sample* button loads bundled fake data if you don't have anything handy. |
-| **🎓 Specialists** | Edit/create the named lenses. Three pre-built (Sales, Inventory, Customer). Each is a system-prompt overlay over a base personality. |
+| **🛠 Godot Workspace** | The IDE. File tree, GDScript editor, scene-tree view, Run/Validate buttons, console panel. The edit-test-visualise loop lives here. *(Phase C-lite)* |
+| **💡 Game Concepts** | Brainstorm concepts: genre, hook, mechanics, target audience, comparable titles. Ship a concept straight into the Godot Workspace as a scaffolded project. *(Phase B)* |
+| **📈 Steam Market** | Pull current Steam stats (SteamSpy + SteamCharts, or your own Steam Web API key) and ask the Market Analyst what's working in the genre you care about. *(Phase D)* |
+| **🎓 Specialists** | Edit/create domain lenses. Game Designer, Genre Analyst, Steam Market Analyst, plus your own. |
 | **🔍 Lens** | Paste an answer, pick which roles should review it in parallel. Useful when you don't fully trust what the Council just told you. |
 | **🕓 Sessions** | Every past chat. Searchable. Click any to load. |
-| **🗄 Vault** | The shared data pool. Drop CSVs / docs / cloned repos in here for the Sage to index. |
-| **🎙 Speech** | Record audio → transcribe → feed to Council. Also reads text aloud. |
+| **🗄 Vault** | The shared data pool. Game-design docs, reference scripts, ingested Steam JSON. |
 
-There are six more "advanced" tabs (IDE, Agents, Nodes, Apothecary, etc.) that are hidden by default. Set `COUNCIL_ADVANCED=1` before launching to see them.
+A few "advanced" tabs (IDE, Agents, Nodes, Apothecary, etc.) carried over from the previous build are hidden by default. Set `COUNCIL_ADVANCED=1` before launching to see them.
 
 ---
 
@@ -74,28 +75,30 @@ There are six more "advanced" tabs (IDE, Agents, Nodes, Apothecary, etc.) that a
 
 ```
 1. Launch
-2. Drop my orders.csv into the Grapher → schema autodetects
-3. 📊 Council: "Which months had the biggest revenue swing?"
-   Sales Specialist auto-summons. Council finds my orders.csv,
-   loads it into the Grapher, asks the Analyst for a chart.
-4. Tweak the chart axes manually until it tells me what I want
-5. 🔍 Lens: paste the verdict, ask Skeptic + Algorithm to review
-6. Done — sessions auto-save in the 🕓 Sessions tab
+2. Game Concepts: "co-op puzzle, 2 players, asymmetric roles, ~3hr playthrough"
+   Game Designer + Genre Analyst summon. They draft mechanics, name candidates,
+   nearest comparables on Steam.
+3. Pick the concept I like → "Send to Godot Workspace"
+4. Workspace: scaffolded project appears with placeholder scene + a main.gd
+5. Council: "the player keeps clipping through the floor when respawning"
+   Coder agent reads main.gd, proposes fix, writes it back.
+6. Hit Run → Godot launches, I watch the fix work
+7. Steam Market: "what 2D puzzle co-ops are charting this month?"
+   Market Analyst computes from cached SteamSpy data, lists 5 with
+   median revenue ranges. Source-cited, no invented numbers.
+8. Sessions auto-save in the 🕓 Sessions tab
 ```
 
 ---
 
-## Personal Specialists
+## Specialists
 
-Three lenses ship with it:
+- **🎮 Game Designer** — mechanics, pacing, balance, player loops
+- **🎭 Genre Analyst** — tropes, conventions, comparable titles, positioning
+- **📈 Steam Market Analyst** — interprets ingested Steam data; the hard rule: never invent numbers, always cite source rows
+- **🧑‍💻 Coder** — GDScript-focused ReAct loop; goal-anchored across retries so refactors don't drift
 
-- **💰 Sales Specialist** — revenue, AOV, retention, churn
-- **📦 Inventory Specialist** — stock, turnover, dead stock, suppliers
-- **🤝 Customer Specialist** — loyalty, dormancy, segmentation
-
-When you ask a question that mentions one of their domain keywords, that specialist gets auto-summoned. Ask something that spans multiple domains ("buy enough stock based on last year's sales") and *both* specialists run in parallel — the Judge synthesises.
-
-You can edit them in the 🎓 Specialists tab. Each one is just config: name, icon, description, keywords, system-prompt overlay, and which base personality wears the lens. There are no separate per-specialist data folders — everything lives in the shared vault, which is the point.
+You can edit them in the 🎓 Specialists tab. Each one is just config: name, icon, description, keywords, system-prompt overlay, and which base personality wears the lens.
 
 ---
 
@@ -103,48 +106,27 @@ You can edit them in the 🎓 Specialists tab. Each one is just config: name, ic
 
 ```
 vault/
-├── data_in/                ← MY DATA  (read-only by the app)
-│   └── *.csv / *.json      drop input files here
-├── data_out/               ← APP OUTPUTS  (charts, exports, joins)
-│   ├── charts/
-│   └── exports/
+├── data_in/                ← REFERENCE DATA  (read-only by the app)
+│   └── *.csv / *.json      drop design docs, level-design CSVs, etc. here
+├── data_out/               ← APP OUTPUTS  (exports, generated assets)
+├── steam/                  ← STEAM CACHE  (protected — analyst-only)
+│   └── *.jsonl             SteamSpy / SteamCharts / Web-API pulls
+├── projects/               ← GODOT PROJECTS  (each subfolder is a project)
 ├── conversations/          one JSONL per session  (app internal)
+├── conversation_logs/      per-session debug log + goal cache (protected)
 ├── memory/                 per-personality persistent notes (app internal)
-├── logs/                   council.log + crash logs
-├── workspace/              code-runner scratch files
-├── .chromadb/              vector index (RAG memory)
-├── .git_clones/            cloned reference repos
 └── specialists.json        the specialist registry
 ```
 
-The hard rule: **input data is never overwritten**.
-
-- `data_in/` is the single read source for the data search / lookup /
-  Find-and-Chart pipeline. The app reads from here and never writes
-  back. Drop your CSVs in this folder.
-- `data_out/` is the only place those features write to. Every chart
-  export, joined dataset, or derived CSV lands here. You can wipe it
-  any time without losing originals.
-- `bundled samples` (`assets/sample_data/`) are also read as inputs —
-  same read-only contract, but they live with the app rather than in
-  the vault.
-
-The split is enforced in code: the `DataIndex` constructor refuses to
-instantiate if its read paths overlap with its write path, and
-`safe_write_path()` refuses to produce a path that would land inside
-`data_in/`.
+The hard rule: **the model never reads Steam data directly.** Steam JSON lives under `vault/steam/`, which is in `PROTECTED_SUBDIRS` — only the Steam Market Analyst can compute from it, and it surfaces results with citations rather than passing raw rows to the council. This is the same anti-hallucination pattern that protected user-data files in the previous build.
 
 All of `vault/` is gitignored. Delete the folder to reset.
-
-The 🎓 Specialists tab has **📂 Open data_in folder** and **📤 Open
-data_out folder** buttons that pop the OS file manager so I never have
-to hunt for them.
 
 ---
 
 ## If something seems stuck after a `git pull`
 
-Python caches compiled bytecode in `__pycache__/`. If the cache somehow ends up newer than the source (rare, but happens with certain git operations or editor mtime quirks), Python uses the cached bytecode and your fix doesn't take effect. The launcher auto-purges stale caches on startup — but if you want to force-clean:
+Python caches compiled bytecode in `__pycache__/`. The launcher auto-purges stale caches on startup — but if you want to force-clean:
 
 ```bash
 python clean.py
@@ -156,10 +138,21 @@ Then relaunch.
 
 ## Things to know
 
-- Models swap = slow. By default every personality runs on the same Ollama model so the GPU/RAM keeps one model hot. If you have 32 GB+ and want to mix in a code-specialist model for the Coder role, edit `vault/personality_backends.json`.
-- The IDE Runner has a trust gate that flags risky operations (subprocess, eval, file delete, raw sockets, etc.) before running generated code. Annoying once or twice; saves your bacon eventually.
-- Crash logs land in `vault/logs/crashes/` — they have a stack trace, OS info, and nothing else. Send them to me if something keeps blowing up.
-- This build never reaches out to the internet apart from talking to your local Ollama. No telemetry, no update server, no license server.
+- Models swap = slow. By default every personality runs on the same GGUF so the GPU/RAM keeps one model hot. To mix in a code-specialist model for the Coder role, edit `vault/personality_backends.json`.
+- The Godot Workspace Run button shells out to `godot --path <project>` — Anvil doesn't bundle Godot. Onboarding asks for the binary path on first launch.
+- Crash logs land in `vault/logs/crashes/` — they have a stack trace, OS info, and nothing else.
+- This build never reaches out to the internet *except* when you explicitly opt into Steam ingestion in the 📈 Steam Market tab. No telemetry, no update server, no license server.
+
+---
+
+## Heritage
+
+Anvil shares its council infrastructure with two sibling branches in this repo:
+
+- `main` — the original creative-tooling build (video / music / idea ops)
+- `Work-Build` — the data-analysis pivot (CSV / Excel / vault analyst)
+
+The shared core is the deliberation loop, the goal-anchor system, the CoderAgent ReAct loop, and the token-aware context manager. Anvil retargets the creative tooling toward game development.
 
 ---
 
