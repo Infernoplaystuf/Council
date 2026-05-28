@@ -480,6 +480,60 @@ _TEXT_SUFFIXES = {
     ".txt", ".md", ".log", ".rst", ".yaml", ".yml",
     ".ini", ".cfg", ".toml", ".html", ".htm",
 }
+
+# Source-code files — same plain-text treatment as _TEXT_SUFFIXES (read
+# first ~4 KB, tokenize, store the resulting keyword set). Adding them
+# here means vault search now surfaces matches in code files: "find files
+# that import pandas," "which scripts reference process_data," etc.
+#
+# Without this set, .py / .js / .ts / .go / etc. files in data_in/ were
+# silently skipped by the rebuild walk — the vault index's _PARSEABLE
+# filter is the only filter the walk respects, and these extensions
+# weren't on it. Users would put Python files in their vault expecting
+# the model to search them and get nothing back.
+#
+# We index source code the same way as plain text (no syntax parsing).
+# Keyword tokenization on raw source produces useful matches for the
+# most common queries: identifier names, library imports, class /
+# function names, comment text. For richer queries on a specific
+# language (e.g. "find files implementing __iter__"), the analyst step
+# can still execute pandas / grep-style code over the raw files
+# regardless of what the keyword index captures.
+_SOURCE_CODE_SUFFIXES = {
+    # Python
+    ".py", ".pyw", ".pyi",
+    # Web / JS / TS
+    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+    ".css", ".scss", ".sass", ".less",
+    ".vue", ".svelte",
+    # Systems
+    ".go", ".rs", ".zig",
+    ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".hxx",
+    # JVM
+    ".java", ".kt", ".kts", ".scala", ".groovy",
+    # .NET
+    ".cs", ".fs", ".vb",
+    # Scripts / shells
+    ".sh", ".bash", ".zsh", ".fish",
+    ".ps1", ".psm1", ".bat", ".cmd",
+    # Other languages
+    ".rb", ".php", ".swift", ".m", ".mm",
+    ".lua", ".pl", ".pm",
+    ".r",   ".jl",
+    ".dart", ".ex", ".exs", ".erl", ".hrl",
+    ".clj", ".cljs", ".cljc",
+    ".hs", ".lhs", ".ml", ".mli", ".elm",
+    # Database / config
+    ".sql", ".env", ".conf",
+    # IaC / build
+    ".dockerfile", ".tf", ".tfvars", ".nix",
+    ".cmake", ".mk", ".ninja",
+    ".gradle", ".sbt",
+    # Web markup beyond html/htm
+    ".xml", ".xsl", ".xslt", ".xsd",
+    ".jsonl", ".ndjson",
+}
+
 _EXCEL_SUFFIXES = {".xlsx", ".xls", ".xlsm"}
 _TABULAR_EXTRA  = {".tsv", ".parquet"}     # parquet needs pyarrow at runtime
 # SQLite databases (.db / .sqlite / .sqlite3) — indexed at the table level
@@ -492,8 +546,8 @@ _BSON_SUFFIXES = {".bson"}
 # like .json for keyword indexing so 'show pipeline X' / vault search
 # both pick them up).
 _D3DPIPELINE_SUFFIXES = {".d3dpipeline"}
-_PARSEABLE = ({".csv", ".json"} | _TEXT_SUFFIXES | _EXCEL_SUFFIXES
-              | _TABULAR_EXTRA | _SQLITE_SUFFIXES
+_PARSEABLE = ({".csv", ".json"} | _TEXT_SUFFIXES | _SOURCE_CODE_SUFFIXES
+              | _EXCEL_SUFFIXES | _TABULAR_EXTRA | _SQLITE_SUFFIXES
               | _DUCKDB_SUFFIXES | _BSON_SUFFIXES | _D3DPIPELINE_SUFFIXES)
 
 
@@ -1218,6 +1272,10 @@ def _index_file(p: Path) -> Optional[Dict[str, Any]]:
     elif suffix in _BSON_SUFFIXES:
         rec = _parse_bson(p)
     elif suffix in _TEXT_SUFFIXES:
+        rec = _parse_text(p, suffix)
+    elif suffix in _SOURCE_CODE_SUFFIXES:
+        # Source code = plain text with the suffix stored so callers
+        # know it's code (e.g. summary_block can label it "type: py").
         rec = _parse_text(p, suffix)
     else:
         return None

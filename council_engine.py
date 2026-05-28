@@ -138,7 +138,9 @@ def _ensure_localhost(url: str, *, allow_remote: bool = False) -> None:
 # Optional:
 #   COUNCIL_GGUF_N_CTX=4096            context window
 #   COUNCIL_GGUF_N_THREADS=8           CPU threads (defaults to os.cpu_count())
-#   COUNCIL_GGUF_GPU_LAYERS=0          0 = CPU only; 99 = all layers on GPU
+#   COUNCIL_GGUF_GPU_LAYERS=99         default 99 = offload every layer
+#                                        (no-op on CPU-only builds, so safe);
+#                                        set 0 to force CPU even on a GPU box
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _council_backend() -> str:
@@ -393,10 +395,59 @@ def _get_gguf_model():
 
     n_threads = int(os.environ.get("COUNCIL_GGUF_N_THREADS",
                                     str(_default_n_threads())))
-    n_gpu_layers = int(os.environ.get("COUNCIL_GGUF_GPU_LAYERS", "0"))
 
-    print(f"[GGUF] Loading {p.name} (n_ctx={n_ctx}, n_threads={n_threads}, "
-          f"n_gpu_layers={n_gpu_layers})", flush=True)
+    # ── n_gpu_layers default = 99 (offload every layer to GPU) ─────
+    #
+    # Why 99 by default instead of the historical 0:
+    #
+    # llama-cpp-python's CUDA wheel quietly falls back to CPU when GPU
+    # offload isn't available — passing n_gpu_layers=99 to a CPU-only
+    # build (Section A in installs.txt) is a NO-OP, not an error. So
+    # "99 by default, fall back if needed" is strictly safer than the
+    # old "0 by default, require env var to use GPU."
+    #
+    # The previous default of 0 produced the bug the user is hitting
+    # right now: they installed the CUDA wheel via Section C / D, but
+    # without setting COUNCIL_GGUF_GPU_LAYERS the model loaded with
+    # everything on CPU and only a few cache/scratchpad operations
+    # touched the GPU — which looked like "GPU occasionally used,
+    # CPU still primary."
+    #
+    # Per-layer offload size on the common models (helpful for users
+    # tuning lower values for smaller GPUs):
+    #   Phi-4 14B Q4_K_M:    ~225 MB per layer × 40 layers = ~9 GB
+    #   Llama 3.1 8B Q5_K_M: ~190 MB per layer × 32 layers = ~6 GB
+    #   Granite 3.1 8B:      ~190 MB per layer × 32 layers = ~6 GB
+    # Plus KV cache (scales with n_ctx) and a small constant overhead.
+    n_gpu_layers = int(os.environ.get("COUNCIL_GGUF_GPU_LAYERS", "99"))
+
+    # Best-effort GPU sanity check — surface the actual GPU + available
+    # VRAM in the startup log when one is detected, so users see why
+    # the model loaded on CPU vs GPU. Both probes are wrapped in try/
+    # except because either may fail on machines without torch / nvidia-
+    # smi; failure just means we don't print the extra diagnostic line.
+    gpu_diag = ""
+    try:
+        import torch as _t   # already a dep via sentence-transformers
+        if _t.cuda.is_available():
+            name = _t.cuda.get_device_name(0)
+            total_gb = _t.cuda.get_device_properties(0).total_memory / (1024**3)
+            gpu_diag = f"  GPU={name} ({total_gb:.1f} GB VRAM)"
+        else:
+            gpu_diag = "  GPU=none detected (torch.cuda.is_available()=False)"
+    except Exception:
+        # No torch installed (rare — sentence-transformers pulls it),
+        # or some other probe failure. Leave the diag empty and trust
+        # the n_gpu_layers line to tell the user what happened.
+        pass
+
+    print(f"[GGUF] Loading {p.name} (n_ctx={n_ctx:,}, n_threads={n_threads}, "
+          f"n_gpu_layers={n_gpu_layers}){gpu_diag}", flush=True)
+    if n_gpu_layers > 0 and "GPU=none" in gpu_diag:
+        print("[GGUF] WARNING: n_gpu_layers > 0 but no CUDA GPU detected. "
+              "llama-cpp will fall back to CPU. To force CPU only and "
+              "silence this warning, set COUNCIL_GGUF_GPU_LAYERS=0.",
+              flush=True)
     _GGUF_MODEL_INSTANCE = Llama(
         model_path=str(p),
         n_ctx=n_ctx,
