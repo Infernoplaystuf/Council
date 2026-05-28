@@ -3713,6 +3713,7 @@ class CouncilConsole(tk.Tk):
         # 6) Manage data        → Vault
         # 7) Speech I/O         → Speech
         self._build_council_tab()
+        self._build_godot_workspace_tab()   # Anvil — phase C-lite, customer-facing
         self._build_dream3d_tab()
         self._build_grapher_tab()
         self._build_specialists_tab()
@@ -3735,15 +3736,13 @@ class CouncilConsole(tk.Tk):
             self._build_vault_health_tab()
             self._build_apoth_tab()
 
-        # ── Anvil game-dev tabs (phase A scaffold) ──
-        # Currently behind _ADVANCED_MODE so the placeholder "coming
-        # soon" panes don't confuse the customer-facing flow before
-        # they actually do anything. Phase C-lite promotes the Godot
-        # Workspace tab to the always-on customer flow once the Run
-        # loop is functional; Phase B does the same for Game Concepts;
-        # Phase D for Steam Market.
+        # ── Anvil game-dev placeholder tabs ──
+        # Game Concepts and Steam Market are still stubs (phase B and D
+        # respectively) so they stay hidden behind COUNCIL_ADVANCED=1
+        # — the "coming soon" pane would otherwise mislead the customer
+        # flow. Each gets promoted to the always-on flow as it lands.
+        # Godot Workspace was promoted to the customer flow above.
         if _ADVANCED_MODE:
-            self._build_godot_workspace_tab()
             self._build_game_concepts_tab()
             self._build_steam_market_tab()
 
@@ -9696,23 +9695,551 @@ class CouncilConsole(tk.Tk):
                          foreground=self._COMING_SOON_FG, wraplength=520)
         body.pack(pady=(10, 0))
 
+    # ---- Godot Workspace tab (phase C-lite) ----
+
+    # Settings keys persisted in backend_settings.json:
+    #   godot_path:       absolute path to the Godot binary
+    #   godot_project:    last-opened project root (autoload on start)
+
+    _GODOT_KEYWORDS = {
+        # core control flow
+        "if", "elif", "else", "for", "while", "match", "break", "continue",
+        "pass", "return", "in", "as", "and", "or", "not", "is",
+        # declarations
+        "var", "const", "func", "class", "class_name", "extends", "static",
+        "signal", "enum", "preload", "onready",
+        # values
+        "true", "false", "null", "self", "super",
+    }
+
     def _build_godot_workspace_tab(self):
-        """Godot Workspace — the IDE tab. Phase C-lite lands the file
-        tree, GDScript editor, Run/Validate buttons, and console panel.
-        Stub for now."""
-        # Module is imported eagerly so a missing godot_workspace.py
-        # surfaces at startup, not the first time you click the tab.
-        import godot_workspace  # noqa: F401
-        self._add_coming_soon_tab(
-            "tab_godot_workspace",
-            "🛠 Godot Workspace",
-            "Godot Workspace",
-            "Phase C-lite",
-            "File tree, GDScript editor, scene-tree view, Run / "
-            "Validate buttons, and stderr-to-Council console will "
-            "live here. Project detection + GodotRunner subprocess "
-            "are the next pieces to land.",
+        """Godot Workspace — the IDE tab. File tree, GDScript editor,
+        Run/Validate buttons, console panel, stderr→console.
+
+        Layout (horizontal PanedWindow):
+
+            ┌─────────────┬──────────────────────────────────────┐
+            │  File tree  │  ┌── GDScript editor ──────────────┐ │
+            │             │  │                                  │ │
+            │             │  │                                  │ │
+            │             │  ├── Console (stdout + stderr) ────│ │
+            │             │  │                                  │ │
+            │             │  └──────────────────────────────────┘ │
+            └─────────────┴──────────────────────────────────────┘
+
+        Run button shells out to ``godot --path <project>``; stderr
+        is mirrored to both the console and the council so a crash
+        can become a deliberation trigger.
+        """
+        import godot_workspace as _gw
+        self.tab_godot_workspace = ttk.Frame(self.nb)
+        self.nb.add(self.tab_godot_workspace, text="🛠 Godot Workspace")
+
+        # Project state
+        self._gw_project = None              # godot_workspace.GodotProject
+        self._gw_open_file: Optional[Path] = None
+        self._gw_runner = None               # godot_workspace.GodotRunner
+        self._gw_dirty = False
+
+        # Top strip — project picker + Godot binary + Run / Validate / Stop
+        strip = ttk.Frame(self.tab_godot_workspace)
+        strip.pack(fill="x", padx=6, pady=(6, 4))
+        ttk.Button(strip, text="📂 Open project…",
+                   command=self._gw_open_project_dialog).pack(side="left")
+        self._gw_project_var = tk.StringVar(value="(no project open)")
+        ttk.Label(strip, textvariable=self._gw_project_var,
+                  foreground="#a98a8a").pack(side="left", padx=(8, 0))
+
+        # Right end of the strip: Run / Validate / Stop + binary picker
+        right = ttk.Frame(strip)
+        right.pack(side="right")
+        self._gw_run_btn = ttk.Button(right, text="▶ Run",
+                                       command=self._gw_run, state="disabled")
+        self._gw_run_btn.pack(side="left", padx=2)
+        self._gw_validate_btn = ttk.Button(right, text="✓ Validate",
+                                            command=self._gw_validate,
+                                            state="disabled")
+        self._gw_validate_btn.pack(side="left", padx=2)
+        self._gw_stop_btn = ttk.Button(right, text="■ Stop",
+                                        command=self._gw_stop, state="disabled")
+        self._gw_stop_btn.pack(side="left", padx=2)
+        ttk.Button(right, text="⚙ Godot binary…",
+                   command=self._gw_pick_godot_binary).pack(side="left", padx=(8, 2))
+
+        # Body — horizontal PanedWindow
+        body = tk.PanedWindow(self.tab_godot_workspace, orient="horizontal",
+                              bg="#1a1414", sashwidth=6)
+        body.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # Left — file tree
+        left = ttk.Frame(body)
+        body.add(left, width=260, minsize=180)
+        ttk.Label(left, text="Project files").pack(anchor="w", padx=2, pady=(0, 2))
+        tree_row = ttk.Frame(left)
+        tree_row.pack(fill="both", expand=True)
+        self._gw_tree = ttk.Treeview(tree_row, show="tree", selectmode="browse")
+        tsb = ttk.Scrollbar(tree_row, orient="vertical",
+                             command=self._gw_tree.yview)
+        self._gw_tree.configure(yscrollcommand=tsb.set)
+        self._gw_tree.pack(side="left", fill="both", expand=True)
+        tsb.pack(side="right", fill="y")
+        self._gw_tree.bind("<<TreeviewSelect>>", self._gw_on_tree_select)
+
+        # Right — vertical split: editor on top, console below
+        right_pane = tk.PanedWindow(body, orient="vertical",
+                                     bg="#1a1414", sashwidth=6)
+        body.add(right_pane, minsize=320)
+
+        # Editor pane
+        ed_frame = ttk.Frame(right_pane)
+        right_pane.add(ed_frame, minsize=200)
+        ed_strip = ttk.Frame(ed_frame)
+        ed_strip.pack(fill="x")
+        self._gw_open_file_var = tk.StringVar(value="(no file open)")
+        ttk.Label(ed_strip, textvariable=self._gw_open_file_var,
+                  foreground="#a98a8a").pack(side="left")
+        self._gw_save_btn = ttk.Button(ed_strip, text="💾 Save",
+                                        command=self._gw_save,
+                                        state="disabled")
+        self._gw_save_btn.pack(side="right", padx=2)
+
+        ed_row = ttk.Frame(ed_frame)
+        ed_row.pack(fill="both", expand=True)
+        self._gw_editor = tk.Text(
+            ed_row, wrap="none", undo=True,
+            bg="#0f0c0c", fg="#d4d4d4",
+            insertbackground="#d4d4d4",
+            font=("Consolas", 10),
         )
+        esb_y = ttk.Scrollbar(ed_row, orient="vertical",
+                               command=self._gw_editor.yview)
+        esb_x = ttk.Scrollbar(ed_frame, orient="horizontal",
+                               command=self._gw_editor.xview)
+        self._gw_editor.configure(yscrollcommand=esb_y.set,
+                                   xscrollcommand=esb_x.set)
+        self._gw_editor.pack(side="left", fill="both", expand=True)
+        esb_y.pack(side="right", fill="y")
+        esb_x.pack(side="bottom", fill="x")
+
+        # Highlight tags
+        self._gw_editor.tag_configure("kw",      foreground="#e0884a")
+        self._gw_editor.tag_configure("string",  foreground="#7ea16d")
+        self._gw_editor.tag_configure("comment", foreground="#7a7575")
+        self._gw_editor.tag_configure("number",  foreground="#a98a8a")
+        self._gw_editor.tag_configure("decorator", foreground="#d32f2f")
+
+        # Editor bindings — re-highlight + dirty flag on edits, Ctrl+S to save
+        self._gw_editor.bind("<<Modified>>", self._gw_on_modified)
+        self._gw_editor.bind("<Control-s>",
+                              lambda e: (self._gw_save(), "break"))
+
+        # Console pane
+        con_frame = ttk.Frame(right_pane)
+        right_pane.add(con_frame, minsize=120)
+        con_strip = ttk.Frame(con_frame)
+        con_strip.pack(fill="x")
+        ttk.Label(con_strip, text="Console (Godot stdout + stderr)",
+                  foreground="#a98a8a").pack(side="left")
+        ttk.Button(con_strip, text="Clear",
+                   command=self._gw_console_clear).pack(side="right")
+        ttk.Button(con_strip, text="→ Send errors to Council",
+                   command=self._gw_send_errors_to_council).pack(side="right",
+                                                                  padx=4)
+        self._gw_console = tk.Text(
+            con_frame, wrap="word",
+            bg="#0a0808", fg="#d4d4d4",
+            insertbackground="#d4d4d4",
+            font=("Consolas", 9),
+            state="disabled",
+        )
+        self._gw_console.pack(fill="both", expand=True)
+        self._gw_console.tag_configure("stderr", foreground="#ff5252")
+        self._gw_console.tag_configure("info",   foreground="#a98a8a")
+
+        # Buffer of stderr lines from the current run, so "Send errors
+        # to Council" can package them up after the run completes.
+        self._gw_stderr_buffer: List[str] = []
+
+        # Try auto-loading the last project
+        self._gw_load_last_project()
+
+    # ── Persistence ─────────────────────────────────────────────────
+
+    def _gw_load_settings(self) -> Dict[str, Any]:
+        p = self._backend_settings_path()
+        if not p.exists():
+            return {}
+        try:
+            import json as _j
+            return _j.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _gw_save_settings_kv(self, **kv) -> None:
+        """Merge ``kv`` into backend_settings.json (preserving other keys)."""
+        import json as _j
+        data = self._gw_load_settings()
+        data.update(kv)
+        try:
+            self._backend_settings_path().write_text(
+                _j.dumps(data, indent=2), encoding="utf-8",
+            )
+        except Exception as _e:
+            print(f"[Godot Workspace] could not save settings: {_e}")
+
+    def _gw_load_last_project(self) -> None:
+        data = self._gw_load_settings()
+        # Restore Godot binary
+        path = data.get("godot_path", "")
+        if not path:
+            # Try detection on first run
+            import godot_workspace as _gw
+            detected = _gw.detect_godot_binary()
+            if detected:
+                path = detected
+                self._gw_save_settings_kv(godot_path=detected)
+        if path:
+            os.environ["ANVIL_GODOT_BINARY"] = path
+        # Restore last project
+        last = data.get("godot_project", "")
+        if last and Path(last).exists():
+            self._gw_open_project(Path(last))
+
+    def _gw_pick_godot_binary(self) -> None:
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Pick the Godot executable",
+            filetypes=[("Executables", "*.exe"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        os.environ["ANVIL_GODOT_BINARY"] = path
+        self._gw_save_settings_kv(godot_path=path)
+        self._gw_console_write("info",
+            f"[Anvil] Godot binary set: {path}")
+
+    # ── Project handling ────────────────────────────────────────────
+
+    def _gw_open_project_dialog(self) -> None:
+        from tkinter import filedialog, messagebox
+        path = filedialog.askdirectory(
+            title="Pick a folder containing project.godot",
+        )
+        if not path:
+            return
+        p = Path(path)
+        if not (p / "project.godot").exists():
+            messagebox.showerror(
+                "Not a Godot project",
+                f"{p}\ndoes not contain a project.godot manifest.",
+                parent=self,
+            )
+            return
+        self._gw_open_project(p)
+        self._gw_save_settings_kv(godot_project=str(p))
+
+    def _gw_open_project(self, path: Path) -> None:
+        import godot_workspace as _gw
+        project = _gw.open_project(path)
+        if project is None:
+            return
+        self._gw_project = project
+        self._gw_project_var.set(
+            f"{project.name}  ({project.root})"
+        )
+        self._gw_run_btn.configure(state="normal")
+        self._gw_validate_btn.configure(state="normal")
+        self._gw_populate_tree()
+        self._gw_console_write("info",
+            f"[Anvil] Opened project: {project.name} "
+            f"({len(project.scripts)} script(s), "
+            f"{len(project.scenes)} scene(s))")
+
+    def _gw_populate_tree(self) -> None:
+        self._gw_tree.delete(*self._gw_tree.get_children())
+        if self._gw_project is None:
+            return
+        # Group: Scenes / Scripts / Other
+        sc_id = self._gw_tree.insert("", "end", text="Scenes (.tscn)", open=True)
+        for p in self._gw_project.scenes:
+            self._gw_tree.insert(
+                sc_id, "end",
+                text=self._gw_project.relpath(p),
+                values=(str(p),),
+            )
+        gd_id = self._gw_tree.insert("", "end", text="Scripts (.gd)", open=True)
+        for p in self._gw_project.scripts:
+            self._gw_tree.insert(
+                gd_id, "end",
+                text=self._gw_project.relpath(p),
+                values=(str(p),),
+            )
+        ot_id = self._gw_tree.insert("", "end", text="Other", open=False)
+        for p in self._gw_project.other_files:
+            self._gw_tree.insert(
+                ot_id, "end",
+                text=self._gw_project.relpath(p),
+                values=(str(p),),
+            )
+
+    def _gw_on_tree_select(self, _event=None) -> None:
+        sel = self._gw_tree.selection()
+        if not sel:
+            return
+        vals = self._gw_tree.item(sel[0], "values")
+        if not vals:
+            return
+        path = Path(vals[0])
+        if not path.is_file():
+            return
+        self._gw_open_file_in_editor(path)
+
+    def _gw_open_file_in_editor(self, path: Path) -> None:
+        from tkinter import messagebox
+        if self._gw_dirty:
+            res = messagebox.askyesnocancel(
+                "Unsaved changes",
+                f"Save changes to {self._gw_open_file.name}?" if self._gw_open_file
+                else "Save changes?",
+                parent=self,
+            )
+            if res is None:
+                return
+            if res:
+                self._gw_save()
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            self._gw_console_write("stderr",
+                f"[Anvil] could not open {path}: {exc!r}")
+            return
+        self._gw_editor.delete("1.0", "end")
+        self._gw_editor.insert("1.0", text)
+        self._gw_open_file = path
+        self._gw_open_file_var.set(
+            self._gw_project.relpath(path) if self._gw_project else str(path)
+        )
+        self._gw_dirty = False
+        self._gw_save_btn.configure(state="disabled")
+        # Re-highlight GDScript and reset modified flag
+        self._gw_highlight()
+        self._gw_editor.edit_modified(False)
+
+    def _gw_on_modified(self, _event=None) -> None:
+        # The <<Modified>> event fires once until edit_modified(False);
+        # we use it as a dirty flag AND a trigger for re-highlighting.
+        if not self._gw_editor.edit_modified():
+            return
+        self._gw_dirty = True
+        self._gw_save_btn.configure(state="normal")
+        self._gw_highlight()
+        self._gw_editor.edit_modified(False)
+
+    def _gw_save(self) -> None:
+        if not self._gw_open_file or not self._gw_dirty:
+            return
+        text = self._gw_editor.get("1.0", "end-1c")
+        try:
+            self._gw_open_file.write_text(text, encoding="utf-8")
+        except Exception as exc:
+            self._gw_console_write("stderr",
+                f"[Anvil] save failed: {exc!r}")
+            return
+        self._gw_dirty = False
+        self._gw_save_btn.configure(state="disabled")
+        self._gw_console_write("info",
+            f"[Anvil] saved {self._gw_project.relpath(self._gw_open_file)}")
+
+    # ── Syntax highlight ────────────────────────────────────────────
+
+    def _gw_highlight(self) -> None:
+        """Crude GDScript syntax colouring — keywords, strings, comments,
+        numbers, decorators. Recomputed on every modification."""
+        # Only highlight .gd files; .tscn / json get plain text
+        if self._gw_open_file is None or self._gw_open_file.suffix.lower() != ".gd":
+            return
+        ed = self._gw_editor
+        # Clear all tags except the cursor / sel
+        for tag in ("kw", "string", "comment", "number", "decorator"):
+            ed.tag_remove(tag, "1.0", "end")
+        text = ed.get("1.0", "end-1c")
+        # Strings: "..." or '...'
+        for m in _re.finditer(r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'", text):
+            self._gw_tag_range(m.start(), m.end(), "string")
+        # Comments: # ... EOL  (do not colour inside strings — we already
+        # tagged strings above; tag overlaps just take the last wins, but
+        # comments after a quoted hash are rare enough not to matter)
+        for m in _re.finditer(r"#[^\n]*", text):
+            self._gw_tag_range(m.start(), m.end(), "comment")
+        # Numbers
+        for m in _re.finditer(r"\b\d+(?:\.\d+)?\b", text):
+            self._gw_tag_range(m.start(), m.end(), "number")
+        # Decorators: @export, @onready, @tool, etc.
+        for m in _re.finditer(r"@[A-Za-z_][A-Za-z0-9_]*", text):
+            self._gw_tag_range(m.start(), m.end(), "decorator")
+        # Keywords
+        for m in _re.finditer(r"\b[A-Za-z_][A-Za-z0-9_]*\b", text):
+            if m.group(0) in self._GODOT_KEYWORDS:
+                self._gw_tag_range(m.start(), m.end(), "kw")
+
+    def _gw_tag_range(self, start_offset: int, end_offset: int, tag: str) -> None:
+        """Tag a substring of the editor by character offsets."""
+        self._gw_editor.tag_add(
+            tag,
+            f"1.0 + {start_offset}c",
+            f"1.0 + {end_offset}c",
+        )
+
+    # ── Run / Validate / Stop ───────────────────────────────────────
+
+    def _gw_ensure_runner(self) -> None:
+        import godot_workspace as _gw
+        if self._gw_runner is None:
+            self._gw_runner = _gw.GodotRunner(
+                on_line=self._gw_runner_line,
+                on_exit=self._gw_runner_exit,
+            )
+
+    def _gw_run(self) -> None:
+        if self._gw_project is None:
+            return
+        if self._gw_dirty:
+            self._gw_save()
+        self._gw_ensure_runner()
+        if self._gw_runner.is_running():
+            self._gw_console_write("info",
+                "[Anvil] Godot is already running — Stop first.")
+            return
+        self._gw_stderr_buffer = []
+        self._gw_console_write("info",
+            f"[Anvil] ▶ Running {self._gw_project.name}…")
+        self._gw_run_btn.configure(state="disabled")
+        self._gw_validate_btn.configure(state="disabled")
+        self._gw_stop_btn.configure(state="normal")
+        try:
+            self._gw_runner.run(self._gw_project)
+        except RuntimeError as exc:
+            self._gw_console_write("stderr", f"[Anvil] {exc}")
+            self._gw_runner_exit(-1)
+
+    def _gw_validate(self) -> None:
+        if self._gw_project is None:
+            return
+        if self._gw_dirty:
+            self._gw_save()
+        # First, the in-process static pass — fast, surfaces broken refs
+        import godot_pipeline as _gp
+        try:
+            issues = _gp.static_validate_project(self._gw_project.root)
+        except Exception as exc:
+            issues = []
+            self._gw_console_write("stderr",
+                f"[Anvil] static_validate crashed: {exc!r}")
+        if not issues:
+            self._gw_console_write("info",
+                "[Anvil] static pass clean — running godot --check-only…")
+        else:
+            self._gw_console_write("info",
+                f"[Anvil] static pass found {len(issues)} issue(s):")
+            for i in issues[:30]:
+                sev = i.severity.upper()
+                self._gw_console_write(
+                    "stderr" if i.severity == "error" else "info",
+                    f"  [{sev}] {i.file}: {i.message}",
+                )
+            if len(issues) > 30:
+                self._gw_console_write("info",
+                    f"  … plus {len(issues) - 30} more.")
+
+        # Then the authoritative pass via Godot itself
+        self._gw_ensure_runner()
+        if self._gw_runner.is_running():
+            self._gw_console_write("info",
+                "[Anvil] another Godot process is running — skipping check-only.")
+            return
+        self._gw_run_btn.configure(state="disabled")
+        self._gw_validate_btn.configure(state="disabled")
+        self._gw_stop_btn.configure(state="normal")
+        self._gw_stderr_buffer = []
+        try:
+            self._gw_runner.validate(self._gw_project)
+        except RuntimeError as exc:
+            self._gw_console_write("stderr", f"[Anvil] {exc}")
+            self._gw_runner_exit(-1)
+
+    def _gw_stop(self) -> None:
+        if self._gw_runner is None:
+            return
+        self._gw_runner.stop()
+
+    def _gw_runner_line(self, stream: str, text: str) -> None:
+        # Callbacks fire on the runner's drainer threads — marshal back
+        # to the GUI thread via after() so tk widget access is safe.
+        self.after(0, lambda: self._gw_console_write(stream, text))
+        if stream == "stderr":
+            self._gw_stderr_buffer.append(text)
+
+    def _gw_runner_exit(self, rc: int) -> None:
+        def _on_main():
+            self._gw_run_btn.configure(state="normal")
+            self._gw_validate_btn.configure(state="normal")
+            self._gw_stop_btn.configure(state="disabled")
+            self._gw_console_write("info",
+                f"[Anvil] Godot exited (rc={rc})")
+        self.after(0, _on_main)
+
+    # ── Console helpers ─────────────────────────────────────────────
+
+    def _gw_console_write(self, tag: str, text: str) -> None:
+        c = self._gw_console
+        c.configure(state="normal")
+        c.insert("end", text + "\n", (tag,) if tag in ("stderr", "info") else ())
+        c.see("end")
+        c.configure(state="disabled")
+
+    def _gw_console_clear(self) -> None:
+        c = self._gw_console
+        c.configure(state="normal")
+        c.delete("1.0", "end")
+        c.configure(state="disabled")
+        self._gw_stderr_buffer = []
+
+    def _gw_send_errors_to_council(self) -> None:
+        """Bundle the current stderr buffer into a Council question.
+
+        Drops the bundle into the Council tab's input box and switches
+        to it; the user clicks Send to actually deliberate. Keeping
+        the click-to-send step explicit means errors don't trigger
+        runaway deliberations.
+        """
+        if not self._gw_stderr_buffer:
+            self._gw_console_write("info",
+                "[Anvil] no stderr lines to send (try a Run or Validate first)")
+            return
+        excerpt = "\n".join(self._gw_stderr_buffer[-60:])
+        body = (
+            "Godot reported errors during the last run. Please diagnose "
+            "and propose a minimal fix.\n\n"
+            f"Project: {self._gw_project.name if self._gw_project else '?'}\n"
+            f"Open file: {self._gw_project.relpath(self._gw_open_file) if (self._gw_project and self._gw_open_file) else '(none)'}\n\n"
+            "Godot stderr:\n"
+            "```\n"
+            f"{excerpt}\n"
+            "```"
+        )
+        # Drop into the Council input box and switch tabs
+        try:
+            inp = getattr(self, "input", None)
+            if inp is not None:
+                inp.delete("1.0", "end")
+                inp.insert("1.0", body)
+            if hasattr(self, "tab_council"):
+                self.nb.select(self.tab_council)
+            self._gw_console_write("info",
+                "[Anvil] Errors loaded into Council input — review and Send.")
+        except Exception as exc:
+            self._gw_console_write("stderr",
+                f"[Anvil] could not stage Council question: {exc!r}")
 
     def _build_game_concepts_tab(self):
         """Game Concepts — Phase B lands the retargeted idea_engine
