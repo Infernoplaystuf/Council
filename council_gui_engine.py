@@ -5808,6 +5808,37 @@ class CouncilConsole(tk.Tk):
         bottom = ttk.Frame(self.tab_council)
         bottom.pack(fill="x", padx=6, pady=(0, 6))
 
+        # Pending injection panel — structurally protected slot for
+        # analyst-computed context (e.g. Steam Market Analyst output).
+        # The user can SEE the attached block and CLEAR it, but cannot
+        # edit it. _send() prepends it to user_text at dispatch time.
+        # This closes the integrity gap where a user could accidentally
+        # strip citations from a pasted block in the editable input
+        # and trigger downstream hallucination on the cited values.
+        self._pending_injection: Optional[Dict[str, str]] = None
+        self._injection_panel = ttk.Frame(bottom)
+        self._injection_panel_header = ttk.Frame(self._injection_panel)
+        self._injection_panel_header.pack(fill="x")
+        self._injection_label_var = tk.StringVar(value="")
+        ttk.Label(self._injection_panel_header,
+                  textvariable=self._injection_label_var,
+                  foreground="#e0884a",
+                  font=("Segoe UI", 9, "bold")).pack(side="left")
+        ttk.Button(self._injection_panel_header, text="✕ Clear",
+                   command=self._council_clear_injection
+                   ).pack(side="right", padx=2)
+        # Read-only Text widget for the actual block contents
+        self._injection_view = tk.Text(
+            self._injection_panel,
+            wrap="word", height=5,
+            bg="#0a0808", fg="#a98a8a",
+            font=("Consolas", 9),
+            state="disabled",
+            relief="flat", borderwidth=1,
+        )
+        self._injection_view.pack(fill="x", pady=(2, 4))
+        # Panel starts hidden; _council_attach_injection() shows it.
+
         ttk.Label(bottom, text="Input").pack(anchor="w")
         self.input = self._make_text(bottom, wrap="word", height=4)
         self.input.pack(fill="x")
@@ -10873,31 +10904,61 @@ class CouncilConsole(tk.Tk):
             "to flesh out the mechanics from the concept's TODO list.")
 
     def _gc_send_to_council(self) -> None:
-        """Drop a critique-this-concept prompt into the Council input."""
+        """Stage a critique-this-concept prompt for the Council.
+
+        Pattern matches the Steam Market handoff: the question
+        ("Critique and improve") sits in the editable input box,
+        the concept's structured fields go into the read-only
+        injection slot so the user can't accidentally edit out
+        the concept's identity (title / hook / mechanics) before
+        sending.
+        """
         if not self._gc_current_id:
             return
         concept = self._gc_store.load(self._gc_current_id)
         if concept is None:
             return
-        body_lines = [
-            f"Critique this game concept and suggest improvements:",
-            "",
-            f"TITLE: {concept.display_title}",
-            f"GENRE: {concept.genre}" if concept.genre else "",
-            f"HOOK: {concept.hook}" if concept.hook else "",
-            f"PREMISE: {concept.premise}" if concept.premise else "",
-            f"CORE LOOP: {concept.core_loop}" if concept.core_loop else "",
-        ]
+        # Structured concept block (the "context" half)
+        concept_lines = ["[CONCEPT — the game the council should critique]"]
+        concept_lines.append(f"  TITLE: {concept.display_title}")
+        if concept.genre:
+            concept_lines.append(f"  GENRE: {concept.genre}")
+        if concept.hook:
+            concept_lines.append(f"  HOOK: {concept.hook}")
+        if concept.premise:
+            concept_lines.append(f"  PREMISE: {concept.premise}")
+        if concept.core_loop:
+            concept_lines.append(f"  CORE LOOP: {concept.core_loop}")
         if concept.mechanics:
-            body_lines.append("MECHANICS: " + ", ".join(concept.mechanics))
+            concept_lines.append(
+                "  MECHANICS: " + ", ".join(concept.mechanics)
+            )
         if concept.comparable_titles:
-            body_lines.append("COMPS: " + ", ".join(concept.comparable_titles))
-        body = "\n".join(l for l in body_lines if l)
+            concept_lines.append(
+                "  COMPARABLE TITLES: " + ", ".join(concept.comparable_titles)
+            )
+        if concept.differentiator:
+            concept_lines.append(
+                f"  WHAT SETS IT APART: {concept.differentiator}"
+            )
+        concept_block = "\n".join(concept_lines)
+        # The question half — user can tweak this if they want
+        # (e.g. "critique" → "find the weakest mechanic and fix it").
+        question = (
+            "Critique the game concept attached above and suggest the "
+            "three most impactful improvements. For each improvement, "
+            "say which mechanic / hook / loop element it changes and "
+            "why it raises the ceiling on the concept."
+        )
         try:
             inp = getattr(self, "input", None)
             if inp is not None:
                 inp.delete("1.0", "end")
-                inp.insert("1.0", body)
+                inp.insert("1.0", question)
+            self._council_attach_injection(
+                label="🎮 Concept context (read-only)",
+                block=concept_block,
+            )
             if hasattr(self, "tab_council"):
                 self.nb.select(self.tab_council)
         except Exception as exc:
@@ -11137,22 +11198,28 @@ class CouncilConsole(tk.Tk):
         d.configure(state="disabled")
 
     def _sm_send_to_council(self) -> None:
-        """Drop the last analyst result + the question into the Council
-        input box, so the council members read a computed result block
-        (citations included) rather than inventing numbers."""
+        """Stage the last analyst result + the question for the Council.
+
+        The question goes into the editable input box. The analyst's
+        computed block goes into the read-only injection slot above
+        the input, so the user can SEE the citations and CLEAR them
+        but cannot edit them out. ``_send`` prepends the slot block
+        to the user_text at dispatch time.
+        """
         result = getattr(self, "_sm_last_result", None)
         question = self._sm_question_var.get().strip()
         if result is None or not question:
             return
-        body = (
-            f"{question}\n\n"
-            + result.to_injection_block()
-        )
         try:
             inp = getattr(self, "input", None)
             if inp is not None:
                 inp.delete("1.0", "end")
-                inp.insert("1.0", body)
+                inp.insert("1.0", question)
+            # Attach the computed block to the protected slot
+            self._council_attach_injection(
+                label="📊 Steam Market context (computed, with citations)",
+                block=result.to_injection_block(),
+            )
             if hasattr(self, "tab_council"):
                 self.nb.select(self.tab_council)
         except Exception as exc:
@@ -12190,6 +12257,60 @@ class CouncilConsole(tk.Tk):
     # Main send logic
     # ============================
 
+    # ── Pending-injection slot ───────────────────────────────────────
+    #
+    # Analyst-computed context (Steam Market Analyst result, Game
+    # Concepts critique scaffold, etc.) is attached here rather than
+    # dumped into the editable input box. Reasons:
+    #   1. Integrity — the user can't accidentally strip citations
+    #      from the block (the widget is state="disabled").
+    #   2. Visibility — a labelled, distinct frame above the input
+    #      makes it obvious that *something* is being injected on
+    #      send, instead of hiding it inside a long input scroll.
+    #   3. Composability — the user keeps editing the actual question
+    #      in `self.input` while the computed block sits beside it,
+    #      both get sent at dispatch time.
+    # `self._pending_injection` holds {"label", "block"}; None means
+    # nothing is attached and the panel is hidden.
+
+    def _council_attach_injection(self, label: str, block: str) -> None:
+        """Stash a computed context block to prepend on the next send.
+
+        ``label`` is the short header shown above the read-only view
+        ("📊 Steam Market context", "🎮 Concept critique context").
+        ``block`` is the raw text that will be prepended verbatim to
+        ``user_text`` inside ``_send`` — it should already include
+        whatever citation framing the analyst produced.
+        """
+        if not block:
+            return
+        self._pending_injection = {"label": label, "block": block}
+        self._injection_label_var.set(label + "  (read-only; sent on next ⌃Enter)")
+        v = self._injection_view
+        v.configure(state="normal")
+        v.delete("1.0", "end")
+        v.insert("1.0", block)
+        v.configure(state="disabled")
+        # Show the panel above the input. We pack it before(self.input)
+        # so it always sits directly above the editable box.
+        try:
+            self._injection_panel.pack(fill="x", before=self.input)
+        except Exception:
+            self._injection_panel.pack(fill="x")
+
+    def _council_clear_injection(self) -> None:
+        """Drop any pending injection block and hide the panel."""
+        self._pending_injection = None
+        self._injection_label_var.set("")
+        v = self._injection_view
+        v.configure(state="normal")
+        v.delete("1.0", "end")
+        v.configure(state="disabled")
+        try:
+            self._injection_panel.pack_forget()
+        except Exception:
+            pass
+
     def _send(self):
         # Clear the goal anchor from the prior turn before doing anything
         # else. `_send` has many early-exit paths (licensing gate, empty
@@ -12224,6 +12345,22 @@ class CouncilConsole(tk.Tk):
         user_text = self.input.get("1.0", "end").strip()
         if not user_text:
             return
+        # ── Apply the pending injection slot ─────────────────────────
+        # If an analyst-computed block is attached (from the Steam
+        # Market or Game Concepts handoff), prepend it verbatim to
+        # the user's question. The block is read-only in the UI so
+        # the user can SEE and CLEAR it but cannot edit citations
+        # out — this preserves the chain-of-custody from the
+        # deterministic analyst to the council prompt.
+        # The injection panel is cleared after the prepend so it
+        # does not leak into the next turn unintentionally.
+        _injected = self._pending_injection
+        if _injected and _injected.get("block"):
+            user_text = _injected["block"].rstrip() + "\n\n" + user_text
+            try:
+                self._council_clear_injection()
+            except Exception:
+                pass
         self._last_sent_query = user_text   # saved for verdict disagree re-run
         self._set_text(self.input, "")
         self._append_transcript("User", user_text)
