@@ -9750,7 +9750,7 @@ class CouncilConsole(tk.Tk):
         ttk.Label(strip, textvariable=self._gw_project_var,
                   foreground="#a98a8a").pack(side="left", padx=(8, 0))
 
-        # Right end of the strip: Run / Validate / Stop + binary picker
+        # Right end of the strip: Run / Validate / Stop + AI buttons + binary picker
         right = ttk.Frame(strip)
         right.pack(side="right")
         self._gw_run_btn = ttk.Button(right, text="▶ Run",
@@ -9763,6 +9763,15 @@ class CouncilConsole(tk.Tk):
         self._gw_stop_btn = ttk.Button(right, text="■ Stop",
                                         command=self._gw_stop, state="disabled")
         self._gw_stop_btn.pack(side="left", padx=2)
+        # AI controls
+        self._gw_coder_btn = ttk.Button(right, text="🤖 Ask Coder",
+                                         command=self._gw_ask_coder_dialog,
+                                         state="disabled")
+        self._gw_coder_btn.pack(side="left", padx=(8, 2))
+        self._gw_scene_tree_btn = ttk.Button(right, text="🌳 Scene tree",
+                                              command=self._gw_show_scene_tree,
+                                              state="disabled")
+        self._gw_scene_tree_btn.pack(side="left", padx=2)
         ttk.Button(right, text="⚙ Godot binary…",
                    command=self._gw_pick_godot_binary).pack(side="left", padx=(8, 2))
 
@@ -9784,6 +9793,10 @@ class CouncilConsole(tk.Tk):
         self._gw_tree.pack(side="left", fill="both", expand=True)
         tsb.pack(side="right", fill="y")
         self._gw_tree.bind("<<TreeviewSelect>>", self._gw_on_tree_select)
+        # Right-click → context menu (cross-platform: Button-3 on win/linux,
+        # Button-2 on mac trackpads)
+        self._gw_tree.bind("<Button-3>", self._gw_on_tree_rightclick)
+        self._gw_tree.bind("<Button-2>", self._gw_on_tree_rightclick)
 
         # Right — vertical split: editor on top, console below
         right_pane = tk.PanedWindow(body, orient="vertical",
@@ -9949,6 +9962,7 @@ class CouncilConsole(tk.Tk):
         )
         self._gw_run_btn.configure(state="normal")
         self._gw_validate_btn.configure(state="normal")
+        self._gw_coder_btn.configure(state="normal")
         self._gw_populate_tree()
         self._gw_console_write("info",
             f"[Anvil] Opened project: {project.name} "
@@ -10024,6 +10038,10 @@ class CouncilConsole(tk.Tk):
         # Re-highlight GDScript and reset modified flag
         self._gw_highlight()
         self._gw_editor.edit_modified(False)
+        # Scene tree button is only meaningful when a .tscn is open
+        self._gw_scene_tree_btn.configure(
+            state="normal" if path.suffix.lower() == ".tscn" else "disabled"
+        )
 
     def _gw_on_modified(self, _event=None) -> None:
         # The <<Modified>> event fires once until edit_modified(False);
@@ -10203,6 +10221,307 @@ class CouncilConsole(tk.Tk):
         c.delete("1.0", "end")
         c.configure(state="disabled")
         self._gw_stderr_buffer = []
+
+    # ── Right-click menu on the file tree ──────────────────────────
+
+    def _gw_on_tree_rightclick(self, event) -> None:
+        """Pop a context menu over the tree item under the click."""
+        iid = self._gw_tree.identify_row(event.y)
+        if not iid:
+            return
+        self._gw_tree.selection_set(iid)
+        vals = self._gw_tree.item(iid, "values")
+        if not vals:
+            return
+        path = Path(vals[0])
+        if not path.is_file():
+            return
+        # Build the menu fresh each time so disabled-state reflects file kind
+        menu = tk.Menu(self.tab_godot_workspace, tearoff=0,
+                       bg="#231a1a", fg="#d4d4d4",
+                       activebackground="#4a2626",
+                       activeforeground="#d4d4d4")
+        menu.add_command(label="📖 Open in editor",
+                         command=lambda: self._gw_open_file_in_editor(path))
+        menu.add_separator()
+        menu.add_command(label="⚖ Ask Council about this",
+                         command=lambda: self._gw_ask_council_about_file(path))
+        if path.suffix.lower() == ".gd":
+            menu.add_command(label="🤖 Ask Coder to edit this",
+                             command=lambda: self._gw_ask_coder_dialog(
+                                 prefilled_target=path))
+        if path.suffix.lower() == ".tscn":
+            menu.add_command(label="🌳 View scene tree",
+                             command=lambda: self._gw_show_scene_tree(
+                                 force_path=path))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _gw_ask_council_about_file(self, path: Path) -> None:
+        """Stage a prompt asking the Council to explain / critique a file."""
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            self._gw_console_write("stderr",
+                f"[Anvil] could not read {path}: {exc!r}")
+            return
+        # Cap the file body so we don't blow context — the goal anchor
+        # will keep the council on track even if the body is short.
+        max_chars = 6000
+        if len(text) > max_chars:
+            text = text[:max_chars] + f"\n\n# … (truncated {len(text) - max_chars} chars)"
+        rel = self._gw_project.relpath(path) if self._gw_project else str(path)
+        body = (
+            f"Explain what this file does and flag anything worth "
+            f"changing for clarity, correctness, or performance.\n\n"
+            f"FILE: {rel}\n"
+            f"```\n{text}\n```"
+        )
+        try:
+            inp = getattr(self, "input", None)
+            if inp is not None:
+                inp.delete("1.0", "end")
+                inp.insert("1.0", body)
+            if hasattr(self, "tab_council"):
+                self.nb.select(self.tab_council)
+            self._gw_console_write("info",
+                f"[Anvil] Staged Council prompt about {rel}.")
+        except Exception as exc:
+            self._gw_console_write("stderr",
+                f"[Anvil] stage to council failed: {exc!r}")
+
+    # ── 🌳 Scene tree popup ─────────────────────────────────────────
+
+    def _gw_show_scene_tree(self, force_path: Optional[Path] = None) -> None:
+        """Pop a small window with the parsed scene tree of the open
+        ``.tscn``. ``force_path`` overrides the open-in-editor file
+        (used by the right-click menu)."""
+        from tkinter import messagebox
+        path = force_path or self._gw_open_file
+        if path is None or path.suffix.lower() != ".tscn":
+            messagebox.showinfo(
+                "Open a scene first",
+                "Pick a .tscn file in the file tree, then click 🌳 Scene tree.",
+                parent=self,
+            )
+            return
+        import godot_pipeline as _gp
+        parsed = _gp.parse_scene(path)
+        if parsed.root is None:
+            messagebox.showwarning(
+                "Could not parse scene",
+                "\n".join(parsed.issues) or
+                "parse_scene returned no root node.",
+                parent=self,
+            )
+            return
+        win = tk.Toplevel(self)
+        win.title(f"Scene tree — {self._gw_project.relpath(path) if self._gw_project else path.name}")
+        win.configure(bg="#1a1414")
+        win.geometry("520x520")
+        tv = ttk.Treeview(win, show="tree")
+        tv.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        sb = ttk.Scrollbar(win, orient="vertical", command=tv.yview)
+        sb.pack(side="right", fill="y", pady=6)
+        tv.configure(yscrollcommand=sb.set)
+
+        # Build the tree recursively
+        def _insert(parent_iid, node):
+            label = f"{node.name} ({node.type or '?'})"
+            if node.script_id:
+                label += "  ← script"
+            iid = tv.insert(parent_iid, "end", text=label, open=True)
+            for child in node.children:
+                _insert(iid, child)
+        _insert("", parsed.root)
+
+        # Bottom row: ext_resources + issues
+        if parsed.ext_resources or parsed.issues:
+            ftr = tk.Frame(win, bg="#1a1414")
+            ftr.pack(side="bottom", fill="x", padx=6, pady=(0, 6))
+            txt = tk.Text(ftr, height=6, bg="#0f0c0c", fg="#a98a8a",
+                          font=("Consolas", 9))
+            txt.pack(fill="x")
+            if parsed.ext_resources:
+                txt.insert("end", "ext_resources:\n")
+                for (rid, rtype, rpath) in parsed.ext_resources:
+                    txt.insert("end", f"  {rid:>10}  {rtype:>10}  {rpath}\n")
+            if parsed.issues:
+                txt.insert("end", "\nissues:\n")
+                for i in parsed.issues:
+                    txt.insert("end", f"  - {i}\n")
+            txt.configure(state="disabled")
+
+    # ── 🤖 Ask Coder dialog ────────────────────────────────────────
+
+    def _gw_ask_coder_dialog(self, prefilled_target: Optional[Path] = None) -> None:
+        """Modal prompt: ask the Godot Coder to write/edit a .gd file.
+
+        Caller supplies an optional ``prefilled_target`` (e.g. the
+        file the user right-clicked). Otherwise defaults to the file
+        currently open in the editor, falling back to ``main.gd`` in
+        the project root.
+        """
+        from tkinter import messagebox
+        if self._gw_project is None:
+            messagebox.showinfo(
+                "Open a project first",
+                "Open a Godot project before asking the Coder.",
+                parent=self,
+            )
+            return
+
+        default_target = (
+            prefilled_target
+            or self._gw_open_file
+            or (self._gw_project.root / "main.gd")
+        )
+
+        win = tk.Toplevel(self)
+        win.title("🤖 Ask the Godot Coder")
+        win.configure(bg="#1a1414")
+        win.geometry("640x440")
+        win.transient(self)
+
+        ttk.Label(win, text="What should the Coder make? (one or two sentences)",
+                  foreground="#d4d4d4").pack(anchor="w", padx=8, pady=(8, 2))
+        task_box = tk.Text(win, height=6, wrap="word",
+                           bg="#0f0c0c", fg="#d4d4d4",
+                           insertbackground="#d4d4d4",
+                           font=("Segoe UI", 10))
+        task_box.pack(fill="x", padx=8)
+
+        # Target path row
+        path_row = ttk.Frame(win)
+        path_row.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Label(path_row, text="Write to (path in project):",
+                  foreground="#d4d4d4").pack(side="left")
+        target_var = tk.StringVar(
+            value=str(default_target.relative_to(self._gw_project.root))
+                  if default_target.is_relative_to(self._gw_project.root)
+                  else str(default_target)
+        )
+        ttk.Entry(path_row, textvariable=target_var).pack(
+            side="left", fill="x", expand=True, padx=(6, 0))
+
+        # Status / log
+        ttk.Label(win, text="Status:", foreground="#d4d4d4").pack(
+            anchor="w", padx=8, pady=(8, 2))
+        log = tk.Text(win, height=10, wrap="word",
+                      bg="#0a0808", fg="#a98a8a",
+                      font=("Consolas", 9),
+                      state="disabled")
+        log.pack(fill="both", expand=True, padx=8)
+
+        def _log(phase, msg):
+            log.configure(state="normal")
+            log.insert("end", f"[{phase}] {msg}\n")
+            log.see("end")
+            log.configure(state="disabled")
+
+        btn_row = ttk.Frame(win)
+        btn_row.pack(fill="x", padx=8, pady=8)
+        run_btn = ttk.Button(btn_row, text="✨ Run Coder")
+        run_btn.pack(side="left")
+        ttk.Button(btn_row, text="Close",
+                   command=win.destroy).pack(side="right")
+
+        # Disable the writer model while we own it — single-flight
+        running = {"flag": False}
+
+        def _go():
+            if running["flag"]:
+                return
+            task = task_box.get("1.0", "end-1c").strip()
+            if not task:
+                _log("error", "Enter a task description first.")
+                return
+            rel = target_var.get().strip()
+            if not rel:
+                _log("error", "Enter a target file path.")
+                return
+            target_abs = (self._gw_project.root / rel).resolve()
+            try:
+                target_abs.relative_to(self._gw_project.root)
+            except ValueError:
+                _log("error", f"Target {target_abs} escapes the project root.")
+                return
+            if target_abs.exists():
+                from tkinter import messagebox
+                if not messagebox.askyesno(
+                    "Overwrite?",
+                    f"{rel} already exists. Overwrite? "
+                    f"(original will be restored if the Coder fails.)",
+                    parent=win,
+                ):
+                    return
+            running["flag"] = True
+            run_btn.configure(state="disabled", text="… working")
+
+            def _worker():
+                import godot_coder as _gc
+                import goal_anchor as _ga
+                try:
+                    goal = _ga.distill_goal(task, model=getattr(self, "judge", None))
+                except Exception:
+                    goal = task[:160]
+                agent = _gc.GodotCoder(
+                    self.writer,
+                    self._gw_project.root,
+                    godot_binary=_gw_get_binary(),
+                    max_attempts=4,
+                    event_callback=lambda phase, msg: self.after(0,
+                        lambda: _log(phase, msg)),
+                )
+                state = agent.run(task, target_abs, goal=goal)
+                def _done():
+                    running["flag"] = False
+                    run_btn.configure(
+                        state="normal",
+                        text=("✓ Done" if state.passed else "✨ Run Coder"),
+                    )
+                    if state.passed:
+                        _log("done",
+                             f"Wrote {rel}. Reload it in the editor "
+                             f"to see the change.")
+                        # If the target is the open file, reload it
+                        if (self._gw_open_file is not None
+                                and self._gw_open_file == target_abs):
+                            try:
+                                text = target_abs.read_text(encoding="utf-8")
+                                self._gw_editor.delete("1.0", "end")
+                                self._gw_editor.insert("1.0", text)
+                                self._gw_dirty = False
+                                self._gw_save_btn.configure(state="disabled")
+                                self._gw_highlight()
+                                self._gw_editor.edit_modified(False)
+                            except Exception:
+                                pass
+                        # Repopulate the file tree so a new file appears
+                        try:
+                            import godot_workspace as _gw
+                            self._gw_project = _gw.open_project(self._gw_project.root)
+                            self._gw_populate_tree()
+                        except Exception:
+                            pass
+                    else:
+                        _log("done",
+                             "Coder gave up after "
+                             f"{state.attempt} attempts. "
+                             "Original file restored.")
+                self.after(0, _done)
+
+            threading.Thread(target=_worker, daemon=True,
+                              name="godot-coder").start()
+
+        # Need access to the binary lookup helper from the worker thread
+        def _gw_get_binary():
+            import godot_workspace as _gw
+            return _gw.get_godot_binary()
+
+        run_btn.configure(command=_go)
 
     def _gw_send_errors_to_council(self) -> None:
         """Bundle the current stderr buffer into a Council question.
