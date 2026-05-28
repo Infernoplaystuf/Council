@@ -10503,6 +10503,45 @@ class CouncilConsole(tk.Tk):
                         lambda: _log(phase, msg)),
                 )
                 state = agent.run(task, target_abs, goal=goal)
+
+                def _refresh_editor_and_tree():
+                    """Reload open file + repopulate tree. Used by both
+                    the Apply path (new content shown) and the Reject
+                    path (restored content shown)."""
+                    if (self._gw_open_file is not None
+                            and self._gw_open_file == target_abs
+                            and target_abs.exists()):
+                        try:
+                            text = target_abs.read_text(encoding="utf-8")
+                            self._gw_editor.delete("1.0", "end")
+                            self._gw_editor.insert("1.0", text)
+                            self._gw_dirty = False
+                            self._gw_save_btn.configure(state="disabled")
+                            self._gw_highlight()
+                            self._gw_editor.edit_modified(False)
+                        except Exception:
+                            pass
+                    elif (self._gw_open_file is not None
+                            and self._gw_open_file == target_abs
+                            and not target_abs.exists()):
+                        # File was rejected as new — clear the editor
+                        try:
+                            self._gw_editor.delete("1.0", "end")
+                            self._gw_open_file = None
+                            self._gw_open_file_var.set("(no file open)")
+                            self._gw_dirty = False
+                            self._gw_save_btn.configure(state="disabled")
+                        except Exception:
+                            pass
+                    # Always refresh the tree — a new file may have
+                    # appeared (Apply) or disappeared (Reject on new).
+                    try:
+                        import godot_workspace as _gw
+                        self._gw_project = _gw.open_project(self._gw_project.root)
+                        self._gw_populate_tree()
+                    except Exception:
+                        pass
+
                 def _done():
                     running["flag"] = False
                     run_btn.configure(
@@ -10511,28 +10550,64 @@ class CouncilConsole(tk.Tk):
                     )
                     if state.passed:
                         _log("done",
-                             f"Wrote {rel}. Reload it in the editor "
-                             f"to see the change.")
-                        # If the target is the open file, reload it
-                        if (self._gw_open_file is not None
-                                and self._gw_open_file == target_abs):
-                            try:
-                                text = target_abs.read_text(encoding="utf-8")
-                                self._gw_editor.delete("1.0", "end")
-                                self._gw_editor.insert("1.0", text)
-                                self._gw_dirty = False
-                                self._gw_save_btn.configure(state="disabled")
-                                self._gw_highlight()
-                                self._gw_editor.edit_modified(False)
-                            except Exception:
-                                pass
-                        # Repopulate the file tree so a new file appears
+                             f"Wrote {rel}. Review the diff before "
+                             f"keeping the change.")
+                        # Pop a diff review dialog before applying.
+                        # The file is already on disk; Apply is a no-op,
+                        # Reject restores the original (or deletes if
+                        # this was a new file).
+                        import diff_view as _dv
+                        is_new = state.backup is None
                         try:
-                            import godot_workspace as _gw
-                            self._gw_project = _gw.open_project(self._gw_project.root)
-                            self._gw_populate_tree()
+                            original_text = (state.backup.decode("utf-8")
+                                              if state.backup else "")
                         except Exception:
-                            pass
+                            original_text = ""
+
+                        def _on_apply():
+                            _log("apply",
+                                 "Kept the Coder's change.")
+                            _refresh_editor_and_tree()
+
+                        def _on_reject():
+                            # New file → silent delete. Existing file →
+                            # atomic restore from backup bytes.
+                            try:
+                                if is_new and target_abs.exists():
+                                    target_abs.unlink()
+                                elif state.backup is not None:
+                                    import godot_coder as _gc_mod
+                                    _gc_mod.GodotCoder._atomic_restore(
+                                        target_abs, state.backup,
+                                    )
+                            except Exception as exc:
+                                _log("reject",
+                                     f"revert failed: {exc!r}")
+                                return
+                            _log("reject",
+                                 "Reverted — "
+                                 + ("new file deleted." if is_new
+                                    else "original restored."))
+                            _refresh_editor_and_tree()
+
+                        try:
+                            _dv.show_diff_dialog(
+                                win,
+                                file_path=target_abs,
+                                original_text=original_text,
+                                proposed_text=state.final_code,
+                                on_apply=_on_apply,
+                                on_reject=_on_reject,
+                                is_new_file=is_new,
+                            )
+                        except Exception as exc:
+                            # If the diff dialog fails to open for any
+                            # reason, fall back to the old behavior so
+                            # the user isn't stuck with no path forward.
+                            _log("diff",
+                                 f"diff view failed ({exc!r}); applying "
+                                 f"directly.")
+                            _refresh_editor_and_tree()
                     else:
                         _log("done",
                              "Coder gave up after "
