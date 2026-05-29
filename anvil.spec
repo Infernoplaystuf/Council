@@ -15,9 +15,20 @@
 
 import sys
 from pathlib import Path
+from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
 project_root = Path.cwd()
+
+# ---- llama-cpp-python special handling ----
+# The package is imported lazily inside council_engine.PersonalityModel
+# so PyInstaller's static scan misses it. Worse, even when listed in
+# hiddenimports the native shared library (llama.dll, ggml.dll) lives
+# next to the Python files in site-packages and PyInstaller's binary
+# collection won't grab them without an explicit collect step.
+# collect_all is the official helper that walks every Python module,
+# data file, and dynamic library under llama_cpp.
+_llama_datas, _llama_binaries, _llama_hidden = collect_all("llama_cpp")
 
 # ---- Hidden imports (pulled in dynamically; PyInstaller can't see them) ----
 hidden = [
@@ -93,9 +104,9 @@ excludes = [
 a = Analysis(
     ["council_gui_engine.py"],
     pathex=[str(project_root)],
-    binaries=[],
-    datas=datas,
-    hiddenimports=hidden,
+    binaries=_llama_binaries,           # llama.dll, ggml.dll, etc.
+    datas=datas + _llama_datas,         # llama_cpp's bundled data files
+    hiddenimports=hidden + _llama_hidden,
     hookspath=[],
     runtime_hooks=[],
     excludes=excludes,
