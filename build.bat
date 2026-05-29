@@ -1,11 +1,15 @@
 @echo off
 REM ============================================================
-REM Council  —  Windows build script
+REM Anvil — Windows build script
 REM ============================================================
-REM Produces dist\Council\Council.exe and supporting files.
+REM Produces dist\Anvil\Anvil.exe and supporting bundle files.
 REM Pre-reqs:
 REM     - Active Python 3.11 environment
 REM     - PyInstaller installed:  pip install pyinstaller
+REM
+REM Expect the build to take 5–10 minutes the first time —
+REM llama-cpp-python, chromadb, sentence-transformers, matplotlib,
+REM and pandas all contribute large native binaries.
 REM ============================================================
 
 setlocal
@@ -26,7 +30,7 @@ if errorlevel 1 (
 )
 
 echo === Running PyInstaller ===
-python -m PyInstaller council.spec --noconfirm --clean
+python -m PyInstaller anvil.spec --noconfirm --clean
 
 if errorlevel 1 (
     echo BUILD FAILED.
@@ -35,10 +39,13 @@ if errorlevel 1 (
 
 echo.
 echo === Build complete ===
-echo Bundle location: %CD%\dist\DatasInferno
-echo Executable:      %CD%\dist\DatasInferno\DatasInferno.exe
+echo Bundle location: %CD%\dist\Anvil
+echo Executable:      %CD%\dist\Anvil\Anvil.exe
 echo.
-echo To create a distributable installer, run an installer builder
-echo like Inno Setup or NSIS against dist\DatasInferno.
+echo Launch with a double-click, or from the command line:
+echo     dist\Anvil\Anvil.exe
+echo.
+echo To create a distributable installer, run Inno Setup or NSIS
+echo against dist\Anvil.
 
 endlocal

@@ -1,13 +1,13 @@
 # ============================================================
-# council.spec  —  PyInstaller build specification
+# anvil.spec  —  PyInstaller build specification for Anvil
 # ============================================================
-# Build with:    pyinstaller council.spec
-# Or use the helper scripts:    build.bat (Windows) / build.sh (mac/linux)
+# Build with:    pyinstaller anvil.spec
+# Or use the helper:    build.bat (Windows) / build.sh (mac/linux)
 #
 # Outputs:
 #   build/  - intermediate work directory (delete after)
-#   dist/Council/    - the bundled application
-#   dist/Council/Council.exe (or `Council` on Unix)
+#   dist/Anvil/         - the bundled application folder
+#   dist/Anvil/Anvil.exe (or `Anvil` on Unix)
 # ============================================================
 
 # pyright: reportMissingImports=false
@@ -27,7 +27,7 @@ hidden = [
     "tkinter.scrolledtext",
     "tkinter.colorchooser",
     "tkinter.font",
-    # Anything imported lazily inside try/except blocks
+    # Stdlib modules used inside lazy try/except blocks
     "ssl",
     "json",
     "urllib.request",
@@ -35,6 +35,7 @@ hidden = [
     "hmac",
     "hashlib",
     "base64",
+    "difflib",
     # Third-party that may be present
     "yaml",
     "chromadb",
@@ -42,10 +43,32 @@ hidden = [
     "tkinterweb",
     "paramiko",
     "pyttsx3",
+    # ---- Anvil-specific modules (all lazily imported from GUI engine) ----
+    # The Workspace tab imports these inside methods so PyInstaller's
+    # static scan misses them on the cold pass; listing them here
+    # guarantees they ship.
+    "goal_anchor",
+    "goal_cache",
+    "godot_workspace",
+    "godot_pipeline",
+    "godot_coder",
+    "game_concept",
+    "demo_builder",
+    "steam_ingest",
+    "steam_analyst",
+    "diff_view",
+    # Restored creative-tooling modules (Phase A restored these from main)
+    "idea_engine",
+    "image_engine",
+    "music_blocks",
+    "music_renderer",
+    "tab_video",
+    "video_processor",
 ]
 
 # ---- Data files to ship alongside the executable ----
-# `assets/` contains icons, splash, and `sample_data/` (3 demo CSVs).
+# Paths are (src_in_project, dest_in_bundle). PyInstaller copies the
+# tree at src to dest under the bundle's _MEI / dist root.
 datas = [
     ("assets",                    "assets"),
     ("personality_config.yaml",   "."),
@@ -87,7 +110,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="DatasInferno",
+    name="Anvil",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -104,5 +127,5 @@ coll = COLLECT(
     a.datas,
     strip=False,
     upx=False,
-    name="DatasInferno",
+    name="Anvil",
 )
