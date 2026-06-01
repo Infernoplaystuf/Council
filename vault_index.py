@@ -1816,9 +1816,41 @@ the vocabulary list. Lowercase only. Single line only.
         terms. Lets queries like "metals" surface "promethium" / "iron"
         / "steel" entries WITHOUT any hardcoded domain mapping in the
         index — the model decides per-vault based on the actual data.
+
+        Query DSL (opt-in, all special syntax sniffed in
+        ``vault_search_query``):
+
+          "Q4 revenue"        — phrase, must appear contiguously
+          /\\bemail.*@/       — regex, applied to the candidate's blob
+          foo AND bar         — boolean AND (default between terms too)
+          foo OR bar          — boolean OR
+          NOT foo             — negation
+          size:>10mb          — size gate (b/kb/mb/gb supported)
+          mtime:<7d           — modified within last N days/h/w/m/y
+          ext:csv,json        — extension restrictor
+          ( ... )             — grouping
+
+        Plain text without any of the above takes the legacy path
+        unchanged (zero regression risk for existing callers). The
+        DSL path currently bypasses semantic expansion (``llm_call``)
+        — the AST already gives the user explicit control over what
+        to look for, so we don't second-guess them.
         """
-        terms = _tokenize(query)
         fuzzy_matches: Dict[str, List[Tuple[str, float]]] = {}
+
+        # Sniff for advanced syntax. Plain queries (the existing common
+        # case) skip the new path entirely.
+        try:
+            import vault_search_query as _vsq
+            parsed = _vsq.parse_query(query)
+        except Exception as exc:
+            print(f"[VaultIndex] parse_query failed; legacy path: {exc!r}")
+            parsed = None
+
+        if parsed is not None and not parsed.is_legacy:
+            return self._search_dsl(parsed, k=k, folder=folder), fuzzy_matches
+
+        terms = _tokenize(query)
         if not terms:
             return [], fuzzy_matches
 
@@ -2007,6 +2039,128 @@ the vocabulary list. Lowercase only. Single line only.
 
         results.sort(key=lambda r: r[0], reverse=True)
         return results[:k], fuzzy_matches
+
+    # ---- DSL search (phrase / boolean / regex / filters) ----
+    def _search_dsl(
+        self,
+        parsed: Any,
+        *,
+        k: int,
+        folder: Optional[str],
+    ) -> List[Tuple[float, Dict[str, Any]]]:
+        """Execute a parsed Query against the index.
+
+        Step 1: gate candidates by ``parsed.filters`` (size / mtime /
+        ext) — fast per-file stats avoid expensive content checks
+        on files that can't satisfy the filter.
+
+        Step 2: evaluate the boolean AST against each survivor's
+        token bag + concatenated content blob.
+
+        Step 3: score the survivors with TF-IDF over the boolean
+        tree's plain Term leaves; phrases and regex contribute a
+        fixed bonus per match so they don't fight IDF noise.
+        """
+        import vault_search_query as _vsq
+
+        # Filter pre-pass — stat each candidate once and skip ones that
+        # fail any filter before we touch their content. ext / size /
+        # mtime are all cheap.
+        gated: List[Tuple[str, Dict[str, Any]]] = []
+        filters = parsed.filters or []
+        for spath, rec in self.records.items():
+            if folder and folder.lower() not in spath.lower():
+                continue
+            if filters:
+                try:
+                    st = Path(spath).stat()
+                    size = st.st_size
+                    mtime = st.st_mtime
+                except Exception:
+                    size = None
+                    mtime = None
+                ext = Path(spath).suffix.lower()
+                if not all(
+                    _vsq.filter_passes(f, size=size, mtime=mtime, ext=ext)
+                    for f in filters
+                ):
+                    continue
+            gated.append((spath, rec))
+        if not gated:
+            return []
+
+        # Per-record haystack + token bag — same data the legacy path
+        # builds, just packaged for the AST evaluator.
+        def _haystack(rec):
+            parts = [
+                " ".join(rec.get("keywords", []) or []),
+                " ".join((h or "") for h in rec.get("headers", []) or []),
+                " ".join(str(k) for k in rec.get("keys", []) or []),
+                (rec.get("sample_text", "") or ""),
+                (rec.get("description", "") or ""),
+                " ".join(str(t) for t in rec.get("topics", []) or []),
+                str(rec.get("name", "") or ""),
+            ]
+            for s in rec.get("sheets", []) or []:
+                parts.append(" ".join(str(h) for h in s.get("headers", []) or []))
+            return " ".join(parts).lower()
+
+        def _tokens(rec):
+            kws = {str(w).lower() for w in (rec.get("keywords", []) or [])}
+            headers = {(h or "").lower() for h in (rec.get("headers", []) or [])}
+            keys = {str(k).lower() for k in (rec.get("keys", []) or [])}
+            topics = {str(t).lower() for t in (rec.get("topics", []) or [])}
+            name = set(_tokenize(rec.get("name", "")))
+            return kws | headers | keys | topics | name
+
+        # Boolean gating
+        survivors: List[Tuple[str, Dict[str, Any], str, set]] = []
+        for spath, rec in gated:
+            blob = _haystack(rec)
+            toks = _tokens(rec)
+            if _vsq.evaluate_node(parsed.root, blob, toks):
+                survivors.append((spath, rec, blob, toks))
+        if not survivors:
+            return []
+
+        # Scoring: TF-IDF over the boolean tree's Term leaves, plus a
+        # fixed bonus per phrase or regex match. We compute IDF over
+        # the survivors (post-gating), which biases toward rare terms
+        # within the matched subset.
+        term_list = _vsq.collect_terms(parsed.root)
+        phrases, regexes = _vsq.collect_phrase_and_regex(parsed.root)
+        N = len(survivors)
+        df_counts: Dict[str, int] = defaultdict(int)
+        for _sp, _rec, _blob, toks in survivors:
+            for t in term_list:
+                if t in toks or t in _blob:
+                    df_counts[t] += 1
+        idf = {
+            t: math.log((N + 1) / (df_counts.get(t, 0) + 1)) + 1.0
+            for t in term_list
+        }
+        results: List[Tuple[float, Dict[str, Any]]] = []
+        for _sp, rec, blob, toks in survivors:
+            score = 0.0
+            for t in term_list:
+                if t in toks:
+                    score += idf[t] * 2.0
+                elif t in blob:
+                    score += idf[t]
+            # Phrase + regex bonuses (additive — no IDF, they're
+            # already rare by construction).
+            for ph in phrases:
+                if ph in blob:
+                    score += 2.5
+            for rg in regexes:
+                if rg.search(blob):
+                    score += 2.0
+            # Boost if the file name is short and matches multiple
+            # terms (cheap "this file is *about* the query" hint).
+            results.append((score, rec))
+
+        results.sort(key=lambda r: r[0], reverse=True)
+        return results[:k]
 
     # ---- LLM semantic-description layer ----
     # Each record gains an optional `description` (one-paragraph English
