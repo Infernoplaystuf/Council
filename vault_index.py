@@ -15,6 +15,7 @@ import csv
 import difflib
 import json
 import math
+import os
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -1645,10 +1646,40 @@ the vocabulary list. Lowercase only. Single line only.
         # Protected subdirs the model must NEVER index/read.
         # conversation_logs is the human-only debugging log; pipelines/out
         # is the modified-version dump that shouldn't leak as context.
+        #
+        # We resolve the protected subdir names to absolute paths ONCE
+        # before the rglob loop, then do a fast prefix-string check per
+        # file. The old per-iteration call to is_protected_path() did
+        # the same work (resolve vault_dir, resolve file, compute
+        # relative_to) on every single file — 5-10 % of the walk on a
+        # vault with a few hundred files.
         try:
-            from conversation_logger import is_protected_path as _is_protected
+            from conversation_logger import (
+                PROTECTED_SUBDIRS as _PROTECTED_SUBDIRS,
+            )
         except Exception:
-            _is_protected = lambda *_a, **_k: False
+            _PROTECTED_SUBDIRS = ()
+        try:
+            _vault_resolved = self.vault_dir.expanduser().resolve()
+            _protected_prefixes = tuple(
+                str(_vault_resolved / sub).lower() + os.sep
+                for sub in _PROTECTED_SUBDIRS
+            )
+        except Exception:
+            _protected_prefixes = ()
+
+        def _is_protected_fast(p: Path) -> bool:
+            """Cheap absolute-prefix check — equivalent to the old
+            is_protected_path call on resolvable paths. Falls back to
+            the slow version only when string-prefix can't help (e.g.
+            symlinked subtree)."""
+            if not _protected_prefixes:
+                return False
+            try:
+                sp = str(p.resolve()).lower()
+            except Exception:
+                return False
+            return any(sp.startswith(prefix) for prefix in _protected_prefixes)
 
         # ── Phase 1: enumerate candidate files, skip up-to-date ones ──────
         # The walk itself is fast; parsing is the slow part. So we first
@@ -1666,7 +1697,16 @@ the vocabulary list. Lowercase only. Single line only.
             # semantic expansion.
             if p.name in _BOOKKEEPING_FILENAMES:
                 continue
-            if _is_protected(p, self.vault_dir):
+            # HARD GUARD — conversation logs and other protected vault
+            # subfolders. Checked first so nothing under them can slip
+            # through any of the other filters.
+            #
+            # _is_protected_fast (defined above) pre-resolves the
+            # protected subdir prefixes once and does a cheap
+            # startswith check per file, instead of the original
+            # per-iteration is_protected_path() call that re-resolved
+            # vault_dir and computed relative_to on every file.
+            if _is_protected_fast(p):
                 continue
             parts = {part.lower() for part in p.parts}
             if "out" in parts and "pipelines" in parts:

@@ -30,6 +30,32 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Tuple
 
+# Process-wide LRU cache for parsed DataFrames. The per-file inventory
+# helpers below (csv_inventory, count_rows_per_csv, average_numeric_
+# column_per_csv, etc.) used to call pd.read_csv from cold for every
+# question — a single user turn that triggers two helpers re-reads each
+# CSV twice. Routing through df_cache gives in-turn cache hits for free.
+try:
+    from df_cache import cached_read_csv as _cached_read_csv
+except Exception:
+    _cached_read_csv = None  # graceful — fall back to pd.read_csv per call
+
+
+def _read_csv_cached(path, **kw):
+    """Wrapper that prefers df_cache.cached_read_csv but degrades to a
+    bare pandas read when the cache is unavailable. Returns the same
+    DataFrame regardless — callers see no behavioural difference."""
+    if _cached_read_csv is not None:
+        try:
+            return _cached_read_csv(path, **kw)
+        except Exception:
+            # Defensive: if the cache misbehaves for any reason, fall
+            # through to the uncached path so the analyst still answers.
+            pass
+    import pandas as _pd_inner
+    return _pd_inner.read_csv(path, **kw)
+
+
 try:
     import pandas as pd
 except Exception as exc:  # pragma: no cover - imported at runtime
@@ -1150,7 +1176,7 @@ def csv_inventory(
     for csv_path in csvs:
         root = first_matching_root(csv_path, folders)
         try:
-            df_head = pd.read_csv(csv_path, nrows=5)
+            df_head = _read_csv_cached(csv_path, nrows=5)
             rows.append({
                 "csv": csv_path.name,
                 "relative_path": safe_relative_path(csv_path, root),
@@ -1177,7 +1203,7 @@ def count_rows_per_csv(data_folder: Any, recursive: bool = True) -> pd.DataFrame
     for csv_path in list_csv_files(folders, recursive=recursive):
         root = first_matching_root(csv_path, folders)
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
             rows.append({
                 "csv": csv_path.name,
                 "relative_path": safe_relative_path(csv_path, root),
@@ -1209,7 +1235,7 @@ def _numeric_aggregate_per_csv(
     for csv_path in list_csv_files(folders, recursive=recursive):
         root = first_matching_root(csv_path, folders)
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
             actual_col = find_column_case_insensitive(df, column_name)
             if actual_col is None:
                 rows.append({
@@ -1308,7 +1334,7 @@ def numeric_summary_per_csv(
     for csv_path in list_csv_files(folders, recursive=recursive):
         root = first_matching_root(csv_path, folders)
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
             if column_name:
                 actual_col = find_column_case_insensitive(df, column_name)
                 if actual_col is None:
@@ -1356,7 +1382,7 @@ def count_matching_rows_per_csv(
     for csv_path in list_csv_files(folders, recursive=recursive):
         root = first_matching_root(csv_path, folders)
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
             actual_col = find_column_case_insensitive(df, column_name)
             if actual_col is None:
                 # also try substring match against header names
@@ -1420,7 +1446,7 @@ def filter_rows_across_csvs(
     for csv_path in list_csv_files(folders, recursive=recursive):
         root = first_matching_root(csv_path, folders)
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
             actual_col = find_column_case_insensitive(df, column_name)
             if actual_col is None:
                 continue
@@ -1464,7 +1490,7 @@ def groupby_mean_per_csv(
     for csv_path in list_csv_files(folders, recursive=recursive):
         root = first_matching_root(csv_path, folders)
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
             actual_group = find_column_case_insensitive(df, group_col)
             actual_value = find_column_case_insensitive(df, value_col)
             if actual_group is None or actual_value is None:
@@ -1572,7 +1598,7 @@ def top_n_per_csv(
     for csv_path in list_csv_files(folders, recursive=recursive):
         root = first_matching_root(csv_path, folders)
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
         except Exception as exc:
             rows.append({
                 "csv": csv_path.name,
@@ -1947,7 +1973,7 @@ def detect_data_quality_issues_per_csv(
     frames: list[pd.DataFrame] = []
     for csv_path in list_csv_files(folders, recursive=recursive):
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
             issues = detect_data_quality_issues(df)
             if not issues.empty:
                 issues.insert(0, "csv", csv_path.name)
@@ -2023,7 +2049,7 @@ def pivot_per_csv(
     for csv_path in list_csv_files(folders, recursive=recursive):
         root = first_matching_root(csv_path, folders)
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
             ix = find_column_case_insensitive(df, index_col)
             cx = find_column_case_insensitive(df, columns_col)
             vx = find_column_case_insensitive(df, value_col)
@@ -2072,7 +2098,7 @@ def correlation_per_csv(
     for csv_path in list_csv_files(folders, recursive=recursive):
         root = first_matching_root(csv_path, folders)
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
             actual_x = find_column_case_insensitive(df, x_col)
             actual_y = find_column_case_insensitive(df, y_col)
             if actual_x is None or actual_y is None:
@@ -2333,7 +2359,7 @@ def preview_csv_inventory(folders: Any, max_files: int = 25, max_cols: int = 30)
     for csv_path in csvs[:max_files]:
         root = first_matching_root(csv_path, normalized)
         try:
-            df_head = pd.read_csv(csv_path, nrows=5)
+            df_head = _read_csv_cached(csv_path, nrows=5)
             cols = list(df_head.columns)
             shown_cols = cols[:max_cols]
             more = "" if len(cols) <= max_cols else f" ... (+{len(cols) - max_cols} more)"

@@ -305,14 +305,33 @@ _FILE_READ_CHAR_LIMIT = 12000  # total chars per file in the injected block
 _BLOCK_HEADER_RE = _re.compile(r"\s*~[\d,]+\s+tokens\s*")
 
 
-def _estimate_block_tokens(block_text: str) -> int:
-    """Cheap token estimator — uses the loaded llama tokenizer when
-    available, falls back to chars/4. Never raises."""
+from functools import lru_cache as _lru_cache
+
+
+@_lru_cache(maxsize=4096)
+def _estimate_block_tokens_cached(block_text: str) -> int:
+    """Inner cacheable form. Tokenisation is pure with respect to its
+    input string — the same block always counts to the same number of
+    tokens for a given model, and the model isn't hot-swapped during
+    a session. 4096 entries × few hundred bytes each ~= 1-2 MB cap."""
     try:
         import council_engine as _ce
         return _ce.estimate_tokens(block_text or "")
     except Exception:
         return max(1, (len(block_text or "") + 3) // 4)
+
+
+def _estimate_block_tokens(block_text: str) -> int:
+    """Cheap token estimator — uses the loaded llama tokenizer when
+    available, falls back to chars/4. Never raises.
+
+    Wrapper around the lru_cache'd impl so callers can pass non-string
+    inputs (None, bytes from a misbehaving caller) without poisoning
+    the cache with un-hashable keys.
+    """
+    if not isinstance(block_text, str):
+        block_text = "" if block_text is None else str(block_text)
+    return _estimate_block_tokens_cached(block_text)
 
 
 def _tag_block_header(block_text: str, token_count: int) -> str:

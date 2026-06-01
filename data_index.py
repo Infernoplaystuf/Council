@@ -316,6 +316,24 @@ class DataIndex:
 
         self._profiles: Dict[Path, FileProfile] = {}
 
+        # ── Inverted column index ────────────────────────────────
+        # find_files_with_column used to iterate every profile and
+        # every column on each call (O(files × cols)). The column
+        # index serves the same query in O(1) average via a
+        # persistent {col_name_lower → file_paths} dict. The first
+        # search root is used as the "vault dir" for the sidecar
+        # JSON file. A misconfig that leaves search_roots empty
+        # disables the index gracefully (find_files_with_column
+        # falls back to the linear scan path).
+        self._col_index = None
+        try:
+            if self.search_roots:
+                import vault_col_index as _vci
+                self._col_index = _vci.ColumnIndex(self.search_roots[0])
+        except Exception as exc:
+            print(f"[DataIndex] could not init column index: {exc!r}")
+            self._col_index = None
+
     # ---- Read-only path validator ----------------------------------
 
     def is_input_path(self, path: Path) -> bool:
@@ -398,7 +416,12 @@ class DataIndex:
         return out
 
     def refresh(self) -> None:
-        """Rebuild every profile. Skip files that haven't changed since last index."""
+        """Rebuild every profile. Skip files that haven't changed since last index.
+
+        Also incrementally maintains the column index sidecar so the
+        next launch can start with a warm O(1) lookup table.
+        """
+        changed = False
         for path in self.discover():
             cached = self._profiles.get(path)
             try:
@@ -407,11 +430,31 @@ class DataIndex:
                 continue
             if cached and cached.indexed_at >= mtime:
                 continue
-            self._profiles[path] = self._profile_file(path)
+            profile = self._profile_file(path)
+            self._profiles[path] = profile
+            changed = True
+            # Update the column index in step with the profile
+            if self._col_index is not None:
+                try:
+                    col_names = [c.name for c in profile.columns]
+                    self._col_index.update(path, col_names, mtime=mtime)
+                except Exception as exc:
+                    print(f"[DataIndex] col_index update failed for {path}: {exc!r}")
         # Drop profiles for files that no longer exist
         for path in list(self._profiles.keys()):
             if not path.exists():
                 self._profiles.pop(path, None)
+                if self._col_index is not None:
+                    try:
+                        if self._col_index.remove(path):
+                            changed = True
+                    except Exception:
+                        pass
+        if changed and self._col_index is not None:
+            try:
+                self._col_index.save()
+            except Exception as exc:
+                print(f"[DataIndex] col_index save failed: {exc!r}")
 
     def all_profiles(self) -> List[FileProfile]:
         if not self._profiles:
@@ -534,10 +577,42 @@ class DataIndex:
         """
         Files that have a column matching `column_name` (substring match,
         case-insensitive). Returns (profile, exact_column_name).
+
+        Fast path: when the inverted ColumnIndex is available, this is
+        O(distinct_cols + hits) rather than O(files × cols). The
+        fallback linear scan still runs if the index is unavailable
+        (early init) or hasn't been populated yet.
         """
         target = column_name.strip().lower()
         if not target:
             return []
+        # ── Fast path via inverted index ──
+        if self._col_index is not None:
+            try:
+                hits = self._col_index.find_files(target, exact=False)
+                if hits:
+                    out: List[Tuple[FileProfile, str]] = []
+                    # Map (path, col) back to (profile, col). Files known
+                    # to the col_index but not yet profiled in memory
+                    # trigger an on-demand profile_file call so the
+                    # caller gets a usable FileProfile back.
+                    for path, exact_col in hits:
+                        prof = self._profiles.get(path)
+                        if prof is None:
+                            # Lazy-profile so the caller always gets a
+                            # FileProfile. Most callers will iterate
+                            # the profile's columns anyway.
+                            try:
+                                prof = self._profile_file(path)
+                                self._profiles[path] = prof
+                            except Exception:
+                                continue
+                        out.append((prof, exact_col))
+                    return out
+            except Exception as exc:
+                print(f"[DataIndex] col_index lookup failed; "
+                      f"falling back to linear: {exc!r}")
+        # ── Fallback: original linear scan ──
         out = []
         for prof in self.all_profiles():
             for col in prof.columns:
@@ -545,6 +620,61 @@ class DataIndex:
                     out.append((prof, col.name))
                     break
         return out
+
+    def find_files_with_columns(
+        self,
+        column_names: Iterable[str],
+        *,
+        all_required: bool = True,
+        exact: bool = False,
+    ) -> List[FileProfile]:
+        """Schema-fingerprint helper — files whose columns include the
+        requested set.
+
+        ``all_required=True`` (default): every requested column must be
+        present (AND). ``False``: any one is enough (OR).
+        ``exact``: require normalised-equal matching per column name
+        instead of the default substring match.
+
+        Use this when you know what shape you're looking for: "find
+        every CSV that has at least 'order_id', 'customer_id', and
+        'amount' columns" → ``find_files_with_columns(
+        ['order_id', 'customer_id', 'amount'])``.
+        """
+        cols = [c for c in column_names if c and c.strip()]
+        if not cols:
+            return []
+        if self._col_index is not None:
+            try:
+                paths = self._col_index.find_files_with_columns(
+                    cols, all_required=all_required, exact=exact,
+                )
+                out: List[FileProfile] = []
+                for path in paths:
+                    prof = self._profiles.get(path)
+                    if prof is None:
+                        try:
+                            prof = self._profile_file(path)
+                            self._profiles[path] = prof
+                        except Exception:
+                            continue
+                    out.append(prof)
+                return out
+            except Exception as exc:
+                print(f"[DataIndex] schema-fingerprint lookup failed; "
+                      f"falling back: {exc!r}")
+        # Fallback: per-column linear search then intersect / union
+        per_col_paths: List[set] = []
+        for c in cols:
+            hits = self.find_files_with_column(c)
+            per_col_paths.append({p.path for p, _ in hits})
+        if not per_col_paths:
+            return []
+        result = per_col_paths[0]
+        op = (lambda a, b: a & b) if all_required else (lambda a, b: a | b)
+        for s in per_col_paths[1:]:
+            result = op(result, s)
+        return [self._profiles[p] for p in result if p in self._profiles]
 
     def find_relationships(self) -> List[Dict[str, Any]]:
         """
