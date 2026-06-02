@@ -14,11 +14,15 @@ from __future__ import annotations
 import csv
 import difflib
 import json
+import logging
 import math
+import os
 import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+_LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Optional fast-path JSON parser. `orjson` is a Rust-backed parser that runs
@@ -97,6 +101,13 @@ _BOOKKEEPING_FILENAMES = {
     SEMANTIC_CACHE_FILENAME,
     "backend_settings.json",   # GGUF model path; not user data
     ".onboarded",              # onboarding marker
+    # Performance sidecars added by 95aa6d4 / 00e0b47. The col-index
+    # is a .json file, so without this exclusion the rebuild walk
+    # picks it up via _PARSEABLE, indexes column-name keys back into
+    # the vocab, AND rewrites the file every refresh — which moves
+    # its mtime and forces a perpetual re-index loop.
+    ".vault_col_index.json",
+    "data_index_cache.pickle",
 }
 
 # Fuzzy match defaults — Levenshtein-style ratio via difflib.
@@ -480,6 +491,60 @@ _TEXT_SUFFIXES = {
     ".txt", ".md", ".log", ".rst", ".yaml", ".yml",
     ".ini", ".cfg", ".toml", ".html", ".htm",
 }
+
+# Source-code files — same plain-text treatment as _TEXT_SUFFIXES (read
+# first ~4 KB, tokenize, store the resulting keyword set). Adding them
+# here means vault search now surfaces matches in code files: "find files
+# that import pandas," "which scripts reference process_data," etc.
+#
+# Without this set, .py / .js / .ts / .go / etc. files in data_in/ were
+# silently skipped by the rebuild walk — the vault index's _PARSEABLE
+# filter is the only filter the walk respects, and these extensions
+# weren't on it. Users would put Python files in their vault expecting
+# the model to search them and get nothing back.
+#
+# We index source code the same way as plain text (no syntax parsing).
+# Keyword tokenization on raw source produces useful matches for the
+# most common queries: identifier names, library imports, class /
+# function names, comment text. For richer queries on a specific
+# language (e.g. "find files implementing __iter__"), the analyst step
+# can still execute pandas / grep-style code over the raw files
+# regardless of what the keyword index captures.
+_SOURCE_CODE_SUFFIXES = {
+    # Python
+    ".py", ".pyw", ".pyi",
+    # Web / JS / TS
+    ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx",
+    ".css", ".scss", ".sass", ".less",
+    ".vue", ".svelte",
+    # Systems
+    ".go", ".rs", ".zig",
+    ".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".hxx",
+    # JVM
+    ".java", ".kt", ".kts", ".scala", ".groovy",
+    # .NET
+    ".cs", ".fs", ".vb",
+    # Scripts / shells
+    ".sh", ".bash", ".zsh", ".fish",
+    ".ps1", ".psm1", ".bat", ".cmd",
+    # Other languages
+    ".rb", ".php", ".swift", ".m", ".mm",
+    ".lua", ".pl", ".pm",
+    ".r",   ".jl",
+    ".dart", ".ex", ".exs", ".erl", ".hrl",
+    ".clj", ".cljs", ".cljc",
+    ".hs", ".lhs", ".ml", ".mli", ".elm",
+    # Database / config
+    ".sql", ".env", ".conf",
+    # IaC / build
+    ".dockerfile", ".tf", ".tfvars", ".nix",
+    ".cmake", ".mk", ".ninja",
+    ".gradle", ".sbt",
+    # Web markup beyond html/htm
+    ".xml", ".xsl", ".xslt", ".xsd",
+    ".jsonl", ".ndjson",
+}
+
 _EXCEL_SUFFIXES = {".xlsx", ".xls", ".xlsm"}
 _TABULAR_EXTRA  = {".tsv", ".parquet"}     # parquet needs pyarrow at runtime
 # SQLite databases (.db / .sqlite / .sqlite3) — indexed at the table level
@@ -492,8 +557,8 @@ _BSON_SUFFIXES = {".bson"}
 # like .json for keyword indexing so 'show pipeline X' / vault search
 # both pick them up).
 _D3DPIPELINE_SUFFIXES = {".d3dpipeline"}
-_PARSEABLE = ({".csv", ".json"} | _TEXT_SUFFIXES | _EXCEL_SUFFIXES
-              | _TABULAR_EXTRA | _SQLITE_SUFFIXES
+_PARSEABLE = ({".csv", ".json"} | _TEXT_SUFFIXES | _SOURCE_CODE_SUFFIXES
+              | _EXCEL_SUFFIXES | _TABULAR_EXTRA | _SQLITE_SUFFIXES
               | _DUCKDB_SUFFIXES | _BSON_SUFFIXES | _D3DPIPELINE_SUFFIXES)
 
 
@@ -1219,6 +1284,10 @@ def _index_file(p: Path) -> Optional[Dict[str, Any]]:
         rec = _parse_bson(p)
     elif suffix in _TEXT_SUFFIXES:
         rec = _parse_text(p, suffix)
+    elif suffix in _SOURCE_CODE_SUFFIXES:
+        # Source code = plain text with the suffix stored so callers
+        # know it's code (e.g. summary_block can label it "type: py").
+        rec = _parse_text(p, suffix)
     else:
         return None
     # Skip records that parsed but yielded nothing useful. See
@@ -1587,10 +1656,40 @@ the vocabulary list. Lowercase only. Single line only.
         # Protected subdirs the model must NEVER index/read.
         # conversation_logs is the human-only debugging log; pipelines/out
         # is the modified-version dump that shouldn't leak as context.
+        #
+        # We resolve the protected subdir names to absolute paths ONCE
+        # before the rglob loop, then do a fast prefix-string check per
+        # file. The old per-iteration call to is_protected_path() did
+        # the same work (resolve vault_dir, resolve file, compute
+        # relative_to) on every single file — 5-10 % of the walk on a
+        # vault with a few hundred files.
         try:
-            from conversation_logger import is_protected_path as _is_protected
+            from conversation_logger import (
+                PROTECTED_SUBDIRS as _PROTECTED_SUBDIRS,
+            )
         except Exception:
-            _is_protected = lambda *_a, **_k: False
+            _PROTECTED_SUBDIRS = ()
+        try:
+            _vault_resolved = self.vault_dir.expanduser().resolve()
+            _protected_prefixes = tuple(
+                str(_vault_resolved / sub).lower() + os.sep
+                for sub in _PROTECTED_SUBDIRS
+            )
+        except Exception:
+            _protected_prefixes = ()
+
+        def _is_protected_fast(p: Path) -> bool:
+            """Cheap absolute-prefix check — equivalent to the old
+            is_protected_path call on resolvable paths. Falls back to
+            the slow version only when string-prefix can't help (e.g.
+            symlinked subtree)."""
+            if not _protected_prefixes:
+                return False
+            try:
+                sp = str(p.resolve()).lower()
+            except Exception:
+                return False
+            return any(sp.startswith(prefix) for prefix in _protected_prefixes)
 
         # ── Phase 1: enumerate candidate files, skip up-to-date ones ──────
         # The walk itself is fast; parsing is the slow part. So we first
@@ -1608,7 +1707,16 @@ the vocabulary list. Lowercase only. Single line only.
             # semantic expansion.
             if p.name in _BOOKKEEPING_FILENAMES:
                 continue
-            if _is_protected(p, self.vault_dir):
+            # HARD GUARD — conversation logs and other protected vault
+            # subfolders. Checked first so nothing under them can slip
+            # through any of the other filters.
+            #
+            # _is_protected_fast (defined above) pre-resolves the
+            # protected subdir prefixes once and does a cheap
+            # startswith check per file, instead of the original
+            # per-iteration is_protected_path() call that re-resolved
+            # vault_dir and computed relative_to on every file.
+            if _is_protected_fast(p):
                 continue
             parts = {part.lower() for part in p.parts}
             if "out" in parts and "pipelines" in parts:
@@ -1718,9 +1826,41 @@ the vocabulary list. Lowercase only. Single line only.
         terms. Lets queries like "metals" surface "promethium" / "iron"
         / "steel" entries WITHOUT any hardcoded domain mapping in the
         index — the model decides per-vault based on the actual data.
+
+        Query DSL (opt-in, all special syntax sniffed in
+        ``vault_search_query``):
+
+          "Q4 revenue"        — phrase, must appear contiguously
+          /\\bemail.*@/       — regex, applied to the candidate's blob
+          foo AND bar         — boolean AND (default between terms too)
+          foo OR bar          — boolean OR
+          NOT foo             — negation
+          size:>10mb          — size gate (b/kb/mb/gb supported)
+          mtime:<7d           — modified within last N days/h/w/m/y
+          ext:csv,json        — extension restrictor
+          ( ... )             — grouping
+
+        Plain text without any of the above takes the legacy path
+        unchanged (zero regression risk for existing callers). The
+        DSL path currently bypasses semantic expansion (``llm_call``)
+        — the AST already gives the user explicit control over what
+        to look for, so we don't second-guess them.
         """
-        terms = _tokenize(query)
         fuzzy_matches: Dict[str, List[Tuple[str, float]]] = {}
+
+        # Sniff for advanced syntax. Plain queries (the existing common
+        # case) skip the new path entirely.
+        try:
+            import vault_search_query as _vsq
+            parsed = _vsq.parse_query(query)
+        except Exception as exc:
+            print(f"[VaultIndex] parse_query failed; legacy path: {exc!r}")
+            parsed = None
+
+        if parsed is not None and not parsed.is_legacy:
+            return self._search_dsl(parsed, k=k, folder=folder), fuzzy_matches
+
+        terms = _tokenize(query)
         if not terms:
             return [], fuzzy_matches
 
@@ -1790,8 +1930,13 @@ the vocabulary list. Lowercase only. Single line only.
         expanded = {t for t in expanded if t
                     and t not in _SEARCH_STOP_TOKENS
                     and len(t) > 1}
-        if not expanded:
-            return [], fuzzy_matches
+        # Note: we deliberately do NOT early-return when `expanded` is
+        # empty. The keyword pass below will simply produce no scored
+        # results, and the embedding pass at the end can still surface
+        # the closest semantic matches (e.g. for a query like "what
+        # pipeline does X" where every word is a stop-word). That's
+        # what makes "show me the closest script even if nothing's an
+        # exact match" work.
 
         # candidate set (folder-scoped if requested)
         cand: List[Tuple[str, Dict[str, Any]]] = []
@@ -1897,13 +2042,143 @@ the vocabulary list. Lowercase only. Single line only.
                         old_sc, idx = by_path[p]
                         results[int(idx)] = (old_sc + boost, results[int(idx)][1])
                     else:
-                        # New path the keyword pass missed
+                        # New path the keyword pass missed — this match
+                        # is "semantic only" (no keyword hits). Tag a
+                        # copy of the record so the downstream renderer
+                        # can label the block clearly. We copy because
+                        # the underlying records dict is shared across
+                        # queries — mutating it would leak the flag.
                         rec = self.records.get(p)
                         if rec:
-                            results.append((boost, rec))
+                            rec_copy = dict(rec)
+                            rec_copy["_semantic_only"] = True
+                            rec_copy["_cosine_similarity"] = float(cos)
+                            results.append((boost, rec_copy))
 
         results.sort(key=lambda r: r[0], reverse=True)
         return results[:k], fuzzy_matches
+
+    # ---- DSL search (phrase / boolean / regex / filters) ----
+    def _search_dsl(
+        self,
+        parsed: Any,
+        *,
+        k: int,
+        folder: Optional[str],
+    ) -> List[Tuple[float, Dict[str, Any]]]:
+        """Execute a parsed Query against the index.
+
+        Step 1: gate candidates by ``parsed.filters`` (size / mtime /
+        ext) — fast per-file stats avoid expensive content checks
+        on files that can't satisfy the filter.
+
+        Step 2: evaluate the boolean AST against each survivor's
+        token bag + concatenated content blob.
+
+        Step 3: score the survivors with TF-IDF over the boolean
+        tree's plain Term leaves; phrases and regex contribute a
+        fixed bonus per match so they don't fight IDF noise.
+        """
+        import vault_search_query as _vsq
+
+        # Filter pre-pass — stat each candidate once and skip ones that
+        # fail any filter before we touch their content. ext / size /
+        # mtime are all cheap.
+        gated: List[Tuple[str, Dict[str, Any]]] = []
+        filters = parsed.filters or []
+        for spath, rec in self.records.items():
+            if folder and folder.lower() not in spath.lower():
+                continue
+            if filters:
+                try:
+                    st = Path(spath).stat()
+                    size = st.st_size
+                    mtime = st.st_mtime
+                except Exception:
+                    size = None
+                    mtime = None
+                ext = Path(spath).suffix.lower()
+                if not all(
+                    _vsq.filter_passes(f, size=size, mtime=mtime, ext=ext)
+                    for f in filters
+                ):
+                    continue
+            gated.append((spath, rec))
+        if not gated:
+            return []
+
+        # Per-record haystack + token bag — same data the legacy path
+        # builds, just packaged for the AST evaluator.
+        def _haystack(rec):
+            parts = [
+                " ".join(rec.get("keywords", []) or []),
+                " ".join((h or "") for h in rec.get("headers", []) or []),
+                " ".join(str(k) for k in rec.get("keys", []) or []),
+                (rec.get("sample_text", "") or ""),
+                (rec.get("description", "") or ""),
+                " ".join(str(t) for t in rec.get("topics", []) or []),
+                str(rec.get("name", "") or ""),
+            ]
+            for s in rec.get("sheets", []) or []:
+                parts.append(" ".join(str(h) for h in s.get("headers", []) or []))
+            return " ".join(parts).lower()
+
+        def _tokens(rec):
+            kws = {str(w).lower() for w in (rec.get("keywords", []) or [])}
+            headers = {(h or "").lower() for h in (rec.get("headers", []) or [])}
+            keys = {str(k).lower() for k in (rec.get("keys", []) or [])}
+            topics = {str(t).lower() for t in (rec.get("topics", []) or [])}
+            name = set(_tokenize(rec.get("name", "")))
+            return kws | headers | keys | topics | name
+
+        # Boolean gating
+        survivors: List[Tuple[str, Dict[str, Any], str, set]] = []
+        for spath, rec in gated:
+            blob = _haystack(rec)
+            toks = _tokens(rec)
+            if _vsq.evaluate_node(parsed.root, blob, toks):
+                survivors.append((spath, rec, blob, toks))
+        if not survivors:
+            return []
+
+        # Scoring: TF-IDF over the boolean tree's Term leaves, plus a
+        # fixed bonus per phrase or regex match. We compute IDF over
+        # the survivors (post-gating), which biases toward rare terms
+        # within the matched subset.
+        term_list = _vsq.collect_terms(parsed.root)
+        phrases, regexes = _vsq.collect_phrase_and_regex(parsed.root)
+        N = len(survivors)
+        df_counts: Dict[str, int] = defaultdict(int)
+        for _sp, _rec, _blob, toks in survivors:
+            for t in term_list:
+                if t in toks or t in _blob:
+                    df_counts[t] += 1
+        idf = {
+            t: math.log((N + 1) / (df_counts.get(t, 0) + 1)) + 1.0
+            for t in term_list
+        }
+        results: List[Tuple[float, Dict[str, Any]]] = []
+        for _sp, rec, blob, toks in survivors:
+            score = 0.0
+            for t in term_list:
+                if t in toks:
+                    score += idf[t] * 2.0
+                elif t in blob:
+                    score += idf[t]
+            # Phrase + regex bonuses (additive — no IDF, they're
+            # already rare by construction).
+            for ph in phrases:
+                if ph in blob:
+                    score += 2.5
+            for rg in regexes:
+                if rg.search(blob):
+                    score += 2.0
+            # Boost if the file name is short and matches multiple
+            # terms (cheap "this file is *about* the query" hint).
+            results.append((score, rec))
+
+        results.sort(key=lambda r: r[0], reverse=True)
+        return results[:k]
 
     # ---- LLM semantic-description layer ----
     # Each record gains an optional `description` (one-paragraph English
@@ -2149,26 +2424,36 @@ the vocabulary list. Lowercase only. Single line only.
         return _split_summary_and_topics(raw or "")
 
     # ---- prompt formatting ----
-    def summary_block(self, rec: Dict[str, Any], max_chars: int = 1500) -> str:
-        """Format a record as a [VAULT MATCH] block for prompt injection."""
-        lines = [
-            f"[VAULT MATCH: {rec.get('name', '?')}]",
-            f"path: {rec.get('path', '')}",
-        ]
-        desc = rec.get("description", "")
-        if desc:
-            lines.append("summary: " + desc.replace("\n", " ").strip())
-        topics = rec.get("topics", [])
-        if topics:
-            lines.append("topics: " + ", ".join(map(str, topics)))
+    # ── Tiered [VAULT MATCH] rendering ────────────────────────────────────
+    # The legacy summary_block emitted everything (Tier 1 + 2 + 3) up to a
+    # 1500-char cap. On a small-ctx model that meant K full blocks could
+    # easily eat half the prompt budget. The tiered API lets the
+    # injection layer pack Tier 1 (filename + type + schema + counts) for
+    # ALL matches first, then top up the highest-priority matches with
+    # Tier 2 (samples + topics + description), then Tier 3 (extended
+    # preview text) only if budget remains.
+    #
+    # Each tier method returns a list of lines so the assembler can join
+    # what it picked. The caller is responsible for adding the
+    # [VAULT MATCH: name] header and [END MATCH] footer — they belong to
+    # the assembled block, not the per-tier payload.
+
+    def _summary_tier1_lines(self, rec: Dict[str, Any]) -> List[str]:
+        """Filename, type, row/count info, and SCHEMA (columns / keys /
+        sheet names). The 'always-included' tier — every block must
+        carry at least this. The bare-minimum context the model needs
+        to know what the file IS.
+        """
         rtype = rec.get("type", "text")
+        lines: List[str] = []
+        lines.append(f"path: {rec.get('path', '')}")
         if rtype in ("csv", "tsv", "csv.gz", "parquet"):
             lines.append(f"type: {rtype}")
+            rows = rec.get("rows")
+            if isinstance(rows, int):
+                lines.append(f"rows: {rows:,}")
             if rec.get("headers"):
                 lines.append("columns: " + ", ".join(rec["headers"]))
-            if rec.get("sample_rows"):
-                lines.append("sample rows:")
-                lines.extend(rec["sample_rows"][:3])
         elif rtype in ("sqlite", "duckdb"):
             lines.append(f"type: {rtype}")
             tables = rec.get("tables", []) or []
@@ -2184,24 +2469,13 @@ the vocabulary list. Lowercase only. Single line only.
                 lines.append(f"documents: {rec['doc_count']}")
             if rec.get("keys"):
                 lines.append("fields: " + ", ".join(map(str, rec["keys"][:30])))
-            if rec.get("sample_text"):
-                lines.append("sample:")
-                lines.append(rec["sample_text"][:600])
         elif rtype == "json":
             lines.append("type: json")
             if rec.get("keys"):
                 lines.append("keys: " + ", ".join(rec["keys"][:30]))
-            # Surface the sampled-indexing note so the writer knows
-            # the keyword surface is partial for very large JSONs.
-            # Prevents the model from confidently asserting "this file
-            # does not contain X" when the index only covered the
-            # head and tail of the file.
             if rec.get("indexing_tier") in ("sampled_head_tail",):
                 lines.append("indexing: head+tail sample only — some keys "
                              "deep in the file may not appear in the index")
-            if rec.get("sample_text"):
-                lines.append("preview:")
-                lines.append(rec["sample_text"][:600])
         elif rtype == "excel":
             lines.append("type: excel")
             sheets = rec.get("sheets", []) or []
@@ -2209,17 +2483,326 @@ the vocabulary list. Lowercase only. Single line only.
             for s in sheets[:6]:
                 cols = ", ".join(map(str, s.get("headers", [])[:15]))
                 lines.append(f"  - {s.get('sheet','?')} ({s.get('rows', 0)} rows): {cols}")
-            if rec.get("sample_rows"):
-                lines.append("samples:")
-                for r in rec["sample_rows"][:3]:
-                    lines.append(f"  {r}")
         else:
             lines.append(f"type: {rtype}")
-            if rec.get("sample_text"):
-                lines.append("preview:")
-                lines.append(rec["sample_text"][:600])
+        return lines
+
+    def _summary_tier2_lines(self, rec: Dict[str, Any]) -> List[str]:
+        """Topics, description, 1-2 sample rows. The 'helpful if budget
+        allows' tier — what the file is *about* and a taste of contents."""
+        lines: List[str] = []
+        topics = rec.get("topics", [])
+        if topics:
+            lines.append("topics: " + ", ".join(map(str, topics)))
+        desc = rec.get("description", "")
+        if desc:
+            lines.append("summary: " + desc.replace("\n", " ").strip())
+        rtype = rec.get("type", "text")
+        if rtype in ("csv", "tsv", "csv.gz", "parquet") and rec.get("sample_rows"):
+            lines.append("sample rows:")
+            for r in rec["sample_rows"][:2]:
+                lines.append(f"  {r}")
+        elif rtype == "excel" and rec.get("sample_rows"):
+            lines.append("samples:")
+            for r in rec["sample_rows"][:2]:
+                lines.append(f"  {r}")
+        return lines
+
+    def _summary_tier3_lines(self, rec: Dict[str, Any]) -> List[str]:
+        """Extended preview text — the longest payload. Only injected
+        when budget is generous and the block is among the top-ranked
+        matches. Truncated to 600 chars so a single rich block doesn't
+        run away."""
+        lines: List[str] = []
+        rtype = rec.get("type", "text")
+        sample_text = rec.get("sample_text", "")
+        if not sample_text:
+            return lines
+        if rtype == "json":
+            lines.append("preview:")
+            lines.append(sample_text[:600])
+        elif rtype == "bson":
+            lines.append("sample:")
+            lines.append(sample_text[:600])
+        elif rtype not in ("csv", "tsv", "csv.gz", "parquet",
+                          "sqlite", "duckdb", "excel"):
+            # Text / code / markdown / config — they only have sample_text
+            # so Tier 3 is the natural place for the preview.
+            lines.append("preview:")
+            lines.append(sample_text[:600])
+        return lines
+
+    def _schema_fingerprint(self, rec: Dict[str, Any]) -> Optional[List[str]]:
+        """Stable, lower-cased column/key set for inter-block schema
+        deduplication. Returns None when the record has no schema to
+        compare (e.g. a plain-text file)."""
+        rtype = rec.get("type", "text")
+        if rtype in ("csv", "tsv", "csv.gz", "parquet"):
+            return [str(h).strip().lower()
+                    for h in (rec.get("headers", []) or []) if str(h).strip()]
+        if rtype == "json":
+            return [str(k).strip().lower()
+                    for k in (rec.get("keys", []) or []) if str(k).strip()]
+        if rtype == "bson":
+            return [str(k).strip().lower()
+                    for k in (rec.get("keys", []) or []) if str(k).strip()]
+        return None
+
+    def _semantic_only_header(self, rec: Dict[str, Any]) -> Optional[str]:
+        """If this record was added by the embedding-only fallback (no
+        keyword hit), return a banner line the renderer can emit so the
+        model can flag the distinction to the user. Returns None for
+        normal keyword-matched records."""
+        if not rec.get("_semantic_only"):
+            return None
+        cos = rec.get("_cosine_similarity")
+        cos_str = f" (cosine {cos:.2f})" if isinstance(cos, (int, float)) else ""
+        return ("note: nearest semantic match — no exact keyword hit"
+                + cos_str + ". The query terms don't appear in this "
+                "file's index; relevance is from meaning similarity only.")
+
+    def summary_block(self, rec: Dict[str, Any], max_chars: int = 1500) -> str:
+        """Legacy — emit a single block containing Tier 1 + Tier 2 + Tier 3.
+
+        Kept so existing call sites that don't yet use the budget-aware
+        assembly still work. The new code path is
+        ``assemble_match_blocks(records, budget_tokens, count_tokens)``
+        which packs blocks tier-by-tier within a shared budget.
+        """
+        # Use a dedicated header for semantic-only matches so the
+        # downstream model and the user can see at a glance which
+        # results came from keyword vs. semantic similarity.
+        sem_note = self._semantic_only_header(rec)
+        header_label = (f"[VAULT MATCH — nearest semantic match: "
+                        f"{rec.get('name', '?')}]"
+                        if sem_note else
+                        f"[VAULT MATCH: {rec.get('name', '?')}]")
+        lines = [header_label]
+        if sem_note:
+            lines.append(sem_note)
+        lines.extend(self._summary_tier1_lines(rec))
+        lines.extend(self._summary_tier2_lines(rec))
+        lines.extend(self._summary_tier3_lines(rec))
         lines.append("[END MATCH]")
         block = "\n".join(lines)
         if len(block) > max_chars:
             block = block[:max_chars] + "\n... (truncated)"
         return block
+
+    def assemble_match_blocks(
+        self,
+        records: List[Dict[str, Any]],
+        budget_tokens: int,
+        count_tokens: Optional[Callable[[str], int]] = None,
+    ) -> Tuple[List[str], Dict[str, Any]]:
+        """Budget-aware packing of [VAULT MATCH] blocks across many records.
+
+        Algorithm:
+          1. Pack Tier 1 for every record (filename + schema + counts).
+             If even Tier 1 alone doesn't fit for all records, drop
+             trailing records (they're least-relevant since `records`
+             is relevance-sorted by caller) until what's left does fit.
+             A WARNING is logged when this happens.
+          2. While budget remains, top up records in relevance order
+             with Tier 2 (topics + samples + description).
+          3. While budget *still* remains, top up the top-ranked
+             records with Tier 3 (extended preview).
+          4. Run schema dedup: when a later block's column set
+             overlaps ≥80 % with an earlier block in this assembly,
+             replace its columns/keys line with a reference back
+             ("schema: same as orders.csv except adds refund_reason").
+             Skipped silently when there's no overlap to dedup
+             (different file types, no schema in the record, …).
+
+        `count_tokens(s)` is the tokenizer-aware sizer. When omitted
+        we fall back to a chars/4 estimate — fine for warning checks
+        but the caller should pass the engine's real tokenizer.
+
+        Returns (assembled_blocks, diag) where ``diag`` carries which
+        tiers were packed for each block and the per-block budget so
+        the caller can log it.
+        """
+        if count_tokens is None:
+            def count_tokens(s: str) -> int:
+                return max(1, (len(s) + 3) // 4)
+
+        # Build per-record assets up-front.
+        assets: List[Dict[str, Any]] = []
+        for rec in records:
+            name = rec.get("name", "?")
+            sem_note = self._semantic_only_header(rec)
+            # Semantic-only matches use a dedicated header label and
+            # prepend an explanatory line so the model can convey the
+            # "no keyword hit" caveat to the user.
+            if sem_note:
+                header = f"[VAULT MATCH — nearest semantic match: {name}]"
+            else:
+                header = f"[VAULT MATCH: {name}]"
+            footer = "[END MATCH]"
+            t1 = self._summary_tier1_lines(rec)
+            if sem_note:
+                t1 = [sem_note] + t1
+            t2 = self._summary_tier2_lines(rec)
+            t3 = self._summary_tier3_lines(rec)
+            assets.append({
+                "name":   name,
+                "rec":    rec,
+                "header": header,
+                "footer": footer,
+                "t1":     t1,
+                "t2":     t2,
+                "t3":     t3,
+                # active tier flags — start with T1 always-on
+                "use_t1": True,
+                "use_t2": False,
+                "use_t3": False,
+            })
+
+        def _render(a: Dict[str, Any]) -> str:
+            lines = [a["header"]]
+            if a["use_t1"]:
+                lines.extend(a["t1"])
+            if a["use_t2"]:
+                lines.extend(a["t2"])
+            if a["use_t3"]:
+                lines.extend(a["t3"])
+            lines.append(a["footer"])
+            return "\n".join(lines)
+
+        # Step 1: Tier-1-only for everyone, drop tail if even that
+        # overflows. Walk forward; the running cost stops growing as
+        # soon as we're at budget.
+        kept: List[Dict[str, Any]] = []
+        running = 0
+        overflow_dropped: List[str] = []
+        for a in assets:
+            cost = count_tokens(_render(a))
+            if running + cost > budget_tokens and kept:
+                # We've already placed at least one; drop the rest.
+                overflow_dropped.append(a["name"])
+                continue
+            if running + cost > budget_tokens and not kept:
+                # Even ONE record's Tier 1 doesn't fit. Place it
+                # anyway (the caller's cumulative-budget eviction
+                # will catch the overflow upstream) and log it.
+                _LOG.warning(
+                    "[assemble_match_blocks] Tier 1 alone (%s tokens) "
+                    "exceeds budget %s for first record %s — packing it "
+                    "anyway; the assembly-level evictor will trim if "
+                    "needed.", cost, budget_tokens, a["name"])
+            kept.append(a)
+            running += cost
+
+        # Step 2: upgrade to Tier 2 from the top of the relevance list
+        # until budget exhausts. Re-render to get exact deltas.
+        for a in kept:
+            if not a["t2"]:
+                continue
+            before = count_tokens(_render(a))
+            a["use_t2"] = True
+            after = count_tokens(_render(a))
+            delta = after - before
+            if running + delta > budget_tokens:
+                a["use_t2"] = False
+                # Don't break — a later block may have a smaller t2
+                # delta that still fits. Continue scanning.
+                continue
+            running += delta
+
+        # Step 3: upgrade to Tier 3 from the top until budget exhausts.
+        for a in kept:
+            if not a["t3"]:
+                continue
+            before = count_tokens(_render(a))
+            a["use_t3"] = True
+            after = count_tokens(_render(a))
+            delta = after - before
+            if running + delta > budget_tokens:
+                a["use_t3"] = False
+                continue
+            running += delta
+
+        # Step 4: schema dedup across the assembled set. Walk in order;
+        # for each block with a fingerprint, check earlier blocks. If
+        # column overlap >= 80 % with some earlier block, replace this
+        # block's columns/keys line with a "same as X except {adds Y, removes Z}"
+        # reference.
+        SIM_THRESHOLD = 0.80
+        fp_cache: List[Tuple[str, Optional[List[str]]]] = []
+        for a in kept:
+            fp = self._schema_fingerprint(a["rec"])
+            fp_cache.append((a["name"], fp))
+
+        for i, a in enumerate(kept):
+            name_i, fp_i = fp_cache[i]
+            if not fp_i:
+                continue
+            set_i = set(fp_i)
+            best_j = -1
+            best_score = 0.0
+            for j in range(i):
+                _name_j, fp_j = fp_cache[j]
+                if not fp_j:
+                    continue
+                set_j = set(fp_j)
+                if not (set_i and set_j):
+                    continue
+                # Jaccard similarity
+                inter = len(set_i & set_j)
+                union = len(set_i | set_j)
+                if union == 0:
+                    continue
+                score = inter / union
+                if score > best_score:
+                    best_score = score
+                    best_j = j
+            if best_j < 0 or best_score < SIM_THRESHOLD:
+                continue
+            # Rewrite a's columns/keys line in t1 with a reference.
+            ref_name = fp_cache[best_j][0]
+            ref_set  = set(fp_cache[best_j][1] or [])
+            adds = sorted(set_i - ref_set)
+            removes = sorted(ref_set - set_i)
+            note_bits = []
+            if adds:
+                note_bits.append("adds " + ", ".join(adds[:8])
+                                  + (f" (+{len(adds)-8})" if len(adds) > 8 else ""))
+            if removes:
+                note_bits.append("removes " + ", ".join(removes[:8])
+                                  + (f" (+{len(removes)-8})" if len(removes) > 8 else ""))
+            note = f"schema: same as {ref_name}"
+            if note_bits:
+                note += " except " + "; ".join(note_bits)
+            # Replace the existing columns/keys line in tier-1 lines.
+            new_t1 = []
+            replaced = False
+            for ln in a["t1"]:
+                lower = ln.lower()
+                if (lower.startswith("columns:") or lower.startswith("keys:")
+                        or lower.startswith("fields:")) and not replaced:
+                    new_t1.append(note)
+                    replaced = True
+                else:
+                    new_t1.append(ln)
+            if not replaced:
+                new_t1.append(note)
+            a["t1"] = new_t1
+
+        # Final render
+        out_blocks = [_render(a) for a in kept]
+        diag = {
+            "budget_tokens":     budget_tokens,
+            "n_records":         len(records),
+            "n_kept":            len(kept),
+            "n_dropped":         len(overflow_dropped),
+            "dropped_names":     overflow_dropped,
+            "tier_breakdown": [
+                {"name": a["name"],
+                 "tiers": "".join(["1" if a["use_t1"] else "",
+                                    "2" if a["use_t2"] else "",
+                                    "3" if a["use_t3"] else ""])}
+                for a in kept
+            ],
+            "running_tokens":    running,
+        }
+        return out_blocks, diag

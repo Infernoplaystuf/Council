@@ -21,22 +21,26 @@ requests>=2.31
 
 # ---- Data ingestion / display ----
 #
-# numpy / pandas pinned BELOW 2.3 because dream3dnx (BlueQuartz
-# Software's SIMPLNX bindings, installed via conda) was built
-# against numpy < 2.x and pandas < 2.3 ABIs. Without these caps,
-# pip can pull numpy 2.3+ and silently break `import simplnx`
-# with "numpy.dtype size changed" / "_ARRAY_API not found".
-numpy>=1.24,<2.3
-pandas>=2.0,<2.3
+# numpy / pandas pinned BELOW 2.3 ONLY when dream3dnx is also in
+# the env (Section E in installs.txt — Linux). Sections A/B/C/D
+# (Windows) deliberately exclude dream3dnx, so this file allows
+# whatever numpy/pandas the resolver picks for those installs.
+# The pip-only path that bundles into the .exe also uses these
+# without the upper caps because it never has dream3dnx loaded.
+numpy>=1.24
+pandas>=2.0
 openpyxl>=3.1            # XLSX support
 xlrd>=2.0                # legacy XLS support
 pyarrow>=15.0            # fast parquet/feather (optional but recommended)
 
-# h5py is installed via conda-forge in installs.txt (NOT here).
-# Reason: dream3dnx ships its own HDF5 .dll/.so and pip's h5py
-# wheel ships a DIFFERENT HDF5 — running both ends with the
-# "HDF5 library version mismatched" crash on `import simplnx`.
-# Don't add h5py to this file even if you think you need it.
+# h5py — read .dream3d HDF5 files for keyword indexing. Safe to
+# install from PyPI on Windows (sections A/B/C/D) because
+# dream3dnx is NOT in those envs — without dream3dnx there's no
+# HDF5 .dll conflict to worry about. Section E (Linux + dream3dnx)
+# deliberately installs h5py via conda-forge BEFORE pip runs;
+# pip's --upgrade-strategy only-if-needed preserves the conda
+# h5py instead of overwriting it with the PyPI version.
+h5py>=3.10
 # h5py>=3.10               # see comment above — conda-only
 
 # ---- Plotting (Grapher tab) ----
@@ -58,10 +62,30 @@ tkinterweb>=3.24         # Plotly HTML viewer inside Tk
 # llama-cpp-python>=0.2.79
 
 # ---- RAG (vault search) — optional but installed by default ----
+# chromadb is used by vault_rag.py for full-document RAG. The
+# per-record vault embedding index (vault_embeddings.py) uses a plain
+# JSON cache + numpy cosine instead — see that file's docstring for
+# the rationale (smaller bundle, faster startup, simpler air-gap path).
 chromadb>=0.4
 sentence-transformers>=2.2    # also used by vault_embeddings.py for the
                               # vector retrieval layer (default model:
                               # all-MiniLM-L6-v2, ~80 MB)
+
+# ---- Context-window optimization env vars (documented here for
+#      visibility — none of these are pip dependencies) ----
+# COUNCIL_GGUF_N_CTX             — explicit n_ctx override (e.g. 32768)
+# COUNCIL_GGUF_N_CTX_MAX         — absolute upper bound (default 32768)
+# COUNCIL_GGUF_KV_VRAM_MARGIN_MB — VRAM headroom for KV cache (default 1024)
+# COUNCIL_GGUF_N_CTX_DEBUG=1     — print full n_ctx ladder trace on load
+# COUNCIL_FORCE_FULL_VAULT_BLOCKS=1 — disable search-headers mode (force
+#                                    full [VAULT MATCH] blocks always)
+# COUNCIL_TIMING_DEBUG=1         — elevate timing logs from DEBUG to INFO
+# COUNCIL_DF_CACHE_MB            — DataFrame cache budget (default 256 MB)
+# COUNCIL_EMBED_MODEL            — sentence-transformer model name
+# COUNCIL_EMBED_DEVICE           — 'cuda' / 'cpu' for embedding model
+# COUNCIL_GGUF_PATH              — path to a .gguf model file (required)
+# COUNCIL_GGUF_GPU_LAYERS        — default 99 (offload all); 0 = CPU
+# COUNCIL_GGUF_N_THREADS         — CPU threads (default = physical cores)
 huggingface_hub>=0.20    # for huggingface-cli download of GGUF models
 
 # ---- File parsing for vault analyst / RAG over docs ----

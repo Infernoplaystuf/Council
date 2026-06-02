@@ -21,6 +21,35 @@ Cache: vault/vault_embeddings.json sits next to vault_index.json.
 Same lazy regenerate pattern as the LLM-descriptions layer — only
 records whose mtime changed get re-embedded.
 
+Why JSON and not ChromaDB
+-------------------------
+ChromaDB is also in the project (used by vault_rag.py for full-document
+RAG over text/markdown/PDF files — that's a separate persistence
+concern from per-record vault embeddings).  The choice for THIS module
+was reconsidered as part of the context-window work order:
+
+  * For ~1000s of vault records at 384 dims that's ~12-30 MB JSON.
+    Lazy-loaded at first read; cosine via numpy over the full set is
+    sub-millisecond for that size. ChromaDB would add startup
+    initialization (open the on-disk index, create the collection,
+    handle migrations) without a real performance win at this scale.
+
+  * Migrating would couple the keyword/embedding blend in
+    vault_index.search() to chroma's query API — currently the blend
+    just consults this index in-memory which is simpler, faster, and
+    has zero external dependencies on the read path.
+
+  * Air-gapped users: chroma works air-gapped but has more moving
+    parts (sqlite-vss, optional ANN backends) than a plain JSON+numpy
+    blob. Fewer moving parts = fewer "doesn't start cleanly on weird
+    systems" reports.
+
+Decision: keep JSON here, keep ChromaDB for vault_rag.py. If we hit
+10K+ records and the in-memory cosine becomes a bottleneck, swap to
+a `.npy` binary cache first; ChromaDB would only earn its keep when
+we need persistent metadata filtering, multi-collection routing, or
+remote queries — none of which apply to this module's job.
+
 Model: 'all-MiniLM-L6-v2' by default (22M params, 384 dims, CPU/GPU
 fine). Override with COUNCIL_EMBED_MODEL env var if you have a heavier
 local model cached (BGE-base, e5-base, etc).
@@ -124,11 +153,21 @@ class EmbeddingIndex:
         self._vectors: Dict[str, List[float]] = {}   # {file_path: vector}
         self._mtimes:  Dict[str, float]       = {}   # {file_path: rec.mtime}
         self._dim: Optional[int] = None
-        self.load()
+        # Lazy load — parsing the JSON cache can be 500ms-1s on big
+        # vaults. We defer until either search() / similar_to() is
+        # called or build_embeddings starts. The previous eager load
+        # at __init__ delayed app startup for users who never opened
+        # the embeddings-aware tabs at all.
+        self._loaded = False
 
     # ---- persistence ----
 
-    def load(self) -> None:
+    def _ensure_loaded(self) -> None:
+        """Lazy guard — any method that reads ``_vectors`` calls this first.
+        Idempotent; subsequent calls are a no-op O(1) flag check."""
+        if self._loaded:
+            return
+        self._loaded = True
         if not self.cache_path.exists():
             return
         try:
@@ -140,6 +179,11 @@ class EmbeddingIndex:
         except Exception:
             self._vectors = {}
             self._mtimes  = {}
+
+    def load(self) -> None:
+        """Backwards-compatible alias — original callers used to call
+        this from __init__. Now it just forces the lazy load early."""
+        self._ensure_loaded()
 
     def save(self) -> None:
         try:
@@ -209,6 +253,11 @@ class EmbeddingIndex:
         if not _NUMPY_OK:
             raise RuntimeError("numpy required for the embedding index")
 
+        # Lazy-load — the JSON cache may not have been parsed yet if no
+        # one searched before now (e.g. user clicked "Build embeddings"
+        # without ever opening the search tab).
+        self._ensure_loaded()
+
         # Decide which records need new vectors
         todo: List[Tuple[str, Dict[str, Any]]] = []
         for path, rec in records.items():
@@ -266,6 +315,9 @@ class EmbeddingIndex:
         `candidates` restricts the search to a subset of paths (used
         for folder-scoped queries).
         """
+        # Lazy-load on first search — saves 500ms-1s at app startup
+        # for users who don't open the search tab right away.
+        self._ensure_loaded()
         if not _NUMPY_OK or not self._vectors:
             return []
         q = (query or "").strip()
@@ -309,9 +361,11 @@ class EmbeddingIndex:
     # ---- inspection ----
 
     def __len__(self) -> int:
+        self._ensure_loaded()
         return len(self._vectors)
 
     def stats(self) -> Dict[str, Any]:
+        self._ensure_loaded()
         return {
             "model":    self.model_name,
             "dim":      self._dim,

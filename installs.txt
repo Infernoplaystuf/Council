@@ -12,23 +12,50 @@
 # ============================================================
 
 
+# NOTE on dream3dnx / SIMPLNX:
+#   Only SECTION E (Linux + dream3dnx) installs dream3dnx. Sections
+#   A / B / C / D (Windows-native) and SECTION F (WSL without
+#   dream3dnx) all skip it because:
+#     - dream3dnx is conda-only with no PyPI wheel
+#     - it forces Python 3.12 and a numpy<2.x ABI pin
+#     - the Dream3D pipeline-execution features silently degrade
+#       cleanly without it (the JSON pipeline parser, vault index,
+#       and pipeline scanner all still work — only simplnx-driven
+#       execution is unavailable)
+#   If you need full Dream3D pipeline EXECUTION on Windows, run
+#   Section E inside WSL2 (it includes dream3dnx). If you want the
+#   GPU-accelerated Council experience inside WSL WITHOUT dream3dnx
+#   (same as Windows Sections B/C/D, just running on Linux),
+#   use SECTION F.
+
+
+# QUICK PICK GUIDE — which section am I?
+#   No NVIDIA GPU                                    → SECTION A
+#   Windows + RTX 20/30 / GTX 16xx / Ax000           → SECTION B (cu121)
+#   Windows + RTX 40-series / Ada                    → SECTION C (cu124)
+#   Windows + RTX 50-series Blackwell                → SECTION D (cu128)
+#   Linux native + want dream3dnx pipeline exec      → SECTION E
+#   WSL2 + want GPU-accelerated Council (no dream3d) → SECTION F
+#   WSL2 + want dream3dnx pipeline exec              → SECTION E
+#                                                       (run inside WSL)
+
+
 # ============================================================
-#  SECTION A — CPU only (no NVIDIA GPU)
+#  SECTION A — Windows CPU only (no NVIDIA GPU)
 #  Llama-cpp inference falls back to CPU; works but expect several
 #  seconds per response on a 7B/8B model. Use a 3B GGUF for speed.
 # ============================================================
 conda config --add channels conda-forge && conda config --set channel_priority strict
-conda create -n council python=3.12 -y && conda activate council
-conda install -c bluequartzsoftware dream3dnx -y && conda install -c conda-forge h5py "numpy<2.3" -y
+conda create -n council python=3.11 -y && conda activate council
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 pip install llama-cpp-python
-pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper html2text huggingface_hub kaleido matplotlib mido music21 openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb "pandas<2.3"
-pip install spyder-kernels && crawl4ai-setup
-python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print('all imports OK')"
+pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper h5py html2text huggingface_hub kaleido matplotlib openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb
+pip install crawl4ai && crawl4ai-setup
+python -c "import torch, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print('all imports OK')"
 
 
 # ============================================================
-#  SECTION B — NVIDIA Ampere / Turing / Older  (PyTorch cu121)
+#  SECTION B — Windows NVIDIA Ampere / Turing / Older  (PyTorch cu121)
 #  Cards in this group (desktop AND laptop variants share the same
 #  architecture/sm_XX so the same wheel covers both):
 #    RTX 30-series desktop:   3050, 3060, 3060 Ti, 3070, 3070 Ti, 3080, 3080 Ti, 3090, 3090 Ti
@@ -42,17 +69,16 @@ python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pa
 #                              Quadro RTX 3000/4000/5000 Mobile
 # ============================================================
 conda config --add channels conda-forge && conda config --set channel_priority strict
-conda create -n council python=3.12 -y && conda activate council
-conda install -c bluequartzsoftware dream3dnx -y && conda install -c conda-forge h5py "numpy<2.3" -y
+conda create -n council python=3.11 -y && conda activate council
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121 --force-reinstall --no-cache-dir
-pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper html2text huggingface_hub kaleido matplotlib mido music21 openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb "pandas<2.3"
-pip install spyder-kernels && crawl4ai-setup
-python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print('all imports OK')"
+pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper h5py html2text huggingface_hub kaleido matplotlib openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb
+pip install crawl4ai && crawl4ai-setup
+python -c "import torch, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print('all imports OK')"
 
 
 # ============================================================
-#  SECTION C — NVIDIA Ada / Hopper  (PyTorch cu124)
+#  SECTION C — Windows NVIDIA Ada / Hopper  (PyTorch cu124)
 #  Cards in this group (Ada sm_89 / Hopper sm_90):
 #    RTX 40-series desktop:   4060, 4060 Ti, 4070, 4070 Super, 4070 Ti, 4070 Ti Super,
 #                              4080, 4080 Super, 4090
@@ -64,17 +90,16 @@ python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pa
 #                              RTX 2000 Ada Laptop GPU, RTX 1000 Ada Laptop GPU
 # ============================================================
 conda config --add channels conda-forge && conda config --set channel_priority strict
-conda create -n council python=3.12 -y && conda activate council
-conda install -c bluequartzsoftware dream3dnx -y && conda install -c conda-forge h5py "numpy<2.3" -y
+conda create -n council python=3.11 -y && conda activate council
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 --force-reinstall --no-cache-dir
-pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper html2text huggingface_hub kaleido matplotlib mido music21 openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb "pandas<2.3"
-pip install spyder-kernels && crawl4ai-setup
-python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print('all imports OK')"
+pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper h5py html2text huggingface_hub kaleido matplotlib openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb
+pip install crawl4ai && crawl4ai-setup
+python -c "import torch, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print('all imports OK')"
 
 
 # ============================================================
-#  SECTION D — NVIDIA Blackwell / RTX 50-series  (PyTorch nightly cu128)
+#  SECTION D — Windows NVIDIA Blackwell / RTX 50-series  (PyTorch nightly cu128)
 #  Cards in this group (Blackwell sm_120):
 #    RTX 50-series desktop:   5070, 5070 Ti, 5080, 5090
 #    RTX 50-series laptop:    5070 Laptop GPU, 5080 Laptop GPU, 5090 Laptop GPU
@@ -90,38 +115,46 @@ python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pa
 #  swap the torch line for the nightly URL; everything else stays.
 # ============================================================
 conda config --add channels conda-forge && conda config --set channel_priority strict
-conda create -n council python=3.12 -y && conda activate council
-conda install -c bluequartzsoftware dream3dnx -y && conda install -c conda-forge h5py "numpy<2.3" -y
+conda create -n council python=3.11 -y && conda activate council
 pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 --force-reinstall --no-cache-dir
-pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper html2text huggingface_hub kaleido matplotlib mido music21 openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb "pandas<2.3"
-pip install spyder-kernels && crawl4ai-setup
-python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'); print('all imports OK')"
+pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper h5py html2text huggingface_hub kaleido matplotlib openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb
+pip install crawl4ai && crawl4ai-setup
+python -c "import torch, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'); print('all imports OK')"
 
 
 # ============================================================
-#  SECTION E — Linux with NVIDIA GPU  (Ubuntu / Debian / Fedora / WSL2)
-#  Sections B / C / D above describe the same Python + pip + conda
-#  install that works on Windows AND Linux — the conda env creation
-#  and the pip install lines are platform-agnostic. What CHANGES
-#  on Linux is how you install the NVIDIA driver. This section
-#  walks through the Linux-specific driver install and then sends
-#  you to whichever of B / C / D matches your GPU architecture.
+#  SECTION E — Linux with NVIDIA GPU + dream3dnx (full SIMPLNX support)
+#  This is the ONLY section that includes dream3dnx. Run it on
+#  native Linux (Ubuntu / Debian / Fedora / Arch) or WSL2 when you
+#  want full Dream3D pipeline execution alongside GPU-accelerated
+#  inference and the rest of the Council app.
 #
-#  Why Linux is easier than Windows for GPU work:
-#  - No hybrid-graphics MUX nonsense; the dGPU is just there.
-#  - No "TF GPU is stuck on Python 3.10" lock — TensorFlow's
-#    Linux GPU builds track current Python.
-#  - llama-cpp-python's CUDA wheels are smaller (no MSVC redist).
-#  - nvidia-smi works without extra setup.
-#  - WSL2 inherits the host Windows driver — you don't reinstall
-#    anything Linux-side; just enable it in WSL.
+#  Cards: any NVIDIA card supported by recent drivers (Turing through
+#         Blackwell). The conda + pip lines below default to cu124
+#         which covers RTX 40-series + most modern hardware. If you
+#         have an older card needing cu121 or a Blackwell card
+#         needing cu128 nightly, swap those two URLs accordingly
+#         (the GPU-architecture-to-CUDA mapping in Sections B/C/D
+#         applies identically on Linux).
 #
-#  Supported distros (anything with apt or dnf and a recent kernel):
+#  Why Linux is the only platform that gets dream3dnx:
+#  - dream3dnx requires Python 3.12 + numpy<2.3 ABI; on Windows that
+#    conflicts with the wheels for several other deps the bundle
+#    needs. On Linux the conda-forge channel resolves cleanly.
+#  - The HDF5 / numpy ABI dance is what made Windows + dream3dnx
+#    fragile. Linux distros + conda-forge handle it without the
+#    MSVC redist / Visual Studio runtime mismatches Windows hits.
+#  - WSL2 lets a Windows user opt in to this section without
+#    leaving their laptop — boot WSL, follow Section E, and you
+#    get dream3dnx execution in a Linux env with GPU passthrough.
+#
+#  Supported distros:
 #    Ubuntu 22.04 LTS, 24.04 LTS
 #    Debian 12 (Bookworm)
 #    Fedora 39 / 40
-#    Pop!_OS 22.04
+#    Pop!_OS 22.04 / 24.04
+#    Arch (current)
 #    WSL2 with Ubuntu 22.04+ on Windows 10 build 19044+ / 11
 # ============================================================
 #
@@ -148,41 +181,38 @@ python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pa
 #      sudo reboot
 #      nvidia-smi
 #
-#  If nvidia-smi reports a CUDA version that's TOO OLD for the
-#  section you want (e.g. you want cu124 but the driver only
-#  supports CUDA 12.1), upgrade the driver per the cheat sheet in
-#  the "No CUDA drivers?" troubleshooting block below.
-#
 #  ── STEP 2: WSL2 ONLY — enable GPU passthrough ──
 #  On Windows host, make sure WSL2 is up to date:
 #      wsl --update
 #  Inside WSL (Ubuntu shell):
 #      nvidia-smi
-#  If the table prints, GPU passthrough works and you can skip
-#  any Linux driver install — the Windows host driver covers it.
-#  If "nvidia-smi: command not found", install JUST the CUDA
-#  user-space tools (NOT a Linux driver):
-#      sudo apt install nvidia-cuda-toolkit-gcc   # optional, helps tooling
+#  If the table prints, GPU passthrough works.
 #
 #  ── STEP 3: Install conda (if not already) ──
 #  Miniforge is the lightest path (conda + conda-forge by default):
 #      wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
 #      bash Miniforge3-Linux-x86_64.sh
 #      source ~/.bashrc
-#  Or Miniconda is fine too (then `conda config --add channels conda-forge`).
 #
-#  ── STEP 4: Run the matching Windows section, verbatim ──
-#  Find your GPU model in the lists at the top of Section B / C / D
-#  above and run THAT section's `conda create` + `pip install` lines
-#  unchanged. The conda commands and pip URLs are identical between
-#  Windows and Linux. Most users want:
+#  ── STEP 4: Create the env + install everything (dream3dnx included) ──
+#  These commands install Python 3.12 + dream3dnx + the GPU CUDA
+#  wheels + every pip dep the Council app needs. Run them in order.
+#  Total install footprint: ~6-8 GB.
 #
-#      RTX 20/30-series, GTX 16, MX450/550:  Section B (cu121)
-#      RTX 40-series, RTX 6000 Ada:          Section C (cu124)
-#      RTX 50-series Blackwell:              Section D (cu128 nightly)
+#  Adjust the cu124 in the torch + llama-cpp URLs if you have an
+#  older (cu121: RTX 20/30 series) or newer (cu128 nightly: RTX 50
+#  series) GPU — see Sections B/D for the GPU mapping.
+conda config --add channels conda-forge && conda config --set channel_priority strict
+conda create -n council python=3.12 -y && conda activate council
+conda install -c bluequartzsoftware dream3dnx -y && conda install -c conda-forge h5py "numpy<2.3" -y
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 --force-reinstall --no-cache-dir
+pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper html2text huggingface_hub kaleido matplotlib mido music21 openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb "pandas<2.3"
+pip install spyder-kernels && crawl4ai-setup
 #
-#  ── STEP 5: Verify (mirror of Sections B/C/D's last line) ──
+#  ── STEP 5: Verify (includes simplnx for dream3dnx) ──
 #      python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'); print('all imports OK')"
+python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'); print('all imports OK')"
 #
 #  Should print:
 #      CUDA: True
@@ -213,6 +243,209 @@ python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pa
 #      Bash scripts that `conda activate council` need `source
 #      ~/miniconda3/etc/profile.d/conda.sh` first (or set
 #      $CONDA_SHLVL beforehand). Not needed in interactive shells.
+
+
+# ============================================================
+#  SECTION F — WSL2 with NVIDIA GPU (no dream3dnx)
+#  Use this when you want the GPU-accelerated Council experience
+#  from inside WSL — same as Windows Sections B / C / D, just
+#  running on an Ubuntu shell with Windows-side GPU passthrough
+#  via the NVIDIA driver you already installed on the host.
+#
+#  Why use WSL instead of Windows native:
+#    - Smoother dependency resolution (apt + pip on Linux usually
+#      has fewer wheel conflicts than the Windows wheel index).
+#    - Native bash for any pipeline scripting you build around the app.
+#    - llama-cpp builds from source cleanly if a CUDA wheel isn't
+#      available for your specific stack.
+#    - Same GPU as the Windows host — no second machine needed.
+#
+#  Why NOT WSL:
+#    - Tkinter GUI requires WSLg (Windows 11) or an X server bridge
+#      on Windows 10. WSLg works out of the box on Win 11 22H2+.
+#    - No audio passthrough — the speech / mic tabs are read-only
+#      inside WSL.
+#    - File I/O across the /mnt/c boundary is ~10x slower than
+#      keeping the vault inside the WSL filesystem (~/vault/).
+#
+#  If you ALSO need dream3dnx pipeline execution, use SECTION E
+#  instead (same WSL prep, plus the conda dream3dnx step).
+# ============================================================
+#
+#  ── STEP 1: Windows host — install WSL2 + NVIDIA driver ──
+#  WSL2 inherits GPU access from the Windows-side NVIDIA driver;
+#  you do NOT install a Linux NVIDIA driver inside WSL. Just make
+#  sure the Windows driver is recent.
+#
+#  In an admin PowerShell:
+#      wsl --install -d Ubuntu-22.04          # if WSL isn't set up yet
+#      wsl --update                             # refresh WSL kernel
+#  Then reboot, sign in to the Ubuntu user, and continue inside WSL.
+#
+#  Verify the Windows-side driver inside WSL:
+#      nvidia-smi
+#  Should print the GPU table. If "command not found" — update the
+#  Windows NVIDIA driver from https://www.nvidia.com/Download then
+#  run `wsl --shutdown` from Windows and reopen the Ubuntu shell.
+#
+#  ── STEP 2: WSL2 — install build tools + audio libs ──
+#  WSL Ubuntu ships minimal; a few system packages keep pip wheels
+#  from falling back to source builds.
+#      sudo apt update
+#      sudo apt install -y build-essential git curl wget \
+#                          libportaudio2 libportaudiocpp0 portaudio19-dev
+#
+#  ── STEP 3: Install Miniforge (conda + conda-forge by default) ──
+#      wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
+#      bash Miniforge3-Linux-x86_64.sh -b -p ~/miniforge3
+#      source ~/miniforge3/etc/profile.d/conda.sh
+#      conda init bash
+#      # Open a new shell or `exec bash` so `conda activate` is wired up.
+#
+#  ── STEP 4: Create the env + install Council ──
+#  These commands mirror Sections B / C / D but on Linux Python 3.11
+#  (matches the Windows GPU sections — no dream3dnx, so no forced
+#  3.12 / numpy<2.3 ABI pin). Pick ONE of the three torch+llama-cpp
+#  URL pairs below based on your GPU (the architecture-to-CUDA
+#  mapping is identical to Sections B / C / D — same GPUs, same wheels).
+#
+#  Pick which cu* URLs to use by GPU:
+#      cu121 — RTX 20/30-series, GTX 16xx, MX450/550, A40/A100,
+#              workstation A1000-A6000
+#      cu124 — RTX 40-series, Ada workstation (RTX 6000 Ada,
+#              L4/L40/L40S, H100/H200), RTX 5000/4000/3500/3000/
+#              2000/1000 Ada Laptop
+#      cu128 — RTX 50-series Blackwell (5070/5080/5090, B100/B200,
+#              RTX PRO 6000 Blackwell) — nightly until stable lands
+#
+#  Common steps (run all):
+conda config --add channels conda-forge && conda config --set channel_priority strict
+conda create -n council python=3.11 -y && conda activate council
+#
+#  Then run ONE of the three GPU lines below:
+#
+#  RTX 20/30/A-series (cu121):
+#      pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+#      pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121 --force-reinstall --no-cache-dir
+#
+#  RTX 40-series / Ada (cu124):
+#      pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+#      pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 --force-reinstall --no-cache-dir
+#
+#  RTX 50-series Blackwell (cu128 nightly):
+#      pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
+#      pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 --force-reinstall --no-cache-dir
+#
+#  Common remainder (run after picking ONE of the three pairs above):
+pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper h5py html2text huggingface_hub kaleido matplotlib openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb
+pip install crawl4ai && crawl4ai-setup
+#
+#  ── STEP 5: Verify ──
+python -c "import torch, llama_cpp, chromadb, sentence_transformers, pandas, openpyxl, duckdb, h5py; print('CUDA:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'); print('all imports OK')"
+#
+#  Should print:
+#      CUDA: True
+#      NVIDIA GeForce RTX <your-card>
+#      all imports OK
+#
+#  ── STEP 6: Run the app inside WSL ──
+#  Windows 11 (WSLg — GUI works out of the box):
+#      cd ~/Council-Demo                      # or wherever you cloned
+#      python council_gui_engine.py
+#  The Tkinter window opens through WSLg automatically.
+#
+#  Windows 10 (no WSLg — needs an X server):
+#      1. Install VcXsrv or X410 on Windows; start it with
+#         "Disable access control" checked.
+#      2. In WSL bash:
+#             export DISPLAY=$(grep -m1 nameserver /etc/resolv.conf \
+#                              | awk '{print $2}'):0
+#             python council_gui_engine.py
+#      Add the `export DISPLAY=...` line to ~/.bashrc to make it
+#      persistent across shells.
+#
+#  ── STEP 7: Where to put the vault ──
+#  Keep `vault/` INSIDE the WSL filesystem (~/Council-Demo/vault/)
+#  rather than under /mnt/c/Users/.../vault. WSL's 9p file-server
+#  bridge is ~10x slower for many-small-file workloads than the
+#  native ext4. The vault index walks 1000s of files; this matters.
+#
+#  If you already have a vault on the Windows side and don't want
+#  to copy it, you can symlink:
+#      ln -s /mnt/c/Users/<you>/Council-Demo/vault ~/vault
+#  but the first vault index build will be noticeably slower.
+#
+#  ── WSL-specific gotchas ──
+#  - `nvidia-smi` works but `torch.cuda.is_available()` is False
+#    → Your Windows NVIDIA driver is too old (need 535+ for cu124,
+#      555+ for cu128). Update the driver on the Windows host
+#      (NOT inside WSL), then `wsl --shutdown` from a Windows
+#      PowerShell and reopen the Ubuntu shell.
+#
+#  - Tkinter window doesn't appear on Windows 11
+#    → WSLg disabled. Confirm with: `wsl --version` — needs WSL 2
+#      version 1.0+. Run `wsl --update` from Windows PowerShell.
+#
+#  - "OSError: libcuda.so: cannot open shared object file"
+#    → The WSL distro is too old (pre-22.04 doesn't expose libcuda
+#      via the GPU driver passthrough cleanly). Install Ubuntu-22.04
+#      or 24.04 with `wsl --install -d Ubuntu-24.04`.
+#
+#  - `paramiko` / `cryptography` build fails with "linker not found"
+#    → STEP 2 missing. Run `sudo apt install -y build-essential`.
+#
+#  - PyInstaller bundle (`council.spec`) — DON'T build inside WSL
+#    if your target is Windows. PyInstaller produces ELF binaries
+#    in WSL. Build the .exe in Windows native (Section B/C/D) and
+#    use WSL only for dev runs / large-dataset testing.
+#
+#  - "Illegal instruction (core dumped)" on model load
+#    The most common WSL crash. The prebuilt CUDA wheels for
+#    llama-cpp-python (from abetlen's index) assume the host CPU
+#    supports AVX2 + F16C. WSL inherits the Windows CPU feature
+#    set, but a few configurations end up without one of those
+#    flags exposed to the Linux side:
+#       - Older CPUs that lack AVX2 entirely (pre-Haswell Intel,
+#         pre-Excavator AMD).
+#       - VMs nested inside Hyper-V where the hypervisor masks
+#         feature flags from the guest.
+#       - Some corporate-managed Windows installs that disable
+#         hardware virt features via group policy.
+#
+#    Diagnose: in the WSL shell, run
+#        grep -o 'avx2\|f16c' /proc/cpuinfo | sort -u
+#    If both `avx2` and `f16c` print, the wheel SHOULD work — and
+#    the crash is something else (read on). If either is missing,
+#    that's the cause.
+#
+#    The app's GGUF loader now prints a CPU feature line at
+#    startup, like:
+#        [CPU] features include avx=True avx2=True f16c=True ...
+#    If avx2=False appears, the next line will be a SIGILL warning.
+#
+#    Fix path 1 — rebuild llama-cpp from source WITHOUT AVX2:
+#        pip uninstall -y llama-cpp-python
+#        CMAKE_ARGS="-DGGML_AVX2=OFF -DGGML_F16C=OFF -DGGML_CUDA=ON" \
+#            pip install llama-cpp-python --no-binary llama-cpp-python
+#    The compile takes 5-15 min on the GPU sections. This produces
+#    a wheel matched to your exact CPU + GPU.
+#
+#    Fix path 2 — if it crashed but `avx2` IS present, it's almost
+#    certainly the CUDA wheel-vs-driver mismatch instead. The
+#    Llama() constructor SIGILL'd inside a CUDA op. Verify with:
+#        nvidia-smi                         # confirms host driver
+#        python -c "import torch; print(torch.cuda.is_available(), \
+#                                       torch.version.cuda)"
+#    If torch.version.cuda is 12.4 but the driver shows CUDA 12.1,
+#    downgrade torch to cu121 (Section B) — `cu124` needs driver
+#    545+. Same logic for cu128 → driver 570+.
+#
+#    Fix path 3 — bypass GPU entirely as a fast sanity check:
+#        export COUNCIL_GGUF_GPU_LAYERS=0
+#        python council_gui_engine.py
+#    If the app starts cleanly on CPU, the crash was definitely
+#    in the GPU path (driver mismatch or CUDA op SIGILL). If it
+#    STILL crashes on CPU, you're in fix path 1.
 
 
 # ─────────────────────────────────────────────────────────────

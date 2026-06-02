@@ -136,9 +136,26 @@ def _ensure_localhost(url: str, *, allow_remote: bool = False) -> None:
 #   COUNCIL_BACKEND=gguf
 #   COUNCIL_GGUF_PATH=C:\path\to\model.gguf
 # Optional:
-#   COUNCIL_GGUF_N_CTX=4096            context window
+#   COUNCIL_GGUF_N_CTX=4096            context window — explicit override.
+#                                        When unset, picked by the n_ctx
+#                                        ladder (VRAM-aware → GGUF metadata
+#                                        → 4096 fallback).
+#   COUNCIL_GGUF_N_CTX_MAX=32768       absolute upper bound for auto-sizing
+#                                        so a model advertising 131K doesn't
+#                                        try to allocate 16 GB of KV cache.
+#   COUNCIL_GGUF_KV_VRAM_MARGIN_MB=1024  safety margin reserved on the GPU
+#                                        beyond model weights — VRAM-aware
+#                                        rung leaves this free for other
+#                                        GPU work (CUDA driver, browser, …).
+#   COUNCIL_GGUF_N_CTX_DEBUG=1         print the full n_ctx ladder trace
+#                                        on model load (every rung tried,
+#                                        every input value, every reason
+#                                        for skipping). Stdout, not just
+#                                        logging — for capture-and-send.
 #   COUNCIL_GGUF_N_THREADS=8           CPU threads (defaults to os.cpu_count())
-#   COUNCIL_GGUF_GPU_LAYERS=0          0 = CPU only; 99 = all layers on GPU
+#   COUNCIL_GGUF_GPU_LAYERS=99         default 99 = offload every layer
+#                                        (no-op on CPU-only builds, so safe);
+#                                        set 0 to force CPU even on a GPU box
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _council_backend() -> str:
@@ -148,6 +165,390 @@ def _council_backend() -> str:
 
 
 _GGUF_MODEL_INSTANCE = None
+
+# Populated by _get_gguf_model after the n_ctx ladder runs. Surfaced to
+# the Tkinter UI via n_ctx_status() so the user always knows what
+# window they're working with.
+_LAST_N_CTX: Optional[int] = None
+_LAST_N_CTX_SOURCE: str = ""
+_LAST_N_CTX_LADDER: list = []
+
+
+class _TimingScope:
+    """Context manager form of _timed for inline blocks.
+
+    Usage:
+        with _TimingScope("vault.rebuild"):
+            idx.rebuild()
+    """
+    __slots__ = ("label", "_t0")
+
+    def __init__(self, label: str):
+        self.label = label
+
+    def __enter__(self):
+        import time as _t
+        self._t0 = _t.monotonic()
+        return self
+
+    def __exit__(self, *_exc):
+        import time as _t
+        dt = _t.monotonic() - self._t0
+        if os.environ.get("COUNCIL_TIMING_DEBUG", "").strip().lower() in (
+            "1", "true", "yes", "on"
+        ):
+            _LOG.info("[timing] %s %.3fs", self.label, dt)
+        else:
+            _LOG.debug("[timing] %s %.3fs", self.label, dt)
+
+
+def _timed(label: str):
+    """Tiny decorator that logs the wall-clock duration of a call at
+    DEBUG level. Zero overhead when logging is not enabled (the LOG
+    handlers filter the message out before formatting).
+
+    Used by the analyst code-gen, analyst exec, vault rebuild, and the
+    final injection assembly so the user (or a triage session) can
+    diagnose where latency lives as the dataset grows. Toggle with
+    `COUNCIL_TIMING_DEBUG=1` to elevate to INFO so it shows up in normal
+    runs.
+
+    Example output (INFO):
+      [timing] analyst.codegen 1.243s
+      [timing] vault.rebuild   3.812s
+    """
+    def _wrap(fn):
+        def _call(*args, **kwargs):
+            import time as _t
+            t0 = _t.monotonic()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                dt = _t.monotonic() - t0
+                if os.environ.get("COUNCIL_TIMING_DEBUG", "").strip().lower() in (
+                    "1", "true", "yes", "on"
+                ):
+                    _LOG.info("[timing] %s %.3fs", label, dt)
+                else:
+                    _LOG.debug("[timing] %s %.3fs", label, dt)
+        _call.__name__ = getattr(fn, "__name__", label)
+        _call.__doc__  = getattr(fn, "__doc__", None)
+        return _call
+    return _wrap
+
+
+def n_ctx_status() -> Dict[str, Any]:
+    """Return the chosen n_ctx + the human-readable source string + the
+    full ladder trace from the most recent model load. The UI calls this
+    to surface the window size in the title bar.
+
+    Falls back to the env var value (or 4096) when the model hasn't been
+    loaded yet (lazy load — first chat call triggers the ladder)."""
+    if _LAST_N_CTX is not None:
+        return {
+            "n_ctx":  _LAST_N_CTX,
+            "source": _LAST_N_CTX_SOURCE,
+            "ladder": list(_LAST_N_CTX_LADDER),
+            "loaded": True,
+        }
+    try:
+        env_val = int(os.environ.get("COUNCIL_GGUF_N_CTX", "4096"))
+    except Exception:
+        env_val = 4096
+    return {
+        "n_ctx":  env_val,
+        "source": "env var (model not loaded yet — preview only)",
+        "ladder": [],
+        "loaded": False,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GGUF metadata reader — peek at the model's advertised max context
+# WITHOUT loading the weights.
+#
+# llama-cpp-python's Llama() constructor allocates the KV cache during load,
+# which means n_ctx has to be decided BEFORE we know what the model
+# actually supports. By pre-parsing the GGUF header we can pick a sensible
+# default automatically — typically the model's full training context up
+# to a safe cap — instead of always defaulting to 4096.
+#
+# GGUF file format (v2/v3 — the only versions in the wild):
+#   magic       : 4 bytes  "GGUF"
+#   version     : uint32   (LE)
+#   tensor_count: uint64   (LE)
+#   metadata_kv : uint64   (LE)  count of metadata key-value pairs
+#   kv pairs    : each:
+#       key_len  uint64
+#       key      bytes (utf-8, length = key_len)
+#       value_t  uint32  (type tag)
+#       value    bytes (length and shape depend on value_t)
+#   tensor metadata follows, then padding, then tensor data
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Value type tags per the GGUF spec
+_GGUF_VAL_TYPES = {
+    0:  ("u8",  1, "<B"),
+    1:  ("i8",  1, "<b"),
+    2:  ("u16", 2, "<H"),
+    3:  ("i16", 2, "<h"),
+    4:  ("u32", 4, "<I"),
+    5:  ("i32", 4, "<i"),
+    6:  ("f32", 4, "<f"),
+    7:  ("bool", 1, "<?"),
+    # 8 = string (handled specially)
+    # 9 = array  (handled specially)
+    10: ("u64", 8, "<Q"),
+    11: ("i64", 8, "<q"),
+    12: ("f64", 8, "<d"),
+}
+
+
+def _read_gguf_value(fh, val_type: int) -> Any:
+    """Read one GGUF value from an open binary file handle. Used by the
+    metadata pre-scan. Returns the parsed value, or raises on a bad type.
+    Arrays are recursively parsed but their items are returned as a list
+    only when small (≤ 32 items); larger arrays return ``[]`` to keep the
+    pre-scan fast — we never need the array contents for n_ctx anyway."""
+    import struct
+    if val_type == 8:
+        # string
+        (slen,) = struct.unpack("<Q", fh.read(8))
+        return fh.read(slen).decode("utf-8", errors="replace")
+    if val_type == 9:
+        # array — read element type + length, then elements
+        (elem_t,) = struct.unpack("<I", fh.read(4))
+        (alen,)   = struct.unpack("<Q", fh.read(8))
+        # Skip array bodies — we don't need them for n_ctx detection,
+        # and some arrays (vocab token lists) can be hundreds of MB.
+        # Compute the element byte-size and seek past.
+        if elem_t in _GGUF_VAL_TYPES:
+            elem_size = _GGUF_VAL_TYPES[elem_t][1]
+            fh.seek(elem_size * alen, 1)  # 1 = SEEK_CUR
+            return []
+        if elem_t == 8:
+            # array of strings — must read each to get past it (variable size)
+            for _ in range(alen):
+                (slen,) = struct.unpack("<Q", fh.read(8))
+                fh.seek(slen, 1)
+            return []
+        # Unknown element type — bail
+        return None
+    if val_type in _GGUF_VAL_TYPES:
+        _name, size, fmt = _GGUF_VAL_TYPES[val_type]
+        (v,) = struct.unpack(fmt, fh.read(size))
+        return v
+    # Unknown type — return None and let the caller bail
+    return None
+
+
+def read_gguf_metadata(path: Any, max_kv: int = 4096) -> Dict[str, Any]:
+    """Open a GGUF file, parse the header KV section, return a dict of
+    metadata. Never loads weights or allocates the KV cache.
+
+    Returns an empty dict on any error — callers fall back to env-var
+    defaults if the reader can't pin down the model's advertised context.
+    The `max_kv` cap protects against malformed files claiming millions
+    of KV entries.
+    """
+    import struct
+    out: Dict[str, Any] = {}
+    try:
+        with open(str(path), "rb") as fh:
+            magic = fh.read(4)
+            if magic != b"GGUF":
+                return {}
+            (version,) = struct.unpack("<I", fh.read(4))
+            if version not in (2, 3):
+                # Old v1 GGUF (very early) used a different layout; not
+                # worth supporting — any current model is v2 or v3.
+                return {}
+            # tensor_count (unused), metadata KV count
+            fh.read(8)
+            (kv_count,) = struct.unpack("<Q", fh.read(8))
+            if kv_count > max_kv:
+                return {}
+            for _ in range(kv_count):
+                (key_len,) = struct.unpack("<Q", fh.read(8))
+                key = fh.read(key_len).decode("utf-8", errors="replace")
+                (val_type,) = struct.unpack("<I", fh.read(4))
+                value = _read_gguf_value(fh, val_type)
+                out[key] = value
+    except Exception:
+        pass
+    return out
+
+
+# Module logger — the project doesn't have a project-wide logging
+# convention, so we set up the standard library logger lazily and let
+# downstream handlers (if any are attached) format it. INFO + DEBUG
+# go to stderr by default via Python's logging.basicConfig fallback.
+import logging as _logging
+_LOG = _logging.getLogger(__name__)
+if not _LOG.handlers and not _logging.getLogger().handlers:
+    # First time we use logging in this process — install a minimal
+    # handler so INFO messages reach stderr without the user having
+    # to configure logging themselves.
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+
+def _gguf_arch_prefix(metadata: Dict[str, Any]) -> str:
+    """Return the architecture prefix used in GGUF metadata keys
+    (``llama``, ``qwen2``, ``phi3``, …). Falls back to ``""`` if the
+    metadata lacks ``general.architecture``."""
+    arch = metadata.get("general.architecture")
+    return str(arch).strip() if isinstance(arch, str) else ""
+
+
+def _gguf_int_field(metadata: Dict[str, Any], *suffixes: str) -> Optional[int]:
+    """Look up an int-valued metadata field by trying each ``arch.<suffix>``
+    in order, then any ``*.<suffix>`` fallback. Returns None if nothing
+    matches or the value isn't a positive int."""
+    arch = _gguf_arch_prefix(metadata)
+    if arch:
+        for suf in suffixes:
+            v = metadata.get(f"{arch}.{suf}")
+            if isinstance(v, int) and v > 0:
+                return int(v)
+    for key, v in metadata.items():
+        if not isinstance(key, str):
+            continue
+        for suf in suffixes:
+            if key.endswith("." + suf) and isinstance(v, int) and v > 0:
+                return int(v)
+    return None
+
+
+def _estimate_kv_cache_bytes(metadata: Dict[str, Any], n_ctx: int,
+                              bytes_per_elem: int = 2) -> Optional[int]:
+    """Estimate KV-cache VRAM cost in bytes for a given n_ctx.
+
+    Formula:
+        2 (K+V) × n_layers × n_ctx × n_kv_heads × head_dim × bytes_per_elem
+
+    Where:
+      - n_layers     = ``<arch>.block_count``
+      - n_kv_heads   = ``<arch>.attention.head_count_kv`` (GQA) or
+                       ``<arch>.attention.head_count`` (MHA fallback)
+      - head_dim     = ``<arch>.embedding_length`` / head_count
+      - bytes_per_elem = 2 for fp16/bf16 KV cache (the llama.cpp default;
+                       f32 is rare but doubles this).
+
+    Returns None if any required field is missing — caller falls back
+    to a conservative non-VRAM-aware ceiling.
+    """
+    n_layers = _gguf_int_field(metadata, "block_count")
+    n_kv_heads = _gguf_int_field(
+        metadata,
+        "attention.head_count_kv",
+        "attention.head_count",
+    )
+    n_heads = _gguf_int_field(metadata, "attention.head_count")
+    embed_dim = _gguf_int_field(metadata, "embedding_length")
+    if not (n_layers and n_kv_heads and n_heads and embed_dim and n_ctx > 0):
+        return None
+    head_dim = max(1, embed_dim // n_heads)
+    return 2 * n_layers * n_ctx * n_kv_heads * head_dim * bytes_per_elem
+
+
+def _available_gpu_bytes() -> Optional[int]:
+    """Free VRAM on the primary CUDA device, in bytes. None when no CUDA
+    GPU is detected (CPU-only build, missing driver, etc.). We use
+    torch.cuda for the query because llama-cpp-python doesn't expose a
+    VRAM probe and torch is already pulled in for the GPU diag print."""
+    try:
+        import torch as _t   # type: ignore[import]
+        if not _t.cuda.is_available():
+            return None
+        # mem_get_info returns (free, total). Free reflects what's
+        # available right now — but the user might launch other GPU
+        # work too, so we leave a safety margin in the caller.
+        free, _total = _t.cuda.mem_get_info()
+        return int(free)
+    except Exception:
+        return None
+
+
+def _pick_vram_aware_n_ctx(metadata: Dict[str, Any],
+                            model_size_bytes: int,
+                            abs_max: int,
+                            margin_bytes: int) -> Tuple[Optional[int], Dict[str, Any]]:
+    """Pick the largest power-of-two n_ctx that fits in available VRAM
+    after subtracting model weights and ``margin_bytes`` safety overhead.
+
+    Returns ``(n_ctx_or_None, diag_dict)``. ``n_ctx_or_None`` is None
+    when we can't compute a VRAM-aware value (no GPU, missing metadata,
+    GPU-info probe failed). ``diag_dict`` carries the inputs so the
+    caller can log them.
+    """
+    diag: Dict[str, Any] = {
+        "model_size_bytes": model_size_bytes,
+        "margin_bytes":     margin_bytes,
+    }
+    free_vram = _available_gpu_bytes()
+    diag["free_vram_bytes"] = free_vram
+    if free_vram is None:
+        diag["reason"] = "no CUDA GPU detected"
+        return None, diag
+
+    # Reserve room for model weights AND the safety margin. If the
+    # model is bigger than the free VRAM, give up — the user will be
+    # on CPU/partial-offload anyway and the KV cache lives in RAM
+    # which we don't try to bound here.
+    available_for_kv = free_vram - model_size_bytes - margin_bytes
+    diag["available_for_kv_bytes"] = available_for_kv
+    if available_for_kv <= 0:
+        diag["reason"] = "no headroom for KV cache after model + margin"
+        return None, diag
+
+    candidates = [1024, 2048, 4096, 8192, 16384, 32768]
+    candidates = [c for c in candidates if c <= abs_max]
+    picked: Optional[int] = None
+    for c in reversed(candidates):
+        cost = _estimate_kv_cache_bytes(metadata, c)
+        if cost is None:
+            diag["reason"] = "missing GGUF metadata fields for KV-cache estimate"
+            return None, diag
+        diag.setdefault("considered", []).append({"n_ctx": c, "kv_bytes": cost})
+        if cost <= available_for_kv:
+            picked = c
+            break
+    diag["picked"] = picked
+    return picked, diag
+
+
+def _gguf_max_context_from_metadata(metadata: Dict[str, Any]) -> Optional[int]:
+    """Extract the model's training context length from a parsed GGUF
+    metadata dict. The key name is namespaced per architecture
+    (``llama.context_length``, ``qwen2.context_length``, etc.), so we
+    look for anything ending in ``.context_length``.
+
+    Returns None when the field is missing or not an int — caller falls
+    back to env-var default.
+    """
+    if not metadata:
+        return None
+    # Common explicit keys first (faster than scanning all metadata).
+    for k in (
+        "general.context_length",
+        "llama.context_length", "qwen2.context_length",
+        "mistral.context_length", "granite.context_length",
+        "phi.context_length", "phi3.context_length", "phi4.context_length",
+        "gemma.context_length", "gemma2.context_length",
+        "deepseek.context_length", "qwen.context_length",
+    ):
+        v = metadata.get(k)
+        if isinstance(v, int) and v > 0:
+            return v
+    # Fallback: any *.context_length field
+    for k, v in metadata.items():
+        if isinstance(k, str) and k.endswith(".context_length"):
+            if isinstance(v, int) and v > 0:
+                return v
+    return None
 
 
 def _get_gguf_model():
@@ -177,7 +578,137 @@ def _get_gguf_model():
             "  pip install llama-cpp-python"
         ) from exc
 
-    n_ctx = int(os.environ.get("COUNCIL_GGUF_N_CTX", "4096"))
+    # ── Auto-detect n_ctx (the ladder) ─────────────────────────────────────
+    #
+    # Four rungs of precedence, highest first:
+    #   1. COUNCIL_GGUF_N_CTX env var — explicit user override, always wins.
+    #   2. VRAM-aware sizing: estimate KV-cache cost from GGUF architecture
+    #      (block_count, head_count_kv, embedding_length) and pick the
+    #      largest power-of-two n_ctx that fits in available VRAM after
+    #      reserving model weights and a safety margin
+    #      (COUNCIL_GGUF_KV_VRAM_MARGIN_MB, default 1024 = 1 GB).
+    #   3. GGUF metadata's advertised training context_length, capped at
+    #      COUNCIL_GGUF_N_CTX_MAX (default 32768). This catches the
+    #      CPU-only case (no CUDA GPU, no VRAM probe) and the
+    #      missing-architecture-metadata case.
+    #   4. Conservative fallback of 4096 — last-resort when metadata
+    #      can't be read at all (very old GGUF / parser failure).
+    #
+    # Setting COUNCIL_GGUF_N_CTX_DEBUG=1 prints the full ladder trace
+    # (every rung tried, every input value, every reason for skipping)
+    # so a user on a failing machine can capture the diagnostic without
+    # needing a debugger.
+    debug_ladder = (os.environ.get("COUNCIL_GGUF_N_CTX_DEBUG", "").strip()
+                    in ("1", "true", "yes", "on"))
+    ladder: list = []   # list of dicts, one per rung tried
+
+    def _ladder_log(rung: str, **fields) -> None:
+        entry = {"rung": rung, **fields}
+        ladder.append(entry)
+        _LOG.info("[n_ctx ladder] %s: %s", rung,
+                  ", ".join(f"{k}={v}" for k, v in fields.items()))
+
+    n_ctx: Optional[int] = None
+    n_ctx_source: str = ""
+
+    # Rung 1: explicit env var override.
+    env_n_ctx_raw = os.environ.get("COUNCIL_GGUF_N_CTX", "").strip()
+    if env_n_ctx_raw:
+        try:
+            n_ctx = int(env_n_ctx_raw)
+            n_ctx_source = "env var COUNCIL_GGUF_N_CTX"
+            _ladder_log("env_override", value=env_n_ctx_raw, parsed=n_ctx,
+                        chosen=True)
+        except ValueError as exc:
+            _ladder_log("env_override", value=env_n_ctx_raw,
+                        error=repr(exc), chosen=False)
+
+    # Pre-compute the absolute cap + parse metadata once — used by rungs
+    # 2 and 3 below.
+    try:
+        n_ctx_cap = int(os.environ.get("COUNCIL_GGUF_N_CTX_MAX", "32768"))
+    except Exception:
+        n_ctx_cap = 32768
+    metadata: Dict[str, Any] = {}
+    if n_ctx is None:
+        try:
+            metadata = read_gguf_metadata(p)
+            _ladder_log("metadata_parse",
+                        keys=len(metadata),
+                        arch=_gguf_arch_prefix(metadata) or "(missing)",
+                        chosen=False)
+        except Exception as exc:
+            _ladder_log("metadata_parse", error=repr(exc), chosen=False)
+
+    # Rung 2: VRAM-aware sizing.
+    if n_ctx is None and metadata:
+        try:
+            margin_mb = int(os.environ.get(
+                "COUNCIL_GGUF_KV_VRAM_MARGIN_MB", "1024"))
+        except Exception:
+            margin_mb = 1024
+        margin_bytes = max(0, margin_mb) * 1024 * 1024
+        try:
+            model_size = int(p.stat().st_size)
+        except Exception:
+            model_size = 0
+        picked, diag = _pick_vram_aware_n_ctx(
+            metadata,
+            model_size_bytes=model_size,
+            abs_max=n_ctx_cap,
+            margin_bytes=margin_bytes,
+        )
+        if picked is not None:
+            n_ctx = picked
+            n_ctx_source = (
+                f"VRAM-aware (free VRAM "
+                f"{(diag.get('free_vram_bytes') or 0) / (1024**3):.1f} GB, "
+                f"model {(diag.get('model_size_bytes') or 0) / (1024**3):.1f} GB, "
+                f"margin {margin_mb} MB)"
+            )
+            _ladder_log("vram_aware", chosen=True, picked=picked, **diag)
+        else:
+            _ladder_log("vram_aware", chosen=False, **diag)
+
+    # Rung 3: GGUF advertised context_length (the old default behaviour).
+    if n_ctx is None and metadata:
+        try:
+            model_max = _gguf_max_context_from_metadata(metadata)
+        except Exception as exc:
+            model_max = None
+            _ladder_log("metadata_context_length", error=repr(exc),
+                        chosen=False)
+        if model_max and model_max > 0:
+            n_ctx = min(model_max, n_ctx_cap)
+            n_ctx_source = (f"GGUF context_length "
+                            f"(advertises {model_max:,}, "
+                            f"capped at {n_ctx_cap:,})")
+            _ladder_log("metadata_context_length",
+                        model_max=model_max, capped_to=n_ctx, chosen=True)
+        else:
+            _ladder_log("metadata_context_length",
+                        model_max=model_max, chosen=False)
+
+    # Rung 4: conservative fallback.
+    if n_ctx is None:
+        n_ctx = 4096
+        n_ctx_source = "fallback default (no other rung succeeded)"
+        _ladder_log("fallback_4096", chosen=True)
+
+    if debug_ladder:
+        print("[GGUF n_ctx ladder]", flush=True)
+        for entry in ladder:
+            print("  " + repr(entry), flush=True)
+
+    # Persist on the engine module so the UI can surface the chosen
+    # n_ctx + source without re-running detection.
+    global _LAST_N_CTX, _LAST_N_CTX_SOURCE, _LAST_N_CTX_LADDER
+    _LAST_N_CTX = n_ctx
+    _LAST_N_CTX_SOURCE = n_ctx_source
+    _LAST_N_CTX_LADDER = ladder
+
+    _LOG.info("[GGUF] n_ctx chosen = %s (source: %s)", f"{n_ctx:,}", n_ctx_source)
+    print(f"[GGUF] n_ctx = {n_ctx:,}  (source: {n_ctx_source})", flush=True)
     # Default n_threads: prefer PHYSICAL cores when we can read them,
     # otherwise fall back to logical-count (os.cpu_count()) which is
     # what the app used historically. Note we deliberately do NOT use a
@@ -202,10 +733,115 @@ def _get_gguf_model():
 
     n_threads = int(os.environ.get("COUNCIL_GGUF_N_THREADS",
                                     str(_default_n_threads())))
-    n_gpu_layers = int(os.environ.get("COUNCIL_GGUF_GPU_LAYERS", "0"))
 
-    print(f"[GGUF] Loading {p.name} (n_ctx={n_ctx}, n_threads={n_threads}, "
-          f"n_gpu_layers={n_gpu_layers})", flush=True)
+    # ── n_gpu_layers default = 99 (offload every layer to GPU) ─────
+    #
+    # Why 99 by default instead of the historical 0:
+    #
+    # llama-cpp-python's CUDA wheel quietly falls back to CPU when GPU
+    # offload isn't available — passing n_gpu_layers=99 to a CPU-only
+    # build (Section A in installs.txt) is a NO-OP, not an error. So
+    # "99 by default, fall back if needed" is strictly safer than the
+    # old "0 by default, require env var to use GPU."
+    #
+    # The previous default of 0 produced the bug the user is hitting
+    # right now: they installed the CUDA wheel via Section C / D, but
+    # without setting COUNCIL_GGUF_GPU_LAYERS the model loaded with
+    # everything on CPU and only a few cache/scratchpad operations
+    # touched the GPU — which looked like "GPU occasionally used,
+    # CPU still primary."
+    #
+    # Per-layer offload size on the common models (helpful for users
+    # tuning lower values for smaller GPUs):
+    #   Phi-4 14B Q4_K_M:    ~225 MB per layer × 40 layers = ~9 GB
+    #   Llama 3.1 8B Q5_K_M: ~190 MB per layer × 32 layers = ~6 GB
+    #   Granite 3.1 8B:      ~190 MB per layer × 32 layers = ~6 GB
+    # Plus KV cache (scales with n_ctx) and a small constant overhead.
+    n_gpu_layers = int(os.environ.get("COUNCIL_GGUF_GPU_LAYERS", "99"))
+
+    # Best-effort GPU sanity check — surface the actual GPU + available
+    # VRAM in the startup log when one is detected, so users see why
+    # the model loaded on CPU vs GPU. Both probes are wrapped in try/
+    # except because either may fail on machines without torch / nvidia-
+    # smi; failure just means we don't print the extra diagnostic line.
+    gpu_diag = ""
+    try:
+        import torch as _t   # already a dep via sentence-transformers
+        if _t.cuda.is_available():
+            name = _t.cuda.get_device_name(0)
+            total_gb = _t.cuda.get_device_properties(0).total_memory / (1024**3)
+            gpu_diag = f"  GPU={name} ({total_gb:.1f} GB VRAM)"
+        else:
+            gpu_diag = "  GPU=none detected (torch.cuda.is_available()=False)"
+    except Exception:
+        # No torch installed (rare — sentence-transformers pulls it),
+        # or some other probe failure. Leave the diag empty and trust
+        # the n_gpu_layers line to tell the user what happened.
+        pass
+
+    # ── CPU feature probe (Linux + WSL only) ────────────────────────────
+    # llama-cpp-python's prebuilt wheels assume AVX2 + F16C. When the
+    # host CPU lacks one of these (most often: a VM with `-cpu host`
+    # passing through an older feature set, or an old desktop), the
+    # library raises SIGILL ("illegal instruction") on the very first
+    # tensor op. The crash leaves no Python traceback and looks like
+    # a generic core dump.
+    #
+    # We print the feature flags here BEFORE calling Llama() so the
+    # user sees what their CPU advertises — if AVX2 is missing the
+    # crash message immediately below makes the cause obvious. Skipped
+    # on Windows native (the wheels there target wider CPU baselines)
+    # and on systems where /proc/cpuinfo isn't readable.
+    cpu_features: List[str] = []
+    try:
+        if sys.platform.startswith("linux"):
+            with open("/proc/cpuinfo", "r", encoding="utf-8",
+                      errors="ignore") as fh:
+                for line in fh:
+                    if line.startswith("flags") or line.startswith("Features"):
+                        cpu_features = line.split(":", 1)[1].strip().split()
+                        break
+    except Exception:
+        cpu_features = []
+    needed = ("avx2", "f16c")
+    missing = [f for f in needed if f not in cpu_features]
+    if cpu_features:
+        _LOG.info("[CPU] features include avx=%s avx2=%s f16c=%s avx512f=%s",
+                  "avx" in cpu_features,
+                  "avx2" in cpu_features,
+                  "f16c" in cpu_features,
+                  "avx512f" in cpu_features)
+        if missing:
+            warning = (
+                f"[CPU] WARNING: this CPU is MISSING {missing} which the "
+                "prebuilt llama-cpp-python wheels assume. The next "
+                "tensor op will likely crash with SIGILL / 'illegal "
+                "instruction' / core dumped. Rebuild llama-cpp from "
+                "source with the missing flags disabled — see "
+                "installs.txt 'illegal instruction' section."
+            )
+            _LOG.warning(warning)
+            print(warning, flush=True)
+
+    print(f"[GGUF] Loading {p.name} (n_ctx={n_ctx:,}, n_threads={n_threads}, "
+          f"n_gpu_layers={n_gpu_layers}){gpu_diag}", flush=True)
+    if n_gpu_layers > 0 and "GPU=none" in gpu_diag:
+        print("[GGUF] WARNING: n_gpu_layers > 0 but no CUDA GPU detected. "
+              "llama-cpp will fall back to CPU. To force CPU only and "
+              "silence this warning, set COUNCIL_GGUF_GPU_LAYERS=0.",
+              flush=True)
+    # Breadcrumb: flush stderr/stdout BEFORE the C-extension call so a
+    # SIGILL inside Llama() doesn't swallow the last "we got this far"
+    # log line. Without this, an illegal-instruction crash inside
+    # llama-cpp leaves the user with no Python output to diagnose.
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    _LOG.info("[GGUF] About to call Llama() — if the process exits here "
+              "with no further output, the C extension SIGILL'd. Check "
+              "the CPU feature flags above.")
     _GGUF_MODEL_INSTANCE = Llama(
         model_path=str(p),
         n_ctx=n_ctx,

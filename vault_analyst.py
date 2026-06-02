@@ -30,6 +30,32 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Tuple
 
+# Process-wide LRU cache for parsed DataFrames. The per-file inventory
+# helpers below (csv_inventory, count_rows_per_csv, average_numeric_
+# column_per_csv, etc.) used to call pd.read_csv from cold for every
+# question — a single user turn that triggers two helpers re-reads each
+# CSV twice. Routing through df_cache gives in-turn cache hits for free.
+try:
+    from df_cache import cached_read_csv as _cached_read_csv
+except Exception:
+    _cached_read_csv = None  # graceful — fall back to pd.read_csv per call
+
+
+def _read_csv_cached(path, **kw):
+    """Wrapper that prefers df_cache.cached_read_csv but degrades to a
+    bare pandas read when the cache is unavailable. Returns the same
+    DataFrame regardless — callers see no behavioural difference."""
+    if _cached_read_csv is not None:
+        try:
+            return _cached_read_csv(path, **kw)
+        except Exception:
+            # Defensive: if the cache misbehaves for any reason, fall
+            # through to the uncached path so the analyst still answers.
+            pass
+    import pandas as _pd_inner
+    return _pd_inner.read_csv(path, **kw)
+
+
 try:
     import pandas as pd
 except Exception as exc:  # pragma: no cover - imported at runtime
@@ -1150,7 +1176,7 @@ def csv_inventory(
     for csv_path in csvs:
         root = first_matching_root(csv_path, folders)
         try:
-            df_head = pd.read_csv(csv_path, nrows=5)
+            df_head = _read_csv_cached(csv_path, nrows=5)
             rows.append({
                 "csv": csv_path.name,
                 "relative_path": safe_relative_path(csv_path, root),
@@ -1177,7 +1203,7 @@ def count_rows_per_csv(data_folder: Any, recursive: bool = True) -> pd.DataFrame
     for csv_path in list_csv_files(folders, recursive=recursive):
         root = first_matching_root(csv_path, folders)
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
             rows.append({
                 "csv": csv_path.name,
                 "relative_path": safe_relative_path(csv_path, root),
@@ -1209,7 +1235,7 @@ def _numeric_aggregate_per_csv(
     for csv_path in list_csv_files(folders, recursive=recursive):
         root = first_matching_root(csv_path, folders)
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
             actual_col = find_column_case_insensitive(df, column_name)
             if actual_col is None:
                 rows.append({
@@ -1308,7 +1334,7 @@ def numeric_summary_per_csv(
     for csv_path in list_csv_files(folders, recursive=recursive):
         root = first_matching_root(csv_path, folders)
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
             if column_name:
                 actual_col = find_column_case_insensitive(df, column_name)
                 if actual_col is None:
@@ -1356,7 +1382,7 @@ def count_matching_rows_per_csv(
     for csv_path in list_csv_files(folders, recursive=recursive):
         root = first_matching_root(csv_path, folders)
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
             actual_col = find_column_case_insensitive(df, column_name)
             if actual_col is None:
                 # also try substring match against header names
@@ -1420,7 +1446,7 @@ def filter_rows_across_csvs(
     for csv_path in list_csv_files(folders, recursive=recursive):
         root = first_matching_root(csv_path, folders)
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
             actual_col = find_column_case_insensitive(df, column_name)
             if actual_col is None:
                 continue
@@ -1464,7 +1490,7 @@ def groupby_mean_per_csv(
     for csv_path in list_csv_files(folders, recursive=recursive):
         root = first_matching_root(csv_path, folders)
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
             actual_group = find_column_case_insensitive(df, group_col)
             actual_value = find_column_case_insensitive(df, value_col)
             if actual_group is None or actual_value is None:
@@ -1572,7 +1598,7 @@ def top_n_per_csv(
     for csv_path in list_csv_files(folders, recursive=recursive):
         root = first_matching_root(csv_path, folders)
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
         except Exception as exc:
             rows.append({
                 "csv": csv_path.name,
@@ -1947,7 +1973,7 @@ def detect_data_quality_issues_per_csv(
     frames: list[pd.DataFrame] = []
     for csv_path in list_csv_files(folders, recursive=recursive):
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
             issues = detect_data_quality_issues(df)
             if not issues.empty:
                 issues.insert(0, "csv", csv_path.name)
@@ -2023,7 +2049,7 @@ def pivot_per_csv(
     for csv_path in list_csv_files(folders, recursive=recursive):
         root = first_matching_root(csv_path, folders)
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
             ix = find_column_case_insensitive(df, index_col)
             cx = find_column_case_insensitive(df, columns_col)
             vx = find_column_case_insensitive(df, value_col)
@@ -2072,7 +2098,7 @@ def correlation_per_csv(
     for csv_path in list_csv_files(folders, recursive=recursive):
         root = first_matching_root(csv_path, folders)
         try:
-            df = pd.read_csv(csv_path)
+            df = _read_csv_cached(csv_path)
             actual_x = find_column_case_insensitive(df, x_col)
             actual_y = find_column_case_insensitive(df, y_col)
             if actual_x is None or actual_y is None:
@@ -2333,7 +2359,7 @@ def preview_csv_inventory(folders: Any, max_files: int = 25, max_cols: int = 30)
     for csv_path in csvs[:max_files]:
         root = first_matching_root(csv_path, normalized)
         try:
-            df_head = pd.read_csv(csv_path, nrows=5)
+            df_head = _read_csv_cached(csv_path, nrows=5)
             cols = list(df_head.columns)
             shown_cols = cols[:max_cols]
             more = "" if len(cols) <= max_cols else f" ... (+{len(cols) - max_cols} more)"
@@ -2446,13 +2472,36 @@ def execute_pandas_code(
 
     safe_builtins = {
         "__import__": _safe_import,
+        # Numeric / collection core
         "abs": abs, "all": all, "any": any, "bool": bool, "dict": dict,
         "enumerate": enumerate, "float": float, "int": int,
-        "isinstance": isinstance, "len": len, "list": list, "max": max,
-        "min": min, "print": print, "range": range, "round": round,
-        "set": set, "sorted": sorted, "str": str, "sum": sum,
-        "tuple": tuple, "zip": zip,
+        "isinstance": isinstance, "issubclass": issubclass,
+        "len": len, "list": list, "max": max, "min": min, "print": print,
+        "range": range, "round": round, "set": set, "frozenset": frozenset,
+        "sorted": sorted, "str": str, "sum": sum, "tuple": tuple, "zip": zip,
+        # Attribute / introspection — model frequently writes
+        # `getattr(df, "shape")`, `type(x).__name__`, etc. Without these
+        # in builtins the sandbox raises NameError mid-snippet and the
+        # analyst silently falls back to model freeform (= wrong answer).
+        "getattr": getattr, "hasattr": hasattr, "setattr": setattr,
+        "type": type, "repr": repr, "format": format, "hash": hash,
+        "id": id, "callable": callable, "vars": vars, "dir": dir,
+        # Iterator helpers
+        "iter": iter, "next": next, "reversed": reversed,
+        "map": map, "filter": filter, "slice": slice,
+        # Numeric / char helpers
+        "divmod": divmod, "pow": pow, "ord": ord, "chr": chr,
+        "bin": bin, "hex": hex, "oct": oct,
+        "bytes": bytes, "bytearray": bytearray, "complex": complex,
+        # Literals — needed inside exec because __builtins__ replaced
+        "True": True, "False": False, "None": None,
+        # Common exception classes for except-clauses
         "Exception": Exception, "ValueError": ValueError, "TypeError": TypeError,
+        "KeyError": KeyError, "IndexError": IndexError,
+        "AttributeError": AttributeError, "ZeroDivisionError": ZeroDivisionError,
+        "StopIteration": StopIteration, "OverflowError": OverflowError,
+        "LookupError": LookupError, "ArithmeticError": ArithmeticError,
+        "RuntimeError": RuntimeError, "NotImplementedError": NotImplementedError,
     }
 
     globals_dict: dict[str, Any] = {
@@ -2749,6 +2798,18 @@ Rules:
 - Assign the final answer to a DataFrame named `result_df`.
 - No filesystem writes, no network, no subprocess, no eval/exec.
 - Prefer helpers over hand-rolled pandas when one fits.
+- PREFER AGGREGATIONS OVER RAW ROWS. The result is shown to a
+  language model with a tight context budget, so:
+  • `df.describe()`, `df.groupby(...).agg(...)`, `value_counts()`,
+    `df[col].mean()/sum()/count()`, scalar answers — strongly
+    preferred.
+  • Return raw rows only if the user explicitly asked for "rows",
+    "examples", or named specific records they want to see.
+  • When raw rows are warranted, cap at a small head/tail
+    (e.g. `df.head(10)` or top-N by ranking) and let the summary
+    do the heavy lifting.
+- Output one or two summary lines if a single scalar suffices —
+  e.g. `result_df = pd.DataFrame([{'metric': 'total_rows', 'value': N}])`.
 
 Examples:
 
@@ -3213,13 +3274,73 @@ def format_filename_hints(hints: List[Tuple[str, Optional[Path]]],
 # DataFrame -> prompt-friendly text
 # ============================================================
 
-def format_result_for_prompt(df: pd.DataFrame, *, max_rows: int = 30, max_chars: int = 4000) -> str:
+def format_result_for_prompt(
+    df: pd.DataFrame,
+    *,
+    max_rows: int = 30,
+    max_chars: int = 4000,
+    max_tokens: Optional[int] = None,
+    count_tokens: Optional[Any] = None,
+) -> str:
+    """Render an analyst DataFrame for prompt injection.
+
+    Truncation strategy (head + middle + tail) — pandas-style summary
+    rows ("Total" / "Mean" / "..." that helpers like ``describe()`` and
+    ``agg()`` append) tend to live at the TAIL of the result. Head-only
+    truncation throws them away. We keep the head AND the tail and elide
+    the middle so the model sees both the first rows and the
+    aggregations.
+
+    Budget knobs:
+      - ``max_rows`` / ``max_chars`` — legacy char-based caps (kept as
+        a hard backstop).
+      - ``max_tokens`` / ``count_tokens`` — token-aware cap when the
+        caller has the tokenizer in hand. When ``max_tokens`` is given,
+        we re-render with progressively fewer rows until the result
+        fits, or fall back to head+tail char truncation if even one
+        row exceeds the budget.
+    """
     if df is None or df.empty:
         return "(analyst returned an empty result)"
-    head = df.head(max_rows)
-    text = head.to_string(index=False)
-    if len(df) > len(head):
-        text += f"\n... ({len(df) - len(head)} more rows omitted)"
+
+    def _render_head_tail(d, n_head: int, n_tail: int) -> str:
+        total = len(d)
+        if n_head + n_tail >= total:
+            return d.to_string(index=False)
+        head = d.head(n_head)
+        tail = d.tail(n_tail)
+        head_txt = head.to_string(index=False)
+        # tail.to_string() repeats the header row; strip it so the
+        # output reads continuously.
+        tail_txt = tail.to_string(index=False)
+        tail_lines = tail_txt.split("\n", 1)
+        tail_body = tail_lines[1] if len(tail_lines) > 1 else tail_lines[0]
+        omitted = total - n_head - n_tail
+        return (head_txt + "\n... (" + str(omitted) + " row"
+                + ("s" if omitted != 1 else "") + " omitted from middle)\n"
+                + tail_body)
+
+    # Token-aware path — try progressively smaller head+tail splits
+    # until we fit. We bias toward keeping the TAIL (where summary rows
+    # live) by giving it slightly more rows than the head.
+    if max_tokens is not None and count_tokens is not None:
+        for n_head, n_tail in [(20, 20), (12, 12), (8, 8), (5, 5),
+                               (3, 3), (2, 2), (1, 1)]:
+            text = _render_head_tail(df, n_head, n_tail)
+            if count_tokens(text) <= max_tokens:
+                return text
+        # Even one head + one tail row blows the budget — fall through
+        # to the char-cap path below as a last resort.
+
+    # Char-based path (legacy default).
+    n_head = min(max_rows, max(1, len(df) - max_rows // 3))
+    n_tail = min(max_rows // 3, max(1, len(df) - n_head))
+    text = _render_head_tail(df, n_head, n_tail)
     if len(text) > max_chars:
-        text = text[:max_chars] + "\n... (truncated)"
+        # Last-resort char trim. Keep head + last few lines so summary
+        # rows still come through even when the row count is huge.
+        keep_head = int(max_chars * 0.7)
+        keep_tail = max_chars - keep_head - 64
+        text = (text[:keep_head] + "\n... (truncated middle)\n"
+                + text[-max(keep_tail, 0):]) if keep_tail > 0 else text[:max_chars]
     return text

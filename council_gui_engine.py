@@ -288,6 +288,23 @@ def _strip_code_blocks(text: str) -> str:
 # contents so every council member sees the actual data rather than
 # hallucinating about it.
 
+def _is_wsl() -> bool:
+    """True when running inside WSL (any flavour). Used to pick a higher
+    default Tk scaling factor — WSLg always reports 96 DPI even when the
+    Windows host is at 150 % / 200 % scaling, so Tkinter widgets render
+    tiny without an explicit multiplier."""
+    try:
+        if "microsoft" in (os.uname().release or "").lower():  # type: ignore[attr-defined]
+            return True
+    except Exception:
+        pass
+    try:
+        with open("/proc/version", "r", encoding="utf-8", errors="ignore") as fh:
+            return "microsoft" in fh.read().lower()
+    except Exception:
+        return False
+
+
 _FILE_PATH_RE = _re.compile(r'[a-zA-Z]:[/\\]\S+|/\S+')
 _FILE_READ_CHAR_LIMIT = 12000  # total chars per file in the injected block
 
@@ -305,14 +322,33 @@ _FILE_READ_CHAR_LIMIT = 12000  # total chars per file in the injected block
 _BLOCK_HEADER_RE = _re.compile(r"\s*~[\d,]+\s+tokens\s*")
 
 
-def _estimate_block_tokens(block_text: str) -> int:
-    """Cheap token estimator — uses the loaded llama tokenizer when
-    available, falls back to chars/4. Never raises."""
+from functools import lru_cache as _lru_cache
+
+
+@_lru_cache(maxsize=4096)
+def _estimate_block_tokens_cached(block_text: str) -> int:
+    """Inner cacheable form. Tokenisation is pure with respect to its
+    input string — the same block always counts to the same number of
+    tokens for a given model, and the model isn't hot-swapped during
+    a session. 4096 entries × few hundred bytes each ~= 1-2 MB cap."""
     try:
         import council_engine as _ce
         return _ce.estimate_tokens(block_text or "")
     except Exception:
         return max(1, (len(block_text or "") + 3) // 4)
+
+
+def _estimate_block_tokens(block_text: str) -> int:
+    """Cheap token estimator — uses the loaded llama tokenizer when
+    available, falls back to chars/4. Never raises.
+
+    Wrapper around the lru_cache'd impl so callers can pass non-string
+    inputs (None, bytes from a misbehaving caller) without poisoning
+    the cache with un-hashable keys.
+    """
+    if not isinstance(block_text, str):
+        block_text = "" if block_text is None else str(block_text)
+    return _estimate_block_tokens_cached(block_text)
 
 
 def _tag_block_header(block_text: str, token_count: int) -> str:
@@ -629,6 +665,102 @@ def _render_excel_block(p, char_limit):
     if len(content) > char_limit:
         content, _ = _smart_truncate_text(content, char_limit)
     return content
+
+
+def _render_folder_summary_compact(folder, max_files=120, max_chars=3500):
+    """Compact folder summary — counts + subfolder breakdown + filename
+    list. No per-file column previews / sheet names / file heads.
+
+    Used by the vault-trigger auto-injection so a small-context model
+    (e.g. 4 K window) doesn't get its entire prompt budget eaten by one
+    rich folder block. About 5-10× smaller than _render_folder_for_injection
+    on the same vault.
+
+    Returns ``None`` when the folder is missing — caller treats as a
+    no-op and skips the block.
+    """
+    folder = Path(folder)
+    if not folder.exists() or not folder.is_dir():
+        return None
+
+    try:
+        import conversation_logger as _cl
+    except Exception:
+        _cl = None
+
+    SKIP_DIRS = {"__pycache__", ".git", ".venv", "venv", "node_modules"}
+    # Higher than the rich renderer's 5K — we don't parse files, so
+    # walking 10K dir entries is still cheap.
+    SCAN_LIMIT = 10000
+
+    from collections import defaultdict as _dd
+    files: list = []
+    subfolders: dict = _dd(int)
+    by_suffix: dict = _dd(int)
+    scanned = 0
+    walk_truncated = False
+    for p in folder.rglob("*"):
+        scanned += 1
+        if scanned > SCAN_LIMIT:
+            walk_truncated = True
+            break
+        if not p.is_file():
+            continue
+        try:
+            rel = p.relative_to(folder)
+        except ValueError:
+            continue
+        if any(part in SKIP_DIRS or part.startswith(".")
+               for part in rel.parts[:-1]):
+            continue
+        if _cl is not None:
+            try:
+                if _cl.is_protected_path(p, folder.parent):
+                    continue
+            except Exception:
+                pass
+        if len(rel.parts) > 1:
+            subfolders[rel.parts[0]] += 1
+        suf = p.suffix.lower() or "(no ext)"
+        by_suffix[suf] += 1
+        files.append(rel)
+
+    total = len(files)
+    total_label = f"{total}" + ("+" if walk_truncated else "")
+    lines = [f"[FOLDER SUMMARY: {folder.name or folder}]"]
+    lines.append(f"Total files: {total_label}"
+                 + (f" (walked first {SCAN_LIMIT:,} entries — more may exist)"
+                    if walk_truncated else ""))
+
+    if subfolders:
+        lines.append("")
+        lines.append("Subfolder file counts:")
+        for sub, count in sorted(subfolders.items(),
+                                  key=lambda x: (-x[1], x[0]))[:30]:
+            lines.append(f"  {sub}/: {count} file{'s' if count != 1 else ''}")
+        if len(subfolders) > 30:
+            lines.append(f"  ... ({len(subfolders) - 30} more subfolders)")
+
+    if by_suffix:
+        type_bits = [f"{s}: {c}" for s, c
+                     in sorted(by_suffix.items(), key=lambda x: -x[1])[:12]]
+        lines.append("")
+        lines.append("Files by type: " + ", ".join(type_bits))
+
+    if files:
+        lines.append("")
+        shown = files[:max_files]
+        lines.append(f"Files (first {len(shown)} of {total}):")
+        for f in shown:
+            lines.append(f"  {f}")
+        if total > max_files:
+            lines.append(f"  ... ({total - max_files} more files not shown — "
+                         f"ask about specific files or subfolders.)")
+
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text, _ = _smart_truncate_text(text, max_chars)
+    return text
 
 
 def _render_folder_for_injection(folder, max_files=40, max_chars=12000):
@@ -1028,8 +1160,77 @@ def _extract_file_paths(text):
     return paths
 
 
+# Phrase substrings that mark a CONCEPTUAL search query — "show me
+# files that …", "find scripts about …", etc. When matched, the
+# injector defaults to search-headers mode (compact one-line entries
+# per match) rather than full [VAULT MATCH] blocks. The model
+# typically wants to acknowledge what's there before zooming into
+# specific files, and headers let it see far more matches per token.
+_SEARCH_HEADERS_PHRASES = (
+    "find files", "find any file", "find every", "find a file",
+    "find scripts", "find pipelines", "find docs",
+    "look through", "look for files",
+    "search through", "search for files", "search for any",
+    "show me files", "show me the files", "list files", "list of files",
+    "which files", "what files", "any files",
+    "files that contain", "files with", "files about",
+    "scripts that", "pipelines that",
+)
+
+
+def _wants_search_headers(text: str) -> bool:
+    """Heuristic: does this query look like 'show me what's there' rather
+    than 'tell me about X specifically'? Conceptual-search queries get
+    compact one-line headers instead of full blocks so the model can see
+    more matches per token. Manual override via
+    COUNCIL_FORCE_FULL_VAULT_BLOCKS=1 (or =yes/true/on) skips this and
+    keeps the legacy full-block behaviour."""
+    if os.environ.get("COUNCIL_FORCE_FULL_VAULT_BLOCKS", "").strip().lower() in (
+        "1", "true", "yes", "on"
+    ):
+        return False
+    t = (text or "").lower()
+    return any(p in t for p in _SEARCH_HEADERS_PHRASES)
+
+
+def _build_search_header_block(rec, score=None) -> str:
+    """A single-line header for a vault match. ~30 tokens.
+
+    Format: ``name  ·  type, R rows  ·  topics: a, b, c  ·  score 4.2``
+    Used by search-headers mode in place of a full [VAULT MATCH] block.
+
+    Semantic-only matches (no keyword hit) get a leading "[semantic] "
+    tag so the model knows the file matched by meaning, not by query
+    terms appearing in it.
+    """
+    name = rec.get("name") or "?"
+    rtype = rec.get("type") or "?"
+    bits = [rtype]
+    if rtype in ("csv", "tsv", "csv.gz", "parquet"):
+        rows = rec.get("rows")
+        if isinstance(rows, int):
+            bits.append(f"{rows:,} rows")
+        n_cols = len(rec.get("headers") or [])
+        if n_cols:
+            bits.append(f"{n_cols} cols")
+    elif rtype == "excel":
+        sheets = rec.get("sheets") or []
+        bits.append(f"{len(sheets)} sheets")
+    elif rtype in ("sqlite", "duckdb"):
+        tables = rec.get("tables") or []
+        bits.append(f"{len(tables)} tables")
+    topics = rec.get("topics") or []
+    sem_tag = "[semantic] " if rec.get("_semantic_only") else ""
+    parts = [f"{sem_tag}{name}", ", ".join(bits)]
+    if topics:
+        parts.append("topics: " + ", ".join(str(t) for t in topics[:4]))
+    if score is not None:
+        parts.append(f"score {score:.1f}")
+    return "  ·  ".join(parts)
+
+
 def _inject_file_contents(user_text, analyst_block=None, n_ctx=None,
-                           task_memo_block=None):
+                           task_memo_block=None, pinned_files=None):
     """Public entry point — wraps `_inject_file_contents_impl` in a
     defensive try/except so unexpected exceptions during injection
     (vault index corruption, network-share disconnect mid-walk,
@@ -1041,6 +1242,7 @@ def _inject_file_contents(user_text, analyst_block=None, n_ctx=None,
         return _inject_file_contents_impl(
             user_text, analyst_block=analyst_block, n_ctx=n_ctx,
             task_memo_block=task_memo_block,
+            pinned_files=pinned_files,
         )
     except Exception as _top_e:
         import sys as _sys_dbg
@@ -1079,7 +1281,7 @@ def _inject_file_contents(user_text, analyst_block=None, n_ctx=None,
 
 
 def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
-                                task_memo_block=None):
+                                task_memo_block=None, pinned_files=None):
     """Augment the user message with file/vault context before deliberation.
 
     Returns ``(augmented_text, fuzzy_matches, breakdown)`` where:
@@ -1126,7 +1328,13 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
     # renderers already cap themselves at ~12KB (~3,000 tokens), so the
     # cap floor of 2048 tokens means well-behaved blocks pass through
     # untouched while a runaway block still gets trimmed.
-    per_block_cap = max(2048, n_ctx // 4)
+    # Per-block cap. Was max(2048, n_ctx // 4) which floored at 2048 for
+    # n_ctx <= 8192 — meaning a single non-droppable block could eat 50%
+    # of a 4K context, and several stacked could push past the window
+    # entirely (the assembly only drops blocks at DROPPABLE_FROM and
+    # above). Scale linearly with n_ctx so a 4K-ctx model gets ~512-token
+    # blocks while a 32K-ctx model still gets 5K-token blocks.
+    per_block_cap = max(512, n_ctx // 6)
     reply_reserve = max(256, int(n_ctx * 0.25))
     safe_input = max(1, n_ctx - reply_reserve)
     user_cost = _estimate_block_tokens(user_text)
@@ -1165,14 +1373,28 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
         candidates.append((PRIO_ANALYST, "[ANALYST RESULT]", analyst_block))
 
     # -- Explicit paths (priority 3 or 4) -----------------------------------
+    # Rich folder rendering (per-file column previews / sheet names / JSON
+    # key heads) is ~12 KB worst-case; compact rendering (counts + filename
+    # list) is ~3.5 KB. On a tight 4 K-ctx model, picking rich for a pasted
+    # folder eats the whole window. We pick adaptively:
+    #   • n_ctx >= 16384 → rich (the original behaviour)
+    #   • n_ctx <  16384 → compact (matches the auto-injection path's choice)
+    # The user can always paste an individual file path inside the folder
+    # to get full rich rendering for that one file.
+    _use_compact_folder = n_ctx < 16384
     for path_str in explicit_paths:
         p_check = Path(path_str.strip())
         # Directory → folder listing block (priority 4, not droppable).
         if p_check.is_dir():
-            folder_block = _render_folder_for_injection(p_check)
+            if _use_compact_folder:
+                folder_block = _render_folder_summary_compact(p_check)
+                lbl_prefix = "[FOLDER SUMMARY: "
+            else:
+                folder_block = _render_folder_for_injection(p_check)
+                lbl_prefix = "[FOLDER: "
             if folder_block:
                 candidates.append((
-                    PRIO_FOLDER, f"[FOLDER: {p_check.name or path_str}]",
+                    PRIO_FOLDER, f"{lbl_prefix}{p_check.name or path_str}]",
                     folder_block,
                 ))
             continue
@@ -1184,6 +1406,72 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
         else:
             missing_paths.append(path_str)
 
+    # -- Vault folder context (priority 4) ----------------------------------
+    # When the user mentions "the vault", "my vault", "vault folder", etc.
+    # but didn't paste an explicit path, inject a COMPACT data_in/ summary
+    # (counts + subfolder breakdown + filename list — no per-file column
+    # previews) so the model knows what files exist. Without this, vault
+    # search may return zero matches for generic queries ("show me what's
+    # in the vault") and the model defaults to "I don't have access to
+    # your filesystem".
+    #
+    # Skipped when:
+    #   • the user pasted an explicit path (FILE/FOLDER block already
+    #     covers their intent)
+    #   • the analyst block is present (analyst has authoritative counts;
+    #     adding a second full listing wastes the prompt budget — this
+    #     was the crash trigger on the 4K-ctx laptop: "how many files in
+    #     data_in" → analyst answers, then injection ALSO rendered the
+    #     full folder = 3K+ tokens of duplicate context.)
+    #
+    # Compact renderer caps at ~3.5 KB even on 1000-file vaults, so a
+    # 4 K-ctx model has headroom for the user text + reply reserve.
+    if (_vault_search_keywords(user_text)
+            and not explicit_paths
+            and analyst_block is None):
+        try:
+            import data_index as _di
+            vault_data_in = _di.input_dir(VAULT_DIR)
+        except Exception:
+            vault_data_in = VAULT_DIR
+        try:
+            vault_folder_block = _render_folder_summary_compact(vault_data_in)
+        except Exception as _e:
+            print('[DEBUG inject] vault folder render failed: ' + repr(_e),
+                  file=_sys_dbg.stderr)
+            vault_folder_block = None
+        if vault_folder_block:
+            vf_label = f"[FOLDER SUMMARY: {Path(vault_data_in).name or str(vault_data_in)}]"
+            already_have_vault_folder = any(
+                lbl == vf_label for _prio, lbl, _content in candidates
+            )
+            if not already_have_vault_folder:
+                candidates.append((PRIO_FOLDER, vf_label, vault_folder_block))
+                print('[DEBUG inject] vault folder injected: '
+                      + str(vault_data_in), file=_sys_dbg.stderr)
+
+        # Sub-folder reference: user said something like "look in the
+        # projects subfolder" or "files in Q3_2024". Compact-render
+        # that subfolder so the user gets focused context.
+        try:
+            import vault_analyst as _va_sub
+            sub = _va_sub.resolve_subfolder_hint(user_text, vault_data_in)
+        except Exception:
+            sub = None
+        if sub is not None and sub != vault_data_in:
+            try:
+                sub_block = _render_folder_summary_compact(sub)
+            except Exception:
+                sub_block = None
+            if sub_block:
+                sub_label = f"[FOLDER SUMMARY: {sub.name or str(sub)}]"
+                already = any(lbl == sub_label
+                              for _prio, lbl, _content in candidates)
+                if not already:
+                    candidates.append((PRIO_FOLDER, sub_label, sub_block))
+                    print('[DEBUG inject] vault subfolder injected: '
+                          + str(sub), file=_sys_dbg.stderr)
+
     # -- Vault search (priority 5, droppable) -------------------------------
     # #4: when the user pasted explicit paths, trust them and skip vault
     # search entirely. The vault hits competed with the explicit file for
@@ -1193,11 +1481,23 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
         idx = _get_vault_index()
         if idx is not None:
             try:
-                idx.rebuild()
+                import council_engine as _ce_tim
+                with _ce_tim._TimingScope("vault.rebuild"):
+                    idx.rebuild()
                 # When analyst already answered (#7), reduce the vault-match
                 # pull from 5 to 1 — the analyst's CSV is the authoritative
                 # source and 5 fuzzy matches just consume budget.
-                k = 1 if analyst_block else 5
+                #
+                # K and TAIL_K both scale with n_ctx so a 4 K-ctx model
+                # doesn't get 5 × ~400-token VAULT MATCH blocks (2 KB just
+                # in matches, half its window). 8 K → 3 / 30, 16 K → 5 / 45.
+                if n_ctx <= 4096:
+                    base_k, base_tail = 2, 15
+                elif n_ctx <= 8192:
+                    base_k, base_tail = 3, 30
+                else:
+                    base_k, base_tail = 5, 45
+                k = 1 if analyst_block else base_k
                 # Semantic expansion via the local model: when a query
                 # term isn't in the vault's vocab, the index calls the
                 # model to ask "which of these vocab tokens belong in
@@ -1223,11 +1523,12 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                 # vs ~2000 tokens for 5 full blocks. The model now
                 # KNOWS the full set of matching files even when only
                 # a few get full content.
-                TAIL_K = 45
-                all_hits, fuzzy_matches = idx.search(
-                    user_text, k=k + TAIL_K, folder=folder_scope,
-                    llm_call=_semantic_llm_call,
-                )
+                TAIL_K = base_tail
+                with _ce_tim._TimingScope("vault.search"):
+                    all_hits, fuzzy_matches = idx.search(
+                        user_text, k=k + TAIL_K, folder=folder_scope,
+                        llm_call=_semantic_llm_call,
+                    )
                 # Drop any hit that's already explicit (won't happen
                 # in practice — we skip vault search entirely when
                 # explicit_paths is non-empty — but safe to keep the
@@ -1246,17 +1547,78 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                     print('[DEBUG inject] fuzzy: ' + repr(fuzzy_matches),
                           file=_sys_dbg.stderr)
 
-                # Full-content matches first — same as before.
-                for _score, rec in full_hits:
-                    vblock = idx.summary_block(rec)
-                    name = rec.get("name") or "?"
-                    candidates.append((PRIO_VAULT, f"[VAULT MATCH: {name}]", vblock))
+                # Decide between full [VAULT MATCH] blocks and compact
+                # search-headers, based on intent. Conceptual queries
+                # ("show me files about X", "find scripts that …") get
+                # one-line headers: the model sees a wider set of
+                # matches per token and can ask follow-up "tell me more
+                # about file Y" in the next turn — those references
+                # will trigger the zoom-in via pinned_files (see
+                # CouncilConsole._send wire-up).
+                use_search_headers = _wants_search_headers(user_text)
 
-                # Summary block — only when there's a tail to surface.
-                # If the search returned ≤k hits the model already sees
-                # everything; adding a redundant summary would just be
-                # noise.
-                if tail_hits:
+                # Pinned files from a previous turn — the user's last
+                # answer referenced these by name, so promote them out
+                # of headers mode into full blocks even when the
+                # current query looks conceptual. Pins expire after a
+                # few turns to avoid bloat (managed by the caller).
+                pinned_set = {str(n).lower() for n in (pinned_files or [])}
+
+                try:
+                    import council_engine as _ce_pack
+                    _count_tokens = _ce_pack.estimate_tokens
+                except Exception:
+                    _count_tokens = None
+                vault_block_budget = max(256, remaining // 2)
+
+                if use_search_headers and not pinned_set:
+                    # Pure headers mode — no per-file rich blocks.
+                    # Pack everything we found into one compact block.
+                    header_lines = ["[VAULT MATCHES (headers — ask about a "
+                                     "file by name to zoom in)]"]
+                    for score, rec in all_hits:
+                        header_lines.append("  • " + _build_search_header_block(rec, score))
+                    headers_block = "\n".join(header_lines)
+                    candidates.append((
+                        PRIO_VAULT, "[VAULT MATCHES — headers]", headers_block,
+                    ))
+                    print('[DEBUG inject] search-headers mode: '
+                          + str(len(all_hits)) + ' headers',
+                          file=_sys_dbg.stderr)
+                else:
+                    # Full-block mode (legacy + pinned-zoom path).
+                    # Split hits into "pinned" (always full) and
+                    # "everyone else" (headers if search-headers mode).
+                    pinned_recs = []
+                    other_full_hits = []
+                    for score, rec in full_hits:
+                        if str(rec.get("name", "")).lower() in pinned_set:
+                            pinned_recs.append(rec)
+                        else:
+                            other_full_hits.append((score, rec))
+
+                    packed_blocks, pack_diag = idx.assemble_match_blocks(
+                        pinned_recs + [rec for _s, rec in other_full_hits],
+                        budget_tokens=vault_block_budget,
+                        count_tokens=_count_tokens,
+                    )
+                    print('[DEBUG inject] vault match assembly: '
+                          + repr(pack_diag), file=_sys_dbg.stderr)
+                    ordered_recs = pinned_recs + [r for _s, r in other_full_hits]
+                    for rec, block in zip(ordered_recs, packed_blocks):
+                        name = rec.get("name") or "?"
+                        label_prefix = ("[VAULT MATCH (pinned): "
+                                        if str(name).lower() in pinned_set
+                                        else "[VAULT MATCH: ")
+                        candidates.append((PRIO_VAULT, f"{label_prefix}{name}]", block))
+
+                # Summary block — emitted ONLY when not in headers mode,
+                # because the headers block already covers the same
+                # ground (compact per-file listing). When tail_hits is
+                # empty the summary is redundant; when search-headers
+                # is on, ALL hits already render as headers, so the
+                # tail summary is also redundant.
+                if tail_hits and not use_search_headers:
                     summary_block = _build_vault_search_summary(
                         all_hits, full_count=len(full_hits),
                     )
@@ -1290,40 +1652,76 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
     # -- Assemble: priority sort, per-block cap, cumulative cap, tag --------
     candidates.sort(key=lambda t: t[0])
 
-    final_blocks = []
-    per_block_costs = []
+    placed: list = []   # list of (prio, label, capped, cost)
     dropped = []
     running = 0
-    # NO_DATA and ANALYST results are already curated (NO_DATA is tiny;
-    # analyst output is pre-capped at ~4000 chars by format_result_for_prompt).
-    # Trimming them risks deleting the answer the user actually asked for,
-    # so they are exempt from the per-block cap. EXPLICIT/FOLDER/VAULT are
-    # still capped because they can be arbitrarily large (a pasted 1GB CSV).
-    # NO_DATA, TASK_MEMO, and ANALYST blocks are exempt from the per-block
-    # cap. NO_DATA is tiny by construction. The task memo is intentionally
-    # short (~80 tokens) and trimming it would defeat the "remember the
-    # original question" guarantee. The analyst block is already capped at
-    # ~4KB by format_result_for_prompt; trimming further could elide the
-    # answer the user asked for.
+    # NO_DATA / TASK_MEMO / ANALYST are exempt from the per-block cap:
+    #   • NO_DATA is tiny by construction.
+    #   • TASK_MEMO is intentionally short (~80 tokens) and trimming it
+    #     would defeat the "remember the original question" guarantee.
+    #   • ANALYST is already capped at ~4 KB by format_result_for_prompt;
+    #     trimming further could elide the answer the user asked for.
+    # VAULT_SUMMARY is uncapped on the per-block axis (it scales with hits
+    # already) but DOES participate in cumulative-budget eviction below.
     UNCAPPED_PRIOS = {PRIO_NODATA, PRIO_TASK_MEMO, PRIO_ANALYST,
                       PRIO_VAULT_SUMMARY}
+    # Truly undroppable — these must reach the model no matter what.
+    # Everything else is sacrificeable in reverse-priority order if the
+    # cumulative budget gets blown by stacked non-droppable blocks (the
+    # old assembly let those overflow the window unconditionally).
+    HARD_KEEP = {PRIO_NODATA, PRIO_TASK_MEMO, PRIO_ANALYST}
     for (prio, label, content) in candidates:
         if prio in UNCAPPED_PRIOS:
             capped = content
         else:
             capped = _smart_truncate_block_to_tokens(content, per_block_cap)
         cost = _estimate_block_tokens(capped)
-        # Cumulative cap — only blocks at DROPPABLE_FROM or below are
-        # eligible for dropping. The NO_DATA marker, analyst result, and
-        # explicit user paths are always included even if budget is tight
-        # (the warning system will tell the user the prompt overflowed).
+        # First-pass cumulative gate — only droppable blocks are filtered
+        # here. Non-droppable ones go into `placed` unconditionally and
+        # the rescue pass below handles overflow.
         if prio >= DROPPABLE_FROM and running + cost > remaining:
             dropped.append((label, cost))
             continue
+        placed.append((prio, label, capped, cost))
+        running += cost
+
+    # -- Cumulative-overflow rescue ------------------------------------------
+    # The first pass enforces budget only for droppable blocks. If multiple
+    # non-droppable blocks (EXPLICIT / FOLDER / VAULT_SUMMARY) stack up on
+    # a small context window, `running` can still exceed `remaining` — the
+    # crash mode reported on the 4 K-ctx laptop. Walk back over the placed
+    # blocks in REVERSE priority order (lowest priority first), evicting
+    # until the budget fits. HARD_KEEP blocks are never evicted.
+    if running > remaining:
+        # Sort indices by descending priority (numerically higher = lower
+        # priority in our scheme), but keep the within-priority order
+        # stable (last-pasted block goes first within the same prio).
+        evictable_order = sorted(
+            range(len(placed)),
+            key=lambda i: (-placed[i][0], -i),
+        )
+        keep_mask = [True] * len(placed)
+        for i in evictable_order:
+            if running <= remaining:
+                break
+            prio_i, label_i, _capped_i, cost_i = placed[i]
+            if prio_i in HARD_KEEP:
+                continue
+            keep_mask[i] = False
+            dropped.append((label_i + " (budget overflow)", cost_i))
+            running -= cost_i
+        placed = [b for i, b in enumerate(placed) if keep_mask[i]]
+
+    # Re-sort by priority (eviction can reorder via mask removal — keep
+    # the assembled order priority-stable for the model).
+    placed.sort(key=lambda t: t[0])
+
+    final_blocks = []
+    per_block_costs = []
+    for prio, label, capped, cost in placed:
         tagged = _tag_block_header(capped, cost)
         final_blocks.append(tagged)
         per_block_costs.append((label, cost))
-        running += cost
 
     breakdown = {
         "costs":    per_block_costs,
@@ -1440,9 +1838,13 @@ def _detect_folder_scope(text):
 _VAULT_TRIGGER_PHRASES = (
     "look through", "search through", "find files", "find every", "find any",
     "every file", "any file with", "all files", "across files",
-    "in my vault", "in the vault", "from the vault",
+    "in my vault", "in the vault", "from the vault", "the vault folder",
+    "my vault folder", "vault folder", "vault directory", "the vault",
+    "data_in", "data folder", "input folder",
+    "what's in the vault", "whats in the vault", "what is in the vault",
     "files that contain", "files with", "which files",
-    "list files", "list of files", "scan", "index",
+    "list files", "list of files", "show files", "show me the files",
+    "show me what's", "scan", "index",
 )
 
 
@@ -1594,12 +1996,13 @@ def _run_analyst_step_impl(query):
     try:
         import council_engine as _ce
         # Backend-agnostic helper — works in both Ollama and GGUF modes.
-        raw = _ce.local_chat(
-            messages=[{'role': 'user', 'content': prompt}],
-            temperature=0.0,
-            num_predict=600,
-            timeout=90,
-        )
+        with _ce._TimingScope("analyst.codegen"):
+            raw = _ce.local_chat(
+                messages=[{'role': 'user', 'content': prompt}],
+                temperature=0.0,
+                num_predict=600,
+                timeout=90,
+            )
     except Exception as _e:
         msg = f"code generation failed: {_e!r}"
         print('[analyst] ' + msg, file=_sys_dbg.stderr)
@@ -1612,7 +2015,8 @@ def _run_analyst_step_impl(query):
         return _build_analyst_failure_block("(empty)", msg), msg, notices
     print('[analyst] generated code (first 300):\n' + code[:300], file=_sys_dbg.stderr)
 
-    result_df, log = _va.execute_pandas_code(code, allowed_folders)
+    with _ce._TimingScope("analyst.exec"):
+        result_df, log = _va.execute_pandas_code(code, allowed_folders)
     if result_df is None:
         # Extract the first traceback line for a concise transcript message.
         # The full log keeps the entire traceback for debugging in the block.
@@ -1620,16 +2024,24 @@ def _run_analyst_step_impl(query):
         print('[analyst] exec failed: ' + log[:400], file=_sys_dbg.stderr)
         return _build_analyst_failure_block(code, log), first_err, notices
 
-    # Old caps (30 rows / 4000 chars) silently truncated wide analyses —
-    # asking "average column X across all CSVs in folder Y" on a 100-file
-    # vault returned a DataFrame with 100 rows but the model only saw 30.
-    # Bump the in-prompt cap to 250 rows / 12,000 chars so the model can
-    # see most or all of a per-file aggregation result. The analyst
-    # block is exempt from the per-block cap (UNCAPPED_PRIOS) and below
-    # DROPPABLE_FROM, so even at this size it never competes with vault
-    # matches for budget.
+    # Budget-scaled rendering. The analyst block is exempt from the
+    # per-block cap (UNCAPPED_PRIOS) and below DROPPABLE_FROM, but
+    # giving it 12 KB worth of rows on a 4 K-ctx machine still eats the
+    # whole window. Cap at 25 % of n_ctx so a 4 K window gets ~1 K
+    # tokens for the analyst result and a 32 K window gets ~8 K.
+    # The renderer keeps head + tail and elides the middle, which
+    # preserves the summary rows pandas appends (Total / Mean / …)
+    # that the model needs to give a correct answer.
+    try:
+        _n_ctx_a = ce.get_n_ctx()
+    except Exception:
+        _n_ctx_a = 4096
+    analyst_max_tokens = max(150, _n_ctx_a // 4)
     table_text = _va.format_result_for_prompt(
-        result_df, max_rows=250, max_chars=12000,
+        result_df,
+        max_rows=250, max_chars=12000,
+        max_tokens=analyst_max_tokens,
+        count_tokens=ce.estimate_tokens,
     )
 
     # Build a separate USER-FACING render of the full result (or as
@@ -3441,6 +3853,58 @@ class CouncilConsole(tk.Tk):
         branding.apply_window_icon(self)
         self.geometry("1150x820")
         self.configure(bg="#1a1414")
+
+        # ── UI scaling ──────────────────────────────────────────────
+        # Tk's default scaling factor renders text small on a few
+        # common configurations: WSLg on Windows (always 96 DPI even
+        # when the host is 1.5×/2× scaled), HiDPI Linux without
+        # GDK_SCALE, and Windows native on a 4K monitor where Tkinter
+        # ignores the system DPI setting. The fonts in this codebase
+        # are hardcoded to size 9-11 — instead of editing dozens of
+        # widget creation sites, we lean on Tk's global scaling
+        # multiplier which applies to ALL widgets uniformly.
+        #
+        # COUNCIL_UI_SCALE env var lets the user pin a value; otherwise
+        # we auto-detect a sensible default (1.5 on WSL, 1.3 on Linux,
+        # OS default on Windows native).
+        try:
+            scale_env = os.environ.get("COUNCIL_UI_SCALE", "").strip()
+            if scale_env:
+                self._ui_scale = float(scale_env)
+            elif _is_wsl():
+                # WSLg always reports 96 DPI; users routinely want
+                # 1.5-2.0 for a comfortable read on a 4K Windows host.
+                self._ui_scale = 1.5
+            elif sys.platform.startswith("linux"):
+                self._ui_scale = 1.3
+            else:
+                self._ui_scale = float(self.tk.call("tk", "scaling"))
+        except Exception:
+            self._ui_scale = 1.0
+        try:
+            self.tk.call("tk", "scaling", self._ui_scale)
+        except Exception:
+            pass
+
+        # Ctrl+= / Ctrl+- (and Ctrl+0 to reset) bump the scaling
+        # multiplier at runtime — same convention as browsers. The new
+        # value persists for the session; pin it via COUNCIL_UI_SCALE
+        # to make it stick across launches.
+        self.bind_all("<Control-equal>",   lambda _e: self._adjust_ui_scale(+0.1))
+        self.bind_all("<Control-plus>",    lambda _e: self._adjust_ui_scale(+0.1))
+        self.bind_all("<Control-KP_Add>",  lambda _e: self._adjust_ui_scale(+0.1))
+        self.bind_all("<Control-minus>",   lambda _e: self._adjust_ui_scale(-0.1))
+        self.bind_all("<Control-KP_Subtract>", lambda _e: self._adjust_ui_scale(-0.1))
+        self.bind_all("<Control-Key-0>",   lambda _e: self._reset_ui_scale())
+
+        # Refresh the title bar with the chosen n_ctx + source as soon
+        # as the model loads. We poll at startup (n_ctx_status returns a
+        # preview before the model is loaded) and then on every chat
+        # turn (via _refresh_title_with_n_ctx). The user always sees the
+        # window size in a persistent location without needing to type
+        # 'context info'.
+        self._base_title = branding.window_title()
+        self.after(500, self._refresh_title_with_n_ctx)
 
         self.ui_q: queue.Queue = queue.Queue()
         # Pause/resume for personality clarification requests
@@ -10429,6 +10893,136 @@ class CouncilConsole(tk.Tk):
         except Exception:
             pass
 
+    # ── Filename pinning for search-headers zoom-in ──────────────────────
+    # When the model's previous turn referenced a vault file by name (e.g.
+    # "the closest match is orders.csv"), the user's natural follow-up is
+    # "tell me more about orders.csv". We want the next turn to inject the
+    # FULL [VAULT MATCH] block for that file even when search-headers
+    # mode is otherwise active. The pin set is per-CouncilConsole, keyed
+    # by filename (lowercased) with a turn-index expiry so a single
+    # mention doesn't permanently inflate the budget.
+    PIN_LIFETIME_TURNS = 3   # pin expires this many turns after creation
+
+    def _pin_state(self) -> Dict[str, int]:
+        """Lazy-init the pinned-files dict: {filename_lower: turn_added}."""
+        if not hasattr(self, "_pinned_files_map") or self._pinned_files_map is None:
+            self._pinned_files_map = {}
+        if not hasattr(self, "_pin_turn_counter") or self._pin_turn_counter is None:
+            self._pin_turn_counter = 0
+        return self._pinned_files_map
+
+    def _current_pinned_filenames(self) -> List[str]:
+        """Return the list of un-expired pinned filenames. Called by the
+        injection pipeline each turn; expires stale entries inline."""
+        pins = self._pin_state()
+        cur_turn = self._pin_turn_counter
+        # Expire pins older than PIN_LIFETIME_TURNS turns.
+        for name in list(pins.keys()):
+            if cur_turn - pins[name] >= self.PIN_LIFETIME_TURNS:
+                pins.pop(name, None)
+        return list(pins.keys())
+
+    def _update_pins_from_response(self, response_text: str) -> None:
+        """Scan the model's response for filename mentions of vault
+        files and pin any it sees. Called from _send after the model
+        replies but BEFORE the next turn's injection. The next turn's
+        injection picks up the pins and zooms the matching files into
+        full [VAULT MATCH] blocks.
+
+        We only pin names that resolve to actual vault records — no
+        false positives on names the model invented.
+        """
+        if not response_text:
+            self._pin_turn_counter = (self._pin_turn_counter or 0) + 1
+            return
+        try:
+            idx = _get_vault_index()
+        except Exception:
+            idx = None
+        if idx is None:
+            self._pin_turn_counter = (self._pin_turn_counter or 0) + 1
+            return
+        # Build a set of every record name in the vault index (lower-cased)
+        # for an O(1) membership check below.
+        try:
+            known = {str(rec.get("name", "")).lower()
+                     for rec in idx.records.values() if rec.get("name")}
+        except Exception:
+            known = set()
+        if not known:
+            self._pin_turn_counter = (self._pin_turn_counter or 0) + 1
+            return
+
+        # Find every plausible filename token in the response (anything
+        # containing a dot, length 3-80, alnum/punct chars). Cross-check
+        # against known vault names.
+        pins = self._pin_state()
+        cur_turn = self._pin_turn_counter
+        for m in _re.finditer(r"[\w\-]{1,60}\.[A-Za-z0-9]{1,8}", response_text):
+            tok = m.group(0).strip(",.;:!?)(\"' `").lower()
+            if tok and tok in known:
+                pins[tok] = cur_turn
+        # Advance the turn counter so the next call's expiry math is correct.
+        self._pin_turn_counter = cur_turn + 1
+
+    def _adjust_ui_scale(self, delta: float) -> None:
+        """Bump the Tk scaling multiplier by `delta`. Clamped to a
+        reasonable range so a stuck Ctrl+= doesn't blow up the layout."""
+        new_scale = max(0.6, min(4.0, self._ui_scale + delta))
+        self._apply_ui_scale(new_scale)
+
+    def _reset_ui_scale(self) -> None:
+        """Restore the auto-detected default scaling."""
+        try:
+            default = float(os.environ.get("COUNCIL_UI_SCALE", "0")) or (
+                1.5 if _is_wsl() else (1.3 if sys.platform.startswith("linux") else 1.0)
+            )
+        except Exception:
+            default = 1.0
+        self._apply_ui_scale(default)
+
+    def _apply_ui_scale(self, value: float) -> None:
+        self._ui_scale = value
+        try:
+            self.tk.call("tk", "scaling", value)
+        except Exception:
+            pass
+        # Surface the change in the title bar so the user knows the
+        # keybinding actually fired. _refresh_title_with_n_ctx will
+        # restore the n_ctx tag on its next tick.
+        try:
+            self.title(f"{self._base_title}  ·  UI scale {value:.2f}×")
+        except Exception:
+            pass
+
+    def _refresh_title_with_n_ctx(self):
+        """Update the window title bar with the current n_ctx + source so the
+        user always sees what context window they're working with — without
+        having to type 'context info' or check the launch log.
+
+        Re-polled periodically until the model is loaded (n_ctx_status returns
+        a preview value before first chat call), then once per minute as a
+        cheap drift check (env-var re-evaluation, model swap, etc.).
+        """
+        try:
+            import council_engine as _ce_title
+            status = _ce_title.n_ctx_status()
+            n_ctx = status.get("n_ctx", 0)
+            loaded = status.get("loaded", False)
+            tag = f"n_ctx={n_ctx:,}" if loaded else f"n_ctx={n_ctx:,} (preview)"
+            self.title(f"{self._base_title}  ·  {tag}")
+        except Exception:
+            pass
+        try:
+            # Poll faster until the model loads, then drift-check every 60 s.
+            delay = 60_000 if (_ce_title.n_ctx_status().get("loaded")) else 2_000
+        except Exception:
+            delay = 60_000
+        try:
+            self.after(delay, self._refresh_title_with_n_ctx)
+        except Exception:
+            pass
+
     def _append_transcript(self, who: str, text: str, kind: str = "final"):
         # Mirror to the per-session debug log first (write-only — the model
         # never reads conversation_logs/). This runs before the UI write
@@ -11590,9 +12184,17 @@ class CouncilConsole(tk.Tk):
             _n_ctx = ce.get_n_ctx()
         except Exception:
             _n_ctx = 4096
+        # Resolve the current pinned-file set (filenames the model
+        # referenced in a recent prior turn). Pins are stamped with the
+        # turn-index they were created on and expire after a few turns
+        # so the budget isn't permanently bloated by a one-off "show
+        # me X" reference. The pin store lives on self; this turn's
+        # number is just an incrementing counter.
+        _pinned_files = self._current_pinned_filenames()
         augmented, fuzzy_matches, _injection_breakdown = _inject_file_contents(
             user_text, analyst_block=_analyst_block, n_ctx=_n_ctx,
             task_memo_block=_task_memo_block,
+            pinned_files=_pinned_files,
         )
         self._last_injection_breakdown = _injection_breakdown
         # Surface defensive-wrapper failures to the transcript. When the
@@ -11657,8 +12259,11 @@ class CouncilConsole(tk.Tk):
             for _label, _cost in _dropped:
                 _msg_lines.append(f"  • {_label}  (~{_cost:,} tokens)")
             _msg_lines.append(
-                "(Analyst result and your explicit files are never dropped. "
-                "Type 'context info' for the full token breakdown.)"
+                "(Analyst result, task memo, and the NO-DATA marker are "
+                "never dropped. Explicit files / folder listings / vault "
+                "summary CAN be dropped on cumulative budget overflow — "
+                "raise COUNCIL_GGUF_N_CTX to keep them. Type 'context "
+                "info' for the full token breakdown.)"
             )
             self._append_transcript("Council", "\n".join(_msg_lines), "observation")
         user_text = augmented
@@ -12681,6 +13286,16 @@ class CouncilConsole(tk.Tk):
                     self._last_final_text  = _final
                     self._last_query_text  = _query
                     self._last_route       = _route
+                    # Scan this turn's final answer for vault filename
+                    # mentions and pin them for the next turn's
+                    # injection. The next user message can then say
+                    # "tell me more about orders.csv" and the injector
+                    # will zoom the file into a full [VAULT MATCH]
+                    # block even when search-headers mode is active.
+                    try:
+                        self._update_pins_from_response(_final)
+                    except Exception as _pin_err:
+                        print(f"[pin] update failed: {_pin_err!r}")
                     # Auto-save if LaTeX was requested
                     if _detect_latex_request(_query):
                         self._auto_save_latex(_final, _query)
