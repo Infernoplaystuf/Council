@@ -45,8 +45,9 @@ First launch shows a small setup wizard that confirms Ollama is running and poin
 
 ### Running on WSL (one-line setup, one-line launch)
 
-If you're on Windows 11 with WSL2 + an NVIDIA GPU, the two scripts in
-the repo root do it all:
+**See [`WSL-QUICKSTART.md`](WSL-QUICKSTART.md) for the full
+step-by-step.** The short version: if you're on Windows 11 with
+WSL2 + an NVIDIA GPU, the two scripts in the repo root do it all:
 
 ```bash
 # 1. one-time setup (creates conda env, picks the right CUDA wheels
