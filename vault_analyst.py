@@ -2798,6 +2798,18 @@ Rules:
 - Assign the final answer to a DataFrame named `result_df`.
 - No filesystem writes, no network, no subprocess, no eval/exec.
 - Prefer helpers over hand-rolled pandas when one fits.
+- PREFER AGGREGATIONS OVER RAW ROWS. The result is shown to a
+  language model with a tight context budget, so:
+  • `df.describe()`, `df.groupby(...).agg(...)`, `value_counts()`,
+    `df[col].mean()/sum()/count()`, scalar answers — strongly
+    preferred.
+  • Return raw rows only if the user explicitly asked for "rows",
+    "examples", or named specific records they want to see.
+  • When raw rows are warranted, cap at a small head/tail
+    (e.g. `df.head(10)` or top-N by ranking) and let the summary
+    do the heavy lifting.
+- Output one or two summary lines if a single scalar suffices —
+  e.g. `result_df = pd.DataFrame([{'metric': 'total_rows', 'value': N}])`.
 
 Examples:
 
@@ -3262,13 +3274,73 @@ def format_filename_hints(hints: List[Tuple[str, Optional[Path]]],
 # DataFrame -> prompt-friendly text
 # ============================================================
 
-def format_result_for_prompt(df: pd.DataFrame, *, max_rows: int = 30, max_chars: int = 4000) -> str:
+def format_result_for_prompt(
+    df: pd.DataFrame,
+    *,
+    max_rows: int = 30,
+    max_chars: int = 4000,
+    max_tokens: Optional[int] = None,
+    count_tokens: Optional[Any] = None,
+) -> str:
+    """Render an analyst DataFrame for prompt injection.
+
+    Truncation strategy (head + middle + tail) — pandas-style summary
+    rows ("Total" / "Mean" / "..." that helpers like ``describe()`` and
+    ``agg()`` append) tend to live at the TAIL of the result. Head-only
+    truncation throws them away. We keep the head AND the tail and elide
+    the middle so the model sees both the first rows and the
+    aggregations.
+
+    Budget knobs:
+      - ``max_rows`` / ``max_chars`` — legacy char-based caps (kept as
+        a hard backstop).
+      - ``max_tokens`` / ``count_tokens`` — token-aware cap when the
+        caller has the tokenizer in hand. When ``max_tokens`` is given,
+        we re-render with progressively fewer rows until the result
+        fits, or fall back to head+tail char truncation if even one
+        row exceeds the budget.
+    """
     if df is None or df.empty:
         return "(analyst returned an empty result)"
-    head = df.head(max_rows)
-    text = head.to_string(index=False)
-    if len(df) > len(head):
-        text += f"\n... ({len(df) - len(head)} more rows omitted)"
+
+    def _render_head_tail(d, n_head: int, n_tail: int) -> str:
+        total = len(d)
+        if n_head + n_tail >= total:
+            return d.to_string(index=False)
+        head = d.head(n_head)
+        tail = d.tail(n_tail)
+        head_txt = head.to_string(index=False)
+        # tail.to_string() repeats the header row; strip it so the
+        # output reads continuously.
+        tail_txt = tail.to_string(index=False)
+        tail_lines = tail_txt.split("\n", 1)
+        tail_body = tail_lines[1] if len(tail_lines) > 1 else tail_lines[0]
+        omitted = total - n_head - n_tail
+        return (head_txt + "\n... (" + str(omitted) + " row"
+                + ("s" if omitted != 1 else "") + " omitted from middle)\n"
+                + tail_body)
+
+    # Token-aware path — try progressively smaller head+tail splits
+    # until we fit. We bias toward keeping the TAIL (where summary rows
+    # live) by giving it slightly more rows than the head.
+    if max_tokens is not None and count_tokens is not None:
+        for n_head, n_tail in [(20, 20), (12, 12), (8, 8), (5, 5),
+                               (3, 3), (2, 2), (1, 1)]:
+            text = _render_head_tail(df, n_head, n_tail)
+            if count_tokens(text) <= max_tokens:
+                return text
+        # Even one head + one tail row blows the budget — fall through
+        # to the char-cap path below as a last resort.
+
+    # Char-based path (legacy default).
+    n_head = min(max_rows, max(1, len(df) - max_rows // 3))
+    n_tail = min(max_rows // 3, max(1, len(df) - n_head))
+    text = _render_head_tail(df, n_head, n_tail)
     if len(text) > max_chars:
-        text = text[:max_chars] + "\n... (truncated)"
+        # Last-resort char trim. Keep head + last few lines so summary
+        # rows still come through even when the row count is huge.
+        keep_head = int(max_chars * 0.7)
+        keep_tail = max_chars - keep_head - 64
+        text = (text[:keep_head] + "\n... (truncated middle)\n"
+                + text[-max(keep_tail, 0):]) if keep_tail > 0 else text[:max_chars]
     return text

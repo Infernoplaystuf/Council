@@ -2000,16 +2000,24 @@ def _run_analyst_step_impl(query):
         print('[analyst] exec failed: ' + log[:400], file=_sys_dbg.stderr)
         return _build_analyst_failure_block(code, log), first_err, notices
 
-    # Old caps (30 rows / 4000 chars) silently truncated wide analyses —
-    # asking "average column X across all CSVs in folder Y" on a 100-file
-    # vault returned a DataFrame with 100 rows but the model only saw 30.
-    # Bump the in-prompt cap to 250 rows / 12,000 chars so the model can
-    # see most or all of a per-file aggregation result. The analyst
-    # block is exempt from the per-block cap (UNCAPPED_PRIOS) and below
-    # DROPPABLE_FROM, so even at this size it never competes with vault
-    # matches for budget.
+    # Budget-scaled rendering. The analyst block is exempt from the
+    # per-block cap (UNCAPPED_PRIOS) and below DROPPABLE_FROM, but
+    # giving it 12 KB worth of rows on a 4 K-ctx machine still eats the
+    # whole window. Cap at 25 % of n_ctx so a 4 K window gets ~1 K
+    # tokens for the analyst result and a 32 K window gets ~8 K.
+    # The renderer keeps head + tail and elides the middle, which
+    # preserves the summary rows pandas appends (Total / Mean / …)
+    # that the model needs to give a correct answer.
+    try:
+        _n_ctx_a = ce.get_n_ctx()
+    except Exception:
+        _n_ctx_a = 4096
+    analyst_max_tokens = max(150, _n_ctx_a // 4)
     table_text = _va.format_result_for_prompt(
-        result_df, max_rows=250, max_chars=12000,
+        result_df,
+        max_rows=250, max_chars=12000,
+        max_tokens=analyst_max_tokens,
+        count_tokens=ce.estimate_tokens,
     )
 
     # Build a separate USER-FACING render of the full result (or as
