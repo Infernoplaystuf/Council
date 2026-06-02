@@ -3693,6 +3693,15 @@ class CouncilConsole(tk.Tk):
         self.geometry("1150x820")
         self.configure(bg="#1a1414")
 
+        # Refresh the title bar with the chosen n_ctx + source as soon
+        # as the model loads. We poll at startup (n_ctx_status returns a
+        # preview before the model is loaded) and then on every chat
+        # turn (via _refresh_title_with_n_ctx). The user always sees the
+        # window size in a persistent location without needing to type
+        # 'context info'.
+        self._base_title = branding.window_title()
+        self.after(500, self._refresh_title_with_n_ctx)
+
         self.ui_q: queue.Queue = queue.Queue()
         # Pause/resume for personality clarification requests
         self._pause_event = threading.Event()
@@ -10677,6 +10686,34 @@ class CouncilConsole(tk.Tk):
             pass
         try:
             self.after(30_000, self._periodic_log_flush)
+        except Exception:
+            pass
+
+    def _refresh_title_with_n_ctx(self):
+        """Update the window title bar with the current n_ctx + source so the
+        user always sees what context window they're working with — without
+        having to type 'context info' or check the launch log.
+
+        Re-polled periodically until the model is loaded (n_ctx_status returns
+        a preview value before first chat call), then once per minute as a
+        cheap drift check (env-var re-evaluation, model swap, etc.).
+        """
+        try:
+            import council_engine as _ce_title
+            status = _ce_title.n_ctx_status()
+            n_ctx = status.get("n_ctx", 0)
+            loaded = status.get("loaded", False)
+            tag = f"n_ctx={n_ctx:,}" if loaded else f"n_ctx={n_ctx:,} (preview)"
+            self.title(f"{self._base_title}  ·  {tag}")
+        except Exception:
+            pass
+        try:
+            # Poll faster until the model loads, then drift-check every 60 s.
+            delay = 60_000 if (_ce_title.n_ctx_status().get("loaded")) else 2_000
+        except Exception:
+            delay = 60_000
+        try:
+            self.after(delay, self._refresh_title_with_n_ctx)
         except Exception:
             pass
 
