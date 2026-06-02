@@ -229,9 +229,16 @@ def _parse_filter(token_value: str) -> Optional[Filter]:
     if not m:
         return None
     kind = m.group("kind").lower()
-    op   = (m.group("op") or "==").replace("=", "==") if not m.group("op") else m.group("op")
-    if op == "=" or op == "==":
+    # Normalise the op: missing op defaults to "==", bare "=" becomes "==".
+    # The previous one-liner ran `(... or "==").replace("=", "==")` which
+    # mangled the default into "====" (each "=" doubled), and the downstream
+    # _cmp then fell through to `return True` — so `size:5mb` (no operator)
+    # silently no-op'd as a filter. Plain if/else makes the intent obvious.
+    op_raw = m.group("op")
+    if not op_raw or op_raw == "=":
         op = "=="
+    else:
+        op = op_raw
     val_raw = m.group("val")
     if kind == "size":
         size = _parse_size(val_raw)

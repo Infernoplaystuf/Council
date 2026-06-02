@@ -98,6 +98,13 @@ _BOOKKEEPING_FILENAMES = {
     SEMANTIC_CACHE_FILENAME,
     "backend_settings.json",   # GGUF model path; not user data
     ".onboarded",              # onboarding marker
+    # Performance sidecars added by 95aa6d4 / 00e0b47. The col-index
+    # is a .json file, so without this exclusion the rebuild walk
+    # picks it up via _PARSEABLE, indexes column-name keys back into
+    # the vocab, AND rewrites the file every refresh — which moves
+    # its mtime and forces a perpetual re-index loop.
+    ".vault_col_index.json",
+    "data_index_cache.pickle",
 }
 
 # Fuzzy match defaults — Levenshtein-style ratio via difflib.
