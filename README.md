@@ -43,7 +43,46 @@ python council_gui_engine.py
 
 First launch shows a small setup wizard that confirms Ollama is running and points at the right model. After that you're done.
 
-If you want the bundled `.exe` instead of running from source:
+### Running on WSL (one-line setup, one-line launch)
+
+If you're on Windows 11 with WSL2 + an NVIDIA GPU, the two scripts in
+the repo root do it all:
+
+```bash
+# 1. one-time setup (creates conda env, picks the right CUDA wheels
+#    for your GPU automatically, installs every dep)
+./setup-wsl.sh
+
+# 2. every launch after that
+./run-wsl.sh
+```
+
+`run-wsl.sh` finds a `.gguf` model in `~/models/`, `~/Downloads/`,
+`./models/`, or `/mnt/c/Users/<you>/models/` automatically. To pin
+a specific path:
+
+```bash
+COUNCIL_GGUF_PATH=~/models/phi-4.gguf ./run-wsl.sh
+```
+
+Force CPU-only (useful for sanity-checking when the GPU path crashes):
+
+```bash
+COUNCIL_GGUF_GPU_LAYERS=0 ./run-wsl.sh
+```
+
+Bigger text (WSLg renders at 96 DPI by default):
+
+```bash
+COUNCIL_UI_SCALE=1.8 ./run-wsl.sh
+```
+
+If `./setup-wsl.sh` fails or you need to choose the CUDA tier
+manually, the full per-card breakdown is in `installs.txt` —
+Section F covers WSL specifically; Sections A-E cover native
+Windows + native Linux.
+
+### Building the bundled `.exe`
 
 ```bash
 pip install pyinstaller
