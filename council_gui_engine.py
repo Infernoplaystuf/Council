@@ -650,6 +650,102 @@ def _render_excel_block(p, char_limit):
     return content
 
 
+def _render_folder_summary_compact(folder, max_files=120, max_chars=3500):
+    """Compact folder summary — counts + subfolder breakdown + filename
+    list. No per-file column previews / sheet names / file heads.
+
+    Used by the vault-trigger auto-injection so a small-context model
+    (e.g. 4 K window) doesn't get its entire prompt budget eaten by one
+    rich folder block. About 5-10× smaller than _render_folder_for_injection
+    on the same vault.
+
+    Returns ``None`` when the folder is missing — caller treats as a
+    no-op and skips the block.
+    """
+    folder = Path(folder)
+    if not folder.exists() or not folder.is_dir():
+        return None
+
+    try:
+        import conversation_logger as _cl
+    except Exception:
+        _cl = None
+
+    SKIP_DIRS = {"__pycache__", ".git", ".venv", "venv", "node_modules"}
+    # Higher than the rich renderer's 5K — we don't parse files, so
+    # walking 10K dir entries is still cheap.
+    SCAN_LIMIT = 10000
+
+    from collections import defaultdict as _dd
+    files: list = []
+    subfolders: dict = _dd(int)
+    by_suffix: dict = _dd(int)
+    scanned = 0
+    walk_truncated = False
+    for p in folder.rglob("*"):
+        scanned += 1
+        if scanned > SCAN_LIMIT:
+            walk_truncated = True
+            break
+        if not p.is_file():
+            continue
+        try:
+            rel = p.relative_to(folder)
+        except ValueError:
+            continue
+        if any(part in SKIP_DIRS or part.startswith(".")
+               for part in rel.parts[:-1]):
+            continue
+        if _cl is not None:
+            try:
+                if _cl.is_protected_path(p, folder.parent):
+                    continue
+            except Exception:
+                pass
+        if len(rel.parts) > 1:
+            subfolders[rel.parts[0]] += 1
+        suf = p.suffix.lower() or "(no ext)"
+        by_suffix[suf] += 1
+        files.append(rel)
+
+    total = len(files)
+    total_label = f"{total}" + ("+" if walk_truncated else "")
+    lines = [f"[FOLDER SUMMARY: {folder.name or folder}]"]
+    lines.append(f"Total files: {total_label}"
+                 + (f" (walked first {SCAN_LIMIT:,} entries — more may exist)"
+                    if walk_truncated else ""))
+
+    if subfolders:
+        lines.append("")
+        lines.append("Subfolder file counts:")
+        for sub, count in sorted(subfolders.items(),
+                                  key=lambda x: (-x[1], x[0]))[:30]:
+            lines.append(f"  {sub}/: {count} file{'s' if count != 1 else ''}")
+        if len(subfolders) > 30:
+            lines.append(f"  ... ({len(subfolders) - 30} more subfolders)")
+
+    if by_suffix:
+        type_bits = [f"{s}: {c}" for s, c
+                     in sorted(by_suffix.items(), key=lambda x: -x[1])[:12]]
+        lines.append("")
+        lines.append("Files by type: " + ", ".join(type_bits))
+
+    if files:
+        lines.append("")
+        shown = files[:max_files]
+        lines.append(f"Files (first {len(shown)} of {total}):")
+        for f in shown:
+            lines.append(f"  {f}")
+        if total > max_files:
+            lines.append(f"  ... ({total - max_files} more files not shown — "
+                         f"ask about specific files or subfolders.)")
+
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text, _ = _smart_truncate_text(text, max_chars)
+    return text
+
+
 def _render_folder_for_injection(folder, max_files=40, max_chars=12000):
     """Build a comprehensive [FOLDER: ...] injection block listing every
     file in the folder. For tabular files, include headers + first 3
@@ -1145,7 +1241,13 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
     # renderers already cap themselves at ~12KB (~3,000 tokens), so the
     # cap floor of 2048 tokens means well-behaved blocks pass through
     # untouched while a runaway block still gets trimmed.
-    per_block_cap = max(2048, n_ctx // 4)
+    # Per-block cap. Was max(2048, n_ctx // 4) which floored at 2048 for
+    # n_ctx <= 8192 — meaning a single non-droppable block could eat 50%
+    # of a 4K context, and several stacked could push past the window
+    # entirely (the assembly only drops blocks at DROPPABLE_FROM and
+    # above). Scale linearly with n_ctx so a 4K-ctx model gets ~512-token
+    # blocks while a 32K-ctx model still gets 5K-token blocks.
+    per_block_cap = max(512, n_ctx // 6)
     reply_reserve = max(256, int(n_ctx * 0.25))
     safe_input = max(1, n_ctx - reply_reserve)
     user_cost = _estimate_block_tokens(user_text)
@@ -1205,45 +1307,51 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
 
     # -- Vault folder context (priority 4) ----------------------------------
     # When the user mentions "the vault", "my vault", "vault folder", etc.
-    # but didn't paste an explicit path, inject the data_in/ inventory as
-    # a [FOLDER: ...] block so the model knows what files exist. Without
-    # this, vault search may return zero matches for generic queries
-    # ("show me what's in the vault") and the model defaults to "I don't
-    # have access to your filesystem" — which is exactly the bug users
-    # report. We only inject when no explicit folder block already covers
-    # the vault to avoid duplicate inventory listings.
-    if _vault_search_keywords(user_text) and not explicit_paths:
+    # but didn't paste an explicit path, inject a COMPACT data_in/ summary
+    # (counts + subfolder breakdown + filename list — no per-file column
+    # previews) so the model knows what files exist. Without this, vault
+    # search may return zero matches for generic queries ("show me what's
+    # in the vault") and the model defaults to "I don't have access to
+    # your filesystem".
+    #
+    # Skipped when:
+    #   • the user pasted an explicit path (FILE/FOLDER block already
+    #     covers their intent)
+    #   • the analyst block is present (analyst has authoritative counts;
+    #     adding a second full listing wastes the prompt budget — this
+    #     was the crash trigger on the 4K-ctx laptop: "how many files in
+    #     data_in" → analyst answers, then injection ALSO rendered the
+    #     full folder = 3K+ tokens of duplicate context.)
+    #
+    # Compact renderer caps at ~3.5 KB even on 1000-file vaults, so a
+    # 4 K-ctx model has headroom for the user text + reply reserve.
+    if (_vault_search_keywords(user_text)
+            and not explicit_paths
+            and analyst_block is None):
         try:
             import data_index as _di
             vault_data_in = _di.input_dir(VAULT_DIR)
         except Exception:
             vault_data_in = VAULT_DIR
         try:
-            vault_folder_block = _render_folder_for_injection(vault_data_in)
+            vault_folder_block = _render_folder_summary_compact(vault_data_in)
         except Exception as _e:
             print('[DEBUG inject] vault folder render failed: ' + repr(_e),
                   file=_sys_dbg.stderr)
             vault_folder_block = None
         if vault_folder_block:
+            vf_label = f"[FOLDER SUMMARY: {Path(vault_data_in).name or str(vault_data_in)}]"
             already_have_vault_folder = any(
-                lbl == f"[FOLDER: {Path(vault_data_in).name or str(vault_data_in)}]"
-                for _prio, lbl, _content in candidates
+                lbl == vf_label for _prio, lbl, _content in candidates
             )
             if not already_have_vault_folder:
-                candidates.append((
-                    PRIO_FOLDER,
-                    f"[FOLDER: {Path(vault_data_in).name or str(vault_data_in)}]",
-                    vault_folder_block,
-                ))
+                candidates.append((PRIO_FOLDER, vf_label, vault_folder_block))
                 print('[DEBUG inject] vault folder injected: '
                       + str(vault_data_in), file=_sys_dbg.stderr)
 
         # Sub-folder reference: user said something like "look in the
-        # projects subfolder" or "files in Q3_2024". Resolve via the
-        # analyst's existing fuzzy hint resolver and inject that
-        # subfolder's full listing. This is what makes "look at the
-        # Foo subfolder within the vault" actually show contents
-        # instead of triggering "I can't see file paths."
+        # projects subfolder" or "files in Q3_2024". Compact-render
+        # that subfolder so the user gets focused context.
         try:
             import vault_analyst as _va_sub
             sub = _va_sub.resolve_subfolder_hint(user_text, vault_data_in)
@@ -1251,11 +1359,11 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
             sub = None
         if sub is not None and sub != vault_data_in:
             try:
-                sub_block = _render_folder_for_injection(sub)
+                sub_block = _render_folder_summary_compact(sub)
             except Exception:
                 sub_block = None
             if sub_block:
-                sub_label = f"[FOLDER: {sub.name or str(sub)}]"
+                sub_label = f"[FOLDER SUMMARY: {sub.name or str(sub)}]"
                 already = any(lbl == sub_label
                               for _prio, lbl, _content in candidates)
                 if not already:
