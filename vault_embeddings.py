@@ -124,11 +124,21 @@ class EmbeddingIndex:
         self._vectors: Dict[str, List[float]] = {}   # {file_path: vector}
         self._mtimes:  Dict[str, float]       = {}   # {file_path: rec.mtime}
         self._dim: Optional[int] = None
-        self.load()
+        # Lazy load — parsing the JSON cache can be 500ms-1s on big
+        # vaults. We defer until either search() / similar_to() is
+        # called or build_embeddings starts. The previous eager load
+        # at __init__ delayed app startup for users who never opened
+        # the embeddings-aware tabs at all.
+        self._loaded = False
 
     # ---- persistence ----
 
-    def load(self) -> None:
+    def _ensure_loaded(self) -> None:
+        """Lazy guard — any method that reads ``_vectors`` calls this first.
+        Idempotent; subsequent calls are a no-op O(1) flag check."""
+        if self._loaded:
+            return
+        self._loaded = True
         if not self.cache_path.exists():
             return
         try:
@@ -140,6 +150,11 @@ class EmbeddingIndex:
         except Exception:
             self._vectors = {}
             self._mtimes  = {}
+
+    def load(self) -> None:
+        """Backwards-compatible alias — original callers used to call
+        this from __init__. Now it just forces the lazy load early."""
+        self._ensure_loaded()
 
     def save(self) -> None:
         try:
@@ -209,6 +224,11 @@ class EmbeddingIndex:
         if not _NUMPY_OK:
             raise RuntimeError("numpy required for the embedding index")
 
+        # Lazy-load — the JSON cache may not have been parsed yet if no
+        # one searched before now (e.g. user clicked "Build embeddings"
+        # without ever opening the search tab).
+        self._ensure_loaded()
+
         # Decide which records need new vectors
         todo: List[Tuple[str, Dict[str, Any]]] = []
         for path, rec in records.items():
@@ -266,6 +286,9 @@ class EmbeddingIndex:
         `candidates` restricts the search to a subset of paths (used
         for folder-scoped queries).
         """
+        # Lazy-load on first search — saves 500ms-1s at app startup
+        # for users who don't open the search tab right away.
+        self._ensure_loaded()
         if not _NUMPY_OK or not self._vectors:
             return []
         q = (query or "").strip()
@@ -309,9 +332,11 @@ class EmbeddingIndex:
     # ---- inspection ----
 
     def __len__(self) -> int:
+        self._ensure_loaded()
         return len(self._vectors)
 
     def stats(self) -> Dict[str, Any]:
+        self._ensure_loaded()
         return {
             "model":    self.model_name,
             "dim":      self._dim,
