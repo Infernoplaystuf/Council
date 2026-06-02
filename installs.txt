@@ -398,6 +398,54 @@ python -c "import torch, llama_cpp, chromadb, sentence_transformers, pandas, ope
 #    if your target is Windows. PyInstaller produces ELF binaries
 #    in WSL. Build the .exe in Windows native (Section B/C/D) and
 #    use WSL only for dev runs / large-dataset testing.
+#
+#  - "Illegal instruction (core dumped)" on model load
+#    The most common WSL crash. The prebuilt CUDA wheels for
+#    llama-cpp-python (from abetlen's index) assume the host CPU
+#    supports AVX2 + F16C. WSL inherits the Windows CPU feature
+#    set, but a few configurations end up without one of those
+#    flags exposed to the Linux side:
+#       - Older CPUs that lack AVX2 entirely (pre-Haswell Intel,
+#         pre-Excavator AMD).
+#       - VMs nested inside Hyper-V where the hypervisor masks
+#         feature flags from the guest.
+#       - Some corporate-managed Windows installs that disable
+#         hardware virt features via group policy.
+#
+#    Diagnose: in the WSL shell, run
+#        grep -o 'avx2\|f16c' /proc/cpuinfo | sort -u
+#    If both `avx2` and `f16c` print, the wheel SHOULD work — and
+#    the crash is something else (read on). If either is missing,
+#    that's the cause.
+#
+#    The app's GGUF loader now prints a CPU feature line at
+#    startup, like:
+#        [CPU] features include avx=True avx2=True f16c=True ...
+#    If avx2=False appears, the next line will be a SIGILL warning.
+#
+#    Fix path 1 — rebuild llama-cpp from source WITHOUT AVX2:
+#        pip uninstall -y llama-cpp-python
+#        CMAKE_ARGS="-DGGML_AVX2=OFF -DGGML_F16C=OFF -DGGML_CUDA=ON" \
+#            pip install llama-cpp-python --no-binary llama-cpp-python
+#    The compile takes 5-15 min on the GPU sections. This produces
+#    a wheel matched to your exact CPU + GPU.
+#
+#    Fix path 2 — if it crashed but `avx2` IS present, it's almost
+#    certainly the CUDA wheel-vs-driver mismatch instead. The
+#    Llama() constructor SIGILL'd inside a CUDA op. Verify with:
+#        nvidia-smi                         # confirms host driver
+#        python -c "import torch; print(torch.cuda.is_available(), \
+#                                       torch.version.cuda)"
+#    If torch.version.cuda is 12.4 but the driver shows CUDA 12.1,
+#    downgrade torch to cu121 (Section B) — `cu124` needs driver
+#    545+. Same logic for cu128 → driver 570+.
+#
+#    Fix path 3 — bypass GPU entirely as a fast sanity check:
+#        export COUNCIL_GGUF_GPU_LAYERS=0
+#        python council_gui_engine.py
+#    If the app starts cleanly on CPU, the crash was definitely
+#    in the GPU path (driver mismatch or CUDA op SIGILL). If it
+#    STILL crashes on CPU, you're in fix path 1.
 
 
 # ─────────────────────────────────────────────────────────────

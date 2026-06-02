@@ -779,6 +779,50 @@ def _get_gguf_model():
         # the n_gpu_layers line to tell the user what happened.
         pass
 
+    # ── CPU feature probe (Linux + WSL only) ────────────────────────────
+    # llama-cpp-python's prebuilt wheels assume AVX2 + F16C. When the
+    # host CPU lacks one of these (most often: a VM with `-cpu host`
+    # passing through an older feature set, or an old desktop), the
+    # library raises SIGILL ("illegal instruction") on the very first
+    # tensor op. The crash leaves no Python traceback and looks like
+    # a generic core dump.
+    #
+    # We print the feature flags here BEFORE calling Llama() so the
+    # user sees what their CPU advertises — if AVX2 is missing the
+    # crash message immediately below makes the cause obvious. Skipped
+    # on Windows native (the wheels there target wider CPU baselines)
+    # and on systems where /proc/cpuinfo isn't readable.
+    cpu_features: List[str] = []
+    try:
+        if sys.platform.startswith("linux"):
+            with open("/proc/cpuinfo", "r", encoding="utf-8",
+                      errors="ignore") as fh:
+                for line in fh:
+                    if line.startswith("flags") or line.startswith("Features"):
+                        cpu_features = line.split(":", 1)[1].strip().split()
+                        break
+    except Exception:
+        cpu_features = []
+    needed = ("avx2", "f16c")
+    missing = [f for f in needed if f not in cpu_features]
+    if cpu_features:
+        _LOG.info("[CPU] features include avx=%s avx2=%s f16c=%s avx512f=%s",
+                  "avx" in cpu_features,
+                  "avx2" in cpu_features,
+                  "f16c" in cpu_features,
+                  "avx512f" in cpu_features)
+        if missing:
+            warning = (
+                f"[CPU] WARNING: this CPU is MISSING {missing} which the "
+                "prebuilt llama-cpp-python wheels assume. The next "
+                "tensor op will likely crash with SIGILL / 'illegal "
+                "instruction' / core dumped. Rebuild llama-cpp from "
+                "source with the missing flags disabled — see "
+                "installs.txt 'illegal instruction' section."
+            )
+            _LOG.warning(warning)
+            print(warning, flush=True)
+
     print(f"[GGUF] Loading {p.name} (n_ctx={n_ctx:,}, n_threads={n_threads}, "
           f"n_gpu_layers={n_gpu_layers}){gpu_diag}", flush=True)
     if n_gpu_layers > 0 and "GPU=none" in gpu_diag:
@@ -786,6 +830,18 @@ def _get_gguf_model():
               "llama-cpp will fall back to CPU. To force CPU only and "
               "silence this warning, set COUNCIL_GGUF_GPU_LAYERS=0.",
               flush=True)
+    # Breadcrumb: flush stderr/stdout BEFORE the C-extension call so a
+    # SIGILL inside Llama() doesn't swallow the last "we got this far"
+    # log line. Without this, an illegal-instruction crash inside
+    # llama-cpp leaves the user with no Python output to diagnose.
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+    _LOG.info("[GGUF] About to call Llama() — if the process exits here "
+              "with no further output, the C extension SIGILL'd. Check "
+              "the CPU feature flags above.")
     _GGUF_MODEL_INSTANCE = Llama(
         model_path=str(p),
         n_ctx=n_ctx,

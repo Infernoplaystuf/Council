@@ -288,6 +288,23 @@ def _strip_code_blocks(text: str) -> str:
 # contents so every council member sees the actual data rather than
 # hallucinating about it.
 
+def _is_wsl() -> bool:
+    """True when running inside WSL (any flavour). Used to pick a higher
+    default Tk scaling factor — WSLg always reports 96 DPI even when the
+    Windows host is at 150 % / 200 % scaling, so Tkinter widgets render
+    tiny without an explicit multiplier."""
+    try:
+        if "microsoft" in (os.uname().release or "").lower():  # type: ignore[attr-defined]
+            return True
+    except Exception:
+        pass
+    try:
+        with open("/proc/version", "r", encoding="utf-8", errors="ignore") as fh:
+            return "microsoft" in fh.read().lower()
+    except Exception:
+        return False
+
+
 _FILE_PATH_RE = _re.compile(r'[a-zA-Z]:[/\\]\S+|/\S+')
 _FILE_READ_CHAR_LIMIT = 12000  # total chars per file in the injected block
 
@@ -3836,6 +3853,49 @@ class CouncilConsole(tk.Tk):
         branding.apply_window_icon(self)
         self.geometry("1150x820")
         self.configure(bg="#1a1414")
+
+        # ── UI scaling ──────────────────────────────────────────────
+        # Tk's default scaling factor renders text small on a few
+        # common configurations: WSLg on Windows (always 96 DPI even
+        # when the host is 1.5×/2× scaled), HiDPI Linux without
+        # GDK_SCALE, and Windows native on a 4K monitor where Tkinter
+        # ignores the system DPI setting. The fonts in this codebase
+        # are hardcoded to size 9-11 — instead of editing dozens of
+        # widget creation sites, we lean on Tk's global scaling
+        # multiplier which applies to ALL widgets uniformly.
+        #
+        # COUNCIL_UI_SCALE env var lets the user pin a value; otherwise
+        # we auto-detect a sensible default (1.5 on WSL, 1.3 on Linux,
+        # OS default on Windows native).
+        try:
+            scale_env = os.environ.get("COUNCIL_UI_SCALE", "").strip()
+            if scale_env:
+                self._ui_scale = float(scale_env)
+            elif _is_wsl():
+                # WSLg always reports 96 DPI; users routinely want
+                # 1.5-2.0 for a comfortable read on a 4K Windows host.
+                self._ui_scale = 1.5
+            elif sys.platform.startswith("linux"):
+                self._ui_scale = 1.3
+            else:
+                self._ui_scale = float(self.tk.call("tk", "scaling"))
+        except Exception:
+            self._ui_scale = 1.0
+        try:
+            self.tk.call("tk", "scaling", self._ui_scale)
+        except Exception:
+            pass
+
+        # Ctrl+= / Ctrl+- (and Ctrl+0 to reset) bump the scaling
+        # multiplier at runtime — same convention as browsers. The new
+        # value persists for the session; pin it via COUNCIL_UI_SCALE
+        # to make it stick across launches.
+        self.bind_all("<Control-equal>",   lambda _e: self._adjust_ui_scale(+0.1))
+        self.bind_all("<Control-plus>",    lambda _e: self._adjust_ui_scale(+0.1))
+        self.bind_all("<Control-KP_Add>",  lambda _e: self._adjust_ui_scale(+0.1))
+        self.bind_all("<Control-minus>",   lambda _e: self._adjust_ui_scale(-0.1))
+        self.bind_all("<Control-KP_Subtract>", lambda _e: self._adjust_ui_scale(-0.1))
+        self.bind_all("<Control-Key-0>",   lambda _e: self._reset_ui_scale())
 
         # Refresh the title bar with the chosen n_ctx + source as soon
         # as the model loads. We poll at startup (n_ctx_status returns a
@@ -10904,6 +10964,36 @@ class CouncilConsole(tk.Tk):
                 pins[tok] = cur_turn
         # Advance the turn counter so the next call's expiry math is correct.
         self._pin_turn_counter = cur_turn + 1
+
+    def _adjust_ui_scale(self, delta: float) -> None:
+        """Bump the Tk scaling multiplier by `delta`. Clamped to a
+        reasonable range so a stuck Ctrl+= doesn't blow up the layout."""
+        new_scale = max(0.6, min(4.0, self._ui_scale + delta))
+        self._apply_ui_scale(new_scale)
+
+    def _reset_ui_scale(self) -> None:
+        """Restore the auto-detected default scaling."""
+        try:
+            default = float(os.environ.get("COUNCIL_UI_SCALE", "0")) or (
+                1.5 if _is_wsl() else (1.3 if sys.platform.startswith("linux") else 1.0)
+            )
+        except Exception:
+            default = 1.0
+        self._apply_ui_scale(default)
+
+    def _apply_ui_scale(self, value: float) -> None:
+        self._ui_scale = value
+        try:
+            self.tk.call("tk", "scaling", value)
+        except Exception:
+            pass
+        # Surface the change in the title bar so the user knows the
+        # keybinding actually fired. _refresh_title_with_n_ctx will
+        # restore the n_ctx tag on its next tick.
+        try:
+            self.title(f"{self._base_title}  ·  UI scale {value:.2f}×")
+        except Exception:
+            pass
 
     def _refresh_title_with_n_ctx(self):
         """Update the window title bar with the current n_ctx + source so the
