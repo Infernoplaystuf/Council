@@ -7,6 +7,12 @@ that is the conda env + torch download).
 You need a Windows 11 machine with an NVIDIA GPU. (Win 10 also
 works but needs an X server — covered at the end.)
 
+> **Never used WSL / Linux terminals before?** Read
+> [Appendix A — WSL crash course](#appendix-a--wsl-crash-course)
+> at the bottom first. Five minutes of background that makes
+> every command below make sense. You can come back to step 1
+> after.
+
 ---
 
 ## 1. Make sure WSL2 is installed
@@ -380,3 +386,207 @@ COUNCIL_GGUF_N_CTX_DEBUG=1 ./run-wsl.sh 2>&1 | tee ~/council-launch.log
 ```
 
 — then look at `~/council-launch.log` for the diagnostic.
+
+
+---
+
+## Appendix A — WSL crash course
+
+If you've never opened a Linux terminal before, here's the
+five-minute version of everything you need to follow the steps
+above. Read it once; you'll probably never need this section again.
+
+### What you see when WSL opens
+
+Click **Ubuntu** in the Start menu and a black window appears with
+a line that looks like:
+
+```
+yourname@DESKTOP-ABC123:~$
+```
+
+That's the **shell prompt**. Breaking it down:
+
+- `yourname` — your Linux username (you picked it on first launch).
+- `DESKTOP-ABC123` — your Windows machine name.
+- `~` — your current location. `~` is shorthand for your home
+  folder, `/home/yourname`. It changes as you move around.
+- `$` — the "ready for a command" signal. When you type, the
+  cursor sits to the right of it.
+
+You type a command, press Enter, output appears, the prompt comes
+back, repeat. That's all a terminal does.
+
+### Five commands that cover 95 % of what you'll need
+
+| Command         | What it does                                         |
+|-----------------|------------------------------------------------------|
+| `pwd`           | **P**rint **w**orking **d**irectory — "where am I right now?" |
+| `ls`            | **L**i**s**t the files in the current folder        |
+| `ls -la`        | Same, but show hidden files + sizes + permissions   |
+| `cd foldername` | **C**hange **d**irectory — go into `foldername`     |
+| `cd ..`         | Go up one folder                                    |
+| `cd ~`          | Jump back to your home folder                       |
+| `cd -`          | Jump back to the previous folder you were in        |
+| `cat filename`  | Print a text file to the screen                     |
+| `nano filename` | Edit a text file (Ctrl-X to exit, Y to save)        |
+
+Example walkthrough — open Ubuntu, then type each of these:
+
+```bash
+pwd                    # prints /home/yourname
+ls                     # lists files in your home folder
+mkdir test             # makes a folder called "test"
+cd test                # goes into it
+pwd                    # prints /home/yourname/test
+cd ..                  # back to home
+rmdir test             # removes the empty folder
+```
+
+### Paths — Linux vs Windows
+
+Linux uses forward slashes `/`, Windows uses backslashes `\`.
+Inside WSL you always use forward slashes.
+
+| Where it lives                | How you refer to it in WSL                  |
+|-------------------------------|---------------------------------------------|
+| Your Linux home folder        | `~`  or  `/home/yourname`                  |
+| `C:\Users\you\Documents` (Windows) | `/mnt/c/Users/you/Documents`           |
+| `D:\stuff` (Windows D drive)  | `/mnt/d/stuff`                              |
+| The current folder            | `.`  (a single dot)                         |
+| One folder up                 | `..`                                        |
+
+So when this guide says "put your model at `~/models/`" — that
+maps to `/home/yourname/models/` on the Linux side, which is
+*separate* from anything on your Windows drives. When it says
+`/mnt/c/Users/you/...` — that's reaching across into your real
+Windows files.
+
+### Tab completion (the time-saver)
+
+Press **Tab** while typing a file or folder name and it
+auto-completes. Hit Tab twice to see all the options when there
+are several. So instead of typing `cd Council-Demo`, you can type
+`cd Coun<Tab>` and it fills in the rest.
+
+### Hot keys you'll use
+
+| Keys             | What it does                                       |
+|------------------|----------------------------------------------------|
+| **Ctrl+C**       | Stop a running command (e.g. cancel a download)    |
+| **Up arrow**     | Recall the previous command                        |
+| **Down arrow**   | Forward through your command history               |
+| **Ctrl+L**       | Clear the screen (same as typing `clear`)          |
+| **Ctrl+Shift+C** | Copy selected text (Linux terminals don't use plain Ctrl+C) |
+| **Ctrl+Shift+V** | Paste                                              |
+| **Right-click**  | Also pastes in the Ubuntu/WSL terminal             |
+
+### Running a script
+
+When the guide says `./setup-wsl.sh`, the `./` part means "the
+file in this current folder". You have to be **in the right
+folder** for that to work:
+
+```bash
+cd ~/Council-Demo      # go to the repo folder first
+./setup-wsl.sh         # then run the script
+```
+
+If you see `bash: ./setup-wsl.sh: No such file or directory`, you
+ran it from the wrong place — `cd ~/Council-Demo` and try again.
+
+If you see `bash: ./setup-wsl.sh: Permission denied`, the file
+isn't marked as runnable. Fix:
+
+```bash
+chmod +x setup-wsl.sh run-wsl.sh
+./setup-wsl.sh
+```
+
+### Copying files between Windows and WSL
+
+Two ways. Pick whichever fits the situation:
+
+**From Windows to WSL (one-off):**
+```bash
+cp /mnt/c/Users/$USER/Downloads/some-model.gguf ~/models/
+```
+`$USER` automatically fills in your Windows username if it matches
+your WSL one (often does). Otherwise spell it out.
+
+**From WSL to Windows:**
+```bash
+cp ~/some-output.csv /mnt/c/Users/$USER/Desktop/
+```
+
+**Open the current WSL folder in Windows Explorer:**
+```bash
+explorer.exe .
+```
+The Windows Explorer window opens at your current Linux folder,
+exposed via a special `\\wsl.localhost\Ubuntu-22.04\...` path.
+You can drag-and-drop files in and out of it like normal.
+
+### Editing a file
+
+If a step says "edit `~/.bashrc`", the easiest editor is `nano`:
+
+```bash
+nano ~/.bashrc
+```
+
+- Arrow keys move the cursor.
+- Type to insert.
+- **Ctrl+O** then **Enter** to save.
+- **Ctrl+X** to quit.
+
+`nano`'s commands are listed at the bottom of its window in
+shorthand (`^O` = Ctrl+O, `^X` = Ctrl+X, etc.).
+
+### Closing and reopening WSL
+
+- **Close the Ubuntu window** — anything still running keeps
+  running in the background. To reopen, click Ubuntu in the Start
+  menu again; you land back in your home folder.
+- **Open a second Ubuntu window** — click Ubuntu in the Start
+  menu again while the first one is still open. Each window is
+  an independent shell; they share the same files.
+- **Fully shut down WSL** — from a Windows PowerShell, run
+  `wsl --shutdown`. The next time you open Ubuntu it's a fresh
+  start (useful when WSL or the GPU passthrough gets into a weird
+  state).
+
+### Reading a wall of output
+
+When a command prints more than fits the screen, pipe it to
+`less`:
+
+```bash
+ls -la /usr/bin | less
+```
+
+- **Space** — next page.
+- **b** — back one page.
+- **/searchterm** — search.
+- **q** — quit.
+
+### "Where did the prompt go?"
+
+Sometimes a command runs for a long time (downloads, the
+`setup-wsl.sh` install) and the terminal seems frozen. That's
+normal — it's just busy. Wait it out. If you genuinely need to
+stop it: **Ctrl+C**.
+
+### That's it
+
+Everything in this guide reduces to:
+
+1. Open Ubuntu.
+2. `cd ~/Council-Demo` to get to the right folder.
+3. Run the commands the step tells you to run.
+4. Watch the output, scroll up if you need to re-read it.
+
+If a step says to run a command and you don't recognise the
+command itself, paste the whole step (command + the explanation
+around it) into a chat with the AI — the app is literally built
+to answer "what does this command do?".
