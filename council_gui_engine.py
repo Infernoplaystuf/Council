@@ -1143,8 +1143,73 @@ def _extract_file_paths(text):
     return paths
 
 
+# Phrase substrings that mark a CONCEPTUAL search query — "show me
+# files that …", "find scripts about …", etc. When matched, the
+# injector defaults to search-headers mode (compact one-line entries
+# per match) rather than full [VAULT MATCH] blocks. The model
+# typically wants to acknowledge what's there before zooming into
+# specific files, and headers let it see far more matches per token.
+_SEARCH_HEADERS_PHRASES = (
+    "find files", "find any file", "find every", "find a file",
+    "find scripts", "find pipelines", "find docs",
+    "look through", "look for files",
+    "search through", "search for files", "search for any",
+    "show me files", "show me the files", "list files", "list of files",
+    "which files", "what files", "any files",
+    "files that contain", "files with", "files about",
+    "scripts that", "pipelines that",
+)
+
+
+def _wants_search_headers(text: str) -> bool:
+    """Heuristic: does this query look like 'show me what's there' rather
+    than 'tell me about X specifically'? Conceptual-search queries get
+    compact one-line headers instead of full blocks so the model can see
+    more matches per token. Manual override via
+    COUNCIL_FORCE_FULL_VAULT_BLOCKS=1 (or =yes/true/on) skips this and
+    keeps the legacy full-block behaviour."""
+    if os.environ.get("COUNCIL_FORCE_FULL_VAULT_BLOCKS", "").strip().lower() in (
+        "1", "true", "yes", "on"
+    ):
+        return False
+    t = (text or "").lower()
+    return any(p in t for p in _SEARCH_HEADERS_PHRASES)
+
+
+def _build_search_header_block(rec, score=None) -> str:
+    """A single-line header for a vault match. ~30 tokens.
+
+    Format: ``name  ·  type, R rows  ·  topics: a, b, c  ·  score 4.2``
+    Used by search-headers mode in place of a full [VAULT MATCH] block.
+    """
+    name = rec.get("name") or "?"
+    rtype = rec.get("type") or "?"
+    bits = [rtype]
+    if rtype in ("csv", "tsv", "csv.gz", "parquet"):
+        rows = rec.get("rows")
+        if isinstance(rows, int):
+            bits.append(f"{rows:,} rows")
+        n_cols = len(rec.get("headers") or [])
+        if n_cols:
+            bits.append(f"{n_cols} cols")
+    elif rtype == "excel":
+        sheets = rec.get("sheets") or []
+        bits.append(f"{len(sheets)} sheets")
+    elif rtype in ("sqlite", "duckdb"):
+        tables = rec.get("tables") or []
+        bits.append(f"{len(tables)} tables")
+    topics = rec.get("topics") or []
+    parts = [f"{name}", ", ".join(bits)]
+    if topics:
+        parts.append("topics: " + ", ".join(str(t) for t in topics[:4]))
+    if score is not None:
+        parts.append(f"score {score:.1f}")
+    return "  ·  ".join(parts)
+
+
 def _inject_file_contents(user_text, analyst_block=None, n_ctx=None,
-                           task_memo_block=None):
+                           task_memo_block=None, pinned_files=None,
+                           prior_model_response=None):
     """Public entry point — wraps `_inject_file_contents_impl` in a
     defensive try/except so unexpected exceptions during injection
     (vault index corruption, network-share disconnect mid-walk,
@@ -1156,6 +1221,8 @@ def _inject_file_contents(user_text, analyst_block=None, n_ctx=None,
         return _inject_file_contents_impl(
             user_text, analyst_block=analyst_block, n_ctx=n_ctx,
             task_memo_block=task_memo_block,
+            pinned_files=pinned_files,
+            prior_model_response=prior_model_response,
         )
     except Exception as _top_e:
         import sys as _sys_dbg
@@ -1194,7 +1261,8 @@ def _inject_file_contents(user_text, analyst_block=None, n_ctx=None,
 
 
 def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
-                                task_memo_block=None):
+                                task_memo_block=None, pinned_files=None,
+                                prior_model_response=None):
     """Augment the user message with file/vault context before deliberation.
 
     Returns ``(augmented_text, fuzzy_matches, breakdown)`` where:
@@ -1457,36 +1525,78 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                     print('[DEBUG inject] fuzzy: ' + repr(fuzzy_matches),
                           file=_sys_dbg.stderr)
 
-                # Full-content matches — packed via the new budget-aware
-                # tiered assembler. We give it a budget equal to the
-                # remaining injection budget × the share that vault
-                # matches are typically allotted (rough rule of thumb:
-                # half of what's left after task memo / analyst / explicit
-                # blocks). The assembler packs Tier 1 for all hits first,
-                # then upgrades top-ranked hits to Tier 2/3 while budget
-                # allows, and dedupes overlapping schemas across blocks.
+                # Decide between full [VAULT MATCH] blocks and compact
+                # search-headers, based on intent. Conceptual queries
+                # ("show me files about X", "find scripts that …") get
+                # one-line headers: the model sees a wider set of
+                # matches per token and can ask follow-up "tell me more
+                # about file Y" in the next turn — those references
+                # will trigger the zoom-in via pinned_files (see
+                # CouncilConsole._send wire-up).
+                use_search_headers = _wants_search_headers(user_text)
+
+                # Pinned files from a previous turn — the user's last
+                # answer referenced these by name, so promote them out
+                # of headers mode into full blocks even when the
+                # current query looks conceptual. Pins expire after a
+                # few turns to avoid bloat (managed by the caller).
+                pinned_set = {str(n).lower() for n in (pinned_files or [])}
+
                 try:
                     import council_engine as _ce_pack
                     _count_tokens = _ce_pack.estimate_tokens
                 except Exception:
                     _count_tokens = None
                 vault_block_budget = max(256, remaining // 2)
-                packed_blocks, pack_diag = idx.assemble_match_blocks(
-                    [rec for _score, rec in full_hits],
-                    budget_tokens=vault_block_budget,
-                    count_tokens=_count_tokens,
-                )
-                print('[DEBUG inject] vault match assembly: '
-                      + repr(pack_diag), file=_sys_dbg.stderr)
-                for rec, block in zip([r for _s, r in full_hits], packed_blocks):
-                    name = rec.get("name") or "?"
-                    candidates.append((PRIO_VAULT, f"[VAULT MATCH: {name}]", block))
 
-                # Summary block — only when there's a tail to surface.
-                # If the search returned ≤k hits the model already sees
-                # everything; adding a redundant summary would just be
-                # noise.
-                if tail_hits:
+                if use_search_headers and not pinned_set:
+                    # Pure headers mode — no per-file rich blocks.
+                    # Pack everything we found into one compact block.
+                    header_lines = ["[VAULT MATCHES (headers — ask about a "
+                                     "file by name to zoom in)]"]
+                    for score, rec in all_hits:
+                        header_lines.append("  • " + _build_search_header_block(rec, score))
+                    headers_block = "\n".join(header_lines)
+                    candidates.append((
+                        PRIO_VAULT, "[VAULT MATCHES — headers]", headers_block,
+                    ))
+                    print('[DEBUG inject] search-headers mode: '
+                          + str(len(all_hits)) + ' headers',
+                          file=_sys_dbg.stderr)
+                else:
+                    # Full-block mode (legacy + pinned-zoom path).
+                    # Split hits into "pinned" (always full) and
+                    # "everyone else" (headers if search-headers mode).
+                    pinned_recs = []
+                    other_full_hits = []
+                    for score, rec in full_hits:
+                        if str(rec.get("name", "")).lower() in pinned_set:
+                            pinned_recs.append(rec)
+                        else:
+                            other_full_hits.append((score, rec))
+
+                    packed_blocks, pack_diag = idx.assemble_match_blocks(
+                        pinned_recs + [rec for _s, rec in other_full_hits],
+                        budget_tokens=vault_block_budget,
+                        count_tokens=_count_tokens,
+                    )
+                    print('[DEBUG inject] vault match assembly: '
+                          + repr(pack_diag), file=_sys_dbg.stderr)
+                    ordered_recs = pinned_recs + [r for _s, r in other_full_hits]
+                    for rec, block in zip(ordered_recs, packed_blocks):
+                        name = rec.get("name") or "?"
+                        label_prefix = ("[VAULT MATCH (pinned): "
+                                        if str(name).lower() in pinned_set
+                                        else "[VAULT MATCH: ")
+                        candidates.append((PRIO_VAULT, f"{label_prefix}{name}]", block))
+
+                # Summary block — emitted ONLY when not in headers mode,
+                # because the headers block already covers the same
+                # ground (compact per-file listing). When tail_hits is
+                # empty the summary is redundant; when search-headers
+                # is on, ALL hits already render as headers, so the
+                # tail summary is also redundant.
+                if tail_hits and not use_search_headers:
                     summary_block = _build_vault_search_summary(
                         all_hits, full_count=len(full_hits),
                     )
@@ -10708,6 +10818,78 @@ class CouncilConsole(tk.Tk):
         except Exception:
             pass
 
+    # ── Filename pinning for search-headers zoom-in ──────────────────────
+    # When the model's previous turn referenced a vault file by name (e.g.
+    # "the closest match is orders.csv"), the user's natural follow-up is
+    # "tell me more about orders.csv". We want the next turn to inject the
+    # FULL [VAULT MATCH] block for that file even when search-headers
+    # mode is otherwise active. The pin set is per-CouncilConsole, keyed
+    # by filename (lowercased) with a turn-index expiry so a single
+    # mention doesn't permanently inflate the budget.
+    PIN_LIFETIME_TURNS = 3   # pin expires this many turns after creation
+
+    def _pin_state(self) -> Dict[str, int]:
+        """Lazy-init the pinned-files dict: {filename_lower: turn_added}."""
+        if not hasattr(self, "_pinned_files_map") or self._pinned_files_map is None:
+            self._pinned_files_map = {}
+        if not hasattr(self, "_pin_turn_counter") or self._pin_turn_counter is None:
+            self._pin_turn_counter = 0
+        return self._pinned_files_map
+
+    def _current_pinned_filenames(self) -> List[str]:
+        """Return the list of un-expired pinned filenames. Called by the
+        injection pipeline each turn; expires stale entries inline."""
+        pins = self._pin_state()
+        cur_turn = self._pin_turn_counter
+        # Expire pins older than PIN_LIFETIME_TURNS turns.
+        for name in list(pins.keys()):
+            if cur_turn - pins[name] >= self.PIN_LIFETIME_TURNS:
+                pins.pop(name, None)
+        return list(pins.keys())
+
+    def _update_pins_from_response(self, response_text: str) -> None:
+        """Scan the model's response for filename mentions of vault
+        files and pin any it sees. Called from _send after the model
+        replies but BEFORE the next turn's injection. The next turn's
+        injection picks up the pins and zooms the matching files into
+        full [VAULT MATCH] blocks.
+
+        We only pin names that resolve to actual vault records — no
+        false positives on names the model invented.
+        """
+        if not response_text:
+            self._pin_turn_counter = (self._pin_turn_counter or 0) + 1
+            return
+        try:
+            idx = _get_vault_index()
+        except Exception:
+            idx = None
+        if idx is None:
+            self._pin_turn_counter = (self._pin_turn_counter or 0) + 1
+            return
+        # Build a set of every record name in the vault index (lower-cased)
+        # for an O(1) membership check below.
+        try:
+            known = {str(rec.get("name", "")).lower()
+                     for rec in idx.records.values() if rec.get("name")}
+        except Exception:
+            known = set()
+        if not known:
+            self._pin_turn_counter = (self._pin_turn_counter or 0) + 1
+            return
+
+        # Find every plausible filename token in the response (anything
+        # containing a dot, length 3-80, alnum/punct chars). Cross-check
+        # against known vault names.
+        pins = self._pin_state()
+        cur_turn = self._pin_turn_counter
+        for m in _re.finditer(r"[\w\-]{1,60}\.[A-Za-z0-9]{1,8}", response_text):
+            tok = m.group(0).strip(",.;:!?)(\"' `").lower()
+            if tok and tok in known:
+                pins[tok] = cur_turn
+        # Advance the turn counter so the next call's expiry math is correct.
+        self._pin_turn_counter = cur_turn + 1
+
     def _refresh_title_with_n_ctx(self):
         """Update the window title bar with the current n_ctx + source so the
         user always sees what context window they're working with — without
@@ -11897,9 +12079,17 @@ class CouncilConsole(tk.Tk):
             _n_ctx = ce.get_n_ctx()
         except Exception:
             _n_ctx = 4096
+        # Resolve the current pinned-file set (filenames the model
+        # referenced in a recent prior turn). Pins are stamped with the
+        # turn-index they were created on and expire after a few turns
+        # so the budget isn't permanently bloated by a one-off "show
+        # me X" reference. The pin store lives on self; this turn's
+        # number is just an incrementing counter.
+        _pinned_files = self._current_pinned_filenames()
         augmented, fuzzy_matches, _injection_breakdown = _inject_file_contents(
             user_text, analyst_block=_analyst_block, n_ctx=_n_ctx,
             task_memo_block=_task_memo_block,
+            pinned_files=_pinned_files,
         )
         self._last_injection_breakdown = _injection_breakdown
         # Surface defensive-wrapper failures to the transcript. When the
@@ -12991,6 +13181,16 @@ class CouncilConsole(tk.Tk):
                     self._last_final_text  = _final
                     self._last_query_text  = _query
                     self._last_route       = _route
+                    # Scan this turn's final answer for vault filename
+                    # mentions and pin them for the next turn's
+                    # injection. The next user message can then say
+                    # "tell me more about orders.csv" and the injector
+                    # will zoom the file into a full [VAULT MATCH]
+                    # block even when search-headers mode is active.
+                    try:
+                        self._update_pins_from_response(_final)
+                    except Exception as _pin_err:
+                        print(f"[pin] update failed: {_pin_err!r}")
                     # Auto-save if LaTeX was requested
                     if _detect_latex_request(_query):
                         self._auto_save_latex(_final, _query)
