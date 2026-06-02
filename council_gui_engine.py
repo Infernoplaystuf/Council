@@ -1213,8 +1213,7 @@ def _build_search_header_block(rec, score=None) -> str:
 
 
 def _inject_file_contents(user_text, analyst_block=None, n_ctx=None,
-                           task_memo_block=None, pinned_files=None,
-                           prior_model_response=None):
+                           task_memo_block=None, pinned_files=None):
     """Public entry point — wraps `_inject_file_contents_impl` in a
     defensive try/except so unexpected exceptions during injection
     (vault index corruption, network-share disconnect mid-walk,
@@ -1227,7 +1226,6 @@ def _inject_file_contents(user_text, analyst_block=None, n_ctx=None,
             user_text, analyst_block=analyst_block, n_ctx=n_ctx,
             task_memo_block=task_memo_block,
             pinned_files=pinned_files,
-            prior_model_response=prior_model_response,
         )
     except Exception as _top_e:
         import sys as _sys_dbg
@@ -1266,8 +1264,7 @@ def _inject_file_contents(user_text, analyst_block=None, n_ctx=None,
 
 
 def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
-                                task_memo_block=None, pinned_files=None,
-                                prior_model_response=None):
+                                task_memo_block=None, pinned_files=None):
     """Augment the user message with file/vault context before deliberation.
 
     Returns ``(augmented_text, fuzzy_matches, breakdown)`` where:
