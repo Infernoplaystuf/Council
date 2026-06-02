@@ -1181,6 +1181,10 @@ def _build_search_header_block(rec, score=None) -> str:
 
     Format: ``name  ·  type, R rows  ·  topics: a, b, c  ·  score 4.2``
     Used by search-headers mode in place of a full [VAULT MATCH] block.
+
+    Semantic-only matches (no keyword hit) get a leading "[semantic] "
+    tag so the model knows the file matched by meaning, not by query
+    terms appearing in it.
     """
     name = rec.get("name") or "?"
     rtype = rec.get("type") or "?"
@@ -1199,7 +1203,8 @@ def _build_search_header_block(rec, score=None) -> str:
         tables = rec.get("tables") or []
         bits.append(f"{len(tables)} tables")
     topics = rec.get("topics") or []
-    parts = [f"{name}", ", ".join(bits)]
+    sem_tag = "[semantic] " if rec.get("_semantic_only") else ""
+    parts = [f"{sem_tag}{name}", ", ".join(bits)]
     if topics:
         parts.append("topics: " + ", ".join(str(t) for t in topics[:4]))
     if score is not None:
@@ -1462,7 +1467,9 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
         idx = _get_vault_index()
         if idx is not None:
             try:
-                idx.rebuild()
+                import council_engine as _ce_tim
+                with _ce_tim._TimingScope("vault.rebuild"):
+                    idx.rebuild()
                 # When analyst already answered (#7), reduce the vault-match
                 # pull from 5 to 1 — the analyst's CSV is the authoritative
                 # source and 5 fuzzy matches just consume budget.
@@ -1503,10 +1510,11 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                 # KNOWS the full set of matching files even when only
                 # a few get full content.
                 TAIL_K = base_tail
-                all_hits, fuzzy_matches = idx.search(
-                    user_text, k=k + TAIL_K, folder=folder_scope,
-                    llm_call=_semantic_llm_call,
-                )
+                with _ce_tim._TimingScope("vault.search"):
+                    all_hits, fuzzy_matches = idx.search(
+                        user_text, k=k + TAIL_K, folder=folder_scope,
+                        llm_call=_semantic_llm_call,
+                    )
                 # Drop any hit that's already explicit (won't happen
                 # in practice — we skip vault search entirely when
                 # explicit_paths is non-empty — but safe to keep the
@@ -1974,12 +1982,13 @@ def _run_analyst_step_impl(query):
     try:
         import council_engine as _ce
         # Backend-agnostic helper — works in both Ollama and GGUF modes.
-        raw = _ce.local_chat(
-            messages=[{'role': 'user', 'content': prompt}],
-            temperature=0.0,
-            num_predict=600,
-            timeout=90,
-        )
+        with _ce._TimingScope("analyst.codegen"):
+            raw = _ce.local_chat(
+                messages=[{'role': 'user', 'content': prompt}],
+                temperature=0.0,
+                num_predict=600,
+                timeout=90,
+            )
     except Exception as _e:
         msg = f"code generation failed: {_e!r}"
         print('[analyst] ' + msg, file=_sys_dbg.stderr)
@@ -1992,7 +2001,8 @@ def _run_analyst_step_impl(query):
         return _build_analyst_failure_block("(empty)", msg), msg, notices
     print('[analyst] generated code (first 300):\n' + code[:300], file=_sys_dbg.stderr)
 
-    result_df, log = _va.execute_pandas_code(code, allowed_folders)
+    with _ce._TimingScope("analyst.exec"):
+        result_df, log = _va.execute_pandas_code(code, allowed_folders)
     if result_df is None:
         # Extract the first traceback line for a concise transcript message.
         # The full log keeps the entire traceback for debugging in the block.

@@ -62,10 +62,30 @@ tkinterweb>=3.24         # Plotly HTML viewer inside Tk
 # llama-cpp-python>=0.2.79
 
 # ---- RAG (vault search) — optional but installed by default ----
+# chromadb is used by vault_rag.py for full-document RAG. The
+# per-record vault embedding index (vault_embeddings.py) uses a plain
+# JSON cache + numpy cosine instead — see that file's docstring for
+# the rationale (smaller bundle, faster startup, simpler air-gap path).
 chromadb>=0.4
 sentence-transformers>=2.2    # also used by vault_embeddings.py for the
                               # vector retrieval layer (default model:
                               # all-MiniLM-L6-v2, ~80 MB)
+
+# ---- Context-window optimization env vars (documented here for
+#      visibility — none of these are pip dependencies) ----
+# COUNCIL_GGUF_N_CTX             — explicit n_ctx override (e.g. 32768)
+# COUNCIL_GGUF_N_CTX_MAX         — absolute upper bound (default 32768)
+# COUNCIL_GGUF_KV_VRAM_MARGIN_MB — VRAM headroom for KV cache (default 1024)
+# COUNCIL_GGUF_N_CTX_DEBUG=1     — print full n_ctx ladder trace on load
+# COUNCIL_FORCE_FULL_VAULT_BLOCKS=1 — disable search-headers mode (force
+#                                    full [VAULT MATCH] blocks always)
+# COUNCIL_TIMING_DEBUG=1         — elevate timing logs from DEBUG to INFO
+# COUNCIL_DF_CACHE_MB            — DataFrame cache budget (default 256 MB)
+# COUNCIL_EMBED_MODEL            — sentence-transformer model name
+# COUNCIL_EMBED_DEVICE           — 'cuda' / 'cpu' for embedding model
+# COUNCIL_GGUF_PATH              — path to a .gguf model file (required)
+# COUNCIL_GGUF_GPU_LAYERS        — default 99 (offload all); 0 = CPU
+# COUNCIL_GGUF_N_THREADS         — CPU threads (default = physical cores)
 huggingface_hub>=0.20    # for huggingface-cli download of GGUF models
 
 # ---- File parsing for vault analyst / RAG over docs ----

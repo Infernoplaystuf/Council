@@ -174,6 +174,69 @@ _LAST_N_CTX_SOURCE: str = ""
 _LAST_N_CTX_LADDER: list = []
 
 
+class _TimingScope:
+    """Context manager form of _timed for inline blocks.
+
+    Usage:
+        with _TimingScope("vault.rebuild"):
+            idx.rebuild()
+    """
+    __slots__ = ("label", "_t0")
+
+    def __init__(self, label: str):
+        self.label = label
+
+    def __enter__(self):
+        import time as _t
+        self._t0 = _t.monotonic()
+        return self
+
+    def __exit__(self, *_exc):
+        import time as _t
+        dt = _t.monotonic() - self._t0
+        if os.environ.get("COUNCIL_TIMING_DEBUG", "").strip().lower() in (
+            "1", "true", "yes", "on"
+        ):
+            _LOG.info("[timing] %s %.3fs", self.label, dt)
+        else:
+            _LOG.debug("[timing] %s %.3fs", self.label, dt)
+
+
+def _timed(label: str):
+    """Tiny decorator that logs the wall-clock duration of a call at
+    DEBUG level. Zero overhead when logging is not enabled (the LOG
+    handlers filter the message out before formatting).
+
+    Used by the analyst code-gen, analyst exec, vault rebuild, and the
+    final injection assembly so the user (or a triage session) can
+    diagnose where latency lives as the dataset grows. Toggle with
+    `COUNCIL_TIMING_DEBUG=1` to elevate to INFO so it shows up in normal
+    runs.
+
+    Example output (INFO):
+      [timing] analyst.codegen 1.243s
+      [timing] vault.rebuild   3.812s
+    """
+    def _wrap(fn):
+        def _call(*args, **kwargs):
+            import time as _t
+            t0 = _t.monotonic()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                dt = _t.monotonic() - t0
+                if os.environ.get("COUNCIL_TIMING_DEBUG", "").strip().lower() in (
+                    "1", "true", "yes", "on"
+                ):
+                    _LOG.info("[timing] %s %.3fs", label, dt)
+                else:
+                    _LOG.debug("[timing] %s %.3fs", label, dt)
+        _call.__name__ = getattr(fn, "__name__", label)
+        _call.__doc__  = getattr(fn, "__doc__", None)
+        return _call
+    return _wrap
+
+
 def n_ctx_status() -> Dict[str, Any]:
     """Return the chosen n_ctx + the human-readable source string + the
     full ladder trace from the most recent model load. The UI calls this

@@ -2042,10 +2042,18 @@ the vocabulary list. Lowercase only. Single line only.
                         old_sc, idx = by_path[p]
                         results[int(idx)] = (old_sc + boost, results[int(idx)][1])
                     else:
-                        # New path the keyword pass missed
+                        # New path the keyword pass missed — this match
+                        # is "semantic only" (no keyword hits). Tag a
+                        # copy of the record so the downstream renderer
+                        # can label the block clearly. We copy because
+                        # the underlying records dict is shared across
+                        # queries — mutating it would leak the flag.
                         rec = self.records.get(p)
                         if rec:
-                            results.append((boost, rec))
+                            rec_copy = dict(rec)
+                            rec_copy["_semantic_only"] = True
+                            rec_copy["_cosine_similarity"] = float(cos)
+                            results.append((boost, rec_copy))
 
         results.sort(key=lambda r: r[0], reverse=True)
         return results[:k], fuzzy_matches
@@ -2540,6 +2548,19 @@ the vocabulary list. Lowercase only. Single line only.
                     for k in (rec.get("keys", []) or []) if str(k).strip()]
         return None
 
+    def _semantic_only_header(self, rec: Dict[str, Any]) -> Optional[str]:
+        """If this record was added by the embedding-only fallback (no
+        keyword hit), return a banner line the renderer can emit so the
+        model can flag the distinction to the user. Returns None for
+        normal keyword-matched records."""
+        if not rec.get("_semantic_only"):
+            return None
+        cos = rec.get("_cosine_similarity")
+        cos_str = f" (cosine {cos:.2f})" if isinstance(cos, (int, float)) else ""
+        return ("note: nearest semantic match — no exact keyword hit"
+                + cos_str + ". The query terms don't appear in this "
+                "file's index; relevance is from meaning similarity only.")
+
     def summary_block(self, rec: Dict[str, Any], max_chars: int = 1500) -> str:
         """Legacy — emit a single block containing Tier 1 + Tier 2 + Tier 3.
 
@@ -2548,7 +2569,17 @@ the vocabulary list. Lowercase only. Single line only.
         ``assemble_match_blocks(records, budget_tokens, count_tokens)``
         which packs blocks tier-by-tier within a shared budget.
         """
-        lines = [f"[VAULT MATCH: {rec.get('name', '?')}]"]
+        # Use a dedicated header for semantic-only matches so the
+        # downstream model and the user can see at a glance which
+        # results came from keyword vs. semantic similarity.
+        sem_note = self._semantic_only_header(rec)
+        header_label = (f"[VAULT MATCH — nearest semantic match: "
+                        f"{rec.get('name', '?')}]"
+                        if sem_note else
+                        f"[VAULT MATCH: {rec.get('name', '?')}]")
+        lines = [header_label]
+        if sem_note:
+            lines.append(sem_note)
         lines.extend(self._summary_tier1_lines(rec))
         lines.extend(self._summary_tier2_lines(rec))
         lines.extend(self._summary_tier3_lines(rec))
@@ -2599,9 +2630,18 @@ the vocabulary list. Lowercase only. Single line only.
         assets: List[Dict[str, Any]] = []
         for rec in records:
             name = rec.get("name", "?")
-            header = f"[VAULT MATCH: {name}]"
+            sem_note = self._semantic_only_header(rec)
+            # Semantic-only matches use a dedicated header label and
+            # prepend an explanatory line so the model can convey the
+            # "no keyword hit" caveat to the user.
+            if sem_note:
+                header = f"[VAULT MATCH — nearest semantic match: {name}]"
+            else:
+                header = f"[VAULT MATCH: {name}]"
             footer = "[END MATCH]"
             t1 = self._summary_tier1_lines(rec)
+            if sem_note:
+                t1 = [sem_note] + t1
             t2 = self._summary_tier2_lines(rec)
             t3 = self._summary_tier3_lines(rec)
             assets.append({

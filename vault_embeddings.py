@@ -21,6 +21,35 @@ Cache: vault/vault_embeddings.json sits next to vault_index.json.
 Same lazy regenerate pattern as the LLM-descriptions layer — only
 records whose mtime changed get re-embedded.
 
+Why JSON and not ChromaDB
+-------------------------
+ChromaDB is also in the project (used by vault_rag.py for full-document
+RAG over text/markdown/PDF files — that's a separate persistence
+concern from per-record vault embeddings).  The choice for THIS module
+was reconsidered as part of the context-window work order:
+
+  * For ~1000s of vault records at 384 dims that's ~12-30 MB JSON.
+    Lazy-loaded at first read; cosine via numpy over the full set is
+    sub-millisecond for that size. ChromaDB would add startup
+    initialization (open the on-disk index, create the collection,
+    handle migrations) without a real performance win at this scale.
+
+  * Migrating would couple the keyword/embedding blend in
+    vault_index.search() to chroma's query API — currently the blend
+    just consults this index in-memory which is simpler, faster, and
+    has zero external dependencies on the read path.
+
+  * Air-gapped users: chroma works air-gapped but has more moving
+    parts (sqlite-vss, optional ANN backends) than a plain JSON+numpy
+    blob. Fewer moving parts = fewer "doesn't start cleanly on weird
+    systems" reports.
+
+Decision: keep JSON here, keep ChromaDB for vault_rag.py. If we hit
+10K+ records and the in-memory cosine becomes a bottleneck, swap to
+a `.npy` binary cache first; ChromaDB would only earn its keep when
+we need persistent metadata filtering, multi-collection routing, or
+remote queries — none of which apply to this module's job.
+
 Model: 'all-MiniLM-L6-v2' by default (22M params, 384 dims, CPU/GPU
 fine). Override with COUNCIL_EMBED_MODEL env var if you have a heavier
 local model cached (BGE-base, e5-base, etc).
