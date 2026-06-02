@@ -1457,11 +1457,30 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                     print('[DEBUG inject] fuzzy: ' + repr(fuzzy_matches),
                           file=_sys_dbg.stderr)
 
-                # Full-content matches first — same as before.
-                for _score, rec in full_hits:
-                    vblock = idx.summary_block(rec)
+                # Full-content matches — packed via the new budget-aware
+                # tiered assembler. We give it a budget equal to the
+                # remaining injection budget × the share that vault
+                # matches are typically allotted (rough rule of thumb:
+                # half of what's left after task memo / analyst / explicit
+                # blocks). The assembler packs Tier 1 for all hits first,
+                # then upgrades top-ranked hits to Tier 2/3 while budget
+                # allows, and dedupes overlapping schemas across blocks.
+                try:
+                    import council_engine as _ce_pack
+                    _count_tokens = _ce_pack.estimate_tokens
+                except Exception:
+                    _count_tokens = None
+                vault_block_budget = max(256, remaining // 2)
+                packed_blocks, pack_diag = idx.assemble_match_blocks(
+                    [rec for _score, rec in full_hits],
+                    budget_tokens=vault_block_budget,
+                    count_tokens=_count_tokens,
+                )
+                print('[DEBUG inject] vault match assembly: '
+                      + repr(pack_diag), file=_sys_dbg.stderr)
+                for rec, block in zip([r for _s, r in full_hits], packed_blocks):
                     name = rec.get("name") or "?"
-                    candidates.append((PRIO_VAULT, f"[VAULT MATCH: {name}]", vblock))
+                    candidates.append((PRIO_VAULT, f"[VAULT MATCH: {name}]", block))
 
                 # Summary block — only when there's a tail to surface.
                 # If the search returned ≤k hits the model already sees
