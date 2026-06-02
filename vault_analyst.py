@@ -2472,13 +2472,36 @@ def execute_pandas_code(
 
     safe_builtins = {
         "__import__": _safe_import,
+        # Numeric / collection core
         "abs": abs, "all": all, "any": any, "bool": bool, "dict": dict,
         "enumerate": enumerate, "float": float, "int": int,
-        "isinstance": isinstance, "len": len, "list": list, "max": max,
-        "min": min, "print": print, "range": range, "round": round,
-        "set": set, "sorted": sorted, "str": str, "sum": sum,
-        "tuple": tuple, "zip": zip,
+        "isinstance": isinstance, "issubclass": issubclass,
+        "len": len, "list": list, "max": max, "min": min, "print": print,
+        "range": range, "round": round, "set": set, "frozenset": frozenset,
+        "sorted": sorted, "str": str, "sum": sum, "tuple": tuple, "zip": zip,
+        # Attribute / introspection — model frequently writes
+        # `getattr(df, "shape")`, `type(x).__name__`, etc. Without these
+        # in builtins the sandbox raises NameError mid-snippet and the
+        # analyst silently falls back to model freeform (= wrong answer).
+        "getattr": getattr, "hasattr": hasattr, "setattr": setattr,
+        "type": type, "repr": repr, "format": format, "hash": hash,
+        "id": id, "callable": callable, "vars": vars, "dir": dir,
+        # Iterator helpers
+        "iter": iter, "next": next, "reversed": reversed,
+        "map": map, "filter": filter, "slice": slice,
+        # Numeric / char helpers
+        "divmod": divmod, "pow": pow, "ord": ord, "chr": chr,
+        "bin": bin, "hex": hex, "oct": oct,
+        "bytes": bytes, "bytearray": bytearray, "complex": complex,
+        # Literals — needed inside exec because __builtins__ replaced
+        "True": True, "False": False, "None": None,
+        # Common exception classes for except-clauses
         "Exception": Exception, "ValueError": ValueError, "TypeError": TypeError,
+        "KeyError": KeyError, "IndexError": IndexError,
+        "AttributeError": AttributeError, "ZeroDivisionError": ZeroDivisionError,
+        "StopIteration": StopIteration, "OverflowError": OverflowError,
+        "LookupError": LookupError, "ArithmeticError": ArithmeticError,
+        "RuntimeError": RuntimeError, "NotImplementedError": NotImplementedError,
     }
 
     globals_dict: dict[str, Any] = {

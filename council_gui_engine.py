@@ -1203,6 +1203,66 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
         else:
             missing_paths.append(path_str)
 
+    # -- Vault folder context (priority 4) ----------------------------------
+    # When the user mentions "the vault", "my vault", "vault folder", etc.
+    # but didn't paste an explicit path, inject the data_in/ inventory as
+    # a [FOLDER: ...] block so the model knows what files exist. Without
+    # this, vault search may return zero matches for generic queries
+    # ("show me what's in the vault") and the model defaults to "I don't
+    # have access to your filesystem" — which is exactly the bug users
+    # report. We only inject when no explicit folder block already covers
+    # the vault to avoid duplicate inventory listings.
+    if _vault_search_keywords(user_text) and not explicit_paths:
+        try:
+            import data_index as _di
+            vault_data_in = _di.input_dir(VAULT_DIR)
+        except Exception:
+            vault_data_in = VAULT_DIR
+        try:
+            vault_folder_block = _render_folder_for_injection(vault_data_in)
+        except Exception as _e:
+            print('[DEBUG inject] vault folder render failed: ' + repr(_e),
+                  file=_sys_dbg.stderr)
+            vault_folder_block = None
+        if vault_folder_block:
+            already_have_vault_folder = any(
+                lbl == f"[FOLDER: {Path(vault_data_in).name or str(vault_data_in)}]"
+                for _prio, lbl, _content in candidates
+            )
+            if not already_have_vault_folder:
+                candidates.append((
+                    PRIO_FOLDER,
+                    f"[FOLDER: {Path(vault_data_in).name or str(vault_data_in)}]",
+                    vault_folder_block,
+                ))
+                print('[DEBUG inject] vault folder injected: '
+                      + str(vault_data_in), file=_sys_dbg.stderr)
+
+        # Sub-folder reference: user said something like "look in the
+        # projects subfolder" or "files in Q3_2024". Resolve via the
+        # analyst's existing fuzzy hint resolver and inject that
+        # subfolder's full listing. This is what makes "look at the
+        # Foo subfolder within the vault" actually show contents
+        # instead of triggering "I can't see file paths."
+        try:
+            import vault_analyst as _va_sub
+            sub = _va_sub.resolve_subfolder_hint(user_text, vault_data_in)
+        except Exception:
+            sub = None
+        if sub is not None and sub != vault_data_in:
+            try:
+                sub_block = _render_folder_for_injection(sub)
+            except Exception:
+                sub_block = None
+            if sub_block:
+                sub_label = f"[FOLDER: {sub.name or str(sub)}]"
+                already = any(lbl == sub_label
+                              for _prio, lbl, _content in candidates)
+                if not already:
+                    candidates.append((PRIO_FOLDER, sub_label, sub_block))
+                    print('[DEBUG inject] vault subfolder injected: '
+                          + str(sub), file=_sys_dbg.stderr)
+
     # -- Vault search (priority 5, droppable) -------------------------------
     # #4: when the user pasted explicit paths, trust them and skip vault
     # search entirely. The vault hits competed with the explicit file for
@@ -1459,9 +1519,13 @@ def _detect_folder_scope(text):
 _VAULT_TRIGGER_PHRASES = (
     "look through", "search through", "find files", "find every", "find any",
     "every file", "any file with", "all files", "across files",
-    "in my vault", "in the vault", "from the vault",
+    "in my vault", "in the vault", "from the vault", "the vault folder",
+    "my vault folder", "vault folder", "vault directory", "the vault",
+    "data_in", "data folder", "input folder",
+    "what's in the vault", "whats in the vault", "what is in the vault",
     "files that contain", "files with", "which files",
-    "list files", "list of files", "scan", "index",
+    "list files", "list of files", "show files", "show me the files",
+    "show me what's", "scan", "index",
 )
 
 
