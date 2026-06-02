@@ -1286,14 +1286,28 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
         candidates.append((PRIO_ANALYST, "[ANALYST RESULT]", analyst_block))
 
     # -- Explicit paths (priority 3 or 4) -----------------------------------
+    # Rich folder rendering (per-file column previews / sheet names / JSON
+    # key heads) is ~12 KB worst-case; compact rendering (counts + filename
+    # list) is ~3.5 KB. On a tight 4 K-ctx model, picking rich for a pasted
+    # folder eats the whole window. We pick adaptively:
+    #   • n_ctx >= 16384 → rich (the original behaviour)
+    #   • n_ctx <  16384 → compact (matches the auto-injection path's choice)
+    # The user can always paste an individual file path inside the folder
+    # to get full rich rendering for that one file.
+    _use_compact_folder = n_ctx < 16384
     for path_str in explicit_paths:
         p_check = Path(path_str.strip())
         # Directory → folder listing block (priority 4, not droppable).
         if p_check.is_dir():
-            folder_block = _render_folder_for_injection(p_check)
+            if _use_compact_folder:
+                folder_block = _render_folder_summary_compact(p_check)
+                lbl_prefix = "[FOLDER SUMMARY: "
+            else:
+                folder_block = _render_folder_for_injection(p_check)
+                lbl_prefix = "[FOLDER: "
             if folder_block:
                 candidates.append((
-                    PRIO_FOLDER, f"[FOLDER: {p_check.name or path_str}]",
+                    PRIO_FOLDER, f"{lbl_prefix}{p_check.name or path_str}]",
                     folder_block,
                 ))
             continue
@@ -1384,7 +1398,17 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                 # When analyst already answered (#7), reduce the vault-match
                 # pull from 5 to 1 — the analyst's CSV is the authoritative
                 # source and 5 fuzzy matches just consume budget.
-                k = 1 if analyst_block else 5
+                #
+                # K and TAIL_K both scale with n_ctx so a 4 K-ctx model
+                # doesn't get 5 × ~400-token VAULT MATCH blocks (2 KB just
+                # in matches, half its window). 8 K → 3 / 30, 16 K → 5 / 45.
+                if n_ctx <= 4096:
+                    base_k, base_tail = 2, 15
+                elif n_ctx <= 8192:
+                    base_k, base_tail = 3, 30
+                else:
+                    base_k, base_tail = 5, 45
+                k = 1 if analyst_block else base_k
                 # Semantic expansion via the local model: when a query
                 # term isn't in the vault's vocab, the index calls the
                 # model to ask "which of these vocab tokens belong in
@@ -1410,7 +1434,7 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                 # vs ~2000 tokens for 5 full blocks. The model now
                 # KNOWS the full set of matching files even when only
                 # a few get full content.
-                TAIL_K = 45
+                TAIL_K = base_tail
                 all_hits, fuzzy_matches = idx.search(
                     user_text, k=k + TAIL_K, folder=folder_scope,
                     llm_call=_semantic_llm_call,
@@ -1477,40 +1501,76 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
     # -- Assemble: priority sort, per-block cap, cumulative cap, tag --------
     candidates.sort(key=lambda t: t[0])
 
-    final_blocks = []
-    per_block_costs = []
+    placed: list = []   # list of (prio, label, capped, cost)
     dropped = []
     running = 0
-    # NO_DATA and ANALYST results are already curated (NO_DATA is tiny;
-    # analyst output is pre-capped at ~4000 chars by format_result_for_prompt).
-    # Trimming them risks deleting the answer the user actually asked for,
-    # so they are exempt from the per-block cap. EXPLICIT/FOLDER/VAULT are
-    # still capped because they can be arbitrarily large (a pasted 1GB CSV).
-    # NO_DATA, TASK_MEMO, and ANALYST blocks are exempt from the per-block
-    # cap. NO_DATA is tiny by construction. The task memo is intentionally
-    # short (~80 tokens) and trimming it would defeat the "remember the
-    # original question" guarantee. The analyst block is already capped at
-    # ~4KB by format_result_for_prompt; trimming further could elide the
-    # answer the user asked for.
+    # NO_DATA / TASK_MEMO / ANALYST are exempt from the per-block cap:
+    #   • NO_DATA is tiny by construction.
+    #   • TASK_MEMO is intentionally short (~80 tokens) and trimming it
+    #     would defeat the "remember the original question" guarantee.
+    #   • ANALYST is already capped at ~4 KB by format_result_for_prompt;
+    #     trimming further could elide the answer the user asked for.
+    # VAULT_SUMMARY is uncapped on the per-block axis (it scales with hits
+    # already) but DOES participate in cumulative-budget eviction below.
     UNCAPPED_PRIOS = {PRIO_NODATA, PRIO_TASK_MEMO, PRIO_ANALYST,
                       PRIO_VAULT_SUMMARY}
+    # Truly undroppable — these must reach the model no matter what.
+    # Everything else is sacrificeable in reverse-priority order if the
+    # cumulative budget gets blown by stacked non-droppable blocks (the
+    # old assembly let those overflow the window unconditionally).
+    HARD_KEEP = {PRIO_NODATA, PRIO_TASK_MEMO, PRIO_ANALYST}
     for (prio, label, content) in candidates:
         if prio in UNCAPPED_PRIOS:
             capped = content
         else:
             capped = _smart_truncate_block_to_tokens(content, per_block_cap)
         cost = _estimate_block_tokens(capped)
-        # Cumulative cap — only blocks at DROPPABLE_FROM or below are
-        # eligible for dropping. The NO_DATA marker, analyst result, and
-        # explicit user paths are always included even if budget is tight
-        # (the warning system will tell the user the prompt overflowed).
+        # First-pass cumulative gate — only droppable blocks are filtered
+        # here. Non-droppable ones go into `placed` unconditionally and
+        # the rescue pass below handles overflow.
         if prio >= DROPPABLE_FROM and running + cost > remaining:
             dropped.append((label, cost))
             continue
+        placed.append((prio, label, capped, cost))
+        running += cost
+
+    # -- Cumulative-overflow rescue ------------------------------------------
+    # The first pass enforces budget only for droppable blocks. If multiple
+    # non-droppable blocks (EXPLICIT / FOLDER / VAULT_SUMMARY) stack up on
+    # a small context window, `running` can still exceed `remaining` — the
+    # crash mode reported on the 4 K-ctx laptop. Walk back over the placed
+    # blocks in REVERSE priority order (lowest priority first), evicting
+    # until the budget fits. HARD_KEEP blocks are never evicted.
+    if running > remaining:
+        # Sort indices by descending priority (numerically higher = lower
+        # priority in our scheme), but keep the within-priority order
+        # stable (last-pasted block goes first within the same prio).
+        evictable_order = sorted(
+            range(len(placed)),
+            key=lambda i: (-placed[i][0], -i),
+        )
+        keep_mask = [True] * len(placed)
+        for i in evictable_order:
+            if running <= remaining:
+                break
+            prio_i, label_i, _capped_i, cost_i = placed[i]
+            if prio_i in HARD_KEEP:
+                continue
+            keep_mask[i] = False
+            dropped.append((label_i + " (budget overflow)", cost_i))
+            running -= cost_i
+        placed = [b for i, b in enumerate(placed) if keep_mask[i]]
+
+    # Re-sort by priority (eviction can reorder via mask removal — keep
+    # the assembled order priority-stable for the model).
+    placed.sort(key=lambda t: t[0])
+
+    final_blocks = []
+    per_block_costs = []
+    for prio, label, capped, cost in placed:
         tagged = _tag_block_header(capped, cost)
         final_blocks.append(tagged)
         per_block_costs.append((label, cost))
-        running += cost
 
     breakdown = {
         "costs":    per_block_costs,
@@ -11848,8 +11908,11 @@ class CouncilConsole(tk.Tk):
             for _label, _cost in _dropped:
                 _msg_lines.append(f"  • {_label}  (~{_cost:,} tokens)")
             _msg_lines.append(
-                "(Analyst result and your explicit files are never dropped. "
-                "Type 'context info' for the full token breakdown.)"
+                "(Analyst result, task memo, and the NO-DATA marker are "
+                "never dropped. Explicit files / folder listings / vault "
+                "summary CAN be dropped on cumulative budget overflow — "
+                "raise COUNCIL_GGUF_N_CTX to keep them. Type 'context "
+                "info' for the full token breakdown.)"
             )
             self._append_transcript("Council", "\n".join(_msg_lines), "observation")
         user_text = augmented
