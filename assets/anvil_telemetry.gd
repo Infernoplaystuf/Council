@@ -109,6 +109,49 @@ func get_param(name: String, default = null):
 
 
 # ----------------------------------------------------------------
+# Persona accessors
+# ----------------------------------------------------------------
+#
+# When a sweep runs with a persona axis, Anvil injects:
+#   persona_name              — the persona's canonical name
+#   persona.<axis>            — flat float per weight axis
+#   persona                   — nested dict view with name / summary
+#                                / weights / tags
+#
+# Read whichever shape fits your code style. The accessors below
+# default to 0.5 for missing axes so a game that reads a weight
+# Anvil didn't set still gets a sensible mid-value.
+
+## Return the active persona name (e.g. "Greedy"), or the supplied
+## default if this run wasn't launched with a persona axis.
+func persona_name(default := "balanced") -> String:
+	return str(get_param("persona_name", default))
+
+
+## Read a single persona weight (e.g. "greed", "aggression", "pace").
+## Returns ``default`` (0.5 by default) if the axis isn't set.
+func get_persona_weight(axis: String, default := 0.5) -> float:
+	var key := "persona." + axis
+	if params.has(key):
+		var v = params[key]
+		if typeof(v) == TYPE_FLOAT or typeof(v) == TYPE_INT:
+			return float(v)
+	# Fall back to the nested ``persona`` dict if the flat key is
+	# absent — covers manual params that only set the nested view.
+	var nested = get_param("persona", null)
+	if nested != null and typeof(nested) == TYPE_DICTIONARY:
+		var weights = nested.get("weights", null)
+		if typeof(weights) == TYPE_DICTIONARY and weights.has(axis):
+			return float(weights[axis])
+	return default
+
+
+## True if this run was launched with a persona axis at all.
+func has_persona() -> bool:
+	return params.has("persona_name") or params.has("persona")
+
+
+# ----------------------------------------------------------------
 # Per-frame work for auto-perf emission
 # ----------------------------------------------------------------
 

@@ -22,11 +22,18 @@ Sweep semantics
   combination; results are appended to the recorder and emitted via
   the progress callback.
 - Parameters can be:
-    range — {"type": "range", "start": <n>, "stop": <n>,
-             "step": <n>=1}   (stop exclusive, like Python's range)
-    list  — {"type": "list",  "values": [...]}
-    const — {"type": "const", "value": <n>}    (single value, useful
-             for clarity when one axis is fixed)
+    range —  {"type": "range", "start": <n>, "stop": <n>,
+              "step": <n>=1}   (stop exclusive, like Python's range)
+    list  —  {"type": "list",  "values": [...]}
+    const —  {"type": "const", "value": <n>}    (single value, useful
+              for clarity when one axis is fixed)
+    persona — {"type": "persona", "names": ["Greedy", "Cautious"]}
+              or {"type": "persona", "names": "all"} — each named
+              persona is materialised into a flat block of
+              ``persona_name`` + ``persona.<weight>`` keys via
+              sim_personas.PersonaRegistry. Unknown names are
+              dropped with a console warning so a typo doesn't
+              silently kill the sweep.
 
 A future-friendly ``concurrency`` field is read but currently
 ignored — sequential runs avoid GIL surprises in the Python runner
@@ -85,34 +92,49 @@ class ParameterSweep:
     progress bar.
     """
 
-    def __init__(self, axes: Dict[str, AxisSpec]):
+    def __init__(
+        self,
+        axes: Dict[str, AxisSpec],
+        *,
+        persona_registry: Any = None,
+    ):
         self.axes = dict(axes or {})
-        # Materialise the per-axis value lists once so __len__ + __iter__
-        # are O(1) per call. Bigger memory footprint than streaming, but
-        # parameter sweeps are bounded by design (you don't ship a
-        # cartesian product of 100k × 100k).
-        self._materialised: List[Tuple[str, List[Any]]] = [
-            (name, _materialise_axis(name, spec))
+        # Each axis materialises into a list of **blocks** — a block is
+        # a dict that contributes one or more keys to the per-run params
+        # when merged. Scalar axes produce single-key blocks
+        # ({axis_name: value}). Persona axes produce multi-key blocks
+        # (persona_name + persona.<weight>... + persona). The cartesian
+        # product over blocks is then a chain of dict.update calls.
+        #
+        # ``persona_registry`` is consulted by the persona axis kind
+        # only. Other axes don't need it; when a persona axis is
+        # present and no registry is supplied, we fall back to the
+        # built-ins (a fresh PersonaRegistry against an empty vault
+        # dir gives those plus no user customisations).
+        self._blocks_per_axis: List[Tuple[str, List[Dict[str, Any]]]] = [
+            (name, _materialise_axis_blocks(name, spec, persona_registry))
             for name, spec in self.axes.items()
         ]
 
     # ----------------------------------------------------------------
 
     def __len__(self) -> int:
-        if not self._materialised:
+        if not self._blocks_per_axis:
             return 0
         total = 1
-        for _name, values in self._materialised:
-            total *= max(1, len(values))
+        for _name, blocks in self._blocks_per_axis:
+            total *= max(1, len(blocks))
         return total
 
     def __iter__(self) -> Iterator[Dict[str, Any]]:
-        if not self._materialised:
+        if not self._blocks_per_axis:
             return iter(())
-        names = [n for n, _v in self._materialised]
-        value_lists = [v for _n, v in self._materialised]
-        for combo in itertools.product(*value_lists):
-            yield dict(zip(names, combo))
+        block_lists = [blocks for _name, blocks in self._blocks_per_axis]
+        for combo in itertools.product(*block_lists):
+            merged: Dict[str, Any] = {}
+            for block in combo:
+                merged.update(block)
+            yield merged
 
     def expand(self) -> List[Dict[str, Any]]:
         """Realise the full list in memory — handy for "warn me if
@@ -133,10 +155,97 @@ class ParameterSweep:
     def from_json(cls, path: Any) -> "ParameterSweep":
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
+    @classmethod
+    def from_dict_with_registry(
+        cls,
+        d: Dict[str, Any],
+        persona_registry: Any,
+    ) -> "ParameterSweep":
+        """Convenience: like ``from_dict`` but threads a PersonaRegistry
+        in so persona axes can resolve named profiles against the
+        user's vault customisations."""
+        axes = (d or {}).get("axes") or {}
+        if not isinstance(axes, dict):
+            raise ValueError("ParameterSweep: 'axes' must be a dict")
+        return cls(axes, persona_registry=persona_registry)
+
 
 # ============================================================
 # Axis materialisation
 # ============================================================
+
+def _materialise_axis_blocks(
+    name: str,
+    spec: AxisSpec,
+    persona_registry: Any = None,
+) -> List[Dict[str, Any]]:
+    """Turn an axis spec into a list of param **blocks**.
+
+    A block is a dict that, when merged into the per-run params,
+    contributes one or more keys. For scalar axes (range / list /
+    const) each block is ``{axis_name: scalar_value}``. For persona
+    axes each block is the flat persona param block produced by
+    ``PersonaProfile.to_params()`` — multiple keys per "value".
+    """
+    if not isinstance(spec, dict):
+        raise ValueError(
+            f"sweep axis {name!r}: spec must be a dict, got "
+            f"{type(spec).__name__}"
+        )
+    kind = (spec.get("type") or "").lower()
+    if kind == "persona":
+        return _materialise_persona_blocks(name, spec, persona_registry)
+    # Scalar — re-use the existing scalar materialiser and wrap each
+    # value in a single-key block.
+    values = _materialise_axis(name, spec)
+    return [{name: v} for v in values]
+
+
+def _materialise_persona_blocks(
+    axis_name: str,
+    spec: AxisSpec,
+    persona_registry: Any,
+) -> List[Dict[str, Any]]:
+    """Resolve a persona axis spec into per-persona param blocks.
+
+    Lazy import of sim_personas so a missing personas module
+    surfaces only when the user actually uses a persona axis,
+    not on every import of sim_sweep.
+    """
+    try:
+        import sim_personas as _sp
+    except Exception as exc:
+        raise ValueError(
+            f"sweep axis {axis_name!r}: persona type requires "
+            f"sim_personas module ({exc!r})"
+        ) from None
+    names_raw = spec.get("names")
+    if names_raw is None:
+        raise ValueError(
+            f"sweep axis {axis_name!r}: persona type needs a 'names' "
+            f"key (a list of persona names or the string \"all\")"
+        )
+    # Without an injected registry, fall back to a built-ins-only
+    # view by giving PersonaRegistry an empty vault dir under the
+    # OS temp dir. The user gets the eight built-in personas but
+    # not their custom personas.json.
+    if persona_registry is None:
+        import tempfile
+        persona_registry = _sp.PersonaRegistry(tempfile.gettempdir())
+    names = persona_registry.expand_names(names_raw)
+    if not names:
+        raise ValueError(
+            f"sweep axis {axis_name!r}: no valid personas resolved from "
+            f"{names_raw!r}"
+        )
+    blocks: List[Dict[str, Any]] = []
+    for n in names:
+        profile = persona_registry.get(n)
+        if profile is None:
+            continue
+        blocks.append(profile.to_params())
+    return blocks
+
 
 def _materialise_axis(name: str, spec: AxisSpec) -> List[Any]:
     """Turn an axis spec into the concrete list of values to try.
