@@ -3244,6 +3244,51 @@ class InstructionManager:
         return sum(1 for e in self._instructions if e.get("active"))
 
 
+# ============================================================
+# Sim persona overlay
+# ============================================================
+# Wraps a ParameterSweep so the picker-selected persona block is
+# merged onto every yielded combo. The user's base axes still win
+# on key conflicts — mirrors merge_persona_params policy so a
+# sweep that explicitly sets persona.greed keeps the override.
+
+def _sim_sweep_has_persona_axis(cfg) -> bool:
+    """True if any axis in the sweep config dict has type=='persona'."""
+    axes = (cfg or {}).get("axes") if isinstance(cfg, dict) else None
+    if not isinstance(axes, dict):
+        return False
+    for spec in axes.values():
+        if isinstance(spec, dict) and str(spec.get("type", "")).lower() == "persona":
+            return True
+    return False
+
+
+class _SimPersonaOverlay:
+    """Iterable wrapper that overlays a persona's params on every
+    combo from the underlying sweep. Exposes the same len + iter
+    contract that run_sweep expects."""
+
+    def __init__(self, sweep, persona):
+        self._sweep = sweep
+        self._persona_params = persona.to_params()
+
+    def __len__(self):
+        return max(1, len(self._sweep))
+
+    def __iter__(self):
+        # If the underlying sweep is empty (no axes), still yield one
+        # combo containing just the persona block so the user can run
+        # "this persona only, no sweep" from the picker.
+        any_yielded = False
+        for combo in self._sweep:
+            any_yielded = True
+            merged = dict(self._persona_params)
+            merged.update(combo)         # base axes win
+            yield merged
+        if not any_yielded:
+            yield dict(self._persona_params)
+
+
 class CouncilConsole(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -11305,13 +11350,17 @@ class CouncilConsole(tk.Tk):
 
     # Default sweep JSON shown in the editor when there is no
     # current sim — gives the user a working example to mutate.
+    # Includes a persona axis so the user sees how to wire it in
+    # alongside scalar axes from the first launch.
     _SIM_DEFAULT_SWEEP = (
         '{\n'
         '  "axes": {\n'
         '    "difficulty": {"type": "range",\n'
-        '                    "start": 1, "stop": 6, "step": 1},\n'
+        '                    "start": 1, "stop": 4, "step": 1},\n'
         '    "starting_gold": {"type": "list",\n'
-        '                       "values": [100, 250, 500]}\n'
+        '                       "values": [100, 250, 500]},\n'
+        '    "playstyle": {"type": "persona",\n'
+        '                   "names": ["Greedy", "Cautious"]}\n'
         '  }\n'
         '}\n'
     )
@@ -11334,11 +11383,16 @@ class CouncilConsole(tk.Tk):
             └───────────────────────────────────────────────────┘
         """
         import sim_recorder as _smrec
+        import sim_personas as _smp
         self.tab_simulations = ttk.Frame(self.nb)
         self.nb.add(self.tab_simulations, text="🎲 Simulations")
 
         # Recorder + state ────────────────────────────────────────
         self._sim_recorder = _smrec.SimRecorder(VAULT_DIR)
+        # Persona registry — merged view of built-ins + user
+        # vault/simulations/personas.json. Threaded into the sweep
+        # parser so persona axes resolve against user customisations.
+        self._sim_personas = _smp.PersonaRegistry(VAULT_DIR)
         self._sim_running = False
         self._sim_cancel = None     # threading.Event when a sweep runs
         self._sim_current_run = None  # id of currently displayed run
@@ -11381,6 +11435,23 @@ class CouncilConsole(tk.Tk):
                                          command=self._sim_stop_sweep,
                                          state="disabled")
         self._sim_stop_btn.pack(side="left", padx=2)
+        # Persona picker — used as a quick way to fire a single run
+        # against one persona without editing the sweep JSON. Set to
+        # "(none)" to leave persona keys out entirely; pick a name to
+        # use that persona's full param block on every run that doesn't
+        # already have a persona axis in the sweep config.
+        ttk.Label(strip2, text="Persona:").pack(side="left", padx=(12, 2))
+        self._sim_persona_var = tk.StringVar(value="(none)")
+        persona_choices = ["(none)"] + self._sim_personas.names()
+        self._sim_persona_menu = ttk.OptionMenu(
+            strip2, self._sim_persona_var,
+            "(none)", *persona_choices,
+        )
+        self._sim_persona_menu.pack(side="left", padx=(0, 4))
+        ttk.Button(strip2, text="↧ Insert axis",
+                   command=self._sim_insert_persona_axis
+                   ).pack(side="left", padx=(0, 8))
+
         self._sim_progress_var = tk.StringVar(
             value="(no sweep running)")
         ttk.Label(strip2, textvariable=self._sim_progress_var,
@@ -11433,13 +11504,15 @@ class CouncilConsole(tk.Tk):
         res_row.pack(fill="both", expand=True)
         self._sim_tree = ttk.Treeview(
             res_row,
-            columns=("sim", "backend", "duration", "params", "metrics", "ok"),
+            columns=("sim", "backend", "persona", "duration",
+                     "params", "metrics", "ok"),
             show="headings",
             selectmode="browse",
         )
         for col, lbl, w in (
             ("sim",      "Sim",       110),
             ("backend",  "Backend",    70),
+            ("persona",  "Persona",    90),
             ("duration", "s",          40),
             ("params",   "Params",    180),
             ("metrics",  "Metrics",   220),
@@ -11488,6 +11561,33 @@ class CouncilConsole(tk.Tk):
         else:
             self._sim_target_label_var.set("Module (.py):")
 
+    def _sim_insert_persona_axis(self) -> None:
+        """Append a ``"playstyle": {"type":"persona", "names": "all"}``
+        axis to the sweep JSON editor. Saves the user from typing the
+        boilerplate every time they want to add persona variation."""
+        snippet = (
+            ',\n    "playstyle": {"type": "persona", "names": "all"}\n'
+        )
+        # Locate the closing `}` of the axes object and inject before it.
+        # If the editor isn't valid JSON, just append the snippet to the
+        # end so the user can adjust manually.
+        raw = self._sim_sweep_text.get("1.0", "end")
+        try:
+            import json as _j
+            cfg = _j.loads(raw)
+            if (isinstance(cfg, dict)
+                    and isinstance(cfg.get("axes"), dict)):
+                cfg["axes"]["playstyle"] = {"type": "persona",
+                                              "names": "all"}
+                pretty = _j.dumps(cfg, indent=2)
+                self._sim_sweep_text.delete("1.0", "end")
+                self._sim_sweep_text.insert("1.0", pretty + "\n")
+                return
+        except Exception:
+            pass
+        # Fallback — just append the snippet at the end.
+        self._sim_sweep_text.insert("end", snippet)
+
     def _sim_browse_target(self) -> None:
         from tkinter import filedialog
         if self._sim_backend_var.get() == "godot":
@@ -11508,18 +11608,33 @@ class CouncilConsole(tk.Tk):
         from tkinter import messagebox
         if self._sim_running:
             return
-        # Parse the sweep JSON
+        # Parse the sweep JSON. Thread the persona registry through so
+        # persona axes resolve against the user's vault customisations.
         try:
             import json as _j
             import sim_sweep as _ss
             cfg = _j.loads(self._sim_sweep_text.get("1.0", "end"))
-            sweep = _ss.ParameterSweep.from_dict(cfg)
+            sweep = _ss.ParameterSweep.from_dict_with_registry(
+                cfg, self._sim_personas,
+            )
         except Exception as exc:
             messagebox.showerror(
                 "Invalid sweep JSON",
                 f"{exc}", parent=self,
             )
             return
+        # If the user picked a persona in the top strip AND the sweep
+        # config doesn't already include a persona axis, overlay the
+        # selected persona on every combo. The base axes still win
+        # on key conflicts (per merge_persona_params policy) so a
+        # sweep that explicitly overrides persona.greed keeps its
+        # override.
+        active_persona = self._sim_persona_var.get()
+        if (active_persona and active_persona != "(none)"
+                and not _sim_sweep_has_persona_axis(cfg)):
+            persona = self._sim_personas.get(active_persona)
+            if persona is not None:
+                sweep = _SimPersonaOverlay(sweep, persona)
         total = len(sweep)
         if total == 0:
             messagebox.showinfo(
@@ -11638,7 +11753,23 @@ class CouncilConsole(tk.Tk):
                     if r.get("sim_name", "").startswith(sim_filter)
                     or sim_filter in r.get("sim_name", "")]
         for entry in runs:
-            params_brief = self._brief_dict(entry.get("params") or {})
+            raw_params = entry.get("params") or {}
+            # Persona column gets the persona_name; the Params column
+            # shows everything ELSE so persona.* keys don't drown out
+            # the scalar params the user actually swept on.
+            persona_name = str(raw_params.get("persona_name") or "")
+            non_persona = {
+                k: v for k, v in raw_params.items()
+                if k == "persona_name"
+                or k == "persona"
+                or k.startswith("persona.")
+                # All persona-related keys filtered out
+            }
+            scalar_params = {
+                k: v for k, v in raw_params.items()
+                if k not in non_persona
+            }
+            params_brief = self._brief_dict(scalar_params)
             metrics_brief = self._brief_dict(entry.get("metrics") or {})
             status = "ok" if entry.get("ok") else "FAIL"
             self._sim_tree.insert(
@@ -11646,6 +11777,7 @@ class CouncilConsole(tk.Tk):
                 values=(
                     entry.get("sim_name", "?"),
                     entry.get("backend", "?"),
+                    persona_name or "—",
                     f"{entry.get('duration_s', 0):.1f}",
                     params_brief,
                     metrics_brief,
@@ -11687,10 +11819,33 @@ class CouncilConsole(tk.Tk):
             ("muted",))
         if run.error:
             d.insert("end", f"\nERROR: {run.error}\n", ("err",))
+        # Persona block first if present, so the playstyle context
+        # leads the read. Other params follow.
+        persona_keys = {
+            k: v for k, v in (run.params or {}).items()
+            if k == "persona_name"
+            or k == "persona"
+            or k.startswith("persona.")
+        }
+        if persona_keys:
+            persona_name = persona_keys.get("persona_name", "?")
+            d.insert("end",
+                f"\npersona: {persona_name}\n", ("muted",))
+            for k in sorted(persona_keys.keys()):
+                if k in ("persona_name", "persona"):
+                    continue
+                # k looks like "persona.greed" → show the axis bare
+                axis = k.split(".", 1)[1] if "." in k else k
+                d.insert("end", f"  {axis:14s} = {persona_keys[k]}\n")
         if run.params:
-            d.insert("end", "\nparams:\n", ("muted",))
-            for k, v in run.params.items():
-                d.insert("end", f"  {k} = {v}\n")
+            non_persona_params = {
+                k: v for k, v in run.params.items()
+                if k not in persona_keys
+            }
+            if non_persona_params:
+                d.insert("end", "\nparams:\n", ("muted",))
+                for k, v in non_persona_params.items():
+                    d.insert("end", f"  {k} = {v}\n")
         if run.metrics:
             d.insert("end", "\nmetrics:\n", ("muted",))
             for k, v in run.metrics.items():
