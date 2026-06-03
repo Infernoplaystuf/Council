@@ -261,6 +261,46 @@ def default_specialists() -> List[Specialist]:
             base_personality="writer",
         ),
         Specialist(
+            id="sim_analyst",
+            name="Sim Analyst",
+            icon="🎲",
+            description=(
+                "Interprets simulation runs — balance reads, "
+                "outlier detection, what to sweep next."
+            ),
+            domain_keywords=[
+                # Sim vocabulary
+                "simulation", "sim", "sims", "sweep", "run",
+                "runs", "param", "params", "parameter", "parameters",
+                "metric", "metrics", "event", "events",
+                # Balance + design terms
+                "balance", "tuning", "outlier", "distribution",
+                "median", "p25", "p50", "p75", "p99",
+                "win rate", "winrate", "kill rate", "ttk",
+                "time to kill", "ttd", "time to death",
+                "drop rate", "spawn rate", "rate",
+                # Statistical readouts
+                "histogram", "scatter", "correlate", "correlation",
+                "trend", "regression", "variance",
+            ],
+            system_prompt_overlay=(
+                "You are a sim-data analyst. ABSOLUTE RULE: never "
+                "invent specific metric values, run counts, or event "
+                "timestamps. If a [SIMULATION RESULT] block is in "
+                "your context, base your answer on those computed "
+                "values and cite them by metric name. If no sim "
+                "context is present, tell the user 'I have no run "
+                "to interpret — open the 🎲 Simulations tab and "
+                "run a sweep first' rather than guessing. When "
+                "recommending next sweeps, name concrete axis "
+                "ranges (e.g. 'try jump_velocity in [400, 700] "
+                "step 50') instead of generic 'tweak it'. Call out "
+                "any failed runs by run id and explain what likely "
+                "went wrong from the error message + stderr tail."
+            ),
+            base_personality="writer",
+        ),
+        Specialist(
             id="steam_market_analyst",
             name="Steam Market Analyst",
             icon="📈",

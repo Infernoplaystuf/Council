@@ -62,7 +62,8 @@ build.bat        # Windows
 | **🛠 Godot Workspace** | The IDE. File tree, GDScript editor, scene-tree view, Run/Validate buttons, console panel. The edit-test-visualise loop lives here. *(Phase C-lite)* |
 | **💡 Game Concepts** | Brainstorm concepts: genre, hook, mechanics, target audience, comparable titles. Ship a concept straight into the Godot Workspace as a scaffolded project. *(Phase B)* |
 | **📈 Steam Market** | Pull current Steam stats (SteamSpy + SteamCharts, or your own Steam Web API key) and ask the Market Analyst what's working in the genre you care about. *(Phase D)* |
-| **🎓 Specialists** | Edit/create domain lenses. Game Designer, Genre Analyst, Steam Market Analyst, plus your own. |
+| **🎲 Simulations** | Run parameter sweeps over a Godot project (headless) or a Python game-model. Telemetry via `ANVIL_METRIC:` / `ANVIL_EVENT:` prints; results persisted under `vault/simulations/`. The Sim Analyst specialist interprets distributions and suggests the next sweep. |
+| **🎓 Specialists** | Edit/create domain lenses. Game Designer, Genre Analyst, Steam Market Analyst, Sim Analyst, plus your own. |
 | **🔍 Lens** | Paste an answer, pick which roles should review it in parallel. Useful when you don't fully trust what the Council just told you. |
 | **🕓 Sessions** | Every past chat. Searchable. Click any to load. |
 | **🗄 Vault** | The shared data pool. Game-design docs, reference scripts, ingested Steam JSON. |

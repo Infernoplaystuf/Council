@@ -3716,6 +3716,7 @@ class CouncilConsole(tk.Tk):
         self._build_godot_workspace_tab()   # Anvil — phase C-lite, customer-facing
         self._build_game_concepts_tab()     # Anvil — phase B,     customer-facing
         self._build_steam_market_tab()      # Anvil — phase D,     customer-facing
+        self._build_simulations_tab()       # Anvil — sim phase,   customer-facing
         self._build_dream3d_tab()
         self._build_grapher_tab()
         self._build_specialists_tab()
@@ -11299,6 +11300,479 @@ class CouncilConsole(tk.Tk):
                 self.nb.select(self.tab_council)
         except Exception as exc:
             print(f"[Steam Market] stage to council failed: {exc!r}")
+
+    # ---- Simulations tab ----
+
+    # Default sweep JSON shown in the editor when there is no
+    # current sim — gives the user a working example to mutate.
+    _SIM_DEFAULT_SWEEP = (
+        '{\n'
+        '  "axes": {\n'
+        '    "difficulty": {"type": "range",\n'
+        '                    "start": 1, "stop": 6, "step": 1},\n'
+        '    "starting_gold": {"type": "list",\n'
+        '                       "values": [100, 250, 500]}\n'
+        '  }\n'
+        '}\n'
+    )
+
+    def _build_simulations_tab(self):
+        """🎲 Simulations — kick off sweeps, browse results.
+
+        Layout (vertical PanedWindow):
+
+            ┌─ Top strip ───────────────────────────────────────┐
+            │ Sim: [name ▼]  Backend [godot|python]             │
+            │ Project / module: [path] [Browse]                 │
+            │ Duration: [s]  [▶ Run sweep] [■ Stop] [Progress]  │
+            ├─ Sweep config ────────────────────────────────────┤
+            │ {JSON editor for the ParameterSweep axes}         │
+            ├─ Results table ───────────────────────────────────┤
+            │ id | sim | backend | params | metrics | error     │
+            ├─ Run detail ──────────────────────────────────────┤
+            │ Selected run's full record + events               │
+            └───────────────────────────────────────────────────┘
+        """
+        import sim_recorder as _smrec
+        self.tab_simulations = ttk.Frame(self.nb)
+        self.nb.add(self.tab_simulations, text="🎲 Simulations")
+
+        # Recorder + state ────────────────────────────────────────
+        self._sim_recorder = _smrec.SimRecorder(VAULT_DIR)
+        self._sim_running = False
+        self._sim_cancel = None     # threading.Event when a sweep runs
+        self._sim_current_run = None  # id of currently displayed run
+
+        # Top strip — sim picker + backend + project + Run controls
+        strip = ttk.Frame(self.tab_simulations)
+        strip.pack(fill="x", padx=6, pady=(6, 4))
+        ttk.Label(strip, text="Sim:").pack(side="left")
+        self._sim_name_var = tk.StringVar(value="my_sim")
+        ttk.Entry(strip, textvariable=self._sim_name_var,
+                   width=18).pack(side="left", padx=(4, 8))
+        ttk.Label(strip, text="Backend:").pack(side="left")
+        self._sim_backend_var = tk.StringVar(value="python")
+        ttk.OptionMenu(strip, self._sim_backend_var,
+                        "python", "python", "godot",
+                        command=lambda _v: self._sim_update_target_label(),
+                        ).pack(side="left", padx=(4, 8))
+        # Target row (different label for python vs godot)
+        self._sim_target_label_var = tk.StringVar(value="Module (.py):")
+        ttk.Label(strip, textvariable=self._sim_target_label_var).pack(
+            side="left")
+        self._sim_target_var = tk.StringVar(value="")
+        ttk.Entry(strip, textvariable=self._sim_target_var,
+                   width=44).pack(side="left", padx=(4, 4),
+                                   fill="x", expand=True)
+        ttk.Button(strip, text="Browse…",
+                   command=self._sim_browse_target).pack(side="left")
+        # Duration + Run buttons
+        strip2 = ttk.Frame(self.tab_simulations)
+        strip2.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(strip2, text="Duration (s):").pack(side="left")
+        self._sim_duration_var = tk.IntVar(value=20)
+        ttk.Spinbox(strip2, from_=2, to=600, increment=2, width=5,
+                     textvariable=self._sim_duration_var
+                     ).pack(side="left", padx=(4, 8))
+        self._sim_run_btn = ttk.Button(strip2, text="▶ Run sweep",
+                                        command=self._sim_run_sweep)
+        self._sim_run_btn.pack(side="left", padx=2)
+        self._sim_stop_btn = ttk.Button(strip2, text="■ Stop",
+                                         command=self._sim_stop_sweep,
+                                         state="disabled")
+        self._sim_stop_btn.pack(side="left", padx=2)
+        self._sim_progress_var = tk.StringVar(
+            value="(no sweep running)")
+        ttk.Label(strip2, textvariable=self._sim_progress_var,
+                  foreground="#a98a8a").pack(side="left", padx=(12, 0))
+
+        # Body — vertical PanedWindow: sweep config → results → detail
+        body = tk.PanedWindow(self.tab_simulations, orient="vertical",
+                               bg="#1a1414", sashwidth=6)
+        body.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # Sweep config editor ─────────────────────────────────────
+        sweep_frame = ttk.Frame(body)
+        body.add(sweep_frame, minsize=120)
+        ttk.Label(sweep_frame,
+                  text="Sweep config (ParameterSweep JSON)",
+                  foreground="#a98a8a"
+                  ).pack(anchor="w")
+        sweep_row = ttk.Frame(sweep_frame)
+        sweep_row.pack(fill="both", expand=True)
+        self._sim_sweep_text = tk.Text(
+            sweep_row, height=8, wrap="none",
+            bg="#0f0c0c", fg="#d4d4d4",
+            insertbackground="#d4d4d4", font=("Consolas", 9),
+        )
+        self._sim_sweep_text.insert("1.0", self._SIM_DEFAULT_SWEEP)
+        ssb = ttk.Scrollbar(sweep_row, orient="vertical",
+                             command=self._sim_sweep_text.yview)
+        self._sim_sweep_text.configure(yscrollcommand=ssb.set)
+        self._sim_sweep_text.pack(side="left", fill="both", expand=True)
+        ssb.pack(side="right", fill="y")
+
+        # Results table ───────────────────────────────────────────
+        res_frame = ttk.Frame(body)
+        body.add(res_frame, minsize=180)
+        res_strip = ttk.Frame(res_frame)
+        res_strip.pack(fill="x")
+        ttk.Label(res_strip, text="Runs (newest first)",
+                  foreground="#a98a8a").pack(side="left")
+        ttk.Button(res_strip, text="⟳ Refresh",
+                   command=self._sim_refresh_results
+                   ).pack(side="right", padx=2)
+        ttk.Button(res_strip, text="🗑 Delete selected",
+                   command=self._sim_delete_selected
+                   ).pack(side="right", padx=2)
+        ttk.Button(res_strip,
+                   text="⚖ Send selected to Council",
+                   command=self._sim_send_to_council
+                   ).pack(side="right", padx=2)
+        res_row = ttk.Frame(res_frame)
+        res_row.pack(fill="both", expand=True)
+        self._sim_tree = ttk.Treeview(
+            res_row,
+            columns=("sim", "backend", "duration", "params", "metrics", "ok"),
+            show="headings",
+            selectmode="browse",
+        )
+        for col, lbl, w in (
+            ("sim",      "Sim",       110),
+            ("backend",  "Backend",    70),
+            ("duration", "s",          40),
+            ("params",   "Params",    180),
+            ("metrics",  "Metrics",   220),
+            ("ok",       "Status",     70),
+        ):
+            self._sim_tree.heading(col, text=lbl)
+            self._sim_tree.column(col, width=w, anchor="w")
+        rsb = ttk.Scrollbar(res_row, orient="vertical",
+                             command=self._sim_tree.yview)
+        self._sim_tree.configure(yscrollcommand=rsb.set)
+        self._sim_tree.pack(side="left", fill="both", expand=True)
+        rsb.pack(side="right", fill="y")
+        self._sim_tree.bind("<<TreeviewSelect>>",
+                              self._sim_on_select)
+
+        # Detail pane ─────────────────────────────────────────────
+        det_frame = ttk.Frame(body)
+        body.add(det_frame, minsize=140)
+        ttk.Label(det_frame, text="Selected run detail",
+                  foreground="#a98a8a").pack(anchor="w")
+        det_row = ttk.Frame(det_frame)
+        det_row.pack(fill="both", expand=True)
+        self._sim_detail = tk.Text(
+            det_row, wrap="word", bg="#0a0808",
+            fg="#d4d4d4", font=("Consolas", 9), state="disabled",
+        )
+        dsb = ttk.Scrollbar(det_row, orient="vertical",
+                             command=self._sim_detail.yview)
+        self._sim_detail.configure(yscrollcommand=dsb.set)
+        self._sim_detail.pack(side="left", fill="both", expand=True)
+        dsb.pack(side="right", fill="y")
+        self._sim_detail.tag_configure("h1",
+            font=("Segoe UI", 11, "bold"), foreground="#e0884a")
+        self._sim_detail.tag_configure("err", foreground="#ff5252")
+        self._sim_detail.tag_configure("muted", foreground="#7a7575")
+
+        # Initial state
+        self._sim_update_target_label()
+        self._sim_refresh_results()
+
+    # ── Helpers — picker + label ────────────────────────────────
+
+    def _sim_update_target_label(self) -> None:
+        if self._sim_backend_var.get() == "godot":
+            self._sim_target_label_var.set("Godot project:")
+        else:
+            self._sim_target_label_var.set("Module (.py):")
+
+    def _sim_browse_target(self) -> None:
+        from tkinter import filedialog
+        if self._sim_backend_var.get() == "godot":
+            path = filedialog.askdirectory(
+                title="Pick a folder containing project.godot",
+            )
+        else:
+            path = filedialog.askopenfilename(
+                title="Pick a Python sim module",
+                filetypes=[("Python", "*.py"), ("All files", "*.*")],
+            )
+        if path:
+            self._sim_target_var.set(path)
+
+    # ── Sweep run ───────────────────────────────────────────────
+
+    def _sim_run_sweep(self) -> None:
+        from tkinter import messagebox
+        if self._sim_running:
+            return
+        # Parse the sweep JSON
+        try:
+            import json as _j
+            import sim_sweep as _ss
+            cfg = _j.loads(self._sim_sweep_text.get("1.0", "end"))
+            sweep = _ss.ParameterSweep.from_dict(cfg)
+        except Exception as exc:
+            messagebox.showerror(
+                "Invalid sweep JSON",
+                f"{exc}", parent=self,
+            )
+            return
+        total = len(sweep)
+        if total == 0:
+            messagebox.showinfo(
+                "Empty sweep",
+                "The sweep would produce zero runs — check your axes.",
+                parent=self,
+            )
+            return
+        if total > 200:
+            if not messagebox.askyesno(
+                "Large sweep",
+                f"This sweep will produce {total} runs. Continue?",
+                parent=self,
+            ):
+                return
+        # Build the runner
+        backend = self._sim_backend_var.get()
+        target = self._sim_target_var.get().strip()
+        if not target:
+            messagebox.showinfo(
+                "Pick a target",
+                "Set a Godot project path or .py module first.",
+                parent=self,
+            )
+            return
+        try:
+            duration = max(2, int(self._sim_duration_var.get() or 20))
+        except Exception:
+            duration = 20
+        try:
+            import sim_runner as _sr
+            if backend == "godot":
+                # Reuse the workspace's binary picker if available
+                try:
+                    import godot_workspace as _gw
+                    godot_bin = _gw.get_godot_binary()
+                except Exception:
+                    godot_bin = "godot"
+                runner = _sr.GodotSimRunner(
+                    target, godot_binary=godot_bin,
+                    duration_s=duration,
+                )
+            else:
+                runner = _sr.PythonSimRunner(
+                    target, timeout_s=duration,
+                )
+        except Exception as exc:
+            messagebox.showerror(
+                "Could not build runner", f"{exc}", parent=self,
+            )
+            return
+
+        sim_name = self._sim_name_var.get().strip() or "untitled"
+        self._sim_running = True
+        self._sim_cancel = threading.Event()
+        self._sim_run_btn.configure(state="disabled")
+        self._sim_stop_btn.configure(state="normal")
+        self._sim_progress_var.set(f"Starting sweep ({total} runs)…")
+
+        def _worker():
+            import sim_sweep as _ss
+            def _on_progress(p):
+                # Marshal to main thread for UI updates
+                def _ui():
+                    self._sim_progress_var.set(
+                        f"{p.completed}/{p.total}  "
+                        + (("⚠ " + (p.error or "")[:40])
+                           if p.error else
+                           f"latest: {p.current!r}"[:80])
+                    )
+                    self._sim_refresh_results()
+                try:
+                    self.after(0, _ui)
+                except Exception:
+                    pass
+            _ss.run_sweep(
+                sweep, runner, self._sim_recorder,
+                sim_name=sim_name,
+                on_progress=_on_progress,
+                cancel=self._sim_cancel,
+            )
+            def _done():
+                self._sim_running = False
+                self._sim_run_btn.configure(state="normal")
+                self._sim_stop_btn.configure(state="disabled")
+                if self._sim_cancel and self._sim_cancel.is_set():
+                    self._sim_progress_var.set(
+                        "Cancelled. Partial results above.")
+                else:
+                    self._sim_progress_var.set(
+                        f"Done. {total} run(s) recorded.")
+                self._sim_refresh_results()
+            try:
+                self.after(0, _done)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True,
+                          name="anvil-sim-sweep").start()
+
+    def _sim_stop_sweep(self) -> None:
+        if self._sim_cancel is not None:
+            self._sim_cancel.set()
+            self._sim_progress_var.set("Cancel requested…")
+
+    # ── Results table ───────────────────────────────────────────
+
+    def _sim_refresh_results(self) -> None:
+        # Wipe and re-populate
+        for iid in self._sim_tree.get_children():
+            self._sim_tree.delete(iid)
+        sim_filter = self._sim_name_var.get().strip()
+        runs = self._sim_recorder.list_runs(limit=200)
+        if sim_filter:
+            runs = [r for r in runs
+                    if r.get("sim_name", "").startswith(sim_filter)
+                    or sim_filter in r.get("sim_name", "")]
+        for entry in runs:
+            params_brief = self._brief_dict(entry.get("params") or {})
+            metrics_brief = self._brief_dict(entry.get("metrics") or {})
+            status = "ok" if entry.get("ok") else "FAIL"
+            self._sim_tree.insert(
+                "", "end", iid=entry["id"],
+                values=(
+                    entry.get("sim_name", "?"),
+                    entry.get("backend", "?"),
+                    f"{entry.get('duration_s', 0):.1f}",
+                    params_brief,
+                    metrics_brief,
+                    status,
+                ),
+            )
+
+    @staticmethod
+    def _brief_dict(d: Dict[str, Any], max_chars: int = 60) -> str:
+        if not d:
+            return ""
+        parts = []
+        for k, v in d.items():
+            if isinstance(v, float):
+                vs = f"{v:.2f}"
+            else:
+                vs = str(v)
+            parts.append(f"{k}={vs}")
+        out = ", ".join(parts)
+        return out if len(out) <= max_chars else out[: max_chars - 1] + "…"
+
+    def _sim_on_select(self, _event=None) -> None:
+        sel = self._sim_tree.selection()
+        if not sel:
+            return
+        run_id = sel[0]
+        self._sim_current_run = run_id
+        run = self._sim_recorder.load_run(run_id)
+        if run is None:
+            return
+        d = self._sim_detail
+        d.configure(state="normal")
+        d.delete("1.0", "end")
+        d.insert("end", f"{run.sim_name}  /  {run.id}\n", ("h1",))
+        d.insert("end",
+            f"backend: {run.backend}   "
+            f"duration: {run.duration_s}s   "
+            f"exit: {run.exit_code}\n",
+            ("muted",))
+        if run.error:
+            d.insert("end", f"\nERROR: {run.error}\n", ("err",))
+        if run.params:
+            d.insert("end", "\nparams:\n", ("muted",))
+            for k, v in run.params.items():
+                d.insert("end", f"  {k} = {v}\n")
+        if run.metrics:
+            d.insert("end", "\nmetrics:\n", ("muted",))
+            for k, v in run.metrics.items():
+                d.insert("end", f"  {k} = {v}\n")
+        if run.events:
+            d.insert("end",
+                f"\nevents ({len(run.events)}):\n", ("muted",))
+            for ev in run.events[:80]:
+                d.insert("end",
+                    f"  [{ev.t:6.2f}s] {ev.name}  {ev.data}\n"
+                )
+            if len(run.events) > 80:
+                d.insert("end",
+                    f"  … plus {len(run.events) - 80} more.\n",
+                    ("muted",))
+        if run.stderr_tail:
+            d.insert("end", "\nstderr (tail):\n", ("muted",))
+            d.insert("end", run.stderr_tail + "\n")
+        d.configure(state="disabled")
+
+    def _sim_delete_selected(self) -> None:
+        from tkinter import messagebox
+        if not self._sim_current_run:
+            return
+        if not messagebox.askyesno(
+            "Delete run?",
+            "Permanently delete this run's JSON record?",
+            parent=self,
+        ):
+            return
+        self._sim_recorder.delete_run(self._sim_current_run)
+        self._sim_current_run = None
+        self._sim_refresh_results()
+
+    def _sim_send_to_council(self) -> None:
+        """Stage the selected run as a critique prompt for the
+        Council via the protected injection slot."""
+        if not self._sim_current_run:
+            return
+        run = self._sim_recorder.load_run(self._sim_current_run)
+        if run is None:
+            return
+        lines = [
+            "[SIMULATION RESULT — reviewed by the Sim Analyst]",
+            f"  sim_name:  {run.sim_name}",
+            f"  backend:   {run.backend}",
+            f"  duration:  {run.duration_s}s",
+            f"  status:    {'ok' if run.ok else 'FAIL'}",
+        ]
+        if run.params:
+            lines.append("  params:")
+            for k, v in run.params.items():
+                lines.append(f"    {k} = {v}")
+        if run.metrics:
+            lines.append("  metrics:")
+            for k, v in run.metrics.items():
+                lines.append(f"    {k} = {v}")
+        if run.events:
+            lines.append(f"  events ({len(run.events)}):")
+            for ev in run.events[:8]:
+                lines.append(f"    [{ev.t:6.2f}s] {ev.name}  {ev.data}")
+            if len(run.events) > 8:
+                lines.append(f"    … plus {len(run.events) - 8} more.")
+        if run.error:
+            lines.append(f"  error:     {run.error}")
+        try:
+            inp = getattr(self, "input", None)
+            if inp is not None:
+                inp.delete("1.0", "end")
+                inp.insert("1.0",
+                    "Interpret this simulation run. Highlight whether "
+                    "the metric values look like a balanced design or "
+                    "an outlier, what the params imply, and what next "
+                    "sweep you'd try.")
+            self._council_attach_injection(
+                label="🎲 Simulation context (read-only)",
+                block="\n".join(lines),
+            )
+            if hasattr(self, "tab_council"):
+                self.nb.select(self.tab_council)
+        except Exception as exc:
+            print(f"[Simulations] stage to council failed: {exc!r}")
 
     # ============================
     # Transcript helpers
