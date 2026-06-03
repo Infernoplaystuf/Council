@@ -5696,6 +5696,73 @@ class CouncilConsole(tk.Tk):
         r"^\s*run\s+(?:the\s+)?workflow\b", _re.IGNORECASE,
     )
 
+    # Sim-analyst intent triggers — recognise questions that should
+    # be answered from the recorded simulations cache rather than
+    # let the model guess. These mirror the patterns in
+    # sim_analyst._XXX_PATTERNS so a question that the analyst can
+    # handle gets routed to it.
+    _SIM_INTENT_RE = _re.compile(
+        r"\b(?:"
+        r"sim|sims|simulation|simulations|sweep|sweeps|"
+        r"(?:per|by|across|each)\s+persona|"
+        r"compare\s+persona|which\s+persona|best\s+persona|"
+        r"last\s+(?:sweep|sim|run|runs)|"
+        r"latest\s+(?:sweep|sim|run|runs)|"
+        r"what\s+(?:did|do)\s+(?:my|the)\s+(?:last|recent|latest)\s+(?:sim|sweep|run)|"
+        r"which\s+runs?\s+(?:failed|crashed|errored)|"
+        r"correlat|relationship\s+between|"
+        r"impact\s+of\s+\w+\s+on|effect\s+of\s+\w+\s+on|"
+        r"how\s+does\s+\w+\s+affect"
+        r")\b",
+        _re.IGNORECASE,
+    )
+
+    def _handle_sim_analyst_intent(self, user_text: str) -> bool:
+        """Detect questions answerable from sim_analyst's compute layer.
+
+        On match: run answer_question(), attach the result block to the
+        protected Council injection slot, and return True. The caller
+        (``_send``) intentionally does NOT return here — we want the
+        council to deliberate over the injected block, the same way
+        the Steam Market handoff works.
+
+        On no match (or any failure): return False so dispatch proceeds
+        without injecting anything.
+        """
+        if not user_text:
+            return False
+        if not self._SIM_INTENT_RE.search(user_text):
+            return False
+        try:
+            import sim_analyst as _sa
+            result = _sa.answer_question(user_text, VAULT_DIR)
+        except Exception as exc:
+            print(f"[sim_intent] analyst failed: {exc!r}")
+            return False
+        # Attach to the protected slot. The user can see the cited
+        # values + Clear them if they want; ``_send`` prepends the
+        # block to user_text at dispatch time.
+        try:
+            self._council_attach_injection(
+                label="🎲 Sim context (computed from vault/simulations, "
+                       "read-only)",
+                block=result.to_injection_block(),
+            )
+        except Exception as exc:
+            print(f"[sim_intent] attach failed: {exc!r}")
+            return False
+        # Surface the analyst answer in the transcript too so the
+        # user sees what was computed even before the council weighs
+        # in. Matches the Steam Market pattern.
+        try:
+            self._append_transcript(
+                "Sim Analyst", result.answer or "(no answer)",
+                "observation",
+            )
+        except Exception:
+            pass
+        return True
+
     def _handle_workflow_intent(self, user_text: str) -> bool:
         """Detect 'run workflow ...' commands and execute them in a worker."""
         if not user_text:
@@ -11497,6 +11564,10 @@ class CouncilConsole(tk.Tk):
                    command=self._sim_delete_selected
                    ).pack(side="right", padx=2)
         ttk.Button(res_strip,
+                   text="⚖ Send sweep to Council",
+                   command=self._sim_send_sweep_to_council
+                   ).pack(side="right", padx=2)
+        ttk.Button(res_strip,
                    text="⚖ Send selected to Council",
                    command=self._sim_send_to_council
                    ).pack(side="right", padx=2)
@@ -11879,6 +11950,57 @@ class CouncilConsole(tk.Tk):
         self._sim_recorder.delete_run(self._sim_current_run)
         self._sim_current_run = None
         self._sim_refresh_results()
+
+    def _sim_send_sweep_to_council(self) -> None:
+        """Hand a sweep-level computed analysis to the Council.
+
+        Pulls the recent runs for the current sim_name, runs the
+        sim_analyst against a generic "summarise" question, and posts
+        the computed block into the protected injection slot. The
+        editable input gets a "Interpret this aggregate" prompt the
+        user can refine.
+        """
+        from tkinter import messagebox
+        try:
+            import sim_analyst as _sa
+        except Exception as exc:
+            messagebox.showerror(
+                "Sim analyst unavailable",
+                f"{exc!r}", parent=self,
+            )
+            return
+        sim_filter = self._sim_name_var.get().strip()
+        # Default query is just "summary" — the analyst's summary route
+        # returns a high-confidence overview of the run set, which is
+        # the right starting point for a Council deliberation.
+        result = _sa.answer_question(
+            "summary of the most recent simulation runs",
+            VAULT_DIR,
+            sim_name=sim_filter,
+        )
+        if result.error and not result.answer:
+            messagebox.showinfo(
+                "No sim data",
+                result.error, parent=self,
+            )
+            return
+        try:
+            inp = getattr(self, "input", None)
+            if inp is not None:
+                inp.delete("1.0", "end")
+                inp.insert("1.0",
+                    "Interpret this aggregate. Call out whether the "
+                    "distribution looks balanced or skewed, whether any "
+                    "persona is dominating, and what a sensible next "
+                    "sweep would look like.")
+            self._council_attach_injection(
+                label="🎲 Sim aggregate context (computed, read-only)",
+                block=result.to_injection_block(),
+            )
+            if hasattr(self, "tab_council"):
+                self.nb.select(self.tab_council)
+        except Exception as exc:
+            print(f"[Simulations] sweep stage failed: {exc!r}")
 
     def _sim_send_to_council(self) -> None:
         """Stage the selected run as a critique prompt for the
@@ -13085,6 +13207,16 @@ class CouncilConsole(tk.Tk):
         if self._handle_vault_tools_intent(user_text):
             self._set_status("● idle")
             return
+
+        # ── Sim Analyst intents (questions about recorded simulations) ──
+        # When the user asks a sim-shaped question, run the deterministic
+        # analyst, attach the computed result to the protected injection
+        # slot, and let the council deliberate over the cited block.
+        # See _handle_sim_analyst_intent for the question patterns.
+        if self._handle_sim_analyst_intent(user_text):
+            # Don't return — we want the council to actually
+            # deliberate. The handler just attached the block.
+            pass
 
         # ── File-listing SAFETY NET ──────────────────────────────────────
         # When the user asks for a list of files in a folder — in ANY
