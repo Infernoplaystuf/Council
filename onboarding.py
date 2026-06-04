@@ -620,23 +620,73 @@ class OnboardingWizard(tk.Toplevel):
         ttk.Button(btn_frame, text="🔄 Re-check",
                    command=self._refresh_gguf_status).pack(side="left", padx=8)
 
-        # Recommended models list
+        # Recommended models list — toggle between text-only and
+        # vision-capable. Vision adds image understanding (the user
+        # can drop screenshots, scans, charts into the vault and the
+        # model can read them) but requires a SECOND .gguf file (the
+        # multimodal projector — mmproj) and twice the disk/VRAM.
         sep = tk.Frame(self.body, bg=self._theme()["muted_fg"], height=1)
         sep.pack(fill="x", pady=12)
-        self._label("Recommended models — click to open the Hugging Face "
-                    "download page in your browser. After downloading, come "
-                    "back and use Browse… to select the .gguf file.",
-                    font=("Segoe UI", 10), fg=self._theme()["muted_fg"],
-                    pady=(0, 8))
 
-        for m in RECOMMENDED_MODELS:
+        # Text-only vs vision toggle
+        toggle_row = tk.Frame(self.body, bg=self._theme()["bg"])
+        toggle_row.pack(fill="x", pady=(0, 6))
+        if not hasattr(self, "_vision_mode_var"):
+            self._vision_mode_var = tk.BooleanVar(value=False)
+        tk.Label(toggle_row, text="Show vision-capable models",
+                 font=("Segoe UI", 10),
+                 bg=self._theme()["bg"], fg=self._theme()["fg"]
+                 ).pack(side="left", padx=(0, 8))
+        ttk.Checkbutton(
+            toggle_row, variable=self._vision_mode_var,
+            command=self._render_step,   # re-render to swap the list
+        ).pack(side="left")
+        # Recommendation badge based on detected VRAM
+        vram = ((self._hw_info or {}).get("vram_gb") or 0)
+        if vram >= 12:
+            badge = "✓ this machine can run vision models"
+            badge_fg = self._theme().get("success")
+        elif vram >= 8:
+            badge = "○ vision works on smaller cards but trims n_ctx"
+            badge_fg = self._theme().get("muted_fg")
+        else:
+            badge = "⚠ vision models need ~10 GB VRAM; you have less"
+            badge_fg = self._theme().get("warning")
+        tk.Label(toggle_row, text=badge, font=("Segoe UI", 9),
+                 bg=self._theme()["bg"], fg=badge_fg
+                 ).pack(side="left", padx=(12, 0))
+
+        showing_vision = bool(self._vision_mode_var.get())
+        models = RECOMMENDED_VISION_MODELS if showing_vision else RECOMMENDED_MODELS
+
+        if showing_vision:
+            self._label(
+                "Vision models — drop image / scan / chart files into "
+                "the vault and the model can read them. Each row "
+                "links to a HF page where you'll download BOTH the "
+                "main weights AND the mmproj file. After both are on "
+                "disk, point COUNCIL_GGUF_PATH at the weights and "
+                "COUNCIL_GGUF_CLIP_PATH at the mmproj.",
+                font=("Segoe UI", 10), fg=self._theme()["muted_fg"],
+                pady=(0, 8))
+        else:
+            self._label(
+                "Recommended models — click to open the Hugging Face "
+                "download page in your browser. After downloading, come "
+                "back and use Browse… to select the .gguf file.",
+                font=("Segoe UI", 10), fg=self._theme()["muted_fg"],
+                pady=(0, 8))
+
+        for m in models:
             row = tk.Frame(self.body, bg=self._theme()["bg"])
             row.pack(fill="x", pady=3)
             tk.Label(row, text=f"  {m['name']}",
                      font=("Segoe UI", 10, "bold"),
                      bg=self._theme()["bg"], fg=self._theme()["fg"]
                      ).pack(side="left")
-            tk.Label(row, text=f"  ·  {m['size']}  ·  {m['ctx']}",
+            tk.Label(row,
+                     text=(f"  ·  {m.get('vendor','?')}  ·  {m['size']}"
+                           + (f"  ·  {m.get('ctx','')}" if m.get('ctx') else "")),
                      font=("Segoe UI", 9),
                      bg=self._theme()["bg"], fg=self._theme()["muted_fg"]
                      ).pack(side="left")

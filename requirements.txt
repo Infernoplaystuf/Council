@@ -92,6 +92,12 @@ huggingface_hub>=0.20    # for huggingface-cli download of GGUF models
 # ---- File parsing for vault analyst / RAG over docs ----
 pypdf>=4.0
 python-docx>=1.1
+Pillow>=10.0             # image EXIF + dimensions for vault_index._parse_image;
+                         # also used by folder_data_summary for image rows.
+                         # Falls back gracefully when absent but with Pillow
+                         # the model sees dimensions, format, capture date,
+                         # camera model, GPS — i.e. the actual content most
+                         # users want when asking about photos / scans.
 duckdb>=0.10             # file-based analytical SQL — .duckdb files
                          # + SELECT-over-CSV/parquet without loading
 pymongo>=4.6             # provides the `bson` module for .bson dumps
