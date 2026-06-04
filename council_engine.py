@@ -848,9 +848,6 @@ def _get_gguf_model():
         sys.stderr.flush()
     except Exception:
         pass
-    _LOG.info("[GGUF] About to call Llama() — if the process exits here "
-              "with no further output, the C extension SIGILL'd. Check "
-              "the CPU feature flags above.")
     # ── Optional vision (multimodal) path ───────────────────────────────
     # When COUNCIL_GGUF_CLIP_PATH points at a valid mmproj/.gguf file,
     # llama-cpp-python attaches a Llava-style chat handler so image
@@ -859,17 +856,32 @@ def _get_gguf_model():
     # such as Llama 3.2 Vision, Phi-4 Multimodal, or Gemma 3.
     #
     # Vision is OPT-IN — when unset, the engine loads text-only as
-    # before. We do not error if the user accidentally pairs a text
-    # model with a clip file; llama-cpp will just ignore image blocks.
+    # before. There are TWO failure modes we have to defend against:
+    #
+    #   (1) Stale clip_path in backend_settings.json from a previous
+    #       wizard run where the user picked vision, then later
+    #       switched to a text-only GGUF (Browse… in the Council tab,
+    #       env var, etc.) without going through the wizard again.
+    #       Attaching a Llava handler to a text-only Llama can crash
+    #       llama-cpp during init — that's exactly the "models are
+    #       not loading" symptom users report.
+    #
+    #   (2) llama-cpp-python version mismatch where Llava15ChatHandler
+    #       imports but its construction or attachment surface has
+    #       moved.
+    #
+    # Both cases are caught by the load-with-retry pattern at the end
+    # of this function — if Llama() raises with a chat_handler in
+    # kwargs, we retry WITHOUT the handler and log the fact loudly.
     chat_handler = None
+    clip_source  = ""   # "env" / "json" / "" for logging
     clip_path_raw = os.environ.get("COUNCIL_GGUF_CLIP_PATH", "").strip()
-    # Fallback — when the env var isn't set, check the persisted wizard
-    # choice in vault/backend_settings.json. This mirrors how
-    # onboarding.load_gguf_path / load_clip_path resolve the GGUF path:
-    # env var first, then persisted JSON. Without this lookup, a user
-    # who picked a vision model in the wizard would NOT actually get
-    # vision until they manually exported the env var.
-    if not clip_path_raw:
+    if clip_path_raw:
+        clip_source = "env"
+    else:
+        # Fallback — when the env var isn't set, check the persisted
+        # wizard choice in vault/backend_settings.json. Same
+        # precedence as onboarding.load_clip_path uses.
         try:
             vault_root = Path(os.environ.get("COUNCIL_VAULT_DIR")
                               or (Path.home() / ".council" / "vault"))
@@ -881,29 +893,34 @@ def _get_gguf_model():
                 clip_path_raw = str(
                     _settings_data.get("clip_path", "") or "").strip()
                 if clip_path_raw:
-                    _LOG.info("[GGUF] clip_path loaded from backend_"
-                              "settings.json: %s", clip_path_raw)
-        except Exception:
+                    clip_source = "json"
+        except Exception as exc:
+            _LOG.warning(
+                "[GGUF] backend_settings.json clip_path read failed: %s",
+                exc,
+            )
             clip_path_raw = ""
+
     if clip_path_raw:
         clip_p = Path(clip_path_raw)
         if clip_p.is_file():
             try:
                 from llama_cpp.llama_chat_format import Llava15ChatHandler  # type: ignore[import]
                 chat_handler = Llava15ChatHandler(clip_model_path=str(clip_p))
-                _LOG.info("[GGUF] vision enabled via mmproj %s", clip_p.name)
+                _LOG.info("[GGUF] vision mmproj loaded via %s: %s",
+                          clip_source, clip_p.name)
                 print(f"[GGUF] Vision mmproj loaded: {clip_p.name}", flush=True)
             except Exception as exc:
                 _LOG.warning(
-                    "[GGUF] COUNCIL_GGUF_CLIP_PATH set but Llava chat "
-                    "handler import failed: %s. Falling back to text-only.",
-                    exc,
+                    "[GGUF] vision mmproj setup failed (%s, source=%s): "
+                    "%s — falling back to text-only.",
+                    clip_path_raw, clip_source, exc,
                 )
                 chat_handler = None
         else:
             _LOG.warning(
-                "[GGUF] COUNCIL_GGUF_CLIP_PATH points at a missing file "
-                "(%s) — ignoring; loading text-only.", clip_path_raw,
+                "[GGUF] clip_path %s (source=%s) does not exist — "
+                "loading text-only.", clip_path_raw, clip_source,
             )
 
     llama_kwargs = dict(
@@ -916,7 +933,55 @@ def _get_gguf_model():
     if chat_handler is not None:
         llama_kwargs["chat_handler"] = chat_handler
 
-    _GGUF_MODEL_INSTANCE = Llama(**llama_kwargs)
+    # Breadcrumb RIGHT before the Llama() call so if the process dies
+    # silently the user can see exactly where. The previous location
+    # was misleading — it printed before the vision/clip lookup ran,
+    # so users saw "About to call Llama()" then a crash that was
+    # actually in the clip-handler setup. Now the message reflects
+    # what's actually about to happen, plus whether vision is attached.
+    print(f"[GGUF] About to call Llama() (vision={'on' if chat_handler else 'off'}) — "
+          f"if the process exits here with no further output, the C "
+          f"extension SIGILL'd or the model file is incompatible. "
+          f"Check the CPU feature flags above.", flush=True)
+    _LOG.info("[GGUF] Llama() call starting (vision=%s)",
+              "on" if chat_handler else "off")
+
+    try:
+        _GGUF_MODEL_INSTANCE = Llama(**llama_kwargs)
+    except Exception as primary_exc:
+        # Failure-mode (1) and (2) from the comment above: if vision
+        # was attached and Llama() crashed, retry without the handler.
+        # llama-cpp's vision path is fragile across version + model
+        # combinations; losing vision is recoverable, but losing the
+        # entire app launch isn't.
+        if chat_handler is not None:
+            _LOG.error(
+                "[GGUF] Llama() FAILED with vision handler attached "
+                "(%s, source=%s): %s. Retrying text-only.",
+                clip_path_raw, clip_source, primary_exc,
+            )
+            print(
+                f"[GGUF] WARNING: model load failed with the vision "
+                f"mmproj attached ({primary_exc!r}).\n"
+                f"        Retrying without vision — your text-only "
+                f"queries will work; image content blocks will not.\n"
+                f"        Fix by either (a) picking a vision-capable "
+                f"main GGUF in the wizard, OR (b) clearing the mmproj "
+                f"via the wizard's 'Clear (text-only)' button.",
+                flush=True,
+            )
+            llama_kwargs.pop("chat_handler", None)
+            _GGUF_MODEL_INSTANCE = Llama(**llama_kwargs)
+            chat_handler = None   # reflect actual state for downstream code
+        else:
+            # No handler involved — re-raise so the user sees the real
+            # error. Adding context first so the traceback is more
+            # useful than llama-cpp's bare error.
+            _LOG.error(
+                "[GGUF] Llama() FAILED loading %s (n_ctx=%d, n_gpu_layers=%d): %s",
+                p.name, n_ctx, n_gpu_layers, primary_exc,
+            )
+            raise
     # Surface the model's advertised max context so the user knows the headroom
     # they have before raising COUNCIL_GGUF_N_CTX. This is a no-op when the
     # GGUF metadata doesn't include the field.
