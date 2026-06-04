@@ -557,9 +557,20 @@ _BSON_SUFFIXES = {".bson"}
 # like .json for keyword indexing so 'show pipeline X' / vault search
 # both pick them up).
 _D3DPIPELINE_SUFFIXES = {".d3dpipeline"}
+# Image files. The indexer stores filename + dimensions + EXIF metadata
+# (date taken, camera model, GPS) when Pillow is available, otherwise
+# just filename + size. The vault search can surface "find photos of
+# Q3 inventory" / "images from this morning" / "all bmp under 1 MB"
+# via the keyword + filter index. Actual image-content understanding
+# requires a multimodal model, which is a separate concern.
+_IMAGE_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
+    ".tiff", ".tif", ".ico", ".heic", ".heif",
+}
 _PARSEABLE = ({".csv", ".json"} | _TEXT_SUFFIXES | _SOURCE_CODE_SUFFIXES
               | _EXCEL_SUFFIXES | _TABULAR_EXTRA | _SQLITE_SUFFIXES
-              | _DUCKDB_SUFFIXES | _BSON_SUFFIXES | _D3DPIPELINE_SUFFIXES)
+              | _DUCKDB_SUFFIXES | _BSON_SUFFIXES | _D3DPIPELINE_SUFFIXES
+              | _IMAGE_SUFFIXES)
 
 
 def _is_gz_csv(p: Path) -> bool:
@@ -1195,6 +1206,81 @@ def _parse_duckdb(p: Path) -> Dict[str, Any]:
     }
 
 
+def _parse_image(p: Path, suffix: str) -> Dict[str, Any]:
+    """Index an image file: dimensions, mode, EXIF (date taken, camera
+    model, GPS) when Pillow is available, otherwise just the filename
+    + extension + size. Returns a dict that the vault search can match
+    by filename tokens / EXIF camera model / capture date — but NOT by
+    image content (that needs a multimodal model, separate concern).
+
+    Pillow is an optional dep. When absent, the record still indexes
+    so the user's image is at least findable by name; the description
+    notes that EXIF wasn't read.
+    """
+    rec: Dict[str, Any] = {
+        "type":         "image",
+        "image_format": suffix.lstrip(".") or "image",
+        "keywords":     sorted(set(_tokenize(p.stem)))[:50],
+    }
+    try:
+        rec["size_bytes"] = p.stat().st_size
+    except Exception:
+        pass
+    try:
+        from PIL import Image, ExifTags  # type: ignore[import]
+    except Exception:
+        rec["indexing"] = "filename only — install Pillow for EXIF + dimensions"
+        return rec
+    try:
+        with Image.open(p) as img:
+            rec["width"]  = img.width
+            rec["height"] = img.height
+            rec["mode"]   = img.mode
+            exif_raw = None
+            try:
+                exif_raw = img.getexif()
+            except Exception:
+                exif_raw = None
+            if exif_raw:
+                # Translate EXIF tag ids to human-readable names so the
+                # vault search vocab gets useful tokens. We keep a small
+                # whitelist of fields users actually search by; the
+                # full EXIF dump can be 50+ fields and most are noise.
+                tag_names = {v: k for k, v in ExifTags.TAGS.items()}
+                keep = {"DateTime", "DateTimeOriginal", "Make", "Model",
+                        "Software", "Artist", "Copyright",
+                        "ImageDescription", "GPSInfo"}
+                exif_clean: Dict[str, Any] = {}
+                for tag_id, val in exif_raw.items():
+                    name = ExifTags.TAGS.get(tag_id, str(tag_id))
+                    if name in keep:
+                        # Coerce bytes / tuples to strings so the JSON
+                        # serialiser in the index doesn't choke.
+                        if isinstance(val, bytes):
+                            try:
+                                val = val.decode("utf-8", errors="replace").strip("\x00 ")
+                            except Exception:
+                                val = repr(val)
+                        elif isinstance(val, (tuple, list)):
+                            val = str(val)
+                        exif_clean[name] = val
+                if exif_clean:
+                    rec["exif"] = exif_clean
+                    # Surface EXIF values as keywords so search hits
+                    # things like "canon eos 5d" or "2024:03:15".
+                    extra_kw = []
+                    for v in exif_clean.values():
+                        extra_kw.extend(_tokenize(str(v)))
+                    rec["keywords"] = sorted(
+                        set(rec["keywords"]) | set(extra_kw)
+                    )[:120]
+    except Exception as exc:
+        # Corrupt image / unsupported codec / permission denied —
+        # still index the filename so the user can find it.
+        rec["indexing"] = f"filename only — could not open image: {exc!r}"
+    return rec
+
+
 def _parse_text(p: Path, suffix: str) -> Dict[str, Any]:
     text = ""
     try:
@@ -1245,6 +1331,13 @@ def _record_has_content(rec: Dict[str, Any]) -> bool:
     if rtype in ("sqlite", "duckdb"):
         return bool(rec.get("tables") or rec.get("keywords"))
 
+    # Image files always count as "has content" — even when PIL isn't
+    # installed we still indexed the filename + size, and the user
+    # should be able to find their photos by name. Stub-rejection
+    # would defeat the point of indexing them in the first place.
+    if rtype == "image":
+        return True
+
     # Plain text / yaml / md / cfg / log / etc. — keyword extraction
     # is the main surface. Require either real keywords OR ≥3 tokenised
     # words from the sample. Tightens the previous "any non-empty
@@ -1288,6 +1381,8 @@ def _index_file(p: Path) -> Optional[Dict[str, Any]]:
         # Source code = plain text with the suffix stored so callers
         # know it's code (e.g. summary_block can label it "type: py").
         rec = _parse_text(p, suffix)
+    elif suffix in _IMAGE_SUFFIXES:
+        rec = _parse_image(p, suffix)
     else:
         return None
     # Skip records that parsed but yielded nothing useful. See
@@ -1696,10 +1791,30 @@ the vocabulary list. Lowercase only. Single line only.
         # collect every (path, mtime) tuple that needs work, THEN parse
         # in parallel. This lets the progress callback emit an accurate
         # total at the start instead of counting up forever.
+        #
+        # Hidden + cache dirs we deliberately skip: .git, .chromadb,
+        # .git_clones, __pycache__, node_modules, .venv. Without this
+        # the walk descended into vault/.chromadb (which can hold
+        # hundreds of .json shards from the embedded ChromaDB store)
+        # and indexed every one — polluting the vocab AND wasting
+        # walk time on each refresh.
+        _WALK_SKIP_DIRS = {
+            "__pycache__", ".git", ".chromadb", ".git_clones",
+            ".venv", "venv", "node_modules", ".cache",
+        }
         to_index: List[Tuple[Path, float]] = []
         seen: Set[str] = set()
         for p in root.rglob("*"):
             if not p.is_file():
+                continue
+            # Bail out as soon as ANY ancestor folder (between `root` and
+            # the file) is a skip-dir. Cheap to check via parts.
+            try:
+                rel_parts = p.relative_to(root).parts[:-1]
+            except ValueError:
+                rel_parts = ()
+            if any(part in _WALK_SKIP_DIRS or part.startswith(".")
+                   for part in rel_parts):
                 continue
             # Skip our own bookkeeping files (index, denylist, semantic
             # cache, backend settings, onboarding marker). Indexing them
@@ -2483,6 +2598,24 @@ the vocabulary list. Lowercase only. Single line only.
             for s in sheets[:6]:
                 cols = ", ".join(map(str, s.get("headers", [])[:15]))
                 lines.append(f"  - {s.get('sheet','?')} ({s.get('rows', 0)} rows): {cols}")
+        elif rtype == "image":
+            lines.append(f"type: image ({rec.get('image_format', '?')})")
+            if rec.get("width") and rec.get("height"):
+                lines.append(f"dimensions: {rec['width']}×{rec['height']}")
+            if rec.get("size_bytes"):
+                sz_kb = rec["size_bytes"] / 1024
+                sz_str = (f"{sz_kb/1024:.1f} MB" if sz_kb > 1024
+                          else f"{sz_kb:.0f} KB")
+                lines.append(f"size: {sz_str}")
+            exif = rec.get("exif") or {}
+            if exif:
+                # Only show the most-searched fields in Tier 1; the
+                # full EXIF dump (if any) goes through keyword matching.
+                for k in ("DateTimeOriginal", "DateTime", "Make", "Model"):
+                    if k in exif:
+                        lines.append(f"{k}: {exif[k]}")
+            if rec.get("indexing"):
+                lines.append(f"note: {rec['indexing']}")
         else:
             lines.append(f"type: {rtype}")
         return lines
