@@ -104,6 +104,13 @@ pymongo>=4.6             # provides the `bson` module for .bson dumps
 SQLAlchemy>=2.0,<3.0     # remote SQL bridge (Postgres / MySQL / MSSQL / ...)
                          # pinned <3.0 because the SQL code paths use
                          # 2.x-style `text()` + `connection.execute()`
+
+# scipy — added in Gate A for the SPC / engineering / stats analyst
+# helpers (process_capability, control_chart_limits, FFT, normality
+# tests, ANOVA). Already present in every installs.txt section as a
+# pip line, but pinning here too closes the gap for pip-only installs
+# and the PyInstaller bundle. ~30 MB.
+scipy>=1.10
 # Optional SQL drivers — install the one you need:
 # psycopg2-binary>=2.9   # PostgreSQL
 # PyMySQL>=1.1           # MySQL / MariaDB

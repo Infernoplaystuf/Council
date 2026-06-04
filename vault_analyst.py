@@ -2711,7 +2711,14 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
 
 
 def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
-    allowed_roots = {"pandas", "pathlib", "numpy", "math", "re", "json", "statistics", "collections"}
+    # scipy added for the SPC / engineering / stats helpers — it has
+    # no filesystem, network, or subprocess surface; it's a pure
+    # numerical library and a safe addition to the sandbox allowlist.
+    allowed_roots = {
+        "pandas", "pathlib", "numpy", "math", "re", "json",
+        "statistics", "collections",
+        "scipy",          # SPC capability indices, ANOVA, FFT, normality tests
+    }
     root = name.split(".")[0]
     if root not in allowed_roots:
         raise ImportError(f"Import blocked by sandbox: {name}")
@@ -2841,6 +2848,19 @@ def execute_pandas_code(
     }
     if np is not None:
         globals_dict["np"] = np
+
+    # Domain helpers — SPC (Gate A), engineering + stats (Gate B).
+    # The register_helpers entry point keeps the wiring centralised so
+    # the sandbox surface for new analytic capabilities lands in one
+    # place, and a registration failure in one helper module (missing
+    # scipy on a CPU-only bundle, say) doesn't take the others down.
+    try:
+        import analyst_helpers as _ah
+        _ah.register_helpers(globals_dict)
+    except Exception as _ah_exc:
+        import sys as _sys_dbg
+        print(f"[analyst] domain helpers not registered: {_ah_exc!r}",
+              file=_sys_dbg.stderr)
 
     # CRITICAL: pass `globals_dict` as BOTH globals and locals. When
     # exec(code, globals, locals) is called with *different* dicts, Python
@@ -3065,6 +3085,24 @@ Remote SQL via SQLAlchemy:
   Connections saved to vault/sql_connections.json. URLs can use
   ${ENV_VAR} placeholders resolved at connect time — keeps passwords
   out of the JSON file.
+
+Manufacturing / SPC helpers (analyst_helpers.spc):
+  process_capability(series, lsl=None, usl=None, subgroup_size=None,
+                     column=None)
+    → dict with Cp / Cpk (short-term, needs subgroup_size) and
+      Pp / Ppk (long-term) plus a normality test result. ALWAYS
+      check normality_ok before reporting Cpk — non-normal data
+      makes Cpk misleading. Returns warnings the model should
+      mention. Either lsl or usl may be None for one-sided specs.
+      For a multi-column DataFrame / CSV, pass column='<name>'.
+  control_chart_limits(series, chart_type='xbar', subgroup_size=None,
+                       column=None)
+    → dict with center, UCL, LCL. Supports 'xbar', 'r', 'i'
+      (individuals), 'mr' (moving range), 'p' (proportion),
+      'np' (count). Constants hardcoded from NIST/ASTM.
+
+For manufacturing data with specification limits, USE process_capability
+and check normality_ok before reporting Cpk values.
 
 Rules:
 - Assign the final answer to a DataFrame named `result_df`.
