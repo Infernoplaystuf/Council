@@ -3315,12 +3315,24 @@ _COMPUTE_KEYWORDS = (
     "summarize the files", "summarize files",
     "summarize the data", "summarize this folder",
     "describe the files", "describe these files", "describe the data",
-    "overview of files", "overview of the folder", "overview of the data",
+    "overview of files", "overview of the files",
+    "overview of the folder", "overview of the data",
     "what's in", "whats in", "what is in",
     "schema of", "schemas of", "schemas in",
+    # Schema-style questions about a single file. These look like
+    # freeform chat ("what columns…") but they're answerable from the
+    # vault index alone — route them through the analyst so the model
+    # doesn't hallucinate column names.
+    "what columns", "which columns", "list columns",
+    "what fields", "which fields", "list fields",
+    "what headers", "which headers", "list headers",
+    "column names", "field names", "header names",
     "profile the", "profile this",
     "inventory", "inventory of", "file inventory",
     "audit the", "audit this", "data quality",
+    # Ranking / extremum questions — top-N, highest, lowest, biggest.
+    "top ", "bottom ", "highest", "lowest", "biggest", "smallest",
+    "most ", "least ", "largest", "rank by",
 )
 
 

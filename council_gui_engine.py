@@ -2094,6 +2094,7 @@ def _run_analyst_step_impl(query):
         "summarize files",
         "describe the files",
         "overview of files",
+        "overview of the files",
         "overview of the data",
         "inventory of files",
         "file inventory",
@@ -9991,6 +9992,11 @@ class CouncilConsole(tk.Tk):
             else:
                 _db.save_sql_connection(VAULT_DIR, name, url)
                 self._vmgr_append(f"saved SQL connection: {name}", "ok")
+        except ValueError as exc:
+            # save_*_connection raises ValueError on empty/scheme-less
+            # input — show the friendly message, not repr().
+            messagebox.showerror("Save failed", str(exc))
+            return
         except Exception as exc:
             messagebox.showerror("Save failed", f"{exc!r}")
             return
@@ -10097,6 +10103,17 @@ class CouncilConsole(tk.Tk):
             tls_warning = result.get("tls_warning")
             if tls_warning:
                 self._vmgr_append(f"TLS posture: {tls_warning}", "info")
+            # If the URL has ${ENV_VAR} placeholders that aren't set,
+            # tell the user EXACTLY which ones — much friendlier than
+            # an opaque auth-fail message from the driver.
+            missing_env = result.get("unresolved_env_vars")
+            if missing_env:
+                self._vmgr_append(
+                    "URL references unset environment variable(s): "
+                    + ", ".join(missing_env)
+                    + " — set them in your shell and re-test.",
+                    "warn",
+                )
         except Exception as exc:
             self._db_conn_status.configure(
                 text=f"✗ test raised {exc!r}",
