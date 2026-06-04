@@ -793,17 +793,52 @@ def print_hardware(hw: dict) -> None:
             warn(n)
 
 
-def print_previous(prev: dict) -> None:
+def print_previous(prev: dict, *, verbose: bool = False) -> None:
+    # ── Conda env ─────────────────────────────────────────────────
     env = prev.get("conda_env", {}) or {}
     if env.get("present"):
         ok(f"existing conda env at {env.get('path') or '(unknown path)'}")
+        tool = env.get("tool")
+        if tool:
+            info(f"   ↳ listed by `{tool} env list`")
     else:
         info("no existing 'council' conda env")
+        # Surface the diagnostic notes so the user can see WHAT we
+        # tried — was conda invokable? did `conda env list` time out?
+        # was the env in a non-standard location?
+        for note in (env.get("notes") or [])[:6]:
+            print(_c("90", f"      {note}"))
+        # Show probed filesystem paths in verbose mode (otherwise it's
+        # ~15 lines of paths nobody reads). Even without --verbose,
+        # show the FIRST FEW so the user can confirm we covered their
+        # install location.
+        candidates = env.get("candidates_checked") or []
+        if candidates:
+            show = candidates if verbose else candidates[:4]
+            print(_c("90",
+                f"      probed {len(candidates)} candidate path(s); "
+                f"{'showing all' if verbose else 'first 4'}:"))
+            for c in show:
+                print(_c("90", f"        {c}"))
+            if not verbose and len(candidates) > 4:
+                print(_c("90",
+                    f"        ... ({len(candidates) - 4} more — "
+                    "pass --verbose to see them all)"))
+
+    # ── Vault ──────────────────────────────────────────────────────
     vlt = prev.get("vault", {}) or {}
     if vlt.get("present"):
         info(f"vault at {vlt['path']}  ({vlt['data_in_files']} file(s) in data_in/)")
+        if vlt.get("has_settings"):
+            info("   ↳ backend_settings.json present (model + clip pairing persisted)")
     else:
         info("no existing vault")
+        for note in (vlt.get("notes") or [])[:4]:
+            print(_c("90", f"      {note}"))
+        for c in (vlt.get("alternates_checked") or []):
+            print(_c("90", f"      also tried: {c}"))
+
+    # ── Models ─────────────────────────────────────────────────────
     models = prev.get("gguf_models") or []
     valid = [m for m in models if m.get("valid")]
     if valid:
@@ -851,6 +886,10 @@ def main() -> int:
                         help="Recreate the env even if one already exists.")
     parser.add_argument("--skip-smoke", action="store_true",
                         help="Skip the post-install smoke test.")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Print every candidate path the detectors "
+                             "probed (useful for diagnosing 'doesn't see "
+                             "my install' reports).")
     args = parser.parse_args()
 
     total = 5
@@ -861,8 +900,18 @@ def main() -> int:
     print_hardware(hw)
 
     step(2, total, "Looking for a previous install")
-    prev = previous_install_detect.detect(HERE, HERE / "vault")
-    print_previous(prev)
+    # Vault lives at ~/.council/vault by GUI convention
+    # (council_gui_engine.py: APP_DIR = Path.home() / ".council";
+    # VAULT_DIR = APP_DIR / "vault"). Passing HERE/'vault' here was
+    # a setup-script bug — it told the detector to look in the wrong
+    # place, which is why users reported "can't find pre-existing
+    # vault that stays consistent normally on where it saves at."
+    vault_canonical = Path.home() / ".council" / "vault"
+    env_name_for_probe = args.env_name or "council"
+    prev = previous_install_detect.detect(
+        HERE, vault_canonical, env_name=env_name_for_probe,
+    )
+    print_previous(prev, verbose=bool(getattr(args, "verbose", False)))
 
     step(3, total, "Build install plan")
     plan = build_plan(hw, prev, args)
