@@ -184,6 +184,38 @@ If a `${PG_PASS}` placeholder ever fails to resolve (the env var isn't set), the
 
 ---
 
+## Operational tuning
+
+A few env vars cover the cases I expect operators to actually need:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `COUNCIL_DB_AUDIT_MAX_MB` | `100` | Cap per `vault/db_audit.log` file. When the current log exceeds this, it's rotated to `db_audit.log.1` and a fresh one is started. |
+| `COUNCIL_DB_AUDIT_KEEP` | `5` | Number of rotated logs kept. Older ones are deleted. Set to `0` to disable rotation entirely. |
+| `COUNCIL_DB_TLS_WARN` | `1` | Set to `0` to suppress the cleartext-credentials-over-non-local-host warning at save/test time. The warning is purely advisory — the connection still works without TLS — but most deployments should fix the URL instead of silencing the warning. |
+
+The app's engine cache (one pooled SQLAlchemy engine per saved connection, up to 16) is automatic and not configurable. Engines are cleaned up at app shutdown via `dispose_engines()`.
+
+## MSSQL SNAPSHOT isolation (opt-in)
+
+MSSQL doesn't have a clean per-session read-only flag like Postgres / MySQL. The canonical defense for MSSQL is the read-only role at layer 1 plus the SQL validator at layer 3 — which is what runs by default.
+
+For belt-and-braces, append `?council_snapshot=on` to the connection URL:
+
+```
+mssql+pyodbc://readonly_user:${MSSQL_PASS}@host:1433/sales?driver=ODBC+Driver+17+for+SQL+Server&council_snapshot=on
+```
+
+When that flag is present, every session issues `SET TRANSACTION ISOLATION LEVEL SNAPSHOT` so the query reads from a consistent snapshot of the database and can't see in-flight writes. **The DB must have `ALLOW_SNAPSHOT_ISOLATION` enabled** (a DB-level setting your DBA controls):
+
+```sql
+ALTER DATABASE sales SET ALLOW_SNAPSHOT_ISOLATION ON;
+```
+
+If the DB rejects the SET command at query time (because snapshot isolation isn't enabled), the engine logs the failure to the audit log and falls back to layers 1 + 3.
+
+The `council_snapshot` flag is stripped from the URL before it reaches the SQLAlchemy driver — pyodbc / ODBC never see it. It's purely an internal hint for the read-only session hint layer.
+
 ## Audit log
 
 Every database action is appended to `vault/db_audit.log` as one JSONL record per line:
@@ -207,6 +239,28 @@ Fields per record kind:
 | `mongo.list_databases` / `mongo.list_collections` | conn, db (for collections), n |
 
 The log file is gitignored along with the rest of `vault/`. Tail it with `tail -f vault/db_audit.log` to watch live, or grep for failed/long queries with `jq` once you have something stored.
+
+When the log exceeds `COUNCIL_DB_AUDIT_MAX_MB` (default 100 MB), it's rotated:
+
+```
+vault/db_audit.log       ← current
+vault/db_audit.log.1     ← previous rotation
+vault/db_audit.log.2
+...
+vault/db_audit.log.5     ← oldest (default keep)
+```
+
+The oldest rotation is deleted when a new one comes in. Set `COUNCIL_DB_AUDIT_KEEP=0` to disable rotation entirely.
+
+## Optional: end-to-end test coverage with mongomock
+
+If you want CI / smoke-test coverage on the live Mongo path (find / aggregate / count / distinct against a real-ish Mongo API), install [`mongomock`](https://pypi.org/project/mongomock/):
+
+```bash
+pip install mongomock
+```
+
+`tests/smoke_test.py` includes a `test_db_mongo_roundtrip_mongomock` case that runs a seeded in-memory Mongo through the same helpers the analyst sandbox uses. The test skips with PASS if mongomock isn't installed — so it never blocks a smoke run on a minimal install. Not a runtime dep; purely a test convenience.
 
 ---
 

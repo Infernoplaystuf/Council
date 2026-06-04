@@ -145,12 +145,173 @@ def _resolve_url(url: str) -> str:
 
 
 # ============================================================
-# Audit log
+# TLS / encryption posture
 # ============================================================
+#
+# We don't FORCE TLS — some deployments have valid reasons for
+# plaintext (local sockets, VPN tunnels, trusted-LAN dev). But when
+# a URL has cleartext credentials AND no TLS hint AND the host
+# clearly isn't local, we surface a warning at save time (UI) and
+# at connection time (audit log). The user can suppress it by
+# setting COUNCIL_DB_TLS_WARN=0.
+
+_LOCAL_HOST_PATTERNS = re.compile(
+    r"(?:^|@)("
+    r"localhost|127\.0\.0\.1|::1|"
+    r"0\.0\.0\.0|"
+    # RFC1918 private ranges — common on LAN deployments
+    r"10\.\d+\.\d+\.\d+|"
+    r"192\.168\.\d+\.\d+|"
+    r"172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+|"
+    # File-based DBs — no network at all
+    r"\.[\\/]"
+    r")",
+    re.IGNORECASE,
+)
+
+# Per-dialect TLS hints we recognise as "TLS already requested"
+_TLS_HINT_PATTERNS = (
+    re.compile(r"sslmode\s*=\s*(?:require|verify[-_]?ca|verify[-_]?full)",
+                re.IGNORECASE),                # postgres
+    re.compile(r"ssl\s*=\s*(?:true|1)", re.IGNORECASE),
+    re.compile(r"ssl_ca\s*=", re.IGNORECASE),  # mysql
+    re.compile(r"tls\s*=\s*(?:true|1)", re.IGNORECASE),
+    re.compile(r"encrypt\s*=\s*(?:yes|true)",
+                re.IGNORECASE),                # mssql
+    re.compile(r"\?.*tls(?:Insecure)?(?:=|$)",
+                re.IGNORECASE),                # mongo &tls=true
+    re.compile(r"^mongodb\+srv://", re.IGNORECASE),  # +srv always TLS
+    re.compile(r"^https?://", re.IGNORECASE),
+    re.compile(r"^sqlite:///", re.IGNORECASE),  # file-based, no network
+    re.compile(r"^duckdb:///", re.IGNORECASE),
+)
+
+
+def _looks_remote(url: str) -> bool:
+    """True when the URL's host is NOT obviously local. Used to gate
+    TLS warnings — we don't warn on localhost / RFC1918 / file URIs."""
+    return not bool(_LOCAL_HOST_PATTERNS.search(url))
+
+
+def _has_tls_hint(url: str) -> bool:
+    """True when the URL has any recognised TLS / encryption hint."""
+    return any(p.search(url) for p in _TLS_HINT_PATTERNS)
+
+
+def _has_cleartext_credentials(url: str) -> bool:
+    """True when the URL contains a literal password (not an
+    ``${ENV_VAR}`` placeholder). Used to gate TLS warnings — a URL
+    with no credentials at all doesn't leak anything by going
+    plaintext."""
+    # Strip env-var placeholders FIRST so a `${PASS}` doesn't trip
+    # the credential detector.
+    no_placeholders = re.sub(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", "", url)
+    # SQLAlchemy / Mongo URI shape: scheme://user:pass@host/...
+    return bool(re.search(r"://[^:/@\s]+:[^@\s]+@", no_placeholders))
+
+
+def check_tls_posture(url: str) -> "Optional[str]":
+    """Returns a warning string when the URL looks like it would
+    send credentials in cleartext over a non-local network, else
+    None. Suppressed entirely when COUNCIL_DB_TLS_WARN=0."""
+    if os.environ.get("COUNCIL_DB_TLS_WARN", "1").strip().lower() in (
+            "0", "false", "no", "off"):
+        return None
+    if not _has_cleartext_credentials(url):
+        # ${ENV_VAR} or no creds — nothing to leak.
+        return None
+    if not _looks_remote(url):
+        # localhost / LAN / file-based — TLS-optional.
+        return None
+    if _has_tls_hint(url):
+        return None
+    return (
+        "⚠ Cleartext credentials over what looks like a non-local "
+        "host without a TLS hint. Add one of: sslmode=require "
+        "(Postgres), ssl=true (MySQL), encrypt=yes (MSSQL), "
+        "tls=true (Mongo). Or replace the password with an "
+        "${ENV_VAR} placeholder. Suppress this check with "
+        "COUNCIL_DB_TLS_WARN=0."
+    )
+
+
+# ============================================================
+# Audit log — size-capped rotation
+# ============================================================
+#
+# Caps default to 100 MB per file, 5 rotations kept (db_audit.log,
+# db_audit.log.1 … db_audit.log.5). Both knobs are env-configurable:
+#
+#   COUNCIL_DB_AUDIT_MAX_MB     (default 100)
+#   COUNCIL_DB_AUDIT_KEEP       (default 5)
+#
+# Rotation runs lazily before each write — when the current log
+# exceeds the cap, we shift db_audit.log.N → .N+1 (oldest deleted),
+# rename db_audit.log → db_audit.log.1, and start a fresh one.
+# Atomic enough for the single-writer pattern; on the unlikely
+# race we may briefly miss a record but never duplicate one.
+
+import threading as _threading
+
+_AUDIT_LOCK = _threading.Lock()
+
+
+def _audit_cap_bytes() -> int:
+    try:
+        mb = int(os.environ.get("COUNCIL_DB_AUDIT_MAX_MB", "100"))
+    except ValueError:
+        mb = 100
+    return max(1, mb) * 1024 * 1024
+
+
+def _audit_keep_count() -> int:
+    try:
+        return max(0, int(os.environ.get("COUNCIL_DB_AUDIT_KEEP", "5")))
+    except ValueError:
+        return 5
+
+
+def _rotate_audit_log(log_path: Path) -> None:
+    """Rotate the audit log when it exceeds the size cap. No-op when
+    under the cap. Never raises."""
+    try:
+        if not log_path.is_file():
+            return
+        if log_path.stat().st_size < _audit_cap_bytes():
+            return
+        keep = _audit_keep_count()
+        # Delete the oldest rotation if at the keep limit
+        oldest = log_path.with_suffix(log_path.suffix + f".{keep}")
+        if oldest.exists():
+            try:
+                oldest.unlink()
+            except Exception:
+                pass
+        # Shift .N → .N+1 working backwards from keep-1 to 1
+        for i in range(keep - 1, 0, -1):
+            src = log_path.with_suffix(log_path.suffix + f".{i}")
+            dst = log_path.with_suffix(log_path.suffix + f".{i+1}")
+            if src.exists():
+                try:
+                    src.rename(dst)
+                except Exception:
+                    pass
+        # Rename current log to .1
+        try:
+            log_path.rename(
+                log_path.with_suffix(log_path.suffix + ".1"))
+        except Exception:
+            pass
+    except Exception:
+        # Rotation failures must NEVER break a query path; the worst
+        # case is that the log grows beyond the cap until next write.
+        pass
+
 
 def _audit(vault_dir: Any, **fields: Any) -> None:
-    """Append a JSONL record to vault/db_audit.log. Best-effort —
-    a log write failure should never break a query."""
+    """Append a JSONL record to vault/db_audit.log with size-capped
+    rotation. Best-effort — a log write failure never breaks a
+    query."""
     try:
         record = {
             "ts":  datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -158,8 +319,10 @@ def _audit(vault_dir: Any, **fields: Any) -> None:
         }
         p = _connections_path(vault_dir, _AUDIT_LOG_FILENAME)
         p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        with _AUDIT_LOCK:
+            _rotate_audit_log(p)
+            with open(p, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception:
         # Never let logging break a query path.
         pass
@@ -270,19 +433,120 @@ def _import_sqlalchemy():
         ) from exc
 
 
+# ── Engine cache ───────────────────────────────────────────────────
+# SQLAlchemy engines are thread-safe and pool connections internally.
+# Creating a new engine per query is expensive on Postgres + MSSQL
+# (DNS, TLS handshake, server-side session setup); on a query-heavy
+# analyst session those costs add up. We cache engines keyed on the
+# RESOLVED URL so a rotated ${ENV_VAR} naturally yields a new entry.
+#
+# Cleanup: dispose_engines() (called explicitly on shutdown) walks
+# the cache and disposes every pool. Also exposed as a smoke-test
+# hook.
+#
+# Eviction: simple LRU over the dict — we keep up to MAX_CACHED
+# engines and dispose the oldest when the cap is exceeded. 16 is
+# plenty for typical analyst workloads (one engine per saved
+# connection).
+
+_ENGINE_CACHE: "Dict[Tuple[str, str], Any]" = {}
+_ENGINE_CACHE_LOCK = _threading.Lock()
+_MAX_CACHED_ENGINES = 16
+
+
+def _strip_council_flags(url: str) -> "Tuple[str, Dict[str, str]]":
+    """Extract our internal ``council_*`` query-string flags from a
+    URL before handing it to SQLAlchemy. SQLAlchemy would otherwise
+    pass them through to the DB driver and produce confusing errors
+    on unknown args. Returns (cleaned_url, flags)."""
+    if "?" not in url:
+        return url, {}
+    head, qs = url.split("?", 1)
+    parts = qs.split("&")
+    keep: List[str] = []
+    flags: Dict[str, str] = {}
+    for part in parts:
+        if "=" in part:
+            k, v = part.split("=", 1)
+        else:
+            k, v = part, ""
+        if k.lower().startswith("council_"):
+            flags[k.lower()] = v.lower()
+        else:
+            keep.append(part)
+    new_url = head + (("?" + "&".join(keep)) if keep else "")
+    return new_url, flags
+
+
 def _sql_engine(vault_dir: Any, conn_name: str):
+    """Return a cached SQLAlchemy engine for the named connection.
+    Engines are keyed on (conn_name, resolved_url) so rotated env
+    vars naturally invalidate the cache."""
     sqlalchemy = _import_sqlalchemy()
     urls = list_sql_connections(vault_dir)
     if conn_name not in urls:
         raise KeyError(f"unknown SQL connection: {conn_name}")
-    resolved = _resolve_url(urls[conn_name])
+    raw = urls[conn_name]
+    resolved = _resolve_url(raw)
+
     # File-URI hardening — SQLite/DuckDB URIs get ?mode=ro appended
-    # if the user didn't already pin it. The file-mode flag is a
-    # bulletproof read-only enforcement at the SQLite engine layer.
+    # when the user didn't already pin it. SQLite-level read-only
+    # enforcement is bulletproof at the file open path.
     if resolved.startswith("sqlite:///") and "mode=ro" not in resolved:
         sep = "&" if "?" in resolved else "?"
         resolved = f"{resolved}{sep}mode=ro&uri=true"
-    return sqlalchemy.create_engine(resolved, pool_pre_ping=True)
+
+    # Strip our internal council_* flags (council_snapshot, etc.)
+    # before SQLAlchemy sees the URL. The flags are stashed on the
+    # returned engine via .info so _apply_read_only_session can read
+    # them later.
+    cleaned, council_flags = _strip_council_flags(resolved)
+
+    cache_key = (str(conn_name), cleaned)
+    with _ENGINE_CACHE_LOCK:
+        cached = _ENGINE_CACHE.get(cache_key)
+        if cached is not None:
+            # Refresh LRU position by re-inserting
+            _ENGINE_CACHE.pop(cache_key, None)
+            _ENGINE_CACHE[cache_key] = cached
+            return cached
+
+        # Build fresh engine. pool_pre_ping bounces dead connections
+        # before handing them to a query — critical for long-lived
+        # cached engines that survive a Mongo/SQL server restart.
+        eng = sqlalchemy.create_engine(
+            cleaned, pool_pre_ping=True, pool_recycle=3600,
+        )
+        # Stash council flags so _apply_read_only_session can pick
+        # up council_snapshot etc. without re-parsing the URL.
+        try:
+            eng.info["council_flags"] = council_flags
+        except Exception:
+            pass
+        _ENGINE_CACHE[cache_key] = eng
+        # Evict oldest if over cap
+        while len(_ENGINE_CACHE) > _MAX_CACHED_ENGINES:
+            oldest_key = next(iter(_ENGINE_CACHE))
+            old_eng = _ENGINE_CACHE.pop(oldest_key)
+            try:
+                old_eng.dispose()
+            except Exception:
+                pass
+        return eng
+
+
+def dispose_engines() -> int:
+    """Dispose every cached engine and clear the cache. Call from the
+    app's shutdown path. Returns the count disposed."""
+    with _ENGINE_CACHE_LOCK:
+        n = len(_ENGINE_CACHE)
+        for eng in list(_ENGINE_CACHE.values()):
+            try:
+                eng.dispose()
+            except Exception:
+                pass
+        _ENGINE_CACHE.clear()
+    return n
 
 
 def _apply_read_only_session(engine, connection) -> List[str]:
@@ -290,11 +554,24 @@ def _apply_read_only_session(engine, connection) -> List[str]:
     notes describing what was applied (used by the audit log).
 
     Failures here are non-fatal — if the DB doesn't support the hint,
-    we still rely on layers 3 (validator) and 4 (API surface)."""
+    we still rely on layers 3 (validator) and 4 (API surface).
+
+    MSSQL: when the connection URL includes ``?council_snapshot=on``,
+    we issue ``SET TRANSACTION ISOLATION LEVEL SNAPSHOT`` so the
+    session reads from a consistent snapshot and cannot see in-
+    flight writes. Requires the DB to have ALLOW_SNAPSHOT_ISOLATION
+    enabled (db-level setting) — when the DB rejects the command we
+    log the failure and continue (layers 1 + 3 still hold).
+    """
     notes: List[str] = []
     sqlalchemy = _import_sqlalchemy()
     text = sqlalchemy.text
     dialect = engine.dialect.name.lower()
+    flags = {}
+    try:
+        flags = engine.info.get("council_flags") or {}
+    except Exception:
+        pass
     try:
         if dialect in ("postgresql", "postgres"):
             connection.execute(text("SET TRANSACTION READ ONLY"))
@@ -303,11 +580,25 @@ def _apply_read_only_session(engine, connection) -> List[str]:
             connection.execute(text("SET SESSION TRANSACTION READ ONLY"))
             notes.append("mysql: SET SESSION TRANSACTION READ ONLY")
         elif dialect in ("mssql", "pyodbc"):
-            # MSSQL doesn't have a read-only session flag per se; the
-            # SNAPSHOT isolation level + a read-only role on the DB
-            # user is the canonical approach. We don't enforce
-            # SNAPSHOT here because it's a DB-level setting.
-            notes.append("mssql: no session hint (rely on DB role + validator)")
+            snapshot = flags.get("council_snapshot", "").lower() in (
+                "on", "true", "1", "yes")
+            if snapshot:
+                try:
+                    connection.execute(
+                        text("SET TRANSACTION ISOLATION LEVEL SNAPSHOT"))
+                    notes.append(
+                        "mssql: SET TRANSACTION ISOLATION LEVEL SNAPSHOT "
+                        "(opt-in via ?council_snapshot=on)")
+                except Exception as exc:
+                    notes.append(
+                        f"mssql: SNAPSHOT request failed ({exc!r}); "
+                        "DB must have ALLOW_SNAPSHOT_ISOLATION ON. "
+                        "Falling back to layers 1+3.")
+            else:
+                notes.append(
+                    "mssql: no session hint (rely on DB role + validator; "
+                    "add ?council_snapshot=on to the URL for SNAPSHOT "
+                    "isolation when the DB supports it)")
         elif dialect == "sqlite":
             # Handled at the URI level via ?mode=ro
             notes.append("sqlite: handled by URI ?mode=ro")
@@ -319,16 +610,16 @@ def _apply_read_only_session(engine, connection) -> List[str]:
 
 
 def list_sql_tables(vault_dir: Any, conn_name: str) -> List[str]:
-    """Inspect a saved connection and return its table names."""
+    """Inspect a saved connection and return its table names.
+
+    Engine is cached — see _sql_engine. Do NOT dispose here.
+    """
     eng = _sql_engine(vault_dir, conn_name)
     sqlalchemy = _import_sqlalchemy()
-    try:
-        names = sorted(sqlalchemy.inspect(eng).get_table_names())
-        _audit(vault_dir, kind="sql.list_tables", conn=conn_name,
-                n_tables=len(names))
-        return names
-    finally:
-        eng.dispose()
+    names = sorted(sqlalchemy.inspect(eng).get_table_names())
+    _audit(vault_dir, kind="sql.list_tables", conn=conn_name,
+            n_tables=len(names))
+    return names
 
 
 def read_sql_table(
@@ -348,17 +639,14 @@ def read_sql_table(
     if limit is not None:
         sql += f" LIMIT {int(limit)}"
     t0 = time.monotonic()
-    try:
-        with eng.connect() as conn:
-            session_notes = _apply_read_only_session(eng, conn)
-            df = pd.read_sql_query(sql, conn)
-        _audit(vault_dir, kind="sql.read_table", conn=conn_name,
-                table=table, rows=len(df),
-                duration_ms=int((time.monotonic() - t0) * 1000),
-                session=session_notes, limit=limit)
-        return df
-    finally:
-        eng.dispose()
+    with eng.connect() as conn:
+        session_notes = _apply_read_only_session(eng, conn)
+        df = pd.read_sql_query(sql, conn)
+    _audit(vault_dir, kind="sql.read_table", conn=conn_name,
+            table=table, rows=len(df),
+            duration_ms=int((time.monotonic() - t0) * 1000),
+            session=session_notes, limit=limit)
+    return df
 
 
 def sql_query(
@@ -372,20 +660,15 @@ def sql_query(
     cleaned = _validate_select_only(sql)
     eng = _sql_engine(vault_dir, conn_name)
     t0 = time.monotonic()
-    try:
-        with eng.connect() as conn:
-            session_notes = _apply_read_only_session(eng, conn)
-            df = pd.read_sql_query(cleaned, conn)
-        _audit(vault_dir, kind="sql.query", conn=conn_name,
-                sql=cleaned[:500],
-                rows=len(df),
-                duration_ms=int((time.monotonic() - t0) * 1000),
-                session=session_notes)
-        return df
-    except ReadOnlyViolation:
-        raise   # already loud + correct
-    finally:
-        eng.dispose()
+    with eng.connect() as conn:
+        session_notes = _apply_read_only_session(eng, conn)
+        df = pd.read_sql_query(cleaned, conn)
+    _audit(vault_dir, kind="sql.query", conn=conn_name,
+            sql=cleaned[:500],
+            rows=len(df),
+            duration_ms=int((time.monotonic() - t0) * 1000),
+            session=session_notes)
+    return df
 
 
 # ============================================================
@@ -601,25 +884,32 @@ def mongo_distinct(
 
 def test_sql_connection(vault_dir: Any, conn_name: str) -> Dict[str, Any]:
     """Best-effort connection probe — returns a result dict for the UI.
-    Doesn't run SELECTs against arbitrary tables, just `SELECT 1`."""
+    Doesn't run SELECTs against arbitrary tables, just ``SELECT 1``.
+    The cached engine remains in the pool after this call (so the
+    subsequent real query reuses the warm connection)."""
     out: Dict[str, Any] = {
         "ok": False, "dialect": None, "tables": 0, "error": None,
+        "tls_warning": None,
     }
+    # TLS posture check — surfaced to the UI on test/save
+    try:
+        urls = list_sql_connections(vault_dir)
+        if conn_name in urls:
+            out["tls_warning"] = check_tls_posture(urls[conn_name])
+    except Exception:
+        pass
     try:
         eng = _sql_engine(vault_dir, conn_name)
         out["dialect"] = eng.dialect.name
         sqlalchemy = _import_sqlalchemy()
+        with eng.connect() as conn:
+            _apply_read_only_session(eng, conn)
+            conn.execute(sqlalchemy.text("SELECT 1"))
         try:
-            with eng.connect() as conn:
-                _apply_read_only_session(eng, conn)
-                conn.execute(sqlalchemy.text("SELECT 1"))
-            try:
-                out["tables"] = len(sqlalchemy.inspect(eng).get_table_names())
-            except Exception:
-                pass
-            out["ok"] = True
-        finally:
-            eng.dispose()
+            out["tables"] = len(sqlalchemy.inspect(eng).get_table_names())
+        except Exception:
+            pass
+        out["ok"] = True
     except Exception as exc:
         out["error"] = repr(exc)
     return out
@@ -629,7 +919,14 @@ def test_mongo_connection(vault_dir: Any, conn_name: str) -> Dict[str, Any]:
     """Best-effort Mongo probe — pings the server, lists databases."""
     out: Dict[str, Any] = {
         "ok": False, "databases": 0, "error": None,
+        "tls_warning": None,
     }
+    try:
+        urls = list_mongo_connections(vault_dir)
+        if conn_name in urls:
+            out["tls_warning"] = check_tls_posture(urls[conn_name])
+    except Exception:
+        pass
     try:
         client = _mongo_client(vault_dir, conn_name, timeout_ms=3000)
         try:
