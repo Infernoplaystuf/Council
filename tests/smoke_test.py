@@ -1,0 +1,353 @@
+"""
+tests/smoke_test.py — fast, no-network, no-dependency smoke tests
+for the modules that are most likely to regress silently across
+platforms.
+
+Runs from any directory; bootstraps sys.path against the repo root.
+Exits 0 on pass, non-zero on first failure. CI gates on the exit
+code; users can run it manually after install via:
+
+    python tests/smoke_test.py
+
+What this covers (and doesn't):
+
+  • hardware_detect.detect() returns the documented dict shape
+    on whatever OS is hosting the test. Doesn't assert specific
+    values — the GPU on CI is whatever the runner has.
+
+  • previous_install_detect.detect() returns the documented dict
+    shape against a temp dir. Verifies the structural contract.
+
+  • Synthetic GGUF round-trip — writes a valid-magic minimal GGUF
+    to a temp file and confirms three independent validators
+    accept it:
+        onboarding.gguf_file_status
+        previous_install_detect._quick_gguf_validate
+        council_engine.read_gguf_metadata
+
+  • Negative cases — non-magic file, too-small file, missing file.
+    Each validator must reject in the documented way.
+
+What this DOES NOT cover (out of scope here):
+  • llama-cpp Llama() construction — needs a real model, real
+    compute, and a GPU on the runner; that belongs in a separate
+    GPU-enabled integration test.
+  • UI / Tkinter — headless CI has no display.
+  • Vault indexing — covered by the existing `python -c \"import vault_index\"`
+    smoke in installs.txt.
+"""
+from __future__ import annotations
+
+import os
+import struct
+import sys
+import tempfile
+import traceback
+from pathlib import Path
+
+
+# ─── Path setup ─────────────────────────────────────────────────────
+HERE = Path(__file__).resolve().parent
+REPO = HERE.parent
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+
+# ─── Test runner ────────────────────────────────────────────────────
+_FAILS: list = []
+_PASSES: list = []
+
+
+def _check(name: str, condition: bool, detail: str = "") -> None:
+    if condition:
+        _PASSES.append(name)
+        print(f"  ✓ {name}")
+    else:
+        _FAILS.append((name, detail))
+        print(f"  ✗ {name}   {detail}")
+
+
+def _run(label: str, fn) -> None:
+    print(f"\n── {label} ──")
+    try:
+        fn()
+    except Exception as exc:
+        _FAILS.append((label, repr(exc)))
+        print(f"  ✗ {label} raised: {exc!r}")
+        traceback.print_exc()
+
+
+# ─── Synthetic GGUF builder ─────────────────────────────────────────
+def _make_synthetic_gguf(path: Path,
+                          arch: str = "llama",
+                          context_length: int = 8192) -> None:
+    """Write a minimum-viable GGUF v3 header to ``path``.
+
+    Layout per https://github.com/ggerganov/ggml/blob/master/docs/gguf.md:
+        4 B  magic = b"GGUF"
+        4 B  version (u32, LE) = 3
+        8 B  tensor_count (u64) = 0
+        8 B  metadata_kv count (u64)
+        for each KV:
+            8 B key_len (u64)
+            <key_len> bytes — utf-8 key
+            4 B value_type (u32)
+            value bytes (variable per type)
+
+    We emit two KVs: general.architecture (string type=8) and
+    {arch}.context_length (u32 type=4). That's enough for
+    read_gguf_metadata + _gguf_max_context_from_metadata to extract
+    the context_length end-to-end.
+    """
+    arch_key = b"general.architecture"
+    ctx_key  = f"{arch}.context_length".encode("utf-8")
+    arch_val = arch.encode("utf-8")
+
+    with open(path, "wb") as fh:
+        # Header
+        fh.write(b"GGUF")
+        fh.write(struct.pack("<I", 3))      # version
+        fh.write(struct.pack("<Q", 0))      # tensor_count
+        fh.write(struct.pack("<Q", 2))      # kv_count
+
+        # KV 1 — general.architecture : string
+        fh.write(struct.pack("<Q", len(arch_key)))
+        fh.write(arch_key)
+        fh.write(struct.pack("<I", 8))      # type = string
+        fh.write(struct.pack("<Q", len(arch_val)))
+        fh.write(arch_val)
+
+        # KV 2 — <arch>.context_length : u32
+        fh.write(struct.pack("<Q", len(ctx_key)))
+        fh.write(ctx_key)
+        fh.write(struct.pack("<I", 4))      # type = u32
+        fh.write(struct.pack("<I", context_length))
+
+        # Pad to 1 KB so the size sanity-check in the validators
+        # doesn't reject it as "suspiciously small".
+        pad_target = 2048
+        cur = fh.tell()
+        if cur < pad_target:
+            fh.write(b"\x00" * (pad_target - cur))
+
+
+# ─── Tests ──────────────────────────────────────────────────────────
+def test_hardware_detect() -> None:
+    import hardware_detect as hd
+    info = hd.detect()
+    _check("returns a dict", isinstance(info, dict))
+    expected_keys = {
+        "os", "os_version", "python", "cpu_brand", "cpu_cores",
+        "ram_gb", "has_avx2", "has_f16c", "gpu_vendor", "gpu_name",
+        "vram_gb", "cuda_max", "recommended", "notes",
+    }
+    missing = expected_keys - set(info)
+    _check(f"all documented keys present (missing={sorted(missing)})",
+           not missing)
+    _check("os value is one of {windows, linux, macos, wsl, unknown}",
+           info.get("os") in ("windows", "linux", "macos", "wsl", "unknown"),
+           detail=f"got {info.get('os')!r}")
+    _check("recommended sub-dict has keys",
+           isinstance(info.get("recommended"), dict)
+           and {"cuda_tier", "model_tier", "model_pick", "n_ctx_max"}.issubset(
+               set(info["recommended"]))
+           )
+    _check("cuda_tier is a known value",
+           info["recommended"]["cuda_tier"] in ("cpu", "cu121", "cu124", "cu128"))
+
+
+def test_previous_install_detect() -> None:
+    import previous_install_detect as pid
+    with tempfile.TemporaryDirectory() as td:
+        app_dir   = Path(td) / "app"
+        vault_dir = Path(td) / "vault"
+        app_dir.mkdir(); vault_dir.mkdir()
+        info = pid.detect(app_dir, vault_dir)
+    _check("returns a dict", isinstance(info, dict))
+    expected_keys = {
+        "conda_env", "vault", "gguf_models",
+        "previous_model", "prior_version", "notes",
+    }
+    missing = expected_keys - set(info)
+    _check(f"all documented keys present (missing={sorted(missing)})",
+           not missing)
+    _check("vault.present matches the temp dir we created",
+           info["vault"]["present"] is True)
+    _check("data_in_files is 0 for empty vault",
+           info["vault"]["data_in_files"] == 0)
+    _check("previous_model is None on empty vault",
+           info["previous_model"] is None)
+
+
+def test_synthetic_gguf_accepted() -> None:
+    """A valid-magic GGUF must pass every validator."""
+    import council_engine as ce
+    import onboarding
+    import previous_install_detect as pid
+
+    with tempfile.TemporaryDirectory() as td:
+        gguf = Path(td) / "test.gguf"
+        _make_synthetic_gguf(gguf, arch="llama", context_length=8192)
+
+        # onboarding.gguf_file_status
+        ok, msg = onboarding.gguf_file_status(str(gguf))
+        _check(f"onboarding.gguf_file_status accepts synthetic GGUF "
+               f"(msg={msg!r})", ok)
+
+        # previous_install_detect._quick_gguf_validate
+        _check("previous_install_detect._quick_gguf_validate accepts it",
+               pid._quick_gguf_validate(gguf))
+
+        # council_engine.read_gguf_metadata round-trip — must produce
+        # a non-empty dict and surface context_length correctly.
+        md = ce.read_gguf_metadata(gguf)
+        _check("read_gguf_metadata returns non-empty dict",
+               isinstance(md, dict) and len(md) > 0,
+               detail=f"got {md!r}")
+        ctx = ce._gguf_max_context_from_metadata(md)
+        _check(f"context_length round-trips through metadata reader "
+               f"(got {ctx})", ctx == 8192)
+
+
+def test_synthetic_gguf_rejected_cases() -> None:
+    """Negative cases — every validator must refuse to accept these."""
+    import council_engine as ce
+    import onboarding
+    import previous_install_detect as pid
+
+    with tempfile.TemporaryDirectory() as td:
+        # Case 1 — non-GGUF magic
+        notgguf = Path(td) / "not.gguf"
+        notgguf.write_bytes(b"<!DOCTYPE html>\n<html>" + b"\0" * 4096)
+        ok, _ = onboarding.gguf_file_status(str(notgguf))
+        _check("non-GGUF magic rejected by onboarding.gguf_file_status",
+               not ok)
+        _check("non-GGUF magic rejected by _quick_gguf_validate",
+               not pid._quick_gguf_validate(notgguf))
+
+        # Case 2 — too small (200 bytes is below the size floor)
+        tiny = Path(td) / "tiny.gguf"
+        tiny.write_bytes(b"GGUF" + b"\0" * 196)
+        ok, _ = onboarding.gguf_file_status(str(tiny))
+        _check("too-small file rejected by onboarding.gguf_file_status",
+               not ok)
+        _check("too-small file rejected by _quick_gguf_validate",
+               not pid._quick_gguf_validate(tiny))
+
+        # Case 3 — missing file
+        missing = Path(td) / "missing.gguf"
+        ok, _ = onboarding.gguf_file_status(str(missing))
+        _check("missing file rejected by onboarding.gguf_file_status",
+               not ok)
+        # read_gguf_metadata on missing file should return {}
+        md = ce.read_gguf_metadata(missing)
+        _check("read_gguf_metadata returns {} on missing file",
+               md == {})
+
+
+def test_data_summary_triggers() -> None:
+    """Data-summary intents must route to the analyst — not freeform.
+    These queries are what makes the Council tab actually capable of
+    answering 'give me a true data summary of files in this subfolder'.
+    """
+    import vault_analyst as va
+    cases = [
+        "give me a true data summary of the files",
+        "what's in the sales subfolder?",
+        "describe the files in data_in/Q3/",
+        "summarize the data in this folder",
+        "overview of the files",
+        "inventory of files in the vault",
+        "data quality on these CSVs",
+        "profile this dataset",
+    ]
+    for q in cases:
+        _check(f"looks_computational matches: {q!r}",
+               va.looks_computational(q),
+               detail="trigger word missing from _COMPUTE_KEYWORDS")
+
+
+def test_folder_data_summary_helper() -> None:
+    """folder_data_summary must:
+       * be importable
+       * return a DataFrame on an empty folder
+       * return one row per file with the documented schema on a
+         folder containing a small CSV + a JSON + an image.
+    """
+    import pandas as pd
+    import vault_analyst as va
+    with tempfile.TemporaryDirectory() as td:
+        td_path = Path(td)
+        # Empty-folder case
+        df_empty = va.folder_data_summary(td_path)
+        _check("returns a DataFrame on empty folder",
+               isinstance(df_empty, pd.DataFrame))
+        _check("empty folder produces 0 rows", len(df_empty) == 0)
+
+        # Mixed-content case
+        (td_path / "orders.csv").write_text(
+            "order_id,total,date\n1,99.5,2024-03-15\n2,150,2024-03-16\n"
+        )
+        (td_path / "config.json").write_text('{"setting": "value"}')
+        (td_path / "logo.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0" * 256)
+        df = va.folder_data_summary(td_path)
+        _check("returns a DataFrame", isinstance(df, pd.DataFrame))
+        _check("documented columns present",
+               {"file", "type", "rows", "columns", "size_kb",
+                "missing_pct"}.issubset(set(df.columns)))
+        types = set(df["type"].astype(str).tolist())
+        _check(f"all three types detected (got {sorted(types)})",
+               {"csv", "json", "image"}.issubset(types))
+        csv_row = df[df["file"] == "orders.csv"]
+        _check("CSV row count correct (2 rows)",
+               not csv_row.empty
+               and int(csv_row.iloc[0]["rows"]) == 2)
+        _check("CSV column count correct (3 cols)",
+               not csv_row.empty
+               and int(csv_row.iloc[0]["columns"]) == 3)
+
+
+def test_vault_image_suffix_routing() -> None:
+    """The image-file routing added in the ship-readiness pass must
+    accept image extensions through _PARSEABLE and produce a record
+    with type='image'. We don't need PIL — the no-PIL branch is what
+    matters for first-run."""
+    import vault_index
+    _check(".png is in _PARSEABLE", ".png" in vault_index._PARSEABLE)
+    _check(".jpg is in _PARSEABLE", ".jpg" in vault_index._PARSEABLE)
+    _check(".gif is in _PARSEABLE", ".gif" in vault_index._PARSEABLE)
+    # Synthetic empty image — the parser should NOT crash and should
+    # still produce a filename record.
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "test.png"
+        p.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0" * 256)
+        rec = vault_index._parse_image(p, ".png")
+    _check("_parse_image returns dict", isinstance(rec, dict))
+    _check("_parse_image record type is 'image'",
+           rec.get("type") == "image")
+
+
+# ─── Main ───────────────────────────────────────────────────────────
+def main() -> int:
+    print("Council smoke tests")
+    print("=" * 70)
+    _run("hardware_detect.detect()",            test_hardware_detect)
+    _run("previous_install_detect.detect()",    test_previous_install_detect)
+    _run("synthetic GGUF — accept case",        test_synthetic_gguf_accepted)
+    _run("synthetic GGUF — reject cases",       test_synthetic_gguf_rejected_cases)
+    _run("data-summary trigger keywords",       test_data_summary_triggers)
+    _run("folder_data_summary helper",          test_folder_data_summary_helper)
+    _run("vault image suffix routing",          test_vault_image_suffix_routing)
+    print()
+    print("=" * 70)
+    print(f"PASSED {len(_PASSES)} · FAILED {len(_FAILS)}")
+    if _FAILS:
+        print("\nFailures:")
+        for name, detail in _FAILS:
+            print(f"  ✗ {name}: {detail}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

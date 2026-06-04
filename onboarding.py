@@ -92,6 +92,49 @@ RECOMMENDED_MODELS = [
 
 
 # ============================================================
+# Vision-capable models — same US-only policy, requires a second
+# .gguf file (the multimodal projector / "mmproj") alongside the
+# main weights. The user points COUNCIL_GGUF_PATH at the LLM and
+# COUNCIL_GGUF_CLIP_PATH at the mmproj.
+# ============================================================
+
+RECOMMENDED_VISION_MODELS = [
+    {
+        "name":    "Llama 3.2 11B Vision Instruct (Q4_K_M)",
+        "vendor":  "Meta",
+        "size":    "~8 GB + ~1 GB mmproj",
+        "vram":    12,
+        "url":     "https://huggingface.co/bartowski/Llama-3.2-11B-Vision-Instruct-GGUF",
+        "mmproj":  "Download the mmproj-llama-3.2-11b-vision-f16.gguf file"
+                   " from the same repo and set COUNCIL_GGUF_CLIP_PATH",
+        "blurb":   "Meta. Strongest US-made vision model that fits on a "
+                   "16 GB GPU. Lets the Council reason about images, "
+                   "charts, scanned documents.",
+    },
+    {
+        "name":    "Phi-4 Multimodal (Q4_K_M)",
+        "vendor":  "Microsoft",
+        "size":    "~9 GB + projector",
+        "vram":    14,
+        "url":     "https://huggingface.co/microsoft/phi-4-multimodal-instruct",
+        "mmproj":  "Microsoft ships the projector alongside the weights",
+        "blurb":   "Microsoft. Vision + speech-aware. Use when you want "
+                   "audio file analysis as well as images.",
+    },
+    {
+        "name":    "Gemma 3 12B Instruct (Q4_K_M)",
+        "vendor":  "Google",
+        "size":    "~7 GB + ~0.5 GB mmproj",
+        "vram":    10,
+        "url":     "https://huggingface.co/bartowski/gemma-3-12b-it-GGUF",
+        "mmproj":  "Download the mmproj-gemma-3-12b-it-f16.gguf file",
+        "blurb":   "Google. Compact vision model. Solid alternative to "
+                   "Llama 3.2 Vision on cards with 10-12 GB VRAM.",
+    },
+]
+
+
+# ============================================================
 # Persistence — shared with the in-app Browse button on the
 # Council tab. Keep the filename and JSON key in sync with
 # council_gui_engine._backend_settings_path / _save_backend_settings.

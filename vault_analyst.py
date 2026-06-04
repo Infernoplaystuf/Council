@@ -1162,6 +1162,266 @@ def find_columns_contains(df: pd.DataFrame, text: str) -> List[str]:
 # Each returns a DataFrame with one row per input CSV.
 # ============================================================
 
+def folder_data_summary(
+    data_folder: Any,
+    recursive: bool = True,
+    max_files: Optional[int] = None,
+    include_image_metadata: bool = True,
+) -> pd.DataFrame:
+    """A "true data summary" of every data file in `data_folder`.
+
+    Returns ONE row per file with the columns the Council's data
+    analytics queries actually want to see — without making the model
+    write per-file code for every question:
+
+        file              file basename
+        relative_path     path relative to its search root
+        type              csv / tsv / parquet / xlsx / json / sqlite /
+                          duckdb / bson / image / text / source / unknown
+        size_kb           file size in KB
+        rows              row count (for tabular formats; null otherwise)
+        columns           column count
+        column_names      comma-joined first 12 column names
+        dtypes            comma-joined dtype shorthand (int, float, str, ...)
+        missing_pct       overall missing-value rate as a percentage (0-100)
+        numeric_cols      count of numeric columns
+        date_cols         count of date / datetime columns
+        sample_value      one representative value from the first non-empty
+                          column (useful for ID-shape sniffing)
+        notes             short freeform diagnostic (errors, warnings)
+
+    Designed for the Council intent "give me a true data summary of
+    files in the <subfolder> folder". The model's analyst step can
+    call it with a single line:
+
+        result_df = folder_data_summary(DATA_FOLDERS)
+
+    and the resulting DataFrame is the answer.
+    """
+    folders = normalize_data_folders(data_folder)
+    rows: list[dict[str, Any]] = []
+
+    # Build a deduped file list across the supported tabular + structured
+    # formats. Image files are reported but not deeply parsed.
+    file_paths: list[Path] = []
+    seen: set = set()
+    for collector in (
+        lambda: list_csv_files(folders, recursive=recursive),
+        lambda: list_excel_files(folders, recursive=recursive),
+        lambda: list_parquet_files(folders, recursive=recursive),
+        lambda: list_sqlite_files(folders, recursive=recursive),
+        lambda: list_duckdb_files(folders, recursive=recursive),
+        lambda: list_bson_files(folders, recursive=recursive),
+    ):
+        try:
+            for p in collector():
+                key = str(p.resolve()).lower()
+                if key not in seen:
+                    seen.add(key)
+                    file_paths.append(p)
+        except Exception:
+            continue
+
+    # Also pick up JSON, plain-text, and image files via folder walks —
+    # these aren't in the collector helpers but are part of "what's in
+    # this folder" from the user's perspective.
+    _EXTRA_EXT = {".json", ".jsonl", ".ndjson", ".txt", ".md",
+                  ".yaml", ".yml", ".xml",
+                  ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
+                  ".tiff", ".tif"}
+    for folder in folders:
+        try:
+            walker = folder.rglob("*") if recursive else folder.glob("*")
+            for p in walker:
+                if not p.is_file():
+                    continue
+                if p.suffix.lower() not in _EXTRA_EXT:
+                    continue
+                key = str(p.resolve()).lower()
+                if key not in seen:
+                    seen.add(key)
+                    file_paths.append(p)
+        except Exception:
+            continue
+
+    if max_files is not None:
+        file_paths = file_paths[:max_files]
+
+    for fp in file_paths:
+        root = first_matching_root(fp, folders)
+        rec: dict[str, Any] = {
+            "file":          fp.name,
+            "relative_path": safe_relative_path(fp, root),
+            "type":          "unknown",
+            "size_kb":       0.0,
+            "rows":          None,
+            "columns":       None,
+            "column_names":  "",
+            "dtypes":        "",
+            "missing_pct":   None,
+            "numeric_cols":  None,
+            "date_cols":     None,
+            "sample_value":  "",
+            "notes":         "",
+        }
+        try:
+            rec["size_kb"] = round(fp.stat().st_size / 1024, 1)
+        except Exception:
+            pass
+
+        suf = fp.suffix.lower()
+        try:
+            if suf in (".csv", ".tsv"):
+                df = _read_csv_cached(fp, sep="\t") if suf == ".tsv" \
+                    else _read_csv_cached(fp)
+                _fill_tabular_summary(rec, df, "csv" if suf == ".csv" else "tsv")
+            elif suf == ".parquet":
+                df = pd.read_parquet(fp)
+                _fill_tabular_summary(rec, df, "parquet")
+            elif suf in (".xlsx", ".xls", ".xlsm"):
+                # Use the first sheet for the headline summary; multi-sheet
+                # files are noted in `notes`.
+                xl = pd.ExcelFile(fp)
+                first_sheet = xl.sheet_names[0] if xl.sheet_names else None
+                if first_sheet is None:
+                    rec["type"] = "excel"
+                    rec["notes"] = "no sheets"
+                else:
+                    df = pd.read_excel(fp, sheet_name=first_sheet)
+                    _fill_tabular_summary(rec, df, "excel")
+                    if len(xl.sheet_names) > 1:
+                        rec["notes"] = (f"first sheet '{first_sheet}'; "
+                                        f"file has {len(xl.sheet_names)} sheets")
+            elif suf in (".json", ".jsonl", ".ndjson"):
+                # JSONL/NDJSON load as records; plain JSON we tabularise
+                # via json_normalize if it's a list of dicts.
+                rec["type"] = "json" if suf == ".json" else "jsonl"
+                try:
+                    if suf == ".json":
+                        import json as _json
+                        data = _json.loads(fp.read_text(encoding="utf-8",
+                                                         errors="replace"))
+                        if isinstance(data, list) and data and isinstance(data[0], dict):
+                            df = pd.json_normalize(data)
+                            _fill_tabular_summary(rec, df, "json")
+                        elif isinstance(data, dict):
+                            rec["columns"] = len(data)
+                            rec["column_names"] = ", ".join(
+                                list(data.keys())[:12])
+                            rec["notes"] = "single object (not a list of records)"
+                    else:
+                        df = pd.read_json(fp, lines=True)
+                        _fill_tabular_summary(rec, df, "jsonl")
+                except Exception as exc:
+                    rec["notes"] = f"json parse failed: {exc}"
+            elif suf in (".db", ".sqlite", ".sqlite3"):
+                rec["type"] = "sqlite"
+                try:
+                    tables = list_sqlite_tables(fp)
+                    rec["columns"] = len(tables)
+                    rec["column_names"] = ", ".join(tables[:12])
+                    rec["notes"] = f"{len(tables)} table(s)"
+                except Exception as exc:
+                    rec["notes"] = f"sqlite read failed: {exc}"
+            elif suf == ".duckdb":
+                rec["type"] = "duckdb"
+                try:
+                    tables = list_duckdb_tables(fp)
+                    rec["columns"] = len(tables)
+                    rec["column_names"] = ", ".join(tables[:12])
+                    rec["notes"] = f"{len(tables)} table(s)"
+                except Exception as exc:
+                    rec["notes"] = f"duckdb read failed: {exc}"
+            elif suf == ".bson":
+                rec["type"] = "bson"
+                try:
+                    docs = read_bson_documents(fp)
+                    rec["rows"] = len(docs)
+                    if docs:
+                        keys = list(docs[0].keys()) if isinstance(docs[0], dict) else []
+                        rec["columns"] = len(keys)
+                        rec["column_names"] = ", ".join(map(str, keys[:12]))
+                except Exception as exc:
+                    rec["notes"] = f"bson read failed: {exc}"
+            elif suf in (".png", ".jpg", ".jpeg", ".gif", ".bmp",
+                          ".webp", ".tiff", ".tif"):
+                rec["type"] = "image"
+                if include_image_metadata:
+                    try:
+                        from PIL import Image  # type: ignore[import]
+                        with Image.open(fp) as img:
+                            rec["columns"] = img.width
+                            rec["rows"]    = img.height
+                            rec["column_names"] = f"mode={img.mode}"
+                            rec["notes"]   = f"{img.width}×{img.height} {img.format or ''}"
+                    except Exception as exc:
+                        rec["notes"] = f"image (PIL unavailable: {exc})"
+                else:
+                    rec["notes"] = "image"
+            elif suf in (".txt", ".md", ".yaml", ".yml", ".xml"):
+                rec["type"] = "text"
+                try:
+                    text = fp.read_text(encoding="utf-8", errors="replace")
+                    rec["rows"] = text.count("\n")
+                    sample = text[:80].replace("\n", " ").strip()
+                    rec["sample_value"] = sample
+                except Exception as exc:
+                    rec["notes"] = f"text read failed: {exc}"
+            else:
+                rec["type"] = "other"
+        except Exception as exc:
+            rec["notes"] = f"profile error: {exc}"
+        rows.append(rec)
+
+    return pd.DataFrame(rows)
+
+
+def _fill_tabular_summary(rec: dict, df: "pd.DataFrame", type_label: str) -> None:
+    """Populate the tabular-summary fields on ``rec`` from ``df``."""
+    try:
+        rec["type"]         = type_label
+        rec["rows"]         = int(len(df))
+        rec["columns"]      = int(len(df.columns))
+        rec["column_names"] = ", ".join(map(str, df.columns[:12]))
+        # Dtype shorthand: keep the names short — int / float / str /
+        # datetime / bool / object — readable in a one-row summary.
+        def _short_dtype(dt) -> str:
+            s = str(dt)
+            if s.startswith("int"):
+                return "int"
+            if s.startswith("float"):
+                return "float"
+            if "datetime" in s:
+                return "datetime"
+            if s == "bool":
+                return "bool"
+            return "str"
+        types = [_short_dtype(d) for d in df.dtypes[:12]]
+        rec["dtypes"] = ", ".join(types)
+        rec["numeric_cols"] = int(
+            df.select_dtypes(include=["number"]).shape[1])
+        try:
+            rec["date_cols"] = int(
+                df.select_dtypes(include=["datetime", "datetimetz"]).shape[1])
+        except Exception:
+            rec["date_cols"] = 0
+        # Missing-value rate — total NaNs / total cells, ×100.
+        total_cells = max(1, len(df) * len(df.columns))
+        rec["missing_pct"] = round(
+            float(df.isna().sum().sum()) / total_cells * 100, 1)
+        # Representative value — first non-null in the first column.
+        if len(df) and len(df.columns):
+            try:
+                non_null = df[df.columns[0]].dropna()
+                if len(non_null):
+                    sv = non_null.iloc[0]
+                    rec["sample_value"] = str(sv)[:60]
+            except Exception:
+                pass
+    except Exception as exc:
+        rec["notes"] = f"summary error: {exc}"
+
+
 def csv_inventory(
     data_folder: Any,
     recursive: bool = True,
@@ -2514,6 +2774,7 @@ def execute_pandas_code(
         "find_column_case_insensitive": find_column_case_insensitive,
         "find_columns_contains": find_columns_contains,
         "csv_inventory": csv_inventory,
+        "folder_data_summary": folder_data_summary,
         "count_rows_per_csv": count_rows_per_csv,
         "average_numeric_column_per_csv": average_numeric_column_per_csv,
         "std_numeric_column_per_csv": std_numeric_column_per_csv,
@@ -2690,6 +2951,17 @@ Available helper functions (prefer these over raw pandas — they handle
 case-insensitive column matching, NaN/zero filtering, and multi-CSV scans):
   list_csv_files(data_folder, recursive=True)
   csv_inventory(data_folder, recursive=True, max_files=None)
+  folder_data_summary(data_folder, recursive=True, max_files=None)
+    THE GO-TO HELPER FOR "GIVE ME A DATA SUMMARY" QUERIES. Returns
+    one row per file across CSV / TSV / Parquet / Excel / JSON /
+    SQLite / DuckDB / BSON / image / text formats with:
+       file, relative_path, type, size_kb, rows, columns,
+       column_names, dtypes, missing_pct, numeric_cols, date_cols,
+       sample_value, notes
+    Use this when the user asks for "a true data summary", "what's
+    in the folder", "describe the files", "schema overview", or
+    "inventory of the subfolder X" — it answers the WHOLE question
+    in one call instead of needing per-file code.
   count_rows_per_csv(data_folder, recursive=True)
   find_column_case_insensitive(df, column_name)
   find_columns_contains(df, text)
@@ -2816,6 +3088,15 @@ Examples:
 Q: How many rows are in each CSV?
 result_df = count_rows_per_csv(DATA_FOLDERS)
 
+Q: Give me a true data summary of the files in this folder.
+Q: What's in this subfolder?  /  Describe the files in here.
+Q: Overview / inventory / profile of the data.
+# `folder_data_summary` answers all of these in one call. The result
+# has rows / columns / dtypes / missing% / sample value per file —
+# everything the user actually means by "summary" without making
+# the model hand-roll per-file logic.
+result_df = folder_data_summary(DATA_FOLDERS)
+
 Q: What is the average rating for each CSV, ignoring zeros?
 result_df = average_numeric_column_per_csv(DATA_FOLDERS, column_name="rating", exclude_zero=True)
 
@@ -2878,6 +3159,21 @@ _COMPUTE_KEYWORDS = (
     "group by", "groupby", "by month", "by year", "by category",
     "filter", "rows with", "rows where", "rows that",
     "which file", "which files", "across files", "across the files",
+    # Data-summary intents — the Council tab needs to handle queries
+    # like "give me a true data summary of files in the sales/
+    # subfolder" through the analyst pipeline (not freeform text from
+    # the model, which can't actually count rows or read schemas).
+    "summary of files", "summary of the files",
+    "data summary", "true data summary",
+    "summarize the files", "summarize files",
+    "summarize the data", "summarize this folder",
+    "describe the files", "describe these files", "describe the data",
+    "overview of files", "overview of the folder", "overview of the data",
+    "what's in", "whats in", "what is in",
+    "schema of", "schemas of", "schemas in",
+    "profile the", "profile this",
+    "inventory", "inventory of", "file inventory",
+    "audit the", "audit this", "data quality",
 )
 
 

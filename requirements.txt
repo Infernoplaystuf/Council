@@ -84,6 +84,7 @@ sentence-transformers>=2.2    # also used by vault_embeddings.py for the
 # COUNCIL_EMBED_MODEL            — sentence-transformer model name
 # COUNCIL_EMBED_DEVICE           — 'cuda' / 'cpu' for embedding model
 # COUNCIL_GGUF_PATH              — path to a .gguf model file (required)
+# COUNCIL_GGUF_CLIP_PATH         — mmproj .gguf for vision (optional)
 # COUNCIL_GGUF_GPU_LAYERS        — default 99 (offload all); 0 = CPU
 # COUNCIL_GGUF_N_THREADS         — CPU threads (default = physical cores)
 huggingface_hub>=0.20    # for huggingface-cli download of GGUF models

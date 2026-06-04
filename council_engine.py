@@ -158,6 +158,13 @@ def _ensure_localhost(url: str, *, allow_remote: bool = False) -> None:
 #   COUNCIL_GGUF_GPU_LAYERS=99         default 99 = offload every layer
 #                                        (no-op on CPU-only builds, so safe);
 #                                        set 0 to force CPU even on a GPU box
+#   COUNCIL_GGUF_CLIP_PATH=...         path to a multimodal projector
+#                                        ("mmproj") .gguf alongside a
+#                                        vision-capable model (Llama 3.2
+#                                        Vision / Phi-4 Multimodal /
+#                                        Gemma 3). Enables image content
+#                                        blocks in create_chat_completion.
+#                                        Optional — text-only when unset.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _council_backend() -> str:
@@ -844,13 +851,50 @@ def _get_gguf_model():
     _LOG.info("[GGUF] About to call Llama() — if the process exits here "
               "with no further output, the C extension SIGILL'd. Check "
               "the CPU feature flags above.")
-    _GGUF_MODEL_INSTANCE = Llama(
+    # ── Optional vision (multimodal) path ───────────────────────────────
+    # When COUNCIL_GGUF_CLIP_PATH points at a valid mmproj/.gguf file,
+    # llama-cpp-python attaches a Llava-style chat handler so image
+    # content blocks become valid in create_chat_completion. The user's
+    # primary GGUF (COUNCIL_GGUF_PATH) must be a vision-capable model
+    # such as Llama 3.2 Vision, Phi-4 Multimodal, or Gemma 3.
+    #
+    # Vision is OPT-IN — when unset, the engine loads text-only as
+    # before. We do not error if the user accidentally pairs a text
+    # model with a clip file; llama-cpp will just ignore image blocks.
+    chat_handler = None
+    clip_path_raw = os.environ.get("COUNCIL_GGUF_CLIP_PATH", "").strip()
+    if clip_path_raw:
+        clip_p = Path(clip_path_raw)
+        if clip_p.is_file():
+            try:
+                from llama_cpp.llama_chat_format import Llava15ChatHandler  # type: ignore[import]
+                chat_handler = Llava15ChatHandler(clip_model_path=str(clip_p))
+                _LOG.info("[GGUF] vision enabled via mmproj %s", clip_p.name)
+                print(f"[GGUF] Vision mmproj loaded: {clip_p.name}", flush=True)
+            except Exception as exc:
+                _LOG.warning(
+                    "[GGUF] COUNCIL_GGUF_CLIP_PATH set but Llava chat "
+                    "handler import failed: %s. Falling back to text-only.",
+                    exc,
+                )
+                chat_handler = None
+        else:
+            _LOG.warning(
+                "[GGUF] COUNCIL_GGUF_CLIP_PATH points at a missing file "
+                "(%s) — ignoring; loading text-only.", clip_path_raw,
+            )
+
+    llama_kwargs = dict(
         model_path=str(p),
         n_ctx=n_ctx,
         n_threads=n_threads,
         n_gpu_layers=n_gpu_layers,
         verbose=False,
     )
+    if chat_handler is not None:
+        llama_kwargs["chat_handler"] = chat_handler
+
+    _GGUF_MODEL_INSTANCE = Llama(**llama_kwargs)
     # Surface the model's advertised max context so the user knows the headroom
     # they have before raising COUNCIL_GGUF_N_CTX. This is a no-op when the
     # GGUF metadata doesn't include the field.
