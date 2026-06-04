@@ -307,6 +307,54 @@ def test_folder_data_summary_helper() -> None:
                and int(csv_row.iloc[0]["columns"]) == 3)
 
 
+def test_clip_path_persistence() -> None:
+    """The vision (mmproj) path must round-trip through backend_settings
+    .json without overwriting the GGUF path stored alongside it. This
+    catches the regression I almost shipped — save_gguf_path() used to
+    overwrite the whole file, which would have wiped clip_path on every
+    model swap."""
+    import onboarding
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td)
+        # Synthesise valid GGUF + mmproj files so the validators don't
+        # reject the paths.
+        gguf  = vault / "weights.gguf"
+        clip  = vault / "mmproj.gguf"
+        _make_synthetic_gguf(gguf, arch="llama", context_length=4096)
+        _make_synthetic_gguf(clip, arch="llama", context_length=4096)
+
+        # 1) Save the GGUF first.
+        onboarding.save_gguf_path(vault, str(gguf))
+        _check("after save_gguf_path, load_gguf_path returns the path",
+               onboarding.load_gguf_path(vault) == str(gguf))
+
+        # Save the clip path — this is the case that broke before the
+        # _merge_backend_settings refactor.
+        onboarding.save_clip_path(vault, str(clip))
+
+        # 2) Both paths must now be readable from the SAME file.
+        _check("load_clip_path round-trips after save_clip_path",
+               onboarding.load_clip_path(vault) == str(clip))
+        _check("save_clip_path did NOT clobber gguf_path",
+               onboarding.load_gguf_path(vault) == str(gguf))
+
+        # 3) Clearing the clip path (text-only mode) must NOT clobber
+        #    the GGUF path either.
+        onboarding.save_clip_path(vault, "")
+        _check("clearing clip_path leaves gguf_path intact",
+               onboarding.load_gguf_path(vault) == str(gguf))
+        _check("clearing clip_path makes load_clip_path return empty",
+               onboarding.load_clip_path(vault) == "")
+
+        # 4) Env-var override beats persisted JSON.
+        try:
+            os.environ["COUNCIL_GGUF_CLIP_PATH"] = "/tmp/env-override.gguf"
+            _check("env var COUNCIL_GGUF_CLIP_PATH wins over JSON",
+                   onboarding.load_clip_path(vault) == "/tmp/env-override.gguf")
+        finally:
+            os.environ.pop("COUNCIL_GGUF_CLIP_PATH", None)
+
+
 def test_vault_image_suffix_routing() -> None:
     """The image-file routing added in the ship-readiness pass must
     accept image extensions through _PARSEABLE and produce a record
@@ -337,6 +385,7 @@ def main() -> int:
     _run("synthetic GGUF — reject cases",       test_synthetic_gguf_rejected_cases)
     _run("data-summary trigger keywords",       test_data_summary_triggers)
     _run("folder_data_summary helper",          test_folder_data_summary_helper)
+    _run("clip_path / GGUF path co-persistence", test_clip_path_persistence)
     _run("vault image suffix routing",          test_vault_image_suffix_routing)
     print()
     print("=" * 70)
