@@ -1927,6 +1927,81 @@ def _run_analyst_step_impl(query):
     except Exception:
         allowed_folders = [VAULT_DIR]
 
+    # ── Direct-intent shortcut for "true data summary" queries ──────
+    # These map deterministically to folder_data_summary() — no model
+    # codegen needed. Saves ~2-5 s per call AND removes a class of
+    # failure mode (the model picking the wrong helper). The trigger
+    # phrases below are a subset of _COMPUTE_KEYWORDS that ONLY make
+    # sense as "summarise everything"; anything ambiguous still goes
+    # through the model.
+    _DIRECT_SUMMARY_TRIGGERS = (
+        "true data summary",
+        "data summary",
+        "summary of the files",
+        "summary of files",
+        "summarize the files",
+        "summarize files",
+        "describe the files",
+        "overview of files",
+        "overview of the data",
+        "inventory of files",
+        "file inventory",
+        "what's in this folder",
+        "what is in this folder",
+        "schema of the files",
+        "schemas of",
+        "profile the data",
+        "profile this folder",
+    )
+    qlower = (query or "").lower()
+    if any(phrase in qlower for phrase in _DIRECT_SUMMARY_TRIGGERS):
+        # Honour subfolder hints exactly like the model path would
+        # (we resolve scope_folder below for the model branch too).
+        try:
+            sub = _va.resolve_subfolder_hint(query, allowed_folders[0])
+        except Exception:
+            sub = None
+        target_folders = [sub] if sub is not None else allowed_folders
+        try:
+            result_df = _va.folder_data_summary(target_folders)
+        except Exception as _e:
+            print('[analyst] direct folder_data_summary failed: '
+                  + repr(_e), file=_sys_dbg.stderr)
+            result_df = None
+        if result_df is not None and not result_df.empty:
+            try:
+                _n_ctx_ds = ce.get_n_ctx()
+            except Exception:
+                _n_ctx_ds = 4096
+            ds_max_tokens = max(150, _n_ctx_ds // 4)
+            table_text = _va.format_result_for_prompt(
+                result_df, max_rows=250, max_chars=12000,
+                max_tokens=ds_max_tokens, count_tokens=ce.estimate_tokens,
+            )
+            scope_str = (f" — scope: {sub.relative_to(allowed_folders[0])}"
+                          if sub is not None else "")
+            block = (f"[ANALYST RESULT — folder_data_summary{scope_str}]\n"
+                     f"# Direct call (no model code-gen). One row per file.\n"
+                     f"{table_text}")
+            notices.append(
+                f"Analyst direct-routed to folder_data_summary"
+                + (f" on subfolder {sub.relative_to(allowed_folders[0])}"
+                   if sub is not None else "")
+                + f" — {len(result_df)} file(s) profiled."
+            )
+            # Also surface the table to the transcript via the same
+            # __ANALYST_TABLE__ payload the model path uses, so the
+            # user sees the actual numbers.
+            try:
+                _user_render = result_df.to_string(index=False,
+                                                    max_rows=80, max_cols=20)
+                notices.append("__ANALYST_TABLE__:" + _user_render)
+            except Exception:
+                pass
+            return block, None, notices
+        # Fall through to the model path if the direct call returned
+        # nothing (empty folder, hint resolved to non-existent path, etc).
+
     # ── Upgrade A+B: pre-resolve filename + subfolder hints ──────────
     # Before sending the prompt to the model, look for explicit
     # filename references ("sales.csv", quoted strings) and folder

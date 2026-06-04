@@ -154,6 +154,19 @@ jobs:
         # into the PyInstaller analysis pass.
         run: python -c "import llama_cpp, pandas, numpy, openpyxl, tkinter, yaml, requests, sentence_transformers, huggingface_hub, pyarrow, duckdb, bson; print('All critical deps OK')"
 
+      - name: Run smoke tests (hardware probe, GGUF validators, etc.)
+        # Calls tests/smoke_test.py which exercises hardware_detect,
+        # previous_install_detect, GGUF magic-byte validation,
+        # synthetic GGUF metadata round-trip, image suffix routing,
+        # data-summary trigger keywords, and the folder_data_summary
+        # helper end-to-end on a temp folder. Pure stdlib + the deps
+        # we just installed — no GPU needed. Catches dependency-ABI
+        # breaks, missing helper functions, and validator regressions
+        # BEFORE PyInstaller spends 15 min building a broken bundle.
+        # Exits 0 on pass, non-zero on first failure → the workflow
+        # stops here if anything regressed.
+        run: python tests/smoke_test.py
+
       - name: Build the bundle (PyInstaller)
         run: python -m PyInstaller council.spec --noconfirm --clean
 

@@ -8,21 +8,23 @@
 # Optional (Phase 3 STT mic): pip install sounddevice soundfile
 # Optional (Phase 3 transcription): pip install faster-whisper
 #
-# DESKTOP BUILD (RTX 5080, 16 GB VRAM):
-#   - Models: qwen2.5:14b-instruct-q4_K_M  (primary — fits comfortably in 16GB)
-#             qwen2.5-coder:14b-instruct-q4_K_M (coder)
-#             qwen2.5:32b-instruct-q4_K_M   (alt/writer — fits if no other model loaded)
-#             phi4                           (fast judge / peasant)
-#   - Context window: num_ctx=8192  (16GB VRAM allows full 8K context)
-#   - Max tokens per call: increased 60-80% vs laptop build
-#   - num_gpu=99: force full GPU offload
-#   - num_keep=128: keep larger system-prompt resident
-#   - OLLAMA_MAX_LOADED_MODELS=2: two models can coexist in 16GB
-#   - Timeouts reduced: 5080 has no cold-load penalty
-# Ollama pull commands:
-#   ollama pull qwen2.5:14b-instruct-q4_K_M
-#   ollama pull qwen2.5-coder:14b-instruct-q4_K_M
-#   ollama pull phi4
+# MODEL POLICY:
+#   All recommended models are from US-based providers (Meta, Microsoft,
+#   IBM, Google, OpenAI). This is a market-share decision — many buyers
+#   in regulated industries (gov, defense, finance, healthcare) can only
+#   deploy AI from US-based companies. The previous defaults (Qwen 2.5
+#   from Alibaba) shipped before that policy was set.
+#
+# DESKTOP BUILD reference (RTX 4080 / 5080, 16 GB VRAM):
+#   Recommended GGUFs (point COUNCIL_GGUF_PATH at one of these):
+#     • Phi-4 14B Q4_K_M           — Microsoft, ~9 GB, best reasoning
+#     • Llama 3.1 8B Q5_K_M        — Meta, ~6 GB, 128K context
+#     • Granite 3.1 8B Q4_K_M      — IBM, ~5 GB, conservative refusal
+#     • Gemma 2 9B Q4_K_M          — Google, ~6 GB, strong instruction following
+#     • gpt-oss-20b Q4_K_M         — OpenAI, ~12 GB, for 24GB+ cards
+#   Context window: auto-detected from GGUF metadata, VRAM-aware
+#   GPU layers: 99 (full offload — no-op on CPU-only builds)
+#   Two-model coexistence dropped along with Ollama; one GGUF at a time.
 # ============================================================
 
 from __future__ import annotations
@@ -156,6 +158,13 @@ def _ensure_localhost(url: str, *, allow_remote: bool = False) -> None:
 #   COUNCIL_GGUF_GPU_LAYERS=99         default 99 = offload every layer
 #                                        (no-op on CPU-only builds, so safe);
 #                                        set 0 to force CPU even on a GPU box
+#   COUNCIL_GGUF_CLIP_PATH=...         path to a multimodal projector
+#                                        ("mmproj") .gguf alongside a
+#                                        vision-capable model (Llama 3.2
+#                                        Vision / Phi-4 Multimodal /
+#                                        Gemma 3). Enables image content
+#                                        blocks in create_chat_completion.
+#                                        Optional — text-only when unset.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _council_backend() -> str:
@@ -842,13 +851,50 @@ def _get_gguf_model():
     _LOG.info("[GGUF] About to call Llama() — if the process exits here "
               "with no further output, the C extension SIGILL'd. Check "
               "the CPU feature flags above.")
-    _GGUF_MODEL_INSTANCE = Llama(
+    # ── Optional vision (multimodal) path ───────────────────────────────
+    # When COUNCIL_GGUF_CLIP_PATH points at a valid mmproj/.gguf file,
+    # llama-cpp-python attaches a Llava-style chat handler so image
+    # content blocks become valid in create_chat_completion. The user's
+    # primary GGUF (COUNCIL_GGUF_PATH) must be a vision-capable model
+    # such as Llama 3.2 Vision, Phi-4 Multimodal, or Gemma 3.
+    #
+    # Vision is OPT-IN — when unset, the engine loads text-only as
+    # before. We do not error if the user accidentally pairs a text
+    # model with a clip file; llama-cpp will just ignore image blocks.
+    chat_handler = None
+    clip_path_raw = os.environ.get("COUNCIL_GGUF_CLIP_PATH", "").strip()
+    if clip_path_raw:
+        clip_p = Path(clip_path_raw)
+        if clip_p.is_file():
+            try:
+                from llama_cpp.llama_chat_format import Llava15ChatHandler  # type: ignore[import]
+                chat_handler = Llava15ChatHandler(clip_model_path=str(clip_p))
+                _LOG.info("[GGUF] vision enabled via mmproj %s", clip_p.name)
+                print(f"[GGUF] Vision mmproj loaded: {clip_p.name}", flush=True)
+            except Exception as exc:
+                _LOG.warning(
+                    "[GGUF] COUNCIL_GGUF_CLIP_PATH set but Llava chat "
+                    "handler import failed: %s. Falling back to text-only.",
+                    exc,
+                )
+                chat_handler = None
+        else:
+            _LOG.warning(
+                "[GGUF] COUNCIL_GGUF_CLIP_PATH points at a missing file "
+                "(%s) — ignoring; loading text-only.", clip_path_raw,
+            )
+
+    llama_kwargs = dict(
         model_path=str(p),
         n_ctx=n_ctx,
         n_threads=n_threads,
         n_gpu_layers=n_gpu_layers,
         verbose=False,
     )
+    if chat_handler is not None:
+        llama_kwargs["chat_handler"] = chat_handler
+
+    _GGUF_MODEL_INSTANCE = Llama(**llama_kwargs)
     # Surface the model's advertised max context so the user knows the headroom
     # they have before raising COUNCIL_GGUF_N_CTX. This is a no-op when the
     # GGUF metadata doesn't include the field.
@@ -4113,14 +4159,18 @@ def _build_default_models(host: str) -> Dict[str, str]:
                 or assigned.get(slot)
                 or hardcoded_fallback)
 
+    # US-only model defaults. The previous fallbacks were Qwen 2.5 (Alibaba)
+    # which blocks the app for buyers in regulated industries that can only
+    # deploy AI from US-based providers. Replaced with Llama (Meta) and
+    # Phi (Microsoft) which cover the same role slots.
     return {
-        "general_primary": _slot("COUNCIL_MODEL_GENERAL_PRIMARY", "general_primary", "qwen2.5:32b-instruct-q4_K_M"),
-        "general_alt":     _slot("COUNCIL_MODEL_GENERAL_ALT",     "general_alt",     "qwen2.5:14b-instruct-q4_K_M"),
-        "coder_primary":   _slot("COUNCIL_MODEL_CODER_PRIMARY",   "coder_primary",   "qwen2.5-coder:14b-instruct-q4_K_M"),
+        "general_primary": _slot("COUNCIL_MODEL_GENERAL_PRIMARY", "general_primary", "llama3.1:8b-instruct-q5_K_M"),
+        "general_alt":     _slot("COUNCIL_MODEL_GENERAL_ALT",     "general_alt",     "llama3.1:8b-instruct-q4_K_M"),
+        "coder_primary":   _slot("COUNCIL_MODEL_CODER_PRIMARY",   "coder_primary",   "phi4"),
         "coder_fast":      _slot("COUNCIL_MODEL_CODER_FAST",      "fast",            "phi4"),
         "judge_fast":      _slot("COUNCIL_MODEL_JUDGE_FAST",      "fast",            "phi4"),
         "peasant_fast":    _slot("COUNCIL_MODEL_PEASANT_FAST",    "fast",            "phi4"),
-        "pi_heavy":        _slot("COUNCIL_MODEL_PI_HEAVY",        "general_alt",     "qwen2.5:14b-instruct-q4_K_M"),
+        "pi_heavy":        _slot("COUNCIL_MODEL_PI_HEAVY",        "general_alt",     "llama3.1:8b-instruct-q4_K_M"),
         "pi_fast":         _slot("COUNCIL_MODEL_PI_FAST",         "fast",            "phi4"),
     }
 

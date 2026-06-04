@@ -26,19 +26,56 @@ This is the home build. No licensing, no trials, no telemetry, no phone-home. If
 
 ## How to run it
 
+The one-command install runs the same way on every supported OS. After cloning the repo, from the project root:
+
+```bash
+# Windows native (PowerShell or cmd):
+setup.bat
+
+# Linux, macOS, WSL:
+./setup.sh
+```
+
+That probes your hardware, picks the right CUDA wheels for your GPU (cu121 / cu124 / cu128 / cpu), creates a conda env named `council`, installs torch + llama-cpp-python + the rest of the Python deps, and runs a smoke test to confirm everything works. Takes 15-25 minutes on a cold start (~2 GB of torch wheels to download). Re-running is safe — the script is idempotent.
+
+After install, activate the env and launch:
+
+```bash
+conda activate council
+python council_gui_engine.py
+```
+
+First launch opens the in-app wizard which detects your hardware again, looks for a previous install we can reuse, recommends a model size based on your VRAM, and offers a checkbox to switch between text-only and vision-capable models. All recommended models are from US-based providers (Meta, Microsoft, IBM, Google).
+
+### Setup options
+
+```bash
+./setup.sh --yes                 # accept all defaults, no prompts
+./setup.sh --cuda-tier cu124     # override auto-detection
+./setup.sh --reinstall           # blow away the existing env
+./setup.sh --skip-install        # print the plan but don't execute
+./setup.sh --skip-smoke          # skip the post-install verification
+./setup.sh --help                # full list
+```
+
+### What the installer does NOT do
+
+- It doesn't auto-install conda on Windows — the silent installer is unreliable. If you don't have conda, the script prints a Miniforge download link and exits cleanly; install conda, re-run `setup.bat`.
+- It doesn't download a model for you. After install, the in-app wizard either reuses a GGUF file it finds in `~/models`, `~/Downloads`, or `~/.cache/huggingface`, or shows you a list of US-made recommendations with one-click HF download links.
+- It doesn't run as administrator. If your conda lives in a system-wide location with restricted write perms, install it user-local first (Miniforge installs into `~/miniforge3` by default).
+
+### Manual install
+
+If you prefer to drive conda + pip yourself, `installs.txt` has the full per-GPU breakdown (Sections A-F covering CPU, RTX 20/30, RTX 40, RTX 50, Linux with dream3dnx, and WSL without).
+
+---
+
 > **Never used WSL or a Linux terminal before?** Skip ahead to
 > [Appendix — WSL / Linux terminal crash course](#appendix--wsl--linux-terminal-crash-course)
 > at the bottom of this README. Five minutes of background that makes
-> every command in this section make sense. Come back here after.
+> every command below make sense. Come back here after.
 
-Three supported paths. Pick the one for your machine.
-
-| If you have                                | Use this path                                         |
-|--------------------------------------------|-------------------------------------------------------|
-| Windows 11 + NVIDIA GPU (recommended)      | [Running on WSL](#running-on-wsl-full-walkthrough)   |
-| Windows native, NVIDIA GPU, want a `.exe`  | [Windows native](#windows-native) — `installs.txt` B/C/D |
-| Native Linux (Ubuntu / Fedora / etc.)      | [Linux native](#linux-native) — `installs.txt` Section E |
-| No NVIDIA GPU (any OS)                     | Same as your OS path above; CPU fallback is automatic |
+The rest of this section is the full step-by-step for users who want a deep dive into the WSL setup, including Windows host prep, GPU passthrough verification, X-server handling on Windows 10, vault placement, and per-failure troubleshooting. If `./setup.sh` worked for you, you can skip it.
 
 ---
 
@@ -386,7 +423,7 @@ python council_gui_engine.py
 
 For a packaged `.exe`:
 
-```bat
+```bash
 pip install pyinstaller
 build.bat
 :: Look in dist\DatasInferno\

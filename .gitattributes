@@ -1,8 +1,9 @@
 # Force LF line endings for shell scripts so a Windows-side clone
-# can still run them inside WSL without "bad interpreter" errors
-# caused by CRLF in the shebang line.
+# can still run them inside WSL / git-bash without "bad interpreter"
+# errors caused by CRLF in the shebang line.
 *.sh text eol=lf
 
-# Same for any other Linux-only entry-point we add later.
+# Linux-only entry points by name (belt + suspenders to the *.sh rule)
+setup.sh     text eol=lf
 setup-wsl.sh text eol=lf
 run-wsl.sh   text eol=lf
