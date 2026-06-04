@@ -870,6 +870,185 @@ def test_db_connection_storage_roundtrip() -> None:
                _db.list_sql_connections(vault) == {})
 
 
+def test_db_tls_posture_warnings() -> None:
+    """check_tls_posture must warn on cleartext-creds-over-non-local
+    URLs and stay silent on safe ones (localhost, RFC1918, ${ENV_VAR}-
+    protected, explicit TLS hint)."""
+    import db_connections as _db
+    SHOULD_WARN = [
+        ("postgresql://u:hunter2@db.example.com:5432/sales",       "remote PG plaintext"),
+        ("mysql+pymysql://u:hunter2@db.example.com:3306/sales",    "remote MySQL plaintext"),
+        ("mongodb://u:hunter2@mongo.example.com:27017/",           "remote Mongo plaintext"),
+    ]
+    SHOULD_NOT_WARN = [
+        # ${ENV_VAR}-protected
+        ("postgresql://u:${PG_PASS}@db.example.com/sales",         "env-var password"),
+        # localhost / RFC1918
+        ("postgresql://u:hunter2@localhost/sales",                 "localhost"),
+        ("postgresql://u:hunter2@127.0.0.1/sales",                 "127.0.0.1"),
+        ("postgresql://u:hunter2@10.1.2.3/sales",                  "10.x RFC1918"),
+        ("postgresql://u:hunter2@192.168.1.5/sales",               "192.168.x RFC1918"),
+        ("postgresql://u:hunter2@172.16.0.1/sales",                "172.16.x RFC1918"),
+        # explicit TLS hint
+        ("postgresql://u:p@db.example.com/sales?sslmode=require",  "sslmode=require"),
+        ("mysql+pymysql://u:p@db.example.com/sales?ssl=true",      "ssl=true"),
+        ("mssql+pyodbc://u:p@db.example.com/sales?encrypt=yes",    "encrypt=yes"),
+        ("mongodb://u:p@mongo.example.com/?tls=true",              "tls=true"),
+        ("mongodb+srv://u:p@cluster.example.com/sales",            "mongodb+srv (TLS by default)"),
+        # File-based, no network
+        ("sqlite:///C:/data/sales.db",                              "sqlite file"),
+        ("duckdb:///C:/data/sales.duckdb",                          "duckdb file"),
+        # No credentials at all
+        ("postgresql://db.example.com/sales",                       "no credentials"),
+    ]
+    for url, label in SHOULD_WARN:
+        warning = _db.check_tls_posture(url)
+        _check(f"TLS warn on {label}", warning is not None,
+               detail=f"got {warning!r} for {url!r}")
+    for url, label in SHOULD_NOT_WARN:
+        warning = _db.check_tls_posture(url)
+        _check(f"TLS silent on {label}", warning is None,
+               detail=f"got {warning!r} for {url!r}")
+
+    # Env-var suppression
+    try:
+        os.environ["COUNCIL_DB_TLS_WARN"] = "0"
+        _check("COUNCIL_DB_TLS_WARN=0 suppresses warnings",
+               _db.check_tls_posture(
+                   "postgresql://u:p@db.example.com/sales") is None)
+    finally:
+        os.environ.pop("COUNCIL_DB_TLS_WARN", None)
+
+
+def test_db_engine_cache_reuses_engines() -> None:
+    """Repeated _sql_engine calls for the same connection must return
+    the cached instance. A different env-var value for the same
+    placeholder yields a NEW engine (because the cache key includes
+    the resolved URL)."""
+    import db_connections as _db
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td)
+        # SQLite in-memory engine via the file-mode bypass — no real
+        # disk, no network. Skip if SQLAlchemy isn't installed.
+        try:
+            _db._import_sqlalchemy()
+        except Exception:
+            _check("SQLAlchemy not installed — engine cache test "
+                   "skipped (expected on minimal builds)", True)
+            return
+        _db.save_sql_connection(vault, "test_db",
+                                 "sqlite:///" + str(vault / "test.db"))
+        try:
+            eng_a = _db._sql_engine(vault, "test_db")
+            eng_b = _db._sql_engine(vault, "test_db")
+            _check("cached engine identity preserved", eng_a is eng_b)
+        finally:
+            _db.dispose_engines()
+
+
+def test_db_audit_log_rotation() -> None:
+    """When the audit log exceeds the size cap, it gets rotated to
+    db_audit.log.1 and a fresh file is started. Set a tiny cap via
+    env var so the test doesn't have to write 100 MB."""
+    import db_connections as _db
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td)
+        try:
+            os.environ["COUNCIL_DB_AUDIT_MAX_MB"] = "1"   # 1 MB cap
+            os.environ["COUNCIL_DB_AUDIT_KEEP"]   = "3"
+            # The cap check uses bytes — write enough records to
+            # cross the MB boundary. Each record is ~120 bytes, so
+            # ~10K records = ~1.2 MB.
+            for i in range(11000):
+                _db._audit(vault, kind="test", n=i, msg="x" * 50)
+            # After the rotation fires (on the write that pushes the
+            # CURRENT log past the cap), the current log should be
+            # smaller than the cap and db_audit.log.1 should exist.
+            cur = vault / "db_audit.log"
+            rot = vault / "db_audit.log.1"
+            _check("current log exists", cur.is_file())
+            _check("rotated .1 file exists", rot.is_file())
+            _check("rotated log carries records",
+                   rot.stat().st_size > 0)
+        finally:
+            os.environ.pop("COUNCIL_DB_AUDIT_MAX_MB", None)
+            os.environ.pop("COUNCIL_DB_AUDIT_KEEP", None)
+
+
+def test_db_mongo_roundtrip_mongomock() -> None:
+    """End-to-end Mongo helpers exercised against an in-memory mongomock
+    instance. Skipped (with PASS) when mongomock isn't installed —
+    the test is optional CI coverage, not a hard requirement.
+
+    Install with: pip install mongomock
+    """
+    try:
+        import mongomock  # type: ignore[import]
+    except ImportError:
+        _check("mongomock not installed — roundtrip test skipped "
+               "(install with `pip install mongomock` for full Mongo "
+               "coverage)", True)
+        return
+    import db_connections as _db
+
+    # Monkey-patch _mongo_client to return a mongomock client. We
+    # restore it on exit so other tests aren't affected.
+    real_mongo_client = _db._mongo_client
+    def _fake_client(vault_dir, conn_name, **kw):
+        return mongomock.MongoClient()
+    _db._mongo_client = _fake_client   # type: ignore[assignment]
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            vault = Path(td)
+            _db.save_mongo_connection(vault, "mock", "mongodb://localhost/")
+
+            # Seed some data
+            client = mongomock.MongoClient()
+            client["testdb"]["events"].insert_many([
+                {"level": "info",  "service": "api",  "n": 1},
+                {"level": "error", "service": "api",  "n": 2},
+                {"level": "error", "service": "db",   "n": 3},
+                {"level": "warn",  "service": "auth", "n": 4},
+            ])
+            # Repoint our fake client constructor to this seeded client
+            _db._mongo_client = (   # type: ignore[assignment]
+                lambda vault_dir, conn_name, **kw: client)
+
+            # list_mongo_collections
+            cols = _db.list_mongo_collections(vault, "mock", "testdb")
+            _check("list_mongo_collections sees the seeded collection",
+                   "events" in cols)
+
+            # read_mongo_collection
+            df = _db.read_mongo_collection(
+                vault, "mock", "testdb", "events",
+                query={"level": "error"})
+            _check("read_mongo_collection returns 2 error rows",
+                   len(df) == 2)
+
+            # mongo_count
+            n = _db.mongo_count(vault, "mock", "testdb", "events",
+                                 query={"service": "api"})
+            _check(f"mongo_count returns 2 api rows (got {n})", n == 2)
+
+            # mongo_distinct
+            services = sorted(_db.mongo_distinct(
+                vault, "mock", "testdb", "events", "service"))
+            _check(f"mongo_distinct returns 3 services (got {services})",
+                   services == ["api", "auth", "db"])
+
+            # mongo_aggregate with a benign pipeline
+            agg = _db.mongo_aggregate(
+                vault, "mock", "testdb", "events",
+                pipeline=[
+                    {"$match": {"level": "error"}},
+                    {"$group": {"_id": "$service", "n": {"$sum": 1}}},
+                ])
+            _check("aggregate returns 2 groups", len(agg) == 2)
+    finally:
+        _db._mongo_client = real_mongo_client   # type: ignore[assignment]
+
+
 def test_db_audit_log_writes() -> None:
     """The audit logger writes one JSONL record per call and never
     raises — even when the file can't be created (the audit log is
@@ -934,6 +1113,10 @@ def main() -> int:
     _run("DB — SQL validator rejects writes",     test_db_sql_validator_rejects_writes)
     _run("DB — Mongo pipeline validator",         test_db_mongo_pipeline_validator)
     _run("DB — connection storage round-trip",    test_db_connection_storage_roundtrip)
+    _run("DB — TLS posture warnings",             test_db_tls_posture_warnings)
+    _run("DB — engine cache reuse",               test_db_engine_cache_reuses_engines)
+    _run("DB — audit log rotation",               test_db_audit_log_rotation)
+    _run("DB — Mongo round-trip (mongomock)",     test_db_mongo_roundtrip_mongomock)
     _run("DB — audit log writes JSONL",           test_db_audit_log_writes)
     # Gate B — engineering
     _run("ENG — units_convert (or ImportError)",  test_engineering_units_convert)

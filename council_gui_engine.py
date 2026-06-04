@@ -9965,6 +9965,25 @@ class CouncilConsole(tk.Tk):
                 "the password so it stays out of the JSON file:\n\n"
                 "  postgresql://user:${PG_PASS}@host:5432/dbname")
             return
+        # TLS / encryption posture check — surface as a yes/no
+        # prompt BEFORE saving. The check is a no-op for ${ENV_VAR}-
+        # protected URLs, localhost / LAN deployments, or URLs with
+        # an explicit TLS hint (sslmode=require, ?tls=true, etc.).
+        try:
+            tls_warning = _db.check_tls_posture(url)
+        except Exception:
+            tls_warning = None
+        if tls_warning:
+            proceed = messagebox.askyesno(
+                "TLS posture warning",
+                tls_warning + "\n\nSave anyway?",
+                default="no",
+            )
+            if not proceed:
+                self._vmgr_append(
+                    f"save aborted on TLS posture warning for {name}",
+                    "info")
+                return
         try:
             if kind == "mongodb":
                 _db.save_mongo_connection(VAULT_DIR, name, url)
@@ -10072,6 +10091,12 @@ class CouncilConsole(tk.Tk):
                     self._vmgr_append(
                         f"tested sql connection {name}: FAILED — "
                         f"{result.get('error')}", "err")
+            # Surface TLS warning if the check returned one (independent
+            # of OK/FAIL — a successful connection over plaintext is
+            # exactly when the warning is most actionable).
+            tls_warning = result.get("tls_warning")
+            if tls_warning:
+                self._vmgr_append(f"TLS posture: {tls_warning}", "info")
         except Exception as exc:
             self._db_conn_status.configure(
                 text=f"✗ test raised {exc!r}",
@@ -11489,10 +11514,21 @@ class CouncilConsole(tk.Tk):
             widget.configure(state="disabled")
 
     def _on_app_close(self):
-        """Flush conversation logs before the window closes."""
+        """Flush conversation logs + dispose cached DB engines before
+        the window closes. Engine disposal returns the pooled
+        SQLAlchemy connections to the underlying DB cleanly instead of
+        relying on socket teardown."""
         try:
             if hasattr(self, "conv_logger") and self.conv_logger:
                 self.conv_logger.end_session("user_close")
+        except Exception:
+            pass
+        try:
+            import db_connections as _db
+            n = _db.dispose_engines()
+            if n:
+                print(f"[shutdown] disposed {n} cached DB engine(s)",
+                      flush=True)
         except Exception:
             pass
         try:
