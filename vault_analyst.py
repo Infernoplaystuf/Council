@@ -3087,19 +3087,19 @@ Remote SQL via SQLAlchemy:
   out of the JSON file.
 
 Manufacturing / SPC helpers (analyst_helpers.spc):
-  process_capability(series, lsl=None, usl=None, subgroup_size=None)
+  process_capability(series, lsl=None, usl=None, subgroup_size=None,
+                     column=None)
     → dict with Cp / Cpk (short-term, needs subgroup_size) and
       Pp / Ppk (long-term) plus a normality test result. ALWAYS
       check normality_ok before reporting Cpk — non-normal data
       makes Cpk misleading. Returns warnings the model should
       mention. Either lsl or usl may be None for one-sided specs.
-  control_chart_limits(series, chart_type='xbar', subgroup_size=None)
+      For a multi-column DataFrame / CSV, pass column='<name>'.
+  control_chart_limits(series, chart_type='xbar', subgroup_size=None,
+                       column=None)
     → dict with center, UCL, LCL. Supports 'xbar', 'r', 'i'
       (individuals), 'mr' (moving range), 'p' (proportion),
       'np' (count). Constants hardcoded from NIST/ASTM.
-  western_electric_rules(series, ucl, lcl, center)
-    → DataFrame, one row per Nelson/WE rule violation
-      (index, value, rule_number 1-4, description, zone, side).
 
 For manufacturing data with specification limits, USE process_capability
 and check normality_ok before reporting Cpk values.

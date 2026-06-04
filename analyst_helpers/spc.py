@@ -95,41 +95,44 @@ _E2_MR2: float = 2.660
 ArrayLike = Union[pd.Series, pd.DataFrame, "np.ndarray", List, Tuple, str]
 
 
-def _coerce_series(x: ArrayLike) -> np.ndarray:
+def _coerce_series(x: ArrayLike, *, column: Optional[str] = None) -> np.ndarray:
     """Normalise the caller's input to a 1-D float numpy array with
     NaN preserved. Caller drops NaN and reports the count.
 
     Accepts:
       • pd.Series                — directly coerced via to_numeric
-      • pd.DataFrame             — must have exactly one column
+      • pd.DataFrame             — needs ``column=...`` to pick the
+        target column when there's more than one. Single-column
+        frames work without column= for the obvious case.
       • list / tuple / ndarray   — float-cast
-      • str (.csv / .tsv path)   — reads first column. Matches the
-        existing helpers' "accept a file path" convention.
+      • str (.csv / .tsv path)   — reads the file. When ``column``
+        is given, picks that column by name (case-insensitive);
+        otherwise uses the first column. Matches the convention
+        used by csv_inventory / folder_data_summary.
 
-    Raises ValueError on the obvious misuses (multi-column DataFrame,
-    non-1-D ndarray, empty input).
+    Raises ValueError on the obvious misuses (column= naming a
+    missing column, non-1-D ndarray, empty input).
+
+    The ``column`` kwarg is the fix for the previous Gate-A
+    behaviour where passing a multi-column DataFrame raised — now
+    the model can write either ``process_capability(df["diameter"],
+    8, 12)`` or ``process_capability(df, 8, 12, column="diameter")``
+    and both work.
     """
-    # File-path shortcut. Bounded to short strings to avoid mistaking
-    # long inline content for a path. The two-suffix check is enough
-    # — passing arbitrary file extensions here would be a footgun
-    # we don't want to expose.
+    # ── File-path shortcut. Bounded length to avoid mistaking
+    # inline content for a path. Suffix-locked to .csv / .tsv.
     if isinstance(x, str) and len(x) < 4096 and x.endswith((".csv", ".tsv")):
         sep = "\t" if x.endswith(".tsv") else ","
         df = pd.read_csv(x, sep=sep)
         if df.shape[1] == 0:
             raise ValueError(f"{x!r} has no columns to coerce.")
-        return pd.to_numeric(df.iloc[:, 0], errors="coerce").to_numpy()
+        return _series_from_df(df, column, source_repr=x).to_numpy(dtype=float)
 
     if isinstance(x, pd.Series):
         return pd.to_numeric(x, errors="coerce").to_numpy(dtype=float)
 
     if isinstance(x, pd.DataFrame):
-        if x.shape[1] != 1:
-            raise ValueError(
-                "Helper expects a single-column input; got "
-                f"{x.shape[1]} columns. Pass df[col] not the DataFrame."
-            )
-        return pd.to_numeric(x.iloc[:, 0], errors="coerce").to_numpy(dtype=float)
+        return _series_from_df(x, column, source_repr="DataFrame").to_numpy(dtype=float)
 
     arr = np.asarray(x, dtype=float)
     if arr.ndim != 1:
@@ -137,6 +140,32 @@ def _coerce_series(x: ArrayLike) -> np.ndarray:
     if arr.size == 0:
         raise ValueError("Empty input.")
     return arr
+
+
+def _series_from_df(df: pd.DataFrame, column: Optional[str], *,
+                    source_repr: str = "DataFrame") -> pd.Series:
+    """Helper for _coerce_series — pull a numeric Series out of a
+    DataFrame with a clear error path. Case-insensitive column match
+    so the model can write `column="Diameter"` even when the CSV
+    header is "diameter"."""
+    if column is None:
+        if df.shape[1] == 1:
+            return pd.to_numeric(df.iloc[:, 0], errors="coerce")
+        raise ValueError(
+            f"{source_repr} has {df.shape[1]} columns — pass "
+            f"column='<name>' to pick which one to analyse, or "
+            f"index it yourself: helper(df[col], ...)."
+        )
+    # Case-insensitive lookup
+    target = str(column).strip().lower()
+    for c in df.columns:
+        if str(c).strip().lower() == target:
+            return pd.to_numeric(df[c], errors="coerce")
+    raise ValueError(
+        f"Column {column!r} not found in {source_repr}. "
+        f"Available: {list(df.columns)[:10]}"
+        + ("…" if len(df.columns) > 10 else "")
+    )
 
 
 # ============================================================
@@ -201,6 +230,7 @@ def process_capability(
     usl: Optional[float] = None,
     *,
     subgroup_size: Optional[int] = None,
+    column: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Cp / Cpk (short-term) and Pp / Ppk (long-term) plus normality.
 
@@ -210,9 +240,10 @@ def process_capability(
 
     Parameters
     ----------
-    series : array-like or file path
-        Measurement values. Single column. NaN values are dropped
-        and reported via ``n_dropped_nan``.
+    series : array-like, file path, Series, or DataFrame
+        Measurement values. When passed a multi-column DataFrame,
+        also pass ``column="<name>"`` to pick the target column.
+        Single-column DataFrames work without the kwarg.
     lsl : float, optional
         Lower specification limit. Pass None for upper-only specs.
     usl : float, optional
@@ -222,6 +253,10 @@ def process_capability(
         estimate via R-bar / d2. When omitted, Cp and Cpk come back
         as None and the helper relies on Pp / Ppk only. The classic
         "Cpk reported from total sigma" trap is avoided this way.
+    column : str, optional
+        Column to analyse when ``series`` is a multi-column
+        DataFrame or a CSV/TSV file path with multiple columns.
+        Case-insensitive lookup.
 
     Returns
     -------
@@ -233,9 +268,11 @@ def process_capability(
     Raises
     ------
     ValueError if neither lsl nor usl is supplied, if lsl >= usl,
-    or if fewer than 2 finite values remain after NaN drop.
+    if fewer than 2 finite values remain after NaN drop, or if
+    ``column`` is required (multi-column input) but missing or not
+    a known column name.
     """
-    raw = _coerce_series(series)
+    raw = _coerce_series(series, column=column)
     n_total = len(raw)
     mask = ~np.isnan(raw)
     arr = raw[mask]
@@ -357,13 +394,16 @@ def control_chart_limits(
     series: ArrayLike,
     chart_type: str = "xbar",
     subgroup_size: Optional[int] = None,
+    *,
+    column: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Compute SPC chart center line and 3-sigma control limits.
 
     Parameters
     ----------
-    series : array-like or file path
-        Raw measurements. Layout depends on chart_type:
+    series : array-like, file path, Series, or DataFrame
+        Raw measurements. Pass ``column="<name>"`` for multi-column
+        DataFrame / CSV inputs. Layout per chart_type:
         • xbar / r          — flat 1-D series; reshape into subgroups
                               of size `subgroup_size`.
         • i (individuals)   — flat 1-D series; treated one-at-a-time.
@@ -387,7 +427,7 @@ def control_chart_limits(
     ValueError on unknown chart_type, missing subgroup_size where
     required, or insufficient data.
     """
-    raw = _coerce_series(series)
+    raw = _coerce_series(series, column=column)
     arr = raw[~np.isnan(raw)]
     chart = chart_type.lower().strip()
 
@@ -502,6 +542,8 @@ def western_electric_rules(
     ucl: float,
     lcl: float,
     center: float,
+    *,
+    column: Optional[str] = None,
 ) -> pd.DataFrame:
     """Apply the classic Western Electric / Nelson rules to a series.
 
@@ -521,7 +563,7 @@ def western_electric_rules(
         3. Four of five consecutive points beyond 1σ on the same side.
         4. Eight consecutive points on the same side of center.
     """
-    arr = _coerce_series(series)
+    arr = _coerce_series(series, column=column)
     if math.isnan(ucl) or math.isnan(lcl) or math.isnan(center):
         raise ValueError("ucl / lcl / center must all be finite numbers.")
     if ucl <= center or lcl >= center:

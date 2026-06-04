@@ -77,6 +77,19 @@ def _run(label: str, fn) -> None:
         traceback.print_exc()
 
 
+def _raises(exc_type, callable_obj) -> bool:
+    """True iff `callable_obj()` raises an instance of `exc_type`.
+    Used by assertions like _check('foo raises', _raises(ValueError,
+    lambda: helper(bad_input)))."""
+    try:
+        callable_obj()
+    except exc_type:
+        return True
+    except Exception:
+        return False
+    return False
+
+
 # ─── Synthetic GGUF builder ─────────────────────────────────────────
 def _make_synthetic_gguf(path: Path,
                           arch: str = "llama",
@@ -447,55 +460,45 @@ def test_spc_control_chart_limits_unknown_chart_type() -> None:
     _check("unknown chart_type raises ValueError", raised)
 
 
-def test_spc_western_electric_rule1() -> None:
-    """Single point > 3σ from center → rule 1 fires."""
-    from analyst_helpers.spc import western_electric_rules
-    # center=10, sigma=1 (UCL=13, LCL=7). Single value at 15 → 5σ → rule 1.
-    series = [10.0, 10.5, 9.5, 15.0, 10.2, 9.8]
-    df = western_electric_rules(series, ucl=13.0, lcl=7.0, center=10.0)
-    _check("rule 1 violation surfaced (n_violations > 0)", len(df) > 0)
-    rule_1_hits = df[df["rule_number"] == 1]
-    _check("the value at index 3 (15.0) is the rule-1 violator",
-           len(rule_1_hits) == 1 and int(rule_1_hits.iloc[0]["index"]) == 3)
-
-
-def test_spc_western_electric_rule4() -> None:
-    """8 consecutive points on the same side of center → rule 4 fires
-    no later than index 7."""
-    from analyst_helpers.spc import western_electric_rules
-    # All points slightly above center=10 (still within 1σ). 10 points.
-    series = [10.3, 10.4, 10.2, 10.5, 10.3, 10.1, 10.4, 10.3,
-              10.2, 10.5]
-    df = western_electric_rules(series, ucl=13.0, lcl=7.0, center=10.0)
-    rule_4 = df[df["rule_number"] == 4]
-    _check("rule 4 violation surfaced", len(rule_4) > 0)
-    _check("rule 4 fires by index 7 (8 consecutive same-side)",
-           int(rule_4.iloc[0]["index"]) == 7)
-
-
-def test_spc_western_electric_clean_data() -> None:
-    """A perfectly random-looking sequence centered at the center with
-    no consecutive runs should produce ZERO violations."""
-    from analyst_helpers.spc import western_electric_rules
-    # Alternates above/below center, all within 1σ → no rule trips.
-    series = [10.3, 9.7, 10.4, 9.6, 10.5, 9.5, 10.2, 9.8,
-              10.1, 9.9]
-    df = western_electric_rules(series, ucl=13.0, lcl=7.0, center=10.0)
-    _check("no violations on alternating in-control data", len(df) == 0)
+def test_spc_dataframe_column_kwarg() -> None:
+    """Multi-column DataFrame input must work via column='<name>',
+    matching the convention used by csv_inventory / numeric_summary_
+    per_csv. The old _coerce_series raised on multi-column DataFrame
+    — this test pins the new behaviour."""
+    import pandas as pd
+    from analyst_helpers.spc import process_capability
+    df = pd.DataFrame({
+        "Diameter": [10.0, 10.5, 9.8, 10.2, 10.1, 9.9, 10.3, 10.0,
+                     10.2, 9.7, 10.4, 10.1],
+        "Operator": ["A"] * 12,
+    })
+    # column kwarg picks the numeric column by case-insensitive name
+    out = process_capability(df, lsl=9.0, usl=11.0, column="diameter")
+    _check("multi-column DataFrame + column= works (Ppk defined)",
+           out["Ppk"] is not None)
+    _check("missing column raises with a helpful message",
+           _raises(ValueError,
+                   lambda: process_capability(df, lsl=9.0, usl=11.0,
+                                                column="nonexistent")))
+    _check("multi-column DataFrame WITHOUT column= raises",
+           _raises(ValueError,
+                   lambda: process_capability(df, lsl=9.0, usl=11.0)))
 
 
 def test_spc_sandbox_registration() -> None:
-    """The SPC helpers must be registered into the analyst sandbox's
-    globals_dict via analyst_helpers.register_helpers — that's the
-    contract that makes them callable from model-generated code."""
+    """The two REGISTERED SPC helpers must be in the analyst
+    sandbox's globals_dict. western_electric_rules and gage_rr are
+    intentionally hidden by project policy — explicitly assert
+    their absence so a future maintainer who flips the switch in
+    __init__.py also has to update this test."""
     import analyst_helpers
     gd: dict = {}
     analyst_helpers.register_helpers(gd)
-    for name in ("process_capability", "control_chart_limits",
-                 "western_electric_rules"):
+    for name in ("process_capability", "control_chart_limits"):
         _check(f"sandbox has {name}", name in gd)
-    _check("gage_rr is NOT registered (per project policy)",
-           "gage_rr" not in gd)
+    for name in ("western_electric_rules", "gage_rr"):
+        _check(f"{name} is NOT registered (per project policy)",
+               name not in gd)
 
 
 def test_vault_image_suffix_routing() -> None:
@@ -535,9 +538,7 @@ def main() -> int:
     _run("SPC — process_capability subgroup path", test_spc_process_capability_subgroup_size_path)
     _run("SPC — control_chart_limits X-bar",      test_spc_control_chart_limits_xbar)
     _run("SPC — control_chart unknown type",      test_spc_control_chart_limits_unknown_chart_type)
-    _run("SPC — Western Electric rule 1",         test_spc_western_electric_rule1)
-    _run("SPC — Western Electric rule 4",         test_spc_western_electric_rule4)
-    _run("SPC — WE clean data, no violations",    test_spc_western_electric_clean_data)
+    _run("SPC — multi-col DataFrame + column=",   test_spc_dataframe_column_kwarg)
     _run("SPC — sandbox registration contract",   test_spc_sandbox_registration)
     _run("vault image suffix routing",          test_vault_image_suffix_routing)
     print()

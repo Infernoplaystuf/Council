@@ -46,21 +46,25 @@ def register_helpers(globals_dict: Dict[str, Any]) -> None:
     Imports are local so a sandbox load failure for one module
     (e.g. scipy not installed) doesn't take the others down.
 
-    NOT registered:
-      • spc.gage_rr — the function exists in code but the project
-        owner asked to keep it dormant for now. To enable, add
-        ``"gage_rr": _spc.gage_rr`` to the SPC block below and
-        update the analyst prompt + smoke tests in lockstep.
+    NOT registered (implemented but hidden by project policy):
+      • spc.gage_rr            — ANOVA Gage R&R study
+      • spc.western_electric_rules — Nelson / WE rule detector
+
+    Both functions exist in spc.py and are fully working; they're
+    just kept out of the sandbox namespace + analyst prompt so the
+    model doesn't suggest them yet. To enable, add the matching
+    name to the SPC block below AND update the analyst prompt
+    (vault_analyst.build_pandas_code_prompt) AND extend the smoke-
+    test sandbox-registration assertion in lockstep.
     """
     # ── Phase 1a — SPC ──────────────────────────────────────────────
     try:
         from . import spc as _spc
         globals_dict.update({
-            "process_capability":     _spc.process_capability,
-            "control_chart_limits":   _spc.control_chart_limits,
-            "western_electric_rules": _spc.western_electric_rules,
-            # NOTE: gage_rr intentionally NOT registered. See module
-            # docstring.
+            "process_capability":   _spc.process_capability,
+            "control_chart_limits": _spc.control_chart_limits,
+            # NOTE: western_electric_rules and gage_rr are
+            # intentionally NOT registered. See module docstring.
         })
     except Exception as exc:
         # Best-effort registration. If scipy is missing on a CPU-only
