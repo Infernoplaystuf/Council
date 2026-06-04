@@ -106,7 +106,10 @@ def fail(msg: str) -> None:
 def run(cmd: list, *, check: bool = True, capture: bool = False,
         shell: bool = False, env=None) -> subprocess.CompletedProcess:
     """Run a subprocess. By default streams output to the parent
-    terminal so the user sees pip/conda progress in real time."""
+    terminal so the user sees pip/conda progress in real time.
+
+    Most callers should use ``step_run`` instead — it gives
+    structured failure reporting + tracks the step counter."""
     info("$ " + (cmd if shell else " ".join(map(str, cmd))))
     return subprocess.run(
         cmd, check=check, shell=shell,
@@ -119,18 +122,182 @@ def have(prog: str) -> bool:
 
 
 # ────────────────────────────────────────────────────────────────────
+# Step runner — single source of truth for "run a command, report
+# success/failure with full context, never silently swallow errors".
+#
+# This replaces the previous pattern where each install step had its
+# own try/except that printed a one-liner like "torch install failed".
+# Users reported "the setup crashes the second there is one failure"
+# — the symptom was that the one-liner gave them no idea what to do
+# next. step_run carries:
+#   • Step number and human-readable label
+#   • The exact command that was attempted (so the user can re-run
+#     it manually to debug)
+#   • The exit code on failure
+#   • A "suggested fix" string the caller passes in — the wrong-
+#     CUDA-tier hint, the "check your internet" hint, etc.
+# Plus it appends to a module-level _STEP_LOG so the failure summary
+# at the end of main() can print exactly which step failed.
+# ────────────────────────────────────────────────────────────────────
+
+_STEP_LOG: list = []   # list of (step_no, label, status, detail)
+_STEP_COUNTER = [0]    # mutable singleton for step numbering
+
+
+def step_run(
+    label: str,
+    cmd: list,
+    *,
+    suggested_fix: str = "",
+    soft_fail: bool = False,
+    env=None,
+) -> bool:
+    """Run a command as a numbered install step.
+
+    Parameters
+    ----------
+    label : str
+        Human-readable step name shown in the progress line and the
+        final summary. Examples: "create conda env", "install torch
+        (cu124)", "install requirements.txt".
+    cmd : list
+        argv-style command list.
+    suggested_fix : str
+        Free-text hint shown on failure. The model knows the most
+        common cause for each step (e.g. torch failure → check
+        internet + check CUDA tier; conda create failure → check
+        env name not already in use elsewhere).
+    soft_fail : bool
+        When True, a non-zero exit is logged as a warning rather
+        than a failure. Used for optional steps (crawl4ai-setup,
+        embedding model warm-cache).
+    env : dict, optional
+        Environment for the subprocess.
+
+    Returns
+    -------
+    bool
+        True on success (or soft-fail). False on a hard failure —
+        caller should abort the install.
+    """
+    _STEP_COUNTER[0] += 1
+    n = _STEP_COUNTER[0]
+    print()
+    print(_c("36;1", f"  [step {n}] {label}"))
+    info("$ " + " ".join(str(c) for c in cmd))
+    try:
+        result = subprocess.run(cmd, check=False, env=env)
+    except FileNotFoundError as exc:
+        _STEP_LOG.append((n, label, "fail",
+                          f"executable not found: {exc}"))
+        fail(f"step {n} ({label}): the executable is not on PATH.")
+        if suggested_fix:
+            print(_c("33", f"    suggested fix: {suggested_fix}"))
+        return False
+    except Exception as exc:
+        _STEP_LOG.append((n, label, "fail",
+                          f"subprocess raised: {exc!r}"))
+        fail(f"step {n} ({label}): subprocess raised {exc!r}")
+        if suggested_fix:
+            print(_c("33", f"    suggested fix: {suggested_fix}"))
+        return False
+
+    if result.returncode == 0:
+        _STEP_LOG.append((n, label, "ok", ""))
+        ok(f"step {n} ({label}) — done")
+        return True
+
+    # Non-zero exit — structured failure reporting.
+    detail = f"exit code {result.returncode}"
+    if soft_fail:
+        _STEP_LOG.append((n, label, "skip", detail))
+        warn(f"step {n} ({label}) failed ({detail}) — continuing "
+             "(this step is optional).")
+        if suggested_fix:
+            print(_c("33", f"    note: {suggested_fix}"))
+        return True
+
+    _STEP_LOG.append((n, label, "fail", detail))
+    fail(f"step {n} ({label}) failed ({detail}).")
+    print(_c("33", "    The command that failed:"))
+    print(_c("90", "      " + " ".join(str(c) for c in cmd)))
+    if suggested_fix:
+        print(_c("33", f"    suggested fix: {suggested_fix}"))
+    print(_c("33", "    Re-run setup.sh / setup.bat to retry — the "
+                    "script is idempotent and will skip steps that "
+                    "already completed."))
+    return False
+
+
+def step_skip(label: str, reason: str) -> None:
+    """Record a step as skipped — already done, optional, etc."""
+    _STEP_COUNTER[0] += 1
+    n = _STEP_COUNTER[0]
+    _STEP_LOG.append((n, label, "skip", reason))
+    print()
+    print(_c("36;1", f"  [step {n}] {label}"))
+    ok(f"step {n} ({label}) — skipping: {reason}")
+
+
+def print_step_summary() -> None:
+    """End-of-run table summarising every step. Always called from
+    main() — successful runs see a green ✓ column; failed runs see
+    the failing step in red so the user knows exactly where to look."""
+    print()
+    print(_c("36;1;4", "Install summary"))
+    if not _STEP_LOG:
+        info("(no steps ran)")
+        return
+    for n, label, status, detail in _STEP_LOG:
+        if status == "ok":
+            sym = _c("32", "✓")
+        elif status == "skip":
+            sym = _c("33", "○")
+        else:
+            sym = _c("31;1", "✗")
+        line = f"  {sym}  step {n:>2}  {label}"
+        if detail:
+            line += "   " + _c("90", f"({detail})")
+        print(line)
+
+
+# ────────────────────────────────────────────────────────────────────
 # Conda detection / install
 # ────────────────────────────────────────────────────────────────────
-def find_conda() -> "Path | None":
+def find_conda(prev: dict = None) -> "Path | None":
     """Locate a working conda / mamba / micromamba executable.
 
-    Returns the Path to the binary, or None if nothing is installed."""
+    Resolution order:
+      1. previous_install_detect's conda_env.tool field — if the
+         detector found a `council` env via `conda env list`, the
+         tool that listed it (conda / mamba / micromamba) is on
+         PATH and we trust that.
+      2. shutil.which on conda / mamba / micromamba.
+      3. Manual scan of common install dirs (~/miniforge3,
+         ~/miniconda3, ~/anaconda3, /opt/conda, C:/ProgramData/...).
+
+    Returns the Path to the binary, or None if nothing is found.
+    Order matters: a user with conda installed under Anaconda
+    Navigator may have NO conda on PATH but their env IS findable
+    via `conda env list` from the Anaconda prompt the detector
+    used. Trusting the detector's tool catches that case.
+    """
+    # Step 1 — trust the detector
+    if prev:
+        env_block = prev.get("conda_env") or {}
+        tool = env_block.get("tool")
+        if tool:
+            p = shutil.which(tool)
+            if p:
+                return Path(p)
+
+    # Step 2 — PATH scan
     for name in ("conda", "mamba", "micromamba"):
         p = shutil.which(name)
         if p:
             return Path(p)
-    # Manual check of the common install dirs — some users have conda
-    # installed but not on PATH.
+
+    # Step 3 — known install locations
     home = Path.home()
     for candidate in (
         home / "miniforge3"  / "Scripts" / "conda.exe",
@@ -146,6 +313,132 @@ def find_conda() -> "Path | None":
         if candidate.is_file():
             return candidate
     return None
+
+
+# ────────────────────────────────────────────────────────────────────
+# Env verification + package probes
+# ────────────────────────────────────────────────────────────────────
+
+def verify_env(conda: Path, env_name: str) -> dict:
+    """Probe a conda env. Returns a dict:
+        {
+          "exists": bool,
+          "python_works": bool,
+          "python_version": str | None,
+          "pip_works": bool,
+          "notes": list[str],   # human-readable findings
+        }
+
+    Used in the reuse decision. If `exists` is True but
+    `python_works` is False, the env is half-built (a previous
+    install crashed mid-conda-create) and the caller should offer
+    to recreate.
+    """
+    out = {
+        "exists": False,
+        "python_works": False,
+        "python_version": None,
+        "pip_works": False,
+        "notes": [],
+    }
+    # 1. Does the env exist at all? `conda env list` is the canonical
+    #    answer — but only if conda itself is invokable.
+    try:
+        r = subprocess.run(
+            [str(conda), "env", "list"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        if r.returncode != 0:
+            out["notes"].append(f"'conda env list' returned {r.returncode}")
+            return out
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if parts and parts[0] == env_name:
+                out["exists"] = True
+                break
+    except subprocess.TimeoutExpired:
+        out["notes"].append("'conda env list' timed out after 15s — "
+                             "conda may be stuck. Try `conda env list` "
+                             "from a fresh terminal.")
+        return out
+    except Exception as exc:
+        out["notes"].append(f"conda probe failed: {exc!r}")
+        return out
+
+    if not out["exists"]:
+        return out
+
+    # 2. Does Python work inside the env?
+    try:
+        r = subprocess.run(
+            [str(conda), "run", "-n", env_name, "python",
+             "-c", "import sys; print(sys.version.split()[0])"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            out["python_works"] = True
+            out["python_version"] = r.stdout.strip()
+        else:
+            out["notes"].append(
+                f"env exists but 'python -c \"...\"' returned "
+                f"{r.returncode}; stderr (last 200 chars): "
+                f"{r.stderr[-200:].strip() if r.stderr else '(empty)'}"
+            )
+    except subprocess.TimeoutExpired:
+        out["notes"].append("python invocation timed out inside the env.")
+        return out
+    except Exception as exc:
+        out["notes"].append(f"python probe failed: {exc!r}")
+        return out
+
+    if not out["python_works"]:
+        return out
+
+    # 3. Does pip work?
+    try:
+        r = subprocess.run(
+            [str(conda), "run", "-n", env_name, "pip", "--version"],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+        out["pip_works"] = (r.returncode == 0)
+        if not out["pip_works"]:
+            out["notes"].append(
+                f"pip is broken in the env (exit {r.returncode}). "
+                "Recreate the env or run "
+                f"'{conda} run -n {env_name} python -m ensurepip'.")
+    except Exception as exc:
+        out["notes"].append(f"pip probe failed: {exc!r}")
+    return out
+
+
+def pkg_already_installed(
+    conda: Path,
+    env_name: str,
+    import_name: str,
+    *,
+    timeout: int = 15,
+) -> bool:
+    """Cheap probe: returns True if ``import <name>`` succeeds
+    inside the env. Used by every install step to skip work that's
+    already done — makes a re-run after a partial install instant
+    on the steps that succeeded the first time around.
+
+    `import_name` is the IMPORT name (e.g. 'llama_cpp', not
+    'llama-cpp-python').
+    """
+    try:
+        r = subprocess.run(
+            [str(conda), "run", "-n", env_name, "python",
+             "-c", f"import {import_name}"],
+            capture_output=True, text=True, timeout=timeout,
+            check=False,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
 
 
 def install_miniforge_unix() -> "Path | None":
@@ -274,7 +567,13 @@ def run_in_env(conda: Path, env_name: str, args: list,
 
 
 def execute_plan(plan: dict, conda: Path, *, only_plan: bool = False) -> bool:
-    """Run the conda + pip install dance. Returns True on success."""
+    """Run the conda + pip install dance. Returns True on success.
+
+    Resumable + idempotent — each install step probes whether the
+    package is already importable inside the env and skips if so.
+    A re-run after a partial failure jumps straight to the broken
+    step instead of redoing 2 GB of torch downloads.
+    """
     env_name      = plan["env_name"]
     python_v      = plan["python_version"]
     cuda_tier     = plan["cuda_tier"]
@@ -296,53 +595,135 @@ def execute_plan(plan: dict, conda: Path, *, only_plan: bool = False) -> bool:
         print("  pip install -r requirements.txt")
         return True
 
-    # ── Create or reuse env ──
+    # ── Step 1 — create or reuse env ──────────────────────────────────
+    # The previous behaviour was "if previous_install_detect said the
+    # env exists, reuse it." That happily reused a HALF-BUILT env
+    # from a previous crashed install, and the next pip step then
+    # exploded with no useful context. Now we VERIFY the env works
+    # before reusing.
     if reuse:
-        ok(f"reusing existing conda env '{env_name}'")
+        info("verifying the existing conda env actually works…")
+        info_blk = verify_env(conda, env_name)
+        if info_blk["exists"] and info_blk["python_works"] and info_blk["pip_works"]:
+            step_skip(f"create conda env {env_name!r}",
+                      f"reusing existing env (Python {info_blk['python_version']})")
+        else:
+            warn(f"the existing env {env_name!r} is broken:")
+            for note in info_blk["notes"]:
+                print(_c("90", f"      {note}"))
+            warn("recreating from scratch.")
+            if not step_run(
+                f"recreate conda env {env_name!r}",
+                [str(conda), "create", "-n", env_name,
+                  f"python={python_v}", "-y"],
+                suggested_fix=(
+                    "If 'env already exists' — `conda env remove -n "
+                    f"{env_name}` manually and re-run setup. Otherwise "
+                    "check disk space and conda's own error message above."
+                ),
+            ):
+                return False
     else:
-        try:
-            run([str(conda), "create", "-n", env_name,
-                 f"python={python_v}", "-y"])
-        except subprocess.CalledProcessError:
-            fail(f"failed to create env '{env_name}'")
+        if not step_run(
+            f"create conda env {env_name!r}",
+            [str(conda), "create", "-n", env_name,
+              f"python={python_v}", "-y"],
+            suggested_fix=(
+                "Common causes: (a) the env name already exists — "
+                "pass --reinstall to recreate, or `conda env remove "
+                f"-n {env_name}`. (b) disk full. (c) conda-forge "
+                "channel down — try again later."
+            ),
+        ):
             return False
 
-    # ── torch ──
-    info(f"installing torch ({cuda_tier} wheels)")
-    torch_idx = _TORCH_INDEX[cuda_tier]
-    torch_args = ["pip", "install", "torch", "torchvision", "torchaudio",
-                   "--index-url", torch_idx]
-    if cuda_tier == "cu128":
-        torch_args.insert(2, "--pre")
-    try:
-        run_in_env(conda, env_name, torch_args)
-    except subprocess.CalledProcessError:
-        fail("torch install failed")
-        return False
+    # ── Step 2 — torch ────────────────────────────────────────────────
+    # Skip if torch is already importable. Note: a CPU-only torch
+    # already installed wouldn't be replaced by --cuda-tier=cu124,
+    # but the skip prevents re-downloading 2 GB after a torch step
+    # already succeeded. Users who DO want to swap tiers should
+    # re-run with --reinstall (which blows away the whole env).
+    if pkg_already_installed(conda, env_name, "torch"):
+        step_skip(f"install torch ({cuda_tier})",
+                  "already importable inside the env")
+    else:
+        torch_idx = _TORCH_INDEX[cuda_tier]
+        torch_args = [str(conda), "run", "--no-capture-output", "-n", env_name,
+                       "pip", "install", "torch", "torchvision", "torchaudio",
+                       "--index-url", torch_idx]
+        if cuda_tier == "cu128":
+            torch_args.insert(torch_args.index("torch"), "--pre")
+        if not step_run(
+            f"install torch ({cuda_tier})",
+            torch_args,
+            suggested_fix=(
+                "Common causes:\n"
+                "       (a) the CUDA tier doesn't match your driver — "
+                "run `nvidia-smi` and check 'CUDA Version' is ≥ what "
+                f"{cuda_tier} needs (12.1 / 12.4 / 12.8).\n"
+                "       (b) no internet / blocked HTTPS — pytorch.org "
+                "must be reachable.\n"
+                "       (c) wrong wheel for your Python version — only "
+                "Python 3.8-3.12 is supported by torch wheels."
+            ),
+        ):
+            return False
 
-    # ── llama-cpp-python ──
-    info(f"installing llama-cpp-python ({cuda_tier})")
-    lcp_args = ["pip", "install", "llama-cpp-python"]
-    lcp_idx = _LLAMA_CPP_INDEX[cuda_tier]
-    if lcp_idx:
-        lcp_args += ["--extra-index-url", lcp_idx,
-                      "--force-reinstall", "--no-cache-dir"]
-    try:
-        run_in_env(conda, env_name, lcp_args)
-    except subprocess.CalledProcessError:
-        fail("llama-cpp-python install failed — see error above")
-        return False
+    # ── Step 3 — llama-cpp-python ────────────────────────────────────
+    if pkg_already_installed(conda, env_name, "llama_cpp"):
+        step_skip(f"install llama-cpp-python ({cuda_tier})",
+                  "already importable inside the env")
+    else:
+        lcp_args = [str(conda), "run", "--no-capture-output", "-n", env_name,
+                     "pip", "install", "llama-cpp-python"]
+        lcp_idx = _LLAMA_CPP_INDEX[cuda_tier]
+        if lcp_idx:
+            lcp_args += ["--extra-index-url", lcp_idx,
+                          "--force-reinstall", "--no-cache-dir"]
+        if not step_run(
+            f"install llama-cpp-python ({cuda_tier})",
+            lcp_args,
+            suggested_fix=(
+                "Common causes:\n"
+                "       (a) abetlen's CUDA wheel index is down — "
+                "the URL is https://abetlen.github.io/llama-cpp-python\n"
+                "       (b) the CUDA tier wheel doesn't exist for "
+                "your Python — try a different tier or build from "
+                "source: `CMAKE_ARGS='-DGGML_CUDA=ON' pip install "
+                "llama-cpp-python --no-binary llama-cpp-python`\n"
+                "       (c) compiler not installed (Windows: install "
+                "Visual Studio Build Tools; Linux: apt install "
+                "build-essential)."
+            ),
+        ):
+            return False
 
-    # ── requirements.txt ──
+    # ── Step 4 — requirements.txt (bulk pip install) ─────────────────
+    # pandas / numpy / scipy / chromadb / sentence-transformers / etc.
+    # No skip-probe here — `pip install -r requirements.txt --upgrade-
+    # strategy only-if-needed` is itself idempotent and fast on
+    # already-satisfied requirements (~5 seconds vs the 2-3 minute
+    # first install). The skip-probe would need to import every dep
+    # one by one which costs more than just letting pip resolve.
     req_file = HERE / "requirements.txt"
     if req_file.is_file():
-        info("installing remaining deps from requirements.txt")
-        try:
-            run_in_env(conda, env_name,
-                       ["pip", "install", "-r", str(req_file),
-                        "--upgrade-strategy", "only-if-needed"])
-        except subprocess.CalledProcessError:
-            fail("requirements.txt install failed")
+        if not step_run(
+            "install requirements.txt",
+            [str(conda), "run", "--no-capture-output", "-n", env_name,
+              "pip", "install", "-r", str(req_file),
+              "--upgrade-strategy", "only-if-needed"],
+            suggested_fix=(
+                "Common causes:\n"
+                "       (a) numpy / pandas ABI mismatch when re-using "
+                "an old env — pass --reinstall.\n"
+                "       (b) a single pip wheel failed to download — "
+                "re-run setup; pip caches downloads and skips what "
+                "succeeded.\n"
+                "       (c) the chromadb / sentence-transformers "
+                "transitive deps need a C compiler on first install "
+                "for tokenisers — see the llama-cpp suggestion above."
+            ),
+        ):
             return False
     else:
         warn("requirements.txt not found — skipping bulk dep install")
@@ -491,25 +872,45 @@ def main() -> int:
         return 0
 
     step(4, total, "Locate or install conda")
-    conda = find_conda()
+    # Pass `prev` so find_conda can trust the detector's discovery
+    # of the env's managing tool (conda / mamba / micromamba). This
+    # is what catches Anaconda-Navigator installs that don't put
+    # conda on PATH but DO let `conda env list` find the env.
+    conda = find_conda(prev)
     if conda is None:
         if sys.platform.startswith("win"):
             install_miniforge_windows()
+            print_step_summary()
             return 2
         # Linux / macOS / WSL — offer to install Miniforge
         if confirm("conda not found — install Miniforge into ~/miniforge3?",
                     default=True, auto_yes=args.yes):
             conda = install_miniforge_unix()
             if conda is None:
+                print_step_summary()
                 return 2
         else:
             fail("conda required. Install miniforge or miniconda manually.")
+            print_step_summary()
             return 2
     ok(f"using conda at {conda}")
 
     step(5, total, "Install (this can take 10-25 min on a cold start)")
     if not execute_plan(plan, conda, only_plan=args.skip_install):
-        fail("install did not complete cleanly")
+        # execute_plan already logged structured diagnostics for the
+        # specific step that failed. The summary table here gives
+        # the user a single place to see where things stopped.
+        print_step_summary()
+        print()
+        print(_c("31;1", "Setup did not complete."))
+        print(_c("33", "  • Each install step is idempotent — re-running "
+                        "setup will skip everything that succeeded above\n"
+                        "    and pick up from the first failed step."))
+        print(_c("33", "  • If the same step keeps failing, the suggested-"
+                        "fix block printed above the summary lists the\n"
+                        "    most common causes for that specific step."))
+        print(_c("33", "  • To recreate the env from scratch (blows away "
+                        "everything so far):  setup.sh --reinstall"))
         return 3
 
     if not args.skip_install and not args.skip_smoke:
@@ -517,6 +918,7 @@ def main() -> int:
             warn("smoke tests failed — the app may still run, but check "
                  "the failures above before relying on it.")
 
+    print_step_summary()
     print()
     print(_c("32;1", "✓ Setup complete."))
     print()
