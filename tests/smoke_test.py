@@ -355,6 +355,149 @@ def test_clip_path_persistence() -> None:
             os.environ.pop("COUNCIL_GGUF_CLIP_PATH", None)
 
 
+def test_spc_process_capability_known_values() -> None:
+    """Cpk of a centered N(10, 0.5) sample with specs [8, 12] should
+    land near 1.33 (process spread ±6 σ = ±3 fits comfortably inside
+    [LSL, USL]). Synthetic data → deterministic check."""
+    import numpy as np
+    from analyst_helpers.spc import process_capability
+    rng = np.random.default_rng(seed=42)
+    series = rng.normal(loc=10.0, scale=0.5, size=2000)
+    out = process_capability(series, lsl=8.0, usl=12.0)
+    ppk = out.get("Ppk")
+    _check(f"Ppk near 1.33 on centered N(10, 0.5) (got {ppk:.3f})",
+           ppk is not None and 1.20 <= ppk <= 1.46)
+    _check("normality_ok=True on a Gaussian sample",
+           out["normality_ok"] is True)
+    _check("n_dropped_nan == 0 on clean data",
+           out["n_dropped_nan"] == 0)
+    _check("Cp/Cpk are None without subgroup_size",
+           out["Cp"] is None and out["Cpk"] is None)
+    _check("warnings list mentions the missing subgroup_size",
+           any("subgroup_size" in w for w in out["warnings"]))
+
+
+def test_spc_process_capability_one_sided() -> None:
+    """One-sided LSL → Pp must be None (no two-sided spread), Ppk
+    reduces to Ppl."""
+    from analyst_helpers.spc import process_capability
+    out = process_capability(
+        [10.0, 11.0, 9.0, 10.5, 9.8, 10.2, 10.1, 9.9, 10.3, 10.0],
+        lsl=5.0,
+    )
+    _check("Pp is None for one-sided spec", out["Pp"] is None)
+    _check("Ppk is defined and positive",
+           out["Ppk"] is not None and out["Ppk"] > 0)
+
+
+def test_spc_process_capability_nan_handling() -> None:
+    """NaN must be DROPPED with the count surfaced, not filled."""
+    import math
+    from analyst_helpers.spc import process_capability
+    arr = [10.0, 10.5, math.nan, 9.7, math.nan, 10.1, 9.9, 10.3, 10.2]
+    out = process_capability(arr, lsl=8.0, usl=12.0)
+    _check("n_dropped_nan reports the 2 NaNs", out["n_dropped_nan"] == 2)
+    _check("n is the post-drop count", out["n"] == 7)
+
+
+def test_spc_process_capability_subgroup_size_path() -> None:
+    """With subgroup_size, Cp and Cpk should be computed from a
+    short-term sigma estimate. Trailing partial subgroups are dropped
+    with a warning per the agreed convention."""
+    import numpy as np
+    from analyst_helpers.spc import process_capability
+    rng = np.random.default_rng(seed=7)
+    # 102 values → 20 full subgroups of size 5, 2 trailing dropped
+    series = rng.normal(loc=10.0, scale=0.5, size=102)
+    out = process_capability(series, lsl=8.0, usl=12.0, subgroup_size=5)
+    _check("Cp computed when subgroup_size given",
+           out["Cp"] is not None and out["Cp"] > 0)
+    _check("Cpk computed when subgroup_size given",
+           out["Cpk"] is not None and out["Cpk"] > 0)
+    _check("trailing-partial-subgroup drop warning present",
+           any("trailing values" in w for w in out["warnings"]))
+
+
+def test_spc_control_chart_limits_xbar() -> None:
+    """X-bar chart on a calibrated dataset — center / UCL / LCL must
+    bracket the data and match the constants-table arithmetic.
+    Subgroup size = 5 → A2 = 0.577 → UCL = grand_mean + 0.577 * R_bar."""
+    import numpy as np
+    from analyst_helpers.spc import control_chart_limits, _A2_CONSTANTS
+    rng = np.random.default_rng(seed=11)
+    series = rng.normal(loc=50.0, scale=2.0, size=100)
+    out = control_chart_limits(series, chart_type="xbar", subgroup_size=5)
+    _check("center bracketed roughly by data mean ±0.5",
+           abs(out["center"] - 50.0) < 1.0)
+    _check("UCL > center > LCL",
+           out["ucl"] > out["center"] > out["lcl"])
+    _check("constants_used.A2 matches the table value",
+           abs(out["constants_used"]["A2"] - _A2_CONSTANTS[5]) < 1e-9)
+    _check("n_subgroups == 100 // 5", out["n_subgroups"] == 20)
+
+
+def test_spc_control_chart_limits_unknown_chart_type() -> None:
+    """Unknown chart_type → ValueError, not a silent fallback."""
+    from analyst_helpers.spc import control_chart_limits
+    try:
+        control_chart_limits([1.0, 2.0, 3.0], chart_type="bogus")
+        raised = False
+    except ValueError:
+        raised = True
+    _check("unknown chart_type raises ValueError", raised)
+
+
+def test_spc_western_electric_rule1() -> None:
+    """Single point > 3σ from center → rule 1 fires."""
+    from analyst_helpers.spc import western_electric_rules
+    # center=10, sigma=1 (UCL=13, LCL=7). Single value at 15 → 5σ → rule 1.
+    series = [10.0, 10.5, 9.5, 15.0, 10.2, 9.8]
+    df = western_electric_rules(series, ucl=13.0, lcl=7.0, center=10.0)
+    _check("rule 1 violation surfaced (n_violations > 0)", len(df) > 0)
+    rule_1_hits = df[df["rule_number"] == 1]
+    _check("the value at index 3 (15.0) is the rule-1 violator",
+           len(rule_1_hits) == 1 and int(rule_1_hits.iloc[0]["index"]) == 3)
+
+
+def test_spc_western_electric_rule4() -> None:
+    """8 consecutive points on the same side of center → rule 4 fires
+    no later than index 7."""
+    from analyst_helpers.spc import western_electric_rules
+    # All points slightly above center=10 (still within 1σ). 10 points.
+    series = [10.3, 10.4, 10.2, 10.5, 10.3, 10.1, 10.4, 10.3,
+              10.2, 10.5]
+    df = western_electric_rules(series, ucl=13.0, lcl=7.0, center=10.0)
+    rule_4 = df[df["rule_number"] == 4]
+    _check("rule 4 violation surfaced", len(rule_4) > 0)
+    _check("rule 4 fires by index 7 (8 consecutive same-side)",
+           int(rule_4.iloc[0]["index"]) == 7)
+
+
+def test_spc_western_electric_clean_data() -> None:
+    """A perfectly random-looking sequence centered at the center with
+    no consecutive runs should produce ZERO violations."""
+    from analyst_helpers.spc import western_electric_rules
+    # Alternates above/below center, all within 1σ → no rule trips.
+    series = [10.3, 9.7, 10.4, 9.6, 10.5, 9.5, 10.2, 9.8,
+              10.1, 9.9]
+    df = western_electric_rules(series, ucl=13.0, lcl=7.0, center=10.0)
+    _check("no violations on alternating in-control data", len(df) == 0)
+
+
+def test_spc_sandbox_registration() -> None:
+    """The SPC helpers must be registered into the analyst sandbox's
+    globals_dict via analyst_helpers.register_helpers — that's the
+    contract that makes them callable from model-generated code."""
+    import analyst_helpers
+    gd: dict = {}
+    analyst_helpers.register_helpers(gd)
+    for name in ("process_capability", "control_chart_limits",
+                 "western_electric_rules"):
+        _check(f"sandbox has {name}", name in gd)
+    _check("gage_rr is NOT registered (per project policy)",
+           "gage_rr" not in gd)
+
+
 def test_vault_image_suffix_routing() -> None:
     """The image-file routing added in the ship-readiness pass must
     accept image extensions through _PARSEABLE and produce a record
@@ -386,6 +529,16 @@ def main() -> int:
     _run("data-summary trigger keywords",       test_data_summary_triggers)
     _run("folder_data_summary helper",          test_folder_data_summary_helper)
     _run("clip_path / GGUF path co-persistence", test_clip_path_persistence)
+    _run("SPC — process_capability known-values", test_spc_process_capability_known_values)
+    _run("SPC — process_capability one-sided",    test_spc_process_capability_one_sided)
+    _run("SPC — process_capability NaN handling", test_spc_process_capability_nan_handling)
+    _run("SPC — process_capability subgroup path", test_spc_process_capability_subgroup_size_path)
+    _run("SPC — control_chart_limits X-bar",      test_spc_control_chart_limits_xbar)
+    _run("SPC — control_chart unknown type",      test_spc_control_chart_limits_unknown_chart_type)
+    _run("SPC — Western Electric rule 1",         test_spc_western_electric_rule1)
+    _run("SPC — Western Electric rule 4",         test_spc_western_electric_rule4)
+    _run("SPC — WE clean data, no violations",    test_spc_western_electric_clean_data)
+    _run("SPC — sandbox registration contract",   test_spc_sandbox_registration)
     _run("vault image suffix routing",          test_vault_image_suffix_routing)
     print()
     print("=" * 70)
