@@ -910,96 +910,163 @@ def read_bson_as_df(path: Any) -> pd.DataFrame:
 # so the user can edit it by hand. NEVER stores raw passwords — users
 # put credentials in env vars and reference them like
 # `postgresql://user:${PGPASS}@host/db`.
-
-import json as _json
-
-_SQL_CONN_FILENAME = "sql_connections.json"
-
-
-def _sql_conn_path(vault_dir: Any) -> Path:
-    return Path(vault_dir) / _SQL_CONN_FILENAME
+#
+# Storage + URL resolution + audit log all moved to db_connections.py
+# so the SQL and Mongo bridges share the same registry / log / env-var
+# expander. The functions below are thin re-exports kept here so any
+# code that previously imported list_sql_connections / save_sql_connection
+# from vault_analyst keeps working — no behaviour change.
 
 
 def list_sql_connections(vault_dir: Any) -> Dict[str, str]:
-    """Return the saved {name: url} mapping (empty if none)."""
-    p = _sql_conn_path(vault_dir)
-    if not p.exists():
-        return {}
-    try:
-        data = _json.loads(p.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return {str(k): str(v) for k, v in data.items()}
-    except Exception:
-        return {}
-    return {}
+    """Return saved ``{name: url}``. URLs still contain ``${ENV_VAR}``
+    placeholders; resolution happens at connect time."""
+    import db_connections as _db
+    return _db.list_sql_connections(vault_dir)
 
 
 def save_sql_connection(vault_dir: Any, name: str, url: str) -> None:
-    """Save a named SQLAlchemy connection URL.
-
-    The URL is stored verbatim — put `${PG_PASS}`-style placeholders in
-    it and the resolver will substitute env vars at connect time.
-    """
-    p = _sql_conn_path(vault_dir)
-    existing = list_sql_connections(vault_dir)
-    existing[str(name)] = str(url)
-    p.write_text(_json.dumps(existing, indent=2), encoding="utf-8")
+    """Save a SQLAlchemy connection URL. Use ``${ENV_VAR}`` placeholders
+    for passwords — they expand at connect time."""
+    import db_connections as _db
+    _db.save_sql_connection(vault_dir, name, url)
 
 
-def _resolve_sql_url(url: str) -> str:
-    """Expand ${ENV_VAR} placeholders against os.environ."""
-    import os as _os
-    import re as _re
-    def _sub(m):
-        return _os.environ.get(m.group(1), m.group(0))
-    return _re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", _sub, url)
+def remove_sql_connection(vault_dir: Any, name: str) -> bool:
+    """Drop a saved SQL connection. Returns True if it existed."""
+    import db_connections as _db
+    return _db.remove_sql_connection(vault_dir, name)
+
+
+def save_mongo_connection(vault_dir: Any, name: str, uri: str) -> None:
+    """Save a MongoDB URI (``mongodb://...``). Use ``${ENV_VAR}``
+    placeholders for passwords."""
+    import db_connections as _db
+    _db.save_mongo_connection(vault_dir, name, uri)
+
+
+def remove_mongo_connection(vault_dir: Any, name: str) -> bool:
+    """Drop a saved Mongo connection. Returns True if it existed."""
+    import db_connections as _db
+    return _db.remove_mongo_connection(vault_dir, name)
 
 
 def list_sql_tables(vault_dir: Any, conn_name: str) -> List[str]:
-    """Inspect a named connection and return its table names."""
-    sqlalchemy = _import_sqlalchemy()
-    urls = list_sql_connections(vault_dir)
-    if conn_name not in urls:
-        raise KeyError(f"unknown SQL connection: {conn_name}")
-    eng = sqlalchemy.create_engine(_resolve_sql_url(urls[conn_name]))
-    insp = sqlalchemy.inspect(eng)
-    try:
-        names = list(insp.get_table_names())
-    finally:
-        eng.dispose()
-    return sorted(names)
+    """Inspect a named connection and return its table names.
+    Read-only — uses db_connections layer with full audit trail."""
+    import db_connections as _db
+    return _db.list_sql_tables(vault_dir, conn_name)
 
 
 def read_sql_table(
-    vault_dir: Any, conn_name: str, table: str, *, limit: Optional[int] = None,
+    vault_dir: Any, conn_name: str, table: str,
+    *, limit: Optional[int] = 10000,
 ) -> pd.DataFrame:
-    """Pull a remote SQL table into a DataFrame using a saved connection."""
-    sqlalchemy = _import_sqlalchemy()
-    urls = list_sql_connections(vault_dir)
-    if conn_name not in urls:
-        raise KeyError(f"unknown SQL connection: {conn_name}")
-    eng = sqlalchemy.create_engine(_resolve_sql_url(urls[conn_name]))
-    qname = '"' + str(table).replace('"', '""') + '"'
-    sql = f"SELECT * FROM {qname}"
-    if limit:
-        sql += f" LIMIT {int(limit)}"
-    try:
-        return pd.read_sql_query(sql, eng)
-    finally:
-        eng.dispose()
+    """Pull a remote SQL table into a DataFrame using a saved
+    connection. Read-only by construction (SELECT only). Default
+    10K-row limit; pass ``limit=None`` to lift it."""
+    import db_connections as _db
+    return _db.read_sql_table(vault_dir, conn_name, table, limit=limit)
 
 
 def sql_query(vault_dir: Any, conn_name: str, sql: str) -> pd.DataFrame:
-    """Run an arbitrary SQL query through a saved connection."""
-    sqlalchemy = _import_sqlalchemy()
-    urls = list_sql_connections(vault_dir)
-    if conn_name not in urls:
-        raise KeyError(f"unknown SQL connection: {conn_name}")
-    eng = sqlalchemy.create_engine(_resolve_sql_url(urls[conn_name]))
-    try:
-        return pd.read_sql_query(sql, eng)
-    finally:
-        eng.dispose()
+    """Run an arbitrary SQL query through a saved connection. The
+    query is VALIDATED to be a single read-only statement before
+    dispatch — DDL / DML keywords (INSERT, UPDATE, DELETE, DROP,
+    TRUNCATE, ALTER, CREATE, GRANT, REVOKE, MERGE, …) are rejected
+    even with comment-cloaking, and multi-statement payloads are
+    rejected too. See db_connections._validate_select_only."""
+    import db_connections as _db
+    return _db.sql_query(vault_dir, conn_name, sql)
+
+
+# ── MongoDB — read-only by API design ──────────────────────────────
+# Same convention as the SQL bridge: URLs in vault/mongo_connections.json,
+# ${ENV_VAR} placeholders supported. The wrappers below expose ONLY
+# find / aggregate / count / distinct / list_* — no insert / update /
+# delete / drop methods are reachable from the analyst sandbox. The
+# aggregation validator also rejects $out, $merge, $function,
+# $accumulator, $where which can bypass a read-only role.
+
+def list_mongo_connections(vault_dir: Any) -> Dict[str, str]:
+    """Return saved ``{name: mongodb_uri}``."""
+    import db_connections as _db
+    return _db.list_mongo_connections(vault_dir)
+
+
+def list_mongo_databases(vault_dir: Any, conn_name: str) -> List[str]:
+    """List databases visible to the saved Mongo connection."""
+    import db_connections as _db
+    return _db.list_mongo_databases(vault_dir, conn_name)
+
+
+def list_mongo_collections(
+    vault_dir: Any, conn_name: str, db_name: str,
+) -> List[str]:
+    """List collections in a database."""
+    import db_connections as _db
+    return _db.list_mongo_collections(vault_dir, conn_name, db_name)
+
+
+def read_mongo_collection(
+    vault_dir: Any,
+    conn_name: str,
+    db_name: str,
+    collection: str,
+    *,
+    query: Optional[Dict[str, Any]] = None,
+    projection: Optional[Dict[str, Any]] = None,
+    limit: Optional[int] = 10000,
+    skip: int = 0,
+    sort: Optional[List] = None,
+) -> pd.DataFrame:
+    """Mongo find() → DataFrame. Default 10K-row hard limit; pass
+    limit=None to lift (audit-logged with a WARN tag)."""
+    import db_connections as _db
+    return _db.read_mongo_collection(
+        vault_dir, conn_name, db_name, collection,
+        query=query, projection=projection,
+        limit=limit, skip=skip, sort=sort,
+    )
+
+
+def mongo_aggregate(
+    vault_dir: Any,
+    conn_name: str,
+    db_name: str,
+    collection: str,
+    pipeline: List[Dict[str, Any]],
+    *,
+    allow_disk_use: bool = False,
+) -> pd.DataFrame:
+    """Run a Mongo aggregation pipeline. Pipeline is validated —
+    $out / $merge / $function / $accumulator / $where stages
+    are rejected."""
+    import db_connections as _db
+    return _db.mongo_aggregate(
+        vault_dir, conn_name, db_name, collection, pipeline,
+        allow_disk_use=allow_disk_use,
+    )
+
+
+def mongo_count(
+    vault_dir: Any, conn_name: str, db_name: str, collection: str,
+    *, query: Optional[Dict[str, Any]] = None,
+) -> int:
+    """count_documents on a collection."""
+    import db_connections as _db
+    return _db.mongo_count(vault_dir, conn_name, db_name, collection,
+                            query=query)
+
+
+def mongo_distinct(
+    vault_dir: Any, conn_name: str, db_name: str, collection: str,
+    field: str, *, query: Optional[Dict[str, Any]] = None,
+) -> List[Any]:
+    """distinct values of `field` in a collection."""
+    import db_connections as _db
+    return _db.mongo_distinct(vault_dir, conn_name, db_name, collection,
+                               field, query=query)
 
 
 def read_excel_sheets(path: Any) -> Dict[str, pd.DataFrame]:
@@ -2845,6 +2912,15 @@ def execute_pandas_code(
         "list_sql_tables":      list_sql_tables,
         "read_sql_table":       read_sql_table,
         "sql_query":            sql_query,
+        # MongoDB — read-only by API design. Pipeline validator
+        # blocks $out / $merge / $function / $accumulator / $where.
+        "list_mongo_connections": list_mongo_connections,
+        "list_mongo_databases":   list_mongo_databases,
+        "list_mongo_collections": list_mongo_collections,
+        "read_mongo_collection":  read_mongo_collection,
+        "mongo_aggregate":        mongo_aggregate,
+        "mongo_count":            mongo_count,
+        "mongo_distinct":         mongo_distinct,
     }
     if np is not None:
         globals_dict["np"] = np
@@ -3077,14 +3153,47 @@ BSON / MongoDB:
   read_bson_documents(path)    # -> list[dict]
   read_bson_as_df(path)        # -> DataFrame (pd.json_normalize)
 
-Remote SQL via SQLAlchemy:
+Remote SQL via SQLAlchemy (READ-ONLY — see notes below):
   list_sql_connections(vault_dir)    # -> {name: url}
   list_sql_tables(vault_dir, conn_name)
-  read_sql_table(vault_dir, conn_name, table, limit=None)
+  read_sql_table(vault_dir, conn_name, table, limit=10000)
   sql_query(vault_dir, conn_name, sql)
-  Connections saved to vault/sql_connections.json. URLs can use
-  ${ENV_VAR} placeholders resolved at connect time — keeps passwords
-  out of the JSON file.
+  • Connections live in vault/sql_connections.json with ${ENV_VAR}
+    placeholders for passwords.
+  • Every SQL string passed to sql_query is VALIDATED before
+    dispatch: only single SELECT / WITH / EXPLAIN / SHOW / DESCRIBE
+    statements are allowed. Multi-statement payloads (`;`), DML/DDL
+    keywords (INSERT / UPDATE / DELETE / DROP / TRUNCATE / ALTER /
+    CREATE / GRANT / …), and comment-cloaked writes are rejected.
+  • read_sql_table defaults to 10K-row hard cap; pass limit=None
+    to lift (audit-logged loudly).
+
+Remote MongoDB (READ-ONLY by API design):
+  list_mongo_connections(vault_dir)            # -> {name: uri}
+  list_mongo_databases(vault_dir, conn)
+  list_mongo_collections(vault_dir, conn, db)
+  read_mongo_collection(vault_dir, conn, db, coll, query=None,
+                        projection=None, limit=10000, skip=0, sort=None)
+  mongo_aggregate(vault_dir, conn, db, coll, pipeline,
+                  allow_disk_use=False)
+  mongo_count(vault_dir, conn, db, coll, query=None)
+  mongo_distinct(vault_dir, conn, db, coll, field, query=None)
+  • Connections live in vault/mongo_connections.json with ${ENV_VAR}
+    placeholders.
+  • Only find / aggregate / count / distinct are reachable from
+    these helpers — no insert / update / delete / drop methods are
+    exposed.
+  • Aggregation pipelines are VALIDATED — $out / $merge / $function
+    / $accumulator / $where stages are rejected (they can write or
+    run server-side JS).
+  • Default 10K-row hard cap on read_mongo_collection.
+
+Audit log:
+  Every database query lands in vault/db_audit.log as one JSONL
+  record per query — timestamp, connection name, query (truncated
+  to 500 chars), result row count, duration. Forensic, not
+  preventive — but if anything ever leaks through, the log tells
+  you exactly what happened.
 
 Manufacturing / SPC helpers (analyst_helpers.spc):
   process_capability(series, lsl=None, usl=None, subgroup_size=None,
