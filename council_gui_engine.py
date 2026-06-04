@@ -667,9 +667,137 @@ def _render_excel_block(p, char_limit):
     return content
 
 
-def _render_folder_summary_compact(folder, max_files=120, max_chars=3500):
+def _short_count(n: int) -> str:
+    """Compact integer rendering used in the folder summary's per-file
+    schema preview. Keeps lines short enough that 47 files fit in
+    a token budget."""
+    if n is None:
+        return "?"
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return "?"
+    if abs(n) >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M"
+    if abs(n) >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def _schema_preview_for_file(rel_path: Path, full_path: Path,
+                              vault_index, include_columns: bool) -> str:
+    """One-line schema preview for a single file. Looks up the file's
+    record in the vault index and renders the columns / row count /
+    sheet names / JSON keys. Falls back to a size-only line when the
+    file isn't in the index (e.g. a .gguf, a binary blob).
+
+    ``include_columns`` controls whether to spell out the first ~8
+    column names. We turn this OFF for files past the per-folder
+    detail cap so a 200-file folder still fits in a token budget.
+
+    The fix for "model can see files exist but can't read data inside":
+    the old compact renderer showed JUST the filename, so the model had
+    no way to know what columns or how many rows each CSV had. Now
+    every line carries the schema — model can answer questions like
+    "what columns does orders.csv have?" purely from the folder block.
+    """
+    rec = None
+    if vault_index is not None:
+        try:
+            rec = vault_index.records.get(str(full_path))
+            # Fallback — index keys often use resolved paths
+            if rec is None:
+                rec = vault_index.records.get(str(full_path.resolve()))
+        except Exception:
+            rec = None
+
+    # No index record → just filename + size
+    if not isinstance(rec, dict):
+        try:
+            sz = full_path.stat().st_size
+            sz_str = (f"{sz/1024/1024:.1f} MB"
+                      if sz >= 1024*1024
+                      else (f"{sz/1024:.0f} KB" if sz >= 1024
+                            else f"{sz} B"))
+            return f"  {rel_path}  ·  {sz_str}"
+        except Exception:
+            return f"  {rel_path}"
+
+    rtype = rec.get("type") or "?"
+
+    if rtype in ("csv", "tsv", "csv.gz", "parquet"):
+        rows = _short_count(rec.get("rows"))
+        cols_full = rec.get("headers") or []
+        ncols = len(cols_full)
+        suffix = f"  ·  {rtype} · {rows} rows × {ncols} cols"
+        if include_columns and cols_full:
+            shown = cols_full[:8]
+            extra = (f", +{ncols - 8}" if ncols > 8 else "")
+            suffix += f" [{', '.join(map(str, shown))}{extra}]"
+        return f"  {rel_path}{suffix}"
+
+    if rtype == "excel":
+        sheets = rec.get("sheets") or []
+        suffix = f"  ·  excel · {len(sheets)} sheet{'s' if len(sheets) != 1 else ''}"
+        if include_columns and sheets:
+            sheet_names = [str(s.get("sheet", "?")) for s in sheets[:5]]
+            extra = (f", +{len(sheets) - 5}" if len(sheets) > 5 else "")
+            suffix += f" [{', '.join(sheet_names)}{extra}]"
+        return f"  {rel_path}{suffix}"
+
+    if rtype in ("json", "d3dpipeline", "bson"):
+        keys = rec.get("keys") or []
+        nkeys = len(keys)
+        suffix = f"  ·  {rtype} · {nkeys} key{'s' if nkeys != 1 else ''}"
+        if include_columns and keys:
+            shown = keys[:8]
+            extra = (f", +{nkeys - 8}" if nkeys > 8 else "")
+            suffix += f" [{', '.join(map(str, shown))}{extra}]"
+        return f"  {rel_path}{suffix}"
+
+    if rtype in ("sqlite", "duckdb"):
+        tables = rec.get("tables") or []
+        suffix = f"  ·  {rtype} · {len(tables)} table{'s' if len(tables) != 1 else ''}"
+        if include_columns and tables:
+            table_names = [str(t.get("table", "?")) for t in tables[:5]]
+            extra = (f", +{len(tables) - 5}" if len(tables) > 5 else "")
+            suffix += f" [{', '.join(table_names)}{extra}]"
+        return f"  {rel_path}{suffix}"
+
+    if rtype == "image":
+        w = rec.get("width")
+        h = rec.get("height")
+        if w and h:
+            return f"  {rel_path}  ·  image · {w}×{h}"
+        return f"  {rel_path}  ·  image"
+
+    # Plain text / source code / etc.
+    if rec.get("rows"):
+        return f"  {rel_path}  ·  {rtype} · {_short_count(rec.get('rows'))} lines"
+    return f"  {rel_path}  ·  {rtype}"
+
+
+def _render_folder_summary_compact(folder, max_files=120, max_chars=4500,
+                                    *, vault_index=None,
+                                    detailed_top_n: int = 40):
     """Compact folder summary — counts + subfolder breakdown + filename
-    list. No per-file column previews / sheet names / file heads.
+    list WITH per-file schema previews pulled from the vault index.
+
+    Previously this rendered filenames ONLY. The model saw "orders.csv
+    exists" but had no way to see the columns or row count, which led
+    to the "model can see files exist but can't read data inside"
+    reports — perfectly true from the model's perspective, since the
+    block we injected literally only contained filenames.
+
+    Now each line carries a one-line schema preview:
+        orders.csv     ·  csv · 1.2K rows × 8 cols [order_id, customer, total, ...]
+        customers.csv  ·  csv · 503 rows × 5 cols  [id, name, email, joined, segment]
+        config.json    ·  json · 12 keys [settings, sources, outputs, ...]
+        report.xlsx    ·  excel · 3 sheets [Q1, Q2, Q3]
+
+    The top ``detailed_top_n`` files get the full schema with column
+    names; the remainder get a shorter `name · type · rows × cols`
+    line so a 500-file folder still fits in a few hundred lines.
 
     Used by the vault-trigger auto-injection so a small-context model
     (e.g. 4 K window) doesn't get its entire prompt budget eaten by one
@@ -683,6 +811,22 @@ def _render_folder_summary_compact(folder, max_files=120, max_chars=3500):
     if not folder.exists() or not folder.is_dir():
         return None
 
+    # Lazy-fetch the vault index if the caller didn't pass one. The
+    # injector usually has it in hand already; standalone callers
+    # (the wizard / debug paths) get it via the existing helper.
+    if vault_index is None:
+        try:
+            vault_index = _get_vault_index()
+        except Exception:
+            vault_index = None
+        if vault_index is not None:
+            # Make sure the index actually reflects what's on disk —
+            # delta-aware so this is cheap if nothing changed.
+            try:
+                vault_index.rebuild()
+            except Exception:
+                pass
+
     try:
         import conversation_logger as _cl
     except Exception:
@@ -694,7 +838,7 @@ def _render_folder_summary_compact(folder, max_files=120, max_chars=3500):
     SCAN_LIMIT = 10000
 
     from collections import defaultdict as _dd
-    files: list = []
+    files: list = []          # list of (rel_path, full_path)
     subfolders: dict = _dd(int)
     by_suffix: dict = _dd(int)
     scanned = 0
@@ -723,7 +867,7 @@ def _render_folder_summary_compact(folder, max_files=120, max_chars=3500):
             subfolders[rel.parts[0]] += 1
         suf = p.suffix.lower() or "(no ext)"
         by_suffix[suf] += 1
-        files.append(rel)
+        files.append((rel, p))
 
     total = len(files)
     total_label = f"{total}" + ("+" if walk_truncated else "")
@@ -750,9 +894,16 @@ def _render_folder_summary_compact(folder, max_files=120, max_chars=3500):
     if files:
         lines.append("")
         shown = files[:max_files]
-        lines.append(f"Files (first {len(shown)} of {total}):")
-        for f in shown:
-            lines.append(f"  {f}")
+        lines.append(
+            f"Files (first {len(shown)} of {total}) — schema preview per "
+            f"file so you can answer 'what's in X' without a follow-up "
+            f"tool call:")
+        for idx, (rel_path, full_path) in enumerate(shown):
+            include_cols = (idx < detailed_top_n)
+            lines.append(_schema_preview_for_file(
+                rel_path, full_path, vault_index,
+                include_columns=include_cols,
+            ))
         if total > max_files:
             lines.append(f"  ... ({total - max_files} more files not shown — "
                          f"ask about specific files or subfolders.)")
