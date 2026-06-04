@@ -38,6 +38,7 @@ What this DOES NOT cover (out of scope here):
 """
 from __future__ import annotations
 
+import math
 import os
 import struct
 import sys
@@ -486,19 +487,256 @@ def test_spc_dataframe_column_kwarg() -> None:
 
 
 def test_spc_sandbox_registration() -> None:
-    """The two REGISTERED SPC helpers must be in the analyst
-    sandbox's globals_dict. western_electric_rules and gage_rr are
-    intentionally hidden by project policy — explicitly assert
-    their absence so a future maintainer who flips the switch in
-    __init__.py also has to update this test."""
+    """Asserts both the registered and the intentionally-hidden
+    helpers across the package. Future maintainers flipping
+    visibility on western_electric_rules or gage_rr have to
+    update this test in lockstep with __init__.py."""
     import analyst_helpers
     gd: dict = {}
     analyst_helpers.register_helpers(gd)
+    # SPC
     for name in ("process_capability", "control_chart_limits"):
         _check(f"sandbox has {name}", name in gd)
     for name in ("western_electric_rules", "gage_rr"):
         _check(f"{name} is NOT registered (per project policy)",
                name not in gd)
+    # Engineering (Gate B)
+    for name in ("units_convert", "dimensional_check",
+                 "tolerance_stackup", "fft_spectrum",
+                 "linear_regression_with_diagnostics"):
+        _check(f"sandbox has {name}", name in gd)
+    # Stats (Gate B)
+    for name in ("descriptive_stats_rigorous", "compare_groups",
+                 "multiple_comparison_correction",
+                 "correlation_with_significance", "bootstrap_ci"):
+        _check(f"sandbox has {name}", name in gd)
+
+
+# ─── Gate B — engineering helpers ───────────────────────────────────
+
+def test_engineering_units_convert() -> None:
+    """Scalar and Series round-trips through pint. Skipped (with a
+    PASS) when pint isn't installed — units_convert raises a clear
+    ImportError that the helper documentation tells the user how
+    to resolve."""
+    try:
+        from analyst_helpers.engineering import units_convert
+        v = units_convert(25.4, "mm", "inch")
+        _check(f"25.4 mm → 1 inch (got {v:.4f})", abs(v - 1.0) < 1e-6)
+        v2 = units_convert(100.0, "psi", "kPa")
+        _check(f"100 psi → ~689.5 kPa (got {v2:.2f})", abs(v2 - 689.5) < 1.0)
+    except ImportError as exc:
+        # pint is optional — the test "passes" by demonstrating the
+        # documented behaviour: the helper raises with a clear hint.
+        msg = str(exc)
+        _check("ImportError mentions `pip install pint`",
+               "pint" in msg.lower() and "install" in msg.lower())
+
+
+def test_engineering_tolerance_stackup() -> None:
+    """Worst-case vs RSS — known values: three ±0.1 components.
+    Worst-case ± = 0.3; RSS ± = sqrt(3)/3 × 0.3 / 1 ≈ 0.1732 / 3 × 3."""
+    from analyst_helpers.engineering import tolerance_stackup
+    nominals   = [10.0, 20.0, 30.0]
+    tolerances = [0.1,  0.1,  0.1]
+    wc = tolerance_stackup(nominals, tolerances, method="worst_case")
+    _check(f"worst-case nominal = 60.0 (got {wc['nominal']})",
+           abs(wc["nominal"] - 60.0) < 1e-9)
+    _check(f"worst-case tolerance = 0.3 (got {wc['tolerance']})",
+           abs(wc["tolerance"] - 0.3) < 1e-9)
+    _check("worst-case expected_std is None",
+           wc["expected_std"] is None)
+    rss = tolerance_stackup(nominals, tolerances, method="rss")
+    _check(f"RSS nominal = 60.0 (got {rss['nominal']})",
+           abs(rss["nominal"] - 60.0) < 1e-9)
+    # RSS: σ_i = 0.1/3 each, σ_stack = sqrt(3) * (0.1/3) ≈ 0.0577,
+    # ±3σ stack = ~0.1732.
+    _check(f"RSS tolerance ≈ 0.173 (got {rss['tolerance']:.4f})",
+           abs(rss["tolerance"] - 0.173205) < 0.001)
+
+
+def test_engineering_tolerance_stackup_rejects_bad_input() -> None:
+    """Length mismatch, negative tolerance, and bad method must
+    all raise ValueError — not silently produce a wrong number."""
+    from analyst_helpers.engineering import tolerance_stackup
+    _check("length mismatch raises",
+           _raises(ValueError,
+                   lambda: tolerance_stackup([1.0, 2.0], [0.1])))
+    _check("negative tolerance raises",
+           _raises(ValueError,
+                   lambda: tolerance_stackup([1.0], [-0.1])))
+    _check("unknown method raises",
+           _raises(ValueError,
+                   lambda: tolerance_stackup([1.0], [0.1], method="bogus")))
+
+
+def test_engineering_fft_spectrum_known_peak() -> None:
+    """Synthesise a 50 Hz sine sampled at 1000 Hz; the magnitude
+    peak should land within 1 bin of 50 Hz."""
+    import numpy as np
+    from analyst_helpers.engineering import fft_spectrum
+    fs = 1000.0
+    t = np.arange(0, 2.0, 1.0 / fs)
+    signal = np.sin(2 * np.pi * 50.0 * t)
+    spec = fft_spectrum(signal, sample_rate_hz=fs)
+    peak_idx = int(spec["magnitude"].idxmax())
+    peak_freq = float(spec["frequency_hz"].iloc[peak_idx])
+    _check(f"50 Hz sine → peak ≈ 50 Hz (got {peak_freq:.2f})",
+           abs(peak_freq - 50.0) < 1.0)
+    _check("frequency_hz column starts at 0 (DC)",
+           abs(float(spec["frequency_hz"].iloc[0])) < 1e-9)
+
+
+def test_engineering_linear_regression_diagnostics() -> None:
+    """Synthetic y = 2*x + noise. Slope estimate should be ~2,
+    R² should be high, and the per-coefficient p-value for x
+    should be small."""
+    import numpy as np
+    import pandas as pd
+    from analyst_helpers.engineering import linear_regression_with_diagnostics
+    rng = np.random.default_rng(123)
+    x = rng.uniform(0, 10, size=200)
+    y = 2.0 * x + rng.normal(0, 0.5, size=200)
+    df = pd.DataFrame({"x": x, "y": y})
+    out = linear_regression_with_diagnostics(df, x_cols="x", y_col="y")
+    coef = out["coefficients"]
+    slope = float(coef.loc[coef["term"] == "x", "estimate"].iloc[0])
+    _check(f"slope ≈ 2 (got {slope:.3f})", 1.95 <= slope <= 2.05)
+    _check(f"r2 > 0.95 on clean linear data (got {out['r2']:.3f})",
+           out["r2"] > 0.95)
+    slope_p = float(coef.loc[coef["term"] == "x", "p_value"].iloc[0])
+    _check(f"slope p-value tiny (got {slope_p:.2e})", slope_p < 1e-9)
+    # VIF is NaN for single predictor — assert that
+    slope_vif = float(coef.loc[coef["term"] == "x", "vif"].iloc[0])
+    _check("VIF is NaN for single-predictor model",
+           math.isnan(slope_vif))
+
+
+def test_engineering_linear_regression_collinearity_flagged() -> None:
+    """Highly correlated predictors → VIF warning surfaces."""
+    import math
+    import numpy as np
+    import pandas as pd
+    from analyst_helpers.engineering import linear_regression_with_diagnostics
+    rng = np.random.default_rng(0)
+    x1 = rng.uniform(0, 10, size=200)
+    x2 = x1 + rng.normal(0, 0.1, size=200)   # ~perfectly correlated with x1
+    y  = 3.0 * x1 + rng.normal(0, 0.5, size=200)
+    df = pd.DataFrame({"x1": x1, "x2": x2, "y": y})
+    out = linear_regression_with_diagnostics(
+        df, x_cols=["x1", "x2"], y_col="y")
+    _check("warning surfaces multicollinearity",
+           any("multicollinearity" in w.lower() for w in out["warnings"]))
+    coef = out["coefficients"]
+    # Max VIF excluding intercept
+    vifs = [float(v) for v in coef.loc[coef["term"] != "(Intercept)", "vif"]
+             if not math.isnan(float(v))]
+    _check(f"max VIF > 10 on near-collinear data (got {max(vifs):.1f})",
+           max(vifs) > 10.0)
+
+
+# ─── Gate B — stats helpers ─────────────────────────────────────────
+
+def test_stats_descriptive() -> None:
+    """Hand-built sample with known mean / SD / CI bounds."""
+    import math
+    from analyst_helpers.stats import descriptive_stats_rigorous
+    out = descriptive_stats_rigorous([1, 2, 3, 4, 5, 6, 7, 8, 9, 10])
+    _check("n == 10", out["n"] == 10)
+    _check("mean = 5.5", abs(out["mean"] - 5.5) < 1e-9)
+    _check("median = 5.5", abs(out["median"] - 5.5) < 1e-9)
+    _check("std ≈ 3.028", abs(out["std"] - 3.0277) < 0.001)
+    _check("ci95 brackets mean",
+           out["ci95_lower"] < out["mean"] < out["ci95_upper"])
+
+
+def test_stats_compare_groups_picks_ttest() -> None:
+    """Two normal groups, equal variance → independent t-test."""
+    import numpy as np
+    import pandas as pd
+    from analyst_helpers.stats import compare_groups
+    rng = np.random.default_rng(42)
+    a = rng.normal(10.0, 1.0, 100)
+    b = rng.normal(10.6, 1.0, 100)
+    df = pd.DataFrame({
+        "value": np.concatenate([a, b]),
+        "group": ["A"] * 100 + ["B"] * 100,
+    })
+    out = compare_groups(df, value_col="value", group_col="group")
+    _check("test_used mentions t-test",
+           "t-test" in out["test_used"].lower())
+    _check("rationale string non-empty", bool(out["rationale"]))
+    _check(f"detected mean diff effect (Cohen's d ~ -0.6, got {out['effect_size']:.3f})",
+           abs(out["effect_size"] + 0.6) < 0.3)
+
+
+def test_stats_compare_groups_picks_mannwhitney() -> None:
+    """Skewed data → falls to Mann-Whitney."""
+    import numpy as np
+    import pandas as pd
+    from analyst_helpers.stats import compare_groups
+    rng = np.random.default_rng(7)
+    a = rng.exponential(scale=1.0, size=80)
+    b = rng.exponential(scale=2.0, size=80)
+    df = pd.DataFrame({
+        "value": np.concatenate([a, b]),
+        "group": ["A"] * 80 + ["B"] * 80,
+    })
+    out = compare_groups(df, value_col="value", group_col="group")
+    _check("test_used is Mann-Whitney U",
+           "mann-whitney" in out["test_used"].lower())
+    _check("rationale references normality failure",
+           "normality" in out["rationale"].lower())
+
+
+def test_stats_multiple_comparison_correction() -> None:
+    """Known input: BH on [0.01, 0.04, 0.03, 0.005] at α=0.05 → all
+    four reject (their BH-adjusted p's stay below 0.05)."""
+    from analyst_helpers.stats import multiple_comparison_correction
+    raw = [0.01, 0.04, 0.03, 0.005]
+    out = multiple_comparison_correction(raw, method="fdr_bh", alpha=0.05)
+    _check(f"BH adjusts all four below α (rejects={out['reject_null'].tolist()})",
+           bool(out["reject_null"].all()))
+    out_bonf = multiple_comparison_correction(
+        raw, method="bonferroni", alpha=0.05)
+    # Bonferroni multiplies by m=4: 0.04*4=0.16, 0.03*4=0.12 → not rejected
+    _check("Bonferroni rejects fewer than BH",
+           int(out_bonf["reject_null"].sum())
+           <= int(out["reject_null"].sum()))
+
+
+def test_stats_bootstrap_ci_reproducible() -> None:
+    """random_state seed → identical CI across calls."""
+    from analyst_helpers.stats import bootstrap_ci
+    data = list(range(1, 101))
+    a = bootstrap_ci(data, n_boot=2000, random_state=99)
+    b = bootstrap_ci(data, n_boot=2000, random_state=99)
+    _check("identical CIs from identical seed", a == b)
+    # CI of the mean of 1..100 should bracket 50.5
+    _check(f"CI brackets the true mean (50.5) — got [{a[1]:.2f}, {a[2]:.2f}]",
+           a[1] < 50.5 < a[2])
+
+
+def test_stats_correlation_with_significance() -> None:
+    """Strong linear correlation should be flagged significant
+    after FDR correction; unrelated columns should not."""
+    import numpy as np
+    import pandas as pd
+    from analyst_helpers.stats import correlation_with_significance
+    rng = np.random.default_rng(0)
+    x = rng.uniform(0, 10, 200)
+    df = pd.DataFrame({
+        "x":       x,
+        "y_linear": 2 * x + rng.normal(0, 0.5, 200),
+        "y_noise":  rng.normal(0, 1, 200),
+    })
+    out = correlation_with_significance(df)
+    _check("x vs y_linear correlation > 0.9",
+           out["corr"].loc["x", "y_linear"] > 0.9)
+    _check("x vs y_linear is FDR-significant",
+           bool(out["significant_fdr"].loc["x", "y_linear"]))
+    _check("x vs y_noise correlation small",
+           abs(out["corr"].loc["x", "y_noise"]) < 0.2)
 
 
 def test_vault_image_suffix_routing() -> None:
@@ -540,6 +778,20 @@ def main() -> int:
     _run("SPC — control_chart unknown type",      test_spc_control_chart_limits_unknown_chart_type)
     _run("SPC — multi-col DataFrame + column=",   test_spc_dataframe_column_kwarg)
     _run("SPC — sandbox registration contract",   test_spc_sandbox_registration)
+    # Gate B — engineering
+    _run("ENG — units_convert (or ImportError)",  test_engineering_units_convert)
+    _run("ENG — tolerance_stackup known values",  test_engineering_tolerance_stackup)
+    _run("ENG — tolerance_stackup bad input",     test_engineering_tolerance_stackup_rejects_bad_input)
+    _run("ENG — fft_spectrum 50 Hz peak",         test_engineering_fft_spectrum_known_peak)
+    _run("ENG — linear regression diagnostics",   test_engineering_linear_regression_diagnostics)
+    _run("ENG — VIF / collinearity warning",      test_engineering_linear_regression_collinearity_flagged)
+    # Gate B — stats
+    _run("STAT — descriptive_stats_rigorous",     test_stats_descriptive)
+    _run("STAT — compare_groups picks t-test",    test_stats_compare_groups_picks_ttest)
+    _run("STAT — compare_groups picks MW-U",      test_stats_compare_groups_picks_mannwhitney)
+    _run("STAT — MC correction (Bonf vs BH)",     test_stats_multiple_comparison_correction)
+    _run("STAT — bootstrap CI reproducibility",   test_stats_bootstrap_ci_reproducible)
+    _run("STAT — correlation_with_significance",  test_stats_correlation_with_significance)
     _run("vault image suffix routing",          test_vault_image_suffix_routing)
     print()
     print("=" * 70)

@@ -76,14 +76,32 @@ def register_helpers(globals_dict: Dict[str, Any]) -> None:
         print(f"[analyst_helpers] SPC helpers not registered: {exc!r}",
               file=_sys.stderr)
 
-    # ── Phase 1b/1c — engineering + stats (Gate B placeholders) ─────
-    # Wired in at Gate B. Keeping the import sites here so the
-    # register call's shape doesn't churn between gates.
-    # try:
-    #     from . import engineering as _eng
-    #     globals_dict.update({...})
-    # except Exception as exc: ...
-    # try:
-    #     from . import stats as _stats
-    #     globals_dict.update({...})
-    # except Exception as exc: ...
+    # ── Phase 1b — engineering ──────────────────────────────────────
+    try:
+        from . import engineering as _eng
+        globals_dict.update({
+            "units_convert":                     _eng.units_convert,
+            "dimensional_check":                 _eng.dimensional_check,
+            "tolerance_stackup":                 _eng.tolerance_stackup,
+            "fft_spectrum":                      _eng.fft_spectrum,
+            "linear_regression_with_diagnostics": _eng.linear_regression_with_diagnostics,
+        })
+    except Exception as exc:
+        import sys as _sys
+        print(f"[analyst_helpers] engineering helpers not registered: "
+              f"{exc!r}", file=_sys.stderr)
+
+    # ── Phase 1c — stats ────────────────────────────────────────────
+    try:
+        from . import stats as _stats
+        globals_dict.update({
+            "descriptive_stats_rigorous":      _stats.descriptive_stats_rigorous,
+            "compare_groups":                  _stats.compare_groups,
+            "multiple_comparison_correction":  _stats.multiple_comparison_correction,
+            "correlation_with_significance":   _stats.correlation_with_significance,
+            "bootstrap_ci":                    _stats.bootstrap_ci,
+        })
+    except Exception as exc:
+        import sys as _sys
+        print(f"[analyst_helpers] stats helpers not registered: "
+              f"{exc!r}", file=_sys.stderr)
