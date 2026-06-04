@@ -739,6 +739,157 @@ def test_stats_correlation_with_significance() -> None:
            abs(out["corr"].loc["x", "y_noise"]) < 0.2)
 
 
+def test_db_sql_validator_accepts_reads() -> None:
+    """The SQL read-only validator must accept the canonical read
+    patterns we promise users in the documentation."""
+    from db_connections import _validate_select_only
+    OK = [
+        "SELECT * FROM orders LIMIT 10",
+        "select 1",
+        "WITH t AS (SELECT * FROM o) SELECT * FROM t",
+        "SELECT * FROM /* comment with WORDS */ orders",
+        "EXPLAIN SELECT * FROM orders",
+        "SHOW TABLES",
+        "DESCRIBE orders",
+        # trailing semicolons are fine
+        "SELECT 1;",
+        # case insensitivity
+        "Select Count(*) From Orders Where x > 1",
+    ]
+    for sql in OK:
+        try:
+            _validate_select_only(sql)
+            _check(f"validator accepts: {sql!r}", True)
+        except Exception as exc:
+            _check(f"validator accepts: {sql!r}", False,
+                   detail=f"raised {exc!r}")
+
+
+def test_db_sql_validator_rejects_writes() -> None:
+    """Every documented rejection must actually raise."""
+    from db_connections import _validate_select_only, ReadOnlyViolation
+    BAD = [
+        ("DROP TABLE orders",                       "drop"),
+        ("DELETE FROM orders WHERE 1=1",            "delete"),
+        ("INSERT INTO orders VALUES (1, 'x')",      "insert"),
+        ("UPDATE orders SET total = 0",             "update"),
+        ("TRUNCATE TABLE orders",                   "truncate"),
+        ("ALTER TABLE orders ADD COLUMN x INT",     "alter"),
+        ("CREATE TABLE x (id INT)",                 "create"),
+        ("GRANT SELECT ON orders TO public",        "grant"),
+        ("MERGE INTO target USING source ON ...",   "merge"),
+        # multi-statement
+        ("SELECT 1; DROP TABLE orders",             "multi-statement"),
+        # comment-cloaked DDL
+        ("/* SELECT */ DROP TABLE orders",          "comment cloak"),
+        ("-- SELECT \n DROP TABLE orders",          "line-comment cloak"),
+        # stored proc that could hide writes
+        ("EXEC sp_some_proc",                       "exec sproc"),
+        # SET ROLE escalation
+        ("SET ROLE admin",                          "SET keyword"),
+        # empty / comment-only
+        ("",                                         "empty"),
+        ("-- only a comment",                       "comment only"),
+        ("/* only */ /* comments */",               "block comments only"),
+    ]
+    for sql, label in BAD:
+        ok = _raises(ReadOnlyViolation, lambda s=sql: _validate_select_only(s))
+        _check(f"validator rejects {label}: {sql!r}", ok)
+
+
+def test_db_mongo_pipeline_validator() -> None:
+    """Mongo aggregation pipelines with write or server-side-JS
+    stages must be rejected. Read-only stages must pass."""
+    from db_connections import (_validate_mongo_pipeline,
+                                 MongoPipelineViolation)
+    OK_PIPELINES = [
+        [{"$match": {"level": "error"}}],
+        [{"$group": {"_id": "$service", "n": {"$sum": 1}}},
+         {"$sort": {"n": -1}},
+         {"$limit": 100}],
+        [{"$project": {"name": 1, "_id": 0}}],
+        [],   # empty pipeline is technically valid for find-like reads
+    ]
+    for p in OK_PIPELINES:
+        try:
+            _validate_mongo_pipeline(p)
+            _check(f"pipeline accepted: {p}", True)
+        except Exception as exc:
+            _check(f"pipeline accepted: {p}", False, detail=repr(exc))
+
+    BAD_PIPELINES = [
+        ("$out",         [{"$match": {}}, {"$out": "errors_archive"}]),
+        ("$merge",       [{"$match": {}}, {"$merge": {"into": "x"}}]),
+        ("$function",    [{"$project": {"x": {"$function":
+                            {"body": "fn", "args": [], "lang": "js"}}}}]),
+        ("$accumulator", [{"$group": {"_id": None,
+                            "acc": {"$accumulator": {"init": "f"}}}}]),
+        ("$where",       [{"$match": {"$where": "this.x > 1"}}]),
+    ]
+    for label, pipeline in BAD_PIPELINES:
+        ok = _raises(MongoPipelineViolation,
+                     lambda p=pipeline: _validate_mongo_pipeline(p))
+        _check(f"pipeline with {label} rejected", ok)
+
+    # Non-list payloads
+    _check("non-list pipeline rejected",
+           _raises(MongoPipelineViolation,
+                   lambda: _validate_mongo_pipeline("not a list")))
+    _check("non-dict stage rejected",
+           _raises(MongoPipelineViolation,
+                   lambda: _validate_mongo_pipeline([1, 2, 3])))
+
+
+def test_db_connection_storage_roundtrip() -> None:
+    """Saved connections round-trip through the JSON files; passwords
+    with ${ENV_VAR} placeholders pass through unmolested."""
+    import db_connections as _db
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td)
+        _db.save_sql_connection(
+            vault, "sales_db",
+            "postgresql://readonly_user:${PG_PASS}@host:5432/sales")
+        _db.save_mongo_connection(
+            vault, "logs",
+            "mongodb://readonly_user:${MONGO_PASS}@host:27017/")
+
+        sql_map   = _db.list_sql_connections(vault)
+        mongo_map = _db.list_mongo_connections(vault)
+        _check("SQL connection round-trips",
+               sql_map.get("sales_db", "").endswith("/sales")
+               and "${PG_PASS}" in sql_map["sales_db"])
+        _check("Mongo connection round-trips",
+               mongo_map.get("logs", "").endswith(":27017/")
+               and "${MONGO_PASS}" in mongo_map["logs"])
+
+        # Removal
+        _check("remove SQL returns True", _db.remove_sql_connection(vault, "sales_db"))
+        _check("remove SQL again returns False",
+               not _db.remove_sql_connection(vault, "sales_db"))
+        _check("after remove, list is empty",
+               _db.list_sql_connections(vault) == {})
+
+
+def test_db_audit_log_writes() -> None:
+    """The audit logger writes one JSONL record per call and never
+    raises — even when the file can't be created (the audit log is
+    forensic and must never break a query)."""
+    import db_connections as _db
+    import json as _json
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td)
+        _db._audit(vault, kind="test", note="hello", n=42)
+        _db._audit(vault, kind="test", note="world", n=43)
+        log_path = vault / "db_audit.log"
+        _check("audit log file created", log_path.is_file())
+        lines = log_path.read_text(encoding="utf-8").strip().split("\n")
+        _check("two records written", len(lines) == 2)
+        rec = _json.loads(lines[0])
+        _check("record has ts + kind + note", {"ts", "kind", "note"} <= set(rec))
+        _check("record contents preserved",
+               rec["kind"] == "test" and rec["note"] == "hello")
+
+
 def test_vault_image_suffix_routing() -> None:
     """The image-file routing added in the ship-readiness pass must
     accept image extensions through _PARSEABLE and produce a record
@@ -778,6 +929,12 @@ def main() -> int:
     _run("SPC — control_chart unknown type",      test_spc_control_chart_limits_unknown_chart_type)
     _run("SPC — multi-col DataFrame + column=",   test_spc_dataframe_column_kwarg)
     _run("SPC — sandbox registration contract",   test_spc_sandbox_registration)
+    # DB connectivity — read-only enforcement
+    _run("DB — SQL validator accepts reads",      test_db_sql_validator_accepts_reads)
+    _run("DB — SQL validator rejects writes",     test_db_sql_validator_rejects_writes)
+    _run("DB — Mongo pipeline validator",         test_db_mongo_pipeline_validator)
+    _run("DB — connection storage round-trip",    test_db_connection_storage_roundtrip)
+    _run("DB — audit log writes JSONL",           test_db_audit_log_writes)
     # Gate B — engineering
     _run("ENG — units_convert (or ImportError)",  test_engineering_units_convert)
     _run("ENG — tolerance_stackup known values",  test_engineering_tolerance_stackup)
