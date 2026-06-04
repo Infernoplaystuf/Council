@@ -9736,6 +9736,15 @@ class CouncilConsole(tk.Tk):
                     self._scraper_status.configure(text="idle", foreground="#6c7086")
             self._scraper_source_cb.bind("<<ComboboxSelected>>", _on_source_change)
 
+        # ── Database Connections (read-only) ──────────────────
+        # Save / list / test / remove saved SQL + Mongo connections.
+        # Every read here is enforced read-only via the db_connections
+        # module: client-side validator + per-dialect session hint +
+        # API-design read-only (Mongo) + audit log to vault/db_audit.log.
+        # See DATABASE_CONNECTIONS.md for the threat model + the
+        # recommended DB-side read-only role per database.
+        self._build_vmgr_db_connections_panel(left)
+
         # ── Vault tree ────────────────────────────────────────
         ttk.Label(left, text="Vault Contents",
                   font=("", 9, "bold")).pack(anchor="w", padx=4, pady=(4, 0))
@@ -9793,6 +9802,390 @@ class CouncilConsole(tk.Tk):
 
         # Populate tree
         self._vmgr_refresh_tree()
+
+    # ── Database Connections panel ─────────────────────────────────────────
+    # Builds the "🔌 Database Connections" LabelFrame in the Vault tab's left
+    # pane. Add / list / test / remove SQL + Mongo connections through the
+    # UI. All operations route through db_connections.py which enforces
+    # the read-only policy (validator + session hints + API surface +
+    # audit log).
+
+    def _build_vmgr_db_connections_panel(self, parent) -> None:
+        import tkinter as tk
+        db_lf = ttk.LabelFrame(parent, text="🔌 Database Connections (read-only)")
+        db_lf.pack(fill="x", padx=4, pady=(0, 6))
+
+        # ── Add-connection row ─────────────────────────────────
+        # Name + type + URL/URI + Save. The "type" dropdown drives the
+        # placeholder we put in the URL box and where the connection is
+        # stored (sql_connections.json vs mongo_connections.json).
+        add_row = ttk.Frame(db_lf)
+        add_row.pack(fill="x", padx=6, pady=(6, 2))
+        ttk.Label(add_row, text="Name:", width=6).pack(side="left")
+        self._db_conn_name_var = tk.StringVar()
+        ttk.Entry(add_row, textvariable=self._db_conn_name_var,
+                   width=12).pack(side="left", padx=(2, 6))
+        ttk.Label(add_row, text="Type:").pack(side="left")
+        self._db_conn_type_var = tk.StringVar(value="postgresql")
+        type_cb = ttk.Combobox(
+            add_row, textvariable=self._db_conn_type_var,
+            values=("postgresql", "mysql", "mssql", "sqlite", "duckdb",
+                    "mongodb"),
+            state="readonly", width=10,
+        )
+        type_cb.pack(side="left", padx=(2, 6))
+
+        url_row = ttk.Frame(db_lf)
+        url_row.pack(fill="x", padx=6, pady=2)
+        ttk.Label(url_row, text="URL:", width=6).pack(side="left")
+        self._db_conn_url_var = tk.StringVar()
+        url_entry = ttk.Entry(url_row, textvariable=self._db_conn_url_var)
+        url_entry.pack(side="left", fill="x", expand=True, padx=(2, 4))
+
+        def _update_url_placeholder(*_):
+            """Set a type-appropriate URL template in the entry box so
+            the user can edit instead of typing from scratch. Only fills
+            when the entry is empty so we don't clobber a half-typed URL."""
+            cur = self._db_conn_url_var.get().strip()
+            if cur:
+                return
+            t = self._db_conn_type_var.get()
+            templates = {
+                "postgresql": "postgresql://readonly_user:${PG_PASS}@host:5432/dbname",
+                "mysql":      "mysql+pymysql://readonly_user:${MYSQL_PASS}@host:3306/dbname",
+                "mssql":      "mssql+pyodbc://readonly_user:${MSSQL_PASS}@host:1433/dbname?driver=ODBC+Driver+17+for+SQL+Server",
+                "sqlite":     "sqlite:///C:/path/to/file.db",
+                "duckdb":     "duckdb:///C:/path/to/file.duckdb",
+                "mongodb":    "mongodb://readonly_user:${MONGO_PASS}@host:27017/?authSource=admin",
+            }
+            self._db_conn_url_var.set(templates.get(t, ""))
+        type_cb.bind("<<ComboboxSelected>>", _update_url_placeholder)
+
+        btn_row = ttk.Frame(db_lf)
+        btn_row.pack(fill="x", padx=6, pady=(2, 4))
+        ttk.Button(btn_row, text="💾 Save",
+                   command=self._db_conn_save).pack(side="left")
+        ttk.Button(btn_row, text="🧪 Test",
+                   command=self._db_conn_test).pack(side="left", padx=4)
+        ttk.Button(btn_row, text="🗑 Remove",
+                   command=self._db_conn_remove).pack(side="left")
+
+        # ── Saved connections list ─────────────────────────────
+        list_lbl = ttk.Label(
+            db_lf, text="Saved connections (double-click → browse):",
+            foreground="#94a3b8",
+        )
+        list_lbl.pack(anchor="w", padx=6, pady=(4, 0))
+        self._db_conn_list = tk.Listbox(
+            db_lf, height=5, bg="#231a1a", fg="#d4d4d4",
+            selectbackground="#5a3030", relief="flat",
+            font=("Consolas", 9),
+        )
+        self._db_conn_list.pack(fill="x", padx=6, pady=2)
+        self._db_conn_list.bind("<Double-Button-1>",
+                                 self._db_conn_browse_selected)
+
+        # Status line — populated by the Test button and the auto-
+        # refresh path. Keeps long messages (full URLs, errors) out
+        # of the activity log.
+        self._db_conn_status = ttk.Label(
+            db_lf, text="(no connections saved yet)",
+            foreground="#6c7086",
+        )
+        self._db_conn_status.pack(anchor="w", padx=6, pady=(2, 4))
+
+        # Initial population
+        self._db_conn_refresh_list()
+
+    # ── Connections-panel actions ──────────────────────────────────
+
+    def _db_conn_refresh_list(self) -> None:
+        """Rebuild the saved-connections listbox from the JSON files."""
+        try:
+            import db_connections as _db
+            sql   = _db.list_sql_connections(VAULT_DIR)
+            mongo = _db.list_mongo_connections(VAULT_DIR)
+        except Exception as exc:
+            self._db_conn_list.delete(0, "end")
+            self._db_conn_status.configure(
+                text=f"⚠ connection registry read failed: {exc}",
+                foreground="#fab387",
+            )
+            return
+        self._db_conn_list.delete(0, "end")
+        for name in sorted(sql):
+            url = sql[name]
+            # Mask the password between :// and @
+            masked = self._db_conn_mask(url)
+            self._db_conn_list.insert("end", f"[sql]    {name}   {masked}")
+        for name in sorted(mongo):
+            url = mongo[name]
+            masked = self._db_conn_mask(url)
+            self._db_conn_list.insert("end", f"[mongo]  {name}   {masked}")
+        total = len(sql) + len(mongo)
+        if total == 0:
+            self._db_conn_status.configure(
+                text="(no connections saved yet)", foreground="#6c7086")
+        else:
+            self._db_conn_status.configure(
+                text=f"{total} connection(s) saved — double-click a row to browse",
+                foreground="#94a3b8",
+            )
+
+    @staticmethod
+    def _db_conn_mask(url: str) -> str:
+        """Mask any password in a connection URL for display in the
+        listbox. Handles both SQLAlchemy (``foo://user:pass@host/db``)
+        and Mongo (``mongodb://user:pass@host/`` + query). ${ENV_VAR}
+        placeholders pass through untouched — there's nothing to mask."""
+        import re as _re
+        return _re.sub(
+            r"(://[^:/@]+:)([^@]+)(@)",
+            lambda m: m.group(1) + "***" + m.group(3),
+            url,
+        )
+
+    def _db_conn_save(self) -> None:
+        from tkinter import messagebox
+        import db_connections as _db
+        name = self._db_conn_name_var.get().strip()
+        url  = self._db_conn_url_var.get().strip()
+        kind = self._db_conn_type_var.get().strip().lower()
+        if not name:
+            messagebox.showwarning(
+                "Connection name required",
+                "Pick a short name for this connection (it's the handle "
+                "you'll reference in analyst queries, e.g. "
+                "'sales_db' → sql_query(VAULT_DIR, 'sales_db', '...')).")
+            return
+        if not url:
+            messagebox.showwarning(
+                "URL required",
+                "Paste the connection URL or URI. Use ${ENV_VAR} for "
+                "the password so it stays out of the JSON file:\n\n"
+                "  postgresql://user:${PG_PASS}@host:5432/dbname")
+            return
+        try:
+            if kind == "mongodb":
+                _db.save_mongo_connection(VAULT_DIR, name, url)
+                self._vmgr_append(f"saved Mongo connection: {name}", "ok")
+            else:
+                _db.save_sql_connection(VAULT_DIR, name, url)
+                self._vmgr_append(f"saved SQL connection: {name}", "ok")
+        except Exception as exc:
+            messagebox.showerror("Save failed", f"{exc!r}")
+            return
+        self._db_conn_name_var.set("")
+        self._db_conn_url_var.set("")
+        self._db_conn_refresh_list()
+
+    def _db_conn_remove(self) -> None:
+        from tkinter import messagebox
+        import db_connections as _db
+        sel = self._db_conn_list.curselection()
+        if not sel:
+            messagebox.showinfo(
+                "Pick a connection",
+                "Select a saved connection in the list first.")
+            return
+        line = self._db_conn_list.get(sel[0])
+        kind, name = self._parse_listbox_line(line)
+        if not name:
+            return
+        if not messagebox.askyesno(
+                "Remove connection",
+                f"Remove the {kind} connection {name!r}?\n\n"
+                "The connection URL is deleted from "
+                f"vault/{'mongo' if kind == 'mongo' else 'sql'}_connections.json. "
+                "Your DB is not touched."):
+            return
+        if kind == "mongo":
+            _db.remove_mongo_connection(VAULT_DIR, name)
+        else:
+            _db.remove_sql_connection(VAULT_DIR, name)
+        self._vmgr_append(f"removed {kind} connection: {name}", "ok")
+        self._db_conn_refresh_list()
+
+    def _db_conn_test(self) -> None:
+        """Probe the selected connection. SQL: SELECT 1 + table count.
+        Mongo: ping + database count. Renders the result in the
+        status line so the user can immediately see whether their
+        connection works."""
+        import db_connections as _db
+        sel = self._db_conn_list.curselection()
+        if not sel:
+            # If no selection, also accept the name field as a test target
+            name = self._db_conn_name_var.get().strip()
+            kind = self._db_conn_type_var.get().strip().lower()
+            if not name:
+                self._db_conn_status.configure(
+                    text="⚠ pick a saved connection or fill the Name field first",
+                    foreground="#fab387",
+                )
+                return
+        else:
+            line = self._db_conn_list.get(sel[0])
+            kind, name = self._parse_listbox_line(line)
+        kind = "mongo" if kind == "mongo" else "sql"
+        self._db_conn_status.configure(
+            text=f"⏳ testing {kind} connection {name!r}…",
+            foreground="#94a3b8",
+        )
+        self.update_idletasks()
+        try:
+            if kind == "mongo":
+                result = _db.test_mongo_connection(VAULT_DIR, name)
+                if result.get("ok"):
+                    self._db_conn_status.configure(
+                        text=(f"✓ {name} — connected · "
+                               f"{result.get('databases', 0)} database(s) "
+                               "visible"),
+                        foreground="#a6e3a1",
+                    )
+                    self._vmgr_append(
+                        f"tested mongo connection {name}: OK", "ok")
+                else:
+                    self._db_conn_status.configure(
+                        text=f"✗ {name} — {result.get('error') or 'unknown error'}",
+                        foreground="#f38ba8",
+                    )
+                    self._vmgr_append(
+                        f"tested mongo connection {name}: FAILED — "
+                        f"{result.get('error')}", "err")
+            else:
+                result = _db.test_sql_connection(VAULT_DIR, name)
+                if result.get("ok"):
+                    self._db_conn_status.configure(
+                        text=(f"✓ {name} — connected ({result.get('dialect')}) · "
+                               f"{result.get('tables', 0)} table(s) visible · "
+                               "SELECT 1 ok"),
+                        foreground="#a6e3a1",
+                    )
+                    self._vmgr_append(
+                        f"tested sql connection {name}: OK "
+                        f"({result.get('dialect')})", "ok")
+                else:
+                    self._db_conn_status.configure(
+                        text=f"✗ {name} — {result.get('error') or 'unknown error'}",
+                        foreground="#f38ba8",
+                    )
+                    self._vmgr_append(
+                        f"tested sql connection {name}: FAILED — "
+                        f"{result.get('error')}", "err")
+        except Exception as exc:
+            self._db_conn_status.configure(
+                text=f"✗ test raised {exc!r}",
+                foreground="#f38ba8",
+            )
+
+    def _db_conn_browse_selected(self, _event=None) -> None:
+        """Double-click handler: open a separate window listing the
+        tables (SQL) or collections (Mongo) of the selected
+        connection. Read-only — clicking a table/collection runs a
+        SELECT / find() with a 50-row cap."""
+        import tkinter as tk
+        from tkinter import messagebox
+        import db_connections as _db
+        sel = self._db_conn_list.curselection()
+        if not sel:
+            return
+        line = self._db_conn_list.get(sel[0])
+        kind, name = self._parse_listbox_line(line)
+        if not name:
+            return
+
+        win = tk.Toplevel(self)
+        win.title(f"{kind.upper()}: {name}")
+        win.geometry("760x560")
+        win.configure(bg="#1a1414")
+
+        # Top: tables / collections list
+        top = ttk.Frame(win)
+        top.pack(fill="x", padx=6, pady=(6, 2))
+        ttk.Label(top, text=f"{name}  ({kind})",
+                   font=("", 10, "bold")).pack(side="left")
+
+        list_frame = ttk.Frame(win)
+        list_frame.pack(fill="x", padx=6, pady=2)
+        lst = tk.Listbox(list_frame, height=8, bg="#231a1a", fg="#d4d4d4",
+                          selectbackground="#5a3030", relief="flat",
+                          font=("Consolas", 9))
+        lst.pack(fill="x")
+
+        # Bottom: preview text
+        preview_lf = ttk.LabelFrame(win,
+                                    text="Preview (first 50 rows, read-only)")
+        preview_lf.pack(fill="both", expand=True, padx=6, pady=4)
+        preview = tk.Text(preview_lf, wrap="none",
+                           bg="#231a1a", fg="#d4d4d4",
+                           font=("Consolas", 9))
+        preview.pack(fill="both", expand=True, padx=4, pady=4)
+
+        def _populate_tables_or_collections():
+            lst.delete(0, "end")
+            try:
+                if kind == "mongo":
+                    dbs = _db.list_mongo_databases(VAULT_DIR, name)
+                    for db_name in dbs:
+                        cols = _db.list_mongo_collections(
+                            VAULT_DIR, name, db_name)
+                        for c in cols:
+                            lst.insert("end", f"{db_name}.{c}")
+                else:
+                    tables = _db.list_sql_tables(VAULT_DIR, name)
+                    for t in tables:
+                        lst.insert("end", t)
+            except Exception as exc:
+                lst.insert("end", f"(error: {exc})")
+
+        def _on_pick(_evt=None):
+            sel2 = lst.curselection()
+            if not sel2:
+                return
+            picked = lst.get(sel2[0])
+            preview.delete("1.0", "end")
+            preview.insert("end", f"loading first 50 rows of {picked}…\n")
+            self.update_idletasks()
+            try:
+                if kind == "mongo":
+                    if "." not in picked:
+                        raise ValueError("expected db.collection format")
+                    db_name, coll = picked.split(".", 1)
+                    df = _db.read_mongo_collection(
+                        VAULT_DIR, name, db_name, coll, limit=50)
+                else:
+                    df = _db.read_sql_table(
+                        VAULT_DIR, name, picked, limit=50)
+                preview.delete("1.0", "end")
+                if df.empty:
+                    preview.insert("end", "(no rows)\n")
+                else:
+                    preview.insert("end", df.to_string(index=False) + "\n")
+                self._vmgr_append(
+                    f"previewed {kind} {name}.{picked} — "
+                    f"{len(df)} row(s)", "ok")
+            except Exception as exc:
+                preview.delete("1.0", "end")
+                preview.insert("end", f"✗ {exc!r}\n")
+                self._vmgr_append(
+                    f"preview failed for {kind} {name}.{picked}: {exc}",
+                    "err")
+
+        lst.bind("<<ListboxSelect>>", _on_pick)
+        _populate_tables_or_collections()
+
+    @staticmethod
+    def _parse_listbox_line(line: str) -> "tuple[str, str]":
+        """Parse a row of the saved-connections listbox.
+        Format: ``[sql]    name   url``. Returns (kind, name)."""
+        if not line:
+            return ("sql", "")
+        kind = "mongo" if line.startswith("[mongo]") else "sql"
+        # Strip the "[kind]   " prefix
+        rest = line.split("]", 1)[1].strip() if "]" in line else line
+        # Pull the first whitespace-separated token as the name
+        parts = rest.split(None, 1)
+        return (kind, parts[0] if parts else "")
 
     # ── Vault Scraper helpers ──────────────────────────────────────────────
 
