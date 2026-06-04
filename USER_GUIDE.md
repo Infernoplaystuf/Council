@@ -168,7 +168,7 @@ The 🧪 *Test* button runs a sample question with the lens applied — useful f
 
 ## Model configuration
 
-By default every personality runs on the **same** Ollama model. Switching models is what makes the panel feel slow — Ollama swaps models in/out of memory between calls. With one shared model, rotation between roles is free.
+By default every personality runs on the **same** GGUF model. Switching models is what makes the panel feel slow — the GGUF runtime has to unload one set of weights from VRAM and load another between calls. With one shared model, rotation between roles is free.
 
 Override per role in `vault/personality_backends.json`:
 
@@ -183,7 +183,7 @@ Override per role in `vault/personality_backends.json`:
 }
 ```
 
-Hot-reloads — no restart needed. Backend keys map to actual Ollama model names; see `council_engine.py` for the table.
+Hot-reloads — no restart needed. Backend keys map to GGUF file paths (one `COUNCIL_GGUF_PATH` per backend slot); see `council_engine.py` for the table.
 
 Only worth doing if you have 32+ GB RAM (so two models can stay hot) or you're using a remote node.
 
@@ -262,7 +262,7 @@ Most useful sessions move between 2–3 tabs as the task evolves.
 ## When things go wrong
 
 - **Council stuck on Round 5+** — question is too ambiguous. Esc, refine, restart.
-- **Same answer regardless of question** — restart Ollama. A model can wedge.
+- **Same answer regardless of question** — restart the app (Ctrl+C the launcher, relaunch). A GGUF model occasionally wedges on long sessions; a fresh `Llama()` instance clears it.
 - **Empty Grapher chart** — column types weren't detected. Manually override in the schema panel.
 - **High RAM** — heavy models stay loaded. Apothecary tab → Unload (set `COUNCIL_ADVANCED=1` first).
 - **Sage doesn't know your data** — feed it. Vault tab → drop relevant files. RAG re-indexes within a minute.

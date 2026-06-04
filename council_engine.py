@@ -1,31 +1,31 @@
 # ============================================================
-# council_engine.py  —  v2  [DESKTOP BUILD: RTX 5080 16GB / 32GB+ RAM]
+# council_engine.py  —  v2  [DESKTOP BUILD: 16 GB VRAM-class card, 32 GB+ RAM]
 # ============================================================
-# Conda env:
+# Backend: GGUF via llama-cpp-python (Ollama path was removed —
+# see _council_backend() below).  Point COUNCIL_GGUF_PATH at a
+# .gguf file; full-GPU offload at COUNCIL_GGUF_GPU_LAYERS=99.
+#
+# Recommended default model (US-origin, runs comfortably in 16 GB VRAM):
+#   ibm-granite/granite-3.1-8b-instruct-GGUF (Q4_K_M, ~5 GB)
+# Other US-origin options: Meta Llama 3.1 8B, Microsoft Phi-4.
+#
+# Conda env (Section C / cu124 — installs.txt):
 #   conda create -n council python=3.11 -y
 #   conda activate council
 # Optional (SSH in Apothecary): pip install paramiko
 # Optional (Phase 3 STT mic): pip install sounddevice soundfile
 # Optional (Phase 3 transcription): pip install faster-whisper
+# Optional (PDF/OCR/Image-search): pip install pypdf pytesseract sentence-transformers
 #
-# DESKTOP BUILD (RTX 5080, 16 GB VRAM):
-#   - Models: qwen2.5:14b-instruct-q4_K_M  (primary — fits comfortably in 16GB)
-#             qwen2.5-coder:14b-instruct-q4_K_M (coder)
-#             qwen2.5:32b-instruct-q4_K_M   (alt/writer — fits if no other model loaded)
-#             phi4                           (fast judge / peasant)
-#   - Context window: num_ctx=8192  (16GB VRAM allows full 8K context)
-#   - Max tokens per call: increased 60-80% vs laptop build
-#   - num_gpu=99: force full GPU offload
-#   - num_keep=128: keep larger system-prompt resident
-#   - OLLAMA_MAX_LOADED_MODELS=2: two models can coexist in 16GB
-#   - Timeouts reduced: 5080 has no cold-load penalty
-# Ollama pull commands:
-#   ollama pull qwen2.5:14b-instruct-q4_K_M
-#   ollama pull qwen2.5-coder:14b-instruct-q4_K_M
-#   ollama pull phi4
+# DESKTOP BUILD (16 GB VRAM class — RTX 4080 / 5080):
+#   - Primary GGUF: granite-3.1-8b-instruct-Q4_K_M  (fits comfortably in 16 GB)
+#   - Context window: 4096-8192  (VRAM-aware ladder — see n_ctx_status())
+#   - n_gpu_layers=99: force full GPU offload
 # ============================================================
 
 from __future__ import annotations
+
+import _windll_bootstrap  # noqa: F401  — Windows: route llama-cpp to torch's CUDA DLLs
 
 import json
 import os

@@ -50,3 +50,6 @@ _norton_/
 *.ggml
 *.bin
 *.safetensors
+
+# Eval / debug run logs
+*.log

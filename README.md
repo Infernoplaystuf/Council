@@ -506,10 +506,10 @@ Then relaunch.
 
 ## Things to know
 
-- Models swap = slow. By default every personality runs on the same Ollama model so the GPU/RAM keeps one model hot. If you have 32 GB+ and want to mix in a code-specialist model for the Coder role, edit `vault/personality_backends.json`.
+- Models swap = slow. By default every personality runs on the same GGUF model so the GPU keeps one model hot. If you have 32 GB+ RAM and want to mix in a code-specialist model for the Coder role, edit `vault/personality_backends.json` (each entry pins a separate `COUNCIL_GGUF_PATH`).
 - The IDE Runner has a trust gate that flags risky operations (subprocess, eval, file delete, raw sockets, etc.) before running generated code. Annoying once or twice; saves your bacon eventually.
 - Crash logs land in `vault/logs/crashes/` — they have a stack trace, OS info, and nothing else. Send them to me if something keeps blowing up.
-- This build never reaches out to the internet apart from talking to your local Ollama. No telemetry, no update server, no license server.
+- This build never reaches out to the internet for inference — the GGUF runtime is local. No telemetry, no update server, no license server. (Optional `huggingface_hub` downloads only happen when you click *Download model* in the UI.)
 
 ---
 

@@ -271,7 +271,7 @@ class DataIndex:
     stdlib — no pandas dependency so it works on a stripped install.
     """
 
-    LOADABLE_EXTS  = {".csv", ".tsv", ".json"}
+    LOADABLE_EXTS  = {".csv", ".tsv", ".json", ".xlsx", ".xlsm"}
     MAX_ROWS_FULL_INDEX = 5000   # rows kept in memory per file
     MAX_FILE_BYTES      = 25 * 1024 * 1024   # 25 MB hard cap
     MAX_SAMPLES_PER_COL = 8
@@ -511,6 +511,8 @@ class DataIndex:
                 self._profile_delimited(path, prof, delim="," if ext == ".csv" else "\t")
             elif ext == ".json":
                 self._profile_json(path, prof)
+            elif ext in (".xlsx", ".xlsm"):
+                self._profile_excel(path, prof)
             else:
                 prof.error = f"Unsupported extension: {ext}"
         except Exception as e:
@@ -546,6 +548,74 @@ class DataIndex:
                             cols[col].sample_values.append(val)
 
         for n in fieldnames:
+            ci = cols[n]
+            ci.distinct_count = len(seen_per_col[n])
+            ci.inferred_type  = self._infer_type(ci.sample_values)
+        prof.columns = list(cols.values())
+
+    def _profile_excel(self, path: Path, prof: FileProfile) -> None:
+        """Profile an XLSX by flattening every sheet into rows.
+
+        Each sheet's first row is treated as headers. Cell values are
+        coerced to str so the cross-file substring lookup (search_value)
+        finds them. Multi-sheet files have every sheet's rows pooled
+        under the same FileProfile — the per-row dict gets an extra
+        ``__sheet__`` key so callers can show which sheet a hit came
+        from without inflating column lists.
+        """
+        try:
+            import openpyxl as _xl
+        except Exception:
+            prof.error = "openpyxl unavailable — .xlsx not loadable"
+            return
+        try:
+            wb = _xl.load_workbook(path, read_only=True, data_only=True)
+        except Exception as e:
+            prof.error = f"openpyxl load failed: {type(e).__name__}: {e}"
+            return
+
+        all_field_set: List[str] = []
+        cols: Dict[str, ColumnInfo] = {}
+        seen_per_col: Dict[str, set] = {}
+
+        for sh in wb.worksheets:
+            it = sh.iter_rows(values_only=True)
+            try:
+                header_row = next(it)
+            except StopIteration:
+                continue
+            headers = [
+                (str(h).strip() if h is not None else f"col_{i+1}")
+                for i, h in enumerate(header_row)
+            ]
+            for h in headers:
+                if h not in cols:
+                    cols[h] = ColumnInfo(name=h)
+                    seen_per_col[h] = set()
+                    all_field_set.append(h)
+
+            for i, row in enumerate(it):
+                if prof.row_count >= self.MAX_ROWS_FULL_INDEX:
+                    # Still want a global row_count for the GUI; finish
+                    # counting without keeping rows.
+                    prof.row_count += 1
+                    continue
+                rowmap: Dict[str, Any] = {"__sheet__": sh.title}
+                for hi, h in enumerate(headers):
+                    val = row[hi] if hi < len(row) else None
+                    s = "" if val is None else str(val).strip()
+                    rowmap[h] = s
+                    if s == "":
+                        cols[h].null_count += 1
+                        continue
+                    if s not in seen_per_col[h]:
+                        seen_per_col[h].add(s)
+                        if len(cols[h].sample_values) < self.MAX_SAMPLES_PER_COL:
+                            cols[h].sample_values.append(s)
+                prof.rows.append(rowmap)
+                prof.row_count += 1
+
+        for n in all_field_set:
             ci = cols[n]
             ci.distinct_count = len(seen_per_col[n])
             ci.inferred_type  = self._infer_type(ci.sample_values)

@@ -48,14 +48,67 @@ CHUNK_OVERLAP  = 150    # overlap between chunks (more overlap = fewer missed bo
 MAX_RESULTS    = 8      # default number of results to return
 EMBED_MODEL    = "all-MiniLM-L6-v2"   # small, fast, good quality
 
-# File types to index
-INDEXABLE_EXTENSIONS = {
+# File types to index. The "extractable" formats need a parser pass before
+# chunking — handled in _extract_text() below. Plain text/code/markdown is
+# read directly. Set COUNCIL_RAG_DISABLE_EXTRACTORS=1 to fall back to
+# text-only behaviour if a parser is misbehaving.
+TEXT_LIKE_EXTENSIONS = {
     ".py", ".md", ".txt", ".json", ".yaml", ".yml",
     ".html", ".rst", ".csv", ".log", ".toml", ".ini",
+    ".tsv", ".jsonl", ".ndjson", ".xml",
 }
+EXTRACTABLE_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".xlsm", ".xls"}
+INDEXABLE_EXTENSIONS = TEXT_LIKE_EXTENSIONS | EXTRACTABLE_EXTENSIONS
 
 # Files to skip
 SKIP_PATTERNS = {".git", "__pycache__", ".chromadb", "node_modules"}
+
+
+def _extract_text(p: Path) -> str:
+    """Best-effort text extraction for analyst formats (PDF/DOCX/XLSX).
+
+    Falls back to '' on any error — callers treat an empty extraction
+    as "skip this file" so a single bad PDF doesn't poison the index.
+    """
+    suf = p.suffix.lower()
+    try:
+        if suf == ".pdf":
+            try:
+                from pypdf import PdfReader
+            except Exception:
+                return ""
+            reader = PdfReader(str(p))
+            parts = []
+            for page in reader.pages[:50]:
+                try:
+                    t = page.extract_text() or ""
+                except Exception:
+                    t = ""
+                if t:
+                    parts.append(t)
+            return "\n".join(parts)
+        if suf == ".docx":
+            try:
+                from docx import Document
+            except Exception:
+                return ""
+            doc = Document(str(p))
+            return "\n".join(par.text for par in doc.paragraphs if par.text)
+        if suf in (".xlsx", ".xlsm", ".xls"):
+            try:
+                import openpyxl as _xl
+            except Exception:
+                return ""
+            wb = _xl.load_workbook(p, read_only=True, data_only=True)
+            chunks = []
+            for sh in wb.worksheets:
+                chunks.append(f"## Sheet: {sh.title}")
+                for row in sh.iter_rows(max_row=500, values_only=True):
+                    chunks.append("\t".join("" if v is None else str(v) for v in row))
+            return "\n".join(chunks)
+    except Exception:
+        return ""
+    return ""
 
 
 # ============================================================
@@ -161,10 +214,20 @@ class _ChromaBackend:
         self._hash_store_path = persist_dir / "file_hashes.json"
         self._hashes: Dict[str, str] = self._load_hashes()
 
-        # Embedding function
+        # Embedding function. COUNCIL_EMBED_DEVICE pins the device
+        # ('cpu' / 'cuda'). On RTX 5080 / Blackwell with cu124 wheels the
+        # GPU path can segfault during MiniLM init (sm_120 PTX fallback);
+        # 'cpu' is the safe default for dev boxes. Native sm_89 (4080)
+        # targets can leave this unset to use CUDA.
         if _ST_OK:
-            self._embedder = SentenceTransformer(EMBED_MODEL)
-            print(f"[VaultRAG] Using sentence-transformers ({EMBED_MODEL})")
+            device = os.environ.get("COUNCIL_EMBED_DEVICE", "").strip() or None
+            try:
+                self._embedder = SentenceTransformer(EMBED_MODEL, device=device) \
+                    if device else SentenceTransformer(EMBED_MODEL)
+                print(f"[VaultRAG] Using sentence-transformers ({EMBED_MODEL}, device={device or 'auto'})")
+            except Exception as exc:
+                print(f"[VaultRAG] embedder load failed ({exc!r}); falling back to ChromaDB default")
+                self._embedder = None
         else:
             self._embedder = None
             print("[VaultRAG] sentence-transformers not installed — using ChromaDB default embeddings")
@@ -199,7 +262,13 @@ class _ChromaBackend:
                 continue
 
             try:
-                text = p.read_text(encoding="utf-8", errors="replace")
+                if p.suffix.lower() in EXTRACTABLE_EXTENSIONS:
+                    text = _extract_text(p)
+                    if not text:
+                        stats.skipped_files += 1
+                        continue
+                else:
+                    text = p.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 stats.skipped_files += 1
                 continue
@@ -322,7 +391,13 @@ class _TFIDFBackend:
                 continue
 
             try:
-                text = p.read_text(encoding="utf-8", errors="replace")
+                if p.suffix.lower() in EXTRACTABLE_EXTENSIONS:
+                    text = _extract_text(p)
+                    if not text:
+                        stats.skipped_files += 1
+                        continue
+                else:
+                    text = p.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 stats.skipped_files += 1
                 continue

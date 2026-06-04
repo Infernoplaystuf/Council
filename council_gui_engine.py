@@ -10,6 +10,8 @@
 
 from __future__ import annotations
 
+import _windll_bootstrap  # noqa: F401  — Windows: route llama-cpp to torch's CUDA DLLs
+
 import json as _json
 import os
 # Demo siloing: prevent the council from pulling cross-session memory into prompts.
@@ -3236,7 +3238,13 @@ def _make_tools(runner: ce.LocalRunner, librarian: ce.Librarian, vault_dir: Path
 
 STORE_PASSWORDS = True
 
-APP_DIR = Path.home() / ".council"
+# COUNCIL_APP_DIR  — root for all Council state (.council/ by default)
+# COUNCIL_VAULT_ROOT — explicit vault folder (overrides APP_DIR/vault).
+# Letting an analyst point at a per-client folder (or a OneDrive sync) without
+# editing source is the difference between "I have to copy data in" and "I can
+# just open my project share".
+APP_DIR = Path(os.environ.get("COUNCIL_APP_DIR", "")).expanduser().resolve() \
+    if os.environ.get("COUNCIL_APP_DIR") else (Path.home() / ".council")
 APP_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -3464,7 +3472,8 @@ def _vmgr_copy_folder(
 #   .git_clones/               ← cloned reference repos
 #   node_registry.json         ← SSH node registry
 #   personality_backends.json  ← model pins
-VAULT_DIR            = APP_DIR / "vault"
+VAULT_DIR            = Path(os.environ.get("COUNCIL_VAULT_ROOT", "")).expanduser().resolve() \
+    if os.environ.get("COUNCIL_VAULT_ROOT") else (APP_DIR / "vault")
 # Repo root — directory holding this file (council_gui_engine.py).
 # Used by the Changelog tab to invoke `git log`/`git show` against the
 # actual checkout the user is running, regardless of CWD.

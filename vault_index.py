@@ -546,6 +546,12 @@ _SOURCE_CODE_SUFFIXES = {
 }
 
 _EXCEL_SUFFIXES = {".xlsx", ".xls", ".xlsm"}
+_PDF_SUFFIXES   = {".pdf"}
+_DOCX_SUFFIXES  = {".docx"}
+# Image suffixes — indexed by filename + EXIF tags (always) and OCR
+# text (when pytesseract is available). The actual pixel content is
+# only addressable through the CLIP index (see image_index.py).
+_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff"}
 _TABULAR_EXTRA  = {".tsv", ".parquet"}     # parquet needs pyarrow at runtime
 # SQLite databases (.db / .sqlite / .sqlite3) — indexed at the table level
 _SQLITE_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
@@ -559,7 +565,8 @@ _BSON_SUFFIXES = {".bson"}
 _D3DPIPELINE_SUFFIXES = {".d3dpipeline"}
 _PARSEABLE = ({".csv", ".json"} | _TEXT_SUFFIXES | _SOURCE_CODE_SUFFIXES
               | _EXCEL_SUFFIXES | _TABULAR_EXTRA | _SQLITE_SUFFIXES
-              | _DUCKDB_SUFFIXES | _BSON_SUFFIXES | _D3DPIPELINE_SUFFIXES)
+              | _DUCKDB_SUFFIXES | _BSON_SUFFIXES | _D3DPIPELINE_SUFFIXES
+              | _PDF_SUFFIXES | _DOCX_SUFFIXES | _IMAGE_SUFFIXES)
 
 
 def _is_gz_csv(p: Path) -> bool:
@@ -1195,6 +1202,114 @@ def _parse_duckdb(p: Path) -> Dict[str, Any]:
     }
 
 
+def _parse_pdf(p: Path) -> Dict[str, Any]:
+    """Index a PDF by extracting text from up to the first 25 pages.
+
+    25 pages is a working compromise — covers most spec sheets, ECNs,
+    SOPs, contracts, and one-pager memos without choking on a 2000-page
+    regulatory binder. Larger PDFs still index (we just take the head).
+    """
+    text = ""
+    pages_read = 0
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        return {"type": "pdf", "sample_text": "", "keywords": [],
+                "note": "pypdf unavailable"}
+    try:
+        reader = PdfReader(str(p))
+        chunks: List[str] = []
+        for i, page in enumerate(reader.pages[:25]):
+            try:
+                t = page.extract_text() or ""
+            except Exception:
+                t = ""
+            if t:
+                chunks.append(t)
+                pages_read += 1
+        text = "\n".join(chunks)
+    except Exception:
+        # Encrypted, malformed, etc. — return a stub so the filename
+        # still indexes but content stays empty.
+        text = ""
+    keywords = sorted(set(_tokenize(text)))[:300]
+    return {
+        "type": "pdf",
+        "sample_text": text[:2500],
+        "keywords": keywords,
+        "pages_read": pages_read,
+    }
+
+
+def _parse_docx(p: Path) -> Dict[str, Any]:
+    """Index a .docx by pulling all paragraph text via python-docx."""
+    try:
+        from docx import Document
+    except Exception:
+        return {"type": "docx", "sample_text": "", "keywords": [],
+                "note": "python-docx unavailable"}
+    try:
+        doc = Document(str(p))
+        text = "\n".join(par.text for par in doc.paragraphs if par.text)
+    except Exception:
+        text = ""
+    keywords = sorted(set(_tokenize(text)))[:300]
+    return {
+        "type": "docx",
+        "sample_text": text[:2500],
+        "keywords": keywords,
+    }
+
+
+def _parse_image(p: Path) -> Dict[str, Any]:
+    """Index an image by filename + EXIF tags + OCR text (if tesseract).
+
+    Filename + path tokens are ALWAYS indexed — that's the cheap win.
+    OCR is best-effort; failure to import pytesseract or to find the
+    tesseract binary falls back to filename-only without raising.
+
+    The CLIP semantic image index (image_index.py) is a separate layer
+    and is built on rebuild()'s post-pass when sentence-transformers is
+    available.
+    """
+    ocr_text = ""
+    exif_blob = ""
+    if os.environ.get("COUNCIL_OCR_DISABLE", "").lower() not in ("1", "true", "yes"):
+        try:
+            from PIL import Image as _PILImage
+            try:
+                import pytesseract as _pt
+                # Allow operators to point at a non-default tesseract via env:
+                tess = os.environ.get("COUNCIL_TESSERACT_CMD", "")
+                if tess:
+                    _pt.pytesseract.tesseract_cmd = tess
+                img = _PILImage.open(str(p))
+                ocr_text = _pt.image_to_string(img) or ""
+            except Exception:
+                ocr_text = ""
+            try:
+                img = _PILImage.open(str(p))
+                if hasattr(img, "_getexif") and img._getexif():
+                    exif_blob = " ".join(
+                        f"{k}={v}" for k, v in (img._getexif() or {}).items()
+                        if isinstance(v, (str, int, float))
+                    )[:1000]
+            except Exception:
+                exif_blob = ""
+        except Exception:
+            pass
+    # Filename tokens are surfaced as keywords regardless.
+    name_tokens = _tokenize(p.stem.replace("-", " ").replace("_", " "))
+    body = (ocr_text + "\n" + exif_blob).strip()
+    keywords = sorted(set(_tokenize(body)) | set(name_tokens))[:300]
+    return {
+        "type": "image",
+        "sample_text": body[:2000] if body else f"[image: {p.name}]",
+        "keywords": keywords,
+        "ocr_chars": len(ocr_text),
+    }
+
+
 def _parse_text(p: Path, suffix: str) -> Dict[str, Any]:
     text = ""
     try:
@@ -1245,6 +1360,19 @@ def _record_has_content(rec: Dict[str, Any]) -> bool:
     if rtype in ("sqlite", "duckdb"):
         return bool(rec.get("tables") or rec.get("keywords"))
 
+    # PDFs / DOCX — accept if any text was extracted; an encrypted /
+    # image-only PDF that yielded no text still surfaces via filename
+    # but is not "content-bearing" for boolean-tightness purposes.
+    if rtype in ("pdf", "docx"):
+        return bool(rec.get("keywords")) or bool((rec.get("sample_text") or "").strip())
+
+    # Images — always content-bearing. Filename tokens alone are enough
+    # to make sku-1001.png discoverable. Tighter checks happen at the
+    # query side (image hits get a lower implicit weight in mixed
+    # result sets).
+    if rtype == "image":
+        return True
+
     # Plain text / yaml / md / cfg / log / etc. — keyword extraction
     # is the main surface. Require either real keywords OR ≥3 tokenised
     # words from the sample. Tightens the previous "any non-empty
@@ -1276,6 +1404,12 @@ def _index_file(p: Path) -> Optional[Dict[str, Any]]:
             rec["type"] = "d3dpipeline"
     elif suffix in _EXCEL_SUFFIXES:
         rec = _parse_excel(p)
+    elif suffix in _PDF_SUFFIXES:
+        rec = _parse_pdf(p)
+    elif suffix in _DOCX_SUFFIXES:
+        rec = _parse_docx(p)
+    elif suffix in _IMAGE_SUFFIXES:
+        rec = _parse_image(p)
     elif suffix in _SQLITE_SUFFIXES:
         rec = _parse_sqlite(p)
     elif suffix in _DUCKDB_SUFFIXES:
