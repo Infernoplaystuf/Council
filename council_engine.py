@@ -863,6 +863,28 @@ def _get_gguf_model():
     # model with a clip file; llama-cpp will just ignore image blocks.
     chat_handler = None
     clip_path_raw = os.environ.get("COUNCIL_GGUF_CLIP_PATH", "").strip()
+    # Fallback — when the env var isn't set, check the persisted wizard
+    # choice in vault/backend_settings.json. This mirrors how
+    # onboarding.load_gguf_path / load_clip_path resolve the GGUF path:
+    # env var first, then persisted JSON. Without this lookup, a user
+    # who picked a vision model in the wizard would NOT actually get
+    # vision until they manually exported the env var.
+    if not clip_path_raw:
+        try:
+            vault_root = Path(os.environ.get("COUNCIL_VAULT_DIR")
+                              or (Path.home() / ".council" / "vault"))
+            settings = vault_root / "backend_settings.json"
+            if settings.is_file():
+                import json as _json
+                _settings_data = _json.loads(
+                    settings.read_text(encoding="utf-8"))
+                clip_path_raw = str(
+                    _settings_data.get("clip_path", "") or "").strip()
+                if clip_path_raw:
+                    _LOG.info("[GGUF] clip_path loaded from backend_"
+                              "settings.json: %s", clip_path_raw)
+        except Exception:
+            clip_path_raw = ""
     if clip_path_raw:
         clip_p = Path(clip_path_raw)
         if clip_p.is_file():

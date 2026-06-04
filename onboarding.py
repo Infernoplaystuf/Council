@@ -147,6 +147,44 @@ def _backend_settings_path(vault_dir: Path) -> Path:
     return vault_dir / _BACKEND_SETTINGS_FILENAME
 
 
+def _load_backend_settings(vault_dir: Path) -> dict:
+    """Read the entire backend settings dict, or return {} on any failure.
+    Internal helper — callers use the typed accessors below."""
+    p = _backend_settings_path(vault_dir)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _merge_backend_settings(vault_dir: Path, **updates: str) -> None:
+    """Merge `updates` into the existing backend settings JSON without
+    blowing away other keys. Atomic-style: read, mutate, write.
+
+    Previously save_gguf_path() overwrote the entire file with
+    `{"gguf_path": ...}` — that destroyed any sibling key like
+    `clip_path`. The merge keeps every key the wizard / engine may have
+    written and only touches the ones the caller is updating.
+    """
+    data = _load_backend_settings(vault_dir)
+    for k, v in updates.items():
+        if v is None or v == "":
+            # Setting to empty/None means CLEAR the key entirely.
+            data.pop(k, None)
+        else:
+            data[k] = v
+    try:
+        _backend_settings_path(vault_dir).write_text(
+            json.dumps(data, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
 def load_gguf_path(vault_dir: Path) -> str:
     """Return the persisted GGUF model path, or empty string if none.
 
@@ -156,14 +194,7 @@ def load_gguf_path(vault_dir: Path) -> str:
     env = _os.environ.get("COUNCIL_GGUF_PATH", "").strip()
     if env:
         return env
-    p = _backend_settings_path(vault_dir)
-    if not p.exists():
-        return ""
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return ""
-    return str(data.get("gguf_path", "")).strip()
+    return str(_load_backend_settings(vault_dir).get("gguf_path", "")).strip()
 
 
 def save_gguf_path(vault_dir: Path, path: str) -> None:
@@ -171,15 +202,49 @@ def save_gguf_path(vault_dir: Path, path: str) -> None:
 
     Also sets COUNCIL_GGUF_PATH in os.environ for the current process so
     the wizard's choice is live immediately — no app restart needed.
+    Preserves any sibling keys (e.g. clip_path) already in the file.
     """
-    try:
-        _backend_settings_path(vault_dir).write_text(
-            json.dumps({"gguf_path": path}, indent=2),
-            encoding="utf-8",
-        )
+    _merge_backend_settings(vault_dir, gguf_path=path)
+    if path:
         _os.environ["COUNCIL_GGUF_PATH"] = path
-    except Exception:
-        pass
+    else:
+        _os.environ.pop("COUNCIL_GGUF_PATH", None)
+
+
+def load_clip_path(vault_dir: Path) -> str:
+    """Return the persisted vision mmproj (CLIP) path, or empty string.
+
+    Same precedence as load_gguf_path: env var COUNCIL_GGUF_CLIP_PATH
+    wins, then the persisted backend_settings.json key. The engine's
+    _get_gguf_model checks the env var directly, so the wizard
+    populates it on save for live effect within the same process.
+    """
+    env = _os.environ.get("COUNCIL_GGUF_CLIP_PATH", "").strip()
+    if env:
+        return env
+    return str(_load_backend_settings(vault_dir).get("clip_path", "")).strip()
+
+
+def save_clip_path(vault_dir: Path, path: str) -> None:
+    """Persist the vision mmproj path. Empty string clears it (text-only
+    mode after a user had picked vision in a previous run).
+    """
+    _merge_backend_settings(vault_dir, clip_path=path)
+    if path:
+        _os.environ["COUNCIL_GGUF_CLIP_PATH"] = path
+    else:
+        _os.environ.pop("COUNCIL_GGUF_CLIP_PATH", None)
+
+
+def clip_file_status(path: str) -> tuple:
+    """Inspect a candidate mmproj .gguf path. Same shape as
+    gguf_file_status: (ok: bool, message: str). The validation is the
+    SAME — an mmproj IS a GGUF file (just a smaller one with vision
+    encoder weights rather than language-model weights) — so the
+    magic-byte check applies unchanged. We keep a separate name for
+    documentation clarity at call sites in the wizard.
+    """
+    return gguf_file_status(path)
 
 
 def gguf_file_status(path: str) -> tuple:
@@ -628,11 +693,15 @@ class OnboardingWizard(tk.Toplevel):
         sep = tk.Frame(self.body, bg=self._theme()["muted_fg"], height=1)
         sep.pack(fill="x", pady=12)
 
-        # Text-only vs vision toggle
+        # Text-only vs vision toggle. We preselect based on whatever
+        # we last persisted — a user who picked vision and downloaded
+        # an mmproj last time gets the toggle ON automatically on
+        # re-run instead of having to opt in again.
         toggle_row = tk.Frame(self.body, bg=self._theme()["bg"])
         toggle_row.pack(fill="x", pady=(0, 6))
         if not hasattr(self, "_vision_mode_var"):
-            self._vision_mode_var = tk.BooleanVar(value=False)
+            init = bool(load_clip_path(self.vault_dir))
+            self._vision_mode_var = tk.BooleanVar(value=init)
         tk.Label(toggle_row, text="Show vision-capable models",
                  font=("Segoe UI", 10),
                  bg=self._theme()["bg"], fg=self._theme()["fg"]
@@ -664,12 +733,47 @@ class OnboardingWizard(tk.Toplevel):
                 "Vision models — drop image / scan / chart files into "
                 "the vault and the model can read them. Each row "
                 "links to a HF page where you'll download BOTH the "
-                "main weights AND the mmproj file. After both are on "
-                "disk, point COUNCIL_GGUF_PATH at the weights and "
-                "COUNCIL_GGUF_CLIP_PATH at the mmproj.",
+                "main weights AND the mmproj file. Use the two pickers "
+                "below (one for the main .gguf, one for the mmproj).",
                 font=("Segoe UI", 10), fg=self._theme()["muted_fg"],
                 pady=(0, 8))
+
+            # Second file picker — for the multimodal projector. Lives
+            # right below the model pickers so the user sees both
+            # paths together and can browse both without leaving the
+            # wizard. Hidden in text-only mode.
+            if not hasattr(self, "_clip_path_var"):
+                self._clip_path_var   = tk.StringVar(value=load_clip_path(self.vault_dir))
+                self._clip_status_var = tk.StringVar(value="")
+            self._refresh_clip_status()
+
+            clip_frame = tk.Frame(self.body, bg=self._theme()["bg"])
+            clip_frame.pack(fill="x", pady=(0, 4))
+            tk.Label(clip_frame, text="mmproj file:",
+                     font=("Segoe UI", 10),
+                     bg=self._theme()["bg"], fg=self._theme()["muted_fg"]
+                     ).pack(side="left", padx=(0, 6))
+            tk.Label(clip_frame, textvariable=self._clip_status_var,
+                     font=("Consolas", 10),
+                     bg=self._theme()["bg"], fg=self._theme()["fg"]
+                     ).pack(side="left", fill="x", expand=True)
+
+            clip_btn_frame = tk.Frame(self.body, bg=self._theme()["bg"])
+            clip_btn_frame.pack(fill="x", pady=(2, 8))
+            ttk.Button(clip_btn_frame,
+                        text="📁 Browse for mmproj .gguf…",
+                        command=self._browse_clip).pack(side="left")
+            ttk.Button(clip_btn_frame, text="🗑 Clear (text-only)",
+                        command=self._clear_clip).pack(side="left", padx=8)
         else:
+            # User turned the vision toggle OFF — clear any previously
+            # persisted clip path so the next launch doesn't try to
+            # load vision against a non-vision GGUF.
+            try:
+                if load_clip_path(self.vault_dir):
+                    save_clip_path(self.vault_dir, "")
+            except Exception:
+                pass
             self._label(
                 "Recommended models — click to open the Hugging Face "
                 "download page in your browser. After downloading, come "
@@ -735,6 +839,71 @@ class OnboardingWizard(tk.Toplevel):
             self._gguf_status_var.set(msg)
         self._gguf_ok = ok
 
+    def _browse_clip(self):
+        """File picker for the multimodal projector (mmproj) .gguf. Same
+        pattern as _browse_gguf — pick file, validate magic, persist
+        the path through save_clip_path so the engine picks it up on
+        next inference call without needing an env-var export."""
+        start_dir = ""
+        cur = self._clip_path_var.get().strip()
+        if cur:
+            try:
+                start_dir = str(Path(cur).parent)
+            except Exception:
+                start_dir = ""
+        # Fall back to the main GGUF's folder — mmproj files almost
+        # always live alongside the weights they project for.
+        if not start_dir:
+            gguf_cur = self._gguf_path_var.get().strip()
+            if gguf_cur:
+                try:
+                    start_dir = str(Path(gguf_cur).parent)
+                except Exception:
+                    start_dir = ""
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="Select mmproj (.gguf) file for vision",
+            initialdir=start_dir or None,
+            filetypes=[("GGUF projector files", "*.gguf"),
+                        ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self._clip_path_var.set(path)
+        save_clip_path(self.vault_dir, path)
+        try:
+            import council_engine as _ce
+            _ce.refresh_backend_config()
+        except Exception:
+            pass
+        self._refresh_clip_status()
+
+    def _clear_clip(self):
+        """User decided to go back to text-only — wipe the persisted
+        clip path AND the env var so the next model load skips the
+        Llava chat-handler path entirely."""
+        self._clip_path_var.set("")
+        save_clip_path(self.vault_dir, "")
+        try:
+            import council_engine as _ce
+            _ce.refresh_backend_config()
+        except Exception:
+            pass
+        self._refresh_clip_status()
+
+    def _refresh_clip_status(self):
+        if not hasattr(self, "_clip_path_var"):
+            return
+        path = self._clip_path_var.get().strip()
+        if not path:
+            self._clip_status_var.set("(none — text-only)")
+            self._clip_ok = True   # empty is a valid choice
+            return
+        ok, msg = clip_file_status(path)
+        if hasattr(self, "_clip_status_var"):
+            self._clip_status_var.set(msg)
+        self._clip_ok = ok
+
     # Step 4: ready
     def _render_ready(self):
         self._heading("Ready.")
@@ -744,14 +913,34 @@ class OnboardingWizard(tk.Toplevel):
         ok, msg = gguf_file_status(path)
         if ok:
             self._label(f"GGUF model:  {msg}", font=("Consolas", 10),
-                        fg=self._theme()["success"], pady=(0, 12))
+                        fg=self._theme()["success"], pady=(0, 6))
         else:
             self._label(
                 "No GGUF model selected. The app will start, but you'll "
                 "need to set COUNCIL_GGUF_PATH or use the Browse… button "
                 "on the Council tab before any query can be answered.",
-                fg=self._theme()["warning"], pady=(0, 12),
+                fg=self._theme()["warning"], pady=(0, 6),
             )
+        # Show the mmproj path too when the user opted into vision —
+        # full disclosure of both files we'll load on next launch so
+        # nothing about the configuration is hidden.
+        clip = load_clip_path(self.vault_dir)
+        if clip:
+            cok, cmsg = clip_file_status(clip)
+            if cok:
+                self._label(f"mmproj:      {cmsg}  (vision enabled)",
+                            font=("Consolas", 10),
+                            fg=self._theme()["success"], pady=(0, 12))
+            else:
+                self._label(
+                    f"mmproj:      {cmsg}",
+                    font=("Consolas", 10),
+                    fg=self._theme()["warning"], pady=(0, 12),
+                )
+        else:
+            self._label("Vision:      off (text-only mode)",
+                        font=("Consolas", 10),
+                        fg=self._theme()["muted_fg"], pady=(0, 12))
 
         self._label(
             "Three ways to start poking at it:\n\n"
