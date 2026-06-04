@@ -92,9 +92,19 @@ def list_sql_connections(vault_dir: Any) -> Dict[str, str]:
 def save_sql_connection(vault_dir: Any, name: str, url: str) -> None:
     """Save a SQLAlchemy connection URL. Use ``${ENV_VAR}`` placeholders
     in passwords; the resolver expands them at connect time."""
+    name = (str(name) if name is not None else "").strip()
+    url = (str(url) if url is not None else "").strip()
+    if not name:
+        raise ValueError("connection name cannot be empty")
+    if not url:
+        raise ValueError("connection URL cannot be empty")
+    if "://" not in url:
+        raise ValueError(
+            f"connection URL {url!r} is missing a scheme "
+            "(expected something like 'postgresql://user:pass@host/db')")
     p = _connections_path(vault_dir, _SQL_CONN_FILENAME)
     existing = _read_json_dict(p)
-    existing[str(name)] = str(url)
+    existing[name] = url
     _write_json_dict(p, existing)
 
 
@@ -121,9 +131,19 @@ def list_mongo_connections(vault_dir: Any) -> Dict[str, str]:
 def save_mongo_connection(vault_dir: Any, name: str, uri: str) -> None:
     """Save a Mongo URI (``mongodb://...``). Use ``${ENV_VAR}``
     placeholders for passwords."""
+    name = (str(name) if name is not None else "").strip()
+    uri = (str(uri) if uri is not None else "").strip()
+    if not name:
+        raise ValueError("connection name cannot be empty")
+    if not uri:
+        raise ValueError("connection URI cannot be empty")
+    if not (uri.startswith("mongodb://") or uri.startswith("mongodb+srv://")):
+        raise ValueError(
+            f"Mongo URI {uri!r} must start with 'mongodb://' or "
+            "'mongodb+srv://'")
     p = _connections_path(vault_dir, _MONGO_CONN_FILENAME)
     existing = _read_json_dict(p)
-    existing[str(name)] = str(uri)
+    existing[name] = uri
     _write_json_dict(p, existing)
 
 
@@ -137,11 +157,48 @@ def remove_mongo_connection(vault_dir: Any, name: str) -> bool:
     return True
 
 
+class UnresolvedEnvVarError(Exception):
+    """Raised when a ${ENV_VAR} placeholder in a saved URL has no value
+    in os.environ. Surfaces a clear message at the UI / audit layer
+    instead of letting an unresolved placeholder reach SQLAlchemy /
+    pymongo and produce an opaque connection error."""
+
+    def __init__(self, missing: List[str]):
+        self.missing = list(missing)
+        super().__init__(
+            "Connection URL references environment variable(s) that are "
+            "not set: " + ", ".join(self.missing) + ". Set them before "
+            "testing or querying this connection."
+        )
+
+
 def _resolve_url(url: str) -> str:
-    """Expand ``${ENV_VAR}`` placeholders against os.environ."""
+    """Expand ``${ENV_VAR}`` placeholders against os.environ.
+
+    Raises UnresolvedEnvVarError when ANY placeholder is missing — we
+    refuse to hand SQLAlchemy / pymongo a URL containing a literal
+    ``${FOO}`` because the resulting connection error gives the user
+    no useful diagnostic ("password authentication failed for user u"
+    when the real cause is "FOO isn't set in your shell").
+    """
+    missing: list = []
+
     def _sub(m: "re.Match") -> str:
-        return os.environ.get(m.group(1), m.group(0))
-    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", _sub, url)
+        name = m.group(1)
+        val = os.environ.get(name)
+        if val is None:
+            missing.append(name)
+            return m.group(0)
+        return val
+
+    resolved = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", _sub, url)
+    if missing:
+        # De-dup while preserving order
+        seen: dict = {}
+        for m in missing:
+            seen[m] = None
+        raise UnresolvedEnvVarError(list(seen))
+    return resolved
 
 
 # ============================================================
@@ -719,6 +776,27 @@ def _mongo_client(vault_dir: Any, conn_name: str, *,
     )
 
 
+def _walk_for_forbidden_keys(node: Any, path: str = "") -> Optional[str]:
+    """Depth-first walk over a Mongo pipeline node looking for any
+    forbidden operator key. Returns ``"$op at <path>"`` on first hit,
+    or None if the node is clean. Dangerous ops can appear nested
+    inside $project/$group/$match expressions, not just at the top
+    of a stage, so the validator must descend through dicts and lists."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            if isinstance(k, str) and k in _MONGO_WRITE_STAGES:
+                return f"{k} at {path or '<root>'}"
+            child = _walk_for_forbidden_keys(v, f"{path}.{k}" if path else k)
+            if child:
+                return child
+    elif isinstance(node, (list, tuple)):
+        for i, item in enumerate(node):
+            child = _walk_for_forbidden_keys(item, f"{path}[{i}]")
+            if child:
+                return child
+    return None
+
+
 def _validate_mongo_pipeline(pipeline: Sequence[Dict[str, Any]]) -> None:
     if not isinstance(pipeline, (list, tuple)):
         raise MongoPipelineViolation(
@@ -727,13 +805,12 @@ def _validate_mongo_pipeline(pipeline: Sequence[Dict[str, Any]]) -> None:
         if not isinstance(stage, dict):
             raise MongoPipelineViolation(
                 f"pipeline[{i}] is not a dict: {type(stage).__name__}")
-        for key in stage.keys():
-            if key in _MONGO_WRITE_STAGES:
-                raise MongoPipelineViolation(
-                    f"pipeline stage {key!r} (pipeline[{i}]) is "
-                    "rejected: it can write or run server-side JS. "
-                    "Read-only Mongo queries cannot use "
-                    f"{sorted(_MONGO_WRITE_STAGES)}.")
+        hit = _walk_for_forbidden_keys(stage, f"pipeline[{i}]")
+        if hit:
+            raise MongoPipelineViolation(
+                f"pipeline stage rejected ({hit}): contains a "
+                "write or server-side-JS operator. Read-only Mongo "
+                f"queries cannot use {sorted(_MONGO_WRITE_STAGES)}.")
 
 
 def list_mongo_databases(vault_dir: Any, conn_name: str) -> List[str]:
@@ -889,7 +966,7 @@ def test_sql_connection(vault_dir: Any, conn_name: str) -> Dict[str, Any]:
     subsequent real query reuses the warm connection)."""
     out: Dict[str, Any] = {
         "ok": False, "dialect": None, "tables": 0, "error": None,
-        "tls_warning": None,
+        "tls_warning": None, "unresolved_env_vars": None,
     }
     # TLS posture check — surfaced to the UI on test/save
     try:
@@ -910,6 +987,9 @@ def test_sql_connection(vault_dir: Any, conn_name: str) -> Dict[str, Any]:
         except Exception:
             pass
         out["ok"] = True
+    except UnresolvedEnvVarError as exc:
+        out["unresolved_env_vars"] = list(exc.missing)
+        out["error"] = str(exc)
     except Exception as exc:
         out["error"] = repr(exc)
     return out
@@ -919,7 +999,7 @@ def test_mongo_connection(vault_dir: Any, conn_name: str) -> Dict[str, Any]:
     """Best-effort Mongo probe — pings the server, lists databases."""
     out: Dict[str, Any] = {
         "ok": False, "databases": 0, "error": None,
-        "tls_warning": None,
+        "tls_warning": None, "unresolved_env_vars": None,
     }
     try:
         urls = list_mongo_connections(vault_dir)
@@ -935,6 +1015,9 @@ def test_mongo_connection(vault_dir: Any, conn_name: str) -> Dict[str, Any]:
             out["ok"] = True
         finally:
             client.close()
+    except UnresolvedEnvVarError as exc:
+        out["unresolved_env_vars"] = list(exc.missing)
+        out["error"] = str(exc)
     except Exception as exc:
         out["error"] = repr(exc)
     return out

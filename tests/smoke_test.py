@@ -46,6 +46,14 @@ import tempfile
 import traceback
 from pathlib import Path
 
+# Force UTF-8 on stdout/stderr so the box-drawing characters used in
+# section headers don't crash on Windows cp1252 consoles.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 # ─── Path setup ─────────────────────────────────────────────────────
 HERE = Path(__file__).resolve().parent
@@ -840,6 +848,48 @@ def test_db_mongo_pipeline_validator() -> None:
                    lambda: _validate_mongo_pipeline([1, 2, 3])))
 
 
+def test_db_unresolved_env_var() -> None:
+    """An unset ${ENV_VAR} in a URL must surface as UnresolvedEnvVarError
+    with the missing names listed — NOT silently pass through to the
+    driver and yield an opaque auth failure."""
+    import db_connections as _db
+    # Make sure the test env var is really not set
+    os.environ.pop("COUNCIL_TEST_MISSING_VAR", None)
+    os.environ.pop("COUNCIL_TEST_PRESENT_VAR", None)
+
+    raised = False
+    try:
+        _db._resolve_url("postgresql://u:${COUNCIL_TEST_MISSING_VAR}@h/d")
+    except _db.UnresolvedEnvVarError as exc:
+        raised = True
+        _check("UnresolvedEnvVarError lists the missing name",
+               "COUNCIL_TEST_MISSING_VAR" in exc.missing)
+    _check("missing env var raises UnresolvedEnvVarError", raised)
+
+    # Multiple missing → all listed
+    raised = False
+    try:
+        _db._resolve_url(
+            "mongodb://${COUNCIL_TEST_MISSING_VAR}:${COUNCIL_TEST_OTHER}@h/d")
+    except _db.UnresolvedEnvVarError as exc:
+        raised = True
+        names = set(exc.missing)
+        _check("both missing env vars listed",
+               "COUNCIL_TEST_MISSING_VAR" in names
+               and "COUNCIL_TEST_OTHER" in names)
+    _check("multi-missing also raises", raised)
+
+    # When the var IS set, _resolve_url succeeds
+    os.environ["COUNCIL_TEST_PRESENT_VAR"] = "secret"
+    try:
+        out = _db._resolve_url(
+            "postgresql://u:${COUNCIL_TEST_PRESENT_VAR}@h/d")
+        _check("present env var substituted",
+               out == "postgresql://u:secret@h/d")
+    finally:
+        os.environ.pop("COUNCIL_TEST_PRESENT_VAR", None)
+
+
 def test_db_connection_storage_roundtrip() -> None:
     """Saved connections round-trip through the JSON files; passwords
     with ${ENV_VAR} placeholders pass through unmolested."""
@@ -1113,6 +1163,7 @@ def main() -> int:
     _run("DB — SQL validator rejects writes",     test_db_sql_validator_rejects_writes)
     _run("DB — Mongo pipeline validator",         test_db_mongo_pipeline_validator)
     _run("DB — connection storage round-trip",    test_db_connection_storage_roundtrip)
+    _run("DB — unresolved env-var error",         test_db_unresolved_env_var)
     _run("DB — TLS posture warnings",             test_db_tls_posture_warnings)
     _run("DB — engine cache reuse",               test_db_engine_cache_reuses_engines)
     _run("DB — audit log rotation",               test_db_audit_log_rotation)
