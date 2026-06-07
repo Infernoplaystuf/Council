@@ -1,0 +1,142 @@
+# ============================================================
+# anvil.spec  —  PyInstaller build specification for Anvil
+# ============================================================
+# Build with:    pyinstaller anvil.spec
+# Or use the helper:    build.bat (Windows) / build.sh (mac/linux)
+#
+# Outputs:
+#   build/  - intermediate work directory (delete after)
+#   dist/Anvil/         - the bundled application folder
+#   dist/Anvil/Anvil.exe (or `Anvil` on Unix)
+# ============================================================
+
+# pyright: reportMissingImports=false
+# noqa: F821 — PyInstaller injects globals (Analysis, EXE, etc.)
+
+import sys
+from pathlib import Path
+from PyInstaller.utils.hooks import collect_all
+
+block_cipher = None
+project_root = Path.cwd()
+
+# ---- llama-cpp-python special handling ----
+# The package is imported lazily inside council_engine.PersonalityModel
+# so PyInstaller's static scan misses it. Worse, even when listed in
+# hiddenimports the native shared library (llama.dll, ggml.dll) lives
+# next to the Python files in site-packages and PyInstaller's binary
+# collection won't grab them without an explicit collect step.
+# collect_all is the official helper that walks every Python module,
+# data file, and dynamic library under llama_cpp.
+_llama_datas, _llama_binaries, _llama_hidden = collect_all("llama_cpp")
+
+# ---- Hidden imports (pulled in dynamically; PyInstaller can't see them) ----
+hidden = [
+    # Tkinter optional submodules
+    "tkinter.filedialog",
+    "tkinter.messagebox",
+    "tkinter.scrolledtext",
+    "tkinter.colorchooser",
+    "tkinter.font",
+    # Stdlib modules used inside lazy try/except blocks
+    "ssl",
+    "json",
+    "urllib.request",
+    "urllib.parse",
+    "hmac",
+    "hashlib",
+    "base64",
+    "difflib",
+    # Third-party that may be present
+    "yaml",
+    "chromadb",
+    "sentence_transformers",
+    "tkinterweb",
+    "paramiko",
+    "pyttsx3",
+    # ---- Anvil-specific modules (all lazily imported from GUI engine) ----
+    # The Workspace tab imports these inside methods so PyInstaller's
+    # static scan misses them on the cold pass; listing them here
+    # guarantees they ship.
+    "goal_anchor",
+    "goal_cache",
+    "godot_workspace",
+    "godot_pipeline",
+    "godot_coder",
+    "game_concept",
+    "demo_builder",
+    "steam_ingest",
+    "steam_analyst",
+    "diff_view",
+    # Restored creative-tooling modules (Phase A restored these from main)
+    "idea_engine",
+    "image_engine",
+    "music_blocks",
+    "music_renderer",
+    "tab_video",
+    "video_processor",
+]
+
+# ---- Data files to ship alongside the executable ----
+# Paths are (src_in_project, dest_in_bundle). PyInstaller copies the
+# tree at src to dest under the bundle's _MEI / dist root.
+datas = [
+    ("assets",                    "assets"),
+    ("personality_config.yaml",   "."),
+    ("personality_backends.json", "."),
+    ("README.md",                 "."),
+    ("USER_GUIDE.md",             "."),
+]
+
+# ---- Modules to deliberately exclude (slim down the bundle) ----
+excludes = [
+    "matplotlib.tests",
+    "pandas.tests",
+    "numpy.tests",
+    "test",
+    "tests",
+    "unittest",
+    # Other developers' test suites that pip pulls in
+    "pytest",
+    "py",
+]
+
+a = Analysis(
+    ["council_gui_engine.py"],
+    pathex=[str(project_root)],
+    binaries=_llama_binaries,           # llama.dll, ggml.dll, etc.
+    datas=datas + _llama_datas,         # llama_cpp's bundled data files
+    hiddenimports=hidden + _llama_hidden,
+    hookspath=[],
+    runtime_hooks=[],
+    excludes=excludes,
+    cipher=block_cipher,
+    noarchive=False,
+)
+
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    [],
+    exclude_binaries=True,
+    name="Anvil",
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,                  # UPX trips antivirus on some Windows boxes
+    console=False,              # Set True to keep a console for debugging
+    disable_windowed_traceback=False,
+    icon=str(project_root / "assets" / ("icon.ico" if sys.platform == "win32" else "icon.png")),
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=False,
+    name="Anvil",
+)
