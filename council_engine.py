@@ -4168,6 +4168,37 @@ def refresh_backend_config() -> Dict[str, str]:
     return dict(DEFAULT_MODELS)
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Odysseus Task 1 — backend-agnostic ModelRunner accessor
+# ─────────────────────────────────────────────────────────────────────
+#
+# build_runner(config) lives in inferno_local.model_runner and refuses
+# every cloud backend at the factory. New code (the blind A/B compare
+# panel, the constrained agent, deep research) consumes a ModelRunner
+# instead of reaching into _get_gguf_model directly. Existing call
+# sites stay on _gguf_chat / _gguf_chat_stream — this just opens a
+# second door on the same model.
+#
+# Config dict keys:
+#   backend     'llama_cpp' (default) | 'ollama'
+#   gguf_path   (llama_cpp only)
+#   url, model  (ollama only — url must be loopback)
+#
+# Returns a runner with chat(messages, ...) and stream_chat(...).
+# Streaming is iterator-based so callers can pump tokens into a
+# queue.Queue and marshal to Tk via root.after.
+# ─────────────────────────────────────────────────────────────────────
+
+def get_runner(config: Optional[Dict[str, Any]] = None):
+    """Return an inferno_local ModelRunner. Defaults to llama_cpp +
+    whatever COUNCIL_GGUF_PATH is currently set to. Cloud backends are
+    rejected at construction by inferno_local.model_runner.build_runner."""
+    cfg = dict(config or {})
+    cfg.setdefault("backend", "llama_cpp")
+    from inferno_local.model_runner import build_runner
+    return build_runner(cfg)
+
+
 def detect_ollama_models() -> List[str]:
     """Deprecated — Ollama was removed. Always returns []."""
     return []

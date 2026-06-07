@@ -26,6 +26,20 @@ This is the home build. No licensing, no trials, no telemetry, no phone-home. If
 
 ## How to run it
 
+> **First-time setup?** Open a terminal in this folder and run:
+>
+> ```
+> python setup_wizard.py
+> ```
+>
+> The wizard walks you through every step — detects your GPU, sets up
+> the venv, installs the right CUDA wheels, lets you pick from the
+> curated US-origin model catalog, and downloads the GGUF. Nothing
+> destructive runs before you confirm. You can re-run it any time.
+>
+> Prefer a diagnostic-only check (no installs)? Use `python
+> setup_wizard.py --check-only` to see what's already configured.
+
 > **Never used WSL or a Linux terminal before?** Skip ahead to
 > [Appendix — WSL / Linux terminal crash course](#appendix--wsl--linux-terminal-crash-course)
 > at the bottom of this README. Five minutes of background that makes
@@ -446,6 +460,69 @@ Three lenses ship with it:
 When you ask a question that mentions one of their domain keywords, that specialist gets auto-summoned. Ask something that spans multiple domains ("buy enough stock based on last year's sales") and *both* specialists run in parallel — the Judge synthesises.
 
 You can edit them in the 🎓 Specialists tab. Each one is just config: name, icon, description, keywords, system-prompt overlay, and which base personality wears the lens. There are no separate per-specialist data folders — everything lives in the shared vault, which is the point.
+
+---
+
+## Pick a model
+
+Council ships with a curated catalog of US-origin GGUF models — Anthropic
+isn't open-weight, so the runtime defaults to other US labs (IBM, Meta,
+Microsoft, Google, AllenAI). The catalog is the single source of truth used
+by `setup_wizard.py`, the in-GUI onboarding wizard, and these docs.
+
+| ID | Name | Org | Size | Ctx | VRAM (Q4) | License | Notes |
+|---|---|---|---|---|---|---|---|
+| `granite-3.1-8b-q4` | IBM Granite 3.1 8B Instruct (Q4_K_M) | IBM | 4.9 GB | 128K | 6.5 GB | Apache-2.0 | **Default.** Solid general baseline. Conservative refusals; good with tabular data. |
+| `llama-3.1-8b-q5` | Meta Llama 3.1 8B Instruct (Q5_K_M) | Meta | 5.7 GB | 128K | 7.0 GB | Llama 3.1 Community License | Long-context generalist. Best for big folder dumps / multi-CSV context. |
+| `llama-3.2-3b-q5` | Meta Llama 3.2 3B Instruct (Q5_K_M) | Meta | 2.4 GB | 128K | 3.2 GB | Llama 3.2 Community License | Fast, fits 8 GB cards comfortably. Good for routing / classification. |
+| `llama-3.2-1b-q8` | Meta Llama 3.2 1B Instruct (Q8_0) | Meta | 1.3 GB | 128K | 1.8 GB | Llama 3.2 Community License | Tiny. CPU-friendly. Use for quick demos or constrained boxes. |
+| `phi-4-q4` | Microsoft Phi-4 14B (Q4_K_M) | Microsoft | 8.9 GB | 16K | 11.0 GB | MIT | Best reasoning at this VRAM tier. Pick for analyst Q&A on dense data. |
+| `phi-3.5-mini-q5` | Microsoft Phi-3.5-mini Instruct (Q5_K_M) | Microsoft | 2.8 GB | 128K | 3.6 GB | MIT | Compact, strong reasoning. Great middle-ground for 8 GB VRAM. |
+| `gemma-2-9b-q4` | Google Gemma 2 9B Instruct (Q4_K_M) | Google | 5.8 GB | 8K | 7.5 GB | Gemma Terms of Use | Polished prose; helpful for write-ups. Short native context. |
+| `granite-3.1-8b-code-q4` | IBM Granite 3.1 8B Code Instruct (Q4_K_M) | IBM | 4.9 GB | 128K | 6.5 GB | Apache-2.0 | Code-specialised IBM model. Wire into the Coder role if you have RAM headroom. |
+| `olmo-2-13b-q4` | AllenAI OLMo 2 13B Instruct (Q4_K_M) | AllenAI | 8.4 GB | 4K | 10.5 GB | Apache-2.0 | Fully open weights + training data (Allen Institute). Pick for transparency. |
+
+VRAM column is approximate at the listed quant + 4K context with ~1.5 GB
+headroom for the CUDA driver and the Tkinter UI. On a 16 GB card (RTX
+4080 / 5080) any of these run comfortably; on an 8 GB card stick to the
+Llama-3.2-3B, Phi-3.5-mini, or the Llama-3.2-1B (CPU-fine too).
+
+Pick one via the wizard:
+
+```bash
+python setup_wizard.py --model phi-4-q4   # preselect by id, or omit to choose
+```
+
+…or download manually then point Council at the file:
+
+```bash
+python -c "from huggingface_hub import hf_hub_download as h; h(repo_id='bartowski/phi-4-GGUF', filename='phi-4-Q4_K_M.gguf', local_dir='./models')"
+export COUNCIL_GGUF_PATH=./models/phi-4-Q4_K_M.gguf
+```
+
+The same catalog renders in the in-GUI onboarding wizard with **Open**
+(goes to Hugging Face) and **⬇ Auto-download** buttons per row.
+
+---
+
+## Optional bits
+
+- **Tesseract OCR** — entirely optional. When installed, the vault
+  index extracts text from your image files (defect photos, scanned
+  forms, dashboard screenshots) and makes it searchable. When **not**
+  installed, image *filenames* are still searchable; only the pixel
+  content stays opaque. Install via `winget install UB-Mannheim.TesseractOCR`
+  on Windows or `sudo apt install tesseract-ocr` on Debian/Ubuntu, or
+  skip entirely — the wizard step is informational only and never
+  blocks you.
+- **CLIP semantic image search** — automatically available when
+  `sentence-transformers` is installed (which it is, after the wizard).
+  Encodes every image into a 512-dim vector on first run so you can
+  search by visual concept ("solder joint crack", "machine nameplate
+  close-up") instead of by exact filename.
+- **SQL connector** — `sql_connector.py` is a SELECT-only SQLAlchemy
+  bridge for warehouse data (SQLite out of the box; Postgres / MySQL /
+  MSSQL / Snowflake URL templates documented in the module header).
 
 ---
 

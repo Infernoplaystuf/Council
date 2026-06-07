@@ -33,36 +33,37 @@ import os as _os
 
 # ============================================================
 # Recommended GGUF models — surfaced as download buttons in the
-# model step. All US-made (Microsoft, Meta, IBM) per the runtime
-# defaults the app's documentation recommends.
+# model step. Sourced from model_catalog.MODELS (US-origin only).
+# Add or reorder models there; this list rebuilds automatically.
 # ============================================================
 
-RECOMMENDED_MODELS = [
-    {
-        "name":  "Phi-4 14B (Q4_K_M)",
-        "size":  "~9 GB",
-        "ctx":   "16K context",
-        "url":   "https://huggingface.co/bartowski/phi-4-GGUF",
-        "blurb": "Microsoft. Best reasoning at this size. Recommended for "
-                 "tabular / data tasks on 16 GB VRAM.",
-    },
-    {
-        "name":  "Llama 3.1 8B Instruct (Q5_K_M)",
-        "size":  "~6 GB",
-        "ctx":   "128K context",
-        "url":   "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
-        "blurb": "Meta. Longest context window — best when injecting big "
-                 "folders / multi-CSV dumps.",
-    },
-    {
-        "name":  "Granite 3.1 8B Instruct (Q4_K_M)",
-        "size":  "~5 GB",
-        "ctx":   "128K context",
-        "url":   "https://huggingface.co/ibm-granite/granite-3.1-8b-instruct-GGUF",
-        "blurb": "IBM. Solid baseline; conservative refusal behaviour. "
-                 "Original Council baseline.",
-    },
-]
+try:
+    import model_catalog as _mc
+
+    def _spec_to_legacy(spec) -> dict:
+        return {
+            "name":  spec.name,
+            "size":  f"~{spec.size_gb:.1f} GB",
+            "ctx":   f"{spec.context_k}K context",
+            "url":   f"https://huggingface.co/{spec.hf_repo}",
+            "blurb": f"{spec.org}. {spec.blurb}",
+            "spec":  spec,
+        }
+
+    RECOMMENDED_MODELS = [_spec_to_legacy(s) for s in _mc.MODELS]
+    DEFAULT_MODEL_ID   = _mc.DEFAULT_MODEL_ID
+except Exception as _exc:
+    # Hard fallback so the wizard still runs if model_catalog ever errors.
+    RECOMMENDED_MODELS = [
+        {
+            "name":  "IBM Granite 3.1 8B Instruct (Q4_K_M)",
+            "size":  "~5 GB",
+            "ctx":   "128K context",
+            "url":   "https://huggingface.co/ibm-granite/granite-3.1-8b-instruct-GGUF",
+            "blurb": "IBM. Solid baseline; conservative refusal behaviour.",
+        },
+    ]
+    DEFAULT_MODEL_ID = "granite-3.1-8b-q4"
 
 
 # ============================================================
@@ -320,29 +321,60 @@ class OnboardingWizard(tk.Toplevel):
         ttk.Button(btn_frame, text="🔄 Re-check",
                    command=self._refresh_gguf_status).pack(side="left", padx=8)
 
-        # Recommended models list
+        # Recommended models list (US-origin catalog).
         sep = tk.Frame(self.body, bg=self._theme()["muted_fg"], height=1)
         sep.pack(fill="x", pady=12)
-        self._label("Recommended models — click to open the Hugging Face "
-                    "download page in your browser. After downloading, come "
-                    "back and use Browse… to select the .gguf file.",
-                    font=("Segoe UI", 10), fg=self._theme()["muted_fg"],
-                    pady=(0, 8))
+        self._label(
+            f"Recommended US-origin models ({len(RECOMMENDED_MODELS)}) — click "
+            "Open to visit the Hugging Face page, or Auto-download to pull "
+            "the .gguf straight into ./models/ and select it automatically.",
+            font=("Segoe UI", 10), fg=self._theme()["muted_fg"],
+            pady=(0, 8))
+
+        # Scrollable container so the list grows beyond the wizard's
+        # fixed height without spilling off-screen.
+        list_wrap = tk.Frame(self.body, bg=self._theme()["bg"])
+        list_wrap.pack(fill="both", expand=True)
+        canvas = tk.Canvas(list_wrap, bg=self._theme()["bg"],
+                           highlightthickness=0, height=200)
+        canvas.pack(side="left", fill="both", expand=True)
+        scroll = ttk.Scrollbar(list_wrap, orient="vertical",
+                               command=canvas.yview)
+        scroll.pack(side="right", fill="y")
+        canvas.configure(yscrollcommand=scroll.set)
+        inner = tk.Frame(canvas, bg=self._theme()["bg"])
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        def _on_resize(_e=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        inner.bind("<Configure>", _on_resize)
+        # Mouse-wheel scroll inside the list
+        def _on_mwheel(e):
+            canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mwheel)
 
         for m in RECOMMENDED_MODELS:
-            row = tk.Frame(self.body, bg=self._theme()["bg"])
-            row.pack(fill="x", pady=3)
-            tk.Label(row, text=f"  {m['name']}",
+            row = tk.Frame(inner, bg=self._theme()["bg"])
+            row.pack(fill="x", pady=3, padx=(0, 8))
+            name_label = f"  {m['name']}"
+            spec_obj = m.get("spec")
+            if spec_obj is not None and getattr(spec_obj, "is_default", False):
+                name_label = "  ★ " + m["name"]
+            tk.Label(row, text=name_label,
                      font=("Segoe UI", 10, "bold"),
-                     bg=self._theme()["bg"], fg=self._theme()["fg"]
+                     bg=self._theme()["bg"], fg=self._theme()["fg"],
                      ).pack(side="left")
             tk.Label(row, text=f"  ·  {m['size']}  ·  {m['ctx']}",
                      font=("Segoe UI", 9),
                      bg=self._theme()["bg"], fg=self._theme()["muted_fg"]
                      ).pack(side="left")
+            # Right-aligned buttons: Open page, Auto-download
             ttk.Button(row, text="🌐 Open",
                        command=lambda u=m["url"]: self._open_url(u)
-                       ).pack(side="right")
+                       ).pack(side="right", padx=(4, 0))
+            if spec_obj is not None:
+                ttk.Button(row, text="⬇ Auto-download",
+                           command=lambda s=spec_obj: self._auto_download(s)
+                           ).pack(side="right", padx=(4, 0))
 
     def _browse_gguf(self):
         """Open a file dialog to pick a .gguf file; persist on selection."""
@@ -375,6 +407,75 @@ class OnboardingWizard(tk.Toplevel):
             # up lazily on next inference call.
             pass
         self._refresh_gguf_status()
+
+    def _auto_download(self, spec) -> None:
+        """Download a catalog model's .gguf via huggingface_hub and select
+        it. Runs in a background thread so the Tk UI stays responsive."""
+        import threading
+        dest_dir = (Path(__file__).resolve().parent / "models")
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        # Confirm before downloading multi-GB content.
+        if not messagebox.askyesno(
+            "Auto-download model",
+            f"Download {spec.name}?\n\n"
+            f"From: {spec.hf_repo}\n"
+            f"File: {spec.hf_file}\n"
+            f"Size: ~{spec.size_gb:.1f} GB\n"
+            f"Into: {dest_dir}\n\n"
+            "This can take several minutes on a slow connection. The wizard "
+            "stays open and the file's path is auto-selected when finished.",
+            parent=self,
+        ):
+            return
+
+        # Status label updates from worker thread via Tk's after-callback
+        # mechanism (Tk isn't thread-safe but `after` queues to the UI loop).
+        try:
+            self._gguf_status_var.set(f"⏳ downloading {spec.hf_file}…")
+        except Exception:
+            pass
+
+        def _worker():
+            try:
+                from huggingface_hub import hf_hub_download
+                path = hf_hub_download(
+                    repo_id=spec.hf_repo,
+                    filename=spec.hf_file,
+                    local_dir=str(dest_dir),
+                )
+                def _ok():
+                    self._gguf_path_var.set(str(path))
+                    save_gguf_path(self.vault_dir, str(path))
+                    try:
+                        import council_engine as _ce
+                        _ce.refresh_backend_config()
+                    except Exception:
+                        pass
+                    self._refresh_gguf_status()
+                    messagebox.showinfo(
+                        "Download complete",
+                        f"Saved to:\n{path}\n\nThe wizard's model selection "
+                        "now points at this file.",
+                        parent=self,
+                    )
+                self.after(0, _ok)
+            except Exception as exc:
+                def _err():
+                    self._gguf_status_var.set(f"✗ download failed: {exc!r}")
+                    messagebox.showerror(
+                        "Download failed",
+                        f"{exc!r}\n\n"
+                        "Common causes:\n"
+                        " • No internet on the air-gapped host\n"
+                        " • Corporate SSL inspection (try `pip install pip-system-certs`)\n"
+                        " • Repo is gated and needs an HF login (`huggingface-cli login`)\n"
+                        "\nYou can also click 🌐 Open to download manually.",
+                        parent=self,
+                    )
+                self.after(0, _err)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _refresh_gguf_status(self):
         path = self._gguf_path_var.get().strip()

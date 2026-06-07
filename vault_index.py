@@ -1262,31 +1262,49 @@ def _parse_docx(p: Path) -> Dict[str, Any]:
 
 
 def _parse_image(p: Path) -> Dict[str, Any]:
-    """Index an image by filename + EXIF tags + OCR text (if tesseract).
+    """Index an image by filename + EXIF tags + OCR text (when available).
 
-    Filename + path tokens are ALWAYS indexed — that's the cheap win.
-    OCR is best-effort; failure to import pytesseract or to find the
-    tesseract binary falls back to filename-only without raising.
+    Tesseract OCR is OPTIONAL — the parser never fails when it's missing.
+    What you get without Tesseract: filename tokens + EXIF tags as
+    searchable keywords. What you get with Tesseract: the same plus the
+    text Tesseract reads out of the pixels.
+
+    Detection order for the Tesseract binary:
+      1. ``COUNCIL_TESSERACT_CMD`` env var (set by the Windows launcher
+         when the UB-Mannheim install is at its default path)
+      2. system PATH (Linux distro default; macOS Homebrew)
+      3. (give up — falls back to filename-only indexing silently)
+
+    The OCR pass can be disabled even when Tesseract is present by
+    setting ``COUNCIL_OCR_DISABLE=1`` — useful when scanning a huge
+    image-heavy folder where filename indexing is enough.
 
     The CLIP semantic image index (image_index.py) is a separate layer
     and is built on rebuild()'s post-pass when sentence-transformers is
     available.
     """
     ocr_text = ""
+    ocr_status = "skipped"
     exif_blob = ""
     if os.environ.get("COUNCIL_OCR_DISABLE", "").lower() not in ("1", "true", "yes"):
         try:
             from PIL import Image as _PILImage
             try:
                 import pytesseract as _pt
-                # Allow operators to point at a non-default tesseract via env:
+                # Allow operators to point at a non-default tesseract via env;
+                # otherwise let pytesseract probe PATH as it would by default.
                 tess = os.environ.get("COUNCIL_TESSERACT_CMD", "")
                 if tess:
                     _pt.pytesseract.tesseract_cmd = tess
                 img = _PILImage.open(str(p))
                 ocr_text = _pt.image_to_string(img) or ""
+                ocr_status = "ok" if ocr_text else "empty"
             except Exception:
+                # Most common cause: tesseract binary not on PATH and no
+                # COUNCIL_TESSERACT_CMD set. Stay silent — filename-only
+                # indexing is the working fallback.
                 ocr_text = ""
+                ocr_status = "tesseract-missing"
             try:
                 img = _PILImage.open(str(p))
                 if hasattr(img, "_getexif") and img._getexif():
@@ -1297,8 +1315,11 @@ def _parse_image(p: Path) -> Dict[str, Any]:
             except Exception:
                 exif_blob = ""
         except Exception:
-            pass
-    # Filename tokens are surfaced as keywords regardless.
+            # Pillow itself missing — absolute last-ditch fallback.
+            ocr_status = "pil-missing"
+    else:
+        ocr_status = "disabled"
+    # Filename tokens are surfaced as keywords regardless of Tesseract.
     name_tokens = _tokenize(p.stem.replace("-", " ").replace("_", " "))
     body = (ocr_text + "\n" + exif_blob).strip()
     keywords = sorted(set(_tokenize(body)) | set(name_tokens))[:300]
@@ -1307,6 +1328,7 @@ def _parse_image(p: Path) -> Dict[str, Any]:
         "sample_text": body[:2000] if body else f"[image: {p.name}]",
         "keywords": keywords,
         "ocr_chars": len(ocr_text),
+        "ocr_status": ocr_status,
     }
 
 
