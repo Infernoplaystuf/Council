@@ -385,6 +385,351 @@ def parse_tool_calls(reply: str) -> List[Tuple[str, Dict[str, Any]]]:
     return out
 
 
+# ============================================================
+# Action protocol (the brief's preferred surface)
+#
+# The model emits ONE JSON object per reply, one of:
+#   {"action": "tool",  "tool": "<name>", "args": {...}}
+#   {"action": "final", "answer": "<text>"}
+#
+# The parser is tolerant:
+#   - Strips ```json fences (or any ``` fenced block).
+#   - Walks brace-balanced JSON to find the first valid action object,
+#     skipping prose around it.
+#   - Falls back to the legacy `parse_tool_calls` output if no action
+#     key is present (kept so older preambles still work).
+#   - If nothing parses, the entire reply is treated as a final answer.
+#     The brief says the loop must "degrade gracefully" — this is how.
+# ============================================================
+
+def _strip_code_fences(s: str) -> str:
+    """Remove a single leading + trailing ``` fence (with optional
+    language tag). Operates only on a stripped-of-whitespace string."""
+    s = (s or "").strip()
+    if s.startswith("```"):
+        nl = s.find("\n")
+        if nl > 0:
+            s = s[nl + 1:]
+        else:
+            # ```{stuff}``` on one line — drop the first three chars
+            s = s[3:]
+        if s.rstrip().endswith("```"):
+            s = s.rstrip()[:-3].rstrip()
+    return s
+
+
+def parse_action(reply: str) -> Dict[str, Any]:
+    """Parse the model's action JSON tolerantly.
+
+    Returns one of:
+        {"action": "tool",  "tool": str, "args": dict}
+        {"action": "final", "answer": str}
+
+    Guarantees:
+        - Never raises.
+        - Always returns a dict whose "action" is "tool" or "final".
+        - If parsing fails entirely, the reply itself becomes the final
+          answer text (graceful degrade per the brief).
+    """
+    if not (reply or "").strip():
+        return {"action": "final", "answer": ""}
+
+    stripped = _strip_code_fences(reply)
+    # Candidate strings to try parsing, in priority order:
+    candidates: List[str] = [stripped, reply]
+    # Plus every brace-balanced sub-object found in the (un-stripped)
+    # reply — covers JSON embedded in prose.
+    for s, e in _iter_brace_balanced(reply or ""):
+        candidates.append(reply[s:e])
+
+    seen: set = set()
+    for raw in candidates:
+        if raw in seen:
+            continue
+        seen.add(raw)
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        action = str(obj.get("action", "")).strip().lower()
+        if action == "final":
+            answer = obj.get("answer")
+            if answer is None:
+                answer = obj.get("text", "")
+            return {"action": "final", "answer": str(answer)}
+        if action == "tool":
+            name = str(obj.get("tool", "")).strip()
+            args = obj.get("args") or {}
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {"_raw": args}
+            if not isinstance(args, dict):
+                args = {"_raw": args}
+            if name:
+                return {"action": "tool", "tool": name, "args": args}
+
+    # No action key — try the legacy `{"tool": ...}` shape one last time.
+    legacy = parse_tool_calls(reply)
+    if legacy:
+        name, args = legacy[0]
+        return {"action": "tool", "tool": name, "args": args}
+
+    # Nothing parsed — treat the whole reply as a final answer.
+    return {"action": "final", "answer": (reply or "").strip()}
+
+
+# ============================================================
+# ConstrainedAgent — the brief's preferred entry point
+# ============================================================
+
+@dataclass
+class StepEvent:
+    """One step in a ConstrainedAgent run. Streamed to the UI via a
+    ``queue.Queue`` so the Tk loop never blocks on inference."""
+    step: int
+    raw_reply: str = ""
+    action: str = ""                  # "tool" | "final"
+    tool: Optional[str] = None
+    args: Optional[Dict[str, Any]] = None
+    available: bool = True            # False when an unlisted tool was requested
+    observation: Optional[str] = None
+    final_answer: Optional[str] = None
+    error: Optional[str] = None
+    elapsed_s: float = 0.0
+
+
+@dataclass
+class AgentRun:
+    task: str
+    final_answer: str = ""
+    stopped_reason: str = ""          # "done" | "max_steps" | "byte_budget" | "error"
+    steps: List[StepEvent] = field(default_factory=list)
+    tools_used: List[str] = field(default_factory=list)
+    tools_missing: List[str] = field(default_factory=list)
+    started_at_ms: int = 0
+    finished_at_ms: int = 0
+    trace: Optional[AgentTrace] = None    # internal — full ToolCall list
+
+
+class ConstrainedAgent:
+    """A bounded, auditable agent loop built around the action protocol.
+
+    Constructor inputs are deliberately narrow:
+      runner            an inferno_local.model_runner.ModelRunner
+      registry          a FROZEN ToolRegistry (model code can't extend)
+      policy            an AgentPolicy (bounds + file/output roots)
+      conversation_log  optional ConversationLog to write run records to
+      gap_log           optional ToolGapLog to write unlisted-tool requests to
+      system_preamble   optional system message prepended to every turn
+
+    The constructor does NOT take a raw tools dict — the dispatcher
+    consumes ``registry.as_dict()`` internally. This keeps the type
+    signature itself a barrier against passing in model-authored tools.
+    """
+
+    def __init__(
+        self,
+        runner,
+        registry,
+        policy: AgentPolicy,
+        *,
+        conversation_log=None,
+        gap_log=None,
+        system_preamble: Optional[str] = None,
+    ) -> None:
+        # Lazy import to avoid a cycle (tool_registry imports safe_agent.Tool)
+        from tool_registry import ToolRegistry
+        if not isinstance(registry, ToolRegistry):
+            raise TypeError(
+                "ConstrainedAgent: registry must be a tool_registry.ToolRegistry "
+                f"(got {type(registry).__name__}). Pass a frozen registry built "
+                "via tool_registry.build_default_registry().")
+        if not registry.frozen:
+            raise ValueError(
+                "ConstrainedAgent: registry must be frozen before use. "
+                "Call registry.freeze() in process-start wiring.")
+        self.runner = runner
+        self.registry = registry
+        self.policy = policy
+        self.conversation_log = conversation_log
+        self.gap_log = gap_log
+        self.system_preamble = system_preamble or _DEFAULT_PREAMBLE
+
+    def run(self,
+            task: str,
+            *,
+            on_step: Optional[Callable[["StepEvent", "AgentRun"], None]] = None,
+            context: Optional[Dict[str, Any]] = None) -> AgentRun:
+        """Drive the agent until a final answer or ``policy.max_steps``.
+
+        on_step is invoked synchronously on the calling thread for each
+        StepEvent. Tk callers should wrap it to queue.put_nowait and
+        drain via root.after — see ``agent_panel.py``.
+        """
+        run = AgentRun(task=task, started_at_ms=_now_ms())
+        run.trace = AgentTrace()
+
+        convo: List[Dict[str, str]] = [
+            {"role": "system", "content": self._system_message()},
+            {"role": "user",   "content": task},
+        ]
+        tools = self.registry.as_dict()
+        used: List[str] = []
+        missing: List[str] = []
+
+        for step in range(1, self.policy.max_steps + 1):
+            t0 = time.time()
+            try:
+                reply = self.runner.chat(
+                    convo, max_tokens=self.policy.max_tokens_per_step)
+            except Exception as exc:
+                ev = StepEvent(step=step, error=repr(exc),
+                                elapsed_s=time.time() - t0)
+                run.steps.append(ev)
+                if on_step: on_step(ev, run)
+                run.final_answer = f"(runner error: {exc!r})"
+                run.stopped_reason = "error"
+                self._finalise(run, used, missing)
+                return run
+
+            action = parse_action(reply)
+            ev = StepEvent(step=step, raw_reply=reply, action=action["action"],
+                            elapsed_s=time.time() - t0)
+
+            if action["action"] == "final":
+                ev.final_answer = action["answer"]
+                run.steps.append(ev)
+                if on_step: on_step(ev, run)
+                run.final_answer = action["answer"]
+                run.stopped_reason = "done"
+                self._finalise(run, used, missing)
+                return run
+
+            # action == "tool"
+            name = action["tool"]
+            args = action["args"]
+            ev.tool = name
+            ev.args = args
+
+            if not self.registry.has(name):
+                # ── Gap: refuse to execute. Record. Feed back. ──
+                ev.available = False
+                ev.observation = (f"[tool-unavailable] {name!r} is not on the "
+                                  "allow-list — no execution occurred. "
+                                  "Adapt and try a registered tool.")
+                run.steps.append(ev)
+                if on_step: on_step(ev, run)
+                missing.append(name)
+                if self.gap_log is not None:
+                    try:
+                        self.gap_log.append(
+                            requested_name=name,
+                            args=args,
+                            task=task,
+                            step=step,
+                            context=(context or {}),
+                        )
+                    except Exception as exc:
+                        _LOG.warning("gap log append failed: %r", exc)
+                # Feed the observation back into the convo so the model can
+                # adapt; do NOT execute.
+                convo.append({"role": "assistant", "content": reply})
+                convo.append({"role": "user",
+                              "content": ev.observation})
+                continue
+
+            # ── Tool is allow-listed; dispatch. ──
+            try:
+                call = dispatch_tool(name, args, self.policy, tools,
+                                     run.trace, step=step)
+                if call.error:
+                    ev.error = call.error
+                    ev.observation = f"[tool-error] {name}: {call.error}"
+                else:
+                    used.append(name)
+                    payload = json.dumps(call.result, default=str)[:1800]
+                    ev.observation = f"[tool-result] {name}: {payload}"
+            except ToolDenied as exc:
+                # Defence in depth — should be unreachable since we
+                # checked registry.has(name) above; surfaces a clear
+                # error if the policy.allowed_tools and registry get
+                # out of sync.
+                ev.available = False
+                ev.error = repr(exc)
+                ev.observation = f"[tool-denied] {name}: {exc}"
+            except ToolTimeout as exc:
+                ev.error = repr(exc)
+                ev.observation = f"[tool-timeout] {name}: {exc}"
+            except Exception as exc:
+                ev.error = repr(exc)
+                ev.observation = f"[tool-failure] {name}: {exc!r}"
+
+            run.steps.append(ev)
+            if on_step: on_step(ev, run)
+
+            # Byte budget check (carry from existing run_agent)
+            for c in run.trace.calls:
+                if c.name == "read_local_file" and isinstance(c.result, dict):
+                    run.trace.bytes_read += int(c.result.get("bytes", 0))
+            if run.trace.bytes_read > self.policy.max_total_read_bytes:
+                run.final_answer = "(stopped: total read budget exceeded)"
+                run.stopped_reason = "byte_budget"
+                self._finalise(run, used, missing)
+                return run
+
+            convo.append({"role": "assistant", "content": reply})
+            convo.append({"role": "user", "content": ev.observation})
+
+        # Loop fell through max_steps without a final answer.
+        run.final_answer = "(stopped: max_steps reached)"
+        run.stopped_reason = "max_steps"
+        self._finalise(run, used, missing)
+        return run
+
+    # ── internals ─────────────────────────────────────────
+    def _system_message(self) -> str:
+        names = ", ".join(self.registry.names())
+        return (self.system_preamble +
+                f"\n\nRegistered tools (you may call ONLY these): {names}\n"
+                "Reply with EXACTLY one JSON object per turn:\n"
+                '  {"action": "tool",  "tool": "<name>", "args": {...}}\n'
+                '  {"action": "final", "answer": "<text>"}\n'
+                "Do not call a tool that is not on the list above. If "
+                "you need a tool that is missing, explain in your final "
+                "answer what you would have done and which tool you "
+                "needed.")
+
+    def _finalise(self, run: AgentRun,
+                  used: List[str], missing: List[str]) -> None:
+        # Dedupe preserving order.
+        seen_u: set = set()
+        run.tools_used = [x for x in used if not (x in seen_u or seen_u.add(x))]
+        seen_m: set = set()
+        run.tools_missing = [x for x in missing if not (x in seen_m or seen_m.add(x))]
+        run.finished_at_ms = _now_ms()
+        if self.conversation_log is not None:
+            try:
+                self.conversation_log.append_run(run)
+            except Exception as exc:
+                _LOG.warning("conversation log append failed: %r", exc)
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+_DEFAULT_PREAMBLE = (
+    "You are the constrained agent for Data's Inferno. You operate "
+    "entirely on the user's machine and have access only to the tools "
+    "listed below. Plan briefly, call tools, observe results, then "
+    "produce a final answer."
+)
+
+
 def run_agent(messages: List[Dict[str, str]],
               runner,
               policy: AgentPolicy,

@@ -1047,6 +1047,27 @@ def _gguf_chat_stream(
     return "".join(pieces)
 
 
+def _agent_memory_enabled() -> bool:
+    """Honour COUNCIL_AGENT_MEMORY_ENABLE — default OFF.
+
+    When on, ``local_chat`` appends a ``council_deliberation`` record to
+    ``agent_logs.ConversationLog`` after every successful chat call.
+    That feeds the same memory store the constrained agent uses, so
+    cross-tool gap analysis benefits from real Council activity.
+
+    Off by default — set to ``1`` / ``true`` / ``yes`` / ``on`` to enable.
+    """
+    return os.environ.get("COUNCIL_AGENT_MEMORY_ENABLE", "").strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
+def set_agent_memory_enabled(on: bool) -> None:
+    """UI toggle helper. Mutates the process env var so subsequent
+    ``_agent_memory_enabled()`` calls see the new state without an
+    app restart."""
+    os.environ["COUNCIL_AGENT_MEMORY_ENABLE"] = "1" if on else "0"
+
+
 def local_chat(
     messages: List[Dict[str, str]],
     *,
@@ -1058,8 +1079,35 @@ def local_chat(
 ) -> str:
     """Blocking chat call against the loaded GGUF. `model`, `host`, `timeout`
     accepted for caller compatibility but ignored — every role uses the
-    single GGUF singleton."""
-    return _gguf_chat(messages, temperature=temperature, num_predict=num_predict)
+    single GGUF singleton.
+
+    When ``COUNCIL_AGENT_MEMORY_ENABLE`` is on, the call's
+    ``(question, answer)`` is appended to the agent ConversationLog after
+    completion. Failures of that side-effect are swallowed — the chat
+    call's return value is what matters.
+    """
+    answer = _gguf_chat(messages, temperature=temperature,
+                        num_predict=num_predict)
+    if _agent_memory_enabled():
+        try:
+            import agent_logs
+            # Pull the last user message as the "task" for the audit
+            # record; absence of one (purely system/assistant convo) is
+            # fine — we just record an empty task.
+            task = ""
+            for m in reversed(messages):
+                if m.get("role") == "user":
+                    task = str(m.get("content") or "")
+                    break
+            agent_logs.ConversationLog.default().append(
+                task=task,
+                final_answer=answer,
+                outcome="done",
+                kind="council_deliberation",
+            )
+        except Exception as _exc:
+            _LOG.debug("agent memory record skipped: %r", _exc)
+    return answer
 
 
 def _ollama_chat(
