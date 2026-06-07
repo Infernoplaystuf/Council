@@ -75,8 +75,23 @@ class VideoTabMixin:
             _root = parent
 
         # ── Video processor instance ───────────────────────────
+        # tab_video was authored on main where VideoProcessor only
+        # required vault_dir; the version on this branch (also from
+        # main) requires tmp_dir too. Derive tmp_dir from vault_dir
+        # if the host hasn't set one explicitly.
         if _VIDEO_OK:
-            self._video_proc = vp.VideoProcessor(vault_dir=self.vault_dir)
+            from pathlib import Path as _Path
+            _tmp = getattr(self, "tmp_dir", None)
+            if _tmp is None:
+                _tmp = _Path(self.vault_dir) / "tmp" / "video"
+            try:
+                self._video_proc = vp.VideoProcessor(
+                    vault_dir=self.vault_dir,
+                    tmp_dir=_tmp,
+                )
+            except TypeError:
+                # Older VideoProcessor signature — single-arg call.
+                self._video_proc = vp.VideoProcessor(vault_dir=self.vault_dir)
         else:
             self._video_proc = None
 

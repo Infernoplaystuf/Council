@@ -54,6 +54,38 @@ import onboarding
 import task_memory as _task_memory_mod
 import specialists as _spec
 import crash_reporter
+
+# ── Odysseus-council creative tabs (main + game-dev merge) ──
+# tab_ideas.IdeaTabMixin and tab_video.VideoTabMixin add the Idea
+# Generator and Video Analyser notebook tabs respectively. Both are
+# mixins composed onto CouncilConsole's MRO; both gate themselves on
+# COUNCIL_ADVANCED so the consumer build stays slim.
+#
+# Imports are tolerant — if either module fails to load (transient
+# dep break during merge), CouncilConsole still constructs but with
+# the relevant tab missing. We define _HAVE_TAB_IDEAS / _HAVE_TAB_VIDEO
+# so the build-time call sites can guard cleanly.
+try:
+    from tab_ideas import IdeaTabMixin as _IdeaTabMixin
+    _HAVE_TAB_IDEAS = True
+except Exception as _exc:
+    print(f"[council_gui] tab_ideas unavailable: {_exc!r}")
+    class _IdeaTabMixin:        # type: ignore[no-redef]
+        """Stub when tab_ideas didn't import — keeps MRO valid."""
+        def _build_ideas_tab(self, parent=None) -> None:
+            return None
+    _HAVE_TAB_IDEAS = False
+
+try:
+    from tab_video import VideoTabMixin as _VideoTabMixin
+    _HAVE_TAB_VIDEO = True
+except Exception as _exc:
+    print(f"[council_gui] tab_video unavailable: {_exc!r}")
+    class _VideoTabMixin:       # type: ignore[no-redef]
+        """Stub when tab_video didn't import — keeps MRO valid."""
+        def _build_video_tab(self, parent=None) -> None:
+            return None
+    _HAVE_TAB_VIDEO = False
 import licensing
 import activation_dialog
 import updater
@@ -4082,7 +4114,10 @@ class InstructionManager:
         return sum(1 for e in self._instructions if e.get("active"))
 
 
-class CouncilConsole(tk.Tk):
+class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
+    # tk.Tk MUST stay first so its __init__ gets the constructor call
+    # via super().__init__(); the mixins are stateless until their
+    # _build_*_tab() methods are explicitly invoked from _build_ui.
     def __init__(self):
         super().__init__()
         self.title(branding.window_title())
@@ -4623,6 +4658,21 @@ class CouncilConsole(tk.Tk):
             self._build_nodes_tab()
             self._build_vault_health_tab()
             self._build_apoth_tab()
+
+            # ── Odysseus-council creative tabs (advanced-only) ──
+            # Behind the same COUNCIL_ADVANCED gate as the other
+            # power-user tabs. Each build call is independently guarded
+            # so one tab's failure doesn't suppress the other.
+            if _HAVE_TAB_IDEAS:
+                try:
+                    self._build_ideas_tab()
+                except Exception as _exc:
+                    print(f"[council_gui] ideas tab build failed: {_exc!r}")
+            if _HAVE_TAB_VIDEO:
+                try:
+                    self._build_video_tab()
+                except Exception as _exc:
+                    print(f"[council_gui] video tab build failed: {_exc!r}")
 
     # ---- Backend strip (model backend selector) ----
 
