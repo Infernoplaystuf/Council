@@ -17,10 +17,26 @@
 # Optional (Phase 3 transcription): pip install faster-whisper
 # Optional (PDF/OCR/Image-search): pip install pypdf pytesseract sentence-transformers
 #
-# DESKTOP BUILD (16 GB VRAM class — RTX 4080 / 5080):
-#   - Primary GGUF: granite-3.1-8b-instruct-Q4_K_M  (fits comfortably in 16 GB)
-#   - Context window: 4096-8192  (VRAM-aware ladder — see n_ctx_status())
-#   - n_gpu_layers=99: force full GPU offload
+# MODEL POLICY:
+#   All recommended models are from US-based providers (Meta, Microsoft,
+#   IBM, Google, OpenAI, AllenAI). This is a market-share decision —
+#   many buyers in regulated industries (gov, defense, finance,
+#   healthcare) can only deploy AI from US-based companies. The previous
+#   defaults (Qwen 2.5 from Alibaba) shipped before that policy was set.
+#   The curated catalog lives in model_catalog.py (single source of
+#   truth for the wizard + GUI onboarding + README).
+#
+# DESKTOP BUILD reference (RTX 4080 / 5080, 16 GB VRAM):
+#   Recommended GGUFs (point COUNCIL_GGUF_PATH at one of these):
+#     • Granite 3.1 8B Q4_K_M      — IBM, ~5 GB, conservative refusal (DEFAULT)
+#     • Phi-4 14B Q4_K_M           — Microsoft, ~9 GB, best reasoning
+#     • Llama 3.1 8B Q5_K_M        — Meta, ~6 GB, 128K context
+#     • Gemma 2 9B Q4_K_M          — Google, ~6 GB, strong instruction following
+#     • OLMo 2 13B Q4_K_M          — AllenAI, ~8 GB, fully open weights + data
+#   Context window: auto-detected from GGUF metadata, VRAM-aware
+#   (see n_ctx_status() / the n_ctx ladder in _get_gguf_model).
+#   GPU layers: 99 (full offload — no-op on CPU-only builds).
+#   Two-model coexistence dropped along with Ollama; one GGUF at a time.
 # ============================================================
 
 from __future__ import annotations
@@ -156,6 +172,13 @@ def _ensure_localhost(url: str, *, allow_remote: bool = False) -> None:
 #   COUNCIL_GGUF_GPU_LAYERS=99         default 99 = offload every layer
 #                                        (no-op on CPU-only builds, so safe);
 #                                        set 0 to force CPU even on a GPU box
+#   COUNCIL_GGUF_CLIP_PATH=...         path to a multimodal projector
+#                                        ("mmproj") .gguf alongside a
+#                                        vision-capable model (Llama 3.2
+#                                        Vision / Phi-4 Multimodal /
+#                                        Gemma 3). Enables image content
+#                                        blocks in create_chat_completion.
+#                                        Optional — text-only when unset.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _council_backend() -> str:
@@ -839,16 +862,140 @@ def _get_gguf_model():
         sys.stderr.flush()
     except Exception:
         pass
-    _LOG.info("[GGUF] About to call Llama() — if the process exits here "
-              "with no further output, the C extension SIGILL'd. Check "
-              "the CPU feature flags above.")
-    _GGUF_MODEL_INSTANCE = Llama(
+    # ── Optional vision (multimodal) path ───────────────────────────────
+    # When COUNCIL_GGUF_CLIP_PATH points at a valid mmproj/.gguf file,
+    # llama-cpp-python attaches a Llava-style chat handler so image
+    # content blocks become valid in create_chat_completion. The user's
+    # primary GGUF (COUNCIL_GGUF_PATH) must be a vision-capable model
+    # such as Llama 3.2 Vision, Phi-4 Multimodal, or Gemma 3.
+    #
+    # Vision is OPT-IN — when unset, the engine loads text-only as
+    # before. There are TWO failure modes we have to defend against:
+    #
+    #   (1) Stale clip_path in backend_settings.json from a previous
+    #       wizard run where the user picked vision, then later
+    #       switched to a text-only GGUF (Browse… in the Council tab,
+    #       env var, etc.) without going through the wizard again.
+    #       Attaching a Llava handler to a text-only Llama can crash
+    #       llama-cpp during init — that's exactly the "models are
+    #       not loading" symptom users report.
+    #
+    #   (2) llama-cpp-python version mismatch where Llava15ChatHandler
+    #       imports but its construction or attachment surface has
+    #       moved.
+    #
+    # Both cases are caught by the load-with-retry pattern at the end
+    # of this function — if Llama() raises with a chat_handler in
+    # kwargs, we retry WITHOUT the handler and log the fact loudly.
+    chat_handler = None
+    clip_source  = ""   # "env" / "json" / "" for logging
+    clip_path_raw = os.environ.get("COUNCIL_GGUF_CLIP_PATH", "").strip()
+    if clip_path_raw:
+        clip_source = "env"
+    else:
+        # Fallback — when the env var isn't set, check the persisted
+        # wizard choice in vault/backend_settings.json. Same
+        # precedence as onboarding.load_clip_path uses.
+        try:
+            vault_root = Path(os.environ.get("COUNCIL_VAULT_DIR")
+                              or (Path.home() / ".council" / "vault"))
+            settings = vault_root / "backend_settings.json"
+            if settings.is_file():
+                import json as _json
+                _settings_data = _json.loads(
+                    settings.read_text(encoding="utf-8"))
+                clip_path_raw = str(
+                    _settings_data.get("clip_path", "") or "").strip()
+                if clip_path_raw:
+                    clip_source = "json"
+        except Exception as exc:
+            _LOG.warning(
+                "[GGUF] backend_settings.json clip_path read failed: %s",
+                exc,
+            )
+            clip_path_raw = ""
+
+    if clip_path_raw:
+        clip_p = Path(clip_path_raw)
+        if clip_p.is_file():
+            try:
+                from llama_cpp.llama_chat_format import Llava15ChatHandler  # type: ignore[import]
+                chat_handler = Llava15ChatHandler(clip_model_path=str(clip_p))
+                _LOG.info("[GGUF] vision mmproj loaded via %s: %s",
+                          clip_source, clip_p.name)
+                print(f"[GGUF] Vision mmproj loaded: {clip_p.name}", flush=True)
+            except Exception as exc:
+                _LOG.warning(
+                    "[GGUF] vision mmproj setup failed (%s, source=%s): "
+                    "%s — falling back to text-only.",
+                    clip_path_raw, clip_source, exc,
+                )
+                chat_handler = None
+        else:
+            _LOG.warning(
+                "[GGUF] clip_path %s (source=%s) does not exist — "
+                "loading text-only.", clip_path_raw, clip_source,
+            )
+
+    llama_kwargs = dict(
         model_path=str(p),
         n_ctx=n_ctx,
         n_threads=n_threads,
         n_gpu_layers=n_gpu_layers,
         verbose=False,
     )
+    if chat_handler is not None:
+        llama_kwargs["chat_handler"] = chat_handler
+
+    # Breadcrumb RIGHT before the Llama() call so if the process dies
+    # silently the user can see exactly where. The previous location
+    # was misleading — it printed before the vision/clip lookup ran,
+    # so users saw "About to call Llama()" then a crash that was
+    # actually in the clip-handler setup. Now the message reflects
+    # what's actually about to happen, plus whether vision is attached.
+    print(f"[GGUF] About to call Llama() (vision={'on' if chat_handler else 'off'}) — "
+          f"if the process exits here with no further output, the C "
+          f"extension SIGILL'd or the model file is incompatible. "
+          f"Check the CPU feature flags above.", flush=True)
+    _LOG.info("[GGUF] Llama() call starting (vision=%s)",
+              "on" if chat_handler else "off")
+
+    try:
+        _GGUF_MODEL_INSTANCE = Llama(**llama_kwargs)
+    except Exception as primary_exc:
+        # Failure-mode (1) and (2) from the comment above: if vision
+        # was attached and Llama() crashed, retry without the handler.
+        # llama-cpp's vision path is fragile across version + model
+        # combinations; losing vision is recoverable, but losing the
+        # entire app launch isn't.
+        if chat_handler is not None:
+            _LOG.error(
+                "[GGUF] Llama() FAILED with vision handler attached "
+                "(%s, source=%s): %s. Retrying text-only.",
+                clip_path_raw, clip_source, primary_exc,
+            )
+            print(
+                f"[GGUF] WARNING: model load failed with the vision "
+                f"mmproj attached ({primary_exc!r}).\n"
+                f"        Retrying without vision — your text-only "
+                f"queries will work; image content blocks will not.\n"
+                f"        Fix by either (a) picking a vision-capable "
+                f"main GGUF in the wizard, OR (b) clearing the mmproj "
+                f"via the wizard's 'Clear (text-only)' button.",
+                flush=True,
+            )
+            llama_kwargs.pop("chat_handler", None)
+            _GGUF_MODEL_INSTANCE = Llama(**llama_kwargs)
+            chat_handler = None   # reflect actual state for downstream code
+        else:
+            # No handler involved — re-raise so the user sees the real
+            # error. Adding context first so the traceback is more
+            # useful than llama-cpp's bare error.
+            _LOG.error(
+                "[GGUF] Llama() FAILED loading %s (n_ctx=%d, n_gpu_layers=%d): %s",
+                p.name, n_ctx, n_gpu_layers, primary_exc,
+            )
+            raise
     # Surface the model's advertised max context so the user knows the headroom
     # they have before raising COUNCIL_GGUF_N_CTX. This is a no-op when the
     # GGUF metadata doesn't include the field.
@@ -4161,14 +4308,18 @@ def _build_default_models(host: str) -> Dict[str, str]:
                 or assigned.get(slot)
                 or hardcoded_fallback)
 
+    # US-only model defaults. The previous fallbacks were Qwen 2.5 (Alibaba)
+    # which blocks the app for buyers in regulated industries that can only
+    # deploy AI from US-based providers. Replaced with Llama (Meta) and
+    # Phi (Microsoft) which cover the same role slots.
     return {
-        "general_primary": _slot("COUNCIL_MODEL_GENERAL_PRIMARY", "general_primary", "qwen2.5:32b-instruct-q4_K_M"),
-        "general_alt":     _slot("COUNCIL_MODEL_GENERAL_ALT",     "general_alt",     "qwen2.5:14b-instruct-q4_K_M"),
-        "coder_primary":   _slot("COUNCIL_MODEL_CODER_PRIMARY",   "coder_primary",   "qwen2.5-coder:14b-instruct-q4_K_M"),
+        "general_primary": _slot("COUNCIL_MODEL_GENERAL_PRIMARY", "general_primary", "llama3.1:8b-instruct-q5_K_M"),
+        "general_alt":     _slot("COUNCIL_MODEL_GENERAL_ALT",     "general_alt",     "llama3.1:8b-instruct-q4_K_M"),
+        "coder_primary":   _slot("COUNCIL_MODEL_CODER_PRIMARY",   "coder_primary",   "phi4"),
         "coder_fast":      _slot("COUNCIL_MODEL_CODER_FAST",      "fast",            "phi4"),
         "judge_fast":      _slot("COUNCIL_MODEL_JUDGE_FAST",      "fast",            "phi4"),
         "peasant_fast":    _slot("COUNCIL_MODEL_PEASANT_FAST",    "fast",            "phi4"),
-        "pi_heavy":        _slot("COUNCIL_MODEL_PI_HEAVY",        "general_alt",     "qwen2.5:14b-instruct-q4_K_M"),
+        "pi_heavy":        _slot("COUNCIL_MODEL_PI_HEAVY",        "general_alt",     "llama3.1:8b-instruct-q4_K_M"),
         "pi_fast":         _slot("COUNCIL_MODEL_PI_FAST",         "fast",            "phi4"),
     }
 

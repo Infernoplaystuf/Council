@@ -26,19 +26,43 @@ This is the home build. No licensing, no trials, no telemetry, no phone-home. If
 
 ## How to run it
 
-> **First-time setup?** Open a terminal in this folder and run:
+> **First-time setup?** Pick whichever feels less foreign:
 >
+> **A. Cross-platform Python wizard (recommended for analysts):**
 > ```
 > python setup_wizard.py
 > ```
+> Detects your GPU, creates `./.venv`, installs the right CUDA wheels,
+> walks the curated US-origin model catalog, downloads the GGUF, and
+> wires up Tesseract if present. Nothing destructive runs before you
+> confirm. Re-runnable. Add `--check-only` for a diagnostic-only pass.
 >
-> The wizard walks you through every step — detects your GPU, sets up
-> the venv, installs the right CUDA wheels, lets you pick from the
-> curated US-origin model catalog, and downloads the GGUF. Nothing
-> destructive runs before you confirm. You can re-run it any time.
+> **B. One-command shell installer (conda-based):**
+> ```bash
+> # Windows native (PowerShell / cmd):
+> setup.bat
 >
-> Prefer a diagnostic-only check (no installs)? Use `python
-> setup_wizard.py --check-only` to see what's already configured.
+> # Linux / macOS / WSL:
+> ./setup.sh
+> ```
+> Probes hardware, picks the cu121 / cu124 / cu128 / cpu wheel tier,
+> creates a conda env called `council`, installs torch + llama-cpp-python
+> + the rest of the deps, and runs a post-install smoke test. ~15-25 min
+> on a cold install (~2 GB of torch wheels). Idempotent.
+>
+> Flags for the shell installer:
+> ```
+> ./setup.sh --yes                 # accept all defaults
+> ./setup.sh --cuda-tier cu124     # override auto-detect
+> ./setup.sh --reinstall           # rebuild the env from scratch
+> ./setup.sh --skip-install        # print the plan, don't run
+> ```
+>
+> Neither path downloads a model on your behalf. After install, the
+> in-app Tk wizard either reuses a `.gguf` it finds in `~/models`,
+> `~/Downloads`, or `~/.cache/huggingface`, or shows the US-origin
+> catalog with one-click HF download links. All recommended models are
+> from US providers (IBM, Meta, Microsoft, Google, AllenAI, OpenAI).
 
 > **Never used WSL or a Linux terminal before?** Skip ahead to
 > [Appendix — WSL / Linux terminal crash course](#appendix--wsl--linux-terminal-crash-course)
@@ -405,6 +429,16 @@ pip install pyinstaller
 build.bat
 :: Look in dist\DatasInferno\
 ```
+
+#### What the installer does NOT do
+
+- It doesn't auto-install conda on Windows — the silent installer is unreliable. If you don't have conda, `setup.bat` prints a Miniforge download link and exits cleanly; install conda, re-run.
+- It doesn't download a model for you. After install, the in-app wizard either reuses a GGUF file it finds in `~/models`, `~/Downloads`, or `~/.cache/huggingface`, or shows you a list of US-made recommendations with one-click HF download links.
+- It doesn't run as administrator. If your conda lives in a system-wide location with restricted write perms, install it user-local first (Miniforge installs into `~/miniforge3` by default).
+
+#### Manual install
+
+If you prefer to drive conda + pip yourself, `installs.txt` has the full per-GPU breakdown (Sections A-F covering CPU, RTX 20/30, RTX 40, RTX 50, Linux with dream3dnx, and WSL without).
 
 ---
 

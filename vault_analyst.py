@@ -910,96 +910,163 @@ def read_bson_as_df(path: Any) -> pd.DataFrame:
 # so the user can edit it by hand. NEVER stores raw passwords — users
 # put credentials in env vars and reference them like
 # `postgresql://user:${PGPASS}@host/db`.
-
-import json as _json
-
-_SQL_CONN_FILENAME = "sql_connections.json"
-
-
-def _sql_conn_path(vault_dir: Any) -> Path:
-    return Path(vault_dir) / _SQL_CONN_FILENAME
+#
+# Storage + URL resolution + audit log all moved to db_connections.py
+# so the SQL and Mongo bridges share the same registry / log / env-var
+# expander. The functions below are thin re-exports kept here so any
+# code that previously imported list_sql_connections / save_sql_connection
+# from vault_analyst keeps working — no behaviour change.
 
 
 def list_sql_connections(vault_dir: Any) -> Dict[str, str]:
-    """Return the saved {name: url} mapping (empty if none)."""
-    p = _sql_conn_path(vault_dir)
-    if not p.exists():
-        return {}
-    try:
-        data = _json.loads(p.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            return {str(k): str(v) for k, v in data.items()}
-    except Exception:
-        return {}
-    return {}
+    """Return saved ``{name: url}``. URLs still contain ``${ENV_VAR}``
+    placeholders; resolution happens at connect time."""
+    import db_connections as _db
+    return _db.list_sql_connections(vault_dir)
 
 
 def save_sql_connection(vault_dir: Any, name: str, url: str) -> None:
-    """Save a named SQLAlchemy connection URL.
-
-    The URL is stored verbatim — put `${PG_PASS}`-style placeholders in
-    it and the resolver will substitute env vars at connect time.
-    """
-    p = _sql_conn_path(vault_dir)
-    existing = list_sql_connections(vault_dir)
-    existing[str(name)] = str(url)
-    p.write_text(_json.dumps(existing, indent=2), encoding="utf-8")
+    """Save a SQLAlchemy connection URL. Use ``${ENV_VAR}`` placeholders
+    for passwords — they expand at connect time."""
+    import db_connections as _db
+    _db.save_sql_connection(vault_dir, name, url)
 
 
-def _resolve_sql_url(url: str) -> str:
-    """Expand ${ENV_VAR} placeholders against os.environ."""
-    import os as _os
-    import re as _re
-    def _sub(m):
-        return _os.environ.get(m.group(1), m.group(0))
-    return _re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", _sub, url)
+def remove_sql_connection(vault_dir: Any, name: str) -> bool:
+    """Drop a saved SQL connection. Returns True if it existed."""
+    import db_connections as _db
+    return _db.remove_sql_connection(vault_dir, name)
+
+
+def save_mongo_connection(vault_dir: Any, name: str, uri: str) -> None:
+    """Save a MongoDB URI (``mongodb://...``). Use ``${ENV_VAR}``
+    placeholders for passwords."""
+    import db_connections as _db
+    _db.save_mongo_connection(vault_dir, name, uri)
+
+
+def remove_mongo_connection(vault_dir: Any, name: str) -> bool:
+    """Drop a saved Mongo connection. Returns True if it existed."""
+    import db_connections as _db
+    return _db.remove_mongo_connection(vault_dir, name)
 
 
 def list_sql_tables(vault_dir: Any, conn_name: str) -> List[str]:
-    """Inspect a named connection and return its table names."""
-    sqlalchemy = _import_sqlalchemy()
-    urls = list_sql_connections(vault_dir)
-    if conn_name not in urls:
-        raise KeyError(f"unknown SQL connection: {conn_name}")
-    eng = sqlalchemy.create_engine(_resolve_sql_url(urls[conn_name]))
-    insp = sqlalchemy.inspect(eng)
-    try:
-        names = list(insp.get_table_names())
-    finally:
-        eng.dispose()
-    return sorted(names)
+    """Inspect a named connection and return its table names.
+    Read-only — uses db_connections layer with full audit trail."""
+    import db_connections as _db
+    return _db.list_sql_tables(vault_dir, conn_name)
 
 
 def read_sql_table(
-    vault_dir: Any, conn_name: str, table: str, *, limit: Optional[int] = None,
+    vault_dir: Any, conn_name: str, table: str,
+    *, limit: Optional[int] = 10000,
 ) -> pd.DataFrame:
-    """Pull a remote SQL table into a DataFrame using a saved connection."""
-    sqlalchemy = _import_sqlalchemy()
-    urls = list_sql_connections(vault_dir)
-    if conn_name not in urls:
-        raise KeyError(f"unknown SQL connection: {conn_name}")
-    eng = sqlalchemy.create_engine(_resolve_sql_url(urls[conn_name]))
-    qname = '"' + str(table).replace('"', '""') + '"'
-    sql = f"SELECT * FROM {qname}"
-    if limit:
-        sql += f" LIMIT {int(limit)}"
-    try:
-        return pd.read_sql_query(sql, eng)
-    finally:
-        eng.dispose()
+    """Pull a remote SQL table into a DataFrame using a saved
+    connection. Read-only by construction (SELECT only). Default
+    10K-row limit; pass ``limit=None`` to lift it."""
+    import db_connections as _db
+    return _db.read_sql_table(vault_dir, conn_name, table, limit=limit)
 
 
 def sql_query(vault_dir: Any, conn_name: str, sql: str) -> pd.DataFrame:
-    """Run an arbitrary SQL query through a saved connection."""
-    sqlalchemy = _import_sqlalchemy()
-    urls = list_sql_connections(vault_dir)
-    if conn_name not in urls:
-        raise KeyError(f"unknown SQL connection: {conn_name}")
-    eng = sqlalchemy.create_engine(_resolve_sql_url(urls[conn_name]))
-    try:
-        return pd.read_sql_query(sql, eng)
-    finally:
-        eng.dispose()
+    """Run an arbitrary SQL query through a saved connection. The
+    query is VALIDATED to be a single read-only statement before
+    dispatch — DDL / DML keywords (INSERT, UPDATE, DELETE, DROP,
+    TRUNCATE, ALTER, CREATE, GRANT, REVOKE, MERGE, …) are rejected
+    even with comment-cloaking, and multi-statement payloads are
+    rejected too. See db_connections._validate_select_only."""
+    import db_connections as _db
+    return _db.sql_query(vault_dir, conn_name, sql)
+
+
+# ── MongoDB — read-only by API design ──────────────────────────────
+# Same convention as the SQL bridge: URLs in vault/mongo_connections.json,
+# ${ENV_VAR} placeholders supported. The wrappers below expose ONLY
+# find / aggregate / count / distinct / list_* — no insert / update /
+# delete / drop methods are reachable from the analyst sandbox. The
+# aggregation validator also rejects $out, $merge, $function,
+# $accumulator, $where which can bypass a read-only role.
+
+def list_mongo_connections(vault_dir: Any) -> Dict[str, str]:
+    """Return saved ``{name: mongodb_uri}``."""
+    import db_connections as _db
+    return _db.list_mongo_connections(vault_dir)
+
+
+def list_mongo_databases(vault_dir: Any, conn_name: str) -> List[str]:
+    """List databases visible to the saved Mongo connection."""
+    import db_connections as _db
+    return _db.list_mongo_databases(vault_dir, conn_name)
+
+
+def list_mongo_collections(
+    vault_dir: Any, conn_name: str, db_name: str,
+) -> List[str]:
+    """List collections in a database."""
+    import db_connections as _db
+    return _db.list_mongo_collections(vault_dir, conn_name, db_name)
+
+
+def read_mongo_collection(
+    vault_dir: Any,
+    conn_name: str,
+    db_name: str,
+    collection: str,
+    *,
+    query: Optional[Dict[str, Any]] = None,
+    projection: Optional[Dict[str, Any]] = None,
+    limit: Optional[int] = 10000,
+    skip: int = 0,
+    sort: Optional[List] = None,
+) -> pd.DataFrame:
+    """Mongo find() → DataFrame. Default 10K-row hard limit; pass
+    limit=None to lift (audit-logged with a WARN tag)."""
+    import db_connections as _db
+    return _db.read_mongo_collection(
+        vault_dir, conn_name, db_name, collection,
+        query=query, projection=projection,
+        limit=limit, skip=skip, sort=sort,
+    )
+
+
+def mongo_aggregate(
+    vault_dir: Any,
+    conn_name: str,
+    db_name: str,
+    collection: str,
+    pipeline: List[Dict[str, Any]],
+    *,
+    allow_disk_use: bool = False,
+) -> pd.DataFrame:
+    """Run a Mongo aggregation pipeline. Pipeline is validated —
+    $out / $merge / $function / $accumulator / $where stages
+    are rejected."""
+    import db_connections as _db
+    return _db.mongo_aggregate(
+        vault_dir, conn_name, db_name, collection, pipeline,
+        allow_disk_use=allow_disk_use,
+    )
+
+
+def mongo_count(
+    vault_dir: Any, conn_name: str, db_name: str, collection: str,
+    *, query: Optional[Dict[str, Any]] = None,
+) -> int:
+    """count_documents on a collection."""
+    import db_connections as _db
+    return _db.mongo_count(vault_dir, conn_name, db_name, collection,
+                            query=query)
+
+
+def mongo_distinct(
+    vault_dir: Any, conn_name: str, db_name: str, collection: str,
+    field: str, *, query: Optional[Dict[str, Any]] = None,
+) -> List[Any]:
+    """distinct values of `field` in a collection."""
+    import db_connections as _db
+    return _db.mongo_distinct(vault_dir, conn_name, db_name, collection,
+                               field, query=query)
 
 
 def read_excel_sheets(path: Any) -> Dict[str, pd.DataFrame]:
@@ -1161,6 +1228,266 @@ def find_columns_contains(df: pd.DataFrame, text: str) -> List[str]:
 # Per-CSV aggregate helpers
 # Each returns a DataFrame with one row per input CSV.
 # ============================================================
+
+def folder_data_summary(
+    data_folder: Any,
+    recursive: bool = True,
+    max_files: Optional[int] = None,
+    include_image_metadata: bool = True,
+) -> pd.DataFrame:
+    """A "true data summary" of every data file in `data_folder`.
+
+    Returns ONE row per file with the columns the Council's data
+    analytics queries actually want to see — without making the model
+    write per-file code for every question:
+
+        file              file basename
+        relative_path     path relative to its search root
+        type              csv / tsv / parquet / xlsx / json / sqlite /
+                          duckdb / bson / image / text / source / unknown
+        size_kb           file size in KB
+        rows              row count (for tabular formats; null otherwise)
+        columns           column count
+        column_names      comma-joined first 12 column names
+        dtypes            comma-joined dtype shorthand (int, float, str, ...)
+        missing_pct       overall missing-value rate as a percentage (0-100)
+        numeric_cols      count of numeric columns
+        date_cols         count of date / datetime columns
+        sample_value      one representative value from the first non-empty
+                          column (useful for ID-shape sniffing)
+        notes             short freeform diagnostic (errors, warnings)
+
+    Designed for the Council intent "give me a true data summary of
+    files in the <subfolder> folder". The model's analyst step can
+    call it with a single line:
+
+        result_df = folder_data_summary(DATA_FOLDERS)
+
+    and the resulting DataFrame is the answer.
+    """
+    folders = normalize_data_folders(data_folder)
+    rows: list[dict[str, Any]] = []
+
+    # Build a deduped file list across the supported tabular + structured
+    # formats. Image files are reported but not deeply parsed.
+    file_paths: list[Path] = []
+    seen: set = set()
+    for collector in (
+        lambda: list_csv_files(folders, recursive=recursive),
+        lambda: list_excel_files(folders, recursive=recursive),
+        lambda: list_parquet_files(folders, recursive=recursive),
+        lambda: list_sqlite_files(folders, recursive=recursive),
+        lambda: list_duckdb_files(folders, recursive=recursive),
+        lambda: list_bson_files(folders, recursive=recursive),
+    ):
+        try:
+            for p in collector():
+                key = str(p.resolve()).lower()
+                if key not in seen:
+                    seen.add(key)
+                    file_paths.append(p)
+        except Exception:
+            continue
+
+    # Also pick up JSON, plain-text, and image files via folder walks —
+    # these aren't in the collector helpers but are part of "what's in
+    # this folder" from the user's perspective.
+    _EXTRA_EXT = {".json", ".jsonl", ".ndjson", ".txt", ".md",
+                  ".yaml", ".yml", ".xml",
+                  ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
+                  ".tiff", ".tif"}
+    for folder in folders:
+        try:
+            walker = folder.rglob("*") if recursive else folder.glob("*")
+            for p in walker:
+                if not p.is_file():
+                    continue
+                if p.suffix.lower() not in _EXTRA_EXT:
+                    continue
+                key = str(p.resolve()).lower()
+                if key not in seen:
+                    seen.add(key)
+                    file_paths.append(p)
+        except Exception:
+            continue
+
+    if max_files is not None:
+        file_paths = file_paths[:max_files]
+
+    for fp in file_paths:
+        root = first_matching_root(fp, folders)
+        rec: dict[str, Any] = {
+            "file":          fp.name,
+            "relative_path": safe_relative_path(fp, root),
+            "type":          "unknown",
+            "size_kb":       0.0,
+            "rows":          None,
+            "columns":       None,
+            "column_names":  "",
+            "dtypes":        "",
+            "missing_pct":   None,
+            "numeric_cols":  None,
+            "date_cols":     None,
+            "sample_value":  "",
+            "notes":         "",
+        }
+        try:
+            rec["size_kb"] = round(fp.stat().st_size / 1024, 1)
+        except Exception:
+            pass
+
+        suf = fp.suffix.lower()
+        try:
+            if suf in (".csv", ".tsv"):
+                df = _read_csv_cached(fp, sep="\t") if suf == ".tsv" \
+                    else _read_csv_cached(fp)
+                _fill_tabular_summary(rec, df, "csv" if suf == ".csv" else "tsv")
+            elif suf == ".parquet":
+                df = pd.read_parquet(fp)
+                _fill_tabular_summary(rec, df, "parquet")
+            elif suf in (".xlsx", ".xls", ".xlsm"):
+                # Use the first sheet for the headline summary; multi-sheet
+                # files are noted in `notes`.
+                xl = pd.ExcelFile(fp)
+                first_sheet = xl.sheet_names[0] if xl.sheet_names else None
+                if first_sheet is None:
+                    rec["type"] = "excel"
+                    rec["notes"] = "no sheets"
+                else:
+                    df = pd.read_excel(fp, sheet_name=first_sheet)
+                    _fill_tabular_summary(rec, df, "excel")
+                    if len(xl.sheet_names) > 1:
+                        rec["notes"] = (f"first sheet '{first_sheet}'; "
+                                        f"file has {len(xl.sheet_names)} sheets")
+            elif suf in (".json", ".jsonl", ".ndjson"):
+                # JSONL/NDJSON load as records; plain JSON we tabularise
+                # via json_normalize if it's a list of dicts.
+                rec["type"] = "json" if suf == ".json" else "jsonl"
+                try:
+                    if suf == ".json":
+                        import json as _json
+                        data = _json.loads(fp.read_text(encoding="utf-8",
+                                                         errors="replace"))
+                        if isinstance(data, list) and data and isinstance(data[0], dict):
+                            df = pd.json_normalize(data)
+                            _fill_tabular_summary(rec, df, "json")
+                        elif isinstance(data, dict):
+                            rec["columns"] = len(data)
+                            rec["column_names"] = ", ".join(
+                                list(data.keys())[:12])
+                            rec["notes"] = "single object (not a list of records)"
+                    else:
+                        df = pd.read_json(fp, lines=True)
+                        _fill_tabular_summary(rec, df, "jsonl")
+                except Exception as exc:
+                    rec["notes"] = f"json parse failed: {exc}"
+            elif suf in (".db", ".sqlite", ".sqlite3"):
+                rec["type"] = "sqlite"
+                try:
+                    tables = list_sqlite_tables(fp)
+                    rec["columns"] = len(tables)
+                    rec["column_names"] = ", ".join(tables[:12])
+                    rec["notes"] = f"{len(tables)} table(s)"
+                except Exception as exc:
+                    rec["notes"] = f"sqlite read failed: {exc}"
+            elif suf == ".duckdb":
+                rec["type"] = "duckdb"
+                try:
+                    tables = list_duckdb_tables(fp)
+                    rec["columns"] = len(tables)
+                    rec["column_names"] = ", ".join(tables[:12])
+                    rec["notes"] = f"{len(tables)} table(s)"
+                except Exception as exc:
+                    rec["notes"] = f"duckdb read failed: {exc}"
+            elif suf == ".bson":
+                rec["type"] = "bson"
+                try:
+                    docs = read_bson_documents(fp)
+                    rec["rows"] = len(docs)
+                    if docs:
+                        keys = list(docs[0].keys()) if isinstance(docs[0], dict) else []
+                        rec["columns"] = len(keys)
+                        rec["column_names"] = ", ".join(map(str, keys[:12]))
+                except Exception as exc:
+                    rec["notes"] = f"bson read failed: {exc}"
+            elif suf in (".png", ".jpg", ".jpeg", ".gif", ".bmp",
+                          ".webp", ".tiff", ".tif"):
+                rec["type"] = "image"
+                if include_image_metadata:
+                    try:
+                        from PIL import Image  # type: ignore[import]
+                        with Image.open(fp) as img:
+                            rec["columns"] = img.width
+                            rec["rows"]    = img.height
+                            rec["column_names"] = f"mode={img.mode}"
+                            rec["notes"]   = f"{img.width}×{img.height} {img.format or ''}"
+                    except Exception as exc:
+                        rec["notes"] = f"image (PIL unavailable: {exc})"
+                else:
+                    rec["notes"] = "image"
+            elif suf in (".txt", ".md", ".yaml", ".yml", ".xml"):
+                rec["type"] = "text"
+                try:
+                    text = fp.read_text(encoding="utf-8", errors="replace")
+                    rec["rows"] = text.count("\n")
+                    sample = text[:80].replace("\n", " ").strip()
+                    rec["sample_value"] = sample
+                except Exception as exc:
+                    rec["notes"] = f"text read failed: {exc}"
+            else:
+                rec["type"] = "other"
+        except Exception as exc:
+            rec["notes"] = f"profile error: {exc}"
+        rows.append(rec)
+
+    return pd.DataFrame(rows)
+
+
+def _fill_tabular_summary(rec: dict, df: "pd.DataFrame", type_label: str) -> None:
+    """Populate the tabular-summary fields on ``rec`` from ``df``."""
+    try:
+        rec["type"]         = type_label
+        rec["rows"]         = int(len(df))
+        rec["columns"]      = int(len(df.columns))
+        rec["column_names"] = ", ".join(map(str, df.columns[:12]))
+        # Dtype shorthand: keep the names short — int / float / str /
+        # datetime / bool / object — readable in a one-row summary.
+        def _short_dtype(dt) -> str:
+            s = str(dt)
+            if s.startswith("int"):
+                return "int"
+            if s.startswith("float"):
+                return "float"
+            if "datetime" in s:
+                return "datetime"
+            if s == "bool":
+                return "bool"
+            return "str"
+        types = [_short_dtype(d) for d in df.dtypes[:12]]
+        rec["dtypes"] = ", ".join(types)
+        rec["numeric_cols"] = int(
+            df.select_dtypes(include=["number"]).shape[1])
+        try:
+            rec["date_cols"] = int(
+                df.select_dtypes(include=["datetime", "datetimetz"]).shape[1])
+        except Exception:
+            rec["date_cols"] = 0
+        # Missing-value rate — total NaNs / total cells, ×100.
+        total_cells = max(1, len(df) * len(df.columns))
+        rec["missing_pct"] = round(
+            float(df.isna().sum().sum()) / total_cells * 100, 1)
+        # Representative value — first non-null in the first column.
+        if len(df) and len(df.columns):
+            try:
+                non_null = df[df.columns[0]].dropna()
+                if len(non_null):
+                    sv = non_null.iloc[0]
+                    rec["sample_value"] = str(sv)[:60]
+            except Exception:
+                pass
+    except Exception as exc:
+        rec["notes"] = f"summary error: {exc}"
+
 
 def csv_inventory(
     data_folder: Any,
@@ -2451,7 +2778,14 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
 
 
 def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
-    allowed_roots = {"pandas", "pathlib", "numpy", "math", "re", "json", "statistics", "collections"}
+    # scipy added for the SPC / engineering / stats helpers — it has
+    # no filesystem, network, or subprocess surface; it's a pure
+    # numerical library and a safe addition to the sandbox allowlist.
+    allowed_roots = {
+        "pandas", "pathlib", "numpy", "math", "re", "json",
+        "statistics", "collections",
+        "scipy",          # SPC capability indices, ANOVA, FFT, normality tests
+    }
     root = name.split(".")[0]
     if root not in allowed_roots:
         raise ImportError(f"Import blocked by sandbox: {name}")
@@ -2514,6 +2848,7 @@ def execute_pandas_code(
         "find_column_case_insensitive": find_column_case_insensitive,
         "find_columns_contains": find_columns_contains,
         "csv_inventory": csv_inventory,
+        "folder_data_summary": folder_data_summary,
         "count_rows_per_csv": count_rows_per_csv,
         "average_numeric_column_per_csv": average_numeric_column_per_csv,
         "std_numeric_column_per_csv": std_numeric_column_per_csv,
@@ -2577,9 +2912,31 @@ def execute_pandas_code(
         "list_sql_tables":      list_sql_tables,
         "read_sql_table":       read_sql_table,
         "sql_query":            sql_query,
+        # MongoDB — read-only by API design. Pipeline validator
+        # blocks $out / $merge / $function / $accumulator / $where.
+        "list_mongo_connections": list_mongo_connections,
+        "list_mongo_databases":   list_mongo_databases,
+        "list_mongo_collections": list_mongo_collections,
+        "read_mongo_collection":  read_mongo_collection,
+        "mongo_aggregate":        mongo_aggregate,
+        "mongo_count":            mongo_count,
+        "mongo_distinct":         mongo_distinct,
     }
     if np is not None:
         globals_dict["np"] = np
+
+    # Domain helpers — SPC (Gate A), engineering + stats (Gate B).
+    # The register_helpers entry point keeps the wiring centralised so
+    # the sandbox surface for new analytic capabilities lands in one
+    # place, and a registration failure in one helper module (missing
+    # scipy on a CPU-only bundle, say) doesn't take the others down.
+    try:
+        import analyst_helpers as _ah
+        _ah.register_helpers(globals_dict)
+    except Exception as _ah_exc:
+        import sys as _sys_dbg
+        print(f"[analyst] domain helpers not registered: {_ah_exc!r}",
+              file=_sys_dbg.stderr)
 
     # CRITICAL: pass `globals_dict` as BOTH globals and locals. When
     # exec(code, globals, locals) is called with *different* dicts, Python
@@ -2690,6 +3047,17 @@ Available helper functions (prefer these over raw pandas — they handle
 case-insensitive column matching, NaN/zero filtering, and multi-CSV scans):
   list_csv_files(data_folder, recursive=True)
   csv_inventory(data_folder, recursive=True, max_files=None)
+  folder_data_summary(data_folder, recursive=True, max_files=None)
+    THE GO-TO HELPER FOR "GIVE ME A DATA SUMMARY" QUERIES. Returns
+    one row per file across CSV / TSV / Parquet / Excel / JSON /
+    SQLite / DuckDB / BSON / image / text formats with:
+       file, relative_path, type, size_kb, rows, columns,
+       column_names, dtypes, missing_pct, numeric_cols, date_cols,
+       sample_value, notes
+    Use this when the user asks for "a true data summary", "what's
+    in the folder", "describe the files", "schema overview", or
+    "inventory of the subfolder X" — it answers the WHOLE question
+    in one call instead of needing per-file code.
   count_rows_per_csv(data_folder, recursive=True)
   find_column_case_insensitive(df, column_name)
   find_columns_contains(df, text)
@@ -2785,14 +3153,65 @@ BSON / MongoDB:
   read_bson_documents(path)    # -> list[dict]
   read_bson_as_df(path)        # -> DataFrame (pd.json_normalize)
 
-Remote SQL via SQLAlchemy:
+Remote SQL via SQLAlchemy (READ-ONLY — see notes below):
   list_sql_connections(vault_dir)    # -> {name: url}
   list_sql_tables(vault_dir, conn_name)
-  read_sql_table(vault_dir, conn_name, table, limit=None)
+  read_sql_table(vault_dir, conn_name, table, limit=10000)
   sql_query(vault_dir, conn_name, sql)
-  Connections saved to vault/sql_connections.json. URLs can use
-  ${ENV_VAR} placeholders resolved at connect time — keeps passwords
-  out of the JSON file.
+  • Connections live in vault/sql_connections.json with ${ENV_VAR}
+    placeholders for passwords.
+  • Every SQL string passed to sql_query is VALIDATED before
+    dispatch: only single SELECT / WITH / EXPLAIN / SHOW / DESCRIBE
+    statements are allowed. Multi-statement payloads (`;`), DML/DDL
+    keywords (INSERT / UPDATE / DELETE / DROP / TRUNCATE / ALTER /
+    CREATE / GRANT / …), and comment-cloaked writes are rejected.
+  • read_sql_table defaults to 10K-row hard cap; pass limit=None
+    to lift (audit-logged loudly).
+
+Remote MongoDB (READ-ONLY by API design):
+  list_mongo_connections(vault_dir)            # -> {name: uri}
+  list_mongo_databases(vault_dir, conn)
+  list_mongo_collections(vault_dir, conn, db)
+  read_mongo_collection(vault_dir, conn, db, coll, query=None,
+                        projection=None, limit=10000, skip=0, sort=None)
+  mongo_aggregate(vault_dir, conn, db, coll, pipeline,
+                  allow_disk_use=False)
+  mongo_count(vault_dir, conn, db, coll, query=None)
+  mongo_distinct(vault_dir, conn, db, coll, field, query=None)
+  • Connections live in vault/mongo_connections.json with ${ENV_VAR}
+    placeholders.
+  • Only find / aggregate / count / distinct are reachable from
+    these helpers — no insert / update / delete / drop methods are
+    exposed.
+  • Aggregation pipelines are VALIDATED — $out / $merge / $function
+    / $accumulator / $where stages are rejected (they can write or
+    run server-side JS).
+  • Default 10K-row hard cap on read_mongo_collection.
+
+Audit log:
+  Every database query lands in vault/db_audit.log as one JSONL
+  record per query — timestamp, connection name, query (truncated
+  to 500 chars), result row count, duration. Forensic, not
+  preventive — but if anything ever leaks through, the log tells
+  you exactly what happened.
+
+Manufacturing / SPC helpers (analyst_helpers.spc):
+  process_capability(series, lsl=None, usl=None, subgroup_size=None,
+                     column=None)
+    → dict with Cp / Cpk (short-term, needs subgroup_size) and
+      Pp / Ppk (long-term) plus a normality test result. ALWAYS
+      check normality_ok before reporting Cpk — non-normal data
+      makes Cpk misleading. Returns warnings the model should
+      mention. Either lsl or usl may be None for one-sided specs.
+      For a multi-column DataFrame / CSV, pass column='<name>'.
+  control_chart_limits(series, chart_type='xbar', subgroup_size=None,
+                       column=None)
+    → dict with center, UCL, LCL. Supports 'xbar', 'r', 'i'
+      (individuals), 'mr' (moving range), 'p' (proportion),
+      'np' (count). Constants hardcoded from NIST/ASTM.
+
+For manufacturing data with specification limits, USE process_capability
+and check normality_ok before reporting Cpk values.
 
 Rules:
 - Assign the final answer to a DataFrame named `result_df`.
@@ -2815,6 +3234,15 @@ Examples:
 
 Q: How many rows are in each CSV?
 result_df = count_rows_per_csv(DATA_FOLDERS)
+
+Q: Give me a true data summary of the files in this folder.
+Q: What's in this subfolder?  /  Describe the files in here.
+Q: Overview / inventory / profile of the data.
+# `folder_data_summary` answers all of these in one call. The result
+# has rows / columns / dtypes / missing% / sample value per file —
+# everything the user actually means by "summary" without making
+# the model hand-roll per-file logic.
+result_df = folder_data_summary(DATA_FOLDERS)
 
 Q: What is the average rating for each CSV, ignoring zeros?
 result_df = average_numeric_column_per_csv(DATA_FOLDERS, column_name="rating", exclude_zero=True)
@@ -2878,6 +3306,33 @@ _COMPUTE_KEYWORDS = (
     "group by", "groupby", "by month", "by year", "by category",
     "filter", "rows with", "rows where", "rows that",
     "which file", "which files", "across files", "across the files",
+    # Data-summary intents — the Council tab needs to handle queries
+    # like "give me a true data summary of files in the sales/
+    # subfolder" through the analyst pipeline (not freeform text from
+    # the model, which can't actually count rows or read schemas).
+    "summary of files", "summary of the files",
+    "data summary", "true data summary",
+    "summarize the files", "summarize files",
+    "summarize the data", "summarize this folder",
+    "describe the files", "describe these files", "describe the data",
+    "overview of files", "overview of the files",
+    "overview of the folder", "overview of the data",
+    "what's in", "whats in", "what is in",
+    "schema of", "schemas of", "schemas in",
+    # Schema-style questions about a single file. These look like
+    # freeform chat ("what columns…") but they're answerable from the
+    # vault index alone — route them through the analyst so the model
+    # doesn't hallucinate column names.
+    "what columns", "which columns", "list columns",
+    "what fields", "which fields", "list fields",
+    "what headers", "which headers", "list headers",
+    "column names", "field names", "header names",
+    "profile the", "profile this",
+    "inventory", "inventory of", "file inventory",
+    "audit the", "audit this", "data quality",
+    # Ranking / extremum questions — top-N, highest, lowest, biggest.
+    "top ", "bottom ", "highest", "lowest", "biggest", "smallest",
+    "most ", "least ", "largest", "rank by",
 )
 
 

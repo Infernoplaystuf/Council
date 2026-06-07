@@ -563,6 +563,16 @@ _BSON_SUFFIXES = {".bson"}
 # like .json for keyword indexing so 'show pipeline X' / vault search
 # both pick them up).
 _D3DPIPELINE_SUFFIXES = {".d3dpipeline"}
+# Image files. The indexer stores filename + dimensions + EXIF metadata
+# (date taken, camera model, GPS) when Pillow is available, otherwise
+# just filename + size. The vault search can surface "find photos of
+# Q3 inventory" / "images from this morning" / "all bmp under 1 MB"
+# via the keyword + filter index. Actual image-content understanding
+# requires a multimodal model, which is a separate concern.
+_IMAGE_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp",
+    ".tiff", ".tif", ".ico", ".heic", ".heif",
+}
 _PARSEABLE = ({".csv", ".json"} | _TEXT_SUFFIXES | _SOURCE_CODE_SUFFIXES
               | _EXCEL_SUFFIXES | _TABULAR_EXTRA | _SQLITE_SUFFIXES
               | _DUCKDB_SUFFIXES | _BSON_SUFFIXES | _D3DPIPELINE_SUFFIXES
@@ -1261,75 +1271,123 @@ def _parse_docx(p: Path) -> Dict[str, Any]:
     }
 
 
-def _parse_image(p: Path) -> Dict[str, Any]:
-    """Index an image by filename + EXIF tags + OCR text (when available).
+def _parse_image(p: Path, suffix: str = "") -> Dict[str, Any]:
+    """Index an image: dimensions, mode, EXIF whitelist (when Pillow is
+    available) AND OCR text (when pytesseract + tesseract binary are
+    available). Three discoverability layers, each optional:
 
-    Tesseract OCR is OPTIONAL — the parser never fails when it's missing.
-    What you get without Tesseract: filename tokens + EXIF tags as
-    searchable keywords. What you get with Tesseract: the same plus the
-    text Tesseract reads out of the pixels.
+      1. Filename tokens — ALWAYS indexed (cheap, no deps).
+      2. EXIF metadata (Pillow optional) — camera Make/Model, dates,
+         GPSInfo, Artist, Copyright, ImageDescription. Whitelisted to
+         keep the search vocab clean.
+      3. OCR pixel text (pytesseract optional) — text rendered in the
+         image itself: defect-photo captions, dashboard screenshots,
+         nameplates. Detection order for the binary:
+            • ``COUNCIL_TESSERACT_CMD`` env (set by the Windows launcher
+              when the UB-Mannheim install is at its default path)
+            • system PATH (Linux distro default; macOS Homebrew)
+            • give up silently — filename + EXIF still indexed.
+         Set ``COUNCIL_OCR_DISABLE=1`` to skip OCR even when present.
 
-    Detection order for the Tesseract binary:
-      1. ``COUNCIL_TESSERACT_CMD`` env var (set by the Windows launcher
-         when the UB-Mannheim install is at its default path)
-      2. system PATH (Linux distro default; macOS Homebrew)
-      3. (give up — falls back to filename-only indexing silently)
-
-    The OCR pass can be disabled even when Tesseract is present by
-    setting ``COUNCIL_OCR_DISABLE=1`` — useful when scanning a huge
-    image-heavy folder where filename indexing is enough.
-
-    The CLIP semantic image index (image_index.py) is a separate layer
-    and is built on rebuild()'s post-pass when sentence-transformers is
-    available.
+    The ``suffix`` arg is optional for back-compat — when omitted it's
+    inferred from ``p.suffix``. The CLIP semantic image index
+    (image_index.py) is a separate layer and is built on rebuild()'s
+    post-pass when sentence-transformers is available.
     """
-    ocr_text = ""
-    ocr_status = "skipped"
-    exif_blob = ""
-    if os.environ.get("COUNCIL_OCR_DISABLE", "").lower() not in ("1", "true", "yes"):
-        try:
-            from PIL import Image as _PILImage
-            try:
-                import pytesseract as _pt
-                # Allow operators to point at a non-default tesseract via env;
-                # otherwise let pytesseract probe PATH as it would by default.
-                tess = os.environ.get("COUNCIL_TESSERACT_CMD", "")
-                if tess:
-                    _pt.pytesseract.tesseract_cmd = tess
-                img = _PILImage.open(str(p))
-                ocr_text = _pt.image_to_string(img) or ""
-                ocr_status = "ok" if ocr_text else "empty"
-            except Exception:
-                # Most common cause: tesseract binary not on PATH and no
-                # COUNCIL_TESSERACT_CMD set. Stay silent — filename-only
-                # indexing is the working fallback.
-                ocr_text = ""
-                ocr_status = "tesseract-missing"
-            try:
-                img = _PILImage.open(str(p))
-                if hasattr(img, "_getexif") and img._getexif():
-                    exif_blob = " ".join(
-                        f"{k}={v}" for k, v in (img._getexif() or {}).items()
-                        if isinstance(v, (str, int, float))
-                    )[:1000]
-            except Exception:
-                exif_blob = ""
-        except Exception:
-            # Pillow itself missing — absolute last-ditch fallback.
-            ocr_status = "pil-missing"
-    else:
-        ocr_status = "disabled"
-    # Filename tokens are surfaced as keywords regardless of Tesseract.
-    name_tokens = _tokenize(p.stem.replace("-", " ").replace("_", " "))
-    body = (ocr_text + "\n" + exif_blob).strip()
-    keywords = sorted(set(_tokenize(body)) | set(name_tokens))[:300]
-    return {
-        "type": "image",
-        "sample_text": body[:2000] if body else f"[image: {p.name}]",
-        "keywords": keywords,
-        "ocr_chars": len(ocr_text),
-        "ocr_status": ocr_status,
+    suffix = suffix or p.suffix.lower()
+    rec: Dict[str, Any] = {
+        "type":         "image",
+        "image_format": suffix.lstrip(".") or "image",
+        "keywords":     sorted(set(_tokenize(
+                            p.stem.replace("-", " ").replace("_", " ")
+                        )))[:60],
+        "ocr_status":   "skipped",
     }
+    try:
+        rec["size_bytes"] = p.stat().st_size
+    except Exception:
+        pass
+
+    # ── Pillow + EXIF + dimensions (optional) ─────────────
+    pil_ok = False
+    try:
+        from PIL import Image, ExifTags  # type: ignore[import]
+        pil_ok = True
+    except Exception:
+        rec["indexing"] = "filename only — install Pillow for EXIF + dimensions"
+
+    if pil_ok:
+        try:
+            with Image.open(p) as img:
+                rec["width"]  = img.width
+                rec["height"] = img.height
+                rec["mode"]   = img.mode
+                try:
+                    exif_raw = img.getexif()
+                except Exception:
+                    exif_raw = None
+                if exif_raw:
+                    keep = {"DateTime", "DateTimeOriginal", "Make", "Model",
+                            "Software", "Artist", "Copyright",
+                            "ImageDescription", "GPSInfo"}
+                    exif_clean: Dict[str, Any] = {}
+                    for tag_id, val in exif_raw.items():
+                        name = ExifTags.TAGS.get(tag_id, str(tag_id))
+                        if name in keep:
+                            if isinstance(val, bytes):
+                                try:
+                                    val = val.decode("utf-8", errors="replace").strip("\x00 ")
+                                except Exception:
+                                    val = repr(val)
+                            elif isinstance(val, (tuple, list)):
+                                val = str(val)
+                            exif_clean[name] = val
+                    if exif_clean:
+                        rec["exif"] = exif_clean
+                        extra_kw = []
+                        for v in exif_clean.values():
+                            extra_kw.extend(_tokenize(str(v)))
+                        rec["keywords"] = sorted(
+                            set(rec["keywords"]) | set(extra_kw)
+                        )[:120]
+        except Exception as exc:
+            rec["indexing"] = f"filename only — could not open image: {exc!r}"
+
+    # ── OCR pass (optional, layered on top of EXIF/dims) ──
+    if (pil_ok
+        and os.environ.get("COUNCIL_OCR_DISABLE", "").lower() not in ("1", "true", "yes")):
+        ocr_text = ""
+        try:
+            import pytesseract as _pt
+            tess = os.environ.get("COUNCIL_TESSERACT_CMD", "")
+            if tess:
+                _pt.pytesseract.tesseract_cmd = tess
+            try:
+                from PIL import Image as _PILImage
+                with _PILImage.open(str(p)) as img:
+                    ocr_text = _pt.image_to_string(img) or ""
+                rec["ocr_status"] = "ok" if ocr_text else "empty"
+            except Exception:
+                rec["ocr_status"] = "tesseract-missing"
+        except Exception:
+            rec["ocr_status"] = "tesseract-missing"
+        if ocr_text:
+            rec["ocr_chars"] = len(ocr_text)
+            rec["sample_text"] = ocr_text[:2000]
+            # OCR tokens flow into the keyword set so a manufacturing
+            # photo annotated "DEF-001 NCR-99001" is searchable by ID.
+            rec["keywords"] = sorted(
+                set(rec["keywords"]) | set(_tokenize(ocr_text))
+            )[:300]
+    elif not pil_ok:
+        rec["ocr_status"] = "pil-missing"
+    else:
+        rec["ocr_status"] = "disabled"
+
+    # Ensure sample_text exists so search has something to show even
+    # when no OCR fired.
+    rec.setdefault("sample_text", f"[image: {p.name}]")
+    return rec
 
 
 def _parse_text(p: Path, suffix: str) -> Dict[str, Any]:
@@ -1389,9 +1447,10 @@ def _record_has_content(rec: Dict[str, Any]) -> bool:
         return bool(rec.get("keywords")) or bool((rec.get("sample_text") or "").strip())
 
     # Images — always content-bearing. Filename tokens alone are enough
-    # to make sku-1001.png discoverable. Tighter checks happen at the
-    # query side (image hits get a lower implicit weight in mixed
-    # result sets).
+    # to make sku-1001.png discoverable; EXIF + OCR (when available)
+    # layer on top. Tighter checks happen at the query side (image hits
+    # get a lower implicit weight in mixed result sets). Stub-rejection
+    # would defeat the point of indexing images in the first place.
     if rtype == "image":
         return True
 
@@ -1431,7 +1490,7 @@ def _index_file(p: Path) -> Optional[Dict[str, Any]]:
     elif suffix in _DOCX_SUFFIXES:
         rec = _parse_docx(p)
     elif suffix in _IMAGE_SUFFIXES:
-        rec = _parse_image(p)
+        rec = _parse_image(p, suffix)
     elif suffix in _SQLITE_SUFFIXES:
         rec = _parse_sqlite(p)
     elif suffix in _DUCKDB_SUFFIXES:
@@ -1852,10 +1911,30 @@ the vocabulary list. Lowercase only. Single line only.
         # collect every (path, mtime) tuple that needs work, THEN parse
         # in parallel. This lets the progress callback emit an accurate
         # total at the start instead of counting up forever.
+        #
+        # Hidden + cache dirs we deliberately skip: .git, .chromadb,
+        # .git_clones, __pycache__, node_modules, .venv. Without this
+        # the walk descended into vault/.chromadb (which can hold
+        # hundreds of .json shards from the embedded ChromaDB store)
+        # and indexed every one — polluting the vocab AND wasting
+        # walk time on each refresh.
+        _WALK_SKIP_DIRS = {
+            "__pycache__", ".git", ".chromadb", ".git_clones",
+            ".venv", "venv", "node_modules", ".cache",
+        }
         to_index: List[Tuple[Path, float]] = []
         seen: Set[str] = set()
         for p in root.rglob("*"):
             if not p.is_file():
+                continue
+            # Bail out as soon as ANY ancestor folder (between `root` and
+            # the file) is a skip-dir. Cheap to check via parts.
+            try:
+                rel_parts = p.relative_to(root).parts[:-1]
+            except ValueError:
+                rel_parts = ()
+            if any(part in _WALK_SKIP_DIRS or part.startswith(".")
+                   for part in rel_parts):
                 continue
             # Skip our own bookkeeping files (index, denylist, semantic
             # cache, backend settings, onboarding marker). Indexing them
@@ -2639,6 +2718,24 @@ the vocabulary list. Lowercase only. Single line only.
             for s in sheets[:6]:
                 cols = ", ".join(map(str, s.get("headers", [])[:15]))
                 lines.append(f"  - {s.get('sheet','?')} ({s.get('rows', 0)} rows): {cols}")
+        elif rtype == "image":
+            lines.append(f"type: image ({rec.get('image_format', '?')})")
+            if rec.get("width") and rec.get("height"):
+                lines.append(f"dimensions: {rec['width']}×{rec['height']}")
+            if rec.get("size_bytes"):
+                sz_kb = rec["size_bytes"] / 1024
+                sz_str = (f"{sz_kb/1024:.1f} MB" if sz_kb > 1024
+                          else f"{sz_kb:.0f} KB")
+                lines.append(f"size: {sz_str}")
+            exif = rec.get("exif") or {}
+            if exif:
+                # Only show the most-searched fields in Tier 1; the
+                # full EXIF dump (if any) goes through keyword matching.
+                for k in ("DateTimeOriginal", "DateTime", "Make", "Model"):
+                    if k in exif:
+                        lines.append(f"{k}: {exif[k]}")
+            if rec.get("indexing"):
+                lines.append(f"note: {rec['indexing']}")
         else:
             lines.append(f"type: {rtype}")
         return lines

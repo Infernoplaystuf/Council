@@ -41,13 +41,19 @@ try:
     import model_catalog as _mc
 
     def _spec_to_legacy(spec) -> dict:
+        """Convert a model_catalog.ModelSpec into the dict shape the
+        wizard UI expects. Emits the ``vendor`` + ``vram`` fields that
+        the in-repo ship-readiness pass added so any UI consumer of
+        those keys keeps working."""
         return {
-            "name":  spec.name,
-            "size":  f"~{spec.size_gb:.1f} GB",
-            "ctx":   f"{spec.context_k}K context",
-            "url":   f"https://huggingface.co/{spec.hf_repo}",
-            "blurb": f"{spec.org}. {spec.blurb}",
-            "spec":  spec,
+            "name":   spec.name,
+            "vendor": spec.org,
+            "size":   f"~{spec.size_gb:.1f} GB",
+            "vram":   int(round(spec.vram_gb_q4)),
+            "ctx":    f"{spec.context_k}K context",
+            "url":    f"https://huggingface.co/{spec.hf_repo}",
+            "blurb":  f"{spec.org}. {spec.blurb}",
+            "spec":   spec,
         }
 
     RECOMMENDED_MODELS = [_spec_to_legacy(s) for s in _mc.MODELS]
@@ -56,14 +62,61 @@ except Exception as _exc:
     # Hard fallback so the wizard still runs if model_catalog ever errors.
     RECOMMENDED_MODELS = [
         {
-            "name":  "IBM Granite 3.1 8B Instruct (Q4_K_M)",
-            "size":  "~5 GB",
-            "ctx":   "128K context",
-            "url":   "https://huggingface.co/ibm-granite/granite-3.1-8b-instruct-GGUF",
-            "blurb": "IBM. Solid baseline; conservative refusal behaviour.",
+            "name":   "IBM Granite 3.1 8B Instruct (Q4_K_M)",
+            "vendor": "IBM",
+            "size":   "~5 GB",
+            "vram":   8,
+            "ctx":    "128K context",
+            "url":    "https://huggingface.co/ibm-granite/granite-3.1-8b-instruct-GGUF",
+            "blurb":  "IBM. Solid baseline; conservative refusal behaviour.",
         },
     ]
     DEFAULT_MODEL_ID = "granite-3.1-8b-q4"
+
+
+# ============================================================
+# Vision-capable models — same US-only policy, requires a second
+# .gguf file (the multimodal projector / "mmproj") alongside the
+# main weights. The user points COUNCIL_GGUF_PATH at the LLM and
+# COUNCIL_GGUF_CLIP_PATH at the mmproj. Curated separately because
+# vision specs carry an extra field (mmproj) that model_catalog
+# doesn't track yet.
+# ============================================================
+
+RECOMMENDED_VISION_MODELS = [
+    {
+        "name":    "Llama 3.2 11B Vision Instruct (Q4_K_M)",
+        "vendor":  "Meta",
+        "size":    "~8 GB + ~1 GB mmproj",
+        "vram":    12,
+        "url":     "https://huggingface.co/bartowski/Llama-3.2-11B-Vision-Instruct-GGUF",
+        "mmproj":  "Download the mmproj-llama-3.2-11b-vision-f16.gguf file"
+                   " from the same repo and set COUNCIL_GGUF_CLIP_PATH",
+        "blurb":   "Meta. Strongest US-made vision model that fits on a "
+                   "16 GB GPU. Lets the Council reason about images, "
+                   "charts, scanned documents.",
+    },
+    {
+        "name":    "Phi-4 Multimodal (Q4_K_M)",
+        "vendor":  "Microsoft",
+        "size":    "~9 GB + projector",
+        "vram":    14,
+        "url":     "https://huggingface.co/microsoft/phi-4-multimodal-instruct",
+        "mmproj":  "Microsoft ships the projector alongside the weights",
+        "blurb":   "Microsoft. Vision + speech-aware. Use when you want "
+                   "audio file analysis as well as images.",
+    },
+    {
+        "name":    "Gemma 3 12B Instruct (Q4_K_M)",
+        "vendor":  "Google",
+        "size":    "~7 GB + ~0.5 GB mmproj",
+        "vram":    10,
+        "url":     "https://huggingface.co/bartowski/gemma-3-12b-it-GGUF",
+        "mmproj":  "Download the mmproj-gemma-3-12b-it-f16.gguf file",
+        "blurb":   "Google. Compact vision model. Solid alternative to "
+                   "Llama 3.2 Vision on cards with 10-12 GB VRAM.",
+    },
+]
 
 
 # ============================================================
@@ -79,6 +132,44 @@ def _backend_settings_path(vault_dir: Path) -> Path:
     return vault_dir / _BACKEND_SETTINGS_FILENAME
 
 
+def _load_backend_settings(vault_dir: Path) -> dict:
+    """Read the entire backend settings dict, or return {} on any failure.
+    Internal helper — callers use the typed accessors below."""
+    p = _backend_settings_path(vault_dir)
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _merge_backend_settings(vault_dir: Path, **updates: str) -> None:
+    """Merge `updates` into the existing backend settings JSON without
+    blowing away other keys. Atomic-style: read, mutate, write.
+
+    Previously save_gguf_path() overwrote the entire file with
+    `{"gguf_path": ...}` — that destroyed any sibling key like
+    `clip_path`. The merge keeps every key the wizard / engine may have
+    written and only touches the ones the caller is updating.
+    """
+    data = _load_backend_settings(vault_dir)
+    for k, v in updates.items():
+        if v is None or v == "":
+            # Setting to empty/None means CLEAR the key entirely.
+            data.pop(k, None)
+        else:
+            data[k] = v
+    try:
+        _backend_settings_path(vault_dir).write_text(
+            json.dumps(data, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
 def load_gguf_path(vault_dir: Path) -> str:
     """Return the persisted GGUF model path, or empty string if none.
 
@@ -88,14 +179,7 @@ def load_gguf_path(vault_dir: Path) -> str:
     env = _os.environ.get("COUNCIL_GGUF_PATH", "").strip()
     if env:
         return env
-    p = _backend_settings_path(vault_dir)
-    if not p.exists():
-        return ""
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return ""
-    return str(data.get("gguf_path", "")).strip()
+    return str(_load_backend_settings(vault_dir).get("gguf_path", "")).strip()
 
 
 def save_gguf_path(vault_dir: Path, path: str) -> None:
@@ -103,19 +187,62 @@ def save_gguf_path(vault_dir: Path, path: str) -> None:
 
     Also sets COUNCIL_GGUF_PATH in os.environ for the current process so
     the wizard's choice is live immediately — no app restart needed.
+    Preserves any sibling keys (e.g. clip_path) already in the file.
     """
-    try:
-        _backend_settings_path(vault_dir).write_text(
-            json.dumps({"gguf_path": path}, indent=2),
-            encoding="utf-8",
-        )
+    _merge_backend_settings(vault_dir, gguf_path=path)
+    if path:
         _os.environ["COUNCIL_GGUF_PATH"] = path
-    except Exception:
-        pass
+    else:
+        _os.environ.pop("COUNCIL_GGUF_PATH", None)
+
+
+def load_clip_path(vault_dir: Path) -> str:
+    """Return the persisted vision mmproj (CLIP) path, or empty string.
+
+    Same precedence as load_gguf_path: env var COUNCIL_GGUF_CLIP_PATH
+    wins, then the persisted backend_settings.json key. The engine's
+    _get_gguf_model checks the env var directly, so the wizard
+    populates it on save for live effect within the same process.
+    """
+    env = _os.environ.get("COUNCIL_GGUF_CLIP_PATH", "").strip()
+    if env:
+        return env
+    return str(_load_backend_settings(vault_dir).get("clip_path", "")).strip()
+
+
+def save_clip_path(vault_dir: Path, path: str) -> None:
+    """Persist the vision mmproj path. Empty string clears it (text-only
+    mode after a user had picked vision in a previous run).
+    """
+    _merge_backend_settings(vault_dir, clip_path=path)
+    if path:
+        _os.environ["COUNCIL_GGUF_CLIP_PATH"] = path
+    else:
+        _os.environ.pop("COUNCIL_GGUF_CLIP_PATH", None)
+
+
+def clip_file_status(path: str) -> tuple:
+    """Inspect a candidate mmproj .gguf path. Same shape as
+    gguf_file_status: (ok: bool, message: str). The validation is the
+    SAME — an mmproj IS a GGUF file (just a smaller one with vision
+    encoder weights rather than language-model weights) — so the
+    magic-byte check applies unchanged. We keep a separate name for
+    documentation clarity at call sites in the wizard.
+    """
+    return gguf_file_status(path)
 
 
 def gguf_file_status(path: str) -> tuple:
-    """Inspect a candidate .gguf path. Returns (ok: bool, message: str)."""
+    """Inspect a candidate .gguf path. Returns (ok: bool, message: str).
+
+    Beyond the extension check, we read the first 4 bytes and confirm
+    they match the GGUF magic. This catches the most common "I downloaded
+    it but it doesn't work" failure mode: a huggingface-cli download
+    that was interrupted mid-stream and left a partial file (or an HTML
+    error page) on disk with the .gguf extension. Without the magic
+    check the user clicks Finish, the app tries to load the file, and
+    llama-cpp crashes deep in C with no actionable error.
+    """
     if not path:
         return False, "(no model selected)"
     p = Path(path)
@@ -125,6 +252,20 @@ def gguf_file_status(path: str) -> tuple:
         return False, f"✗ Not a file: {p}"
     if p.suffix.lower() != ".gguf":
         return False, f"⚠ Not a .gguf extension: {p.name}"
+    # Magic-byte check
+    try:
+        if p.stat().st_size < 1024:
+            return False, (f"⚠ {p.name} is suspiciously small "
+                            f"({p.stat().st_size} bytes) — likely a failed "
+                            "download. Re-fetch the file.")
+        with open(p, "rb") as fh:
+            magic = fh.read(4)
+        if magic != b"GGUF":
+            return False, (f"⚠ {p.name} doesn't start with the GGUF magic "
+                            f"bytes (got {magic!r}). Likely a corrupted or "
+                            "partial download — re-fetch the file.")
+    except Exception as exc:
+        return False, f"⚠ Could not read {p.name}: {exc!r}"
     try:
         size_gb = p.stat().st_size / (1024 ** 3)
     except Exception:
@@ -150,20 +291,30 @@ class OnboardingWizard(tk.Toplevel):
         self.completed  = False
         self.skipped    = False
 
+        # Cached probe results — populated lazily in the hardware /
+        # previous-install steps. Stash on self so the model + plan
+        # steps can read them without re-probing.
+        self._hw_info: Optional[dict] = None
+        self._prev_info: Optional[dict] = None
+
         self.title(f"Welcome to {branding.PRODUCT_NAME}")
         try:
             branding.apply_window_icon(self)
         except Exception:
             pass
-        self.geometry("640x520")
+        self.geometry("680x600")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
 
-        # Step list — dropped "ollama" step (the app is GGUF-only;
-        # no daemon to detect or service to install). The model step
-        # now does GGUF file selection directly.
-        self._steps = ["welcome", "disk", "model", "ready"]
+        # Step list. New hardware + previous-install + plan steps land
+        # between welcome and the disk-space check so the wizard can:
+        #   1. Probe the user's CPU/RAM/GPU once.
+        #   2. Look for an existing conda env / vault / GGUF on disk.
+        #   3. Show a recommended install plan with one-click reuse.
+        # The model + ready steps then preselect the recommendation.
+        self._steps = ["welcome", "hardware", "previous_install",
+                       "plan", "disk", "model", "ready"]
         self._step_idx = 0
 
         self._build_ui()
@@ -245,15 +396,194 @@ class OnboardingWizard(tk.Toplevel):
         self._label(branding.PRODUCT_TAGLINE, font=("Segoe UI", 12), pady=(0, 14))
         self._label(
             "Quick walkthrough — about two minutes. We'll:\n"
-            "   • Confirm there's enough disk space for an AI model\n"
-            "   • Point the app at a GGUF model file (we'll suggest a few)\n\n"
-            "Everything runs locally; nothing leaves this machine.\n"
-            "The model never sends your data to the cloud.\n\n"
+            "   • Detect your hardware and recommend a model size\n"
+            "   • Look for a previous install we can reuse\n"
+            "   • Confirm there's enough disk space\n"
+            "   • Point the app at a GGUF model file\n\n"
+            "All recommended models are from US-based providers "
+            "(Meta, Microsoft, IBM, Google). Everything runs locally;\n"
+            "nothing leaves this machine.\n\n"
             "Skip if you'd rather configure things by hand "
             f"(set COUNCIL_GGUF_PATH=<path-to-.gguf> in your environment)."
         )
 
-    # Step 2: disk space warning
+    # Step 2: hardware scan — runs the detector, summarises CPU/RAM/GPU.
+    def _render_hardware(self):
+        self._heading("Hardware scan")
+        if self._hw_info is None:
+            self._label("Probing your machine…", pady=(0, 8))
+            self.update_idletasks()
+            try:
+                import hardware_detect as _hwd
+                self._hw_info = _hwd.detect()
+            except Exception as exc:
+                self._hw_info = {"error": repr(exc)}
+        info = self._hw_info or {}
+        if "error" in info:
+            self._label("Hardware detection failed: " + str(info["error"]),
+                         fg=self._theme().get("warning"))
+            self._label(
+                "The wizard can still proceed; you'll just have to pick a "
+                "model size yourself in the next step."
+            )
+            return
+
+        # Pretty-print the key fields.
+        def _fmt(label, val):
+            return f"   • {label:<14} {val}"
+
+        gpu_line = info.get("gpu_name") or "(none — CPU-only inference)"
+        vram = info.get("vram_gb")
+        if vram:
+            gpu_line += f"   ·  {vram:.1f} GB VRAM"
+        ram = info.get("ram_gb")
+        ram_line = f"{ram:.1f} GB" if ram else "(unknown)"
+
+        avx_warn = ""
+        if info.get("has_avx2") is False and info.get("os") in ("linux", "wsl"):
+            avx_warn = ("\n⚠ This CPU lacks AVX2 — prebuilt llama-cpp wheels "
+                        "will crash. See installs.txt 'Illegal instruction'.")
+
+        self._label(
+            _fmt("OS:", f"{info.get('os','?')} — {info.get('os_version','?')}") + "\n"
+            + _fmt("CPU:", str(info.get("cpu_brand") or "?")) + "\n"
+            + _fmt("Cores:", str(info.get("cpu_cores") or "?")) + "\n"
+            + _fmt("RAM:", ram_line) + "\n"
+            + _fmt("GPU:", gpu_line) + "\n"
+            + _fmt("CUDA max:", str(info.get("cuda_max") or "—"))
+            + avx_warn,
+            font=("Consolas", 10),
+        )
+
+    # Step 3: previous-install detection — looks for reusable artifacts.
+    def _render_previous_install(self):
+        self._heading("Previous install check")
+        if self._prev_info is None:
+            self._label("Scanning for a previous install…", pady=(0, 8))
+            self.update_idletasks()
+            try:
+                import previous_install_detect as _pid
+                app_dir = Path(__file__).resolve().parent
+                self._prev_info = _pid.detect(app_dir, self.vault_dir)
+            except Exception as exc:
+                self._prev_info = {"error": repr(exc)}
+        info = self._prev_info or {}
+        if "error" in info:
+            self._label("Detection failed: " + str(info["error"]),
+                         fg=self._theme().get("warning"))
+            return
+
+        # Conda env
+        env = info.get("conda_env", {}) or {}
+        if env.get("present"):
+            self._label(
+                f"   ✓ conda env 'council' found at\n     {env.get('path') or '(unknown path)'}\n"
+                f"     (managed by {env.get('tool') or 'unknown tool'})",
+                fg=self._theme().get("success"),
+            )
+        else:
+            self._label(
+                "   ○ No 'council' conda env found.\n"
+                "     setup-wsl.sh or installs.txt will create one for you.",
+            )
+
+        # Vault
+        vlt = info.get("vault", {}) or {}
+        if vlt.get("present"):
+            files = vlt.get("data_in_files", 0)
+            settings = vlt.get("has_settings")
+            tag = "+ settings" if settings else ""
+            self._label(
+                f"   ✓ Vault exists at {vlt.get('path')}\n"
+                f"     {files} file(s) in data_in/ {tag}",
+                fg=self._theme().get("success") if files else None,
+            )
+        else:
+            self._label("   ○ No existing vault — one will be created.")
+
+        # GGUF models
+        models = info.get("gguf_models") or []
+        if models:
+            valid = [m for m in models if m.get("valid")]
+            self._label(
+                f"   ✓ Found {len(models)} .gguf file(s) "
+                f"({len(valid)} valid):",
+                fg=self._theme().get("success") if valid else
+                    self._theme().get("warning"),
+            )
+            for m in models[:5]:
+                ok = "✓" if m.get("valid") else "⚠"
+                self._label(
+                    f"        {ok} {m['name']}  ({m.get('size_gb','?')} GB)",
+                    font=("Consolas", 9), pady=2,
+                )
+            if len(models) > 5:
+                self._label(f"        ... ({len(models)-5} more)",
+                             font=("Consolas", 9), pady=2)
+        else:
+            self._label(
+                "   ○ No GGUF models found in ~/models, ~/Downloads, or "
+                "~/.cache/huggingface.\n     You'll pick one in the next step."
+            )
+
+        prev = info.get("previous_model")
+        if prev:
+            self._label(
+                f"\n   ↻ Previous session used: {prev}\n"
+                "   We'll preselect this on the model step.",
+                fg=self._theme().get("success"),
+            )
+
+    # Step 4: install plan — show hardware-aware recommendation.
+    def _render_plan(self):
+        self._heading("Recommended setup")
+        info = self._hw_info or {}
+        rec = info.get("recommended", {}) or {}
+        cuda_tier = rec.get("cuda_tier", "cpu")
+        model_pick = rec.get("model_pick", "(no recommendation)")
+        n_ctx_max = rec.get("n_ctx_max", 4096)
+
+        gpu_name = info.get("gpu_name") or "no GPU"
+        vram = info.get("vram_gb")
+        vram_str = f"{vram:.1f} GB VRAM" if vram else "CPU only"
+
+        if cuda_tier == "cpu":
+            install_blurb = (
+                "   • Install path: SECTION A in installs.txt (CPU only)\n"
+                "   • Or on WSL: ./setup-wsl.sh — it auto-detects no GPU\n"
+                "     and installs the CPU torch wheel."
+            )
+        else:
+            install_blurb = (
+                f"   • Install path: SECTION {'D' if cuda_tier=='cu128' else 'C' if cuda_tier=='cu124' else 'B'} "
+                f"in installs.txt — CUDA wheel tier: {cuda_tier}\n"
+                f"   • Or on WSL: ./setup-wsl.sh — it auto-detects your GPU\n"
+                f"     and picks the same wheel tier."
+            )
+
+        self._label(
+            f"For {gpu_name} ({vram_str}) we recommend:\n\n"
+            f"   • Model:       {model_pick}\n"
+            f"   • Max n_ctx:   {n_ctx_max:,} tokens\n"
+            f"   • CUDA tier:   {cuda_tier}\n\n"
+            f"{install_blurb}\n\n"
+            "You can still pick any model in the next step — this is\n"
+            "just the recommendation based on what fits comfortably.",
+            font=("Segoe UI", 11),
+        )
+
+        # If a previous model on disk is valid, offer one-click reuse.
+        prev = (self._prev_info or {}).get("previous_model")
+        if prev and Path(prev).exists():
+            tk.Label(
+                self.body,
+                text=f"\n↻ Reuse previous model: {Path(prev).name}",
+                bg=self._theme()["bg"], fg=self._theme().get("success"),
+                font=("Segoe UI", 10, "italic"), wraplength=580, justify="left",
+                anchor="w",
+            ).pack(fill="x", pady=(8, 0))
+
+    # Step 5: disk space warning
     def _render_disk(self):
         self._heading("Disk space")
         # Try to detect free space
@@ -291,15 +621,34 @@ class OnboardingWizard(tk.Toplevel):
         self._heading("Choose a GGUF model")
 
         self._label(
-            "The app loads models via .gguf files (the standard local-LLM "
-            "format from the llama.cpp project). You can:\n"
+            "All recommended models are from US-based providers (Meta, "
+            "Microsoft, IBM, Google). The app loads them via .gguf files "
+            "(the standard local-LLM format). You can:\n"
             "   • Pick a .gguf file already on this machine\n"
             "   • Download a recommended one from Hugging Face\n",
             pady=(0, 12),
         )
 
-        # Current path status
-        self._gguf_path_var = tk.StringVar(value=load_gguf_path(self.vault_dir))
+        # Preselect — order of preference:
+        #   1. Whatever the user has already configured (env var or
+        #      backend_settings.json).
+        #   2. The previous-install detector's "last used" path, if it
+        #      still exists.
+        #   3. The first GGUF file the detector found in standard
+        #      locations, if it's valid.
+        # Otherwise the field stays empty and the user picks via Browse.
+        current = load_gguf_path(self.vault_dir)
+        if not current:
+            prev = (self._prev_info or {}).get("previous_model")
+            if prev and Path(prev).exists():
+                current = prev
+        if not current:
+            for m in (self._prev_info or {}).get("gguf_models", []):
+                if m.get("valid"):
+                    current = m["path"]
+                    break
+
+        self._gguf_path_var = tk.StringVar(value=current)
         self._gguf_status_var = tk.StringVar(value="")
         self._refresh_gguf_status()
 
@@ -321,18 +670,105 @@ class OnboardingWizard(tk.Toplevel):
         ttk.Button(btn_frame, text="🔄 Re-check",
                    command=self._refresh_gguf_status).pack(side="left", padx=8)
 
-        # Recommended models list (US-origin catalog).
+        # Recommended models list — toggle between text-only and
+        # vision-capable. Vision adds image understanding (the user
+        # can drop screenshots, scans, charts into the vault and the
+        # model can read them) but requires a SECOND .gguf file (the
+        # multimodal projector — mmproj) and twice the disk/VRAM.
         sep = tk.Frame(self.body, bg=self._theme()["muted_fg"], height=1)
         sep.pack(fill="x", pady=12)
-        self._label(
-            f"Recommended US-origin models ({len(RECOMMENDED_MODELS)}) — click "
-            "Open to visit the Hugging Face page, or Auto-download to pull "
-            "the .gguf straight into ./models/ and select it automatically.",
-            font=("Segoe UI", 10), fg=self._theme()["muted_fg"],
-            pady=(0, 8))
 
-        # Scrollable container so the list grows beyond the wizard's
-        # fixed height without spilling off-screen.
+        # Text-only vs vision toggle. We preselect based on whatever
+        # we last persisted — a user who picked vision and downloaded
+        # an mmproj last time gets the toggle ON automatically on
+        # re-run instead of having to opt in again.
+        toggle_row = tk.Frame(self.body, bg=self._theme()["bg"])
+        toggle_row.pack(fill="x", pady=(0, 6))
+        if not hasattr(self, "_vision_mode_var"):
+            init = bool(load_clip_path(self.vault_dir))
+            self._vision_mode_var = tk.BooleanVar(value=init)
+        tk.Label(toggle_row, text="Show vision-capable models",
+                 font=("Segoe UI", 10),
+                 bg=self._theme()["bg"], fg=self._theme()["fg"]
+                 ).pack(side="left", padx=(0, 8))
+        ttk.Checkbutton(
+            toggle_row, variable=self._vision_mode_var,
+            command=self._render_step,   # re-render to swap the list
+        ).pack(side="left")
+        # Recommendation badge based on detected VRAM
+        vram = ((self._hw_info or {}).get("vram_gb") or 0)
+        if vram >= 12:
+            badge = "✓ this machine can run vision models"
+            badge_fg = self._theme().get("success")
+        elif vram >= 8:
+            badge = "○ vision works on smaller cards but trims n_ctx"
+            badge_fg = self._theme().get("muted_fg")
+        else:
+            badge = "⚠ vision models need ~10 GB VRAM; you have less"
+            badge_fg = self._theme().get("warning")
+        tk.Label(toggle_row, text=badge, font=("Segoe UI", 9),
+                 bg=self._theme()["bg"], fg=badge_fg
+                 ).pack(side="left", padx=(12, 0))
+
+        showing_vision = bool(self._vision_mode_var.get())
+        models = RECOMMENDED_VISION_MODELS if showing_vision else RECOMMENDED_MODELS
+
+        if showing_vision:
+            self._label(
+                "Vision models — drop image / scan / chart files into "
+                "the vault and the model can read them. Each row "
+                "links to a HF page where you'll download BOTH the "
+                "main weights AND the mmproj file. Use the two pickers "
+                "below (one for the main .gguf, one for the mmproj).",
+                font=("Segoe UI", 10), fg=self._theme()["muted_fg"],
+                pady=(0, 8))
+
+            # Second file picker — for the multimodal projector. Lives
+            # right below the model pickers so the user sees both
+            # paths together and can browse both without leaving the
+            # wizard. Hidden in text-only mode.
+            if not hasattr(self, "_clip_path_var"):
+                self._clip_path_var   = tk.StringVar(value=load_clip_path(self.vault_dir))
+                self._clip_status_var = tk.StringVar(value="")
+            self._refresh_clip_status()
+
+            clip_frame = tk.Frame(self.body, bg=self._theme()["bg"])
+            clip_frame.pack(fill="x", pady=(0, 4))
+            tk.Label(clip_frame, text="mmproj file:",
+                     font=("Segoe UI", 10),
+                     bg=self._theme()["bg"], fg=self._theme()["muted_fg"]
+                     ).pack(side="left", padx=(0, 6))
+            tk.Label(clip_frame, textvariable=self._clip_status_var,
+                     font=("Consolas", 10),
+                     bg=self._theme()["bg"], fg=self._theme()["fg"]
+                     ).pack(side="left", fill="x", expand=True)
+
+            clip_btn_frame = tk.Frame(self.body, bg=self._theme()["bg"])
+            clip_btn_frame.pack(fill="x", pady=(2, 8))
+            ttk.Button(clip_btn_frame,
+                        text="📁 Browse for mmproj .gguf…",
+                        command=self._browse_clip).pack(side="left")
+            ttk.Button(clip_btn_frame, text="🗑 Clear (text-only)",
+                        command=self._clear_clip).pack(side="left", padx=8)
+        else:
+            # User turned the vision toggle OFF — clear any previously
+            # persisted clip path so the next launch doesn't try to
+            # load vision against a non-vision GGUF.
+            try:
+                if load_clip_path(self.vault_dir):
+                    save_clip_path(self.vault_dir, "")
+            except Exception:
+                pass
+            self._label(
+                "Recommended models — click to open the Hugging Face "
+                "download page in your browser. After downloading, come "
+                "back and use Browse… to select the .gguf file.",
+                font=("Segoe UI", 10), fg=self._theme()["muted_fg"],
+                pady=(0, 8))
+
+        # Scrollable container so the catalog grows beyond the wizard's
+        # fixed height without spilling off-screen — matters for the
+        # 9-row text catalog (and any growth in the vision list).
         list_wrap = tk.Frame(self.body, bg=self._theme()["bg"])
         list_wrap.pack(fill="both", expand=True)
         canvas = tk.Canvas(list_wrap, bg=self._theme()["bg"],
@@ -347,12 +783,11 @@ class OnboardingWizard(tk.Toplevel):
         def _on_resize(_e=None):
             canvas.configure(scrollregion=canvas.bbox("all"))
         inner.bind("<Configure>", _on_resize)
-        # Mouse-wheel scroll inside the list
         def _on_mwheel(e):
             canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
         canvas.bind_all("<MouseWheel>", _on_mwheel)
 
-        for m in RECOMMENDED_MODELS:
+        for m in models:
             row = tk.Frame(inner, bg=self._theme()["bg"])
             row.pack(fill="x", pady=3, padx=(0, 8))
             name_label = f"  {m['name']}"
@@ -363,11 +798,13 @@ class OnboardingWizard(tk.Toplevel):
                      font=("Segoe UI", 10, "bold"),
                      bg=self._theme()["bg"], fg=self._theme()["fg"],
                      ).pack(side="left")
-            tk.Label(row, text=f"  ·  {m['size']}  ·  {m['ctx']}",
+            tk.Label(row,
+                     text=(f"  ·  {m.get('vendor','?')}  ·  {m['size']}"
+                           + (f"  ·  {m.get('ctx','')}" if m.get('ctx') else "")),
                      font=("Segoe UI", 9),
                      bg=self._theme()["bg"], fg=self._theme()["muted_fg"]
                      ).pack(side="left")
-            # Right-aligned buttons: Open page, Auto-download
+            # Right-aligned buttons: Open page, Auto-download (catalog-only)
             ttk.Button(row, text="🌐 Open",
                        command=lambda u=m["url"]: self._open_url(u)
                        ).pack(side="right", padx=(4, 0))
@@ -486,6 +923,71 @@ class OnboardingWizard(tk.Toplevel):
             self._gguf_status_var.set(msg)
         self._gguf_ok = ok
 
+    def _browse_clip(self):
+        """File picker for the multimodal projector (mmproj) .gguf. Same
+        pattern as _browse_gguf — pick file, validate magic, persist
+        the path through save_clip_path so the engine picks it up on
+        next inference call without needing an env-var export."""
+        start_dir = ""
+        cur = self._clip_path_var.get().strip()
+        if cur:
+            try:
+                start_dir = str(Path(cur).parent)
+            except Exception:
+                start_dir = ""
+        # Fall back to the main GGUF's folder — mmproj files almost
+        # always live alongside the weights they project for.
+        if not start_dir:
+            gguf_cur = self._gguf_path_var.get().strip()
+            if gguf_cur:
+                try:
+                    start_dir = str(Path(gguf_cur).parent)
+                except Exception:
+                    start_dir = ""
+        path = filedialog.askopenfilename(
+            parent=self,
+            title="Select mmproj (.gguf) file for vision",
+            initialdir=start_dir or None,
+            filetypes=[("GGUF projector files", "*.gguf"),
+                        ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self._clip_path_var.set(path)
+        save_clip_path(self.vault_dir, path)
+        try:
+            import council_engine as _ce
+            _ce.refresh_backend_config()
+        except Exception:
+            pass
+        self._refresh_clip_status()
+
+    def _clear_clip(self):
+        """User decided to go back to text-only — wipe the persisted
+        clip path AND the env var so the next model load skips the
+        Llava chat-handler path entirely."""
+        self._clip_path_var.set("")
+        save_clip_path(self.vault_dir, "")
+        try:
+            import council_engine as _ce
+            _ce.refresh_backend_config()
+        except Exception:
+            pass
+        self._refresh_clip_status()
+
+    def _refresh_clip_status(self):
+        if not hasattr(self, "_clip_path_var"):
+            return
+        path = self._clip_path_var.get().strip()
+        if not path:
+            self._clip_status_var.set("(none — text-only)")
+            self._clip_ok = True   # empty is a valid choice
+            return
+        ok, msg = clip_file_status(path)
+        if hasattr(self, "_clip_status_var"):
+            self._clip_status_var.set(msg)
+        self._clip_ok = ok
+
     # Step 4: ready
     def _render_ready(self):
         self._heading("Ready.")
@@ -495,14 +997,34 @@ class OnboardingWizard(tk.Toplevel):
         ok, msg = gguf_file_status(path)
         if ok:
             self._label(f"GGUF model:  {msg}", font=("Consolas", 10),
-                        fg=self._theme()["success"], pady=(0, 12))
+                        fg=self._theme()["success"], pady=(0, 6))
         else:
             self._label(
                 "No GGUF model selected. The app will start, but you'll "
                 "need to set COUNCIL_GGUF_PATH or use the Browse… button "
                 "on the Council tab before any query can be answered.",
-                fg=self._theme()["warning"], pady=(0, 12),
+                fg=self._theme()["warning"], pady=(0, 6),
             )
+        # Show the mmproj path too when the user opted into vision —
+        # full disclosure of both files we'll load on next launch so
+        # nothing about the configuration is hidden.
+        clip = load_clip_path(self.vault_dir)
+        if clip:
+            cok, cmsg = clip_file_status(clip)
+            if cok:
+                self._label(f"mmproj:      {cmsg}  (vision enabled)",
+                            font=("Consolas", 10),
+                            fg=self._theme()["success"], pady=(0, 12))
+            else:
+                self._label(
+                    f"mmproj:      {cmsg}",
+                    font=("Consolas", 10),
+                    fg=self._theme()["warning"], pady=(0, 12),
+                )
+        else:
+            self._label("Vision:      off (text-only mode)",
+                        font=("Consolas", 10),
+                        fg=self._theme()["muted_fg"], pady=(0, 12))
 
         self._label(
             "Three ways to start poking at it:\n\n"
