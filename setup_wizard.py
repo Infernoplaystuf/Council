@@ -556,13 +556,28 @@ def step8_tesseract(args) -> None:
 
 def step9_persist(root: Path, spec, model_path: Optional[Path]) -> None:
     banner(9, TOTAL_STEPS, "Saving your settings")
-    # Default to ~/.council/vault (matches council_gui_engine.VAULT_DIR).
-    # COUNCIL_VAULT_ROOT override is respected at runtime.
-    vault = Path.home() / ".council" / "vault"
+    # Honour COUNCIL_VAULT_ROOT for users who keep their vault somewhere
+    # other than ~/.council/vault (custom drive, OneDrive sync, etc.).
+    # Without this the wizard wrote settings into the default home
+    # location while the GUI read from the user's actual vault — the
+    # GUI then saw no persisted model and the user had to re-Browse.
+    env_vault = os.environ.get("COUNCIL_VAULT_ROOT", "").strip()
+    vault = (Path(env_vault).expanduser().resolve()
+             if env_vault else (Path.home() / ".council" / "vault"))
     vault.mkdir(parents=True, exist_ok=True)
     cfg_path = vault / "backend_settings.json"
     if model_path:
-        cfg = {"gguf_path": str(model_path)}
+        # MERGE with existing keys (clip_path from a prior vision run,
+        # any future siblings) instead of clobbering the whole file.
+        cfg: dict = {}
+        if cfg_path.exists():
+            try:
+                cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+                if not isinstance(cfg, dict):
+                    cfg = {}
+            except Exception:
+                cfg = {}
+        cfg["gguf_path"] = str(model_path)
         if spec is not None:
             cfg["model_id"] = spec.id
             cfg["model_org"] = spec.org

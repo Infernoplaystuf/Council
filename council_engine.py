@@ -896,8 +896,14 @@ def _get_gguf_model():
         # Fallback — when the env var isn't set, check the persisted
         # wizard choice in vault/backend_settings.json. Same
         # precedence as onboarding.load_clip_path uses.
+        #
+        # Honour COUNCIL_VAULT_ROOT (the env var that every other
+        # module respects — see council_memory, agent_logs, the GUI's
+        # own VAULT_DIR assignment). The previous COUNCIL_VAULT_DIR
+        # spelling never matched anything users actually set, so
+        # custom-vault users always hit the ~/.council/vault fallback.
         try:
-            vault_root = Path(os.environ.get("COUNCIL_VAULT_DIR")
+            vault_root = Path(os.environ.get("COUNCIL_VAULT_ROOT")
                               or (Path.home() / ".council" / "vault"))
             settings = vault_root / "backend_settings.json"
             if settings.is_file():

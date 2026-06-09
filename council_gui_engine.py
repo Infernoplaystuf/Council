@@ -4633,7 +4633,18 @@ class CouncilConsole(tk.Tk):
 
     def _load_backend_settings(self):
         """Read persisted GGUF model path from vault/backend_settings.json and
-        apply to env so council_engine picks it up at import."""
+        apply to env so council_engine picks it up at import.
+
+        Env-var precedence: if COUNCIL_GGUF_PATH is ALREADY set in the
+        environment (typically by run-windows.bat / run-linux.sh / a
+        shell export), we DO NOT clobber it with the persisted JSON.
+        This matches the documented precedence in
+        ``onboarding.load_gguf_path`` (env wins over JSON). Previously
+        the JSON unconditionally won, which broke users who moved their
+        model file and overrode the launch path via the env var — the
+        stale JSON path silently took effect and Llama() failed to
+        find the model.
+        """
         p = self._backend_settings_path()
         if not p.exists():
             return {}
@@ -4642,17 +4653,35 @@ class CouncilConsole(tk.Tk):
             data = _j.loads(p.read_text(encoding="utf-8"))
         except Exception:
             return {}
-        if data.get("gguf_path"):
+        if data.get("gguf_path") and not os.environ.get("COUNCIL_GGUF_PATH", "").strip():
             os.environ["COUNCIL_GGUF_PATH"] = str(data["gguf_path"])
         return data
 
     def _save_backend_settings(self):
+        """Persist the user's GGUF path. MERGES with the existing file so
+        the wizard's informational keys (model_id, model_org) survive a
+        Browse-driven model switch. Vision-specific keys (clip_path)
+        are EXPLICITLY cleared because the Browse button selects a
+        single text-only .gguf — if the user wants vision, they go
+        through the wizard which knows to pair a model with an mmproj.
+        Leaving a stale clip_path would trigger the vision-attach
+        retry warning on every subsequent load.
+        """
         import json as _j
-        data = {"gguf_path": self._gguf_path_var.get()}
+        path = self._backend_settings_path()
+        existing: dict = {}
+        if path.exists():
+            try:
+                existing = _j.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(existing, dict):
+                    existing = {}
+            except Exception:
+                existing = {}
+        existing["gguf_path"] = self._gguf_path_var.get()
+        # Clear vision state — Browse is text-only by contract.
+        existing.pop("clip_path", None)
         try:
-            self._backend_settings_path().write_text(
-                _j.dumps(data, indent=2), encoding="utf-8",
-            )
+            path.write_text(_j.dumps(existing, indent=2), encoding="utf-8")
         except Exception as _e:
             print(f"[backend strip] could not save settings: {_e}")
 
