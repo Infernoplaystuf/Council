@@ -209,7 +209,13 @@ def _safe_resolve(root: Path, target: str) -> Path:
 
 def _tool_read_local_file(args: Dict[str, Any],
                           policy: AgentPolicy) -> Dict[str, Any]:
-    path = str(args.get("path", "")).strip()
+    # Don't coerce non-strings to "None" / "123" — that produced
+    # confusing "file 'None' does not exist" errors for the model.
+    # Reject the call explicitly so the agent loop can re-plan.
+    raw = args.get("path", "")
+    if not isinstance(raw, str):
+        return {"error": f"'path' must be a string, got {type(raw).__name__}"}
+    path = raw.strip()
     full = _safe_resolve(policy.file_root, path)
     if not full.exists():
         return {"path": str(full), "error": "file does not exist"}

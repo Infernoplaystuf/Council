@@ -425,10 +425,19 @@ def step6_pick_model(py: Path, args) -> "Optional[object]":
     except Exception as e:
         print(bad(f"  model_catalog import failed: {e!r}"))
         return None
-    # Filter by VRAM if we know it
+    # Filter by VRAM if we know it. ALWAYS include the "tiny" role
+    # alongside "general" — the only model in the catalog that fits a
+    # 4 GB GPU (or runs comfortably on CPU) is llama-3.2-1b-q8, which
+    # has role="tiny". The previous strict role="general" filter showed
+    # zero models to anyone with a low-VRAM GPU, dead-ending the wizard
+    # at "Choose 1-0 or s".
     _, vram_gb, _ = detect_gpu()
     if vram_gb:
-        suitable = mc.for_vram(vram_gb, role="general")
+        suitable = sorted(
+            (m for m in mc.MODELS
+             if m.role in ("general", "tiny") and mc.fits(m, vram_gb)),
+            key=lambda m: (not m.is_default, -m.params_b),
+        )
         print(f"  Showing models that fit comfortably in {vram_gb} GB VRAM. "
               "Add --all to see everything.")
     else:
@@ -443,6 +452,16 @@ def step6_pick_model(py: Path, args) -> "Optional[object]":
             return None
         print(good(f"  preselected via --model: {chosen.id}"))
         return chosen
+
+    # If no model fits the detected VRAM budget, offer the full
+    # catalog with a warning rather than leaving the user at an
+    # impossible "Choose 1-0 or s" prompt.
+    if not suitable:
+        print(warn(
+            f"  No catalogued model fits a {vram_gb} GB budget "
+            "comfortably. Showing the full catalog — the smallest "
+            "option may still run if you accept slow CPU offload."))
+        suitable = [m for m in mc.MODELS if m.role in ("general", "tiny")]
 
     print()
     for i, m in enumerate(suitable, 1):

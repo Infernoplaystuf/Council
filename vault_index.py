@@ -1221,10 +1221,16 @@ def _parse_pdf(p: Path) -> Dict[str, Any]:
     """
     text = ""
     pages_read = 0
+    # Filename tokens are the baseline indexability layer — when
+    # text extraction fails (missing dep, encrypted file, image-only
+    # PDF) the file is still findable by name.
+    name_keywords = sorted(set(_tokenize(
+        p.stem.replace("-", " ").replace("_", " ")
+    )))[:60]
     try:
         from pypdf import PdfReader
     except Exception:
-        return {"type": "pdf", "sample_text": "", "keywords": [],
+        return {"type": "pdf", "sample_text": "", "keywords": name_keywords,
                 "note": "pypdf unavailable"}
     try:
         reader = PdfReader(str(p))
@@ -1242,7 +1248,9 @@ def _parse_pdf(p: Path) -> Dict[str, Any]:
         # Encrypted, malformed, etc. — return a stub so the filename
         # still indexes but content stays empty.
         text = ""
-    keywords = sorted(set(_tokenize(text)))[:300]
+    # Union extracted keywords with filename tokens so the file is
+    # findable by name even when text extraction yielded nothing.
+    keywords = sorted(set(_tokenize(text)) | set(name_keywords))[:300]
     return {
         "type": "pdf",
         "sample_text": text[:2500],
@@ -1253,17 +1261,20 @@ def _parse_pdf(p: Path) -> Dict[str, Any]:
 
 def _parse_docx(p: Path) -> Dict[str, Any]:
     """Index a .docx by pulling all paragraph text via python-docx."""
+    name_keywords = sorted(set(_tokenize(
+        p.stem.replace("-", " ").replace("_", " ")
+    )))[:60]
     try:
         from docx import Document
     except Exception:
-        return {"type": "docx", "sample_text": "", "keywords": [],
+        return {"type": "docx", "sample_text": "", "keywords": name_keywords,
                 "note": "python-docx unavailable"}
     try:
         doc = Document(str(p))
         text = "\n".join(par.text for par in doc.paragraphs if par.text)
     except Exception:
         text = ""
-    keywords = sorted(set(_tokenize(text)))[:300]
+    keywords = sorted(set(_tokenize(text)) | set(name_keywords))[:300]
     return {
         "type": "docx",
         "sample_text": text[:2500],
@@ -1440,11 +1451,14 @@ def _record_has_content(rec: Dict[str, Any]) -> bool:
     if rtype in ("sqlite", "duckdb"):
         return bool(rec.get("tables") or rec.get("keywords"))
 
-    # PDFs / DOCX — accept if any text was extracted; an encrypted /
-    # image-only PDF that yielded no text still surfaces via filename
-    # but is not "content-bearing" for boolean-tightness purposes.
+    # PDFs / DOCX — always accept. Filename tokens make the file
+    # findable even when text extraction failed (encrypted, image-only,
+    # or pypdf / python-docx not installed on this build). The earlier
+    # "must have keywords or sample_text" rule silently dropped every
+    # PDF/DOCX on bundles without the optional deps — users couldn't
+    # see their docs were even indexed.
     if rtype in ("pdf", "docx"):
-        return bool(rec.get("keywords")) or bool((rec.get("sample_text") or "").strip())
+        return True
 
     # Images — always content-bearing. Filename tokens alone are enough
     # to make sku-1001.png discoverable; EXIF + OCR (when available)
