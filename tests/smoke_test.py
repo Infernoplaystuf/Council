@@ -1119,6 +1119,103 @@ def test_db_audit_log_writes() -> None:
                rec["kind"] == "test" and rec["note"] == "hello")
 
 
+def test_failure_log_roundtrip() -> None:
+    """FailureLog appends structured records, normalises signatures so
+    the same root cause on different files buckets together, and
+    record_failure never raises."""
+    import agent_logs as _al
+    with tempfile.TemporaryDirectory() as td:
+        log = _al.FailureLog(Path(td) / "failures.jsonl")
+        log.append(kind="analyst.exec_error", subsystem="vault_analyst",
+                   message="KeyError: 'revenue' in C:\\Users\\u\\v\\data_in\\q1.csv",
+                   detail="Traceback ...")
+        log.append(kind="analyst.exec_error", subsystem="vault_analyst",
+                   message="KeyError: 'revenue' in C:\\Users\\u\\v\\data_in\\q2.csv")
+        recs = log.all()
+        _check("two failure records written", len(recs) == 2)
+        _check("record carries kind + subsystem + signature + ts",
+               {"kind", "subsystem", "signature", "ts"} <= set(recs[0]))
+        _check("paths scrubbed from signature",
+               "q1.csv" not in recs[0]["signature"])
+        _check("same root cause → same signature",
+               recs[0]["signature"] == recs[1]["signature"])
+        # Different kind → different signature
+        log.append(kind="model.load_error", subsystem="council_engine",
+                   message="KeyError: 'revenue'")
+        recs = log.all()
+        _check("kind anchors the bucket",
+               recs[2]["signature"] != recs[0]["signature"])
+
+    # record_failure must never raise, even when the vault root is
+    # unwritable — here we point it UNDER an existing file, so the
+    # parent-dir mkdir inside _write() fails.
+    import os as _os
+    prev = _os.environ.get("COUNCIL_VAULT_ROOT")
+    try:
+        with tempfile.TemporaryDirectory() as td2:
+            blocker = Path(td2) / "blocker.txt"
+            blocker.write_text("not a directory")
+            _os.environ["COUNCIL_VAULT_ROOT"] = str(blocker / "vault")
+            _al.record_failure("x", "y", "z")   # must not raise
+            _check("record_failure swallows unwritable vault root", True)
+    except Exception as exc:
+        _check("record_failure swallows unwritable vault root", False,
+               repr(exc))
+    finally:
+        if prev is None:
+            _os.environ.pop("COUNCIL_VAULT_ROOT", None)
+        else:
+            _os.environ["COUNCIL_VAULT_ROOT"] = prev
+
+
+def test_failure_analyzer_drafts_proposals() -> None:
+    """aggregate_failures buckets by signature; FailureAnalyzer drafts a
+    kind='failure_fix' proposal once a signature crosses the threshold,
+    dedups on re-run, and — cardinal rule — registers NOTHING."""
+    import agent_logs as _al
+    import tool_gap_analyzer as _tga
+    with tempfile.TemporaryDirectory() as td:
+        flog = _al.FailureLog(Path(td) / "failures.jsonl")
+        queue = _tga.ProposalQueue(Path(td) / "proposals.jsonl")
+        for i in range(3):
+            # Full paths — the signature scrubber collapses them so all
+            # three occurrences land in ONE bucket.
+            flog.append(kind="analyst.exec_error", subsystem="vault_analyst",
+                        message=("KeyError: 'revenue' in "
+                                 f"C:\\Users\\u\\vault\\data_in\\file_{i}.csv"))
+        flog.append(kind="db.sql_test_failed", subsystem="db_connections",
+                    message="timeout connecting")   # below threshold (1x)
+
+        buckets = _tga.aggregate_failures(flog.all())
+        _check("two distinct signatures bucketed", len(buckets) == 2)
+        ana = _tga.FailureAnalyzer(failure_log=flog, queue=queue, threshold=3)
+        report = ana.analyze()   # no runner → deterministic template
+        _check("one signature over threshold", report.over_threshold == 1)
+        _check("one proposal written", report.proposals_written == 1)
+        props = queue.current_status()
+        _check("proposal kind is failure_fix",
+               props and props[0].get("kind") == "failure_fix")
+        _check("proposal carries observed_count 3",
+               props[0].get("observed_count") == 3)
+        # Re-run → dedup, no duplicate proposal
+        report2 = ana.analyze()
+        _check("re-run writes no duplicate", report2.proposals_written == 0)
+        _check("queue still has exactly one proposal",
+               len(queue.current_status()) == 1)
+        # Human review flips status only
+        queue.update_status(props[0]["proposal_id"], "approved")
+        _check("status flip works",
+               queue.current_status()[0]["status"] == "approved")
+
+        # CARDINAL RULE — the failure path exposes no registration
+        # surface: neither FailureAnalyzer nor FailureLog has any
+        # attribute that can register a tool.
+        for obj in (ana, flog):
+            has_reg = any("register" in a.lower() for a in dir(obj))
+            _check(f"{type(obj).__name__} has no register surface",
+                   not has_reg)
+
+
 def test_vault_image_suffix_routing() -> None:
     """The image-file routing added in the ship-readiness pass must
     accept image extensions through _PARSEABLE and produce a record
@@ -1169,6 +1266,8 @@ def main() -> int:
     _run("DB — audit log rotation",               test_db_audit_log_rotation)
     _run("DB — Mongo round-trip (mongomock)",     test_db_mongo_roundtrip_mongomock)
     _run("DB — audit log writes JSONL",           test_db_audit_log_writes)
+    _run("SELF-IMPROVE — failure log roundtrip",  test_failure_log_roundtrip)
+    _run("SELF-IMPROVE — failure analyzer",       test_failure_analyzer_drafts_proposals)
     # Gate B — engineering
     _run("ENG — units_convert (or ImportError)",  test_engineering_units_convert)
     _run("ENG — tolerance_stackup known values",  test_engineering_tolerance_stackup)

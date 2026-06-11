@@ -2235,12 +2235,16 @@ def _run_analyst_step_impl(query):
     except Exception as _e:
         msg = f"code generation failed: {_e!r}"
         print('[analyst] ' + msg, file=_sys_dbg.stderr)
+        _record_app_failure("analyst.codegen_error", "council_gui_engine",
+                            msg, context={"query": query[:200]})
         return _build_analyst_failure_block("(no code generated)", msg), msg, notices
 
     code = _va.extract_python_code(raw)
     if not code.strip():
         msg = "the model produced no executable pandas code"
         print('[analyst] empty code from model', file=_sys_dbg.stderr)
+        _record_app_failure("analyst.empty_code", "council_gui_engine",
+                            msg, context={"query": query[:200]})
         return _build_analyst_failure_block("(empty)", msg), msg, notices
     print('[analyst] generated code (first 300):\n' + code[:300], file=_sys_dbg.stderr)
 
@@ -2251,6 +2255,9 @@ def _run_analyst_step_impl(query):
         # The full log keeps the entire traceback for debugging in the block.
         first_err = _summarise_analyst_error(log)
         print('[analyst] exec failed: ' + log[:400], file=_sys_dbg.stderr)
+        _record_app_failure("analyst.exec_error", "vault_analyst",
+                            first_err, detail=log,
+                            context={"query": query[:200]})
         return _build_analyst_failure_block(code, log), first_err, notices
 
     # Budget-scaled rendering. The analyst block is exempt from the
@@ -2359,6 +2366,24 @@ def _summarise_analyst_error(log: str) -> str:
     if last:
         return last[:200]
     return log.strip().splitlines()[0][:200] if log.strip() else "analyst failed"
+
+
+def _record_app_failure(kind: str, subsystem: str, message: str,
+                        detail: str = "",
+                        context: "Optional[dict]" = None) -> None:
+    """Best-effort failure capture into the self-improvement loop.
+
+    Forwards to agent_logs.record_failure (append-only JSONL in the
+    vault). The FailureAnalyzer aggregates recurring signatures into
+    human-reviewed improvement proposals in the Agent panel. Import-
+    guarded and exception-proof so the failing code path is never made
+    worse by the act of recording it."""
+    try:
+        import agent_logs as _al
+        _al.record_failure(kind, subsystem, message,
+                           detail=detail, context=context)
+    except Exception:
+        pass
 
 
 def _build_analyst_failure_block(code: str, error_log: str) -> str:
@@ -10178,6 +10203,10 @@ class CouncilConsole(tk.Tk):
                     self._vmgr_append(
                         f"tested mongo connection {name}: FAILED — "
                         f"{result.get('error')}", "err")
+                    _record_app_failure(
+                        "db.mongo_test_failed", "db_connections",
+                        str(result.get("error") or "unknown error"),
+                        context={"connection": name})
             else:
                 result = _db.test_sql_connection(VAULT_DIR, name)
                 if result.get("ok"):
@@ -10198,6 +10227,10 @@ class CouncilConsole(tk.Tk):
                     self._vmgr_append(
                         f"tested sql connection {name}: FAILED — "
                         f"{result.get('error')}", "err")
+                    _record_app_failure(
+                        "db.sql_test_failed", "db_connections",
+                        str(result.get("error") or "unknown error"),
+                        context={"connection": name})
             # Surface TLS warning if the check returned one (independent
             # of OK/FAIL — a successful connection over plaintext is
             # exactly when the warning is most actionable).

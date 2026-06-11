@@ -129,10 +129,10 @@ class AgentPanel(tk.Toplevel):
                               "registered by this panel.",
                  bg=bg, fg="#cbd1de").pack(side="left", padx=8)
 
-        cols = ("status", "name", "count", "description")
+        cols = ("status", "kind", "name", "count", "description")
         self._proposal_tree = ttk.Treeview(f, columns=cols,
                                             show="headings", height=12)
-        for c, w in zip(cols, (90, 200, 80, 480)):
+        for c, w in zip(cols, (90, 95, 200, 80, 400)):
             self._proposal_tree.heading(c, text=c.upper())
             self._proposal_tree.column(c, width=w, anchor="w")
         self._proposal_tree.pack(fill="both", expand=True, padx=10, pady=4)
@@ -157,7 +157,7 @@ class AgentPanel(tk.Toplevel):
                                         command=self._on_dismiss)
         self._dismiss_btn.pack(side="left", padx=6)
         self._analyze_btn = ttk.Button(actions,
-                                        text="🔬 Analyze gaps now (no model)",
+                                        text="🔬 Analyze gaps + failures (no model)",
                                         command=self._on_analyze)
         self._analyze_btn.pack(side="right")
 
@@ -210,7 +210,29 @@ class AgentPanel(tk.Toplevel):
             self._step_queue.put(("done", None))
 
     def _schedule_drain(self) -> None:
-        self._after_id = self.after(_DRAIN_INTERVAL_MS, self._drain_queue)
+        # Liveness guard — after the Toplevel is destroyed, self.after()
+        # raises TclError. Without this check the drain loop's `finally`
+        # reschedule throws into Tk's callback error handler on every
+        # tick after the user closes the panel.
+        try:
+            if not self.winfo_exists():
+                self._after_id = None
+                return
+            self._after_id = self.after(_DRAIN_INTERVAL_MS, self._drain_queue)
+        except tk.TclError:
+            self._after_id = None
+
+    def destroy(self) -> None:
+        # Cancel the pending drain callback so a destroyed panel leaves
+        # nothing in Tk's after-queue. Worker threads are daemons and
+        # write only to self._step_queue, so they can finish harmlessly.
+        if self._after_id is not None:
+            try:
+                self.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+        super().destroy()
 
     def _drain_queue(self) -> None:
         try:
@@ -280,6 +302,7 @@ class AgentPanel(tk.Toplevel):
                 iid=p.get("proposal_id", ""),
                 values=(
                     p.get("status", "pending").upper(),
+                    p.get("kind", "tool_gap"),
                     p.get("proposed_name", ""),
                     p.get("observed_count", 0),
                     (p.get("description", "") or "")[:120],
@@ -298,6 +321,7 @@ class AgentPanel(tk.Toplevel):
         self._detail_text.delete("1.0", "end")
         self._detail_text.insert("end",
             f"id:          {p.get('proposal_id')}\n"
+            f"kind:        {p.get('kind', 'tool_gap')}\n"
             f"name:        {p.get('proposed_name')}\n"
             f"observed:    {p.get('observed_count')}\n"
             f"status:      {p.get('status')}\n"
@@ -357,12 +381,27 @@ class AgentPanel(tk.Toplevel):
                 threshold=2,
             )
             report = analyzer.analyze()
+            # Second half of the improvement loop: recurring failure
+            # signatures (analyst errors, model-load failures, DB test
+            # failures) become kind="failure_fix" proposals in the same
+            # human-reviewed queue. Deterministic template — no model
+            # call from the panel button.
+            fail_analyzer = tool_gap_analyzer.FailureAnalyzer(
+                queue=self._proposal_queue,
+                threshold=3,
+            )
+            fail_report = fail_analyzer.analyze()
             messagebox.showinfo(
                 "Analyze complete",
+                f"— tool gaps —\n"
                 f"buckets:        {report.bucket_count}\n"
                 f"over threshold: {report.over_threshold}\n"
                 f"proposals new:  {report.proposals_written}\n"
-                f"already listed: {report.skipped_already_listed or '—'}",
+                f"already listed: {report.skipped_already_listed or '—'}\n"
+                f"\n— recurring failures —\n"
+                f"signatures:     {fail_report.bucket_count}\n"
+                f"over threshold: {fail_report.over_threshold}\n"
+                f"proposals new:  {fail_report.proposals_written}",
                 parent=self)
             self._refresh_proposals()
         except Exception as exc:

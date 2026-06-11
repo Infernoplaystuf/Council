@@ -182,10 +182,17 @@ def _collect_files(vault_dir: Path) -> List[Path]:
 
 
 def _file_hash(p: Path) -> str:
-    """Fast hash of file content for change detection."""
+    """Fast hash of file content for change detection.
+
+    Streams in 64 KB chunks — the previous read_bytes() loaded the
+    ENTIRE file into memory first, which stalls or OOMs the process
+    when a vault contains multi-GB media/dataset files."""
     try:
-        content = p.read_bytes()
-        return hashlib.md5(content).hexdigest()
+        h = hashlib.md5()
+        with open(p, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
     except Exception:
         return ""
 

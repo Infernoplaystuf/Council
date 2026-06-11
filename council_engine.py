@@ -574,6 +574,19 @@ def _gguf_max_context_from_metadata(metadata: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+def _record_engine_failure(kind: str, message: str,
+                            context: "Optional[Dict[str, Any]]" = None) -> None:
+    """Best-effort capture into the self-improvement failure log
+    (agent_logs.FailureLog). Recurring signatures surface as human-
+    reviewed improvement proposals in the Agent panel. Import-guarded
+    and exception-proof — recording a failure must never deepen it."""
+    try:
+        import agent_logs as _al
+        _al.record_failure(kind, "council_engine", message, context=context)
+    except Exception:
+        pass
+
+
 def _get_gguf_model():
     """Lazy-load the GGUF model singleton. Raises with a helpful message on
     misconfiguration so the user knows what env var to set."""
@@ -990,6 +1003,11 @@ def _get_gguf_model():
                 f"via the wizard's 'Clear (text-only)' button.",
                 flush=True,
             )
+            _record_engine_failure(
+                "model.vision_load_retry",
+                f"Llama() failed with vision mmproj attached: {primary_exc!r}",
+                context={"model": p.name, "clip_source": clip_source},
+            )
             llama_kwargs.pop("chat_handler", None)
             _GGUF_MODEL_INSTANCE = Llama(**llama_kwargs)
             chat_handler = None   # reflect actual state for downstream code
@@ -1000,6 +1018,12 @@ def _get_gguf_model():
             _LOG.error(
                 "[GGUF] Llama() FAILED loading %s (n_ctx=%d, n_gpu_layers=%d): %s",
                 p.name, n_ctx, n_gpu_layers, primary_exc,
+            )
+            _record_engine_failure(
+                "model.load_error",
+                f"Llama() failed loading {p.name}: {primary_exc!r}",
+                context={"model": p.name, "n_ctx": n_ctx,
+                         "n_gpu_layers": n_gpu_layers},
             )
             raise
     # Surface the model's advertised max context so the user knows the headroom

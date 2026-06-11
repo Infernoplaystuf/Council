@@ -65,6 +65,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -159,6 +160,13 @@ class EmbeddingIndex:
         # at __init__ delayed app startup for users who never opened
         # the embeddings-aware tabs at all.
         self._loaded = False
+        # Guards _vectors/_mtimes against the build-vs-search race:
+        # build() runs on a background thread (the GUI's embedding
+        # builder) and deletes stale keys while search() on a worker
+        # thread does check-then-get per path. The GIL makes each dict
+        # op atomic but NOT the check-then-get pair. Model encode calls
+        # stay OUTSIDE the lock — only dict mutation/snapshot is held.
+        self._vec_lock = threading.RLock()
 
     # ---- persistence ----
 
@@ -277,23 +285,27 @@ class EmbeddingIndex:
             texts = [_record_to_text(rec) for _path, rec in chunk]
             vecs = model.encode(texts, normalize_embeddings=True,
                                 show_progress_bar=False)
-            for (path, rec), vec in zip(chunk, vecs):
-                self._vectors[path] = [float(x) for x in vec]
-                self._mtimes[path]  = float(rec.get("mtime", 0))
-                if self._dim is None:
-                    self._dim = len(self._vectors[path])
-                n_done += 1
-                if on_progress:
+            with self._vec_lock:
+                for (path, rec), vec in zip(chunk, vecs):
+                    self._vectors[path] = [float(x) for x in vec]
+                    self._mtimes[path]  = float(rec.get("mtime", 0))
+                    if self._dim is None:
+                        self._dim = len(self._vectors[path])
+                    n_done += 1
+            if on_progress:
+                for (path, rec), _vec in zip(chunk, vecs):
                     try:
                         on_progress(n_done, len(todo), rec.get("name", path))
                     except Exception:
                         pass
 
-        # Drop vectors for records that no longer exist
+        # Drop vectors for records that no longer exist — atomic swap
+        # under the lock so a concurrent search() never sees a dict
+        # mid-deletion.
         live = set(records.keys())
-        for stale in [k for k in list(self._vectors) if k not in live]:
-            del self._vectors[stale]
-            self._mtimes.pop(stale, None)
+        with self._vec_lock:
+            self._vectors = {k: v for k, v in self._vectors.items() if k in live}
+            self._mtimes  = {k: v for k, v in self._mtimes.items() if k in live}
 
         self.save()
         return n_done
@@ -333,17 +345,21 @@ class EmbeddingIndex:
             qvec = qvec.tolist()
         qarr = _np.asarray(qvec, dtype=_np.float32)
 
-        raw_paths = list(candidates) if candidates is not None \
-                    else list(self._vectors.keys())
-        if not raw_paths:
-            return []
-        # Build aligned (path, vector) pairs so the matrix row order matches
-        # the path list. Skipping a path with `if p in self._vectors` in the
-        # matrix-only comprehension would leave cand_paths longer than the
-        # matrix and misalign every score.
-        aligned: List[Tuple[str, List[float]]] = [
-            (p, self._vectors[p]) for p in raw_paths if p in self._vectors
-        ]
+        # Snapshot under the lock — build() may be mutating _vectors on
+        # a background thread, and the per-element check-then-get below
+        # is not atomic without it.
+        with self._vec_lock:
+            raw_paths = list(candidates) if candidates is not None \
+                        else list(self._vectors.keys())
+            if not raw_paths:
+                return []
+            # Build aligned (path, vector) pairs so the matrix row order
+            # matches the path list. Skipping a path with `if p in
+            # self._vectors` in the matrix-only comprehension would leave
+            # cand_paths longer than the matrix and misalign every score.
+            aligned: List[Tuple[str, List[float]]] = [
+                (p, self._vectors[p]) for p in raw_paths if p in self._vectors
+            ]
         if not aligned:
             return []
         mat_paths = [p for p, _ in aligned]
