@@ -11665,13 +11665,34 @@ class CouncilConsole(tk.Tk):
             widget.configure(state="disabled")
 
     def _on_app_close(self):
-        """Flush conversation logs + dispose cached DB engines before
-        the window closes. Engine disposal returns the pooled
-        SQLAlchemy connections to the underlying DB cleanly instead of
-        relying on socket teardown."""
+        """Flush conversation logs, run the self-improvement analyzers,
+        and dispose cached DB engines before the window closes. Engine
+        disposal returns the pooled SQLAlchemy connections to the
+        underlying DB cleanly instead of relying on socket teardown."""
         try:
             if hasattr(self, "conv_logger") and self.conv_logger:
                 self.conv_logger.end_session("user_close")
+        except Exception:
+            pass
+        # ── Auto-analyze on close ────────────────────────────────────
+        # Aggregate this session's tool gaps + failure signatures into
+        # human-reviewed proposals so they accumulate without anyone
+        # remembering to press the panel button. Deterministic templates
+        # only (no model call — the model may already be unloaded and
+        # close must stay fast); both analyzers dedup against the queue
+        # so closing the app twice never writes a proposal twice.
+        try:
+            import tool_gap_analyzer as _tga
+            from tool_registry import ToolRegistry as _TReg
+            _tmp = _TReg(); _tmp.freeze()
+            _gap_rep = _tga.ToolGapAnalyzer(
+                _tmp.view(), threshold=2).analyze()
+            _fail_rep = _tga.FailureAnalyzer(threshold=3).analyze()
+            _new = _gap_rep.proposals_written + _fail_rep.proposals_written
+            if _new:
+                print(f"[shutdown] self-improvement: {_new} new proposal(s) "
+                      "drafted — review in the Agent panel next launch.",
+                      flush=True)
         except Exception:
             pass
         try:
@@ -14726,6 +14747,52 @@ class CouncilConsole(tk.Tk):
                     except Exception:
                         pass
                     break  # one observer per deliberation is enough
+
+            # ── User-quirks layer: observe always, influence only when
+            # mature. One small extraction call per deliberation; the
+            # compiled USER PROFILE block stays empty until the maturity
+            # gates pass (≥N distinct sessions, each quirk corroborated
+            # in ≥K sessions) so a young profile can't poison answers.
+            try:
+                import user_quirks as _uq
+
+                def _quirk_call(prompt: str) -> str:
+                    return ce.local_chat(
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.0, num_predict=200, timeout=45,
+                    )
+
+                _was_active = bool(
+                    (memmgr.read(ce._USER_PROFILE_KEY) or "").strip())
+                _qstatus = _uq.update_after_deliberation(
+                    user_text, getattr(self, "session_id", "unknown"),
+                    _quirk_call, memory_manager=memmgr,
+                )
+                _now_active = bool(
+                    (memmgr.read(ce._USER_PROFILE_KEY) or "").strip())
+                if _now_active and not _was_active:
+                    self._append_transcript(
+                        "Librarian",
+                        "👤 User profile is now ACTIVE — "
+                        f"{_qstatus['quirks_confirmed']} preference(s) "
+                        f"confirmed across {_qstatus['sessions_observed']} "
+                        "sessions now inform every personality. "
+                        "(COUNCIL_QUIRKS_ENABLE=0 disables.)",
+                        "final",
+                    )
+                elif (_qstatus.get("enabled")
+                        and not _qstatus.get("active")
+                        and _qstatus.get("observed_now")):
+                    self._append_transcript(
+                        "Librarian",
+                        "👤 User-profile learning: observing only — "
+                        f"{_qstatus['sessions_observed']}/"
+                        f"{_qstatus['sessions_required']} sessions before "
+                        "anything is applied.",
+                        "observation",
+                    )
+            except Exception as _uq_exc:
+                print(f"[quirks] update skipped: {_uq_exc!r}")
 
             self._append_transcript("Librarian", f"Role memories updated ({outcome}).", "final")
 

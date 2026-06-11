@@ -3055,16 +3055,29 @@ class PersonalityModel:
         if self.memory_manager is not None:
             proj_mem = self.memory_manager.read(_PROJECT_MEMORY_KEY)
 
+        # Gated user profile — durable user preferences compiled by
+        # user_quirks once its maturity gates pass. Empty (and therefore
+        # skipped) until ≥N distinct sessions have been observed AND the
+        # individual quirks are corroborated across sessions.
+        user_profile = ""
+        if self.memory_manager is not None:
+            user_profile = self.memory_manager.read(_USER_PROFILE_KEY)
+
         # Demo silo: keep memory files on disk, but skip cross-session injection.
         if os.environ.get('COUNCIL_DEMO_SILO', '').strip().lower() in ('1', 'true', 'yes', 'on'):
             mem = ''
             proj_mem = ''
             prior_txt = ''
             history_txt = ''
+            user_profile = ''
 
         prefix_parts = []
         if mem.strip():
             prefix_parts.append("ROLE MEMORY (maintain consistency):\n" + mem.strip())
+        if user_profile.strip():
+            prefix_parts.append("USER PROFILE (durable preferences, "
+                                "cross-session confirmed):\n"
+                                + user_profile.strip())
         if proj_mem.strip():
             prefix_parts.append("PROJECT CONTEXT (shared across all roles):\n" + proj_mem.strip())
         if prior_txt.strip():
@@ -3347,6 +3360,13 @@ PROJECT_OBSERVER_ROLES: set = {
 
 # Special key used by RoleMemoryManager to store the shared project context.
 _PROJECT_MEMORY_KEY = "_project"
+
+# Special key for the gated USER PROFILE (durable user preferences).
+# Written ONLY by user_quirks.update_after_deliberation — and only once
+# the profile's maturity gates pass (≥N distinct sessions observed,
+# each quirk corroborated in ≥K distinct sessions). While dormant the
+# key holds an empty string, so injection below is naturally a no-op.
+_USER_PROFILE_KEY = "_user_profile"
 
 # What each write-capable role should focus on when distilling a memory update.
 # Two categories are always expected: user/project observations and reasoning patterns.

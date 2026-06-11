@@ -1216,6 +1216,118 @@ def test_failure_analyzer_drafts_proposals() -> None:
                    not has_reg)
 
 
+def test_user_quirks_gates() -> None:
+    """The user-quirks personality layer must OBSERVE from day one but
+    INFLUENCE nothing until both maturity gates pass:
+      gate 1 — ≥N distinct sessions observed (global dormancy);
+      gate 2 — each quirk corroborated in ≥K distinct sessions.
+    """
+    import user_quirks as _uq
+    import os as _os
+
+    prev_min = _os.environ.get("COUNCIL_QUIRKS_MIN_SESSIONS")
+    prev_per = _os.environ.get("COUNCIL_QUIRKS_MIN_SESSIONS_PER_QUIRK")
+    try:
+        _os.environ["COUNCIL_QUIRKS_MIN_SESSIONS"] = "3"
+        _os.environ["COUNCIL_QUIRKS_MIN_SESSIONS_PER_QUIRK"] = "2"
+        with tempfile.TemporaryDirectory() as td:
+            log = _uq.UserQuirksLog(Path(td) / "quirks.jsonl")
+
+            # Invalid category is rejected
+            _check("invalid category rejected",
+                   log.append(session="s1", category="zodiac",
+                              text="user is a libra") is None)
+
+            # One session, repeated quirk — gate 1 must hold even with
+            # many observations (repeats in ONE session ≠ corroboration).
+            for _ in range(5):
+                log.append(session="s1", category="format",
+                           text="prefers tables over prose")
+            _check("gate 1: dormant under min sessions",
+                   _uq.compile_profile(log) == "")
+            st = _uq.profile_status(log)
+            _check("status reports dormant", not st["active"])
+            _check("status counts 1 session", st["sessions_observed"] == 1)
+
+            # Two more sessions corroborate the same quirk (reworded) —
+            # clustering must bucket the rewordings together.
+            log.append(session="s2", category="format",
+                       text="prefers tables instead of prose")
+            log.append(session="s3", category="format",
+                       text="likes tables, not prose")
+            # And a single-session quirk that must stay BELOW gate 2.
+            log.append(session="s3", category="tone",
+                       text="enjoys puns in headings")
+
+            profile = _uq.compile_profile(log)
+            _check("gate 1 lifts at min sessions", profile != "")
+            _check("corroborated quirk in profile", "tables" in profile)
+            _check("gate 2: single-session quirk excluded",
+                   "puns" not in profile)
+            st = _uq.profile_status(log)
+            _check("status active", st["active"])
+            _check("one confirmed quirk", st["quirks_confirmed"] == 1)
+
+            # clear() is the user's escape hatch
+            _check("clear() wipes", log.clear() and log.all() == [])
+    finally:
+        for k, v in (("COUNCIL_QUIRKS_MIN_SESSIONS", prev_min),
+                     ("COUNCIL_QUIRKS_MIN_SESSIONS_PER_QUIRK", prev_per)):
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+
+
+def test_user_quirks_extraction_defensive() -> None:
+    """extract_quirks must parse model JSON defensively: garbage → [],
+    invalid categories dropped, cap enforced, model exception → []."""
+    import user_quirks as _uq
+    _check("garbage reply → []",
+           _uq.extract_quirks("msg", lambda p: "no json here") == [])
+    _check("model exception → []",
+           _uq.extract_quirks("msg", lambda p: 1 / 0) == [])
+    good = ('[{"category": "format", "text": "prefers SI units"},'
+            ' {"category": "zodiac", "text": "dropped"},'
+            ' {"category": "tone", "text": "concise answers"}]')
+    out = _uq.extract_quirks("msg", lambda p: f"Sure!\n{good}\nDone.")
+    _check("valid items parsed, invalid category dropped",
+           [o["category"] for o in out] == ["format", "tone"])
+    many = "[" + ",".join(
+        f'{{"category": "tone", "text": "quirk {i}"}}' for i in range(9)) + "]"
+    _check("per-turn cap enforced",
+           len(_uq.extract_quirks("msg", lambda p: many)) == 3)
+    _check("empty user text → no call",
+           _uq.extract_quirks("   ", lambda p: 1 / 0) == [])
+
+
+def test_user_quirks_disabled_env() -> None:
+    """COUNCIL_QUIRKS_ENABLE=0 must hard-disable compilation even when
+    the data would otherwise pass both gates."""
+    import user_quirks as _uq
+    import os as _os
+    prev = {k: _os.environ.get(k) for k in
+            ("COUNCIL_QUIRKS_ENABLE", "COUNCIL_QUIRKS_MIN_SESSIONS",
+             "COUNCIL_QUIRKS_MIN_SESSIONS_PER_QUIRK")}
+    try:
+        _os.environ["COUNCIL_QUIRKS_ENABLE"] = "0"
+        _os.environ["COUNCIL_QUIRKS_MIN_SESSIONS"] = "1"
+        _os.environ["COUNCIL_QUIRKS_MIN_SESSIONS_PER_QUIRK"] = "1"
+        with tempfile.TemporaryDirectory() as td:
+            log = _uq.UserQuirksLog(Path(td) / "quirks.jsonl")
+            log.append(session="s1", category="format", text="loves tables")
+            _check("disabled → empty profile",
+                   _uq.compile_profile(log) == "")
+            _check("disabled → status inactive",
+                   not _uq.profile_status(log)["active"])
+    finally:
+        for k, v in prev.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+
+
 def test_vault_image_suffix_routing() -> None:
     """The image-file routing added in the ship-readiness pass must
     accept image extensions through _PARSEABLE and produce a record
@@ -1268,6 +1380,9 @@ def main() -> int:
     _run("DB — audit log writes JSONL",           test_db_audit_log_writes)
     _run("SELF-IMPROVE — failure log roundtrip",  test_failure_log_roundtrip)
     _run("SELF-IMPROVE — failure analyzer",       test_failure_analyzer_drafts_proposals)
+    _run("QUIRKS — maturity gates",               test_user_quirks_gates)
+    _run("QUIRKS — defensive extraction",         test_user_quirks_extraction_defensive)
+    _run("QUIRKS — env kill-switch",              test_user_quirks_disabled_env)
     # Gate B — engineering
     _run("ENG — units_convert (or ImportError)",  test_engineering_units_convert)
     _run("ENG — tolerance_stackup known values",  test_engineering_tolerance_stackup)
