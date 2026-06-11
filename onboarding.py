@@ -21,10 +21,28 @@ from __future__ import annotations
 
 import json
 import platform
-import tkinter as tk
 from pathlib import Path
-from tkinter import ttk, messagebox, filedialog
 from typing import Callable, List, Optional
+
+# Tk is optional at IMPORT time: the pure helpers in this module
+# (gguf_file_status, load/save_gguf_path, load/save_clip_path,
+# needs_onboarding) are used by the engine, the setup wizard, and CI
+# smoke tests on headless Linux boxes where python3-tk isn't installed.
+# Only the OnboardingWizard UI actually needs Tk — it raises a clear
+# error if constructed without it.
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox, filedialog
+    _TK_OK = True
+except Exception:                       # pragma: no cover — headless box
+    tk = None          # type: ignore[assignment]
+    ttk = messagebox = filedialog = None  # type: ignore[assignment]
+    _TK_OK = False
+
+# Base class for the wizard. With `from __future__ import annotations`
+# every tk.* type hint in this module is a string (never evaluated), so
+# the class statement below is the only module-level Tk dependency.
+_TkBase = tk.Toplevel if _TK_OK else object
 
 import branding
 
@@ -277,7 +295,7 @@ def gguf_file_status(path: str) -> tuple:
 # Wizard
 # ============================================================
 
-class OnboardingWizard(tk.Toplevel):
+class OnboardingWizard(_TkBase):
     """
     Modal wizard shown on first launch. Returns when the user finishes
     or cancels. The host application should check `wizard.completed`
@@ -285,6 +303,11 @@ class OnboardingWizard(tk.Toplevel):
     """
 
     def __init__(self, parent: tk.Tk, vault_dir: Path):
+        if not _TK_OK:
+            raise RuntimeError(
+                "OnboardingWizard requires tkinter, which is not "
+                "available (headless box / python3-tk not installed). "
+                "The file helpers in this module work without it.")
         super().__init__(parent)
         self.parent     = parent
         self.vault_dir  = vault_dir
@@ -1113,6 +1136,13 @@ def run_if_needed(parent: tk.Tk, vault_dir: Path,
     if not needs_onboarding(vault_dir):
         if on_complete:
             on_complete(True)
+        return
+
+    if not _TK_OK:
+        # Headless box — can't show a wizard; treat as not completed so
+        # the caller can fall back to env-var / CLI configuration.
+        if on_complete:
+            on_complete(False)
         return
 
     wiz = OnboardingWizard(parent, vault_dir)

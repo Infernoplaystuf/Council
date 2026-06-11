@@ -25,10 +25,22 @@ from __future__ import annotations
 import json
 import platform
 import threading
-import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox, ttk
 from typing import Any, Dict, List, Optional
+
+# Tk optional at import time — snapshot() and render_cli() are pure and
+# used headless (CI on Linux without python3-tk, CLI diagnostics). Only
+# the SystemPanel UI class needs Tk. Same pattern as onboarding.py.
+try:
+    import tkinter as tk
+    from tkinter import messagebox, ttk
+    _TK_OK = True
+except Exception:                       # pragma: no cover — headless box
+    tk = None          # type: ignore[assignment]
+    messagebox = ttk = None  # type: ignore[assignment]
+    _TK_OK = False
+
+_TkBase = tk.Toplevel if _TK_OK else object
 
 from inferno_local import cookbook, model_runner, security
 import model_catalog
@@ -106,13 +118,17 @@ def render_cli(snap: Dict[str, Any]) -> str:
 # Tkinter panel
 # ============================================================
 
-class SystemPanel(tk.Toplevel):
+class SystemPanel(_TkBase):
     """Standalone Toplevel — doesn't require modifying the main GUI's
     notebook. Opens via ``open_panel(parent)``. Every long-running probe
     (none yet) would go on a worker thread; right now ``snapshot()`` is
     cheap enough to call on the UI thread."""
 
     def __init__(self, parent: Optional[tk.Misc] = None):
+        if not _TK_OK:
+            raise RuntimeError(
+                "SystemPanel requires tkinter (not available on this "
+                "headless box). snapshot() / render_cli() work without it.")
         super().__init__(parent)
         self.title("System & Models — Data's Inferno")
         try:
