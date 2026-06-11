@@ -7366,6 +7366,18 @@ class CouncilConsole(tk.Tk):
         ttk.Button(list_btns, text="Open out/ folder",
                    command=self._dream3d_open_out_folder).pack(side="left", padx=4)
 
+        # Geometry sidekick — interactive 3D cube that reads out the
+        # equivalent 4×4 transformation matrix. Standalone HTML, opens
+        # in the default browser; useful for sanity-checking an
+        # orientation before committing it to a pipeline.
+        tools_row = ttk.Frame(right)
+        tools_row.pack(fill="x", pady=(0, 4))
+        ttk.Label(tools_row, text="Tools:",
+                  foreground="#7a7575").pack(side="left", padx=(0, 4))
+        ttk.Button(tools_row, text="🧊 Transformation Cube…",
+                   command=self._open_transformation_cube_tool
+                   ).pack(side="left")
+
         ttk.Label(right, text="Pipeline visualization").pack(anchor="w", pady=(6, 0))
         self.dream3d_view = self._make_text(right, wrap="word", state="disabled")
         d3d_view_sb = ttk.Scrollbar(right, command=self.dream3d_view.yview)
@@ -7430,6 +7442,51 @@ class CouncilConsole(tk.Tk):
     def _dream3d_open_out_folder(self):
         import pipeline_scanner as _ps
         self._open_in_explorer(_ps.vault_pipelines_out_dir(VAULT_DIR))
+
+    def _open_transformation_cube_tool(self):
+        """Open the bundled interactive 3D cube → 4×4 transformation matrix
+        tool in the user's default browser. The HTML is dependency-free
+        (Canvas 2D, no external libraries) so it runs fully offline.
+
+        Useful alongside Dream3D pipelines that need a quick sanity check
+        on an orientation matrix or a hand-built rotation. Lives in
+        ``assets/transformation_cube.html`` so PyInstaller bundles it.
+        """
+        import webbrowser
+        # Resolve from APP_DIR so it works in both the source checkout and
+        # a PyInstaller --onedir bundle (sys._MEIPASS for --onefile, but
+        # the spec ships assets/ to the bundle root).
+        candidates = [
+            APP_DIR / "assets" / "transformation_cube.html",
+        ]
+        # PyInstaller --onefile extracts to sys._MEIPASS at runtime.
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "assets" / "transformation_cube.html")
+        for html in candidates:
+            if html.is_file():
+                try:
+                    webbrowser.open(html.resolve().as_uri())
+                    self._append_transcript(
+                        "Council",
+                        f"Opened Transformation Cube tool ({html.name}) in "
+                        "your default browser.",
+                        "observation",
+                    )
+                except Exception as exc:
+                    self._append_transcript(
+                        "Council",
+                        f"Couldn't launch browser for {html}: {exc!r}",
+                        "observation",
+                    )
+                return
+        self._append_transcript(
+            "Council",
+            "Transformation Cube tool not found — expected at "
+            f"{candidates[0]}. Re-installing the assets/ folder should "
+            "restore it.",
+            "observation",
+        )
 
     def _open_in_explorer(self, path: Path):
         try:
