@@ -1301,6 +1301,49 @@ def test_user_quirks_extraction_defensive() -> None:
            _uq.extract_quirks("   ", lambda p: 1 / 0) == [])
 
 
+def test_user_quirks_apply_bypass() -> None:
+    """COUNCIL_QUIRKS_APPLY=0 is the EXPLICIT bypass: injection stops
+    (engine-side flag) but observation and compilation keep running —
+    distinct from COUNCIL_QUIRKS_ENABLE=0 which kills the layer."""
+    import user_quirks as _uq
+    import council_engine as _ce
+    import os as _os
+    prev = {k: _os.environ.get(k) for k in
+            ("COUNCIL_QUIRKS_APPLY", "COUNCIL_QUIRKS_MIN_SESSIONS",
+             "COUNCIL_QUIRKS_MIN_SESSIONS_PER_QUIRK")}
+    try:
+        # Engine flag semantics
+        _os.environ.pop("COUNCIL_QUIRKS_APPLY", None)
+        _check("apply defaults ON", _ce.user_profile_apply_enabled())
+        _ce.set_user_profile_apply(False)
+        _check("set_user_profile_apply(False) bypasses",
+               not _ce.user_profile_apply_enabled())
+        _ce.set_user_profile_apply(True)
+        _check("set_user_profile_apply(True) re-enables",
+               _ce.user_profile_apply_enabled())
+
+        # Learning continues under bypass: observations still append and
+        # the profile still compiles (only INJECTION is gated, in
+        # PersonalityModel.respond, not here).
+        _os.environ["COUNCIL_QUIRKS_APPLY"] = "0"
+        _os.environ["COUNCIL_QUIRKS_MIN_SESSIONS"] = "1"
+        _os.environ["COUNCIL_QUIRKS_MIN_SESSIONS_PER_QUIRK"] = "1"
+        with tempfile.TemporaryDirectory() as td:
+            log = _uq.UserQuirksLog(Path(td) / "quirks.jsonl")
+            fake = lambda p: '[{"category": "format", "text": "prefers tables"}]'
+            st = _uq.update_after_deliberation("msg", "s1", fake, log=log)
+            _check("bypass: observation continues",
+                   st["observed_now"] == 1 and len(log.all()) == 1)
+            _check("bypass: profile still compiles",
+                   "tables" in _uq.compile_profile(log))
+    finally:
+        for k, v in prev.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+
+
 def test_user_quirks_disabled_env() -> None:
     """COUNCIL_QUIRKS_ENABLE=0 must hard-disable compilation even when
     the data would otherwise pass both gates."""
@@ -1382,6 +1425,7 @@ def main() -> int:
     _run("SELF-IMPROVE — failure analyzer",       test_failure_analyzer_drafts_proposals)
     _run("QUIRKS — maturity gates",               test_user_quirks_gates)
     _run("QUIRKS — defensive extraction",         test_user_quirks_extraction_defensive)
+    _run("QUIRKS — explicit apply bypass",        test_user_quirks_apply_bypass)
     _run("QUIRKS — env kill-switch",              test_user_quirks_disabled_env)
     # Gate B — engineering
     _run("ENG — units_convert (or ImportError)",  test_engineering_units_convert)

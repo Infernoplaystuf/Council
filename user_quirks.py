@@ -36,6 +36,21 @@ Additional hygiene:
     executes anything, and clear() wipes it instantly.
   • COUNCIL_QUIRKS_ENABLE=0 turns the entire layer off.
 
+Explicit bypass (apply vs observe)
+----------------------------------
+Sometimes the user's NORMAL preferences are wrong for the CURRENT ask
+(they usually want terse tables, today they want a flowing essay).
+Three escalating overrides:
+  1. Just ask — the injected block ends with "Honour them unless the
+     current request says otherwise", so an explicit request wins at
+     the prompt level with no toggling.
+  2. COUNCIL_QUIRKS_APPLY=0 (GUI: the "👤 Profile" toolbar checkbox) —
+     stops INJECTION on the next message while observation keeps
+     running. The profile keeps maturing; nothing learned is lost.
+     Checked at respond() time in council_engine, not here.
+  3. COUNCIL_QUIRKS_ENABLE=0 — kills the whole layer, observation
+     included, and wipes the injected block on the next update.
+
 Storage: ~/.council/vault/.user_quirks.jsonl (append-only JSONL, same
 pattern as the agent audit logs; honours COUNCIL_VAULT_ROOT).
 """

@@ -7190,9 +7190,17 @@ class CouncilConsole(tk.Tk):
         self.var_adversarial     = tk.BooleanVar(value=False)  # T2-B: adversarial Peasant
         self.var_judge_panel     = tk.BooleanVar(value=False)  # Judge model picks panel
         self.var_robust_voices   = tk.BooleanVar(value=False)  # Robust personality voices
+        # Learned user-profile injection. The checkbox is the EXPLICIT
+        # bypass for sessions where the user's durable preferences don't
+        # fit the current ask — unchecking skips injection on the very
+        # next message while learning continues underneath. Initial
+        # state honours a pre-set COUNCIL_QUIRKS_APPLY from the shell.
+        self.var_use_profile     = tk.BooleanVar(
+            value=ce.user_profile_apply_enabled())
 
         # Wire voice toggle to apply/remove voices immediately on change
         self.var_robust_voices.trace_add("write", self._on_voice_toggle)
+        self.var_use_profile.trace_add("write", self._on_profile_toggle)
 
         # ── Toolbar row 1: core toggles ───────────────────────────────
         # Deliberation/Adversarial/Judge-panel only make sense for the
@@ -7203,6 +7211,9 @@ class CouncilConsole(tk.Tk):
         ttk.Checkbutton(btns, text="Tools",           variable=self.var_tools).pack(side="left", padx=4)
         ttk.Checkbutton(btns, text="Fill IDE",        variable=self.var_fill_ide).pack(side="left", padx=4)
         ttk.Checkbutton(btns, text="Stream tokens",   variable=self.var_stream).pack(side="left", padx=4)
+        # Visible in DEMO_MODE too — the learned profile shapes the
+        # single-personality answers just the same.
+        ttk.Checkbutton(btns, text="👤 Profile",      variable=self.var_use_profile).pack(side="left", padx=4)
         if not _demo:
             ttk.Checkbutton(btns, text="Adversarial",     variable=self.var_adversarial).pack(side="left", padx=4)
             ttk.Checkbutton(btns, text="Judge panel ✦",   variable=self.var_judge_panel).pack(side="left", padx=4)
@@ -12235,6 +12246,22 @@ class CouncilConsole(tk.Tk):
         ce.set_voice_mode(self.personalities, enabled)
         state = "ON — each personality now has its own voice" if enabled else "OFF — neutral mode"
         self._set_status(f"● Robust voices: {state}", "#cba6f7" if enabled else "#a6e3a1")
+
+    def _on_profile_toggle(self, *_):
+        """Explicit user-profile bypass. Unchecking parks the learned
+        USER PROFILE for now — injection stops on the very next message
+        (the engine checks the flag at respond() time) while quirk
+        OBSERVATION keeps running, so nothing learned is lost and the
+        profile keeps maturing in the background."""
+        enabled = bool(self.var_use_profile.get())
+        ce.set_user_profile_apply(enabled)
+        if enabled:
+            self._set_status("● 👤 Profile: ON — learned preferences "
+                             "inform answers again", "#a6e3a1")
+        else:
+            self._set_status("● 👤 Profile: BYPASSED — answers ignore "
+                             "learned preferences (learning continues)",
+                             "#fab387")
 
     def _vfb_hide(self):
         """Hide the feedback bar and detail panel."""

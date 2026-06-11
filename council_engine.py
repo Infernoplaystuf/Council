@@ -3058,9 +3058,12 @@ class PersonalityModel:
         # Gated user profile — durable user preferences compiled by
         # user_quirks once its maturity gates pass. Empty (and therefore
         # skipped) until ≥N distinct sessions have been observed AND the
-        # individual quirks are corroborated across sessions.
+        # individual quirks are corroborated across sessions. The
+        # apply-check is the EXPLICIT bypass: the user can park the
+        # profile for a session whose ask conflicts with their normal
+        # preferences, while observation keeps running underneath.
         user_profile = ""
-        if self.memory_manager is not None:
+        if self.memory_manager is not None and user_profile_apply_enabled():
             user_profile = self.memory_manager.read(_USER_PROFILE_KEY)
 
         # Demo silo: keep memory files on disk, but skip cross-session injection.
@@ -3367,6 +3370,25 @@ _PROJECT_MEMORY_KEY = "_project"
 # each quirk corroborated in ≥K distinct sessions). While dormant the
 # key holds an empty string, so injection below is naturally a no-op.
 _USER_PROFILE_KEY = "_user_profile"
+
+
+def user_profile_apply_enabled() -> bool:
+    """Whether the compiled USER PROFILE block is INJECTED into prompts.
+
+    COUNCIL_QUIRKS_APPLY=0 is the explicit bypass: learning continues
+    (observations keep accumulating, the profile keeps compiling) but
+    nothing is injected — for the sessions where the user's normal
+    preferences don't fit what they're asking for right now. Checked at
+    respond() time so the GUI toggle takes effect on the very next
+    message, no restart. Distinct from COUNCIL_QUIRKS_ENABLE, which
+    turns the whole layer off including observation."""
+    return os.environ.get("COUNCIL_QUIRKS_APPLY", "1").strip().lower() \
+        not in ("0", "false", "no", "off")
+
+
+def set_user_profile_apply(on: bool) -> None:
+    """UI toggle helper — mirrors set_agent_memory_enabled's pattern."""
+    os.environ["COUNCIL_QUIRKS_APPLY"] = "1" if on else "0"
 
 # What each write-capable role should focus on when distilling a memory update.
 # Two categories are always expected: user/project observations and reasoning patterns.
