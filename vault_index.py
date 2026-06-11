@@ -1548,6 +1548,15 @@ class VaultIndex:
         self.denylist_path = self.vault_dir / DENYLIST_FILENAME
         self.records: Dict[str, Dict[str, Any]] = {}
         self._vocab_cache: Optional[Set[str]] = None
+        # Per-record derived search structures (lowercased keyword/header/
+        # key sets, stems, pre-split header/key tokens, name tokens).
+        # These are pure functions of a record and were previously
+        # rebuilt for EVERY candidate on EVERY search — twice (once in
+        # the IDF pass, once in scoring). Cached here keyed by path with
+        # a cheap signature so they recompute only when the record
+        # actually changes. Kept off the record dict because records are
+        # JSON-serialised to disk and sets aren't JSON-safe.
+        self._search_cache: Dict[str, Dict[str, Any]] = {}
         self._denylist_cache: Optional[Set[str]] = None
         # Lazy embedding layer — only loads sentence-transformers on first use.
         self._emb_index = None
@@ -2035,18 +2044,102 @@ the vocabulary list. Lowercase only. Single line only.
                         self.records[spath] = rec
                         n_updated += 1
 
-        # Drop stale records for files that have been removed (only on full-tree walks)
+        # Drop stale records for files that have been removed (only on
+        # full-tree walks). The walk above already visited every existing
+        # parseable file and recorded its path in `seen`, so a record
+        # whose path isn't in `seen` no longer exists. This replaces an
+        # O(n) Path.exists() syscall sweep over EVERY record with a set
+        # membership test — on a full rebuild `root == self.vault_dir`,
+        # so `seen` is authoritative.
         if scope is None or Path(scope) == self.vault_dir:
-            for stale in [k for k in list(self.records)
-                          if not Path(k).exists()]:
+            for stale in [k for k in list(self.records) if k not in seen]:
                 del self.records[stale]
+                self._search_cache.pop(stale, None)
 
         self.save()
-        # Invalidate cached vocab — record set just changed.
+        # Invalidate cached vocab — record set just changed. Per-record
+        # search structures self-invalidate via their signature, so the
+        # _search_cache is left intact (surviving records keep their
+        # precomputed sets across the rebuild).
         self._vocab_cache = None
         return n_updated
 
     # ---- search ----
+    def _search_terms(self, spath: str, rec: Dict[str, Any]) -> Dict[str, Any]:
+        """Return cached, pre-derived search structures for a record.
+
+        All of these are pure functions of the record's content. They
+        used to be rebuilt per-candidate-per-search (and again in the
+        IDF pass). Now they're computed once and cached on the index,
+        invalidated by a cheap signature that moves whenever any source
+        field changes shape — which covers descriptions/topics being
+        added LATER by generate_descriptions().
+        """
+        desc = rec.get("description", "") or ""
+        topics = rec.get("topics", []) or []
+        sample = rec.get("sample_text", "") or ""
+        sig = (
+            len(rec.get("keywords", []) or []),
+            len(rec.get("headers", []) or []),
+            len(rec.get("sheets", []) or []),
+            len(rec.get("keys", []) or []),
+            rec.get("name", ""),
+            len(desc), len(topics), len(sample),
+        )
+        cached = self._search_cache.get(spath)
+        if cached is not None and cached.get("_sig") == sig:
+            return cached
+
+        kws = set(rec.get("keywords", []) or [])
+        stems_kw = {_stem(w) for w in kws}
+        # Base headers = just the record's own `headers` (no Excel sheet
+        # headers). The IDF document-frequency pass historically used
+        # ONLY these, so we keep a base set to preserve that weighting
+        # exactly.
+        headers_base = [(h or "").lower() for h in rec.get("headers", []) or []]
+        headers_base_set = set(headers_base)
+        # Flattened headers = base + Excel `sheets[*].headers`, used by the
+        # scoring pass (which has always counted sheet headers).
+        headers_lc = list(headers_base)
+        for s in rec.get("sheets", []) or []:
+            for h in s.get("headers", []) or []:
+                headers_lc.append(str(h).lower())
+        # Pre-split header/key tokens so scoring doesn't call .split()
+        # once per query-term per header (was O(terms × headers) splits).
+        # Each token set ALSO includes the full lowercased string so the
+        # original `term == h` exact-match check is preserved (a query
+        # term like "unit_price" still matches a key "unit_price", not
+        # just its split tokens "unit"/"price").
+        headers_tok = [set(h.split()) | {h} for h in headers_lc]
+        keys_lc = [str(k).lower() for k in rec.get("keys", []) or []]
+        keys_tok = [set(k.split("_")) | {k} for k in keys_lc]
+        keys_set = set(keys_lc)
+        name_tokens = set(_tokenize(rec.get("name", "")))
+        name_stems = {_stem(t) for t in name_tokens}
+
+        cached = {
+            "_sig":             sig,
+            "kws":              kws,
+            "stems_kw":         stems_kw,
+            "headers_lc":       headers_lc,
+            "headers_tok":      headers_tok,
+            "headers_base":     headers_base,
+            "headers_base_set": headers_base_set,
+            "keys_lc":          keys_lc,
+            "keys_tok":         keys_tok,
+            "keys_set":         keys_set,
+            "name_tokens":      name_tokens,
+            "name_stems":       name_stems,
+            "sample_blob":      sample.lower(),
+            "desc_blob":        desc.lower(),
+            "topic_set":        {str(t).lower() for t in topics},
+            # Union used by the IDF document-frequency pass — base headers
+            # only, matching the original (pre-cache) IDF semantics.
+            "haystack":         kws | stems_kw | headers_base_set | keys_set,
+        }
+        self._search_cache[spath] = cached
+        return cached
+
     def search(
         self,
         query: str,
@@ -2204,18 +2297,24 @@ the vocabulary list. Lowercase only. Single line only.
         if not cand:
             return [], fuzzy_matches
 
+        # Pre-derive (or fetch cached) per-record search structures once
+        # for this candidate set. Each entry is reused by BOTH the IDF
+        # pass and the scoring pass below, so we never rebuild the same
+        # sets/splits twice per search.
+        terms_by_path = [(spath, rec, self._search_terms(spath, rec))
+                         for spath, rec in cand]
+
         # IDF over candidate set
         N = len(cand)
         df: Dict[str, int] = defaultdict(int)
-        for _spath, rec in cand:
-            kws = set(rec.get("keywords", []))
-            stems_kw = {_stem(w) for w in kws}
-            headers_lc = {(h or "").lower() for h in rec.get("headers", [])}
-            keys_lc = {str(k).lower() for k in rec.get("keys", [])}
-            haystack = kws | stems_kw | headers_lc | keys_lc
+        for _spath, _rec, t in terms_by_path:
+            haystack = t["haystack"]
+            headers_base_set = t["headers_base_set"]
+            keys_set = t["keys_set"]
             for term in expanded:
-                if term in haystack or any(term in h for h in headers_lc) \
-                        or any(term in k for k in keys_lc):
+                if term in haystack \
+                        or any(term in h for h in headers_base_set) \
+                        or any(term in k for k in keys_set):
                     df[term] += 1
         idf = {
             term: math.log((N + 1) / (df.get(term, 0) + 1)) + 1.0
@@ -2223,22 +2322,16 @@ the vocabulary list. Lowercase only. Single line only.
         }
 
         results: List[Tuple[float, Dict[str, Any]]] = []
-        for _spath, rec in cand:
-            kws = set(rec.get("keywords", []))
-            stems_kw = {_stem(w) for w in kws}
-            # Flatten CSV `headers` and Excel `sheets[*].headers` into one list
-            headers_lc = [(h or "").lower() for h in rec.get("headers", [])]
-            for s in rec.get("sheets", []) or []:
-                for h in s.get("headers", []) or []:
-                    headers_lc.append(str(h).lower())
-            keys_lc = [str(k).lower() for k in rec.get("keys", [])]
-            name_tokens = set(_tokenize(rec.get("name", "")))
-            name_stems = {_stem(t) for t in name_tokens}
-            sample_blob = (rec.get("sample_text", "") or "").lower()
-            # LLM-generated layer (may be empty if generate_descriptions
-            # hasn't run yet)
-            desc_blob = (rec.get("description", "") or "").lower()
-            topic_set = {str(t).lower() for t in rec.get("topics", []) or []}
+        for _spath, rec, t in terms_by_path:
+            kws = t["kws"]
+            stems_kw = t["stems_kw"]
+            headers_tok = t["headers_tok"]      # list[set[str]] (pre-split)
+            keys_tok = t["keys_tok"]            # list[set[str]] (pre-split on _)
+            name_tokens = t["name_tokens"]
+            name_stems = t["name_stems"]
+            sample_blob = t["sample_blob"]
+            desc_blob = t["desc_blob"]
+            topic_set = t["topic_set"]
 
             score = 0.0
             for term in expanded:
@@ -2247,9 +2340,10 @@ the vocabulary list. Lowercase only. Single line only.
                     score += 1.0 * w
                 if term in name_tokens or term in name_stems:
                     score += 2.5 * w
-                if any(term == h or term in h.split() for h in headers_lc):
+                # term == full-header OR term is one of its pre-split tokens
+                if any(term in htok for htok in headers_tok):
                     score += 3.0 * w
-                if any(term == k or term in k.split("_") for k in keys_lc):
+                if any(term in ktok for ktok in keys_tok):
                     score += 3.0 * w
                 if term in sample_blob:
                     score += 0.4 * w

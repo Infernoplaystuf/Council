@@ -2551,9 +2551,15 @@ def detect_outliers(
         lower = q1 - threshold * iqr
         upper = q3 + threshold * iqr
         mask = (work[column] < lower) | (work[column] > upper)
-        work["outlier_score"] = work[column].apply(
-            lambda v: max(lower - v, v - upper) / max(iqr, 1e-9)
-        )
+        # Vectorized element-wise max(lower-v, v-upper) / iqr. The old
+        # .apply(lambda) ran one Python call per row (O(n) interpreter
+        # round-trips); the row-wise pd.concat(...).max(axis=1) runs in
+        # C. No numpy dependency (np is optional in this module).
+        denom = max(iqr, 1e-9)
+        col = work[column]
+        work["outlier_score"] = pd.concat(
+            [lower - col, col - upper], axis=1
+        ).max(axis=1) / denom
     return work.loc[mask].sort_values("outlier_score", ascending=False)
 
 

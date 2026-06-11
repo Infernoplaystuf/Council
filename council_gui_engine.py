@@ -4279,6 +4279,12 @@ class CouncilConsole(tk.Tk):
 
         self.current_script_name = "script"
         self._stream_buffers: Dict[str, str] = {}  # role -> partial streamed text
+        # Set while ≥1 token was inserted into the stream box during the
+        # current _poll_ui_queue drain. The expensive see("end") (which
+        # forces a full line-geometry recalc) is deferred to ONCE per
+        # drain instead of once per token — at 100+ tok/s that turns
+        # ~100 layout passes/sec into ~20, eliminating streaming jank.
+        self._stream_box_dirty = False
         self._node_refresh_id = None
 
         # ── Agents ────────────────────────────────────────────
@@ -11838,16 +11844,39 @@ class CouncilConsole(tk.Tk):
             self.convo_store.append(self.session_id, {"ts": now_iso(), "who": who, "text": text})
 
     def _append_stream_box(self, who: str, token: str):
-        """Append a single token to the live stream preview box."""
-        self.stream_box.configure(state="normal")
+        """Append a single token to the live stream preview box.
+
+        Hot path — runs once per streamed token (100+/s). We do the
+        cheap insert here but DEFER the expensive see("end") scroll to
+        _flush_stream_box(), called once at the end of each
+        _poll_ui_queue drain. The widget is left in 'normal' state
+        across a drain and flipped back to 'disabled' in the flush, so
+        we also avoid two configure() calls per token.
+        """
+        try:
+            self.stream_box.configure(state="normal")
+        except tk.TclError:
+            return
         if who not in self._stream_buffers:
             # New speaker — add header
             self._stream_buffers[who] = ""
             self.stream_box.insert("end", f"\n{who}: ", self._role_tag(who))
         self._stream_buffers[who] += token
         self.stream_box.insert("end", token)
-        self.stream_box.see("end")
-        self.stream_box.configure(state="disabled")
+        self._stream_box_dirty = True
+
+    def _flush_stream_box(self):
+        """Scroll the stream box to the end and re-lock it. Called once
+        per _poll_ui_queue drain when ≥1 token was appended — see
+        _append_stream_box for why the per-token see() was removed."""
+        if not self._stream_box_dirty:
+            return
+        self._stream_box_dirty = False
+        try:
+            self.stream_box.see("end")
+            self.stream_box.configure(state="disabled")
+        except tk.TclError:
+            pass
 
     def _clear_stream_box(self):
         self._stream_buffers.clear()
@@ -14088,6 +14117,10 @@ class CouncilConsole(tk.Tk):
 
         except queue.Empty:
             pass
+        # Coalesced scroll: if any stream tokens were appended during
+        # this drain, do the single deferred see("end") + re-lock now
+        # instead of once per token inside the loop above.
+        self._flush_stream_box()
         self.after(50, self._poll_ui_queue)
 
     # ============================
