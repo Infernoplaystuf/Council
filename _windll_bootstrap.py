@@ -25,11 +25,20 @@ def _bootstrap() -> None:
         return
     if not hasattr(os, "add_dll_directory"):
         return
+    # Locate torch WITHOUT importing it. We only need the path to
+    # torch/lib — importlib.util.find_spec finds the package on disk in
+    # milliseconds, while `import torch` executes its __init__ (CUDA
+    # context probing, ~3.8 s measured) at every app launch. llama-cpp
+    # only needs the DLL directory on the search path; torch itself
+    # loads later, if and when something actually uses it.
     try:
-        import torch  # type: ignore
+        import importlib.util
+        spec = importlib.util.find_spec("torch")
     except Exception:
         return
-    torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
+    if spec is None or not spec.origin:
+        return
+    torch_lib = os.path.join(os.path.dirname(spec.origin), "lib")
     if os.path.isdir(torch_lib):
         try:
             os.add_dll_directory(torch_lib)

@@ -46,11 +46,12 @@ try:
 except ImportError:
     _MPL_OK = False
 
-try:
-    from scipy import signal, stats
-    _SCIPY_OK = True
-except ImportError:
-    _SCIPY_OK = False
+# Probe-only: find_spec locates scipy without executing it (importing
+# scipy.signal costs ~1.6 s and this module loads at app startup). The
+# two call sites that need it (_distribution's gaussian_kde and
+# _spectrogram) import locally on first use.
+import importlib.util as _ilu_sp
+_SCIPY_OK = _ilu_sp.find_spec("scipy") is not None
 
 try:
     from sklearn.decomposition import PCA
@@ -313,6 +314,7 @@ class PlotlyRenderer:
                 continue
             x = df[col].dropna()
             if _SCIPY_OK:
+                from scipy import stats  # deferred — see probe at module top
                 kde_x = np.linspace(x.min(), x.max(), 300)
                 kde   = stats.gaussian_kde(x)
                 fig.add_trace(go.Scatter(x=kde_x, y=kde(kde_x),
@@ -358,6 +360,7 @@ class PlotlyRenderer:
     def _spectrogram(self, spec, df):
         if not _SCIPY_OK:
             raise ImportError("pip install scipy")
+        from scipy import signal  # deferred — see probe at module top
         col = spec.y_col or df.select_dtypes(include="number").columns[0]
         sig = df[col].dropna().values.astype(float)
         sr  = spec.fft_sample_rate

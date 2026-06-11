@@ -102,10 +102,12 @@ try:
 except Exception:
     sf = None
 
-try:
-    from faster_whisper import WhisperModel  # type: ignore
-except Exception:
-    WhisperModel = None
+# faster-whisper availability probe — find_spec locates the package
+# without executing it. The real import (3.2 s: ctranslate2 +
+# transformers) is deferred to SpeechToText.load(), i.e. first actual
+# use of the Speech tab, instead of taxing every app launch.
+import importlib.util as _ilu_fw
+_FASTER_WHISPER_OK = _ilu_fw.find_spec("faster_whisper") is not None
 
 
 # ============================================================
@@ -4239,7 +4241,7 @@ class SpeechToText:
     def ready(self) -> Tuple[bool, str]:
         if sd is None or sf is None:
             return False, "sounddevice/soundfile not installed."
-        if WhisperModel is None:
+        if not _FASTER_WHISPER_OK:
             return False, "faster-whisper not installed."
         return True, "OK"
 
@@ -4248,6 +4250,9 @@ class SpeechToText:
         if not ok:
             return ok, msg
         if self.model is None:
+            # Deferred heavy import — see the find_spec probe at module
+            # top. First Speech-tab use pays this once, not every launch.
+            from faster_whisper import WhisperModel  # type: ignore
             self.model = WhisperModel(
                 self.model_size,
                 device="cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu",

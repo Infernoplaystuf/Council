@@ -21,12 +21,13 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 # ── Crawl4AI (optional) ──────────────────────────────────────
-try:
-    import asyncio
-    from crawl4ai import AsyncWebCrawler, CacheMode
-    _CRAWL4AI_OK = True
-except ImportError:
-    _CRAWL4AI_OK = False
+# Probe-only at import time: find_spec locates the package without
+# executing it. Actually importing crawl4ai costs ~2 s (async
+# machinery + Playwright glue) and this module is imported at app
+# startup — the real import is deferred to _scrape_url_crawl4ai.
+import asyncio
+import importlib.util as _ilu
+_CRAWL4AI_OK = _ilu.find_spec("crawl4ai") is not None
 
 import council_engine as ce
 
@@ -156,6 +157,11 @@ def _scrape_url_crawl4ai(url: str, timeout: int = 15) -> Tuple[bool, str]:
     """Scrape a URL and return clean markdown using Crawl4AI."""
     if not _CRAWL4AI_OK:
         return False, "crawl4ai not installed"
+    # Deferred heavy import — see the find_spec probe at module top.
+    try:
+        from crawl4ai import AsyncWebCrawler, CacheMode
+    except Exception as exc:
+        return False, f"crawl4ai import failed: {exc!r}"
 
     async def _crawl():
         async with AsyncWebCrawler(verbose=False) as crawler:

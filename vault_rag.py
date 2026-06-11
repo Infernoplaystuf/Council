@@ -30,11 +30,15 @@ except ImportError:
     _CHROMA_OK = False
 
 # ── Sentence transformers for embeddings (optional) ──────────
-try:
-    from sentence_transformers import SentenceTransformer
-    _ST_OK = True
-except ImportError:
-    _ST_OK = False
+# Availability is probed WITHOUT importing: find_spec only locates the
+# package on disk (milliseconds), while actually importing
+# sentence_transformers executes torch + sklearn + transformers — 6.7 s
+# measured on the dev box. That cost used to land at app startup
+# because this module is imported by council_gui_engine at module
+# level; now it lands inside VaultRAG.__init__, which already runs on
+# the background RAG-indexing thread, off the critical startup path.
+import importlib.util as _ilu
+_ST_OK = _ilu.find_spec("sentence_transformers") is not None
 
 import council_engine as ce
 
@@ -229,6 +233,9 @@ class _ChromaBackend:
         if _ST_OK:
             device = os.environ.get("COUNCIL_EMBED_DEVICE", "").strip() or None
             try:
+                # Deferred heavy import — see the find_spec note at the
+                # top of this module.
+                from sentence_transformers import SentenceTransformer
                 self._embedder = SentenceTransformer(EMBED_MODEL, device=device) \
                     if device else SentenceTransformer(EMBED_MODEL)
                 print(f"[VaultRAG] Using sentence-transformers ({EMBED_MODEL}, device={device or 'auto'})")
