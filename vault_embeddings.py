@@ -83,6 +83,29 @@ EMBEDDINGS_FILENAME = "vault_embeddings.json"
 DEFAULT_MODEL = os.environ.get("COUNCIL_EMBED_MODEL", "all-MiniLM-L6-v2")
 
 
+def _model_is_cached(model_name: str) -> bool:
+    """Best-effort check: is this model already in the local HF hub
+    cache? Used to pass local_files_only=True so a cached model loads
+    with ZERO network calls. Detection failure returns False, which
+    just means today's behaviour (online check) — never worse."""
+    try:
+        hub = os.environ.get("HF_HUB_CACHE", "").strip()
+        if hub:
+            cache = Path(hub)
+        else:
+            home = os.environ.get("HF_HOME", "").strip()
+            cache = (Path(home) if home
+                     else Path.home() / ".cache" / "huggingface") / "hub"
+        slug = str(model_name).replace("/", "--")
+        for cand in (f"models--sentence-transformers--{slug}",
+                     f"models--{slug}"):
+            if (cache / cand).is_dir():
+                return True
+    except Exception:
+        pass
+    return False
+
+
 # ============================================================
 # Per-record text representation
 # ============================================================
@@ -224,10 +247,20 @@ class EmbeddingIndex:
         # CPU-only by default; sentence-transformers picks GPU if torch
         # sees CUDA. Override via COUNCIL_EMBED_DEVICE.
         device = os.environ.get("COUNCIL_EMBED_DEVICE")  # 'cuda' / 'cpu'
+        # When the model is already in the local HF cache, force
+        # local_files_only so the load NEVER touches the network.
+        # Without it, huggingface_hub HEAD-checks the repo on every
+        # load — behind a broken or TLS-intercepting proxy that's a
+        # 5-retry backoff stall (observed: SSL CERTIFICATE_VERIFY_FAILED
+        # x5) before the cached model loads anyway.
+        local_only = _model_is_cached(self.model_name)
         try:
             try:
-                self._model = SentenceTransformer(self.model_name, device=device)
+                self._model = SentenceTransformer(
+                    self.model_name, device=device,
+                    local_files_only=local_only)
             except TypeError:
+                # Older sentence-transformers without the kwarg(s)
                 self._model = SentenceTransformer(self.model_name)
         except Exception as exc:
             # Most common failure is "can't reach huggingface.co" — corporate

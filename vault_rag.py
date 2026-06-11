@@ -234,10 +234,20 @@ class _ChromaBackend:
             device = os.environ.get("COUNCIL_EMBED_DEVICE", "").strip() or None
             try:
                 # Deferred heavy import — see the find_spec note at the
-                # top of this module.
+                # top of this module. local_files_only when cached: a
+                # cached model must load with zero network calls (the
+                # default HEAD-check stalls through 5 SSL retries behind
+                # intercepting proxies before using the cache anyway).
                 from sentence_transformers import SentenceTransformer
-                self._embedder = SentenceTransformer(EMBED_MODEL, device=device) \
-                    if device else SentenceTransformer(EMBED_MODEL)
+                from vault_embeddings import _model_is_cached
+                _kw = {"local_files_only": _model_is_cached(EMBED_MODEL)}
+                if device:
+                    _kw["device"] = device
+                try:
+                    self._embedder = SentenceTransformer(EMBED_MODEL, **_kw)
+                except TypeError:   # older ST without local_files_only
+                    self._embedder = SentenceTransformer(EMBED_MODEL, device=device) \
+                        if device else SentenceTransformer(EMBED_MODEL)
                 print(f"[VaultRAG] Using sentence-transformers ({EMBED_MODEL}, device={device or 'auto'})")
             except Exception as exc:
                 print(f"[VaultRAG] embedder load failed ({exc!r}); falling back to ChromaDB default")
