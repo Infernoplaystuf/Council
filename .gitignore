@@ -1,0 +1,13 @@
+# Build artifacts — produced locally by build-windows.bat / build-linux.sh.
+# Binaries don't belong in git (they bloat every clone and exceed
+# GitHub's size limits). Ship the executable via GitHub Releases or a
+# file share instead, or have each user run the build script once.
+.build-venv/
+build/
+dist/
+*.spec.bak
+__pycache__/
+*.pyc
+
+# Per-user runtime data (saved connections, exports, audit log).
+.db_grabber/
