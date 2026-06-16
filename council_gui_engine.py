@@ -4110,6 +4110,17 @@ class InstructionManager:
 class CouncilConsole(tk.Tk):
     def __init__(self):
         super().__init__()
+        # Hide immediately, before any widgets are built. Otherwise Tk
+        # paints the half-constructed root while the ~15 tabs are being
+        # assembled — the "small version appears while loading then
+        # disappears" flicker. main() reveals the finished window after
+        # the splash (the geometry/scaling calls below are unaffected by
+        # being withdrawn). Reveal is guaranteed by main()'s splash
+        # on_done + an independent backstop timer.
+        try:
+            self.withdraw()
+        except Exception:
+            pass
         self.title(branding.window_title())
         branding.apply_window_icon(self)
         self.geometry("1150x820")
@@ -15404,41 +15415,97 @@ def _fmt_bytes(n: int) -> str:
     return f"{n}MB"
 
 
+# Hard reference to the live root window. Under an interactive host
+# (Spyder / IPython / Jupyter) the kernel already runs a Tk event loop,
+# so app.mainloop() returns immediately instead of blocking; main()
+# then returns and its `app` local would go out of scope, letting the
+# withdrawn root get garbage-collected before the splash ever reveals
+# it — the "splash shows then everything vanishes" bug. Keeping the
+# reference at module scope pins the window for the kernel's loop.
+_APP = None
+
+
+def _interactive_tk_loop_active() -> bool:
+    """True when we're inside an IPython/Spyder kernel that is already
+    pumping a Tk event loop (``%gui tk``). In that case our own
+    blocking mainloop() is unnecessary — and calling it can re-enter
+    the host's loop — so we skip it and let the kernel drive the UI."""
+    try:
+        from IPython import get_ipython  # type: ignore
+    except Exception:
+        return False
+    try:
+        ip = get_ipython()
+        if ip is None:
+            return False
+        return getattr(ip, "active_eventloop", None) in ("tk", "tkinter")
+    except Exception:
+        return False
+
+
 def main():
+    global _APP
+
     # Install system-level crash hooks BEFORE the GUI exists so any error
     # during startup is captured. Tk hook gets wired after the root window
     # is created (inside CouncilConsole.__init__).
     def _on_crash(crash_path):
         # Defer dialog to the Tk main loop — show_dialog needs a parent.
         try:
-            if app and app.winfo_exists():
-                app.after(0, lambda: crash_reporter.show_dialog(app, crash_path))
+            if _APP and _APP.winfo_exists():
+                _APP.after(0, lambda: crash_reporter.show_dialog(_APP, crash_path))
         except Exception:
             pass
     crash_reporter.install(VAULT_DIR, on_crash=_on_crash)
 
     app = CouncilConsole()
+    _APP = app                      # pin against GC under interactive hosts
     crash_reporter.install_tk_hook(app, VAULT_DIR, on_crash=_on_crash)
 
     # Splash: hide the main window briefly, run the spinning-cog
-    # animation, then reveal. If the splash fails (e.g. on a stripped-down
-    # tk build), the app still launches normally.
-    try:
-        app.withdraw()
-        def _reveal():
+    # animation, then reveal. The reveal is made bulletproof with three
+    # independent guarantees, because a withdrawn root that never
+    # re-appears is a dead app:
+    #   1. an idempotent _reveal() (safe to call more than once),
+    #   2. the splash's on_done callback (the normal path), AND
+    #   3. an independent backstop timer on the app itself — so even if
+    #      the splash construction half-fails or its callback never
+    #      fires (interactive-host event-loop quirks), the window still
+    #      appears a beat later.
+    _revealed = {"done": False}
+
+    def _reveal():
+        if _revealed["done"]:
+            return
+        _revealed["done"] = True
+        try:
+            app.deiconify()
+            app.lift()
+            app.focus_force()
+        except Exception as e:
+            # Do NOT swallow silently — a failed reveal means a blank
+            # session, and the reason needs to reach the console.
+            print(f"[Splash] reveal failed, showing window directly: {e!r}")
             try:
                 app.deiconify()
-                app.lift()
-                app.focus_force()
             except Exception:
                 pass
+
+    try:
+        app.withdraw()
         splash.show_splash(app, duration_ms=1800, on_done=_reveal)
+        # Backstop — fires slightly after the splash's own dismiss so the
+        # window is guaranteed visible regardless of the splash path.
+        app.after(2200, _reveal)
     except Exception as e:
         print(f"[Splash] Skipping animation: {e}")
-        try: app.deiconify()
-        except Exception: pass
+        _reveal()
 
-    app.mainloop()
+    # Only run our own blocking loop when a host loop isn't already
+    # pumping Tk. Under Spyder/IPython %gui tk the kernel drives events
+    # (and keeps _APP alive), so mainloop() here is unnecessary.
+    if not _interactive_tk_loop_active():
+        app.mainloop()
 
 
 def _purge_stale_pycache():
