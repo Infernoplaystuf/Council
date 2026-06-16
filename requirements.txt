@@ -1,0 +1,21 @@
+# Database Grabber — standalone read-only DB connector + exporter.
+#
+# Core (always needed):
+pandas>=1.5
+SQLAlchemy>=2.0
+openpyxl>=3.1            # Excel (.xlsx) export
+
+# MongoDB support:
+pymongo>=4.0
+
+# SQL drivers — install the ones you actually connect to. They are
+# optional at runtime (the app shows a clear "driver not installed"
+# message), but to BUNDLE support for a database into the packaged
+# executable, its driver must be present when you run PyInstaller.
+psycopg2-binary>=2.9    # PostgreSQL
+PyMySQL>=1.1            # MySQL / MariaDB
+pyodbc>=5.0             # Microsoft SQL Server (also needs a system ODBC driver)
+duckdb>=0.9             # DuckDB files
+
+# Build-time only (produces the standalone executable):
+pyinstaller>=6.0
