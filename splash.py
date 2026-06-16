@@ -97,10 +97,20 @@ class SplashWindow(tk.Toplevel):
 
     def __init__(self, parent: tk.Tk,
                  duration_ms: int = 1800,
-                 on_done: Optional[Callable[[], None]] = None):
+                 on_done: Optional[Callable[[], None]] = None,
+                 manual: bool = False):
         super().__init__(parent)
         self.parent = parent
         self.on_done = on_done
+        # Manual mode: the caller controls dismissal (via dismiss()) and
+        # keeps the cog turning during a blocking section with pump().
+        # Used to COVER the host window's construction — the splash goes
+        # up first, spins one frame per build step while the Tk loop is
+        # blocked, then the caller dismisses once the build is done and a
+        # minimum display time has elapsed. Non-manual mode keeps the
+        # original fire-and-forget behaviour (auto-dismiss after
+        # duration_ms).
+        self.manual = bool(manual)
 
         # Frameless, on-top
         self.overrideredirect(True)
@@ -166,17 +176,40 @@ class SplashWindow(tk.Toplevel):
         self._flame_core_id   = None
         self._spark_ids = []
 
-        # Begin animation
+        # Begin animation. The after-driven loop spins the cog whenever
+        # the Tk event loop is live. During a blocking host construction
+        # the loop can't run — pump() advances frames in that window.
         self.after(10, self._animate)
-        # Schedule auto-close
-        self.after(self._duration_ms, self._dismiss)
+        # Auto-close only in fire-and-forget mode. Manual callers dismiss
+        # explicitly so the splash can cover an arbitrarily long load.
+        if not self.manual:
+            self.after(self._duration_ms, self._dismiss)
 
     # ---- Animation -------------------------------------------------
 
     def _animate(self):
+        """Driven by the Tk after-loop: render one frame, reschedule."""
         if self._cancelled or not self.winfo_exists():
             return
+        self._animate_once()
+        self.after(self.FRAME_MS, self._animate)
 
+    def pump(self):
+        """Render ONE frame synchronously and flush the redraw, WITHOUT
+        dispatching the event queue. Call this between steps of a long
+        blocking operation (e.g. building the host window's tabs) so the
+        cog keeps turning even though the Tk loop isn't running yet.
+        update_idletasks() repaints but does not process input events,
+        so it can't re-enter the caller's construction code."""
+        if self._cancelled or not self.winfo_exists():
+            return
+        try:
+            self._animate_once()
+            self.update_idletasks()
+        except tk.TclError:
+            pass
+
+    def _animate_once(self):
         self._rotation += self.ROT_PER_FRAME
         self._frame += 1
         c = self.canvas
@@ -254,10 +287,14 @@ class SplashWindow(tk.Toplevel):
             self._spark_ids.append((sid, random.randint(8, 16),
                                      random.uniform(0.8, 1.6)))
 
-        # Schedule next frame
-        self.after(self.FRAME_MS, self._animate)
-
     # ---- Dismiss ---------------------------------------------------
+
+    def dismiss(self, on_done: Optional[Callable[[], None]] = None):
+        """Public dismissal for manual-mode callers. If ``on_done`` is
+        given it overrides the one set at construction."""
+        if on_done is not None:
+            self.on_done = on_done
+        self._dismiss()
 
     def _dismiss(self):
         if self._cancelled:
@@ -279,10 +316,17 @@ class SplashWindow(tk.Toplevel):
 
 def show_splash(parent: tk.Tk,
                 duration_ms: int = 1800,
-                on_done: Optional[Callable[[], None]] = None) -> SplashWindow:
+                on_done: Optional[Callable[[], None]] = None,
+                manual: bool = False) -> SplashWindow:
     """
     Show the splash window. `parent` should be a withdrawn root window;
     deiconify it inside `on_done` to reveal the main UI when the splash
     finishes.
+
+    ``manual=True`` suppresses the auto-dismiss timer: the caller spins
+    the cog through a blocking load with ``pump()`` and ends it with
+    ``dismiss(on_done=...)`` once the load is done. Used to cover the
+    host window's entire construction.
     """
-    return SplashWindow(parent, duration_ms=duration_ms, on_done=on_done)
+    return SplashWindow(parent, duration_ms=duration_ms,
+                        on_done=on_done, manual=manual)

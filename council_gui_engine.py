@@ -4178,6 +4178,24 @@ class CouncilConsole(tk.Tk):
         self._base_title = branding.window_title()
         self.after(500, self._refresh_title_with_n_ctx)
 
+        # ── Loading splash (covers the whole construction) ───────────
+        # Bring the spinning-cog splash up NOW, before the heavy
+        # personality/engine/agent wiring and the ~15-tab build below.
+        # Manual mode = no auto-dismiss; we pump one frame per heavy step
+        # (the Tk loop is blocked during synchronous construction, so the
+        # cog can't spin on its own) and main() dismisses + reveals once
+        # construction is done and a minimum display time has elapsed.
+        import time as _time
+        self._splash = None
+        self._splash_started = _time.monotonic()
+        try:
+            import splash as _splash_mod
+            self._splash = _splash_mod.show_splash(self, manual=True)
+            self._splash.pump()
+        except Exception as _e:
+            print(f"[Splash] could not start loading screen: {_e!r}")
+            self._splash = None
+
         self.ui_q: queue.Queue = queue.Queue()
         # Pause/resume for personality clarification requests
         self._pause_event = threading.Event()
@@ -4346,6 +4364,8 @@ class CouncilConsole(tk.Tk):
         else:
             self.intern_agent = None
 
+        self._pump_splash()
+
         # ── RAG ───────────────────────────────────────────────
         if _RAG_OK:
             self.rag = vr.VaultRAG(
@@ -4357,8 +4377,10 @@ class CouncilConsole(tk.Tk):
         else:
             self.rag = None
 
+        self._pump_splash()
         self._build_ui()
         self._apply_dark_theme()
+        self._pump_splash()
         self.after(100, self._poll_ui_queue)
         self.after(2000, self._refresh_nodes_async)   # initial node probe
         self._start_config_watcher()                   # T1-E: hot-reload pins.json
@@ -4630,6 +4652,14 @@ class CouncilConsole(tk.Tk):
         except Exception as e:
             self.ui_q.put(("agent_phase", "rag_index", f"RAG index error: {e}"))
 
+    def _pump_splash(self):
+        """Advance the loading-cog one frame during blocking construction.
+        No-op once the splash is gone. Cheap (one frame + redraw, no
+        event dispatch) so peppering build steps with it is safe."""
+        sp = getattr(self, "_splash", None)
+        if sp is not None:
+            sp.pump()
+
     def _build_ui(self):
         self.nb = ttk.Notebook(self)
         self.nb.pack(fill="both", expand=True, padx=6, pady=6)
@@ -4642,16 +4672,20 @@ class CouncilConsole(tk.Tk):
         # 5) Re-visit           → Sessions
         # 6) Manage data        → Vault
         # 7) Speech I/O         → Speech
-        self._build_council_tab()
-        self._build_dream3d_tab()
-        self._build_grapher_tab()
-        self._build_specialists_tab()
-        self._build_lens_tab()
-        self._build_sessions_tab()
-        self._build_vault_manager_tab()
-        self._build_speech_tab()
-        self._build_changelog_tab()
-        self._build_diagnostics_tab()
+        # Pump the loading-cog after each tab so it visibly turns while
+        # the Tk event loop is blocked building widgets.
+        for _build in (self._build_council_tab,
+                       self._build_dream3d_tab,
+                       self._build_grapher_tab,
+                       self._build_specialists_tab,
+                       self._build_lens_tab,
+                       self._build_sessions_tab,
+                       self._build_vault_manager_tab,
+                       self._build_speech_tab,
+                       self._build_changelog_tab,
+                       self._build_diagnostics_tab):
+            _build()
+            self._pump_splash()
 
         # ── Advanced / admin tabs ──
         # Hidden by default unless explicitly enabled. Power users and
@@ -4659,12 +4693,14 @@ class CouncilConsole(tk.Tk):
         # COUNCIL_ADVANCED=1 to expose the IDE, Agents panel, Librarian
         # snapshots, Nodes, Vault Health, and Apothecary tabs.
         if _ADVANCED_MODE:
-            self._build_ide_tab()
-            self._build_librarian_tab()
-            self._build_agents_tab()
-            self._build_nodes_tab()
-            self._build_vault_health_tab()
-            self._build_apoth_tab()
+            for _build in (self._build_ide_tab,
+                           self._build_librarian_tab,
+                           self._build_agents_tab,
+                           self._build_nodes_tab,
+                           self._build_vault_health_tab,
+                           self._build_apoth_tab):
+                _build()
+                self._pump_splash()
 
     # ---- Backend strip (model backend selector) ----
 
@@ -15458,20 +15494,21 @@ def main():
             pass
     crash_reporter.install(VAULT_DIR, on_crash=_on_crash)
 
+    # The splash is created and pumped INSIDE CouncilConsole.__init__ so
+    # the spinning cog covers the entire construction (heavy model /
+    # personality wiring + the ~15-tab build). The root is withdrawn the
+    # whole time. By the time CouncilConsole() returns, construction is
+    # done and the cog has been turning; here we just enforce a minimum
+    # on-screen time, then dismiss the splash and reveal the window.
     app = CouncilConsole()
     _APP = app                      # pin against GC under interactive hosts
     crash_reporter.install_tk_hook(app, VAULT_DIR, on_crash=_on_crash)
 
-    # Splash: hide the main window briefly, run the spinning-cog
-    # animation, then reveal. The reveal is made bulletproof with three
-    # independent guarantees, because a withdrawn root that never
-    # re-appears is a dead app:
-    #   1. an idempotent _reveal() (safe to call more than once),
-    #   2. the splash's on_done callback (the normal path), AND
-    #   3. an independent backstop timer on the app itself — so even if
-    #      the splash construction half-fails or its callback never
-    #      fires (interactive-host event-loop quirks), the window still
-    #      appears a beat later.
+    # Reveal is made bulletproof with independent guarantees, because a
+    # withdrawn root that never re-appears is a dead app: an idempotent
+    # _reveal(), the splash dismiss's on_done (normal path), AND a
+    # backstop timer — so an event-loop quirk can't strand the window.
+    _MIN_SPLASH_MS = 1500
     _revealed = {"done": False}
 
     def _reveal():
@@ -15491,14 +15528,29 @@ def main():
             except Exception:
                 pass
 
+    def _finish_splash_and_reveal():
+        sp = getattr(app, "_splash", None)
+        if sp is not None:
+            try:
+                sp.dismiss(on_done=_reveal)   # destroy cog, then reveal
+                return
+            except Exception:
+                pass
+        _reveal()
+
     try:
-        app.withdraw()
-        splash.show_splash(app, duration_ms=1800, on_done=_reveal)
-        # Backstop — fires slightly after the splash's own dismiss so the
-        # window is guaranteed visible regardless of the splash path.
-        app.after(2200, _reveal)
+        import time as _time
+        started = getattr(app, "_splash_started", _time.monotonic())
+        elapsed_ms = (_time.monotonic() - started) * 1000.0
+        remaining = max(0, int(_MIN_SPLASH_MS - elapsed_ms))
+        # During `remaining`, the splash's own after-loop spins the cog
+        # smoothly (the Tk loop is live now). Then dismiss + reveal.
+        app.after(remaining, _finish_splash_and_reveal)
+        # Backstop — guarantees the window appears even if the dismiss
+        # path or its on_done never completes.
+        app.after(remaining + 1500, _reveal)
     except Exception as e:
-        print(f"[Splash] Skipping animation: {e}")
+        print(f"[Splash] reveal scheduling failed: {e}")
         _reveal()
 
     # Only run our own blocking loop when a host loop isn't already
