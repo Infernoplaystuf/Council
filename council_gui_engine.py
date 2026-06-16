@@ -4188,13 +4188,23 @@ class CouncilConsole(tk.Tk):
         import time as _time
         self._splash = None
         self._splash_started = _time.monotonic()
-        try:
-            import splash as _splash_mod
-            self._splash = _splash_mod.show_splash(self, manual=True)
-            self._splash.pump()
-        except Exception as _e:
-            print(f"[Splash] could not start loading screen: {_e!r}")
-            self._splash = None
+        # Under Spyder/IPython the host's Qt loop + in-process threads make
+        # the Tk splash-pump and the off-main-thread torch load unsafe, so
+        # we detect that here and take the simpler path (no splash, reveal
+        # now, no RAG auto-thread). Normal .exe / CLI launches are
+        # unaffected.
+        self._interactive_host = _under_interactive_host()
+        if not self._interactive_host:
+            try:
+                import splash as _splash_mod
+                self._splash = _splash_mod.show_splash(self, manual=True)
+                self._splash.pump()
+            except Exception as _e:
+                print(f"[Splash] could not start loading screen: {_e!r}")
+                self._splash = None
+        else:
+            print("[startup] Interactive host (Spyder/IPython) detected — "
+                  "splash disabled; window shows immediately.", flush=True)
 
         self.ui_q: queue.Queue = queue.Queue()
         # Pause/resume for personality clarification requests
@@ -4372,8 +4382,19 @@ class CouncilConsole(tk.Tk):
                 vault_dir=VAULT_DIR,
                 chroma_dir=VAULT_DIR / ".chromadb",
             )
-            # Index in background so startup isn't blocked
-            threading.Thread(target=self._init_rag_index, daemon=True).start()
+            if self._interactive_host:
+                # Do NOT load torch/sentence-transformers on a background
+                # thread under Spyder/IPython — off-main-thread CUDA init
+                # segfaults the kernel (~30 s in). Keyword search works
+                # without it; rebuild the semantic index on demand from
+                # the Vault tab.
+                print("[startup] RAG auto-index skipped under interactive "
+                      "host (avoids off-main-thread torch crash). Use the "
+                      "Vault tab to build it if you need semantic search.",
+                      flush=True)
+            else:
+                # Index in background so startup isn't blocked
+                threading.Thread(target=self._init_rag_index, daemon=True).start()
         else:
             self.rag = None
 
@@ -4394,6 +4415,17 @@ class CouncilConsole(tk.Tk):
             self, VAULT_DIR,
             on_complete=lambda _ok: self.after(400, self._check_license_status),
         ))
+
+        # Interactive host: no splash will reveal us, so show the finished
+        # window now (it was withdrawn at the top of __init__ to avoid the
+        # construction flicker). main() does the splash-timed reveal for
+        # the normal launch path.
+        if self._interactive_host:
+            try:
+                self.deiconify()
+                self.lift()
+            except Exception:
+                pass
 
     def _unpack_personalities(self):
         # Required core personalities — missing any of these is a config error
@@ -15557,6 +15589,34 @@ def _fmt_bytes(n: int) -> str:
 _APP = None
 
 
+def _under_interactive_host() -> bool:
+    """True when running inside an IPython / Spyder / Jupyter kernel
+    rather than a plain ``python …`` launch or the frozen .exe.
+
+    Such hosts run their OWN Qt event loop and worker threads in the
+    same process, which makes two things from the normal startup path
+    unsafe:
+      • pumping a Tk splash with update_idletasks() while the host's Qt
+        loop is also live, and
+      • initialising torch / CUDA on a BACKGROUND thread (the RAG
+        indexer) — off-main-thread CUDA init segfaults the kernel about
+        30 s in, which is the "no tabs then the kernel dies" report.
+
+    Under an interactive host we take a simpler, deterministic path: no
+    splash, reveal the window immediately, and skip the auto-start of
+    the torch-loading RAG thread. Vault keyword search still works;
+    full-document semantic RAG can be built on demand from the Vault
+    tab. The normal .exe / CLI launch is unaffected.
+    """
+    try:
+        from IPython import get_ipython  # type: ignore
+        if get_ipython() is not None:
+            return True
+    except Exception:
+        pass
+    return ("spyder_kernels" in sys.modules) or ("spyder" in sys.modules)
+
+
 def main():
     global _APP
 
@@ -15616,20 +15676,26 @@ def main():
                 pass
         _reveal()
 
-    try:
-        import time as _time
-        started = getattr(app, "_splash_started", _time.monotonic())
-        elapsed_ms = (_time.monotonic() - started) * 1000.0
-        remaining = max(0, int(_MIN_SPLASH_MS - elapsed_ms))
-        # During `remaining`, the splash's own after-loop spins the cog
-        # smoothly (the Tk loop is live now). Then dismiss + reveal.
-        app.after(remaining, _finish_splash_and_reveal)
-        # Backstop — guarantees the window appears even if the dismiss
-        # path or its on_done never completes.
-        app.after(remaining + 1500, _reveal)
-    except Exception as e:
-        print(f"[Splash] reveal scheduling failed: {e}")
+    if getattr(app, "_interactive_host", False):
+        # No splash under Spyder/IPython — __init__ already deiconified;
+        # this just guarantees it and avoids relying on deferred timers
+        # the host's loop may pump only intermittently.
         _reveal()
+    else:
+        try:
+            import time as _time
+            started = getattr(app, "_splash_started", _time.monotonic())
+            elapsed_ms = (_time.monotonic() - started) * 1000.0
+            remaining = max(0, int(_MIN_SPLASH_MS - elapsed_ms))
+            # During `remaining`, the splash's own after-loop spins the cog
+            # smoothly (the Tk loop is live now). Then dismiss + reveal.
+            app.after(remaining, _finish_splash_and_reveal)
+            # Backstop — guarantees the window appears even if the dismiss
+            # path or its on_done never completes.
+            app.after(remaining + 1500, _reveal)
+        except Exception as e:
+            print(f"[Splash] reveal scheduling failed: {e}")
+            _reveal()
 
     # Always run our own blocking loop — the standard way every Tk app
     # runs, including inside Spyder/IPython. The earlier "skip mainloop
