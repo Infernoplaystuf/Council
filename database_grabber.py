@@ -354,6 +354,17 @@ def _open_folder(path: Path):
 
 
 def main():
+    # --self-test: construct the window, pump one update, exit 0. Lets a
+    # packaging build verify the bundle actually starts (all DLLs + Tk +
+    # imports resolve) WITHOUT blocking forever in mainloop. Prints a
+    # sentinel so an automated build check can confirm success.
+    if "--self-test" in sys.argv:
+        app = DatabaseGrabberApp()
+        app.update_idletasks()
+        app.update()
+        app.destroy()
+        print("SELFTEST OK")
+        return
     app = DatabaseGrabberApp()
     app.mainloop()
 

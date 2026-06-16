@@ -15,6 +15,23 @@
 # not cross-compile — build on each OS you want to ship to.
 # ============================================================
 
+import os
+import sys
+
+# Conda fix: when building under a conda Python (or a venv based on one),
+# the C extensions — pyexpat, _sqlite3, _tkinter — link against DLLs
+# (libexpat.dll, sqlite3.dll, tcl86t.dll, tk86t.dll, libssl/libcrypto…)
+# that live in <env>\Library\bin, which is NOT on PATH during the build.
+# Without this, PyInstaller can't follow the dependency chain and the
+# resulting exe dies at startup with "ImportError: DLL load failed while
+# importing pyexpat". Prepend the base interpreter's DLL dirs so the
+# scanner resolves and bundles them. No-op on a standard python.org
+# build (those folders don't exist there), so the spec stays portable.
+for _sub in ("Library\\bin", "DLLs", "Library\\mingw-w64\\bin", ""):
+    _d = os.path.join(sys.base_prefix, _sub)
+    if os.path.isdir(_d):
+        os.environ["PATH"] = _d + os.pathsep + os.environ.get("PATH", "")
+
 block_cipher = None
 
 # Hidden imports: SQLAlchemy dialects, the DB drivers, and pandas'
