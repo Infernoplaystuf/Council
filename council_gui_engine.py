@@ -10346,6 +10346,23 @@ class CouncilConsole(tk.Tk):
                           font=("Consolas", 9))
         lst.pack(fill="x")
 
+        # Middle: export row — pull the SELECTED table/collection to a
+        # file in vault/data_out/db_exports/. Read-only by construction
+        # (routes through db_connections.export_*, which only READ from
+        # the DB and WRITE a local file — no DB-write path exists).
+        export_bar = ttk.Frame(win)
+        export_bar.pack(fill="x", padx=6, pady=(2, 0))
+        ttk.Label(export_bar, text="Export selected →",
+                   foreground="#a6adc8").pack(side="left", padx=(0, 4))
+        for _fmt, _lbl in (("csv", "CSV"), ("json", "JSON"), ("xlsx", "Excel")):
+            ttk.Button(
+                export_bar, text=_lbl, width=7,
+                command=lambda f=_fmt: _export_selected(f),
+            ).pack(side="left", padx=2)
+        ttk.Label(export_bar,
+                   text="(full table, read-only — never deletes)",
+                   foreground="#6c7086", font=("", 8)).pack(side="left", padx=6)
+
         # Bottom: preview text
         preview_lf = ttk.LabelFrame(win,
                                     text="Preview (first 50 rows, read-only)")
@@ -10404,6 +10421,52 @@ class CouncilConsole(tk.Tk):
                 self._vmgr_append(
                     f"preview failed for {kind} {name}.{picked}: {exc}",
                     "err")
+
+        def _export_selected(fmt: str):
+            sel2 = lst.curselection()
+            if not sel2:
+                messagebox.showinfo(
+                    "Pick a table",
+                    "Select a table/collection in the list first.",
+                    parent=win)
+                return
+            picked = lst.get(sel2[0])
+            try:
+                import data_index as _di
+                export_dir = _di.output_dir(VAULT_DIR) / "db_exports"
+            except Exception:
+                export_dir = VAULT_DIR / "data_out" / "db_exports"
+            dest = export_dir / _db._safe_export_name(
+                f"{name}__{picked}", fmt)
+            preview.delete("1.0", "end")
+            preview.insert("end", f"exporting {picked} → {dest} …\n")
+            self.update_idletasks()
+            try:
+                if kind == "mongo":
+                    if "." not in picked:
+                        raise ValueError("expected db.collection format")
+                    db_name, coll = picked.split(".", 1)
+                    info = _db.export_mongo_collection(
+                        VAULT_DIR, name, db_name, coll, dest, fmt=fmt)
+                else:
+                    info = _db.export_sql_table(
+                        VAULT_DIR, name, picked, dest, fmt=fmt)
+                preview.delete("1.0", "end")
+                preview.insert(
+                    "end",
+                    f"✓ exported {info['rows']} row(s) to:\n{info['path']}\n")
+                self._vmgr_append(
+                    f"exported {kind} {name}.{picked} → "
+                    f"{info['rows']} row(s) ({fmt}) at {info['path']}", "ok")
+                try:
+                    self._open_in_explorer(Path(info["path"]).parent)
+                except Exception:
+                    pass
+            except Exception as exc:
+                preview.delete("1.0", "end")
+                preview.insert("end", f"✗ export failed: {exc!r}\n")
+                self._vmgr_append(
+                    f"export failed for {kind} {name}.{picked}: {exc}", "err")
 
         lst.bind("<<ListboxSelect>>", _on_pick)
         _populate_tables_or_collections()

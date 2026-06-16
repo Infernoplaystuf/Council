@@ -956,6 +956,121 @@ def mongo_distinct(
 
 
 # ============================================================
+# Export — pull data OUT of a DB into a local file
+# ============================================================
+#
+# Every export routes through the read-only readers above
+# (read_sql_table / sql_query / read_mongo_collection). There is NO
+# code path here that writes to the database — these functions only
+# READ from the DB and WRITE to a local file under the vault. The
+# read-only guarantee is therefore inherited wholesale: an export can
+# no more delete a row than read_sql_table can.
+
+_EXPORT_FORMATS = ("csv", "json", "xlsx")
+
+
+def _safe_export_name(stem: str, fmt: str) -> str:
+    """Sanitise a table/collection name into a filename. Strips path
+    separators and odd characters so a remote object called
+    ``../../etc`` or ``my db.tbl`` can't escape the export dir."""
+    import re as _re
+    base = _re.sub(r"[^A-Za-z0-9._-]+", "_", str(stem)).strip("._") or "export"
+    return f"{base}.{fmt}"
+
+
+def _write_dataframe(df: "pd.DataFrame", dest_path: Any, fmt: str) -> str:
+    """Write a DataFrame to ``dest_path`` in ``fmt``. Returns the path
+    written. Raises ValueError for an unknown/unavailable format. This
+    is the ONLY filesystem write in the export path — it never touches
+    a database."""
+    fmt = str(fmt or "").lower().lstrip(".")
+    p = Path(dest_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if fmt == "csv":
+        df.to_csv(p, index=False)
+    elif fmt == "json":
+        # records orientation = a JSON array of row objects; readable
+        # and re-importable. date_format=iso keeps timestamps sane.
+        df.to_json(p, orient="records", indent=2, date_format="iso")
+    elif fmt == "xlsx":
+        try:
+            df.to_excel(p, index=False)
+        except Exception as exc:
+            raise ValueError(
+                "Excel export needs openpyxl. Install it, or export to "
+                f"CSV/JSON instead. Original error: {exc}") from exc
+    elif fmt in ("parquet", "pq"):
+        try:
+            df.to_parquet(p, index=False)
+        except Exception as exc:
+            raise ValueError(
+                "Parquet export needs pyarrow or fastparquet (not "
+                "installed). Export to CSV/JSON/Excel instead. "
+                f"Original error: {exc}") from exc
+    else:
+        raise ValueError(
+            f"unknown export format {fmt!r}; use one of {_EXPORT_FORMATS}")
+    return str(p)
+
+
+def export_sql_table(
+    vault_dir: Any,
+    conn_name: str,
+    table: str,
+    dest_path: Any,
+    *,
+    fmt: str = "csv",
+    limit: Optional[int] = 100000,
+) -> Dict[str, Any]:
+    """Read a SQL table (SELECT-only) and write it to a local file.
+    Returns {"path", "rows", "format"}. Never writes to the DB."""
+    df = read_sql_table(vault_dir, conn_name, table, limit=limit)
+    written = _write_dataframe(df, dest_path, fmt)
+    _audit(vault_dir, kind="sql.export", conn=conn_name, table=table,
+            rows=len(df), fmt=fmt, dest=written, limit=limit)
+    return {"path": written, "rows": int(len(df)), "format": fmt}
+
+
+def export_sql_query(
+    vault_dir: Any,
+    conn_name: str,
+    sql: str,
+    dest_path: Any,
+    *,
+    fmt: str = "csv",
+) -> Dict[str, Any]:
+    """Run a validated SELECT-only query and write the result to a file.
+    Never writes to the DB (sql_query rejects any non-SELECT)."""
+    df = sql_query(vault_dir, conn_name, sql)
+    written = _write_dataframe(df, dest_path, fmt)
+    _audit(vault_dir, kind="sql.export_query", conn=conn_name,
+            sql=str(sql)[:500], rows=len(df), fmt=fmt, dest=written)
+    return {"path": written, "rows": int(len(df)), "format": fmt}
+
+
+def export_mongo_collection(
+    vault_dir: Any,
+    conn_name: str,
+    db_name: str,
+    collection: str,
+    dest_path: Any,
+    *,
+    fmt: str = "csv",
+    query: Optional[Dict[str, Any]] = None,
+    limit: Optional[int] = 100000,
+) -> Dict[str, Any]:
+    """Read a Mongo collection (find(), read-only) and write it to a
+    local file. Never writes to the DB."""
+    df = read_mongo_collection(vault_dir, conn_name, db_name, collection,
+                                query=query, limit=limit)
+    written = _write_dataframe(df, dest_path, fmt)
+    _audit(vault_dir, kind="mongo.export", conn=conn_name, db=db_name,
+            collection=collection, rows=len(df), fmt=fmt, dest=written,
+            limit=limit)
+    return {"path": written, "rows": int(len(df)), "format": fmt}
+
+
+# ============================================================
 # Test helpers — used by the Vault tab's "Test connection" button
 # ============================================================
 

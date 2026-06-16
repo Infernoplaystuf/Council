@@ -55,6 +55,28 @@ admin-credential case is what the layered enforcement below is for.
 4. Click **💾 Save**.
 5. Click **🧪 Test** — verifies connectivity and the read-only role.
 6. Double-click the saved connection in the list to open a Browser window showing tables (SQL) or `db.collection` pairs (Mongo). Click any entry to preview the first 50 rows.
+7. **Export** — with a table/collection selected in the browser window, click **CSV**, **JSON**, or **Excel** to pull the full object to a file under `vault/data_out/db_exports/`. The export folder opens automatically when the write finishes.
+
+### Exporting data (pull, never push)
+
+Exports route through the same read-only readers as everything else
+(`read_sql_table` / `sql_query` / `read_mongo_collection`) and then write
+a **local file** — there is no code path that writes back to the
+database. An export can no more delete a row than a preview can. The
+underlying functions, callable from the analyst sandbox too:
+
+```python
+db.export_sql_table(VAULT_DIR, "sales_db", "orders", dest, fmt="csv")
+db.export_sql_query(VAULT_DIR, "sales_db", "SELECT * FROM orders WHERE total > 100", dest, fmt="json")
+db.export_mongo_collection(VAULT_DIR, "logs", "app", "events", dest, fmt="xlsx", query={"level": "error"})
+```
+
+Formats: `csv`, `json`, `xlsx` (Excel needs `openpyxl`; `parquet` works
+only if `pyarrow`/`fastparquet` is installed, otherwise you get a clear
+error pointing you at CSV/JSON). Default row cap is 100 000 (`limit=None`
+lifts it, logged to the audit). `export_sql_query` runs the SELECT-only
+validator **before opening a connection**, so a `DELETE`/`DROP` dressed
+up as an export query is rejected up front.
 
 The saved connection appears in the list with the password masked:
 

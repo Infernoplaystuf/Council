@@ -1099,6 +1099,94 @@ def test_db_mongo_roundtrip_mongomock() -> None:
         _db._mongo_client = real_mongo_client   # type: ignore[assignment]
 
 
+def test_db_export_write_formats() -> None:
+    """_write_dataframe writes CSV/JSON/Excel correctly, rejects unknown
+    formats, and _safe_export_name neutralises path traversal. Needs
+    only pandas — no DB."""
+    import db_connections as _db
+    import pandas as _pd
+    df = _pd.DataFrame({"id": [1, 2, 3], "name": ["a", "b", "c"]})
+    with tempfile.TemporaryDirectory() as td:
+        base = Path(td)
+        # CSV
+        p = _db._write_dataframe(df, base / "out.csv", "csv")
+        _check("csv written", Path(p).is_file())
+        _check("csv round-trips 3 rows", len(_pd.read_csv(p)) == 3)
+        # JSON
+        p = _db._write_dataframe(df, base / "out.json", "json")
+        _check("json round-trips 3 rows", len(_pd.read_json(p)) == 3)
+        # Excel (openpyxl present in this env)
+        try:
+            p = _db._write_dataframe(df, base / "out.xlsx", "xlsx")
+            _check("xlsx written", Path(p).is_file())
+        except ValueError:
+            _check("xlsx unavailable handled cleanly (ValueError)", True)
+        # Unknown format rejected
+        _check("unknown format rejected",
+               _raises(ValueError,
+                       lambda: _db._write_dataframe(df, base / "x.zzz", "zzz")))
+        # Path-traversal name neutralised
+        safe = _db._safe_export_name("../../etc/passwd", "csv")
+        _check("traversal stripped from export name",
+               "/" not in safe and "\\" not in safe and safe.endswith(".csv"))
+
+
+def test_db_export_query_cannot_write() -> None:
+    """The KEY guarantee for exports: export_sql_query routes through the
+    SELECT-only validator, so a DELETE/DROP dressed up as an export is
+    rejected BEFORE any connection is opened. Proven without a live DB —
+    the validator runs first."""
+    import db_connections as _db
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td)
+        _db.save_sql_connection(vault, "x", "sqlite:///:memory:")
+        for bad in ("DELETE FROM users",
+                    "DROP TABLE users",
+                    "TRUNCATE t",
+                    "UPDATE t SET a=1",
+                    "SELECT 1; DELETE FROM users"):
+            _check(f"export blocks {bad.split()[0]}",
+                   _raises(_db.ReadOnlyViolation,
+                           lambda b=bad: _db.export_sql_query(
+                               vault, "x", b, Path(td) / "o.csv")))
+    # And the public API exposes NO database-write verb.
+    public = [n for n in dir(_db) if not n.startswith("_") and callable(getattr(_db, n))]
+    write_verbs = ("insert", "update", "delete", "drop", "truncate", "to_sql")
+    offenders = [n for n in public
+                 if any(v in n.lower() for v in write_verbs)
+                 and n not in ("remove_sql_connection", "remove_mongo_connection")]
+    _check(f"no DB-write function in public API (found {offenders})",
+           not offenders)
+
+
+def test_db_export_mongo_roundtrip() -> None:
+    """export_mongo_collection reads via find() and writes a real CSV.
+    mongomock-backed; skips with PASS when mongomock isn't installed."""
+    try:
+        import mongomock  # type: ignore[import]
+    except ImportError:
+        _check("mongomock not installed — export roundtrip skipped", True)
+        return
+    import db_connections as _db
+    import pandas as _pd
+    real = _db._mongo_client
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            vault = Path(td)
+            _db.save_mongo_connection(vault, "mock", "mongodb://localhost/")
+            client = mongomock.MongoClient()
+            client["d"]["c"].insert_many([{"n": i, "k": "x"} for i in range(5)])
+            _db._mongo_client = lambda *a, **k: client  # type: ignore
+            dest = vault / "exp.csv"
+            info = _db.export_mongo_collection(vault, "mock", "d", "c", dest, fmt="csv")
+            _check("mongo export reports 5 rows", info["rows"] == 5)
+            _check("mongo export file exists", Path(info["path"]).is_file())
+            _check("mongo export CSV round-trips 5 rows",
+                   len(_pd.read_csv(info["path"])) == 5)
+    finally:
+        _db._mongo_client = real  # type: ignore
+
+
 def test_db_audit_log_writes() -> None:
     """The audit logger writes one JSONL record per call and never
     raises — even when the file can't be created (the audit log is
@@ -1420,6 +1508,9 @@ def main() -> int:
     _run("DB — engine cache reuse",               test_db_engine_cache_reuses_engines)
     _run("DB — audit log rotation",               test_db_audit_log_rotation)
     _run("DB — Mongo round-trip (mongomock)",     test_db_mongo_roundtrip_mongomock)
+    _run("DB — export write formats",             test_db_export_write_formats)
+    _run("DB — export query cannot write",        test_db_export_query_cannot_write)
+    _run("DB — export Mongo round-trip",          test_db_export_mongo_roundtrip)
     _run("DB — audit log writes JSONL",           test_db_audit_log_writes)
     _run("SELF-IMPROVE — failure log roundtrip",  test_failure_log_roundtrip)
     _run("SELF-IMPROVE — failure analyzer",       test_failure_analyzer_drafts_proposals)
