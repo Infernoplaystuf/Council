@@ -203,10 +203,13 @@ class SplashWindow(tk.Toplevel):
         so it can't re-enter the caller's construction code."""
         if self._cancelled or not self.winfo_exists():
             return
+        # Swallow ANY error — pump is a cosmetic frame advance during the
+        # host's construction; it must never abort the build or destabilise
+        # a fragile host event loop (e.g. Spyder's mixed Qt/Tk process).
         try:
             self._animate_once()
             self.update_idletasks()
-        except tk.TclError:
+        except Exception:
             pass
 
     def _animate_once(self):

@@ -15461,24 +15461,6 @@ def _fmt_bytes(n: int) -> str:
 _APP = None
 
 
-def _interactive_tk_loop_active() -> bool:
-    """True when we're inside an IPython/Spyder kernel that is already
-    pumping a Tk event loop (``%gui tk``). In that case our own
-    blocking mainloop() is unnecessary — and calling it can re-enter
-    the host's loop — so we skip it and let the kernel drive the UI."""
-    try:
-        from IPython import get_ipython  # type: ignore
-    except Exception:
-        return False
-    try:
-        ip = get_ipython()
-        if ip is None:
-            return False
-        return getattr(ip, "active_eventloop", None) in ("tk", "tkinter")
-    except Exception:
-        return False
-
-
 def main():
     global _APP
 
@@ -15553,11 +15535,17 @@ def main():
         print(f"[Splash] reveal scheduling failed: {e}")
         _reveal()
 
-    # Only run our own blocking loop when a host loop isn't already
-    # pumping Tk. Under Spyder/IPython %gui tk the kernel drives events
-    # (and keeps _APP alive), so mainloop() here is unnecessary.
-    if not _interactive_tk_loop_active():
-        app.mainloop()
+    # Always run our own blocking loop — the standard way every Tk app
+    # runs, including inside Spyder/IPython. The earlier "skip mainloop
+    # if the host pumps Tk" heuristic was wrong: when skipped, main()
+    # returns and the script ends, but the live root, its pending
+    # after() timers (reveal, _poll_ui_queue), and the torch-loading RAG
+    # daemon thread were left in an undefined state — the reveal never
+    # fired ("no tabs") and the process segfaulted once torch finished
+    # loading (~30s, "kernel dies"). Owning the loop on the main thread
+    # keeps everything deterministic. Under Spyder this makes the kernel
+    # "busy" until the window is closed — which is correct for a GUI app.
+    app.mainloop()
 
 
 def _purge_stale_pycache():
