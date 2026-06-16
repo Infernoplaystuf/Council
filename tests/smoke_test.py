@@ -1187,6 +1187,78 @@ def test_db_export_mongo_roundtrip() -> None:
         _db._mongo_client = real  # type: ignore
 
 
+def test_db_wizard_url_assembly() -> None:
+    """The guided wizard's pure URL builder: correct schemes, default
+    ports, percent-encoding of credentials (the bug a hand-typed URL
+    hits), file paths, env-var placeholders, and required-field errors."""
+    import db_connect_wizard as _w
+
+    # Postgres with a nasty password — must be percent-encoded so the
+    # netloc isn't corrupted by @ : / characters.
+    kind, url = _w.build_connection_url(
+        "postgresql", host="db.co", database="sales",
+        user="ro_user", password="p@ss:w/rd ")
+    _check("postgres kind is sql", kind == "sql")
+    _check("postgres scheme", url.startswith("postgresql://"))
+    _check("default port 5432 applied", ":5432/" in url)
+    _check("password percent-encoded",
+           "p%40ss%3Aw%2Frd%20" in url and "p@ss:w/rd" not in url)
+    _check("host intact", "@db.co:" in url)
+    _check("database in path", url.endswith("/sales"))
+
+    # MySQL scheme + default port
+    _, url = _w.build_connection_url("mysql", host="h", database="d",
+                                     user="u", password="p")
+    _check("mysql pymysql scheme", url.startswith("mysql+pymysql://"))
+    _check("mysql default port 3306", ":3306/" in url)
+
+    # MSSQL appends the ODBC driver param
+    _, url = _w.build_connection_url("mssql", host="h", database="d",
+                                     user="u", password="p")
+    _check("mssql pyodbc scheme", url.startswith("mssql+pyodbc://"))
+    _check("mssql driver param present", "driver=ODBC" in url)
+
+    # Mongo: kind=mongo, default port, authSource from the db name
+    kind, url = _w.build_connection_url("mongodb", host="h", database="appdb",
+                                        user="u", password="p")
+    _check("mongo kind is mongo", kind == "mongo")
+    _check("mongo scheme + port", url.startswith("mongodb://") and ":27017/" in url)
+    _check("mongo authSource set from db", "authSource=appdb" in url)
+
+    # Env-var password → placeholder, NOT inlined/encoded
+    _, url = _w.build_connection_url("postgresql", host="h", database="d",
+                                     user="u", env_var="PG_PASS")
+    _check("env-var placeholder used", "${PG_PASS}" in url)
+
+    # File-based: path only, three-slash form, backslashes normalised
+    kind, url = _w.build_connection_url("sqlite",
+                                        file_path=r"C:\data\my.db")
+    _check("sqlite kind is sql", kind == "sql")
+    _check("sqlite three-slash + forward slashes",
+           url == "sqlite:///C:/data/my.db")
+
+    # Required-field errors are user-facing ValueErrors
+    _check("missing host raises",
+           _raises(ValueError, lambda: _w.build_connection_url(
+               "postgresql", database="d", user="u", password="p")))
+    _check("missing file raises",
+           _raises(ValueError, lambda: _w.build_connection_url("sqlite")))
+
+    # Assembled URLs satisfy the saver's own validation (round-trip).
+    import db_connections as _db
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td)
+        kind, url = _w.build_connection_url(
+            "postgresql", host="h", database="d", user="u", password="p@w")
+        _db.save_sql_connection(vault, "wiz_pg", url)
+        _check("wizard URL accepted by saver",
+               _db.list_sql_connections(vault).get("wiz_pg") == url)
+
+    # env-var name suggester
+    _check("env-var name suggestion tidy",
+           _w.suggest_env_var_name("sales db") == "SALES_DB_PASSWORD")
+
+
 def test_db_audit_log_writes() -> None:
     """The audit logger writes one JSONL record per call and never
     raises — even when the file can't be created (the audit log is
@@ -1511,6 +1583,7 @@ def main() -> int:
     _run("DB — export write formats",             test_db_export_write_formats)
     _run("DB — export query cannot write",        test_db_export_query_cannot_write)
     _run("DB — export Mongo round-trip",          test_db_export_mongo_roundtrip)
+    _run("DB — guided wizard URL assembly",       test_db_wizard_url_assembly)
     _run("DB — audit log writes JSONL",           test_db_audit_log_writes)
     _run("SELF-IMPROVE — failure log roundtrip",  test_failure_log_roundtrip)
     _run("SELF-IMPROVE — failure analyzer",       test_failure_analyzer_drafts_proposals)

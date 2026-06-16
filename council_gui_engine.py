@@ -10000,7 +10000,20 @@ class CouncilConsole(tk.Tk):
         db_lf = ttk.LabelFrame(parent, text="🔌 Database Connections (read-only)")
         db_lf.pack(fill="x", padx=4, pady=(0, 6))
 
-        # ── Add-connection row ─────────────────────────────────
+        # ── Guided setup (recommended for non-technical users) ──
+        # A field-based wizard (Server / Database / Sign-in / Password)
+        # that assembles + encodes the connection URL for the user and
+        # tests it before saving. The manual URL row below stays for
+        # power users who'd rather paste a connection string.
+        guided_row = ttk.Frame(db_lf)
+        guided_row.pack(fill="x", padx=6, pady=(6, 2))
+        ttk.Button(guided_row, text="➕ Connect a database (guided)…",
+                   command=self._db_conn_open_wizard).pack(side="left")
+        ttk.Label(guided_row, text="  ← easiest: fill in the fields",
+                  foreground="#6c7086", font=("", 8)).pack(side="left")
+        ttk.Separator(db_lf, orient="horizontal").pack(fill="x", padx=6, pady=4)
+
+        # ── Add-connection row (manual URL — power users) ───────
         # Name + type + URL/URI + Save. The "type" dropdown drives the
         # placeholder we put in the URL box and where the connection is
         # stored (sql_connections.json vs mongo_connections.json).
@@ -10083,6 +10096,26 @@ class CouncilConsole(tk.Tk):
         self._db_conn_refresh_list()
 
     # ── Connections-panel actions ──────────────────────────────────
+
+    def _db_conn_open_wizard(self) -> None:
+        """Open the guided, field-based connection wizard. On a
+        successful save it refreshes the saved-connections list."""
+        try:
+            import db_connect_wizard as _wiz
+        except Exception as exc:
+            from tkinter import messagebox
+            messagebox.showerror(
+                "Wizard unavailable", f"Could not load the wizard: {exc!r}")
+            return
+
+        def _on_saved(_name: str):
+            try:
+                self._db_conn_refresh_list()
+            except Exception:
+                pass
+
+        _wiz.open_wizard(self, VAULT_DIR, on_saved=_on_saved,
+                         log=self._vmgr_append)
 
     def _db_conn_refresh_list(self) -> None:
         """Rebuild the saved-connections listbox from the JSON files."""
