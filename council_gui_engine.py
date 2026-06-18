@@ -13159,6 +13159,90 @@ class CouncilConsole(tk.Tk):
     # Main send logic
     # ============================
 
+    def _maybe_suggest_model_swap(self, user_text: str) -> None:
+        """Ask the swap advisor whether a specialist model would help this
+        task enough to be worth the cost; if so, prompt the user once per
+        target per session. On yes: LOCAL target swaps the model
+        (GPU-gated); REMOTE target enables node dispatch so the dispatcher
+        routes that role's model to the reachable node."""
+        from tkinter import messagebox
+        import os as _os
+        try:
+            import swap_advisor as _adv
+            import role_models as _rm
+        except Exception:
+            return
+
+        # Build the advisor's view of the world from current state.
+        current = _os.path.basename(_os.environ.get("COUNCIL_GGUF_PATH", "")) \
+            or "the current model"
+        assignments = {}
+        try:
+            assignments = _rm.RoleModelRegistry(VAULT_DIR).all()
+        except Exception:
+            pass
+        # Remote specialists: roles whose assigned model is installed on a
+        # reachable node. Derived from the dispatcher's probe (best-effort,
+        # no extra network here — uses cached probe state).
+        remote_specialists = {}
+        try:
+            if _os.environ.get("COUNCIL_REMOTE_NODES", "").strip().lower() in ("1", "true", "yes", "on"):
+                statuses = [s for s in self.dispatcher.probe_all() if getattr(s, "reachable", False)]
+                for role, model in assignments.items():
+                    for s in statuses:
+                        if any(model.split("/")[-1].split(".")[0] in m
+                               for m in getattr(s, "installed_models", [])):
+                            remote_specialists[role] = {
+                                "model": model,
+                                "node": getattr(s, "host", "a node"),
+                                "label": f"{role} model on {getattr(s, 'host', 'a node')}"}
+                            break
+        except Exception:
+            pass
+
+        sugg = _adv.advise(
+            user_text, current_model=current,
+            role_assignments=assignments,
+            remote_specialists=remote_specialists,
+            gpu_swap_enabled=_rm.gpu_swap_enabled(),
+        )
+        if sugg is None:
+            return
+        # Don't nag: at most one prompt per (role, target_kind) per session.
+        seen = getattr(self, "_swap_suggested", None)
+        if seen is None:
+            seen = self._swap_suggested = set()
+        key = (sugg.role, sugg.target_kind, sugg.target_model)
+        if key in seen:
+            return
+        seen.add(key)
+
+        if not messagebox.askyesno(
+                "Use a specialist model?",
+                f"{sugg.reason}\n\nSwitch to {sugg.target_label}?\n"
+                f"Cost: {sugg.est_cost}.",
+                parent=self):
+            return
+        if sugg.target_kind == "remote":
+            _os.environ["COUNCIL_REMOTE_NODES"] = "1"
+            self._append_transcript(
+                "Council", f"Routing {sugg.role} tasks to {sugg.target_label} "
+                "(remote node). Local model stays loaded.", "observation")
+        else:
+            # swap_to_role() resets the engine's model singleton, so the
+            # next inference lazy-loads the specialist — no personality
+            # rebuild needed (they call the global GGUF singleton).
+            res = _rm.swap_to_role(sugg.role, VAULT_DIR)
+            if res.get("swapped"):
+                self._append_transcript(
+                    "Council", f"Switched to {sugg.target_label} "
+                    f"({_os.path.basename(res.get('model', ''))}) — loads on the "
+                    "next message.", "observation")
+            else:
+                self._append_transcript(
+                    "Council", f"Couldn't switch ({res.get('reason')}); "
+                    "continuing with the current model.", "observation")
+
     def _send(self):
         # Licensing gate — skipped entirely in DEMO_MODE. In product
         # builds, this blocks new deliberations when trial expired and
@@ -13190,6 +13274,14 @@ class CouncilConsole(tk.Tk):
         self._set_text(self.input, "")
         self._append_transcript("User", user_text)
         self._clear_stream_box()
+        # ── Specialist-model suggestion ─────────────────────────────────
+        # If this task looks like a fit for an assigned specialist and the
+        # benefit is judged worth the cost, ask the user (once per target
+        # per session) before proceeding. Best-effort; never blocks send.
+        try:
+            self._maybe_suggest_model_swap(user_text)
+        except Exception as _adv_exc:
+            print(f"[advisor] skipped: {_adv_exc!r}")
         # ── Pipeline intents (show / modify a Dream3D pipeline) ─────────
         # The handlers manage their own status: list/show are synchronous
         # (they set idle themselves on completion); modify is async (it
