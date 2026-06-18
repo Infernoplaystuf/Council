@@ -1279,6 +1279,71 @@ def test_db_audit_log_writes() -> None:
                rec["kind"] == "test" and rec["note"] == "hello")
 
 
+def test_role_models_swap_gating() -> None:
+    """role_models: GPU-gated swap (CPU = no-op), registry round-trip,
+    role->model resolution with base fallback, and no redundant swaps."""
+    import os as _os
+    import role_models as rm
+
+    prev = {k: _os.environ.get(k) for k in
+            ("COUNCIL_ROLE_SWAP", "COUNCIL_GGUF_GPU_LAYERS", "COUNCIL_GGUF_PATH")}
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            base = d / "base.gguf"; base.write_bytes(b"GGUF" + b"\0" * 64)
+            coder = d / "coder.gguf"; coder.write_bytes(b"GGUF" + b"\0" * 64)
+            _os.environ["COUNCIL_GGUF_PATH"] = str(base)
+
+            # Registry round-trip
+            reg = rm.RoleModelRegistry(vault_dir=d)
+            reg.set("coder", str(coder))
+            _check("registry persists assignment", reg.get("coder") == str(coder))
+            _check("registry lists assignment", reg.all().get("coder") == str(coder))
+
+            # Resolution: assigned role -> its model; unassigned -> base
+            _check("assigned role resolves to its model",
+                   rm.resolve_model_for_role("coder", d) == str(coder))
+            _check("unassigned role falls back to base",
+                   rm.resolve_model_for_role("writer", d) == str(base))
+
+            # GPU disabled (CPU-only) -> swap is a NO-OP, engine untouched
+            _os.environ["COUNCIL_ROLE_SWAP"] = "0"
+            r = rm.swap_to_role("coder", d)
+            _check("CPU/disabled: swap is a no-op",
+                   r["swapped"] is False and r["reason"] == "gpu-disabled")
+            _check("env model path unchanged when swap disabled",
+                   _os.environ["COUNCIL_GGUF_PATH"] == str(base))
+
+            # GPU enabled (forced) -> swap occurs; monkeypatch the engine
+            # reload so the test never loads a real model.
+            import council_engine as _ce
+            _orig = _ce.refresh_backend_config
+            calls = {"n": 0}
+            _ce.refresh_backend_config = lambda: calls.__setitem__("n", calls["n"] + 1) or {}
+            try:
+                _os.environ["COUNCIL_ROLE_SWAP"] = "1"
+                rm._LOADED_PATH = str(base)        # pretend base is loaded
+                r2 = rm.swap_to_role("coder", d)
+                _check("GPU: swap to coder happens", r2["swapped"] is True)
+                _check("engine reload was triggered once", calls["n"] == 1)
+                _check("env now points at the coder model",
+                       _os.environ["COUNCIL_GGUF_PATH"] == str(coder))
+                # Re-asking the same role -> no redundant swap
+                r3 = rm.swap_to_role("coder", d)
+                _check("same role again is a no-op",
+                       r3["swapped"] is False and r3["reason"] == "already-loaded")
+                _check("no extra engine reload", calls["n"] == 1)
+            finally:
+                _ce.refresh_backend_config = _orig
+                rm._LOADED_PATH = None
+    finally:
+        for k, v in prev.items():
+            if v is None:
+                _os.environ.pop(k, None)
+            else:
+                _os.environ[k] = v
+
+
 def test_model_finder_us_filter_and_fit() -> None:
     """model_finder: US-origin heuristic (non-US wins over US repacker),
     param parsing, VRAM estimate, hardware-aware catalog ranking, and a
@@ -1823,6 +1888,7 @@ def main() -> int:
     _run("DB — audit log writes JSONL",           test_db_audit_log_writes)
     _run("STATS — cache exact + incremental + query cache", test_stats_cache_exact_and_incremental)
     _run("MODELS — finder US filter + hardware fit", test_model_finder_us_filter_and_fit)
+    _run("MODELS — role swap GPU-gated",          test_role_models_swap_gating)
     _run("STATS — per-folder CSV shards",         test_stats_cache_per_folder_csv_shards)
     _run("STATS — analyst cache-backed helpers",  test_analyst_cached_stats_helpers)
     _run("ANALYST — folder summary samples (no full read)", test_folder_summary_samples_not_full_read)
