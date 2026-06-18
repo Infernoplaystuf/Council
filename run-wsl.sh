@@ -74,7 +74,18 @@ fi
 : "${COUNCIL_UI_SCALE:=1.5}"        # WSLg reports 96 DPI → text is tiny
 : "${COUNCIL_GGUF_GPU_LAYERS:=99}"  # offload everything to GPU; harmless on CPU
 : "${COUNCIL_GGUF_N_CTX_DEBUG:=1}"  # dump the n_ctx ladder so users can debug
+# Embeddings on CPU by default — matches run-windows.bat. With the GGUF
+# fully offloaded (GPU_LAYERS=99) AND sentence-transformers also on the
+# GPU, a smaller-VRAM card (≤ ~8 GB) runs both + the KV cache + per-turn
+# GPU encoding in the same VRAM. After a couple of messages that
+# exhausts VRAM and llama-cpp aborts with a CUDA out-of-memory — a
+# NATIVE crash (core dump, no Python traceback). Pinning embeddings to
+# the CPU costs a little embedding speed but leaves the whole GPU for
+# the model. Set COUNCIL_EMBED_DEVICE=cuda before launch to override on
+# a big-VRAM card.
+: "${COUNCIL_EMBED_DEVICE:=cpu}"
 export COUNCIL_UI_SCALE COUNCIL_GGUF_GPU_LAYERS COUNCIL_GGUF_N_CTX_DEBUG
+export COUNCIL_EMBED_DEVICE
 
 # Tk needs DISPLAY on Windows 10 (no WSLg). WSLg sets it for us
 # on Windows 11. If we're on Win 10 and DISPLAY is unset, use the
