@@ -1279,6 +1279,89 @@ def test_db_audit_log_writes() -> None:
                rec["kind"] == "test" and rec["note"] == "hello")
 
 
+def test_stats_cache_exact_and_incremental() -> None:
+    """stats_cache: streaming column stats are EXACT (match full pandas,
+    even across multiple chunks), self-describing detection works, the
+    per-file cache is incremental (mtime-keyed), and the query-report
+    cache saves/retrieves and invalidates on input change."""
+    import os as _os
+    import pandas as pd
+    import stats_cache as sc
+
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        # File with a numeric + text column, a stats-named column, and a
+        # 'Total' summary row up top.
+        csv = d / "sales.csv"
+        rows = ["amount,region,mean"]
+        rows.append("Total,,999")                  # summary row (label in col 0)
+        for n in range(250):
+            rows.append(f"{n*2}.5,{'NESW'[n%4]},{n}")
+        csv.write_text("\n".join(rows) + "\n")
+
+        # Force multi-chunk streaming to exercise cross-chunk aggregation.
+        old_chunk = sc._CHUNK_ROWS
+        sc._CHUNK_ROWS = 64
+        try:
+            st = sc.compute_column_stats(csv)
+        finally:
+            sc._CHUNK_ROWS = old_chunk
+
+        # Compare numeric stats to a full pandas read (the 'Total' row
+        # makes 'amount' object-typed, so compare on the clean numeric
+        # column 'mean' which is all integers 0..249 + the 999 row).
+        full = pd.read_csv(csv)
+        cs = st["column_stats"]
+        _check("stats has the numeric column", "mean" in cs)
+        msr = cs["mean"]
+        _check("streamed count == pandas count",
+               msr["count"] == int(full["mean"].count()))
+        _check("streamed sum == pandas sum",
+               abs(msr["sum"] - float(full["mean"].sum())) < 1e-6)
+        _check("streamed min/max exact",
+               msr["min"] == float(full["mean"].min())
+               and msr["max"] == float(full["mean"].max()))
+        _check("streamed mean ~ pandas mean",
+               abs(msr["mean"] - float(full["mean"].mean())) < 1e-6)
+        _check("streamed std ~ pandas std (ddof=1)",
+               abs(msr["std"] - float(full["mean"].std())) < 1e-4)
+
+        # Self-describing detection
+        sd = st["self_describing"]
+        _check("summary column 'mean' detected",
+               "mean" in sd["summary_columns"])
+        _check("summary 'Total' row detected",
+               any(r["label"].lower() == "total" for r in sd["summary_rows"]))
+
+        # Incremental per-file cache
+        cache = sc.StatsCache(vault_dir=d)
+        r1 = cache.process_unprocessed(d)
+        _check("first sweep processes the file", r1["processed"] == 1)
+        r2 = cache.process_unprocessed(d)
+        _check("second sweep processes nothing (all current)",
+               r2["processed"] == 0 and r2["already_current"] >= 1)
+        # Touch the file (advance mtime) → must reprocess
+        _os.utime(csv, (csv.stat().st_atime, csv.stat().st_mtime + 5))
+        _check("changed file is no longer current", not cache.is_current(csv))
+        r3 = cache.process_unprocessed(d)
+        _check("changed file reprocessed", r3["processed"] == 1)
+
+        # Query-report cache: save + retrieve, and invalidate on change
+        qc = sc.QueryReportCache(vault_dir=d)
+        k1 = qc.make_key("first 200 row stats", [csv])
+        computed = {"answer": 42}
+        got = qc.get_or_compute("first 200 row stats", [csv],
+                                lambda: computed)
+        _check("query report stored + returned", got == computed)
+        _check("query report retrieved on second call",
+               qc.get(k1) is not None)
+        _os.utime(csv, (csv.stat().st_atime, csv.stat().st_mtime + 9))
+        k2 = qc.make_key("first 200 row stats", [csv])
+        _check("query key changes when input mtime changes", k1 != k2)
+        _check("stale key no longer matches the new fingerprint",
+               qc.get(k2) is None)
+
+
 def test_folder_summary_samples_not_full_read() -> None:
     """folder_data_summary must summarise CSVs from a HEAD-SAMPLE (flat
     memory at scale) while still reporting the EXACT row count. The old
@@ -1619,6 +1702,7 @@ def main() -> int:
     _run("DB — export Mongo round-trip",          test_db_export_mongo_roundtrip)
     _run("DB — guided wizard URL assembly",       test_db_wizard_url_assembly)
     _run("DB — audit log writes JSONL",           test_db_audit_log_writes)
+    _run("STATS — cache exact + incremental + query cache", test_stats_cache_exact_and_incremental)
     _run("ANALYST — folder summary samples (no full read)", test_folder_summary_samples_not_full_read)
     _run("SELF-IMPROVE — failure log roundtrip",  test_failure_log_roundtrip)
     _run("SELF-IMPROVE — failure analyzer",       test_failure_analyzer_drafts_proposals)
