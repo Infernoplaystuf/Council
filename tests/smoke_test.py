@@ -1279,6 +1279,38 @@ def test_db_audit_log_writes() -> None:
                rec["kind"] == "test" and rec["note"] == "hello")
 
 
+def test_analyst_cached_stats_helpers() -> None:
+    """The cache-backed analyst helpers (folder_column_stats /
+    cached_column_stats) and their sandbox names (column_stats /
+    file_stats) return exact precomputed stats and populate the cache."""
+    import os as _os
+    with tempfile.TemporaryDirectory() as td:
+        _os.environ["COUNCIL_VAULT_ROOT"] = td
+        try:
+            di = Path(td) / "data_in"; di.mkdir(parents=True)
+            (di / "s.csv").write_text("amount,region\n10,N\n20,S\n30,N\n40,E\n")
+            import importlib, vault_analyst as va
+            importlib.reload(va)  # pick up COUNCIL_VAULT_ROOT-derived cache
+
+            # Direct helper
+            fcs = va.folder_column_stats(td, di)
+            amt = fcs[(fcs["file"] == "s.csv") & (fcs["column"] == "amount")]
+            _check("folder_column_stats returns the column", len(amt) == 1)
+            r = amt.iloc[0]
+            _check("cached min/max/mean/sum exact",
+                   r["min"] == 10.0 and r["max"] == 40.0
+                   and r["mean"] == 25.0 and r["sum"] == 100.0)
+
+            # Sandbox names
+            sdf, msg = va.execute_pandas_code("result_df = column_stats()",
+                                              allowed_folders=[di])
+            _check("sandbox column_stats() runs", msg == "ok" and sdf is not None)
+            _check("sandbox column_stats has stats rows",
+                   sdf is not None and len(sdf) >= 1)
+        finally:
+            _os.environ.pop("COUNCIL_VAULT_ROOT", None)
+
+
 def test_stats_cache_exact_and_incremental() -> None:
     """stats_cache: streaming column stats are EXACT (match full pandas,
     even across multiple chunks), self-describing detection works, the
@@ -1703,6 +1735,7 @@ def main() -> int:
     _run("DB — guided wizard URL assembly",       test_db_wizard_url_assembly)
     _run("DB — audit log writes JSONL",           test_db_audit_log_writes)
     _run("STATS — cache exact + incremental + query cache", test_stats_cache_exact_and_incremental)
+    _run("STATS — analyst cache-backed helpers",  test_analyst_cached_stats_helpers)
     _run("ANALYST — folder summary samples (no full read)", test_folder_summary_samples_not_full_read)
     _run("SELF-IMPROVE — failure log roundtrip",  test_failure_log_roundtrip)
     _run("SELF-IMPROVE — failure analyzer",       test_failure_analyzer_drafts_proposals)

@@ -2116,42 +2116,74 @@ def _run_analyst_step_impl(query):
         except Exception:
             sub = None
         target_folders = [sub] if sub is not None else allowed_folders
+        scope_str = (f" — scope: {sub.relative_to(allowed_folders[0])}"
+                      if sub is not None else "")
+
+        # Query-report cache: an identical summary over an UNCHANGED set
+        # of files is served from disk instantly. The key fingerprints
+        # each input file's mtime, so adding / editing / removing a file
+        # changes the key and forces a fresh compute — correct staleness.
+        _qc = None
+        _qkey = None
         try:
-            result_df = _va.folder_data_summary(target_folders)
-        except Exception as _e:
-            print('[analyst] direct folder_data_summary failed: '
-                  + repr(_e), file=_sys_dbg.stderr)
-            result_df = None
-        if result_df is not None and not result_df.empty:
+            import stats_cache as _sc
+            _qc = _sc.QueryReportCache(VAULT_DIR)
+            _inputs = [str(p) for p in _va.list_csv_files(target_folders)]
+            _qkey = _qc.make_key("folder_data_summary" + scope_str, _inputs)
+        except Exception:
+            _qc = None
+
+        rep = None
+        _hit = _qc.get(_qkey) if (_qc and _qkey) else None
+        if _hit is not None:
+            rep = _hit.get("report")
+
+        if rep is None:
             try:
-                _n_ctx_ds = ce.get_n_ctx()
-            except Exception:
-                _n_ctx_ds = 4096
-            ds_max_tokens = max(150, _n_ctx_ds // 4)
-            table_text = _va.format_result_for_prompt(
-                result_df, max_rows=250, max_chars=12000,
-                max_tokens=ds_max_tokens, count_tokens=ce.estimate_tokens,
-            )
-            scope_str = (f" — scope: {sub.relative_to(allowed_folders[0])}"
-                          if sub is not None else "")
+                result_df = _va.folder_data_summary(target_folders)
+            except Exception as _e:
+                print('[analyst] direct folder_data_summary failed: '
+                      + repr(_e), file=_sys_dbg.stderr)
+                result_df = None
+            if result_df is not None and not result_df.empty:
+                try:
+                    _n_ctx_ds = ce.get_n_ctx()
+                except Exception:
+                    _n_ctx_ds = 4096
+                ds_max_tokens = max(150, _n_ctx_ds // 4)
+                table_text = _va.format_result_for_prompt(
+                    result_df, max_rows=250, max_chars=12000,
+                    max_tokens=ds_max_tokens, count_tokens=ce.estimate_tokens,
+                )
+                try:
+                    _user_render = result_df.to_string(index=False,
+                                                        max_rows=80, max_cols=20)
+                except Exception:
+                    _user_render = ""
+                rep = {"table_text": table_text, "user_render": _user_render,
+                       "n_files": int(len(result_df))}
+                if _qc and _qkey:
+                    try:
+                        _qc.put(_qkey, query="folder_data_summary" + scope_str,
+                                report=rep)
+                    except Exception:
+                        pass
+
+        if rep is not None:
             block = (f"[ANALYST RESULT — folder_data_summary{scope_str}]\n"
                      f"# Direct call (no model code-gen). One row per file.\n"
-                     f"{table_text}")
+                     f"{rep.get('table_text', '')}")
             notices.append(
                 f"Analyst direct-routed to folder_data_summary"
                 + (f" on subfolder {sub.relative_to(allowed_folders[0])}"
                    if sub is not None else "")
-                + f" — {len(result_df)} file(s) profiled."
+                + f" — {rep.get('n_files', 0)} file(s) profiled"
+                + (" (cached)" if _hit is not None else "") + "."
             )
-            # Also surface the table to the transcript via the same
-            # __ANALYST_TABLE__ payload the model path uses, so the
-            # user sees the actual numbers.
-            try:
-                _user_render = result_df.to_string(index=False,
-                                                    max_rows=80, max_cols=20)
-                notices.append("__ANALYST_TABLE__:" + _user_render)
-            except Exception:
-                pass
+            # Surface the table to the transcript via the same
+            # __ANALYST_TABLE__ payload the model path uses.
+            if rep.get("user_render"):
+                notices.append("__ANALYST_TABLE__:" + rep["user_render"])
             return block, None, notices
         # Fall through to the model path if the direct call returned
         # nothing (empty folder, hint resolved to non-existent path, etc).
@@ -4416,6 +4448,16 @@ class CouncilConsole(tk.Tk):
             on_complete=lambda _ok: self.after(400, self._check_license_status),
         ))
 
+        # Incremental data-stats precompute, deferred + on a daemon thread
+        # so it never competes with startup or the model. CPU/IO only (no
+        # GPU), streamed in chunks. Slow the first sweep on a big vault,
+        # near-instant after — only unprocessed files are touched, so it
+        # keeps pace as data grows. Disable with COUNCIL_STATS_PRECOMPUTE=0.
+        if os.environ.get("COUNCIL_STATS_PRECOMPUTE", "1").strip().lower() \
+                not in ("0", "false", "no", "off"):
+            self.after(8000, lambda: threading.Thread(
+                target=self._init_stats_index, daemon=True).start())
+
         # Interactive host: no splash will reveal us, so show the finished
         # window now (it was withdrawn at the top of __init__ to avoid the
         # construction flicker). main() does the splash-timed reveal for
@@ -4683,6 +4725,37 @@ class CouncilConsole(tk.Tk):
                                f"{stats.total_chunks} chunks ({stats.backend})"))
         except Exception as e:
             self.ui_q.put(("agent_phase", "rag_index", f"RAG index error: {e}"))
+
+    def _build_stats_index(self, *, on_progress=None) -> dict:
+        """Precompute column stats for any UNPROCESSED CSVs under data_in
+        (incremental — only files not already cached at their current
+        mtime). Pure pandas / CPU, streamed in chunks so it's memory-safe
+        on big files. Slow the first time, near-instant afterwards;
+        new files added later are picked up on the next call. Returns the
+        sweep counts ({seen, processed, already_current})."""
+        import stats_cache as _sc
+        import vault_analyst as _va
+        try:
+            data_in = data_index.input_dir(VAULT_DIR)
+        except Exception:
+            data_in = VAULT_DIR
+        cache = _sc.StatsCache(VAULT_DIR)
+        return cache.process_unprocessed(
+            data_in, list_files=_va.list_csv_files, on_progress=on_progress)
+
+    def _init_stats_index(self):
+        """Background-thread entry: incremental stats sweep with the
+        result posted to the activity feed. Failures are swallowed — a
+        stats precompute must never break the app."""
+        try:
+            res = self._build_stats_index()
+            if res.get("processed"):
+                self.ui_q.put(("agent_phase", "stats_index",
+                               f"Data stats: processed {res['processed']} new "
+                               f"file(s); {res['already_current']} already "
+                               f"cached ({res['seen']} CSVs total)."))
+        except Exception as e:
+            self.ui_q.put(("agent_phase", "stats_index", f"stats index error: {e}"))
 
     def _pump_splash(self):
         """Advance the loading-cog one frame during blocking construction.
@@ -9962,6 +10035,20 @@ class CouncilConsole(tk.Tk):
         # recommended DB-side read-only role per database.
         self._build_vmgr_db_connections_panel(left)
 
+        # ── Data stats precompute ──────────────────────────────
+        # Manual trigger for the incremental column-stats cache. Runs
+        # the same sweep the background timer does, on demand, with a
+        # result line in the activity log. Incremental: only unprocessed
+        # CSVs are touched, so repeat clicks are near-instant.
+        stats_lf = ttk.LabelFrame(left, text="📊 Data stats (precomputed)")
+        stats_lf.pack(fill="x", padx=4, pady=(0, 6))
+        srow = ttk.Frame(stats_lf)
+        srow.pack(fill="x", padx=6, pady=4)
+        ttk.Button(srow, text="🧮 Build / update stats",
+                   command=self._vmgr_build_stats).pack(side="left")
+        ttk.Label(srow, text="min/max/mean/… per column, cached",
+                  foreground="#6c7086", font=("", 8)).pack(side="left", padx=6)
+
         # ── Vault tree ────────────────────────────────────────
         ttk.Label(left, text="Vault Contents",
                   font=("", 9, "bold")).pack(anchor="w", padx=4, pady=(4, 0))
@@ -10756,6 +10843,31 @@ class CouncilConsole(tk.Tk):
         threading.Thread(target=_worker, daemon=True).start()
 
     # ── Vault Manager helpers ─────────────────────────────────
+
+    def _vmgr_build_stats(self):
+        """Manual trigger for the incremental column-stats precompute.
+        Runs on a daemon thread (CPU/IO heavy on a cold vault) and posts
+        progress + a final summary to the activity log via the UI queue."""
+        self._vmgr_append("📊 building data stats (incremental — only new "
+                          "files)…", "info")
+
+        def _worker():
+            try:
+                def _prog(i, total, name):
+                    if total and (i == total or i % 25 == 0):
+                        self.ui_q.put(("agent_phase", "stats_index",
+                                       f"  stats: {i}/{total} ({name})"))
+                res = self._build_stats_index(on_progress=_prog)
+                self.ui_q.put(("agent_phase", "stats_index",
+                               f"✓ data stats ready — processed "
+                               f"{res['processed']} new, {res['already_current']} "
+                               f"already cached ({res['seen']} CSVs)."))
+            except Exception as exc:
+                self.ui_q.put(("agent_phase", "stats_index",
+                               f"✗ stats build failed: {exc!r}"))
+
+        import threading as _th
+        _th.Thread(target=_worker, daemon=True).start()
 
     def _vmgr_append(self, msg: str, tag: str = "info"):
         """Append a line to the vault manager log."""

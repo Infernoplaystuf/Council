@@ -1225,6 +1225,62 @@ def find_columns_contains(df: pd.DataFrame, text: str) -> List[str]:
 
 
 # ============================================================
+# Cache-backed column stats (precomputed via stats_cache)
+# ============================================================
+
+def cached_column_stats(vault_dir: Any, path: Any) -> Dict[str, Any]:
+    """Return precomputed column stats for one CSV from the stats cache,
+    computing + storing them on a miss. Fast on repeat — the whole point
+    of the cache. Returns {} if stats_cache is unavailable."""
+    try:
+        import stats_cache
+        return stats_cache.StatsCache(vault_dir).get(path) or {}
+    except Exception:
+        return {}
+
+
+def folder_column_stats(vault_dir: Any, data_folder: Any,
+                        recursive: bool = True) -> "pd.DataFrame":
+    """One row per (file, column) with the precomputed stats — count,
+    missing, min, max, mean, std, sum (numeric) / n_unique, top (text) —
+    served from the cache (computed + stored on first sight of a file).
+    Use this instead of re-reading files when a question asks for column
+    statistics. The ``notes`` column flags files that already carry their
+    own summary (a Total/Mean row or a stat-named column)."""
+    rows: List[Dict[str, Any]] = []
+    try:
+        import stats_cache
+        cache = stats_cache.StatsCache(vault_dir)
+    except Exception:
+        return pd.DataFrame(rows)
+    folders = normalize_data_folders(data_folder)
+    for fp in list_csv_files(folders, recursive=recursive):
+        st = cache.get(fp) or {}
+        root = first_matching_root(fp, folders)
+        rel = safe_relative_path(fp, root)
+        sd = st.get("self_describing") or {}
+        note = ("file carries its own summary"
+                if (sd.get("summary_columns") or sd.get("summary_rows"))
+                else "")
+        cs = st.get("column_stats") or {}
+        if not cs:
+            rows.append({"file": fp.name, "relative_path": rel,
+                         "column": None, "notes": note or "no stats"})
+            continue
+        for col, s in cs.items():
+            rows.append({
+                "file": fp.name, "relative_path": rel, "column": col,
+                "dtype": s.get("dtype"), "count": s.get("count"),
+                "missing": s.get("missing"), "min": s.get("min"),
+                "max": s.get("max"), "mean": s.get("mean"),
+                "std": s.get("std"), "sum": s.get("sum"),
+                "n_unique": s.get("n_unique"), "top": s.get("top"),
+                "notes": note,
+            })
+    return pd.DataFrame(rows)
+
+
+# ============================================================
 # Per-CSV aggregate helpers
 # Each returns a DataFrame with one row per input CSV.
 # ============================================================
@@ -2909,6 +2965,16 @@ def execute_pandas_code(
         "find_columns_contains": find_columns_contains,
         "csv_inventory": csv_inventory,
         "folder_data_summary": folder_data_summary,
+        # Cache-backed precomputed column stats — fast on repeat (served
+        # from <vault>/.stats_cache, computed + stored on first sight).
+        # vault_dir=None lets stats_cache resolve the vault root itself so
+        # the location is the same regardless of the scope folder passed.
+        #   column_stats(folder=None) -> one row per (file, column)
+        #   file_stats(path)          -> dict of stats for one CSV
+        "column_stats": (lambda folder=None: folder_column_stats(
+            None, folder if folder is not None
+            else [str(p) for p in normalized_folders])),
+        "file_stats": (lambda path: cached_column_stats(None, path)),
         "count_rows_per_csv": count_rows_per_csv,
         "average_numeric_column_per_csv": average_numeric_column_per_csv,
         "std_numeric_column_per_csv": std_numeric_column_per_csv,
