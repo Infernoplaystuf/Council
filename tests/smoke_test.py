@@ -1279,6 +1279,40 @@ def test_db_audit_log_writes() -> None:
                rec["kind"] == "test" and rec["note"] == "hello")
 
 
+def test_folder_summary_samples_not_full_read() -> None:
+    """folder_data_summary must summarise CSVs from a HEAD-SAMPLE (flat
+    memory at scale) while still reporting the EXACT row count. The old
+    full-file read OOM-crashed on 200+ / large CSVs."""
+    import vault_analyst as va
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        # A file bigger than the sample window so 'sampled' kicks in.
+        big_rows = va._SUMMARY_SAMPLE_ROWS + 1500
+        with open(d / "big.csv", "w") as fh:
+            fh.write("id,name,amount\n")
+            for n in range(big_rows):
+                fh.write(f"{n},Cust{n%50},{n*1.5}\n")
+        # A small file (no sampling note expected).
+        (d / "small.csv").write_text("a,b\n1,2\n3,4\n")
+
+        # Fast row counter is exact for well-formed CSVs.
+        _check("fast row count exact (big)",
+               va._count_csv_rows_fast(d / "big.csv") == big_rows)
+        _check("fast row count exact (small)",
+               va._count_csv_rows_fast(d / "small.csv") == 2)
+
+        df = va.folder_data_summary(d)
+        by = {r["file"]: r for _, r in df.iterrows()}
+        _check("big.csv exact row count preserved despite sampling",
+               int(by["big.csv"]["rows"]) == big_rows)
+        _check("big.csv columns intact", int(by["big.csv"]["columns"]) == 3)
+        _check("big.csv flagged as sampled",
+               "sampled" in str(by["big.csv"]["notes"]))
+        _check("small.csv exact rows", int(by["small.csv"]["rows"]) == 2)
+        _check("small.csv NOT flagged sampled (fits in one read)",
+               "sampled" not in str(by["small.csv"]["notes"]))
+
+
 def test_failure_log_roundtrip() -> None:
     """FailureLog appends structured records, normalises signatures so
     the same root cause on different files buckets together, and
@@ -1585,6 +1619,7 @@ def main() -> int:
     _run("DB — export Mongo round-trip",          test_db_export_mongo_roundtrip)
     _run("DB — guided wizard URL assembly",       test_db_wizard_url_assembly)
     _run("DB — audit log writes JSONL",           test_db_audit_log_writes)
+    _run("ANALYST — folder summary samples (no full read)", test_folder_summary_samples_not_full_read)
     _run("SELF-IMPROVE — failure log roundtrip",  test_failure_log_roundtrip)
     _run("SELF-IMPROVE — failure analyzer",       test_failure_analyzer_drafts_proposals)
     _run("QUIRKS — maturity gates",               test_user_quirks_gates)

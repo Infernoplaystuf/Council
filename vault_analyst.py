@@ -1339,9 +1339,19 @@ def folder_data_summary(
         suf = fp.suffix.lower()
         try:
             if suf in (".csv", ".tsv"):
-                df = _read_csv_cached(fp, sep="\t") if suf == ".tsv" \
-                    else _read_csv_cached(fp)
-                _fill_tabular_summary(rec, df, "csv" if suf == ".csv" else "tsv")
+                # Read only a head-sample for the column stats (keeps memory
+                # flat across hundreds of files); count the exact rows with
+                # a cheap byte scan. Reading every file in full was the
+                # cause of the OOM/slow crash on 200+ CSV summaries.
+                sep = "\t" if suf == ".tsv" else ","
+                sample = _read_csv_cached(fp, sep=sep,
+                                          nrows=_SUMMARY_SAMPLE_ROWS)
+                exact_rows = _count_csv_rows_fast(fp)
+                _fill_tabular_summary(
+                    rec, sample, "csv" if suf == ".csv" else "tsv",
+                    exact_rows=exact_rows,
+                    sampled=(exact_rows < 0 or exact_rows > len(sample)),
+                )
             elif suf == ".parquet":
                 df = pd.read_parquet(fp)
                 _fill_tabular_summary(rec, df, "parquet")
@@ -1443,11 +1453,49 @@ def folder_data_summary(
     return pd.DataFrame(rows)
 
 
-def _fill_tabular_summary(rec: dict, df: "pd.DataFrame", type_label: str) -> None:
-    """Populate the tabular-summary fields on ``rec`` from ``df``."""
+# Rows to sample when summarising a file. A summary needs column names,
+# dtypes, a missing-value feel and a sample value — none of which require
+# the WHOLE file. Reading only the head keeps memory flat and time low so
+# folder_data_summary scales to hundreds of files without OOM.
+_SUMMARY_SAMPLE_ROWS = 2000
+
+
+def _count_csv_rows_fast(path: Any) -> int:
+    """Exact data-row count for a CSV/TSV via a buffered byte scan — no
+    pandas parse, bounded memory. Returns newline-count minus the header
+    (floored at 0), or -1 if it can't be read. Treats a missing trailing
+    newline as a final row. (A file with quoted embedded newlines would
+    over-count slightly; that's an acceptable approximation for a
+    hundreds-of-files overview and far cheaper than a full parse.)"""
+    try:
+        n = 0
+        last = b"\n"
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(1024 * 1024)
+                if not chunk:
+                    break
+                n += chunk.count(b"\n")
+                last = chunk[-1:]
+        if last != b"\n":          # file didn't end in a newline
+            n += 1
+        return max(0, n - 1)       # drop the header line
+    except Exception:
+        return -1
+
+
+def _fill_tabular_summary(rec: dict, df: "pd.DataFrame", type_label: str,
+                          *, exact_rows: "Optional[int]" = None,
+                          sampled: bool = False) -> None:
+    """Populate the tabular-summary fields on ``rec`` from ``df``.
+
+    When ``df`` is only a head-sample of a larger file, pass
+    ``exact_rows`` (the true row count, counted cheaply elsewhere) and
+    ``sampled=True``; the row count is then reported exactly while the
+    column stats are derived from the sample and flagged in ``notes``."""
     try:
         rec["type"]         = type_label
-        rec["rows"]         = int(len(df))
+        rec["rows"]         = int(exact_rows) if (exact_rows is not None and exact_rows >= 0) else int(len(df))
         rec["columns"]      = int(len(df.columns))
         rec["column_names"] = ", ".join(map(str, df.columns[:12]))
         # Dtype shorthand: keep the names short — int / float / str /
@@ -1485,6 +1533,12 @@ def _fill_tabular_summary(rec: dict, df: "pd.DataFrame", type_label: str) -> Non
                     rec["sample_value"] = str(sv)[:60]
             except Exception:
                 pass
+        # Flag that column stats came from a head-sample, not the full
+        # file, so the row count (exact) and the stats (sampled) aren't
+        # silently conflated.
+        if sampled:
+            note = f"stats sampled from first {len(df):,} rows"
+            rec["notes"] = (rec["notes"] + "; " + note) if rec["notes"] else note
     except Exception as exc:
         rec["notes"] = f"summary error: {exc}"
 
