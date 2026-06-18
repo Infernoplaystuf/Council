@@ -1601,6 +1601,26 @@ def probe_node(host: str, timeout_s: int = 5) -> NodeStatus:
     )
 
 
+def _remote_nodes_enabled() -> bool:
+    """Whether inference may be dispatched to remote nodes. OFF by
+    default — the user opts in with COUNCIL_REMOTE_NODES=1 after
+    registering nodes in the Apothecary tab. Re-enables the Ollama HTTP
+    path for REMOTE machines only; local inference stays on the GGUF."""
+    return os.environ.get("COUNCIL_REMOTE_NODES", "").strip().lower() \
+        in ("1", "true", "yes", "on")
+
+
+def _is_remote_host(host: str) -> bool:
+    """True for a real remote node — i.e. NOT loopback. A localhost pick
+    (the dispatcher's no-reachable-node fallback) must run on the local
+    GGUF, not via an Ollama HTTP call to a server that isn't there."""
+    h = (host or "").lower()
+    if not h:
+        return False
+    return not any(tok in h for tok in
+                   ("localhost", "127.0.0.1", "::1", "0.0.0.0"))
+
+
 class LoadAwareDispatcher:
     """
     Picks the best available Ollama host for a given model at call time.
@@ -4518,6 +4538,37 @@ class _DispatchedBackendSpec(LocalBackendSpec):
                  token_callback: Optional[Callable[[str], None]] = None) -> str:
         self.host = self._dispatcher.best_host_for(self.model)
         self.allow_remote = True
+        # Multi-node inference (opt-in via COUNCIL_REMOTE_NODES). When a
+        # REACHABLE, non-loopback node is chosen for this model, run the
+        # inference THERE (Ollama HTTP) instead of on the local GGUF —
+        # the "multiple machines" path. Default OFF, and a localhost /
+        # unreachable pick always falls through to the local GGUF, so the
+        # standard single-machine behaviour is unchanged unless the user
+        # registers a node and turns this on.
+        if _remote_nodes_enabled() and _is_remote_host(self.host):
+            temp = self.default_temperature if temperature is None else float(temperature)
+            mtok = self.default_max_tokens if max_tokens is None else int(max_tokens)
+            messages = [
+                {"role": "system", "content": developer_instructions},
+                {"role": "user", "content": user_text},
+            ]
+            try:
+                if trace:
+                    print(f"[REMOTE] {self.key} model={self.model} -> {self.host}",
+                          flush=True)
+                if token_callback is not None:
+                    return _ollama_chat_stream(
+                        self.host, self.model, messages,
+                        temperature=temp, num_predict=mtok,
+                        allow_remote=True, token_callback=token_callback)
+                return _ollama_chat(
+                    self.host, self.model, messages,
+                    temperature=temp, num_predict=mtok, allow_remote=True)
+            except Exception as exc:
+                # Remote node failed mid-call — fall back to the local
+                # GGUF so the user still gets an answer.
+                print(f"[REMOTE] node {self.host} failed ({exc!r}); "
+                      "falling back to local model.", flush=True)
         return super().generate(
             developer_instructions=developer_instructions,
             user_text=user_text,

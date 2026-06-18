@@ -1279,6 +1279,109 @@ def test_db_audit_log_writes() -> None:
                rec["kind"] == "test" and rec["note"] == "hello")
 
 
+def test_swap_advisor_decisions() -> None:
+    """swap_advisor: classify tasks, prefer a remote specialist (cheap),
+    gate local swaps on GPU + cost, and stay silent when no specialist
+    helps or the task is generalist."""
+    import swap_advisor as sa
+
+    _check("code task classified", sa.classify_task("write a python function to parse logs") == "coder")
+    _check("reasoning task classified",
+           sa.classify_task("derive this step by step and prove the bound") == "reasoning")
+    _check("chit-chat -> no role", sa.classify_task("what do you think about the weather") is None)
+
+    base = "llama-generalist"
+    # No specialist assigned -> no suggestion even on a code task
+    _check("no specialist -> no suggestion",
+           sa.advise("write code to sort a list", current_model=base,
+                     role_assignments={}, remote_specialists={},
+                     gpu_swap_enabled=True) is None)
+
+    # Local specialist, GPU ON, cheap reload -> suggest local
+    s_local = sa.advise("write a python function with a regex",
+                        current_model=base,
+                        role_assignments={"coder": "granite-code"},
+                        gpu_swap_enabled=True, local_swap_seconds=6.0)
+    _check("local specialist suggested on GPU", s_local is not None
+           and s_local.target_kind == "local" and s_local.role == "coder")
+
+    # Same, but GPU OFF -> no local suggestion (reload not worth it on CPU)
+    _check("no local swap suggested on CPU",
+           sa.advise("write a python function with a regex", current_model=base,
+                     role_assignments={"coder": "granite-code"},
+                     gpu_swap_enabled=False) is None)
+
+    # Reload too slow -> not worth it
+    _check("too-slow local reload not suggested",
+           sa.advise("write a python function with a regex", current_model=base,
+                     role_assignments={"coder": "granite-code"},
+                     gpu_swap_enabled=True, local_swap_seconds=30.0) is None)
+
+    # Remote specialist present -> preferred (cheap), even on CPU
+    s_rem = sa.advise("write a python function with a regex", current_model=base,
+                      role_assignments={"coder": "granite-code"},
+                      remote_specialists={"coder": {"model": "granite-code",
+                                                    "node": "pi-01",
+                                                    "label": "coder on pi-01"}},
+                      gpu_swap_enabled=False)
+    _check("remote specialist preferred + works on CPU",
+           s_rem is not None and s_rem.target_kind == "remote"
+           and "pi-01" in s_rem.target_label)
+    _check("remote suggestion advertises no local reload",
+           s_rem is not None and "no local reload" in s_rem.est_cost)
+
+
+def test_remote_dispatch_gating() -> None:
+    """The reconnected remote path: dispatch to a REMOTE node only when
+    COUNCIL_REMOTE_NODES is on AND the chosen host is non-loopback;
+    otherwise run on the local GGUF. Verified with mocks (no real node)."""
+    import os as _os
+    import council_engine as ce
+
+    _check("remote off by default",
+           not ce._remote_nodes_enabled() if not _os.environ.get("COUNCIL_REMOTE_NODES")
+           else True)
+    _check("localhost is NOT a remote host", not ce._is_remote_host("http://localhost:11434"))
+    _check("127.0.0.1 is NOT remote", not ce._is_remote_host("http://127.0.0.1:11434"))
+    _check("LAN IP IS a remote host", ce._is_remote_host("http://192.168.1.50:11434"))
+
+    # Build a dispatched spec pointing at a fake remote node; mock both
+    # the local GGUF and the Ollama call so nothing real is invoked.
+    class _FakeDispatcher:
+        def best_host_for(self, model):
+            return "http://192.168.1.50:11434"
+    spec = ce._DispatchedBackendSpec(
+        key="k", host="http://localhost:11434", model="granite",
+        tags={}, default_temperature=0.2, default_max_tokens=64,
+        allow_remote=True)
+    spec._dispatcher = _FakeDispatcher()
+
+    prev = _os.environ.get("COUNCIL_REMOTE_NODES")
+    _orig_remote = ce._ollama_chat
+    _orig_local = ce._gguf_chat
+    try:
+        calls = {"remote": 0, "local": 0}
+        ce._ollama_chat = lambda *a, **k: calls.__setitem__("remote", calls["remote"] + 1) or "REMOTE"
+        ce._gguf_chat = lambda *a, **k: calls.__setitem__("local", calls["local"] + 1) or "LOCAL"
+
+        # Remote ON -> dispatches to the node
+        _os.environ["COUNCIL_REMOTE_NODES"] = "1"
+        out = spec.generate(developer_instructions="sys", user_text="hi", trace=False)
+        _check("remote ON routes to the node", out == "REMOTE" and calls["remote"] == 1)
+
+        # Remote OFF -> local GGUF
+        _os.environ["COUNCIL_REMOTE_NODES"] = "0"
+        out2 = spec.generate(developer_instructions="sys", user_text="hi", trace=False)
+        _check("remote OFF routes to local GGUF", out2 == "LOCAL" and calls["local"] == 1)
+    finally:
+        ce._ollama_chat = _orig_remote
+        ce._gguf_chat = _orig_local
+        if prev is None:
+            _os.environ.pop("COUNCIL_REMOTE_NODES", None)
+        else:
+            _os.environ["COUNCIL_REMOTE_NODES"] = prev
+
+
 def test_role_models_swap_gating() -> None:
     """role_models: GPU-gated swap (CPU = no-op), registry round-trip,
     role->model resolution with base fallback, and no redundant swaps."""
@@ -1889,6 +1992,8 @@ def main() -> int:
     _run("STATS — cache exact + incremental + query cache", test_stats_cache_exact_and_incremental)
     _run("MODELS — finder US filter + hardware fit", test_model_finder_us_filter_and_fit)
     _run("MODELS — role swap GPU-gated",          test_role_models_swap_gating)
+    _run("MODELS — swap advisor decisions",       test_swap_advisor_decisions)
+    _run("MODELS — remote dispatch gating",       test_remote_dispatch_gating)
     _run("STATS — per-folder CSV shards",         test_stats_cache_per_folder_csv_shards)
     _run("STATS — analyst cache-backed helpers",  test_analyst_cached_stats_helpers)
     _run("ANALYST — folder summary samples (no full read)", test_folder_summary_samples_not_full_read)
