@@ -1279,6 +1279,52 @@ def test_db_audit_log_writes() -> None:
                rec["kind"] == "test" and rec["note"] == "hello")
 
 
+def test_model_finder_us_filter_and_fit() -> None:
+    """model_finder: US-origin heuristic (non-US wins over US repacker),
+    param parsing, VRAM estimate, hardware-aware catalog ranking, and a
+    guaranteed offline fallback that always returns something runnable."""
+    import model_finder as mf
+
+    # Origin heuristic
+    _check("Meta is US", mf.classify_origin("meta-llama/Llama-3.1-8B") == "us")
+    _check("IBM granite is US", mf.classify_origin("bartowski/granite-3.1-8b") == "us")
+    _check("Qwen is non-US even via US repacker",
+           mf.classify_origin("bartowski/Qwen2.5-7B-GGUF") == "non_us")
+    _check("Mistral is non-US", mf.classify_origin("TheBloke/Mistral-7B") == "non_us")
+    _check("unknown stays unknown", mf.classify_origin("someuser/mystery-model") == "unknown")
+
+    # Param parsing (incl. MoE AxB)
+    _check("8B parsed", mf._params_b_from_name("Llama-3.1-8B-Instruct") == 8.0)
+    _check("3B parsed", mf._params_b_from_name("Llama-3.2-3B") == 3.0)
+    _check("20b parsed", mf._params_b_from_name("gpt-oss-20b") == 20.0)
+    _check("MoE 8x7B = 56", mf._params_b_from_name("Mixtral-8x7B") == 56.0)
+    _check("no params -> None", mf._params_b_from_name("granite-instruct") is None)
+
+    # VRAM estimate scales with quant
+    q4 = mf.estimate_vram_gb(8.0, quant="Q4_K_M")
+    q8 = mf.estimate_vram_gb(8.0, quant="Q8_0")
+    _check("Q8 needs more VRAM than Q4", q8 > q4)
+    _check("8B Q4 estimate is in a sane range", 5.0 <= q4 <= 9.0)
+
+    # Hardware-aware catalog ranking — big GPU gets a bigger model than
+    # a tiny GPU, and BOTH always get a runnable suggestion.
+    big = mf.recommend_from_catalog(vram_gb=24.0, role="general")
+    small = mf.recommend_from_catalog(vram_gb=4.0, role="general")
+    _check("big-GPU recommendation non-empty", len(big) >= 1)
+    _check("small-GPU recommendation non-empty (CPU/tiny fallback)", len(small) >= 1)
+    _check("all catalog picks are US + verified",
+           all(m["origin"] == "us" and m["origin_verified"] for m in big))
+    _check("big GPU's top pick >= small GPU's top pick (params)",
+           big[0]["params_b"] >= small[0]["params_b"])
+
+    # find_models offline: prefer_online=False must still return catalog.
+    res = mf.find_models(hardware={"vram_gb": 8.0, "ram_gb": 16.0},
+                         role="general", prefer_online=False)
+    _check("find_models returns catalog offline", len(res["catalog"]) >= 1)
+    _check("find_models marks online unavailable offline",
+           res["online_available"] is False and res["online"] == [])
+
+
 def test_stats_cache_per_folder_csv_shards() -> None:
     """The cache writes ONE CSV shard per folder (mirroring the tree),
     readable as a plain stats table, and never processes its own shards."""
@@ -1776,6 +1822,7 @@ def main() -> int:
     _run("DB — guided wizard URL assembly",       test_db_wizard_url_assembly)
     _run("DB — audit log writes JSONL",           test_db_audit_log_writes)
     _run("STATS — cache exact + incremental + query cache", test_stats_cache_exact_and_incremental)
+    _run("MODELS — finder US filter + hardware fit", test_model_finder_us_filter_and_fit)
     _run("STATS — per-folder CSV shards",         test_stats_cache_per_folder_csv_shards)
     _run("STATS — analyst cache-backed helpers",  test_analyst_cached_stats_helpers)
     _run("ANALYST — folder summary samples (no full read)", test_folder_summary_samples_not_full_read)
