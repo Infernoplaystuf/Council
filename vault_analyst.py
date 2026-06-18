@@ -3438,6 +3438,12 @@ _COMPUTE_KEYWORDS = (
     # the model, which can't actually count rows or read schemas).
     "summary of files", "summary of the files",
     "data summary", "true data summary",
+    # Stats-summary intents — route to the bounded, cache-backed
+    # folder_column_stats path (NOT model code-gen, which over 200+
+    # files OOMs the app). Bare "stats"/"statistics" is inherently a
+    # computational ask, so it belongs in the analyst pipeline.
+    "stats", "statistics", "summary of stats", "stats summary",
+    "summary statistics", "column stats", "min max mean", "min/max/mean",
     "summarize the files", "summarize files",
     "summarize the data", "summarize this folder",
     "describe the files", "describe these files", "describe the data",

@@ -329,6 +329,57 @@ def test_folder_data_summary_helper() -> None:
                and int(csv_row.iloc[0]["columns"]) == 3)
 
 
+def test_stats_summary_triggers() -> None:
+    """Stats-summary intents must reach the analyst (looks_computational).
+    If they don't, the bounded folder_column_stats direct-route never
+    runs and the query crashes the app on 200+ CSVs via model code-gen.
+    """
+    import vault_analyst as va
+    cases = [
+        "give me a summary of stats for this folder",
+        "stats summary of the files",
+        "column stats across the data",
+        "min max mean of every csv",
+        "compute statistics for the folder",
+    ]
+    for q in cases:
+        _check(f"looks_computational matches: {q!r}",
+               va.looks_computational(q),
+               detail="stats keyword missing from _COMPUTE_KEYWORDS")
+
+
+def test_folder_column_stats_bounded_many_files() -> None:
+    """folder_column_stats must aggregate stats over MANY CSVs from the
+    cache (streaming per file) and return one row per (file, column) —
+    this is the bounded path that replaces the OOM-prone model code-gen
+    on a 'summary of stats in a folder containing 200 csvs' query.
+    """
+    import pandas as pd
+    import vault_analyst as va
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td) / "vault"
+        data = vault / "data_in" / "many"
+        data.mkdir(parents=True)
+        n = 60
+        for i in range(n):
+            (data / f"part_{i:03d}.csv").write_text(
+                "id,value,label\n"
+                f"{i},{i * 1.5},a\n{i + 1},{i * 2.0},b\n"
+            )
+        df = va.folder_column_stats(vault, data)
+        _check("returns a DataFrame", isinstance(df, pd.DataFrame))
+        _check("non-empty over many files", not df.empty)
+        _check("one row per (file,column) — file column present",
+               "file" in df.columns and "column" in df.columns)
+        files_seen = df["file"].nunique() if "file" in df else 0
+        _check(f"all {n} files represented (got {files_seen})",
+               files_seen == n)
+        # numeric stats must be populated for the 'value' column
+        val_rows = df[df["column"] == "value"] if "column" in df else df.iloc[0:0]
+        _check("numeric stats computed for 'value' column",
+               not val_rows.empty and val_rows["mean"].notna().any())
+
+
 def test_clip_path_persistence() -> None:
     """The vision (mmproj) path must round-trip through backend_settings
     .json without overwriting the GGUF path stored alongside it. This
@@ -1965,6 +2016,8 @@ def main() -> int:
     _run("synthetic GGUF — reject cases",       test_synthetic_gguf_rejected_cases)
     _run("data-summary trigger keywords",       test_data_summary_triggers)
     _run("folder_data_summary helper",          test_folder_data_summary_helper)
+    _run("stats-summary trigger keywords",       test_stats_summary_triggers)
+    _run("folder_column_stats bounded many-file", test_folder_column_stats_bounded_many_files)
     _run("clip_path / GGUF path co-persistence", test_clip_path_persistence)
     _run("SPC — process_capability known-values", test_spc_process_capability_known_values)
     _run("SPC — process_capability one-sided",    test_spc_process_capability_one_sided)

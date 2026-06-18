@@ -2188,6 +2188,100 @@ def _run_analyst_step_impl(query):
         # Fall through to the model path if the direct call returned
         # nothing (empty folder, hint resolved to non-existent path, etc).
 
+    # ── Direct-route: STATS summary over a folder ───────────────────
+    # "summary of stats", "column statistics", "min/max/mean of the
+    # files" etc. used to fall through to the MODEL, which would write
+    # arbitrary pandas — and over 200+ CSVs a `pd.concat([read_csv(f)
+    # for f in files])` blows memory and crashes the app. Route these
+    # to folder_column_stats(), which reads ONLY from the precomputed
+    # stats cache (streaming compute on a miss, one file at a time) so
+    # peak memory is bounded no matter how many files there are.
+    _STATS_SUMMARY_TRIGGERS = (
+        "summary of stats", "summary of the stats", "stats summary",
+        "statistics summary", "summary statistics", "statistical summary",
+        "column stats", "column statistics", "stats of the files",
+        "stats for the files", "statistics of the files",
+        "statistics for the files", "stats of the folder",
+        "stats on the files", "min max mean", "min/max/mean",
+        "summarize the stats", "summarise the stats", "summarize stats",
+        "give me stats", "compute stats", "calculate stats",
+        "stats across", "statistics across",
+    )
+    if any(phrase in qlower for phrase in _STATS_SUMMARY_TRIGGERS):
+        try:
+            _ssub = _va.resolve_subfolder_hint(query, allowed_folders[0])
+        except Exception:
+            _ssub = None
+        _starget = [_ssub] if _ssub is not None else allowed_folders
+        _sscope = (f" — scope: {_ssub.relative_to(allowed_folders[0])}"
+                   if _ssub is not None else "")
+
+        # Query-report cache, fingerprinted on each input file's mtime —
+        # an unchanged folder serves the prior stats table instantly.
+        _sqc = _sqkey = None
+        try:
+            import stats_cache as _sc2
+            _sqc = _sc2.QueryReportCache(VAULT_DIR)
+            _sinputs = [str(p) for p in _va.list_csv_files(_starget)]
+            _sqkey = _sqc.make_key("folder_column_stats" + _sscope, _sinputs)
+        except Exception:
+            _sqc = None
+
+        srep = None
+        _shit = _sqc.get(_sqkey) if (_sqc and _sqkey) else None
+        if _shit is not None:
+            srep = _shit.get("report")
+
+        if srep is None:
+            try:
+                _sdf = _va.folder_column_stats(VAULT_DIR, _starget)
+            except Exception as _se:
+                print('[analyst] direct folder_column_stats failed: '
+                      + repr(_se), file=_sys_dbg.stderr)
+                _sdf = None
+            if _sdf is not None and not _sdf.empty:
+                try:
+                    _n_ctx_st = ce.get_n_ctx()
+                except Exception:
+                    _n_ctx_st = 4096
+                _st_max_tokens = max(150, _n_ctx_st // 4)
+                _stable = _va.format_result_for_prompt(
+                    _sdf, max_rows=400, max_chars=12000,
+                    max_tokens=_st_max_tokens, count_tokens=ce.estimate_tokens,
+                )
+                try:
+                    _srender = _sdf.to_string(index=False,
+                                              max_rows=120, max_cols=20)
+                except Exception:
+                    _srender = ""
+                _nfiles = int(_sdf["file"].nunique()) if "file" in _sdf else 0
+                srep = {"table_text": _stable, "user_render": _srender,
+                        "n_files": _nfiles}
+                if _sqc and _sqkey:
+                    try:
+                        _sqc.put(_sqkey,
+                                 query="folder_column_stats" + _sscope,
+                                 report=srep)
+                    except Exception:
+                        pass
+
+        if srep is not None:
+            block = (f"[ANALYST RESULT — folder_column_stats{_sscope}]\n"
+                     f"# Direct call (no model code-gen). Stats served from "
+                     f"the precomputed cache — one row per (file, column).\n"
+                     f"{srep.get('table_text', '')}")
+            notices.append(
+                "Analyst direct-routed to folder_column_stats"
+                + (f" on subfolder {_ssub.relative_to(allowed_folders[0])}"
+                   if _ssub is not None else "")
+                + f" — stats for {srep.get('n_files', 0)} file(s)"
+                + (" (cached)" if _shit is not None else "") + "."
+            )
+            if srep.get("user_render"):
+                notices.append("__ANALYST_TABLE__:" + srep["user_render"])
+            return block, None, notices
+        # Empty result → fall through to the model path.
+
     # ── Upgrade A+B: pre-resolve filename + subfolder hints ──────────
     # Before sending the prompt to the model, look for explicit
     # filename references ("sales.csv", quoted strings) and folder
