@@ -283,9 +283,14 @@ class StatsCache:
         return bool(entry) and entry.get("mtime") == _mtime(path)
 
     def get(self, path: Any, *, compute_if_missing: bool = True,
-            sep: str = ",") -> Optional[Dict[str, Any]]:
+            sep: str = ",", save: bool = True) -> Optional[Dict[str, Any]]:
         """Return the cached stats for a file, recomputing if missing or
-        stale (unless compute_if_missing=False)."""
+        stale (unless compute_if_missing=False).
+
+        ``save=False`` updates the in-memory record but skips the disk
+        write — used by process_unprocessed to write ONCE at the end of a
+        sweep instead of rewriting the whole file per processed file
+        (which was O(N²) write volume on a cold sweep)."""
         key = self._key(path)
         mt = _mtime(path)
         entry = self._data.get(key)
@@ -296,7 +301,8 @@ class StatsCache:
         stats = compute_column_stats(path, sep=sep)
         with self._lock:
             self._data[key] = {"mtime": mt, "stats": stats}
-            self._save()
+            if save:
+                self._save()
         return stats
 
     def process_unprocessed(self, folders: Any, *,
@@ -322,13 +328,18 @@ class StatsCache:
             todo = todo[:limit]
         processed = 0
         for i, f in enumerate(todo, 1):
-            self.get(f)                     # computes + stores
+            # save=False: accumulate in memory, write once at the end —
+            # avoids rewriting the whole cache file per processed file.
+            self.get(f, save=False)
             processed += 1
             if on_progress:
                 try:
                     on_progress(i, len(todo), f.name)
                 except Exception:
                     pass
+        if processed:
+            with self._lock:
+                self._save()                # single write for the sweep
         return {"seen": len(files), "processed": processed,
                 "already_current": len(files) - len(todo)}
 
