@@ -1279,6 +1279,47 @@ def test_db_audit_log_writes() -> None:
                rec["kind"] == "test" and rec["note"] == "hello")
 
 
+def test_stats_cache_per_folder_csv_shards() -> None:
+    """The cache writes ONE CSV shard per folder (mirroring the tree),
+    readable as a plain stats table, and never processes its own shards."""
+    import csv as _csv
+    import stats_cache as sc
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        (d / "data_in").mkdir()
+        (d / "data_in" / "sub").mkdir()
+        (d / "data_in" / "orders.csv").write_text("amount,region\n10,N\n20,S\n30,N\n")
+        (d / "data_in" / "sub" / "q.csv").write_text("rev\n100\n200\n")
+        cache = sc.StatsCache(d)
+        r = cache.process_unprocessed(d / "data_in")
+        _check("processed both files", r["processed"] == 2)
+
+        # One shard per folder, mirroring the tree, named columns.csv
+        shards = sorted(p.relative_to(d).as_posix()
+                        for p in (d / ".stats_cache").rglob("columns.csv"))
+        _check("per-folder shards mirror the tree",
+               shards == [".stats_cache/data_in/columns.csv",
+                          ".stats_cache/data_in/sub/columns.csv"])
+
+        # Shard is a plain, readable CSV with the agreed schema
+        with (d / ".stats_cache" / "data_in" / "columns.csv").open() as fh:
+            rows = list(_csv.DictReader(fh))
+        _check("shard header is the CSV schema",
+               set(["file", "rows", "column", "min", "max", "mean", "sum"])
+               <= set(rows[0].keys()))
+        amt = [x for x in rows
+               if x["file"] == "orders.csv" and x["column"] == "amount"][0]
+        _check("shard carries exact stats",
+               amt["min"] == "10.0" and amt["max"] == "30.0"
+               and amt["mean"] == "20.0" and amt["sum"] == "60.0"
+               and amt["rows"] == "3")
+
+        # Re-running must NOT process the shard CSVs themselves
+        r2 = cache.process_unprocessed(d / "data_in")
+        _check("shards excluded from the walk (no self-processing)",
+               r2["processed"] == 0 and r2["seen"] == 2)
+
+
 def test_analyst_cached_stats_helpers() -> None:
     """The cache-backed analyst helpers (folder_column_stats /
     cached_column_stats) and their sandbox names (column_stats /
@@ -1735,6 +1776,7 @@ def main() -> int:
     _run("DB — guided wizard URL assembly",       test_db_wizard_url_assembly)
     _run("DB — audit log writes JSONL",           test_db_audit_log_writes)
     _run("STATS — cache exact + incremental + query cache", test_stats_cache_exact_and_incremental)
+    _run("STATS — per-folder CSV shards",         test_stats_cache_per_folder_csv_shards)
     _run("STATS — analyst cache-backed helpers",  test_analyst_cached_stats_helpers)
     _run("ANALYST — folder summary samples (no full read)", test_folder_summary_samples_not_full_read)
     _run("SELF-IMPROVE — failure log roundtrip",  test_failure_log_roundtrip)
