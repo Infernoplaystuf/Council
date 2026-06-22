@@ -3760,6 +3760,7 @@ class CouncilConsole(tk.Tk):
         self._build_council_tab()
         self._build_godot_workspace_tab()   # Anvil — phase C-lite, customer-facing
         self._build_game_concepts_tab()     # Anvil — phase B,     customer-facing
+        self._build_pixel_art_tab()         # Anvil — pixel-art,   customer-facing
         self._build_steam_market_tab()      # Anvil — phase D,     customer-facing
         self._build_simulations_tab()       # Anvil — sim phase,   customer-facing
         self._build_dream3d_tab()
@@ -11151,6 +11152,683 @@ class CouncilConsole(tk.Tk):
                 self.nb.select(self.tab_council)
         except Exception as exc:
             print(f"[Game Concepts] stage to council failed: {exc!r}")
+
+    # ---- 🎨 Pixel Art tab ----
+
+    # Default colour, brush size, palette, and canvas dimensions
+    _PX_DEFAULT_COLOR = "#1a1414"
+    _PX_DEFAULT_SIZE  = 32
+    _PX_SIZES         = (16, 32, 48, 64, 96, 128)
+
+    def _build_pixel_art_tab(self):
+        """🎨 Pixel Art — hand-paint sprites with pencil / fill / line
+        / rect tools, optional vertical-mirror symmetry, predefined
+        palettes, multi-frame animation, PNG export, and a one-click
+        Save into the open Godot project's assets.
+
+        Pillow-backed model (see pixel_art.PixelDocument). Falls
+        back to a friendly "install Pillow" pane if PIL is missing
+        rather than wedging the tab.
+        """
+        self.tab_pixel_art = ttk.Frame(self.nb)
+        self.nb.add(self.tab_pixel_art, text="🎨 Pixel Art")
+
+        # ── Pillow check ────────────────────────────────────────
+        try:
+            import pixel_art as _px
+        except Exception as exc:
+            self._px_show_unavailable(f"pixel_art import failed: {exc!r}")
+            return
+        if not _px.PIL_OK:
+            self._px_show_unavailable(
+                "Pillow (PIL) isn't installed in this Python env.\n\n"
+                "Install with:  pip install pillow\n"
+                "Then restart Anvil."
+            )
+            return
+
+        # ── State ───────────────────────────────────────────────
+        self._px_module = _px
+        self._px_doc = _px.PixelDocument(
+            width=self._PX_DEFAULT_SIZE, height=self._PX_DEFAULT_SIZE,
+        )
+        self._px_color: tuple = _px.hex_to_rgba(self._PX_DEFAULT_COLOR)
+        self._px_recent_colors: list = []
+        self._px_zoom = 16
+        self._px_tool = "pencil"
+        self._px_brush_size = 1
+        self._px_show_grid = True
+        self._px_line_start = None     # (x, y) for line/rect drag start
+        self._px_drag_active = False
+        self._px_photo = None          # ImageTk.PhotoImage ref
+        self._px_overlay_ids: list = []
+        self._px_frame_thumbs: list = []  # ImageTk refs for the frame strip
+
+        # ── Top strip: file actions ────────────────────────────
+        top = ttk.Frame(self.tab_pixel_art)
+        top.pack(fill="x", padx=6, pady=(6, 4))
+        ttk.Button(top, text="📂 New",
+                   command=self._px_new).pack(side="left")
+        ttk.Button(top, text="📥 Load PNG…",
+                   command=self._px_load).pack(side="left", padx=4)
+        ttk.Button(top, text="💾 Save PNG",
+                   command=self._px_save).pack(side="left")
+        ttk.Button(top, text="💾 Save sprite sheet",
+                   command=self._px_save_sheet).pack(side="left", padx=4)
+        ttk.Button(top, text="🛠 Save into open Godot project",
+                   command=self._px_save_into_godot
+                   ).pack(side="left", padx=(8, 0))
+        self._px_status_var = tk.StringVar(value="new 32×32 canvas")
+        ttk.Label(top, textvariable=self._px_status_var,
+                  foreground="#a98a8a").pack(side="right")
+
+        # ── Tool strip ─────────────────────────────────────────
+        tools = ttk.Frame(self.tab_pixel_art)
+        tools.pack(fill="x", padx=6, pady=(0, 4))
+        for code, label in (
+            ("pencil",     "✎ Pencil"),
+            ("eraser",     "⌫ Eraser"),
+            ("fill",       "▣ Fill"),
+            ("eyedropper", "💧 Pick"),
+            ("line",       "／ Line"),
+            ("rect",       "□ Rect"),
+            ("rect_fill",  "■ Rect fill"),
+        ):
+            b = ttk.Button(tools, text=label,
+                           command=lambda c=code: self._px_set_tool(c))
+            b.pack(side="left", padx=1)
+        ttk.Label(tools, text="  Brush:").pack(side="left", padx=(8, 2))
+        self._px_brush_var = tk.IntVar(value=self._px_brush_size)
+        ttk.Spinbox(tools, from_=1, to=8, width=3,
+                     textvariable=self._px_brush_var,
+                     command=lambda: self._px_brush_size_update()
+                     ).pack(side="left")
+        self._px_sym_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(tools, text="↔ Symmetry",
+                         variable=self._px_sym_var,
+                         command=self._px_apply_symmetry
+                         ).pack(side="left", padx=8)
+        self._px_grid_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(tools, text="# Grid",
+                         variable=self._px_grid_var,
+                         command=self._px_redraw
+                         ).pack(side="left", padx=2)
+        ttk.Label(tools, text="  Canvas:").pack(side="left", padx=(8, 2))
+        self._px_size_var = tk.StringVar(value=str(self._PX_DEFAULT_SIZE))
+        size_choices = tuple(str(s) for s in self._PX_SIZES)
+        ttk.OptionMenu(tools, self._px_size_var,
+                        str(self._PX_DEFAULT_SIZE),
+                        *size_choices,
+                        command=lambda _v: self._px_resize_canvas()
+                        ).pack(side="left")
+        ttk.Label(tools, text="  Zoom:").pack(side="left", padx=(8, 2))
+        self._px_zoom_var = tk.IntVar(value=self._px_zoom)
+        ttk.Spinbox(tools, from_=2, to=32, width=3,
+                     textvariable=self._px_zoom_var,
+                     command=self._px_zoom_update
+                     ).pack(side="left")
+        ttk.Button(tools, text="↶ Undo",
+                   command=self._px_undo).pack(side="right", padx=2)
+        ttk.Button(tools, text="↷ Redo",
+                   command=self._px_redo).pack(side="right", padx=2)
+
+        # ── Body — left palette / center canvas / right frames ─
+        body = tk.PanedWindow(self.tab_pixel_art, orient="horizontal",
+                               bg="#1a1414", sashwidth=6)
+        body.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # Left — colour + palette
+        left = ttk.Frame(body)
+        body.add(left, width=180, minsize=160)
+        ttk.Label(left, text="Color").pack(anchor="w")
+        self._px_color_btn = tk.Button(
+            left, text="", width=12, height=2,
+            bg=_px.to_hex(self._px_color[:3]),
+            command=self._px_pick_color,
+        )
+        self._px_color_btn.pack(fill="x", pady=(2, 4))
+        # Hex entry — direct text input for known colours
+        ttk.Label(left, text="Hex:").pack(anchor="w")
+        self._px_hex_var = tk.StringVar(
+            value=_px.to_hex(self._px_color[:3]))
+        hex_row = ttk.Frame(left)
+        hex_row.pack(fill="x", pady=(0, 6))
+        ttk.Entry(hex_row, textvariable=self._px_hex_var,
+                   width=10).pack(side="left", fill="x", expand=True)
+        ttk.Button(hex_row, text="Apply",
+                   command=self._px_apply_hex
+                   ).pack(side="left", padx=2)
+
+        # Recent swatches
+        ttk.Label(left, text="Recent").pack(anchor="w")
+        self._px_recent_frame = ttk.Frame(left)
+        self._px_recent_frame.pack(fill="x", pady=(2, 6))
+        self._px_render_recent()
+
+        # Palette dropdown + swatch grid
+        ttk.Label(left, text="Palette").pack(anchor="w")
+        self._px_palette_var = tk.StringVar(value="Default")
+        ttk.OptionMenu(left, self._px_palette_var,
+                        "Default",
+                        *_px.PALETTES.keys(),
+                        command=lambda _v: self._px_render_palette()
+                        ).pack(fill="x", pady=(2, 4))
+        self._px_palette_canvas = tk.Canvas(
+            left, bg="#0f0c0c", highlightthickness=0,
+            height=240,
+        )
+        self._px_palette_canvas.pack(fill="both", expand=True)
+        self._px_palette_canvas.bind("<Button-1>",
+                                       self._px_palette_click)
+        self._px_palette_swatches: list = []  # [(x0,y0,x1,y1,rgb), ...]
+
+        # Center — drawing canvas
+        center = ttk.Frame(body)
+        body.add(center, minsize=400)
+        canvas_row = ttk.Frame(center)
+        canvas_row.pack(fill="both", expand=True)
+        self._px_canvas = tk.Canvas(
+            canvas_row, bg="#0a0808", highlightthickness=0,
+            cursor="tcross",
+        )
+        # Scrollbars so big canvases at high zoom can pan
+        self._px_canvas_xsb = ttk.Scrollbar(
+            canvas_row, orient="horizontal",
+            command=self._px_canvas.xview,
+        )
+        self._px_canvas_ysb = ttk.Scrollbar(
+            canvas_row, orient="vertical",
+            command=self._px_canvas.yview,
+        )
+        self._px_canvas.configure(
+            xscrollcommand=self._px_canvas_xsb.set,
+            yscrollcommand=self._px_canvas_ysb.set,
+        )
+        self._px_canvas.grid(row=0, column=0, sticky="nsew")
+        self._px_canvas_ysb.grid(row=0, column=1, sticky="ns")
+        self._px_canvas_xsb.grid(row=1, column=0, sticky="ew")
+        canvas_row.grid_rowconfigure(0, weight=1)
+        canvas_row.grid_columnconfigure(0, weight=1)
+        # Mouse bindings
+        self._px_canvas.bind("<Button-1>", self._px_on_mouse_down)
+        self._px_canvas.bind("<B1-Motion>", self._px_on_mouse_drag)
+        self._px_canvas.bind("<ButtonRelease-1>", self._px_on_mouse_up)
+        self._px_canvas.bind("<Button-3>", self._px_on_right_click)
+        # Ctrl+Z / Ctrl+Y for undo / redo
+        self.bind_class("Text", "<Control-Key-z>", lambda e: None)
+        # Keyboard bindings live on the canvas so they don't fight
+        # the chat-input field on the Council tab.
+        self._px_canvas.bind("<Control-z>", lambda e: self._px_undo())
+        self._px_canvas.bind("<Control-y>", lambda e: self._px_redo())
+
+        # Right — frame strip
+        right = ttk.Frame(body)
+        body.add(right, width=140, minsize=120)
+        ttk.Label(right, text="Frames").pack(anchor="w")
+        frame_actions = ttk.Frame(right)
+        frame_actions.pack(fill="x", pady=(2, 4))
+        ttk.Button(frame_actions, text="+ Dup",
+                   command=lambda: self._px_add_frame(True)
+                   ).pack(side="left", padx=1)
+        ttk.Button(frame_actions, text="+ New",
+                   command=lambda: self._px_add_frame(False)
+                   ).pack(side="left", padx=1)
+        ttk.Button(frame_actions, text="🗑",
+                   command=self._px_remove_frame
+                   ).pack(side="left", padx=1)
+        self._px_frames_box = tk.Listbox(
+            right, bg="#0f0c0c", fg="#d4d4d4",
+            selectbackground="#4a2626", selectforeground="#d4d4d4",
+            font=("Consolas", 9), activestyle="none",
+            height=18,
+        )
+        self._px_frames_box.pack(fill="both", expand=True)
+        self._px_frames_box.bind("<<ListboxSelect>>",
+                                  self._px_on_frame_select)
+
+        # Initial render
+        self._px_render_palette()
+        self._px_refresh_frames_list()
+        self._px_redraw()
+
+    # ----------------------------------------------------------------
+    # Fallback when Pillow isn't installed
+    # ----------------------------------------------------------------
+
+    def _px_show_unavailable(self, message: str) -> None:
+        wrap = ttk.Frame(self.tab_pixel_art)
+        wrap.place(relx=0.5, rely=0.4, anchor="center")
+        ttk.Label(wrap, text="Pixel Art tab unavailable",
+                  font=("Segoe UI", 14, "bold"),
+                  foreground="#e0884a").pack(pady=(0, 8))
+        ttk.Label(wrap, text=message, justify="center",
+                  foreground="#a98a8a", wraplength=420).pack()
+
+    # ----------------------------------------------------------------
+    # Render — keep PhotoImage + canvas in sync
+    # ----------------------------------------------------------------
+
+    def _px_redraw(self) -> None:
+        if not hasattr(self, "_px_doc"):
+            return
+        try:
+            from PIL import ImageTk
+        except Exception:
+            return
+        doc = self._px_doc
+        zoom = max(1, int(self._px_zoom_var.get() or self._px_zoom))
+        self._px_zoom = zoom
+        zoomed = doc.frame.image.resize(
+            (doc.width * zoom, doc.height * zoom),
+            self._px_module.Image.NEAREST,
+        )
+        self._px_photo = ImageTk.PhotoImage(zoomed)
+        c = self._px_canvas
+        c.delete("img")
+        c.delete("grid")
+        c.create_image(0, 0, image=self._px_photo, anchor="nw", tags="img")
+        # Grid overlay
+        if self._px_grid_var.get():
+            color = "#3a2828"
+            for i in range(doc.width + 1):
+                x = i * zoom
+                c.create_line(x, 0, x, doc.height * zoom,
+                              fill=color, tags="grid")
+            for i in range(doc.height + 1):
+                y = i * zoom
+                c.create_line(0, y, doc.width * zoom, y,
+                              fill=color, tags="grid")
+        c.configure(scrollregion=(0, 0, doc.width * zoom, doc.height * zoom))
+        self._px_update_status()
+
+    def _px_update_status(self) -> None:
+        doc = self._px_doc
+        dirty = " *" if doc.dirty else ""
+        path = f" — {doc.file_path.name}" if doc.file_path else ""
+        self._px_status_var.set(
+            f"{doc.width}×{doc.height} • frame "
+            f"{doc.current + 1}/{len(doc.frames)} • "
+            f"zoom {self._px_zoom}×{dirty}{path}"
+        )
+
+    # ----------------------------------------------------------------
+    # Tool dispatch (mouse events → primitives)
+    # ----------------------------------------------------------------
+
+    def _px_canvas_to_pixel(self, event) -> tuple:
+        z = max(1, self._px_zoom)
+        cx = self._px_canvas.canvasx(event.x)
+        cy = self._px_canvas.canvasy(event.y)
+        return (int(cx // z), int(cy // z))
+
+    def _px_set_tool(self, name: str) -> None:
+        self._px_tool = name
+
+    def _px_on_mouse_down(self, event) -> None:
+        x, y = self._px_canvas_to_pixel(event)
+        tool = self._px_tool
+        doc = self._px_doc
+        if tool in ("line", "rect", "rect_fill"):
+            # Defer the actual draw until release — but snapshot now
+            # so a previewed stroke can be cancelled by Esc later.
+            doc.snapshot()
+            self._px_line_start = (x, y)
+            self._px_drag_active = True
+            return
+        # Stamping tools snapshot once per stroke
+        doc.snapshot()
+        self._px_drag_active = True
+        self._px_apply_tool_at(x, y)
+
+    def _px_on_mouse_drag(self, event) -> None:
+        if not self._px_drag_active:
+            return
+        x, y = self._px_canvas_to_pixel(event)
+        tool = self._px_tool
+        if tool in ("line", "rect", "rect_fill"):
+            # Live preview — undo last preview then redraw
+            self._px_doc.undo()
+            self._px_doc.snapshot()
+            self._px_apply_tool_at(x, y, preview=True)
+            return
+        self._px_apply_tool_at(x, y)
+
+    def _px_on_mouse_up(self, event) -> None:
+        if not self._px_drag_active:
+            return
+        self._px_drag_active = False
+        x, y = self._px_canvas_to_pixel(event)
+        tool = self._px_tool
+        if tool in ("line", "rect", "rect_fill"):
+            self._px_doc.undo()
+            self._px_doc.snapshot()
+            self._px_apply_tool_at(x, y)
+        self._px_line_start = None
+        # Frame strip thumbnail refresh
+        self._px_refresh_frames_list()
+
+    def _px_on_right_click(self, event) -> None:
+        # Right-click = eyedropper regardless of current tool
+        x, y = self._px_canvas_to_pixel(event)
+        col = self._px_module.eyedropper(self._px_doc, x, y)
+        if col is not None:
+            self._px_set_color(col)
+
+    def _px_apply_tool_at(self, x: int, y: int, *,
+                            preview: bool = False) -> None:
+        m = self._px_module
+        doc = self._px_doc
+        tool = self._px_tool
+        color = tuple(self._px_color)
+        size = max(1, int(self._px_brush_var.get() or 1))
+        if tool == "pencil":
+            m.pencil(doc, x, y, color, size=size)
+        elif tool == "eraser":
+            m.eraser(doc, x, y, size=size)
+        elif tool == "fill":
+            m.flood_fill(doc, x, y, color)
+        elif tool == "eyedropper":
+            col = m.eyedropper(doc, x, y)
+            if col is not None:
+                self._px_set_color(col)
+            doc.undo()  # eyedropper shouldn't push history
+            self._px_redraw()
+            return
+        elif tool == "line":
+            if self._px_line_start is None:
+                return
+            x0, y0 = self._px_line_start
+            m.line(doc, x0, y0, x, y, color, size=size)
+        elif tool in ("rect", "rect_fill"):
+            if self._px_line_start is None:
+                return
+            x0, y0 = self._px_line_start
+            m.rect(doc, x0, y0, x, y, color,
+                    filled=(tool == "rect_fill"), size=size)
+        self._px_redraw()
+        # Track recent colour on real strokes (not preview)
+        if not preview and tool in ("pencil", "fill", "line",
+                                      "rect", "rect_fill"):
+            self._px_track_recent(color)
+
+    # ----------------------------------------------------------------
+    # Color picker / palette
+    # ----------------------------------------------------------------
+
+    def _px_set_color(self, rgba: tuple) -> None:
+        self._px_color = tuple(rgba)
+        hex_str = self._px_module.to_hex(rgba[:3])
+        self._px_color_btn.configure(bg=hex_str)
+        self._px_hex_var.set(hex_str)
+
+    def _px_pick_color(self) -> None:
+        from tkinter import colorchooser
+        cur = self._px_module.to_hex(self._px_color[:3])
+        result = colorchooser.askcolor(initialcolor=cur, parent=self)
+        if result and result[1]:
+            self._px_set_color(self._px_module.hex_to_rgba(result[1]))
+
+    def _px_apply_hex(self) -> None:
+        try:
+            rgba = self._px_module.hex_to_rgba(
+                self._px_hex_var.get().strip(),
+            )
+        except Exception:
+            return
+        self._px_set_color(rgba)
+
+    def _px_track_recent(self, rgba: tuple) -> None:
+        if rgba in self._px_recent_colors:
+            self._px_recent_colors.remove(rgba)
+        self._px_recent_colors.insert(0, rgba)
+        if len(self._px_recent_colors) > 12:
+            self._px_recent_colors = self._px_recent_colors[:12]
+        self._px_render_recent()
+
+    def _px_render_recent(self) -> None:
+        for child in self._px_recent_frame.winfo_children():
+            child.destroy()
+        for i, rgba in enumerate(self._px_recent_colors):
+            hex_str = self._px_module.to_hex(rgba[:3])
+            b = tk.Button(self._px_recent_frame, text="", width=2, height=1,
+                          bg=hex_str,
+                          command=lambda r=rgba: self._px_set_color(r))
+            b.grid(row=i // 6, column=i % 6, padx=1, pady=1)
+
+    def _px_render_palette(self) -> None:
+        name = self._px_palette_var.get()
+        swatches = self._px_module.PALETTES.get(name, [])
+        c = self._px_palette_canvas
+        c.delete("all")
+        self._px_palette_swatches = []
+        if not swatches:
+            return
+        # Layout: 6 columns, swatch_size tall
+        cols = 6
+        sw = 22
+        for i, rgb in enumerate(swatches):
+            col = i % cols
+            row = i // cols
+            x0 = col * sw + 2
+            y0 = row * sw + 2
+            x1 = x0 + sw - 2
+            y1 = y0 + sw - 2
+            hex_str = self._px_module.to_hex(rgb)
+            c.create_rectangle(x0, y0, x1, y1, fill=hex_str, outline="#222")
+            self._px_palette_swatches.append((x0, y0, x1, y1, rgb))
+
+    def _px_palette_click(self, event) -> None:
+        for x0, y0, x1, y1, rgb in self._px_palette_swatches:
+            if x0 <= event.x <= x1 and y0 <= event.y <= y1:
+                rgba = tuple(list(rgb) + [255])
+                self._px_set_color(rgba)
+                return
+
+    # ----------------------------------------------------------------
+    # File + canvas ops
+    # ----------------------------------------------------------------
+
+    def _px_new(self) -> None:
+        from tkinter import messagebox
+        if self._px_doc.dirty:
+            if not messagebox.askyesno(
+                "Discard?",
+                "You have unsaved changes. Discard them?",
+                parent=self,
+            ):
+                return
+        size = self._PX_DEFAULT_SIZE
+        try:
+            size = int(self._px_size_var.get())
+        except Exception:
+            pass
+        self._px_doc = self._px_module.PixelDocument(width=size, height=size)
+        self._px_refresh_frames_list()
+        self._px_redraw()
+
+    def _px_load(self) -> None:
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Open PNG",
+            filetypes=[("PNG", "*.png"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self._px_doc = self._px_module.load_png(path)
+        except Exception as exc:
+            from tkinter import messagebox
+            messagebox.showerror("Load failed", repr(exc), parent=self)
+            return
+        # Resync size dropdown
+        if self._px_doc.width in self._PX_SIZES:
+            self._px_size_var.set(str(self._px_doc.width))
+        self._px_refresh_frames_list()
+        self._px_redraw()
+
+    def _px_default_save_dir(self) -> Path:
+        d = VAULT_DIR / "sprites"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _px_save(self) -> None:
+        from tkinter import filedialog
+        initial = (self._px_doc.file_path
+                    or self._px_default_save_dir() / "sprite.png")
+        path = filedialog.asksaveasfilename(
+            title="Save PNG",
+            initialdir=str(initial.parent),
+            initialfile=initial.name,
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png")],
+        )
+        if not path:
+            return
+        try:
+            self._px_module.save_png(self._px_doc, path)
+            self._px_update_status()
+        except Exception as exc:
+            from tkinter import messagebox
+            messagebox.showerror("Save failed", repr(exc), parent=self)
+
+    def _px_save_sheet(self) -> None:
+        from tkinter import filedialog
+        if len(self._px_doc.frames) < 2:
+            from tkinter import messagebox
+            messagebox.showinfo(
+                "Only one frame",
+                "Add more frames first (use + Dup / + New in the "
+                "frame strip).",
+                parent=self,
+            )
+            return
+        initial = (self._px_default_save_dir() / "sprite_sheet.png")
+        path = filedialog.asksaveasfilename(
+            title="Save sprite sheet",
+            initialdir=str(initial.parent),
+            initialfile=initial.name,
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png")],
+        )
+        if not path:
+            return
+        try:
+            self._px_module.save_sprite_sheet(self._px_doc, path)
+        except Exception as exc:
+            from tkinter import messagebox
+            messagebox.showerror("Save failed", repr(exc), parent=self)
+
+    def _px_save_into_godot(self) -> None:
+        """Drop the PNG into the open Workspace project. Saves to
+        ``<project>/assets/sprites/<name>.png`` and refreshes the
+        Workspace file tree."""
+        from tkinter import messagebox, filedialog
+        proj = getattr(self, "_gw_project", None)
+        if proj is None:
+            messagebox.showinfo(
+                "No project open",
+                "Open a Godot project in the 🛠 Workspace tab first.",
+                parent=self,
+            )
+            return
+        default_name = (self._px_doc.file_path.stem
+                         if self._px_doc.file_path else "sprite")
+        target_dir = proj.root / "assets" / "sprites"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = filedialog.asksaveasfilename(
+            title="Save into Godot project",
+            initialdir=str(target_dir),
+            initialfile=f"{default_name}.png",
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png")],
+        )
+        if not path:
+            return
+        try:
+            self._px_module.save_png(self._px_doc, path)
+        except Exception as exc:
+            messagebox.showerror("Save failed", repr(exc), parent=self)
+            return
+        # Refresh the file tree so the new PNG appears immediately
+        try:
+            import godot_workspace as _gw
+            self._gw_project = _gw.open_project(proj.root)
+            self._gw_populate_tree()
+        except Exception:
+            pass
+        self._px_update_status()
+
+    def _px_resize_canvas(self) -> None:
+        try:
+            n = int(self._px_size_var.get())
+        except Exception:
+            return
+        self._px_doc.resize_canvas(n, n)
+        self._px_refresh_frames_list()
+        self._px_redraw()
+
+    # ----------------------------------------------------------------
+    # History
+    # ----------------------------------------------------------------
+
+    def _px_undo(self) -> None:
+        if self._px_doc.undo():
+            self._px_redraw()
+            self._px_refresh_frames_list()
+
+    def _px_redo(self) -> None:
+        if self._px_doc.redo():
+            self._px_redraw()
+            self._px_refresh_frames_list()
+
+    # ----------------------------------------------------------------
+    # Brush + symmetry + zoom helpers
+    # ----------------------------------------------------------------
+
+    def _px_brush_size_update(self) -> None:
+        try:
+            self._px_brush_size = max(1, int(self._px_brush_var.get() or 1))
+        except Exception:
+            self._px_brush_size = 1
+
+    def _px_apply_symmetry(self) -> None:
+        self._px_doc.symmetry = bool(self._px_sym_var.get())
+
+    def _px_zoom_update(self) -> None:
+        self._px_redraw()
+
+    # ----------------------------------------------------------------
+    # Frames strip
+    # ----------------------------------------------------------------
+
+    def _px_refresh_frames_list(self) -> None:
+        self._px_frames_box.delete(0, "end")
+        for i, fr in enumerate(self._px_doc.frames):
+            marker = "● " if i == self._px_doc.current else "  "
+            self._px_frames_box.insert("end", f"{marker}{fr.name}")
+        try:
+            self._px_frames_box.selection_clear(0, "end")
+            self._px_frames_box.selection_set(self._px_doc.current)
+        except Exception:
+            pass
+
+    def _px_on_frame_select(self, _event=None) -> None:
+        sel = self._px_frames_box.curselection()
+        if not sel:
+            return
+        self._px_doc.go_frame(sel[0])
+        self._px_refresh_frames_list()
+        self._px_redraw()
+
+    def _px_add_frame(self, duplicate: bool) -> None:
+        self._px_doc.add_frame(duplicate=duplicate)
+        self._px_refresh_frames_list()
+        self._px_redraw()
+
+    def _px_remove_frame(self) -> None:
+        if self._px_doc.remove_frame(self._px_doc.current):
+            self._px_refresh_frames_list()
+            self._px_redraw()
 
     # ---- Steam Market tab (phase D) ----
 
