@@ -704,7 +704,10 @@ def _get_gguf_model():
                 f"model {(diag.get('model_size_bytes') or 0) / (1024**3):.1f} GB, "
                 f"margin {margin_mb} MB)"
             )
-            _ladder_log("vram_aware", chosen=True, picked=picked, **diag)
+            # `diag` already carries "picked" (set in _pick_vram_aware_n_ctx);
+            # passing picked= explicitly too would raise "multiple values for
+            # keyword argument 'picked'". Splat diag alone.
+            _ladder_log("vram_aware", chosen=True, **diag)
         else:
             _ladder_log("vram_aware", chosen=False, **diag)
 

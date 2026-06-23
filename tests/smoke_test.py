@@ -1801,6 +1801,44 @@ def test_model_finder_us_filter_and_fit() -> None:
            unknown["can_upgrade"] is False and len(unknown["upgrades"]) >= 1)
 
 
+def test_vram_aware_n_ctx_ladder_log_no_kwarg_collision() -> None:
+    """Regression: after switching to a model that triggers the VRAM-aware
+    n_ctx path, the engine logged the result. _pick_vram_aware_n_ctx puts
+    'picked' INTO its diag dict, so the log call must NOT also pass
+    picked= explicitly — that raised 'got multiple values for keyword
+    argument picked' and broke model load on a capable GPU.
+    """
+    import council_engine as ce
+    prev = ce._available_gpu_bytes
+    ce._available_gpu_bytes = lambda: 24 * 1024 ** 3      # force GPU success
+    try:
+        meta = {
+            "llama.block_count": 32,
+            "llama.embedding_length": 4096,
+            "llama.attention.head_count": 32,
+            "llama.attention.head_count_kv": 8,
+        }
+        picked, diag = ce._pick_vram_aware_n_ctx(
+            meta, model_size_bytes=5 * 1024 ** 3, abs_max=32768,
+            margin_bytes=512 * 1024 * 1024)
+        _check("VRAM-aware path picks an n_ctx", picked is not None)
+        _check("diag carries its own 'picked' key", "picked" in diag)
+
+        # Mirror the engine's logger signature: _ladder_log(rung, **fields).
+        # The fixed call splats diag WITHOUT a separate picked= — this must
+        # not raise. (The old buggy form `picked=picked, **diag` would.)
+        def _ladder_log(rung, **fields):
+            return {"rung": rung, **fields}
+        try:
+            _ladder_log("vram_aware", chosen=True, **diag)
+            ok = True
+        except TypeError:
+            ok = False
+        _check("logging the pick (chosen=True, **diag) does not collide", ok)
+    finally:
+        ce._available_gpu_bytes = prev
+
+
 def test_model_downloader() -> None:
     """model_downloader: OS-aware dir, HF URL build, GGUF magic check,
     non-HF URL refusal, and a real streaming download (local server) with
@@ -2348,6 +2386,8 @@ def main() -> int:
     _run("Mongo BSON/JSON model-digestible convert", test_mongo_normalize_model_digestible)
     _run("Mongo streaming convert (bounded/OOM-safe)", test_mongo_stream_convert_bounded)
     _run("model_downloader (OS dir, stream, verify)", test_model_downloader)
+    _run("VRAM-aware n_ctx log: no 'picked' kwarg collision",
+         test_vram_aware_n_ctx_ladder_log_no_kwarg_collision)
     _run("clip_path / GGUF path co-persistence", test_clip_path_persistence)
     _run("SPC — process_capability known-values", test_spc_process_capability_known_values)
     _run("SPC — process_capability one-sided",    test_spc_process_capability_one_sided)
