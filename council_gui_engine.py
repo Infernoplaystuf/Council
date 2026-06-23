@@ -10007,6 +10007,55 @@ class CouncilConsole(tk.Tk):
                    command=self._vmgr_build_embeddings
                    ).pack(side="left", padx=2)
 
+        # ── Convert Mongo BSON/JSON → model-readable section ──
+        conv_lf = ttk.LabelFrame(left, text="🍃 Convert Mongo BSON / JSON")
+        conv_lf.pack(fill="x", padx=4, pady=(0, 6))
+
+        ttk.Label(
+            conv_lf,
+            text=("Flattens nested Mongo documents and turns ObjectId / dates /\n"
+                  "Decimal128 / arrays into clean columns a model can read.\n"
+                  "Source files are only read; output lands in data_in/"
+                  "converted_mongo/\nso you can Index & Vectorize it above."),
+            justify="left", foreground="#9a9a9a"
+        ).pack(anchor="w", padx=6, pady=(4, 0))
+
+        cv1 = ttk.Frame(conv_lf)
+        cv1.pack(fill="x", padx=6, pady=(4, 2))
+        ttk.Label(cv1, text="File:", width=6).pack(side="left")
+        self._vmgr_mongo_var = tk.StringVar()
+        ttk.Entry(cv1, textvariable=self._vmgr_mongo_var,
+                  width=30).pack(side="left", padx=4)
+        ttk.Button(cv1, text="📂 Browse",
+                   command=self._vmgr_browse_mongo).pack(side="left")
+
+        cv2 = ttk.Frame(conv_lf)
+        cv2.pack(fill="x", padx=6, pady=(2, 2))
+        self._vmgr_mongo_csv = tk.BooleanVar(value=True)
+        self._vmgr_mongo_schema = tk.BooleanVar(value=True)
+        self._vmgr_mongo_text = tk.BooleanVar(value=False)
+        ttk.Checkbutton(cv2, text="Clean CSV",
+                        variable=self._vmgr_mongo_csv).pack(side="left")
+        ttk.Checkbutton(cv2, text="Schema profile",
+                        variable=self._vmgr_mongo_schema).pack(side="left", padx=6)
+        ttk.Checkbutton(cv2, text="Text digest",
+                        variable=self._vmgr_mongo_text).pack(side="left")
+
+        cv3 = ttk.Frame(conv_lf)
+        cv3.pack(fill="x", padx=6, pady=(2, 4))
+        ttk.Button(cv3, text="🍃 Convert File",
+                   command=self._vmgr_convert_mongo).pack(side="left")
+        ttk.Button(cv3, text="Convert ALL in vault",
+                   command=lambda: self._vmgr_convert_mongo(scan_all=True)
+                   ).pack(side="left", padx=6)
+        ttk.Button(cv3, text="📂 Open Output",
+                   command=self._vmgr_open_converted_mongo).pack(side="left")
+
+        self._mongo_status_var = tk.StringVar(value="")
+        ttk.Label(conv_lf, textvariable=self._mongo_status_var,
+                  foreground="#cba6f7", wraplength=380, justify="left"
+                  ).pack(anchor="w", padx=6, pady=(0, 4))
+
         # ── Scraper section ───────────────────────────────────
         scrape_lf = ttk.LabelFrame(left, text="🌐 Web Scraper")
         scrape_lf.pack(fill="x", padx=4, pady=(0, 6))
@@ -11332,6 +11381,124 @@ class CouncilConsole(tk.Tk):
         path = filedialog.askdirectory(title="Select folder to import into vault")
         if path:
             self._vmgr_folder_var.set(path)
+
+    # ── Mongo BSON/JSON → model-readable conversion ──────────
+    def _converted_mongo_dir(self):
+        """Output folder for converted Mongo data: a subfolder of the vault
+        INPUT dir so the clean CSVs are immediately indexable/queryable."""
+        return data_index.input_dir(VAULT_DIR) / "converted_mongo"
+
+    def _vmgr_browse_mongo(self):
+        """File dialog to pick a MongoDB .bson / .json / .jsonl export."""
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Select MongoDB BSON / JSON export",
+            filetypes=[("Mongo data", "*.bson *.json *.jsonl"),
+                       ("BSON", "*.bson"),
+                       ("JSON / JSONL", "*.json *.jsonl"),
+                       ("All files", "*.*")],
+        )
+        if path:
+            self._vmgr_mongo_var.set(path)
+
+    def _vmgr_open_converted_mongo(self):
+        """Reveal the converted-Mongo output folder in the OS file manager."""
+        d = self._converted_mongo_dir()
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        self._open_in_filemanager(d)
+
+    def _vmgr_convert_mongo(self, scan_all: bool = False):
+        """Convert a Mongo .bson/.json/.jsonl file (or every such file in the
+        vault) into model-digestible artefacts written under
+        data_in/converted_mongo/. The source is only ever read.
+
+        Outputs (per selected checkbox):
+          <stem>_clean.csv    flattened, all-scalar table (one row per doc)
+          <stem>_schema.csv   field / types / presence% / example
+          <stem>_digest.txt   compact key:value text digest
+        """
+        import threading as _th
+        sel = self._vmgr_mongo_var.get().strip()
+        want_csv = self._vmgr_mongo_csv.get()
+        want_schema = self._vmgr_mongo_schema.get()
+        want_text = self._vmgr_mongo_text.get()
+        if not (want_csv or want_schema or want_text):
+            self._mongo_status_var.set(
+                "Pick at least one output (Clean CSV / Schema / Text digest).")
+            return
+        if not scan_all and not sel:
+            self._mongo_status_var.set(
+                "Select a .bson/.json/.jsonl file, or use “Convert ALL”.")
+            return
+        self._mongo_status_var.set("Converting…")
+
+        def _worker():
+            try:
+                import vault_analyst as _va
+                out_root = self._converted_mongo_dir()
+                out_root.mkdir(parents=True, exist_ok=True)
+
+                if scan_all:
+                    in_dir = data_index.input_dir(VAULT_DIR)
+                    files = []
+                    for ext in ("*.bson", "*.json", "*.jsonl"):
+                        files += list(in_dir.rglob(ext))
+                    # Never re-convert our own outputs.
+                    files = [f for f in files
+                             if out_root not in f.parents and f.parent != out_root]
+                else:
+                    files = [Path(sel)]
+
+                if not files:
+                    self.after(0, lambda: self._mongo_status_var.set(
+                        "No .bson/.json/.jsonl files found in the vault."))
+                    return
+
+                done = ok = total_rows = 0
+                last_err = ""
+                for fp in files:
+                    try:
+                        docs = (_va.read_bson_documents(fp)
+                                if fp.suffix.lower() == ".bson"
+                                else _va.read_json_documents(fp))
+                        if not docs:
+                            done += 1
+                            continue
+                        stem = fp.stem
+                        if want_csv:
+                            df = _va.mongo_documents_to_frame(docs)
+                            df.to_csv(out_root / f"{stem}_clean.csv", index=False)
+                            total_rows += len(df)
+                        if want_schema:
+                            prof = _va.mongo_schema_profile(docs)
+                            prof.to_csv(out_root / f"{stem}_schema.csv", index=False)
+                        if want_text:
+                            txt = _va.mongo_documents_to_text(docs)
+                            (out_root / f"{stem}_digest.txt").write_text(
+                                txt, encoding="utf-8")
+                        ok += 1
+                    except Exception as fe:
+                        last_err = f"{fp.name}: {fe!r}"
+                    done += 1
+                    self.after(0, lambda d=done, t=len(files), n=fp.name:
+                               self._mongo_status_var.set(
+                                   f"Converting {d}/{t} — {n[:40]}"))
+
+                tail = f"  (last error — {last_err})" if last_err else ""
+                self.after(0, lambda: self._mongo_status_var.set(
+                    f"Done — {ok}/{len(files)} file(s), {total_rows} rows → "
+                    f"data_in/converted_mongo/.{tail}  "
+                    "Run “1. Build Keyword Index” to make it searchable."))
+                # Refresh the tree so the new files show up.
+                self.after(0, self._vmgr_refresh_tree)
+            except Exception as exc:
+                self.after(0, lambda: self._mongo_status_var.set(
+                    f"Convert failed: {exc!r}"))
+
+        _th.Thread(target=_worker, daemon=True).start()
 
     def _vmgr_import_zip(self):
         """Extract a zip file into a vault subfolder, keeping only indexable files."""
