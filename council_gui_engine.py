@@ -8169,6 +8169,13 @@ class CouncilConsole(tk.Tk):
             justify="left", font=("", 9, "bold"))
         self._mf_banner_lbl.pack(anchor="w", pady=(4, 0))
 
+        # One-click: download the suggested upgrade and make it active.
+        self._mf_top_upgrade = None       # dict of the best fitting upgrade
+        self._mf_upgrade_btn = ttk.Button(
+            top, text="⬇ Download & switch (no upgrade available yet)",
+            state="disabled", command=self._mf_download_and_switch)
+        self._mf_upgrade_btn.pack(anchor="w", pady=(4, 0))
+
         # Controls.
         ctl = ttk.Frame(self.tab_models)
         ctl.pack(fill="x", padx=10, pady=(2, 6))
@@ -8231,6 +8238,7 @@ class CouncilConsole(tk.Tk):
         self._mf_selected = None      # dict of the selected model row
         self._mf_dl_cancel = False
         self._mf_downloading = False
+        self._mf_auto_activate = False   # set the model active without asking
 
         # Populate the offline catalog immediately so the tab is useful
         # before the user clicks anything, and assess upgrade headroom so
@@ -8287,6 +8295,21 @@ class CouncilConsole(tk.Tk):
             f"{icon}  Current model: {name} ({curtxt}).  {a.get('reason', '')}")
         self._mf_banner_lbl.configure(
             foreground="#a6e3a1" if can else "#9a9a9a")
+
+        # Enable the one-click upgrade button when a fitting stronger model
+        # exists; label it with the specific model so the action is clear.
+        ups = a.get("upgrades") or []
+        if can and ups:
+            self._mf_top_upgrade = ups[0]
+            self._mf_upgrade_btn.configure(
+                state="normal",
+                text=f"⬇ Download & switch to {ups[0].get('name', 'the upgrade')}")
+        else:
+            self._mf_top_upgrade = None
+            self._mf_upgrade_btn.configure(
+                state="disabled",
+                text="⬇ Download & switch (no upgrade available)")
+
         if repopulate and a.get("upgrades"):
             self._mf_populate({"catalog": a["upgrades"], "online": []}, False)
             self._mf_status.set(
@@ -8401,10 +8424,21 @@ class CouncilConsole(tk.Tk):
         except Exception as exc:
             self._mf_status.set(f"Copy failed: {exc!r}")
 
-    def _mf_download(self):
+    def _mf_download_and_switch(self):
+        """One-click: download the suggested upgrade and make it active."""
+        if not self._mf_top_upgrade:
+            self._mf_status.set("No upgrade available to download.")
+            return
+        self._mf_selected = self._mf_top_upgrade
+        self._mf_download(auto_activate=True)
+
+    def _mf_download(self, auto_activate: bool = False):
         """Download the selected model's GGUF straight into the OS-appropriate
         models folder, then offer to make it the active model. The download
-        is explicit + user-initiated (it doesn't change offline-by-default)."""
+        is explicit + user-initiated (it doesn't change offline-by-default).
+
+        ``auto_activate`` skips the post-download "set as active?" prompt —
+        used by the upgrade button, where switching is the whole point."""
         from tkinter import messagebox
         import threading as _th
 
@@ -8457,6 +8491,7 @@ class CouncilConsole(tk.Tk):
 
         self._mf_downloading = True
         self._mf_dl_cancel = False
+        self._mf_auto_activate = bool(auto_activate)
         self._mf_dl_btn.configure(text="■ Cancel download")
 
         def _prog(done, total):
@@ -8491,6 +8526,7 @@ class CouncilConsole(tk.Tk):
     def _mf_download_reset(self):
         self._mf_downloading = False
         self._mf_dl_cancel = False
+        self._mf_auto_activate = False
         try:
             self._mf_dl_btn.configure(text="⬇ Download & install")
         except Exception:
@@ -8501,11 +8537,13 @@ class CouncilConsole(tk.Tk):
         path = res.get("path", "")
         verb = "Already present" if res.get("skipped") else "Downloaded"
         self._mf_status.set(f"{verb}: {path}")
-        if messagebox.askyesno(
-                "Set as active model?",
-                f"{verb} {m.get('name', '')}.\n\n{path}\n\n"
-                "Make this the Council's active model now? "
-                "(Takes effect on the next message.)"):
+        # The upgrade button already committed to switching — don't ask twice.
+        do_activate = self._mf_auto_activate or messagebox.askyesno(
+            "Set as active model?",
+            f"{verb} {m.get('name', '')}.\n\n{path}\n\n"
+            "Make this the Council's active model now? "
+            "(Takes effect on the next message.)")
+        if do_activate:
             try:
                 import onboarding
                 onboarding.save_gguf_path(VAULT_DIR, path)
@@ -8514,7 +8552,8 @@ class CouncilConsole(tk.Tk):
                     _ce.refresh_backend_config()
                 except Exception:
                     pass
-                self._mf_status.set(f"Active model set: {Path(path).name}")
+                self._mf_status.set(f"✅ Switched — active model is now "
+                                    f"{Path(path).name}")
                 # Refresh the upgrade banner against the new current model.
                 self._mf_check_upgrades(initial=True)
             except Exception as exc:
