@@ -4877,6 +4877,7 @@ class CouncilConsole(tk.Tk):
                        self._build_dream3d_tab,
                        self._build_grapher_tab,
                        self._build_specialists_tab,
+                       self._build_model_finder_tab,
                        self._build_lens_tab,
                        self._build_sessions_tab,
                        self._build_vault_manager_tab,
@@ -8118,6 +8119,211 @@ class CouncilConsole(tk.Tk):
     # A list view of the user's specialists with create / edit / delete
     # / test actions. Specialists are pure config — there is no per-
     # specialist data folder. The shared knowledge pool is the vault.
+
+    # ---- Model Finder tab (US-made models that fit this hardware) ----
+
+    def _build_model_finder_tab(self):
+        """Show US-made GGUF models that run on this machine's hardware.
+
+        Always lists a curated, offline US-only catalog ranked by fit; an
+        optional checkbox augments it with a best-effort Hugging Face search
+        when the machine is online. Nothing is downloaded automatically —
+        the panel surfaces the repo / file so the user fetches it manually
+        (the app stays offline-by-design)."""
+        import tkinter as tk
+        self.tab_models = ttk.Frame(self.nb)
+        self.nb.add(self.tab_models, text="🇺🇸 Models")
+        self._mf_results = {}     # tree-iid -> result dict
+
+        top = ttk.Frame(self.tab_models)
+        top.pack(fill="x", padx=10, pady=(8, 4))
+
+        # Hardware summary.
+        hw = {}
+        try:
+            import hardware_detect
+            hw = hardware_detect.detect()
+        except Exception:
+            hw = {}
+        self._mf_hw = hw
+        vram = hw.get("vram_gb")
+        ram = hw.get("ram_gb")
+        gpu = hw.get("gpu_name") or "no GPU detected"
+        hw_text = (f"Your hardware:  GPU: {gpu}   "
+                   f"VRAM: {vram or '—'} GB   RAM: {ram or '—'} GB")
+        ttk.Label(top, text=hw_text, font=("", 9, "bold"),
+                  foreground="#cba6f7").pack(anchor="w")
+        ttk.Label(
+            top, justify="left", foreground="#9a9a9a",
+            text=("Curated US-made GGUF models ranked by fit for this machine. "
+                  "Models that fit your VRAM run on GPU; the rest run on CPU.\n"
+                  "Nothing downloads automatically — pick one and fetch it from "
+                  "the listed repo. US-origin is verified for the catalog; "
+                  "online results are a name heuristic.")
+        ).pack(anchor="w", pady=(2, 0))
+
+        # Controls.
+        ctl = ttk.Frame(self.tab_models)
+        ctl.pack(fill="x", padx=10, pady=(2, 6))
+        ttk.Label(ctl, text="Task:").pack(side="left")
+        self._mf_role = tk.StringVar(value="general")
+        ttk.Combobox(ctl, textvariable=self._mf_role, width=10,
+                     state="readonly",
+                     values=["general", "code", "tiny"]).pack(side="left", padx=6)
+        self._mf_online = tk.BooleanVar(value=False)
+        ttk.Checkbutton(ctl, text="Also search Hugging Face (needs internet)",
+                        variable=self._mf_online).pack(side="left", padx=6)
+        ttk.Button(ctl, text="🔎 Find Models",
+                   command=self._mf_find).pack(side="left", padx=6)
+        self._mf_status = tk.StringVar(value="")
+        ttk.Label(ctl, textvariable=self._mf_status,
+                  foreground="#a6e3a1").pack(side="left", padx=8)
+
+        # Results table.
+        mid = ttk.Frame(self.tab_models)
+        mid.pack(fill="both", expand=True, padx=10, pady=(0, 6))
+        cols = ("name", "org", "params", "vram", "fits", "ctx", "source")
+        self._mf_tree = ttk.Treeview(mid, columns=cols, show="headings",
+                                     height=14)
+        headings = {
+            "name": ("Model", 240), "org": ("Maker", 110),
+            "params": ("Params(B)", 80), "vram": ("VRAM≈GB", 80),
+            "fits": ("Fits GPU?", 80), "ctx": ("Ctx(K)", 70),
+            "source": ("Source", 90),
+        }
+        for c in cols:
+            txt, w = headings[c]
+            self._mf_tree.heading(c, text=txt)
+            self._mf_tree.column(c, width=w,
+                                 anchor="center" if c != "name" else "w")
+        vs = ttk.Scrollbar(mid, orient="vertical",
+                           command=self._mf_tree.yview)
+        self._mf_tree.configure(yscrollcommand=vs.set)
+        self._mf_tree.pack(side="left", fill="both", expand=True)
+        vs.pack(side="left", fill="y")
+        self._mf_tree.tag_configure("fits", foreground="#a6e3a1")
+        self._mf_tree.tag_configure("cpu", foreground="#f9e2af")
+        self._mf_tree.bind("<<TreeviewSelect>>", self._mf_on_select)
+
+        # Detail / download-info panel.
+        det = ttk.LabelFrame(self.tab_models, text="Selected model")
+        det.pack(fill="x", padx=10, pady=(0, 8))
+        self._mf_detail = tk.Text(det, height=5, wrap="word")
+        self._mf_detail.configure(state="disabled")
+        self._mf_detail.pack(fill="x", padx=6, pady=4)
+        drow = ttk.Frame(det)
+        drow.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Button(drow, text="📋 Copy download info",
+                   command=self._mf_copy).pack(side="left")
+        self._mf_copy_target = ""
+
+        # Populate the offline catalog immediately so the tab is useful
+        # before the user clicks anything.
+        self._mf_find(initial=True)
+
+    def _mf_find(self, initial: bool = False):
+        import threading as _th
+        role = self._mf_role.get()
+        online = bool(self._mf_online.get()) and not initial
+        self._mf_status.set("Searching…" if online else "Loading catalog…")
+
+        def _worker():
+            try:
+                import model_finder
+                res = model_finder.find_models(
+                    hardware=self._mf_hw, role=role, prefer_online=online)
+            except Exception as exc:
+                self.after(0, lambda: self._mf_status.set(
+                    f"Model finder unavailable: {exc!r}"))
+                return
+            self.after(0, lambda: self._mf_populate(res, online))
+
+        _th.Thread(target=_worker, daemon=True).start()
+
+    def _mf_populate(self, res: dict, online_requested: bool):
+        tree = self._mf_tree
+        tree.delete(*tree.get_children())
+        self._mf_results.clear()
+
+        def _add(m, src_label):
+            params = m.get("params_b")
+            vram = m.get("vram_gb_q4", m.get("approx_vram_gb"))
+            fits = m.get("fits_vram")
+            ctx = m.get("context_k", "")
+            iid = tree.insert(
+                "", "end",
+                values=(m.get("name", m.get("id", "?")),
+                        m.get("org", ""),
+                        f"{params:g}" if isinstance(params, (int, float)) else "",
+                        f"{vram:.1f}" if isinstance(vram, (int, float)) else "",
+                        "yes" if fits else "CPU",
+                        ctx or "",
+                        src_label),
+                tags=("fits" if fits else "cpu",))
+            self._mf_results[iid] = m
+
+        for m in res.get("catalog", []):
+            _add(m, "catalog")
+        for m in res.get("online", []):
+            _add(m, "HF")
+
+        n_cat = len(res.get("catalog", []))
+        n_on = len(res.get("online", []))
+        if online_requested and not n_on:
+            msg = (f"{n_cat} curated model(s). Hugging Face search returned "
+                   "nothing (offline or blocked) — showing the catalog.")
+        elif n_on:
+            msg = f"{n_cat} curated + {n_on} from Hugging Face."
+        else:
+            msg = f"{n_cat} curated US-made model(s) ranked by fit."
+        self._mf_status.set(msg)
+
+    def _mf_on_select(self, _event=None):
+        sel = self._mf_tree.selection()
+        if not sel:
+            return
+        m = self._mf_results.get(sel[0])
+        if not m:
+            return
+        repo = m.get("hf_repo")
+        hf_file = m.get("hf_file")
+        url = m.get("url") or (f"https://huggingface.co/{repo}" if repo else "")
+        lines = [f"{m.get('name', m.get('id', '?'))}  —  {m.get('org', '')}"]
+        if m.get("blurb"):
+            lines.append(m["blurb"])
+        if m.get("license"):
+            lines.append(f"License: {m['license']}")
+        if repo:
+            lines.append(f"Hugging Face repo: {repo}")
+            if hf_file:
+                lines.append(f"File: {hf_file}")
+            self._mf_copy_target = f"{repo}" + (f"  ({hf_file})" if hf_file else "")
+        elif url:
+            lines.append(f"URL: {url}")
+            self._mf_copy_target = url
+        else:
+            self._mf_copy_target = ""
+        if m.get("source") == "huggingface" and not m.get("origin_verified", True):
+            lines.append("⚠ US-origin is a name heuristic here — verify the "
+                         "maker before trusting it.")
+        if not m.get("fits_vram"):
+            lines.append("Note: doesn't fit your VRAM — will run on CPU "
+                         "(slower) via llama-cpp.")
+        self._mf_detail.configure(state="normal")
+        self._mf_detail.delete("1.0", "end")
+        self._mf_detail.insert("1.0", "\n".join(lines))
+        self._mf_detail.configure(state="disabled")
+
+    def _mf_copy(self):
+        if not self._mf_copy_target:
+            self._mf_status.set("Select a model first.")
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(self._mf_copy_target)
+            self._mf_status.set(f"Copied: {self._mf_copy_target}")
+        except Exception as exc:
+            self._mf_status.set(f"Copy failed: {exc!r}")
 
     def _build_specialists_tab(self):
         self.tab_specialists = ttk.Frame(self.nb)
