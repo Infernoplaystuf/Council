@@ -9915,6 +9915,9 @@ class CouncilConsole(tk.Tk):
         self._gw_scene_tree_btn.pack(side="left", padx=2)
         ttk.Button(right, text="⚙ Godot binary…",
                    command=self._gw_pick_godot_binary).pack(side="left", padx=(8, 2))
+        ttk.Button(right, text="📄 Build from GDD",
+                   command=self._gw_open_gdd_dialog
+                   ).pack(side="left", padx=(8, 2))
 
         # Body — horizontal PanedWindow
         body = tk.PanedWindow(self.tab_godot_workspace, orient="horizontal",
@@ -10738,6 +10741,229 @@ class CouncilConsole(tk.Tk):
             return _gw.get_godot_binary()
 
         run_btn.configure(command=_go)
+
+    # ---- GDD plan viewer + Build from GDD ----
+    #
+    # State: self._gw_gdd_dialog (Toplevel), self._gw_gdd_text (Text
+    # widget the user pastes the markdown into), self._gw_gdd_plan
+    # (cached Plan after Parse for the Build click).
+
+    def _gw_open_gdd_dialog(self) -> None:
+        """Pop the GDD intake dialog. Lets the user paste markdown,
+        click Parse to see the structured plan, then click Build to
+        kick off the orchestrator (Phase 3)."""
+        from tkinter import messagebox
+        if self._gw_project is None:
+            messagebox.showinfo(
+                "Open a project first",
+                "The GDD builder writes scenes + scripts into the "
+                "current Godot project. Open or scaffold one in the "
+                "🛠 Workspace before opening a GDD.",
+                parent=self,
+            )
+            return
+        if getattr(self, "_gw_gdd_dialog", None) is not None:
+            try:
+                self._gw_gdd_dialog.lift()
+                return
+            except Exception:
+                self._gw_gdd_dialog = None
+
+        win = tk.Toplevel(self)
+        self._gw_gdd_dialog = win
+        win.title("📄 Build from GDD")
+        win.configure(bg="#1a1414")
+        win.geometry("900x680")
+        win.transient(self.winfo_toplevel())
+        def _on_close():
+            self._gw_gdd_dialog = None
+            try: win.destroy()
+            except Exception: pass
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+        # Top strip
+        hdr = ttk.Frame(win)
+        hdr.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(hdr, text="Paste a markdown GDD below or load a .md file.",
+                  foreground="#a98a8a").pack(side="left")
+        ttk.Button(hdr, text="📥 Load .md…",
+                   command=self._gw_gdd_load).pack(side="right", padx=2)
+        ttk.Button(hdr, text="🔎 Parse + plan",
+                   command=self._gw_gdd_parse_and_plan
+                   ).pack(side="right", padx=2)
+        ttk.Button(hdr, text="🛠 Build into project",
+                   command=self._gw_gdd_build
+                   ).pack(side="right", padx=2)
+
+        # Body — vertical split: input on top, plan view below
+        body = tk.PanedWindow(win, orient="vertical",
+                               bg="#1a1414", sashwidth=6)
+        body.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        # GDD markdown editor
+        in_frame = ttk.Frame(body)
+        body.add(in_frame, minsize=140)
+        ttk.Label(in_frame, text="GDD (markdown)",
+                  foreground="#a98a8a").pack(anchor="w")
+        in_row = ttk.Frame(in_frame)
+        in_row.pack(fill="both", expand=True)
+        self._gw_gdd_text = tk.Text(
+            in_row, wrap="word",
+            bg="#0f0c0c", fg="#d4d4d4",
+            insertbackground="#d4d4d4",
+            font=("Consolas", 10), undo=True,
+        )
+        in_sb = ttk.Scrollbar(in_row, orient="vertical",
+                               command=self._gw_gdd_text.yview)
+        self._gw_gdd_text.configure(yscrollcommand=in_sb.set)
+        self._gw_gdd_text.pack(side="left", fill="both", expand=True)
+        in_sb.pack(side="right", fill="y")
+        # Seed with a minimal template
+        self._gw_gdd_text.insert("1.0",
+            "# My Game\n\n"
+            "**Genre:** Top-down Shooter\n"
+            "**Hook:** One-line elevator pitch.\n\n"
+            "## Mechanics\n"
+            "- Move and shoot\n"
+            "- Collect ore\n\n"
+            "## Entities\n"
+            "- **Player** -- the protagonist\n"
+            "- **Drone** -- patrols and shoots\n"
+            "- **Ore Pile** -- pickup item\n\n"
+            "## Scenes\n"
+            "- Main\n\n"
+            "## Win Condition\n"
+            "Collect 10 ore.\n\n"
+            "## Lose Condition\n"
+            "Player HP zero.\n"
+        )
+
+        # Plan view
+        plan_frame = ttk.Frame(body)
+        body.add(plan_frame, minsize=200)
+        ttk.Label(plan_frame, text="Parsed plan",
+                  foreground="#a98a8a").pack(anchor="w")
+        plan_row = ttk.Frame(plan_frame)
+        plan_row.pack(fill="both", expand=True)
+        self._gw_gdd_plan_text = tk.Text(
+            plan_row, wrap="none",
+            bg="#0a0808", fg="#d4d4d4",
+            font=("Consolas", 9), state="disabled",
+        )
+        plan_y = ttk.Scrollbar(plan_row, orient="vertical",
+                                 command=self._gw_gdd_plan_text.yview)
+        plan_x = ttk.Scrollbar(plan_frame, orient="horizontal",
+                                 command=self._gw_gdd_plan_text.xview)
+        self._gw_gdd_plan_text.configure(
+            yscrollcommand=plan_y.set,
+            xscrollcommand=plan_x.set,
+        )
+        self._gw_gdd_plan_text.pack(side="left", fill="both", expand=True)
+        plan_y.pack(side="right", fill="y")
+        plan_x.pack(side="bottom", fill="x")
+        self._gw_gdd_plan_text.tag_configure("h1",
+            font=("Segoe UI", 11, "bold"), foreground="#e0884a")
+        self._gw_gdd_plan_text.tag_configure("h2",
+            font=("Segoe UI", 10, "bold"), foreground="#a98a8a")
+        self._gw_gdd_plan_text.tag_configure("muted",
+            foreground="#7a7575")
+        self._gw_gdd_plan_text.tag_configure("warn",
+            foreground="#e0884a")
+        self._gw_gdd_plan = None
+
+    def _gw_gdd_load(self) -> None:
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Load a GDD markdown file",
+            filetypes=[("Markdown", "*.md *.markdown"),
+                        ("All files", "*.*")],
+            parent=self._gw_gdd_dialog,
+        )
+        if not path:
+            return
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except Exception as exc:
+            from tkinter import messagebox
+            messagebox.showerror(
+                "Load failed", repr(exc),
+                parent=self._gw_gdd_dialog,
+            )
+            return
+        self._gw_gdd_text.delete("1.0", "end")
+        self._gw_gdd_text.insert("1.0", text)
+        self._gw_gdd_parse_and_plan()
+
+    def _gw_gdd_parse_and_plan(self) -> None:
+        """Parse the GDD textarea + run the planner. Render the
+        result into the plan view."""
+        md = self._gw_gdd_text.get("1.0", "end-1c")
+        try:
+            import gdd_parser as _gp
+            import gdd_planner as _gpl
+            gdd = _gp.parse_gdd(md)
+            plan = _gpl.plan_from_gdd(gdd)
+        except Exception as exc:
+            from tkinter import messagebox
+            messagebox.showerror(
+                "Parse failed", repr(exc),
+                parent=self._gw_gdd_dialog,
+            )
+            return
+        self._gw_gdd_plan = plan
+        self._gw_gdd_render_plan(gdd, plan)
+
+    def _gw_gdd_render_plan(self, gdd, plan) -> None:
+        d = self._gw_gdd_plan_text
+        d.configure(state="normal")
+        d.delete("1.0", "end")
+        d.insert("end", f"{plan.title}\n", ("h1",))
+        d.insert("end",
+            f"genre: {plan.genre}   template: {plan.template}\n",
+            ("muted",))
+        if gdd.parse_warnings:
+            d.insert("end", "\nGDD warnings:\n", ("warn",))
+            for w in gdd.parse_warnings:
+                d.insert("end", f"  ⚠ {w}\n", ("warn",))
+        if plan.notes:
+            d.insert("end", "\nPlanner notes:\n", ("warn",))
+            for n in plan.notes:
+                d.insert("end", f"  • {n}\n", ("warn",))
+        d.insert("end", "\nFiles to generate\n", ("h2",))
+        for fp, purpose in plan.file_summary():
+            d.insert("end", f"  {fp:36s}  {purpose}\n")
+        d.insert("end", "\nEntities + roles\n", ("h2",))
+        for slug, ent in plan.entity_registry.items():
+            d.insert("end",
+                f"  {slug:24s}  role={ent.role:9s}  {ent.description[:60]}\n")
+        d.insert("end", "\nSignal contracts\n", ("h2",))
+        for sc in plan.signal_contracts:
+            args = ", ".join(sc.args) if sc.args else ""
+            d.insert("end",
+                f"  {sc.name}({args})\n"
+                f"    emitter:  {sc.emitter}\n"
+                f"    handlers: {', '.join(sc.handlers)}\n")
+        d.insert("end", "\nAutoloads\n", ("h2",))
+        for a in plan.autoloads:
+            d.insert("end", f"  {a.name:16s}  {a.purpose[:80]}\n")
+        d.configure(state="disabled")
+
+    def _gw_gdd_build(self) -> None:
+        """Phase 3 stub — orchestrator lands next commit."""
+        from tkinter import messagebox
+        if self._gw_gdd_plan is None:
+            self._gw_gdd_parse_and_plan()
+            if self._gw_gdd_plan is None:
+                return
+        messagebox.showinfo(
+            "Build from GDD",
+            "The orchestrator (gdd_builder) lands in the next "
+            "commit. For now, use the parsed plan as a manual "
+            "scaffold — open files via 🤖 Ask Coder one at a "
+            "time, using the file list above as a checklist and "
+            "the signal contracts as the integration contract.",
+            parent=self._gw_gdd_dialog,
+        )
 
     def _gw_send_errors_to_council(self) -> None:
         """Bundle the current stderr buffer into a Council question.
