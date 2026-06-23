@@ -380,6 +380,68 @@ def test_folder_column_stats_bounded_many_files() -> None:
                not val_rows.empty and val_rows["mean"].notna().any())
 
 
+def test_analyst_read_budget_guard() -> None:
+    """Model-written code that loops pd.read_csv over many files and
+    concats them must hit a CATCHABLE read-budget error (clean failure,
+    no OOM-crash) — while bounded per-file helpers still succeed under
+    the same cap. This is the guardrail for the 200-CSV crash on a
+    memory-capped machine, independent of how the query is routed.
+    """
+    import csv as _csv
+    import vault_analyst as va
+    prev = os.environ.get("COUNCIL_ANALYST_READ_BUDGET_MB")
+    os.environ["COUNCIL_ANALYST_READ_BUDGET_MB"] = "10"   # tiny cap
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            # ~0.7 MB/frame x 60 files = ~42 MB summed reads, well over
+            # the 10 MB cap, so the loop must refuse partway through.
+            for i in range(60):
+                with (d / f"f_{i:03d}.csv").open(
+                        "w", newline="", encoding="utf-8") as fh:
+                    w = _csv.writer(fh)
+                    w.writerow(["id", "value", "label"])
+                    for r in range(6000):
+                        w.writerow([i * 6000 + r, r * 1.5,
+                                    "lorem ipsum dolor sit amet " * 2])
+
+            # Unbounded pattern -> must refuse cleanly.
+            unbounded = (
+                "frames = [pd.read_csv(f) for f in list_csv_files(DATA_FOLDERS)]\n"
+                "result_df = pd.concat(frames, ignore_index=True).describe()\n"
+            )
+            df, log = va.execute_pandas_code(unbounded, [d])
+            _check("unbounded concat returns no frame (refused)", df is None)
+            _check("refusal mentions the read budget",
+                   "read budget exceeded" in (log or ""),
+                   detail=f"log head: {(log or '')[:80]!r}")
+            _check("refusal points to per-file helpers",
+                   "per-file helpers" in (log or "")
+                   or "column_stats" in (log or ""))
+
+            # Re-import bypass must ALSO be budgeted.
+            bypass = (
+                "import pandas as p2\n"
+                "frames = [p2.read_csv(f) for f in list_csv_files(DATA_FOLDERS)]\n"
+                "result_df = p2.concat(frames, ignore_index=True).describe()\n"
+            )
+            df_b, log_b = va.execute_pandas_code(bypass, [d])
+            _check("re-imported pandas is also budgeted (refused)",
+                   df_b is None and "read budget exceeded" in (log_b or ""))
+
+            # Bounded per-file helper must still succeed under the same cap.
+            bounded = "result_df = numeric_summary_per_csv(DATA_FOLDERS)\n"
+            df2, log2 = va.execute_pandas_code(bounded, [d])
+            _check("bounded per-file helper still succeeds under the cap",
+                   df2 is not None and not df2.empty,
+                   detail=f"log: {(log2 or '')[:80]!r}")
+    finally:
+        if prev is None:
+            os.environ.pop("COUNCIL_ANALYST_READ_BUDGET_MB", None)
+        else:
+            os.environ["COUNCIL_ANALYST_READ_BUDGET_MB"] = prev
+
+
 def test_clip_path_persistence() -> None:
     """The vision (mmproj) path must round-trip through backend_settings
     .json without overwriting the GGUF path stored alongside it. This
@@ -2018,6 +2080,7 @@ def main() -> int:
     _run("folder_data_summary helper",          test_folder_data_summary_helper)
     _run("stats-summary trigger keywords",       test_stats_summary_triggers)
     _run("folder_column_stats bounded many-file", test_folder_column_stats_bounded_many_files)
+    _run("analyst read-budget guard (OOM safety)", test_analyst_read_budget_guard)
     _run("clip_path / GGUF path co-persistence", test_clip_path_persistence)
     _run("SPC — process_capability known-values", test_spc_process_capability_known_values)
     _run("SPC — process_capability one-sided",    test_spc_process_capability_one_sided)

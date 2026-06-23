@@ -24,6 +24,7 @@ from __future__ import annotations
 import ast
 import io
 import json
+import os
 import re
 import traceback
 from contextlib import redirect_stderr, redirect_stdout
@@ -2908,6 +2909,88 @@ def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
     return __import__(name, globals, locals, fromlist, level)
 
 
+# Readers that pull a whole file into a DataFrame. Looping any of these
+# over hundreds of files (then pd.concat-ing) is the one way model-written
+# analyst code can exhaust memory and OOM-crash the app — every other
+# sandbox helper aggregates file-by-file. We cap the cumulative bytes
+# such reads hold within a single execution.
+_BUDGETED_READERS = frozenset({
+    "read_csv", "read_table", "read_excel", "read_parquet",
+    "read_json", "read_feather", "read_orc", "read_fwf",
+})
+
+
+def _analyst_read_budget_bytes() -> int:
+    """Bytes a single analyst execution may hold across whole-file reads.
+    Override with COUNCIL_ANALYST_READ_BUDGET_MB. Default scales to the
+    machine: min(1.5 GiB, 40% of available RAM) — low enough on a
+    memory-capped box (e.g. WSL) to REFUSE before the OS OOM-killer fires,
+    generous enough that normal multi-file queries never trip it."""
+    ov = os.environ.get("COUNCIL_ANALYST_READ_BUDGET_MB", "").strip()
+    if ov:
+        try:
+            # Respect an explicit override down to a small sane floor.
+            return max(8, int(ov)) * 1024 * 1024
+        except ValueError:
+            pass
+    cap = 1536 * 1024 * 1024
+    try:
+        import psutil
+        avail = int(psutil.virtual_memory().available * 0.40)
+        if avail > 0:
+            return min(cap, avail)
+    except Exception:
+        pass
+    return cap
+
+
+class _BudgetedPandas:
+    """Proxy around the real pandas module for the analyst sandbox.
+
+    Delegates everything to pandas EXCEPT the whole-file readers, which it
+    wraps to accrue the in-memory size of every frame they return. Once the
+    running total crosses the budget it raises a CATCHABLE MemoryError —
+    refusing the 201st read in a `pd.concat([read_csv(f) for f in files])`
+    loop *before* the allocation that would OOM-kill the process. The error
+    points the model at the bounded per-file helpers instead.
+    """
+
+    def __init__(self, real, budget_bytes: int, state: dict) -> None:
+        self._real = real
+        self._budget = int(budget_bytes)
+        self._state = state          # {"used": int}
+
+    def _account(self, df):
+        try:
+            n = int(df.memory_usage(deep=True).sum())
+        except Exception:
+            n = 0
+        self._state["used"] += n
+        if self._state["used"] > self._budget:
+            used_mb = self._state["used"] // (1024 * 1024)
+            cap_mb = self._budget // (1024 * 1024)
+            raise MemoryError(
+                f"Analyst read budget exceeded (~{used_mb} MB held, cap "
+                f"{cap_mb} MB). This query loads too many whole files at "
+                "once. Use the bounded per-file helpers instead — e.g. "
+                "column_stats(), numeric_summary_per_csv(), "
+                "average_numeric_column_per_csv(), count_rows_per_csv() — "
+                "which aggregate file-by-file without holding every file "
+                "in memory.")
+        return df
+
+    def __getattr__(self, name):
+        # __getattr__ only fires for names not found normally, so the
+        # instance attrs (_real/_budget/_state) never route through here.
+        real_attr = getattr(self._real, name)
+        if name in _BUDGETED_READERS and callable(real_attr):
+            def _guarded(*a, **k):
+                return self._account(real_attr(*a, **k))
+            _guarded.__name__ = name
+            return _guarded
+        return real_attr
+
+
 def execute_pandas_code(
     code: str,
     allowed_folders: List[Path],
@@ -2920,8 +3003,19 @@ def execute_pandas_code(
     if not normalized_folders:
         return None, "No allowed folders configured for the analyst."
 
+    # Per-execution memory budget for whole-file reads. The proxy below
+    # guards `pd`; the import hook hands the SAME proxy back for any
+    # `import pandas` so model code can't sidestep the cap by re-importing.
+    _read_state = {"used": 0}
+    _budgeted_pd = _BudgetedPandas(pd, _analyst_read_budget_bytes(), _read_state)
+
+    def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name.split(".")[0] == "pandas":
+            return _budgeted_pd
+        return _safe_import(name, globals, locals, fromlist, level)
+
     safe_builtins = {
-        "__import__": _safe_import,
+        "__import__": _guarded_import,
         # Numeric / collection core
         "abs": abs, "all": all, "any": any, "bool": bool, "dict": dict,
         "enumerate": enumerate, "float": float, "int": int,
@@ -2956,7 +3050,7 @@ def execute_pandas_code(
 
     globals_dict: dict[str, Any] = {
         "__builtins__": safe_builtins,
-        "pd": pd,
+        "pd": _budgeted_pd,
         "Path": Path,
         "DATA_FOLDERS": [str(p) for p in normalized_folders],
         "DATA_FOLDER": str(normalized_folders[0]),
