@@ -442,6 +442,108 @@ def test_analyst_read_budget_guard() -> None:
             os.environ["COUNCIL_ANALYST_READ_BUDGET_MB"] = prev
 
 
+def test_mongo_normalize_model_digestible() -> None:
+    """Mongo BSON/JSON -> model-digestible conversion must:
+       * coerce ObjectId / datetime / Decimal128 / Extended-JSON wrappers
+         ($oid/$date/$numberLong/$numberDecimal/$binary) into clean scalars
+       * flatten nested dicts to dotted keys
+       * collapse scalar arrays (joined + truncated) and object arrays
+         (compact JSON) into single cells
+       * produce an all-scalar DataFrame, a schema profile, a text digest,
+         and a tidy 'explode' view
+       * read .json, .jsonl, AND a single JSON object from disk
+    """
+    import datetime as _dt
+    import pandas as pd
+    import mongo_normalize as mn
+    import vault_analyst as va
+
+    class _OID:               # stand-in for bson.ObjectId (matched by name)
+        def __init__(self, h): self.h = h
+        def __str__(self): return self.h
+    _OID.__name__ = "ObjectId"
+
+    docs = [
+        {"_id": _OID("a" * 24),
+         "created": _dt.datetime(2024, 3, 15, 12, 30, 0),
+         "price": {"$numberDecimal": "19.99"},
+         "qty": {"$numberLong": "1200"},
+         "ext": {"$oid": "b" * 24},
+         "thumb": {"$binary": {"base64": "AAAA", "subType": "00"}},
+         "tags": ["red", "blue", "green"],
+         "addr": {"city": "Denver", "geo": {"lat": 39.7}},
+         "line_items": [{"sku": "A", "q": 2}, {"sku": "B", "q": 1}]},
+        {"_id": _OID("c" * 24), "name": "Gadget",
+         "tags": list(range(30))},
+    ]
+
+    flat = mn.flatten_document(docs[0])
+    _check("ObjectId coerced to hex string",
+           flat.get("_id") == "a" * 24)
+    _check("datetime coerced to ISO-8601",
+           str(flat.get("created", "")).startswith("2024-03-15T12:30"))
+    _check("$numberDecimal coerced to float", flat.get("price") == 19.99)
+    _check("$numberLong coerced to int", flat.get("qty") == 1200)
+    _check("$oid wrapper coerced to string", flat.get("ext") == "b" * 24)
+    _check("$binary rendered as a short marker",
+           isinstance(flat.get("thumb"), str) and "binary" in flat["thumb"])
+    _check("nested dict flattened to dotted key",
+           flat.get("addr.geo.lat") == 39.7)
+    _check("scalar array joined into one cell",
+           flat.get("tags") == "red; blue; green")
+    _check("object array collapsed to compact JSON",
+           isinstance(flat.get("line_items"), str)
+           and flat["line_items"].startswith("[{") and "sku" in flat["line_items"])
+
+    # Large scalar array must be truncated with a (+N more) marker.
+    flat2 = mn.flatten_document(docs[1])
+    _check("large scalar array truncated",
+           "(+" in str(flat2.get("tags")) and "more)" in str(flat2.get("tags")))
+
+    # Clean frame: every column must be a scalar dtype (no object-of-dict).
+    df = mn.documents_to_frame(docs)
+    _check("clean frame has a row per document", len(df) == 2)
+    no_containers = not any(
+        isinstance(v, (dict, list))
+        for col in df.columns for v in df[col].tolist())
+    _check("clean frame contains no dict/list cells", no_containers)
+
+    # Schema profile.
+    prof = {r["field"]: r for r in mn.infer_schema(docs)}
+    _check("schema profile reports presence %",
+           prof["_id"]["present_pct"] == 100.0
+           and prof["name"]["present_pct"] == 50.0)
+
+    # Text digest is bounded + flat.
+    txt = mn.documents_to_text(docs, max_docs=1)
+    _check("text digest includes a schema header and is doc-bounded",
+           txt.startswith("# 2 document(s)") and "doc 1" in txt
+           and "doc 2" not in txt)
+
+    # Explode the object array into a tidy frame.
+    ex = mn.explode_documents([docs[0]], "line_items", meta=["_id"])
+    _check("explode yields one row per array element",
+           len(ex) == 2 and "sku" in ex.columns)
+
+    # File reading: array, single object, and JSONL.
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td)
+        (p / "arr.json").write_text(
+            '[{"_id":{"$oid":"' + "d" * 24 + '"},"v":1},{"v":2}]',
+            encoding="utf-8")
+        (p / "one.json").write_text('{"v":1,"nested":{"a":2}}', encoding="utf-8")
+        (p / "lines.jsonl").write_text('{"v":1}\n{"v":2}\n{"v":3}\n',
+                                       encoding="utf-8")
+        _check("reads JSON array", len(va.read_json_documents(p / "arr.json")) == 2)
+        _check("reads single JSON object",
+               len(va.read_json_documents(p / "one.json")) == 1)
+        _check("reads JSONL (one doc per line)",
+               len(va.read_json_documents(p / "lines.jsonl")) == 3)
+        clean = va.json_to_clean_frame(p / "arr.json")
+        _check("json_to_clean_frame coerces $oid in a file",
+               str(clean.iloc[0]["_id"]) == "d" * 24)
+
+
 def test_clip_path_persistence() -> None:
     """The vision (mmproj) path must round-trip through backend_settings
     .json without overwriting the GGUF path stored alongside it. This
@@ -2081,6 +2183,7 @@ def main() -> int:
     _run("stats-summary trigger keywords",       test_stats_summary_triggers)
     _run("folder_column_stats bounded many-file", test_folder_column_stats_bounded_many_files)
     _run("analyst read-budget guard (OOM safety)", test_analyst_read_budget_guard)
+    _run("Mongo BSON/JSON model-digestible convert", test_mongo_normalize_model_digestible)
     _run("clip_path / GGUF path co-persistence", test_clip_path_persistence)
     _run("SPC — process_capability known-values", test_spc_process_capability_known_values)
     _run("SPC — process_capability one-sided",    test_spc_process_capability_one_sided)

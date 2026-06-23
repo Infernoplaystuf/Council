@@ -904,6 +904,120 @@ def read_bson_as_df(path: Any) -> pd.DataFrame:
 
 
 # ============================================================
+# MongoDB -> model-digestible conversion
+# ============================================================
+# Mongo BSON / JSON is nested and full of ObjectId / datetime / arrays of
+# sub-documents that a language model reads poorly. The helpers below flatten
+# + coerce documents into clean scalars (see mongo_normalize.py). They accept
+# a .bson file, a Mongo-export .json / .jsonl file, OR a list of dicts you
+# already have (e.g. from read_mongo_collection), so the same clean view is
+# available whatever the source.
+
+def read_json_documents(path: Any) -> List[Dict[str, Any]]:
+    """Read a JSON / JSONL / NDJSON file into a list of documents.
+
+    Handles the three shapes a Mongo export takes:
+      * a JSON array of objects                ``[ {...}, {...} ]``
+      * one JSON object                        ``{...}``  (-> single-doc list)
+      * JSON-Lines / NDJSON (one object/line)  ``{...}\\n{...}\\n``
+    MongoDB *Extended JSON* type wrappers (``$oid`` / ``$date`` / …) are left
+    intact here and coerced later by the normaliser, so no bson is needed.
+    """
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"JSON file not found: {p}")
+    text = p.read_text(encoding="utf-8", errors="replace").strip()
+    if not text:
+        return []
+    # Try a single JSON value (array or object) first.
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, list):
+            return [d for d in obj if isinstance(d, dict)]
+        if isinstance(obj, dict):
+            return [obj]
+    except json.JSONDecodeError:
+        pass
+    # Fall back to JSON-Lines: one document per non-blank line.
+    docs: List[Dict[str, Any]] = []
+    for line in text.splitlines():
+        line = line.strip().rstrip(",")
+        if not line or line in ("[", "]"):
+            continue
+        try:
+            d = json.loads(line)
+            if isinstance(d, dict):
+                docs.append(d)
+        except json.JSONDecodeError:
+            continue
+    return docs
+
+
+def mongo_documents_to_frame(docs: Any, *,
+                             max_array_items: int = 25,
+                             max_array_chars: int = 300) -> pd.DataFrame:
+    """Flatten + coerce a list of Mongo documents into a clean, all-scalar
+    DataFrame: dotted columns for nested fields, ObjectId/dates as strings,
+    arrays collapsed to bounded cells. Feed this to the model instead of
+    raw documents."""
+    import mongo_normalize as _mn
+    return _mn.documents_to_frame(
+        docs, max_array_items=max_array_items, max_array_chars=max_array_chars)
+
+
+def bson_to_clean_frame(path: Any, **kw) -> pd.DataFrame:
+    """Read a .bson file straight into the model-digestible DataFrame."""
+    return mongo_documents_to_frame(read_bson_documents(path), **kw)
+
+
+def json_to_clean_frame(path: Any, **kw) -> pd.DataFrame:
+    """Read a Mongo-export .json / .jsonl file into the model-digestible
+    DataFrame (Extended-JSON ``$oid`` / ``$date`` wrappers coerced)."""
+    return mongo_documents_to_frame(read_json_documents(path), **kw)
+
+
+def mongo_schema_profile(docs: Any, *, sample: int = 1000) -> pd.DataFrame:
+    """One row per field after flattening: field, types seen, how many docs
+    carry it, presence %, and an example value. The most token-cheap way to
+    show a model a collection's structure before it queries the data."""
+    import mongo_normalize as _mn
+    import pandas as _pd
+    if isinstance(docs, (str, Path)):
+        p = Path(docs)
+        docs = (read_bson_documents(p) if p.suffix.lower() == ".bson"
+                else read_json_documents(p))
+    return _pd.DataFrame(_mn.infer_schema(docs, sample=sample))
+
+
+def mongo_documents_to_text(docs: Any, *, max_docs: int = 50,
+                            max_value_chars: int = 160,
+                            include_schema: bool = True) -> str:
+    """Render documents as a compact, flat ``key: value`` text block (with an
+    optional schema header) for direct insertion into a model prompt."""
+    import mongo_normalize as _mn
+    if isinstance(docs, (str, Path)):
+        p = Path(docs)
+        docs = (read_bson_documents(p) if p.suffix.lower() == ".bson"
+                else read_json_documents(p))
+    return _mn.documents_to_text(
+        docs, max_docs=max_docs, max_value_chars=max_value_chars,
+        include_schema=include_schema)
+
+
+def mongo_explode_array(docs: Any, record_path: str, *,
+                        meta: Optional[List[str]] = None) -> pd.DataFrame:
+    """One row per element of the array at ``record_path`` (dotted), carrying
+    chosen top-level ``meta`` fields down — the tidy/tabular view of an
+    array-of-subdocuments field (e.g. order ``line_items``)."""
+    import mongo_normalize as _mn
+    if isinstance(docs, (str, Path)):
+        p = Path(docs)
+        docs = (read_bson_documents(p) if p.suffix.lower() == ".bson"
+                else read_json_documents(p))
+    return _mn.explode_documents(docs, record_path, meta=meta)
+
+
+# ============================================================
 # SQLAlchemy bridge — remote SQL databases (Postgres / MySQL / MSSQL / etc.)
 # ============================================================
 
@@ -3127,6 +3241,16 @@ def execute_pandas_code(
         "list_bson_files":     list_bson_files,
         "read_bson_documents": read_bson_documents,
         "read_bson_as_df":     read_bson_as_df,
+        # Mongo -> model-digestible: flatten nested docs, coerce ObjectId /
+        # dates / arrays into clean scalars. Work on a .bson / .json / .jsonl
+        # path OR a list of docs (e.g. from read_mongo_collection).
+        "read_json_documents":     read_json_documents,
+        "mongo_documents_to_frame": mongo_documents_to_frame,
+        "bson_to_clean_frame":      bson_to_clean_frame,
+        "json_to_clean_frame":      json_to_clean_frame,
+        "mongo_schema_profile":     mongo_schema_profile,
+        "mongo_documents_to_text":  mongo_documents_to_text,
+        "mongo_explode_array":      mongo_explode_array,
         # SQLAlchemy bridge
         "list_sql_connections": list_sql_connections,
         "list_sql_tables":      list_sql_tables,
@@ -3371,7 +3495,20 @@ DuckDB (file-based analytical SQL):
 BSON / MongoDB:
   list_bson_files(folder, recursive=True)
   read_bson_documents(path)    # -> list[dict]
-  read_bson_as_df(path)        # -> DataFrame (pd.json_normalize)
+  read_bson_as_df(path)        # -> DataFrame (raw; nested cells kept)
+  read_json_documents(path)    # -> list[dict] from .json / .jsonl / NDJSON
+
+Mongo -> model-digestible (PREFER these for BSON/JSON — they flatten nested
+docs and turn ObjectId / dates / Decimal128 / arrays into clean scalars, so
+the model isn't fed raw ObjectId and array-of-subdocument noise). Each accepts
+a .bson / .json / .jsonl PATH or a list of docs (e.g. from read_mongo_collection):
+  bson_to_clean_frame(path)              # .bson  -> clean flat DataFrame
+  json_to_clean_frame(path)              # .json/.jsonl -> clean flat DataFrame
+  mongo_documents_to_frame(docs)         # list[dict] -> clean flat DataFrame
+  mongo_schema_profile(docs_or_path)     # -> field, types, present_pct, example
+  mongo_documents_to_text(docs_or_path)  # -> compact key:value text for a prompt
+  mongo_explode_array(docs_or_path, "line_items", meta=["_id","name"])
+                                         # one row per array element (tidy view)
 
 Remote SQL via SQLAlchemy (READ-ONLY — see notes below):
   list_sql_connections(vault_dir)    # -> {name: url}
