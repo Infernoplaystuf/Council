@@ -1801,6 +1801,75 @@ def test_model_finder_us_filter_and_fit() -> None:
            unknown["can_upgrade"] is False and len(unknown["upgrades"]) >= 1)
 
 
+def test_model_downloader() -> None:
+    """model_downloader: OS-aware dir, HF URL build, GGUF magic check,
+    non-HF URL refusal, and a real streaming download (local server) with
+    magic validation + skip-if-present."""
+    import http.server
+    import socketserver
+    import threading as _th
+    import time as _time
+    import model_downloader as md
+
+    _check("detect_os returns a known value",
+           md.detect_os() in ("windows", "linux", "macos", "unknown"))
+    _check("default_models_dir is absolute",
+           Path(md.default_models_dir()).is_absolute())
+    url = md.hf_resolve_url("org/repo-GGUF", "model-Q4_K_M.gguf")
+    _check("hf_resolve_url targets huggingface.co",
+           url.startswith("https://huggingface.co/org/repo-GGUF/resolve/main/"))
+
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        good = d / "good.gguf"
+        good.write_bytes(b"GGUF" + b"\0" * 32)
+        bad = d / "bad.gguf"
+        bad.write_bytes(b"<html>nope</html>")
+        _check("looks_like_gguf true on GGUF magic", md.looks_like_gguf(good))
+        _check("looks_like_gguf false on non-GGUF", not md.looks_like_gguf(bad))
+
+        # Non-HF URL must be refused.
+        refused = False
+        try:
+            md.download_gguf("x", "y.gguf", d / "o",
+                             url="https://evil.example/y.gguf")
+        except md.DownloadError:
+            refused = True
+        _check("non-Hugging-Face URL refused", refused)
+
+        # Real streaming download from a local server (host shim).
+        srv = d / "srv"
+        srv.mkdir()
+        (srv / "m.gguf").write_bytes(b"GGUF" + b"\0" * (256 * 1024))
+        cwd0 = os.getcwd()
+        os.chdir(srv)
+        httpd = socketserver.TCPServer(
+            ("127.0.0.1", 0), http.server.SimpleHTTPRequestHandler)
+        port = httpd.server_address[1]
+        _th.Thread(target=httpd.serve_forever, daemon=True).start()
+        _time.sleep(0.15)
+        prev_host = md._HF_HOST
+        md._HF_HOST = "127.0.0.1"
+        try:
+            out = d / "models"
+            seen = []
+            r = md.download_gguf(
+                "repo", "m.gguf", out,
+                url=f"http://127.0.0.1:{port}/m.gguf",
+                progress=lambda done, total: seen.append(done))
+            _check("download produced a valid GGUF",
+                   md.looks_like_gguf(r["path"]) and r["bytes"] > 0)
+            _check("progress callback fired", len(seen) >= 1)
+            r2 = md.download_gguf("repo", "m.gguf", out,
+                                  url=f"http://127.0.0.1:{port}/m.gguf")
+            _check("re-download skips an already-present valid file",
+                   r2["skipped"] is True)
+        finally:
+            md._HF_HOST = prev_host
+            httpd.shutdown()
+            os.chdir(cwd0)
+
+
 def test_stats_cache_per_folder_csv_shards() -> None:
     """The cache writes ONE CSV shard per folder (mirroring the tree),
     readable as a plain stats table, and never processes its own shards."""
@@ -2278,6 +2347,7 @@ def main() -> int:
     _run("analyst read-budget guard (OOM safety)", test_analyst_read_budget_guard)
     _run("Mongo BSON/JSON model-digestible convert", test_mongo_normalize_model_digestible)
     _run("Mongo streaming convert (bounded/OOM-safe)", test_mongo_stream_convert_bounded)
+    _run("model_downloader (OS dir, stream, verify)", test_model_downloader)
     _run("clip_path / GGUF path co-persistence", test_clip_path_persistence)
     _run("SPC — process_capability known-values", test_spc_process_capability_known_values)
     _run("SPC — process_capability one-sided",    test_spc_process_capability_one_sided)

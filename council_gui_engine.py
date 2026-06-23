@@ -8222,9 +8222,15 @@ class CouncilConsole(tk.Tk):
         self._mf_detail.pack(fill="x", padx=6, pady=4)
         drow = ttk.Frame(det)
         drow.pack(fill="x", padx=6, pady=(0, 4))
+        self._mf_dl_btn = ttk.Button(drow, text="⬇ Download & install",
+                                     command=self._mf_download)
+        self._mf_dl_btn.pack(side="left")
         ttk.Button(drow, text="📋 Copy download info",
-                   command=self._mf_copy).pack(side="left")
+                   command=self._mf_copy).pack(side="left", padx=6)
         self._mf_copy_target = ""
+        self._mf_selected = None      # dict of the selected model row
+        self._mf_dl_cancel = False
+        self._mf_downloading = False
 
         # Populate the offline catalog immediately so the tab is useful
         # before the user clicks anything, and assess upgrade headroom so
@@ -8354,6 +8360,7 @@ class CouncilConsole(tk.Tk):
         m = self._mf_results.get(sel[0])
         if not m:
             return
+        self._mf_selected = m
         repo = m.get("hf_repo")
         hf_file = m.get("hf_file")
         url = m.get("url") or (f"https://huggingface.co/{repo}" if repo else "")
@@ -8393,6 +8400,125 @@ class CouncilConsole(tk.Tk):
             self._mf_status.set(f"Copied: {self._mf_copy_target}")
         except Exception as exc:
             self._mf_status.set(f"Copy failed: {exc!r}")
+
+    def _mf_download(self):
+        """Download the selected model's GGUF straight into the OS-appropriate
+        models folder, then offer to make it the active model. The download
+        is explicit + user-initiated (it doesn't change offline-by-default)."""
+        from tkinter import messagebox
+        import threading as _th
+
+        # A click while a download is running acts as Cancel.
+        if self._mf_downloading:
+            self._mf_dl_cancel = True
+            self._mf_status.set("Cancelling…")
+            return
+
+        m = self._mf_selected
+        if not m:
+            self._mf_status.set("Select a model in the table first.")
+            return
+        repo, hf_file = m.get("hf_repo"), m.get("hf_file")
+        if not (repo and hf_file):
+            self._mf_status.set(
+                "This is an online search result with no single known file — "
+                "use a catalog entry (it has an exact GGUF to fetch), or open "
+                "the repo and pick a .gguf manually.")
+            return
+
+        try:
+            import model_downloader as _md
+        except Exception as exc:
+            self._mf_status.set(f"Downloader unavailable: {exc!r}")
+            return
+
+        dest = _md.default_models_dir()
+        size_gb = m.get("size_gb")
+        free = _md.disk_free_gb(dest)
+        osname = _md.detect_os()
+
+        # Free-space guard (need the file + a little headroom).
+        if size_gb and free is not None and free < size_gb * 1.1:
+            messagebox.showwarning(
+                "Not enough disk space",
+                f"{m.get('name', hf_file)} needs ~{size_gb} GB but only "
+                f"{free} GB is free on the {osname} models drive.\n\n{dest}")
+            return
+
+        size_txt = f"~{size_gb} GB" if size_gb else "unknown size"
+        if not messagebox.askyesno(
+                "Download model?",
+                f"Download {m.get('name', hf_file)} ({size_txt}) from "
+                f"Hugging Face?\n\nFrom:  {repo}\nFile:  {hf_file}\n"
+                f"To ({osname}):  {dest}\nFree space:  "
+                f"{free if free is not None else '?'} GB\n\n"
+                "This needs an internet connection."):
+            return
+
+        self._mf_downloading = True
+        self._mf_dl_cancel = False
+        self._mf_dl_btn.configure(text="■ Cancel download")
+
+        def _prog(done, total):
+            if total:
+                pct = done * 100 // total
+                msg = (f"Downloading {pct}%  "
+                       f"({done / 1e6:.0f} / {total / 1e6:.0f} MB)")
+            else:
+                msg = f"Downloading… {done / 1e6:.0f} MB"
+            self.after(0, lambda: self._mf_status.set(msg))
+
+        def _worker():
+            try:
+                res = _md.download_gguf(
+                    repo, hf_file, dest,
+                    progress=_prog,
+                    should_cancel=lambda: self._mf_dl_cancel,
+                    expected_size_gb=size_gb)
+                self.after(0, lambda: self._mf_download_done(res, m))
+            except _md.DownloadError as de:
+                self.after(0, lambda: self._mf_status.set(
+                    str(de) + (" (partial saved — resumes next time)"
+                               if "cancel" in str(de).lower() else "")))
+            except Exception as exc:
+                self.after(0, lambda: self._mf_status.set(
+                    f"Download failed: {exc!r}"))
+            finally:
+                self.after(0, self._mf_download_reset)
+
+        _th.Thread(target=_worker, daemon=True).start()
+
+    def _mf_download_reset(self):
+        self._mf_downloading = False
+        self._mf_dl_cancel = False
+        try:
+            self._mf_dl_btn.configure(text="⬇ Download & install")
+        except Exception:
+            pass
+
+    def _mf_download_done(self, res: dict, m: dict):
+        from tkinter import messagebox
+        path = res.get("path", "")
+        verb = "Already present" if res.get("skipped") else "Downloaded"
+        self._mf_status.set(f"{verb}: {path}")
+        if messagebox.askyesno(
+                "Set as active model?",
+                f"{verb} {m.get('name', '')}.\n\n{path}\n\n"
+                "Make this the Council's active model now? "
+                "(Takes effect on the next message.)"):
+            try:
+                import onboarding
+                onboarding.save_gguf_path(VAULT_DIR, path)
+                try:
+                    import council_engine as _ce
+                    _ce.refresh_backend_config()
+                except Exception:
+                    pass
+                self._mf_status.set(f"Active model set: {Path(path).name}")
+                # Refresh the upgrade banner against the new current model.
+                self._mf_check_upgrades(initial=True)
+            except Exception as exc:
+                self._mf_status.set(f"Saved, but couldn't activate: {exc!r}")
 
     def _build_specialists_tab(self):
         self.tab_specialists = ttk.Frame(self.nb)
