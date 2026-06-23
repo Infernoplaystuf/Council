@@ -354,6 +354,238 @@ def documents_to_frame(docs: Iterable[Dict[str, Any]], *,
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
 
+# ============================================================
+# Streaming conversion to files — bounded memory for huge dumps
+# ============================================================
+# A real Mongo dump can be gigabytes. Loading it whole (bson.decode_all /
+# json.loads) and then building a full DataFrame holds ~3 copies in RAM and
+# OOM-kills the app on a memory-capped box (Linux / WSL). These helpers
+# stream documents one at a time and write the CSV row-by-row, so peak
+# memory stays flat regardless of collection size.
+
+def iter_bson_documents(path: Any) -> "Iterable[Dict[str, Any]]":
+    """Yield documents from a .bson file ONE at a time (constant memory),
+    using bson.decode_file_iter instead of decode_all."""
+    try:
+        import bson
+    except ImportError as exc:
+        raise RuntimeError(
+            "Reading .bson files needs pymongo (provides the `bson` "
+            f"module). Install with: pip install pymongo (original: {exc})"
+        ) from exc
+    with open(path, "rb") as fh:
+        for doc in bson.decode_file_iter(fh):
+            yield doc
+
+
+def _peek_first_nonspace(path: Any) -> str:
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        while True:
+            ch = fh.read(1)
+            if ch == "":
+                return ""
+            if not ch.isspace():
+                return ch
+
+
+def iter_json_documents(path: Any, *,
+                        max_json_bytes: Optional[int] = None
+                        ) -> "Iterable[Dict[str, Any]]":
+    """Yield documents from .json / .jsonl / .ndjson.
+
+    JSONL / NDJSON stream line-by-line (constant memory). A single JSON
+    array or object must be loaded whole — guarded by ``max_json_bytes`` so
+    an oversized array raises a clear, CATCHABLE error instead of OOM-killing
+    the process (re-export as .jsonl or .bson to stream it)."""
+    from pathlib import Path as _P
+    p = _P(path)
+    ext = p.suffix.lower()
+    if ext in (".jsonl", ".ndjson"):
+        with open(p, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip().rstrip(",")
+                if not line or line in ("[", "]"):
+                    continue
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(d, dict):
+                    yield d
+        return
+    # .json — array or single object; must load, so guard the size.
+    first = _peek_first_nonspace(p)
+    try:
+        size = p.stat().st_size
+    except OSError:
+        size = 0
+    if max_json_bytes and size > max_json_bytes and first == "[":
+        raise MemoryError(
+            f"JSON array file is {size // (1024 * 1024)} MB (> "
+            f"{max_json_bytes // (1024 * 1024)} MB safe limit). Re-export it "
+            "as .jsonl / NDJSON or .bson so it can be streamed without "
+            "loading the whole file into memory.")
+    text = p.read_text(encoding="utf-8", errors="replace").strip()
+    if not text:
+        return
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        # Mislabeled NDJSON inside a .json file — fall back to line streaming.
+        for line in text.splitlines():
+            line = line.strip().rstrip(",")
+            if not line or line in ("[", "]"):
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(d, dict):
+                yield d
+        return
+    if isinstance(obj, list):
+        for d in obj:
+            if isinstance(d, dict):
+                yield d
+    elif isinstance(obj, dict):
+        yield obj
+
+
+def _doc_iter_factory(path: Any, *, max_json_bytes: Optional[int] = None):
+    """Return a zero-arg callable that produces a FRESH document iterator
+    each call (so we can make two streaming passes over the same file)."""
+    from pathlib import Path as _P
+    p = _P(path)
+    if p.suffix.lower() == ".bson":
+        return lambda: iter_bson_documents(p)
+    return lambda: iter_json_documents(p, max_json_bytes=max_json_bytes)
+
+
+def stream_convert_file(src: Any, out_dir: Any, *,
+                        want_csv: bool = True,
+                        want_schema: bool = True,
+                        want_text: bool = False,
+                        max_docs: Optional[int] = None,
+                        max_cols: int = 2048,
+                        text_sample_docs: int = 50,
+                        max_value_chars: int = 160,
+                        max_array_items: int = DEFAULT_MAX_ARRAY_ITEMS,
+                        max_array_chars: int = DEFAULT_MAX_ARRAY_CHARS,
+                        max_json_bytes: Optional[int] = None,
+                        stem: Optional[str] = None,
+                        ) -> Dict[str, Any]:
+    """Convert ONE .bson/.json/.jsonl file to model-digestible artefacts with
+    bounded memory, streaming documents one at a time:
+
+      <stem>_clean.csv    flattened all-scalar table (one row per doc)
+      <stem>_schema.csv   field / types / presence% / example
+      <stem>_digest.txt   compact key:value text digest (first N docs)
+
+    Two streaming passes: pass 1 collects the column union + schema + a small
+    text sample; pass 2 writes CSV rows one at a time. Peak memory is the
+    field set + one document — flat no matter how big the dump is.
+    Returns a summary dict.
+    """
+    import csv as _csv
+    from pathlib import Path as _P
+    src = _P(src)
+    out_dir = _P(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = stem or src.stem
+    make_iter = _doc_iter_factory(src, max_json_bytes=max_json_bytes)
+
+    def _flat(doc):
+        if not isinstance(doc, dict):
+            return {"value": coerce_value(doc)}
+        return flatten_document(doc, max_array_items=max_array_items,
+                                max_array_chars=max_array_chars)
+
+    # ---- Pass 1: column union + schema counters + text sample ----
+    columns: List[str] = []
+    colset: set = set()
+    cols_capped = False
+    schema: Dict[str, Dict[str, Any]] = {}
+    sample_rows: List[Dict[str, Any]] = []
+    doc_count = 0
+    for doc in make_iter():
+        if max_docs and doc_count >= max_docs:
+            break
+        row = _flat(doc)
+        for k, v in row.items():
+            if k not in colset:
+                if len(columns) >= max_cols:
+                    cols_capped = True
+                    continue          # drop pathological extra fields
+                colset.add(k)
+                columns.append(k)
+            info = schema.get(k)
+            if info is None:
+                info = {"count": 0, "types": set(), "example": ""}
+                schema[k] = info
+            info["count"] += 1
+            info["types"].add(type(v).__name__)
+            if not info["example"] and v not in (None, ""):
+                ex = str(v)
+                info["example"] = ex[:80] + ("…" if len(ex) > 80 else "")
+        if len(sample_rows) < text_sample_docs:
+            sample_rows.append(row)
+        doc_count += 1
+
+    outputs: List[str] = []
+
+    if want_schema and doc_count:
+        sp = out_dir / f"{stem}_schema.csv"
+        with open(sp, "w", newline="", encoding="utf-8") as fh:
+            w = _csv.writer(fh)
+            w.writerow(["field", "types", "present", "present_pct", "example"])
+            for k in columns:
+                info = schema[k]
+                w.writerow([k, ", ".join(sorted(info["types"])), info["count"],
+                            round(100.0 * info["count"] / doc_count, 1),
+                            info["example"]])
+        outputs.append(str(sp))
+
+    if want_text and doc_count:
+        tp = out_dir / f"{stem}_digest.txt"
+        hdr = ", ".join(f"{k}({schema[k]['count'] * 100 // doc_count}%)"
+                        for k in columns[:40])
+        lines = [f"# {doc_count} document(s); fields: {hdr}"]
+        if doc_count > len(sample_rows):
+            lines.append(f"# showing first {len(sample_rows)} of {doc_count}")
+        for i, r in enumerate(sample_rows):
+            lines.append(f"- doc {i + 1}:")
+            for k, v in r.items():
+                sval = "" if v is None else str(v)
+                if len(sval) > max_value_chars:
+                    sval = sval[:max_value_chars] + "…"
+                lines.append(f"    {k}: {sval}")
+        tp.write_text("\n".join(lines), encoding="utf-8")
+        outputs.append(str(tp))
+
+    # ---- Pass 2: stream rows into the CSV (one document at a time) ----
+    rows_written = 0
+    if want_csv and doc_count:
+        cp = out_dir / f"{stem}_clean.csv"
+        with open(cp, "w", newline="", encoding="utf-8") as fh:
+            w = _csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
+            w.writeheader()
+            n = 0
+            for doc in make_iter():
+                if max_docs and n >= max_docs:
+                    break
+                w.writerow(_flat(doc))
+                rows_written += 1
+                n += 1
+        outputs.append(str(cp))
+
+    return {
+        "stem": stem, "docs": doc_count, "rows": rows_written,
+        "columns": len(columns), "outputs": outputs,
+        "truncated": bool(max_docs and doc_count >= max_docs),
+        "cols_capped": cols_capped,
+    }
+
+
 def explode_documents(docs: Iterable[Dict[str, Any]], record_path: str, *,
                       meta: Optional[List[str]] = None) -> "Any":
     """One row per element of the array at ``record_path`` (dotted), with

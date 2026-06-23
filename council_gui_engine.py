@@ -11461,25 +11461,15 @@ class CouncilConsole(tk.Tk):
                 last_err = ""
                 for fp in files:
                     try:
-                        docs = (_va.read_bson_documents(fp)
-                                if fp.suffix.lower() == ".bson"
-                                else _va.read_json_documents(fp))
-                        if not docs:
-                            done += 1
-                            continue
-                        stem = fp.stem
-                        if want_csv:
-                            df = _va.mongo_documents_to_frame(docs)
-                            df.to_csv(out_root / f"{stem}_clean.csv", index=False)
-                            total_rows += len(df)
-                        if want_schema:
-                            prof = _va.mongo_schema_profile(docs)
-                            prof.to_csv(out_root / f"{stem}_schema.csv", index=False)
-                        if want_text:
-                            txt = _va.mongo_documents_to_text(docs)
-                            (out_root / f"{stem}_digest.txt").write_text(
-                                txt, encoding="utf-8")
-                        ok += 1
+                        # Streaming, bounded-memory conversion — never loads
+                        # the whole dump (that OOM-crashed the app on Linux).
+                        summary = _va.convert_mongo_file(
+                            fp, out_root,
+                            want_csv=want_csv, want_schema=want_schema,
+                            want_text=want_text)
+                        if summary.get("docs"):
+                            total_rows += summary.get("rows", 0)
+                            ok += 1
                     except Exception as fe:
                         last_err = f"{fp.name}: {fe!r}"
                     done += 1

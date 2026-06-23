@@ -1004,6 +1004,41 @@ def mongo_documents_to_text(docs: Any, *, max_docs: int = 50,
         include_schema=include_schema)
 
 
+def _mongo_json_byte_budget() -> int:
+    """Max bytes a single JSON ARRAY file may be before conversion refuses
+    (it must be loaded whole). Streaming formats (.bson / .jsonl) are
+    unaffected. Override with COUNCIL_MONGO_MAX_JSON_MB."""
+    ov = os.environ.get("COUNCIL_MONGO_MAX_JSON_MB", "").strip()
+    if ov:
+        try:
+            return max(8, int(ov)) * 1024 * 1024
+        except ValueError:
+            pass
+    cap = 256 * 1024 * 1024
+    try:
+        import psutil
+        avail = int(psutil.virtual_memory().available * 0.20)
+        if avail > 0:
+            return min(cap, avail)
+    except Exception:
+        pass
+    return cap
+
+
+def convert_mongo_file(src: Any, out_dir: Any, *,
+                       want_csv: bool = True, want_schema: bool = True,
+                       want_text: bool = False,
+                       max_docs: Optional[int] = None) -> Dict[str, Any]:
+    """Stream-convert ONE .bson/.json/.jsonl file into model-digestible
+    files under ``out_dir`` with BOUNDED memory (safe on a huge dump). See
+    mongo_normalize.stream_convert_file. Returns a summary dict."""
+    import mongo_normalize as _mn
+    return _mn.stream_convert_file(
+        src, out_dir, want_csv=want_csv, want_schema=want_schema,
+        want_text=want_text, max_docs=max_docs,
+        max_json_bytes=_mongo_json_byte_budget())
+
+
 def mongo_explode_array(docs: Any, record_path: str, *,
                         meta: Optional[List[str]] = None) -> pd.DataFrame:
     """One row per element of the array at ``record_path`` (dotted), carrying

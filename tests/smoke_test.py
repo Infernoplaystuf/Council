@@ -544,6 +544,72 @@ def test_mongo_normalize_model_digestible() -> None:
                str(clean.iloc[0]["_id"]) == "d" * 24)
 
 
+def test_mongo_stream_convert_bounded() -> None:
+    """Streaming Mongo conversion must:
+       * convert a JSONL dump one doc at a time (bounded memory) into
+         _clean.csv / _schema.csv / _digest.txt with coerced scalars
+       * stream a single JSON object and a JSON array correctly
+       * REFUSE an oversized single JSON array with a catchable error
+         (the OOM that crashed the app on Linux) rather than loading it
+    """
+    import json as _json
+    import mongo_normalize as mn
+    import vault_analyst as va
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        out = d / "out"
+        # JSONL with nested + extended-JSON + arrays.
+        with (d / "dump.jsonl").open("w", encoding="utf-8") as fh:
+            for i in range(500):
+                fh.write(_json.dumps({
+                    "_id": {"$oid": f"{i:024x}"},
+                    "amt": {"$numberDecimal": str(i * 1.5)},
+                    "tags": ["a", "b"],
+                    "cust": {"name": f"u{i}", "city": "Denver"},
+                    "items": [{"sku": "X", "q": i % 5}],
+                }) + "\n")
+        summ = va.convert_mongo_file(d / "dump.jsonl", out,
+                                     want_csv=True, want_schema=True,
+                                     want_text=True)
+        _check("streamed all docs", summ["docs"] == 500 and summ["rows"] == 500)
+        _check("clean CSV written", (out / "dump_clean.csv").exists())
+        _check("schema CSV written", (out / "dump_schema.csv").exists())
+        _check("digest written", (out / "dump_digest.txt").exists())
+        import pandas as pd
+        df = pd.read_csv(out / "dump_clean.csv", dtype=str)
+        _check("nested dict flattened to dotted column",
+               "cust.name" in df.columns and "cust.city" in df.columns)
+        _check("$numberDecimal coerced (numeric column present)",
+               "amt" in df.columns)
+
+        # Single JSON object + array stream correctly.
+        (d / "one.json").write_text('{"v":1,"nested":{"a":2}}', encoding="utf-8")
+        s1 = va.convert_mongo_file(d / "one.json", out / "o1")
+        _check("single JSON object -> 1 doc", s1["docs"] == 1)
+        (d / "arr.json").write_text('[{"v":1},{"v":2},{"v":3}]', encoding="utf-8")
+        s2 = va.convert_mongo_file(d / "arr.json", out / "o2")
+        _check("small JSON array -> n docs", s2["docs"] == 3)
+
+        # Oversized JSON array must refuse (catchable), not OOM.
+        big = d / "big.json"
+        big.write_text(_json.dumps([{"v": i, "pad": "x" * 200}
+                                    for i in range(60000)]), encoding="utf-8")
+        refused = False
+        try:
+            mn.stream_convert_file(big, out / "o3",
+                                   max_json_bytes=4 * 1024 * 1024)
+        except MemoryError as exc:
+            refused = "safe limit" in str(exc)
+        _check("oversized JSON array refused cleanly (no OOM crash)", refused)
+
+        # ...while the bson/jsonl streaming path has no such limit.
+        with (d / "big.jsonl").open("w", encoding="utf-8") as fh:
+            for i in range(2000):
+                fh.write(_json.dumps({"v": i, "pad": "x" * 200}) + "\n")
+        s3 = va.convert_mongo_file(d / "big.jsonl", out / "o4")
+        _check("large JSONL streams regardless of size", s3["docs"] == 2000)
+
+
 def test_clip_path_persistence() -> None:
     """The vision (mmproj) path must round-trip through backend_settings
     .json without overwriting the GGUF path stored alongside it. This
@@ -2184,6 +2250,7 @@ def main() -> int:
     _run("folder_column_stats bounded many-file", test_folder_column_stats_bounded_many_files)
     _run("analyst read-budget guard (OOM safety)", test_analyst_read_budget_guard)
     _run("Mongo BSON/JSON model-digestible convert", test_mongo_normalize_model_digestible)
+    _run("Mongo streaming convert (bounded/OOM-safe)", test_mongo_stream_convert_bounded)
     _run("clip_path / GGUF path co-persistence", test_clip_path_persistence)
     _run("SPC — process_capability known-values", test_spc_process_capability_known_values)
     _run("SPC — process_capability one-sided",    test_spc_process_capability_one_sided)
