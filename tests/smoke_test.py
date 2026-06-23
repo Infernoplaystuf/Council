@@ -1773,6 +1773,33 @@ def test_model_finder_us_filter_and_fit() -> None:
     _check("find_models marks online unavailable offline",
            res["online_available"] is False and res["online"] == [])
 
+    # Upgrade detection: roomy GPU + small current model => can upgrade;
+    # running the top model OR no headroom => no upgrade; unknown current
+    # size => no claimed upgrade (but still lists fits).
+    up = mf.assess_upgrade(hardware={"vram_gb": 24.0, "ram_gb": 64.0},
+                           current_model="granite-3.1-8b-instruct-Q4_K_M.gguf",
+                           role="general")
+    _check("roomy GPU + 8B current => can_upgrade", up["can_upgrade"] is True)
+    _check("upgrades are strictly bigger than current 8B",
+           all(m["params_b"] > 8.0 for m in up["upgrades"]) and up["upgrades"])
+    _check("upgrade headroom is positive", (up["headroom_gb"] or 0) > 0)
+
+    top = mf.assess_upgrade(hardware={"vram_gb": 24.0, "ram_gb": 64.0},
+                            current_model="phi-4-14b-Q4_K_M.gguf",
+                            role="general")
+    _check("already running top model => no upgrade",
+           top["can_upgrade"] is False and top["upgrades"] == [])
+
+    nogpu = mf.assess_upgrade(hardware={"vram_gb": None, "ram_gb": 16.0},
+                              current_model="granite-3.1-8b.gguf")
+    _check("no VRAM headroom over 8B => no upgrade",
+           nogpu["can_upgrade"] is False)
+
+    unknown = mf.assess_upgrade(hardware={"vram_gb": 16.0, "ram_gb": 32.0},
+                                current_model="my-mystery-model.gguf")
+    _check("unknown current size => no claimed upgrade but lists fits",
+           unknown["can_upgrade"] is False and len(unknown["upgrades"]) >= 1)
+
 
 def test_stats_cache_per_folder_csv_shards() -> None:
     """The cache writes ONE CSV shard per folder (mirroring the tree),

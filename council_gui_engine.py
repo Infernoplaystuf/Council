@@ -8162,6 +8162,13 @@ class CouncilConsole(tk.Tk):
                   "online results are a name heuristic.")
         ).pack(anchor="w", pady=(2, 0))
 
+        # Upgrade banner — does this machine have room for a stronger model?
+        self._mf_banner = tk.StringVar(value="")
+        self._mf_banner_lbl = ttk.Label(
+            top, textvariable=self._mf_banner, wraplength=860,
+            justify="left", font=("", 9, "bold"))
+        self._mf_banner_lbl.pack(anchor="w", pady=(4, 0))
+
         # Controls.
         ctl = ttk.Frame(self.tab_models)
         ctl.pack(fill="x", padx=10, pady=(2, 6))
@@ -8175,6 +8182,8 @@ class CouncilConsole(tk.Tk):
                         variable=self._mf_online).pack(side="left", padx=6)
         ttk.Button(ctl, text="🔎 Find Models",
                    command=self._mf_find).pack(side="left", padx=6)
+        ttk.Button(ctl, text="⬆ Suggest upgrades",
+                   command=self._mf_check_upgrades).pack(side="left", padx=2)
         self._mf_status = tk.StringVar(value="")
         ttk.Label(ctl, textvariable=self._mf_status,
                   foreground="#a6e3a1").pack(side="left", padx=8)
@@ -8218,8 +8227,68 @@ class CouncilConsole(tk.Tk):
         self._mf_copy_target = ""
 
         # Populate the offline catalog immediately so the tab is useful
-        # before the user clicks anything.
+        # before the user clicks anything, and assess upgrade headroom so
+        # the banner tells the user right away whether a stronger model fits.
         self._mf_find(initial=True)
+        self._mf_check_upgrades(initial=True)
+
+    def _mf_current_model_name(self) -> str:
+        """Best-effort name of the currently loaded GGUF (for size compare)."""
+        import os
+        p = os.environ.get("COUNCIL_GGUF_PATH", "").strip()
+        if not p:
+            try:
+                import role_models
+                p = role_models.current_loaded_path()
+            except Exception:
+                p = ""
+        try:
+            return Path(p).name if p else ""
+        except Exception:
+            return ""
+
+    def _mf_check_upgrades(self, initial: bool = False):
+        """Assess whether the hardware can run a stronger model than the one
+        loaded; update the banner and (on explicit click) show the upgrade
+        list in the table."""
+        import threading as _th
+        role = self._mf_role.get()
+        current = self._mf_current_model_name()
+        if not initial:
+            self._mf_status.set("Checking headroom…")
+
+        def _worker():
+            try:
+                import model_finder
+                a = model_finder.assess_upgrade(
+                    hardware=self._mf_hw, current_model=current, role=role)
+            except Exception as exc:
+                self.after(0, lambda: self._mf_banner.set(
+                    f"Upgrade check unavailable: {exc!r}"))
+                return
+            self.after(0, lambda: self._mf_apply_assessment(
+                a, repopulate=not initial))
+
+        _th.Thread(target=_worker, daemon=True).start()
+
+    def _mf_apply_assessment(self, a: dict, repopulate: bool):
+        cur = a.get("current_params_b")
+        curtxt = f"~{cur:g}B" if cur else "size unknown"
+        name = self._mf_current_model_name() or "none set"
+        can = a.get("can_upgrade")
+        icon = "✅" if can else "ℹ"
+        self._mf_banner.set(
+            f"{icon}  Current model: {name} ({curtxt}).  {a.get('reason', '')}")
+        self._mf_banner_lbl.configure(
+            foreground="#a6e3a1" if can else "#9a9a9a")
+        if repopulate and a.get("upgrades"):
+            self._mf_populate({"catalog": a["upgrades"], "online": []}, False)
+            self._mf_status.set(
+                f"{len(a['upgrades'])} suggested upgrade(s) that fit your hardware.")
+        elif repopulate:
+            self._mf_status.set(
+                "No stronger model fits comfortably — showing the full catalog.")
+            self._mf_find()
 
     def _mf_find(self, initial: bool = False):
         import threading as _th

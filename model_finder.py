@@ -241,3 +241,96 @@ def find_models(hardware: Optional[Dict[str, Any]] = None,
         "online": online,
         "online_available": bool(online),
     }
+
+
+# ---- upgrade detection ----
+
+# A candidate must be at least this much bigger (params) than the current
+# model to count as a real upgrade — avoids nagging over a trivial bump.
+_UPGRADE_MIN_GAIN = 1.20
+
+
+def assess_upgrade(hardware: Optional[Dict[str, Any]] = None,
+                   current_model: str = "",
+                   current_params_b: Optional[float] = None,
+                   role: str = "general",
+                   limit: int = 6,
+                   min_gain: float = _UPGRADE_MIN_GAIN) -> Dict[str, Any]:
+    """Decide whether this machine can run a STRONGER model than the one
+    currently loaded, and list catalog upgrades that fit.
+
+    Inputs:
+      • hardware           — detect() dict (auto-detected if None).
+      • current_model      — loaded model id / filename (used to infer size).
+      • current_params_b   — explicit current size in B (overrides the name
+                             parse when known).
+
+    Returns:
+      {current_params_b, current_vram_gb, budget_gb, headroom_gb,
+       can_upgrade, reason, upgrades:[catalog dicts]}.
+    A model is an "upgrade" when it FITS the hardware AND is >= min_gain×
+    bigger than the current model. When the current size is unknown, the
+    best-fitting catalog models are returned but can_upgrade stays False
+    (we won't claim an upgrade we can't justify).
+    """
+    if hardware is None:
+        try:
+            import hardware_detect
+            hardware = hardware_detect.detect()
+        except Exception:
+            hardware = {}
+    vram = hardware.get("vram_gb")
+    ram = hardware.get("ram_gb")
+    budget = vram if vram else (ram * 0.5 if ram else 0)
+
+    cur_params = current_params_b or _params_b_from_name(current_model or "")
+    cur_vram = estimate_vram_gb(cur_params) if cur_params else None
+    headroom = round(budget - (cur_vram or 0.0), 1) if budget else None
+
+    # Fitting catalog models for the role (pull a deep list, then keep the
+    # ones that genuinely fit the VRAM/RAM budget).
+    pool = recommend_from_catalog(vram, ram, role=role, limit=50)
+
+    def _fits(m: Dict[str, Any]) -> bool:
+        return budget <= 0 or (m["vram_gb_q4"] + 1.5) <= budget
+
+    fitting = [m for m in pool if _fits(m)]
+
+    if cur_params:
+        upgrades = [m for m in fitting
+                    if m["params_b"] >= cur_params * min_gain]
+    else:
+        upgrades = fitting        # unknown current size — just show fits
+
+    upgrades = sorted(upgrades, key=lambda m: -m["params_b"])[:limit]
+    can_upgrade = bool(upgrades) and bool(cur_params)
+
+    if not budget:
+        reason = ("Couldn't read your VRAM/RAM, so I can't judge headroom. "
+                  "Showing models that commonly run on modest hardware.")
+    elif can_upgrade:
+        big = upgrades[0]
+        reason = (f"Your hardware has room (~{headroom} GB free over the "
+                  f"current ~{cur_params:g}B model) — it can run a stronger "
+                  f"model, up to {big['name']} ({big['params_b']:g}B).")
+    elif cur_params and not upgrades:
+        reason = (f"You're already running a model (~{cur_params:g}B) at or "
+                  "above the best fit for your hardware — no stronger model "
+                  "fits comfortably.")
+    elif not cur_params:
+        reason = ("Couldn't tell the current model's size from its name, so "
+                  "I can't confirm an upgrade — here are the best fits for "
+                  "your hardware to compare.")
+    else:
+        reason = "No clear upgrade found for your hardware."
+
+    return {
+        "current_model": current_model,
+        "current_params_b": cur_params,
+        "current_vram_gb": cur_vram,
+        "budget_gb": round(budget, 1) if budget else None,
+        "headroom_gb": headroom,
+        "can_upgrade": can_upgrade,
+        "reason": reason,
+        "upgrades": upgrades,
+    }
