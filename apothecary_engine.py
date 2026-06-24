@@ -1182,6 +1182,23 @@ if _TK_OK:
             ttk.Label(self, textvariable=self._detail_var,
                       foreground="#89b4fa", wraplength=600).pack(anchor="w", padx=10, pady=(0,4))
 
+            # Per-node recommendations row — populated by _on_select.
+            # Hidden when no node is selected; shows up to 4 swatches
+            # of US-origin models that fit the node's RAM (or VRAM
+            # when the node has a GPU). Click installs via wget over
+            # SSH to ~/models on the Pi.
+            self._rec_outer = ttk.Frame(self)
+            self._rec_outer.pack(fill="x", padx=10, pady=(0, 4))
+            self._rec_label_var = tk.StringVar(value="")
+            ttk.Label(self._rec_outer,
+                      textvariable=self._rec_label_var,
+                      foreground="#94e2d5",
+                      font=("Consolas", 9)
+                      ).pack(side="left")
+            self._rec_btn_frame = ttk.Frame(self._rec_outer)
+            self._rec_btn_frame.pack(side="left", fill="x",
+                                      expand=True, padx=(6, 0))
+
             ttk.Label(self, text="Output:").pack(anchor="w", padx=10)
             log_f = ttk.Frame(self)
             log_f.pack(fill="both", expand=True, padx=10, pady=(0,8))
@@ -1354,6 +1371,116 @@ if _TK_OK:
                     f"status:{node.status}{installed}  |  "
                     f"active:{node.active_model or chr(0x2014)}"
                 )
+                self._refresh_node_recs(node)
+            else:
+                self._rec_label_var.set("")
+                for child in self._rec_btn_frame.winfo_children():
+                    child.destroy()
+
+        # ── Per-node model recommendations ──────────────────────────
+
+        def _refresh_node_recs(self, node) -> None:
+            """Populate the per-node recommendation row based on the
+            cached hw_probe + the US-origin model catalog."""
+            for child in self._rec_btn_frame.winfo_children():
+                child.destroy()
+            if not node.hw_probe:
+                self._rec_label_var.set(
+                    "Recommendations: (probe hardware first with "
+                    "🔎 Probe Hardware)"
+                )
+                return
+            try:
+                import model_catalog as _mc
+            except Exception as exc:
+                self._rec_label_var.set(
+                    f"Recommendations: model_catalog unavailable ({exc!r})"
+                )
+                return
+            hw = node.hw_probe
+            vram = hw.get("vram_gb")
+            ram = hw.get("ram_gb") or 0
+            if isinstance(vram, (int, float)) and vram > 0:
+                recs = _mc.for_vram(float(vram))
+                budget_kind = f"{vram} GB VRAM"
+            else:
+                recs = _mc.for_ram(float(ram)) if hasattr(_mc, "for_ram") \
+                       else _mc.for_vram(max(2.0, float(ram) * 0.5))
+                budget_kind = f"{ram} GB RAM (CPU)"
+            if not recs:
+                self._rec_label_var.set(
+                    f"Recommendations ({budget_kind}): "
+                    "no US-origin model fits this hardware."
+                )
+                return
+            self._rec_label_var.set(
+                f"Fits {budget_kind} →"
+            )
+            for spec in recs[:4]:
+                lbl = f"{spec.id}  ({spec.size_gb:.1f} GB)"
+                ttk.Button(
+                    self._rec_btn_frame, text=lbl,
+                    command=lambda n=node, s=spec: self._install_model_on_node(n, s),
+                ).pack(side="left", padx=2)
+
+        def _install_model_on_node(self, node, spec) -> None:
+            """One-click install: wget the GGUF directly to ~/models
+            on the Pi over SSH. Confirms with the user (size warning)
+            before running so an accidental click on Phi-4-Q4 (~9 GB)
+            doesn't silently burn 10 minutes of bandwidth."""
+            ok = messagebox.askyesno(
+                "Install model on Pi?",
+                f"Download {spec.name}\n"
+                f"({spec.size_gb:.1f} GB) to {node.username}@{node.host}\n"
+                f"into ~/models/?\n\n"
+                f"Uses wget against huggingface.co. Pi needs an "
+                f"internet connection; large files can take a while.",
+                parent=self,
+            )
+            if not ok:
+                return
+            url = (f"https://huggingface.co/{spec.hf_repo}/"
+                    f"resolve/main/{spec.hf_file}")
+            cmd = (
+                f"mkdir -p ~/models && "
+                f"cd ~/models && "
+                f"wget --no-verbose --show-progress "
+                f"'{url}' -O '{spec.hf_file}' && "
+                f"echo 'ANVIL_INSTALL_OK {spec.id}'"
+            )
+            self._emit(
+                f"📥 Installing {spec.id} on [{node.name}]… (wget over SSH)"
+            )
+
+            def _worker():
+                try:
+                    rc, out, err = self.apoth.run(
+                        node.name, cmd,
+                        password_override=self._pw_override(),
+                        timeout_s=600,    # 10-minute ceiling
+                    )
+                except Exception as exc:
+                    rc, out, err = -1, "", repr(exc)
+
+                def _ui():
+                    if rc == 0 and "ANVIL_INSTALL_OK" in out:
+                        self._emit(
+                            f"✓ [{node.name}] installed {spec.id} "
+                            f"→ ~/models/{spec.hf_file}"
+                        )
+                    else:
+                        self._emit(
+                            f"✗ [{node.name}] install of {spec.id} "
+                            f"failed (rc={rc})",
+                            True,
+                        )
+                        tail = (err or out or "").strip().splitlines()[-3:]
+                        for ln in tail:
+                            self._emit(f"   {ln}", True)
+                self.after(0, _ui)
+
+            threading.Thread(target=_worker, daemon=True,
+                              name="apoth-install").start()
 
         # ── node management ──────────────────────────────────────
 

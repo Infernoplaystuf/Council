@@ -214,6 +214,35 @@ def for_vram(vram_gb: float, *, role: str = "general") -> List[ModelSpec]:
     return sorted(out, key=lambda m: (not m.is_default, -m.params_b))
 
 
+def fits_ram(spec: ModelSpec, ram_gb: float) -> bool:
+    """True if ``spec`` will run on a CPU-only system with the given
+    total RAM. The rule of thumb here is conservative: GGUF needs
+    roughly the file size plus a context buffer (~1 GB at 4K ctx)
+    AND we have to leave room for the OS / Tk UI / Python runtime
+    (~2 GB on a Pi, more if Chrome is open on a desktop). So:
+
+      working_set ≈ size_gb × 1.3 + 1.0 (context) + 2.0 (OS / runtime)
+
+    For a Pi 5 with 8 GB RAM that means models up to ~3.8 GB
+    (Phi-3.5-mini, Llama-3.2-3B); for 16 GB Pi or 16 GB CPU box,
+    up to ~10 GB (Phi-4-Q4, OLMo-2-13B).
+    """
+    working = spec.size_gb * 1.3 + 1.0 + 2.0
+    return working <= ram_gb
+
+
+def for_ram(ram_gb: float, *, role: str = "general") -> List[ModelSpec]:
+    """CPU-only companion to ``for_vram`` — picks models that fit a
+    total-RAM budget when there's no GPU to offload onto.
+
+    Used by the Apothecary's per-Pi recommendations: most Raspberry
+    Pis don't expose a CUDA GPU so VRAM-shaped recommendations
+    aren't useful. RAM is the binding constraint.
+    """
+    out = [m for m in MODELS if m.role == role and fits_ram(m, ram_gb)]
+    return sorted(out, key=lambda m: (not m.is_default, -m.params_b))
+
+
 def download_command(spec: ModelSpec, *, dest: str = "./models") -> str:
     """Return a one-line Python CLI snippet that downloads this GGUF
     via huggingface_hub. Suitable for pasting into a terminal."""
