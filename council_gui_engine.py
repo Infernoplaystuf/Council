@@ -4740,6 +4740,17 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         self._build_sessions_tab()
         self._build_vault_manager_tab()
         self._build_speech_tab()
+        # ── Council Network (Apothecary) ──
+        # Wire the main machine to Raspberry Pi nodes (or any SSH-
+        # reachable Linux box) so the council can offload roles to
+        # extra compute. Used to live behind COUNCIL_ADVANCED=1 — but
+        # that hid it from people who'd actually benefit, so it's now
+        # in the customer flow. Guarded so a missing paramiko / SSH
+        # tooling can't prevent the rest of the GUI from building.
+        try:
+            self._build_apoth_tab()
+        except Exception as _exc:
+            print(f"[council_gui] apothecary tab build failed: {_exc!r}")
         self._build_changelog_tab()
         self._build_diagnostics_tab()
 
@@ -4747,14 +4758,13 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         # Hidden by default unless explicitly enabled. Power users and
         # support staff can launch with --advanced or set
         # COUNCIL_ADVANCED=1 to expose the IDE, Agents panel, Librarian
-        # snapshots, Nodes, Vault Health, and Apothecary tabs.
+        # snapshots, Nodes, and Vault Health tabs.
         if _ADVANCED_MODE:
             self._build_ide_tab()
             self._build_librarian_tab()
             self._build_agents_tab()
             self._build_nodes_tab()
             self._build_vault_health_tab()
-            self._build_apoth_tab()
 
             # ── Odysseus-council creative tabs (advanced-only) ──
             # Behind the same COUNCIL_ADVANCED gate as the other
@@ -11732,13 +11742,12 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
     # ---- Apothecary tab (advanced mode only) ----
 
     def _build_apoth_tab(self):
-        """Lazily import apothecary_engine and build the Apothecary tab.
+        """Build the 🔌 Council Network tab (formerly named Apothecary).
 
-        This is only called from _build_ui when _ADVANCED_MODE is True.
-        Consumer builds skip this entirely — the import never happens,
-        the SSH provisioning code never loads, and the Ollama-flavoured
-        UI strings the Apothecary still contains never appear anywhere
-        in the bundled .exe.
+        This is the SSH-based wire-up panel for adding Raspberry Pi
+        (or any Linux box) nodes to the council. Lazy-imports
+        apothecary_engine so a missing paramiko / unreachable network
+        stack cannot prevent the rest of the GUI from building.
         """
         global ae
         if ae is None:
@@ -11749,15 +11758,17 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
                 print(f"[Apothecary] failed to import: {exc!r}")
                 return
         # Apothecary engine init — also lazy. Was previously created in
-        # __init__ unconditionally; moved here so consumer mode pays
-        # nothing for an engine it'll never expose.
+        # __init__ unconditionally; moved here so the engine pays
+        # nothing if the tab isn't shown.
         if not hasattr(self, "apoth"):
             self.apoth = ae.Apothecary(
                 registry_path=str(REGISTRY_PATH),
                 store_passwords=STORE_PASSWORDS,
             )
         self.tab_apoth = ttk.Frame(self.nb)
-        self.nb.add(self.tab_apoth, text="🔧 Apothecary")
+        # Customer-facing label: this is the "wire up extra compute"
+        # tab, not an internal admin tool.
+        self.nb.add(self.tab_apoth, text="🔌 Council Network")
         self.apoth_console = ae.ApothecaryConsole(
             self.tab_apoth, self.apoth, ui_queue=self.ui_q,
         )
