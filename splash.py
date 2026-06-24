@@ -135,7 +135,7 @@ class SplashWindow(tk.Toplevel):
             tagline      = branding.PRODUCT_TAGLINE
         except Exception:
             title_fg, subtitle_fg = "#d4d4d4", "#7a7575"
-            product_name = "Data's Inferno"
+            product_name = "Anvil"
             tagline = ""
         title_strip = tk.Frame(self, bg=bg, height=60)
         title_strip.pack(side="top", fill="x")

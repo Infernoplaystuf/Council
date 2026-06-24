@@ -1,8 +1,8 @@
 @echo off
 REM ============================================================
-REM Council / Datas Inferno  -  Windows build script
+REM Anvil (Odysseus Council)  -  Windows build script
 REM ============================================================
-REM Produces dist\DatasInferno\DatasInferno.exe and supporting files.
+REM Produces dist\Anvil\Anvil.exe and supporting files.
 REM
 REM Pre-reqs:
 REM     - Python 3.11 on PATH (or a conda env activated — see
@@ -11,8 +11,12 @@ REM     - All runtime deps installed:  pip install -r requirements.txt
 REM     - PyInstaller installed:       pip install pyinstaller
 REM       (the script will pip-install it for you if missing).
 REM
-REM The resulting dist\DatasInferno\ folder is fully self-contained.
+REM The resulting dist\Anvil\ folder is fully self-contained.
 REM Copy/zip it to ship — no Python install needed on the target box.
+REM
+REM Expect the build to take 5-15 minutes the first time —
+REM llama-cpp-python, chromadb, sentence-transformers, matplotlib,
+REM and pandas all contribute large native binaries.
 REM
 REM What is NOT bundled (by design):
 REM     - The GGUF model file. Users point COUNCIL_GGUF_PATH at one
@@ -72,7 +76,8 @@ echo All critical deps OK.
 
 echo.
 echo === Running PyInstaller (this takes 5-15 minutes) ===
-python -m PyInstaller council.spec --noconfirm --clean
+python -m PyInstaller anvil.spec --noconfirm --clean
+
 if errorlevel 1 (
     echo.
     echo BUILD FAILED. See PyInstaller output above for the missing
@@ -82,24 +87,24 @@ if errorlevel 1 (
 
 echo.
 echo === Reporting bundle size ===
-for /f "tokens=*" %%S in ('powershell -NoProfile -Command "[math]::Round((Get-ChildItem -Path 'dist\DatasInferno' -Recurse -File ^| Measure-Object -Property Length -Sum).Sum / 1MB, 1)"') do set "BUNDLE_MB=%%S"
+for /f "tokens=*" %%S in ('powershell -NoProfile -Command "[math]::Round((Get-ChildItem -Path 'dist\Anvil' -Recurse -File ^| Measure-Object -Property Length -Sum).Sum / 1MB, 1)"') do set "BUNDLE_MB=%%S"
 echo Bundle size: %BUNDLE_MB% MB
 
 echo.
 echo ============================================================
 echo  BUILD COMPLETE
 echo ============================================================
-echo  Bundle:      %CD%\dist\DatasInferno
-echo  Executable:  %CD%\dist\DatasInferno\DatasInferno.exe
+echo  Bundle:      %CD%\dist\Anvil
+echo  Executable:  %CD%\dist\Anvil\Anvil.exe
 echo.
 echo  First-run setup on the target machine:
-echo    1. Copy/extract dist\DatasInferno\ anywhere (e.g. C:\Programs\)
-echo    2. Double-click DatasInferno.exe
+echo    1. Copy/extract dist\Anvil\ anywhere (e.g. C:\Programs\)
+echo    2. Double-click Anvil.exe
 echo    3. When prompted, point COUNCIL_GGUF_PATH at a .gguf model
 echo       (Browse button inside the app does this for you).
 echo.
 echo  To create an installer:
-echo    - Inno Setup or NSIS against dist\DatasInferno\
+echo    - Inno Setup or NSIS against dist\Anvil\
 echo    - or just zip the folder
 echo ============================================================
 

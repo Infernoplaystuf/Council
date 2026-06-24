@@ -185,6 +185,12 @@ class AgentEvent:
 @dataclass
 class AgentContext:
     user_text: str
+    # One-line distillation of what the user is actually asking. Set once
+    # per turn by the dispatch site and re-injected at the top + bottom
+    # of every agent prompt so small models don't lose the thread when
+    # the augmented user_text is dominated by injected file/vault data.
+    # Empty string means "no anchor available — fall back to user_text".
+    goal: str = ""
     shared: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -2680,6 +2686,23 @@ class ModelAgent:
     def _compose_prompt(self, ctx: AgentContext) -> str:
         parts: List[str] = []
 
+        # Goal anchor — primacy slot. The user's distilled goal goes at the
+        # very top of every agent prompt so small models (8B-ish) anchor on
+        # the actual task before they get buried in injected file/analyst
+        # context. The same anchor is repeated near the bottom (recency
+        # slot) just before USER REQUEST. Empty string when no goal is set.
+        _goal = getattr(ctx, "goal", "") or ""
+        if _goal:
+            try:
+                import goal_anchor as _ga
+                _hdr = _ga.format_goal_header(_goal)
+                if _hdr:
+                    parts.append(_hdr)
+            except Exception:
+                # goal_anchor is a tiny helper module; if importing it fails
+                # somehow, degrade silently rather than blocking the prompt.
+                parts.append(f"[USER GOAL]\n  {_goal}")
+
         # Inject query mode so every personality knows what type of response to give.
         # This overrides the code-centric defaults baked into each system prompt.
         _mode = ctx.shared.get("query_mode", "")
@@ -2766,6 +2789,19 @@ class ModelAgent:
                 "⚠ REMINDER: This is a TECHNICAL query. "
                 "Prioritise working, complete code."
             )
+
+        # Goal anchor — recency slot. Repeat the distilled goal right
+        # before USER REQUEST so that even if the augmented user_text is
+        # dominated by ~3K tokens of CSV / vault data, the model still
+        # sees the actual ask at the highest-attention position.
+        if _goal:
+            try:
+                import goal_anchor as _ga
+                _rem = _ga.format_goal_reminder(_goal)
+                if _rem:
+                    parts.append(_rem)
+            except Exception:
+                parts.append(f"⚑ REMEMBER — the user's goal is: {_goal}")
 
         parts.append(f"USER REQUEST:\n{ctx.user_text}")
 
@@ -2878,8 +2914,9 @@ class DeliberationOrchestrator:
         self._emit(AgentEvent("Orchestrator", "phase", f"▶ {label}"))
 
     def run(self, user_text: str, *, panel: List[str], synth: str = "writer",
-            extra_ctx: Optional[Dict[str, Any]] = None) -> List[AgentEvent]:
-        ctx = AgentContext(user_text=user_text)
+            extra_ctx: Optional[Dict[str, Any]] = None,
+            goal: str = "") -> List[AgentEvent]:
+        ctx = AgentContext(user_text=user_text, goal=goal)
         if extra_ctx:
             ctx.shared.update(extra_ctx)
         all_events: List[AgentEvent] = []
@@ -4114,6 +4151,51 @@ class InstructionManager:
         return sum(1 for e in self._instructions if e.get("active"))
 
 
+# ============================================================
+# Sim persona overlay
+# ============================================================
+# Wraps a ParameterSweep so the picker-selected persona block is
+# merged onto every yielded combo. The user's base axes still win
+# on key conflicts — mirrors merge_persona_params policy so a
+# sweep that explicitly sets persona.greed keeps the override.
+
+def _sim_sweep_has_persona_axis(cfg) -> bool:
+    """True if any axis in the sweep config dict has type=='persona'."""
+    axes = (cfg or {}).get("axes") if isinstance(cfg, dict) else None
+    if not isinstance(axes, dict):
+        return False
+    for spec in axes.values():
+        if isinstance(spec, dict) and str(spec.get("type", "")).lower() == "persona":
+            return True
+    return False
+
+
+class _SimPersonaOverlay:
+    """Iterable wrapper that overlays a persona's params on every
+    combo from the underlying sweep. Exposes the same len + iter
+    contract that run_sweep expects."""
+
+    def __init__(self, sweep, persona):
+        self._sweep = sweep
+        self._persona_params = persona.to_params()
+
+    def __len__(self):
+        return max(1, len(self._sweep))
+
+    def __iter__(self):
+        # If the underlying sweep is empty (no axes), still yield one
+        # combo containing just the persona block so the user can run
+        # "this persona only, no sweep" from the picker.
+        any_yielded = False
+        for combo in self._sweep:
+            any_yielded = True
+            merged = dict(self._persona_params)
+            merged.update(combo)         # base axes win
+            yield merged
+        if not any_yielded:
+            yield dict(self._persona_params)
+
+
 class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
     # tk.Tk MUST stay first so its __init__ gets the constructor call
     # via super().__init__(); the mixins are stateless until their
@@ -4197,10 +4279,20 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         # an exact row reference (or flag it as hallucinated).
         import provenance as _prov
         self.provenance = _prov.ProvenanceTracker(max_turns=20)
+        # Per-session record of distilled user goals so follow-up turns
+        # ("now do that for last quarter") can resolve their back-reference
+        # against earlier intents. Shares the same PROTECTED_SUBDIRS
+        # guarantee as conv_logger — the model never reads this file.
+        import goal_cache as _gc
+        self.goal_cache = _gc.GoalCache(VAULT_DIR)
         try:
             self.conv_logger.start_session(self.session_id)
         except Exception as _e:
             print(f"[ConvLogger] start_session failed: {_e!r}")
+        try:
+            self.goal_cache.start_session(self.session_id)
+        except Exception as _e:
+            print(f"[GoalCache] start_session failed: {_e!r}")
         # Window-close handler so the log gets a clean session_end marker.
         self.protocol("WM_DELETE_WINDOW", self._on_app_close)
         # Periodic background flush so logs survive crashes mid-session.
@@ -4636,6 +4728,11 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         # 6) Manage data        → Vault
         # 7) Speech I/O         → Speech
         self._build_council_tab()
+        self._build_godot_workspace_tab()   # Anvil — phase C-lite, customer-facing
+        self._build_game_concepts_tab()     # Anvil — phase B,     customer-facing
+        self._build_pixel_art_tab()         # Anvil — pixel-art,   customer-facing
+        self._build_steam_market_tab()      # Anvil — phase D,     customer-facing
+        self._build_simulations_tab()       # Anvil — sim phase,   customer-facing
         self._build_dream3d_tab()
         self._build_grapher_tab()
         self._build_specialists_tab()
@@ -4673,6 +4770,11 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
                     self._build_video_tab()
                 except Exception as _exc:
                     print(f"[council_gui] video tab build failed: {_exc!r}")
+        # ── All Anvil game-dev tabs (Godot Workspace, Game Concepts,
+        # Steam Market, Simulations, Pixel Art) are in the customer-
+        # facing flow above (build_ui section before the advanced
+        # block). They're not gated behind COUNCIL_ADVANCED — they're
+        # what the Odysseus-council branch is for.
 
     # ---- Backend strip (model backend selector) ----
 
@@ -6960,6 +7062,73 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         r"^\s*run\s+(?:the\s+)?workflow\b", _re.IGNORECASE,
     )
 
+    # Sim-analyst intent triggers — recognise questions that should
+    # be answered from the recorded simulations cache rather than
+    # let the model guess. These mirror the patterns in
+    # sim_analyst._XXX_PATTERNS so a question that the analyst can
+    # handle gets routed to it.
+    _SIM_INTENT_RE = _re.compile(
+        r"\b(?:"
+        r"sim|sims|simulation|simulations|sweep|sweeps|"
+        r"(?:per|by|across|each)\s+persona|"
+        r"compare\s+persona|which\s+persona|best\s+persona|"
+        r"last\s+(?:sweep|sim|run|runs)|"
+        r"latest\s+(?:sweep|sim|run|runs)|"
+        r"what\s+(?:did|do)\s+(?:my|the)\s+(?:last|recent|latest)\s+(?:sim|sweep|run)|"
+        r"which\s+runs?\s+(?:failed|crashed|errored)|"
+        r"correlat|relationship\s+between|"
+        r"impact\s+of\s+\w+\s+on|effect\s+of\s+\w+\s+on|"
+        r"how\s+does\s+\w+\s+affect"
+        r")\b",
+        _re.IGNORECASE,
+    )
+
+    def _handle_sim_analyst_intent(self, user_text: str) -> bool:
+        """Detect questions answerable from sim_analyst's compute layer.
+
+        On match: run answer_question(), attach the result block to the
+        protected Council injection slot, and return True. The caller
+        (``_send``) intentionally does NOT return here — we want the
+        council to deliberate over the injected block, the same way
+        the Steam Market handoff works.
+
+        On no match (or any failure): return False so dispatch proceeds
+        without injecting anything.
+        """
+        if not user_text:
+            return False
+        if not self._SIM_INTENT_RE.search(user_text):
+            return False
+        try:
+            import sim_analyst as _sa
+            result = _sa.answer_question(user_text, VAULT_DIR)
+        except Exception as exc:
+            print(f"[sim_intent] analyst failed: {exc!r}")
+            return False
+        # Attach to the protected slot. The user can see the cited
+        # values + Clear them if they want; ``_send`` prepends the
+        # block to user_text at dispatch time.
+        try:
+            self._council_attach_injection(
+                label="🎲 Sim context (computed from vault/simulations, "
+                       "read-only)",
+                block=result.to_injection_block(),
+            )
+        except Exception as exc:
+            print(f"[sim_intent] attach failed: {exc!r}")
+            return False
+        # Surface the analyst answer in the transcript too so the
+        # user sees what was computed even before the council weighs
+        # in. Matches the Steam Market pattern.
+        try:
+            self._append_transcript(
+                "Sim Analyst", result.answer or "(no answer)",
+                "observation",
+            )
+        except Exception:
+            pass
+        return True
+
     def _handle_workflow_intent(self, user_text: str) -> bool:
         """Detect 'run workflow ...' commands and execute them in a worker."""
         if not user_text:
@@ -7117,6 +7286,37 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         # Bottom input area
         bottom = ttk.Frame(self.tab_council)
         bottom.pack(fill="x", padx=6, pady=(0, 6))
+
+        # Pending injection panel — structurally protected slot for
+        # analyst-computed context (e.g. Steam Market Analyst output).
+        # The user can SEE the attached block and CLEAR it, but cannot
+        # edit it. _send() prepends it to user_text at dispatch time.
+        # This closes the integrity gap where a user could accidentally
+        # strip citations from a pasted block in the editable input
+        # and trigger downstream hallucination on the cited values.
+        self._pending_injection: Optional[Dict[str, str]] = None
+        self._injection_panel = ttk.Frame(bottom)
+        self._injection_panel_header = ttk.Frame(self._injection_panel)
+        self._injection_panel_header.pack(fill="x")
+        self._injection_label_var = tk.StringVar(value="")
+        ttk.Label(self._injection_panel_header,
+                  textvariable=self._injection_label_var,
+                  foreground="#e0884a",
+                  font=("Segoe UI", 9, "bold")).pack(side="left")
+        ttk.Button(self._injection_panel_header, text="✕ Clear",
+                   command=self._council_clear_injection
+                   ).pack(side="right", padx=2)
+        # Read-only Text widget for the actual block contents
+        self._injection_view = tk.Text(
+            self._injection_panel,
+            wrap="word", height=5,
+            bg="#0a0808", fg="#a98a8a",
+            font=("Consolas", 9),
+            state="disabled",
+            relief="flat", borderwidth=1,
+        )
+        self._injection_view.pack(fill="x", pady=(2, 4))
+        # Panel starts hidden; _council_attach_injection() shows it.
 
         ttk.Label(bottom, text="Input").pack(anchor="w")
         self.input = self._make_text(bottom, wrap="word", height=4)
@@ -11563,6 +11763,3241 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         )
         self.apoth_console.pack(fill="both", expand=True)
 
+    # ---- Anvil game-dev tabs (phase A scaffold) ----
+    #
+    # These are stub tabs reserving the slot + import-time wiring for the
+    # phase B / C-lite / D / E features. Each shows a "phase X — coming
+    # soon" placeholder pane until the matching phase implements it.
+    #
+    # The pattern (matching _build_apoth_tab above): lazy import of the
+    # backing module, build a tk.Frame, attach a placeholder label,
+    # leave a structural TODO comment pointing at what lands next.
+
+    _COMING_SOON_BG = "#1a1414"
+    _COMING_SOON_FG = "#9a8a8a"
+
+    def _add_coming_soon_tab(self, attr: str, label: str,
+                              title: str, phase: str, description: str):
+        """Build a uniform "coming soon" placeholder Frame and add it as
+        a Notebook tab. Used by all phase-A stub tabs."""
+        frame = ttk.Frame(self.nb)
+        setattr(self, attr, frame)
+        self.nb.add(frame, text=label)
+        # Centered headline + small body. Nothing fancy — meant to be
+        # replaced by the real builder when the phase lands.
+        wrap = ttk.Frame(frame)
+        wrap.place(relx=0.5, rely=0.4, anchor="center")
+        ttk.Label(wrap, text=title,
+                  font=("Segoe UI", 16, "bold"),
+                  foreground=self._COMING_SOON_FG).pack(pady=(0, 6))
+        ttk.Label(wrap, text=f"{phase} — not yet implemented",
+                  foreground=self._COMING_SOON_FG).pack()
+        body = ttk.Label(wrap, text=description, justify="center",
+                         foreground=self._COMING_SOON_FG, wraplength=520)
+        body.pack(pady=(10, 0))
+
+    # ---- Godot Workspace tab (phase C-lite) ----
+
+    # Settings keys persisted in backend_settings.json:
+    #   godot_path:       absolute path to the Godot binary
+    #   godot_project:    last-opened project root (autoload on start)
+
+    _GODOT_KEYWORDS = {
+        # core control flow
+        "if", "elif", "else", "for", "while", "match", "break", "continue",
+        "pass", "return", "in", "as", "and", "or", "not", "is",
+        # declarations
+        "var", "const", "func", "class", "class_name", "extends", "static",
+        "signal", "enum", "preload", "onready",
+        # values
+        "true", "false", "null", "self", "super",
+    }
+
+    def _build_godot_workspace_tab(self):
+        """Godot Workspace — the IDE tab. File tree, GDScript editor,
+        Run/Validate buttons, console panel, stderr→console.
+
+        Layout (horizontal PanedWindow):
+
+            ┌─────────────┬──────────────────────────────────────┐
+            │  File tree  │  ┌── GDScript editor ──────────────┐ │
+            │             │  │                                  │ │
+            │             │  │                                  │ │
+            │             │  ├── Console (stdout + stderr) ────│ │
+            │             │  │                                  │ │
+            │             │  └──────────────────────────────────┘ │
+            └─────────────┴──────────────────────────────────────┘
+
+        Run button shells out to ``godot --path <project>``; stderr
+        is mirrored to both the console and the council so a crash
+        can become a deliberation trigger.
+        """
+        import godot_workspace as _gw
+        self.tab_godot_workspace = ttk.Frame(self.nb)
+        self.nb.add(self.tab_godot_workspace, text="🛠 Godot Workspace")
+
+        # Project state
+        self._gw_project = None              # godot_workspace.GodotProject
+        self._gw_open_file: Optional[Path] = None
+        self._gw_runner = None               # godot_workspace.GodotRunner
+        self._gw_dirty = False
+
+        # Top strip — project picker + Godot binary + Run / Validate / Stop
+        strip = ttk.Frame(self.tab_godot_workspace)
+        strip.pack(fill="x", padx=6, pady=(6, 4))
+        ttk.Button(strip, text="📂 Open project…",
+                   command=self._gw_open_project_dialog).pack(side="left")
+        self._gw_project_var = tk.StringVar(value="(no project open)")
+        ttk.Label(strip, textvariable=self._gw_project_var,
+                  foreground="#a98a8a").pack(side="left", padx=(8, 0))
+
+        # Right end of the strip: Run / Validate / Stop + AI buttons + binary picker
+        right = ttk.Frame(strip)
+        right.pack(side="right")
+        self._gw_run_btn = ttk.Button(right, text="▶ Run",
+                                       command=self._gw_run, state="disabled")
+        self._gw_run_btn.pack(side="left", padx=2)
+        self._gw_validate_btn = ttk.Button(right, text="✓ Validate",
+                                            command=self._gw_validate,
+                                            state="disabled")
+        self._gw_validate_btn.pack(side="left", padx=2)
+        self._gw_stop_btn = ttk.Button(right, text="■ Stop",
+                                        command=self._gw_stop, state="disabled")
+        self._gw_stop_btn.pack(side="left", padx=2)
+        # AI controls
+        self._gw_coder_btn = ttk.Button(right, text="🤖 Ask Coder",
+                                         command=self._gw_ask_coder_dialog,
+                                         state="disabled")
+        self._gw_coder_btn.pack(side="left", padx=(8, 2))
+        self._gw_scene_tree_btn = ttk.Button(right, text="🌳 Scene tree",
+                                              command=self._gw_show_scene_tree,
+                                              state="disabled")
+        self._gw_scene_tree_btn.pack(side="left", padx=2)
+        ttk.Button(right, text="⚙ Godot binary…",
+                   command=self._gw_pick_godot_binary).pack(side="left", padx=(8, 2))
+        ttk.Button(right, text="📄 Build from GDD",
+                   command=self._gw_open_gdd_dialog
+                   ).pack(side="left", padx=(8, 2))
+
+        # Body — horizontal PanedWindow
+        body = tk.PanedWindow(self.tab_godot_workspace, orient="horizontal",
+                              bg="#1a1414", sashwidth=6)
+        body.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # Left — file tree
+        left = ttk.Frame(body)
+        body.add(left, width=260, minsize=180)
+        ttk.Label(left, text="Project files").pack(anchor="w", padx=2, pady=(0, 2))
+        tree_row = ttk.Frame(left)
+        tree_row.pack(fill="both", expand=True)
+        self._gw_tree = ttk.Treeview(tree_row, show="tree", selectmode="browse")
+        tsb = ttk.Scrollbar(tree_row, orient="vertical",
+                             command=self._gw_tree.yview)
+        self._gw_tree.configure(yscrollcommand=tsb.set)
+        self._gw_tree.pack(side="left", fill="both", expand=True)
+        tsb.pack(side="right", fill="y")
+        self._gw_tree.bind("<<TreeviewSelect>>", self._gw_on_tree_select)
+        # Right-click → context menu (cross-platform: Button-3 on win/linux,
+        # Button-2 on mac trackpads)
+        self._gw_tree.bind("<Button-3>", self._gw_on_tree_rightclick)
+        self._gw_tree.bind("<Button-2>", self._gw_on_tree_rightclick)
+
+        # Right — vertical split: editor on top, console below
+        right_pane = tk.PanedWindow(body, orient="vertical",
+                                     bg="#1a1414", sashwidth=6)
+        body.add(right_pane, minsize=320)
+
+        # Editor pane
+        ed_frame = ttk.Frame(right_pane)
+        right_pane.add(ed_frame, minsize=200)
+        ed_strip = ttk.Frame(ed_frame)
+        ed_strip.pack(fill="x")
+        self._gw_open_file_var = tk.StringVar(value="(no file open)")
+        ttk.Label(ed_strip, textvariable=self._gw_open_file_var,
+                  foreground="#a98a8a").pack(side="left")
+        self._gw_save_btn = ttk.Button(ed_strip, text="💾 Save",
+                                        command=self._gw_save,
+                                        state="disabled")
+        self._gw_save_btn.pack(side="right", padx=2)
+
+        ed_row = ttk.Frame(ed_frame)
+        ed_row.pack(fill="both", expand=True)
+        self._gw_editor = tk.Text(
+            ed_row, wrap="none", undo=True,
+            bg="#0f0c0c", fg="#d4d4d4",
+            insertbackground="#d4d4d4",
+            font=("Consolas", 10),
+        )
+        esb_y = ttk.Scrollbar(ed_row, orient="vertical",
+                               command=self._gw_editor.yview)
+        esb_x = ttk.Scrollbar(ed_frame, orient="horizontal",
+                               command=self._gw_editor.xview)
+        self._gw_editor.configure(yscrollcommand=esb_y.set,
+                                   xscrollcommand=esb_x.set)
+        self._gw_editor.pack(side="left", fill="both", expand=True)
+        esb_y.pack(side="right", fill="y")
+        esb_x.pack(side="bottom", fill="x")
+
+        # Highlight tags
+        self._gw_editor.tag_configure("kw",      foreground="#e0884a")
+        self._gw_editor.tag_configure("string",  foreground="#7ea16d")
+        self._gw_editor.tag_configure("comment", foreground="#7a7575")
+        self._gw_editor.tag_configure("number",  foreground="#a98a8a")
+        self._gw_editor.tag_configure("decorator", foreground="#d32f2f")
+
+        # Editor bindings — re-highlight + dirty flag on edits, Ctrl+S to save
+        self._gw_editor.bind("<<Modified>>", self._gw_on_modified)
+        self._gw_editor.bind("<Control-s>",
+                              lambda e: (self._gw_save(), "break"))
+
+        # Console pane
+        con_frame = ttk.Frame(right_pane)
+        right_pane.add(con_frame, minsize=120)
+        con_strip = ttk.Frame(con_frame)
+        con_strip.pack(fill="x")
+        ttk.Label(con_strip, text="Console (Godot stdout + stderr)",
+                  foreground="#a98a8a").pack(side="left")
+        ttk.Button(con_strip, text="Clear",
+                   command=self._gw_console_clear).pack(side="right")
+        ttk.Button(con_strip, text="→ Send errors to Council",
+                   command=self._gw_send_errors_to_council).pack(side="right",
+                                                                  padx=4)
+        self._gw_console = tk.Text(
+            con_frame, wrap="word",
+            bg="#0a0808", fg="#d4d4d4",
+            insertbackground="#d4d4d4",
+            font=("Consolas", 9),
+            state="disabled",
+        )
+        self._gw_console.pack(fill="both", expand=True)
+        self._gw_console.tag_configure("stderr", foreground="#ff5252")
+        self._gw_console.tag_configure("info",   foreground="#a98a8a")
+
+        # Buffer of stderr lines from the current run, so "Send errors
+        # to Council" can package them up after the run completes.
+        self._gw_stderr_buffer: List[str] = []
+
+        # Try auto-loading the last project
+        self._gw_load_last_project()
+
+    # ── Persistence ─────────────────────────────────────────────────
+
+    def _gw_load_settings(self) -> Dict[str, Any]:
+        p = self._backend_settings_path()
+        if not p.exists():
+            return {}
+        try:
+            import json as _j
+            return _j.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+
+    def _gw_save_settings_kv(self, **kv) -> None:
+        """Merge ``kv`` into backend_settings.json (preserving other keys)."""
+        import json as _j
+        data = self._gw_load_settings()
+        data.update(kv)
+        try:
+            self._backend_settings_path().write_text(
+                _j.dumps(data, indent=2), encoding="utf-8",
+            )
+        except Exception as _e:
+            print(f"[Godot Workspace] could not save settings: {_e}")
+
+    def _gw_load_last_project(self) -> None:
+        data = self._gw_load_settings()
+        # Restore Godot binary
+        path = data.get("godot_path", "")
+        if not path:
+            # Try detection on first run
+            import godot_workspace as _gw
+            detected = _gw.detect_godot_binary()
+            if detected:
+                path = detected
+                self._gw_save_settings_kv(godot_path=detected)
+        if path:
+            os.environ["ANVIL_GODOT_BINARY"] = path
+        # Restore last project
+        last = data.get("godot_project", "")
+        if last and Path(last).exists():
+            self._gw_open_project(Path(last))
+
+    def _gw_pick_godot_binary(self) -> None:
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Pick the Godot executable",
+            filetypes=[("Executables", "*.exe"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        os.environ["ANVIL_GODOT_BINARY"] = path
+        self._gw_save_settings_kv(godot_path=path)
+        self._gw_console_write("info",
+            f"[Anvil] Godot binary set: {path}")
+
+    # ── Project handling ────────────────────────────────────────────
+
+    def _gw_open_project_dialog(self) -> None:
+        from tkinter import filedialog, messagebox
+        path = filedialog.askdirectory(
+            title="Pick a folder containing project.godot",
+        )
+        if not path:
+            return
+        p = Path(path)
+        if not (p / "project.godot").exists():
+            messagebox.showerror(
+                "Not a Godot project",
+                f"{p}\ndoes not contain a project.godot manifest.",
+                parent=self,
+            )
+            return
+        self._gw_open_project(p)
+        self._gw_save_settings_kv(godot_project=str(p))
+
+    def _gw_open_project(self, path: Path) -> None:
+        import godot_workspace as _gw
+        project = _gw.open_project(path)
+        if project is None:
+            return
+        self._gw_project = project
+        self._gw_project_var.set(
+            f"{project.name}  ({project.root})"
+        )
+        self._gw_run_btn.configure(state="normal")
+        self._gw_validate_btn.configure(state="normal")
+        self._gw_coder_btn.configure(state="normal")
+        self._gw_populate_tree()
+        self._gw_console_write("info",
+            f"[Anvil] Opened project: {project.name} "
+            f"({len(project.scripts)} script(s), "
+            f"{len(project.scenes)} scene(s))")
+
+    def _gw_populate_tree(self) -> None:
+        self._gw_tree.delete(*self._gw_tree.get_children())
+        if self._gw_project is None:
+            return
+        # Group: Scenes / Scripts / Other
+        sc_id = self._gw_tree.insert("", "end", text="Scenes (.tscn)", open=True)
+        for p in self._gw_project.scenes:
+            self._gw_tree.insert(
+                sc_id, "end",
+                text=self._gw_project.relpath(p),
+                values=(str(p),),
+            )
+        gd_id = self._gw_tree.insert("", "end", text="Scripts (.gd)", open=True)
+        for p in self._gw_project.scripts:
+            self._gw_tree.insert(
+                gd_id, "end",
+                text=self._gw_project.relpath(p),
+                values=(str(p),),
+            )
+        ot_id = self._gw_tree.insert("", "end", text="Other", open=False)
+        for p in self._gw_project.other_files:
+            self._gw_tree.insert(
+                ot_id, "end",
+                text=self._gw_project.relpath(p),
+                values=(str(p),),
+            )
+
+    def _gw_on_tree_select(self, _event=None) -> None:
+        sel = self._gw_tree.selection()
+        if not sel:
+            return
+        vals = self._gw_tree.item(sel[0], "values")
+        if not vals:
+            return
+        path = Path(vals[0])
+        if not path.is_file():
+            return
+        self._gw_open_file_in_editor(path)
+
+    def _gw_open_file_in_editor(self, path: Path) -> None:
+        from tkinter import messagebox
+        if self._gw_dirty:
+            res = messagebox.askyesnocancel(
+                "Unsaved changes",
+                f"Save changes to {self._gw_open_file.name}?" if self._gw_open_file
+                else "Save changes?",
+                parent=self,
+            )
+            if res is None:
+                return
+            if res:
+                self._gw_save()
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            self._gw_console_write("stderr",
+                f"[Anvil] could not open {path}: {exc!r}")
+            return
+        self._gw_editor.delete("1.0", "end")
+        self._gw_editor.insert("1.0", text)
+        self._gw_open_file = path
+        self._gw_open_file_var.set(
+            self._gw_project.relpath(path) if self._gw_project else str(path)
+        )
+        self._gw_dirty = False
+        self._gw_save_btn.configure(state="disabled")
+        # Re-highlight GDScript and reset modified flag
+        self._gw_highlight()
+        self._gw_editor.edit_modified(False)
+        # Scene tree button is only meaningful when a .tscn is open
+        self._gw_scene_tree_btn.configure(
+            state="normal" if path.suffix.lower() == ".tscn" else "disabled"
+        )
+
+    def _gw_on_modified(self, _event=None) -> None:
+        # The <<Modified>> event fires once until edit_modified(False);
+        # we use it as a dirty flag AND a trigger for re-highlighting.
+        if not self._gw_editor.edit_modified():
+            return
+        self._gw_dirty = True
+        self._gw_save_btn.configure(state="normal")
+        self._gw_highlight()
+        self._gw_editor.edit_modified(False)
+
+    def _gw_save(self) -> None:
+        if not self._gw_open_file or not self._gw_dirty:
+            return
+        text = self._gw_editor.get("1.0", "end-1c")
+        try:
+            self._gw_open_file.write_text(text, encoding="utf-8")
+        except Exception as exc:
+            self._gw_console_write("stderr",
+                f"[Anvil] save failed: {exc!r}")
+            return
+        self._gw_dirty = False
+        self._gw_save_btn.configure(state="disabled")
+        self._gw_console_write("info",
+            f"[Anvil] saved {self._gw_project.relpath(self._gw_open_file)}")
+
+    # ── Syntax highlight ────────────────────────────────────────────
+
+    def _gw_highlight(self) -> None:
+        """Crude GDScript syntax colouring — keywords, strings, comments,
+        numbers, decorators. Recomputed on every modification."""
+        # Only highlight .gd files; .tscn / json get plain text
+        if self._gw_open_file is None or self._gw_open_file.suffix.lower() != ".gd":
+            return
+        ed = self._gw_editor
+        # Clear all tags except the cursor / sel
+        for tag in ("kw", "string", "comment", "number", "decorator"):
+            ed.tag_remove(tag, "1.0", "end")
+        text = ed.get("1.0", "end-1c")
+        # Strings: "..." or '...'
+        for m in _re.finditer(r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'", text):
+            self._gw_tag_range(m.start(), m.end(), "string")
+        # Comments: # ... EOL  (do not colour inside strings — we already
+        # tagged strings above; tag overlaps just take the last wins, but
+        # comments after a quoted hash are rare enough not to matter)
+        for m in _re.finditer(r"#[^\n]*", text):
+            self._gw_tag_range(m.start(), m.end(), "comment")
+        # Numbers
+        for m in _re.finditer(r"\b\d+(?:\.\d+)?\b", text):
+            self._gw_tag_range(m.start(), m.end(), "number")
+        # Decorators: @export, @onready, @tool, etc.
+        for m in _re.finditer(r"@[A-Za-z_][A-Za-z0-9_]*", text):
+            self._gw_tag_range(m.start(), m.end(), "decorator")
+        # Keywords
+        for m in _re.finditer(r"\b[A-Za-z_][A-Za-z0-9_]*\b", text):
+            if m.group(0) in self._GODOT_KEYWORDS:
+                self._gw_tag_range(m.start(), m.end(), "kw")
+
+    def _gw_tag_range(self, start_offset: int, end_offset: int, tag: str) -> None:
+        """Tag a substring of the editor by character offsets."""
+        self._gw_editor.tag_add(
+            tag,
+            f"1.0 + {start_offset}c",
+            f"1.0 + {end_offset}c",
+        )
+
+    # ── Run / Validate / Stop ───────────────────────────────────────
+
+    def _gw_ensure_runner(self) -> None:
+        import godot_workspace as _gw
+        if self._gw_runner is None:
+            self._gw_runner = _gw.GodotRunner(
+                on_line=self._gw_runner_line,
+                on_exit=self._gw_runner_exit,
+            )
+
+    def _gw_run(self) -> None:
+        if self._gw_project is None:
+            return
+        if self._gw_dirty:
+            self._gw_save()
+        self._gw_ensure_runner()
+        if self._gw_runner.is_running():
+            self._gw_console_write("info",
+                "[Anvil] Godot is already running — Stop first.")
+            return
+        self._gw_stderr_buffer = []
+        self._gw_console_write("info",
+            f"[Anvil] ▶ Running {self._gw_project.name}…")
+        self._gw_run_btn.configure(state="disabled")
+        self._gw_validate_btn.configure(state="disabled")
+        self._gw_stop_btn.configure(state="normal")
+        try:
+            self._gw_runner.run(self._gw_project)
+        except RuntimeError as exc:
+            self._gw_console_write("stderr", f"[Anvil] {exc}")
+            self._gw_runner_exit(-1)
+
+    def _gw_validate(self) -> None:
+        if self._gw_project is None:
+            return
+        if self._gw_dirty:
+            self._gw_save()
+        # First, the in-process static pass — fast, surfaces broken refs
+        import godot_pipeline as _gp
+        try:
+            issues = _gp.static_validate_project(self._gw_project.root)
+        except Exception as exc:
+            issues = []
+            self._gw_console_write("stderr",
+                f"[Anvil] static_validate crashed: {exc!r}")
+        if not issues:
+            self._gw_console_write("info",
+                "[Anvil] static pass clean — running godot --check-only…")
+        else:
+            self._gw_console_write("info",
+                f"[Anvil] static pass found {len(issues)} issue(s):")
+            for i in issues[:30]:
+                sev = i.severity.upper()
+                self._gw_console_write(
+                    "stderr" if i.severity == "error" else "info",
+                    f"  [{sev}] {i.file}: {i.message}",
+                )
+            if len(issues) > 30:
+                self._gw_console_write("info",
+                    f"  … plus {len(issues) - 30} more.")
+
+        # Then the authoritative pass via Godot itself
+        self._gw_ensure_runner()
+        if self._gw_runner.is_running():
+            self._gw_console_write("info",
+                "[Anvil] another Godot process is running — skipping check-only.")
+            return
+        self._gw_run_btn.configure(state="disabled")
+        self._gw_validate_btn.configure(state="disabled")
+        self._gw_stop_btn.configure(state="normal")
+        self._gw_stderr_buffer = []
+        try:
+            self._gw_runner.validate(self._gw_project)
+        except RuntimeError as exc:
+            self._gw_console_write("stderr", f"[Anvil] {exc}")
+            self._gw_runner_exit(-1)
+
+    def _gw_stop(self) -> None:
+        if self._gw_runner is None:
+            return
+        self._gw_runner.stop()
+
+    def _gw_runner_line(self, stream: str, text: str) -> None:
+        # Callbacks fire on the runner's drainer threads — marshal back
+        # to the GUI thread via after() so tk widget access is safe.
+        self.after(0, lambda: self._gw_console_write(stream, text))
+        if stream == "stderr":
+            self._gw_stderr_buffer.append(text)
+
+    def _gw_runner_exit(self, rc: int) -> None:
+        def _on_main():
+            self._gw_run_btn.configure(state="normal")
+            self._gw_validate_btn.configure(state="normal")
+            self._gw_stop_btn.configure(state="disabled")
+            self._gw_console_write("info",
+                f"[Anvil] Godot exited (rc={rc})")
+        self.after(0, _on_main)
+
+    # ── Console helpers ─────────────────────────────────────────────
+
+    def _gw_console_write(self, tag: str, text: str) -> None:
+        c = self._gw_console
+        c.configure(state="normal")
+        c.insert("end", text + "\n", (tag,) if tag in ("stderr", "info") else ())
+        c.see("end")
+        c.configure(state="disabled")
+
+    def _gw_console_clear(self) -> None:
+        c = self._gw_console
+        c.configure(state="normal")
+        c.delete("1.0", "end")
+        c.configure(state="disabled")
+        self._gw_stderr_buffer = []
+
+    # ── Right-click menu on the file tree ──────────────────────────
+
+    def _gw_on_tree_rightclick(self, event) -> None:
+        """Pop a context menu over the tree item under the click."""
+        iid = self._gw_tree.identify_row(event.y)
+        if not iid:
+            return
+        self._gw_tree.selection_set(iid)
+        vals = self._gw_tree.item(iid, "values")
+        if not vals:
+            return
+        path = Path(vals[0])
+        if not path.is_file():
+            return
+        # Build the menu fresh each time so disabled-state reflects file kind
+        menu = tk.Menu(self.tab_godot_workspace, tearoff=0,
+                       bg="#231a1a", fg="#d4d4d4",
+                       activebackground="#4a2626",
+                       activeforeground="#d4d4d4")
+        menu.add_command(label="📖 Open in editor",
+                         command=lambda: self._gw_open_file_in_editor(path))
+        menu.add_separator()
+        menu.add_command(label="⚖ Ask Council about this",
+                         command=lambda: self._gw_ask_council_about_file(path))
+        if path.suffix.lower() == ".gd":
+            menu.add_command(label="🤖 Ask Coder to edit this",
+                             command=lambda: self._gw_ask_coder_dialog(
+                                 prefilled_target=path))
+        if path.suffix.lower() == ".tscn":
+            menu.add_command(label="🌳 View scene tree",
+                             command=lambda: self._gw_show_scene_tree(
+                                 force_path=path))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _gw_ask_council_about_file(self, path: Path) -> None:
+        """Stage a prompt asking the Council to explain / critique a file."""
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception as exc:
+            self._gw_console_write("stderr",
+                f"[Anvil] could not read {path}: {exc!r}")
+            return
+        # Cap the file body so we don't blow context — the goal anchor
+        # will keep the council on track even if the body is short.
+        max_chars = 6000
+        if len(text) > max_chars:
+            text = text[:max_chars] + f"\n\n# … (truncated {len(text) - max_chars} chars)"
+        rel = self._gw_project.relpath(path) if self._gw_project else str(path)
+        body = (
+            f"Explain what this file does and flag anything worth "
+            f"changing for clarity, correctness, or performance.\n\n"
+            f"FILE: {rel}\n"
+            f"```\n{text}\n```"
+        )
+        try:
+            inp = getattr(self, "input", None)
+            if inp is not None:
+                inp.delete("1.0", "end")
+                inp.insert("1.0", body)
+            if hasattr(self, "tab_council"):
+                self.nb.select(self.tab_council)
+            self._gw_console_write("info",
+                f"[Anvil] Staged Council prompt about {rel}.")
+        except Exception as exc:
+            self._gw_console_write("stderr",
+                f"[Anvil] stage to council failed: {exc!r}")
+
+    # ── 🌳 Scene tree popup ─────────────────────────────────────────
+
+    def _gw_show_scene_tree(self, force_path: Optional[Path] = None) -> None:
+        """Pop a small window with the parsed scene tree of the open
+        ``.tscn``. ``force_path`` overrides the open-in-editor file
+        (used by the right-click menu)."""
+        from tkinter import messagebox
+        path = force_path or self._gw_open_file
+        if path is None or path.suffix.lower() != ".tscn":
+            messagebox.showinfo(
+                "Open a scene first",
+                "Pick a .tscn file in the file tree, then click 🌳 Scene tree.",
+                parent=self,
+            )
+            return
+        import godot_pipeline as _gp
+        parsed = _gp.parse_scene(path)
+        if parsed.root is None:
+            messagebox.showwarning(
+                "Could not parse scene",
+                "\n".join(parsed.issues) or
+                "parse_scene returned no root node.",
+                parent=self,
+            )
+            return
+        win = tk.Toplevel(self)
+        win.title(f"Scene tree — {self._gw_project.relpath(path) if self._gw_project else path.name}")
+        win.configure(bg="#1a1414")
+        win.geometry("520x520")
+        tv = ttk.Treeview(win, show="tree")
+        tv.pack(side="left", fill="both", expand=True, padx=(6, 0), pady=6)
+        sb = ttk.Scrollbar(win, orient="vertical", command=tv.yview)
+        sb.pack(side="right", fill="y", pady=6)
+        tv.configure(yscrollcommand=sb.set)
+
+        # Build the tree recursively
+        def _insert(parent_iid, node):
+            label = f"{node.name} ({node.type or '?'})"
+            if node.script_id:
+                label += "  ← script"
+            iid = tv.insert(parent_iid, "end", text=label, open=True)
+            for child in node.children:
+                _insert(iid, child)
+        _insert("", parsed.root)
+
+        # Bottom row: ext_resources + issues
+        if parsed.ext_resources or parsed.issues:
+            ftr = tk.Frame(win, bg="#1a1414")
+            ftr.pack(side="bottom", fill="x", padx=6, pady=(0, 6))
+            txt = tk.Text(ftr, height=6, bg="#0f0c0c", fg="#a98a8a",
+                          font=("Consolas", 9))
+            txt.pack(fill="x")
+            if parsed.ext_resources:
+                txt.insert("end", "ext_resources:\n")
+                for (rid, rtype, rpath) in parsed.ext_resources:
+                    txt.insert("end", f"  {rid:>10}  {rtype:>10}  {rpath}\n")
+            if parsed.issues:
+                txt.insert("end", "\nissues:\n")
+                for i in parsed.issues:
+                    txt.insert("end", f"  - {i}\n")
+            txt.configure(state="disabled")
+
+    # ── 🤖 Ask Coder dialog ────────────────────────────────────────
+
+    def _gw_ask_coder_dialog(self, prefilled_target: Optional[Path] = None) -> None:
+        """Modal prompt: ask the Godot Coder to write/edit a .gd file.
+
+        Caller supplies an optional ``prefilled_target`` (e.g. the
+        file the user right-clicked). Otherwise defaults to the file
+        currently open in the editor, falling back to ``main.gd`` in
+        the project root.
+        """
+        from tkinter import messagebox
+        if self._gw_project is None:
+            messagebox.showinfo(
+                "Open a project first",
+                "Open a Godot project before asking the Coder.",
+                parent=self,
+            )
+            return
+
+        default_target = (
+            prefilled_target
+            or self._gw_open_file
+            or (self._gw_project.root / "main.gd")
+        )
+
+        win = tk.Toplevel(self)
+        win.title("🤖 Ask the Godot Coder")
+        win.configure(bg="#1a1414")
+        win.geometry("640x440")
+        win.transient(self)
+
+        ttk.Label(win, text="What should the Coder make? (one or two sentences)",
+                  foreground="#d4d4d4").pack(anchor="w", padx=8, pady=(8, 2))
+        task_box = tk.Text(win, height=6, wrap="word",
+                           bg="#0f0c0c", fg="#d4d4d4",
+                           insertbackground="#d4d4d4",
+                           font=("Segoe UI", 10))
+        task_box.pack(fill="x", padx=8)
+
+        # Target path row
+        path_row = ttk.Frame(win)
+        path_row.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Label(path_row, text="Write to (path in project):",
+                  foreground="#d4d4d4").pack(side="left")
+        target_var = tk.StringVar(
+            value=str(default_target.relative_to(self._gw_project.root))
+                  if default_target.is_relative_to(self._gw_project.root)
+                  else str(default_target)
+        )
+        ttk.Entry(path_row, textvariable=target_var).pack(
+            side="left", fill="x", expand=True, padx=(6, 0))
+
+        # Status / log
+        ttk.Label(win, text="Status:", foreground="#d4d4d4").pack(
+            anchor="w", padx=8, pady=(8, 2))
+        log = tk.Text(win, height=10, wrap="word",
+                      bg="#0a0808", fg="#a98a8a",
+                      font=("Consolas", 9),
+                      state="disabled")
+        log.pack(fill="both", expand=True, padx=8)
+
+        def _log(phase, msg):
+            log.configure(state="normal")
+            log.insert("end", f"[{phase}] {msg}\n")
+            log.see("end")
+            log.configure(state="disabled")
+
+        btn_row = ttk.Frame(win)
+        btn_row.pack(fill="x", padx=8, pady=8)
+        run_btn = ttk.Button(btn_row, text="✨ Run Coder")
+        run_btn.pack(side="left")
+        ttk.Button(btn_row, text="Close",
+                   command=win.destroy).pack(side="right")
+
+        # Disable the writer model while we own it — single-flight
+        running = {"flag": False}
+
+        def _go():
+            if running["flag"]:
+                return
+            task = task_box.get("1.0", "end-1c").strip()
+            if not task:
+                _log("error", "Enter a task description first.")
+                return
+            rel = target_var.get().strip()
+            if not rel:
+                _log("error", "Enter a target file path.")
+                return
+            target_abs = (self._gw_project.root / rel).resolve()
+            try:
+                target_abs.relative_to(self._gw_project.root)
+            except ValueError:
+                _log("error", f"Target {target_abs} escapes the project root.")
+                return
+            if target_abs.exists():
+                from tkinter import messagebox
+                if not messagebox.askyesno(
+                    "Overwrite?",
+                    f"{rel} already exists. Overwrite? "
+                    f"(original will be restored if the Coder fails.)",
+                    parent=win,
+                ):
+                    return
+            running["flag"] = True
+            run_btn.configure(state="disabled", text="… working")
+
+            def _worker():
+                import godot_coder as _gc
+                import goal_anchor as _ga
+                try:
+                    goal = _ga.distill_goal(task, model=getattr(self, "judge", None))
+                except Exception:
+                    goal = task[:160]
+                agent = _gc.GodotCoder(
+                    self.writer,
+                    self._gw_project.root,
+                    godot_binary=_gw_get_binary(),
+                    max_attempts=4,
+                    event_callback=lambda phase, msg: self.after(0,
+                        lambda: _log(phase, msg)),
+                )
+                state = agent.run(task, target_abs, goal=goal)
+
+                def _refresh_editor_and_tree():
+                    """Reload open file + repopulate tree. Used by both
+                    the Apply path (new content shown) and the Reject
+                    path (restored content shown)."""
+                    if (self._gw_open_file is not None
+                            and self._gw_open_file == target_abs
+                            and target_abs.exists()):
+                        try:
+                            text = target_abs.read_text(encoding="utf-8")
+                            self._gw_editor.delete("1.0", "end")
+                            self._gw_editor.insert("1.0", text)
+                            self._gw_dirty = False
+                            self._gw_save_btn.configure(state="disabled")
+                            self._gw_highlight()
+                            self._gw_editor.edit_modified(False)
+                        except Exception:
+                            pass
+                    elif (self._gw_open_file is not None
+                            and self._gw_open_file == target_abs
+                            and not target_abs.exists()):
+                        # File was rejected as new — clear the editor
+                        try:
+                            self._gw_editor.delete("1.0", "end")
+                            self._gw_open_file = None
+                            self._gw_open_file_var.set("(no file open)")
+                            self._gw_dirty = False
+                            self._gw_save_btn.configure(state="disabled")
+                        except Exception:
+                            pass
+                    # Always refresh the tree — a new file may have
+                    # appeared (Apply) or disappeared (Reject on new).
+                    try:
+                        import godot_workspace as _gw
+                        self._gw_project = _gw.open_project(self._gw_project.root)
+                        self._gw_populate_tree()
+                    except Exception:
+                        pass
+
+                def _done():
+                    running["flag"] = False
+                    run_btn.configure(
+                        state="normal",
+                        text=("✓ Done" if state.passed else "✨ Run Coder"),
+                    )
+                    if state.passed:
+                        _log("done",
+                             f"Wrote {rel}. Review the diff before "
+                             f"keeping the change.")
+                        # Pop a diff review dialog before applying.
+                        # The file is already on disk; Apply is a no-op,
+                        # Reject restores the original (or deletes if
+                        # this was a new file).
+                        import diff_view as _dv
+                        is_new = state.backup is None
+                        try:
+                            original_text = (state.backup.decode("utf-8")
+                                              if state.backup else "")
+                        except Exception:
+                            original_text = ""
+
+                        def _on_apply():
+                            _log("apply",
+                                 "Kept the Coder's change.")
+                            _refresh_editor_and_tree()
+
+                        def _on_reject():
+                            # New file → silent delete. Existing file →
+                            # atomic restore from backup bytes.
+                            try:
+                                if is_new and target_abs.exists():
+                                    target_abs.unlink()
+                                elif state.backup is not None:
+                                    import godot_coder as _gc_mod
+                                    _gc_mod.GodotCoder._atomic_restore(
+                                        target_abs, state.backup,
+                                    )
+                            except Exception as exc:
+                                _log("reject",
+                                     f"revert failed: {exc!r}")
+                                return
+                            _log("reject",
+                                 "Reverted — "
+                                 + ("new file deleted." if is_new
+                                    else "original restored."))
+                            _refresh_editor_and_tree()
+
+                        try:
+                            _dv.show_diff_dialog(
+                                win,
+                                file_path=target_abs,
+                                original_text=original_text,
+                                proposed_text=state.final_code,
+                                on_apply=_on_apply,
+                                on_reject=_on_reject,
+                                is_new_file=is_new,
+                            )
+                        except Exception as exc:
+                            # If the diff dialog fails to open for any
+                            # reason, fall back to the old behavior so
+                            # the user isn't stuck with no path forward.
+                            _log("diff",
+                                 f"diff view failed ({exc!r}); applying "
+                                 f"directly.")
+                            _refresh_editor_and_tree()
+                    else:
+                        _log("done",
+                             "Coder gave up after "
+                             f"{state.attempt} attempts. "
+                             "Original file restored.")
+                self.after(0, _done)
+
+            threading.Thread(target=_worker, daemon=True,
+                              name="godot-coder").start()
+
+        # Need access to the binary lookup helper from the worker thread
+        def _gw_get_binary():
+            import godot_workspace as _gw
+            return _gw.get_godot_binary()
+
+        run_btn.configure(command=_go)
+
+    # ---- GDD plan viewer + Build from GDD ----
+    #
+    # State: self._gw_gdd_dialog (Toplevel), self._gw_gdd_text (Text
+    # widget the user pastes the markdown into), self._gw_gdd_plan
+    # (cached Plan after Parse for the Build click).
+
+    def _gw_open_gdd_dialog(self) -> None:
+        """Pop the GDD intake dialog. Lets the user paste markdown,
+        click Parse to see the structured plan, then click Build to
+        kick off the orchestrator (Phase 3)."""
+        from tkinter import messagebox
+        if self._gw_project is None:
+            messagebox.showinfo(
+                "Open a project first",
+                "The GDD builder writes scenes + scripts into the "
+                "current Godot project. Open or scaffold one in the "
+                "🛠 Workspace before opening a GDD.",
+                parent=self,
+            )
+            return
+        if getattr(self, "_gw_gdd_dialog", None) is not None:
+            try:
+                self._gw_gdd_dialog.lift()
+                return
+            except Exception:
+                self._gw_gdd_dialog = None
+
+        win = tk.Toplevel(self)
+        self._gw_gdd_dialog = win
+        win.title("📄 Build from GDD")
+        win.configure(bg="#1a1414")
+        win.geometry("900x680")
+        win.transient(self.winfo_toplevel())
+        def _on_close():
+            self._gw_gdd_dialog = None
+            try: win.destroy()
+            except Exception: pass
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+
+        # Top strip
+        hdr = ttk.Frame(win)
+        hdr.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(hdr, text="Paste a markdown GDD below or load a .md file.",
+                  foreground="#a98a8a").pack(side="left")
+        ttk.Button(hdr, text="📥 Load .md…",
+                   command=self._gw_gdd_load).pack(side="right", padx=2)
+        ttk.Button(hdr, text="🔎 Parse + plan",
+                   command=self._gw_gdd_parse_and_plan
+                   ).pack(side="right", padx=2)
+        ttk.Button(hdr, text="🛠 Build into project",
+                   command=self._gw_gdd_build
+                   ).pack(side="right", padx=2)
+
+        # Body — vertical split: input on top, plan view below
+        body = tk.PanedWindow(win, orient="vertical",
+                               bg="#1a1414", sashwidth=6)
+        body.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+
+        # GDD markdown editor
+        in_frame = ttk.Frame(body)
+        body.add(in_frame, minsize=140)
+        ttk.Label(in_frame, text="GDD (markdown)",
+                  foreground="#a98a8a").pack(anchor="w")
+        in_row = ttk.Frame(in_frame)
+        in_row.pack(fill="both", expand=True)
+        self._gw_gdd_text = tk.Text(
+            in_row, wrap="word",
+            bg="#0f0c0c", fg="#d4d4d4",
+            insertbackground="#d4d4d4",
+            font=("Consolas", 10), undo=True,
+        )
+        in_sb = ttk.Scrollbar(in_row, orient="vertical",
+                               command=self._gw_gdd_text.yview)
+        self._gw_gdd_text.configure(yscrollcommand=in_sb.set)
+        self._gw_gdd_text.pack(side="left", fill="both", expand=True)
+        in_sb.pack(side="right", fill="y")
+        # Seed with a minimal template
+        self._gw_gdd_text.insert("1.0",
+            "# My Game\n\n"
+            "**Genre:** Top-down Shooter\n"
+            "**Hook:** One-line elevator pitch.\n\n"
+            "## Mechanics\n"
+            "- Move and shoot\n"
+            "- Collect ore\n\n"
+            "## Entities\n"
+            "- **Player** -- the protagonist\n"
+            "- **Drone** -- patrols and shoots\n"
+            "- **Ore Pile** -- pickup item\n\n"
+            "## Scenes\n"
+            "- Main\n\n"
+            "## Win Condition\n"
+            "Collect 10 ore.\n\n"
+            "## Lose Condition\n"
+            "Player HP zero.\n"
+        )
+
+        # Plan view
+        plan_frame = ttk.Frame(body)
+        body.add(plan_frame, minsize=200)
+        ttk.Label(plan_frame, text="Parsed plan",
+                  foreground="#a98a8a").pack(anchor="w")
+        plan_row = ttk.Frame(plan_frame)
+        plan_row.pack(fill="both", expand=True)
+        self._gw_gdd_plan_text = tk.Text(
+            plan_row, wrap="none",
+            bg="#0a0808", fg="#d4d4d4",
+            font=("Consolas", 9), state="disabled",
+        )
+        plan_y = ttk.Scrollbar(plan_row, orient="vertical",
+                                 command=self._gw_gdd_plan_text.yview)
+        plan_x = ttk.Scrollbar(plan_frame, orient="horizontal",
+                                 command=self._gw_gdd_plan_text.xview)
+        self._gw_gdd_plan_text.configure(
+            yscrollcommand=plan_y.set,
+            xscrollcommand=plan_x.set,
+        )
+        self._gw_gdd_plan_text.pack(side="left", fill="both", expand=True)
+        plan_y.pack(side="right", fill="y")
+        plan_x.pack(side="bottom", fill="x")
+        self._gw_gdd_plan_text.tag_configure("h1",
+            font=("Segoe UI", 11, "bold"), foreground="#e0884a")
+        self._gw_gdd_plan_text.tag_configure("h2",
+            font=("Segoe UI", 10, "bold"), foreground="#a98a8a")
+        self._gw_gdd_plan_text.tag_configure("muted",
+            foreground="#7a7575")
+        self._gw_gdd_plan_text.tag_configure("warn",
+            foreground="#e0884a")
+        self._gw_gdd_plan = None
+
+    def _gw_gdd_load(self) -> None:
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Load a GDD markdown file",
+            filetypes=[("Markdown", "*.md *.markdown"),
+                        ("All files", "*.*")],
+            parent=self._gw_gdd_dialog,
+        )
+        if not path:
+            return
+        try:
+            text = Path(path).read_text(encoding="utf-8")
+        except Exception as exc:
+            from tkinter import messagebox
+            messagebox.showerror(
+                "Load failed", repr(exc),
+                parent=self._gw_gdd_dialog,
+            )
+            return
+        self._gw_gdd_text.delete("1.0", "end")
+        self._gw_gdd_text.insert("1.0", text)
+        self._gw_gdd_parse_and_plan()
+
+    def _gw_gdd_parse_and_plan(self) -> None:
+        """Parse the GDD textarea + run the planner. Render the
+        result into the plan view."""
+        md = self._gw_gdd_text.get("1.0", "end-1c")
+        try:
+            import gdd_parser as _gp
+            import gdd_planner as _gpl
+            gdd = _gp.parse_gdd(md)
+            plan = _gpl.plan_from_gdd(gdd)
+        except Exception as exc:
+            from tkinter import messagebox
+            messagebox.showerror(
+                "Parse failed", repr(exc),
+                parent=self._gw_gdd_dialog,
+            )
+            return
+        self._gw_gdd_plan = plan
+        self._gw_gdd_render_plan(gdd, plan)
+
+    def _gw_gdd_render_plan(self, gdd, plan) -> None:
+        d = self._gw_gdd_plan_text
+        d.configure(state="normal")
+        d.delete("1.0", "end")
+        d.insert("end", f"{plan.title}\n", ("h1",))
+        d.insert("end",
+            f"genre: {plan.genre}   template: {plan.template}\n",
+            ("muted",))
+        if gdd.parse_warnings:
+            d.insert("end", "\nGDD warnings:\n", ("warn",))
+            for w in gdd.parse_warnings:
+                d.insert("end", f"  ⚠ {w}\n", ("warn",))
+        if plan.notes:
+            d.insert("end", "\nPlanner notes:\n", ("warn",))
+            for n in plan.notes:
+                d.insert("end", f"  • {n}\n", ("warn",))
+        d.insert("end", "\nFiles to generate\n", ("h2",))
+        for fp, purpose in plan.file_summary():
+            d.insert("end", f"  {fp:36s}  {purpose}\n")
+        d.insert("end", "\nEntities + roles\n", ("h2",))
+        for slug, ent in plan.entity_registry.items():
+            d.insert("end",
+                f"  {slug:24s}  role={ent.role:9s}  {ent.description[:60]}\n")
+        d.insert("end", "\nSignal contracts\n", ("h2",))
+        for sc in plan.signal_contracts:
+            args = ", ".join(sc.args) if sc.args else ""
+            d.insert("end",
+                f"  {sc.name}({args})\n"
+                f"    emitter:  {sc.emitter}\n"
+                f"    handlers: {', '.join(sc.handlers)}\n")
+        d.insert("end", "\nAutoloads\n", ("h2",))
+        for a in plan.autoloads:
+            d.insert("end", f"  {a.name:16s}  {a.purpose[:80]}\n")
+        d.configure(state="disabled")
+
+    def _gw_gdd_build(self) -> None:
+        """Run the gdd_builder orchestrator against the current plan.
+
+        Spawns a daemon thread so the long-running build (multiple
+        GodotCoder calls + godot --check-only across the project)
+        doesn't freeze the GUI. Progress events stream into the
+        plan view as they arrive."""
+        from tkinter import messagebox
+        if self._gw_gdd_plan is None:
+            self._gw_gdd_parse_and_plan()
+            if self._gw_gdd_plan is None:
+                return
+        plan = self._gw_gdd_plan
+        if not messagebox.askyesno(
+            "Build from GDD",
+            f"Generate {len(plan.scenes)} scene(s), "
+            f"{len(plan.scripts)} script(s), and "
+            f"{len(plan.autoloads)} autoload(s) into a new project? "
+            "Each script will be written by the Coder agent and "
+            "validated.",
+            parent=self._gw_gdd_dialog,
+        ):
+            return
+
+        # Append a build-log section to the plan view
+        d = self._gw_gdd_plan_text
+        d.configure(state="normal")
+        d.insert("end", "\n\nBuild log\n", ("h2",))
+        d.configure(state="disabled")
+
+        def _emit_to_view(phase: str, msg: str) -> None:
+            def _ui():
+                d.configure(state="normal")
+                d.insert("end", f"  [{phase}] {msg}\n")
+                d.see("end")
+                d.configure(state="disabled")
+            try:
+                self.after(0, _ui)
+            except Exception:
+                pass
+
+        # Use the current Workspace's open Godot binary if set
+        try:
+            import godot_workspace as _gw
+            binary = _gw.get_godot_binary()
+        except Exception:
+            binary = "godot"
+
+        def _worker():
+            import gdd_builder as _gb
+            opts = _gb.BuildOptions(
+                model=getattr(self, "writer", None),
+                godot_binary=binary,
+                max_repair_passes=2,
+                coder_max_attempts=3,
+                dry_run=False,
+                on_event=_emit_to_view,
+            )
+            result = _gb.build_from_plan(plan, VAULT_DIR, opts)
+
+            def _done():
+                if result.ok:
+                    _emit_to_view(
+                        "done",
+                        f"✓ Project at {result.project_path}. "
+                        f"{len(result.scripts_passed)} script(s) passed, "
+                        f"{len(result.scripts_failed)} failed."
+                    )
+                    if result.notes:
+                        for n in result.notes:
+                            _emit_to_view("note", n)
+                    # Offer to open the new project in Workspace
+                    from tkinter import messagebox
+                    if messagebox.askyesno(
+                        "Build complete",
+                        f"Project written to:\n{result.project_path}\n\n"
+                        f"Open it in the Godot Workspace tab?",
+                        parent=self._gw_gdd_dialog,
+                    ):
+                        try:
+                            self._gw_open_project(result.project_path)
+                            self._gw_save_settings_kv(
+                                godot_project=str(result.project_path))
+                            if hasattr(self, "tab_godot_workspace"):
+                                self.nb.select(self.tab_godot_workspace)
+                        except Exception as exc:
+                            print(f"[GDD build] auto-open failed: {exc!r}")
+                else:
+                    _emit_to_view(
+                        "fail",
+                        f"✗ Build failed: {result.error}"
+                    )
+            try:
+                self.after(0, _done)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True,
+                          name="anvil-gdd-build").start()
+
+    def _gw_send_errors_to_council(self) -> None:
+        """Bundle the current stderr buffer into a Council question.
+
+        Drops the bundle into the Council tab's input box and switches
+        to it; the user clicks Send to actually deliberate. Keeping
+        the click-to-send step explicit means errors don't trigger
+        runaway deliberations.
+        """
+        if not self._gw_stderr_buffer:
+            self._gw_console_write("info",
+                "[Anvil] no stderr lines to send (try a Run or Validate first)")
+            return
+        excerpt = "\n".join(self._gw_stderr_buffer[-60:])
+        body = (
+            "Godot reported errors during the last run. Please diagnose "
+            "and propose a minimal fix.\n\n"
+            f"Project: {self._gw_project.name if self._gw_project else '?'}\n"
+            f"Open file: {self._gw_project.relpath(self._gw_open_file) if (self._gw_project and self._gw_open_file) else '(none)'}\n\n"
+            "Godot stderr:\n"
+            "```\n"
+            f"{excerpt}\n"
+            "```"
+        )
+        # Drop into the Council input box and switch tabs
+        try:
+            inp = getattr(self, "input", None)
+            if inp is not None:
+                inp.delete("1.0", "end")
+                inp.insert("1.0", body)
+            if hasattr(self, "tab_council"):
+                self.nb.select(self.tab_council)
+            self._gw_console_write("info",
+                "[Anvil] Errors loaded into Council input — review and Send.")
+        except Exception as exc:
+            self._gw_console_write("stderr",
+                f"[Anvil] could not stage Council question: {exc!r}")
+
+    # ---- Game Concepts tab (phase B) ----
+
+    def _build_game_concepts_tab(self):
+        """Game Concepts — brainstorm + browse game concepts.
+
+        Left pane: list of saved concepts with seed + Generate button.
+        Right pane: detail view of the selected concept with editable
+        notes / rating / status, and a "Send to Godot Workspace" button
+        that hands the concept off to demo_builder (phase E land-site).
+        """
+        import game_concept as _gc
+        self.tab_game_concepts = ttk.Frame(self.nb)
+        self.nb.add(self.tab_game_concepts, text="💡 Game Concepts")
+
+        self._gc_store = _gc.GameConceptStore(VAULT_DIR)
+        self._gc_current_id: Optional[str] = None
+        self._gc_generating = False
+
+        # Top strip — seed input + Generate + count badge
+        strip = ttk.Frame(self.tab_game_concepts)
+        strip.pack(fill="x", padx=6, pady=(6, 4))
+        ttk.Label(strip, text="Seed:").pack(side="left")
+        self._gc_seed_var = tk.StringVar()
+        seed_entry = ttk.Entry(strip, textvariable=self._gc_seed_var)
+        seed_entry.pack(side="left", padx=(4, 4), fill="x", expand=True)
+        ttk.Label(strip, text="N:").pack(side="left")
+        self._gc_n_var = tk.IntVar(value=3)
+        ttk.Spinbox(strip, from_=1, to=6, width=3,
+                     textvariable=self._gc_n_var).pack(side="left", padx=(2, 4))
+        self._gc_generate_btn = ttk.Button(
+            strip, text="✨ Generate", command=self._gc_generate,
+        )
+        self._gc_generate_btn.pack(side="left")
+        self._gc_status_var = tk.StringVar(
+            value=f"{self._gc_store.count()} concept(s) saved",
+        )
+        ttk.Label(strip, textvariable=self._gc_status_var,
+                  foreground="#a98a8a").pack(side="right")
+
+        # Body — horizontal pane: list on left, detail on right
+        body = tk.PanedWindow(self.tab_game_concepts, orient="horizontal",
+                               bg="#1a1414", sashwidth=6)
+        body.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # Left — listbox of concepts
+        left = ttk.Frame(body)
+        body.add(left, width=320, minsize=240)
+        ttk.Label(left, text="Concepts (newest first)").pack(anchor="w",
+                                                              padx=2, pady=(0, 2))
+        list_row = ttk.Frame(left)
+        list_row.pack(fill="both", expand=True)
+        self._gc_listbox = tk.Listbox(
+            list_row, bg="#0f0c0c", fg="#d4d4d4",
+            selectbackground="#4a2626", selectforeground="#d4d4d4",
+            font=("Segoe UI", 10), activestyle="none",
+        )
+        lsb = ttk.Scrollbar(list_row, orient="vertical",
+                             command=self._gc_listbox.yview)
+        self._gc_listbox.configure(yscrollcommand=lsb.set)
+        self._gc_listbox.pack(side="left", fill="both", expand=True)
+        lsb.pack(side="right", fill="y")
+        self._gc_listbox.bind("<<ListboxSelect>>", self._gc_on_select)
+
+        # Left bottom — list actions
+        list_actions = ttk.Frame(left)
+        list_actions.pack(fill="x", pady=(4, 0))
+        ttk.Button(list_actions, text="⟳ Refresh",
+                   command=self._gc_refresh_list).pack(side="left")
+        ttk.Button(list_actions, text="🗑 Delete",
+                   command=self._gc_delete_selected).pack(side="left", padx=4)
+
+        # Right — detail pane
+        right = ttk.Frame(body)
+        body.add(right, minsize=420)
+        # Scrollable detail body
+        det_row = ttk.Frame(right)
+        det_row.pack(fill="both", expand=True)
+        self._gc_detail = tk.Text(
+            det_row, wrap="word", bg="#0f0c0c", fg="#d4d4d4",
+            insertbackground="#d4d4d4", font=("Segoe UI", 10),
+            state="disabled",
+        )
+        dsb = ttk.Scrollbar(det_row, orient="vertical",
+                             command=self._gc_detail.yview)
+        self._gc_detail.configure(yscrollcommand=dsb.set)
+        self._gc_detail.pack(side="left", fill="both", expand=True)
+        dsb.pack(side="right", fill="y")
+        # Headline tag for big bold titles inside the detail pane
+        self._gc_detail.tag_configure("h1", font=("Segoe UI", 14, "bold"),
+                                       foreground="#e0884a", spacing3=4)
+        self._gc_detail.tag_configure("h2", font=("Segoe UI", 11, "bold"),
+                                       foreground="#a98a8a", spacing1=8,
+                                       spacing3=2)
+        self._gc_detail.tag_configure("muted", foreground="#7a7575")
+
+        # Right bottom — concept actions
+        det_actions = ttk.Frame(right)
+        det_actions.pack(fill="x", pady=(4, 0))
+        ttk.Button(det_actions, text="🛠 Send to Godot Workspace",
+                   command=self._gc_send_to_workspace).pack(side="left")
+        ttk.Button(det_actions, text="⚖ Ask Council about this concept",
+                   command=self._gc_send_to_council).pack(side="left", padx=4)
+
+        self._gc_refresh_list()
+
+    # ── List + selection ────────────────────────────────────────────
+
+    def _gc_refresh_list(self) -> None:
+        self._gc_listbox.delete(0, "end")
+        for entry in self._gc_store.list_index():
+            stars = "★" * int(entry.get("rating", 0) or 0)
+            line = (f"  {entry.get('title', '?')}"
+                    + (f"   [{entry.get('genre', '')}]"
+                       if entry.get("genre") else "")
+                    + (f"   {stars}" if stars else ""))
+            self._gc_listbox.insert("end", line)
+        self._gc_status_var.set(f"{self._gc_store.count()} concept(s) saved")
+
+    def _gc_on_select(self, _event=None) -> None:
+        sel = self._gc_listbox.curselection()
+        if not sel:
+            return
+        entry = self._gc_store.list_index()[sel[0]]
+        cid = entry.get("id")
+        if not cid:
+            return
+        concept = self._gc_store.load(cid)
+        if concept is None:
+            return
+        self._gc_current_id = cid
+        self._gc_render_detail(concept)
+
+    def _gc_delete_selected(self) -> None:
+        from tkinter import messagebox
+        if not self._gc_current_id:
+            return
+        if not messagebox.askyesno(
+            "Delete concept?",
+            "This permanently removes the concept JSON. Continue?",
+            parent=self,
+        ):
+            return
+        self._gc_store.delete(self._gc_current_id)
+        self._gc_current_id = None
+        self._gc_refresh_list()
+        self._gc_render_detail(None)
+
+    # ── Detail rendering ────────────────────────────────────────────
+
+    def _gc_render_detail(self, concept) -> None:
+        d = self._gc_detail
+        d.configure(state="normal")
+        d.delete("1.0", "end")
+        if concept is None:
+            d.insert("end", "(no concept selected)\n", ("muted",))
+            d.configure(state="disabled")
+            return
+
+        d.insert("end", f"{concept.display_title}\n", ("h1",))
+        meta = f"{concept.status_icon} {concept.status}"
+        if concept.genre:
+            meta += f"  •  {concept.genre}"
+        if concept.engine:
+            meta += f"  •  {concept.engine}"
+        d.insert("end", meta + "\n", ("muted",))
+
+        def _section(title, body):
+            if not body:
+                return
+            d.insert("end", title + "\n", ("h2",))
+            if isinstance(body, list):
+                for item in body:
+                    if item:
+                        d.insert("end", f"  • {item}\n")
+            else:
+                d.insert("end", str(body).strip() + "\n")
+
+        _section("Hook", concept.hook)
+        _section("Premise", concept.premise)
+        _section("Core loop", concept.core_loop)
+        _section("Mechanics", concept.mechanics)
+        _section("Sub-genres", concept.sub_genres)
+        _section("Art style", concept.art_style)
+        _section("Play length", concept.play_length)
+        _section("Players", concept.player_count)
+        _section("Target audience", concept.target_audience)
+        _section("Comparable titles", concept.comparable_titles)
+        _section("What sets it apart", concept.differentiator)
+        _section("Why it works", concept.why_it_works)
+        _section("Progression", concept.progression)
+        _section("Win / loss", concept.win_loss)
+        _section("Monetization", concept.monetization)
+        _section("Estimated dev time", concept.estimated_dev_time)
+        if concept.seed_used:
+            _section("Seed used", concept.seed_used)
+        if concept.notes:
+            _section("Notes", concept.notes)
+
+        d.configure(state="disabled")
+
+    # ── Generation ──────────────────────────────────────────────────
+
+    def _gc_generate(self) -> None:
+        if self._gc_generating:
+            return
+        seed = self._gc_seed_var.get().strip()
+        n = int(self._gc_n_var.get() or 3)
+        if not seed:
+            seed = "any indie-scale Godot game"
+        self._gc_generating = True
+        self._gc_generate_btn.configure(state="disabled", text="… brainstorming")
+        self._gc_status_var.set(f"Brainstorming {n} concept(s)…")
+        # Run on a background thread — the model call blocks for
+        # ~10–30s on small models and would freeze the GUI otherwise.
+        threading.Thread(
+            target=self._gc_generate_worker,
+            args=(seed, n),
+            daemon=True,
+            name="game-concept-brainstorm",
+        ).start()
+
+    def _gc_generate_worker(self, seed: str, n: int) -> None:
+        import game_concept as _gc
+        concepts = []
+        try:
+            # The Game Designer specialist's overlay is the right voice
+            # for brainstorming — pull it via the registry and prepend.
+            extra = ""
+            try:
+                gd = self.specialists.get("game_designer")
+                if gd is not None:
+                    extra = gd.context_block()
+            except Exception:
+                pass
+            concepts = _gc.brainstorm_concepts(
+                seed, self.writer, n=n, extra_context=extra,
+            )
+        except Exception as exc:
+            print(f"[Game Concepts] brainstorm failed: {exc!r}")
+
+        def _on_done():
+            self._gc_generating = False
+            self._gc_generate_btn.configure(state="normal", text="✨ Generate")
+            if not concepts:
+                self._gc_status_var.set(
+                    "No parseable concepts from the model — try a "
+                    "tighter seed or a stronger model."
+                )
+                return
+            for c in concepts:
+                self._gc_store.save(c)
+            self._gc_refresh_list()
+            self._gc_status_var.set(
+                f"Generated {len(concepts)} concept(s) — saved."
+            )
+            # Auto-select the first new one
+            try:
+                self._gc_listbox.selection_clear(0, "end")
+                self._gc_listbox.selection_set(0)
+                self._gc_listbox.event_generate("<<ListboxSelect>>")
+            except Exception:
+                pass
+
+        self.after(0, _on_done)
+
+    # ── Outbound actions ────────────────────────────────────────────
+
+    def _gc_send_to_workspace(self) -> None:
+        """Scaffold a Godot project from the selected concept via
+        demo_builder, then open it in the Workspace tab."""
+        from tkinter import messagebox
+        if not self._gc_current_id:
+            messagebox.showinfo(
+                "No concept selected",
+                "Pick a concept first.",
+                parent=self,
+            )
+            return
+        concept = self._gc_store.load(self._gc_current_id)
+        if concept is None:
+            return
+
+        import demo_builder as _db
+        # First attempt without overwrite. If the project already exists
+        # we ask the user whether to overwrite.
+        result = _db.build_demo(concept, VAULT_DIR, overwrite=False)
+        if result.error and "already exists" in result.error:
+            if messagebox.askyesno(
+                "Project exists",
+                f"{result.project_path.name} already exists in "
+                f"vault/projects/. Overwrite it?",
+                parent=self,
+            ):
+                result = _db.build_demo(concept, VAULT_DIR, overwrite=True)
+        if result.error:
+            messagebox.showerror(
+                "Build failed", result.error, parent=self,
+            )
+            return
+
+        # Switch to Workspace + auto-open the new project
+        if hasattr(self, "tab_godot_workspace"):
+            self.nb.select(self.tab_godot_workspace)
+        try:
+            self._gw_open_project(result.project_path)
+            self._gw_save_settings_kv(godot_project=str(result.project_path))
+        except Exception as exc:
+            print(f"[Game Concepts] auto-open failed: {exc!r}")
+        self._gw_console_write("info",
+            f"[Anvil] ✨ Demo scaffolded at {result.project_path}")
+        for note in result.notes:
+            self._gw_console_write("info", f"  • {note}")
+        self._gw_console_write("info",
+            "[Anvil] Hit ▶ Run to see it move, then use 🤖 Ask Coder "
+            "to flesh out the mechanics from the concept's TODO list.")
+
+    def _gc_send_to_council(self) -> None:
+        """Stage a critique-this-concept prompt for the Council.
+
+        Pattern matches the Steam Market handoff: the question
+        ("Critique and improve") sits in the editable input box,
+        the concept's structured fields go into the read-only
+        injection slot so the user can't accidentally edit out
+        the concept's identity (title / hook / mechanics) before
+        sending.
+        """
+        if not self._gc_current_id:
+            return
+        concept = self._gc_store.load(self._gc_current_id)
+        if concept is None:
+            return
+        # Structured concept block (the "context" half)
+        concept_lines = ["[CONCEPT — the game the council should critique]"]
+        concept_lines.append(f"  TITLE: {concept.display_title}")
+        if concept.genre:
+            concept_lines.append(f"  GENRE: {concept.genre}")
+        if concept.hook:
+            concept_lines.append(f"  HOOK: {concept.hook}")
+        if concept.premise:
+            concept_lines.append(f"  PREMISE: {concept.premise}")
+        if concept.core_loop:
+            concept_lines.append(f"  CORE LOOP: {concept.core_loop}")
+        if concept.mechanics:
+            concept_lines.append(
+                "  MECHANICS: " + ", ".join(concept.mechanics)
+            )
+        if concept.comparable_titles:
+            concept_lines.append(
+                "  COMPARABLE TITLES: " + ", ".join(concept.comparable_titles)
+            )
+        if concept.differentiator:
+            concept_lines.append(
+                f"  WHAT SETS IT APART: {concept.differentiator}"
+            )
+        concept_block = "\n".join(concept_lines)
+        # The question half — user can tweak this if they want
+        # (e.g. "critique" → "find the weakest mechanic and fix it").
+        question = (
+            "Critique the game concept attached above and suggest the "
+            "three most impactful improvements. For each improvement, "
+            "say which mechanic / hook / loop element it changes and "
+            "why it raises the ceiling on the concept."
+        )
+        try:
+            inp = getattr(self, "input", None)
+            if inp is not None:
+                inp.delete("1.0", "end")
+                inp.insert("1.0", question)
+            self._council_attach_injection(
+                label="🎮 Concept context (read-only)",
+                block=concept_block,
+            )
+            if hasattr(self, "tab_council"):
+                self.nb.select(self.tab_council)
+        except Exception as exc:
+            print(f"[Game Concepts] stage to council failed: {exc!r}")
+
+    # ---- 🎨 Pixel Art tab ----
+
+    # Default colour, brush size, palette, and canvas dimensions
+    _PX_DEFAULT_COLOR = "#1a1414"
+    _PX_DEFAULT_SIZE  = 32
+    _PX_SIZES         = (16, 32, 48, 64, 96, 128)
+
+    def _build_pixel_art_tab(self):
+        """🎨 Pixel Art — hand-paint sprites with pencil / fill / line
+        / rect tools, optional vertical-mirror symmetry, predefined
+        palettes, multi-frame animation, PNG export, and a one-click
+        Save into the open Godot project's assets.
+
+        Pillow-backed model (see pixel_art.PixelDocument). Falls
+        back to a friendly "install Pillow" pane if PIL is missing
+        rather than wedging the tab.
+        """
+        self.tab_pixel_art = ttk.Frame(self.nb)
+        self.nb.add(self.tab_pixel_art, text="🎨 Pixel Art")
+
+        # ── Pillow check ────────────────────────────────────────
+        try:
+            import pixel_art as _px
+        except Exception as exc:
+            self._px_show_unavailable(f"pixel_art import failed: {exc!r}")
+            return
+        if not _px.PIL_OK:
+            self._px_show_unavailable(
+                "Pillow (PIL) isn't installed in this Python env.\n\n"
+                "Install with:  pip install pillow\n"
+                "Then restart Anvil."
+            )
+            return
+
+        # ── State ───────────────────────────────────────────────
+        self._px_module = _px
+        self._px_doc = _px.PixelDocument(
+            width=self._PX_DEFAULT_SIZE, height=self._PX_DEFAULT_SIZE,
+        )
+        self._px_color: tuple = _px.hex_to_rgba(self._PX_DEFAULT_COLOR)
+        self._px_recent_colors: list = []
+        self._px_zoom = 16
+        self._px_tool = "pencil"
+        self._px_brush_size = 1
+        self._px_show_grid = True
+        self._px_line_start = None     # (x, y) for line/rect drag start
+        self._px_drag_active = False
+        self._px_photo = None          # ImageTk.PhotoImage ref
+        self._px_overlay_ids: list = []
+        self._px_frame_thumbs: list = []  # ImageTk refs for the frame strip
+
+        # ── Top strip: file actions ────────────────────────────
+        top = ttk.Frame(self.tab_pixel_art)
+        top.pack(fill="x", padx=6, pady=(6, 4))
+        ttk.Button(top, text="📂 New",
+                   command=self._px_new).pack(side="left")
+        ttk.Button(top, text="📥 Load PNG…",
+                   command=self._px_load).pack(side="left", padx=4)
+        ttk.Button(top, text="💾 Save PNG",
+                   command=self._px_save).pack(side="left")
+        ttk.Button(top, text="💾 Save sprite sheet",
+                   command=self._px_save_sheet).pack(side="left", padx=4)
+        ttk.Button(top, text="🛠 Save into open Godot project",
+                   command=self._px_save_into_godot
+                   ).pack(side="left", padx=(8, 0))
+        self._px_status_var = tk.StringVar(value="new 32×32 canvas")
+        ttk.Label(top, textvariable=self._px_status_var,
+                  foreground="#a98a8a").pack(side="right")
+
+        # ── Tool strip ─────────────────────────────────────────
+        tools = ttk.Frame(self.tab_pixel_art)
+        tools.pack(fill="x", padx=6, pady=(0, 4))
+        for code, label in (
+            ("pencil",     "✎ Pencil"),
+            ("eraser",     "⌫ Eraser"),
+            ("fill",       "▣ Fill"),
+            ("eyedropper", "💧 Pick"),
+            ("line",       "／ Line"),
+            ("rect",       "□ Rect"),
+            ("rect_fill",  "■ Rect fill"),
+        ):
+            b = ttk.Button(tools, text=label,
+                           command=lambda c=code: self._px_set_tool(c))
+            b.pack(side="left", padx=1)
+        ttk.Label(tools, text="  Brush:").pack(side="left", padx=(8, 2))
+        self._px_brush_var = tk.IntVar(value=self._px_brush_size)
+        ttk.Spinbox(tools, from_=1, to=8, width=3,
+                     textvariable=self._px_brush_var,
+                     command=lambda: self._px_brush_size_update()
+                     ).pack(side="left")
+        self._px_sym_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(tools, text="↔ Symmetry",
+                         variable=self._px_sym_var,
+                         command=self._px_apply_symmetry
+                         ).pack(side="left", padx=8)
+        self._px_grid_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(tools, text="# Grid",
+                         variable=self._px_grid_var,
+                         command=self._px_redraw
+                         ).pack(side="left", padx=2)
+        ttk.Label(tools, text="  Canvas:").pack(side="left", padx=(8, 2))
+        self._px_size_var = tk.StringVar(value=str(self._PX_DEFAULT_SIZE))
+        size_choices = tuple(str(s) for s in self._PX_SIZES)
+        ttk.OptionMenu(tools, self._px_size_var,
+                        str(self._PX_DEFAULT_SIZE),
+                        *size_choices,
+                        command=lambda _v: self._px_resize_canvas()
+                        ).pack(side="left")
+        ttk.Label(tools, text="  Zoom:").pack(side="left", padx=(8, 2))
+        self._px_zoom_var = tk.IntVar(value=self._px_zoom)
+        ttk.Spinbox(tools, from_=2, to=32, width=3,
+                     textvariable=self._px_zoom_var,
+                     command=self._px_zoom_update
+                     ).pack(side="left")
+        ttk.Button(tools, text="↶ Undo",
+                   command=self._px_undo).pack(side="right", padx=2)
+        ttk.Button(tools, text="↷ Redo",
+                   command=self._px_redo).pack(side="right", padx=2)
+
+        # ── Body — left palette / center canvas / right frames ─
+        body = tk.PanedWindow(self.tab_pixel_art, orient="horizontal",
+                               bg="#1a1414", sashwidth=6)
+        body.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # Left — colour + palette
+        left = ttk.Frame(body)
+        body.add(left, width=180, minsize=160)
+        ttk.Label(left, text="Color").pack(anchor="w")
+        self._px_color_btn = tk.Button(
+            left, text="", width=12, height=2,
+            bg=_px.to_hex(self._px_color[:3]),
+            command=self._px_pick_color,
+        )
+        self._px_color_btn.pack(fill="x", pady=(2, 4))
+        # Hex entry — direct text input for known colours
+        ttk.Label(left, text="Hex:").pack(anchor="w")
+        self._px_hex_var = tk.StringVar(
+            value=_px.to_hex(self._px_color[:3]))
+        hex_row = ttk.Frame(left)
+        hex_row.pack(fill="x", pady=(0, 6))
+        ttk.Entry(hex_row, textvariable=self._px_hex_var,
+                   width=10).pack(side="left", fill="x", expand=True)
+        ttk.Button(hex_row, text="Apply",
+                   command=self._px_apply_hex
+                   ).pack(side="left", padx=2)
+
+        # Recent swatches
+        ttk.Label(left, text="Recent").pack(anchor="w")
+        self._px_recent_frame = ttk.Frame(left)
+        self._px_recent_frame.pack(fill="x", pady=(2, 6))
+        self._px_render_recent()
+
+        # Palette dropdown + swatch grid
+        ttk.Label(left, text="Palette").pack(anchor="w")
+        self._px_palette_var = tk.StringVar(value="Default")
+        ttk.OptionMenu(left, self._px_palette_var,
+                        "Default",
+                        *_px.PALETTES.keys(),
+                        command=lambda _v: self._px_render_palette()
+                        ).pack(fill="x", pady=(2, 4))
+        self._px_palette_canvas = tk.Canvas(
+            left, bg="#0f0c0c", highlightthickness=0,
+            height=240,
+        )
+        self._px_palette_canvas.pack(fill="both", expand=True)
+        self._px_palette_canvas.bind("<Button-1>",
+                                       self._px_palette_click)
+        self._px_palette_swatches: list = []  # [(x0,y0,x1,y1,rgb), ...]
+
+        # Center — drawing canvas
+        center = ttk.Frame(body)
+        body.add(center, minsize=400)
+        canvas_row = ttk.Frame(center)
+        canvas_row.pack(fill="both", expand=True)
+        self._px_canvas = tk.Canvas(
+            canvas_row, bg="#0a0808", highlightthickness=0,
+            cursor="tcross",
+        )
+        # Scrollbars so big canvases at high zoom can pan
+        self._px_canvas_xsb = ttk.Scrollbar(
+            canvas_row, orient="horizontal",
+            command=self._px_canvas.xview,
+        )
+        self._px_canvas_ysb = ttk.Scrollbar(
+            canvas_row, orient="vertical",
+            command=self._px_canvas.yview,
+        )
+        self._px_canvas.configure(
+            xscrollcommand=self._px_canvas_xsb.set,
+            yscrollcommand=self._px_canvas_ysb.set,
+        )
+        self._px_canvas.grid(row=0, column=0, sticky="nsew")
+        self._px_canvas_ysb.grid(row=0, column=1, sticky="ns")
+        self._px_canvas_xsb.grid(row=1, column=0, sticky="ew")
+        canvas_row.grid_rowconfigure(0, weight=1)
+        canvas_row.grid_columnconfigure(0, weight=1)
+        # Mouse bindings
+        self._px_canvas.bind("<Button-1>", self._px_on_mouse_down)
+        self._px_canvas.bind("<B1-Motion>", self._px_on_mouse_drag)
+        self._px_canvas.bind("<ButtonRelease-1>", self._px_on_mouse_up)
+        self._px_canvas.bind("<Button-3>", self._px_on_right_click)
+        # Ctrl+Z / Ctrl+Y for undo / redo
+        self.bind_class("Text", "<Control-Key-z>", lambda e: None)
+        # Keyboard bindings live on the canvas so they don't fight
+        # the chat-input field on the Council tab.
+        self._px_canvas.bind("<Control-z>", lambda e: self._px_undo())
+        self._px_canvas.bind("<Control-y>", lambda e: self._px_redo())
+
+        # Right — frame strip
+        right = ttk.Frame(body)
+        body.add(right, width=140, minsize=120)
+        ttk.Label(right, text="Frames").pack(anchor="w")
+        frame_actions = ttk.Frame(right)
+        frame_actions.pack(fill="x", pady=(2, 4))
+        ttk.Button(frame_actions, text="+ Dup",
+                   command=lambda: self._px_add_frame(True)
+                   ).pack(side="left", padx=1)
+        ttk.Button(frame_actions, text="+ New",
+                   command=lambda: self._px_add_frame(False)
+                   ).pack(side="left", padx=1)
+        ttk.Button(frame_actions, text="🗑",
+                   command=self._px_remove_frame
+                   ).pack(side="left", padx=1)
+        self._px_frames_box = tk.Listbox(
+            right, bg="#0f0c0c", fg="#d4d4d4",
+            selectbackground="#4a2626", selectforeground="#d4d4d4",
+            font=("Consolas", 9), activestyle="none",
+            height=18,
+        )
+        self._px_frames_box.pack(fill="both", expand=True)
+        self._px_frames_box.bind("<<ListboxSelect>>",
+                                  self._px_on_frame_select)
+
+        # Initial render
+        self._px_render_palette()
+        self._px_refresh_frames_list()
+        self._px_redraw()
+
+    # ----------------------------------------------------------------
+    # Fallback when Pillow isn't installed
+    # ----------------------------------------------------------------
+
+    def _px_show_unavailable(self, message: str) -> None:
+        wrap = ttk.Frame(self.tab_pixel_art)
+        wrap.place(relx=0.5, rely=0.4, anchor="center")
+        ttk.Label(wrap, text="Pixel Art tab unavailable",
+                  font=("Segoe UI", 14, "bold"),
+                  foreground="#e0884a").pack(pady=(0, 8))
+        ttk.Label(wrap, text=message, justify="center",
+                  foreground="#a98a8a", wraplength=420).pack()
+
+    # ----------------------------------------------------------------
+    # Render — keep PhotoImage + canvas in sync
+    # ----------------------------------------------------------------
+
+    def _px_redraw(self) -> None:
+        if not hasattr(self, "_px_doc"):
+            return
+        try:
+            from PIL import ImageTk
+        except Exception:
+            return
+        doc = self._px_doc
+        zoom = max(1, int(self._px_zoom_var.get() or self._px_zoom))
+        self._px_zoom = zoom
+        zoomed = doc.frame.image.resize(
+            (doc.width * zoom, doc.height * zoom),
+            self._px_module.Image.NEAREST,
+        )
+        self._px_photo = ImageTk.PhotoImage(zoomed)
+        c = self._px_canvas
+        c.delete("img")
+        c.delete("grid")
+        c.create_image(0, 0, image=self._px_photo, anchor="nw", tags="img")
+        # Grid overlay
+        if self._px_grid_var.get():
+            color = "#3a2828"
+            for i in range(doc.width + 1):
+                x = i * zoom
+                c.create_line(x, 0, x, doc.height * zoom,
+                              fill=color, tags="grid")
+            for i in range(doc.height + 1):
+                y = i * zoom
+                c.create_line(0, y, doc.width * zoom, y,
+                              fill=color, tags="grid")
+        c.configure(scrollregion=(0, 0, doc.width * zoom, doc.height * zoom))
+        self._px_update_status()
+
+    def _px_update_status(self) -> None:
+        doc = self._px_doc
+        dirty = " *" if doc.dirty else ""
+        path = f" — {doc.file_path.name}" if doc.file_path else ""
+        self._px_status_var.set(
+            f"{doc.width}×{doc.height} • frame "
+            f"{doc.current + 1}/{len(doc.frames)} • "
+            f"zoom {self._px_zoom}×{dirty}{path}"
+        )
+
+    # ----------------------------------------------------------------
+    # Tool dispatch (mouse events → primitives)
+    # ----------------------------------------------------------------
+
+    def _px_canvas_to_pixel(self, event) -> tuple:
+        z = max(1, self._px_zoom)
+        cx = self._px_canvas.canvasx(event.x)
+        cy = self._px_canvas.canvasy(event.y)
+        return (int(cx // z), int(cy // z))
+
+    def _px_set_tool(self, name: str) -> None:
+        self._px_tool = name
+
+    def _px_on_mouse_down(self, event) -> None:
+        x, y = self._px_canvas_to_pixel(event)
+        tool = self._px_tool
+        doc = self._px_doc
+        if tool in ("line", "rect", "rect_fill"):
+            # Defer the actual draw until release — but snapshot now
+            # so a previewed stroke can be cancelled by Esc later.
+            doc.snapshot()
+            self._px_line_start = (x, y)
+            self._px_drag_active = True
+            return
+        # Stamping tools snapshot once per stroke
+        doc.snapshot()
+        self._px_drag_active = True
+        self._px_apply_tool_at(x, y)
+
+    def _px_on_mouse_drag(self, event) -> None:
+        if not self._px_drag_active:
+            return
+        x, y = self._px_canvas_to_pixel(event)
+        tool = self._px_tool
+        if tool in ("line", "rect", "rect_fill"):
+            # Live preview — undo last preview then redraw
+            self._px_doc.undo()
+            self._px_doc.snapshot()
+            self._px_apply_tool_at(x, y, preview=True)
+            return
+        self._px_apply_tool_at(x, y)
+
+    def _px_on_mouse_up(self, event) -> None:
+        if not self._px_drag_active:
+            return
+        self._px_drag_active = False
+        x, y = self._px_canvas_to_pixel(event)
+        tool = self._px_tool
+        if tool in ("line", "rect", "rect_fill"):
+            self._px_doc.undo()
+            self._px_doc.snapshot()
+            self._px_apply_tool_at(x, y)
+        self._px_line_start = None
+        # Frame strip thumbnail refresh
+        self._px_refresh_frames_list()
+
+    def _px_on_right_click(self, event) -> None:
+        # Right-click = eyedropper regardless of current tool
+        x, y = self._px_canvas_to_pixel(event)
+        col = self._px_module.eyedropper(self._px_doc, x, y)
+        if col is not None:
+            self._px_set_color(col)
+
+    def _px_apply_tool_at(self, x: int, y: int, *,
+                            preview: bool = False) -> None:
+        m = self._px_module
+        doc = self._px_doc
+        tool = self._px_tool
+        color = tuple(self._px_color)
+        size = max(1, int(self._px_brush_var.get() or 1))
+        if tool == "pencil":
+            m.pencil(doc, x, y, color, size=size)
+        elif tool == "eraser":
+            m.eraser(doc, x, y, size=size)
+        elif tool == "fill":
+            m.flood_fill(doc, x, y, color)
+        elif tool == "eyedropper":
+            col = m.eyedropper(doc, x, y)
+            if col is not None:
+                self._px_set_color(col)
+            doc.undo()  # eyedropper shouldn't push history
+            self._px_redraw()
+            return
+        elif tool == "line":
+            if self._px_line_start is None:
+                return
+            x0, y0 = self._px_line_start
+            m.line(doc, x0, y0, x, y, color, size=size)
+        elif tool in ("rect", "rect_fill"):
+            if self._px_line_start is None:
+                return
+            x0, y0 = self._px_line_start
+            m.rect(doc, x0, y0, x, y, color,
+                    filled=(tool == "rect_fill"), size=size)
+        self._px_redraw()
+        # Track recent colour on real strokes (not preview)
+        if not preview and tool in ("pencil", "fill", "line",
+                                      "rect", "rect_fill"):
+            self._px_track_recent(color)
+
+    # ----------------------------------------------------------------
+    # Color picker / palette
+    # ----------------------------------------------------------------
+
+    def _px_set_color(self, rgba: tuple) -> None:
+        self._px_color = tuple(rgba)
+        hex_str = self._px_module.to_hex(rgba[:3])
+        self._px_color_btn.configure(bg=hex_str)
+        self._px_hex_var.set(hex_str)
+
+    def _px_pick_color(self) -> None:
+        from tkinter import colorchooser
+        cur = self._px_module.to_hex(self._px_color[:3])
+        result = colorchooser.askcolor(initialcolor=cur, parent=self)
+        if result and result[1]:
+            self._px_set_color(self._px_module.hex_to_rgba(result[1]))
+
+    def _px_apply_hex(self) -> None:
+        try:
+            rgba = self._px_module.hex_to_rgba(
+                self._px_hex_var.get().strip(),
+            )
+        except Exception:
+            return
+        self._px_set_color(rgba)
+
+    def _px_track_recent(self, rgba: tuple) -> None:
+        if rgba in self._px_recent_colors:
+            self._px_recent_colors.remove(rgba)
+        self._px_recent_colors.insert(0, rgba)
+        if len(self._px_recent_colors) > 12:
+            self._px_recent_colors = self._px_recent_colors[:12]
+        self._px_render_recent()
+
+    def _px_render_recent(self) -> None:
+        for child in self._px_recent_frame.winfo_children():
+            child.destroy()
+        for i, rgba in enumerate(self._px_recent_colors):
+            hex_str = self._px_module.to_hex(rgba[:3])
+            b = tk.Button(self._px_recent_frame, text="", width=2, height=1,
+                          bg=hex_str,
+                          command=lambda r=rgba: self._px_set_color(r))
+            b.grid(row=i // 6, column=i % 6, padx=1, pady=1)
+
+    def _px_render_palette(self) -> None:
+        name = self._px_palette_var.get()
+        swatches = self._px_module.PALETTES.get(name, [])
+        c = self._px_palette_canvas
+        c.delete("all")
+        self._px_palette_swatches = []
+        if not swatches:
+            return
+        # Layout: 6 columns, swatch_size tall
+        cols = 6
+        sw = 22
+        for i, rgb in enumerate(swatches):
+            col = i % cols
+            row = i // cols
+            x0 = col * sw + 2
+            y0 = row * sw + 2
+            x1 = x0 + sw - 2
+            y1 = y0 + sw - 2
+            hex_str = self._px_module.to_hex(rgb)
+            c.create_rectangle(x0, y0, x1, y1, fill=hex_str, outline="#222")
+            self._px_palette_swatches.append((x0, y0, x1, y1, rgb))
+
+    def _px_palette_click(self, event) -> None:
+        for x0, y0, x1, y1, rgb in self._px_palette_swatches:
+            if x0 <= event.x <= x1 and y0 <= event.y <= y1:
+                rgba = tuple(list(rgb) + [255])
+                self._px_set_color(rgba)
+                return
+
+    # ----------------------------------------------------------------
+    # File + canvas ops
+    # ----------------------------------------------------------------
+
+    def _px_new(self) -> None:
+        from tkinter import messagebox
+        if self._px_doc.dirty:
+            if not messagebox.askyesno(
+                "Discard?",
+                "You have unsaved changes. Discard them?",
+                parent=self,
+            ):
+                return
+        size = self._PX_DEFAULT_SIZE
+        try:
+            size = int(self._px_size_var.get())
+        except Exception:
+            pass
+        self._px_doc = self._px_module.PixelDocument(width=size, height=size)
+        self._px_refresh_frames_list()
+        self._px_redraw()
+
+    def _px_load(self) -> None:
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Open PNG",
+            filetypes=[("PNG", "*.png"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self._px_doc = self._px_module.load_png(path)
+        except Exception as exc:
+            from tkinter import messagebox
+            messagebox.showerror("Load failed", repr(exc), parent=self)
+            return
+        # Resync size dropdown
+        if self._px_doc.width in self._PX_SIZES:
+            self._px_size_var.set(str(self._px_doc.width))
+        self._px_refresh_frames_list()
+        self._px_redraw()
+
+    def _px_default_save_dir(self) -> Path:
+        d = VAULT_DIR / "sprites"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _px_save(self) -> None:
+        from tkinter import filedialog
+        initial = (self._px_doc.file_path
+                    or self._px_default_save_dir() / "sprite.png")
+        path = filedialog.asksaveasfilename(
+            title="Save PNG",
+            initialdir=str(initial.parent),
+            initialfile=initial.name,
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png")],
+        )
+        if not path:
+            return
+        try:
+            self._px_module.save_png(self._px_doc, path)
+            self._px_update_status()
+        except Exception as exc:
+            from tkinter import messagebox
+            messagebox.showerror("Save failed", repr(exc), parent=self)
+
+    def _px_save_sheet(self) -> None:
+        from tkinter import filedialog
+        if len(self._px_doc.frames) < 2:
+            from tkinter import messagebox
+            messagebox.showinfo(
+                "Only one frame",
+                "Add more frames first (use + Dup / + New in the "
+                "frame strip).",
+                parent=self,
+            )
+            return
+        initial = (self._px_default_save_dir() / "sprite_sheet.png")
+        path = filedialog.asksaveasfilename(
+            title="Save sprite sheet",
+            initialdir=str(initial.parent),
+            initialfile=initial.name,
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png")],
+        )
+        if not path:
+            return
+        try:
+            self._px_module.save_sprite_sheet(self._px_doc, path)
+        except Exception as exc:
+            from tkinter import messagebox
+            messagebox.showerror("Save failed", repr(exc), parent=self)
+
+    def _px_save_into_godot(self) -> None:
+        """Drop the PNG into the open Workspace project. Saves to
+        ``<project>/assets/sprites/<name>.png`` and refreshes the
+        Workspace file tree."""
+        from tkinter import messagebox, filedialog
+        proj = getattr(self, "_gw_project", None)
+        if proj is None:
+            messagebox.showinfo(
+                "No project open",
+                "Open a Godot project in the 🛠 Workspace tab first.",
+                parent=self,
+            )
+            return
+        default_name = (self._px_doc.file_path.stem
+                         if self._px_doc.file_path else "sprite")
+        target_dir = proj.root / "assets" / "sprites"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        path = filedialog.asksaveasfilename(
+            title="Save into Godot project",
+            initialdir=str(target_dir),
+            initialfile=f"{default_name}.png",
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png")],
+        )
+        if not path:
+            return
+        try:
+            self._px_module.save_png(self._px_doc, path)
+        except Exception as exc:
+            messagebox.showerror("Save failed", repr(exc), parent=self)
+            return
+        # Refresh the file tree so the new PNG appears immediately
+        try:
+            import godot_workspace as _gw
+            self._gw_project = _gw.open_project(proj.root)
+            self._gw_populate_tree()
+        except Exception:
+            pass
+        self._px_update_status()
+
+    def _px_resize_canvas(self) -> None:
+        try:
+            n = int(self._px_size_var.get())
+        except Exception:
+            return
+        self._px_doc.resize_canvas(n, n)
+        self._px_refresh_frames_list()
+        self._px_redraw()
+
+    # ----------------------------------------------------------------
+    # History
+    # ----------------------------------------------------------------
+
+    def _px_undo(self) -> None:
+        if self._px_doc.undo():
+            self._px_redraw()
+            self._px_refresh_frames_list()
+
+    def _px_redo(self) -> None:
+        if self._px_doc.redo():
+            self._px_redraw()
+            self._px_refresh_frames_list()
+
+    # ----------------------------------------------------------------
+    # Brush + symmetry + zoom helpers
+    # ----------------------------------------------------------------
+
+    def _px_brush_size_update(self) -> None:
+        try:
+            self._px_brush_size = max(1, int(self._px_brush_var.get() or 1))
+        except Exception:
+            self._px_brush_size = 1
+
+    def _px_apply_symmetry(self) -> None:
+        self._px_doc.symmetry = bool(self._px_sym_var.get())
+
+    def _px_zoom_update(self) -> None:
+        self._px_redraw()
+
+    # ----------------------------------------------------------------
+    # Frames strip
+    # ----------------------------------------------------------------
+
+    def _px_refresh_frames_list(self) -> None:
+        self._px_frames_box.delete(0, "end")
+        for i, fr in enumerate(self._px_doc.frames):
+            marker = "● " if i == self._px_doc.current else "  "
+            self._px_frames_box.insert("end", f"{marker}{fr.name}")
+        try:
+            self._px_frames_box.selection_clear(0, "end")
+            self._px_frames_box.selection_set(self._px_doc.current)
+        except Exception:
+            pass
+
+    def _px_on_frame_select(self, _event=None) -> None:
+        sel = self._px_frames_box.curselection()
+        if not sel:
+            return
+        self._px_doc.go_frame(sel[0])
+        self._px_refresh_frames_list()
+        self._px_redraw()
+
+    def _px_add_frame(self, duplicate: bool) -> None:
+        self._px_doc.add_frame(duplicate=duplicate)
+        self._px_refresh_frames_list()
+        self._px_redraw()
+
+    def _px_remove_frame(self) -> None:
+        if self._px_doc.remove_frame(self._px_doc.current):
+            self._px_refresh_frames_list()
+            self._px_redraw()
+
+    # ---- Steam Market tab (phase D) ----
+
+    def _build_steam_market_tab(self):
+        """Steam Market — pull cached Steam data and ask the
+        Steam Market Analyst computed-not-invented questions.
+
+        Network policy:
+          • All HTTP via urllib (stdlib)
+          • Strict opt-in: every Pull button confirms before
+            making requests
+          • Cache lives under vault/steam/ (protected from the
+            council — the analyst is the only reader)
+        """
+        import steam_ingest, steam_analyst  # noqa: F401
+        self.tab_steam_market = ttk.Frame(self.nb)
+        self.nb.add(self.tab_steam_market, text="📈 Steam Market")
+
+        self._sm_busy = False
+
+        # Top strip — pull controls
+        strip = ttk.Frame(self.tab_steam_market)
+        strip.pack(fill="x", padx=6, pady=(6, 4))
+        ttk.Label(strip, text="Pull current data:").pack(side="left")
+        self._sm_pull_top_btn = ttk.Button(
+            strip, text="🌐 Top sellers (SteamSpy + Charts)",
+            command=lambda: self._sm_pull("top"),
+        )
+        self._sm_pull_top_btn.pack(side="left", padx=(8, 4))
+        ttk.Label(strip, text="Genre:").pack(side="left", padx=(8, 2))
+        self._sm_genre_var = tk.StringVar()
+        ttk.Entry(strip, textvariable=self._sm_genre_var, width=18).pack(
+            side="left", padx=(0, 4))
+        self._sm_pull_genre_btn = ttk.Button(
+            strip, text="🌐 Pull genre",
+            command=lambda: self._sm_pull("genre"),
+        )
+        self._sm_pull_genre_btn.pack(side="left")
+        self._sm_status_var = tk.StringVar(value="(no recent pulls)")
+        ttk.Label(strip, textvariable=self._sm_status_var,
+                  foreground="#a98a8a").pack(side="right")
+
+        # Body — horizontal pane: cache list | Q&A panel
+        body = tk.PanedWindow(self.tab_steam_market, orient="horizontal",
+                              bg="#1a1414", sashwidth=6)
+        body.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # Left — cache file list
+        left = ttk.Frame(body)
+        body.add(left, width=320, minsize=240)
+        ttk.Label(left, text="Cached pulls (newest first)").pack(
+            anchor="w", padx=2, pady=(0, 2))
+        cache_row = ttk.Frame(left)
+        cache_row.pack(fill="both", expand=True)
+        self._sm_cache_box = tk.Listbox(
+            cache_row, bg="#0f0c0c", fg="#d4d4d4",
+            selectbackground="#4a2626", selectforeground="#d4d4d4",
+            font=("Consolas", 9), activestyle="none",
+        )
+        clsb = ttk.Scrollbar(cache_row, orient="vertical",
+                              command=self._sm_cache_box.yview)
+        self._sm_cache_box.configure(yscrollcommand=clsb.set)
+        self._sm_cache_box.pack(side="left", fill="both", expand=True)
+        clsb.pack(side="right", fill="y")
+        cache_actions = ttk.Frame(left)
+        cache_actions.pack(fill="x", pady=(4, 0))
+        ttk.Button(cache_actions, text="⟳ Refresh",
+                   command=self._sm_refresh_cache).pack(side="left")
+        ttk.Button(cache_actions, text="📂 Open cache folder",
+                   command=lambda: self._open_in_explorer(
+                       VAULT_DIR / "steam")).pack(side="left", padx=4)
+
+        # Right — Q&A panel
+        right = ttk.Frame(body)
+        body.add(right, minsize=420)
+        ttk.Label(right, text="Ask the Steam Market Analyst").pack(
+            anchor="w", padx=2, pady=(0, 2))
+        q_row = ttk.Frame(right)
+        q_row.pack(fill="x", pady=(0, 4))
+        self._sm_question_var = tk.StringVar()
+        q_entry = ttk.Entry(q_row, textvariable=self._sm_question_var)
+        q_entry.pack(side="left", fill="x", expand=True)
+        q_entry.bind("<Return>", lambda e: self._sm_ask())
+        ttk.Button(q_row, text="📊 Compute",
+                   command=self._sm_ask).pack(side="left", padx=(4, 0))
+
+        # Answer pane
+        ans_row = ttk.Frame(right)
+        ans_row.pack(fill="both", expand=True)
+        self._sm_answer = tk.Text(
+            ans_row, wrap="word",
+            bg="#0a0808", fg="#d4d4d4", font=("Consolas", 10),
+            state="disabled",
+        )
+        asb = ttk.Scrollbar(ans_row, orient="vertical",
+                             command=self._sm_answer.yview)
+        self._sm_answer.configure(yscrollcommand=asb.set)
+        self._sm_answer.pack(side="left", fill="both", expand=True)
+        asb.pack(side="right", fill="y")
+        self._sm_answer.tag_configure("h1", font=("Segoe UI", 11, "bold"),
+                                       foreground="#e0884a")
+        self._sm_answer.tag_configure("muted", foreground="#7a7575")
+        self._sm_answer.tag_configure("err", foreground="#ff5252")
+
+        # Send to Council button
+        send_row = ttk.Frame(right)
+        send_row.pack(fill="x", pady=(4, 0))
+        ttk.Button(send_row, text="⚖ Send this computation to the Council",
+                   command=self._sm_send_to_council).pack(side="left")
+
+        self._sm_refresh_cache()
+
+    # ── Pull ────────────────────────────────────────────────────────
+
+    def _sm_pull(self, kind: str) -> None:
+        from tkinter import messagebox
+        if self._sm_busy:
+            return
+        if kind == "top":
+            hosts = "steamspy.com, steamcharts.com, api.steampowered.com"
+            label = "top sellers"
+        else:
+            genre = self._sm_genre_var.get().strip()
+            if not genre:
+                messagebox.showinfo(
+                    "Genre needed",
+                    "Type a genre in the Genre box first (e.g. Puzzle, Roguelike).",
+                    parent=self,
+                )
+                return
+            hosts = "steamspy.com"
+            label = f"genre {genre!r}"
+        if not messagebox.askyesno(
+            "Network request",
+            f"Anvil will make HTTP requests to {hosts} to pull {label} "
+            f"into vault/steam/. Continue?",
+            parent=self,
+        ):
+            return
+        self._sm_busy = True
+        self._sm_pull_top_btn.configure(state="disabled")
+        self._sm_pull_genre_btn.configure(state="disabled")
+        self._sm_status_var.set("Pulling… (network)")
+
+        def _worker():
+            import steam_ingest as _si
+            results = []
+            try:
+                if kind == "top":
+                    results = _si.ingest_top_sellers(VAULT_DIR)
+                else:
+                    genre = self._sm_genre_var.get().strip()
+                    results = [_si.ingest_steamspy_genre(VAULT_DIR, genre)]
+            except Exception as exc:
+                print(f"[Steam Market] pull crashed: {exc!r}")
+                results = []
+
+            def _done():
+                self._sm_busy = False
+                self._sm_pull_top_btn.configure(state="normal")
+                self._sm_pull_genre_btn.configure(state="normal")
+                ok_count = sum(1 for r in results if r.ok)
+                if not results:
+                    self._sm_status_var.set("Pull crashed — see console.")
+                    return
+                if ok_count == 0:
+                    msgs = "; ".join(f"{r.source}: {r.error}" for r in results)
+                    self._sm_status_var.set(f"All pulls failed — {msgs}")
+                else:
+                    summary = ", ".join(
+                        f"{r.source}={r.record_count}" for r in results if r.ok
+                    )
+                    failed = [r for r in results if not r.ok]
+                    msg = f"Pulled {ok_count} source(s) — {summary}"
+                    if failed:
+                        msg += " (partial: " + "; ".join(
+                            f"{r.source}: {r.error}" for r in failed
+                        ) + ")"
+                    self._sm_status_var.set(msg)
+                self._sm_refresh_cache()
+            self.after(0, _done)
+
+        threading.Thread(target=_worker, daemon=True,
+                          name="steam-pull").start()
+
+    # ── Cache list ──────────────────────────────────────────────────
+
+    def _sm_refresh_cache(self) -> None:
+        import steam_analyst as _sa
+        self._sm_cache_box.delete(0, "end")
+        files = _sa.list_cached_pulls(VAULT_DIR)
+        for p in files:
+            try:
+                n_lines = sum(1 for _ in open(p, "r", encoding="utf-8"))
+            except Exception:
+                n_lines = 0
+            self._sm_cache_box.insert(
+                "end", f"  {p.name}   ({n_lines} rows)"
+            )
+        if not files:
+            self._sm_cache_box.insert("end",
+                "  (no pulls yet — click a 🌐 button above)")
+
+    # ── Q&A ─────────────────────────────────────────────────────────
+
+    def _sm_ask(self) -> None:
+        import steam_analyst as _sa
+        q = self._sm_question_var.get().strip()
+        if not q:
+            return
+        result = _sa.answer_question(q, VAULT_DIR)
+        self._sm_last_result = result
+        self._sm_render_answer(q, result)
+
+    def _sm_render_answer(self, question: str, result) -> None:
+        d = self._sm_answer
+        d.configure(state="normal")
+        d.delete("1.0", "end")
+        d.insert("end", f"Q: {question}\n\n", ("h1",))
+        d.insert("end", f"confidence: {result.confidence}\n", ("muted",))
+        if result.error:
+            d.insert("end", f"\nERROR: {result.error}\n", ("err",))
+        if result.answer:
+            d.insert("end", "\n" + result.answer + "\n")
+        if result.computed_values:
+            d.insert("end", "\ncomputed:\n", ("muted",))
+            for k, v in result.computed_values.items():
+                d.insert("end", f"  {k}: {v}\n", ("muted",))
+        if result.sources:
+            d.insert("end", "\nsources:\n", ("muted",))
+            for s in result.sources:
+                d.insert("end", f"  - {s.name}\n", ("muted",))
+        d.configure(state="disabled")
+
+    def _sm_send_to_council(self) -> None:
+        """Stage the last analyst result + the question for the Council.
+
+        The question goes into the editable input box. The analyst's
+        computed block goes into the read-only injection slot above
+        the input, so the user can SEE the citations and CLEAR them
+        but cannot edit them out. ``_send`` prepends the slot block
+        to the user_text at dispatch time.
+        """
+        result = getattr(self, "_sm_last_result", None)
+        question = self._sm_question_var.get().strip()
+        if result is None or not question:
+            return
+        try:
+            inp = getattr(self, "input", None)
+            if inp is not None:
+                inp.delete("1.0", "end")
+                inp.insert("1.0", question)
+            # Attach the computed block to the protected slot
+            self._council_attach_injection(
+                label="📊 Steam Market context (computed, with citations)",
+                block=result.to_injection_block(),
+            )
+            if hasattr(self, "tab_council"):
+                self.nb.select(self.tab_council)
+        except Exception as exc:
+            print(f"[Steam Market] stage to council failed: {exc!r}")
+
+    # ---- Simulations tab ----
+
+    # Default sweep JSON shown in the editor when there is no
+    # current sim — gives the user a working example to mutate.
+    # Includes a persona axis so the user sees how to wire it in
+    # alongside scalar axes from the first launch.
+    _SIM_DEFAULT_SWEEP = (
+        '{\n'
+        '  "axes": {\n'
+        '    "difficulty": {"type": "range",\n'
+        '                    "start": 1, "stop": 4, "step": 1},\n'
+        '    "starting_gold": {"type": "list",\n'
+        '                       "values": [100, 250, 500]},\n'
+        '    "playstyle": {"type": "persona",\n'
+        '                   "names": ["Greedy", "Cautious"]}\n'
+        '  }\n'
+        '}\n'
+    )
+
+    def _build_simulations_tab(self):
+        """🎲 Simulations — kick off sweeps, browse results.
+
+        Layout (vertical PanedWindow):
+
+            ┌─ Top strip ───────────────────────────────────────┐
+            │ Sim: [name ▼]  Backend [godot|python]             │
+            │ Project / module: [path] [Browse]                 │
+            │ Duration: [s]  [▶ Run sweep] [■ Stop] [Progress]  │
+            ├─ Sweep config ────────────────────────────────────┤
+            │ {JSON editor for the ParameterSweep axes}         │
+            ├─ Results table ───────────────────────────────────┤
+            │ id | sim | backend | params | metrics | error     │
+            ├─ Run detail ──────────────────────────────────────┤
+            │ Selected run's full record + events               │
+            └───────────────────────────────────────────────────┘
+        """
+        import sim_recorder as _smrec
+        import sim_personas as _smp
+        self.tab_simulations = ttk.Frame(self.nb)
+        self.nb.add(self.tab_simulations, text="🎲 Simulations")
+
+        # Recorder + state ────────────────────────────────────────
+        self._sim_recorder = _smrec.SimRecorder(VAULT_DIR)
+        # Persona registry — merged view of built-ins + user
+        # vault/simulations/personas.json. Threaded into the sweep
+        # parser so persona axes resolve against user customisations.
+        self._sim_personas = _smp.PersonaRegistry(VAULT_DIR)
+        self._sim_running = False
+        self._sim_cancel = None     # threading.Event when a sweep runs
+        self._sim_current_run = None  # id of currently displayed run
+
+        # Top strip — sim picker + backend + project + Run controls
+        strip = ttk.Frame(self.tab_simulations)
+        strip.pack(fill="x", padx=6, pady=(6, 4))
+        ttk.Label(strip, text="Sim:").pack(side="left")
+        self._sim_name_var = tk.StringVar(value="my_sim")
+        ttk.Entry(strip, textvariable=self._sim_name_var,
+                   width=18).pack(side="left", padx=(4, 8))
+        ttk.Label(strip, text="Backend:").pack(side="left")
+        self._sim_backend_var = tk.StringVar(value="python")
+        ttk.OptionMenu(strip, self._sim_backend_var,
+                        "python", "python", "godot",
+                        command=lambda _v: self._sim_update_target_label(),
+                        ).pack(side="left", padx=(4, 8))
+        # Target row (different label for python vs godot)
+        self._sim_target_label_var = tk.StringVar(value="Module (.py):")
+        ttk.Label(strip, textvariable=self._sim_target_label_var).pack(
+            side="left")
+        self._sim_target_var = tk.StringVar(value="")
+        ttk.Entry(strip, textvariable=self._sim_target_var,
+                   width=44).pack(side="left", padx=(4, 4),
+                                   fill="x", expand=True)
+        ttk.Button(strip, text="Browse…",
+                   command=self._sim_browse_target).pack(side="left")
+        # Duration + Run buttons
+        strip2 = ttk.Frame(self.tab_simulations)
+        strip2.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(strip2, text="Duration (s):").pack(side="left")
+        self._sim_duration_var = tk.IntVar(value=20)
+        ttk.Spinbox(strip2, from_=2, to=600, increment=2, width=5,
+                     textvariable=self._sim_duration_var
+                     ).pack(side="left", padx=(4, 8))
+        self._sim_run_btn = ttk.Button(strip2, text="▶ Run sweep",
+                                        command=self._sim_run_sweep)
+        self._sim_run_btn.pack(side="left", padx=2)
+        self._sim_stop_btn = ttk.Button(strip2, text="■ Stop",
+                                         command=self._sim_stop_sweep,
+                                         state="disabled")
+        self._sim_stop_btn.pack(side="left", padx=2)
+        # Persona picker — used as a quick way to fire a single run
+        # against one persona without editing the sweep JSON. Set to
+        # "(none)" to leave persona keys out entirely; pick a name to
+        # use that persona's full param block on every run that doesn't
+        # already have a persona axis in the sweep config.
+        ttk.Label(strip2, text="Persona:").pack(side="left", padx=(12, 2))
+        self._sim_persona_var = tk.StringVar(value="(none)")
+        persona_choices = ["(none)"] + self._sim_personas.names()
+        self._sim_persona_menu = ttk.OptionMenu(
+            strip2, self._sim_persona_var,
+            "(none)", *persona_choices,
+        )
+        self._sim_persona_menu.pack(side="left", padx=(0, 4))
+        ttk.Button(strip2, text="↧ Insert axis",
+                   command=self._sim_insert_persona_axis
+                   ).pack(side="left", padx=(0, 8))
+
+        self._sim_progress_var = tk.StringVar(
+            value="(no sweep running)")
+        ttk.Label(strip2, textvariable=self._sim_progress_var,
+                  foreground="#a98a8a").pack(side="left", padx=(12, 0))
+
+        # Body — vertical PanedWindow: sweep config → results → detail
+        body = tk.PanedWindow(self.tab_simulations, orient="vertical",
+                               bg="#1a1414", sashwidth=6)
+        body.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+
+        # Sweep config editor ─────────────────────────────────────
+        sweep_frame = ttk.Frame(body)
+        body.add(sweep_frame, minsize=120)
+        ttk.Label(sweep_frame,
+                  text="Sweep config (ParameterSweep JSON)",
+                  foreground="#a98a8a"
+                  ).pack(anchor="w")
+        sweep_row = ttk.Frame(sweep_frame)
+        sweep_row.pack(fill="both", expand=True)
+        self._sim_sweep_text = tk.Text(
+            sweep_row, height=8, wrap="none",
+            bg="#0f0c0c", fg="#d4d4d4",
+            insertbackground="#d4d4d4", font=("Consolas", 9),
+        )
+        self._sim_sweep_text.insert("1.0", self._SIM_DEFAULT_SWEEP)
+        ssb = ttk.Scrollbar(sweep_row, orient="vertical",
+                             command=self._sim_sweep_text.yview)
+        self._sim_sweep_text.configure(yscrollcommand=ssb.set)
+        self._sim_sweep_text.pack(side="left", fill="both", expand=True)
+        ssb.pack(side="right", fill="y")
+
+        # Results table ───────────────────────────────────────────
+        res_frame = ttk.Frame(body)
+        body.add(res_frame, minsize=180)
+        res_strip = ttk.Frame(res_frame)
+        res_strip.pack(fill="x")
+        ttk.Label(res_strip, text="Runs (newest first)",
+                  foreground="#a98a8a").pack(side="left")
+        ttk.Button(res_strip, text="⟳ Refresh",
+                   command=self._sim_refresh_results
+                   ).pack(side="right", padx=2)
+        ttk.Button(res_strip, text="🗑 Delete selected",
+                   command=self._sim_delete_selected
+                   ).pack(side="right", padx=2)
+        ttk.Button(res_strip,
+                   text="⚖ Send sweep to Council",
+                   command=self._sim_send_sweep_to_council
+                   ).pack(side="right", padx=2)
+        ttk.Button(res_strip,
+                   text="⚖ Send selected to Council",
+                   command=self._sim_send_to_council
+                   ).pack(side="right", padx=2)
+        res_row = ttk.Frame(res_frame)
+        res_row.pack(fill="both", expand=True)
+        self._sim_tree = ttk.Treeview(
+            res_row,
+            columns=("sim", "backend", "persona", "duration",
+                     "params", "metrics", "ok"),
+            show="headings",
+            selectmode="browse",
+        )
+        for col, lbl, w in (
+            ("sim",      "Sim",       110),
+            ("backend",  "Backend",    70),
+            ("persona",  "Persona",    90),
+            ("duration", "s",          40),
+            ("params",   "Params",    180),
+            ("metrics",  "Metrics",   220),
+            ("ok",       "Status",     70),
+        ):
+            self._sim_tree.heading(col, text=lbl)
+            self._sim_tree.column(col, width=w, anchor="w")
+        rsb = ttk.Scrollbar(res_row, orient="vertical",
+                             command=self._sim_tree.yview)
+        self._sim_tree.configure(yscrollcommand=rsb.set)
+        self._sim_tree.pack(side="left", fill="both", expand=True)
+        rsb.pack(side="right", fill="y")
+        self._sim_tree.bind("<<TreeviewSelect>>",
+                              self._sim_on_select)
+
+        # Detail pane ─────────────────────────────────────────────
+        det_frame = ttk.Frame(body)
+        body.add(det_frame, minsize=140)
+        ttk.Label(det_frame, text="Selected run detail",
+                  foreground="#a98a8a").pack(anchor="w")
+        det_row = ttk.Frame(det_frame)
+        det_row.pack(fill="both", expand=True)
+        self._sim_detail = tk.Text(
+            det_row, wrap="word", bg="#0a0808",
+            fg="#d4d4d4", font=("Consolas", 9), state="disabled",
+        )
+        dsb = ttk.Scrollbar(det_row, orient="vertical",
+                             command=self._sim_detail.yview)
+        self._sim_detail.configure(yscrollcommand=dsb.set)
+        self._sim_detail.pack(side="left", fill="both", expand=True)
+        dsb.pack(side="right", fill="y")
+        self._sim_detail.tag_configure("h1",
+            font=("Segoe UI", 11, "bold"), foreground="#e0884a")
+        self._sim_detail.tag_configure("err", foreground="#ff5252")
+        self._sim_detail.tag_configure("muted", foreground="#7a7575")
+
+        # Initial state
+        self._sim_update_target_label()
+        self._sim_refresh_results()
+
+    # ── Helpers — picker + label ────────────────────────────────
+
+    def _sim_update_target_label(self) -> None:
+        if self._sim_backend_var.get() == "godot":
+            self._sim_target_label_var.set("Godot project:")
+        else:
+            self._sim_target_label_var.set("Module (.py):")
+
+    def _sim_insert_persona_axis(self) -> None:
+        """Append a ``"playstyle": {"type":"persona", "names": "all"}``
+        axis to the sweep JSON editor. Saves the user from typing the
+        boilerplate every time they want to add persona variation."""
+        snippet = (
+            ',\n    "playstyle": {"type": "persona", "names": "all"}\n'
+        )
+        # Locate the closing `}` of the axes object and inject before it.
+        # If the editor isn't valid JSON, just append the snippet to the
+        # end so the user can adjust manually.
+        raw = self._sim_sweep_text.get("1.0", "end")
+        try:
+            import json as _j
+            cfg = _j.loads(raw)
+            if (isinstance(cfg, dict)
+                    and isinstance(cfg.get("axes"), dict)):
+                cfg["axes"]["playstyle"] = {"type": "persona",
+                                              "names": "all"}
+                pretty = _j.dumps(cfg, indent=2)
+                self._sim_sweep_text.delete("1.0", "end")
+                self._sim_sweep_text.insert("1.0", pretty + "\n")
+                return
+        except Exception:
+            pass
+        # Fallback — just append the snippet at the end.
+        self._sim_sweep_text.insert("end", snippet)
+
+    def _sim_browse_target(self) -> None:
+        from tkinter import filedialog
+        if self._sim_backend_var.get() == "godot":
+            path = filedialog.askdirectory(
+                title="Pick a folder containing project.godot",
+            )
+        else:
+            path = filedialog.askopenfilename(
+                title="Pick a Python sim module",
+                filetypes=[("Python", "*.py"), ("All files", "*.*")],
+            )
+        if path:
+            self._sim_target_var.set(path)
+
+    # ── Sweep run ───────────────────────────────────────────────
+
+    def _sim_run_sweep(self) -> None:
+        from tkinter import messagebox
+        if self._sim_running:
+            return
+        # Parse the sweep JSON. Thread the persona registry through so
+        # persona axes resolve against the user's vault customisations.
+        try:
+            import json as _j
+            import sim_sweep as _ss
+            cfg = _j.loads(self._sim_sweep_text.get("1.0", "end"))
+            sweep = _ss.ParameterSweep.from_dict_with_registry(
+                cfg, self._sim_personas,
+            )
+        except Exception as exc:
+            messagebox.showerror(
+                "Invalid sweep JSON",
+                f"{exc}", parent=self,
+            )
+            return
+        # If the user picked a persona in the top strip AND the sweep
+        # config doesn't already include a persona axis, overlay the
+        # selected persona on every combo. The base axes still win
+        # on key conflicts (per merge_persona_params policy) so a
+        # sweep that explicitly overrides persona.greed keeps its
+        # override.
+        active_persona = self._sim_persona_var.get()
+        if (active_persona and active_persona != "(none)"
+                and not _sim_sweep_has_persona_axis(cfg)):
+            persona = self._sim_personas.get(active_persona)
+            if persona is not None:
+                sweep = _SimPersonaOverlay(sweep, persona)
+        total = len(sweep)
+        if total == 0:
+            messagebox.showinfo(
+                "Empty sweep",
+                "The sweep would produce zero runs — check your axes.",
+                parent=self,
+            )
+            return
+        if total > 200:
+            if not messagebox.askyesno(
+                "Large sweep",
+                f"This sweep will produce {total} runs. Continue?",
+                parent=self,
+            ):
+                return
+        # Build the runner
+        backend = self._sim_backend_var.get()
+        target = self._sim_target_var.get().strip()
+        if not target:
+            messagebox.showinfo(
+                "Pick a target",
+                "Set a Godot project path or .py module first.",
+                parent=self,
+            )
+            return
+        try:
+            duration = max(2, int(self._sim_duration_var.get() or 20))
+        except Exception:
+            duration = 20
+        try:
+            import sim_runner as _sr
+            if backend == "godot":
+                # Reuse the workspace's binary picker if available
+                try:
+                    import godot_workspace as _gw
+                    godot_bin = _gw.get_godot_binary()
+                except Exception:
+                    godot_bin = "godot"
+                runner = _sr.GodotSimRunner(
+                    target, godot_binary=godot_bin,
+                    duration_s=duration,
+                )
+            else:
+                runner = _sr.PythonSimRunner(
+                    target, timeout_s=duration,
+                )
+        except Exception as exc:
+            messagebox.showerror(
+                "Could not build runner", f"{exc}", parent=self,
+            )
+            return
+
+        sim_name = self._sim_name_var.get().strip() or "untitled"
+        self._sim_running = True
+        self._sim_cancel = threading.Event()
+        self._sim_run_btn.configure(state="disabled")
+        self._sim_stop_btn.configure(state="normal")
+        self._sim_progress_var.set(f"Starting sweep ({total} runs)…")
+
+        def _worker():
+            import sim_sweep as _ss
+            def _on_progress(p):
+                # Marshal to main thread for UI updates
+                def _ui():
+                    self._sim_progress_var.set(
+                        f"{p.completed}/{p.total}  "
+                        + (("⚠ " + (p.error or "")[:40])
+                           if p.error else
+                           f"latest: {p.current!r}"[:80])
+                    )
+                    self._sim_refresh_results()
+                try:
+                    self.after(0, _ui)
+                except Exception:
+                    pass
+            _ss.run_sweep(
+                sweep, runner, self._sim_recorder,
+                sim_name=sim_name,
+                on_progress=_on_progress,
+                cancel=self._sim_cancel,
+            )
+            def _done():
+                self._sim_running = False
+                self._sim_run_btn.configure(state="normal")
+                self._sim_stop_btn.configure(state="disabled")
+                if self._sim_cancel and self._sim_cancel.is_set():
+                    self._sim_progress_var.set(
+                        "Cancelled. Partial results above.")
+                else:
+                    self._sim_progress_var.set(
+                        f"Done. {total} run(s) recorded.")
+                self._sim_refresh_results()
+            try:
+                self.after(0, _done)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True,
+                          name="anvil-sim-sweep").start()
+
+    def _sim_stop_sweep(self) -> None:
+        if self._sim_cancel is not None:
+            self._sim_cancel.set()
+            self._sim_progress_var.set("Cancel requested…")
+
+    # ── Results table ───────────────────────────────────────────
+
+    def _sim_refresh_results(self) -> None:
+        # Wipe and re-populate
+        for iid in self._sim_tree.get_children():
+            self._sim_tree.delete(iid)
+        sim_filter = self._sim_name_var.get().strip()
+        runs = self._sim_recorder.list_runs(limit=200)
+        if sim_filter:
+            runs = [r for r in runs
+                    if r.get("sim_name", "").startswith(sim_filter)
+                    or sim_filter in r.get("sim_name", "")]
+        for entry in runs:
+            raw_params = entry.get("params") or {}
+            # Persona column gets the persona_name; the Params column
+            # shows everything ELSE so persona.* keys don't drown out
+            # the scalar params the user actually swept on.
+            persona_name = str(raw_params.get("persona_name") or "")
+            non_persona = {
+                k: v for k, v in raw_params.items()
+                if k == "persona_name"
+                or k == "persona"
+                or k.startswith("persona.")
+                # All persona-related keys filtered out
+            }
+            scalar_params = {
+                k: v for k, v in raw_params.items()
+                if k not in non_persona
+            }
+            params_brief = self._brief_dict(scalar_params)
+            metrics_brief = self._brief_dict(entry.get("metrics") or {})
+            status = "ok" if entry.get("ok") else "FAIL"
+            self._sim_tree.insert(
+                "", "end", iid=entry["id"],
+                values=(
+                    entry.get("sim_name", "?"),
+                    entry.get("backend", "?"),
+                    persona_name or "—",
+                    f"{entry.get('duration_s', 0):.1f}",
+                    params_brief,
+                    metrics_brief,
+                    status,
+                ),
+            )
+
+    @staticmethod
+    def _brief_dict(d: Dict[str, Any], max_chars: int = 60) -> str:
+        if not d:
+            return ""
+        parts = []
+        for k, v in d.items():
+            if isinstance(v, float):
+                vs = f"{v:.2f}"
+            else:
+                vs = str(v)
+            parts.append(f"{k}={vs}")
+        out = ", ".join(parts)
+        return out if len(out) <= max_chars else out[: max_chars - 1] + "…"
+
+    def _sim_on_select(self, _event=None) -> None:
+        sel = self._sim_tree.selection()
+        if not sel:
+            return
+        run_id = sel[0]
+        self._sim_current_run = run_id
+        run = self._sim_recorder.load_run(run_id)
+        if run is None:
+            return
+        d = self._sim_detail
+        d.configure(state="normal")
+        d.delete("1.0", "end")
+        d.insert("end", f"{run.sim_name}  /  {run.id}\n", ("h1",))
+        d.insert("end",
+            f"backend: {run.backend}   "
+            f"duration: {run.duration_s}s   "
+            f"exit: {run.exit_code}\n",
+            ("muted",))
+        if run.error:
+            d.insert("end", f"\nERROR: {run.error}\n", ("err",))
+        # Persona block first if present, so the playstyle context
+        # leads the read. Other params follow.
+        persona_keys = {
+            k: v for k, v in (run.params or {}).items()
+            if k == "persona_name"
+            or k == "persona"
+            or k.startswith("persona.")
+        }
+        if persona_keys:
+            persona_name = persona_keys.get("persona_name", "?")
+            d.insert("end",
+                f"\npersona: {persona_name}\n", ("muted",))
+            for k in sorted(persona_keys.keys()):
+                if k in ("persona_name", "persona"):
+                    continue
+                # k looks like "persona.greed" → show the axis bare
+                axis = k.split(".", 1)[1] if "." in k else k
+                d.insert("end", f"  {axis:14s} = {persona_keys[k]}\n")
+        if run.params:
+            non_persona_params = {
+                k: v for k, v in run.params.items()
+                if k not in persona_keys
+            }
+            if non_persona_params:
+                d.insert("end", "\nparams:\n", ("muted",))
+                for k, v in non_persona_params.items():
+                    d.insert("end", f"  {k} = {v}\n")
+        if run.metrics:
+            d.insert("end", "\nmetrics:\n", ("muted",))
+            for k, v in run.metrics.items():
+                d.insert("end", f"  {k} = {v}\n")
+        if run.events:
+            d.insert("end",
+                f"\nevents ({len(run.events)}):\n", ("muted",))
+            for ev in run.events[:80]:
+                d.insert("end",
+                    f"  [{ev.t:6.2f}s] {ev.name}  {ev.data}\n"
+                )
+            if len(run.events) > 80:
+                d.insert("end",
+                    f"  … plus {len(run.events) - 80} more.\n",
+                    ("muted",))
+        if run.stderr_tail:
+            d.insert("end", "\nstderr (tail):\n", ("muted",))
+            d.insert("end", run.stderr_tail + "\n")
+        d.configure(state="disabled")
+
+    def _sim_delete_selected(self) -> None:
+        from tkinter import messagebox
+        if not self._sim_current_run:
+            return
+        if not messagebox.askyesno(
+            "Delete run?",
+            "Permanently delete this run's JSON record?",
+            parent=self,
+        ):
+            return
+        self._sim_recorder.delete_run(self._sim_current_run)
+        self._sim_current_run = None
+        self._sim_refresh_results()
+
+    def _sim_send_sweep_to_council(self) -> None:
+        """Hand a sweep-level computed analysis to the Council.
+
+        Pulls the recent runs for the current sim_name, runs the
+        sim_analyst against a generic "summarise" question, and posts
+        the computed block into the protected injection slot. The
+        editable input gets a "Interpret this aggregate" prompt the
+        user can refine.
+        """
+        from tkinter import messagebox
+        try:
+            import sim_analyst as _sa
+        except Exception as exc:
+            messagebox.showerror(
+                "Sim analyst unavailable",
+                f"{exc!r}", parent=self,
+            )
+            return
+        sim_filter = self._sim_name_var.get().strip()
+        # Default query is just "summary" — the analyst's summary route
+        # returns a high-confidence overview of the run set, which is
+        # the right starting point for a Council deliberation.
+        result = _sa.answer_question(
+            "summary of the most recent simulation runs",
+            VAULT_DIR,
+            sim_name=sim_filter,
+        )
+        if result.error and not result.answer:
+            messagebox.showinfo(
+                "No sim data",
+                result.error, parent=self,
+            )
+            return
+        try:
+            inp = getattr(self, "input", None)
+            if inp is not None:
+                inp.delete("1.0", "end")
+                inp.insert("1.0",
+                    "Interpret this aggregate. Call out whether the "
+                    "distribution looks balanced or skewed, whether any "
+                    "persona is dominating, and what a sensible next "
+                    "sweep would look like.")
+            self._council_attach_injection(
+                label="🎲 Sim aggregate context (computed, read-only)",
+                block=result.to_injection_block(),
+            )
+            if hasattr(self, "tab_council"):
+                self.nb.select(self.tab_council)
+        except Exception as exc:
+            print(f"[Simulations] sweep stage failed: {exc!r}")
+
+    def _sim_send_to_council(self) -> None:
+        """Stage the selected run as a critique prompt for the
+        Council via the protected injection slot."""
+        if not self._sim_current_run:
+            return
+        run = self._sim_recorder.load_run(self._sim_current_run)
+        if run is None:
+            return
+        lines = [
+            "[SIMULATION RESULT — reviewed by the Sim Analyst]",
+            f"  sim_name:  {run.sim_name}",
+            f"  backend:   {run.backend}",
+            f"  duration:  {run.duration_s}s",
+            f"  status:    {'ok' if run.ok else 'FAIL'}",
+        ]
+        if run.params:
+            lines.append("  params:")
+            for k, v in run.params.items():
+                lines.append(f"    {k} = {v}")
+        if run.metrics:
+            lines.append("  metrics:")
+            for k, v in run.metrics.items():
+                lines.append(f"    {k} = {v}")
+        if run.events:
+            lines.append(f"  events ({len(run.events)}):")
+            for ev in run.events[:8]:
+                lines.append(f"    [{ev.t:6.2f}s] {ev.name}  {ev.data}")
+            if len(run.events) > 8:
+                lines.append(f"    … plus {len(run.events) - 8} more.")
+        if run.error:
+            lines.append(f"  error:     {run.error}")
+        try:
+            inp = getattr(self, "input", None)
+            if inp is not None:
+                inp.delete("1.0", "end")
+                inp.insert("1.0",
+                    "Interpret this simulation run. Highlight whether "
+                    "the metric values look like a balanced design or "
+                    "an outlier, what the params imply, and what next "
+                    "sweep you'd try.")
+            self._council_attach_injection(
+                label="🎲 Simulation context (read-only)",
+                block="\n".join(lines),
+            )
+            if hasattr(self, "tab_council"):
+                self.nb.select(self.tab_council)
+        except Exception as exc:
+            print(f"[Simulations] stage to council failed: {exc!r}")
+
     # ============================
     # Transcript helpers
     # ============================
@@ -11608,6 +15043,11 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         except Exception:
             pass
         try:
+            if hasattr(self, "goal_cache") and self.goal_cache:
+                self.goal_cache.end_session()
+        except Exception:
+            pass
+        try:
             self.destroy()
         except Exception:
             pass
@@ -11617,6 +15057,11 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         try:
             if hasattr(self, "conv_logger") and self.conv_logger:
                 self.conv_logger.flush()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "goal_cache") and self.goal_cache:
+                self.goal_cache.flush()
         except Exception:
             pass
         try:
@@ -12726,7 +16171,68 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
     # Main send logic
     # ============================
 
+    # ── Pending-injection slot ───────────────────────────────────────
+    #
+    # Analyst-computed context (Steam Market Analyst result, Game
+    # Concepts critique scaffold, etc.) is attached here rather than
+    # dumped into the editable input box. Reasons:
+    #   1. Integrity — the user can't accidentally strip citations
+    #      from the block (the widget is state="disabled").
+    #   2. Visibility — a labelled, distinct frame above the input
+    #      makes it obvious that *something* is being injected on
+    #      send, instead of hiding it inside a long input scroll.
+    #   3. Composability — the user keeps editing the actual question
+    #      in `self.input` while the computed block sits beside it,
+    #      both get sent at dispatch time.
+    # `self._pending_injection` holds {"label", "block"}; None means
+    # nothing is attached and the panel is hidden.
+
+    def _council_attach_injection(self, label: str, block: str) -> None:
+        """Stash a computed context block to prepend on the next send.
+
+        ``label`` is the short header shown above the read-only view
+        ("📊 Steam Market context", "🎮 Concept critique context").
+        ``block`` is the raw text that will be prepended verbatim to
+        ``user_text`` inside ``_send`` — it should already include
+        whatever citation framing the analyst produced.
+        """
+        if not block:
+            return
+        self._pending_injection = {"label": label, "block": block}
+        self._injection_label_var.set(label + "  (read-only; sent on next ⌃Enter)")
+        v = self._injection_view
+        v.configure(state="normal")
+        v.delete("1.0", "end")
+        v.insert("1.0", block)
+        v.configure(state="disabled")
+        # Show the panel above the input. We pack it before(self.input)
+        # so it always sits directly above the editable box.
+        try:
+            self._injection_panel.pack(fill="x", before=self.input)
+        except Exception:
+            self._injection_panel.pack(fill="x")
+
+    def _council_clear_injection(self) -> None:
+        """Drop any pending injection block and hide the panel."""
+        self._pending_injection = None
+        self._injection_label_var.set("")
+        v = self._injection_view
+        v.configure(state="normal")
+        v.delete("1.0", "end")
+        v.configure(state="disabled")
+        try:
+            self._injection_panel.pack_forget()
+        except Exception:
+            pass
+
     def _send(self):
+        # Clear the goal anchor from the prior turn before doing anything
+        # else. `_send` has many early-exit paths (licensing gate, empty
+        # input, fast-path handlers) above the distillation block; without
+        # this reset, an orch.run() call later in the same turn could read
+        # a stale goal from a prior turn via getattr(self, "_last_goal_anchor").
+        self._last_goal_anchor = ""
+
         # Licensing gate — skipped entirely in DEMO_MODE. In product
         # builds, this blocks new deliberations when trial expired and
         # no license active; past sessions are still readable.
@@ -12753,6 +16259,22 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         user_text = self.input.get("1.0", "end").strip()
         if not user_text:
             return
+        # ── Apply the pending injection slot ─────────────────────────
+        # If an analyst-computed block is attached (from the Steam
+        # Market or Game Concepts handoff), prepend it verbatim to
+        # the user's question. The block is read-only in the UI so
+        # the user can SEE and CLEAR it but cannot edit citations
+        # out — this preserves the chain-of-custody from the
+        # deterministic analyst to the council prompt.
+        # The injection panel is cleared after the prepend so it
+        # does not leak into the next turn unintentionally.
+        _injected = self._pending_injection
+        if _injected and _injected.get("block"):
+            user_text = _injected["block"].rstrip() + "\n\n" + user_text
+            try:
+                self._council_clear_injection()
+            except Exception:
+                pass
         self._last_sent_query = user_text   # saved for verdict disagree re-run
         self._set_text(self.input, "")
         self._append_transcript("User", user_text)
@@ -12773,6 +16295,16 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         if self._handle_vault_tools_intent(user_text):
             self._set_status("● idle")
             return
+
+        # ── Sim Analyst intents (questions about recorded simulations) ──
+        # When the user asks a sim-shaped question, run the deterministic
+        # analyst, attach the computed result to the protected injection
+        # slot, and let the council deliberate over the cited block.
+        # See _handle_sim_analyst_intent for the question patterns.
+        if self._handle_sim_analyst_intent(user_text):
+            # Don't return — we want the council to actually
+            # deliberate. The handler just attached the block.
+            pass
 
         # ── File-listing SAFETY NET ──────────────────────────────────────
         # When the user asks for a list of files in a folder — in ANY
@@ -12904,6 +16436,55 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
                 f"try rephrasing or check the file/column name.",
                 "observation",
             )
+
+        # ── Distill the user's goal BEFORE injection ──────────────────────
+        # On small local models (8B-ish) the post-injection prompt is often
+        # dominated by ~3K tokens of CSV / vault / analyst data with the
+        # actual question stuck at the tail. We compute a one-line goal
+        # anchor here so it can be:
+        #   1. re-injected at the top + bottom of every agent prompt
+        #      (primacy + recency slots — see _compose_prompt),
+        #   2. used to score rows during file-injection slicing (phase 3),
+        #   3. persisted to GoalCache so follow-up turns ("now do that for
+        #      last quarter") can chain against earlier intents.
+        # Hybrid strategy: heuristic strip first; if the result is short
+        # enough, no LLM call. Otherwise one cheap call to the judge model
+        # (max ~60 tokens out). Never raises — falls back to truncation.
+        _goal = ""
+        try:
+            import goal_anchor as _ga
+            _goal_model = getattr(self, "judge", None)
+            _goal = _ga.distill_goal(original_user_text, model=_goal_model)
+            # Follow-up turns: prepend prior goals so the model can resolve
+            # back-references ("the same thing", "again but with X").
+            if _ga.looks_like_followup(original_user_text) and hasattr(self, "goal_cache"):
+                try:
+                    _prev = self.goal_cache.recent_goal_strings(n=3)
+                    if _prev:
+                        _goal = _ga.format_followup_goal(_goal, _prev)
+                except Exception:
+                    pass
+        except Exception as _ge:
+            print(f"[goal_anchor] distillation failed: {_ge!r}")
+            _goal = (original_user_text or "")[:160]
+        # Stash for the orchestrator + transcript surfacing.
+        self._last_goal_anchor = _goal
+        if _goal:
+            try:
+                self.goal_cache.record(original_user_text, _goal)
+            except Exception:
+                pass
+            # Surface the goal so the user can sanity-check what the
+            # model is actually anchored on for this turn.
+            try:
+                _goal_line = _goal.replace("\n", " ").strip()
+                if len(_goal_line) > 200:
+                    _goal_line = _goal_line[:197] + "…"
+                self._append_transcript(
+                    "Council", f"Goal: {_goal_line}", "observation",
+                )
+            except Exception:
+                pass
 
         # ── Inject file/folder/vault context with token-aware caps ────────
         # The new pipeline (a) tags each block with its token cost, (b) caps
@@ -13307,7 +16888,14 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
                     def _make_token_cb(self_):
                         return None
                     def act(self_, ctx):
-                        state = self_.agent.run(ctx.user_text)
+                        # Pass the distilled goal so the ReAct retry loop
+                        # keeps the user's intent anchored across attempts,
+                        # even when the FIX prompt is dominated by failed
+                        # code + stderr.
+                        state = self_.agent.run(
+                            ctx.user_text,
+                            goal=getattr(ctx, "goal", "") or "",
+                        )
                         evs = [AgentEvent("Coder", "final",
                                           f"{state.final_code}\n\n{state.explanation}")]
                         if state.passed:
@@ -13670,7 +17258,8 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
                                        f"Style brief skipped ({_dsb_e})"))
 
                 events = orch.run(user_text, panel=panel, synth=synth_role,
-                                  extra_ctx=_orch_extra)
+                                  extra_ctx=_orch_extra,
+                                  goal=getattr(self, "_last_goal_anchor", ""))
 
                 # Extract final and critique
                 final_text = next((e.text for e in reversed(events) if e.who == "Writer" and e.kind == "final"), "")
@@ -14444,7 +18033,17 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
                 judge_model=self.judge, agents=agents,
                 max_rounds=2, debate_turns=1,  # leaner for background -- 1 cross-fire turn
             )
-            events = orch.run(prompt, panel=panel, synth=synth_role)
+            # Background queue runs without the foreground goal_anchor —
+            # distill heuristically (no LLM call) so the bg path still
+            # gets a top-of-prompt anchor without slowing down the queue.
+            _bg_goal = ""
+            try:
+                import goal_anchor as _ga_bg
+                _bg_goal = _ga_bg.distill_goal(prompt, model=None)
+            except Exception:
+                pass
+            events = orch.run(prompt, panel=panel, synth=synth_role,
+                              goal=_bg_goal)
             result = next((e.text for e in reversed(events)
                            if e.who == "Writer" and e.kind == "final"), "")
             critique = next((e.text for e in reversed(events)

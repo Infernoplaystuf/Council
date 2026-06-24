@@ -53,3 +53,14 @@ _norton_/
 
 # Eval / debug run logs
 *.log
+
+# Godot scratch / generated
+.godot/
+*.import
+.import/
+export_presets.cfg
+*.translation
+godot-mono-builds/
+# Per-user editor state — let each dev keep their own
+project.godot.bak
+*.tmp.gd

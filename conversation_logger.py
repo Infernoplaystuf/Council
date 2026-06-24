@@ -49,6 +49,14 @@ PROTECTED_SUBDIRS: tuple = (
     # query_history_search bypasses vault_index (reads conversations/
     # directly), so excluding the folder here doesn't break that feature.
     "conversations",
+    # Ingested Steam market data (SteamSpy / SteamCharts / Web API pulls).
+    # The Steam Market Analyst computes from this cache deterministically
+    # and surfaces results with citations — but the raw JSON must NOT be
+    # readable by the model directly, or it will hallucinate "according
+    # to Steam, X has 50K players" from training memory rather than from
+    # current data. Same defence pattern as user-data files in the
+    # previous build.
+    "steam",
 )
 
 
