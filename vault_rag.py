@@ -517,8 +517,18 @@ class VaultRAG:
 
         if _CHROMA_OK:
             chroma_path = chroma_dir or (vault_dir.parent / ".chromadb")
-            self._backend = _ChromaBackend(chroma_path)
-            self._backend_name = "chromadb"
+            try:
+                self._backend = _ChromaBackend(chroma_path)
+                self._backend_name = "chromadb"
+            except Exception as exc:
+                # Chroma 1.x+ split the PersistentClient into a separate
+                # package and a stale install can still expose the import
+                # but fail at construction time. Fall through to the
+                # keyword backend rather than killing startup.
+                print(f"[VaultRAG] chromadb backend init failed "
+                      f"({exc!r}); falling back to keyword search.")
+                self._backend = _KeywordBackend(vault_dir)
+                self._backend_name = "keyword"
         else:
             print("[VaultRAG] chromadb not installed — using TF-IDF search fallback")
             self._backend = _KeywordBackend(vault_dir)
