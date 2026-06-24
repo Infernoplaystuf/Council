@@ -59,7 +59,7 @@ build.bat        # Windows
 | Tab | What it's for |
 |---|---|
 | **⚖ Council** | The chat. Ask anything. The Judge picks a panel and they deliberate. |
-| **🛠 Godot Workspace** | The IDE. File tree, GDScript editor, scene-tree view, Run/Validate buttons, console panel. The edit-test-visualise loop lives here. *(Phase C-lite)* |
+| **🛠 Godot Workspace** | The IDE. File tree, GDScript editor, scene-tree view, Run/Validate buttons, console panel. The edit-test-visualise loop lives here. **📄 Build from GDD button** — paste a markdown Game Design Document, review the parsed plan (entities, scenes, scripts, signal contracts, autoloads), click Build to generate a runnable project with ColorRect+Label placeholders ready for hand-painted sprites from the 🎨 Pixel Art tab. *(Phase C-lite + GDD pipeline)* |
 | **💡 Game Concepts** | Brainstorm concepts: genre, hook, mechanics, target audience, comparable titles. Ship a concept straight into the Godot Workspace as a scaffolded project. *(Phase B)* |
 | **🎨 Pixel Art** | Hand-paint sprites. Pencil / eraser / fill / line / rect tools, vertical-mirror symmetry, predefined palettes (Default / NES / Game Boy / PICO-8), multi-frame animation with sprite-sheet export. Save into `vault/sprites/` or directly into the open Godot project. Pillow required. |
 | **📈 Steam Market** | Pull current Steam stats (SteamSpy + SteamCharts, or your own Steam Web API key) and ask the Market Analyst what's working in the genre you care about. *(Phase D)* |

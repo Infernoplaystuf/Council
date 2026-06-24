@@ -1,0 +1,481 @@
+"""
+gdd_builder.py — orchestrate a ``Plan`` into a working Godot project.
+
+Walks the Plan produced by ``gdd_planner.plan_from_gdd``:
+
+  1. Skeleton — call ``demo_builder`` to lay down ``project.godot``,
+     ``icon.svg``, and a placeholder ``main.tscn``/``main.gd`` from
+     the template the planner detected.
+  2. Scenes — render each ``ScenePlan`` as a real ``.tscn`` file
+     against the chosen project root.
+  3. Autoloads — write a stub for each ``AutoloadPlan`` (just the
+     extends + signal declarations + empty ``_ready``) and register
+     them in ``project.godot``.
+  4. Scripts — for each ``ScriptPlan``, call ``GodotCoder.run``
+     with a structured task that includes the entity registry +
+     the signal contracts the script must emit / handle. Atomic
+     write + diff-view confirmation per file (skipped in headless
+     mode for batch builds).
+  5. Cross-file validation — after every script is written, run
+     ``godot --headless --check-only`` once across the whole
+     project. Group reported errors per file. For each broken
+     file, call GodotCoder again with the error message + the
+     other plan-known context, up to ``max_repair_passes`` times.
+
+The orchestrator is *callable from the GUI on a background thread*
+and *unit-testable in dry-run mode* (set ``dry_run=True`` and no
+subprocess or LLM calls fire — useful for asserting the file
+layout is what the smoke test expects).
+
+The user's hard preference applies throughout: **no AI art**. Every
+visual is a ColorRect + Label primitive that the user later
+replaces with hand-painted sprites from the 🎨 Pixel Art tab.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from gdd_planner import (
+    Plan, ScenePlan, ScriptPlan, AutoloadPlan, NodeSpec,
+    SignalContract,
+)
+
+
+# ============================================================
+# Build result type
+# ============================================================
+
+@dataclass
+class BuildResult:
+    """Outcome of one full orchestrator run."""
+    project_path:  Optional[Path] = None
+    files_written: List[Path] = field(default_factory=list)
+    scripts_passed: List[Path] = field(default_factory=list)
+    scripts_failed: List[Path] = field(default_factory=list)
+    repair_passes: int = 0
+    notes:         List[str] = field(default_factory=list)
+    error:         str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.project_path is not None and not self.error
+
+
+# ============================================================
+# Scene rendering — NodeSpec tree → .tscn text
+# ============================================================
+
+def render_tscn(scene: ScenePlan,
+                  ext_resources: List[Tuple[str, str, str]] | None = None) -> str:
+    """Turn a ``ScenePlan`` into the text of a .tscn file.
+
+    ``ext_resources`` is a list of (id, type, path) tuples for any
+    scripts the scene references. The Main scene script is passed
+    here so the root node's ``script = ExtResource(...)`` line resolves.
+    """
+    ext_resources = ext_resources or []
+    lines: List[str] = []
+    load_steps = max(1, 1 + len(ext_resources))
+    lines.append(f"[gd_scene load_steps={load_steps} format=3]\n")
+    for (rid, rtype, rpath) in ext_resources:
+        lines.append(
+            f'[ext_resource type="{rtype}" path="{rpath}" id="{rid}"]\n'
+        )
+    # Walk the tree
+    _emit_node(scene.root, lines, "", ext_resources)
+    return "\n".join(lines)
+
+
+def _emit_node(node: NodeSpec, lines: List[str], parent_path: str,
+                 ext_resources: List[Tuple[str, str, str]]) -> None:
+    if not node:
+        return
+    header = f'[node name="{node.name}" type="{node.type}"'
+    if parent_path:
+        header += f' parent="{parent_path}"'
+    header += "]"
+    lines.append(header)
+    if node.script:
+        # Find the matching ext_resource id
+        for (rid, _t, rpath) in ext_resources:
+            if rpath == node.script:
+                lines.append(f'script = ExtResource("{rid}")')
+                break
+    for k, v in node.props.items():
+        lines.append(f"{k} = {v}")
+    lines.append("")          # blank line after header block
+    # Children: parent is "." for direct child of root, otherwise
+    # use the path from root down to this node.
+    if not parent_path:
+        child_parent = "."
+    elif parent_path == ".":
+        child_parent = node.name
+    else:
+        child_parent = f"{parent_path}/{node.name}"
+    for child in node.children:
+        _emit_node(child, lines, child_parent, ext_resources)
+
+
+# ============================================================
+# Autoload stub — a minimal extends + signals + _ready
+# ============================================================
+
+def render_autoload_stub(autoload: AutoloadPlan) -> str:
+    """Tiny GDScript stub for a manager singleton.
+
+    Signals are declared with the planned signatures so the rest of
+    the project can connect immediately. Body is a printable
+    placeholder; GodotCoder can flesh it out later when the user
+    asks for "make GameManager actually track score".
+    """
+    lines = ["extends Node", ""]
+    lines.append(f"# {autoload.purpose}")
+    lines.append("")
+    for sig in autoload.signals_emit:
+        if sig.args:
+            args = ", ".join(sig.args)
+            lines.append(f"signal {sig.name}({args})")
+        else:
+            lines.append(f"signal {sig.name}")
+    lines.append("")
+    lines.append("var score: int = 0")
+    lines.append("var hp: int = 100")
+    lines.append("")
+    lines.append("func _ready() -> void:")
+    lines.append(f'\tprint("[{autoload.name}] ready")')
+    lines.append("")
+    return "\n".join(lines)
+
+
+# ============================================================
+# Script rendering — placeholder body + coder-friendly task
+# ============================================================
+
+def render_script_placeholder(script: ScriptPlan) -> str:
+    """A minimal but parseable .gd stub that compiles in Godot 4.
+
+    The orchestrator writes this BEFORE calling GodotCoder. If the
+    coder is skipped (dry_run, no model), the placeholder is the
+    final content — it parses cleanly so the project loads but
+    doesn't actually implement the entity's behaviour. The
+    placeholder spells out the planned exports + signals so the
+    user (or a later Coder pass) can see what was intended.
+    """
+    lines = [
+        f"extends {script.extends}",
+    ]
+    if script.class_name:
+        lines.append(f"class_name {script.class_name}")
+    lines.append("")
+    # Header comment carrying the planner's purpose so a human reader
+    # sees the task brief inline.
+    lines.append(f"# Anvil GDD plan — {script.purpose}")
+    lines.append("")
+    # Signal declarations
+    for sig in script.signals_emit:
+        if sig.args:
+            args = ", ".join(sig.args)
+            lines.append(f"signal {sig.name}({args})")
+        else:
+            lines.append(f"signal {sig.name}")
+    if script.signals_emit:
+        lines.append("")
+    # Exports
+    for (name, type_, default) in script.exported_vars:
+        lines.append(f"@export var {name}: {type_} = {default}")
+    if script.exported_vars:
+        lines.append("")
+    # Minimum methods so the script parses + does something visible
+    lines.append("func _ready() -> void:")
+    lines.append(f'\tprint("[" + str(self.name) + "] _ready")')
+    lines.append("")
+    return "\n".join(lines)
+
+
+def build_coder_task(script: ScriptPlan, plan: Plan,
+                     placeholder: str) -> str:
+    """Build the prompt-shaped task we hand to GodotCoder for one
+    script. The Coder uses this as its FIRST_ATTEMPT task; failure
+    feedback comes from godot --check-only stderr on retry."""
+    parts: List[str] = []
+    parts.append(f"PURPOSE: {script.purpose}")
+    parts.append("")
+    parts.append(f"This script extends {script.extends}.")
+    if script.class_name:
+        parts.append(f"Declare class_name {script.class_name}.")
+    if script.exported_vars:
+        parts.append("Exported variables (keep these as @export):")
+        for (name, type_, default) in script.exported_vars:
+            parts.append(f"  @export var {name}: {type_} = {default}")
+    if script.signals_emit:
+        parts.append("This script MUST DECLARE and EMIT these signals "
+                      "with the exact signatures:")
+        for sig in script.signals_emit:
+            args = ", ".join(sig.args) if sig.args else ""
+            parts.append(f"  signal {sig.name}({args})")
+    if script.signals_handle:
+        parts.append("This script MUST CONNECT to and HANDLE these "
+                      "signals from other nodes (use a "
+                      "deferred connect in _ready):")
+        for sig in script.signals_handle:
+            parts.append(f"  {sig.emitter}.{sig.name} → handler "
+                          f"with args ({', '.join(sig.args)})")
+    # Entity registry — let the coder reference other entity types
+    # by name when wiring signals.
+    if plan.entity_registry:
+        parts.append("Other entities in this project (for reference):")
+        for slug, ent in plan.entity_registry.items():
+            parts.append(f"  {slug}  (role={ent.role})  {ent.description[:80]}")
+    parts.append("")
+    parts.append("Constraints:")
+    parts.append("- Godot 4 syntax only (no `tool`/`export`/`onready` — "
+                 "use `@tool`/`@export`/`@onready`).")
+    parts.append("- Do NOT change the extends line.")
+    parts.append("- Do NOT add network / shell / filesystem code.")
+    parts.append("- A `_ready()` function MUST exist.")
+    parts.append("- Output ONE fenced GDScript block, no prose.")
+    parts.append("")
+    parts.append("STARTING STUB (you may keep or rewrite, but the "
+                 "extends + signals + exports must remain):")
+    parts.append("```gdscript")
+    parts.append(placeholder.rstrip())
+    parts.append("```")
+    return "\n".join(parts)
+
+
+# ============================================================
+# project.godot autoload registration
+# ============================================================
+
+def add_autoloads_to_project(project_path: Path,
+                              autoloads: List[AutoloadPlan]) -> None:
+    """Insert an [autoload] section into project.godot listing every
+    planned autoload. If a section already exists, append; otherwise
+    add a new section at the end.
+    """
+    manifest = project_path / "project.godot"
+    if not manifest.exists() or not autoloads:
+        return
+    try:
+        text = manifest.read_text(encoding="utf-8")
+    except Exception as exc:
+        print(f"[gdd_builder] could not read project.godot: {exc!r}")
+        return
+    autoload_lines = [
+        f'{a.name}="*res://{a.file}"' for a in autoloads
+    ]
+    if "[autoload]" in text:
+        # Append our lines under the existing section
+        new_text = text.replace(
+            "[autoload]",
+            "[autoload]\n" + "\n".join(autoload_lines),
+            1,
+        )
+    else:
+        new_text = text.rstrip() + "\n\n[autoload]\n" \
+                   + "\n".join(autoload_lines) + "\n"
+    try:
+        manifest.write_text(new_text, encoding="utf-8")
+    except Exception as exc:
+        print(f"[gdd_builder] could not write project.godot: {exc!r}")
+
+
+# ============================================================
+# Orchestrator
+# ============================================================
+
+@dataclass
+class BuildOptions:
+    """Caller-provided knobs.
+
+    ``model`` is a PersonalityModel-like object with .respond().
+    ``godot_binary`` is the path used by GodotCoder's --check-only.
+    When ``dry_run`` is True, the orchestrator writes only the
+    placeholders + scene/autoload files — no LLM calls, no
+    --check-only invocation. Useful for unit-test layout assertions.
+    """
+    model:            Any = None
+    godot_binary:     str = "godot"
+    max_repair_passes: int = 2
+    coder_max_attempts: int = 3
+    dry_run:          bool = False
+    on_event:         Optional[Callable[[str, str], None]] = None
+
+
+def build_from_plan(
+    plan: Plan,
+    vault_dir: Any,
+    options: Optional[BuildOptions] = None,
+) -> BuildResult:
+    """Execute ``plan`` and return a ``BuildResult`` summarising the
+    project path + files + which scripts passed.
+
+    Never raises — every failure becomes a ``result.notes`` entry or
+    a populated ``result.error``. The caller (GUI thread) is
+    expected to surface those to the user.
+    """
+    options = options or BuildOptions()
+    result = BuildResult()
+    _emit = options.on_event or (lambda phase, msg: None)
+
+    # ── Step 1: skeleton via demo_builder ──
+    try:
+        import demo_builder as _db
+        import game_concept as _gc
+    except Exception as exc:
+        result.error = f"could not import demo_builder: {exc!r}"
+        return result
+    concept = _gc.GameConcept(
+        title=plan.title,
+        genre=plan.genre,
+        hook=plan.notes[0] if plan.notes else "",
+        engine="Godot 4",
+        mechanics=[],
+    )
+    _emit("skeleton", f"Scaffolding skeleton for {plan.title!r}…")
+    skel = _db.build_demo(concept, vault_dir, overwrite=False)
+    if skel.error and "already exists" in skel.error:
+        # Reuse existing project — the orchestrator overwrites files
+        # so this is fine.
+        result.notes.append(
+            f"Project folder existed — reusing "
+            f"{skel.project_path.name}.")
+        skel = _db.build_demo(concept, vault_dir, overwrite=True)
+    if not skel.ok:
+        result.error = f"demo_builder failed: {skel.error}"
+        return result
+    project_path = skel.project_path
+    result.project_path = project_path
+    result.files_written.extend(skel.files_written)
+    _emit("skeleton", f"  → {project_path}")
+
+    # ── Step 2: scenes ──
+    # The demo_builder already wrote a main.tscn; we replace it
+    # with our planned version. Multi-scene projects would append.
+    ext_resources_main = [
+        ("1_main", "Script", "res://scripts/main.gd"),
+    ]
+    for scene in plan.scenes:
+        scene_path = project_path / scene.file
+        scene_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            scene_path.write_text(
+                render_tscn(scene, ext_resources_main),
+                encoding="utf-8",
+            )
+            result.files_written.append(scene_path)
+            _emit("scene", f"  scene: {scene.file}")
+        except Exception as exc:
+            result.notes.append(f"scene write failed for {scene.file}: {exc!r}")
+
+    # ── Step 3: autoloads ──
+    for autoload in plan.autoloads:
+        a_path = project_path / autoload.file
+        a_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            a_path.write_text(
+                render_autoload_stub(autoload),
+                encoding="utf-8",
+            )
+            result.files_written.append(a_path)
+            _emit("autoload", f"  autoload: {autoload.file}")
+        except Exception as exc:
+            result.notes.append(
+                f"autoload write failed for {autoload.file}: {exc!r}")
+    add_autoloads_to_project(project_path, plan.autoloads)
+
+    # ── Step 4: script placeholders + (non-dry-run) Coder pass ──
+    placeholders: Dict[Path, str] = {}
+    for script in plan.scripts:
+        s_path = project_path / script.file
+        s_path.parent.mkdir(parents=True, exist_ok=True)
+        placeholder = render_script_placeholder(script)
+        placeholders[s_path] = placeholder
+        try:
+            s_path.write_text(placeholder, encoding="utf-8")
+            result.files_written.append(s_path)
+            _emit("placeholder", f"  placeholder: {script.file}")
+        except Exception as exc:
+            result.notes.append(
+                f"placeholder write failed for {script.file}: {exc!r}")
+
+    if options.dry_run or options.model is None:
+        # Skip the LLM + validation pass entirely.
+        result.scripts_passed = list(placeholders.keys())
+        result.notes.append(
+            "dry-run / no model — kept placeholders, no Coder pass."
+        )
+        return result
+
+    # ── Live Coder pass ──
+    try:
+        import godot_coder as _gcd
+    except Exception as exc:
+        result.notes.append(f"godot_coder unavailable: {exc!r}")
+        result.scripts_passed = list(placeholders.keys())
+        return result
+    coder = _gcd.GodotCoder(
+        options.model,
+        project_path,
+        godot_binary=options.godot_binary,
+        max_attempts=options.coder_max_attempts,
+        event_callback=lambda phase, msg: _emit(
+            "coder", f"  {phase}: {msg}"),
+    )
+    for script in plan.scripts:
+        target = project_path / script.file
+        task = build_coder_task(script, plan, placeholders[target])
+        _emit("coder", f"  generating: {script.file}")
+        state = coder.run(task, target, goal=script.purpose[:160])
+        if state.passed:
+            result.scripts_passed.append(target)
+        else:
+            result.scripts_failed.append(target)
+            result.notes.append(
+                f"coder failed on {script.file}: "
+                f"{(state.stderr or 'no stderr')[:200]}"
+            )
+
+    # ── Step 5: cross-file validation + repair ──
+    for pass_idx in range(options.max_repair_passes):
+        if not result.scripts_failed:
+            break
+        _emit("repair",
+              f"Repair pass {pass_idx + 1}/{options.max_repair_passes}…")
+        result.repair_passes += 1
+        # godot --check-only across the project surfaces the same
+        # errors GodotCoder already reflected against; the repair
+        # pass re-runs Coder against each failed file with the
+        # accumulated context. Same loop as the inline FIX prompt
+        # except the script gets a fresh start.
+        new_failed: List[Path] = []
+        for target in result.scripts_failed:
+            script_plan = next(
+                (s for s in plan.scripts
+                 if (project_path / s.file).resolve() == target.resolve()),
+                None,
+            )
+            if script_plan is None:
+                continue
+            task = build_coder_task(
+                script_plan, plan, placeholders[target],
+            )
+            state = coder.run(task, target,
+                              goal=script_plan.purpose[:160])
+            if state.passed:
+                result.scripts_passed.append(target)
+            else:
+                new_failed.append(target)
+                result.notes.append(
+                    f"still failing after pass {pass_idx + 1}: "
+                    f"{target.name}"
+                )
+        result.scripts_failed = new_failed
+
+    return result

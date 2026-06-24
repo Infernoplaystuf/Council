@@ -10949,21 +10949,104 @@ class CouncilConsole(tk.Tk):
         d.configure(state="disabled")
 
     def _gw_gdd_build(self) -> None:
-        """Phase 3 stub — orchestrator lands next commit."""
+        """Run the gdd_builder orchestrator against the current plan.
+
+        Spawns a daemon thread so the long-running build (multiple
+        GodotCoder calls + godot --check-only across the project)
+        doesn't freeze the GUI. Progress events stream into the
+        plan view as they arrive."""
         from tkinter import messagebox
         if self._gw_gdd_plan is None:
             self._gw_gdd_parse_and_plan()
             if self._gw_gdd_plan is None:
                 return
-        messagebox.showinfo(
+        plan = self._gw_gdd_plan
+        if not messagebox.askyesno(
             "Build from GDD",
-            "The orchestrator (gdd_builder) lands in the next "
-            "commit. For now, use the parsed plan as a manual "
-            "scaffold — open files via 🤖 Ask Coder one at a "
-            "time, using the file list above as a checklist and "
-            "the signal contracts as the integration contract.",
+            f"Generate {len(plan.scenes)} scene(s), "
+            f"{len(plan.scripts)} script(s), and "
+            f"{len(plan.autoloads)} autoload(s) into a new project? "
+            "Each script will be written by the Coder agent and "
+            "validated.",
             parent=self._gw_gdd_dialog,
-        )
+        ):
+            return
+
+        # Append a build-log section to the plan view
+        d = self._gw_gdd_plan_text
+        d.configure(state="normal")
+        d.insert("end", "\n\nBuild log\n", ("h2",))
+        d.configure(state="disabled")
+
+        def _emit_to_view(phase: str, msg: str) -> None:
+            def _ui():
+                d.configure(state="normal")
+                d.insert("end", f"  [{phase}] {msg}\n")
+                d.see("end")
+                d.configure(state="disabled")
+            try:
+                self.after(0, _ui)
+            except Exception:
+                pass
+
+        # Use the current Workspace's open Godot binary if set
+        try:
+            import godot_workspace as _gw
+            binary = _gw.get_godot_binary()
+        except Exception:
+            binary = "godot"
+
+        def _worker():
+            import gdd_builder as _gb
+            opts = _gb.BuildOptions(
+                model=getattr(self, "writer", None),
+                godot_binary=binary,
+                max_repair_passes=2,
+                coder_max_attempts=3,
+                dry_run=False,
+                on_event=_emit_to_view,
+            )
+            result = _gb.build_from_plan(plan, VAULT_DIR, opts)
+
+            def _done():
+                if result.ok:
+                    _emit_to_view(
+                        "done",
+                        f"✓ Project at {result.project_path}. "
+                        f"{len(result.scripts_passed)} script(s) passed, "
+                        f"{len(result.scripts_failed)} failed."
+                    )
+                    if result.notes:
+                        for n in result.notes:
+                            _emit_to_view("note", n)
+                    # Offer to open the new project in Workspace
+                    from tkinter import messagebox
+                    if messagebox.askyesno(
+                        "Build complete",
+                        f"Project written to:\n{result.project_path}\n\n"
+                        f"Open it in the Godot Workspace tab?",
+                        parent=self._gw_gdd_dialog,
+                    ):
+                        try:
+                            self._gw_open_project(result.project_path)
+                            self._gw_save_settings_kv(
+                                godot_project=str(result.project_path))
+                            if hasattr(self, "tab_godot_workspace"):
+                                self.nb.select(self.tab_godot_workspace)
+                        except Exception as exc:
+                            print(f"[GDD build] auto-open failed: {exc!r}")
+                else:
+                    _emit_to_view(
+                        "fail",
+                        f"✗ Build failed: {result.error}"
+                    )
+            try:
+                self.after(0, _done)
+            except Exception:
+                pass
+
+        threading.Thread(target=_worker, daemon=True,
+                          name="anvil-gdd-build").start()
 
     def _gw_send_errors_to_council(self) -> None:
         """Bundle the current stderr buffer into a Council question.
