@@ -975,6 +975,15 @@ if _TK_OK:
         # ── build ────────────────────────────────────────────────
 
         def _build(self):
+            # ── Local-machine panel ─────────────────────────────────
+            # "This machine" header — what the user has locally plus
+            # which curated US-origin models will run on it. Sits at
+            # the top so users see the local picture before they go
+            # adding Pi nodes. Lazily imports hardware_detect +
+            # model_catalog so a missing module degrades to a one-
+            # line "couldn't probe" message instead of a build crash.
+            self._build_local_panel()
+
             top = ttk.Frame(self)
             top.pack(fill="both", expand=True, padx=10, pady=(10, 4))
 
@@ -1033,6 +1042,124 @@ if _TK_OK:
             self.log.tag_config("warn", foreground="#fab387")
             self.log.tag_config("info", foreground="#cdd6f4")
             self._refresh()
+
+        # ── Local panel — this machine + recommended US-origin models ──
+
+        def _build_local_panel(self) -> None:
+            """Top-of-tab "This machine" section.
+
+            Shows the local hardware probe and the curated US-origin
+            models that fit. Clicking a model swatch surfaces a one-
+            line download instruction in the console log.
+            """
+            outer = ttk.LabelFrame(self, text="This machine")
+            outer.pack(fill="x", padx=10, pady=(8, 0))
+            row1 = ttk.Frame(outer)
+            row1.pack(fill="x", padx=8, pady=(6, 2))
+            self._hw_var = tk.StringVar(value="Probing hardware…")
+            ttk.Label(row1, textvariable=self._hw_var,
+                      foreground="#94e2d5",
+                      font=("Consolas", 9)
+                      ).pack(side="left", fill="x", expand=True)
+            ttk.Button(row1, text="↻ Re-probe",
+                       command=self._refresh_local_panel,
+                       width=10).pack(side="right")
+
+            row2 = ttk.Frame(outer)
+            row2.pack(fill="x", padx=8, pady=(2, 8))
+            ttk.Label(row2, text="Recommended (US-origin):",
+                      foreground="#cdd6f4").pack(side="left")
+            self._model_btn_frame = ttk.Frame(row2)
+            self._model_btn_frame.pack(side="left", fill="x",
+                                        expand=True, padx=(6, 0))
+
+            self._refresh_local_panel()
+
+        def _refresh_local_panel(self) -> None:
+            """Re-run hardware detection and recompute the recommended
+            models. Cheap (<200 ms) so it's safe to call from a button."""
+            hw, recs, err = self._probe_local_models()
+            if err:
+                self._hw_var.set(f"⚠ Hardware probe failed: {err}")
+            else:
+                # Compact one-liner: CPU / RAM / GPU / VRAM / CUDA
+                cpu = (hw.get("cpu_brand") or "CPU unknown")[:40]
+                ram = hw.get("ram_gb") or 0
+                gpu = hw.get("gpu_name") or "no GPU"
+                vram = hw.get("vram_gb")
+                cuda = hw.get("cuda_max")
+                vram_part = f", {vram:.1f} GB VRAM" if vram else ""
+                cuda_part = f", CUDA {cuda}" if cuda else ""
+                self._hw_var.set(
+                    f"{cpu} | {ram:.1f} GB RAM | {gpu}"
+                    f"{vram_part}{cuda_part}"
+                )
+
+            # Rebuild the model swatches
+            for child in self._model_btn_frame.winfo_children():
+                child.destroy()
+            if not recs:
+                ttk.Label(self._model_btn_frame,
+                          text="(no fitting models found)",
+                          foreground="#7a7575").pack(side="left")
+                return
+            for spec in recs[:6]:
+                lbl = f"{spec.id}  ({spec.size_gb:.1f} GB)"
+                ttk.Button(
+                    self._model_btn_frame, text=lbl,
+                    command=lambda s=spec: self._on_pick_local_model(s),
+                ).pack(side="left", padx=2)
+
+        def _probe_local_models(self):
+            """Run hardware_detect + model_catalog. Returns (hw_dict,
+            list_of_ModelSpec, error_str). All three are safe to consume
+            even on failure — hw is an empty dict, recs is empty list,
+            error is the diagnostic string."""
+            try:
+                import hardware_detect as _hwd
+                hw = _hwd.detect() or {}
+            except Exception as exc:
+                return ({}, [], f"hardware_detect failed: {exc!r}")
+            try:
+                import model_catalog as _mc
+            except Exception as exc:
+                return (hw, [], f"model_catalog import failed: {exc!r}")
+            vram = hw.get("vram_gb")
+            ram = hw.get("ram_gb") or 0
+            # GPU-equipped boxes prefer for_vram. CPU-only / mystery-GPU
+            # fall back to for_ram (added in phase 4) when present,
+            # else use a generous RAM budget against for_vram.
+            try:
+                if vram and vram > 0:
+                    recs = _mc.for_vram(float(vram))
+                elif hasattr(_mc, "for_ram"):
+                    recs = _mc.for_ram(float(ram))
+                else:
+                    # Cheap heuristic: treat each GB of RAM as ~0.5 GB
+                    # of effective VRAM budget on a CPU-only system.
+                    recs = _mc.for_vram(max(2.0, float(ram) * 0.5))
+            except Exception as exc:
+                return (hw, [], f"model_catalog query failed: {exc!r}")
+            return (hw, list(recs), "")
+
+        def _on_pick_local_model(self, spec) -> None:
+            """User clicked a recommended-model swatch."""
+            try:
+                import model_catalog as _mc
+                cmd = _mc.download_command(spec)
+            except Exception:
+                cmd = (f"# install {spec.id} from "
+                        f"https://huggingface.co/{spec.hf_repo}")
+            self._emit(
+                f"📥 {spec.name}  ({spec.params_b:.1f}B, {spec.quant}, "
+                f"~{spec.size_gb:.1f} GB)"
+            )
+            self._emit(f"   {spec.blurb}")
+            self._emit(f"   {cmd}")
+            self._emit(
+                "   (Run that line in a shell to download. Then point "
+                "COUNCIL_GGUF_PATH at the resulting file.)"
+            )
 
         # ── list helpers ─────────────────────────────────────────
 
