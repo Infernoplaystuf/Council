@@ -450,6 +450,12 @@ class NodeEntry:
     has_ai_hat: bool = False    # Raspberry Pi AI HAT+ attached
     ai_hat_tops: float = 0.0    # TOPS rating (26.0 for AI HAT+)
     ram_gb: int = 0             # RAM in GB (4, 8, 16)
+    # Full remote hardware probe result + ISO timestamp of the last
+    # successful probe. Populated by ApothecaryEngine.remote_hardware_probe.
+    # Same keys as the local hardware_detect.detect() output where
+    # they make sense; Pi-specific extras live alongside.
+    hw_probe: Dict = field(default_factory=dict)
+    hw_probe_at: str = ""
     # ── Model inventory ─────────────────────────────────────────
     installed_models: list = field(default_factory=list)   # from ollama list
     active_model: str = ""      # currently loaded model
@@ -584,6 +590,136 @@ class ApothecaryEngine:
                 client.close()
             except Exception:
                 pass
+
+    # ────────────────────────────────────────────────────────────
+    # Remote hardware probe
+    # ────────────────────────────────────────────────────────────
+
+    # A self-contained Python 3 snippet that prints a JSON dict of
+    # hardware facts. Designed for Pi OS / generic Debian — only
+    # stdlib, only files that exist on a minimal system, falls back
+    # to "" / None / 0 for anything missing. NEVER raises (Python
+    # exits 0 with whatever it could gather).
+    _REMOTE_PROBE_PY = r"""
+import json, os, platform, re, shutil, subprocess
+def _read(p, default=""):
+    try:
+        with open(p, "r") as f: return f.read()
+    except Exception: return default
+def _run(cmd, timeout=3):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                            timeout=timeout)
+        return r.stdout.strip()
+    except Exception: return ""
+info = {"os": "linux"}
+info["os_version"] = platform.platform()
+info["python"] = platform.python_version()
+cpuinfo = _read("/proc/cpuinfo")
+# CPU brand — Pi: 'Model' line; x86 Linux: 'model name'
+m = re.search(r"^model name\s*:\s*(.+)$", cpuinfo, re.M)
+if m: info["cpu_brand"] = m.group(1).strip()
+else:
+    m = re.search(r"^Model\s*:\s*(.+)$", cpuinfo, re.M)
+    info["cpu_brand"] = m.group(1).strip() if m else ""
+info["cpu_cores"] = os.cpu_count() or 0
+# RAM from /proc/meminfo (kB) → GB
+m = re.search(r"MemTotal:\s*(\d+)\s*kB", _read("/proc/meminfo"))
+info["ram_gb"] = round((int(m.group(1)) / 1024 / 1024), 2) if m else 0.0
+# Raspberry Pi model from device-tree
+pi = _read("/proc/device-tree/model", "").strip("\x00").strip()
+info["pi_model"] = pi
+# GPU — try nvidia-smi briefly; presence-only check for AMD/Intel
+info["gpu_vendor"] = None
+info["gpu_name"] = None
+info["vram_gb"] = None
+info["cuda_max"] = None
+nvsmi = shutil.which("nvidia-smi")
+if nvsmi:
+    line = _run([nvsmi, "--query-gpu=name,memory.total,driver_version",
+                  "--format=csv,noheader,nounits"])
+    if line:
+        parts = [p.strip() for p in line.splitlines()[0].split(",")]
+        if len(parts) >= 2:
+            info["gpu_vendor"] = "nvidia"
+            info["gpu_name"] = parts[0]
+            try: info["vram_gb"] = round(int(parts[1]) / 1024, 2)
+            except Exception: pass
+# AI HAT presence (rpi-only; safe no-op elsewhere)
+info["has_ai_hat"] = bool(re.search(r"hailo|aihat", _read("/proc/bus/pci/devices") or "", re.I))
+print(json.dumps(info))
+"""
+
+    def remote_hardware_probe(
+        self,
+        node: NodeEntry,
+        password_override: Optional[str] = None,
+        timeout_s: int = 15,
+    ) -> Tuple[bool, Dict, str]:
+        """SSH into ``node`` and run the inline probe.
+
+        Returns ``(ok, hw_dict, err)``:
+          - ``ok`` is True when a JSON dict came back
+          - ``hw_dict`` is the parsed probe (same key shape as
+            hardware_detect.detect on the local side)
+          - ``err`` is a diagnostic string when ok=False
+
+        On success the result is also persisted onto the node's
+        ``hw_probe`` + ``hw_probe_at`` fields and written back to
+        the registry, so the GUI can show the most recent reading
+        without re-running the probe.
+        """
+        # Use a here-doc style invocation so the python snippet's
+        # quoting survives the shell.
+        # Prefer python3, fall back to python.
+        cmd = (
+            "command -v python3 >/dev/null && PY=python3 || PY=python; "
+            "$PY - <<'ANVIL_PROBE_EOF'\n"
+            + self._REMOTE_PROBE_PY
+            + "\nANVIL_PROBE_EOF\n"
+        )
+        try:
+            rc, out, err = self.run_ssh(
+                node, cmd, password_override, timeout_s,
+            )
+        except Exception as exc:
+            return (False, {}, f"ssh failed: {exc!r}")
+        if rc != 0:
+            return (False, {}, f"remote exited rc={rc}: {err.strip()[:200]}")
+        out = (out or "").strip()
+        if not out:
+            return (False, {}, "remote returned no output")
+        # Sometimes shell login banners come before the JSON line —
+        # grab the LAST line that parses as JSON.
+        candidates = [ln.strip() for ln in out.splitlines()
+                      if ln.strip().startswith("{")]
+        if not candidates:
+            return (False, {}, f"no JSON line in remote output: {out[:200]}")
+        for line in reversed(candidates):
+            try:
+                hw = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(hw, dict):
+                continue
+            # Cache on the node + persist registry
+            node.hw_probe = hw
+            node.hw_probe_at = now_iso()
+            # Backfill the legacy ram_gb int field when we get a
+            # better number from the probe — keeps anything that
+            # reads node.ram_gb directly in sync.
+            ram = hw.get("ram_gb")
+            if isinstance(ram, (int, float)) and ram > 0:
+                node.ram_gb = max(node.ram_gb, int(round(ram)))
+            pi = hw.get("pi_model")
+            if isinstance(pi, str) and pi and not node.pi_model:
+                node.pi_model = pi
+            try:
+                self.registry.upsert(node)
+            except Exception:
+                pass
+            return (True, hw, "")
+        return (False, {}, "no JSON dict in remote output")
 
     def run_task_sequence(
         self,
@@ -831,6 +967,22 @@ class Apothecary:
             self.upsert_node(node)
         return ok, msg
 
+    def probe_hardware(
+        self, name: str,
+        password_override: Optional[str] = None, timeout_s: int = 15,
+    ) -> Tuple[bool, Dict, str]:
+        """Façade for ApothecaryEngine.remote_hardware_probe.
+
+        Returns ``(ok, hw_dict, err)``. On success the probe is also
+        persisted onto the node (engine method handles that), so the
+        Console can read ``self.apoth.list_nodes()[i].hw_probe`` on
+        the next refresh.
+        """
+        node = self._get(name)
+        return self.engine.remote_hardware_probe(
+            node, password_override, timeout_s,
+        )
+
     def run(
         self, name: str, cmd: str,
         password_override: Optional[str] = None, timeout_s: int = 30
@@ -1011,6 +1163,8 @@ if _TK_OK:
             ttk.Button(right, text="Delete",       command=self._delete).pack(fill="x", pady=(2,0))
             ttk.Separator(right, orient="horizontal").pack(fill="x", pady=8)
             ttk.Button(right, text="Test SSH",     command=self._test_ssh).pack(fill="x")
+            ttk.Button(right, text="\U0001f50e Probe Hardware",
+                       command=self._probe_hardware).pack(fill="x", pady=(2,0))
             ttk.Button(right, text="Check Ollama", command=self._check_ollama).pack(fill="x", pady=(2,0))
             ttk.Button(right, text="Run Command",  command=self._run_cmd).pack(fill="x", pady=(2,0))
             ttk.Separator(right, orient="horizontal").pack(fill="x", pady=8)
@@ -1669,6 +1823,53 @@ if _TK_OK:
                 return
             ok, msg = self.apoth.engine.check_ollama(node, self._pw_override())
             self._emit(("\u2713" if ok else "\u2717") + f" Ollama [{node.name}]: {msg}", not ok)
+
+        def _probe_hardware(self):
+            node = self._selected_node()
+            if not node:
+                return
+            self._emit(f"\U0001f50e Probing {node.name}\u2026")
+
+            def _worker():
+                try:
+                    ok, hw, err = self.apoth.probe_hardware(
+                        node.name,
+                        password_override=self._pw_override(),
+                        timeout_s=20,
+                    )
+                except Exception as exc:
+                    ok, hw, err = False, {}, repr(exc)
+
+                def _ui():
+                    if not ok:
+                        self._emit(f"\u2717 Probe [{node.name}] failed: {err}",
+                                    True)
+                        return
+                    # Compact summary line
+                    pi = hw.get("pi_model") or ""
+                    cpu = (hw.get("cpu_brand") or "")[:50]
+                    ram = hw.get("ram_gb") or 0
+                    gpu = hw.get("gpu_name") or "no GPU"
+                    vram = hw.get("vram_gb")
+                    cores = hw.get("cpu_cores") or 0
+                    bits = []
+                    if pi:
+                        bits.append(pi)
+                    bits.append(f"{cpu} ({cores} cores)")
+                    bits.append(f"{ram} GB RAM")
+                    bits.append(gpu)
+                    if vram:
+                        bits.append(f"{vram} GB VRAM")
+                    if hw.get("has_ai_hat"):
+                        bits.append("AI HAT detected")
+                    self._emit(f"\u2713 [{node.name}]  " + "  |  ".join(bits))
+                    # Refresh the list so the per-node label can pick
+                    # up any new pi_model / ram_gb the probe surfaced
+                    self._refresh()
+                self.after(0, _ui)
+
+            threading.Thread(target=_worker, daemon=True,
+                              name="apoth-probe").start()
 
         def _run_cmd(self):
             node = self._selected_node()
