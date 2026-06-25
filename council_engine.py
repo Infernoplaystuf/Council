@@ -4539,15 +4539,20 @@ class _DispatchedBackendSpec(LocalBackendSpec):
                  temperature: Optional[float] = None, max_tokens: Optional[int] = None,
                  trace: bool = True,
                  token_callback: Optional[Callable[[str], None]] = None) -> str:
-        self.host = self._dispatcher.best_host_for(self.model)
-        self.allow_remote = True
         # Multi-node inference (opt-in via COUNCIL_REMOTE_NODES). When a
         # REACHABLE, non-loopback node is chosen for this model, run the
         # inference THERE (Ollama HTTP) instead of on the local GGUF —
-        # the "multiple machines" path. Default OFF, and a localhost /
-        # unreachable pick always falls through to the local GGUF, so the
-        # standard single-machine behaviour is unchanged unless the user
-        # registers a node and turns this on.
+        # the "multiple machines" path. Default OFF.
+        #
+        # IMPORTANT: only probe hosts when remote nodes are actually
+        # enabled. Otherwise best_host_for() would hit localhost:11434
+        # (Ollama) on EVERY model call — a wasted connection attempt that
+        # prints "[DISPATCHER] No reachable hosts — falling back to
+        # localhost:11434" and adds latency, even though we always run the
+        # local GGUF anyway. Single-machine = straight to local, no probe.
+        if _remote_nodes_enabled():
+            self.host = self._dispatcher.best_host_for(self.model)
+            self.allow_remote = True
         if _remote_nodes_enabled() and _is_remote_host(self.host):
             temp = self.default_temperature if temperature is None else float(temperature)
             mtok = self.default_max_tokens if max_tokens is None else int(max_tokens)

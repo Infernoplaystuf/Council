@@ -1825,6 +1825,45 @@ def test_model_finder_us_filter_and_fit() -> None:
            unknown["can_upgrade"] is False and len(unknown["upgrades"]) >= 1)
 
 
+def test_dispatcher_no_probe_when_remote_disabled() -> None:
+    """Single-machine regression: with COUNCIL_REMOTE_NODES off (default),
+    a model call must NOT probe hosts (best_host_for) — that probe hits
+    localhost:11434 (Ollama) every call, prints 'No reachable hosts —
+    falling back to localhost', and adds latency, even though inference
+    always runs on the local GGUF. With remote nodes ON it must probe.
+    """
+    import council_engine as ce
+    prev_flag = os.environ.pop("COUNCIL_REMOTE_NODES", None)
+    prev_chat = ce._gguf_chat
+    ce._gguf_chat = lambda messages, **kw: "LOCAL"
+    probes = {"n": 0}
+
+    class _FakeDisp:
+        def best_host_for(self, model):
+            probes["n"] += 1
+            return "http://localhost:11434"
+
+    try:
+        spec = ce._DispatchedBackendSpec(
+            key="writer", host=ce.DEFAULT_OLLAMA_HOST, model="m", tags={},
+            default_temperature=0.3, default_max_tokens=32, allow_remote=True)
+        spec._dispatcher = _FakeDisp()
+
+        out = spec.generate(developer_instructions="s", user_text="hi",
+                            trace=False)
+        _check("remote OFF returns local answer", out == "LOCAL")
+        _check("remote OFF does NOT probe hosts", probes["n"] == 0)
+
+        os.environ["COUNCIL_REMOTE_NODES"] = "1"
+        spec.generate(developer_instructions="s", user_text="hi", trace=False)
+        _check("remote ON probes hosts", probes["n"] == 1)
+    finally:
+        ce._gguf_chat = prev_chat
+        os.environ.pop("COUNCIL_REMOTE_NODES", None)
+        if prev_flag is not None:
+            os.environ["COUNCIL_REMOTE_NODES"] = prev_flag
+
+
 def test_vram_aware_n_ctx_ladder_log_no_kwarg_collision() -> None:
     """Regression: after switching to a model that triggers the VRAM-aware
     n_ctx path, the engine logged the result. _pick_vram_aware_n_ctx puts
@@ -2414,6 +2453,8 @@ def main() -> int:
     _run("model_downloader (OS dir, stream, verify)", test_model_downloader)
     _run("VRAM-aware n_ctx log: no 'picked' kwarg collision",
          test_vram_aware_n_ctx_ladder_log_no_kwarg_collision)
+    _run("dispatcher: no host probe when remote disabled",
+         test_dispatcher_no_probe_when_remote_disabled)
     _run("clip_path / GGUF path co-persistence", test_clip_path_persistence)
     _run("SPC — process_capability known-values", test_spc_process_capability_known_values)
     _run("SPC — process_capability one-sided",    test_spc_process_capability_one_sided)
