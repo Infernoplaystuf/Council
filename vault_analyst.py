@@ -3414,7 +3414,7 @@ Available data folders:
 
 CSV inventory (column names taken from real files):
 {inventory}
-
+""" + """
 Available variables:
 - DATA_FOLDERS  (list[str]) — pass this as `data_folder=DATA_FOLDERS` to helpers
 - DATA_FOLDER   (str)       — first folder, for legacy single-folder calls

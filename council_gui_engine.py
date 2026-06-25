@@ -4048,7 +4048,7 @@ class ContentStyleManager:
     def _load(self) -> None:
         try:
             if self.path.exists():
-                self._data = json.loads(self.path.read_text(encoding="utf-8"))
+                self._data = _json.loads(self.path.read_text(encoding="utf-8"))
         except Exception:
             self._data = {}
 
@@ -4056,7 +4056,7 @@ class ContentStyleManager:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(
-                json.dumps(self._data, indent=2, ensure_ascii=False),
+                _json.dumps(self._data, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
         except Exception:
@@ -4174,7 +4174,7 @@ class InstructionManager:
     def _load(self) -> None:
         try:
             if self.path.exists():
-                data = json.loads(self.path.read_text(encoding="utf-8"))
+                data = _json.loads(self.path.read_text(encoding="utf-8"))
                 self._instructions = data if isinstance(data, list) else []
         except Exception:
             self._instructions = []
@@ -4183,7 +4183,7 @@ class InstructionManager:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(
-                json.dumps(self._instructions, indent=2, ensure_ascii=False),
+                _json.dumps(self._instructions, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
         except Exception:
@@ -5299,7 +5299,7 @@ class CouncilConsole(tk.Tk):
                     repo, filename, dest_dir=dest, on_progress=_progress,
                 )
             except Exception as exc:
-                self.after(0, lambda: (
+                self.after(0, lambda exc=exc: (
                     self._append_transcript("Writer",
                                             f"Download crashed: {exc!r}", "final"),
                     self._set_status("● idle"),
@@ -5347,7 +5347,7 @@ class CouncilConsole(tk.Tk):
             try:
                 desc = _pe.pipeline_to_natural_language(pl)
             except Exception as exc:
-                self.after(0, lambda: (
+                self.after(0, lambda exc=exc: (
                     self._append_transcript("Writer", f"description failed: {exc!r}", "final"),
                     self._set_status("● idle"),
                 ))
@@ -5418,7 +5418,7 @@ class CouncilConsole(tk.Tk):
                     description, VAULT_DIR, suggested_name=suggested,
                 )
             except Exception as exc:
-                self.after(0, lambda: (
+                self.after(0, lambda exc=exc: (
                     self._append_transcript("Writer",
                                             f"generation failed: {exc!r}",
                                             "final"),
@@ -5518,7 +5518,7 @@ class CouncilConsole(tk.Tk):
                     pl.path, full_request, VAULT_DIR,
                 )
             except Exception as exc:
-                self.after(0, lambda: (
+                self.after(0, lambda exc=exc: (
                     self._append_transcript("Writer",
                                             f"Pipeline edit failed: {exc!r}",
                                             "final"),
@@ -6603,7 +6603,7 @@ class CouncilConsole(tk.Tk):
             try:
                 df = _vt.find_atomic_elements_in_folder(root)
             except Exception as exc:
-                self.after(0, lambda: (
+                self.after(0, lambda exc=exc: (
                     self._append_transcript("Writer",
                                             f"element scan failed: {exc!r}",
                                             "final"),
@@ -7058,7 +7058,7 @@ class CouncilConsole(tk.Tk):
             try:
                 n = idx.build_embeddings(on_progress=_progress)
             except Exception as exc:
-                self.after(0, lambda: (
+                self.after(0, lambda exc=exc: (
                     self._append_transcript("Writer",
                                             f"embedding build failed: {exc!r}",
                                             "final"),
@@ -7122,7 +7122,7 @@ class CouncilConsole(tk.Tk):
             try:
                 n = idx.generate_descriptions(on_progress=_progress)
             except Exception as exc:
-                self.after(0, lambda: (
+                self.after(0, lambda exc=exc: (
                     self._append_transcript("Writer",
                                             f"semantic index failed: {exc!r}",
                                             "final"),
@@ -7192,7 +7192,7 @@ class CouncilConsole(tk.Tk):
                     topics_only=True, batch_size=4, on_progress=_progress,
                 )
             except Exception as exc:
-                self.after(0, lambda: (
+                self.after(0, lambda exc=exc: (
                     self._append_transcript("Writer",
                                             f"topic build failed: {exc!r}",
                                             "final"),
@@ -8277,7 +8277,7 @@ class CouncilConsole(tk.Tk):
                 a = model_finder.assess_upgrade(
                     hardware=self._mf_hw, current_model=current, role=role)
             except Exception as exc:
-                self.after(0, lambda: self._mf_banner.set(
+                self.after(0, lambda exc=exc: self._mf_banner.set(
                     f"Upgrade check unavailable: {exc!r}"))
                 return
             self.after(0, lambda: self._mf_apply_assessment(
@@ -8331,7 +8331,7 @@ class CouncilConsole(tk.Tk):
                 res = model_finder.find_models(
                     hardware=self._mf_hw, role=role, prefer_online=online)
             except Exception as exc:
-                self.after(0, lambda: self._mf_status.set(
+                self.after(0, lambda exc=exc: self._mf_status.set(
                     f"Model finder unavailable: {exc!r}"))
                 return
             self.after(0, lambda: self._mf_populate(res, online))
@@ -8512,11 +8512,11 @@ class CouncilConsole(tk.Tk):
                     expected_size_gb=size_gb)
                 self.after(0, lambda: self._mf_download_done(res, m))
             except _md.DownloadError as de:
-                self.after(0, lambda: self._mf_status.set(
+                self.after(0, lambda de=de: self._mf_status.set(
                     str(de) + (" (partial saved — resumes next time)"
                                if "cancel" in str(de).lower() else "")))
             except Exception as exc:
-                self.after(0, lambda: self._mf_status.set(
+                self.after(0, lambda exc=exc: self._mf_status.set(
                     f"Download failed: {exc!r}"))
             finally:
                 self.after(0, self._mf_download_reset)
@@ -11637,7 +11637,7 @@ class CouncilConsole(tk.Tk):
             try:
                 n = idx.rebuild(progress=_on_progress)
             except Exception as exc:
-                self.after(0, lambda: self._idx_status_var.set(
+                self.after(0, lambda exc=exc: self._idx_status_var.set(
                     f"Keyword index failed: {exc!r}"))
                 return
             self.after(0, lambda: self._idx_status_var.set(
@@ -11675,7 +11675,7 @@ class CouncilConsole(tk.Tk):
             try:
                 n = idx.generate_descriptions(on_progress=_progress)
             except Exception as exc:
-                self.after(0, lambda: self._idx_status_var.set(
+                self.after(0, lambda exc=exc: self._idx_status_var.set(
                     f"Description build failed: {exc!r}"))
                 return
             self.after(0, lambda: self._idx_status_var.set(
@@ -11711,7 +11711,7 @@ class CouncilConsole(tk.Tk):
             try:
                 n = idx.build_embeddings(on_progress=_progress)
             except Exception as exc:
-                self.after(0, lambda: self._idx_status_var.set(
+                self.after(0, lambda exc=exc: self._idx_status_var.set(
                     f"Embedding build failed: {exc!r}"))
                 return
             stats = emb.stats()
@@ -11925,7 +11925,7 @@ class CouncilConsole(tk.Tk):
                 # Refresh the tree so the new files show up.
                 self.after(0, self._vmgr_refresh_tree)
             except Exception as exc:
-                self.after(0, lambda: self._mongo_status_var.set(
+                self.after(0, lambda exc=exc: self._mongo_status_var.set(
                     f"Convert failed: {exc!r}"))
 
         _th.Thread(target=_worker, daemon=True).start()

@@ -267,6 +267,30 @@ def test_synthetic_gguf_rejected_cases() -> None:
                md == {})
 
 
+def test_build_pandas_code_prompt_no_fstring_brace_bug() -> None:
+    """Regression: build_pandas_code_prompt is an f-string, and its helper
+    catalog contains literal braces ({name: df}, {df, top_left, ...},
+    ${ENV_VAR}). If the catalog is inside the f-string those parse as
+    interpolations and raise 'NameError: name ... is not defined' EVERY
+    time the analyst generates code (i.e. on every data model-call). The
+    catalog must be a plain (non-f) string so braces stay literal.
+    """
+    from pathlib import Path as _P
+    import vault_analyst as va
+    # Must not raise (the bug raised NameError here).
+    prompt = va.build_pandas_code_prompt(
+        "how many rows in sales.csv?", [_P(".")], "sales.csv: id,amount")
+    _check("prompt builds without NameError", isinstance(prompt, str) and prompt)
+    _check("header interpolation still works",
+           "how many rows in sales.csv?" in prompt
+           and "sales.csv: id,amount" in prompt)
+    # Literal braces from the catalog survive as TEXT (not interpolated).
+    _check("literal '{name: df}' preserved", "{name: df}" in prompt)
+    _check("literal set-shape doc preserved",
+           "{df, top_left, n_rows, n_cols, header_row}" in prompt)
+    _check("literal '${ENV_VAR}' preserved", "${ENV_VAR}" in prompt)
+
+
 def test_data_summary_triggers() -> None:
     """Data-summary intents must route to the analyst — not freeform.
     These queries are what makes the Council tab actually capable of
@@ -2378,6 +2402,8 @@ def main() -> int:
     _run("previous_install_detect.detect()",    test_previous_install_detect)
     _run("synthetic GGUF — accept case",        test_synthetic_gguf_accepted)
     _run("synthetic GGUF — reject cases",       test_synthetic_gguf_rejected_cases)
+    _run("analyst code prompt: no f-string brace bug",
+         test_build_pandas_code_prompt_no_fstring_brace_bug)
     _run("data-summary trigger keywords",       test_data_summary_triggers)
     _run("folder_data_summary helper",          test_folder_data_summary_helper)
     _run("stats-summary trigger keywords",       test_stats_summary_triggers)
