@@ -4933,6 +4933,15 @@ class CouncilConsole(tk.Tk):
             return {}
         if data.get("gguf_path") and not os.environ.get("COUNCIL_GGUF_PATH", "").strip():
             os.environ["COUNCIL_GGUF_PATH"] = str(data["gguf_path"])
+        # Apply persisted engine knobs (set from the Engine settings dialog)
+        # to the environment, with the same "env always wins" precedence —
+        # a shell/launcher export overrides the saved value.
+        for _key, _env in (("n_ctx", "COUNCIL_GGUF_N_CTX"),
+                           ("gpu_layers", "COUNCIL_GGUF_GPU_LAYERS"),
+                           ("embed_device", "COUNCIL_EMBED_DEVICE")):
+            _val = data.get(_key)
+            if _val not in (None, "") and not os.environ.get(_env, "").strip():
+                os.environ[_env] = str(_val)
         return data
 
     def _save_backend_settings(self):
@@ -4980,6 +4989,124 @@ class CouncilConsole(tk.Tk):
         self._gguf_path_label.pack(side="left", padx=(0, 6), fill="x", expand=True)
         ttk.Button(strip, text="Browse...",
                    command=self._browse_gguf_file).pack(side="left")
+        ttk.Button(strip, text="⚙ Engine",
+                   command=self._open_engine_settings).pack(side="left", padx=(6, 0))
+
+    def _open_engine_settings(self):
+        """Dialog to set the local-engine env knobs from the app: max
+        context (COUNCIL_GGUF_N_CTX), GPU layers (COUNCIL_GGUF_GPU_LAYERS),
+        and embedding device (COUNCIL_EMBED_DEVICE). Applied live + persisted
+        so they survive a restart — no shell exports needed."""
+        import tkinter as tk
+        from tkinter import ttk, messagebox
+        win = tk.Toplevel(self)
+        win.title("Engine settings")
+        win.transient(self)
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, foreground="#888", justify="left",
+                  text="Tune the local model engine. Blank = auto / default.\n"
+                       "Context + GPU layers reload the model on the next "
+                       "message.").grid(row=0, column=0, columnspan=2,
+                                        sticky="w", pady=(0, 10))
+
+        ttk.Label(frm, text="Max context (n_ctx):").grid(
+            row=1, column=0, sticky="w", pady=3)
+        nctx_var = tk.StringVar(value=os.environ.get("COUNCIL_GGUF_N_CTX", ""))
+        ttk.Entry(frm, textvariable=nctx_var, width=12).grid(
+            row=1, column=1, sticky="w")
+        ttk.Label(frm, foreground="#888",
+                  text="e.g. 8192, 16384, 32768. Blank = auto-detect "
+                       "(falls back to 4096).").grid(
+            row=2, column=1, sticky="w")
+
+        ttk.Label(frm, text="GPU layers:").grid(
+            row=3, column=0, sticky="w", pady=3)
+        gpu_var = tk.StringVar(
+            value=os.environ.get("COUNCIL_GGUF_GPU_LAYERS", ""))
+        ttk.Entry(frm, textvariable=gpu_var, width=12).grid(
+            row=3, column=1, sticky="w")
+        ttk.Label(frm, foreground="#888",
+                  text="99 = all on GPU, 0 = CPU only. Blank = default (99).").grid(
+            row=4, column=1, sticky="w")
+
+        ttk.Label(frm, text="Embedding device:").grid(
+            row=5, column=0, sticky="w", pady=3)
+        cur_embed = os.environ.get("COUNCIL_EMBED_DEVICE", "").strip() or "auto"
+        embed_var = tk.StringVar(value=cur_embed)
+        ttk.Combobox(frm, textvariable=embed_var, width=10, state="readonly",
+                     values=["auto", "cpu", "cuda"]).grid(
+            row=5, column=1, sticky="w")
+        ttk.Label(frm, foreground="#888",
+                  text="cpu avoids GPU VRAM contention (recommended on WSL).").grid(
+            row=6, column=1, sticky="w")
+
+        status = tk.StringVar(value="")
+        ttk.Label(frm, textvariable=status, foreground="#a6e3a1").grid(
+            row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        def _apply():
+            n = nctx_var.get().strip()
+            g = gpu_var.get().strip()
+            e = embed_var.get().strip()
+            for label, val in (("Max context", n), ("GPU layers", g)):
+                if val and not val.isdigit():
+                    messagebox.showwarning(
+                        "Invalid value",
+                        f"{label} must be a whole number (or left blank).")
+                    return
+            self._apply_engine_settings(
+                n_ctx=n, gpu_layers=g,
+                embed_device=("" if e == "auto" else e))
+            status.set("Applied + saved. Model reloads on the next message.")
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=8, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(btns, text="Apply", command=_apply).pack(side="right")
+        ttk.Button(btns, text="Close", command=win.destroy).pack(
+            side="right", padx=6)
+
+    def _apply_engine_settings(self, *, n_ctx: str = "", gpu_layers: str = "",
+                               embed_device: str = ""):
+        """Set the engine env knobs (or clear them when blank), persist to
+        backend_settings.json, and reset the engine so context / GPU-layer
+        changes take effect on the next inference."""
+        def _set(env: str, val: str):
+            if val:
+                os.environ[env] = str(val)
+            else:
+                os.environ.pop(env, None)
+        _set("COUNCIL_GGUF_N_CTX", n_ctx)
+        _set("COUNCIL_GGUF_GPU_LAYERS", gpu_layers)
+        _set("COUNCIL_EMBED_DEVICE", embed_device)
+
+        import json as _j
+        path = self._backend_settings_path()
+        existing: dict = {}
+        if path.exists():
+            try:
+                existing = _j.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(existing, dict):
+                    existing = {}
+            except Exception:
+                existing = {}
+        existing["n_ctx"] = n_ctx
+        existing["gpu_layers"] = gpu_layers
+        existing["embed_device"] = embed_device
+        try:
+            path.write_text(_j.dumps(existing, indent=2), encoding="utf-8")
+        except Exception as _e:
+            print(f"[engine settings] could not save: {_e}")
+
+        # Reset the GGUF singleton so n_ctx / gpu_layers are re-read on the
+        # next call (they're applied at model load, not per-inference).
+        try:
+            import council_engine as _ce
+            _ce.refresh_backend_config()
+        except Exception as _e:
+            print(f"[engine settings] backend refresh failed: {_e}")
 
     def _browse_gguf_file(self):
         from tkinter import filedialog
