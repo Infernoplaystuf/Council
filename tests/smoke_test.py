@@ -267,6 +267,52 @@ def test_synthetic_gguf_rejected_cases() -> None:
                md == {})
 
 
+def test_context_condenser() -> None:
+    """context_condenser must shrink an oversized block to fit a target,
+    keeping head/tail + the lines most relevant to the task memo, and
+    return None when the target is too tiny to be worth it. This is the
+    'chunk into sections to extend context' rescue that replaces dropping
+    overflow blocks on a small window.
+    """
+    import context_condenser as cc
+    est = lambda s: max(1, len(s) // 4)
+    lines = [f"filler line number {i} with random words" for i in range(60)]
+    lines[0] = "HEADER: data summary"
+    lines[10] = "sales.csv has 4820 rows and column revenue"
+    lines[30] = "revenue total is 99213 for sales.csv"
+    lines[-1] = "FOOTER: end of report"
+    text = "\n".join(lines)
+    full = est(text)
+
+    out = cc.condense_to_fit(text, full // 4,
+                             task="goal: total revenue in sales.csv",
+                             estimate_tokens=est)
+    _check("condensed output fits the target", out is not None
+           and est(out) <= full // 4)
+    _check("condense keeps the header line", "HEADER: data summary" in out)
+    _check("condense keeps the footer line", "FOOTER: end of report" in out)
+    _check("condense keeps a task-relevant line",
+           "99213" in out or "4820 rows" in out)
+    _check("condense records what was elided", "elided" in out)
+
+    _check("tiny target -> None (caller drops)",
+           cc.condense_to_fit(text, 8, estimate_tokens=est) is None)
+    _check("already-fits text returned unchanged",
+           cc.condense_to_fit("short text", 999, estimate_tokens=est)
+           == "short text")
+
+    chunks = cc.chunk_by_tokens(text, 50, est)
+    _check("chunking splits into multiple sections", len(chunks) > 1)
+    _check("each chunk respects the token cap",
+           all(est(c) <= 60 for c in chunks))
+
+    # LLM map-reduce path uses the injected call and still fits.
+    out2 = cc.condense_with_llm(text, full // 4, task="revenue",
+                                chunk_tokens=40, estimate_tokens=est,
+                                llm_call=lambda p: "- revenue 99213\n- 4820 rows")
+    _check("llm map-reduce output fits the target", est(out2) <= full // 4)
+
+
 def test_build_pandas_code_prompt_no_fstring_brace_bug() -> None:
     """Regression: build_pandas_code_prompt is an f-string, and its helper
     catalog contains literal braces ({name: df}, {df, top_left, ...},
@@ -2502,6 +2548,7 @@ def main() -> int:
     _run("previous_install_detect.detect()",    test_previous_install_detect)
     _run("synthetic GGUF — accept case",        test_synthetic_gguf_accepted)
     _run("synthetic GGUF — reject cases",       test_synthetic_gguf_rejected_cases)
+    _run("context_condenser (chunk + condense overflow)", test_context_condenser)
     _run("analyst code prompt: no f-string brace bug",
          test_build_pandas_code_prompt_no_fstring_brace_bug)
     _run("data-summary trigger keywords",       test_data_summary_triggers)

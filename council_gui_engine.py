@@ -1846,9 +1846,34 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
     # blocks in REVERSE priority order (lowest priority first), evicting
     # until the budget fits. HARD_KEEP blocks are never evicted.
     if running > remaining:
-        # Sort indices by descending priority (numerically higher = lower
-        # priority in our scheme), but keep the within-priority order
-        # stable (last-pasted block goes first within the same prio).
+        # Before evicting an overflow block, try to CONDENSE it to fit —
+        # chunk it and keep the parts most relevant to the user's task
+        # (the [TASK MEMO]) instead of losing the whole block. This is the
+        # "extend the model's effective context" path: a big file or wide
+        # vault-match set survives in digest form on a small window.
+        # Deterministic by default (no latency); COUNCIL_CONDENSE_LLM=1
+        # switches to a model map-reduce. Disable with
+        # COUNCIL_CONDENSE_OVERFLOW=0 to restore plain eviction.
+        _condense_on = os.environ.get(
+            "COUNCIL_CONDENSE_OVERFLOW", "1").strip().lower() \
+            not in ("0", "false", "no", "off")
+        _cond = None
+        if _condense_on:
+            try:
+                import context_condenser as _cond
+            except Exception:
+                _cond = None
+        _cond_llm = None
+        if _cond is not None and os.environ.get(
+                "COUNCIL_CONDENSE_LLM", "").strip().lower() in (
+                "1", "true", "yes", "on"):
+            def _cond_llm(_p):
+                import council_engine as _cc
+                return _cc.local_chat(
+                    messages=[{"role": "user", "content": _p}],
+                    temperature=0.0, num_predict=256, timeout=60)
+        _task_src = task_memo_block or user_text or ""
+
         evictable_order = sorted(
             range(len(placed)),
             key=lambda i: (-placed[i][0], -i),
@@ -1860,6 +1885,26 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
             prio_i, label_i, _capped_i, cost_i = placed[i]
             if prio_i in HARD_KEEP:
                 continue
+            # How much room this block may occupy if it's the one that fits.
+            headroom = remaining - (running - cost_i)
+            if _cond is not None and headroom >= 64:
+                try:
+                    condensed = _cond.condense_to_fit(
+                        _capped_i, headroom, task=_task_src,
+                        estimate_tokens=_estimate_block_tokens,
+                        llm_call=_cond_llm)
+                except Exception as _cx:
+                    print('[inject] condense failed: ' + repr(_cx),
+                          file=_sys_dbg.stderr)
+                    condensed = None
+                if condensed:
+                    new_cost = _estimate_block_tokens(condensed)
+                    if new_cost < cost_i and new_cost <= headroom:
+                        placed[i] = (prio_i, label_i, condensed, new_cost)
+                        running -= (cost_i - new_cost)
+                        print(f'[inject] condensed {label_i}: '
+                              f'{cost_i}->{new_cost} tok', file=_sys_dbg.stderr)
+                        continue
             keep_mask[i] = False
             dropped.append((label_i + " (budget overflow)", cost_i))
             running -= cost_i
