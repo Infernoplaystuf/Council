@@ -249,6 +249,70 @@ PHASE 4 — Real cluster (only if the fleet outgrows the homemade orchestrator)
   the working GPU path, and the local folder-watcher/job-queue (Phase 1), which
   is the foundation every distributed phase builds on.
 
+--------------------------------------------------------------------------------
+11. ADDENDUM — DEFERRED-TASK CAPABILITY ROUTING  (added later, parked)
+--------------------------------------------------------------------------------
+CONTEXT: the app now has a "Defer to Vault" feature — when the council can't
+satisfy a request in chat, the user defers it and the Vault tab can run it.
+Today "Run" only does deterministic ops (folder_data_summary / folder_column_
+stats). This addendum captures the DESIGN for what it should eventually grow
+into, once the model/hardware foundations exist.
+
+THE KEY REALIZATION:
+  Deferring only has value if there is somewhere MORE CAPABLE to send the task.
+  Re-running the SAME model with a bigger context window only helps when the
+  bottleneck was CONTEXT (the file/data didn't fit). If the bottleneck was the
+  model's REASONING / CAPABILITY, a bigger window just gives it more room to be
+  wrong. So a deferred "Run" must mean "run this on a model that can ACTUALLY
+  do it" — which means a larger or more specialized model, local or remote.
+
+REFRAME:
+  The deferred queue's real job is to DECOUPLE capturing the hard task from
+  having the capability to do it. The task waits in the queue until a
+  capable-enough resource exists, then runs THERE. The deferred-Run moment is
+  also exactly when paying the cost of a model swap or a remote dispatch is
+  justified — the user has explicitly said "this one matters, I'll wait."
+
+ESCALATION TIERS a deferred Run could target (all use pieces that exist):
+  TIER 0  deterministic            folder_data_summary / stats (TODAY)
+          helps: task is really a data op, not reasoning. Cost: free/instant.
+  TIER 1  same model, bigger ctx   raise n_ctx (Engine settings) + condenser
+          helps: limit was "the data didn't fit". Cost: needs RAM/VRAM for
+          the larger window.
+  TIER 2  bigger/specialist LOCAL  role_models swap (GPU-gated)
+          helps: a stronger model has been DOWNLOADED and there's VRAM for it.
+          Cost: reload time + VRAM.
+  TIER 3  REMOTE node w/ big model Apothecary multi-node dispatch
+          helps: local hardware can't run a capable model at all.
+          Cost: needs a second machine (ties to Sections 4-7 above).
+
+  Tiers 2 and 3 are the "true fix" — and they loop straight back to the
+  hardware / multi-node story: a deferred queue is only as good as the most
+  capable model you can point it at.
+
+PROPOSED DESIGN (when foundations are ready):
+  * Each deferred task records a "needs" hint: big-context / heavy-reasoning /
+    specialized-coding / just-more-time.
+  * "Run" becomes a CHOOSER: run on <current> / <a downloaded bigger model> /
+    <the model on node X>. It picks the best AVAILABLE option for the hint.
+  * When nothing capable enough is available, it says so HONESTLY —
+    "no model here can likely do better; download a stronger one (Models tab)
+    or register a node" — instead of pretending a retry fixed it.
+  * This is the natural home for the swap-advisor and the remote-node dispatch
+    that are already wired but unproven: the deferred-Run is where their cost
+    is worth paying.
+
+GATING (must be true before Tier 2/3 delivers):
+  1. A capable model must EXIST and RUN on the hardware (or a node) — the
+     GPU-path / bigger-model / hardware story (currently blocked on WSL CUDA).
+  2. The model must be working at all — Tier 1+ re-runs need a loaded,
+     non-crashing model (the foundation being hardened now).
+
+STATUS: capture layer DONE (deferred_tasks.py + Council "Defer to Vault" +
+Vault "Deferred tasks" panel, Tier 0 run). Capability-routing (Tiers 1-3) is
+PARKED behind the same Phase-0 foundations as the rest of this document.
+
+
 ================================================================================
  END — parked pending "foundations good enough" call.
 ================================================================================
