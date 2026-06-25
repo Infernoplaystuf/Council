@@ -12270,11 +12270,42 @@ class CouncilConsole(tk.Tk):
                              else "stats")
                 _name = "__".join(p for p in (_kindword, _fold, _slug, _short) if p)
                 op = out_dir / f"{_name}.csv"
+                # SCOPE to the files the task is actually about. The capture
+                # dialog resolves filenames from the question into task.files;
+                # without this the run summarised the WHOLE folder regardless
+                # of which file the user asked about ("wrong files").
+                import pandas as _pd_run
+                want = {f.lower() for f in (task.files or []) if f}
+                named_paths = []
+                if want:
+                    for _p in _va.list_data_files([target]):
+                        if _p.name.lower() in want:
+                            named_paths.append(_p)
+                    if not named_paths:   # widen to any csv under the scope
+                        for _p in _va.list_csv_files([target]):
+                            if _p.name.lower() in want:
+                                named_paths.append(_p)
+
                 if task.kind == _dt.KIND_BIGGER_SUMMARY:
-                    df = _va.folder_data_summary([target])
-                    summary = f"{len(df)} file(s) profiled"
+                    if named_paths:
+                        # Per-COLUMN profile of each named file — a genuinely
+                        # "bigger" summary than chat gave, on the right files.
+                        frames = [_va.summarize_csv(p) for p in named_paths]
+                        df = (_pd_run.concat(frames, ignore_index=True)
+                              if frames else _va.folder_data_summary([target]))
+                        summary = (f"profiled {len(named_paths)} named file(s): "
+                                   + ", ".join(p.name for p in named_paths[:5]))
+                    else:
+                        df = _va.folder_data_summary([target])
+                        summary = (f"{len(df)} file(s) profiled"
+                                   + (" (named file(s) not found — used the "
+                                      "whole folder)" if want else ""))
                 else:   # deeper_stats
                     df = _va.folder_column_stats(VAULT_DIR, [target])
+                    if want and "file" in df.columns:
+                        sub = df[df["file"].str.lower().isin(want)]
+                        if not sub.empty:
+                            df = sub.reset_index(drop=True)
                     nfiles = int(df["file"].nunique()) if "file" in df else 0
                     summary = f"stats for {nfiles} file(s)"
                 df.to_csv(op, index=False)
@@ -14458,6 +14489,23 @@ class CouncilConsole(tk.Tk):
         ttk.Entry(frm, textvariable=folder_var, width=46).grid(
             row=4, column=1, sticky="w")
 
+        # Files the task is about — PRE-FILLED from filenames detected in the
+        # question, but EDITABLE so the run scopes to the right files even if
+        # detection missed them. Blank = summarise the whole folder.
+        ttk.Label(frm, text="Files (comma-separated; blank = whole folder):").grid(
+            row=5, column=0, sticky="w", pady=3)
+        files_var = tk.StringVar()
+        try:
+            import vault_analyst as _va_pf
+            _pf = _va_pf.resolve_filename_hints(
+                prefill, [data_index.input_dir(VAULT_DIR)])
+            _det = list(dict.fromkeys(r.name for _t, r in _pf if r is not None))
+            files_var.set(", ".join(_det))
+        except Exception:
+            pass
+        ttk.Entry(frm, textvariable=files_var, width=46).grid(
+            row=5, column=1, sticky="w")
+
         def _save():
             q = q_txt.get("1.0", "end").strip()
             if not q:
@@ -14465,14 +14513,19 @@ class CouncilConsole(tk.Tk):
                                        "Describe what you want done first.")
                 return
             try:
-                files = []
-                try:
-                    import vault_analyst as _va
-                    pairs = _va.resolve_filename_hints(
-                        q, [data_index.input_dir(VAULT_DIR)])
-                    files = [r.name for _tok, r in pairs if r is not None]
-                except Exception:
-                    files = []
+                files = [f.strip() for f in
+                         files_var.get().replace(";", ",").split(",")
+                         if f.strip()]
+                if not files:
+                    # Field was cleared — fall back to resolving from the
+                    # (possibly edited) question text.
+                    try:
+                        import vault_analyst as _va
+                        pairs = _va.resolve_filename_hints(
+                            q, [data_index.input_dir(VAULT_DIR)])
+                        files = [r.name for _tok, r in pairs if r is not None]
+                    except Exception:
+                        files = []
                 _dt.DeferredTaskStore(VAULT_DIR).add(
                     kind=kind_map.get(kind_var.get(), _dt.KIND_OTHER),
                     question=q,
@@ -14496,7 +14549,7 @@ class CouncilConsole(tk.Tk):
             win.destroy()
 
         btns = ttk.Frame(frm)
-        btns.grid(row=5, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        btns.grid(row=6, column=0, columnspan=2, sticky="e", pady=(12, 0))
         ttk.Button(btns, text="Save", command=_save).pack(side="right")
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(
             side="right", padx=6)
