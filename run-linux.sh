@@ -70,6 +70,15 @@ export COUNCIL_BACKEND=gguf
 : "${COUNCIL_GGUF_N_CTX_DEBUG:=1}"
 export COUNCIL_GGUF_GPU_LAYERS COUNCIL_GGUF_N_CTX_DEBUG
 
+# Pin embeddings to the CPU by default. With the model fully offloaded to
+# the GPU, loading the sentence-transformers embedder on the SAME GPU can
+# exhaust VRAM and trigger a CUDA error / NATIVE crash (core dump, no
+# Python traceback) — the same failure already seen on WSL. Embeddings on
+# CPU cost a little speed but leave the whole GPU for the model. Override
+# with COUNCIL_EMBED_DEVICE=cuda before launch on a box with spare VRAM.
+: "${COUNCIL_EMBED_DEVICE:=cpu}"
+export COUNCIL_EMBED_DEVICE
+
 # ── Launch ──────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
