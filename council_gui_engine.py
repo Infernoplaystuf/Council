@@ -12211,13 +12211,24 @@ class CouncilConsole(tk.Tk):
                         target = cand
                 out_dir = in_dir / ".deferred_results"
                 out_dir.mkdir(parents=True, exist_ok=True)
+                # Human-readable filename derived from the task itself, not the
+                # opaque internal id. e.g. a "bigger summary of sales.csv" task
+                # over folder Q3 -> "summary__Q3__bigger_summary_of_sales__a1b2.csv".
+                import re as _re
+                _desc = (task.question or task.folder or "deferred").strip().lower()
+                _slug = _re.sub(r"[^a-z0-9]+", "_", _desc).strip("_")[:48] or "deferred"
+                _fold = (_re.sub(r"[^A-Za-z0-9]+", "_", task.folder).strip("_")
+                         if task.folder else "")
+                _short = task.id[-4:]      # keep runs unique without being noisy
+                _kindword = ("summary" if task.kind == _dt.KIND_BIGGER_SUMMARY
+                             else "stats")
+                _name = "__".join(p for p in (_kindword, _fold, _slug, _short) if p)
+                op = out_dir / f"{_name}.csv"
                 if task.kind == _dt.KIND_BIGGER_SUMMARY:
                     df = _va.folder_data_summary([target])
-                    op = out_dir / f"{task.id}_summary.csv"
                     summary = f"{len(df)} file(s) profiled"
                 else:   # deeper_stats
                     df = _va.folder_column_stats(VAULT_DIR, [target])
-                    op = out_dir / f"{task.id}_stats.csv"
                     nfiles = int(df["file"].nunique()) if "file" in df else 0
                     summary = f"stats for {nfiles} file(s)"
                 df.to_csv(op, index=False)
