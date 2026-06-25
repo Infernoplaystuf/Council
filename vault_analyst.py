@@ -198,6 +198,50 @@ def list_data_files(data_folder: Any, recursive: bool = True) -> List[Path]:
                   | set(list_excel_files(data_folder, recursive=recursive)))
 
 
+# Internal/cache dirs that aren't user data — never counted as "files".
+_CENSUS_SKIP_DIRS = {".stats_cache", ".vault_index", "__pycache__",
+                     ".git", "conversation_logs"}
+
+
+def folder_file_counts(data_folder: Any, recursive: bool = True
+                       ) -> Dict[str, Any]:
+    """Cheap file census — total count + breakdown by extension — WITHOUT
+    reading any file contents. Answers "how many files are in <folder>"
+    deterministically and in a tiny prompt, so it never overflows a small
+    context window the way model code-gen would. Skips hidden entries and
+    the app's internal cache dirs. Returns
+    {"total": int, "folders": int, "by_ext": {ext: count}}.
+    """
+    folders = normalize_data_folders(data_folder)
+    total = 0
+    nfolders = 0
+    by_ext: Dict[str, int] = {}
+    for root in folders:
+        rp = Path(root)
+        if not rp.exists():
+            continue
+        it = rp.rglob("*") if recursive else rp.iterdir()
+        for p in it:
+            try:
+                rel_parts = p.relative_to(rp).parts
+            except Exception:
+                rel_parts = (p.name,)
+            # Skip anything under an internal/hidden dir (or hidden itself).
+            if any(part in _CENSUS_SKIP_DIRS or part.startswith(".")
+                   for part in rel_parts):
+                continue
+            try:
+                if p.is_dir():
+                    nfolders += 1
+                elif p.is_file():
+                    total += 1
+                    ext = p.suffix.lower() or "(no extension)"
+                    by_ext[ext] = by_ext.get(ext, 0) + 1
+            except OSError:
+                continue
+    return {"total": total, "folders": nfolders, "by_ext": by_ext}
+
+
 # ============================================================
 # Messy-data helpers — robust CSV / multi-table Excel / reshape
 # ============================================================

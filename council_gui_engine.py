@@ -2108,6 +2108,55 @@ def _run_analyst_step_impl(query):
         "profile this folder",
     )
     qlower = (query or "").lower()
+
+    # ── Direct-route: FILE COUNT ("how many files in data_in") ──────
+    # A trivial question that must NOT go through model code-gen — the
+    # code-gen prompt is ~3.5K tokens and overflows a small context
+    # window ("exceeds max tokens" crash on the 4K-ctx machine). Answer
+    # it deterministically with a cheap census (no file reads, tiny
+    # prompt). Guarded against row/record/column intents, which need
+    # per-file work, not a file count.
+    _FILE_COUNT_TRIGGERS = (
+        "how many files", "how many data files", "how many csv",
+        "how many csvs", "how many spreadsheets", "how many documents",
+        "how many json", "number of files", "count of files",
+        "count the files", "file count", "total files", "how many files are",
+    )
+    if (any(t in qlower for t in _FILE_COUNT_TRIGGERS)
+            and not any(x in qlower for x in
+                        ("row", "record", "column", "value", "cell"))):
+        try:
+            _csub = _va.resolve_subfolder_hint(query, allowed_folders[0])
+        except Exception:
+            _csub = None
+        _ctarget = _csub if _csub is not None else allowed_folders[0]
+        _cscope = (f" — scope: {_csub.relative_to(allowed_folders[0])}"
+                   if _csub is not None else "")
+        try:
+            counts = _va.folder_file_counts(_ctarget)
+        except Exception as _ce_exc:
+            print('[analyst] folder_file_counts failed: ' + repr(_ce_exc),
+                  file=_sys_dbg.stderr)
+            counts = None
+        if counts is not None:
+            by_ext = counts.get("by_ext", {})
+            breakdown = ", ".join(
+                f"{n} {ext}" for ext, n in
+                sorted(by_ext.items(), key=lambda kv: -kv[1])) or "no files"
+            folder_name = (str(_csub.relative_to(allowed_folders[0]))
+                           if _csub is not None else "data_in")
+            block = (f"[ANALYST RESULT — file count{_cscope}]\n"
+                     f"# Direct census (no model code-gen, no file reads).\n"
+                     f"{folder_name} contains {counts.get('total', 0)} file(s) "
+                     f"across {counts.get('folders', 0)} subfolder(s).\n"
+                     f"By type: {breakdown}")
+            notices.append(
+                f"Analyst direct-routed to file count"
+                + (f" on subfolder {folder_name}" if _csub is not None else "")
+                + f" — {counts.get('total', 0)} file(s).")
+            return block, None, notices
+        # Census failed → fall through to the model path.
+
     if any(phrase in qlower for phrase in _DIRECT_SUMMARY_TRIGGERS):
         # Honour subfolder hints exactly like the model path would
         # (we resolve scope_folder below for the model branch too).

@@ -353,6 +353,38 @@ def test_folder_data_summary_helper() -> None:
                and int(csv_row.iloc[0]["columns"]) == 3)
 
 
+def test_folder_file_counts_census() -> None:
+    """folder_file_counts gives a cheap, exact file census (total +
+    by-extension) WITHOUT reading files — the deterministic answer for
+    'how many files in data_in', which must never go through the ~3.5K-token
+    code-gen prompt (that overflowed a 4K context and crashed). Internal
+    cache dirs and hidden entries are excluded.
+    """
+    import vault_analyst as va
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        for i in range(3):
+            (d / f"a{i}.csv").write_text("x\n1\n")
+        for i in range(2):
+            (d / f"b{i}.json").write_text("{}")
+        (d / "notes.txt").write_text("hi")
+        sub = d / "sub"
+        sub.mkdir()
+        (sub / "c.csv").write_text("x\n1\n")
+        cache = d / ".stats_cache"
+        cache.mkdir()
+        (cache / "junk.csv").write_text("ignore")  # must be excluded
+
+        c = va.folder_file_counts(d)
+        _check("total counts real files only (excludes .stats_cache)",
+               c["total"] == 7)
+        _check("subfolder counted", c["folders"] == 1)
+        _check("csv breakdown correct (3 top + 1 sub)",
+               c["by_ext"].get(".csv") == 4)
+        _check("json breakdown correct", c["by_ext"].get(".json") == 2)
+        _check("txt breakdown correct", c["by_ext"].get(".txt") == 1)
+
+
 def test_stats_summary_triggers() -> None:
     """Stats-summary intents must reach the analyst (looks_computational).
     If they don't, the bounded folder_column_stats direct-route never
@@ -2474,6 +2506,7 @@ def main() -> int:
          test_build_pandas_code_prompt_no_fstring_brace_bug)
     _run("data-summary trigger keywords",       test_data_summary_triggers)
     _run("folder_data_summary helper",          test_folder_data_summary_helper)
+    _run("folder_file_counts census (file-count route)", test_folder_file_counts_census)
     _run("stats-summary trigger keywords",       test_stats_summary_triggers)
     _run("folder_column_stats bounded many-file", test_folder_column_stats_bounded_many_files)
     _run("analyst read-budget guard (OOM safety)", test_analyst_read_budget_guard)
