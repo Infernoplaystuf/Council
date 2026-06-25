@@ -1,0 +1,254 @@
+================================================================================
+ DATA'S INFERNO / COUNCIL — DISTRIBUTED DATA + GEOMETRY FINDINGS PROPOSAL
+================================================================================
+ Status:   DRAFT / PARKED. Revisit once the single-machine foundations are
+           judged solid enough to expand. This is a planning document, not a
+           commitment — nothing here is built unless the "Today" sections say so.
+ Audience: future us.
+ Scope:    What it would take — hardware AND software — to feed a database-scale
+           corpus plus images linked to parts of the data, run the same heavy
+           process repeatedly over many folders in the background (e.g. DREAM3D
+           pipelines), pull statistics out of geometries, and have the council
+           surface "special findings" — first on one machine, then across several.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+1. THE VISION (in one paragraph)
+--------------------------------------------------------------------------------
+A machine (or a fleet) that watches folders of data + linked images, notices new
+or changed data, automatically runs an assigned processing pipeline over it
+(DREAM3D / simplnx pipelines on 3D microstructure geometries being the driving
+example), extracts statistics out of the resulting geometries, accumulates those
+into a findings store, and lets the local LLM council read the accumulated
+stats + image context to pull out non-obvious findings — all running in the
+background, speeding up over time as caches fill, with no data leaving the
+owner's hardware.
+
+
+--------------------------------------------------------------------------------
+2. WORKLOAD DECOMPOSITION  (the key insight: these bottleneck DIFFERENTLY)
+--------------------------------------------------------------------------------
+This is not one workload. It is 4-5 loosely-coupled workloads, each strained by
+a different resource. Size each one independently; do not buy a giant GPU and
+assume it covers everything.
+
+  WORKLOAD                       PRIMARY BOTTLENECK     NOTES
+  ----------------------------   --------------------   --------------------------
+  DREAM3D pipelines on           RAM + CPU cores        Holds the whole data
+  geometries                                            container in memory. A
+                                                        1000^3 volume ~ 1B voxels;
+                                                        several fields = tens of GB
+                                                        PER dataset. CPU-bound,
+                                                        parallelizes well.
+  "Database worth" of tabular    Storage I/O            Streaming/stats-cache keeps
+  data ingest + index                                   RAM bounded; this is fast
+                                                        disk + total capacity.
+  Images linked to data          GPU (modest) + storage CLIP-style vision model for
+                                                        embeddings/search = a few GB
+                                                        VRAM; images need bulk disk.
+  LLM "findings" extraction      VRAM                   8-14B model fits ONE good
+                                                        GPU. Counterintuitively the
+                                                        CHEAPEST piece.
+  Background "repeat on every    cores x RAM            Queue/watcher running N jobs
+  folder"                        (concurrency)          at once needs cores for
+                                                        parallelism and RAM =
+                                                        (largest job footprint x N).
+
+  TAKEAWAY: the big hardware numbers come from RAM (for 3D volumes) and storage
+  (for the data lake), NOT the LLM. The LLM is the easy part.
+
+
+--------------------------------------------------------------------------------
+3. SINGLE-MACHINE SIZING TIERS
+--------------------------------------------------------------------------------
+TIER 1 — capable single workstation  (current machine is already close)
+  CPU      16-32 cores            (have: 28 cores — genuinely strong for batch)
+  RAM      64-128 GB              (likely the real upgrade lever for DREAM3D)
+  GPU      16-24 GB VRAM          (RTX 4090 / 3090 / A4000-class) runs a 14B LLM
+                                  + a vision model with headroom
+  Storage  2-4 TB NVMe scratch + bulk HDD/NAS for archive
+  Handles  geometries up to a few hundred M voxels, moderate image corpora,
+           a couple of concurrent pipelines.
+
+TIER 2 — serious geometries / heavy concurrency
+  CPU      32-64 cores            (Threadripper Pro / Epyc / dual Xeon)
+  RAM      256-512 GB             (large volumes + several pipelines at once)
+  GPU      24-48 GB               (RTX 6000 Ada / A6000, or 2x 4090) — bigger LLMs
+                                  (30-70B) for sharper findings
+  Storage  4-8 TB NVMe (RAID) + NAS
+
+TIER 3 — distributed / always-on   (see Section 5)
+  A GPU "head" node + several CPU/RAM compute nodes + shared storage.
+  Scale by adding boxes instead of buying one monster.
+
+CURRENT-MACHINE UPGRADE PRIORITY (highest leverage first):
+  1. RAM        64 -> 128 GB    (if DREAM3D OOMs or you want concurrency)
+  2. 24 GB GPU                  (LLM + vision + ends the CPU-only slowness once
+                                 the CUDA build is fixed)
+  3. Fast NVMe scratch          (stops pipelines I/O-stalling)
+
+
+--------------------------------------------------------------------------------
+4. GOING MULTI-MACHINE — WHY IT FITS, AND THE CATCH
+--------------------------------------------------------------------------------
+WHY IT FITS:
+  "Same process applied to many folders" is embarrassingly parallel — each
+  folder/dataset is an independent job with no cross-talk. Throughput scales
+  nearly linearly with node count... until everyone hits the same disk.
+
+THE CATCH (this is the whole story of going distributed):
+  The bottleneck stops being COMPUTE and becomes NETWORK + SHARED STORAGE.
+  3D geometries are gigabytes each. If N nodes all pull them from one NAS over
+  ordinary 1GbE (~125 MB/s), the link saturates and the expensive machines sit
+  STARVED waiting on data. Adding machines can make it SLOWER, not faster.
+
+THE DECISIVE ARCHITECTURAL CHOICE — move compute to data, or data to compute?
+  * Compute -> data: partition folders so each node OWNS a shard on its local
+    NVMe and processes it in place. Cheapest + fastest, less flexible.
+  * Data -> compute: central fast storage + 10GbE-or-faster networking, accept
+    the transfer cost. More flexible, networking becomes a real line item.
+  This choice — not the CPUs — drives most of the multi-machine spend
+  (10GbE switch + NICs, or a parallel filesystem like BeeGFS/Ceph).
+
+NODE ROLES:
+  * Head / orchestrator   job queue, folder watcher, findings DB, dispatch.
+                          The "council" lives here.
+  * GPU node(s)           LLM findings + image/vision embeddings, served AS A
+                          SERVICE so the model stays resident in VRAM (never
+                          reload per job).
+  * Compute nodes         CPU + RAM workhorses running DREAM3D. Scale by adding
+                          these; barely need a GPU.
+  * Shared storage / NAS  the data lake every node mounts.
+
+
+--------------------------------------------------------------------------------
+5. TOPOLOGIES (roughly by scale)
+--------------------------------------------------------------------------------
+A. Workstation + workers (lab scale)  <-- sweet spot for this workload
+     1 GPU head box + 2-6 CPU/RAM compute nodes + NAS on 10GbE.
+     Chews through a backlog overnight.
+
+B. Heterogeneous fleet (what Apothecary is aimed at)
+     Mixed machines — even Raspberry Pis for light I/O/stats, beefy boxes for
+     DREAM3D, one GPU node for the LLM — dispatcher routes BY CAPABILITY.
+     Fits the existing PiHealthMonitor + node registry + LoadAwareDispatcher.
+
+C. Real cluster (if you outgrow the homemade orchestrator)
+     Slurm / Ray / Dask + a parallel filesystem + dedicated GPU nodes.
+     The "stop hand-rolling it" tier.
+
+
+--------------------------------------------------------------------------------
+6. WHAT THE APP HAS TODAY vs WHAT MUST BE BUILT
+--------------------------------------------------------------------------------
+HAS (the skeleton — verify each before relying on it):
+  * Local GGUF LLM inference (single in-process model).
+  * Vault indexing (keyword / descriptions / embeddings).
+  * Incremental, streaming STATS CACHE (built so it speeds up over time).
+  * Query-report cache (reuses prior summaries by file-fingerprint).
+  * Image-metadata parsing; RAG / vector search.
+  * DREAM3D tab + crawler (dream3d_crawl.py).
+  * Apothecary multi-node framework: NodeRegistry, ApothecaryEngine (SSH
+    provisioning), PiHealthMonitor, LoadAwareDispatcher.
+  * Opt-in remote LLM-inference dispatch (COUNCIL_REMOTE_NODES) — WIRED BUT
+    NEVER LIVE-TESTED across two real machines.
+
+MISSING (the real work — this is SOFTWARE, not hardware):
+  * Durable distributed JOB QUEUE. Current framework dispatches INFERENCE, not
+    arbitrary DREAM3D pipeline JOBS, and it is not durable — a crashed node's
+    job should re-route, not vanish.
+  * Folder watcher -> enqueuer ("new data landed -> schedule the pipeline").
+  * Idempotent results store so two nodes never double-process a folder;
+    coordinated writes to the central findings DB.
+  * Data-locality-aware scheduling (send the job to where the data already is).
+  * The DREAM3D-pipeline -> extract-geometry-stats -> LLM-findings chain as one
+    automated flow.
+  * Live validation of the multi-node inference path.
+
+  HONEST FRAMING: the hardware to go multi-machine is the EASY half. The
+  orchestration layer that turns "a bunch of boxes" into "a thing that watches
+  folders, runs pipelines everywhere, and accumulates findings without stepping
+  on itself" is the part that needs building.
+
+
+--------------------------------------------------------------------------------
+7. PHASED ROADMAP
+--------------------------------------------------------------------------------
+PHASE 0 — Foundations (PREREQUISITE; do not expand until these are "good enough")
+  * Single-machine app stable: model loads, no core dumps, context handling sane.
+  * GPU path actually works on the target box (CUDA-matched llama-cpp build).
+  * Stats cache + query-report cache proven to speed up repeat work at scale.
+  * DREAM3D pipeline can be run from the app over a folder and its geometry
+    stats extracted reliably, by hand, once.
+
+PHASE 1 — Single-box background automation
+  * Folder watcher + LOCAL job queue: notice new/changed folder -> run assigned
+    pipeline -> extract stats -> write to findings store -> council summarizes.
+  * Idempotency + a "processed" ledger (don't redo unchanged folders) — reuse
+    the stats-cache mtime-keyed pattern.
+  * Concurrency limited to (cores, RAM/job). Prove the loop end-to-end on ONE
+    machine before any networking exists.
+
+PHASE 2 — Two-machine prototype (the cheap, decisive experiment)
+  * Current 28-core box = head; one second machine = worker.
+  * Run a handful of REAL DREAM3D folders through the queue over whatever
+    network exists. MEASURE where it stalls:
+        - stalls on disk/network  -> you need 10GbE or local-staging BEFORE scaling
+        - stalls on RAM/CPU       -> more nodes genuinely help
+  * Doubles as the first live test of the app's untested multi-node path.
+
+PHASE 3 — Small fleet (Topology A / B)
+  * Add compute nodes; promote one box to GPU/LLM service node.
+  * Capability-aware dispatch (heavy pipelines -> big nodes; light stats/IO ->
+    small nodes; LLM -> GPU node).
+  * Durable queue with retry/re-route; central findings DB with coordinated writes.
+  * Decide compute-to-data vs data-to-compute based on Phase-2 measurements;
+    buy networking/storage accordingly.
+
+PHASE 4 — Real cluster (only if the fleet outgrows the homemade orchestrator)
+  * Adopt Slurm/Ray/Dask + a parallel filesystem. Retire the hand-rolled queue.
+
+
+--------------------------------------------------------------------------------
+8. THE NUMBERS THAT DETERMINE THE SPEC  (answer these before buying anything)
+--------------------------------------------------------------------------------
+  1. How big is ONE 3D dataset? (voxel dims, # of fields)  -> sets RAM, and
+     whether a geometry fits on a node's local disk.
+  2. Total data volume + image count?                      -> sets storage.
+  3. How many folders, how often, how concurrent?          -> sets node count and
+                                                              single-box vs fleet.
+  4. Can a dataset live on a node's local NVMe?            -> compute-to-data vs
+                                                              data-to-compute, which
+                                                              sets the networking spend.
+  5. How often does new data land?                         -> always-on watcher vs
+                                                              batch runs.
+
+
+--------------------------------------------------------------------------------
+9. RISKS / HONEST CAVEATS
+--------------------------------------------------------------------------------
+  * Network + shared storage is the real cost and the real bottleneck of going
+    distributed — not the CPUs/GPU.
+  * Orchestration complexity is the hard, build-it-yourself part. Easy to
+    underestimate (queues, retries, idempotency, coordination).
+  * Large-geometry data movement is expensive; design around locality early.
+  * The app's distributed paths are UNPROVEN in the wild; treat Phase 2 as a
+    real experiment that may surface architectural rework.
+  * LLM findings quality scales with model size (VRAM) — but bigger models slow
+    throughput; balance against the volume of findings you need.
+  * Keep it offline-by-design: a fleet must not become a reason data leaves the
+    owner's hardware.
+
+
+--------------------------------------------------------------------------------
+10. REVISIT CRITERIA
+--------------------------------------------------------------------------------
+  Open this document again when ALL of Phase 0 is true on the real target
+  hardware. Until then, the highest-value work is single-machine: stability,
+  the working GPU path, and the local folder-watcher/job-queue (Phase 1), which
+  is the foundation every distributed phase builds on.
+
+================================================================================
+ END — parked pending "foundations good enough" call.
+================================================================================
