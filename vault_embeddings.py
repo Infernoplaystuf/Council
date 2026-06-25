@@ -244,9 +244,15 @@ class EmbeddingIndex:
                 "`pip install sentence-transformers`. Original error: "
                 f"{exc!r}"
             )
-        # CPU-only by default; sentence-transformers picks GPU if torch
-        # sees CUDA. Override via COUNCIL_EMBED_DEVICE.
-        device = os.environ.get("COUNCIL_EMBED_DEVICE")  # 'cuda' / 'cpu'
+        # Device: COUNCIL_EMBED_DEVICE if set, else auto — but forced to
+        # 'cpu' on WSL, where the embedder on the same GPU as a fully-
+        # offloaded model causes a CUDA core dump. Resolved in code so the
+        # safe default holds regardless of launcher.
+        try:
+            import hardware_detect as _hd
+            device = _hd.resolve_embed_device()
+        except Exception:
+            device = os.environ.get("COUNCIL_EMBED_DEVICE")  # 'cuda' / 'cpu'
         # When the model is already in the local HF cache, force
         # local_files_only so the load NEVER touches the network.
         # Without it, huggingface_hub HEAD-checks the repo on every

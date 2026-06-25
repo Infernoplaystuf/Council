@@ -1825,6 +1825,35 @@ def test_model_finder_us_filter_and_fit() -> None:
            unknown["can_upgrade"] is False and len(unknown["upgrades"]) >= 1)
 
 
+def test_resolve_embed_device_wsl_cpu_default() -> None:
+    """hardware_detect.resolve_embed_device: explicit COUNCIL_EMBED_DEVICE
+    wins; otherwise default to 'cpu' on WSL (GPU embedder + offloaded model
+    = CUDA core dump) and None (auto) elsewhere. In code so the safe WSL
+    default holds however the app is launched.
+    """
+    import hardware_detect as hd
+    prev_env = os.environ.pop("COUNCIL_EMBED_DEVICE", None)
+    prev_os = hd._detect_os
+    try:
+        os.environ["COUNCIL_EMBED_DEVICE"] = "cuda"
+        _check("explicit override respected",
+               hd.resolve_embed_device() == "cuda")
+        os.environ.pop("COUNCIL_EMBED_DEVICE", None)
+        hd._detect_os = lambda: "wsl"
+        _check("WSL defaults to cpu", hd.resolve_embed_device() == "cpu")
+        hd._detect_os = lambda: "linux"
+        _check("plain Linux stays auto (None)",
+               hd.resolve_embed_device() is None)
+        hd._detect_os = lambda: "windows"
+        _check("Windows stays auto (None)",
+               hd.resolve_embed_device() is None)
+    finally:
+        hd._detect_os = prev_os
+        os.environ.pop("COUNCIL_EMBED_DEVICE", None)
+        if prev_env is not None:
+            os.environ["COUNCIL_EMBED_DEVICE"] = prev_env
+
+
 def test_dispatcher_no_probe_when_remote_disabled() -> None:
     """Single-machine regression: with COUNCIL_REMOTE_NODES off (default),
     a model call must NOT probe hosts (best_host_for) — that probe hits
@@ -2455,6 +2484,8 @@ def main() -> int:
          test_vram_aware_n_ctx_ladder_log_no_kwarg_collision)
     _run("dispatcher: no host probe when remote disabled",
          test_dispatcher_no_probe_when_remote_disabled)
+    _run("embed device: WSL defaults to CPU (no CUDA crash)",
+         test_resolve_embed_device_wsl_cpu_default)
     _run("clip_path / GGUF path co-persistence", test_clip_path_persistence)
     _run("SPC — process_capability known-values", test_spc_process_capability_known_values)
     _run("SPC — process_capability one-sided",    test_spc_process_capability_one_sided)

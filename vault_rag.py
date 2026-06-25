@@ -231,7 +231,14 @@ class _ChromaBackend:
         # 'cpu' is the safe default for dev boxes. Native sm_89 (4080)
         # targets can leave this unset to use CUDA.
         if _ST_OK:
-            device = os.environ.get("COUNCIL_EMBED_DEVICE", "").strip() or None
+            # Env var if set, else auto — but 'cpu' on WSL (GPU embedder +
+            # offloaded model = CUDA core dump). Resolved in code so the
+            # safe default applies however the app was launched.
+            try:
+                import hardware_detect as _hd
+                device = _hd.resolve_embed_device()
+            except Exception:
+                device = os.environ.get("COUNCIL_EMBED_DEVICE", "").strip() or None
             try:
                 # Deferred heavy import — see the find_spec note at the
                 # top of this module. local_files_only when cached: a

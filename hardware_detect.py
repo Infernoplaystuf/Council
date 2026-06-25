@@ -87,6 +87,26 @@ def _detect_os() -> str:
     return "unknown"
 
 
+def resolve_embed_device() -> Optional[str]:
+    """Device for the sentence-transformers embedder, or None to auto-pick.
+
+    Honors COUNCIL_EMBED_DEVICE when set. Otherwise defaults to 'cpu' on
+    WSL: loading the embedder on the SAME GPU as a fully-offloaded GGUF
+    model exhausts VRAM there and causes a CUDA error / NATIVE crash (core
+    dump, no Python traceback). This makes that safe default apply no matter
+    how the app is launched (not only via run-wsl.sh). Other platforms
+    return None so sentence-transformers picks GPU when one is present."""
+    ov = os.environ.get("COUNCIL_EMBED_DEVICE", "").strip()
+    if ov:
+        return ov
+    try:
+        if _detect_os() == "wsl":
+            return "cpu"
+    except Exception:
+        pass
+    return None
+
+
 def _os_version() -> str:
     try:
         if sys.platform.startswith("win"):
