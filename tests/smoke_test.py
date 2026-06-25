@@ -399,6 +399,39 @@ def test_folder_data_summary_helper() -> None:
                and int(csv_row.iloc[0]["columns"]) == 3)
 
 
+def test_single_file_helpers_handle_empty_and_malformed() -> None:
+    """summarize_csv / schema_doc_from_csv must degrade gracefully on an
+    empty (0-byte) or malformed CSV instead of raising EmptyDataError /
+    KeyError — these run over whole folders, where one bad file must not
+    abort the batch. (Found by adversarial-data simulation.)
+    """
+    import vault_analyst as va
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        empty = d / "empty.csv"
+        empty.write_text("")                       # 0 bytes, no header
+        good = d / "good.csv"
+        good.write_text("id,amount\n1,10\n2,20\n")
+
+        # summarize_csv: empty -> diagnostic row (no raise); good -> profile.
+        r_empty = va.summarize_csv(empty)
+        _check("summarize_csv(empty) returns a frame, doesn't raise",
+               hasattr(r_empty, "shape") and len(r_empty) >= 1)
+        _check("summarize_csv(empty) flags the empty/unreadable status",
+               "status" in r_empty.columns)
+        r_good = va.summarize_csv(good)
+        _check("summarize_csv(good) still profiles columns",
+               "dtype" in r_good.columns and len(r_good) == 2)
+
+        # schema_doc_from_csv: must not KeyError on the diagnostic frame.
+        doc_empty = va.schema_doc_from_csv(empty)
+        _check("schema_doc_from_csv(empty) returns a string, no KeyError",
+               isinstance(doc_empty, str) and "empty.csv" in doc_empty)
+        doc_good = va.schema_doc_from_csv(good)
+        _check("schema_doc_from_csv(good) still produces a real doc",
+               isinstance(doc_good, str) and "good.csv" in doc_good)
+
+
 def test_folder_file_counts_census() -> None:
     """folder_file_counts gives a cheap, exact file census (total +
     by-extension) WITHOUT reading files — the deterministic answer for
@@ -2615,6 +2648,8 @@ def main() -> int:
          test_build_pandas_code_prompt_no_fstring_brace_bug)
     _run("data-summary trigger keywords",       test_data_summary_triggers)
     _run("folder_data_summary helper",          test_folder_data_summary_helper)
+    _run("single-file helpers: empty/malformed CSV safe",
+         test_single_file_helpers_handle_empty_and_malformed)
     _run("folder_file_counts census (file-count route)", test_folder_file_counts_census)
     _run("stats-summary trigger keywords",       test_stats_summary_triggers)
     _run("folder_column_stats bounded many-file", test_folder_column_stats_bounded_many_files)

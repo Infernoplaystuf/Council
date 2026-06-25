@@ -2445,8 +2445,14 @@ def schema_doc_from_csv(path: Any) -> str:
         prof = summarize_csv(p)
     except Exception as exc:
         return f"# {p.name}\n\nCould not profile file: {exc}\n"
-    if prof.empty:
-        return f"# {p.name}\n\nEmpty or unreadable.\n"
+    # summarize_csv returns a 1-row diagnostic frame (cols: csv/column/status,
+    # NO 'dtype') for an empty/unreadable file rather than raising. Detect
+    # that shape so we don't KeyError on the per-column 'dtype' access below.
+    if prof.empty or "dtype" not in prof.columns:
+        note = ""
+        if not prof.empty and "status" in prof.columns:
+            note = f" ({prof.iloc[0]['status']})"
+        return f"# {p.name}\n\nEmpty or unreadable.{note}\n"
 
     try:
         full_df = pd.read_csv(p, nrows=1)  # for total-column count, not values
@@ -2794,7 +2800,21 @@ def summarize_csv(path: Any) -> pd.DataFrame:
     Saves the model from hand-rolling 15 lines of pandas.
     """
     p = Path(path)
-    df = pd.read_csv(p)
+    # An empty / header-less file raises EmptyDataError ("No columns to
+    # parse"); a malformed one raises ParserError. Degrade to a one-row
+    # diagnostic frame instead of crashing — these helpers are called over
+    # whole folders, where one bad file shouldn't abort the batch.
+    try:
+        df = pd.read_csv(p)
+    except Exception as exc:
+        return pd.DataFrame([{
+            "csv": p.name, "column": None,
+            "status": f"could not read: {type(exc).__name__}: {exc}",
+        }])
+    if df.shape[1] == 0:
+        return pd.DataFrame([{
+            "csv": p.name, "column": None, "status": "empty file (no columns)",
+        }])
     rows: List[Dict[str, Any]] = []
     total = max(1, len(df))
     for col in df.columns:
