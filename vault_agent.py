@@ -726,7 +726,9 @@ if _TK_OK:
                     self.after(0, _finish)
 
                 except Exception as e:
-                    self.after(0, lambda: (
+                    # Capture e by value — the lambda runs on the Tk loop
+                    # after this block exits, where `e` is already deleted.
+                    self.after(0, lambda e=e: (
                         self._log(f"Agent error: {e}", "error"),
                         self._run_btn.configure(state="normal"),
                     ))

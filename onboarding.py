@@ -921,7 +921,10 @@ class OnboardingWizard(_TkBase):
                     )
                 self.after(0, _ok)
             except Exception as exc:
-                def _err():
+                # Bind exc as a default arg: self.after defers _err to the Tk
+                # loop AFTER this except block exits, at which point Python
+                # has deleted `exc` — referencing it then is a NameError.
+                def _err(exc=exc):
                     self._gguf_status_var.set(f"✗ download failed: {exc!r}")
                     messagebox.showerror(
                         "Download failed",

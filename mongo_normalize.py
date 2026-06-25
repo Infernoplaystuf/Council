@@ -56,7 +56,16 @@ def _coerce_extended_json(d: Dict[str, Any]) -> Any:
         if k == "$oid":
             return str(v)
         if k == "$date":
-            # $date is epoch-ms (int) or an ISO string; normalise to ISO.
+            # Three forms in the wild:
+            #   relaxed   : {"$date": "2024-03-15T12:30:00Z"}  (ISO string)
+            #   relaxed   : {"$date": 1710505800000}           (epoch-ms int)
+            #   canonical : {"$date": {"$numberLong": "1710505800000"}}
+            #               (what modern `mongoexport` emits by default)
+            if isinstance(v, dict) and "$numberLong" in v:
+                try:
+                    v = int(v["$numberLong"])
+                except (TypeError, ValueError):
+                    return str(v)
             if isinstance(v, (int, float)):
                 try:
                     return datetime.utcfromtimestamp(v / 1000.0).isoformat() + "Z"
@@ -215,6 +224,8 @@ def flatten_document(doc: Dict[str, Any], *,
     coerced = coerce_value(doc)
     if not isinstance(coerced, dict):
         return {"value": coerced}
+    if not coerced:
+        return {}                 # empty document -> empty row, not {"": "{}"}
     out: Dict[str, Any] = {}
 
     def _walk(prefix: str, val: Any) -> None:

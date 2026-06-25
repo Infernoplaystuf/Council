@@ -505,6 +505,11 @@ def generate_pipeline_from_description(
     except Exception as exc:
         return None, f"model call failed: {exc!r}"
 
+    # extract_python_code lives in vault_analyst — was used here without an
+    # import, so this line raised NameError whenever the model returned
+    # output (the whole pipeline-edit feature was dead). Import lazily to
+    # avoid pulling pandas at module load.
+    from vault_analyst import extract_python_code
     code = extract_python_code(raw or "")
     if not code.strip():
         return None, "model returned empty output"

@@ -15,6 +15,19 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+# Protected-path guard. Without this import the calls to is_protected_path()
+# below raised NameError every time — silently swallowed by their
+# `except Exception: pass`, so the protection check NEVER ran and the vault
+# tools would read/grep files under protected dirs (conversation_logs,
+# pipelines/out, …). Import the real check so it actually applies; fall
+# back to "not protected" (the prior effective behaviour) only if the
+# logger module can't be imported.
+try:
+    from conversation_logger import is_protected_path
+except Exception:  # pragma: no cover - defensive
+    def is_protected_path(path: Any, vault_dir: Any) -> bool:  # type: ignore
+        return False
+
 
 # ============================================================
 # Vault stats

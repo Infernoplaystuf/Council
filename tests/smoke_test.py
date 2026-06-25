@@ -2061,10 +2061,7 @@ def test_model_downloader() -> None:
     """model_downloader: OS-aware dir, HF URL build, GGUF magic check,
     non-HF URL refusal, and a real streaming download (local server) with
     magic validation + skip-if-present."""
-    import http.server
-    import socketserver
-    import threading as _th
-    import time as _time
+    import io
     import model_downloader as md
 
     _check("detect_os returns a known value",
@@ -2093,48 +2090,54 @@ def test_model_downloader() -> None:
             refused = True
         _check("non-Hugging-Face URL refused", refused)
 
-        # Real streaming download from a local server (host shim).
-        srv = d / "srv"
-        srv.mkdir()
-        (srv / "m.gguf").write_bytes(b"GGUF" + b"\0" * (256 * 1024))
-        cwd0 = os.getcwd()
-        os.chdir(srv)
-        httpd = socketserver.TCPServer(
-            ("127.0.0.1", 0), http.server.SimpleHTTPRequestHandler)
-        port = httpd.server_address[1]
-        _th.Thread(target=httpd.serve_forever, daemon=True).start()
-        _time.sleep(0.15)
+        # Streaming download via a MOCKED urlopen — deterministic, no real
+        # socket. (A real localhost http.server flakes with WinError 10054
+        # on Windows: it resets the connection rather than sending a clean
+        # EOF, which has nothing to do with the downloader.) The mock serves
+        # the GGUF bytes in chunks so we still exercise the streaming +
+        # magic-byte-verify + skip-if-present logic in download_gguf.
+        import urllib.request as _ureq
+        payload = b"GGUF" + b"\0" * (256 * 1024)
+
+        class _FakeResp:
+            status = 200
+
+            def __init__(self, data):
+                self._buf = io.BytesIO(data)
+                self.headers = {"Content-Length": str(len(data))}
+
+            # download_gguf calls resp.headers.get("Content-Length", "")
+            def read(self, n=-1):
+                return self._buf.read(n)
+
+            def close(self):
+                self._buf.close()
+
+        # headers needs .get(); a plain dict works since dict.get exists.
+        def _fake_urlopen(req, timeout=60):
+            return _FakeResp(payload)
+
+        prev_urlopen = _ureq.urlopen
         prev_host = md._HF_HOST
         md._HF_HOST = "127.0.0.1"
+        _ureq.urlopen = _fake_urlopen
         try:
             out = d / "models"
             seen = []
-            # The stdlib http.server occasionally resets a localhost
-            # connection mid-stream on Windows (WinError 10054). That's a
-            # test-server flake, not a downloader bug — retry a couple of
-            # times (download_gguf resumes from the .part file).
-            r = None
-            for _attempt in range(3):
-                try:
-                    r = md.download_gguf(
-                        "repo", "m.gguf", out,
-                        url=f"http://127.0.0.1:{port}/m.gguf",
-                        progress=lambda done, total: seen.append(done))
-                    break
-                except md.DownloadError:
-                    _time.sleep(0.2)
+            r = md.download_gguf(
+                "repo", "m.gguf", out, url="http://127.0.0.1/m.gguf",
+                progress=lambda done, total: seen.append(done))
             _check("download produced a valid GGUF",
-                   r is not None and md.looks_like_gguf(r["path"])
-                   and r["bytes"] > 0)
+                   md.looks_like_gguf(r["path"]) and r["bytes"] > 0)
             _check("progress callback fired", len(seen) >= 1)
+            # Second call: file present + valid -> skips the network entirely.
             r2 = md.download_gguf("repo", "m.gguf", out,
-                                  url=f"http://127.0.0.1:{port}/m.gguf")
+                                  url="http://127.0.0.1/m.gguf")
             _check("re-download skips an already-present valid file",
                    r2["skipped"] is True)
         finally:
+            _ureq.urlopen = prev_urlopen
             md._HF_HOST = prev_host
-            httpd.shutdown()
-            os.chdir(cwd0)
 
 
 def test_stats_cache_per_folder_csv_shards() -> None:

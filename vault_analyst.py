@@ -216,29 +216,44 @@ def folder_file_counts(data_folder: Any, recursive: bool = True
     total = 0
     nfolders = 0
     by_ext: Dict[str, int] = {}
+    # os.walk (not Path.rglob) so we can (a) PRUNE internal/hidden dirs
+    # instead of descending into them, and (b) survive a permission-denied
+    # or broken-symlink dir via the onerror callback — rglob would raise
+    # mid-iteration and abort the whole census (real risk under WSL /mnt).
+    import os as _os
     for root in folders:
         rp = Path(root)
         if not rp.exists():
             continue
-        it = rp.rglob("*") if recursive else rp.iterdir()
-        for p in it:
+        if not recursive:
             try:
-                rel_parts = p.relative_to(rp).parts
-            except Exception:
-                rel_parts = (p.name,)
-            # Skip anything under an internal/hidden dir (or hidden itself).
-            if any(part in _CENSUS_SKIP_DIRS or part.startswith(".")
-                   for part in rel_parts):
-                continue
-            try:
-                if p.is_dir():
-                    nfolders += 1
-                elif p.is_file():
-                    total += 1
-                    ext = p.suffix.lower() or "(no extension)"
-                    by_ext[ext] = by_ext.get(ext, 0) + 1
+                for p in rp.iterdir():
+                    if p.name in _CENSUS_SKIP_DIRS or p.name.startswith("."):
+                        continue
+                    try:
+                        if p.is_dir():
+                            nfolders += 1
+                        elif p.is_file():
+                            total += 1
+                            ext = p.suffix.lower() or "(no extension)"
+                            by_ext[ext] = by_ext.get(ext, 0) + 1
+                    except OSError:
+                        continue
             except OSError:
                 continue
+            continue
+        for dirpath, dirnames, filenames in _os.walk(
+                str(rp), onerror=lambda _e: None):
+            # Prune internal/hidden subdirs in place so os.walk skips them.
+            dirnames[:] = [d for d in dirnames
+                           if d not in _CENSUS_SKIP_DIRS and not d.startswith(".")]
+            nfolders += len(dirnames)
+            for fn in filenames:
+                if fn.startswith("."):
+                    continue
+                total += 1
+                ext = Path(fn).suffix.lower() or "(no extension)"
+                by_ext[ext] = by_ext.get(ext, 0) + 1
     return {"total": total, "folders": nfolders, "by_ext": by_ext}
 
 

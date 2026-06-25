@@ -2067,7 +2067,7 @@ If the user mentions a filename or asks about a specific dataset and the
 prompt does NOT contain a [FILE: ...] block or [VAULT MATCH: ...] block
 for that file, the file IS NOT AVAILABLE on this machine. Examples that
 should ALL trigger a refusal:
-  - User says "summarize C:\path\to\foo.csv" but no [FILE: foo.csv] block
+  - User says "summarize C:\\path\\to\\foo.csv" but no [FILE: foo.csv] block
     is present in your prompt.
   - User asks about a dataset by name (e.g. "the games dataset") and no
     [VAULT MATCH] or [FILE] block mentions a file matching that name.
