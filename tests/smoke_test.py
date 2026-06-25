@@ -2135,6 +2135,27 @@ def test_deferred_tasks_store() -> None:
             # Survives a fresh store instance (persisted).
             _check("persists across instances",
                    len(dt.DeferredTaskStore().all()) == 3)
+
+            # find_answered: a completed task with an existing result file is
+            # matched when the question is re-asked (so the council can reuse
+            # it); reworded matches, unrelated doesn't, and a missing result
+            # file disqualifies it.
+            res = Path(td) / "result.csv"
+            res.write_text("a,b\n1,2\n")
+            tq = s.add(kind="bigger_summary",
+                       question="bigger summary of the orders file")
+            s.mark_done(tq.id, result_path=str(res), result_summary="ok")
+            _check("find_answered matches the same question",
+                   s.find_answered("bigger summary of the orders file") is not None)
+            _check("find_answered matches a rewording",
+                   s.find_answered("can you give a bigger summary of orders")
+                   is not None)
+            _check("find_answered rejects an unrelated question",
+                   s.find_answered("what is the average revenue") is None)
+            # If the result file is gone, it must NOT be offered.
+            res.unlink()
+            _check("find_answered skips a task whose result file vanished",
+                   s.find_answered("bigger summary of the orders file") is None)
         finally:
             if prev is None:
                 os.environ.pop("COUNCIL_VAULT_ROOT", None)

@@ -186,3 +186,45 @@ class DeferredTaskStore:
 
     def reopen(self, task_id: str) -> bool:
         return self._update(task_id, status=STATUS_PENDING, done_ts=None)
+
+    def find_answered(self, question: str, *,
+                      min_overlap: float = 0.5) -> Optional[DeferredTask]:
+        """Return the best COMPLETED task whose question lexically matches
+        ``question`` AND whose result file still exists — so re-asking a
+        previously-deferred question can be answered from the saved result
+        instead of recomputed. Returns None when nothing matches well enough.
+        """
+        best: Optional[DeferredTask] = None
+        best_score = float(min_overlap)
+        for t in self.all():
+            if t.status != STATUS_DONE or not t.result_path:
+                continue
+            try:
+                if not Path(t.result_path).exists():
+                    continue
+            except Exception:
+                continue
+            sc = _question_overlap(question, t.question)
+            if sc >= best_score:
+                best, best_score = t, sc
+        return best
+
+
+# Jaccard overlap on meaningful tokens — cheap "is this the same question?"
+# check, mirroring task_memory's similarity but kept self-contained.
+_OVERLAP_STOP = {
+    "a", "an", "the", "of", "in", "on", "for", "to", "and", "or", "is", "it",
+    "what", "how", "with", "by", "at", "give", "me", "my", "please", "can",
+    "you", "show", "tell", "get", "do", "i", "want", "need", "that", "this",
+}
+
+
+def _question_overlap(a: str, b: str) -> float:
+    import re
+    def toks(s: str):
+        return {w for w in re.findall(r"[a-z0-9]+", (s or "").lower())
+                if w not in _OVERLAP_STOP and len(w) > 1}
+    sa, sb = toks(a), toks(b)
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)

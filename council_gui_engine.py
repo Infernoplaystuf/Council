@@ -2125,6 +2125,47 @@ def _run_analyst_step_impl(query):
     except Exception:
         allowed_folders = [VAULT_DIR]
 
+    # ── Direct-route: PRECOMPUTED ANSWER from a deferred task ────────
+    # If the user re-asks something they previously deferred to the Vault
+    # tab and ran there, answer FROM that saved result instead of
+    # recomputing — that is the whole point of "Defer to Vault": ask again
+    # later, get the answer. Highest priority so it wins over recompute.
+    try:
+        import deferred_tasks as _dft
+        _ans = _dft.DeferredTaskStore(VAULT_DIR).find_answered(query)
+    except Exception:
+        _ans = None
+    if _ans is not None and _ans.result_path:
+        try:
+            import pandas as _pd_pre
+            _rp = Path(_ans.result_path)
+            _rdf = _pd_pre.read_csv(_rp)
+            try:
+                _n_ctx_pre = ce.get_n_ctx()
+            except Exception:
+                _n_ctx_pre = 4096
+            _ptable = _va.format_result_for_prompt(
+                _rdf, max_rows=300, max_chars=12000,
+                max_tokens=max(150, _n_ctx_pre // 4),
+                count_tokens=ce.estimate_tokens)
+            block = (f"[ANALYST RESULT — precomputed from a deferred task]\n"
+                     f"# This question was deferred to the Vault tab earlier and "
+                     f"computed there ({_ans.result_summary or 'saved result'}). "
+                     f"Answer from this saved result ({_rp.name}); do NOT recompute.\n"
+                     f"{_ptable}")
+            notices.append(
+                f"Used a precomputed answer from a deferred task — {_rp.name}.")
+            try:
+                notices.append("__ANALYST_TABLE__:" + _rdf.to_string(
+                    index=False, max_rows=80, max_cols=20))
+            except Exception:
+                pass
+            return block, None, notices
+        except Exception as _pe:
+            print('[analyst] precomputed-answer load failed: ' + repr(_pe),
+                  file=_sys_dbg.stderr)
+            # fall through to normal routing if the saved file is unreadable
+
     # ── Direct-intent shortcut for "true data summary" queries ──────
     # These map deterministically to folder_data_summary() — no model
     # codegen needed. Saves ~2-5 s per call AND removes a class of
@@ -12209,7 +12250,12 @@ class CouncilConsole(tk.Tk):
                     cand = in_dir / task.folder
                     if cand.exists():
                         target = cand
-                out_dir = in_dir / ".deferred_results"
+                # NON-hidden folder on purpose: a ".deferred_results" dot-dir
+                # is skipped by the vault index/analyst, so the council could
+                # never find the saved result. This way, re-asking the same
+                # question surfaces it (see the precomputed-answer route in
+                # _run_analyst_step_impl).
+                out_dir = in_dir / "deferred_results"
                 out_dir.mkdir(parents=True, exist_ok=True)
                 # Human-readable filename derived from the task itself, not the
                 # opaque internal id. e.g. a "bigger summary of sales.csv" task
@@ -12240,7 +12286,8 @@ class CouncilConsole(tk.Tk):
                     self._vmgr_refresh_deferred(),
                     self._defer_status.set(
                         f"Done — {summary} → {op.name} (in "
-                        "data_in/.deferred_results/).")))
+                        "data_in/deferred_results/). Re-ask in the Council tab "
+                        "to use it.")))
             except Exception as exc:
                 self.after(0, lambda: self._defer_status.set(
                     f"Run failed: {exc!r}"))
