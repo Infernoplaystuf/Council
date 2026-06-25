@@ -1971,6 +1971,54 @@ def test_dispatcher_no_probe_when_remote_disabled() -> None:
             os.environ["COUNCIL_REMOTE_NODES"] = prev_flag
 
 
+def test_gpu_crash_sentinel_lifecycle() -> None:
+    """GPU-crash sentinel: a native CUDA abort can't be caught in Python, so
+    we mark 'GPU unconfirmed' before a GPU load and clear it after the first
+    successful generation. If it's still present next load, the prior GPU
+    attempt crashed -> auto-fall-back to CPU. Verifies mark/pending/confirm/
+    clear + that refresh resets the per-process confirm flag.
+    """
+    import council_engine as ce
+    prev_root = os.environ.get("COUNCIL_VAULT_ROOT")
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["COUNCIL_VAULT_ROOT"] = td
+        try:
+            ce.gpu_clear_attempt()
+            _check("no sentinel initially", not ce.gpu_attempt_pending())
+            ce._gpu_mark_attempt(99)
+            _check("sentinel present after mark", ce.gpu_attempt_pending())
+
+            # A confirmed-good generation clears it (once per process).
+            ce._GPU_CONFIRMED_THIS_PROCESS = False
+            ce._gpu_confirm_success()
+            _check("sentinel cleared after a successful generation",
+                   not ce.gpu_attempt_pending())
+
+            # Second confirm in the same process is a no-op (guarded).
+            ce._gpu_mark_attempt(99)
+            ce._gpu_confirm_success()   # already confirmed -> must NOT clear
+            _check("confirm is once-per-process (sentinel still present)",
+                   ce.gpu_attempt_pending())
+
+            # Explicit clear (engine settings / clean close path).
+            ce.gpu_clear_attempt()
+            _check("explicit clear removes sentinel",
+                   not ce.gpu_attempt_pending())
+
+            # refresh_backend_config resets the per-process confirm flag so a
+            # newly loaded model re-proves the GPU path.
+            ce._GPU_CONFIRMED_THIS_PROCESS = True
+            ce.refresh_backend_config()
+            _check("refresh resets the confirm flag",
+                   ce._GPU_CONFIRMED_THIS_PROCESS is False)
+        finally:
+            ce.gpu_clear_attempt()
+            if prev_root is None:
+                os.environ.pop("COUNCIL_VAULT_ROOT", None)
+            else:
+                os.environ["COUNCIL_VAULT_ROOT"] = prev_root
+
+
 def test_vram_aware_n_ctx_ladder_log_no_kwarg_collision() -> None:
     """Regression: after switching to a model that triggers the VRAM-aware
     n_ctx path, the engine logged the result. _pick_vram_aware_n_ctx puts
@@ -2061,12 +2109,23 @@ def test_model_downloader() -> None:
         try:
             out = d / "models"
             seen = []
-            r = md.download_gguf(
-                "repo", "m.gguf", out,
-                url=f"http://127.0.0.1:{port}/m.gguf",
-                progress=lambda done, total: seen.append(done))
+            # The stdlib http.server occasionally resets a localhost
+            # connection mid-stream on Windows (WinError 10054). That's a
+            # test-server flake, not a downloader bug — retry a couple of
+            # times (download_gguf resumes from the .part file).
+            r = None
+            for _attempt in range(3):
+                try:
+                    r = md.download_gguf(
+                        "repo", "m.gguf", out,
+                        url=f"http://127.0.0.1:{port}/m.gguf",
+                        progress=lambda done, total: seen.append(done))
+                    break
+                except md.DownloadError:
+                    _time.sleep(0.2)
             _check("download produced a valid GGUF",
-                   md.looks_like_gguf(r["path"]) and r["bytes"] > 0)
+                   r is not None and md.looks_like_gguf(r["path"])
+                   and r["bytes"] > 0)
             _check("progress callback fired", len(seen) >= 1)
             r2 = md.download_gguf("repo", "m.gguf", out,
                                   url=f"http://127.0.0.1:{port}/m.gguf")
@@ -2560,6 +2619,8 @@ def main() -> int:
     _run("Mongo BSON/JSON model-digestible convert", test_mongo_normalize_model_digestible)
     _run("Mongo streaming convert (bounded/OOM-safe)", test_mongo_stream_convert_bounded)
     _run("model_downloader (OS dir, stream, verify)", test_model_downloader)
+    _run("GPU-crash sentinel lifecycle (CPU auto-fallback)",
+         test_gpu_crash_sentinel_lifecycle)
     _run("VRAM-aware n_ctx log: no 'picked' kwarg collision",
          test_vram_aware_n_ctx_ladder_log_no_kwarg_collision)
     _run("dispatcher: no host probe when remote disabled",

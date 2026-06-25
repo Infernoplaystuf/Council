@@ -5198,6 +5198,14 @@ class CouncilConsole(tk.Tk):
         # next call (they're applied at model load, not per-inference).
         try:
             import council_engine as _ce
+            # The user explicitly chose a GPU-layer setting — clear any
+            # GPU-crash sentinel so a GPU retry is actually attempted
+            # (the auto-CPU fallback only kicks in after an UNconfirmed
+            # crash, not after a deliberate setting change).
+            try:
+                _ce.gpu_clear_attempt()
+            except Exception:
+                pass
             _ce.refresh_backend_config()
         except Exception as _e:
             print(f"[engine settings] backend refresh failed: {_e}")
@@ -12882,6 +12890,15 @@ class CouncilConsole(tk.Tk):
         try:
             if hasattr(self, "conv_logger") and self.conv_logger:
                 self.conv_logger.end_session("user_close")
+        except Exception:
+            pass
+        # Clean shutdown ⇒ the GPU load/inference didn't crash this run, so
+        # clear the GPU-crash sentinel. (A real CUDA core dump never reaches
+        # this handler, so its sentinel correctly survives to force CPU next
+        # launch.)
+        try:
+            import council_engine as _ce_close
+            _ce_close.gpu_clear_attempt()
         except Exception:
             pass
         # ── Auto-analyze on close ────────────────────────────────────

@@ -191,6 +191,64 @@ def _council_backend() -> str:
 
 _GGUF_MODEL_INSTANCE = None
 
+# ── GPU-crash sentinel ───────────────────────────────────────────────
+# A native CUDA abort inside llama-cpp (the "CUDA error → hex addresses →
+# core dumped" sequence) cannot be caught in Python — it kills the whole
+# process. We can't prevent it in-process, but we CAN stop it from
+# happening every launch: write a marker before a GPU load, clear it after
+# the first successful generation. If the marker is still present on the
+# NEXT load, the previous GPU attempt crashed (at load or first inference),
+# so we fall back to CPU automatically. The user re-enables GPU explicitly
+# (⚙ Engine settings) once the CUDA build/driver is fixed.
+_GPU_SENTINEL_NAME = ".gpu_attempt"
+_GPU_CONFIRMED_THIS_PROCESS = False
+
+
+def _gpu_sentinel_path() -> Path:
+    root = os.environ.get("COUNCIL_VAULT_ROOT") or str(
+        Path.home() / ".council" / "vault")
+    return Path(root) / _GPU_SENTINEL_NAME
+
+
+def gpu_attempt_pending() -> bool:
+    """True if a prior GPU load was started but never confirmed working."""
+    try:
+        return _gpu_sentinel_path().exists()
+    except Exception:
+        return False
+
+
+def _gpu_mark_attempt(n_layers: int) -> None:
+    try:
+        p = _gpu_sentinel_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"n_gpu_layers={n_layers}\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
+def gpu_clear_attempt() -> None:
+    """Remove the sentinel — called on first successful generation, on a
+    clean app shutdown, and when the user explicitly re-enables GPU."""
+    global _GPU_CONFIRMED_THIS_PROCESS
+    try:
+        _gpu_sentinel_path().unlink()
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+def _gpu_confirm_success() -> None:
+    """Called after a successful generation — the GPU path works, so clear
+    the sentinel. Guarded so we only touch the file once per process."""
+    global _GPU_CONFIRMED_THIS_PROCESS
+    if _GPU_CONFIRMED_THIS_PROCESS:
+        return
+    _GPU_CONFIRMED_THIS_PROCESS = True
+    gpu_clear_attempt()
+
+
 # Populated by _get_gguf_model after the n_ctx ladder runs. Surfaced to
 # the Tkinter UI via n_ctx_status() so the user always knows what
 # window they're working with.
@@ -961,6 +1019,22 @@ def _get_gguf_model():
                 "loading text-only.", clip_path_raw, clip_source,
             )
 
+    # ── GPU-crash sentinel: auto-fall-back to CPU after a CUDA core dump ──
+    # If the previous GPU load/inference died with a native CUDA abort, the
+    # sentinel is still on disk (it's only cleared on a confirmed-good run /
+    # clean shutdown). Run on CPU this time so the app starts instead of
+    # dumping again; the user re-enables GPU in ⚙ Engine once fixed.
+    if n_gpu_layers > 0:
+        if gpu_attempt_pending():
+            print("[GGUF] Previous GPU run did not complete (likely a CUDA "
+                  "core dump). Falling back to CPU (n_gpu_layers=0) so the app "
+                  "starts. Re-enable GPU in the ⚙ Engine settings once the "
+                  "CUDA build/driver is fixed.", flush=True)
+            _LOG.warning("[GGUF] GPU sentinel present — forcing CPU load.")
+            n_gpu_layers = 0
+        else:
+            _gpu_mark_attempt(n_gpu_layers)
+
     llama_kwargs = dict(
         model_path=str(p),
         n_ctx=n_ctx,
@@ -1190,6 +1264,7 @@ def _gguf_chat(
             temperature=float(temperature),
             max_tokens=int(num_predict),
         )
+    _gpu_confirm_success()   # a generation completed — GPU path is stable
     try:
         return str(result["choices"][0]["message"]["content"]).strip()
     except Exception:
@@ -1226,6 +1301,7 @@ def _gguf_chat_stream(
                 pieces.append(delta)
                 if token_callback:
                     token_callback(delta)
+    _gpu_confirm_success()   # a generation completed — GPU path is stable
     return "".join(pieces)
 
 
@@ -4458,8 +4534,10 @@ def refresh_backend_config() -> Dict[str, str]:
     new settings. Also clears the cached GGUF singleton so the next chat
     call reloads from disk if the GGUF path changed.
     """
-    global DEFAULT_MODELS, _GGUF_MODEL_INSTANCE
+    global DEFAULT_MODELS, _GGUF_MODEL_INSTANCE, _GPU_CONFIRMED_THIS_PROCESS
     _GGUF_MODEL_INSTANCE = None
+    # A different model is about to load — let it re-prove the GPU path.
+    _GPU_CONFIRMED_THIS_PROCESS = False
     DEFAULT_MODELS.clear()
     DEFAULT_MODELS.update(_populate_default_models())
     print(f"[council] backend refreshed: {_council_backend()}, "

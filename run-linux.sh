@@ -89,15 +89,18 @@ say "GPU layers: $COUNCIL_GGUF_GPU_LAYERS"
 python council_gui_engine.py
 EXIT=$?
 
-if [ "$EXIT" = "132" ] || [ "$EXIT" = "139" ]; then
-    # 132 = SIGILL (illegal instruction), 139 = SIGSEGV
-    warn "Process exited with code $EXIT (likely SIGILL from the GPU path)."
+case "$EXIT" in
+  132|133|134|135|136|139)
+    # Native crash from the GPU path: 132 SIGILL · 134 SIGABRT (CUDA
+    # assert/abort — "CUDA error … core dumped") · 139 SIGSEGV · etc.
+    warn "Process exited with code $EXIT (native crash from the GPU path)."
     if [ "${COUNCIL_GGUF_GPU_LAYERS}" != "0" ]; then
         warn "Retrying once with COUNCIL_GGUF_GPU_LAYERS=0 (CPU only)..."
         export COUNCIL_GGUF_GPU_LAYERS=0
         python council_gui_engine.py
         EXIT=$?
     fi
-fi
+    ;;
+esac
 
 exit "$EXIT"

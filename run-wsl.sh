@@ -107,25 +107,29 @@ if [ -n "${COUNCIL_GGUF_PATH:-}" ]; then
     say "model:      $COUNCIL_GGUF_PATH"
 fi
 
-# Run the app. On a SIGILL / illegal-instruction crash (the
-# common WSL failure mode for prebuilt CUDA wheels), retry once
-# with GPU offload disabled so the user at least sees the UI
-# and gets a clear diagnostic instead of a silent core dump.
+# Run the app. On a NATIVE crash from the GPU path (the common WSL failure
+# mode for prebuilt CUDA wheels) retry once with GPU offload disabled, so
+# the user gets the UI + a clear diagnostic instead of a silent core dump.
+# Signals that mean "the C extension aborted", any of which a bad CUDA
+# build/driver can raise:
+#   132 SIGILL · 133 SIGTRAP · 134 SIGABRT (CUDA assert/abort — the
+#   "CUDA error … core dumped" case) · 135 SIGBUS · 136 SIGFPE · 139 SIGSEGV
 python council_gui_engine.py
 EXIT=$?
 
-if [ "$EXIT" = "132" ] || [ "$EXIT" = "139" ]; then
-    # 132 = SIGILL, 139 = SIGSEGV
-    warn "Process exited with code $EXIT (likely SIGILL / 'illegal"
-    warn "instruction' from the GPU path)."
+case "$EXIT" in
+  132|133|134|135|136|139)
+    warn "Process exited with code $EXIT (native crash from the GPU path —"
+    warn "SIGILL/SIGABRT/SIGSEGV etc., typically a CUDA wheel/driver issue)."
     if [ "${COUNCIL_GGUF_GPU_LAYERS}" != "0" ]; then
         warn "Retrying once with COUNCIL_GGUF_GPU_LAYERS=0 (CPU only)..."
         warn "If this works, the issue is a CUDA wheel / driver mismatch."
-        warn "See installs.txt — 'Illegal instruction (core dumped)'."
+        warn "See installs.txt — 'Illegal instruction / CUDA core dumped'."
         export COUNCIL_GGUF_GPU_LAYERS=0
         python council_gui_engine.py
         EXIT=$?
     fi
-fi
+    ;;
+esac
 
 exit "$EXIT"
