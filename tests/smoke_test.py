@@ -2090,6 +2090,58 @@ def test_vram_aware_n_ctx_ladder_log_no_kwarg_collision() -> None:
         ce._available_gpu_bytes = prev
 
 
+def test_deferred_tasks_store() -> None:
+    """Deferred-task store: capture 'the model couldn't do this' tasks,
+    list pending, run/complete/dismiss/reopen, coerce unknown kinds, and
+    mirror tool requests into the developer-facing ToolGapLog.
+    """
+    import deferred_tasks as dt
+    prev = os.environ.get("COUNCIL_VAULT_ROOT")
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["COUNCIL_VAULT_ROOT"] = td
+        try:
+            s = dt.DeferredTaskStore()
+            _check("starts empty", s.pending() == [])
+            t1 = s.add(kind="bigger_summary",
+                       question="much bigger summary of sales.csv",
+                       files=["sales.csv"], folder="Q3")
+            t2 = s.add(kind="tool_request",
+                       question="add a histogram tool", note="histograms")
+            t3 = s.add(kind="bogus", question="x")
+            _check("ids are unique", len({t1.id, t2.id, t3.id}) == 3)
+            _check("unknown kind coerced to 'other'", t3.kind == "other")
+            _check("three pending", len(s.pending()) == 3)
+
+            _check("mark_done records result",
+                   s.mark_done(t1.id, result_path="out/s.csv",
+                               result_summary="done"))
+            _check("dismiss works", s.dismiss(t2.id))
+            statuses = {t.kind: t.status for t in s.all()}
+            _check("statuses updated",
+                   statuses["bigger_summary"] == "done"
+                   and statuses["tool_request"] == "dismissed"
+                   and statuses["other"] == "pending")
+            _check("one still pending", len(s.pending()) == 1)
+
+            # Tool request mirrored into ToolGapLog (existing analyzer input).
+            import agent_logs
+            gaps = agent_logs.ToolGapLog().all()
+            _check("tool request mirrored to ToolGapLog",
+                   any(g.get("requested_name") == "user_requested_tool"
+                       for g in gaps))
+
+            _check("reopen restores pending", s.reopen(t2.id)
+                   and len(s.pending()) == 2)
+            # Survives a fresh store instance (persisted).
+            _check("persists across instances",
+                   len(dt.DeferredTaskStore().all()) == 3)
+        finally:
+            if prev is None:
+                os.environ.pop("COUNCIL_VAULT_ROOT", None)
+            else:
+                os.environ["COUNCIL_VAULT_ROOT"] = prev
+
+
 def test_model_downloader() -> None:
     """model_downloader: OS-aware dir, HF URL build, GGUF magic check,
     non-HF URL refusal, and a real streaming download (local server) with
@@ -2656,6 +2708,7 @@ def main() -> int:
     _run("analyst read-budget guard (OOM safety)", test_analyst_read_budget_guard)
     _run("Mongo BSON/JSON model-digestible convert", test_mongo_normalize_model_digestible)
     _run("Mongo streaming convert (bounded/OOM-safe)", test_mongo_stream_convert_bounded)
+    _run("deferred-task store (capture/run/dismiss)", test_deferred_tasks_store)
     _run("model_downloader (OS dir, stream, verify)", test_model_downloader)
     _run("GPU-crash sentinel lifecycle (CPU auto-fallback)",
          test_gpu_crash_sentinel_lifecycle)

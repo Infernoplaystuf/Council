@@ -7620,6 +7620,8 @@ class CouncilConsole(tk.Tk):
                    command=self._council_lookup_button
                    ).pack(side="left", padx=6)
         ttk.Button(btns, text="Clear", command=lambda: self._set_text(self.input, "")).pack(side="left", padx=6)
+        ttk.Button(btns, text="⤓ Defer to Vault",
+                   command=self._defer_to_vault).pack(side="left", padx=6)
 
         # License / trial badge — clickable to open activation dialog.
         # In DEMO_MODE the whole element is hidden since there's no
@@ -10729,6 +10731,44 @@ class CouncilConsole(tk.Tk):
                   foreground="#cba6f7", wraplength=380, justify="left"
                   ).pack(anchor="w", padx=6, pady=(0, 4))
 
+        # ── Deferred tasks (things the council couldn't do in chat) ──
+        defer_lf = ttk.LabelFrame(left, text="📋 Deferred tasks")
+        defer_lf.pack(fill="both", expand=False, padx=4, pady=(0, 6))
+        ttk.Label(
+            defer_lf, foreground="#9a9a9a", justify="left", wraplength=400,
+            text="Tasks you sent here from the Council tab (⤓ Defer to Vault). "
+                 "Run a summary/stats task with the full deterministic tooling, "
+                 "or keep tool requests for the developer."
+        ).pack(anchor="w", padx=6, pady=(4, 2))
+
+        dcols = ("kind", "task")
+        self._defer_tree = ttk.Treeview(defer_lf, columns=dcols,
+                                        show="headings", height=5)
+        self._defer_tree.heading("kind", text="Type")
+        self._defer_tree.heading("task", text="Task")
+        self._defer_tree.column("kind", width=110, anchor="w")
+        self._defer_tree.column("task", width=300, anchor="w")
+        self._defer_tree.pack(fill="x", padx=6, pady=(0, 2))
+        self._defer_ids = {}      # tree-iid -> task id
+
+        drow = ttk.Frame(defer_lf)
+        drow.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Button(drow, text="▶ Run",
+                   command=self._vmgr_run_deferred).pack(side="left")
+        ttk.Button(drow, text="✓ Done",
+                   command=lambda: self._vmgr_set_deferred("done")
+                   ).pack(side="left", padx=4)
+        ttk.Button(drow, text="✗ Dismiss",
+                   command=lambda: self._vmgr_set_deferred("dismissed")
+                   ).pack(side="left", padx=4)
+        ttk.Button(drow, text="⟳ Refresh",
+                   command=self._vmgr_refresh_deferred).pack(side="left", padx=4)
+        self._defer_status = tk.StringVar(value="")
+        ttk.Label(defer_lf, textvariable=self._defer_status,
+                  foreground="#cba6f7", wraplength=400, justify="left"
+                  ).pack(anchor="w", padx=6, pady=(0, 4))
+        self._vmgr_refresh_deferred()
+
         # ── Scraper section ───────────────────────────────────
         scrape_lf = ttk.LabelFrame(left, text="🌐 Web Scraper")
         scrape_lf.pack(fill="x", padx=4, pady=(0, 6))
@@ -12083,6 +12123,119 @@ class CouncilConsole(tk.Tk):
             pass
         self._open_in_filemanager(d)
 
+    # ── Deferred tasks (sent from the Council tab) ──────────────
+    def _vmgr_refresh_deferred(self):
+        """Reload the pending deferred tasks into the Vault-tab table."""
+        tree = getattr(self, "_defer_tree", None)
+        if tree is None:
+            return
+        try:
+            import deferred_tasks as _dt
+            pend = _dt.DeferredTaskStore(VAULT_DIR).pending()
+        except Exception as exc:
+            self._defer_status.set(f"Could not load tasks: {exc!r}")
+            return
+        tree.delete(*tree.get_children())
+        self._defer_ids = {}
+        _labels = {
+            "bigger_summary": "Bigger summary",
+            "deeper_stats": "Deeper stats",
+            "tool_request": "Tool request",
+            "other": "Other",
+        }
+        for t in pend:
+            iid = tree.insert("", "end",
+                              values=(_labels.get(t.kind, t.kind), t.label()))
+            self._defer_ids[iid] = t.id
+        self._defer_status.set(
+            f"{len(pend)} pending task(s)." if pend
+            else "No pending tasks. Send some from the Council tab (⤓ Defer to Vault).")
+
+    def _vmgr_selected_deferred(self):
+        sel = self._defer_tree.selection()
+        if not sel:
+            self._defer_status.set("Select a task first.")
+            return None
+        return self._defer_ids.get(sel[0])
+
+    def _vmgr_set_deferred(self, status: str):
+        tid = self._vmgr_selected_deferred()
+        if not tid:
+            return
+        try:
+            import deferred_tasks as _dt
+            store = _dt.DeferredTaskStore(VAULT_DIR)
+            if status == "done":
+                store.mark_done(tid)
+            else:
+                store.dismiss(tid)
+        except Exception as exc:
+            self._defer_status.set(f"Update failed: {exc!r}")
+            return
+        self._vmgr_refresh_deferred()
+
+    def _vmgr_run_deferred(self):
+        """Run a runnable deferred task (bigger summary / deeper stats) with
+        the full deterministic tooling, write the result under
+        data_in/.deferred_results/, and mark it done. Tool-requests / other
+        kinds aren't auto-runnable."""
+        import threading as _th
+        tid = self._vmgr_selected_deferred()
+        if not tid:
+            return
+        try:
+            import deferred_tasks as _dt
+            store = _dt.DeferredTaskStore(VAULT_DIR)
+            task = store.get(tid)
+        except Exception as exc:
+            self._defer_status.set(f"Load failed: {exc!r}")
+            return
+        if task is None:
+            self._defer_status.set("Task not found (refresh).")
+            return
+        if task.kind not in _dt.RUNNABLE_KINDS:
+            self._defer_status.set(
+                "This is a tool request / note — it's logged for the developer, "
+                "not auto-runnable. Use ✓ Done when handled.")
+            return
+        self._defer_status.set("Running…")
+
+        def _worker():
+            try:
+                import vault_analyst as _va
+                in_dir = data_index.input_dir(VAULT_DIR)
+                target = in_dir
+                if task.folder:
+                    cand = in_dir / task.folder
+                    if cand.exists():
+                        target = cand
+                out_dir = in_dir / ".deferred_results"
+                out_dir.mkdir(parents=True, exist_ok=True)
+                if task.kind == _dt.KIND_BIGGER_SUMMARY:
+                    df = _va.folder_data_summary([target])
+                    op = out_dir / f"{task.id}_summary.csv"
+                    summary = f"{len(df)} file(s) profiled"
+                else:   # deeper_stats
+                    df = _va.folder_column_stats(VAULT_DIR, [target])
+                    op = out_dir / f"{task.id}_stats.csv"
+                    nfiles = int(df["file"].nunique()) if "file" in df else 0
+                    summary = f"stats for {nfiles} file(s)"
+                df.to_csv(op, index=False)
+                store.mark_done(task.id, result_path=str(op),
+                                result_summary=summary)
+                # Refresh FIRST (it resets the status line), THEN show the
+                # completion message so it isn't immediately overwritten.
+                self.after(0, lambda: (
+                    self._vmgr_refresh_deferred(),
+                    self._defer_status.set(
+                        f"Done — {summary} → {op.name} (in "
+                        "data_in/.deferred_results/).")))
+            except Exception as exc:
+                self.after(0, lambda: self._defer_status.set(
+                    f"Run failed: {exc!r}"))
+
+        _th.Thread(target=_worker, daemon=True).start()
+
     def _vmgr_convert_mongo(self, scan_all: bool = False):
         """Convert a Mongo .bson/.json/.jsonl file (or every such file in the
         vault) into model-digestible artefacts written under
@@ -13091,6 +13244,16 @@ class CouncilConsole(tk.Tk):
                     kind=kind, who=who, text=text,
                     meta={"session": getattr(self, "session_id", "")},
                 )
+        except Exception:
+            pass
+        # Track the last user question + last final Writer answer so the
+        # "Defer to Vault" action can capture the exact turn the model
+        # couldn't satisfy (e.g. "give me a much bigger summary").
+        try:
+            if who == "User":
+                self._last_user_text = text
+            elif who == "Writer" and kind == "final":
+                self._last_answer = text
         except Exception:
             pass
 
@@ -14175,6 +14338,110 @@ class CouncilConsole(tk.Tk):
                 self._append_transcript(
                     "Council", f"Couldn't switch ({res.get('reason')}); "
                     "continuing with the current model.", "observation")
+
+    def _defer_to_vault(self):
+        """Capture the current/last request as a DEFERRED TASK — something the
+        council couldn't do easily in-chat — so the Vault tab can run it with
+        the heavyweight deterministic tooling (or log a tool request). The
+        question is pre-filled from the input box or the last user turn."""
+        import tkinter as tk
+        from tkinter import ttk, messagebox
+        import deferred_tasks as _dt
+
+        prefill = ""
+        try:
+            prefill = self.input.get("1.0", "end").strip()
+        except Exception:
+            prefill = ""
+        if not prefill:
+            prefill = getattr(self, "_last_user_text", "") or ""
+
+        win = tk.Toplevel(self)
+        win.title("Defer to Vault")
+        win.transient(self)
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, foreground="#888", justify="left", wraplength=440,
+                  text="Save a task the council couldn't do easily in chat. "
+                       "The Vault tab can run summaries/stats with the full "
+                       "deterministic tooling, or hold tool requests for the "
+                       "developer.").grid(row=0, column=0, columnspan=2,
+                                          sticky="w", pady=(0, 10))
+
+        ttk.Label(frm, text="What do you want done?").grid(
+            row=1, column=0, sticky="nw", pady=3)
+        q_txt = tk.Text(frm, width=46, height=3, wrap="word")
+        q_txt.insert("1.0", prefill)
+        q_txt.grid(row=1, column=1, sticky="w")
+
+        ttk.Label(frm, text="Type:").grid(row=2, column=0, sticky="w", pady=3)
+        kind_var = tk.StringVar(value="Bigger summary")
+        kind_map = {
+            "Bigger summary": _dt.KIND_BIGGER_SUMMARY,
+            "Deeper stats": _dt.KIND_DEEPER_STATS,
+            "Tool request (for the developer)": _dt.KIND_TOOL_REQUEST,
+            "Other": _dt.KIND_OTHER,
+        }
+        ttk.Combobox(frm, textvariable=kind_var, width=32, state="readonly",
+                     values=list(kind_map.keys())).grid(
+            row=2, column=1, sticky="w")
+
+        ttk.Label(frm, text="Note (optional):").grid(
+            row=3, column=0, sticky="w", pady=3)
+        note_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=note_var, width=46).grid(
+            row=3, column=1, sticky="w")
+
+        ttk.Label(frm, text="Folder (optional, under data_in):").grid(
+            row=4, column=0, sticky="w", pady=3)
+        folder_var = tk.StringVar()
+        ttk.Entry(frm, textvariable=folder_var, width=46).grid(
+            row=4, column=1, sticky="w")
+
+        def _save():
+            q = q_txt.get("1.0", "end").strip()
+            if not q:
+                messagebox.showwarning("Nothing to defer",
+                                       "Describe what you want done first.")
+                return
+            try:
+                files = []
+                try:
+                    import vault_analyst as _va
+                    pairs = _va.resolve_filename_hints(
+                        q, [data_index.input_dir(VAULT_DIR)])
+                    files = [r.name for _tok, r in pairs if r is not None]
+                except Exception:
+                    files = []
+                _dt.DeferredTaskStore(VAULT_DIR).add(
+                    kind=kind_map.get(kind_var.get(), _dt.KIND_OTHER),
+                    question=q,
+                    answer_excerpt=getattr(self, "_last_answer", "") or "",
+                    files=files, folder=folder_var.get().strip(),
+                    note=note_var.get().strip())
+            except Exception as exc:
+                messagebox.showerror("Save failed", f"{exc!r}")
+                return
+            try:
+                self._append_transcript(
+                    "Writer", "Saved to the Vault tab's deferred tasks — open "
+                    "🗄 Vault → “Deferred tasks” to run it.", "observation")
+            except Exception:
+                pass
+            # Refresh the Vault panel if it's been built.
+            try:
+                self._vmgr_refresh_deferred()
+            except Exception:
+                pass
+            win.destroy()
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=5, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        ttk.Button(btns, text="Save", command=_save).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(
+            side="right", padx=6)
 
     def _send(self):
         # Licensing gate — skipped entirely in DEMO_MODE. In product
