@@ -8469,11 +8469,15 @@ class CouncilConsole(tk.Tk):
         self._mf_downloading = False
         self._mf_auto_activate = False   # set the model active without asking
 
-        # Populate the offline catalog immediately so the tab is useful
-        # before the user clicks anything, and assess upgrade headroom so
-        # the banner tells the user right away whether a stronger model fits.
-        self._mf_find(initial=True)
-        self._mf_check_upgrades(initial=True)
+        # Populate the offline catalog + assess upgrade headroom so the tab
+        # is useful before the user clicks anything. DEFER via self.after:
+        # these spawn worker threads that call self.after(), and doing that
+        # NOW (during tab construction, before mainloop starts) raises
+        # "RuntimeError: main thread is not in main loop" — the worker fires
+        # before the Tk loop exists. Scheduling from the main thread runs
+        # them on the first loop iteration, by which point after() is safe.
+        self.after(900, lambda: self._mf_find(initial=True))
+        self.after(1100, lambda: self._mf_check_upgrades(initial=True))
 
     def _mf_current_model_name(self) -> str:
         """Best-effort name of the currently loaded GGUF (for size compare)."""
