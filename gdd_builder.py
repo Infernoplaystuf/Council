@@ -61,6 +61,11 @@ class BuildResult:
     repair_passes: int = 0
     notes:         List[str] = field(default_factory=list)
     error:         str = ""
+    # Path to the generated sim-harness SimContract JSON, when a sim
+    # was generated. The GUI passes this straight to
+    # godot_sim_project.load_contract so a freshly-built game is
+    # immediately sweepable in the 🎲 Simulations tab.
+    sim_contract_path: Optional[Path] = None
 
     @property
     def ok(self) -> bool:
@@ -306,6 +311,10 @@ class BuildOptions:
     coder_max_attempts: int = 3
     dry_run:          bool = False
     on_event:         Optional[Callable[[str, str], None]] = None
+    # When True (default), also generate a headless sim harness
+    # (scripts/sim/Sim.gd) + a SimContract so the built game can be
+    # swept in the Simulations tab. Pure GDScript/JSON — no AI art.
+    generate_sim:     bool = True
 
 
 def build_from_plan(
@@ -404,6 +413,23 @@ def build_from_plan(
         except Exception as exc:
             result.notes.append(
                 f"placeholder write failed for {script.file}: {exc!r}")
+
+    # ── Step 4.5: generate a headless sim harness + contract ──
+    # One whole-project artifact (NOT per-entity), so it sits outside
+    # the per-script Coder loop. Written even in dry-run so a
+    # placeholder-only build is still sweepable. Failure here is a
+    # note, never fatal — the game still built.
+    if options.generate_sim:
+        try:
+            import sim_harness_gen as _shg
+            sim_gd, contract_path = _shg.generate_for_project(plan, project_path)
+            result.files_written.append(sim_gd)
+            result.files_written.append(contract_path)
+            result.sim_contract_path = contract_path
+            _emit("sim", f"  sim harness: {sim_gd.relative_to(project_path)} "
+                          f"(+ {contract_path.name})")
+        except Exception as exc:
+            result.notes.append(f"sim-harness generation skipped: {exc!r}")
 
     if options.dry_run or options.model is None:
         # Skip the LLM + validation pass entirely.

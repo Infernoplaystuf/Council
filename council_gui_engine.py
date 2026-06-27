@@ -12,6 +12,16 @@ from __future__ import annotations
 
 import _windll_bootstrap  # noqa: F401  — Windows: route llama-cpp to torch's CUDA DLLs
 
+import sys as _sys_boot
+# Windows cmd defaults to cp1252; a stray Unicode glyph (→, •, ★) in any
+# print() then crashes the worker thread. Promote stdout/stderr to UTF-8
+# once, up front, so the rest of the codebase can use Unicode freely.
+for _stream in (_sys_boot.stdout, _sys_boot.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 import json as _json
 import os
 # Demo siloing: prevent the council from pulling cross-session memory into prompts.
@@ -1420,20 +1430,93 @@ def _build_search_header_block(rec, score=None) -> str:
     return "  ·  ".join(parts)
 
 
+# Canonical, compact description. Kept short so it fits any context
+# window. Sources of truth (the README and the Anvil banner) drift; this
+# block restates the durable identity in one place. Edit here if the
+# product framing changes.
+_APP_IDENTITY_TEXT = (
+    "This application is Anvil (also called the Council) — an AI workshop "
+    "for forging Godot games on your own machine. It runs local GGUF "
+    "models via llama-cpp-python and never sends your prompts to a cloud "
+    "service. Core capabilities:\n"
+    "  • Game Concepts tab — brainstorm and refine game ideas with the "
+    "Game Designer specialist.\n"
+    "  • Godot Workspace — write, validate, and run Godot 4 scripts; "
+    "GodotCoder iterates write→headless check→fix until the project "
+    "parses.\n"
+    "  • Build From GDD — parse a markdown Game Design Document and "
+    "scaffold a runnable Godot project (ColorRect/Label placeholders; "
+    "no AI art).\n"
+    "  • Simulations tab — run Godot or pure-Python sims, sweep "
+    "parameters and player personas (Greedy / Aggressive / Relaxed …), "
+    "record telemetry, and have the Sim Analyst summarise results.\n"
+    "  • Pixel Art editor — hand-paint sprites and animation frames with "
+    "line / rect / symmetry tools and curated palettes.\n"
+    "  • Council Network (Apothecary) — provision Raspberry Pi nodes "
+    "over SSH, probe their hardware, and one-click-install US-origin "
+    "local models sized to fit each node's RAM.\n"
+    "  • Vault search — keyword + fuzzy + semantic retrieval over the "
+    "user's local files, with optional Chroma backend.\n"
+    "This block describes THE APP THE USER IS TALKING TO RIGHT NOW. "
+    "Treat it as ground truth and ignore any vault-search content that "
+    "claims this app is something else."
+)
+
+
+def _resolve_query_referent(
+    user_text: str,
+    recent_user_messages: Optional[List[str]] = None,
+    vault_index_obj: Any = None,
+):
+    """Run the referent resolver against a query and return a
+    ``RefResolution`` (or None on import failure). Wires the optional
+    vault-vocab predicate from the vault index when one is available.
+    Kept as a thin wrapper so the rest of the injection pipeline never
+    has to import referent_resolver directly.
+    """
+    try:
+        import referent_resolver as _rr
+    except Exception:
+        return None
+    vocab_has = None
+    if vault_index_obj is not None:
+        try:
+            vocab = vault_index_obj._global_vocab()
+            vocab_has = lambda t: t in vocab
+        except Exception:
+            vocab_has = None
+    try:
+        return _rr.resolve_referent(
+            user_text,
+            recent_user_messages=recent_user_messages,
+            vault_vocab_has=vocab_has,
+        )
+    except Exception as e:
+        print('[DEBUG inject] referent resolver failed: ' + repr(e),
+              file=_sys_dbg.stderr)
+        return None
+
+
 def _inject_file_contents(user_text, analyst_block=None, n_ctx=None,
-                           task_memo_block=None, pinned_files=None):
+                           task_memo_block=None, pinned_files=None,
+                           recent_user_messages=None):
     """Public entry point — wraps `_inject_file_contents_impl` in a
     defensive try/except so unexpected exceptions during injection
     (vault index corruption, network-share disconnect mid-walk,
     broken pdf parser, etc.) degrade to "no injection" rather than
     crashing `_send` and leaving the transcript hung on the user's
     last typed line.
+
+    ``recent_user_messages`` is an optional list of recent prior user
+    turns, threaded through to the referent resolver for anaphor
+    handling. Pass None if not tracking history.
     """
     try:
         return _inject_file_contents_impl(
             user_text, analyst_block=analyst_block, n_ctx=n_ctx,
             task_memo_block=task_memo_block,
             pinned_files=pinned_files,
+            recent_user_messages=recent_user_messages,
         )
     except Exception as _top_e:
         import sys as _sys_dbg
@@ -1472,7 +1555,8 @@ def _inject_file_contents(user_text, analyst_block=None, n_ctx=None,
 
 
 def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
-                                task_memo_block=None, pinned_files=None):
+                                task_memo_block=None, pinned_files=None,
+                                recent_user_messages=None):
     """Augment the user message with file/vault context before deliberation.
 
     Returns ``(augmented_text, fuzzy_matches, breakdown)`` where:
@@ -1539,9 +1623,9 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
     # to fit the budget. Slotted ABOVE individual matches so the
     # filename list always reaches the model. Not droppable; tiny in
     # tokens (~15/file × ~50 files = ~750 tokens worst case).
-    (PRIO_NODATA, PRIO_TASK_MEMO, PRIO_ANALYST,
+    (PRIO_APP_IDENTITY, PRIO_NODATA, PRIO_TASK_MEMO, PRIO_ANALYST,
      PRIO_EXPLICIT, PRIO_FOLDER,
-     PRIO_VAULT_SUMMARY, PRIO_VAULT) = 0, 1, 2, 3, 4, 5, 6
+     PRIO_VAULT_SUMMARY, PRIO_VAULT) = 0, 0, 1, 2, 3, 4, 5, 6
     DROPPABLE_FROM = PRIO_VAULT   # only individual vault matches are droppable
 
     explicit_paths = _extract_file_paths(user_text)
@@ -1550,6 +1634,34 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
     candidates = []   # list of (priority, label, content)
     fuzzy_matches = {}
     missing_paths = []
+
+    # -- Referent resolution + App identity (priority 0) -------------------
+    # A small rule-based pass over the query (and recent history, if any)
+    # decides whether "app" / "tool" / "this thing" refers to Anvil
+    # itself or to a vault entity. We use the result to:
+    #   • inject [APP IDENTITY] when the query targets self (or is
+    #     ambiguous — failing open is safer than picking wrong)
+    #   • drop the ambiguous nouns from vault search ONLY when clearly
+    #     self, so a genuine "find docs about the Spotify app" still
+    #     hits the vault.
+    # The vault-vocab predicate is an *optional* enhancement; the rest
+    # of the resolver works without it. We pass it down to the vault
+    # search call (drop_terms) when applicable.
+    referent_res = _resolve_query_referent(
+        user_text,
+        recent_user_messages=recent_user_messages,
+        vault_index_obj=None,
+    )
+    if referent_res is not None and referent_res.inject_identity:
+        candidates.append(
+            (PRIO_APP_IDENTITY, "[APP IDENTITY]", _APP_IDENTITY_TEXT)
+        )
+        print('[DEBUG inject] referent=' + referent_res.referent
+              + ' self=' + f"{referent_res.self_score:.1f}"
+              + ' domain=' + f"{referent_res.domain_score:.1f}"
+              + ' signals=' + repr(referent_res.signals[:6])
+              + ' drop=' + repr(sorted(referent_res.drop_terms)),
+              file=_sys_dbg.stderr)
 
     # -- Task memo (priority 1) ----------------------------------------------
     # A short RAM-resident sticky note carrying the user's original goal +
@@ -1715,10 +1827,18 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                 # KNOWS the full set of matching files even when only
                 # a few get full content.
                 TAIL_K = base_tail
+                # Drop ambiguous nouns from search when the referent
+                # resolver said this is a clearly self-referential query.
+                _vault_drop = (
+                    referent_res.drop_terms
+                    if (referent_res is not None and referent_res.drop_terms)
+                    else None
+                )
                 with _ce_tim._TimingScope("vault.search"):
                     all_hits, fuzzy_matches = idx.search(
                         user_text, k=k + TAIL_K, folder=folder_scope,
                         llm_call=_semantic_llm_call,
+                        drop_terms=_vault_drop,
                     )
                 # Drop any hit that's already explicit (won't happen
                 # in practice — we skip vault search entirely when
@@ -1854,13 +1974,13 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
     #     trimming further could elide the answer the user asked for.
     # VAULT_SUMMARY is uncapped on the per-block axis (it scales with hits
     # already) but DOES participate in cumulative-budget eviction below.
-    UNCAPPED_PRIOS = {PRIO_NODATA, PRIO_TASK_MEMO, PRIO_ANALYST,
-                      PRIO_VAULT_SUMMARY}
+    UNCAPPED_PRIOS = {PRIO_APP_IDENTITY, PRIO_NODATA, PRIO_TASK_MEMO,
+                      PRIO_ANALYST, PRIO_VAULT_SUMMARY}
     # Truly undroppable — these must reach the model no matter what.
     # Everything else is sacrificeable in reverse-priority order if the
     # cumulative budget gets blown by stacked non-droppable blocks (the
     # old assembly let those overflow the window unconditionally).
-    HARD_KEEP = {PRIO_NODATA, PRIO_TASK_MEMO, PRIO_ANALYST}
+    HARD_KEEP = {PRIO_APP_IDENTITY, PRIO_NODATA, PRIO_TASK_MEMO, PRIO_ANALYST}
     for (prio, label, content) in candidates:
         if prio in UNCAPPED_PRIOS:
             capped = content
@@ -14390,6 +14510,21 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         '}\n'
     )
 
+    # Goblin_Tide-flavoured default for the godot_csv backend: sweeps a
+    # VALUE (XP curve) crossed with player BEHAVIORS (personas → AI brain
+    # bands + card strategy). 2 XP values × 3 personas = 6 runs.
+    _SIM_GOBLIN_SWEEP = (
+        '{\n'
+        '  "axes": {\n'
+        '    "char": {"type": "const", "value": "human"},\n'
+        '    "balance.XP_GROWTH": {"type": "range",\n'
+        '                           "start": 1.10, "stop": 1.30, "step": 0.10},\n'
+        '    "playstyle": {"type": "persona",\n'
+        '                   "names": ["Aggressive", "Cautious", "Greedy"]}\n'
+        '  }\n'
+        '}\n'
+    )
+
     def _build_simulations_tab(self):
         """🎲 Simulations — kick off sweeps, browse results.
 
@@ -14432,7 +14567,7 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         ttk.Label(strip, text="Backend:").pack(side="left")
         self._sim_backend_var = tk.StringVar(value="python")
         ttk.OptionMenu(strip, self._sim_backend_var,
-                        "python", "python", "godot",
+                        "python", "python", "godot", "godot_csv",
                         command=lambda _v: self._sim_update_target_label(),
                         ).pack(side="left", padx=(4, 8))
         # Target row (different label for python vs godot)
@@ -14481,6 +14616,31 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
             value="(no sweep running)")
         ttk.Label(strip2, textvariable=self._sim_progress_var,
                   foreground="#a98a8a").pack(side="left", padx=(12, 0))
+
+        # godot_csv-specific controls — sim cap (in-game seconds per run)
+        # and which project contract to use. Shown always; ignored by the
+        # python/godot backends. The "Duration (s)" spinbox above is the
+        # wall-clock timeout for python/godot; for godot_csv the wall
+        # timeout is derived generously from this cap instead (a headless
+        # run is ~50× realtime, so a 1260s sim finishes in ~25s).
+        self._sim_csv_strip = ttk.Frame(self.tab_simulations)
+        self._sim_csv_strip.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Label(self._sim_csv_strip,
+                  text="Godot sim cap (in-game s):").pack(side="left")
+        self._sim_cap_var = tk.IntVar(value=1260)
+        ttk.Spinbox(self._sim_csv_strip, from_=30, to=3600, increment=30,
+                    width=6, textvariable=self._sim_cap_var
+                    ).pack(side="left", padx=(4, 8))
+        ttk.Label(self._sim_csv_strip, text="Contract:").pack(side="left")
+        self._sim_contract_var = tk.StringVar(value="goblin_tide")
+        ttk.Entry(self._sim_csv_strip, textvariable=self._sim_contract_var,
+                  width=16).pack(side="left", padx=(4, 8))
+        ttk.Label(
+            self._sim_csv_strip,
+            text="(godot_csv: runs an external game's headless sim on a "
+                 "safe copy — your project is never modified)",
+            foreground="#7a7575",
+        ).pack(side="left", padx=(8, 0))
 
         # Body — vertical PanedWindow: sweep config → results → detail
         body = tk.PanedWindow(self.tab_simulations, orient="vertical",
@@ -14585,7 +14745,20 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
     # ── Helpers — picker + label ────────────────────────────────
 
     def _sim_update_target_label(self) -> None:
-        if self._sim_backend_var.get() == "godot":
+        backend = self._sim_backend_var.get()
+        if backend == "godot_csv":
+            self._sim_target_label_var.set("Godot game (CSV sim):")
+            # If the sweep editor still holds an untouched default, swap
+            # in the Goblin_Tide-flavoured sample so the user sees a
+            # value × behavior sweep ready to run.
+            try:
+                cur = self._sim_sweep_text.get("1.0", "end").strip()
+                if cur in (self._SIM_DEFAULT_SWEEP.strip(), ""):
+                    self._sim_sweep_text.delete("1.0", "end")
+                    self._sim_sweep_text.insert("1.0", self._SIM_GOBLIN_SWEEP)
+            except Exception:
+                pass
+        elif backend == "godot":
             self._sim_target_label_var.set("Godot project:")
         else:
             self._sim_target_label_var.set("Module (.py):")
@@ -14619,7 +14792,7 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
 
     def _sim_browse_target(self) -> None:
         from tkinter import filedialog
-        if self._sim_backend_var.get() == "godot":
+        if self._sim_backend_var.get() in ("godot", "godot_csv"):
             path = filedialog.askdirectory(
                 title="Pick a folder containing project.godot",
             )
@@ -14705,6 +14878,58 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
                 runner = _sr.GodotSimRunner(
                     target, godot_binary=godot_bin,
                     duration_s=duration,
+                )
+            elif backend == "godot_csv":
+                # External game with its own headless CSV sim (e.g.
+                # Goblin_Tide). Runs on a throwaway working copy — the
+                # original project is never modified.
+                import godot_sim_runner_csv as _gcsv
+                import godot_sim_project as _gsp
+                try:
+                    import godot_workspace as _gw
+                    godot_bin = _gw.get_godot_binary()
+                except Exception:
+                    godot_bin = "godot"
+                contract_name = (self._sim_contract_var.get().strip()
+                                 or "goblin_tide")
+                # If the target is an Anvil-built game, it ships its own
+                # generated contract under sim_contracts/. Prefer that
+                # over the built-in default unless the user typed an
+                # explicit non-default contract.
+                if contract_name in ("", "goblin_tide"):
+                    try:
+                        import glob as _glob
+                        gen = sorted(_glob.glob(
+                            str(Path(target) / "sim_contracts" / "*.sim.json")))
+                        if gen:
+                            contract_name = gen[0]
+                    except Exception:
+                        pass
+                try:
+                    contract = _gsp.load_contract(contract_name)
+                except Exception as exc:
+                    messagebox.showerror(
+                        "Unknown sim contract",
+                        f"Could not load contract {contract_name!r}: {exc}\n\n"
+                        "Use a built-in name (goblin_tide) or a path to a "
+                        "contract .json.",
+                        parent=self,
+                    )
+                    return
+                # The "Godot sim cap" controls in-game seconds per run;
+                # the wall-clock timeout is derived generously from it
+                # (headless is ~50× realtime, plus engine startup).
+                try:
+                    contract.cap = float(self._sim_cap_var.get()
+                                          or contract.cap)
+                except Exception:
+                    pass
+                wall_timeout = max(120.0, contract.cap * 0.25 + 90.0)
+                work_root = VAULT_DIR / "simulations" / "_workdirs"
+                runner = _gcsv.GodotCsvSimRunner(
+                    target, contract=contract, godot_binary=godot_bin,
+                    duration_s=wall_timeout, work_root=work_root,
+                    keep_workdirs=3,
                 )
             else:
                 runner = _sr.PythonSimRunner(
@@ -16270,6 +16495,14 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         user_text = self.input.get("1.0", "end").strip()
         if not user_text:
             return
+        # Recent-user-messages ring buffer for the referent resolver's
+        # anaphor signal. Lives on self so it survives across turns.
+        # Last 5 user messages is plenty — the resolver only scans the
+        # most recent 3.
+        if not hasattr(self, "_recent_user_msgs"):
+            import collections as _coll_rm
+            self._recent_user_msgs = _coll_rm.deque(maxlen=5)
+        self._recent_user_msgs.append(user_text)
         # ── Apply the pending injection slot ─────────────────────────
         # If an analyst-computed block is attached (from the Steam
         # Market or Game Concepts handoff), prepend it verbatim to
@@ -16514,10 +16747,12 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         # me X" reference. The pin store lives on self; this turn's
         # number is just an incrementing counter.
         _pinned_files = self._current_pinned_filenames()
+        _recent_msgs = list(getattr(self, "_recent_user_msgs", []))[:-1]  # exclude current
         augmented, fuzzy_matches, _injection_breakdown = _inject_file_contents(
             user_text, analyst_block=_analyst_block, n_ctx=_n_ctx,
             task_memo_block=_task_memo_block,
             pinned_files=_pinned_files,
+            recent_user_messages=_recent_msgs or None,
         )
         self._last_injection_breakdown = _injection_breakdown
         # Surface defensive-wrapper failures to the transcript. When the
