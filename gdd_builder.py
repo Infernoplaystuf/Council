@@ -66,6 +66,10 @@ class BuildResult:
     # godot_sim_project.load_contract so a freshly-built game is
     # immediately sweepable in the 🎲 Simulations tab.
     sim_contract_path: Optional[Path] = None
+    # The dev ledger (plan.ledger), with statuses updated to reflect
+    # the actual build outcome (real / failed / placeholder). The
+    # Godot Workspace plan pane renders it as a per-file worklist.
+    ledger:        List[Any] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -331,7 +335,15 @@ def build_from_plan(
     """
     options = options or BuildOptions()
     result = BuildResult()
+    result.ledger = list(getattr(plan, "ledger", []) or [])
     _emit = options.on_event or (lambda phase, msg: None)
+
+    def _ledger_set(path_suffix: str, **changes) -> None:
+        for entry in result.ledger:
+            if str(getattr(entry, "path", "")).endswith(path_suffix):
+                for k, v in changes.items():
+                    setattr(entry, k, v)
+                return
 
     # ── Step 1: skeleton via demo_builder ──
     try:
@@ -426,6 +438,7 @@ def build_from_plan(
             result.files_written.append(sim_gd)
             result.files_written.append(contract_path)
             result.sim_contract_path = contract_path
+            _ledger_set("scripts/sim/Sim.gd", status="real")
             _emit("sim", f"  sim harness: {sim_gd.relative_to(project_path)} "
                           f"(+ {contract_path.name})")
         except Exception as exc:
@@ -461,8 +474,10 @@ def build_from_plan(
         state = coder.run(task, target, goal=script.purpose[:160])
         if state.passed:
             result.scripts_passed.append(target)
+            _ledger_set(script.file, status="real", tools_suggested=[])
         else:
             result.scripts_failed.append(target)
+            _ledger_set(script.file, status="failed")
             result.notes.append(
                 f"coder failed on {script.file}: "
                 f"{(state.stderr or 'no stderr')[:200]}"
@@ -496,6 +511,7 @@ def build_from_plan(
                               goal=script_plan.purpose[:160])
             if state.passed:
                 result.scripts_passed.append(target)
+                _ledger_set(script_plan.file, status="real", tools_suggested=[])
             else:
                 new_failed.append(target)
                 result.notes.append(

@@ -108,6 +108,25 @@ class AutoloadPlan:
 
 
 @dataclass
+class LedgerEntry:
+    """One row of the dev ledger — a per-artifact 'what still needs
+    doing' record. Lets the user (and Anvil) see which files still
+    need a tool applied and which assets need creating, with their
+    temporary placeholder standing in until real work lands.
+    """
+    path:            str                        # file path or scene node path
+    kind:            str                        # script|scene|autoload|asset|sim
+    purpose:         str = ""
+    status:          str = "planned"            # planned|placeholder|real|failed
+    tools_suggested: List[str] = field(default_factory=list)
+    placeholder:     Optional[str] = None       # what temporarily stands in
+    # For assets only: where the real (hand-painted) asset will go. Stays
+    # None until the user paints it in the Pixel Art tab — Anvil NEVER
+    # auto-generates art.
+    replace_with:    Optional[str] = None
+
+
+@dataclass
 class Plan:
     """Output of ``plan_from_gdd``. Input to ``gdd_builder``."""
     title:          str = ""
@@ -118,6 +137,7 @@ class Plan:
     autoloads:      List[AutoloadPlan] = field(default_factory=list)
     entity_registry: Dict[str, Entity] = field(default_factory=dict)
     signal_contracts: List[SignalContract] = field(default_factory=list)
+    ledger:         List[LedgerEntry] = field(default_factory=list)
     notes:          List[str] = field(default_factory=list)
 
     def file_summary(self) -> List[Tuple[str, str]]:
@@ -563,4 +583,59 @@ def plan_from_gdd(gdd: GDD) -> Plan:
             "No lose condition in GDD — main.gd will default to "
             "'HP zero'."
         )
+    _build_ledger(plan)
     return plan
+
+
+def _build_ledger(plan: Plan) -> None:
+    """Populate ``plan.ledger`` from the rest of the plan — a per-file
+    worklist of what still needs a tool applied + which assets need
+    creating (with their ColorRect/Label placeholder).
+    """
+    ledger: List[LedgerEntry] = []
+    # Scripts: placeholders until GodotCoder fleshes them out.
+    for sp in plan.scripts:
+        ledger.append(LedgerEntry(
+            path=sp.file, kind="script",
+            purpose=(sp.purpose or "")[:120],
+            status="placeholder",
+            tools_suggested=["GodotCoder"],
+            placeholder="parseable stub (_ready only)",
+        ))
+    # Autoloads: minimal stubs.
+    for al in plan.autoloads:
+        ledger.append(LedgerEntry(
+            path=al.file, kind="autoload",
+            purpose=(al.purpose or "")[:120],
+            status="placeholder",
+            tools_suggested=["GodotCoder"],
+            placeholder="state vars + signal decls",
+        ))
+    # Scenes: fully rendered by the builder, no further tool needed.
+    for scn in plan.scenes:
+        ledger.append(LedgerEntry(
+            path=scn.file, kind="scene",
+            purpose=(scn.purpose or "scene tree")[:120],
+            status="real",
+        ))
+    # Assets: every entity's visual is a ColorRect+Label placeholder the
+    # user later hand-paints in the Pixel Art tab. replace_with stays
+    # None — Anvil never generates art.
+    for slug, ent in plan.entity_registry.items():
+        name = (getattr(ent, "name", "") or slug).split()[0] if getattr(ent, "name", "") else slug
+        ledger.append(LedgerEntry(
+            path=f"Main/{name}/Visual", kind="asset",
+            purpose=f"{getattr(ent, 'role', 'entity')} sprite for {name}",
+            status="placeholder",
+            tools_suggested=["Pixel Art"],
+            placeholder="ColorRect + Label",
+            replace_with=None,
+        ))
+    # The generated sim harness.
+    ledger.append(LedgerEntry(
+        path="scripts/sim/Sim.gd", kind="sim",
+        purpose="headless balance-sim harness",
+        status="planned",
+        tools_suggested=["SimHarness"],
+    ))
+    plan.ledger = ledger

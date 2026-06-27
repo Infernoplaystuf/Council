@@ -13037,6 +13037,39 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         d.insert("end", "\nAutoloads\n", ("h2",))
         for a in plan.autoloads:
             d.insert("end", f"  {a.name:16s}  {a.purpose[:80]}\n")
+
+        # Dev ledger — per-file worklist: which files still need a tool
+        # applied, which assets need hand-painting (+ their placeholder).
+        ledger = getattr(plan, "ledger", None)
+        if ledger:
+            d.insert("end", "\nDev Ledger — what still needs work\n", ("h2",))
+            _kind_labels = {
+                "script":   "Scripts (apply GodotCoder)",
+                "autoload": "Autoloads (apply GodotCoder)",
+                "asset":    "Assets to hand-paint (🎨 Pixel Art — no AI art)",
+                "sim":      "Simulation harness",
+                "scene":    "Scenes (generated)",
+            }
+            by_kind = {}
+            for e in ledger:
+                by_kind.setdefault(getattr(e, "kind", "other"), []).append(e)
+            for kind in ("script", "autoload", "asset", "sim", "scene"):
+                items = by_kind.get(kind)
+                if not items:
+                    continue
+                d.insert("end", f"  {_kind_labels.get(kind, kind)}:\n",
+                         ("muted",))
+                for e in items:
+                    status = getattr(e, "status", "planned")
+                    tag = "muted" if status == "real" else "warn"
+                    extra = ""
+                    if getattr(e, "placeholder", None):
+                        extra = f"   ⟵ {e.placeholder}"
+                    if kind == "asset":
+                        extra += "  → paint a sprite"
+                    d.insert("end",
+                             f"    {str(e.path):30s} [{status}]{extra}\n",
+                             (tag,))
         d.configure(state="disabled")
 
     def _gw_gdd_build(self) -> None:
@@ -13110,22 +13143,12 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
                     if result.notes:
                         for n in result.notes:
                             _emit_to_view("note", n)
-                    # Offer to open the new project in Workspace
-                    from tkinter import messagebox
-                    if messagebox.askyesno(
-                        "Build complete",
-                        f"Project written to:\n{result.project_path}\n\n"
-                        f"Open it in the Godot Workspace tab?",
-                        parent=self._gw_gdd_dialog,
-                    ):
-                        try:
-                            self._gw_open_project(result.project_path)
-                            self._gw_save_settings_kv(
-                                godot_project=str(result.project_path))
-                            if hasattr(self, "tab_godot_workspace"):
-                                self.nb.select(self.tab_godot_workspace)
-                        except Exception as exc:
-                            print(f"[GDD build] auto-open failed: {exc!r}")
+                    if result.sim_contract_path:
+                        _emit_to_view(
+                            "sim", "🎲 sim harness generated — this game is "
+                                   "ready to simulate.")
+                    # Offer to open in Workspace AND/OR simulate it now.
+                    self._gdd_build_done_dialog(result)
                 else:
                     _emit_to_view(
                         "fail",
@@ -13138,6 +13161,63 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
 
         threading.Thread(target=_worker, daemon=True,
                           name="anvil-gdd-build").start()
+
+    def _gdd_build_done_dialog(self, result) -> None:
+        """Build-complete chooser: open the project in Workspace, or
+        jump straight to simulating it (when a sim harness was
+        generated). Runs on the main thread (called from _done)."""
+        import tkinter as _tk
+        from tkinter import ttk as _ttk
+        parent = getattr(self, "_gw_gdd_dialog", None) or self
+        win = _tk.Toplevel(parent)
+        win.title("Build complete")
+        win.configure(padx=16, pady=14)
+        try:
+            win.transient(parent)
+        except Exception:
+            pass
+        _ttk.Label(win, text="✓ Game built",
+                   font=("Segoe UI", 12, "bold")).pack(anchor="w")
+        _ttk.Label(win, text=f"Project: {result.project_path}",
+                   wraplength=440, foreground="#a98a8a"
+                   ).pack(anchor="w", pady=(2, 10))
+        has_sim = result.sim_contract_path is not None
+        msg = ("Anvil also generated a headless sim harness — you can "
+               "simulate this game right now to test values and player "
+               "behaviors." if has_sim else
+               "Open the project to keep building it.")
+        _ttk.Label(win, text=msg, wraplength=440).pack(anchor="w", pady=(0, 12))
+
+        btns = _ttk.Frame(win)
+        btns.pack(fill="x")
+
+        def _open():
+            win.destroy()
+            try:
+                self._gw_open_project(result.project_path)
+                self._gw_save_settings_kv(
+                    godot_project=str(result.project_path))
+                if hasattr(self, "tab_godot_workspace"):
+                    self.nb.select(self.tab_godot_workspace)
+            except Exception as exc:
+                print(f"[GDD build] auto-open failed: {exc!r}")
+
+        def _sim():
+            win.destroy()
+            self._sim_prefill_for_project(
+                result.project_path, result.sim_contract_path)
+
+        if has_sim:
+            _ttk.Button(btns, text="🎲 Simulate this game",
+                        command=_sim).pack(side="left", padx=(0, 6))
+        _ttk.Button(btns, text="Open in Workspace",
+                    command=_open).pack(side="left", padx=(0, 6))
+        _ttk.Button(btns, text="Close",
+                    command=win.destroy).pack(side="left")
+        try:
+            win.grab_set()
+        except Exception:
+            pass
 
     def _gw_send_errors_to_council(self) -> None:
         """Bundle the current stderr buffer into a Council question.
@@ -14525,6 +14605,20 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         '}\n'
     )
 
+    # Default for an Anvil-GENERATED game's sim: its sweepable knobs are
+    # harness consts (MOVE_SPEED + AI bands), so sweep movement speed
+    # crossed with persona behavior. 3 speeds × 2 personas = 6 runs.
+    _SIM_GENERATED_SWEEP = (
+        '{\n'
+        '  "axes": {\n'
+        '    "brain.MOVE_SPEED": {"type": "range",\n'
+        '                          "start": 120, "stop": 400, "step": 120},\n'
+        '    "playstyle": {"type": "persona",\n'
+        '                   "names": ["Aggressive", "Cautious"]}\n'
+        '  }\n'
+        '}\n'
+    )
+
     def _build_simulations_tab(self):
         """🎲 Simulations — kick off sweeps, browse results.
 
@@ -14789,6 +14883,37 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
             pass
         # Fallback — just append the snippet at the end.
         self._sim_sweep_text.insert("end", snippet)
+
+    def _sim_prefill_for_project(self, project_path, contract_path=None) -> None:
+        """Point the Simulations tab at a (just-built) Godot project and
+        switch to it — the one-click "build a game → simulate it" handoff.
+
+        Sets backend=godot_csv, the target path, the generated contract,
+        a sensible sim name + cap, and seeds a movement×persona sweep
+        appropriate to a generated game's harness-const knobs.
+        """
+        try:
+            self._sim_backend_var.set("godot_csv")
+            self._sim_target_label_var.set("Godot game (CSV sim):")
+            self._sim_target_var.set(str(project_path))
+            if contract_path:
+                self._sim_contract_var.set(str(contract_path))
+            try:
+                self._sim_name_var.set(Path(project_path).name[:18] or "game")
+            except Exception:
+                pass
+            # Seed a generated-game-appropriate sweep (movement × persona).
+            self._sim_sweep_text.delete("1.0", "end")
+            self._sim_sweep_text.insert("1.0", self._SIM_GENERATED_SWEEP)
+            # Generated games are short — lower the default sim cap.
+            try:
+                self._sim_cap_var.set(60)
+            except Exception:
+                pass
+            if hasattr(self, "tab_simulations"):
+                self.nb.select(self.tab_simulations)
+        except Exception as exc:
+            print(f"[sim prefill] failed: {exc!r}")
 
     def _sim_browse_target(self) -> None:
         from tkinter import filedialog
