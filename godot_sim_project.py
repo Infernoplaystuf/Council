@@ -263,6 +263,19 @@ class GdConstPatcher:
         pat = re.compile(regex)
         return self._sub_group(pat, value)
 
+    def set_export_var(self, name: str, value: Any) -> bool:
+        """Rewrite ``@export var NAME[: TYPE] = <number>`` — the form
+        the GDD builder emits for tunables (player ``move_speed``,
+        enemy ``hp`` / ``speed`` / ``damage``). Lets generated games
+        sweep their own balance VALUES, not just the harness consts.
+        """
+        pat = re.compile(
+            r"(?P<head>@export\s+var\s+" + re.escape(name)
+            + r"\b\s*(?::\s*[A-Za-z0-9_]+)?\s*=\s*)"
+            r"(?P<val>-?\d+(?:\.\d+)?)"
+        )
+        return self._sub_group(pat, value)
+
     def set_dict_path(self, path: List[str], value: Any) -> bool:
         """Set a field nested inside dict consts, e.g.
         ``["CHARACTERS", "human", "max_hp"]`` → the ``max_hp`` number
@@ -409,7 +422,14 @@ class SimContract:
     brain_knobs: Dict[str, KnobTarget] = field(default_factory=dict)
 
     def resolve_file(self, logical: str) -> str:
-        return self.balance_file if logical == "balance" else self.brain_file
+        # "balance" / "brain" are logical aliases; anything else is
+        # treated as a direct project-relative path (used by per-entity
+        # @export-var knobs, which each live in their own script).
+        if logical == "balance":
+            return self.balance_file
+        if logical == "brain":
+            return self.brain_file
+        return logical
 
     def all_knobs(self) -> Dict[str, KnobTarget]:
         merged = dict(self.value_knobs)

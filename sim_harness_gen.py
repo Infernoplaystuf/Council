@@ -72,10 +72,14 @@ class HarnessSpec:
     player_node:  str = "Player"            # node name to drive
     move_style:   str = "topdown"           # "topdown" | "platformer"
     hp_autoload:  str = "GameManager"       # autoload exposing hp/score/victory
+    enemies_node: str = "Enemies"           # scene folder of enemy nodes
     move_speed:   float = 220.0
     contact_band: float = 64.0
     engage_band:  float = 160.0
     default_cap:  float = 60.0
+    # Per-entity @export tunables to expose as sweep knobs:
+    #   {"game.<slug>.<var>": (relative_script_path, var_name)}
+    value_exports: Dict[str, tuple] = field(default_factory=dict)
     notes:        List[str] = field(default_factory=list)
 
 
@@ -111,6 +115,7 @@ const SCENE_PATH := "__SCENE_PATH__"
 const PLAYER_NODE := "__PLAYER_NODE__"
 const MOVE_STYLE := "__MOVE_STYLE__"        # "topdown" | "platformer"
 const HP_AUTOLOAD := "__HP_AUTOLOAD__"
+const ENEMIES_NODE := "__ENEMIES_NODE__"    # scene node holding enemies
 
 # --- Sweepable knobs (Anvil's GdConstPatcher patches these) ---
 const MOVE_SPEED := __MOVE_SPEED__          # AI player move speed (px/s)
@@ -133,6 +138,7 @@ var _elapsed: float = 0.0
 var _min_hp: float = 1.0e9
 var _kills: int = 0
 var _heading: Vector2 = Vector2.RIGHT
+var _prev_enemy_count: int = 0
 var _rng := RandomNumberGenerator.new()
 var _grace: float = 0.0
 
@@ -191,6 +197,7 @@ func _begin_run(cfg: Dictionary) -> void:
 	_grace = 0.0
 	_min_hp = 1.0e9
 	_kills = 0
+	_prev_enemy_count = 0
 	_rng.seed = int(cfg["seed"])
 	seed(int(cfg["seed"]))
 	_heading = Vector2.RIGHT.rotated(_rng.randf() * TAU)
@@ -236,27 +243,59 @@ func _player():
 	return _inst.find_child(PLAYER_NODE, true, false)
 
 
+func _enemies() -> Array:
+	var out: Array = []
+	if _inst == null or not is_instance_valid(_inst):
+		return out
+	var folder = _inst.find_child(ENEMIES_NODE, true, false)
+	if folder != null:
+		for c in folder.get_children():
+			if c is Node2D and is_instance_valid(c):
+				out.append(c)
+	return out
+
+
 func _drive_player(delta: float) -> void:
 	var p = _player()
-	if p == null or not is_instance_valid(p):
+	if p == null or not is_instance_valid(p) or not (p is CharacterBody2D):
 		return
-	if not (p is CharacterBody2D):
-		return
-	if MOVE_STYLE == "platformer":
-		p.velocity.x = MOVE_SPEED
-		if not p.is_on_floor():
-			p.velocity.y += 980.0 * delta
-		elif _rng.randf() < 0.04:
-			p.velocity.y = -400.0
+	var ppos: Vector2 = p.global_position
+	# Kill count: enemies that vanished since last tick (a real game's
+	# combat removes them). Lets the sim score offense, not just survival.
+	var enemies := _enemies()
+	if enemies.size() < _prev_enemy_count:
+		_kills += _prev_enemy_count - enemies.size()
+	_prev_enemy_count = enemies.size()
+	# Nearest enemy drives flee/seek through CONTACT_BAND / ENGAGE_BAND —
+	# the persona-tuned bands Anvil patches per run, so Cautious kites
+	# from farther and Aggressive hugs the pack.
+	var nearest = null
+	var nd := 1.0e9
+	for e in enemies:
+		var d: float = ppos.distance_to(e.global_position)
+		if d < nd:
+			nd = d
+			nearest = e
+	var desired := Vector2.ZERO
+	if nearest != null and nd < CONTACT_BAND:
+		desired = (ppos - nearest.global_position).normalized()        # flee
+	elif nearest != null and nd > ENGAGE_BAND:
+		desired = (nearest.global_position - ppos).normalized()        # close in
 	else:
-		# Topdown: wander on a persistent heading, occasionally re-roll,
-		# and steer toward the arena centre if we drift to an edge.
 		if _rng.randf() < 0.03:
 			_heading = _heading.rotated(_rng.randf_range(-1.2, 1.2))
-		var pos: Vector2 = p.global_position
-		if pos.length() > 1200.0:
-			_heading = (-pos).normalized()
-		p.velocity = _heading * MOVE_SPEED
+		desired = _heading
+	# Steer back from the arena edge so the player doesn't pin a wall.
+	if ppos.length() > 1200.0:
+		desired = (desired + (-ppos).normalized()).normalized()
+	if MOVE_STYLE == "platformer":
+		p.velocity.x = desired.x * MOVE_SPEED
+		if not p.is_on_floor():
+			p.velocity.y += 980.0 * delta
+		elif desired.y < -0.3 or _rng.randf() < 0.04:
+			p.velocity.y = -400.0
+	else:
+		p.velocity = desired * MOVE_SPEED
 	p.move_and_slide()
 
 
@@ -342,6 +381,7 @@ def render_sim_harness(spec: HarnessSpec) -> str:
         "__PLAYER_NODE__": spec.player_node,
         "__MOVE_STYLE__": spec.move_style,
         "__HP_AUTOLOAD__": spec.hp_autoload,
+        "__ENEMIES_NODE__": spec.enemies_node,
         "__MOVE_SPEED__": _fmt_float(spec.move_speed),
         "__CONTACT_BAND__": _fmt_float(spec.contact_band),
         "__ENGAGE_BAND__": _fmt_float(spec.engage_band),
@@ -392,16 +432,25 @@ def spec_from_plan(plan: Any) -> HarnessSpec:
                 player_node = nm[0]
             break
 
-    # Pull move_speed from the player ScriptPlan's exported vars if set.
+    # Walk every script's exported tunables: pull the player's
+    # move_speed for the harness default, and register all numeric
+    # @export vars (player move/jump, enemy hp/speed/damage, item value)
+    # as sweepable game-VALUE knobs keyed by "game.<slug>.<var>".
+    value_exports: Dict[str, tuple] = {}
     for sp in getattr(plan, "scripts", []) or []:
-        if getattr(sp, "entity", None) and registry.get(sp.entity) \
-                and getattr(registry[sp.entity], "role", "") == "player":
-            for (vname, _vtype, vdefault) in getattr(sp, "exported_vars", []) or []:
-                if vname == "move_speed":
-                    try:
-                        move_speed = float(vdefault)
-                    except (TypeError, ValueError):
-                        pass
+        slug = getattr(sp, "entity", None)
+        role = getattr(registry.get(slug), "role", "") if slug else ""
+        rel = getattr(sp, "file", "") or ""
+        for (vname, vtype, vdefault) in getattr(sp, "exported_vars", []) or []:
+            if vtype not in ("int", "float"):
+                continue
+            if role == "player" and vname == "move_speed":
+                try:
+                    move_speed = float(vdefault)
+                except (TypeError, ValueError):
+                    pass
+            if rel and slug:
+                value_exports[f"game.{slug}.{vname}"] = (rel, vname)
 
     return HarnessSpec(
         title=title,
@@ -409,23 +458,34 @@ def spec_from_plan(plan: Any) -> HarnessSpec:
         player_node=player_node,
         move_style=move_style,
         hp_autoload="GameManager",
+        enemies_node="Enemies",
         move_speed=move_speed,
         default_cap=60.0,
+        value_exports=value_exports,
     )
 
 
 def build_sim_contract(spec: HarnessSpec) -> SimContract:
-    """Build a SimContract whose sweepable knobs are the harness's own
-    consts. ``brain_file`` IS the generated Sim.gd, so every knob is a
-    ``set_const`` against that one file — no @export-var patching
-    needed for v1.
+    """Build a SimContract for a generated game.
+
+    BEHAVIOR knobs are consts inside the generated Sim.gd (MOVE_SPEED +
+    the AI bands), patched with ``set_const``. VALUE knobs are the
+    game's own ``@export var`` tunables (enemy hp/speed/damage, player
+    jump), patched in their per-entity scripts with ``set_export_var``
+    — so a generated game sweeps both how the AI plays AND the game's
+    balance numbers.
     """
     brain = "scripts/sim/Sim.gd"
-    knobs = {
+    brain_knobs = {
         "brain.MOVE_SPEED":   KnobTarget("brain", "const", name="MOVE_SPEED"),
         "brain.CONTACT_BAND": KnobTarget("brain", "const", name="CONTACT_BAND"),
         "brain.ENGAGE_BAND":  KnobTarget("brain", "const", name="ENGAGE_BAND"),
     }
+    value_knobs = {}
+    for key, (rel_path, var_name) in (spec.value_exports or {}).items():
+        # file = the entity's own script (resolve_file passes it through);
+        # kind 'export' patches the @export var line.
+        value_knobs[key] = KnobTarget(rel_path, "export", name=var_name)
     return SimContract(
         name=_slug(spec.title),
         sim_script="res://scripts/sim/Sim.gd",
@@ -441,8 +501,8 @@ def build_sim_contract(spec: HarnessSpec) -> SimContract:
         strategy_arg="strategies",
         char_default="player",
         strategy_default="default",
-        value_knobs={},
-        brain_knobs=knobs,
+        value_knobs=value_knobs,
+        brain_knobs=brain_knobs,
     )
 
 

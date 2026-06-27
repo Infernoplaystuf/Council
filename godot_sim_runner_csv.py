@@ -281,6 +281,8 @@ class GodotCsvSimRunner(SimRunner):
             return patcher.set_dict_path(list(kt.path), value)
         if kt.kind == "literal":
             return patcher.set_literal(kt.regex, value)
+        if kt.kind == "export":
+            return patcher.set_export_var(kt.name, value)
         return False
 
     # ----------------------------------------------------------------
