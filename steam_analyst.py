@@ -251,6 +251,98 @@ def _looks_like_revenue_question(q: str) -> bool:
     ))
 
 
+def _looks_like_correlation_question(q: str) -> bool:
+    return bool(re.search(
+        r"\b(?:correlat|relationship|relate\b|relates|affect|impact|"
+        r"versus|vs\.?|predict|driv|tied to|linked)",
+        q, re.IGNORECASE,
+    ))
+
+
+# ── Numeric field extractors for correlation, with question synonyms ──
+def _field_price(r: Dict[str, Any]) -> Optional[float]:
+    try:
+        v = float(r.get("initialprice") or 0) / 100.0
+        return v if v > 0 else None
+    except Exception:
+        return None
+
+
+def _field_ccu(r: Dict[str, Any]) -> Optional[float]:
+    for k in ("ccu", "current", "players_2weeks"):
+        v = r.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            return float(v)
+    return None
+
+
+def _field_owners(r: Dict[str, Any]) -> Optional[float]:
+    lo, hi = _parse_owners(r.get("owners", ""))
+    return (lo + hi) / 2.0 if (lo or hi) else None
+
+
+def _field_reviews(r: Dict[str, Any]) -> Optional[float]:
+    tot = 0.0
+    for k in ("positive", "negative"):
+        v = r.get(k)
+        if isinstance(v, (int, float)):
+            tot += float(v)
+    return tot if tot > 0 else None
+
+
+def _field_rating(r: Dict[str, Any]) -> Optional[float]:
+    pos, neg = r.get("positive"), r.get("negative")
+    if isinstance(pos, (int, float)) and isinstance(neg, (int, float)) \
+            and (pos + neg) > 0:
+        return round(100.0 * pos / (pos + neg), 2)
+    return None
+
+
+_STEAM_FIELDS = {
+    "price":   (_field_price,   ("price", "pricier", "pricy", "pricey",
+                                  "pricing", "cost", "expensive", "cheap",
+                                  "dollar")),
+    "players": (_field_ccu,     ("player", "concurrent", "ccu", "popular",
+                                  "active", "playercount")),
+    "owners":  (_field_owners,  ("owner", "own", "sales", "sold", "copies")),
+    "reviews": (_field_reviews, ("review count", "number of review",
+                                  "how many review", "review")),
+    "rating":  (_field_rating,  ("rating", "score", "positive", "quality",
+                                  "well-reviewed", "well reviewed")),
+}
+
+
+def _pick_steam_fields(q: str) -> List[str]:
+    ql = q.lower()
+    out: List[str] = []
+    for name, (_fn, syns) in _STEAM_FIELDS.items():
+        if any(s in ql for s in syns) and name not in out:
+            out.append(name)
+    return out[:2]
+
+
+def _compute_correlation(records: List[Dict[str, Any]], question: str):
+    """Pearson r between two question-named Steam fields. Returns
+    ``(result_dict | None, fields_found)``."""
+    fields = _pick_steam_fields(question)
+    if len(fields) < 2:
+        return None, fields
+    fn_a = _STEAM_FIELDS[fields[0]][0]
+    fn_b = _STEAM_FIELDS[fields[1]][0]
+    xs: List[float] = []
+    ys: List[float] = []
+    for r in records:
+        a, b = fn_a(r), fn_b(r)
+        if a is not None and b is not None:
+            xs.append(a)
+            ys.append(b)
+    import sim_analyst as _sa
+    res = _sa.pearson(xs, ys)
+    if res is None:
+        return None, fields
+    return {"a": fields[0], "b": fields[1], **res}, fields
+
+
 # ============================================================
 # Computations
 # ============================================================
@@ -285,15 +377,14 @@ def _compute_revenue_band(records: List[Dict[str, Any]]) -> Dict[str, Any]:
             revenues.append(mid * price)
     if not revenues:
         return {}
-    revenues.sort()
-    return {
-        "n":     len(revenues),
-        "min":   round(revenues[0], 0),
-        "p25":   round(revenues[len(revenues) // 4], 0),
-        "median": round(statistics.median(revenues), 0),
-        "p75":   round(revenues[3 * len(revenues) // 4], 0),
-        "max":   round(revenues[-1], 0),
-    }
+    # Reuse the sim analyst's battle-tested percentile helper rather
+    # than hand-rolling the p25/median/p75 recipe (both are pure stdlib
+    # and share the same shape).
+    import sim_analyst as _sa
+    band = _sa.median_iqr(revenues)
+    if not band:
+        return {}
+    return {k: (v if k == "n" else round(v, 0)) for k, v in band.items()}
 
 
 def _format_top_block(top: List[Dict[str, Any]], header: str) -> str:
@@ -396,6 +487,45 @@ def answer_question(
                 # Don't clobber SteamSpy's players_2weeks; add ccu
                 r.setdefault("ccu", sc["current"])
         sources.append(sc_path)
+
+    # ── Correlation first (a distinct intent) ──
+    if _looks_like_correlation_question(question_l):
+        corr, fields = _compute_correlation(records, question_l)
+        if corr is None:
+            if len(fields) < 2:
+                return SteamAnalystResult(
+                    answer=("Name two numeric fields to correlate — e.g. "
+                            "'do pricier games have more players?' Fields: "
+                            "price, players, owners, reviews, rating."),
+                    confidence="low", sources=sources,
+                )
+            return SteamAnalystResult(
+                answer=(f"Not enough paired {fields[0]}/{fields[1]} data to "
+                        "correlate (need 3+ games carrying both)."),
+                confidence="low", sources=sources,
+            )
+        r = corr["r"]
+        strength = (
+            "strong negative" if r <= -0.7 else
+            "moderate negative" if r <= -0.4 else
+            "weak negative" if r < -0.1 else
+            "no clear" if abs(r) < 0.1 else
+            "weak positive" if r < 0.4 else
+            "moderate positive" if r < 0.7 else
+            "strong positive"
+        )
+        return SteamAnalystResult(
+            answer=(
+                f"Correlation between {corr['a']} and {corr['b']}"
+                + (f" ({genre_hint})" if genre_hint else "")
+                + f": r={r:+.3f} ({strength} relationship; "
+                  f"n={corr['n']} games)."
+            ),
+            confidence="high",
+            computed_values={"r": r, "n": corr["n"],
+                             "field_a": corr["a"], "field_b": corr["b"]},
+            sources=sources,
+        )
 
     # ── Decide which computation ──
     out_lines: List[str] = []

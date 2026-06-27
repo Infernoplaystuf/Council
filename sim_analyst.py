@@ -199,6 +199,33 @@ def best_per_persona(
     return out
 
 
+def pearson(xs: Iterable[float], ys: Iterable[float]) -> Optional[Dict[str, float]]:
+    """Pearson r over two equal-length numeric sequences.
+
+    Returns ``{"n", "r"}`` or None when fewer than 3 valid numeric
+    pairs remain or either side has zero variance. Pure stdlib — no
+    scipy. Shared by the sim analyst (correlate) and the Steam Market
+    analyst so neither hand-rolls the formula.
+    """
+    pairs: List[Tuple[float, float]] = [
+        (float(x), float(y)) for x, y in zip(xs, ys)
+        if isinstance(x, (int, float)) and isinstance(y, (int, float))
+    ]
+    if len(pairs) < 3:
+        return None
+    xs2 = [p for p, _ in pairs]
+    ys2 = [q for _, q in pairs]
+    n = len(pairs)
+    mx = sum(xs2) / n
+    my = sum(ys2) / n
+    num = sum((x - mx) * (y - my) for x, y in pairs)
+    denx = math.sqrt(sum((x - mx) ** 2 for x in xs2))
+    deny = math.sqrt(sum((y - my) ** 2 for y in ys2))
+    if denx == 0 or deny == 0:
+        return None
+    return {"n": n, "r": round(num / (denx * deny), 4)}
+
+
 def correlate(
     runs: List[Dict[str, Any]],
     param: str,
@@ -206,32 +233,22 @@ def correlate(
 ) -> Optional[Dict[str, float]]:
     """Pearson correlation between a numeric param and metric.
 
-    Cheap to compute via the standard formula; returns ``{"n",
-    "r", "param_range", "metric_range"}`` or None when fewer than
-    3 numeric pairs are available. We don't ship scipy here — this
-    is pure-stdlib statistics.
+    Returns ``{"n", "r", "param_range", "metric_range"}`` or None when
+    fewer than 3 numeric pairs are available. Math lives in ``pearson``.
     """
-    pairs: List[Tuple[float, float]] = []
+    xs: List[float] = []
+    ys: List[float] = []
     for r in runs:
         p = (r.get("params") or {}).get(param)
         m = (r.get("metrics") or {}).get(metric)
         if isinstance(p, (int, float)) and isinstance(m, (int, float)):
-            pairs.append((float(p), float(m)))
-    if len(pairs) < 3:
-        return None
-    xs = [p for p, _ in pairs]
-    ys = [m for _, m in pairs]
-    n = len(pairs)
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    num = sum((x - mx) * (y - my) for x, y in pairs)
-    denx = math.sqrt(sum((x - mx) ** 2 for x in xs))
-    deny = math.sqrt(sum((y - my) ** 2 for y in ys))
-    if denx == 0 or deny == 0:
+            xs.append(float(p))
+            ys.append(float(m))
+    res = pearson(xs, ys)
+    if res is None:
         return None
     return {
-        "n":            n,
-        "r":            round(num / (denx * deny), 4),
+        **res,
         "param_range":  f"{min(xs)}..{max(xs)}",
         "metric_range": f"{min(ys):.3f}..{max(ys):.3f}",
     }
