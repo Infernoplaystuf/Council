@@ -88,6 +88,17 @@ _SEARCH_STOP_TOKENS = frozenset({
     "row", "rows", "entry", "entries", "record", "records",
     "item", "items", "thing", "things", "result", "results",
     "column", "columns", "field", "fields", "value", "values",
+    # Pronouns and auxiliary verbs — true stop words for vault search
+    # regardless of who/what the user is talking about.
+    "you", "your", "yours", "me", "my", "mine", "we", "us", "our", "ours",
+    "can", "could", "should", "would", "do", "does", "did",
+    # NOTE: noun-like ambiguous words ("app", "tool", "system", "site",
+    # "page", etc.) are deliberately NOT in this list. They might
+    # legitimately refer to vault content. They are handled by the
+    # referent_resolver pass in council_gui_engine, which drops them
+    # ONLY when the query is clearly self-referential (e.g. "what does
+    # this app do?" → drop "app"; "find docs about the Spotify app" →
+    # keep "app").
 })
 
 # Bookkeeping files we write to the vault root. The rebuild walk MUST
@@ -114,6 +125,54 @@ _BOOKKEEPING_FILENAMES = {
 FUZZY_CUTOFF = 0.82           # similarity threshold (0..1)
 FUZZY_MAX_PER_TERM = 3        # cap matches per query term
 FUZZY_MIN_TERM_LEN = 4        # don't fuzzy-match very short tokens
+
+
+def _filter_semantic_expansions(source: str, suggestions: List[str]) -> List[str]:
+    """Drop semantic expansions that aren't structurally similar to
+    ``source``. Defends against small-model hallucinations where the
+    LLM picks vault-vocab tokens with no real relation to the query
+    word — e.g. "colony" → "axolotlinputconfig" because the long vault
+    term happens to share a handful of bigrams.
+
+    Keep a suggestion when EITHER:
+      • it shares a ≥3-char prefix with the source (catches stem
+        variants like "train"→"training" cheaply), OR
+      • its difflib SequenceMatcher ratio with the source is ≥ 0.50
+        AND its length is within ±50% of the source's length.
+
+    The length-disparity gate is what kills the cross-domain noise:
+    real spelling/stem variants are always similar in length; an LLM
+    hallucination against a long vault-vocab token blows past the
+    disparity threshold even when difflib's character-overlap score
+    looks middling.
+
+    True zero-overlap synonyms ("salary" → "wage") are the cost; for
+    those, the static SYNONYMS map already covers the common cases.
+    """
+    import difflib as _dl
+    if not suggestions:
+        return suggestions
+    s_low = source.lower()
+    s_len = len(s_low)
+    if s_len == 0:
+        return []
+    kept: List[str] = []
+    for w in suggestions:
+        wl = (w or "").lower().strip()
+        if not wl:
+            continue
+        # Strong prefix bypass — 3 shared head chars is a clear stem.
+        if s_len >= 3 and len(wl) >= 3 and wl[:3] == s_low[:3]:
+            kept.append(w)
+            continue
+        # Length disparity gate.
+        max_len = max(s_len, len(wl))
+        if abs(s_len - len(wl)) / max_len > 0.5:
+            continue
+        # Sequence similarity gate.
+        if _dl.SequenceMatcher(None, s_low, wl).ratio() >= 0.50:
+            kept.append(w)
+    return kept
 
 # ---------- synonym layer ---------------------------------------------------
 # Static map of common business/data/time terms. Bidirectional usage: query
@@ -2041,6 +2100,7 @@ the vocabulary list. Lowercase only. Single line only.
         folder: Optional[str] = None,
         use_fuzzy: bool = True,
         llm_call: Optional[Callable[[str], str]] = None,
+        drop_terms: Optional[Set[str]] = None,
     ) -> Tuple[List[Tuple[float, Dict[str, Any]]], Dict[str, List[Tuple[str, float]]]]:
         """Return (top-k results, fuzzy_matches) for a free-text query.
 
@@ -2096,6 +2156,15 @@ the vocabulary list. Lowercase only. Single line only.
             return self._search_dsl(parsed, k=k, folder=folder), fuzzy_matches
 
         terms = _tokenize(query)
+        # Drop caller-specified terms before any expansion. Used by the
+        # referent_resolver path: when the user's query is clearly
+        # self-referential ("what does this app do"), the caller passes
+        # drop_terms={"app"} so we don't expand "app" against vault
+        # vocab — which on small local models has been observed to
+        # hallucinate unrelated tokens (e.g. axolotl class names).
+        if drop_terms:
+            drop_lower = {t.lower() for t in drop_terms}
+            terms = [t for t in terms if t.lower() not in drop_lower]
         if not terms:
             return [], fuzzy_matches
 
@@ -2130,7 +2199,11 @@ the vocabulary list. Lowercase only. Single line only.
                     continue
                 if t in fuzzy_matches:
                     continue                # fuzzy already handled it
-                if len(t) < 3:
+                if len(t) < 4:
+                    # Short tokens (e.g. "app", "ide", "dpo") are too
+                    # ambiguous to expand semantically — the model has
+                    # no real intent to anchor on and tends to grab
+                    # whatever vault terms share a couple of letters.
                     continue
                 # Don't burn CPU asking the model to find semantic
                 # categories for common English stop words ("find",
@@ -2145,6 +2218,17 @@ the vocabulary list. Lowercase only. Single line only.
                     expansions = self.semantic_expand(t, llm_call=llm_call)
                 except Exception:
                     expansions = []
+                if expansions:
+                    # Sanity gate: a small local model occasionally
+                    # answers semantic_expand with vault-vocab tokens
+                    # that share almost no characters with the source
+                    # term — e.g. "app" → "axolotlrewardtrainer". We
+                    # require either a shared 2-char prefix or a
+                    # Jaccard ≥ 0.20 over character bigrams. True
+                    # zero-overlap synonyms ("salary" → "wage") are
+                    # the cost; for those, the static SYNONYMS map
+                    # already covers the common cases.
+                    expansions = _filter_semantic_expansions(t, expansions)
                 if expansions:
                     # Reuse the fuzzy_matches map so the existing UI path
                     # that surfaces "treated as your spelling" matches

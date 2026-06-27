@@ -328,6 +328,36 @@ _PARAM_OF_RE = re.compile(
 )
 
 
+def _loose_name_match(known, ql: str) -> Optional[str]:
+    """Tolerant name → query match for namespaced/underscored keys.
+
+    Lets "XP growth" match the param ``balance.XP_GROWTH`` and "king"
+    match the metric ``t_king``: drops the namespace prefix
+    (``balance.`` / ``brain.`` / ``persona.``), splits the remainder on
+    ``_``/punctuation into tokens, and requires at least half of those
+    tokens to appear (stem-matched) in the query. Returns the
+    best-scoring name, or None when nothing clears the bar.
+    """
+    import re as _re
+    best, best_score = None, 0.0
+    for k in known:
+        base = str(k).split(".")[-1]
+        toks = [t for t in _re.split(r"[_\W]+", base.lower()) if len(t) >= 2]
+        if not toks:
+            continue
+        hits = 0
+        for t in toks:
+            stem = t if len(t) <= 4 else t[: len(t) - 2]
+            if stem in ql:
+                hits += 1
+        if hits == 0:
+            continue
+        score = hits / len(toks) + 0.01 * hits
+        if score > best_score:
+            best, best_score = k, score
+    return best if best_score >= 0.5 else None
+
+
 def _pick_metric(query: str, runs: List[Dict[str, Any]]) -> Optional[str]:
     """Guess which metric the user is asking about. Prefer an explicit
     name in the query if it matches a known metric; otherwise fall
@@ -342,6 +372,10 @@ def _pick_metric(query: str, runs: List[Dict[str, Any]]) -> Optional[str]:
     for m in sorted(known, key=len, reverse=True):
         if m.lower() in ql:
             return m
+    # Tolerant token-stem match ("survives longest" → survived_s).
+    loose = _loose_name_match(known, ql)
+    if loose is not None:
+        return loose
     # Match by guesser
     m = _METRIC_NAME_RE.search(query)
     if m and m.group(1) in known:
@@ -369,6 +403,10 @@ def _pick_param(query: str, runs: List[Dict[str, Any]]) -> Optional[str]:
     for k in sorted(known, key=len, reverse=True):
         if k.lower() in ql:
             return k
+    # Tolerant token-stem match ("XP growth" → balance.XP_GROWTH).
+    loose = _loose_name_match(known, ql)
+    if loose is not None:
+        return loose
     m = _PARAM_OF_RE.search(query)
     if m and m.group(1) in known:
         return m.group(1)

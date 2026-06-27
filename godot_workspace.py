@@ -35,19 +35,82 @@ GODOT_BINARY_ENV = "ANVIL_GODOT_BINARY"
 
 
 def get_godot_binary() -> str:
-    """Return the configured Godot binary path or "godot" as fallback."""
-    return os.environ.get(GODOT_BINARY_ENV, "godot")
+    """Return the configured Godot binary path.
+
+    Order: ``ANVIL_GODOT_BINARY`` env override → autodetect (PATH +
+    common install/download locations) → bare ``"godot"`` so the error
+    message is still sensible when nothing is found.
+    """
+    env = os.environ.get(GODOT_BINARY_ENV)
+    if env:
+        return env
+    found = detect_godot_binary()
+    return found or "godot"
+
+
+_DETECT_CACHE: List[Optional[str]] = []   # memoised detect result
 
 
 def detect_godot_binary() -> Optional[str]:
-    """Probe PATH for the Godot binary so first-launch onboarding can
-    pre-fill the setting. Returns the absolute path or None.
+    """Locate a Godot binary so onboarding / the sim runner can use it
+    without the user hand-setting a path. Returns an absolute path or
+    None. Result is memoised — the filesystem probe runs once per
+    process.
+
+    Probes, in order: PATH, then common Windows download/install
+    locations. The official Windows build is a zip the user extracts
+    to a ``Godot_*`` folder, so we look only a couple of levels deep
+    (NOT a full recursive walk, which is slow over OneDrive/Documents).
+    The ``_console.exe`` build is preferred because it pipes stdout
+    reliably for headless runs.
     """
+    if _DETECT_CACHE:
+        return _DETECT_CACHE[0]
+    result = _detect_godot_binary_uncached()
+    _DETECT_CACHE.append(result)
+    return result
+
+
+def _detect_godot_binary_uncached() -> Optional[str]:
     for name in ("godot", "godot4", "Godot_v4", "Godot"):
         found = shutil.which(name)
         if found:
             return found
-    return None
+    roots: List[Path] = []
+    home = Path.home()
+    roots.extend([home / "Downloads", home / "Desktop", home / "Godot",
+                  home / "Documents"])
+    for env_key in ("LOCALAPPDATA", "PROGRAMFILES", "PROGRAMFILES(X86)"):
+        base = os.environ.get(env_key)
+        if base:
+            roots.append(Path(base))
+    # Shallow patterns only: the exe sits at depth 0-2 under a root.
+    patterns = ("Godot*.exe", "Godot*/Godot*.exe", "Godot*/*/Godot*.exe")
+    candidates: List[Path] = []
+    seen = set()
+    for root in roots:
+        try:
+            rp = root.resolve()
+        except Exception:
+            continue
+        if rp in seen or not rp.exists():
+            continue
+        seen.add(rp)
+        for pat in patterns:
+            try:
+                for p in rp.glob(pat):
+                    if p.is_file():
+                        candidates.append(p)
+            except Exception:
+                continue
+        if candidates:
+            break  # first root with a hit wins
+    if not candidates:
+        return None
+    console = [c for c in candidates if "_console" in c.name.lower()]
+    pick_from = console or candidates
+    pick_from.sort(key=lambda p: p.name, reverse=True)
+    return str(pick_from[0])
 
 
 # ============================================================

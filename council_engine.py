@@ -689,7 +689,11 @@ def _get_gguf_model():
                 f"model {(diag.get('model_size_bytes') or 0) / (1024**3):.1f} GB, "
                 f"margin {margin_mb} MB)"
             )
-            _ladder_log("vram_aware", chosen=True, picked=picked, **diag)
+            # ``diag`` already carries ``picked`` (set by
+            # _pick_vram_aware_n_ctx); pass it through **diag rather
+            # than as a separate kwarg to avoid a duplicate-keyword
+            # TypeError on the GPU code path.
+            _ladder_log("vram_aware", chosen=True, **diag)
         else:
             _ladder_log("vram_aware", chosen=False, **diag)
 
@@ -1607,7 +1611,7 @@ class LoadAwareDispatcher:
         candidates.sort(key=lambda s: (s.active_models, s.latency_ms))
         chosen = candidates[0].host
         print(
-            f"[DISPATCHER] model={model} → {chosen} "
+            f"[DISPATCHER] model={model} -> {chosen} "
             f"(active={candidates[0].active_models}, latency={candidates[0].latency_ms:.0f}ms)"
         )
         return chosen
