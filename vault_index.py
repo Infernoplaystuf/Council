@@ -2047,7 +2047,12 @@ the vocabulary list. Lowercase only. Single line only.
                         progress(i, total, p.name)
                     except Exception:
                         pass
-                rec = _index_file(p)
+                # #12: guard like the parallel path — one corrupt/locked
+                # file must not abort the whole reindex before save().
+                try:
+                    rec = _index_file(p)
+                except Exception:
+                    rec = None
                 if rec:
                     self.records[spath] = rec
                     n_updated += 1

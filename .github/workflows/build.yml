@@ -1,5 +1,5 @@
 # ============================================================
-# Build the standalone Windows bundle (DatasInferno.exe)
+# Build the standalone Windows bundle (Anvil.exe)
 # ============================================================
 # Two trigger modes:
 #
@@ -75,7 +75,35 @@ permissions:
   contents: write
 
 jobs:
+  # #6: a fast regression guard. The build job depends on this, so a
+  # broken sim/gdd/vault/analyst module can't ship. Headless-safe.
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install Tk + runtime deps (no llama-cpp/torch needed for tests)
+        run: |
+          sudo apt-get update && sudo apt-get install -y python3-tk
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Smoke test (headless)
+        run: |
+          if [ -f tests/smoke_test.py ]; then python tests/smoke_test.py; \
+          else echo "no tests/smoke_test.py — skipping"; fi
+      - name: Unit tests
+        run: |
+          pip install pytest
+          if [ -d inferno_local/tests ]; then pytest inferno_local/tests -q; \
+          else echo "no inferno_local/tests — skipping"; fi
+
   build-windows:
+    needs: test
     runs-on: windows-latest
     timeout-minutes: 45
 
@@ -155,12 +183,15 @@ jobs:
         run: python -c "import llama_cpp, pandas, numpy, openpyxl, tkinter, yaml, requests, sentence_transformers, huggingface_hub, pyarrow, duckdb, bson; print('All critical deps OK')"
 
       - name: Build the bundle (PyInstaller)
-        run: python -m PyInstaller council.spec --noconfirm --clean
+        shell: pwsh
+        run: |
+          if (-not (Test-Path anvil.spec)) { throw "anvil.spec not found" }
+          python -m PyInstaller anvil.spec --noconfirm --clean
 
       - name: Report bundle size
         shell: pwsh
         run: |
-          $size = (Get-ChildItem -Path dist\DatasInferno -Recurse -File `
+          $size = (Get-ChildItem -Path dist\Anvil -Recurse -File `
                    | Measure-Object -Property Length -Sum).Sum
           $sizeMB = [math]::Round($size / 1MB, 1)
           echo "Bundle size on disk: $sizeMB MB"
@@ -173,8 +204,8 @@ jobs:
         # 4 GB limit, switch to 7-Zip (also pre-installed at
         # 'C:\Program Files\7-Zip\7z.exe').
         run: |
-          $archive = "DatasInferno-windows-x64.zip"
-          Compress-Archive -Path dist\DatasInferno\* `
+          $archive = "Anvil-windows-x64.zip"
+          Compress-Archive -Path dist\Anvil\* `
                            -DestinationPath $archive `
                            -CompressionLevel Optimal
           $zipMB = [math]::Round((Get-Item $archive).Length / 1MB, 1)
@@ -187,8 +218,8 @@ jobs:
         # is convenient for debugging if the Release step fails.
         uses: actions/upload-artifact@v4
         with:
-          name: DatasInferno-windows-x64
-          path: DatasInferno-windows-x64.zip
+          name: Anvil-windows-x64
+          path: Anvil-windows-x64.zip
           retention-days: 30
           if-no-files-found: error
 
@@ -203,6 +234,6 @@ jobs:
         # tag (--generate-notes).
         run: |
           gh release create $env:GITHUB_REF_NAME `
-            DatasInferno-windows-x64.zip `
+            Anvil-windows-x64.zip `
             --title "Datas Inferno $env:GITHUB_REF_NAME" `
             --generate-notes
