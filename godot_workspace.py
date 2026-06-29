@@ -114,6 +114,81 @@ def _detect_godot_binary_uncached() -> Optional[str]:
 
 
 # ============================================================
+# Sprite placement (Pixel Art → game)
+# ============================================================
+
+def list_tscn_body_nodes(tscn_text: str) -> List[str]:
+    """Return node names in a .tscn that are likely game entities — the
+    bodies/areas a hand-painted sprite would be attached to (skips the
+    root, HUD, Labels, ColorRects, collisions)."""
+    out: List[str] = []
+    skip_types = ("Label", "ColorRect", "CollisionShape2D", "Control",
+                  "CanvasLayer", "Camera2D")
+    for m in re.finditer(r'\[node name="([^"]+)" type="([^"]+)"'
+                          r'(?:\s+parent="([^"]+)")?', tscn_text):
+        name, ntype, parent = m.group(1), m.group(2), m.group(3)
+        if parent is None:
+            continue  # root
+        if ntype in skip_types:
+            continue
+        if name not in out:
+            out.append(name)
+    return out
+
+
+def place_sprite_in_tscn(tscn_text: str, node_name: str,
+                          texture_res_path: str,
+                          sprite_name: str = "Sprite") -> Tuple[str, bool]:
+    """Return ``(new_tscn_text, ok)`` with a ``Sprite2D`` child carrying
+    ``texture_res_path`` added under ``node_name``.
+
+    Pure text transform (no Godot needed) so it's unit-testable: adds an
+    ``[ext_resource type="Texture2D" ...]`` for the PNG, bumps
+    ``load_steps``, and appends the Sprite2D node. ``ok`` is False when
+    the target node isn't present.
+    """
+    # Confirm the target node exists.
+    if not re.search(r'\[node name="' + re.escape(node_name) + r'"', tscn_text):
+        return tscn_text, False
+
+    # Allocate an ext_resource id not already used.
+    used = set(re.findall(r'\[ext_resource [^\]]*id="([^"]+)"', tscn_text))
+    n = 1
+    while f"{n}_tex" in used or str(n) in used:
+        n += 1
+    rid = f"{n}_tex"
+
+    lines = tscn_text.splitlines()
+    out_lines: List[str] = []
+    inserted_ext = False
+    for ln in lines:
+        out_lines.append(ln)
+        if not inserted_ext and ln.startswith("[gd_scene"):
+            # Bump load_steps in the header we just appended.
+            m = re.search(r"load_steps=(\d+)", out_lines[-1])
+            if m:
+                out_lines[-1] = out_lines[-1].replace(
+                    f"load_steps={m.group(1)}",
+                    f"load_steps={int(m.group(1)) + 1}")
+            out_lines.append(
+                f'[ext_resource type="Texture2D" '
+                f'path="{texture_res_path}" id="{rid}"]')
+            inserted_ext = True
+    if not inserted_ext:
+        # No gd_scene header (shouldn't happen) — prepend one.
+        out_lines.insert(0, '[gd_scene load_steps=2 format=3]')
+        out_lines.insert(1, f'[ext_resource type="Texture2D" '
+                            f'path="{texture_res_path}" id="{rid}"]')
+
+    out_lines.append("")
+    out_lines.append(f'[node name="{sprite_name}" type="Sprite2D" '
+                     f'parent="{node_name}"]')
+    out_lines.append(f'texture = ExtResource("{rid}")')
+    out_lines.append("")
+    return "\n".join(out_lines), True
+
+
+# ============================================================
 # Project model
 # ============================================================
 

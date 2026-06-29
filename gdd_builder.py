@@ -70,6 +70,8 @@ class BuildResult:
     # the actual build outcome (real / failed / placeholder). The
     # Godot Workspace plan pane renders it as a per-file worklist.
     ledger:        List[Any] = field(default_factory=list)
+    # None until a runtime smoke ran; True/False after. None in dry-run.
+    runtime_smoke_ok: Optional[bool] = None
 
     @property
     def ok(self) -> bool:
@@ -99,6 +101,26 @@ def render_tscn(scene: ScenePlan,
     # Walk the tree
     _emit_node(scene.root, lines, "", ext_resources)
     return "\n".join(lines)
+
+
+def _snapshot_project(project_path: Path, vault_dir: Path) -> Optional[Path]:
+    """Copy ``project_path`` to ``projects/.history/<slug>/<timestamp>``
+    before a destructive rebuild. Excludes the regenerable ``.godot`` /
+    ``.import`` caches to keep snapshots small. Returns the snapshot
+    dir, or None if there was nothing to snapshot.
+    """
+    if not project_path.exists() or not any(project_path.iterdir()):
+        return None
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    dest = vault_dir / "projects" / ".history" / project_path.name / ts
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(
+        project_path, dest,
+        ignore=shutil.ignore_patterns(".godot", ".import", ".git",
+                                       "__pycache__", ".history"),
+    )
+    return dest
 
 
 def _collect_ext_resources(scene: ScenePlan) -> List[Tuple[str, str, str]]:
@@ -342,6 +364,15 @@ class BuildOptions:
     coder_max_attempts: int = 3
     dry_run:          bool = False
     on_event:         Optional[Callable[[str, str], None]] = None
+    # When True (default), snapshot an existing project to
+    # projects/.history/<slug>/<timestamp> before a destructive
+    # overwrite rebuild, so an edited-GDD rebuild can't silently lose
+    # the prior working version.
+    snapshot_history: bool = True
+    # When True (default), run the built game headless for a few frames
+    # after the Coder pass to catch RUNTIME errors that --check-only
+    # (parse-only) misses. Skipped in dry-run.
+    runtime_smoke:    bool = True
     # When True (default), also generate a headless sim harness
     # (scripts/sim/Sim.gd) + a SimContract so the built game can be
     # swept in the Simulations tab. Pure GDScript/JSON — no AI art.
@@ -389,6 +420,18 @@ def build_from_plan(
     _emit("skeleton", f"Scaffolding skeleton for {plan.title!r}…")
     skel = _db.build_demo(concept, vault_dir, overwrite=False)
     if skel.error and "already exists" in skel.error:
+        # Snapshot the prior version before the destructive overwrite so
+        # an edited-GDD rebuild is recoverable.
+        if options.snapshot_history and skel.project_path:
+            try:
+                snap = _snapshot_project(Path(skel.project_path), Path(vault_dir))
+                if snap:
+                    result.notes.append(
+                        f"Snapshotted previous version → "
+                        f"{snap.relative_to(Path(vault_dir))}")
+                    _emit("snapshot", f"  saved prior version → {snap.name}")
+            except Exception as exc:
+                result.notes.append(f"snapshot skipped: {exc!r}")
         # Reuse existing project — the orchestrator overwrites files
         # so this is fine.
         result.notes.append(
@@ -551,4 +594,61 @@ def build_from_plan(
                 )
         result.scripts_failed = new_failed
 
+    # ── Step 6: runtime smoke ──
+    # --check-only is parse-only: a script that compiles but errors at
+    # runtime (bad node path, null deref in _ready) still shows green.
+    # Run the game headless for a few frames and flag runtime SCRIPT
+    # ERRORs the parse pass can't see.
+    if options.runtime_smoke and not options.dry_run:
+        ok, detail = _runtime_smoke(project_path, options.godot_binary)
+        result.runtime_smoke_ok = ok
+        if ok:
+            _emit("smoke", "  runtime smoke passed (ran headless, no errors)")
+        else:
+            result.notes.append(f"runtime smoke flagged issues: {detail}")
+            _emit("smoke", f"  runtime smoke: {detail}")
+
     return result
+
+
+def _runtime_smoke(project_path: Path, godot_binary: str,
+                    frames: int = 90, timeout_s: float = 30.0) -> Tuple[bool, str]:
+    """Run the built game headless for ~``frames`` frames and report
+    whether any runtime SCRIPT ERROR / crash hint appeared. Returns
+    ``(ok, detail)``; ok=True also when Godot isn't available (we don't
+    want a missing binary to fail a build).
+    """
+    import subprocess
+    args = [godot_binary, "--headless", "--path", str(project_path),
+            f"--quit-after", str(frames)]
+    startupinfo = None
+    creationflags = 0
+    if os.name == "nt":
+        try:
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        except Exception:
+            startupinfo = None
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        cp = subprocess.run(
+            args, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=timeout_s,
+            startupinfo=startupinfo, creationflags=creationflags,
+        )
+    except FileNotFoundError:
+        return True, "godot binary not found — runtime smoke skipped"
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {timeout_s:.0f}s (possible hang in _ready/_process)"
+    except Exception as exc:
+        return True, f"runtime smoke could not launch ({exc!r}) — skipped"
+    blob = (cp.stderr or "") + "\n" + (cp.stdout or "")
+    hints = ("SCRIPT ERROR", "Parse Error:", "Cannot call method",
+             "Invalid get index", "Attempt to call", "Nonexistent function",
+             "null instance")
+    for h in hints:
+        if h in blob:
+            # Grab the first offending line for the note.
+            line = next((ln.strip() for ln in blob.splitlines() if h in ln), h)
+            return False, line[:200]
+    return True, "ok"

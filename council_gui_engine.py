@@ -13698,6 +13698,9 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         ttk.Button(top, text="🛠 Save into open Godot project",
                    command=self._px_save_into_godot
                    ).pack(side="left", padx=(8, 0))
+        ttk.Button(top, text="🎯 Place on entity…",
+                   command=self._px_place_sprite_on_entity
+                   ).pack(side="left", padx=(4, 0))
         self._px_status_var = tk.StringVar(value="new 32×32 canvas")
         ttk.Label(top, textvariable=self._px_status_var,
                   foreground="#a98a8a").pack(side="right")
@@ -14237,6 +14240,108 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         except Exception:
             pass
         self._px_update_status()
+
+    def _px_place_sprite_on_entity(self) -> None:
+        """Save the current sprite into the open project, import it, and
+        attach it as a Sprite2D on a chosen entity node in main.tscn —
+        so a hand-painted sprite actually shows up in-game. Never
+        generates art; only relocates the user's PNG + edits scene text.
+        """
+        from tkinter import messagebox, simpledialog
+        import godot_workspace as _gw
+        proj = getattr(self, "_gw_project", None)
+        if proj is None:
+            messagebox.showinfo(
+                "No project open",
+                "Open a Godot project in the 🛠 Workspace tab first.",
+                parent=self)
+            return
+        # Pick the target scene (default main.tscn) + an entity node in it.
+        tscn = proj.root / "main.tscn"
+        if not tscn.exists():
+            cands = list(proj.root.glob("*.tscn")) + list(
+                proj.root.glob("scenes/*.tscn"))
+            if not cands:
+                messagebox.showinfo("No scene",
+                    "No .tscn found to place the sprite into.", parent=self)
+                return
+            tscn = cands[0]
+        try:
+            tscn_text = tscn.read_text(encoding="utf-8")
+        except Exception as exc:
+            messagebox.showerror("Read failed", repr(exc), parent=self)
+            return
+        nodes = _gw.list_tscn_body_nodes(tscn_text)
+        if not nodes:
+            messagebox.showinfo("No entities",
+                f"No entity nodes found in {tscn.name} to attach a sprite to.",
+                parent=self)
+            return
+        entity = simpledialog.askstring(
+            "Place on entity",
+            "Attach this sprite to which entity?\n\n"
+            "Available: " + ", ".join(nodes),
+            initialvalue=nodes[0], parent=self)
+        if not entity:
+            return
+        entity = entity.strip()
+        if entity not in nodes:
+            messagebox.showinfo("Unknown entity",
+                f"{entity!r} is not one of: {', '.join(nodes)}", parent=self)
+            return
+        # Save the PNG under res://assets/sprites/<entity>.png.
+        sprites_dir = proj.root / "assets" / "sprites"
+        sprites_dir.mkdir(parents=True, exist_ok=True)
+        png_name = f"{entity.lower()}.png"
+        png_path = sprites_dir / png_name
+        try:
+            self._px_module.save_png(self._px_doc, str(png_path))
+        except Exception as exc:
+            messagebox.showerror("Save failed", repr(exc), parent=self)
+            return
+        res_path = f"res://assets/sprites/{png_name}"
+        # Import the texture so the .tscn reference resolves at runtime.
+        try:
+            binary = _gw.get_godot_binary()
+            import subprocess
+            cf = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            subprocess.run([binary, "--headless", "--path", str(proj.root),
+                            "--import"], capture_output=True, timeout=120,
+                           creationflags=cf)
+        except Exception:
+            pass  # import is best-effort; the editor will import on open
+        # Rewrite the scene to add the Sprite2D, atomically.
+        new_text, ok = _gw.place_sprite_in_tscn(tscn_text, entity, res_path)
+        if not ok:
+            messagebox.showerror("Placement failed",
+                f"Could not find node {entity!r} in {tscn.name}.", parent=self)
+            return
+        try:
+            tmp = tscn.with_suffix(tscn.suffix + ".tmp")
+            tmp.write_text(new_text, encoding="utf-8")
+            os.replace(tmp, tscn)
+        except Exception as exc:
+            messagebox.showerror("Write failed", repr(exc), parent=self)
+            return
+        # Flip the matching dev-ledger asset entry if a recent build is held.
+        try:
+            ledger = getattr(getattr(self, "_gw_last_build", None), "ledger", None)
+            if ledger:
+                for e in ledger:
+                    if getattr(e, "kind", "") == "asset" and entity in str(getattr(e, "path", "")):
+                        e.status = "real"
+                        e.replace_with = res_path
+        except Exception:
+            pass
+        try:
+            self._gw_project = _gw.open_project(proj.root)
+            self._gw_populate_tree()
+        except Exception:
+            pass
+        messagebox.showinfo(
+            "Sprite placed",
+            f"Placed {png_name} as a Sprite2D on {entity} in {tscn.name}.\n"
+            "Run the game to see it.", parent=self)
 
     def _px_resize_canvas(self) -> None:
         try:
