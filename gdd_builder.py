@@ -284,12 +284,22 @@ def build_coder_task(script: ScriptPlan, plan: Plan,
         for sig in script.signals_handle:
             parts.append(f"  {sig.emitter}.{sig.name} → handler "
                           f"with args ({', '.join(sig.args)})")
-    # Entity registry — let the coder reference other entity types
-    # by name when wiring signals.
+    # Entity registry — only the entities THIS script actually
+    # references (its own + the emitters of signals it emits/handles),
+    # not the whole project. Sending the full registry in every
+    # per-script prompt blows the context on small local models (#17).
     if plan.entity_registry:
-        parts.append("Other entities in this project (for reference):")
-        for slug, ent in plan.entity_registry.items():
-            parts.append(f"  {slug}  (role={ent.role})  {ent.description[:80]}")
+        relevant = set()
+        if script.entity:
+            relevant.add(script.entity)
+        for sig in (script.signals_handle + script.signals_emit):
+            relevant.add(sig.emitter)
+        refs = [(slug, ent) for slug, ent in plan.entity_registry.items()
+                if slug in relevant]
+        if refs:
+            parts.append("Related entities (for reference):")
+            for slug, ent in refs:
+                parts.append(f"  {slug}  (role={ent.role})  {ent.description[:80]}")
     parts.append("")
     parts.append("Constraints:")
     parts.append("- Godot 4 syntax only (no `tool`/`export`/`onready` — "

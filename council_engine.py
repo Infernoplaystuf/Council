@@ -798,6 +798,24 @@ def _get_gguf_model():
             name = _t.cuda.get_device_name(0)
             total_gb = _t.cuda.get_device_properties(0).total_memory / (1024**3)
             gpu_diag = f"  GPU={name} ({total_gb:.1f} GB VRAM)"
+            # #26: if the model weights ALONE can't fit in VRAM (minus a
+            # 1.5 GB headroom for KV + runtime), don't ask llama-cpp to
+            # offload every layer — it would OOM or hard-fail. Switch to
+            # a conservative partial offload instead. Only triggers for
+            # genuinely-too-big models, so an 8B on a 16 GB card is
+            # untouched (stays at 99 = full offload).
+            if n_gpu_layers >= 99 and not os.environ.get("COUNCIL_GGUF_GPU_LAYERS"):
+                try:
+                    model_gb = p.stat().st_size / (1024**3)
+                    budget_gb = max(0.0, total_gb - 1.5)
+                    if model_gb > budget_gb > 0:
+                        frac = budget_gb / model_gb
+                        n_gpu_layers = max(1, int(frac * 32))
+                        gpu_diag += (f" — model ~{model_gb:.1f} GB > VRAM "
+                                     f"budget {budget_gb:.1f} GB; partial "
+                                     f"offload n_gpu_layers={n_gpu_layers}")
+                except Exception:
+                    pass
         else:
             gpu_diag = "  GPU=none detected (torch.cuda.is_available()=False)"
     except Exception:
@@ -1076,6 +1094,33 @@ def estimate_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
 
 
+def _assemble_within_budget(segs, user_block, budget, est_fn):
+    """Fit labelled prefix segments + ``user_block`` into ``budget`` tokens.
+
+    ``segs`` is a list of ``(display_order, drop_priority, text)``.
+    Segments with ``drop_priority == 0`` and ``user_block`` are always
+    kept; the rest are added most-valuable-first (lowest drop_priority)
+    until the budget is hit, so the highest drop_priority segments are
+    the ones evicted. The kept segments are re-joined in ``display_order``
+    so a no-eviction result is identical to a plain join.
+
+    Returns ``(stitched_user, dropped_labels)``. Pure / unit-testable.
+    """
+    mandatory = [user_block] + [t for (_o, _d, t) in segs if _d == 0]
+    used = sum(est_fn(t) for t in mandatory)
+    kept = [s for s in segs if s[1] == 0]
+    dropped = []
+    for s in sorted((s for s in segs if s[1] > 0), key=lambda s: s[1]):
+        t = est_fn(s[2])
+        if used + t <= budget:
+            kept.append(s)
+            used += t
+        else:
+            dropped.append(s[2].split(":", 1)[0])
+    kept.sort(key=lambda s: s[0])
+    return "\n\n".join([s[2] for s in kept] + [user_block]), dropped
+
+
 def get_model_max_context() -> Optional[int]:
     """Return the GGUF's advertised max context (from metadata), or None if
     the model isn't loaded or the field is missing. Granite 3.0 reports
@@ -1177,9 +1222,19 @@ def _gguf_chat_stream(
     pieces: list[str] = []
     # Hold the inference lock for the entire stream. Releasing between
     # chunks would let another call slip in and corrupt the in-progress
-    # KV cache. token_callback fires INSIDE the lock — callbacks should
-    # be fast (queue.put_nowait or a buffer append) and must NOT call
-    # back into local_chat (would deadlock).
+    # KV cache, so the loop must stay inside the lock. token_callback
+    # therefore fires inside the lock — it MUST be fast and non-blocking
+    # (queue.put_nowait or a buffer append) and must NOT call back into
+    # local_chat. #21: we invoke it through a guarded wrapper so a
+    # throwing/slow callback can't break the stream or wedge the lock
+    # holder — a misbehaving callback is dropped, not propagated.
+    def _emit(text: str) -> None:
+        if not token_callback:
+            return
+        try:
+            token_callback(text)
+        except Exception:
+            pass  # never let a UI callback abort an in-flight generation
     with _INFERENCE_LOCK:
         for chunk in llm.create_chat_completion(
             messages=messages,
@@ -1193,8 +1248,7 @@ def _gguf_chat_stream(
                 delta = ""
             if delta:
                 pieces.append(delta)
-                if token_callback:
-                    token_callback(delta)
+                _emit(delta)
     return "".join(pieces)
 
 
@@ -3036,19 +3090,26 @@ class PersonalityModel:
             prior_txt = ''
             history_txt = ''
 
-        prefix_parts = []
+        # ── Labelled prefix segments with an eviction order ───────────
+        # Each segment is (display_order, drop_priority, text). When the
+        # stitched prompt would exceed n_ctx, the HIGHEST drop_priority
+        # segments are evicted first so llama-cpp never silently clips
+        # the high-value tail — USER TASK and the goal anchor that lives
+        # inside COUNCIL CONTEXT. COUNCIL CONTEXT + USER TASK are never
+        # evicted. When nothing overflows (the common case) the final
+        # string is identical to the old prefix_parts join.
+        _segs = []  # (display_order, drop_priority, text)
         if mem.strip():
-            prefix_parts.append("ROLE MEMORY (maintain consistency):\n" + mem.strip())
+            _segs.append((0, 4, "ROLE MEMORY (maintain consistency):\n" + mem.strip()))
         if proj_mem.strip():
-            prefix_parts.append("PROJECT CONTEXT (shared across all roles):\n" + proj_mem.strip())
+            _segs.append((1, 3, "PROJECT CONTEXT (shared across all roles):\n" + proj_mem.strip()))
         if prior_txt.strip():
-            prefix_parts.append("PRIOR SESSION CONTEXT:\n" + prior_txt.strip())
+            _segs.append((2, 6, "PRIOR SESSION CONTEXT:\n" + prior_txt.strip()))
         if history_txt.strip():
-            prefix_parts.append("RECENT CONVERSATION:\n" + history_txt.strip())
+            _segs.append((3, 5, "RECENT CONVERSATION:\n" + history_txt.strip()))
         if filtered_extra.strip():
-            prefix_parts.append("COUNCIL CONTEXT:\n" + filtered_extra.strip())
-
-        stitched_user = "\n\n".join(prefix_parts + ["USER TASK:\n" + user_text])
+            _segs.append((4, 0, "COUNCIL CONTEXT:\n" + filtered_extra.strip()))
+        user_block = "USER TASK:\n" + user_text
 
         spec = (
             self.registry.get(self.backend_key)
@@ -3057,6 +3118,23 @@ class PersonalityModel:
         )
 
         effective_max_tokens = max_tokens if max_tokens is not None else self.max_output_tokens
+
+        # ── Final-assembly budget check (the #1 anti-truncation fix) ──
+        try:
+            _n_ctx = get_n_ctx()
+            _budget = max(512, _n_ctx - int(effective_max_tokens or 512)
+                          - estimate_tokens(self.system_prompt or "") - 256)
+            stitched_user, _dropped = _assemble_within_budget(
+                _segs, user_block, _budget, estimate_tokens)
+            if _dropped:
+                import sys as _sd
+                print(f"[respond] trimmed to fit n_ctx={_n_ctx}: dropped "
+                      f"{_dropped} (kept USER TASK + COUNCIL CONTEXT)",
+                      file=_sd.stderr)
+        except Exception:
+            # Never let budgeting break a turn — fall back to a full join.
+            _segs.sort(key=lambda s: s[0])
+            stitched_user = "\n\n".join([s[2] for s in _segs] + [user_block])
         return spec.generate(
             developer_instructions=self.system_prompt,
             user_text=stitched_user,

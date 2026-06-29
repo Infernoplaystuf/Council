@@ -335,7 +335,27 @@ class _ChromaBackend:
                     "score":  round(score, 3),
                     "chunk_id": "",
                 })
-            return chunks
+            # #10: drop weak matches that would just consume the (tight)
+            # context budget, and don't let one file dominate the slots.
+            # Never return empty when we had candidates — keep the top-1.
+            try:
+                floor = float(os.environ.get("VAULTRAG_SCORE_FLOOR", "0.15"))
+            except Exception:
+                floor = 0.15
+            strong = [c for c in chunks if c["score"] >= floor]
+            if not strong and chunks:
+                strong = sorted(chunks, key=lambda c: c["score"],
+                                reverse=True)[:1]
+            strong.sort(key=lambda c: c["score"], reverse=True)
+            per_source: Dict[str, int] = {}
+            deduped: List[Dict[str, Any]] = []
+            for c in strong:
+                src = c["source"]
+                if per_source.get(src, 0) >= 2:   # at most 2 chunks / file
+                    continue
+                per_source[src] = per_source.get(src, 0) + 1
+                deduped.append(c)
+            return deduped
         except Exception as e:
             print(f"[VaultRAG] search error: {e}")
             return []

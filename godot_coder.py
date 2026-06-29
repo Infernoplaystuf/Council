@@ -457,13 +457,20 @@ class GodotCoder:
                     )
                 else:
                     history_block = ""
+                # #17: feed the model the COMPRESSED error (the one
+                # representative line) plus a short tail, not 2000 raw
+                # chars of Godot noise — keeps the FIX prompt small
+                # enough for an 8B to actually use it.
+                _err_summary = _summarise_stderr(state.stderr or "")
+                _err_tail = "\n".join(
+                    (state.stderr or "").splitlines()[-8:])
                 prompt = FIX_PROMPT_TEMPLATE.format(
                     task=task,
                     attempt=attempt - 1,
                     max_attempts=self.max_attempts,
                     code=state.code,
                     returncode=state.returncode,
-                    stderr=(state.stderr or "")[:2000],
+                    stderr=(_err_summary + "\n---\n" + _err_tail)[:900],
                     history_block=history_block,
                     goal_header=_goal_header(goal),
                     goal_reminder=_goal_reminder(goal),

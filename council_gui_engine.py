@@ -1785,8 +1785,20 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
         if idx is not None:
             try:
                 import council_engine as _ce_tim
-                with _ce_tim._TimingScope("vault.rebuild"):
-                    idx.rebuild()
+                # #16: don't re-walk the vault on every single turn — the
+                # delta-aware rebuild is cheap on no-change but the tree
+                # walk still sits in front of the first model call. Gate
+                # it to at most once per 10s on this hot path; the vault-
+                # management actions still rebuild immediately on edits.
+                import time as _t_rb
+                _now_rb = _t_rb.monotonic()
+                if _now_rb - getattr(idx, "_last_hot_rebuild", 0.0) > 10.0:
+                    with _ce_tim._TimingScope("vault.rebuild"):
+                        idx.rebuild()
+                    try:
+                        idx._last_hot_rebuild = _now_rb
+                    except Exception:
+                        pass
                 # When analyst already answered (#7), reduce the vault-match
                 # pull from 5 to 1 — the analyst's CSV is the authoritative
                 # source and 5 fuzzy matches just consume budget.
@@ -1834,9 +1846,21 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                     if (referent_res is not None and referent_res.drop_terms)
                     else None
                 )
+                # #15: search with a de-bloated query — strip pasted code
+                # fences, file paths, and tabular/CSV runs so the retrieval
+                # matches on the user's actual intent, not the noise. Falls
+                # back to the raw text when stripping leaves too little.
+                _search_q = user_text
+                try:
+                    import goal_anchor as _ga_q
+                    _cleaned = _ga_q._strip_bloat(user_text).strip()
+                    if len(_cleaned) >= 4:
+                        _search_q = _cleaned
+                except Exception:
+                    pass
                 with _ce_tim._TimingScope("vault.search"):
                     all_hits, fuzzy_matches = idx.search(
-                        user_text, k=k + TAIL_K, folder=folder_scope,
+                        _search_q, k=k + TAIL_K, folder=folder_scope,
                         llm_call=_semantic_llm_call,
                         drop_terms=_vault_drop,
                     )
@@ -17216,6 +17240,24 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
                         self._set_status(f"● panel: {_judge_chosen}…", "#fab387")
                 except Exception as _jpe:
                     self._set_judge(f"Judge panel failed ({_jpe}), using keyword panel\n")
+
+            # #3: bound fan-out on small local models. With single-voice
+            # off, a wide panel makes an 8B reprocess the full injected
+            # context once per role — the dominant latency/quality cost.
+            # Cap to 2 roles + the synth role when n_ctx is small; large-
+            # context setups keep the full panel.
+            try:
+                if ce.get_n_ctx() <= 8192 and len(_keyword_panel) > 2:
+                    _trimmed = _keyword_panel[:2]
+                    if _synth_role not in _trimmed:
+                        _trimmed.append(_synth_role)
+                    if len(_trimmed) < len(_keyword_panel):
+                        self._set_judge(
+                            f"Small context ({ce.get_n_ctx()}) — trimmed panel "
+                            f"to {_trimmed} for speed.\n")
+                    _keyword_panel = _trimmed
+            except Exception:
+                pass
 
         # ── Personality-lead override ────────────────────────────
         # If the user names a specific personality ("with the writer as lead",
