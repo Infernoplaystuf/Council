@@ -579,6 +579,15 @@ class ApothecaryEngine:
                     raise TimeoutError(f"Command timed out after {timeout_s}s.")
                 time.sleep(0.05)
 
+            # #30: a fast-exiting command can have buffered output still
+            # in the channel when exit_status_ready() fires — drain it
+            # fully before assembling, or the JSON a probe returns gets
+            # truncated and the per-Pi model recommendation is wrong.
+            while chan.recv_ready():
+                stdout_chunks.append(chan.recv(4096).decode("utf-8", errors="replace"))
+            while chan.recv_stderr_ready():
+                stderr_chunks.append(chan.recv_stderr(4096).decode("utf-8", errors="replace"))
+
             rc = chan.recv_exit_status()
             stdout = "".join(stdout_chunks)
             stderr = "".join(stderr_chunks)

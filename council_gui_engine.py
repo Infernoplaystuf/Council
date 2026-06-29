@@ -4930,6 +4930,191 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         # block). They're not gated behind COUNCIL_ADVANCED — they're
         # what the Odysseus-council branch is for.
 
+        # ── #14: persistent bottom status bar (model · n_ctx · GPU) ──
+        try:
+            self._build_status_bar()
+        except Exception as _exc:
+            print(f"[council_gui] status bar build failed: {_exc!r}")
+        # ── #18: menu bar (File / Tools / Help) ──
+        try:
+            self._build_menu_bar()
+        except Exception as _exc:
+            print(f"[council_gui] menu bar build failed: {_exc!r}")
+        # ── #9: welcome empty-state in the Council transcript ──
+        try:
+            self._council_welcome()
+        except Exception as _exc:
+            print(f"[council_gui] welcome write failed: {_exc!r}")
+
+    # ---- Global status bar + menu (Batch D: discoverability) ----
+
+    def _build_status_bar(self) -> None:
+        """A always-visible bottom bar so the user can tell which model
+        is active, its context window, and whether the GPU is engaged —
+        the 'is it working / is it fast' question (#14)."""
+        bar = ttk.Frame(self)
+        bar.pack(side="bottom", fill="x")
+        ttk.Separator(self, orient="horizontal").pack(
+            side="bottom", fill="x")
+        self._statusbar_var = tk.StringVar(value="…")
+        ttk.Label(bar, textvariable=self._statusbar_var,
+                  foreground="#9aa0a6", anchor="w"
+                  ).pack(side="left", padx=8, pady=2)
+        self._refresh_status_bar()
+
+    def _refresh_status_bar(self) -> None:
+        """Recompute the bottom-bar text from the live backend state."""
+        if not hasattr(self, "_statusbar_var"):
+            return
+        bits = []
+        try:
+            import onboarding as _ob_sb
+            gp = _ob_sb.load_gguf_path(VAULT_DIR)
+            bits.append(f"Model: {Path(gp).name}" if gp else "Model: (none set)")
+        except Exception:
+            bits.append("Model: ?")
+        try:
+            import council_engine as _ce_sb
+            bits.append(f"ctx: {_ce_sb.n_ctx_status().get('n_ctx', '?')}")
+        except Exception:
+            pass
+        # GPU line — read the same probe council_engine logs at load.
+        try:
+            import torch as _t_sb
+            if _t_sb.cuda.is_available():
+                from llama_cpp import llama_supports_gpu_offload as _supp
+                gpu_on = bool(_supp())
+                name = _t_sb.cuda.get_device_name(0)
+                bits.append(f"GPU: {name}" if gpu_on else f"GPU: {name} (CPU infer)")
+            else:
+                bits.append("GPU: none (CPU)")
+        except Exception:
+            bits.append("GPU: CPU")
+        self._statusbar_var.set("   ·   ".join(bits))
+        # Refresh periodically so a model swap is reflected.
+        try:
+            self.after(8000, self._refresh_status_bar)
+        except Exception:
+            pass
+
+    def _build_menu_bar(self) -> None:
+        """File / Tools / Help menu — gives a re-entry to onboarding and
+        a zero-latency 'What can Anvil do?' (#18 / #22)."""
+        menubar = tk.Menu(self)
+        filem = tk.Menu(menubar, tearoff=0)
+        filem.add_command(label="Run first-run setup again…",
+                          command=self._menu_rerun_setup)
+        filem.add_separator()
+        filem.add_command(label="Quit", command=self.destroy)
+        menubar.add_cascade(label="File", menu=filem)
+
+        toolsm = tk.Menu(menubar, tearoff=0)
+        toolsm.add_command(label="🎲 Simulations",
+                           command=lambda: self._menu_select_tab("tab_simulations"))
+        toolsm.add_command(label="🛠 Godot Workspace",
+                           command=lambda: self._menu_select_tab("tab_godot_workspace"))
+        toolsm.add_command(label="🎨 Pixel Art",
+                           command=lambda: self._menu_select_tab("tab_pixel_art"))
+        toolsm.add_command(label="🔌 Council Network",
+                           command=lambda: self._menu_select_tab("tab_apoth"))
+        menubar.add_cascade(label="Tools", menu=toolsm)
+
+        helpm = tk.Menu(menubar, tearoff=0)
+        helpm.add_command(label="What can Anvil do?",
+                          command=self._menu_show_capabilities)
+        menubar.add_cascade(label="Help", menu=helpm)
+        try:
+            self.config(menu=menubar)
+        except Exception:
+            pass
+
+    def _menu_select_tab(self, attr: str) -> None:
+        tab = getattr(self, attr, None)
+        if tab is not None:
+            try:
+                self.nb.select(tab)
+            except Exception:
+                pass
+
+    def _menu_rerun_setup(self) -> None:
+        from tkinter import messagebox
+        try:
+            import onboarding as _ob
+            _ob.OnboardingWizard(self, VAULT_DIR)
+        except Exception as exc:
+            messagebox.showinfo(
+                "Setup",
+                "Could not open the setup wizard.\n"
+                f"({exc})\n\nYou can set the model via the backend "
+                "selector on the Council tab.", parent=self)
+
+    _STARTER_PROMPTS = [
+        "What can this app do?",
+        "I want to make a 2D top-down game — where do I start?",
+        "Build me a game from a GDD",
+        "Simulate a game and tune its difficulty",
+    ]
+
+    def _council_welcome(self) -> None:
+        """Greet a new user in the otherwise-blank Council transcript with
+        a one-line intro + clickable starter prompts, so the entrypoint
+        tab isn't a dead end (#9). Cleared on the first real send."""
+        tr = getattr(self, "transcript", None)
+        inp = getattr(self, "input", None)
+        if tr is None or inp is None:
+            return
+        try:
+            tr.configure(state="normal")
+            tr.insert("end", "Welcome to Anvil\n", ("who_default",))
+            tr.insert("end",
+                      "A local-AI workshop for building and tuning Godot "
+                      "games — plus a Council, Vault, Speech, and Council "
+                      "Network. Ask me anything, or try:\n\n", ("muted",))
+            for i, p in enumerate(self._STARTER_PROMPTS):
+                tag = f"starter{i}"
+                tr.insert("end", f"   →  {p}\n", (tag,))
+                tr.tag_configure(tag, foreground="#5aa9e6",
+                                 font=("Segoe UI", 10, "underline"))
+                tr.tag_bind(tag, "<Button-1>",
+                            lambda _e, t=p: self._council_use_starter(t))
+                tr.tag_bind(tag, "<Enter>",
+                            lambda _e: tr.configure(cursor="hand2"))
+                tr.tag_bind(tag, "<Leave>",
+                            lambda _e: tr.configure(cursor=""))
+            tr.insert("end", "\n")
+            tr.configure(state="disabled")
+            self._welcome_shown = True
+        except Exception:
+            pass
+
+    def _council_use_starter(self, prompt: str) -> None:
+        """Put a starter prompt in the input box (the user presses Send)."""
+        try:
+            self.input.delete("1.0", "end")
+            self.input.insert("1.0", prompt)
+            self.input.focus_set()
+        except Exception:
+            pass
+
+    def _menu_show_capabilities(self) -> None:
+        """Zero-latency 'About / What can Anvil do' panel (#22) — renders
+        the same canonical identity text the Council injects, so the
+        answer is instant and always discoverable."""
+        import tkinter as _tk
+        win = _tk.Toplevel(self)
+        win.title("What can Anvil do?")
+        win.configure(padx=14, pady=12)
+        txt = _tk.Text(win, wrap="word", width=78, height=24,
+                       bg="#0f0c0c", fg="#d4d4d4", font=("Segoe UI", 10),
+                       relief="flat")
+        try:
+            txt.insert("1.0", _APP_IDENTITY_TEXT)
+        except Exception:
+            txt.insert("1.0", "Anvil — a local-AI Godot game-dev workshop.")
+        txt.configure(state="disabled")
+        txt.pack(fill="both", expand=True)
+        ttk.Button(win, text="Close", command=win.destroy).pack(pady=(8, 0))
+
     # ---- Backend strip (model backend selector) ----
 
     _BACKEND_SETTINGS_FILENAME = "backend_settings.json"
@@ -16749,6 +16934,15 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         user_text = self.input.get("1.0", "end").strip()
         if not user_text:
             return
+        # #9: clear the one-time welcome empty-state on the first real send.
+        if getattr(self, "_welcome_shown", False):
+            try:
+                self.transcript.configure(state="normal")
+                self.transcript.delete("1.0", "end")
+                self.transcript.configure(state="disabled")
+            except Exception:
+                pass
+            self._welcome_shown = False
         # Recent-user-messages ring buffer for the referent resolver's
         # anaphor signal. Lives on self so it survives across turns.
         # Last 5 user messages is plenty — the resolver only scans the

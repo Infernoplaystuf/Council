@@ -1057,14 +1057,45 @@ class OnboardingWizard(tk.Toplevel):
         self._render_step()
 
     def _on_skip(self):
-        if not messagebox.askyesno(
-            "Skip setup?",
-            "Skipping means you'll need to set COUNCIL_GGUF_PATH manually "
-            "(or use the Browse… button on the Council tab) before any "
-            "query can be answered. Continue?",
-            parent=self,
-        ):
-            return
+        # #8: if no model is configured, don't drop the user into a dead,
+        # model-less app — offer to download the recommended one now.
+        have_model = False
+        try:
+            have_model = bool(load_gguf_path(self.vault_dir).strip())
+        except Exception:
+            have_model = False
+        if not have_model:
+            choice = messagebox.askyesnocancel(
+                "No model set",
+                "Anvil needs a local model to answer anything, and none is "
+                "set yet.\n\n"
+                "• Yes — download the recommended model now (one click)\n"
+                "• No  — skip anyway (set it later via Browse… on the "
+                "Council tab)\n"
+                "• Cancel — go back to setup",
+                parent=self,
+            )
+            if choice is None:           # Cancel — stay in the wizard
+                return
+            if choice:                    # Yes — auto-download the ★ default
+                try:
+                    import model_catalog as _mc2
+                    spec = _mc2.by_id(_mc2.DEFAULT_MODEL_ID)
+                    if spec is not None:
+                        self._auto_download(spec)
+                        return            # download runs; wizard stays open
+                except Exception as exc:
+                    messagebox.showinfo(
+                        "Download",
+                        f"Couldn't start the download ({exc}). You can pick "
+                        "a model from the list above instead.", parent=self)
+                    return
+            # No → fall through to the plain skip below.
+        else:
+            if not messagebox.askyesno(
+                "Skip setup?",
+                "You already have a model set. Close setup?", parent=self):
+                return
         self.skipped = True
         self.completed = False
         self._mark_onboarded()

@@ -1896,13 +1896,21 @@ the vocabulary list. Lowercase only. Single line only.
                 self.records = {}
 
     def save(self) -> None:
+        # #24: atomic write (temp + replace) so a crash mid-write can't
+        # corrupt the index, and SURFACE a failure instead of silently
+        # swallowing it — a vanished index that "saved fine" is worse
+        # than a visible warning.
         try:
-            self.index_path.write_text(
+            tmp = self.index_path.with_suffix(self.index_path.suffix + ".tmp")
+            tmp.write_text(
                 json.dumps(self.records, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
-        except Exception:
-            pass
+            os.replace(tmp, self.index_path)
+        except Exception as exc:
+            import sys as _sv
+            print(f"[VaultIndex] save FAILED ({self.index_path}): {exc!r}",
+                  file=_sv.stderr)
 
     # ---- build ----
     def rebuild(self, *, scope: Optional[Path] = None,
