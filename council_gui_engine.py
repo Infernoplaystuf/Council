@@ -14489,22 +14489,69 @@ class CouncilConsole(tk.Tk):
         ttk.Entry(frm, textvariable=folder_var, width=46).grid(
             row=4, column=1, sticky="w")
 
-        # Files the task is about — PRE-FILLED from filenames detected in the
-        # question, but EDITABLE so the run scopes to the right files even if
-        # detection missed them. Blank = summarise the whole folder.
-        ttk.Label(frm, text="Files (comma-separated; blank = whole folder):").grid(
-            row=5, column=0, sticky="w", pady=3)
-        files_var = tk.StringVar()
+        # ── Files to work on ─────────────────────────────────────
+        # AUTO-DETECTED from the message (often wrong/incomplete), but the
+        # user must confirm the scope: edit the list, add more files (a job
+        # can span several files), or explicitly choose the whole folder.
+        ttk.Label(frm, text="Files to work on\n(auto-detected — fix / add):",
+                  justify="left").grid(row=5, column=0, sticky="nw", pady=3)
+        files_frame = ttk.Frame(frm)
+        files_frame.grid(row=5, column=1, sticky="w")
+
+        files_lb = tk.Listbox(files_frame, height=4, width=34,
+                              selectmode="extended", exportselection=False)
+        files_lb.grid(row=0, column=0, rowspan=3, sticky="nw")
+        # Auto-detect pre-fill from the question.
         try:
             import vault_analyst as _va_pf
             _pf = _va_pf.resolve_filename_hints(
                 prefill, [data_index.input_dir(VAULT_DIR)])
-            _det = list(dict.fromkeys(r.name for _t, r in _pf if r is not None))
-            files_var.set(", ".join(_det))
+            for _f in dict.fromkeys(r.name for _t, r in _pf if r is not None):
+                files_lb.insert("end", _f)
         except Exception:
             pass
-        ttk.Entry(frm, textvariable=files_var, width=46).grid(
-            row=5, column=1, sticky="w")
+        # Every (non-hidden) file under data_in, for the Add dropdown.
+        _avail = []
+        try:
+            import os as _os_av
+            _ind = data_index.input_dir(VAULT_DIR)
+            for _dp, _dn, _fn in _os_av.walk(str(_ind)):
+                _dn[:] = [d for d in _dn
+                          if not d.startswith(".") and d != "deferred_results"]
+                _avail.extend(f for f in _fn if not f.startswith("."))
+            _avail = sorted(set(_avail))
+        except Exception:
+            _avail = []
+        add_var = tk.StringVar()
+        add_cb = ttk.Combobox(files_frame, textvariable=add_var, values=_avail,
+                              width=26, state="normal")
+        add_cb.grid(row=0, column=1, sticky="w", padx=(6, 0))
+
+        def _files_now():
+            return list(files_lb.get(0, "end"))
+
+        def _add_file(_e=None):
+            v = add_var.get().strip()
+            if v and v not in _files_now():
+                files_lb.insert("end", v)
+            add_var.set("")
+        add_cb.bind("<Return>", _add_file)
+        ttk.Button(files_frame, text="➕ Add", width=10,
+                   command=_add_file).grid(row=1, column=1, sticky="w",
+                                           padx=(6, 0))
+
+        def _remove_sel():
+            for i in reversed(files_lb.curselection()):
+                files_lb.delete(i)
+        ttk.Button(files_frame, text="✗ Remove", width=10,
+                   command=_remove_sel).grid(row=2, column=1, sticky="nw",
+                                             padx=(6, 0))
+
+        whole_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frm, variable=whole_var,
+            text="Apply to the WHOLE folder instead (ignore the file list)"
+        ).grid(row=6, column=1, sticky="w", pady=(2, 0))
 
         def _save():
             q = q_txt.get("1.0", "end").strip()
@@ -14512,20 +14559,17 @@ class CouncilConsole(tk.Tk):
                 messagebox.showwarning("Nothing to defer",
                                        "Describe what you want done first.")
                 return
-            try:
-                files = [f.strip() for f in
-                         files_var.get().replace(";", ",").split(",")
-                         if f.strip()]
+            if whole_var.get():
+                files = []                       # explicit whole-folder choice
+            else:
+                files = [f.strip() for f in _files_now() if f.strip()]
                 if not files:
-                    # Field was cleared — fall back to resolving from the
-                    # (possibly edited) question text.
-                    try:
-                        import vault_analyst as _va
-                        pairs = _va.resolve_filename_hints(
-                            q, [data_index.input_dir(VAULT_DIR)])
-                        files = [r.name for _tok, r in pairs if r is not None]
-                    except Exception:
-                        files = []
+                    messagebox.showwarning(
+                        "Choose the files",
+                        "Add at least one file to work on, or tick "
+                        "“Apply to the WHOLE folder”.")
+                    return
+            try:
                 _dt.DeferredTaskStore(VAULT_DIR).add(
                     kind=kind_map.get(kind_var.get(), _dt.KIND_OTHER),
                     question=q,
@@ -14549,7 +14593,7 @@ class CouncilConsole(tk.Tk):
             win.destroy()
 
         btns = ttk.Frame(frm)
-        btns.grid(row=6, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        btns.grid(row=7, column=0, columnspan=2, sticky="e", pady=(12, 0))
         ttk.Button(btns, text="Save", command=_save).pack(side="right")
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(
             side="right", padx=6)
