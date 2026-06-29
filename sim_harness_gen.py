@@ -121,6 +121,12 @@ const ENEMIES_NODE := "__ENEMIES_NODE__"    # scene node holding enemies
 const MOVE_SPEED := __MOVE_SPEED__          # AI player move speed (px/s)
 const CONTACT_BAND := __CONTACT_BAND__      # flee enemies closer than this
 const ENGAGE_BAND := __ENGAGE_BAND__        # seek toward enemies within this
+# Sim HP model — used so a game with no damage code still yields a real
+# survival signal. If the game DOES track HP (GameManager.hp), the
+# harness takes the lower of the two each tick.
+const STARTING_HP := 100.0                  # sim HP at run start
+const ENEMY_DAMAGE := 10.0                  # fallback contact dmg/sec per enemy
+const CONTACT_DMG_RADIUS := 30.0            # enemy within this hurts the player
 
 var fps: int = 30
 var cap: float = __DEFAULT_CAP__
@@ -139,6 +145,8 @@ var _min_hp: float = 1.0e9
 var _kills: int = 0
 var _heading: Vector2 = Vector2.RIGHT
 var _prev_enemy_count: int = 0
+var _sim_hp: float = 100.0
+var _any_damage: bool = false
 var _rng := RandomNumberGenerator.new()
 var _grace: float = 0.0
 
@@ -182,6 +190,7 @@ func _process(delta: float) -> bool:
 	_elapsed += delta
 	_grace += delta
 	_drive_player(delta)
+	_apply_contact_damage(delta)
 	_min_hp = minf(_min_hp, _player_hp())
 	# A short grace period stops a run ending on tick 0 before the
 	# scene has initialised its HP.
@@ -198,6 +207,7 @@ func _begin_run(cfg: Dictionary) -> void:
 	_min_hp = 1.0e9
 	_kills = 0
 	_prev_enemy_count = 0
+	_sim_hp = STARTING_HP
 	_rng.seed = int(cfg["seed"])
 	seed(int(cfg["seed"]))
 	_heading = Vector2.RIGHT.rotated(_rng.randf() * TAU)
@@ -299,6 +309,27 @@ func _drive_player(delta: float) -> void:
 	p.move_and_slide()
 
 
+# ----------------------------------------------------------------- damage model
+func _apply_contact_damage(delta: float) -> void:
+	# Fallback combat: any enemy within CONTACT_DMG_RADIUS drains sim HP.
+	# Damage/sec is the enemy's own `damage` export when it has one, else
+	# ENEMY_DAMAGE. Gives a real survival signal even for games whose
+	# enemies don't (yet) deal damage themselves.
+	var p = _player()
+	if p == null or not is_instance_valid(p):
+		return
+	var ppos: Vector2 = p.global_position
+	for e in _enemies():
+		if ppos.distance_to(e.global_position) < CONTACT_DMG_RADIUS:
+			var dmg = e.get("damage")
+			var per_sec: float = ENEMY_DAMAGE
+			if typeof(dmg) == TYPE_INT or typeof(dmg) == TYPE_FLOAT:
+				per_sec = float(dmg)
+			if per_sec > 0.0:
+				_sim_hp -= per_sec * delta
+				_any_damage = true
+
+
 # ----------------------------------------------------------------- state reads
 func _hp_node():
 	# Autoloads live under /root in -s mode IF Godot registered them.
@@ -323,7 +354,10 @@ func _read_num(keys: Array, default: float) -> float:
 
 
 func _player_hp() -> float:
-	return _read_num(["hp", "health", "player_hp"], 100.0)
+	# Authoritative sim HP, floored by the game's own HP when it tracks
+	# one (so a real damage model still counts).
+	var game_hp := _read_num(["hp", "health", "player_hp"], STARTING_HP)
+	return min(_sim_hp, game_hp)
 
 
 func _is_dead() -> bool:
@@ -353,6 +387,9 @@ func _is_victory() -> bool:
 func _finalize() -> void:
 	if _csv != null:
 		_csv.close()
+	if not _any_damage and _results.size() > 0:
+		print("[SIM] WARNING: no damage taken in any run — survival metrics ",
+			"are degenerate (enemies may be inert / out of reach).")
 	print("[SIM] DONE - ", _results.size(), " runs. Wrote sim_results.csv")
 
 
@@ -477,9 +514,12 @@ def build_sim_contract(spec: HarnessSpec) -> SimContract:
     """
     brain = "scripts/sim/Sim.gd"
     brain_knobs = {
-        "brain.MOVE_SPEED":   KnobTarget("brain", "const", name="MOVE_SPEED"),
-        "brain.CONTACT_BAND": KnobTarget("brain", "const", name="CONTACT_BAND"),
-        "brain.ENGAGE_BAND":  KnobTarget("brain", "const", name="ENGAGE_BAND"),
+        "brain.MOVE_SPEED":         KnobTarget("brain", "const", name="MOVE_SPEED"),
+        "brain.CONTACT_BAND":       KnobTarget("brain", "const", name="CONTACT_BAND"),
+        "brain.ENGAGE_BAND":        KnobTarget("brain", "const", name="ENGAGE_BAND"),
+        "brain.STARTING_HP":        KnobTarget("brain", "const", name="STARTING_HP"),
+        "brain.ENEMY_DAMAGE":       KnobTarget("brain", "const", name="ENEMY_DAMAGE"),
+        "brain.CONTACT_DMG_RADIUS": KnobTarget("brain", "const", name="CONTACT_DMG_RADIUS"),
     }
     value_knobs = {}
     for key, (rel_path, var_name) in (spec.value_exports or {}).items():

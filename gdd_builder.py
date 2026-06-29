@@ -101,6 +101,33 @@ def render_tscn(scene: ScenePlan,
     return "\n".join(lines)
 
 
+def _collect_ext_resources(scene: ScenePlan) -> List[Tuple[str, str, str]]:
+    """Walk a scene's NodeSpec tree and return one ``(id, "Script",
+    res://path)`` ext_resource per distinct ``node.script``, in
+    first-seen order. These feed ``render_tscn`` so every scripted node
+    resolves its ``script = ExtResource(...)`` line.
+    """
+    seen: Dict[str, bool] = {}
+    order: List[str] = []
+
+    def _walk(node: Optional[NodeSpec]) -> None:
+        if node is None:
+            return
+        if node.script and node.script not in seen:
+            seen[node.script] = True
+            order.append(node.script)
+        for child in node.children:
+            _walk(child)
+
+    _walk(scene.root)
+    out: List[Tuple[str, str, str]] = []
+    for i, path in enumerate(order, start=1):
+        stem = re.sub(r"[^A-Za-z0-9]+", "_",
+                      path.rsplit("/", 1)[-1].rsplit(".", 1)[0]) or "res"
+        out.append((f"{i}_{stem}", "Script", path))
+    return out
+
+
 def _emit_node(node: NodeSpec, lines: List[str], parent_path: str,
                  ext_resources: List[Tuple[str, str, str]]) -> None:
     if not node:
@@ -379,19 +406,23 @@ def build_from_plan(
     # ── Step 2: scenes ──
     # The demo_builder already wrote a main.tscn; we replace it
     # with our planned version. Multi-scene projects would append.
-    ext_resources_main = [
-        ("1_main", "Script", "res://scripts/main.gd"),
-    ]
+    # ext_resources are collected FROM the scene tree so every node
+    # with a script (the main controller + each inlined entity) gets a
+    # real [ext_resource] + `script = ExtResource(...)` line — without
+    # this the entity scripts are written but never attached, and the
+    # game runs as inert shapes.
     for scene in plan.scenes:
         scene_path = project_path / scene.file
         scene_path.parent.mkdir(parents=True, exist_ok=True)
         try:
+            ext_resources = _collect_ext_resources(scene)
             scene_path.write_text(
-                render_tscn(scene, ext_resources_main),
+                render_tscn(scene, ext_resources),
                 encoding="utf-8",
             )
             result.files_written.append(scene_path)
-            _emit("scene", f"  scene: {scene.file}")
+            _emit("scene",
+                  f"  scene: {scene.file} ({len(ext_resources)} script(s) wired)")
         except Exception as exc:
             result.notes.append(f"scene write failed for {scene.file}: {exc!r}")
 

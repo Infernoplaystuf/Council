@@ -340,6 +340,10 @@ def _inline_entity_node(entity: Entity, idx: int = 0) -> NodeSpec:
     node = NodeSpec(
         name=entity.name.split()[0],  # first word so " " doesn't break .tscn
         type=body_type, parent=".",
+        # Attach the entity's own script so the scene actually loads its
+        # behaviour at runtime (without this the body is an inert shape
+        # and the script file, even when Coder-filled, is never run).
+        script=f"res://scripts/{entity.slug}.gd",
         props={"position": f"Vector2({100 + idx * 80}, {200})"},
         children=[_placeholder_visual(entity, color)],
     )
