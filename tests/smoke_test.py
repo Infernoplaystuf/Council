@@ -2090,6 +2090,80 @@ def test_vram_aware_n_ctx_ladder_log_no_kwarg_collision() -> None:
         ce._available_gpu_bytes = prev
 
 
+def test_vault_collections() -> None:
+    """Virtual collections: store named file sets (paths normalised relative
+    to data_in, case-insensitive), add/remove/rename/delete, detect a name in
+    a query, and PROPOSE members from filename + value + relationship signals
+    (incl. a disparate file found only by value match).
+    """
+    import vault_collections as vc
+    import data_index
+    prev = os.environ.get("COUNCIL_VAULT_ROOT")
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["COUNCIL_VAULT_ROOT"] = td
+        try:
+            din = data_index.input_dir(Path(td))
+            din.mkdir(parents=True, exist_ok=True)
+            (din / "JobBlue_costs.csv").write_text("job_id,amount\nBLUE-1,1\n")
+            (din / "site_photo.png").write_text("img")
+            (din / "timesheet.csv").write_text("job_id,hours\nBLUE-1,8\n")
+            (din / "unrelated.csv").write_text("a,b\n1,2\n")
+
+            s = vc.CollectionStore()
+            c = s.upsert("Job Blue",
+                         ["JobBlue_costs.csv", din / "site_photo.png"])
+            _check("created with normalised relative paths",
+                   c.files == ["JobBlue_costs.csv", "site_photo.png"])
+            _check("get is case-insensitive", s.get("job blue") is not None)
+            _check("add_files grows the set",
+                   len(s.add_files("Job Blue", ["timesheet.csv"]).files) == 3)
+            _check("remove_files shrinks it",
+                   "site_photo.png" not in
+                   s.remove_files("Job Blue", ["site_photo.png"]).files)
+            _check("dedupes on re-add",
+                   len(s.add_files("Job Blue", ["timesheet.csv"]).files) == 2)
+            _check("find_in_text detects the name in a query",
+                   s.find_in_text("show me job blue please").name == "Job Blue")
+            _check("abs_paths resolves existing members",
+                   {p.name for p in s.abs_paths("Job Blue")}
+                   == {"JobBlue_costs.csv", "timesheet.csv"})
+            _check("rename works",
+                   s.rename("Job Blue", "Blue Job") and s.get("Blue Job"))
+            _check("delete works",
+                   s.delete("Blue Job") and s.get("Blue Job") is None)
+
+            # Discovery — filename only (no index).
+            fn = {r: (sc, rs) for r, sc, rs in vc.propose_members(None, "Job Blue")}
+            _check("filename match found JobBlue_costs.csv",
+                   "JobBlue_costs.csv" in fn)
+            _check("unrelated file not proposed", "unrelated.csv" not in fn)
+
+            # Discovery — with an index (value + relationship signals).
+            class _Idx:
+                def search_value(self, v):
+                    return ([{"file": str(din / "site_photo.png")}]
+                            if v.lower() == "job blue" else [])
+                def find_relationships(self):
+                    return [{"column": "job_id",
+                             "files": [str(din / "JobBlue_costs.csv"),
+                                       str(din / "timesheet.csv")]}]
+            res = {r: (sc, rs) for r, sc, rs in
+                   vc.propose_members(None, "Job Blue", index=_Idx())}
+            _check("value match finds the disparate photo",
+                   "site_photo.png" in res
+                   and "value match" in res["site_photo.png"][1])
+            _check("relationship expansion pulls in the joinable file",
+                   "timesheet.csv" in res
+                   and any("shares" in x for x in res["timesheet.csv"][1]))
+            _check("value match outranks filename match",
+                   res["site_photo.png"][0] > res["JobBlue_costs.csv"][0])
+        finally:
+            if prev is None:
+                os.environ.pop("COUNCIL_VAULT_ROOT", None)
+            else:
+                os.environ["COUNCIL_VAULT_ROOT"] = prev
+
+
 def test_deferred_tasks_store() -> None:
     """Deferred-task store: capture 'the model couldn't do this' tasks,
     list pending, run/complete/dismiss/reopen, coerce unknown kinds, and
@@ -2729,6 +2803,7 @@ def main() -> int:
     _run("analyst read-budget guard (OOM safety)", test_analyst_read_budget_guard)
     _run("Mongo BSON/JSON model-digestible convert", test_mongo_normalize_model_digestible)
     _run("Mongo streaming convert (bounded/OOM-safe)", test_mongo_stream_convert_bounded)
+    _run("vault collections (store + discovery)", test_vault_collections)
     _run("deferred-task store (capture/run/dismiss)", test_deferred_tasks_store)
     _run("model_downloader (OS dir, stream, verify)", test_model_downloader)
     _run("GPU-crash sentinel lifecycle (CPU auto-fallback)",
