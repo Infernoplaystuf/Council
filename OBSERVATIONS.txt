@@ -1,0 +1,35 @@
+================================================================================
+ DATA'S INFERNO / COUNCIL — RUNNING OBSERVATIONS LOG
+================================================================================
+ Purpose: capture things the user notices while USING the app, to triage and
+          address later. Not bugs-to-fix-now — a parking lot we revisit.
+ Format per entry:
+   [O#] <date> — <short title>          STATUS: OPEN | IN PROGRESS | DONE | WONTFIX
+     Observed:  what the user saw.
+     Notes:     initial hypothesis / where to look (added by Claude, unconfirmed).
+ Newest entries at the BOTTOM. Don't delete — mark DONE/WONTFIX with a note.
+================================================================================
+
+
+[O1] 2026-06-30 — "how many files are in the vault" feels slow      STATUS: OPEN
+  Observed:  Asking the count routes to the analyst's file-count, shows the
+             total number of files it can see, then "computes from data" and
+             then "reviews the matching files". The whole thing feels slow for
+             what is a trivial question.
+  Notes (unconfirmed): the deterministic file-count direct-route returns the
+             answer essentially instantly (a cheap os.walk census, no model).
+             So the slowness is almost certainly the layers AROUND it, not the
+             count:
+               1) the council still runs full model deliberation + Writer
+                  synthesis on top of the instant answer (model time, slow on
+                  CPU / a weak model), and
+               2) vault search / "[VAULT MATCH]" file-matching + injection may
+                  still run for the same query ("reviews the matching files").
+             Likely fixes to weigh later: for a pure file-count intent, skip the
+             vault-match pass and/or short-circuit to a terse direct reply
+             without a full multi-role deliberation. Confirm by watching the
+             [MODEL_CALL] / [DEBUG inject] console lines for where the time goes.
+
+================================================================================
+ END
+================================================================================
