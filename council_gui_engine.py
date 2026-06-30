@@ -2117,19 +2117,16 @@ def _run_analyst_step_impl(query):
         print('[analyst] import failed: ' + repr(_e), file=_sys_dbg.stderr)
         return None, None, notices
 
-    if not _va.looks_computational(query):
-        return None, None, notices
-
-    try:
-        allowed_folders = [data_index.input_dir(VAULT_DIR)]
-    except Exception:
-        allowed_folders = [VAULT_DIR]
-
     # ── Direct-route: PRECOMPUTED ANSWER from a deferred task ────────
     # If the user re-asks something they previously deferred to the Vault
     # tab and ran there, answer FROM that saved result instead of
     # recomputing — that is the whole point of "Defer to Vault": ask again
-    # later, get the answer. Highest priority so it wins over recompute.
+    # later, get the answer.
+    #
+    # This runs BEFORE the looks_computational gate on purpose: a re-asked
+    # deferred question must surface its saved answer even when the phrasing
+    # doesn't read as "computational" (e.g. "bigger summary of sales.csv"
+    # has no compute keyword and would otherwise be dropped here).
     try:
         import deferred_tasks as _dft
         _ans = _dft.DeferredTaskStore(VAULT_DIR).find_answered(query)
@@ -2165,6 +2162,16 @@ def _run_analyst_step_impl(query):
             print('[analyst] precomputed-answer load failed: ' + repr(_pe),
                   file=_sys_dbg.stderr)
             # fall through to normal routing if the saved file is unreadable
+
+    # No precomputed answer — only continue into the data routes when the
+    # question actually looks computational.
+    if not _va.looks_computational(query):
+        return None, None, notices
+
+    try:
+        allowed_folders = [data_index.input_dir(VAULT_DIR)]
+    except Exception:
+        allowed_folders = [VAULT_DIR]
 
     # ── Direct-intent shortcut for "true data summary" queries ──────
     # These map deterministically to folder_data_summary() — no model
