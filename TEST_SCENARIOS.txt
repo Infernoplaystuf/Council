@@ -19,6 +19,20 @@
    G(31), H.
    On a box WITH a working model (incl. the WSL machine): also do C(M rows),
    F(30), G(32), I, and the [M] analyst rows.
+
+ -- AUTOMATED PRE-CHECK (2026-06-30, Windows dev box, no model, UI driven
+    headlessly via real Tk handlers + real app launches) --------------------
+   PASS (verified):  A1 A2 A3 · B5 B6 B7 B8 · C10 C11 C12 C13 C14 C15 C16 C17 ·
+                     D18 D19(jsonl) D20 D21 D22 · E23 E24 E25 E26 ·
+                     F28 F29 · H34 H35 H36 · I38 I39
+   NOT verifiable here (need a model / internet / real UI click / WSL+GPU):
+                     A4(partial) · C9 · D19(.bson needs pymongo) · E27(online) ·
+                     F30 · G31(verify in app) · G32 · G33 · I37
+   Bug found + fixed by this pass: C15 (precomputed re-ask was gated behind
+                     looks_computational; a non-"computational" re-ask like
+                     "bigger summary of sales.csv" never reached the lookup).
+   NOTE: PASS here = the underlying code path/handler works headlessly. It does
+   NOT replace a real click-through in the running window or a real model run.
 ================================================================================
 
 
