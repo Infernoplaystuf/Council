@@ -154,6 +154,33 @@ I. GPU / CRASH RECOVERY (WSL-specific)                                      [M]
 
 
 --------------------------------------------------------------------------------
+J. USABILITY FEATURES (2026-06-30 batch)                                    [D]
+--------------------------------------------------------------------------------
+[ ] J40  [D] Ask "how many files in data_in" → answers INSTANTLY (status "●
+         direct"), no multi-role deliberation. "⤢ Expand with council" button
+         enables; clicking it re-runs the full council on the same question.
+[ ] J41  [D] ⚙ Engine → untick "Fast direct answers" → Save → the same question
+         now runs the full deliberation. Re-tick to restore instant answers.
+[ ] J42  [D] After a data answer, "Sources (click to preview)" chips appear;
+         clicking one opens a schema + first-rows PREVIEW (no model); the
+         preview's "Open containing folder" reveals the file.
+[ ] J43  [D] Force an error (e.g. tiny COUNCIL_GGUF_N_CTX so a query overflows)
+         → friendly guidance + a one-click fix chip (Open Engine settings /
+         Switch to CPU / Open Models), NOT a raw traceback.
+[ ] J44  [D] Vault tab → "🔍 Find files" → type a name or a value → results list;
+         double-click a result → preview. App-generated dirs are excluded.
+[ ] J45  [D] After an answer, "💾 Save answer" → writes a Markdown report
+         (question + answer + table + sources) into data_in/derived/.
+[ ] J46  [D] "🕘 History" → past questions (newest first); Re-ask runs one;
+         Copy / Clear all work.
+[ ] J47  [D] "💡 What can I ask?" → categorised examples; clicking one fills the
+         input box.
+[ ] J48  [D/M] First launch (delete vault/.onboarded) → wizard runs; the new
+         "Add your data" step imports a chosen folder into data_in and builds
+         the index; Finish. Skipping is allowed.
+
+
+--------------------------------------------------------------------------------
 NOTES / KNOWN GAPS  (update as you test)
 --------------------------------------------------------------------------------
   * The [M] rows can only be truly confirmed where a working .gguf is loaded —

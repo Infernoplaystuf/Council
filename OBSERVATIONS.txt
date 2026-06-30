@@ -11,7 +11,7 @@
 ================================================================================
 
 
-[O1] 2026-06-30 — "how many files are in the vault" feels slow      STATUS: OPEN
+[O1] 2026-06-30 — "how many files are in the vault" feels slow      STATUS: DONE
   Observed:  Asking the count routes to the analyst's file-count, shows the
              total number of files it can see, then "computes from data" and
              then "reviews the matching files". The whole thing feels slow for
@@ -29,6 +29,12 @@
              vault-match pass and/or short-circuit to a terse direct reply
              without a full multi-role deliberation. Confirm by watching the
              [MODEL_CALL] / [DEBUG inject] console lines for where the time goes.
+  Resolution (2026-06-30): added a FAST-ANSWER SHORT-CIRCUIT. When the analyst
+             direct-routes (file count, data/stats summary, fresh derived
+             result, or a saved collection), the answer is rendered instantly
+             with NO model call and NO multi-role deliberation; an "⤢ Expand
+             with council" button re-runs the full deliberation on demand.
+             Toggle in ⚙ Engine → "Fast direct answers" (default on).
 
 ================================================================================
  END
