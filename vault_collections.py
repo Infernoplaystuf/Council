@@ -225,6 +225,12 @@ class CollectionStore:
 # Discovery — propose which files belong to a named collection
 # ============================================================
 
+# App-generated output dirs under data_in — NOT source data, so they must
+# not be proposed as collection members (a collection's own summary lands in
+# deferred_results/ and would otherwise be suggested as its own member).
+_DISCOVER_SKIP_DIRS = {"deferred_results", "converted_mongo", "__pycache__"}
+
+
 def _slug(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (s or "").lower())
 
@@ -255,6 +261,10 @@ def propose_members(vault_dir: Optional[Any], term: str, *,
     def bump(rel: str, pts: float, reason: str) -> None:
         if not rel:
             return
+        # Never propose app-generated outputs (covers value/relationship
+        # signals too, not just the filename walk above).
+        if rel.split("/", 1)[0] in _DISCOVER_SKIP_DIRS:
+            return
         e = scores.setdefault(rel, [0.0, set()])
         e[0] += pts
         e[1].add(reason)
@@ -262,7 +272,8 @@ def propose_members(vault_dir: Optional[Any], term: str, *,
     # 1) filename / path match (walk data_in; no index needed)
     try:
         for dp, dn, fn in os.walk(str(in_dir)):
-            dn[:] = [d for d in dn if not d.startswith(".")]
+            dn[:] = [d for d in dn if not d.startswith(".")
+                     and d not in _DISCOVER_SKIP_DIRS]
             for f in fn:
                 if f.startswith("."):
                     continue

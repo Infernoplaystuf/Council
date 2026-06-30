@@ -2163,8 +2163,31 @@ def _run_analyst_step_impl(query):
                   file=_sys_dbg.stderr)
             # fall through to normal routing if the saved file is unreadable
 
-    # No precomputed answer — only continue into the data routes when the
-    # question actually looks computational.
+    # ── Direct-route: a saved COLLECTION named in the query ─────────
+    # "show me Job Blue" / "summarise the Job Blue files" — if the query
+    # names a saved collection, tell the council exactly which files make up
+    # that project so it answers about the whole set (and only that set).
+    # Runs before the looks_computational gate ("show me X" isn't a compute
+    # phrase). The Vault tab's Collections panel is where the set is built.
+    try:
+        import vault_collections as _vc_q
+        _coll = _vc_q.CollectionStore(VAULT_DIR).find_in_text(query)
+    except Exception:
+        _coll = None
+    if _coll is not None and len(_coll.name.strip()) >= 3 and _coll.files:
+        _flist = "\n".join(f"  - {f}" for f in _coll.files[:200])
+        _more = (f"\n  …(+{len(_coll.files) - 200} more)"
+                 if len(_coll.files) > 200 else "")
+        block = (f"[ANALYST RESULT — collection “{_coll.name}”]\n"
+                 f"# “{_coll.name}” is a saved collection the user grouped "
+                 f"together: {len(_coll.files)} file(s). When answering about "
+                 f"“{_coll.name}”, use ONLY these files:\n{_flist}{_more}")
+        notices.append(
+            f"Recognised the “{_coll.name}” collection — {len(_coll.files)} file(s).")
+        return block, None, notices
+
+    # No precomputed answer / collection — only continue into the data
+    # routes when the question actually looks computational.
     if not _va.looks_computational(query):
         return None, None, notices
 
@@ -10860,6 +10883,44 @@ class CouncilConsole(tk.Tk):
                   ).pack(anchor="w", padx=6, pady=(0, 4))
         self._vmgr_refresh_deferred()
 
+        # ── Collections (group disparate files into a project) ──
+        coll_lf = ttk.LabelFrame(left, text="📁 Collections (projects)")
+        coll_lf.pack(fill="both", expand=False, padx=4, pady=(0, 6))
+        ttk.Label(
+            coll_lf, foreground="#9a9a9a", justify="left", wraplength=400,
+            text="Group disparate files that belong together (e.g. “Job "
+                 "Blue”). New… lets the council propose members from name / "
+                 "value / shared-key signals; you confirm. Then the council "
+                 "can pull up or summarise the whole set."
+        ).pack(anchor="w", padx=6, pady=(4, 2))
+
+        self._coll_tree = ttk.Treeview(coll_lf, columns=("name", "n"),
+                                       show="headings", height=4)
+        self._coll_tree.heading("name", text="Collection")
+        self._coll_tree.heading("n", text="Files")
+        self._coll_tree.column("name", width=300, anchor="w")
+        self._coll_tree.column("n", width=60, anchor="center")
+        self._coll_tree.pack(fill="x", padx=6, pady=(0, 2))
+        self._coll_names = {}     # tree-iid -> collection name
+
+        crow = ttk.Frame(coll_lf)
+        crow.pack(fill="x", padx=6, pady=(0, 4))
+        ttk.Button(crow, text="➕ New…",
+                   command=self._vmgr_new_collection).pack(side="left")
+        ttk.Button(crow, text="✎ Edit",
+                   command=lambda: self._vmgr_new_collection(edit=True)
+                   ).pack(side="left", padx=4)
+        ttk.Button(crow, text="📊 Summarize",
+                   command=self._vmgr_summarize_collection).pack(side="left", padx=4)
+        ttk.Button(crow, text="✗ Delete",
+                   command=self._vmgr_delete_collection).pack(side="left", padx=4)
+        ttk.Button(crow, text="⟳",
+                   command=self._vmgr_refresh_collections).pack(side="left", padx=4)
+        self._coll_status = tk.StringVar(value="")
+        ttk.Label(coll_lf, textvariable=self._coll_status, foreground="#cba6f7",
+                  wraplength=400, justify="left").pack(anchor="w", padx=6, pady=(0, 4))
+        self._vmgr_refresh_collections()
+
         # ── Scraper section ───────────────────────────────────
         scrape_lf = ttk.LabelFrame(left, text="🌐 Web Scraper")
         scrape_lf.pack(fill="x", padx=4, pady=(0, 6))
@@ -12374,6 +12435,242 @@ class CouncilConsole(tk.Tk):
                     f"Run failed: {exc!r}"))
 
         _th.Thread(target=_worker, daemon=True).start()
+
+    # ── Collections (virtual projects over the vault) ───────────
+    def _vmgr_refresh_collections(self):
+        tree = getattr(self, "_coll_tree", None)
+        if tree is None:
+            return
+        try:
+            import vault_collections as _vc
+            cols = _vc.CollectionStore(VAULT_DIR).all()
+        except Exception as exc:
+            self._coll_status.set(f"Could not load collections: {exc!r}")
+            return
+        tree.delete(*tree.get_children())
+        self._coll_names = {}
+        for c in sorted(cols, key=lambda c: c.name.lower()):
+            iid = tree.insert("", "end", values=(c.name, len(c.files)))
+            self._coll_names[iid] = c.name
+        self._coll_status.set(
+            f"{len(cols)} collection(s)." if cols else
+            "No collections yet. ➕ New… groups files into a project.")
+
+    def _vmgr_selected_collection(self):
+        sel = self._coll_tree.selection()
+        if not sel:
+            self._coll_status.set("Select a collection first.")
+            return None
+        return self._coll_names.get(sel[0])
+
+    def _vmgr_delete_collection(self):
+        from tkinter import messagebox
+        name = self._vmgr_selected_collection()
+        if not name:
+            return
+        if not messagebox.askyesno(
+                "Delete collection",
+                f"Delete the collection “{name}”?\n(The files themselves are "
+                "NOT touched — this only removes the grouping.)"):
+            return
+        try:
+            import vault_collections as _vc
+            _vc.CollectionStore(VAULT_DIR).delete(name)
+        except Exception as exc:
+            self._coll_status.set(f"Delete failed: {exc!r}")
+            return
+        self._vmgr_refresh_collections()
+
+    def _vmgr_new_collection(self, edit: bool = False):
+        """Dialog: name a project, let the council DISCOVER candidate members
+        (name/value/shared-key signals), confirm/edit the set, and save it."""
+        import tkinter as tk
+        from tkinter import ttk, messagebox
+        import vault_collections as _vc
+        store = _vc.CollectionStore(VAULT_DIR)
+        existing = None
+        if edit:
+            nm = self._vmgr_selected_collection()
+            if not nm:
+                return
+            existing = store.get(nm)
+
+        win = tk.Toplevel(self)
+        win.title(f"Edit collection: {existing.name}" if existing
+                  else "New collection")
+        win.transient(self)
+        win.resizable(False, False)
+        frm = ttk.Frame(win, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(frm, foreground="#888", justify="left", wraplength=470,
+                  text="Name the project, then Discover to let the council "
+                       "propose members (by filename, by value match, and by "
+                       "shared join keys). Remove wrong ones, add missing "
+                       "files, then Save.").grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 8))
+
+        ttk.Label(frm, text="Name:").grid(row=1, column=0, sticky="w", pady=3)
+        name_var = tk.StringVar(value=existing.name if existing else "")
+        ttk.Entry(frm, textvariable=name_var, width=32).grid(
+            row=1, column=1, sticky="w")
+        ttk.Button(frm, text="🔎 Discover", command=lambda: _discover()).grid(
+            row=1, column=2, sticky="w", padx=6)
+
+        ttk.Label(frm, text="Files:").grid(row=2, column=0, sticky="nw", pady=3)
+        ff = ttk.Frame(frm)
+        ff.grid(row=2, column=1, columnspan=2, sticky="w")
+        lb = tk.Listbox(ff, height=8, width=46, selectmode="extended",
+                        exportselection=False)
+        lb.grid(row=0, column=0, rowspan=3, sticky="nw")
+        reasons: dict = {}
+
+        avail = []
+        try:
+            import os as _os_av
+            _ind = data_index.input_dir(VAULT_DIR)
+            for _dp, _dn, _fn in _os_av.walk(str(_ind)):
+                _dn[:] = [d for d in _dn if not d.startswith(".")]
+                for _f in _fn:
+                    if _f.startswith("."):
+                        continue
+                    avail.append(str(Path(_dp, _f).relative_to(_ind)
+                                     ).replace("\\", "/"))
+            avail = sorted(set(avail))
+        except Exception:
+            avail = []
+        add_var = tk.StringVar()
+        addcb = ttk.Combobox(ff, textvariable=add_var, values=avail,
+                             width=30, state="normal")
+        addcb.grid(row=0, column=1, sticky="w", padx=(6, 0))
+
+        def _files_now():
+            return list(lb.get(0, "end"))
+
+        def _add(_e=None):
+            v = add_var.get().strip()
+            if v and v not in _files_now():
+                lb.insert("end", v)
+            add_var.set("")
+        addcb.bind("<Return>", _add)
+        ttk.Button(ff, text="➕ Add", width=10, command=_add).grid(
+            row=1, column=1, sticky="w", padx=(6, 0))
+
+        def _rm():
+            for i in reversed(lb.curselection()):
+                lb.delete(i)
+        ttk.Button(ff, text="✗ Remove", width=10, command=_rm).grid(
+            row=2, column=1, sticky="nw", padx=(6, 0))
+
+        detail = tk.StringVar(value="")
+        ttk.Label(frm, textvariable=detail, foreground="#9a9a9a",
+                  wraplength=470, justify="left").grid(
+            row=3, column=1, columnspan=2, sticky="w")
+
+        def _on_sel(_e=None):
+            sel = lb.curselection()
+            if sel:
+                rel = lb.get(sel[0])
+                detail.set(f"{rel} — {reasons.get(rel, 'added manually')}")
+        lb.bind("<<ListboxSelect>>", _on_sel)
+
+        if existing:
+            for f in existing.files:
+                lb.insert("end", f)
+
+        def _discover():
+            nm = name_var.get().strip()
+            if not nm:
+                messagebox.showwarning("Name first",
+                                       "Enter a collection name to discover by.")
+                return
+            detail.set("Discovering…")
+
+            def _w():
+                try:
+                    idx = getattr(self, "data_index", None)
+                    props = _vc.propose_members(VAULT_DIR, nm, index=idx)
+                except Exception as exc:
+                    self.after(0, lambda: detail.set(f"Discover failed: {exc!r}"))
+                    return
+
+                def _apply():
+                    have = set(_files_now())
+                    added = 0
+                    for rel, sc, rs in props:
+                        reasons[rel] = ", ".join(rs)
+                        if rel not in have:
+                            lb.insert("end", rel)
+                            have.add(rel)
+                            added += 1
+                    detail.set(f"Proposed {len(props)} file(s) ({added} new) — "
+                               "select a row to see why; remove/add, then Save.")
+                self.after(0, _apply)
+            import threading as _th
+            _th.Thread(target=_w, daemon=True).start()
+
+        def _save():
+            nm = name_var.get().strip()
+            if not nm:
+                messagebox.showwarning("Name first", "Enter a collection name.")
+                return
+            files = _files_now()
+            if existing and existing.name != nm:
+                store.rename(existing.name, nm)
+            store.upsert(nm, files)
+            self._coll_status.set(
+                f"Saved “{nm}” — {len(files)} file(s). Ask the council: "
+                f"“show me {nm}”.")
+            self._vmgr_refresh_collections()
+            win.destroy()
+
+        btns = ttk.Frame(frm)
+        btns.grid(row=4, column=0, columnspan=3, sticky="e", pady=(12, 0))
+        ttk.Button(btns, text="Save", command=_save).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(
+            side="right", padx=6)
+
+    def _vmgr_summarize_collection(self):
+        """Profile every file in the selected collection (per-column) and
+        write the result to data_in/deferred_results/collection__<name>.csv."""
+        import threading as _th
+        name = self._vmgr_selected_collection()
+        if not name:
+            return
+        self._coll_status.set("Summarizing…")
+
+        def _w():
+            try:
+                import vault_collections as _vc
+                import vault_analyst as _va
+                import pandas as _pd
+                import re as _re
+                paths = _vc.CollectionStore(VAULT_DIR).abs_paths(name)
+                if not paths:
+                    self.after(0, lambda: self._coll_status.set(
+                        "No existing files in that collection."))
+                    return
+                frames = []
+                for p in paths:
+                    try:
+                        frames.append(_va.summarize_csv(p))
+                    except Exception:
+                        pass
+                df = (_pd.concat(frames, ignore_index=True)
+                      if frames else _pd.DataFrame())
+                out = data_index.input_dir(VAULT_DIR) / "deferred_results"
+                out.mkdir(parents=True, exist_ok=True)
+                slug = _re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") \
+                    or "collection"
+                op = out / f"collection__{slug}.csv"
+                df.to_csv(op, index=False)
+                self.after(0, lambda: self._coll_status.set(
+                    f"Summarized {len(paths)} file(s) → "
+                    f"data_in/deferred_results/{op.name}"))
+            except Exception as exc:
+                self.after(0, lambda: self._coll_status.set(
+                    f"Summarize failed: {exc!r}"))
+        _th.Thread(target=_w, daemon=True).start()
 
     def _vmgr_convert_mongo(self, scan_all: bool = False):
         """Convert a Mongo .bson/.json/.jsonl file (or every such file in the
