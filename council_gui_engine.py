@@ -399,6 +399,64 @@ def _smart_truncate_text(text: str, max_chars: int) -> tuple:
     return head + marker + tail, True
 
 
+def _coach_for_error(msg: str):
+    """Map a raw error / traceback string to plain-language guidance plus a
+    one-click fix. Returns ``dict(plain, action_label, action)`` for a
+    recognised failure, or ``None`` for an unrecognised one (the caller then
+    shows the raw error). Pure + UI-free so it's unit-testable.
+
+    Actions the GUI knows how to run: ``"engine"`` (open Engine settings),
+    ``"models"`` (open the Models tab), ``"cpu"`` (force CPU + retry).
+    """
+    m = (msg or "").lower()
+    # 1) Context-window overflow — the most common confusing failure on a
+    #    small model / 4K-ctx box ("exceeds max tokens").
+    if (("exceed" in m and ("context" in m or "token" in m))
+            or "requested tokens" in m
+            or "exceeds max tokens" in m
+            or "context window" in m):
+        return {
+            "plain": ("The question plus its data was larger than the model's "
+                      "context window. Raise the max context in Engine "
+                      "settings, or ask about fewer files at once."),
+            "action_label": "⚙ Open Engine settings",
+            "action": "engine",
+        }
+    # 2) GPU / CUDA failure — VRAM exhaustion, a driver fault, or a prior
+    #    core-dump sentinel. Degrade to CPU (slower but reliable).
+    if ("cuda" in m or "cublas" in m or "ggml_cuda" in m
+            or "device-side assert" in m
+            or ("gpu" in m and "memory" in m)):
+        return {
+            "plain": ("The GPU run failed — usually not enough VRAM. Switch "
+                      "the model to CPU (slower but reliable) and retry."),
+            "action_label": "Switch to CPU and retry",
+            "action": "cpu",
+        }
+    # 3) Model not loaded / missing file.
+    if (("llama" in m and ("failed" in m or "could not" in m or "load" in m))
+            or "no such file" in m
+            or "model not found" in m
+            or "council_gguf_path" in m
+            or ("gguf" in m and "not found" in m)):
+        return {
+            "plain": ("The model could not be loaded. Choose a model file, or "
+                      "download one that fits your hardware."),
+            "action_label": "🇺🇸 Open Models",
+            "action": "models",
+        }
+    # 4) Generic out-of-memory (CPU RAM).
+    if ("memoryerror" in m or "out of memory" in m
+            or "cannot allocate" in m):
+        return {
+            "plain": ("Ran out of memory. Try asking about fewer or smaller "
+                      "files, or switch to a smaller model."),
+            "action_label": "🇺🇸 Open Models",
+            "action": "models",
+        }
+    return None
+
+
 def _smart_truncate_block_to_tokens(block_text: str, max_tokens: int) -> str:
     """Truncate a rendered injection block to fit a per-block token cap.
 
@@ -9187,6 +9245,68 @@ class CouncilConsole(tk.Tk):
             except tk.TclError:
                 pass
 
+    def _run_coach_action(self, action):
+        """Execute a one-click fix offered by error coaching (see
+        _coach_for_error). Best-effort; never raises into the UI loop."""
+        try:
+            if action == "engine":
+                self._open_engine_settings()
+            elif action == "models":
+                if hasattr(self, "tab_models"):
+                    self.nb.select(self.tab_models)
+                else:
+                    self._append_transcript(
+                        "Council", "The Models tab isn't available in this "
+                        "build.", "observation")
+            elif action == "cpu":
+                # Pin model + embeddings to CPU, clear the GPU-crash sentinel
+                # (done inside _apply_engine_settings), then re-ask the last
+                # question so the user sees it actually work.
+                self._apply_engine_settings(
+                    n_ctx=os.environ.get("COUNCIL_GGUF_N_CTX", ""),
+                    gpu_layers="0", embed_device="cpu")
+                self._append_transcript(
+                    "Council", "Switched the model to CPU. Re-running your "
+                    "last question…", "observation")
+                q = (getattr(self, "_last_sent_query", "") or "").strip()
+                if q:
+                    self._set_text(self.input, q)
+                    self._send()
+        except Exception as e:
+            print(f"[coach action] {action} failed: {e!r}")
+
+    def _render_error_coach_button(self, coach):
+        """Render the clickable one-click-fix action for a coached error as an
+        underlined chip in the transcript (the plain guidance is shown
+        separately as an observation)."""
+        for widget in (getattr(self, "transcript", None),
+                       getattr(self, "dream3d_transcript", None)):
+            if widget is None:
+                continue
+            try:
+                widget.configure(state="normal")
+                widget.insert("end", "\nFix: ", "phase")
+                self._chip_seq = getattr(self, "_chip_seq", 0) + 1
+                tag = f"coach_{self._chip_seq}"
+                widget.tag_configure(tag, foreground="#a6e3a1", underline=True)
+                _act = coach.get("action", "")
+                widget.tag_bind(
+                    tag, "<Button-1>",
+                    lambda e, a=_act: self._run_coach_action(a))
+                widget.tag_bind(
+                    tag, "<Enter>",
+                    lambda e, w=widget: w.configure(cursor="hand2"))
+                widget.tag_bind(
+                    tag, "<Leave>",
+                    lambda e, w=widget: w.configure(cursor=""))
+                widget.insert("end",
+                              f" [ {coach.get('action_label', 'Fix')} ] ", tag)
+                widget.insert("end", "\n")
+                widget.see("end")
+                widget.configure(state="disabled")
+            except tk.TclError:
+                pass
+
     def _spec_refresh_pool_stats(self):
         """Show how many files are in the vault knowledge pool."""
         try:
@@ -16646,9 +16766,24 @@ class CouncilConsole(tk.Tk):
 
                 elif kind == "error":
                     _, msg = item
-                    self._append_transcript("ERROR", msg, "final")
-                    self.transcript.tag_add("error", "end-2l", "end")
-                    self._set_status("● error", "#f38ba8")
+                    _coach = _coach_for_error(msg)
+                    if _coach:
+                        # Friendly guidance + a one-click fix, with only the
+                        # LAST traceback line for the curious (full trace is in
+                        # conversation_logs). Non-technical users shouldn't face
+                        # a raw Python traceback.
+                        _last = (str(msg).strip().splitlines() or ["error"])[-1]
+                        self._append_transcript(
+                            "Council",
+                            "⚠ That didn't work. " + _coach["plain"]
+                            + f"\n(Technical detail: {_last[:200]})",
+                            "observation")
+                        self._render_error_coach_button(_coach)
+                        self._set_status("● needs attention", "#f9e2af")
+                    else:
+                        self._append_transcript("ERROR", msg, "final")
+                        self.transcript.tag_add("error", "end-2l", "end")
+                        self._set_status("● error", "#f38ba8")
 
         except queue.Empty:
             pass

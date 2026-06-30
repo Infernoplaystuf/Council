@@ -2392,6 +2392,43 @@ def test_provenance_source_resolve() -> None:
                 cge.VAULT_DIR = prev
 
 
+def test_error_coaching() -> None:
+    """_coach_for_error maps raw errors/tracebacks to plain-language guidance
+    plus a one-click fix action. Pure + UI-free, so directly unit-testable."""
+    try:
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_gui_engine importable (skipped: {exc!r})", True)
+        return
+    coach = cge._coach_for_error
+    # Context-window overflow -> Engine settings.
+    c = coach("ValueError: Requested tokens (5000) exceed context window of 4096")
+    _check("ctx overflow -> engine action",
+           c is not None and c["action"] == "engine")
+    c2 = coach("llama: this answer exceeds max tokens for the model")
+    _check("'exceeds max tokens' -> engine action",
+           c2 is not None and c2["action"] == "engine")
+    # GPU / CUDA -> switch to CPU.
+    c3 = coach("RuntimeError: CUDA error: out of memory (ggml_cuda)")
+    _check("CUDA failure -> cpu action",
+           c3 is not None and c3["action"] == "cpu")
+    # Model not loaded -> Models tab.
+    c4 = coach("RuntimeError: Llama() failed to load model: no such file")
+    _check("model load failure -> models action",
+           c4 is not None and c4["action"] == "models")
+    # Generic OOM -> Models (smaller model).
+    c5 = coach("MemoryError: cannot allocate 8.0 GiB")
+    _check("OOM -> models action",
+           c5 is not None and c5["action"] == "models")
+    # Unrecognised -> None (caller shows the raw error).
+    _check("unknown error -> no coaching",
+           coach("KeyError: 'frobnicate'") is None)
+    # Each coaching dict carries a human plain message + a button label.
+    for c in (c, c3, c4, c5):
+        _check("coaching has plain + action_label",
+               bool(c.get("plain")) and bool(c.get("action_label")))
+
+
 def test_model_downloader() -> None:
     """model_downloader: OS-aware dir, HF URL build, GGUF magic check,
     non-HF URL refusal, and a real streaming download (local server) with
@@ -2966,6 +3003,8 @@ def main() -> int:
          test_fast_answer_direct_route)
     _run("provenance source resolution (answer chips)",
          test_provenance_source_resolve)
+    _run("error coaching (plain-language + one-click fix)",
+         test_error_coaching)
     _run("model_downloader (OS dir, stream, verify)", test_model_downloader)
     _run("GPU-crash sentinel lifecycle (CPU auto-fallback)",
          test_gpu_crash_sentinel_lifecycle)
