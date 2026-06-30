@@ -1,0 +1,150 @@
+================================================================================
+ DATA'S INFERNO / COUNCIL — MANUAL FUNCTIONALITY TEST CHECKLIST
+================================================================================
+ Purpose: hands-on confirmation of features in the RUNNING app (the click-
+          through that automated/headless tests can't fully cover).
+ How to use: work an item, then mark it:  [x] pass   [F] fail (note why)   [-] skip
+ Living doc: add scenarios over time — append to the relevant section or add a
+             new one. Keep the legend + "where to test" tags consistent.
+
+ LEGEND
+   [D]  Deterministic — works WITHOUT a loaded .gguf model (testable on a box
+        with no model, e.g. the Windows dev machine).
+   [M]  Needs a loaded model (inference) — testable only where COUNCIL_GGUF_PATH
+        points at a working .gguf.
+   Status box: [ ] untested  ·  [x] pass  ·  [F] fail  ·  [-] skip / N/A
+
+ QUICK ROUTING
+   On a box with NO model: do sections A, B(D rows), C(D rows), D, E, F(set),
+   G(31), H.
+   On a box WITH a working model (incl. the WSL machine): also do C(M rows),
+   F(30), G(32), I, and the [M] analyst rows.
+================================================================================
+
+
+--------------------------------------------------------------------------------
+A. STARTUP & SHELL                                                          [D]
+--------------------------------------------------------------------------------
+[ ] A1  Launch via the normal launcher → main window appears (<~30s), no crash,
+        all expected tabs present.
+[ ] A2  Launch with NO model configured → app still opens and is usable; it does
+        not hang waiting on a model.
+[ ] A3  Launch with COUNCIL_GGUF_PATH pointing at a MISSING file → starts with a
+        clear "model not found" message, no crash.
+[ ] A4  Close the app normally → no error on shutdown. Relaunch → persisted
+        settings/state restored.
+
+
+--------------------------------------------------------------------------------
+B. ANALYST DIRECT-ROUTES (bounded, no model code-gen)
+--------------------------------------------------------------------------------
+[ ] B5  [D] Council: "how many files are in data_in" → instant exact count +
+        by-type breakdown. No "exceeds max tokens", no model code-gen.
+[ ] B6  [D] "give me a true data summary of the files" → one-row-per-file table.
+[ ] B7  [D] "summary of stats for the files" → per-column stats table.
+[ ] B8  [D/M] Folder with 200+ CSVs: ask for a summary/stats → completes with
+        bounded memory, NO OOM / crash.
+
+
+--------------------------------------------------------------------------------
+C. DEFER TO VAULT  (capture -> run -> reuse)
+--------------------------------------------------------------------------------
+[ ] C9   [M] Ask a question, get a weak answer → click "⤓ Defer to Vault" →
+         dialog opens pre-filled with your question.
+[ ] C10  [D] Files list AUTO-DETECTS the filename(s) mentioned in the question.
+[ ] C11  [D] Override: "✗ Remove" drops a wrongly-detected file. Add: "➕ Add"
+         dropdown lets you add more files (multi-file job).
+[ ] C12  [D] Save with NO files and "whole folder" UNticked → it WARNS (forces a
+         choice). Tick "whole folder" → save succeeds.
+[ ] C13  [D] Save → Vault tab "📋 Deferred tasks" lists the task.
+[ ] C14  [D] Select it → "▶ Run" → result CSV in data_in/deferred_results/ with a
+         DESCRIPTIVE name, scoped to ONLY the chosen file(s); task marked done.
+[ ] C15  [M] Re-ask the same/reworded question in Council → answered FROM the
+         saved result ("precomputed from a deferred task"), not recomputed.
+[ ] C16  [D] Defer a "Tool request" → saved but NOT auto-runnable (logged for dev).
+[ ] C17  [D] "✓ Done" / "✗ Dismiss" / "⟳ Refresh" behave correctly.
+
+
+--------------------------------------------------------------------------------
+D. MONGO CONVERTER (Vault tab)                                              [D]
+--------------------------------------------------------------------------------
+[ ] D18  .json Mongo export (with $oid/$date) → "Convert File" → clean CSV +
+         schema (+ optional digest) in data_in/converted_mongo/.
+[ ] D19  A .bson and a .jsonl file → convert correctly.
+[ ] D20  "Convert ALL in vault" → picks up every mongo file, skips its own outputs.
+[ ] D21  A LARGE dump (hundreds of MB / many docs) → converts with flat memory,
+         NO crash.
+[ ] D22  Canonical Extended JSON {"$date":{"$numberLong":...}} → renders as an ISO
+         date, not a dict string.
+
+
+--------------------------------------------------------------------------------
+E. MODELS TAB  (download step needs internet)                              [D]
+--------------------------------------------------------------------------------
+[ ] E23  Open "🇺🇸 Models" → hardware shown (GPU/VRAM/RAM); catalog ranked by fit,
+         fits-GPU flagged.
+[ ] E24  "⬆ Suggest upgrades" → banner says whether a stronger model fits; lists
+         suggestions (or "well-matched, no upgrade").
+[ ] E25  Switch Task (general / code / tiny) → list updates accordingly.
+[ ] E26  Select a model → details + HF repo/file shown; "Copy" works.
+[ ] E27  (Online) "⬇ Download & install" → confirms, streams with %, lands in the
+         OS models folder. "Download & switch" activates it.
+
+
+--------------------------------------------------------------------------------
+F. ENGINE SETTINGS (⚙ Engine)                            [D set / M effect]
+--------------------------------------------------------------------------------
+[ ] F28  ⚙ Engine → set Max context (e.g. 16384), GPU layers, Embed device →
+         Save → persists to backend_settings.json.
+[ ] F29  Restart → values restored (a shell/launcher env var still wins if set).
+[ ] F30  [M] With Max context set, a query that previously hit "exceeds max
+         tokens" now fits and answers.
+
+
+--------------------------------------------------------------------------------
+G. INDEX & VECTORIZE (Vault tab)
+--------------------------------------------------------------------------------
+[ ] G31  [D] "1. Build Keyword Index" → completes, file count reported.
+[ ] G32  [M] "2. Build Descriptions" (LLM) → per-file summaries generated.
+[ ] G33  [D/M] "3. Build Vector Embeddings" → completes (downloads embedder on
+         first run).
+
+
+--------------------------------------------------------------------------------
+H. ROBUSTNESS / ADVERSARIAL                                                 [D]
+--------------------------------------------------------------------------------
+[ ] H34  Vault with an empty (0-byte) CSV, a ragged CSV, and binary-as-.json →
+         summaries / stats / convert degrade gracefully, NO crash.
+[ ] H35  A protected dir (e.g. conversation_logs) → vault tools/search SKIP it
+         (don't read its contents).
+[ ] H36  Re-run the same expensive query twice → second is noticeably faster
+         (stats cache / query-report cache working).
+
+
+--------------------------------------------------------------------------------
+I. GPU / CRASH RECOVERY (WSL-specific)                                      [M]
+--------------------------------------------------------------------------------
+[ ] I37  WSL: launch, ask several questions → no core dump (embeddings pinned to
+         CPU).
+[ ] I38  If the GPU path DOES crash once → next launch auto-falls-back to CPU
+         ("previous GPU run did not complete"); the app starts.
+[ ] I39  ⚙ Engine → set GPU layers > 0 → clears the crash sentinel so a GPU retry
+         is actually attempted.
+
+
+--------------------------------------------------------------------------------
+NOTES / KNOWN GAPS  (update as you test)
+--------------------------------------------------------------------------------
+  * The [M] rows can only be truly confirmed where a working .gguf is loaded —
+    most critically C15 (precomputed re-ask), F30 (context fitting), and the
+    section-I GPU recovery on the WSL box.
+  * The biggest open risk is the WSL CUDA path: getting the model onto the GPU
+    needs a CUDA-matched llama-cpp build (see installs notes); until then it
+    runs CPU-only (slower) but should not core-dump (section I).
+  * Add new scenarios below this line over time:
+
+  ...
+
+================================================================================
+ END
+================================================================================
