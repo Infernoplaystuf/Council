@@ -2308,6 +2308,46 @@ def test_derived_results_store() -> None:
                 os.environ["COUNCIL_VAULT_ROOT"] = prev
 
 
+def test_fast_answer_direct_route() -> None:
+    """The analyst direct routes now emit a human __ANALYST_ANSWER__ headline
+    so the council's fast-answer short-circuit can reply instantly (no model
+    call). Verifies the file-count route returns a block + a headline notice
+    carrying the count, against a real temp vault. Importing the GUI module is
+    import-only (no Tk root is created), so it's safe headless."""
+    try:
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover - only if Tk import is broken
+        _check(f"council_gui_engine importable (skipped: {exc!r})", True)
+        return
+    import data_index
+    prev = getattr(cge, "VAULT_DIR", None)
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td)
+        din = data_index.input_dir(vault)
+        din.mkdir(parents=True, exist_ok=True)
+        for i in range(3):
+            (din / f"f{i}.csv").write_text("a,b\n1,2\n")
+        (din / "notes.json").write_text("{}")
+        try:
+            cge.VAULT_DIR = vault
+            block, err, notices = cge._run_analyst_step_impl(
+                "how many files are in data_in")
+            _check("file-count route returns a block", bool(block) and err is None)
+            _check("block is the file-count direct route",
+                   isinstance(block, str) and "file count" in block)
+            headline = next(
+                (n[len("__ANALYST_ANSWER__:"):] for n in (notices or [])
+                 if isinstance(n, str) and n.startswith("__ANALYST_ANSWER__:")),
+                None)
+            _check("emits an __ANALYST_ANSWER__ headline for the fast path",
+                   headline is not None)
+            _check("headline states the total (4 files)",
+                   headline is not None and "4 file(s)" in headline)
+        finally:
+            if prev is not None:
+                cge.VAULT_DIR = prev
+
+
 def test_model_downloader() -> None:
     """model_downloader: OS-aware dir, HF URL build, GGUF magic check,
     non-HF URL refusal, and a real streaming download (local server) with
@@ -2878,6 +2918,8 @@ def main() -> int:
     _run("deferred-task store (capture/run/dismiss)", test_deferred_tasks_store)
     _run("derived-results store (fingerprint/staleness/reuse)",
          test_derived_results_store)
+    _run("fast-answer direct route (analyst headline)",
+         test_fast_answer_direct_route)
     _run("model_downloader (OS dir, stream, verify)", test_model_downloader)
     _run("GPU-crash sentinel lifecycle (CPU auto-fallback)",
          test_gpu_crash_sentinel_lifecycle)

@@ -2160,6 +2160,11 @@ def _run_analyst_step_impl(query):
                     index=False, max_rows=80, max_cols=20))
             except Exception:
                 pass
+            notices.append(
+                "__ANALYST_ANSWER__:"
+                f"Reused a saved result that is still current "
+                f"({_rp.name}) — its source files are unchanged, so this "
+                f"was not recomputed (see the table above).")
             return block, None, notices
         except Exception as _pe:
             print('[analyst] precomputed-answer load failed: ' + repr(_pe),
@@ -2187,6 +2192,10 @@ def _run_analyst_step_impl(query):
                  f"“{_coll.name}”, use ONLY these files:\n{_flist}{_more}")
         notices.append(
             f"Recognised the “{_coll.name}” collection — {len(_coll.files)} file(s).")
+        notices.append(
+            "__ANALYST_ANSWER__:"
+            f"“{_coll.name}” is a saved collection of {len(_coll.files)} "
+            f"file(s):\n{_flist}{_more}")
         return block, None, notices
 
     # No precomputed answer / collection — only continue into the data
@@ -2273,6 +2282,11 @@ def _run_analyst_step_impl(query):
                 f"Analyst direct-routed to file count"
                 + (f" on subfolder {folder_name}" if _csub is not None else "")
                 + f" — {counts.get('total', 0)} file(s).")
+            notices.append(
+                "__ANALYST_ANSWER__:"
+                f"{folder_name} contains {counts.get('total', 0)} file(s) "
+                f"across {counts.get('folders', 0)} subfolder(s).\n"
+                f"By type: {breakdown}")
             return block, None, notices
         # Census failed → fall through to the model path.
 
@@ -2352,6 +2366,10 @@ def _run_analyst_step_impl(query):
             # __ANALYST_TABLE__ payload the model path uses.
             if rep.get("user_render"):
                 notices.append("__ANALYST_TABLE__:" + rep["user_render"])
+            notices.append(
+                "__ANALYST_ANSWER__:"
+                f"Here is a per-file data summary of {rep.get('n_files', 0)} "
+                f"file(s) — one row per file (see the table above).")
             return block, None, notices
         # Fall through to the model path if the direct call returned
         # nothing (empty folder, hint resolved to non-existent path, etc).
@@ -2447,6 +2465,11 @@ def _run_analyst_step_impl(query):
             )
             if srep.get("user_render"):
                 notices.append("__ANALYST_TABLE__:" + srep["user_render"])
+            notices.append(
+                "__ANALYST_ANSWER__:"
+                f"Here are per-column statistics across "
+                f"{srep.get('n_files', 0)} file(s) — one row per "
+                f"(file, column) (see the table above).")
             return block, None, notices
         # Empty result → fall through to the model path.
 
@@ -4558,7 +4581,13 @@ class CouncilConsole(tk.Tk):
         # Load persisted backend selection (Ollama vs. GGUF, model choice)
         # BEFORE the engine builds its model dispatcher. Applies to env vars
         # so council_engine.DEFAULT_MODELS picks the right values.
-        self._load_backend_settings()
+        _backend_cfg = self._load_backend_settings()
+        # Fast direct answers: when the analyst can answer deterministically
+        # (file count, summaries, a fresh derived result, a collection), skip
+        # the multi-role deliberation and reply instantly. Default ON; the
+        # Engine settings dialog persists the user's choice.
+        self._fast_answers_enabled = bool(
+            (_backend_cfg or {}).get("fast_answers", True))
         try:
             ce.refresh_backend_config()
         except Exception:
@@ -5238,9 +5267,22 @@ class CouncilConsole(tk.Tk):
                   text="cpu avoids GPU VRAM contention (recommended on WSL).").grid(
             row=6, column=1, sticky="w")
 
+        fast_var = tk.BooleanVar(
+            value=bool(getattr(self, "_fast_answers_enabled", True)))
+        ttk.Checkbutton(
+            frm, text="Fast direct answers (skip council for instant answers)",
+            variable=fast_var).grid(row=7, column=0, columnspan=2,
+                                    sticky="w", pady=(8, 0))
+        ttk.Label(frm, foreground="#888", justify="left",
+                  text="File counts, summaries, derived results and "
+                       "collections answer instantly with no model call.\n"
+                       "Use “⤢ Expand with council” on any answer for a "
+                       "fuller discussion.").grid(
+            row=8, column=0, columnspan=2, sticky="w")
+
         status = tk.StringVar(value="")
         ttk.Label(frm, textvariable=status, foreground="#a6e3a1").grid(
-            row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
+            row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
 
         def _apply():
             n = nctx_var.get().strip()
@@ -5254,17 +5296,19 @@ class CouncilConsole(tk.Tk):
                     return
             self._apply_engine_settings(
                 n_ctx=n, gpu_layers=g,
-                embed_device=("" if e == "auto" else e))
+                embed_device=("" if e == "auto" else e),
+                fast_answers=bool(fast_var.get()))
             status.set("Applied + saved. Model reloads on the next message.")
 
         btns = ttk.Frame(frm)
-        btns.grid(row=8, column=0, columnspan=2, sticky="e", pady=(12, 0))
+        btns.grid(row=10, column=0, columnspan=2, sticky="e", pady=(12, 0))
         ttk.Button(btns, text="Apply", command=_apply).pack(side="right")
         ttk.Button(btns, text="Close", command=win.destroy).pack(
             side="right", padx=6)
 
     def _apply_engine_settings(self, *, n_ctx: str = "", gpu_layers: str = "",
-                               embed_device: str = ""):
+                               embed_device: str = "",
+                               fast_answers: bool = None):
         """Set the engine env knobs (or clear them when blank), persist to
         backend_settings.json, and reset the engine so context / GPU-layer
         changes take effect on the next inference."""
@@ -5276,6 +5320,8 @@ class CouncilConsole(tk.Tk):
         _set("COUNCIL_GGUF_N_CTX", n_ctx)
         _set("COUNCIL_GGUF_GPU_LAYERS", gpu_layers)
         _set("COUNCIL_EMBED_DEVICE", embed_device)
+        if fast_answers is not None:
+            self._fast_answers_enabled = bool(fast_answers)
 
         import json as _j
         path = self._backend_settings_path()
@@ -5290,6 +5336,8 @@ class CouncilConsole(tk.Tk):
         existing["n_ctx"] = n_ctx
         existing["gpu_layers"] = gpu_layers
         existing["embed_device"] = embed_device
+        if fast_answers is not None:
+            existing["fast_answers"] = bool(fast_answers)
         try:
             path.write_text(_j.dumps(existing, indent=2), encoding="utf-8")
         except Exception as _e:
@@ -7723,6 +7771,12 @@ class CouncilConsole(tk.Tk):
         ttk.Button(btns, text="Clear", command=lambda: self._set_text(self.input, "")).pack(side="left", padx=6)
         ttk.Button(btns, text="⤓ Defer to Vault",
                    command=self._defer_to_vault).pack(side="left", padx=6)
+        # Enabled only after a fast (direct-route) answer — re-asks the SAME
+        # question through the full multi-role council for a prose discussion.
+        self._expand_btn = ttk.Button(
+            btns, text="⤢ Expand with council", state="disabled",
+            command=self._council_expand_with_council)
+        self._expand_btn.pack(side="left", padx=6)
 
         # License / trial badge — clickable to open activation dialog.
         # In DEMO_MODE the whole element is hidden since there's no
@@ -14485,6 +14539,23 @@ class CouncilConsole(tk.Tk):
         self._append_transcript("User", query)
         self._council_find_and_chart(query)
 
+    def _council_expand_with_council(self):
+        """Re-ask the last fast (direct-route) question through the FULL
+        multi-role council. The fast-answer short-circuit gave an instant
+        deterministic answer; this trades that speed for a prose discussion
+        when the user wants it. One-shot bypass via _force_full_council."""
+        q = (getattr(self, "_last_fast_question", "") or "").strip()
+        if not q:
+            return
+        try:
+            self._expand_btn.configure(state="disabled")
+        except Exception:
+            pass
+        self._force_full_council = True
+        self._last_fast_question = ""
+        self._set_text(self.input, q)
+        self._send()
+
     # ============================
     # Look Up — cross-file value/column search
     # ============================
@@ -15087,6 +15158,11 @@ class CouncilConsole(tk.Tk):
         user_text = self.input.get("1.0", "end").strip()
         if not user_text:
             return
+        # One-shot "Expand with council" bypass: capture + clear it here at the
+        # very top so it can't leak past an earlier fast-path return (chart /
+        # lookup) onto an unrelated later question.
+        _force_full = bool(getattr(self, "_force_full_council", False))
+        self._force_full_council = False
         self._last_sent_query = user_text   # saved for verdict disagree re-run
         self._set_text(self.input, "")
         self._append_transcript("User", user_text)
@@ -15225,6 +15301,10 @@ class CouncilConsole(tk.Tk):
         #     surface that as an "observation" too but with a clear
         #     "Analyst result table:" header so the user sees the
         #     actual numbers, not just the model's prose summary.
+        # A direct-route headline (file-count / summary / stats / precomputed
+        # / collection) that the fast-answer short-circuit below can render as
+        # the final answer WITHOUT any model call — that's the O1 speed win.
+        _fast_answer = None
         for _note in (_analyst_notices or []):
             if isinstance(_note, str) and _note.startswith("__ANALYST_TABLE__:"):
                 _table = _note[len("__ANALYST_TABLE__:"):]
@@ -15233,6 +15313,8 @@ class CouncilConsole(tk.Tk):
                     "Analyst result table:\n" + _table,
                     "observation",
                 )
+            elif isinstance(_note, str) and _note.startswith("__ANALYST_ANSWER__:"):
+                _fast_answer = _note[len("__ANALYST_ANSWER__:"):]
             else:
                 self._append_transcript("Council", _note, "observation")
         if _analyst_block and not _analyst_err:
@@ -15431,6 +15513,35 @@ class CouncilConsole(tk.Tk):
         if not was_injected and self._looks_like_lookup_question(original_user_text):
             self._council_run_lookup(original_user_text)
             self._set_status("● lookup", "#a6e3a1")
+            return
+
+        # ── Fast path: a deterministic analyst answer needs no council ─────
+        # When the analyst direct-routed (file count, data/stats summary, a
+        # fresh precomputed/derived result, or a named collection), the answer
+        # is already computed exactly — running the full multi-role
+        # deliberation + Writer synthesis on top only adds model latency (the
+        # O1 slowness). Render the answer immediately and offer an explicit
+        # "Expand with the council" button for a fuller, prose discussion.
+        # One-shot bypass: the Expand button set _force_full_council, captured
+        # into _force_full at the top of _send.
+        if (_fast_answer and not _analyst_err and not _force_full
+                and getattr(self, "_fast_answers_enabled", True)):
+            self._append_transcript("Writer", _fast_answer, "final")
+            # Remember the question so the Expand button can re-ask it through
+            # the full council without the user retyping anything.
+            self._last_fast_question = original_user_text
+            try:
+                self._expand_btn.configure(state="normal")
+            except Exception:
+                pass
+            self._append_transcript(
+                "Council",
+                "Answered directly from the data (no council deliberation, so "
+                "it's instant). Click “⤢ Expand with council” for a fuller "
+                "discussion.",
+                "observation",
+            )
+            self._set_status("● direct", "#a6e3a1")
             return
 
         # ── Personal Specialists: detect which (if any) to summon ──────
