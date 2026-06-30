@@ -200,7 +200,10 @@ def list_data_files(data_folder: Any, recursive: bool = True) -> List[Path]:
 
 # Internal/cache dirs that aren't user data — never counted as "files".
 _CENSUS_SKIP_DIRS = {".stats_cache", ".vault_index", "__pycache__",
-                     ".git", "conversation_logs"}
+                     ".git", "conversation_logs",
+                     # App-generated COMPUTED outputs — not source data, so a
+                     # file-count / data-summary should not inflate with them.
+                     "derived", "deferred_results"}
 
 
 def folder_file_counts(data_folder: Any, recursive: bool = True

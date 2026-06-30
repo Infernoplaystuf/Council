@@ -2127,15 +2127,18 @@ def _run_analyst_step_impl(query):
     # deferred question must surface its saved answer even when the phrasing
     # doesn't read as "computational" (e.g. "bigger summary of sales.csv"
     # has no compute keyword and would otherwise be dropped here).
+    # Reuse goes through the DerivedStore, which only returns a result whose
+    # SOURCES ARE UNCHANGED — so a precomputed average is never served after
+    # the underlying CSVs were edited (the staleness fix).
     try:
-        import deferred_tasks as _dft
-        _ans = _dft.DeferredTaskStore(VAULT_DIR).find_answered(query)
+        import derived_results as _dr
+        _ans = _dr.DerivedStore(VAULT_DIR).find_fresh(query)
     except Exception:
         _ans = None
-    if _ans is not None and _ans.result_path:
+    if _ans is not None and _ans.output:
         try:
             import pandas as _pd_pre
-            _rp = Path(_ans.result_path)
+            _rp = Path(_ans.output)
             _rdf = _pd_pre.read_csv(_rp)
             try:
                 _n_ctx_pre = ce.get_n_ctx()
@@ -2145,13 +2148,13 @@ def _run_analyst_step_impl(query):
                 _rdf, max_rows=300, max_chars=12000,
                 max_tokens=max(150, _n_ctx_pre // 4),
                 count_tokens=ce.estimate_tokens)
-            block = (f"[ANALYST RESULT — precomputed from a deferred task]\n"
-                     f"# This question was deferred to the Vault tab earlier and "
-                     f"computed there ({_ans.result_summary or 'saved result'}). "
-                     f"Answer from this saved result ({_rp.name}); do NOT recompute.\n"
+            block = (f"[ANALYST RESULT — precomputed (sources unchanged)]\n"
+                     f"# This was computed earlier ({_ans.operation or _ans.label}) "
+                     f"and its source files are UNCHANGED, so answer from this "
+                     f"saved result ({_rp.name}); do NOT recompute.\n"
                      f"{_ptable}")
             notices.append(
-                f"Used a precomputed answer from a deferred task — {_rp.name}.")
+                f"Reused a fresh precomputed result — {_rp.name}.")
             try:
                 notices.append("__ANALYST_TABLE__:" + _rdf.to_string(
                     index=False, max_rows=80, max_cols=20))
@@ -12366,8 +12369,12 @@ class CouncilConsole(tk.Tk):
                 # never find the saved result. This way, re-asking the same
                 # question surfaces it (see the precomputed-answer route in
                 # _run_analyst_step_impl).
-                out_dir = in_dir / "deferred_results"
-                out_dir.mkdir(parents=True, exist_ok=True)
+                # Computed outputs live in data_in/derived/ (searchable, but
+                # excluded from the source-data census) and are catalogued in
+                # the DerivedStore with their source fingerprint for
+                # staleness-safe reuse.
+                import derived_results as _drv
+                out_dir = _drv.derived_dir(VAULT_DIR)
                 # Human-readable filename derived from the task itself, not the
                 # opaque internal id. e.g. a "bigger summary of sales.csv" task
                 # over folder Q3 -> "summary__Q3__bigger_summary_of_sales__a1b2.csv".
@@ -12422,13 +12429,28 @@ class CouncilConsole(tk.Tk):
                 df.to_csv(op, index=False)
                 store.mark_done(task.id, result_path=str(op),
                                 result_summary=summary)
+                # Catalogue the computed output with its SOURCE FINGERPRINT so
+                # a future re-ask reuses it ONLY while the sources are unchanged
+                # (staleness-safe). The precomputed-answer route in
+                # _run_analyst_step_impl reads this via DerivedStore.find_fresh.
+                try:
+                    _srcs = ([str(p) for p in named_paths] if named_paths
+                             else [str(target)])
+                    _drv.DerivedStore(VAULT_DIR).record(
+                        label=(task.question or task.label() or _name),
+                        output=str(op), sources=_srcs,
+                        operation=task.kind,
+                        columns=[str(c) for c in df.columns],
+                        rows=int(len(df)))
+                except Exception:
+                    pass
                 # Refresh FIRST (it resets the status line), THEN show the
                 # completion message so it isn't immediately overwritten.
                 self.after(0, lambda: (
                     self._vmgr_refresh_deferred(),
                     self._defer_status.set(
                         f"Done — {summary} → {op.name} (in "
-                        "data_in/deferred_results/). Re-ask in the Council tab "
+                        "data_in/derived/). Re-ask in the Council tab "
                         "to use it.")))
             except Exception as exc:
                 self.after(0, lambda: self._defer_status.set(
@@ -12632,7 +12654,8 @@ class CouncilConsole(tk.Tk):
 
     def _vmgr_summarize_collection(self):
         """Profile every file in the selected collection (per-column) and
-        write the result to data_in/deferred_results/collection__<name>.csv."""
+        write the result to data_in/derived/collection__<name>.csv, recording
+        it in the DerivedStore so a re-ask reuses it while sources are fresh."""
         import threading as _th
         name = self._vmgr_selected_collection()
         if not name:
@@ -12658,15 +12681,24 @@ class CouncilConsole(tk.Tk):
                         pass
                 df = (_pd.concat(frames, ignore_index=True)
                       if frames else _pd.DataFrame())
-                out = data_index.input_dir(VAULT_DIR) / "deferred_results"
-                out.mkdir(parents=True, exist_ok=True)
+                import derived_results as _drv
+                out = _drv.derived_dir(VAULT_DIR)
                 slug = _re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") \
                     or "collection"
                 op = out / f"collection__{slug}.csv"
                 df.to_csv(op, index=False)
+                try:
+                    _drv.DerivedStore(VAULT_DIR).record(
+                        label=f"summary of the {name} collection",
+                        output=str(op), sources=[str(p) for p in paths],
+                        operation="collection_summary",
+                        columns=[str(c) for c in df.columns],
+                        rows=int(len(df)))
+                except Exception:
+                    pass
                 self.after(0, lambda: self._coll_status.set(
                     f"Summarized {len(paths)} file(s) → "
-                    f"data_in/deferred_results/{op.name}"))
+                    f"data_in/derived/{op.name}"))
             except Exception as exc:
                 self.after(0, lambda: self._coll_status.set(
                     f"Summarize failed: {exc!r}"))

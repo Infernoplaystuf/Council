@@ -228,7 +228,8 @@ class CollectionStore:
 # App-generated output dirs under data_in — NOT source data, so they must
 # not be proposed as collection members (a collection's own summary lands in
 # deferred_results/ and would otherwise be suggested as its own member).
-_DISCOVER_SKIP_DIRS = {"deferred_results", "converted_mongo", "__pycache__"}
+_DISCOVER_SKIP_DIRS = {"deferred_results", "derived", "converted_mongo",
+                       "__pycache__"}
 
 
 def _slug(s: str) -> str:

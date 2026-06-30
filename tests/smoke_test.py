@@ -2237,6 +2237,77 @@ def test_deferred_tasks_store() -> None:
                 os.environ["COUNCIL_VAULT_ROOT"] = prev
 
 
+def test_derived_results_store() -> None:
+    """DerivedStore: catalogue a computed output with its source fingerprint,
+    reuse it via find_fresh while sources are unchanged, REFUSE to reuse once a
+    source changes (staleness), recover after recompute, prune missing outputs,
+    and not match unrelated questions."""
+    import time as _t
+    import derived_results as dr
+    prev = os.environ.get("COUNCIL_VAULT_ROOT")
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["COUNCIL_VAULT_ROOT"] = td
+        try:
+            vault = Path(td)
+            src = vault / "data_in" / "sales.csv"
+            src.parent.mkdir(parents=True, exist_ok=True)
+            src.write_text("month,amount\njan,10\nfeb,20\n")
+
+            store = dr.DerivedStore(vault)
+            _check("starts with no derived results", store.all() == [])
+
+            # derived_dir lives under data_in/derived and is auto-created.
+            ddir = dr.derived_dir(vault)
+            _check("derived_dir is under data_in/derived",
+                   ddir.name == "derived" and ddir.parent.name == "data_in"
+                   and ddir.is_dir())
+
+            out = ddir / "avg_amount.csv"
+            out.write_text("avg_amount\n15\n")
+            store.record(label="average amount in sales.csv",
+                         output=str(out), sources=[str(src)],
+                         operation="avg(amount)", columns=["avg_amount"],
+                         rows=1)
+
+            # Fresh reuse: a matching question returns the saved result.
+            hit = store.find_fresh("what is the average amount in sales.csv")
+            _check("fresh result is reused", hit is not None
+                   and Path(hit.output) == out)
+            _check("recorded fingerprint is non-empty", bool(hit.source_fp))
+
+            # Unrelated question does not match.
+            _check("unrelated question does not match",
+                   store.find_fresh("how many customers are there") is None)
+
+            # Staleness: change the source -> the saved result is NOT served.
+            _t.sleep(1.1)   # ensure a different int(mtime)
+            src.write_text("month,amount\njan,10\nfeb,20\nmar,90\n")
+            _check("stale source blocks reuse",
+                   store.find_fresh("average amount in sales.csv") is None)
+
+            # Recompute over the new sources -> fresh again.
+            out.write_text("avg_amount\n40\n")
+            store.record(label="average amount in sales.csv",
+                         output=str(out), sources=[str(src)],
+                         operation="avg(amount)", rows=1)
+            _check("only one entry after re-record (replaced, not appended)",
+                   len(store.all()) == 1)
+            _check("recompute is fresh again",
+                   store.find_fresh("average amount in sales.csv") is not None)
+
+            # Deleted output -> not fresh, and prune_missing removes it.
+            out.unlink()
+            _check("deleted output is not served",
+                   store.find_fresh("average amount in sales.csv") is None)
+            _check("prune_missing drops the dead entry",
+                   store.prune_missing() == 1 and store.all() == [])
+        finally:
+            if prev is None:
+                os.environ.pop("COUNCIL_VAULT_ROOT", None)
+            else:
+                os.environ["COUNCIL_VAULT_ROOT"] = prev
+
+
 def test_model_downloader() -> None:
     """model_downloader: OS-aware dir, HF URL build, GGUF magic check,
     non-HF URL refusal, and a real streaming download (local server) with
@@ -2805,6 +2876,8 @@ def main() -> int:
     _run("Mongo streaming convert (bounded/OOM-safe)", test_mongo_stream_convert_bounded)
     _run("vault collections (store + discovery)", test_vault_collections)
     _run("deferred-task store (capture/run/dismiss)", test_deferred_tasks_store)
+    _run("derived-results store (fingerprint/staleness/reuse)",
+         test_derived_results_store)
     _run("model_downloader (OS dir, stream, verify)", test_model_downloader)
     _run("GPU-crash sentinel lifecycle (CPU auto-fallback)",
          test_gpu_crash_sentinel_lifecycle)
