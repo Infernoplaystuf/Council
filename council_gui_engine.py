@@ -399,6 +399,67 @@ def _smart_truncate_text(text: str, max_chars: int) -> tuple:
     return head + marker + tail, True
 
 
+def _text_peek(path, max_bytes: int = 4096) -> str:
+    """First ~max_bytes of a file decoded as text, or a binary note. Bounded."""
+    p = Path(path)
+    try:
+        data = p.read_bytes()[:max_bytes]
+    except Exception as e:
+        return f"(could not read: {e})"
+    try:
+        txt = data.decode("utf-8")
+    except Exception:
+        try:
+            txt = data.decode("utf-8", errors="replace")
+        except Exception:
+            try:
+                return f"(binary file, {p.stat().st_size} bytes)"
+            except Exception:
+                return "(binary file)"
+    return txt
+
+
+def _data_preview_text(path, max_rows: int = 50):
+    """Return ``(schema_text, rows_text)`` for a quick, MODEL-FREE preview of a
+    data file — column dtypes + the first ``max_rows`` rows. Bounded reads.
+    Best-effort across CSV/TSV/parquet/Excel/JSON; falls back to a short text
+    peek for anything non-tabular. Pure + UI-free so it's unit-testable."""
+    p = Path(path)
+    suf = p.suffix.lower()
+    try:
+        import pandas as pd
+    except Exception:
+        return ("(pandas unavailable — showing a raw text peek.)", _text_peek(p))
+    df = None
+    try:
+        if suf in (".csv", ".tsv", ".txt"):
+            sep = "\t" if suf == ".tsv" else None
+            df = pd.read_csv(p, nrows=max_rows, sep=sep, engine="python")
+        elif suf in (".parquet", ".pq"):
+            df = pd.read_parquet(p).head(max_rows)
+        elif suf in (".xlsx", ".xls"):
+            df = pd.read_excel(p, nrows=max_rows)
+        elif suf == ".json":
+            try:
+                df = pd.read_json(p).head(max_rows)
+            except Exception:
+                df = None
+    except Exception as e:
+        return (f"Could not parse {p.name} as a table: {e}", _text_peek(p))
+    if df is not None:
+        try:
+            schema_lines = [f"{c}: {t}"
+                            for c, t in df.dtypes.astype(str).items()]
+            schema = (f"{len(df.columns)} column(s) (dtypes from the first "
+                      f"{max_rows} rows):\n\n" + "\n".join(schema_lines))
+            rows = df.to_string(index=False, max_rows=max_rows, max_cols=40)
+            return (schema, rows)
+        except Exception:
+            pass
+    return ("Not a recognised table format — showing a raw text peek.",
+            _text_peek(p))
+
+
 def _coach_for_error(msg: str):
     """Map a raw error / traceback string to plain-language guidance plus a
     one-click fix. Returns ``dict(plain, action_label, action)`` for a
@@ -9208,6 +9269,48 @@ class CouncilConsole(tk.Tk):
                     out.append(cand)
         return out
 
+    def _preview_data_file(self, path):
+        """Quick, MODEL-FREE preview of a data file: schema (column dtypes) +
+        the first rows, in a popup. No inference, so it's instant and works
+        with no model loaded. Reachable from the answer source chips."""
+        import tkinter as tk
+        from tkinter import ttk
+        p = Path(path)
+        if not p.exists():
+            self._append_transcript(
+                "Council", f"That file no longer exists: {p.name}",
+                "observation")
+            return
+        try:
+            schema_txt, rows_txt = _data_preview_text(p)
+        except Exception as e:
+            schema_txt, rows_txt = (f"Preview failed: {e}", "")
+        win = tk.Toplevel(self)
+        win.title(f"Preview: {p.name}")
+        win.geometry("900x600")
+        try:
+            win.transient(self)
+        except Exception:
+            pass
+        info = ttk.Label(win, foreground="#888", anchor="w",
+                         text=f"{p}  ·  {p.stat().st_size:,} bytes")
+        info.pack(fill="x", padx=8, pady=(6, 0))
+        nb = ttk.Notebook(win)
+        nb.pack(fill="both", expand=True, padx=6, pady=6)
+        for label, txt in (("First rows", rows_txt), ("Schema", schema_txt)):
+            fr = ttk.Frame(nb)
+            nb.add(fr, text=label)
+            t = self._make_text(fr, wrap="none")
+            t.insert("1.0", txt or "(empty)")
+            t.configure(state="disabled")
+            t.pack(fill="both", expand=True)
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(btns, text="Open containing folder",
+                   command=lambda: self._reveal_file(str(p))).pack(side="left")
+        ttk.Button(btns, text="Close",
+                   command=win.destroy).pack(side="right")
+
     def _render_source_chips(self, raw_sources):
         """Render clickable source-file chips under the most recent answer.
         Each chip reveals the file in the OS file manager. No-op when there are
@@ -9221,7 +9324,7 @@ class CouncilConsole(tk.Tk):
                 continue
             try:
                 widget.configure(state="normal")
-                widget.insert("end", "\nSources (click to reveal): ", "phase")
+                widget.insert("end", "\nSources (click to preview): ", "phase")
                 for pp in paths[:12]:
                     self._chip_seq = getattr(self, "_chip_seq", 0) + 1
                     tag = f"srcchip_{self._chip_seq}"
@@ -9229,7 +9332,7 @@ class CouncilConsole(tk.Tk):
                                          underline=True)
                     widget.tag_bind(
                         tag, "<Button-1>",
-                        lambda e, q=str(pp): self._reveal_file(q))
+                        lambda e, q=str(pp): self._preview_data_file(q))
                     widget.tag_bind(
                         tag, "<Enter>",
                         lambda e, w=widget: w.configure(cursor="hand2"))

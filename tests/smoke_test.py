@@ -2392,6 +2392,40 @@ def test_provenance_source_resolve() -> None:
                 cge.VAULT_DIR = prev
 
 
+def test_data_preview_text() -> None:
+    """_data_preview_text gives a model-free (schema, rows) preview of a data
+    file with bounded reads, and falls back to a text peek for non-tabular
+    files. Pure + UI-free, so directly unit-testable."""
+    try:
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_gui_engine importable (skipped: {exc!r})", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        csv = d / "sales.csv"
+        csv.write_text("month,amount\njan,10\nfeb,20\nmar,30\n")
+        schema, rows = cge._data_preview_text(csv, max_rows=2)
+        _check("schema lists the columns",
+               "month" in schema and "amount" in schema)
+        _check("schema reports column count", "2 column(s)" in schema)
+        _check("rows preview shows data values", "jan" in rows)
+        _check("max_rows bounds the row preview", "mar" not in rows)
+
+        # Non-tabular file -> graceful text peek, no exception.
+        txt = d / "notes.md"
+        txt.write_text("# hello\nsome notes here\n")
+        s2, r2 = cge._data_preview_text(txt)
+        _check("non-tabular file previews without raising",
+               isinstance(s2, str) and "hello" in r2)
+
+        # _text_peek bounds its read and never raises on binary.
+        binf = d / "blob.bin"
+        binf.write_bytes(bytes(range(256)) * 100)
+        peek = cge._text_peek(binf, max_bytes=128)
+        _check("text peek is bounded", len(peek) <= 256)
+
+
 def test_error_coaching() -> None:
     """_coach_for_error maps raw errors/tracebacks to plain-language guidance
     plus a one-click fix action. Pure + UI-free, so directly unit-testable."""
@@ -3003,6 +3037,8 @@ def main() -> int:
          test_fast_answer_direct_route)
     _run("provenance source resolution (answer chips)",
          test_provenance_source_resolve)
+    _run("data preview (model-free schema + rows)",
+         test_data_preview_text)
     _run("error coaching (plain-language + one-click fix)",
          test_error_coaching)
     _run("model_downloader (OS dir, stream, verify)", test_model_downloader)
