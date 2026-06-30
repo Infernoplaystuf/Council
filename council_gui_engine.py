@@ -7962,6 +7962,8 @@ class CouncilConsole(tk.Tk):
         self._expand_btn.pack(side="left", padx=6)
         ttk.Button(btns, text="💾 Save answer",
                    command=self._save_council_answer).pack(side="left", padx=6)
+        ttk.Button(btns, text="🕘 History",
+                   command=self._show_question_history).pack(side="left", padx=6)
 
         # License / trial badge — clickable to open activation dialog.
         # In DEMO_MODE the whole element is hidden since there's no
@@ -15036,6 +15038,84 @@ class CouncilConsole(tk.Tk):
         self._append_transcript("User", query)
         self._council_find_and_chart(query)
 
+    def _show_question_history(self):
+        """Browse past Council questions and re-ask one with a click. Re-asks
+        are cheap + correct now that fresh derived results are reused."""
+        import tkinter as tk
+        from tkinter import ttk
+        try:
+            import question_history as _qh
+            store = _qh.QuestionHistory(VAULT_DIR)
+            items = store.recent(300)
+        except Exception:
+            store, items = None, []
+        win = tk.Toplevel(self)
+        win.title("Question history")
+        win.geometry("680x480")
+        try:
+            win.transient(self)
+        except Exception:
+            pass
+        ttk.Label(win, text=f"{len(items)} past question(s) — newest first",
+                  foreground="#888", anchor="w").pack(fill="x", padx=8,
+                                                      pady=(6, 0))
+        lb = tk.Listbox(win, bg="#231a1a", fg="#d4d4d4",
+                        selectbackground="#5a3030", relief="flat",
+                        font=("Consolas", 10))
+        lb.pack(fill="both", expand=True, padx=8, pady=8)
+        questions = []
+        for it in items:
+            q = str(it.get("q", "")).replace("\n", " ").strip()
+            questions.append(q)
+            lb.insert("end", q[:160] if q else "(blank)")
+        if not items:
+            lb.insert("end", "(no questions yet — ask something in the "
+                      "Council tab)")
+
+        def _selected():
+            sel = lb.curselection()
+            if not sel or sel[0] >= len(questions):
+                return None
+            return questions[sel[0]]
+
+        def _reask():
+            q = _selected()
+            if not q:
+                return
+            win.destroy()
+            self._set_text(self.input, q)
+            self._send()
+
+        lb.bind("<Double-Button-1>", lambda e: _reask())
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(btns, text="Re-ask", command=_reask).pack(side="left")
+
+        def _copy():
+            q = _selected()
+            if q:
+                try:
+                    self.clipboard_clear()
+                    self.clipboard_append(q)
+                except Exception:
+                    pass
+
+        ttk.Button(btns, text="Copy", command=_copy).pack(side="left", padx=6)
+
+        def _clear():
+            from tkinter import messagebox
+            if store is not None and messagebox.askyesno(
+                    "Clear history",
+                    "Remove all saved questions? This cannot be undone.",
+                    parent=win):
+                store.clear()
+                lb.delete(0, "end")
+                questions.clear()
+
+        ttk.Button(btns, text="Clear all", command=_clear).pack(side="left",
+                                                                padx=6)
+        ttk.Button(btns, text="Close", command=win.destroy).pack(side="right")
+
     def _save_council_answer(self):
         """Export the most recent answer (question + answer + any result table
         + sources) to a Markdown report. Defaults into data_in/derived/ so it
@@ -15710,6 +15790,12 @@ class CouncilConsole(tk.Tk):
         self._last_sent_query = user_text   # saved for verdict disagree re-run
         self._set_text(self.input, "")
         self._append_transcript("User", user_text)
+        # Log to the per-vault question history (browse + re-ask later).
+        try:
+            import question_history as _qh
+            _qh.QuestionHistory(VAULT_DIR).add(user_text)
+        except Exception:
+            pass
         self._clear_stream_box()
         # ── Specialist-model suggestion ─────────────────────────────────
         # If this task looks like a fit for an assigned specialist and the

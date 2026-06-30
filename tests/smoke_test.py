@@ -2392,6 +2392,39 @@ def test_provenance_source_resolve() -> None:
                 cge.VAULT_DIR = prev
 
 
+def test_question_history() -> None:
+    """QuestionHistory: append questions, skip immediate duplicates and
+    blanks, list newest-first, persist across instances, and clear."""
+    import question_history as qh
+    prev = os.environ.get("COUNCIL_VAULT_ROOT")
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["COUNCIL_VAULT_ROOT"] = td
+        try:
+            h = qh.QuestionHistory()
+            _check("starts empty", h.all() == [])
+            h.add("how many files are in data_in", ts=1.0)
+            h.add("how many files are in data_in", ts=2.0)  # immediate dup
+            h.add("   ", ts=3.0)                             # blank
+            h.add("average amount in sales.csv", ts=4.0)
+            _check("dedupes immediate duplicate + drops blank",
+                   len(h.all()) == 2)
+            recent = h.recent(10)
+            _check("recent is newest-first",
+                   recent[0]["q"] == "average amount in sales.csv")
+            _check("persists across instances",
+                   len(qh.QuestionHistory().all()) == 2)
+            # A non-immediate repeat IS allowed (asked again later).
+            h.add("how many files are in data_in", ts=5.0)
+            _check("non-adjacent repeat is kept", len(h.all()) == 3)
+            h.clear()
+            _check("clear empties the log", h.all() == [])
+        finally:
+            if prev is None:
+                os.environ.pop("COUNCIL_VAULT_ROOT", None)
+            else:
+                os.environ["COUNCIL_VAULT_ROOT"] = prev
+
+
 def test_answer_report_md() -> None:
     """_build_answer_report_md renders a council answer as Markdown with the
     question, answer, optional result table, and sources. Pure + UI-free."""
@@ -3095,6 +3128,8 @@ def main() -> int:
          test_fast_answer_direct_route)
     _run("provenance source resolution (answer chips)",
          test_provenance_source_resolve)
+    _run("question history (browse + re-ask)",
+         test_question_history)
     _run("answer report markdown (save answer)",
          test_answer_report_md)
     _run("instant filename search (no model)",
