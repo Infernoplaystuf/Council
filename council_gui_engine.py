@@ -10686,6 +10686,22 @@ class CouncilConsole(tk.Tk):
         ttk.Button(zi3, text="📦 Extract Zip to Vault",
                    command=self._vmgr_import_zip).pack(side="left")
 
+        # Row — BATCH zip import: a folder full of .zip files, extract them all
+        zb1 = ttk.Frame(import_lf)
+        zb1.pack(fill="x", padx=6, pady=(2, 2))
+        ttk.Label(zb1, text="Zip folder:", width=10).pack(side="left")
+        self._vmgr_zipdir_var = tk.StringVar()
+        ttk.Entry(zb1, textvariable=self._vmgr_zipdir_var,
+                  width=32).pack(side="left", padx=4)
+        ttk.Button(zb1, text="📂 Browse",
+                   command=self._vmgr_browse_zip_folder).pack(side="left")
+        zb2 = ttk.Frame(import_lf)
+        zb2.pack(fill="x", padx=6, pady=(2, 6))
+        ttk.Button(zb2, text="📦 Extract ALL zips in folder",
+                   command=self._vmgr_import_zip_folder).pack(side="left")
+        ttk.Label(zb2, text="(each zip → its own subfolder)",
+                  foreground="#5a3030").pack(side="left", padx=6)
+
         # Row — folder import
         fi1 = ttk.Frame(import_lf)
         fi1.pack(fill="x", padx=6, pady=(2, 2))
@@ -12446,6 +12462,81 @@ class CouncilConsole(tk.Tk):
                 self._vmgr_zip_subfolder_var.set("")
             except Exception as e:
                 self.ui_q.put(("vault_mgr_log", f"✗ Extraction failed: {e}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _vmgr_browse_zip_folder(self):
+        """Pick a folder that CONTAINS .zip files to batch-extract."""
+        from tkinter import filedialog
+        path = filedialog.askdirectory(
+            title="Select a folder containing .zip files")
+        if path:
+            self._vmgr_zipdir_var.set(path)
+
+    def _vmgr_import_zip_folder(self):
+        """Extract EVERY .zip found under the chosen folder (recursively) into
+        the vault — each zip into its own subfolder named after the zip. One
+        bad/corrupt zip is logged and skipped; the rest still import."""
+        import threading
+        folder = self._vmgr_zipdir_var.get().strip()
+        if not folder:
+            self._vmgr_append("✗ Pick a folder of zip files first.", "err")
+            return
+        src = Path(folder)
+        if not src.exists() or not src.is_dir():
+            self._vmgr_append(f"✗ Folder not found: {folder}", "err")
+            return
+
+        def worker():
+            import zipfile as _zf
+            try:
+                zips = sorted(src.rglob("*.zip"))
+            except Exception as e:
+                self.ui_q.put(("vault_mgr_log", f"✗ Could not scan folder: {e}"))
+                return
+            if not zips:
+                self.ui_q.put(("vault_mgr_log",
+                               f"No .zip files found under {src.name}."))
+                return
+            self.ui_q.put(("vault_mgr_log",
+                           f"Found {len(zips)} zip(s) under {src.name} — extracting…"))
+            ok = total_copied = failed = 0
+            used: set = set()
+            for i, zp in enumerate(zips, 1):
+                # Validate BEFORE extracting so a corrupt/.zip-misnamed file
+                # doesn't leave an empty subfolder behind.
+                if not _zf.is_zipfile(zp):
+                    failed += 1
+                    self.ui_q.put((
+                        "vault_mgr_log",
+                        f"  [{i}/{len(zips)}] ✗ {zp.name}: not a valid zip — skipped"))
+                    continue
+                # Unique subfolder per zip (two zips can share a stem).
+                sub = zp.stem
+                while sub in used:
+                    sub = f"{zp.stem}_{i}"
+                used.add(sub)
+                try:
+                    dest, copied, skipped = _vmgr_extract_zip(
+                        zp, vault_dir=VAULT_DIR, subfolder=sub,
+                        log_cb=lambda m: self.ui_q.put(("vault_mgr_log", m)))
+                    ok += 1
+                    total_copied += copied
+                    self.ui_q.put((
+                        "vault_mgr_log",
+                        f"  [{i}/{len(zips)}] ✓ {zp.name} → vault/{dest.name} "
+                        f"({copied} files, {skipped} skipped)"))
+                except Exception as e:
+                    failed += 1
+                    self.ui_q.put((
+                        "vault_mgr_log",
+                        f"  [{i}/{len(zips)}] ✗ {zp.name}: {e}"))
+            self.ui_q.put((
+                "vault_mgr_log",
+                f"Done — {ok}/{len(zips)} zip(s) extracted, {total_copied} "
+                f"files total" + (f", {failed} failed" if failed else "") + "."))
+            self.ui_q.put(("vault_mgr_refresh", None))
+            self._vmgr_zipdir_var.set("")
 
         threading.Thread(target=worker, daemon=True).start()
 
