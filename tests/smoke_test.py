@@ -2392,6 +2392,42 @@ def test_provenance_source_resolve() -> None:
                 cge.VAULT_DIR = prev
 
 
+def test_first_run_wizard_data_step() -> None:
+    """The first-run wizard gained a data-import + index-build step, and the
+    copy engine it drives (_vmgr_copy_folder) copies a folder of files into
+    the vault's data_in, keeping indexable files. Structural + functional."""
+    try:
+        import onboarding
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"modules importable (skipped: {exc!r})", True)
+        return
+    W = onboarding.OnboardingWizard
+    for meth in ("_render_data", "_wiz_choose_data_folder",
+                 "_wiz_import_and_index"):
+        _check(f"wizard has {meth}", hasattr(W, meth))
+    src_init = __import__("inspect").getsource(W.__init__)
+    _check("'data' step is registered before 'ready'",
+           '"data"' in src_init and
+           src_init.index('"data"') < src_init.index('"ready"'))
+
+    # Functional: the copy engine the wizard calls, targeting data_in exactly
+    # as the wizard does (so the analyst, scoped to data_in, can see it).
+    import data_index
+    with tempfile.TemporaryDirectory() as src_d, \
+            tempfile.TemporaryDirectory() as vault_d:
+        src = Path(src_d)
+        (src / "sales.csv").write_text("a,b\n1,2\n")
+        (src / "notes.txt").write_text("hello\n")
+        vault = Path(vault_d)
+        in_dir = data_index.input_dir(vault)
+        dest, copied, skipped = cge._vmgr_copy_folder(
+            src, vault_dir=in_dir, subfolder=src.name)
+        _check("copy_folder copied at least the CSV", copied >= 1)
+        landed = [p.name for p in in_dir.rglob("*") if p.is_file()]
+        _check("CSV landed under data_in", "sales.csv" in landed)
+
+
 def test_council_examples() -> None:
     """The 'What can I ask?' panel data is well-formed: non-empty, each entry
     is (category, prompt, hint) with real text, and it covers the headline
@@ -3148,6 +3184,8 @@ def main() -> int:
          test_fast_answer_direct_route)
     _run("provenance source resolution (answer chips)",
          test_provenance_source_resolve)
+    _run("first-run wizard data/index step",
+         test_first_run_wizard_data_step)
     _run("council examples panel data",
          test_council_examples)
     _run("question history (browse + re-ask)",

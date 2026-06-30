@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import platform
+import threading
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -337,7 +338,9 @@ class OnboardingWizard(_TkBase):
         #   3. Show a recommended install plan with one-click reuse.
         # The model + ready steps then preselect the recommendation.
         self._steps = ["welcome", "hardware", "previous_install",
-                       "plan", "disk", "model", "ready"]
+                       "plan", "disk", "model", "data", "ready"]
+        self._data_folder = ""          # folder the user chose to import
+        self._data_busy = False         # an import/index thread is running
         self._step_idx = 0
 
         self._build_ui()
@@ -1015,6 +1018,108 @@ class OnboardingWizard(_TkBase):
         self._clip_ok = ok
 
     # Step 4: ready
+    # Step 7: add data — pick a folder, copy into data_in, build the index.
+    def _render_data(self):
+        self._heading("Add your data (optional)")
+        self._label(
+            "Point the app at a folder of files (CSV, Excel, JSON, text, "
+            "PDFs, …). They're copied into the vault and indexed so the "
+            "Council can answer questions about them. You can also do this "
+            "anytime later from the Vault tab — skip if you're not ready.",
+            pady=(0, 10),
+        )
+        self._data_status_var = tk.StringVar(
+            value=(f"Selected: {self._data_folder}" if self._data_folder
+                   else "No folder chosen yet."))
+        row = tk.Frame(self.body, bg=self._theme()["bg"])
+        row.pack(fill="x", pady=(0, 8))
+        self._data_choose_btn = ttk.Button(
+            row, text="📁 Choose data folder…",
+            command=self._wiz_choose_data_folder)
+        self._data_choose_btn.pack(side="left")
+        self._data_import_btn = ttk.Button(
+            row, text="⬇ Import + build index",
+            command=self._wiz_import_and_index,
+            state=("normal" if self._data_folder else "disabled"))
+        self._data_import_btn.pack(side="left", padx=8)
+        tk.Label(self.body, textvariable=self._data_status_var,
+                 font=("Consolas", 10), bg=self._theme()["bg"],
+                 fg=self._theme()["fg"], wraplength=580, justify="left",
+                 anchor="w").pack(fill="x", pady=(4, 0))
+
+    def _wiz_choose_data_folder(self):
+        from tkinter import filedialog
+        path = filedialog.askdirectory(
+            title="Choose a folder of data to import", parent=self)
+        if not path:
+            return
+        self._data_folder = path
+        try:
+            self._data_status_var.set(f"Selected: {path}")
+            self._data_import_btn.configure(state="normal")
+        except Exception:
+            pass
+
+    def _wiz_import_and_index(self):
+        """Copy the chosen folder into data_in and rebuild the keyword index,
+        on a background thread so the wizard stays responsive."""
+        if self._data_busy or not self._data_folder:
+            return
+        self._data_busy = True
+        try:
+            self._data_import_btn.configure(state="disabled")
+            self._data_choose_btn.configure(state="disabled")
+            self.btn_next.configure(state="disabled")
+        except Exception:
+            pass
+
+        def _set(msg):
+            try:
+                self._data_status_var.set(msg)
+            except Exception:
+                pass
+
+        def _work():
+            try:
+                self.after(0, lambda: _set("Copying files into the vault…"))
+                import council_gui_engine as _cge
+                import data_index as _di
+                # Copy INTO data_in/<folder-name> so the analyst (which scopes
+                # to data_in) and the index both see the imported files.
+                _in = _di.input_dir(self.vault_dir)
+                dest, copied, skipped = _cge._vmgr_copy_folder(
+                    Path(self._data_folder), vault_dir=_in,
+                    subfolder=Path(self._data_folder).name)
+                self.after(0, lambda: _set(
+                    f"Copied {copied} file(s) (skipped {skipped}). "
+                    "Building the keyword index…"))
+                n = 0
+                try:
+                    import vault_index as _vi
+                    n = _vi.VaultIndex(self.vault_dir).rebuild()
+                except Exception as _ie:
+                    self.after(0, lambda ie=_ie: _set(
+                        f"Copied {copied} file(s); index build failed: {ie!r}. "
+                        "You can retry from the Vault tab."))
+                    return
+                self.after(0, lambda: _set(
+                    f"✓ Imported {copied} file(s) and indexed {n}. "
+                    "Click Next to finish."))
+            except Exception as exc:
+                self.after(0, lambda e=exc: _set(f"Import failed: {e!r}"))
+            finally:
+                self._data_busy = False
+                def _reenable():
+                    try:
+                        self._data_choose_btn.configure(state="normal")
+                        self._data_import_btn.configure(state="normal")
+                        self.btn_next.configure(state="normal")
+                    except Exception:
+                        pass
+                self.after(0, _reenable)
+
+        threading.Thread(target=_work, daemon=True).start()
+
     def _render_ready(self):
         self._heading("Ready.")
         # Show what we settled on so the user knows the chosen model
