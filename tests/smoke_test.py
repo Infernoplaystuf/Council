@@ -2348,6 +2348,50 @@ def test_fast_answer_direct_route() -> None:
                 cge.VAULT_DIR = prev
 
 
+def test_provenance_source_resolve() -> None:
+    """_resolve_source_paths normalises a mixed list of absolute paths,
+    vault-relative paths and bare filenames into existing absolute files,
+    de-duplicated, and drops things that don't exist. This is the engine
+    behind the answer-provenance chips. Called unbound (the method touches no
+    instance state) with the module VAULT_DIR patched to a temp vault."""
+    try:
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_gui_engine importable (skipped: {exc!r})", True)
+        return
+    import data_index
+    prev = getattr(cge, "VAULT_DIR", None)
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td)
+        din = data_index.input_dir(vault)
+        (din / "sub").mkdir(parents=True, exist_ok=True)
+        f_abs = din / "alpha.csv"
+        f_abs.write_text("a\n1\n")
+        f_nested = din / "sub" / "beta.csv"
+        f_nested.write_text("b\n2\n")
+        try:
+            cge.VAULT_DIR = vault
+            resolve = cge.CouncilConsole._resolve_source_paths
+            # absolute path, vault-relative path, bare name (nested), a
+            # nonexistent name, and a duplicate of the first.
+            raw = [str(f_abs), "sub/beta.csv", "alpha.csv",
+                   "does_not_exist.csv", str(f_abs)]
+            out = resolve(None, raw)
+            names = [p.name for p in out]
+            _check("resolves absolute + relative + bare name",
+                   "alpha.csv" in names and "beta.csv" in names)
+            _check("drops nonexistent sources",
+                   "does_not_exist.csv" not in names)
+            _check("de-duplicates repeated sources",
+                   names.count("alpha.csv") == 1)
+            _check("returns only existing files",
+                   all(p.exists() for p in out))
+            _check("empty input yields no chips", resolve(None, []) == [])
+        finally:
+            if prev is not None:
+                cge.VAULT_DIR = prev
+
+
 def test_model_downloader() -> None:
     """model_downloader: OS-aware dir, HF URL build, GGUF magic check,
     non-HF URL refusal, and a real streaming download (local server) with
@@ -2920,6 +2964,8 @@ def main() -> int:
          test_derived_results_store)
     _run("fast-answer direct route (analyst headline)",
          test_fast_answer_direct_route)
+    _run("provenance source resolution (answer chips)",
+         test_provenance_source_resolve)
     _run("model_downloader (OS dir, stream, verify)", test_model_downloader)
     _run("GPU-crash sentinel lifecycle (CPU auto-fallback)",
          test_gpu_crash_sentinel_lifecycle)

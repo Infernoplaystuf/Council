@@ -2165,6 +2165,14 @@ def _run_analyst_step_impl(query):
                 f"Reused a saved result that is still current "
                 f"({_rp.name}) — its source files are unchanged, so this "
                 f"was not recomputed (see the table above).")
+            # Source files behind this answer → provenance chips.
+            try:
+                import json as _js
+                _srcs = list(getattr(_ans, "sources", []) or [])
+                _srcs.append(str(_rp))
+                notices.append("__ANALYST_SOURCES__:" + _js.dumps(_srcs))
+            except Exception:
+                pass
             return block, None, notices
         except Exception as _pe:
             print('[analyst] precomputed-answer load failed: ' + repr(_pe),
@@ -2196,6 +2204,12 @@ def _run_analyst_step_impl(query):
             "__ANALYST_ANSWER__:"
             f"“{_coll.name}” is a saved collection of {len(_coll.files)} "
             f"file(s):\n{_flist}{_more}")
+        try:
+            import json as _js
+            notices.append("__ANALYST_SOURCES__:" + _js.dumps(
+                list(_coll.files or [])))
+        except Exception:
+            pass
         return block, None, notices
 
     # No precomputed answer / collection — only continue into the data
@@ -9078,6 +9092,101 @@ class CouncilConsole(tk.Tk):
         except Exception as e:
             print(f"[OpenFolder] Could not open {path}: {e}")
 
+    def _reveal_file(self, path):
+        """Reveal a single FILE in the OS file manager (selecting it where the
+        platform supports it). Unlike _open_in_filemanager this never creates
+        the path — it's for existing source files behind an answer."""
+        import subprocess, sys as _sys
+        try:
+            p = Path(path)
+            if not p.exists():
+                self._append_transcript(
+                    "Council", f"That source file no longer exists: {p.name}",
+                    "observation")
+                return
+            if _sys.platform == "win32":
+                # explorer needs the file as ONE argument after /select,
+                subprocess.Popen(f'explorer /select,"{p}"')
+            elif _sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", str(p)])
+            else:
+                subprocess.Popen(["xdg-open", str(p.parent)])
+        except Exception as e:
+            print(f"[reveal] could not reveal {path}: {e}")
+
+    def _resolve_source_paths(self, raw_sources):
+        """Normalise a mixed list of absolute paths / vault-relative paths /
+        bare filenames into existing absolute file paths, de-duplicated and
+        order-preserving. Bare names are resolved against the vault input dir
+        (searched recursively as a fallback). Returns a list of Path."""
+        try:
+            in_dir = data_index.input_dir(VAULT_DIR)
+        except Exception:
+            in_dir = VAULT_DIR
+        out, seen = [], set()
+        for s in (raw_sources or []):
+            if not s or not str(s).strip():
+                continue
+            cand = None
+            try:
+                pp = Path(str(s))
+                if pp.is_absolute() and pp.exists():
+                    cand = pp
+                elif (in_dir / str(s)).exists():
+                    cand = in_dir / str(s)
+                else:
+                    # bare filename — find the first match under the vault
+                    name = pp.name
+                    for hit in in_dir.rglob(name):
+                        if hit.is_file():
+                            cand = hit
+                            break
+            except Exception:
+                cand = None
+            if cand is not None:
+                key = str(cand.resolve()).lower()
+                if key not in seen:
+                    seen.add(key)
+                    out.append(cand)
+        return out
+
+    def _render_source_chips(self, raw_sources):
+        """Render clickable source-file chips under the most recent answer.
+        Each chip reveals the file in the OS file manager. No-op when there are
+        no resolvable sources, so non-data answers stay clean."""
+        paths = self._resolve_source_paths(raw_sources)
+        if not paths:
+            return
+        for widget in (getattr(self, "transcript", None),
+                       getattr(self, "dream3d_transcript", None)):
+            if widget is None:
+                continue
+            try:
+                widget.configure(state="normal")
+                widget.insert("end", "\nSources (click to reveal): ", "phase")
+                for pp in paths[:12]:
+                    self._chip_seq = getattr(self, "_chip_seq", 0) + 1
+                    tag = f"srcchip_{self._chip_seq}"
+                    widget.tag_configure(tag, foreground="#61afef",
+                                         underline=True)
+                    widget.tag_bind(
+                        tag, "<Button-1>",
+                        lambda e, q=str(pp): self._reveal_file(q))
+                    widget.tag_bind(
+                        tag, "<Enter>",
+                        lambda e, w=widget: w.configure(cursor="hand2"))
+                    widget.tag_bind(
+                        tag, "<Leave>",
+                        lambda e, w=widget: w.configure(cursor=""))
+                    widget.insert("end", f" 📄 {pp.name} ", tag)
+                if len(paths) > 12:
+                    widget.insert("end", f" (+{len(paths) - 12} more)")
+                widget.insert("end", "\n")
+                widget.see("end")
+                widget.configure(state="disabled")
+            except tk.TclError:
+                pass
+
     def _spec_refresh_pool_stats(self):
         """Show how many files are in the vault knowledge pool."""
         try:
@@ -15163,6 +15272,9 @@ class CouncilConsole(tk.Tk):
         # lookup) onto an unrelated later question.
         _force_full = bool(getattr(self, "_force_full_council", False))
         self._force_full_council = False
+        # Reset per-turn provenance so a later answer never shows last turn's
+        # source chips (set again after this turn's injection runs).
+        self._last_turn_sources = []
         self._last_sent_query = user_text   # saved for verdict disagree re-run
         self._set_text(self.input, "")
         self._append_transcript("User", user_text)
@@ -15305,6 +15417,7 @@ class CouncilConsole(tk.Tk):
         # / collection) that the fast-answer short-circuit below can render as
         # the final answer WITHOUT any model call — that's the O1 speed win.
         _fast_answer = None
+        _analyst_sources: list = []
         for _note in (_analyst_notices or []):
             if isinstance(_note, str) and _note.startswith("__ANALYST_TABLE__:"):
                 _table = _note[len("__ANALYST_TABLE__:"):]
@@ -15315,6 +15428,13 @@ class CouncilConsole(tk.Tk):
                 )
             elif isinstance(_note, str) and _note.startswith("__ANALYST_ANSWER__:"):
                 _fast_answer = _note[len("__ANALYST_ANSWER__:"):]
+            elif isinstance(_note, str) and _note.startswith("__ANALYST_SOURCES__:"):
+                try:
+                    import json as _js_src
+                    _analyst_sources = list(
+                        _js_src.loads(_note[len("__ANALYST_SOURCES__:"):]) or [])
+                except Exception:
+                    _analyst_sources = []
             else:
                 self._append_transcript("Council", _note, "observation")
         if _analyst_block and not _analyst_err:
@@ -15382,6 +15502,23 @@ class CouncilConsole(tk.Tk):
         _has_folder = any(lbl.startswith("[FOLDER:") for lbl in _labels)
         _has_nodata = any(lbl.startswith("[NO DATA AVAILABLE") for lbl in _labels)
         was_injected = bool(_has_vault or _has_file or _has_folder or _has_nodata)
+        # ── Provenance: the source files behind this turn's answer ──────────
+        # Assembled from (a) the analyst's own sources (derived result inputs,
+        # collection members), (b) vault-match / file / folder injection
+        # labels, and (c) files the user named explicitly. Rendered as
+        # clickable chips under the final answer (fast path + deliberation).
+        _turn_sources: list = list(_analyst_sources)
+        for _lbl in _labels:
+            _m = _re.match(
+                r"\[(?:VAULT MATCH(?:\s*\(pinned\))?|FILE|FOLDER):\s*(.+?)\]",
+                _lbl)
+            if _m:
+                _turn_sources.append(_m.group(1).strip())
+        try:
+            _turn_sources.extend(_extract_file_paths(original_user_text))
+        except Exception:
+            pass
+        self._last_turn_sources = _turn_sources
         if was_injected:
             # Filter out empty names (Path("/").name == "" etc) so we don't
             # render "Reading: , , " on edge-case paths.
@@ -15527,6 +15664,7 @@ class CouncilConsole(tk.Tk):
         if (_fast_answer and not _analyst_err and not _force_full
                 and getattr(self, "_fast_answers_enabled", True)):
             self._append_transcript("Writer", _fast_answer, "final")
+            self._render_source_chips(getattr(self, "_last_turn_sources", []))
             # Remember the question so the Expand button can re-ask it through
             # the full council without the user retyping anything.
             self._last_fast_question = original_user_text
@@ -16276,6 +16414,15 @@ class CouncilConsole(tk.Tk):
                         # Finalised — clear stream buffer for this speaker
                         self._stream_buffers.pop(ev.who, None)
                         self._append_transcript(ev.who, ev.text, "final")
+                        # Provenance chips under the Writer's final answer —
+                        # the source files that fed this turn (assembled in
+                        # _send as self._last_turn_sources).
+                        if ev.who == "Writer":
+                            try:
+                                self._render_source_chips(
+                                    getattr(self, "_last_turn_sources", []))
+                            except Exception:
+                                pass
                     elif ev.kind in ("observation", "action"):
                         self._append_transcript(ev.who, ev.text, ev.kind)
                     # "thought" and "token" events are lightweight; skip transcript
