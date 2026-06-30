@@ -3858,6 +3858,43 @@ def _vmgr_clone_repo(
     return dest_dir
 
 
+# ── Shared import filters (zip + folder import both use these) ──────────
+# Widened from the original code-repo allow-list to include the DATA formats
+# the analyst actually reads (Excel / Parquet / SQLite / DuckDB / BSON / TSV
+# / NDJSON / images / PDF), so importing a zip or folder of data isn't lossy.
+_IMPORT_INDEXABLE = {
+    # text / code / config
+    ".py", ".md", ".txt", ".json", ".yaml", ".yml", ".html", ".rst",
+    ".csv", ".log", ".toml", ".ini", ".xml", ".cfg", ".conf", ".tex",
+    ".r", ".m", ".ipynb",
+    # tabular / structured data the analyst reads
+    ".tsv", ".xlsx", ".xls", ".xlsm", ".parquet", ".feather", ".orc",
+    ".arrow", ".db", ".sqlite", ".sqlite3", ".duckdb", ".bson",
+    ".jsonl", ".ndjson", ".gz",
+    # images (parsed for metadata / vision)
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff",
+    # documents
+    ".pdf",
+}
+_IMPORT_SKIP_DIRS = {"__pycache__", "node_modules", ".git", ".venv", "venv",
+                     "dist", "build", ".eggs", ".tox", ".idea", ".vscode"}
+
+
+def _import_max_bytes() -> int:
+    """Max size of a SINGLE file kept on import — a runaway guard, NOT a data
+    limit. Default 1 GiB (vs the old 500 KB, which silently dropped any real
+    data file). Override with COUNCIL_IMPORT_MAX_MB; set it very high to
+    effectively disable the cap."""
+    import os as _os
+    ov = _os.environ.get("COUNCIL_IMPORT_MAX_MB", "").strip()
+    if ov:
+        try:
+            return max(1, int(ov)) * 1024 * 1024
+        except ValueError:
+            pass
+    return 1024 * 1024 * 1024
+
+
 def _vmgr_extract_zip(
     zip_path: Path,
     *,
@@ -3877,14 +3914,9 @@ def _vmgr_extract_zip(
         if log_cb: log_cb(m)
         else: print(m)
 
-    INDEXABLE = {
-        ".py", ".md", ".txt", ".json", ".yaml", ".yml",
-        ".html", ".rst", ".csv", ".log", ".toml", ".ini",
-        ".xml", ".cfg", ".conf", ".tex", ".r", ".m", ".ipynb",
-    }
-    SKIP_DIRS = {"__pycache__", "node_modules", ".git", ".venv", "venv",
-                 "dist", "build", ".eggs", ".tox"}
-    MAX_BYTES = 500_000
+    INDEXABLE = _IMPORT_INDEXABLE
+    SKIP_DIRS = _IMPORT_SKIP_DIRS
+    MAX_BYTES = _import_max_bytes()
 
     if not subfolder:
         subfolder = zip_path.stem
@@ -3946,14 +3978,9 @@ def _vmgr_copy_folder(
         if log_cb: log_cb(m)
         else: print(m)
 
-    INDEXABLE = {
-        ".py", ".md", ".txt", ".json", ".yaml", ".yml",
-        ".html", ".rst", ".csv", ".log", ".toml", ".ini",
-        ".xml", ".cfg", ".conf", ".tex", ".r", ".m", ".ipynb",
-    }
-    SKIP_DIRS = {"__pycache__", "node_modules", ".git", ".venv", "venv",
-                 "dist", "build", ".eggs", ".tox", ".idea", ".vscode"}
-    MAX_BYTES = 500_000
+    INDEXABLE = _IMPORT_INDEXABLE
+    SKIP_DIRS = _IMPORT_SKIP_DIRS
+    MAX_BYTES = _import_max_bytes()
 
     if not subfolder:
         subfolder = src.name
