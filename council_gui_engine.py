@@ -460,6 +460,28 @@ def _data_preview_text(path, max_rows: int = 50):
             _text_peek(p))
 
 
+def _build_answer_report_md(question, answer, table, sources):
+    """Render a council answer as a Markdown report (question, answer, result
+    table, sources). Pure + UI-free so it's unit-testable. ``sources`` may be
+    Path objects or strings."""
+    lines = ["# Council answer", ""]
+    q = (question or "").strip()
+    if q:
+        lines += ["## Question", "", q, ""]
+    lines += ["## Answer", "", (answer or "").strip(), ""]
+    t = (table or "").strip()
+    if t:
+        lines += ["## Result table", "", "```", t, "```", ""]
+    srcs = list(sources or [])
+    if srcs:
+        lines += ["## Sources", ""]
+        for s in srcs:
+            name = getattr(s, "name", None) or Path(str(s)).name
+            lines.append(f"- {name}")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def _search_vault_filenames(in_dir, term, limit: int = 200):
     """Files under ``in_dir`` whose path/name contains every word of ``term``
     (case-insensitive). App-generated output dirs are skipped. Returns a list
@@ -7938,6 +7960,8 @@ class CouncilConsole(tk.Tk):
             btns, text="⤢ Expand with council", state="disabled",
             command=self._council_expand_with_council)
         self._expand_btn.pack(side="left", padx=6)
+        ttk.Button(btns, text="💾 Save answer",
+                   command=self._save_council_answer).pack(side="left", padx=6)
 
         # License / trial badge — clickable to open activation dialog.
         # In DEMO_MODE the whole element is hidden since there's no
@@ -15012,6 +15036,49 @@ class CouncilConsole(tk.Tk):
         self._append_transcript("User", query)
         self._council_find_and_chart(query)
 
+    def _save_council_answer(self):
+        """Export the most recent answer (question + answer + any result table
+        + sources) to a Markdown report. Defaults into data_in/derived/ so it
+        sits with the other computed outputs; the user picks the final path."""
+        from tkinter import filedialog, messagebox
+        answer = (getattr(self, "_last_answer", "") or "").strip()
+        if not answer:
+            messagebox.showinfo(
+                "Nothing to save",
+                "Ask a question first — there's no answer to save yet.")
+            return
+        question = ((getattr(self, "_last_user_text", "") or "")
+                    or getattr(self, "_last_sent_query", "") or "").strip()
+        table = (getattr(self, "_last_answer_table", "") or "").strip()
+        sources = self._resolve_source_paths(
+            getattr(self, "_last_turn_sources", []))
+        slug = _re.sub(r"[^a-z0-9]+", "_", question.lower()).strip("_")[:48] \
+            or "answer"
+        try:
+            import derived_results as _drv
+            default_dir = _drv.derived_dir(VAULT_DIR)
+        except Exception:
+            default_dir = VAULT_DIR
+        path = filedialog.asksaveasfilename(
+            title="Save answer report",
+            initialdir=str(default_dir),
+            initialfile=f"answer__{slug}.md",
+            defaultextension=".md",
+            filetypes=[("Markdown report", "*.md"), ("Text", "*.txt"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        md = _build_answer_report_md(question, answer, table, sources)
+        try:
+            Path(path).write_text(md, encoding="utf-8")
+        except Exception as e:
+            messagebox.showerror("Save failed", f"{e!r}")
+            return
+        self._append_transcript(
+            "Council", f"Saved the answer to {Path(path).name}.",
+            "observation")
+        self._render_source_chips([path])
+
     def _council_expand_with_council(self):
         """Re-ask the last fast (direct-route) question through the FULL
         multi-role council. The fast-answer short-circuit gave an instant
@@ -15639,6 +15706,7 @@ class CouncilConsole(tk.Tk):
         # Reset per-turn provenance so a later answer never shows last turn's
         # source chips (set again after this turn's injection runs).
         self._last_turn_sources = []
+        self._last_answer_table = ""   # set if this turn renders an analyst table
         self._last_sent_query = user_text   # saved for verdict disagree re-run
         self._set_text(self.input, "")
         self._append_transcript("User", user_text)
@@ -15785,6 +15853,8 @@ class CouncilConsole(tk.Tk):
         for _note in (_analyst_notices or []):
             if isinstance(_note, str) and _note.startswith("__ANALYST_TABLE__:"):
                 _table = _note[len("__ANALYST_TABLE__:"):]
+                # Stash for "Save answer" (exported into the report).
+                self._last_answer_table = _table
                 self._append_transcript(
                     "Council",
                     "Analyst result table:\n" + _table,

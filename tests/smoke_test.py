@@ -2392,6 +2392,33 @@ def test_provenance_source_resolve() -> None:
                 cge.VAULT_DIR = prev
 
 
+def test_answer_report_md() -> None:
+    """_build_answer_report_md renders a council answer as Markdown with the
+    question, answer, optional result table, and sources. Pure + UI-free."""
+    try:
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_gui_engine importable (skipped: {exc!r})", True)
+        return
+    md = cge._build_answer_report_md(
+        question="What is the average amount?",
+        answer="The average amount is 15.",
+        table="month  amount\njan    10\nfeb    20",
+        sources=[Path("data_in/sales.csv"), "orders.csv"])
+    _check("report has the question", "What is the average amount?" in md)
+    _check("report has the answer", "The average amount is 15." in md)
+    _check("report includes the table in a code block",
+           "```" in md and "amount" in md)
+    _check("report lists source file names (basename only)",
+           "- sales.csv" in md and "- orders.csv" in md)
+    # No table / no sources -> those sections are omitted, no crash.
+    md2 = cge._build_answer_report_md("Q", "A", "", [])
+    _check("omits the table section when there's none",
+           "Result table" not in md2)
+    _check("omits the sources section when there are none",
+           "Sources" not in md2 and "## Answer" in md2)
+
+
 def test_instant_filename_search() -> None:
     """_search_vault_filenames finds files whose path contains every query
     word (case-insensitive), skips app-generated output dirs, and returns
@@ -3068,6 +3095,8 @@ def main() -> int:
          test_fast_answer_direct_route)
     _run("provenance source resolution (answer chips)",
          test_provenance_source_resolve)
+    _run("answer report markdown (save answer)",
+         test_answer_report_md)
     _run("instant filename search (no model)",
          test_instant_filename_search)
     _run("data preview (model-free schema + rows)",
