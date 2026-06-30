@@ -460,6 +460,39 @@ def _data_preview_text(path, max_rows: int = 50):
             _text_peek(p))
 
 
+# Discoverability: example prompts shown by the "What can I ask?" panel.
+# Grouped (category, prompt, hint). Hints explain WHY a prompt is useful and
+# which capability it exercises — most of these are instant direct routes.
+_COUNCIL_EXAMPLES = [
+    ("Counting & summaries",
+     "how many files are in data_in",
+     "Instant exact count + by-type breakdown (no model)."),
+    ("Counting & summaries",
+     "give me a data summary of the files",
+     "One row per file: rows, columns, types (no model)."),
+    ("Counting & summaries",
+     "summary of stats for the files",
+     "Per-column min/max/mean across the files (no model)."),
+    ("Find & explore",
+     "find files containing Job Blue",
+     "Deterministic search by name + indexed content; click to preview."),
+    ("Find & explore",
+     "look up the value 12345 across files",
+     "Cross-file value search — which files mention it, and where."),
+    ("Charts",
+     "chart sales by month",
+     "Finds the right CSV and plots it for you."),
+    ("Projects (Collections)",
+     "summarise the Job Blue files",
+     "Answer about a whole project once you've saved it as a Collection "
+     "(Vault tab → Collections)."),
+    ("When an answer is weak",
+     "(click ⤓ Defer to Vault)",
+     "Save what the model couldn't do; run it from the Vault tab, then "
+     "re-ask — the saved result is reused."),
+]
+
+
 def _build_answer_report_md(question, answer, table, sources):
     """Render a council answer as a Markdown report (question, answer, result
     table, sources). Pure + UI-free so it's unit-testable. ``sources`` may be
@@ -7964,6 +7997,8 @@ class CouncilConsole(tk.Tk):
                    command=self._save_council_answer).pack(side="left", padx=6)
         ttk.Button(btns, text="🕘 History",
                    command=self._show_question_history).pack(side="left", padx=6)
+        ttk.Button(btns, text="💡 What can I ask?",
+                   command=self._show_examples).pack(side="left", padx=6)
 
         # License / trial badge — clickable to open activation dialog.
         # In DEMO_MODE the whole element is hidden since there's no
@@ -15037,6 +15072,65 @@ class CouncilConsole(tk.Tk):
         self._set_text(self.input, "")
         self._append_transcript("User", query)
         self._council_find_and_chart(query)
+
+    def _show_examples(self):
+        """A 'What can I ask?' panel that raises discoverability of the app's
+        capabilities. Clicking an example drops it into the council input
+        (ready to send), so a new user can learn by doing."""
+        import tkinter as tk
+        from tkinter import ttk
+        win = tk.Toplevel(self)
+        win.title("What can I ask?")
+        win.geometry("640x520")
+        try:
+            win.transient(self)
+        except Exception:
+            pass
+        ttk.Label(win, text="Click an example to drop it into the input box.",
+                  foreground="#888", anchor="w").pack(fill="x", padx=10,
+                                                      pady=(8, 2))
+        canvas = tk.Canvas(win, highlightthickness=0, bg="#1a1414")
+        scroll = ttk.Scrollbar(win, orient="vertical", command=canvas.yview)
+        body = ttk.Frame(canvas)
+        body.bind("<Configure>",
+                  lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=body, anchor="nw")
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.pack(side="left", fill="both", expand=True, padx=(10, 0),
+                    pady=6)
+        scroll.pack(side="right", fill="y", pady=6)
+
+        def _use(prompt):
+            # Skip the parenthetical "(click ...)" guidance rows.
+            if prompt.startswith("("):
+                return
+            self._set_text(self.input, prompt)
+            win.destroy()
+            try:
+                self.input.focus_set()
+            except Exception:
+                pass
+
+        last_cat = None
+        for cat, prompt, hint in _COUNCIL_EXAMPLES:
+            if cat != last_cat:
+                ttk.Label(body, text=cat, font=("", 10, "bold"),
+                          foreground="#f9b384").pack(anchor="w",
+                                                     pady=(10, 2))
+                last_cat = cat
+            row = ttk.Frame(body)
+            row.pack(fill="x", pady=2)
+            btn_text = prompt if prompt.startswith("(") else f"→ {prompt}"
+            b = ttk.Button(row, text=btn_text, width=46,
+                           command=lambda p=prompt: _use(p))
+            b.pack(side="left")
+            if prompt.startswith("("):
+                b.state(["disabled"])
+            ttk.Label(row, text=hint, foreground="#7a7575",
+                      wraplength=300, justify="left").pack(side="left",
+                                                           padx=8)
+        ttk.Button(win, text="Close",
+                   command=win.destroy).pack(pady=(0, 8))
 
     def _show_question_history(self):
         """Browse past Council questions and re-ask one with a click. Re-asks

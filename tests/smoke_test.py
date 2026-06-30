@@ -2392,6 +2392,26 @@ def test_provenance_source_resolve() -> None:
                 cge.VAULT_DIR = prev
 
 
+def test_council_examples() -> None:
+    """The 'What can I ask?' panel data is well-formed: non-empty, each entry
+    is (category, prompt, hint) with real text, and it covers the headline
+    capabilities (counting, find, charts)."""
+    try:
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_gui_engine importable (skipped: {exc!r})", True)
+        return
+    ex = cge._COUNCIL_EXAMPLES
+    _check("examples list is non-empty", isinstance(ex, list) and len(ex) >= 5)
+    _check("each example is (category, prompt, hint) of strings",
+           all(isinstance(t, tuple) and len(t) == 3
+               and all(isinstance(x, str) and x for x in t) for t in ex))
+    blob = " ".join(p for _, p, _ in ex).lower()
+    _check("covers file counting", "how many files" in blob)
+    _check("covers find/search", "find files" in blob or "look up" in blob)
+    _check("covers charts", "chart" in blob)
+
+
 def test_question_history() -> None:
     """QuestionHistory: append questions, skip immediate duplicates and
     blanks, list newest-first, persist across instances, and clear."""
@@ -3128,6 +3148,8 @@ def main() -> int:
          test_fast_answer_direct_route)
     _run("provenance source resolution (answer chips)",
          test_provenance_source_resolve)
+    _run("council examples panel data",
+         test_council_examples)
     _run("question history (browse + re-ask)",
          test_question_history)
     _run("answer report markdown (save answer)",
