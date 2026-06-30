@@ -77,6 +77,13 @@ C. DEFER TO VAULT  (capture -> run -> reuse)
          saved result ("precomputed from a deferred task"), not recomputed.
 [ ] C16  [D] Defer a "Tool request" → saved but NOT auto-runnable (logged for dev).
 [ ] C17  [D] "✓ Done" / "✗ Dismiss" / "⟳ Refresh" behave correctly.
+[ ] C18  [D] Run produces a file in data_in/derived/ (NOT deferred_results/) and
+         it is catalogued in <vault>/derived_results.json with a source list.
+[ ] C19  [M] STALENESS: after a successful re-ask reuse (C15), EDIT one of the
+         source files, then re-ask → it does NOT serve the saved result (it
+         recomputes / re-routes). Restore/recompute → reuse returns.
+[ ] C20  [D] A file in data_in/derived/ is NOT counted by "how many files" and is
+         NOT proposed as a collection member (computed output, not source data).
 
 
 --------------------------------------------------------------------------------
