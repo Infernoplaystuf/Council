@@ -12475,7 +12475,8 @@ class CouncilConsole(tk.Tk):
 
     def _vmgr_import_zip_folder(self):
         """Extract EVERY .zip found under the chosen folder (recursively) into
-        the vault — each zip into its own subfolder named after the zip. One
+        the vault's data_in/ — each zip into its own subfolder named after the
+        zip — so the imported files are immediately usable by the council. One
         bad/corrupt zip is logged and skipped; the rest still import."""
         import threading
         folder = self._vmgr_zipdir_var.get().strip()
@@ -12489,6 +12490,13 @@ class CouncilConsole(tk.Tk):
 
         def worker():
             import zipfile as _zf
+            # Extract into data_in/ (the analyst/index scope) so the files are
+            # usable by the council, not the vault root.
+            try:
+                _indir = data_index.input_dir(VAULT_DIR)
+                _indir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                _indir = VAULT_DIR
             try:
                 zips = sorted(src.rglob("*.zip"))
             except Exception as e:
@@ -12518,13 +12526,13 @@ class CouncilConsole(tk.Tk):
                 used.add(sub)
                 try:
                     dest, copied, skipped = _vmgr_extract_zip(
-                        zp, vault_dir=VAULT_DIR, subfolder=sub,
+                        zp, vault_dir=_indir, subfolder=sub,
                         log_cb=lambda m: self.ui_q.put(("vault_mgr_log", m)))
                     ok += 1
                     total_copied += copied
                     self.ui_q.put((
                         "vault_mgr_log",
-                        f"  [{i}/{len(zips)}] ✓ {zp.name} → vault/{dest.name} "
+                        f"  [{i}/{len(zips)}] ✓ {zp.name} → data_in/{dest.name} "
                         f"({copied} files, {skipped} skipped)"))
                 except Exception as e:
                     failed += 1
