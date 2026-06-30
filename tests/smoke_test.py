@@ -2392,6 +2392,37 @@ def test_provenance_source_resolve() -> None:
                 cge.VAULT_DIR = prev
 
 
+def test_instant_filename_search() -> None:
+    """_search_vault_filenames finds files whose path contains every query
+    word (case-insensitive), skips app-generated output dirs, and returns
+    (path, reason). This is the no-index half of the instant search box."""
+    try:
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_gui_engine importable (skipped: {exc!r})", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "jobs").mkdir()
+        (root / "derived").mkdir()
+        (root / "jobs" / "Job_Blue_costs.csv").write_text("a\n1\n")
+        (root / "jobs" / "Job_Blue_notes.txt").write_text("hi\n")
+        (root / "jobs" / "Red_team.csv").write_text("a\n1\n")
+        (root / "derived" / "Job_Blue_summary.csv").write_text("a\n1\n")  # skipped
+
+        hits = cge._search_vault_filenames(root, "job blue")
+        names = sorted(Path(p).name for p, _ in hits)
+        _check("matches both Job Blue files",
+               "Job_Blue_costs.csv" in names and "Job_Blue_notes.txt" in names)
+        _check("non-matching file excluded", "Red_team.csv" not in names)
+        _check("app-generated derived/ output is skipped",
+               "Job_Blue_summary.csv" not in names)
+        _check("every result carries a reason",
+               all(r for _, r in hits))
+        _check("empty term yields nothing",
+               cge._search_vault_filenames(root, "") == [])
+
+
 def test_data_preview_text() -> None:
     """_data_preview_text gives a model-free (schema, rows) preview of a data
     file with bounded reads, and falls back to a text peek for non-tabular
@@ -3037,6 +3068,8 @@ def main() -> int:
          test_fast_answer_direct_route)
     _run("provenance source resolution (answer chips)",
          test_provenance_source_resolve)
+    _run("instant filename search (no model)",
+         test_instant_filename_search)
     _run("data preview (model-free schema + rows)",
          test_data_preview_text)
     _run("error coaching (plain-language + one-click fix)",

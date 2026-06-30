@@ -460,6 +460,34 @@ def _data_preview_text(path, max_rows: int = 50):
             _text_peek(p))
 
 
+def _search_vault_filenames(in_dir, term, limit: int = 200):
+    """Files under ``in_dir`` whose path/name contains every word of ``term``
+    (case-insensitive). App-generated output dirs are skipped. Returns a list
+    of (abs_path, reason). Pure + UI-free so it's unit-testable."""
+    import os as _os
+    skip = {"derived", "deferred_results", "converted_mongo", "__pycache__",
+            ".vault_index", ".stats_cache", "conversation_logs", ".git"}
+    words = [w for w in _re.findall(r"[a-z0-9]+", (term or "").lower())
+             if len(w) > 0]
+    if not words:
+        return []
+    out = []
+    try:
+        for dp, dn, fn in _os.walk(str(in_dir)):
+            dn[:] = [d for d in dn if d not in skip and not d.startswith(".")]
+            for f in fn:
+                if f.startswith("."):
+                    continue
+                full = _os.path.join(dp, f)
+                if all(w in full.lower() for w in words):
+                    out.append((full, "name match"))
+                    if len(out) >= limit:
+                        return out
+    except Exception:
+        pass
+    return out
+
+
 def _coach_for_error(msg: str):
     """Map a raw error / traceback string to plain-language guidance plus a
     one-click fix. Returns ``dict(plain, action_label, action)`` for a
@@ -9269,6 +9297,103 @@ class CouncilConsole(tk.Tk):
                     out.append(cand)
         return out
 
+    def _vmgr_instant_search(self):
+        """Find vault files by NAME or CONTENT (indexed values / column names),
+        instantly and with no model. Pops a clickable results list whose items
+        preview on double-click."""
+        term = (self._vmgr_search_var.get() or "").strip()
+        if not term:
+            return
+        try:
+            in_dir = data_index.input_dir(VAULT_DIR)
+        except Exception:
+            in_dir = VAULT_DIR
+        results = []   # (path, reason)
+        seen = set()
+
+        def _add(path, reason):
+            try:
+                key = str(Path(path).resolve()).lower()
+            except Exception:
+                key = str(path).lower()
+            if key not in seen:
+                seen.add(key)
+                results.append((str(path), reason))
+
+        # 1) filename / path matches (no index needed)
+        for full, reason in _search_vault_filenames(in_dir, term):
+            _add(full, reason)
+        # 2) content matches via the data index (best-effort; refresh lazily)
+        try:
+            self.data_index.refresh()
+            for h in (self.data_index.search_value(term, max_per_file=1) or []):
+                name = h.get("file") if isinstance(h, dict) else None
+                if name:
+                    hit = in_dir / name
+                    _add(hit if hit.exists() else name,
+                         f"contains “{term}”")
+        except Exception:
+            pass
+        try:
+            for prof, exact in (self.data_index.find_files_with_column(term)
+                                or []):
+                hit = in_dir / prof.name
+                _add(hit if hit.exists() else prof.name, f"column “{exact}”")
+        except Exception:
+            pass
+
+        self._show_file_results(f"Find: {term}", results)
+
+    def _show_file_results(self, title, results):
+        """A clickable results list of (path, reason). Double-click or Preview
+        opens the model-free data preview; Open folder reveals the file."""
+        import tkinter as tk
+        from tkinter import ttk
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.geometry("720x460")
+        try:
+            win.transient(self)
+        except Exception:
+            pass
+        ttk.Label(win, text=f"{len(results)} match(es)", foreground="#888",
+                  anchor="w").pack(fill="x", padx=8, pady=(6, 0))
+        if not results:
+            ttk.Label(win, text="No files match by name or indexed content. "
+                      "Try a different term, or add the data in this tab.",
+                      foreground="#7a7575", wraplength=680,
+                      justify="left").pack(anchor="w", padx=12, pady=12)
+            ttk.Button(win, text="Close",
+                       command=win.destroy).pack(pady=8)
+            return
+        lb = tk.Listbox(win, bg="#231a1a", fg="#d4d4d4",
+                        selectbackground="#5a3030", relief="flat",
+                        font=("Consolas", 10))
+        lb.pack(fill="both", expand=True, padx=8, pady=8)
+        paths = []
+        for path, reason in results:
+            paths.append(path)
+            lb.insert("end", f"{Path(path).name}   —   {reason}")
+
+        def _selected():
+            sel = lb.curselection()
+            return paths[sel[0]] if sel else None
+
+        lb.bind("<Double-Button-1>",
+                lambda e: (_selected() and self._preview_data_file(_selected())))
+        btns = ttk.Frame(win)
+        btns.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(btns, text="Preview",
+                   command=lambda: (_selected()
+                                    and self._preview_data_file(_selected()))
+                   ).pack(side="left")
+        ttk.Button(btns, text="Open containing folder",
+                   command=lambda: (_selected()
+                                    and self._reveal_file(_selected()))
+                   ).pack(side="left", padx=6)
+        ttk.Button(btns, text="Close",
+                   command=win.destroy).pack(side="right")
+
     def _preview_data_file(self, path):
         """Quick, MODEL-FREE preview of a data file: schema (column dtypes) +
         the first rows, in a popup. No inference, so it's instant and works
@@ -11059,6 +11184,22 @@ class CouncilConsole(tk.Tk):
                    command=self._vmgr_refresh_tree).pack(side="right", padx=4)
         ttk.Button(top, text="RAG Misses",
                    command=self._show_rag_misses).pack(side="right", padx=4)
+
+        # ── Instant search bar (no model) ─────────────────────
+        # Find vault files by NAME or by CONTENT (indexed values / columns),
+        # instantly and with no inference. Results are clickable → preview.
+        srch = ttk.Frame(self.tab_vmgr)
+        srch.pack(fill="x", padx=10, pady=(0, 4))
+        ttk.Label(srch, text="🔍 Find files:",
+                  font=("", 9, "bold")).pack(side="left")
+        self._vmgr_search_var = tk.StringVar()
+        _se = ttk.Entry(srch, textvariable=self._vmgr_search_var, width=36)
+        _se.pack(side="left", padx=6)
+        _se.bind("<Return>", lambda e: self._vmgr_instant_search())
+        ttk.Button(srch, text="Search",
+                   command=self._vmgr_instant_search).pack(side="left")
+        ttk.Label(srch, text="by file name or content — instant, no model",
+                  foreground="#7a7575").pack(side="left", padx=8)
 
         # ── Main pane ─────────────────────────────────────────
         main = tk.PanedWindow(self.tab_vmgr, orient="horizontal",
