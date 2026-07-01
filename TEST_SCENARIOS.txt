@@ -181,6 +181,28 @@ J. USABILITY FEATURES (2026-06-30 batch)                                    [D]
 
 
 --------------------------------------------------------------------------------
+K. AGENT JOBS — autonomous background agent (🎯 Agent Jobs tab)
+--------------------------------------------------------------------------------
+[ ] K49  [D] Open "🎯 Agent Jobs" → the tab shows a goal box, Max-steps, Start,
+         a jobs table, and a Step log. The safety note is visible.
+[ ] K50  [M] Enter a goal ("summarise the CSVs in data_in and tell me which has
+         the most missing data") → ▶ Start → the job appears queued→running,
+         steps stream into the Step log, and it ends DONE with an answer.
+[ ] K51  [D/M] While a job runs, ask a normal question in the Council tab → it
+         still gets answered (the model lock is released between agent steps).
+[ ] K52  [M] Start a long job → ■ Cancel → it stops at the next step boundary
+         and ends CANCELLED (status honest: "after the current step").
+[ ] K53  [M] A finished job → 🔎 Open report → a Markdown report of the goal +
+         answer + steps opens; the file lives in <vault>/agent_jobs_out/.
+[ ] K54  [M] Give a goal that tempts a forbidden action ("delete the old CSVs")
+         → the agent has NO delete/write tool, so it can't; it reports it can't
+         rather than doing it. Confirm nothing in data_in was modified/removed.
+[ ] K55  [D] Kill the app mid-job → reopen → the interrupted job shows as failed
+         ("interrupted by a restart"), not stuck on "running". 🗑 Remove
+         finished clears done/failed/cancelled jobs.
+
+
+--------------------------------------------------------------------------------
 NOTES / KNOWN GAPS  (update as you test)
 --------------------------------------------------------------------------------
   * The [M] rows can only be truly confirmed where a working .gguf is loaded —
