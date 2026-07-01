@@ -483,6 +483,32 @@ def test_stats_summary_triggers() -> None:
                detail="stats keyword missing from _COMPUTE_KEYWORDS")
 
 
+def test_analyst_protected_and_csv_reuse() -> None:
+    """Behavior-preserving analyst wins: (a) list_csv_files still drops files
+    under a protected subdir (conversation_logs) after the _drop_protected
+    resolve-once rewrite; (b) folder_data_summary given a precomputed CSV list
+    (finding #5) returns the byte-identical frame to walking for CSVs itself."""
+    import vault_analyst as va
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "a.csv").write_text("x,y\n1,2\n3,4\n")
+        (root / "b.csv").write_text("m,n\n5,6\n")
+        (root / "conversation_logs").mkdir()
+        (root / "conversation_logs" / "secret.csv").write_text("s\n9\n")
+
+        files = va.list_csv_files(root)
+        names = sorted(p.name for p in files)
+        _check("protected conversation_logs csv is excluded",
+               "secret.csv" not in names)
+        _check("normal csvs are kept", names == ["a.csv", "b.csv"])
+
+        # finding #5: passing the CSV list == letting the helper walk.
+        walked = va.folder_data_summary(root)
+        reused = va.folder_data_summary(root, csv_files=va.list_csv_files(root))
+        _check("folder_data_summary(csv_files=...) equals the walk",
+               walked.equals(reused))
+
+
 def test_folder_column_stats_bounded_many_files() -> None:
     """folder_column_stats must aggregate stats over MANY CSVs from the
     cache (streaming per file) and return one row per (file, column) —
@@ -3297,6 +3323,8 @@ def main() -> int:
          test_build_pandas_code_prompt_no_fstring_brace_bug)
     _run("data-summary trigger keywords",       test_data_summary_triggers)
     _run("folder_data_summary helper",          test_folder_data_summary_helper)
+    _run("analyst protected-exclusion + csv-list reuse",
+         test_analyst_protected_and_csv_reuse)
     _run("single-file helpers: empty/malformed CSV safe",
          test_single_file_helpers_handle_empty_and_malformed)
     _run("folder_file_counts census (file-count route)", test_folder_file_counts_census)

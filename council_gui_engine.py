@@ -2577,10 +2577,14 @@ def _run_analyst_step_impl(query):
         # changes the key and forces a fresh compute — correct staleness.
         _qc = None
         _qkey = None
+        _csv_paths = None
         try:
             import stats_cache as _sc
             _qc = _sc.QueryReportCache(VAULT_DIR)
-            _inputs = [str(p) for p in _va.list_csv_files(target_folders)]
+            # Keep the raw Path list so the helper below doesn't walk for CSVs
+            # a second time (it's the same file set that built the cache key).
+            _csv_paths = _va.list_csv_files(target_folders)
+            _inputs = [str(p) for p in _csv_paths]
             _qkey = _qc.make_key("folder_data_summary" + scope_str, _inputs)
         except Exception:
             _qc = None
@@ -2592,7 +2596,8 @@ def _run_analyst_step_impl(query):
 
         if rep is None:
             try:
-                result_df = _va.folder_data_summary(target_folders)
+                result_df = _va.folder_data_summary(
+                    target_folders, csv_files=_csv_paths)
             except Exception as _e:
                 print('[analyst] direct folder_data_summary failed: '
                       + repr(_e), file=_sys_dbg.stderr)
@@ -2675,10 +2680,13 @@ def _run_analyst_step_impl(query):
         # Query-report cache, fingerprinted on each input file's mtime —
         # an unchanged folder serves the prior stats table instantly.
         _sqc = _sqkey = None
+        _scsv_paths = None
         try:
             import stats_cache as _sc2
             _sqc = _sc2.QueryReportCache(VAULT_DIR)
-            _sinputs = [str(p) for p in _va.list_csv_files(_starget)]
+            # Reuse this CSV Path list below instead of re-walking for it.
+            _scsv_paths = _va.list_csv_files(_starget)
+            _sinputs = [str(p) for p in _scsv_paths]
             _sqkey = _sqc.make_key("folder_column_stats" + _sscope, _sinputs)
         except Exception:
             _sqc = None
@@ -2690,7 +2698,8 @@ def _run_analyst_step_impl(query):
 
         if srep is None:
             try:
-                _sdf = _va.folder_column_stats(VAULT_DIR, _starget)
+                _sdf = _va.folder_column_stats(
+                    VAULT_DIR, _starget, csv_files=_scsv_paths)
             except Exception as _se:
                 print('[analyst] direct folder_column_stats failed: '
                       + repr(_se), file=_sys_dbg.stderr)

@@ -132,17 +132,48 @@ def safe_relative_path(path: Path, root: Optional[Path]) -> str:
 
 
 def _drop_protected(paths: List[Path], data_folder: Any) -> List[Path]:
-    """Filter out any file under a protected vault subdir (conversation_logs etc.)."""
+    """Filter out any file under a protected vault subdir (conversation_logs etc.).
+
+    Resolves each folder once and each path once, rather than re-resolving both
+    on every (path, folder) pair inside is_protected_path — same kept/dropped
+    set and same input order. An un-resolvable path is KEPT (matching
+    is_protected_path returning False), never crashing the walk.
+    """
     try:
-        from conversation_logger import is_protected_path
+        from conversation_logger import _PROTECTED_SUBDIRS_LC
     except Exception:
-        return paths
+        # Older conversation_logger without the hoisted set — fall back to the
+        # per-item helper (still correct, just slower).
+        try:
+            from conversation_logger import is_protected_path
+        except Exception:
+            return paths
+        folders = normalize_data_folders(data_folder)
+        return [p for p in paths
+                if not any(is_protected_path(p, vd) for vd in folders)]
+
     folders = normalize_data_folders(data_folder)
+    res_folders: List[Path] = []
+    for vd in folders:
+        try:
+            res_folders.append(Path(vd).expanduser().resolve())
+        except Exception:
+            pass  # unresolvable folder: skip it (is_protected_path -> False)
     out: List[Path] = []
     for p in paths:
+        try:
+            rp = Path(p).expanduser().resolve()
+        except Exception:
+            out.append(p)   # unresolvable path is kept (matches False return)
+            continue
         protected = False
-        for vd in folders:
-            if is_protected_path(p, vd):
+        for fr in res_folders:
+            try:
+                rel = rp.relative_to(fr)
+            except ValueError:
+                continue
+            parts = rel.parts
+            if parts and parts[0].lower() in _PROTECTED_SUBDIRS_LC:
                 protected = True
                 break
         if not protected:
@@ -1452,13 +1483,19 @@ def cached_column_stats(vault_dir: Any, path: Any) -> Dict[str, Any]:
 
 
 def folder_column_stats(vault_dir: Any, data_folder: Any,
-                        recursive: bool = True) -> "pd.DataFrame":
+                        recursive: bool = True, *,
+                        csv_files: Optional[List[Path]] = None
+                        ) -> "pd.DataFrame":
     """One row per (file, column) with the precomputed stats — count,
     missing, min, max, mean, std, sum (numeric) / n_unique, top (text) —
     served from the cache (computed + stored on first sight of a file).
     Use this instead of re-reading files when a question asks for column
     statistics. The ``notes`` column flags files that already carry their
-    own summary (a Total/Mean row or a stat-named column)."""
+    own summary (a Total/Mean row or a stat-named column).
+
+    ``csv_files``: an already-materialised CSV list (e.g. computed by the
+    caller for a cache key). When given it's used verbatim instead of walking
+    the folder again; None (default) preserves the original walk."""
     rows: List[Dict[str, Any]] = []
     try:
         import stats_cache
@@ -1466,7 +1503,9 @@ def folder_column_stats(vault_dir: Any, data_folder: Any,
     except Exception:
         return pd.DataFrame(rows)
     folders = normalize_data_folders(data_folder)
-    for fp in list_csv_files(folders, recursive=recursive):
+    _files = (csv_files if csv_files is not None
+              else list_csv_files(folders, recursive=recursive))
+    for fp in _files:
         st = cache.get(fp) or {}
         root = first_matching_root(fp, folders)
         rel = safe_relative_path(fp, root)
@@ -1502,6 +1541,8 @@ def folder_data_summary(
     recursive: bool = True,
     max_files: Optional[int] = None,
     include_image_metadata: bool = True,
+    *,
+    csv_files: Optional[List[Path]] = None,
 ) -> pd.DataFrame:
     """A "true data summary" of every data file in `data_folder`.
 
@@ -1540,8 +1581,12 @@ def folder_data_summary(
     # formats. Image files are reported but not deeply parsed.
     file_paths: list[Path] = []
     seen: set = set()
+    # Reuse a caller-supplied CSV list (e.g. already walked for a cache key)
+    # instead of walking for CSVs a second time; None preserves the walk.
+    _csv_collector = ((lambda: csv_files) if csv_files is not None
+                      else (lambda: list_csv_files(folders, recursive=recursive)))
     for collector in (
-        lambda: list_csv_files(folders, recursive=recursive),
+        _csv_collector,
         lambda: list_excel_files(folders, recursive=recursive),
         lambda: list_parquet_files(folders, recursive=recursive),
         lambda: list_sqlite_files(folders, recursive=recursive),
@@ -2457,11 +2502,10 @@ def schema_doc_from_csv(path: Any) -> str:
             note = f" ({prof.iloc[0]['status']})"
         return f"# {p.name}\n\nEmpty or unreadable.{note}\n"
 
-    try:
-        full_df = pd.read_csv(p, nrows=1)  # for total-column count, not values
-        n_cols = len(full_df.columns)
-    except Exception:
-        n_cols = len(prof)
+    # summarize_csv emits exactly one profile row per column (we only reach
+    # here when prof is the real profile — the empty/unreadable shape returned
+    # above). So the column count is len(prof); no second read of the file.
+    n_cols = len(prof)
     try:
         nrows_total = int(prof["non_null"].max() + prof["null_pct"].max() / 100 * prof["non_null"].max())
     except Exception:
