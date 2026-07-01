@@ -90,11 +90,13 @@ _OVERLAP_STOP = {
 }
 
 
+def _overlap_toks(s: str) -> set:
+    return {w for w in re.findall(r"[a-z0-9]+", (s or "").lower())
+            if w not in _OVERLAP_STOP and len(w) > 1}
+
+
 def _overlap(a: str, b: str) -> float:
-    def toks(s: str):
-        return {w for w in re.findall(r"[a-z0-9]+", (s or "").lower())
-                if w not in _OVERLAP_STOP and len(w) > 1}
-    sa, sb = toks(a), toks(b)
+    sa, sb = _overlap_toks(a), _overlap_toks(b)
     if not sa or not sb:
         return 0.0
     return len(sa & sb) / len(sa | sb)
@@ -190,8 +192,14 @@ class DerivedStore:
         the best match is stale. Prunes nothing — staleness is checked live."""
         best: Optional[DerivedResult] = None
         best_score = float(min_overlap)
+        q_tokens = _overlap_toks(query)   # tokenize the query ONCE, not per row
         for r in self.all():
-            sc = _overlap(query, r.label)
+            if q_tokens:
+                l_tokens = _overlap_toks(r.label)
+                sc = (len(q_tokens & l_tokens) / len(q_tokens | l_tokens)
+                      if l_tokens else 0.0)
+            else:
+                sc = 0.0
             if sc >= best_score and r.is_fresh():
                 best, best_score = r, sc
         return best

@@ -478,13 +478,16 @@ class _TFIDFBackend:
                 if not chunk_terms:
                     continue
 
+                # Lowercase the chunk text ONCE (was re-lowered per query term
+                # in the tf count, then again for the boost pass).
+                text_low = chunk["text"].lower()
                 # TF-IDF score: sum over query terms of tf * idf
                 score = 0.0
                 for term in q_terms:
                     if term not in chunk_terms:
                         continue
                     # TF: term appears in chunk (binary presence, can extend to freq)
-                    tf = chunk["text"].lower().count(term) / max(len(chunk_terms), 1)
+                    tf = text_low.count(term) / max(len(chunk_terms), 1)
                     # IDF: log(N / df+1) — rare terms score higher
                     df = self._df.get(term, 0)
                     idf = math.log((n_docs + 1) / (df + 1)) + 1.0
@@ -492,7 +495,6 @@ class _TFIDFBackend:
 
                 if score > 0:
                     # Boost: prefer chunks where query terms appear close together
-                    text_low = chunk["text"].lower()
                     # Find best window where most terms co-occur
                     best_idx = 0
                     best_density = 0

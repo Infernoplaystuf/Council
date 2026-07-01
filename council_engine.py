@@ -1299,13 +1299,17 @@ def _clamp_messages_to_ctx(
     marker = "\n…[trimmed to fit the model's context window]…\n"
     mlen = len(marker)
     for _ in range(len(msgs) + 2):
-        total = sum(_est(m.get("content", "")) for m in msgs)
+        # One estimate per message per pass, reused for total, argmax, and the
+        # 'other' deficit (was tokenizing the largest message ~3x). Estimates
+        # are recomputed fresh each pass, never carried across — carrying them
+        # would mix counts taken under different tokenizer-lock states.
+        ests = [_est(m.get("content", "")) for m in msgs]
+        total = sum(ests)
         if total <= prompt_budget:
             break
-        big_i = max(range(len(msgs)),
-                    key=lambda i: _est(msgs[i].get("content", "")))
+        big_i = max(range(len(msgs)), key=lambda i: ests[i])
         content = msgs[big_i].get("content", "") or ""
-        other = total - _est(content)
+        other = total - ests[big_i]
         avail = max(24, prompt_budget - other)      # tokens this msg may keep
         target_chars = max(80, avail * 4 - mlen)    # leave room for the marker
         if len(content) <= target_chars:
@@ -3194,10 +3198,12 @@ class PersonalityModel:
             _has_vault = any(m in extra_context for m in _vault_markers)
             if _has_vault:
                 if use_vault == "none":
-                    # Find vault block start and strip from there
+                    # Find vault block start and strip from there. find()==-1
+                    # means absent, so filtering p>=0 folds the membership test
+                    # into a single scan per marker (was `m in` then `.find(m)`).
                     _v_start = min(
-                        (extra_context.find(m) for m in _vault_markers
-                         if m in extra_context),
+                        (p for p in (extra_context.find(m) for m in _vault_markers)
+                         if p >= 0),
                         default=-1,
                     )
                     # Keep everything before vault (council instructions etc.)
@@ -3206,10 +3212,11 @@ class PersonalityModel:
                     elif _v_start == 0:
                         filtered_extra = ""
                 elif use_vault == "lite":
-                    # Truncate vault block to first 1500 chars
+                    # Truncate vault block to first 1500 chars. One find() per
+                    # marker (idx == -1 means absent) instead of `in` then find.
                     for marker in _vault_markers:
-                        if marker in filtered_extra:
-                            idx = filtered_extra.find(marker)
+                        idx = filtered_extra.find(marker)
+                        if idx != -1:
                             vault_tail = filtered_extra[idx:]
                             if len(vault_tail) > 1500:
                                 filtered_extra = (
@@ -3854,110 +3861,115 @@ _ROUTE_TEMP_OVERRIDES: Dict[str, Dict[str, float]] = {
 }
 
 
+# Routing phrase-lists — hoisted to module scope so they're built once at
+# import instead of rebuilt on every route_message() call. Read-only; used
+# only in `any(phrase in t ...)` membership tests, so ordering is irrelevant.
+_no_code_phrases = [
+    "no code", "no script", "no program", "not code", "without code",
+    "text only", "text response", "just text", "just a text",
+    "text answer", "plain text", "written response", "prose only",
+    "don't write code", "do not write code", "don't code", "no need for code",
+    "conceptual", "in words", "in plain english", "conversational",
+]
+_meta_phrases = [
+    "council's weakness", "council weakness", "your weakness", "your strength",
+    "council's strength", "what are you", "what can you", "what do you",
+    "how do you work", "how does the council", "who are you", "describe yourself",
+    "tell me about yourself", "what is the council",
+]
+_algorithm_phrases = [
+    "thumbnail", "title optimiz", "title optimis", "ctr", "click through rate",
+    "hook mechanics", "open loop", "discoverability", "video seo", "seo for youtube",
+    "watch time", "channel growth", "posting schedule", "posting cadence",
+    "keyword strategy", "channel positioning", "niche positioning",
+    "packaging the video",
+]
+_coach_phrases = [
+    "how do i sound", "how i sound", "my delivery", "speaking pace", "my pacing",
+    "vocal coaching", "voice coaching", "presentation coaching",
+    "too monotone", "monotone voice", "sounds flat", "breath control",
+    "uptalk", "filler sounds", "speaking habits", "delivery coaching",
+    "sounds boring", "speak better", "diction", "clarity of my speech",
+]
+_ideator_phrases = [
+    "brainstorm video", "video ideas", "video concepts", "idea for a video",
+    "come up with ideas", "generate ideas", "give me ideas", "what should i make",
+    "what video should i", "content ideas for", "idea generation", "ideation",
+    "new video idea", "pitch me ideas", "pitch me ", "video suggestions",
+    "video topic ideas", "ideas for", "ideas about",
+]
+_pitcher_phrases = [
+    "flesh out", "flesh this out", "develop this idea", "develop the idea",
+    "turn this into a video", "make a pitch", "full pitch", "full outline for",
+    "production plan for", "build out this idea", "turn the idea into",
+    "pitch this idea", "script outline for", "develop the concept",
+]
+_content_phrases = [
+    "youtube", "video script", "script for", "script for my", "script for a",
+    "video idea", "video essay", "blog post", "blog article", "social media",
+    "podcast script", "narrator", "narration", "storyboard", "content plan",
+    "highlight clip", "edit my video", "video editing",
+    "video title", "video description", "talking points", "monologue",
+]
+_code_signals = ["python", "source code", "def ", "class ",
+                 "bug", "implement", "refactor", "coding"]
+_specialist_signals = [
+    # visual / edit
+    "shot composition", "framing", "lighting", "color grade", "colour grade",
+    "edit the video", "cut list", "b-roll", "j-cut", "l-cut", "cold open",
+    "bokeh", "shallow focus", "lens choice", "rule of thirds",
+    "camera angle", "camera movement", "depth of field", "exposure",
+    "cinematography", "white balance", "skin tone",
+    "where to cut", "where should i cut", "cut this video", "tighten",
+    "pacing of the edit", "reorder the video",
+    # delivery / coaching (fallback from hard override above)
+    "delivery", "my delivery", "vocal", "diction", "uptalk", "monotone",
+    "breath control", "speaking pacing", "speaking habits",
+    # algorithm (fallback from hard override above)
+    "ctr", "retention", "hook", "watch time", "discoverability",
+    # ideation
+    "video idea", "video ideas", "brainstorm", "video concept", "ideation",
+    "flesh out", "pitch me", "pitch this", "content ideas",
+]
+
+
 def route_message(user_text: str) -> str:
     """Score-based routing — returns the winning route label."""
     t = user_text.lower()
 
     # Hard override: explicit no-code signals — user said they don't want code/scripts.
     # Must check BEFORE keyword scoring so "no code needed" doesn't hit 'ide'.
-    _no_code_phrases = [
-        "no code", "no script", "no program", "not code", "without code",
-        "text only", "text response", "just text", "just a text",
-        "text answer", "plain text", "written response", "prose only",
-        "don't write code", "do not write code", "don't code", "no need for code",
-        "conceptual", "in words", "in plain english", "conversational",
-    ]
     if any(phrase in t for phrase in _no_code_phrases):
         return "writer"
 
     # Hard override: pure reflection / meta questions about the council itself
     # → chat route: Writer + Peasant only, no code personalities
-    _meta_phrases = [
-        "council's weakness", "council weakness", "your weakness", "your strength",
-        "council's strength", "what are you", "what can you", "what do you",
-        "how do you work", "how does the council", "who are you", "describe yourself",
-        "tell me about yourself", "what is the council",
-    ]
     if any(phrase in t for phrase in _meta_phrases):
         return "chat"
 
     # Hard override: algorithm packaging — thumbnail/CTR/retention trump generic content/chat
-    _algorithm_phrases = [
-        "thumbnail", "title optimiz", "title optimis", "ctr", "click through rate",
-        "hook mechanics", "open loop", "discoverability", "video seo", "seo for youtube",
-        "watch time", "channel growth", "posting schedule", "posting cadence",
-        "keyword strategy", "channel positioning", "niche positioning",
-        "packaging the video",
-    ]
     if any(phrase in t for phrase in _algorithm_phrases):
         return "algorithm"
 
     # Hard override: delivery / coaching — beats generic content/chat routing
-    _coach_phrases = [
-        "how do i sound", "how i sound", "my delivery", "speaking pace", "my pacing",
-        "vocal coaching", "voice coaching", "presentation coaching",
-        "too monotone", "monotone voice", "sounds flat", "breath control",
-        "uptalk", "filler sounds", "speaking habits", "delivery coaching",
-        "sounds boring", "speak better", "diction", "clarity of my speech",
-    ]
     if any(phrase in t for phrase in _coach_phrases):
         return "coach"
 
     # Hard override: ideation — brainstorming / idea generation beats generic content
-    _ideator_phrases = [
-        "brainstorm video", "video ideas", "video concepts", "idea for a video",
-        "come up with ideas", "generate ideas", "give me ideas", "what should i make",
-        "what video should i", "content ideas for", "idea generation", "ideation",
-        "new video idea", "pitch me ideas", "pitch me ", "video suggestions",
-        "video topic ideas", "ideas for", "ideas about",
-    ]
     if any(phrase in t for phrase in _ideator_phrases):
         return "ideator"
 
     # Hard override: pitch development — flesh out / develop beats generic content
-    _pitcher_phrases = [
-        "flesh out", "flesh this out", "develop this idea", "develop the idea",
-        "turn this into a video", "make a pitch", "full pitch", "full outline for",
-        "production plan for", "build out this idea", "turn the idea into",
-        "pitch this idea", "script outline for", "develop the concept",
-    ]
     if any(phrase in t for phrase in _pitcher_phrases):
         return "pitcher"
 
     # Hard override: content creation — video/blog/social signals beat "script" in ide
-    _content_phrases = [
-        "youtube", "video script", "script for", "script for my", "script for a",
-        "video idea", "video essay", "blog post", "blog article", "social media",
-        "podcast script", "narrator", "narration", "storyboard", "content plan",
-        "highlight clip", "edit my video", "video editing",
-        "video title", "video description", "talking points", "monologue",
-    ]
     if any(phrase in t for phrase in _content_phrases):
         return "content"
 
     # Hard override: short conversational queries (≤12 words, no specialist signals)
     # These are almost never code/specialist requests — route to chat to avoid
     # hallucinating domain roles for "what did we discuss last session?" etc.
-    _code_signals = ["python", "source code", "def ", "class ",
-                     "bug", "implement", "refactor", "coding"]
-    _specialist_signals = [
-        # visual / edit
-        "shot composition", "framing", "lighting", "color grade", "colour grade",
-        "edit the video", "cut list", "b-roll", "j-cut", "l-cut", "cold open",
-        "bokeh", "shallow focus", "lens choice", "rule of thirds",
-        "camera angle", "camera movement", "depth of field", "exposure",
-        "cinematography", "white balance", "skin tone",
-        "where to cut", "where should i cut", "cut this video", "tighten",
-        "pacing of the edit", "reorder the video",
-        # delivery / coaching (fallback from hard override above)
-        "delivery", "my delivery", "vocal", "diction", "uptalk", "monotone",
-        "breath control", "speaking pacing", "speaking habits",
-        # algorithm (fallback from hard override above)
-        "ctr", "retention", "hook", "watch time", "discoverability",
-        # ideation
-        "video idea", "video ideas", "brainstorm", "video concept", "ideation",
-        "flesh out", "pitch me", "pitch this", "content ideas",
-    ]
     word_count = len(t.split())
     if (word_count <= 12
             and not any(sig in t for sig in _code_signals)

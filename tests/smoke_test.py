@@ -2418,6 +2418,67 @@ def test_provenance_source_resolve() -> None:
                 cge.VAULT_DIR = prev
 
 
+def test_graph_introspect_columns() -> None:
+    """graph_data._introspect_columns classification is unchanged after the
+    nunique-computed-once (#14) and to_numeric-reuse (#15) CSE: native numeric,
+    string-encoded numeric (coercion path), and low-cardinality categorical."""
+    try:
+        import graph_data as gd
+        import pandas as pd
+    except Exception as exc:  # pragma: no cover
+        _check(f"graph_data importable (skipped: {exc!r})", True)
+        return
+    df = pd.DataFrame({
+        "amount": [1.0, 2.5, 3.0, 4.0],              # native numeric
+        "code": ["10", "20", "30", "40"],            # string-encoded numeric
+        "category": ["a", "b", "a", "b"],            # low-cardinality
+    })
+    infos = {c.name: c for c in gd._introspect_columns(df)}
+    _check("native numeric detected", infos["amount"].dtype == "numeric")
+    _check("string-encoded numeric detected via coercion",
+           infos["code"].dtype == "numeric")
+    _check("low-cardinality column is categorical",
+           infos["category"].dtype == "categorical")
+    _check("numeric min/max/mean populated",
+           infos["amount"].min_val == 1.0 and infos["amount"].max_val == 4.0)
+    _check("coerced numeric min/max correct",
+           infos["code"].min_val == 10.0 and infos["code"].max_val == 40.0)
+
+
+def test_route_message_golden() -> None:
+    """route_message keyword routing is unchanged after hoisting its nine
+    phrase-lists to module scope (finding #10). Golden input->route map."""
+    import council_engine as ce
+    golden = {
+        "no code please, just text": "writer",
+        "what are you": "chat",
+        "how does the council work": "chat",
+        "thumbnail and ctr optimization for my channel": "algorithm",
+        "my delivery sounds monotone": "coach",
+        "brainstorm some video ideas": "ideator",
+        "flesh out this idea into a full pitch": "pitcher",
+        "youtube video script for my channel": "content",
+        "hello there friend": "chat",
+        "https://example.com please summarize": "chat",
+        "implement a python function to sort": "ide",
+        "refactor this class for me": "ide",
+        "what did we discuss last session": "chat",
+        "give me ideas for a video about cats": "ideator",
+        "write a blog post about dogs": "content",
+        "deploy to pi via ssh": "chat",
+        "color grade and b-roll for the edit": "content",
+        "analyze the sales csv and compute averages": "chat",
+        "how many files in data_in": "chat",
+        "tell me about yourself": "chat",
+        "plain text answer only": "writer",
+        "pitch me ideas": "ideator",
+    }
+    for q, expected in golden.items():
+        got = ce.route_message(q)
+        _check(f"route {q!r} -> {expected}", got == expected,
+               detail=f"got {got!r}")
+
+
 def test_read_file_injection_memo() -> None:
     """_read_file_for_injection memoizes on (resolved path, mtime, size): the
     cached read is byte-identical to the uncached one, it invalidates when the
@@ -3341,6 +3402,10 @@ def main() -> int:
          test_fast_answer_direct_route)
     _run("provenance source resolution (answer chips)",
          test_provenance_source_resolve)
+    _run("graph introspect columns (numeric/coerce/categorical)",
+         test_graph_introspect_columns)
+    _run("route_message golden (routing unchanged)",
+         test_route_message_golden)
     _run("read-file injection memo (identical + invalidates)",
          test_read_file_injection_memo)
     _run("context clamp (prevents ctx-overflow abort)",

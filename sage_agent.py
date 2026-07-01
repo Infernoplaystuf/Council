@@ -23,6 +23,10 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+
+# TF-IDF tokenizer (3+ alphanumerics), compiled once — used for the query and
+# once per record during scoring.
+_SAGE_TOKEN_RE = re.compile(r"[a-zA-Z0-9]{3,}")
 from typing import Any, Callable, Dict, List, Optional
 
 
@@ -103,17 +107,22 @@ class SageKnowledge:
         )
         n_docs = max(len(all_records), 1)
 
+        # Lowercase + tokenize each record ONCE into parallel arrays (both the
+        # DF pass and the scoring pass need them). Kept OFF the rec dict — the
+        # result cleaner below only strips "_text", so extra keys would leak.
+        rec_text_low = [rec["_text"].lower() for rec in all_records]
+        rec_terms = [set(_SAGE_TOKEN_RE.findall(tl)) for tl in rec_text_low]
+
         # Build document frequency for IDF
         df: Dict[str, int] = {}
-        for rec in all_records:
-            terms = set(re.findall(r"[a-zA-Z0-9]{3,}", rec["_text"].lower()))
+        for terms in rec_terms:
             for t in terms:
                 df[t] = df.get(t, 0) + 1
 
         scored: List[tuple] = []
-        for rec in all_records:
-            text_low = rec["_text"].lower()
-            terms    = set(re.findall(r"[a-zA-Z0-9]{3,}", text_low))
+        for _i, rec in enumerate(all_records):
+            text_low = rec_text_low[_i]
+            terms    = rec_terms[_i]
             n_terms  = max(len(terms), 1)
 
             score = 0.0

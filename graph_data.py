@@ -129,31 +129,42 @@ def _introspect_columns(df: Any) -> List[ColumnInfo]:
         series = df[col]
         n_null = int(series.isna().sum())
 
-        if _is_numeric(series):
-            numeric = _PANDAS_OK and pd.to_numeric(series, errors="coerce")
+        # Numeric: native columns convert once (as before); non-native columns
+        # reuse the SAME coercion that decided they're numeric instead of
+        # computing pd.to_numeric twice. A None sentinel avoids evaluating a
+        # Series in a boolean context.
+        if pd.api.types.is_numeric_dtype(series):
+            numeric = pd.to_numeric(series, errors="coerce")
+        else:
+            numeric = _coerced_numeric_or_none(series)
+        if numeric is not None:
             infos.append(ColumnInfo(
                 name=str(col),
                 dtype="numeric",
                 n_null=n_null,
                 n_unique=int(series.nunique()),
-                min_val=float(numeric.min()) if _PANDAS_OK else None,
-                max_val=float(numeric.max()) if _PANDAS_OK else None,
-                mean_val=float(numeric.mean()) if _PANDAS_OK else None,
+                min_val=float(numeric.min()),
+                max_val=float(numeric.max()),
+                mean_val=float(numeric.mean()),
             ))
-        elif _is_datetime(series):
+            continue
+        if _is_datetime(series):
             infos.append(ColumnInfo(
                 name=str(col), dtype="datetime",
                 n_null=n_null, n_unique=int(series.nunique()),
             ))
-        elif series.nunique() <= max(20, len(series) * 0.1):
+            continue
+        # categorical vs text — nunique() computed once, not twice.
+        nu = int(series.nunique())
+        if nu <= max(20, len(series) * 0.1):
             infos.append(ColumnInfo(
                 name=str(col), dtype="categorical",
-                n_null=n_null, n_unique=int(series.nunique()),
+                n_null=n_null, n_unique=nu,
             ))
         else:
             infos.append(ColumnInfo(
                 name=str(col), dtype="text",
-                n_null=n_null, n_unique=int(series.nunique()),
+                n_null=n_null, n_unique=nu,
             ))
     return infos
 
@@ -165,6 +176,19 @@ def _is_numeric(series: Any) -> bool:
         return True
     converted = pd.to_numeric(series, errors="coerce")
     return converted.notna().mean() > 0.7
+
+
+def _coerced_numeric_or_none(series: Any):
+    """For a NON-native-numeric column, return pd.to_numeric(coerce) when >70%
+    of values coerce (so the caller can reuse it instead of recomputing), else
+    None. Native-numeric columns are handled separately by the caller and keep
+    their existing single conversion — so this never double-counts them."""
+    if not _PANDAS_OK:
+        return None
+    converted = pd.to_numeric(series, errors="coerce")
+    if converted.notna().mean() > 0.7:
+        return converted
+    return None
 
 
 def _is_datetime(series: Any) -> bool:
