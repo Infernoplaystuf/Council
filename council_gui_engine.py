@@ -1343,7 +1343,38 @@ def _render_bson_block(p):
     return '\n'.join(lines)
 
 
+# Small memo so a file read once during injection isn't re-opened and
+# re-parsed a second time in the same turn (the provenance pass reads the same
+# explicit paths). Keyed on (resolved path, mtime_ns, size) — a single stat()
+# is far cheaper than re-parsing a 50k-row CSV, and the key invalidates when
+# the file changes across turns. None results (missing/protected/dir) are NOT
+# cached, so protection is always re-checked.
+_FILE_INJECT_CACHE: dict = {}
+_FILE_INJECT_CACHE_MAX = 64
+
+
 def _read_file_for_injection(path_str):
+    """Memoizing wrapper over ``_read_file_for_injection_uncached`` (see it for
+    the real read + the protected-path guard). Returns byte-identical blocks;
+    falls through to the uncached read whenever the path can't be stat'd."""
+    try:
+        p = Path(str(path_str).strip())
+        st = p.stat()
+        key = (str(p.resolve()).lower(), st.st_mtime_ns, st.st_size)
+    except Exception:
+        return _read_file_for_injection_uncached(path_str)
+    hit = _FILE_INJECT_CACHE.get(key)
+    if hit is not None:
+        return hit
+    block = _read_file_for_injection_uncached(path_str)
+    if block is not None:
+        if len(_FILE_INJECT_CACHE) >= _FILE_INJECT_CACHE_MAX:
+            _FILE_INJECT_CACHE.clear()
+        _FILE_INJECT_CACHE[key] = block
+    return block
+
+
+def _read_file_for_injection_uncached(path_str):
     """Read a file into a compact prompt block. CSVs get headers + sample
     rows; large rows are abbreviated so the header line always survives the
     model's context window.
@@ -1787,6 +1818,24 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
     #
     # Compact renderer caps at ~3.5 KB even on 1000-file vaults, so a
     # 4 K-ctx model has headroom for the user text + reply reserve.
+    #
+    # Rebuild the vault index ONCE per turn when we'll consult it (no explicit
+    # paths). The folder-summary render(s) below and the vault-search branch
+    # each used to trigger their own rebuild() on the same singleton — 2-3 full
+    # rglob walks + a stat() per file per turn. rebuild() is delta-aware and
+    # idempotent, so one consolidated call yields byte-identical folder + search
+    # blocks. Passed into the renders via vault_index= so they skip re-walking.
+    _vault_idx = None
+    if not explicit_paths:
+        _vault_idx = _get_vault_index()
+        if _vault_idx is not None:
+            try:
+                import council_engine as _ce_tim0
+                with _ce_tim0._TimingScope("vault.rebuild"):
+                    _vault_idx.rebuild()
+            except Exception as _rb_exc:
+                print('[DEBUG inject] vault index rebuild failed: '
+                      + repr(_rb_exc), file=_sys_dbg.stderr)
     if (_vault_search_keywords(user_text)
             and not explicit_paths
             and analyst_block is None):
@@ -1796,7 +1845,8 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
         except Exception:
             vault_data_in = VAULT_DIR
         try:
-            vault_folder_block = _render_folder_summary_compact(vault_data_in)
+            vault_folder_block = _render_folder_summary_compact(
+                vault_data_in, vault_index=_vault_idx)
         except Exception as _e:
             print('[DEBUG inject] vault folder render failed: ' + repr(_e),
                   file=_sys_dbg.stderr)
@@ -1821,7 +1871,8 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
             sub = None
         if sub is not None and sub != vault_data_in:
             try:
-                sub_block = _render_folder_summary_compact(sub)
+                sub_block = _render_folder_summary_compact(
+                    sub, vault_index=_vault_idx)
             except Exception:
                 sub_block = None
             if sub_block:
@@ -1839,12 +1890,9 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
     # budget and frequently caused the explicit file to get truncated.
     folder_scope = _detect_folder_scope(user_text)
     if not explicit_paths:
-        idx = _get_vault_index()
+        idx = _vault_idx   # rebuilt once at the top of this region
         if idx is not None:
             try:
-                import council_engine as _ce_tim
-                with _ce_tim._TimingScope("vault.rebuild"):
-                    idx.rebuild()
                 # When analyst already answered (#7), reduce the vault-match
                 # pull from 5 to 1 — the analyst's CSV is the authoritative
                 # source and 5 fuzzy matches just consume budget.
@@ -16129,20 +16177,27 @@ class CouncilConsole(tk.Tk):
         # collection members), (b) vault-match / file / folder injection
         # labels, and (c) files the user named explicitly. Rendered as
         # clickable chips under the final answer (fast path + deliberation).
+        # Explicit paths the user named — computed ONCE and reused at all three
+        # post-injection sites below (source assembly, injected-names notice,
+        # provenance). original_user_text == user_text here (user_text isn't
+        # reassigned to the augmented text until later), and _extract_file_paths
+        # is a pure function of its text, so one call is byte-identical to three
+        # (each did a full unicodedata scan + regex + per-path resolve()).
+        try:
+            _explicit_paths_turn = _extract_file_paths(original_user_text)
+        except Exception:
+            _explicit_paths_turn = []
         _turn_sources: list = list(_analyst_sources)
         for _lbl in _labels:
             _m = _SOURCE_LABEL_RE.match(_lbl)
             if _m:
                 _turn_sources.append(_m.group(1).strip())
-        try:
-            _turn_sources.extend(_extract_file_paths(original_user_text))
-        except Exception:
-            pass
+        _turn_sources.extend(_explicit_paths_turn)
         self._last_turn_sources = _turn_sources
         if was_injected:
             # Filter out empty names (Path("/").name == "" etc) so we don't
             # render "Reading: , , " on edge-case paths.
-            injected_names = [n for n in (Path(p).name for p in _extract_file_paths(user_text)) if n]
+            injected_names = [n for n in (Path(p).name for p in _explicit_paths_turn) if n]
             if injected_names:
                 self._append_transcript("Council", "Reading: " + ", ".join(injected_names), "observation")
             elif _has_vault:
@@ -16230,8 +16285,10 @@ class CouncilConsole(tk.Tk):
             if hasattr(self, "provenance"):
                 import provenance as _prov_mod
                 injected_records = []
-                # Recorded file paths (explicit user-given paths)
-                for p_str in _extract_file_paths(original_user_text):
+                # Recorded file paths (explicit user-given paths) — reuse the
+                # once-computed list; _read_file_for_injection is now memoized
+                # so this doesn't re-parse files injection already read.
+                for p_str in _explicit_paths_turn:
                     block = _read_file_for_injection(p_str)
                     if block:
                         injected_records.append(_prov_mod.InjectedBlock(

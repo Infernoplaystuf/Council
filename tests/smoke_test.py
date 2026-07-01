@@ -2392,6 +2392,48 @@ def test_provenance_source_resolve() -> None:
                 cge.VAULT_DIR = prev
 
 
+def test_read_file_injection_memo() -> None:
+    """_read_file_for_injection memoizes on (resolved path, mtime, size): the
+    cached read is byte-identical to the uncached one, it invalidates when the
+    file changes, and it still returns None for directories/missing files."""
+    import time as _t
+    try:
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_gui_engine importable (skipped: {exc!r})", True)
+        return
+    prev = getattr(cge, "VAULT_DIR", None)
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td)
+        csv = vault / "orders.csv"
+        csv.write_text("order_id,total\n1,10\n2,20\n")
+        try:
+            cge.VAULT_DIR = vault
+            cge._FILE_INJECT_CACHE.clear()
+            cached = cge._read_file_for_injection(str(csv))
+            uncached = cge._read_file_for_injection_uncached(str(csv))
+            _check("memoized read is byte-identical to uncached",
+                   cached == uncached and cached is not None)
+            # Second call returns the same object from cache.
+            again = cge._read_file_for_injection(str(csv))
+            _check("second read returns identical block", again == cached)
+            # Change the file -> the memo invalidates (mtime/size differ).
+            _t.sleep(1.1)
+            csv.write_text("order_id,total\n1,10\n2,20\n3,999\n")
+            fresh = cge._read_file_for_injection(str(csv))
+            _check("changed file invalidates the memo",
+                   fresh != cached and "999" in fresh)
+            # Directory and missing path still return None (not cached).
+            _check("directory returns None",
+                   cge._read_file_for_injection(str(vault)) is None)
+            _check("missing file returns None",
+                   cge._read_file_for_injection(str(vault / "nope.csv")) is None)
+        finally:
+            cge._FILE_INJECT_CACHE.clear()
+            if prev is not None:
+                cge.VAULT_DIR = prev
+
+
 def test_context_clamp() -> None:
     """_clamp_messages_to_ctx keeps prompt+reply within n_ctx so an over-long
     prompt can never trigger llama-cpp's 'exceeds context window' native abort.
@@ -3271,6 +3313,8 @@ def main() -> int:
          test_fast_answer_direct_route)
     _run("provenance source resolution (answer chips)",
          test_provenance_source_resolve)
+    _run("read-file injection memo (identical + invalidates)",
+         test_read_file_injection_memo)
     _run("context clamp (prevents ctx-overflow abort)",
          test_context_clamp)
     _run("describe non-text routing (no model on binaries)",
