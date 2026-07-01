@@ -5384,6 +5384,7 @@ class CouncilConsole(tk.Tk):
                        self._build_lens_tab,
                        self._build_sessions_tab,
                        self._build_vault_manager_tab,
+                       self._build_agent_jobs_tab,
                        self._build_speech_tab,
                        self._build_changelog_tab,
                        self._build_diagnostics_tab):
@@ -8638,6 +8639,216 @@ class CouncilConsole(tk.Tk):
                    command=self._apply_pi_hosts).pack(side="left")
 
     # ---- Agents tab ----
+
+    # ============================
+    # Agent Jobs — autonomous, goal-driven background agents
+    # ============================
+    def _get_job_runner(self):
+        """Lazily build the single background JobRunner (one daemon worker;
+        the GGUF serialises inference so one worker is correct). Marks any job
+        left 'running' by a prior crash as failed — MVP has no auto-resume."""
+        jr = getattr(self, "_job_runner", None)
+        if jr is not None:
+            return jr
+        import agent_jobs_runner as _ajr
+        try:
+            _fr = data_index.input_dir(VAULT_DIR)
+        except Exception:
+            _fr = VAULT_DIR
+        jr = _ajr.JobRunner(vault_dir=VAULT_DIR, ui_q=self.ui_q, file_root=_fr)
+        try:
+            import agent_jobs as _aj
+            for _j in jr.store.running():
+                jr.store.set_status(_j.job_id, _aj.JobStatus.FAILED.value,
+                                    "interrupted by a restart")
+        except Exception:
+            pass
+        self._job_runner = jr
+        return jr
+
+    def _build_agent_jobs_tab(self):
+        import tkinter as tk
+        from tkinter import ttk
+        self.tab_agent_jobs = ttk.Frame(self.nb)
+        self.nb.add(self.tab_agent_jobs, text="🎯 Agent Jobs")
+        self._aj_tree_iids = {}
+        self._aj_iid_to_job = {}
+
+        top = ttk.Frame(self.tab_agent_jobs)
+        top.pack(fill="x", padx=10, pady=(8, 4))
+        ttk.Label(top, font=("", 10, "bold"),
+                  text="Give the agent a goal — it plans and runs read-only "
+                       "steps in the background to achieve it.").pack(anchor="w")
+        ttk.Label(top, foreground="#7a7575", justify="left",
+                  text="Safe by design: it can only list / read / analyse your "
+                       "data in data_in. No delete, no writes, no network — those "
+                       "tools don't exist. Bounded by a step budget; cancellable.").pack(
+            anchor="w", pady=(0, 4))
+        self._aj_goal = self._make_text(top, wrap="word", height=3)
+        self._aj_goal.pack(fill="x")
+        row = ttk.Frame(top)
+        row.pack(fill="x", pady=4)
+        ttk.Label(row, text="Max steps:").pack(side="left")
+        self._aj_maxsteps = tk.IntVar(value=6)
+        ttk.Spinbox(row, from_=2, to=20, width=4,
+                    textvariable=self._aj_maxsteps).pack(side="left", padx=(4, 10))
+        ttk.Button(row, text="▶ Start job",
+                   command=self._aj_start).pack(side="left")
+        ttk.Button(row, text="⟳ Refresh",
+                   command=self._aj_refresh).pack(side="left", padx=6)
+
+        mid = ttk.Frame(self.tab_agent_jobs)
+        mid.pack(fill="both", expand=True, padx=10, pady=4)
+        cols = ("status", "goal", "steps")
+        self._aj_tree = ttk.Treeview(mid, columns=cols, show="headings",
+                                     height=8)
+        for c, w in (("status", 90), ("goal", 520), ("steps", 60)):
+            self._aj_tree.heading(c, text=c.title())
+            self._aj_tree.column(c, width=w, anchor="w")
+        self._aj_tree.pack(side="left", fill="both", expand=True)
+        _sb = ttk.Scrollbar(mid, orient="vertical",
+                            command=self._aj_tree.yview)
+        _sb.pack(side="right", fill="y")
+        self._aj_tree.configure(yscrollcommand=_sb.set)
+        self._aj_tree.bind("<<TreeviewSelect>>",
+                           lambda e: self._aj_show_selected())
+
+        jb = ttk.Frame(self.tab_agent_jobs)
+        jb.pack(fill="x", padx=10)
+        ttk.Button(jb, text="■ Cancel", command=self._aj_cancel).pack(side="left")
+        ttk.Button(jb, text="🔎 Open report",
+                   command=self._aj_inspect).pack(side="left", padx=6)
+        ttk.Button(jb, text="🗑 Remove finished",
+                   command=self._aj_clear_finished).pack(side="left", padx=6)
+        self._aj_status = tk.StringVar(value="")
+        ttk.Label(jb, textvariable=self._aj_status,
+                  foreground="#a6e3a1").pack(side="left", padx=10)
+
+        ttk.Label(self.tab_agent_jobs, text="Step log").pack(anchor="w", padx=10)
+        self._aj_log = self._make_text(self.tab_agent_jobs, wrap="word",
+                                       height=10, state="disabled")
+        self._aj_log.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        self._aj_refresh()
+
+    def _aj_start(self):
+        goal = self._aj_goal.get("1.0", "end").strip()
+        if not goal:
+            self._aj_status.set("Enter a goal first.")
+            return
+        jr = self._get_job_runner()
+        jid = jr.submit(goal, max_steps=int(self._aj_maxsteps.get()))
+        self._set_text(self._aj_goal, "")
+        self._aj_status.set(f"Started {jid}. Watch the step log below.")
+        self._aj_log_append(f"▶ {jid}: {goal}")
+        self._aj_refresh()
+
+    def _aj_selected_job_id(self):
+        sel = self._aj_tree.selection()
+        return self._aj_iid_to_job.get(sel[0]) if sel else None
+
+    def _aj_cancel(self):
+        jid = self._aj_selected_job_id()
+        if not jid:
+            self._aj_status.set("Select a job to cancel.")
+            return
+        self._get_job_runner().cancel(jid)
+        self._aj_status.set(f"Cancelling {jid} after the current step…")
+
+    def _aj_inspect(self):
+        jid = self._aj_selected_job_id()
+        if not jid:
+            return
+        j = self._get_job_runner().store.get(jid)
+        if j is not None and j.report_path and Path(j.report_path).exists():
+            self._preview_data_file(j.report_path)
+        elif j is not None:
+            self._aj_set_log(self._aj_render_job(j))
+
+    def _aj_clear_finished(self):
+        import agent_jobs as _aj
+        jr = self._get_job_runner()
+        _fin = {_aj.JobStatus.DONE.value, _aj.JobStatus.FAILED.value,
+                _aj.JobStatus.CANCELLED.value}
+        for j in jr.store.all():
+            if j.status in _fin:
+                jr.store.delete(j.job_id)
+        self._aj_refresh()
+
+    def _aj_show_selected(self):
+        jid = self._aj_selected_job_id()
+        if not jid:
+            return
+        j = self._get_job_runner().store.get(jid)
+        if j is not None:
+            self._aj_set_log(self._aj_render_job(j))
+
+    def _aj_render_job(self, j):
+        lines = [f"Job {j.job_id} — {j.status}", f"Goal: {j.goal}", ""]
+        for s in j.steps:
+            lines.append(
+                f"{s.index}. {s.label}"
+                + (f" — {s.observation[:180]}" if s.observation else "")
+                + (f"  ⚠ {s.error}" if s.error else ""))
+        if j.result_summary:
+            lines += ["", "Answer:", j.result_summary]
+        if j.report_path:
+            lines += ["", f"Report: {j.report_path}"]
+        return "\n".join(lines)
+
+    def _aj_set_log(self, text):
+        w = getattr(self, "_aj_log", None)
+        if w is None:
+            return
+        try:
+            w.configure(state="normal")
+            w.delete("1.0", "end")
+            w.insert("1.0", text)
+            w.see("end")
+            w.configure(state="disabled")
+        except tk.TclError:
+            pass
+
+    def _aj_log_append(self, text):
+        w = getattr(self, "_aj_log", None)
+        if w is None:
+            return
+        try:
+            w.configure(state="normal")
+            w.insert("end", text + "\n")
+            w.see("end")
+            w.configure(state="disabled")
+        except tk.TclError:
+            pass
+
+    def _aj_refresh(self):
+        tree = getattr(self, "_aj_tree", None)
+        if tree is None:
+            return
+        jr = self._get_job_runner()
+        tree.delete(*tree.get_children())
+        self._aj_tree_iids = {}
+        self._aj_iid_to_job = {}
+        for j in sorted(jr.store.all(), key=lambda x: -x.updated_ts):
+            iid = tree.insert("", "end",
+                              values=(j.status, j.goal[:120], len(j.steps)))
+            self._aj_tree_iids[j.job_id] = iid
+            self._aj_iid_to_job[iid] = j.job_id
+
+    def _aj_update_row(self, job_id):
+        tree = getattr(self, "_aj_tree", None)
+        if tree is None:
+            return
+        j = self._get_job_runner().store.get(job_id)
+        if j is None:
+            return
+        vals = (j.status, j.goal[:120], len(j.steps))
+        iid = self._aj_tree_iids.get(job_id)
+        if iid and tree.exists(iid):
+            tree.item(iid, values=vals)
+        else:
+            iid = tree.insert("", "end", values=vals)
+            self._aj_tree_iids[job_id] = iid
+            self._aj_iid_to_job[iid] = job_id
 
     def _build_agents_tab(self):
         self.tab_agents = ttk.Frame(self.nb)
@@ -17134,6 +17345,28 @@ class CouncilConsole(tk.Tk):
                                           + "\n".join("  • " + c for c in _changes)
                                           + "\n")
                             self._set_judge(txt + _chg_block)
+
+                elif kind == "job_status":
+                    # Agent-job lifecycle event from the background JobRunner.
+                    _, job_id, status = item
+                    self._aj_update_row(job_id)
+                    self._aj_log_append(f"• {job_id}: {status}")
+
+                elif kind == "job_step":
+                    _, job_id, step = item
+                    self._aj_update_row(job_id)
+                    _obs = (step.get("observation") or "")
+                    self._aj_log_append(
+                        f"  {job_id} · step {step.get('index')} · "
+                        f"{step.get('label')}"
+                        + (f" — {_obs[:160]}" if _obs else ""))
+
+                elif kind == "job_done":
+                    _, job_id, status, summary = item
+                    self._aj_update_row(job_id)
+                    self._aj_log_append(
+                        f"✓ {job_id}: {status}"
+                        + (f" — {str(summary)[:200]}" if summary else ""))
 
                 elif kind == "ide_fill":
                     # IDE tab is advanced-only; ignore the fill event in
