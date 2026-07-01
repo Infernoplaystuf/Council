@@ -1248,6 +1248,73 @@ def context_budget_report(prompt_text: str) -> Dict[str, Any]:
     }
 
 
+def _clamp_messages_to_ctx(
+    messages: List[Dict[str, str]], num_predict: int,
+) -> Tuple[List[Dict[str, str]], int]:
+    """Guarantee ``prompt_tokens + reply_tokens <= n_ctx`` BEFORE handing the
+    prompt to llama-cpp. An over-long prompt is the classic "exceeds context
+    window" failure; on some llama-cpp builds that is a native abort (SIGABRT)
+    that Python cannot catch, which is exactly the kind of crash that takes the
+    whole app down mid-"build descriptions" on a small-ctx box.
+
+    Strategy (never raises, always returns a usable pair):
+      • reserve a reply budget (capped so it can't eat the whole window),
+      • if the prompt still overflows, head+tail trim the LARGEST message
+        (with a visible marker) until it fits.
+    Returns ``(messages, safe_max_tokens)``.
+    """
+    try:
+        n_ctx = int(get_n_ctx())
+    except Exception:
+        n_ctx = 4096
+    if n_ctx <= 0:
+        n_ctx = 4096
+
+    def _est(s: str) -> int:
+        try:
+            return max(1, int(estimate_tokens(s or "")))
+        except Exception:
+            return max(1, (len(s or "") + 3) // 4)
+
+    # Reply budget: honour the caller but never let it (or the margin) exceed
+    # the window. 64 tokens of slack covers chat-template / role tokens.
+    margin = 64
+    reply = max(16, min(int(num_predict), max(16, (n_ctx - margin) // 2)))
+    prompt_budget = max(64, n_ctx - reply - margin)
+
+    msgs = [dict(m) for m in messages]
+    total = sum(_est(m.get("content", "")) for m in msgs)
+    if total <= prompt_budget:
+        return msgs, reply
+
+    # Overflow — head+tail trim the largest message(s) to recover the deficit.
+    # Trimming the biggest block (usually the injected context / file sample)
+    # preserves short system + instruction messages.
+    #
+    # Termination: the marker length is SUBTRACTED from the char target, so a
+    # trimmed message is strictly within its token share (2*half + len(marker)
+    # <= target_chars). Without that, 2*half + len(marker) exceeds the target
+    # and the content can never shrink past the break threshold — an infinite
+    # loop. A hard pass cap (one trim per message + slack) is the backstop.
+    marker = "\n…[trimmed to fit the model's context window]…\n"
+    mlen = len(marker)
+    for _ in range(len(msgs) + 2):
+        total = sum(_est(m.get("content", "")) for m in msgs)
+        if total <= prompt_budget:
+            break
+        big_i = max(range(len(msgs)),
+                    key=lambda i: _est(msgs[i].get("content", "")))
+        content = msgs[big_i].get("content", "") or ""
+        other = total - _est(content)
+        avail = max(24, prompt_budget - other)      # tokens this msg may keep
+        target_chars = max(80, avail * 4 - mlen)    # leave room for the marker
+        if len(content) <= target_chars:
+            break            # can't recover more by trimming this message
+        half = target_chars // 2
+        msgs[big_i]["content"] = content[:half] + marker + content[-half:]
+    return msgs, reply
+
+
 def _gguf_chat(
     messages: List[Dict[str, str]],
     *,
@@ -1256,6 +1323,7 @@ def _gguf_chat(
 ) -> str:
     """Blocking GGUF chat completion using the loaded llama-cpp model."""
     llm = _get_gguf_model()
+    messages, num_predict = _clamp_messages_to_ctx(messages, num_predict)
     # Serialize against every other inference call on the same Llama
     # instance — see _INFERENCE_LOCK docstring at module top for why.
     with _INFERENCE_LOCK:
@@ -1280,6 +1348,7 @@ def _gguf_chat_stream(
 ) -> str:
     """Streaming GGUF chat completion — emits each token via token_callback."""
     llm = _get_gguf_model()
+    messages, num_predict = _clamp_messages_to_ctx(messages, num_predict)
     pieces: list[str] = []
     # Hold the inference lock for the entire stream. Releasing between
     # chunks would let another call slip in and corrupt the in-progress

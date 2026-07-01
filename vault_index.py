@@ -244,6 +244,26 @@ def _parse_topics_line(text: str) -> List[str]:
     return out[:6]
 
 
+# Record types that carry no model-readable TEXT — describing them with the
+# LLM means feeding it an empty or binary-ish prompt (a waste at best, and on
+# a fragile build one more native model call that can take the app down). They
+# get a deterministic name/type description instead.
+_NON_TEXT_DESCRIBE_TYPES = {"image", "audio", "video", "binary", "unknown",
+                            "archive", "executable", ""}
+
+
+def _describe_nontext(rec: Dict[str, Any]) -> Tuple[str, List[str]]:
+    """Deterministic description + topics for a non-text file (image, audio,
+    binary, …) — no model call. Topics come from the filename tokens."""
+    name = str(rec.get("name", "") or "file")
+    rtype = str(rec.get("type", "") or "file")
+    stem = name.rsplit(".", 1)[0]
+    topics = [t for t in re.findall(r"[a-z0-9]+", stem.lower()) if len(t) > 1]
+    article = "an" if rtype[:1] in "aeiou" else "a"
+    desc = f"{name} — {article} {rtype} file (no text content to summarise)."
+    return desc, topics[:6]
+
+
 def _render_record_for_describe(idx: int, rec: Dict[str, Any]) -> str:
     """Render one record into a compact block the model can read.
 
@@ -2595,15 +2615,38 @@ the vocabulary list. Lowercase only. Single line only.
                          "sqlite", "duckdb"}
         tabular: List[Tuple[str, Dict[str, Any]]] = []
         modelable: List[Tuple[str, Dict[str, Any]]] = []
+        nontext: List[Tuple[str, Dict[str, Any]]] = []
         for spath, rec in candidates:
-            if rec.get("type") in tabular_kinds:
+            rtype = rec.get("type")
+            if rtype in tabular_kinds:
                 tabular.append((spath, rec))
+            elif (rtype in _NON_TEXT_DESCRIBE_TYPES
+                  or not (str(rec.get("sample_text", "") or "").strip()
+                          or rec.get("keys"))):
+                # No model-readable text → deterministic, no model call. This
+                # is the "build descriptions breaks on non-text files" guard:
+                # images / binaries / empty records never reach the LLM.
+                nontext.append((spath, rec))
             else:
                 modelable.append((spath, rec))
 
         updated = 0
         progressed = 0
         total = len(candidates)
+
+        # ── Non-text records: instant, no model call ──────────────────
+        for spath, rec in nontext:
+            desc, topics = _describe_nontext(rec)
+            rec["description"] = (desc or "")[:800]
+            rec["topics"]      = (topics or [])[:6]
+            rec["_describe_via"] = "nontext"
+            updated += 1
+            progressed += 1
+            if on_progress:
+                try:
+                    on_progress(progressed, total, rec.get("name", spath))
+                except Exception:
+                    pass
 
         # ── Tabular records: instant, no model call ────────────────────
         for spath, rec in tabular:
