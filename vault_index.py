@@ -189,9 +189,10 @@ def _expand(term: str) -> Set[str]:
     t = term.lower().strip()
     if not t or len(t) < 2:
         return set()
-    out: Set[str] = {t, _stem(t)}
+    st = _stem(t)                      # stem once, reused below
+    out: Set[str] = {t, st}
     # Look up both raw and stemmed forms
-    for w in (t, _stem(t)):
+    for w in (t, st):
         if w in SYNONYMS:
             for syn in SYNONYMS[w]:
                 out.add(syn.lower())
@@ -461,6 +462,9 @@ def _describe_from_schema(rec: Dict[str, Any]) -> Tuple[str, List[str]]:
 
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
 _HEX_RE = re.compile(r"^[0-9a-f]+$", re.IGNORECASE)
+# Splits a multi-value cell ("a|b;c") — used per sampled cell in all three
+# tabular parsers, so it's compiled once here rather than per call.
+_CELL_SPLIT_RE = re.compile(r"[|;,/]")
 
 
 def _is_useful_token(t: str) -> bool:
@@ -476,8 +480,12 @@ def _tokenize(text: str) -> List[str]:
     """Lowercase alpha-numeric tokens. Splits on underscores and other punctuation
     so `Ultimate_Games_Dataset` indexes as ['ultimate','games','dataset'].
     Filters hex hashes and overly long tokens that pollute the keyword set."""
-    return [t.lower() for t in _TOKEN_RE.findall(text or "")
-            if _is_useful_token(t.lower())]
+    out: List[str] = []
+    for t in _TOKEN_RE.findall(text or ""):
+        tl = t.lower()                 # lower once, not twice per token
+        if _is_useful_token(tl):
+            out.append(tl)
+    return out
 
 
 def _select_top_keywords(kw_set: Set[str], cap: int) -> List[str]:
@@ -641,7 +649,7 @@ def _parse_csv(p: Path) -> Dict[str, Any]:
                         # Skip URL cells outright — they only add hex/path noise.
                         if cv.startswith("http://") or cv.startswith("https://"):
                             continue
-                        for part in re.split(r"[|;,/]", cv):
+                        for part in _CELL_SPLIT_RE.split(cv):
                             part = part.strip()
                             if 2 <= len(part) <= 80:
                                 keywords.update(_tokenize(part))
@@ -958,7 +966,7 @@ def _parse_excel(p: Path) -> Dict[str, Any]:
                         continue
                     if cv.startswith("http://") or cv.startswith("https://"):
                         continue
-                    for part in re.split(r"[|;,/]", cv):
+                    for part in _CELL_SPLIT_RE.split(cv):
                         part = part.strip()
                         if 2 <= len(part) <= 80:
                             keywords.update(_tokenize(part))
@@ -1003,7 +1011,7 @@ def _parse_tabular_df(p: Path, df, *, kind: str) -> Dict[str, Any]:
                 continue
             if cv.startswith("http://") or cv.startswith("https://"):
                 continue
-            for part in re.split(r"[|;,/]", cv):
+            for part in _CELL_SPLIT_RE.split(cv):
                 part = part.strip()
                 if 2 <= len(part) <= 80:
                     keywords.update(_tokenize(part))
@@ -1996,8 +2004,10 @@ the vocabulary list. Lowercase only. Single line only.
             # vault_dir and computed relative_to on every file.
             if _is_protected_fast(p):
                 continue
-            parts = {part.lower() for part in p.parts}
-            if "out" in parts and "pipelines" in parts:
+            # Cheap membership without allocating a lowercased set of every
+            # path segment per file; short-circuits on the first non-match.
+            if (any(seg.lower() == "out" for seg in p.parts)
+                    and any(seg.lower() == "pipelines" for seg in p.parts)):
                 lower_str = str(p).lower().replace("\\", "/")
                 if "/pipelines/out/" in lower_str or lower_str.endswith("/pipelines/out"):
                     continue

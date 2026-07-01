@@ -32,6 +32,11 @@ except ImportError:
     _OPENPYXL_OK = False
 
 
+# Number extractor for the free-text load fallback — compiled once, applied
+# per line of the input file.
+_NUM_RE = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+
+
 # ============================================================
 # DataSet — the unified data container
 # ============================================================
@@ -268,7 +273,7 @@ class DataLoader:
             # Strategy 2: extract all numbers per line
             rows = []
             for line in text.splitlines():
-                nums = re.findall(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", line)
+                nums = _NUM_RE.findall(line)
                 if nums:
                     rows.append([float(n) for n in nums])
 

@@ -309,6 +309,11 @@ def _is_wsl() -> bool:
 
 _FILE_PATH_RE = _re.compile(r'[a-zA-Z]:[/\\]\S+|/\S+')
 _FILE_READ_CHAR_LIMIT = 12000  # total chars per file in the injected block
+# Extracts the file/folder name out of an injection cost label like
+# "[VAULT MATCH: sales.csv]" / "[FILE: x]" / "[FOLDER: y]" — used per-label in
+# the per-turn provenance source assembly (hoisted out of that loop).
+_SOURCE_LABEL_RE = _re.compile(
+    r"\[(?:VAULT MATCH(?:\s*\(pinned\))?|FILE|FOLDER):\s*(.+?)\]")
 
 
 # ----- Token-aware injection helpers ---------------------------------------
@@ -534,7 +539,8 @@ def _search_vault_filenames(in_dir, term, limit: int = 200):
                 if f.startswith("."):
                     continue
                 full = _os.path.join(dp, f)
-                if all(w in full.lower() for w in words):
+                full_lc = full.lower()   # lower once per file, not per word
+                if all(w in full_lc for w in words):
                     out.append((full, "name match"))
                     if len(out) >= limit:
                         return out
@@ -14445,10 +14451,12 @@ class CouncilConsole(tk.Tk):
         except tk.TclError:
             return
         if who not in self._stream_buffers:
-            # New speaker — add header
+            # New speaker — add header. The dict is used only as a SET of
+            # speakers-seen (this membership test); the per-token text value is
+            # never read (it's .pop()/.clear()-ed), so we don't accumulate it —
+            # that += was an O(N^2) string realloc on the hottest UI path.
             self._stream_buffers[who] = ""
             self.stream_box.insert("end", f"\n{who}: ", self._role_tag(who))
-        self._stream_buffers[who] += token
         self.stream_box.insert("end", token)
         self._stream_box_dirty = True
 
@@ -16123,9 +16131,7 @@ class CouncilConsole(tk.Tk):
         # clickable chips under the final answer (fast path + deliberation).
         _turn_sources: list = list(_analyst_sources)
         for _lbl in _labels:
-            _m = _re.match(
-                r"\[(?:VAULT MATCH(?:\s*\(pinned\))?|FILE|FOLDER):\s*(.+?)\]",
-                _lbl)
+            _m = _SOURCE_LABEL_RE.match(_lbl)
             if _m:
                 _turn_sources.append(_m.group(1).strip())
         try:

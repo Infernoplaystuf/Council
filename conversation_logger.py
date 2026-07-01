@@ -51,6 +51,11 @@ PROTECTED_SUBDIRS: tuple = (
     "conversations",
 )
 
+# Lowercased once at import for the per-path membership test in
+# is_protected_path — that ran on every (path, folder) pair during vault-wide
+# walks and rebuilt this set each time.
+_PROTECTED_SUBDIRS_LC = frozenset(s.lower() for s in PROTECTED_SUBDIRS)
+
 
 def is_protected_path(path: Any, vault_dir: Any) -> bool:
     """True if `path` is inside one of the protected vault subdirs.
@@ -70,8 +75,8 @@ def is_protected_path(path: Any, vault_dir: Any) -> bool:
         # The path isn't under vault_dir at all — not "protected" by us
         # (it's just outside our scope).
         return False
-    parts = [seg.lower() for seg in rel.parts]
-    return bool(parts) and parts[0] in {s.lower() for s in PROTECTED_SUBDIRS}
+    parts = rel.parts
+    return bool(parts) and parts[0].lower() in _PROTECTED_SUBDIRS_LC
 
 
 # ============================================================

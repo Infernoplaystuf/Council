@@ -21,6 +21,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# TF-IDF tokenizer (3+ alphanumerics). Compiled once; used per chunk at index
+# time and per query at search time.
+_TOKEN_RE = re.compile(r"[a-zA-Z0-9]{3,}")
+
 # ── ChromaDB (optional) ──────────────────────────────────────
 try:
     import chromadb
@@ -440,7 +444,7 @@ class _TFIDFBackend:
             # Build term sets per chunk
             chunk_records = []
             for c in chunks:
-                terms = set(re.findall(r"[a-zA-Z0-9]{3,}", c["text"].lower()))
+                terms = set(_TOKEN_RE.findall(c["text"].lower()))
                 chunk_records.append({**c, "terms": terms})
                 for term in terms:
                     new_df[term] = new_df.get(term, 0) + 1
@@ -461,7 +465,7 @@ class _TFIDFBackend:
         if self._dirty or not self._index:
             self.index_vault(self.vault_dir)
 
-        q_terms = set(re.findall(r"[a-zA-Z0-9]{3,}", query.lower()))
+        q_terms = set(_TOKEN_RE.findall(query.lower()))
         if not q_terms:
             return []
 
