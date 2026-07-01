@@ -2445,6 +2445,122 @@ def test_graph_introspect_columns() -> None:
            infos["code"].min_val == 10.0 and infos["code"].max_val == 40.0)
 
 
+def test_agentic_jobs_core() -> None:
+    """Background agentic-job engine, driven by a SCRIPTED fake model (no GGUF):
+    the ConstrainedAgent loop runs read-only tools, persists each step, writes a
+    report, refuses unlisted tools (gap), and cancels at a step boundary. Also
+    checks the tool registry exposes ONLY the 3 read/compute tools (no
+    delete/write/network) — the structural security guarantee."""
+    import threading as _th
+    try:
+        import agent_jobs as aj
+        import agent_jobs_runner as ajr
+        from safe_agent import AgentPolicy
+        from tool_registry import build_default_registry
+    except Exception as exc:  # pragma: no cover
+        _check(f"agent-job modules importable (skipped: {exc!r})", True)
+        return
+
+    prev = os.environ.get("COUNCIL_VAULT_ROOT")
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["COUNCIL_VAULT_ROOT"] = td
+        try:
+            import data_index
+            vault = Path(td)
+            din = data_index.input_dir(vault)
+            din.mkdir(parents=True, exist_ok=True)
+            (din / "alpha.csv").write_text("a,b\n1,2\n3,4\n")
+
+            # ── Security: registry exposes ONLY the safe read/compute tools ──
+            pol = AgentPolicy(
+                allowed_tools=ajr._AGENT_TOOLS,
+                file_root=din, output_dir=vault / "out")
+            reg = build_default_registry(pol)
+            names = set(reg.as_dict().keys())
+            _check("registry exposes exactly the 3 safe tools",
+                   names == {"read_local_file", "run_pandas_analysis",
+                             "query_memory"})
+            _check("no delete/write/network tool is registered",
+                   not any(k in n for n in names
+                           for k in ("delete", "write", "remove", "http",
+                                     "sql_write", "unlink", "export")))
+            _check("registry is frozen (model can't extend it)", reg.frozen)
+
+            class FakeRunner:
+                def __init__(self, replies):
+                    self.replies = list(replies)
+                    self.i = 0
+
+                def chat(self, messages, max_tokens=None):
+                    r = (self.replies[self.i] if self.i < len(self.replies)
+                         else '{"action":"final","answer":"stop"}')
+                    self.i += 1
+                    return r
+
+            def _run_sync(runner, goal, job_id, max_steps=5, precancel=False):
+                jr = ajr.JobRunner(vault_dir=vault, ui_q=None,
+                                   file_root=din, runner=runner,
+                                   max_steps=max_steps)
+                job = aj.AgentJob(job_id=job_id, goal=goal, max_steps=max_steps)
+                jr.store.upsert(job)
+                jr._cancels[job_id] = _th.Event()
+                if precancel:
+                    jr._cancels[job_id].set()
+                jr._run_job(job_id)
+                return jr.store.get(job_id)
+
+            # ── Happy path: read a file, then finalize ──
+            done = _run_sync(FakeRunner([
+                '{"action":"tool","tool":"read_local_file","args":{"path":"alpha.csv"}}',
+                '{"action":"final","answer":"alpha.csv has columns a,b"}',
+            ]), "look at alpha.csv", "job_ok")
+            _check("job reaches DONE", done.status == aj.JobStatus.DONE.value)
+            _check("both steps persisted", len(done.steps) >= 2)
+            _check("a tool step ran read_local_file",
+                   any(s.tool == "read_local_file" for s in done.steps))
+            _check("final answer captured", "alpha.csv" in done.result_summary)
+            _check("report artifact was written",
+                   bool(done.report_path) and Path(done.report_path).exists())
+            _check("report lands in agent_jobs_out (not data_in)",
+                   "agent_jobs_out" in done.report_path
+                   and "data_in" not in Path(done.report_path).parent.name)
+
+            # ── Unlisted tool -> refused (gap), loop continues ──
+            gap = _run_sync(FakeRunner([
+                '{"action":"tool","tool":"delete_everything","args":{}}',
+                '{"action":"final","answer":"could not delete"}',
+            ]), "try to delete", "job_gap")
+            _check("unlisted tool produced a gap step (not executed)",
+                   any(s.kind == "gap" for s in gap.steps))
+            _check("job still finishes DONE after a refused tool",
+                   gap.status == aj.JobStatus.DONE.value)
+
+            # ── Cancellation at a step boundary ──
+            canc = _run_sync(FakeRunner([
+                '{"action":"tool","tool":"read_local_file","args":{"path":"alpha.csv"}}',
+            ] * 5), "loop forever", "job_cancel", precancel=True)
+            _check("pre-cancelled job ends CANCELLED",
+                   canc.status == aj.JobStatus.CANCELLED.value)
+            _check("cancel stops after the first step boundary",
+                   len(canc.steps) == 1)
+
+            # ── Store persistence across instances + queries ──
+            _check("running() excludes finished jobs",
+                   all(j.status != aj.JobStatus.RUNNING.value
+                       for j in aj.JobStore(vault).running()))
+            _check("jobs persist across store instances",
+                   {j.job_id for j in aj.JobStore(vault).all()}
+                   >= {"job_ok", "job_gap", "job_cancel"})
+            _check("delete removes a job",
+                   aj.JobStore(vault).delete("job_ok")
+                   and aj.JobStore(vault).get("job_ok") is None)
+        finally:
+            if prev is None:
+                os.environ.pop("COUNCIL_VAULT_ROOT", None)
+            else:
+                os.environ["COUNCIL_VAULT_ROOT"] = prev
+
+
 def test_route_message_golden() -> None:
     """route_message keyword routing is unchanged after hoisting its nine
     phrase-lists to module scope (finding #10). Golden input->route map."""
@@ -3402,6 +3518,8 @@ def main() -> int:
          test_fast_answer_direct_route)
     _run("provenance source resolution (answer chips)",
          test_provenance_source_resolve)
+    _run("agentic jobs core (autonomous loop, safe tools, cancel)",
+         test_agentic_jobs_core)
     _run("graph introspect columns (numeric/coerce/categorical)",
          test_graph_introspect_columns)
     _run("route_message golden (routing unchanged)",
