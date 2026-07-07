@@ -504,6 +504,16 @@ def stream_convert_file(src: Any, out_dir: Any, *,
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = stem or src.stem
     make_iter = _doc_iter_factory(src, max_json_bytes=max_json_bytes)
+    # A whole-file .json ARRAY is already fully parsed into memory by make_iter
+    # each call, so the two-pass design re-reads + re-parses it twice. Parse it
+    # ONCE and drive both passes from the cached list (peak memory unchanged:
+    # a single copy of the list is held instead of two sequential copies).
+    # .jsonl / .ndjson / .bson keep their genuinely-constant-memory streaming.
+    _cached_docs = (list(make_iter()) if src.suffix.lower() == ".json"
+                    else None)
+
+    def _docs():
+        return _cached_docs if _cached_docs is not None else make_iter()
 
     def _flat(doc):
         if not isinstance(doc, dict):
@@ -518,7 +528,7 @@ def stream_convert_file(src: Any, out_dir: Any, *,
     schema: Dict[str, Dict[str, Any]] = {}
     sample_rows: List[Dict[str, Any]] = []
     doc_count = 0
-    for doc in make_iter():
+    for doc in _docs():
         if max_docs and doc_count >= max_docs:
             break
         row = _flat(doc)
@@ -581,7 +591,7 @@ def stream_convert_file(src: Any, out_dir: Any, *,
             w = _csv.DictWriter(fh, fieldnames=columns, extrasaction="ignore")
             w.writeheader()
             n = 0
-            for doc in make_iter():
+            for doc in _docs():
                 if max_docs and n >= max_docs:
                     break
                 w.writerow(_flat(doc))

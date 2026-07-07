@@ -1511,7 +1511,7 @@ def _record_has_content(rec: Dict[str, Any]) -> bool:
     return False
 
 
-def _index_file(p: Path) -> Optional[Dict[str, Any]]:
+def _index_file(p: Path, prefetched_stat=None) -> Optional[Dict[str, Any]]:
     suffix = p.suffix.lower()
     if suffix == ".csv":
         rec = _parse_csv(p)
@@ -1554,10 +1554,15 @@ def _index_file(p: Path) -> Optional[Dict[str, Any]]:
     # model sees an empty [VAULT MATCH] block.
     if not _record_has_content(rec):
         return None
-    try:
-        st = p.stat()
-    except Exception:
-        return None
+    # Reuse the stat the rebuild walk already took (one stat/file instead of
+    # two); also removes latent re-index churn from comparing two separate
+    # stats of the same file taken microseconds apart.
+    st = prefetched_stat
+    if st is None:
+        try:
+            st = p.stat()
+        except Exception:
+            return None
     rec["path"] = str(p)
     rec["name"] = p.name
     rec["mtime"] = st.st_mtime
@@ -2017,13 +2022,14 @@ the vocabulary list. Lowercase only. Single line only.
             spath = str(p)
             seen.add(spath)
             try:
-                mtime = p.stat().st_mtime
+                st = p.stat()
             except Exception:
                 continue
+            mtime = st.st_mtime
             existing = self.records.get(spath)
             if existing and existing.get("mtime") == mtime:
                 continue   # unchanged since last index, skip
-            to_index.append((p, mtime))
+            to_index.append((p, st))   # carry the stat into _index_file
 
         # ── Phase 2: parse in parallel ────────────────────────────────────
         n_updated = 0
@@ -2034,14 +2040,14 @@ the vocabulary list. Lowercase only. Single line only.
         elif total == 1 or (max_workers is not None and max_workers <= 1):
             # Serial fallback. Useful for very small batches (threading
             # overhead would dwarf the work) and for debugging.
-            for i, (p, _mtime) in enumerate(to_index, 1):
+            for i, (p, _st) in enumerate(to_index, 1):
                 spath = str(p)
                 if progress is not None:
                     try:
                         progress(i, total, p.name)
                     except Exception:
                         pass
-                rec = _index_file(p)
+                rec = _index_file(p, _st)
                 if rec:
                     self.records[spath] = rec
                     n_updated += 1
@@ -2056,7 +2062,7 @@ the vocabulary list. Lowercase only. Single line only.
             done = 0
             with ThreadPoolExecutor(max_workers=workers,
                                     thread_name_prefix="vault-index") as ex:
-                futures = {ex.submit(_index_file, p): p for p, _ in to_index}
+                futures = {ex.submit(_index_file, p, st): p for p, st in to_index}
                 for fut in as_completed(futures):
                     done += 1
                     p = futures[fut]
