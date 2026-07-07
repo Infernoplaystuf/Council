@@ -203,6 +203,32 @@ K. AGENT JOBS — autonomous background agent (🎯 Agent Jobs tab)
 
 
 --------------------------------------------------------------------------------
+L. SECURITY & ROBUSTNESS (ship-readiness)                                   [D]
+--------------------------------------------------------------------------------
+[ ] L56  [D] Pandas sandbox WRITE escape: an analyst/agent code snippet using
+         Path("x").write_text/.touch/.mkdir/.open("w"), getattr(p,"write_text"),
+         or dunder tricks (type(1).__mro__[-1].__subclasses__()) is REFUSED and
+         writes NO file. Legit Path-join + pd.read_csv + str.replace still work.
+         (Automated: SECURITY: pandas sandbox write-escape blocked.)
+[ ] L57  [D] Zip Slip: import a zip containing an absolute-path entry and a
+         ../ entry → neither escapes the vault subfolder; only safe files land.
+         (Automated: SECURITY: zip-slip extraction guard.)
+[ ] L58  [D] safe_agent read_local_file cannot read outside its root: ../ ,
+         absolute, and sibling-dir paths are rejected.
+[ ] L59  [D] Corrupt/half-written store JSON (agent_jobs / derived_results /
+         deferred_tasks / collections / question_history) → app reads it as
+         empty, no crash, on next launch.
+[ ] L60  [D] ADVERSE STARTUP: launch with COUNCIL_GGUF_PATH pointing at a
+         missing file, a CORRUPT backend_settings.json, and malformed data
+         files in data_in (0-byte / ragged / binary-as-.json) → the main window
+         still opens, no traceback.
+[ ] L61  [M] Agent Jobs: a multi-file-read job that stays under the read budget
+         completes (does NOT stop early with "total read budget exceeded").
+[ ] L62  [D] Restart with a job left "queued"/"running" (kill app mid-job) →
+         on relaunch it shows FAILED ("interrupted by a restart"), not stuck.
+
+
+--------------------------------------------------------------------------------
 NOTES / KNOWN GAPS  (update as you test)
 --------------------------------------------------------------------------------
   * The [M] rows can only be truly confirmed where a working .gguf is loaded —
