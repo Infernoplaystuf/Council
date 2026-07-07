@@ -677,10 +677,14 @@ class ConstrainedAgent:
             run.steps.append(ev)
             if on_step: on_step(ev, run)
 
-            # Byte budget check (carry from existing run_agent)
-            for c in run.trace.calls:
-                if c.name == "read_local_file" and isinstance(c.result, dict):
-                    run.trace.bytes_read += int(c.result.get("bytes", 0))
+            # Byte budget check — recompute the TRUE total from the append-only
+            # call list each step. A running `+=` over the whole list re-added
+            # every prior read on every step (triangular double-count), tripping
+            # the budget ~sqrt(N) too early and truncating legit multi-read jobs.
+            run.trace.bytes_read = sum(
+                int(c.result.get("bytes", 0))
+                for c in run.trace.calls
+                if c.name == "read_local_file" and isinstance(c.result, dict))
             if run.trace.bytes_read > self.policy.max_total_read_bytes:
                 run.final_answer = "(stopped: total read budget exceeded)"
                 run.stopped_reason = "byte_budget"
@@ -785,10 +789,12 @@ def run_agent(messages: List[Dict[str, str]],
                    else f"ERROR {call.error}")
             )
             observations.append(obs)
-        # Bookkeeping for the byte cap
-        for c in trace.calls:
-            if c.name == "read_local_file" and isinstance(c.result, dict):
-                trace.bytes_read += int(c.result.get("bytes", 0))
+        # Bookkeeping for the byte cap — recompute the true total each step
+        # (a running += over the whole call list triangular-double-counts).
+        trace.bytes_read = sum(
+            int(c.result.get("bytes", 0))
+            for c in trace.calls
+            if c.name == "read_local_file" and isinstance(c.result, dict))
         if trace.bytes_read > policy.max_total_read_bytes:
             return AgentResult(
                 final_answer="(stopped: total read budget exceeded)",

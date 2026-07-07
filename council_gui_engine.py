@@ -8659,8 +8659,10 @@ class CouncilConsole(tk.Tk):
     # ============================
     def _get_job_runner(self):
         """Lazily build the single background JobRunner (one daemon worker;
-        the GGUF serialises inference so one worker is correct). Marks any job
-        left 'running' by a prior crash as failed — MVP has no auto-resume."""
+        the GGUF serialises inference so one worker is correct). Reconciles any
+        job left RUNNING *or* QUEUED by a prior shutdown — its in-RAM queue is
+        gone, so it can never progress; mark it failed so it isn't orphaned
+        forever in the UI. MVP has no auto-resume."""
         jr = getattr(self, "_job_runner", None)
         if jr is not None:
             return jr
@@ -8672,9 +8674,11 @@ class CouncilConsole(tk.Tk):
         jr = _ajr.JobRunner(vault_dir=VAULT_DIR, ui_q=self.ui_q, file_root=_fr)
         try:
             import agent_jobs as _aj
-            for _j in jr.store.running():
-                jr.store.set_status(_j.job_id, _aj.JobStatus.FAILED.value,
-                                    "interrupted by a restart")
+            _stale = {_aj.JobStatus.RUNNING.value, _aj.JobStatus.QUEUED.value}
+            for _j in jr.store.all():
+                if _j.status in _stale:
+                    jr.store.set_status(_j.job_id, _aj.JobStatus.FAILED.value,
+                                        "interrupted by a restart")
         except Exception:
             pass
         self._job_runner = jr

@@ -2445,6 +2445,82 @@ def test_graph_introspect_columns() -> None:
            infos["code"].min_val == 10.0 and infos["code"].max_val == 40.0)
 
 
+def test_agent_read_budget_not_double_counted() -> None:
+    """ConstrainedAgent's read-byte budget must be the TRUE cumulative total,
+    not a triangular re-sum that trips ~sqrt(N) too early and truncates legit
+    multi-read jobs. A scripted agent that reads a small file several times,
+    staying under the budget, must finish 'done' — not 'byte_budget'."""
+    try:
+        from safe_agent import AgentPolicy, ConstrainedAgent
+        from tool_registry import build_default_registry
+    except Exception as exc:  # pragma: no cover
+        _check(f"safe_agent importable (skipped: {exc!r})", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        folder = Path(td)
+        (folder / "data.csv").write_text("x" * 1000)   # 1000 bytes
+        policy = AgentPolicy(
+            allowed_tools=("read_local_file",),
+            file_root=folder, output_dir=folder, max_steps=8,
+            max_total_read_bytes=5000)               # true 4*1000=4000 < 5000
+        reg = build_default_registry(policy)
+
+        class FakeRunner:
+            def __init__(self):
+                self.i = 0
+
+            def chat(self, messages, max_tokens=None):
+                self.i += 1
+                if self.i <= 4:
+                    return ('{"action":"tool","tool":"read_local_file",'
+                            '"args":{"path":"data.csv"}}')
+                return '{"action":"final","answer":"done"}'
+
+        run = ConstrainedAgent(FakeRunner(), reg, policy).run("read a few times")
+        _check("multi-read under budget finishes (not byte_budget)",
+               run.stopped_reason == "done")
+        _check("bytes_read is the true sum (4000), not triangular",
+               run.trace is not None and run.trace.bytes_read == 4000)
+
+
+def test_job_runner_reconciles_stale_on_restart() -> None:
+    """On restart, a JobRunner that finds a job persisted as RUNNING *or*
+    QUEUED (its in-RAM queue is gone) must mark it FAILED so it isn't orphaned
+    forever. Exercises the real _get_job_runner reconciliation via a stub self."""
+    import types
+    import queue as _q
+    try:
+        import council_gui_engine as cge
+        import agent_jobs as aj
+    except Exception as exc:  # pragma: no cover
+        _check(f"modules importable (skipped: {exc!r})", True)
+        return
+    prev = getattr(cge, "VAULT_DIR", None)
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td)
+        try:
+            cge.VAULT_DIR = vault
+            st = aj.JobStore(vault)
+            st.upsert(aj.AgentJob(job_id="q1", goal="queued one",
+                                  status=aj.JobStatus.QUEUED.value))
+            st.upsert(aj.AgentJob(job_id="r1", goal="running one",
+                                  status=aj.JobStatus.RUNNING.value))
+            st.upsert(aj.AgentJob(job_id="d1", goal="done one",
+                                  status=aj.JobStatus.DONE.value))
+            stub = types.SimpleNamespace(ui_q=_q.Queue())
+            cge.CouncilConsole._get_job_runner.__get__(stub)()
+            st2 = aj.JobStore(vault)
+            _check("stale QUEUED job reconciled to FAILED",
+                   st2.get("q1").status == aj.JobStatus.FAILED.value)
+            _check("stale RUNNING job reconciled to FAILED",
+                   st2.get("r1").status == aj.JobStatus.FAILED.value)
+            _check("finished job left untouched",
+                   st2.get("d1").status == aj.JobStatus.DONE.value)
+        finally:
+            if prev is not None:
+                cge.VAULT_DIR = prev
+
+
 def test_pandas_sandbox_write_escape_blocked() -> None:
     """SECURITY: the pandas sandbox exposes pathlib.Path for read-side path
     construction, so its WRITE surface (write_text/touch/mkdir/open('w')) — and
@@ -3593,6 +3669,10 @@ def main() -> int:
          test_fast_answer_direct_route)
     _run("provenance source resolution (answer chips)",
          test_provenance_source_resolve)
+    _run("agent read-budget not double-counted",
+         test_agent_read_budget_not_double_counted)
+    _run("job runner reconciles stale jobs on restart",
+         test_job_runner_reconciles_stale_on_restart)
     _run("SECURITY: pandas sandbox write-escape blocked",
          test_pandas_sandbox_write_escape_blocked)
     _run("SECURITY: zip-slip extraction guard",
