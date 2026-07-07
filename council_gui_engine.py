@@ -8856,10 +8856,13 @@ class CouncilConsole(tk.Tk):
         tree = getattr(self, "_aj_tree", None)
         if tree is None:
             return
-        j = self._get_job_runner().store.get(job_id)
-        if j is None:
+        # Hot per-event path: read only the 3 scalars from a single raw store
+        # read, without materialising every job's dataclass graph.
+        summ = self._get_job_runner().store.get_summary(job_id)
+        if summ is None:
             return
-        vals = (j.status, j.goal[:120], len(j.steps))
+        _status, _goal, _nsteps = summ
+        vals = (_status, _goal[:120], _nsteps)
         iid = self._aj_tree_iids.get(job_id)
         if iid and tree.exists(iid):
             tree.item(iid, values=vals)
@@ -13276,13 +13279,12 @@ class CouncilConsole(tk.Tk):
                 want = {f.lower() for f in (task.files or []) if f}
                 named_paths = []
                 if want:
+                    # list_data_files = CSV ∪ Excel (superset of list_csv_files),
+                    # so a CSV-only re-walk fallback was logically dead — a name
+                    # that didn't match here can't match the CSV subset.
                     for _p in _va.list_data_files([target]):
                         if _p.name.lower() in want:
                             named_paths.append(_p)
-                    if not named_paths:   # widen to any csv under the scope
-                        for _p in _va.list_csv_files([target]):
-                            if _p.name.lower() in want:
-                                named_paths.append(_p)
 
                 if task.kind == _dt.KIND_BIGGER_SUMMARY:
                     if named_paths:
@@ -14699,13 +14701,13 @@ class CouncilConsole(tk.Tk):
         except Exception:
             pass
 
+        tag = self._role_tag(who)   # loop-invariant — compute once, not per widget
         for widget in (getattr(self, "transcript", None),
                        getattr(self, "dream3d_transcript", None)):
             if widget is None:
                 continue
             try:
                 widget.configure(state="normal")
-                tag = self._role_tag(who)
                 if kind == "phase":
                     widget.insert("end", f"  {text}\n", "phase")
                 elif kind == "token":
@@ -15899,6 +15901,15 @@ class CouncilConsole(tk.Tk):
         except Exception:
             return
 
+        # Cheap, I/O-free gate: advise() returns None when classify_task does,
+        # so skip the RoleModelRegistry disk read + dispatcher probe entirely
+        # for the common case where the task matches no specialist.
+        try:
+            if _adv.classify_task(user_text) is None:
+                return
+        except Exception:
+            pass
+
         # Build the advisor's view of the world from current state.
         current = _os.path.basename(_os.environ.get("COUNCIL_GGUF_PATH", "")) \
             or "the current model"
@@ -16579,7 +16590,9 @@ class CouncilConsole(tk.Tk):
         if (_fast_answer and not _analyst_err and not _force_full
                 and getattr(self, "_fast_answers_enabled", True)):
             self._append_transcript("Writer", _fast_answer, "final")
-            self._render_source_chips(getattr(self, "_last_turn_sources", []))
+            _fsrc = getattr(self, "_last_turn_sources", None)
+            if _fsrc:
+                self._render_source_chips(_fsrc)
             # Remember the question so the Expand button can re-ask it through
             # the full council without the user retyping anything.
             self._last_fast_question = original_user_text
@@ -17332,10 +17345,12 @@ class CouncilConsole(tk.Tk):
                         # Provenance chips under the Writer's final answer —
                         # the source files that fed this turn (assembled in
                         # _send as self._last_turn_sources).
-                        if ev.who == "Writer":
+                        # Only do the source-path resolution when there ARE
+                        # sources — skips the work entirely for non-data answers.
+                        _srcs = getattr(self, "_last_turn_sources", None)
+                        if ev.who == "Writer" and _srcs:
                             try:
-                                self._render_source_chips(
-                                    getattr(self, "_last_turn_sources", []))
+                                self._render_source_chips(_srcs)
                             except Exception:
                                 pass
                     elif ev.kind in ("observation", "action"):

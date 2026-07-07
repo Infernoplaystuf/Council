@@ -63,8 +63,10 @@ class JobStep:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "JobStep":
-        known = set(JobStep.__dataclass_fields__)  # type: ignore
-        return JobStep(**{k: v for k, v in d.items() if k in known})
+        return JobStep(**{k: v for k, v in d.items() if k in _JOBSTEP_FIELDS})
+
+
+_JOBSTEP_FIELDS = frozenset(JobStep.__dataclass_fields__)   # hoisted once
 
 
 @dataclass
@@ -88,10 +90,12 @@ class AgentJob:
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "AgentJob":
-        known = set(AgentJob.__dataclass_fields__)  # type: ignore
-        dd = {k: v for k, v in d.items() if k in known}
+        dd = {k: v for k, v in d.items() if k in _AGENTJOB_FIELDS}
         dd["steps"] = [JobStep.from_dict(s) for s in (dd.get("steps") or [])]
         return AgentJob(**dd)
+
+
+_AGENTJOB_FIELDS = frozenset(AgentJob.__dataclass_fields__)   # hoisted once
 
 
 class JobStore:
@@ -123,9 +127,21 @@ class JobStore:
         return [AgentJob.from_dict(d) for d in self._read()]
 
     def get(self, job_id: str) -> Optional[AgentJob]:
-        for j in self.all():
-            if j.job_id == job_id:
-                return j
+        # Scan the raw dicts first; only materialise the ONE match (was
+        # from_dict on every job + all its steps just to find one).
+        for d in self._read():
+            if d.get("job_id") == job_id:
+                return AgentJob.from_dict(d)
+        return None
+
+    def get_summary(self, job_id: str):
+        """(status, goal, step_count) for one job from a single raw read,
+        WITHOUT building AgentJob/JobStep dataclasses — for the hot UI row
+        update on every job event. None if the job isn't found."""
+        for d in self._read():
+            if d.get("job_id") == job_id:
+                return (d.get("status", ""), str(d.get("goal", "")),
+                        len(d.get("steps") or []))
         return None
 
     def upsert(self, job: AgentJob) -> None:

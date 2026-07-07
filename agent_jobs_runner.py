@@ -200,8 +200,11 @@ class JobRunner:
         self._post(("job_status", job_id, JobStatus.RUNNING.value))
         agent = self._build_agent(job)
 
+        reduced: list = []   # steps already reduced in on_step — reuse for the report
+
         def on_step(ev: Any, run: Any) -> None:
             step = _step_from_event(ev)
+            reduced.append(step)
             self._store.append_step(job_id, step)
             self._post(("job_step", job_id, step.to_dict()))
             if cancel.is_set():
@@ -222,7 +225,8 @@ class JobRunner:
                   else JobStatus.DONE.value)
         report_path = ""
         try:
-            report_path = self._write_report(job_id, job.goal, run)
+            report_path = self._write_report(job_id, job.goal, run,
+                                             steps=reduced)
         except Exception:
             report_path = ""
         j = self._store.get(job_id)
@@ -234,9 +238,12 @@ class JobRunner:
             self._store.upsert(j)
         self._post(("job_done", job_id, status, summary[:400]))
 
-    def _write_report(self, job_id: str, goal: str, run: Any) -> str:
+    def _write_report(self, job_id: str, goal: str, run: Any,
+                      *, steps: Optional[list] = None) -> str:
         """Write a Markdown report of the run — the job's deliverable. Done by
-        the runner (NOT a model-invoked tool), into a dedicated jobs-out dir."""
+        the runner (NOT a model-invoked tool), into a dedicated jobs-out dir.
+        ``steps`` are the already-reduced JobSteps from on_step (reused so we
+        don't re-reduce every StepEvent); falls back to reducing run.steps."""
         out_dir = _vault_root(self._vault_dir) / "agent_jobs_out"
         out_dir.mkdir(parents=True, exist_ok=True)
         path = out_dir / f"report__{_slug(goal)}__{job_id}.md"
@@ -246,8 +253,10 @@ class JobRunner:
                  "", "## Answer", "",
                  (getattr(run, "final_answer", "") or "").strip(), "",
                  "## Steps", ""]
-        for ev in getattr(run, "steps", []) or []:
-            st = _step_from_event(ev)
+        _steps = (steps if steps is not None
+                  else [_step_from_event(ev)
+                        for ev in (getattr(run, "steps", []) or [])])
+        for st in _steps:
             lines.append(f"- **{st.index}. {st.label}**"
                          + (f" — {st.observation[:200]}" if st.observation
                             else "")

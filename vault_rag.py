@@ -444,8 +444,9 @@ class _TFIDFBackend:
             # Build term sets per chunk
             chunk_records = []
             for c in chunks:
-                terms = set(_TOKEN_RE.findall(c["text"].lower()))
-                chunk_records.append({**c, "terms": terms})
+                low = c["text"].lower()          # keep for search-time reuse
+                terms = set(_TOKEN_RE.findall(low))
+                chunk_records.append({**c, "terms": terms, "text_low": low})
                 for term in terms:
                     new_df[term] = new_df.get(term, 0) + 1
                 stats.total_chunks += 1
@@ -478,9 +479,9 @@ class _TFIDFBackend:
                 if not chunk_terms:
                     continue
 
-                # Lowercase the chunk text ONCE (was re-lowered per query term
-                # in the tf count, then again for the boost pass).
-                text_low = chunk["text"].lower()
+                # Reuse the lowercased text cached at index time; fall back for
+                # any record built before the field existed.
+                text_low = chunk.get("text_low") or chunk["text"].lower()
                 # TF-IDF score: sum over query terms of tf * idf
                 score = 0.0
                 for term in q_terms:

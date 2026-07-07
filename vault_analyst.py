@@ -195,7 +195,8 @@ def list_csv_files(data_folder: Any, recursive: bool = True) -> List[Path]:
     deduped: dict[str, Path] = {}
     for path in out:
         try:
-            deduped[str(path.resolve()).lower()] = path.resolve()
+            _rp = path.resolve()          # resolve once (was twice per path)
+            deduped[str(_rp).lower()] = _rp
         except Exception:
             pass
     return _drop_protected(sorted(deduped.values()), folders)
@@ -217,7 +218,8 @@ def list_excel_files(data_folder: Any, recursive: bool = True) -> List[Path]:
     deduped: dict[str, Path] = {}
     for path in out:
         try:
-            deduped[str(path.resolve()).lower()] = path.resolve()
+            _rp = path.resolve()          # resolve once (was twice per path)
+            deduped[str(_rp).lower()] = _rp
         except Exception:
             pass
     return _drop_protected(sorted(deduped.values()), folders)
@@ -822,7 +824,8 @@ def list_sqlite_files(data_folder: Any, recursive: bool = True) -> List[Path]:
     deduped: dict[str, Path] = {}
     for path in out:
         try:
-            deduped[str(path.resolve()).lower()] = path.resolve()
+            _rp = path.resolve()          # resolve once (was twice per path)
+            deduped[str(_rp).lower()] = _rp
         except Exception:
             pass
     return _drop_protected(sorted(deduped.values()), folders)
