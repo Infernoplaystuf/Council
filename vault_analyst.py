@@ -3130,6 +3130,36 @@ DANGEROUS_PATTERNS = [
 ]
 
 
+# Attribute names the sandbox refuses — at BOTH the AST validator and the
+# sandboxed getattr (so `getattr(obj, "write_text")` can't dodge the AST check).
+# pathlib.Path is exposed for read-side path construction, so its WRITE/CREATE
+# surface must be blocked here or model code could write arbitrary files
+# (Path("/x").write_text(...), .touch(), .mkdir(), .open("w"), …) — a real
+# arbitrary-write escape. Deletion / process / DB-write names are here too.
+# NB: names that collide with common, legitimate pandas/str methods
+# (replace, to_json/to_html/to_string which return strings, drop, …) are
+# deliberately NOT listed.
+_SANDBOX_FORBIDDEN_ATTRS = frozenset({
+    # deletion / rename (data-loss)
+    "unlink", "rmdir", "remove", "rename", "rmtree", "removedirs",
+    # serialise-to-disk / DB writes (write-only forms)
+    "to_csv", "to_excel", "to_parquet", "to_pickle", "to_sql",
+    "to_feather", "to_hdf", "to_stata",
+    # pathlib / filesystem write + create surface
+    "write_text", "write_bytes", "touch", "mkdir", "makedirs", "mknod",
+    "symlink_to", "hardlink_to", "chmod", "lchmod", "open", "fdopen",
+    # process / shell
+    "system", "popen", "Popen",
+})
+# Introspection dunders that enable classic eval-sandbox escapes (reach os via
+# the class hierarchy, or grab __globals__ / __builtins__).
+_SANDBOX_FORBIDDEN_DUNDERS = frozenset({
+    "__subclasses__", "__bases__", "__mro__", "__base__", "__globals__",
+    "__subclasshook__", "__builtins__", "__code__", "__closure__",
+    "__reduce__", "__reduce_ex__", "__getattribute__",
+})
+
+
 def validate_generated_code(code: str) -> Tuple[bool, str]:
     if not code.strip():
         return False, "Generated code is empty."
@@ -3146,11 +3176,6 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
         "requests", "urllib", "http", "ftplib",
     }
     forbidden_calls = {"eval", "exec", "compile", "input"}
-    forbidden_attrs = {
-        "unlink", "rmdir", "remove", "rename",
-        "to_csv", "to_excel", "to_parquet", "to_pickle", "to_sql",
-        "system", "popen", "Popen",
-    }
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -3161,10 +3186,14 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
             root = (node.module or "").split(".")[0]
             if root in forbidden_import_roots:
                 return False, f"Forbidden import from: {node.module}"
+        # Any attribute access to an escape dunder — even without a call —
+        # e.g. `x.__globals__[...]`, `type(1).__mro__`.
+        if isinstance(node, ast.Attribute) and node.attr in _SANDBOX_FORBIDDEN_DUNDERS:
+            return False, f"Forbidden attribute: {node.attr}"
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name) and node.func.id in forbidden_calls:
                 return False, f"Forbidden call: {node.func.id}"
-            if isinstance(node.func, ast.Attribute) and node.func.attr in forbidden_attrs:
+            if isinstance(node.func, ast.Attribute) and node.func.attr in _SANDBOX_FORBIDDEN_ATTRS:
                 return False, f"Forbidden method: {node.func.attr}"
     return True, "ok"
 
@@ -3289,6 +3318,17 @@ def execute_pandas_code(
             return _budgeted_pd
         return _safe_import(name, globals, locals, fromlist, level)
 
+    def _guarded_getattr(obj, name, *default):
+        # Close the getattr bypass: the AST validator blocks `x.write_text(...)`
+        # by name, but `getattr(x, "write_text")(...)` would sidestep it. Refuse
+        # the same forbidden names + escape dunders here too.
+        if isinstance(name, str) and (
+                name in _SANDBOX_FORBIDDEN_ATTRS
+                or name in _SANDBOX_FORBIDDEN_DUNDERS):
+            raise AttributeError(
+                f"sandbox: access to attribute {name!r} is blocked")
+        return getattr(obj, name, *default)
+
     safe_builtins = {
         "__import__": _guarded_import,
         # Numeric / collection core
@@ -3302,7 +3342,7 @@ def execute_pandas_code(
         # `getattr(df, "shape")`, `type(x).__name__`, etc. Without these
         # in builtins the sandbox raises NameError mid-snippet and the
         # analyst silently falls back to model freeform (= wrong answer).
-        "getattr": getattr, "hasattr": hasattr, "setattr": setattr,
+        "getattr": _guarded_getattr, "hasattr": hasattr,
         "type": type, "repr": repr, "format": format, "hash": hash,
         "id": id, "callable": callable, "vars": vars, "dir": dir,
         # Iterator helpers

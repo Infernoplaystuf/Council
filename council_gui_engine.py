@@ -4251,6 +4251,7 @@ def _vmgr_extract_zip(
     subfolder = _re.sub(r"[^A-Za-z0-9._-]", "_", subfolder) or "import"
     dest_dir = vault_dir / subfolder
     dest_dir.mkdir(parents=True, exist_ok=True)
+    _dest_root = dest_dir.resolve()   # Zip Slip containment boundary
 
     if not zipfile.is_zipfile(zip_path):
         raise ValueError(f"{zip_path.name} is not a valid zip file")
@@ -4280,6 +4281,19 @@ def _vmgr_extract_zip(
             if not rel_parts:
                 rel_parts = (Path(member.filename).name,)
             dest_file = dest_dir / Path(*rel_parts)
+            # ── Zip Slip guard ──────────────────────────────────────────
+            # zf.open()+manual write bypasses ZipFile.extractall()'s built-in
+            # sanitisation, so a crafted entry with an ABSOLUTE path (pathlib
+            # resets the join) or ../ / symlink parts could write OUTSIDE the
+            # target. Refuse anything that doesn't resolve inside dest_dir.
+            try:
+                _resolved = dest_file.resolve()
+                _resolved.relative_to(_dest_root)
+            except (ValueError, OSError):
+                _log(f"  SKIP (unsafe path escapes target): {member.filename}")
+                skipped += 1
+                continue
+            dest_file = _resolved
             dest_file.parent.mkdir(parents=True, exist_ok=True)
             with zf.open(member) as src, open(dest_file, "wb") as dst:
                 _shutil.copyfileobj(src, dst)

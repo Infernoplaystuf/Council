@@ -2445,6 +2445,81 @@ def test_graph_introspect_columns() -> None:
            infos["code"].min_val == 10.0 and infos["code"].max_val == 40.0)
 
 
+def test_pandas_sandbox_write_escape_blocked() -> None:
+    """SECURITY: the pandas sandbox exposes pathlib.Path for read-side path
+    construction, so its WRITE surface (write_text/touch/mkdir/open('w')) — and
+    the getattr / dunder bypasses — must be refused, with NO file written.
+    Legit read/compute code must still run."""
+    import vault_analyst as va
+    with tempfile.TemporaryDirectory() as td:
+        folder = Path(td)
+        (folder / "a.csv").write_text("name,qty\nx,1\ny,2\n")
+        mp = (folder / "PWNED.txt").as_posix()
+        dp = (folder / "PWNED_DIR").as_posix()
+        escapes = [
+            f'Path("{mp}").write_text("pwned")',
+            f'Path("{mp}").write_bytes(b"x")',
+            f'Path("{mp}").touch()',
+            f'Path("{dp}").mkdir()',
+            f'Path("{mp}").open("w").write("x")',
+            f'getattr(Path("{mp}"), "write_text")("x")',   # getattr bypass
+            'result = type(1).__mro__[-1].__subclasses__()',  # dunder escape
+            'x = ().__class__.__bases__[0].__globals__',       # __globals__
+        ]
+        for code in escapes:
+            df, msg = va.execute_pandas_code(code, [folder])
+            _check(f"escape blocked: {code[:34]!r}",
+                   ("SAFETY CHECK FAILED" in str(msg)
+                    or "blocked" in str(msg).lower()))
+        _check("no file written by any sandbox escape",
+               not (folder / "PWNED.txt").exists())
+        _check("no dir created by any sandbox escape",
+               not (folder / "PWNED_DIR").exists())
+        # Legit read/compute still works.
+        df_ok, _m = va.execute_pandas_code(
+            'df = pd.read_csv(Path(DATA_FOLDER) / "a.csv"); '
+            'df["name"] = df["name"].str.replace("x", "z"); result_df = df',
+            [folder])
+        _check("legit path-join + str.replace still runs", df_ok is not None)
+        df_ga, _m2 = va.execute_pandas_code(
+            'df = pd.read_csv(Path(DATA_FOLDER) / "a.csv"); '
+            'result_df = pd.DataFrame({"n": [getattr(df, "shape")[0]]})',
+            [folder])
+        _check("legit getattr(df,'shape') still runs", df_ga is not None)
+
+
+def test_zip_slip_guard() -> None:
+    """SECURITY (Zip Slip): a malicious archive with an absolute-path entry or a
+    ../ entry must NOT write outside the extraction target. zf.open()+manual
+    write bypasses extractall()'s sanitisation, so the extractor must contain
+    every entry itself."""
+    import zipfile
+    try:
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_gui_engine importable (skipped: {exc!r})", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td) / "vault"
+        vault.mkdir()
+        outside = Path(td) / "OUTSIDE.csv"
+        zp = Path(td) / "evil.zip"
+        with zipfile.ZipFile(zp, "w") as z:
+            z.writestr("good.csv", "a,b\n1,2\n")               # benign
+            z.writestr(str(outside).replace("\\", "/"), "x\n9\n")  # absolute
+            z.writestr("../../ESCAPED.csv", "p\n1\n")           # traversal
+        dest, copied, skipped = cge._vmgr_extract_zip(
+            zp, vault_dir=vault, subfolder="imp")
+        _check("absolute-path zip entry did NOT escape the vault",
+               not outside.exists())
+        _check("../ zip entry did NOT escape the vault",
+               not (Path(td) / "ESCAPED.csv").exists())
+        landed = [p.name for p in vault.rglob("*") if p.is_file()]
+        _check("only the benign file was extracted", landed == ["good.csv"])
+        _check("malicious entries were skipped, benign kept",
+               copied == 1 and skipped >= 2)
+
+
 def test_agentic_jobs_core() -> None:
     """Background agentic-job engine, driven by a SCRIPTED fake model (no GGUF):
     the ConstrainedAgent loop runs read-only tools, persists each step, writes a
@@ -3518,6 +3593,10 @@ def main() -> int:
          test_fast_answer_direct_route)
     _run("provenance source resolution (answer chips)",
          test_provenance_source_resolve)
+    _run("SECURITY: pandas sandbox write-escape blocked",
+         test_pandas_sandbox_write_escape_blocked)
+    _run("SECURITY: zip-slip extraction guard",
+         test_zip_slip_guard)
     _run("agentic jobs core (autonomous loop, safe tools, cancel)",
          test_agentic_jobs_core)
     _run("graph introspect columns (numeric/coerce/categorical)",
