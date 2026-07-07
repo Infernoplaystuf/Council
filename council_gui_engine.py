@@ -112,13 +112,40 @@ try:
 except Exception:
     _RAG_OK = False
 
+class _LazyModule:
+    """Imports the real module on FIRST attribute access, deferring heavy graph
+    deps (plotly + matplotlib, ~seconds) out of app startup. The Grapher tab
+    builds with widgets only; gd/ge/gp are touched solely on user plot actions,
+    so this moves those imports off the startup path with zero call-site
+    changes (`ge.foo` transparently loads graph_engine on first use)."""
+    __slots__ = ("_lm_name", "_lm_mod")
+
+    def __init__(self, name):
+        self._lm_name = name
+        self._lm_mod = None
+
+    def __getattr__(self, attr):
+        mod = self._lm_mod          # a slot — no __getattr__ recursion
+        if mod is None:
+            import importlib
+            mod = importlib.import_module(self._lm_name)
+            self._lm_mod = mod
+        return getattr(mod, attr)
+
+
 try:
-    import graph_data as gd
-    import graph_engine as ge
-    import graph_personality as gp
-    _GRAPHER_OK = True
+    import importlib.util as _ilu
+    _GRAPHER_OK = all(_ilu.find_spec(_m) is not None
+                      for _m in ("graph_data", "graph_engine",
+                                 "graph_personality"))
 except Exception:
     _GRAPHER_OK = False
+if _GRAPHER_OK:
+    # Lazy proxies — the underlying modules (and plotly/matplotlib) load on
+    # first use, not at import.
+    gd = _LazyModule("graph_data")
+    ge = _LazyModule("graph_engine")
+    gp = _LazyModule("graph_personality")
 
 try:
     import tkinterweb
@@ -5021,23 +5048,26 @@ class CouncilConsole(tk.Tk):
 
         # ── RAG ───────────────────────────────────────────────
         if _RAG_OK:
-            self.rag = vr.VaultRAG(
-                vault_dir=VAULT_DIR,
-                chroma_dir=VAULT_DIR / ".chromadb",
-            )
             if self._interactive_host:
-                # Do NOT load torch/sentence-transformers on a background
-                # thread under Spyder/IPython — off-main-thread CUDA init
-                # segfaults the kernel (~30 s in). Keyword search works
-                # without it; rebuild the semantic index on demand from
-                # the Vault tab.
+                # Off-main-thread torch/CUDA init segfaults the kernel under
+                # Spyder/IPython, so construct eagerly on the MAIN thread here
+                # (the background index thread never starts under an interactive
+                # host, so deferring construction would leave self.rag = None).
+                self.rag = vr.VaultRAG(
+                    vault_dir=VAULT_DIR, chroma_dir=VAULT_DIR / ".chromadb")
                 print("[startup] RAG auto-index skipped under interactive "
                       "host (avoids off-main-thread torch crash). Use the "
                       "Vault tab to build it if you need semantic search.",
                       flush=True)
             else:
-                # Index in background so startup isn't blocked
-                threading.Thread(target=self._init_rag_index, daemon=True).start()
+                # Construct AND index on the background thread: the ~6.7s
+                # SentenceTransformer load + chromadb PersistentClient open used
+                # to run here on the main thread, blocking the window from
+                # appearing. Every self.rag consumer already guards on
+                # `if self.rag`, so None during the brief build window is safe.
+                self.rag = None
+                threading.Thread(target=self._init_rag_index,
+                                 daemon=True).start()
         else:
             self.rag = None
 
@@ -5327,8 +5357,13 @@ class CouncilConsole(tk.Tk):
     # ============================
 
     def _init_rag_index(self):
-        """Run vault indexing in background thread at startup."""
+        """Construct (if needed) + index the vault RAG on a background thread at
+        startup, so the heavy SentenceTransformer/chromadb init doesn't block
+        the window. Safe to call again from the Vault tab's re-index button."""
         try:
+            if self.rag is None and _RAG_OK:
+                self.rag = vr.VaultRAG(
+                    vault_dir=VAULT_DIR, chroma_dir=VAULT_DIR / ".chromadb")
             if self.rag:
                 stats = self.rag.index()
                 self.ui_q.put(("agent_phase", "rag_index",
