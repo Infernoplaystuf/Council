@@ -2445,6 +2445,62 @@ def test_graph_introspect_columns() -> None:
            infos["code"].min_val == 10.0 and infos["code"].max_val == 40.0)
 
 
+def test_stores_survive_corrupt_json() -> None:
+    """ROBUSTNESS: every per-vault JSON store must degrade gracefully (empty,
+    no crash) when its file is corrupt / truncated / binary — a half-written
+    store after a crash must never take the app down on next launch."""
+    import agent_jobs, derived_results, deferred_tasks
+    import vault_collections, question_history
+    prev = os.environ.get("COUNCIL_VAULT_ROOT")
+    with tempfile.TemporaryDirectory() as td:
+        os.environ["COUNCIL_VAULT_ROOT"] = td
+        v = Path(td)
+        try:
+            stores = {
+                "jobs": agent_jobs.JobStore(v),
+                "derived": derived_results.DerivedStore(v),
+                "deferred": deferred_tasks.DeferredTaskStore(v),
+                "collections": vault_collections.CollectionStore(v),
+                "history": question_history.QuestionHistory(v),
+            }
+            all_ok = True
+            for junk in ["{ not json", "", "[1,2,", "\x00\x01bin", "null", "{}"]:
+                for name, st in stores.items():
+                    st.path.write_text(junk, encoding="utf-8", errors="ignore")
+                    try:
+                        st.all()
+                    except Exception:
+                        all_ok = False
+            _check("all stores read corrupt/truncated JSON without crashing",
+                   all_ok)
+        finally:
+            if prev is None:
+                os.environ.pop("COUNCIL_VAULT_ROOT", None)
+            else:
+                os.environ["COUNCIL_VAULT_ROOT"] = prev
+
+
+def test_safe_resolve_rejects_escapes() -> None:
+    """SECURITY: safe_agent._safe_resolve (the agent's read_local_file root
+    guard) must reject ../ traversal, absolute paths, and sibling-dir escapes,
+    while allowing paths inside the root."""
+    from safe_agent import _safe_resolve
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "root"
+        root.mkdir()
+        (root / "ok.txt").write_text("x")
+        for bad in ["../escape.txt", "../../etc/passwd", "/etc/passwd",
+                    str(Path(td) / "sibling.txt")]:
+            rejected = False
+            try:
+                _safe_resolve(root, bad)
+            except (PermissionError, ValueError, OSError):
+                rejected = True
+            _check(f"rejects escape {bad!r}", rejected)
+        inside = _safe_resolve(root, "ok.txt")
+        _check("allows a path inside the root", inside.name == "ok.txt")
+
+
 def test_agent_read_budget_not_double_counted() -> None:
     """ConstrainedAgent's read-byte budget must be the TRUE cumulative total,
     not a triangular re-sum that trips ~sqrt(N) too early and truncates legit
@@ -3669,6 +3725,10 @@ def main() -> int:
          test_fast_answer_direct_route)
     _run("provenance source resolution (answer chips)",
          test_provenance_source_resolve)
+    _run("stores survive corrupt JSON",
+         test_stores_survive_corrupt_json)
+    _run("SECURITY: safe_resolve rejects escapes",
+         test_safe_resolve_rejects_escapes)
     _run("agent read-budget not double-counted",
          test_agent_read_budget_not_double_counted)
     _run("job runner reconciles stale jobs on restart",
