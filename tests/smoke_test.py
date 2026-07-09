@@ -3247,6 +3247,94 @@ def test_vault_search_runs_on_main_path() -> None:
                any("VAULT" in l for l in labels))
 
 
+def test_quick_analytics_helpers() -> None:
+    """Model-free per-file analytics: column_stats (mean/median WITH and
+    WITHOUT zeros), missing_data_report, duplicate_rows_report,
+    top_values_per_column, numeric_correlations. Pure — directly testable."""
+    try:
+        import vault_analyst as va
+    except Exception as exc:  # pragma: no cover
+        _check(f"vault_analyst importable (skipped: {exc!r})", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "sales.csv"
+        p.write_text(
+            "region,units,revenue\n"
+            "East,0,0\n"
+            "East,5,50\n"
+            "West,0,0\n"
+            "West,10,100\n"
+            "East,5,50\n"          # exact duplicate of row 2
+        )
+        cs = va.column_stats(p)
+        units = cs[cs["column"] == "units"].iloc[0]
+        _check("column_stats mean INCLUDES zeros (0,5,0,10,5 -> 4.0)",
+               float(units["mean"]) == 4.0)
+        _check("column_stats mean_nonzero EXCLUDES zeros (5,10,5 -> 6.67)",
+               abs(float(units["mean_nonzero"]) - 6.6667) < 0.01)
+        _check("column_stats counts zeros", int(units["zeros"]) == 2)
+        _check("column_stats zero_pct correct", float(units["zero_pct"]) == 40.0)
+        _check("column_stats classifies a text column",
+               cs[cs["column"] == "region"].iloc[0]["kind"] == "text")
+
+        md = va.missing_data_report(p)
+        _check("missing_data_report total rows", md["total_rows"] == 5)
+        _check("missing_data_report complete rows (no nulls here)",
+               md["complete_rows"] == 5)
+
+        dup = va.duplicate_rows_report(p)
+        _check("duplicate_rows_report finds the 1 exact dup",
+               dup["duplicate_rows"] == 1)
+        _check("duplicate_rows_report unique count", dup["unique_rows"] == 4)
+        _check("duplicate_rows_report returns a sample", len(dup["sample"]) == 1)
+
+        tv = va.top_values_per_column(p, top_n=2)
+        region = next(c for c in tv["columns"] if c["column"] == "region")
+        _check("top_values ranks East first (x3)",
+               region["values"][0] == ("East", 3))
+
+        corr = va.numeric_correlations(p)
+        _check("numeric_correlations finds units~revenue = 1.0",
+               len(corr) >= 1 and abs(float(corr.iloc[0]["corr"]) - 1.0) < 1e-6)
+
+        # Robustness: unreadable file -> error frame, never raises.
+        cs2 = va.column_stats(Path(td) / "does_not_exist.csv")
+        _check("column_stats returns an error frame on unreadable file",
+               "error" in cs2.columns)
+
+
+def test_quick_analytics_routing() -> None:
+    """The five quick-analytics chat commands parse to the right target file,
+    and column-stats does NOT hijack the folder-level 'stats for the files'
+    route."""
+    try:
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_gui_engine importable (skipped: {exc!r})", True)
+        return
+    C = cge.CouncilConsole
+
+    def tgt(rx, text):
+        m = rx.match(text)
+        return (m.group(1) or "").strip() if m else None
+
+    _check("column stats route captures file",
+           tgt(C._COLUMN_STATS_RE, "column stats in sales.csv") == "sales.csv")
+    _check("'summarize the data in the columns of X' routes",
+           tgt(C._COLUMN_STATS_RE,
+               "summarize the data in the columns of sales.csv") == "sales.csv")
+    _check("missing data route captures file",
+           tgt(C._MISSING_DATA_RE, "missing data in sales.csv") == "sales.csv")
+    _check("duplicates route captures file",
+           tgt(C._DUPLICATES_RE, "duplicates in sales.csv") == "sales.csv")
+    _check("top values route captures file",
+           tgt(C._TOP_VALUES_RE, "top values in sales.csv") == "sales.csv")
+    _check("correlations route captures file",
+           tgt(C._CORRELATIONS_RE, "correlations in sales.csv") == "sales.csv")
+    _check("column-stats does NOT grab the folder-stats route",
+           C._COLUMN_STATS_RE.match("summary of stats for the files") is None)
+
+
 def test_data_preview_text() -> None:
     """_data_preview_text gives a model-free (schema, rows) preview of a data
     file with bounded reads, and falls back to a text peek for non-tabular
@@ -3938,6 +4026,10 @@ def main() -> int:
          test_tabular_sample_text_captures_body)
     _run("vault search runs on main path (NameError regression)",
          test_vault_search_runs_on_main_path)
+    _run("quick analytics helpers (stats/missing/dupes/top/corr)",
+         test_quick_analytics_helpers)
+    _run("quick analytics command routing",
+         test_quick_analytics_routing)
     _run("data preview (model-free schema + rows)",
          test_data_preview_text)
     _run("error coaching (plain-language + one-click fix)",

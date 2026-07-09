@@ -2486,6 +2486,192 @@ def column_type_inferences(path: Any) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# ---------------------------------------------------------------------------
+# Quick, model-free per-file analytics.
+#
+# Each of these reads a CSV/Excel once with read_table() and returns a plain
+# pandas/dict result — NO model call, so they run instantly and never touch the
+# serialized inference lock. Wired to fast chat commands in council_gui_engine
+# (column stats / missing data / duplicates / top values / correlations).
+# ---------------------------------------------------------------------------
+def _stat_num(x) -> Optional[float]:
+    """Round a numeric stat for display; None for NaN / inf / non-numeric."""
+    try:
+        f = float(x)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):   # NaN / ±inf
+        return None
+    return round(f, 4)
+
+
+def _looks_numeric(series: "pd.Series") -> tuple[bool, "pd.Series"]:
+    """A column is treated as numeric when at least half its non-null values
+    coerce to numbers (so numeric columns stored as strings still count).
+    Returns (is_numeric, coerced_series)."""
+    coerced = pd.to_numeric(series, errors="coerce")
+    non_null = int(series.count())
+    num_ok = int(coerced.notna().sum())
+    return (num_ok > 0 and num_ok >= 0.5 * max(1, non_null)), coerced
+
+
+def column_stats(path: Any) -> pd.DataFrame:
+    """Per-column descriptive statistics for a CSV/Excel, model-free.
+
+    Numeric columns report count/nulls/zeros and min/max/mean/median/std/sum —
+    with mean & median computed BOTH including and excluding zeros (so sparse
+    columns where 0 means "no activity" are read correctly). Non-numeric
+    columns report count/nulls/unique/top-value. Returns one row per column
+    with a ``kind`` of 'numeric' or 'text'. On read failure returns a 1-row
+    frame with an ``error`` column.
+    """
+    p = Path(path)
+    try:
+        df = read_table(p)
+    except Exception as exc:
+        return pd.DataFrame([{"column": "", "error": str(exc)}])
+    total = int(len(df))
+    rows: List[Dict[str, Any]] = []
+    for col in df.columns:
+        s = df[col]
+        non_null = int(s.count())
+        nulls = total - non_null
+        rec: Dict[str, Any] = {
+            "column":   str(col),
+            "kind":     "text",
+            "count":    non_null,
+            "nulls":    nulls,
+            "null_pct": round(100 * nulls / total, 2) if total else 0.0,
+        }
+        is_num, coerced = _looks_numeric(s)
+        if is_num:
+            vals = coerced.dropna()
+            nz = vals[vals != 0]
+            zeros = int((vals == 0).sum())
+            rec.update({
+                "kind":           "numeric",
+                "zeros":          zeros,
+                "zero_pct":       round(100 * zeros / max(1, len(vals)), 2),
+                "min":            _stat_num(vals.min()),
+                "max":            _stat_num(vals.max()),
+                "mean":           _stat_num(vals.mean()),
+                "mean_nonzero":   _stat_num(nz.mean()) if len(nz) else None,
+                "median":         _stat_num(vals.median()),
+                "median_nonzero": _stat_num(nz.median()) if len(nz) else None,
+                "std":            _stat_num(vals.std()),
+                "sum":            _stat_num(vals.sum()),
+            })
+        else:
+            vc = s.dropna().astype(str).value_counts()
+            rec.update({
+                "unique":    int(s.nunique(dropna=True)),
+                "top":       str(vc.index[0]) if len(vc) else "",
+                "top_count": int(vc.iloc[0]) if len(vc) else 0,
+            })
+        rows.append(rec)
+    return pd.DataFrame(rows)
+
+
+def missing_data_report(path: Any) -> Dict[str, Any]:
+    """Per-column null counts + how many rows are fully complete.
+
+    Returns ``{total_rows, complete_rows, complete_pct, columns:[{column,
+    nulls, null_pct, non_null}, ...]}``.
+    """
+    p = Path(path)
+    df = read_table(p)
+    total = int(len(df))
+    cols: List[Dict[str, Any]] = []
+    for col in df.columns:
+        n_null = int(df[col].isna().sum())
+        cols.append({
+            "column":   str(col),
+            "nulls":    n_null,
+            "null_pct": round(100 * n_null / total, 2) if total else 0.0,
+            "non_null": total - n_null,
+        })
+    complete = int(df.dropna(how="any").shape[0]) if total else 0
+    cols.sort(key=lambda c: -c["nulls"])
+    return {
+        "total_rows":   total,
+        "complete_rows": complete,
+        "complete_pct": round(100 * complete / total, 2) if total else 0.0,
+        "columns":      cols,
+    }
+
+
+def duplicate_rows_report(path: Any, *, sample: int = 5) -> Dict[str, Any]:
+    """Exact duplicate-row report. ``duplicate_rows`` is the number of redundant
+    copies (rows you'd drop to dedupe); ``rows_in_dup_groups`` counts every row
+    that shares its values with at least one other. Returns a small sample of
+    the duplicated rows as a DataFrame for display.
+    """
+    p = Path(path)
+    df = read_table(p)
+    total = int(len(df))
+    extra = int(df.duplicated(keep="first").sum())       # redundant copies
+    in_groups = int(df.duplicated(keep=False).sum())     # all members of a group
+    sample_df = df[df.duplicated(keep="first")].head(max(0, sample))
+    return {
+        "total_rows":        total,
+        "duplicate_rows":    extra,
+        "unique_rows":       total - extra,
+        "rows_in_dup_groups": in_groups,
+        "sample":            sample_df,
+    }
+
+
+def top_values_per_column(path: Any, *, top_n: int = 5,
+                          max_cols: int = 40) -> Dict[str, Any]:
+    """Most frequent values per column (a fast categorical frequency table).
+
+    Returns ``{truncated, columns:[{column, unique, values:[(value, count),
+    ...]}]}`` with at most ``top_n`` values per column and ``max_cols`` columns.
+    """
+    p = Path(path)
+    df = read_table(p)
+    all_cols = list(df.columns)
+    cols_used = all_cols[:max_cols]
+    out: List[Dict[str, Any]] = []
+    for col in cols_used:
+        vc = df[col].dropna().astype(str).value_counts().head(max(1, top_n))
+        out.append({
+            "column": str(col),
+            "unique": int(df[col].nunique(dropna=True)),
+            "values": [(str(k), int(v)) for k, v in vc.items()],
+        })
+    return {"truncated": len(all_cols) > max_cols, "columns": out}
+
+
+def numeric_correlations(path: Any, *, top_n: int = 15,
+                         method: str = "pearson") -> pd.DataFrame:
+    """Pairwise correlations between numeric columns, strongest |corr| first.
+
+    Columns stored as numeric strings are coerced; all-NaN and constant
+    columns are dropped. Returns a DataFrame with columns
+    ``col_a, col_b, corr`` (empty when fewer than two numeric columns).
+    """
+    p = Path(path)
+    df = read_table(p)
+    num = df.apply(lambda s: pd.to_numeric(s, errors="coerce"))
+    num = num.dropna(axis=1, how="all")
+    # Drop constant columns — corr is undefined (NaN) for zero-variance data.
+    keep = [c for c in num.columns if int(num[c].nunique(dropna=True)) > 1]
+    num = num[keep]
+    if num.shape[1] < 2:
+        return pd.DataFrame([], columns=["col_a", "col_b", "corr"])
+    corr = num.corr(method=method)
+    cols = list(corr.columns)
+    pairs: List[tuple] = []
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            c = corr.iloc[i, j]
+            if pd.notna(c):
+                pairs.append((cols[i], cols[j], round(float(c), 4)))
+    pairs.sort(key=lambda t: -abs(t[2]))
+    return pd.DataFrame(pairs[:max(1, top_n)], columns=["col_a", "col_b", "corr"])
+
+
 def schema_doc_from_csv(path: Any) -> str:
     """Generate a Markdown schema doc from summarize_csv output.
 

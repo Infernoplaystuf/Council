@@ -518,6 +518,22 @@ _COUNCIL_EXAMPLES = [
      "summarise the Job Blue files",
      "Answer about a whole project once you've saved it as a Collection "
      "(Vault tab → Collections)."),
+    ("Column analytics",
+     "column stats in sales.csv",
+     "Per-column min/max/mean/median/std/sum + zero counts, with mean & "
+     "median BOTH including and excluding zeros (no model)."),
+    ("Column analytics",
+     "missing data in sales.csv",
+     "Nulls per column + how many rows are fully complete (no model)."),
+    ("Column analytics",
+     "duplicates in sales.csv",
+     "How many exact duplicate rows, with a few examples (no model)."),
+    ("Column analytics",
+     "top values in sales.csv",
+     "Most frequent values in each column — a fast frequency table (no model)."),
+    ("Column analytics",
+     "correlations in sales.csv",
+     "Strongest pairwise correlations between numeric columns (no model)."),
     ("When an answer is weak",
      "(click ⤓ Defer to Vault)",
      "Save what the model couldn't do; run it from the Vault tab, then "
@@ -6580,6 +6596,41 @@ class CouncilConsole(tk.Tk):
         r"(?:\s+(?:in|of|for)\s+(.+?))?\s*\??\s*$",
         _re.IGNORECASE,
     )
+    # ── Quick per-file analytics (model-free) ────────────────────────────
+    # Requires the word "column(s)" so this never grabs the folder-level
+    # "summary of stats for the files" route handled elsewhere.
+    _COLUMN_STATS_RE = _re.compile(
+        r"^\s*(?:column\s+(?:stats|statistics|summary)"
+        r"|summari[sz]e\s+(?:the\s+)?(?:data\s+in\s+(?:the\s+)?)?columns?"
+        r"|describe\s+(?:the\s+)?columns?"
+        r"|stats?\s+(?:for|of|on)\s+(?:the\s+)?columns?)"
+        r"(?:\s+(?:in|of|for|on)\s+(.+?))?\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+    _MISSING_DATA_RE = _re.compile(
+        r"^\s*(?:missing\s+(?:data|values)|null\s+(?:report|counts?)|nulls?|"
+        r"completeness)"
+        r"(?:\s+(?:in|of|for|report\s+for)\s+(.+?))?\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+    _DUPLICATES_RE = _re.compile(
+        r"^\s*(?:find\s+|count\s+|show\s+|check\s+(?:for\s+)?)?"
+        r"(?:duplicates?|duplicate\s+rows?|dupes?)"
+        r"(?:\s+(?:in|of|for)\s+(.+?))?\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+    _TOP_VALUES_RE = _re.compile(
+        r"^\s*(?:top\s+values?|value\s+counts?|most\s+(?:common|frequent)\s+values?|"
+        r"value\s+frequenc(?:y|ies)|frequenc(?:y|ies))"
+        r"(?:\s+(?:in|of|for)\s+(.+?))?\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+    _CORRELATIONS_RE = _re.compile(
+        r"^\s*(?:correlations?|correlate|corr|what\s+correlates)"
+        r"(?:\s+(?:in|of|for|between\s+(?:the\s+)?columns\s+(?:in|of))\s+(.+?))?"
+        r"\s*\??\s*$",
+        _re.IGNORECASE,
+    )
     _MONEY_RE_CHAT = _re.compile(
         r"^\s*(?:find|list|show)\s+(?:money|currency|prices?|amounts?|dollar\s+amounts?)"
         r"(?:\s+(?:in|under|inside|within)\s+(.+?))?\s*\??\s*$",
@@ -6951,6 +7002,26 @@ class CouncilConsole(tk.Tk):
         if m:
             target = (m.group(1) or "").strip().strip("'\"`")
             self._column_types_response(target)
+            return True
+        m = self._COLUMN_STATS_RE.match(single_line)
+        if m:
+            self._column_stats_response((m.group(1) or "").strip().strip("'\"`"))
+            return True
+        m = self._MISSING_DATA_RE.match(single_line)
+        if m:
+            self._missing_data_response((m.group(1) or "").strip().strip("'\"`"))
+            return True
+        m = self._DUPLICATES_RE.match(single_line)
+        if m:
+            self._duplicates_response((m.group(1) or "").strip().strip("'\"`"))
+            return True
+        m = self._TOP_VALUES_RE.match(single_line)
+        if m:
+            self._top_values_response((m.group(1) or "").strip().strip("'\"`"))
+            return True
+        m = self._CORRELATIONS_RE.match(single_line)
+        if m:
+            self._correlations_response((m.group(1) or "").strip().strip("'\"`"))
             return True
 
         if self._EXPORT_TRANSCRIPT_RE.match(single_line):
@@ -7483,6 +7554,221 @@ class CouncilConsole(tk.Tk):
                 f"{int(row['non_null']):>10}"
                 f"{int(row['unique']):>10}"
             )
+        self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
+    def _resolve_data_file_or_hint(self, target: str):
+        """Resolve `target` to a CSV/Excel file, or return (None, message)
+        naming a few available data files to try. Shared by the quick-analytics
+        commands. Supports the #/​* filename wildcards via _resolve_file_target."""
+        p = self._resolve_file_target(target) if target else None
+        if p:
+            return p, None
+        try:
+            import vault_analyst as _va
+            avail = (_va.list_csv_files(VAULT_DIR)
+                     + _va.list_excel_files(VAULT_DIR))[:6]
+            names = ", ".join(a.name for a in avail) if avail else \
+                "(no CSV/Excel files found in the vault)"
+        except Exception:
+            names = "(could not list vault files)"
+        lead = (f"Couldn't find a data file matching {target!r}."
+                if target else
+                "Name a data file — e.g. 'column stats in sales.csv'.")
+        return None, lead + "\n  Available: " + names
+
+    @staticmethod
+    def _fmt_stat(v) -> str:
+        """Compact numeric formatting for stat tables; '' for None / NaN."""
+        if v is None:
+            return ""
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            return str(v)
+        if f != f:                       # NaN
+            return ""
+        if f == int(f) and abs(f) < 1e15:
+            return f"{int(f)}"
+        return f"{f:.4g}"
+
+    def _column_stats_response(self, target: str):
+        """Per-column descriptive stats (with & without zeros). No model."""
+        import vault_analyst as _va
+        p, hint = self._resolve_data_file_or_hint(target)
+        if not p:
+            self._append_transcript("Writer", hint, "final")
+            self._set_status("● idle")
+            return
+        try:
+            df = _va.column_stats(p)
+        except Exception as exc:
+            self._append_transcript("Writer",
+                                    f"Column stats failed: {exc!r}", "final")
+            self._set_status("● idle")
+            return
+        if "error" in df.columns:
+            self._append_transcript(
+                "Writer", f"Could not read {p.name}: {df.iloc[0]['error']}",
+                "final")
+            self._set_status("● idle")
+            return
+        fs = self._fmt_stat
+        lines = [f"Column summary for {p.name}:"]
+        num = df[df["kind"] == "numeric"]
+        txt = df[df["kind"] == "text"]
+        if len(num):
+            lines.append("")
+            lines.append("Numeric columns "
+                         "(mean/median shown as all | excluding-zeros):")
+            lines.append(
+                f"  {'column':<22}{'n':>7}{'nulls':>7}{'zeros':>7}"
+                f"{'min':>10}{'max':>10}{'mean':>12}{'mean≠0':>12}"
+                f"{'median':>10}{'med≠0':>10}{'std':>10}{'sum':>12}")
+            for _, r in num.iterrows():
+                lines.append(
+                    f"  {str(r['column'])[:21]:<22}"
+                    f"{int(r['count']):>7}{int(r['nulls']):>7}{int(r['zeros']):>7}"
+                    f"{fs(r['min']):>10}{fs(r['max']):>10}"
+                    f"{fs(r['mean']):>12}{fs(r['mean_nonzero']):>12}"
+                    f"{fs(r['median']):>10}{fs(r['median_nonzero']):>10}"
+                    f"{fs(r['std']):>10}{fs(r['sum']):>12}")
+        if len(txt):
+            lines.append("")
+            lines.append("Text / other columns:")
+            lines.append(f"  {'column':<28}{'n':>8}{'nulls':>8}"
+                         f"{'unique':>8}   top value")
+            for _, r in txt.iterrows():
+                top = (f"{r['top']} (×{int(r['top_count'])})"
+                       if r['top'] else "")
+                lines.append(
+                    f"  {str(r['column'])[:27]:<28}"
+                    f"{int(r['count']):>8}{int(r['nulls']):>8}"
+                    f"{int(r['unique']):>8}   {str(top)[:40]}")
+        self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
+    def _missing_data_response(self, target: str):
+        """Per-column nulls + fully-complete row count. No model."""
+        import vault_analyst as _va
+        p, hint = self._resolve_data_file_or_hint(target)
+        if not p:
+            self._append_transcript("Writer", hint, "final")
+            self._set_status("● idle")
+            return
+        try:
+            rep = _va.missing_data_report(p)
+        except Exception as exc:
+            self._append_transcript(
+                "Writer", f"Missing-data report failed: {exc!r}", "final")
+            self._set_status("● idle")
+            return
+        total = rep["total_rows"]
+        lines = [
+            f"Missing-data report for {p.name}:",
+            f"  {rep['complete_rows']} of {total} row(s) fully complete "
+            f"({rep['complete_pct']}%).",
+            "",
+            f"  {'column':<32}{'nulls':>10}{'null %':>9}{'non-null':>10}",
+        ]
+        for c in rep["columns"]:
+            lines.append(
+                f"  {str(c['column'])[:31]:<32}{int(c['nulls']):>10}"
+                f"{c['null_pct']:>8}%{int(c['non_null']):>10}")
+        if not rep["columns"]:
+            lines.append("  (no columns)")
+        self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
+    def _duplicates_response(self, target: str):
+        """Exact duplicate-row count + a few examples. No model."""
+        import vault_analyst as _va
+        p, hint = self._resolve_data_file_or_hint(target)
+        if not p:
+            self._append_transcript("Writer", hint, "final")
+            self._set_status("● idle")
+            return
+        try:
+            rep = _va.duplicate_rows_report(p)
+        except Exception as exc:
+            self._append_transcript(
+                "Writer", f"Duplicate scan failed: {exc!r}", "final")
+            self._set_status("● idle")
+            return
+        n = rep["duplicate_rows"]
+        lines = [f"Duplicate-row scan for {p.name}:"]
+        if n == 0:
+            lines.append(f"  No exact duplicate rows — all "
+                         f"{rep['total_rows']} row(s) are unique.")
+        else:
+            lines.append(
+                f"  {n} duplicate row(s) (redundant copies) of "
+                f"{rep['total_rows']} total; {rep['unique_rows']} unique.")
+            sample = rep["sample"]
+            if len(sample):
+                lines.append("")
+                lines.append("  Examples:")
+                cols = list(sample.columns)
+                for _, row in sample.iterrows():
+                    cells = "  |  ".join(f"{c}={row[c]}" for c in cols)
+                    lines.append("    " + cells[:180])
+        self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
+    def _top_values_response(self, target: str):
+        """Most frequent values per column (frequency table). No model."""
+        import vault_analyst as _va
+        p, hint = self._resolve_data_file_or_hint(target)
+        if not p:
+            self._append_transcript("Writer", hint, "final")
+            self._set_status("● idle")
+            return
+        try:
+            rep = _va.top_values_per_column(p, top_n=5)
+        except Exception as exc:
+            self._append_transcript(
+                "Writer", f"Top-values failed: {exc!r}", "final")
+            self._set_status("● idle")
+            return
+        lines = [f"Most frequent values per column in {p.name}:"]
+        for c in rep["columns"]:
+            vals = ", ".join(f"{v} (×{ct})" for v, ct in c["values"]) \
+                or "(all null)"
+            lines.append(f"  {str(c['column'])[:30]:<30} "
+                         f"[{c['unique']} unique]  {vals[:120]}")
+        if rep.get("truncated"):
+            lines.append("  … (more columns not shown)")
+        self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
+    def _correlations_response(self, target: str):
+        """Strongest numeric correlations between columns. No model."""
+        import vault_analyst as _va
+        p, hint = self._resolve_data_file_or_hint(target)
+        if not p:
+            self._append_transcript("Writer", hint, "final")
+            self._set_status("● idle")
+            return
+        try:
+            df = _va.numeric_correlations(p, top_n=15)
+        except Exception as exc:
+            self._append_transcript(
+                "Writer", f"Correlation scan failed: {exc!r}", "final")
+            self._set_status("● idle")
+            return
+        if df is None or len(df) == 0:
+            self._append_transcript(
+                "Writer",
+                f"{p.name} has fewer than two numeric columns with variation "
+                "— nothing to correlate.", "final")
+            self._set_status("● idle")
+            return
+        lines = [f"Strongest numeric correlations in {p.name}:",
+                 f"  {'column A':<24}{'column B':<24}{'corr':>8}"]
+        for _, r in df.iterrows():
+            lines.append(f"  {str(r['col_a'])[:23]:<24}"
+                         f"{str(r['col_b'])[:23]:<24}"
+                         f"{float(r['corr']):>8.3f}")
         self._append_transcript("Writer", "\n".join(lines), "final")
         self._set_status("● idle")
 
