@@ -612,10 +612,44 @@ def _is_gz_csv(p: Path) -> bool:
     return p.suffix.lower() == ".gz" and p.stem.lower().endswith(".csv")
 
 
+# ---------------------------------------------------------------------------
+# Body-content sample for tabular files.
+#
+# Tabular records used to store only `sample_rows` (the first ~6 rows, for the
+# prompt-time preview) and a flat keyword bag. The embedding builder
+# (vault_embeddings._record_to_text) and the phrase-match scorer
+# (_search_terms → sample_blob) both read `sample_text`, which CSV/TSV/Excel
+# records never populated — so the vector and phrase haystack saw only column
+# names + 3 rows. Here we accumulate a bounded, DEDUPED sample of DISTINCT
+# short cell values spread across the rows we already visit, so ranking and
+# embeddings reflect the file's BODY (product names, categories, IDs), not
+# just its schema. Deterministic, build-time only, no model calls.
+# ---------------------------------------------------------------------------
+_BODY_SAMPLE_MAX_VALS = 200
+_BODY_SAMPLE_MAX_CHARS = 1500
+
+
+def _collect_body_sample(cv: str, sample_vals: List[str], seen: Set[str]) -> None:
+    """Retain a short, DISTINCT cell value in `sample_vals` (mutated in place).
+    Bounded by _BODY_SAMPLE_MAX_VALS so a wide file can't blow the record up."""
+    if 2 <= len(cv) <= 80 and len(sample_vals) < _BODY_SAMPLE_MAX_VALS:
+        low = cv.lower()
+        if low not in seen:
+            seen.add(low)
+            sample_vals.append(cv)
+
+
+def _join_body_sample(sample_vals: List[str]) -> str:
+    """Compact ' | '-joined body sample, char-capped for the record."""
+    return " | ".join(sample_vals)[:_BODY_SAMPLE_MAX_CHARS]
+
+
 def _parse_csv(p: Path) -> Dict[str, Any]:
     headers: List[str] = []
     sample_rows: List[str] = []
     keywords: Set[str] = set()
+    sample_vals: List[str] = []
+    _seen_vals: Set[str] = set()
     total_rows = 0
     try:
         with open(p, newline="", encoding="utf-8", errors="replace") as fh:
@@ -653,6 +687,7 @@ def _parse_csv(p: Path) -> Dict[str, Any]:
                             part = part.strip()
                             if 2 <= len(part) <= 80:
                                 keywords.update(_tokenize(part))
+                        _collect_body_sample(cv, sample_vals, _seen_vals)
                 else:
                     break
                 if len(keywords) > 8000:
@@ -663,6 +698,7 @@ def _parse_csv(p: Path) -> Dict[str, Any]:
         "type": "csv",
         "headers": headers,
         "sample_rows": sample_rows,
+        "sample_text": _join_body_sample(sample_vals),
         "rows": total_rows,
         "keywords": sorted(keywords)[:5000],
     }
@@ -947,6 +983,8 @@ def _parse_excel(p: Path) -> Dict[str, Any]:
     sheets_meta: List[Dict[str, Any]] = []
     sample_rows: List[str] = []
     keywords: Set[str] = set()
+    sample_vals: List[str] = []
+    _seen_vals: Set[str] = set()
     try:
         import pandas as _pd
         xl = _pd.ExcelFile(str(p))
@@ -970,6 +1008,7 @@ def _parse_excel(p: Path) -> Dict[str, Any]:
                         part = part.strip()
                         if 2 <= len(part) <= 80:
                             keywords.update(_tokenize(part))
+                    _collect_body_sample(cv, sample_vals, _seen_vals)
             sheets_meta.append({
                 "sheet":   sname,
                 "headers": headers,
@@ -988,6 +1027,7 @@ def _parse_excel(p: Path) -> Dict[str, Any]:
         "type":        "excel",
         "sheets":      sheets_meta,
         "sample_rows": sample_rows,
+        "sample_text": _join_body_sample(sample_vals),
         "keywords":    sorted(keywords)[:5000],
     }
 
@@ -999,6 +1039,8 @@ def _parse_tabular_df(p: Path, df, *, kind: str) -> Dict[str, Any]:
     headers: List[str] = [str(c).strip() for c in df.columns]
     sample_rows: List[str] = []
     keywords: Set[str] = set(_tokenize(" ".join(headers)))
+    sample_vals: List[str] = []
+    _seen_vals: Set[str] = set()
     # First 6 rows for the prompt-time sample block
     for _, row in df.head(6).iterrows():
         sample_rows.append(", ".join(str(v) for v in row.values))
@@ -1015,12 +1057,14 @@ def _parse_tabular_df(p: Path, df, *, kind: str) -> Dict[str, Any]:
                 part = part.strip()
                 if 2 <= len(part) <= 80:
                     keywords.update(_tokenize(part))
+            _collect_body_sample(cv, sample_vals, _seen_vals)
         if len(keywords) > 8000:
             break
     return {
         "type":        kind,
         "headers":     headers,
         "sample_rows": sample_rows,
+        "sample_text": _join_body_sample(sample_vals),
         "keywords":    sorted(keywords)[:5000],
     }
 

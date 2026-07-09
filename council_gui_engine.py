@@ -33,7 +33,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
@@ -547,18 +547,86 @@ def _build_answer_report_md(question, answer, table, sources):
     return "\n".join(lines)
 
 
+# ── Filename wildcard patterns ──────────────────────────────────────────────
+# Users reference files by shape, not spelling: "job_####" means "job_ then any
+# four characters" (job_1234, job_0087, job_ab12), and "report_*" means "report_
+# then anything". The resolvers below used pure substring matching, so `#`/`*`
+# were treated as literal characters and never matched. `_compile_name_pattern`
+# turns such a token into a safe, anchored, case-insensitive regex:
+#   #  → any single character        (the user's "any 4 characters")
+#   *  → any run of characters (incl. empty)
+#   ?  → any single character
+# It returns None when the token has no `#`/`*` wildcard, so callers keep their
+# plain-substring behaviour for ordinary names. Pure stdlib, fully offline. The
+# generated regex has no nested quantifiers, so there is no catastrophic-
+# backtracking risk regardless of user input.
+_NAME_WILDCARD_CHARS = ("#", "*")
+
+
+def _compile_name_pattern(token):
+    """Compile a filename-wildcard token to a case-insensitive ``re.Pattern``,
+    or return ``None`` when ``token`` contains no ``#``/``*`` wildcard."""
+    token = (token or "").strip().strip("'\"`")
+    if not token:
+        return None
+    if not any(c in token for c in _NAME_WILDCARD_CHARS):
+        return None
+    parts = []
+    for ch in token:
+        if ch == "#" or ch == "?":
+            parts.append(".")          # any single character
+        elif ch == "*":
+            parts.append(".*")         # any run (incl. empty)
+        else:
+            parts.append(_re.escape(ch))
+    try:
+        return _re.compile("".join(parts), _re.IGNORECASE)
+    except _re.error:
+        return None
+
+
+def _name_matches_pattern(pat, filename: str) -> bool:
+    """True when ``filename`` matches the compiled pattern. Anchored: the
+    pattern must span the whole basename OR the whole stem (so ``job_####``
+    matches ``job_1234.csv`` via the stem and ``job_####.csv`` via the name)."""
+    if pat is None or not filename:
+        return False
+    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+    return bool(pat.fullmatch(filename) or pat.fullmatch(stem))
+
+
 def _search_vault_filenames(in_dir, term, limit: int = 200):
     """Files under ``in_dir`` whose path/name contains every word of ``term``
-    (case-insensitive). App-generated output dirs are skipped. Returns a list
-    of (abs_path, reason). Pure + UI-free so it's unit-testable."""
+    (case-insensitive), OR whose basename matches a ``#``/``*`` wildcard
+    pattern in ``term`` (e.g. ``job_####``). App-generated output dirs are
+    skipped. Returns a list of (abs_path, reason). Pure + UI-free so it's
+    unit-testable."""
     import os as _os
     skip = {"derived", "deferred_results", "converted_mongo", "__pycache__",
             ".vault_index", ".stats_cache", "conversation_logs", ".git"}
+    # Wildcard mode: match the compiled pattern against each basename. This
+    # takes precedence because re.findall(r"[a-z0-9]+", ...) below would
+    # silently drop `#`/`*`/`_` and collapse "job_####" to just "job".
+    pat = _compile_name_pattern(term)
+    out = []
+    if pat is not None:
+        try:
+            for dp, dn, fn in _os.walk(str(in_dir)):
+                dn[:] = [d for d in dn if d not in skip and not d.startswith(".")]
+                for f in fn:
+                    if f.startswith("."):
+                        continue
+                    if _name_matches_pattern(pat, f):
+                        out.append((_os.path.join(dp, f), "pattern match"))
+                        if len(out) >= limit:
+                            return out
+        except Exception:
+            pass
+        return out
     words = [w for w in _re.findall(r"[a-z0-9]+", (term or "").lower())
              if len(w) > 0]
     if not words:
         return []
-    out = []
     try:
         for dp, dn, fn in _os.walk(str(in_dir)):
             dn[:] = [d for d in dn if d not in skip and not d.startswith(".")]
@@ -1960,6 +2028,12 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                 # KNOWS the full set of matching files even when only
                 # a few get full content.
                 TAIL_K = base_tail
+                # NOTE: `_ce_tim` was referenced here but never imported
+                # (introduced by the "behavior-preserving" perf batch c613e75),
+                # so this whole block raised NameError on EVERY turn and the
+                # outer except swallowed it — vault search was silently dead.
+                # Import the alias locally, matching _ce_sem / _ce_pack nearby.
+                import council_engine as _ce_tim
                 with _ce_tim._TimingScope("vault.search"):
                     all_hits, fuzzy_matches = idx.search(
                         user_text, k=k + TAIL_K, folder=folder_scope,
@@ -2066,6 +2140,72 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
             except Exception as _e:
                 print('[DEBUG inject] vault search failed: ' + repr(_e),
                       file=_sys_dbg.stderr)
+
+    # -- Cell-value matches (compact, high-priority) ------------------------
+    # The vault search above is filename / header / topic / embedding biased,
+    # so a value that lives INSIDE a file (a cell in row 400, a code, a name)
+    # frequently isn't surfaced — the app's core "can't find data inside my
+    # files" complaint. Here we run the deterministic cell scanner
+    # (data_index.search_value — pure pandas/dict, NO model call, so the
+    # single serialized-inference lock is untouched) over the query's content
+    # terms and fold real hits into the context as a compact block. Slotted at
+    # PRIO_VAULT_SUMMARY: above droppable vault matches (these are ACTUAL cell
+    # hits, more authoritative than fuzzy matches) and kept small by self-cap.
+    if not explicit_paths and analyst_block is None:
+        try:
+            _val_terms = _content_query_terms(user_text)
+            _di_inst = _get_data_index() if _val_terms else None
+            if _di_inst is not None:
+                try:
+                    _di_inst.refresh()
+                except Exception:
+                    pass
+                _val_merged: dict = {}
+                for _t in _val_terms:
+                    try:
+                        _vhits = _di_inst.search_value(_t, max_per_file=5)
+                    except Exception:
+                        _vhits = []
+                    for _h in _vhits:
+                        _ent = _val_merged.setdefault(_h["path"], {
+                            "file": _h["file"], "cols": [], "rows": [],
+                            "terms": set(),
+                        })
+                        _ent["terms"].add(_t)
+                        for _c in _h["column_hits"]:
+                            if _c not in _ent["cols"]:
+                                _ent["cols"].append(_c)
+                        for _r in _h["rows"]:
+                            if len(_ent["rows"]) < 3:
+                                _ent["rows"].append(_r)
+                if _val_merged:
+                    # Most terms matched + most rows first; cap files for size.
+                    _ranked = sorted(
+                        _val_merged.values(),
+                        key=lambda e: (-len(e["terms"]), -len(e["rows"])),
+                    )[:4]
+                    _vlines = ["[VALUE MATCHES — rows inside your vault files "
+                               "that contain the search terms]"]
+                    for _ent in _ranked:
+                        _vlines.append(
+                            f"  {_ent['file']}  (matched in column(s): "
+                            f"{', '.join(_ent['cols'][:6])})"
+                        )
+                        for _r in _ent["rows"]:
+                            _cells = "  |  ".join(
+                                f"{_k}={_v}" for _k, _v in _r.items()
+                                if _v not in (None, "", "nan")
+                            )
+                            _vlines.append("    " + _cells[:160])
+                    candidates.append(
+                        (PRIO_VAULT_SUMMARY, "[VALUE MATCHES]", "\n".join(_vlines))
+                    )
+                    print('[DEBUG inject] value matches: '
+                          + str(len(_ranked)) + ' file(s) from terms '
+                          + repr(_val_terms), file=_sys_dbg.stderr)
+        except Exception as _ve:
+            print('[DEBUG inject] value search failed: ' + repr(_ve),
+                  file=_sys_dbg.stderr)
 
     # -- NO DATA marker (priority 1, never dropped) -------------------------
     # Critical defense against cross-machine hallucination: when the user
@@ -2350,6 +2490,87 @@ def _get_vault_index():
         print('[VaultIndex] init failed: ' + repr(_e), file=_sys_dbg.stderr)
         _VAULT_INDEX_INSTANCE = None
     return _VAULT_INDEX_INSTANCE
+
+
+_DATA_INDEX_INSTANCE = None
+
+
+def _register_data_index(di) -> None:
+    """Let module-level helpers (the context injector's value-search stage)
+    reuse the SAME DataIndex the console built + refreshes, instead of
+    constructing a duplicate one."""
+    global _DATA_INDEX_INSTANCE
+    _DATA_INDEX_INSTANCE = di
+
+
+def _get_data_index():
+    """Return a DataIndex over the vault's data_in/ + bundled samples.
+
+    Prefers the instance the console registered (already warm + refreshed);
+    otherwise lazily builds one so headless / agent contexts still get value
+    search. Returns None on failure — callers must degrade gracefully.
+    """
+    global _DATA_INDEX_INSTANCE
+    if _DATA_INDEX_INSTANCE is not None:
+        return _DATA_INDEX_INSTANCE
+    try:
+        import data_index as _di
+        _DATA_INDEX_INSTANCE = _di.DataIndex(
+            search_roots=[
+                _di.input_dir(VAULT_DIR),
+                _di.bundled_samples_dir(),
+            ],
+            write_root=_di.output_dir(VAULT_DIR),
+        )
+    except Exception as _e:
+        import sys as _sys_dbg
+        print('[DataIndex] module init failed: ' + repr(_e), file=_sys_dbg.stderr)
+        _DATA_INDEX_INSTANCE = None
+    return _DATA_INDEX_INSTANCE
+
+
+# Stop-words for the value-search stage's content-term extraction. Module-level
+# because the console's _query_keywords is a method, unavailable to the
+# module-level injector. Broad by design: we want proper-noun / ID-like tokens
+# likely to appear as CELL VALUES, not generic verbs or aggregate words (which
+# describe an OPERATION on the data, not a value stored in it).
+_VALUE_QUERY_STOPS = frozenset({
+    "the", "a", "an", "of", "for", "by", "in", "on", "at", "and", "or", "to",
+    "with", "what", "which", "who", "whose", "how", "many", "much", "do",
+    "does", "did", "is", "are", "was", "were", "have", "has", "had", "from",
+    "this", "that", "these", "those", "all", "any", "show", "tell", "give",
+    "find", "list", "look", "up", "lookup", "search", "me", "my", "our",
+    "your", "us", "i", "about", "across", "between", "into", "per", "over",
+    "under", "most", "least", "more", "less", "than", "when", "where", "why",
+    "value", "values", "row", "rows", "record", "records", "file", "files",
+    "data", "column", "columns", "field", "fields", "get", "see", "please",
+    "name", "named", "called",
+    # Aggregate / analytic words describe an operation, not a stored value.
+    "average", "avg", "total", "sum", "count", "mean", "median", "mode",
+    "maximum", "minimum", "max", "min", "percentage", "percent", "number",
+    "amount", "compare", "trend", "group", "grouped",
+})
+
+
+def _content_query_terms(text, *, max_terms: int = 6):
+    """Content terms likely to be CELL VALUES: strip punctuation + stop-words,
+    keep tokens length >= 3 (or ANY token containing a digit — an ID/code).
+    Deduped, order-preserving, capped at ``max_terms``."""
+    out: List[str] = []
+    seen: Set[str] = set()
+    for raw in (text or "").split():
+        t = raw.strip(".,!?;:()[]{}\"'`").lower()
+        if not t or t in _VALUE_QUERY_STOPS:
+            continue
+        if len(t) < 3 and not any(ch.isdigit() for ch in t):
+            continue
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+        if len(out) >= max_terms:
+            break
+    return out
 
 
 # ---- Data analyst step ----------------------------------------------------
@@ -4952,6 +5173,9 @@ class CouncilConsole(tk.Tk):
             ],
             write_root=data_index.output_dir(VAULT_DIR),
         )
+        # Share this warm instance with the module-level context injector so
+        # its cell-value search stage reuses the same (refreshed) index.
+        _register_data_index(self.data_index)
         self.librarian = ce.Librarian(VAULT_DIR, LOG_PATH)
         self.runner = ce.LocalRunner(WORKSPACE_DIR)
         self.speech = ce.SpeechToText(model_size="base")
@@ -7177,18 +7401,24 @@ class CouncilConsole(tk.Tk):
         self._set_status("● idle")
 
     def _resolve_file_target(self, target: str) -> Optional[Path]:
-        """Resolve target string to an existing CSV/Excel file."""
+        """Resolve target string to an existing CSV/Excel file. Supports
+        ``#``/``*`` wildcard patterns (e.g. ``job_####`` → job_1234.csv)."""
         p = Path(target).expanduser()
         if p.is_absolute() and p.is_file():
             return p
         try:
             import vault_analyst as _va
+            pat = _compile_name_pattern(target)
             matches = []
             for c in _va.list_csv_files(VAULT_DIR) + _va.list_excel_files(VAULT_DIR):
-                if target.lower() in c.name.lower():
+                if pat is not None:
+                    if _name_matches_pattern(pat, c.name):
+                        matches.append(c)
+                elif target.lower() in c.name.lower():
                     matches.append(c)
             if matches:
-                return matches[0]
+                # Deterministic pick when a pattern spans several files.
+                return sorted(matches, key=lambda m: m.name)[0] if pat is not None else matches[0]
         except Exception:
             pass
         candidate = VAULT_DIR / target
@@ -9668,7 +9898,14 @@ class CouncilConsole(tk.Tk):
             cand = None
             try:
                 pp = Path(str(s))
-                if pp.is_absolute() and pp.exists():
+                _pat = _compile_name_pattern(pp.name)
+                if _pat is not None:
+                    # Wildcard bare name (e.g. job_####) — first basename match.
+                    for hit in in_dir.rglob("*"):
+                        if hit.is_file() and _name_matches_pattern(_pat, hit.name):
+                            cand = hit
+                            break
+                elif pp.is_absolute() and pp.exists():
                     cand = pp
                 elif (in_dir / str(s)).exists():
                     cand = in_dir / str(s)
@@ -15632,10 +15869,51 @@ class CouncilConsole(tk.Tk):
                 f"Could not refresh data index: {e}", "final")
             return
 
-        # Two queries in parallel — value search and column-name search.
-        # The popup shows both; the more useful set bubbles to the top.
-        value_hits  = self.data_index.search_value(query, max_per_file=25)
-        col_hits    = self.data_index.find_files_with_column(query)
+        # Value + column-name search, driven by the query's CONTENT terms
+        # rather than the whole raw sentence. search_value tests
+        # `needle in cell`, so passing "who bought promethium in Q3" never
+        # substring-matches a single cell — we extract keywords first and
+        # union the per-term hits, merged by file. The popup shows both value
+        # and column matches; the more useful set bubbles to the top.
+        terms = self._query_keywords(query) or [query.strip()]
+        terms = [t for t in dict.fromkeys(terms) if t]   # dedupe, keep order
+
+        merged: dict = {}
+        for term in terms:
+            for h in self.data_index.search_value(term, max_per_file=25):
+                cur = merged.get(h["path"])
+                if cur is None:
+                    merged[h["path"]] = {
+                        "file":          h["file"],
+                        "path":          h["path"],
+                        "row_count":     h["row_count"],
+                        "matched_count": len(h["rows"]),
+                        "column_hits":   list(h["column_hits"]),
+                        "rows":          list(h["rows"]),
+                        "_rowkeys":      {tuple(sorted(r.items())) for r in h["rows"]},
+                    }
+                else:
+                    for c in h["column_hits"]:
+                        if c not in cur["column_hits"]:
+                            cur["column_hits"].append(c)
+                    for r in h["rows"]:
+                        rk = tuple(sorted(r.items()))
+                        if rk not in cur["_rowkeys"] and len(cur["rows"]) < 25:
+                            cur["_rowkeys"].add(rk)
+                            cur["rows"].append(r)
+        value_hits = sorted(merged.values(), key=lambda r: -len(r["rows"]))
+        for h in value_hits:
+            h["matched_count"] = len(h["rows"])
+            h.pop("_rowkeys", None)
+
+        col_seen: set = set()
+        col_hits: list = []
+        for term in terms:
+            for prof, exact in self.data_index.find_files_with_column(term):
+                key = (getattr(prof, "name", str(prof)), exact)
+                if key not in col_seen:
+                    col_seen.add(key)
+                    col_hits.append((prof, exact))
         relationships = self.data_index.find_relationships()
 
         if not value_hits and not col_hits:

@@ -3099,6 +3099,154 @@ def test_instant_filename_search() -> None:
                cge._search_vault_filenames(root, "") == [])
 
 
+def test_filename_wildcard_patterns() -> None:
+    """`job_####` / `report_*` file references resolve as PATTERNS, not literal
+    strings. `#` = any single char, `*` = any run. Covers the helper pair and
+    the end-to-end _search_vault_filenames wildcard branch."""
+    try:
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_gui_engine importable (skipped: {exc!r})", True)
+        return
+    pat = cge._compile_name_pattern("job_####")
+    _check("job_#### compiles to a pattern", pat is not None)
+    _check("job_#### matches a 4-digit suffix",
+           cge._name_matches_pattern(pat, "job_1234.csv"))
+    _check("job_#### matches a 4-letter suffix (# = any char)",
+           cge._name_matches_pattern(pat, "job_abcd.csv"))
+    _check("job_#### rejects a 3-char suffix",
+           not cge._name_matches_pattern(pat, "job_123.csv"))
+    _check("job_#### rejects a 5-char suffix",
+           not cge._name_matches_pattern(pat, "job_12345.csv"))
+    _check("a plain name is NOT treated as a pattern",
+           cge._compile_name_pattern("sales") is None)
+    star = cge._compile_name_pattern("report_*")
+    _check("report_* compiles to a glob pattern", star is not None)
+    _check("report_* matches any suffix",
+           cge._name_matches_pattern(star, "report_q3_2024.xlsx"))
+    _check("report_* rejects a different prefix",
+           not cge._name_matches_pattern(star, "summary_q3.xlsx"))
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "job_1234.csv").write_text("a\n1\n")
+        (root / "job_0087.csv").write_text("a\n1\n")
+        (root / "job_notes.txt").write_text("hi\n")   # 5-char suffix -> no match
+        hits = cge._search_vault_filenames(root, "job_####")
+        names = sorted(Path(p).name for p, _ in hits)
+        _check("wildcard filename search finds both 4-char jobs",
+               "job_1234.csv" in names and "job_0087.csv" in names)
+        _check("wildcard filename search excludes non-4-char suffix",
+               "job_notes.txt" not in names)
+        _check("wildcard hits carry a reason",
+               all(r for _, r in hits))
+
+
+def test_content_query_terms_and_value_index() -> None:
+    """The context injector's value-search stage extracts CELL-VALUE-like terms
+    (dropping stop/aggregate words, keeping IDs), and the registered DataIndex
+    is reused by _get_data_index() so search_value finds in-cell values."""
+    try:
+        import council_gui_engine as cge
+        import data_index
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_gui_engine importable (skipped: {exc!r})", True)
+        return
+    terms = cge._content_query_terms("what is the average revenue for job_0087")
+    _check("aggregate word 'average' dropped from value terms",
+           "average" not in terms)
+    _check("stop-word 'the' dropped from value terms", "the" not in terms)
+    _check("ID-like token 'job_0087' kept", "job_0087" in terms)
+    dterms = cge._content_query_terms("row 12")
+    _check("short digit-bearing token kept ('12')", "12" in dterms)
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        d = root / "data_in"
+        d.mkdir()
+        (root / "out").mkdir()
+        (d / "orders.csv").write_text(
+            "customer,product\nAcme,Promethium\nBeta,Widget\n")
+        di = data_index.DataIndex(search_roots=[d], write_root=root / "out")
+        cge._register_data_index(di)
+        try:
+            _check("register/get data index round-trips",
+                   cge._get_data_index() is di)
+            vterms = cge._content_query_terms("who bought promethium")
+            names = set()
+            for t in vterms:
+                for h in di.search_value(t):
+                    names.add(h["file"])
+            _check("value search finds a value that lives INSIDE a cell",
+                   "orders.csv" in names)
+        finally:
+            cge._register_data_index(None)   # reset module global for isolation
+
+
+def test_tabular_sample_text_captures_body() -> None:
+    """_parse_csv (and the tabular/Excel parsers) now populate `sample_text`
+    with a DEDUPED, bounded sample of cell VALUES across the file, so the
+    embedding (_record_to_text embeds sample_text[:300]) and phrase-match
+    scorer (sample_blob) reflect the file body, not just its headers."""
+    try:
+        import vault_index as vi
+    except Exception as exc:  # pragma: no cover
+        _check(f"vault_index importable (skipped: {exc!r})", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "games.csv"
+        lines = ["console,title"]
+        for i in range(50):
+            lines.append(f"PlayStation,Game{i}")
+        p.write_text("\n".join(lines) + "\n")
+        rec = vi._parse_csv(p)
+        st = rec.get("sample_text", "")
+        _check("csv record now carries a sample_text body sample", bool(st))
+        _check("body cell VALUES captured in sample_text",
+               "PlayStation" in st and "Game0" in st)
+        _check("repeated value deduped (PlayStation appears once)",
+               st.count("PlayStation") == 1)
+        _check("sample_text is char-bounded",
+               len(st) <= vi._BODY_SAMPLE_MAX_CHARS)
+        _check("headers are not mixed into the value sample",
+               "console" not in st.split(" | "))
+
+
+def test_vault_search_runs_on_main_path() -> None:
+    """Regression: the context injector's vault-search block referenced an
+    undefined alias `_ce_tim` (introduced by the "behavior-preserving" perf
+    batch c613e75), so idx.search() raised NameError on EVERY turn and the
+    outer except swallowed it — vault search was silently DEAD. Assert a VAULT
+    block is actually produced for a matching query."""
+    try:
+        import council_gui_engine as cge
+        import vault_index
+        import data_index
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_gui_engine importable (skipped: {exc!r})", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        vroot = Path(td)
+        (vroot / "data_in").mkdir()
+        (vroot / "out").mkdir()
+        (vroot / "data_in" / "quarterly_promethium_report.txt").write_text(
+            "Promethium output rose sharply in Q3.\n")
+        vi = vault_index.VaultIndex(vroot)
+        vi.rebuild()
+        di = data_index.DataIndex(
+            search_roots=[vroot / "data_in"], write_root=vroot / "out")
+        saved = cge._VAULT_INDEX_INSTANCE
+        cge._VAULT_INDEX_INSTANCE = vi
+        cge._register_data_index(di)
+        try:
+            _aug, _fuzzy, bd = cge._inject_file_contents_impl(
+                "find files about promethium", n_ctx=8192)
+        finally:
+            cge._VAULT_INDEX_INSTANCE = saved
+            cge._register_data_index(None)
+        labels = [l for l, _ in bd.get("costs", [])]
+        _check("vault search produces a VAULT block (no swallowed NameError)",
+               any("VAULT" in l for l in labels))
+
+
 def test_data_preview_text() -> None:
     """_data_preview_text gives a model-free (schema, rows) preview of a data
     file with bounded reads, and falls back to a text peek for non-tabular
@@ -3782,6 +3930,14 @@ def main() -> int:
          test_answer_report_md)
     _run("instant filename search (no model)",
          test_instant_filename_search)
+    _run("filename wildcard patterns (job_#### / report_*)",
+         test_filename_wildcard_patterns)
+    _run("value-search: content terms + in-cell lookup",
+         test_content_query_terms_and_value_index)
+    _run("tabular sample_text captures file body",
+         test_tabular_sample_text_captures_body)
+    _run("vault search runs on main path (NameError regression)",
+         test_vault_search_runs_on_main_path)
     _run("data preview (model-free schema + rows)",
          test_data_preview_text)
     _run("error coaching (plain-language + one-click fix)",
