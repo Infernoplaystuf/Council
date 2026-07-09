@@ -38,7 +38,7 @@ elif command -v conda >/dev/null 2>&1; then
 else
     die "conda not found. Run ./setup-linux.sh first."
 fi
-conda activate council 2>/dev/null || die "conda env 'council' missing. Run ./setup-linux.sh."
+conda activate wizardCouncil 2>/dev/null || die "conda env 'wizardCouncil' missing. Run ./setup-linux.sh."
 
 # ── Find a GGUF model ───────────────────────────────────────
 if [ -z "${COUNCIL_GGUF_PATH:-}" ]; then

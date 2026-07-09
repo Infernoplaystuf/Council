@@ -31,7 +31,7 @@ if /i "%~1"=="--check" set "CHECK_ONLY=1"
 REM ── Resolve the Python interpreter ───────────────────────────
 REM Order: (0) .council_python marker written by setup_council.py, so
 REM setup->run just works with no conda-on-PATH needed; (1) COUNCIL_PYTHON
-REM override; (2) a local .venv; (3) the conda 'council' env via
+REM override; (2) a local .venv; (3) the conda 'wizardCouncil' env via
 REM `conda info --base`; (4) common conda install locations.
 set "PYEXE="
 if exist "%SCRIPT_DIR%.council_python" (
@@ -43,19 +43,21 @@ if not defined PYEXE if defined COUNCIL_PYTHON if exist "%COUNCIL_PYTHON%" set "
 if not defined PYEXE if exist "%SCRIPT_DIR%.venv\Scripts\python.exe" set "PYEXE=%SCRIPT_DIR%.venv\Scripts\python.exe"
 if not defined PYEXE (
     for /f "usebackq delims=" %%i in (`conda info --base 2^>nul`) do (
-        if not defined PYEXE if exist "%%i\envs\council\python.exe" set "PYEXE=%%i\envs\council\python.exe"
+        if not defined PYEXE if exist "%%i\envs\wizardCouncil\python.exe" set "PYEXE=%%i\envs\wizardCouncil\python.exe"
     )
 )
 if not defined PYEXE (
     for %%B in ("%USERPROFILE%\miniconda3" "%USERPROFILE%\anaconda3" "%USERPROFILE%\miniforge3" "%LOCALAPPDATA%\miniconda3" "%ProgramData%\miniconda3" "%ProgramData%\Anaconda3" "C:\miniconda3" "C:\Anaconda3") do (
-        if not defined PYEXE if exist "%%~B\envs\council\python.exe" set "PYEXE=%%~B\envs\council\python.exe"
+        if not defined PYEXE if exist "%%~B\envs\wizardCouncil\python.exe" set "PYEXE=%%~B\envs\wizardCouncil\python.exe"
     )
 )
 if not defined PYEXE (
     echo [run-windows] Could not find a Python environment.
     echo [run-windows] Run setup first:   setup.bat
     echo [run-windows] ...or point at one: set COUNCIL_PYTHON=C:\path\to\python.exe
-    pause
+    REM Keep the window open for a double-click launch, but never block a
+    REM scripted --check / non-interactive run on a keypress.
+    if not defined CHECK_ONLY pause
     exit /b 1
 )
 echo [run-windows] python: !PYEXE!

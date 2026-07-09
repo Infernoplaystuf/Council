@@ -505,7 +505,7 @@ def build_plan(hw: dict, prev: dict, args) -> dict:
     concrete plan we'll execute. Returns a dict the runner consumes."""
     rec = hw.get("recommended") or {}
     cuda_tier = args.cuda_tier or rec.get("cuda_tier", "cpu")
-    env_name = args.env_name or "council"
+    env_name = args.env_name or "wizardCouncil"
     python_version = args.python_version or "3.11"
     reuse_env = (prev.get("conda_env", {}).get("present")
                   and not args.reinstall)
@@ -802,7 +802,7 @@ def print_previous(prev: dict, *, verbose: bool = False) -> None:
         if tool:
             info(f"   ↳ listed by `{tool} env list`")
     else:
-        info("no existing 'council' conda env")
+        info("no existing 'wizardCouncil' conda env")
         # Surface the diagnostic notes so the user can see WHAT we
         # tried — was conda invokable? did `conda env list` time out?
         # was the env in a non-standard location?
@@ -877,7 +877,7 @@ def main() -> int:
     parser.add_argument("--cuda-tier", choices=("cpu", "cu121", "cu124", "cu128"),
                         help="Override auto-detected CUDA wheel tier.")
     parser.add_argument("--env-name", default=None,
-                        help="Conda env name (default: 'council').")
+                        help="Conda env name (default: 'wizardCouncil').")
     parser.add_argument("--python-version", default=None,
                         help="Python version (default: 3.11).")
     parser.add_argument("--skip-install", action="store_true",
@@ -907,7 +907,7 @@ def main() -> int:
     # place, which is why users reported "can't find pre-existing
     # vault that stays consistent normally on where it saves at."
     vault_canonical = Path.home() / ".council" / "vault"
-    env_name_for_probe = args.env_name or "council"
+    env_name_for_probe = args.env_name or "wizardCouncil"
     prev = previous_install_detect.detect(
         HERE, vault_canonical, env_name=env_name_for_probe,
     )

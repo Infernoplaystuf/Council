@@ -503,13 +503,13 @@ class OnboardingWizard(_TkBase):
         env = info.get("conda_env", {}) or {}
         if env.get("present"):
             self._label(
-                f"   ✓ conda env 'council' found at\n     {env.get('path') or '(unknown path)'}\n"
+                f"   ✓ conda env 'wizardCouncil' found at\n     {env.get('path') or '(unknown path)'}\n"
                 f"     (managed by {env.get('tool') or 'unknown tool'})",
                 fg=self._theme().get("success"),
             )
         else:
             self._label(
-                "   ○ No 'council' conda env found.\n"
+                "   ○ No 'wizardCouncil' conda env found.\n"
                 "     setup-wsl.sh or installs.txt will create one for you.",
             )
 

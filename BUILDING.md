@@ -20,7 +20,7 @@ missing in the bundle.
 
 ```cmd
 :: Recommended: build inside the same conda env you develop in.
-::   conda activate council        (or whatever you named yours)
+::   conda activate wizardCouncil   (or whatever you named yours)
 
 :: Sanity-check the version:
 python --version

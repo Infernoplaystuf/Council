@@ -30,7 +30,7 @@ say()  { echo -e "${GREEN}[run-wsl]${RESET} $*"; }
 warn() { echo -e "${YELLOW}[run-wsl]${RESET} $*"; }
 die()  { echo -e "${RED}[run-wsl]${RESET} $*" >&2; exit 1; }
 
-# ── Locate conda + activate council env ─────────────────────
+# ── Locate conda + activate wizardCouncil env ───────────────
 if [ -f "$HOME/miniforge3/etc/profile.d/conda.sh" ]; then
     # shellcheck disable=SC1091
     source "$HOME/miniforge3/etc/profile.d/conda.sh"
@@ -43,7 +43,7 @@ elif command -v conda >/dev/null 2>&1; then
 else
     die "conda not found. Run ./setup-wsl.sh first."
 fi
-conda activate council 2>/dev/null || die "conda env 'council' not found. Run ./setup-wsl.sh."
+conda activate wizardCouncil 2>/dev/null || die "conda env 'wizardCouncil' not found. Run ./setup-wsl.sh."
 
 # ── Find the GGUF model ─────────────────────────────────────
 if [ -z "${COUNCIL_GGUF_PATH:-}" ]; then

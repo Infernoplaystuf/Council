@@ -46,7 +46,7 @@
 #  seconds per response on a 7B/8B model. Use a 3B GGUF for speed.
 # ============================================================
 conda config --add channels conda-forge && conda config --set channel_priority strict
-conda create -n council python=3.11 -y && conda activate council
+conda create -n wizardCouncil python=3.11 -y && conda activate wizardCouncil
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
 pip install llama-cpp-python
 pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper h5py html2text huggingface_hub kaleido matplotlib openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb
@@ -69,7 +69,7 @@ python -c "import torch, llama_cpp, chromadb, sentence_transformers, pandas, ope
 #                              Quadro RTX 3000/4000/5000 Mobile
 # ============================================================
 conda config --add channels conda-forge && conda config --set channel_priority strict
-conda create -n council python=3.11 -y && conda activate council
+conda create -n wizardCouncil python=3.11 -y && conda activate wizardCouncil
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121 --force-reinstall --no-cache-dir
 pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper h5py html2text huggingface_hub kaleido matplotlib openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb
@@ -90,7 +90,7 @@ python -c "import torch, llama_cpp, chromadb, sentence_transformers, pandas, ope
 #                              RTX 2000 Ada Laptop GPU, RTX 1000 Ada Laptop GPU
 # ============================================================
 conda config --add channels conda-forge && conda config --set channel_priority strict
-conda create -n council python=3.11 -y && conda activate council
+conda create -n wizardCouncil python=3.11 -y && conda activate wizardCouncil
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 --force-reinstall --no-cache-dir
 pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper h5py html2text huggingface_hub kaleido matplotlib openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb
@@ -115,7 +115,7 @@ python -c "import torch, llama_cpp, chromadb, sentence_transformers, pandas, ope
 #  swap the torch line for the nightly URL; everything else stays.
 # ============================================================
 conda config --add channels conda-forge && conda config --set channel_priority strict
-conda create -n council python=3.11 -y && conda activate council
+conda create -n wizardCouncil python=3.11 -y && conda activate wizardCouncil
 pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 --force-reinstall --no-cache-dir
 pip install --upgrade-strategy only-if-needed beautifulsoup4 chromadb crawl4ai duckdb faster-whisper h5py html2text huggingface_hub kaleido matplotlib openpyxl paramiko plotly pyarrow pymongo pypdf python-docx PyYAML requests scikit-learn scipy sentence-transformers sounddevice soundfile SQLAlchemy tkinterweb
@@ -203,7 +203,7 @@ python -c "import torch, llama_cpp, chromadb, sentence_transformers, pandas, ope
 #  older (cu121: RTX 20/30 series) or newer (cu128 nightly: RTX 50
 #  series) GPU — see Sections B/D for the GPU mapping.
 conda config --add channels conda-forge && conda config --set channel_priority strict
-conda create -n council python=3.12 -y && conda activate council
+conda create -n wizardCouncil python=3.12 -y && conda activate wizardCouncil
 conda install -c bluequartzsoftware dream3dnx -y && conda install -c conda-forge h5py "numpy<2.3" -y
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
 pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu124 --force-reinstall --no-cache-dir
@@ -240,7 +240,7 @@ python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pa
 #      hear anything. The speech tab is effectively read-only in WSL.
 #
 #  - Conda env activation in scripts
-#      Bash scripts that `conda activate council` need `source
+#      Bash scripts that `conda activate wizardCouncil` need `source
 #      ~/miniconda3/etc/profile.d/conda.sh` first (or set
 #      $CONDA_SHLVL beforehand). Not needed in interactive shells.
 
@@ -320,7 +320,7 @@ python -c "import torch, simplnx, llama_cpp, chromadb, sentence_transformers, pa
 #
 #  Common steps (run all):
 conda config --add channels conda-forge && conda config --set channel_priority strict
-conda create -n council python=3.11 -y && conda activate council
+conda create -n wizardCouncil python=3.11 -y && conda activate wizardCouncil
 #
 #  Then run ONE of the three GPU lines below:
 #

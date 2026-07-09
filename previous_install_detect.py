@@ -32,7 +32,7 @@ from typing import Any, Dict, List, Optional
 # ============================================================
 
 def detect(app_dir: Path, vault_dir: Path,
-            env_name: str = "council") -> Dict[str, Any]:
+            env_name: str = "wizardCouncil") -> Dict[str, Any]:
     """Snapshot every reusable artifact we can find.
 
     Returns a dict with:
@@ -88,9 +88,9 @@ def detect(app_dir: Path, vault_dir: Path,
 # Conda env
 # ============================================================
 
-def _detect_conda_env(env_name: str = "council") -> Dict[str, Any]:
+def _detect_conda_env(env_name: str = "wizardCouncil") -> Dict[str, Any]:
     """Look for the named conda env across the common conda install
-    flavours. Default name is 'council' (used by setup-wsl.sh and
+    flavours. Default name is 'wizardCouncil' (used by setup-wsl.sh and
     setup_council.py); callers can override for custom env names.
 
     Returns:
@@ -138,7 +138,7 @@ def _detect_conda_env(env_name: str = "council") -> Dict[str, Any]:
                     continue
                 # Lines look like:
                 #   base                  *  /opt/conda
-                #   council                  /opt/conda/envs/council
+                #   wizardCouncil            /opt/conda/envs/wizardCouncil
                 # The active env has '*' in column 2; we don't care
                 # about activation state, just the name match.
                 parts = line.split()

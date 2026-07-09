@@ -101,15 +101,15 @@ fi
 source "$CONDA_HOME/etc/profile.d/conda.sh"
 
 # ── STEP 4: create conda env ────────────────────────────────
-say "STEP 4/7  — creating conda env 'council' (Python 3.11)"
-if conda env list | grep -q '^council\s'; then
-    say "  env 'council' already exists — reusing."
+say "STEP 4/7  — creating conda env 'wizardCouncil' (Python 3.11)"
+if conda env list | grep -q '^wizardCouncil\s'; then
+    say "  env 'wizardCouncil' already exists — reusing."
 else
     conda config --add channels conda-forge >/dev/null
     conda config --set channel_priority strict >/dev/null
-    conda create -n council python=3.11 -y
+    conda create -n wizardCouncil python=3.11 -y
 fi
-conda activate council
+conda activate wizardCouncil
 
 # ── STEP 5: torch + llama-cpp-python (CUDA-tier-specific) ──
 say "STEP 5/7  — installing torch + llama-cpp-python ($CUDA_TIER)"
