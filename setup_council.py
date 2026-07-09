@@ -970,19 +970,49 @@ def main() -> int:
     print_step_summary()
     print()
     print(_c("32;1", "✓ Setup complete."))
+
+    # ── Plug-and-play launch marker ──────────────────────────────────
+    # Write the exact env interpreter to .council_python so the launcher
+    # scripts (run-windows.bat / run-wsl.sh) find it WITHOUT needing conda on
+    # PATH — this is what wires "setup" straight into "run" as one flow.
+    _envpy = None
+    if not args.skip_install:
+        try:
+            _envpy = env_python(conda, plan["env_name"])
+            if _envpy is not None:
+                (HERE / ".council_python").write_text(
+                    str(_envpy) + "\n", encoding="utf-8")
+                ok("launch marker written (.council_python)")
+        except Exception as _e:
+            warn(f"could not write launch marker: {_e}")
+
+    # ── GPU readiness (honest heads-up before first launch) ──────────
+    if _envpy is not None:
+        try:
+            print()
+            subprocess.run([str(_envpy), str(HERE / "gpu_check.py")],
+                           check=False, timeout=60)
+        except Exception:
+            pass
+
     print()
     print("Next steps:")
-    print(f"  1. Activate the env:    conda activate {plan['env_name']}")
-    if not (plan.get("previous_model")
-            or any(m.get("valid") for m in plan.get("found_models", []))):
-        print(f"  2. Download a model:    huggingface-cli download "
-              f"bartowski/{_model_for_tier(plan['recommended'].get('model_tier','small'))}"
-              f" --local-dir ~/models")
-        print(f"  3. Point at the model: export COUNCIL_GGUF_PATH=~/models/<file>.gguf")
-        print(f"  4. Launch:             python council_gui_engine.py")
+    _is_win = sys.platform.startswith("win")
+    _launcher = "run-windows.bat" if _is_win else "./run-wsl.sh  (or ./run-linux.sh)"
+    _need_model = not (plan.get("previous_model")
+                       or any(m.get("valid")
+                              for m in plan.get("found_models", [])))
+    print(f"  1. Launch:  {_launcher}")
+    if _need_model:
+        print("     On first launch the in-app wizard detects your GPU and")
+        print("     lets you download a model sized to your VRAM.")
+        print("     (Or pre-download:  huggingface-cli download bartowski/"
+              f"{_model_for_tier(plan['recommended'].get('model_tier','small'))}"
+              " --local-dir ./models)")
     else:
-        print(f"  2. Launch:             python council_gui_engine.py")
-        print(f"     The wizard will preselect the model it found.")
+        print("     The wizard will preselect the model it found.")
+    print(f"  Manual alternative:  conda activate {plan['env_name']}"
+          " && python council_gui_engine.py")
     return 0
 
 

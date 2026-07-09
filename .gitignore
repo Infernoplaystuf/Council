@@ -53,3 +53,6 @@ _norton_/
 
 # Eval / debug run logs
 *.log
+
+# Per-machine launch marker written by setup_council.py (absolute interpreter path)
+.council_python

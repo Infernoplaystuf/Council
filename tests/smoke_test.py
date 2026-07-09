@@ -2577,6 +2577,27 @@ def test_job_runner_reconciles_stale_on_restart() -> None:
                 cge.VAULT_DIR = prev
 
 
+def test_gpu_check_smoke() -> None:
+    """gpu_check.py (the plug-and-play GPU readiness reporter) runs on any box
+    without hanging or raising, returns a 0/1 exit code, and prints a verdict.
+    Its probes tolerate a missing nvidia-smi / llama-cpp / torch."""
+    import io
+    import contextlib
+    import gpu_check
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = gpu_check.main()
+    _check("gpu_check.main() returns 0 or 1", rc in (0, 1))
+    _check("gpu_check prints a verdict line", "VERDICT" in buf.getvalue())
+    # Probes are individually crash-safe.
+    _check("nvidia_smi probe returns None or a list",
+           gpu_check._nvidia_smi() is None
+           or isinstance(gpu_check._nvidia_smi(), list))
+    _llg, _note = gpu_check._llama_gpu()
+    _check("llama_gpu probe returns (bool|None, str)",
+           (_llg is None or isinstance(_llg, bool)) and isinstance(_note, str))
+
+
 def test_pandas_sandbox_write_escape_blocked() -> None:
     """SECURITY: the pandas sandbox exposes pathlib.Path for read-side path
     construction, so its WRITE surface (write_text/touch/mkdir/open('w')) — and
@@ -3733,6 +3754,8 @@ def main() -> int:
          test_agent_read_budget_not_double_counted)
     _run("job runner reconciles stale jobs on restart",
          test_job_runner_reconciles_stale_on_restart)
+    _run("gpu_check readiness reporter (no hang, verdict)",
+         test_gpu_check_smoke)
     _run("SECURITY: pandas sandbox write-escape blocked",
          test_pandas_sandbox_write_escape_blocked)
     _run("SECURITY: zip-slip extraction guard",
