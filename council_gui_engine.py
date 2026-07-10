@@ -6677,6 +6677,20 @@ class CouncilConsole(tk.Tk):
         r"\s+(?:column\s+)?(?:in|across|over|from|within)\s+(.+?)\s*$",
         _re.IGNORECASE,
     )
+    # Layered vault content search: "search all files in the vault for X",
+    # "which files mention X", "find references to X". Distinct from _GREP_RE
+    # (a folder-scoped grep) — this requires the all-files / vault / which-files
+    # framing so bare "search files for X in Y" still routes to grep.
+    _VAULT_SEARCH_RE = _re.compile(
+        r"^\s*(?:search\s+(?:through\s+)?(?:all\s+(?:the\s+)?|the\s+|my\s+)"
+        r"(?:files|documents?|data)(?:\s+in\s+(?:the\s+)?vault)?\s+for"
+        r"|search\s+(?:the\s+)?vault\s+for"
+        r"|which\s+files\s+(?:mention|reference|contain|include|talk\s+about)"
+        r"|what\s+files\s+(?:mention|reference|contain|include)"
+        r"|find\s+(?:all\s+)?(?:references?\s+to|mentions?\s+of))"
+        r"\s+(?:the\s+(?:term|word|phrase|value)\s+)?['\"]?(.+?)['\"]?\s*\??\s*$",
+        _re.IGNORECASE,
+    )
     # "list app tools" / "app tools" / "what tools have you built"
     _APP_TOOLS_RE = _re.compile(
         r"^\s*(?:list\s+|show\s+|what\s+(?:are\s+the\s+)?)?"
@@ -7030,6 +7044,10 @@ class CouncilConsole(tk.Tk):
         if m:
             target = self._FOLDER_NOISE_RE.sub("", (m.group(1) or "").strip().strip("'\"`")).strip()
             self._tree_response(target)
+            return True
+        m = self._VAULT_SEARCH_RE.match(single_line)
+        if m:
+            self._vault_term_search_response(m.group(1).strip().strip("'\"`"))
             return True
         m = self._GREP_RE.match(single_line)
         if m:
@@ -7445,9 +7463,106 @@ class CouncilConsole(tk.Tk):
             self._append_transcript("Writer", text, "final")
         self._set_status("● idle")
 
+    def _vault_term_search_response(self, term: str):
+        """Layered vault search for a term: file SUMMARIES / keywords first,
+        then a DEEPER scan of file contents — over the user's data area only.
+        App-state files (question_history.json, agent_jobs.json, indices) and
+        conversation logs are excluded via conversation_logger.is_protected_path.
+        """
+        term = (term or "").strip().strip("'\"`")
+        if not term:
+            self._append_transcript(
+                "Writer", "What term should I search the files for?", "final")
+            self._set_status("● idle")
+            return
+        import data_index as _di
+        import vault_tools as _vt
+        try:
+            import conversation_logger as _cl
+        except Exception:
+            _cl = None
+
+        def _protected(pth) -> bool:
+            if _cl is None or not pth:
+                return False
+            try:
+                return _cl.is_protected_path(pth, VAULT_DIR)
+            except Exception:
+                return False
+
+        self._set_status("● searching…", "#cba6f7")
+        data_root = _di.input_dir(VAULT_DIR)
+
+        # 1) Summaries / descriptions / keywords via the vault index (fast, no
+        #    file reads). This is the "check the summaries first" layer.
+        summary: list = []          # (name, type)
+        summary_names: set = set()
+        idx = _get_vault_index()
+        if idx is not None:
+            try:
+                idx.rebuild()
+            except Exception:
+                pass
+            try:
+                all_hits, _fz = idx.search(term, k=25)
+            except Exception:
+                all_hits = []
+            for _score, rec in all_hits:
+                pth = rec.get("path")
+                if not pth or _protected(pth):
+                    continue
+                nm = rec.get("name") or Path(str(pth)).name
+                if nm in summary_names:
+                    continue
+                summary_names.add(nm)
+                summary.append((nm, rec.get("type", "?")))
+
+        # 2) Deeper scan of the actual file text (the "then a deeper look"
+        #    layer). find_files_containing_text already skips protected paths.
+        content: list = []          # (name, snippet)
+        content_names: set = set()
+        try:
+            hits = _vt.find_files_containing_text(data_root, term, max_hits=300)
+        except Exception:
+            hits = []
+        for h in hits:
+            nm = Path(str(h.get("path", ""))).name
+            if not nm or nm in summary_names or nm in content_names:
+                continue
+            if _protected(h.get("path")):
+                continue
+            content_names.add(nm)
+            content.append((nm, (h.get("context") or "").strip()[:100]))
+
+        if not summary and not content:
+            self._append_transcript(
+                "Writer",
+                f"No files reference {term!r} — checked the file summaries and "
+                f"then the full text of files under {data_root.name}/.", "final")
+            self._set_status("● idle")
+            return
+        lines = [f"Files referencing {term!r}:"]
+        if summary:
+            lines.append("")
+            lines.append(f"Matched in file summary / keywords ({len(summary)}):")
+            for nm, ty in summary[:40]:
+                lines.append(f"  • {nm}  [{ty}]")
+        if content:
+            lines.append("")
+            lines.append(f"Found deeper in file contents ({len(content)}):")
+            for nm, snip in content[:40]:
+                lines.append(f"  • {nm}" + (f"  →  {snip}" if snip else ""))
+        self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
     def _grep_response(self, query: str, target: str):
         import vault_tools as _vt
-        root = self._resolve_folder_target(target) if target else VAULT_DIR
+        # Default to the user's DATA area (data_in), NOT the raw vault root —
+        # the vault root holds app-state files (question_history.json,
+        # agent_jobs.json, indices) and the conversation_logs/ the model must
+        # never read; rooting a whole-vault grep there returned those instead
+        # of real files. _resolve_folder_target('') already resolves to data_in.
+        root = self._resolve_folder_target(target)
         if not root.exists():
             self._append_transcript("Writer", f"Folder not found: {root}", "final")
             self._set_status("● idle")

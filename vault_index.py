@@ -109,6 +109,16 @@ _BOOKKEEPING_FILENAMES = {
     ".vault_col_index.json",
     "data_index_cache.pickle",
 }
+# Also skip every app-STATE file the rest of the app writes to the vault root
+# (question_history.json, agent_jobs.json, connection lists, other indices…).
+# Single source of truth in conversation_logger so the keyword/summary index
+# and the content-grep guard can never drift apart — indexing these made a
+# vault search for a term return the app's own bookkeeping files.
+try:
+    from conversation_logger import PROTECTED_STATE_FILES as _PROTECTED_STATE_FILES
+    _BOOKKEEPING_FILENAMES |= set(_PROTECTED_STATE_FILES)
+except Exception:
+    pass
 
 # Fuzzy match defaults — Levenshtein-style ratio via difflib.
 FUZZY_CUTOFF = 0.82           # similarity threshold (0..1)

@@ -3616,6 +3616,71 @@ def test_agent_can_author_and_run_a_tool() -> None:
                 os.environ["COUNCIL_VAULT_ROOT"] = prev
 
 
+def test_vault_search_excludes_app_state() -> None:
+    """A vault content search must return the user's files, NOT the app's own
+    bookkeeping (question_history.json / agent_jobs.json) — which used to match
+    because they contain the searched term from a prior question/job. Guarded
+    centrally by conversation_logger.is_protected_path (basename), the vault
+    index bookkeeping set, and find_files_containing_text."""
+    try:
+        import conversation_logger as cl
+        import vault_index as vi
+        import vault_tools as vt
+    except Exception as exc:  # pragma: no cover
+        _check(f"modules importable (skipped: {exc!r})", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td) / "vault"
+        (vault / "data_in").mkdir(parents=True)
+        (vault / "question_history.json").write_text('[{"q":"search for bacon"}]')
+        (vault / "agent_jobs.json").write_text('[{"goal":"find bacon"}]')
+        (vault / "data_in" / "menu.txt").write_text("we serve bacon and eggs\n")
+        qh = vault / "question_history.json"
+        _check("question_history.json protected (rooted at vault)",
+               cl.is_protected_path(qh, vault))
+        _check("question_history.json protected even rooted at the parent",
+               cl.is_protected_path(qh, vault.parent))
+        _check("agent_jobs.json is protected",
+               cl.is_protected_path(vault / "agent_jobs.json", vault))
+        _check("a real data file is NOT protected",
+               not cl.is_protected_path(vault / "data_in" / "menu.txt", vault))
+        _check("vault index skips app-state files",
+               "question_history.json" in vi._BOOKKEEPING_FILENAMES
+               and "agent_jobs.json" in vi._BOOKKEEPING_FILENAMES)
+        names = {Path(h["path"]).name
+                 for h in vt.find_files_containing_text(vault, "bacon",
+                                                        max_hits=50)}
+        _check("vault grep excludes question_history.json",
+               "question_history.json" not in names)
+        _check("vault grep excludes agent_jobs.json",
+               "agent_jobs.json" not in names)
+        _check("vault grep still finds the real file", "menu.txt" in names)
+
+
+def test_vault_term_search_routing() -> None:
+    """The layered 'search the vault for X' command parses the term and does
+    NOT hijack the folder-scoped grep ('search files for X in Y')."""
+    try:
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_gui_engine importable (skipped: {exc!r})", True)
+        return
+    C = cge.CouncilConsole
+
+    def tgt(text):
+        m = C._VAULT_SEARCH_RE.match(text)
+        return m.group(1).strip() if m else None
+
+    _check("'search all files in the vault for bacon' -> bacon",
+           tgt("search all files in the vault for bacon") == "bacon")
+    _check("'which files mention bacon' -> bacon",
+           tgt("which files mention bacon") == "bacon")
+    _check("'find references to bacon' -> bacon",
+           tgt("find references to bacon") == "bacon")
+    _check("bare 'search files for X in Y' stays with grep (not hijacked)",
+           C._VAULT_SEARCH_RE.match("search files for bacon in reports") is None)
+
+
 def test_data_preview_text() -> None:
     """_data_preview_text gives a model-free (schema, rows) preview of a data
     file with bounded reads, and falls back to a text peek for non-tabular
@@ -4321,6 +4386,10 @@ def main() -> int:
          test_app_built_tools_and_sandbox_fs)
     _run("agent authors + runs a tool (write_tool/run_app_tool e2e)",
          test_agent_can_author_and_run_a_tool)
+    _run("vault search excludes app-state files (bacon bug)",
+         test_vault_search_excludes_app_state)
+    _run("layered vault-term search routing",
+         test_vault_term_search_routing)
     _run("data preview (model-free schema + rows)",
          test_data_preview_text)
     _run("error coaching (plain-language + one-click fix)",

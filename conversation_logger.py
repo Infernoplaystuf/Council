@@ -56,17 +56,47 @@ PROTECTED_SUBDIRS: tuple = (
 # walks and rebuilt this set each time.
 _PROTECTED_SUBDIRS_LC = frozenset(s.lower() for s in PROTECTED_SUBDIRS)
 
+# App-STATE / bookkeeping files various subsystems write to the vault ROOT
+# (past questions, job records, indices, caches, settings, connection lists).
+# They hold the app's OWN data, NOT the user's — so a vault CONTENT search must
+# never index or return them. Guarded here by BASENAME so the protection holds
+# no matter where a search was rooted. Without this, "search the vault for
+# bacon" hit question_history.json / agent_jobs.json (which contain the term
+# because it was asked/ran before) instead of the user's real files.
+PROTECTED_STATE_FILES: tuple = (
+    "question_history.json", "agent_jobs.json", "deferred_tasks.json",
+    "derived_results.json", "collections.json",
+    "image_index.json", "vault_index.json", "vault_embeddings.json",
+    "fuzzy_denylist.json", "semantic_cache.json", "backend_settings.json",
+    "sql_connections.json", "mongo_connections.json",
+    "data_index_cache.pickle", ".vault_col_index.json",
+    ".agent_runs.jsonl", ".tool_gaps.jsonl", ".failures.jsonl",
+    ".user_quirks.jsonl", ".tool_proposals.jsonl",
+    ".onboarded", ".council_python",
+)
+_PROTECTED_STATE_FILES_LC = frozenset(s.lower() for s in PROTECTED_STATE_FILES)
+
 
 def is_protected_path(path: Any, vault_dir: Any) -> bool:
-    """True if `path` is inside one of the protected vault subdirs.
+    """True if `path` is a protected vault subdir member OR an app-state file.
 
     Works on absolute paths, relative paths, and Path objects. Returns
     False on any error rather than raising — callers use this as a
     filter and never want it to crash a vault walk.
     """
     try:
+        p_raw = Path(path).expanduser()
+    except Exception:
+        return False
+    # App-state files are protected by BASENAME, independent of how the walk
+    # was rooted. A vault-WIDE search roots at the vault itself, which makes
+    # the vault_dir-relative subdir check below resolve against the vault's
+    # PARENT and silently stop matching — basename is the robust guard.
+    if p_raw.name.lower() in _PROTECTED_STATE_FILES_LC:
+        return True
+    try:
         vd = Path(vault_dir).expanduser().resolve()
-        p  = Path(path).expanduser().resolve()
+        p  = p_raw.resolve()
     except Exception:
         return False
     try:
