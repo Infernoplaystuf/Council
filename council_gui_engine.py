@@ -534,6 +534,11 @@ _COUNCIL_EXAMPLES = [
     ("Column analytics",
      "correlations in sales.csv",
      "Strongest pairwise correlations between numeric columns (no model)."),
+    ("Column analytics",
+     "mean of revenue in all csvs in data_in and save to a csv",
+     "Compute a stat (mean/sum/min/max/median/std/count) of one column across "
+     "every CSV in a folder; add 'save to a csv/text file' to write the result "
+     "into the vault's data_out/reports/ (no model)."),
     ("When an answer is weak",
      "(click ⤓ Defer to Vault)",
      "Save what the model couldn't do; run it from the Vault tab, then "
@@ -6631,6 +6636,30 @@ class CouncilConsole(tk.Tk):
         r"\s*\??\s*$",
         _re.IGNORECASE,
     )
+    # "mean of <column> in <folder>" (+ optional "and save to <file>").
+    # Groups: (1) aggregation word, (2) column, (3) the rest (folder phrase,
+    # possibly with a trailing save clause parsed by _SAVE_CLAUSE_RE).
+    _FOLDER_AGG_RE = _re.compile(
+        r"^\s*(?:get|calculate|calc|compute|find|give\s+me|show(?:\s+me)?|"
+        r"what(?:'s|\s+is|\s+are)|tell\s+me)?\s*(?:the\s+)?"
+        r"(mean|average|avg|sum|total|min(?:imum)?|max(?:imum)?|median|"
+        r"std(?:ev)?|standard\s+deviation|count)\b"
+        r"\s+(?:value\s+)?(?:(?:of|for)\s+)?(?:the\s+)?(?:column\s+)?"
+        r"['\"]?(.+?)['\"]?"
+        r"\s+(?:column\s+)?(?:in|across|over|from|within)\s+(.+?)\s*$",
+        _re.IGNORECASE,
+    )
+    # Trailing "…and save it to a csv file called foo.csv" clause.
+    # Groups: (1) optional format (csv/tsv/text/txt), (2) optional filename.
+    _SAVE_CLAUSE_RE = _re.compile(
+        r"\s+(?:and\s+|then\s+)?(?:save|write|export|output|dump|put)\s+"
+        r"(?:it|them|this|that|the\s+results?|the\s+findings?|the\s+output)?\s*"
+        r"(?:out\s+)?(?:to|as|into|in)?\s*(?:a\s+|an\s+)?"
+        r"(csv|tsv|text|txt|plain\s+text)?\s*(?:file)?\s*"
+        r"(?:(?:named|called|titled)\s+)?"
+        r"['\"]?([\w\-. ]+?)?['\"]?\s*[.!]?\s*$",
+        _re.IGNORECASE,
+    )
     _MONEY_RE_CHAT = _re.compile(
         r"^\s*(?:find|list|show)\s+(?:money|currency|prices?|amounts?|dollar\s+amounts?)"
         r"(?:\s+(?:in|under|inside|within)\s+(.+?))?\s*\??\s*$",
@@ -7022,6 +7051,10 @@ class CouncilConsole(tk.Tk):
         m = self._CORRELATIONS_RE.match(single_line)
         if m:
             self._correlations_response((m.group(1) or "").strip().strip("'\"`"))
+            return True
+        m = self._FOLDER_AGG_RE.match(single_line)
+        if m:
+            self._folder_agg_response(m.group(1), m.group(2), m.group(3))
             return True
 
         if self._EXPORT_TRANSCRIPT_RE.match(single_line):
@@ -7771,6 +7804,138 @@ class CouncilConsole(tk.Tk):
                          f"{float(r['corr']):>8.3f}")
         self._append_transcript("Writer", "\n".join(lines), "final")
         self._set_status("● idle")
+
+    def _clean_folder_phrase(self, s: str) -> str:
+        """Strip 'all csvs in' / 'the files in' prefixes and folder/vault noise
+        from a folder phrase, leaving a folder target ('' -> data_in)."""
+        s = (s or "").strip().strip("'\"`")
+        s = _re.sub(
+            r"^(?:all\s+|the\s+)*(?:csv\s+files?|csvs?|excels?|xlsx?|"
+            r"spreadsheets?|data\s+files?|files?|data)\s+"
+            r"(?:files?\s+)?(?:in|under|within|inside|from|of)\s+",
+            "", s, flags=_re.IGNORECASE)
+        s = _re.sub(r"^(?:all\s+|the\s+)+", "", s, flags=_re.IGNORECASE).strip()
+        s = self._FOLDER_NOISE_RE.sub("", s).strip()
+        return s
+
+    def _folder_agg_response(self, agg_word, column, rest):
+        """Compute one aggregation (mean/sum/min/max/median/std/count) of a
+        column across every CSV/Excel in a folder, and optionally write the
+        result to a CSV/TSV/TXT under the vault output folder. No model."""
+        import vault_analyst as _va
+        agg_word = (agg_word or "mean").strip()
+        column = (column or "").strip().strip("'\"`")
+        rest = (rest or "").strip()
+
+        # 1) Detect + strip a trailing "…save/write/export to <file>" clause.
+        save = False
+        save_fmt = ""
+        out_name = None
+        m = self._SAVE_CLAUSE_RE.search(rest)
+        if m and (m.group(1) or m.group(2)):
+            save = True
+            save_fmt = (m.group(1) or "").strip().lower()
+            out_name = (m.group(2) or "").strip() or None
+            rest = rest[:m.start()].strip()
+
+        # 2) Optional "excluding zeros" modifier.
+        _zero_re = _re.compile(
+            r"[,\s]*(?:exclud\w*|without|ignor\w*|not?\s+counting|no)\s+"
+            r"(?:the\s+)?zero(?:e?s)?\b", _re.IGNORECASE)
+        exclude_zeros = bool(_zero_re.search(column) or _zero_re.search(rest))
+        column = _zero_re.sub("", column).strip().strip("'\"`")
+        rest = _zero_re.sub("", rest).strip()
+
+        # 3) Resolve the folder.
+        root = self._resolve_folder_target(self._clean_folder_phrase(rest))
+        if not root.exists():
+            self._append_transcript("Writer", f"Folder not found: {root}",
+                                    "final")
+            self._set_status("● idle")
+            return
+
+        canon = _va.canonical_agg(agg_word) or "mean"
+        self._set_status("● calculating…", "#cba6f7")
+        try:
+            res = _va.folder_column_aggregate(
+                root, column, canon, exclude_zeros=exclude_zeros)
+        except Exception as exc:
+            self._append_transcript("Writer",
+                                    f"Calculation failed: {exc!r}", "final")
+            self._set_status("● idle")
+            return
+
+        fs = self._fmt_stat
+        zsuffix = " (excluding zeros)" if exclude_zeros else ""
+        body = [f"{canon} of '{column}'{zsuffix} across "
+                f"{res['files_scanned']} file(s) in {root.name or root}:"]
+        if res["per_file"]:
+            body.append(f"  {'file':<40}{'n':>8}{canon:>16}")
+            for r in res["per_file"]:
+                body.append(f"  {str(r['file'])[:39]:<40}"
+                            f"{int(r['n']):>8}{fs(r['value']):>16}")
+            body.append("")
+            body.append(f"  OVERALL {canon} (n={res['overall_n']}): "
+                        f"{fs(res['overall'])}")
+        else:
+            body.append(f"  No CSV/Excel under {root.name or root} has a "
+                        f"column matching '{column}'.")
+        if res["missing"] and res["per_file"]:
+            body.append(f"  ({len(res['missing'])} file(s) had no matching "
+                        f"column)")
+        if res["truncated"]:
+            body.append("  (scan capped at 200 files)")
+
+        lines = list(body)
+        if save and res["per_file"]:
+            lines.append("")
+            lines.append(self._save_stat_report(
+                res, column, root, save_fmt, out_name, body))
+        elif save:
+            lines.append("")
+            lines.append("  (nothing to save — no matching column found)")
+
+        self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
+    def _save_stat_report(self, res, column, root, save_fmt, out_name, body):
+        """Write an aggregate result to a CSV/TSV/TXT under the vault output
+        folder (data_out/reports/). Returns a status line for the transcript.
+        Uses data_index.safe_write_path, which refuses to touch input data."""
+        kind = "csv"
+        if save_fmt in ("text", "txt", "plain text"):
+            kind = "txt"
+        elif save_fmt == "tsv":
+            kind = "tsv"
+        if out_name and "." in out_name:
+            ext = out_name.rsplit(".", 1)[1].lower()
+            kind = {"txt": "txt", "text": "txt", "tsv": "tsv",
+                    "csv": "csv"}.get(ext, kind)
+        base = out_name or f"{res['agg']}_{column}_{root.name or 'vault'}"
+        if "." in base:
+            base = base.rsplit(".", 1)[0]
+        base = _re.sub(r"[^\w\-]+", "_", base).strip("_") or "stat_report"
+        ext = {"txt": ".txt", "tsv": ".tsv", "csv": ".csv"}[kind]
+        fname = base + ext
+        try:
+            outp = self.data_index.safe_write_path(fname, subfolder="reports")
+        except Exception as exc:
+            return f"  ⚠ Could not save the report: {exc!r}"
+        try:
+            if kind in ("csv", "tsv"):
+                import pandas as _pd
+                recs = [{"file": r["file"], "column": r["matched_column"],
+                         "n": r["n"], res["agg"]: r["value"]}
+                        for r in res["per_file"]]
+                recs.append({"file": "OVERALL", "column": column,
+                             "n": res["overall_n"], res["agg"]: res["overall"]})
+                _pd.DataFrame(recs).to_csv(
+                    outp, index=False, sep=("\t" if kind == "tsv" else ","))
+            else:
+                outp.write_text("\n".join(body) + "\n", encoding="utf-8")
+        except Exception as exc:
+            return f"  ⚠ Could not write {outp.name}: {exc!r}"
+        return f"  ✓ Saved to: {outp}"
 
     def _money_response(self, target: str):
         import vault_tools as _vt

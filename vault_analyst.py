@@ -2672,6 +2672,121 @@ def numeric_correlations(path: Any, *, top_n: int = 15,
     return pd.DataFrame(pairs[:max(1, top_n)], columns=["col_a", "col_b", "corr"])
 
 
+# ---------------------------------------------------------------------------
+# Folder-scoped single-column aggregation (mean/sum/min/max/median/std/count
+# of ONE column across every CSV/Excel in a folder). Reads each file once and
+# pools the column's values so the OVERALL figure is exact (not an average of
+# per-file averages). Model-free; feeds the "mean of <col> in <folder>" command.
+# ---------------------------------------------------------------------------
+_AGG_ALIASES = {
+    "mean": "mean", "average": "mean", "avg": "mean",
+    "sum": "sum", "total": "sum",
+    "min": "min", "minimum": "min",
+    "max": "max", "maximum": "max",
+    "median": "median",
+    "std": "std", "stdev": "std", "standard deviation": "std",
+    "count": "count",
+}
+
+
+def canonical_agg(agg: str) -> Optional[str]:
+    """Map a user aggregation word to a canonical name, or None if unknown."""
+    key = " ".join((agg or "").strip().lower().split())
+    return _AGG_ALIASES.get(key)
+
+
+def _apply_agg(s: "pd.Series", agg: str):
+    """Apply a canonical aggregation to a NaN-dropped numeric Series."""
+    if s is None or len(s) == 0:
+        return 0 if agg == "count" else None
+    if agg == "count":
+        return int(len(s))
+    fn = {"mean": s.mean, "sum": s.sum, "min": s.min, "max": s.max,
+          "median": s.median, "std": s.std}.get(agg)
+    return _stat_num(fn()) if fn is not None else None
+
+
+def match_column_name(columns: Any, wanted: str) -> Optional[str]:
+    """Resolve `wanted` to a real column: case-insensitive exact match first,
+    then a unique case-insensitive substring, else a whole-token substring
+    match. Returns the actual column name or None."""
+    import re as _re
+    if not wanted:
+        return None
+    w = wanted.strip().lower()
+    cols = [str(c) for c in columns]
+    for c in cols:
+        if c.lower() == w:
+            return c
+    subs = [c for c in cols if w in c.lower()]
+    if len(subs) == 1:
+        return subs[0]
+    for c in subs:
+        if w in [t.lower() for t in _re.split(r"[\s_\-]+", c)]:
+            return c
+    return subs[0] if subs else None
+
+
+def folder_column_aggregate(data_folder: Any, column: str, agg: str = "mean",
+                            *, recursive: bool = True, max_files: int = 200,
+                            exclude_zeros: bool = False) -> Dict[str, Any]:
+    """Aggregate ONE column across every CSV/Excel in a folder, model-free.
+
+    Returns ``{agg, column, files_scanned, per_file:[{file, matched_column, n,
+    value}], missing:[names without the column], overall, overall_n,
+    truncated, exclude_zeros}``. ``overall`` is computed from the POOLED values
+    (exact), not from the per-file results. ``exclude_zeros`` drops 0s first
+    (so a sparse column's mean reflects only the active rows).
+    """
+    canon = canonical_agg(agg) or "mean"
+    folders = normalize_data_folders(data_folder)
+    files = (list_csv_files(folders, recursive=recursive)
+             + list_excel_files(folders, recursive=recursive))
+    truncated = len(files) > max_files
+    files = files[:max_files]
+    per_file: List[Dict[str, Any]] = []
+    missing: List[str] = []
+    pooled: List[Any] = []
+    pooled_n = 0
+    _POOL_CAP = 2_000_000
+    for fp in files:
+        try:
+            df = read_table(fp)
+        except Exception:
+            missing.append(fp.name)
+            continue
+        col = match_column_name(df.columns, column)
+        if col is None:
+            missing.append(fp.name)
+            continue
+        s = pd.to_numeric(df[col], errors="coerce").dropna()
+        if exclude_zeros:
+            s = s[s != 0]
+        n = int(len(s))
+        per_file.append({"file": fp.name, "matched_column": col,
+                         "n": n, "value": _apply_agg(s, canon)})
+        if pooled_n < _POOL_CAP and n:
+            pooled.append(s.to_numpy())
+            pooled_n += n
+    overall = None
+    if pooled:
+        import numpy as _np
+        overall = _apply_agg(pd.Series(_np.concatenate(pooled)), canon)
+    elif canon == "count":
+        overall = 0
+    return {
+        "agg":           canon,
+        "column":        column,
+        "files_scanned": len(files),
+        "per_file":      per_file,
+        "missing":       missing,
+        "overall":       overall,
+        "overall_n":     pooled_n,
+        "truncated":     truncated,
+        "exclude_zeros": exclude_zeros,
+    }
+
+
 def schema_doc_from_csv(path: Any) -> str:
     """Generate a Markdown schema doc from summarize_csv output.
 

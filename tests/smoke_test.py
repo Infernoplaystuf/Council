@@ -3335,6 +3335,99 @@ def test_quick_analytics_routing() -> None:
            C._COLUMN_STATS_RE.match("summary of stats for the files") is None)
 
 
+def test_folder_column_aggregate() -> None:
+    """folder_column_aggregate computes one aggregation of a column across all
+    CSVs in a folder, pooling values for an EXACT overall (not an average of
+    per-file averages), tracks files missing the column, and supports
+    excluding zeros. Model-free."""
+    try:
+        import vault_analyst as va
+    except Exception as exc:  # pragma: no cover
+        _check(f"vault_analyst importable (skipped: {exc!r})", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "a.csv").write_text("region,units\nE,0\nE,10\n")   # 0, 10
+        (root / "b.csv").write_text("region,units\nW,20\nW,30\n")  # 20, 30
+        (root / "c.csv").write_text("region,price\nX,5\n")         # no 'units'
+        res = va.folder_column_aggregate(root, "units", "mean")
+        _check("overall mean pools all rows (0,10,20,30 -> 15.0)",
+               res["overall"] == 15.0)
+        _check("overall n counts pooled values", res["overall_n"] == 4)
+        _check("file lacking the column is reported missing",
+               "c.csv" in res["missing"])
+        _check("per-file means are exact",
+               {r["file"]: r["value"] for r in res["per_file"]}
+               == {"a.csv": 5.0, "b.csv": 25.0})
+        _check("sum aggregation pools correctly (60)",
+               va.folder_column_aggregate(root, "units", "sum")["overall"] == 60.0)
+        _check("exclude-zeros changes the mean (10,20,30 -> 20.0)",
+               va.folder_column_aggregate(
+                   root, "units", "mean", exclude_zeros=True)["overall"] == 20.0)
+        _check("canonical_agg maps 'average' -> 'mean'",
+               va.canonical_agg("average") == "mean")
+        _check("match_column_name is case-insensitive",
+               va.match_column_name(["Units", "Region"], "units") == "Units")
+
+
+def test_folder_agg_command() -> None:
+    """The 'mean of <col> in <folder> [and save to <file>]' command parses
+    correctly and its save path writes a report ONLY under the vault output
+    folder (never the input folder)."""
+    try:
+        import council_gui_engine as cge
+        import data_index
+        import vault_analyst as va
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_gui_engine importable (skipped: {exc!r})", True)
+        return
+    C = cge.CouncilConsole
+
+    def tgt(text):
+        m = C._FOLDER_AGG_RE.match(text)
+        return [(g or "").strip() for g in m.groups()] if m else None
+
+    _check("routes 'what is the average price in data_in'",
+           tgt("what is the average price in data_in")
+           == ["average", "price", "data_in"])
+    _check("routes 'mean of revenue in data_in and save to a csv'",
+           (tgt("mean of revenue in data_in and save to a csv")
+            or [None])[0] == "mean")
+    _check("routes 'max temperature in sensors' (no of/for needed)",
+           tgt("max temperature in sensors") == ["max", "temperature", "sensors"])
+    m = C._SAVE_CLAUSE_RE.search(" and export as csv named q3.csv")
+    _check("save clause captures format + filename",
+           bool(m) and m.group(1) == "csv" and m.group(2) == "q3.csv")
+    _check("folder phrase 'all csvs in data_in' -> 'data_in'",
+           C._clean_folder_phrase(C, "all csvs in data_in") == "data_in")
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "data_in").mkdir()
+        (root / "data_out").mkdir()
+        (root / "data_in" / "a.csv").write_text("region,units\nE,0\nE,10\n")
+        (root / "data_in" / "b.csv").write_text("region,units\nW,20\nW,30\n")
+        di = data_index.DataIndex(search_roots=[root / "data_in"],
+                                  write_root=root / "data_out")
+        res = va.folder_column_aggregate(root / "data_in", "units", "mean")
+
+        class _Fake:
+            pass
+        fake = _Fake()
+        fake.data_index = di
+        status = C._save_stat_report(
+            fake, res, "units", root / "data_in", "csv", "means_out", [])
+        _check("save reports success", "Saved to" in status)
+        out = root / "data_out" / "reports" / "means_out.csv"
+        _check("report written under vault output (data_out/reports)",
+               out.exists())
+        text = out.read_text()
+        _check("report contains the OVERALL pooled mean row",
+               "OVERALL" in text and "15.0" in text)
+        _check("report never lands in the input folder",
+               not (root / "data_in" / "reports").exists())
+
+
 def test_data_preview_text() -> None:
     """_data_preview_text gives a model-free (schema, rows) preview of a data
     file with bounded reads, and falls back to a text peek for non-tabular
@@ -4030,6 +4123,10 @@ def main() -> int:
          test_quick_analytics_helpers)
     _run("quick analytics command routing",
          test_quick_analytics_routing)
+    _run("folder column aggregate (pooled mean/sum/excl-zeros)",
+         test_folder_column_aggregate)
+    _run("folder-agg command routing + safe report write",
+         test_folder_agg_command)
     _run("data preview (model-free schema + rows)",
          test_data_preview_text)
     _run("error coaching (plain-language + one-click fix)",
