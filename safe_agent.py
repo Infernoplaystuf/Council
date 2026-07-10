@@ -183,7 +183,9 @@ def dispatch_tool(name: str,
 
 
 # ============================================================
-# Default tools — read_local_file, run_pandas_analysis, query_memory
+# Default tools — list_files, search_files, read_local_file,
+# run_pandas_analysis, query_memory. All READ-ONLY and sandboxed to
+# policy.file_root; there is still NO delete / write / shell / network tool.
 # ============================================================
 
 def _safe_resolve(root: Path, target: str) -> Path:
@@ -284,9 +286,120 @@ def _tool_query_memory(args: Dict[str, Any],
     }
 
 
+def _tool_list_files(args: Dict[str, Any],
+                     policy: AgentPolicy) -> Dict[str, Any]:
+    """List files under file_root (or a subdirectory of it). Read-only,
+    sandboxed, bounded. Lets the agent DISCOVER what data exists before it
+    reads or searches — without this the agent can only read a path it was
+    already told, which is why goals like 'look at every file in the folder'
+    used to be impossible."""
+    subdir = str(args.get("dir") or args.get("path") or args.get("folder")
+                 or "").strip()
+    recursive = bool(args.get("recursive", False))
+    pattern = args.get("pattern")
+    pat = (pattern.strip() if isinstance(pattern, str) and pattern.strip()
+           else "*")
+    try:
+        root = (_safe_resolve(policy.file_root, subdir) if subdir
+                else policy.file_root)
+    except PermissionError as exc:
+        return {"error": str(exc)}
+    if not root.exists():
+        return {"dir": subdir or ".", "error": "directory does not exist"}
+    if not root.is_dir():
+        return {"dir": subdir or ".", "error": "not a directory"}
+    _MAX = 500
+    files: List[Dict[str, Any]] = []
+    try:
+        it = root.rglob(pat) if recursive else root.glob(pat)
+    except Exception as exc:
+        return {"error": f"bad pattern {pat!r}: {exc!r}"}
+    for p in it:
+        try:
+            if not p.is_file() or p.name.startswith("."):
+                continue
+            files.append({"path": str(p.relative_to(policy.file_root)),
+                          "size": p.stat().st_size})
+        except Exception:
+            continue
+        if len(files) >= _MAX:
+            break
+    files.sort(key=lambda f: f["path"])
+    rel_dir = (str(root.relative_to(policy.file_root))
+               if root != policy.file_root else ".")
+    return {"dir": rel_dir, "count": len(files),
+            "truncated": len(files) >= _MAX, "files": files}
+
+
+def _tool_search_files(args: Dict[str, Any],
+                       policy: AgentPolicy) -> Dict[str, Any]:
+    """Search the CONTENTS of every text-like file under file_root (or a
+    subdirectory) for a term, returning the LIST of files that contain it
+    (most matches first) plus one sample line each. Read-only, sandboxed,
+    bounded. This is how the agent answers 'which files mention X'."""
+    query = str(args.get("query") or args.get("text")
+                or args.get("term") or "").strip()
+    if not query:
+        return {"error": "missing 'query' — the text to search for inside files"}
+    subdir = str(args.get("dir") or args.get("path") or args.get("folder")
+                 or "").strip()
+    try:
+        root = (_safe_resolve(policy.file_root, subdir) if subdir
+                else policy.file_root)
+    except PermissionError as exc:
+        return {"error": str(exc)}
+    if not root.exists() or not root.is_dir():
+        return {"query": query, "error": "directory does not exist"}
+    try:
+        from vault_tools import find_files_containing_text
+    except Exception as exc:
+        return {"error": f"search unavailable: {exc!r}"}
+    try:
+        hits = find_files_containing_text(root, query, max_hits=1000)
+    except Exception as exc:
+        return {"error": f"search failed: {exc!r}"}
+    agg: Dict[str, Dict[str, Any]] = {}
+    for h in hits:
+        rec = agg.setdefault(h["path"],
+                             {"path": h["path"], "matches": 0, "first": ""})
+        rec["matches"] += 1
+        if not rec["first"]:
+            rec["first"] = (h.get("context") or "")[:160]
+    files = sorted(agg.values(), key=lambda m: -m["matches"])
+    out: Dict[str, Any] = {"query": query,
+                           "files_with_matches": len(files),
+                           "files": files}
+    if len(hits) >= 1000:
+        out["note"] = "match counts capped at 1000 scanned lines"
+    return out
+
+
 def default_tools(policy: AgentPolicy) -> Dict[str, Tool]:
     """The reviewed allow-list. Extending requires a code review per §0."""
     return {
+        "list_files": Tool(
+            name="list_files",
+            fn=_tool_list_files,
+            description="List files under file_root (optional 'dir' subfolder, "
+                        "'pattern' glob like *.csv, 'recursive' bool). Use this "
+                        "FIRST to discover what files exist before reading or "
+                        "searching them.",
+            schema={"dir": "str (optional subfolder)",
+                    "pattern": "str (optional glob, e.g. *.csv)",
+                    "recursive": "bool (optional, default false)"},
+            timeout_s=15.0,
+        ),
+        "search_files": Tool(
+            name="search_files",
+            fn=_tool_search_files,
+            description="Search the CONTENTS of text-like files under file_root "
+                        "(optional 'dir' subfolder) for 'query'; returns the "
+                        "list of files that contain it, most matches first. Use "
+                        "to answer 'which files mention X'.",
+            schema={"query": "str (text to find inside files)",
+                    "dir": "str (optional subfolder)"},
+            timeout_s=30.0,
+        ),
         "read_local_file": Tool(
             name="read_local_file",
             fn=_tool_read_local_file,
@@ -702,16 +815,26 @@ class ConstrainedAgent:
 
     # ── internals ─────────────────────────────────────────
     def _system_message(self) -> str:
-        names = ", ".join(self.registry.names())
+        # Render name(args) + description for each tool so a small local model
+        # knows HOW to call them — listing bare names left it guessing the
+        # arguments, which made the tools effectively unusable.
+        lines: List[str] = []
+        for tool in self.registry.as_dict().values():
+            params = ", ".join(f"{k}: {v}"
+                               for k, v in (tool.schema or {}).items()) or "no args"
+            lines.append(f"  - {tool.name}({params})\n      {tool.description}")
+        catalog = "\n".join(lines)
         return (self.system_preamble +
-                f"\n\nRegistered tools (you may call ONLY these): {names}\n"
-                "Reply with EXACTLY one JSON object per turn:\n"
+                "\n\nAvailable tools (you may call ONLY these):\n" + catalog +
+                "\n\nReply with EXACTLY one JSON object per turn:\n"
                 '  {"action": "tool",  "tool": "<name>", "args": {...}}\n'
                 '  {"action": "final", "answer": "<text>"}\n'
-                "Do not call a tool that is not on the list above. If "
-                "you need a tool that is missing, explain in your final "
-                "answer what you would have done and which tool you "
-                "needed.")
+                "Typical flow: use list_files to see what exists, search_files "
+                "to find which files mention something, read_local_file to read "
+                "one, run_pandas_analysis for numeric work — then give a final "
+                "answer. Do not call a tool that is not listed above. If a "
+                "needed tool is missing, say so in your final answer and "
+                "describe what you would have done.")
 
     def _finalise(self, run: AgentRun,
                   used: List[str], missing: List[str]) -> None:

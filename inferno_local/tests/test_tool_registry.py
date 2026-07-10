@@ -151,12 +151,13 @@ class TestBuildDefaultRegistry(unittest.TestCase):
         with self.assertRaises(tool_registry.RegistryFrozen):
             reg.register(Tool(name="evil", fn=_noop))
 
-    def test_default_registry_contains_the_three_tools(self):
+    def test_default_registry_contains_the_reviewed_tools(self):
         reg = tool_registry.build_default_registry(self.policy)
-        # Three reviewed tools per the brief:
+        # The reviewed READ-ONLY allow-list (discover + search + read +
+        # compute + memory). All sandboxed; no delete/write/network tool.
         self.assertEqual(set(reg.names()),
-                         {"read_local_file", "run_pandas_analysis",
-                          "query_memory"})
+                         {"list_files", "search_files", "read_local_file",
+                          "run_pandas_analysis", "query_memory"})
 
 
 if __name__ == "__main__":

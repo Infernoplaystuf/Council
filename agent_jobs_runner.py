@@ -10,12 +10,13 @@ contention. Each step is persisted (JobStore) and streamed to the UI via the
 app's ui_q, and each job has a cooperative cancel Event checked at step
 boundaries.
 
-Security is structural, not policy: the agent's only tools are read_local_file
-(sandboxed to file_root), run_pandas_analysis (the validated pandas sandbox),
-and query_memory. There is NO delete / DB-write / shell / network tool, so the
-"never delete from a database" and offline rules can't be violated. The final
-REPORT is written by THIS runner (not a model-invoked tool) into a dedicated
-agent_jobs_out/ folder.
+Security is structural, not policy: the agent's tools are all READ-ONLY and
+sandboxed to file_root — list_files (discover), search_files (grep contents ->
+file list), read_local_file, run_pandas_analysis (the validated pandas
+sandbox), and query_memory. There is NO delete / DB-write / shell / network
+tool, so the "never delete from a database" and offline rules can't be
+violated. The final REPORT is written by THIS runner (not a model-invoked
+tool) into a dedicated agent_jobs_out/ folder.
 """
 from __future__ import annotations
 
@@ -50,7 +51,8 @@ class LocalRunner:
                              num_predict=int(max_tokens or 600))
 
 
-_AGENT_TOOLS = ("read_local_file", "run_pandas_analysis", "query_memory")
+_AGENT_TOOLS = ("list_files", "search_files", "read_local_file",
+                "run_pandas_analysis", "query_memory")
 
 
 def _default_file_root(vault_dir: Optional[Any]) -> Path:

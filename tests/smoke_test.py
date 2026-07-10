@@ -2705,13 +2705,15 @@ def test_agentic_jobs_core() -> None:
                 file_root=din, output_dir=vault / "out")
             reg = build_default_registry(pol)
             names = set(reg.as_dict().keys())
-            _check("registry exposes exactly the 3 safe tools",
-                   names == {"read_local_file", "run_pandas_analysis",
-                             "query_memory"})
+            _check("registry exposes exactly the safe read-only tools",
+                   names == {"list_files", "search_files", "read_local_file",
+                             "run_pandas_analysis", "query_memory"})
+            _check("allow-list matches the registered tools",
+                   set(ajr._AGENT_TOOLS) == names)
             _check("no delete/write/network tool is registered",
                    not any(k in n for n in names
-                           for k in ("delete", "write", "remove", "http",
-                                     "sql_write", "unlink", "export")))
+                           for k in ("delete", "remove", "http",
+                                     "sql_write", "unlink", "rmtree")))
             _check("registry is frozen (model can't extend it)", reg.frozen)
 
             class FakeRunner:
@@ -3428,6 +3430,73 @@ def test_folder_agg_command() -> None:
                not (root / "data_in" / "reports").exists())
 
 
+def test_agent_file_tools() -> None:
+    """The agent's new READ-ONLY discovery tools: list_files (see what's in a
+    directory) and search_files (grep contents -> list of matching files),
+    both sandboxed to file_root. Plus an end-to-end ConstrainedAgent run that
+    actually calls search_files to answer 'which files contain apple' — proof
+    the agent jobs are no longer toothless."""
+    try:
+        from safe_agent import AgentPolicy, default_tools, ConstrainedAgent
+        from tool_registry import build_default_registry
+        import agent_jobs_runner as ajr
+    except Exception as exc:  # pragma: no cover
+        _check(f"safe_agent importable (skipped: {exc!r})", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td) / "data_in"
+        root.mkdir()
+        (root / "fruits.csv").write_text("name,note\napple,red\nbanana,yellow\n")
+        (root / "log.txt").write_text("we shipped apple crates today\n")
+        (root / "veggies.csv").write_text("name\ncarrot\n")
+        pol = AgentPolicy(allowed_tools=ajr._AGENT_TOOLS,
+                          file_root=root, output_dir=Path(td) / "out",
+                          max_steps=4)
+        tools = default_tools(pol)
+
+        lf = tools["list_files"].fn({}, pol)
+        _check("list_files discovers every file",
+               {f["path"] for f in lf["files"]}
+               == {"fruits.csv", "log.txt", "veggies.csv"})
+
+        sf = tools["search_files"].fn({"query": "apple"}, pol)
+        hit_files = {f["path"] for f in sf["files"]}
+        _check("search_files returns files whose CONTENTS contain the term",
+               hit_files == {"fruits.csv", "log.txt"})
+        _check("search_files excludes non-matching files",
+               "veggies.csv" not in hit_files)
+
+        _check("list_files refuses path traversal out of the sandbox",
+               "error" in tools["list_files"].fn({"dir": "../.."}, pol))
+        _check("search_files refuses path traversal out of the sandbox",
+               "error" in tools["search_files"].fn(
+                   {"query": "x", "dir": "../../etc"}, pol))
+
+        class _FakeRunner:
+            def __init__(self, replies):
+                self.replies = list(replies)
+                self.i = 0
+
+            def chat(self, messages, max_tokens=None):
+                out = self.replies[min(self.i, len(self.replies) - 1)]
+                self.i += 1
+                return out
+
+        reg = build_default_registry(pol)
+        runner = _FakeRunner([
+            '{"action":"tool","tool":"search_files","args":{"query":"apple"}}',
+            '{"action":"final","answer":"apple is in fruits.csv and log.txt"}',
+        ])
+        run = ConstrainedAgent(runner, reg, pol).run("which files contain apple")
+        called = [c.name for c in run.trace.calls]
+        _check("agent actually invokes search_files", "search_files" in called)
+        _check("agent reaches a final answer", run.stopped_reason == "done")
+        sf_call = next(c for c in run.trace.calls if c.name == "search_files")
+        _check("search_files handed the agent the 2 matching files",
+               isinstance(sf_call.result, dict)
+               and sf_call.result.get("files_with_matches") == 2)
+
+
 def test_data_preview_text() -> None:
     """_data_preview_text gives a model-free (schema, rows) preview of a data
     file with bounded reads, and falls back to a text peek for non-tabular
@@ -4127,6 +4196,8 @@ def main() -> int:
          test_folder_column_aggregate)
     _run("folder-agg command routing + safe report write",
          test_folder_agg_command)
+    _run("agent file tools (list_files/search_files + e2e run)",
+         test_agent_file_tools)
     _run("data preview (model-free schema + rows)",
          test_data_preview_text)
     _run("error coaching (plain-language + one-click fix)",
