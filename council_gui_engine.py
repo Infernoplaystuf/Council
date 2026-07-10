@@ -539,6 +539,14 @@ _COUNCIL_EXAMPLES = [
      "Compute a stat (mean/sum/min/max/median/std/count) of one column across "
      "every CSV in a folder; add 'save to a csv/text file' to write the result "
      "into the vault's data_out/reports/ (no model)."),
+    ("Build a tool",
+     "create a tool that flags rows where quantity is 0",
+     "Opens the Tool Creation tab; the local model writes the tool, the "
+     "sandbox validates it (read-only), and it's saved (UNREVIEWED) for reuse."),
+    ("Find in files",
+     "which files mention bacon",
+     "Layered vault search — file summaries first, then a deeper scan of the "
+     "actual text; app-state files are excluded."),
     ("When an answer is weak",
      "(click ⤓ Defer to Vault)",
      "Save what the model couldn't do; run it from the Vault tab, then "
@@ -2226,6 +2234,29 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                           + repr(_val_terms), file=_sys_dbg.stderr)
         except Exception as _ve:
             print('[DEBUG inject] value search failed: ' + repr(_ve),
+                  file=_sys_dbg.stderr)
+
+    # -- Dataset overview (expert-mode grounding) ---------------------------
+    # A compact, always-current map of ALL of data_in so the model knows the
+    # whole dataset it is meant to be an expert on; the retrieval blocks above
+    # then supply the specifics. Model-free + cached (rebuilds only when data_in
+    # changes), size-scaled to n_ctx, and gated to real data questions.
+    if (not explicit_paths and analyst_block is None
+            and _content_query_terms(user_text)):
+        try:
+            import dataset_digest as _dd
+            _digest_cap = (1200 if n_ctx <= 4096
+                           else 2500 if n_ctx <= 8192 else 4000)
+            _digest = _dd.get_digest(VAULT_DIR, max_chars=_digest_cap)
+            if _digest:
+                candidates.append((
+                    PRIO_VAULT_SUMMARY, "[DATASET OVERVIEW]",
+                    "[DATASET OVERVIEW — every data file currently in the "
+                    "vault; ask about any of them]\n" + _digest))
+                print('[DEBUG inject] dataset overview injected ('
+                      + str(len(_digest)) + ' chars)', file=_sys_dbg.stderr)
+        except Exception as _de:
+            print('[DEBUG inject] dataset overview failed: ' + repr(_de),
                   file=_sys_dbg.stderr)
 
     # -- NO DATA marker (priority 1, never dropped) -------------------------
@@ -5707,6 +5738,7 @@ class CouncilConsole(tk.Tk):
                        self._build_sessions_tab,
                        self._build_vault_manager_tab,
                        self._build_agent_jobs_tab,
+                       self._build_tool_forge_tab,
                        self._build_speech_tab,
                        self._build_changelog_tab,
                        self._build_diagnostics_tab):
@@ -6691,6 +6723,13 @@ class CouncilConsole(tk.Tk):
         r"\s+(?:the\s+(?:term|word|phrase|value)\s+)?['\"]?(.+?)['\"]?\s*\??\s*$",
         _re.IGNORECASE,
     )
+    # "create a tool that ..." / "make a tool to ..." — route to Tool Creation.
+    _TOOL_CREATE_RE = _re.compile(
+        r"^\s*(?:create|make|build|write|generate|forge)\s+(?:me\s+)?"
+        r"(?:a\s+|an\s+)?(?:new\s+)?(?:tool|function|script)\s+"
+        r"(?:that|to|which|for|called)\s+(.+?)\s*[.!?]?\s*$",
+        _re.IGNORECASE,
+    )
     # "list app tools" / "app tools" / "what tools have you built"
     _APP_TOOLS_RE = _re.compile(
         r"^\s*(?:list\s+|show\s+|what\s+(?:are\s+the\s+)?)?"
@@ -7112,6 +7151,15 @@ class CouncilConsole(tk.Tk):
             return True
         if self._APP_TOOLS_RE.match(single_line):
             self._app_tools_response()
+            return True
+        m = self._TOOL_CREATE_RE.match(single_line)
+        if m:
+            _task = m.group(1).strip().strip("'\"`")
+            self._append_transcript(
+                "Council",
+                f"Opening the Tool Creation tab to build a tool: {_task}",
+                "observation")
+            self._forge_route(_task)
             return True
 
         if self._EXPORT_TRANSCRIPT_RE.match(single_line):
@@ -9432,6 +9480,215 @@ class CouncilConsole(tk.Tk):
         ttk.Button(btns, text="Snapshot to Vault",  command=self._ide_snapshot).pack(side="left")
         ttk.Button(btns, text="Clear Output",
                    command=lambda: self._set_text(self.ide_out, "")).pack(side="left", padx=6)
+
+    # ---- Tool Creation (Tool Forge) tab ----
+
+    def _build_tool_forge_tab(self):
+        """A tab where the local model writes a NEW tool for a described task.
+        The generated code is sandbox-validated (read-only; no delete/write/
+        network) and saved UNREVIEWED to App_Built_tools/. Council and Agent
+        route here via 'create a tool that ...' when a needed tool is missing."""
+        self.tab_forge = ttk.Frame(self.nb)
+        self.nb.add(self.tab_forge, text="🛠 Tool Creation")
+        self._forge_tools: list = []
+
+        ttk.Label(
+            self.tab_forge,
+            text=("Describe a tool you need — the local model writes it, the "
+                  "sandbox validates it (read-only; no delete / write / network "
+                  "/ shell), and it's saved UNREVIEWED to App_Built_tools/. "
+                  "Council & Agent route here when a tool is missing "
+                  "(try: “create a tool that …”)."),
+            wraplength=920, justify="left",
+        ).pack(anchor="w", padx=10, pady=(8, 2))
+
+        task_row = ttk.Frame(self.tab_forge)
+        task_row.pack(fill="x", padx=10, pady=(2, 2))
+        ttk.Label(task_row, text="Task:").pack(anchor="w")
+        self.forge_task = self._make_text(task_row, height=3, wrap="word")
+        self.forge_task.pack(fill="x")
+
+        btns = ttk.Frame(self.tab_forge)
+        btns.pack(fill="x", padx=10, pady=(2, 4))
+        ttk.Button(btns, text="✨ Generate Tool",
+                   command=self._forge_generate).pack(side="left")
+        ttk.Button(btns, text="💾 Save Edited Code",
+                   command=self._forge_save).pack(side="left", padx=6)
+        ttk.Button(btns, text="▶ Run Selected",
+                   command=self._forge_run).pack(side="left")
+        ttk.Button(btns, text="⟳ Refresh",
+                   command=self._forge_refresh_list).pack(side="left", padx=6)
+
+        paned = tk.PanedWindow(self.tab_forge, orient="horizontal",
+                               bg="#1a1414", sashwidth=6)
+        paned.pack(fill="both", expand=True, padx=10, pady=4)
+
+        left = ttk.Frame(paned)
+        paned.add(left, minsize=420)
+        ttk.Label(left, text="Tool code (editable — review before trusting)"
+                  ).pack(anchor="w")
+        self.forge_code = self._make_text(left, wrap="none",
+                                          font=("Consolas", 11))
+        self.forge_code.pack(fill="both", expand=True)
+
+        right = ttk.Frame(paned)
+        paned.add(right, minsize=300)
+        ttk.Label(right, text="Existing app-built tools").pack(anchor="w")
+        self.forge_list = tk.Listbox(right, height=8)
+        self.forge_list.pack(fill="x")
+        ttk.Label(right, text="Output").pack(anchor="w", pady=(6, 0))
+        self.forge_out = self._make_text(right, wrap="word", state="disabled")
+        self.forge_out.pack(fill="both", expand=True)
+
+        self.forge_status = ttk.Label(self.tab_forge, text="Ready.", anchor="w")
+        self.forge_status.pack(fill="x", padx=10, pady=(0, 8))
+        try:
+            self._forge_refresh_list()
+        except Exception:
+            pass
+
+    def _forge_set_status(self, text: str):
+        try:
+            self.forge_status.config(text=text)
+        except Exception:
+            pass
+
+    def _forge_out_write(self, text: str):
+        try:
+            self._set_text(self.forge_out, text)
+        except Exception:
+            pass
+
+    def _forge_refresh_list(self):
+        try:
+            import app_built_tools as _abt
+            tools = _abt.list_tools(vault_dir=VAULT_DIR)
+        except Exception:
+            tools = []
+        self._forge_tools = tools
+        try:
+            self.forge_list.delete(0, "end")
+            for t in tools:
+                self.forge_list.insert(
+                    "end",
+                    f"{t.get('name')}  —  {(t.get('description') or '')[:50]}")
+        except Exception:
+            pass
+
+    def _forge_generate(self):
+        task = self.forge_task.get("1.0", "end").strip()
+        if not task:
+            self._forge_set_status("Describe a tool first.")
+            return
+        self._forge_set_status("Generating… the local model is writing the tool.")
+
+        def _worker():
+            import council_engine as _ce
+            import tool_forge as _tf
+
+            def _model_call(prompt):
+                return _ce.local_chat(
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.2, num_predict=700, timeout=120)
+            try:
+                ok, msg, name, code = _tf.generate_tool(
+                    task, _model_call, author="council", vault_dir=VAULT_DIR)
+            except Exception as exc:
+                ok, msg, name, code = False, f"error: {exc!r}", None, ""
+
+            def _apply():
+                if code:
+                    self._set_text(self.forge_code, code)
+                if ok:
+                    self._forge_set_status(
+                        f"✓ Saved '{name}' — UNREVIEWED. Select it and Run to test.")
+                    self._forge_out_write(
+                        f"{msg}\n\nThe tool is saved but UNREVIEWED — review the "
+                        "code on the left. Select it in the list and press "
+                        "'Run Selected' to try it.")
+                    self._forge_refresh_list()
+                else:
+                    self._forge_set_status("⚠ " + str(msg)[:80])
+                    self._forge_out_write(
+                        str(msg) + "\n\nYou can edit the code on the left and "
+                        "press 'Save Edited Code'.")
+            self.after(0, _apply)
+
+        import threading as _th
+        _th.Thread(target=_worker, daemon=True).start()
+
+    def _forge_save(self):
+        code = self.forge_code.get("1.0", "end").strip()
+        if not code:
+            self._forge_set_status("Nothing to save — generate or paste code first.")
+            return
+        try:
+            import tool_forge as _tf
+            ok, msg, name = _tf.save_edited_tool(
+                code, description="", author="user", vault_dir=VAULT_DIR)
+        except Exception as exc:
+            ok, msg, name = False, f"error: {exc!r}", None
+        self._forge_set_status(f"✓ Saved '{name}'." if ok else "⚠ " + str(msg)[:80])
+        self._forge_out_write(str(msg))
+        if ok:
+            self._forge_refresh_list()
+
+    def _forge_run(self):
+        sel = None
+        try:
+            idx = self.forge_list.curselection()
+            if idx and 0 <= idx[0] < len(self._forge_tools):
+                sel = self._forge_tools[idx[0]].get("name")
+        except Exception:
+            sel = None
+        if not sel:
+            self._forge_set_status("Select a tool in the list to run.")
+            return
+        self._forge_set_status(f"Running '{sel}'…")
+
+        def _worker():
+            import app_built_tools as _abt
+            import data_index as _di
+            try:
+                root = _di.input_dir(VAULT_DIR)
+                df, msg = _abt.run_tool(sel, {}, allowed_folders=[root],
+                                        vault_dir=VAULT_DIR)
+            except Exception as exc:
+                df, msg = None, f"run failed: {exc!r}"
+
+            def _apply():
+                out = str(msg) + "\n"
+                if df is not None:
+                    try:
+                        out += "\n" + df.head(30).to_string(index=False)
+                    except Exception:
+                        out += "\n" + str(df)[:2000]
+                self._forge_out_write(out)
+                self._forge_set_status("Done.")
+            self.after(0, _apply)
+
+        import threading as _th
+        _th.Thread(target=_worker, daemon=True).start()
+
+    def _forge_route(self, task: str):
+        """Council/Agent (or the 'create a tool that …' command) routes a
+        missing-tool request here: switch to the tab, prefill, and generate.
+        Marshalled onto the UI thread (Tk isn't thread-safe)."""
+        def _do():
+            try:
+                self.nb.select(self.tab_forge)
+            except Exception:
+                pass
+            try:
+                self._set_text(self.forge_task, task or "")
+            except Exception:
+                pass
+            if task:
+                self._forge_generate()
+        try:
+            self.after(0, _do)
+        except Exception:
+            pass
 
     # ---- Librarian tab ----
 

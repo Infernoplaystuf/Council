@@ -3681,6 +3681,89 @@ def test_vault_term_search_routing() -> None:
            C._VAULT_SEARCH_RE.match("search files for bacon in reports") is None)
 
 
+def test_tool_forge_generate() -> None:
+    """tool_forge.generate_tool asks a (fake) model for ONE function, validates
+    it via the sandbox, and saves it — and rejects deletion / multi-function
+    code. This is the backend of the Tool Creation tab."""
+    try:
+        import tool_forge as tf
+        import app_built_tools as abt
+    except Exception as exc:  # pragma: no cover
+        _check(f"tool_forge importable (skipped: {exc!r})", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td) / "vault"
+        (vault / "data_in").mkdir(parents=True)
+        (vault / "data_in" / "a.csv").write_text("x\n1\n")
+        (vault / "data_in" / "b.csv").write_text("x\n2\n")
+
+        def good(_prompt):
+            return ("def count_csvs(folder=None):\n"
+                    "    return sum(1 for f in list_dir(folder) "
+                    "if f.endswith('.csv'))\n")
+        ok, _m, name, _code = tf.generate_tool("count csvs", good,
+                                               vault_dir=vault)
+        _check("generate_tool saves a valid model-written tool",
+               ok and name == "count_csvs")
+        _check("the generated tool is listed",
+               "count_csvs" in [t["name"]
+                                for t in abt.list_tools(vault_dir=vault)])
+        rdf, _rmsg = abt.run_tool("count_csvs", {},
+                                  allowed_folders=[vault / "data_in"],
+                                  vault_dir=vault)
+        _check("the generated tool runs to the right answer",
+               rdf is not None and int(rdf.iloc[0]["result"]) == 2)
+
+        def evil(_p):
+            return "def wipe(p):\n import os\n os.remove(p)\n return 1\n"
+        _check("a deletion tool is rejected at generation",
+               not tf.generate_tool("delete files", evil, vault_dir=vault)[0])
+
+        def two(_p):
+            return "def a():\n return 1\ndef b():\n return 2\n"
+        _check("multi-function code is rejected",
+               not tf.generate_tool("x", two, vault_dir=vault)[0])
+
+
+def test_dataset_digest_and_tool_routing() -> None:
+    """dataset_digest builds a bounded, model-free overview of data_in (the
+    expert-mode grounding), and 'create a tool that ...' routes to the Tool
+    Creation tab with the task captured."""
+    try:
+        import dataset_digest as dd
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"modules importable (skipped: {exc!r})", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td) / "vault"
+        din = vault / "data_in"
+        din.mkdir(parents=True)
+        (din / "sales.csv").write_text("region,revenue\nEast,100\nWest,200\n")
+        (din / "orders.csv").write_text("id,item\n1,apple\n2,pear\n")
+        dig = dd.build_digest(vault)
+        _check("digest lists the data files",
+               "sales.csv" in dig and "orders.csv" in dig)
+        _check("digest names columns", ("revenue" in dig or "region" in dig))
+        _check("digest is size-bounded", len(dig) <= 4000)
+        _check("digest is cached-stable",
+               dd.get_digest(vault) == dd.get_digest(vault) and bool(dd.get_digest(vault)))
+
+    C = cge.CouncilConsole
+
+    def tgt(text):
+        m = C._TOOL_CREATE_RE.match(text)
+        return m.group(1).strip() if m else None
+
+    _check("'create a tool that ...' captures the task",
+           tgt("create a tool that counts orders over 100")
+           == "counts orders over 100")
+    _check("'make a tool to ...' routes",
+           tgt("make a tool to summarize each csv") == "summarize each csv")
+    _check("a non-tool request does not route",
+           C._TOOL_CREATE_RE.match("what tools do i have") is None)
+
+
 def test_data_preview_text() -> None:
     """_data_preview_text gives a model-free (schema, rows) preview of a data
     file with bounded reads, and falls back to a text peek for non-tabular
@@ -4390,6 +4473,10 @@ def main() -> int:
          test_vault_search_excludes_app_state)
     _run("layered vault-term search routing",
          test_vault_term_search_routing)
+    _run("tool forge: model writes + validates + saves a tool",
+         test_tool_forge_generate)
+    _run("dataset digest (expert grounding) + tool-create routing",
+         test_dataset_digest_and_tool_routing)
     _run("data preview (model-free schema + rows)",
          test_data_preview_text)
     _run("error coaching (plain-language + one-click fix)",
