@@ -2705,12 +2705,13 @@ def test_agentic_jobs_core() -> None:
                 file_root=din, output_dir=vault / "out")
             reg = build_default_registry(pol)
             names = set(reg.as_dict().keys())
-            _check("registry exposes exactly the safe read-only tools",
+            _check("registry exposes exactly the safe read-only + author tools",
                    names == {"list_files", "search_files", "read_local_file",
-                             "run_pandas_analysis", "query_memory"})
+                             "run_pandas_analysis", "query_memory",
+                             "list_app_tools", "write_tool", "run_app_tool"})
             _check("allow-list matches the registered tools",
                    set(ajr._AGENT_TOOLS) == names)
-            _check("no delete/write/network tool is registered",
+            _check("no raw delete/network tool is registered",
                    not any(k in n for n in names
                            for k in ("delete", "remove", "http",
                                      "sql_write", "unlink", "rmtree")))
@@ -3497,6 +3498,124 @@ def test_agent_file_tools() -> None:
                and sf_call.result.get("files_with_matches") == 2)
 
 
+def test_app_built_tools_and_sandbox_fs() -> None:
+    """Self-authored tools: the sandbox gains read-only FS helpers (no os
+    needed to count files/folders), and a model-authored tool is
+    sandbox-validated (no delete/write/network), saved UNREVIEWED under the
+    vault's App_Built_tools/, and run with an UNVERIFIED label. Dangerous tools
+    are refused at save time, and the model has no way to delete a tool."""
+    try:
+        import app_built_tools as abt
+        import vault_analyst as va
+    except Exception as exc:  # pragma: no cover
+        _check(f"app_built_tools importable (skipped: {exc!r})", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td) / "vault"
+        din = vault / "data_in"
+        din.mkdir(parents=True)
+        (din / "a.csv").write_text("x\n1\n")
+        (din / "b.csv").write_text("x\n2\n")
+        (din / "sub").mkdir()
+
+        # Part 1 — read-only FS helpers replace the blocked os module.
+        df, _msg = va.execute_pandas_code(
+            "result_df = pd.DataFrame([{'files': count_files(DATA_FOLDER), "
+            "'dirs': count_folders(DATA_FOLDER)}])", [din])
+        _check("sandbox FS helpers count files without os",
+               df is not None and int(df.iloc[0]["files"]) == 2)
+        _check("sandbox FS helpers count folders",
+               int(df.iloc[0]["dirs"]) == 1)
+        _check("import os is STILL blocked in the sandbox",
+               va.execute_pandas_code("import os\nresult_df=None", [din])[0]
+               is None)
+
+        # Part 2 — author + run a tool.
+        good = ("def count_csvs(folder=None):\n"
+                "    return sum(1 for f in list_dir(folder) "
+                "if f.endswith('.csv'))\n")
+        ok, _m, name = abt.save_tool("count_csvs", "count csvs", good,
+                                     author="test", vault_dir=vault)
+        _check("a valid tool saves", ok and name == "count_csvs")
+        _check("tool file lands under vault App_Built_tools/",
+               (vault / "App_Built_tools" / "count_csvs.py").exists())
+        _check("tool file is flagged UNREVIEWED",
+               "UNREVIEWED" in (abt.get_tool_code("count_csvs",
+                                                   vault_dir=vault) or ""))
+        _check("tool appears in the index",
+               "count_csvs" in [t["name"]
+                                for t in abt.list_tools(vault_dir=vault)])
+        rdf, rmsg = abt.run_tool("count_csvs", {}, allowed_folders=[din],
+                                 vault_dir=vault)
+        _check("running a tool labels output UNVERIFIED", "UNVERIFIED" in rmsg)
+        _check("the tool computed the right answer (2 csvs)",
+               rdf is not None and int(rdf.iloc[0]["result"]) == 2)
+
+        # Dangerous tools are refused at save time.
+        _check("a tool importing os is rejected",
+               not abt.save_tool(
+                   "wipe", "x",
+                   "def wipe(p):\n import os\n os.remove(p)\n return 1\n",
+                   vault_dir=vault)[0])
+        _check("a getattr(unlink) bypass is rejected",
+               not abt.save_tool(
+                   "sneaky", "x",
+                   "def s(p):\n getattr(__import__('pathlib')."
+                   "Path(p),'unlink')()\n return 1\n",
+                   vault_dir=vault)[0])
+        _check("a tool without exactly one entry function is rejected",
+               not abt.save_tool(
+                   "two", "x", "def a():\n return 1\ndef b():\n return 2\n",
+                   vault_dir=vault)[0])
+        _check("the model has NO delete_tool / remove_tool function",
+               not hasattr(abt, "delete_tool")
+               and not hasattr(abt, "remove_tool"))
+
+
+def test_agent_can_author_and_run_a_tool() -> None:
+    """End-to-end: the agent's write_tool validates + saves a tool and
+    run_app_tool executes it, all through the frozen registry + allow-list."""
+    try:
+        from safe_agent import AgentPolicy, default_tools
+        import agent_jobs_runner as ajr
+    except Exception as exc:  # pragma: no cover
+        _check(f"safe_agent importable (skipped: {exc!r})", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td) / "vault"
+        din = vault / "data_in"
+        din.mkdir(parents=True)
+        (din / "a.csv").write_text("x\n1\n")
+        (din / "b.csv").write_text("x\n2\n")
+        prev = os.environ.get("COUNCIL_VAULT_ROOT")
+        os.environ["COUNCIL_VAULT_ROOT"] = str(vault)
+        try:
+            pol = AgentPolicy(allowed_tools=ajr._AGENT_TOOLS,
+                              file_root=din, output_dir=vault / "out")
+            tools = default_tools(pol)
+            w = tools["write_tool"].fn({
+                "name": "n_csvs", "description": "count csvs",
+                "code": "def n_csvs(folder=None):\n"
+                        "    return len([f for f in list_dir(folder) "
+                        "if f.endswith('.csv')])\n",
+            }, pol)
+            _check("agent write_tool saves the tool", w.get("saved") is True)
+            listed = tools["list_app_tools"].fn({}, pol)["tools"]
+            _check("agent list_app_tools sees the new tool",
+                   "n_csvs" in [t["name"] for t in listed])
+            r = tools["run_app_tool"].fn({"name": "n_csvs", "args": {}}, pol)
+            _check("agent run_app_tool labels result UNVERIFIED",
+                   "UNVERIFIED" in r.get("message", ""))
+            _check("agent-built tool returns the right count",
+                   bool(r.get("preview"))
+                   and int(r["preview"][0]["result"]) == 2)
+        finally:
+            if prev is None:
+                os.environ.pop("COUNCIL_VAULT_ROOT", None)
+            else:
+                os.environ["COUNCIL_VAULT_ROOT"] = prev
+
+
 def test_data_preview_text() -> None:
     """_data_preview_text gives a model-free (schema, rows) preview of a data
     file with bounded reads, and falls back to a text peek for non-tabular
@@ -4198,6 +4317,10 @@ def main() -> int:
          test_folder_agg_command)
     _run("agent file tools (list_files/search_files + e2e run)",
          test_agent_file_tools)
+    _run("app-built tools + sandbox FS helpers (self-authored, sandboxed)",
+         test_app_built_tools_and_sandbox_fs)
+    _run("agent authors + runs a tool (write_tool/run_app_tool e2e)",
+         test_agent_can_author_and_run_a_tool)
     _run("data preview (model-free schema + rows)",
          test_data_preview_text)
     _run("error coaching (plain-language + one-click fix)",

@@ -3113,8 +3113,36 @@ def _run_analyst_step_impl(query):
         return _build_analyst_failure_block("(empty)", msg), msg, notices
     print('[analyst] generated code (first 300):\n' + code[:300], file=_sys_dbg.stderr)
 
+    # Hand the analyst a way to BUILD its own tools when a capability is
+    # missing. save_app_tool validates via the sandbox and persists to the
+    # vault's App_Built_tools/ (UNREVIEWED); run/list let it reuse them. These
+    # are curated app callables — NOT passed to app-built tools themselves, so
+    # a tool can't spawn more tools.
+    def _save_app_tool(name, description, code):
+        import app_built_tools as _abt
+        ok, msg, _ = _abt.save_tool(name, description, code,
+                                    author="council", vault_dir=VAULT_DIR)
+        return msg
+
+    def _run_app_tool(name, args=None):
+        import app_built_tools as _abt
+        _df, _msg = _abt.run_tool(name, args or {},
+                                  allowed_folders=allowed_folders,
+                                  vault_dir=VAULT_DIR)
+        return _df if _df is not None else _msg
+
+    def _list_app_tools():
+        import app_built_tools as _abt
+        return _abt.list_tools(vault_dir=VAULT_DIR)
+
+    _analyst_extra = {
+        "save_app_tool": _save_app_tool,
+        "run_app_tool":  _run_app_tool,
+        "list_app_tools": _list_app_tools,
+    }
     with _ce._TimingScope("analyst.exec"):
-        result_df, log = _va.execute_pandas_code(code, allowed_folders)
+        result_df, log = _va.execute_pandas_code(
+            code, allowed_folders, extra_globals=_analyst_extra)
     if result_df is None:
         # Extract the first traceback line for a concise transcript message.
         # The full log keeps the entire traceback for debugging in the block.
@@ -6649,6 +6677,14 @@ class CouncilConsole(tk.Tk):
         r"\s+(?:column\s+)?(?:in|across|over|from|within)\s+(.+?)\s*$",
         _re.IGNORECASE,
     )
+    # "list app tools" / "app tools" / "what tools have you built"
+    _APP_TOOLS_RE = _re.compile(
+        r"^\s*(?:list\s+|show\s+|what\s+(?:are\s+the\s+)?)?"
+        r"(?:app[\s_-]?built\s+tools?|app\s+tools?|built\s+tools?|"
+        r"self[\s-]?built\s+tools?|custom\s+tools?)"
+        r"(?:\s+(?:have\s+you\s+built|available|do\s+i\s+have))?\s*\??\s*$",
+        _re.IGNORECASE,
+    )
     # Trailing "…and save it to a csv file called foo.csv" clause.
     # Groups: (1) optional format (csv/tsv/text/txt), (2) optional filename.
     _SAVE_CLAUSE_RE = _re.compile(
@@ -7055,6 +7091,9 @@ class CouncilConsole(tk.Tk):
         m = self._FOLDER_AGG_RE.match(single_line)
         if m:
             self._folder_agg_response(m.group(1), m.group(2), m.group(3))
+            return True
+        if self._APP_TOOLS_RE.match(single_line):
+            self._app_tools_response()
             return True
 
         if self._EXPORT_TRANSCRIPT_RE.match(single_line):
@@ -7936,6 +7975,37 @@ class CouncilConsole(tk.Tk):
         except Exception as exc:
             return f"  ⚠ Could not write {outp.name}: {exc!r}"
         return f"  ✓ Saved to: {outp}"
+
+    def _app_tools_response(self):
+        """List the self-authored (app-built) tools the models have created."""
+        try:
+            import app_built_tools as _abt
+            tools = _abt.list_tools(vault_dir=VAULT_DIR)
+        except Exception as exc:
+            self._append_transcript(
+                "Writer", f"Could not list app-built tools: {exc!r}", "final")
+            self._set_status("● idle")
+            return
+        if not tools:
+            self._append_transcript(
+                "Writer",
+                "No app-built tools yet. The council and agent create these "
+                "automatically when a needed capability is missing; each is "
+                "sandbox-validated and saved UNREVIEWED under App_Built_tools/ "
+                "in your vault.", "final")
+            self._set_status("● idle")
+            return
+        lines = [f"App-built tools ({len(tools)}) — UNREVIEWED, may be "
+                 f"inaccurate:"]
+        for t in tools:
+            lines.append(
+                f"  • {t.get('name')}  [{t.get('author', '?')}]"
+                f"  — {(t.get('description') or '')[:80]}")
+        lines.append("")
+        lines.append(f"Location: {_abt.tools_dir(VAULT_DIR)}")
+        lines.append("(You can delete any file there to remove a tool.)")
+        self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
 
     def _money_response(self, target: str):
         import vault_tools as _vt

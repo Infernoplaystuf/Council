@@ -10,13 +10,17 @@ contention. Each step is persisted (JobStore) and streamed to the UI via the
 app's ui_q, and each job has a cooperative cancel Event checked at step
 boundaries.
 
-Security is structural, not policy: the agent's tools are all READ-ONLY and
+Security is structural, not policy: the agent's data tools are READ-ONLY and
 sandboxed to file_root — list_files (discover), search_files (grep contents ->
 file list), read_local_file, run_pandas_analysis (the validated pandas
-sandbox), and query_memory. There is NO delete / DB-write / shell / network
-tool, so the "never delete from a database" and offline rules can't be
-violated. The final REPORT is written by THIS runner (not a model-invoked
-tool) into a dedicated agent_jobs_out/ folder.
+sandbox), and query_memory. It may also AUTHOR tools (write_tool -> run_app_tool
+-> list_app_tools): the code is validated by the SAME sandbox rules and can
+only ever be read-only itself, so a self-built tool still cannot delete,
+write outside the output dir, use the network, or shell out. The only write the
+agent can cause is the curated save of a validated tool file under the vault's
+App_Built_tools/ (flagged UNREVIEWED). The "never delete from a database" and
+offline rules can't be violated. The final REPORT is written by THIS runner
+(not a model-invoked tool) into a dedicated agent_jobs_out/ folder.
 """
 from __future__ import annotations
 
@@ -52,7 +56,8 @@ class LocalRunner:
 
 
 _AGENT_TOOLS = ("list_files", "search_files", "read_local_file",
-                "run_pandas_analysis", "query_memory")
+                "run_pandas_analysis", "query_memory",
+                "list_app_tools", "write_tool", "run_app_tool")
 
 
 def _default_file_root(vault_dir: Optional[Any]) -> Path:

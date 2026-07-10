@@ -3479,7 +3479,11 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
         "os", "sys", "subprocess", "shutil", "socket",
         "requests", "urllib", "http", "ftplib",
     }
-    forbidden_calls = {"eval", "exec", "compile", "input"}
+    # `__import__` is blocked as a direct call: `import pandas` statements go
+    # through the guarded import and are fine, but an explicit
+    # `__import__("pathlib").Path(p).unlink()` is a classic sandbox-escape
+    # vector, so refuse the raw builtin call.
+    forbidden_calls = {"eval", "exec", "compile", "input", "__import__"}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -3499,6 +3503,18 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
                 return False, f"Forbidden call: {node.func.id}"
             if isinstance(node.func, ast.Attribute) and node.func.attr in _SANDBOX_FORBIDDEN_ATTRS:
                 return False, f"Forbidden method: {node.func.attr}"
+            # getattr/setattr with a constant forbidden name — the string-based
+            # bypass of the attribute checks above, e.g.
+            # `getattr(p, "unlink")()` or `getattr(x, "__globals__")`.
+            if (isinstance(node.func, ast.Name)
+                    and node.func.id in ("getattr", "setattr")
+                    and len(node.args) >= 2
+                    and isinstance(node.args[1], ast.Constant)
+                    and isinstance(node.args[1].value, str)
+                    and node.args[1].value in (_SANDBOX_FORBIDDEN_ATTRS
+                                               | _SANDBOX_FORBIDDEN_DUNDERS)):
+                return False, (f"Forbidden {node.func.id} of "
+                               f"{node.args[1].value!r}")
     return True, "ok"
 
 
@@ -3602,6 +3618,8 @@ class _BudgetedPandas:
 def execute_pandas_code(
     code: str,
     allowed_folders: List[Path],
+    *,
+    extra_globals: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[pd.DataFrame], str]:
     ok, msg = validate_generated_code(code)
     if not ok:
@@ -3616,6 +3634,56 @@ def execute_pandas_code(
     # `import pandas` so model code can't sidestep the cap by re-importing.
     _read_state = {"used": 0}
     _budgeted_pd = _BudgetedPandas(pd, _analyst_read_budget_bytes(), _read_state)
+
+    # ── Safe, READ-ONLY directory helpers ───────────────────────────────
+    # The sandbox blocks `import os`, so model code that tried os.listdir /
+    # os.walk to count files/folders used to fail with "Forbidden import:
+    # os". These closures give the same answer without any dangerous surface:
+    # they only iterate + stat (no open/read/write/delete) and are bounded to
+    # the allowed data folders.
+    def _sb_resolve_dir(folder=None) -> Path:
+        base = Path(str(normalized_folders[0]))
+        if folder is None:
+            return base
+        p = Path(str(folder)).expanduser()
+        if not p.is_absolute():
+            for root in normalized_folders:
+                cand = Path(str(root)) / p
+                if cand.exists():
+                    p = cand
+                    break
+            else:
+                p = base / p
+        p = p.resolve()
+        for root in normalized_folders:
+            try:
+                p.relative_to(Path(str(root)).resolve())
+                return p
+            except ValueError:
+                continue
+        raise PermissionError(
+            f"list/count is limited to the data folders; {folder!r} is "
+            "outside them")
+
+    def _sb_count_files(folder=None, recursive=True) -> int:
+        d = _sb_resolve_dir(folder)
+        if not d.is_dir():
+            return 0
+        it = d.rglob("*") if recursive else d.glob("*")
+        return sum(1 for x in it if x.is_file())
+
+    def _sb_count_folders(folder=None, recursive=False) -> int:
+        d = _sb_resolve_dir(folder)
+        if not d.is_dir():
+            return 0
+        it = d.rglob("*") if recursive else d.glob("*")
+        return sum(1 for x in it if x.is_dir())
+
+    def _sb_list_dir(folder=None) -> list:
+        d = _sb_resolve_dir(folder)
+        if not d.is_dir():
+            return []
+        return sorted(x.name for x in d.iterdir())
 
     def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
         if name.split(".")[0] == "pandas":
@@ -3673,6 +3741,11 @@ def execute_pandas_code(
         "Path": Path,
         "DATA_FOLDERS": [str(p) for p in normalized_folders],
         "DATA_FOLDER": str(normalized_folders[0]),
+        # Read-only directory helpers (no os needed to count files/folders).
+        "count_files":        _sb_count_files,
+        "count_folders":      _sb_count_folders,
+        "list_dir":           _sb_list_dir,
+        "folder_file_counts": folder_file_counts,
         "list_csv_files": list_csv_files,
         "find_column_case_insensitive": find_column_case_insensitive,
         "find_columns_contains": find_columns_contains,
@@ -3805,6 +3878,17 @@ def execute_pandas_code(
     # but a body reference to `name` inside the comprehension fails. We
     # use a single namespace so the model's hand-rolled pandas snippets
     # behave the same as if they ran in a normal module.
+    # Caller-supplied extra helpers (e.g. the council analyst is handed
+    # save_app_tool / run_app_tool / list_app_tools so it can build tools).
+    # These are curated app callables, NOT model-provided. They are NOT given
+    # to app-built tools themselves (run_tool passes no extra_globals), so a
+    # tool cannot author or run further tools — no recursion. __builtins__ can
+    # never be overridden here.
+    if extra_globals:
+        for _k, _v in extra_globals.items():
+            if _k != "__builtins__":
+                globals_dict[_k] = _v
+
     stdout_buf = io.StringIO()
     stderr_buf = io.StringIO()
 
@@ -3891,6 +3975,19 @@ Available variables:
 - pd            (pandas)
 - Path          (pathlib.Path)
 - np            (numpy, may be None)
+
+Counting files / folders (do NOT `import os` — it is blocked; use these):
+  count_files(folder=None, recursive=True)     -> int
+  count_folders(folder=None, recursive=False)  -> int
+  list_dir(folder=None)                         -> list[str] of names
+  folder_file_counts(data_folder)               -> DataFrame of counts by type
+
+If a capability you need is genuinely missing, you MAY build a reusable tool:
+  save_app_tool(name, description, code)  — `code` must define EXACTLY ONE
+      top-level function; it is sandbox-validated (no delete / write-outside-
+      output / network / shell) and saved UNREVIEWED under App_Built_tools/.
+  run_app_tool(name, args_dict)   list_app_tools()
+Prefer the helper functions below; only build a tool for something they cannot do.
 
 Available helper functions (prefer these over raw pandas — they handle
 case-insensitive column matching, NaN/zero filtering, and multi-CSV scans):

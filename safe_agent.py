@@ -374,6 +374,67 @@ def _tool_search_files(args: Dict[str, Any],
     return out
 
 
+def _tool_list_app_tools(args: Dict[str, Any],
+                         policy: AgentPolicy) -> Dict[str, Any]:
+    """List the app-built (self-authored) tools available to reuse."""
+    try:
+        import app_built_tools as abt
+        tools = abt.list_tools()
+    except Exception as exc:
+        return {"error": f"app-built tools unavailable: {exc!r}"}
+    return {"count": len(tools),
+            "tools": [{"name": t.get("name"),
+                       "description": t.get("description", ""),
+                       "entry": t.get("entry")} for t in tools]}
+
+
+def _tool_write_tool(args: Dict[str, Any],
+                     policy: AgentPolicy) -> Dict[str, Any]:
+    """Author a NEW tool when an existing one is missing. Provide 'name',
+    'description', and 'code' (Python defining EXACTLY ONE top-level function
+    — its entry point). The code is validated by the same sandbox rules (no
+    delete/write-outside-output/network/shell) and saved UNREVIEWED under the
+    vault's App_Built_tools/. Then call it with run_app_tool."""
+    name = str(args.get("name") or "").strip()
+    description = str(args.get("description") or "").strip()
+    code = str(args.get("code") or "")
+    if not name or not code.strip():
+        return {"error": "write_tool needs 'name' and 'code' "
+                         "(python with one top-level function)"}
+    try:
+        import app_built_tools as abt
+        ok, msg, saved = abt.save_tool(name, description, code, author="agent")
+    except Exception as exc:
+        return {"error": f"write_tool failed: {exc!r}"}
+    return {"saved": bool(ok), "name": saved, "message": msg,
+            "note": "APP-BUILT tool — UNREVIEWED; its output may be inaccurate."}
+
+
+def _tool_run_app_tool(args: Dict[str, Any],
+                       policy: AgentPolicy) -> Dict[str, Any]:
+    """Run a previously-authored app-built tool by 'name' with an 'args' dict.
+    Runs in the same sandbox; the result is flagged UNVERIFIED."""
+    name = str(args.get("name") or "").strip()
+    targs = args.get("args") or {}
+    if not isinstance(targs, dict):
+        targs = {}
+    if not name:
+        return {"error": "run_app_tool needs 'name'"}
+    try:
+        import app_built_tools as abt
+        df, msg = abt.run_tool(name, targs, allowed_folders=[policy.file_root])
+    except Exception as exc:
+        return {"error": f"run_app_tool failed: {exc!r}"}
+    out: Dict[str, Any] = {"message": msg}
+    if df is not None:
+        try:
+            out["preview"] = df.head(20).to_dict(orient="records")
+            out["shape"] = list(df.shape)
+        except Exception:
+            out["preview"] = str(df)[:2000]
+    return out
+
+
 def default_tools(policy: AgentPolicy) -> Dict[str, Tool]:
     """The reviewed allow-list. Extending requires a code review per §0."""
     return {
@@ -425,6 +486,34 @@ def default_tools(policy: AgentPolicy) -> Dict[str, Tool]:
             description="Retrieve the top-k records from LocalMemory.",
             schema={"text": "str", "k": "int (optional, default 5)"},
             timeout_s=15.0,
+        ),
+        "list_app_tools": Tool(
+            name="list_app_tools",
+            fn=_tool_list_app_tools,
+            description="List the app-built (self-authored) tools you can reuse "
+                        "with run_app_tool. Check here before writing a new one.",
+            schema={},
+            timeout_s=15.0,
+        ),
+        "write_tool": Tool(
+            name="write_tool",
+            fn=_tool_write_tool,
+            description="Author a NEW tool when a needed one is missing. Args: "
+                        "name, description, code (python with EXACTLY ONE "
+                        "top-level function = entry point). Validated by the "
+                        "sandbox (no delete/write-outside-output/network/shell) "
+                        "and saved UNREVIEWED. Then call it via run_app_tool.",
+            schema={"name": "str", "description": "str",
+                    "code": "str (python; one top-level function)"},
+            timeout_s=20.0,
+        ),
+        "run_app_tool": Tool(
+            name="run_app_tool",
+            fn=_tool_run_app_tool,
+            description="Run an app-built tool by name with an args dict. Runs "
+                        "in the sandbox; result is flagged UNVERIFIED.",
+            schema={"name": "str", "args": "dict (optional)"},
+            timeout_s=60.0,
         ),
     }
 
