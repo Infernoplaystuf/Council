@@ -12911,8 +12911,18 @@ class CouncilConsole(tk.Tk):
             saved = mpl_r.save(fig, Path(path_str))
             self._grapher_show_stats(f"\u2713 Exported: {saved}")
         else:
-            self._grapher_show_stats(
-                "\u2717 Export failed \u2014 matplotlib could not render this plot type.")
+            # Reachable now that the static renderer returns None for a type it
+            # cannot draw, instead of silently exporting a generic plot.
+            if not getattr(ge, "_MPL_OK", False):
+                msg = ("\u2717 Export failed \u2014 matplotlib isn't installed. "
+                       "Use 'Open in browser' to save the interactive chart.")
+            elif spec.plot_type not in getattr(ge, "MPL_SUPPORTED", ()):
+                msg = (f"\u2717 '{spec.plot_type}' has no static {fmt.upper()} "
+                       "export. Use 'Open in browser' to save the interactive "
+                       "chart instead.")
+            else:
+                msg = "\u2717 Export failed \u2014 no data to plot."
+            self._grapher_show_stats(msg)
 
     def _grapher_ai_plot(self):
         if not _GRAPHER_OK:

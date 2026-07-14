@@ -2418,6 +2418,88 @@ def test_provenance_source_resolve() -> None:
                 cge.VAULT_DIR = prev
 
 
+def test_graph_engine_correctness() -> None:
+    """The graph engine must never present a fabricated or mis-aligned result,
+    and an interactive chart must render on an air-gapped machine."""
+    try:
+        import re as _re
+        import numpy as np
+        import pandas as pd
+        import graph_engine as ge
+        from graph_data import DataSet
+    except Exception as exc:  # pragma: no cover
+        _check(f"graph_engine importable ({exc!r})", False)
+        return
+
+    def _ds(df, name="fixture"):
+        return DataSet(name=name, source_path=Path("fixture.csv"),
+                       format="csv", df=df)
+
+    # A trend must never fit a column against itself. The old expression
+    #   y = spec.y_col or num[1] if len(num) > 1 else x
+    # parses as (spec.y_col or num[1]) if len(num) > 1 else x, so a frame with
+    # ONE numeric column silently fitted x vs x and reported a perfect r=1.0.
+    one_num = pd.DataFrame({"yield": [1.0, 2.0, 3.0], "build": list("abc")})
+    try:
+        ge._resolve_trend_cols(ge.PlotSpec(plot_type="trend", x_col="yield",
+                                           y_col="yield"), one_num)
+        _check("trend refuses to fit a column against itself", False)
+    except ValueError:
+        _check("trend refuses to fit a column against itself "
+               "(no fabricated r=1.0)", True)
+    two = pd.DataFrame({"n": [1.0, 2.0, 3.0, 4.0], "other": [2.0, 4.0, 7.0, 8.0]})
+    _check("an explicit y_col is never discarded",
+           ge._resolve_trend_cols(
+               ge.PlotSpec(plot_type="trend", x_col="n", y_col="other"),
+               two) == ("n", "other"))
+
+    # x and y were dropna()'d INDEPENDENTLY then truncated to the shorter,
+    # so one gap silently re-paired every point with the wrong partner.
+    gappy = pd.DataFrame({"x": [1.0, 2.0, np.nan, 4.0, 5.0],
+                          "y": [10.0, np.nan, 30.0, 40.0, 50.0]})
+    xv, yv = ge._paired_xy(gappy, "x", "y", 1)
+    _check("trend drops NaNs pairwise so (x, y) stay aligned",
+           list(xv) == [1.0, 4.0, 5.0] and list(yv) == [10.0, 40.0, 50.0])
+
+    # The anomaly mask came from the dropna()'d column but indexed the
+    # full-length frame, so a single NaN broke the whole chart.
+    nan_col = pd.DataFrame({"v": [1.0, 2.0, np.nan, 3.0, 100.0, 2.0, 1.0]})
+    x_vals, data, mask, _mean, _std, _col = ge._anomaly_parts(
+        ge.PlotSpec(plot_type="anomaly", anomaly_threshold=1.5), nan_col)
+    _check("anomaly survives a NaN with x/y/mask aligned",
+           len(x_vals) == len(data) == len(mask) == 6 and mask.sum() >= 1)
+
+    # The static exporter covers a subset of PLOT_TYPES. It used to fall
+    # through to a generic numeric plot and return a truthy Figure, so the GUI
+    # reported success over a chart that was not the one requested.
+    _check("mpl-unsupported types are declared, not silently substituted",
+           set(ge.PLOT_TYPES) - set(ge.MPL_SUPPORTED) == {
+               "pie", "area", "distribution", "density_2d", "parallel_coords",
+               "polar", "contour", "scatter_3d", "facet"})
+    if getattr(ge, "_MPL_OK", False):
+        r = ge.MatplotlibRenderer()
+        _check("an unsupported export returns None (so the caller can say so)",
+               r.render(ge.PlotSpec(plot_type="pie", x_col="build",
+                                    y_col="yield"), _ds(one_num)) is None)
+        _check("a supported type still exports",
+               r.render(ge.PlotSpec(plot_type="histogram", y_col="yield"),
+                        _ds(one_num)) is not None)
+
+    # THE air-gap regression: include_plotlyjs="cdn" made every chart a blank
+    # div offline (the <script src> never resolved) while to_html() succeeded,
+    # so the app reported a rendered chart and showed nothing.
+    _check("plotly.js is never loaded from the network", ge._PLOTLY_JS is True)
+    if getattr(ge, "_PLOTLY_OK", False):
+        html = ge.PlotlyRenderer().render(
+            ge.PlotSpec(plot_type="histogram", y_col="yield"), _ds(one_num))
+        ext = _re.findall(r"<script[^>]+src=[\"']([^\"']+)[\"']", html)
+        # Note: the string 'cdn.plot.ly' still occurs INSIDE the bundled
+        # plotly.js (its topojsonURL default), so assert on fetches, not text.
+        _check("emitted chart has no external <script src> to fetch", not ext)
+        _check("plotly.js is inlined, so the chart renders air-gapped",
+               "Plotly.newPlot" in html and len(html) > 1_000_000)
+
+
 def test_graph_introspect_columns() -> None:
     """graph_data._introspect_columns classification is unchanged after the
     nunique-computed-once (#14) and to_numeric-reuse (#15) CSE: native numeric,
@@ -2426,7 +2508,9 @@ def test_graph_introspect_columns() -> None:
         import graph_data as gd
         import pandas as pd
     except Exception as exc:  # pragma: no cover
-        _check(f"graph_data importable (skipped: {exc!r})", True)
+        # NOT _check(..., True): reporting PASS when the module cannot be
+        # imported is how a dead graph subsystem stayed green.
+        _check(f"graph_data importable ({exc!r})", False)
         return
     df = pd.DataFrame({
         "amount": [1.0, 2.5, 3.0, 4.0],              # native numeric
@@ -4908,6 +4992,8 @@ def main() -> int:
          test_agentic_jobs_core)
     _run("graph introspect columns (numeric/coerce/categorical)",
          test_graph_introspect_columns)
+    _run("graph engine correctness (no fake trend, aligned, offline-safe)",
+         test_graph_engine_correctness)
     _run("route_message golden (routing unchanged)",
          test_route_message_golden)
     _run("read-file injection memo (identical + invalidates)",

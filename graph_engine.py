@@ -62,6 +62,21 @@ except ImportError:
 
 from graph_data import DataSet
 
+# How plotly.js gets into the emitted HTML.
+#
+# This was "cdn", which made EVERY interactive chart a blank div on the
+# air-gapped machines this app is built for: the page's only <script src>
+# pointed at https://cdn.plot.ly/, which never resolves offline, while
+# to_html() still returned successfully — so the app reported a rendered chart
+# and showed nothing, with no error anywhere.
+#
+# True inlines plotly.js into each file (~3 MB), so a chart is self-contained
+# and works offline, opened from anywhere, forever. "directory" would be
+# smaller but writes a sidecar plotly.min.js the HTML must sit next to, and
+# render() returns a STRING without knowing where the caller will put it.
+# Correctness first: keep it self-contained.
+_PLOTLY_JS: Any = True
+
 
 # ============================================================
 # PlotSpec — the declarative plot description
@@ -83,6 +98,25 @@ PLOT_TYPES = [
     # Faceted
     "facet",
 ]
+
+class UnsupportedPlotType(ValueError):
+    """A renderer has no implementation for this plot type.
+
+    Distinct from a render failure: the static (matplotlib) exporter covers a
+    subset of PLOT_TYPES, and used to fall through to a generic 5-line numeric
+    plot for the rest — returning a truthy Figure, so the GUI reported
+    '✓ Exported' over a chart that was not the one requested."""
+
+
+# Plot types the matplotlib (static export) renderer actually implements.
+# Anything in PLOT_TYPES but not here raises UnsupportedPlotType rather than
+# silently exporting something else.
+MPL_SUPPORTED = frozenset({
+    "line", "bar", "scatter", "histogram", "box", "violin", "heatmap",
+    "correlation", "fft", "spectrogram", "surface_3d", "timeseries",
+    "rolling_mean", "trend", "anomaly", "pca",
+})
+
 
 @dataclass
 class PlotSpec:
@@ -139,6 +173,86 @@ class PlotSpec:
 
 
 # ============================================================
+# Shared column/alignment helpers
+#
+# Both renderers used to resolve trend columns with
+#     y = spec.y_col or num[1] if len(num) > 1 else x
+# which Python parses as (spec.y_col or num[1]) if len(num) > 1 else x — so a
+# single-numeric-column frame DISCARDED an explicit y_col and fitted x against
+# itself, reporting a perfect r=1.0 trend that looked entirely correct. They
+# also dropna()'d x and y INDEPENDENTLY and truncated to the shorter, which
+# silently misaligns every (x, y) pair when either column has a gap.
+# ============================================================
+
+def _resolve_trend_cols(spec, df):
+    """(x_col, y_col) for a trend fit. An explicit y_col is never discarded,
+    and x is never fitted against itself."""
+    num = df.select_dtypes(include="number").columns
+    if len(num) == 0:
+        raise ValueError("A trend needs at least one numeric column.")
+    x_col = spec.x_col or num[0]
+    if spec.y_col:
+        y_col = spec.y_col
+    elif len(num) > 1:
+        y_col = num[1]
+    else:
+        y_col = num[0]
+    if x_col == y_col:
+        raise ValueError(
+            f"A trend needs two different columns — got '{x_col}' for both x "
+            "and y. Pick a y column, or add a second numeric column. "
+            "(Fitting a column against itself always reports a perfect "
+            "r=1.0, so this refuses rather than showing a fake trend.)")
+    for c in (x_col, y_col):
+        if c not in df.columns:
+            raise ValueError(f"Column {c!r} is not in this dataset.")
+    return x_col, y_col
+
+
+def _paired_xy(df, x_col, y_col, degree=1):
+    """x/y values with NaNs dropped PAIRWISE, so the points stay aligned."""
+    pair = df[[x_col, y_col]].dropna()
+    try:
+        xv = pair[x_col].to_numpy(dtype=float)
+        yv = pair[y_col].to_numpy(dtype=float)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"A trend needs numeric x and y — '{x_col}' and/or '{y_col}' "
+            "is not numeric.")
+    if len(xv) < degree + 1:
+        raise ValueError(
+            f"Not enough paired points to fit a degree-{degree} trend: "
+            f"{len(xv)} row(s) have both '{x_col}' and '{y_col}'.")
+    return xv, yv
+
+
+def _anomaly_parts(spec, df):
+    """(x_values, y_values, mask) for an anomaly plot, all aligned to the rows
+    that survive dropna() — the old code built the mask from the dropna()'d
+    column but indexed the FULL-length frame with it, so one NaN broke it."""
+    num = df.select_dtypes(include="number").columns
+    if len(num) == 0:
+        raise ValueError("An anomaly plot needs a numeric column.")
+    col = spec.y_col or num[0]
+    if col not in df.columns:
+        raise ValueError(f"Column {col!r} is not in this dataset.")
+    data = df[col].dropna()
+    if data.empty:
+        raise ValueError(f"Column {col!r} has no non-empty values.")
+    mean, std = data.mean(), data.std()
+    if not std or np.isnan(std):
+        std = 0.0
+    mask = (np.abs(data - mean) > spec.anomaly_threshold * std).to_numpy()
+    if spec.x_col:
+        if spec.x_col not in df.columns:
+            raise ValueError(f"Column {spec.x_col!r} is not in this dataset.")
+        x_vals = df.loc[data.index, spec.x_col]
+    else:
+        x_vals = data.index.to_series(index=data.index)
+    return x_vals, data, mask, mean, std, col
+
+
+# ============================================================
 # Plotly renderer
 # ============================================================
 
@@ -163,7 +277,7 @@ class PlotlyRenderer:
                 showlegend=spec.show_legend,
                 margin=dict(l=50, r=30, t=60, b=50),
             )
-            return pio.to_html(fig, full_html=True, include_plotlyjs="cdn")
+            return pio.to_html(fig, full_html=True, include_plotlyjs=_PLOTLY_JS)
         except Exception as e:
             return self._error_html(f"{spec.plot_type} failed: {e}")
 
@@ -458,43 +572,37 @@ class PlotlyRenderer:
         return fig
 
     def _trend(self, spec, df):
-        x_col = spec.x_col or df.select_dtypes(include="number").columns[0]
-        y_col = spec.y_col or df.select_dtypes(include="number").columns[1] if len(df.select_dtypes(include="number").columns) > 1 else x_col
-        x_vals = df[x_col].dropna().values
-        y_vals = df[y_col].dropna().values
-        min_len = min(len(x_vals), len(y_vals))
-        x_vals, y_vals = x_vals[:min_len], y_vals[:min_len]
+        x_col, y_col = _resolve_trend_cols(spec, df)
+        x_vals, y_vals = _paired_xy(df, x_col, y_col, spec.trend_degree)
 
         coeffs = np.polyfit(x_vals, y_vals, spec.trend_degree)
-        trend  = np.polyval(coeffs, x_vals)
+        # Sort for the fitted line, else it zig-zags between unordered points.
+        order   = np.argsort(x_vals)
+        trend_x = x_vals[order]
+        trend   = np.polyval(coeffs, trend_x)
 
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=x_vals, y=y_vals,
                                   mode="markers", name="Data",
                                   marker=dict(size=spec.marker_size,
                                               opacity=spec.opacity)))
-        fig.add_trace(go.Scatter(x=x_vals, y=trend,
+        fig.add_trace(go.Scatter(x=trend_x, y=trend,
                                   mode="lines", name=f"Trend (deg {spec.trend_degree})",
                                   line=dict(width=spec.line_width + 1,
                                             dash="dash")))
+        fig.update_layout(xaxis_title=spec.x_label or x_col,
+                          yaxis_title=spec.y_label or y_col)
         return fig
 
     def _anomaly(self, spec, df):
-        col  = spec.y_col or df.select_dtypes(include="number").columns[0]
-        x    = spec.x_col
-        data = df[col].dropna()
-        mean = data.mean()
-        std  = data.std()
+        x_vals, data, mask, mean, std, col = _anomaly_parts(spec, df)
         threshold = spec.anomaly_threshold
-        is_anomaly = (np.abs(data - mean) > threshold * std)
 
         fig = go.Figure()
-        normal_x = df.index[~is_anomaly] if not x else df[x][~is_anomaly]
-        anom_x   = df.index[is_anomaly]  if not x else df[x][is_anomaly]
-        fig.add_trace(go.Scatter(x=normal_x, y=data[~is_anomaly],
+        fig.add_trace(go.Scatter(x=x_vals[~mask], y=data[~mask],
                                   mode="markers", name="Normal",
                                   marker=dict(size=spec.marker_size)))
-        fig.add_trace(go.Scatter(x=anom_x,   y=data[is_anomaly],
+        fig.add_trace(go.Scatter(x=x_vals[mask],  y=data[mask],
                                   mode="markers", name=f"Anomaly (>{threshold}σ)",
                                   marker=dict(size=spec.marker_size + 4,
                                               color="red", symbol="x")))
@@ -580,7 +688,7 @@ class PlotlyRenderer:
                 width=spec.width, height=spec.height,
                 showlegend=True,
             )
-            return pio.to_html(fig, full_html=True, include_plotlyjs="cdn")
+            return pio.to_html(fig, full_html=True, include_plotlyjs=_PLOTLY_JS)
         except Exception as e:
             return self._error_html(f"Overlay failed: {e}")
 
@@ -614,6 +722,10 @@ class MatplotlibRenderer:
             warnings.simplefilter("ignore")
             try:
                 fig = self._dispatch(spec, df)
+            except UnsupportedPlotType:
+                # Return None so the caller's "export failed" branch fires with
+                # the truth, instead of writing a PNG of the wrong chart.
+                return None
             except Exception as e:
                 fig, ax = plt.subplots(figsize=(8, 4))
                 ax.text(0.5, 0.5, f"Plot error:\n{e}",
@@ -767,12 +879,12 @@ class MatplotlibRenderer:
         if t == "pca":
             return self._pca_mpl(spec, df)
 
-        # Fallback: generic numeric plot
-        fig, ax = plt.subplots(figsize=(8, 5))
-        for col in num.columns[:5]:
-            ax.plot(df.index, df[col], label=col)
-        ax.legend()
-        return fig
+        # No silent fallback: substituting a generic numeric plot here made a
+        # 'pie' export come back as 5 overlaid line series, reported as success.
+        raise UnsupportedPlotType(
+            f"'{t}' has no static (matplotlib) export. Supported: "
+            f"{', '.join(sorted(MPL_SUPPORTED))}. Use the interactive chart, "
+            "or save it as HTML instead.")
 
     def _time_mpl(self, spec, df, t):
         num  = df.select_dtypes(include="number")
@@ -781,21 +893,19 @@ class MatplotlibRenderer:
         fig, ax = plt.subplots(figsize=(12, 5))
 
         if t == "trend":
-            xc = spec.x_col or num.columns[0]
-            yc = spec.y_col or num.columns[1] if len(num.columns) > 1 else num.columns[0]
-            xv = df[xc].dropna().values
-            yv = df[yc].dropna().values[:len(xv)]
+            xc, yc = _resolve_trend_cols(spec, df)
+            xv, yv = _paired_xy(df, xc, yc, spec.trend_degree)
             ax.scatter(xv, yv, alpha=0.5, s=10, label="Data")
             coeffs = np.polyfit(xv, yv, spec.trend_degree)
-            ax.plot(xv, np.polyval(coeffs, xv), "r--",
+            order  = np.argsort(xv)
+            ax.plot(xv[order], np.polyval(coeffs, xv[order]), "r--",
                     label=f"Trend (deg {spec.trend_degree})", linewidth=2)
+            ax.set_xlabel(xc)
+            ax.set_ylabel(yc)
         elif t == "anomaly":
-            col  = spec.y_col or num.columns[0]
-            data = df[col].dropna()
-            mean, std = data.mean(), data.std()
-            is_anom = np.abs(data - mean) > spec.anomaly_threshold * std
-            ax.plot(x, data, alpha=0.6, label=col)
-            ax.scatter(df.index[is_anom], data[is_anom],
+            x_vals, data, mask, mean, std, col = _anomaly_parts(spec, df)
+            ax.plot(x_vals, data, alpha=0.6, label=col)
+            ax.scatter(x_vals[mask], data[mask],
                        color="red", zorder=5, s=40,
                        label=f"Anomaly (>{spec.anomaly_threshold}σ)")
             ax.axhline(mean + spec.anomaly_threshold * std,
