@@ -3761,6 +3761,17 @@ def execute_pandas_code(
             return {"error": f"image_stats unavailable: {_e!r}"}
         return _ims.aggregate_image_folder(_sb_resolve_dir(folder))
 
+    def _sb_detect_features(path, polarity="auto", min_area=6, expected=None):
+        """Detect + count features in an image (read-only; no annotated file is
+        written from the sandbox). Returns count + per-feature bboxes."""
+        try:
+            import feature_detect as _fd
+        except Exception as _e:
+            return {"error": f"feature_detect unavailable: {_e!r}"}
+        return _fd.detect_and_count_features(
+            _sb_resolve_file(path), polarity=polarity, min_area=int(min_area),
+            expected=expected, annotate=False)
+
     def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
         if name.split(".")[0] == "pandas":
             return _budgeted_pd
@@ -3828,6 +3839,7 @@ def execute_pandas_code(
         "read_lines":         _sb_read_lines,
         "image_pixel_stats":  _sb_image_stats,
         "aggregate_image_folder": _sb_aggregate_images,
+        "detect_and_count_features": _sb_detect_features,
         "folder_file_counts": folder_file_counts,
         "list_csv_files": list_csv_files,
         "find_column_case_insensitive": find_column_case_insensitive,

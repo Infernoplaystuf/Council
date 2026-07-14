@@ -3882,6 +3882,69 @@ def test_image_pixel_stats() -> None:
                agg["darkest"] == "black.png" and agg["brightest"] == "red.png")
 
 
+def test_feature_detect() -> None:
+    """Deterministic feature detection + counting + annotation (classical CV,
+    offline, no model), the expected-count comparison, and command routing.
+    Pixel maths is skipped gracefully when numpy/scipy/Pillow are absent."""
+    try:
+        import feature_detect as fd
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"modules importable (skipped: {exc!r})", True)
+        return
+    C = cge.CouncilConsole
+    m = C._DETECT_RE.match("count features in spots.png expecting 5")
+    _check("'count features in X expecting N' routes",
+           bool(m) and m.group(3).strip() == "spots.png"
+           and (m.group(4) or m.group(1)) == "5")
+    m2 = C._DETECT_RE.match("detect 3 dark objects in holes.png")
+    _check("'detect N <polarity> objects in X' routes",
+           bool(m2) and m2.group(1) == "3" and m2.group(2) == "dark"
+           and m2.group(3).strip() == "holes.png")
+    _check("'count objects in X' is handled by detect (not folder-agg)",
+           C._DETECT_RE.match("count objects in image.png") is not None)
+
+    try:
+        from PIL import Image, ImageDraw
+        import numpy as np
+        import scipy  # noqa: F401
+    except Exception:
+        _check("feature detect degrades gracefully without numpy/scipy/Pillow",
+               "error" in fd.detect_and_count_features("nope.png"))
+        return
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        out = d / "out"
+        out.mkdir()
+        img = Image.new("RGB", (300, 200), (0, 0, 0))
+        dr = ImageDraw.Draw(img)
+        for (cx, cy) in [(40, 40), (120, 60), (200, 50), (80, 150), (240, 140)]:
+            dr.ellipse([cx - 12, cy - 12, cx + 12, cy + 12],
+                       fill=(255, 255, 255))
+        p = d / "spots.png"
+        img.save(p)
+        r = fd.detect_and_count_features(p, polarity="bright", min_area=20,
+                                         expected=5, out_dir=out)
+        _check("detects the 5 bright features", r["count"] == 5)
+        _check("expected-count comparison matches",
+               r.get("matches_expected") is True)
+        _check("writes an annotated image with the features boxed",
+               bool(r.get("annotated_image"))
+               and Path(r["annotated_image"]).exists())
+        _check("each feature carries a bbox + centroid",
+               all("bbox" in f and "centroid" in f for f in r["features"]))
+
+        img2 = Image.new("RGB", (200, 200), (255, 255, 255))
+        dr2 = ImageDraw.Draw(img2)
+        for (cx, cy) in [(40, 40), (150, 60), (90, 150)]:
+            dr2.rectangle([cx - 10, cy - 10, cx + 10, cy + 10], fill=(0, 0, 0))
+        p2 = d / "holes.png"
+        img2.save(p2)
+        r2 = fd.detect_and_count_features(p2, polarity="dark", min_area=20,
+                                          out_dir=out)
+        _check("detects the 3 dark features", r2["count"] == 3)
+
+
 def test_data_preview_text() -> None:
     """_data_preview_text gives a model-free (schema, rows) preview of a data
     file with bounded reads, and falls back to a text peek for non-tabular
@@ -4601,6 +4664,8 @@ def main() -> int:
          test_tool_forge_self_correction)
     _run("image pixel stats + folder rollup + routing",
          test_image_pixel_stats)
+    _run("feature detect + count + annotate (classical CV)",
+         test_feature_detect)
     _run("data preview (model-free schema + rows)",
          test_data_preview_text)
     _run("error coaching (plain-language + one-click fix)",

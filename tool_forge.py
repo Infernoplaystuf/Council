@@ -43,6 +43,8 @@ _SANDBOX_API = (
     "  image_pixel_stats(path)        -> dict of per-image pixel stats "
     "(brightness/contrast/channels/dominant colours)\n"
     "  aggregate_image_folder(folder=None) -> dict rollup over a folder of images\n"
+    "  detect_and_count_features(path, polarity='auto', min_area=6, expected=None)\n"
+    "      -> dict {count, features:[bbox...]} — count blobs/objects in an image\n"
     "  open(path)                     -> READ-ONLY file handle (writing blocked)\n"
     "\n"
     "FORBIDDEN (the sandbox will REJECT the tool): importing os / sys / "

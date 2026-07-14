@@ -544,6 +544,12 @@ _COUNCIL_EXAMPLES = [
      "Pixel statistics (brightness, contrast, per-channel, dominant colours) "
      "of one image, or 'image stats in <folder>' for a whole-folder rollup "
      "(no model). Also: 'ocr <image>' to read text inside it."),
+    ("Images",
+     "count features in layer_0345.png expecting 12",
+     "Detect + count discrete features/objects (pores, spatter, spots) in an "
+     "image, check against an expected number, and save an annotated image with "
+     "each one boxed + numbered (classical CV, no model). Use 'bright'/'dark' "
+     "to pick feature polarity."),
     ("Build a tool",
      "create a tool that flags rows where quantity is 0",
      "Opens the Tool Creation tab; the local model writes the tool, the "
@@ -6714,6 +6720,19 @@ class CouncilConsole(tk.Tk):
         r"(?:from|in))\s+(.+?)\s*\??\s*$",
         _re.IGNORECASE,
     )
+    # "count 12 features in <image>" / "detect objects in <image> expecting 12"
+    # / "count dark pores in <image>". Groups: leadN, polarity, target, trailN.
+    _DETECT_RE = _re.compile(
+        r"^\s*(?:detect|count|find)\s+(?:and\s+count\s+)?"
+        r"(?:(\d+)\s+)?"
+        r"(?:(bright|light|dark)\s+)?"
+        r"(?:objects?|features?|blobs?|particles?|pores?|spots?|holes?|"
+        r"defects?|dots?|voids?)"
+        r"\s+(?:in|on|of)\s+(.+?)"
+        r"(?:\s+(?:expecting|expect|should\s+(?:have|be)|~|=)\s*(\d+))?"
+        r"\s*\??\s*$",
+        _re.IGNORECASE,
+    )
     # "mean of <column> in <folder>" (+ optional "and save to <file>").
     # Groups: (1) aggregation word, (2) column, (3) the rest (folder phrase,
     # possibly with a trailing save clause parsed by _SAVE_CLAUSE_RE).
@@ -7170,6 +7189,13 @@ class CouncilConsole(tk.Tk):
         m = self._OCR_RE.match(single_line)
         if m:
             self._ocr_response(m.group(1).strip().strip("'\"`"))
+            return True
+        m = self._DETECT_RE.match(single_line)
+        if m:
+            self._detect_features_response(
+                (m.group(2) or "").strip(),
+                m.group(3).strip().strip("'\"`"),
+                (m.group(4) or m.group(1)))
             return True
         m = self._FOLDER_AGG_RE.match(single_line)
         if m:
@@ -8128,6 +8154,74 @@ class CouncilConsole(tk.Tk):
             lines.append("  (capped at 500 images)")
         self._append_transcript("Writer", "\n".join(lines), "final")
         self._set_status("● idle")
+
+    def _detect_features_response(self, polarity: str, target: str, expected):
+        """Detect + count discrete features/objects in an image (classical CV,
+        no model), compare to an expected count, and write an annotated image
+        with each counted feature boxed + numbered to data_out/annotated/."""
+        import feature_detect as _fd
+        import data_index as _di
+        _root, fpath = self._resolve_image_target(target)
+        if fpath is None:
+            self._append_transcript(
+                "Writer",
+                f"Point me at a single image file — I couldn't resolve "
+                f"{target!r} to one image. Try 'count features in "
+                "layer_0345.png'.", "final")
+            self._set_status("● idle")
+            return
+        pol = (polarity or "auto").lower()
+        if pol == "light":
+            pol = "bright"
+        exp = None
+        if expected is not None and str(expected).strip():
+            try:
+                exp = int(str(expected).strip())
+            except Exception:
+                exp = None
+        self._set_status("● detecting features…", "#cba6f7")
+
+        def _worker():
+            try:
+                out_dir = _di.output_dir(VAULT_DIR) / "annotated"
+            except Exception:
+                out_dir = None
+            try:
+                r = _fd.detect_and_count_features(
+                    fpath, polarity=pol, expected=exp, out_dir=out_dir)
+            except Exception as exc:
+                r = {"error": f"detection failed: {exc!r}"}
+
+            def _apply():
+                if "error" in r:
+                    self._append_transcript("Writer", str(r["error"]), "final")
+                    self._set_status("● idle")
+                    return
+                lines = [f"Detected {r['count']} {r['polarity']} feature(s) in "
+                         f"{r['file']}  (threshold {r['threshold']}, "
+                         f"min area {r['min_area']} px)."]
+                if "expected" in r:
+                    if r.get("matches_expected"):
+                        lines.append(f"  ✓ matches the expected {r['expected']}.")
+                    else:
+                        d = r["difference"]
+                        lines.append(
+                            f"  ✗ expected {r['expected']}, found {r['count']} "
+                            f"({'+' if d > 0 else ''}{d}). If off, try the other "
+                            "polarity (bright/dark) or a clearer image.")
+                if r.get("annotated_image"):
+                    lines.append(f"  Annotated image → {r['annotated_image']}")
+                feats = r.get("features") or []
+                if feats:
+                    sizes = sorted((f["area"] for f in feats), reverse=True)[:8]
+                    lines.append("  largest feature areas (px): "
+                                 + ", ".join(str(s) for s in sizes))
+                self._append_transcript("Writer", "\n".join(lines), "final")
+                self._set_status("● idle")
+            self.after(0, _apply)
+
+        import threading as _th
+        _th.Thread(target=_worker, daemon=True).start()
 
     def _ocr_response(self, target: str):
         """Extract text rendered inside an image (charts, scanned tables)."""
