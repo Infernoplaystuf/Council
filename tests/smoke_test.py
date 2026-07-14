@@ -3831,6 +3831,57 @@ def test_tool_forge_self_correction() -> None:
                rdf is not None and int(rdf.iloc[0]["result"]) == 42)
 
 
+def test_image_pixel_stats() -> None:
+    """Deterministic per-image + folder pixel statistics (offline, no model),
+    and the 'image stats of X' / 'ocr X' command routing. The pixel maths is
+    skipped gracefully when Pillow/numpy aren't installed."""
+    try:
+        import image_stats as ims
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"modules importable (skipped: {exc!r})", True)
+        return
+    C = cge.CouncilConsole
+
+    def tgt(rx, text):
+        m = rx.match(text)
+        return m.group(1).strip() if m else None
+
+    _check("'image stats of X' routes",
+           tgt(C._IMAGE_STATS_RE, "image stats of layer_1.png") == "layer_1.png")
+    _check("'analyze images in X' routes",
+           tgt(C._IMAGE_STATS_RE, "analyze images in builds") == "builds")
+    _check("'ocr X' routes", tgt(C._OCR_RE, "ocr chart.png") == "chart.png")
+    _check("'read the text in X' routes",
+           tgt(C._OCR_RE, "read the text in scan.jpg") == "scan.jpg")
+
+    try:
+        from PIL import Image
+        import numpy as np
+    except Exception:
+        _check("image pixel stats degrade gracefully without Pillow/numpy",
+               "error" in ims.image_pixel_stats("nope.png"))
+        return
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td)
+        Image.fromarray(np.zeros((16, 32, 3), dtype="uint8")).save(d / "black.png")
+        red = np.zeros((16, 32, 3), dtype="uint8")
+        red[:, :, 0] = 255
+        Image.fromarray(red).save(d / "red.png")
+        s = ims.image_pixel_stats(d / "red.png")
+        _check("pixel stats report dimensions",
+               s.get("width") == 32 and s.get("height") == 16)
+        _check("pixel stats compute per-channel mean (R high, G low)",
+               s["channels"]["R"]["mean"] > 200
+               and s["channels"]["G"]["mean"] < 5)
+        _check("pixel stats report brightness",
+               isinstance(s.get("brightness"), (int, float)))
+        agg = ims.aggregate_image_folder(d)
+        _check("folder rollup counts both images", agg["count"] == 2)
+        _check("folder rollup identifies darkest/brightest",
+               agg["darkest"] == "black.png" and agg["brightest"] == "red.png")
+
+
 def test_data_preview_text() -> None:
     """_data_preview_text gives a model-free (schema, rows) preview of a data
     file with bounded reads, and falls back to a text peek for non-tabular
@@ -4548,6 +4599,8 @@ def main() -> int:
          test_sandbox_readonly_file_read)
     _run("tool forge self-correction (test-run + fix loop)",
          test_tool_forge_self_correction)
+    _run("image pixel stats + folder rollup + routing",
+         test_image_pixel_stats)
     _run("data preview (model-free schema + rows)",
          test_data_preview_text)
     _run("error coaching (plain-language + one-click fix)",

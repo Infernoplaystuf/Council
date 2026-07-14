@@ -539,6 +539,11 @@ _COUNCIL_EXAMPLES = [
      "Compute a stat (mean/sum/min/max/median/std/count) of one column across "
      "every CSV in a folder; add 'save to a csv/text file' to write the result "
      "into the vault's data_out/reports/ (no model)."),
+    ("Images",
+     "image stats of layer_0345.png",
+     "Pixel statistics (brightness, contrast, per-channel, dominant colours) "
+     "of one image, or 'image stats in <folder>' for a whole-folder rollup "
+     "(no model). Also: 'ocr <image>' to read text inside it."),
     ("Build a tool",
      "create a tool that flags rows where quantity is 0",
      "Opens the Tool Creation tab; the local model writes the tool, the "
@@ -6696,6 +6701,19 @@ class CouncilConsole(tk.Tk):
         r"\s*\??\s*$",
         _re.IGNORECASE,
     )
+    # "image stats of <file>" / "pixel stats in <folder>" / "analyze images in X"
+    _IMAGE_STATS_RE = _re.compile(
+        r"^\s*(?:(?:image|picture|photo|pixel)\s+(?:stats|statistics|analysis|"
+        r"summary)|analy[sz]e\s+(?:the\s+)?images?|summari[sz]e\s+(?:the\s+)?"
+        r"images?)\s+(?:for|of|in|on|under)\s+(.+?)\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+    # "ocr <image>" / "read text in <image>" / "extract text from <image>"
+    _OCR_RE = _re.compile(
+        r"^\s*(?:ocr|read\s+(?:the\s+)?text\s+(?:in|from|on)|extract\s+text\s+"
+        r"(?:from|in))\s+(.+?)\s*\??\s*$",
+        _re.IGNORECASE,
+    )
     # "mean of <column> in <folder>" (+ optional "and save to <file>").
     # Groups: (1) aggregation word, (2) column, (3) the rest (folder phrase,
     # possibly with a trailing save clause parsed by _SAVE_CLAUSE_RE).
@@ -7144,6 +7162,14 @@ class CouncilConsole(tk.Tk):
         m = self._CORRELATIONS_RE.match(single_line)
         if m:
             self._correlations_response((m.group(1) or "").strip().strip("'\"`"))
+            return True
+        m = self._IMAGE_STATS_RE.match(single_line)
+        if m:
+            self._image_stats_response(m.group(1).strip().strip("'\"`"))
+            return True
+        m = self._OCR_RE.match(single_line)
+        if m:
+            self._ocr_response(m.group(1).strip().strip("'\"`"))
             return True
         m = self._FOLDER_AGG_RE.match(single_line)
         if m:
@@ -8005,6 +8031,125 @@ class CouncilConsole(tk.Tk):
                          f"{str(r['col_b'])[:23]:<24}"
                          f"{float(r['corr']):>8.3f}")
         self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
+    def _resolve_image_target(self, target: str):
+        """Resolve a target string to (folder, file). Returns (Path|None,
+        Path|None): a directory of images, or a single image file."""
+        import image_stats as _ims
+        import data_index as _di
+        t = (target or "").strip().strip("'\"`")
+        try:
+            din = _di.input_dir(VAULT_DIR)
+        except Exception:
+            din = VAULT_DIR / "data_in"
+        if not t:
+            return (din if din.exists() else None), None
+        p = Path(t).expanduser()
+        if p.is_absolute():
+            if p.is_dir():
+                return p, None
+            if p.is_file():
+                return None, p
+        for base in (din, VAULT_DIR):
+            cand = base / t
+            if cand.is_dir():
+                return cand, None
+            if cand.is_file():
+                return None, cand
+        # bare image name anywhere under data_in
+        try:
+            for q in din.rglob("*"):
+                if (q.is_file() and q.name.lower() == t.lower()
+                        and q.suffix.lower() in _ims._IMAGE_SUFFIXES):
+                    return None, q
+        except Exception:
+            pass
+        return None, None
+
+    def _image_stats_response(self, target: str):
+        """Per-image pixel statistics, or a folder rollup. Model-free."""
+        import image_stats as _ims
+        root, fpath = self._resolve_image_target(target)
+        if root is None and fpath is None:
+            self._append_transcript(
+                "Writer", f"Could not find an image or image folder for "
+                f"{target!r}.", "final")
+            self._set_status("● idle")
+            return
+        self._set_status("● analysing images…", "#cba6f7")
+        if fpath is not None:
+            s = _ims.image_pixel_stats(fpath)
+            if "error" in s:
+                self._append_transcript("Writer", s["error"], "final")
+                self._set_status("● idle")
+                return
+            lines = [f"Pixel statistics for {s['file']}:",
+                     f"  {s['width']}x{s['height']} px  ({s['megapixels']} MP, "
+                     f"{s['mode']}, {s['format']}, {s.get('size_kb')} KB)",
+                     f"  brightness (0-255): {s['brightness']}   "
+                     f"contrast: {s['contrast']}"]
+            for c, cs in s.get("channels", {}).items():
+                lines.append(f"  {c}: mean {cs['mean']:>6}  std {cs['std']:>6}  "
+                             f"min {cs['min']:>3}  max {cs['max']:>3}")
+            dc = s.get("dominant_colors") or []
+            if dc:
+                lines.append("  dominant colours: " + ", ".join(
+                    f"rgb{tuple(x['rgb'])} ({int(x['fraction']*100)}%)"
+                    for x in dc[:5]))
+            self._append_transcript("Writer", "\n".join(lines), "final")
+            self._set_status("● idle")
+            return
+        rep = _ims.aggregate_image_folder(root)
+        if rep.get("count", 0) == 0:
+            self._append_transcript(
+                "Writer", f"No images found under {root.name}/.", "final")
+            self._set_status("● idle")
+            return
+        if "error" in rep:
+            self._append_transcript("Writer", str(rep["error"]), "final")
+            self._set_status("● idle")
+            return
+
+        def _fmt(d):
+            return (f"mean {d['mean']}  (min {d['min']} – max {d['max']})"
+                    if isinstance(d, dict) else "n/a")
+        lines = [f"Image folder stats for {root.name}/ "
+                 f"({rep['count']} image(s)):",
+                 "  formats: " + ", ".join(f"{k} x{v}"
+                                           for k, v in rep["by_format"].items()),
+                 f"  width:  {_fmt(rep.get('width'))}",
+                 f"  height: {_fmt(rep.get('height'))}",
+                 f"  brightness: {_fmt(rep.get('brightness'))}",
+                 f"  contrast:   {_fmt(rep.get('contrast'))}",
+                 f"  darkest: {rep.get('darkest')}   "
+                 f"brightest: {rep.get('brightest')}"]
+        if rep.get("truncated"):
+            lines.append("  (capped at 500 images)")
+        self._append_transcript("Writer", "\n".join(lines), "final")
+        self._set_status("● idle")
+
+    def _ocr_response(self, target: str):
+        """Extract text rendered inside an image (charts, scanned tables)."""
+        import image_stats as _ims
+        _root, fpath = self._resolve_image_target(target)
+        if fpath is None:
+            self._append_transcript(
+                "Writer", f"Could not find an image named {target!r}.", "final")
+            self._set_status("● idle")
+            return
+        self._set_status("● reading image text…", "#cba6f7")
+        rep = _ims.ocr_image(fpath)
+        if "error" in rep:
+            self._append_transcript("Writer", str(rep["error"]), "final")
+        elif not rep.get("text"):
+            self._append_transcript(
+                "Writer", f"No text found in {rep.get('file', target)}.", "final")
+        else:
+            self._append_transcript(
+                "Writer",
+                f"Text extracted from {rep['file']} ({rep['chars']} chars):\n\n"
+                + rep["text"], "final")
         self._set_status("● idle")
 
     def _clean_folder_phrase(self, s: str) -> str:

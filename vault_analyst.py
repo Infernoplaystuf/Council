@@ -3745,6 +3745,22 @@ def execute_pandas_code(
         return p.open("r", encoding=(encoding or "utf-8"),
                       errors=(errors or "replace"), newline=newline)
 
+    def _sb_image_stats(path):
+        """Per-image pixel statistics (read-only, path-contained)."""
+        try:
+            import image_stats as _ims
+        except Exception as _e:
+            return {"error": f"image_stats unavailable: {_e!r}"}
+        return _ims.image_pixel_stats(_sb_resolve_file(path))
+
+    def _sb_aggregate_images(folder=None):
+        """Pixel-stat rollup over every image in a data folder (read-only)."""
+        try:
+            import image_stats as _ims
+        except Exception as _e:
+            return {"error": f"image_stats unavailable: {_e!r}"}
+        return _ims.aggregate_image_folder(_sb_resolve_dir(folder))
+
     def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
         if name.split(".")[0] == "pandas":
             return _budgeted_pd
@@ -3810,6 +3826,8 @@ def execute_pandas_code(
         "list_dir":           _sb_list_dir,
         "read_text":          _sb_read_text,
         "read_lines":         _sb_read_lines,
+        "image_pixel_stats":  _sb_image_stats,
+        "aggregate_image_folder": _sb_aggregate_images,
         "folder_file_counts": folder_file_counts,
         "list_csv_files": list_csv_files,
         "find_column_case_insensitive": find_column_case_insensitive,
