@@ -6939,6 +6939,29 @@ class CouncilConsole(tk.Tk):
         r"(?:name|filename|file\s+name|folder(?:\s+name)?|path)\s*\??\s*$",
         _re.IGNORECASE,
     )
+    # Field:value cross-file search. "find files with the same <field> as
+    # <file>" (extract the field's value from that file, then search); "find
+    # files with <value> as the <field>"; "find files where the <field> is
+    # <value>". Checked before the entity/vault routes.
+    _FILES_SAME_FIELD_RE = _re.compile(
+        r"^\s*(?:find|list|show(?:\s+me)?|which|what|get)?\s*(?:all\s+|the\s+)?"
+        r"files?\s+(?:that\s+have\s+|with\s+|having\s+|sharing\s+)"
+        r"the\s+same\s+(.+?)\s+(?:as|to)\s+(.+?)\s*\??\s*$",
+        _re.IGNORECASE,
+    )                                                   # (field, file_ref)
+    _FILES_VALUE_AS_FIELD_RE = _re.compile(
+        r"^\s*(?:find|list|show(?:\s+me)?|which|what|get)?\s*(?:all\s+|the\s+)?"
+        r"files?\s+(?:that\s+have\s+|with\s+|having\s+|listing\s+)"
+        r"['\"]?(.+?)['\"]?\s+(?:listed\s+|shown\s+|set\s+|marked\s+)?"
+        r"(?:as|for)\s+(?:the\s+|a\s+|an\s+|their\s+)?(.+?)\s*\??\s*$",
+        _re.IGNORECASE,
+    )                                                   # (value, field)
+    _FILES_FIELD_IS_VALUE_RE = _re.compile(
+        r"^\s*(?:find|list|show(?:\s+me)?|which|what|get)?\s*(?:all\s+|the\s+)?"
+        r"files?\s+(?:where|whose|with)\s+(?:the\s+)?(.+?)\s+"
+        r"(?:is|are|=|equals?)\s+['\"]?(.+?)['\"]?\s*\??\s*$",
+        _re.IGNORECASE,
+    )                                                   # (field, value)
     # Layered vault content search: "search all files in the vault for X",
     # "which files mention X", "find references to X". Distinct from _GREP_RE
     # (a folder-scoped grep) — this requires the all-files / vault / which-files
@@ -7313,6 +7336,21 @@ class CouncilConsole(tk.Tk):
         if m:
             target = self._FOLDER_NOISE_RE.sub("", (m.group(1) or "").strip().strip("'\"`")).strip()
             self._tree_response(target)
+            return True
+        m = self._FILES_SAME_FIELD_RE.match(single_line)
+        if m:
+            self._same_field_response(m.group(1).strip().strip("'\"`"),
+                                      m.group(2).strip().strip("'\"`"))
+            return True
+        m = self._FILES_FIELD_IS_VALUE_RE.match(single_line)
+        if m:
+            self._field_value_response(m.group(1).strip().strip("'\"`"),
+                                       m.group(2).strip().strip("'\"`"))
+            return True
+        m = self._FILES_VALUE_AS_FIELD_RE.match(single_line)
+        if m:
+            self._field_value_response(m.group(2).strip().strip("'\"`"),
+                                       m.group(1).strip().strip("'\"`"))
             return True
         m = (self._FILES_FOR_ENTITY_RE.match(single_line)
              or self._FILES_WITH_NAME_RE.match(single_line))
@@ -7760,6 +7798,118 @@ class CouncilConsole(tk.Tk):
             text = _vt.tree(root, max_depth=3, show_files=False)
             self._append_transcript("Writer", text, "final")
         self._set_status("● idle")
+
+    def _last_referenced_file(self):
+        """The most-recently referenced/listed file's absolute path, or None.
+        Used to resolve 'the same X as the file' back-references."""
+        m = getattr(self, "_referenced_files", None)
+        if not m:
+            return None
+        try:
+            return next(reversed(list(m.values())))
+        except Exception:
+            return None
+
+    def _field_value_response(self, field: str, value: str):
+        """Find every file where the labeled FIELD has VALUE (field-aware:
+        a matching column, or the label + value on/near the same line). No
+        model. Answers 'find all files with Bob as the point of contact'."""
+        import field_search as _fs
+        import data_index as _di
+        field = (field or "").strip().strip("'\"`")
+        value = (value or "").strip().strip("'\"`")
+        if not field or not value:
+            self._append_transcript(
+                "Writer", "Tell me both the field and the value — e.g. "
+                "'find files with Bob as the point of contact'.", "final")
+            self._set_status("● idle")
+            return
+        try:
+            root = _di.input_dir(VAULT_DIR)
+        except Exception:
+            root = VAULT_DIR / "data_in"
+        self._set_status("● searching fields…", "#cba6f7")
+
+        def _worker():
+            try:
+                hits = _fs.find_files_with_field_value(root, field, value)
+                err = None
+            except Exception as exc:
+                hits, err = [], repr(exc)
+
+            def _apply():
+                if err:
+                    self._append_transcript(
+                        "Writer", f"Field search failed: {err}", "final")
+                    self._set_status("● idle")
+                    return
+                if not hits:
+                    self._append_transcript(
+                        "Writer",
+                        f"No files found where {field!r} is {value!r}.", "final")
+                    self._set_status("● idle")
+                    return
+                self._remember_files([h[0] for h in hits])
+                lines = [f"{len(hits)} file(s) where {field!r} is {value!r}:"]
+                for pth, ctx in hits[:60]:
+                    try:
+                        rel = str(Path(pth).relative_to(root))
+                    except Exception:
+                        rel = Path(pth).name
+                    lines.append(f"  - {rel}   ({ctx})")
+                if len(hits) >= 500:
+                    lines.append("  … (capped)")
+                self._append_transcript("Writer", "\n".join(lines), "final")
+                self._set_status("● idle")
+            self.after(0, _apply)
+
+        import threading as _th
+        _th.Thread(target=_worker, daemon=True).start()
+
+    def _same_field_response(self, field: str, file_ref: str):
+        """'find files with the same <field> as <file>': resolve the file
+        (named, or 'the file' = the last one referenced), read its <field>
+        value, then run the field:value search."""
+        import field_search as _fs
+        field = (field or "").strip().strip("'\"`")
+        file_ref = (file_ref or "").strip().strip("'\"`")
+        _generic = ("the file", "it", "this file", "that file",
+                    "the above file", "the previous file", "the last file",
+                    "this", "that")
+        path = None
+        if file_ref.lower() in _generic:
+            path = self._last_referenced_file()
+        else:
+            rp = _resolve_referenced_path(file_ref)
+            if rp and Path(rp).is_file():
+                path = rp
+            else:
+                path = self._last_referenced_file()
+        if not path:
+            self._append_transcript(
+                "Writer",
+                f"I couldn't tell which file you mean — name it, e.g. 'find "
+                f"files with the same {field or 'point of contact'} as "
+                "report.csv'.", "final")
+            self._set_status("● idle")
+            return
+        try:
+            vals = _fs.extract_field_value(path, field)
+        except Exception:
+            vals = None
+        if not vals:
+            self._append_transcript(
+                "Writer",
+                f"I couldn't find a {field!r} value in {Path(path).name}.",
+                "final")
+            self._set_status("● idle")
+            return
+        value = vals[0]
+        self._append_transcript(
+            "Council",
+            f"{Path(path).name} has {field} = {value!r}; finding other files "
+            "with the same value…", "observation")
+        self._field_value_response(field, value)
 
     def _remember_files(self, paths, *, cap: int = 800):
         """Record files just surfaced to the user (absolute paths) so a

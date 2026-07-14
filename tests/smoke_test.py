@@ -4046,6 +4046,64 @@ def test_referenced_file_followup() -> None:
             cge._register_referenced_files(None)
 
 
+def test_field_value_search() -> None:
+    """Field:value cross-file search — extract a labeled field's value from a
+    file (text 'Field: value', a heading, or a CSV column) and find files where
+    that field has that value (field-aware, so a stray mention is not a match).
+    Plus the command routing for all three phrasings."""
+    try:
+        import field_search as fs
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"modules importable (skipped: {exc!r})", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "report1.txt").write_text("Project A\nPoint of Contact: Bob\n")
+        (root / "report2.md").write_text("# B\n\nPoint of Contact\nBob Smith\n")
+        (root / "report3.txt").write_text("Point of Contact: Alice\n")
+        (root / "roster.csv").write_text(
+            "task,Point of Contact\nA,Bob\nB,Carol\n")
+        (root / "notes.txt").write_text("Bob had lunch, not a contact field.\n")
+        _check("extract 'Field: value' from text",
+               fs.extract_field_value(root / "report1.txt",
+                                      "point of contact") == ["Bob"])
+        _check("extract heading + next line",
+               fs.extract_field_value(root / "report2.md",
+                                      "point of contact") == ["Bob Smith"])
+        _check("extract a CSV column's values",
+               fs.extract_field_value(root / "roster.csv",
+                                      "point of contact") == ["Bob", "Carol"])
+        names = sorted(Path(p).name for p, _c
+                       in fs.find_files_with_field_value(
+                           root, "point of contact", "bob"))
+        _check("field:value finds text + heading + CSV-column hits",
+               names == ["report1.txt", "report2.md", "roster.csv"])
+        _check("field:value excludes a different value (Alice)",
+               "report3.txt" not in names)
+        _check("field:value excludes a stray non-field mention",
+               "notes.txt" not in names)
+
+    C = cge.CouncilConsole
+
+    def groups(rx, text):
+        r = rx.match(text)
+        return tuple(g.strip() for g in r.groups()) if r else None
+
+    _check("'files with bob listed as the point of contact' -> (value, field)",
+           groups(C._FILES_VALUE_AS_FIELD_RE,
+                  "find all files with bob listed as the point of contact")
+           == ("bob", "point of contact"))
+    _check("'files where the point of contact is bob' -> (field, value)",
+           groups(C._FILES_FIELD_IS_VALUE_RE,
+                  "find files where the point of contact is bob")
+           == ("point of contact", "bob"))
+    _check("'files with the same point of contact as report.csv' -> (field, file)",
+           groups(C._FILES_SAME_FIELD_RE,
+                  "find all files with the same point of contact as report.csv")
+           == ("point of contact", "report.csv"))
+
+
 def test_data_preview_text() -> None:
     """_data_preview_text gives a model-free (schema, rows) preview of a data
     file with bounded reads, and falls back to a text peek for non-tabular
@@ -4759,6 +4817,8 @@ def main() -> int:
          test_files_associated_with_entity)
     _run("follow-up file reference resolves + injects (session memory)",
          test_referenced_file_followup)
+    _run("field:value cross-file search + extraction (point of contact)",
+         test_field_value_search)
     _run("tool forge: model writes + validates + saves a tool",
          test_tool_forge_generate)
     _run("dataset digest (expert grounding) + tool-create routing",
