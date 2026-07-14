@@ -7839,8 +7839,13 @@ class CouncilConsole(tk.Tk):
         self._set_status("● searching fields…", "#cba6f7")
 
         def _worker():
+            def _prog(i, total):
+                if total:
+                    self.after(0, lambda i=i, t=total: self._set_status(
+                        f"● searching fields… {i}/{t}", "#cba6f7"))
             try:
-                hits = _fs.find_files_with_field_value(root, field, value)
+                hits = _fs.find_files_with_field_value(
+                    root, field, value, on_progress=_prog)
                 err = None
             except Exception as exc:
                 hits, err = [], repr(exc)

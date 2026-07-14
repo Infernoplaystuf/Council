@@ -4083,6 +4083,36 @@ def test_field_value_search() -> None:
                "report3.txt" not in names)
         _check("field:value excludes a stray non-field mention",
                "notes.txt" not in names)
+        # A CSV that lacks the field column is skipped HEADER-FIRST (no full
+        # read) and must not match even though it mentions the value.
+        (root / "unrelated.csv").write_text("id,name\n1,Bob\n2,Carol\n")
+        names2 = sorted(Path(p).name for p, _c
+                        in fs.find_files_with_field_value(
+                            root, "point of contact", "bob"))
+        _check("field:value skips a CSV without the field column",
+               "unrelated.csv" not in names2)
+
+    # Scale: past the old silent 1000-file cap the search still scans every
+    # file, still finds a match beyond #1000, and reports progress to the UI.
+    with tempfile.TemporaryDirectory() as td2:
+        big = Path(td2)
+        for i in range(1100):
+            (big / f"f{i:04d}.txt").write_text(f"Owner: person{i}\nnotes\n")
+        (big / "f1090.txt").write_text("Point of Contact: Bob\n")
+        seen = {"last": None, "calls": 0}
+
+        def _prog(i, total):
+            seen["last"] = (i, total)
+            seen["calls"] += 1
+
+        hits = fs.find_files_with_field_value(
+            big, "point of contact", "bob", on_progress=_prog)
+        _check("field:value scans ALL files (no silent 1000-file cap)",
+               seen["last"] == (1100, 1100))
+        _check("field:value finds a match beyond file #1000",
+               any("f1090.txt" in p for p, _c in hits))
+        _check("field:value reports progress for the UI",
+               seen["calls"] >= 2)
 
     C = cge.CouncilConsole
 

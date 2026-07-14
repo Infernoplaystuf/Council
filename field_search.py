@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 _TABULAR = {".csv", ".tsv", ".xlsx", ".xls", ".parquet"}
 _TEXTUAL = {".txt", ".md", ".markdown", ".rst", ".log", ".json", ".jsonl",
@@ -95,11 +95,70 @@ def extract_field_value(path: Any, field: str,
     return None
 
 
+def _table_columns(p: Path) -> List[str]:
+    """The column names of a tabular file WITHOUT reading all its rows — the
+    cheap first pass so a CSV that lacks the field column is skipped without a
+    full read (the key optimisation for a big vault)."""
+    suf = p.suffix.lower()
+    try:
+        import pandas as pd
+        if suf in (".csv", ".tsv"):
+            sep = "\t" if suf == ".tsv" else ","
+            return list(pd.read_csv(p, sep=sep, nrows=0,
+                                    on_bad_lines="skip").columns)
+        if suf in (".xlsx", ".xls"):
+            return list(pd.read_excel(p, nrows=0).columns)
+        if suf == ".parquet":
+            import pyarrow.parquet as _pq  # type: ignore
+            return list(_pq.ParquetFile(str(p)).schema.names)
+    except Exception:
+        pass
+    try:
+        import vault_analyst as va
+        return list(va.read_table(p).columns)
+    except Exception:
+        return []
+
+
+def _table_column_values(p: Path, col: str) -> List[str]:
+    """Read ONLY the given column of a tabular file (not the whole frame)."""
+    suf = p.suffix.lower()
+    try:
+        import pandas as pd
+        if suf in (".csv", ".tsv"):
+            sep = "\t" if suf == ".tsv" else ","
+            s = pd.read_csv(p, sep=sep, usecols=[col],
+                            on_bad_lines="skip")[col]
+            return s.dropna().astype(str).tolist()
+        if suf in (".xlsx", ".xls"):
+            s = pd.read_excel(p, usecols=[col])[col]
+            return s.dropna().astype(str).tolist()
+    except Exception:
+        pass
+    try:
+        import vault_analyst as va
+        df = va.read_table(p)
+        if col in df.columns:
+            return df[col].dropna().astype(str).tolist()
+    except Exception:
+        pass
+    return []
+
+
 def find_files_with_field_value(root: Any, field: str, value: str, *,
-                                limit: int = 500, max_files: int = 1000
+                                limit: int = 5000, max_files: int = 100000,
+                                text_max_chars: int = 200000,
+                                on_progress: Optional[Callable[[int, int],
+                                                               None]] = None
                                 ) -> List[Tuple[str, str]]:
     """Files under ``root`` where ``field`` is associated with ``value``.
-    Returns ``[(abs_path, context)]``. Field-aware (see module docstring)."""
+    Returns ``[(abs_path, context)]``. Field-aware (see module docstring).
+
+    Scales to large vaults: tabular files are checked HEADER-FIRST (only the
+    matching column is read, and files without the column are skipped without a
+    full read); text reads are bounded; ``max_files`` defaults high enough not
+    to silently truncate. ``on_progress(scanned, total)`` is called ~every 100
+    files so the UI can show progress."""
     root = Path(root)
     fn = _norm(field)
     vn = str(value or "").strip().lower()
@@ -109,13 +168,27 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
         import conversation_logger as _cl
     except Exception:
         _cl = None
+    try:
+        files = [p for p in sorted(root.rglob("*"))
+                 if p.is_file() and not p.name.startswith(".")]
+    except Exception:
+        files = []
+    files = files[:max_files]
+    total = len(files)
     out: List[Tuple[str, str]] = []
-    scanned = 0
-    for p in sorted(root.rglob("*")):
-        if scanned >= max_files or len(out) >= limit:
+    try:
+        import vault_analyst as va
+        _match_col = va.match_column_name
+    except Exception:
+        _match_col = None
+    for i, p in enumerate(files):
+        if on_progress is not None and i % 100 == 0:
+            try:
+                on_progress(i, total)
+            except Exception:
+                pass
+        if len(out) >= limit:
             break
-        if not p.is_file() or p.name.startswith("."):
-            continue
         if _cl is not None:
             try:
                 if _cl.is_protected_path(p, root):
@@ -125,27 +198,32 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
         suf = p.suffix.lower()
         try:
             if suf in _TABULAR:
-                scanned += 1
-                import vault_analyst as va
-                df = va.read_table(p)
-                col = va.match_column_name(df.columns, field) if fn else None
-                if col is not None:
-                    ser = df[col].astype(str).str.lower()
-                    if ser.str.contains(re.escape(vn), regex=True,
-                                        na=False).any():
-                        out.append((str(p), f"column '{col}' = '{value}'"))
+                cols = _table_columns(p)
+                col = (_match_col(cols, field)
+                       if (cols and _match_col and fn) else None)
+                if col is None:
+                    continue                       # no such column — no full read
+                vals = _table_column_values(p, col)
+                if any(vn in v.lower() for v in vals):
+                    out.append((str(p), f"column '{col}' = '{value}'"))
             elif suf in _TEXTUAL or suf in _EXTRACTABLE:
-                scanned += 1
-                text = _read_text(p)
+                if not fn:
+                    continue
+                text = _read_text(p, max_chars=text_max_chars)
                 if not text:
                     continue
                 lines = text.splitlines()
-                for i, line in enumerate(lines):
+                for k, line in enumerate(lines):
                     if fn in _norm(line):
-                        window = " ".join(lines[i:i + 3]).lower()
+                        window = " ".join(lines[k:k + 3]).lower()
                         if vn in window:
                             out.append((str(p), line.strip()[:140]))
                             break
         except Exception:
             continue
+    if on_progress is not None:
+        try:
+            on_progress(total, total)
+        except Exception:
+            pass
     return out
