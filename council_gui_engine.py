@@ -639,24 +639,46 @@ def _name_matches_pattern(pat, filename: str) -> bool:
     return bool(pat.fullmatch(filename) or pat.fullmatch(stem))
 
 
-def _norm_token(s) -> str:
-    """Lower-case + drop every non-alphanumeric char, so 'Job 317', 'job_317',
-    'job-317' and 'job317' all collapse to the same token for matching."""
-    return _re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
+def _tokenize_ident(s) -> list:
+    """Typed tokens from a name: numeric runs -> ('n', int) so LEADING ZEROS
+    don't matter (0317 == 317 == 00317), alpha runs -> ('a', str). Separators
+    (space / _ / - / . etc.) are dropped, so 'Job 317', 'job_0317', 'job-317'
+    and 'job317' all tokenize compatibly."""
+    out = []
+    for m in _re.finditer(r"[a-z]+|[0-9]+", str(s or "").lower()):
+        t = m.group(0)
+        out.append(("n", int(t)) if t.isdigit() else ("a", t))
+    return out
+
+
+def _ident_contains(seg_tokens, q_tokens) -> bool:
+    """True if ``q_tokens`` appears as a CONTIGUOUS sub-sequence of
+    ``seg_tokens`` — numeric tokens compared by VALUE, alpha by equality. So
+    'job 317' matches 'job_0317' and 'summary_job317' but NOT 'job 3170'
+    (317 != 3170) and not 'myjob317'."""
+    m = len(q_tokens)
+    if m == 0:
+        return False
+    for i in range(len(seg_tokens) - m + 1):
+        if seg_tokens[i:i + m] == q_tokens:
+            return True
+    return False
 
 
 def _files_associated_with(in_dir, entity, *, limit: int = 3000):
-    """Files under ``in_dir`` ASSOCIATED with ``entity``: the entity token
-    (separator-insensitive) appears either in a FOLDER segment of the file's
-    path OR in the FILENAME. Answers 'how many files are associated with job
-    317' — a folder named `Job_317/` or a file `job317_data.csv` both count.
+    """Files under ``in_dir`` ASSOCIATED with ``entity``: the entity's typed
+    token sequence appears in a FOLDER segment of the file's path OR in the
+    FILENAME. Answers 'how many files are associated with job 317' — a folder
+    `Job_317/` or `Job_0317/` and a file `job317_data.csv` all count, but
+    `Job 318/` and `job 3170` do not. Numbers match by value (leading zeros
+    ignored).
 
     Returns a list of ``(abs_path, where)`` where ``where`` is 'folder' or
     'filename'. App-state / protected files (question_history.json, indices,
     conversation logs) are excluded. Pure + UI-free so it's unit-testable."""
     import os as _os
-    tok = _norm_token(entity)
-    if not tok:
+    q_tokens = _tokenize_ident(entity)
+    if not q_tokens:
         return []
     try:
         import conversation_logger as _cl
@@ -673,7 +695,8 @@ def _files_associated_with(in_dir, entity, *, limit: int = 3000):
                 rel_parts = Path(dp).relative_to(root).parts
             except Exception:
                 rel_parts = ()
-            folder_match = any(tok in _norm_token(seg) for seg in rel_parts)
+            folder_match = any(_ident_contains(_tokenize_ident(seg), q_tokens)
+                               for seg in rel_parts)
             for f in fn:
                 if f.startswith("."):
                     continue
@@ -684,7 +707,7 @@ def _files_associated_with(in_dir, entity, *, limit: int = 3000):
                             continue
                     except Exception:
                         pass
-                file_match = tok in _norm_token(f)
+                file_match = _ident_contains(_tokenize_ident(f), q_tokens)
                 if folder_match or file_match:
                     out.append((str(full),
                                 "filename" if file_match else "folder"))

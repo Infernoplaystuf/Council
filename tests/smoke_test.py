@@ -3957,10 +3957,12 @@ def test_files_associated_with_entity() -> None:
         return
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
-        (root / "Job_317_run").mkdir()
-        (root / "Job_317_run" / "a.csv").write_text("x\n1\n")
+        (root / "Job_0317_run").mkdir()                # zero-padded folder
+        (root / "Job_0317_run" / "a.csv").write_text("x\n1\n")
         (root / "Job 318").mkdir()
         (root / "Job 318" / "c.csv").write_text("x\n1\n")
+        (root / "Job_3170").mkdir()                     # 3170 != 317
+        (root / "Job_3170" / "d.csv").write_text("x\n1\n")
         (root / "job317_summary.pdf").write_text("pdf")
         (root / "part3170.csv").write_text("x\n1\n")
         (root / "agent_jobs.json").write_text("[]")
@@ -3969,11 +3971,15 @@ def test_files_associated_with_entity() -> None:
             return sorted(Path(f).name
                           for f, _w in cge._files_associated_with(root, entity))
         got = names("job 317")
-        _check("matches folder-name AND filename hits",
+        _check("matches folder-name AND filename hits (0317 folder counts)",
                got == ["a.csv", "job317_summary.pdf"])
         _check("separator-insensitive (job_317 / job317 == 'job 317')",
                names("job_317") == got and names("job317") == got)
+        _check("numeric-aware: 'job 0317' == 'job 317' == '317'",
+               names("job 0317") == got and names("317") == got)
         _check("excludes a different job's folder (318)", "c.csv" not in got)
+        _check("does NOT match job 3170 folder (317 != 3170)",
+               "d.csv" not in got)
         _check("does not over-match part3170", "part3170.csv" not in got)
         _check("excludes app-state files (agent_jobs.json)",
                "agent_jobs.json" not in got)
