@@ -4092,6 +4092,49 @@ def test_field_value_search() -> None:
         _check("field:value skips a CSV without the field column",
                "unrelated.csv" not in names2)
 
+    # Field-awareness: a name mentioned ELSEWHERE in the file must never be
+    # reported as the field's value (the value is read off the field itself,
+    # not from nearby lines), and the compare is token-aware, not substring.
+    with tempfile.TemporaryDirectory() as td3:
+        r = Path(td3)
+        r_txt = r / "reported.txt"
+        r_txt.write_text("Point of Contact: Bob\nReviewer: Alice\n"
+                         "Notes: Alice attended the review.\n")
+        (r / "heading.md").write_text("## Point of Contact\nBob Smith\n\n"
+                                      "Reviewer: Alice\n")
+        (r / "table.md").write_text("| Field | Value |\n|---|---|\n"
+                                    "| Point of Contact | Carol |\n")
+        (r / "bold.md").write_text("**Point of Contact:** Dave\n")
+        (r / "multi.txt").write_text("Point of Contact: Bob and Alice\n")
+        (r / "bobby.txt").write_text("Point of Contact: Bobby Jones\n")
+
+        def _n(field, value):
+            return sorted(Path(p).name for p, _c
+                          in fs.find_files_with_field_value(r, field, value))
+
+        alice = _n("point of contact", "alice")
+        _check("a name mentioned elsewhere is NOT the field's value",
+               "reported.txt" not in alice and "heading.md" not in alice)
+        _check("a genuinely listed second value still matches",
+               "multi.txt" in alice)
+        bob = _n("point of contact", "bob")
+        _check("the real field value still matches (inline + heading + multi)",
+               {"reported.txt", "heading.md", "multi.txt"} <= set(bob))
+        _check("token-aware: 'bob' does not match 'Bobby Jones'",
+               "bobby.txt" not in bob)
+        _check("markdown table '| Field | value |' is read",
+               "table.md" in _n("point of contact", "carol"))
+        _check("bold '**Field:**' label is read",
+               "bold.md" in _n("point of contact", "dave"))
+        _check("full-name query matches, wrong full name does not",
+               "heading.md" in _n("point of contact", "bob smith")
+               and "heading.md" not in _n("point of contact", "bob jones"))
+        _check("extract reads only the field's own value",
+               fs.extract_field_value(r_txt, "point of contact") == ["Bob"])
+        _check("extract splits a multi-value field",
+               fs.extract_field_value(r / "multi.txt",
+                                      "point of contact") == ["Bob", "Alice"])
+
     # Scale: past the old silent 1000-file cap the search still scans every
     # file, still finds a match beyond #1000, and reports progress to the UI.
     with tempfile.TemporaryDirectory() as td2:

@@ -28,13 +28,115 @@ _TEXTUAL = {".txt", ".md", ".markdown", ".rst", ".log", ".json", ".jsonl",
             ".ndjson", ".yaml", ".yml", ".html", ".htm", ".xml", ".ini",
             ".cfg", ".csv", ".tsv"}
 _EXTRACTABLE = {".pdf", ".docx"}
-_VALUE_LINE_RE = re.compile(r"[:\-–—=]\s*(.+)$")
+
+# A field label is followed by its value after ':' / '=' / a SPACED dash. The
+# dash must be spaced so hyphenated values ('Jean-Luc') are not split.
+_SEP_RE = re.compile(r"[:=]|(?<=\s)[-–—](?=\s)")
+_BULLET_RE = re.compile(r"^\s*(?:[-*•+]|\d+[.)])\s+")
+_EMPH_RE = re.compile(r"[*`]+")          # markdown emphasis; NOT '_' (_norm eats it)
+# One field may list several values: 'Bob, Alice', 'Bob and Alice', 'Bob; Alice'.
+_VAL_SPLIT_RE = re.compile(r"\s*(?:[,;/]|\band\b|&)\s*", re.I)
+# A markdown table separator row: |---|:--:|
+_RULE_RE = re.compile(r"^[\s:\-–—|]+$")
 
 
 def _norm(s) -> str:
     """Lower-case + collapse non-alphanumerics to single spaces (so 'Point of
     Contact', 'point_of_contact' and 'POINT-OF-CONTACT' compare equal)."""
     return re.sub(r"[^a-z0-9]+", " ", str(s or "").lower()).strip()
+
+
+def _label_is(text, fn: str) -> bool:
+    """True when ``text`` reads as the LABEL for field ``fn`` — not a sentence
+    that merely mentions it. ``fn`` must appear as a contiguous run of whole
+    tokens, and the text must be label-short (a heading/key, not prose). This
+    is what stops 'Bob met the point of contact yesterday' from being treated
+    as a 'Point of Contact' field."""
+    t = _norm(_EMPH_RE.sub("", _BULLET_RE.sub("", str(text or ""))))
+    if not t or not fn:
+        return False
+    tt, ft = t.split(), fn.split()
+    if len(tt) > len(ft) + 3:
+        return False
+    return any(tt[i:i + len(ft)] == ft for i in range(len(tt) - len(ft) + 1))
+
+
+def _split_kv(line: str):
+    """Split 'Key: value' on the FIRST separator -> (key, value), else None."""
+    s = _EMPH_RE.sub("", _BULLET_RE.sub("", line or "")).strip()
+    if not s:
+        return None
+    m = _SEP_RE.search(s)
+    if not m:
+        return None
+    return s[:m.start()].strip(), s[m.end():].strip()
+
+
+def _split_values(v: str):
+    """One field's value text -> the individual values it lists."""
+    out = []
+    for part in _VAL_SPLIT_RE.split(str(v or "")):
+        part = _EMPH_RE.sub("", part).strip().strip(".").strip()
+        if part:
+            out.append(part)
+    return out
+
+
+def _value_matches(field_value, query) -> bool:
+    """True when ``query`` names the same value as ``field_value``.
+
+    Token-aware, NOT substring: every token of the query must appear as a WHOLE
+    token of the field value. So 'Bob' matches 'Bob Smith', 'Smith, Bob' and
+    'bob.smith@x.com', but NOT 'Bobby'; and 'Bob Smith' needs both tokens."""
+    q = _norm(query).split()
+    if not q:
+        return False
+    v = set(_norm(field_value).split())
+    return all(t in v for t in q)
+
+
+def _field_values_in_text(text: str, fn: str, *, max_hits: int = 100):
+    """Every value ASSIGNED to field ``fn`` in ``text``.
+
+    Only the value side of the field is returned — never nearby text — which is
+    what makes a search field-aware. Handles 'Field: value', 'Field = value',
+    'Field - value', '**Field:** value', '- Field: value', a 'Field' heading
+    with the value on the next line, and markdown '| Field | value |'."""
+    vals = []
+    lines = text.splitlines()
+    for i, raw in enumerate(lines):
+        if len(vals) >= max_hits:
+            break
+        line = raw.strip()
+        if not line:
+            continue
+        # markdown table row: | Field | value |
+        if line.startswith("|") and line.count("|") >= 2:
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            for j, cell in enumerate(cells[:-1]):
+                if _label_is(cell, fn):
+                    nxt = cells[j + 1].strip()
+                    if nxt and not _RULE_RE.match(nxt):
+                        vals.extend(_split_values(nxt))
+            continue
+        kv = _split_kv(line)
+        if kv:
+            key, val = kv
+            if val and _label_is(key, fn):
+                vals.extend(_split_values(val))
+            continue
+        # heading style: the line IS the label -> value on the next non-empty
+        # line, unless that line starts a different field.
+        if _label_is(line, fn):
+            for j in range(i + 1, min(i + 4, len(lines))):
+                nxt = lines[j].strip()
+                if not nxt:
+                    continue
+                if nxt.startswith("|") or _split_kv(nxt):
+                    break        # the next field began; this heading has no value
+                vals.extend(_split_values(nxt))
+                break
+    return vals
 
 
 def _read_text(p: Path, max_chars: int = 400000) -> str:
@@ -83,16 +185,13 @@ def extract_field_value(path: Any, field: str,
     text = _read_text(p)
     if not text:
         return None
-    lines = text.splitlines()
-    for i, line in enumerate(lines):
-        if fn in _norm(line):
-            m = _VALUE_LINE_RE.search(line)
-            if m and m.group(1).strip():
-                return [m.group(1).strip()]
-            for j in range(i + 1, min(i + 3, len(lines))):
-                if lines[j].strip():
-                    return [lines[j].strip()]
-    return None
+    vals: List[str] = []
+    for v in _field_values_in_text(text, fn):
+        if v not in vals:
+            vals.append(v)
+        if len(vals) >= max_values:
+            break
+    return vals or None
 
 
 def _table_columns(p: Path) -> List[str]:
@@ -204,7 +303,7 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
                 if col is None:
                     continue                       # no such column — no full read
                 vals = _table_column_values(p, col)
-                if any(vn in v.lower() for v in vals):
+                if any(_value_matches(v, value) for v in vals):
                     out.append((str(p), f"column '{col}' = '{value}'"))
             elif suf in _TEXTUAL or suf in _EXTRACTABLE:
                 if not fn:
@@ -212,13 +311,10 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
                 text = _read_text(p, max_chars=text_max_chars)
                 if not text:
                     continue
-                lines = text.splitlines()
-                for k, line in enumerate(lines):
-                    if fn in _norm(line):
-                        window = " ".join(lines[k:k + 3]).lower()
-                        if vn in window:
-                            out.append((str(p), line.strip()[:140]))
-                            break
+                for v in _field_values_in_text(text, fn):
+                    if _value_matches(v, value):
+                        out.append((str(p), f"{field}: {v}"[:140]))
+                        break
         except Exception:
             continue
     if on_progress is not None:
