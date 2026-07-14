@@ -3685,6 +3685,66 @@ def execute_pandas_code(
             return []
         return sorted(x.name for x in d.iterdir())
 
+    # ── Safe, READ-ONLY file reading ─────────────────────────────────────
+    # Model-written tools reach for `open(path)` and manual decoding, which
+    # used to fail with "name 'open' is not defined" (no builtin) and
+    # UnicodeDecodeError (wrong encoding). These give a bounded, encoding-safe,
+    # path-contained way to read files WITHOUT any write/delete surface.
+    def _sb_resolve_file(path) -> Path:
+        p = Path(str(path)).expanduser()
+        if not p.is_absolute():
+            for root in normalized_folders:
+                cand = Path(str(root)) / p
+                if cand.exists():
+                    p = cand
+                    break
+            else:
+                p = Path(str(normalized_folders[0])) / p
+        p = p.resolve()
+        for root in normalized_folders:
+            try:
+                p.relative_to(Path(str(root)).resolve())
+                return p
+            except ValueError:
+                continue
+        raise PermissionError(
+            f"file access is blocked outside the data folders; {path!r} is "
+            "outside them")
+
+    def _sb_read_text(path, max_chars=200000, encoding="utf-8") -> str:
+        """Read a text file: encoding-robust (never raises UnicodeDecodeError),
+        size-bounded, read-only, within the data folders."""
+        p = _sb_resolve_file(path)
+        if not p.is_file():
+            return ""
+        try:
+            with p.open("rb") as _f:
+                data = _f.read(int(max_chars) + 1)
+        except Exception:
+            return ""
+        return data[:int(max_chars)].decode(encoding or "utf-8",
+                                            errors="replace")
+
+    def _sb_read_lines(path, max_lines=10000, max_chars=1000000) -> list:
+        return _sb_read_text(path, max_chars=max_chars).splitlines()[
+            :int(max_lines)]
+
+    def _sb_open(path, mode="r", buffering=-1, encoding=None, errors=None,
+                 newline=None):
+        """Read-ONLY replacement for the builtin open(): writing/appending is
+        blocked, reads are contained to the data folders, and text mode defaults
+        to encoding-robust decoding so tools don't hit UnicodeDecodeError."""
+        m = str(mode)
+        if any(c in m for c in ("w", "a", "x", "+")):
+            raise PermissionError(
+                "open: writing is blocked in the sandbox — only read modes "
+                "are allowed")
+        p = _sb_resolve_file(path)
+        if "b" in m:
+            return p.open("rb")
+        return p.open("r", encoding=(encoding or "utf-8"),
+                      errors=(errors or "replace"), newline=newline)
+
     def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
         if name.split(".")[0] == "pandas":
             return _budgeted_pd
@@ -3714,6 +3774,9 @@ def execute_pandas_code(
         # `getattr(df, "shape")`, `type(x).__name__`, etc. Without these
         # in builtins the sandbox raises NameError mid-snippet and the
         # analyst silently falls back to model freeform (= wrong answer).
+        # Read-only file open (write/append modes refused, path-contained,
+        # encoding-robust) so `open(path)` works in model-written tools.
+        "open": _sb_open,
         "getattr": _guarded_getattr, "hasattr": hasattr,
         "type": type, "repr": repr, "format": format, "hash": hash,
         "id": id, "callable": callable, "vars": vars, "dir": dir,
@@ -3745,6 +3808,8 @@ def execute_pandas_code(
         "count_files":        _sb_count_files,
         "count_folders":      _sb_count_folders,
         "list_dir":           _sb_list_dir,
+        "read_text":          _sb_read_text,
+        "read_lines":         _sb_read_lines,
         "folder_file_counts": folder_file_counts,
         "list_csv_files": list_csv_files,
         "find_column_case_insensitive": find_column_case_insensitive,

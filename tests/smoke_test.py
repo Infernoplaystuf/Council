@@ -3764,6 +3764,73 @@ def test_dataset_digest_and_tool_routing() -> None:
            C._TOOL_CREATE_RE.match("what tools do i have") is None)
 
 
+def test_sandbox_readonly_file_read() -> None:
+    """The analyst / tool sandbox provides a READ-ONLY open() + read_text():
+    open(path) reads (encoding-safe), write/append modes are BLOCKED with no
+    file written, reads outside the data folders are blocked, and read_text
+    never raises on bad encoding. This is what unblocks model-written tools that
+    hit \"'open' is not defined\" and UnicodeDecodeError."""
+    import vault_analyst as va
+    with tempfile.TemporaryDirectory() as td:
+        folder = Path(td)
+        (folder / "note.txt").write_text("hello bacon\n")
+        (folder / "bad.txt").write_bytes(b"caf\xe9 \xff\xfe\n")  # invalid utf-8
+        df, _m = va.execute_pandas_code(
+            "with open(Path(DATA_FOLDER)/'note.txt') as f:\n"
+            "    t = f.read()\n"
+            "result_df = pd.DataFrame([{'ok': 'bacon' in t}])", [folder])
+        _check("read-only open() reads a text file",
+               df is not None and bool(df.iloc[0]["ok"]))
+        d2, _m2 = va.execute_pandas_code(
+            "result_df = pd.DataFrame([{'n': len(read_text('bad.txt'))}])",
+            [folder])
+        _check("read_text is encoding-safe (no UnicodeDecodeError)",
+               d2 is not None and int(d2.iloc[0]["n"]) > 0)
+        d3, m3 = va.execute_pandas_code(
+            "open(str(Path(DATA_FOLDER)/'X.txt'),'w').write('x')\n"
+            "result_df=None", [folder])
+        _check("open() in write mode is blocked",
+               d3 is None and "blocked" in str(m3).lower())
+        _check("no file written by a blocked open('w')",
+               not (folder / "X.txt").exists())
+        outside = (Path(td) / "..").resolve() / "evil.txt"
+        d4, m4 = va.execute_pandas_code(
+            f"open(r'{outside.as_posix()}')\nresult_df=None", [folder])
+        _check("open() outside the data folders is blocked",
+               d4 is None and "blocked" in str(m4).lower())
+
+
+def test_tool_forge_self_correction() -> None:
+    """generate_tool test-runs the saved tool and, on a runtime error, feeds the
+    error back to the model to fix — a bounded self-correction loop."""
+    try:
+        import tool_forge as tf
+        import app_built_tools as abt
+    except Exception as exc:  # pragma: no cover
+        _check(f"tool_forge importable (skipped: {exc!r})", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td) / "vault"
+        (vault / "data_in").mkdir(parents=True)
+        (vault / "data_in" / "a.csv").write_text("x\n1\n")
+        calls = {"n": 0}
+
+        def flaky(_prompt):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return "def compute_answer():\n    return undefined_name_here\n"
+            return "def compute_answer():\n    return 42\n"
+        ok, _msg, name, _code = tf.generate_tool("compute the answer", flaky,
+                                                 vault_dir=vault)
+        _check("self-correction retried after the runtime error",
+               calls["n"] == 2)
+        _check("self-correction ended with a working tool",
+               ok and name == "compute_answer")
+        rdf, _r = abt.run_tool(name, {}, vault_dir=vault)
+        _check("the corrected tool returns the right value",
+               rdf is not None and int(rdf.iloc[0]["result"]) == 42)
+
+
 def test_data_preview_text() -> None:
     """_data_preview_text gives a model-free (schema, rows) preview of a data
     file with bounded reads, and falls back to a text peek for non-tabular
@@ -4477,6 +4544,10 @@ def main() -> int:
          test_tool_forge_generate)
     _run("dataset digest (expert grounding) + tool-create routing",
          test_dataset_digest_and_tool_routing)
+    _run("sandbox read-only open() + read_text() (encoding-safe)",
+         test_sandbox_readonly_file_read)
+    _run("tool forge self-correction (test-run + fix loop)",
+         test_tool_forge_self_correction)
     _run("data preview (model-free schema + rows)",
          test_data_preview_text)
     _run("error coaching (plain-language + one-click fix)",
