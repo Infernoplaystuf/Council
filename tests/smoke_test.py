@@ -3945,6 +3945,57 @@ def test_feature_detect() -> None:
         _check("detects the 3 dark features", r2["count"] == 3)
 
 
+def test_files_associated_with_entity() -> None:
+    """'how many files are associated with job 317' matches files whose FOLDER
+    name OR FILE name includes the entity token (separator-insensitive),
+    excludes app-state files and false-positives, and does NOT hijack the plain
+    file-count census."""
+    try:
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_gui_engine importable (skipped: {exc!r})", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        (root / "Job_317_run").mkdir()
+        (root / "Job_317_run" / "a.csv").write_text("x\n1\n")
+        (root / "Job 318").mkdir()
+        (root / "Job 318" / "c.csv").write_text("x\n1\n")
+        (root / "job317_summary.pdf").write_text("pdf")
+        (root / "part3170.csv").write_text("x\n1\n")
+        (root / "agent_jobs.json").write_text("[]")
+
+        def names(entity):
+            return sorted(Path(f).name
+                          for f, _w in cge._files_associated_with(root, entity))
+        got = names("job 317")
+        _check("matches folder-name AND filename hits",
+               got == ["a.csv", "job317_summary.pdf"])
+        _check("separator-insensitive (job_317 / job317 == 'job 317')",
+               names("job_317") == got and names("job317") == got)
+        _check("excludes a different job's folder (318)", "c.csv" not in got)
+        _check("does not over-match part3170", "part3170.csv" not in got)
+        _check("excludes app-state files (agent_jobs.json)",
+               "agent_jobs.json" not in got)
+
+    C = cge.CouncilConsole
+
+    def ent(text):
+        m = (C._FILES_FOR_ENTITY_RE.match(text)
+             or C._FILES_WITH_NAME_RE.match(text))
+        return m.group(1).strip() if m else None
+
+    _check("'how many files are associated with job 317' -> 'job 317'",
+           ent("how many files are associated with job 317") == "job 317")
+    _check("'files for job 317' -> 'job 317'",
+           ent("files for job 317") == "job 317")
+    _check("'files with job 317 in the name' -> 'job 317'",
+           ent("files with job 317 in the name") == "job 317")
+    _check("plain 'how many files in data_in' is NOT hijacked (census stays)",
+           C._FILES_FOR_ENTITY_RE.match("how many files in data_in") is None
+           and C._FILES_WITH_NAME_RE.match("how many files in data_in") is None)
+
+
 def test_data_preview_text() -> None:
     """_data_preview_text gives a model-free (schema, rows) preview of a data
     file with bounded reads, and falls back to a text peek for non-tabular
@@ -4654,6 +4705,8 @@ def main() -> int:
          test_vault_search_excludes_app_state)
     _run("layered vault-term search routing",
          test_vault_term_search_routing)
+    _run("files associated with an entity (job 317 fix)",
+         test_files_associated_with_entity)
     _run("tool forge: model writes + validates + saves a tool",
          test_tool_forge_generate)
     _run("dataset digest (expert grounding) + tool-create routing",

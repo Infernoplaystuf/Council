@@ -558,6 +558,10 @@ _COUNCIL_EXAMPLES = [
      "which files mention bacon",
      "Layered vault search — file summaries first, then a deeper scan of the "
      "actual text; app-state files are excluded."),
+    ("Find in files",
+     "how many files are associated with job 317",
+     "Counts + lists files whose FOLDER name or FILE name includes the term "
+     "(ignoring spaces / underscores / hyphens) — not the whole vault."),
     ("When an answer is weak",
      "(click ⤓ Defer to Vault)",
      "Save what the model couldn't do; run it from the Vault tab, then "
@@ -633,6 +637,62 @@ def _name_matches_pattern(pat, filename: str) -> bool:
         return False
     stem = filename.rsplit(".", 1)[0] if "." in filename else filename
     return bool(pat.fullmatch(filename) or pat.fullmatch(stem))
+
+
+def _norm_token(s) -> str:
+    """Lower-case + drop every non-alphanumeric char, so 'Job 317', 'job_317',
+    'job-317' and 'job317' all collapse to the same token for matching."""
+    return _re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
+
+
+def _files_associated_with(in_dir, entity, *, limit: int = 3000):
+    """Files under ``in_dir`` ASSOCIATED with ``entity``: the entity token
+    (separator-insensitive) appears either in a FOLDER segment of the file's
+    path OR in the FILENAME. Answers 'how many files are associated with job
+    317' — a folder named `Job_317/` or a file `job317_data.csv` both count.
+
+    Returns a list of ``(abs_path, where)`` where ``where`` is 'folder' or
+    'filename'. App-state / protected files (question_history.json, indices,
+    conversation logs) are excluded. Pure + UI-free so it's unit-testable."""
+    import os as _os
+    tok = _norm_token(entity)
+    if not tok:
+        return []
+    try:
+        import conversation_logger as _cl
+    except Exception:
+        _cl = None
+    skip = {"__pycache__", ".git", ".vault_index", ".stats_cache",
+            "conversation_logs", "conversations", ".chromadb", "derived"}
+    out = []
+    root = Path(in_dir)
+    try:
+        for dp, dn, fn in _os.walk(str(root)):
+            dn[:] = [d for d in dn if d not in skip and not d.startswith(".")]
+            try:
+                rel_parts = Path(dp).relative_to(root).parts
+            except Exception:
+                rel_parts = ()
+            folder_match = any(tok in _norm_token(seg) for seg in rel_parts)
+            for f in fn:
+                if f.startswith("."):
+                    continue
+                full = Path(dp) / f
+                if _cl is not None:
+                    try:
+                        if _cl.is_protected_path(full, VAULT_DIR):
+                            continue
+                    except Exception:
+                        pass
+                file_match = tok in _norm_token(f)
+                if folder_match or file_match:
+                    out.append((str(full),
+                                "filename" if file_match else "folder"))
+                    if len(out) >= limit:
+                        return out
+    except Exception:
+        pass
+    return out
 
 
 def _search_vault_filenames(in_dir, term, limit: int = 200):
@@ -6746,6 +6806,28 @@ class CouncilConsole(tk.Tk):
         r"\s+(?:column\s+)?(?:in|across|over|from|within)\s+(.+?)\s*$",
         _re.IGNORECASE,
     )
+    # "how many files are associated with job 317" / "files for job 317" /
+    # "files related to <X>" — count/list files whose FOLDER name or FILENAME
+    # includes <X> (separator-insensitive). Must beat the analyst file-count
+    # census, which ignores the qualifier and counts the whole folder.
+    _FILES_FOR_ENTITY_RE = _re.compile(
+        r"^\s*(?:how\s+many|count|list|show(?:\s+me)?|what|which)?\s*"
+        r"(?:the\s+|all\s+)?files?\s+(?:are\s+)?(?:there\s+)?"
+        r"(?:that\s+are\s+|which\s+are\s+)?"
+        r"(?:associated\s+with|related\s+to|linked\s+to|tied\s+to|"
+        r"belong(?:ing)?\s+to|for|about|from|under)\s+"
+        r"['\"]?(.+?)['\"]?\s*\??\s*$",
+        _re.IGNORECASE,
+    )
+    # "files with <X> in the name" / "files that have <X> in the filename/folder"
+    _FILES_WITH_NAME_RE = _re.compile(
+        r"^\s*(?:how\s+many|count|list|show(?:\s+me)?|what|which)?\s*"
+        r"(?:the\s+|all\s+)?files?\s+"
+        r"(?:that\s+(?:have|contain|include)\s+|with\s+)"
+        r"['\"]?(.+?)['\"]?\s+in\s+(?:the\s+|its?\s+)?"
+        r"(?:name|filename|file\s+name|folder(?:\s+name)?|path)\s*\??\s*$",
+        _re.IGNORECASE,
+    )
     # Layered vault content search: "search all files in the vault for X",
     # "which files mention X", "find references to X". Distinct from _GREP_RE
     # (a folder-scoped grep) — this requires the all-files / vault / which-files
@@ -7120,6 +7202,11 @@ class CouncilConsole(tk.Tk):
         if m:
             target = self._FOLDER_NOISE_RE.sub("", (m.group(1) or "").strip().strip("'\"`")).strip()
             self._tree_response(target)
+            return True
+        m = (self._FILES_FOR_ENTITY_RE.match(single_line)
+             or self._FILES_WITH_NAME_RE.match(single_line))
+        if m:
+            self._files_for_entity_response(m.group(1).strip().strip("'\"`"))
             return True
         m = self._VAULT_SEARCH_RE.match(single_line)
         if m:
@@ -7561,6 +7648,61 @@ class CouncilConsole(tk.Tk):
         else:
             text = _vt.tree(root, max_depth=3, show_files=False)
             self._append_transcript("Writer", text, "final")
+        self._set_status("● idle")
+
+    def _files_for_entity_response(self, entity: str):
+        """Count + list files ASSOCIATED with an entity (e.g. 'job 317'): files
+        whose FOLDER name or FILENAME includes the entity token, matched
+        separator-insensitively. Excludes app-state files. Model-free."""
+        import data_index as _di
+        entity = (entity or "").strip().strip("'\"`")
+        if not entity:
+            self._append_transcript(
+                "Writer", "Which job / entity should I look for?", "final")
+            self._set_status("● idle")
+            return
+        try:
+            root = _di.input_dir(VAULT_DIR)
+        except Exception:
+            root = VAULT_DIR / "data_in"
+        matches = _files_associated_with(root, entity)
+        if not matches:
+            self._append_transcript(
+                "Writer",
+                f"No files associated with {entity!r} under {root.name}/. "
+                "(I matched folder names and file names, ignoring spaces / "
+                "underscores / hyphens.)", "final")
+            self._set_status("● idle")
+            return
+        from collections import OrderedDict
+        by_folder: "OrderedDict[str, list]" = OrderedDict()
+        n_filename = 0
+        for full, where in matches:
+            if where == "filename":
+                n_filename += 1
+            p = Path(full)
+            try:
+                rel_parent = str(p.parent.relative_to(root))
+            except Exception:
+                rel_parent = str(p.parent)
+            by_folder.setdefault(rel_parent or ".", []).append(p.name)
+        total = len(matches)
+        lines = [f"{total} file(s) associated with {entity!r} "
+                 f"(across {len(by_folder)} folder(s); {n_filename} matched by "
+                 f"file name, {total - n_filename} by folder name):"]
+        shown = 0
+        for folder, files in by_folder.items():
+            label = "data_in/" if folder == "." else f"{folder}/"
+            lines.append(f"  {label}  ({len(files)} file(s))")
+            for nm in files[:20]:
+                lines.append(f"    - {nm}")
+                shown += 1
+            if len(files) > 20:
+                lines.append(f"    … and {len(files) - 20} more")
+            if shown >= 200:
+                lines.append("  … (more folders omitted)")
+                break
+        self._append_transcript("Writer", "\n".join(lines), "final")
         self._set_status("● idle")
 
     def _vault_term_search_response(self, term: str):
