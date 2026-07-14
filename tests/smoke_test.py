@@ -4102,6 +4102,27 @@ def test_field_value_search() -> None:
            groups(C._FILES_SAME_FIELD_RE,
                   "find all files with the same point of contact as report.csv")
            == ("point of contact", "report.csv"))
+    # The count + question forms must route to the field search, not the
+    # generic file-count census (which lists every file).
+    _check("'how many files have bob as the point of contact' routes to field",
+           groups(C._FILES_VALUE_AS_FIELD_RE,
+                  "how many files have bob as the point of contact")
+           == ("bob", "point of contact"))
+    _check("'which files have bob as the point of contact' routes to field",
+           groups(C._FILES_VALUE_AS_FIELD_RE,
+                  "which files have bob as the point of contact")
+           == ("bob", "point of contact"))
+    _check("'of' stays inside the field name (point OF contact)",
+           groups(C._FILES_FIELD_IS_VALUE_RE,
+                  "how many files where the point of contact is bob")
+           == ("point of contact", "bob"))
+    _check("field:value does NOT hijack the plain file-count census",
+           C._FILES_VALUE_AS_FIELD_RE.match("how many files in data_in") is None
+           and C._FILES_FIELD_IS_VALUE_RE.match("how many files in data_in")
+           is None)
+    _check("field:value does NOT hijack the entity route",
+           C._FILES_VALUE_AS_FIELD_RE.match(
+               "how many files are associated with job 317") is None)
 
 
 def test_data_preview_text() -> None:

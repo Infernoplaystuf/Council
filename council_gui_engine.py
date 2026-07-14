@@ -6943,23 +6943,31 @@ class CouncilConsole(tk.Tk):
     # <file>" (extract the field's value from that file, then search); "find
     # files with <value> as the <field>"; "find files where the <field> is
     # <value>". Checked before the entity/vault routes.
+    # Shared leading prefix — covers count phrasings ("how many"), commands
+    # ("list/find/show"), and questions ("which/what"). Without "how many" the
+    # count form fell through to the generic file-count census (all files).
+    _F_PREFIX = (
+        r"^\s*(?:how\s+many|find|list|show(?:\s+me)?|which|what|get|count|"
+        r"tell\s+me(?:\s+how\s+many)?)?\s*(?:of\s+)?(?:all\s+|the\s+|my\s+)?"
+        r"files?\s+")
     _FILES_SAME_FIELD_RE = _re.compile(
-        r"^\s*(?:find|list|show(?:\s+me)?|which|what|get)?\s*(?:all\s+|the\s+)?"
-        r"files?\s+(?:that\s+have\s+|with\s+|having\s+|sharing\s+)"
+        _F_PREFIX
+        + r"(?:that\s+have\s+|with\s+|having\s+|sharing\s+|share\s+)"
         r"the\s+same\s+(.+?)\s+(?:as|to)\s+(.+?)\s*\??\s*$",
         _re.IGNORECASE,
     )                                                   # (field, file_ref)
     _FILES_VALUE_AS_FIELD_RE = _re.compile(
-        r"^\s*(?:find|list|show(?:\s+me)?|which|what|get)?\s*(?:all\s+|the\s+)?"
-        r"files?\s+(?:that\s+have\s+|with\s+|having\s+|listing\s+)"
-        r"['\"]?(.+?)['\"]?\s+(?:listed\s+|shown\s+|set\s+|marked\s+)?"
-        r"(?:as|for)\s+(?:the\s+|a\s+|an\s+|their\s+)?(.+?)\s*\??\s*$",
+        _F_PREFIX
+        + r"(?:that\s+have\s+|that\s+list\s+|have\s+|has\s+|with\s+|having\s+|"
+        r"listing\s+|list\s+)"
+        r"['\"]?(.+?)['\"]?\s+(?:listed\s+|shown\s+|set\s+|marked\s+|given\s+|"
+        r"named\s+)?(?:as|for)\s+(?:the\s+|a\s+|an\s+|their\s+)?(.+?)\s*\??\s*$",
         _re.IGNORECASE,
     )                                                   # (value, field)
     _FILES_FIELD_IS_VALUE_RE = _re.compile(
-        r"^\s*(?:find|list|show(?:\s+me)?|which|what|get)?\s*(?:all\s+|the\s+)?"
-        r"files?\s+(?:where|whose|with)\s+(?:the\s+)?(.+?)\s+"
-        r"(?:is|are|=|equals?)\s+['\"]?(.+?)['\"]?\s*\??\s*$",
+        _F_PREFIX
+        + r"(?:where|whose|with|that\s+have)\s+(?:the\s+)?(.+?)\s+"
+        r"(?:is|are|=|equals?|set\s+to)\s+['\"]?(.+?)['\"]?\s*\??\s*$",
         _re.IGNORECASE,
     )                                                   # (field, value)
     # Layered vault content search: "search all files in the vault for X",
