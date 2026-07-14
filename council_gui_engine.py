@@ -1770,6 +1770,70 @@ def _extract_file_paths(text):
     return paths
 
 
+# ── Session "recently referenced files" registry ────────────────────────────
+# When a command lists files to the user (e.g. "files associated with job 456"),
+# the console records their ABSOLUTE paths here, keyed by lowercase basename. A
+# follow-up that names one ("summarize report.csv") then resolves to the real
+# file even though _FILE_PATH_RE matches only absolute paths and the file lives
+# in a subfolder. Populated by CouncilConsole._remember_files; read by the
+# injector. This is the app's short-term memory of "the files I just showed you".
+_REFERENCED_FILES_MAP = None
+
+
+def _register_referenced_files(m) -> None:
+    global _REFERENCED_FILES_MAP
+    _REFERENCED_FILES_MAP = m
+
+
+def _extract_bare_filenames(text):
+    """Bare filename tokens (name.ext) the user typed. _FILE_PATH_RE only
+    catches absolute paths, so this catches 'report.csv' in a follow-up. Over-
+    matching (e.g. 'e.g') is harmless — only tokens that resolve to a real file
+    are used by the caller."""
+    out, seen = [], set()
+    for m in _re.finditer(r"[\w\-]{1,60}\.[A-Za-z0-9]{1,8}", text or ""):
+        tok = m.group(0)
+        low = tok.lower()
+        if low not in seen:
+            seen.add(low)
+            out.append(tok)
+    return out
+
+
+def _resolve_referenced_path(name):
+    """Resolve a bare filename / path to an existing absolute path:
+    (1) keep it if it already exists; (2) the session referenced-files registry
+    by basename (the file the user was just shown); (3) a vault filename lookup
+    under data_in. Returns the input unchanged if nothing resolves."""
+    try:
+        p = Path(str(name)).expanduser()
+        if p.is_absolute() and p.exists():
+            return str(p)
+    except Exception:
+        return str(name)
+    base = p.name.lower()
+    if _REFERENCED_FILES_MAP:
+        hit = _REFERENCED_FILES_MAP.get(base)
+        try:
+            if hit and Path(hit).exists():
+                return hit
+        except Exception:
+            pass
+    try:
+        import data_index as _di
+        root = _di.input_dir(VAULT_DIR)
+        for q in root.rglob(p.name):
+            if q.is_file():
+                return str(q)
+        low = p.name.lower()
+        for q in root.rglob("*"):
+            if q.is_file() and q.name.lower() == low:
+                return str(q)
+    except Exception:
+        pass
+    return str(name)
+
+
 # Phrase substrings that mark a CONCEPTUAL search query — "show me
 # files that …", "find scripts about …", etc. When matched, the
 # injector defaults to search-headers mode (compact one-line entries
@@ -1964,6 +2028,24 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
     DROPPABLE_FROM = PRIO_VAULT   # only individual vault matches are droppable
 
     explicit_paths = _extract_file_paths(user_text)
+    # Resolve BARE filenames the user names in a follow-up ("summarize
+    # report.csv"): _FILE_PATH_RE only matches absolute paths, so a bare name in
+    # a subfolder used to be invisible and the model refused. Look each up in
+    # the session's recently-referenced files, then a vault filename search, and
+    # inject the resolved file. Protected/app-state files are never injected.
+    try:
+        import conversation_logger as _cl_ref
+    except Exception:
+        _cl_ref = None
+    for _bare in _extract_bare_filenames(user_text):
+        _rp = _resolve_referenced_path(_bare)
+        try:
+            if (_rp and _rp not in explicit_paths and Path(_rp).is_file()
+                    and (_cl_ref is None
+                         or not _cl_ref.is_protected_path(_rp, VAULT_DIR))):
+                explicit_paths.append(_rp)
+        except Exception:
+            pass
     print('[DEBUG inject] explicit paths: ' + str(explicit_paths), file=_sys_dbg.stderr)
 
     candidates = []   # list of (priority, label, content)
@@ -5350,6 +5432,12 @@ class CouncilConsole(tk.Tk):
         # Share this warm instance with the module-level context injector so
         # its cell-value search stage reuses the same (refreshed) index.
         _register_data_index(self.data_index)
+        # Short-term memory of files surfaced to the user (basename -> abs path)
+        # so a follow-up like "summarize report.csv" resolves the file that was
+        # just listed, even in a subfolder / of any type.
+        from collections import OrderedDict as _OD
+        self._referenced_files = _OD()
+        _register_referenced_files(self._referenced_files)
         self.librarian = ce.Librarian(VAULT_DIR, LOG_PATH)
         self.runner = ce.LocalRunner(WORKSPACE_DIR)
         self.speech = ce.SpeechToText(model_size="base")
@@ -7673,6 +7761,30 @@ class CouncilConsole(tk.Tk):
             self._append_transcript("Writer", text, "final")
         self._set_status("● idle")
 
+    def _remember_files(self, paths, *, cap: int = 800):
+        """Record files just surfaced to the user (absolute paths) so a
+        follow-up can reference one by name. Keyed by lowercase basename;
+        most-recent wins. Powers 'summarize <that file>' across turns."""
+        m = getattr(self, "_referenced_files", None)
+        if m is None:
+            return
+        for p in paths:
+            try:
+                ap = Path(str(p))
+                if not ap.is_absolute():
+                    continue
+                key = ap.name.lower()
+                if key in m:
+                    m.move_to_end(key)
+                m[key] = str(ap)
+            except Exception:
+                continue
+        while len(m) > cap:
+            try:
+                m.popitem(last=False)
+            except Exception:
+                break
+
     def _files_for_entity_response(self, entity: str):
         """Count + list files ASSOCIATED with an entity (e.g. 'job 317'): files
         whose FOLDER name or FILENAME includes the entity token, matched
@@ -7689,6 +7801,8 @@ class CouncilConsole(tk.Tk):
         except Exception:
             root = VAULT_DIR / "data_in"
         matches = _files_associated_with(root, entity)
+        # Remember these so a follow-up ("summarize <one of them>") resolves.
+        self._remember_files(full for full, _w in matches)
         if not matches:
             self._append_transcript(
                 "Writer",
@@ -7781,6 +7895,7 @@ class CouncilConsole(tk.Tk):
                     continue
                 summary_names.add(nm)
                 summary.append((nm, rec.get("type", "?")))
+                self._remember_files([pth])
 
         # 2) Deeper scan of the actual file text (the "then a deeper look"
         #    layer). find_files_containing_text already skips protected paths.
@@ -7798,6 +7913,7 @@ class CouncilConsole(tk.Tk):
                 continue
             content_names.add(nm)
             content.append((nm, (h.get("context") or "").strip()[:100]))
+            self._remember_files([str(data_root / str(h.get("path", "")))])
 
         if not summary and not content:
             self._append_transcript(

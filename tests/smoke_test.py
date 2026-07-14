@@ -4002,6 +4002,50 @@ def test_files_associated_with_entity() -> None:
            and C._FILES_WITH_NAME_RE.match("how many files in data_in") is None)
 
 
+def test_referenced_file_followup() -> None:
+    """After a command lists files, a FOLLOW-UP that names one by bare filename
+    resolves to the real file (even in a subfolder, any type) and gets injected
+    — fixing 'summarize report.csv' -> "can't access the file". _FILE_PATH_RE
+    only matches absolute paths, so this is the session's file memory."""
+    try:
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_gui_engine importable (skipped: {exc!r})", True)
+        return
+    _check("bare filename is extracted from a follow-up",
+           "report.csv" in cge._extract_bare_filenames(
+               "summarize report.csv please"))
+    from collections import OrderedDict
+    with tempfile.TemporaryDirectory() as td:
+        sub = Path(td) / "Job_456_run"
+        sub.mkdir()
+        f = sub / "report.csv"
+        f.write_text("region,revenue\nEast,100\nWest,250\n")
+        reg = OrderedDict()
+        reg["report.csv"] = str(f)
+        cge._register_referenced_files(reg)
+        try:
+            _check("a listed bare name resolves to its real subfolder path",
+                   cge._resolve_referenced_path("report.csv") == str(f))
+
+            class _Holder:
+                _referenced_files = OrderedDict()
+                _remember_files = cge.CouncilConsole._remember_files
+            h = _Holder()
+            h._remember_files([str(f)])
+            _check("_remember_files keys by lowercase basename",
+                   h._referenced_files.get("report.csv") == str(f))
+
+            aug, _fz, bd = cge._inject_file_contents_impl(
+                "summarize report.csv", n_ctx=8192)
+            labels = [lbl for lbl, _ in bd.get("costs", [])]
+            _check("the follow-up injects the referenced file's content",
+                   any("report.csv" in lbl for lbl in labels)
+                   and "revenue" in aug)
+        finally:
+            cge._register_referenced_files(None)
+
+
 def test_data_preview_text() -> None:
     """_data_preview_text gives a model-free (schema, rows) preview of a data
     file with bounded reads, and falls back to a text peek for non-tabular
@@ -4713,6 +4757,8 @@ def main() -> int:
          test_vault_term_search_routing)
     _run("files associated with an entity (job 317 fix)",
          test_files_associated_with_entity)
+    _run("follow-up file reference resolves + injects (session memory)",
+         test_referenced_file_followup)
     _run("tool forge: model writes + validates + saves a tool",
          test_tool_forge_generate)
     _run("dataset digest (expert grounding) + tool-create routing",
