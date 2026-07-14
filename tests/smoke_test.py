@@ -4125,6 +4125,51 @@ def test_field_value_search() -> None:
                "how many files are associated with job 317") is None)
 
 
+def test_emit_full_list_to_file() -> None:
+    """Search result lists are written IN FULL to data_out/reports/<name>.txt
+    (never truncated), and the transcript shows the list up to a cap plus the
+    saved path — so a large result set isn't lost to a display cap."""
+    try:
+        import council_gui_engine as cge
+        import data_index
+    except Exception as exc:  # pragma: no cover
+        _check(f"modules importable (skipped: {exc!r})", True)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td) / "vault"
+        (vault / "data_in").mkdir(parents=True)
+        (vault / "data_out").mkdir()
+        di = data_index.DataIndex(search_roots=[vault / "data_in"],
+                                  write_root=vault / "data_out")
+
+        class _Fake:
+            pass
+        fake = _Fake()
+        fake.data_index = di
+        fake.captured = []
+        fake._append_transcript = (
+            lambda who, text, kind=None: fake.captured.append(text))
+        fake._emit_file_list = cge.CouncilConsole._emit_file_list.__get__(fake)
+
+        items = [f"  - file_{i}.csv   (match)" for i in range(1500)]
+        saved = fake._emit_file_list("1500 file(s) where 'poc' is 'bob':",
+                                     items, name="files_poc_bob")
+        _check("full list written under data_out/reports/",
+               bool(saved) and Path(saved).exists() and "reports" in saved)
+        txt = Path(saved).read_text(encoding="utf-8")
+        _check("the FILE contains ALL 1500 items (nothing truncated)",
+               txt.count("file_") == 1500 and "file_1499.csv" in txt)
+        shown = fake.captured[-1]
+        _check("transcript notes the overflow and the saved path",
+               "more" in shown and saved in shown)
+        fake.captured.clear()
+        s2 = fake._emit_file_list("2 file(s):", ["  - a.csv", "  - b.csv"],
+                                  name="tiny")
+        _check("a small list shows fully inline and still writes a file",
+               bool(s2) and "a.csv" in fake.captured[-1]
+               and "b.csv" in fake.captured[-1])
+
+
 def test_data_preview_text() -> None:
     """_data_preview_text gives a model-free (schema, rows) preview of a data
     file with bounded reads, and falls back to a text peek for non-tabular
@@ -4840,6 +4885,8 @@ def main() -> int:
          test_referenced_file_followup)
     _run("field:value cross-file search + extraction (point of contact)",
          test_field_value_search)
+    _run("full result lists written to a file (no display-cap loss)",
+         test_emit_full_list_to_file)
     _run("tool forge: model writes + validates + saves a tool",
          test_tool_forge_generate)
     _run("dataset digest (expert grounding) + tool-create routing",

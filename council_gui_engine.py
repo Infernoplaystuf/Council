@@ -7858,16 +7858,16 @@ class CouncilConsole(tk.Tk):
                     self._set_status("● idle")
                     return
                 self._remember_files([h[0] for h in hits])
-                lines = [f"{len(hits)} file(s) where {field!r} is {value!r}:"]
-                for pth, ctx in hits[:60]:
+                header = f"{len(hits)} file(s) where {field!r} is {value!r}:"
+                items = []
+                for pth, ctx in hits:
                     try:
                         rel = str(Path(pth).relative_to(root))
                     except Exception:
                         rel = Path(pth).name
-                    lines.append(f"  - {rel}   ({ctx})")
-                if len(hits) >= 500:
-                    lines.append("  … (capped)")
-                self._append_transcript("Writer", "\n".join(lines), "final")
+                    items.append(f"  - {rel}   ({ctx})")
+                self._emit_file_list(header, items,
+                                     name=f"files_{field}_{value}")
                 self._set_status("● idle")
             self.after(0, _apply)
 
@@ -7918,6 +7918,36 @@ class CouncilConsole(tk.Tk):
             f"{Path(path).name} has {field} = {value!r}; finding other files "
             "with the same value…", "observation")
         self._field_value_response(field, value)
+
+    def _emit_file_list(self, header: str, item_lines, *, name: str,
+                        show_cap: int = 1000):
+        """Show a (possibly long) result list in the transcript AND write the
+        FULL list to a .txt under the vault output (data_out/reports/), so
+        nothing is lost to a display cap. The saved path is shown so the user
+        can open the complete list regardless of context limits. Returns the
+        path or None."""
+        item_lines = list(item_lines)
+        saved = None
+        try:
+            base = _re.sub(r"[^\w\-]+", "_", str(name)).strip("_") or "results"
+            outp = self.data_index.safe_write_path(base + ".txt",
+                                                   subfolder="reports")
+            outp.write_text(header + "\n" + "\n".join(item_lines) + "\n",
+                            encoding="utf-8")
+            saved = str(outp)
+        except Exception:
+            saved = None
+        body = [header]
+        body.extend(item_lines[:show_cap])
+        if len(item_lines) > show_cap:
+            body.append(f"  … ({len(item_lines) - show_cap} more — the full "
+                        "list is in the file below)")
+        if saved:
+            body.append("")
+            body.append(f"\U0001F4C4 Full list ({len(item_lines)} item(s)) "
+                        f"written to: {saved}")
+        self._append_transcript("Writer", "\n".join(body), "final")
+        return saved
 
     def _remember_files(self, paths, *, cap: int = 800):
         """Record files just surfaced to the user (absolute paths) so a
@@ -7982,22 +8012,16 @@ class CouncilConsole(tk.Tk):
                 rel_parent = str(p.parent)
             by_folder.setdefault(rel_parent or ".", []).append(p.name)
         total = len(matches)
-        lines = [f"{total} file(s) associated with {entity!r} "
-                 f"(across {len(by_folder)} folder(s); {n_filename} matched by "
-                 f"file name, {total - n_filename} by folder name):"]
-        shown = 0
+        header = (f"{total} file(s) associated with {entity!r} "
+                  f"(across {len(by_folder)} folder(s); {n_filename} matched by "
+                  f"file name, {total - n_filename} by folder name):")
+        items = []
         for folder, files in by_folder.items():
             label = "data_in/" if folder == "." else f"{folder}/"
-            lines.append(f"  {label}  ({len(files)} file(s))")
-            for nm in files[:20]:
-                lines.append(f"    - {nm}")
-                shown += 1
-            if len(files) > 20:
-                lines.append(f"    … and {len(files) - 20} more")
-            if shown >= 200:
-                lines.append("  … (more folders omitted)")
-                break
-        self._append_transcript("Writer", "\n".join(lines), "final")
+            items.append(f"  {label}  ({len(files)} file(s))")
+            for nm in files:
+                items.append(f"    - {nm}")
+        self._emit_file_list(header, items, name=f"files_for_{entity}")
         self._set_status("● idle")
 
     def _vault_term_search_response(self, term: str):
@@ -8080,18 +8104,19 @@ class CouncilConsole(tk.Tk):
                 f"then the full text of files under {data_root.name}/.", "final")
             self._set_status("● idle")
             return
-        lines = [f"Files referencing {term!r}:"]
+        header = f"Files referencing {term!r}:"
+        items = []
         if summary:
-            lines.append("")
-            lines.append(f"Matched in file summary / keywords ({len(summary)}):")
-            for nm, ty in summary[:40]:
-                lines.append(f"  • {nm}  [{ty}]")
+            items.append("")
+            items.append(f"Matched in file summary / keywords ({len(summary)}):")
+            for nm, ty in summary:
+                items.append(f"  • {nm}  [{ty}]")
         if content:
-            lines.append("")
-            lines.append(f"Found deeper in file contents ({len(content)}):")
-            for nm, snip in content[:40]:
-                lines.append(f"  • {nm}" + (f"  →  {snip}" if snip else ""))
-        self._append_transcript("Writer", "\n".join(lines), "final")
+            items.append("")
+            items.append(f"Found deeper in file contents ({len(content)}):")
+            for nm, snip in content:
+                items.append(f"  • {nm}" + (f"  →  {snip}" if snip else ""))
+        self._emit_file_list(header, items, name=f"files_referencing_{term}")
         self._set_status("● idle")
 
     def _grep_response(self, query: str, target: str):
