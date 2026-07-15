@@ -2939,6 +2939,102 @@ def test_nx_capability_policy() -> None:
         _check("an ordinary pipeline still runs", False)
 
 
+def test_nx_script_gate() -> None:
+    """The model WRITES the Python — filters as execute() lines plus whatever
+    glue the task needs. A filter-selection cannot express the spec's own CSV
+    route (npview[:] = np.loadtxt(...) is not a filter), so restricting the
+    model to picking filters would fail the feature it exists for.
+
+    The gate is therefore on the code the APP would EXECUTE, not on the model's
+    freedom to write it — the same shape as
+    vault_analyst.validate_generated_code, which already gates every
+    model-authored tool in app_built_tools."""
+    try:
+        import nx_generate as gen
+        import nx_policy as pol
+    except Exception as exc:  # pragma: no cover
+        _check(f"nx script modules importable ({exc!r})", False)
+        return
+
+    # MUST PASS: the spec's B.1 idiom, plus a folder loop.
+    real_work = (
+        "import simplnx as nx\n"
+        "import numpy as np\n"
+        "from pathlib import Path\n"
+        "ds = nx.DataStructure()\n"
+        "r0 = nx.CreateDataArrayFilter.execute(data_structure=ds,\n"
+        "    numeric_type_index=nx.NumericType.float32,\n"
+        "    output_array_path=nx.DataPath('Values'),\n"
+        "    tuple_dimensions=[[100.0]])\n"
+        "assert not r0.errors, r0.errors\n"
+        "view = ds[nx.DataPath('Values')].npview()\n"
+        "view[:] = np.loadtxt('C:/data/in.csv', delimiter=',')\n"
+        "for src in sorted(Path('C:/data').glob('*.csv')):\n"
+        "    print(src.name)\n")
+    ok, why = pol.validate_script(real_work)
+    _check("the spec's numpy/npview glue is ALLOWED (a selection can't do it)",
+           ok, "" if ok else str(why))
+
+    # MUST BE REFUSED — each is a way out of the pipeline.
+    for label, code in (
+        ("the shell filter written as python",
+         "import simplnx as nx\nnx.ExecuteProcessFilter.execute("
+         "data_structure=ds, arguments='cmd /c del /s /q C:/data')"),
+        ("os", "import os\nos.system('del /s /q C:/data')"),
+        ("subprocess", "import subprocess\nsubprocess.run(['cmd'])"),
+        ("shutil", "import shutil\nshutil.rmtree('C:/data')"),
+        ("a dunder escape",
+         "x = ().__class__.__bases__[0].__subclasses__()"),
+        ("eval", "eval('1')"),
+        ("getattr indirection",
+         "import simplnx as nx\n"
+         "getattr(nx, 'Execute' + 'ProcessFilter').execute(arguments='x')"),
+        ("open for writing", "open('C:/x','w').write('x')"),
+        ("the python-codegen filter",
+         "import simplnx as nx\nnx.CreatePythonSkeletonFilter.execute("
+         "data_structure=ds)"),
+    ):
+        ok, _why = pol.validate_script(code)
+        _check(f"refused: {label}", not ok)
+
+    _check("an empty script is refused", not pol.validate_script("")[0])
+    _check("a syntax error is reported, not raised",
+           not pol.validate_script("def (:")[0])
+
+    # write_script: grounded prompt, gate, and fail-closed after retries.
+    catalog = {"enums": {}, "filters": [
+        {"uuid": "u-create", "module": "simplnx", "alias": "nx",
+         "py_attr": "CreateDataArrayFilter", "human_name": "Create Data Array",
+         "default_tags": [], "execute": {"params": [
+             {"name": "data_structure", "type": "simplnx.DataStructure",
+              "required": False},
+             {"name": "output_array_path", "type": "simplnx.DataPath",
+              "required": False, "default": "DataPath()"}]}}]}
+    prompt_seen = []
+
+    def _good(p):
+        prompt_seen.append(p)
+        return ("```python\nimport simplnx as nx\nds = nx.DataStructure()\n"
+                "r0 = nx.CreateDataArrayFilter.execute(data_structure=ds)\n```")
+
+    r = gen.write_script("create a data array", catalog, _good)
+    _check("a clean script passes the gate", r["ok"] and r["attempts"] == 1)
+    _check("the fence is stripped from the model's reply",
+           r["code"].startswith("import simplnx"))
+    _check("the prompt carries the filter's REAL signature",
+           "output_array_path" in prompt_seen[0]
+           and "simplnx.DataPath" in prompt_seen[0])
+    _check("the prompt teaches the npview copy the spec requires",
+           "npview()" in prompt_seen[0])
+
+    bad = gen.write_script("create a data array", catalog,
+                           lambda p: "import os\nos.system('rm -rf /')")
+    _check("a model that keeps writing a shell FAILS closed",
+           bad["ok"] is False and bad["errors"])
+    _check("the code is still returned so a human can see what it wrote",
+           bad["code"] is not None)
+
+
 def _json_dumps(o) -> str:
     import json as _j
     return _j.dumps(o)
@@ -6040,6 +6136,8 @@ def main() -> int:
          test_nx_generate)
     _run("SECURITY: nx capability policy (a real uuid is not a sanctioned uuid)",
          test_nx_capability_policy)
+    _run("SECURITY: nx script gate (model writes python; execution is gated)",
+         test_nx_script_gate)
     _run("plot roles (datetime/bool ordering, coercion, no mutation)",
          test_plot_roles)
     _run("plot registry (role-gated catalog, validation, aggregation)",

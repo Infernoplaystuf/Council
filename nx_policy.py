@@ -40,7 +40,40 @@ outliers precisely because they escape the data structure.
 """
 from __future__ import annotations
 
-from typing import Dict, Optional
+import ast
+from typing import Dict, List, Optional, Tuple
+
+# The model writes real Python — filters as execute() lines, plus whatever glue
+# the task needs. That is the point of the feature, and a filter-selection
+# cannot express the spec's own CSV path
+# (npview[:] = np.loadtxt(...) is not a filter).
+#
+# So the gate is on the code, not on the model's freedom to write it — the same
+# shape as vault_analyst.validate_generated_code, which already gates every
+# model-authored tool in app_built_tools. It is not reused verbatim because it
+# forbids the attribute `remove`, and DataStructure.remove is legitimate here.
+#
+# Imports are an ALLOWLIST: everything a pipeline legitimately needs is short
+# and known, while the ways to reach a shell are not enumerable.
+ALLOWED_IMPORT_ROOTS = frozenset({
+    "simplnx", "orientationanalysis", "itkimageprocessing",
+    "numpy", "math", "json", "pathlib", "datetime", "re", "typing",
+})
+
+# Names that end the conversation regardless of import.
+DENIED_CALLS = frozenset({
+    "eval", "exec", "compile", "__import__", "open", "input", "breakpoint",
+    "getattr", "setattr", "delattr", "globals", "locals", "vars", "memoryview",
+})
+
+# The class names of the capability outliers. The pipeline path denies them by
+# uuid; a script names the CLASS, so both spellings must be covered.
+DENIED_CLASS_NAMES = frozenset({
+    "ExecuteProcessFilter", "CreatePythonSkeletonFilter",
+})
+
+# Attribute-based escapes: __globals__ -> builtins -> anything.
+_DUNDER_OK = frozenset({"__init__", "__name__", "__file__", "__doc__"})
 
 # uuid -> why it is refused (shown to the user; keep it plain).
 DENIED_UUIDS: Dict[str, str] = {
@@ -67,3 +100,83 @@ def permitted_filters(catalog: dict) -> list:
     """The catalog's filters minus the capability outliers."""
     return [f for f in (catalog or {}).get("filters", [])
             if f.get("uuid") and not is_denied(f["uuid"])]
+
+
+def validate_script(code: str) -> Tuple[bool, List[str]]:
+    """(ok, reasons) for a model-written simplnx pipeline script.
+
+    Gates the code the APP would execute. It does not gate what the app WRITES:
+    a script the user reads and runs themselves is their call on their machine,
+    and this app's job there is to be legible, not to be a nanny.
+
+    The model is free to write real Python here — execute() lines, numpy glue,
+    the npview[:] = np.loadtxt(...) copy the spec requires, loops over files.
+    What it may not do is reach outside that: no shell, no filesystem module,
+    no dynamic attribute lookup, and none of the two filters whose capability
+    is arbitrary code execution.
+    """
+    reasons: List[str] = []
+    if not (code or "").strip():
+        return False, ["the script is empty"]
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as exc:
+        return False, [f"syntax error: {exc}"]
+
+    for node in ast.walk(tree):
+        # ---- imports: allowlist ---------------------------------------
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                root = a.name.split(".")[0]
+                if root not in ALLOWED_IMPORT_ROOTS:
+                    reasons.append(
+                        f"line {node.lineno}: import {a.name!r} is not "
+                        f"allowed. Allowed: "
+                        f"{', '.join(sorted(ALLOWED_IMPORT_ROOTS))}")
+        elif isinstance(node, ast.ImportFrom):
+            root = (node.module or "").split(".")[0]
+            if node.level or root not in ALLOWED_IMPORT_ROOTS:
+                reasons.append(
+                    f"line {node.lineno}: from {node.module!r} import ... is "
+                    f"not allowed")
+        # ---- calls ------------------------------------------------------
+        elif isinstance(node, ast.Call):
+            fn = node.func
+            name = None
+            if isinstance(fn, ast.Name):
+                name = fn.id
+            elif isinstance(fn, ast.Attribute):
+                name = fn.attr
+            if name in DENIED_CALLS:
+                reasons.append(f"line {node.lineno}: {name}() is not allowed")
+            if name in DENIED_CLASS_NAMES:
+                reasons.append(
+                    f"line {node.lineno}: {name} is refused — "
+                    f"{reason_for_class(name)}")
+        # ---- attributes -------------------------------------------------
+        elif isinstance(node, ast.Attribute):
+            if node.attr in DENIED_CLASS_NAMES:
+                reasons.append(
+                    f"line {node.lineno}: {node.attr} is refused — "
+                    f"{reason_for_class(node.attr)}")
+            elif (node.attr.startswith("__") and node.attr.endswith("__")
+                    and node.attr not in _DUNDER_OK):
+                reasons.append(
+                    f"line {node.lineno}: {node.attr} is not allowed "
+                    f"(dunder access reaches the interpreter)")
+        elif isinstance(node, ast.Name) and node.id in DENIED_CLASS_NAMES:
+            reasons.append(f"line {node.lineno}: {node.id} is refused — "
+                           f"{reason_for_class(node.id)}")
+    return (not reasons), reasons
+
+
+def reason_for_class(class_name: str) -> str:
+    for uuid, why in DENIED_UUIDS.items():
+        if class_name.replace("Filter", "") in why.replace(" ", "") \
+                or class_name in why:
+            return why
+    if class_name == "ExecuteProcessFilter":
+        return DENIED_UUIDS["fb511a70-2175-4595-8c11-d1b5b6794221"]
+    if class_name == "CreatePythonSkeletonFilter":
+        return DENIED_UUIDS["1a35f50d-a9f5-9ea2-af70-5b9cf894e45f"]
+    return "this filter executes arbitrary code."

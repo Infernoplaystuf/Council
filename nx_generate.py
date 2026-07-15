@@ -331,3 +331,125 @@ def generate(query: str, catalog: dict, model_fn: Callable[[str], str], *,
     return {"ok": False, "pipeline": parsed, "errors": last_errors,
             "attempts": max_attempts,
             "candidates": [c["uuid"] for c in candidates], "raw": raw}
+
+
+def render_from_selection(query: str, catalog: dict,
+                          model_fn: Callable[[str], str], *, k: int = 12,
+                          max_attempts: int = 2) -> Dict[str, Any]:
+    """Task -> a validated filter SELECTION -> Python rendered from it.
+
+    The conservative path: the model only picks filters and arguments, and the
+    Python is rendered by the same type-aware renderer that converts a saved
+    .d3dpipeline. Nothing the model writes is ever executed as source.
+
+    It cannot express glue, which is a real limit and not a small one — the
+    spec's own CSV route needs `npview[:] = np.loadtxt(...)`, and that is not a
+    filter. Use write_script() for a task that needs code between the filters;
+    use this when the task really is just a chain of filters.
+    """
+    import nx_transpile
+    res = generate(query, catalog, model_fn, k=k, max_attempts=max_attempts)
+    if not res.get("ok"):
+        return {**res, "code": None, "render_warnings": []}
+    rendered = nx_transpile.transpile(res["pipeline"], catalog)
+    return {**res, "code": rendered["code"],
+            "render_warnings": rendered.get("warnings", [])}
+
+
+def build_script_prompt(query: str, candidates: List[dict]) -> str:
+    """Ask for a real simplnx script, grounded on real signatures."""
+    cat = "\n".join(describe_filter(e) for e in candidates)
+    allowed = ", ".join(sorted(nx_policy.ALLOWED_IMPORT_ROOTS))
+    return f"""You write DREAM3D-NX pipelines as Python, using the simplnx API.
+
+These filters were read from the package installed on this machine. Their
+parameter names, types and defaults are exact. Use only these, and call them
+exactly as shown.
+
+AVAILABLE FILTERS
+{cat}
+
+HOW A FILTER IS CALLED
+    result = nx.<FilterName>.execute(data_structure=ds, <param>=<value>, ...)
+    assert not result.errors, result.errors
+
+TYPED VALUES (get these right — they are not plain strings)
+    a data path      -> nx.DataPath("Some/Path")
+    a numeric type   -> nx.NumericType.float32
+    a dream3d import -> nx.Dream3dImportParameter.ImportData(file_path="C:/x.dream3d")
+    a file path      -> a plain string
+
+WRITING DATA INTO AN ARRAY (there is no zero-copy wrap; you must copy)
+    view = ds[nx.DataPath("Values")].npview()
+    view[:] = np.loadtxt("C:/data/in.csv", delimiter=",")
+
+REQUEST
+{query}
+
+Write a COMPLETE Python script. Start from `ds = nx.DataStructure()`. You may
+use ordinary Python — loops over files, numpy, pathlib — to do whatever the
+task needs between filters.
+
+You may import only: {allowed}
+Do not use the shell, the filesystem modules, eval/exec, or getattr.
+
+Reply with ONLY the Python, no prose, no code fence.
+"""
+
+
+def extract_code(text: str) -> str:
+    """The Python out of a model reply, tolerating a code fence."""
+    if not text:
+        return ""
+    s = text.strip()
+    m = re.search(r"```(?:python)?\s*(.+?)```", s, re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return s
+
+
+def write_script(query: str, catalog: dict, model_fn: Callable[[str], str], *,
+                 k: int = 12, max_attempts: int = 3) -> Dict[str, Any]:
+    """A task in English -> a runnable simplnx Python pipeline script.
+
+    THE deliverable. The model writes real Python: filters as execute() lines
+    plus whatever code the task needs between them — the numpy copy, a loop
+    over a folder, a computed path. That freedom is the point; a pure filter
+    selection cannot express the spec's own CSV route.
+
+    It is grounded, not trusted. The prompt carries the REAL signatures of the
+    retrieved filters (from the installed binary, so the model is not recalling
+    an API), and the result is gated by nx_policy.validate_script before this
+    app would run it — the same shape as vault_analyst.validate_generated_code,
+    which already gates every model-authored tool here.
+
+    The gate is on EXECUTION, not on authorship: the script is returned either
+    way, and a user reading and running it themselves is their call. `ok` says
+    whether the app should run it.
+
+    Returns {"ok", "code", "errors", "attempts", "candidates", "raw"}.
+    """
+    candidates = retrieve(catalog, query, k=k)
+    if not candidates:
+        return {"ok": False, "code": None, "attempts": 0, "candidates": [],
+                "errors": ["No filter in the installed package matches that "
+                           "request."]}
+    prompt = build_script_prompt(query, candidates)
+    errors: List[str] = []
+    code = ""
+    for attempt in range(1, max_attempts + 1):
+        raw = model_fn(prompt) or ""
+        code = extract_code(raw)
+        ok, errors = nx_policy.validate_script(code)
+        if ok:
+            return {"ok": True, "code": code, "errors": [],
+                    "attempts": attempt,
+                    "candidates": [c["uuid"] for c in candidates], "raw": raw}
+        if attempt < max_attempts:
+            prompt = (f"Your script was refused:\n"
+                      f"{chr(10).join('- ' + e for e in errors)}\n\n"
+                      f"{build_script_prompt(query, candidates)}"
+                      f"Fix every point above. Reply with ONLY the Python.")
+    return {"ok": False, "code": code, "errors": errors,
+            "attempts": max_attempts,
+            "candidates": [c["uuid"] for c in candidates]}
