@@ -32,6 +32,35 @@ import nx_policy
 
 # Present in a saved pipeline's args, but not a parameter of execute().
 NON_PARAM_KEYS = {"parameters_version"}
+# Never emit these as call kwargs: the renderer always supplies data_structure
+# itself, so a pipeline carrying it would produce a duplicate keyword and a
+# TypeError. validate() lets it through (it is an implicit arg), so the guard
+# belongs here.
+SKIP_ARG_KEYS = NON_PARAM_KEYS | {"data_structure"}
+
+
+def _comment(text, limit: int = 300) -> str:
+    """``text`` flattened so it cannot escape the comment it is written into.
+
+    Everything a pipeline carries — filter name, uuid, arg keys and values — is
+    attacker-controlled if the .d3dpipeline came from anywhere but this app,
+    and it all gets interpolated into `# ...` lines. A newline in a filter name
+    ends the comment and the rest becomes live code:
+
+        # [0] UNKNOWN FILTER — not in the installed package.
+        #      name: harmless
+        import os
+        os.system("...")            <- was inside filter.name
+
+    Verified against the real renderer before this existed. So: collapse every
+    newline/carriage return, and cap the length so a megabyte of junk cannot
+    bury the real output.
+    """
+    s = str(text)
+    s = s.replace("\r", " ").replace("\n", "\\n")
+    if len(s) > limit:
+        s = s[:limit] + "…"
+    return s
 
 
 def load_catalog(catalog: Any) -> dict:
@@ -139,23 +168,32 @@ def transpile(pipeline: Any, catalog: Any) -> dict:
     warnings: List[str] = []
 
     for i, step in enumerate(steps):
+        if not isinstance(step, dict):
+            body.append(f"# [{i}] SKIPPED — not an object")
+            body.append("")
+            continue
         filt = step.get("filter") or {}
+        if not isinstance(filt, dict):
+            filt = {}
         uuid = filt.get("uuid")
+        if not isinstance(uuid, (str, type(None))):
+            uuid = str(uuid)      # a list/dict uuid must not reach idx.get()
         jname = filt.get("name")
         if step.get("isDisabled"):
-            body.append(f"# [{i}] DISABLED in the pipeline: {jname}")
+            body.append(f"# [{i}] DISABLED in the pipeline: {_comment(jname)}")
             body.append("")
             continue
         if nx_policy.is_denied(uuid):
             # Rendering this as a live call would hand the user a script that
             # runs a shell. Emit it visibly instead — the transpiler's output
             # never passes through nx_generate.validate().
-            body.append(f"# [{i}] REFUSED — {jname}")
-            body.append(f"#      {nx_policy.reason(uuid)}")
+            body.append(f"# [{i}] REFUSED — {_comment(jname)}")
+            body.append(f"#      {_comment(nx_policy.reason(uuid))}")
             body.append(f"#      Its args were:")
             for k, v in (step.get("args") or {}).items():
                 if k not in NON_PARAM_KEYS:
-                    body.append(f"#        {k} = {unwrap(v)!r}")
+                    body.append(f"#        {_comment(k, 80)} = "
+                                f"{_comment(repr(unwrap(v)))}")
             body.append("")
             warnings.append(f"step {i}: {jname} is not permitted "
                             f"and was commented out, not transpiled.")
@@ -165,12 +203,13 @@ def transpile(pipeline: Any, catalog: Any) -> dict:
             # Never guess: an unknown UUID is not in the installed binary.
             body.append(f"# [{i}] UNKNOWN FILTER — not in the installed "
                         f"package.")
-            body.append(f"#      name: {jname}")
-            body.append(f"#      uuid: {uuid}")
+            body.append(f"#      name: {_comment(jname)}")
+            body.append(f"#      uuid: {_comment(uuid, 80)}")
             body.append(f"#      Its args are preserved below for reference:")
             for k, v in (step.get("args") or {}).items():
                 if k not in NON_PARAM_KEYS:
-                    body.append(f"#        {k} = {unwrap(v)!r}")
+                    body.append(f"#        {_comment(k, 80)} = "
+                                f"{_comment(repr(unwrap(v)))}")
             body.append("")
             unknown.append({"index": i, "uuid": uuid, "name": jname})
             continue
@@ -181,8 +220,8 @@ def transpile(pipeline: Any, catalog: Any) -> dict:
         valid = set(types)
         rendered: List[str] = []
         for k, raw in sorted((step.get("args") or {}).items()):
-            if k in NON_PARAM_KEYS:
-                continue          # bookkeeping, not an execute() parameter
+            if k in SKIP_ARG_KEYS:
+                continue      # bookkeeping, or supplied by the renderer itself
             v = unwrap(raw)
             if k not in valid:
                 warnings.append(
@@ -198,7 +237,8 @@ def transpile(pipeline: Any, catalog: Any) -> dict:
                 src = f"{src}  # TODO: verify type {types.get(k)}"
             rendered.append(f"    {k}={src},")
 
-        body.append(f"# [{i}] {entry.get('human_name') or entry['py_attr']}")
+        body.append(f"# [{i}] "
+                    f"{_comment(entry.get('human_name') or entry['py_attr'], 80)}")
         body.append(f"r{i} = {alias}.{entry['py_attr']}.execute(")
         body.append("    data_structure=ds,")
         body.extend(rendered)

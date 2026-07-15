@@ -2939,6 +2939,117 @@ def test_nx_capability_policy() -> None:
         _check("an ordinary pipeline still runs", False)
 
 
+def test_nx_hardening() -> None:
+    """Defects an adversarial pass found in Part B, each verified against the
+    real code before being fixed."""
+    try:
+        import time as _time
+        import nx_generate as gen
+        import nx_transpile as tp
+        import nx_worker as nw
+    except Exception as exc:  # pragma: no cover
+        _check(f"nx modules importable ({exc!r})", False)
+        return
+
+    cat = {"enums": {}, "filters": [
+        {"uuid": "u-w", "module": "simplnx", "alias": "nx",
+         "py_attr": "WriteDREAM3DFilter", "human_name": "Write DREAM3D",
+         "default_tags": [], "execute": {"params": [
+             {"name": "data_structure", "type": "simplnx.DataStructure",
+              "required": False},
+             {"name": "export_file_path", "type": "os.PathLike",
+              "required": True, "default": None}]}}]}
+
+    # CODE INJECTION: every value a pipeline carries is interpolated into a
+    # `# ...` line. A newline in filter.name ends the comment and the rest
+    # becomes live Python in the script handed to the user.
+    evil = {"pipeline": [{"filter": {
+        "name": 'ok\nimport os\nos.system("PWNED")', "uuid": "not-installed"},
+        "args": {"k\nimport sys": "v\nimport socket"}}]}
+    code = tp.transpile(evil, cat)["code"]
+    live = [ln for ln in code.splitlines()
+            if not ln.strip().startswith("#")
+            and ("import os" in ln or "os.system" in ln or "import sys" in ln
+                 or "import socket" in ln)]
+    _check("a newline in filter.name cannot inject code into the script",
+           live == [])
+    _check("the injected text survives as a flattened comment",
+           "\\n" in code and "PWNED" in code)
+    _check("the poisoned script is still valid python", _compiles(code))
+
+    # data_structure in args -> a duplicate kwarg at runtime. validate() lets it
+    # through as an implicit arg, so the renderer has to drop it.
+    dup = {"pipeline": [{"filter": {"name": "x", "uuid": "u-w"},
+                         "args": {"data_structure": "ds",
+                                  "export_file_path": "o.d3d"}}]}
+    dcode = tp.transpile(dup, cat)["code"]
+    _check("data_structure in args does not become a duplicate keyword",
+           dcode.count("data_structure=") == 1)
+
+    # A model reply that shows its working: the FINAL object is the answer.
+    _check("extract_json takes the last object, not the draft",
+           gen.extract_json('draft {"pipeline":["WRONG"]} final '
+                            '{"pipeline":["RIGHT"]}') == {"pipeline": ["RIGHT"]})
+    _check("a nested object does not shadow the real answer",
+           gen.extract_json('{"pipeline":[{"filter":{"uuid":"u"}}]}')
+           == {"pipeline": [{"filter": {"uuid": "u"}}]})
+    _check("a brace inside a string is not treated as a close",
+           gen.extract_json('{"note":"a } here","b":2}')
+           == {"note": "a } here", "b": 2})
+    t0 = _time.time()
+    gen.extract_json("{" * 6000)
+    _check("an unbalanced reply cannot hang the app",
+           (_time.time() - t0) < 1.0)
+
+    # A non-string uuid is unhashable: idx.get(uuid) raised TypeError straight
+    # out of generate() instead of becoming a repairable error.
+    errs = gen.validate({"pipeline": [{"filter": {"uuid": ["a", "b"]},
+                                       "args": {}}]}, cat)
+    _check("a non-string uuid is a repairable error, not a crash",
+           errs and "must be a string" in errs[0])
+
+    # Key presence is not supply.
+    _check("a required parameter set to null is rejected",
+           any("null" in e for e in gen.validate(
+               {"pipeline": [{"filter": {"uuid": "u-w"},
+                              "args": {"export_file_path": None}}]}, cat)))
+
+    # Plurals must meet their singulars, or a filter is missed for the obvious
+    # phrasing: 'surfaces' stemmed to 'surfac' while 'surface' stayed whole.
+    _check("a plural stems to its singular (surfaces/surface)",
+           gen._stem("surfaces") == gen._stem("surface"))
+    _check("images/image agree", gen._stem("images") == gen._stem("image"))
+    _check("stemming still finds smoothing from smooth",
+           gen._stem("smoothing") == "smooth")
+
+    # is_writer is a NAME test. A filter taking an output path without
+    # 'write'/'export' in its name was never containment-checked at all.
+    class _PF:
+        def __init__(self, p):
+            self._p = p
+
+        def get_args(self):
+            return {"output_path": self._p}
+
+    class _Pipe:
+        def __init__(self, m):
+            self._m = m
+
+        def __getitem__(self, i):
+            return self._m[i]
+
+    odd = [{"index": 0, "name": "Convert Thing", "is_reader": False,
+            "is_writer": False, "path_params": {"output_path": "path"}}]
+    try:
+        nw._check_writers(_Pipe({0: _PF("C:/somewhere/else.dat")}), odd,
+                          set(), Path("C:/allowed"))
+        _check("a path-taking filter that isn't named 'write' is still checked",
+               False)
+    except ValueError:
+        _check("a path-taking filter that isn't named 'write' is still checked",
+               True)
+
+
 def test_nx_script_gate() -> None:
     """The model WRITES the Python — filters as execute() lines plus whatever
     glue the task needs. A filter-selection cannot express the spec's own CSV
@@ -6138,6 +6249,8 @@ def main() -> int:
          test_nx_capability_policy)
     _run("SECURITY: nx script gate (model writes python; execution is gated)",
          test_nx_script_gate)
+    _run("nx hardening (comment injection, last-object, path checks)",
+         test_nx_hardening)
     _run("plot roles (datetime/bool ordering, coercion, no mutation)",
          test_plot_roles)
     _run("plot registry (role-gated catalog, validation, aggregation)",

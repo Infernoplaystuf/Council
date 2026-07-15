@@ -67,7 +67,14 @@ def _stem(t: str) -> str:
     for suf in ("ization", "isation", "ing", "ment", "ers", "er", "ed",
                 "es", "s"):
         if len(t) > len(suf) + 3 and t.endswith(suf):
-            return t[:-len(suf)]
+            stem = t[:-len(suf)]
+            # 'surfaces' -> 'surfac' would never meet 'surface' -> 'surface',
+            # so an e-final noun's plural stopped matching its singular. Keep
+            # the 'e' when stripping 'es'/'s' would strand a stem that reads
+            # like one.
+            if suf in ("es", "s") and stem.endswith(("c", "g", "v", "z")):
+                return stem + "e"
+            return stem
     return t
 
 
@@ -179,34 +186,54 @@ def extract_json(text: str) -> Optional[dict]:
     if not text:
         return None
     s = text.strip()
-    fence = re.search(r"```(?:json)?\s*(.+?)```", s, re.DOTALL)
-    if fence:
-        s = fence.group(1).strip()
-    start = s.find("{")
-    while start != -1:
-        depth, in_str, esc = 0, False, False
-        for i in range(start, len(s)):
-            ch = s[i]
-            if in_str:
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif ch == '"':
-                    in_str = False
-                continue
-            if ch == '"':
-                in_str = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(s[start:i + 1])
-                    except Exception:
-                        break
-        start = s.find("{", start + 1)
+    # The LAST fenced block, not the first: a reply that shows a draft and then
+    # the real answer would otherwise have its draft win.
+    fences = re.findall(r"```(?:json)?\s*(.+?)```", s, re.DOTALL)
+    if fences:
+        s = fences[-1].strip()
+    found = None
+    pos = 0
+    while True:
+        start = s.find("{", pos)
+        if start == -1:
+            return found
+        end = _balanced_end(s, start)
+        if end is None:
+            return found        # nothing balanced from here; stop scanning
+        try:
+            found = json.loads(s[start:end + 1])
+            # Resume AFTER the object just consumed. Resuming at start+1 walks
+            # back INTO it and lets a nested {"filter": ...} overwrite the real
+            # answer with one of its own children.
+            pos = end + 1
+        except Exception:
+            pos = start + 1     # not JSON; try the next brace along
+
+
+def _balanced_end(s: str, start: int) -> Optional[int]:
+    """Index of the '}' closing the object at ``start``, or None.
+
+    Brace-counting that respects strings and escapes — a '}' inside a quoted
+    value must not close the object."""
+    depth, in_str, esc = 0, False, False
+    for i in range(start, len(s)):
+        ch = s[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return i
     return None
 
 
@@ -245,6 +272,12 @@ def validate(pipeline: Any, catalog: dict) -> List[str]:
             errors.append(f"step {i}: 'filter.uuid' is required — copy it "
                           f"from the filter list")
             continue
+        if not isinstance(uuid, str):
+            # A list/dict uuid is unhashable: idx.get(uuid) would raise
+            # TypeError straight out of generate() instead of driving a repair.
+            errors.append(f"step {i}: 'filter.uuid' must be a string, got "
+                          f"{type(uuid).__name__}")
+            continue
         entry = idx.get(uuid)
         if entry is None:
             if nx_policy.is_denied(uuid):
@@ -272,10 +305,18 @@ def validate(pipeline: Any, catalog: dict) -> List[str]:
                     f"step {i} ({entry['py_attr']}): {k!r} is not a parameter "
                     f"of this filter. Valid keys: {near}")
         for p in _params_of(entry):
-            if p.get("required") and p["name"] not in args:
+            if not p.get("required"):
+                continue
+            if p["name"] not in args:
                 errors.append(
                     f"step {i} ({entry['py_attr']}): required parameter "
                     f"{p['name']!r} ({p.get('type')}) is missing")
+            elif args[p["name"]] is None:
+                # Key-presence alone is not supply: null reaches execute() and
+                # raises there, long after this was supposed to catch it.
+                errors.append(
+                    f"step {i} ({entry['py_attr']}): required parameter "
+                    f"{p['name']!r} is null — give it a value")
     return errors
 
 

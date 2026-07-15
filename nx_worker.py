@@ -180,7 +180,12 @@ def _check_writers(pipeline, steps, redirected, write_root) -> None:
     if not write_root:
         return
     for s in steps:
-        if not s["is_writer"]:
+        # NOT `if not s["is_writer"]: continue`. is_writer is a NAME test, so a
+        # filter that takes an output path without "write"/"export" in its name
+        # was never inspected at all. Readers are the only safe skip — reading
+        # cannot destroy anything; everything else is treated as a potential
+        # write and must land in the output area.
+        if s.get("is_reader") and not s.get("is_writer"):
             continue
         for key, kind in (s["path_params"] or {}).items():
             if (s["index"], key) in redirected:
