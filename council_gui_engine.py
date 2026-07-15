@@ -12389,27 +12389,42 @@ class CouncilConsole(tk.Tk):
         ttk.Label(plot_frame, textvariable=self._grapher_plot_label_var,
                   foreground="#a6e3a1").pack(anchor="w", padx=4)
 
+        # Two views. Inline is FIRST and default because it is the one that
+        # works on an air-gapped box: it draws an Agg figure straight onto a Tk
+        # canvas — no browser, no JavaScript, nothing to fetch. The HTML view
+        # needs plotly.js AND a JS engine; tkinterweb (tkhtml3) has no JS
+        # engine at all, so it can only ever show a static shell.
+        self._grapher_view_nb = ttk.Notebook(plot_frame)
+        self._grapher_view_nb.pack(fill="both", expand=True)
+
+        inline_tab = ttk.Frame(self._grapher_view_nb)
+        self._grapher_view_nb.add(inline_tab, text="\U0001f4c8 Plots (offline)")
+        self._build_grapher_inline(inline_tab)
+
+        web_tab = ttk.Frame(self._grapher_view_nb)
+        self._grapher_view_nb.add(web_tab, text="\U0001f310 Interactive (HTML)")
+
         self._grapher_web_frame = None
         if _TKWEB_OK:
             try:
                 self._grapher_web_frame = tkinterweb.HtmlFrame(
-                    plot_frame, messages_enabled=False)
+                    web_tab, messages_enabled=False)
                 self._grapher_web_frame.pack(fill="both", expand=True)
             except Exception:
                 self._grapher_web_frame = None
 
         if self._grapher_web_frame is None:
             ttk.Label(
-                plot_frame,
+                web_tab,
                 text="Interactive plots open in your browser.\n"
                      "Install tkinterweb for embedded view:\n"
                      "  pip install tkinterweb",
                 foreground="#d32f2f", font=("", 11),
             ).pack(expand=True)
-            ttk.Button(
-                plot_frame, text="\U0001f310 Open last plot in browser",
-                command=self._grapher_open_in_browser,
-            ).pack(pady=8)
+        ttk.Button(
+            web_tab, text="\U0001f310 Open last plot in browser",
+            command=self._grapher_open_in_browser,
+        ).pack(pady=8)
 
         stats_frame = ttk.LabelFrame(right_pane, text="Stats & AI Analysis")
         right_pane.add(stats_frame, height=180)
@@ -12640,6 +12655,11 @@ class CouncilConsole(tk.Tk):
         rows, cols = ds.shape
         self._grapher_status_var.set(
             f"\u2713 {path.name} \u2014 {rows:,} rows \u00d7 {cols} cols  [{ds.format}]")
+
+        try:
+            self._inline_refresh_columns()
+        except Exception as exc:
+            print(f"[Grapher] inline column refresh: {exc}")
 
         all_cols = ["\u2014"] + ds.all_columns
         num_cols = ["\u2014"] + ds.numeric_columns
@@ -12876,6 +12896,137 @@ class CouncilConsole(tk.Tk):
             self._grapher_show_stats(
                 f"Plot opened in browser: {hpath}\n\n"
                 + ge.DataAnalyser.describe(ds)[:800])
+
+    # ── Inline (offline) plots ────────────────────────────────────────────
+    #
+    # Pick columns; only the plots those columns can actually produce are
+    # offered (plot_registry.applicable), and the figure is drawn straight onto
+    # a Tk canvas. No browser, no JS, no network — so it works air-gapped.
+
+    def _build_grapher_inline(self, parent):
+        import tkinter as tk
+        try:
+            import plots_pane as _pp
+        except Exception as exc:
+            ttk.Label(parent, foreground="#d32f2f",
+                      text=f"Inline plots unavailable: {exc}").pack(expand=True)
+            self._inline_pane = None
+            return
+
+        bar = ttk.Frame(parent)
+        bar.pack(fill="x", padx=4, pady=3)
+
+        ttk.Label(bar, text="Columns:").pack(side="left")
+        self._inline_cols_lb = tk.Listbox(
+            bar, selectmode="extended", height=4, width=22,
+            exportselection=False, bg="#3a2828", fg="#d4d4d4",
+            highlightthickness=0)
+        self._inline_cols_lb.pack(side="left", padx=(4, 8))
+        self._inline_cols_lb.bind("<<ListboxSelect>>",
+                                  lambda e: self._inline_refresh_plots())
+
+        right = ttk.Frame(bar)
+        right.pack(side="left", fill="x", expand=True)
+
+        row1 = ttk.Frame(right)
+        row1.pack(fill="x", pady=1)
+        ttk.Label(row1, text="Plot:", width=5).pack(side="left")
+        self._inline_kind_var = tk.StringVar()
+        self._inline_kind_cb = ttk.Combobox(
+            row1, textvariable=self._inline_kind_var, state="readonly", width=26)
+        self._inline_kind_cb.pack(side="left", padx=3)
+        ttk.Label(row1, text="Agg:").pack(side="left", padx=(8, 0))
+        self._inline_agg_var = tk.StringVar(value="sum")
+        ttk.Combobox(row1, textvariable=self._inline_agg_var, state="readonly",
+                     width=8, values=list(("sum", "mean", "count", "median",
+                                           "min", "max"))).pack(side="left",
+                                                                padx=3)
+        ttk.Button(row1, text="\U0001f4c8 Plot",
+                   command=self._inline_plot).pack(side="left", padx=6)
+
+        row2 = ttk.Frame(right)
+        row2.pack(fill="x", pady=1)
+        self._inline_hint_var = tk.StringVar(value="Load a data file.")
+        ttk.Label(row2, textvariable=self._inline_hint_var,
+                  foreground="#9a8c8c").pack(side="left")
+
+        self._inline_pane = _pp.PlotsPane(parent)
+        self._inline_pane.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        self._inline_roles = {}
+        self._inline_df = None
+
+    def _inline_refresh_columns(self):
+        """Repopulate the column list from the loaded dataset."""
+        if getattr(self, "_inline_pane", None) is None:
+            return
+        import plot_roles as _pr
+        ds = self._grapher_dataset
+        self._inline_cols_lb.delete(0, "end")
+        if ds is None or ds.df is None:
+            self._inline_df, self._inline_roles = None, {}
+            self._inline_hint_var.set("Load a data file.")
+            return
+        # Recover dates that arrived as strings (CSV is read without
+        # parse_dates), so the time-series plots become available at all.
+        self._inline_df = _pr.coerce_datetime_columns(ds.df)
+        self._inline_roles = _pr.infer_roles(self._inline_df)
+        for col in self._inline_df.columns:
+            role = self._inline_roles.get(col, "?")
+            self._inline_cols_lb.insert("end", f"{col}   [{role[:4]}]")
+        self._inline_hint_var.set("Select one or more columns.")
+        self._inline_refresh_plots()
+
+    def _inline_selected_columns(self):
+        if getattr(self, "_inline_pane", None) is None or self._inline_df is None:
+            return []
+        cols = list(self._inline_df.columns)
+        return [cols[i] for i in self._inline_cols_lb.curselection()
+                if 0 <= i < len(cols)]
+
+    def _inline_refresh_plots(self):
+        """Offer ONLY the plots this column selection can actually draw."""
+        if getattr(self, "_inline_pane", None) is None:
+            return
+        import plot_registry as _reg
+        cols = self._inline_selected_columns()
+        if not cols:
+            self._inline_kind_cb.configure(values=[])
+            self._inline_kind_var.set("")
+            self._inline_hint_var.set("Select one or more columns.")
+            return
+        kinds = _reg.applicable(self._inline_roles, cols)
+        labels = [f"{k.label}  ({k.key})" for k in kinds]
+        self._inline_kind_cb.configure(values=labels)
+        if labels and self._inline_kind_var.get() not in labels:
+            self._inline_kind_var.set(labels[0])
+        if not labels:
+            self._inline_kind_var.set("")
+            self._inline_hint_var.set(
+                f"No plot fits {len(cols)} column(s) of those types — "
+                "try adding a numeric or category column.")
+        else:
+            self._inline_hint_var.set(f"{len(labels)} plot(s) fit this selection.")
+
+    def _inline_plot(self):
+        if getattr(self, "_inline_pane", None) is None:
+            return
+        import plot_registry as _reg
+        cols = self._inline_selected_columns()
+        label = self._inline_kind_var.get()
+        if not cols or not label:
+            self._inline_hint_var.set("Pick columns and a plot type first.")
+            return
+        key = label.rsplit("(", 1)[-1].rstrip(")").strip()
+        try:
+            fig = _reg.build(key, self._inline_df, cols,
+                             agg=self._inline_agg_var.get())
+            self._inline_pane.add_figure(fig)
+            self._inline_hint_var.set(
+                f"{key}: {', '.join(str(c) for c in cols)}")
+        except Exception as exc:
+            # A builder raises a plain-English reason; show that, not a
+            # traceback, and never a half-drawn chart.
+            self._inline_hint_var.set(f"✗ {exc}")
 
     def _grapher_open_in_browser(self):
         if self._last_html_path and self._last_html_path.exists():

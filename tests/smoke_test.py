@@ -2649,6 +2649,96 @@ def test_plots_pane_core() -> None:
            len(plt.get_fignums()) == before)
 
 
+def test_grapher_inline_wiring() -> None:
+    """The Grapher's offline pane, driven for real: load a frame, select
+    columns, see only the plots that fit, and render one into the pane.
+
+    Needs a display for Tk. A missing display is environmental and skipped; a
+    missing MODULE is a defect and fails."""
+    try:
+        import warnings
+        import pandas as pd
+        import council_gui_engine as cge
+        import plots_pane  # noqa: F401
+        import plot_registry  # noqa: F401
+        from graph_data import DataSet
+        import tkinter as tk
+        from tkinter import ttk
+    except Exception as exc:  # pragma: no cover
+        _check(f"grapher inline modules importable ({exc!r})", False)
+        return
+    try:
+        root = tk.Tk()
+        root.withdraw()
+    except Exception as exc:  # pragma: no cover  (headless CI: no display)
+        print(f"    (skipped — no display: {exc!r})")
+        return
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            C = cge.CouncilConsole
+            frame = ttk.Frame(root)
+            frame.pack()
+
+            class _Fake:
+                pass
+
+            f = _Fake()
+            for m in ("_build_grapher_inline", "_inline_refresh_columns",
+                      "_inline_selected_columns", "_inline_refresh_plots",
+                      "_inline_plot"):
+                setattr(f, m, getattr(C, m).__get__(f))
+
+            f._build_grapher_inline(frame)
+            _check("the offline plots pane builds", f._inline_pane is not None)
+
+            df = pd.DataFrame({
+                "when": pd.date_range("2024-01-01", periods=6).astype(str),
+                "build": ["A", "B", "A", "B", "C", "C"],
+                "yield": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            })
+            f._grapher_dataset = DataSet(name="d", source_path=Path("d.csv"),
+                                         format="csv", df=df)
+            f._inline_refresh_columns()
+            root.update()
+            _check("loading a file lists its columns",
+                   f._inline_cols_lb.size() == 3)
+            _check("string dates are recovered on load, enabling time plots",
+                   f._inline_roles.get("when") == "datetime")
+
+            cols = list(f._inline_df.columns)
+            f._inline_cols_lb.selection_clear(0, "end")
+            f._inline_cols_lb.selection_set(cols.index("build"))
+            f._inline_cols_lb.selection_set(cols.index("yield"))
+            f._inline_refresh_plots()
+            root.update()
+            opts = list(f._inline_kind_cb.cget("values"))
+            _check("a category+numeric selection offers bar",
+                   any("(bar)" in o for o in opts))
+            _check("only fitting plots are offered", 0 < len(opts) < 31)
+
+            f._inline_kind_var.set([o for o in opts if "(bar)" in o][0])
+            f._inline_agg_var.set("sum")
+            f._inline_plot()
+            root.update()
+            _check("plotting renders a figure into the pane",
+                   f._inline_pane.count == 1)
+
+            f._inline_cols_lb.selection_clear(0, "end")
+            f._inline_refresh_plots()
+            f._inline_plot()
+            root.update()
+            _check("an empty selection reports a reason, not a traceback",
+                   f._inline_pane.count == 1
+                   and "Pick columns" in f._inline_hint_var.get())
+    finally:
+        try:
+            root.destroy()
+        except Exception:
+            pass
+
+
 def test_graph_engine_correctness() -> None:
     """The graph engine must never present a fabricated or mis-aligned result,
     and an interactive chart must render on an air-gapped machine."""
@@ -5286,6 +5376,8 @@ def main() -> int:
          test_plot_registry_renders_all)
     _run("plots pane core (thumbnails, no pyplot leak)",
          test_plots_pane_core)
+    _run("grapher inline wiring (columns -> valid plots -> render)",
+         test_grapher_inline_wiring)
     _run("route_message golden (routing unchanged)",
          test_route_message_golden)
     _run("read-file injection memo (identical + invalidates)",
