@@ -117,6 +117,57 @@ def _describe(pipeline) -> list:
     return steps
 
 
+def _get_path(pf, key: str, kind: str):
+    """The path a parameter currently points at, or None."""
+    args = pf.get_args()
+    if key not in args:
+        return None
+    v = args[key]
+    if kind == "import_data":
+        return getattr(v, "file_path", None)
+    return v
+
+
+def _under(root: Path, p) -> bool:
+    """Is ``p`` inside ``root``? Resolved, so ../ cannot walk out."""
+    try:
+        rp = Path(str(p)).resolve()
+        rr = Path(str(root)).resolve()
+    except Exception:
+        return False
+    return rp == rr or rr in rp.parents
+
+
+def _check_writers(pipeline, steps, redirected, write_root) -> None:
+    """Every writer must target ``write_root``. Raises otherwise.
+
+    Redirecting the reader and the writer is NOT enough. A pipeline can
+    contain more than one writer, and only one gets redirected — the other
+    keeps whatever path it was saved with, which for a model-generated
+    pipeline is a path the model chose. Verified: a two-writer pipeline wrote
+    into the read-only input area while the runner reported success, because
+    the out_dir guard only governs where the RUNNER writes, not where a
+    writer filter's own argument points.
+    """
+    if not write_root:
+        return
+    for s in steps:
+        if not s["is_writer"]:
+            continue
+        for key, kind in (s["path_params"] or {}).items():
+            if (s["index"], key) in redirected:
+                continue
+            cur = _get_path(pipeline[s["index"]], key, kind)
+            if cur in (None, ""):
+                continue
+            if not _under(write_root, cur):
+                raise ValueError(
+                    f"step {s['index']} ({s['name']}) would write outside the "
+                    f"allowed output area.\n  its {key!r} points at: {cur}\n"
+                    f"  allowed root: {write_root}\n"
+                    f"This pipeline is refused rather than run.")
+
+
 def _set_path(pf, key: str, kind: str, value: str) -> bool:
     """Point one path parameter at ``value``. True if it took."""
     args = pf.get_args()
@@ -181,6 +232,9 @@ def h_run_folder(job) -> dict:
     write_index = job.get("write_index")
     out_suffix = job.get("out_suffix", "_out.dream3d")
     limit = int(job.get("limit", 0)) or None
+    # Every writer in the pipeline must land inside this, not just the one the
+    # runner redirects. The bridge always supplies it.
+    write_root = job.get("write_root") or job.get("out_dir")
 
     out_dir.mkdir(parents=True, exist_ok=True)
     srcs = sorted(q for q in in_dir.glob(pattern) if q.is_file())
@@ -214,6 +268,7 @@ def h_run_folder(job) -> dict:
             if not _set_path(p[r_idx], r_key, r_kind, str(src)):
                 raise ValueError(f"Could not set {r_key!r} on step {r_idx}.")
             rec["read_set"] = {"index": r_idx, "key": r_key, "kind": r_kind}
+            redirected = {(r_idx, r_key)}
 
             # Resolve the writer the same way (last matching step).
             w_idx = write_index
@@ -228,6 +283,12 @@ def h_run_folder(job) -> dict:
                     if _set_path(p[w_idx], w_key, w_kind, str(dest)):
                         rec["write_set"] = {"index": w_idx, "key": w_key,
                                             "dest": str(dest)}
+                        redirected.add((w_idx, w_key))
+
+            # Refuse the whole run if ANY other writer aims outside the
+            # allowed output area — checked BEFORE execute, so nothing is
+            # written at all.
+            _check_writers(p, steps, redirected, write_root)
 
             result = p.execute(nx.DataStructure())
             errs = [str(e) for e in getattr(result, "errors", [])]
@@ -242,10 +303,53 @@ def h_run_folder(job) -> dict:
             "failed": sum(1 for r in runs if not r["ok"]), "runs": runs}
 
 
+def h_preflight(job) -> dict:
+    """Per-filter ARGUMENT validation for a saved pipeline.
+
+    What this is NOT: a whole-pipeline dry-run. There is no pipeline-level
+    preflight in this build — nx.Pipeline exposes none — and
+    IFilter.preflight2 does NOT propagate the data structure (it comes back
+    empty), so preflighting step 2 cannot see what step 1 would have created.
+    A later step that consumes an earlier step's output will therefore report
+    a missing path here even when the pipeline is fine.
+
+    So: errors here are real for step 0 and for any step whose inputs already
+    exist, and 'missing path' errors on later steps are inconclusive. The
+    reliable gate is a limit=1 trial run (run_folder), where simplnx executes
+    and reports its own errors. This is reported honestly rather than dressed
+    up as a dry-run.
+    """
+    import simplnx as nx
+    p = nx.Pipeline.from_file(str(job["pipeline"]))
+    ds = nx.DataStructure()
+    steps = []
+    for i in range(p.size()):
+        pf = p[i]
+        rec = {"index": i, "name": _attr(pf, "human_name"), "errors": []}
+        try:
+            filt = pf.get_filter()
+            args = {k: v for k, v in pf.get_args().items()
+                    if k != "parameters_version"}
+            res = filt.preflight2(ds, **args)
+            # get_result() returns a LIST of errors ([] == valid), not a
+            # Result object with .errors.
+            rec["errors"] = [str(e) for e in (res.get_result() or [])]
+        except Exception as exc:
+            rec["errors"] = [f"{type(exc).__name__}: {exc}"]
+        rec["ok"] = not rec["errors"]
+        steps.append(rec)
+    return {"steps": steps,
+            "first_step_ok": steps[0]["ok"] if steps else False,
+            "note": "per-filter argument check only; preflight does not "
+                    "propagate the data structure, so 'missing path' on a "
+                    "later step is inconclusive. Use a limit=1 run to be sure."}
+
+
 HANDLERS = {
     "ping": h_ping,
     "catalog": h_catalog,
     "describe": h_describe,
+    "preflight": h_preflight,
     "run_folder": h_run_folder,
 }
 

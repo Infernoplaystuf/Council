@@ -2555,6 +2555,58 @@ def test_nx_bridge() -> None:
                 _check(f"refuses to write to {label}",
                        "refusing to write outside" in str(exc))
 
+    # ---- EVERY writer must land in the output area ---------------------
+    # Redirecting the reader and "the" writer is not enough: a pipeline can
+    # hold more than one writer and only one gets redirected, so the other
+    # keeps the path it was saved with — which for a model-generated pipeline
+    # is a path the model chose. Verified against the real install: a
+    # two-writer pipeline wrote into the READ-ONLY INPUT AREA while the runner
+    # reported success, because out_dir only governs where the RUNNER writes,
+    # not where a writer filter's own argument points.
+    _check("_under resolves ../ before deciding containment",
+           nw._under(Path("/a/b"), "/a/b/c/d")
+           and not nw._under(Path("/a/b"), "/a/b/../../etc")
+           and not nw._under(Path("/a/b"), "/a/bb/c"))
+
+    class _FakePF:
+        def __init__(self, path):
+            self._p = path
+
+        def get_args(self):
+            return {"export_file_path": self._p}
+
+    class _FakePipe:
+        def __init__(self, m):
+            self._m = m
+
+        def __getitem__(self, i):
+            return self._m[i]
+
+    with _tf.TemporaryDirectory() as td:
+        root = Path(td) / "out"
+        root.mkdir()
+        steps = [{"index": 0, "name": "W0", "is_writer": True,
+                  "path_params": {"export_file_path": "path"}},
+                 {"index": 1, "name": "W1", "is_writer": True,
+                  "path_params": {"export_file_path": "path"}}]
+        # step 1 is redirected into the output area; step 0 aims elsewhere.
+        pipe = _FakePipe({0: _FakePF(str(Path(td) / "victim.dream3d")),
+                          1: _FakePF(str(root / "ok.dream3d"))})
+        try:
+            nw._check_writers(pipe, steps, {(1, "export_file_path")}, root)
+            _check("a second writer aiming outside the output area is refused",
+                   False)
+        except ValueError as exc:
+            _check("a second writer aiming outside the output area is refused",
+                   "would write outside" in str(exc) and "step 0" in str(exc))
+        inside = _FakePipe({0: _FakePF(str(root / "a.dream3d")),
+                            1: _FakePF(str(root / "ok.dream3d"))})
+        try:
+            nw._check_writers(inside, steps, {(1, "export_file_path")}, root)
+            _check("writers already inside the output area are allowed", True)
+        except ValueError:
+            _check("writers already inside the output area are allowed", False)
+
     # ---- failure paths -------------------------------------------------
     _check("a missing nx env raises a NxError naming the fix",
            _raises(nb.NxError,
@@ -2606,9 +2658,27 @@ def test_nx_bridge() -> None:
             else:
                 os.environ["COUNCIL_NX_PYTHON"] = real_env
 
-    _check("an unknown action is rejected by the worker",
-           "unknown action" in _json.dumps(sorted(nw.HANDLERS)) or
-           set(nw.HANDLERS) == {"ping", "catalog", "describe", "run_folder"})
+    # An unknown action must produce an error payload naming the known ones,
+    # not a traceback and not silence. Driven through main() so the real
+    # dispatch runs (no simplnx needed — it never reaches a handler).
+    with _tf.TemporaryDirectory() as td:
+        jp, rp = Path(td) / "job.json", Path(td) / "res.json"
+        jp.write_text(_json.dumps({"action": "not_a_real_action"}),
+                      encoding="utf-8")
+        argv = sys.argv[:]
+        try:
+            sys.argv = ["nx_worker.py", str(jp), str(rp)]
+            code = nw.main()
+        finally:
+            sys.argv = argv
+        payload = _json.loads(rp.read_text(encoding="utf-8"))
+        _check("an unknown action is rejected with a non-zero exit",
+               code != 0 and payload.get("ok") is False)
+        _check("the rejection names the actions that DO exist",
+               "unknown action" in payload.get("error", "")
+               and "run_folder" in payload.get("error", ""))
+    _check("the worker exposes the four job types the bridge calls",
+           {"ping", "catalog", "describe", "run_folder"} <= set(nw.HANDLERS))
 
 
 def test_nx_transpile() -> None:
@@ -2749,6 +2819,142 @@ def _compiles(src: str) -> bool:
         return True
     except SyntaxError:
         return False
+
+
+def test_nx_generate() -> None:
+    """Natural language -> a validated DREAM3D-NX pipeline.
+
+    The model never writes code and never recalls a binding: it picks from a
+    shortlist retrieved out of the catalog of the INSTALLED package, and every
+    uuid and arg key is checked back against that catalog. Pure — no simplnx,
+    and the 'model' here is a scripted function so the tests are deterministic."""
+    try:
+        import json as _json
+        import nx_generate as gen
+    except Exception as exc:  # pragma: no cover
+        _check(f"nx_generate importable ({exc!r})", False)
+        return
+
+    RD = "0dbd31c7-19e0-4077-83ef-f4a6459a0e2d"
+    WD = "b3a95784-2ced-41ec-8d3d-0242ac130003"
+    catalog = {
+        "enums": {},
+        "filters": [
+            {"uuid": RD, "module": "simplnx", "alias": "nx",
+             "py_attr": "ReadDREAM3DFilter",
+             "human_name": "Read DREAM3D-NX File", "default_tags": ["io"],
+             "execute": {"params": [
+                 {"name": "data_structure", "type": "simplnx.DataStructure",
+                  "required": False},
+                 {"name": "import_data_object",
+                  "type": "simplnx.Dream3dImportParameter.ImportData",
+                  "required": False, "default": "ImportData()"}]}},
+            {"uuid": WD, "module": "simplnx", "alias": "nx",
+             "py_attr": "WriteDREAM3DFilter",
+             "human_name": "Write DREAM3D-NX File", "default_tags": ["io"],
+             "execute": {"params": [
+                 {"name": "data_structure", "type": "simplnx.DataStructure",
+                  "required": False},
+                 {"name": "export_file_path", "type": "os.PathLike",
+                  "required": True, "default": None},
+                 {"name": "write_xdmf_file", "type": "bool",
+                  "required": False, "default": "True"}]}},
+            {"uuid": "u-smooth", "module": "simplnx", "alias": "nx",
+             "py_attr": "LaplacianSmoothingFilter",
+             "human_name": "Laplacian Smoothing", "default_tags": ["mesh"],
+             "execute": {"params": [
+                 {"name": "data_structure", "type": "simplnx.DataStructure",
+                  "required": False}]}},
+        ],
+    }
+
+    # ---- retrieval: model-free, and the stemmer earns its keep -------
+    got = [e["py_attr"] for e in gen.retrieve(catalog, "read a dream3d file")]
+    _check("retrieval finds the right filter for a plain request",
+           "ReadDREAM3DFilter" in got)
+    _check("'smooth' finds 'Laplacian Smoothing' (stemming)",
+           "LaplacianSmoothingFilter" in
+           [e["py_attr"] for e in gen.retrieve(catalog, "smooth the mesh")])
+    _check("a stop-word-only request retrieves nothing rather than noise",
+           gen.retrieve(catalog, "the a of to") == [])
+
+    # ---- the prompt is the vocabulary --------------------------------
+    prompt = gen.build_prompt("read a file", gen.retrieve(catalog, "read"))
+    _check("the prompt carries the REAL uuid to copy", RD in prompt)
+    _check("the prompt carries the REAL parameter keys",
+           "import_data_object" in prompt)
+
+    # ---- extract_json: balanced scan, not a greedy regex --------------
+    _check("json inside a code fence is found",
+           gen.extract_json('```json\n{"pipeline": []}\n```') == {"pipeline": []})
+    _check("json with prose around it is found",
+           gen.extract_json('Sure!\n{"pipeline": []}\nHope that helps.')
+           == {"pipeline": []})
+    # A greedy '{.*}' would swallow the trailing brace and fail to parse —
+    # the exact bug that made the Grapher's analyst silently drop good specs.
+    _check("a trailing brace after the object does not break parsing",
+           gen.extract_json('{"pipeline": []}\n} oops') == {"pipeline": []})
+    _check("a non-json reply is reported, not crashed",
+           gen.extract_json("I cannot do that") is None)
+
+    # ---- validation: the guard ---------------------------------------
+    ok_pipe = {"pipeline": [{"filter": {"name": "x", "uuid": RD}, "args": {}}]}
+    _check("a real uuid with real args validates",
+           gen.validate(ok_pipe, catalog) == [])
+    _check("an invented uuid is rejected",
+           any("not in the installed package" in e for e in gen.validate(
+               {"pipeline": [{"filter": {"name": "x", "uuid": "made-up"},
+                              "args": {}}]}, catalog)))
+    # The spec itself hardcodes this key; it exists on no filter.
+    _check("a bogus arg key is rejected (the spec's own import_file_path)",
+           any("import_file_path" in e for e in gen.validate(
+               {"pipeline": [{"filter": {"name": "x", "uuid": RD},
+                              "args": {"import_file_path": "a.d3d"}}]},
+               catalog)))
+    _check("a missing REQUIRED parameter is reported",
+           any("export_file_path" in e and "required" in e
+               for e in gen.validate(
+                   {"pipeline": [{"filter": {"name": "x", "uuid": WD},
+                                  "args": {}}]}, catalog)))
+    _check("a step with no uuid is rejected",
+           gen.validate({"pipeline": [{"filter": {"name": "x"}, "args": {}}]},
+                        catalog) != [])
+    _check("an empty pipeline is rejected",
+           gen.validate({"pipeline": []}, catalog) != [])
+    _check("garbage shapes are rejected, not crashed",
+           all(gen.validate(x, catalog) != []
+               for x in ("a string", 42, None, {"nope": 1},
+                         {"pipeline": "not a list"},
+                         {"pipeline": [42]},
+                         {"pipeline": [{"filter": {"uuid": RD},
+                                        "args": "not a dict"}]})))
+
+    # ---- the loop: repair once, then FAIL CLOSED ----------------------
+    seen = []
+
+    def _flaky(p):
+        seen.append(p)
+        if len(seen) == 1:
+            return '{"pipeline":[{"filter":{"name":"x","uuid":"bogus"},"args":{}}]}'
+        return _json.dumps(ok_pipe)
+
+    r = gen.generate("read a dream3d file", catalog, _flaky)
+    _check("a bad uuid is repaired on the second pass",
+           r["ok"] and r["attempts"] == 2)
+    _check("the repair prompt tells the model exactly what was wrong",
+           "not in the installed package" in seen[1])
+
+    r2 = gen.generate("read a dream3d file", catalog,
+                      lambda p: '{"pipeline":[{"filter":{"name":"x",'
+                                '"uuid":"still-bogus"},"args":{}}]}')
+    _check("a model that never validates FAILS — nothing is passed through",
+           r2["ok"] is False and r2["errors"])
+    _check("a model that returns nothing fails cleanly",
+           gen.generate("read a dream3d file", catalog,
+                        lambda p: "")["ok"] is False)
+    _check("a request matching no filter fails before calling the model",
+           gen.generate("the a of", catalog,
+                        lambda p: "should not be called")["attempts"] == 0)
 
 
 def test_plot_roles() -> None:
@@ -5707,6 +5913,8 @@ def main() -> int:
          test_nx_bridge)
     _run("nx transpile (.d3dpipeline -> runnable Python, UUID-keyed)",
          test_nx_transpile)
+    _run("nx generate (retrieval, constrained JSON, validate, repair)",
+         test_nx_generate)
     _run("plot roles (datetime/bool ordering, coercion, no mutation)",
          test_plot_roles)
     _run("plot registry (role-gated catalog, validation, aggregation)",

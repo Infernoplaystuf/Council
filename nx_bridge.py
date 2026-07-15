@@ -170,6 +170,7 @@ def run_folder(pipeline: Any, in_dir: Any, out_dir: Any, *,
     the only side that knows what the vault is.
     """
     out_dir = Path(out_dir).resolve()
+    write_root = out_dir
     if vault_dir is not None:
         try:
             import data_index
@@ -180,11 +181,13 @@ def run_folder(pipeline: Any, in_dir: Any, out_dir: Any, *,
             raise NxError(
                 f"refusing to write outside the vault output area.\n"
                 f"  asked for: {out_dir}\n  allowed   : {allowed}")
+        write_root = allowed
     job = {
         "action": "run_folder",
         "pipeline": str(pipeline),
         "in_dir": str(Path(in_dir).resolve()),
         "out_dir": str(out_dir),
+        "write_root": str(write_root),
         "glob": glob,
         "read_index": read_index,
         "write_index": write_index,
