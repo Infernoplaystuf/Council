@@ -2821,6 +2821,129 @@ def _compiles(src: str) -> bool:
         return False
 
 
+def test_nx_capability_policy() -> None:
+    """A real UUID is NOT a sanctioned UUID.
+
+    Part B sanctions filters by PROVENANCE ('is this uuid in the installed
+    binary?'). That says where a filter came from, not what it can do — and two
+    of the installed 289 execute arbitrary code. Verified against the real
+    install before this policy existed: retrieval ranked 'Execute Process' the
+    #1 hit for "run a process", validate() approved it, and a Read + Execute
+    Process pipeline ran to completion with h_run_folder reporting ok=1,
+    failed=0 while the spawned shell wrote its marker file. A spawned process
+    is bound by none of this app's guarantees: it is not a writer, so the
+    output-area check never inspects it, and it needs no network, so being
+    air-gapped does not stop `del /s /q`.
+    """
+    try:
+        import nx_generate as gen
+        import nx_policy
+        import nx_transpile as tp
+        import nx_worker as nw
+    except Exception as exc:  # pragma: no cover
+        _check(f"nx policy modules importable ({exc!r})", False)
+        return
+
+    EP = "fb511a70-2175-4595-8c11-d1b5b6794221"   # Execute Process — a shell
+    PY = "1a35f50d-a9f5-9ea2-af70-5b9cf894e45f"   # Create Python Plugin
+
+    _check("the shell filter is denied by uuid", nx_policy.is_denied(EP))
+    _check("the python-codegen filter is denied by uuid", nx_policy.is_denied(PY))
+    _check("an ordinary filter is not denied",
+           not nx_policy.is_denied("0dbd31c7-19e0-4077-83ef-f4a6459a0e2d"))
+    _check("the refusal explains itself in plain language",
+           "shell" in (nx_policy.reason(EP) or "").lower())
+
+    catalog = {
+        "enums": {},
+        "filters": [
+            {"uuid": EP, "module": "simplnx", "alias": "nx",
+             "py_attr": "ExecuteProcessFilter", "human_name": "Execute Process",
+             "default_tags": [], "execute": {"params": [
+                 {"name": "data_structure", "type": "simplnx.DataStructure",
+                  "required": False},
+                 {"name": "arguments", "type": "str", "required": False,
+                  "default": "'x'"}]}},
+            {"uuid": "u-ok", "module": "simplnx", "alias": "nx",
+             "py_attr": "ReadDREAM3DFilter",
+             "human_name": "Read DREAM3D-NX File", "default_tags": [],
+             "execute": {"params": [
+                 {"name": "data_structure", "type": "simplnx.DataStructure",
+                  "required": False}]}},
+        ],
+    }
+    _check("permitted_filters drops the outliers, keeps the rest",
+           [f["uuid"] for f in nx_policy.permitted_filters(catalog)] == ["u-ok"])
+
+    # 1) The model must never even SEE it. Retrieval used to rank it #1 for
+    #    "run a process", handing over the uuid the prompt says to copy.
+    _check("retrieval never surfaces a code-execution filter",
+           "Execute Process" not in
+           [e["human_name"] for e in gen.retrieve(catalog, "execute a process")])
+
+    rce = {"pipeline": [{"filter": {"name": "x", "uuid": EP},
+                         "args": {"arguments": "cmd /c del /f /s /q C:/data"}}]}
+    # 2) ...and if it emits one anyway, it must not validate. Note the args are
+    #    all REAL keys of a REAL uuid, so every other check passes.
+    errs = gen.validate(rce, catalog)
+    _check("a shell pipeline does NOT validate", errs != [])
+    _check("the validation error says it is not permitted",
+           any("not permitted" in e for e in errs))
+    _check("generate() fails closed on a shell pipeline",
+           gen.generate("execute a process", catalog,
+                        lambda p: _json_dumps(rce))["ok"] is False)
+
+    # 3) The transpiler never passes through validate() at all, so it must
+    #    refuse independently rather than hand back a script that runs a shell.
+    out = tp.transpile(rce, catalog)
+    _check("the transpiler emits no live call for a denied filter",
+           ".execute(" not in out["code"] and "REFUSED" in out["code"])
+    _check("the transpiler warns about what it refused",
+           any("not permitted" in w for w in out["warnings"]))
+
+    # 4) THE load-bearing one: a saved .d3dpipeline reaching the worker never
+    #    passes through validate(). _check_capability must refuse it there.
+    class _FakeFilter:
+        def __init__(self, u):
+            self.uuid = u
+
+    class _FakePF:
+        def __init__(self, u, n):
+            self._f, self.human_name, self.name = _FakeFilter(u), n, n
+
+        def get_filter(self):
+            return self._f
+
+    class _FakePipe:
+        def __init__(self, steps):
+            self._s = steps
+
+        def size(self):
+            return len(self._s)
+
+        def __getitem__(self, i):
+            return self._s[i]
+
+    denied_pipe = _FakePipe([_FakePF("u-ok", "Read"),
+                             _FakePF(EP, "Execute Process")])
+    try:
+        nw._check_capability(denied_pipe)
+        _check("the worker refuses a saved pipeline containing a shell", False)
+    except ValueError as exc:
+        _check("the worker refuses a saved pipeline containing a shell",
+               "refused" in str(exc) and "step 1" in str(exc))
+    try:
+        nw._check_capability(_FakePipe([_FakePF("u-ok", "Read")]))
+        _check("an ordinary pipeline still runs", True)
+    except ValueError:
+        _check("an ordinary pipeline still runs", False)
+
+
+def _json_dumps(o) -> str:
+    import json as _j
+    return _j.dumps(o)
+
+
 def test_nx_generate() -> None:
     """Natural language -> a validated DREAM3D-NX pipeline.
 
@@ -5915,6 +6038,8 @@ def main() -> int:
          test_nx_transpile)
     _run("nx generate (retrieval, constrained JSON, validate, repair)",
          test_nx_generate)
+    _run("SECURITY: nx capability policy (a real uuid is not a sanctioned uuid)",
+         test_nx_capability_policy)
     _run("plot roles (datetime/bool ordering, coercion, no mutation)",
          test_plot_roles)
     _run("plot registry (role-gated catalog, validation, aggregation)",

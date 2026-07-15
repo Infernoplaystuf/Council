@@ -4,10 +4,24 @@ nx_generate.py — a DREAM3D-NX pipeline from a natural-language request.
 Runs in the APP env (pure: catalog + text), so it is testable without simplnx.
 
 The model is kept on rails. It never writes code and never recalls a binding
-from memory: it PICKS from a shortlist of filters that were retrieved out of
-the catalog of the INSTALLED binary, and every UUID and argument key it emits
-is checked back against that catalog before anything runs. The worst case is a
-suboptimal filter choice, never a hallucinated call.
+from memory: it PICKS from a shortlist of filters retrieved out of the catalog
+of the INSTALLED binary, and every UUID and argument key it emits is checked
+back against that catalog before anything runs.
+
+That is necessary but NOT sufficient, and an earlier version of this docstring
+claimed otherwise ("the worst case is a suboptimal filter choice, never a
+hallucinated call"). It was wrong. Being in the catalog says where a filter
+came from, not what it can do, and two of the 289 execute arbitrary code —
+Execute Process is a shell. Retrieval ranked it the #1 hit for "run a process",
+so the model was handed the UUID to copy, and validate() approved it. Capability
+is now denied by UUID via nx_policy, at BOTH ends: denied filters are never
+retrieved (so the model never sees one) and never validate (so an emitted one
+is rejected and drives the repair pass).
+
+Note the shortlist is not a boundary either: validate() indexes the whole
+catalog, so a UUID the retriever never surfaced still validates. That is
+deliberate — a saved pipeline is legitimate — which is exactly why the
+load-bearing capability check lives in nx_worker, on the executing side.
 
     request ──▶ retrieve(k)          lexical, deterministic, no model
             ──▶ build_prompt         only the shortlist + their REAL params
@@ -30,6 +44,8 @@ from __future__ import annotations
 import json
 import re
 from typing import Any, Callable, Dict, List, Optional
+
+import nx_policy
 
 # Args that exist on every filter but are not model-supplied.
 IMPLICIT_ARGS = {"data_structure"}
@@ -87,6 +103,8 @@ def retrieve(catalog: dict, query: str, k: int = 12) -> List[dict]:
         return []
     scored = []
     for e in catalog.get("filters", []):
+        if nx_policy.is_denied(e.get("uuid")):
+            continue          # never put a shell in the model's vocabulary
         name_toks = set(_tokens(entry_name := (e.get("human_name") or "")))
         all_toks = set(_tokens(filter_text(e)))
         if not all_toks:
@@ -199,7 +217,7 @@ def validate(pipeline: Any, catalog: dict) -> List[str]:
     It does NOT mean the pipeline is sensible — that is what the trial run is
     for."""
     errors: List[str] = []
-    idx = {f["uuid"]: f for f in catalog.get("filters", []) if f.get("uuid")}
+    idx = {f["uuid"]: f for f in nx_policy.permitted_filters(catalog)}
     if isinstance(pipeline, dict):
         steps = pipeline.get("pipeline")
         if steps is None:
@@ -229,9 +247,13 @@ def validate(pipeline: Any, catalog: dict) -> List[str]:
             continue
         entry = idx.get(uuid)
         if entry is None:
-            errors.append(
-                f"step {i}: uuid {uuid!r} is not in the installed package. "
-                f"Use a uuid exactly as listed.")
+            if nx_policy.is_denied(uuid):
+                errors.append(f"step {i}: this filter is not permitted. "
+                              f"{nx_policy.reason(uuid)}")
+            else:
+                errors.append(
+                    f"step {i}: uuid {uuid!r} is not in the installed package. "
+                    f"Use a uuid exactly as listed.")
             continue
         args = step.get("args", {})
         if args is None:

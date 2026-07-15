@@ -31,6 +31,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import nx_introspect  # noqa: E402  (same directory; pure stdlib)
+import nx_policy      # noqa: E402  (same directory; pure stdlib)
 
 
 # ============================================================
@@ -138,6 +139,33 @@ def _under(root: Path, p) -> bool:
     return rp == rr or rr in rp.parents
 
 
+def _check_capability(pipeline) -> None:
+    """Refuse a pipeline containing a code-execution filter. Raises.
+
+    THIS is the load-bearing check, not the one in nx_generate: a saved
+    .d3dpipeline that reaches h_run_folder never passes through validate() at
+    all. Every path guard in this file is blind to these filters — Execute
+    Process is neither a reader nor a writer, so nothing rewrites its args and
+    _check_writers never even looks at it, and a spawned process is not bound
+    by an output directory in any case.
+
+    Called BEFORE anything is set or executed, so a denied pipeline does
+    nothing at all.
+    """
+    for i in range(pipeline.size()):
+        pf = pipeline[i]
+        uuid = None
+        try:
+            uuid = str(_attr(pf.get_filter(), "uuid"))
+        except Exception:
+            pass
+        if uuid and nx_policy.is_denied(uuid):
+            raise ValueError(
+                f"step {i} ({_attr(pf, 'human_name') or _attr(pf, 'name')}) "
+                f"is refused: {nx_policy.reason(uuid)}\n"
+                f"This pipeline will not be run.")
+
+
 def _check_writers(pipeline, steps, redirected, write_root) -> None:
     """Every writer must target ``write_root``. Raises otherwise.
 
@@ -212,7 +240,18 @@ def h_describe(job) -> dict:
     """What a .d3dpipeline contains, and where its file paths live."""
     import simplnx as nx
     p = nx.Pipeline.from_file(str(job["pipeline"]))
-    return {"name": _attr(p, "name"), "size": p.size(), "steps": _describe(p)}
+    steps = _describe(p)
+    denied = []
+    for s_ in steps:
+        try:
+            u = str(_attr(p[s_["index"]].get_filter(), "uuid"))
+        except Exception:
+            continue
+        if nx_policy.is_denied(u):
+            denied.append({"index": s_["index"], "uuid": u,
+                           "reason": nx_policy.reason(u)})
+    return {"name": _attr(p, "name"), "size": p.size(), "steps": steps,
+            "denied": denied}
 
 
 def h_run_folder(job) -> dict:
@@ -247,6 +286,7 @@ def h_run_folder(job) -> dict:
                "read_set": None, "write_set": None}
         try:
             p = nx.Pipeline.from_file(str(pipeline_path))
+            _check_capability(p)      # before any _set_path / execute
             steps = _describe(p)
 
             # Resolve the reader: an explicit index, else the first step that
@@ -321,6 +361,7 @@ def h_preflight(job) -> dict:
     """
     import simplnx as nx
     p = nx.Pipeline.from_file(str(job["pipeline"]))
+    _check_capability(p)
     ds = nx.DataStructure()
     steps = []
     for i in range(p.size()):

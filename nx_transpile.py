@@ -28,6 +28,8 @@ import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import nx_policy
+
 # Present in a saved pipeline's args, but not a parameter of execute().
 NON_PARAM_KEYS = {"parameters_version"}
 
@@ -143,6 +145,20 @@ def transpile(pipeline: Any, catalog: Any) -> dict:
         if step.get("isDisabled"):
             body.append(f"# [{i}] DISABLED in the pipeline: {jname}")
             body.append("")
+            continue
+        if nx_policy.is_denied(uuid):
+            # Rendering this as a live call would hand the user a script that
+            # runs a shell. Emit it visibly instead — the transpiler's output
+            # never passes through nx_generate.validate().
+            body.append(f"# [{i}] REFUSED — {jname}")
+            body.append(f"#      {nx_policy.reason(uuid)}")
+            body.append(f"#      Its args were:")
+            for k, v in (step.get("args") or {}).items():
+                if k not in NON_PARAM_KEYS:
+                    body.append(f"#        {k} = {unwrap(v)!r}")
+            body.append("")
+            warnings.append(f"step {i}: {jname} is not permitted "
+                            f"and was commented out, not transpiled.")
             continue
         entry = idx.get(uuid)
         if entry is None:
