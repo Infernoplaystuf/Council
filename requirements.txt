@@ -44,9 +44,27 @@ h5py>=3.10
 # h5py>=3.10               # see comment above — conda-only
 
 # ---- Plotting (Grapher tab) ----
+#
+# matplotlib is the PRIMARY renderer: the Grapher's inline pane embeds Agg
+# figures via FigureCanvasTkAgg (plots_pane.py), which needs no browser, no
+# JavaScript and no network — the only charting stack that actually works on an
+# air-gapped box.
 matplotlib>=3.7
+seaborn>=0.13            # statistical plots in plot_registry.py (kde, ecdf,
+                         # violin, pair, 2-D density). Optional at runtime —
+                         # plots needing it are hidden when it's absent.
+#
+# plotly + tkinterweb drive the older interactive HTML chart path. Note
+# tkinterweb (tkhtml3) has NO JavaScript engine, so a Plotly figure cannot
+# actually run inside it; that path is only useful via "Open in browser".
 plotly>=5.17
-tkinterweb>=3.24         # Plotly HTML viewer inside Tk
+tkinterweb>=3.24         # Plotly HTML viewer inside Tk (no JS engine)
+#
+# scikit-learn backs the 'pca' plot type, which is user-selectable in the
+# Grapher. It was advertised without being declared, so 'pca' returned a
+# "pip install scikit-learn" error card on a stock install.
+scikit-learn>=1.3
+# squarify>=0.4          # optional: treemap plot type
 
 # ---- AI backend ----
 # GGUF-only — point COUNCIL_GGUF_PATH at a .gguf file from Hugging Face,

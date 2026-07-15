@@ -19,6 +19,7 @@ All reads are bounded and read-only. Optional deps degrade gracefully.
 """
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
@@ -34,10 +35,23 @@ _EXTRACTABLE = {".pdf", ".docx"}
 _SEP_RE = re.compile(r"[:=]|(?<=\s)[-–—](?=\s)")
 _BULLET_RE = re.compile(r"^\s*(?:[-*•+]|\d+[.)])\s+")
 _EMPH_RE = re.compile(r"[*`]+")          # markdown emphasis; NOT '_' (_norm eats it)
+# camelCase / PascalCase word boundaries: pointOfContact -> point Of Contact,
+# POCName -> POC Name.
+_CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 # One field may list several values: 'Bob, Alice', 'Bob and Alice', 'Bob; Alice'.
 _VAL_SPLIT_RE = re.compile(r"\s*(?:[,;/]|\band\b|&)\s*", re.I)
+# A value ends where the next field starts. Only ':' / '=' — a spaced dash
+# would eat 'Bob Smith - Engineering'.
+_NEW_FIELD_RE = re.compile(r"[:=]")
+# Several fields can share a line: 'Point of Contact: Bob; Reviewer: Alice'.
+_SEG_SPLIT_RE = re.compile(r"\s*;\s*")
 # A markdown table separator row: |---|:--:|
 _RULE_RE = re.compile(r"^[\s:\-–—|]+$")
+# "key": "value"  /  "key": 12.5  — for JSON that won't parse (truncated by the
+# read cap, or embedded in prose).
+_JSON_PAIR_RE = re.compile(
+    r'"([^"\n]{1,80})"\s*:\s*(?:"((?:[^"\\]|\\.)*)"'
+    r'|([-+]?\d[\d.eE+\-]*|true|false|null))')
 
 
 def _norm(s) -> str:
@@ -46,13 +60,22 @@ def _norm(s) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(s or "").lower()).strip()
 
 
+def _norm_key(s) -> str:
+    """_norm for a FIELD NAME, splitting camelCase first.
+
+    JSON keys are routinely 'pointOfContact'. _norm lower-cases before it
+    splits, so it would see one token 'pointofcontact' and never match the
+    field 'point of contact'."""
+    return _norm(_CAMEL_RE.sub(" ", str(s or "")))
+
+
 def _label_is(text, fn: str) -> bool:
     """True when ``text`` reads as the LABEL for field ``fn`` — not a sentence
     that merely mentions it. ``fn`` must appear as a contiguous run of whole
     tokens, and the text must be label-short (a heading/key, not prose). This
     is what stops 'Bob met the point of contact yesterday' from being treated
     as a 'Point of Contact' field."""
-    t = _norm(_EMPH_RE.sub("", _BULLET_RE.sub("", str(text or ""))))
+    t = _norm_key(_EMPH_RE.sub("", _BULLET_RE.sub("", str(text or ""))))
     if not t or not fn:
         return False
     tt, ft = t.split(), fn.split()
@@ -61,25 +84,115 @@ def _label_is(text, fn: str) -> bool:
     return any(tt[i:i + len(ft)] == ft for i in range(len(tt) - len(ft) + 1))
 
 
-def _split_kv(line: str):
-    """Split 'Key: value' on the FIRST separator -> (key, value), else None."""
-    s = _EMPH_RE.sub("", _BULLET_RE.sub("", line or "")).strip()
-    if not s:
-        return None
-    m = _SEP_RE.search(s)
-    if not m:
-        return None
-    return s[:m.start()].strip(), s[m.end():].strip()
-
-
 def _split_values(v: str):
-    """One field's value text -> the individual values it lists."""
+    """One field's value text -> the individual values it lists.
+
+    Stops at the point another field begins: 'Bob; Reviewer: Alice' is Bob, not
+    Bob AND 'Reviewer: Alice'. Only a colon/equals ends a value — a spaced dash
+    does not, or 'Bob Smith - Engineering' would be thrown away."""
     out = []
     for part in _VAL_SPLIT_RE.split(str(v or "")):
         part = _EMPH_RE.sub("", part).strip().strip(".").strip()
-        if part:
-            out.append(part)
+        if not part:
+            continue
+        if _NEW_FIELD_RE.search(part):
+            break
+        out.append(part)
     return out
+
+
+def _kv_pairs(line: str):
+    """Every 'key: value' pair on ONE line, not just the first.
+
+    Records are often written one-per-line ('Point of Contact: Bob; Reviewer:
+    Alice'), so splitting a line at its first separator both misses the later
+    fields and lets the first field's value swallow them."""
+    s = _EMPH_RE.sub("", _BULLET_RE.sub("", line or "")).strip()
+    if not s:
+        return []
+    pairs = []
+    for seg in _SEG_SPLIT_RE.split(s):
+        seg = seg.strip()
+        if not seg:
+            continue
+        m = _SEP_RE.search(seg)
+        if m:
+            pairs.append((seg[:m.start()].strip(), seg[m.end():].strip()))
+        elif pairs:
+            # No separator: a continuation of the previous field's value
+            # ('Contact: Bob; Alice' lists two contacts).
+            k, v = pairs[-1]
+            pairs[-1] = (k, f"{v}; {seg}")
+    return pairs
+
+
+def _scalars(o):
+    """Every scalar leaf of a JSON value, so a field whose value is an object
+    ({'name': 'Bob', 'email': ...}) still yields something matchable."""
+    if isinstance(o, dict):
+        for v in o.values():
+            yield from _scalars(v)
+    elif isinstance(o, (list, tuple)):
+        for v in o:
+            yield from _scalars(v)
+    elif o is not None and not isinstance(o, bool):
+        yield str(o)
+
+
+def _json_field_values(text: str, fn: str):
+    """Values for field ``fn`` read STRUCTURALLY out of JSON, or None if the
+    text isn't JSON.
+
+    JSON records are routinely minified onto a single line, which defeats every
+    line-oriented rule: the whole record is one 'line', so proximity matching
+    says a field's value is anything else in the record, and first-separator
+    splitting sees a key of '{"job"'. Parsing gives the exact key->value
+    mapping, so 'point_of_contact' is Bob no matter what else the record says
+    about Alice."""
+    t = (text or "").strip()
+    if not t or t[0] not in "[{":
+        return None
+    vals: List[str] = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if _label_is(k, fn):
+                    vals.extend(_scalars(v))
+                else:
+                    walk(v)
+        elif isinstance(o, (list, tuple)):
+            for v in o:
+                walk(v)
+
+    try:
+        walk(json.loads(t))
+        return vals
+    except Exception:
+        pass
+    # JSON Lines, or a truncated/oversized read: try per-line objects.
+    got_any = False
+    for line in t.splitlines():
+        line = line.strip().rstrip(",")
+        if not line or line[0] not in "[{":
+            continue
+        try:
+            walk(json.loads(line))
+            got_any = True
+        except Exception:
+            continue
+    if got_any:
+        return vals
+    # Still not parseable (truncated by the read cap, or embedded in prose).
+    # Fall back to reading "key": value pairs textually — still structural
+    # (a key maps to ITS value), never proximity.
+    for m in _JSON_PAIR_RE.finditer(t):
+        key = m.group(1)
+        if _label_is(key, fn):
+            val = m.group(2) if m.group(2) is not None else m.group(3)
+            if val:
+                vals.append(val)
+    return vals or None
 
 
 def _value_matches(field_value, query) -> bool:
@@ -100,8 +213,16 @@ def _field_values_in_text(text: str, fn: str, *, max_hits: int = 100):
 
     Only the value side of the field is returned — never nearby text — which is
     what makes a search field-aware. Handles 'Field: value', 'Field = value',
-    'Field - value', '**Field:** value', '- Field: value', a 'Field' heading
-    with the value on the next line, and markdown '| Field | value |'."""
+    'Field - value', '**Field:** value', '- Field: value', several fields on
+    one line, a 'Field' heading with the value on the next line, and markdown
+    '| Field | value |'. JSON is read structurally, not as lines."""
+    # JSON FIRST. A minified record puts the whole object on one line, so every
+    # line rule below breaks on it: proximity would call anything in the record
+    # the field's value, and splitting at the first ':' yields a key of '{"job"'.
+    js = _json_field_values(text, fn)
+    if js is not None:
+        return js[:max_hits]
+
     vals = []
     lines = text.splitlines()
     for i, raw in enumerate(lines):
@@ -119,11 +240,11 @@ def _field_values_in_text(text: str, fn: str, *, max_hits: int = 100):
                     if nxt and not _RULE_RE.match(nxt):
                         vals.extend(_split_values(nxt))
             continue
-        kv = _split_kv(line)
-        if kv:
-            key, val = kv
-            if val and _label_is(key, fn):
-                vals.extend(_split_values(val))
+        pairs = _kv_pairs(line)
+        if pairs:
+            for key, val in pairs:
+                if val and _label_is(key, fn):
+                    vals.extend(_split_values(val))
             continue
         # heading style: the line IS the label -> value on the next non-empty
         # line, unless that line starts a different field.
@@ -132,7 +253,7 @@ def _field_values_in_text(text: str, fn: str, *, max_hits: int = 100):
                 nxt = lines[j].strip()
                 if not nxt:
                     continue
-                if nxt.startswith("|") or _split_kv(nxt):
+                if nxt.startswith("|") or _kv_pairs(nxt):
                     break        # the next field began; this heading has no value
                 vals.extend(_split_values(nxt))
                 break

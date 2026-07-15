@@ -2418,6 +2418,237 @@ def test_provenance_source_resolve() -> None:
                 cge.VAULT_DIR = prev
 
 
+def test_plot_roles() -> None:
+    """Column-role inference. Two orderings here are load-bearing: datetime is
+    tested before the numeric-coercion rule (pd.to_numeric SUCCEEDS on real
+    datetimes, which is how dates became epoch-nanosecond 'numeric' columns),
+    and boolean before numeric (is_numeric_dtype is True for bool)."""
+    try:
+        import pandas as pd
+        import plot_roles as pr
+    except Exception as exc:  # pragma: no cover
+        _check(f"plot_roles importable ({exc!r})", False)
+        return
+
+    n = 200
+    df = pd.DataFrame({
+        "when": pd.date_range("2024-01-01", periods=n),
+        "date_s": pd.date_range("2024-01-01", periods=n).astype(str),
+        "flag": [True, False] * (n // 2),
+        "yield": [float(i) for i in range(n)],
+        "year": [str(2000 + (i % 20)) for i in range(n)],
+        "build": ["a", "b", "c", "d"] * (n // 4),
+        "notes": [f"free form comment number {i}" for i in range(n)],
+    })
+    roles = pr.infer_roles(df)
+    _check("a real datetime column is datetime, not epoch-numeric",
+           roles["when"] == pr.DATETIME)
+    _check("a bool column is boolean, not numeric",
+           roles["flag"] == pr.BOOLEAN)
+    _check("a numeric column is numeric", roles["yield"] == pr.NUMERIC)
+    _check("a low-cardinality column is categorical",
+           roles["build"] == pr.CATEGORICAL)
+    _check("a high-cardinality string column is text",
+           roles["notes"] == pr.TEXT)
+
+    coerced = pr.infer_roles(df, coerce_dates=True)
+    _check("string dates are recovered when coercing",
+           coerced["date_s"] == pr.DATETIME)
+    _check("all-digit strings are NOT mistaken for dates",
+           coerced["year"] != pr.DATETIME)
+
+    before = str(df["date_s"].dtype)
+    out = pr.coerce_datetime_columns(df)
+    _check("coercion parses dates on the returned copy",
+           str(out["date_s"].dtype).startswith("datetime"))
+    _check("coercion never mutates the caller's frame",
+           str(df["date_s"].dtype) == before and out is not df)
+    _check("count_role counts by role",
+           pr.count_role(roles, ["yield", "build", "flag"], pr.NUMERIC) == 1)
+
+
+def test_plot_registry() -> None:
+    """The registry is the closed vocabulary behind both the UI picker and the
+    model: only plots whose column-role requirements are satisfied are offered,
+    and build() validates its key/columns instead of executing anything."""
+    try:
+        import pandas as pd
+        import plot_registry as reg
+        import plot_roles as pr
+    except Exception as exc:  # pragma: no cover
+        _check(f"plot_registry importable ({exc!r})", False)
+        return
+
+    _check("the registry is populated", len(reg.REGISTRY) >= 20)
+    _check("every entry has a distinct key",
+           len(reg.REGISTRY) == len({k.key for k in reg.REGISTRY.values()}))
+
+    df = pd.DataFrame({
+        "build": ["a", "b", "a", "b", "c", "c"],
+        "yield": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        "cost": [2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+    })
+    roles = pr.infer_roles(df)
+
+    # Applicability is role-driven: a numeric-only selection must not offer a
+    # plot that needs a category, and vice versa.
+    num_only = reg.applicable(roles, ["yield", "cost"])
+    keys = {k.key for k in num_only}
+    _check("a 2-numeric selection offers scatter", "scatter" in keys)
+    _check("a 2-numeric selection does NOT offer a bar (needs a category)",
+           "bar" not in keys)
+    cat_num = {k.key for k in reg.applicable(roles, ["build", "yield"])}
+    _check("a category+numeric selection offers bar", "bar" in cat_num)
+
+    # The model-facing catalog is plain data (a closed vocabulary).
+    cat = reg.catalog(roles, ["build", "yield"])
+    _check("catalog returns json-able dicts with key/label/requires",
+           all({"key", "label", "requires"} <= set(c) for c in cat))
+
+    # build() validates rather than trusting.
+    try:
+        reg.build("no_such_plot", df, ["yield"])
+        _check("an unknown plot key is rejected", False)
+    except ValueError:
+        _check("an unknown plot key is rejected (model can't invent one)", True)
+    try:
+        reg.build("bar", df, ["build", "nope"])
+        _check("an unknown column is rejected", False)
+    except ValueError:
+        _check("an unknown column is rejected", True)
+
+    # Aggregation: the whole point. Repeated x values must be summed, not
+    # stacked as duplicate bars.
+    agg = reg._aggregate(df, "build", "yield", "sum")
+    _check("categories are aggregated (a=1+3=4, b=2+4=6, c=5+6=11)",
+           agg.loc["a"] == 4.0 and agg.loc["b"] == 6.0 and agg.loc["c"] == 11.0)
+    _check("a bad agg function is rejected",
+           _raises(ValueError,
+                   lambda: reg._aggregate(df, "build", "yield", "drop")))
+
+
+def test_plot_registry_renders_all() -> None:
+    """Every registered plot must actually render headlessly, and its own
+    applies() must accept the selection it was designed for. matplotlib is
+    Agg-only here, so there is no reason for this to be untested.
+
+    EXPECTED is asserted explicitly: iterating only what IS registered means a
+    plot that silently failed to register is silently never tested (which is
+    exactly how 'bar' went missing)."""
+    try:
+        import io
+        import warnings
+        import numpy as np
+        import pandas as pd
+        import matplotlib.pyplot as plt
+        import plot_registry as reg
+        import plot_roles as pr
+    except Exception as exc:  # pragma: no cover
+        _check(f"plot_registry renderable ({exc!r})", False)
+        return
+
+    expected = {
+        "line", "multi_line", "step", "area", "scatter", "bubble", "hexbin",
+        "histogram", "kde", "ecdf", "kde_2d", "box", "violin", "strip",
+        "bar", "grouped_bar", "stacked_bar", "count", "pie", "treemap",
+        "timeseries", "rolling_mean", "lag", "autocorr", "errorbar", "ohlc",
+        "corr_heatmap", "pair", "parallel_coords", "radar", "scatter_3d",
+    }
+    have = set(reg.REGISTRY)
+    # Plots needing an absent optional lib are legitimately not registered.
+    missing = {k for k in expected - have
+               if k not in ("treemap", "kde", "ecdf", "kde_2d", "violin",
+                            "strip", "pair")}
+    _check(f"every core plot type is registered (missing: {sorted(missing)})",
+           not missing)
+
+    rng = np.random.default_rng(0)
+    n = 120
+    df = pd.DataFrame({
+        "when": pd.date_range("2024-01-01", periods=n, freq="D"),
+        "build": rng.choice(["A", "B", "C"], n),
+        "shift": rng.choice(["day", "night"], n),
+        "yield": rng.normal(80, 5, n),
+        "cost": rng.normal(50, 8, n),
+        "temp": rng.normal(200, 20, n),
+        "err": np.abs(rng.normal(2, 0.5, n)),
+        "open": rng.normal(10, 1, n), "high": rng.normal(12, 1, n),
+        "low": rng.normal(8, 1, n), "close": rng.normal(10, 1, n),
+    })
+    roles = pr.infer_roles(df)
+    num3 = ["yield", "cost", "temp"]
+    sel = {
+        "line": ["yield"], "multi_line": ["yield", "cost"], "step": ["yield"],
+        "area": ["yield", "cost"], "scatter": ["yield", "cost"],
+        "bubble": ["yield", "cost", "temp"], "hexbin": ["yield", "cost"],
+        "histogram": ["yield"], "kde": ["yield"], "ecdf": ["yield"],
+        "kde_2d": ["yield", "cost"], "box": ["yield", "build"],
+        "violin": ["yield", "build"], "strip": ["yield", "build"],
+        "bar": ["build", "yield"], "grouped_bar": ["build", "yield", "cost"],
+        "stacked_bar": ["build", "shift", "yield"], "count": ["build"],
+        "pie": ["build"], "treemap": ["build", "yield"],
+        "timeseries": ["when", "yield"], "rolling_mean": ["when", "yield"],
+        "lag": ["yield"], "autocorr": ["yield"], "errorbar": ["yield", "err"],
+        "ohlc": ["open", "high", "low", "close"],
+        "corr_heatmap": num3, "pair": ["yield", "cost"],
+        "parallel_coords": num3, "radar": num3, "scatter_3d": num3,
+    }
+
+    before = len(plt.get_fignums())
+    failures = []
+    untested = []
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for key in sorted(have):
+            cols = sel.get(key)
+            if cols is None:
+                untested.append(key)
+                continue
+            try:
+                fig = reg.build(key, df, cols)
+                if fig is None:
+                    raise AssertionError("build returned None")
+                buf = io.BytesIO()
+                fig.savefig(buf, format="png", dpi=50)
+                if buf.tell() < 1000:
+                    raise AssertionError("rendered an empty PNG")
+                if not reg.REGISTRY[key].applies(roles, cols):
+                    raise AssertionError(
+                        "applies() rejects the selection it was built for")
+            except Exception as exc:
+                failures.append(f"{key}: {type(exc).__name__}: {exc}")
+
+    _check(f"every registered plot renders to a PNG ({failures})",
+           not failures)
+    _check(f"no registered plot is left untested ({untested})", not untested)
+    _check("rendering leaks nothing into pyplot's global registry",
+           len(plt.get_fignums()) == before)
+
+
+def test_plots_pane_core() -> None:
+    """The plots pane renders Figures to thumbnails without Tk and without
+    pyplot — pyplot would register every figure in a global list (a leak over a
+    long session) and can open external windows, which is the popup behaviour
+    the inline pane exists to avoid."""
+    try:
+        from matplotlib.figure import Figure
+        import matplotlib.pyplot as plt
+        import plots_pane as pp
+    except Exception as exc:  # pragma: no cover
+        _check(f"plots_pane importable ({exc!r})", False)
+        return
+    before = len(plt.get_fignums())
+    fig = Figure(figsize=(4, 3))
+    fig.add_subplot(111).plot([1, 2, 3], [2, 4, 3])
+    png = pp.figure_to_png_bytes(fig)
+    _check("a Figure renders to PNG bytes",
+           len(png) > 500 and png[:4] == b"\x89PNG")
+    im = pp.figure_to_thumbnail(fig, 180)
+    _check("the thumbnail is capped to the rail width", im.size[0] <= 180)
+    _check("building figures leaks nothing into pyplot's global registry",
+           len(plt.get_fignums()) == before)
+
+
 def test_graph_engine_correctness() -> None:
     """The graph engine must never present a fabricated or mis-aligned result,
     and an interactive chart must render on an air-gapped machine."""
@@ -4219,6 +4450,59 @@ def test_field_value_search() -> None:
                fs.extract_field_value(r / "multi.txt",
                                       "point of contact") == ["Bob", "Alice"])
 
+    # JSON records are routinely MINIFIED onto a single line. That defeats
+    # every line-oriented rule: the whole record is one "line", so proximity
+    # matching calls anything in the record the field's value, and splitting at
+    # the first ':' yields a key of '{"job"'. JSON is parsed structurally.
+    def _vals(text, field):
+        return fs._field_values_in_text(text, field)
+
+    def _hit(text, field, value):
+        return any(fs._value_matches(v, value) for v in _vals(text, field))
+
+    flat = ('{"job": "0317", "point_of_contact": "Bob", "reviewer": "Alice",'
+            ' "notes": "Alice attended the review"}')
+    _check("one-line JSON: the POC is the POC's value",
+           _hit(flat, "point of contact", "bob"))
+    _check("one-line JSON: another name in the record is NOT the POC",
+           not _hit(flat, "point of contact", "alice"))
+    _check("one-line JSON: the other field is still searchable",
+           _hit(flat, "reviewer", "alice"))
+    nested = ('{"meta": {"point_of_contact": {"name": "Bob Smith",'
+              ' "email": "bob@x.com"}}, "owner": "Alice"}')
+    _check("nested JSON: a field whose value is an object still matches",
+           _hit(nested, "point of contact", "bob")
+           and not _hit(nested, "point of contact", "alice"))
+    _check("a JSON array of records yields every record's value",
+           _hit('[{"point_of_contact": "Bob"}, {"point_of_contact": "Carol"}]',
+                "point of contact", "bob"))
+    _check("JSON Lines (one object per line) is read",
+           _hit('{"point_of_contact": "Bob"}\n{"point_of_contact": "Carol"}',
+                "point of contact", "carol"))
+    # A big JSON file is cut off by the read cap, so json.loads fails; the
+    # fallback must still map key->value, never proximity.
+    cut = '{"a":1, "point_of_contact": "Bob", "reviewer": "Alice", "notes": "Alice att'
+    _check("truncated JSON still maps the field to its own value",
+           _hit(cut, "point of contact", "bob")
+           and not _hit(cut, "point of contact", "alice"))
+    _check("camelCase JSON keys match (pointOfContact)",
+           _hit('{"pointOfContact": "Bob", "reviewer": "Alice"}',
+                "point of contact", "bob"))
+    _check("token-awareness holds inside JSON too (Bobby != Bob)",
+           not _hit('{"point_of_contact": "Bobby Jones"}',
+                    "point of contact", "bob"))
+
+    # The same one-line problem in plain text: several fields per line.
+    two_up = "Point of Contact: Bob; Reviewer: Alice"
+    _check("several fields on one line: the value stops at the next field",
+           _hit(two_up, "point of contact", "bob")
+           and not _hit(two_up, "point of contact", "alice"))
+    _check("several fields on one line: the later field is findable",
+           _hit(two_up, "reviewer", "alice"))
+    _check("a spaced dash inside a value is not mistaken for a new field",
+           _vals("Point of Contact: Bob Smith - Engineering",
+                 "point of contact") == ["Bob Smith - Engineering"])
+
     # Scale: past the old silent 1000-file cap the search still scans every
     # file, still finds a match beyond #1000, and reports progress to the UI.
     with tempfile.TemporaryDirectory() as td2:
@@ -4994,6 +5278,14 @@ def main() -> int:
          test_graph_introspect_columns)
     _run("graph engine correctness (no fake trend, aligned, offline-safe)",
          test_graph_engine_correctness)
+    _run("plot roles (datetime/bool ordering, coercion, no mutation)",
+         test_plot_roles)
+    _run("plot registry (role-gated catalog, validation, aggregation)",
+         test_plot_registry)
+    _run("plot registry renders all types headlessly",
+         test_plot_registry_renders_all)
+    _run("plots pane core (thumbnails, no pyplot leak)",
+         test_plots_pane_core)
     _run("route_message golden (routing unchanged)",
          test_route_message_golden)
     _run("read-file injection memo (identical + invalidates)",
