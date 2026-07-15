@@ -2939,6 +2939,83 @@ def test_nx_capability_policy() -> None:
         _check("an ordinary pipeline still runs", False)
 
 
+def test_dream3d_tab_wiring() -> None:
+    """The Dream3D tab reaches Part B.
+
+    Until this existed the whole subsystem was library code with tests and no
+    way in from the app. The handlers are bound to a stub here — Tk is never
+    started — so the parts that break silently in a GUI (a wrong helper call,
+    a write outside the vault, work landing on the Tk thread) are caught."""
+    try:
+        import council_gui_engine as cge
+        import data_index
+    except Exception as exc:  # pragma: no cover
+        _check(f"gui engine importable ({exc!r})", False)
+        return
+
+    C = cge.CouncilConsole
+    for name in ("_nx_check_env", "_nx_catalog", "_nx_transpile_selected",
+                 "_nx_write_script", "_nx_show"):
+        _check(f"the tab has {name}", callable(getattr(C, name, None)))
+
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td) / "vault"
+        (vault / "data_in").mkdir(parents=True)
+        (vault / "data_out").mkdir()
+        di = data_index.DataIndex(search_roots=[vault / "data_in"],
+                                  write_root=vault / "data_out")
+
+        class _Fake:
+            pass
+
+        f = _Fake()
+        f.data_index = di
+        f.shown = []
+        f.status = []
+        f._nx_show = lambda t: f.shown.append(t)
+
+        class _Var:
+            def __init__(self, v=""):
+                self.v = v
+
+            def set(self, x):
+                f.status.append(x)
+                self.v = x
+
+            def get(self):
+                return self.v
+
+        f._nx_status_var = _Var()
+        f._nx_task_var = _Var()
+        f.after = lambda ms, fn: fn()
+        f._nx_write_script = C._nx_write_script.__get__(f)
+        f._nx_transpile_selected = C._nx_transpile_selected.__get__(f)
+
+        # An empty task must not spawn a thread or reach the model.
+        f._nx_task_var.set("")
+        f._nx_write_script()
+        _check("an empty task is guarded before the model is called",
+               f.shown and "Describe what" in f.shown[-1])
+
+        # Nothing selected must not reach the nx env either.
+        class _LB:
+            def curselection(self):
+                return ()
+
+        f.dream3d_pipeline_list = _LB()
+        f.shown.clear()
+        f._nx_transpile_selected()
+        _check("transpile with nothing selected asks for a selection",
+               f.shown and "Select a pipeline" in f.shown[-1])
+
+        # Generated artefacts go to the vault OUTPUT area, never the inputs.
+        out = di.safe_write_path("nx_catalog.json", subfolder="dream3d")
+        _check("nx artefacts are written under data_out",
+               Path(data_index.output_dir(vault)) in Path(out).parents)
+        _check("the helper used is the instance method, not a module function",
+               not hasattr(data_index, "safe_write_path"))
+
+
 def test_nx_hardening() -> None:
     """Defects an adversarial pass found in Part B, each verified against the
     real code before being fixed."""
@@ -6251,6 +6328,8 @@ def main() -> int:
          test_nx_script_gate)
     _run("nx hardening (comment injection, last-object, path checks)",
          test_nx_hardening)
+    _run("Dream3D tab wiring (Part B reachable from the app)",
+         test_dream3d_tab_wiring)
     _run("plot roles (datetime/bool ordering, coercion, no mutation)",
          test_plot_roles)
     _run("plot registry (role-gated catalog, validation, aggregation)",

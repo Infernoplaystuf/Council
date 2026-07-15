@@ -10010,6 +10010,36 @@ class CouncilConsole(tk.Tk):
                    command=self._open_transformation_cube_tool
                    ).pack(side="left")
 
+        # ── DREAM3D-NX: pipelines as Python ──────────────────────────
+        #
+        # The point of the subsystem: describe a task, get a simplnx script —
+        # filters as execute() lines you can read, edit and run. Everything
+        # runs in the nx conda env as a subprocess (nx_bridge); this process
+        # never imports simplnx.
+        nx_row = ttk.LabelFrame(right, text="DREAM3D-NX → Python")
+        nx_row.pack(fill="x", pady=(4, 4))
+
+        nx_top = ttk.Frame(nx_row)
+        nx_top.pack(fill="x", padx=4, pady=(3, 1))
+        self._nx_status_var = tk.StringVar(value="nx env: not checked")
+        ttk.Label(nx_top, textvariable=self._nx_status_var,
+                  foreground="#9a8c8c").pack(side="left")
+        ttk.Button(nx_top, text="Check env",
+                   command=self._nx_check_env).pack(side="right", padx=2)
+        ttk.Button(nx_top, text="→ Python (selected)",
+                   command=self._nx_transpile_selected).pack(side="right",
+                                                             padx=2)
+
+        nx_task = ttk.Frame(nx_row)
+        nx_task.pack(fill="x", padx=4, pady=(1, 4))
+        ttk.Label(nx_task, text="Task:").pack(side="left")
+        self._nx_task_var = tk.StringVar()
+        e = ttk.Entry(nx_task, textvariable=self._nx_task_var)
+        e.pack(side="left", fill="x", expand=True, padx=4)
+        e.bind("<Return>", lambda _e: self._nx_write_script())
+        ttk.Button(nx_task, text="✍ Write pipeline",
+                   command=self._nx_write_script).pack(side="left")
+
         ttk.Label(right, text="Pipeline visualization").pack(anchor="w", pady=(6, 0))
         self.dream3d_view = self._make_text(right, wrap="word", state="disabled")
         d3d_view_sb = ttk.Scrollbar(right, command=self.dream3d_view.yview)
@@ -10019,6 +10049,174 @@ class CouncilConsole(tk.Tk):
 
         # Initial population
         self._dream3d_refresh_pipelines()
+
+    # ── DREAM3D-NX bridge (Part B) ────────────────────────────────────────
+    #
+    # simplnx is a compiled pybind11 package in its own conda env, so every
+    # call here is a subprocess (nx_bridge). None of it may run on the Tk
+    # thread: the catalog takes seconds and a pipeline run can take minutes.
+
+    def _nx_show(self, text: str):
+        """Write to the pipeline-visualisation pane."""
+        try:
+            self.dream3d_view.configure(state="normal")
+            self.dream3d_view.delete("1.0", "end")
+            self.dream3d_view.insert("1.0", text)
+            self.dream3d_view.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _nx_check_env(self):
+        """Is the nx env there, and which plugins import?"""
+        self._nx_status_var.set("nx env: checking…")
+
+        def _work():
+            try:
+                import nx_bridge as _nb
+                info = _nb.ping()
+                mods = [m for m, ok in info.get("modules", {}).items() if ok]
+                msg = (f"nx env: python {info.get('python')} · "
+                       f"{len(mods)} module(s)")
+                detail = ("DREAM3D-NX is reachable.\n\n"
+                          f"python : {info.get('python')}\n"
+                          f"modules: {', '.join(mods) or 'none'}\n")
+            except Exception as exc:
+                msg = "nx env: unavailable"
+                detail = (f"DREAM3D-NX is not reachable.\n\n{exc}\n\n"
+                          "Create the env with:\n"
+                          "  conda create -n nxpython python=3.12 dream3dnx "
+                          "-c conda-forge\n"
+                          "  conda install -n nxpython -c conda-forge numpy\n\n"
+                          "Install numpy from conda-forge, never pip: a pip "
+                          "numpy dies at import with a missing-DLL fault and "
+                          "no traceback, which silently removes CSV loading.")
+            self.after(0, lambda: (self._nx_status_var.set(msg),
+                                   self._nx_show(detail)))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _nx_catalog(self):
+        """The filter catalog of the INSTALLED package, cached on disk.
+
+        Building it costs a subprocess and a few seconds, and it only changes
+        when the nx install does — so cache it and reuse. Called from a worker
+        thread only."""
+        import json as _json
+        import nx_bridge as _nb
+        cached = getattr(self, "_nx_catalog_cache", None)
+        if cached:
+            return cached
+        try:
+            path = self.data_index.safe_write_path(
+                "nx_catalog.json", subfolder="dream3d")
+        except Exception:
+            path = None
+        if path and path.exists():
+            try:
+                cached = _json.loads(path.read_text(encoding="utf-8"))
+                if cached.get("filters"):
+                    self._nx_catalog_cache = cached
+                    return cached
+            except Exception:
+                pass
+        cached = _nb.catalog()
+        self._nx_catalog_cache = cached
+        if path:
+            try:
+                path.write_text(_json.dumps(cached), encoding="utf-8")
+            except Exception:
+                pass
+        return cached
+
+    def _nx_transpile_selected(self):
+        """The selected .d3dpipeline, rendered as editable Python."""
+        sel = self.dream3d_pipeline_list.curselection()
+        if not sel:
+            self._nx_show("Select a pipeline in the list first.")
+            return
+        name = self.dream3d_pipeline_list.get(sel[0])
+        self._nx_status_var.set("nx: transpiling…")
+
+        def _work():
+            try:
+                import nx_bridge as _nb
+                src = data_index.input_dir(VAULT_DIR) / "pipelines" / "in" / name
+                if not src.exists():
+                    src = Path(VAULT_DIR) / "pipelines" / "in" / name
+                cat = self._nx_catalog()
+                res = _nb.transpile(src, catalog_cache=cat)
+                code = res["code"]
+                out = self.data_index.safe_write_path(
+                    f"{Path(name).stem}.py", subfolder="dream3d")
+                out.write_text(code, encoding="utf-8")
+                notes = []
+                if res.get("unknown"):
+                    notes.append(f"{len(res['unknown'])} step(s) are not in "
+                                 f"the installed package and were commented "
+                                 f"out rather than guessed.")
+                notes.extend(res.get("warnings") or [])
+                head = f"# saved to: {out}\n"
+                if notes:
+                    head += "".join(f"# note: {n}\n" for n in notes)
+                msg, body = "nx: transpiled", head + "\n" + code
+            except Exception as exc:
+                msg, body = "nx: failed", f"Transpile failed.\n\n{exc}"
+            self.after(0, lambda: (self._nx_status_var.set(msg),
+                                   self._nx_show(body)))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _nx_write_script(self):
+        """A task in plain English -> a simplnx pipeline script.
+
+        The model writes the Python (filters plus whatever glue the task needs
+        — a filter selection cannot express the numpy copy simplnx forces). It
+        is grounded on the REAL signatures of filters retrieved from the
+        installed catalog, and gated by nx_policy before this app would run it.
+        The script is saved and shown either way; a refusal only means the app
+        will not execute it.
+        """
+        task = (self._nx_task_var.get() or "").strip()
+        if not task:
+            self._nx_show("Describe what the pipeline should do, e.g. "
+                          "'read every .dream3d and write an STL'.")
+            return
+        self._nx_status_var.set("nx: writing…")
+
+        def _work():
+            try:
+                import council_engine as _ce
+                import nx_generate as _ng
+
+                def _model_call(prompt):
+                    return _ce.local_chat(
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.2, num_predict=900, timeout=180)
+
+                cat = self._nx_catalog()
+                res = _ng.write_script(task, cat, _model_call)
+                code = res.get("code") or ""
+                stem = re.sub(r"[^a-z0-9]+", "_", task.lower())[:40] or "pipeline"
+                out = self.data_index.safe_write_path(
+                    f"task_{stem}.py", subfolder="dream3d")
+                if code:
+                    out.write_text(code, encoding="utf-8")
+                if res.get("ok"):
+                    msg = f"nx: written ({res['attempts']} attempt(s))"
+                    body = f"# saved to: {out}\n\n{code}"
+                else:
+                    msg = "nx: refused"
+                    body = ("The generated script was NOT accepted, so the "
+                            "app will not run it:\n\n"
+                            + "\n".join(f"  - {e}" for e in res.get("errors", []))
+                            + "\n\nIt is saved for you to read at:\n"
+                            + f"  {out}\n\n" + code)
+            except Exception as exc:
+                msg, body = "nx: failed", f"Could not write a pipeline.\n\n{exc}"
+            self.after(0, lambda: (self._nx_status_var.set(msg),
+                                   self._nx_show(body)))
+
+        threading.Thread(target=_work, daemon=True).start()
 
     def _dream3d_refresh_pipelines(self):
         """Re-scan vault/pipelines/in/ and populate the listbox."""
