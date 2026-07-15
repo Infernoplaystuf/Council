@@ -2472,6 +2472,145 @@ def test_nx_signature_parser() -> None:
            nxi.parse_execute_signature("").get("error"))
 
 
+def test_nx_bridge() -> None:
+    """The app<->DREAM3D-NX bridge. Runs WITHOUT the nx env installed: the
+    parts that must be right regardless are the write-containment guard, the
+    path-parameter discovery, and the failure paths."""
+    try:
+        import json as _json
+        import tempfile as _tf
+        import nx_bridge as nb
+        import nx_worker as nw
+        import data_index
+    except Exception as exc:  # pragma: no cover
+        _check(f"nx bridge modules importable ({exc!r})", False)
+        return
+
+    # ---- path-parameter DISCOVERY -------------------------------------
+    # There is no read_key/write_key convention to hardcode: the real keys
+    # are input_file / stl_file_path / export_file_path / ..., and the spec's
+    # 'import_file_path' exists on no filter at all. Worse, ReadDREAM3DFilter
+    # takes no path — it takes a Dream3dImportParameter.ImportData compound.
+    class _FakeFilter:
+        class execute:
+            __doc__ = ("execute(data_structure: simplnx.DataStructure, "
+                       "export_file_path: os.PathLike = PathLike(''), "
+                       "write_xdmf_file: bool = True) "
+                       "-> simplnx.IFilter.ExecuteResult")
+
+    _check("a plain os.PathLike parameter is discovered as a path",
+           nw.path_params(_FakeFilter()) == {"export_file_path": "path"})
+
+    class _FakeReader:
+        class execute:
+            __doc__ = ("execute(data_structure: simplnx.DataStructure, "
+                       "import_data_object: simplnx.Dream3dImportParameter."
+                       "ImportData = Dream3dImportParameter.ImportData()) "
+                       "-> simplnx.IFilter.ExecuteResult")
+
+    _check("a Dream3dImportParameter.ImportData compound is discovered, "
+           "not mistaken for a path",
+           nw.path_params(_FakeReader()) == {"import_data_object": "import_data"})
+
+    class _NoPaths:
+        class execute:
+            __doc__ = ("execute(data_structure: simplnx.DataStructure, "
+                       "component_count: int = 1) "
+                       "-> simplnx.IFilter.ExecuteResult")
+
+    _check("a filter with no file parameter yields none",
+           nw.path_params(_NoPaths()) == {})
+
+    # ---- the binding is inconsistent about method vs property ----------
+    # Pipeline.name is a str attribute; PipelineFilter.name() is a method.
+    class _Meth:
+        def name(self):
+            return "as-a-method"
+
+    class _Prop:
+        name = "as-a-property"
+
+    _check("accessors work whether they are methods or properties",
+           nw._attr(_Meth(), "name") == "as-a-method"
+           and nw._attr(_Prop(), "name") == "as-a-property")
+    _check("a missing accessor returns the default, never raises",
+           nw._attr(object(), "nope", "fallback") == "fallback")
+
+    # ---- WRITE CONTAINMENT --------------------------------------------
+    # The worker writes wherever it is told, so the vault check lives on the
+    # app side — the only side that knows what the vault is.
+    with _tf.TemporaryDirectory() as td:
+        vault = Path(td) / "vault"
+        (vault / "data_in").mkdir(parents=True)
+        (vault / "data_out").mkdir()
+        allowed = Path(data_index.output_dir(vault))
+        for target, label in ((vault / "data_in", "the read-only input area"),
+                              (Path(td) / "elsewhere", "outside the vault"),
+                              (allowed.parent / ".." / "escape", "a ../ escape")):
+            try:
+                nb.run_folder("p.d3dpipeline", vault / "data_in", target,
+                              vault_dir=vault)
+                _check(f"refuses to write to {label}", False)
+            except nb.NxError as exc:
+                _check(f"refuses to write to {label}",
+                       "refusing to write outside" in str(exc))
+
+    # ---- failure paths -------------------------------------------------
+    _check("a missing nx env raises a NxError naming the fix",
+           _raises(nb.NxError,
+                   lambda: nb.run_job({"action": "ping"},
+                                      env="definitely-not-an-env-xyz")))
+
+    # A worker that writes an error payload must surface it, not swallow it.
+    with _tf.TemporaryDirectory() as td:
+        fake = Path(td) / "fake_worker.py"
+        fake.write_text(
+            "import json,sys\n"
+            "json.dump({'ok': False, 'error': 'boom from worker'},"
+            " open(sys.argv[2],'w'))\n", encoding="utf-8")
+        real_worker, real_env = nb.WORKER, os.environ.get("COUNCIL_NX_PYTHON")
+        try:
+            nb.WORKER = fake
+            os.environ["COUNCIL_NX_PYTHON"] = sys.executable
+            try:
+                nb.run_job({"action": "ping"})
+                _check("a worker-reported error is raised, not swallowed", False)
+            except nb.NxError as exc:
+                _check("a worker-reported error is raised, not swallowed",
+                       "boom from worker" in str(exc))
+        finally:
+            nb.WORKER = real_worker
+            if real_env is None:
+                os.environ.pop("COUNCIL_NX_PYTHON", None)
+            else:
+                os.environ["COUNCIL_NX_PYTHON"] = real_env
+
+    # A worker that dies without writing a result must not look like success.
+    with _tf.TemporaryDirectory() as td:
+        fake = Path(td) / "dead_worker.py"
+        fake.write_text("import sys; sys.exit(3)\n", encoding="utf-8")
+        real_worker, real_env = nb.WORKER, os.environ.get("COUNCIL_NX_PYTHON")
+        try:
+            nb.WORKER = fake
+            os.environ["COUNCIL_NX_PYTHON"] = sys.executable
+            try:
+                nb.run_job({"action": "ping"})
+                _check("a worker that writes no result is an error", False)
+            except nb.NxError as exc:
+                _check("a worker that writes no result is an error",
+                       "no result" in str(exc))
+        finally:
+            nb.WORKER = real_worker
+            if real_env is None:
+                os.environ.pop("COUNCIL_NX_PYTHON", None)
+            else:
+                os.environ["COUNCIL_NX_PYTHON"] = real_env
+
+    _check("an unknown action is rejected by the worker",
+           "unknown action" in _json.dumps(sorted(nw.HANDLERS)) or
+           set(nw.HANDLERS) == {"ping", "catalog", "describe", "run_folder"})
+
+
 def test_plot_roles() -> None:
     """Column-role inference. Two orderings here are load-bearing: datetime is
     tested before the numeric-coercion rule (pd.to_numeric SUCCEEDS on real
@@ -5424,6 +5563,8 @@ def main() -> int:
          test_graph_engine_correctness)
     _run("nx execute-signature parser (the DREAM3D-NX catalog linchpin)",
          test_nx_signature_parser)
+    _run("nx bridge (path discovery, write containment, failure paths)",
+         test_nx_bridge)
     _run("plot roles (datetime/bool ordering, coercion, no mutation)",
          test_plot_roles)
     _run("plot registry (role-gated catalog, validation, aggregation)",
