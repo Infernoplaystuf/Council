@@ -96,8 +96,25 @@ def register(kind: PlotKind) -> PlotKind:
     return kind
 
 
+def _dedupe(cols: Sequence[str]) -> List[str]:
+    """``cols`` with repeats removed, selection order kept.
+
+    applies() counts roles positionally, so ['build', 'build', 'yield'] reads
+    as TWO categoricals and green-lights stacked_bar — which then raises,
+    because it needs two DIFFERENT ones. The Tk listbox cannot produce a
+    duplicate, but build() is the model-facing API and can be handed anything,
+    so the contract "applies() implies build() works" is enforced here rather
+    than trusted."""
+    out: List[str] = []
+    for c in cols:
+        if c not in out:
+            out.append(c)
+    return out
+
+
 def applicable(roles: Dict[str, str], cols: Sequence[str]) -> List[PlotKind]:
     """Every plot that can be drawn from ``cols`` given their ``roles``."""
+    cols = _dedupe(cols)
     out = []
     for k in REGISTRY.values():
         if not k.available():
@@ -131,10 +148,11 @@ def build(key: str, df, cols: Sequence[str], **opts):
         raise ValueError(f"{kind.label} needs {missing}, which isn't installed.")
     if df is None:
         raise ValueError("No data loaded.")
+    cols = _dedupe(cols)
     missing_cols = [c for c in cols if c not in df.columns]
     if missing_cols:
         raise ValueError(f"Column(s) not in this dataset: {missing_cols}")
-    return kind.build(df, list(cols), **opts)
+    return kind.build(df, cols, **opts)
 
 
 # ============================================================

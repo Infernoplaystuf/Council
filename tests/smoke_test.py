@@ -2821,6 +2821,15 @@ def _compiles(src: str) -> bool:
         return False
 
 
+def _plot_builds(reg, key, df, cols) -> bool:
+    """True if reg.build(key, df, cols) returns a figure without raising — the
+    contract that applies() must never permit what build() rejects."""
+    try:
+        return reg.build(key, df, cols) is not None
+    except Exception:
+        return False
+
+
 def test_nx_capability_policy() -> None:
     """A real UUID is NOT a sanctioned UUID.
 
@@ -3491,6 +3500,17 @@ def test_plot_registry() -> None:
            "bar" not in keys)
     cat_num = {k.key for k in reg.applicable(roles, ["build", "yield"])}
     _check("a category+numeric selection offers bar", "bar" in cat_num)
+
+    # applies() counts roles positionally, so a repeated column
+    # (['build','build','yield']) read as two categoricals and green-lit
+    # stacked_bar, which then raised because it needs two DIFFERENT ones. The
+    # listbox can't produce a duplicate but build() is the model-facing API.
+    dup_roles = reg.applicable(roles, ["build", "build", "yield"])
+    _check("a duplicate selection is not offered a plot needing two distinct "
+           "columns", "stacked_bar" not in {k.key for k in dup_roles})
+    _check("applies()-implies-build() holds for every offered plot on a dup",
+           all(_plot_builds(reg, k.key, df, ["build", "build", "yield"])
+               for k in dup_roles))
 
     # The model-facing catalog is plain data (a closed vocabulary).
     cat = reg.catalog(roles, ["build", "yield"])
