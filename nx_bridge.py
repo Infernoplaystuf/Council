@@ -16,6 +16,23 @@ Direct python.exe is preferred over `conda run` deliberately: `conda run` was
 observed crashing into its own error-reporting prompt on this machine, and it
 also buffers/steals output. The direct path is what actually works.
 
+Building the env — install numpy from conda-forge, NEVER from pip:
+
+    conda create -n nxpython python=3.12 dream3dnx -c conda-forge
+    conda install -n nxpython -c conda-forge numpy
+
+A pip numpy in this env is not a version quibble, it is a hard crash. numpy
+2.4.3 from pip died with Windows fatal exception 0xc06d007f (missing DLL) in
+blas_fpe_check at numpy/__init__.py:878 — its BLAS DLLs do not match the conda
+env's. There is no traceback and no Python error: the interpreter exits 127 in
+silence, so a generated script "fails" with nothing to read. simplnx itself
+imports fine, which makes it look like the pipeline is at fault. conda-forge
+numpy 2.5.1 fixed it, with simplnx unaffected.
+
+This matters beyond tidiness: the pipeline scripts need numpy for the copy the
+API forces (there is no zero-copy wrap — `npview[:] = np.loadtxt(...)`), so a
+broken numpy silently removes CSV ingestion.
+
 Safety: run_folder REFUSES to write anywhere but the vault's output area. The
 worker takes an absolute out_dir and would happily write wherever it is told,
 so the check belongs here, on the side that knows what the vault is. Inputs are
