@@ -2418,6 +2418,60 @@ def test_provenance_source_resolve() -> None:
                 cge.VAULT_DIR = prev
 
 
+def test_nx_signature_parser() -> None:
+    """nx_introspect parses simplnx's pybind11 execute() signatures.
+
+    This is the linchpin of the DREAM3D-NX catalog: the installed build exposes
+    NO .parameters() on any filter (verified against all 289), so the docstring
+    signature is the ONLY machine-readable source of parameter names, types and
+    defaults. The parser runs in the app env (it is pure string work), so it is
+    testable here without simplnx installed."""
+    try:
+        import nx_introspect as nxi
+    except Exception as exc:  # pragma: no cover
+        _check(f"nx_introspect importable ({exc!r})", False)
+        return
+
+    # A real signature, copied verbatim from simplnx 7.4.x.
+    doc = ("execute(data_structure: simplnx.DataStructure, "
+           "component_count: int = 1, data_format: str = '', "
+           "initialization_value_str: str = '0', "
+           "numeric_type_index: simplnx.NumericType = <NumericType.int32: 4>, "
+           "output_array_path: simplnx.DataPath = DataPath('Data'), "
+           "set_tuple_dimensions: bool = True, "
+           "tuple_dimensions: list[list[float]] = [[0.0]]) "
+           "-> simplnx.IFilter.ExecuteResult\n\nExecutes the filter")
+    got = nxi.parse_execute_signature(doc)
+    names = [p["name"] for p in got["params"]]
+    _check("every parameter is recovered from the signature",
+           names == ["data_structure", "component_count", "data_format",
+                     "initialization_value_str", "numeric_type_index",
+                     "output_array_path", "set_tuple_dimensions",
+                     "tuple_dimensions"])
+    by = {p["name"]: p for p in got["params"]}
+    _check("parameter types are recovered",
+           by["output_array_path"]["type"] == "simplnx.DataPath"
+           and by["component_count"]["type"] == "int")
+    # These two defaults are why a naive comma split fails: both CONTAIN commas
+    # (or angle brackets) that must not be treated as parameter separators.
+    _check("a default containing angle brackets is not split",
+           by["numeric_type_index"]["default"] == "<NumericType.int32: 4>")
+    _check("a nested-list default is not split",
+           by["tuple_dimensions"]["default"] == "[[0.0]]")
+    _check("the return type is recovered",
+           got["returns"] == "simplnx.IFilter.ExecuteResult")
+    _check("no parse error on a real signature", not got.get("error"))
+
+    _check("a comma inside brackets does not split",
+           nxi._split_top_level("a: int = 1, b: list[int, str] = [1, 2], c: str")
+           == ["a: int = 1", "b: list[int, str] = [1, 2]", "c: str"])
+    _check("a comma inside quotes does not split",
+           nxi._split_top_level("a: str = 'x, y', b: int = 2")
+           == ["a: str = 'x, y'", "b: int = 2"])
+    _check("an empty docstring is reported, not crashed",
+           nxi.parse_execute_signature("").get("error"))
+
+
 def test_plot_roles() -> None:
     """Column-role inference. Two orderings here are load-bearing: datetime is
     tested before the numeric-coercion rule (pd.to_numeric SUCCEEDS on real
@@ -5368,6 +5422,8 @@ def main() -> int:
          test_graph_introspect_columns)
     _run("graph engine correctness (no fake trend, aligned, offline-safe)",
          test_graph_engine_correctness)
+    _run("nx execute-signature parser (the DREAM3D-NX catalog linchpin)",
+         test_nx_signature_parser)
     _run("plot roles (datetime/bool ordering, coercion, no mutation)",
          test_plot_roles)
     _run("plot registry (role-gated catalog, validation, aggregation)",
