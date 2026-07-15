@@ -10029,6 +10029,8 @@ class CouncilConsole(tk.Tk):
         ttk.Button(nx_top, text="→ Python (selected)",
                    command=self._nx_transpile_selected).pack(side="right",
                                                              padx=2)
+        ttk.Button(nx_top, text="▶ Run over folder…",
+                   command=self._nx_run_folder).pack(side="right", padx=2)
 
         nx_task = ttk.Frame(nx_row)
         nx_task.pack(fill="x", padx=4, pady=(1, 4))
@@ -10128,21 +10130,39 @@ class CouncilConsole(tk.Tk):
                 pass
         return cached
 
-    def _nx_transpile_selected(self):
-        """The selected .d3dpipeline, rendered as editable Python."""
+    def _nx_selected_pipeline(self):
+        """The selected Pipeline object, or None.
+
+        Via _dream3d_pipelines_cache, NOT the listbox text: the list shows
+        `name  (format, N steps)`, so building a path out of what is displayed
+        looks for a file whose name ends in "(json, 3 steps)" and never finds
+        one. The cache is what _dream3d_show_selected already uses."""
         sel = self.dream3d_pipeline_list.curselection()
         if not sel:
+            return None
+        cache = getattr(self, "_dream3d_pipelines_cache", [])
+        idx = sel[0]
+        if idx < 0 or idx >= len(cache):
+            return None
+        return cache[idx]
+
+    def _nx_transpile_selected(self):
+        """The selected .d3dpipeline, rendered as editable Python."""
+        pl = self._nx_selected_pipeline()
+        if pl is None:
             self._nx_show("Select a pipeline in the list first.")
             return
-        name = self.dream3d_pipeline_list.get(sel[0])
+        name, src = pl.name, Path(pl.path)
+        if src.suffix.lower() == ".py":
+            self._nx_show(f"{name} is already a Python script — open it from "
+                          "the in/ folder. This button converts a saved "
+                          ".d3dpipeline into Python.")
+            return
         self._nx_status_var.set("nx: transpiling…")
 
         def _work():
             try:
                 import nx_bridge as _nb
-                src = data_index.input_dir(VAULT_DIR) / "pipelines" / "in" / name
-                if not src.exists():
-                    src = Path(VAULT_DIR) / "pipelines" / "in" / name
                 cat = self._nx_catalog()
                 res = _nb.transpile(src, catalog_cache=cat)
                 code = res["code"]
@@ -10161,6 +10181,66 @@ class CouncilConsole(tk.Tk):
                 msg, body = "nx: transpiled", head + "\n" + code
             except Exception as exc:
                 msg, body = "nx: failed", f"Transpile failed.\n\n{exc}"
+            self.after(0, lambda: (self._nx_status_var.set(msg),
+                                   self._nx_show(body)))
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _nx_run_folder(self):
+        """Run the selected pipeline over every matching file in a folder.
+
+        The pipeline is loaded fresh per file and only its I/O paths are
+        changed, so simplnx's own execution is the gate on each run. Outputs go
+        to data_out/dream3d/runs/ — passing vault_dir makes the bridge refuse
+        any pipeline that would write elsewhere, including a second writer
+        still pointing at wherever it was saved.
+        """
+        pl = self._nx_selected_pipeline()
+        if pl is None:
+            self._nx_show("Select a pipeline to run over a folder.")
+            return
+        if Path(pl.path).suffix.lower() == ".py":
+            self._nx_show(f"{pl.name} is a Python script — run it directly. "
+                          "The folder runner drives a saved .d3dpipeline.")
+            return
+        import tkinter.filedialog as fd
+        in_dir = fd.askdirectory(title="Folder of input files to process",
+                                 initialdir=str(data_index.input_dir(VAULT_DIR)))
+        if not in_dir:
+            return
+        pattern = simpledialog.askstring(
+            "File pattern", "Which files? (e.g. *.dream3d)",
+            initialvalue="*.dream3d", parent=self)
+        if not pattern:
+            return
+        self._nx_status_var.set("nx: running…")
+        self._nx_show(f"Running {pl.name} over {pattern} in:\n  {in_dir}\n\n"
+                      "This runs in the DREAM3D-NX env and may take a while.")
+
+        def _work():
+            try:
+                import nx_bridge as _nb
+                out_dir = (Path(data_index.output_dir(VAULT_DIR))
+                           / "dream3d" / "runs")
+                res = _nb.run_folder(Path(pl.path), in_dir, out_dir,
+                                     glob=pattern, vault_dir=VAULT_DIR)
+                lines = [f"{pl.name} over {pattern}",
+                         f"  files : {res['total']}",
+                         f"  ok    : {res['ok']}",
+                         f"  failed: {res['failed']}",
+                         f"  output: {out_dir}", ""]
+                for r in res["runs"]:
+                    tag = "ok " if r["ok"] else "FAIL"
+                    lines.append(f"[{tag}] {Path(r['file']).name}")
+                    if r.get("write_set"):
+                        lines.append(f"        -> {r['write_set']['dest']}")
+                    for e in (r.get("errors") or [])[:2]:
+                        lines.append(f"        {e.splitlines()[0]}")
+                msg = (f"nx: {res['ok']}/{res['total']} ok"
+                       if res["total"] else "nx: no matching files")
+                body = "\n".join(lines)
+            except Exception as exc:
+                msg, body = "nx: run failed", f"The run was refused or failed.\n\n{exc}"
             self.after(0, lambda: (self._nx_status_var.set(msg),
                                    self._nx_show(body)))
 

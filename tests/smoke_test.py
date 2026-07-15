@@ -2990,6 +2990,8 @@ def test_dream3d_tab_wiring() -> None:
         f.after = lambda ms, fn: fn()
         f._nx_write_script = C._nx_write_script.__get__(f)
         f._nx_transpile_selected = C._nx_transpile_selected.__get__(f)
+        f._nx_selected_pipeline = C._nx_selected_pipeline.__get__(f)
+        f._dream3d_pipelines_cache = []
 
         # An empty task must not spawn a thread or reach the model.
         f._nx_task_var.set("")
@@ -3014,6 +3016,50 @@ def test_dream3d_tab_wiring() -> None:
                Path(data_index.output_dir(vault)) in Path(out).parents)
         _check("the helper used is the instance method, not a module function",
                not hasattr(data_index, "safe_write_path"))
+
+        # THE selection bug: the listbox shows "name  (format, N steps)", so a
+        # handler that builds a path out of the displayed text looks for a file
+        # called "job.d3dpipeline  (json, 2 steps)" and never finds one. The
+        # cache is the only source of a real path.
+        try:
+            import pipeline_scanner as _ps
+        except Exception:
+            _check("pipeline_scanner importable", False)
+            return
+        import json as _json
+        pin = _ps.vault_pipelines_in_dir(vault)
+        (pin / "job.d3dpipeline").write_text(_json.dumps({
+            "name": "j", "pipeline": [
+                {"filter": {"name": "nx::core::CreateDataArrayFilter",
+                            "uuid": "67041f9b-bdc6-4122-acc6-c9fe9280e90d"},
+                 "args": {"parameters_version": 1}}]}), encoding="utf-8")
+        f._dream3d_pipelines_cache = _ps.scan_pipelines(pin)
+
+        class _LB2:
+            def curselection(self):
+                return (0,)
+
+            def get(self, i):
+                # what the tab really shows — decorated, not a filename
+                pl = f._dream3d_pipelines_cache[i]
+                return f"{pl.name}  ({pl.format}, {len(pl.steps)} steps)"
+
+        f.dream3d_pipeline_list = _LB2()
+        f._nx_selected_pipeline = C._nx_selected_pipeline.__get__(f)
+        sel = f._nx_selected_pipeline()
+        _check("the selection resolves via the cache to a path that EXISTS",
+               sel is not None and Path(sel.path).exists())
+        _check("the displayed row is decorated, so it is NOT a usable path",
+               not (pin / f.dream3d_pipeline_list.get(0)).exists())
+
+        # Nothing selected must not reach the nx env.
+        class _LBNone:
+            def curselection(self):
+                return ()
+
+        f.dream3d_pipeline_list = _LBNone()
+        _check("no selection yields None rather than an index error",
+               f._nx_selected_pipeline() is None)
 
 
 def test_nx_hardening() -> None:
