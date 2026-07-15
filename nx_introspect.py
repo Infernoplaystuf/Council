@@ -161,11 +161,55 @@ def describe_params(inst) -> dict:
     return out
 
 
+def collect_enums(mod, mod_name: str, out: dict) -> None:
+    """Every enum's int -> member-name map, including enums nested one level
+    inside parameter classes (Dream3dImportParameter.PathImportPolicy).
+
+    The transpiler needs these: a saved pipeline stores an enum as its INTEGER
+    (numeric_type_index is 8, not 'float32'), so rendering runnable Python
+    means mapping 8 back to NumericType.float32."""
+    def members(cls):
+        try:
+            return {int(m.value): m.name for m in cls.__members__.values()}
+        except Exception:
+            return None
+
+    for attr in dir(mod):
+        if attr.startswith("_"):
+            continue
+        try:
+            obj = getattr(mod, attr)
+        except Exception:
+            continue
+        if not isinstance(obj, type):
+            continue
+        m = members(obj)
+        if m:
+            out[f"{mod_name}.{attr}"] = m
+            continue
+        # Nested enums (Dream3dImportParameter.PathImportPolicy) via vars(),
+        # NOT dir()+getattr(). getattr on a pybind11 class attribute HARD
+        # CRASHES this interpreter — probing simplnx.BoolArray kills the
+        # process with no traceback (exit 127), taking the catalog with it.
+        # vars() hands back the raw entry without invoking any descriptor.
+        try:
+            raw = dict(vars(obj))
+        except Exception:
+            continue
+        for sub, so in raw.items():
+            if sub.startswith("_") or not isinstance(so, type):
+                continue
+            sm = members(so)
+            if sm:
+                out[f"{mod_name}.{attr}.{sub}"] = sm
+
+
 def catalog() -> dict:
     result = {
         "python": sys.version,
         "modules_loaded": [],
         "modules_missing": [],
+        "enums": {},
         "filters": [],
         # The two things the spec says to confirm from real data rather than
         # memory: how a pipeline is executed, and what it returns.
@@ -179,6 +223,7 @@ def catalog() -> dict:
                 {"module": mod_name, "error": f"{type(e).__name__}: {e}"})
             continue
         result["modules_loaded"].append(mod_name)
+        collect_enums(mod, mod_name, result["enums"])
         for attr in dir(mod):
             try:
                 obj = getattr(mod, attr)

@@ -2611,6 +2611,146 @@ def test_nx_bridge() -> None:
            set(nw.HANDLERS) == {"ping", "catalog", "describe", "run_folder"})
 
 
+def test_nx_transpile() -> None:
+    """.d3dpipeline JSON -> runnable Python, keyed on UUID.
+
+    Pure string work over a catalog, so it runs without simplnx. The cases
+    here are the ones a naive walk of the JSON gets wrong — each was found
+    against a real pipeline file written by the installed build."""
+    try:
+        import nx_transpile as tp
+    except Exception as exc:  # pragma: no cover
+        _check(f"nx_transpile importable ({exc!r})", False)
+        return
+
+    catalog = {
+        "enums": {
+            "simplnx.NumericType": {"4": "int32", "8": "float32"},
+            "simplnx.Dream3dImportParameter.PathImportPolicy": {"0": "All"},
+        },
+        "filters": [
+            {"uuid": "u-create", "module": "simplnx", "alias": "nx",
+             "py_attr": "CreateDataArrayFilter",
+             "human_name": "Create Data Array",
+             "execute": {"params": [
+                 {"name": "data_structure", "type": "simplnx.DataStructure"},
+                 {"name": "component_count", "type": "int"},
+                 {"name": "numeric_type_index", "type": "simplnx.NumericType"},
+                 {"name": "output_array_path", "type": "simplnx.DataPath"},
+                 {"name": "tuple_dimensions", "type": "list[list[float]]"},
+             ]}},
+            {"uuid": "u-read", "module": "simplnx", "alias": "nx",
+             "py_attr": "ReadDREAM3DFilter", "human_name": "Read DREAM3D",
+             "execute": {"params": [
+                 {"name": "data_structure", "type": "simplnx.DataStructure"},
+                 {"name": "import_data_object",
+                  "type": "simplnx.Dream3dImportParameter.ImportData"},
+             ]}},
+            {"uuid": "u-write", "module": "simplnx", "alias": "nx",
+             "py_attr": "WriteDREAM3DFilter", "human_name": "Write DREAM3D",
+             "execute": {"params": [
+                 {"name": "data_structure", "type": "simplnx.DataStructure"},
+                 {"name": "export_file_path", "type": "os.PathLike"},
+             ]}},
+        ],
+    }
+
+    # Every arg in a saved pipeline is a VERSIONED ENVELOPE, not a value.
+    _check("a {'value','version'} envelope is unwrapped",
+           tp.unwrap({"value": 7, "version": 1}) == 7)
+    _check("a bare value passes through unwrap",
+           tp.unwrap(5) == 5 and tp.unwrap({"a": 1}) == {"a": 1})
+
+    pipe = {"pipeline": [
+        {"filter": {"name": "nx::core::CreateDataArrayFilter",
+                    "uuid": "u-create"},
+         "args": {"component_count": {"value": 1, "version": 1},
+                  "numeric_type_index": {"value": 8, "version": 1},
+                  "output_array_path": {"value": "Values", "version": 1},
+                  "tuple_dimensions": {"value": [[10.0]], "version": 1},
+                  "parameters_version": 1}},
+    ]}
+    out = tp.transpile(pipe, catalog)
+    code = out["code"]
+    _check("the envelope never leaks into the generated code",
+           "'version'" not in code and "{'value'" not in code)
+    _check("parameters_version is dropped (it is not an execute() parameter)",
+           "parameters_version" not in code)
+    _check("an enum int is rendered as its member (8 -> float32)",
+           "numeric_type_index=nx.NumericType.float32" in code)
+    _check("a DataPath is wrapped, not passed as a bare string",
+           "output_array_path=nx.DataPath('Values')" in code)
+    _check("plain values render as themselves",
+           "component_count=1" in code and "tuple_dimensions=[[10.0]]" in code)
+    _check("the generated code is syntactically valid Python",
+           _compiles(code))
+
+    # A Windows path must round-trip. repr() escapes each backslash; an
+    # r-prefix on top of that yields literal doubled backslashes.
+    winp = {"pipeline": [
+        {"filter": {"name": "x", "uuid": "u-write"},
+         "args": {"export_file_path":
+                  {"value": "C:\\data\\out.dream3d", "version": 1}}}]}
+    wcode = tp.transpile(winp, catalog)["code"]
+    _check("a Windows path is not double-escaped (no r-prefix on a repr)",
+           "r'C:" not in wcode)
+    ns = {}
+    exec(compile(wcode.split("import simplnx")[0], "<t>", "exec"), ns)
+    import re as _re
+    lit = _re.search(r"export_file_path=(.+),", wcode).group(1)
+    _check("the path literal evaluates back to the original path",
+           eval(lit) == "C:\\data\\out.dream3d")
+
+    # The compound the spec treats as a path string.
+    rp = {"pipeline": [
+        {"filter": {"name": "x", "uuid": "u-read"},
+         "args": {"import_data_object": {"value": {
+             "file_path": "C:\\in\\a.dream3d", "data_paths": [],
+             "path_import_policy": 0}, "version": 1}}}]}
+    rcode = tp.transpile(rp, catalog)["code"]
+    _check("an ImportData compound is reconstructed, not stringified",
+           "nx.Dream3dImportParameter.ImportData(file_path=" in rcode)
+    _check("its nested enum is rendered as a member",
+           "PathImportPolicy.All" in rcode)
+
+    # An unknown UUID must be an obvious comment, never silently-wrong code.
+    unk = {"pipeline": [{"filter": {"name": "nx::core::Ghost",
+                                    "uuid": "not-installed"},
+                         "args": {"foo": {"value": 1, "version": 1}}}]}
+    u = tp.transpile(unk, catalog)
+    _check("an unknown UUID becomes a comment, not a call",
+           "UNKNOWN FILTER" in u["code"] and "Ghost" in u["code"]
+           and ".execute(" not in u["code"])
+    _check("an unknown UUID is reported to the caller",
+           len(u["unknown"]) == 1 and u["unknown"][0]["uuid"] == "not-installed")
+    _check("a pipeline with an unknown filter still compiles",
+           _compiles(u["code"]))
+
+    dis = {"pipeline": [{"filter": {"name": "x", "uuid": "u-create"},
+                         "isDisabled": True, "args": {}}]}
+    _check("a disabled step is commented out, not executed",
+           ".execute(" not in tp.transpile(dis, catalog)["code"])
+
+    # An arg the installed build does not have must warn, not be emitted.
+    stale = {"pipeline": [
+        {"filter": {"name": "x", "uuid": "u-write"},
+         "args": {"export_file_path": {"value": "o.d3d", "version": 1},
+                  "removed_option": {"value": 1, "version": 1}}}]}
+    s = tp.transpile(stale, catalog)
+    _check("an arg absent from the installed filter is skipped with a warning",
+           "removed_option" not in s["code"]
+           and any("removed_option" in w for w in s["warnings"]))
+
+
+def _compiles(src: str) -> bool:
+    """True if `src` is syntactically valid Python (it is not executed)."""
+    try:
+        compile(src, "<generated>", "exec")
+        return True
+    except SyntaxError:
+        return False
+
+
 def test_plot_roles() -> None:
     """Column-role inference. Two orderings here are load-bearing: datetime is
     tested before the numeric-coercion rule (pd.to_numeric SUCCEEDS on real
@@ -5565,6 +5705,8 @@ def main() -> int:
          test_nx_signature_parser)
     _run("nx bridge (path discovery, write containment, failure paths)",
          test_nx_bridge)
+    _run("nx transpile (.d3dpipeline -> runnable Python, UUID-keyed)",
+         test_nx_transpile)
     _run("plot roles (datetime/bool ordering, coercion, no mutation)",
          test_plot_roles)
     _run("plot registry (role-gated catalog, validation, aggregation)",

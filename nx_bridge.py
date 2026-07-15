@@ -139,6 +139,24 @@ def describe_pipeline(pipeline: Any, *, env: str = NX_ENV,
                    env=env, timeout=timeout)
 
 
+def transpile(pipeline: Any, *, catalog_cache: Any = None,
+              env: str = NX_ENV, timeout: int = 900) -> Dict[str, Any]:
+    """A .d3dpipeline rendered as editable Python (spec B.3 Mode 2).
+
+    Needs a catalog, not the nx env: the rendering itself is pure. Pass
+    ``catalog_cache`` (a path or a dict) to skip the subprocess entirely —
+    the catalog only changes when the nx install does.
+    """
+    import nx_transpile
+    if catalog_cache is None:
+        cat = catalog(env=env, timeout=timeout)
+    elif isinstance(catalog_cache, dict):
+        cat = catalog_cache
+    else:
+        cat = json.loads(Path(catalog_cache).read_text(encoding="utf-8"))
+    return nx_transpile.transpile(pipeline, cat)
+
+
 def run_folder(pipeline: Any, in_dir: Any, out_dir: Any, *,
                glob: str = "*.dream3d", read_index: Optional[int] = None,
                write_index: Optional[int] = None,
