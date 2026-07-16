@@ -560,12 +560,54 @@ class PlotlyRenderer:
         return fig
 
     def _contour(self, spec, df):
+        """Contour Z over (X, Y) — and it now actually contours Z.
+
+        `z` was resolved on its own line and then dropped on the floor: the
+        call was `px.density_contour(df, x=x, y=y)` with no z at all, which
+        contours the DENSITY OF POINTS — where the samples happen to sit, not
+        what they measured.
+
+        That is not a near-miss, it is a different question, and the two are
+        routinely ANTI-correlated. Measured on a melt-pool field sampled
+        densely in the cold corner and sparsely in the hot one, "contour
+        temp_C" drew its peak over the COLDEST region. Nothing on the plot
+        said otherwise — the colour bar was an unlabelled count, so the plot
+        was indistinguishable from a correct one and read as the answer.
+        """
         num_cols = df.select_dtypes(include="number").columns.tolist()
+        if len(num_cols) < 2:
+            raise ValueError(
+                "A contour plot needs at least two numeric columns for the x "
+                f"and y axes; this dataset has {len(num_cols)}.")
         x = spec.x_col or num_cols[0]
         y = spec.y_col or num_cols[1]
-        z = spec.z_col or (num_cols[2] if len(num_cols) > 2 else num_cols[0])
-        return px.density_contour(df, x=x, y=y,
-                                  color_discrete_sequence=px.colors.qualitative.Plotly)
+        # Fall back to None, NOT num_cols[0] — the old fallback made z the same
+        # column as x whenever there were only two numeric columns, so the
+        # "height" was the horizontal axis.
+        z = spec.z_col or (num_cols[2] if len(num_cols) > 2 else None)
+        for col in (x, y, z):
+            if col is not None and col not in df.columns:
+                raise ValueError(f"Column {col!r} is not in this dataset.")
+
+        if z is None:
+            # No third variable exists, so point density is the only thing
+            # there is to contour. That is a fine plot — it just has to say so
+            # rather than let a count masquerade as a measurement.
+            fig = px.density_contour(
+                df, x=x, y=y,
+                color_discrete_sequence=px.colors.qualitative.Plotly)
+            fig.update_traces(contours_coloring="fill", contours_showlabels=True,
+                              colorbar_title_text="count")
+            fig.update_layout(title=f"Density of points — {y} vs {x}")
+            return fig
+
+        # histfunc="avg" bins (x, y) and averages z inside each bin, which is
+        # the right reduction for scattered samples of a field.
+        fig = px.density_contour(df, x=x, y=y, z=df[z], histfunc="avg")
+        fig.update_traces(contours_coloring="fill", contours_showlabels=True,
+                          colorbar_title_text=z)
+        fig.update_layout(title=f"{z} over {x} / {y} (mean per bin)")
+        return fig
 
     def _surface_3d(self, spec, df):
         num_df = df.select_dtypes(include="number")

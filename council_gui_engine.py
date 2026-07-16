@@ -334,7 +334,39 @@ def _is_wsl() -> bool:
         return False
 
 
-_FILE_PATH_RE = _re.compile(r'[a-zA-Z]:[/\\]\S+|/\S+')
+# A POSIX path segment must start at a word BOUNDARY. The `/` in "pass/fail" is
+# not the start of a path, and the lookbehind is what says so.
+#
+# The pattern was `/\S+`, unanchored, so a slash anywhere inside a word matched
+# and everything after it became a "file path the user referenced". In this
+# app's own domain that fires constantly — and it is not a harmless
+# over-match, because a path that doesn't exist is fed to the [NO DATA
+# AVAILABLE] block, which is PRIO_NODATA (0), the highest priority in the whole
+# injector and never dropped. It instructs the model to *refuse to answer*:
+#
+#     user   : "Did the tensile bar pass/fail?"
+#     becomes: [NO DATA AVAILABLE - ... they do NOT exist on this machine:]
+#                - /fail
+#              [Refuse to give specific values for these files. Tell the user
+#               the file is not present on this machine.]
+#
+# So an ordinary question got an outright refusal about a file the user never
+# mentioned. Measured triggers, all plain English an AM engineer types daily:
+# pass/fail, W/mm2, g/cm3, and/or, 50/50, as-built/HIP, plus every relative
+# path ("data/jobs/x.csv" -> "/jobs/x.csv").
+#
+# `~/data/x.csv` was the same defect wearing a different hat: no `~` branch
+# existed, so it matched the inner `/data/x.csv` — silently dropping the home
+# directory and turning a REAL path into a refusal. `~` is deliberately
+# preserved by the cleaning step above, so the intent to support it was there;
+# only the pattern was missing. It is expanded at extraction so the three
+# consumers (all of which do a bare `Path(...)`, none of which expanduser) get
+# something openable.
+_FILE_PATH_RE = _re.compile(
+    r'[a-zA-Z]:[/\\]\S+'        # C:\... / C:/...  — drive-letter absolute
+    r'|~[/\\]\S+'               # ~/...            — home-relative
+    r'|(?<![\w.~])/\S+'         # /...             — POSIX absolute, at a
+)                               #                    word boundary only
 _FILE_READ_CHAR_LIMIT = 12000  # total chars per file in the injected block
 # Extracts the file/folder name out of an injection cost label like
 # "[VAULT MATCH: sales.csv]" / "[FILE: x]" / "[FOLDER: y]" — used per-label in
@@ -1756,6 +1788,15 @@ def _extract_file_paths(text):
         candidate = m.group(0).strip()
         while candidate and not (candidate[-1].isalnum() or candidate[-1] in '\\/'):
             candidate = candidate[:-1]
+        # Expand ~ HERE, once, rather than in each consumer: all three call
+        # sites do a bare Path(...), so an unexpanded "~/data/x.csv" is a
+        # path that cannot be opened and would be reported to the model as
+        # missing — the exact wrong answer this regex change is fixing.
+        if candidate.startswith('~'):
+            try:
+                candidate = str(Path(candidate).expanduser())
+            except Exception:
+                pass
         if candidate and candidate not in seen:
             seen.add(candidate)
             paths.append(candidate)

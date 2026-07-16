@@ -4237,6 +4237,127 @@ def test_dependency_check_sees_the_chart_libs() -> None:
            all(f.install for f in dc.OPTIONAL_FEATURES))
 
 
+def test_plain_english_is_not_a_file_path() -> None:
+    """A slash inside a word is not a path, and must not trigger a refusal.
+
+    `_FILE_PATH_RE` was `/\\S+`, unanchored, so the slash in "pass/fail" started
+    a "file path the user referenced". That is not a harmless over-match: a
+    referenced path that doesn't exist feeds the [NO DATA AVAILABLE] block,
+    which is priority 0 — the highest in the injector, never dropped — and it
+    orders the model to refuse to answer and to say the file isn't on this
+    machine. So an ordinary question earned a refusal about a file the user
+    never mentioned. Every trigger below is plain English an AM engineer types.
+    """
+    try:
+        import council_gui_engine as g
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_gui_engine importable ({exc!r})", False)
+        return
+
+    for msg in ("Did the tensile bar pass/fail?",
+                "What is the laser power density in W/mm2?",
+                "Is the alloy Ti-6Al-4V and/or IN718?",
+                "The yield was 50/50 across the plate",
+                "Compare density g/cm3 for each layer",
+                "Any porosity in the as-built/HIP condition?",
+                "summarize data/jobs/report.csv"):
+        _check(f"not a path: {msg!r}", g._extract_file_paths(msg) == [])
+
+    # The guard must keep working for paths that really are paths.
+    for msg, want in ((r"Summarize C:\data\jobs\job317.csv please",
+                       r"C:\data\jobs\job317.csv"),
+                      ("look at /home/bob/data.csv", "/home/bob/data.csv"),
+                      ("check (/mnt/vault/run.csv) for me", "/mnt/vault/run.csv")):
+        _check(f"still a path: {want!r}", want in g._extract_file_paths(msg))
+
+    # `~` had no branch at all, so it matched the inner "/data/x.csv" and threw
+    # the home directory away — a real path turned into a refusal.
+    import os
+    hits = g._extract_file_paths("summarize ~/data/x.csv")
+    _check("~/ expands instead of losing the home dir",
+           bool(hits) and os.path.expanduser("~").lower() in hits[0].lower()
+           and hits[0].lower().endswith(("data/x.csv", "data\\x.csv")))
+
+    # End to end: the refusal block fires for a real absent path and only then.
+    aug, _f, _b = g._inject_file_contents_impl("Did the tensile bar pass/fail?",
+                                               n_ctx=8192)
+    _check("no refusal block for 'pass/fail'", "[NO DATA AVAILABLE" not in aug)
+    aug2, _f, _b = g._inject_file_contents_impl("summarize /home/bob/nope.csv",
+                                                n_ctx=8192)
+    _check("cross-machine refusal still fires for a genuinely absent path",
+           "[NO DATA AVAILABLE" in aug2)
+
+
+def test_contour_contours_the_z_column() -> None:
+    """A contour of Z over (X, Y) must contour Z, not the point density.
+
+    `z` was resolved and then dropped: the call was density_contour(x=x, y=y)
+    with no z, which contours WHERE THE SAMPLES SIT rather than what they
+    measured. The two are routinely anti-correlated. Sampled densely in the
+    cold corner and sparsely in the hot one, "contour temp_C" put its peak on
+    the COLDEST region and nothing on the plot said the colour was a count.
+    """
+    try:
+        import numpy as np
+        import pandas as pd
+        import graph_engine as ge
+        import plotly  # noqa: F401
+    except Exception as exc:  # pragma: no cover
+        _check(f"numpy/pandas/plotly importable for the contour test ({exc!r})",
+               False)
+        return
+
+    rng = np.random.default_rng(0)
+    x = np.concatenate([rng.uniform(7, 10, 40), rng.uniform(0, 3, 400)])
+    y = np.concatenate([rng.uniform(7, 10, 40), rng.uniform(0, 3, 400)])
+    df = pd.DataFrame({"x_mm": x, "y_mm": y, "temp_C": 20.0 + 30.0 * (x + y)})
+
+    R = ge.PlotlyRenderer()
+    tr = R._contour(ge.PlotSpec(plot_type="contour", x_col="x_mm",
+                                y_col="y_mm", z_col="temp_C"), df).data[0]
+    _check("z_col reaches the trace", tr.z is not None)
+    _check("trace z is the temp_C column value-for-value",
+           np.allclose(np.sort(np.asarray(tr.z, "float64")),
+                       np.sort(df["temp_C"].values)))
+    _check("z is reduced by mean per bin", tr.histfunc == "avg")
+    _check("colour bar names the z column", tr.colorbar.title.text == "temp_C")
+
+    # Apply the reduction plotly.js will apply and check which corner wins.
+    tx, ty = np.asarray(tr.x, "float64"), np.asarray(tr.y, "float64")
+    xb = np.linspace(tx.min(), tx.max() + 1e-9, 11)
+    yb = np.linspace(ty.min(), ty.max() + 1e-9, 11)
+    cnt, _, _ = np.histogram2d(tx, ty, bins=[xb, yb])
+    s, _, _ = np.histogram2d(tx, ty, bins=[xb, yb],
+                             weights=np.asarray(tr.z, "float64"))
+    grid = np.divide(s, cnt, out=np.full_like(s, np.nan), where=cnt > 0)
+    i, j = np.unravel_index(
+        np.nanargmax(np.where(np.isnan(grid), -np.inf, grid)), grid.shape)
+    peak_x, peak_y = (xb[i] + xb[i + 1]) / 2, (yb[j] + yb[j + 1]) / 2
+    _check("peak lands in the hot corner, not the densely-sampled cold one",
+           peak_x > 5 and peak_y > 5)
+    _check("peak value is a temperature (~620 C), not a point count",
+           500 < float(np.nanmax(grid)) < 700)
+
+    # Two numeric columns: density is the only honest answer — and it says so.
+    tr2 = R._contour(ge.PlotSpec(plot_type="contour"),
+                     df[["x_mm", "y_mm"]]).data[0]
+    _check("2-column frame labels its colour bar 'count'",
+           tr2.colorbar.title.text == "count")
+    _check("2-column frame carries no fabricated z",
+           getattr(tr2, "z", None) is None)
+
+    # The old fallback made z the same column as x. It must not come back.
+    tr3 = R._contour(ge.PlotSpec(plot_type="contour"), df).data[0]
+    _check("with no z_col the 3rd numeric column is used, not x",
+           np.allclose(np.sort(np.asarray(tr3.z, "float64")),
+                       np.sort(df["temp_C"].values)))
+
+    _check("one numeric column is a clear error, not an IndexError",
+           _raises(ValueError,
+                   lambda: R._contour(ge.PlotSpec(plot_type="contour"),
+                                      df[["x_mm"]])))
+
+
 def test_feature_detect_counts_thin_features() -> None:
     """A feature count must not silently exclude thin features.
 
@@ -7378,6 +7499,10 @@ def main() -> int:
          test_sqlite_readonly_uri)
     _run("TF-IDF idf units (the vault's own terms are not dropped)",
          test_tfidf_idf_units)
+    _run("plain English with a slash is not a file path",
+         test_plain_english_is_not_a_file_path)
+    _run("contour contours the z column, not the point density",
+         test_contour_contours_the_z_column)
     _run("UI pump survives a bad queue item",
          test_ui_pump_survives_a_bad_item)
     _run("dependency check sees the chart libraries",
