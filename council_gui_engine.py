@@ -7960,9 +7960,40 @@ class CouncilConsole(tk.Tk):
         return names
 
     def _parse_field_value_fallback(self, line: str):
-        """(field, value) for a field-search phrasing the regexes missed."""
+        """(field, value) for a field-search phrasing the regexes missed.
+
+        A parse that finds no field returns None — that is the normal "this
+        sentence isn't a field search" answer and stays silent. But field_search
+        being BROKEN is not that, and this used to be unable to tell the two
+        apart: a bare `except Exception` swallowed ImportError and SyntaxError
+        alike, so a broken module read as "no field here", the question quietly
+        fell through to the model over capped context, and the user saw a
+        vague answer instead of an error. That is exactly what happened when
+        field_search carried 3.12-only syntax on a 3.11 box: the module was
+        unimportable, this returned None on every question, and the whole
+        deterministic search route vanished with nothing printed.
+        """
         try:
             import field_search as _fs
+        except Exception as exc:
+            # Loud, once-per-session: the route is DOWN, not merely unmatched.
+            if not getattr(self, "_fs_import_warned", False):
+                self._fs_import_warned = True
+                msg = (f"Field search is unavailable — field_search failed to "
+                       f"import ({exc.__class__.__name__}: {exc}). Searches "
+                       f"will fall back to the model, which reads only part of "
+                       f"the vault. This is a bug, not a data problem.")
+                # Plain print, no module alias: `_sys_dbg` is imported inside
+                # OTHER functions, not at module scope, so referencing it here
+                # would make this error handler raise NameError on its way to
+                # reporting the error.
+                print("[field_search] " + msg)
+                try:
+                    self._append_transcript("Council", msg, "observation")
+                except Exception:
+                    pass
+            return None
+        try:
             return _fs.parse_field_value_intent(line, self._known_field_names())
         except Exception:
             return None

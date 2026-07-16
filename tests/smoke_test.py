@@ -4237,6 +4237,107 @@ def test_dependency_check_sees_the_chart_libs() -> None:
            all(f.install for f in dc.OPTIONAL_FEATURES))
 
 
+def test_vault_search_reads_every_file() -> None:
+    """"Search all files" must read all files — and count only what it read.
+
+    The user reported, twice, that the app "doesn't seem to actually look
+    through all of the files in the vault". They were right, for two reasons,
+    both measured on a folder where EVERY file contained the same POC line:
+
+      • an extension whitelist decided what to open. .xlsm (macro Excel — most
+        of a manufacturing vault), README, Makefile, run_output.dat, batch.rpt
+        and every extensionless file were skipped without being read. 9 of 20
+        files were opened.
+      • stats["scanned"] was assigned len(files) — the count ENUMERATED, not
+        the count OPENED — so coverage_line announced "Searched all 20 file(s)"
+        after reading 9. The one sentence whose entire job is to let a user
+        trust a negative result was the thing lying about it.
+
+    A third defect, on the app's own primary data shape: a 260 KB one-line
+    field JSON with the POC near the end lost it to the 200k-char read cap,
+    reported truncated=False, and still claimed full coverage.
+    """
+    try:
+        import field_search as fs
+    except Exception as exc:  # pragma: no cover
+        _check(f"field_search importable ({exc!r})", False)
+        return
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    line = "Point of Contact: Bob Smith\nProgram: Falcon\n"
+    names = ["spec.txt", "notes.md", "run.log", "rec.json", "rows.jsonl",
+             "conf.yaml", "page.html", "data.xml", "settings.ini",
+             "run_output.dat", "batch.rpt", "README", "Makefile", "notes.text"]
+    scratch = Path(tempfile.mkdtemp(prefix="smoke_vault_cov_"))
+    try:
+        for n in names:
+            (scratch / n).write_text(line, encoding="utf-8")
+        # Genuinely binary: must be REPORTED as unread, never silently dropped
+        # and never absorbed into the scanned count.
+        (scratch / "scan.bin").write_bytes(bytes(range(256)) * 40)
+
+        stats = {}
+        hits = fs.find_files_with_field_value(scratch, "point of contact",
+                                              "Bob Smith", stats=stats)
+        found = {Path(h[0]).name for h in hits}
+        missing = [n for n in names if n not in found]
+        _check("every readable file is searched, whatever its extension "
+               "(README/Makefile/.dat/.rpt/.text included)",
+               not missing, f"missed: {missing}")
+        _check("scanned counts files actually OPENED, not files enumerated",
+               stats["scanned"] == len(names),
+               f"scanned={stats['scanned']} read={len(names)}")
+        _check("an unreadable binary is reported, not silently skipped",
+               any(n == "scan.bin" for n, _w in stats.get("skipped_detail") or []))
+        _check("a run that skipped a file is flagged incomplete",
+               stats.get("truncated") is True)
+        cov = fs.coverage_line(stats)
+        _check("coverage does NOT claim 'all' when a file went unread",
+               "Searched all" not in cov, cov)
+        _check("coverage states the real numbers", "of " in cov and "PARTIAL" in cov, cov)
+
+        # All-readable folder: the confident sentence is allowed, and only here.
+        (scratch / "scan.bin").unlink()
+        st2 = {}
+        fs.find_files_with_field_value(scratch, "point of contact",
+                                       "Bob Smith", stats=st2)
+        _check("with every file read, coverage says so plainly",
+               fs.coverage_line(st2) == f"Searched all {len(names):,} file(s) "
+                                        f"in the vault.",
+               fs.coverage_line(st2))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    # The app's primary shape: one-line JSON, field near the end.
+    scratch = Path(tempfile.mkdtemp(prefix="smoke_vault_big_"))
+    try:
+        big = scratch / "field_record.json"
+        big.write_text('{"notes": "' + ("x" * 260000) + '", '
+                       '"Point of Contact": "Bob Smith"}', encoding="utf-8")
+        st3 = {}
+        h3 = fs.find_files_with_field_value(scratch, "point of contact",
+                                            "Bob Smith", stats=st3)
+        _check("a 260KB one-line field JSON still yields its point of contact",
+               len(h3) == 1, f"hits={h3}")
+
+        # And when a cap DOES fire, it must be announced, not swallowed.
+        st4 = {}
+        h4 = fs.find_files_with_field_value(scratch, "point of contact",
+                                            "Bob Smith", stats=st4,
+                                            text_max_chars=1000)
+        _check("a read cap that fires is reported as partial, not silent",
+               st4.get("truncated") is True and st4.get("partial") == 1,
+               f"stats={ {k: v for k, v in st4.items() if k != 'skipped_detail'} }")
+        _check("...and the user is told the answer is incomplete",
+               "PARTIAL" in fs.coverage_line(st4), fs.coverage_line(st4))
+        _check("a truncated read that finds nothing is not reported as a 'no'",
+               not h4 or "PARTIAL" in fs.coverage_line(st4))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def test_no_312_only_syntax() -> None:
     """Every source file must PARSE on the oldest Python the app supports.
 
@@ -7597,6 +7698,8 @@ def main() -> int:
          test_sqlite_readonly_uri)
     _run("TF-IDF idf units (the vault's own terms are not dropped)",
          test_tfidf_idf_units)
+    _run("vault search reads every file and counts only what it read",
+         test_vault_search_reads_every_file)
     _run("no source file uses Python 3.12-only syntax (floor is 3.11)",
          test_no_312_only_syntax)
     _run("plain English with a slash is not a file path",

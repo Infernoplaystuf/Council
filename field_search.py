@@ -24,7 +24,10 @@ import re
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 
-_TABULAR = {".csv", ".tsv", ".xlsx", ".xls", ".parquet"}
+_TABULAR = {".csv", ".tsv", ".xlsx", ".xlsm", ".xls", ".parquet"}
+# .xlsm is macro-enabled Excel and openpyxl reads it exactly like .xlsx. It was
+# absent, so every macro workbook in a vault — which in a manufacturing shop is
+# most of them (travelers, routers, inspection sheets) — was skipped.
 _TEXTUAL = {".txt", ".md", ".markdown", ".rst", ".log", ".json", ".jsonl",
             ".ndjson", ".yaml", ".yml", ".html", ".htm", ".xml", ".ini",
             ".cfg", ".csv", ".tsv"}
@@ -346,6 +349,39 @@ def _read_text(p: Path, max_chars: int = 400000) -> str:
         return ""
 
 
+def _looks_textual(p: Path, probe: int = 8192) -> bool:
+    """Is this file plain text, judged by its BYTES rather than its name?
+
+    An extension whitelist cannot answer "did you search all my files". A
+    vault is full of readable text with names nobody whitelisted — README,
+    Makefile, run_output.dat, batch.rpt, notes.text, job_314 with no suffix at
+    all. Every one was skipped silently. So the question the loop asks is no
+    longer "do I recognise this extension" but "is this actually text".
+
+    NUL bytes are the classic binary tell; beyond that, a high proportion of
+    undecodable bytes means it is not text we can field-search. Reads at most
+    `probe` bytes, so this costs one small read per unknown file.
+    """
+    try:
+        with open(p, "rb") as fh:
+            chunk = fh.read(probe)
+    except Exception:
+        return False
+    if not chunk:
+        return False
+    if b"\x00" in chunk:
+        return False
+    try:
+        chunk.decode("utf-8")
+        return True
+    except UnicodeDecodeError:
+        pass
+    # Not clean UTF-8 — allow a little corruption (a stray latin-1 byte in an
+    # otherwise textual log) but not a lot.
+    bad = sum(1 for b in chunk if b < 9 or (13 < b < 32))
+    return (bad / len(chunk)) < 0.05
+
+
 def extract_field_value(path: Any, field: str,
                         *, max_values: int = 10) -> Optional[List[str]]:
     """Return the value(s) of the labeled ``field`` in one file, or None.
@@ -440,7 +476,7 @@ def _table_column_values(p: Path, col: str) -> List[str]:
 def find_files_with_field_value(root: Any, field: str, value: str, *,
                                 limit: Optional[int] = None,
                                 max_files: Optional[int] = None,
-                                text_max_chars: int = 200000,
+                                text_max_chars: int = 5_000_000,
                                 on_progress: Optional[Callable[[int, int],
                                                                None]] = None,
                                 stats: Optional[dict] = None
@@ -497,6 +533,15 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
                 f"scanned (max_files)")
     total = len(files)
     out: List[Tuple[str, str]] = []
+    # scanned must count files we actually OPENED. It used to be assigned
+    # len(files) at the end — the number ENUMERATED — so coverage_line reported
+    # "Searched all 20 file(s)" after reading 9 of them. Same class of bug as
+    # every other count in this app that was right in one unit and wrong in the
+    # equivalent one; here it made the coverage line, whose entire job is to be
+    # trustworthy, into the least trustworthy thing on screen.
+    _read_count = 0
+    _skipped: List[Tuple[str, str]] = []
+    _partial: List[str] = []
     try:
         import vault_analyst as va
         _match_col = va.match_column_name
@@ -524,6 +569,10 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
         try:
             if suf in _TABULAR:
                 cols = _table_columns(p)
+                if not cols:
+                    _skipped.append((p.name, "could not read the table header"))
+                    continue
+                _read_count += 1
                 col = (_match_col(cols, field)
                        if (cols and _match_col and fn) else None)
                 if col is None:
@@ -551,12 +600,28 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
                         break
                 if hit:
                     out.append((str(p), hit))
-            elif suf in _TEXTUAL or suf in _EXTRACTABLE:
+            elif suf in _TEXTUAL or suf in _EXTRACTABLE or _looks_textual(p):
+                # `or _looks_textual(p)` is the difference between "I searched
+                # the extensions I know" and "I searched your files". The
+                # whitelist silently dropped README, Makefile, run_output.dat,
+                # batch.rpt and every extensionless file — while still counting
+                # them as scanned.
                 if not fn:
                     continue
                 text = _read_text(p, max_chars=text_max_chars)
                 if not text:
+                    _skipped.append((p.name, "unreadable or empty"))
                     continue
+                # A field can sit anywhere in a file, so a truncated read that
+                # finds nothing is NOT a "no". This app's own primary shape is
+                # a field JSON with every key on ONE line, where the tail is as
+                # likely to hold the point of contact as the head — measured, a
+                # 260 KB one-line JSON lost its POC to the cap and reported
+                # "Searched all files" with a straight face.
+                if (text_max_chars is not None
+                        and len(text) >= text_max_chars):
+                    _partial.append(p.name)
+                _read_count += 1
                 for v in _field_values_in_text(text, fn):
                     ok, note = _match_detail(v, value)
                     if ok:
@@ -564,7 +629,13 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
                                     (f"{field}: {v}"[:140]
                                      + (f"  [{note}]" if note else ""))))
                         break
-        except Exception:
+            else:
+                # Genuinely binary and not an extractable document. Say so —
+                # a file we cannot read must be reported, never absorbed into
+                # a "searched everything" count.
+                _skipped.append((p.name, f"unsupported file type ({suf or 'no extension'})"))
+        except Exception as exc:
+            _skipped.append((p.name, f"read failed: {exc.__class__.__name__}"))
             continue
     if on_progress is not None:
         try:
@@ -572,9 +643,28 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
         except Exception:
             pass
     if stats is not None:
-        stats["scanned"] = total
+        stats["scanned"] = _read_count          # files actually OPENED
         stats["total_files"] = total_found
         stats["hits"] = len(out)
+        stats["skipped"] = len(_skipped)
+        stats["skipped_detail"] = _skipped[:50]
+        stats["partial"] = len(_partial)
+        stats["partial_detail"] = _partial[:50]
+        # A skipped or partially-read file means the answer is not complete.
+        # Say so through the SAME flag the caps use, so every incomplete run
+        # reaches the user by one path instead of some being announced and
+        # others staying quiet.
+        if _skipped and not stats.get("truncated"):
+            stats["truncated"] = True
+            stats["truncated_why"] = (
+                f"{len(_skipped)} of {total_found} file(s) could not be read "
+                f"(e.g. {_skipped[0][0]} — {_skipped[0][1]})")
+        if _partial and not stats.get("truncated"):
+            stats["truncated"] = True
+            stats["truncated_why"] = (
+                f"{len(_partial)} file(s) were larger than the "
+                f"{text_max_chars:,}-char read limit and were only searched "
+                f"up to it (e.g. {_partial[0]})")
     return out
 
 
@@ -734,6 +824,14 @@ def coverage_line(stats: dict) -> str:
         return ""
     scanned = stats.get("scanned", 0)
     total = stats.get("total_files", scanned)
+    # "Searched all N" is only sayable when N were actually READ. This used to
+    # print the enumerated count, so it said "Searched all 20 file(s)" after
+    # opening 9 — the one sentence whose job is to let a user trust a negative
+    # result was the thing lying about it.
+    if total and scanned < total:
+        why = stats.get("truncated_why") or "some files could not be read"
+        return (f"⚠ PARTIAL — searched {scanned:,} of {total:,} file(s): "
+                f"{why}. Treat a missing file as unknown, not absent.")
     if stats.get("truncated"):
         # Resolve the reason on its own line, and keep every f-string on ONE
         # line. This expression used to span a newline INSIDE the braces, which
