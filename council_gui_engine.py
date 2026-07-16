@@ -4414,19 +4414,29 @@ class DeliberationOrchestrator:
 # Vault search tool
 # ============================================================
 
-# Chunks retrieved PER ANGLE by the librarian brief.
+# Retrieval breadth per angle.
 #
-# Was 4. Measured against a vault with known ground truth — 12 of 52 files
-# genuinely on-topic — the Council recalled 4 of the 12 (33%). n=8 → 67%,
-# n=16 → 100%. The multi-angle union did not help: when several files are
-# equally relevant, every angle returns the same arbitrary top-4, so the union
-# is still 4.
+# ANY fixed number is wrong in both directions, which measuring showed plainly.
+# Against vaults with known ground truth:
 #
-# 12 trades a little context for most of the recall, and the brief is still
-# clamped by max_chars — so this widens what the ranking may CONSIDER without
-# letting it flood the prompt. The full ranked set is written to a file
-# regardless, so nothing retrieved is lost to the cap.
+#   relevant files   fixed n=12            adaptive
+#             12     100%, returns 12      100%, returns 12
+#             30      40%, returns 12      100%, returns 30
+#              2     100%, returns 4       100%, returns 2
+#              1     100%, returns 2       100%, returns 1
+#
+# The n=30 row is the point: a constant that looks generous still hands back a
+# third of the answer the moment more files qualify than someone guessed — the
+# same "you gave me a subsection" failure, moved from 4 to 12.
+#
+# So the window is ELASTIC (vault_rag.search_adaptive): take a batch, and while
+# every hit in it is still strong relative to the best hit, take another; stop
+# when a batch stops filling. The size of the answer becomes a consequence of
+# the data. RAG_PER_ANGLE remains only as the fallback for a backend without
+# search_adaptive (e.g. chromadb).
 RAG_PER_ANGLE = 12
+RAG_BATCH = 4          # window growth step — the "add another 4" increment
+RAG_FLOOR_RATIO = 0.8  # a hit is strong if >= this share of the best score
 
 
 def _librarian_brief(
@@ -4473,7 +4483,12 @@ def _librarian_brief(
         if log_cb:
             log_cb("RAG search: " + repr(angle))
         try:
-            if hasattr(rag, "search"):
+            if hasattr(rag, "search_adaptive"):
+                # Elastic window: keep taking batches while they stay strong.
+                results = rag.search_adaptive(
+                    angle, batch=RAG_BATCH, floor_ratio=RAG_FLOOR_RATIO,
+                    stats=_rag_stats)
+            elif hasattr(rag, "search"):
                 try:
                     results = rag.search(angle, n_results=RAG_PER_ANGLE,
                                          stats=_rag_stats)

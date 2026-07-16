@@ -195,17 +195,89 @@ def _json_field_values(text: str, fn: str):
     return vals or None
 
 
-def _value_matches(field_value, query) -> bool:
-    """True when ``query`` names the same value as ``field_value``.
+# A token shorter than this must match EXACTLY. Measured against real names:
+# every pair of DIFFERENT people that is one edit apart is short —
+# bob/rob, tim/tom, dan/don, jon/jan, kim/tim, sam/pam, ron/don, ann/anna —
+# while every genuine typo of a name is longer: smith/smtih, johnson/johsnon,
+# anderson/andersen, mueller/muller, patel/patell. Length is what separates
+# "a typo" from "a different person", so fuzzy matching stops below it.
+_FUZZY_MIN_LEN = 5
+
+
+def _edit1(a: str, b: str) -> bool:
+    """True if one insert/delete/substitute turns ``a`` into ``b``."""
+    if abs(len(a) - len(b)) > 1:
+        return False
+    if len(a) > len(b):
+        a, b = b, a
+    i = j = diff = 0
+    while i < len(a) and j < len(b):
+        if a[i] != b[j]:
+            diff += 1
+            if diff > 1:
+                return False
+            if len(a) == len(b):
+                i += 1
+            j += 1
+        else:
+            i += 1
+            j += 1
+    return True
+
+
+def _transposed(a: str, b: str) -> bool:
+    """True if ``a`` and ``b`` differ only by one ADJACENT swap.
+
+    Separate from _edit1 because a transposition is edit-distance TWO —
+    'smtih' vs 'smith' is the most common typo there is and a plain
+    edit-distance-1 rule misses it entirely."""
+    if len(a) != len(b):
+        return False
+    d = [k for k in range(len(a)) if a[k] != b[k]]
+    return (len(d) == 2 and d[1] == d[0] + 1
+            and a[d[0]] == b[d[1]] and a[d[1]] == b[d[0]])
+
+
+def _is_typo_of(a: str, b: str) -> bool:
+    """True when ``a`` and ``b`` are the same word with one typo in it."""
+    if a == b:
+        return True
+    if len(a) < _FUZZY_MIN_LEN or len(b) < _FUZZY_MIN_LEN:
+        return False           # too short — a single edit is a different name
+    return _edit1(a, b) or _transposed(a, b)
+
+
+def _match_detail(field_value, query, *, fuzzy: bool = True):
+    """(matched, note) for ``query`` against one field value.
 
     Token-aware, NOT substring: every token of the query must appear as a WHOLE
-    token of the field value. So 'Bob' matches 'Bob Smith', 'Smith, Bob' and
-    'bob.smith@x.com', but NOT 'Bobby'; and 'Bob Smith' needs both tokens."""
+    token of the field value. 'Bob' matches 'Bob Smith', 'Smith, Bob' and
+    'bob.smith@x.com', but NOT 'Bobby'; 'Bob Smith' needs both tokens.
+
+    With ``fuzzy`` (default), a token may also match through ONE typo — but
+    only when both tokens are long enough that a typo is the likelier
+    explanation than a different name (see _FUZZY_MIN_LEN). ``note`` names the
+    typo when one was used, so a fuzzy hit is never presented as an exact one.
+    """
     q = _norm(query).split()
     if not q:
-        return False
-    v = set(_norm(field_value).split())
-    return all(t in v for t in q)
+        return False, ""
+    v = _norm(field_value).split()
+    vs = set(v)
+    notes = []
+    for t in q:
+        if t in vs:
+            continue
+        near = next((w for w in v if _is_typo_of(t, w)), None) if fuzzy else None
+        if near is None:
+            return False, ""
+        notes.append(f"{near!r}≈{t!r}")
+    return True, ("spelling: " + ", ".join(notes) if notes else "")
+
+
+def _value_matches(field_value, query, *, fuzzy: bool = True) -> bool:
+    """True when ``query`` names the same value as ``field_value``."""
+    return _match_detail(field_value, query, fuzzy=fuzzy)[0]
 
 
 def _field_values_in_text(text: str, fn: str, *, max_hits: int = 100):
@@ -457,8 +529,15 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
                 if col is None:
                     continue                       # no such column — no full read
                 vals = _table_column_values(p, col)
-                if any(_value_matches(v, value) for v in vals):
-                    out.append((str(p), f"column '{col}' = '{value}'"))
+                for v in vals:
+                    ok, note = _match_detail(v, value)
+                    if ok:
+                        # Show the value ACTUALLY in the cell, and name the
+                        # typo when one was needed — a near-match must never
+                        # read as an exact one.
+                        out.append((str(p), f"column '{col}' = {v!r}"
+                                            + (f"  [{note}]" if note else "")))
+                        break
             elif suf in _TEXTUAL or suf in _EXTRACTABLE:
                 if not fn:
                     continue
@@ -466,8 +545,11 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
                 if not text:
                     continue
                 for v in _field_values_in_text(text, fn):
-                    if _value_matches(v, value):
-                        out.append((str(p), f"{field}: {v}"[:140]))
+                    ok, note = _match_detail(v, value)
+                    if ok:
+                        out.append((str(p),
+                                    (f"{field}: {v}"[:140]
+                                     + (f"  [{note}]" if note else ""))))
                         break
         except Exception:
             continue

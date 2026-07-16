@@ -4159,6 +4159,126 @@ def test_audit_wrong_answer_fixes() -> None:
            rp["effect_size"] > 0)
 
 
+def test_field_search_typo_tolerance() -> None:
+    """A field value must match through a TYPO, without conflating two people.
+
+    "The name after the point of contact isn't a match unless there's a slight
+    spelling error" — so Smtih/Smith must hit. But naive edit-distance would
+    re-introduce the false positives this search exists to prevent: measured
+    against real names, every DIFFERENT-person pair one edit apart is short
+    (bob/rob, tim/tom, dan/don, sam/pam), while every genuine typo is longer
+    (smith/smtih, johnson/johsnon, anderson/andersen). Length is the separator.
+    """
+    try:
+        import field_search as fs
+    except Exception as exc:  # pragma: no cover
+        _check(f"field_search importable ({exc!r})", False)
+        return
+
+    # A transposition is edit-distance TWO — the most common typo there is
+    # would be missed by a plain edit-1 rule.
+    _check("an adjacent transposition is recognised (smtih/smith)",
+           fs._transposed("smtih", "smith") and not fs._edit1("smtih", "smith"))
+    _check("a substitution/insertion is recognised",
+           fs._edit1("smyth", "smith") and fs._edit1("smithh", "smith"))
+    _check("a typo of a long name matches", fs._is_typo_of("smtih", "smith"))
+    for a, b in (("bob", "rob"), ("tim", "tom"), ("dan", "don"),
+                 ("sam", "pam"), ("kim", "tim")):
+        _check(f"SHORT names one edit apart are NOT merged ({a}/{b})",
+               not fs._is_typo_of(a, b))
+
+    with tempfile.TemporaryDirectory() as td:
+        r = Path(td)
+        for name, body in {
+            "exact.txt": "Point of Contact: Bob Smith",
+            "swap.txt": "Point of Contact: Bob Smtih",
+            "sub.txt": "Point of Contact: Bob Smyth",
+            "ins.txt": "Point of Contact: Bob Smithh",
+            "rob.txt": "Point of Contact: Rob Smith",      # different person
+            "bobby.txt": "Point of Contact: Bobby Smith",  # different person
+            "alice.txt": "Point of Contact: Alice Jones",
+        }.items():
+            (r / name).write_text(body + "\n")
+        hits = {Path(p).name: c
+                for p, c in fs.find_files_with_field_value(
+                    r, "point of contact", "Bob Smith")}
+        _check("a misspelt surname still matches",
+               {"swap.txt", "sub.txt", "ins.txt"} <= set(hits))
+        _check("the exact spelling matches", "exact.txt" in hits)
+        _check("'Rob Smith' is NOT returned for 'Bob Smith'",
+               "rob.txt" not in hits)
+        _check("'Bobby Smith' is NOT returned for 'Bob Smith'",
+               "bobby.txt" not in hits)
+        _check("an unrelated contact is not returned", "alice.txt" not in hits)
+        _check("a fuzzy hit is LABELLED, never shown as exact",
+               "spelling" in hits.get("swap.txt", "")
+               and "spelling" not in hits.get("exact.txt", ""))
+
+
+def test_rag_adaptive_window() -> None:
+    """The retrieval window must size itself to the data.
+
+    ANY fixed N is wrong in both directions, measured against known ground
+    truth: with 30 relevant files a fixed n=12 recalled 40% — the same "you
+    gave me a subsection" failure, just moved from 4 to 12 — while with 1
+    relevant file it padded the prompt with irrelevant ones. The window now
+    grows a batch at a time while each batch stays strong, and stops at the
+    relevance cliff."""
+    try:
+        import vault_rag as vr
+    except Exception as exc:  # pragma: no cover
+        _check(f"vault_rag importable ({exc!r})", False)
+        return
+    backend = getattr(vr, "_TFIDFBackend", None)
+    if backend is None:  # pragma: no cover
+        _check("vault_rag exposes the TF-IDF backend", False)
+        return
+
+    def build(vault, n_rel, n_irr):
+        rel = set()
+        for i in range(n_rel):
+            n = f"porosity_{i:02d}.txt"
+            rel.add(n)
+            (vault / n).write_text(
+                "Porosity analysis for the Inconel build. Measured porosity "
+                "fraction across the layer. Lack-of-fusion pores dominate. " * 6)
+        for i in range(n_irr):
+            (vault / f"other_{i:02d}.txt").write_text(
+                "Maintenance log. Chamber cleaned. Filter replaced. " * 6)
+        b = backend(vault)
+        b.index_vault(vault)
+        return b, rel
+
+    # Scales UP: more relevant files than any constant would have guessed.
+    with tempfile.TemporaryDirectory() as td:
+        v = Path(td) / "vault"
+        v.mkdir()
+        b, rel = build(v, 30, 20)
+        fixed = {Path(r["source"]).name for r in b.search("porosity",
+                                                          n_results=12)}
+        st = {}
+        adapt = {Path(r["source"]).name
+                 for r in b.search_adaptive("porosity", stats=st)}
+        _check("a fixed n=12 really does miss most of 30 relevant files",
+               len(fixed & rel) / len(rel) < 0.5)
+        _check("the adaptive window finds them all", adapt >= rel)
+        _check("and pulls in nothing irrelevant", not (adapt - rel))
+        _check("it took several batches to get there", st["batches"] > 1)
+
+    # Scales DOWN: don't pad the prompt when little is relevant.
+    with tempfile.TemporaryDirectory() as td:
+        v = Path(td) / "vault"
+        v.mkdir()
+        b, rel = build(v, 2, 50)
+        st = {}
+        adapt = b.search_adaptive("porosity", stats=st)
+        srcs = {Path(r["source"]).name for r in adapt}
+        _check("with only 2 relevant files it returns 2, not a padded 12",
+               srcs == rel and st["batches"] == 1)
+        _check("the cutoff is reported so the cap is never invisible",
+               st["cutoff"] > 0 and "returned" in st)
+
+
 def test_rag_recall_and_coverage() -> None:
     """The Council's vault retrieval must not silently return an arbitrary
     slice of the relevant files.
@@ -6902,6 +7022,10 @@ def main() -> int:
          test_sqlite_readonly_uri)
     _run("TF-IDF idf units (the vault's own terms are not dropped)",
          test_tfidf_idf_units)
+    _run("field search typo tolerance (without merging people)",
+         test_field_search_typo_tolerance)
+    _run("RAG adaptive window (sizes itself to the data)",
+         test_rag_adaptive_window)
     _run("RAG recall + coverage (no arbitrary top-N slice)",
          test_rag_recall_and_coverage)
     _run("search_value streams every row (no 5k blind spot)",
