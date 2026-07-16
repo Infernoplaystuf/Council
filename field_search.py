@@ -529,15 +529,28 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
                 if col is None:
                     continue                       # no such column — no full read
                 vals = _table_column_values(p, col)
+                hit = None
                 for v in vals:
-                    ok, note = _match_detail(v, value)
-                    if ok:
-                        # Show the value ACTUALLY in the cell, and name the
-                        # typo when one was needed — a near-match must never
-                        # read as an exact one.
-                        out.append((str(p), f"column '{col}' = {v!r}"
-                                            + (f"  [{note}]" if note else "")))
+                    # Split the cell the way the TEXT path already did. One
+                    # cell can list several people — "Bob Jones, Alice Smith" —
+                    # and matching the cell whole means its tokens pool, so a
+                    # query for "Bob Smith" matched a cell naming Bob Jones and
+                    # Alice Smith: a person who is not on it, invented out of
+                    # two who are. The text path split; this one did not, and
+                    # the two drifted apart.
+                    for one in (_split_values(v) or [v]):
+                        ok, note = _match_detail(one, value)
+                        if ok:
+                            # Report the value ACTUALLY in the cell, and name
+                            # the typo when one was needed — a near-match must
+                            # never read as an exact one.
+                            hit = (f"column '{col}' = {one!r}"
+                                   + (f"  [{note}]" if note else ""))
+                            break
+                    if hit:
                         break
+                if hit:
+                    out.append((str(p), hit))
             elif suf in _TEXTUAL or suf in _EXTRACTABLE:
                 if not fn:
                     continue

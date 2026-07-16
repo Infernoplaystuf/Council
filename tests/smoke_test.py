@@ -4214,6 +4214,28 @@ def test_field_search_typo_tolerance() -> None:
                "spelling" in hits.get("swap.txt", "")
                and "spelling" not in hits.get("exact.txt", ""))
 
+    # A CELL can list several people. Matching the cell WHOLE pools its tokens,
+    # so "Bob Jones, Alice Smith" matched a query for "Bob Smith" — a person
+    # who is not on it, invented out of two who are. The text path split
+    # multi-values; the tabular path did not, and the twins drifted.
+    with tempfile.TemporaryDirectory() as td:
+        r = Path(td)
+        hdr = "task,Point of Contact\n"
+        (r / "fabricate.csv").write_text(hdr + 'A,"Bob Jones, Alice Smith"\n')
+        (r / "real_multi.csv").write_text(hdr + 'B,"Bob Smith, Alice Jones"\n')
+        (r / "typo_multi.csv").write_text(hdr + 'D,"Carol White, Bob Smtih"\n')
+        got = {Path(q).name: c
+               for q, c in fs.find_files_with_field_value(
+                   r, "point of contact", "Bob Smith")}
+        _check("two people in one cell do not merge into a third",
+               "fabricate.csv" not in got)
+        _check("a genuine multi-value cell still matches",
+               "real_multi.csv" in got)
+        _check("it reports the ONE value that matched, not the whole cell",
+               got.get("real_multi.csv", "").endswith("'Bob Smith'"))
+        _check("a typo inside a multi-value cell still matches",
+               "typo_multi.csv" in got and "spelling" in got["typo_multi.csv"])
+
 
 def test_rag_adaptive_window() -> None:
     """The retrieval window must size itself to the data.
