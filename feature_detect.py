@@ -94,7 +94,8 @@ def detect_and_count_features(path: Any, *,
                               annotate: bool = True,
                               out_dir: Optional[Any] = None,
                               max_side: int = 1600,
-                              max_features: int = 5000) -> Dict[str, Any]:
+                              max_features: int = 5000,
+                              denoise: bool = False) -> Dict[str, Any]:
     """Detect + count discrete features and (optionally) write an annotated PNG.
 
     polarity: 'bright' (features lighter than background, e.g. spatter/spots),
@@ -145,10 +146,30 @@ def detect_and_count_features(path: Any, *,
         else:
             mask, pol = dark_mask, "dark"
 
-    try:
-        mask = ndi.binary_opening(mask, structure=np.ones((3, 3)))
-    except Exception:
-        pass
+    # Morphological opening is OFF by default, and that is a correctness call,
+    # not a preference.
+    #
+    # It was unconditional. An opening is an erosion followed by a dilation, so
+    # it deletes anything THINNER than its structuring element outright —
+    # regardless of area, and regardless of min_area, which the docstring
+    # promises is the size filter. Measured on a synthetic scan of 4 round
+    # pores + 4 cracks (1 px x 60 px, area 60 — TEN TIMES min_area=6):
+    #
+    #     ground truth : 8 features
+    #     reported     : 4          <- every crack silently erased
+    #
+    # In this app's actual domain that is the worst possible bias: cracks and
+    # lack-of-fusion ARE thin elongated features, so "count the defects" hid
+    # exactly the defects that matter and reported a confident number.
+    #
+    # min_area already removes speckle (a 1-3 px speck is far below it), which
+    # is all the opening was there for — so the default now measures what the
+    # user asked for, and denoise=True remains for a genuinely noisy scan.
+    if denoise:
+        try:
+            mask = ndi.binary_opening(mask, structure=np.ones((3, 3)))
+        except Exception:
+            pass
     lbl, n = ndi.label(mask)
     feats: List[Dict[str, Any]] = []
     if n > 0:

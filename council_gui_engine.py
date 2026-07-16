@@ -20091,11 +20091,34 @@ class CouncilConsole(tk.Tk):
 
         except queue.Empty:
             pass
-        # Coalesced scroll: if any stream tokens were appended during
-        # this drain, do the single deferred see("end") + re-lock now
-        # instead of once per token inside the loop above.
-        self._flush_stream_box()
-        self.after(50, self._poll_ui_queue)
+        except Exception as _ui_err:
+            # ONE bad item must not kill the pump. Only queue.Empty was caught
+            # here, so any exception from any handler above escaped this
+            # method — and the reschedule at the bottom never ran. The pump
+            # stopped forever: no transcript, no status, no results, while the
+            # worker threads carried on. The app simply appeared to freeze,
+            # with nothing printed and nothing to notice.
+            #
+            # The offending item is dropped and the drain resumes on the next
+            # tick (50 ms), so a poison item cannot wedge the queue either.
+            # Plain print: an error handler must not have dependencies that
+            # can fail. The first version referenced a module alias that is not
+            # in this scope, so the handler raised NameError on the way to
+            # reporting the original error — caught only because a test threw a
+            # poison item at it.
+            print(f"[ui] queue handler failed, pump continues: {_ui_err!r}")
+        finally:
+            # Coalesced scroll: if any stream tokens were appended during
+            # this drain, do the single deferred see("end") + re-lock now
+            # instead of once per token inside the loop above.
+            #
+            # In `finally` so the reschedule is unconditional — that is the
+            # whole point: the pump must outlive any handler's bad day.
+            try:
+                self._flush_stream_box()
+            except Exception:
+                pass
+            self.after(50, self._poll_ui_queue)
 
     # ============================
     # Actions

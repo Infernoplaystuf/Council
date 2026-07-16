@@ -4159,6 +4159,142 @@ def test_audit_wrong_answer_fixes() -> None:
            rp["effect_size"] > 0)
 
 
+def test_ui_pump_survives_a_bad_item() -> None:
+    """One bad queue item must not kill every UI update for the session.
+
+    _poll_ui_queue caught only queue.Empty, so any exception from any of its
+    ~290 lines of handlers escaped the method — and the self.after(50, ...)
+    reschedule at the bottom never ran. The pump stopped permanently: no
+    transcript, no status, no results, while the worker threads carried on. The
+    app simply looked frozen, with nothing printed and nothing to notice."""
+    try:
+        import queue as _q
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"gui engine importable ({exc!r})", False)
+        return
+
+    class _Fake:
+        pass
+
+    class _Poison:
+        def __getattr__(self, n):
+            raise RuntimeError("poison item")
+
+    f = _Fake()
+    f.ui_q = _q.Queue()
+    f.rescheduled = []
+    f.after = lambda ms, fn: f.rescheduled.append(ms)
+    f._flush_stream_box = lambda: None
+    f._poll_ui_queue = cge.CouncilConsole._poll_ui_queue.__get__(f)
+
+    f.ui_q.put(("live_event", _Poison()))
+    raised = False
+    try:
+        f._poll_ui_queue()
+    except Exception:
+        raised = True
+    _check("a handler blowing up does not escape the pump", not raised)
+    _check("...and the pump still reschedules itself", f.rescheduled == [50])
+
+    f.rescheduled.clear()
+    f._poll_ui_queue()
+    _check("the pump keeps running on later ticks", f.rescheduled == [50])
+
+    # The reschedule lives in `finally`, so even the cleanup failing is safe.
+    f.rescheduled.clear()
+
+    def _boom():
+        raise RuntimeError("flush failed")
+
+    f._flush_stream_box = _boom
+    f._poll_ui_queue()
+    _check("even a failing flush cannot stop the reschedule",
+           f.rescheduled == [50])
+
+
+def test_dependency_check_sees_the_chart_libs() -> None:
+    """Diagnostics must be able to see its most visible failure.
+
+    dependency_check probed 24 optional modules but neither matplotlib nor
+    plotly, on the stated reasoning that core packages would have stopped the
+    app launching. That reasoning is false for these two: the app launches
+    fine, the Grapher tab shows an error label, and Diagnostics reported "all
+    optional dependencies installed" while every chart in the app was dead."""
+    try:
+        import dependency_check as dc
+    except Exception as exc:  # pragma: no cover
+        _check(f"dependency_check importable ({exc!r})", False)
+        return
+    mods = {m for f in dc.OPTIONAL_FEATURES for m in f.modules}
+    _check("matplotlib — the primary chart renderer — is checked",
+           "matplotlib" in mods)
+    _check("plotly is checked", "plotly" in mods)
+    _check("matplotlib is flagged high impact",
+           any(f.impact == "high" for f in dc.OPTIONAL_FEATURES
+               if "matplotlib" in f.modules))
+    _check("every feature still carries an install command",
+           all(f.install for f in dc.OPTIONAL_FEATURES))
+
+
+def test_feature_detect_counts_thin_features() -> None:
+    """A feature count must not silently exclude thin features.
+
+    An unconditional 3x3 morphological opening ran before labelling. An opening
+    is erode-then-dilate, so it deletes anything THINNER than its element
+    outright — regardless of area, and regardless of min_area, which the
+    docstring calls the size filter. In this app's domain that is the worst
+    possible bias: cracks and lack-of-fusion ARE thin elongated features, so
+    "count the defects" hid exactly the defects that matter and reported a
+    confident number."""
+    try:
+        import numpy as np
+        from PIL import Image
+        import feature_detect as fd
+    except Exception as exc:  # pragma: no cover
+        _check(f"feature_detect deps available (skipped: {exc!r})", True)
+        return
+
+    def _scan(noisy=False):
+        img = np.zeros((200, 200), dtype=np.uint8)
+        for cx, cy in ((30, 30), (30, 90), (30, 150), (90, 30)):
+            yy, xx = np.ogrid[:200, :200]
+            img[(yy - cy) ** 2 + (xx - cx) ** 2 <= 36] = 255   # round pores
+        for y in (120, 140, 160, 180):
+            img[y, 20:80] = 255        # cracks: 1px x 60px -> area 60
+        if noisy:
+            rng = np.random.default_rng(0)
+            img[rng.random((200, 200)) < 0.002] = 255          # 1px speckle
+        return img
+
+    with tempfile.TemporaryDirectory() as td:
+        clean = Path(td) / "clean.png"
+        Image.fromarray(_scan()).save(clean)
+        r = fd.detect_and_count_features(clean, polarity="bright", min_area=6,
+                                         annotate=False, out_dir=td)
+        _check("all 8 features are counted — 4 pores AND 4 cracks (was 4)",
+               r["count"] == 8)
+        _check("the cracks are well above min_area, so min_area is not why",
+               all(f["area"] >= 6 for f in r["features"]))
+
+        # The opening is still available for a genuinely noisy scan, and its
+        # documented cost is visible: it erases the cracks.
+        r2 = fd.detect_and_count_features(clean, polarity="bright", min_area=6,
+                                          annotate=False, out_dir=td,
+                                          denoise=True)
+        _check("denoise=True is opt-in and does erase thin features",
+               r2["count"] == 4)
+
+        # ...and turning it off costs nothing: min_area already kills speckle,
+        # which is all the opening was there for.
+        noisy = Path(td) / "noisy.png"
+        Image.fromarray(_scan(noisy=True)).save(noisy)
+        r3 = fd.detect_and_count_features(noisy, polarity="bright", min_area=6,
+                                          annotate=False, out_dir=td)
+        _check("min_area alone still rejects single-pixel speckle",
+               r3["count"] == 8)
+
+
 def test_df_cache_isolation() -> None:
     """A cached DataFrame must never be mutable by its readers.
 
@@ -7242,6 +7378,12 @@ def main() -> int:
          test_sqlite_readonly_uri)
     _run("TF-IDF idf units (the vault's own terms are not dropped)",
          test_tfidf_idf_units)
+    _run("UI pump survives a bad queue item",
+         test_ui_pump_survives_a_bad_item)
+    _run("dependency check sees the chart libraries",
+         test_dependency_check_sees_the_chart_libs)
+    _run("feature detect counts thin features (cracks are not erased)",
+         test_feature_detect_counts_thin_features)
     _run("df_cache isolation (a reader cannot poison the cache)",
          test_df_cache_isolation)
     _run("export draws the chart you selected",

@@ -60,6 +60,33 @@ class FeatureStatus:
 
 
 OPTIONAL_FEATURES: List[FeatureSpec] = [
+    # matplotlib and plotly ARE in this catalog, despite the note above about
+    # core packages. That note's reasoning — "the app wouldn't have launched"
+    # — is false for these two: the app launches fine without them and the
+    # Grapher tab simply shows an error label, so Diagnostics reported
+    # "all optional dependencies installed ✓" while every chart in the app was
+    # dead. A diagnostic that cannot see the most visible failure it has is
+    # worse than no diagnostic.
+    FeatureSpec(
+        name="Charts (Grapher tab)",
+        modules=["matplotlib"],
+        install="conda install -c conda-forge matplotlib",
+        description=(
+            "The PRIMARY chart renderer. Without it the Grapher's inline "
+            "plots pane and every static export are dead — the tab loads but "
+            "cannot draw anything."),
+        impact="high",
+    ),
+    FeatureSpec(
+        name="Interactive HTML charts",
+        modules=["plotly"],
+        install="conda install -c conda-forge plotly",
+        description=(
+            "The 'Interactive (HTML)' chart view and the saved chart files "
+            "under data_out/charts. The offline inline pane (matplotlib) "
+            "works without it."),
+        impact="med",
+    ),
     # ── HIGH IMPACT — these change what the app can actually answer
     FeatureSpec(
         name="Vector embeddings (semantic vault search)",
