@@ -4237,6 +4237,104 @@ def test_dependency_check_sees_the_chart_libs() -> None:
            all(f.install for f in dc.OPTIONAL_FEATURES))
 
 
+def test_no_312_only_syntax() -> None:
+    """Every source file must PARSE on the oldest Python the app supports.
+
+    This exists because a real user pulled the build and the app crashed with
+    "unterminated string literal" the moment they ran a search. field_search.py
+    used an f-string whose expression spanned a newline — PEP 701, which is
+    Python 3.12+ ONLY. The app's floor is 3.11 (installs.txt pins python=3.11,
+    setup.bat says "Python 3.11+"), where that is a hard SyntaxError, so the
+    whole module was unimportable and the entire field:value search feature was
+    dead. It reached a user because every dev box here runs 3.12, where it
+    parses fine, and because field_search is imported LAZILY inside the search
+    handlers — so the app started normally and only died on the first search.
+
+    A normal test cannot catch this: running under 3.12, the file parses. Nor
+    can ast.parse(feature_version=(3, 11)) — PEP 701 is a tokenizer change, and
+    feature_version only gates AST-level features (verified: it accepts the
+    offending source). The only version-independent check is to look for the
+    constructs 3.12 relaxed, which is what this does.
+
+    3.12 relaxed three f-string rules. Each is a SyntaxError on 3.11:
+      1. a single-quoted f-string spanning a newline
+      2. reusing the enclosing quote inside the braces  — f"{d["k"]}"
+      3. a backslash inside the braces                  — f"{'\\n'.join(x)}"
+    """
+    import io
+    import tokenize
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    skip = {"Version_History", ".git", "__pycache__", ".venv", "node_modules",
+            "build", "dist"}
+
+    def offenders(path):
+        try:
+            src = path.read_text(encoding="utf-8")
+            toks = list(tokenize.generate_tokens(io.StringIO(src).readline))
+        except Exception:
+            return          # unreadable/untokenizable is another test's problem
+        depth, start, triple, body = 0, None, False, []
+        for t in toks:
+            if t.type == tokenize.FSTRING_START:
+                if depth == 0:
+                    start, body = t, []
+                    triple = t.string.endswith(('"""', "'''"))
+                depth += 1
+            elif t.type == tokenize.FSTRING_END:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    quote = start.string.lstrip("fFrRbB")
+                    if not triple and t.end[0] != start.start[0]:
+                        yield (start.start[0], "f-string spans a newline "
+                                               "(3.12-only)")
+                    else:
+                        joined = "".join(body)
+                        if quote[0] in joined:
+                            yield (start.start[0], "enclosing quote reused "
+                                                   "inside f-string (3.12-only)")
+                        elif "\\" in joined:
+                            yield (start.start[0], "backslash inside f-string "
+                                                   "expression (3.12-only)")
+                    start = None
+            elif depth > 0 and t.type != tokenize.FSTRING_MIDDLE:
+                body.append(t.string)
+
+    # tokenize only exposes FSTRING_* from 3.12 on. On an older interpreter the
+    # import itself would already have failed, so there is nothing to scan —
+    # but say so rather than report a silent all-clear.
+    if not hasattr(tokenize, "FSTRING_START"):
+        _check("PEP 701 scan needs py>=3.12 to tokenize; running on older "
+               "python, which would itself have rejected the syntax", True)
+        return
+
+    bad = []
+    for p in sorted(root.rglob("*.py")):
+        if any(part in skip for part in p.parts):
+            continue
+        for lineno, why in offenders(p):
+            bad.append(f"{p.relative_to(root)}:{lineno} — {why}")
+
+    _check("no source file uses 3.12-only f-string syntax (floor is 3.11)",
+           not bad, "; ".join(bad[:5]))
+
+    # The scanner must actually be able to fail — a guard that cannot fire is
+    # worse than none, because it reads as proof. Feed it the exact source that
+    # crashed the user and require a hit.
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        probe = Path(td) / "probe.py"
+        probe.write_text(
+            'stats = {}\n'
+            'def f():\n'
+            '    return (f"PARTIAL {stats.get(\'why\') or \'results were \'\n'
+            '            \'truncated\'}. tail")\n',
+            encoding="utf-8")
+        _check("the scanner detects the construct that crashed the user",
+               any(offenders(probe)))
+
+
 def test_plain_english_is_not_a_file_path() -> None:
     """A slash inside a word is not a path, and must not trigger a refusal.
 
@@ -7499,6 +7597,8 @@ def main() -> int:
          test_sqlite_readonly_uri)
     _run("TF-IDF idf units (the vault's own terms are not dropped)",
          test_tfidf_idf_units)
+    _run("no source file uses Python 3.12-only syntax (floor is 3.11)",
+         test_no_312_only_syntax)
     _run("plain English with a slash is not a file path",
          test_plain_english_is_not_a_file_path)
     _run("contour contours the z column, not the point density",

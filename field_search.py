@@ -735,8 +735,15 @@ def coverage_line(stats: dict) -> str:
     scanned = stats.get("scanned", 0)
     total = stats.get("total_files", scanned)
     if stats.get("truncated"):
-        return (f"⚠ PARTIAL — {stats.get('truncated_why') or 'results were '
-                'truncated'}. Treat a missing file as unknown, not absent.")
+        # Resolve the reason on its own line, and keep every f-string on ONE
+        # line. This expression used to span a newline INSIDE the braces, which
+        # is PEP 701 — Python 3.12+ only. This app's supported floor is 3.11
+        # (installs.txt pins python=3.11; setup.bat says "Python 3.11+"), where
+        # a single-quoted f-string may not cross a newline at all, so the file
+        # was an unimportable SyntaxError: "unterminated string literal".
+        why = stats.get("truncated_why") or "results were truncated"
+        return (f"⚠ PARTIAL — {why}. "
+                "Treat a missing file as unknown, not absent.")
     if total:
         return f"Searched all {total:,} file(s) in the vault."
     return "No files to search."
