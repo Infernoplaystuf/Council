@@ -4066,6 +4066,40 @@ def test_pandas_sandbox_write_escape_blocked() -> None:
         _check("legit getattr(df,'shape') still runs", df_ga is not None)
 
 
+def test_cleanup_never_deletes_user_data() -> None:
+    """SECURITY / data-loss: cleanup_misplaced_internals runs at every startup
+    and used to hard-delete any data_in/ file merely NAMED like app state
+    (node_registry.json, license.json, verdict_history.jsonl, ...). A user's
+    own file with such a name — plausible for scientific data — was destroyed,
+    with no recycle bin. It must now delete ONLY a byte-identical stray copy of
+    a vault-root original."""
+    import data_index as di
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td) / "vault"
+        ind = di.input_dir(vault)
+        ind.mkdir(parents=True, exist_ok=True)
+
+        # A genuine user file whose name collides, with NO vault-root twin.
+        user = ind / "node_registry.json"
+        user.write_text('{"scan":"real user data"}')
+        # A collision where a vault-root file exists but DIFFERS.
+        (vault / "license.json").write_text("APP STATE")
+        diff = ind / "license.json"
+        diff.write_text("USER DATA, different bytes")
+        # A genuine legacy stray: byte-identical to a vault-root original.
+        (vault / "specialists.json").write_text("STATE X")
+        stray = ind / "specialists.json"
+        stray.write_text("STATE X")
+
+        removed = di.cleanup_misplaced_internals(vault)
+        _check("a user file with a colliding name and no twin is KEPT",
+               user.exists())
+        _check("a colliding file whose bytes differ from the twin is KEPT",
+               diff.exists())
+        _check("a byte-identical legacy stray is still removed",
+               not stray.exists() and stray in removed)
+
+
 def test_zip_slip_guard() -> None:
     """SECURITY (Zip Slip): a malicious archive with an absolute-path entry or a
     ../ entry must NOT write outside the extraction target. zf.open()+manual
@@ -6382,6 +6416,8 @@ def main() -> int:
          test_pandas_sandbox_write_escape_blocked)
     _run("SECURITY: zip-slip extraction guard",
          test_zip_slip_guard)
+    _run("SECURITY: startup cleanup never deletes user data",
+         test_cleanup_never_deletes_user_data)
     _run("agentic jobs core (autonomous loop, safe tools, cancel)",
          test_agentic_jobs_core)
     _run("graph introspect columns (numeric/coerce/categorical)",

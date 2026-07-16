@@ -210,23 +210,34 @@ def migrate_loose_vault_files(vault_dir: Path,
 
 def cleanup_misplaced_internals(vault_dir: Path) -> List[Path]:
     """
-    A previous version of migrate_loose_vault_files copied app-internal
-    config files (specialists.json, node_registry.json, etc.) into
-    data_in/. This helper removes them from data_in/ — they're already
-    living at the proper place under vault/, so deleting the data_in/
-    copy is safe.
+    A previous version of migrate_loose_vault_files copied app-internal config
+    files (specialists.json, node_registry.json, etc.) into data_in/. This
+    removes ONLY such a stray copy — proven by byte-identity to the original
+    still sitting at the vault root.
+
+    The identity check is not optional. A data_in/ file is USER DATA, and the
+    app must never destroy user data. Deleting on NAME alone would hard-delete
+    a user's own file that happened to be called node_registry.json or
+    verdict_history.jsonl — and the current migrate_loose_vault_files already
+    skips these names, so a name match here can only be a coincidence unless
+    the byte-identical vault-root twin exists. When in doubt, keep the file.
 
     Returns the list of removed paths.
     """
-    in_d = input_dir(Path(vault_dir))
+    import filecmp
+    vault = Path(vault_dir)
+    in_d = input_dir(vault)
     if not in_d.exists():
         return []
     removed: List[Path] = []
     for name in _APP_INTERNAL_FILENAMES:
         p = in_d / name
-        if not p.exists():
+        original = vault / name          # where migrate left the real copy
+        if not p.is_file() or not original.is_file():
             continue
         try:
+            if not filecmp.cmp(p, original, shallow=False):
+                continue                 # different content -> real user data
             p.unlink()
             removed.append(p)
         except Exception:
