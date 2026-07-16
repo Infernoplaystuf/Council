@@ -4109,6 +4109,109 @@ def test_pandas_sandbox_write_escape_blocked() -> None:
         _check("legit getattr(df,'shape') still runs", df_ga is not None)
 
 
+def test_audit_wrong_answer_fixes() -> None:
+    """Wrong-answer defects found by a full-codebase audit, each reproduced
+    against the real code before being fixed. All three presented a confident,
+    authoritative, WRONG result — the worst failure mode this app has."""
+    try:
+        import numpy as np
+        import pandas as pd
+        import vault_index as vi
+        from analyst_helpers import stats as S
+    except Exception as exc:  # pragma: no cover
+        _check(f"audit-fix modules importable ({exc!r})", False)
+        return
+
+    # 1) The CSV row count stopped with the TOKENIZER: `total_rows = i` then
+    #    `else: break` at row 500. A 2,000-row file was described to the model
+    #    as "rows: 500", as fact. The comment already claimed counting
+    #    continued past the cap; it did not.
+    with tempfile.TemporaryDirectory() as td:
+        for n in (100, 2000):
+            p = Path(td) / f"f{n}.csv"
+            with open(p, "w", encoding="utf-8", newline="") as fh:
+                fh.write("id,build,yield\n")
+                for i in range(n):
+                    fh.write(f"{i},b{i % 4},{i * 0.5}\n")
+            _check(f"a {n}-row CSV reports {n} rows, not the tokenizer cap",
+                   vi._parse_csv(p)["rows"] == n)
+
+    # 2) Rank-biserial r from Mann-Whitney had the sign the wrong way round, so
+    #    the unpaired path said "group 1 is smaller" for data where it is
+    #    plainly larger — disagreeing with the Wilcoxon branch of the SAME
+    #    function, which uses positive = group1 larger.
+    rng = np.random.default_rng(1)
+    a = np.concatenate([rng.exponential(1, 30) + 50, [500.0, 600.0]])
+    b = np.concatenate([rng.exponential(1, 30), [400.0]])
+    df = pd.DataFrame({"g": ["A"] * len(a) + ["B"] * len(b),
+                       "v": np.concatenate([a, b])})
+    r = S.compare_groups(df, "v", "g")
+    _check("the skewed fixture really takes the Mann-Whitney branch",
+           "Mann-Whitney" in r["test_used"])
+    _check("Mann-Whitney effect size is POSITIVE when group 1 is larger",
+           r["effect_size"] > 0)
+    # ...and the paired branch must still agree in sign on the same idea.
+    paired = pd.DataFrame({"g": ["A"] * 8 + ["B"] * 8,
+                           "v": [10, 11, 12, 13, 14, 15, 16, 17,
+                                 1, 2, 3, 4, 5, 6, 7, 8]})
+    rp = S.compare_groups(paired, "v", "g")
+    _check("the parametric branch agrees in sign (group 1 larger -> positive)",
+           rp["effect_size"] > 0)
+
+
+def test_sqlite_readonly_uri() -> None:
+    """A SQLite URL needs the `file:` prefix for uri=true to be valid.
+
+    Without it sqlite3 treated the whole "path?mode=ro&uri=true" as a literal
+    FILENAME, so EVERY SQLite connection died with "unable to open database
+    file" — and SQLite is the file-based default type. The read-only comment
+    was true only because the open never succeeded."""
+    try:
+        import sqlite3
+        import sqlalchemy as sa
+    except Exception as exc:  # pragma: no cover
+        _check(f"sqlalchemy importable (skipped: {exc!r})", True)
+        return
+    td = tempfile.mkdtemp()
+    try:
+        db = Path(td) / "t.db"
+        con = sqlite3.connect(db)
+        con.execute("create table t(x int)")
+        con.execute("insert into t values(42)")
+        con.commit()
+        con.close()
+
+        def _build(raw: str) -> str:
+            # mirrors db_connections._sql_engine
+            if raw.startswith("sqlite:///") and "mode=ro" not in raw:
+                pp = raw[len("sqlite:///"):]
+                if pp and not pp.startswith("file:"):
+                    pp = f"file:{pp}"
+                sep = "&" if "?" in pp else "?"
+                return f"sqlite:///{pp}{sep}mode=ro&uri=true"
+            return raw
+
+        url = _build(f"sqlite:///{db.as_posix()}")
+        _check("the built URL is a real file: URI", "sqlite:///file:" in url)
+        eng = sa.create_engine(url)
+        try:
+            with eng.connect() as conn:
+                _check("a SQLite SELECT actually works",
+                       conn.execute(sa.text("select x from t")).scalar() == 42)
+                try:
+                    conn.execute(sa.text("insert into t values(99)"))
+                    conn.commit()
+                    _check("mode=ro refuses a write", False)
+                except Exception:
+                    _check("mode=ro refuses a write (read-only now engages)",
+                           True)
+        finally:
+            eng.dispose()
+    finally:
+        import shutil
+        shutil.rmtree(td, ignore_errors=True)
+
+
 def test_cleanup_never_deletes_user_data() -> None:
     """SECURITY / data-loss: cleanup_misplaced_internals runs at every startup
     and used to hard-delete any data_in/ file merely NAMED like app state
@@ -6461,6 +6564,10 @@ def main() -> int:
          test_zip_slip_guard)
     _run("SECURITY: startup cleanup never deletes user data",
          test_cleanup_never_deletes_user_data)
+    _run("audit fixes: honest row count + effect-size sign",
+         test_audit_wrong_answer_fixes)
+    _run("SQLite read-only URI actually opens (and refuses writes)",
+         test_sqlite_readonly_uri)
     _run("agentic jobs core (autonomous loop, safe tools, cancel)",
          test_agentic_jobs_core)
     _run("graph introspect columns (numeric/coerce/categorical)",

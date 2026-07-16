@@ -339,9 +339,19 @@ def compare_groups(
         f"At least one group failed normality "
         f"(p={p_norm_a:.3f}, p={p_norm_b:.3f}); paired=False → "
         "Mann-Whitney U (non-parametric unpaired).")
-    # Rank-biserial r from U: r = 1 - 2U / (n1 * n2)
+    # Rank-biserial r from U, signed so POSITIVE means group 1 is larger —
+    # the same convention as the Wilcoxon branch above ((pos-neg)/total) and as
+    # Cohen's d in the parametric branch.
+    #
+    # This was `1 - 2U/(n1*n2)`, which is the sign the OTHER way round: scipy's
+    # mannwhitneyu(a, b) returns U for the FIRST sample, so a group-1-dominant
+    # comparison gives U ~= n1*n2 and the old form returned r = -1 for data
+    # where group 1 is clearly larger. Verified: a=[10..17] vs b=[1..8]
+    # reported -1.0 while the Wilcoxon branch reported +1.0 on the same
+    # numbers, so the paired and unpaired paths of one function disagreed about
+    # which group was bigger.
     n_a, n_b = len(a), len(b)
-    r_rb = 1.0 - (2.0 * float(u_stat)) / (n_a * n_b)
+    r_rb = (2.0 * float(u_stat)) / (n_a * n_b) - 1.0
     return {
         "test_used":        test_used,
         "rationale":        rationale,

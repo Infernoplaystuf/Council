@@ -678,7 +678,8 @@ def _parse_csv(p: Path) -> Dict[str, Any]:
                 total_rows = i
                 if i < 6:
                     sample_rows.append(", ".join(row))
-                if i < 500:
+                # Both budgets gate the per-cell WORK only — never the count.
+                if i < 500 and len(keywords) <= 8000:
                     # Tokenize short cell values from every column so values
                     # like "PlayStation", "Xbox", "January" are searchable.
                     # Multi-value cells (e.g. "PlayStation 5|Xbox Series S/X")
@@ -698,10 +699,13 @@ def _parse_csv(p: Path) -> Dict[str, Any]:
                             if 2 <= len(part) <= 80:
                                 keywords.update(_tokenize(part))
                         _collect_body_sample(cv, sample_vals, _seen_vals)
-                else:
-                    break
-                if len(keywords) > 8000:
-                    break
+                # NOTE: no `else: break` here, and no break on the keyword cap.
+                # Those caps are budgets for the expensive TOKENIZING, but they
+                # used to stop the loop outright — so total_rows froze at the
+                # cutoff and a 2,000-row file was reported to the model as
+                # "rows: 500", as fact. Counting to EOF is cheap (the csv
+                # reader is already streaming); only the per-cell work above is
+                # gated. Verified: 2,000 rows in, 2,000 reported.
     except Exception:
         pass
     return {

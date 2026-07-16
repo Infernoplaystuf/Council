@@ -546,12 +546,22 @@ def _sql_engine(vault_dir: Any, conn_name: str):
     raw = urls[conn_name]
     resolved = _resolve_url(raw)
 
-    # File-URI hardening — SQLite/DuckDB URIs get ?mode=ro appended
-    # when the user didn't already pin it. SQLite-level read-only
-    # enforcement is bulletproof at the file open path.
+    # File-URI hardening — a SQLite URL gets ?mode=ro so the driver itself
+    # refuses writes at the file-open path.
+    #
+    # uri=true REQUIRES the path to be a real URI, i.e. prefixed with `file:`.
+    # Without it sqlite3 treats "C:/x/t.db?mode=ro&uri=true" as a literal
+    # FILENAME and every connection died with "unable to open database file" —
+    # so SQLite, the file-based default type, never worked at all. The old
+    # comment called read-only "bulletproof at the file open path", which was
+    # true only in the sense that the open never succeeded. Verified both ways
+    # against a real .db before changing.
     if resolved.startswith("sqlite:///") and "mode=ro" not in resolved:
-        sep = "&" if "?" in resolved else "?"
-        resolved = f"{resolved}{sep}mode=ro&uri=true"
+        path_part = resolved[len("sqlite:///"):]
+        if path_part and not path_part.startswith("file:"):
+            path_part = f"file:{path_part}"
+        sep = "&" if "?" in path_part else "?"
+        resolved = f"sqlite:///{path_part}{sep}mode=ro&uri=true"
 
     # Strip our internal council_* flags (council_snapshot, etc.)
     # before SQLAlchemy sees the URL. The flags are stashed on the
