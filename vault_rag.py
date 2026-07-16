@@ -468,12 +468,31 @@ class _TFIDFBackend:
         self._dirty = False
         return stats
 
-    def search(self, query: str, n_results: int = MAX_RESULTS) -> List[Dict[str, Any]]:
+    def search(self, query: str, n_results: Optional[int] = MAX_RESULTS,
+               *, stats: Optional[Dict[str, Any]] = None
+               ) -> List[Dict[str, Any]]:
+        """The ranked chunks for ``query``.
+
+        ``n_results=None`` returns the FULL ranked set (every chunk that scored
+        above zero) — use it when the caller intends to write the whole list
+        somewhere rather than read it into a prompt.
+
+        ``stats`` is filled with the coverage of the search:
+            matched   chunks that scored > 0
+            returned  chunks handed back
+            truncated True when matched > returned
+        Measured need for this: with 12 equally-relevant files in a 52-file
+        vault, the Council's top-4 returned an ARBITRARY 4 of the 12 (33%
+        recall) and nothing said so. When many chunks tie, a top-N cap is a
+        coin toss the user cannot see.
+        """
         import math
 
         if self._dirty or not self._index:
             self.index_vault(self.vault_dir)
 
+        if stats is not None:
+            stats.update({"matched": 0, "returned": 0, "truncated": False})
         q_terms = set(_TOKEN_RE.findall(query.lower()))
         if not q_terms:
             return []
@@ -531,7 +550,13 @@ class _TFIDFBackend:
                     }))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        return [r for _, r in scored[:n_results]]
+        out = [r for _, r in scored] if n_results is None \
+            else [r for _, r in scored[:n_results]]
+        if stats is not None:
+            stats["matched"] = len(scored)
+            stats["returned"] = len(out)
+            stats["truncated"] = len(out) < len(scored)
+        return out
 
     def collection_count(self) -> int:
         if self._dirty:

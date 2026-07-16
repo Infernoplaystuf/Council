@@ -4159,6 +4159,81 @@ def test_audit_wrong_answer_fixes() -> None:
            rp["effect_size"] > 0)
 
 
+def test_rag_recall_and_coverage() -> None:
+    """The Council's vault retrieval must not silently return an arbitrary
+    slice of the relevant files.
+
+    Measured against known ground truth (12 of 52 files genuinely on-topic):
+    the Council asked each angle for 4 chunks and recalled 4 of the 12 — 33% —
+    and the multi-angle union did NOT rescue it, because when several files are
+    equally relevant every angle returns the SAME arbitrary top-4. A top-N cap
+    over a tie is a coin toss the user cannot see."""
+    try:
+        import re as _re
+        import council_gui_engine as cge
+        import vault_rag as vr
+    except Exception as exc:  # pragma: no cover
+        _check(f"rag modules importable ({exc!r})", False)
+        return
+    backend = getattr(vr, "_TFIDFBackend", None)
+    if backend is None:  # pragma: no cover
+        _check("vault_rag exposes the TF-IDF backend", False)
+        return
+
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td) / "vault"
+        vault.mkdir()
+        relevant = set()
+        for i in range(12):
+            name = f"porosity_{i:02d}.txt"
+            relevant.add(name)
+            (vault / name).write_text(
+                "Porosity analysis for the Inconel build. Measured porosity "
+                "fraction across the layer. Lack-of-fusion pores dominate at "
+                "low laser power. Porosity correlates with scan speed. " * 6)
+        for i in range(40):
+            (vault / f"other_{i:02d}.txt").write_text(
+                "Machine maintenance log. The build chamber was cleaned. "
+                "Filter replaced. Calibration on the recoater blade. " * 6)
+        b = backend(vault)
+        b.index_vault(vault)
+
+        # Reproduce the Council's own multi-angle expansion.
+        q = "what drives porosity in the inconel build"
+        stop = {"what", "when", "where", "who", "why", "how", "is", "are",
+                "the", "a", "an", "in", "on", "of", "to", "do", "does", "can",
+                "i", "my", "me", "for", "and", "or", "with", "this", "that"}
+        kw = [w for w in _re.findall(r"[a-zA-Z]{3,}", q.lower())
+              if w not in stop]
+        angles = [q] + kw[:3]
+
+        def recall_at(k):
+            seen = set()
+            for a in angles:
+                seen |= {Path(r["source"]).name
+                         for r in b.search(a, n_results=k)}
+            return len(seen & relevant) / len(relevant), len(seen - relevant)
+
+        r4, _ = recall_at(4)
+        _check("the OLD per-angle breadth (4) really did miss most of them",
+               r4 < 0.5)
+        r_now, junk = recall_at(cge.RAG_PER_ANGLE)
+        _check(f"the shipped breadth ({cge.RAG_PER_ANGLE}) recalls them all",
+               r_now == 1.0)
+        _check("and does not drag in irrelevant files", junk == 0)
+
+        # Coverage must be reported, and the full set reachable.
+        st = {}
+        full = b.search("porosity", n_results=None, stats=st)
+        _check("n_results=None returns the FULL ranked set",
+               len(full) == st["matched"] and st["truncated"] is False)
+        st2 = {}
+        b.search("porosity", n_results=4, stats=st2)
+        _check("a capped search REPORTS that it truncated",
+               st2["truncated"] and st2["returned"] == 4
+               and st2["matched"] > 4)
+
+
 def test_search_value_searches_every_row() -> None:
     """data_index.search_value must look at EVERY row, and count honestly.
 
@@ -6827,6 +6902,8 @@ def main() -> int:
          test_sqlite_readonly_uri)
     _run("TF-IDF idf units (the vault's own terms are not dropped)",
          test_tfidf_idf_units)
+    _run("RAG recall + coverage (no arbitrary top-N slice)",
+         test_rag_recall_and_coverage)
     _run("search_value streams every row (no 5k blind spot)",
          test_search_value_searches_every_row)
     _run("field search returns EVERY match (all means all)",

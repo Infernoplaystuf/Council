@@ -4414,6 +4414,21 @@ class DeliberationOrchestrator:
 # Vault search tool
 # ============================================================
 
+# Chunks retrieved PER ANGLE by the librarian brief.
+#
+# Was 4. Measured against a vault with known ground truth — 12 of 52 files
+# genuinely on-topic — the Council recalled 4 of the 12 (33%). n=8 → 67%,
+# n=16 → 100%. The multi-angle union did not help: when several files are
+# equally relevant, every angle returns the same arbitrary top-4, so the union
+# is still 4.
+#
+# 12 trades a little context for most of the recall, and the brief is still
+# clamped by max_chars — so this widens what the ranking may CONSIDER without
+# letting it flood the prompt. The full ranked set is written to a file
+# regardless, so nothing retrieved is lost to the cap.
+RAG_PER_ANGLE = 12
+
+
 def _librarian_brief(
     rag,
     query: str,
@@ -4447,12 +4462,24 @@ def _librarian_brief(
     all_matches: list = []
     sources_seen: set = set()
 
+    # Per-angle breadth. Measured on a vault with known ground truth (12 of 52
+    # files genuinely on-topic): n=4 per angle recalled 33% of them, n=8 → 67%,
+    # n=16 → 100%. The multi-angle union did NOT rescue it — when several files
+    # are equally relevant every angle returns the SAME arbitrary top-4, so the
+    # union was still 4. A ranked list is only as good as how much of it you
+    # look at.
+    _rag_stats: dict = {}
     for angle in angles:
         if log_cb:
             log_cb("RAG search: " + repr(angle))
         try:
             if hasattr(rag, "search"):
-                results = rag.search(angle, n_results=4)
+                try:
+                    results = rag.search(angle, n_results=RAG_PER_ANGLE,
+                                         stats=_rag_stats)
+                except TypeError:
+                    # A backend (e.g. chromadb) without the stats kwarg.
+                    results = rag.search(angle, n_results=RAG_PER_ANGLE)
                 # RAGResult may be a custom object, not a plain list.
                 # Normalise to a list of dicts regardless of return type.
                 if results is None:
