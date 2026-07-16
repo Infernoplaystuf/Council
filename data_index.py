@@ -859,46 +859,121 @@ class DataIndex:
                     break
         return seen
 
-    def search_value(self, value: str, *, max_per_file: int = 25
-                      ) -> List[Dict[str, Any]]:
+    def _stream_rows(self, prof: FileProfile):
+        """Yield EVERY row of a profiled file, straight from disk.
+
+        Not prof.rows: that cache stops at MAX_ROWS_FULL_INDEX (5,000) while
+        prof.row_count keeps counting to EOF, so searching the cache made a
+        40,000-row file answer for its first 5,000 while still calling itself
+        40,000 rows. A value at row 30,000 was invisible and the app said "not
+        found" — a confident negative built on a truncated search.
+
+        Streaming costs one sequential pass and no memory: the cache stays for
+        previews and column stats, where a sample is the right thing.
+        """
+        suf = prof.path.suffix.lower()
+        if suf in (".csv", ".tsv"):
+            delim = "\t" if suf == ".tsv" else ","
+            try:
+                with prof.path.open("r", encoding="utf-8", errors="replace",
+                                    newline="") as fh:
+                    for row in csv.DictReader(fh, delimiter=delim):
+                        yield row
+                return
+            except Exception:
+                pass
+        # Non-delimited (JSON, ...) or unreadable — fall back to the cache and
+        # let the caller's coverage stats say so.
+        for row in prof.rows:
+            yield row
+
+    def _fully_streamable(self, prof: FileProfile) -> bool:
+        return prof.path.suffix.lower() in (".csv", ".tsv")
+
+    def search_value(self, value: str, *, max_per_file: int = 25,
+                     stats: Optional[Dict[str, Any]] = None
+                     ) -> List[Dict[str, Any]]:
         """
         Find rows where any cell contains `value` (case-insensitive
-        substring). Returns a list of:
-          {file, column_hits: [colname, ...], rows: [first_few_rows]}
-        Only files that match are included.
+        substring), across EVERY row of every file. Returns:
+          {file, path, row_count, matched_count, shown, column_hits, rows}
+
+        matched_count is the TRUE number of matching rows; `rows` holds up to
+        `max_per_file` of them as a sample and `shown` says how many that is.
+        (matched_count used to be len(rows), i.e. capped at max_per_file — so a
+        file with 500 hits reported 25.)
+
+        `stats`, if given, is filled with the coverage of the search:
+          files_searched / files_total / files_partial (names of files that
+          could only be searched from the row cache) — so the caller can state
+          whether a NEGATIVE result covered everything.
         """
         needle = value.strip().lower()
+        if stats is not None:
+            stats.update({"files_searched": 0, "files_total": 0,
+                          "files_partial": [], "rows_searched": 0})
         if not needle:
             return []
         results = []
-        for prof in self.all_profiles():
-            if prof.error:
-                continue
+        partial: List[str] = []
+        rows_seen = 0
+        profs = [p for p in self.all_profiles() if not p.error]
+        for prof in profs:
             col_hits: set = set()
             matching_rows = []
-            for row in prof.rows:
-                hit = False
+            total_matches = 0
+            for row in self._stream_rows(prof):
+                rows_seen += 1
                 row_hits: List[str] = []
                 for col_name, cell in row.items():
                     if cell and needle in str(cell).lower():
-                        hit = True
                         row_hits.append(col_name)
-                if hit:
+                if row_hits:
+                    total_matches += 1
                     col_hits.update(row_hits)
                     if len(matching_rows) < max_per_file:
                         matching_rows.append(row)
-            if matching_rows:
+            if not self._fully_streamable(prof) and \
+                    prof.row_count > len(prof.rows):
+                partial.append(prof.name)
+            if total_matches:
                 results.append({
                     "file":          prof.name,
                     "path":          str(prof.path),
                     "row_count":     prof.row_count,
-                    "matched_count": len(matching_rows),
+                    "matched_count": total_matches,
+                    "shown":         len(matching_rows),
                     "column_hits":   sorted(col_hits),
                     "rows":          matching_rows,
                 })
+        if stats is not None:
+            stats["files_searched"] = len(profs)
+            stats["files_total"] = len(profs)
+            stats["files_partial"] = partial
+            stats["rows_searched"] = rows_seen
         # Sort by match count desc — most relevant first
         results.sort(key=lambda r: -r["matched_count"])
         return results
+
+    @staticmethod
+    def search_coverage_line(stats: Dict[str, Any]) -> str:
+        """One sentence on how complete a search_value() run was.
+
+        Stated for a negative result too: "no match" only means something if
+        every row was actually looked at.
+        """
+        if not stats:
+            return ""
+        rows = stats.get("rows_searched", 0)
+        files = stats.get("files_searched", 0)
+        partial = stats.get("files_partial") or []
+        line = f"Searched all {rows:,} row(s) across {files:,} file(s)."
+        if partial:
+            line += (f" ⚠ {len(partial)} file(s) could only be searched from "
+                     f"the cached sample ({', '.join(partial[:3])}"
+                     f"{'…' if len(partial) > 3 else ''}) — a miss there is "
+                     f"unknown, not absent.")
+        return line
 
     def lookup_related(self, source_file: str, key_value: str, *,
                        max_per_file: int = 25) -> Dict[str, Any]:

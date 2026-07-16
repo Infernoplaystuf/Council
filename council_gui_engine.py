@@ -2366,17 +2366,26 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                 except Exception:
                     pass
                 _val_merged: dict = {}
+                _val_cov: dict = {}
                 for _t in _val_terms:
                     try:
-                        _vhits = _di_inst.search_value(_t, max_per_file=5)
+                        # search_value STREAMS every row now; the 5,000-row
+                        # cache is only a preview sample. Before, a value past
+                        # row 5,000 was invisible while the file still called
+                        # itself 40,000 rows, so the model was handed a
+                        # confident "not found".
+                        _vhits = _di_inst.search_value(_t, max_per_file=5,
+                                                       stats=_val_cov)
                     except Exception:
                         _vhits = []
                     for _h in _vhits:
                         _ent = _val_merged.setdefault(_h["path"], {
                             "file": _h["file"], "cols": [], "rows": [],
-                            "terms": set(),
+                            "terms": set(), "matched": 0,
                         })
                         _ent["terms"].add(_t)
+                        _ent["matched"] = max(_ent["matched"],
+                                              _h.get("matched_count", 0))
                         for _c in _h["column_hits"]:
                             if _c not in _ent["cols"]:
                                 _ent["cols"].append(_c)
@@ -2391,10 +2400,24 @@ def _inject_file_contents_impl(user_text, analyst_block=None, n_ctx=None,
                     )[:4]
                     _vlines = ["[VALUE MATCHES — rows inside your vault files "
                                "that contain the search terms]"]
+                    # Tell the model the COVERAGE and the TRUE match counts, so
+                    # it cannot present a sample as the whole story. The rows
+                    # below are a sample; matched_count is the real total.
+                    try:
+                        _cov_line = data_index.DataIndex.search_coverage_line(
+                            _val_cov)
+                        if _cov_line:
+                            _vlines.append(f"  ({_cov_line})")
+                    except Exception:
+                        pass
                     for _ent in _ranked:
+                        _tot = _ent.get("matched", 0)
+                        _shown = len(_ent["rows"])
+                        _more = (f"; showing {_shown} of {_tot} matching rows"
+                                 if _tot > _shown else "")
                         _vlines.append(
                             f"  {_ent['file']}  (matched in column(s): "
-                            f"{', '.join(_ent['cols'][:6])})"
+                            f"{', '.join(_ent['cols'][:6])}{_more})"
                         )
                         for _r in _ent["rows"]:
                             _cells = "  |  ".join(

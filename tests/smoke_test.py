@@ -4159,6 +4159,59 @@ def test_audit_wrong_answer_fixes() -> None:
            rp["effect_size"] > 0)
 
 
+def test_search_value_searches_every_row() -> None:
+    """data_index.search_value must look at EVERY row, and count honestly.
+
+    Two defects, both reproduced: (1) it searched prof.rows, which stops at
+    MAX_ROWS_FULL_INDEX=5,000 while prof.row_count keeps counting to EOF — so a
+    40,000-row file answered for its first 5,000 while still calling itself
+    40,000 rows, and a value at row 30,000 came back "not found"; (2)
+    matched_count was len(rows), capped at max_per_file, so a file with 500
+    hits reported 25."""
+    try:
+        import data_index as di
+    except Exception as exc:  # pragma: no cover
+        _check(f"data_index importable ({exc!r})", False)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        d = Path(td) / "data_in"
+        d.mkdir()
+        n = 8000                       # comfortably past the 5,000 cache cap
+        with open(d / "big.csv", "w", encoding="utf-8", newline="") as fh:
+            fh.write("id,serial,note\n")
+            for i in range(n):
+                ser = "NEEDLE-XYZ" if i == 6000 else f"SN-{i:05d}"
+                fh.write(f"{i},{ser},row {i}\n")
+        with open(d / "many.csv", "w", encoding="utf-8", newline="") as fh:
+            fh.write("id,owner\n")
+            for i in range(500):
+                fh.write(f"{i},Bob\n")
+
+        idx = di.DataIndex(search_roots=[d], write_root=Path(td) / "out")
+        idx.refresh()
+        prof = next(p for p in idx.all_profiles() if p.name == "big.csv")
+        _check("the row CACHE is still capped (it is a preview, by design)",
+               len(prof.rows) <= idx.MAX_ROWS_FULL_INDEX < prof.row_count)
+
+        stats = {}
+        hits = idx.search_value("NEEDLE-XYZ", stats=stats)
+        _check("a value PAST the cache cap is found (was 0 hits)",
+               len(hits) == 1 and hits[0]["file"] == "big.csv")
+        _check("every row of every file was streamed",
+               stats["rows_searched"] == n + 500)
+
+        bob = [h for h in idx.search_value("Bob", stats={})
+               if h["file"] == "many.csv"][0]
+        _check("matched_count is the TRUE total, not the sample cap",
+               bob["matched_count"] == 500)
+        _check("the sample is capped and says so",
+               bob["shown"] <= 25 and len(bob["rows"]) == bob["shown"])
+        _check("the coverage line names the rows actually searched",
+               "8,500 row(s)" in di.DataIndex.search_coverage_line(stats))
+        _check("an absent value still returns nothing",
+           idx.search_value("zzz-not-here", stats={}) == [])
+
+
 def test_field_search_returns_every_match() -> None:
     """"Search all files for the point of contact" must mean ALL.
 
@@ -6774,6 +6827,8 @@ def main() -> int:
          test_sqlite_readonly_uri)
     _run("TF-IDF idf units (the vault's own terms are not dropped)",
          test_tfidf_idf_units)
+    _run("search_value streams every row (no 5k blind spot)",
+         test_search_value_searches_every_row)
     _run("field search returns EVERY match (all means all)",
          test_field_search_returns_every_match)
     _run("standing primer actually reaches the model",
