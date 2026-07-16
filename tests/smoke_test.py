@@ -4237,6 +4237,82 @@ def test_dependency_check_sees_the_chart_libs() -> None:
            all(f.install for f in dc.OPTIONAL_FEATURES))
 
 
+def test_an_adjective_does_not_break_a_field_search() -> None:
+    """"the LISTED point of contact" must find what "the point of contact" does.
+
+    User-reported: "when I ask for the listed point of contact it breaks but
+    when I ask the point of contact it works". Reproduced exactly — and it was
+    a router bug, not a model one.
+
+    _FILES_VALUE_AS_FIELD_RE captures the field with a greedy (.+?), so a word
+    between "as the" and the field name is swallowed INTO the field:
+
+        "...as the point of contact"         -> field='point of contact'         ok
+        "...as the listed point of contact"  -> field='listed point of contact'  0 files
+        "...as the primary point of contact" -> field='primary point of contact' 0 files
+
+    Nothing has a field called "listed point of contact", so the search
+    returned zero — silently, because "no files found" is a legitimate answer
+    that looks exactly like this. One adjective turned a working question into
+    a confident wrong one.
+
+    The regex ran BEFORE _parse_field_value_fallback, which validates its field
+    against the vault's real vocabulary and parses these correctly — so the
+    unvalidated path was shadowing the one that already worked.
+    """
+    try:
+        import council_gui_engine as g
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_gui_engine importable ({exc!r})", False)
+        return
+    C = g.CouncilConsole
+
+    class _Fake:
+        def __init__(self, known):
+            self._k = known
+        def _known_field_names(self):
+            return self._k
+
+    plain = _Fake({"point of contact", "poc", "owner"})
+    # Not a stopword list — ANY modifier a person might type must work, which
+    # is why this is resolved against the vault's real names instead.
+    for adj in ("listed", "primary", "current", "assigned", "designated",
+                "responsible", "main", "official", "named"):
+        got = C._resolve_proposed_field(plain, f"{adj} point of contact")
+        _check(f"'{adj} point of contact' resolves to the real field",
+               got == "point of contact", f"got {got!r}")
+
+    _check("'listed poc' resolves to poc",
+           C._resolve_proposed_field(plain, "listed poc") == "poc")
+
+    # A phrase naming no real field must resolve to None so the router falls
+    # through to the validated parser, rather than searching for a field that
+    # cannot exist and reporting a confident "none found".
+    _check("a phrase with no known field resolves to None",
+           C._resolve_proposed_field(plain, "blorp of bob") is None)
+    _check("an unknown field phrase resolves to None",
+           C._resolve_proposed_field(plain, "listed sprocket tension") is None)
+
+    # When the drifted name IS the vault's real label, keep it as typed rather
+    # than stripping the modifier on principle.
+    drift = _Fake({"point of contact", "primary point of contact", "poc"})
+    _check("a real drifted label is used as typed, not stripped",
+           C._resolve_proposed_field(drift, "primary point of contact")
+           == "primary point of contact")
+    _check("...even with an extra modifier in front",
+           C._resolve_proposed_field(drift, "listed primary point of contact")
+           == "primary point of contact")
+
+    # And the regex really does capture the adjective — if this ever stops
+    # being true the resolver above is dead code and this test would hide it.
+    m = C._FILES_VALUE_AS_FIELD_RE.match(
+        "which files have Bob Smith as the listed point of contact")
+    _check("the regex still captures the adjective into the field "
+           "(so the resolver is load-bearing)",
+           bool(m) and m.group(2).strip() == "listed point of contact",
+           f"captured {m.group(2)!r}" if m else "no match")
+
+
 def test_vault_index_can_find_a_numbered_job() -> None:
     """"job 412" must find job 412 — the app's single most common question.
 
@@ -7785,6 +7861,8 @@ def main() -> int:
          test_sqlite_readonly_uri)
     _run("TF-IDF idf units (the vault's own terms are not dropped)",
          test_tfidf_idf_units)
+    _run("an adjective does not break a field search ('listed point of contact')",
+         test_an_adjective_does_not_break_a_field_search)
     _run("vault index can find a numbered job (job 412 -> job 412)",
          test_vault_index_can_find_a_numbered_job)
     _run("vault search reads every file and counts only what it read",

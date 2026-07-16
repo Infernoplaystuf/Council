@@ -7456,16 +7456,25 @@ class CouncilConsole(tk.Tk):
             self._same_field_response(m.group(1).strip().strip("'\"`"),
                                       m.group(2).strip().strip("'\"`"))
             return True
+        # Both regexes capture the field greedily, so an adjective the user
+        # typed ("the LISTED point of contact") lands inside it. Resolve the
+        # captured phrase against the vault's real field names first; if it
+        # resolves to nothing, do NOT search for a field that cannot exist —
+        # fall through to the validated parser below, which handles these.
         m = self._FILES_FIELD_IS_VALUE_RE.match(single_line)
         if m:
-            self._field_value_response(m.group(1).strip().strip("'\"`"),
-                                       m.group(2).strip().strip("'\"`"))
-            return True
+            _fld = self._resolve_proposed_field(m.group(1).strip().strip("'\"`"))
+            if _fld:
+                self._field_value_response(_fld,
+                                           m.group(2).strip().strip("'\"`"))
+                return True
         m = self._FILES_VALUE_AS_FIELD_RE.match(single_line)
         if m:
-            self._field_value_response(m.group(2).strip().strip("'\"`"),
-                                       m.group(1).strip().strip("'\"`"))
-            return True
+            _fld = self._resolve_proposed_field(m.group(2).strip().strip("'\"`"))
+            if _fld:
+                self._field_value_response(_fld,
+                                           m.group(1).strip().strip("'\"`"))
+                return True
         # Fallback for every OTHER way of asking the same thing. The three
         # regexes above matched 6 of 15 realistic phrasings — including
         # "search all files for bob as point of contact", which fell through to
@@ -7958,6 +7967,62 @@ class CouncilConsole(tk.Tk):
         names.update({"point of contact", "poc", "owner", "author",
                       "reviewer", "approver", "requester"})
         return names
+
+    def _resolve_proposed_field(self, proposed: str):
+        """Resolve a regex-CAPTURED field phrase to a field the vault has.
+
+        The three field regexes capture the field with a greedy `(.+?)`, so any
+        word sitting between "as the" and the field name is swallowed INTO the
+        field. Measured, before this existed:
+
+            "...as the point of contact"          -> 'point of contact'          ok
+            "...as the listed point of contact"   -> 'listed point of contact'   0 files
+            "...as the primary point of contact"  -> 'primary point of contact'  0 files
+
+        No file has a field called "listed point of contact", so the search
+        returned zero — and said so with total confidence, because "no files
+        found" is a legitimate answer that looks identical to this. One
+        adjective silently turned a working question into a wrong one.
+
+        The regexes ran BEFORE _parse_field_value_fallback, which validates its
+        field against the vault's real vocabulary and parses these correctly —
+        so the unvalidated path was shadowing the one that worked.
+
+        Returns the field to search, or None to let the caller fall through to
+        the validated parser. NOT a stopword list of adjectives: "listed",
+        "primary", "current", "assigned", "designated", "responsible", "main"
+        and every other modifier a person might type is unbounded. The vault's
+        own field names are the ground truth, so the phrase is resolved against
+        those — which also means "primary point of contact" keeps working when
+        that IS the real label, rather than being stripped on principle.
+        """
+        proposed = (proposed or "").strip()
+        if not proposed:
+            return None
+        try:
+            import field_search as _fs
+        except Exception:
+            return proposed          # can't validate — behave as before
+        known = self._known_field_names() or set()
+        pn = _fs._norm_key(proposed)
+        if not pn:
+            return None
+        # 1. The phrase IS a real field — use it as typed. This is what keeps a
+        #    genuinely drifted label ("Primary Point of Contact") working.
+        for k in known:
+            if _fs._norm_key(k) == pn:
+                return proposed
+        # 2. Otherwise find the LONGEST real field contained in the phrase, as
+        #    whole tokens: "listed point of contact" -> "point of contact".
+        best, best_n = None, ""
+        for k in known:
+            kn = _fs._norm_key(k)
+            if not kn:
+                continue
+            if _re.search(r"\b" + _re.escape(kn) + r"\b", pn):
+                if len(kn) > len(best_n):
+                    best, best_n = k, kn
+        return best
 
     def _parse_field_value_fallback(self, line: str):
         """(field, value) for a field-search phrasing the regexes missed.
