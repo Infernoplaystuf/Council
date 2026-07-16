@@ -4159,6 +4159,53 @@ def test_audit_wrong_answer_fixes() -> None:
            rp["effect_size"] > 0)
 
 
+def test_derived_result_agg_conflict() -> None:
+    """A cached result must not answer a question it did not compute.
+
+    find_fresh reused a precomputed CSV on label token-overlap alone, ignoring
+    the `operation` field it stores. The labels differ by exactly the word that
+    decides the answer — and that is the word overlap cannot see:
+
+        cached "sum of yield by build"     asked "max of yield by build"  0.50
+        cached "average cost per supplier" asked "total cost per supplier" 0.60
+
+    Both clear the 0.5 reuse threshold, so the SUM was served as the MAX, with
+    "do NOT recompute" attached. Measured: 6 of 6 realistic pairs."""
+    try:
+        import derived_results as dr
+    except Exception as exc:  # pragma: no cover
+        _check(f"derived_results importable ({exc!r})", False)
+        return
+
+    for cached, asked in (("sum of yield by build", "max of yield by build"),
+                          ("average cost per supplier",
+                           "total cost per supplier"),
+                          ("mean yield by build", "median yield by build"),
+                          ("count of parts by station",
+                           "sum of parts by station"),
+                          ("min temperature by run",
+                           "max temperature by run")):
+        _check(f"blocks reuse: cached {cached[:22]!r} for {asked[:22]!r}",
+               dr._agg_conflict(asked, cached))
+        # ...and the overlap really would have allowed it.
+        ta, tb = dr._overlap_toks(cached), dr._overlap_toks(asked)
+        _check(f"  (overlap alone would have reused it: {asked[:24]!r})",
+               len(ta & tb) / len(ta | tb) >= 0.5)
+
+    for cached, asked in (("sum of yield by build", "total of yield by build"),
+                          ("average cost per supplier",
+                           "mean cost per supplier"),
+                          ("max temperature by run",
+                           "highest temperature by run")):
+        _check(f"still reuses a SYNONYM: {asked[:26]!r}",
+               not dr._agg_conflict(asked, cached))
+
+    _check("a label naming no aggregation is unaffected",
+           not dr._agg_conflict("yield by build", "yield by build"))
+    _check("the stored operation field is consulted, not just the label",
+           dr._agg_conflict("max of yield", "yield by build", "sum(yield)"))
+
+
 def test_field_value_intent_routing() -> None:
     """The thorough search must be reachable by the words people actually use.
 
@@ -7114,6 +7161,8 @@ def main() -> int:
          test_sqlite_readonly_uri)
     _run("TF-IDF idf units (the vault's own terms are not dropped)",
          test_tfidf_idf_units)
+    _run("derived results: a cached SUM must not answer a MAX",
+         test_derived_result_agg_conflict)
     _run("field:value intent routing (the words people actually use)",
          test_field_value_intent_routing)
     _run("field search typo tolerance (without merging people)",

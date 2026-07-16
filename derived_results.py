@@ -90,6 +90,46 @@ _OVERLAP_STOP = {
 }
 
 
+# Words that NAME the aggregation. Two labels that differ only by one of these
+# are asking opposite questions, and token overlap cannot see it:
+#
+#   cached "sum of yield by build"  vs  asked "max of yield by build"  -> 0.50
+#   cached "average cost per supplier" vs "total cost per supplier"    -> 0.60
+#
+# Both clear the 0.5 reuse threshold, so the cached SUM was served as the
+# answer to a MAX — an authoritative wrong number, with "do NOT recompute"
+# attached. Measured: 6 of 6 realistic pairs. The one word that decides the
+# answer is the one word the matcher ignored.
+_AGG_SYNONYMS = {
+    "sum": "sum", "total": "sum", "totals": "sum", "summed": "sum",
+    "mean": "mean", "average": "mean", "avg": "mean",
+    "median": "median",
+    "max": "max", "maximum": "max", "highest": "max", "largest": "max",
+    "biggest": "max", "peak": "max",
+    "min": "min", "minimum": "min", "lowest": "min", "smallest": "min",
+    "count": "count", "counts": "count", "how_many": "count",
+    "std": "std", "stdev": "std", "deviation": "std", "variance": "var",
+}
+
+
+def _agg_intent(s: str) -> set:
+    """The aggregation(s) a label/query names, canonicalised."""
+    return {_AGG_SYNONYMS[w] for w in re.findall(r"[a-z0-9]+", (s or "").lower())
+            if w in _AGG_SYNONYMS}
+
+
+def _agg_conflict(query: str, label: str, operation: str = "") -> bool:
+    """True when the query and the cached result want DIFFERENT aggregations.
+
+    Only a genuine disagreement blocks reuse: if either side names no
+    aggregation there is nothing to conflict with, and the overlap score
+    decides as before.
+    """
+    q = _agg_intent(query)
+    c = _agg_intent(label) | _agg_intent(operation)
+    return bool(q and c and not (q & c))
+
+
 def _overlap_toks(s: str) -> set:
     return {w for w in re.findall(r"[a-z0-9]+", (s or "").lower())
             if w not in _OVERLAP_STOP and len(w) > 1}
@@ -200,6 +240,10 @@ class DerivedStore:
                       if l_tokens else 0.0)
             else:
                 sc = 0.0
+            # A high token overlap is NOT enough: "max of yield by build" and
+            # "sum of yield by build" score 0.50 and want opposite numbers.
+            if _agg_conflict(query, r.label, r.operation):
+                continue
             if sc >= best_score and r.is_fresh():
                 best, best_score = r, sc
         return best
