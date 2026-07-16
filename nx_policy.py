@@ -139,6 +139,16 @@ def validate_script(code: str) -> Tuple[bool, List[str]]:
                 reasons.append(
                     f"line {node.lineno}: from {node.module!r} import ... is "
                     f"not allowed")
+            # The imported NAME matters, not just the module. simplnx is
+            # allowed, so `from simplnx import ExecuteProcessFilter as EP`
+            # passed the module check, and `EP.execute(...)` never mentions the
+            # denied class at the call site — the alias walked the shell
+            # straight through a denylist that only ever saw call sites.
+            for a in node.names:
+                if a.name in DENIED_CLASS_NAMES:
+                    reasons.append(
+                        f"line {node.lineno}: importing {a.name} is refused — "
+                        f"{reason_for_class(a.name)}")
         # ---- calls ------------------------------------------------------
         elif isinstance(node, ast.Call):
             fn = node.func

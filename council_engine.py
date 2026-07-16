@@ -3149,6 +3149,17 @@ class PersonalityModel:
     session_id: Optional[str] = None
     prior_session_id: Optional[str] = None  # inject context from a past session
     trace: bool = True
+    # A STANDING primer for this model, prepended to every respond() call.
+    #
+    # Four call sites already assigned `model.extra_context = ...` —
+    # dream3d_primer (the SIMPLNX primer for coder/writer/intern) and
+    # graph_personality (the analyst's whole PlotSpec schema and plot-type
+    # list). None of it ever reached the model: respond() reads only its
+    # extra_context KEYWORD, and this was not a field, so the assignment just
+    # stuck an unused attribute on the instance while the app logged
+    # "[Dream3D] Injected" and "analyst schema loaded". Declaring it here and
+    # folding it in below is what those call sites always meant.
+    extra_context: str = ""
 
     def respond(
         self,
@@ -3189,6 +3200,16 @@ class PersonalityModel:
             )
 
         # ── Vault / extra context (role-gated) ───────────────────────
+        # Fold in this model's STANDING primer (see the extra_context field).
+        # It goes first so a per-call briefing reads as the more specific,
+        # later instruction. Everything downstream — vault gating, clamping —
+        # then treats the two as one block, which is what the four call sites
+        # assigning model.extra_context always intended.
+        standing = (self.extra_context or "").strip()
+        if standing:
+            extra_context = (f"{standing}\n\n{extra_context}".strip()
+                             if (extra_context or "").strip() else standing)
+
         # extra_context may contain vault briefing, council instructions, or both.
         # Apply vault gating conservatively: only strip/truncate vault blocks,
         # never touch council instructions or other non-vault content.

@@ -4159,6 +4159,88 @@ def test_audit_wrong_answer_fixes() -> None:
            rp["effect_size"] > 0)
 
 
+def test_standing_primer_reaches_the_model() -> None:
+    """`model.extra_context = ...` must actually reach respond().
+
+    Four call sites assigned it — dream3d_primer (the SIMPLNX primer for
+    coder/writer/intern) and graph_personality (4,169 chars of PlotSpec schema
+    and plot-type list). respond() reads only its extra_context KEYWORD and
+    PersonalityModel had no such field, so every one of those assignments just
+    stuck an unused attribute on the instance while the app printed
+    "[Dream3D] Injected" and loaded the analyst schema. The model saw none of
+    it."""
+    try:
+        import inspect
+        import council_engine as ce
+        import graph_personality as gp
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_engine importable ({exc!r})", False)
+        return
+    PM = ce.PersonalityModel
+    _check("extra_context is a real dataclass field",
+           "extra_context" in getattr(PM, "__dataclass_fields__", {}))
+    _check("it defaults to empty, so an unset model is unchanged",
+           PM.__dataclass_fields__["extra_context"].default == "")
+    _check("respond() folds the standing primer in",
+           "self.extra_context" in inspect.getsource(PM.respond))
+
+    # The fold's contract, exactly as respond() computes it.
+    def fold(standing, per_call):
+        s = (standing or "").strip()
+        if s:
+            per_call = (f"{s}\n\n{per_call}".strip()
+                        if (per_call or "").strip() else s)
+        return per_call
+
+    _check("a standing primer alone becomes the context",
+           fold("PRIMER", "") == "PRIMER")
+    _check("the primer comes FIRST, so a per-call briefing reads as the more "
+           "specific later instruction",
+           fold("PRIMER", "BRIEF").index("PRIMER")
+           < fold("PRIMER", "BRIEF").index("BRIEF"))
+    _check("no standing primer leaves the per-call context untouched",
+           fold("", "BRIEF") == "BRIEF")
+
+    # The analyst's schema is substantial — it was not a trivial loss.
+    prompt = gp._build_analyst_system_prompt()
+    _check("the analyst PlotSpec schema is real content (was discarded)",
+           len(prompt) > 1000 and "plot_type" in prompt)
+
+
+def test_nx_denylist_import_alias() -> None:
+    """A denied filter must stay denied through an import alias.
+
+    nx_policy's ImportFrom branch checked the MODULE root — simplnx is allowed
+    — so `from simplnx import ExecuteProcessFilter as EP` passed, and
+    `EP.execute(...)` never mentions the denied class at the call site. The
+    alias walked a shell straight through a denylist that only saw call
+    sites."""
+    try:
+        import nx_policy as pol
+    except Exception as exc:  # pragma: no cover
+        _check(f"nx_policy importable ({exc!r})", False)
+        return
+    for label, code in (
+        ("a direct call",
+         "import simplnx as nx\nnx.ExecuteProcessFilter.execute(arguments='x')"),
+        ("an ALIASED from-import",
+         "from simplnx import ExecuteProcessFilter as EP\n"
+         "EP.execute(arguments='x')"),
+        ("a plain from-import",
+         "from simplnx import ExecuteProcessFilter\n"
+         "ExecuteProcessFilter.execute()"),
+        ("the codegen filter, aliased",
+         "from simplnx import CreatePythonSkeletonFilter as CP\nCP.execute()"),
+        ("hidden among legitimate names",
+         "from simplnx import DataPath, ExecuteProcessFilter as E2\n"
+         "E2.execute()"),
+    ):
+        _check(f"refused: {label}", not pol.validate_script(code)[0])
+    _check("an ordinary filter import still passes",
+           pol.validate_script(
+               "from simplnx import DataPath, CreateDataArrayFilter\nds = 1")[0])
+
+
 def test_tfidf_idf_units() -> None:
     """TF-IDF must not silently drop a vault's MOST relevant chunks.
 
@@ -6620,6 +6702,10 @@ def main() -> int:
          test_sqlite_readonly_uri)
     _run("TF-IDF idf units (the vault's own terms are not dropped)",
          test_tfidf_idf_units)
+    _run("standing primer actually reaches the model",
+         test_standing_primer_reaches_the_model)
+    _run("SECURITY: nx denylist survives an import alias",
+         test_nx_denylist_import_alias)
     _run("agentic jobs core (autonomous loop, safe tools, cancel)",
          test_agentic_jobs_core)
     _run("graph introspect columns (numeric/coerce/categorical)",
