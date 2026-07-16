@@ -4159,6 +4159,56 @@ def test_audit_wrong_answer_fixes() -> None:
            rp["effect_size"] > 0)
 
 
+def test_tfidf_idf_units() -> None:
+    """TF-IDF must not silently drop a vault's MOST relevant chunks.
+
+    df is incremented once per CHUNK, but N was len(index) — a FILE count. So
+    log((N+1)/(df+1)) went negative the moment a term appeared in more chunks
+    than the vault has files (immediate for any common term), the chunk scored
+    <= 0, `if score > 0` dropped it, and the search reported nothing for the
+    term the vault is most about. chromadb is absent on the target box, so this
+    IS the live search path."""
+    try:
+        import math
+        import vault_rag as vr
+    except Exception as exc:  # pragma: no cover
+        _check(f"vault_rag importable ({exc!r})", False)
+        return
+    backend = getattr(vr, "_TFIDFBackend", None)
+    if backend is None:  # pragma: no cover
+        _check("vault_rag exposes the TF-IDF backend", False)
+        return
+
+    # The arithmetic, stated plainly: mixing units makes idf negative.
+    files, chunks_with_term = 5, 20
+    _check("mixing units (N=files, df=chunks) yields a NEGATIVE idf",
+           math.log((files + 1) / (chunks_with_term + 1)) + 1.0 < 0)
+    total_chunks = 60
+    _check("matching units (N=chunks) keeps idf positive",
+           math.log((total_chunks + 1) / (chunks_with_term + 1)) + 1.0 > 0)
+
+    with tempfile.TemporaryDirectory() as td:
+        vault = Path(td) / "vault"
+        vault.mkdir()
+        for i in range(5):
+            (vault / f"report_{i}.txt").write_text(
+                "Build temperature analysis. The temperature profile was "
+                "measured. Temperature stability matters here. " * 40)
+        (vault / "unrelated.txt").write_text("bacon lettuce tomato " * 200)
+
+        b = backend(vault)
+        stats = b.index_vault(vault)
+        _check("n_docs counts CHUNKS, the same unit as df",
+               b._n_docs == stats.total_chunks and b._n_docs > stats.total_files)
+        _check("the fixture really has a term in more chunks than files",
+               b._df.get("temperature", 0) > stats.total_files)
+        hits = b.search("temperature", n_results=10)
+        _check("the vault's most common on-topic term IS found (was 0 hits)",
+               len(hits) > 0)
+        _check("an absent term still returns nothing",
+               b.search("zzzznotpresent", n_results=5) == [])
+
+
 def test_sqlite_readonly_uri() -> None:
     """A SQLite URL needs the `file:` prefix for uri=true to be valid.
 
@@ -6568,6 +6618,8 @@ def main() -> int:
          test_audit_wrong_answer_fixes)
     _run("SQLite read-only URI actually opens (and refuses writes)",
          test_sqlite_readonly_uri)
+    _run("TF-IDF idf units (the vault's own terms are not dropped)",
+         test_tfidf_idf_units)
     _run("agentic jobs core (autonomous loop, safe tools, cancel)",
          test_agentic_jobs_core)
     _run("graph introspect columns (numeric/coerce/categorical)",

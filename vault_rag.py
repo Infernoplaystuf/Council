@@ -456,7 +456,15 @@ class _TFIDFBackend:
 
         self._index = new_index
         self._df = new_df
-        self._n_docs = len(new_index)
+        # N must be counted in the SAME unit as df, and df is incremented once
+        # per CHUNK above — not per file. Using len(new_index) (a FILE count)
+        # made log((N+1)/(df+1)) go NEGATIVE as soon as a term appeared in more
+        # chunks than the vault has files, which for any common term is
+        # immediate: in a 5-file vault a term in 20 chunks scored idf=-0.25, so
+        # `if score > 0` dropped it and the search reported "no relevant
+        # results" for its most on-topic chunks. The more relevant the term,
+        # the more certain the miss.
+        self._n_docs = sum(len(chunks) for chunks in new_index.values())
         self._dirty = False
         return stats
 
