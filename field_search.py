@@ -578,6 +578,152 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
     return out
 
 
+# ============================================================
+# Intent: "which files have <value> as the <field>?"
+#
+# The three regexes in the console matched 6 of 15 realistic phrasings of this
+# question — including, measured, the user's own words ("search all files for
+# bob as point of contact"), which fell through to the model with capped
+# context. The other 9 got a guess instead of a search.
+#
+# More regexes is not the answer; there is always a tenth phrasing. Instead:
+# pull a CANDIDATE (field, value) out of the sentence loosely, then VALIDATE
+# the field against the vault's real vocabulary. A field the vault does not
+# have never routes, so a loose parse cannot hijack ordinary chat — the guard
+# is the data, not the grammar.
+# ============================================================
+
+# Words that mean "a file", so a question is about finding files at all.
+_FILE_NOUN_RE = re.compile(
+    r"\b(files?|documents?|docs?|reports?|records?|sheets?|everything|"
+    r"anywhere|anything)\b", re.I)
+# Openers that mean "search", ANCHORED to the start of the sentence.
+#
+# Anchoring matters: an unanchored 'is' matched any sentence containing the
+# word, so the STATEMENT "the owner of this project is unclear to me" routed as
+# a search for owner='project'. A search is asked for at the start — "is bob
+# the point of contact anywhere?" — while a passing mention of a field mid-
+# sentence is just conversation.
+_SEARCH_VERB_RE = re.compile(
+    r"^\s*(find|list|show|search|get|which|what|who|how\s+many|count|"
+    r"tell\s+me|give\s+me|is|are|does|do)\b", re.I)
+# The joins between a field and its value, in either order.
+_REL_RE = re.compile(
+    r"\s+(?:listed\s+|shown\s+|set\s+|marked\s+|given\s+|named\s+)?"
+    r"(?:as|is|are|was|were|=|equals?|for|of|on|to)\s+"
+    r"(?:the\s+|a\s+|an\s+|their\s+|its\s+)?", re.I)
+_TRIM_RE = re.compile(r"^[\s'\"`,:;.\-]+|[\s'\"`,:;.\-?!]+$")
+# A "who ..." question asks for a value, not a file list — see the guard in
+# parse_field_value_intent. The \b matters: without it this also swallows
+# "whole", "whoever", ... and refuses to route a legitimate search.
+_WHO_RE = re.compile(r"^\s*who\b", re.I)
+
+
+def _clean_phrase(s: str) -> str:
+    return _TRIM_RE.sub("", str(s or "")).strip()
+
+
+def looks_like_file_search(text: str) -> bool:
+    """Is this asking to find files at all? (cheap pre-filter)"""
+    t = str(text or "")
+    return bool(_FILE_NOUN_RE.search(t) or _SEARCH_VERB_RE.search(t))
+
+
+def parse_field_value_intent(text: str, known_fields) -> Optional[Tuple[str, str]]:
+    """(field, value) when ``text`` asks which files carry a field's value.
+
+    ``known_fields`` is the vault's real field vocabulary — CSV column names,
+    text labels. The field MUST be one of them: that is what makes a loose
+    parse safe. "which files mention the blorp of bob" parses fine and then
+    routes nowhere, because no file has a blorp.
+
+    Returns None when the sentence does not carry a known field + a value.
+    """
+    t = _clean_phrase(text)
+    if not t or not looks_like_file_search(t):
+        return None
+    # "who is the point of contact on job 412?" asks for a NAME, not a list of
+    # files. Parsed loosely it yields field='point of contact', value='job 412'
+    # — a search that matches nothing and answers "No files found" with total
+    # confidence, turning a good question into a false negative. A "who"
+    # question wants a value out of a file; it is not this route's job.
+    if _WHO_RE.match(t):
+        return None
+    norm_t = _norm(t)
+    if not norm_t:
+        return None
+
+    # Longest known field first: 'point of contact' must win over 'contact'.
+    cands = sorted({_norm(f) for f in (known_fields or []) if _norm(f)},
+                   key=len, reverse=True)
+    field_n = next((f for f in cands
+                    if re.search(rf"\b{re.escape(f)}\b", norm_t)), None)
+    if not field_n:
+        return None
+
+    # Split the normalised sentence on the field: the value sits on one side.
+    m = re.search(rf"\b{re.escape(field_n)}\b", norm_t)
+    before, after = norm_t[:m.start()], norm_t[m.end():]
+
+    # Prefer a value AFTER the field ("point of contact is bob", "poc bob").
+    val = _value_after(after)
+    if not val:
+        val = _value_before(before)
+    if not val:
+        return None
+    return field_n, val
+
+
+# Words that are never the value being searched for.
+_VALUE_STOP = {
+    "find", "list", "show", "search", "get", "which", "what", "who", "how",
+    "many", "count", "tell", "give", "me", "all", "the", "a", "an", "of",
+    "for", "with", "have", "has", "having", "that", "is", "are", "was",
+    "were", "as", "in", "on", "to", "and", "or", "files", "file", "documents",
+    "document", "docs", "doc", "reports", "report", "records", "record",
+    "everything", "anywhere", "anything", "listed", "their", "its", "my",
+    "please", "sheets", "sheet", "same", "does", "do", "us", "it", "this",
+    "them", "any",
+    # Relative/interrogative connectors. Without these, "files WHERE bob is
+    # listed as poc" yields the value "where bob" and finds nothing — the
+    # search runs, matches nobody, and reports a confident empty list.
+    "where", "when", "whose", "whom", "there", "here", "contain", "contains",
+    "containing", "mention", "mentions", "mentioning", "include", "includes",
+    "including", "shows", "showing", "marked", "set", "given", "named",
+    "assigned", "owns", "own", "owned",
+}
+
+
+def _take_name(tokens) -> str:
+    """The leading run of non-stopword tokens — the value."""
+    out = []
+    for tok in tokens:
+        if tok in _VALUE_STOP:
+            if out:
+                break
+            continue
+        out.append(tok)
+    return " ".join(out)
+
+
+def _value_after(after: str) -> str:
+    a = _REL_RE.sub(" ", " " + after, count=1).strip() if after.strip() else ""
+    return _take_name(a.split()) if a else ""
+
+
+def _value_before(before: str) -> str:
+    # "...bob as the point of contact" -> the value is the tail of `before`.
+    toks = before.split()
+    tail = []
+    for tok in reversed(toks):
+        if tok in _VALUE_STOP:
+            if tail:
+                break
+            continue
+        tail.append(tok)
+    return " ".join(reversed(tail))
+
+
 def coverage_line(stats: dict) -> str:
     """One plain sentence describing how complete a search was.
 

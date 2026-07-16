@@ -4159,6 +4159,76 @@ def test_audit_wrong_answer_fixes() -> None:
            rp["effect_size"] > 0)
 
 
+def test_field_value_intent_routing() -> None:
+    """The thorough search must be reachable by the words people actually use.
+
+    Measured: the three console regexes matched 6 of 15 realistic phrasings —
+    including "search all files for bob as point of contact", the user's own
+    words, which fell through to the model and got a guess over capped context
+    instead of a search. More regexes is not the fix; there is always a tenth
+    phrasing. So the sentence is parsed loosely and the FIELD is validated
+    against the vault's real vocabulary: an unknown field never routes, so a
+    loose parse cannot hijack ordinary chat. The guard is the data, not the
+    grammar."""
+    try:
+        import field_search as fs
+    except Exception as exc:  # pragma: no cover
+        _check(f"field_search importable ({exc!r})", False)
+        return
+    known = ["Point of Contact", "POC", "Owner", "Reviewer", "Approver",
+             "Customer"]
+
+    for q, field, value in (
+        ("find all files with bob as the point of contact",
+         "point of contact", "bob"),
+        ("what files is bob the point of contact for",
+         "point of contact", "bob"),
+        ("show me everything bob is the point of contact on",
+         "point of contact", "bob"),
+        ("is bob the point of contact anywhere", "point of contact", "bob"),
+        ("search all files for bob as point of contact",
+         "point of contact", "bob"),
+        ("files where bob is listed as poc", "poc", "bob"),
+        ("all documents with point of contact bob smith",
+         "point of contact", "bob smith"),
+        ("which reports list carol as the reviewer", "reviewer", "carol"),
+        ("find files where the owner is dave jones", "owner", "dave jones"),
+        ("get me the files bob owns as point of contact",
+         "point of contact", "bob"),
+    ):
+        _check(f"routes: {q[:44]!r}",
+               fs.parse_field_value_intent(q, known) == (field, value))
+
+    # A "who ..." question wants a NAME, not a file list. Parsed loosely it
+    # yields field='point of contact', value='job 412' — a search that matches
+    # nothing and answers "No files found" with total confidence, turning a
+    # good question into a false negative.
+    for q in ("who is the point of contact on job 412?",
+              "who is the owner of report.csv",
+              "Who is the POC for job 88"):
+        _check(f"a 'who' question does NOT become a file search: {q[:34]!r}",
+               fs.parse_field_value_intent(q, known) is None)
+    _check("but a word merely starting with 'who' is not swallowed",
+           fs.parse_field_value_intent(
+               "whole set of files with bob as the point of contact",
+               known) == ("point of contact", "bob"))
+    # The guard regex must contain no stray control bytes — a \b that became a
+    # literal backspace silently disabled this whole check once already.
+    _check("the 'who' guard has no control characters in it",
+           all(ord(c) > 31 for c in fs._WHO_RE.pattern))
+
+    for q in ("what is the weather today",
+              "summarize report.csv",
+              "plot yield by build",
+              "which files mention the blorp of bob",   # unknown field
+              "the owner of this project is unclear to me",   # a statement
+              "i think the customer is happy",
+              "how many files are in the vault",
+              "hello"):
+        _check(f"does NOT hijack: {q[:40]!r}",
+               fs.parse_field_value_intent(q, known) is None)
+
+
 def test_field_search_typo_tolerance() -> None:
     """A field value must match through a TYPO, without conflating two people.
 
@@ -7044,6 +7114,8 @@ def main() -> int:
          test_sqlite_readonly_uri)
     _run("TF-IDF idf units (the vault's own terms are not dropped)",
          test_tfidf_idf_units)
+    _run("field:value intent routing (the words people actually use)",
+         test_field_value_intent_routing)
     _run("field search typo tolerance (without merging people)",
          test_field_search_typo_tolerance)
     _run("RAG adaptive window (sizes itself to the data)",

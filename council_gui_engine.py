@@ -7425,6 +7425,17 @@ class CouncilConsole(tk.Tk):
             self._field_value_response(m.group(2).strip().strip("'\"`"),
                                        m.group(1).strip().strip("'\"`"))
             return True
+        # Fallback for every OTHER way of asking the same thing. The three
+        # regexes above matched 6 of 15 realistic phrasings — including
+        # "search all files for bob as point of contact", which fell through to
+        # the model and got a guess over capped context instead of a search.
+        # This parses the sentence loosely and then VALIDATES the field against
+        # the vault's real column names, so an unknown field simply does not
+        # route: the guard is the data, not the grammar.
+        fv = self._parse_field_value_fallback(single_line)
+        if fv:
+            self._field_value_response(fv[0], fv[1])
+            return True
         m = (self._FILES_FOR_ENTITY_RE.match(single_line)
              or self._FILES_WITH_NAME_RE.match(single_line))
         if m:
@@ -7880,6 +7891,38 @@ class CouncilConsole(tk.Tk):
             return None
         try:
             return next(reversed(list(m.values())))
+        except Exception:
+            return None
+
+    def _known_field_names(self):
+        """The vault's real field vocabulary — its actual CSV column names.
+
+        This is what makes a loose sentence parse safe to act on: a field the
+        vault does not have never routes, so "which files mention the blorp of
+        bob" stays ordinary chat.
+        """
+        names = set()
+        try:
+            for prof in self.data_index.all_profiles():
+                if getattr(prof, "error", ""):
+                    continue
+                for col in (getattr(prof, "columns", None) or []):
+                    n = (getattr(col, "name", "") or "").strip()
+                    if 2 <= len(n) <= 60:
+                        names.add(n)
+        except Exception:
+            pass
+        # Labels that live in prose rather than a column header, so a text-only
+        # vault still routes. Kept tiny and generic on purpose.
+        names.update({"point of contact", "poc", "owner", "author",
+                      "reviewer", "approver", "requester"})
+        return names
+
+    def _parse_field_value_fallback(self, line: str):
+        """(field, value) for a field-search phrasing the regexes missed."""
+        try:
+            import field_search as _fs
+            return _fs.parse_field_value_intent(line, self._known_field_names())
         except Exception:
             return None
 
