@@ -4159,6 +4159,78 @@ def test_audit_wrong_answer_fixes() -> None:
            rp["effect_size"] > 0)
 
 
+def test_field_search_returns_every_match() -> None:
+    """"Search all files for the point of contact" must mean ALL.
+
+    The stated requirement: read every file, return every file that lists the
+    value — not a subsection. Two silent caps used to break that: a 5,000-HIT
+    limit and a 100,000-FILE limit, neither of which said it had fired. A
+    silently short list is indistinguishable from a complete one, so a missing
+    file reads as "that person isn't on it"."""
+    try:
+        import json as _json
+        import field_search as fs
+    except Exception as exc:  # pragma: no cover
+        _check(f"field_search importable ({exc!r})", False)
+        return
+
+    # No caps by default — the signature itself is the guarantee.
+    import inspect
+    sig = inspect.signature(fs.find_files_with_field_value)
+    _check("there is NO default hit cap",
+           sig.parameters["limit"].default is None)
+    _check("there is NO default file cap",
+           sig.parameters["max_files"].default is None)
+
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        bob = 0
+        # A mixed vault, in the shapes that actually occur: prose text,
+        # MINIFIED json (one line), and a CSV column — plus distractors that
+        # name Alice, and prose that merely mentions Bob.
+        for i in range(300):
+            d = root / f"batch_{i // 50:02d}"
+            d.mkdir(exist_ok=True)
+            if i % 3 == 0:
+                (d / f"job_{i:04d}.txt").write_text(
+                    "Job report\nPoint of Contact: Bob Smith\n"
+                    "Notes: Alice reviewed this.\n")
+                bob += 1
+            elif i % 3 == 1:
+                (d / f"rec_{i:04d}.json").write_text(_json.dumps(
+                    {"job": i, "point_of_contact": "Bob Smith",
+                     "reviewer": "Alice"}))
+                bob += 1
+            else:
+                (d / f"tab_{i:04d}.csv").write_text(
+                    "task,Point of Contact\nA,Alice\n")
+
+        stats = {}
+        hits = fs.find_files_with_field_value(root, "point of contact", "bob",
+                                              stats=stats)
+        _check("every file in the vault was scanned",
+               stats["scanned"] == stats["total_files"] == 300)
+        _check("EVERY file listing Bob is returned, not a subsection",
+               len(hits) == bob and bob > 0)
+        _check("no file that merely mentions Bob elsewhere is included",
+               not any("tab_" in h[0] for h in hits))
+        _check("a complete search is not flagged as truncated",
+               stats["truncated"] is False)
+        _check("the coverage line states the whole vault was searched",
+               "Searched all 300" in fs.coverage_line(stats))
+
+        # An opt-in cap must SAY it fired — never truncate quietly.
+        capped = {}
+        short = fs.find_files_with_field_value(root, "point of contact", "bob",
+                                               limit=10, stats=capped)
+        _check("an explicit cap truncates only when asked", len(short) == 10)
+        _check("and it is reported, not hidden",
+               capped["truncated"] and "there may be more"
+               in capped["truncated_why"])
+        _check("the coverage line warns the result is PARTIAL",
+               "PARTIAL" in fs.coverage_line(capped))
+
+
 def test_standing_primer_reaches_the_model() -> None:
     """`model.extra_context = ...` must actually reach respond().
 
@@ -6702,6 +6774,8 @@ def main() -> int:
          test_sqlite_readonly_uri)
     _run("TF-IDF idf units (the vault's own terms are not dropped)",
          test_tfidf_idf_units)
+    _run("field search returns EVERY match (all means all)",
+         test_field_search_returns_every_match)
     _run("standing primer actually reaches the model",
          test_standing_primer_reaches_the_model)
     _run("SECURITY: nx denylist survives an import alias",

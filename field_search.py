@@ -366,22 +366,44 @@ def _table_column_values(p: Path, col: str) -> List[str]:
 
 
 def find_files_with_field_value(root: Any, field: str, value: str, *,
-                                limit: int = 5000, max_files: int = 100000,
+                                limit: Optional[int] = None,
+                                max_files: Optional[int] = None,
                                 text_max_chars: int = 200000,
                                 on_progress: Optional[Callable[[int, int],
-                                                               None]] = None
+                                                               None]] = None,
+                                stats: Optional[dict] = None
                                 ) -> List[Tuple[str, str]]:
-    """Files under ``root`` where ``field`` is associated with ``value``.
+    """EVERY file under ``root`` where ``field`` is associated with ``value``.
     Returns ``[(abs_path, context)]``. Field-aware (see module docstring).
 
-    Scales to large vaults: tabular files are checked HEADER-FIRST (only the
-    matching column is read, and files without the column are skipped without a
-    full read); text reads are bounded; ``max_files`` defaults high enough not
-    to silently truncate. ``on_progress(scanned, total)`` is called ~every 100
-    files so the UI can show progress."""
+    ALL means all. By default this scans every file and returns every match —
+    there is no hit cap and no file cap. "Search all files for the point of
+    contact" has to answer for the whole vault or the answer is worthless: a
+    silently short list is indistinguishable from a complete one, so a missing
+    file reads as "that person isn't on it".
+
+    ``limit`` / ``max_files`` are opt-in and OFF by default. When either is
+    set and actually fires, it is recorded in ``stats`` — nothing truncates
+    quietly.
+
+    ``stats`` (optional dict) is filled in with the coverage of the run:
+        scanned        files actually examined
+        total_files    files found under root
+        hits           matches returned
+        truncated      True if a cap cut the results short
+        truncated_why  plain-English reason, or ""
+    so the caller can state "searched all 8,412 files" rather than implying it.
+
+    Scales: tabular files are checked HEADER-FIRST (only a matching column is
+    read; a file without the column is skipped without a full read) and text
+    reads are bounded. ``on_progress(scanned, total)`` fires ~every 100 files.
+    """
     root = Path(root)
     fn = _norm(field)
     vn = str(value or "").strip().lower()
+    if stats is not None:
+        stats.update({"scanned": 0, "total_files": 0, "hits": 0,
+                      "truncated": False, "truncated_why": ""})
     if not vn:
         return []
     try:
@@ -393,7 +415,14 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
                  if p.is_file() and not p.name.startswith(".")]
     except Exception:
         files = []
-    files = files[:max_files]
+    total_found = len(files)
+    if max_files is not None and total_found > max_files:
+        files = files[:max_files]
+        if stats is not None:
+            stats["truncated"] = True
+            stats["truncated_why"] = (
+                f"only the first {max_files} of {total_found} files were "
+                f"scanned (max_files)")
     total = len(files)
     out: List[Tuple[str, str]] = []
     try:
@@ -407,7 +436,11 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
                 on_progress(i, total)
             except Exception:
                 pass
-        if len(out) >= limit:
+        if limit is not None and len(out) >= limit:
+            if stats is not None:
+                stats["truncated"] = True
+                stats["truncated_why"] = (
+                    f"stopped after {limit} matches (limit); there may be more")
             break
         if _cl is not None:
             try:
@@ -443,4 +476,26 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
             on_progress(total, total)
         except Exception:
             pass
+    if stats is not None:
+        stats["scanned"] = total
+        stats["total_files"] = total_found
+        stats["hits"] = len(out)
     return out
+
+
+def coverage_line(stats: dict) -> str:
+    """One plain sentence describing how complete a search was.
+
+    A negative result is only trustworthy if the search was complete, so the
+    coverage is stated either way rather than left for the reader to assume.
+    """
+    if not stats:
+        return ""
+    scanned = stats.get("scanned", 0)
+    total = stats.get("total_files", scanned)
+    if stats.get("truncated"):
+        return (f"⚠ PARTIAL — {stats.get('truncated_why') or 'results were '
+                'truncated'}. Treat a missing file as unknown, not absent.")
+    if total:
+        return f"Searched all {total:,} file(s) in the vault."
+    return "No files to search."

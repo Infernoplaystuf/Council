@@ -7843,9 +7843,14 @@ class CouncilConsole(tk.Tk):
                 if total:
                     self.after(0, lambda i=i, t=total: self._set_status(
                         f"● searching fields… {i}/{t}", "#cba6f7"))
+            cov = {}
             try:
+                # No caps: "search all files for the point of contact" must
+                # answer for the whole vault. A silently short list is
+                # indistinguishable from a complete one, so a file missing
+                # from it would read as "that person isn't on it".
                 hits = _fs.find_files_with_field_value(
-                    root, field, value, on_progress=_prog)
+                    root, field, value, on_progress=_prog, stats=cov)
                 err = None
             except Exception as exc:
                 hits, err = [], repr(exc)
@@ -7856,14 +7861,20 @@ class CouncilConsole(tk.Tk):
                         "Writer", f"Field search failed: {err}", "final")
                     self._set_status("● idle")
                     return
+                # State the COVERAGE either way. A "no files found" is only
+                # worth anything if the search was complete — otherwise the
+                # user cannot tell "nobody has that" from "we stopped early".
+                coverage = _fs.coverage_line(cov)
                 if not hits:
                     self._append_transcript(
                         "Writer",
-                        f"No files found where {field!r} is {value!r}.", "final")
+                        f"No files found where {field!r} is {value!r}.\n"
+                        f"{coverage}", "final")
                     self._set_status("● idle")
                     return
                 self._remember_files([h[0] for h in hits])
-                header = f"{len(hits)} file(s) where {field!r} is {value!r}:"
+                header = (f"{len(hits)} file(s) where {field!r} is {value!r}:\n"
+                          f"{coverage}")
                 items = []
                 for pth, ctx in hits:
                     try:
