@@ -226,6 +226,40 @@ def _paired_xy(df, x_col, y_col, degree=1):
     return xv, yv
 
 
+def _pca_matrix(spec, df):
+    """(matrix, kept_index, note) for PCA — selected columns, THEN dropna.
+
+    Both PCA paths did `df.select_dtypes("number").dropna()` and only
+    subselected spec.columns AFTERWARDS, so a row was discarded because of a
+    column the user never chose. One optional sensor logged 5% of the time
+    dropped a 500-row study to 25 rows — and the explained-variance ratios were
+    still reported as if the whole dataset had been used, with nothing on
+    screen saying otherwise. Measured, not hypothesised.
+
+    Selecting first means only the chosen columns can drop a row. The kept
+    index comes back so a colour column can be aligned to the same rows, and
+    the note states any drop on the chart rather than hiding it.
+    """
+    num_df = df.select_dtypes(include="number")
+    if spec.columns:
+        cols = [c for c in spec.columns if c in num_df.columns]
+        if cols:
+            num_df = num_df[cols]
+    total = len(num_df)
+    num_df = num_df.dropna()
+    if num_df.shape[1] < 2:
+        raise ValueError(
+            "PCA needs at least two numeric columns — "
+            f"got {num_df.shape[1]}.")
+    if len(num_df) < 2:
+        raise ValueError(
+            "Not enough complete rows for PCA: only "
+            f"{len(num_df)} row(s) have every selected column.")
+    lost = total - len(num_df)
+    note = (f"  ({lost} incomplete row(s) dropped)" if lost else "")
+    return num_df, num_df.index, note
+
+
 def _anomaly_parts(spec, df):
     """(x_values, y_values, mask) for an anomaly plot, all aligned to the rows
     that survive dropna() — the old code built the mask from the dropna()'d
@@ -269,8 +303,19 @@ class PlotlyRenderer:
 
         try:
             fig = self._dispatch(spec, df)
+            # A plot method may set a title carrying COMPUTED information —
+            # PCA's explained-variance ratios, the row count actually used.
+            # This used to overwrite it unconditionally, so the most
+            # informative thing about a PCA never reached the user. Precedence:
+            # an explicit spec.title, else what the method computed, else a
+            # generic label.
+            try:
+                computed = fig.layout.title.text
+            except Exception:
+                computed = None
             fig.update_layout(
-                title=spec.title or f"{spec.plot_type.replace('_',' ').title()} — {ds.name}",
+                title=(spec.title or computed
+                       or f"{spec.plot_type.replace('_',' ').title()} — {ds.name}"),
                 template=spec.theme,
                 width=spec.width,
                 height=spec.height,
@@ -615,9 +660,7 @@ class PlotlyRenderer:
     def _pca(self, spec, df):
         if not _SKLEARN_OK:
             raise ImportError("pip install scikit-learn")
-        num_df = df.select_dtypes(include="number").dropna()
-        if spec.columns:
-            num_df = num_df[[c for c in spec.columns if c in num_df.columns]]
+        num_df, kept, dropped = _pca_matrix(spec, df)
         scaler     = StandardScaler()
         scaled     = scaler.fit_transform(num_df)
         n_comp     = min(3, scaled.shape[1])
@@ -625,17 +668,24 @@ class PlotlyRenderer:
         components = pca.fit_transform(scaled)
         explained  = pca.explained_variance_ratio_
 
+        # The colour column must come from the SAME rows the components did.
+        # Reading it off the full frame produced a length mismatch the moment
+        # any row was dropped.
+        colour = None
+        if spec.color_col and spec.color_col in df.columns:
+            colour = df.loc[kept, spec.color_col].values
+
         if n_comp >= 3:
             pca_df = pd.DataFrame(components, columns=["PC1", "PC2", "PC3"])
             fig = px.scatter_3d(pca_df, x="PC1", y="PC2", z="PC3",
-                                color=df[spec.color_col].values if spec.color_col and spec.color_col in df else None,
-                                opacity=spec.opacity)
+                                color=colour, opacity=spec.opacity)
         else:
             pca_df = pd.DataFrame(components, columns=["PC1", "PC2"][:n_comp])
             fig    = px.scatter(pca_df, x="PC1", y="PC2",
-                                opacity=spec.opacity)
+                                color=colour, opacity=spec.opacity)
         evr_str = "  ".join(f"PC{i+1}={v:.1%}" for i, v in enumerate(explained))
-        fig.update_layout(title=f"PCA — Explained variance: {evr_str}")
+        fig.update_layout(title=f"PCA ({len(num_df)} rows) — "
+                                f"Explained variance: {evr_str}{dropped}")
         return fig
 
     def _facet(self, spec, df):
@@ -930,9 +980,7 @@ class MatplotlibRenderer:
     def _pca_mpl(self, spec, df):
         if not _SKLEARN_OK:
             raise ImportError("pip install scikit-learn")
-        num  = df.select_dtypes(include="number").dropna()
-        if spec.columns:
-            num = num[[c for c in spec.columns if c in num.columns]]
+        num, _kept, _note = _pca_matrix(spec, df)
         scaled     = StandardScaler().fit_transform(num)
         n_comp     = min(3, scaled.shape[1])
         pca        = PCA(n_components=n_comp)

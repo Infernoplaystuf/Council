@@ -3818,6 +3818,49 @@ def test_graph_engine_correctness() -> None:
                r.render(ge.PlotSpec(plot_type="histogram", y_col="yield"),
                         _ds(one_num)) is not None)
 
+    # PCA dropped rows on columns the user did NOT select: dropna() ran across
+    # every numeric column and only subselected spec.columns afterwards. One
+    # optional sensor logged 5% of the time cut a 500-row study to 25 rows,
+    # and the explained-variance ratios were still reported as authoritative.
+    n = 500
+    sparse = pd.DataFrame({
+        "x": np.linspace(0, 1, n), "y": np.linspace(1, 0, n),
+        "z": np.linspace(0, 2, n),
+        # an unselected column present in only 5% of rows
+        "optional": [1.0 if i % 20 == 0 else np.nan for i in range(n)],
+    })
+    spec_pca = ge.PlotSpec(plot_type="pca", columns=["x", "y", "z"])
+    mat, kept, note = ge._pca_matrix(spec_pca, sparse)
+    _check("PCA uses every row of the SELECTED columns",
+           len(mat) == n and list(mat.columns) == ["x", "y", "z"])
+    _check("PCA is not shrunk by a column the user did not select", note == "")
+    _check("the kept index aligns with the matrix (colour alignment)",
+           len(kept) == len(mat))
+    m2, _k2, note2 = ge._pca_matrix(
+        ge.PlotSpec(plot_type="pca", columns=["x", "y", "optional"]), sparse)
+    _check("when a sparse column IS selected, the drop is stated, not hidden",
+           len(m2) == 25 and "475 incomplete row" in note2)
+    _check("PCA refuses one column rather than plotting nonsense",
+           _raises(ValueError, lambda: ge._pca_matrix(
+               ge.PlotSpec(plot_type="pca", columns=["x"]), sparse)))
+
+    if getattr(ge, "_PLOTLY_OK", False):
+        pds = _ds(sparse, "study")
+        html_pca = ge.PlotlyRenderer().render(spec_pca, pds)
+        # render() used to overwrite the title _dispatch set, so PCA's
+        # explained-variance readout — the most informative thing about a PCA —
+        # never reached the user at all.
+        _check("a plot's COMPUTED title survives render()",
+               "Explained variance" in html_pca
+               and "PCA (500 rows)" in html_pca)
+        _check("an explicit spec.title still wins over the computed one",
+               "My title" in ge.PlotlyRenderer().render(
+                   ge.PlotSpec(plot_type="pca", columns=["x", "y", "z"],
+                               title="My title"), pds))
+        _check("a plot with no computed title still gets the default",
+               "Histogram " in ge.PlotlyRenderer().render(
+                   ge.PlotSpec(plot_type="histogram", y_col="x"), pds))
+
     # THE air-gap regression: include_plotlyjs="cdn" made every chart a blank
     # div offline (the <script src> never resolved) while to_html() succeeded,
     # so the app reported a rendered chart and showed nothing.
