@@ -3461,7 +3461,26 @@ _SANDBOX_FORBIDDEN_DUNDERS = frozenset({
     "__subclasses__", "__bases__", "__mro__", "__base__", "__globals__",
     "__subclasshook__", "__builtins__", "__code__", "__closure__",
     "__reduce__", "__reduce_ex__", "__getattribute__",
+    "__class__", "__dict__", "__loader__", "__spec__", "__import__",
+    "__getattr__",
 })
+# Attribute NAMES that reach a live module (and thence os/subprocess/socket)
+# without an import statement. pathlib is allowlisted, but pathlib.sys.modules
+# hands back every already-loaded module, so `pathlib.sys.modules["subprocess"]
+# .run(...)` was arbitrary code execution that never touched a blocked import.
+_SANDBOX_FORBIDDEN_MODULE_ATTRS = frozenset({
+    "sys", "os", "modules", "subprocess", "socket", "sqlite3", "shutil",
+    "importlib", "import_module", "load_module", "builtins", "posix", "nt",
+    "ctypes", "pickle", "marshal",
+})
+# The full set an attribute access — CALLED OR NOT — is checked against. A
+# blocklist is only as strong as its least-checked syntactic form, and the
+# checks used to fire only on a direct call (p.unlink()) or a bare dunder,
+# so a bound-method reference (fn = p.unlink; fn()) walked straight through
+# and deleted a file outside the sandbox. Every Attribute node is now checked.
+_SANDBOX_FORBIDDEN_ANY_ATTR = (_SANDBOX_FORBIDDEN_ATTRS
+                               | _SANDBOX_FORBIDDEN_DUNDERS
+                               | _SANDBOX_FORBIDDEN_MODULE_ATTRS)
 
 
 def validate_generated_code(code: str) -> Tuple[bool, str]:
@@ -3494,15 +3513,17 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
             root = (node.module or "").split(".")[0]
             if root in forbidden_import_roots:
                 return False, f"Forbidden import from: {node.module}"
-        # Any attribute access to an escape dunder — even without a call —
-        # e.g. `x.__globals__[...]`, `type(1).__mro__`.
-        if isinstance(node, ast.Attribute) and node.attr in _SANDBOX_FORBIDDEN_DUNDERS:
+        # ANY attribute access to a forbidden name — called or not. Checking
+        # only calls let `fn = p.unlink; fn()` and `w = p.write_text; w(...)`
+        # through (a bound-method reference is an Attribute, not a Call), which
+        # deleted and overwrote real files; and checking only dunders let
+        # `pathlib.sys.modules[...]` reach a live subprocess module.
+        if (isinstance(node, ast.Attribute)
+                and node.attr in _SANDBOX_FORBIDDEN_ANY_ATTR):
             return False, f"Forbidden attribute: {node.attr}"
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name) and node.func.id in forbidden_calls:
                 return False, f"Forbidden call: {node.func.id}"
-            if isinstance(node.func, ast.Attribute) and node.func.attr in _SANDBOX_FORBIDDEN_ATTRS:
-                return False, f"Forbidden method: {node.func.attr}"
             # getattr/setattr with a constant forbidden name — the string-based
             # bypass of the attribute checks above, e.g.
             # `getattr(p, "unlink")()` or `getattr(x, "__globals__")`.
@@ -3511,8 +3532,7 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
                     and len(node.args) >= 2
                     and isinstance(node.args[1], ast.Constant)
                     and isinstance(node.args[1].value, str)
-                    and node.args[1].value in (_SANDBOX_FORBIDDEN_ATTRS
-                                               | _SANDBOX_FORBIDDEN_DUNDERS)):
+                    and node.args[1].value in _SANDBOX_FORBIDDEN_ANY_ATTR):
                 return False, (f"Forbidden {node.func.id} of "
                                f"{node.args[1].value!r}")
     return True, "ok"

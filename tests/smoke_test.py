@@ -4035,6 +4035,14 @@ def test_pandas_sandbox_write_escape_blocked() -> None:
             f'getattr(Path("{mp}"), "write_text")("x")',   # getattr bypass
             'result = type(1).__mro__[-1].__subclasses__()',  # dunder escape
             'x = ().__class__.__bases__[0].__globals__',       # __globals__
+            # SYNTACTIC-SHAPE escapes that the CALL-only checks missed and that
+            # an audit verified end to end (a bound-method reference deleted a
+            # real file outside the sandbox):
+            f'fn = Path("{mp}").write_text\nfn("pwned")',       # bound-method write
+            f'g = Path("{mp}").unlink\ng()',                    # bound-method delete
+            'm = pathlib.sys.modules\nm["subprocess"].run(["echo"])',  # live module reach
+            'pathlib.os.getcwd()',                              # module attr on a pure import
+            'x = ().__class__',                                 # bare __class__
         ]
         for code in escapes:
             df, msg = va.execute_pandas_code(code, [folder])
