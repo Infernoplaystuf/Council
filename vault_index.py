@@ -470,7 +470,24 @@ def _describe_from_schema(rec: Dict[str, Any]) -> Tuple[str, List[str]]:
     return " ".join(summary_parts), topics_sorted[:6]
 
 
-_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
+# A token may START WITH A DIGIT. The old pattern was [A-Za-z][A-Za-z0-9]*,
+# which required a leading letter and so threw away every number in the vault:
+#
+#     "job_100"   -> ['job']    the 100 is gone
+#     "Job 317"   -> ['job']    the 317 is gone
+#     "part_90210"-> ['part']   the 90210 is gone
+#     "412"       -> []         nothing at all
+#
+# In a vault of 600 job folders that made all 600 records token-IDENTICAL —
+# every one reduced to {job, json, material, contact...}. So "job_412" matched
+# all 600 equally, the tie resolved to index order, and every query returned
+# the same handful of lowest-numbered files. That is why the app looked like it
+# "only searched the first 400" and "got worse on numerically higher files":
+# the low ones were never found on merit, they were just first in line.
+#
+# Digit-led tokens are bounded by _is_useful_token below so a numeric CSV
+# cannot flood the keyword set.
+_TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 _HEX_RE = re.compile(r"^[0-9a-f]+$", re.IGNORECASE)
 # Splits a multi-value cell ("a|b;c") — used per sampled cell in all three
 # tabular parsers, so it's compiled once here rather than per call.
@@ -482,6 +499,13 @@ def _is_useful_token(t: str) -> bool:
     if len(t) > 20:
         return False
     if len(t) >= 8 and _HEX_RE.match(t):
+        return False
+    # Pure digits are now tokenized (see _TOKEN_RE) because "job 412" is the
+    # single most common question this app is asked. But an all-digit run
+    # longer than an identifier is a timestamp, epoch, or measurement — the
+    # noise the leading-letter rule was really aimed at. Keep the identifiers,
+    # drop the rest: 412 / 90210 / 2024 stay, 1719429301234 does not.
+    if len(t) > 9 and t.isdigit():
         return False
     return True
 
@@ -495,6 +519,31 @@ def _tokenize(text: str) -> List[str]:
         tl = t.lower()                 # lower once, not twice per token
         if _is_useful_token(tl):
             out.append(tl)
+    return out
+
+
+_PATH_TOKEN_DEPTH = 3   # the file + its 2 nearest parent folders
+
+
+def _path_tokens(rec: Dict[str, Any]) -> Set[str]:
+    """Tokens from a record's own folder(s), which is where its identity is.
+
+    Computed at SEARCH time from the stored path, deliberately: it needs no
+    reindex, so an existing on-disk index gains folder-aware search the moment
+    this ships rather than after a full rebuild the user has to know to run.
+
+    Bounded to the nearest `_PATH_TOKEN_DEPTH` segments. The full absolute path
+    would give every record in the vault the same tokens for the drive letter,
+    the user's home folder and so on — and those would then match a query that
+    happened to mention them.
+    """
+    raw = str(rec.get("path", "") or "")
+    if not raw:
+        return set()
+    segs = raw.replace("\\", "/").rstrip("/").split("/")
+    out: Set[str] = set()
+    for seg in segs[-_PATH_TOKEN_DEPTH:]:
+        out.update(_tokenize(seg))
     return out
 
 
@@ -2555,6 +2604,11 @@ the vocabulary list. Lowercase only. Single line only.
                 (rec.get("description", "") or ""),
                 " ".join(str(t) for t in rec.get("topics", []) or []),
                 str(rec.get("name", "") or ""),
+                # The folder too — same reason as _tokens: for "job_412/job.json"
+                # the filename is the part that carries no information. Without
+                # this the boolean gate drops the record before scoring ever
+                # sees it, so the path tokens below would arrive too late.
+                " ".join(sorted(_path_tokens(rec))),
             ]
             for s in rec.get("sheets", []) or []:
                 parts.append(" ".join(str(h) for h in s.get("headers", []) or []))
@@ -2566,7 +2620,15 @@ the vocabulary list. Lowercase only. Single line only.
             keys = {str(k).lower() for k in (rec.get("keys", []) or [])}
             topics = {str(t).lower() for t in (rec.get("topics", []) or [])}
             name = set(_tokenize(rec.get("name", "")))
-            return kws | headers | keys | topics | name
+            # A record's IDENTITY usually lives in its FOLDER, not its
+            # filename. 600 job folders each holding a file called "job.json"
+            # are, by name alone, 600 identical records — the number that
+            # tells them apart is in the directory above. Only the file's own
+            # parent folders are used (last few segments), never the whole
+            # absolute path, or every record in the vault would share
+            # "users", "documents", the drive letter and so on, and those
+            # would match queries that mention them.
+            return kws | headers | keys | topics | name | _path_tokens(rec)
 
         # Boolean gating
         survivors: List[Tuple[str, Dict[str, Any], str, set]] = []

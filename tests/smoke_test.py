@@ -4237,6 +4237,93 @@ def test_dependency_check_sees_the_chart_libs() -> None:
            all(f.install for f in dc.OPTIONAL_FEATURES))
 
 
+def test_vault_index_can_find_a_numbered_job() -> None:
+    """"job 412" must find job 412 — the app's single most common question.
+
+    The user reported that with ~600 job folders "only the first 400ish seem to
+    actually be searched" and "the model gets way worse about files numerically
+    higher". The truth was starker. Two causes, both measured:
+
+      • _TOKEN_RE required a LEADING LETTER ([A-Za-z][A-Za-z0-9]*), so every
+        number was discarded: "job_100" -> ['job'], "Job 317" -> ['job'],
+        "412" -> []. No job number was searchable at all.
+      • _tokens()/_haystack() read only rec["name"] — and 600 folders each
+        holding a file called "job.json" have 600 identical names. The number
+        that distinguishes them lives in the FOLDER.
+
+    Together those made all 600 records token-identical, so "job_412" matched
+    all 600 equally, the tie broke on index order, and every query returned the
+    same few lowest-numbered files. The low-numbered ones were never found on
+    merit — they were just first in line, which is exactly what "worse on
+    higher numbers" looks like from outside.
+    """
+    try:
+        import vault_index as vi
+    except Exception as exc:  # pragma: no cover
+        _check(f"vault_index importable ({exc!r})", False)
+        return
+    import json
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    _check("a bare number survives tokenizing", vi._tokenize("412") == ["412"])
+    _check("an underscored id keeps its number",
+           vi._tokenize("job_100") == ["job", "100"], str(vi._tokenize("job_100")))
+    _check("a spaced id keeps its number",
+           vi._tokenize("Job 317") == ["job", "317"], str(vi._tokenize("Job 317")))
+    _check("a part number survives",
+           vi._tokenize("part_90210") == ["part", "90210"])
+    _check("an epoch-millis timestamp is still treated as noise",
+           vi._tokenize("1719429301234") == [], str(vi._tokenize("1719429301234")))
+    _check("a long hex hash is still treated as noise",
+           vi._tokenize("deadbeefcafe1234") == [])
+
+    scratch = Path(tempfile.mkdtemp(prefix="smoke_jobs_"))
+    try:
+        root = scratch / "data_in"
+        root.mkdir(parents=True)
+        n = 60
+        for i in range(1, n + 1):
+            d = root / ("job_%03d" % i)
+            d.mkdir()
+            # Every file has the SAME name and the SAME keys — the folder is
+            # the only thing that tells them apart, exactly as the user's is.
+            (d / "job.json").write_text(json.dumps({
+                "job_id": "job_%03d" % i, "material": "IN718",
+                "Point of Contact": "Bob Smith",
+            }), encoding="utf-8")
+
+        idx = vi.VaultIndex(scratch)
+        idx.rebuild()
+        _check("every job folder is indexed", len(idx.records) == n,
+               f"records={len(idx.records)} expected={n}")
+
+        # The real test: a HIGH-numbered job must win its own query, not lose
+        # to whatever happens to sit first in the index.
+        bad = []
+        for probe in (1, 7, 30, 44, 59, 60):
+            q = "job_%03d" % probe
+            hits, _f = idx.search(q, k=5)
+            names = [Path(r.get("path", "")).parent.name for _s, r in hits]
+            if not names or names[0] != q:
+                bad.append(f"{q}->{names[:3]}")
+        _check("every job number resolves to its OWN folder at rank 1, "
+               "high numbers included", not bad, "; ".join(bad))
+
+        # And the failure signature itself: results must not be independent of
+        # the query. Two different job queries must not return the same #1.
+        h1, _ = idx.search("job_007", k=3)
+        h2, _ = idx.search("job_059", k=3)
+        top1 = Path(h1[0][1].get("path", "")).parent.name if h1 else None
+        top2 = Path(h2[0][1].get("path", "")).parent.name if h2 else None
+        _check("different job queries return different files "
+               "(the old index returned the same set for every query)",
+               top1 != top2, f"both returned {top1}")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def test_vault_search_reads_every_file() -> None:
     """"Search all files" must read all files — and count only what it read.
 
@@ -7698,6 +7785,8 @@ def main() -> int:
          test_sqlite_readonly_uri)
     _run("TF-IDF idf units (the vault's own terms are not dropped)",
          test_tfidf_idf_units)
+    _run("vault index can find a numbered job (job 412 -> job 412)",
+         test_vault_index_can_find_a_numbered_job)
     _run("vault search reads every file and counts only what it read",
          test_vault_search_reads_every_file)
     _run("no source file uses Python 3.12-only syntax (floor is 3.11)",
