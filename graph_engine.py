@@ -226,6 +226,21 @@ def _paired_xy(df, x_col, y_col, degree=1):
     return xv, yv
 
 
+def _selected_numeric(spec, num_df):
+    """``num_df`` narrowed to spec.columns when the user chose some.
+
+    Shared so the interactive and export paths cannot drift: the Plotly
+    heatmap/correlation honoured spec.columns and the matplotlib EXPORT of the
+    same chart did not, so picking 2 of 6 columns showed 2 on screen and
+    exported all 6 — a different chart, saved as though it were the one you
+    were looking at.
+    """
+    if not getattr(spec, "columns", None):
+        return num_df
+    cols = [c for c in spec.columns if c in num_df.columns]
+    return num_df[cols] if cols else num_df
+
+
 def _pca_matrix(spec, df):
     """(matrix, kept_index, note) for PCA — selected columns, THEN dropna.
 
@@ -456,9 +471,9 @@ class PlotlyRenderer:
                          aspect="auto")
 
     def _correlation(self, spec, df):
-        num_df = df.select_dtypes(include="number")
-        if spec.columns:
-            num_df = num_df[[c for c in spec.columns if c in num_df.columns]]
+        # Same helper as the matplotlib export, so the two cannot drift apart
+        # again — they already had, and the export drew the wrong chart.
+        num_df = _selected_numeric(spec, df.select_dtypes(include="number"))
         corr = num_df.corr()
         fig  = px.imshow(corr, color_continuous_scale="RdBu_r",
                          zmin=-1, zmax=1, text_auto=".2f",
@@ -862,6 +877,12 @@ class MatplotlibRenderer:
             return fig
 
         if t == "heatmap":
+            # Honour the user's column selection, exactly as the Plotly twin
+            # does. This branch used every numeric column in the frame, so the
+            # PNG you exported was a different chart from the one on screen:
+            # pick 2 of 6 columns, see 2 interactively, export 6. The same
+            # feature implemented twice, and the copies disagreed.
+            num = _selected_numeric(spec, num)
             fig, ax = plt.subplots(figsize=(10, 8))
             data_m = num.values
             im = ax.imshow(data_m, cmap=spec.color_scheme, aspect="auto")
@@ -872,7 +893,7 @@ class MatplotlibRenderer:
             return fig
 
         if t == "correlation":
-            corr  = num.corr()
+            corr  = _selected_numeric(spec, num).corr()
             fig, ax = plt.subplots(figsize=(max(6, len(corr) * 0.8),
                                             max(6, len(corr) * 0.8)))
             im = ax.imshow(corr.values, cmap="RdBu_r", vmin=-1, vmax=1)

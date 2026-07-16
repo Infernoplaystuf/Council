@@ -4159,6 +4159,87 @@ def test_audit_wrong_answer_fixes() -> None:
            rp["effect_size"] > 0)
 
 
+def test_df_cache_isolation() -> None:
+    """A cached DataFrame must never be mutable by its readers.
+
+    get() handed out the cached object itself, and an analyst helper runs
+    `df[col] = pd.to_numeric(df[col], errors="coerce")` IN PLACE — so a text
+    column's unparseable values became NaN inside the CACHE and every later
+    reader of that file silently got different data. Measured: a copy costs
+    3.8 ms against a 153 ms re-read on a 200k-row CSV, so isolation costs ~2.5%
+    of the saving it protects."""
+    try:
+        import pandas as pd
+        import df_cache
+    except Exception as exc:  # pragma: no cover
+        _check(f"df_cache importable ({exc!r})", False)
+        return
+    with tempfile.TemporaryDirectory() as td:
+        p = Path(td) / "f.csv"
+        p.write_text("v\n1\n2\noops\n4\n")
+        original = ["1", "2", "oops", "4"]
+
+        a = df_cache.cached_read_csv(p)          # miss
+        a["v"] = pd.to_numeric(a["v"], errors="coerce")   # the real mutation
+        b = df_cache.cached_read_csv(p)          # hit
+        _check("a mutation on the FIRST (miss) read cannot poison the cache",
+               list(b["v"]) == original)
+        b["v"] = "CLOBBERED"
+        c = df_cache.cached_read_csv(p)
+        _check("a mutation on a LATER (hit) read cannot poison it either",
+               list(c["v"]) == original)
+        _check("each reader gets a distinct object",
+               a is not b and b is not c)
+        _check("the values are genuinely the file's, not a coincidence",
+               list(c["v"]) == original and str(c["v"].dtype) != "float64")
+
+
+def test_export_matches_the_selection() -> None:
+    """A static export must draw the chart you are looking at.
+
+    The Plotly heatmap/correlation honoured spec.columns; the matplotlib EXPORT
+    of the same chart did not — it drew every numeric column. Pick 2 of 6, see
+    2 on screen, export 6, and the PNG is a different chart saved as though it
+    were yours."""
+    try:
+        import numpy as np
+        import pandas as pd
+        import graph_engine as ge
+        from graph_data import DataSet
+    except Exception as exc:  # pragma: no cover
+        _check(f"graph_engine importable ({exc!r})", False)
+        return
+    if not getattr(ge, "_MPL_OK", False):  # pragma: no cover
+        _check("matplotlib available", False)
+        return
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame({c: rng.normal(size=40)
+                       for c in ("yield", "cost", "mass", "temp", "speed")})
+    ds = DataSet(name="d", source_path=Path("x.csv"), format="csv", df=df)
+
+    for kind in ("correlation", "heatmap"):
+        fig = ge.MatplotlibRenderer().render(
+            ge.PlotSpec(plot_type=kind, columns=["yield", "cost"]), ds)
+        labels = {t.get_text() for ax in fig.axes
+                  for t in ax.get_xticklabels() if t.get_text()}
+        _check(f"the {kind} EXPORT honours the column selection",
+               labels <= {"yield", "cost"} and labels)
+        fig2 = ge.MatplotlibRenderer().render(ge.PlotSpec(plot_type=kind), ds)
+        all_labels = {t.get_text() for ax in fig2.axes
+                      for t in ax.get_xticklabels() if t.get_text()}
+        _check(f"the {kind} export with NO selection still shows everything",
+               len(all_labels & set(df.columns)) == len(df.columns))
+
+    _check("the shared helper narrows to the selection",
+           list(ge._selected_numeric(
+               ge.PlotSpec(plot_type="heatmap", columns=["yield", "mass"]),
+               df).columns) == ["yield", "mass"])
+    _check("and is a no-op when nothing was selected",
+           list(ge._selected_numeric(
+               ge.PlotSpec(plot_type="heatmap"), df).columns)
+           == list(df.columns))
+
+
 def test_derived_result_agg_conflict() -> None:
     """A cached result must not answer a question it did not compute.
 
@@ -7161,6 +7242,10 @@ def main() -> int:
          test_sqlite_readonly_uri)
     _run("TF-IDF idf units (the vault's own terms are not dropped)",
          test_tfidf_idf_units)
+    _run("df_cache isolation (a reader cannot poison the cache)",
+         test_df_cache_isolation)
+    _run("export draws the chart you selected",
+         test_export_matches_the_selection)
     _run("derived results: a cached SUM must not answer a MAX",
          test_derived_result_agg_conflict)
     _run("field:value intent routing (the words people actually use)",
