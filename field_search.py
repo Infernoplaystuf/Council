@@ -668,6 +668,128 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
     return out
 
 
+def field_value_counts(root: Any, field: str, *,
+                       max_files: Optional[int] = None,
+                       text_max_chars: int = 5_000_000,
+                       on_progress: Optional[Callable[[int, int],
+                                                      None]] = None,
+                       stats: Optional[dict] = None
+                       ) -> List[Tuple[str, int]]:
+    """Every DISTINCT value of ``field`` across the vault, with a file count.
+
+    Answers "what are all the names, and how often does each appear, for the
+    point of contact" — the DISTRIBUTION of a field, not the files matching one
+    value. Returns ``[(value, n_files)]`` sorted by count descending, then
+    value. Counts FILES, not occurrences: a value listed five times in one file
+    counts once for that file, because "how often it appears" across files is
+    the question people mean.
+
+    Same coverage discipline as find_files_with_field_value: no caps by
+    default, every readable file examined, and ``stats`` filled with the true
+    scanned/total/skipped so the caller can say how complete the tally is. A
+    partial tally is worse than useless if it looks complete — a name that
+    appears in unread files would read as rarer than it is.
+    """
+    root = Path(root)
+    fn = _norm(field)
+    if stats is not None:
+        stats.update({"scanned": 0, "total_files": 0, "distinct": 0,
+                      "files_with_field": 0, "truncated": False,
+                      "truncated_why": ""})
+    if not fn:
+        return []
+    try:
+        import conversation_logger as _cl
+    except Exception:
+        _cl = None
+    try:
+        files = [p for p in sorted(root.rglob("*"))
+                 if p.is_file() and not p.name.startswith(".")]
+    except Exception:
+        files = []
+    total_found = len(files)
+    if max_files is not None and total_found > max_files:
+        files = files[:max_files]
+        if stats is not None:
+            stats["truncated"] = True
+            stats["truncated_why"] = (
+                f"only the first {max_files} of {total_found} files were "
+                f"scanned (max_files)")
+    total = len(files)
+
+    # value (normalised for grouping) -> [display value, set of file indices].
+    # Files are grouped by the NORMALISED value so "Bob Smith" and "bob smith"
+    # are one person, but the first-seen surface form is what we show.
+    groups: Dict[str, List[Any]] = {}
+    read_count = 0
+    skipped: List[Tuple[str, str]] = []
+    partial: List[str] = []
+
+    for i, p in enumerate(files):
+        if on_progress is not None and i % 100 == 0:
+            try:
+                on_progress(i, total)
+            except Exception:
+                pass
+        if _cl is not None:
+            try:
+                if _cl.is_protected_path(p, root):
+                    continue
+            except Exception:
+                pass
+        suf = p.suffix.lower()
+        if not (suf in _TABULAR or suf in _TEXTUAL or suf in _EXTRACTABLE
+                or _looks_textual(p)):
+            skipped.append((p.name, f"unsupported file type "
+                                    f"({suf or 'no extension'})"))
+            continue
+        try:
+            vals = extract_field_value(p, field, max_values=1000)
+        except Exception as exc:
+            skipped.append((p.name, f"read failed: {exc.__class__.__name__}"))
+            continue
+        read_count += 1
+        if not vals:
+            continue
+        # Distinct values WITHIN this file, so one file contributes at most 1
+        # to each value's count regardless of repeats.
+        seen_here = set()
+        for raw in vals:
+            for one in (_split_values(raw) or [raw]):
+                one = str(one).strip()
+                key = _norm(one)
+                if not key or key in seen_here:
+                    continue
+                seen_here.add(key)
+                g = groups.get(key)
+                if g is None:
+                    groups[key] = [one, 1]
+                else:
+                    g[1] += 1
+
+    if on_progress is not None:
+        try:
+            on_progress(total, total)
+        except Exception:
+            pass
+
+    out = sorted(((disp, cnt) for disp, cnt in groups.values()),
+                 key=lambda t: (-t[1], t[0].lower()))
+    if stats is not None:
+        stats["scanned"] = read_count
+        stats["total_files"] = total_found
+        stats["distinct"] = len(out)
+        stats["files_with_field"] = sum(c for _v, c in out)
+        stats["skipped"] = len(skipped)
+        stats["skipped_detail"] = skipped[:50]
+        if skipped and not stats.get("truncated"):
+            stats["truncated"] = True
+            stats["truncated_why"] = (
+                f"{len(skipped)} of {total_found} file(s) could not be read "
+                f"(e.g. {skipped[0][0]} — {skipped[0][1]})")
+    return out
+
+
 # ============================================================
 # Intent: "which files have <value> as the <field>?"
 #
@@ -708,6 +830,37 @@ _TRIM_RE = re.compile(r"^[\s'\"`,:;.\-]+|[\s'\"`,:;.\-?!]+$")
 # "whole", "whoever", ... and refuses to route a legitimate search.
 _WHO_RE = re.compile(r"^\s*who\b", re.I)
 
+# An AGGREGATION question asks for the DISTRIBUTION of a field's values across
+# files — "all the names and how often they appear", "how many files per point
+# of contact", "distinct values of X" — NOT for the files where the field has
+# one specific value. The two share almost every word, so the field:value
+# parser happily forced an aggregation into a search, grabbing a stray word out
+# of the sentence as the "value": measured, "all names and how often they
+# appear ... for point of contact" parsed to value='searchable' and answered
+# "no files where 'point of contact' is 'searchable'". Detected here so the
+# field:value parser can decline and the caller can route to the counter.
+_AGG_INTENT_RE = re.compile(
+    r"\bhow\s+(?:often|many|frequently)\b"
+    r"|\b(?:value|name)\s+counts?\b"
+    r"|\bcount\s+(?:of|by|per)\b"
+    r"|\b(?:each|every|all|distinct|unique|different)\b[^.?!]*\b"
+    r"(?:appears?|appearing|occurs?|occurrence|frequency|how\s+many|count)\b"
+    r"|\b(?:distinct|unique|all\s+the|every|list\s+all|what\s+are\s+all)\b"
+    r"[^.?!]*\bvalues?\b"
+    r"|\bbreak\s*down\b|\bdistribution\s+of\b|\btally\b|\bhistogram\b",
+    re.I,
+)
+
+
+def looks_like_aggregation(text: str) -> bool:
+    """True when the text asks for a field's value DISTRIBUTION, not its files.
+
+    Kept deliberately narrow: it must see an explicit counting/enumeration
+    cue ("how often", "how many ... per", "distinct values", "value counts",
+    "breakdown of"). A plain "which files have X as the point of contact" has
+    none of these and is unaffected."""
+    return bool(_AGG_INTENT_RE.search(str(text or "")))
+
 
 def _clean_phrase(s: str) -> str:
     return _TRIM_RE.sub("", str(s or "")).strip()
@@ -738,6 +891,13 @@ def parse_field_value_intent(text: str, known_fields) -> Optional[Tuple[str, str
     # confidence, turning a good question into a false negative. A "who"
     # question wants a value out of a file; it is not this route's job.
     if _WHO_RE.match(t):
+        return None
+    # An aggregation ("all names and how often they appear for point of
+    # contact") is NOT a field:value search. Forced into one, it grabbed a
+    # stray sentence word as the value and answered "no files where 'point of
+    # contact' is 'searchable'". Decline here so the caller routes it to the
+    # counter instead.
+    if looks_like_aggregation(t):
         return None
     norm_t = _norm(t)
     if not norm_t:

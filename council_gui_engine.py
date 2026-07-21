@@ -7456,6 +7456,22 @@ class CouncilConsole(tk.Tk):
             self._same_field_response(m.group(1).strip().strip("'\"`"),
                                       m.group(2).strip().strip("'\"`"))
             return True
+        # "all the names and how often they appear for point of contact" asks
+        # for the DISTRIBUTION of a field, not the files for one value. Checked
+        # BEFORE the field:value regexes, which would otherwise grab a stray
+        # word ("searchable") as the value and answer "no files where 'point of
+        # contact' is 'searchable'". Only fires when a real field is named, so
+        # a generic "how many files" still falls through.
+        try:
+            import field_search as _fs_agg
+            _is_agg = _fs_agg.looks_like_aggregation(single_line)
+        except Exception:
+            _is_agg = False
+        if _is_agg:
+            _afld = self._field_from_text(single_line)
+            if _afld:
+                self._field_value_counts_response(_afld)
+                return True
         # Both regexes capture the field greedily, so an adjective the user
         # typed ("the LISTED point of contact") lands inside it. Resolve the
         # captured phrase against the vault's real field names first; if it
@@ -8023,6 +8039,89 @@ class CouncilConsole(tk.Tk):
                 if len(kn) > len(best_n):
                     best, best_n = k, kn
         return best
+
+    def _field_from_text(self, text: str):
+        """The longest known vault field NAMED anywhere in ``text``, or None.
+
+        Used by the aggregation route, where there is no "field is value"
+        grammar to anchor on — the field is just mentioned ("how often does
+        each point of contact appear"). Resolved against the vault's real field
+        vocabulary so an aggregation over a field the vault does not have does
+        not route (and cannot invent a distribution of nothing)."""
+        try:
+            import field_search as _fs
+        except Exception:
+            return None
+        known = self._known_field_names() or set()
+        tn = _fs._norm_key(text or "")
+        if not tn:
+            return None
+        best, best_n = None, ""
+        for k in known:
+            kn = _fs._norm_key(k)
+            if not kn:
+                continue
+            if _re.search(r"\b" + _re.escape(kn) + r"\b", tn) and len(kn) > len(best_n):
+                best, best_n = k, kn
+        return best
+
+    def _field_value_counts_response(self, field: str):
+        """'all the <field> values and how often each appears' across the
+        vault — a distribution, computed with no model. Reports coverage the
+        same way the field:value search does, because a tally over an
+        incompletely-read vault understates every value."""
+        import field_search as _fs
+        import data_index as _di
+        field = (field or "").strip().strip("'\"`")
+        if not field:
+            self._append_transcript(
+                "Writer", "Tell me which field to tally — e.g. 'how often does "
+                "each point of contact appear'.", "final")
+            self._set_status("● idle")
+            return
+        try:
+            root = _di.input_dir(VAULT_DIR)
+        except Exception:
+            root = VAULT_DIR / "data_in"
+        self._set_status("● counting values…", "#cba6f7")
+
+        def _worker():
+            def _prog(i, total):
+                if total:
+                    self.after(0, lambda i=i, t=total: self._set_status(
+                        f"● counting values… {i}/{t}", "#cba6f7"))
+            cov = {}
+            try:
+                counts = _fs.field_value_counts(
+                    root, field, on_progress=_prog, stats=cov)
+                err = None
+            except Exception as exc:
+                counts, err = [], repr(exc)
+
+            def _apply():
+                if err:
+                    self._append_transcript(
+                        "Writer", f"Value tally failed: {err}", "final")
+                    self._set_status("● idle")
+                    return
+                coverage = _fs.coverage_line(cov)
+                if not counts:
+                    self._append_transcript(
+                        "Writer",
+                        f"No values found for {field!r} in any file.\n"
+                        f"{coverage}", "final")
+                    self._set_status("● idle")
+                    return
+                total_vals = cov.get("files_with_field", 0)
+                header = (f"{len(counts)} distinct value(s) of {field!r}, "
+                          f"across {total_vals} file(s):\n{coverage}")
+                items = [f"  {cnt:>5} x  {val}" for val, cnt in counts]
+                self._emit_file_list(header, items, name=f"counts_{field}")
+                self._set_status("● idle")
+            self.after(0, _apply)
+
+        import threading as _th
+        _th.Thread(target=_worker, daemon=True).start()
 
     def _parse_field_value_fallback(self, line: str):
         """(field, value) for a field-search phrasing the regexes missed.

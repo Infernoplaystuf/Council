@@ -4237,6 +4237,96 @@ def test_dependency_check_sees_the_chart_libs() -> None:
            all(f.install for f in dc.OPTIONAL_FEATURES))
 
 
+def test_field_value_aggregation() -> None:
+    """"all the names and how often they appear for point of contact" must
+    count values, not be forced into a field:value search.
+
+    User-reported error: "no files where 'point of contact' is 'searchable'".
+    The field:value parser grabbed the word "searchable" out of the sentence
+    and searched for it as a name. The real defect: the question is an
+    AGGREGATION — the distribution of a field's values — and the field:value
+    parser had no way to decline it, so it invented a value from a stray word
+    and returned a confident false negative.
+    """
+    try:
+        import field_search as fs
+    except Exception as exc:  # pragma: no cover
+        _check(f"field_search importable ({exc!r})", False)
+        return
+    import json
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    known = {"point of contact", "poc", "owner"}
+
+    # The parser must DECLINE aggregation questions (so the caller can route
+    # them to the counter) ...
+    for q in ("all names and how often they appear across all searchable "
+              "files for point of contact",
+              "how many files does each point of contact appear in",
+              "what are all the values of point of contact",
+              "count of files by point of contact",
+              "distinct point of contact values",
+              "breakdown of point of contact"):
+        _check(f"aggregation declines field:value: {q[:44]!r}",
+               fs.parse_field_value_intent(q, known) is None)
+
+    # ... while a real field:value search still routes with the RIGHT value.
+    for q, wantval in (
+            ("which files have Bob Smith as the point of contact", "bob smith"),
+            ("search all files for Bob Smith as point of contact", "bob smith"),
+            ("files where point of contact is Alice Jones", "alice jones")):
+        got = fs.parse_field_value_intent(q, known)
+        _check(f"field:value still routes: {q[:40]!r}",
+               got is not None and got[1] == wantval, f"got {got!r}")
+
+    # The counter itself: correct distribution, files not occurrences.
+    scratch = Path(tempfile.mkdtemp(prefix="smoke_agg_"))
+    try:
+        root = scratch / "data_in"
+        root.mkdir(parents=True)
+        plan = ([("Bob Smith",)] * 4 + [("Bob Smith", "Bob Smith")]  # 5 w/ Bob
+                + [("Alice Jones",)] * 3 + [("Carol Lee",)] * 2)
+        for i, pocs in enumerate(plan):
+            d = root / f"job_{i:02d}"
+            d.mkdir()
+            rec = {"job_id": f"job_{i:02d}", "material": "IN718",
+                   "Point of Contact": list(pocs) if len(pocs) > 1 else pocs[0]}
+            (d / "job.json").write_text(json.dumps(rec), encoding="utf-8")
+        d = root / "job_none"
+        d.mkdir()
+        (d / "job.json").write_text('{"job_id":"x","material":"Ti64"}',
+                                    encoding="utf-8")
+
+        st = {}
+        counts = fs.field_value_counts(root, "point of contact", stats=st)
+        d = dict(counts)
+        _check("Bob Smith counted in 5 files (repeats in one file count once)",
+               d.get("Bob Smith") == 5, f"got {d.get('Bob Smith')}")
+        _check("Alice Jones counted in 3 files", d.get("Alice Jones") == 3)
+        _check("Carol Lee counted in 2 files", d.get("Carol Lee") == 2)
+        _check("ranked by count descending", counts[0][0] == "Bob Smith")
+        _check("only real distinct values (no phantom 4th)", len(counts) == 3)
+        _check("every readable file scanned, incl the one with no POC",
+               st["scanned"] == 11, f"scanned={st['scanned']}")
+        _check("files_with_field counts only files that had the field",
+               st["files_with_field"] == 10)
+        _check("full-coverage tally says so",
+               "Searched all" in fs.coverage_line(st), fs.coverage_line(st))
+
+        # A tally that skipped a file must not claim completeness — a value in
+        # an unread file would look rarer than it is.
+        (root / "blob.bin").write_bytes(bytes(range(256)) * 40)
+        st2 = {}
+        fs.field_value_counts(root, "point of contact", stats=st2)
+        _check("a skipped file makes the tally report partial",
+               st2.get("truncated") is True
+               and "PARTIAL" in fs.coverage_line(st2), fs.coverage_line(st2))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def test_an_adjective_does_not_break_a_field_search() -> None:
     """"the LISTED point of contact" must find what "the point of contact" does.
 
@@ -7861,6 +7951,8 @@ def main() -> int:
          test_sqlite_readonly_uri)
     _run("TF-IDF idf units (the vault's own terms are not dropped)",
          test_tfidf_idf_units)
+    _run("field-value aggregation ('how often does each X appear')",
+         test_field_value_aggregation)
     _run("an adjective does not break a field search ('listed point of contact')",
          test_an_adjective_does_not_break_a_field_search)
     _run("vault index can find a numbered job (job 412 -> job 412)",
