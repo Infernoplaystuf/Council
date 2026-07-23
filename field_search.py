@@ -250,6 +250,273 @@ def _is_typo_of(a: str, b: str) -> bool:
     return _edit1(a, b) or _transposed(a, b)
 
 
+# ============================================================
+# Field-NAME drift matching (SUGGESTION, never silent substitution)
+#
+# A field's LABEL drifts across files — "Point of Contact" becomes
+# "Router_Point_of_Contact" (prefix), "Point of Contact (Primary)" (suffix),
+# "pointOfContact", "POC". Given the user's requested field and the vault's
+# REAL harvested vocabulary, rank the labels that plausibly ARE the same field,
+# each with a confidence and a one-phrase reason a non-technical user can read.
+#
+# This is deliberately built for SUGGESTION, not silent substitution. Three
+# independent designs that tried to return the single right field silently were
+# each broken by adversarial review on the same axis: to admit an arbitrary
+# prefix like "Router_", any lexicon-free rule must accept any leading word,
+# which lets a MEANINGFUL prefix ("Bill of Materials", "Contract Number") slip
+# in as a confident wrong answer. There is no lexicon-free way to tell a
+# meaningless prefix from a meaningful one — that distinction IS a lexicon, and
+# a hardcoded word list is exactly the overfitting that failed before.
+#
+# So the human adjudicates. A wrong suggestion shown with its confidence and
+# reason is harmless; a wrong silent substitution is the false positive that
+# started this whole line of work. The scorer therefore favours RECALL (surface
+# the plausible candidates) while the confidence + "why" carry the honesty.
+#
+# NO domain word list anywhere below. Every constant is a threshold, a weight,
+# an English plural suffix (grammar, not vocabulary), or a regex over
+# orthography. IDF is learned from the vault's own labels at call time.
+_PLURAL_SUFFIXES = ("ies", "ses", "xes", "zes", "ches", "shes", "s")
+
+
+def _singularize(tok: str) -> str:
+    """Fold an English plural token to a singular STEM, algorithmically.
+
+    Not a word list — suffix stripping. 'contacts'->'contact',
+    'entries'->'entri' (stem; the same fold is applied to both sides so the
+    stems still compare equal). Short tokens are left alone so 'is'/'as' are
+    not mangled."""
+    if len(tok) <= 3:
+        return tok
+    for suf in _PLURAL_SUFFIXES:
+        if tok.endswith(suf) and len(tok) - len(suf) >= 2:
+            if suf == "ies":
+                return tok[:-3] + "i"
+            if suf in ("ses", "xes", "zes", "ches", "shes"):
+                return tok[:-2]
+            return tok[:-1]
+    return tok
+
+
+def _key_tokens(label: str) -> List[str]:
+    """A field label -> its normalised word tokens (camelCase already split)."""
+    return _norm_key(label).split()
+
+
+def _contiguous_index(hay: List[str], needle: List[str]) -> int:
+    """Index where ``needle`` occurs as a contiguous run in ``hay``, or -1."""
+    if not needle or len(needle) > len(hay):
+        return -1
+    for i in range(len(hay) - len(needle) + 1):
+        if hay[i:i + len(needle)] == needle:
+            return i
+    return -1
+
+
+def _idf_map(available) -> Dict[str, float]:
+    """Inverse document frequency of each token across the vault's labels.
+
+    Learned from the data, not hardcoded: a token in many labels ('name',
+    'id', 'number', 'date') is weak evidence; a rare one is strong. Used only
+    to gate the loosest tier so a shared COMMON token cannot, by itself,
+    suggest a match."""
+    import math
+    labels = [str(x) for x in (available or [])]
+    n = len(labels) or 1
+    df: Dict[str, int] = {}
+    for lab in labels:
+        for t in set(_key_tokens(lab)):
+            df[t] = df.get(t, 0) + 1
+    return {t: math.log((n + 1.0) / (c + 1.0)) + 1.0 for t, c in df.items()}
+
+
+def _structural_affixes(available) -> set:
+    """Tokens that RECUR as a prefix or suffix across the vault's labels.
+
+    This is the lexicon-free discriminator for the hardest case: a single-word
+    field ("material") sitting inside a longer label. Structure alone cannot
+    tell drift ("Router_Material") from a different field ("Material Cost") —
+    both add one word. But "Router_" recurs as the FIRST token of many labels
+    (a schema generation stamped it on everything), while "Cost" is a one-off
+    trailing word. So a first/last token seen on >=2 labels is treated as an
+    affix (a low-information wrapper), and an extra token that is NOT is treated
+    as substantive (it makes a different field). No word is named; the vault's
+    own positional frequencies decide."""
+    first: Dict[str, int] = {}
+    last: Dict[str, int] = {}
+    for raw in (available or []):
+        toks = _key_tokens(raw)
+        if len(toks) < 2:
+            continue
+        first[toks[0]] = first.get(toks[0], 0) + 1
+        last[toks[-1]] = last.get(toks[-1], 0) + 1
+    out = {t for t, c in first.items() if c >= 2}
+    out |= {t for t, c in last.items() if c >= 2}
+    return out
+
+
+def _affix_phrase(extra_before: int, extra_after: int) -> str:
+    if extra_before and extra_after:
+        return "same words with text around them"
+    if extra_before:
+        return "same words with a prefix"
+    return "same words with extra words after"
+
+
+def _acronym_of(tokens: List[str]) -> str:
+    return "".join(t[0] for t in tokens if t)
+
+
+def field_name_candidates(requested, available, *,
+                          min_confidence: float = 0.55,
+                          limit: int = 12) -> List[Dict[str, Any]]:
+    """Rank the vault's real field labels that plausibly ARE ``requested``.
+
+    ``requested`` — the field the user typed. ``available`` — the vault's real
+    harvested field vocabulary (JSON keys + table headers). Returns, DESCENDING
+    by confidence::
+
+        [{"label": <real label as it appears>, "confidence": 0.0-1.0,
+          "why": "<one phrase>"}]
+
+    Suggestion-grade: the caller SHOWS these and lets the user include them; it
+    must never silently substitute. Field-agnostic — it never needs to know
+    which field was asked for. See the module block above for why silent
+    matching is unsafe and this is not.
+    """
+    req_raw = str(requested or "").strip()
+    req = _key_tokens(req_raw)
+    if not req:
+        return []
+    req_norm = " ".join(req)
+    req_sing = [_singularize(t) for t in req]
+    idf = _idf_map(available)
+    affixes = _structural_affixes(available)
+
+    seen_norm = set()
+    out: List[Dict[str, Any]] = []
+    for raw in (available or []):
+        label = str(raw).strip()
+        lab = _key_tokens(label)
+        if not lab:
+            continue
+        lab_norm = " ".join(lab)
+        # De-dup labels that normalise identically (pointOfContact vs
+        # point_of_contact), keeping the first surface form.
+        if lab_norm in seen_norm:
+            continue
+
+        conf = 0.0
+        why = ""
+        lab_sing = [_singularize(t) for t in lab]
+
+        # IDF-weighted "how much of the LABEL does the request explain". Extra
+        # words in the label that are RARE (high IDF) are substantive — they
+        # make a DIFFERENT field ("Material Cost", "Bill of Materials"), so they
+        # tank the score. Extra words that are COMMON in the vault's own labels
+        # (low IDF) are affixes/noise ("Router_" repeated across a whole schema
+        # generation, "_1", generic qualifiers) and barely dent it. This is the
+        # lexicon-free way to tell a meaningful prefix from a meaningless one:
+        # the vault's own token frequencies decide, not a hardcoded word list.
+        # It also means precision scales with how consistently a drift repeats —
+        # a one-off oddball label is correctly low-confidence.
+        def _explains(req_toks, lab_toks):
+            req_idf = sum(idf.get(t, 3.0) for t in req_toks)
+            rem = list(req_toks)
+            extra = []
+            for t in lab_toks:
+                if t in rem:
+                    rem.remove(t)
+                else:
+                    extra.append(t)
+            # A structural affix (a wrapper the vault stamps on many labels)
+            # barely counts against the match; a substantive extra word — one
+            # that makes a different field — counts in full.
+            extra_idf = sum((0.12 if t in affixes else 1.0) * idf.get(t, 3.0)
+                            for t in extra)
+            if req_idf + extra_idf <= 0:
+                return 1.0
+            return req_idf / (req_idf + extra_idf)
+
+        if lab_norm == req_norm:
+            conf, why = 1.0, "exact match"
+        else:
+            idx = _contiguous_index(lab, req)
+            idx_s = _contiguous_index(lab_sing, req_sing)
+            if idx >= 0:
+                # Request appears intact; the rest of the label is affixes,
+                # scored by how substantive those affixes are.
+                ratio = _explains(req, lab)
+                conf = 0.55 + 0.42 * ratio
+                why = _affix_phrase(idx, len(lab) - idx - len(req))
+            elif lab_sing == req_sing:
+                conf, why = 0.95, "singular/plural of the same name"
+            elif idx_s >= 0:
+                ratio = _explains(req_sing, lab_sing)
+                conf = 0.52 + 0.40 * ratio
+                why = "singular/plural, " + _affix_phrase(
+                    idx_s, len(lab) - idx_s - len(req))
+            elif set(req).issubset(set(lab)):
+                # Reordered. Word order often flips meaning ("part number" vs
+                # "number of parts"), so this is a MAYBE, scaled by extra-word
+                # substance and never confident on its own.
+                conf = 0.45 + 0.20 * _explains(req, lab)
+                why = "same words, different order"
+            elif set(req_sing).issubset(set(lab_sing)):
+                conf = 0.42 + 0.18 * _explains(req_sing, lab_sing)
+                why = "same words (singular/plural), different order"
+            elif (len(lab) == 1 and len(req) > 1
+                  and lab_norm == _acronym_of(req)):
+                conf, why = 0.80, "acronym of " + req_raw
+            elif (len(req) == 1 and len(lab) > 1
+                  and req_norm == _acronym_of(lab)):
+                conf, why = 0.72, "the label these are the initials of"
+            else:
+                # Fuzzy, gated hard so a near-spelling of ONE token cannot
+                # match a different field. Require: an exactly-shared token to
+                # anchor (the sibling), AND every remaining request token to be
+                # a one-edit typo of a label token. "Contract Number" shares 0
+                # tokens with "point of contact", so it never engages — the
+                # contact/contract trap dies without naming either word.
+                shared = set(req) & set(lab)
+                if shared and len(req) == len(lab):
+                    used = list(lab)
+                    ok = True
+                    typo_used = False
+                    for rt in req:
+                        if rt in used:
+                            used.remove(rt)
+                            continue
+                        hit = next((lt for lt in used if _is_typo_of(rt, lt)),
+                                   None)
+                        if hit is None:
+                            ok = False
+                            break
+                        used.remove(hit)
+                        typo_used = True
+                    if ok and typo_used:
+                        conf, why = 0.62, "possible spelling variant"
+                if conf == 0.0:
+                    # Last resort, IDF-gated: enough of the request's RARE
+                    # tokens are present. A common shared token alone cannot
+                    # trip this, so "Contact Method" does not suggest for
+                    # "point of contact" on the strength of "contact".
+                    total = sum(idf.get(t, 1.0) for t in req)
+                    got = sum(idf.get(t, 1.0) for t in req if t in lab)
+                    frac = got / total if total else 0.0
+                    if frac >= 0.66 and len(set(req) & set(lab)) >= 1:
+                        conf = 0.5 + 0.1 * (frac - 0.66) / 0.34
+                        why = "shares its most distinctive words"
+
+        if conf >= min_confidence:
+            seen_norm.add(lab_norm)
+            out.append({"label": label, "confidence": round(conf, 3),
+                        "why": why})
+
+    out.sort(key=lambda d: (-d["confidence"], d["label"].lower()))
+    return out[:limit]
+
+
 def _match_detail(field_value, query, *, fuzzy: bool = True):
     """(matched, note) for ``query`` against one field value.
 

@@ -4237,6 +4237,103 @@ def test_dependency_check_sees_the_chart_libs() -> None:
            all(f.install for f in dc.OPTIONAL_FEATURES))
 
 
+def test_field_name_drift_candidates() -> None:
+    """Fuzzy field-NAME matching: rank real vault labels that ARE the requested
+    field, with confidence + a human reason. Suggestion-grade, field-agnostic,
+    NO domain word list.
+
+    This is the deliverable from a design workflow that killed three silent
+    matchers for the same reason: to admit an arbitrary prefix like 'Router_',
+    any lexicon-free rule must accept any leading word, letting a MEANINGFUL
+    prefix ('Bill of Materials') slip in as a confident wrong answer. The fix
+    is (a) never substitute silently — surface ranked suggestions the user
+    confirms — and (b) tell a meaningless prefix from a meaningful one using
+    the vault's OWN positional token frequencies ('Router_' recurs as a prefix;
+    'Cost' does not), never a hardcoded list.
+
+    Bar: real drift ranks >= 0.85 (pre-checked); a genuinely different field
+    NEVER reaches 0.85; the true field is always rank 1. Proven across 4
+    different fields so it cannot be tuned to one.
+    """
+    try:
+        import field_search as fs
+    except Exception as exc:  # pragma: no cover
+        _check(f"field_search importable ({exc!r})", False)
+        return
+
+    # A realistic vault vocabulary: a 'Router_' schema generation stamped a
+    # prefix across many fields (so it is a learnable affix), plus genuine
+    # other fields, plus the adversarial near-misses that broke silent designs.
+    vocab = [
+        "Point of Contact", "Router_Point_of_Contact", "pointOfContact",
+        "Point of Contact (Primary)", "POC", "Points of Contact",
+        "Operator", "Router_Operator", "Material", "Router_Material",
+        "Part Number", "Router_Part_Number", "PartNumber", "Supplier",
+        "Layer Thickness", "Build ID", "Work Order", "Inspector",
+        # adversarial different-fields
+        "Contract Number", "Contact Method", "Contact Email",
+        "Bill of Materials", "Material Cost", "Number of Parts", "Part Name",
+        "Parting Line", "Operation", "Operating Pressure",
+        "Point Cloud Density", "Dew Point", "Reorder Point", "Supply Chain",
+    ]
+    PRECHECK = 0.85
+
+    def by(req):
+        return {c["label"]: c["confidence"]
+                for c in fs.field_name_candidates(req, vocab, min_confidence=0.5)}
+
+    # 1. Real drift must surface and be pre-checkable (>= 0.85).
+    poc = by("point of contact")
+    for lbl in ("Router_Point_of_Contact", "Points of Contact"):
+        _check(f"drift surfaces and is confident: {lbl!r}",
+               poc.get(lbl, 0) >= PRECHECK, f"{lbl}={poc.get(lbl)}")
+    _check("acronym POC surfaces (as a lower-confidence maybe)",
+           0.5 <= poc.get("POC", 0) < PRECHECK)
+
+    # 2. The exact/true field is always rank 1, on every field.
+    for req in ("point of contact", "material", "part number", "operator",
+                "supplier"):
+        cands = fs.field_name_candidates(req, vocab, min_confidence=0.5)
+        _check(f"true field ranks #1 for {req!r}",
+               cands and fs._norm_key(cands[0]["label"]) == fs._norm_key(req),
+               f"top={cands[0]['label'] if cands else None}")
+
+    # 3. A genuinely DIFFERENT field must never reach the pre-check bar — this
+    #    is the false-positive class that started the whole line of work.
+    for req, wrong in (("point of contact", "Contract Number"),
+                       ("point of contact", "Contact Method"),
+                       ("point of contact", "Dew Point"),
+                       ("point of contact", "Reorder Point"),
+                       ("material", "Bill of Materials"),
+                       ("material", "Material Cost"),
+                       ("part number", "Number of Parts"),
+                       ("part number", "Part Name"),
+                       ("operator", "Operation"),
+                       ("supplier", "Supply Chain")):
+        _check(f"different field stays below pre-check: {req!r} vs {wrong!r}",
+               by(req).get(wrong, 0) < PRECHECK,
+               f"{wrong}={by(req).get(wrong)}")
+
+    # 4. The 'Router_' prefix is learned from the vault, so it boosts drift on
+    #    fields the matcher was never tuned for.
+    for req, drift in (("material", "Router_Material"),
+                       ("operator", "Router_Operator"),
+                       ("part number", "Router_Part_Number")):
+        _check(f"learned prefix lifts drift: {drift!r}",
+               by(req).get(drift, 0) >= PRECHECK, f"{drift}={by(req).get(drift)}")
+
+    # 5. No lexicon: the contact/contract trap dies without either word being
+    #    named — Contract Number shares zero tokens with 'point of contact'.
+    _check("contact/contract trap: Contract Number not even a candidate",
+           "Contract Number" not in by("point of contact"))
+
+    # 6. Empty/degenerate inputs are safe.
+    _check("empty request -> no candidates",
+           fs.field_name_candidates("", vocab) == [])
+    _check("empty vocabulary -> no candidates",
+           fs.field_name_candidates("point of contact", []) == [])
+
+
 def test_known_field_names_harvests_real_labels() -> None:
     """The vault's real field names must come from the index, not 7 constants.
 
@@ -8022,6 +8119,8 @@ def main() -> int:
          test_sqlite_readonly_uri)
     _run("TF-IDF idf units (the vault's own terms are not dropped)",
          test_tfidf_idf_units)
+    _run("field-name drift candidates (ranked, lexicon-free, field-agnostic)",
+         test_field_name_drift_candidates)
     _run("known field names harvest real vault labels (not 7 constants)",
          test_known_field_names_harvests_real_labels)
     _run("field-value aggregation ('how often does each X appear')",
