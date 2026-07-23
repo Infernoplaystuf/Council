@@ -449,8 +449,37 @@ def extract_code(text: str) -> str:
     return s
 
 
+def _fit_candidates_to_ctx(query: str, candidates: List[dict],
+                           n_ctx: Optional[int], *,
+                           num_predict: int = 900) -> List[dict]:
+    """Drop the lowest-ranked filters until the prompt fits the model's window.
+
+    The generation prompt lists every retrieved filter with its full signature
+    and had NO context awareness — it always dumped k filters. That is why the
+    Dream3D generator overflowed a small n_ctx while the Council tab (which
+    budgets its injected context) did not: same model, same window, but only
+    one side sized its prompt to it. On overflow the clamp head/tail-trims the
+    biggest message, cutting filters out of the MIDDLE of the list — so the
+    model is told to "use only these filters" from a list that was silently
+    mangled.
+
+    A no-op when n_ctx is ample (the common case). Never returns empty — the
+    single most relevant filter is always kept, because a shorter shortlist is
+    recoverable but an empty one is not. Conservative on chars-per-token (3.2,
+    not the clamp's optimistic 4.0) because filter text is dense with
+    identifiers and punctuation, which tokenizes finer than prose."""
+    if not n_ctx or n_ctx <= 0 or len(candidates) <= 1:
+        return candidates
+    budget_chars = int(max(256, n_ctx - num_predict - 256) * 3.2)
+    cur = list(candidates)
+    while len(cur) > 1 and len(build_script_prompt(query, cur)) > budget_chars:
+        cur = cur[:-1]          # retrieve() ranked best-first, so drop the tail
+    return cur
+
+
 def write_script(query: str, catalog: dict, model_fn: Callable[[str], str], *,
-                 k: int = 12, max_attempts: int = 3) -> Dict[str, Any]:
+                 k: int = 12, max_attempts: int = 3,
+                 n_ctx: Optional[int] = None) -> Dict[str, Any]:
     """A task in English -> a runnable simplnx Python pipeline script.
 
     THE deliverable. The model writes real Python: filters as execute() lines
@@ -475,6 +504,9 @@ def write_script(query: str, catalog: dict, model_fn: Callable[[str], str], *,
         return {"ok": False, "code": None, "attempts": 0, "candidates": [],
                 "errors": ["No filter in the installed package matches that "
                            "request."]}
+    # Size the shortlist to the model's window so the prompt is never silently
+    # trimmed mid-list. No-op when n_ctx is ample or unknown.
+    candidates = _fit_candidates_to_ctx(query, candidates, n_ctx)
     prompt = build_script_prompt(query, candidates)
     errors: List[str] = []
     code = ""

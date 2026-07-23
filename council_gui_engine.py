@@ -10818,7 +10818,11 @@ class CouncilConsole(tk.Tk):
                         temperature=0.2, num_predict=900, timeout=180)
 
                 cat = self._nx_catalog()
-                res = _ng.write_script(task, cat, _model_call)
+                try:
+                    _nx_n_ctx = int(_ce.get_n_ctx())
+                except Exception:
+                    _nx_n_ctx = None
+                res = _ng.write_script(task, cat, _model_call, n_ctx=_nx_n_ctx)
                 code = res.get("code") or ""
                 stem = _re.sub(r"[^a-z0-9]+", "_", task.lower())[:40] or "pipeline"
                 out = self.data_index.safe_write_path(

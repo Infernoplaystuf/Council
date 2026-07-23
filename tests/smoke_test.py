@@ -3362,6 +3362,53 @@ def _json_dumps(o) -> str:
     return _j.dumps(o)
 
 
+def test_nx_prompt_fits_context() -> None:
+    """The Dream3D generation prompt must be sized to the model's window.
+
+    There is NO Dream3D-specific token limit — the generator calls the same
+    local_chat as every other model call, sharing the one GGUF's n_ctx. The
+    difference the user saw ("4096 hits Dream3D but not the Council tab") is
+    that the Council tab budgets its injected context to n_ctx while the
+    generator dumped all k retrieved filters regardless. On a small window the
+    clamp then head/tail-trims the prompt, cutting filters out of the MIDDLE of
+    a list the model is told is exhaustive. _fit_candidates_to_ctx sizes the
+    shortlist to the window: a no-op when n_ctx is ample, a graceful shrink
+    (top-ranked kept, never empty) when it is tight.
+    """
+    try:
+        import nx_generate as gen
+    except Exception as exc:  # pragma: no cover
+        _check(f"nx_generate importable ({exc!r})", False)
+        return
+
+    def mk(i, nparams):
+        return {"human_name": f"Filter With A Fairly Long Name Number {i}",
+                "uuid": "01234567-89ab-cdef-0123-456789abcdef",
+                "alias": "nx", "py_attr": f"SomeFilter{i}Filter",
+                "execute": {"params": [
+                    {"name": f"input_data_array_path_{j}", "type": "DataPath",
+                     "required": j % 2 == 0,
+                     "default": None if j % 2 == 0 else "[]"}
+                    for j in range(nparams)]}}
+    cands = [mk(i, 12) for i in range(12)]     # heavy: 12 filters x 12 params
+    q = "read every dream3d, threshold it, and write an stl"
+
+    _check("ample n_ctx keeps the whole shortlist (no-op)",
+           len(gen._fit_candidates_to_ctx(q, cands, 32768)) == 12)
+    _check("unknown n_ctx is a no-op",
+           len(gen._fit_candidates_to_ctx(q, cands, None)) == 12)
+
+    small = gen._fit_candidates_to_ctx(q, cands, 4096)
+    budget = int(max(256, 4096 - 900 - 256) * 3.2)
+    _check("a tight window drops filters to fit", len(small) < 12)
+    _check("the shrunk prompt is within the char budget",
+           len(gen.build_script_prompt(q, small)) <= budget)
+    _check("the TOP-ranked filters are kept (tail dropped, not the middle)",
+           small == cands[:len(small)])
+    _check("even a tiny window keeps at least one filter",
+           len(gen._fit_candidates_to_ctx(q, cands, 2048)) >= 1)
+
+
 def test_nx_generate() -> None:
     """Natural language -> a validated DREAM3D-NX pipeline.
 
@@ -8449,6 +8496,8 @@ def main() -> int:
          test_nx_transpile)
     _run("nx generate (retrieval, constrained JSON, validate, repair)",
          test_nx_generate)
+    _run("nx generation prompt is sized to the model's context window",
+         test_nx_prompt_fits_context)
     _run("SECURITY: nx capability policy (a real uuid is not a sanctioned uuid)",
          test_nx_capability_policy)
     _run("SECURITY: nx script gate (model writes python; execution is gated)",
