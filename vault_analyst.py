@@ -2706,10 +2706,26 @@ def _apply_agg(s: "pd.Series", agg: str):
     return _stat_num(fn()) if fn is not None else None
 
 
+_MC_CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def _mc_norm(s: Any) -> str:
+    """Format-agnostic normalisation of a column/field name: split camelCase,
+    then collapse every run of non-alphanumerics to one space and lower-case.
+
+    So 'Point of Contact', 'point_of_contact', 'pointOfContact', 'PointOfContact'
+    and 'POINT-OF-CONTACT' all become 'point of contact' and compare equal."""
+    s = _MC_CAMEL_RE.sub(" ", str(s or ""))
+    return re.sub(r"[^a-z0-9]+", " ", s.lower()).strip()
+
+
 def match_column_name(columns: Any, wanted: str) -> Optional[str]:
-    """Resolve `wanted` to a real column: case-insensitive exact match first,
-    then a unique case-insensitive substring, else a whole-token substring
-    match. Returns the actual column name or None."""
+    """Resolve `wanted` to a real column. Case-insensitive exact match first,
+    then exact match after FORMAT normalisation (so 'point of contact' resolves
+    a 'point_of_contact' / 'pointOfContact' / 'POINT-OF-CONTACT' column — the
+    same field written in a different style), then a unique case-insensitive
+    substring, else a whole-token substring match. Returns the actual column
+    name or None."""
     import re as _re
     if not wanted:
         return None
@@ -2718,6 +2734,17 @@ def match_column_name(columns: Any, wanted: str) -> Optional[str]:
     for c in cols:
         if c.lower() == w:
             return c
+    # Exact after format normalisation — a column that IS the field, only
+    # written camelCase / snake_case / kebab-case. This ran on space-separated
+    # names only, so a JSON-style 'pointOfContact' header or a 'point_of_contact'
+    # column silently did not match 'point of contact'. Placed before the
+    # substring tiers so an exact style-variant always wins over a loose
+    # substring hit.
+    wn = _mc_norm(wanted)
+    if wn:
+        norm_exact = [c for c in cols if _mc_norm(c) == wn]
+        if norm_exact:
+            return norm_exact[0]
     subs = [c for c in cols if w in c.lower()]
     if len(subs) == 1:
         return subs[0]

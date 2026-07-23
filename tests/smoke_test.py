@@ -4405,6 +4405,67 @@ def test_known_field_names_harvests_real_labels() -> None:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def test_column_name_matches_all_formats() -> None:
+    """A field must resolve to a column written in ANY style.
+
+    match_column_name did case-insensitive exact + substring, so "point of
+    contact" resolved a "Point of Contact" column but NOT "point_of_contact",
+    "pointOfContact", "POINT-OF-CONTACT" or "PointOfContact" — the same field
+    in a different style silently missed. On a tabular vault that meant a real
+    column went unsearched. A format-normalising exact tier now matches all of
+    them, ranked before the substring tiers so a style variant always wins over
+    a loose substring hit.
+    """
+    try:
+        import vault_analyst as va
+    except Exception as exc:  # pragma: no cover
+        _check(f"vault_analyst importable ({exc!r})", False)
+        return
+
+    for header in ("Point of Contact", "pointOfContact", "point_of_contact",
+                   "POINT-OF-CONTACT", "PointOfContact", "Point_Of_Contact",
+                   "point of contact"):
+        _check(f"'point of contact' resolves the {header!r} column",
+               va.match_column_name(["job_id", header], "point of contact")
+               == header)
+
+    # A format-exact variant must beat a longer substring distractor.
+    _check("format-exact wins over a substring column",
+           va.match_column_name(["Point of Contact Notes", "point_of_contact"],
+                                "point of contact") == "point_of_contact")
+    # An unrelated column must never match.
+    _check("unrelated column does not match",
+           va.match_column_name(["job_id", "material"],
+                                "point of contact") is None)
+    # The existing unique-substring behaviour is preserved.
+    _check("unique substring still resolves ('temp' -> 'temp_C')",
+           va.match_column_name(["job_id", "temp_C"], "temp") == "temp_C")
+    # And it drives the real cross-file search on a CSV vault.
+    try:
+        import field_search as fs
+        import json  # noqa: F401
+        import shutil
+        import tempfile
+        from pathlib import Path
+        scratch = Path(tempfile.mkdtemp(prefix="smoke_colfmt_"))
+        try:
+            root = scratch / "data_in"
+            root.mkdir(parents=True)
+            for i, header in enumerate(("Point of Contact", "pointOfContact",
+                                        "point_of_contact", "POINT-OF-CONTACT")):
+                d = root / f"job_{i}"
+                d.mkdir()
+                (d / "rec.csv").write_text(f"job_id,{header}\nA,Bob Smith\n",
+                                           encoding="utf-8")
+            counts = dict(fs.field_value_counts(root, "point of contact"))
+            _check("CSV vault: every column-name style is tallied together",
+                   counts.get("Bob Smith") == 4, f"counts={counts}")
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+    except Exception as exc:  # pragma: no cover
+        _check(f"CSV format-variant search ran ({exc!r})", False)
+
+
 def test_field_value_aggregation() -> None:
     """"all the names and how often they appear for point of contact" must
     count values, not be forced into a field:value search.
@@ -8172,6 +8233,8 @@ def main() -> int:
          test_field_name_drift_candidates)
     _run("known field names harvest real vault labels (not 7 constants)",
          test_known_field_names_harvests_real_labels)
+    _run("column name matches all styles (camel/snake/kebab/spaced)",
+         test_column_name_matches_all_formats)
     _run("field-value aggregation ('how often does each X appear')",
          test_field_value_aggregation)
     _run("an adjective does not break a field search ('listed point of contact')",
