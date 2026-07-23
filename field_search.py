@@ -658,7 +658,13 @@ def extract_field_value(path: Any, field: str,
     name matches ``field``."""
     p = Path(path)
     suf = p.suffix.lower()
-    fn = _norm(field)
+    # _norm_key, NOT _norm: a FIELD NAME must normalise the way the in-file
+    # labels do (via _label_is -> _norm_key), which SPLITS camelCase. With
+    # _norm, a request for the harvested drift form 'pointOfContact' became
+    # 'pointofcontact' (one token) while the file's own key became
+    # 'point of contact' (three) — so it matched nothing and reported
+    # "no values found for pointOfContact" for a vault full of them.
+    fn = _norm_key(field)
     if not fn:
         return None
     if suf in _TABULAR:
@@ -774,7 +780,13 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
     reads are bounded. ``on_progress(scanned, total)`` fires ~every 100 files.
     """
     root = Path(root)
-    fn = _norm(field)
+    # _norm_key, NOT _norm: a FIELD NAME must normalise the way the in-file
+    # labels do (via _label_is -> _norm_key), which SPLITS camelCase. With
+    # _norm, a request for the harvested drift form 'pointOfContact' became
+    # 'pointofcontact' (one token) while the file's own key became
+    # 'point of contact' (three) — so it matched nothing and reported
+    # "no values found for pointOfContact" for a vault full of them.
+    fn = _norm_key(field)
     vn = str(value or "").strip().lower()
     if stats is not None:
         stats.update({"scanned": 0, "total_files": 0, "hits": 0,
@@ -958,7 +970,13 @@ def field_value_counts(root: Any, field: str, *,
     appears in unread files would read as rarer than it is.
     """
     root = Path(root)
-    fn = _norm(field)
+    # _norm_key, NOT _norm: a FIELD NAME must normalise the way the in-file
+    # labels do (via _label_is -> _norm_key), which SPLITS camelCase. With
+    # _norm, a request for the harvested drift form 'pointOfContact' became
+    # 'pointofcontact' (one token) while the file's own key became
+    # 'point of contact' (three) — so it matched nothing and reported
+    # "no values found for pointOfContact" for a vault full of them.
+    fn = _norm_key(field)
     if stats is not None:
         stats.update({"scanned": 0, "total_files": 0, "distinct": 0,
                       "files_with_field": 0, "truncated": False,

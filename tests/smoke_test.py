@@ -4470,6 +4470,34 @@ def test_field_value_aggregation() -> None:
                "list all files with Bob Smith as the point of contact", known)
             or (None, None))[1] == "bob smith")
 
+    # A camelCase FIELD NAME (the harvested drift form 'pointOfContact') must
+    # match the same files a spaced request does. It did not: the search
+    # normalised the field with _norm ('pointofcontact', one token) while the
+    # file's own key normalised with _norm_key ('point of contact', three), so
+    # it matched nothing and reported "no values found for pointOfContact" for
+    # a vault full of them. Both forms must now agree.
+    scratch0 = Path(tempfile.mkdtemp(prefix="smoke_camel_"))
+    try:
+        r0 = scratch0 / "data_in"
+        r0.mkdir(parents=True)
+        for i in range(6):
+            d = r0 / f"job_{i:02d}"
+            d.mkdir()
+            (d / "job.json").write_text(json.dumps({
+                "job_id": f"job_{i:02d}",
+                "pointOfContact": "Bob Smith" if i % 2 else "Alice Jones",
+            }), encoding="utf-8")
+        spaced = dict(fs.field_value_counts(r0, "point of contact"))
+        camel = dict(fs.field_value_counts(r0, "pointOfContact"))
+        _check("camelCase field name tallies the same as the spaced form",
+               camel == spaced and camel.get("Bob Smith") == 3, f"camel={camel}")
+        # and the field:value SEARCH path (same normalisation) agrees too
+        h = fs.find_files_with_field_value(r0, "pointOfContact", "Bob Smith")
+        _check("camelCase field name also works for the field:value search",
+               len(h) == 3, f"hits={len(h)}")
+    finally:
+        shutil.rmtree(scratch0, ignore_errors=True)
+
     # The counter itself: correct distribution, files not occurrences.
     scratch = Path(tempfile.mkdtemp(prefix="smoke_agg_"))
     try:
