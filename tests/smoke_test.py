@@ -4237,6 +4237,77 @@ def test_dependency_check_sees_the_chart_libs() -> None:
            all(f.install for f in dc.OPTIONAL_FEATURES))
 
 
+def test_known_field_names_harvests_real_labels() -> None:
+    """The vault's real field names must come from the index, not 7 constants.
+
+    For a JSON vault, _known_field_names() used to return ONLY 7 hardcoded
+    strings: data_index._profile_json handles only list-of-objects, so a
+    per-record nested-dict JSON is rejected and contributes nothing. Every
+    drift/aggregation route resolves against this set, so on a real JSON vault
+    they had almost no vocabulary to work with. vault_index already captured
+    every real key (incl. drifted "Router_Point_of_Contact" and nested keys)
+    and the method threw them away. It now harvests them — strictly additive,
+    no domain word list.
+    """
+    try:
+        import council_gui_engine as g
+        import vault_index as vi
+    except Exception as exc:  # pragma: no cover
+        _check(f"imports ({exc!r})", False)
+        return
+    import json
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    scratch = Path(tempfile.mkdtemp(prefix="smoke_harvest_"))
+    saved = g._VAULT_INDEX_INSTANCE
+    try:
+        root = scratch / "data_in"
+        root.mkdir(parents=True)
+        labels = ["Point of Contact", "Router_Point_of_Contact",
+                  "pointOfContact", "Point of Contact (Primary)", "POC"]
+        for i in range(15):
+            d = root / f"job_{i:03d}"
+            d.mkdir()
+            (d / "job.json").write_text(json.dumps({
+                "job_id": f"job_{i:03d}", "material": "IN718",
+                labels[i % len(labels)]: "Bob Smith",
+            }), encoding="utf-8")
+
+        idx = vi.VaultIndex(scratch)
+        idx.rebuild()
+        g._VAULT_INDEX_INSTANCE = idx
+
+        class _Fake(g.CouncilConsole):
+            def __init__(self):
+                pass
+            class _DI:
+                def all_profiles(self):
+                    return []
+            data_index = _DI()
+
+        con = _Fake()
+        known = {k.lower() for k in con._known_field_names()}
+        for lbl in labels:
+            _check(f"real vault label harvested: {lbl!r}",
+                   lbl.lower() in known)
+        # The generic prose fallbacks must still be present (empty-vault case).
+        _check("generic prose labels remain as a fallback",
+               "point of contact" in known and "poc" in known)
+        # And the payoff: the drift routes now have vocabulary on a JSON vault.
+        _check("drift resolver reaches a harvested drifted label",
+               (con._resolve_proposed_field("listed Router_Point_of_Contact")
+                or "").lower() == "router_point_of_contact")
+        _check("aggregation resolves a harvested drifted label",
+               (con._field_from_text(
+                   "how often does each Router_Point_of_Contact appear")
+                or "").lower() == "router_point_of_contact")
+    finally:
+        g._VAULT_INDEX_INSTANCE = saved
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def test_field_value_aggregation() -> None:
     """"all the names and how often they appear for point of contact" must
     count values, not be forced into a field:value search.
@@ -7951,6 +8022,8 @@ def main() -> int:
          test_sqlite_readonly_uri)
     _run("TF-IDF idf units (the vault's own terms are not dropped)",
          test_tfidf_idf_units)
+    _run("known field names harvest real vault labels (not 7 constants)",
+         test_known_field_names_harvests_real_labels)
     _run("field-value aggregation ('how often does each X appear')",
          test_field_value_aggregation)
     _run("an adjective does not break a field search ('listed point of contact')",

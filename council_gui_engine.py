@@ -7961,13 +7961,55 @@ class CouncilConsole(tk.Tk):
             return None
 
     def _known_field_names(self):
-        """The vault's real field vocabulary — its actual CSV column names.
+        """The vault's real field vocabulary — its actual field names.
 
         This is what makes a loose sentence parse safe to act on: a field the
         vault does not have never routes, so "which files mention the blorp of
-        bob" stays ordinary chat.
+        bob" stays ordinary chat. It is also the ground truth every drift and
+        aggregation route resolves against — so if this set is empty, none of
+        them can work.
+
+        For a long time this read ONLY data_index CSV column profiles plus 7
+        hardcoded strings. For a JSON vault — this app's actual data — it
+        therefore returned almost nothing: data_index._profile_json only
+        handles list-of-objects, so a per-record nested-dict JSON is rejected
+        outright and contributes ZERO field names. Meanwhile vault_index had
+        already captured every real key of that same file — including drifted
+        ones like "Router_Point_of_Contact" and nested keys — and this method
+        threw them away. That is why drift/aggregation looked broken on a real
+        vault: they had nothing to resolve against.
+
+        Now the real labels are harvested from the vault_index records the app
+        already builds and refreshes: JSON "keys" (incl. nested) and CSV/Excel
+        "headers". Strictly additive — it can only ADD labels the vault really
+        has, introduces no domain word list, and is a dict walk over records
+        already in RAM (measured ~2.4 ms for 600 files). The data_index path
+        and the 7 generic prose labels remain as a union, so nothing that used
+        to route stops routing and a brand-new empty vault still works.
         """
         names = set()
+        # 1. The real vocabulary, harvested from the index the app already has.
+        try:
+            idx = _get_vault_index()
+            if idx is not None:
+                for rec in idx.records.values():
+                    for k in (rec.get("keys") or []):
+                        s = str(k).strip()
+                        if 2 <= len(s) <= 60:
+                            names.add(s)
+                    for h in (rec.get("headers") or []):
+                        s = str(h).strip()
+                        if 2 <= len(s) <= 60:
+                            names.add(s)
+                    for sh in (rec.get("sheets") or []):
+                        for h in (sh.get("headers") or []):
+                            s = str(h).strip()
+                            if 2 <= len(s) <= 60:
+                                names.add(s)
+        except Exception:
+            pass
+        # 2. data_index CSV column profiles — kept so nothing that routed
+        #    before stops routing.
         try:
             for prof in self.data_index.all_profiles():
                 if getattr(prof, "error", ""):
@@ -7978,8 +8020,8 @@ class CouncilConsole(tk.Tk):
                         names.add(n)
         except Exception:
             pass
-        # Labels that live in prose rather than a column header, so a text-only
-        # vault still routes. Kept tiny and generic on purpose.
+        # 3. Generic prose labels, so a text-only or not-yet-indexed vault
+        #    still routes the common questions.
         names.update({"point of contact", "poc", "owner", "author",
                       "reviewer", "approver", "requester"})
         return names
