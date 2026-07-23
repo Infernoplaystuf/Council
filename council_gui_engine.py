@@ -6341,6 +6341,36 @@ class CouncilConsole(tk.Tk):
         r"(?:\s+(?:me|a))?\s+(?:new\s+)?pipelines?\s+(?:that\s+|to\s+|which\s+)?(.+?)\s*[.!?]?\s*$",
         _re.IGNORECASE,
     )
+    # Convert an EXISTING saved pipeline to Python. This MUST be deterministic
+    # (nx_transpile, no model) — routing it to the model injects the pipeline
+    # file plus the converter script as context and truncates both at the n_ctx
+    # fallback, so it "converts" nothing. Each pattern captures the pipeline
+    # name in group(1). Ordered/anchored so it does not swallow a "create
+    # pipeline that ..." request (which has no 'python'/'transpile' cue).
+    _PIPELINE_TO_PYTHON_RES = (
+        # "convert/turn/render <name> (in)to [a] python [script]"
+        _re.compile(
+            r"^\s*(?:convert|transpile|translate|turn|render|rewrite|export)\s+"
+            r"(?:the\s+|my\s+)?(?:pipeline\s+)?(.+?)\s+"
+            r"(?:in)?to\s+(?:a\s+|its\s+|the\s+)?python"
+            r"(?:\s+(?:script|code|equivalent|version|file))?\s*[.!?]?\s*$",
+            _re.IGNORECASE),
+        # "[the] python [script|equivalent|version] of/for <name>"
+        _re.compile(
+            r"^\s*(?:convert|make|give\s+me|write|get|show(?:\s+me)?)?\s*"
+            r"(?:the\s+)?python\s+"
+            r"(?:script|code|equivalent|version)?\s*(?:of|for)\s+"
+            r"(?:the\s+|my\s+|pipeline\s+)*(.+?)\s*[.!?]?\s*$",
+            _re.IGNORECASE),
+        # "transpile <name>" / "<name> to python"
+        _re.compile(
+            r"^\s*transpile\s+(?:the\s+|my\s+)?(?:pipeline\s+)?(.+?)\s*[.!?]?\s*$",
+            _re.IGNORECASE),
+        _re.compile(
+            r"^\s*(?:convert\s+)?(?:the\s+|my\s+)?(?:pipeline\s+)?(.+?)\s+"
+            r"(?:in)?to\s+(?:a\s+|its\s+)?python(?:\s+\w+)?\s*[.!?]?\s*$",
+            _re.IGNORECASE),
+    )
     _PIPELINE_EXPORT_RE = _re.compile(
         r"^\s*(?:export|save)\s+pipelines?\s+(.+?)\s+(?:as|to)\s+"
         r"(?:markdown|md|a\s+markdown\s+file)\s*[.!?]?\s*$",
@@ -6408,6 +6438,19 @@ class CouncilConsole(tk.Tk):
         if m:
             self._pipeline_graph_response(m.group(1).strip().strip("'\"`"))
             return True
+
+        # Convert an existing pipeline to Python — DETERMINISTIC, never the
+        # model. Checked before Create so "convert X to python" is not read as
+        # "create a pipeline". Skipped when the phrasing is really a CREATE
+        # ("... that outputs a python file") by requiring the match to name a
+        # pipeline that actually exists.
+        for _rx in self._PIPELINE_TO_PYTHON_RES:
+            _m = _rx.match(single_line)
+            if _m:
+                _pname = _m.group(1).strip().strip("'\"`.")
+                if _pname and self._pipeline_to_python_response(_pname):
+                    return True
+                break
 
         # Create (generation)
         m = self._PIPELINE_CREATE_RE.match(single_line)
@@ -6788,6 +6831,65 @@ class CouncilConsole(tk.Tk):
             rendered = _ps.render_pipeline(pl)
             self._append_transcript("Writer", rendered, "final")
         self._set_status("● idle")
+
+    def _pipeline_to_python_response(self, name: str) -> bool:
+        """Convert a saved .d3dpipeline to an editable Python script — with the
+        DETERMINISTIC transpiler (nx_transpile via nx_bridge), never the model.
+
+        This is the fix for "converting a pipeline to python truncates at the
+        4096 token fallback": there was no chat route for it, so a
+        natural-language request fell through to the model, which injected the
+        pipeline file (and the converter script) and clipped both. Transpiling
+        is pure UUID→Python string work — it has no token budget at all.
+
+        Returns True if the request named a real pipeline and was handled;
+        False if no such pipeline exists (so the caller keeps routing rather
+        than claiming a false match on a 'create ... python ...' request).
+        """
+        import pipeline_scanner as _ps
+        pl = _ps.find_pipeline_by_name(VAULT_DIR, name)
+        if not pl:
+            return False
+        src = Path(pl.path)
+        if src.suffix.lower() == ".py":
+            self._append_transcript(
+                "Writer", f"{pl.name} is already a Python script — open it "
+                "from vault/pipelines/in/. This converts a saved "
+                ".d3dpipeline into Python.", "final")
+            self._set_status("● idle")
+            return True
+        self._set_status("● transpiling…", "#cba6f7")
+
+        def _work():
+            try:
+                import nx_bridge as _nb
+                cat = self._nx_catalog()
+                res = _nb.transpile(src, catalog_cache=cat)
+                code = res.get("code") or ""
+                out = self.data_index.safe_write_path(
+                    f"{Path(pl.name).stem}.py", subfolder="dream3d")
+                out.write_text(code, encoding="utf-8")
+                notes = []
+                if res.get("unknown"):
+                    notes.append(f"{len(res['unknown'])} step(s) are not in the "
+                                 "installed package and were commented out "
+                                 "rather than guessed.")
+                notes.extend(res.get("warnings") or [])
+                head = f"# converted (deterministically, no model) → {out}\n"
+                for n in notes:
+                    head += f"# note: {n}\n"
+                msg, body = "● idle", head + "\n" + code
+            except Exception as exc:
+                msg = "● idle"
+                body = (f"Could not convert {pl.name} to Python.\n\n{exc}\n\n"
+                        "This path is deterministic (no model), so a failure "
+                        "here is the DREAM3D-NX catalog being unavailable — "
+                        "run 'Check env' in the Dream3D tab.")
+            self.after(0, lambda: (self._append_transcript("Writer", body, "final"),
+                                   self._set_status(msg)))
+
+        threading.Thread(target=_work, daemon=True).start()
+        return True
 
     def _pipeline_modify_response(self, name: str, change: str, full_request: str):
         import pipeline_scanner as _ps
@@ -10718,7 +10820,7 @@ class CouncilConsole(tk.Tk):
                 cat = self._nx_catalog()
                 res = _ng.write_script(task, cat, _model_call)
                 code = res.get("code") or ""
-                stem = re.sub(r"[^a-z0-9]+", "_", task.lower())[:40] or "pipeline"
+                stem = _re.sub(r"[^a-z0-9]+", "_", task.lower())[:40] or "pipeline"
                 out = self.data_index.safe_write_path(
                     f"task_{stem}.py", subfolder="dream3d")
                 if code:
@@ -13844,9 +13946,9 @@ class CouncilConsole(tk.Tk):
                         council_prompt,
                         extra_context="DATASET SUMMARY:\n" + ds.summary(),
                     )
-                    m = re.search(r"```json\s*(.*?)\s*```", response, re.DOTALL)
+                    m = _re.search(r"```json\s*(.*?)\s*```", response, _re.DOTALL)
                     if not m:
-                        m = re.search(r'\{[^{}]*"plot_type"[^{}]*\}', response, re.DOTALL)
+                        m = _re.search(r'\{[^{}]*"plot_type"[^{}]*\}', response, _re.DOTALL)
                     spec      = None
                     parse_err = ""
                     if m:

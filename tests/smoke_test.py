@@ -2948,6 +2948,85 @@ def test_nx_capability_policy() -> None:
         _check("an ordinary pipeline still runs", False)
 
 
+def test_no_bare_re_in_gui() -> None:
+    """council_gui_engine imports `re as _re`, so a bare `re.<attr>` is a
+    NameError waiting to fire at runtime.
+
+    Two shipped: `re.sub` in _nx_write_script (so "Write pipeline" crashed with
+    "re is undefined" AFTER the model had already generated the script) and two
+    `re.search` in the grapher's JSON parse. None are caught by import or
+    compile — the name only resolves when the line executes — so this scans the
+    AST for any `re.<attr>` where `re` is not a locally-imported alias.
+    """
+    import ast
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent / "council_gui_engine.py"
+    tree = ast.parse(src.read_text(encoding="utf-8"))
+    bad = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "re"):
+            bad.append(node.lineno)
+    _check("no bare `re.<attr>` in council_gui_engine (module imports re as _re)",
+           not bad, f"bare re. at lines: {sorted(set(bad))}")
+
+
+def test_dream3d_convert_to_python_routing() -> None:
+    """A natural-language "convert this pipeline to python" must route to the
+    DETERMINISTIC transpiler, never the model.
+
+    There was no chat intent for it, so the request fell through to the model,
+    which injected the pipeline file plus the converter script and truncated
+    both at the n_ctx fallback (4096) — "converting" nothing. Transpiling is
+    pure UUID→Python string work with no token budget, so it must not touch the
+    model.
+    """
+    try:
+        import council_gui_engine as cge
+    except Exception as exc:  # pragma: no cover
+        _check(f"council_gui_engine importable ({exc!r})", False)
+        return
+    C = cge.CouncilConsole
+
+    def name_of(text):
+        for rx in C._PIPELINE_TO_PYTHON_RES:
+            m = rx.match(text)
+            if m:
+                return m.group(1).strip()
+        return None
+
+    for text, want in (
+            ("convert job.d3dpipeline to python", "job.d3dpipeline"),
+            ("convert my pipeline segmentation to a python script", "segmentation"),
+            ("transpile stats_pipeline", "stats_pipeline"),
+            ("turn grain_analysis into python", "grain_analysis"),
+            ("the python equivalent of surface_mesh", "surface_mesh"),
+            ("python version of job_417", "job_417"),
+            ("segmentation to python", "segmentation")):
+        _check(f"convert phrasing captures the name: {text!r}",
+               name_of(text) == want, f"got {name_of(text)!r}")
+
+    # A real CREATE request has no python/transpile cue and must keep its own
+    # intent (not be eaten by the convert route).
+    _check("'create a pipeline that segments grains' is still a CREATE",
+           bool(C._PIPELINE_CREATE_RE.match("create a pipeline that segments grains")))
+    _check("'list pipelines' is still LIST",
+           bool(C._PIPELINE_LIST_RE.match("list pipelines")))
+
+    # The handler uses the deterministic transpiler and never the model:
+    # verified structurally by reading the method's source (it must call
+    # nx_bridge.transpile and must not call local_chat / self.writer).
+    import inspect
+    src = inspect.getsource(C._pipeline_to_python_response)
+    _check("handler calls the deterministic nx_bridge.transpile",
+           "nx_bridge" in src and ".transpile(" in src)
+    _check("handler does NOT invoke the model",
+           "local_chat" not in src and "self.writer" not in src
+           and "_model_call" not in src)
+
+
 def test_dream3d_tab_wiring() -> None:
     """The Dream3D tab reaches Part B.
 
@@ -8376,6 +8455,10 @@ def main() -> int:
          test_nx_script_gate)
     _run("nx hardening (comment injection, last-object, path checks)",
          test_nx_hardening)
+    _run("no bare re.<attr> in the GUI (module imports re as _re)",
+         test_no_bare_re_in_gui)
+    _run("Dream3D convert-to-python routes to the deterministic transpiler",
+         test_dream3d_convert_to_python_routing)
     _run("Dream3D tab wiring (Part B reachable from the app)",
          test_dream3d_tab_wiring)
     _run("plot roles (datetime/bool ordering, coercion, no mutation)",
