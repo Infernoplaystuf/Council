@@ -1114,6 +1114,19 @@ _AGG_INTENT_RE = re.compile(
     r"(?:appears?|appearing|occurs?|occurrence|frequency|how\s+many|count)\b"
     r"|\b(?:distinct|unique|all\s+the|every|list\s+all|what\s+are\s+all)\b"
     r"[^.?!]*\bvalues?\b"
+    # "...and the AMOUNT/NUMBER/COUNT of files they are associated with" — a
+    # per-value file count, phrased without the word "count". This is the shape
+    # a real user typed ("list all names ... and the amount of files they are
+    # associated with"), which fell through to the field:value parser and had
+    # "vault" grabbed as the value.
+    r"|\b(?:amount|number|count|#)\s+of\s+(?:files|records|documents|entries)\b"
+    r"|\bfiles?\s+(?:they|each|it)\s+(?:are|is)\s+associated\s+with\b"
+    # "list/show/give all NAMES/VALUES/PEOPLE ..." (distinct from "list all
+    # FILES", which is a file search). Asking for all the VALUES of a field is
+    # aggregation; the field_from_text guard still requires a real field.
+    r"|\b(?:list|show|give|get|display|name)\s+(?:me\s+)?(?:all|every|each|the)\s+"
+    r"(?:the\s+)?(?:names?|values?|people|persons?|contacts?|entries|"
+    r"distinct)\b"
     r"|\bbreak\s*down\b|\bdistribution\s+of\b|\btally\b|\bhistogram\b",
     re.I,
 )

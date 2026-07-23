@@ -4449,6 +4449,27 @@ def test_field_value_aggregation() -> None:
         _check(f"field:value still routes: {q[:40]!r}",
                got is not None and got[1] == wantval, f"got {got!r}")
 
+    # Phrasings that do NOT use an obvious counting cue but ARE aggregation —
+    # the file-count is asked for as "the amount/number of files ...", and the
+    # values as "list all names". A real user typed the first; before the fix
+    # it parsed to value='vault' and answered "no files where POC is 'vault'".
+    for q in ("Please list all names assigned as a point of contact in the "
+              "vault and the amount of files they are associated with",
+              "list all the point of contact names and the number of files each",
+              "give me every point of contact and the amount of files"):
+        _check(f"amount/number-of-files phrasing is aggregation: {q[:40]!r}",
+               fs.looks_like_aggregation(q))
+        _check(f"...and it does NOT misparse into a field:value search: {q[:30]!r}",
+               fs.parse_field_value_intent(q, known) is None)
+    # ...but "list all FILES with Bob as the point of contact" is a SEARCH.
+    _check("'list all files with <value>' stays a field:value search",
+           not fs.looks_like_aggregation(
+               "list all files with Bob Smith as the point of contact"))
+    _check("...and still routes with the right value",
+           (fs.parse_field_value_intent(
+               "list all files with Bob Smith as the point of contact", known)
+            or (None, None))[1] == "bob smith")
+
     # The counter itself: correct distribution, files not occurrences.
     scratch = Path(tempfile.mkdtemp(prefix="smoke_agg_"))
     try:
