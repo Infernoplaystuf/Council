@@ -8134,11 +8134,13 @@ class CouncilConsole(tk.Tk):
                         f"● counting values… {i}/{t}", "#cba6f7"))
             cov = {}
             try:
-                counts = _fs.field_value_counts(
+                # One walk yields the per-file rows; the tally is derived from
+                # them, so the CSV and the on-screen counts can never disagree.
+                rows = _fs.field_value_file_rows(
                     root, field, on_progress=_prog, stats=cov)
                 err = None
             except Exception as exc:
-                counts, err = [], repr(exc)
+                rows, err = [], repr(exc)
 
             def _apply():
                 if err:
@@ -8147,17 +8149,40 @@ class CouncilConsole(tk.Tk):
                     self._set_status("● idle")
                     return
                 coverage = _fs.coverage_line(cov)
-                if not counts:
+                if not rows:
                     self._append_transcript(
                         "Writer",
                         f"No values found for {field!r} in any file.\n"
                         f"{coverage}", "final")
                     self._set_status("● idle")
                     return
+
+                # Aggregate rows -> per-value FILE counts (a file with the same
+                # value twice is one row, so counting rows per value = files).
+                from collections import Counter as _Counter
+                by_val = _Counter(r["value"] for r in rows)
+                counts = sorted(by_val.items(),
+                                key=lambda t: (-t[1], t[0].lower()))
                 total_vals = cov.get("files_with_field", 0)
+
+                # The CSV the user asked for: a row per file, name + file, plus
+                # the absolute path for opening. The field name is the value
+                # column's header so the sheet is self-describing.
+                col_name = field.strip() or "value"
+                csv_rows = [{col_name: r["value"], "file": r["file"],
+                             "full_path": r["path"]} for r in rows]
+                csv_path = self._write_rows_csv(
+                    csv_rows, [col_name, "file", "full_path"],
+                    name=f"{field}_by_file")
+
                 header = (f"{len(counts)} distinct value(s) of {field!r}, "
                           f"across {total_vals} file(s):\n{coverage}")
                 items = [f"  {cnt:>5} x  {val}" for val, cnt in counts]
+                if csv_path:
+                    items.append("")
+                    items.append(f"\U0001F4C4 Per-file CSV ({len(rows)} row(s), "
+                                 f"columns: {col_name} / file / full_path) "
+                                 f"written to: {csv_path}")
                 self._emit_file_list(header, items, name=f"counts_{field}")
                 self._set_status("● idle")
             self.after(0, _apply)
@@ -8350,6 +8375,26 @@ class CouncilConsole(tk.Tk):
                         f"written to: {saved}")
         self._append_transcript("Writer", "\n".join(body), "final")
         return saved
+
+    def _write_rows_csv(self, rows, columns, *, name: str):
+        """Write ``rows`` (list of dicts) to a CSV under data_out/reports/ and
+        return the path, or None on failure. ``columns`` is the ordered list of
+        dict keys to emit as columns. Uses the csv module so values with commas,
+        quotes or newlines are escaped correctly — a hand-joined string cannot
+        be reopened as a spreadsheet once a name contains a comma."""
+        import csv as _csv
+        try:
+            base = _re.sub(r"[^\w\-]+", "_", str(name)).strip("_") or "results"
+            outp = self.data_index.safe_write_path(base + ".csv",
+                                                   subfolder="reports")
+            with open(outp, "w", encoding="utf-8-sig", newline="") as fh:
+                w = _csv.DictWriter(fh, fieldnames=columns,
+                                    extrasaction="ignore")
+                w.writeheader()
+                w.writerows(rows)
+            return str(outp)
+        except Exception:
+            return None
 
     def _remember_files(self, paths, *, cap: int = 800):
         """Record files just surfaced to the user (absolute paths) so a

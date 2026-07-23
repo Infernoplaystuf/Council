@@ -4405,6 +4405,83 @@ def test_known_field_names_harvests_real_labels() -> None:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+def test_field_value_file_rows_and_csv() -> None:
+    """The per-file export: one row per (file, value), and the tally derived
+    from the SAME walk so a CSV and the on-screen counts cannot disagree.
+
+    The user asked for the point-of-contact list as a CSV (name column, file
+    column, a row per file) instead of a txt blob. field_value_file_rows is the
+    row source; the console writes it with the csv module so a value containing
+    a comma or quote stays one cell.
+    """
+    try:
+        import csv
+        import field_search as fs
+    except Exception as exc:  # pragma: no cover
+        _check(f"imports ({exc!r})", False)
+        return
+    import io
+    import json
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    scratch = Path(tempfile.mkdtemp(prefix="smoke_csvrows_"))
+    try:
+        root = scratch / "data_in"
+        root.mkdir(parents=True)
+        (root / "a").mkdir()
+        (root / "a" / "job.json").write_text(
+            json.dumps({"pointOfContact": "Bob Smith"}), encoding="utf-8")
+        (root / "b").mkdir()
+        (root / "b" / "job.json").write_text(
+            json.dumps({"point_of_contact": ["Alice Jones", "Bob Smith"]}),
+            encoding="utf-8")
+        (root / "c").mkdir()
+        (root / "c" / "job.json").write_text(
+            json.dumps({"Point of Contact": 'Bob "The Boss" Smith'}),
+            encoding="utf-8")
+        (root / "d").mkdir()
+        (root / "d" / "job.json").write_text(
+            json.dumps({"material": "IN718"}), encoding="utf-8")
+
+        st = {}
+        rows = fs.field_value_file_rows(root, "point of contact", stats=st)
+        _check("one row per (file, distinct value)", len(rows) == 4,
+               f"rows={len(rows)}")
+        _check("files_with_field counts distinct files, not rows",
+               st["files_with_field"] == 3, f"={st['files_with_field']}")
+        _check("every row carries value + file + path",
+               all({"value", "file", "path"} <= set(r) for r in rows))
+        _check("rows come from every key style (camel/snake/spaced)",
+               {r["file"] for r in rows} ==
+               {str(Path("a") / "job.json"), str(Path("b") / "job.json"),
+                str(Path("c") / "job.json")})
+
+        # The tally is derived from the same rows and must agree.
+        counts = dict(fs.field_value_counts(root, "point of contact"))
+        _check("tally derived from the same walk (Bob in 2 files)",
+               counts.get("Bob Smith") == 2)
+
+        # Round-trip the CSV the console writes.
+        col = "point of contact"
+        csv_rows = [{col: r["value"], "file": r["file"], "full_path": r["path"]}
+                    for r in rows]
+        buf = io.StringIO()
+        w = csv.DictWriter(buf, fieldnames=[col, "file", "full_path"],
+                           extrasaction="ignore")
+        w.writeheader()
+        w.writerows(csv_rows)
+        back = list(csv.DictReader(io.StringIO(buf.getvalue())))
+        _check("CSV round-trips every row", len(back) == 4)
+        _check("a value with quotes stays one cell",
+               any(r[col] == 'Bob "The Boss" Smith' for r in back))
+        _check("CSV columns are exactly <field>/file/full_path",
+               all(set(r) == {col, "file", "full_path"} for r in back))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def test_column_name_matches_all_formats() -> None:
     """A field must resolve to a column written in ANY style.
 
@@ -8233,6 +8310,8 @@ def main() -> int:
          test_field_name_drift_candidates)
     _run("known field names harvest real vault labels (not 7 constants)",
          test_known_field_names_harvests_real_labels)
+    _run("field-value per-file rows + CSV export",
+         test_field_value_file_rows_and_csv)
     _run("column name matches all styles (camel/snake/kebab/spaced)",
          test_column_name_matches_all_formats)
     _run("field-value aggregation ('how often does each X appear')",

@@ -947,40 +947,29 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
     return out
 
 
-def field_value_counts(root: Any, field: str, *,
-                       max_files: Optional[int] = None,
-                       text_max_chars: int = 5_000_000,
-                       on_progress: Optional[Callable[[int, int],
-                                                      None]] = None,
-                       stats: Optional[dict] = None
-                       ) -> List[Tuple[str, int]]:
-    """Every DISTINCT value of ``field`` across the vault, with a file count.
+def field_value_file_rows(root: Any, field: str, *,
+                          max_files: Optional[int] = None,
+                          text_max_chars: int = 5_000_000,
+                          on_progress: Optional[Callable[[int, int],
+                                                         None]] = None,
+                          stats: Optional[dict] = None
+                          ) -> List[Dict[str, str]]:
+    """One row per (file, distinct value of ``field`` in that file).
 
-    Answers "what are all the names, and how often does each appear, for the
-    point of contact" — the DISTRIBUTION of a field, not the files matching one
-    value. Returns ``[(value, n_files)]`` sorted by count descending, then
-    value. Counts FILES, not occurrences: a value listed five times in one file
-    counts once for that file, because "how often it appears" across files is
-    the question people mean.
+    Returns ``[{"value", "file", "path"}]`` — the raw per-file data behind
+    field_value_counts, which is what you want to write to a CSV ("who is the
+    point of contact in each file"). ``file`` is the path relative to ``root``;
+    ``path`` is absolute. A file that lists two contacts yields two rows.
 
-    Same coverage discipline as find_files_with_field_value: no caps by
-    default, every readable file examined, and ``stats`` filled with the true
-    scanned/total/skipped so the caller can say how complete the tally is. A
-    partial tally is worse than useless if it looks complete — a name that
-    appears in unread files would read as rarer than it is.
+    Same coverage discipline as the search and the tally: no caps by default,
+    every readable file examined, and ``stats`` filled with the true
+    scanned/total/skipped so an incomplete export can say so.
     """
     root = Path(root)
-    # _norm_key, NOT _norm: a FIELD NAME must normalise the way the in-file
-    # labels do (via _label_is -> _norm_key), which SPLITS camelCase. With
-    # _norm, a request for the harvested drift form 'pointOfContact' became
-    # 'pointofcontact' (one token) while the file's own key became
-    # 'point of contact' (three) — so it matched nothing and reported
-    # "no values found for pointOfContact" for a vault full of them.
     fn = _norm_key(field)
     if stats is not None:
-        stats.update({"scanned": 0, "total_files": 0, "distinct": 0,
-                      "files_with_field": 0, "truncated": False,
-                      "truncated_why": ""})
+        stats.update({"scanned": 0, "total_files": 0, "files_with_field": 0,
+                      "rows": 0, "truncated": False, "truncated_why": ""})
     if not fn:
         return []
     try:
@@ -1002,13 +991,10 @@ def field_value_counts(root: Any, field: str, *,
                 f"scanned (max_files)")
     total = len(files)
 
-    # value (normalised for grouping) -> [display value, set of file indices].
-    # Files are grouped by the NORMALISED value so "Bob Smith" and "bob smith"
-    # are one person, but the first-seen surface form is what we show.
-    groups: Dict[str, List[Any]] = {}
+    rows: List[Dict[str, str]] = []
     read_count = 0
+    files_with = 0
     skipped: List[Tuple[str, str]] = []
-    partial: List[str] = []
 
     for i, p in enumerate(files):
         if on_progress is not None and i % 100 == 0:
@@ -1036,9 +1022,12 @@ def field_value_counts(root: Any, field: str, *,
         read_count += 1
         if not vals:
             continue
-        # Distinct values WITHIN this file, so one file contributes at most 1
-        # to each value's count regardless of repeats.
+        try:
+            rel = str(p.relative_to(root))
+        except Exception:
+            rel = p.name
         seen_here = set()
+        had_one = False
         for raw in vals:
             for one in (_split_values(raw) or [raw]):
                 one = str(one).strip()
@@ -1046,25 +1035,21 @@ def field_value_counts(root: Any, field: str, *,
                 if not key or key in seen_here:
                     continue
                 seen_here.add(key)
-                g = groups.get(key)
-                if g is None:
-                    groups[key] = [one, 1]
-                else:
-                    g[1] += 1
+                rows.append({"value": one, "file": rel, "path": str(p)})
+                had_one = True
+        if had_one:
+            files_with += 1
 
     if on_progress is not None:
         try:
             on_progress(total, total)
         except Exception:
             pass
-
-    out = sorted(((disp, cnt) for disp, cnt in groups.values()),
-                 key=lambda t: (-t[1], t[0].lower()))
     if stats is not None:
         stats["scanned"] = read_count
         stats["total_files"] = total_found
-        stats["distinct"] = len(out)
-        stats["files_with_field"] = sum(c for _v, c in out)
+        stats["files_with_field"] = files_with
+        stats["rows"] = len(rows)
         stats["skipped"] = len(skipped)
         stats["skipped_detail"] = skipped[:50]
         if skipped and not stats.get("truncated"):
@@ -1072,6 +1057,48 @@ def field_value_counts(root: Any, field: str, *,
             stats["truncated_why"] = (
                 f"{len(skipped)} of {total_found} file(s) could not be read "
                 f"(e.g. {skipped[0][0]} — {skipped[0][1]})")
+    return rows
+
+
+def field_value_counts(root: Any, field: str, *,
+                       max_files: Optional[int] = None,
+                       text_max_chars: int = 5_000_000,
+                       on_progress: Optional[Callable[[int, int],
+                                                      None]] = None,
+                       stats: Optional[dict] = None
+                       ) -> List[Tuple[str, int]]:
+    """Every DISTINCT value of ``field`` across the vault, with a file count.
+
+    Answers "what are all the names, and how often does each appear, for the
+    point of contact" — the DISTRIBUTION of a field, not the files matching one
+    value. Returns ``[(value, n_files)]`` sorted by count descending, then
+    value. Counts FILES, not occurrences: a value listed five times in one file
+    counts once for that file, because "how often it appears" across files is
+    the question people mean.
+
+    Derived from field_value_file_rows (one walk), so the tally and the
+    per-file CSV can never disagree about coverage.
+    """
+    rows = field_value_file_rows(
+        root, field, max_files=max_files, text_max_chars=text_max_chars,
+        on_progress=on_progress, stats=stats)
+    # value (normalised) -> [display, file count]. Rows are already one per
+    # (file, distinct-value-in-file), so counting rows per value counts FILES.
+    groups: Dict[str, List[Any]] = {}
+    for r in rows:
+        one = r["value"]
+        key = _norm(one)
+        g = groups.get(key)
+        if g is None:
+            groups[key] = [one, 1]
+        else:
+            g[1] += 1
+    out = sorted(((disp, cnt) for disp, cnt in groups.values()),
+                 key=lambda t: (-t[1], t[0].lower()))
+    if stats is not None:
+        stats["distinct"] = len(out)
+        # files_with_field is set by the row walker; keep the counts-era key too.
+        stats.setdefault("files_with_field", sum(c for _v, c in out))
     return out
 
 
