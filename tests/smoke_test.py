@@ -3008,6 +3008,26 @@ def test_dream3d_convert_to_python_routing() -> None:
         _check(f"convert phrasing captures the name: {text!r}",
                name_of(text) == want, f"got {name_of(text)!r}")
 
+    # A qualifier word ("dream3d"/"simplnx") between the article and "python"
+    # must not break the match — this is the most natural way to phrase it, and
+    # it used to miss entirely and fall through to the model.
+    for text in (
+            "convert a dream3d pipeline into a dream3d python script",
+            "convert my segmentation pipeline into a dream3d python script",
+            "turn the grain pipeline into a simplnx python script",
+            "the dream3d python equivalent of surface_mesh"):
+        _check(f"'...dream3d python...' still routes to convert: {text[:44]!r}",
+               name_of(text) is not None)
+
+    # _clean_pipeline_ref reduces a generic reference to no specific name, so a
+    # generic request gets a chooser instead of a wrong guess or a model call.
+    _check("'a dream3d pipeline' cleans to no specific name",
+           C._clean_pipeline_ref(C, "a dream3d pipeline") == "")
+    _check("'my segmentation pipeline' cleans to 'segmentation'",
+           C._clean_pipeline_ref(C, "my segmentation pipeline") == "segmentation")
+    _check("a real name survives cleaning",
+           C._clean_pipeline_ref(C, "job_417.d3dpipeline") == "job_417.d3dpipeline")
+
     # A real CREATE request has no python/transpile cue and must keep its own
     # intent (not be eaten by the convert route).
     _check("'create a pipeline that segments grains' is still a CREATE",

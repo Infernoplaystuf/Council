@@ -6347,30 +6347,48 @@ class CouncilConsole(tk.Tk):
     # fallback, so it "converts" nothing. Each pattern captures the pipeline
     # name in group(1). Ordered/anchored so it does not swallow a "create
     # pipeline that ..." request (which has no 'python'/'transpile' cue).
+    # `(?:\w+\s+){0,3}python` tolerates qualifier words the user puts before
+    # "python" — "into a DREAM3D python script", "to its simplnx python
+    # equivalent". Without it, the most natural phrasing ("convert a dream3d
+    # pipeline into a dream3d python script") matched NOTHING and fell through
+    # to the model — the exact truncation this route exists to prevent. The
+    # captured name is cleaned by _clean_pipeline_ref, so a generic "a dream3d
+    # pipeline" resolves to "" and gets a "which pipeline?" listing, not a
+    # model call.
     _PIPELINE_TO_PYTHON_RES = (
-        # "convert/turn/render <name> (in)to [a] python [script]"
+        # "convert/turn/render <name> (in)to [a] [dream3d] python [script]"
         _re.compile(
             r"^\s*(?:convert|transpile|translate|turn|render|rewrite|export)\s+"
-            r"(?:the\s+|my\s+)?(?:pipeline\s+)?(.+?)\s+"
-            r"(?:in)?to\s+(?:a\s+|its\s+|the\s+)?python"
-            r"(?:\s+(?:script|code|equivalent|version|file))?\s*[.!?]?\s*$",
+            r"(?:the\s+|my\s+|a\s+|an\s+)?(?:pipeline\s+)?(.+?)\s+"
+            r"(?:in)?to\s+(?:a\s+|an\s+|its\s+|the\s+)?(?:\w+\s+){0,3}python\b"
+            r"[\w\s]*?[.!?]?\s*$",
             _re.IGNORECASE),
-        # "[the] python [script|equivalent|version] of/for <name>"
+        # "[the] [dream3d] python [script|...] of/for <name>"
         _re.compile(
             r"^\s*(?:convert|make|give\s+me|write|get|show(?:\s+me)?)?\s*"
-            r"(?:the\s+)?python\s+"
-            r"(?:script|code|equivalent|version)?\s*(?:of|for)\s+"
+            r"(?:the\s+)?(?:\w+\s+){0,2}python\s+"
+            r"(?:script|code|equivalent|version|file)?\s*(?:of|for)\s+"
             r"(?:the\s+|my\s+|pipeline\s+)*(.+?)\s*[.!?]?\s*$",
             _re.IGNORECASE),
-        # "transpile <name>" / "<name> to python"
+        # "transpile <name>"
         _re.compile(
             r"^\s*transpile\s+(?:the\s+|my\s+)?(?:pipeline\s+)?(.+?)\s*[.!?]?\s*$",
             _re.IGNORECASE),
+        # bare "<name> (in)to [a] [dream3d] python [...]"
         _re.compile(
-            r"^\s*(?:convert\s+)?(?:the\s+|my\s+)?(?:pipeline\s+)?(.+?)\s+"
-            r"(?:in)?to\s+(?:a\s+|its\s+)?python(?:\s+\w+)?\s*[.!?]?\s*$",
+            r"^\s*(?:convert\s+)?(?:the\s+|my\s+|a\s+|an\s+)?(?:pipeline\s+)?(.+?)\s+"
+            r"(?:in)?to\s+(?:a\s+|an\s+|its\s+)?(?:\w+\s+){0,3}python\b"
+            r"[\w\s]*?[.!?]?\s*$",
             _re.IGNORECASE),
     )
+    # Words that describe a pipeline generically rather than name one, so
+    # "convert a dream3d pipeline to python" resolves to no specific name and
+    # is answered with a chooser instead of a guess.
+    _PIPELINE_GENERIC_TOKENS = frozenset({
+        "a", "an", "the", "my", "this", "that", "some", "any", "it",
+        "dream3d", "d3d", "simplnx", "nx", "pipeline", "pipelines",
+        "script", "file", "saved", "existing", "example",
+    })
     _PIPELINE_EXPORT_RE = _re.compile(
         r"^\s*(?:export|save)\s+pipelines?\s+(.+?)\s+(?:as|to)\s+"
         r"(?:markdown|md|a\s+markdown\s+file)\s*[.!?]?\s*$",
@@ -6832,6 +6850,16 @@ class CouncilConsole(tk.Tk):
             self._append_transcript("Writer", rendered, "final")
         self._set_status("● idle")
 
+    def _clean_pipeline_ref(self, name: str) -> str:
+        """Strip generic words from a captured pipeline reference, leaving the
+        part that actually names a pipeline. "a dream3d pipeline" -> "" (no
+        specific name), "my segmentation pipeline" -> "segmentation",
+        "job_417.d3dpipeline" -> "job_417.d3dpipeline"."""
+        toks = [t for t in _re.split(r"\s+", (name or "").strip()) if t]
+        kept = [t for t in toks
+                if t.lower().strip(".") not in self._PIPELINE_GENERIC_TOKENS]
+        return " ".join(kept).strip()
+
     def _pipeline_to_python_response(self, name: str) -> bool:
         """Convert a saved .d3dpipeline to an editable Python script — with the
         DETERMINISTIC transpiler (nx_transpile via nx_bridge), never the model.
@@ -6847,9 +6875,34 @@ class CouncilConsole(tk.Tk):
         than claiming a false match on a 'create ... python ...' request).
         """
         import pipeline_scanner as _ps
-        pl = _ps.find_pipeline_by_name(VAULT_DIR, name)
-        if not pl:
-            return False
+        cleaned = self._clean_pipeline_ref(name)
+        pl = _ps.find_pipeline_by_name(VAULT_DIR, cleaned) if cleaned else None
+        if pl is None:
+            # No specific pipeline named (or the name didn't match). Guide
+            # DETERMINISTICALLY — list what's convertible — rather than let a
+            # generic "convert a dream3d pipeline to python" fall to the model.
+            try:
+                in_dir = _ps.vault_pipelines_in_dir(VAULT_DIR)
+                pls = _ps.scan_pipelines(in_dir)
+            except Exception:
+                pls = []
+            if not pls:
+                # Nothing to convert — not a pipeline request after all. Let the
+                # router keep going instead of claiming a false match.
+                return False
+            if len(pls) == 1 and not cleaned:
+                pl = pls[0]        # the only pipeline, and no name given → it
+            else:
+                listing = "\n".join(f"  • {p.name}" for p in pls[:60])
+                which = (f" I couldn't find a pipeline matching {cleaned!r}."
+                         if cleaned else "")
+                self._append_transcript(
+                    "Writer",
+                    f"Which pipeline should I convert to Python?{which}\n"
+                    f"Available in vault/pipelines/in/:\n{listing}\n\n"
+                    f"Try: convert {pls[0].name} to python", "final")
+                self._set_status("● idle")
+                return True
         src = Path(pl.path)
         if src.suffix.lower() == ".py":
             self._append_transcript(
