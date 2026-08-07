@@ -90,8 +90,7 @@ dist/DatasInferno/
 │   ├── tcl/, tk/                 ← Tkinter UI libraries
 │   └── ...
 ├── assets/                       ← icons, splash, sample CSVs
-├── personality_config.yaml
-├── personality_backends.json
+├── personality_backends.json    ← model pins per personality
 ├── README.md
 ├── USER_GUIDE.md
 └── BUILDING.md                   ← this file
