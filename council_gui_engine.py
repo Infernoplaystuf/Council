@@ -10167,6 +10167,9 @@ class CouncilConsole(tk.Tk):
             "linear":   "linear (each pipeline once)",
             "per_file": f"per-file over {spec.input_dir} (pattern: {spec.pattern})",
             "per_step": f"per-step over {spec.input_dir} (pattern: {spec.pattern})",
+            "chained":  (f"chained, {getattr(spec, 'chain_scope', 'per_file')} "
+                         f"(each pipeline reads the previous one's output) over "
+                         f"{spec.input_dir} (pattern: {spec.pattern})"),
         }.get(spec.mode, spec.mode)
 
         names = "\n  ".join(p.name for p in spec.pipeline_paths)

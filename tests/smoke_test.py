@@ -2948,6 +2948,155 @@ def test_nx_capability_policy() -> None:
         _check("an ordinary pipeline still runs", False)
 
 
+def test_workflow_chaining() -> None:
+    """Two pipelines chained: pipeline 2 runs on pipeline 1's OUTPUT.
+
+    The other workflow modes (linear/per_file/per_step) all feed each pipeline
+    the ORIGINAL files. Chaining is the missing piece the user asked for:
+    folder -> P1 -> its output -> P2. It works by overriding P1's output-path
+    parameter to a staging file and then feeding that file into P2's input.
+    Runs headless with a fake subprocess runner that simulates output creation,
+    so the wiring is proven without simplnx or the nx env.
+    """
+    try:
+        import workflow_runner as wr
+    except Exception as exc:  # pragma: no cover
+        _check(f"workflow_runner importable ({exc!r})", False)
+        return
+    import re
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    template = (
+        "import simplnx as nx\n"
+        "ds = nx.DataStructure()\n"
+        "r0 = nx.ReadDREAM3DFilter.execute(\n"
+        "    data_structure=ds,\n"
+        "    import_data_object=nx.Dream3dImportParameter.ImportData("
+        "file_path='ORIG_IN.dream3d'),\n"
+        ")\n"
+        "r1 = nx.WriteDREAM3DFilter.execute(\n"
+        "    data_structure=ds,\n"
+        "    export_file_path='ORIG_OUT.dream3d',\n"
+        ")\n"
+    )
+
+    # Staging: input AND output substitution, rest of the script intact.
+    scratch = Path(tempfile.mkdtemp(prefix="smoke_chain_"))
+    try:
+        pl = scratch / "p.py"
+        pl.write_text(template, encoding="utf-8")
+        st = scratch / "stage"
+        st.mkdir()
+        staged, out_used = wr._stage_chain_pipeline(
+            pl, st, input_value=Path("NEW_IN.dream3d"),
+            output_value=Path("NEW_OUT.dream3d"), dest_name="s.py")
+        txt = staged.read_text()
+        _check("staging substitutes the input path",
+               "NEW_IN.dream3d" in txt and "ORIG_IN" not in txt)
+        _check("staging substitutes the output path",
+               "NEW_OUT.dream3d" in txt and "ORIG_OUT" not in txt)
+        _check("staging reports the output param it overrode",
+               out_used == "export_file_path")
+        _check("staging leaves the rest of the script intact",
+               txt.count("ReadDREAM3DFilter.execute") == 1)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+    # The chain wiring, with a fake runner that creates each output file.
+    saved_runner = wr._run_pipeline_subprocess
+    recorded = []
+
+    def fake_run(staged_path, timeout_s=600):
+        src = staged_path.read_text(errors="replace")
+        fin = re.search(r"file_path=([^,\)\n]+)", src)
+        fout = re.search(r"export_file_path=([^,\)\n]+)", src)
+        inp = fin.group(1).strip().strip("'\"") if fin else None
+        outp = fout.group(1).strip().strip("'\"") if fout else None
+        recorded.append((staged_path.name, inp, outp))
+        if outp:
+            Path(outp).parent.mkdir(parents=True, exist_ok=True)
+            Path(outp).write_text("x", encoding="utf-8")
+        return wr.StepResult(
+            step_index=-1, pipeline_name=staged_path.name, input_label="",
+            success=True, return_code=0, duration_s=0.0, stdout="", stderr="",
+            pipeline_path=staged_path)
+
+    wr._run_pipeline_subprocess = fake_run
+    try:
+        scratch = Path(tempfile.mkdtemp(prefix="smoke_chain2_"))
+        try:
+            root = scratch / "in"
+            root.mkdir()
+            for i in range(2):
+                (root / f"sample_{i}.dream3d").write_text("d", encoding="utf-8")
+            p1 = scratch / "P1.py"
+            p1.write_text(template, encoding="utf-8")
+            p2 = scratch / "P2.py"
+            p2.write_text(template, encoding="utf-8")
+
+            recorded.clear()
+            res = wr.run_chained([p1, p2], root, scope="per_file",
+                                 pattern="*.dream3d")
+            _check("per-file chain succeeds", res.success, res.error or "")
+            _check("2 files x 2 pipelines = 4 steps", res.steps_run == 4,
+                   f"got {res.steps_run}")
+            p1_outs = {o for n, i, o in recorded if "P1" in n}
+            p2_ins = {i for n, i, o in recorded if "P2" in n}
+            _check("P2's inputs are exactly P1's outputs (this IS the chain)",
+                   p2_ins == p1_outs and len(p1_outs) == 2)
+            _check("P1 reads the ORIGINAL folder files",
+                   all("sample_" in i for n, i, o in recorded if "P1" in n))
+
+            recorded.clear()
+            res2 = wr.run_chained([p1, p2], root, scope="folder",
+                                  pattern="*.dream3d")
+            _check("folder chain succeeds", res2.success, res2.error or "")
+            _check("folder scope: P2 reads all of P1's outputs",
+                   {i for n, i, o in recorded if "P2" in n}
+                   == {o for n, i, o in recorded if "P1" in n})
+
+            # A non-final pipeline with no output param can't be chained —
+            # fail loudly, not silently on the wrong input.
+            recorded.clear()
+            noout = scratch / "NoOut.py"
+            noout.write_text("import simplnx as nx\n"
+                             "nx.SomeFilter.execute(data_structure=ds)\n",
+                             encoding="utf-8")
+            res3 = wr.run_chained([noout, p2], root, scope="per_file",
+                                  pattern="*.dream3d")
+            _check("a non-final pipeline with no output param fails clearly",
+                   not res3.success and "output" in (res3.error or "").lower())
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+    finally:
+        wr._run_pipeline_subprocess = saved_runner
+
+    # Parser: the chained intent is recognized and names extracted cleanly.
+    saved_resolve = wr.resolve_pipeline_path
+    wr.resolve_pipeline_path = lambda n, v: __import__("pathlib").Path(n)
+    try:
+        from pathlib import Path as _P
+        s = wr.parse_workflow_request(
+            "run workflow seg then stats, feeding the output of seg into stats",
+            _P("."))
+        _check("'feeding the output ... into' -> chained mode",
+               s.mode == "chained")
+        _check("chained names extracted cleanly",
+               [p.name for p in s.pipeline_paths] == ["seg", "stats"])
+        _check("default chain scope is per_file", s.chain_scope == "per_file")
+        s2 = wr.parse_workflow_request("run workflow a, b chained folder-level",
+                                       _P("."))
+        _check("'folder-level' -> folder scope", s2.chain_scope == "folder")
+        s3 = wr.parse_workflow_request("run workflow a then b on /d per-file",
+                                       _P("."))
+        _check("plain per-file is NOT reclassified as chained",
+               s3.mode == "per_file")
+    finally:
+        wr.resolve_pipeline_path = saved_resolve
+
+
 def test_no_bare_re_in_gui() -> None:
     """council_gui_engine imports `re as _re`, so a bare `re.<attr>` is a
     NameError waiting to fire at runtime.
@@ -8524,6 +8673,8 @@ def main() -> int:
          test_nx_script_gate)
     _run("nx hardening (comment injection, last-object, path checks)",
          test_nx_hardening)
+    _run("workflow chaining (pipeline 2 runs on pipeline 1's output)",
+         test_workflow_chaining)
     _run("no bare re.<attr> in the GUI (module imports re as _re)",
          test_no_bare_re_in_gui)
     _run("Dream3D convert-to-python routes to the deterministic transpiler",
