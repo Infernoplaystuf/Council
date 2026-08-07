@@ -3015,7 +3015,11 @@ def test_workflow_chaining() -> None:
         inp = fin.group(1).strip().strip("'\"") if fin else None
         outp = fout.group(1).strip().strip("'\"") if fout else None
         recorded.append((staged_path.name, inp, outp))
-        if outp:
+        # Only honour an ABSOLUTE staged path. The final pipeline in a chain
+        # keeps its template's relative export_file_path, and creating that
+        # would drop a file in whatever directory the tests happen to run
+        # from — which it did, leaving ORIG_OUT.dream3d in the repo root.
+        if outp and Path(outp).is_absolute():
             Path(outp).parent.mkdir(parents=True, exist_ok=True)
             Path(outp).write_text("x", encoding="utf-8")
         return wr.StepResult(
