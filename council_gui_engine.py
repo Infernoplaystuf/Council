@@ -95,6 +95,21 @@ except Exception:
     _SCRAPER_OK = False
 
 try:
+    import gui_shapes as _gs
+    import gui_layout as _gl
+    import gui_spec as _gsp
+    import gui_classify as _gcl
+    import gui_emit as _ge
+    import gui_policy as _gpol
+    import gui_projects as _gp
+    import gui_runner as _grun
+    import gui_canvas as _gc
+    _GUI_DESIGNER_OK = True
+except Exception as _gd_exc:
+    print(f"[GUI Designer] unavailable: {_gd_exc!r}")
+    _GUI_DESIGNER_OK = False
+
+try:
     import dream3d_primer as d3p
     _DREAM3D_OK = True
 except Exception:
@@ -5709,7 +5724,8 @@ class CouncilConsole(tk.Tk):
         if _missing:
             raise RuntimeError(
                 f"Missing required personalities: {', '.join(_missing)}. "
-                f"Check personality_config.yaml and personality_backends.json."
+                f"Check personality_backends.json (the model pins) — "
+                f"personalities are built by council_engine."
             )
         self.judge                = self.personalities["judge"]
         self.writer               = self.personalities["writer"]
@@ -6027,6 +6043,7 @@ class CouncilConsole(tk.Tk):
                        self._build_vault_manager_tab,
                        self._build_agent_jobs_tab,
                        self._build_tool_forge_tab,
+                       self._build_gui_designer_tab,
                        self._build_speech_tab,
                        self._build_changelog_tab,
                        self._build_diagnostics_tab):
@@ -11072,6 +11089,333 @@ class CouncilConsole(tk.Tk):
                    command=lambda: self._set_text(self.ide_out, "")).pack(side="left", padx=6)
 
     # ---- Tool Creation (Tool Forge) tab ----
+
+    # ---- GUI Designer tab ----
+
+    def _build_gui_designer_tab(self):
+        """Draw a wireframe, generate a working Tkinter app.
+
+        WIDGET CONSTRUCTION AND EVENT WIRING ONLY. Every decision lives in the
+        gui_* modules: gui_layout infers the grid, gui_classify is the one place
+        a model is consulted, gui_spec validates, gui_emit writes, gui_policy
+        gates, gui_runner previews. Logic that leaked in here would be
+        untestable — this file needs a display to import a widget from."""
+        self.tab_gui = ttk.Frame(self.nb)
+        self.nb.add(self.tab_gui, text="🎨 GUI Designer")
+        self._gd_project = None          # project name, or None
+        self._gd_questions = []
+
+        ttk.Label(
+            self.tab_gui,
+            text=("Draw a wireframe: pick a widget on the left, drag it on the "
+                  "canvas, label it, set how it resizes. Generate writes a real "
+                  "multi-file Tkinter app — ui/ is regenerated every time, "
+                  "app.py is yours and is never overwritten."),
+            wraplength=920, justify="left",
+        ).pack(anchor="w", padx=10, pady=(8, 2))
+
+        bar = ttk.Frame(self.tab_gui)
+        bar.pack(fill="x", padx=10, pady=(2, 4))
+        for text, cmd in (("New", self._gd_new), ("Open", self._gd_open),
+                          ("Save", self._gd_save),
+                          ("⚙ Generate", self._gd_generate),
+                          ("▶ Run", self._gd_run), ("■ Stop", self._gd_stop),
+                          ("Review with Council", self._gd_review),
+                          ("Detach", self._gd_detach)):
+            ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=2)
+        self._gd_status = tk.StringVar(value="no project")
+        ttk.Label(bar, textvariable=self._gd_status,
+                  foreground="#a6adc8").pack(side="right")
+
+        body = ttk.Frame(self.tab_gui)
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 4))
+
+        palette = ttk.LabelFrame(body, text="Widgets")
+        palette.pack(side="left", fill="y", padx=(0, 6))
+        self._gd_palette = tk.Listbox(palette, width=18, exportselection=False,
+                                      activestyle="none")
+        for key in _gs.PALETTE:
+            self._gd_palette.insert("end", _gs.PALETTE[key]["label"])
+        self._gd_palette_keys = list(_gs.PALETTE)
+        self._gd_palette.pack(fill="y", expand=True)
+        self._gd_palette.bind("<<ListboxSelect>>", self._gd_pick_kind)
+        ttk.Button(palette, text="Pointer",
+                   command=lambda: self._gd_arm(None)).pack(fill="x")
+
+        self.gui_canvas = _gc.DesignerCanvas(body, on_change=self._gd_changed,
+                                             canvas_w=1100, canvas_h=700)
+        self.gui_canvas.pack(side="left", fill="both", expand=True)
+
+        logf = ttk.LabelFrame(self.tab_gui, text="Log / clarifications")
+        logf.pack(fill="x", padx=10, pady=(0, 8))
+        self.gui_log = self._make_text(logf, height=8, wrap="word",
+                                       state="disabled")
+        self.gui_log.pack(fill="both", expand=True)
+
+    # ── GUI Designer helpers (thin: they marshal, they do not decide) ────
+
+    def _gd_log(self, text: str) -> None:
+        try:
+            self.gui_log.configure(state="normal")
+            self.gui_log.insert("end", str(text).rstrip() + "\n")
+            self.gui_log.see("end")
+            self.gui_log.configure(state="disabled")
+        except Exception:
+            pass
+
+    def _gd_arm(self, kind):
+        self.gui_canvas.set_active_kind(kind)
+        if kind is None:
+            try:
+                self._gd_palette.selection_clear(0, "end")
+            except Exception:
+                pass
+
+    def _gd_pick_kind(self, _e=None):
+        sel = self._gd_palette.curselection()
+        if sel:
+            self._gd_arm(self._gd_palette_keys[sel[0]])
+
+    def _gd_changed(self) -> None:
+        name = self._gd_project or "no project"
+        self._gd_status.set(f"{name}{' *' if self.gui_canvas.dirty else ''}")
+
+    def _gd_dir(self):
+        if not self._gd_project:
+            return None
+        return _gp.project_path(self._gd_project, VAULT_DIR)
+
+    def _gd_new(self):
+        name = simpledialog.askstring("New GUI project", "Project name:",
+                                      parent=self)
+        if not name:
+            return
+        mode = "linked" if messagebox.askyesno(
+            "Import mode",
+            "Linked mode lets the app import this app's analysis modules "
+            "(image_stats, plot_registry, ...).\n\n"
+            "Yes = linked   ·   No = standalone (portable)") else "standalone"
+        try:
+            _gp.create(name, mode, vault_dir=VAULT_DIR)
+        except Exception as exc:
+            messagebox.showerror("New project", str(exc))
+            return
+        self._gd_project = name
+        self.gui_canvas.load([])
+        self._gd_log(f"created {name} ({mode})")
+        self._gd_changed()
+
+    def _gd_open(self):
+        names = _gp.list_projects(vault_dir=VAULT_DIR)
+        if not names:
+            messagebox.showinfo("Open", "No GUI projects yet — use New.")
+            return
+        name = simpledialog.askstring(
+            "Open GUI project", "Project:\n  " + "\n  ".join(names),
+            parent=self, initialvalue=names[0])
+        if not name:
+            return
+        try:
+            proj = _gp.open_project(name, vault_dir=VAULT_DIR)
+        except Exception as exc:
+            messagebox.showerror("Open", str(exc))
+            return
+        # Stop a preview belonging to the project we are leaving (spec 9).
+        old = self._gd_dir()
+        if old:
+            _grun.stop(old)
+        self._gd_project = name
+        self.gui_canvas.load(proj.shapes)
+        self._gd_log(f"opened {name} ({len(proj.shapes)} shape(s))")
+        self._gd_changed()
+
+    def _gd_save(self):
+        if not self._gd_project:
+            messagebox.showinfo("Save", "No project open.")
+            return
+        proj = _gp.open_project(self._gd_project, vault_dir=VAULT_DIR)
+        proj.shapes = self.gui_canvas.export()
+        _gp.save_project(self._gd_project, proj, vault_dir=VAULT_DIR)
+        self.gui_canvas.mark_saved()
+        self._gd_log(f"saved {self._gd_project}")
+        self._gd_changed()
+
+    def _gd_generate(self):
+        """Classify → spec → validate → orphan-check → backup → emit → policy.
+
+        All of it off the Tk thread; results marshalled back with after(0)."""
+        if not self._gd_project:
+            messagebox.showinfo("Generate", "No project open.")
+            return
+        self._gd_save()
+        pdir = self._gd_dir()
+        shapes = self.gui_canvas.export()
+        self._gd_status.set("generating…")
+
+        def _work():
+            out: list = []
+            questions: list = []
+            try:
+                import council_engine as _ce
+                proj = _gp.open_project(self._gd_project, vault_dir=VAULT_DIR)
+                man = _gp.load_manifest(pdir)
+                if man.detached:
+                    out.append("this project is detached — regeneration "
+                               "is disabled")
+                    return (out, questions)
+
+                cls = []
+                if _gcl.needs_model(shapes):
+                    def _model_call(prompt):
+                        return _ce.local_chat(
+                            messages=[{"role": "user", "content": prompt}],
+                            temperature=0.1, num_predict=700, timeout=180)
+                    tree0 = _gl.infer(shapes, proj.canvas.w, proj.canvas.h)
+                    cls, questions = _gcl.classify(shapes, tree0, _model_call)
+                    out.append(f"classified {len(cls)} untyped shape(s)")
+                else:
+                    out.append("no untyped shapes — generated with no model call")
+
+                tree = _gl.infer(shapes, proj.canvas.w, proj.canvas.h)
+                spec = _gsp.build(
+                    shapes, tree, _gcl.apply_classifications(cls),
+                    registry=man.widget_names, project=self._gd_project,
+                    mode=man.mode, title=proj.window.title,
+                    min_w=proj.window.min_w, min_h=proj.window.min_h)
+                for w in tree.warnings:
+                    out.append(f"warning: {w}")
+
+                ok, errs = _gsp.validate(spec)
+                if not ok:
+                    out.extend(f"cannot generate: {e}" for e in errs)
+                    return (out, questions)
+
+                orphans = _gp.find_orphans(pdir, spec.widget_names)
+                if orphans:
+                    out.append("BLOCKED — hand-written code still uses these:")
+                    out.extend("  " + o.describe() for o in orphans)
+                    return (out, questions)
+
+                edited = _gp.hand_edited_ui_files(pdir)
+                if edited:
+                    out.append(f"note: ui/ edits will be overwritten: "
+                               f"{', '.join(edited)} (backed up first)")
+                _gp.backup(pdir)
+                res = _ge.emit(spec, pdir)
+                out.append(f"wrote {len(res.files_written)} file(s); "
+                           f"kept {len(res.files_skipped)} hand-written")
+                if res.handlers_added:
+                    out.append("new handler stubs: "
+                               + ", ".join(res.handlers_added))
+                out.extend(res.warnings)
+
+                pol_ok, pol_errs = _gpol.validate_project(
+                    sorted((pdir / "ui").glob("*.py"))
+                    + [pdir / "app.py", pdir / "launch.py"], man.mode)
+                out.append("policy: OK" if pol_ok
+                           else "policy REFUSED (the app will not run it):")
+                out.extend("  " + e for e in pol_errs)
+
+                man.widget_names = spec.name_registry()
+                man.ui_checksums = _gp.ui_checksums(pdir)
+                _gp.save_manifest(pdir, man)
+            except Exception as exc:
+                out.append(f"generate failed: {exc!r}")
+            return (out, questions)
+
+        def _run():
+            lines, questions = _work()
+
+            def _apply():
+                for line in lines:
+                    self._gd_log(line)
+                self._gd_questions = questions or []
+                for q in self._gd_questions:
+                    self._gd_log(f"?  {q.question}  "
+                                 f"[{' | '.join(q.options)}]  "
+                                 f"(default: {q.default})")
+                self._gd_status.set(self._gd_project or "")
+            self.after(0, _apply)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _gd_run(self):
+        pdir = self._gd_dir()
+        if not pdir:
+            messagebox.showinfo("Run", "No project open.")
+            return
+
+        def _line(text, level):
+            self.after(0, lambda: self._gd_log(
+                ("! " if level == "error" else "  ") + text))
+        try:
+            pv = _grun.start(pdir, on_line=_line)
+            self._gd_log(f"preview running (pid {pv.pid})")
+        except Exception as exc:
+            self._gd_log(f"could not start preview: {exc}")
+
+    def _gd_stop(self):
+        pdir = self._gd_dir()
+        if pdir and _grun.stop(pdir):
+            self._gd_log("preview stopped")
+
+    def _gd_review(self):
+        """Advisory critique of the generated ui/. NEVER edits code."""
+        pdir = self._gd_dir()
+        if not pdir or not (pdir / "ui" / "main_ui.py").exists():
+            messagebox.showinfo("Review", "Generate the project first.")
+            return
+        self._gd_status.set("review…")
+
+        def _work():
+            try:
+                src = "\n\n".join(
+                    f"# ---- {p.name} ----\n"
+                    + p.read_text(encoding="utf-8", errors="replace")
+                    for p in sorted((pdir / "ui").glob("*.py")))
+                prompt = (
+                    "Critique this generated Tkinter UI for LAYOUT, "
+                    "ACCESSIBILITY and RESIZE BEHAVIOUR only. Do not rewrite "
+                    "it; describe what to change and why.\n\n" + src[:12000])
+                agents = {
+                    "coder": ModelAgent("Coder", self.coder, enable_tools=False),
+                    "writer": ModelAgent("Writer", self.writer,
+                                         enable_tools=False),
+                }
+                orch = DeliberationOrchestrator(
+                    judge_model=self.judge, agents=agents,
+                    max_rounds=1, debate_turns=1)
+                events = orch.run(prompt, panel=["coder", "writer"],
+                                  synth="writer")
+                text = next((e.text for e in reversed(events)
+                             if e.who == "Writer" and e.kind == "final"),
+                            "(no critique returned)")
+            except Exception as exc:
+                text = f"review failed: {exc!r}"
+
+            def _apply():
+                self._gd_log("── Council review (advisory only) ──")
+                self._gd_log(text)
+                self._gd_status.set(self._gd_project or "")
+            self.after(0, _apply)
+
+        threading.Thread(target=_work, daemon=True).start()
+
+    def _gd_detach(self):
+        pdir = self._gd_dir()
+        if not pdir:
+            return
+        if not messagebox.askyesno(
+                "Detach project",
+                "Detaching merges ui/ into the project and disables "
+                "regeneration from the wireframe.\n\nThis is ONE WAY. "
+                "Continue?"):
+            return
+        try:
+            merged = _gp.detach(pdir)
+            self._gd_log(f"detached — merged into {merged.name}")
+        except Exception as exc:
+            messagebox.showerror("Detach", str(exc))
 
     def _build_tool_forge_tab(self):
         """A tab where the local model writes a NEW tool for a described task.
