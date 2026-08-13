@@ -4701,8 +4701,66 @@ def _make_tools(runner: ce.LocalRunner, librarian: ce.Librarian, vault_dir: Path
             lines.append("(no matches)")
         return True, "\n".join(lines), res
 
+    def api_search(args: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+        """Find callables in the vault's own Python by what they do.
+
+        LOOKUP, NOT EXECUTION — see api_catalogue's module docstring. Calling a
+        vault function would mean importing arbitrary customer or vendor code,
+        and an import runs its top level. The agent gets the REAL signature and
+        writes code the user runs, which prevents the failure this exists for
+        anyway: a model recalling `size=` when the parameter is `element_size=`.
+        """
+        try:
+            import api_catalogue as _ac
+        except Exception as exc:
+            return False, f"api catalogue unavailable: {exc!r}", {}
+        query = str(args.get("query", "")).strip()
+        if not query:
+            return False, "No query provided.", {}
+        cat = _ac.build(vault_dir)
+        try:
+            k = max(1, min(20, int(args.get("k", 6))))
+        except (TypeError, ValueError):
+            k = 6
+        hits = cat.search(query, k=k)
+        if not hits:
+            return True, (
+                f"No callable in the vault matches {query!r}. "
+                f"({len(cat)} indexed from {cat.files_scanned} file(s).)"
+            ), {"matches": [], "indexed": len(cat)}
+        body = "\n\n".join(_ac.describe(h) for h in hits)
+        head = (f"{len(hits)} of {len(cat)} catalogued callable(s) matching "
+                f"{query!r}:")
+        return True, head + "\n\n" + body, {"matches": hits,
+                                            "indexed": len(cat)}
+
+    def api_signature(args: Dict[str, Any]) -> Tuple[bool, str, Dict[str, Any]]:
+        """The exact parameter list for one callable, plus a call template.
+
+        Use this before writing any call into generated code: the template
+        shows the call SHAPE with the blanks marked, so only argument values
+        have to be supplied and the structure cannot be invented."""
+        try:
+            import api_catalogue as _ac
+        except Exception as exc:
+            return False, f"api catalogue unavailable: {exc!r}", {}
+        name = str(args.get("name", "")).strip()
+        if not name:
+            return False, "No name provided.", {}
+        cat = _ac.build(vault_dir)
+        spec = cat.get(name)
+        if spec is None:
+            near = [h["name"] for h in cat.search(name, k=5)]
+            msg = f"{name!r} is not in the vault catalogue."
+            if near:
+                msg += " Did you mean: " + ", ".join(near) + "?"
+            return True, msg, {"found": False, "near": near}
+        return True, _ac.describe(spec), {"found": True, "spec": spec}
+
     return {"run_python": run_python, "vault_save": vault_save,
-            "vault_list": vault_list, "vault_read": vault_read, "vault_search": vault_search}
+            "vault_list": vault_list, "vault_read": vault_read,
+            "vault_search": vault_search,
+            "api_search": api_search, "api_signature": api_signature}
 
 
 # ============================================================
