@@ -145,9 +145,32 @@ class IndexStats:
 # Chunking
 # ============================================================
 
+def _chunk_for(text: str, source: str, suffix: str = "") -> List[Dict[str, str]]:
+    """Chunk a file, CODE-AWARE when it is source.
+
+    An 800-character window is right for prose and wrong for code: it lands
+    mid-function, so the retrieved chunk has a loop body with no `def` line, no
+    parameters and no imports. Someone asking "how do I call mesh()" gets the
+    middle of an example script — a relevant chunk that cannot answer the
+    question. code_chunks splits on the boundaries the language already defines
+    and prefixes each one with the module's imports.
+
+    Falls back to the character window whenever code_chunks declines (not
+    source, or source that does not parse), so a corpus with one broken script
+    still indexes completely."""
+    try:
+        import code_chunks
+        got = code_chunks.chunk_source(text, source, suffix)
+        if got:
+            return got
+    except Exception:
+        pass          # a chunker bug must never cost the file
+    return _chunk_text(text, source=source)
+
+
 def _chunk_text(text: str, source: str, chunk_size: int = CHUNK_SIZE,
                 overlap: int = CHUNK_OVERLAP) -> List[Dict[str, str]]:
-    """Split text into overlapping chunks with metadata."""
+    """Split text into overlapping chunks with metadata (prose fallback)."""
     chunks: List[Dict[str, str]] = []
     text = text.strip()
     if not text:
@@ -308,7 +331,7 @@ class _ChromaBackend:
                 stats.skipped_files += 1
                 continue
 
-            chunks = _chunk_text(text, source=rel)
+            chunks = _chunk_for(text, rel, p.suffix)
             if not chunks:
                 continue
 
@@ -437,7 +460,7 @@ class _TFIDFBackend:
                 stats.skipped_files += 1
                 continue
 
-            chunks = _chunk_text(text, source=rel)
+            chunks = _chunk_for(text, rel, p.suffix)
             if not chunks:
                 continue
 
