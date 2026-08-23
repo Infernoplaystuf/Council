@@ -13919,6 +13919,9 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         ttk.Button(top, text="🎯 Place on entity…",
                    command=self._px_place_sprite_on_entity
                    ).pack(side="left", padx=(4, 0))
+        ttk.Button(top, text="✨ Inspiration…",
+                   command=self._px_open_inspiration
+                   ).pack(side="left", padx=(4, 0))
         self._px_status_var = tk.StringVar(value="new 32×32 canvas")
         ttk.Label(top, textvariable=self._px_status_var,
                   foreground="#a98a8a").pack(side="right")
@@ -14642,6 +14645,197 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
             "Sprite placed",
             f"Placed {png_name} as a Sprite2D on {entity} in {tscn.name}.\n"
             "Run the game to see it.", parent=self)
+
+    # ----------------------------------------------------------------
+    # Inspiration — procedural generator + reference-only image backend
+    # ----------------------------------------------------------------
+
+    def _px_open_inspiration(self) -> None:
+        """Idea generator for the Pixel Art tab.
+
+        Two clearly separated halves:
+          • Procedural — algorithmic sprites/tiles (no model, no training
+            data). These load straight into the canvas to draw over.
+          • Reference — locally generated images for looking at only.
+            Deliberately has NO load-into-canvas action; it writes to
+            vault/art_reference/ so generated imagery stays on the mood
+            board and out of the artwork.
+        """
+        import random as _random
+        import tkinter as _tk
+        from tkinter import ttk as _ttk, messagebox
+        try:
+            import pixel_gen as _pg
+        except Exception as exc:
+            messagebox.showerror("Inspiration unavailable",
+                                 f"Could not load pixel_gen: {exc}", parent=self)
+            return
+        from PIL import Image as _PImage, ImageTk as _PImageTk
+
+        win = _tk.Toplevel(self)
+        win.title("Inspiration")
+        win.configure(padx=12, pady=10)
+        try:
+            win.transient(self)
+        except Exception:
+            pass
+        nb = _ttk.Notebook(win)
+        nb.pack(fill="both", expand=True)
+
+        # ── Procedural ────────────────────────────────────────
+        proc = _ttk.Frame(nb, padding=10)
+        nb.add(proc, text="Procedural (no AI)")
+        _ttk.Label(
+            proc,
+            text=("Algorithmic sprites and material tiles — pure maths, "
+                  "no model and no training data.\nGenerate a batch, then "
+                  "click one to load it into the canvas and paint over it."),
+            justify="left", foreground="#a98a8a").pack(anchor="w", pady=(0, 8))
+
+        row = _ttk.Frame(proc)
+        row.pack(fill="x", pady=(0, 8))
+        _ttk.Label(row, text="Kind:").pack(side="left")
+        kind_var = _tk.StringVar(value="Sprite")
+        kinds = ["Sprite"] + list(_pg.TILE_KINDS)
+        kind_cb = _ttk.Combobox(row, textvariable=kind_var, values=kinds,
+                                state="readonly", width=10)
+        kind_cb.pack(side="left", padx=(4, 10))
+        _ttk.Label(row, text="Palette:").pack(side="left")
+        pal_var = _tk.StringVar(value="Ramp: Blue")
+        pal_cb = _ttk.Combobox(row, textvariable=pal_var,
+                               values=list(self._px_module.PALETTES.keys()),
+                               state="readonly", width=20)
+        pal_cb.pack(side="left", padx=(4, 10))
+        _ttk.Label(row, text="Count:").pack(side="left")
+        count_var = _tk.IntVar(value=12)
+        _ttk.Spinbox(row, from_=4, to=36, increment=4, width=4,
+                     textvariable=count_var).pack(side="left", padx=(4, 0))
+
+        def _kind_changed(_e=None):
+            # Tiles are designed around a specific material kit — follow it.
+            k = kind_var.get()
+            if k != "Sprite":
+                pal_var.set(_pg.default_kit_for(k))
+        kind_cb.bind("<<ComboboxSelected>>", _kind_changed)
+
+        grid = _ttk.Frame(proc)
+        grid.pack(fill="both", expand=True)
+        self._px_insp_thumbs: list = []      # keep PhotoImage refs alive
+
+        def _load_into_canvas(img):
+            doc = self._px_doc
+            doc.snapshot()
+            fitted = img.resize((doc.width, doc.height), _PImage.NEAREST)
+            doc.frame.image = fitted.convert("RGBA")
+            doc.dirty = True
+            self._px_redraw()
+            self._px_refresh_frames_list()
+            win.lift()
+
+        def _generate():
+            for w_ in grid.winfo_children():
+                w_.destroy()
+            self._px_insp_thumbs = []
+            kind = kind_var.get()
+            pal = pal_var.get()
+            n = max(1, int(count_var.get() or 12))
+            size = max(8, int(self._px_doc.width))
+            seed = _random.randint(0, 10_000_000)
+            try:
+                if kind == "Sprite":
+                    imgs = _pg.gen_sprite_sheet(pal, count=n, size=size,
+                                                seed=seed)
+                else:
+                    imgs = _pg.gen_tile_sheet(kind, count=n, kit=pal,
+                                              size=size, seed=seed)
+            except Exception as exc:
+                messagebox.showerror("Generate failed", repr(exc), parent=win)
+                return
+            cols = 6
+            zoom = max(1, min(4, 96 // max(1, size)))
+            for i, im in enumerate(imgs):
+                shown = im.resize((size * zoom, size * zoom), _PImage.NEAREST)
+                photo = _PImageTk.PhotoImage(shown)
+                self._px_insp_thumbs.append(photo)
+                b = _tk.Label(grid, image=photo, bg="#0f0c0c",
+                              bd=1, relief="flat", cursor="hand2")
+                b.grid(row=i // cols, column=i % cols, padx=3, pady=3)
+                b.bind("<Button-1>", lambda _e, m=im: _load_into_canvas(m))
+
+        _ttk.Button(proc, text="🎲 Generate batch", command=_generate
+                    ).pack(anchor="w", pady=(8, 0))
+
+        # ── Reference (local model) ───────────────────────────
+        ref = _ttk.Frame(nb, padding=10)
+        nb.add(ref, text="Reference (local model)")
+        try:
+            import art_reference as _ar
+            refgen = _ar.ReferenceGenerator(VAULT_DIR)
+        except Exception as exc:
+            refgen = None
+            print(f"[pixel art] reference generator unavailable: {exc!r}")
+
+        _ttk.Label(
+            ref,
+            text=("Generated images are REFERENCE ONLY — to look at while "
+                  "you paint.\nThey are written to vault/art_reference/ and "
+                  "cannot be loaded into the canvas or into a game project."),
+            justify="left", foreground="#a98a8a").pack(anchor="w", pady=(0, 8))
+        status_var = _tk.StringVar(
+            value=refgen.status_text() if refgen else
+            "Reference generation unavailable.")
+        _ttk.Label(ref, textvariable=status_var, wraplength=520,
+                   foreground="#7fb0cb").pack(anchor="w", pady=(0, 8))
+
+        prow = _ttk.Frame(ref)
+        prow.pack(fill="x", pady=(0, 6))
+        _ttk.Label(prow, text="Subject:").pack(side="left")
+        subj_var = _tk.StringVar(value="")
+        _ttk.Entry(prow, textvariable=subj_var).pack(
+            side="left", fill="x", expand=True, padx=(4, 4))
+
+        def _gen_reference():
+            if refgen is None or not refgen.available:
+                status_var.set(refgen.status_text() if refgen else
+                               "Reference generation unavailable.")
+                return
+            subject = subj_var.get().strip()
+            if not subject:
+                return
+            status_var.set("Generating… (local backend, this can take a while)")
+
+            def _worker():
+                path = refgen.generate(subject)
+                def _done():
+                    if path:
+                        status_var.set(f"Saved reference → {path.name}")
+                    else:
+                        status_var.set(
+                            "Generation failed or no local backend running.")
+                try:
+                    self.after(0, _done)
+                except Exception:
+                    pass
+            threading.Thread(target=_worker, daemon=True,
+                             name="anvil-art-ref").start()
+
+        _ttk.Button(prow, text="Generate", command=_gen_reference
+                    ).pack(side="left")
+
+        def _open_ref_folder():
+            try:
+                d = (refgen.out_dir if refgen
+                     else VAULT_DIR / "art_reference")
+                d.mkdir(parents=True, exist_ok=True)
+                os.startfile(str(d))            # noqa: S606 - user action
+            except Exception as exc:
+                status_var.set(f"Could not open folder: {exc}")
+
+        _ttk.Button(ref, text="📂 Open reference folder",
+                    command=_open_ref_folder).pack(anchor="w", pady=(4, 0))
+
+        _ttk.Button(win, text="Close", command=win.destroy
+                    ).pack(anchor="e", pady=(10, 0))
 
     def _px_resize_canvas(self) -> None:
         try:
