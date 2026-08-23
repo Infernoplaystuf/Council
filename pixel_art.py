@@ -356,6 +356,57 @@ _KIT_DEFS: List[Tuple[str, List[Tuple[str, List[Tuple[int, int, int]]]]]] = [
                         + make_ramp((255, 196, 96), 5)     # hot spark
                         + make_ramp((44, 46, 54), 4)),     # deep cavity
     ]),
+    # Fired clay runs warm and chalky; mortar is the quiet row that
+    # makes brickwork read as courses instead of a flat wall.
+    ("Brick & Clay", [
+        ("Red brick",   make_ramp((156, 74, 56), 9)),
+        ("Fired brick", make_ramp((108, 52, 44), 9)),
+        ("Pale brick",  make_ramp((196, 148, 112), 9)),
+        ("Terracotta",  make_ramp((188, 106, 68), 9)),
+        ("Adobe",       make_ramp((176, 140, 100), 9)),
+        ("Mortar",      make_ramp((172, 164, 148), 9)),
+        ("Shadow",      shadow_row((88, 72, 66))),
+        ("Accents",     make_ramp((96, 112, 68), 5)        # moss
+                        + make_ramp((72, 64, 60), 5)       # soot
+                        + make_ramp((208, 190, 168), 4)),  # chipped edge
+    ]),
+    # Thatch lives on deep shadow between the bundles — the shadow row
+    # matters as much as the straw here.
+    ("Thatch & Straw", [
+        ("Fresh straw", make_ramp((206, 172, 96), 9)),
+        ("Dry straw",   make_ramp((176, 142, 78), 9)),
+        ("Aged thatch", make_ramp((124, 96, 54), 9)),
+        ("Weathered",   make_ramp((144, 132, 108), 9)),
+        ("Reed",        make_ramp((156, 156, 96), 9)),
+        ("Shadow",      shadow_row((78, 64, 48))),
+        ("Accents",     make_ramp((132, 106, 64), 5)       # rope binding
+                        + make_ramp((92, 88, 62), 5)       # damp patch
+                        + make_ramp((104, 124, 72), 4)),   # moss
+    ]),
+    # Glass is sold by its speculars, not its body colour — hence a
+    # dedicated near-white highlight row alongside the tints.
+    ("Glass & Crystal", [
+        ("Clear",       make_ramp((196, 220, 226), 9)),
+        ("Bottle green", make_ramp((108, 158, 124), 9)),
+        ("Blue glass",  make_ramp((108, 152, 196), 9)),
+        ("Amber",       make_ramp((198, 148, 76), 9)),
+        ("Amethyst",    make_ramp((150, 118, 190), 9)),
+        ("Rose quartz", make_ramp((204, 146, 156), 9)),
+        ("Highlight",   make_ramp((236, 248, 252), 9)),
+        ("Shadow",      shadow_row((68, 78, 92))),
+    ]),
+    ("Fabric & Cloth", [
+        ("Linen",       make_ramp((206, 190, 160), 9)),
+        ("Wool",        make_ramp((146, 140, 134), 9)),
+        ("Dyed red",    make_ramp((164, 62, 62), 9)),
+        ("Dyed blue",   make_ramp((66, 92, 158), 9)),
+        ("Dyed green",  make_ramp((86, 124, 76), 9)),
+        ("Leather",     make_ramp((128, 88, 56), 9)),
+        ("Shadow",      shadow_row((80, 76, 78))),
+        ("Accents",     make_ramp((196, 164, 72), 5)       # gold trim
+                        + make_ramp((58, 52, 50), 5)       # dark thread
+                        + make_ramp((222, 214, 200), 4)),  # stitching
+    ]),
 ]
 
 
