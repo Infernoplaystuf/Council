@@ -12047,7 +12047,16 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         btns.pack(fill="x")
         ttk.Button(btns, text="Record 5s",       command=self._stt_record).pack(side="left")
         ttk.Button(btns, text="Transcribe",      command=self._stt_transcribe).pack(side="left", padx=6)
-        ttk.Button(btns, text="Send to Council", command=self._stt_send_to_council).pack(side="left")
+        # Video / audio file transcription.
+        ttk.Button(btns, text="📹 Transcribe video/audio…",
+                   command=self._stt_transcribe_media).pack(side="left")
+        ttk.Label(btns, text="Model:", foreground="#6c7086").pack(side="left", padx=(8, 2))
+        self._stt_model_var = tk.StringVar(value="base")
+        ttk.Combobox(btns, textvariable=self._stt_model_var, state="readonly",
+                     width=8, values=["tiny", "base", "small", "medium"]
+                     ).pack(side="left")
+        ttk.Button(btns, text="Send to Council", command=self._stt_send_to_council
+                   ).pack(side="left", padx=(8, 0))
 
         # ── #10 TTS controls ─────────────────────────────────────────────
         ttk.Separator(btns, orient="vertical").pack(side="left", fill="y", padx=10)
@@ -14005,14 +14014,39 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
                         *_px.PALETTES.keys(),
                         command=lambda _v: self._px_render_palette()
                         ).pack(fill="x", pady=(2, 4))
+        # Build a shading ramp from whatever colour is currently active —
+        # the fastest path from "I picked my armour blue" to "I have its
+        # shadow and highlight".
+        ttk.Button(left, text="🎚 Ramp from current colour",
+                   command=self._px_ramp_from_current
+                   ).pack(fill="x", pady=(0, 4))
+        # Swatch grid — scrolls, because the wide palettes run long.
+        pal_wrap = ttk.Frame(left)
+        pal_wrap.pack(fill="both", expand=True)
         self._px_palette_canvas = tk.Canvas(
-            left, bg="#0f0c0c", highlightthickness=0,
+            pal_wrap, bg="#0f0c0c", highlightthickness=0,
             height=240,
         )
-        self._px_palette_canvas.pack(fill="both", expand=True)
-        self._px_palette_canvas.bind("<Button-1>",
-                                       self._px_palette_click)
+        _pal_sb = ttk.Scrollbar(pal_wrap, orient="vertical",
+                                 command=self._px_palette_canvas.yview)
+        self._px_palette_canvas.configure(yscrollcommand=_pal_sb.set)
+        self._px_palette_canvas.pack(side="left", fill="both", expand=True)
+        _pal_sb.pack(side="right", fill="y")
+        self._px_palette_canvas.bind("<Button-1>", self._px_palette_click)
+        self._px_palette_canvas.bind("<Motion>", self._px_palette_hover)
+        self._px_palette_canvas.bind(
+            "<MouseWheel>",
+            lambda e: self._px_palette_canvas.yview_scroll(
+                int(-1 * (e.delta / 120)), "units"))
+        # Re-flow the grid when the panel is resized.
+        self._px_palette_cols = 0
+        self._px_palette_canvas.bind(
+            "<Configure>", lambda _e: self._px_render_palette())
         self._px_palette_swatches: list = []  # [(x0,y0,x1,y1,rgb), ...]
+        # Hex readout for the swatch under the cursor.
+        self._px_hover_var = tk.StringVar(value="")
+        ttk.Label(left, textvariable=self._px_hover_var,
+                  foreground="#a98a8a").pack(anchor="w", pady=(2, 0))
 
         # Center — drawing canvas
         center = ttk.Frame(body)
@@ -14294,10 +14328,14 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
         c.delete("all")
         self._px_palette_swatches = []
         if not swatches:
+            c.configure(scrollregion=(0, 0, 0, 0))
             return
-        # Layout: 6 columns, swatch_size tall
-        cols = 6
+        # Columns adapt to the panel width so a 78-swatch spectrum stays
+        # readable in a narrow panel and spreads out in a wide one.
         sw = 22
+        width = c.winfo_width()
+        cols = max(4, (width - 4) // sw) if width > 1 else 6
+        self._px_palette_cols = cols
         for i, rgb in enumerate(swatches):
             col = i % cols
             row = i // cols
@@ -14308,13 +14346,39 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
             hex_str = self._px_module.to_hex(rgb)
             c.create_rectangle(x0, y0, x1, y1, fill=hex_str, outline="#222")
             self._px_palette_swatches.append((x0, y0, x1, y1, rgb))
+        rows = (len(swatches) + cols - 1) // cols
+        c.configure(scrollregion=(0, 0, cols * sw + 4, rows * sw + 4))
+
+    def _px_swatch_at(self, x: int, y: int):
+        """Return the rgb of the swatch under a canvas point, or None.
+        Coordinates are translated for the scrolled view."""
+        cx = self._px_palette_canvas.canvasx(x)
+        cy = self._px_palette_canvas.canvasy(y)
+        for x0, y0, x1, y1, rgb in self._px_palette_swatches:
+            if x0 <= cx <= x1 and y0 <= cy <= y1:
+                return rgb
+        return None
 
     def _px_palette_click(self, event) -> None:
-        for x0, y0, x1, y1, rgb in self._px_palette_swatches:
-            if x0 <= event.x <= x1 and y0 <= event.y <= y1:
-                rgba = tuple(list(rgb) + [255])
-                self._px_set_color(rgba)
-                return
+        rgb = self._px_swatch_at(event.x, event.y)
+        if rgb is not None:
+            self._px_set_color(tuple(list(rgb) + [255]))
+
+    def _px_palette_hover(self, event) -> None:
+        """Show the hex of the swatch under the cursor — picking a shade
+        off a ramp is much easier when you can read its value."""
+        rgb = self._px_swatch_at(event.x, event.y)
+        self._px_hover_var.set(
+            self._px_module.to_hex(rgb) if rgb is not None else "")
+
+    def _px_ramp_from_current(self) -> None:
+        """Generate a hue-shifted shading ramp from the active colour and
+        switch the swatch grid to it."""
+        _px = self._px_module
+        ramp = _px.make_ramp(self._px_color[:3], 10)
+        _px.PALETTES[_px.CUSTOM_RAMP_NAME] = ramp
+        self._px_palette_var.set(_px.CUSTOM_RAMP_NAME)
+        self._px_render_palette()
 
     # ----------------------------------------------------------------
     # File + canvas ops
@@ -18264,6 +18328,11 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
                     self.stt_out.delete("1.0", "end")
                     self.stt_out.insert("1.0", text)
 
+                elif kind == "stt_append":
+                    _, text = item
+                    self.stt_out.insert("end", text + "\n")
+                    self.stt_out.see("end")
+
                 elif kind == "verdict_confidence":
                     _, conf = item
                     self._last_confidence = conf
@@ -19422,6 +19491,71 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
                 self.ui_q.put(("error", str(e)))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    _STT_MEDIA_TYPES = [
+        ("Video/Audio", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.flv "
+                        "*.mp3 *.wav *.m4a *.aac *.ogg *.flac *.wma"),
+        ("All files", "*.*"),
+    ]
+
+    def _stt_transcribe_media(self):
+        """Pick a video or audio file and transcribe it locally with
+        faster-whisper. faster-whisper decodes the container (incl. video)
+        via PyAV, so no separate audio extraction is needed. Runs on a
+        background thread and streams progress into the transcript box."""
+        from tkinter import filedialog, messagebox
+        try:
+            import video_processor as _vp
+        except Exception as exc:
+            messagebox.showerror(
+                "Transcription unavailable",
+                f"Could not load the video processor ({exc}).", parent=self)
+            return
+        if not getattr(_vp, "_WHISPER_OK", False):
+            messagebox.showwarning(
+                "Whisper not installed",
+                "Local transcription needs faster-whisper:\n\n"
+                "    pip install faster-whisper\n\n"
+                "then restart Anvil.", parent=self)
+            return
+        path = filedialog.askopenfilename(
+            title="Pick a video or audio file to transcribe",
+            filetypes=self._STT_MEDIA_TYPES)
+        if not path:
+            return
+        model_size = (getattr(self, "_stt_model_var", None)
+                      and self._stt_model_var.get()) or "base"
+        # Reset the output box + show a header immediately.
+        self.ui_q.put(("stt_out", f"Transcribing {Path(path).name}  "
+                                   f"(whisper {model_size})…\n"))
+
+        def _progress(msg: str) -> None:
+            self.ui_q.put(("stt_append", msg))
+
+        def _worker():
+            try:
+                # CPU by default — reliable everywhere. faster-whisper CUDA
+                # needs a CTranslate2 CUDA build + cuDNN; transcribe_audio
+                # already falls back to CPU if a GPU load fails.
+                segs = _vp.transcribe_audio(
+                    path, model_size=model_size, device="cpu",
+                    progress_cb=_progress)
+                if not segs:
+                    self.ui_q.put(("stt_append",
+                                   "\n(no speech transcribed — the file may "
+                                   "have no audio track, or be silent.)"))
+                    return
+                body = "\n".join(
+                    f"{s.timestamp}  {s.text.strip()}" for s in segs)
+                # Replace the streaming log with the clean timestamped
+                # transcript so "Send to Council" gets clean text.
+                self.ui_q.put(("stt_out",
+                               f"Transcript of {Path(path).name}:\n\n" + body))
+            except Exception as e:
+                self.ui_q.put(("stt_append", f"\nERROR: {e}"))
+
+        threading.Thread(target=_worker, daemon=True,
+                         name="anvil-stt-media").start()
 
     def _stt_send_to_council(self):
         text = self.stt_out.get("1.0", "end").strip()
