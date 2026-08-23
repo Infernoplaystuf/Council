@@ -278,8 +278,85 @@ _RAMP_BASES = [
 ]
 
 _RAMP_PALETTES = {
-    f"Ramp: {name}": make_ramp(rgb, 10) for name, rgb in _RAMP_BASES
+    f"Ramp: {name}": make_ramp(rgb, 14) for name, rgb in _RAMP_BASES
 }
+
+
+# ============================================================
+# Material kits — everything one structure needs, in one palette
+# ============================================================
+# Building a wooden wall means reaching for a dozen browns (different
+# boards, weathering, grain) AND a set of neutrals for ambient
+# occlusion, outlines and cast shadow. Hunting those across separate
+# palettes is slow, so a "kit" gathers the whole material in one
+# place, organised as one ramp per ROW: each row is a single wood /
+# stone / metal, running dark → light.
+#
+# ``PALETTE_ROWS`` keeps that row structure (and the row names) so the
+# editor can lay a kit out as clean gradient rows instead of a
+# reflowed soup, and name the row you're hovering.
+
+#: name -> [(row_label, [rgb, ...]), ...]
+PALETTE_ROWS: dict = {}
+
+
+def register_kit(name: str, rows: List[Tuple[str, List[Tuple[int, int, int]]]]) -> None:
+    """Register a row-structured palette. Also flattens it into
+    ``PALETTES`` so every existing code path keeps working."""
+    PALETTE_ROWS[name] = rows
+    PALETTES[name] = [c for _label, row in rows for c in row]
+
+
+def shadow_row(tint: Iterable[int], steps: int = 12) -> List[Tuple[int, int, int]]:
+    """A near-black → light-grey neutral run, faintly tinted toward the
+    material's temperature. Tinted neutrals sit on a material far more
+    convincingly than pure grey."""
+    return make_ramp(tint, steps, hue_shift=0.03, sat_shift=0.75)
+
+
+#: Kit definitions. Registered into ``PALETTES`` once that dict exists
+#: (see the ``register_kit`` calls below the PALETTES declaration).
+_KIT_DEFS: List[Tuple[str, List[Tuple[str, List[Tuple[int, int, int]]]]]] = [
+    # Six wood species × 9 shades = 54 browns, plus warm-tinted
+    # neutrals for shadow and accents (rope, iron nails, moss).
+    ("Wooden Structure", [
+        ("Pine",        make_ramp((196, 154, 104), 9)),
+        ("Oak",         make_ramp((154, 110, 64), 9)),
+        ("Walnut",      make_ramp((96, 64, 42), 9)),
+        ("Mahogany",    make_ramp((128, 62, 40), 9)),
+        ("Weathered",   make_ramp((140, 124, 108), 9)),
+        ("Driftwood",   make_ramp((176, 166, 148), 9)),
+        ("Shadow",      shadow_row((92, 80, 68))),
+        ("Accents",     make_ramp((122, 96, 54), 5)        # rope / twine
+                        + make_ramp((104, 100, 96), 5)     # iron nail
+                        + make_ramp((96, 116, 68), 4)),    # moss
+    ]),
+    ("Stone Structure", [
+        ("Granite",     make_ramp((140, 140, 146), 9)),
+        ("Sandstone",   make_ramp((196, 168, 124), 9)),
+        ("Slate",       make_ramp((96, 106, 124), 9)),
+        ("Basalt",      make_ramp((72, 70, 76), 9)),
+        ("Limestone",   make_ramp((206, 200, 184), 9)),
+        ("Mossy",       make_ramp((118, 132, 104), 9)),
+        ("Shadow",      shadow_row((76, 78, 86))),
+        ("Accents",     make_ramp((92, 116, 84), 5)        # lichen
+                        + make_ramp((62, 66, 74), 5)       # wet / crack
+                        + make_ramp((168, 148, 120), 4)),  # mortar
+    ]),
+    ("Metal Structure", [
+        ("Iron",        make_ramp((132, 140, 152), 9)),
+        ("Gunmetal",    make_ramp((74, 78, 88), 9)),
+        ("Steel",       make_ramp((176, 184, 196), 9)),
+        ("Gold",        make_ramp((212, 172, 64), 9)),
+        ("Brass",       make_ramp((180, 148, 78), 9)),
+        ("Copper",      make_ramp((168, 102, 62), 9)),
+        ("Rust",        make_ramp((140, 74, 42), 9)),
+        ("Shadow",      shadow_row((70, 74, 84))),
+        ("Accents",     make_ramp((92, 148, 132), 5)       # verdigris
+                        + make_ramp((255, 196, 96), 5)     # hot spark
+                        + make_ramp((44, 46, 54), 4)),     # deep cavity
+    ]),
+]
 
 
 PALETTES = {
@@ -303,7 +380,12 @@ PALETTES = {
     "Metal":         PALETTE_METAL,
     "Sky":           PALETTE_SKY,
 }
-# Single-hue shading ramps, listed after the kits.
+
+# Material kits first — they're the workhorses for building assets.
+for _kit_name, _kit_rows in _KIT_DEFS:
+    register_kit(_kit_name, _kit_rows)
+
+# Single-hue shading ramps.
 PALETTES.update(_RAMP_PALETTES)
 
 #: Name used for the ramp generated live from the artist's current

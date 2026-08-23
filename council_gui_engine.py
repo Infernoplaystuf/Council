@@ -14323,53 +14323,80 @@ class CouncilConsole(tk.Tk, _IdeaTabMixin, _VideoTabMixin):
 
     def _px_render_palette(self) -> None:
         name = self._px_palette_var.get()
-        swatches = self._px_module.PALETTES.get(name, [])
+        _px = self._px_module
         c = self._px_palette_canvas
         c.delete("all")
         self._px_palette_swatches = []
-        if not swatches:
+        rows = getattr(_px, "PALETTE_ROWS", {}).get(name)
+        swatches = _px.PALETTES.get(name, [])
+        if not rows and not swatches:
             c.configure(scrollregion=(0, 0, 0, 0))
             return
-        # Columns adapt to the panel width so a 78-swatch spectrum stays
-        # readable in a narrow panel and spreads out in a wide one.
-        sw = 22
         width = c.winfo_width()
-        cols = max(4, (width - 4) // sw) if width > 1 else 6
+        avail = (width - 6) if width > 1 else 156
+
+        if rows:
+            # Material kit: one material per row, so each row reads as a
+            # clean dark→light gradient you can pick a shade off. Swatch
+            # size shrinks to fit the widest row rather than reflowing.
+            widest = max(len(r) for _lbl, r in rows)
+            sw = max(10, min(22, avail // max(1, widest)))
+            y = 2
+            for label, row in rows:
+                for i, rgb in enumerate(row):
+                    x0 = i * sw + 2
+                    y0 = y
+                    x1 = x0 + sw - 2
+                    y1 = y0 + sw - 2
+                    c.create_rectangle(x0, y0, x1, y1,
+                                       fill=_px.to_hex(rgb), outline="#222")
+                    self._px_palette_swatches.append(
+                        (x0, y0, x1, y1, rgb, label))
+                y += sw + 3          # a breath between materials
+            c.configure(scrollregion=(0, 0, widest * sw + 4, y + 2))
+            return
+
+        # Flat palette: columns adapt to the panel width so a 78-swatch
+        # spectrum stays readable narrow and spreads out wide.
+        sw = 22
+        cols = max(4, avail // sw) if width > 1 else 6
         self._px_palette_cols = cols
         for i, rgb in enumerate(swatches):
-            col = i % cols
-            row = i // cols
-            x0 = col * sw + 2
-            y0 = row * sw + 2
+            x0 = (i % cols) * sw + 2
+            y0 = (i // cols) * sw + 2
             x1 = x0 + sw - 2
             y1 = y0 + sw - 2
-            hex_str = self._px_module.to_hex(rgb)
-            c.create_rectangle(x0, y0, x1, y1, fill=hex_str, outline="#222")
-            self._px_palette_swatches.append((x0, y0, x1, y1, rgb))
-        rows = (len(swatches) + cols - 1) // cols
-        c.configure(scrollregion=(0, 0, cols * sw + 4, rows * sw + 4))
+            c.create_rectangle(x0, y0, x1, y1,
+                               fill=_px.to_hex(rgb), outline="#222")
+            self._px_palette_swatches.append((x0, y0, x1, y1, rgb, ""))
+        n_rows = (len(swatches) + cols - 1) // cols
+        c.configure(scrollregion=(0, 0, cols * sw + 4, n_rows * sw + 4))
 
     def _px_swatch_at(self, x: int, y: int):
-        """Return the rgb of the swatch under a canvas point, or None.
-        Coordinates are translated for the scrolled view."""
+        """Return ``(rgb, row_label)`` for the swatch under a canvas
+        point, or None. Coordinates are translated for the scrolled view."""
         cx = self._px_palette_canvas.canvasx(x)
         cy = self._px_palette_canvas.canvasy(y)
-        for x0, y0, x1, y1, rgb in self._px_palette_swatches:
+        for x0, y0, x1, y1, rgb, label in self._px_palette_swatches:
             if x0 <= cx <= x1 and y0 <= cy <= y1:
-                return rgb
+                return rgb, label
         return None
 
     def _px_palette_click(self, event) -> None:
-        rgb = self._px_swatch_at(event.x, event.y)
-        if rgb is not None:
-            self._px_set_color(tuple(list(rgb) + [255]))
+        hit = self._px_swatch_at(event.x, event.y)
+        if hit is not None:
+            self._px_set_color(tuple(list(hit[0]) + [255]))
 
     def _px_palette_hover(self, event) -> None:
-        """Show the hex of the swatch under the cursor — picking a shade
-        off a ramp is much easier when you can read its value."""
-        rgb = self._px_swatch_at(event.x, event.y)
-        self._px_hover_var.set(
-            self._px_module.to_hex(rgb) if rgb is not None else "")
+        """Name the material and show the hex under the cursor — picking
+        a shade off a ramp is much easier when you can read both."""
+        hit = self._px_swatch_at(event.x, event.y)
+        if hit is None:
+            self._px_hover_var.set("")
+            return
+        rgb, label = hit
+        hex_str = self._px_module.to_hex(rgb)
+        self._px_hover_var.set(f"{label} · {hex_str}" if label else hex_str)
 
     def _px_ramp_from_current(self) -> None:
         """Generate a hue-shifted shading ramp from the active colour and
