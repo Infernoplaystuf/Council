@@ -131,12 +131,63 @@ def _flux_workflow(prompt: str, width: int, height: int, steps: int, seed: int) 
     }
 
 
+# Standard checkpoint (SD 1.5 / SD 2 / SDXL) workflow. Any single
+# .safetensors in ComfyUI/models/checkpoints/ works with this graph,
+# which is why it is preferred when one is present — Flux needs four
+# separate model files and a different sampler chain.
+def _sd_workflow(prompt: str, negative: str, width: int, height: int,
+                 steps: int, seed: int, ckpt: str, cfg: float = 7.0) -> dict:
+    return {
+        "1": {"class_type": "CheckpointLoaderSimple",
+              "inputs": {"ckpt_name": ckpt}},
+        "2": {"class_type": "CLIPTextEncode",
+              "inputs": {"text": prompt, "clip": ["1", 1]}},
+        "3": {"class_type": "CLIPTextEncode",
+              "inputs": {"text": negative, "clip": ["1", 1]}},
+        "4": {"class_type": "EmptyLatentImage",
+              "inputs": {"width": width, "height": height, "batch_size": 1}},
+        "5": {"class_type": "KSampler",
+              "inputs": {"seed": seed, "steps": steps, "cfg": cfg,
+                         "sampler_name": "euler", "scheduler": "normal",
+                         "denoise": 1.0, "model": ["1", 0],
+                         "positive": ["2", 0], "negative": ["3", 0],
+                         "latent_image": ["4", 0]}},
+        "6": {"class_type": "VAEDecode",
+              "inputs": {"samples": ["5", 0], "vae": ["1", 2]}},
+        "7": {"class_type": "SaveImage",
+              "inputs": {"filename_prefix": "council_img",
+                         "images": ["6", 0]}},
+    }
+
+
+def available_checkpoints() -> list:
+    """Checkpoints ComfyUI can currently load, newest-install first.
+    Empty list when ComfyUI isn't running or has none installed."""
+    raw = _get(f"{COMFYUI_HOST}/object_info/CheckpointLoaderSimple", timeout=5)
+    if not raw:
+        return []
+    try:
+        info = json.loads(raw)
+        names = info["CheckpointLoaderSimple"]["input"]["required"]["ckpt_name"][0]
+        return [n for n in names if isinstance(n, str)]
+    except Exception:
+        return []
+
+
 def _comfyui_generate(
     prompt: str, dest: Path,
     width: int, height: int, steps: int,
 ) -> Optional[Path]:
-    seed     = int(uuid.uuid4().int % (2 ** 32))
-    workflow = _flux_workflow(prompt, width, height, steps, seed)
+    seed = int(uuid.uuid4().int % (2 ** 32))
+    # Prefer a plain checkpoint when one is installed; fall back to the
+    # Flux graph for setups built around it.
+    ckpts = available_checkpoints()
+    if ckpts:
+        sd_steps = max(8, min(40, steps if steps > 6 else 22))
+        workflow = _sd_workflow(prompt, _NEGATIVE_PROMPT, width, height,
+                                sd_steps, seed, ckpts[0])
+    else:
+        workflow = _flux_workflow(prompt, width, height, steps, seed)
 
     resp = _post(f"{COMFYUI_HOST}/prompt", {"prompt": workflow}, timeout=15)
     if not resp or "prompt_id" not in resp:
@@ -242,8 +293,14 @@ class ThumbnailGenerator:
     @property
     def backend_label(self) -> str:
         b = self.probe()
-        return {"comfyui": "ComfyUI (Flux)", "a1111": "A1111 (SDXL/SD)"}.get(
-            b or "", "not available")
+        if b == "comfyui":
+            # Name the checkpoint actually in use rather than assuming
+            # Flux — the SD-checkpoint path is preferred when one exists.
+            ckpts = available_checkpoints()
+            if ckpts:
+                return f"ComfyUI ({Path(ckpts[0]).stem})"
+            return "ComfyUI (Flux)"
+        return {"a1111": "A1111 (SDXL/SD)"}.get(b or "", "not available")
 
     # ── Generation ────────────────────────────────────────────────
 
