@@ -11190,7 +11190,8 @@ class CouncilConsole(tk.Tk):
 
         bar = ttk.Frame(self.tab_gui)
         bar.pack(fill="x", padx=10, pady=(2, 4))
-        for text, cmd in (("New", self._gd_new), ("Open", self._gd_open),
+        for text, cmd in (("✨ Start with a wizard", self._gd_wizard),
+                          ("New", self._gd_new), ("Open", self._gd_open),
                           ("Save", self._gd_save),
                           ("⚙ Generate", self._gd_generate),
                           ("▶ Run", self._gd_run), ("■ Stop", self._gd_stop),
@@ -11263,6 +11264,43 @@ class CouncilConsole(tk.Tk):
         if not self._gd_project:
             return None
         return _gp.project_path(self._gd_project, VAULT_DIR)
+
+    def _gd_wizard(self):
+        """Guided start. The wizard writes nothing — it hands back a layout and
+        this applies it — so cancelling leaves no half-made project behind."""
+        try:
+            import gui_wizard as _gw
+        except Exception as exc:
+            messagebox.showerror("GUI Designer", f"wizard unavailable: {exc}")
+            return
+        try:
+            existing = _gp.list_projects(VAULT_DIR)
+        except Exception:
+            existing = []
+        _gw.open_wizard(self, on_done=self._gd_wizard_done, log=self._gd_log,
+                        existing=existing)
+
+    def _gd_wizard_done(self, res):
+        """Apply a finished wizard. Always a NEW project, so the destructive
+        load() and the widget-name registry are both safe here."""
+        try:
+            _gp.create(res.name, res.mode, vault_dir=VAULT_DIR)
+            proj = _gp.open_project(res.name, vault_dir=VAULT_DIR)
+            proj.window.title = res.title
+            proj.window.min_w, proj.window.min_h = res.min_w, res.min_h
+            # Match the real drawing surface, not the 1280x800 default: layout
+            # inference measures edge-anchoring against these numbers.
+            proj.canvas.w, proj.canvas.h = 1100, 700
+            proj.shapes = list(res.shapes)
+            _gp.save_project(res.name, proj, vault_dir=VAULT_DIR)
+        except Exception as exc:
+            messagebox.showerror("New project", str(exc))
+            return
+        self._gd_project = res.name
+        self.gui_canvas.load(res.shapes)
+        self.gui_canvas.mark_saved()
+        self._gd_log(f"created {res.name} ({res.mode}) from the wizard")
+        self._gd_changed()
 
     def _gd_new(self):
         name = simpledialog.askstring("New GUI project", "Project name:",

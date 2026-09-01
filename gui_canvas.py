@@ -408,6 +408,24 @@ class DesignerCanvas(ttk.Frame):
         self.redraw()
         self._fire()
 
+    def add_shapes(self, shapes: Sequence[Shape]) -> None:
+        """Append shapes above the existing scene, as ONE undoable step.
+
+        The non-destructive counterpart to ``load()``. load() replaces the
+        scene and resets undo, so using it to drop a wizard's output onto a
+        canvas the user had already drawn on would destroy that work with no
+        way back. This is the seam any scripted mutation should come through."""
+        if not shapes:
+            return
+        base = max((s.z for s in self.shapes), default=0) + 1
+        added = copy.deepcopy(list(shapes))
+        for i, s in enumerate(added):
+            s.z = base + i
+        self.shapes.extend(added)
+        self.selection = [s.id for s in added]
+        self.inspector.show(self._selected())
+        self._commit()
+
     def export(self) -> List[Shape]:
         return copy.deepcopy(self.shapes)
 

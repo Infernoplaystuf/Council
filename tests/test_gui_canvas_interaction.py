@@ -35,36 +35,18 @@ class _Ev:
         self.x_root, self.y_root = x, y
 
 
-@pytest.fixture(scope="module")
-def root():
-    """ONE Tk root for the whole module.
+@pytest.fixture()
+def canvas(tk_root):
+    """A fresh canvas on the session-wide root (tests/conftest.py).
 
     A root per test was intermittently failing with TclError "couldn't read
-    file .../ttk/spinbox.tcl" — naming a DIFFERENT file each run, for files
-    that are present on disk. Building and tearing down a dozen interpreters
-    back to back re-sources the whole Tcl library each time, and on Windows a
-    real-time virus scanner will occasionally hold one of those files long
-    enough for the read to fail. Those failures were landing in the skip
-    branch, which meant a broken run reported as a clean one."""
-    try:
-        r = tk.Tk()
-        r.withdraw()
-    except Exception as exc:                       # pragma: no cover
-        pytest.skip(f"no display: {exc!r}")
-    try:
-        yield r
-    finally:
-        try:
-            r.destroy()
-        except Exception:
-            pass
-
-
-@pytest.fixture()
-def canvas(root):
-    c = gc.DesignerCanvas(root, canvas_w=600, canvas_h=400)
+    file .../ttk/spinbox.tcl", naming a different file each run for files that
+    are present on disk; a root per FILE then failed outright on Python 3.11,
+    which cannot re-initialise Tcl after a root is destroyed. Both landed in
+    the skip branch, so a broken run reported as a clean one."""
+    c = gc.DesignerCanvas(tk_root, canvas_w=600, canvas_h=400)
     c.pack()
-    root.update_idletasks()
+    tk_root.update_idletasks()
     try:
         yield c
     finally:
