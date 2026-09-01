@@ -120,6 +120,13 @@ def _run_pipeline_subprocess(
             capture_output=True,
             text=True,
             timeout=timeout_s,
+            # A generated pipeline prints filter names and file paths, either
+            # of which can carry a non-cp1252 byte. Without this the reader
+            # thread dies and proc.stdout is None — and `proc.stdout or ""`
+            # below turns that into a SILENT empty log for a run that
+            # produced plenty of output.
+            encoding="utf-8",
+            errors="replace",
         )
         base.return_code = proc.returncode
         base.stdout = proc.stdout or ""

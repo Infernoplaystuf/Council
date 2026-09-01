@@ -4827,7 +4827,8 @@ def _vmgr_clone_repo(
     if clone_dir.exists():
         _log(f"Updating existing clone: {subfolder}")
         r = _sp.run(["git", "pull"], cwd=str(clone_dir),
-                    capture_output=True, text=True, timeout=120)
+                    capture_output=True, text=True, timeout=120,
+                    encoding="utf-8", errors="replace")
         _log(r.stdout.strip() or r.stderr.strip() or "Already up to date.")
     else:
         clone_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -4836,7 +4837,8 @@ def _vmgr_clone_repo(
             cmd += ["--branch", branch]
         cmd += [url, str(clone_dir)]
         _log(f"Cloning {url} …")
-        r = _sp.run(cmd, capture_output=True, text=True, timeout=300)
+        r = _sp.run(cmd, capture_output=True, text=True, timeout=300,
+                    encoding="utf-8", errors="replace")
         if r.returncode != 0:
             raise RuntimeError(r.stderr.strip() or "git clone failed")
         _log(f"Cloned to {clone_dir.name}")
@@ -16467,14 +16469,16 @@ class CouncilConsole(tk.Tk):
                 import subprocess
                 r = subprocess.run(
                     ["git", "pull"], cwd=str(clone_dir),
-                    capture_output=True, text=True, timeout=120)
+                    capture_output=True, text=True, timeout=120,
+                    encoding="utf-8", errors="replace")
                 msg = r.stdout.strip() or r.stderr.strip() or "Done."
                 self.ui_q.put(("vault_mgr_log", f"git pull: {msg}"))
                 # Re-copy updated files
                 rc2, url, _ = (lambda r2: (r2.returncode, r2.stdout.strip(), ""))(
                     subprocess.run(["git", "remote", "get-url", "origin"],
                                    cwd=str(clone_dir),
-                                   capture_output=True, text=True, timeout=15))
+                                   capture_output=True, text=True, timeout=15,
+                                   encoding="utf-8", errors="replace"))
                 if rc2 == 0 and url:
                     _vmgr_clone_repo(
                         url, vault_dir=VAULT_DIR, subfolder=subfolder,
@@ -17673,6 +17677,12 @@ class CouncilConsole(tk.Tk):
                  "--pretty=format:%H|%h|%ai|%s", "-100"],
                 cwd=str(_REPO_ROOT),
                 capture_output=True, text=True, timeout=15,
+                # git speaks UTF-8. text=True decodes with the LOCALE encoding,
+                # which is cp1252 here, and a commit subject containing an
+                # em-dash or a curly quote kills the reader THREAD — so
+                # communicate() returns stdout=None instead of raising, and
+                # this tab silently showed nothing. Caught only by running it.
+                encoding="utf-8", errors="replace",
                 creationflags=(subprocess.CREATE_NO_WINDOW
                                if sys.platform == "win32"
                                and hasattr(subprocess, "CREATE_NO_WINDOW") else 0),
@@ -17737,6 +17747,7 @@ class CouncilConsole(tk.Tk):
                 ["git", "show", "--stat", "--patch", "--no-color", full_hash],
                 cwd=str(_REPO_ROOT),
                 capture_output=True, text=True, timeout=30,
+                encoding="utf-8", errors="replace",   # a diff carries any byte
                 creationflags=(subprocess.CREATE_NO_WINDOW
                                if sys.platform == "win32"
                                and hasattr(subprocess, "CREATE_NO_WINDOW") else 0),

@@ -4306,7 +4306,14 @@ class Librarian:
         git_dir = self.vault_dir / ".git"
         if git_dir.exists():
             return True, "git repo already present."
-        p = subprocess.run(["git", "init"], cwd=str(self.vault_dir), capture_output=True, text=True)
+        # encoding= on every git call: text=True decodes with the locale
+        # encoding (cp1252 on Windows), and git speaks UTF-8. A non-cp1252 byte
+        # kills the reader THREAD, so .stdout comes back None rather than
+        # raising — and the next .strip() is an AttributeError inside an error
+        # path. A vault commit message is user text, so this is reachable.
+        p = subprocess.run(["git", "init"], cwd=str(self.vault_dir),
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
         if p.returncode != 0:
             return False, p.stderr.strip() or "git init failed."
         return True, p.stdout.strip() or "git init OK."
@@ -4315,10 +4322,15 @@ class Librarian:
         ok, msg = self.ensure_git_repo()
         if not ok:
             return False, msg
-        add = subprocess.run(["git", "add", "-A"], cwd=str(self.vault_dir), capture_output=True, text=True)
+        add = subprocess.run(["git", "add", "-A"], cwd=str(self.vault_dir),
+                             capture_output=True, text=True,
+                             encoding="utf-8", errors="replace")
         if add.returncode != 0:
             return False, add.stderr.strip() or "git add failed."
-        commit = subprocess.run(["git", "commit", "-m", message], cwd=str(self.vault_dir), capture_output=True, text=True)
+        commit = subprocess.run(["git", "commit", "-m", message],
+                                cwd=str(self.vault_dir),
+                                capture_output=True, text=True,
+                                encoding="utf-8", errors="replace")
         if commit.returncode != 0:
             out = (commit.stdout + "\n" + commit.stderr).strip()
             return False, out or "git commit failed."
@@ -4378,6 +4390,12 @@ class LocalRunner:
             text=True,
             timeout=timeout_s,
             env=env,
+            # The code being run is generated, so it can print anything. Under
+            # the locale encoding one emoji or accented character kills the
+            # reader thread and .stdout comes back None — the tool would report
+            # "no output" for a script that ran fine and printed plenty.
+            encoding="utf-8",
+            errors="replace",
         )
         return p.returncode, p.stdout, p.stderr, path
 
@@ -4407,6 +4425,12 @@ class LocalRunner:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            # Same reason as run_code, and worse here: _drain iterates the
+            # stream on a daemon thread, so a decode error kills that thread
+            # silently and the output simply stops part-way through a run that
+            # is still going.
+            encoding="utf-8",
+            errors="replace",
         )
 
         def _drain(stream, cb):

@@ -117,7 +117,13 @@ def run_job(job: Dict[str, Any], *, env: str = NX_ENV,
         try:
             proc = subprocess.run(cmd + [str(job_path), str(out_path)],
                                   capture_output=True, text=True,
-                                  timeout=timeout)
+                                  timeout=timeout,
+                                  # The worker's traceback is what the error
+                                  # below reports. Under the locale encoding a
+                                  # non-cp1252 byte makes .stdout None, so the
+                                  # report itself would raise instead of saying
+                                  # what went wrong.
+                                  encoding="utf-8", errors="replace")
         except subprocess.TimeoutExpired:
             raise NxError(f"nx job {job.get('action')!r} timed out after "
                           f"{timeout}s")
