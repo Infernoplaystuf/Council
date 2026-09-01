@@ -79,7 +79,13 @@ def _schema(**kw: Any) -> Dict[str, Any]:
 PALETTE: Dict[str, Dict[str, Any]] = {
     # ---- containers -------------------------------------------------
     "frame": {
-        "label": "Frame", "is_container": True,
+        # "Reserved space" is in the name because that capability already
+        # worked and nobody could find it: an empty frame is emitted with an
+        # explicit size and grid_propagate(False), so it holds the spot at the
+        # drawn size with no model call. Users reached for "Generic (classify)"
+        # instead, which does the opposite — it asks a model to turn the box
+        # into some real widget.
+        "label": "Frame / Reserved space", "is_container": True,
         "default_w": 240, "default_h": 160, "default_resize": "stretch_both",
         "prop_schema": {
             "relief": _schema(type="str", choices=["flat", "raised", "sunken",

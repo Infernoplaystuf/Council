@@ -140,6 +140,101 @@ def snap_value(v: float, candidates: Sequence[float], grid: int = GRID_SNAP,
     return snap_to_grid(v, grid), None
 
 
+def snap_box(v: float, extent: float, candidates: Sequence[float],
+             grid: int = GRID_SNAP, threshold: int = EDGE_SNAP
+             ) -> Tuple[int, Optional[float]]:
+    """Snap a box's LEADING edge, CENTRE or TRAILING edge — whichever lands
+    closest to a sibling — and return where the leading edge ends up.
+
+    ``snap_value`` only ever tested the single value handed to it, which during
+    a move is the top-left corner. But ``sibling_edges`` publishes sibling
+    CENTRES as candidates too, so the guide would light up for a centre match
+    when what had actually lined up was this shape's LEFT edge against that
+    centre: the widget sat half its own width off and the tool said it was
+    aligned. Testing all three offsets is what makes the guide honest, and it
+    is also the only thing that makes right-edge-to-right-edge alignment
+    reachable by dragging at all.
+
+    Ties resolve to the earliest offset, so a leading-edge match beats a centre
+    match at equal distance — the plainer reading of the same gesture."""
+    best_val: Optional[int] = None
+    best_guide: Optional[float] = None
+    best_d = float(threshold) + 1.0
+    for offset in (0.0, extent / 2.0, float(extent)):
+        edge = v + offset
+        for c in candidates:
+            d = abs(c - edge)
+            if d <= threshold and d < best_d:
+                best_d = d
+                best_val = int(round(c - offset))
+                best_guide = float(c)
+    if best_val is not None:
+        return best_val, best_guide
+    return snap_to_grid(v, grid), None
+
+
+ALIGN_EDGES = ("left", "hcenter", "right", "top", "vcenter", "bottom")
+
+
+def align(shapes: Sequence[Shape], edge: str) -> bool:
+    """Line every shape up on one edge of the selection's bounding box.
+
+    The bounding box, not the first-selected shape: selection order is
+    invisible on screen, so anchoring to it would make one command do different
+    things depending on which widget the user happened to click first.
+
+    Mutates in place and returns whether it did anything, so the caller knows
+    whether an undo entry is worth pushing."""
+    sel = list(shapes)
+    if len(sel) < 2 or edge not in ALIGN_EDGES:
+        return False
+    x1 = min(s.x for s in sel)
+    x2 = max(s.x2 for s in sel)
+    y1 = min(s.y for s in sel)
+    y2 = max(s.y2 for s in sel)
+    for s in sel:
+        if edge == "left":
+            s.x = int(x1)
+        elif edge == "right":
+            s.x = int(x2 - s.w)
+        elif edge == "hcenter":
+            s.x = int(round((x1 + x2) / 2.0 - s.w / 2.0))
+        elif edge == "top":
+            s.y = int(y1)
+        elif edge == "bottom":
+            s.y = int(y2 - s.h)
+        else:                                   # vcenter
+            s.y = int(round((y1 + y2) / 2.0 - s.h / 2.0))
+    return True
+
+
+def distribute(shapes: Sequence[Shape], axis: str) -> bool:
+    """Even GAPS between the outermost two shapes — not even centres.
+
+    Equal gaps is what "distribute" means to the eye once the widgets are
+    different sizes; equalising centres instead leaves a wide button visually
+    crowding its neighbour. The two outermost shapes do not move: they are the
+    span the user already chose by placing them."""
+    sel = list(shapes)
+    if len(sel) < 3 or axis not in ("h", "v"):
+        return False
+    horiz = axis == "h"
+    sel.sort(key=(lambda s: s.x) if horiz else (lambda s: s.y))
+    lead = sel[0].x if horiz else sel[0].y
+    tail = sel[-1].x2 if horiz else sel[-1].y2
+    solid = sum((s.w if horiz else s.h) for s in sel)
+    gap = (tail - lead - solid) / float(len(sel) - 1)
+    cursor = float(lead)
+    for s in sel:
+        if horiz:
+            s.x = int(round(cursor))
+            cursor += s.w + gap
+        else:
+            s.y = int(round(cursor))
+            cursor += s.h + gap
+    return True
+
+
 def sibling_edges(shapes: Sequence[Shape], exclude: Sequence[str] = ()
                   ) -> Tuple[List[float], List[float]]:
     """(vertical_edges, horizontal_edges) of every shape except ``exclude``.
@@ -244,6 +339,7 @@ class DesignerCanvas(ttk.Frame):
     that bypassed it would be invisible to undo and to the Generate button."""
 
     def __init__(self, master, *, on_change: Optional[Callable[[], None]] = None,
+                 on_kind_change: Optional[Callable[[Optional[str]], None]] = None,
                  canvas_w: int = 1280, canvas_h: int = 800, **kw):
         super().__init__(master, **kw)
         self.shapes: List[Shape] = []
@@ -252,8 +348,10 @@ class DesignerCanvas(ttk.Frame):
         self.grid_snap = GRID_SNAP
         self.dirty = False
         self._on_change = on_change
+        self._on_kind_change = on_kind_change
         self._undo = UndoStack(self.shapes)
         self._active_kind: Optional[str] = None
+        self._draw_sticky = False
 
         # Drag state
         self._mode: Optional[str] = None       # draw|move|resize|band
@@ -286,9 +384,18 @@ class DesignerCanvas(ttk.Frame):
     # -- public API ---------------------------------------------------
 
     def set_active_kind(self, kind: Optional[str]) -> None:
-        """Arm a palette kind; the next click-drag draws one."""
+        """Arm a palette kind; the next click-drag draws one.
+
+        Announces the change, because the canvas now disarms ITSELF after a
+        placement and the palette strip would otherwise keep a row highlighted
+        that no longer describes the mode the canvas is in."""
         self._active_kind = kind
         self.canvas.configure(cursor="crosshair" if kind else "")
+        if self._on_kind_change:
+            try:
+                self._on_kind_change(kind)
+            except Exception as exc:  # a broken callback must not wedge
+                print(f"[gui_canvas] on_kind_change raised: {exc!r}")
 
     def load(self, shapes: Sequence[Shape]) -> None:
         """Replace the scene. Resets undo — a freshly opened project has no
@@ -373,6 +480,7 @@ class DesignerCanvas(ttk.Frame):
             ("<Control-y>", self.redo),
             ("<Control-Shift-Z>", self.redo),
             ("<Control-a>", self._select_all),
+            ("<Escape>", self._disarm),
         ):
             c.bind(seq, fn)
         for key, dx, dy in (("Left", -1, 0), ("Right", 1, 0),
@@ -382,7 +490,8 @@ class DesignerCanvas(ttk.Frame):
             # common one, the fine move is the deliberate one.
             c.bind(f"<{key}>",
                    lambda e, a=dx, b=dy: self._nudge(a * self.grid_snap,
-                                                     b * self.grid_snap))
+                                                     b * self.grid_snap,
+                                                     snap=True))
             c.bind(f"<Control-{key}>", lambda e, a=dx, b=dy: self._nudge(a, b))
 
     # -- mouse --------------------------------------------------------
@@ -398,6 +507,9 @@ class DesignerCanvas(ttk.Frame):
 
         if self._active_kind:
             self._mode = "draw"
+            # Shift keeps the tool armed across the release, for laying out a
+            # row of buttons without returning to the palette between each.
+            self._draw_sticky = additive
             return
 
         # A handle on an already-selected shape beats a plain hit, so grabbing
@@ -452,11 +564,20 @@ class DesignerCanvas(ttk.Frame):
         vx, vy = sibling_edges(self._start, exclude=ids)
 
         if self._mode == "move":
-            for s in self._selected():
-                base = next(b for b in self._start if b.id == s.id)
-                nx, gx = snap_value(base.x + dx, vx, self.grid_snap)
-                ny, gy = snap_value(base.y + dy, vy, self.grid_snap)
-                s.x, s.y = nx, ny
+            sel = self._selected()
+            anchor = self._by_id(self.selection[0]) if self.selection else None
+            if sel and anchor is not None:
+                base0 = next(b for b in self._start if b.id == anchor.id)
+                nx, gx = snap_box(base0.x + dx, base0.w, vx, self.grid_snap)
+                ny, gy = snap_box(base0.y + dy, base0.h, vy, self.grid_snap)
+                # ONE delta, applied to the whole selection. Snapping each
+                # shape independently let members grab different candidates, so
+                # dragging a group quietly changed the spacing inside it — the
+                # gesture reached for to PRESERVE a layout was deforming it.
+                sdx, sdy = nx - base0.x, ny - base0.y
+                for s in sel:
+                    base = next(b for b in self._start if b.id == s.id)
+                    s.x, s.y = int(base.x + sdx), int(base.y + sdy)
                 if gx is not None:
                     self._guides.append(("v", gx))
                 if gy is not None:
@@ -513,6 +634,13 @@ class DesignerCanvas(ttk.Frame):
             self.shapes.append(s)
             self.selection = [s.id]
             self.inspector.show([s])
+            # Disarm unless the user asked to keep placing. Staying armed meant
+            # the next press — on the shape just placed, to nudge it — drew a
+            # DUPLICATE on top of it instead of moving it, because _press
+            # returns into draw mode before it ever hit-tests. The canvas read
+            # as ignoring the drag, and the stray shape was easy to miss.
+            if not self._draw_sticky:
+                self.set_active_kind(None)
             self._commit()
             return
 
@@ -544,6 +672,24 @@ class DesignerCanvas(ttk.Frame):
         m.add_command(label="Bring forward", command=lambda: self._z(+1))
         m.add_command(label="Send back", command=lambda: self._z(-1))
         m.add_separator()
+        # Dragging snaps to whatever is nearby, which aligns things one pair at
+        # a time. This is the version you can ASK for over a whole selection.
+        n = len(self.selection)
+        am = tk.Menu(m, tearoff=0)
+        for label, ed in (("Left edges", "left"), ("Centres", "hcenter"),
+                          ("Right edges", "right"), ("Tops", "top"),
+                          ("Middles", "vcenter"), ("Bottoms", "bottom")):
+            am.add_command(label=label,
+                           command=lambda e=ed: self._align(e))
+        am.add_separator()
+        dstate = "normal" if n >= 3 else "disabled"
+        am.add_command(label="Space evenly across", state=dstate,
+                       command=lambda: self._distribute("h"))
+        am.add_command(label="Space evenly down", state=dstate,
+                       command=lambda: self._distribute("v"))
+        m.add_cascade(label="Align", menu=am,
+                      state="normal" if n >= 2 else "disabled")
+        m.add_separator()
         m.add_command(label="Duplicate", command=self._duplicate_selected)
         m.add_command(label="Delete", command=self._delete_selected)
         try:
@@ -559,13 +705,36 @@ class DesignerCanvas(ttk.Frame):
         if self.selection:
             self._commit()
 
-    def _nudge(self, dx: int, dy: int):
+    def _disarm(self, _e=None):
+        """Escape: drop the armed palette kind and abandon any in-flight drag.
+
+        Clearing ``_mode`` is what abandons the drag — ``_release`` returns
+        early without it, so the half-drawn rectangle is never committed."""
+        self._mode, self._handle = None, None
+        self._guides = []
+        self.set_active_kind(None)
+        self.redraw()
+
+    def _align(self, edge: str):
+        if align(self._selected(), edge):
+            self._commit()
+
+    def _distribute(self, axis: str):
+        if distribute(self._selected(), axis):
+            self._commit()
+
+    def _nudge(self, dx: int, dy: int, snap: bool = False):
+        """Move the selection. ``snap`` lands it back ON the grid.
+
+        The grid-sized arrow step snaps; the 1px Ctrl step does not. Without
+        that, a shape parked at x=101 by an edge snap walked 101 -> 109 -> 117
+        and could never be got back onto the grid by keyboard at all."""
         sel = self._selected()
         if not sel:
             return
         for s in sel:
-            s.x += dx
-            s.y += dy
+            s.x = snap_to_grid(s.x + dx) if snap else s.x + dx
+            s.y = snap_to_grid(s.y + dy) if snap else s.y + dy
         self._commit()
 
     def _delete_selected(self, _e=None):

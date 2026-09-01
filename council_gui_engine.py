@@ -11163,12 +11163,28 @@ class CouncilConsole(tk.Tk):
         self._gd_project = None          # project name, or None
         self._gd_questions = []
 
+        if not _GUI_DESIGNER_OK:
+            # The flag was set but never read, so a failed gui_* import did not
+            # disable the tab — it raised NameError on the first _gs use, and
+            # since _build_ui calls this unguarded, that took the ENTIRE main
+            # window down with it. One missing module must cost one tab.
+            ttk.Label(
+                self.tab_gui,
+                text=("GUI Designer unavailable — a gui_* module failed to "
+                      "import. The reason was printed to the console at "
+                      "startup. Every other tab is unaffected."),
+                wraplength=920, justify="left",
+            ).pack(anchor="w", padx=10, pady=10)
+            return
+
         ttk.Label(
             self.tab_gui,
             text=("Draw a wireframe: pick a widget on the left, drag it on the "
-                  "canvas, label it, set how it resizes. Generate writes a real "
-                  "multi-file Tkinter app — ui/ is regenerated every time, "
-                  "app.py is yours and is never overwritten."),
+                  "canvas, label it, set how it resizes. An empty Frame is a "
+                  "reserved space — it is held open at the size you drew, with "
+                  "no model call, so you can fill it in later. Generate writes "
+                  "a real multi-file Tkinter app — ui/ is regenerated every "
+                  "time, app.py is yours and is never overwritten."),
             wraplength=920, justify="left",
         ).pack(anchor="w", padx=10, pady=(8, 2))
 
@@ -11201,6 +11217,7 @@ class CouncilConsole(tk.Tk):
                    command=lambda: self._gd_arm(None)).pack(fill="x")
 
         self.gui_canvas = _gc.DesignerCanvas(body, on_change=self._gd_changed,
+                                             on_kind_change=self._gd_kind_changed,
                                              canvas_w=1100, canvas_h=700)
         self.gui_canvas.pack(side="left", fill="both", expand=True)
 
@@ -11223,6 +11240,10 @@ class CouncilConsole(tk.Tk):
 
     def _gd_arm(self, kind):
         self.gui_canvas.set_active_kind(kind)
+
+    def _gd_kind_changed(self, kind):
+        """The canvas disarms itself after placing a widget; drop the palette
+        highlight with it, so the strip never claims a mode the canvas left."""
         if kind is None:
             try:
                 self._gd_palette.selection_clear(0, "end")

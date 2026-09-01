@@ -144,6 +144,96 @@ def test_sibling_edges_include_centres_and_honour_exclude():
 
 
 # ============================================================
+# snap_box — the honest version of snap_value
+# ============================================================
+
+def test_snap_box_aligns_a_trailing_edge():
+    """Right-edge-to-right-edge was unreachable by dragging: only the top-left
+    corner was ever tested against the candidates."""
+    v, guide = gc.snap_box(58, 100, [160.0], grid=8)
+    assert (v, guide) == (60, 160.0), "x=60 puts the 100-wide box's right edge on 160"
+
+
+def test_snap_box_centres_honestly():
+    """The bug this exists for: sibling_edges publishes CENTRES, but snap_value
+    compared them against the shape's LEFT edge — so the guide announced
+    'aligned' while the widget sat half its own width off."""
+    v, guide = gc.snap_box(203, 100, [250.0], grid=8)
+    assert guide == 250.0
+    assert v == 200, "centre of a 100-wide box at x=200 is 250"
+    assert v + 100 / 2 == 250
+
+
+def test_snap_box_prefers_the_leading_edge_on_a_tie():
+    v, _ = gc.snap_box(100, 40, [98.0, 122.0], grid=8)
+    assert v == 98, "equal distance -> the plainer reading wins"
+
+
+def test_snap_box_falls_back_to_the_grid():
+    v, guide = gc.snap_box(101, 100, [], grid=8)
+    assert (v, guide) == (104, None)
+
+    v, guide = gc.snap_box(101, 100, [400.0], grid=8)
+    assert guide is None and v == 104, "candidate outside the threshold is ignored"
+
+
+# ============================================================
+# align / distribute — the version you can ask for
+# ============================================================
+
+def test_align_uses_the_bounding_box_not_selection_order():
+    """Selection order is invisible on screen; anchoring to it would make one
+    command do different things depending on what was clicked first."""
+    a, b, c = mk("a", 100, 0, 50, 20), mk("b", 30, 40, 50, 20), mk("c", 70, 80, 90, 20)
+    assert gc.align([a, b, c], "left")
+    assert [s.x for s in (a, b, c)] == [30, 30, 30]
+
+    a, b, c = mk("a", 100, 0, 50, 20), mk("b", 30, 40, 50, 20), mk("c", 70, 80, 90, 20)
+    gc.align([a, b, c], "right")
+    assert [s.x2 for s in (a, b, c)] == [160, 160, 160]
+
+
+def test_align_centres_account_for_differing_widths():
+    a, b = mk("a", 0, 0, 100, 20), mk("b", 0, 40, 40, 20)
+    gc.align([a, b], "hcenter")
+    assert a.x + a.w / 2 == b.x + b.w / 2
+
+
+def test_align_refuses_a_single_shape_and_an_unknown_edge():
+    a = mk("a", 5, 5, 10, 10)
+    assert not gc.align([a], "left"), "one shape has nothing to align to"
+    assert a.x == 5
+    assert not gc.align([a, mk("b", 0, 0, 10, 10)], "sideways")
+
+
+def test_distribute_evens_the_gaps_not_the_centres():
+    """Equal gaps is what the eye reads as evenly spaced once the widgets are
+    different sizes."""
+    a = mk("a", 0, 0, 100, 20)
+    b = mk("b", 120, 0, 20, 20)
+    c = mk("c", 300, 0, 100, 20)
+    assert gc.distribute([a, b, c], "h")
+    assert (a.x, c.x) == (0, 300), "the outermost two anchor the span"
+    assert b.x - a.x2 == c.x - b.x2, "gaps equal"
+
+
+def test_distribute_needs_three_shapes():
+    a, b = mk("a", 0, 0, 10, 10), mk("b", 50, 0, 10, 10)
+    assert not gc.distribute([a, b], "h")
+    assert (a.x, b.x) == (0, 50)
+
+
+def test_distribute_is_order_independent():
+    """It sorts by position, so passing the selection in click order must not
+    scramble the layout."""
+    shapes = [mk("c", 300, 0, 100, 20), mk("a", 0, 0, 100, 20),
+              mk("b", 120, 0, 20, 20)]
+    gc.distribute(shapes, "h")
+    by = {s.id: s.x for s in shapes}
+    assert by["a"] == 0 and by["c"] == 300 and 100 < by["b"] < 300
+
+
+# ============================================================
 # Hit testing
 # ============================================================
 
