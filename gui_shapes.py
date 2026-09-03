@@ -391,6 +391,11 @@ class Shape:
     z: int = 0
     freeform: bool = False
     props: Dict[str, Any] = field(default_factory=dict)
+    # Colours are their own axis, deliberately OUTSIDE `props`: gui_classify
+    # may only write into props, so keeping colour here makes a model-authored
+    # colour structurally impossible. "" means "inherit from ancestor / OS".
+    bg: str = ""
+    fg: str = ""
     # The typed binding, decided by gui_ports. Keys used today:
     #   name    str          — the port name; absent = derived from the label
     #   type    str          — one of gui_ports.PORT_CAPS[kind].types
@@ -470,6 +475,12 @@ class Window:
     title: str = "Untitled"
     min_w: int = 900
     min_h: int = 600
+    # The chrome colour of the WHOLE generated app. When bg is set, the root
+    # window and MainUi are switched from ttk.Frame to tk.Frame (which honours
+    # `background=` — ttk widgets do not, verified: ttk vista returns 0.0%
+    # magenta while tk returns ~97%). "" means "OS default".
+    bg: str = ""
+    fg: str = ""
 
 
 @dataclass
@@ -507,13 +518,18 @@ class GspecError(ValueError):
 def required_version(project: "Project") -> int:
     """Lowest gspec_version that reads this project without silent loss.
 
-    Stamped by CONTENT, not by the writing build: a project with no ports stays
-    v1 and stays openable by an older build; one that declares even a single
-    port becomes v2 so an older build refuses it (with the clear message
-    load_gspec already emits) instead of dropping the bindings. The previous
-    behaviour of stamping ``p.gspec_version`` back was a live bug — this build
-    exposes it, and this function is the fix."""
+    Stamped by CONTENT, not by the writing build: a project with no ports and
+    no colours stays v1 and stays openable by an older build; one that declares
+    either becomes v2, so an older build refuses it (with the clear message
+    load_gspec already emits) instead of dropping the data. The previous
+    behaviour of stamping ``p.gspec_version`` back was a live bug — this
+    function is the fix, extended here for colour."""
     if any(getattr(s, "port", None) for s in project.shapes):
+        return 2
+    if any(getattr(s, "bg", "") or getattr(s, "fg", "")
+           for s in project.shapes):
+        return 2
+    if project.window.bg or project.window.fg:
         return 2
     return 1
 
@@ -589,6 +605,8 @@ def load_gspec(path: Any) -> Project:
                 z=int(sd.get("z", 0)),
                 freeform=bool(sd.get("freeform", False)),
                 props=dict(sd.get("props") or {}),
+                bg=str(sd.get("bg") or ""),           # v1 files -> ""
+                fg=str(sd.get("fg") or ""),
                 port=dict(sd.get("port") or {}),      # v1 files -> {}
             ))
         except (TypeError, ValueError) as exc:
@@ -609,7 +627,9 @@ def load_gspec(path: Any) -> Project:
                       grid_snap=int(canvas_raw.get("grid_snap", 8))),
         window=Window(title=str(window_raw.get("title") or "Untitled"),
                       min_w=int(window_raw.get("min_w", 900)),
-                      min_h=int(window_raw.get("min_h", 600))),
+                      min_h=int(window_raw.get("min_h", 600)),
+                      bg=str(window_raw.get("bg") or ""),
+                      fg=str(window_raw.get("fg") or "")),
         shapes=shapes,
         clarifications=clars,
         gspec_version=ver,

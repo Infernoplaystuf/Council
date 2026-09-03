@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import gui_colors as _gcol
 from gui_ports import PortSpec
 from gui_shapes import PALETTE
 from gui_spec import COMMAND_KINDS, Spec, WidgetSpec
@@ -141,59 +142,150 @@ def _text_of(w: WidgetSpec) -> str:
 # ============================================================
 # Per-kind construction
 # ============================================================
+#
+# WHY A COLOURED WIDGET IS EMITTED AS CLASSIC tk INSTEAD OF ttk
+# ------------------------------------------------------------
+# ttk widgets have no bg/fg option — ``ttk.Button(bg=...)`` raises `unknown
+# option "-bg"`. ttk colour goes through a named style, and a style option is
+# honoured only if the ACTIVE THEME's element for the widget reads it.
+# Measured on Windows 11 by rendering the widgets and reading pixels:
+#     vista (the Windows default): ttk style background = 0.0% (IGNORED)
+#     clam:                        ttk style background = 95.9% (works)
+# So a style-based colour system on the default Windows theme is a picker
+# that silently does nothing — worse than one that never works. The one fix,
+# style.theme_use("clam"), restyles EVERY widget in the app, so it is not
+# built. Instead: a shape with a colour becomes the classic tk widget, which
+# reads background from its own option database with no theme involved.
+# COLOUR_CAPS in gui_colors names which kinds have a classic equivalent;
+# Notebook, Treeview, Combobox and Progressbar have none, and the inspector
+# refuses to offer a picker for them rather than emit an unhonoured colour.
+
+# ttk kind -> classic (tk.*) constructor for the kinds that CAN be swapped.
+# Anything not in the map falls back to its ttk form even when coloured — the
+# inspector cannot offer the picker for those kinds (COLOUR_CAPS[kind] == ()).
+_CLASSIC_CLASS: Dict[str, str] = {
+    "frame": "tk.Frame", "freeform": "tk.Frame",
+    "labelframe": "tk.LabelFrame", "panedwindow": "tk.PanedWindow",
+    "label": "tk.Label", "button": "tk.Button", "entry": "tk.Entry",
+    "checkbutton": "tk.Checkbutton", "radiobutton": "tk.Radiobutton",
+    "spinbox": "tk.Spinbox", "scale": "tk.Scale",
+    # separator IS a filled rectangle — a tk.Frame with a fixed height IS the
+    # widget, not an approximation.
+    "separator": "tk.Frame",
+}
+
+
+def _colour_kwargs(w: WidgetSpec) -> str:
+    """`, background="#...", foreground="#..."` when the widget declares any.
+
+    Reads from WidgetSpec.bg / .fg (populated by gui_spec.build from
+    Shape.bg / Shape.fg). Skips kinds that cannot honour colour anyway — that
+    is what makes the inspector's "cannot be coloured" story honest rather
+    than a pretence.
+    """
+    cap = _gcol.caps(w.kind)
+    if not cap:
+        return ""
+    bits = []
+    bg = getattr(w, "bg", "") or ""
+    fg = getattr(w, "fg", "") or ""
+    if bg and "bg" in cap:
+        try:
+            bits.append(f"background={_py(_gcol.normalise(bg))}")
+        except ValueError:
+            pass
+    if fg and "fg" in cap:
+        try:
+            bits.append(f"foreground={_py(_gcol.normalise(fg))}")
+        except ValueError:
+            pass
+    return (", " + ", ".join(bits)) if bits else ""
+
+
+def _uses_classic(w: WidgetSpec) -> bool:
+    """A shape becomes classic tk when it carries ANY colour that the kind
+    can honour. The uncolourable native kinds (Notebook/Treeview/Combobox/
+    Progressbar) always stay ttk, and so do composites."""
+    if w.kind not in _CLASSIC_CLASS:
+        return False
+    cap = _gcol.caps(w.kind)
+    if not cap:
+        return False
+    bg = getattr(w, "bg", "") or ""
+    fg = getattr(w, "fg", "") or ""
+    return bool((bg and "bg" in cap) or (fg and "fg" in cap))
+
 
 def construct(w: WidgetSpec, parent: str) -> str:
     """The right-hand side of `self.<name> = ...` for one widget."""
     k = w.kind
     cmd = f", command=self.{w.handler}" if w.handler else ""
+    ck = _colour_kwargs(w)               # empty when no colour or kind cannot
+    classic = _uses_classic(w)
 
     if k in ("frame", "freeform"):
-        return f"ttk.Frame({parent})"
+        cls = "tk.Frame" if classic else "ttk.Frame"
+        return f"{cls}({parent}{ck})"
     if k == "labelframe":
-        return f"ttk.LabelFrame({parent}, text={_py(_text_of(w))})"
+        cls = "tk.LabelFrame" if classic else "ttk.LabelFrame"
+        return f"{cls}({parent}, text={_py(_text_of(w))}{ck})"
     if k == "notebook":
         return f"ttk.Notebook({parent})"
     if k == "panedwindow":
-        return (f"ttk.PanedWindow({parent}, "
-                f"orient={_py(_prop(w, 'orient', 'horizontal'))})")
+        cls = "tk.PanedWindow" if classic else "ttk.PanedWindow"
+        return (f"{cls}({parent}, "
+                f"orient={_py(_prop(w, 'orient', 'horizontal'))}{ck})")
     if k == "label":
-        return (f"ttk.Label({parent}, text={_py(_text_of(w))}, "
-                f"anchor={_py(_prop(w, 'anchor', 'w'))})")
+        cls = "tk.Label" if classic else "ttk.Label"
+        return (f"{cls}({parent}, text={_py(_text_of(w))}, "
+                f"anchor={_py(_prop(w, 'anchor', 'w'))}{ck})")
     if k == "button":
-        return f"ttk.Button({parent}, text={_py(_text_of(w))}{cmd})"
+        cls = "tk.Button" if classic else "ttk.Button"
+        return f"{cls}({parent}, text={_py(_text_of(w))}{cmd}{ck})"
     if k == "entry":
         show = _prop(w, "show", "")
         extra = f", show={_py(show)}" if show else ""
-        return (f"ttk.Entry({parent}, "
-                f"justify={_py(_prop(w, 'justify', 'left'))}{extra})")
+        cls = "tk.Entry" if classic else "ttk.Entry"
+        return (f"{cls}({parent}, "
+                f"justify={_py(_prop(w, 'justify', 'left'))}{extra}{ck})")
     if k == "text":
-        return f"tk.Text({parent}, wrap={_py(_prop(w, 'wrap', 'word'))})"
+        return (f"tk.Text({parent}, "
+                f"wrap={_py(_prop(w, 'wrap', 'word'))}{ck})")
     if k == "checkbutton":
-        return f"ttk.Checkbutton({parent}, text={_py(_text_of(w))}{cmd})"
+        cls = "tk.Checkbutton" if classic else "ttk.Checkbutton"
+        return f"{cls}({parent}, text={_py(_text_of(w))}{cmd}{ck})"
     if k == "radiobutton":
-        return (f"ttk.Radiobutton({parent}, text={_py(_text_of(w))}, "
-                f"value={_py(_prop(w, 'value', ''))}{cmd})")
+        cls = "tk.Radiobutton" if classic else "ttk.Radiobutton"
+        return (f"{cls}({parent}, text={_py(_text_of(w))}, "
+                f"value={_py(_prop(w, 'value', ''))}{cmd}{ck})")
     if k == "combobox":
         state = "readonly" if _prop(w, "readonly", True) else "normal"
         return (f"ttk.Combobox({parent}, "
                 f"values={_py(_prop(w, 'values', []))}, state={_py(state)})")
     if k == "listbox":
         return (f"tk.Listbox({parent}, "
-                f"selectmode={_py(_prop(w, 'selectmode', 'browse'))})")
+                f"selectmode={_py(_prop(w, 'selectmode', 'browse'))}{ck})")
     if k == "spinbox":
-        return (f"ttk.Spinbox({parent}, from_={_py(_prop(w, 'from_', 0))}, "
+        cls = "tk.Spinbox" if classic else "ttk.Spinbox"
+        return (f"{cls}({parent}, from_={_py(_prop(w, 'from_', 0))}, "
                 f"to={_py(_prop(w, 'to', 100))}, "
-                f"increment={_py(_prop(w, 'increment', 1))}{cmd})")
+                f"increment={_py(_prop(w, 'increment', 1))}{cmd}{ck})")
     if k == "scale":
-        return (f"ttk.Scale({parent}, "
+        cls = "tk.Scale" if classic else "ttk.Scale"
+        return (f"{cls}({parent}, "
                 f"orient={_py(_prop(w, 'orient', 'horizontal'))}, "
                 f"from_={_py(_prop(w, 'from_', 0))}, "
-                f"to={_py(_prop(w, 'to', 100))})")
+                f"to={_py(_prop(w, 'to', 100))}{ck})")
     if k == "progressbar":
         return (f"ttk.Progressbar({parent}, "
                 f"orient={_py(_prop(w, 'orient', 'horizontal'))}, "
                 f"mode={_py(_prop(w, 'mode', 'determinate'))})")
     if k == "separator":
+        # A separator IS a 2px filled rectangle when coloured — tk.Frame with
+        # a fixed height. When uncoloured it stays ttk.Separator's native look.
+        if classic:
+            axis = "height=2" if _prop(w, "orient", "horizontal") == "horizontal" else "width=2"
+            return f"tk.Frame({parent}, {axis}{ck})"
         return (f"ttk.Separator({parent}, "
                 f"orient={_py(_prop(w, 'orient', 'horizontal'))})")
     if k == "treeview":
@@ -314,9 +406,14 @@ def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
         L.append("")
     L.append("from .ports import Ports")
     L.append("")
+    # When the window carries a background, MainUi becomes tk.Frame — ttk.Frame
+    # ignores `background=` and there is no theme-portable way around that.
+    # A ttk theme swap would recolour every uncoloured widget in the app too.
+    root_bg = _gcol.normalise(spec.root_bg) if spec.root_bg else ""
+    base = "tk.Frame" if root_bg else "ttk.Frame"
     L += [
         "",
-        "class MainUi(ttk.Frame):",
+        f"class MainUi({base}):",
         '    """Every widget, built and placed. Handlers live in app.py."""',
         "",
         "    def __init__(self, master=None, **kw):",
@@ -326,6 +423,14 @@ def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
         "    def _build(self) -> None:",
     ]
     ind = " " * 8
+    if root_bg:
+        # Both MainUi (self) and the toplevel (root). The toplevel matters
+        # because a MainUi that does not fill it leaves the OS-default frame
+        # visible around the edges. tk.Tk.configure(background=) always works.
+        L.append(f'{ind}self.configure(background={_py(root_bg)})')
+        L.append(f'{ind}try: self.winfo_toplevel().configure('
+                 f'background={_py(root_bg)})')
+        L.append(f'{ind}except tk.TclError: pass')
     L += _grid_config("self", spec.root_row_weights, spec.root_col_weights,
                       spec.root_row_minsizes, spec.root_col_minsizes, ind)
     L.append("")

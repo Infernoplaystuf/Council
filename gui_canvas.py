@@ -383,6 +383,16 @@ class DesignerCanvas(ttk.Frame):
 
     # -- public API ---------------------------------------------------
 
+    def attach_window(self, window,
+                      on_window: Callable[[Dict[str, Any]], None]) -> None:
+        """Tell the inspector's "nothing selected" panel about the project's
+        Window. Called by the tab when a project is opened or created, so the
+        window title / size / colour become editable without a project dialog."""
+        self.inspector._window = window
+        self.inspector._on_window = on_window
+        if not self.selection:
+            self.inspector._empty()
+
     def set_active_kind(self, kind: Optional[str]) -> None:
         """Arm a palette kind; the next click-drag draws one.
 
@@ -1588,12 +1598,18 @@ class _Inspector(ttk.Frame):
     to the catalogue gives it an inspector for free — and, more importantly, so
     the inspector cannot offer a prop that gui_emit has no template for."""
 
-    def __init__(self, master, *, on_apply: Callable[[Dict[str, Any]], None]):
+    def __init__(self, master, *, on_apply: Callable[[Dict[str, Any]], None],
+                 on_window: Optional[Callable[[Dict[str, Any]], None]] = None,
+                 window=None):
         super().__init__(master)
         self._on_apply = on_apply
+        self._on_window = on_window       # invoked with {title/min_w/min_h/bg/fg}
+        self._window = window             # gui_shapes.Window instance
         self._vars: Dict[str, tk.Variable] = {}
         self._prop_vars: Dict[str, tk.Variable] = {}
         self._port_vars: Dict[str, tk.Variable] = {}
+        self._col_vars: Dict[str, tk.Variable] = {}
+        self._win_vars: Dict[str, tk.Variable] = {}
         self._shapes: List[Shape] = []
         ttk.Label(self, text="Properties").pack(anchor="w", pady=(0, 4))
         self.body = ttk.Frame(self)
@@ -1603,6 +1619,13 @@ class _Inspector(ttk.Frame):
     def _empty(self) -> None:
         for w in self.body.winfo_children():
             w.destroy()
+        # When nothing is selected the panel shows WINDOW controls — title,
+        # min size, and background/foreground colour. Without this the window
+        # colour would be uneditable from the UI, and the whole colour story
+        # would land only for individual widgets.
+        if self._window is not None and self._on_window is not None:
+            self._window_panel()
+            return
         ttk.Label(self.body, text="(nothing selected)",
                   foreground=THEME["subtext"]).pack(anchor="w")
 
@@ -1613,6 +1636,7 @@ class _Inspector(ttk.Frame):
         self._vars.clear()
         self._prop_vars.clear()
         self._port_vars.clear()
+        self._col_vars.clear()
         if not shapes:
             self._empty()
             return
@@ -1632,6 +1656,7 @@ class _Inspector(ttk.Frame):
 
         if not multi:
             self._binding_block(s)
+            self._colour_block(s)
 
         schema = PALETTE.get(s.kind, {}).get("prop_schema") or {}
         if schema and not multi:
@@ -1653,6 +1678,131 @@ class _Inspector(ttk.Frame):
                               prop=True)
         ttk.Button(self.body, text="Apply", command=self._apply).pack(
             anchor="w", pady=(8, 0))
+
+    # -- window panel + colour block ---------------------------------
+
+    def _window_panel(self) -> None:
+        """The controls that DON'T belong to any shape: window title, min
+        size, and window bg/fg. Applied via a separate callback so shape and
+        window edits never race for the same _apply_props dispatch."""
+        import gui_colors as _gcol
+        w = self._window
+        self._win_vars.clear()
+        ttk.Label(self.body, text="Window",
+                  foreground=THEME["subtext"]).pack(anchor="w", pady=(0, 4))
+        self._winrow("title", "Title", w.title)
+        self._winrow("min_w", "Min width", w.min_w, caster=int)
+        self._winrow("min_h", "Min height", w.min_h, caster=int)
+        ttk.Separator(self.body).pack(fill="x", pady=6)
+        ttk.Label(self.body, text="Background").pack(anchor="w")
+        self._colour_field("bg", w.bg, target=self._win_vars)
+        ttk.Label(self.body, text="Text colour").pack(anchor="w")
+        self._colour_field("fg", w.fg, target=self._win_vars)
+        ttk.Button(self.body, text="Apply", command=self._apply_window).pack(
+            anchor="w", pady=(8, 0))
+
+    def _winrow(self, key, label, value, caster=str) -> None:
+        ttk.Label(self.body, text=label).pack(anchor="w")
+        v = tk.StringVar(value="" if value is None else str(value))
+        ttk.Entry(self.body, textvariable=v, width=24).pack(anchor="w")
+        v._caster = caster                  # type: ignore[attr-defined]
+        self._win_vars[key] = v
+
+    def _apply_window(self) -> None:
+        out: Dict[str, Any] = {}
+        for k, var in self._win_vars.items():
+            out[k] = _cast(var)
+        if self._on_window is not None:
+            self._on_window(out)
+
+    def _colour_block(self, s: Shape) -> None:
+        """Background/foreground picker for a single selected shape. When the
+        kind cannot honour colour (Notebook, Treeview, Combobox,
+        Progressbar, composites), the section shows the REASON from
+        gui_colors.COLOUR_NOTE instead of a picker — same discipline as the
+        Binding block."""
+        import gui_colors as _gcol
+        ttk.Separator(self.body).pack(fill="x", pady=6)
+        ttk.Label(self.body, text="Colour").pack(anchor="w")
+        cap = _gcol.caps(s.kind)
+        if not cap:
+            note = _gcol.note(s.kind) or "This kind cannot be coloured."
+            ttk.Label(self.body, text=note, foreground=THEME["subtext"],
+                      wraplength=200, justify="left").pack(anchor="w")
+            return
+        if "bg" in cap:
+            ttk.Label(self.body, text="Background").pack(anchor="w")
+            self._colour_field("bg", getattr(s, "bg", ""),
+                               target=self._col_vars)
+        if "fg" in cap:
+            ttk.Label(self.body, text="Text colour").pack(anchor="w")
+            self._colour_field("fg", getattr(s, "fg", ""),
+                               target=self._col_vars)
+
+    def _colour_field(self, key: str, value: str,
+                      target: Dict[str, tk.Variable]) -> None:
+        """One colour row: a swatch dropdown + a hex entry.
+
+        Uses gui_colors.PALETTES for the dropdown; a raw hex in the entry
+        wins over the dropdown selection (empty entry = the dropdown wins;
+        empty both = revert to inherit)."""
+        import gui_colors as _gcol
+        row = ttk.Frame(self.body)
+        row.pack(fill="x")
+        # Swatch dropdown: a list of "PaletteName: label (#hex)" plus a
+        # "(inherit)" entry at the top for the revert case.
+        options: List[str] = ["(inherit)"]
+        by_label: Dict[str, str] = {}
+        for pname, cols in _gcol.PALETTES.items():
+            for hexv in cols:
+                label = f"{pname}: {hexv}"
+                options.append(label)
+                by_label[label] = hexv
+        current = ""
+        try:
+            current_hex = _gcol.normalise(value) if value else ""
+        except ValueError:
+            current_hex = ""
+        for lbl, hexv in by_label.items():
+            if hexv == current_hex:
+                current = lbl
+                break
+        pv = tk.StringVar(value=current)
+        cb = ttk.Combobox(row, textvariable=pv, values=options,
+                          state="readonly", width=18)
+        cb.pack(side="left")
+        hv = tk.StringVar(value=current_hex)
+        e = ttk.Entry(row, textvariable=hv, width=10)
+        e.pack(side="left", padx=(4, 0))
+        # A tiny preview chip.
+        chip = tk.Frame(row, width=16, height=16,
+                        bg=current_hex or THEME["surface"],
+                        highlightthickness=1,
+                        highlightbackground=THEME["overlay"])
+        chip.pack(side="left", padx=(4, 0))
+        chip.pack_propagate(False)
+
+        def _sync_from_dropdown(*_a):
+            lbl = pv.get()
+            if lbl and lbl != "(inherit)" and lbl in by_label:
+                hv.set(by_label[lbl])
+            elif lbl == "(inherit)":
+                hv.set("")
+            _repaint_chip()
+
+        def _repaint_chip(*_a):
+            try:
+                col = _gcol.normalise(hv.get()) if hv.get() else ""
+            except ValueError:
+                col = ""
+            try:
+                chip.configure(bg=col or THEME["surface"])
+            except tk.TclError:
+                pass
+        pv.trace_add("write", _sync_from_dropdown)
+        hv.trace_add("write", _repaint_chip)
+        hv._caster = str                    # type: ignore[attr-defined]
+        target[key] = hv
 
     # -- binding block ------------------------------------------------
 
@@ -1773,6 +1923,12 @@ class _Inspector(ttk.Frame):
             port[k] = raw
         if port:
             out["port"] = port
+        # Colours live on the shape directly, not under any dict — they are
+        # emitted as top-level keys so _apply_props writes them through the
+        # `hasattr(s, k)` branch, same as `label` / `note`.
+        for k in ("bg", "fg"):
+            if k in self._col_vars:
+                out[k] = _cast(self._col_vars[k])
         self._on_apply(out)
 
 

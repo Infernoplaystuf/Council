@@ -11321,6 +11321,7 @@ class CouncilConsole(tk.Tk):
             return
         self._gd_project = name
         self.gui_canvas.load([])
+        self._gd_wire_window()
         self._gd_log(f"created {name} ({mode})")
         self._gd_changed()
 
@@ -11345,8 +11346,30 @@ class CouncilConsole(tk.Tk):
             _grun.stop(old)
         self._gd_project = name
         self.gui_canvas.load(proj.shapes)
+        self._gd_wire_window()
         self._gd_log(f"opened {name} ({len(proj.shapes)} shape(s))")
         self._gd_changed()
+
+    def _gd_wire_window(self) -> None:
+        """Show Window controls in the inspector's empty state, and save
+        through the same helper so bg / title / min size survive regen."""
+        if not self._gd_project:
+            return
+        try:
+            proj = _gp.open_project(self._gd_project, vault_dir=VAULT_DIR)
+        except Exception:
+            return
+
+        def _apply(values):
+            for k, v in values.items():
+                if hasattr(proj.window, k):
+                    setattr(proj.window, k, v)
+            proj.shapes = self.gui_canvas.export()
+            _gp.save_project(self._gd_project, proj, vault_dir=VAULT_DIR)
+            self.gui_canvas.mark_saved()
+            self._gd_log(f"window: bg={proj.window.bg or '(none)'} "
+                         f"title={proj.window.title!r}")
+        self.gui_canvas.attach_window(proj.window, _apply)
 
     def _gd_save(self):
         if not self._gd_project:
@@ -11402,7 +11425,9 @@ class CouncilConsole(tk.Tk):
                     port_registry=getattr(man, "port_names", {}) or {},
                     project=self._gd_project,
                     mode=man.mode, title=proj.window.title,
-                    min_w=proj.window.min_w, min_h=proj.window.min_h)
+                    min_w=proj.window.min_w, min_h=proj.window.min_h,
+                    root_bg=getattr(proj.window, "bg", "") or "",
+                    root_fg=getattr(proj.window, "fg", "") or "")
                 for w in tree.warnings:
                     out.append(f"warning: {w}")
 
@@ -11411,17 +11436,11 @@ class CouncilConsole(tk.Tk):
                     out.extend(f"cannot generate: {e}" for e in errs)
                     return (out, questions)
 
-                # Port names live on a parallel registry. Compute the RENAME
-                # plan first: an old name that is aliased is not an orphan,
-                # it is redirected. Only ports removed outright reach
-                # find_orphans, and even those are already caught in
-                # plan.removed with the same actionable message.
+                # Plan renames first; an aliased old name is redirected, not
+                # orphaned. valid_ports lets find_orphans see aliases as live.
                 new_ports = spec.port_registry() if hasattr(spec, "port_registry") else {}
                 plan = _gp.plan_ports(
                     pdir, getattr(man, "port_names", {}) or {}, new_ports)
-                # Aliased old names count as "known" for find_orphans so a
-                # rename with a live reference does not double-report as both
-                # a rename and an orphan.
                 valid_ports = set(new_ports.values()) | set(plan.aliases)
                 orphans = _gp.find_orphans(
                     pdir, spec.widget_names, new_port_names=valid_ports)
@@ -11431,12 +11450,8 @@ class CouncilConsole(tk.Tk):
                     out.extend("  " + c for c in plan.collisions)
                     return (out, questions)
                 for old, new in plan.renamed:
-                    if old in plan.aliases:
-                        out.append(f"port renamed: {old} -> {new} "
-                                   f"(aliased for now; the alias vanishes once "
-                                   f"the last self.ports.{old} is gone)")
-                    else:
-                        out.append(f"port renamed: {old} -> {new}")
+                    tag = " (aliased for now)" if old in plan.aliases else ""
+                    out.append(f"port renamed: {old} -> {new}{tag}")
 
                 if orphans:
                     out.append("BLOCKED — hand-written code still uses these:")

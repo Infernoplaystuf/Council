@@ -133,6 +133,12 @@ class WidgetSpec:
     # opted out. Radio group members share the SAME PortSpec instance.
     port: Optional[PortSpec] = None
 
+    # Colour, copied from Shape.bg / Shape.fg. Emitted only for kinds that
+    # can honour it (gui_colors.COLOUR_CAPS); the emitter's classic-tk swap
+    # is what makes that honouring possible on the default Windows theme.
+    bg: str = ""
+    fg: str = ""
+
 
 @dataclass
 class Spec:
@@ -141,6 +147,11 @@ class Spec:
     title: str = "Untitled"
     min_w: int = 900
     min_h: int = 600
+    # Root/MainUi colour. When bg is set, emit_main_ui swaps MainUi from
+    # ttk.Frame to tk.Frame (which honours `background=`) and configures
+    # both self and the toplevel with the colour.
+    root_bg: str = ""
+    root_fg: str = ""
     widgets: List[WidgetSpec] = field(default_factory=list)
     root_children: List[str] = field(default_factory=list)
     root_row_weights: List[int] = field(default_factory=list)
@@ -210,7 +221,8 @@ def build(shapes: Sequence[Shape], layout_tree: Any,
           port_registry: Optional[Dict[str, str]] = None,
           project: str = "untitled", mode: str = "linked",
           title: str = "Untitled", min_w: int = 900,
-          min_h: int = 600) -> Spec:
+          min_h: int = 600,
+          root_bg: str = "", root_fg: str = "") -> Spec:
     """Assemble the IR.
 
     ``classifications`` maps shape id -> {"kind", "props"} for shapes the model
@@ -223,7 +235,8 @@ def build(shapes: Sequence[Shape], layout_tree: Any,
     app.py references it and rename is a deliberate action, not a side effect
     of retyping a label (§3 in the build spec)."""
     spec = Spec(project=project, mode=mode, title=title,
-                min_w=min_w, min_h=min_h)
+                min_w=min_w, min_h=min_h,
+                root_bg=root_bg, root_fg=root_fg)
     spec.warnings.extend(getattr(layout_tree, "warnings", []) or [])
     nodes = getattr(layout_tree, "nodes", {}) or {}
     reg = dict(registry or {})
@@ -265,6 +278,8 @@ def build(shapes: Sequence[Shape], layout_tree: Any,
             note=s.note, props=props[s.id],
             parent=names.get(getattr(n, "parent_id", None) or "") or None,
             is_container=is_container(kind),
+            bg=str(getattr(s, "bg", "") or ""),
+            fg=str(getattr(s, "fg", "") or ""),
         )
         if kind in COMMAND_KINDS:
             w.handler = f"on_{w.name}"
