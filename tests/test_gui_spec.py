@@ -211,6 +211,119 @@ def test_validate_catches_a_window_that_cannot_resize():
     assert not ok and any("will not resize" in e for e in errs)
 
 
+# ============================================================
+# Typed bindings — Step 3 of the ports plan
+# ============================================================
+
+def test_ports_derive_from_labels_without_typing():
+    """The common case: name a widget, get a port with the same slug."""
+    spec = built([mk("entry", 0, 0, 200, 24, sid="e", label="Scan Folder"),
+                  mk("button", 220, 0, 100, 30, sid="b", label="Start scan"),
+                  mk("checkbutton", 0, 40, 120, 24, sid="c", label="Dry run")])
+    ports = {p.name: p for p in spec.ports}
+    assert set(ports) == {"scan_folder", "start_scan", "dry_run"}
+    assert ports["scan_folder"].direction == "i"
+    assert ports["start_scan"].binder == "event"
+    assert ports["dry_run"].var_class == "BooleanVar"
+
+
+def test_a_caption_label_gets_no_port_by_default_but_can_be_opted_in():
+    """A Label whose only role is to caption an Entry does not need a port,
+    but a Label used as a status display DOES — the port dict is the opt-in."""
+    plain = mk("label", 0, 0, 100, 20, sid="L", label="Files:")
+    plain.port = {"off": True}
+    active = mk("label", 0, 40, 200, 20, sid="M", label="Status")
+    spec = built([plain, active])
+    got = {w.shape_id: (w.port.name if w.port else None) for w in spec.widgets}
+    assert got["L"] is None
+    assert got["M"] == "status"
+
+
+def test_a_radio_group_becomes_ONE_port_shared_by_its_members():
+    """One PortSpec instance, referenced by every member's w.port."""
+    outer = mk("frame", 0, 0, 400, 200, sid="f", label="mode",
+               freeform=False)
+    r1 = mk("radiobutton", 20, 40, 120, 24, sid="r1", label="Fast",
+            props={"group": "mode", "value": "fast"})
+    r2 = mk("radiobutton", 20, 80, 120, 24, sid="r2", label="Thorough",
+            props={"group": "mode", "value": "thorough"})
+    spec = built([outer, r1, r2])
+    assert spec.by_shape("r1").port is spec.by_shape("r2").port, (
+        "radio group members must share the SAME PortSpec instance")
+    assert spec.by_shape("r1").port.name == "mode"
+    assert spec.by_shape("r1").port.choices == ("fast", "thorough")
+    assert len(spec.ports) == 1, "one port, not two"
+
+
+def test_a_registered_port_name_wins_over_a_new_label():
+    """Retyping the label of a widget hand-written code depends on must NOT
+    silently rename the port."""
+    shapes = [mk("entry", 0, 0, 200, 24, sid="e", label="Scan Folder")]
+    reg = {"e": "scan_dir"}
+    spec = built(shapes, port_registry=reg)
+    assert spec.by_shape("e").port.name == "scan_dir"
+
+
+def test_port_registry_survives_a_relabel():
+    """The regeneration-safety property, in its own test — retyping a label
+    keeps the same port name in the returned registry."""
+    shapes = [mk("entry", 0, 0, 200, 24, sid="e", label="Scan Folder")]
+    first = built(shapes)
+    reg = first.port_registry()
+    shapes[0].label = "Where To Look"
+    again = built(shapes, port_registry=reg)
+    assert again.by_shape("e").port.name == "scan_folder"
+
+
+def test_validate_catches_a_duplicate_radio_value_within_one_group():
+    """var.get() would be ambiguous — the widget silently reports whichever
+    button was clicked LAST wrote the shared var."""
+    r1 = mk("radiobutton", 0, 0, 100, 24, sid="r1", label="A",
+            props={"group": "g", "value": "same"})
+    r2 = mk("radiobutton", 0, 40, 100, 24, sid="r2", label="B",
+            props={"group": "g", "value": "same"})
+    spec = built([r1, r2])
+    ok, errs = gsp.validate(spec)
+    assert not ok and any("ambiguous" in e for e in errs)
+
+
+def test_validate_catches_a_radio_default_that_is_not_a_member_value():
+    """Silently deselects every radio on init."""
+    r1 = mk("radiobutton", 0, 0, 100, 24, sid="r1", label="A",
+            props={"group": "g", "value": "a"},
+            port={"default": "z"})
+    r2 = mk("radiobutton", 0, 40, 100, 24, sid="r2", label="B",
+            props={"group": "g", "value": "b"})
+    spec = built([r1, r2])
+    ok, errs = gsp.validate(spec)
+    assert not ok and any("not one of" in e and "z" in e for e in errs)
+
+
+def test_validate_catches_a_bad_port_type_from_the_gspec():
+    """A hand-edited .gspec that names a type not in the kind's caps."""
+    e = mk("entry", 0, 0, 200, 24, sid="e", label="Age")
+    e.port = {"type": "bool"}
+    spec = built([e])
+    ok, errs = gsp.validate(spec)
+    assert not ok and any("port type" in e for e in errs)
+
+
+def test_port_registry_uses_group_keys_for_radios():
+    """Radio port names live under `group:<parent>/<name>`, not any single
+    member's id — a later regeneration that reorders members must still hit
+    the same entry."""
+    f = mk("frame", 0, 0, 400, 200, sid="f", label="")
+    r1 = mk("radiobutton", 10, 40, 100, 24, sid="r1", label="A",
+            props={"group": "size", "value": "a"})
+    r2 = mk("radiobutton", 10, 80, 100, 24, sid="r2", label="B",
+            props={"group": "size", "value": "b"})
+    spec = built([f, r1, r2])
+    reg = spec.port_registry()
+    keys = [k for k in reg if k.startswith("group:")]
+    assert len(keys) == 1
+    assert reg[keys[0]] == "size"
+
+
 def test_spec_module_is_pure():
     import ast
     src = (Path(__file__).resolve().parent.parent / "gui_spec.py").read_text(

@@ -31,6 +31,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import gui_ports as _gpo
+from gui_ports import PortSpec
 from gui_shapes import GENERIC_KIND, PALETTE, RESIZE_MODES, Shape, is_container
 
 # kind -> attribute prefix (spec 7.2). The tuple of these prefixes is mirrored
@@ -127,6 +129,10 @@ class WidgetSpec:
     explicit_w: int = 0
     explicit_h: int = 0
 
+    # typed binding, when the kind has one and the widget is not explicitly
+    # opted out. Radio group members share the SAME PortSpec instance.
+    port: Optional[PortSpec] = None
+
 
 @dataclass
 class Spec:
@@ -167,6 +173,32 @@ class Spec:
     def handlers(self) -> List[str]:
         return sorted({w.handler for w in self.widgets if w.handler})
 
+    @property
+    def ports(self) -> List[PortSpec]:
+        """The ports, deduplicated. Radio group members share one PortSpec, so
+        without dedup a group of three radios would appear three times."""
+        seen: List[PortSpec] = []
+        seen_ids = set()
+        for w in self.widgets:
+            if w.port is None or id(w.port) in seen_ids:
+                continue
+            seen.append(w.port)
+            seen_ids.add(id(w.port))
+        return seen
+
+    @property
+    def port_names(self) -> List[str]:
+        return [p.name for p in self.ports]
+
+    def port_registry(self, parents: Optional[Dict[str, str]] = None
+                      ) -> Dict[str, str]:
+        """The port_names registry entry to persist in the manifest.
+
+        Delegates to gui_ports.registry_for so key formation (per-shape versus
+        the ``group:<parent>/<name>`` shape used for radio groups) is decided
+        in one place — same discipline as name_registry above."""
+        return _gpo.registry_for(self.ports, parents=parents)
+
 
 # ============================================================
 # build
@@ -175,6 +207,7 @@ class Spec:
 def build(shapes: Sequence[Shape], layout_tree: Any,
           classifications: Optional[Dict[str, Any]] = None, *,
           registry: Optional[Dict[str, str]] = None,
+          port_registry: Optional[Dict[str, str]] = None,
           project: str = "untitled", mode: str = "linked",
           title: str = "Untitled", min_w: int = 900,
           min_h: int = 600) -> Spec:
@@ -184,7 +217,11 @@ def build(shapes: Sequence[Shape], layout_tree: Any,
     typed; it is applied BEFORE naming so a classified treeview is named tbl_,
     not the lbl_ its generic placeholder would have produced.
 
-    ``registry`` is the manifest's shape id -> name map. Existing names win."""
+    ``registry`` is the manifest's shape id -> name map. Existing names win.
+    ``port_registry`` is the manifest's port_names, wired the same way — a
+    registered port name wins over a fresh derivation, because hand-written
+    app.py references it and rename is a deliberate action, not a side effect
+    of retyping a label (§3 in the build spec)."""
     spec = Spec(project=project, mode=mode, title=title,
                 min_w=min_w, min_h=min_h)
     spec.warnings.extend(getattr(layout_tree, "warnings", []) or [])
@@ -250,6 +287,35 @@ def build(shapes: Sequence[Shape], layout_tree: Any,
         spec.root_col_weights = list(root.col_weights)
         spec.root_row_minsizes = list(root.row_minsizes)
         spec.root_col_minsizes = list(root.col_minsizes)
+
+    # -- typed bindings ------------------------------------------------
+    #
+    # Ports are derived from a SHIM view of each shape that carries the
+    # classified kind and merged props — gui_ports duck-types on
+    # .id/.kind/.label/.props/.port, so the shim only needs those fields.
+    # This is the seam that keeps a classified generic Frame from getting a
+    # Frame's "no port" answer.
+    class _S:
+        __slots__ = ("id", "kind", "label", "props", "port", "z")
+    shims = []
+    for s in shapes:
+        sh = _S()
+        sh.id = s.id
+        sh.kind = kinds[s.id]
+        sh.label = s.label
+        sh.props = props[s.id]
+        sh.port = dict(getattr(s, "port", None) or {})
+        sh.z = s.z
+        shims.append(sh)
+    parents = {c: getattr(n, "parent_id", None) for c in names
+               for n in [nodes.get(c)] if n is not None}
+    ports = _gpo.build_ports(shims, parents=parents, registry=port_registry)
+    by_sid: Dict[str, PortSpec] = {}
+    for p in ports:
+        for sid in p.shape_ids:
+            by_sid[sid] = p
+    for w in spec.widgets:
+        w.port = by_sid.get(w.shape_id)
     return spec
 
 
@@ -268,6 +334,7 @@ def validate(spec: Spec) -> Tuple[bool, List[str]]:
     into five rounds."""
     errs: List[str] = []
     seen: Dict[str, str] = {}
+    seen_ports: Dict[str, str] = {}   # port name -> shape id
 
     for w in spec.widgets:
         where = f"{w.label or w.kind} ({w.name})"
@@ -311,6 +378,48 @@ def validate(spec: Spec) -> Tuple[bool, List[str]]:
             errs.append(f"{where}: parent {w.parent!r} is not in the spec")
         if not w.is_container and w.children:
             errs.append(f"{where}: {w.kind} cannot contain children")
+
+        # -- port validation --------------------------------------------
+        cap = _gpo.caps(w.kind)
+        if w.port is None:
+            # An explicit port on a kind with no caps must not just quietly
+            # vanish — build_ports drops it, but the AUTHOR asked for it.
+            if not cap.types and dict(getattr(spec.by_shape(w.shape_id), "props",
+                                              None) or {}).get("port"):
+                errs.append(f"{where}: {w.kind} cannot have a port — "
+                            f"{_gpo.note(w.kind)}")
+            continue
+        p = w.port
+        ok, why = _gpo.validate_port_name(
+            p.name, taken=[n for n in seen_ports if n != p.name])
+        if not ok:
+            errs.append(f"{where}: port name {why}")
+        # A radio group shows this port once per member; skip the seen check
+        # for the additional members so we do not report a self-duplicate.
+        prior = seen_ports.get(p.name)
+        if prior is not None and prior != p.shape_ids[0]:
+            errs.append(f"{where}: duplicate port name {p.name!r}")
+        else:
+            seen_ports.setdefault(p.name, p.shape_ids[0] if p.shape_ids else w.shape_id)
+        if cap.types and p.type not in cap.types:
+            errs.append(f"{where}: port type {p.type!r} not in "
+                        f"{list(cap.types)}")
+        if cap.dirs and p.direction not in cap.dirs:
+            errs.append(f"{where}: port direction {p.direction!r} not in "
+                        f"{list(cap.dirs)}")
+        # Radio group: default must be one of the actual member values, else
+        # every button silently deselects on init.
+        if w.kind == "radiobutton" and p.default is not None:
+            if p.default not in p.choices:
+                errs.append(f"{where}: radio default {p.default!r} is not "
+                            f"one of {list(p.choices)}")
+        # Radio group: duplicate value= within one group means var.get() is
+        # ambiguous — the widget silently reports whichever button was clicked
+        # LAST wrote the shared var.
+        if w.kind == "radiobutton" and len(p.choices) != len(set(p.choices)):
+            dups = sorted({v for v in p.choices if p.choices.count(v) > 1})
+            errs.append(f"{where}: duplicate radio value(s) {dups} in group "
+                        f"{p.group!r} — var.get() would be ambiguous")
 
     # A window with no elastic axis cannot be resized — gui_layout guarantees
     # against it, so reaching here means the tree was built some other way.

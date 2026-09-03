@@ -323,9 +323,12 @@ def build_ports(shapes: Sequence[Any],
             value = str(props.get("value") or slug(_label_of(props, getattr(s, "label", ""))))
             existing = radio_ports.get(key)
             if existing is not None:
-                # extend the group
-                if value not in existing.choices:
-                    existing.choices = tuple(list(existing.choices) + [value])
+                # extend the group. choices preserves DUPLICATES on purpose:
+                # two radios with the same value= is a spec bug because
+                # var.get() cannot tell them apart, so gui_spec.validate has
+                # to see it. Emit iterates shape_ids, not choices, so the
+                # duplication does not double-configure the widget.
+                existing.choices = tuple(list(existing.choices) + [value])
                 existing.shape_ids = tuple(list(existing.shape_ids) + [
                     str(getattr(s, "id", ""))])
                 continue
