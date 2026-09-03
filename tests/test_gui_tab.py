@@ -242,6 +242,80 @@ def test_generate_refuses_when_hand_written_code_would_break(console, tmp_path):
     assert "BLOCKED" in log and "btn_gone" in log
 
 
+def test_generate_writes_a_runnable_project_that_carries_ports(console, tmp_path):
+    """Step 5+7: `self.ports = Ports(self)` reaches generated code, and the
+    manifest keeps the port registry across regenerations."""
+    from gui_shapes import new_shape
+    c, gp = console
+    gp.create("demo", vault_dir=tmp_path / "vault")
+    c._gd_project = "demo"
+    e = new_shape("entry", 0, 0, label="Scan Folder")
+    b = new_shape("button", 0, 60, label="Start scan")
+    c.gui_canvas.load([e, b])
+    c._gd_generate()
+    pdir = tmp_path / "vault" / "GUI_Projects" / "demo"
+    src = (pdir / "ui" / "main_ui.py").read_text(encoding="utf-8")
+    assert "self.ports = Ports(self)" in src
+    ast.parse((pdir / "ui" / "ports.py").read_text(encoding="utf-8"))
+    man = gp.load_manifest(pdir)
+    # port_names is stored, and re-generation reuses it
+    assert "scan_folder" in set(man.port_names.values())
+
+
+def test_generate_aliases_a_renamed_port_that_is_still_referenced(console, tmp_path):
+    """Step 7 through the tab. Rename the port, keep the old name in app.py,
+    regenerate. The Generate log announces the alias; ports.py carries the
+    RENAMED entry; app.py's old reference keeps working."""
+    from gui_shapes import new_shape
+    c, gp = console
+    gp.create("demo", vault_dir=tmp_path / "vault")
+    c._gd_project = "demo"
+    e = new_shape("entry", 0, 0, label="Scan Folder")
+    c.gui_canvas.load([e])
+    c._gd_generate()                       # first pass writes ports.py
+
+    pdir = tmp_path / "vault" / "GUI_Projects" / "demo"
+    # App.py still uses the OLD name.
+    (pdir / "app.py").write_text(
+        "class App:\n    def start(self):\n"
+        "        p = self.ports.scan_folder\n", encoding="utf-8")
+
+    # Now the user renames the port on the shape. load() deep-copied, so the
+    # canvas's shape is the one to mutate.
+    c.gui_canvas.shapes[0].port = {"name": "scan_dir"}
+    c.logged.clear()
+    c._gd_generate()
+    log = "\n".join(c.logged)
+    assert "port renamed" in log and "scan_folder -> scan_dir" in log, log
+
+    ports_src = (pdir / "ui" / "ports.py").read_text(encoding="utf-8")
+    assert 'RENAMED["scan_folder"] = "scan_dir"' in ports_src
+
+
+def test_generate_blocks_when_a_port_is_removed_that_the_app_uses(console, tmp_path):
+    """The self-expiring alias covers renames; a genuine DELETE has to block,
+    because there is nothing to alias the old name TO."""
+    from gui_shapes import new_shape
+    c, gp = console
+    gp.create("demo", vault_dir=tmp_path / "vault")
+    c._gd_project = "demo"
+    e = new_shape("entry", 0, 0, label="Scan Folder")
+    c.gui_canvas.load([e])
+    c._gd_generate()
+
+    pdir = tmp_path / "vault" / "GUI_Projects" / "demo"
+    (pdir / "app.py").write_text(
+        "class App:\n    def start(self):\n"
+        "        p = self.ports.scan_folder\n", encoding="utf-8")
+
+    # Drop the entry — the port is genuinely gone.
+    c.gui_canvas.load([new_shape("button", 0, 0, label="Only")])
+    c.logged.clear()
+    c._gd_generate()
+    log = "\n".join(c.logged)
+    assert "BLOCKED" in log and "scan_folder" in log
+
+
 def test_generate_is_disabled_on_a_detached_project(console, tmp_path):
     from gui_shapes import new_shape
     c, gp = console

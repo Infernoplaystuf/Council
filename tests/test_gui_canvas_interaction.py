@@ -228,6 +228,64 @@ def test_align_through_the_widget_is_one_undo_step(canvas):
         "one align must undo in exactly one step")
 
 
+# ============================================================
+# Inspector — Binding block (Step 8)
+# ============================================================
+
+def _apply_inspector(canvas):
+    """Trigger the same code path the Apply button would."""
+    canvas.inspector._apply()
+
+
+def test_the_inspector_shows_a_binding_row_for_an_entry(canvas):
+    """A bindable kind gets the section — Direction, Name, Default."""
+    place(canvas, "entry", 20, 20, 220, 44)
+    labels = [w.cget("text") for w in canvas.inspector.body.winfo_children()
+              if isinstance(w, __import__("tkinter").ttk.Label)]
+    assert any("Binding" in t for t in labels)
+    assert any("Direction" in t for t in labels)
+    assert any("Name" in t for t in labels), labels
+
+
+def test_the_inspector_shows_a_note_for_an_unbindable_kind(canvas):
+    """A container has no port; the section explains why instead of showing
+    a picker that would silently do nothing (the colour-inspector rule)."""
+    place(canvas, "frame", 20, 20, 300, 200)
+    labels = [w.cget("text") for w in canvas.inspector.body.winfo_children()
+              if isinstance(w, __import__("tkinter").ttk.Label)]
+    joined = " | ".join(labels)
+    assert "Binding" in joined
+    # The exact reason string comes from gui_ports.PORT_NOTE
+    assert "container" in joined or "children" in joined, joined
+
+
+def test_inspector_writes_into_shape_dot_port_not_props(canvas):
+    """A binding-row change must NOT leak into props — gui_classify may only
+    write into props, so port living elsewhere is what makes a model-authored
+    port structurally impossible."""
+    place(canvas, "entry", 20, 20, 220, 44)
+    shape = canvas.shapes[0]
+    # Set a non-derived name via the inspector
+    canvas.inspector._port_vars["name"].set("my_field")
+    _apply_inspector(canvas)
+    assert shape.port.get("name") == "my_field"
+    assert "name" not in shape.props, "port fields must not leak into props"
+
+
+def test_inspector_empty_name_reverts_to_the_default(canvas):
+    """Clearing the field is the [reset] gesture — the derived name comes
+    back on next Generate, and the .gspec is not polluted with the empty
+    string."""
+    place(canvas, "entry", 20, 20, 220, 44)
+    shape = canvas.shapes[0]
+    canvas.inspector._port_vars["name"].set("temp")
+    _apply_inspector(canvas)
+    assert shape.port.get("name") == "temp"
+    canvas.inspector._port_vars["name"].set("")
+    _apply_inspector(canvas)
+    assert "name" not in shape.port
+
+
 def test_align_on_one_shape_does_not_push_an_undo_entry(canvas):
     place(canvas, "button", 40, 40, 140, 70)
     canvas.selection = [canvas.shapes[0].id]

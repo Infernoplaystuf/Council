@@ -11398,7 +11398,9 @@ class CouncilConsole(tk.Tk):
                 tree = _gl.infer(shapes, proj.canvas.w, proj.canvas.h)
                 spec = _gsp.build(
                     shapes, tree, _gcl.apply_classifications(cls),
-                    registry=man.widget_names, project=self._gd_project,
+                    registry=man.widget_names,
+                    port_registry=getattr(man, "port_names", {}) or {},
+                    project=self._gd_project,
                     mode=man.mode, title=proj.window.title,
                     min_w=proj.window.min_w, min_h=proj.window.min_h)
                 for w in tree.warnings:
@@ -11409,7 +11411,33 @@ class CouncilConsole(tk.Tk):
                     out.extend(f"cannot generate: {e}" for e in errs)
                     return (out, questions)
 
-                orphans = _gp.find_orphans(pdir, spec.widget_names)
+                # Port names live on a parallel registry. Compute the RENAME
+                # plan first: an old name that is aliased is not an orphan,
+                # it is redirected. Only ports removed outright reach
+                # find_orphans, and even those are already caught in
+                # plan.removed with the same actionable message.
+                new_ports = spec.port_registry() if hasattr(spec, "port_registry") else {}
+                plan = _gp.plan_ports(
+                    pdir, getattr(man, "port_names", {}) or {}, new_ports)
+                # Aliased old names count as "known" for find_orphans so a
+                # rename with a live reference does not double-report as both
+                # a rename and an orphan.
+                valid_ports = set(new_ports.values()) | set(plan.aliases)
+                orphans = _gp.find_orphans(
+                    pdir, spec.widget_names, new_port_names=valid_ports)
+                if plan.removed or plan.collisions:
+                    out.append("BLOCKED — port rename cannot proceed:")
+                    out.extend("  " + o.describe() for o in plan.removed)
+                    out.extend("  " + c for c in plan.collisions)
+                    return (out, questions)
+                for old, new in plan.renamed:
+                    if old in plan.aliases:
+                        out.append(f"port renamed: {old} -> {new} "
+                                   f"(aliased for now; the alias vanishes once "
+                                   f"the last self.ports.{old} is gone)")
+                    else:
+                        out.append(f"port renamed: {old} -> {new}")
+
                 if orphans:
                     out.append("BLOCKED — hand-written code still uses these:")
                     out.extend("  " + o.describe() for o in orphans)
@@ -11420,7 +11448,7 @@ class CouncilConsole(tk.Tk):
                     out.append(f"note: ui/ edits will be overwritten: "
                                f"{', '.join(edited)} (backed up first)")
                 _gp.backup(pdir)
-                res = _ge.emit(spec, pdir)
+                res = _ge.emit(spec, pdir, aliases=plan.aliases)
                 out.append(f"wrote {len(res.files_written)} file(s); "
                            f"kept {len(res.files_skipped)} hand-written")
                 if res.handlers_added:
@@ -11436,6 +11464,7 @@ class CouncilConsole(tk.Tk):
                 out.extend("  " + e for e in pol_errs)
 
                 man.widget_names = spec.name_registry()
+                man.port_names = new_ports
                 man.ui_checksums = _gp.ui_checksums(pdir)
                 _gp.save_manifest(pdir, man)
             except Exception as exc:

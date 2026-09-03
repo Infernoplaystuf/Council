@@ -38,7 +38,7 @@ import shutil
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Set
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from gui_shapes import GSPEC_VERSION, Project, load_gspec, save_gspec
 
@@ -342,18 +342,79 @@ def _self_attrs_and_handlers(src: str) -> tuple:
     return attrs, handlers
 
 
-def find_orphans(pdir: Any, new_widget_names: Iterable[str]) -> List[Orphan]:
-    """Widgets/handlers hand-written code still uses that the new spec drops.
+def port_references(pdir: Any) -> List[Tuple[str, str, int]]:
+    """(file, port_name, line) for every ``self.ports.<name>`` and
+    ``self.ports["<name>"]`` in app.py / handlers.py.
 
-    ``new_widget_names`` is the widget-name registry the next generation would
-    produce (a gui_spec.Spec's names, or any iterable of names).
+    A REAL hole this closes: _self_attrs_and_handlers walks
+    ``ast.Attribute`` whose ``.value`` is ``ast.Name("self")``. In
+    ``self.ports.scan_folder`` the outer Attribute's ``.value`` is another
+    Attribute, not a Name — so the walk sees only the harmless ``ports`` and
+    misses every port reference. Port renames and deletes are invisible to
+    find_orphans today, and this is the shared AST reader that fixes it.
 
-    Regeneration MUST block on a non-empty result (spec 7.3). Silently removing
-    a widget that app.py references turns a working app into an AttributeError
-    inside a callback — far from the wireframe edit that caused it, and with no
-    hint that regeneration was the cause."""
+    An AST walk rather than substring for the same reason as
+    _self_attrs_and_handlers: a hit inside a string or comment would report a
+    false orphan and block a legitimate regeneration."""
+    out: List[Tuple[str, str, int]] = []
+    d = Path(pdir)
+    for fname in ("app.py", "handlers.py"):
+        f = d / fname
+        if not f.is_file():
+            continue
+        try:
+            tree = ast.parse(f.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            # self.ports.<name>
+            if (isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Attribute)
+                    and node.value.attr == "ports"
+                    and isinstance(node.value.value, ast.Name)
+                    and node.value.value.id == "self"):
+                out.append((fname, node.attr, getattr(node, "lineno", 0)))
+            # self.ports["<name>"]
+            elif (isinstance(node, ast.Subscript)
+                    and isinstance(node.value, ast.Attribute)
+                    and node.value.attr == "ports"
+                    and isinstance(node.value.value, ast.Name)
+                    and node.value.value.id == "self"):
+                key = _string_key(node.slice)
+                if key is not None:
+                    out.append((fname, key, getattr(node, "lineno", 0)))
+    return out
+
+
+def _string_key(node) -> Optional[str]:
+    """The str inside ``self.ports[<...>]``, or None if it is not a plain str.
+
+    A computed key (``self.ports[some_var]``) is invisible to this scan — the
+    same limitation _self_attrs_and_handlers has for ``getattr(self, name)``,
+    and stated in port_references' docstring rather than papered over."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Index) and isinstance(node.value, ast.Constant) \
+            and isinstance(node.value.value, str):                      # py<3.9
+        return node.value.value
+    return None
+
+
+def find_orphans(pdir: Any, new_widget_names: Iterable[str], *,
+                 new_port_names: Iterable[str] = ()) -> List[Orphan]:
+    """Widgets/handlers/ports hand-written code still uses that the new spec
+    drops.
+
+    ``new_widget_names`` is the widget-name registry the next generation
+    would produce; ``new_port_names`` is the parallel registry for ports.
+    Both must block regeneration when non-empty — silently removing either
+    turns a working app into an AttributeError inside a callback.
+
+    ``new_port_names`` is keyword-only so existing single-arg callers keep
+    working; step 7 wires the tab through."""
     d = Path(pdir)
     names: Set[str] = {str(n) for n in new_widget_names}
+    port_names: Set[str] = {str(n) for n in new_port_names}
     # Handler names the new spec implies: a widget named btn_go binds on_btn_go.
     implied = {f"on_{n}" for n in names}
     out: List[Orphan] = []
@@ -382,7 +443,79 @@ def find_orphans(pdir: Any, new_widget_names: Iterable[str]) -> List[Orphan]:
             if base and base not in names and _looks_like_widget(base):
                 seen.add(h)
                 out.append(Orphan("handler", h, fname, line))
+
+    # Ports live on a different attribute, so they need their own scan.
+    seen_ports: Set[str] = set()
+    for fname, pname, line in port_references(d):
+        if pname in port_names or pname in seen_ports:
+            continue
+        seen_ports.add(pname)
+        out.append(Orphan("port", pname, fname, line))
+
     return out
+
+
+# ============================================================
+# Port rename planning
+# ============================================================
+#
+# The alias story of the ports plan (§3). We DERIVE aliases from AST evidence
+# every regeneration — no manifest bookkeeping to keep in sync — so the alias
+# is emitted only while hand-written code still uses the old name and vanishes
+# on the first regeneration after the last reference is gone.
+
+@dataclass
+class PortPlan:
+    renamed: List[Tuple[str, str]] = field(default_factory=list)
+    aliases: Dict[str, str] = field(default_factory=dict)     # old -> new
+    removed: List[Orphan] = field(default_factory=list)
+    collisions: List[str] = field(default_factory=list)
+
+
+def plan_ports(pdir: Any, old_registry: Dict[str, str],
+               new_registry: Dict[str, str]) -> PortPlan:
+    """Compare the manifest's port_names to the newly built one; decide
+    which are renames (alias the old name), which are removed (block), and
+    which would collide with a still-live port (block, no silent shadow).
+
+    Rename detection is keyed on the shape id (or, for a radio group, the
+    ``group:<parent>/<name>`` key gui_spec.port_registry emits) — same key on
+    both sides means the port was RENAMED, not deleted-and-re-added, and a
+    stable identity is what makes the alias safe."""
+    plan = PortPlan()
+    d = Path(pdir)
+    live_new = set(new_registry.values())
+    refs = port_references(d)
+    referenced = {pname for _f, pname, _l in refs}
+
+    for key, old_name in old_registry.items():
+        new_name = new_registry.get(key)
+        if new_name is None:
+            # The port is gone from the new spec. Only an orphan if app.py
+            # still uses it — otherwise a routine delete.
+            for fname, pname, line in refs:
+                if pname == old_name:
+                    plan.removed.append(Orphan("port", old_name, fname, line))
+                    break
+            continue
+        if new_name == old_name:
+            continue
+        plan.renamed.append((old_name, new_name))
+        # Alias only while the old name is still referenced. That is the
+        # self-expiring property — a rename that was already migrated leaves
+        # no residue on the next regeneration.
+        if old_name in referenced:
+            if old_name in live_new:
+                plan.collisions.append(
+                    f"cannot alias {old_name!r} -> {new_name!r}: "
+                    f"another live port is already called {old_name!r}")
+            elif old_name in plan.aliases and plan.aliases[old_name] != new_name:
+                plan.collisions.append(
+                    f"cannot alias {old_name!r}: two ports want it as their "
+                    f"old name ({plan.aliases[old_name]!r} and {new_name!r})")
+            else:
+                plan.aliases[old_name] = new_name
+    return plan
 
 
 # Kind prefixes assigned by spec 7.2. Kept here because orphan detection needs

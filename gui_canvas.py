@@ -793,6 +793,15 @@ class DesignerCanvas(ttk.Frame):
             for k, v in values.items():
                 if k == "props":
                     s.props.update(v)
+                elif k == "port":
+                    # Store only KEYS the user actually set. Empty strings
+                    # revert to the derived default (which is the point of the
+                    # [reset] button), so remove the key rather than persist "".
+                    for pk, pv in v.items():
+                        if pv in ("", None):
+                            s.port.pop(pk, None)
+                        else:
+                            s.port[pk] = pv
                 elif hasattr(s, k):
                     setattr(s, k, v)
         self._commit()
@@ -1584,6 +1593,7 @@ class _Inspector(ttk.Frame):
         self._on_apply = on_apply
         self._vars: Dict[str, tk.Variable] = {}
         self._prop_vars: Dict[str, tk.Variable] = {}
+        self._port_vars: Dict[str, tk.Variable] = {}
         self._shapes: List[Shape] = []
         ttk.Label(self, text="Properties").pack(anchor="w", pady=(0, 4))
         self.body = ttk.Frame(self)
@@ -1602,6 +1612,7 @@ class _Inspector(ttk.Frame):
             w.destroy()
         self._vars.clear()
         self._prop_vars.clear()
+        self._port_vars.clear()
         if not shapes:
             self._empty()
             return
@@ -1618,6 +1629,9 @@ class _Inspector(ttk.Frame):
         self._row("min_h", "Min height", s.min_h, int)
         if is_container(s.kind):
             self._bool("freeform", "Freeform (place)", s.freeform)
+
+        if not multi:
+            self._binding_block(s)
 
         schema = PALETTE.get(s.kind, {}).get("prop_schema") or {}
         if schema and not multi:
@@ -1639,6 +1653,78 @@ class _Inspector(ttk.Frame):
                               prop=True)
         ttk.Button(self.body, text="Apply", command=self._apply).pack(
             anchor="w", pady=(8, 0))
+
+    # -- binding block ------------------------------------------------
+
+    def _binding_block(self, s: Shape) -> None:
+        """The row that says what this widget PRODUCES for the surrounding
+        code. Reads from gui_ports.PORT_CAPS so a kind that cannot honour a
+        picker gets a reason instead of a dead control — same discipline as
+        the colour picker."""
+        import gui_ports as _gpo                # local import: keeps the
+                                                # module purity-optional
+        cap = _gpo.caps(s.kind)
+        ttk.Separator(self.body).pack(fill="x", pady=6)
+        ttk.Label(self.body, text="Binding").pack(anchor="w")
+
+        if not cap.types:
+            note = _gpo.note(s.kind) or "This kind has no runtime value."
+            ttk.Label(self.body, text=note, foreground=THEME["subtext"],
+                      wraplength=200, justify="left").pack(anchor="w")
+            return
+
+        port = dict(s.port or {})
+        default_name = _gpo.default_port_name(
+            s.kind, s.label,
+            group=str(s.props.get("group") or ""))
+        name_now = port.get("name") or default_name
+        self._port("name", "Name (self.ports.<name>)", name_now,
+                   placeholder=default_name)
+        # Direction shown in words, not "in/out"; the underlying stored value
+        # is still the terse code, mapped both ways here.
+        DIR_LABEL = {"i": "user → app", "o": "app → user",
+                     "io": "both ways", "e": "event"}
+        DIR_CODE = {v: k for k, v in DIR_LABEL.items()}
+        cur_dir = port.get("dir") or cap.dirs[0]
+        self._port_choice(
+            "dir", "Direction", DIR_LABEL.get(cur_dir, cur_dir),
+            [DIR_LABEL[d] for d in cap.dirs if d in DIR_LABEL],
+            reverse_map=DIR_CODE)
+        if len(cap.types) > 1:
+            self._port_choice("type", "Value type",
+                              port.get("type") or cap.types[0],
+                              list(cap.types))
+        else:
+            # Only one legal type — show it read-only, so the field is
+            # informative rather than a control that pretends to do something.
+            ttk.Label(self.body,
+                      text=f"Value type: {cap.types[0]}",
+                      foreground=THEME["subtext"]).pack(anchor="w")
+
+        if cap.binder != "event":
+            self._port("default", "Default value",
+                       "" if port.get("default") is None
+                       else str(port.get("default")))
+
+    def _port(self, key: str, label: str, value,
+              placeholder: str = "") -> None:
+        ttk.Label(self.body, text=label).pack(anchor="w")
+        v = tk.StringVar(value="" if value is None else str(value))
+        e = ttk.Entry(self.body, textvariable=v, width=24)
+        e.pack(anchor="w")
+        v._caster = str                     # type: ignore[attr-defined]
+        v._placeholder = placeholder        # type: ignore[attr-defined]
+        self._port_vars[key] = v
+
+    def _port_choice(self, key: str, label: str, value, choices,
+                     reverse_map: Optional[Dict[str, str]] = None) -> None:
+        ttk.Label(self.body, text=label).pack(anchor="w")
+        v = tk.StringVar(value=str(value))
+        ttk.Combobox(self.body, textvariable=v, values=choices,
+                     state="readonly", width=22).pack(anchor="w")
+        v._caster = str                     # type: ignore[attr-defined]
+        v._reverse = reverse_map or {}      # type: ignore[attr-defined]
+        self._port_vars[key] = v
 
     # -- field builders ----------------------------------------------
 
@@ -1673,6 +1759,20 @@ class _Inspector(ttk.Frame):
         props = {k: _cast(v) for k, v in self._prop_vars.items()}
         if props:
             out["props"] = props
+        # Ports: empty entries revert to the derived default (removed from the
+        # dict by _apply_props), matching the [reset] semantics.
+        port: Dict[str, Any] = {}
+        for k, var in self._port_vars.items():
+            raw = _cast(var)
+            rev = getattr(var, "_reverse", {})
+            if isinstance(raw, str) and rev and raw in rev:
+                raw = rev[raw]
+            placeholder = getattr(var, "_placeholder", "")
+            if isinstance(raw, str) and raw == placeholder:
+                raw = ""                    # derived — don't persist
+            port[k] = raw
+        if port:
+            out["port"] = port
         self._on_apply(out)
 
 

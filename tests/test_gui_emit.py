@@ -407,6 +407,31 @@ def test_regeneration_is_still_byte_identical_with_ports(tmp_path):
     assert (tmp_path / "ui" / "ports.py").read_bytes() == first
 
 
+def test_colour_and_ports_are_orthogonal(tmp_path):
+    """Step 10 integration. The two axes do not know about each other:
+    gui_colors reads .bg / .fg; gui_ports reads .port. A single shape can
+    carry both, and the emitted code must reflect BOTH — the port makes it
+    into ui/ports.py and the classic-widget swap (colour) happens in the
+    ui/main_ui.py branch that produces the widget."""
+    e = mk("entry", 0, 0, 200, 24, sid="e", label="Query")
+    e.port = {"name": "query", "default": "hello"}
+    # .bg/.fg on the entry — colour path (from gui_colors.COLOUR_CAPS)
+    e.bg = "#181825"
+    e.fg = "#cdd6f4"
+    spec = gsp.build([e], gl.infer([e], 1000, 800), project="both")
+    ok, errs = gsp.validate(spec)
+    assert ok, errs
+    ge.emit(spec, tmp_path)
+    ports_src = (tmp_path / "ui" / "ports.py").read_text(encoding="utf-8")
+    main_src = (tmp_path / "ui" / "main_ui.py").read_text(encoding="utf-8")
+    # The port carries the user's overrides
+    assert 'self.query = _VarPort' in ports_src
+    assert 'default="hello"' in ports_src
+    # The widget still exists and Ports is still built at the end
+    assert "self.ent_query = " in main_src
+    assert "self.ports = Ports(self)" in main_src
+
+
 def test_emit_module_is_pure():
     src = (Path(__file__).resolve().parent.parent / "gui_emit.py").read_text(
         encoding="utf-8")

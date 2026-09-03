@@ -196,6 +196,104 @@ def test_orphan_check_ignores_names_in_strings_and_comments(vault):
         f"a regex would have flagged the comment and the string too: {names}")
 
 
+# ---- port_references + plan_ports (Step 6) -----------------------------
+
+APP_PY_WITH_PORTS = '''\
+"""Handwritten app."""
+class App:
+    def _init(self):
+        self.ports.on_change(self._changed)          # NOT a port ref (self.ports.<method>...)
+        self._path = self.ports.scan_folder.get()
+        self.ports.progress.set(0.0)
+    def _changed(self, v):
+        r = self.ports["results"]
+        # "self.ports.pretend" is in a string, must NOT count
+        s = "self.ports.pretend"
+'''
+
+
+def test_port_references_finds_dotted_and_subscript_access(vault):
+    p = gp.create("po", vault_dir=vault)
+    (p / "app.py").write_text(APP_PY_WITH_PORTS, encoding="utf-8")
+    got = gp.port_references(p)
+    names = {n for _f, n, _l in got}
+    # dotted attributes and subscripts, minus the string mention
+    assert "scan_folder" in names
+    assert "progress" in names
+    assert "results" in names, "subscript access must be picked up"
+    assert "pretend" not in names, "a string is not a port reference"
+    # A member access on ports whose target is a Ports method (.on_change)
+    # DOES look like a port ref by AST — it is up to the caller to compare
+    # against the port name registry, which the test below covers.
+
+
+def test_find_orphans_reports_a_deleted_port(vault):
+    p = gp.create("po2", vault_dir=vault)
+    (p / "app.py").write_text(APP_PY_WITH_PORTS, encoding="utf-8")
+    got = gp.find_orphans(p, set(), new_port_names={"scan_folder", "progress"})
+    names = {o.name for o in got if o.kind == "port"}
+    # `results` is not in new_port_names; everything else IS.
+    assert "results" in names
+    assert "scan_folder" not in names
+    assert "progress" not in names
+
+
+def test_plan_ports_aliases_a_rename_while_hand_written_code_still_uses_it(vault):
+    p = gp.create("po3", vault_dir=vault)
+    (p / "app.py").write_text(
+        "class App:\n    def _init(self):\n"
+        "        p = self.ports.scan_folder\n", encoding="utf-8")
+    plan = gp.plan_ports(p,
+                         old_registry={"sid1": "scan_folder"},
+                         new_registry={"sid1": "scan_dir"})
+    assert plan.renamed == [("scan_folder", "scan_dir")]
+    assert plan.aliases == {"scan_folder": "scan_dir"}, (
+        "the alias must be emitted while app.py still uses the old name")
+    assert not plan.removed and not plan.collisions
+
+
+def test_plan_ports_produces_no_alias_when_the_last_reference_is_gone(vault):
+    """The self-expiring guarantee: a rename that was already migrated leaves
+    no residue on the next regeneration."""
+    p = gp.create("po4", vault_dir=vault)
+    (p / "app.py").write_text(
+        "class App:\n    def _init(self):\n"
+        "        p = self.ports.scan_dir\n", encoding="utf-8")  # new name only
+    plan = gp.plan_ports(p,
+                         old_registry={"sid1": "scan_folder"},
+                         new_registry={"sid1": "scan_dir"})
+    assert plan.renamed == [("scan_folder", "scan_dir")]
+    assert plan.aliases == {}, "no reference to the old name -> no alias"
+
+
+def test_plan_ports_blocks_on_a_collision(vault):
+    """A rename that would silently shadow a still-live port must not be
+    allowed to alias — the alias would break the OTHER port instead of fixing
+    the one being renamed. The real case: sid1 renames 'a'->'b' while sid2
+    renames 'c'->'a', so aliasing 'a'->'b' would hide sid2's fresh 'a' port."""
+    p = gp.create("po5", vault_dir=vault)
+    (p / "app.py").write_text(
+        "class App:\n    def _init(self):\n"
+        "        p = self.ports.a\n", encoding="utf-8")
+    plan = gp.plan_ports(p,
+                         old_registry={"sid1": "a", "sid2": "c"},
+                         new_registry={"sid1": "b", "sid2": "a"})
+    assert any("cannot alias" in c for c in plan.collisions), plan.collisions
+    assert "a" not in plan.aliases
+
+
+def test_plan_ports_reports_a_removed_port_the_app_still_uses(vault):
+    p = gp.create("po6", vault_dir=vault)
+    (p / "app.py").write_text(
+        "class App:\n    def _init(self):\n"
+        "        p = self.ports.gone\n", encoding="utf-8")
+    plan = gp.plan_ports(p,
+                         old_registry={"sid1": "gone"},
+                         new_registry={})
+    assert len(plan.removed) == 1
+    assert plan.removed[0].name == "gone"
+
+
 # ---- detach (spec 7.5) --------------------------------------------------
 
 def test_detach_is_one_way_and_destroys_nothing(vault):
