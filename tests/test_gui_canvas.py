@@ -223,6 +223,114 @@ def test_distribute_needs_three_shapes():
     assert (a.x, b.x) == (0, 50)
 
 
+# ============================================================
+# Widget-shaped rendering
+# ============================================================
+
+def test_every_palette_kind_has_a_renderer():
+    """Same catalogue-pinning discipline as gui_colors.COLOUR_CAPS. A new kind
+    added to PALETTE without a renderer would fall through to _render_generic
+    (a dashed rectangle) silently, which is the class of failure the pinning
+    test exists to prevent."""
+    from gui_shapes import PALETTE
+    assert set(gc.RENDERERS) == set(PALETTE), (
+        f"missing renderers for: {set(PALETTE) - set(gc.RENDERERS)}; "
+        f"stale renderers for: {set(gc.RENDERERS) - set(PALETTE)}")
+
+
+def test_the_tier_boundaries_are_what_the_spec_says():
+    assert gc._tier(20, 20) == 0
+    assert gc._tier(30, 12) == 0
+    assert gc._tier(40, 20) == 1
+    assert gc._tier(60, 22) == 2
+    assert gc._tier(200, 100) == 2
+
+
+class _Fake:
+    """Records every canvas call — no display needed. The renderers are pure
+    tk.Canvas wrappers with no widget instances, so a mock Canvas suffices."""
+
+    def __init__(self):
+        self.calls = []
+
+    def create_rectangle(self, *a, **kw): self.calls.append(("rect", a, kw))
+    def create_line(self, *a, **kw): self.calls.append(("line", a, kw))
+    def create_text(self, *a, **kw): self.calls.append(("text", a, kw))
+    def create_polygon(self, *a, **kw): self.calls.append(("poly", a, kw))
+    def create_oval(self, *a, **kw): self.calls.append(("oval", a, kw))
+
+
+def _run_renderer(kind, w=200, h=40, **shape_kw):
+    fc = _Fake()
+    s = mk("s", 20, 20, w, h, kind=kind, **shape_kw)
+    ctx = gc._mk_ctx(fc, s, "", "")
+    gc.RENDERERS[kind](fc, ctx)
+    return fc.calls
+
+
+def test_every_kind_paints_something_at_a_reasonable_size():
+    """None of the 27 kinds may render as nothing at the default size, or the
+    user has a shape that reads as 'no widget here'.
+
+    Frame is the honest exception — its identity IS the container ring, which
+    is chrome added by _draw_shape, not the renderer. With a label the frame
+    also paints its ID."""
+    for kind in gc.RENDERERS:
+        calls = _run_renderer(kind, w=160, h=32,
+                              label="hello" if kind == "frame" else "")
+        assert calls, f"{kind} rendered zero primitives at 160x32"
+
+
+def test_tier0_only_paints_outline_and_fill_for_input_kinds():
+    """The degradation contract: a minimum-size Entry must not try to draw a
+    caret and a placeholder into 20x10."""
+    for kind in ("entry", "combobox", "listbox", "spinbox", "treeview",
+                 "file_picker", "log_pane"):
+        calls = _run_renderer(kind, w=20, h=10)
+        creates = [c[0] for c in calls]
+        assert creates == ["rect"], f"{kind} at tier 0 painted {creates}"
+
+
+def test_a_checked_checkbox_shows_a_check_mark():
+    """default=True must be visibly reflected — the wireframe promises what
+    the emitter will produce."""
+    calls_off = _run_renderer("checkbutton", w=120, h=24)
+    calls_on = _run_renderer("checkbutton", w=120, h=24,
+                             props={"default": True})
+    # Two extra green lines for the tick.
+    def green_lines(cs):
+        return sum(1 for k, _a, kw in cs
+                   if k == "line" and kw.get("fill") == gc.THEME["green"])
+    assert green_lines(calls_off) == 0
+    assert green_lines(calls_on) == 2
+
+
+def test_a_password_entry_shows_bullets_not_the_placeholder_text():
+    """show=* must not leak the label text into the wireframe."""
+    calls = _run_renderer("entry", w=160, h=28,
+                          label="hunter2", props={"show": "*"})
+    texts = [kw.get("text", a[2] if len(a) > 2 else "")
+             for k, a, kw in calls if k == "text"]
+    joined = " ".join(str(t) for t in texts)
+    assert "hunter2" not in joined
+    assert "•" in joined
+
+
+def test_the_container_ring_paints_around_a_notebook_not_over_it():
+    """This is the layering guarantee: a Notebook keeps its mauve container
+    hint AND its tab strip. If the container ring painted over the tabs the
+    widget would be indistinguishable from a Frame again."""
+    # The renderer never draws chrome — chrome is applied in _draw_shape
+    # AFTER. So a renderer's output must not include a mauve rectangle of
+    # the full box.
+    calls = _run_renderer("notebook", w=240, h=160)
+    for k, args, kw in calls:
+        if k == "rect" and kw.get("outline") == gc.THEME["mauve"]:
+            raise AssertionError(
+                "notebook renderer painted its own container ring — chrome "
+                "belongs in _draw_shape or the ring will overwrite the tabs")
+
+
 def test_distribute_is_order_independent():
     """It sorts by position, so passing the selection in click order must not
     scramble the layout."""
