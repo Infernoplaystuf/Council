@@ -302,6 +302,111 @@ def test_linked_and_standalone_launchers_differ(tmp_path):
     ast.parse(alone)
 
 
+# ============================================================
+# Ports — Step 4 of the ports plan
+# ============================================================
+
+def _ports_spec():
+    """A scene that exercises every binder."""
+    shapes = [
+        mk("entry", 0, 0, 200, 24, sid="e", label="Scan Folder"),
+        mk("checkbutton", 0, 40, 120, 24, sid="c", label="Dry run"),
+        mk("button", 0, 80, 100, 30, sid="b", label="Start scan"),
+        mk("radiobutton", 0, 120, 100, 24, sid="r1", label="Fast",
+           props={"group": "mode", "value": "fast"}),
+        mk("radiobutton", 0, 160, 100, 24, sid="r2", label="Thorough",
+           props={"group": "mode", "value": "thorough"}),
+        mk("progressbar", 0, 200, 200, 18, sid="p", label="Progress"),
+    ]
+    return gsp.build(shapes, gl.infer(shapes, 1000, 800), project="ports_demo")
+
+
+def test_ports_file_is_written_and_parses(tmp_path):
+    spec = _ports_spec()
+    res = ge.emit(spec, tmp_path)
+    ports = tmp_path / "ui" / "ports.py"
+    assert ports.exists(), "emit must write ui/ports.py"
+    assert str(ports) in res.files_written
+    ast.parse(ports.read_text(encoding="utf-8"))
+
+
+def test_the_generated_ports_class_names_every_declared_port(tmp_path):
+    spec = _ports_spec()
+    ge.emit(spec, tmp_path)
+    src = (tmp_path / "ui" / "ports.py").read_text(encoding="utf-8")
+    for name in ("scan_folder", "dry_run", "start_scan", "mode", "progress"):
+        assert f"self.{name} = " in src, f"port {name!r} missing from Ports"
+
+
+def test_a_button_gets_an_EventPort_and_no_get_or_set(tmp_path):
+    spec = _ports_spec()
+    ge.emit(spec, tmp_path)
+    src = (tmp_path / "ui" / "ports.py").read_text(encoding="utf-8")
+    # button binder is event
+    assert "_EventPort(\n            'start_scan'" in src \
+           or "_EventPort(\n            \"start_scan\"" in src
+    # a bool "flicker" is what a Checkbutton gives you, not a Button; make sure
+    # nobody grafted a BooleanVar onto a button behind our backs
+    block = src[src.index("start_scan"):src.index("start_scan") + 400]
+    assert "BooleanVar" not in block
+
+
+def test_a_checkbutton_configures_onvalue_and_offvalue(tmp_path):
+    """The tri-state bug closer. An unbound ttk.Checkbutton renders as
+    ('alternate',); the on/off pair is what makes .get() a real bool."""
+    spec = _ports_spec()
+    ge.emit(spec, tmp_path)
+    src = (tmp_path / "ui" / "ports.py").read_text(encoding="utf-8")
+    assert "chk_dry_run.configure(onvalue=True, offvalue=False)" in src
+
+
+def test_a_radio_group_shares_one_var_across_members(tmp_path):
+    """Every member configures with the SAME .var and its own value=."""
+    spec = _ports_spec()
+    ge.emit(spec, tmp_path)
+    src = (tmp_path / "ui" / "ports.py").read_text(encoding="utf-8")
+    assert 'ui.rad_fast.configure(variable=self.mode.var, value="fast")' in src
+    assert 'ui.rad_thorough.configure(variable=self.mode.var, '\
+           'value="thorough")' in src
+
+
+def test_main_ui_imports_ports_and_wires_self_dot_ports_last(tmp_path):
+    """`self.ports = Ports(self)` must appear AFTER every widget assignment —
+    a composite that owns its var (FilePicker) has to exist first, or the
+    adopt-the-var pattern reads an attribute that is not yet set."""
+    spec = _ports_spec()
+    ge.emit(spec, tmp_path)
+    src = (tmp_path / "ui" / "main_ui.py").read_text(encoding="utf-8")
+    assert "from .ports import Ports" in src
+    assert "self.ports = Ports(self)" in src
+    # order: the last widget assignment must come BEFORE `self.ports = ...`
+    ports_pos = src.index("self.ports = Ports(self)")
+    prg_pos = src.index("self.prg_progress = ")
+    assert prg_pos < ports_pos, "Ports must be built AFTER widgets"
+
+
+def test_a_scene_with_no_bindable_widgets_still_emits(tmp_path):
+    """A wireframe of only frames and separators still emits ports.py — the
+    Ports class is just empty. Without this the import in main_ui breaks."""
+    shapes = [mk("frame", 0, 0, 400, 200, sid="f", label="outer"),
+              mk("separator", 0, 210, 400, 4, sid="s")]
+    spec = gsp.build(shapes, gl.infer(shapes, 500, 300), project="empty")
+    ge.emit(spec, tmp_path)
+    src = (tmp_path / "ui" / "ports.py").read_text(encoding="utf-8")
+    ast.parse(src)
+    assert "class Ports" in src
+    assert "_names = ()" in src
+
+
+def test_regeneration_is_still_byte_identical_with_ports(tmp_path):
+    """The existing idempotence guarantee extends to ports.py."""
+    spec = _ports_spec()
+    ge.emit(spec, tmp_path)
+    first = (tmp_path / "ui" / "ports.py").read_bytes()
+    ge.emit(spec, tmp_path)
+    assert (tmp_path / "ui" / "ports.py").read_bytes() == first
+
+
 def test_emit_module_is_pure():
     src = (Path(__file__).resolve().parent.parent / "gui_emit.py").read_text(
         encoding="utf-8")
