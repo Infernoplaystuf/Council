@@ -176,6 +176,59 @@ def test_load_tolerates_a_sparse_shape(tmp_path):
     assert s.resize == "auto" and s.props == {} and s.id
 
 
+# ============================================================
+# v2 — Shape.port, content-based version stamping
+# ============================================================
+
+def test_a_v1_gspec_still_loads_and_has_no_ports(tmp_path):
+    """An older build wrote no `port` field. It must load without loss."""
+    p = tmp_path / "v1.gspec"
+    p.write_text(json.dumps({
+        "gspec_version": 1, "project": "p",
+        "shapes": [{"id": "a", "kind": "entry", "x": 0, "y": 0,
+                    "w": 100, "h": 24, "label": "Name"}],
+    }), encoding="utf-8")
+    proj = gs.load_gspec(p)
+    assert proj.shapes[0].port == {}
+
+
+def test_a_project_with_no_ports_still_stamps_v1(tmp_path):
+    """The content-based rule that keeps older builds working."""
+    proj = gs.Project(project="p", shapes=[
+        gs.new_shape("entry", 0, 0)                       # port is empty
+    ])
+    assert gs.required_version(proj) == 1
+    p = tmp_path / "out.gspec"
+    gs.save_gspec(p, proj)
+    on_disk = json.loads(p.read_text(encoding="utf-8"))
+    assert on_disk["gspec_version"] == 1
+
+
+def test_a_project_with_a_port_stamps_v2(tmp_path):
+    """The moment a port arrives, the file is v2 — so an older build refuses
+    it (with the actionable message load_gspec already gives) rather than
+    dropping the bindings."""
+    s = gs.new_shape("entry", 0, 0)
+    s.port = {"name": "scan_folder"}
+    proj = gs.Project(project="p", shapes=[s])
+    assert gs.required_version(proj) == 2
+    p = tmp_path / "v2.gspec"
+    gs.save_gspec(p, proj)
+    on_disk = json.loads(p.read_text(encoding="utf-8"))
+    assert on_disk["gspec_version"] == 2
+
+
+def test_a_v2_gspec_round_trips_the_port_dict(tmp_path):
+    s = gs.new_shape("radiobutton", 0, 0)
+    s.port = {"name": "mode", "default": "fast"}
+    s.props["group"] = "mode"
+    proj = gs.Project(project="p", shapes=[s])
+    p = tmp_path / "rt.gspec"
+    gs.save_gspec(p, proj)
+    back = gs.load_gspec(p)
+    assert back.shapes[0].port == {"name": "mode", "default": "fast"}
+
+
 def test_shapes_module_is_pure():
     """No Tk, no engine, no vault imports — the model layer stays loadable
     with nothing else present."""

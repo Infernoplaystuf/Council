@@ -120,6 +120,10 @@ class Manifest:
     gspec_version: int = GSPEC_VERSION
     # shape id -> assigned widget name. Stable across regeneration (spec 7.2).
     widget_names: Dict[str, str] = field(default_factory=dict)
+    # shape id (or radio group key) -> assigned port name. Same registry-first
+    # discipline as widget_names: hand-written app.py references these by name,
+    # so retyping a widget's label may not silently rename the port.
+    port_names: Dict[str, str] = field(default_factory=dict)
     # ui/<relpath> -> sha256, so a hand-edit of generated code is detectable.
     ui_checksums: Dict[str, str] = field(default_factory=dict)
     detached: bool = False
@@ -147,6 +151,7 @@ def load_manifest(pdir: Any) -> Manifest:
         mode=str(raw.get("mode") or "linked"),
         gspec_version=int(raw.get("gspec_version") or GSPEC_VERSION),
         widget_names=dict(raw.get("widget_names") or {}),
+        port_names=dict(raw.get("port_names") or {}),
         ui_checksums=dict(raw.get("ui_checksums") or {}),
         detached=bool(raw.get("detached", False)),
         created=str(raw.get("created") or ""),

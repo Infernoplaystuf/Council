@@ -40,7 +40,12 @@ from typing import Any, Dict, List, Optional
 # version it does not know rather than guessing: a .gspec written by a future
 # build could carry kinds or fields this build would silently drop, and silently
 # dropping a user's work is the one failure mode a file format must not have.
-GSPEC_VERSION = 1
+#
+# v2 adds Shape.port (the typed binding surface, gui_ports). A project with no
+# ports still SAVES as v1 — see required_version below — so older builds keep
+# opening pure-wireframe projects, and only projects that actually declare a
+# port are refused by them.
+GSPEC_VERSION = 2
 
 # Resize modes. "auto" is resolved at layout time and never survives into an
 # emitted spec (spec 4.1).
@@ -386,6 +391,15 @@ class Shape:
     z: int = 0
     freeform: bool = False
     props: Dict[str, Any] = field(default_factory=dict)
+    # The typed binding, decided by gui_ports. Keys used today:
+    #   name    str          — the port name; absent = derived from the label
+    #   type    str          — one of gui_ports.PORT_CAPS[kind].types
+    #   dir     str          — one of gui_ports.PORT_CAPS[kind].dirs
+    #   default JSON scalar  — initial value
+    #   off     bool         — no port on this widget (Label caption escape)
+    # Separate from ``props``: gui_classify may write only into props, so
+    # keeping port here makes a model-authored port structurally impossible.
+    port: Dict[str, Any] = field(default_factory=dict)
 
     # -- geometry helpers used throughout gui_layout ------------------
     @property
@@ -490,9 +504,23 @@ class GspecError(ValueError):
     """A .gspec that cannot be loaded, with a reason a user can act on."""
 
 
+def required_version(project: "Project") -> int:
+    """Lowest gspec_version that reads this project without silent loss.
+
+    Stamped by CONTENT, not by the writing build: a project with no ports stays
+    v1 and stays openable by an older build; one that declares even a single
+    port becomes v2 so an older build refuses it (with the clear message
+    load_gspec already emits) instead of dropping the bindings. The previous
+    behaviour of stamping ``p.gspec_version`` back was a live bug — this build
+    exposes it, and this function is the fix."""
+    if any(getattr(s, "port", None) for s in project.shapes):
+        return 2
+    return 1
+
+
 def _project_to_dict(p: Project) -> Dict[str, Any]:
     return {
-        "gspec_version": p.gspec_version,
+        "gspec_version": required_version(p),
         "project": p.project,
         "mode": p.mode,
         "canvas": asdict(p.canvas),
@@ -561,6 +589,7 @@ def load_gspec(path: Any) -> Project:
                 z=int(sd.get("z", 0)),
                 freeform=bool(sd.get("freeform", False)),
                 props=dict(sd.get("props") or {}),
+                port=dict(sd.get("port") or {}),      # v1 files -> {}
             ))
         except (TypeError, ValueError) as exc:
             raise GspecError(f"{p.name}: shape #{i} has a bad field: {exc}")
