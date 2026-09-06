@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import math
+import os
 import random
 import tkinter as tk
 from typing import Callable, Optional
@@ -112,9 +113,21 @@ class SplashWindow(tk.Toplevel):
         # duration_ms).
         self.manual = bool(manual)
 
-        # Frameless, on-top
+        # Frameless. There is no title bar to grab, so dragging is wired up
+        # by hand below — without it the window cannot be moved at all.
         self.overrideredirect(True)
+
+        # On top only long enough to be seen.
+        #
+        # This used to be a permanent "-topmost". On a slow load — a big vault,
+        # a cold model — the splash then sat over EVERY application on the
+        # desktop for the whole load, frameless and unmovable, with nothing to
+        # click. That is indistinguishable from a hung modal.
+        #
+        # So: raise it, then drop topmost shortly after. It still appears in
+        # front when the app starts, and it stops owning the screen.
         self.attributes("-topmost", True)
+        self.after(1200, self._release_topmost)
 
         # Theme
         try:
@@ -180,6 +193,8 @@ class SplashWindow(tk.Toplevel):
         # the Tk event loop is live. During a blocking host construction
         # the loop can't run — pump() advances frames in that window.
         self.after(10, self._animate)
+        # Make it movable and escapable now that every child widget exists.
+        self._enable_drag()
         # Auto-close only in fire-and-forget mode. Manual callers dismiss
         # explicitly so the splash can cover an arbitrarily long load.
         if not self.manual:
@@ -292,6 +307,76 @@ class SplashWindow(tk.Toplevel):
 
     # ---- Dismiss ---------------------------------------------------
 
+    # ── window behaviour: movable, escapable ────────────────────
+    def _release_topmost(self):
+        """Stop floating above other applications. Best-effort: if the window
+        is already gone this is a no-op, not an error."""
+        try:
+            if self.winfo_exists():
+                self.attributes("-topmost", False)
+        except Exception:
+            pass
+
+    def _enable_drag(self):
+        """Let the user move a frameless window by dragging anywhere on it.
+
+        overrideredirect(True) means Windows draws no title bar, so the normal
+        drag affordance does not exist. Bind press/motion on the window and
+        every child that would otherwise swallow the event (the canvas fills
+        most of it), and move the window by the pointer delta.
+        """
+        def press(e):
+            self._drag_dx = e.x_root - self.winfo_x()
+            self._drag_dy = e.y_root - self.winfo_y()
+
+        def drag(e):
+            if self._drag_dx is None:
+                return
+            try:
+                self.geometry(f"+{e.x_root - self._drag_dx}"
+                              f"+{e.y_root - self._drag_dy}")
+            except Exception:
+                pass
+
+        def release(_e):
+            self._drag_dx = self._drag_dy = None
+
+        self._drag_dx = self._drag_dy = None
+        for w in (self, *self._all_children(self)):
+            try:
+                w.bind("<ButtonPress-1>", press, add="+")
+                w.bind("<B1-Motion>", drag, add="+")
+                w.bind("<ButtonRelease-1>", release, add="+")
+            except Exception:
+                pass
+        # An escape hatch that does not depend on the loader finishing.
+        try:
+            self.bind("<Escape>", lambda _e: self._user_dismiss(), add="+")
+            self.bind("<Double-Button-1>", lambda _e: self._user_dismiss(),
+                      add="+")
+        except Exception:
+            pass
+
+    @staticmethod
+    def _all_children(w):
+        out = []
+        for c in w.winfo_children():
+            out.append(c)
+            out.extend(SplashWindow._all_children(c))
+        return out
+
+    def _user_dismiss(self):
+        """Esc / double-click. In manual mode the loader still owns the real
+        dismissal, so just get out of the way rather than firing on_done and
+        revealing a window that is still being built."""
+        if self.manual:
+            try:
+                self.withdraw()
+            except Exception:
+                pass
+            return
+        self._dismiss()
+
     def dismiss(self, on_done: Optional[Callable[[], None]] = None):
         """Public dismissal for manual-mode callers. If ``on_done`` is
         given it overrides the one set at construction."""
@@ -330,6 +415,39 @@ def show_splash(parent: tk.Tk,
     the cog through a blocking load with ``pump()`` and ends it with
     ``dismiss(on_done=...)`` once the load is done. Used to cover the
     host window's entire construction.
+
+    Set ``COUNCIL_NO_SPLASH=1`` to skip the splash entirely. Scripted and
+    headless runs drive the app with its window withdrawn, and a frameless
+    always-visible splash from a background process is pure nuisance — it
+    appears over whatever the user is actually doing. Returns a stub with
+    the same surface (``pump`` / ``dismiss``), so callers need no branch.
     """
+    if os.environ.get("COUNCIL_NO_SPLASH", "").strip().lower() in (
+            "1", "true", "yes"):
+        return _NoSplash(on_done)
     return SplashWindow(parent, duration_ms=duration_ms,
                         on_done=on_done, manual=manual)
+
+
+class _NoSplash:
+    """Does nothing, quietly, with the SplashWindow surface callers use."""
+
+    def __init__(self, on_done: Optional[Callable[[], None]] = None):
+        self.on_done = on_done
+
+    def pump(self):
+        pass
+
+    def dismiss(self, on_done: Optional[Callable[[], None]] = None):
+        cb = on_done if on_done is not None else self.on_done
+        if cb:
+            try:
+                cb()
+            except Exception:
+                pass
+
+    def destroy(self):
+        pass
+
+    def winfo_exists(self):
+        return False
