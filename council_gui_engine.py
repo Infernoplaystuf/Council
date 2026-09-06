@@ -2886,6 +2886,37 @@ def _content_query_terms(text, *, max_terms: int = 6):
 # local model to write pandas code calling our helpers, executes it in a
 # locked-down sandbox, and returns the result as text the Writer can quote.
 
+_FILE_COUNT_TRIGGERS = (
+    "how many files", "how many data files", "how many csv",
+    "how many csvs", "how many spreadsheets", "how many documents",
+    "how many json", "number of files", "count of files",
+    "count the files", "file count", "total files", "how many files are",
+)
+# Intents that need per-file work, not a census: "how many rows in the files".
+_FILE_COUNT_EXCLUSIONS = ("row", "record", "column", "value", "cell")
+
+
+def looks_like_file_count(query) -> bool:
+    """Is this a plain 'how many files' census question?
+
+    Module-level because TWO places need the same answer and they used to
+    disagree. The analyst owns the deterministic file-count route - a cheap
+    os.walk census, no model, no file reads - and it is correct. But the vault
+    intent chain runs FIRST, and its field routes were claiming the question
+    before the analyst ever saw it: "how many files are in data_in" resolved
+    `data` (a real column name somewhere in a broad vault) out of the folder
+    name `data_in` and answered with a 151-second value tally of unrelated
+    strings, against a documented promise of an instant exact count.
+
+    The intent was already written down next to the field route - "Only fires
+    when a real field is named, so a generic 'how many files' still falls
+    through" - it just had no way to test for it. This is that test.
+    """
+    q = str(query or "").lower()
+    return (any(t in q for t in _FILE_COUNT_TRIGGERS)
+            and not any(x in q for x in _FILE_COUNT_EXCLUSIONS))
+
+
 def _run_analyst_step(query):
     """Public entry point — wraps `_run_analyst_step_impl` in a defensive
     try/except so that any unexpected exception (network share dropped
@@ -3069,15 +3100,7 @@ def _run_analyst_step_impl(query):
     # it deterministically with a cheap census (no file reads, tiny
     # prompt). Guarded against row/record/column intents, which need
     # per-file work, not a file count.
-    _FILE_COUNT_TRIGGERS = (
-        "how many files", "how many data files", "how many csv",
-        "how many csvs", "how many spreadsheets", "how many documents",
-        "how many json", "number of files", "count of files",
-        "count the files", "file count", "total files", "how many files are",
-    )
-    if (any(t in qlower for t in _FILE_COUNT_TRIGGERS)
-            and not any(x in qlower for x in
-                        ("row", "record", "column", "value", "cell"))):
+    if looks_like_file_count(query):
         try:
             _csub = _va.resolve_subfolder_hint(query, allowed_folders[0])
         except Exception:
@@ -7694,12 +7717,41 @@ class CouncilConsole(tk.Tk):
         # word ("searchable") as the value and answer "no files where 'point of
         # contact' is 'searchable'". Only fires when a real field is named, so
         # a generic "how many files" still falls through.
+        # GATE for both field routes below: the sentence must actually name a
+        # file / document / report / record / sheet.
+        #
+        # Without it these routes claim any sentence that happens to contain a
+        # word the vault uses as a column name. The validation step was meant
+        # to prevent that ("a field the vault does not have never routes"), but
+        # the vocabulary is the UNION of every header and JSON key in the
+        # vault, so on a broad vault it contains 'data', 'total', 'value',
+        # 'name', 'date', 'count' - and rejects nothing. Measured on a
+        # 1,674-file corpus spanning ten domains: 30 of 49 ordinary analytical
+        # questions were claimed here, including "What is total sales revenue
+        # across all years?" (as field='sales', value='revenue across') and
+        # "how many files are in data_in" (as a 151-second value tally of
+        # field='data', against a documented promise of an instant count).
+        # With the gate: 7 of 49, and every genuine field search still routes.
+        #
+        # It is a gate, not a reordering: a question that names a file still
+        # reaches these routes first, exactly as before.
+        #
+        # A plain file census is never a field question either: it says "files"
+        # (so the noun gate passes) but the folder it names often CONTAINS a
+        # real column name - "data_in" yields the field 'data'. The analyst
+        # owns that question and answers it instantly; let it through.
         try:
             import field_search as _fs_agg
-            _is_agg = _fs_agg.looks_like_aggregation(single_line)
+            _names_file = (_fs_agg.names_a_file_noun(single_line)
+                           and not looks_like_file_count(single_line))
+        except Exception:
+            _fs_agg = None
+            _names_file = False
+        try:
+            _is_agg = bool(_fs_agg) and _fs_agg.looks_like_aggregation(single_line)
         except Exception:
             _is_agg = False
-        if _is_agg:
+        if _is_agg and _names_file:
             _afld = self._field_from_text(single_line)
             if _afld:
                 self._field_value_counts_response(_afld)
@@ -7730,7 +7782,9 @@ class CouncilConsole(tk.Tk):
         # This parses the sentence loosely and then VALIDATES the field against
         # the vault's real column names, so an unknown field simply does not
         # route: the guard is the data, not the grammar.
-        fv = self._parse_field_value_fallback(single_line)
+        # Gated on _names_file for the reason documented above: this is the
+        # loose parser, so it is the one that claimed most of the 30.
+        fv = self._parse_field_value_fallback(single_line) if _names_file else None
         if fv:
             self._field_value_response(fv[0], fv[1])
             return True
@@ -9468,7 +9522,25 @@ class CouncilConsole(tk.Tk):
             body.append(f"  ({len(res['missing'])} file(s) had no matching "
                         f"column)")
         if res["truncated"]:
-            body.append("  (scan capped at 200 files)")
+            # Say what was left out, not just that a cap exists. "capped at
+            # 200 files" reads like a performance note; on a 1,075-CSV vault
+            # the scan never reached a single sales or ops file, because the
+            # file list is sorted and the cap takes the front of it.
+            _seen = res.get("files_scanned") or 0
+            try:
+                _all = len(_va.list_csv_files(root)) + len(
+                    _va.list_excel_files(root))
+            except Exception:
+                _all = 0
+            if _all > _seen:
+                body.append(f"  ⚠ PARTIAL - scanned {_seen} of {_all} file(s); "
+                            f"{_all - _seen} were not looked at. The scan takes "
+                            f"files in name order, so this is not a random "
+                            f"sample of your data.")
+            else:
+                body.append("  (scan capped at 200 files)")
+        if res.get("sentinel_note"):
+            body.append(f"  ⚠ {res['sentinel_note']}")
 
         lines = list(body)
         if save and res["per_file"]:

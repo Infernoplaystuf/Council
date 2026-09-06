@@ -1192,9 +1192,49 @@ def _clean_phrase(s: str) -> str:
 
 
 def looks_like_file_search(text: str) -> bool:
-    """Is this asking to find files at all? (cheap pre-filter)"""
+    """Is this asking to find files at all? (cheap pre-filter)
+
+    NOTE: this is a very weak filter and must not be used as a routing gate.
+    _SEARCH_VERB_RE alone matches any sentence opening with what / which / who /
+    how many / is / are / do — which is nearly every question anyone types. Use
+    ``names_a_file_noun`` when the question is whether a FIELD route may claim
+    the sentence.
+    """
     t = str(text or "")
     return bool(_FILE_NOUN_RE.search(t) or _SEARCH_VERB_RE.search(t))
+
+
+def names_a_file_noun(text: str) -> bool:
+    """Does the text actually name a file / document / report / record / sheet?
+
+    The gate on the field routes. Those routes parse a sentence loosely and
+    then validate the captured field against the vault's real vocabulary, on
+    the principle that "a field the vault does not have never routes". That
+    principle silently inverts as a vault broadens: the vocabulary is the UNION
+    of every CSV header and JSON key across every domain, so on a vault
+    spanning sales, ops, HR, IoT and finance it contains 'data', 'total',
+    'value', 'name', 'date', 'time', 'count', 'type' and 'id' — 22 of 29
+    ordinary English words, measured. A vocabulary containing "data" rejects
+    nothing, and the loose parse then claims ordinary questions:
+
+        "What is total sales revenue across all years?"
+                          -> field='sales'  value='revenue across'
+        "How many files are in data_in"
+                          -> a value tally of field='data', 151 seconds
+
+    Measured on a 1,674-file corpus, requiring a file noun first takes the
+    share of benchmark questions claimed by a field route from 30/49 to 7/49
+    while every genuine field search still routes ("find all files with Bob
+    listed as the point of contact", "which files have Sarah Smith as the
+    owner", ...). Those all name a file, because that is what they are asking
+    for.
+
+    Deliberately NOT a stopword list of generic column names: which words
+    collide with English depends on the vault, and a vault is free to have a
+    column called "revenue". What does not vary is that asking *which files
+    carry a value* means saying so.
+    """
+    return bool(_FILE_NOUN_RE.search(str(text or "")))
 
 
 def parse_field_value_intent(text: str, known_fields) -> Optional[Tuple[str, str]]:
