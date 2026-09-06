@@ -792,22 +792,122 @@ def unpivot_year_columns(
     return melted
 
 
+def _header_separator_count(p: Path) -> int:
+    """How many non-comma separators sit in the first line.
+
+    Used to spot a read that "succeeded" into a single column because the
+    separator was wrong — a 1-column frame whose header is
+    'a|b|c|d' is not a successful read, it is a silent wrong one.
+    """
+    try:
+        with open(p, "rb") as fh:
+            head = fh.readline().decode("utf-8", "replace")
+    except Exception:
+        return 0
+    return sum(head.count(c) for c in "|;\t^")
+
+
+def _rescue(p: Path, why: str) -> Optional[pd.DataFrame]:
+    """Second attempt through read_csv_robust, with its findings attached.
+
+    read_csv_robust sniffs the encoding and the separator, skips a banner row
+    before the header, drops unparseable lines and strips trailing summary
+    rows. It has been in this module the whole time; nothing called it on the
+    read path, so every one of those problems surfaced as a hard failure or,
+    worse, as a one-column DataFrame.
+
+    Its findings are attached to ``df.attrs['read_diagnostics']`` rather than
+    swallowed. That matters: this path can drop bad lines, so a caller that
+    reports a number computed from it should be able to say what the read did.
+    """
+    try:
+        df, diag = read_csv_robust(p)
+    except Exception:
+        return None
+    if df is None or df.empty or len(df.columns) <= 1:
+        return None
+    diag = dict(diag or {})
+    diag["rescued_because"] = why
+    try:
+        df.attrs["read_diagnostics"] = diag
+    except Exception:
+        pass
+    return df
+
+
 def read_table(path: Any, *, sheet: Optional[str] = None) -> pd.DataFrame:
     """Read a tabular file into a DataFrame. Supported formats:
        .csv / .tsv / .csv.gz / .xlsx / .xls / .xlsm / .parquet
-    For Excel, `sheet` picks which tab (default = first sheet)."""
+    For Excel, `sheet` picks which tab (default = first sheet).
+
+    Delimited text is read strictly first, exactly as before. The strict read
+    is only abandoned when it fails outright or returns a single column from a
+    file whose header clearly has separators — so a file that reads correctly
+    today reads identically today, and only the failures change behaviour.
+    When the fallback runs, what it had to do is recorded in
+    ``df.attrs['read_diagnostics']``.
+    """
     p = Path(path)
     name = p.name.lower()
     suf = p.suffix.lower()
     if suf in (".xlsx", ".xls", ".xlsm"):
         return pd.read_excel(p, sheet_name=sheet if sheet else 0)
-    if suf == ".tsv":
-        return pd.read_csv(p, sep="\t")
     if suf == ".parquet":
         return pd.read_parquet(p)
+    if suf == ".tsv":
+        try:
+            return pd.read_csv(p, sep="\t", low_memory=False)
+        except Exception as exc:
+            got = _rescue(p, f"strict tab-separated read failed: "
+                             f"{type(exc).__name__}")
+            if got is not None:
+                return got
+            raise
     if name.endswith(".csv.gz") or (suf == ".gz" and p.stem.lower().endswith(".csv")):
-        return pd.read_csv(p, compression="infer")
-    return pd.read_csv(p)
+        return pd.read_csv(p, compression="infer", low_memory=False)
+    # low_memory=False is NOT a performance tweak here — it is a correctness
+    # fix. The chunked reader (low_memory=True, the default) infers dtypes per
+    # chunk, and when a column comes out mixed it builds a DtypeWarning. On
+    # pandas 3.0.3 that warning path raises:
+    #
+    #   pandas/io/parsers/c_parser_wrapper.py, _concatenate_chunks
+    #   warning_columns.append(column_names[name])  -> IndexError: list index
+    #                                                  out of range
+    #
+    # So a perfectly readable file with one mixed-type column fails to load,
+    # with an error that names neither the file nor the column. Measured on
+    # one year of the test corpus, 2 of 12 monthly sales exports died this way
+    # (sales_2023-08.csv, sales_2023-12.csv); both read fine — 277,166 rows —
+    # with low_memory=False. Mixed-type columns are the normal case for the
+    # data this app exists to read, so the chunked path is the wrong default.
+    try:
+        df = pd.read_csv(p, low_memory=False)
+    except Exception as exc:
+        got = _rescue(p, f"strict read failed: {type(exc).__name__}")
+        if got is not None:
+            return got
+        raise
+    # A strict read that "succeeds" into one or two columns is the quiet
+    # failure mode: no exception, a plausible row count, an unusable frame.
+    # Three ways it happens, all present in the reference corpus:
+    #
+    #   wrong separator  90 .psv files -> 1 column named
+    #                    'shipment_id|shipped|carrier|...'
+    #   sep= directive   Excel writes a leading 'sep=;' line, which pandas
+    #                    takes as the header -> ['sep=', 'Unnamed: 1']
+    #   banner row       a title line above the real header
+    #                    -> ['sales 2023-12']
+    #
+    # Only the first is visible from the header's separators, so the trigger
+    # is the column count itself. Trying the rescue is safe for a genuinely
+    # narrow file: it is kept only if it finds MORE columns than the strict
+    # read did, so a real one-column CSV stays a one-column CSV.
+    if len(df.columns) <= 2:
+        got = _rescue(p, f"strict read produced {len(df.columns)} column(s) — "
+                         f"wrong separator, a sep= directive or a banner row")
+        if got is not None and len(got.columns) > len(df.columns):
+            return got
+    return df
 
 
 def list_sqlite_files(data_folder: Any, recursive: bool = True) -> List[Path]:
@@ -2689,6 +2789,72 @@ _AGG_ALIASES = {
 }
 
 
+# Placeholders that mean "no reading", written as numbers. NOAA uses -9999
+# throughout GHCN; -999 and 9999 are the same convention at other widths.
+# They are excluded from aggregates because leaving them in does not merely
+# skew an answer — measured on a weather VALUE column where 4% of rows were
+# -9999, the mean came out at -228.43 against a true 179.55. The SIGN was
+# wrong, and nothing in the answer suggested anything was amiss.
+#
+# -1 is deliberately NOT in this set. It is a placeholder often enough to
+# notice and a real measurement often enough that excluding it would corrupt
+# honest data. It is counted and reported instead.
+SENTINEL_VALUES = (-9999.0, -999.0, 9999.0)
+SENTINEL_SUSPECTS = (-1.0,)
+# A real measurement does not land on exactly -9999 thousands of times. A
+# frequency floor keeps a legitimate value that happens to equal a sentinel
+# (one reading of -999 in a column of pressures) from being thrown away.
+_SENTINEL_MIN_SHARE = 0.001
+
+
+def detect_sentinels(s: "pd.Series") -> Dict[float, int]:
+    """Which sentinel values are present often enough to be placeholders.
+
+    Returns {value: count} for values in SENTINEL_VALUES that repeat at least
+    _SENTINEL_MIN_SHARE of the series (and at least twice).
+    """
+    out: Dict[float, int] = {}
+    n = len(s)
+    if not n:
+        return out
+    floor = max(2, int(n * _SENTINEL_MIN_SHARE))
+    for v in SENTINEL_VALUES:
+        c = int((s == v).sum())
+        if c >= floor:
+            out[v] = c
+    return out
+
+
+def count_sentinel_suspects(s: "pd.Series") -> Dict[float, int]:
+    """Values we will NOT exclude but should mention (currently -1)."""
+    out: Dict[float, int] = {}
+    n = len(s)
+    if not n:
+        return out
+    floor = max(2, int(n * _SENTINEL_MIN_SHARE))
+    for v in SENTINEL_SUSPECTS:
+        c = int((s == v).sum())
+        if c >= floor:
+            out[v] = c
+    return out
+
+
+def sentinel_note(excluded: Dict[float, int],
+                  suspects: Dict[float, int]) -> str:
+    """One line the user can read, or '' when there is nothing to say."""
+    bits = []
+    if excluded:
+        parts = ", ".join(f"{int(v)} x{c:,}" for v, c in sorted(excluded.items()))
+        bits.append(f"excluded {sum(excluded.values()):,} placeholder value(s) "
+                    f"({parts}) — these mean 'no reading', not a measurement")
+    if suspects:
+        parts = ", ".join(f"{int(v)} x{c:,}" for v, c in sorted(suspects.items()))
+        bits.append(f"kept {sum(suspects.values()):,} value(s) of {parts} — "
+                    f"often a placeholder, but too often real to drop; check "
+                    f"whether this column uses it that way")
+    return "; ".join(bits)
+
+
 def canonical_agg(agg: str) -> Optional[str]:
     """Map a user aggregation word to a canonical name, or None if unknown."""
     key = " ".join((agg or "").strip().lower().split())
@@ -2775,6 +2941,8 @@ def folder_column_aggregate(data_folder: Any, column: str, agg: str = "mean",
     missing: List[str] = []
     pooled: List[Any] = []
     pooled_n = 0
+    sentinels_excluded: Dict[float, int] = {}
+    sentinel_suspects: Dict[float, int] = {}
     _POOL_CAP = 2_000_000
     for fp in files:
         try:
@@ -2789,6 +2957,15 @@ def folder_column_aggregate(data_folder: Any, column: str, agg: str = "mean",
         s = pd.to_numeric(df[col], errors="coerce").dropna()
         if exclude_zeros:
             s = s[s != 0]
+        # Placeholder numbers are not measurements. Drop them before the
+        # aggregate and remember what was dropped, so the answer can say so.
+        found = detect_sentinels(s)
+        if found:
+            for v, c in found.items():
+                sentinels_excluded[v] = sentinels_excluded.get(v, 0) + c
+            s = s[~s.isin(list(found))]
+        for v, c in count_sentinel_suspects(s).items():
+            sentinel_suspects[v] = sentinel_suspects.get(v, 0) + c
         n = int(len(s))
         per_file.append({"file": fp.name, "matched_column": col,
                          "n": n, "value": _apply_agg(s, canon)})
@@ -2811,6 +2988,9 @@ def folder_column_aggregate(data_folder: Any, column: str, agg: str = "mean",
         "overall_n":     pooled_n,
         "truncated":     truncated,
         "exclude_zeros": exclude_zeros,
+        "sentinels_excluded": sentinels_excluded,
+        "sentinel_suspects": sentinel_suspects,
+        "sentinel_note":  sentinel_note(sentinels_excluded, sentinel_suspects),
     }
 
 
