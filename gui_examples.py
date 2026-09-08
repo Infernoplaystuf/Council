@@ -30,7 +30,10 @@ WHAT EACH ONE TEACHES
   barbie_capture  the basics: a window colour, a font, labels ABOVE their
                   boxes, and transparent labels (a label with no bg of its
                   own inherits the window's, which is what "transparent"
-                  means in Tk — there is no alpha)
+                  means in Tk — there is no alpha). Its picker, canvas and
+                  scrubber are WIRED: a widget that looks like it browses
+                  frames has to actually browse them, or the example teaches
+                  a form that does nothing.
   image_viewer    everything above plus the three declaration types that
                   connect a wireframe to real behaviour:
                     port   — the typed value a widget exposes
@@ -49,10 +52,13 @@ EXAMPLES_DIR = Path(__file__).resolve().parent / "examples" / "gui"
 # because a .gspec is a project file and should not carry teaching notes.
 NOTES: Dict[str, str] = {
     "barbie_capture": (
-        "A capture form. Shows: window bg + fg + font applied to the whole "
-        "app; a file picker in FOLDER mode; three numeric rows with the "
-        "label directly ABOVE its spinbox; labels with no bg of their own, "
-        "which inherit the window colour and so read as transparent."
+        "A capture form that browses a folder of frames. Shows: window bg + "
+        "fg + font applied to the whole app; a file picker in FOLDER mode "
+        "wired to an image canvas by a scrubber's `drives`, so picking a "
+        "folder loads it and the slider steps through it; three numeric rows "
+        "with the label directly ABOVE its spinbox; labels with no bg of "
+        "their own, which inherit the window colour and so read as "
+        "transparent."
     ),
     "image_viewer": (
         "The same form plus behaviour. Shows: `port` naming the typed value "

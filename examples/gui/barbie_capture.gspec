@@ -69,11 +69,13 @@
       "min_h": 0,
       "min_w": 0,
       "note": "",
-      "port": {},
+      "port": {
+        "name": "capture_folder"
+      },
       "props": {
         "command": "",
         "filetypes": [],
-        "mode": "file"
+        "mode": "folder"
       },
       "resize": "auto",
       "w": 464,
@@ -264,7 +266,9 @@
       "min_h": 0,
       "min_w": 0,
       "note": "",
-      "port": {},
+      "port": {
+        "name": "live_view"
+      },
       "props": {
         "colormap": "",
         "overlay": false,
@@ -283,18 +287,24 @@
       "font": "",
       "freeform": false,
       "h": 40,
+      "drives": {
+        "folder": "capture_folder",
+        "target": "live_view"
+      },
       "id": "s11",
       "kind": "scrubber",
       "label": "Frame",
       "min_h": 0,
       "min_w": 0,
       "note": "",
-      "port": {},
+      "port": {
+        "name": "frame"
+      },
       "props": {
         "command": "",
         "from_": 0,
         "show_total": true,
-        "to": 100
+        "to": 0
       },
       "resize": "auto",
       "w": 400,
