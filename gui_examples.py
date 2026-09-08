@@ -52,12 +52,14 @@ EXAMPLES_DIR = Path(__file__).resolve().parent / "examples" / "gui"
 # because a .gspec is a project file and should not carry teaching notes.
 NOTES: Dict[str, str] = {
     "barbie_capture": (
-        "A capture form that browses a folder of frames. Shows: window bg + "
-        "fg + font applied to the whole app; a file picker in FOLDER mode "
-        "wired to an image canvas by a scrubber's `drives`, so picking a "
-        "folder loads it and the slider steps through it; three numeric rows "
-        "with the label directly ABOVE its spinbox; labels with no bg of "
-        "their own, which inherit the window colour and so read as "
+        "A capture form that browses a folder of frames and reports which of "
+        "them are mistimed. Shows: window bg + fg + font applied to the whole "
+        "app; a file picker in FOLDER mode wired to an image canvas by a "
+        "scrubber's `drives`, so picking a folder loads it and the slider "
+        "steps through it; a button whose `script` runs a Python function and "
+        "fills TWO readouts — a count and a list — from ONE call; three "
+        "numeric rows with the label directly ABOVE its spinbox; labels with "
+        "no bg of their own, which inherit the window colour and so read as "
         "transparent."
     ),
     "image_viewer": (
