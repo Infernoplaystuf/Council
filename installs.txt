@@ -79,6 +79,28 @@ python -c "import torch, llama_cpp, chromadb, sentence_transformers, pandas, ope
 
 # ============================================================
 #  SECTION C — Windows NVIDIA Ada / Hopper  (PyTorch cu124)
+#
+#  !! KNOWN FAILURE — READ BEFORE RUNNING THE llama-cpp-python LINE !!
+#  On a CPU WITHOUT AVX-512, the prebuilt cu124 wheel below dies with
+#  Windows error 0xC000001D (STATUS_ILLEGAL_INSTRUCTION) at CONTEXT
+#  creation — after the weights load, which makes it look like a bad
+#  model file. It fails with n_gpu_layers=0 too, so it is the CPU code
+#  in the wheel, not the CUDA kernels.
+#
+#  Every consumer 12th/13th/14th-gen Intel Core chip is affected:
+#  AVX-512 is fused off on those parts. Confirmed on an i7-14700HX
+#  (Raptor Lake-HX) paired with an RTX 4070 Laptop.
+#
+#  If you hit it, fall back to the CPU-built wheel — it runs correctly,
+#  but WITHOUT GPU offload (expect ~80s for a 1k-character answer from
+#  an 8B Q4_K_M model):
+#     pip install llama-cpp-python --force-reinstall --no-cache-dir \
+#       --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+#
+#  To keep CUDA you must build from source against your own CPU:
+#     set CMAKE_ARGS=-DGGML_CUDA=ON -DGGML_AVX2=ON -DGGML_AVX512=OFF
+#     pip install llama-cpp-python --no-binary llama-cpp-python
+#  which needs MSVC Build Tools + the CUDA Toolkit installed.
 #  Cards in this group (Ada sm_89 / Hopper sm_90):
 #    RTX 40-series desktop:   4060, 4060 Ti, 4070, 4070 Super, 4070 Ti, 4070 Ti Super,
 #                              4080, 4080 Super, 4090

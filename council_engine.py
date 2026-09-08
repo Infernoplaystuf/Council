@@ -537,22 +537,119 @@ def _estimate_kv_cache_bytes(metadata: Dict[str, Any], n_ctx: int,
     return 2 * n_layers * n_ctx * n_kv_heads * head_dim * bytes_per_elem
 
 
-def _available_gpu_bytes() -> Optional[int]:
-    """Free VRAM on the primary CUDA device, in bytes. None when no CUDA
-    GPU is detected (CPU-only build, missing driver, etc.). We use
-    torch.cuda for the query because llama-cpp-python doesn't expose a
-    VRAM probe and torch is already pulled in for the GPU diag print."""
+def _available_gpu_bytes() -> Tuple[Optional[int], str]:
+    """Free VRAM on the primary CUDA device in bytes, plus WHY when unknown.
+
+    Returns ``(bytes_or_None, reason)``. The reason string matters: this
+    probe used to import torch and return a bare None, so a machine with a
+    working RTX 4070 and no torch installed reported "no CUDA GPU detected"
+    and silently fell through to the largest n_ctx rung. The message named
+    the wrong culprit and sent a real debugging session after the GPU.
+
+    torch is NOT a dependency of the GGUF path — llama-cpp-python is. So
+    torch is tried first (cheapest, in-process, and already loaded when the
+    RAG stack is live) and nvidia-smi is the fallback, matching how
+    gpu_check.py and hardware_detect.py already probe for GPUs.
+    """
+    # 1. torch, when it happens to be installed.
     try:
         import torch as _t   # type: ignore[import]
-        if not _t.cuda.is_available():
-            return None
-        # mem_get_info returns (free, total). Free reflects what's
-        # available right now — but the user might launch other GPU
-        # work too, so we leave a safety margin in the caller.
-        free, _total = _t.cuda.mem_get_info()
-        return int(free)
-    except Exception:
-        return None
+        if _t.cuda.is_available():
+            free, _total = _t.cuda.mem_get_info()
+            return int(free), "torch.cuda.mem_get_info"
+        torch_says = "torch present but torch.cuda.is_available() is False"
+    except ImportError:
+        torch_says = "torch not installed"
+    except Exception as exc:
+        torch_says = f"torch probe failed: {exc!r}"
+
+    # 2. nvidia-smi — the same query gpu_check.py uses. Present whenever the
+    #    NVIDIA driver is, regardless of which Python packages are.
+    try:
+        import shutil as _sh
+        exe = _sh.which("nvidia-smi")
+        if exe:
+            r = subprocess.run(
+                [exe, "--query-gpu=memory.free",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10,
+                encoding="utf-8", errors="replace")
+            first = (r.stdout or "").strip().splitlines()
+            if first and first[0].strip().isdigit():
+                # nvidia-smi reports MiB.
+                return int(first[0].strip()) * 1024 * 1024, "nvidia-smi"
+            return None, f"{torch_says}; nvidia-smi returned no usable value"
+        return None, f"{torch_says}; nvidia-smi not on PATH"
+    except Exception as exc:
+        return None, f"{torch_says}; nvidia-smi probe failed: {exc!r}"
+
+
+def _diagnose_load_failure(model_path: Any, exc: BaseException) -> str:
+    """Turn llama.cpp's terse load failure into something actionable.
+
+    Two real failures, both hit on a clean install, both reported by
+    llama-cpp as an indistinguishable "Failed to load model from file":
+
+      TRUNCATED DOWNLOAD. A partial GGUF has a perfectly valid header, so a
+      magic-byte check passes and the file looks fine. llama.cpp only
+      notices when a tensor's data runs past EOF. curl exits 0 on a
+      short read, so "the download succeeded" is not evidence.
+
+      ILLEGAL INSTRUCTION (Windows 0xC000001D / SIGILL elsewhere). The
+      wheel was compiled for CPU features this machine lacks — e.g. an
+      AVX-512 build on a consumer Raptor Lake, which has AVX2 only. The
+      weights load and it dies at context creation, which reads like a
+      model problem and is not.
+    """
+    from pathlib import Path as _P
+    p = _P(str(model_path))
+    lines = ["", "=" * 68, "[GGUF] MODEL LOAD FAILED — likely causes:", "=" * 68]
+
+    text = f"{exc!r}"
+    winerr = getattr(exc, "winerror", None)
+    is_sigill = (winerr == -1073741795) or ("0xc000001d" in text.lower())
+
+    if is_sigill:
+        lines += [
+            "",
+            "ILLEGAL INSTRUCTION (0xC000001D). This is a WHEEL/CPU mismatch,",
+            "not a problem with the model file. The installed",
+            "llama-cpp-python was built for CPU instructions this machine",
+            "does not have (commonly an AVX-512 build on a CPU that has",
+            "only AVX2 — all consumer 12th/13th/14th-gen Intel cores).",
+            "",
+            "  Fix: reinstall from a conservatively-built wheel:",
+            "    pip install llama-cpp-python --force-reinstall --no-cache-dir \\",
+            "      --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu",
+            "",
+            "  Note this costs GPU offload. If you need CUDA, you must find",
+            "  a CUDA wheel built without AVX-512 or build from source with",
+            "  -DGGML_AVX512=OFF -DGGML_CUDA=ON.",
+        ]
+    else:
+        try:
+            size = p.stat().st_size
+            lines += ["", f"File on disk: {size:,} bytes"]
+        except Exception:
+            size = 0
+            lines += ["", "File on disk: could not stat the path"]
+        lines += [
+            "",
+            "TRUNCATED OR CORRUPT DOWNLOAD is the most common cause. A",
+            "partial GGUF still has a valid header, so 'it looks like a",
+            "GGUF' proves nothing — and curl/wget exit 0 on a short read.",
+            "",
+            "  Check: compare the byte count above against the source.",
+            "    curl -sI <url> | grep -i content-length",
+            "  Resume rather than restart:",
+            "    curl -L -C - -o <file> <url>",
+            "",
+            "  llama.cpp names the specific tensor that ran past EOF in the",
+            "  lines above this message — 'data is not within the file",
+            "  bounds' is a truncation, full stop.",
+        ]
+    lines += ["=" * 68, ""]
+    return "\n".join(lines)
 
 
 def _pick_vram_aware_n_ctx(metadata: Dict[str, Any],
@@ -571,10 +668,13 @@ def _pick_vram_aware_n_ctx(metadata: Dict[str, Any],
         "model_size_bytes": model_size_bytes,
         "margin_bytes":     margin_bytes,
     }
-    free_vram = _available_gpu_bytes()
+    free_vram, vram_source = _available_gpu_bytes()
     diag["free_vram_bytes"] = free_vram
+    diag["vram_source"] = vram_source
     if free_vram is None:
-        diag["reason"] = "no CUDA GPU detected"
+        # Say WHICH probe failed and why. "no CUDA GPU detected" was a lie on
+        # any machine that simply lacked torch.
+        diag["reason"] = f"free VRAM unknown ({vram_source})"
         return None, diag
 
     # Reserve room for model weights AND the safety margin. If the
@@ -770,6 +870,15 @@ def _get_gguf_model():
             _ladder_log("vram_aware", chosen=False, **diag)
 
     # Rung 3: GGUF advertised context_length (the old default behaviour).
+    #
+    # CAP IT HARDER WHEN VRAM IS UNKNOWN. Reaching this rung means rung 2
+    # could not size the KV cache — no GPU, no probe, or missing metadata.
+    # Taking the model's advertised maximum in that state is the worst
+    # possible guess: Granite 3.3 8B advertises 131,072, which this rung
+    # capped to 32,768, and a 32k KV cache on top of 4.6 GB of weights does
+    # not fit in an 8 GB card or a modest RAM budget. When we do not know
+    # what we have, ask for little — the user can always raise
+    # COUNCIL_GGUF_N_CTX, and the load message below tells them they can.
     if n_ctx is None and metadata:
         try:
             model_max = _gguf_max_context_from_metadata(metadata)
@@ -778,12 +887,14 @@ def _get_gguf_model():
             _ladder_log("metadata_context_length", error=repr(exc),
                         chosen=False)
         if model_max and model_max > 0:
-            n_ctx = min(model_max, n_ctx_cap)
+            blind_cap = 8192
+            n_ctx = min(model_max, n_ctx_cap, blind_cap)
             n_ctx_source = (f"GGUF context_length "
-                            f"(advertises {model_max:,}, "
-                            f"capped at {n_ctx_cap:,})")
+                            f"(advertises {model_max:,}; VRAM unknown so "
+                            f"capped at {n_ctx:,})")
             _ladder_log("metadata_context_length",
-                        model_max=model_max, capped_to=n_ctx, chosen=True)
+                        model_max=model_max, capped_to=n_ctx,
+                        blind_cap=blind_cap, n_ctx_max=n_ctx_cap, chosen=True)
         else:
             _ladder_log("metadata_context_length",
                         model_max=model_max, chosen=False)
@@ -1104,6 +1215,7 @@ def _get_gguf_model():
                 context={"model": p.name, "n_ctx": n_ctx,
                          "n_gpu_layers": n_gpu_layers},
             )
+            print(_diagnose_load_failure(p, primary_exc), flush=True)
             raise
     # Surface the model's advertised max context so the user knows the headroom
     # they have before raising COUNCIL_GGUF_N_CTX. This is a no-op when the

@@ -2078,6 +2078,74 @@ def test_gpu_crash_sentinel_lifecycle() -> None:
                 os.environ["COUNCIL_VAULT_ROOT"] = prev_root
 
 
+def test_gpu_probe_survives_missing_torch() -> None:
+    """The probe must not report "no CUDA GPU" when the real cause is that
+    torch is not installed.
+
+    FOUND ON A REAL MACHINE: an RTX 4070 with a working driver and no torch
+    reported "no CUDA GPU detected", so the n_ctx ladder fell through to the
+    model's advertised context and picked 32,768 — a KV cache far too large
+    for the 8 GB card. The message named the wrong culprit and cost a real
+    debugging session. torch is NOT a dependency of the GGUF path;
+    llama-cpp-python is, and nvidia-smi ships with the driver.
+    """
+    import builtins
+    import council_engine as ce
+
+    real_import = builtins.__import__
+
+    def no_torch(name, *a, **kw):
+        if name == "torch":
+            raise ImportError("No module named 'torch'")
+        return real_import(name, *a, **kw)
+
+    builtins.__import__ = no_torch
+    try:
+        free, source = ce._available_gpu_bytes()
+    finally:
+        builtins.__import__ = real_import
+
+    _check("GPU probe returns a (bytes, reason) pair",
+           isinstance(source, str))
+    # Whatever the answer, the REASON must mention torch rather than
+    # asserting there is no GPU.
+    if free is None:
+        _check("probe blames torch, not the GPU, when torch is missing",
+               "torch" in source.lower())
+    else:
+        _check("probe found VRAM without torch (nvidia-smi fallback)",
+               free > 0 and "nvidia-smi" in source)
+
+
+def test_load_failure_diagnosis_names_the_real_cause() -> None:
+    """llama-cpp reports truncation and an illegal instruction with the SAME
+    opaque 'Failed to load model from file'. Both were hit on a clean
+    install; the diagnostic has to tell them apart."""
+    import council_engine as ce
+
+    trunc = ce._diagnose_load_failure(
+        "m.gguf", ValueError("Failed to load model from file: m.gguf"))
+    _check("truncation diagnosis mentions a short download",
+           "TRUNCATED" in trunc and "-C -" in trunc)
+
+    sigill = OSError("boom")
+    sigill.winerror = -1073741795          # STATUS_ILLEGAL_INSTRUCTION
+    ill = ce._diagnose_load_failure("m.gguf", sigill)
+    _check("SIGILL diagnosis blames the wheel, not the model",
+           "ILLEGAL INSTRUCTION" in ill and "AVX" in ill)
+    _check("SIGILL diagnosis does not misdiagnose as truncation",
+           "TRUNCATED" not in ill)
+
+
+def test_blind_n_ctx_fallback_is_conservative() -> None:
+    """When VRAM is unknown the ladder must ask for LITTLE, not the model's
+    advertised maximum. Granite 3.3 8B advertises 131,072; taking it (capped
+    to 32,768) put a KV cache on an 8 GB card that could not fit."""
+    src = (REPO / "council_engine.py").read_text(encoding="utf-8")
+    _check("blind fallback caps n_ctx well below the 32k ceiling",
+           "blind_cap = 8192" in src)
+
+
 def test_vram_aware_n_ctx_ladder_log_no_kwarg_collision() -> None:
     """Regression: after switching to a model that triggers the VRAM-aware
     n_ctx path, the engine logged the result. _pick_vram_aware_n_ctx puts
@@ -2087,7 +2155,10 @@ def test_vram_aware_n_ctx_ladder_log_no_kwarg_collision() -> None:
     """
     import council_engine as ce
     prev = ce._available_gpu_bytes
-    ce._available_gpu_bytes = lambda: 24 * 1024 ** 3      # force GPU success
+    # Returns (bytes, source) since the probe learned to say WHY it failed —
+    # "no CUDA GPU detected" used to be reported on any machine that merely
+    # lacked torch, which named the wrong culprit.
+    ce._available_gpu_bytes = lambda: (24 * 1024 ** 3, "stub")
     try:
         meta = {
             "llama.block_count": 32,
@@ -8768,6 +8839,12 @@ def main() -> int:
          test_gpu_crash_sentinel_lifecycle)
     _run("VRAM-aware n_ctx log: no 'picked' kwarg collision",
          test_vram_aware_n_ctx_ladder_log_no_kwarg_collision)
+    _run("GPU probe survives a missing torch",
+         test_gpu_probe_survives_missing_torch)
+    _run("model-load failure diagnosis names the real cause",
+         test_load_failure_diagnosis_names_the_real_cause)
+    _run("blind n_ctx fallback is conservative",
+         test_blind_n_ctx_fallback_is_conservative)
     _run("dispatcher: no host probe when remote disabled",
          test_dispatcher_no_probe_when_remote_disabled)
     _run("embed device: WSL defaults to CPU (no CUDA crash)",
