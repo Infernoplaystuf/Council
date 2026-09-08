@@ -462,6 +462,7 @@ prereqs, Miniforge install, and conda env steps are identical).
 | **🔍 Lens** | Paste an answer, pick which roles should review it in parallel. Useful when you don't fully trust what the Council just told you. |
 | **🕓 Sessions** | Every past chat. Searchable. Click any to load. |
 | **🗄 Vault** | The shared data pool. Drop CSVs / docs / cloned repos in here for the Sage to index. |
+| **🎨 GUI Designer** | Draw a wireframe, get a real multi-file Tkinter app. See [Build a GUI without writing Tkinter](#build-a-gui-without-writing-tkinter). |
 | **🎙 Speech** | Record audio → transcribe → feed to Council. Also reads text aloud. |
 
 There are six more "advanced" tabs (IDE, Agents, Nodes, Apothecary, etc.) that are hidden by default. Set `COUNCIL_ADVANCED=1` before launching to see them.
@@ -480,6 +481,81 @@ There are six more "advanced" tabs (IDE, Agents, Nodes, Apothecary, etc.) that a
 5. 🔍 Lens: paste the verdict, ask Skeptic + Algorithm to review
 6. Done — sessions auto-save in the 🕓 Sessions tab
 ```
+
+---
+
+## Build a GUI without writing Tkinter
+
+The **🎨 GUI Designer** tab turns a drawn wireframe into a real, multi-file
+Tkinter application: you drag widgets onto a canvas, hit **⚙ Generate**, and get
+a project you can run and keep editing.
+
+### Try it in one command
+
+Two worked examples ship with the repo. From the repo root, on any OS:
+
+```bash
+python run_example_gui.py
+```
+
+That lists them. To build one and launch it:
+
+```bash
+python run_example_gui.py barbie_capture
+```
+
+**What you need:** Python with `tkinter`, and nothing else. Verified on 3.10,
+3.11, 3.12 and 3.13 with `PIL`, `matplotlib`, `numpy` and `pandas` all absent.
+The `image_viewer` example additionally wants **Pillow** (`pip install Pillow`)
+to *display* frames; without it the app still runs and says so rather than
+crashing.
+
+You do **not** need `requirements.txt` for this — that file covers the whole
+Council app (models, RAG, plotting, speech) and is a much larger install.
+
+> On most Linux distros `tkinter` is a separate package — `sudo apt install
+> python3-tk` (Debian/Ubuntu) or `sudo dnf install python3-tkinter` (Fedora).
+> If it's missing you'll see `ModuleNotFoundError: No module named 'tkinter'`.
+
+> The Barbie example asks for the **Magneto** font, which ships with Windows.
+> On macOS/Linux Tk silently substitutes a default face — the app works, it just
+> won't look like the screenshot.
+
+### Where it goes
+
+Generated projects are written to your **vault**, not the repo:
+
+```
+~/.council/vault/GUI_Projects/example_barbie_capture/
+```
+
+Set `COUNCIL_VAULT_ROOT` to put the vault elsewhere. The directory is created
+for you if it doesn't exist. `vault/` is gitignored, which is why a fresh clone
+has the wireframes (`examples/gui/*.gspec`) but none of the generated code —
+`run_example_gui.py` is what turns one into the other.
+
+### Then edit it in the app
+
+Once built, the example is an ordinary project. Launch Council → **🎨 GUI
+Designer** → **Open** → pick `example_barbie_capture` → drag things around →
+**⚙ Generate** → **▶ Run**.
+
+(**Open** lists projects in your vault only; it has no file browser, so an
+example must be built once before it shows up there.)
+
+### What a generated project looks like
+
+```
+example_barbie_capture/
+  main.py        ← run this
+  app.py         ← your code. Written once, NEVER overwritten
+  handlers.py    ← your button handlers. Appended to, never rewritten
+  ui/            ← generated. Overwritten on every Generate
+  project.gspec  ← the wireframe
+```
+
+Regenerating only ever rewrites `ui/`. Anything you put in `app.py` or
+`handlers.py` survives.
 
 ---
 
