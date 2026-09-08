@@ -436,6 +436,47 @@ def validate(spec: Spec) -> Tuple[bool, List[str]]:
             errs.append(f"{where}: duplicate radio value(s) {dups} in group "
                         f"{p.group!r} — var.get() would be ambiguous")
 
+    # ---- structural traps that emit fine and render as NOTHING ----------
+    #
+    # Everything above checks that a widget is well-formed. These check that
+    # the LAYOUT is one a user could actually see. Both were found by asking
+    # a model to design a wireframe: it produced a spec that passed every
+    # check above, emitted parseable code, passed the policy gate, and came
+    # up as a completely blank window.
+
+    # Two root-level siblings covering the same area. Whichever is emitted
+    # last is place()d on top and hides the other. A full-canvas Frame plus a
+    # full-canvas Notebook is the exact shape that failed.
+    roots = [w for w in spec.widgets if not w.parent]
+    for i, a in enumerate(roots):
+        for b in roots[i + 1:]:
+            if not (a.manager == b.manager == "place"):
+                continue
+            same = (abs(a.relx - b.relx) < 1e-6 and abs(a.rely - b.rely) < 1e-6
+                    and abs(a.relwidth - b.relwidth) < 1e-6
+                    and abs(a.relheight - b.relheight) < 1e-6)
+            if same and a.relwidth > 0 and a.relheight > 0:
+                errs.append(
+                    f"{a.name!r} and {b.name!r} are both placed over the same "
+                    f"area with nothing between them — the second one drawn "
+                    f"hides the first. Nest one inside the other, or give "
+                    f"them different regions of the canvas.")
+
+    # A Notebook with no children shows an empty tab strip; that is a
+    # legitimate placeholder. But a Notebook is a container, so anything the
+    # user drew inside it becomes a TAB — and if the tabs prop is short, the
+    # tab titles fall back to widget labels. Warn rather than error: the
+    # emitter now handles it, and a missing title is cosmetic.
+    for w in spec.widgets:
+        if w.kind != "notebook" or not w.children:
+            continue
+        tabs = list((w.props or {}).get("tabs") or [])
+        if len(tabs) < len(w.children):
+            spec.warnings.append(
+                f"{w.name}: {len(w.children)} child widget(s) but only "
+                f"{len(tabs)} tab title(s) — the rest are named from their "
+                f"labels")
+
     # A window with no elastic axis cannot be resized — gui_layout guarantees
     # against it, so reaching here means the tree was built some other way.
     if spec.widgets and spec.root_col_weights and not any(spec.root_col_weights):

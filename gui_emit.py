@@ -435,11 +435,31 @@ def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
                       spec.root_row_minsizes, spec.root_col_minsizes, ind)
     L.append("")
 
+    # Which parents manage their children with .add() instead of a geometry
+    # manager. A child of a Notebook that is .grid()-ed is CONSTRUCTED,
+    # PARENTED, AND INVISIBLE — the notebook shows an empty tab strip and the
+    # widget never appears. Same for PanedWindow. This produced a completely
+    # blank generated app and nothing anywhere warned.
+    _tab_index: Dict[str, int] = {}
+
     for w in _ordered(spec):
         parent = f"self.{w.parent}" if w.parent else "self"
+        parent_spec = spec.by_name(w.parent) if w.parent else None
+        parent_kind = parent_spec.kind if parent_spec else ""
         L.append(f"{ind}# {w.kind}: {w.label or w.name}")
         L.append(f"{ind}self.{w.name} = {construct(w, parent)}")
-        L.append(f"{ind}{place_call(w)}")
+        if parent_kind == "notebook":
+            # Tab titles come from the parent's `tabs` prop, in child order —
+            # which is what that prop's comment in the catalogue promises.
+            i = _tab_index.get(w.parent, 0)
+            _tab_index[w.parent] = i + 1
+            tabs = list(_prop(parent_spec, "tabs", []) or [])
+            title = str(tabs[i]) if i < len(tabs) else (w.label or w.name)
+            L.append(f"{ind}{parent}.add(self.{w.name}, text={_py(title)})")
+        elif parent_kind == "panedwindow":
+            L.append(f"{ind}{parent}.add(self.{w.name})")
+        else:
+            L.append(f"{ind}{place_call(w)}")
         if w.is_container and (w.row_weights or w.col_weights):
             L += _grid_config(f"self.{w.name}", w.row_weights, w.col_weights,
                               w.row_minsizes, w.col_minsizes, ind)

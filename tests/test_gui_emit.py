@@ -407,6 +407,48 @@ def test_regeneration_is_still_byte_identical_with_ports(tmp_path):
     assert (tmp_path / "ui" / "ports.py").read_bytes() == first
 
 
+def test_notebook_children_are_added_as_tabs_not_gridded():
+    """A child .grid()-ed into a ttk.Notebook is constructed, parented, and
+    INVISIBLE — the notebook shows an empty tab strip and the widget never
+    appears. This produced a completely blank generated app, and the spec
+    validated, emitted, parsed and passed the policy gate on the way there."""
+    nb = mk("notebook", 0, 0, 600, 400, sid="nb", props={"tabs": ["One", "Two"]})
+    a = mk("label", 20, 40, 200, 24, sid="a", label="Inside A")
+    b = mk("button", 20, 90, 200, 30, sid="b", label="Inside B")
+    spec = gsp.build([nb, a, b], gl.infer([nb, a, b], 700, 500), project="nb")
+    src = ge.emit_main_ui(spec, {})
+
+    assert 'self.nbk_notebook.add(self.lbl_inside_a, text="One")' in src
+    assert 'self.nbk_notebook.add(self.btn_inside_b, text="Two")' in src
+    # And they must NOT also be gridded into it.
+    assert "self.lbl_inside_a.grid(" not in src
+    ast.parse(src)
+
+
+def test_notebook_tab_titles_fall_back_to_labels():
+    """Fewer tab titles than children is a warning, not a crash — the title
+    falls back to the widget's own label so no tab is nameless."""
+    nb = mk("notebook", 0, 0, 600, 400, sid="nb", props={"tabs": ["Only"]})
+    a = mk("label", 20, 40, 200, 24, sid="a", label="First")
+    b = mk("button", 20, 90, 200, 30, sid="b", label="Second")
+    spec = gsp.build([nb, a, b], gl.infer([nb, a, b], 700, 500), project="nb")
+    ok, errs = gsp.validate(spec)
+    assert ok, errs
+    assert any("tab title" in w for w in spec.warnings), spec.warnings
+    src = ge.emit_main_ui(spec, {})
+    assert 'text="Only"' in src
+    assert 'text="Second"' in src, "second tab should fall back to its label"
+
+
+def test_panedwindow_children_are_added_too():
+    """ttk.PanedWindow has the same .add() contract as Notebook."""
+    pw = mk("panedwindow", 0, 0, 600, 400, sid="pw")
+    a = mk("frame", 20, 40, 200, 300, sid="a", label="Left")
+    spec = gsp.build([pw, a], gl.infer([pw, a], 700, 500), project="pw")
+    src = ge.emit_main_ui(spec, {})
+    assert "self.pnd_panedwindow.add(self.frm_left)" in src
+
+
 def test_colour_and_ports_are_orthogonal(tmp_path):
     """Step 10 integration. The two axes do not know about each other:
     gui_colors reads .bg / .fg; gui_ports reads .port. A single shape can

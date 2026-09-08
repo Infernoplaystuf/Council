@@ -324,6 +324,28 @@ def test_port_registry_uses_group_keys_for_radios():
     assert reg[keys[0]] == "size"
 
 
+def test_validate_rejects_two_root_widgets_stacked_on_the_same_area():
+    """FOUND BY ASKING A MODEL TO DESIGN A WIREFRAME. It emitted a
+    full-canvas Frame AND a full-canvas Notebook as siblings. Both were
+    place()d at 100%x100%; the second one drawn covered the first, and the
+    generated app was a completely blank window. Every other check passed."""
+    f = mk("frame", 0, 0, 1280, 800, sid="f")
+    n = mk("notebook", 0, 0, 1280, 800, sid="n")
+    lab = mk("label", 10, 10, 100, 20, sid="l", label="File Path:")
+    spec = built([f, n, lab])
+    ok, errs = gsp.validate(spec)
+    assert not ok
+    assert any("same area" in e for e in errs), errs
+
+
+def test_validate_allows_root_widgets_that_do_not_overlap():
+    """The check must not fire on an ordinary side-by-side layout."""
+    a = mk("frame", 0, 0, 600, 800, sid="a", label="Left")
+    b = mk("frame", 640, 0, 600, 800, sid="b", label="Right")
+    ok, errs = gsp.validate(built([a, b]))
+    assert ok, errs
+
+
 def test_spec_module_is_pure():
     import ast
     src = (Path(__file__).resolve().parent.parent / "gui_spec.py").read_text(
