@@ -401,6 +401,15 @@ class Shape:
     # Tk's font= option takes, so it round-trips into generated code verbatim
     # with no reassembly step to get wrong. "" = the widget's default font.
     font: str = ""
+    # A link to a Python function this widget runs. Keys:
+    #   module   str        importable module, e.g. "frame_timing"
+    #   function str        the entry point, e.g. "count_bad_frames"
+    #   inputs   list[str]  port names whose values are passed, in order
+    #   output   str        port name that receives the return value
+    # Kept out of props for the same reason colour is: gui_classify may
+    # write only into props, and a model-authored import target is not
+    # something this app will ever generate.
+    script: Dict[str, Any] = field(default_factory=dict)
     # The typed binding, decided by gui_ports. Keys used today:
     #   name    str          — the port name; absent = derived from the label
     #   type    str          — one of gui_ports.PORT_CAPS[kind].types
@@ -531,7 +540,8 @@ def required_version(project: "Project") -> int:
     load_gspec already emits) instead of dropping the data. The previous
     behaviour of stamping ``p.gspec_version`` back was a live bug — this
     function is the fix, extended here for colour."""
-    if any(getattr(s, "port", None) for s in project.shapes):
+    if any(getattr(s, "port", None) or getattr(s, "script", None)
+           for s in project.shapes):
         return 2
     if any(getattr(s, "bg", "") or getattr(s, "fg", "")
            or getattr(s, "font", "")
@@ -617,6 +627,7 @@ def load_gspec(path: Any) -> Project:
                 fg=str(sd.get("fg") or ""),
                 font=str(sd.get("font") or ""),
                 port=dict(sd.get("port") or {}),      # v1 files -> {}
+                script=dict(sd.get("script") or {}),
             ))
         except (TypeError, ValueError) as exc:
             raise GspecError(f"{p.name}: shape #{i} has a bad field: {exc}")

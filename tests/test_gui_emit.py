@@ -486,3 +486,63 @@ def test_emit_module_is_pure():
     banned = {m for m in mods
               if m in {"tkinter", "council_engine"} or m.startswith("vault_")}
     assert not banned, f"gui_emit writes text; it must not import {banned}"
+
+
+# ============================================================
+# Script links (declare in the wireframe, edit the stub)
+# ============================================================
+
+def _linked_spec(**script):
+    b = mk("button", 10, 10, 200, 32, sid="b", label="Scan")
+    b.script = script or {"module": "frame_timing",
+                          "function": "count_bad_frames",
+                          "inputs": ["capture_folder"],
+                          "output": "bad_count"}
+    return gsp.build([b], gl.infer([b], 400, 300), project="linked")
+
+
+def test_a_declared_script_becomes_a_working_handler_body():
+    """The point of the feature: the designer records the wiring, the
+    generated stub is a real call the user can then edit."""
+    spec = _linked_spec()
+    src = ge.emit_handlers_py(spec)
+    assert "from frame_timing import count_bad_frames" in src
+    assert "count_bad_frames(self.ports.capture_folder.get())" in src
+    assert "self.ports.bad_count.set(result)" in src
+    ast.parse(src)
+
+
+def test_a_widget_with_no_script_still_gets_the_plain_stub():
+    b = mk("button", 10, 10, 200, 32, sid="b", label="Go")
+    spec = gsp.build([b], gl.infer([b], 400, 300), project="plain")
+    src = ge.emit_handlers_py(spec)
+    assert "TODO: implement" in src
+    ast.parse(src)
+
+
+def test_a_script_link_with_no_output_port_prints_instead_of_setting():
+    spec = _linked_spec(module="frame_timing", function="count_bad_frames",
+                        inputs=["capture_folder"])
+    src = ge.emit_handlers_py(spec)
+    assert "no output port declared" in src
+    assert ".set(result)" not in src
+    ast.parse(src)
+
+
+def test_a_failing_script_cannot_kill_the_ui():
+    """An analysis script that raises must surface, not freeze the window."""
+    src = ge.emit_handlers_py(_linked_spec())
+    assert "except Exception as exc:" in src
+    assert "failed:" in src
+
+
+def test_app_py_mixes_handlers_in_FIRST():
+    """handlers.py defines HandlerMixin, and MainUi defines no-op stubs of the
+    same names. If App does not inherit the mixin BEFORE MainUi, the stubs
+    shadow every handler and they all silently do nothing — which is what
+    happened until app.py started importing it."""
+    spec = _linked_spec()
+    src = ge.emit_app_py(spec)
+    assert "from handlers import HandlerMixin" in src
+    assert "class App(HandlerMixin, MainUi):" in src
+    ast.parse(src)

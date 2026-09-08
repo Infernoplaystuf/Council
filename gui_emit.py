@@ -48,6 +48,7 @@ REGION_CLOSE = re.compile(r"^\s*#\s*endregion\b")
 LINKED_ALLOWLIST = (
     "image_stats", "image_index", "plot_registry", "plots_pane", "graph_data",
     "vault_analyst", "data_index", "df_cache", "stats_cache", "provenance",
+    "frame_timing",
 )
 
 
@@ -1415,16 +1416,23 @@ here: the generated MainUi builds the widgets and calls self.on_<name>, and
 those methods live below.
 
 Regenerating the wireframe rewrites ui/ only. Nothing here is touched.
+
+App inherits HandlerMixin FIRST so the handler bodies in handlers.py win over
+the no-op stubs MainUi defines. Without that order the stubs shadow them and
+every handler silently does nothing — which is exactly what happened before
+this line existed: handlers.py was generated, never wired in, and a declared
+script link produced dead code that looked correct.
 """
 from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk
 
+from handlers import HandlerMixin
 from ui.main_ui import MainUi
 
 
-class App(MainUi):
+class App(HandlerMixin, MainUi):
     def __init__(self, master=None, **kw):
         super().__init__(master, **kw)
 
@@ -1443,14 +1451,66 @@ if __name__ == "__main__":
 '''
 
 
-def handler_stub(name: str) -> str:
-    return (f"\n    def {name}(self, *args) -> None:\n"
-            f'        """TODO: implement."""\n'
-            f"        pass\n")
+def handler_stub(name: str, script: Optional[Dict[str, Any]] = None) -> str:
+    """A handler body for handlers.py.
+
+    With no script link this is the TODO stub it always was. With one, it is a
+    WORKING call — the declared function, fed the declared input ports, its
+    result written to the declared output port.
+
+    Generated ONCE. handlers.py is append-only and never rewritten, so this is
+    a starting point the user owns and edits, not generated code that will be
+    clobbered. That is the whole point of routing the link through here rather
+    than into ui/: the designer records the wiring, the user keeps the
+    behaviour."""
+    script = dict(script or {})
+    module = str(script.get("module") or "").strip()
+    func = str(script.get("function") or "").strip()
+    if not (module and func):
+        return (f"\n    def {name}(self, *args) -> None:\n"
+                f'        """TODO: implement."""\n'
+                f"        pass\n")
+
+    inputs = [str(p) for p in (script.get("inputs") or []) if str(p).strip()]
+    output = str(script.get("output") or "").strip()
+    args = ", ".join(f"self.ports.{p}.get()" for p in inputs)
+    call = f"{func}({args})"
+
+    lines = [
+        f"\n    def {name}(self, *args) -> None:",
+        f'        """Runs {module}.{func} — wired from the wireframe.',
+        "",
+        "        Generated once from the widget's script link. handlers.py is",
+        "        never rewritten, so edit this freely.",
+        '        """',
+        f"        from {module} import {func}",
+        "        try:",
+        f"            result = {call}",
+    ]
+    if output:
+        lines.append(f"            self.ports.{output}.set(result)")
+    else:
+        lines.append("            print(result)   # no output port declared")
+    lines += [
+        "        except Exception as exc:",
+        "            # A analysis script raising must not kill the UI thread;",
+        "            # the user sees the failure instead of a frozen window.",
+        f'            print(f"{name} failed: {{exc!r}}")',
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _script_for(spec: Spec, handler: str) -> Dict[str, Any]:
+    """The script link declared on the widget that owns ``handler``, if any."""
+    for w in spec.widgets:
+        if w.handler == handler and getattr(w, "script", None):
+            return dict(w.script)
+    return {}
 
 
 def emit_handlers_py(spec: Spec) -> str:
-    body = "".join(handler_stub(h) for h in spec.handlers) or "\n    pass\n"
+    body = "".join(handler_stub(h, _script_for(spec, h))
+                   for h in spec.handlers) or "\n    pass\n"
     return f'''"""Handler stubs for {spec.project}.
 
 APPEND-ONLY. Regeneration adds stubs for NEW widgets to the end of this file
@@ -1549,7 +1609,7 @@ def emit(spec: Spec, project_path: Any, *,
             with handlers.open("a", encoding="utf-8") as fh:
                 fh.write("\n    # --- added by regeneration ---\n")
                 for h in missing:
-                    fh.write(handler_stub(h))
+                    fh.write(handler_stub(h, _script_for(spec, h)))
             res.handlers_added.extend(missing)
         res.files_skipped.append(str(handlers))
     else:

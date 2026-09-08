@@ -140,6 +140,8 @@ class WidgetSpec:
     fg: str = ""
     # Tk font spec, e.g. "Magneto 18 bold". Shape's own, else Window's.
     font: str = ""
+    # A declared link to a Python function. See Shape.script.
+    script: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -286,6 +288,7 @@ def build(shapes: Sequence[Shape], layout_tree: Any,
             bg=str(getattr(s, "bg", "") or ""),
             fg=str(getattr(s, "fg", "") or ""),
             font=str(getattr(s, "font", "") or ""),
+            script=dict(getattr(s, "script", None) or {}),
         )
         if kind in COMMAND_KINDS:
             w.handler = f"on_{w.name}"
