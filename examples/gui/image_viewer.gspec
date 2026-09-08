@@ -1,0 +1,492 @@
+{
+  "canvas": {
+    "grid_snap": 8,
+    "h": 800,
+    "w": 1280
+  },
+  "clarifications": [],
+  "gspec_version": 2,
+  "mode": "linked",
+  "project": "image_viewer",
+  "shapes": [
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Magneto 20",
+      "freeform": false,
+      "h": 40,
+      "id": "s00",
+      "kind": "label",
+      "label": "Image Viewer",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 416,
+      "x": 24,
+      "y": 16,
+      "z": 1
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "s01",
+      "kind": "label",
+      "label": "Capture folder",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 304,
+      "x": 24,
+      "y": 72,
+      "z": 2
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s02",
+      "kind": "file_picker",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "capture_folder"
+      },
+      "props": {
+        "mode": "folder"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 440,
+      "x": 24,
+      "y": 104,
+      "z": 3
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "s03",
+      "kind": "label",
+      "label": "Exposure (ms)",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 240,
+      "x": 24,
+      "y": 152,
+      "z": 4
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s04",
+      "kind": "spinbox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "exposure_ms"
+      },
+      "props": {
+        "from_": 0,
+        "increment": 1,
+        "to": 10000
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 240,
+      "x": 24,
+      "y": 176,
+      "z": 5
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "s05",
+      "kind": "label",
+      "label": "Gain",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 240,
+      "x": 24,
+      "y": 224,
+      "z": 6
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s06",
+      "kind": "spinbox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "gain"
+      },
+      "props": {
+        "from_": 0,
+        "increment": 1,
+        "to": 10000
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 240,
+      "x": 24,
+      "y": 256,
+      "z": 7
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "s07",
+      "kind": "label",
+      "label": "Frame count",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 240,
+      "x": 24,
+      "y": 296,
+      "z": 8
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s08",
+      "kind": "spinbox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "frame_count"
+      },
+      "props": {
+        "from_": 0,
+        "increment": 1,
+        "to": 10000
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 240,
+      "x": 24,
+      "y": 320,
+      "z": 9
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s09",
+      "kind": "button",
+      "label": "Scan for bad timings",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {
+        "function": "scan_report",
+        "inputs": [
+          "capture_folder"
+        ],
+        "module": "frame_timing",
+        "outputs": {
+          "bad_count": "count",
+          "bad_list": "names"
+        }
+      },
+      "w": 256,
+      "x": 24,
+      "y": 376,
+      "z": 10
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "s10",
+      "kind": "label",
+      "label": "Frames on a bad timing",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 256,
+      "x": 24,
+      "y": 432,
+      "z": 11
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s11",
+      "kind": "entry",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "dir": "io",
+        "name": "bad_count"
+      },
+      "props": {
+        "justify": "left",
+        "placeholder": "",
+        "show": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 256,
+      "x": 24,
+      "y": 464,
+      "z": 12
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "s12",
+      "kind": "label",
+      "label": "Which frames",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 256,
+      "x": 24,
+      "y": 512,
+      "z": 13
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 152,
+      "id": "s13",
+      "kind": "listbox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "dir": "io",
+        "name": "bad_list"
+      },
+      "props": {
+        "selectmode": "browse"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 256,
+      "x": 24,
+      "y": 536,
+      "z": 14
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "s14",
+      "kind": "label",
+      "label": "Live view",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 304,
+      "x": 560,
+      "y": 72,
+      "z": 15
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 336,
+      "id": "s15",
+      "kind": "image_canvas",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "live_view"
+      },
+      "props": {
+        "colormap": "",
+        "overlay": false,
+        "overlay_alpha": 0.5,
+        "zoom_to_fit": true
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 440,
+      "x": 560,
+      "y": 104,
+      "z": 16
+    },
+    {
+      "bg": "",
+      "drives": {
+        "folder": "capture_folder",
+        "target": "live_view"
+      },
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 40,
+      "id": "s16",
+      "kind": "scrubber",
+      "label": "Frame",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "frame"
+      },
+      "props": {
+        "command": "",
+        "from_": 0,
+        "show_total": true,
+        "to": 100
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 440,
+      "x": 560,
+      "y": 464,
+      "z": 17
+    }
+  ],
+  "window": {
+    "bg": "#ff4fa3",
+    "fg": "#ffffff",
+    "font": "Magneto 12",
+    "min_h": 760,
+    "min_w": 1060,
+    "title": "Image Viewer"
+  }
+}

@@ -218,3 +218,35 @@ def count_bad_frames(folder: Any) -> int:
     this is what a GUI binds a button to. Use classify_folder when you want
     the per-frame detail."""
     return classify_folder(folder).bad
+
+
+def list_bad_frames(folder: Any) -> List[str]:
+    """Just the FILENAMES of the bad frames, in name order."""
+    return [Path(v.path).name
+            for v in classify_folder(folder).verdicts if v.bad_timing]
+
+
+def scan_report(folder: Any) -> Dict[str, Any]:
+    """Everything a GUI wants from one scan, keyed for a multi-output link.
+
+    A count on its own says a folder has ten bad frames and leaves the user
+    to find them. Returning the names alongside means one button press
+    answers "how many" and "which" together, from a single pass over the
+    folder — scanning twice to fill two widgets would double the work for
+    no gain.
+
+    Keys are stable because a script link binds ports to them by name:
+        count   int        how many frames were bad
+        names   list[str]  their filenames, in name order
+        indices list[int]  their positions in the folder listing, so a
+                           caller can jump a scrubber straight to one
+        summary str        a one-line human description
+    """
+    rep = classify_folder(folder)
+    names, indices = [], []
+    for i, v in enumerate(rep.verdicts):
+        if v.bad_timing:
+            names.append(Path(v.path).name)
+            indices.append(i)
+    return {"count": rep.bad, "names": names, "indices": indices,
+            "summary": rep.summary()}

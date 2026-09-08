@@ -410,6 +410,13 @@ class Shape:
     # write only into props, and a model-authored import target is not
     # something this app will ever generate.
     script: Dict[str, Any] = field(default_factory=dict)
+    # A SEQUENCE LINK. Declared on an index widget (a scrubber or scale)
+    # to say: this index steps through the images in `folder`, showing
+    # each in `target`. Keys are PORT names, not widget names, so a
+    # widget rename that keeps its port leaves the link intact.
+    #   folder str  port holding a directory path
+    #   target str  port of the widget that displays one item
+    drives: Dict[str, Any] = field(default_factory=dict)
     # The typed binding, decided by gui_ports. Keys used today:
     #   name    str          — the port name; absent = derived from the label
     #   type    str          — one of gui_ports.PORT_CAPS[kind].types
@@ -541,6 +548,7 @@ def required_version(project: "Project") -> int:
     behaviour of stamping ``p.gspec_version`` back was a live bug — this
     function is the fix, extended here for colour."""
     if any(getattr(s, "port", None) or getattr(s, "script", None)
+           or getattr(s, "drives", None)
            for s in project.shapes):
         return 2
     if any(getattr(s, "bg", "") or getattr(s, "fg", "")
@@ -628,6 +636,7 @@ def load_gspec(path: Any) -> Project:
                 font=str(sd.get("font") or ""),
                 port=dict(sd.get("port") or {}),      # v1 files -> {}
                 script=dict(sd.get("script") or {}),
+                drives=dict(sd.get("drives") or {}),
             ))
         except (TypeError, ValueError) as exc:
             raise GspecError(f"{p.name}: shape #{i} has a bad field: {exc}")

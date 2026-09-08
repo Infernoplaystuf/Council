@@ -559,6 +559,7 @@ class ImageCanvas(ttk.Frame):
         self._base = None          # PIL.Image
         self._overlay_img = None   # PIL.Image
         self._photo = None         # keep a reference or Tk drops the image
+        self._fitted_at = (0, 0)   # canvas size when zoom_to_fit last ran
         self.overlay_enabled = bool(overlay)
         self.overlay_alpha = float(overlay_alpha)
 
@@ -568,7 +569,22 @@ class ImageCanvas(ttk.Frame):
         self.canvas.bind("<MouseWheel>", self._wheel)          # Windows / macOS
         self.canvas.bind("<Button-4>", lambda e: self._zoom_at(1.1, e.x, e.y))
         self.canvas.bind("<Button-5>", lambda e: self._zoom_at(1 / 1.1, e.x, e.y))
-        self.canvas.bind("<Configure>", lambda e: self._render())
+        self.canvas.bind("<Configure>", self._on_configure)
+
+    def _on_configure(self, _e=None) -> None:
+        """Re-fit if the last fit ran before the widget had a real size.
+
+        zoom_to_fit divides by winfo_width(), which is 1 until Tk has laid the
+        window out. An app that sets an image during construction — the normal
+        thing to do when a folder is preloaded — therefore fitted at scale
+        1/width and drew the image one pixel across, then every later
+        <Configure> re-rendered at that same dead scale. Refitting once the
+        canvas has real dimensions is what makes a preloaded image visible.
+        """
+        if min(self._fitted_at) <= 1 and self._base is not None:
+            self.zoom_to_fit()
+        else:
+            self._render()
 
     # -- public ------------------------------------------------------
     def set_image(self, image) -> None:
@@ -595,6 +611,7 @@ class ImageCanvas(ttk.Frame):
         self._scale = min(cw / iw, ch / ih) if iw and ih else 1.0
         self._ox = (cw - iw * self._scale) / 2
         self._oy = (ch - ih * self._scale) / 2
+        self._fitted_at = (cw, ch)
         self._render()
 
     # -- interaction -------------------------------------------------
@@ -1032,6 +1049,23 @@ class _VarPort(_Port):
         return _coerce(self.var.get(), self.type)
 
     def set(self, value) -> None:
+        # A COMPOSITE THAT OWNS ITS VAR MUST BE SET THROUGH ITS OWN set().
+        # Scrubber keeps three views of one index — the variable, the scale
+        # position and the entry text — and only Scrubber.set() syncs them.
+        # Writing the variable directly moved the value and left the scale
+        # and entry showing the old one: measured as
+        #     port.set(50) -> var=50, scale=0.0, entry='0'
+        # An adopted port is exactly the case where option is "" (we did not
+        # attach the variable, the widget already had it), so that flag is
+        # the honest test for "this widget owns more than the variable".
+        if not self._option:
+            setter = getattr(self.widget, "set", None)
+            if callable(setter):
+                try:
+                    setter(value)
+                    return
+                except Exception:
+                    pass
         self.var.set(value)
 
     def on_change(self, fn) -> None:
@@ -1229,6 +1263,101 @@ class _TabPort(_Port):
         self.widget.bind("<<NotebookTabChanged>>", _cb, add=True)
 
 
+class _FrameBrowser:
+    """Folder -> ordered files -> index -> one displayed image.
+
+    Wired from a `drives` declaration on the index widget. Talks only to
+    PORTS, never to widget attribute names, so renaming a widget that keeps
+    its port leaves this intact.
+
+    ONE IMAGE IS DECODED AT A TIME. A capture folder can hold thousands of
+    frames; listing them is cheap (names only) but decoding them is not, so
+    the file list is held and the pixels are not. Scrubbing decodes the frame
+    you land on and drops the one before it.
+    """
+
+    SUFFIXES = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif")
+
+    def __init__(self, folder_port, index_port, target_port):
+        self.folder, self.index, self.target = folder_port, index_port, target_port
+        self.files = []
+        self._last = None
+        folder_port.on_change(self.reload)
+        index_port.on_change(self.show)
+        try:
+            self.reload(folder_port.get())
+        except Exception:
+            pass                      # an empty picker at startup is normal
+
+    # -- the two events ----------------------------------------------
+    def reload(self, folder=None) -> None:
+        """A new folder: relist, RESIZE THE INDEX to fit, show the first."""
+        import os
+        folder = str(folder if folder is not None else self.folder.get() or "")
+        folder = folder.strip().strip('"')
+        self.files = []
+        if folder and os.path.isdir(folder):
+            try:
+                self.files = sorted(
+                    os.path.join(folder, n) for n in os.listdir(folder)
+                    if os.path.splitext(n)[1].lower() in self.SUFFIXES)
+            except OSError:
+                self.files = []
+        # The index widget's range must match the folder, or the slider runs
+        # past the end of a short folder and stops short on a long one.
+        hi = max(0, len(self.files) - 1)
+        w = getattr(self.index, "widget", None)
+        setter = getattr(w, "set_range", None)
+        if callable(setter):
+            try: setter(0, hi)
+            except Exception: pass
+        else:
+            try: w.configure(from_=0, to=hi)
+            except Exception: pass
+        self._last = None
+        try: self.index.set(0)
+        except Exception: pass
+        self.show(0)
+
+    def show(self, i=None) -> None:
+        """Display frame ``i``. Decodes exactly one image."""
+        try:
+            i = int(i if i is not None else self.index.get())
+        except (TypeError, ValueError):
+            return
+        if not self.files:
+            return
+        i = max(0, min(i, len(self.files) - 1))
+        if i == self._last:
+            return                    # scrubbing fires repeatedly on one frame
+        try:
+            from PIL import Image
+        except ImportError:
+            print("[ports] Pillow is not installed; cannot display frames")
+            return
+        try:
+            with Image.open(self.files[i]) as im:
+                # copy() forces the decode, so the pixels survive the `with`.
+                # An explicit im.load() would be the obvious way and is
+                # refused by gui_policy — `.load` is denied wherever it
+                # appears, because that is also pickle.load's spelling.
+                self.target.set(im.copy())
+            self._last = i
+        except Exception as exc:
+            print(f"[ports] could not display {self.files[i]}: {exc!r}")
+
+    # -- read-only detail, for hand-written code ---------------------
+    def count(self) -> int:
+        return len(self.files)
+
+    def path(self, i=None) -> str:
+        try:
+            i = int(i if i is not None else self.index.get())
+        except (TypeError, ValueError):
+            return ""
+        return self.files[i] if 0 <= i < len(self.files) else ""
+
+
 class _PortsBase:
     """Common iteration + rename shim for the generated Ports subclass."""
 
@@ -1394,6 +1523,22 @@ def emit_ports(spec: Spec, aliases: Optional[Dict[str, str]] = None) -> str:
         else:
             L.append(f"        # {p.kind}: unknown binder {p.binder!r} — port dropped")
             continue
+
+    # -- sequence links, LAST: a browser references three finished ports ----
+    by_port = {p.name: p for p in ports}
+    for w in spec.widgets:
+        d = dict(getattr(w, "drives", None) or {})
+        if not d:
+            continue
+        folder, target = str(d.get("folder") or ""), str(d.get("target") or "")
+        index = w.port.name if w.port else ""
+        if not (folder in by_port and target in by_port and index):
+            L.append(f"        # {w.name}: sequence link skipped — "
+                     f"folder={folder!r} target={target!r} index={index!r}")
+            continue
+        L.append(f"        # {w.name} steps through {folder} -> {target}")
+        L.append(f"        self.browse_{index} = _FrameBrowser(")
+        L.append(f"            self.{folder}, self.{index}, self.{target})")
     return "\n".join(L).rstrip() + "\n"
 
 
@@ -1473,6 +1618,11 @@ def handler_stub(name: str, script: Optional[Dict[str, Any]] = None) -> str:
 
     inputs = [str(p) for p in (script.get("inputs") or []) if str(p).strip()]
     output = str(script.get("output") or "").strip()
+    # `outputs` maps PORT NAME -> RESULT KEY, so one call can fill several
+    # widgets. A count on its own tells a user ten frames are bad and leaves
+    # them to find which; scanning twice to fill two widgets would double the
+    # work for nothing.
+    outputs = dict(script.get("outputs") or {})
     args = ", ".join(f"self.ports.{p}.get()" for p in inputs)
     call = f"{func}({args})"
 
@@ -1487,7 +1637,10 @@ def handler_stub(name: str, script: Optional[Dict[str, Any]] = None) -> str:
         "        try:",
         f"            result = {call}",
     ]
-    if output:
+    if outputs:
+        for port, key in outputs.items():
+            lines.append(f"            self.ports.{port}.set(result[{_py(str(key))}])")
+    elif output:
         lines.append(f"            self.ports.{output}.set(result)")
     else:
         lines.append("            print(result)   # no output port declared")

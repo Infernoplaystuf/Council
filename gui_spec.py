@@ -142,6 +142,8 @@ class WidgetSpec:
     font: str = ""
     # A declared link to a Python function. See Shape.script.
     script: Dict[str, Any] = field(default_factory=dict)
+    # A declared sequence link. See Shape.drives.
+    drives: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -289,6 +291,7 @@ def build(shapes: Sequence[Shape], layout_tree: Any,
             fg=str(getattr(s, "fg", "") or ""),
             font=str(getattr(s, "font", "") or ""),
             script=dict(getattr(s, "script", None) or {}),
+            drives=dict(getattr(s, "drives", None) or {}),
         )
         if kind in COMMAND_KINDS:
             w.handler = f"on_{w.name}"
