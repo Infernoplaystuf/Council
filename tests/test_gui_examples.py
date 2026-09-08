@@ -154,3 +154,46 @@ def test_module_is_pure():
     banned = {m for m in mods
               if m in {"tkinter", "council_engine"} or m.startswith("vault_")}
     assert not banned, f"gui_examples must stay pure; imports {banned}"
+
+
+# ============================================================
+# run_example_gui — the one-command path from wireframe to app
+# ============================================================
+
+def test_an_example_builds_into_a_runnable_project(tmp_path):
+    """`vault/` is gitignored, so a fresh clone gets the WIREFRAMES and none
+    of the generated code. Without this, "run the Barbie GUI" meant a
+    five-step trip through the designer."""
+    import run_example_gui as rex
+    pdir = rex.build("barbie_capture", project="t_barbie", vault_dir=tmp_path)
+
+    for rel in ("main.py", "app.py", "handlers.py", "ui/main_ui.py",
+                "ui/ports.py", "ui/widgets.py", "project.gspec",
+                "manifest.json"):
+        assert (pdir / rel).is_file(), f"missing {rel}"
+
+    import ast
+    ast.parse((pdir / "main.py").read_text(encoding="utf-8"))
+
+    # It must also be a project the DESIGNER can reopen and regenerate, not a
+    # one-way export — the wireframe goes in alongside the generated code.
+    import gui_projects as gpj
+    proj = gpj.open_project("t_barbie", vault_dir=tmp_path)
+    assert proj.shapes
+
+
+def test_building_over_an_existing_project_refuses_without_force(tmp_path):
+    """That directory may hold app.py and handlers.py the user has edited —
+    the two files regeneration never rewrites, and the worst to lose."""
+    import run_example_gui as rex
+    rex.build("barbie_capture", project="t_dup", vault_dir=tmp_path)
+    with pytest.raises(SystemExit) as exc:
+        rex.build("barbie_capture", project="t_dup", vault_dir=tmp_path)
+    assert "--force" in str(exc.value)
+
+
+def test_an_unknown_example_lists_the_real_ones(tmp_path):
+    import run_example_gui as rex
+    with pytest.raises(SystemExit) as exc:
+        rex.build("not_a_real_example", vault_dir=tmp_path)
+    assert "barbie_capture" in str(exc.value)

@@ -1819,7 +1819,27 @@ class HandlerMixin:
 {body}'''
 
 
-def emit_launch_py(spec: Spec, project_dir: Path) -> str:
+# A file that exists at the app root and nowhere else, used by a generated
+# main.py to recognise the app if it has been moved since generation.
+_ROOT_MARKER = "council_gui_engine.py"
+
+LAUNCH_SHIM = '''"""Moved to main.py. Kept so existing shortcuts keep working."""
+from main import main
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def emit_main_py(spec: Spec, project_dir: Path) -> str:
+    """The entry point: `python main.py`.
+
+    REGENERATED every time, on purpose. The sys.path block below depends on
+    the project's mode and on LINKED_ALLOWLIST, so freezing it into a
+    hand-edited file would leave it describing an allowlist that has since
+    changed. Behaviour goes in app.py, which is written once and never
+    rewritten; this file only bootstraps.
+    """
     linked = spec.mode == "linked"
     note = (
         "# linked mode: the app's own directory is put on sys.path so the\n"
@@ -1830,11 +1850,31 @@ def emit_launch_py(spec: Spec, project_dir: Path) -> str:
         if linked else
         "# standalone mode: stdlib plus pandas/numpy/matplotlib/Pillow only.\n"
         "# Portable — zip this directory and it runs anywhere.\n")
+    # THE APP ROOT IS BAKED IN, not walked to.
+    #
+    # This used to be `Path(__file__).parent.parent.parent`, which assumed the
+    # vault lived INSIDE the repo. The default vault is ~/.council/vault, so
+    # three levels up from the project landed on ~/.council and EVERY
+    # allowlisted import failed at runtime — measured:
+    #     ModuleNotFoundError: No module named 'frame_timing'
+    # It looked fine from a shell sitting in the repo, because '' on sys.path
+    # covered for it; it failed when launched with cwd set to the project,
+    # which is how gui_runner actually starts it.
+    app_root = Path(__file__).resolve().parent
     path_block = (
-        "_APP_ROOT = Path(__file__).resolve().parent.parent.parent\n"
-        "if str(_APP_ROOT) not in sys.path:\n"
-        "    sys.path.insert(0, str(_APP_ROOT))\n" if linked else "")
-    return f'''"""Launcher for {spec.project}. Generated."""
+        f"_APP_ROOT = Path({str(app_root)!r})\n"
+        f"if not (_APP_ROOT / {_ROOT_MARKER!r}).is_file():\n"
+        f"    # the app was moved or copied; find it from here instead\n"
+        f"    for _p in Path(__file__).resolve().parents:\n"
+        f"        if (_p / {_ROOT_MARKER!r}).is_file():\n"
+        f"            _APP_ROOT = _p\n"
+        f"            break\n"
+        f"if str(_APP_ROOT) not in sys.path:\n"
+        f"    sys.path.insert(0, str(_APP_ROOT))\n" if linked else "")
+    return f'''"""Entry point for {spec.project}. Generated — run `python main.py`.
+
+Behaviour belongs in app.py, which is created once and never rewritten.
+"""
 from __future__ import annotations
 
 import sys
@@ -1909,7 +1949,15 @@ def emit(spec: Spec, project_path: Any, *,
         _write(handlers, emit_handlers_py(spec), res)
         res.handlers_added.extend(spec.handlers)
 
-    _write(root / "launch.py", emit_launch_py(spec, root), res)
+    _write(root / "main.py", emit_main_py(spec, root), res)
+
+    # MIGRATION. Projects generated before the rename ran from launch.py, and
+    # a shortcut or a note may still point at it. Replace it with a shim
+    # rather than deleting it — but only where it already exists, so a fresh
+    # project does not start life with a vestigial file.
+    legacy = root / "launch.py"
+    if legacy.exists():
+        _write(legacy, LAUNCH_SHIM, res)
 
     if res.orphaned_regions:
         backups = root / ".backups"

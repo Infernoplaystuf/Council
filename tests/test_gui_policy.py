@@ -185,7 +185,7 @@ def test_the_emitted_project_passes_its_own_policy(tmp_path):
     spec = gsp.build(shapes, gl.infer(shapes, 1000, 800), project="p")
     ge.emit(spec, tmp_path)
     files = sorted((tmp_path / "ui").glob("*.py")) + [
-        tmp_path / "app.py", tmp_path / "handlers.py", tmp_path / "launch.py"]
+        tmp_path / "app.py", tmp_path / "handlers.py", tmp_path / "main.py"]
     good, errs = pol.validate_project(files, "linked")
     assert good, errs
 
@@ -194,10 +194,10 @@ def test_the_emitted_project_passes_its_own_policy(tmp_path):
 # Preview runner
 # ============================================================
 
-def _project(tmp_path, body: str) -> Path:
+def _project(tmp_path, body: str, entry: str = "main.py") -> Path:
     p = tmp_path / "proj"
     p.mkdir()
-    (p / "launch.py").write_text(body, encoding="utf-8")
+    (p / entry).write_text(body, encoding="utf-8")
     return p
 
 
@@ -229,8 +229,30 @@ def test_a_crash_points_at_the_offending_line(tmp_path):
     assert done and done[0] != 0
     text = "\n".join(t for _lv, t in lines)
     assert "exited with code" in text
-    assert "launch.py, line 1" in text, (
+    assert "main.py, line 1" in text, (
         f"the failing line must be named, not left in a stack: {text}")
+
+
+def test_a_project_generated_before_the_rename_still_runs(tmp_path):
+    """Projects made before main.py existed have only launch.py, and are not
+    regenerated until the user opens them. Run them anyway."""
+    p = _project(tmp_path, "print('from the old launcher')\n", entry="launch.py")
+    lines, done = [], []
+    run.start(p, on_line=lambda t, lv: lines.append((lv, t)), on_exit=done.append)
+    for _ in range(100):
+        if done:
+            break
+        time.sleep(0.05)
+    assert done == [0]
+    assert any("from the old launcher" in t for _lv, t in lines)
+
+
+def test_a_project_with_neither_entry_point_says_so(tmp_path):
+    p = tmp_path / "empty"
+    p.mkdir()
+    with pytest.raises(FileNotFoundError) as exc:
+        run.start(p)
+    assert "main.py" in str(exc.value)
 
 
 def test_explain_failure_names_the_last_generated_frame(tmp_path):

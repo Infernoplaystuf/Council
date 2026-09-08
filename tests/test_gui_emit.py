@@ -77,7 +77,7 @@ def test_emitted_ui_parses_and_assigns_each_widget_exactly_once(tmp_path):
     ast.parse((tmp_path / "ui" / "widgets.py").read_text(encoding="utf-8"))
     ast.parse((tmp_path / "app.py").read_text(encoding="utf-8"))
     ast.parse((tmp_path / "handlers.py").read_text(encoding="utf-8"))
-    ast.parse((tmp_path / "launch.py").read_text(encoding="utf-8"))
+    ast.parse((tmp_path / "main.py").read_text(encoding="utf-8"))
 
     assigned = []
     for node in ast.walk(tree):
@@ -286,20 +286,72 @@ def test_new_handlers_are_appended_not_rewritten(tmp_path):
 # Modes
 # ============================================================
 
-def test_linked_and_standalone_launchers_differ(tmp_path):
+def test_linked_and_standalone_entry_points_differ(tmp_path):
     spec = peregrine_spec()
     spec.mode = "linked"
     ge.emit(spec, tmp_path / "a")
-    linked = (tmp_path / "a" / "launch.py").read_text(encoding="utf-8")
+    linked = (tmp_path / "a" / "main.py").read_text(encoding="utf-8")
     assert "_APP_ROOT" in linked and "council_engine" in linked, (
         "linked mode must set sys.path and say why council_engine is excluded")
 
     spec.mode = "standalone"
     ge.emit(spec, tmp_path / "b")
-    alone = (tmp_path / "b" / "launch.py").read_text(encoding="utf-8")
+    alone = (tmp_path / "b" / "main.py").read_text(encoding="utf-8")
     assert "_APP_ROOT" not in alone
     ast.parse(linked)
     ast.parse(alone)
+
+
+def test_the_linked_app_root_is_not_a_fixed_number_of_levels_up(tmp_path):
+    """MEASURED FAILURE: ModuleNotFoundError: No module named 'frame_timing'.
+
+    The path was `parent.parent.parent`, which assumed the vault lived inside
+    the repo. The DEFAULT vault is ~/.council/vault, so three levels up from a
+    project landed on ~/.council and every allowlisted import failed. It read
+    fine from a shell sitting in the repo — '' on sys.path covered for it —
+    and only failed when launched with cwd set to the project, which is how
+    gui_runner starts it."""
+    spec = peregrine_spec()
+    spec.mode = "linked"
+    ge.emit(spec, tmp_path / "deep" / "nested" / "elsewhere")
+    src = (tmp_path / "deep" / "nested" / "elsewhere"
+           / "main.py").read_text(encoding="utf-8")
+    assert "parent.parent.parent" not in src
+    repo = Path(ge.__file__).resolve().parent
+
+    # Read the baked-in literal out of the AST rather than matching text: the
+    # path is repr()-escaped in the source, so a substring check would compare
+    # single backslashes against doubled ones and pass or fail for the wrong
+    # reason.
+    baked = [n.args[0].value
+             for n in ast.walk(ast.parse(src))
+             if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name) and n.func.id == "Path"
+             and n.args and isinstance(n.args[0], ast.Constant)
+             and isinstance(n.args[0].value, str)]
+    assert baked, "no absolute app root was baked in"
+    assert Path(baked[0]) == repo, f"{baked[0]!r} is not the app root"
+
+    # and it must still find the app if the app itself was moved or copied
+    assert "for _p in Path(__file__).resolve().parents" in src
+
+
+def test_a_fresh_project_gets_no_vestigial_launch_py(tmp_path):
+    ge.emit(peregrine_spec(), tmp_path)
+    assert (tmp_path / "main.py").is_file()
+    assert not (tmp_path / "launch.py").exists()
+
+
+def test_an_existing_launch_py_becomes_a_shim_rather_than_being_deleted(tmp_path):
+    """Projects generated before the rename may be pointed at by a shortcut
+    or a note. Replace, do not delete."""
+    spec = peregrine_spec()
+    ge.emit(spec, tmp_path)
+    (tmp_path / "launch.py").write_text("# the old launcher\n", encoding="utf-8")
+    ge.emit(spec, tmp_path)
+    shim = (tmp_path / "launch.py").read_text(encoding="utf-8")
+    assert "from main import main" in shim
+    ast.parse(shim)
 
 
 # ============================================================

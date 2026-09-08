@@ -11550,9 +11550,15 @@ class CouncilConsole(tk.Tk):
                                + ", ".join(res.handlers_added))
                 out.extend(res.warnings)
 
+                # Every hand-editable and generated .py at the top level. The
+                # list is built from what EXISTS so the launch.py shim left
+                # behind by the main.py rename is gated too — an ungated file
+                # in the project is a hole in the gate.
                 pol_ok, pol_errs = _gpol.validate_project(
                     sorted((pdir / "ui").glob("*.py"))
-                    + [pdir / "app.py", pdir / "launch.py"], man.mode)
+                    + [p for p in (pdir / "app.py", pdir / "handlers.py",
+                                   pdir / "main.py", pdir / "launch.py")
+                       if p.is_file()], man.mode)
                 out.append("policy: OK" if pol_ok
                            else "policy REFUSED (the app will not run it):")
                 out.extend("  " + e for e in pol_errs)

@@ -168,16 +168,25 @@ def get(project) -> Optional[Preview]:
 
 def start(project, *, on_line: Optional[Callable[[str, str], None]] = None,
           on_exit: Optional[Callable[[int], None]] = None,
-          entry: str = "launch.py") -> Preview:
+          entry: str = "") -> Preview:
     """Launch the project's preview. A second Run stops the first (spec 9).
 
     NO TIMEOUT. A GUI runs until the user closes it; a timeout here would kill
     a working preview mid-use, which is precisely the LocalRunner failure this
-    module exists to avoid."""
+    module exists to avoid.
+
+    ``entry`` defaults to main.py, falling back to launch.py for a project
+    generated before the rename that has not been regenerated since."""
     proj = Path(project).resolve()
-    launch = proj / entry
+    if entry:
+        launch = proj / entry
+    else:
+        launch = next((proj / n for n in ("main.py", "launch.py")
+                       if (proj / n).is_file()), proj / "main.py")
+        entry = launch.name
     if not launch.is_file():
-        raise FileNotFoundError(f"no {entry} in {proj} — generate the project first")
+        raise FileNotFoundError(
+            f"no main.py in {proj} — generate the project first")
 
     stop(proj)      # one preview per project
 
