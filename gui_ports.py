@@ -316,6 +316,20 @@ def build_ports(shapes: Sequence[Any],
         if port_overrides.get("off"):
             continue
 
+        # THE CAPTION RULE. A Label's port binds `textvariable`, and in Tk a
+        # textvariable OVERRIDES text= — so attaching an empty StringVar to a
+        # label blanks its caption. A label that already says something is a
+        # caption, not a readout, and gets no port unless the user asks for
+        # one explicitly.
+        #
+        # Found by building a GUI whose every label came out invisible: the
+        # generated source said text="Exposure (ms)" and the running widget
+        # reported text=''. Nothing warned, because the code was correct in
+        # isolation and only wrong once the var was attached.
+        if (kind == "label" and not port_overrides
+                and str(getattr(s, "label", "") or props.get("text") or "")):
+            continue
+
         # ---- radio: one port per group; extend choices ----
         if kind == "radiobutton":
             group = str(props.get("group") or "")

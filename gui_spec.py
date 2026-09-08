@@ -138,6 +138,8 @@ class WidgetSpec:
     # is what makes that honouring possible on the default Windows theme.
     bg: str = ""
     fg: str = ""
+    # Tk font spec, e.g. "Magneto 18 bold". Shape's own, else Window's.
+    font: str = ""
 
 
 @dataclass
@@ -152,6 +154,8 @@ class Spec:
     # both self and the toplevel with the colour.
     root_bg: str = ""
     root_fg: str = ""
+    # Default font for every text-bearing widget that names none.
+    root_font: str = ""
     widgets: List[WidgetSpec] = field(default_factory=list)
     root_children: List[str] = field(default_factory=list)
     root_row_weights: List[int] = field(default_factory=list)
@@ -222,7 +226,8 @@ def build(shapes: Sequence[Shape], layout_tree: Any,
           project: str = "untitled", mode: str = "linked",
           title: str = "Untitled", min_w: int = 900,
           min_h: int = 600,
-          root_bg: str = "", root_fg: str = "") -> Spec:
+          root_bg: str = "", root_fg: str = "",
+          root_font: str = "") -> Spec:
     """Assemble the IR.
 
     ``classifications`` maps shape id -> {"kind", "props"} for shapes the model
@@ -236,7 +241,7 @@ def build(shapes: Sequence[Shape], layout_tree: Any,
     of retyping a label (§3 in the build spec)."""
     spec = Spec(project=project, mode=mode, title=title,
                 min_w=min_w, min_h=min_h,
-                root_bg=root_bg, root_fg=root_fg)
+                root_bg=root_bg, root_fg=root_fg, root_font=root_font)
     spec.warnings.extend(getattr(layout_tree, "warnings", []) or [])
     nodes = getattr(layout_tree, "nodes", {}) or {}
     reg = dict(registry or {})
@@ -280,6 +285,7 @@ def build(shapes: Sequence[Shape], layout_tree: Any,
             is_container=is_container(kind),
             bg=str(getattr(s, "bg", "") or ""),
             fg=str(getattr(s, "fg", "") or ""),
+            font=str(getattr(s, "font", "") or ""),
         )
         if kind in COMMAND_KINDS:
             w.handler = f"on_{w.name}"
@@ -324,6 +330,49 @@ def build(shapes: Sequence[Shape], layout_tree: Any,
         shims.append(sh)
     parents = {c: getattr(n, "parent_id", None) for c in names
                for n in [nodes.get(c)] if n is not None}
+
+    # ---- resolve colour INHERITANCE ---------------------------------
+    #
+    # A widget with no colour of its own takes its nearest coloured ancestor's
+    # background. That is not a nicety: Tk has no transparency, so "a label
+    # with a transparent background over a pink panel" IS "a label whose
+    # background is that pink". Inheritance produces it with no extra concept,
+    # and it also prevents the ugly default: a coloured panel scattered with
+    # grey OS-default boxes.
+    #
+    # resolve_scene refuses to inherit into a kind that cannot honour colour
+    # (Notebook, Treeview, Combobox, Progressbar), so the emitter is never
+    # handed a colour it would have to drop.
+    import gui_colors as _gcol
+    _parents_nonnull = {k: v for k, v in parents.items() if v}
+    effective = _gcol.resolve_scene(shapes, _parents_nonnull)
+    # The window's own background is the root of the inheritance chain: a
+    # top-level widget with no colour should sit on the window's colour.
+    for w in spec.widgets:
+        eff_bg, eff_fg = effective.get(w.shape_id, ("", ""))
+        if not eff_bg and root_bg and _gcol.can_colour(w.kind, "bg"):
+            try:
+                eff_bg = _gcol.normalise(root_bg)
+            except ValueError:
+                eff_bg = ""
+        if not eff_fg and _gcol.can_colour(w.kind, "fg"):
+            # An EXPLICIT window foreground beats the derived one. auto_fg
+            # picks maximum contrast, which against Barbie pink is near-black
+            # — a perfectly reasonable default and the exact opposite of the
+            # white lettering a user who set Window.fg asked for. Derived
+            # colour is a fallback for when nobody chose, not an override.
+            if root_fg:
+                try:
+                    eff_fg = _gcol.normalise(root_fg)
+                except ValueError:
+                    eff_fg = _gcol.auto_fg(eff_bg) if eff_bg else ""
+            elif eff_bg:
+                eff_fg = _gcol.auto_fg(eff_bg)
+        w.bg, w.fg = eff_bg, eff_fg
+        # Font: the shape's own, else the window's default.
+        if not w.font and root_font:
+            w.font = root_font
+
     ports = _gpo.build_ports(shims, parents=parents, registry=port_registry)
     by_sid: Dict[str, PortSpec] = {}
     for p in ports:

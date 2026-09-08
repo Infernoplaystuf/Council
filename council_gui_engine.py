@@ -11499,7 +11499,8 @@ class CouncilConsole(tk.Tk):
                     mode=man.mode, title=proj.window.title,
                     min_w=proj.window.min_w, min_h=proj.window.min_h,
                     root_bg=getattr(proj.window, "bg", "") or "",
-                    root_fg=getattr(proj.window, "fg", "") or "")
+                    root_fg=getattr(proj.window, "fg", "") or "",
+                    root_font=getattr(proj.window, "font", "") or "")
                 for w in tree.warnings:
                     out.append(f"warning: {w}")
 

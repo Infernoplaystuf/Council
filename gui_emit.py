@@ -178,10 +178,14 @@ _CLASSIC_CLASS: Dict[str, str] = {
 def _colour_kwargs(w: WidgetSpec) -> str:
     """`, background="#...", foreground="#..."` when the widget declares any.
 
-    Reads from WidgetSpec.bg / .fg (populated by gui_spec.build from
-    Shape.bg / Shape.fg). Skips kinds that cannot honour colour anyway — that
-    is what makes the inspector's "cannot be coloured" story honest rather
-    than a pretence.
+    Reads from WidgetSpec.bg / .fg, which gui_spec.build fills with the
+    EFFECTIVE colours from gui_colors.resolve_scene — i.e. after inheritance.
+    That is what makes a "transparent" label work: Tk has no transparency, but
+    a label whose background equals its parent's IS visually transparent, and
+    inheritance produces exactly that with no extra concept.
+
+    Skips kinds that cannot honour colour anyway — what makes the inspector's
+    "cannot be coloured" story honest rather than a pretence.
     """
     cap = _gcol.caps(w.kind)
     if not cap:
@@ -200,6 +204,18 @@ def _colour_kwargs(w: WidgetSpec) -> str:
         except ValueError:
             pass
     return (", " + ", ".join(bits)) if bits else ""
+
+
+def _font_kwarg(w: WidgetSpec) -> str:
+    """`, font="Magneto 18 bold"` for kinds that render text.
+
+    The stored string is Tk's own font format, so it passes through verbatim.
+    Both ttk and classic tk widgets accept `font=`, so unlike colour this needs
+    no widget swap — a ttk.Label honours a font perfectly well."""
+    font = str(getattr(w, "font", "") or "").strip()
+    if not font or not _gcol.can_font(w.kind):
+        return ""
+    return f", font={_py(font)}"
 
 
 def _uses_classic(w: WidgetSpec) -> bool:
@@ -222,6 +238,9 @@ def construct(w: WidgetSpec, parent: str) -> str:
     cmd = f", command=self.{w.handler}" if w.handler else ""
     ck = _colour_kwargs(w)               # empty when no colour or kind cannot
     classic = _uses_classic(w)
+    # Font rides along on the same kinds that render text. Appended to ck so
+    # every construct branch picks it up without a second interpolation.
+    ck = ck + _font_kwarg(w)
 
     if k in ("frame", "freeform"):
         cls = "tk.Frame" if classic else "ttk.Frame"
@@ -1332,6 +1351,14 @@ def emit_ports(spec: Spec, aliases: Optional[Dict[str, str]] = None) -> str:
                 f"            {_py(p.name)}, {wname}, writer={_py(p.writer)}, "
                 f"direction={_py(p.direction)}, type={_py(p.type)})")
         elif p.binder == "var":
+            # SEED A CAPTION INTO ITS VAR. Attaching a textvariable to a
+            # widget that carries text= makes the variable authoritative, so
+            # an unseeded var blanks the caption. gui_ports' caption rule
+            # keeps most labels port-free; this covers the ones a user
+            # deliberately bound, so binding a label does not erase it.
+            if (p.default is None and p.tk_option == "textvariable"
+                    and _text_of(primary)):
+                default = _py(_text_of(primary))
             # Composites that own their own var: adopt it, don't re-attach.
             adopt = p.kind in ("file_picker", "scrubber")
             if adopt:

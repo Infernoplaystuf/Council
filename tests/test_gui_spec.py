@@ -228,15 +228,42 @@ def test_ports_derive_from_labels_without_typing():
 
 
 def test_a_caption_label_gets_no_port_by_default_but_can_be_opted_in():
-    """A Label whose only role is to caption an Entry does not need a port,
-    but a Label used as a status display DOES — the port dict is the opt-in."""
-    plain = mk("label", 0, 0, 100, 20, sid="L", label="Files:")
-    plain.port = {"off": True}
-    active = mk("label", 0, 40, 200, 20, sid="M", label="Status")
-    spec = built([plain, active])
+    """A Label that already SAYS something is a caption, not a readout.
+
+    This test previously asserted the opposite and encoded a real bug. A
+    Label's port binds `textvariable`, and in Tk a textvariable OVERRIDES
+    text= — so attaching a fresh empty StringVar to a captioned label blanks
+    it. Every label in a generated app came out invisible: the source said
+    text="Exposure (ms)" and the running widget reported text=''.
+
+    So the rule is: text and no explicit port -> NO port (it is a caption);
+    no text -> a port (it is a readout waiting to be filled); explicit port
+    -> a port, and gui_emit seeds the var with the caption so binding one
+    does not erase it.
+    """
+    caption = mk("label", 0, 0, 100, 20, sid="L", label="Files:")
+    readout = mk("label", 0, 40, 200, 20, sid="M", label="")
+    opted_in = mk("label", 0, 80, 200, 20, sid="N", label="Status")
+    opted_in.port = {"name": "status_line"}
+    spec = built([caption, readout, opted_in])
     got = {w.shape_id: (w.port.name if w.port else None) for w in spec.widgets}
-    assert got["L"] is None
-    assert got["M"] == "status"
+
+    assert got["L"] is None, "a captioned label must not be given a port"
+    assert got["M"] is not None, "an empty label is a readout and needs one"
+    assert got["N"] == "status_line", "an explicit port is always honoured"
+
+
+def test_an_opted_in_label_keeps_its_caption_in_the_emitted_var():
+    """The other half of the caption rule: if a user DOES bind a label that
+    has text, the generated var must start holding that text, or binding it
+    silently erases it."""
+    import gui_emit as ge
+    lab = mk("label", 0, 0, 200, 20, sid="L", label="Status")
+    lab.port = {"name": "status_line"}
+    spec = built([lab])
+    src = ge.emit_ports(spec)
+    assert 'default="Status"' in src, (
+        "the label's caption must seed its textvariable")
 
 
 def test_a_radio_group_becomes_ONE_port_shared_by_its_members():

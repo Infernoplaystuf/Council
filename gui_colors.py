@@ -278,6 +278,21 @@ COLOUR_NOTE: Dict[str, str] = {
 }
 
 
+# Kinds that render TEXT and therefore honour a `font=` option. A Frame has no
+# text; a Progressbar's is drawn by the theme; a Notebook's tab labels are a
+# style property, not a widget option. Offering a font picker on any of those
+# would be a control that does nothing — the same rule COLOUR_CAPS follows.
+FONT_KINDS: FrozenSet[str] = frozenset({
+    "label", "button", "entry", "text", "checkbutton", "radiobutton",
+    "listbox", "spinbox", "labelframe", "combobox", "menubar",
+    "log_pane", "status_bar",
+})
+
+
+def can_font(kind: str) -> bool:
+    return kind in FONT_KINDS
+
+
 def caps(kind: str) -> Tuple[str, ...]:
     """Which of ("bg", "fg") ``kind`` can honour. Unknown kinds get none."""
     return COLOUR_CAPS.get(kind, ())

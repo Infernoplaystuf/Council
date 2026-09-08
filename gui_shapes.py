@@ -396,6 +396,11 @@ class Shape:
     # colour structurally impossible. "" means "inherit from ancestor / OS".
     bg: str = ""
     fg: str = ""
+    # Tk's own font spec: "<family> <size> <styles>", e.g. "Magneto 18 bold".
+    # Stored as one string rather than three fields because that IS the format
+    # Tk's font= option takes, so it round-trips into generated code verbatim
+    # with no reassembly step to get wrong. "" = the widget's default font.
+    font: str = ""
     # The typed binding, decided by gui_ports. Keys used today:
     #   name    str          — the port name; absent = derived from the label
     #   type    str          — one of gui_ports.PORT_CAPS[kind].types
@@ -481,6 +486,8 @@ class Window:
     # magenta while tk returns ~97%). "" means "OS default".
     bg: str = ""
     fg: str = ""
+    # Applied to every text-bearing widget that does not name its own.
+    font: str = ""
 
 
 @dataclass
@@ -527,9 +534,10 @@ def required_version(project: "Project") -> int:
     if any(getattr(s, "port", None) for s in project.shapes):
         return 2
     if any(getattr(s, "bg", "") or getattr(s, "fg", "")
+           or getattr(s, "font", "")
            for s in project.shapes):
         return 2
-    if project.window.bg or project.window.fg:
+    if project.window.bg or project.window.fg or project.window.font:
         return 2
     return 1
 
@@ -607,6 +615,7 @@ def load_gspec(path: Any) -> Project:
                 props=dict(sd.get("props") or {}),
                 bg=str(sd.get("bg") or ""),           # v1 files -> ""
                 fg=str(sd.get("fg") or ""),
+                font=str(sd.get("font") or ""),
                 port=dict(sd.get("port") or {}),      # v1 files -> {}
             ))
         except (TypeError, ValueError) as exc:
@@ -629,7 +638,8 @@ def load_gspec(path: Any) -> Project:
                       min_w=int(window_raw.get("min_w", 900)),
                       min_h=int(window_raw.get("min_h", 600)),
                       bg=str(window_raw.get("bg") or ""),
-                      fg=str(window_raw.get("fg") or "")),
+                      fg=str(window_raw.get("fg") or ""),
+                      font=str(window_raw.get("font") or "")),
         shapes=shapes,
         clarifications=clars,
         gspec_version=ver,
