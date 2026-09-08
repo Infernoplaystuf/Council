@@ -11514,7 +11514,13 @@ class CouncilConsole(tk.Tk):
                 new_ports = spec.port_registry() if hasattr(spec, "port_registry") else {}
                 plan = _gp.plan_ports(
                     pdir, getattr(man, "port_names", {}) or {}, new_ports)
-                valid_ports = set(new_ports.values()) | set(plan.aliases)
+                # A sequence link also puts `browse_<index>` on Ports, and
+                # `path()`/`count()` on it are the natural way to name the
+                # frame you are looking at. That attribute is not a PORT, so
+                # find_orphans called it dead and BLOCKED Generate forever on
+                # any app.py that used it.
+                valid_ports = (set(new_ports.values()) | set(plan.aliases)
+                               | spec.sequence_attr_names())
                 orphans = _gp.find_orphans(
                     pdir, spec.widget_names, new_port_names=valid_ports)
                 if plan.removed or plan.collisions:

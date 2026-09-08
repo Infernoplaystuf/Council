@@ -29,7 +29,7 @@ from __future__ import annotations
 import keyword
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import gui_ports as _gpo
 from gui_ports import PortSpec
@@ -187,6 +187,18 @@ class Spec:
     def name_registry(self) -> Dict[str, str]:
         """shape id -> widget name, for the manifest."""
         return {w.shape_id: w.name for w in self.widgets}
+
+    def sequence_attr_names(self) -> Set[str]:
+        """The non-port attributes a sequence link adds to Ports.
+
+        emit_ports writes `self.browse_<index>` for every `drives`
+        declaration, and hand-written code reaches for `.path()` on it to name
+        the frame on screen. It is an attribute, not a port, so the orphan
+        check has to be told about it explicitly or it reads every use as a
+        reference to something the wireframe deleted. Kept HERE, beside the
+        spec that decides the name, so the two cannot drift."""
+        return {f"browse_{w.port.name}" for w in self.widgets
+                if w.drives and w.port}
 
     @property
     def handlers(self) -> List[str]:
@@ -405,6 +417,9 @@ def validate(spec: Spec) -> Tuple[bool, List[str]]:
     errs: List[str] = []
     seen: Dict[str, str] = {}
     seen_ports: Dict[str, str] = {}   # port name -> shape id
+    driven_sinks: Dict[str, str] = {}  # target port name -> driving widget
+    # Every port in the spec, for resolving cross-references by name.
+    port_of: Dict[str, Any] = {w.port.name: w for w in spec.widgets if w.port}
 
     for w in spec.widgets:
         where = f"{w.label or w.kind} ({w.name})"
@@ -448,6 +463,56 @@ def validate(spec: Spec) -> Tuple[bool, List[str]]:
             errs.append(f"{where}: parent {w.parent!r} is not in the spec")
         if not w.is_container and w.children:
             errs.append(f"{where}: {w.kind} cannot contain children")
+
+        # -- sequence link (drives) --------------------------------------
+        #
+        # A BROKEN LINK USED TO BE A COMMENT. emit_ports wrote
+        # "# scr_frame: sequence link skipped" into ui/ports.py and generation
+        # succeeded, so deleting the image canvas — or renaming its port —
+        # produced an app that built, ran, and did nothing when you moved the
+        # slider. Nothing in the UI said why. These are blocking errors so the
+        # break surfaces at Generate, next to the widget that caused it.
+        d = dict(getattr(w, "drives", None) or {})
+        if d:
+            if w.kind not in _gpo.SEQUENCE_DRIVERS:
+                errs.append(f"{where}: {w.kind} cannot drive a sequence "
+                            f"(only {', '.join(sorted(_gpo.SEQUENCE_DRIVERS))} can)")
+            if w.port is None:
+                errs.append(f"{where}: drives a sequence but has no port to "
+                            f"carry the frame index")
+            src_name, snk_name = str(d.get("folder") or ""), str(d.get("target") or "")
+            src, snk = port_of.get(src_name), port_of.get(snk_name)
+            if src is None:
+                errs.append(f"{where}: drives.folder names no port "
+                            f"({src_name!r}) — the folder widget was renamed "
+                            f"or deleted")
+            elif src.kind not in _gpo.SEQUENCE_SOURCES:
+                errs.append(f"{where}: {src.kind} cannot be a frame source")
+            elif str((src.props or {}).get("mode", "")) != "folder":
+                errs.append(
+                    f"{where}: {src_name!r} is a file picker set to "
+                    f"mode={(src.props or {}).get('mode')!r} — set mode=folder "
+                    f"or it can never list frames")
+            if snk is None:
+                errs.append(f"{where}: drives.target names no port "
+                            f"({snk_name!r}) — the display widget was renamed "
+                            f"or deleted")
+            elif snk.kind not in _gpo.SEQUENCE_SINKS:
+                errs.append(f"{where}: {snk.kind} cannot display a frame")
+            st_name = str(d.get("status") or "")
+            if st_name and st_name not in port_of:
+                errs.append(f"{where}: drives.status names no port "
+                            f"({st_name!r})")
+            names = [n for n in (src_name, snk_name,
+                                 w.port.name if w.port else None) if n]
+            if len(set(names)) != len(names):
+                errs.append(f"{where}: a sequence link needs three DIFFERENT "
+                            f"ports; got {names}")
+            if snk_name:
+                prior = driven_sinks.setdefault(snk_name, w.name)
+                if prior != w.name:
+                    errs.append(f"{where}: {snk_name!r} is already driven by "
+                                f"{prior!r} — last writer would win invisibly")
 
         # -- port validation --------------------------------------------
         cap = _gpo.caps(w.kind)

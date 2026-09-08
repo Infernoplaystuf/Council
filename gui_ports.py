@@ -158,6 +158,18 @@ class PortCap:
 _NONE = PortCap()  # no port at all
 
 
+# WHO MAY PARTICIPATE IN A SEQUENCE LINK (Shape.drives).
+#
+# Deliberately three frozensets and NOT a fourth column on PortCap: a table
+# with one row in each has not earned being a table, and a dataclass field
+# defaulting to () would let a newly added kind inherit "cannot drive" in
+# silence — the unexamined default this module exists to avoid. Adding a kind
+# here is a decision somebody has to type.
+SEQUENCE_DRIVERS: FrozenSet[str] = frozenset({"scrubber"})
+SEQUENCE_SOURCES: FrozenSet[str] = frozenset({"file_picker"})
+SEQUENCE_SINKS: FrozenSet[str] = frozenset({"image_canvas"})
+
+
 PORT_CAPS: Dict[str, PortCap] = {
     # ---- containers / decoration — no port ----
     "frame": _NONE,
@@ -281,6 +293,65 @@ def _radio_group_key(parent_id: Optional[str], group: str) -> str:
     return f"group:{parent_id or '~'}/{group or 'default'}"
 
 
+def _bindable(order: Sequence[Any],
+              parents: Dict[str, str]) -> List[Tuple[Any, str, PortCap,
+                                                     Dict[str, Any],
+                                                     Dict[str, Any],
+                                                     str, str, bool]]:
+    """Every shape that participates in a port, in build order.
+
+    Yields ``(shape, kind, cap, props, overrides, key, group, opens_port)``.
+    ``opens_port`` is False only for a radio that EXTENDS a group another
+    radio already opened.
+
+    Both passes in build_ports walk this list, so the skip rules — an
+    unbindable kind, port.off, the caption rule — are stated ONCE. When the
+    reservation pass and the naming pass disagree about which shapes get
+    ports, a name gets reserved for a shape that never claims it and the next
+    shape is pushed to a `_2` suffix for no visible reason.
+    """
+    seen_groups: set = set()
+    out = []
+    for s in order:
+        kind = str(getattr(s, "kind", ""))
+        cap = caps(kind)
+        if not cap.types:
+            # Unbindable kind. An explicit port on one is caught by
+            # gui_spec.validate; here we simply skip.
+            continue
+
+        props = dict(getattr(s, "props", None) or {})
+        overrides = dict(getattr(s, "port", None) or {})
+        if overrides.get("off"):
+            continue
+
+        # THE CAPTION RULE. A Label's port binds `textvariable`, and in Tk a
+        # textvariable OVERRIDES text= — so attaching an empty StringVar to a
+        # label blanks its caption. A label that already says something is a
+        # caption, not a readout, and gets no port unless the user asks for
+        # one explicitly.
+        #
+        # Found by building a GUI whose every label came out invisible: the
+        # generated source said text="Exposure (ms)" and the running widget
+        # reported text=''. Nothing warned, because the code was correct in
+        # isolation and only wrong once the var was attached.
+        if (kind == "label" and not overrides
+                and str(getattr(s, "label", "") or props.get("text") or "")):
+            continue
+
+        if kind == "radiobutton":
+            group = str(props.get("group") or "")
+            key = _radio_group_key(parents.get(getattr(s, "id", "")), group)
+            opens = key not in seen_groups
+            seen_groups.add(key)
+            out.append((s, kind, cap, props, overrides, key, group, opens))
+            continue
+
+        out.append((s, kind, cap, props, overrides,
+                    str(getattr(s, "id", "")), "", True))
+    return out
+
+
 def build_ports(shapes: Sequence[Any],
                 *,
                 parents: Optional[Dict[str, str]] = None,
@@ -294,64 +365,66 @@ def build_ports(shapes: Sequence[Any],
     ``registry`` is the manifest's port_names (shape id / group key -> name);
     registered names WIN over derivation so retyping a label does not rename a
     port that hand-written code already references.
+
+    ASKED-FOR NAMES ARE RESERVED BEFORE ANY NAME IS DERIVED. Names used to be
+    assigned in one pass in (z, id) order, which let a shape that asked for
+    nothing consume a name another shape had explicitly declared. Measured:
+    two image_canvas shapes, the lower-z one bare and the higher-z one
+    declaring port name "image_canvas", produced
+
+        [('image_canvas', ('zzz',)), ('image_canvas_2', ('aaa',))]
+
+    — the shape that asked by name lost it to the shape that did not, purely
+    because it was drawn later. That silently re-points every reference made
+    BY NAME: a script link's `inputs`, a script link's `outputs`, and a
+    scrubber's `drives`. Nothing warned, because both names were valid and
+    both ports existed.
     """
     parents = dict(parents or {})
     reg = dict(registry or {})
     order = sorted(shapes, key=lambda s: (getattr(s, "z", 0),
                                           str(getattr(s, "id", ""))))
+    cands = _bindable(order, parents)
     taken: List[str] = []
     out: List[PortSpec] = []
     radio_ports: Dict[str, PortSpec] = {}
 
-    for s in order:
-        kind = str(getattr(s, "kind", ""))
-        cap = caps(kind)
-        if not cap.types:
-            # Uncolourable-style: an explicit port on a kind that has none is
-            # caught by gui_spec.validate; here we simply skip.
+    # ---- pass 1: reserve the names somebody asked for, in order ----
+    # Sequential validation, so two shapes both declaring "foo" still resolve
+    # first-come-first-served rather than colliding.
+    claimed: Dict[str, str] = {}
+    for _s, _k, _c, _p, overrides, key, _g, opens in cands:
+        if not opens:
             continue
+        wanted = overrides.get("name") or reg.get(key)
+        if wanted and validate_port_name(wanted, taken)[0]:
+            taken.append(wanted)
+            claimed[key] = wanted
 
-        props = dict(getattr(s, "props", None) or {})
-        port_overrides = dict(getattr(s, "port", None) or {})
-        if port_overrides.get("off"):
-            continue
-
-        # THE CAPTION RULE. A Label's port binds `textvariable`, and in Tk a
-        # textvariable OVERRIDES text= — so attaching an empty StringVar to a
-        # label blanks its caption. A label that already says something is a
-        # caption, not a readout, and gets no port unless the user asks for
-        # one explicitly.
-        #
-        # Found by building a GUI whose every label came out invisible: the
-        # generated source said text="Exposure (ms)" and the running widget
-        # reported text=''. Nothing warned, because the code was correct in
-        # isolation and only wrong once the var was attached.
-        if (kind == "label" and not port_overrides
-                and str(getattr(s, "label", "") or props.get("text") or "")):
-            continue
+    # ---- pass 2: build, deriving only the names nobody claimed ----
+    for s, kind, cap, props, port_overrides, key, group, opens in cands:
 
         # ---- radio: one port per group; extend choices ----
         if kind == "radiobutton":
-            group = str(props.get("group") or "")
-            key = _radio_group_key(parents.get(getattr(s, "id", "")), group)
-            value = str(props.get("value") or slug(_label_of(props, getattr(s, "label", ""))))
-            existing = radio_ports.get(key)
-            if existing is not None:
+            value = str(props.get("value")
+                        or slug(_label_of(props, getattr(s, "label", ""))))
+            if not opens:
                 # extend the group. choices preserves DUPLICATES on purpose:
                 # two radios with the same value= is a spec bug because
                 # var.get() cannot tell them apart, so gui_spec.validate has
                 # to see it. Emit iterates shape_ids, not choices, so the
                 # duplication does not double-configure the widget.
+                existing = radio_ports[key]
                 existing.choices = tuple(list(existing.choices) + [value])
                 existing.shape_ids = tuple(list(existing.shape_ids) + [
                     str(getattr(s, "id", ""))])
                 continue
-            reg_name = reg.get(key)
-            wanted = port_overrides.get("name") or reg_name
-            name = wanted if wanted and validate_port_name(wanted, taken)[0] \
-                else default_port_name(kind, _label_of(props, getattr(s, "label", "")),
-                                       group=group, taken=taken)
-            taken.append(name)
+            name = claimed.get(key)
+            if name is None:
+                name = default_port_name(
+                    kind, _label_of(props, getattr(s, "label", "")),
+                    group=group, taken=taken)
+                taken.append(name)
             spec = PortSpec(
                 name=name, kind=kind,
                 type=str(port_overrides.get("type") or cap.types[0]),
@@ -367,14 +440,12 @@ def build_ports(shapes: Sequence[Any],
             continue
 
         # ---- everything else ----
-        reg_key = str(getattr(s, "id", ""))
-        reg_name = reg.get(reg_key)
-        wanted = port_overrides.get("name") or reg_name
-        name = wanted if wanted and validate_port_name(wanted, taken)[0] \
-            else default_port_name(
+        name = claimed.get(key)
+        if name is None:
+            name = default_port_name(
                 kind, _label_of(props, getattr(s, "label", "")),
                 taken=taken)
-        taken.append(name)
+            taken.append(name)
         spec = PortSpec(
             name=name, kind=kind,
             type=str(port_overrides.get("type") or cap.types[0]),
@@ -383,7 +454,7 @@ def build_ports(shapes: Sequence[Any],
             tk_option=cap.tk_option, writer=cap.writer,
             default=port_overrides.get("default"),
             deep=cap.deep,
-            shape_ids=(reg_key,),
+            shape_ids=(key,),
         )
         out.append(spec)
 

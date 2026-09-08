@@ -604,6 +604,11 @@ class ImageCanvas(ttk.Frame):
 
     def zoom_to_fit(self) -> None:
         if self._base is None:
+            # CLEARING IS A RENDER. set_image(None) assigns _base then calls
+            # here; returning early left the PREVIOUS frame painted, so an
+            # empty folder showed the last folder's image under a message
+            # saying there was nothing to show. _render deletes and returns.
+            self._render()
             return
         cw = max(1, self.canvas.winfo_width())
         ch = max(1, self.canvas.winfo_height())
@@ -1263,6 +1268,47 @@ class _TabPort(_Port):
         self.widget.bind("<<NotebookTabChanged>>", _cb, add=True)
 
 
+_SEQ_SUFFIXES = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif",
+                 ".webp")
+
+
+def _natkey(path):
+    """Sort key: frame_9 before frame_10, layer_9/ before layer_10/.
+
+    A lexical sort puts 10 before 9, so a layer-wise scan comes out reordered
+    and NOTHING LOOKS WRONG — the frames are all there, in a plausible order,
+    just not the order they were captured in. Measured on the old code:
+
+        frame_1, frame_10, frame_100, frame_11, frame_2, frame_9
+
+    Applied per PATH SEGMENT so a recursive scan orders directories
+    numerically too; keying only the basename would order layer_10/ before
+    layer_9/ and reintroduce the same bug one level up.
+
+    The int() is guarded: the split is ASCII-only but str.isdigit() is not, so
+    a filename carrying e.g. a superscript would otherwise raise inside the
+    scan and take the whole folder down with it.
+    """
+    import re
+    parts = []
+    # chr(92) is a backslash. Spelled this way because PORTS_RUNTIME is a
+    # non-raw string constant, so a literal one here would have to be written
+    # four-deep to survive into the generated file — a maintenance trap that
+    # silently produces an unterminated literal.
+    for seg in str(path).replace(chr(92), "/").split("/"):
+        row = []
+        for tok in re.split("([0-9]+)", seg):
+            if tok.isdigit():
+                try:
+                    row.append((0, int(tok), ""))
+                    continue
+                except ValueError:
+                    pass
+            row.append((1, 0, tok.lower()))
+        parts.append(row)
+    return parts
+
+
 class _FrameBrowser:
     """Folder -> ordered files -> index -> one displayed image.
 
@@ -1274,38 +1320,93 @@ class _FrameBrowser:
     frames; listing them is cheap (names only) but decoding them is not, so
     the file list is held and the pixels are not. Scrubbing decodes the frame
     you land on and drops the one before it.
+
+    BOTH EVENTS ARE COALESCED. A scale fires once per integer crossed, so
+    dragging across 5,000 frames asks for ~600 decodes; a Browse entry fires
+    once per KEYSTROKE, so typing a path rescans the folder ~60 times. The
+    `_last` guard cannot help with either — every intermediate value really is
+    a different folder or a different frame. Debouncing is what makes the drag
+    smooth instead of a sequence of stalls.
     """
 
-    SUFFIXES = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif")
+    SUFFIXES = _SEQ_SUFFIXES
+    SCAN_MS = 150     # coalesce a typed folder path
+    SHOW_MS = 30      # coalesce a scrubber drag
 
-    def __init__(self, folder_port, index_port, target_port):
+    def __init__(self, folder_port, index_port, target_port, *,
+                 suffixes=(), recursive=False, status_port=None):
         self.folder, self.index, self.target = folder_port, index_port, target_port
+        self.status = status_port
+        self.suffixes = tuple(s.lower() for s in (suffixes or self.SUFFIXES))
+        self.recursive = bool(recursive)
         self.files = []
         self._last = None
-        folder_port.on_change(self.reload)
-        index_port.on_change(self.show)
+        self._scan_tok = None
+        self._show_tok = None
+        folder_port.on_change(self._folder_changed)
+        index_port.on_change(self._index_changed)
+        # DEFERRED. __init__ runs inside MainUi._build(), before the window is
+        # mapped, so a folder restored from a port default would be scanned
+        # and shown into a 1x1 canvas.
+        idle = getattr(getattr(self.index, "widget", None), "after_idle", None)
+        if callable(idle):
+            idle(self.reload)
+        else:
+            self.reload()
+
+    # -- scheduling ---------------------------------------------------
+    def _later(self, token, ms, fn):
+        """Replace a pending callback. Returns the new token, or None when Tk
+        will not schedule — a destroyed widget during teardown — in which case
+        the update is DROPPED rather than run inline into a dead canvas."""
+        w = getattr(self.index, "widget", None)
+        if token is not None:
+            try: w.after_cancel(token)
+            except Exception: pass
         try:
-            self.reload(folder_port.get())
+            return w.after(ms, fn)
         except Exception:
-            pass                      # an empty picker at startup is normal
+            return None
+
+    def _cancel(self, attr):
+        tok = getattr(self, attr, None)
+        if tok is not None:
+            try: self.index.widget.after_cancel(tok)
+            except Exception: pass
+        setattr(self, attr, None)
+
+    def _folder_changed(self, folder=None):
+        self._scan_tok = self._later(self._scan_tok, self.SCAN_MS, self.reload)
+
+    def _index_changed(self, i=None):
+        self._show_tok = self._later(self._show_tok, self.SHOW_MS, self.show)
 
     # -- the two events ----------------------------------------------
     def reload(self, folder=None) -> None:
         """A new folder: relist, RESIZE THE INDEX to fit, show the first."""
         import os
+        self._cancel("_scan_tok")
         folder = str(folder if folder is not None else self.folder.get() or "")
         folder = folder.strip().strip('"')
-        self.files = []
-        if folder and os.path.isdir(folder):
+        if folder and not os.path.isdir(folder):
+            return          # half-typed path: keep what is already loaded
+        files, stack = [], ([folder] if folder else [])
+        while stack:
             try:
-                self.files = sorted(
-                    os.path.join(folder, n) for n in os.listdir(folder)
-                    if os.path.splitext(n)[1].lower() in self.SUFFIXES)
+                with os.scandir(stack.pop()) as it:
+                    for e in it:
+                        if e.is_dir():
+                            if self.recursive:
+                                stack.append(e.path)
+                        elif os.path.splitext(e.name)[1].lower() in self.suffixes:
+                            files.append(e.path)
             except OSError:
-                self.files = []
+                continue
+        files.sort(key=_natkey)
+        self.files = files
         # The index widget's range must match the folder, or the slider runs
         # past the end of a short folder and stops short on a long one.
-        hi = max(0, len(self.files) - 1)
+        hi = max(0, len(files) - 1)
         w = getattr(self.index, "widget", None)
         setter = getattr(w, "set_range", None)
         if callable(setter):
@@ -1314,18 +1415,29 @@ class _FrameBrowser:
         else:
             try: w.configure(from_=0, to=hi)
             except Exception: pass
-        self._last = None
         try: self.index.set(0)
         except Exception: pass
+        # Both writes above trip the index trace and queue a show. Cancel it,
+        # or switching folders from a non-zero index decodes twice.
+        self._cancel("_show_tok")
+        self._last = None
         self.show(0)
 
     def show(self, i=None) -> None:
         """Display frame ``i``. Decodes exactly one image."""
+        import os
+        self._show_tok = None
         try:
             i = int(i if i is not None else self.index.get())
         except (TypeError, ValueError):
             return
         if not self.files:
+            # CLEAR. Leaving the previous folder's frame on screen under a
+            # message saying the folder is empty is worse than showing nothing.
+            self._last = None
+            try: self.target.set(None)
+            except Exception: pass
+            self._say("no images in this folder")
             return
         i = max(0, min(i, len(self.files) - 1))
         if i == self._last:
@@ -1333,18 +1445,39 @@ class _FrameBrowser:
         try:
             from PIL import Image
         except ImportError:
-            print("[ports] Pillow is not installed; cannot display frames")
+            self._say("Pillow is not installed; cannot display frames")
             return
         try:
             with Image.open(self.files[i]) as im:
-                # copy() forces the decode, so the pixels survive the `with`.
-                # An explicit im.load() would be the obvious way and is
-                # refused by gui_policy — `.load` is denied wherever it
-                # appears, because that is also pickle.load's spelling.
-                self.target.set(im.copy())
+                # draft() makes libjpeg DCT-scale the decode, so a 6000x4000
+                # JPEG never materialises full size. A no-op for PNG/TIFF.
+                im.draft("RGB", (2048, 2048))
+                if im.mode in ("I", "I;16", "I;16B", "I;16L", "F"):
+                    # 16-bit CT / layer scans. ImageCanvas._render does
+                    # .convert("RGBA"), which CLAMPS a 16-bit slice to near
+                    # white; scaling here is what makes it look like the scan.
+                    frame = im.point(lambda v: v * (1.0 / 256)).convert("L")
+                else:
+                    # copy() forces the decode, so the pixels survive the
+                    # `with`. An explicit im.load() would be the obvious way
+                    # and is refused by gui_policy — `.load` is denied wherever
+                    # it appears, because that is also pickle.load's spelling.
+                    frame = im.copy()
+            self.target.set(frame)
             self._last = i
+            self._say(f"{i + 1} / {len(self.files)}  "
+                      f"{os.path.basename(self.files[i])}")
         except Exception as exc:
-            print(f"[ports] could not display {self.files[i]}: {exc!r}")
+            self._say(f"cannot read {os.path.basename(self.files[i])}: {exc!r}")
+
+    def _say(self, message) -> None:
+        if self.status is not None:
+            try:
+                self.status.set(message)
+                return
+            except Exception:
+                pass
+        print(f"[ports] {message}")
 
     # -- read-only detail, for hand-written code ---------------------
     def count(self) -> int:
@@ -1531,14 +1664,21 @@ def emit_ports(spec: Spec, aliases: Optional[Dict[str, str]] = None) -> str:
         if not d:
             continue
         folder, target = str(d.get("folder") or ""), str(d.get("target") or "")
+        status = str(d.get("status") or "")
         index = w.port.name if w.port else ""
         if not (folder in by_port and target in by_port and index):
+            # gui_spec.validate blocks this before emit is reached; the guard
+            # stays so a hand-built Spec cannot emit a NameError.
             L.append(f"        # {w.name}: sequence link skipped — "
                      f"folder={folder!r} target={target!r} index={index!r}")
             continue
         L.append(f"        # {w.name} steps through {folder} -> {target}")
         L.append(f"        self.browse_{index} = _FrameBrowser(")
-        L.append(f"            self.{folder}, self.{index}, self.{target})")
+        L.append(f"            self.{folder}, self.{index}, self.{target},")
+        L.append(f"            suffixes={_py(tuple(d.get('suffixes') or ()))},")
+        L.append(f"            recursive={_py(bool(d.get('recursive')))},")
+        L.append(f"            status_port="
+                 f"{('self.' + status) if status in by_port else 'None'})")
     return "\n".join(L).rstrip() + "\n"
 
 
