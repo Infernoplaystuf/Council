@@ -271,6 +271,23 @@ def test_a_broken_script_link_is_an_error_at_generate(patch, fragment):
     assert not ok and any(fragment in e for e in errs), errs
 
 
+def test_a_re_exported_function_counts_as_defined(tmp_path):
+    """`from .core import scan` in a module really does offer `scan`; only
+    counting defs would reject a working link as 'has no function'."""
+    (tmp_path / "wrapper.py").write_text(
+        "from frame_timing import count_bad_frames as tally\n"
+        "import os.path\n\n"
+        "def local():\n    pass\n", encoding="utf-8")
+    defs = gsp._top_level_defs("wrapper", root=tmp_path)
+    assert {"tally", "local", "os"} <= defs
+
+
+def test_a_star_import_makes_the_function_check_step_aside(tmp_path):
+    (tmp_path / "starry.py").write_text("from frame_timing import *\n",
+                                        encoding="utf-8")
+    assert gsp._top_level_defs("starry", root=tmp_path) is None
+
+
 def test_a_declared_vendor_module_is_allowed_and_not_parsed():
     """A vendor SDK is not a file in the app root, so its functions cannot be
     checked without importing it — and validation never imports."""

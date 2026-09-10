@@ -413,13 +413,15 @@ def build(shapes: Sequence[Shape], layout_tree: Any,
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _top_level_defs(module: str) -> Optional[set]:
+def _top_level_defs(module: str, root: Any = None) -> Optional[set]:
     """Function and class names defined at the top of an app-root module, by
     PARSING its source — never importing it. None when the module is not a
-    file beside this one (a vendor package), which is then not checked."""
+    file in ``root`` (default: beside this one) — a vendor package, which is
+    then not checked."""
     import ast as _ast
     from pathlib import Path as _Path
-    p = _Path(__file__).resolve().parent / (module.replace(".", "/") + ".py")
+    base = _Path(root) if root else _Path(__file__).resolve().parent
+    p = base / (module.replace(".", "/") + ".py")
     if not p.is_file():
         return None
     try:
@@ -433,6 +435,13 @@ def _top_level_defs(module: str) -> Optional[set]:
             out.add(node.name)
         elif isinstance(node, _ast.Assign):     # fn = other_fn aliases
             out.update(t.id for t in node.targets if isinstance(t, _ast.Name))
+        elif isinstance(node, (_ast.Import, _ast.ImportFrom)):
+            # A module that RE-EXPORTS a function (`from .core import scan`)
+            # really does offer it; without this the check would reject a
+            # working link as "has no function".
+            if any(a.name == "*" for a in node.names):
+                return None                     # star import: cannot know
+            out.update((a.asname or a.name).split(".")[0] for a in node.names)
     return out
 
 
