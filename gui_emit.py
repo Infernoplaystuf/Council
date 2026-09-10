@@ -408,6 +408,64 @@ def _ordered(spec: Spec) -> List[WidgetSpec]:
     return out
 
 
+STOP_WATCHER = '''
+
+def _watch_for_stop(ui) -> None:
+    """Close cleanly when the GUI Designer asks, or when it goes away.
+
+    Active only when the designer launched this app (it sets
+    COUNCIL_PREVIEW_CONTROL=stdin). The designer writes "stop" on stdin to ask
+    for a clean close; if the designer exits or crashes, stdin reaches
+    end-of-file and the app closes the same way. Either way on_close runs, so
+    a camera app gets to stop its grab and close the device.
+
+    Before this, Stop was TerminateProcess on Windows: no finally, no atexit,
+    no window handler ran, and a crashed designer left its preview running
+    with nothing able to stop it.
+
+    The reader thread never touches Tk — Tk is not safe to call from another
+    thread. It only sets a flag, which the Tk thread polls. It reads the raw
+    file descriptor rather than sys.stdin: a thread parked inside sys.stdin's
+    buffered reader when the window is closed by its X can abort the
+    interpreter at shutdown ("could not acquire lock for stdin").
+    """
+    import os
+    import sys
+    import threading
+    if os.environ.get("COUNCIL_PREVIEW_CONTROL") != "stdin" or sys.stdin is None:
+        return
+    asked = threading.Event()
+
+    def _read():
+        seen = b""
+        try:
+            fd = sys.stdin.fileno()
+            while True:
+                chunk = os.read(fd, 64)
+                if not chunk:
+                    break              # end-of-file: the designer is gone
+                seen = (seen + chunk)[-64:]
+                if b"stop" in seen.lower():
+                    break
+        except Exception:
+            pass
+        asked.set()
+
+    threading.Thread(target=_read, name="stop-watcher", daemon=True).start()
+
+    def _poll():
+        if asked.is_set():
+            ui.request_close()
+            return
+        try:
+            ui.after(150, _poll)
+        except Exception:
+            pass                       # the window is already gone
+
+    ui.after(150, _poll)
+'''
+
+
 def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
     r = dict(regions or {})
     composites = sorted({w.kind for w in spec.widgets
@@ -428,6 +486,7 @@ def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
             _COMPOSITE_KINDS[k] for k in composites))
         L.append("")
     L.append("from .ports import Ports")
+    L.append(STOP_WATCHER.rstrip())
     L.append("")
     # When the window carries a background, MainUi becomes tk.Frame — ttk.Frame
     # ignores `background=` and there is no theme-portable way around that.
@@ -441,7 +500,39 @@ def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
         "",
         "    def __init__(self, master=None, **kw):",
         "        super().__init__(master, **kw)",
+        "        self._closing = False",
         "        self._build()",
+        "        # ONE close path: the window's X, the designer's Stop, and the",
+        "        # designer going away all run on_close before the window goes.",
+        "        try:",
+        "            self.winfo_toplevel().protocol('WM_DELETE_WINDOW',",
+        "                                           self.request_close)",
+        "        except tk.TclError:",
+        "            pass",
+        "        _watch_for_stop(self)",
+        "",
+        "    # -- closing ---------------------------------------------------",
+        "    def on_close(self) -> None:",
+        '        """Release hardware here: stop a camera grab, close the device,',
+        "        finish writing a file. Runs for the window's X, the designer's",
+        "        Stop, and the designer exiting. Override it in handlers.py or",
+        '        app.py."""',
+        "",
+        "    def request_close(self) -> None:",
+        '        """Close cleanly: on_close first, then the window. Runs once."""',
+        "        if self._closing:",
+        "            return",
+        "        self._closing = True",
+        "        try:",
+        "            self.on_close()",
+        "        except Exception as exc:",
+        "            # A failing cleanup must not keep a window the user asked to",
+        "            # close open; say what failed and close anyway.",
+        '            print(f"on_close failed: {exc!r}")',
+        "        try:",
+        "            self.winfo_toplevel().destroy()",
+        "        except tk.TclError:",
+        "            pass",
         "",
         "    def _build(self) -> None:",
     ]
@@ -2079,9 +2170,19 @@ def _script_for(spec: Spec, handler: str) -> Dict[str, Any]:
     return {}
 
 
+ON_CLOSE_STUB = '''
+    def on_close(self) -> None:
+        """Runs when the app closes — its window's X, the GUI Designer's Stop,
+        or the designer exiting. Put hardware cleanup here: stop a camera
+        grab, close the device, finish writing a recording. The window closes
+        after this returns, and closes anyway if this raises."""
+        pass
+'''
+
+
 def emit_handlers_py(spec: Spec) -> str:
     body = "".join(handler_stub(h, _script_for(spec, h))
-                   for h in spec.handlers) or "\n    pass\n"
+                   for h in spec.handlers) + ON_CLOSE_STUB
     return f'''"""Handler stubs for {spec.project}.
 
 APPEND-ONLY. Regeneration adds stubs for NEW widgets to the end of this file

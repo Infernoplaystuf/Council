@@ -19,6 +19,14 @@ orphaned window that no longer corresponds to anything on screen and cannot be
 stopped from the app that started it. So every launch is registered, one preview
 per project is enforced, and an atexit hook is the backstop for the path nobody
 remembered.
+
+WHY STOP ASKS BEFORE IT KILLS
+-----------------------------
+A preview may be driving hardware. Stop sends "stop" on the child's stdin and
+waits for it to close itself — running its on_close, where a camera app stops
+its grab and releases the device — and only kills it if it will not. If the
+designer itself dies, the child's stdin reaches end-of-file and it closes the
+same way. See Preview.stop for what the old terminate() actually did.
 """
 from __future__ import annotations
 
@@ -42,6 +50,13 @@ _LIVE: Dict[str, "Preview"] = {}
 _LOCK = threading.RLock()
 
 
+# How long a preview gets to close itself after Stop before it is killed. A
+# camera app has to stop its grab, close the device and finalise a file; five
+# seconds is generous for that and short enough that a hung app does not make
+# Stop feel broken.
+STOP_GRACE = 5.0
+
+
 @dataclass
 class Preview:
     """One running preview process."""
@@ -49,6 +64,13 @@ class Preview:
     proc: subprocess.Popen
     on_line: Optional[Callable[[str, str], None]] = None   # (text, level)
     on_exit: Optional[Callable[[int], None]] = None
+    # Whether this app's generated code listens for a stop request. Projects
+    # generated before the stop listener existed do not, and waiting out the
+    # grace period on them would only make Stop slow.
+    listens: bool = False
+    forced: bool = False       # killed because it would not close itself
+    stopping: bool = False     # Stop was pressed — its exit is not a crash
+    grace: float = STOP_GRACE  # what the last stop() actually waited
     _threads: List[threading.Thread] = field(default_factory=list)
     _tail: List[str] = field(default_factory=list)
 
@@ -60,23 +82,50 @@ class Preview:
     def running(self) -> bool:
         return self.proc.poll() is None
 
-    def stop(self, timeout: float = 3.0) -> None:
-        """Terminate, then kill if it will not go.
-
-        terminate() first so the child can close its window cleanly; kill()
-        after a grace period because a Tk app stuck in a modal dialog will
-        ignore the polite request and must not survive its parent."""
-        if self.proc.poll() is not None:
-            return
+    def ask_to_stop(self) -> None:
+        """Send the polite request and return without waiting."""
+        self.stopping = True
         try:
-            self.proc.terminate()
+            if self.proc.stdin and not self.proc.stdin.closed:
+                self.proc.stdin.write("stop\n")
+                self.proc.stdin.flush()
+                self.proc.stdin.close()      # end-of-file backs it up
+        except Exception:
+            pass                            # already gone, or not listening
+
+    def stop(self, grace: float = STOP_GRACE) -> bool:
+        """Ask the app to close; kill it only if it will not. True = it closed
+        by itself.
+
+        On Windows, Popen.terminate() IS TerminateProcess — an immediate hard
+        kill in which no finally, atexit or window-close handler runs. Measured:
+        stop() returned in 0.01 s, exit code 1, and none of three cleanup
+        markers was written. A camera app stopped that way never called
+        StopGrabbing or Close and never finalised its recording. So the request
+        goes over stdin, which the generated app listens to (gui_emit
+        STOP_WATCHER), and kill() is only the fallback for a hung app."""
+        if self.proc.poll() is not None:
+            return True
+        self.grace = grace
+        self.ask_to_stop()
+        if self.listens:
             try:
-                self.proc.wait(timeout=timeout)
+                self.proc.wait(timeout=grace)
+                return True
             except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait(timeout=timeout)
+                pass
+        return self._kill()
+
+    def _kill(self) -> bool:
+        if self.proc.poll() is not None:
+            return True
+        self.forced = True
+        try:
+            self.proc.kill()
+            self.proc.wait(timeout=5.0)
         except Exception:
             pass
+        return False
 
 
 def _emit(pv: Preview, text: str, level: str) -> None:
@@ -115,13 +164,20 @@ def _watch(pv: Preview) -> None:
     code = pv.proc.wait()
     for t in pv._threads:
         t.join(timeout=2.0)
-    if code != 0:
+    if pv.forced:
+        # Not a crash: Stop was pressed and the app did not close itself.
+        why = ("it was generated before clean Stop existed — Generate it "
+               "again" if not pv.listens else
+               f"it did not close within {pv.grace:g} s (hung?)")
+        _emit(pv, f"preview killed: {why}", "error")
+    elif code != 0:
         _emit(pv, f"preview exited with code {code}", "error")
         blame = explain_failure("\n".join(pv._tail), pv.project)
         if blame:
             _emit(pv, blame, "error")
     else:
-        _emit(pv, "preview closed", "info")
+        _emit(pv, "preview closed cleanly" if pv.stopping
+              else "preview closed", "info")
     with _LOCK:
         if _LIVE.get(str(pv.project)) is pv:
             _LIVE.pop(str(pv.project), None)
@@ -192,9 +248,19 @@ def start(project, *, on_line: Optional[Callable[[str, str], None]] = None,
 
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
+    # The pipes below are decoded as UTF-8, but a child Python on Windows
+    # writes its locale code page (cp1252) unless told otherwise — measured on
+    # a 3.9 child — so non-ASCII output arrived garbled or raised in the child.
+    env["PYTHONIOENCODING"] = "utf-8"
+    # A native SDK crash (an access violation inside a camera driver) is
+    # otherwise a bare exit code with nothing to explain it.
+    env["PYTHONFAULTHANDLER"] = "1"
+    # Tells the generated app to listen on stdin for a clean-close request.
+    env["COUNCIL_PREVIEW_CONTROL"] = "stdin"
     proc = subprocess.Popen(
         [sys.executable, "-u", str(launch)],
         cwd=str(proj),
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -202,7 +268,8 @@ def start(project, *, on_line: Optional[Callable[[str, str], None]] = None,
         errors="replace",
         env=env,
     )
-    pv = Preview(project=proj, proc=proc, on_line=on_line, on_exit=on_exit)
+    pv = Preview(project=proj, proc=proc, on_line=on_line, on_exit=on_exit,
+                 listens=_listens_for_stop(proj))
     for stream, level in ((proc.stdout, "info"), (proc.stderr, "error")):
         t = threading.Thread(target=_drain, args=(pv, stream, level),
                              daemon=True)
@@ -216,30 +283,59 @@ def start(project, *, on_line: Optional[Callable[[str, str], None]] = None,
     return pv
 
 
-def stop(project) -> bool:
-    """Stop one project's preview. True if something was running."""
+def _listens_for_stop(proj: Path) -> bool:
+    """Whether this project's generated UI carries the stop listener."""
+    try:
+        src = (proj / "ui" / "main_ui.py").read_text(encoding="utf-8",
+                                                     errors="replace")
+    except OSError:
+        return False
+    return "_watch_for_stop(self)" in src
+
+
+def stop(project, grace: float = STOP_GRACE) -> bool:
+    """Stop one project's preview, cleanly if it will go. True if something
+    was running."""
     key = str(Path(project).resolve())
     with _LOCK:
         pv = _LIVE.pop(key, None)
     if pv is None:
         return False
     was = pv.running
-    pv.stop()
+    pv.stop(grace)
     return was
 
 
-def stop_all() -> int:
-    """Stop every preview. The tab-close / app-exit path."""
+def stop_all(grace: float = STOP_GRACE) -> int:
+    """Stop every preview — the tab-close / app-exit path.
+
+    Every preview is asked FIRST and then all are waited on against one shared
+    deadline, so three camera apps closing take one grace period, not three."""
+    import time
     with _LOCK:
         pvs = list(_LIVE.values())
         _LIVE.clear()
     for pv in pvs:
-        pv.stop()
+        if pv.running:
+            pv.grace = grace
+            pv.ask_to_stop()
+    deadline = time.monotonic() + grace
+    for pv in pvs:
+        if not pv.running:
+            continue
+        if pv.listens:
+            try:
+                pv.proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+                continue
+            except subprocess.TimeoutExpired:
+                pass
+        pv._kill()
     return len(pvs)
 
 
 # The backstop. Tab close and project switch call stop() explicitly; this
 # catches the paths nobody remembered, including an unhandled exception on the
-# way out. Without it a crash in the designer leaves an orphan window the user
-# cannot connect to anything.
+# way out. If the designer dies without running it (killed, or a hard crash),
+# each preview's stdin pipe closes with it, and the generated app treats that
+# end-of-file as a stop request — so it still closes cleanly.
 atexit.register(stop_all)
