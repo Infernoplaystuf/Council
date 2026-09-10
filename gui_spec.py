@@ -503,11 +503,30 @@ def validate(spec: Spec) -> Tuple[bool, List[str]]:
             if st_name and st_name not in port_of:
                 errs.append(f"{where}: drives.status names no port "
                             f"({st_name!r})")
-            names = [n for n in (src_name, snk_name,
+            # Optional ROI text port, kept in sync with the canvas's box so a
+            # script link (crop-on-save) can read it. Both halves have to be
+            # declared: a port with no drawable canvas behind it, or a canvas
+            # whose box nothing can read, is a link that silently does nothing.
+            roi_name = str(d.get("roi") or "")
+            if roi_name:
+                rp = port_of.get(roi_name)
+                if rp is None:
+                    errs.append(f"{where}: drives.roi names no port "
+                                f"({roi_name!r})")
+                elif rp.kind != "entry":
+                    errs.append(f"{where}: drives.roi must be an entry, so the "
+                                f"box can be read and typed; {roi_name!r} is "
+                                f"a {rp.kind}")
+                if snk is not None and snk.kind in _gpo.SEQUENCE_SINKS \
+                        and not bool((snk.props or {}).get("roi")):
+                    errs.append(f"{where}: drives.roi is set but {snk_name!r} "
+                                f"has roi off — set its roi prop to true so a "
+                                f"box can be drawn")
+            names = [n for n in (src_name, snk_name, roi_name,
                                  w.port.name if w.port else None) if n]
             if len(set(names)) != len(names):
-                errs.append(f"{where}: a sequence link needs three DIFFERENT "
-                            f"ports; got {names}")
+                errs.append(f"{where}: a sequence link needs a DIFFERENT "
+                            f"port for each role; got {names}")
             if snk_name:
                 prior = driven_sinks.setdefault(snk_name, w.name)
                 if prior != w.name:

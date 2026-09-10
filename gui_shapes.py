@@ -273,6 +273,9 @@ PALETTE: Dict[str, Dict[str, Any]] = {
             "overlay_alpha": _schema(type="float", default=0.5),
             "colormap": _schema(type="str", default=""),
             "zoom_to_fit": _schema(type="bool", default=True),
+            # Draw ROI / Apply ROI / Clear ROI above the image. Off by default
+            # so every existing canvas keeps plain drag-to-pan.
+            "roi": _schema(type="bool", default=False),
         },
     },
     "chart_panel": {

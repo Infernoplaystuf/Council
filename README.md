@@ -492,7 +492,7 @@ a project you can run and keep editing.
 
 ### Try it in one command
 
-Two worked examples ship with the repo. From the repo root, on any OS:
+Three worked examples ship with the repo. From the repo root, on any OS:
 
 ```bash
 python run_example_gui.py
@@ -501,25 +501,38 @@ python run_example_gui.py
 That lists them. To build one and launch it:
 
 ```bash
-python run_example_gui.py barbie_capture
+python run_example_gui.py barbie_capture_v2
 ```
 
-**What you need:** Python with `tkinter`, and nothing else. Verified on 3.10,
-3.11, 3.12 and 3.13 with `PIL`, `matplotlib`, `numpy` and `pandas` all absent.
-The `image_viewer` example additionally wants **Pillow** (`pip install Pillow`)
-to *display* frames; without it the app still runs and says so rather than
-crashing.
+`barbie_capture_v2` is the current version: a readable font, and a **region of
+interest** on the live image. Browse to a folder of frames, click **Draw ROI**
+and drag a box on the image, then **Apply ROI** — the view zooms to the box and
+stays zoomed as you scrub. **Save cropped frames** writes every frame cropped to
+the box into a new `roi_…` subfolder of the folder you choose; it never writes
+into the capture folder or overwrites anything. `barbie_capture` (v1) is kept
+alongside it so the two can be compared.
 
-You do **not** need `requirements.txt` for this — that file covers the whole
-Council app (models, RAG, plotting, speech) and is a much larger install.
+**What you need:** Python 3.10+ with `tkinter` builds the example and opens its
+window. To *use* it — show frames, crop them, and scan for bad timings — you
+also need **Pillow** and **numpy**:
+
+```bash
+python -m pip install Pillow numpy
+```
+
+Without Pillow the live view stays blank and saving reports why; without
+numpy the bad-timing scan does not work. You do **not** need
+`requirements.txt` for this — that file covers the whole Council app (models,
+RAG, plotting, speech) and is a much larger install.
 
 > On most Linux distros `tkinter` is a separate package — `sudo apt install
 > python3-tk` (Debian/Ubuntu) or `sudo dnf install python3-tkinter` (Fedora).
 > If it's missing you'll see `ModuleNotFoundError: No module named 'tkinter'`.
 
-> The Barbie example asks for the **Magneto** font, which ships with Windows.
-> On macOS/Linux Tk silently substitutes a default face — the app works, it just
-> won't look like the screenshot.
+> v1 asks for the **Magneto** font and v2 for **Segoe UI**, both of which ship
+> with Windows. On macOS/Linux Tk silently substitutes a default face — the app
+> works, it just looks different. Multi-word font names like `Segoe UI` are
+> safe to use in a wireframe.
 
 ### Where it goes
 

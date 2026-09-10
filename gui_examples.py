@@ -39,6 +39,19 @@ WHAT EACH ONE TEACHES
                     port   — the typed value a widget exposes
                     script — a Python function a button runs
                     drives — a slider stepping an image panel through a folder
+  barbie_capture_v2
+                  the current version, and the only one sent to a model by
+                  default: all of the above, a readable font, and a region of
+                  interest drawn on the live image — Apply zooms the view to
+                  it, and Save writes every frame cropped to it.
+
+VERSIONS ARE KEPT, NOT REPLACED
+-------------------------------
+barbie_capture and barbie_capture_v2 both stay on disk so the improvement is
+visible side by side (python run_example_gui.py <name>). Only PROMPT_EXAMPLES
+is sent as model context: three near-identical wireframes cost three times the
+tokens to teach one thing, and the budget is what leaves room for the user's
+own request.
 """
 from __future__ import annotations
 
@@ -68,7 +81,22 @@ NOTES: Dict[str, str] = {
         "with several outputs; `drives` making a scrubber step an image "
         "canvas through the images in a folder port."
     ),
+    "barbie_capture_v2": (
+        "A capture form that browses a folder of frames, reports mistimed "
+        "ones, and crops to a region of interest. Shows: window bg + fg + a "
+        "readable font; a FOLDER picker driving an image canvas through a "
+        "scrubber's `drives`; `roi: true` on the canvas (Draw / Apply / Clear "
+        "ROI above the image) with `drives.roi` naming an entry that mirrors "
+        "the box as 'x, y, w, h'; a button whose `script` fills TWO readouts "
+        "from ONE call; a Save button whose `script` passes three ports to a "
+        "function and shows its one-line result; labels ABOVE their boxes."
+    ),
 }
+
+# The examples sent to a model when none is named. The newest version teaches
+# everything the older ones do; sending all of them tripled the context for
+# no new signal. Older versions remain loadable by name.
+PROMPT_EXAMPLES = ("barbie_capture_v2",)
 
 # The declarations a designing model most often gets wrong, stated once.
 DECLARATION_HELP = """\
@@ -86,7 +114,9 @@ Beyond kind/label/x/y/w/h, a shape may declare:
                 handler that calls it.
   "drives"      on a scrubber/scale: {"folder": <port>, "target": <port>} —
                 steps the target widget through the files in the folder port,
-                and sizes itself to the folder automatically.
+                and sizes itself to the folder automatically. Add
+                "roi": <entry port> to mirror a box drawn on the target
+                (which needs props {"roi": true}) as "x, y, w, h".
 """
 
 
@@ -165,8 +195,14 @@ def for_prompt(name: Optional[str] = None, *, include_help: bool = True) -> str:
 
     Returns text meant to be pasted into a prompt: a one-line statement of
     what the example teaches, then the compact JSON a model should imitate.
-    With no name, every example is included, simplest first."""
-    wanted = [name] if name else names()
+    With no name, PROMPT_EXAMPLES — the current version — is sent; if none of
+    those exist on disk, every example is, so the model is never shown
+    nothing."""
+    on_disk = names()
+    if name:
+        wanted = [name]
+    else:
+        wanted = [n for n in PROMPT_EXAMPLES if n in on_disk] or on_disk
     blocks: List[str] = []
     for n in wanted:
         try:

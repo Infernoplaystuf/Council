@@ -48,7 +48,7 @@ REGION_CLOSE = re.compile(r"^\s*#\s*endregion\b")
 LINKED_ALLOWLIST = (
     "image_stats", "image_index", "plot_registry", "plots_pane", "graph_data",
     "vault_analyst", "data_index", "df_cache", "stats_cache", "provenance",
-    "frame_timing",
+    "frame_timing", "frame_roi",
 )
 
 
@@ -216,7 +216,9 @@ def _font_kwarg(w: WidgetSpec) -> str:
     font = str(getattr(w, "font", "") or "").strip()
     if not font or not _gcol.can_font(w.kind):
         return ""
-    return f", font={_py(font)}"
+    # Brace-quote a multi-word family. Passed verbatim, "Segoe UI 12" makes
+    # Tk parse "UI" as the size and the app dies at construction.
+    return f", font={_py(_gcol.tk_font(font))}"
 
 
 def _uses_classic(w: WidgetSpec) -> bool:
@@ -317,7 +319,8 @@ def construct(w: WidgetSpec, parent: str) -> str:
     if k == "image_canvas":
         return (f"ImageCanvas({parent}, "
                 f"overlay={_py(bool(_prop(w, 'overlay', False)))}, "
-                f"overlay_alpha={_py(float(_prop(w, 'overlay_alpha', 0.5)))})")
+                f"overlay_alpha={_py(float(_prop(w, 'overlay_alpha', 0.5)))}, "
+                f"roi={_py(bool(_prop(w, 'roi', False)))})")
     if k == "chart_panel":
         return (f"ChartPanel({parent}, "
                 f"toolbar={_py(bool(_prop(w, 'toolbar', False)))})")
@@ -540,36 +543,71 @@ from tkinter import filedialog, ttk
 
 
 class ImageCanvas(ttk.Frame):
-    """Image viewer: pan, zoom-to-fit, zoom-to-cursor, optional alpha overlay.
+    """Image viewer: pan, zoom-to-fit, zoom-to-cursor, optional alpha overlay,
+    and an optional region of interest (roi=True).
 
     Zoom is anchored to the CURSOR, not the widget centre. Centre-anchored zoom
     is the classic mistake — the thing under the pointer slides away and the
     user chases it, which on a layer-wise scan is unusable.
+
+    THE ROI. Draw ROI arms the next left-drag to draw a box instead of panning.
+    Apply ROI crops the view to that box and zooms it to fit, and the crop is
+    re-applied to EVERY new frame, so a scrubbed or live sequence stays zoomed
+    on the region instead of snapping back to the whole frame. Clear ROI
+    returns to the whole frame.
+
+    The box is stored in FULL-IMAGE pixels, never canvas pixels. Canvas pixels
+    change with every pan and zoom; image pixels mean the same region at any
+    zoom, which is exactly what a crop-on-save routine needs to be handed.
     """
 
+    ROI_COLOUR = "#00e5ff"
+
     def __init__(self, master=None, *, overlay: bool = False,
-                 overlay_alpha: float = 0.5, **kw):
+                 overlay_alpha: float = 0.5, roi: bool = False, **kw):
         super().__init__(master, **kw)
+        self.roi_enabled = bool(roi)
+        self._roi = None           # (x, y, w, h) in full-image pixels
+        self._roi_applied = False
+        self._roi_armed = False    # the next left-drag draws instead of pans
+        self._roi_from = None      # canvas point where the ROI drag began
+        self._roi_listeners = []
+        if self.roi_enabled:
+            bar = ttk.Frame(self)
+            bar.pack(side="top", fill="x")
+            self._btn_draw = ttk.Button(bar, text="Draw ROI",
+                                        command=self.arm_roi)
+            self._btn_apply = ttk.Button(bar, text="Apply ROI",
+                                         command=self.apply_roi)
+            self._btn_clear = ttk.Button(bar, text="Clear ROI",
+                                         command=self.clear_roi)
+            for b in (self._btn_draw, self._btn_apply, self._btn_clear):
+                b.pack(side="left", padx=2, pady=2)
+            self._roi_note = ttk.Label(bar, text="")
+            self._roi_note.pack(side="left", padx=8)
         self.canvas = tk.Canvas(self, highlightthickness=0, background="#1e1e2e")
         self.canvas.pack(fill="both", expand=True)
         self._scale = 1.0
         self._ox = 0.0
         self._oy = 0.0
         self._pan_from = None
-        self._base = None          # PIL.Image
+        self._base = None          # PIL.Image — the whole frame
+        self._view = None          # what is shown: _base, or its ROI crop
+        self._crop_at = (0, 0)     # full-image position of _view's top-left
         self._overlay_img = None   # PIL.Image
         self._photo = None         # keep a reference or Tk drops the image
         self._fitted_at = (0, 0)   # canvas size when zoom_to_fit last ran
         self.overlay_enabled = bool(overlay)
         self.overlay_alpha = float(overlay_alpha)
 
-        self.canvas.bind("<ButtonPress-1>", self._pan_start)
-        self.canvas.bind("<B1-Motion>", self._pan_move)
-        self.canvas.bind("<ButtonRelease-1>", lambda e: setattr(self, "_pan_from", None))
+        self.canvas.bind("<ButtonPress-1>", self._press)
+        self.canvas.bind("<B1-Motion>", self._drag)
+        self.canvas.bind("<ButtonRelease-1>", self._release)
         self.canvas.bind("<MouseWheel>", self._wheel)          # Windows / macOS
         self.canvas.bind("<Button-4>", lambda e: self._zoom_at(1.1, e.x, e.y))
         self.canvas.bind("<Button-5>", lambda e: self._zoom_at(1 / 1.1, e.x, e.y))
         self.canvas.bind("<Configure>", self._on_configure)
+        self._sync_roi_controls()
 
     def _on_configure(self, _e=None) -> None:
         """Re-fit if the last fit ran before the widget had a real size.
@@ -581,15 +619,16 @@ class ImageCanvas(ttk.Frame):
         <Configure> re-rendered at that same dead scale. Refitting once the
         canvas has real dimensions is what makes a preloaded image visible.
         """
-        if min(self._fitted_at) <= 1 and self._base is not None:
+        if min(self._fitted_at) <= 1 and self._view is not None:
             self.zoom_to_fit()
         else:
             self._render()
 
     # -- public ------------------------------------------------------
     def set_image(self, image) -> None:
-        """``image`` is a PIL.Image."""
+        """``image`` is a PIL.Image. An applied ROI is re-applied to it."""
         self._base = image
+        self._refresh_view()
         self.zoom_to_fit()
 
     def set_overlay(self, image, alpha: float = None) -> None:
@@ -603,7 +642,9 @@ class ImageCanvas(ttk.Frame):
         self._render()
 
     def zoom_to_fit(self) -> None:
-        if self._base is None:
+        """Fit what is SHOWN — the ROI crop when one is applied, which is how
+        applying an ROI zooms the view onto it."""
+        if self._view is None:
             # CLEARING IS A RENDER. set_image(None) assigns _base then calls
             # here; returning early left the PREVIOUS frame painted, so an
             # empty folder showed the last folder's image under a message
@@ -612,14 +653,192 @@ class ImageCanvas(ttk.Frame):
             return
         cw = max(1, self.canvas.winfo_width())
         ch = max(1, self.canvas.winfo_height())
-        iw, ih = self._base.size
+        iw, ih = self._view.size
         self._scale = min(cw / iw, ch / ih) if iw and ih else 1.0
         self._ox = (cw - iw * self._scale) / 2
         self._oy = (ch - ih * self._scale) / 2
         self._fitted_at = (cw, ch)
         self._render()
 
+    # -- region of interest -------------------------------------------
+    def get_roi(self):
+        """(x, y, w, h) in full-image pixels, or None."""
+        return self._roi
+
+    @property
+    def roi_applied(self) -> bool:
+        return bool(self._roi_applied and self._roi)
+
+    def on_roi_change(self, fn) -> None:
+        """Call ``fn(roi)`` whenever the box is drawn, cleared or replaced."""
+        self._roi_listeners.append(fn)
+
+    def set_roi(self, roi, notify: bool = False) -> None:
+        """Replace the box with ``roi`` — (x, y, w, h) or None.
+
+        Anything that is not a usable box becomes None. If an ROI is applied,
+        the view re-crops to the new box straight away."""
+        roi = self._valid_roi(roi)
+        if roi == self._roi:
+            return
+        self._roi = roi
+        if roi is None:
+            self._roi_applied = False
+        self._refresh_view()
+        if self._roi_applied:
+            self.zoom_to_fit()
+        else:
+            self._render()
+        if notify:
+            self._emit_roi()
+
+    def arm_roi(self) -> None:
+        """The next left-drag draws the ROI instead of panning."""
+        if self._roi_applied:
+            return              # Clear first: a box drawn on a crop is ambiguous
+        self._roi_armed = True
+        self.canvas.configure(cursor="crosshair")
+        self._sync_roi_controls()
+
+    def apply_roi(self) -> None:
+        """Crop the view to the ROI and zoom it to fit — now and every frame."""
+        if not self._roi:
+            return
+        self._roi_applied = True
+        self._refresh_view()
+        self.zoom_to_fit()
+
+    def clear_roi(self) -> None:
+        had = self._roi is not None
+        self._roi = None
+        self._roi_applied = False
+        self._roi_armed = False
+        self._roi_from = None
+        self.canvas.configure(cursor="")
+        self._refresh_view()
+        self.zoom_to_fit()
+        if had:
+            self._emit_roi()
+
+    def _valid_roi(self, roi):
+        try:
+            x, y, w, h = (int(round(float(v))) for v in roi)
+        except (TypeError, ValueError):
+            return None
+        if w < 2 or h < 2 or x < 0 or y < 0:
+            return None
+        return (x, y, w, h)
+
+    def _roi_box(self, size):
+        """The ROI clamped to an image of ``size``, as a PIL crop box — or
+        None when it lies entirely outside that image."""
+        if not self._roi:
+            return None
+        iw, ih = size
+        x, y, w, h = self._roi
+        left, top = max(0, x), max(0, y)
+        right, bottom = min(iw, x + w), min(ih, y + h)
+        if right - left < 1 or bottom - top < 1:
+            return None
+        return (left, top, right, bottom)
+
+    def _refresh_view(self) -> None:
+        """Recompute what is shown: the whole frame, or its ROI crop."""
+        b = self._base
+        self._view, self._crop_at = b, (0, 0)
+        if b is not None and self._roi_applied:
+            box = self._roi_box(b.size)
+            if box is not None:
+                self._view = b.crop(box)
+                self._crop_at = (box[0], box[1])
+        self._sync_roi_controls()
+
+    def _to_image(self, cx, cy):
+        """Canvas point -> full-image pixel, through pan, zoom and any crop."""
+        s = self._scale or 1.0
+        return (self._crop_at[0] + (cx - self._ox) / s,
+                self._crop_at[1] + (cy - self._oy) / s)
+
+    def _to_canvas(self, ix, iy):
+        s = self._scale
+        return (self._ox + (ix - self._crop_at[0]) * s,
+                self._oy + (iy - self._crop_at[1]) * s)
+
+    def _emit_roi(self) -> None:
+        for fn in list(self._roi_listeners):
+            try:
+                fn(self._roi)
+            except Exception as exc:
+                print(f"[ImageCanvas] ROI listener failed: {exc!r}")
+
+    def _sync_roi_controls(self) -> None:
+        if not self.roi_enabled:
+            return
+        have, applied = self._roi is not None, self.roi_applied
+        self._btn_draw.state(["disabled"] if applied else ["!disabled"])
+        self._btn_apply.state(["!disabled"] if have and not applied
+                              else ["disabled"])
+        self._btn_clear.state(["!disabled"] if have else ["disabled"])
+        if self._roi_armed:
+            text = "Drag a box on the image"
+        elif not have:
+            text = "No ROI"
+        elif applied and self._base is not None and self._view is self._base:
+            text = "ROI lies outside this frame"
+        else:
+            # Report the box as it lands on THIS frame. A box typed larger
+            # than the frame is clamped when shown and when saved; quoting the
+            # requested size would describe pixels that do not exist.
+            x, y, w, h = self._roi
+            box = self._roi_box(self._base.size) if self._base is not None else None
+            if box is not None:
+                x, y, w, h = box[0], box[1], box[2] - box[0], box[3] - box[1]
+            text = f"{'Applied' if applied else 'ROI'}: {w} x {h} at ({x}, {y})"
+            if box is not None and (w, h) != (self._roi[2], self._roi[3]):
+                text += " (clamped)"
+        self._roi_note.configure(text=text)
+
     # -- interaction -------------------------------------------------
+    def _press(self, e) -> None:
+        if self._roi_armed and self._view is not None:
+            self._roi_from = (e.x, e.y)
+            self.canvas.delete("roi_band")
+            self.canvas.create_rectangle(e.x, e.y, e.x, e.y,
+                                         outline=self.ROI_COLOUR, width=2,
+                                         dash=(4, 2), tags="roi_band")
+            return
+        self._pan_from = (e.x, e.y)
+
+    def _drag(self, e) -> None:
+        if self._roi_from is not None:
+            x0, y0 = self._roi_from
+            self.canvas.coords("roi_band", x0, y0, e.x, e.y)
+            return
+        self._pan_move(e)
+
+    def _release(self, e) -> None:
+        if self._roi_from is None:
+            self._pan_from = None
+            return
+        x0, y0 = self._roi_from
+        self._roi_from = None
+        self._roi_armed = False
+        self.canvas.configure(cursor="")
+        self.canvas.delete("roi_band")
+        ax, ay = self._to_image(min(x0, e.x), min(y0, e.y))
+        bx, by = self._to_image(max(x0, e.x), max(y0, e.y))
+        iw, ih = self._base.size
+        # Rounded, not truncated: canvas->image is float maths, and int() on
+        # 9.9999 would shift the box a pixel left of where it was drawn.
+        ax, ay = max(0, int(round(ax))), max(0, int(round(ay)))
+        bx, by = min(iw, int(round(bx))), min(ih, int(round(by)))
+        drawn = self._valid_roi((ax, ay, bx - ax, by - ay))
+        if drawn is not None:
+            # A click without a drag must not wipe a box drawn earlier.
+            self.set_roi(drawn, notify=True)
+        self._sync_roi_controls()
+        self._render()
+
     def _pan_start(self, e) -> None:
         self._pan_from = (e.x, e.y)
 
@@ -649,7 +868,8 @@ class ImageCanvas(ttk.Frame):
     # -- painting ----------------------------------------------------
     def _render(self) -> None:
         self.canvas.delete("all")
-        if self._base is None:
+        view = self._view
+        if view is None:
             return
         try:
             from PIL import Image, ImageTk
@@ -657,16 +877,30 @@ class ImageCanvas(ttk.Frame):
             self.canvas.create_text(10, 10, anchor="nw", fill="#f38ba8",
                                     text="Pillow is required to show images")
             return
-        iw, ih = self._base.size
+        iw, ih = view.size
         w = max(1, int(iw * self._scale))
         h = max(1, int(ih * self._scale))
-        img = self._base.resize((w, h), Image.NEAREST).convert("RGBA")
+        img = view.resize((w, h), Image.NEAREST).convert("RGBA")
         if self.overlay_enabled and self._overlay_img is not None:
-            ov = self._overlay_img.resize((w, h), Image.NEAREST).convert("RGBA")
+            ov = self._overlay_img
+            if view is not self._base and ov.size == self._base.size:
+                box = self._roi_box(self._base.size)
+                if box is not None:
+                    ov = ov.crop(box)     # the overlay follows the crop
+            ov = ov.resize((w, h), Image.NEAREST).convert("RGBA")
             img = Image.blend(img, ov, max(0.0, min(1.0, self.overlay_alpha)))
         self._photo = ImageTk.PhotoImage(img)
         self.canvas.create_image(self._ox, self._oy, anchor="nw",
                                  image=self._photo)
+        # The drawn, not-yet-applied box, redrawn on every pan and zoom.
+        if self._roi and not self._roi_applied and self._base is not None:
+            box = self._roi_box(self._base.size)
+            if box is not None:
+                x0, y0 = self._to_canvas(box[0], box[1])
+                x1, y1 = self._to_canvas(box[2], box[3])
+                self.canvas.create_rectangle(x0, y0, x1, y1,
+                                             outline=self.ROI_COLOUR, width=2,
+                                             dash=(4, 2), tags="roi_box")
 
     # region: custom:ImageCanvas -- preserved across regeneration
     # endregion
@@ -1334,17 +1568,28 @@ class _FrameBrowser:
     SHOW_MS = 30      # coalesce a scrubber drag
 
     def __init__(self, folder_port, index_port, target_port, *,
-                 suffixes=(), recursive=False, status_port=None):
+                 suffixes=(), recursive=False, status_port=None,
+                 roi_port=None):
         self.folder, self.index, self.target = folder_port, index_port, target_port
         self.status = status_port
+        self.roi = roi_port
         self.suffixes = tuple(s.lower() for s in (suffixes or self.SUFFIXES))
         self.recursive = bool(recursive)
         self.files = []
         self._last = None
         self._scan_tok = None
         self._show_tok = None
+        self._roi_syncing = False
         folder_port.on_change(self._folder_changed)
         index_port.on_change(self._index_changed)
+        # ROI <-> a text port, both ways. The canvas holds the box; the port
+        # is what a script link (e.g. crop-on-save) reads, and typing numbers
+        # into it moves the box, so the region can be set precisely too.
+        canvas = getattr(target_port, "widget", None)
+        hook = getattr(canvas, "on_roi_change", None)
+        if roi_port is not None and callable(hook):
+            hook(self._roi_drawn)
+            roi_port.on_change(self._roi_typed)
         # DEFERRED. __init__ runs inside MainUi._build(), before the window is
         # mapped, so a folder restored from a port default would be scanned
         # and shown into a 1x1 canvas.
@@ -1469,6 +1714,36 @@ class _FrameBrowser:
                       f"{os.path.basename(self.files[i])}")
         except Exception as exc:
             self._say(f"cannot read {os.path.basename(self.files[i])}: {exc!r}")
+
+    # -- ROI sync -----------------------------------------------------
+    def _roi_drawn(self, roi) -> None:
+        if self._roi_syncing or self.roi is None:
+            return
+        self._roi_syncing = True
+        try:
+            self.roi.set("" if roi is None else ", ".join(str(v) for v in roi))
+        finally:
+            self._roi_syncing = False
+
+    def _roi_typed(self, text=None) -> None:
+        if self._roi_syncing:
+            return
+        import re
+        text = str(text if text is not None else self.roi.get() or "")
+        nums = re.findall("[0-9]+", text)
+        canvas = getattr(self.target, "widget", None)
+        setter = getattr(canvas, "set_roi", None)
+        if not callable(setter):
+            return
+        self._roi_syncing = True
+        try:
+            if not text.strip():
+                setter(None)
+            elif len(nums) == 4:
+                setter(tuple(int(n) for n in nums))
+            # Anything else is a half-typed box: leave the current one alone.
+        finally:
+            self._roi_syncing = False
 
     def _say(self, message) -> None:
         if self.status is not None:
@@ -1665,6 +1940,7 @@ def emit_ports(spec: Spec, aliases: Optional[Dict[str, str]] = None) -> str:
             continue
         folder, target = str(d.get("folder") or ""), str(d.get("target") or "")
         status = str(d.get("status") or "")
+        roi = str(d.get("roi") or "")
         index = w.port.name if w.port else ""
         if not (folder in by_port and target in by_port and index):
             # gui_spec.validate blocks this before emit is reached; the guard
@@ -1678,7 +1954,9 @@ def emit_ports(spec: Spec, aliases: Optional[Dict[str, str]] = None) -> str:
         L.append(f"            suffixes={_py(tuple(d.get('suffixes') or ()))},")
         L.append(f"            recursive={_py(bool(d.get('recursive')))},")
         L.append(f"            status_port="
-                 f"{('self.' + status) if status in by_port else 'None'})")
+                 f"{('self.' + status) if status in by_port else 'None'},")
+        L.append(f"            roi_port="
+                 f"{('self.' + roi) if roi in by_port else 'None'})")
     return "\n".join(L).rstrip() + "\n"
 
 

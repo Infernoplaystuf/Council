@@ -362,7 +362,7 @@ def test_the_index_folder_and_target_must_be_three_different_ports():
     scr.drives = {"folder": "capture_folder", "target": "capture_folder"}
     ok, errs = _validate(shapes)
     assert not ok
-    assert any("three DIFFERENT ports" in e for e in errs), errs
+    assert any("DIFFERENT port for each role" in e for e in errs), errs
 
 
 # ============================================================

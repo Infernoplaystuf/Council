@@ -293,6 +293,36 @@ def can_font(kind: str) -> bool:
     return kind in FONT_KINDS
 
 
+_INT_RE = re.compile(r"-?\d+")
+
+
+def tk_font(spec: str) -> str:
+    """A Tk font string that survives a family name containing spaces.
+
+    Tk reads "Segoe UI 12 bold" as family "Segoe", size "UI", and raises
+        TclError: expected integer but got "UI"
+    at widget construction — so a generated app whose wireframe names any
+    multi-word family (Segoe UI, Times New Roman, DejaVu Sans) died before its
+    window appeared, and gui_spec.validate let it through because the string
+    is well-formed text. Braces are Tk's own quoting: "{Segoe UI} 12 bold"
+    means exactly what the user typed.
+
+    The family is everything before the first integer token; the rest (size,
+    then styles) passes through untouched. A single-word family, an empty
+    string, or a spec already starting with "{" is returned as-is.
+    """
+    s = str(spec or "").strip()
+    if not s or s.startswith("{"):
+        return s
+    toks = s.split()
+    i = next((k for k, t in enumerate(toks) if _INT_RE.fullmatch(t)),
+             len(toks))
+    family, rest = toks[:i], toks[i:]
+    if len(family) <= 1:
+        return s
+    return " ".join(["{" + " ".join(family) + "}"] + rest)
+
+
 def caps(kind: str) -> Tuple[str, ...]:
     """Which of ("bg", "fg") ``kind`` can honour. Unknown kinds get none."""
     return COLOUR_CAPS.get(kind, ())
