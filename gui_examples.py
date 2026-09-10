@@ -100,6 +100,11 @@ PROMPT_EXAMPLES = ("barbie_capture_v2",)
 
 # The declarations a designing model most often gets wrong, stated once.
 DECLARATION_HELP = """\
+At the top level, "requires" lists every package the app imports beyond the
+stdlib, by IMPORT name (["pypylon", "numpy", "PIL"]). It is the only way an
+import gets past the policy gate, and each one is checked in the Python that
+will run the app before it starts.
+
 Beyond kind/label/x/y/w/h, a shape may declare:
 
   "bg" / "fg"   "#rrggbb". A widget with no bg inherits its container's, so
@@ -144,8 +149,10 @@ def _compact(spec: Dict[str, Any]) -> Dict[str, Any]:
     win = dict(spec.get("window") or {})
     out: Dict[str, Any] = {
         "window": {k: v for k, v in win.items() if v not in ("", 0, None)},
-        "shapes": [],
     }
+    if spec.get("requires"):
+        out["requires"] = list(spec["requires"])
+    out["shapes"] = []
     for s in spec.get("shapes") or []:
         keep: Dict[str, Any] = {"kind": s.get("kind")}
         if s.get("label"):

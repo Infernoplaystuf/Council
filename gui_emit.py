@@ -2210,6 +2210,56 @@ if __name__ == "__main__":
 '''
 
 
+def _requires_block(requires: Sequence[str]) -> str:
+    """Startup check for the project's declared packages.
+
+    Every entry is a STATIC import, so it passes the policy gate on exactly
+    the same terms as the app's own imports (a declared package is on this
+    project's allowlist) and needs neither importlib nor __import__, both of
+    which the gate refuses.
+
+    Launched from the designer, the message goes to stderr, which is the
+    designer's log. Launched by hand there is no log to read, so it is also
+    shown in a window — the designer marks its launches with
+    COUNCIL_PREVIEW_CONTROL, which is how the two are told apart."""
+    if not requires:
+        return ""
+    L = ["# -- declared packages (the project's `requires`) -----------------",
+         "# Checked BEFORE any widget exists: the wrong Python fails here with",
+         "# a list of what is missing, instead of a blank panel or a traceback",
+         "# on the first click.",
+         "_MISSING = []"]
+    for name in requires:
+        L += ["try:",
+              f"    import {name}  # noqa: F401",
+              "except Exception as _exc:",
+              f"    _MISSING.append(({name!r}, '%s: %s' % "
+              f"(type(_exc).__name__, _exc)))"]
+    L += ["if _MISSING:",
+          "    _LINES = ['This app cannot start under ' + sys.executable +",
+          "              ' because it is missing:']",
+          "    _LINES += ['  - %s (%s)' % _m for _m in _MISSING]",
+          "    _LINES.append(\"Choose a Python that has them (the GUI \"",
+          "                  \"Designer's 'Run with'), or install them into \"",
+          "                  \"this one.\")",
+          r'    _MSG = "\n".join(_LINES)',
+          r'    sys.stderr.write(_MSG + "\n")',
+          "    import os as _os",
+          "    if not _os.environ.get('COUNCIL_PREVIEW_CONTROL'):",
+          "        try:",
+          "            import tkinter as _tk",
+          "            from tkinter import messagebox as _mb",
+          "            _r = _tk.Tk()",
+          "            _r.withdraw()",
+          "            _mb.showerror('Missing packages', _MSG)",
+          "            _r.destroy()",
+          "        except Exception:",
+          "            pass",
+          "    raise SystemExit(3)",
+          ""]
+    return "\n".join(L)
+
+
 def emit_main_py(spec: Spec, project_dir: Path) -> str:
     """The entry point: `python main.py`.
 
@@ -2262,6 +2312,7 @@ from pathlib import Path
 {note}
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 {path_block}
+{_requires_block(spec.requires)}
 from app import main
 
 if __name__ == "__main__":

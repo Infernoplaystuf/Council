@@ -105,6 +105,7 @@ try:
     import gui_runner as _grun
     import gui_canvas as _gc
     import python_envs as _pe
+    import gui_runwith as _grw
     _GUI_DESIGNER_OK = True
 except Exception as _gd_exc:
     print(f"[GUI Designer] unavailable: {_gd_exc!r}")
@@ -11273,16 +11274,11 @@ class CouncilConsole(tk.Tk):
                           ("Review with Council", self._gd_review),
                           ("Detach", self._gd_detach)):
             ttk.Button(bar, text=text, command=cmd).pack(side="left", padx=2)
-        # Which Python runs the preview. Per project, stored in its manifest —
-        # a camera app needs its SDK's env, not the Council's own Python.
-        ttk.Label(bar, text="Run with:").pack(side="left", padx=(12, 2))
-        self._gd_python = tk.StringVar(value=_pe.DEFAULT_LABEL)
-        self._gd_python_box = ttk.Combobox(
-            bar, textvariable=self._gd_python, width=24, state="readonly",
-            postcommand=self._gd_python_fill)
-        self._gd_python_box.pack(side="left")
-        self._gd_python_box.bind("<<ComboboxSelected>>", self._gd_python_picked)
-        self._gd_python_fill()
+        # Which Python runs the preview — per project, in its manifest. A
+        # camera app needs its SDK's env, not the Council's own Python.
+        self._gd_runwith = _grw.RunWithBox(bar, get_dir=self._gd_dir,
+                                           log=lambda t: self._gd_log(t))
+        self._gd_runwith.pack(side="left", padx=(12, 0))
         self._gd_status = tk.StringVar(value="no project")
         ttk.Label(bar, textvariable=self._gd_status,
                   foreground="#a6adc8").pack(side="right")
@@ -11350,69 +11346,6 @@ class CouncilConsole(tk.Tk):
             return None
         return _gp.project_path(self._gd_project, VAULT_DIR)
 
-    # ---- Run with: which Python runs this project ----
-    _GD_BROWSE = "Browse for python.exe..."
-
-    def _gd_python_display(self, spec: str) -> str:
-        if not spec:
-            return _pe.DEFAULT_LABEL
-        return spec if _pe.looks_like_path(spec) else f"conda: {spec}"
-
-    def _gd_python_fill(self) -> None:
-        """Refresh the list each time it opens — an env created since the
-        Council started should appear without a restart."""
-        values = [_pe.DEFAULT_LABEL] + [f"conda: {n}" for n, _ in
-                                        _pe.list_envs()]
-        cur = self._gd_python.get()
-        if cur and cur not in values and cur != self._GD_BROWSE:
-            values.append(cur)            # an explicit python.exe path
-        self._gd_python_box.configure(values=values + [self._GD_BROWSE])
-
-    def _gd_python_sync(self) -> None:
-        """Show the open project's setting."""
-        pdir = self._gd_dir()
-        spec = ""
-        if pdir:
-            try:
-                spec = _gp.load_manifest(pdir).python
-            except Exception:
-                spec = ""
-        self._gd_python.set(self._gd_python_display(spec))
-
-    def _gd_python_picked(self, _e=None) -> None:
-        choice = self._gd_python.get()
-        pdir = self._gd_dir()
-        if not pdir:
-            messagebox.showinfo("Run with", "Open or create a project first — "
-                                "the choice is saved with the project.")
-            self._gd_python.set(_pe.DEFAULT_LABEL)
-            return
-        if choice == self._GD_BROWSE:
-            from tkinter import filedialog
-            path = filedialog.askopenfilename(
-                parent=self, title="Choose the Python that runs this project",
-                filetypes=[("Python", "python*.exe python python3"),
-                           ("All files", "*.*")])
-            if not path:
-                self._gd_python_sync()
-                return
-            spec = path
-        elif choice == _pe.DEFAULT_LABEL:
-            spec = ""
-        elif choice.startswith("conda: "):
-            spec = choice[len("conda: "):]
-        else:
-            spec = choice
-        try:
-            man = _gp.load_manifest(pdir)
-            man.python = spec
-            _gp.save_manifest(pdir, man)
-        except Exception as exc:
-            messagebox.showerror("Run with", str(exc))
-        self._gd_python_sync()
-        self._gd_log(f"Run with: {self._gd_python.get()} — checked when you "
-                     f"press Run")
-
     def _gd_wizard(self):
         """Guided start. The wizard writes nothing — it hands back a layout and
         this applies it — so cancelling leaves no half-made project behind."""
@@ -11447,7 +11380,7 @@ class CouncilConsole(tk.Tk):
         self._gd_project = res.name
         self.gui_canvas.load(res.shapes)
         self.gui_canvas.mark_saved()
-        self._gd_python_sync()
+        self._gd_runwith.sync()
         self._gd_log(f"created {res.name} ({res.mode}) from the wizard")
         self._gd_changed()
 
@@ -11469,7 +11402,7 @@ class CouncilConsole(tk.Tk):
         self._gd_project = name
         self.gui_canvas.load([])
         self._gd_wire_window()
-        self._gd_python_sync()
+        self._gd_runwith.sync()
         self._gd_log(f"created {name} ({mode})")
         self._gd_changed()
 
@@ -11495,7 +11428,7 @@ class CouncilConsole(tk.Tk):
         self._gd_project = name
         self.gui_canvas.load(proj.shapes)
         self._gd_wire_window()
-        self._gd_python_sync()
+        self._gd_runwith.sync()
         self._gd_log(f"opened {name} ({len(proj.shapes)} shape(s))")
         self._gd_changed()
 
@@ -11511,14 +11444,20 @@ class CouncilConsole(tk.Tk):
 
         def _apply(values):
             for k, v in values.items():
-                if hasattr(proj.window, k):
+                if k == "requires":     # project-level, edited in this panel
+                    proj.requires = _gpol.parse_requires(v)
+                elif hasattr(proj.window, k):
                     setattr(proj.window, k, v)
+            for e in _gpol.check_requires(proj.requires):
+                self._gd_log(f"! {e}")
             proj.shapes = self.gui_canvas.export()
             _gp.save_project(self._gd_project, proj, vault_dir=VAULT_DIR)
             self.gui_canvas.mark_saved()
             self._gd_log(f"window: bg={proj.window.bg or '(none)'} "
-                         f"title={proj.window.title!r}")
-        self.gui_canvas.attach_window(proj.window, _apply)
+                         f"title={proj.window.title!r} "
+                         f"requires={', '.join(proj.requires) or '(none)'}")
+        self.gui_canvas.attach_window(proj.window, _apply,
+                                      requires=getattr(proj, "requires", []))
 
     def _gd_save(self):
         if not self._gd_project:
@@ -11577,7 +11516,8 @@ class CouncilConsole(tk.Tk):
                     min_w=proj.window.min_w, min_h=proj.window.min_h,
                     root_bg=getattr(proj.window, "bg", "") or "",
                     root_fg=getattr(proj.window, "fg", "") or "",
-                    root_font=getattr(proj.window, "font", "") or "")
+                    root_font=getattr(proj.window, "font", "") or "",
+                    requires=getattr(proj, "requires", []) or [])
                 for w in tree.warnings:
                     out.append(f"warning: {w}")
 
@@ -11627,17 +11567,14 @@ class CouncilConsole(tk.Tk):
                                + ", ".join(res.handlers_added))
                 out.extend(res.warnings)
 
-                # Every hand-editable and generated .py at the top level. The
-                # list is built from what EXISTS so the launch.py shim left
-                # behind by the main.py rename is gated too — an ungated file
-                # in the project is a hole in the gate.
-                pol_ok, pol_errs = _gpol.validate_project(
-                    sorted((pdir / "ui").glob("*.py"))
-                    + [p for p in (pdir / "app.py", pdir / "handlers.py",
-                                   pdir / "main.py", pdir / "launch.py")
-                       if p.is_file()], man.mode)
+                # The project's declared `requires` widen its allowlist — a
+                # camera app's SDK — and nothing else does. Run applies the
+                # same gate, so this message is now a promise, not a warning.
+                pol_ok, pol_errs = _gpol.validate_dir(
+                    pdir, man.mode, spec.requires)
                 out.append("policy: OK" if pol_ok
-                           else "policy REFUSED (the app will not run it):")
+                           else "policy REFUSED — Run will not start it until "
+                                "this is fixed:")
                 out.extend("  " + e for e in pol_errs)
 
                 man.widget_names = spec.name_registry()
@@ -11670,50 +11607,18 @@ class CouncilConsole(tk.Tk):
             messagebox.showinfo("Run", "No project open.")
             return
 
-        def _line(text, level):
-            self.after(0, lambda: self._gd_log(
-                ("! " if level == "error" else "  ") + text))
-
         try:
-            spec = _gp.load_manifest(pdir).python
-        except Exception:
-            spec = ""
-        requires = self._gd_requires()
-
-        # The chosen Python checks ITSELF before anything launches: tkinter,
-        # every required package (imported, so a wrong-ABI build is caught),
-        # and that the generated files compile under it. Off the Tk thread —
-        # importing a vendor SDK can take seconds.
-        self._gd_log(f"checking {self._gd_python_display(spec)} ...")
-
-        def _check():
-            res = _pe.resolve(spec)
-            pr = None if res.error else _pe.probe(
-                res.python, modules=requires, files=_pe.project_files(pdir))
-            self.after(0, lambda: _launch(res, pr))
-
-        def _launch(res, pr):
-            for ln in _pe.describe(res, pr):
-                self._gd_log(("! " if ln.startswith(("Not", "  -")) else "  ")
-                             + ln)
-            if res.error or pr is None or not pr.ok:
-                return
-            try:
-                pv = _grun.start(pdir, on_line=_line, python=res.python)
-                self._gd_log(f"preview running (pid {pv.pid})")
-            except Exception as exc:
-                self._gd_log(f"could not start preview: {exc}")
-
-        threading.Thread(target=_check, name="gd-run-check",
-                         daemon=True).start()
-
-    def _gd_requires(self):
-        """The open project's declared packages ([] until it declares any)."""
-        try:
-            proj = _gp.open_project(self._gd_project, vault_dir=VAULT_DIR)
-            return list(getattr(proj, "requires", None) or [])
-        except Exception:
-            return []
+            man = _gp.load_manifest(pdir)
+            reqs = _gp.open_project(self._gd_project, vault_dir=VAULT_DIR).requires
+        except Exception as exc:
+            self._gd_log(f"could not start preview: {exc}")
+            return
+        # Policy gate (ENFORCED here now — it used to say "the app will not
+        # run it" while Run launched it anyway), interpreter, self-check,
+        # launch. Off the Tk thread; see gui_runner.run_checked.
+        _grun.run_checked(pdir, python_spec=man.python, mode=man.mode,
+                          requires=reqs, log=self._gd_log,
+                          call_soon=lambda fn: self.after(0, fn))
 
     def _gd_stop(self):
         pdir = self._gd_dir()

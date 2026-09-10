@@ -5,9 +5,13 @@
     "w": 1280
   },
   "clarifications": [],
-  "gspec_version": 2,
+  "gspec_version": 3,
   "mode": "linked",
   "project": "barbie_capture_v2",
+  "requires": [
+    "numpy",
+    "PIL"
+  ],
   "shapes": [
     {
       "bg": "",

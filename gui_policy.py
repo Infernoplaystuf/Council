@@ -114,19 +114,74 @@ def _stdlib_names() -> Set[str]:
     }
 
 
-def allowed_modules(mode: str) -> Set[str]:
-    """Every root module name importable in ``mode``."""
+def _roots(names: Sequence[str]) -> Set[str]:
+    return {str(n).strip().split(".")[0] for n in names if str(n).strip()}
+
+
+def allowed_modules(mode: str, extra: Sequence[str] = ()) -> Set[str]:
+    """Every root module name importable in ``mode``.
+
+    ``extra`` is the project's declared `requires` — a camera app's SDK. It
+    widens the allowlist for THAT project only, so an import nobody declared
+    is still refused, and it can never re-admit a denied module: that
+    subtraction happens last."""
     base = _stdlib_names() | set(THIRD_PARTY) | set(PROJECT_MODULES)
     if mode == "linked":
         base |= set(LINKED_MODULES)
+    base |= _roots(extra)
     return base - set(DENIED_MODULES)
 
 
-def validate(code: str, mode: str = "linked") -> Tuple[bool, List[str]]:
+def parse_requires(text) -> List[str]:
+    """'pypylon, numpy PIL' -> ['pypylon', 'numpy', 'PIL'].
+
+    Commas or whitespace separate; order is kept and repeats dropped, so what
+    the user typed is what the gspec stores. Validity is check_requires' job."""
+    out: List[str] = []
+    for part in str(text or "").replace(",", " ").split():
+        if part not in out:
+            out.append(part)
+    return out
+
+
+def check_requires(names: Sequence[str]) -> List[str]:
+    """Problems with a project's declared `requires`, one message each.
+
+    Declaring a package is how a project widens its own allowlist, so the
+    declaration itself is gated: a denied module (subprocess, socket, pickle,
+    ...) and council_engine cannot be declared into it."""
+    errs: List[str] = []
+    seen: Set[str] = set()
+    for raw in names:
+        name = str(raw).strip()
+        if not name:
+            continue
+        parts = name.split(".")
+        if not all(p.isidentifier() for p in parts):
+            errs.append(f"requires {name!r} is not an importable module name "
+                        f"(use the IMPORT name — PIL, not Pillow)")
+            continue
+        root = parts[0]
+        if root in DENIED_MODULES:
+            errs.append(f"requires {name!r}: {root!r} is never permitted in a "
+                        f"generated app, declared or not")
+        elif root == "council_engine":
+            errs.append("requires 'council_engine': it would build a second "
+                        "GGUF singleton inside the app")
+        if name in seen:
+            errs.append(f"requires {name!r} is listed twice")
+        seen.add(name)
+    return errs
+
+
+def validate(code: str, mode: str = "linked",
+             extra_modules: Sequence[str] = ()) -> Tuple[bool, List[str]]:
     """(ok, errors) for one source file.
 
     Returns EVERY fault, like gui_spec.validate — a user fixing generated or
-    hand-written code should see the whole list, not one per run."""
+    hand-written code should see the whole list, not one per run.
+
+    ``extra_modules`` is the project's declared `requires`."""
     errs: List[str] = []
     if mode not in MODES:
         return False, [f"unknown import mode {mode!r}; expected one of {MODES}"]
@@ -135,7 +190,7 @@ def validate(code: str, mode: str = "linked") -> Tuple[bool, List[str]]:
     except SyntaxError as exc:
         return False, [f"does not parse: line {exc.lineno}: {exc.msg}"]
 
-    allowed = allowed_modules(mode)
+    allowed = allowed_modules(mode, extra_modules)
 
     for node in ast.walk(tree):
         # ---- imports ----
@@ -203,7 +258,8 @@ def _check_import(root: str, node: ast.AST, mode: str, allowed: Set[str],
             f"line {line}: {root!r} is an app module, so this project is not "
             f"standalone. Switch the project to linked mode, or remove it.")
         return
-    errs.append(f"line {line}: {root!r} is not on the {mode} allowlist")
+    errs.append(f"line {line}: {root!r} is not on the {mode} allowlist — if "
+                f"the app needs it, add it to the project's requires")
 
 
 def _receiver_name(node: ast.AST) -> str:
@@ -217,11 +273,34 @@ def _receiver_name(node: ast.AST) -> str:
     return ""
 
 
-def validate_project(paths: Sequence, mode: str = "linked"
-                     ) -> Tuple[bool, List[str]]:
-    """Validate several files, prefixing each fault with its filename."""
+def project_sources(pdir) -> list:
+    """Every .py a generated project runs: ui/, the hand-written files and
+    the entry points. Built from what EXISTS, so the launch.py shim left in
+    older projects is gated too — an ungated file is a hole in the gate."""
     from pathlib import Path
-    all_errs: List[str] = []
+    pdir = Path(pdir)
+    return (sorted((pdir / "ui").glob("*.py"))
+            + [p for p in (pdir / "app.py", pdir / "handlers.py",
+                           pdir / "main.py", pdir / "launch.py")
+               if p.is_file()])
+
+
+def validate_dir(pdir, mode: str = "linked",
+                 extra_modules: Sequence[str] = ()) -> Tuple[bool, List[str]]:
+    """The gate over a whole project directory. The one call Generate, Run
+    and run_example_gui all make, so they cannot disagree about a project."""
+    return validate_project(project_sources(pdir), mode, extra_modules)
+
+
+def validate_project(paths: Sequence, mode: str = "linked",
+                     extra_modules: Sequence[str] = ()
+                     ) -> Tuple[bool, List[str]]:
+    """Validate several files, prefixing each fault with its filename.
+
+    ``extra_modules`` is the project's declared `requires`; a bad declaration
+    is itself a fault."""
+    from pathlib import Path
+    all_errs: List[str] = list(check_requires(extra_modules))
     for p in paths:
         p = Path(p)
         try:
@@ -229,6 +308,6 @@ def validate_project(paths: Sequence, mode: str = "linked"
         except OSError as exc:
             all_errs.append(f"{p.name}: cannot read ({exc})")
             continue
-        ok, errs = validate(src, mode)
+        ok, errs = validate(src, mode, extra_modules)
         all_errs.extend(f"{p.name}: {e}" for e in errs)
     return (not all_errs), all_errs

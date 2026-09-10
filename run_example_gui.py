@@ -78,7 +78,8 @@ def build(name: str, *, project: str = "", force: bool = False,
     spec = gsp.build(proj.shapes, tree, project=project,
                      title=proj.window.title,
                      root_bg=proj.window.bg, root_fg=proj.window.fg,
-                     root_font=proj.window.font)
+                     root_font=proj.window.font,
+                     requires=proj.requires)
     ok, errs = gsp.validate(spec)
     if not ok:
         # An example that cannot generate is a bug in the example, and saying
@@ -139,20 +140,22 @@ def main(argv=None) -> int:
     pdir = build(args.example, project=args.project, force=args.force,
                  python=args.python)
     entry = pdir / "main.py"
-    pr = pe.probe(res.python, modules=_requires_of(pdir),
-                  files=pe.project_files(pdir))
+    # The same preflight the designer's Run makes — policy gate (this path
+    # used to have none at all), interpreter, self-check.
+    pf = pe.preflight(pdir, args.python, gpj.load_manifest(pdir).mode,
+                      _requires_of(pdir))
     print()
-    for line in pe.describe(res, pr):
+    for line in pf.lines:
         print(line)
-    if not pr.ok:
+    if not pf.ok:
         return 1
     if args.no_run:
-        print(f'\nrun it with:  "{res.python}" "{entry}"')
+        print(f'\nrun it with:  "{pf.python}" "{entry}"')
         return 0
 
     print(f"\nlaunching {pdir.name} — close the window to return")
     import subprocess
-    return subprocess.call([res.python, str(entry)], cwd=str(pdir))
+    return subprocess.call([pf.python, str(entry)], cwd=str(pdir))
 
 
 def _requires_of(pdir: Path):

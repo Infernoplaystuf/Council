@@ -129,7 +129,10 @@ def test_generate_blocks_on_orphans_and_backs_up_first():
     assert "find_orphans" in src, "regeneration must not break app.py silently"
     i_backup, i_emit = src.index("backup("), src.index("emit(")
     assert i_backup < i_emit, "the backup has to happen BEFORE anything is written"
-    assert "validate_project" in src, "emitted code is policy-checked"
+    # validate_dir is validate_project over the project's own file list —
+    # the one call Generate, Run and run_example_gui share.
+    assert "validate_dir" in src or "validate_project" in src, \
+        "emitted code is policy-checked"
 
 
 # ============================================================

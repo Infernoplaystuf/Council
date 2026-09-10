@@ -167,6 +167,9 @@ class Spec:
     root_row_minsizes: List[int] = field(default_factory=list)
     root_col_minsizes: List[int] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    # Declared packages (Project.requires): checked at startup by the
+    # generated main.py, and the project's additions to the policy allowlist.
+    requires: List[str] = field(default_factory=list)
 
     def by_name(self, name: str) -> Optional[WidgetSpec]:
         for w in self.widgets:
@@ -243,7 +246,8 @@ def build(shapes: Sequence[Shape], layout_tree: Any,
           title: str = "Untitled", min_w: int = 900,
           min_h: int = 600,
           root_bg: str = "", root_fg: str = "",
-          root_font: str = "") -> Spec:
+          root_font: str = "",
+          requires: Sequence[str] = ()) -> Spec:
     """Assemble the IR.
 
     ``classifications`` maps shape id -> {"kind", "props"} for shapes the model
@@ -257,7 +261,8 @@ def build(shapes: Sequence[Shape], layout_tree: Any,
     of retyping a label (§3 in the build spec)."""
     spec = Spec(project=project, mode=mode, title=title,
                 min_w=min_w, min_h=min_h,
-                root_bg=root_bg, root_fg=root_fg, root_font=root_font)
+                root_bg=root_bg, root_fg=root_fg, root_font=root_font,
+                requires=[str(r).strip() for r in requires if str(r).strip()])
     spec.warnings.extend(getattr(layout_tree, "warnings", []) or [])
     nodes = getattr(layout_tree, "nodes", {}) or {}
     reg = dict(registry or {})
@@ -414,7 +419,10 @@ def validate(spec: Spec) -> Tuple[bool, List[str]]:
     A generator that stopped at the first problem would make the user fix one
     thing, regenerate, and discover the next — turning a five-minute correction
     into five rounds."""
-    errs: List[str] = []
+    # A declared package widens this project's policy allowlist, so the
+    # declaration is gated too: no denied module, no council_engine.
+    import gui_policy as _gpol
+    errs: List[str] = list(_gpol.check_requires(spec.requires))
     seen: Dict[str, str] = {}
     seen_ports: Dict[str, str] = {}   # port name -> shape id
     driven_sinks: Dict[str, str] = {}  # target port name -> driving widget

@@ -45,7 +45,12 @@ from typing import Any, Dict, List, Optional
 # ports still SAVES as v1 — see required_version below — so older builds keep
 # opening pure-wireframe projects, and only projects that actually declare a
 # port are refused by them.
-GSPEC_VERSION = 2
+#
+# v3 adds Project.requires. Same content stamping: only a project that declares
+# a package saves as v3. An older build would otherwise drop the list without a
+# word and then refuse the vendor import it was meant to permit — so it is
+# better that it refuses the file up front, with the message load_gspec gives.
+GSPEC_VERSION = 3
 
 # Resize modes. "auto" is resolved at layout time and never survives into an
 # emitted spec (spec 4.1).
@@ -529,6 +534,14 @@ class Project:
     shapes: List[Shape] = field(default_factory=list)
     clarifications: List[Clarification] = field(default_factory=list)
     gspec_version: int = GSPEC_VERSION
+    # Packages the generated app imports beyond the stdlib, by IMPORT name
+    # ("pypylon", "PIL", "metavision_core"). Two jobs: each one is checked
+    # against the interpreter that will run the app before it launches, and
+    # each one is ADDED to the policy allowlist for this project only — an
+    # import nobody declared is still refused. Portable, unlike the
+    # interpreter (which lives in the machine's manifest): the wireframe says
+    # what it needs, each machine says which Python provides it.
+    requires: List[str] = field(default_factory=list)
 
     def shape_by_id(self, sid: str) -> Optional[Shape]:
         for s in self.shapes:
@@ -550,6 +563,8 @@ def required_version(project: "Project") -> int:
     load_gspec already emits) instead of dropping the data. The previous
     behaviour of stamping ``p.gspec_version`` back was a live bug — this
     function is the fix, extended here for colour."""
+    if getattr(project, "requires", None):
+        return 3
     if any(getattr(s, "port", None) or getattr(s, "script", None)
            or getattr(s, "drives", None)
            for s in project.shapes):
@@ -572,6 +587,7 @@ def _project_to_dict(p: Project) -> Dict[str, Any]:
         "window": asdict(p.window),
         "shapes": [asdict(s) for s in p.shapes],
         "clarifications": [asdict(c) for c in p.clarifications],
+        **({"requires": list(p.requires)} if p.requires else {}),
     }
 
 
@@ -666,4 +682,6 @@ def load_gspec(path: Any) -> Project:
         shapes=shapes,
         clarifications=clars,
         gspec_version=ver,
+        requires=[str(r).strip() for r in (raw.get("requires") or [])
+                  if str(r).strip()],
     )

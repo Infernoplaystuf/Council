@@ -288,6 +288,43 @@ def start(project, *, on_line: Optional[Callable[[str, str], None]] = None,
     return pv
 
 
+def run_checked(project, *, python_spec: str = "", mode: str = "linked",
+                requires=(), log: Callable[[str], None],
+                call_soon: Callable[[Callable[[], None]], None]
+                ) -> threading.Thread:
+    """The designer's Run: preflight, then launch — without freezing the UI.
+
+    The preflight (policy gate, interpreter, its self-check — see
+    python_envs.preflight) runs on a worker thread, because importing a
+    vendor SDK to check it can take seconds. Everything that touches the UI —
+    each log line and the launch — is handed back through ``call_soon``
+    (for Tk: ``lambda fn: widget.after(0, fn)``). Returns the worker thread."""
+    import python_envs
+
+    def _line(text, level):
+        call_soon(lambda: log(("! " if level == "error" else "  ") + text))
+
+    def _launch(pf):
+        for ln in pf.lines:
+            log(("! " if ln.startswith(("Not", "  -")) else "  ") + ln)
+        if not pf.ok:
+            return
+        try:
+            pv = start(project, on_line=_line, python=pf.python)
+            log(f"preview running (pid {pv.pid})")
+        except Exception as exc:
+            log(f"could not start preview: {exc}")
+
+    def _check():
+        pf = python_envs.preflight(project, python_spec, mode, requires)
+        call_soon(lambda: _launch(pf))
+
+    log(f"checking {python_envs.display(python_spec)} ...")
+    t = threading.Thread(target=_check, name="run-checked", daemon=True)
+    t.start()
+    return t
+
+
 def _listens_for_stop(proj: Path) -> bool:
     """Whether this project's generated UI carries the stop listener."""
     try:

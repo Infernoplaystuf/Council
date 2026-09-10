@@ -274,6 +274,68 @@ def describe(res: Resolved, pr: Optional[Probe]) -> List[str]:
     return out
 
 
+@dataclass
+class Preflight:
+    """Everything that must hold before a generated app launches."""
+    ok: bool
+    python: str                 # the interpreter to launch with, when ok
+    lines: List[str]            # for the log; the first says go or no-go
+
+
+def preflight(pdir, spec: str, mode: str = "linked",
+              requires: Sequence[str] = ()) -> Preflight:
+    """The whole pre-launch check, in the order a user needs the answers:
+
+      1. the policy gate — with the project's `requires` on its allowlist
+      2. the interpreter named in the manifest exists
+      3. that interpreter can run THIS app (probe)
+
+    One function for the designer's Run and for run_example_gui, so the two
+    cannot disagree about whether a project may start."""
+    import gui_policy
+    ok, errs = gui_policy.validate_dir(pdir, mode, requires)
+    if not ok:
+        return Preflight(False, "", ["Not started: the policy gate refused "
+                                     "this code:"] + ["  - " + e for e in errs])
+    res = resolve(spec)
+    pr = None if res.error else probe(res.python, modules=list(requires),
+                                      files=project_files(pdir))
+    good = not res.error and pr is not None and pr.ok
+    return Preflight(good, res.python if good else "", describe(res, pr))
+
+
+# -- the designer's "Run with" choices ----------------------------------
+BROWSE_LABEL = "Browse for python.exe..."
+_CONDA_PREFIX = "conda: "
+
+
+def display(spec: str) -> str:
+    """How a manifest setting reads in the dropdown."""
+    spec = str(spec or "")
+    if not spec:
+        return DEFAULT_LABEL
+    return spec if looks_like_path(spec) else _CONDA_PREFIX + spec
+
+
+def choices(current: str = "") -> List[str]:
+    """Dropdown values: the default, every conda env, the current explicit
+    path if there is one, and Browse. Rebuilt each time it opens, so an env
+    created since the Council started appears without a restart."""
+    values = [DEFAULT_LABEL] + [_CONDA_PREFIX + n for n, _ in list_envs()]
+    if current and current not in values and current != BROWSE_LABEL:
+        values.append(current)
+    return values + [BROWSE_LABEL]
+
+
+def spec_from_choice(choice: str) -> str:
+    """The manifest setting for a dropdown choice (not BROWSE_LABEL)."""
+    if choice == DEFAULT_LABEL:
+        return ""
+    if choice.startswith(_CONDA_PREFIX):
+        return choice[len(_CONDA_PREFIX):]
+    return choice
+
+
 def project_files(pdir) -> List[str]:
     """Every .py a generated project runs, for the compile check."""
     pdir = Path(pdir)

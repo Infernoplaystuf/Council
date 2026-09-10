@@ -384,12 +384,18 @@ class DesignerCanvas(ttk.Frame):
     # -- public API ---------------------------------------------------
 
     def attach_window(self, window,
-                      on_window: Callable[[Dict[str, Any]], None]) -> None:
+                      on_window: Callable[[Dict[str, Any]], None],
+                      requires: Optional[Sequence[str]] = None) -> None:
         """Tell the inspector's "nothing selected" panel about the project's
         Window. Called by the tab when a project is opened or created, so the
-        window title / size / colour become editable without a project dialog."""
+        window title / size / colour become editable without a project dialog.
+
+        ``requires`` is the project's declared packages. It is not a Window
+        property, but it is project-level like one, so it is edited in the
+        same panel and handed back to ``on_window`` as a "requires" key."""
         self.inspector._window = window
         self.inspector._on_window = on_window
+        self.inspector._requires = list(requires or [])
         if not self.selection:
             self.inspector._empty()
 
@@ -1605,6 +1611,7 @@ class _Inspector(ttk.Frame):
         self._on_apply = on_apply
         self._on_window = on_window       # invoked with {title/min_w/min_h/bg/fg}
         self._window = window             # gui_shapes.Window instance
+        self._requires: List[str] = []    # the project's declared packages
         self._vars: Dict[str, tk.Variable] = {}
         self._prop_vars: Dict[str, tk.Variable] = {}
         self._port_vars: Dict[str, tk.Variable] = {}
@@ -1698,6 +1705,12 @@ class _Inspector(ttk.Frame):
         self._colour_field("bg", w.bg, target=self._win_vars)
         ttk.Label(self.body, text="Text colour").pack(anchor="w")
         self._colour_field("fg", w.fg, target=self._win_vars)
+        ttk.Separator(self.body).pack(fill="x", pady=6)
+        # What the app imports beyond the stdlib — a camera SDK, PIL, numpy.
+        # Checked in the chosen Python before Run, and the only way a
+        # package gets onto this project's policy allowlist.
+        self._winrow("requires", "Packages it needs (import names, "
+                     "comma-separated)", ", ".join(self._requires))
         ttk.Button(self.body, text="Apply", command=self._apply_window).pack(
             anchor="w", pady=(8, 0))
 

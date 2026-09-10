@@ -194,6 +194,97 @@ def test_run_example_records_the_choice_and_refuses_a_missing_env(
     assert "no conda env named" in str(exc.value)
 
 
+# ============================================================
+# preflight / run_checked / the Run-with widget — the logic that used to
+# live inside the designer tab, where nothing could test it
+# ============================================================
+
+def _built(tmp_path, name="pre"):
+    import run_example_gui as rex
+    return rex.build("barbie_capture", project=name, vault_dir=tmp_path)
+
+
+def test_preflight_passes_a_clean_project(tmp_path):
+    pf = pe.preflight(_built(tmp_path), "")
+    assert pf.ok and pf.python == sys.executable
+    assert pf.lines[0].startswith("Run with")
+
+
+def test_preflight_stops_at_the_gate_before_touching_any_python(tmp_path):
+    pdir = _built(tmp_path)
+    h = pdir / "handlers.py"
+    h.write_text("from pypylon import pylon\n" + h.read_text(encoding="utf-8"),
+                 encoding="utf-8")
+    pf = pe.preflight(pdir, "definitely_not_an_env_xyz")
+    assert not pf.ok and pf.python == ""
+    assert "policy gate refused" in pf.lines[0]
+    assert any("pypylon" in l for l in pf.lines)
+
+
+def test_preflight_reports_a_declared_package_the_python_lacks(tmp_path):
+    pf = pe.preflight(_built(tmp_path), "", requires=["definitely_missing_xyz"])
+    assert not pf.ok
+    assert any("missing definitely_missing_xyz" in l for l in pf.lines)
+
+
+@pytest.mark.parametrize("spec", ["", "pylon", r"C:\envs\cam\python.exe"])
+def test_dropdown_choices_round_trip_to_the_setting(spec):
+    assert pe.spec_from_choice(pe.display(spec)) == spec
+
+
+def test_dropdown_lists_default_envs_and_browse():
+    vals = pe.choices()
+    assert vals[0] == pe.DEFAULT_LABEL and vals[-1] == pe.BROWSE_LABEL
+    assert pe.choices(r"C:\x\python.exe")[-2] == r"C:\x\python.exe"
+
+
+def test_run_checked_launches_through_the_callbacks(tmp_path):
+    """The designer's Run, with Tk's after() replaced by a plain queue: every
+    UI touch must go through call_soon, so the worker never touches Tk."""
+    import queue
+    pdir = _built(tmp_path, "rc")
+    log, q = [], queue.Queue()
+    t = run.run_checked(pdir, log=log.append, call_soon=q.put)
+    t.join(timeout=90)
+    end = time.time() + 30
+    while time.time() < end and not any("preview running" in l for l in log):
+        try:
+            q.get(timeout=0.5)()
+        except queue.Empty:
+            pass
+    try:
+        assert log[0].startswith("checking")
+        assert any("ready" in l for l in log)
+        assert any("preview running" in l for l in log)
+    finally:
+        run.stop(pdir, grace=3)
+
+
+def test_the_run_with_widget_saves_to_the_open_project(tmp_path, tk_root):
+    import tkinter as tk
+    import gui_runwith as grw
+    py = pe.find_env("council")
+    if not py:
+        pytest.skip("conda env 'council' not on this machine")
+    pdir = _built(tmp_path, "rw")
+    top = tk.Toplevel(tk_root)
+    try:
+        logged = []
+        box = grw.RunWithBox(top, get_dir=lambda: pdir, log=logged.append)
+        box.sync()
+        assert box.var.get() == pe.DEFAULT_LABEL
+        box.fill()
+        assert "conda: council" in box.box.cget("values")
+        box.var.set("conda: council")
+        box._picked()
+        assert gpj.load_manifest(pdir).python == "council"
+        box.var.set("something else")
+        box.sync()
+        assert box.var.get() == "conda: council"
+    finally:
+        top.destroy()
+
+
 def test_project_files_are_everything_the_app_runs(tmp_path):
     import run_example_gui as rex
     pdir = rex.build("barbie_capture", project="pf", vault_dir=tmp_path)

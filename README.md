@@ -512,18 +512,18 @@ the box into a new `roi_…` subfolder of the folder you choose; it never writes
 into the capture folder or overwrites anything. `barbie_capture` (v1) is kept
 alongside it so the two can be compared.
 
-**What you need:** Python 3.10+ with `tkinter` builds the example and opens its
-window. To *use* it — show frames, crop them, and scan for bad timings — you
-also need **Pillow** and **numpy**:
+**What you need:** Python 3.10+ with `tkinter`, plus **Pillow** and **numpy**
+for v2 (it shows frames, crops them, and scans them):
 
 ```bash
 python -m pip install Pillow numpy
 ```
 
-Without Pillow the live view stays blank and saving reports why; without
-numpy the bad-timing scan does not work. You do **not** need
-`requirements.txt` for this — that file covers the whole Council app (models,
-RAG, plotting, speech) and is a much larger install.
+v2 *declares* those two in its `requires`, so under a Python that lacks either
+it says so at startup and exits, rather than opening a window whose live view
+stays blank. You do **not** need `requirements.txt` for this — that file
+covers the whole Council app (models, RAG, plotting, speech) and is a much
+larger install.
 
 > On most Linux distros `tkinter` is a separate package — `sudo apt install
 > python3-tk` (Debian/Ubuntu) or `sudo dnf install python3-tkinter` (Fedora).
@@ -565,6 +565,13 @@ files compile under its version — and says plainly what is missing instead of
 failing at the first click. The choice is saved in the project's
 `manifest.json`, not the wireframe, so a wireframe stays portable between
 machines.
+
+**Declare what the app imports.** With nothing selected, the inspector's
+window panel has *Packages it needs* — e.g. `pypylon, numpy, PIL` (import
+names, so `PIL` not `Pillow`). Each one is added to that project's policy
+allowlist, is checked in the chosen Python before Run, and is checked again
+when the app starts. An import that isn't declared is refused, and modules the
+app may never use (`subprocess`, `socket`, `pickle`, …) cannot be declared.
 
 ### Then edit it in the app
 
