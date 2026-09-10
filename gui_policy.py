@@ -53,8 +53,13 @@ LINKED_MODULES = frozenset({
 THIRD_PARTY = frozenset({"pandas", "numpy", "matplotlib", "PIL", "pillow"})
 
 # The generated project's own modules.
-PROJECT_MODULES = frozenset({"ui", "app", "handlers", "launch", "widgets",
-                             "main_ui"})
+# "main" is the entry point since the launch.py -> main.py rename, and the
+# launch.py shim left in older projects is literally `from main import main`.
+# Without it here that shim — generated code — failed the project's own gate,
+# so every older project reported "policy REFUSED" on Generate while running
+# fine, which teaches a user to ignore the one message that matters.
+PROJECT_MODULES = frozenset({"ui", "app", "handlers", "launch", "main",
+                             "widgets", "main_ui"})
 
 # Denied in BOTH modes. Each escapes the process, executes arbitrary text, or
 # deserialises into live objects.

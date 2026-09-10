@@ -354,6 +354,25 @@ def test_an_existing_launch_py_becomes_a_shim_rather_than_being_deleted(tmp_path
     ast.parse(shim)
 
 
+def test_the_launch_shim_passes_the_projects_own_policy():
+    """MEASURED REGRESSION: the shim is generated code, and it failed the
+    gate with "'main' is not on the linked allowlist" — so every older project
+    reported 'policy REFUSED' on Generate while running fine."""
+    import gui_policy as pol
+    for mode in pol.MODES:
+        ok, errs = pol.validate(ge.LAUNCH_SHIM, mode)
+        assert ok, (mode, errs)
+
+
+def test_the_two_allowlist_copies_cannot_drift():
+    """gui_emit writes LINKED_ALLOWLIST into main.py's comment; gui_policy
+    enforces LINKED_MODULES. Adding frame_roi meant editing both by hand, and
+    nothing checked they matched — a module allowlisted in one and not the
+    other is either refused at Generate or undocumented in the app."""
+    import gui_policy as pol
+    assert set(ge.LINKED_ALLOWLIST) == set(pol.LINKED_MODULES)
+
+
 # ============================================================
 # Ports — Step 4 of the ports plan
 # ============================================================
