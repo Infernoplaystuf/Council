@@ -254,9 +254,13 @@ def test_an_empty_folder_clears_the_canvas(rig):
     empty.mkdir()
     rig["p_folder"].set(str(empty))
     _pump(rig["root"])
+    c = rig["canvas"].canvas
     assert rig["canvas"]._base is None
-    assert len(rig["canvas"].canvas.find_all()) == 0, (
+    assert not [i for i in c.find_all() if c.type(i) == "image"], (
         "a stale frame is still on screen")
+    # ...and the panel says WHY it is empty, instead of a blank rectangle
+    msg = c.find_withtag("message")
+    assert msg and "No images in" in c.itemcget(msg[0], "text")
 
 
 def test_a_half_typed_path_does_not_wipe_the_loaded_folder(rig):

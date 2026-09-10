@@ -413,6 +413,65 @@ def build(shapes: Sequence[Shape], layout_tree: Any,
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+def _top_level_defs(module: str) -> Optional[set]:
+    """Function and class names defined at the top of an app-root module, by
+    PARSING its source — never importing it. None when the module is not a
+    file beside this one (a vendor package), which is then not checked."""
+    import ast as _ast
+    from pathlib import Path as _Path
+    p = _Path(__file__).resolve().parent / (module.replace(".", "/") + ".py")
+    if not p.is_file():
+        return None
+    try:
+        tree = _ast.parse(p.read_text(encoding="utf-8", errors="replace"))
+    except SyntaxError:
+        return None
+    out = set()
+    for node in tree.body:
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef,
+                             _ast.ClassDef)):
+            out.add(node.name)
+        elif isinstance(node, _ast.Assign):     # fn = other_fn aliases
+            out.update(t.id for t in node.targets if isinstance(t, _ast.Name))
+    return out
+
+
+def _script_errors(w, where: str, port_of: Dict[str, Any], spec: "Spec",
+                   gpol, cache: Dict[str, Optional[set]]) -> List[str]:
+    """Everything wrong with one widget's script link, one message each."""
+    sc = dict(getattr(w, "script", None) or {})
+    if not sc:
+        return []
+    errs: List[str] = []
+    module = str(sc.get("module") or "").strip()
+    func = str(sc.get("function") or "").strip()
+    if not module or not all(p.isidentifier() for p in module.split(".")):
+        errs.append(f"{where}: script link names no valid module ({module!r})")
+        return errs
+    if not func.isidentifier():
+        errs.append(f"{where}: script link names no valid function ({func!r})")
+        return errs
+    if module.split(".")[0] not in gpol.allowed_modules(spec.mode,
+                                                         spec.requires):
+        errs.append(f"{where}: script module {module!r} is not allowed in "
+                    f"{spec.mode} mode — add it to the project's requires")
+    if module not in cache:
+        cache[module] = _top_level_defs(module)
+    defs = cache[module]
+    if defs is not None and func not in defs:
+        errs.append(f"{where}: {module} has no function {func!r}")
+    for p in sc.get("inputs") or []:
+        if str(p) not in port_of:
+            errs.append(f"{where}: script input {p!r} names no port")
+    targets = list((sc.get("outputs") or {}).keys())
+    if sc.get("output"):
+        targets.append(sc["output"])
+    for p in targets:
+        if str(p) not in port_of:
+            errs.append(f"{where}: script output {p!r} names no port")
+    return errs
+
+
 def validate(spec: Spec) -> Tuple[bool, List[str]]:
     """(ok, errors). EVERY fault, not the first.
 
@@ -423,6 +482,7 @@ def validate(spec: Spec) -> Tuple[bool, List[str]]:
     # declaration is gated too: no denied module, no council_engine.
     import gui_policy as _gpol
     errs: List[str] = list(_gpol.check_requires(spec.requires))
+    _module_defs: Dict[str, Optional[set]] = {}     # per-validate AST cache
     seen: Dict[str, str] = {}
     seen_ports: Dict[str, str] = {}   # port name -> shape id
     driven_sinks: Dict[str, str] = {}  # target port name -> driving widget
@@ -471,6 +531,13 @@ def validate(spec: Spec) -> Tuple[bool, List[str]]:
             errs.append(f"{where}: parent {w.parent!r} is not in the spec")
         if not w.is_container and w.children:
             errs.append(f"{where}: {w.kind} cannot contain children")
+
+        # -- script link --------------------------------------------------
+        # Checked HERE, at Generate. It was never checked at all: a wrong
+        # module, function or port name surfaced only when the button was
+        # pressed, as a print to a console nobody reads.
+        errs.extend(_script_errors(w, where, port_of, spec, _gpol,
+                                   _module_defs))
 
         # -- sequence link (drives) --------------------------------------
         #

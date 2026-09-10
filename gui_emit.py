@@ -534,6 +534,25 @@ def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
         "        except tk.TclError:",
         "            pass",
         "",
+        "    # -- failures --------------------------------------------------",
+        "    def report_error(self, what, exc) -> None:",
+        '        """Say what failed IN THE WINDOW, not only on a console nobody',
+        "        reads. Also written to stderr, which is the GUI Designer's log.",
+        "        COUNCIL_NO_DIALOGS=1 skips the dialog for unattended runs, where",
+        '        a modal box would wait for a click that never comes."""',
+        "        import os",
+        "        import sys",
+        "        msg = str(exc) or type(exc).__name__",
+        '        sys.stderr.write(f"{what} failed: {msg}\\n")',
+        "        if os.environ.get('COUNCIL_NO_DIALOGS'):",
+        "            return",
+        "        try:",
+        "            from tkinter import messagebox",
+        "            messagebox.showerror(f'{what} failed', msg,",
+        "                                 parent=self.winfo_toplevel())",
+        "        except tk.TclError:",
+        "            pass",
+        "",
         "    def _build(self) -> None:",
     ]
     ind = " " * 8
@@ -688,6 +707,7 @@ class ImageCanvas(ttk.Frame):
         self._overlay_img = None   # PIL.Image
         self._photo = None         # keep a reference or Tk drops the image
         self._fitted_at = (0, 0)   # canvas size when zoom_to_fit last ran
+        self._message = ""         # shown when there is no image to show
         self.overlay_enabled = bool(overlay)
         self.overlay_alpha = float(overlay_alpha)
 
@@ -719,8 +739,19 @@ class ImageCanvas(ttk.Frame):
     def set_image(self, image) -> None:
         """``image`` is a PIL.Image. An applied ROI is re-applied to it."""
         self._base = image
+        if image is not None:
+            self._message = ""
         self._refresh_view()
         self.zoom_to_fit()
+
+    def show_message(self, text: str) -> None:
+        """Say something IN the panel when there is no image — why a folder
+        showed no frames — instead of leaving a blank dark rectangle while the
+        reason goes to a console nobody reads."""
+        self._base = None
+        self._message = str(text or "")
+        self._refresh_view()
+        self._render()
 
     def set_overlay(self, image, alpha: float = None) -> None:
         self._overlay_img = image
@@ -961,6 +992,12 @@ class ImageCanvas(ttk.Frame):
         self.canvas.delete("all")
         view = self._view
         if view is None:
+            if self._message:
+                w = max(1, self.canvas.winfo_width())
+                h = max(1, self.canvas.winfo_height())
+                self.canvas.create_text(w / 2, h / 2, text=self._message,
+                                        fill="#f5c2e7", width=max(80, w - 40),
+                                        justify="center", tags="message")
             return
         try:
             from PIL import Image, ImageTk
@@ -1341,6 +1378,14 @@ class _Port:
         raise TypeError(f"port {self.name!r} has no change hook "
                         f"(direction {self.direction!r})")
 
+    def clear(self) -> None:
+        """Show NOTHING — used when the call that fills this port failed.
+
+        Deliberately not set(0) or set(""): a zero in a count box after a
+        failed scan is exactly the false answer this exists to prevent. The
+        base does nothing; each port type that has an honest empty state
+        overrides it, and one that does not keeps its value rather than lie."""
+
 
 class _VarPort(_Port):
     """A port backed by a Tk variable.
@@ -1407,6 +1452,13 @@ class _VarPort(_Port):
             _last[0] = v
             _fn(_coerce(v, self.type))
         self.var.trace_add("write", _cb)
+
+    def clear(self) -> None:
+        # Only a text variable can be genuinely blank. An IntVar/DoubleVar
+        # has no empty state — clearing it would write the very 0 a failed
+        # call must not show — so those keep their value.
+        if isinstance(self.var, tk.StringVar):
+            self.var.set("")
 
 
 def _coerce(v, t):
@@ -1495,6 +1547,9 @@ class _TextPort(_Port):
             except tk.TclError: pass
         w.bind("<<Modified>>", _cb, add=True)
 
+    def clear(self) -> None:
+        self.set("")
+
 
 class _ListPort(_Port):
     """A port over a tk.Listbox — the selection is the value.
@@ -1523,6 +1578,9 @@ class _ListPort(_Port):
         self.widget.bind("<<ListboxSelect>>",
                          lambda _e, _fn=fn: _fn(self.get()), add=True)
 
+    def clear(self) -> None:
+        self.set([])
+
 
 class _TablePort(_Port):
     """A port over a ttk.Treeview — selection returns each row's values."""
@@ -1548,6 +1606,9 @@ class _TablePort(_Port):
         self.widget.bind("<<TreeviewSelect>>",
                          lambda _e, _fn=fn: _fn(self.get()), add=True)
 
+    def clear(self) -> None:
+        self.set([])
+
 
 class _ProxyPort(_Port):
     """A port that calls a WRITER method on a composite — LogPane.append,
@@ -1568,6 +1629,12 @@ class _ProxyPort(_Port):
         raise TypeError(
             f"port {self.name!r} is write-only "
             f"(composite {type(self.widget).__name__})")
+
+    def clear(self) -> None:
+        # An image panel has an honest empty state. A status bar or a log is
+        # the record of what happened, so a failure must not wipe it.
+        if self._writer == "set_image":
+            self.set(None)
 
 
 class _TabPort(_Port):
@@ -1773,7 +1840,12 @@ class _FrameBrowser:
             self._last = None
             try: self.target.set(None)
             except Exception: pass
-            self._say("no images in this folder")
+            folder = str(self.folder.get() or "").strip()
+            if folder:
+                self._say(f"No images in {folder}", error=True)
+            else:
+                self._say("Choose a folder of frames to view them",
+                          error=True)
             return
         i = max(0, min(i, len(self.files) - 1))
         if i == self._last:
@@ -1781,7 +1853,8 @@ class _FrameBrowser:
         try:
             from PIL import Image
         except ImportError:
-            self._say("Pillow is not installed; cannot display frames")
+            self._say("Pillow is not installed, so frames cannot be shown "
+                      "(pip install Pillow)", error=True)
             return
         try:
             with Image.open(self.files[i]) as im:
@@ -1804,7 +1877,8 @@ class _FrameBrowser:
             self._say(f"{i + 1} / {len(self.files)}  "
                       f"{os.path.basename(self.files[i])}")
         except Exception as exc:
-            self._say(f"cannot read {os.path.basename(self.files[i])}: {exc!r}")
+            self._say(f"Cannot read {os.path.basename(self.files[i])}: {exc}",
+                      error=True)
 
     # -- ROI sync -----------------------------------------------------
     def _roi_drawn(self, roi) -> None:
@@ -1836,13 +1910,25 @@ class _FrameBrowser:
         finally:
             self._roi_syncing = False
 
-    def _say(self, message) -> None:
+    def _say(self, message, error: bool = False) -> None:
+        """Report to the status port if one is declared. An ERROR with no
+        status port is shown in the image panel itself — the user is looking
+        there, and "Pillow is not installed" used to go only to a console
+        while the panel stayed blank."""
         if self.status is not None:
             try:
                 self.status.set(message)
                 return
             except Exception:
                 pass
+        if error:
+            show = getattr(getattr(self.target, "widget", None),
+                           "show_message", None)
+            if callable(show):
+                try:
+                    show(message)
+                except Exception:
+                    pass
         print(f"[ports] {message}")
 
     # -- read-only detail, for hand-written code ---------------------
@@ -2105,12 +2191,24 @@ if __name__ == "__main__":
 '''
 
 
-def handler_stub(name: str, script: Optional[Dict[str, Any]] = None) -> str:
+def handler_stub(name: str, script: Optional[Dict[str, Any]] = None,
+                 title: str = "") -> str:
     """A handler body for handlers.py.
 
     With no script link this is the TODO stub it always was. With one, it is a
     WORKING call — the declared function, fed the declared input ports, its
     result written to the declared output port.
+
+    FAILURE IS SHOWN, NOT ROUNDED TO ZERO. The function reports failure by
+    raising, or by returning a dict with a non-empty "error"; both land in the
+    except, which CLEARS every port this call fills and shows the message in
+    the window (MainUi.report_error). The old stub printed to a console nobody
+    reads and left the ports alone — so a scan that could not run left "0 bad
+    frames" on screen, or the previous run's count. The import is inside the
+    try too: a linked module missing on this machine is a failure to report,
+    not a traceback that escapes the handler.
+
+    ``title`` names the action in the error dialog — the button's label.
 
     Generated ONCE. handlers.py is append-only and never rewritten, so this is
     a starting point the user owns and edits, not generated code that will be
@@ -2142,10 +2240,14 @@ def handler_stub(name: str, script: Optional[Dict[str, Any]] = None) -> str:
         "        Generated once from the widget's script link. handlers.py is",
         "        never rewritten, so edit this freely.",
         '        """',
-        f"        from {module} import {func}",
         "        try:",
+        f"            from {module} import {func}",
         f"            result = {call}",
+        "            # Failure is raising, or a dict carrying a non-empty 'error'.",
+        "            if isinstance(result, dict) and result.get('error'):",
+        "                raise RuntimeError(result['error'])",
     ]
+    filled = list(outputs) if outputs else ([output] if output else [])
     if outputs:
         for port, key in outputs.items():
             lines.append(f"            self.ports.{port}.set(result[{_py(str(key))}])")
@@ -2155,11 +2257,23 @@ def handler_stub(name: str, script: Optional[Dict[str, Any]] = None) -> str:
         lines.append("            print(result)   # no output port declared")
     lines += [
         "        except Exception as exc:",
-        "            # A analysis script raising must not kill the UI thread;",
-        "            # the user sees the failure instead of a frozen window.",
-        f'            print(f"{name} failed: {{exc!r}}")',
+        "            # Clear what this call fills — a stale or zero value must",
+        "            # not sit there looking like an answer — then say why, in",
+        "            # the window.",
     ]
+    lines += [f"            self.ports.{p}.clear()" for p in filled]
+    lines.append(f"            self.report_error({_py(title or f'{module}.{func}')}, "
+                 f"exc)")
     return "\n".join(lines) + "\n"
+
+
+def _title_for(spec: Spec, handler: str) -> str:
+    """The label of the widget that owns ``handler`` — the error dialog's
+    title, so it names the button the user pressed."""
+    for w in spec.widgets:
+        if w.handler == handler:
+            return str(w.label or w.name)
+    return ""
 
 
 def _script_for(spec: Spec, handler: str) -> Dict[str, Any]:
@@ -2181,7 +2295,7 @@ ON_CLOSE_STUB = '''
 
 
 def emit_handlers_py(spec: Spec) -> str:
-    body = "".join(handler_stub(h, _script_for(spec, h))
+    body = "".join(handler_stub(h, _script_for(spec, h), _title_for(spec, h))
                    for h in spec.handlers) + ON_CLOSE_STUB
     return f'''"""Handler stubs for {spec.project}.
 
@@ -2372,7 +2486,8 @@ def emit(spec: Spec, project_path: Any, *,
             with handlers.open("a", encoding="utf-8") as fh:
                 fh.write("\n    # --- added by regeneration ---\n")
                 for h in missing:
-                    fh.write(handler_stub(h, _script_for(spec, h)))
+                    fh.write(handler_stub(h, _script_for(spec, h),
+                                          _title_for(spec, h)))
             res.handlers_added.extend(missing)
         res.files_skipped.append(str(handlers))
     else:

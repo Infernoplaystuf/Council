@@ -596,6 +596,12 @@ example_barbie_capture/
 Regenerating only ever rewrites `ui/`. Anything you put in `app.py` or
 `handlers.py` survives.
 
+When a button's script fails — no folder chosen, a package missing, nothing
+to scan — the app clears whatever that button fills and says why in a dialog,
+rather than leaving a `0` that looks like an answer. **■ Stop** asks the app to
+close itself first (it runs `on_close` in `handlers.py`, the place to release a
+camera), and only kills it if it doesn't close within a few seconds.
+
 ---
 
 ## Personal Specialists

@@ -601,10 +601,16 @@ def test_a_script_link_with_no_output_port_prints_instead_of_setting():
 
 
 def test_a_failing_script_cannot_kill_the_ui():
-    """An analysis script that raises must surface, not freeze the window."""
+    """An analysis script that raises must surface, not freeze the window.
+    What the user actually SEES is tested by pressing real buttons in
+    tests/test_gui_errors.py; this pins the stub's shape."""
     src = ge.emit_handlers_py(_linked_spec())
     assert "except Exception as exc:" in src
-    assert "failed:" in src
+    assert "self.report_error(" in src
+    # the import is inside the try: a module missing on this machine is a
+    # failure to report, not a traceback escaping the handler
+    body = src[src.index("try:"):]
+    assert "import" in body.split("except Exception")[0]
 
 
 def test_app_py_mixes_handlers_in_FIRST():
