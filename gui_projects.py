@@ -129,6 +129,12 @@ class Manifest:
     detached: bool = False
     created: str = ""
     updated: str = ""
+    # Which Python runs this project: "" = the Council's own, a conda env
+    # name, or a path to python.exe. See python_envs. HERE and not in the
+    # .gspec because a .gspec is portable and an interpreter names one
+    # machine. A real field, because load_manifest drops unknown keys and a
+    # hand-added one would vanish on the next save.
+    python: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -156,6 +162,7 @@ def load_manifest(pdir: Any) -> Manifest:
         detached=bool(raw.get("detached", False)),
         created=str(raw.get("created") or ""),
         updated=str(raw.get("updated") or ""),
+        python=str(raw.get("python") or ""),
     )
 
 

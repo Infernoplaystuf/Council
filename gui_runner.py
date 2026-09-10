@@ -224,7 +224,7 @@ def get(project) -> Optional[Preview]:
 
 def start(project, *, on_line: Optional[Callable[[str, str], None]] = None,
           on_exit: Optional[Callable[[int], None]] = None,
-          entry: str = "") -> Preview:
+          entry: str = "", python: str = "") -> Preview:
     """Launch the project's preview. A second Run stops the first (spec 9).
 
     NO TIMEOUT. A GUI runs until the user closes it; a timeout here would kill
@@ -232,7 +232,11 @@ def start(project, *, on_line: Optional[Callable[[str, str], None]] = None,
     module exists to avoid.
 
     ``entry`` defaults to main.py, falling back to launch.py for a project
-    generated before the rename that has not been regenerated since."""
+    generated before the rename that has not been regenerated since.
+
+    ``python`` is the interpreter to run it under — resolved by the caller
+    from the project's manifest (python_envs.resolve). Empty means the
+    Council's own, which is what every project used before the setting."""
     proj = Path(project).resolve()
     if entry:
         launch = proj / entry
@@ -257,8 +261,9 @@ def start(project, *, on_line: Optional[Callable[[str, str], None]] = None,
     env["PYTHONFAULTHANDLER"] = "1"
     # Tells the generated app to listen on stdin for a clean-close request.
     env["COUNCIL_PREVIEW_CONTROL"] = "stdin"
+    interpreter = python or sys.executable
     proc = subprocess.Popen(
-        [sys.executable, "-u", str(launch)],
+        [interpreter, "-u", str(launch)],
         cwd=str(proj),
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,

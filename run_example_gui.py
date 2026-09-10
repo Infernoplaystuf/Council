@@ -45,8 +45,11 @@ import gui_spec as gsp         # noqa: E402
 
 
 def build(name: str, *, project: str = "", force: bool = False,
-          vault_dir=None) -> Path:
-    """Materialise example ``name`` as a generated project. Returns its dir."""
+          vault_dir=None, python: str = "") -> Path:
+    """Materialise example ``name`` as a generated project. Returns its dir.
+
+    ``python`` is recorded in the project's manifest (see python_envs), so the
+    designer's Run uses the same interpreter afterwards."""
     if name not in gx.names():
         raise SystemExit(f"no such example: {name!r}\n"
                          f"available: {', '.join(gx.names()) or '(none)'}")
@@ -88,6 +91,7 @@ def build(name: str, *, project: str = "", force: bool = False,
     man.port_names = spec.port_registry() if hasattr(spec, "port_registry") else {}
     man.widget_names = spec.name_registry()
     man.ui_checksums = gpj.ui_checksums(pdir)
+    man.python = str(python or "")
     gpj.save_manifest(pdir, man)
 
     print(f"built {project!r}")
@@ -110,6 +114,11 @@ def main(argv=None) -> int:
                     help="replace an existing project of that name")
     ap.add_argument("--no-run", action="store_true",
                     help="generate the project but do not launch it")
+    ap.add_argument("--python", default="", metavar="ENV_OR_PATH",
+                    help="the Python that runs the app: a conda env name "
+                         "(e.g. pylon) or a path to python.exe. Default: "
+                         "this Python. Saved with the project, so the GUI "
+                         "Designer's Run uses it too.")
     args = ap.parse_args(argv)
 
     if not args.example:
@@ -119,15 +128,40 @@ def main(argv=None) -> int:
         print("\nrun one with:  python run_example_gui.py <name>")
         return 0
 
-    pdir = build(args.example, project=args.project, force=args.force)
+    import python_envs as pe
+    res = pe.resolve(args.python)
+    if res.error:
+        # Refuse BEFORE building: a --force build deletes app.py and
+        # handlers.py, and must not do that for an interpreter that is not
+        # even there.
+        raise SystemExit(f"--python {args.python!r}: {res.error}")
+
+    pdir = build(args.example, project=args.project, force=args.force,
+                 python=args.python)
     entry = pdir / "main.py"
+    pr = pe.probe(res.python, modules=_requires_of(pdir),
+                  files=pe.project_files(pdir))
+    print()
+    for line in pe.describe(res, pr):
+        print(line)
+    if not pr.ok:
+        return 1
     if args.no_run:
-        print(f"\nrun it with:  python {entry}")
+        print(f'\nrun it with:  "{res.python}" "{entry}"')
         return 0
 
     print(f"\nlaunching {pdir.name} — close the window to return")
     import subprocess
-    return subprocess.call([sys.executable, str(entry)], cwd=str(pdir))
+    return subprocess.call([res.python, str(entry)], cwd=str(pdir))
+
+
+def _requires_of(pdir: Path):
+    """The built project's declared packages ([] until it declares any)."""
+    try:
+        return list(getattr(gs.load_gspec(pdir / gpj.GSPEC_NAME),
+                            "requires", None) or [])
+    except Exception:
+        return []
 
 
 if __name__ == "__main__":

@@ -547,6 +547,25 @@ for you if it doesn't exist. `vault/` is gitignored, which is why a fresh clone
 has the wireframes (`examples/gui/*.gspec`) but none of the generated code —
 `run_example_gui.py` is what turns one into the other.
 
+### Running a project with a different Python
+
+A generated app normally runs under the Council's own Python. An app that
+drives hardware usually can't — camera SDKs such as `pypylon` or Metavision
+ship for particular Pythons and belong in their own environment. Pick one per
+project with **Run with:** next to **▶ Run** (any conda env on the machine, or
+*Browse for python.exe…*), or from the command line:
+
+```bash
+python run_example_gui.py barbie_capture_v2 --python my_camera_env
+```
+
+Before launching, that Python checks itself — that it has `tkinter`, that it
+can actually import every package the project needs, and that the generated
+files compile under its version — and says plainly what is missing instead of
+failing at the first click. The choice is saved in the project's
+`manifest.json`, not the wireframe, so a wireframe stays portable between
+machines.
+
 ### Then edit it in the app
 
 Once built, the example is an ordinary project. Launch Council → **🎨 GUI
