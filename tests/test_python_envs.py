@@ -291,3 +291,195 @@ def test_project_files_are_everything_the_app_runs(tmp_path):
     names = {Path(f).name for f in pe.project_files(pdir)}
     assert {"main_ui.py", "ports.py", "widgets.py", "app.py", "handlers.py",
             "main.py"} <= names
+
+
+# ============================================================
+# The probe answers through a file (adversarial review, 2026-09)
+# ============================================================
+#
+# Its answer used to be a marker line on stdout, which any package imported
+# during the check could break, fake, or hold open.
+
+def _module(tmp_path, monkeypatch, name, body):
+    (tmp_path / f"{name}.py").write_text(body, encoding="utf-8")
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+
+
+def test_a_banner_with_no_newline_is_not_a_crash(tmp_path, monkeypatch):
+    """MEASURED: print('SDK v1.2 loaded', end='') glued the marker onto the
+    banner, and a working Python was reported as having CRASHED (exit 0)."""
+    _module(tmp_path, monkeypatch, "noisy_sdk_xyz",
+            "import sys\nsys.stdout.write('SDK v1.2 loaded')\n")
+    pr = pe.probe(sys.executable, modules=["json", "noisy_sdk_xyz"])
+    assert pr.ok, (pr.missing, pr.error)
+
+
+def test_import_output_cannot_answer_for_the_probe(tmp_path, monkeypatch):
+    _module(tmp_path, monkeypatch, "spoof_sdk_xyz",
+            "print('__PROBE__{\"tkinter\": \"8.6\", \"missing\": {}}')\n"
+            "raise ImportError('really missing')\n")
+    pr = pe.probe(sys.executable, modules=["spoof_sdk_xyz"])
+    assert not pr.ok and "spoof_sdk_xyz" in pr.missing
+
+
+def test_a_package_that_swaps_stdout_is_fine(tmp_path, monkeypatch):
+    _module(tmp_path, monkeypatch, "swap_sdk_xyz",
+            "import io, sys\nsys.stdout = io.StringIO()\n")
+    assert pe.probe(sys.executable, modules=["swap_sdk_xyz"]).ok
+
+
+def test_a_helper_process_holding_the_output_does_not_stall_it(
+        tmp_path, monkeypatch):
+    """MEASURED: an import that started a helper sharing stdout made
+    probe(timeout=5) take 20 s and report a working SDK as hanging."""
+    _module(tmp_path, monkeypatch, "helper_sdk_xyz",
+            "import subprocess, sys\n"
+            "subprocess.Popen([sys.executable, '-c', "
+            "'import time; time.sleep(20)'], stdout=sys.stdout, "
+            "stderr=sys.stderr)\n")
+    t0 = time.time()
+    pr = pe.probe(sys.executable, modules=["helper_sdk_xyz"], timeout=15)
+    assert pr.ok, (pr.missing, pr.error)
+    assert time.time() - t0 < 12
+
+
+def test_the_probe_sees_the_projects_own_modules(tmp_path):
+    """The probe ran from the Council's cwd, so a helper module beside
+    main.py was 'missing' although the app imports it fine."""
+    (tmp_path / "camlib_xyz.py").write_text("X = 1\n", encoding="utf-8")
+    assert not pe.probe(sys.executable, modules=["camlib_xyz"]).ok
+    pr = pe.probe(sys.executable, modules=["camlib_xyz"],
+                  path=[str(tmp_path)], cwd=str(tmp_path))
+    assert pr.ok, pr.missing
+
+
+def test_preflight_passes_a_project_with_a_helper_module(tmp_path):
+    pdir = _built(tmp_path, "helper")
+    (pdir / "camlib_xyz.py").write_text("def grab():\n    return 1\n",
+                                        encoding="utf-8")
+    app = pdir / "app.py"
+    app.write_text(app.read_text(encoding="utf-8") + "\nimport camlib_xyz\n",
+                   encoding="utf-8")
+    pf = pe.preflight(pdir, "")
+    assert pf.ok, pf.lines
+
+
+def test_an_undeclared_startup_import_the_python_lacks_is_caught():
+    """numpy is allowed undeclared, and the stdlib is judged by the
+    Council's own version (tomllib, 3.11+) — so the gate cannot know whether
+    the target has them. 'ready' then crashed on open."""
+    pr = pe.probe(sys.executable, locate=["json", "no_such_module_xyz"])
+    assert not pr.ok and list(pr.missing) == ["no_such_module_xyz"]
+
+
+def test_a_stdlib_module_the_target_lacks_says_which_python_to_use():
+    pr = pe.Probe(False, "3.9.21", "8.6", missing={"tomllib": pe.NOT_FOUND})
+    lines = pe.describe(pe.Resolved("x", "x", "conda env 'x'"), pr)
+    assert any("standard library" in l and "tomllib" in l for l in lines)
+
+
+def test_tomllib_under_python_39_is_refused(tmp_path):
+    py39 = _env_or_skip("VoxRecorder")
+    pdir = _built(tmp_path, "toml")
+    app = pdir / "app.py"
+    app.write_text(app.read_text(encoding="utf-8") + "\nimport tomllib\n",
+                   encoding="utf-8")
+    pf = pe.preflight(pdir, py39)
+    assert not pf.ok, pf.lines
+    assert any("tomllib" in l and "standard library" in l
+               for l in pf.lines), pf.lines
+    assert not any("does not compile" in l for l in pf.lines), pf.lines
+
+
+def test_startup_imports_skip_optional_and_lazy_ones(tmp_path):
+    f = tmp_path / "a.py"
+    f.write_text("import os\nfrom pathlib import Path\nfrom . import x\n"
+                 "try:\n    import optional_xyz\nexcept ImportError:\n"
+                 "    pass\n"
+                 "def f():\n    import lazy_xyz\n", encoding="utf-8")
+    assert pe.startup_imports([str(f)]) == ["os", "pathlib"]
+
+
+# ============================================================
+# Run and Stop while the check is still running
+# ============================================================
+
+def _pump(q, until, seconds=30):
+    import queue
+    end = time.time() + seconds
+    while time.time() < end and not until():
+        try:
+            q.get(timeout=0.2)()
+        except queue.Empty:
+            pass
+
+
+def test_stop_during_the_check_cancels_the_run(tmp_path):
+    """MEASURED: stop() returned False, nothing was logged, and the preview
+    opened when the check finished — a camera app opening its device after
+    the last thing the user pressed was Stop."""
+    import queue
+    pdir = _built(tmp_path, "cancel")
+    log, q = [], queue.Queue()
+    t = run.run_checked(pdir, log=log.append, call_soon=q.put)
+    assert run.stop(pdir) is True
+    t.join(timeout=90)
+    _pump(q, lambda: any("cancelled" in l for l in log))
+    try:
+        assert any("Run cancelled: Stop was pressed" in l for l in log), log
+        assert not any("preview running" in l for l in log)
+        assert not run.is_running(pdir)
+    finally:
+        run.stop(pdir, grace=3)
+
+
+def test_a_newer_run_replaces_one_still_being_checked(tmp_path):
+    import queue
+    pdir = _built(tmp_path, "twice")
+    log, q = [], queue.Queue()
+    t1 = run.run_checked(pdir, log=log.append, call_soon=q.put)
+    t2 = run.run_checked(pdir, log=log.append, call_soon=q.put)
+    t1.join(timeout=90)
+    t2.join(timeout=90)
+    _pump(q, lambda: any("preview running" in l for l in log)
+          and any("replaced" in l for l in log))
+    try:
+        assert sum("preview running" in l for l in log) == 1, log
+        assert any("a newer Run replaced it" in l for l in log)
+    finally:
+        run.stop(pdir, grace=3)
+
+
+def test_a_check_that_raises_says_so_instead_of_hanging(tmp_path,
+                                                        monkeypatch):
+    """MEASURED: an exception in preflight killed the worker silently and
+    Run sat at 'checking ...' for ever."""
+    import queue
+
+    def boom(*a, **k):
+        raise ValueError("bad probe answer")
+    pdir = _built(tmp_path, "boom")
+    monkeypatch.setattr(pe, "preflight", boom)
+    log, q = [], queue.Queue()
+    t = run.run_checked(pdir, log=log.append, call_soon=q.put)
+    t.join(timeout=30)
+    _pump(q, lambda: len(log) > 1, seconds=5)
+    assert any("check itself failed" in l and "bad probe answer" in l
+               for l in log), log
+
+
+def test_run_example_saves_an_absolute_python_path(tmp_path, monkeypatch):
+    """A relative --python was saved as typed, and the designer's Run later
+    resolved it against a different working directory."""
+    import run_example_gui as rex
+    if not sys.platform.startswith("win"):
+        pytest.skip("uses python.exe as the relative path")
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(tmp_path / "vault"))
+    exe = Path(sys.executable)
+    monkeypatch.chdir(exe.parent)
+    rc = rex.main(["barbie_capture", "--project", "abs", "--no-run",
+                   "--python", exe.name])
+    assert rc == 0
+    pdir = next(p for p in (tmp_path / "vault").rglob("abs") if p.is_dir())
+    saved = gpj.load_manifest(pdir).python
+    assert Path(saved).is_absolute() and Path(saved) == exe

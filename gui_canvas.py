@@ -1725,6 +1725,14 @@ class _Inspector(ttk.Frame):
         out: Dict[str, Any] = {}
         for k, var in self._win_vars.items():
             out[k] = _cast(var)
+        if "requires" in out:
+            # Kept in step with what was applied. The Window fields are the
+            # live object; this list was a copy taken at attach time, so the
+            # panel re-rendered the OLD packages after any selection change
+            # and the next Apply saved them back — measured, a declared
+            # pypylon vanished on the next title edit.
+            import gui_policy as _gpol
+            self._requires = _gpol.parse_requires(out["requires"])
         if self._on_window is not None:
             self._on_window(out)
 

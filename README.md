@@ -586,6 +586,11 @@ names, so `PIL` not `Pillow`). Each one is added to that project's policy
 allowlist, is checked in the chosen Python before Run, and is checked again
 when the app starts. An import that isn't declared is refused, and modules the
 app may never use (`subprocess`, `socket`, `pickle`, …) cannot be declared.
+Neither can the Council's own modules: an app reaches Council code only through
+the linked modules (`frame_timing`, `frame_roi`, `frame_classes`, …), and only
+in linked mode. A helper `.py` you add to the project folder needs no
+declaring. The gate reads every `.py` in the project, so the helper is checked
+like everything else.
 
 ### Then edit it in the app
 
@@ -608,7 +613,10 @@ example_barbie_capture/
 ```
 
 Regenerating only ever rewrites `ui/`. Anything you put in `app.py` or
-`handlers.py` survives.
+`handlers.py` survives. The one exception is a handler stub written by an
+older version that nobody has edited. It is replaced with the current one, and
+the Generate log names it. An edited stub is left alone, and the log says so if
+it doesn't report failures.
 
 When a button's script fails — no folder chosen, a package missing, nothing
 to scan — the app clears whatever that button fills and says why in a dialog,

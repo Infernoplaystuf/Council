@@ -284,6 +284,29 @@ def test_sixteen_bit_frames_are_scaled_not_clamped(rig):
     assert rig["canvas"]._base.getpixel((0, 0)) == 16
 
 
+def test_stepping_back_past_an_unreadable_frame_shows_the_good_one(rig):
+    """MEASURED: frame 1 unreadable, step 0 -> 1 -> 0, and frame 0 never came
+    back — _last still said 0, so show(0) returned early and the 'Cannot
+    read' message stayed up with no image."""
+    Image = rig["Image"]
+    d = rig["tmp"] / "bad"
+    d.mkdir()
+    Image.new("RGB", (40, 30), (9, 9, 9)).save(d / "f_0.png")
+    (d / "f_1.png").write_bytes(b"\x89PNG\r\n\x1a\n truncated")
+    Image.new("RGB", (40, 30), (9, 9, 9)).save(d / "f_2.png")
+    rig["p_folder"].set(str(d))
+    _pump(rig["root"])
+    assert rig["canvas"]._base is not None
+    rig["p_index"].set(1)
+    _pump(rig["root"])
+    assert rig["canvas"]._base is None
+    rig["p_index"].set(0)
+    _pump(rig["root"])
+    c = rig["canvas"].canvas
+    assert rig["canvas"]._base is not None, "frame 0 did not come back"
+    assert not c.find_withtag("message"), "the 'Cannot read' message stayed"
+
+
 def test_zoom_to_fit_clears_when_there_is_no_image(rt, tk_root):
     tk = pytest.importorskip("tkinter")
     Image = pytest.importorskip("PIL.Image")

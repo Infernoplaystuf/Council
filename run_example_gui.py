@@ -136,6 +136,10 @@ def main(argv=None) -> int:
         # handlers.py, and must not do that for an interpreter that is not
         # even there.
         raise SystemExit(f"--python {args.python!r}: {res.error}")
+    if pe.looks_like_path(args.python):
+        # Saved in the manifest, and the designer's Run resolves it from
+        # wherever the Council was started — so never a relative path.
+        args.python = str(Path(args.python).expanduser().absolute())
 
     pdir = build(args.example, project=args.project, force=args.force,
                  python=args.python)

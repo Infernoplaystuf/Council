@@ -682,6 +682,12 @@ def load_gspec(path: Any) -> Project:
         shapes=shapes,
         clarifications=clars,
         gspec_version=ver,
-        requires=[str(r).strip() for r in (raw.get("requires") or [])
-                  if str(r).strip()],
+        # A string ("numpy, PIL") is accepted as the list it obviously means;
+        # iterated as-is it became one package per character.
+        requires=_as_requires(raw.get("requires")),
     )
+
+
+def _as_requires(value) -> List[str]:
+    import gui_policy
+    return gui_policy.as_requires(value)

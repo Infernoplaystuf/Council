@@ -262,7 +262,7 @@ def build(shapes: Sequence[Shape], layout_tree: Any,
     spec = Spec(project=project, mode=mode, title=title,
                 min_w=min_w, min_h=min_h,
                 root_bg=root_bg, root_fg=root_fg, root_font=root_font,
-                requires=[str(r).strip() for r in requires if str(r).strip()])
+                requires=_gpol_as_requires(requires))
     spec.warnings.extend(getattr(layout_tree, "warnings", []) or [])
     nodes = getattr(layout_tree, "nodes", {}) or {}
     reg = dict(registry or {})
@@ -413,42 +413,109 @@ def build(shapes: Sequence[Shape], layout_tree: Any,
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
-def _top_level_defs(module: str, root: Any = None) -> Optional[set]:
-    """Function and class names defined at the top of an app-root module, by
-    PARSING its source — never importing it. None when the module is not a
-    file in ``root`` (default: beside this one) — a vendor package, which is
-    then not checked."""
+def _gpol_as_requires(value) -> List[str]:
+    import gui_policy
+    return gui_policy.as_requires(value)
+
+
+def _bound_names(stmts, out: set, plain: Optional[set] = None) -> bool:
+    """Collect names bound by module-level statements into ``out``, looking
+    inside if/try/with — `try: from fast import scan` / `except ImportError:
+    def scan(...)` is the standard way to offer a function, and a check that
+    read only the top level rejected that working link. False on a star
+    import, where the names cannot be known.
+
+    ``plain`` also gets the names bound to something that cannot be CALLED:
+    a literal (IMAGE_SUFFIXES = (...)) or a module (import os). Linking a
+    button to one of those passed validation and failed on every press."""
     import ast as _ast
-    from pathlib import Path as _Path
-    base = _Path(root) if root else _Path(__file__).resolve().parent
-    p = base / (module.replace(".", "/") + ".py")
-    if not p.is_file():
-        return None
-    try:
-        tree = _ast.parse(p.read_text(encoding="utf-8", errors="replace"))
-    except SyntaxError:
-        return None
-    out = set()
-    for node in tree.body:
+    plain = set() if plain is None else plain
+    literal = (_ast.Constant, _ast.Tuple, _ast.List, _ast.Dict, _ast.Set,
+               _ast.JoinedStr)
+    for node in stmts:
         if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef,
                              _ast.ClassDef)):
             out.add(node.name)
-        elif isinstance(node, _ast.Assign):     # fn = other_fn aliases
-            out.update(t.id for t in node.targets if isinstance(t, _ast.Name))
+        elif isinstance(node, (_ast.Assign, _ast.AnnAssign)):
+            targets = node.targets if isinstance(node, _ast.Assign) \
+                else [node.target]
+            names = [t.id for t in targets if isinstance(t, _ast.Name)]
+            out.update(names)
+            if isinstance(node.value, literal):
+                plain.update(names)
         elif isinstance(node, (_ast.Import, _ast.ImportFrom)):
             # A module that RE-EXPORTS a function (`from .core import scan`)
             # really does offer it; without this the check would reject a
             # working link as "has no function".
             if any(a.name == "*" for a in node.names):
-                return None                     # star import: cannot know
-            out.update((a.asname or a.name).split(".")[0] for a in node.names)
-    return out
+                return False
+            names = [(a.asname or a.name).split(".")[0] for a in node.names]
+            out.update(names)
+            if isinstance(node, _ast.Import):
+                plain.update(names)
+        elif isinstance(node, (_ast.If, _ast.With, _ast.Try)):
+            blocks = [node.body, getattr(node, "orelse", []),
+                      getattr(node, "finalbody", [])]
+            blocks += [h.body for h in getattr(node, "handlers", [])]
+            for b in blocks:
+                if not _bound_names(b, out, plain):
+                    return False
+    return True
+
+
+def _module_file(module: str, root: Any = None):
+    """The .py (or package __init__.py) for ``module`` under ``root``
+    (default: beside this one), or None."""
+    from pathlib import Path as _Path
+    base = _Path(root) if root else _Path(__file__).resolve().parent
+    rel = module.replace(".", "/")
+    for p in (base / f"{rel}.py", base / rel / "__init__.py"):
+        if p.is_file():
+            return p
+    return None
+
+
+def _module_names(module: str, root: Any = None):
+    """(every name the module binds, those that cannot be called) for an
+    app-root module, by PARSING its source — never importing it. None when
+    the module is not a file in ``root`` (default: beside this one) — a
+    vendor package, which is then not checked."""
+    import ast as _ast
+    p = _module_file(module, root)
+    if p is None:
+        return None
+    try:
+        tree = _ast.parse(p.read_text(encoding="utf-8", errors="replace"))
+    except SyntaxError:
+        return None
+    out: set = set()
+    plain: set = set()
+    if not _bound_names(tree.body, out, plain):
+        return None
+    # Bound to a def somewhere as well (a fallback, a redefinition): callable.
+    defs = {n.name for n in _ast.walk(tree)
+            if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef,
+                              _ast.ClassDef))}
+    return out, plain - defs
+
+
+def _top_level_defs(module: str, root: Any = None) -> Optional[set]:
+    """Every name bound at the top of an app-root module (see _module_names)."""
+    got = _module_names(module, root)
+    return None if got is None else got[0]
 
 
 def _script_errors(w, where: str, port_of: Dict[str, Any], spec: "Spec",
                    gpol, cache: Dict[str, Optional[set]]) -> List[str]:
-    """Everything wrong with one widget's script link, one message each."""
-    sc = dict(getattr(w, "script", None) or {})
+    """Everything wrong with one widget's script link, one message each.
+
+    Reports a malformed link rather than raising on it: a model writing
+    "outputs": ["count"] used to crash validate() with an AttributeError."""
+    sc = getattr(w, "script", None) or {}
+    if not isinstance(sc, dict):
+        return [f"{where}: script link must be an object with module, "
+                f"function, inputs and outputs (got {type(sc).__name__})"]
+    sc = dict(sc)
     if not sc:
         return []
     errs: List[str] = []
@@ -460,25 +527,94 @@ def _script_errors(w, where: str, port_of: Dict[str, Any], spec: "Spec",
     if not func.isidentifier():
         errs.append(f"{where}: script link names no valid function ({func!r})")
         return errs
-    if module.split(".")[0] not in gpol.allowed_modules(spec.mode,
-                                                         spec.requires):
+    root = module.split(".")[0]
+    if root not in gpol.allowed_modules(spec.mode, spec.requires):
+        fix = ("switch the project to linked mode"
+               if spec.mode != "linked" and (root in gpol.LINKED_MODULES
+                                             or gpol.is_council_module(root))
+               else "add it to the project's requires")
         errs.append(f"{where}: script module {module!r} is not allowed in "
-                    f"{spec.mode} mode — add it to the project's requires")
+                    f"{spec.mode} mode — {fix}")
+    elif "." in module and _module_file(root) is not None \
+            and _module_file(module) is None:
+        # 'frame_timing.count_bad_frames': the function written into the
+        # module path. The allowlist sees only the root, so this passed and
+        # then failed on the first press with ModuleNotFoundError.
+        errs.append(f"{where}: {module!r} is not a module — did you mean "
+                    f"module {module.rsplit('.', 1)[0]!r}, function "
+                    f"{module.rsplit('.', 1)[1]!r}?")
     if module not in cache:
-        cache[module] = _top_level_defs(module)
-    defs = cache[module]
-    if defs is not None and func not in defs:
+        cache[module] = _module_names(module)
+    names = cache[module]
+    if names is not None and func not in names[0]:
         errs.append(f"{where}: {module} has no function {func!r}")
-    for p in sc.get("inputs") or []:
-        if str(p) not in port_of:
+    elif names is not None and func in names[1]:
+        errs.append(f"{where}: {module}.{func} is a value or a module, not a "
+                    f"function — a button can only call a function")
+    if w.kind not in COMMAND_KINDS:
+        # Only a pressable widget gets a handler; on anything else the link
+        # was dropped at generation with no message.
+        errs.append(f"{where}: a script link runs when the widget is used, "
+                    f"and a {w.kind} cannot be — put it on a button")
+    inputs = sc.get("inputs") or []
+    if isinstance(inputs, str) or not isinstance(inputs, (list, tuple)):
+        errs.append(f"{where}: script inputs must be a list of port names "
+                    f"(got {inputs!r})")
+        inputs = []
+    for p in inputs:
+        src = port_of.get(str(p))
+        if src is None:
             errs.append(f"{where}: script input {p!r} names no port")
-    targets = list((sc.get("outputs") or {}).keys())
+        elif src.port.binder in ("proxy", "event"):
+            errs.append(f"{where}: script input {p!r} is a {src.kind}, which "
+                        f"has no value to read")
+    outputs = sc.get("outputs") or {}
+    if not isinstance(outputs, dict):
+        errs.append(f"{where}: script outputs must map port name -> result "
+                    f"key (got {outputs!r})")
+        outputs = {}
+    targets = list(outputs.keys())
     if sc.get("output"):
         targets.append(sc["output"])
     for p in targets:
-        if str(p) not in port_of:
+        dst = port_of.get(str(p))
+        if dst is None:
             errs.append(f"{where}: script output {p!r} names no port")
+        elif dst.port.binder == "event" or (
+                dst.port.binder == "proxy"
+                and dst.port.writer == "figure_for_drawing"):
+            # A button reported a SUCCESSFUL scan as a failure: the result
+            # was written, then setting the button raised.
+            errs.append(f"{where}: script output {p!r} is a {dst.kind}, "
+                        f"which cannot show a result")
     return errs
+
+
+# Kinds whose value always reads as an answer: no blank state to show after
+# a failed call (see Port.clear), so a stale value stays.
+NO_EMPTY_STATE = frozenset({"scale", "checkbutton", "scrubber"})
+
+
+def script_warnings(spec: "Spec") -> List[str]:
+    """Things that generate but deserve a word — today, script outputs that
+    cannot be blanked when their call fails."""
+    port_of = {w.port.name: w for w in spec.widgets if w.port}
+    out: List[str] = []
+    for w in spec.widgets:
+        sc = getattr(w, "script", None)
+        if not isinstance(sc, dict) or not sc:
+            continue
+        outputs = sc.get("outputs") if isinstance(sc.get("outputs"), dict) \
+            else {}
+        targets = list(outputs) + ([sc["output"]] if sc.get("output") else [])
+        for p in targets:
+            dst = port_of.get(str(p))
+            if dst is not None and dst.kind in NO_EMPTY_STATE:
+                out.append(f"{w.label or w.name}: output {p!r} is a "
+                           f"{dst.kind}, which has no blank state — if the "
+                           f"call fails it keeps showing the previous "
+                           f"value (a label or entry can be cleared)")
+    return out
 
 
 def validate(spec: Spec) -> Tuple[bool, List[str]]:
@@ -490,7 +626,7 @@ def validate(spec: Spec) -> Tuple[bool, List[str]]:
     # A declared package widens this project's policy allowlist, so the
     # declaration is gated too: no denied module, no council_engine.
     import gui_policy as _gpol
-    errs: List[str] = list(_gpol.check_requires(spec.requires))
+    errs: List[str] = list(_gpol.check_requires(spec.requires, spec.mode))
     _module_defs: Dict[str, Optional[set]] = {}     # per-validate AST cache
     seen: Dict[str, str] = {}
     seen_ports: Dict[str, str] = {}   # port name -> shape id

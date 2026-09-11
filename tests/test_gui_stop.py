@@ -210,6 +210,61 @@ def test_stop_all_waits_on_one_shared_deadline(tmp_path):
             pv._kill()
 
 
+def test_a_chatty_on_close_is_not_killed_when_the_log_is_slow(tmp_path):
+    """The designer's log callback marshals onto the Tk thread and BLOCKS
+    until Tk runs it — and Stop waits on that same Tk thread. The pipe
+    readers used to call the callback themselves, so they stopped reading,
+    the app filled its pipe in on_close and blocked, and Stop killed it as
+    hung. MEASURED: ~5 KB of on_close output was enough.
+
+    Here the callback blocks until stop() has returned, which is exactly
+    what Tk's marshalling does while the Tk thread is inside stop()."""
+    import threading
+    pdir = _project(tmp_path, "chatty",
+                    "for i in range(400):\n"
+                    "    print('released buffer %04d of the camera' % i)\n"
+                    "open(r'MARKER', 'w').write('released')")
+    tk_free = threading.Event()
+    lines = []
+
+    def slow_log(t, lv):
+        tk_free.wait()
+        lines.append(t)
+    pv = run.start(pdir, on_line=slow_log)
+    try:
+        time.sleep(3)
+        tk_free.clear()
+        clean = pv.stop(grace=10)
+        tk_free.set()
+        assert clean is True and not pv.forced, "the app had to be killed"
+        assert (pdir / "closed.txt").read_text() == "released"
+        assert _wait_until(lambda: any("buffer 0399" in t for t in lines))
+        assert _wait_until(lambda: any("closed cleanly" in t for t in lines))
+    finally:
+        tk_free.set()
+        pv._kill()
+
+
+def test_a_crashed_designer_lets_a_printing_on_close_finish(tmp_path):
+    """With the designer gone nobody reads the app's output, and on Windows
+    every write to that pipe raises — so the first print() in on_close
+    aborted the cleanup after it. MEASURED: exit 1, marker never written."""
+    pdir = _project(tmp_path, "s2p",
+                    "print('camera released')\n"
+                    "open(r'MARKER', 'w').write('released')")
+    helper = tmp_path / "designer.py"
+    helper.write_text(
+        "import os, sys, time\n"
+        f"sys.path.insert(0, r'{REPO}')\n"
+        "import gui_runner as run\n"
+        f"pv = run.start(r'{pdir}', on_line=lambda t, lv: None)\n"
+        "time.sleep(3)\n"
+        "os._exit(0)\n", encoding="utf-8")
+    subprocess.run([sys.executable, str(helper)], timeout=60)
+    assert _wait_until(lambda: (pdir / "closed.txt").exists()), \
+        "on_close stopped at its first print"
+
+
 def test_non_ascii_output_survives_the_pipe(tmp_path):
     """A child Python writes its locale code page unless told otherwise, and
     the runner reads UTF-8 — measured garbled on a 3.9 child."""

@@ -11580,6 +11580,8 @@ class CouncilConsole(tk.Tk):
                 man.widget_names = spec.name_registry()
                 man.port_names = new_ports
                 man.ui_checksums = _gp.ui_checksums(pdir)
+                # 'Run with' may have changed while this ran; keep it.
+                man.python = _gp.load_manifest(pdir).python
                 _gp.save_manifest(pdir, man)
             except Exception as exc:
                 out.append(f"generate failed: {exc!r}")

@@ -188,3 +188,101 @@ def test_the_model_is_taught_to_declare_requires():
     text = gx.for_prompt()
     assert '"requires": [' in text
     assert "IMPORT name" in text
+
+
+# ============================================================
+# What may be declared (adversarial review, 2026-09)
+# ============================================================
+
+@pytest.mark.parametrize("bad", ["as", "if", "None", "class", "async",
+                                 "pypylon.async"])
+def test_a_keyword_is_not_a_package(bad):
+    """'numpy as np' typed into the panel became ['numpy', 'as', 'np'], and
+    main.py got `import as` — a SyntaxError reported as 'does not parse'."""
+    assert pol.check_requires([bad])
+    assert pol.check_requires(pol.parse_requires("numpy as np"))
+
+
+@pytest.mark.parametrize("name", ["council_agents", "council_gui_engine",
+                                  "coder_agent", "vault_rag"])
+def test_council_code_cannot_be_declared_in(name):
+    """Each of these imports council_engine at load, so declaring one was the
+    second GGUF singleton the council_engine ban exists to prevent."""
+    if not pol.is_council_module(name):
+        pytest.skip(f"{name} is not in this checkout")
+    assert any("part of the Council" in e for e in pol.check_requires([name]))
+    ok, errs = pol.validate(f"from {name} import x\n", "linked",
+                            extra_modules=[name])
+    assert not ok, errs
+
+
+def test_the_linked_modules_are_still_declarable_in_linked_mode():
+    assert pol.check_requires(["frame_timing"], "linked") == []
+
+
+def test_a_standalone_project_is_told_to_switch_to_linked():
+    """Generate used to say 'add it to requires'; doing so gave a project
+    the preflight called ready, which then exited 3 at startup."""
+    errs = pol.check_requires(["frame_timing"], "standalone")
+    assert errs and "linked mode" in errs[0]
+    ok, errs = pol.validate("import frame_timing\n", "standalone",
+                            extra_modules=["frame_timing"])
+    assert not ok and any("linked mode" in e for e in errs)
+
+
+@pytest.mark.parametrize("raw,want", [
+    ("numpy", ["numpy"]),
+    ("numpy, PIL", ["numpy", "PIL"]),
+    (["numpy", " PIL ", ""], ["numpy", "PIL"]),
+    (None, []),
+])
+def test_a_string_requires_is_the_list_it_means(tmp_path, raw, want):
+    """'requires': 'numpy' was iterated into ['n', 'u', 'm', 'p', 'y']."""
+    p = tmp_path / "cam.gspec"
+    gs.save_gspec(p, _project([]))
+    d = json.loads(p.read_text(encoding="utf-8"))
+    d["requires"] = raw
+    p.write_text(json.dumps(d), encoding="utf-8")
+    assert gs.load_gspec(p).requires == want
+    proj = _project([])
+    spec = gsp.build(proj.shapes, gl.infer(proj.shapes, 400, 300),
+                     project="cam", requires=raw)
+    assert spec.requires == want
+
+
+def test_unattended_startup_never_waits_on_a_dialog(tmp_path):
+    """COUNCIL_NO_DIALOGS=1 is the switch for unattended runs. The startup
+    check ignored it and opened a modal nobody would click."""
+    pdir = _emit(tmp_path, ["definitely_missing_pkg_xyz"])
+    env = {k: v for k, v in os.environ.items()
+           if k != "COUNCIL_PREVIEW_CONTROL"}
+    env["COUNCIL_NO_DIALOGS"] = "1"
+    r = subprocess.run([sys.executable, "main.py"], cwd=str(pdir),
+                       capture_output=True, text=True, timeout=60, env=env)
+    assert r.returncode == 3
+    assert "definitely_missing_pkg_xyz" in r.stderr
+
+
+def test_the_window_panel_keeps_what_was_applied(tk_root):
+    """The panel copied requires once at attach time and re-rendered that
+    copy after any selection change — so the next Apply (a title edit) saved
+    the OLD list back. Measured: a declared pypylon vanished."""
+    import tkinter as tk
+    import gui_canvas as gc
+    saved = []
+    top = tk.Toplevel(tk_root)
+    try:
+        canvas = gc.DesignerCanvas(top)
+        win = gs.Window(title="Cam")
+
+        def on_window(values):
+            saved.append(pol.parse_requires(values.get("requires", "")))
+        canvas.attach_window(win, on_window, requires=[])
+        insp = canvas.inspector
+        insp._win_vars["requires"].set("pypylon")
+        insp._apply_window()
+        insp._empty()                   # what a selection change re-renders
+        insp._apply_window()            # e.g. after editing only the title
+        assert saved == [["pypylon"], ["pypylon"]]
+    finally:
+        top.destroy()

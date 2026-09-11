@@ -150,27 +150,56 @@ def resolve(spec: str) -> Resolved:
 
 # Runs INSIDE the target interpreter. Deliberately plain: no f-strings, no
 # walrus, no annotations, so a 3.6-era vendor Python can run it too.
+#
+# It answers through FILES, not stdout. A package is free to print while it
+# imports, and stdout was measured failing three ways: a banner with no
+# trailing newline swallowed the marker, so a working Python was reported as
+# having CRASHED; a package printing the marker itself could answer "ready";
+# and a helper process an SDK started kept the pipe open, so a finished probe
+# waited out its timeout and was reported as hanging.
 _PROBE = r'''
 import json, sys
 req = json.loads(sys.argv[1])
+sys.path[0:0] = req.get("path", [])
+
+
+def _note(path, text):
+    fh = open(path, "w", encoding="utf-8")
+    fh.write(text)
+    fh.close()
+
+
 out = {"version": "%d.%d.%d" % tuple(sys.version_info[:3]),
        "executable": sys.executable, "tkinter": "", "tkinter_error": "",
-       "missing": {}, "compile_errors": {}}
+       "missing": {}, "not_found": [], "compile_errors": {}}
 try:
     import tkinter
     out["tkinter"] = str(tkinter.TkVersion)
 except Exception as exc:
     out["tkinter_error"] = "%s: %s" % (type(exc).__name__, exc)
 for name in req.get("modules", []):
-    # Announced BEFORE the import: a native crash kills this process with no
-    # chance to report, and the last announcement is then the only way to say
-    # WHICH package took it down.
-    sys.stdout.write("__TRY__" + name + "\n")
-    sys.stdout.flush()
+    # Noted BEFORE the import: a native crash kills this process with no
+    # chance to report, and the last note is then the only way to say WHICH
+    # package took it down.
+    _note(req["trying"], name)
     try:
         __import__(name)
     except BaseException as exc:
         out["missing"][name] = "%s: %s" % (type(exc).__name__, exc)
+_note(req["trying"], "")
+try:
+    from importlib.util import find_spec
+except Exception:
+    find_spec = None
+for name in req.get("locate", []):
+    # Located, not imported: the imports the app makes at startup that are
+    # not declared (numpy is allowed undeclared; tomllib is stdlib on 3.11
+    # but not on 3.9). find_spec on a top-level name imports nothing.
+    try:
+        if find_spec is not None and find_spec(name) is None:
+            out["not_found"].append(name)
+    except Exception:
+        out["not_found"].append(name)
 for path in req.get("files", []):
     try:
         with open(path, "rb") as fh:
@@ -179,7 +208,7 @@ for path in req.get("files", []):
         out["compile_errors"][path] = "line %s: %s" % (exc.lineno, exc.msg)
     except Exception as exc:
         out["compile_errors"][path] = "%s: %s" % (type(exc).__name__, exc)
-sys.stdout.write("__PROBE__" + json.dumps(out) + "\n")
+_note(req["result"], json.dumps(out))
 '''
 
 
@@ -193,42 +222,80 @@ class Probe:
     error: str = ""        # the interpreter itself could not be run
 
 
-def probe(python: str, *, modules: Sequence[str] = (),
-          files: Sequence[str] = (), timeout: float = PROBE_TIMEOUT) -> Probe:
-    """Ask ``python`` about itself. Never raises."""
-    payload = json.dumps({"modules": list(modules),
-                          "files": [str(f) for f in files]})
-    env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONFAULTHANDLER="1")
+NOT_FOUND = "the app imports it at startup, and this Python does not have it"
+
+
+def _read(path: Path) -> str:
     try:
-        r = subprocess.run([python, "-c", _PROBE, payload],
-                           capture_output=True, text=True, encoding="utf-8",
-                           errors="replace", timeout=timeout, env=env)
-    except subprocess.TimeoutExpired:
-        return Probe(False, error=f"it did not answer within {timeout:g} s "
-                     f"(an import may be hanging)")
-    except OSError as exc:
-        return Probe(False, error=f"it could not be started: {exc}")
-    lines = r.stdout.splitlines()
-    line = next((l for l in lines if l.startswith("__PROBE__")), "")
-    if not line:
-        tried = [l[len("__TRY__"):] for l in lines if l.startswith("__TRY__")]
-        code = r.returncode
-        shown = f"0x{code & 0xFFFFFFFF:08X}" if (code < 0 or code > 0xFFFF) \
-            else str(code)
-        if tried:
-            # Measured on this machine: an env whose numpy was pip-installed
-            # dies inside the import with 0xC06D007F (a delay-load DLL fault)
-            # and no Python traceback at all. find_spec would have said "fine".
-            return Probe(False, missing={tried[-1]: (
-                f"importing it CRASHED this Python (exit code {shown}) — "
-                f"usually a package built for a different Python, or a "
-                f"missing DLL")})
-        tail = (r.stderr or r.stdout).strip().splitlines()[-3:]
-        return Probe(False, error="it crashed while checking itself"
-                     + (": " + " | ".join(tail) if tail else
-                        f" (exit code {shown})"))
-    d = json.loads(line[len("__PROBE__"):])
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def probe(python: str, *, modules: Sequence[str] = (),
+          files: Sequence[str] = (), locate: Sequence[str] = (),
+          path: Sequence[str] = (), cwd: Optional[str] = None,
+          timeout: float = PROBE_TIMEOUT) -> Probe:
+    """Ask ``python`` about itself. Never raises.
+
+    ``modules`` are imported, ``locate`` only found; ``path`` goes at the
+    front of the target's sys.path and ``cwd`` is where it runs — the same
+    two things the generated main.py sets up, so a module the app finds (its
+    own helper file, a linked Council module) is found here too."""
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="council_probe_",
+                                     ignore_cleanup_errors=True) as tmp:
+        tmp = Path(tmp)
+        payload = json.dumps({"modules": list(modules),
+                              "locate": list(locate),
+                              "files": [str(f) for f in files],
+                              "path": [str(p) for p in path],
+                              "trying": str(tmp / "trying.txt"),
+                              "result": str(tmp / "result.json")})
+        env = dict(os.environ, PYTHONIOENCODING="utf-8",
+                   PYTHONFAULTHANDLER="1")
+        log = tmp / "output.txt"
+        try:
+            # Output goes to a FILE: subprocess.run waits for a pipe to reach
+            # end-of-file, and an SDK's helper process holding it open made a
+            # finished probe wait out its whole timeout.
+            with open(log, "wb") as out:
+                r = subprocess.run([python, "-c", _PROBE, payload],
+                                   stdin=subprocess.DEVNULL, stdout=out,
+                                   stderr=subprocess.STDOUT, timeout=timeout,
+                                   env=env, cwd=cwd or None)
+        except subprocess.TimeoutExpired:
+            return Probe(False, error=f"it did not answer within {timeout:g} "
+                         f"s (an import may be hanging)")
+        except OSError as exc:
+            return Probe(False, error=f"it could not be started: {exc}")
+        try:
+            d = json.loads(_read(tmp / "result.json"))
+            if not isinstance(d, dict):
+                raise ValueError("not a JSON object")
+        except ValueError:
+            d = None
+        if d is None:
+            tried = _read(tmp / "trying.txt").strip()
+            code = r.returncode
+            shown = (f"0x{code & 0xFFFFFFFF:08X}"
+                     if (code < 0 or code > 0xFFFF) else str(code))
+            if tried:
+                # Measured on this machine: an env whose numpy was
+                # pip-installed dies inside the import with 0xC06D007F (a
+                # delay-load DLL fault) and no Python traceback at all.
+                # find_spec would have said "fine".
+                return Probe(False, missing={tried: (
+                    f"importing it CRASHED this Python (exit code {shown}) — "
+                    f"usually a package built for a different Python, or a "
+                    f"missing DLL")})
+            tail = _read(log).strip().splitlines()[-3:]
+            return Probe(False, error="it crashed while checking itself"
+                         + (": " + " | ".join(tail) if tail else
+                            f" (exit code {shown})"))
     missing = dict(d.get("missing") or {})
+    for name in d.get("not_found") or []:
+        missing.setdefault(str(name), NOT_FOUND)
     compile_errors = dict(d.get("compile_errors") or {})
     tk = str(d.get("tkinter") or "")
     ok = bool(tk) and not missing and not compile_errors
@@ -265,7 +332,17 @@ def describe(res: Resolved, pr: Optional[Probe]) -> List[str]:
     out = [f"Not started: {head} cannot run this app."]
     if pr.error:
         out.append(f"  - {pr.error}")
+    import gui_policy
+    stdlib = gui_policy._stdlib_names()
     for mod, why in pr.missing.items():
+        if why == NOT_FOUND and mod in stdlib:
+            # tomllib under 3.9, imghdr under 3.13: the gate judged the code
+            # against the Council's Python, whose standard library differs.
+            out.append(f"  - {mod} is standard library in the Council's "
+                       f"Python {sys.version_info[0]}.{sys.version_info[1]} "
+                       f"but not in this one — choose another Python, or "
+                       f"stop importing it")
+            continue
         out.append(f"  - missing {mod} — install {install_hint(mod)} into "
                    f"that Python ({why})")
     for path, why in pr.compile_errors.items():
@@ -293,15 +370,56 @@ def preflight(pdir, spec: str, mode: str = "linked",
     One function for the designer's Run and for run_example_gui, so the two
     cannot disagree about whether a project may start."""
     import gui_policy
+    requires = gui_policy.as_requires(requires)
     ok, errs = gui_policy.validate_dir(pdir, mode, requires)
     if not ok:
         return Preflight(False, "", ["Not started: the policy gate refused "
                                      "this code:"] + ["  - " + e for e in errs])
     res = resolve(spec)
-    pr = None if res.error else probe(res.python, modules=list(requires),
-                                      files=project_files(pdir))
+    pr = None
+    if not res.error:
+        files = project_files(pdir)
+        # The target's sys.path as the generated main.py builds it: the app
+        # root in front (linked mode), then the project.
+        path = ([str(gui_policy.APP_ROOT)] if mode == "linked" else []) \
+            + [str(Path(pdir).resolve())]
+        pr = probe(res.python, modules=requires, files=files,
+                   locate=[m for m in startup_imports(files)
+                           if m not in requires],
+                   path=path, cwd=str(pdir))
     good = not res.error and pr is not None and pr.ok
     return Preflight(good, res.python if good else "", describe(res, pr))
+
+
+def startup_imports(files: Sequence[str]) -> List[str]:
+    """Top-level modules the app imports AS IT STARTS: absolute imports at
+    module level of its own files.
+
+    Not those inside a try (optional by construction) or a function (needed
+    only when that feature is used). Each of these must exist for the app to
+    open at all, and the gate cannot know whether the target Python has
+    them: it allows numpy undeclared, and it judges the stdlib by the
+    Council's own version."""
+    import ast
+    out: List[str] = []
+    for f in files:
+        try:
+            tree = ast.parse(Path(f).read_text(encoding="utf-8",
+                                               errors="replace"))
+        except (OSError, SyntaxError, ValueError):
+            continue            # the compile check reports a bad file
+        for node in tree.body:
+            if isinstance(node, ast.Import):
+                names = [a.name for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and not node.level:
+                names = [node.module or ""]
+            else:
+                continue
+            for n in names:
+                root = n.split(".")[0]
+                if root and root != "__future__" and root not in out:
+                    out.append(root)
+    return out
 
 
 # -- the designer's "Run with" choices ----------------------------------
@@ -337,9 +455,7 @@ def spec_from_choice(choice: str) -> str:
 
 
 def project_files(pdir) -> List[str]:
-    """Every .py a generated project runs, for the compile check."""
-    pdir = Path(pdir)
-    files = sorted((pdir / "ui").glob("*.py"))
-    files += [pdir / n for n in ("app.py", "handlers.py", "main.py")
-              if (pdir / n).is_file()]
-    return [str(f) for f in files]
+    """Every .py a generated project runs, for the compile check — the same
+    set the policy gate reads, so neither can miss a file the other sees."""
+    import gui_policy
+    return [str(f) for f in gui_policy.project_sources(pdir)]

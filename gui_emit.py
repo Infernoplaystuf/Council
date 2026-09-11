@@ -57,6 +57,7 @@ class EmitResult:
     files_written: List[str] = field(default_factory=list)
     files_skipped: List[str] = field(default_factory=list)   # never rewritten
     handlers_added: List[str] = field(default_factory=list)
+    handlers_upgraded: List[str] = field(default_factory=list)
     orphaned_regions: Dict[str, str] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
 
@@ -111,9 +112,12 @@ def _py(value: Any) -> str:
     widgets from labels is that the result reads as if a person wrote it.
 
     A string already containing a double quote keeps repr()'s choice rather
-    than growing a backslash — which is also what black does."""
+    than growing a backslash — which is also what black does.
+
+    A control character (a newline in a label) also goes through repr(),
+    which escapes it; written raw it ended the string literal mid-line."""
     if isinstance(value, str):
-        if '"' in value:
+        if '"' in value or any(ord(c) < 32 or c == "\x7f" for c in value):
             return repr(value)
         return '"' + value.replace("\\", "\\\\") + '"'
     if isinstance(value, bool):
@@ -125,6 +129,13 @@ def _py(value: Any) -> str:
     if value is None:
         return "None"
     return repr(value)
+
+
+def _c(text: Any) -> str:
+    """Text for a generated COMMENT: control characters become spaces. A
+    label's newline written into `# button: Scan<newline>folder` put the rest
+    of the label on a code line of its own."""
+    return re.sub(r"[\x00-\x1f\x7f]+", " ", str(text))
 
 
 def _prop(w: WidgetSpec, key: str, default: Any = None) -> Any:
@@ -449,6 +460,7 @@ def _watch_for_stop(ui) -> None:
     if os.environ.get("COUNCIL_PREVIEW_CONTROL") != "stdin" or sys.stdin is None:
         return
     asked = threading.Event()
+    gone = []
 
     def _read():
         seen = b""
@@ -457,7 +469,8 @@ def _watch_for_stop(ui) -> None:
             while True:
                 chunk = os.read(fd, 64)
                 if not chunk:
-                    break              # end-of-file: the designer is gone
+                    gone.append(True)  # end-of-file: the designer is gone
+                    break
                 seen = (seen + chunk)[-64:]
                 if b"stop" in seen.lower():
                     break
@@ -469,6 +482,15 @@ def _watch_for_stop(ui) -> None:
 
     def _poll():
         if asked.is_set():
+            if gone:
+                # Nobody reads this app's output any more, and on Windows
+                # every write to the orphaned pipe raises OSError — so the
+                # first print() in on_close aborted the very cleanup it was
+                # reporting on. Measured: exit code 1, camera never released.
+                try:
+                    sys.stdout = sys.stderr = open(os.devnull, "w")
+                except OSError:
+                    pass
             ui.request_close()
             return
         try:
@@ -542,7 +564,10 @@ def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
         "        except Exception as exc:",
         "            # A failing cleanup must not keep a window the user asked to",
         "            # close open; say what failed and close anyway.",
-        '            print(f"on_close failed: {exc!r}")',
+        "            try:",
+        '                print(f"on_close failed: {exc!r}")',
+        "            except Exception:",
+        "                pass                       # no one is reading output",
         "        try:",
         "            self.winfo_toplevel().destroy()",
         "        except tk.TclError:",
@@ -557,7 +582,11 @@ def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
         "        import os",
         "        import sys",
         "        msg = str(exc) or type(exc).__name__",
-        '        sys.stderr.write(f"{what} failed: {msg}\\n")',
+        "        try:",
+        "            if sys.stderr is not None:     # None under pythonw",
+        '                sys.stderr.write(f"{what} failed: {msg}\\n")',
+        "        except (OSError, ValueError):",
+        "            pass                           # nobody is reading it",
         "        if os.environ.get('COUNCIL_NO_DIALOGS'):",
         "            return",
         "        try:",
@@ -566,6 +595,16 @@ def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
         "                                 parent=self.winfo_toplevel())",
         "        except tk.TclError:",
         "            pass",
+        "",
+        "    def clear_ports(self, *names) -> None:",
+        '        """Blank the named ports after a failed call (Port.clear).',
+        "        Never raises: a port renamed since handlers.py was written",
+        '        must not stop report_error from saying what went wrong."""',
+        "        for name in names:",
+        "            try:",
+        "                self.ports[name].clear()",
+        "            except Exception:",
+        "                pass",
         "",
         "    def _build(self) -> None:",
     ]
@@ -593,7 +632,7 @@ def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
         parent = f"self.{w.parent}" if w.parent else "self"
         parent_spec = spec.by_name(w.parent) if w.parent else None
         parent_kind = parent_spec.kind if parent_spec else ""
-        L.append(f"{ind}# {w.kind}: {w.label or w.name}")
+        L.append(f"{ind}# {w.kind}: {_c(w.label or w.name)}")
         L.append(f"{ind}self.{w.name} = {construct(w, parent)}")
         if parent_kind == "notebook":
             # Tab titles come from the parent's `tabs` prop, in child order —
@@ -1468,23 +1507,37 @@ class _VarPort(_Port):
         self.var.trace_add("write", _cb)
 
     def clear(self) -> None:
-        # Only a text variable can be genuinely blank. An IntVar/DoubleVar
-        # has no empty state — clearing it would write the very 0 a failed
-        # call must not show — so those keep their value.
+        # A text variable can be genuinely blank, and an empty progress bar
+        # claims nothing. A scale, a checkbox or a scrubber has no empty
+        # state — any value it shows would read as an answer — so those keep
+        # theirs, and Generate warns when one is a script output.
         if isinstance(self.var, tk.StringVar):
             self.var.set("")
+        elif isinstance(self.widget, ttk.Progressbar):
+            self.var.set(0)
 
 
 def _coerce(v, t):
     """Nudge a Tk value into the port's declared type. StringVar-backed
     Entries hand back a str even when the port is typed int — coerce once
-    here so app.py never writes int(self.ports.n.get())."""
-    if t in ("int",):
-        try: return int(v)
-        except (TypeError, ValueError): return 0
-    if t in ("float",):
-        try: return float(v)
-        except (TypeError, ValueError): return 0.0
+    here so app.py never writes int(self.ports.n.get()).
+
+    A blank or unreadable number is None, not 0. A count box cleared after a
+    failed call (Port.clear) read back as 0 — the same false zero clear()
+    exists to keep off the screen, handed to whatever read it next."""
+    if t in ("int", "float"):
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return int(v) if t == "int" else float(v)
+        s = "" if v is None else str(v).strip()
+        try:
+            return int(s) if t == "int" else float(s)
+        except ValueError:
+            pass
+        try:
+            f = float(s)                     # "3.0" typed into an int box
+            return int(f) if t == "int" else f
+        except (ValueError, OverflowError):
+            return None
     if t == "bool":
         return bool(v)
     if t == "path":
@@ -1645,10 +1698,14 @@ class _ProxyPort(_Port):
             f"(composite {type(self.widget).__name__})")
 
     def clear(self) -> None:
-        # An image panel has an honest empty state. A status bar or a log is
-        # the record of what happened, so a failure must not wipe it.
+        # An image panel and a status bar have an honest empty state — a
+        # status bar left saying "3 of 5 frames bad" after the next scan
+        # failed was the previous folder's answer shown beside this one.
+        # A log is the record of what happened, so it is never wiped.
         if self._writer == "set_image":
             self.set(None)
+        elif self._writer == "set":
+            self.set("")
 
 
 class _TabPort(_Port):
@@ -1900,6 +1957,14 @@ class _FrameBrowser:
             self._say(f"{i + 1} / {len(self.files)}  "
                       f"{os.path.basename(self.files[i])}")
         except Exception as exc:
+            # Nothing valid is on screen now, so no frame is "last". Leaving
+            # _last alone made stepping BACK to the previous frame hit the
+            # early return above and keep this message up with no image, and
+            # the current-file port kept naming a frame that was not shown.
+            self._last = None
+            try: self.target.set(None)
+            except Exception: pass
+            self._set_current("")
             self._say(f"Cannot read {os.path.basename(self.files[i])}: {exc}",
                       error=True)
 
@@ -2067,13 +2132,13 @@ def emit_ports(spec: Spec, aliases: Optional[Dict[str, str]] = None) -> str:
         default = _py(p.default) if p.default is not None else "None"
 
         if p.binder == "event":
-            L.append(f"        # {p.kind}: {primary.label or p.name} -> event")
+            L.append(f"        # {p.kind}: {_c(primary.label or p.name)} -> event")
             L.append(
                 f"        self.{p.name} = _EventPort(\n"
                 f"            {_py(p.name)}, {wname}, ui=ui, "
                 f"handler={_py(primary.handler or '')})")
         elif p.binder == "text":
-            L.append(f"        # {p.kind}: {primary.label or p.name} -> str (accessor pair)")
+            L.append(f"        # {p.kind}: {_c(primary.label or p.name)} -> str (accessor pair)")
             L.append(
                 f"        self.{p.name} = _TextPort(\n"
                 f"            {_py(p.name)}, {wname}, "
@@ -2081,25 +2146,25 @@ def emit_ports(spec: Spec, aliases: Optional[Dict[str, str]] = None) -> str:
             if p.default is not None:
                 L.append(f"        self.{p.name}.set({default})")
         elif p.binder == "list":
-            L.append(f"        # {p.kind}: {primary.label or p.name} -> selection")
+            L.append(f"        # {p.kind}: {_c(primary.label or p.name)} -> selection")
             L.append(
                 f"        self.{p.name} = _ListPort(\n"
                 f"            {_py(p.name)}, {wname}, "
                 f"direction={_py(p.direction)}, type={_py(p.type)})")
         elif p.binder == "table":
-            L.append(f"        # {p.kind}: {primary.label or p.name} -> selection (rows)")
+            L.append(f"        # {p.kind}: {_c(primary.label or p.name)} -> selection (rows)")
             L.append(
                 f"        self.{p.name} = _TablePort(\n"
                 f"            {_py(p.name)}, {wname}, "
                 f"direction={_py(p.direction)}, type={_py(p.type)})")
         elif p.binder == "tab":
-            L.append(f"        # {p.kind}: {primary.label or p.name} -> current tab")
+            L.append(f"        # {p.kind}: {_c(primary.label or p.name)} -> current tab")
             L.append(
                 f"        self.{p.name} = _TabPort(\n"
                 f"            {_py(p.name)}, {wname}, "
                 f"direction={_py(p.direction)}, type={_py(p.type)})")
         elif p.binder == "proxy":
-            L.append(f"        # {p.kind}: {primary.label or p.name} -> {p.writer}")
+            L.append(f"        # {p.kind}: {_c(primary.label or p.name)} -> {p.writer}")
             L.append(
                 f"        self.{p.name} = _ProxyPort(\n"
                 f"            {_py(p.name)}, {wname}, writer={_py(p.writer)}, "
@@ -2121,7 +2186,7 @@ def emit_ports(spec: Spec, aliases: Optional[Dict[str, str]] = None) -> str:
             else:
                 var_expr = f"tk.{p.var_class}()"
                 option_expr = _py(p.tk_option)
-            L.append(f"        # {p.kind}: {primary.label or p.name} -> "
+            L.append(f"        # {p.kind}: {_c(primary.label or p.name)} -> "
                      f"{p.type}, {p.direction}")
             L.append(
                 f"        self.{p.name} = _VarPort(\n"
@@ -2303,7 +2368,9 @@ def handler_stub(name: str, script: Optional[Dict[str, Any]] = None,
         "            # not sit there looking like an answer — then say why, in",
         "            # the window.",
     ]
-    lines += [f"            self.ports.{p}.clear()" for p in filled]
+    if filled:
+        lines.append("            self.clear_ports("
+                     + ", ".join(_py(p) for p in filled) + ")")
     lines.append(f"            self.report_error({_py(title or f'{module}.{func}')}, "
                  f"exc)")
     return "\n".join(lines) + "\n"
@@ -2326,6 +2393,113 @@ def _script_for(spec: Spec, handler: str) -> Dict[str, Any]:
     return {}
 
 
+def _legacy_stubs(name: str, script: Dict[str, Any], title: str) -> List[str]:
+    """Every stub an OLDER Council wrote for this handler, byte for byte.
+
+    handlers.py is never rewritten, so a stub generated before failures were
+    reported kept its old except — print() to a console — for ever. Once the
+    linked functions began raising instead of returning zeros, that turned a
+    failed scan from a false "0" into the PREVIOUS folder's count and file
+    names, silently (measured on all four of the user's projects). An exact
+    match is a stub nobody has touched, so replacing it loses nothing; an
+    edited one never matches and is left alone.
+
+      * the TODO stub, from before the button had a script link
+      * 7fdafb0 .. 4ffd556: import outside the try, print() on failure
+      * 4ffd556 .. now: ports cleared one by one, where a renamed port's
+        AttributeError stopped report_error from running"""
+    module = str(script.get("module") or "").strip()
+    func = str(script.get("function") or "").strip()
+    inputs = [str(p) for p in (script.get("inputs") or []) if str(p).strip()]
+    output = str(script.get("output") or "").strip()
+    outputs = dict(script.get("outputs") or {})
+    args = ", ".join(f"self.ports.{p}.get()" for p in inputs)
+    head = [f"    def {name}(self, *args) -> None:",
+            f'        """Runs {module}.{func} — wired from the wireframe.',
+            "",
+            "        Generated once from the widget's script link. handlers.py is",
+            "        never rewritten, so edit this freely.",
+            '        """']
+    if outputs:
+        sets = [f"            self.ports.{p}.set(result[{_py(str(k))}])"
+                for p, k in outputs.items()]
+    elif output:
+        sets = [f"            self.ports.{output}.set(result)"]
+    else:
+        sets = ["            print(result)   # no output port declared"]
+    printing = head + [
+        f"        from {module} import {func}",
+        "        try:",
+        f"            result = {func}({args})",
+    ] + sets + [
+        "        except Exception as exc:",
+        "            # A analysis script raising must not kill the UI thread;",
+        "            # the user sees the failure instead of a frozen window.",
+        f'            print(f"{name} failed: {{exc!r}}")']
+    filled = list(outputs) if outputs else ([output] if output else [])
+    clearing = head + [
+        "        try:",
+        f"            from {module} import {func}",
+        f"            result = {func}({args})",
+        "            # Failure is raising, or a dict carrying a non-empty 'error'.",
+        "            if isinstance(result, dict) and result.get('error'):",
+        "                raise RuntimeError(result['error'])",
+    ] + sets + [
+        "        except Exception as exc:",
+        "            # Clear what this call fills — a stale or zero value must",
+        "            # not sit there looking like an answer — then say why, in",
+        "            # the window.",
+    ] + [f"            self.ports.{p}.clear()" for p in filled] + [
+        f"            self.report_error({_py(title or f'{module}.{func}')}, exc)"]
+    todo = handler_stub(name).lstrip("\n")
+    return [todo, "\n".join(printing) + "\n", "\n".join(clearing) + "\n"]
+
+
+def upgrade_stubs(src: str, spec: Spec) -> Tuple[str, List[str], List[str]]:
+    """(new source, upgraded handlers, handlers left as they are that do not
+    report failures) for an existing handlers.py.
+
+    Only a script-linked handler whose WHOLE definition — found by parsing,
+    so a line appended to it is part of it — equals a _legacy_stubs text is
+    replaced, with the stub this version writes."""
+    import ast
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return src, [], []
+    spans: Dict[str, List[Tuple[int, int]]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    first = min([item.lineno] + [d.lineno for d in
+                                                 item.decorator_list])
+                    spans.setdefault(item.name, []).append(
+                        (first, item.end_lineno))
+    lines = src.splitlines(keepends=True)
+    edits, upgraded, silent = [], [], []
+    for h in spec.handlers:
+        script = _script_for(spec, h)
+        if not script or len(spans.get(h, [])) != 1:
+            continue
+        a, b = spans[h][0]
+        current = "".join(lines[a - 1:b])
+        if not current.endswith("\n"):
+            current += "\n"
+        title = _title_for(spec, h)
+        new = handler_stub(h, script, title).lstrip("\n")
+        if current == new:
+            continue
+        if current in _legacy_stubs(h, script, title):
+            edits.append((a, b, new))
+            upgraded.append(h)
+        elif "report_error" not in current:
+            silent.append(h)
+    for a, b, new in sorted(edits, reverse=True):
+        lines[a - 1:b] = [new]
+    return "".join(lines), upgraded, silent
+
+
 ON_CLOSE_STUB = '''
     def on_close(self) -> None:
         """Runs when the app closes — its window's X, the GUI Designer's Stop,
@@ -2342,7 +2516,8 @@ def emit_handlers_py(spec: Spec) -> str:
     return f'''"""Handler stubs for {spec.project}.
 
 APPEND-ONLY. Regeneration adds stubs for NEW widgets to the end of this file
-and never rewrites what is already here.
+and never rewrites what you have written. (A stub an older version generated
+that nobody has edited is upgraded in place, and the Generate log says so.)
 
 Mix HandlerMixin into App (in app.py) if you would rather keep behaviour out of
 app.py itself.
@@ -2399,9 +2574,11 @@ def _requires_block(requires: Sequence[str]) -> str:
           "                  \"Designer's 'Run with'), or install them into \"",
           "                  \"this one.\")",
           r'    _MSG = "\n".join(_LINES)',
-          r'    sys.stderr.write(_MSG + "\n")',
+          "    if sys.stderr is not None:     # None under pythonw",
+          r'        sys.stderr.write(_MSG + "\n")',
           "    import os as _os",
-          "    if not _os.environ.get('COUNCIL_PREVIEW_CONTROL'):",
+          "    if not (_os.environ.get('COUNCIL_PREVIEW_CONTROL')",
+          "            or _os.environ.get('COUNCIL_NO_DIALOGS')):",
           "        try:",
           "            import tkinter as _tk",
           "            from tkinter import messagebox as _mb",
@@ -2522,6 +2699,22 @@ def emit(spec: Spec, project_path: Any, *,
     handlers = root / "handlers.py"
     if handlers.exists():
         src = handlers.read_text(encoding="utf-8", errors="replace")
+        # MIGRATION, the one exception to append-only: a stub an older
+        # Council wrote and nobody has edited is replaced (upgrade_stubs).
+        new_src, upgraded, silent = upgrade_stubs(src, spec)
+        if upgraded:
+            handlers.write_text(new_src, encoding="utf-8")
+            src = new_src
+            res.handlers_upgraded.extend(upgraded)
+            res.warnings.append(
+                "handlers.py: upgraded " + ", ".join(upgraded) + " — unedited "
+                "stubs from an older version, which left the previous "
+                "results on screen when the call failed")
+        for h in silent:
+            res.warnings.append(
+                f"handlers.py: {h} has been edited, so it was left as it is "
+                f"— it does not call report_error, so if its script fails the "
+                f"window will not say so")
         missing = [h for h in spec.handlers if f"def {h}(" not in src]
         if missing:
             # APPEND, never rewrite. Existing bodies are untouched.
@@ -2537,6 +2730,8 @@ def emit(spec: Spec, project_path: Any, *,
         res.handlers_added.extend(spec.handlers)
 
     _write(root / "main.py", emit_main_py(spec, root), res)
+    import gui_spec as _gsp
+    res.warnings.extend(_gsp.script_warnings(spec))
 
     # MIGRATION. Projects generated before the rename ran from launch.py, and
     # a shortcut or a note may still point at it. Replace it with a shim

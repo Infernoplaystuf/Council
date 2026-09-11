@@ -30,12 +30,25 @@ module denies the calls whose PURPOSE is destruction (rmtree, unlink, remove,
 rmdir) and the modules that escape the process entirely, and it does NOT claim
 to prove where a write lands. Claiming an enforcement that does not exist would
 be worse than the gap: it would make a reviewer stop looking.
+
+For the same reason: a name assembled at runtime (getattr(os, "sys" + "tem"))
+cannot be read statically either. Every SPELLED form is checked — attribute,
+`from os import system`, `from os import *`, getattr with a literal, and the
+namespace dicts (__dict__, vars(), globals()) a literal key would reach it
+through — but this is a gate against generated code going wrong, not a
+sandbox against code written to escape it.
 """
 from __future__ import annotations
 
 import ast
+import keyword
 import sys
+from pathlib import Path
 from typing import List, Sequence, Set, Tuple
+
+# The Council's own source directory. A `requires` naming a module here is
+# Council code, not a package — see check_requires.
+APP_ROOT = Path(__file__).resolve().parent
 
 MODES = ("linked", "standalone")
 
@@ -68,10 +81,21 @@ DENIED_MODULES = frozenset({
     "http", "ftplib", "telnetlib", "smtplib", "ctypes", "cffi",
     "pickle", "cPickle", "marshal", "shelve", "dill",
     "importlib", "imp", "runpy", "code", "codeop", "pty", "multiprocessing",
+    # `builtins.exec(...)` is exec — and `compile` cannot be denied as an
+    # attribute, because re.compile is everywhere.
+    "builtins",
 })
 
-# Builtins that turn data into code.
-DENIED_BUILTINS = frozenset({"eval", "exec", "compile", "__import__"})
+# Builtins that turn data into code, and the namespace dicts that hand any
+# denied name back through a string key: vars(os)["system"],
+# globals()["__builtins__"]["eval"]. Generated code uses none of them.
+DENIED_BUILTINS = frozenset({"eval", "exec", "compile", "__import__",
+                             "__builtins__", "globals", "vars", "locals"})
+
+# `from X import *` pulls every public name in — `from os import *` is
+# `system` with no attribute left to check. Tkinter is the one library whose
+# documentation teaches star imports, and it exports nothing on the deny list.
+STAR_IMPORT_OK = frozenset({"tkinter"})
 
 # Attribute names denied wherever they appear. os and sys are PERMITTED — a
 # real application needs os.path and sys.argv — so the dangerous surface is
@@ -85,7 +109,7 @@ DENIED_ATTRS = frozenset({
     # introspection escapes that reach the interpreter's own state
     "__subclasses__", "__bases__", "__mro__", "__globals__", "__code__",
     "__closure__", "__builtins__", "__import__", "__reduce__",
-    "__reduce_ex__", "__getattribute__",
+    "__reduce_ex__", "__getattribute__", "__dict__",
     # loaders
     "load_module", "import_module", "exec_module", "loads", "load",
 })
@@ -121,15 +145,36 @@ def _roots(names: Sequence[str]) -> Set[str]:
 def allowed_modules(mode: str, extra: Sequence[str] = ()) -> Set[str]:
     """Every root module name importable in ``mode``.
 
-    ``extra`` is the project's declared `requires` — a camera app's SDK. It
-    widens the allowlist for THAT project only, so an import nobody declared
-    is still refused, and it can never re-admit a denied module: that
-    subtraction happens last."""
+    ``extra`` is the project's declared `requires` — a camera app's SDK — plus,
+    from validate_dir, the project's own modules. It widens the allowlist for
+    THAT project only, so an import nobody declared is still refused, and it
+    can never re-admit a denied module, nor an app module into a standalone
+    project: those subtractions happen last."""
     base = _stdlib_names() | set(THIRD_PARTY) | set(PROJECT_MODULES)
     if mode == "linked":
         base |= set(LINKED_MODULES)
-    base |= _roots(extra)
+    # Council code is never admitted this way (check_requires says why).
+    base |= {r for r in _roots(extra)
+             if r in LINKED_MODULES or r in PROJECT_MODULES
+             or not is_council_module(r)}
+    if mode != "linked":
+        base -= set(LINKED_MODULES)
     return base - set(DENIED_MODULES)
+
+
+def as_requires(value) -> List[str]:
+    """A `requires` value as a clean list, whatever shape it arrived in.
+
+    A hand-edited or model-written gspec may say "requires": "numpy" where a
+    list was meant; iterating that string gave ['n', 'u', 'm', 'p', 'y'] and
+    main.py imported each letter."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return parse_requires(value)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [str(value).strip()] if str(value).strip() else []
 
 
 def parse_requires(text) -> List[str]:
@@ -144,22 +189,35 @@ def parse_requires(text) -> List[str]:
     return out
 
 
-def check_requires(names: Sequence[str]) -> List[str]:
+def is_council_module(root: str) -> bool:
+    """Whether ``root`` is a module of the Council itself (a .py file or a
+    package beside this one)."""
+    return ((APP_ROOT / f"{root}.py").is_file()
+            or (APP_ROOT / root / "__init__.py").is_file())
+
+
+def check_requires(names: Sequence[str], mode: str = "linked") -> List[str]:
     """Problems with a project's declared `requires`, one message each.
 
     Declaring a package is how a project widens its own allowlist, so the
     declaration itself is gated: a denied module (subprocess, socket, pickle,
-    ...) and council_engine cannot be declared into it."""
+    ...) cannot be declared into it, and neither can Council code. `requires`
+    is for PACKAGES. The Council modules an app may reach are LINKED_MODULES,
+    and only in linked mode: council_agents, vault_rag and the rest import
+    council_engine at load, so declaring one would build the second GGUF
+    singleton the council_engine ban exists to prevent."""
     errs: List[str] = []
     seen: Set[str] = set()
-    for raw in names:
+    for raw in as_requires(names):
         name = str(raw).strip()
         if not name:
             continue
         parts = name.split(".")
-        if not all(p.isidentifier() for p in parts):
+        if not all(p.isidentifier() and not keyword.iskeyword(p)
+                   for p in parts):
             errs.append(f"requires {name!r} is not an importable module name "
-                        f"(use the IMPORT name — PIL, not Pillow)")
+                        f"(one package per entry, by its IMPORT name — PIL, "
+                        f"not Pillow; no 'as')")
             continue
         root = parts[0]
         if root in DENIED_MODULES:
@@ -168,6 +226,15 @@ def check_requires(names: Sequence[str]) -> List[str]:
         elif root == "council_engine":
             errs.append("requires 'council_engine': it would build a second "
                         "GGUF singleton inside the app")
+        elif root in LINKED_MODULES:
+            if mode != "linked":
+                errs.append(f"requires {name!r}: {root!r} is Council code, so "
+                            f"a standalone project cannot use it — switch the "
+                            f"project to linked mode")
+        elif root not in PROJECT_MODULES and is_council_module(root):
+            errs.append(f"requires {name!r}: {root!r} is part of the Council, "
+                        f"not a package. An app may use only the linked "
+                        f"modules: {', '.join(sorted(LINKED_MODULES))}")
         if name in seen:
             errs.append(f"requires {name!r} is listed twice")
         seen.add(name)
@@ -199,11 +266,27 @@ def validate(code: str, mode: str = "linked",
                 root = a.name.split(".")[0]
                 _check_import(root, node, mode, allowed, errs)
         elif isinstance(node, ast.ImportFrom):
-            if node.level:          # relative: inside the project, fine
-                continue
             root = (node.module or "").split(".")[0]
-            if root:
+            if root and not node.level:     # relative: inside the project
                 _check_import(root, node, mode, allowed, errs)
+            # `from os import system` binds the denied attribute to a plain
+            # name, and a plain name is never checked again — so the IMPORTED
+            # NAMES are checked here, relative imports included.
+            line = getattr(node, "lineno", 0)
+            for a in node.names:
+                if a.name == "*":
+                    if node.level or root in STAR_IMPORT_OK:
+                        continue
+                    errs.append(f"line {line}: `from {node.module} import *` "
+                                f"is not permitted in a generated app — "
+                                f"import the names it uses")
+                elif a.name in DENIED_BUILTINS or (
+                        a.name in DENIED_ATTRS
+                        and not (a.name in ("load", "loads")
+                                 and root in SAFE_LOAD_RECEIVERS)):
+                    errs.append(f"line {line}: importing {a.name!r} from "
+                                f"{node.module or '.'} is not permitted in a "
+                                f"generated app")
 
         # ---- attribute access: CALLED OR NOT ----
         elif isinstance(node, ast.Attribute):
@@ -219,8 +302,9 @@ def validate(code: str, mode: str = "linked",
         # ---- name-level ----
         elif isinstance(node, ast.Name):
             if node.id in DENIED_BUILTINS:
+                call = "" if node.id.startswith("__b") else "()"
                 errs.append(f"line {getattr(node, 'lineno', 0)}: "
-                            f"{node.id}() is not permitted")
+                            f"{node.id}{call} is not permitted")
 
         # ---- getattr(x, "system") — the string-indirection bypass ----
         elif isinstance(node, ast.Call):
@@ -258,6 +342,10 @@ def _check_import(root: str, node: ast.AST, mode: str, allowed: Set[str],
             f"line {line}: {root!r} is an app module, so this project is not "
             f"standalone. Switch the project to linked mode, or remove it.")
         return
+    if root not in PROJECT_MODULES and is_council_module(root):
+        errs.append(f"line {line}: {root!r} is part of the Council — an app "
+                    f"may use only the linked modules")
+        return
     errs.append(f"line {line}: {root!r} is not on the {mode} allowlist — if "
                 f"the app needs it, add it to the project's requires")
 
@@ -273,41 +361,72 @@ def _receiver_name(node: ast.AST) -> str:
     return ""
 
 
+# Folders inside a project that hold no code the app runs.
+_SKIP_DIRS = frozenset({"__pycache__", ".git", ".venv", "venv", "env"})
+
+
 def project_sources(pdir) -> list:
-    """Every .py a generated project runs: ui/, the hand-written files and
-    the entry points. Built from what EXISTS, so the launch.py shim left in
-    older projects is gated too — an ungated file is a hole in the gate."""
-    from pathlib import Path
+    """Every .py in a generated project, subfolders included.
+
+    Not a fixed list of the files generation writes: the app can import any
+    module it can reach, and a helper module the gate never read was a way
+    past it — measured, a widgets.py beside main.py ran subprocess with the
+    gate saying OK. Built from what EXISTS, so the launch.py shim left in
+    older projects is gated too."""
     pdir = Path(pdir)
-    return (sorted((pdir / "ui").glob("*.py"))
-            + [p for p in (pdir / "app.py", pdir / "handlers.py",
-                           pdir / "main.py", pdir / "launch.py")
-               if p.is_file()])
+    out = []
+    for p in sorted(pdir.rglob("*.py")):
+        rel = p.relative_to(pdir).parts[:-1]
+        if any(part in _SKIP_DIRS or part.startswith(".") for part in rel):
+            continue
+        out.append(p)
+    return out
+
+
+def project_modules(pdir) -> List[str]:
+    """The top-level module names a project provides itself — its own .py
+    files and packages — which its code may import.
+
+    Safe to admit because project_sources gates every one of them. A local
+    file cannot re-admit a denied module or council_engine: allowed_modules
+    and _check_import still subtract and refuse those by name."""
+    pdir = Path(pdir)
+    names = [p.stem for p in pdir.glob("*.py")]
+    names += [d.name for d in pdir.iterdir()
+              if d.is_dir() and (d / "__init__.py").is_file()]
+    return sorted({n for n in names if n.isidentifier()})
 
 
 def validate_dir(pdir, mode: str = "linked",
                  extra_modules: Sequence[str] = ()) -> Tuple[bool, List[str]]:
     """The gate over a whole project directory. The one call Generate, Run
     and run_example_gui all make, so they cannot disagree about a project."""
-    return validate_project(project_sources(pdir), mode, extra_modules)
+    return validate_project(project_sources(pdir), mode, extra_modules,
+                            local_modules=project_modules(pdir), root=pdir)
 
 
 def validate_project(paths: Sequence, mode: str = "linked",
-                     extra_modules: Sequence[str] = ()
+                     extra_modules: Sequence[str] = (),
+                     local_modules: Sequence[str] = (), root=None
                      ) -> Tuple[bool, List[str]]:
-    """Validate several files, prefixing each fault with its filename.
+    """Validate several files, prefixing each fault with its filename (its
+    path under ``root`` when given, so ui/app.py and app.py stay distinct).
 
     ``extra_modules`` is the project's declared `requires`; a bad declaration
-    is itself a fault."""
-    from pathlib import Path
-    all_errs: List[str] = list(check_requires(extra_modules))
+    is itself a fault. ``local_modules`` are the project's own modules."""
+    all_errs: List[str] = list(check_requires(extra_modules, mode))
+    importable = as_requires(extra_modules) + list(local_modules)
     for p in paths:
         p = Path(p)
         try:
+            name = p.relative_to(root).as_posix() if root else p.name
+        except ValueError:
+            name = p.name
+        try:
             src = p.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
-            all_errs.append(f"{p.name}: cannot read ({exc})")
+            all_errs.append(f"{name}: cannot read ({exc})")
             continue
-        ok, errs = validate(src, mode, extra_modules)
-        all_errs.extend(f"{p.name}: {e}" for e in errs)
+        ok, errs = validate(src, mode, importable)
+        all_errs.extend(f"{name}: {e}" for e in errs)
     return (not all_errs), all_errs

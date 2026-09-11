@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import queue
 import re
 import subprocess
 import sys
@@ -48,6 +49,18 @@ _FRAME_RE = re.compile(r'File "([^"]+)", line (\d+)')
 # the atexit hook has to reach them without a reference to the tab.
 _LIVE: Dict[str, "Preview"] = {}
 _LOCK = threading.RLock()
+
+
+@dataclass
+class _Ticket:
+    """A Run that is still being checked (run_checked) — not yet a process,
+    so not in _LIVE, and until this existed Stop could not reach it: Stop
+    returned False, and the preview opened anyway when the check finished."""
+    cancelled: str = ""        # why, once cancelled
+
+
+# Runs being checked, keyed like _LIVE.
+_PENDING: Dict[str, _Ticket] = {}
 
 
 # How long a preview gets to close itself after Stop before it is killed. A
@@ -73,6 +86,8 @@ class Preview:
     grace: float = STOP_GRACE  # what the last stop() actually waited
     _threads: List[threading.Thread] = field(default_factory=list)
     _tail: List[str] = field(default_factory=list)
+    # Output waiting for the callbacks — see _deliver.
+    _q: "queue.SimpleQueue" = field(default_factory=queue.SimpleQueue)
 
     @property
     def pid(self) -> int:
@@ -129,9 +144,31 @@ class Preview:
 
 
 def _emit(pv: Preview, text: str, level: str) -> None:
+    """Queue a line for on_line. Never blocks, never calls the callback."""
     if pv.on_line:
+        pv._q.put(("line", text, level))
+
+
+def _deliver(pv: Preview) -> None:
+    """Hand queued output to the callbacks, in order, on a thread of its own.
+
+    The pipe readers used to call on_line themselves. The designer's on_line
+    marshals onto the Tk thread and BLOCKS until Tk runs it, while Stop waits
+    for the app on that same Tk thread. So a reader sat inside the callback,
+    the app filled its pipe and blocked writing in its own on_close, and Stop
+    killed it as hung — measured with ~5 KB of on_close output. Now a reader
+    only puts lines on a queue, which never blocks, so the app can always
+    finish closing; this thread waits on Tk instead, and nothing waits on it.
+    on_exit is queued behind the last line, so it still arrives last."""
+    while True:
+        item = pv._q.get()
+        if item is None:
+            return
         try:
-            pv.on_line(text, level)
+            if item[0] == "line" and pv.on_line:
+                pv.on_line(item[1], item[2])
+            elif item[0] == "exit" and pv.on_exit:
+                pv.on_exit(item[1])
         except Exception:
             pass
 
@@ -181,11 +218,8 @@ def _watch(pv: Preview) -> None:
     with _LOCK:
         if _LIVE.get(str(pv.project)) is pv:
             _LIVE.pop(str(pv.project), None)
-    if pv.on_exit:
-        try:
-            pv.on_exit(code)
-        except Exception:
-            pass
+    pv._q.put(("exit", code))
+    pv._q.put(None)             # ends _deliver
 
 
 def explain_failure(stderr_text: str, project: Path) -> str:
@@ -248,7 +282,7 @@ def start(project, *, on_line: Optional[Callable[[str, str], None]] = None,
         raise FileNotFoundError(
             f"no main.py in {proj} — generate the project first")
 
-    stop(proj)      # one preview per project
+    _stop_live(str(proj))      # one preview per project
 
     env = dict(os.environ)
     env["PYTHONUNBUFFERED"] = "1"
@@ -280,6 +314,7 @@ def start(project, *, on_line: Optional[Callable[[str, str], None]] = None,
                              daemon=True)
         t.start()
         pv._threads.append(t)
+    threading.Thread(target=_deliver, args=(pv,), daemon=True).start()
     threading.Thread(target=_watch, args=(pv,), daemon=True).start()
 
     with _LOCK:
@@ -298,13 +333,29 @@ def run_checked(project, *, python_spec: str = "", mode: str = "linked",
     python_envs.preflight) runs on a worker thread, because importing a
     vendor SDK to check it can take seconds. Everything that touches the UI —
     each log line and the launch — is handed back through ``call_soon``
-    (for Tk: ``lambda fn: widget.after(0, fn)``). Returns the worker thread."""
+    (for Tk: ``lambda fn: widget.after(0, fn)``). Returns the worker thread.
+
+    Stop (gui_runner.stop) cancels a Run that is still being checked, and so
+    does a newer Run of the same project."""
     import python_envs
+    key = str(Path(project).resolve())
+    ticket = _Ticket()
+    with _LOCK:
+        older = _PENDING.get(key)
+        if older is not None:
+            older.cancelled = "a newer Run replaced it"
+        _PENDING[key] = ticket
 
     def _line(text, level):
         call_soon(lambda: log(("! " if level == "error" else "  ") + text))
 
     def _launch(pf):
+        with _LOCK:
+            if _PENDING.get(key) is ticket:
+                _PENDING.pop(key, None)
+        if ticket.cancelled:
+            log(f"  Run cancelled: {ticket.cancelled}.")
+            return
         for ln in pf.lines:
             log(("! " if ln.startswith(("Not", "  -")) else "  ") + ln)
         if not pf.ok:
@@ -316,7 +367,19 @@ def run_checked(project, *, python_spec: str = "", mode: str = "linked",
             log(f"could not start preview: {exc}")
 
     def _check():
-        pf = python_envs.preflight(project, python_spec, mode, requires)
+        try:
+            pf = python_envs.preflight(project, python_spec, mode, requires)
+        except Exception as exc:
+            # Without this the worker died silently and Run sat at
+            # "checking ..." for ever, with no message and no preview.
+            pf = python_envs.Preflight(False, "", [
+                f"Not started: the check itself failed — "
+                f"{type(exc).__name__}: {exc}"])
+        if pf.ok and not ticket.cancelled:
+            # Close the previous preview HERE, on this worker. start() would
+            # do it on the caller's thread — the designer's Tk thread, frozen
+            # for as long as the old app takes over its on_close.
+            _stop_live(key)
         call_soon(lambda: _launch(pf))
 
     log(f"checking {python_envs.display(python_spec)} ...")
@@ -336,9 +399,17 @@ def _listens_for_stop(proj: Path) -> bool:
 
 
 def stop(project, grace: float = STOP_GRACE) -> bool:
-    """Stop one project's preview, cleanly if it will go. True if something
-    was running."""
+    """Stop one project's preview, cleanly if it will go — or cancel its Run
+    if that is still being checked. True if either was happening."""
     key = str(Path(project).resolve())
+    with _LOCK:
+        ticket = _PENDING.pop(key, None)
+        if ticket is not None:
+            ticket.cancelled = "Stop was pressed while it was being checked"
+    return _stop_live(key, grace) or ticket is not None
+
+
+def _stop_live(key: str, grace: float = STOP_GRACE) -> bool:
     with _LOCK:
         pv = _LIVE.pop(key, None)
     if pv is None:
@@ -355,6 +426,9 @@ def stop_all(grace: float = STOP_GRACE) -> int:
     deadline, so three camera apps closing take one grace period, not three."""
     import time
     with _LOCK:
+        for ticket in _PENDING.values():
+            ticket.cancelled = "the designer is closing"
+        _PENDING.clear()
         pvs = list(_LIVE.values())
         _LIVE.clear()
     for pv in pvs:

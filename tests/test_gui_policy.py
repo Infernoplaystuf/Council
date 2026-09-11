@@ -317,3 +317,108 @@ def test_atexit_backstop_is_registered():
     src = inspect.getsource(run)
     assert "atexit.register(stop_all)" in src, (
         "without it, a crash in the designer leaves an orphaned preview window")
+
+
+# ============================================================
+# Every SPELLED way to reach a denied name (adversarial review, 2026-09)
+# ============================================================
+#
+# The gate checked `os.system(...)` as an attribute and nothing else, so each
+# of these passed it — and the gate is enforced at Run. `from os import
+# system` binds the denied attribute to a plain name, which is never checked
+# again; `from os import *` does the same for every name at once.
+
+@pytest.mark.parametrize("code", [
+    "from os import system\nsystem('x')",
+    "from os import system as s\ns('x')",
+    "from shutil import rmtree\nrmtree('x')",
+    "from os import remove, unlink, execv",
+    "from nt import system",
+    "from os import *\nsystem('x')",
+    "from shutil import *",
+    "import builtins\nbuiltins.exec('1')",
+    "__builtins__.exec('1')",
+    "import os\nos.__dict__['system']('x')",
+    "import os\nvars(os)['system']('x')",
+    "globals()['__builtins__']['eval']('1')",
+    "from . import system",
+])
+def test_a_denied_name_is_refused_however_it_is_spelled(code):
+    good, errs = ok(code)
+    assert not good, f"passed the gate: {code!r}"
+
+
+@pytest.mark.parametrize("code", [
+    "import re\nre.compile('a')",
+    "from json import loads\nloads('1')",
+    "from os import path\npath.join('a', 'b')",
+    "from tkinter import *\nTk",
+    "from PIL import Image\nImage.open",
+])
+def test_the_honest_spellings_still_pass(code):
+    good, errs = ok(code)
+    assert good, errs
+
+
+# ============================================================
+# The gate reads every file the app can import
+# ============================================================
+
+def _proj(tmp_path):
+    (tmp_path / "ui").mkdir()
+    (tmp_path / "ui" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "main.py").write_text("from app import main\n",
+                                      encoding="utf-8")
+    (tmp_path / "app.py").write_text("def main():\n    pass\n",
+                                     encoding="utf-8")
+    return tmp_path
+
+
+@pytest.mark.parametrize("where", ["widgets.py", "helpers.py",
+                                   "ui/sub/evil.py"])
+def test_a_helper_module_is_gated_too(tmp_path, where):
+    """MEASURED: a root-level widgets.py (its name is on PROJECT_MODULES)
+    running subprocess got 'policy: OK', and importing the app ran it."""
+    pdir = _proj(tmp_path)
+    (pdir / where).parent.mkdir(parents=True, exist_ok=True)
+    (pdir / where).write_text("import subprocess\nsubprocess.run(['x'])\n",
+                              encoding="utf-8")
+    good, errs = pol.validate_dir(pdir)
+    assert not good and any("subprocess" in e for e in errs), errs
+
+
+def test_the_projects_own_helper_module_may_be_imported(tmp_path):
+    """The gate used to say 'add it to requires', and the probe then said it
+    was missing — a project with its own helper could never Run."""
+    pdir = _proj(tmp_path)
+    (pdir / "helpers.py").write_text("def scale(x):\n    return x * 2\n",
+                                     encoding="utf-8")
+    (pdir / "app.py").write_text("import helpers\ndef main():\n    pass\n",
+                                 encoding="utf-8")
+    good, errs = pol.validate_dir(pdir)
+    assert good, errs
+    assert "helpers" in pol.project_modules(pdir)
+
+
+def test_a_local_file_cannot_readmit_a_denied_module(tmp_path):
+    pdir = _proj(tmp_path)
+    (pdir / "app.py").write_text("import subprocess\nimport council_engine\n",
+                                 encoding="utf-8")
+    (pdir / "subprocess.py").write_text("", encoding="utf-8")
+    (pdir / "council_engine.py").write_text("", encoding="utf-8")
+    good, errs = pol.validate_dir(pdir)
+    assert not good
+    assert any("'subprocess'" in e for e in errs)
+    assert any("council_engine" in e for e in errs)
+
+
+def test_generated_output_folders_are_not_read_as_code(tmp_path):
+    pdir = _proj(tmp_path)
+    (pdir / "__pycache__").mkdir()
+    (pdir / "__pycache__" / "x.py").write_text("import subprocess\n",
+                                               encoding="utf-8")
+    (pdir / ".backups").mkdir()
+    (pdir / ".backups" / "app.py").write_text("import subprocess\n",
+                                              encoding="utf-8")
+    good, errs = pol.validate_dir(pdir)
+    assert good, errs
