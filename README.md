@@ -492,7 +492,7 @@ a project you can run and keep editing.
 
 ### Try it in one command
 
-Three worked examples ship with the repo. From the repo root, on any OS:
+Four worked examples ship with the repo. From the repo root, on any OS:
 
 ```bash
 python run_example_gui.py
@@ -501,11 +501,24 @@ python run_example_gui.py
 That lists them. To build one and launch it:
 
 ```bash
-python run_example_gui.py barbie_capture_v2
+python run_example_gui.py barbie_capture_v3
 ```
 
-`barbie_capture_v2` is the current version: a readable font, and a **region of
-interest** on the live image. Browse to a folder of frames, click **Draw ROI**
+`barbie_capture_v3` is the current version: everything in v2, in **Arial**,
+plus a **frame classifier**. Type a class name and **Add class** (e.g. *good*,
+*bad timing*); pick a class in the list, scrub to a frame and **Mark this
+frame**; mark a few of each, then **Train** — it reports a leave-one-out
+accuracy so you can see whether it has learned anything. **Predict this frame**
+names the frame on screen's likely class and the most similar frame you
+marked; **Classify all frames** lists every frame in the folder with its class.
+It is a random forest on small greyscale thumbnails (scikit-learn, no model
+download). On the 120-frame sample capture, 3 bad-timing and 4 good marked
+frames were enough to find all 10 bad-timing frames with no false alarms.
+Classes and marks are kept in your vault under `classifiers/<name>/` — never in
+the capture folder — and a class that still labels frames cannot be removed.
+
+`barbie_capture_v2` adds a readable font and a **region of
+interest** on the live image to v1. Browse to a folder of frames, click **Draw ROI**
 and drag a box on the image, then **Apply ROI** — the view zooms to the box and
 stays zoomed as you scrub. **Save cropped frames** writes every frame cropped to
 the box into a new `roi_…` subfolder of the folder you choose; it never writes
@@ -513,15 +526,16 @@ into the capture folder or overwrites anything. `barbie_capture` (v1) is kept
 alongside it so the two can be compared.
 
 **What you need:** Python 3.10+ with `tkinter`, plus **Pillow** and **numpy**
-for v2 (it shows frames, crops them, and scans them):
+(v2 and v3 show frames, crop them, and scan them) and **scikit-learn** for
+v3's classifier:
 
 ```bash
-python -m pip install Pillow numpy
+python -m pip install Pillow numpy scikit-learn
 ```
 
-v2 *declares* those two in its `requires`, so under a Python that lacks either
-it says so at startup and exits, rather than opening a window whose live view
-stays blank. You do **not** need `requirements.txt` for this — that file
+Each version *declares* what it needs in its `requires`, so under a Python
+that lacks one it says so at startup and exits, rather than opening a window
+whose live view stays blank. You do **not** need `requirements.txt` for this — that file
 covers the whole Council app (models, RAG, plotting, speech) and is a much
 larger install.
 

@@ -46,7 +46,7 @@ MODES = ("linked", "standalone")
 LINKED_MODULES = frozenset({
     "image_stats", "image_index", "plot_registry", "plots_pane", "graph_data",
     "vault_analyst", "data_index", "df_cache", "stats_cache", "provenance",
-    "frame_timing", "frame_roi",
+    "frame_timing", "frame_roi", "frame_classes",
 })
 
 # Third-party packages both modes may use.

@@ -606,7 +606,19 @@ def validate(spec: Spec) -> Tuple[bool, List[str]]:
                     errs.append(f"{where}: drives.roi is set but {snk_name!r} "
                                 f"has roi off — set its roi prop to true so a "
                                 f"box can be drawn")
-            names = [n for n in (src_name, snk_name, roi_name,
+            # Optional port that shows the displayed file's name — what
+            # "this frame" means to a button that marks or predicts it.
+            cur_name = str(d.get("current") or "")
+            if cur_name:
+                cp = port_of.get(cur_name)
+                if cp is None:
+                    errs.append(f"{where}: drives.current names no port "
+                                f"({cur_name!r})")
+                elif cp.kind not in ("label", "entry"):
+                    errs.append(f"{where}: drives.current must be a label or "
+                                f"entry, to show the file name; "
+                                f"{cur_name!r} is a {cp.kind}")
+            names = [n for n in (src_name, snk_name, roi_name, cur_name,
                                  w.port.name if w.port else None) if n]
             if len(set(names)) != len(names):
                 errs.append(f"{where}: a sequence link needs a DIFFERENT "

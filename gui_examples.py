@@ -91,6 +91,13 @@ NOTES: Dict[str, str] = {
         "from ONE call; a Save button whose `script` passes three ports to a "
         "function and shows its one-line result; labels ABOVE their boxes."
     ),
+    "barbie_capture_v3": (
+        "v2 plus a frame classifier, in Arial. Shows: `drives.current` "
+        "naming a label that shows the file on screen; a column of buttons "
+        "whose `script` links call frame_classes to add classes, mark the "
+        "current frame, train and predict; soft results (the class list) "
+        "and hard failures (no class picked) handled differently."
+    ),
 }
 
 # The examples sent to a model when none is named. The newest version teaches
@@ -121,7 +128,9 @@ Beyond kind/label/x/y/w/h, a shape may declare:
                 steps the target widget through the files in the folder port,
                 and sizes itself to the folder automatically. Add
                 "roi": <entry port> to mirror a box drawn on the target
-                (which needs props {"roi": true}) as "x, y, w, h".
+                (which needs props {"roi": true}) as "x, y, w, h", and
+                "current": <label or entry port> to show the displayed
+                file's name — what "this frame" means to a button.
 """
 
 

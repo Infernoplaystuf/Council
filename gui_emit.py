@@ -48,7 +48,7 @@ REGION_CLOSE = re.compile(r"^\s*#\s*endregion\b")
 LINKED_ALLOWLIST = (
     "image_stats", "image_index", "plot_registry", "plots_pane", "graph_data",
     "vault_analyst", "data_index", "df_cache", "stats_cache", "provenance",
-    "frame_timing", "frame_roi",
+    "frame_timing", "frame_roi", "frame_classes",
 )
 
 
@@ -259,8 +259,17 @@ def construct(w: WidgetSpec, parent: str) -> str:
                 f"orient={_py(_prop(w, 'orient', 'horizontal'))}{ck})")
     if k == "label":
         cls = "tk.Label" if classic else "ttk.Label"
+        # wraplength was in the label's catalogue and the inspector offered
+        # it, but it was never emitted — a long status line was cut off
+        # mid-word at the label's edge instead of wrapping. justify="left"
+        # keeps the wrapped lines aligned with the first.
+        try:
+            wrap = int(_prop(w, "wraplength", 0) or 0)
+        except (TypeError, ValueError):
+            wrap = 0
+        wrapkw = f", wraplength={wrap}, justify=\"left\"" if wrap > 0 else ""
         return (f"{cls}({parent}, text={_py(_text_of(w))}, "
-                f"anchor={_py(_prop(w, 'anchor', 'w'))}{ck})")
+                f"anchor={_py(_prop(w, 'anchor', 'w'))}{wrapkw}{ck})")
     if k == "button":
         cls = "tk.Button" if classic else "ttk.Button"
         return f"{cls}({parent}, text={_py(_text_of(w))}{cmd}{ck})"
@@ -285,8 +294,13 @@ def construct(w: WidgetSpec, parent: str) -> str:
         return (f"ttk.Combobox({parent}, "
                 f"values={_py(_prop(w, 'values', []))}, state={_py(state)})")
     if k == "listbox":
+        # exportselection=False: with Tk's default, selecting in ANY other
+        # listbox or entry silently CLEARS this one's selection — so a class
+        # picked in one list vanished when the user clicked in another, and
+        # "Mark this frame" found nothing selected.
         return (f"tk.Listbox({parent}, "
-                f"selectmode={_py(_prop(w, 'selectmode', 'browse'))}{ck})")
+                f"selectmode={_py(_prop(w, 'selectmode', 'browse'))}, "
+                f"exportselection=False{ck})")
     if k == "spinbox":
         cls = "tk.Spinbox" if classic else "ttk.Spinbox"
         return (f"{cls}({parent}, from_={_py(_prop(w, 'from_', 0))}, "
@@ -1727,10 +1741,16 @@ class _FrameBrowser:
 
     def __init__(self, folder_port, index_port, target_port, *,
                  suffixes=(), recursive=False, status_port=None,
-                 roi_port=None):
+                 roi_port=None, current_port=None):
         self.folder, self.index, self.target = folder_port, index_port, target_port
         self.status = status_port
         self.roi = roi_port
+        # The displayed file's path RELATIVE to the folder (usually just its
+        # name). Anything that acts on "this frame" — marking it with a class
+        # — reads it here rather than recomputing it from the index, which
+        # would need this class's exact sort and suffix rules and would label
+        # the wrong file the moment they differed.
+        self.current = current_port
         self.suffixes = tuple(s.lower() for s in (suffixes or self.SUFFIXES))
         self.recursive = bool(recursive)
         self.files = []
@@ -1793,6 +1813,7 @@ class _FrameBrowser:
         folder = folder.strip().strip('"')
         if folder and not os.path.isdir(folder):
             return          # half-typed path: keep what is already loaded
+        self._root = folder              # what relative paths are relative TO
         files, stack = [], ([folder] if folder else [])
         while stack:
             try:
@@ -1840,6 +1861,7 @@ class _FrameBrowser:
             self._last = None
             try: self.target.set(None)
             except Exception: pass
+            self._set_current("")
             folder = str(self.folder.get() or "").strip()
             if folder:
                 self._say(f"No images in {folder}", error=True)
@@ -1874,11 +1896,28 @@ class _FrameBrowser:
                     frame = im.copy()
             self.target.set(frame)
             self._last = i
+            self._set_current(self.files[i])
             self._say(f"{i + 1} / {len(self.files)}  "
                       f"{os.path.basename(self.files[i])}")
         except Exception as exc:
             self._say(f"Cannot read {os.path.basename(self.files[i])}: {exc}",
                       error=True)
+
+    def _set_current(self, path) -> None:
+        """Publish the displayed file relative to the folder ("" for none)."""
+        if self.current is None:
+            return
+        import os
+        rel = ""
+        if path:
+            try:
+                rel = os.path.relpath(path, getattr(self, "_root", "") or ".")
+            except ValueError:            # another drive: keep it absolute
+                rel = str(path)
+        try:
+            self.current.set(rel)
+        except Exception:
+            pass
 
     # -- ROI sync -----------------------------------------------------
     def _roi_drawn(self, roi) -> None:
@@ -2118,6 +2157,7 @@ def emit_ports(spec: Spec, aliases: Optional[Dict[str, str]] = None) -> str:
         folder, target = str(d.get("folder") or ""), str(d.get("target") or "")
         status = str(d.get("status") or "")
         roi = str(d.get("roi") or "")
+        current = str(d.get("current") or "")
         index = w.port.name if w.port else ""
         if not (folder in by_port and target in by_port and index):
             # gui_spec.validate blocks this before emit is reached; the guard
@@ -2133,7 +2173,9 @@ def emit_ports(spec: Spec, aliases: Optional[Dict[str, str]] = None) -> str:
         L.append(f"            status_port="
                  f"{('self.' + status) if status in by_port else 'None'},")
         L.append(f"            roi_port="
-                 f"{('self.' + roi) if roi in by_port else 'None'})")
+                 f"{('self.' + roi) if roi in by_port else 'None'},")
+        L.append(f"            current_port="
+                 f"{('self.' + current) if current in by_port else 'None'})")
     return "\n".join(L).rstrip() + "\n"
 
 

@@ -53,6 +53,20 @@ from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Sequence, Tup
 
 RESERVED_PORT_NAMES: FrozenSet[str] = frozenset({"read", "apply"})
 
+
+def _policy_denied() -> FrozenSet[str]:
+    """Names the policy gate refuses as an attribute ANYWHERE — `remove`,
+    `load`, `kill`, `system`, ... A port is emitted as `self.<name> = ...` in
+    ui/ports.py, so a port with one of these names makes the gate refuse the
+    whole app. Measured: a button labelled "Remove" produced
+        ports.py: line 809: self.remove is not permitted in a generated app
+    and, now the gate is enforced at Run, the app would not start."""
+    try:
+        import gui_policy as _pol
+        return frozenset(_pol.DENIED_ATTRS) | frozenset(_pol.DENIED_BUILTINS)
+    except Exception:                      # pragma: no cover - always present
+        return frozenset()
+
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
@@ -88,6 +102,9 @@ def validate_port_name(name: str, taken: Iterable[str] = ()) -> Tuple[bool, str]
         return False, f"{name!r} starts with '_' (reserved for internals)"
     if s in RESERVED_PORT_NAMES:
         return False, f"{name!r} is reserved (Ports.{s})"
+    if s in _policy_denied():
+        return False, (f"{name!r} would make the policy gate refuse the app "
+                       f"(it is also the name of a call the gate blocks)")
     if s in set(taken):
         return False, f"{name!r} is already in use"
     return True, ""
@@ -115,6 +132,9 @@ def default_port_name(kind: str, label: str, group: str = "",
         base = base.lstrip("_") or "value"
     if base in RESERVED_PORT_NAMES:
         base = f"{base}_value"
+    if base in _policy_denied():
+        # "Remove" -> remove_button: still readable, never refused by the gate
+        base = f"{base}_{slug(kind) or 'value'}"
     used = set(taken)
     if base not in used:
         return base
