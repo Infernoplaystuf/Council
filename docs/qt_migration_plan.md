@@ -1,12 +1,13 @@
 # Tkinter -> PySide6: the migration plan
 
-Status: **Phase 1 (survey and measurement) complete. Nothing has been ported.**
-This document is the proposal; the numbers behind it are in
+Status: **Phase 1 complete. Stage 1 (the vertical slice) is built and working** —
+see §11 for what actually runs today. The numbers behind the plan are in
 [qt_migration/measurements.md](qt_migration/measurements.md), and the scripts that
 produce them are in [qt_migration/probes/](qt_migration/probes/).
 
 Read section 9 first if you only read one part: it is the list of decisions that
-are yours, not mine.
+are yours, not mine. They are still open — the slice was built so that answering
+them is cheap, not to pre-empt them.
 
 ---
 
@@ -269,3 +270,54 @@ the gate is AST. Only items 2-4 and the screenshot need a real Qt env.
 - **Text is reinterpreted by Qt.** `&` in a button caption becomes a mnemonic, and
   `QLabel` auto-detects rich text, so a caption like `<3 items` can vanish. The
   emitter must escape captions.
+
+---
+
+## 11. What is built (Stage 1, done)
+
+The vertical slice from §8 exists and runs. `gui_emit.emit(spec, path, target="qt")`
+writes a complete PySide6 project from an unmodified `.gspec`.
+
+**Verified, not asserted:**
+
+| Claim | How it was checked |
+|---|---|
+| Tk output did not move | Every example emitted through the new dispatch is **byte-identical** to the pre-change output, and `emit(...)` with no `target=` equals `target="tk"`. Pinned by `tests/test_gui_emit_qt.py`. |
+| The Qt project runs | `image_viewer` generated as Qt, launched under PySide6 6.10.2: the frame browser found 8 frames, displayed `frame_1`, the scrubber moved to index 4 and the view followed to `frame_5`. Screenshot taken from the running window. |
+| Clean Stop still works | Driven through the real `gui_runner`: `listens_for_stop=True`, the app **closed itself in 0.35 s with exit code 0**, `on_close` ran (where a camera releases its device), no kill needed. |
+| A Qt project passes its own gate | `validate_dir(..., toolkit="qt")` is clean for all four examples; the same project is **refused** on a Tk target. |
+| The escapes stay shut | 14 Qt escape spellings are refused, including the two the root-name allowlist used to miss: `from PySide6 import QtNetwork` and `import PySide6.QtNetwork`. |
+| Ordinary Qt code is not refused | `app.exec()`, `QFileDialog.getOpenFileName`, `QTimer.singleShot`, `QPixmap(path)` all pass. `exec` must stay out of `DENIED_ATTRS` or every Qt app breaks. |
+| Both targets agree where they must | Same wireframe -> identical `handlers.py` and identical port names on both targets. |
+| Nothing regressed | Full suite green: 927 existing + 66 new. |
+
+**New files:** `gui_emit_qt.py` (the Qt backend), `tests/test_gui_emit_qt.py`.
+**Changed:** `gui_emit.py` (a ~60-line dispatch, nothing else), `gui_policy.py`
+(the toolkit-aware allowlist and the Qt deny rules), `gui_projects.py`
+(`Manifest.toolkit` + `toolkit_of()`).
+
+**Design decisions taken while building, worth knowing:**
+
+- **The toolkit is write-once per project, and `emit()` enforces it.** `app.py`
+  runs the event loop and is never rewritten, so regenerating `ui/` for the other
+  toolkit would leave a project whose `app.py` cannot drive its own UI. The
+  truth is read back out of `app.py`, not trusted from the manifest.
+- **Colour is a stylesheet scoped by `objectName`.** An unscoped one cascades into
+  every child — measured: the whole app came out pink, entries and spinboxes
+  included. Scoping also matches Tk, where `resolve_scene` has already decided
+  each child's own colour.
+- **`sticky` sets both alignment and size policy.** Qt takes stretch from the
+  widget's size policy, and a `QPushButton` is Minimum/Fixed by default, so a
+  cell Tk would have filled would otherwise hold a natural-height button.
+- **Per-item padding rides in a nested layout.** `QGridLayout` has no per-item
+  margins; `addLayout` rather than a wrapper widget keeps `parentWidget()` where
+  the spec put it.
+- **No `.load` anywhere in emitted code.** `QPixmap.load(path)` is the natural
+  spelling and the gate refuses it; `QPixmap(path)` does the same job.
+
+**Not done yet** (the rest of Stage 2): the designer UI for choosing the target,
+the toolkit-aware `python_envs` probe (it still requires tkinter of every
+interpreter, so a Qt project cannot yet be Run from the Designer against a
+Qt-only env), the camera/thread worker API, and packaging. Grid-heavy layouts are
+also under-exercised: all four examples are freeform designs, so `_place` carries
+18-42 widgets each and `_cell` only one.

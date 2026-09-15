@@ -135,6 +135,18 @@ class Manifest:
     # machine. A real field, because load_manifest drops unknown keys and a
     # hand-added one would vanish on the next save.
     python: str = ""
+    # Which toolkit this project's code is written in: "tk" (the default and
+    # what every existing project is) or "qt" (PySide6). HERE rather than in
+    # the .gspec for the same reason `python` is: a wireframe generates as
+    # either toolkit, and keeping it neutral is what lets one example prove
+    # both targets.
+    #
+    # WRITE-ONCE IN PRACTICE. app.py builds the root window and runs the event
+    # loop, and it is created once and NEVER rewritten — so flipping this key
+    # on an existing project would regenerate a ui/ its app.py cannot drive.
+    # toolkit_of() reads the truth back out of app.py, and Generate refuses on
+    # a mismatch rather than writing a project that cannot start.
+    toolkit: str = "tk"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -163,7 +175,35 @@ def load_manifest(pdir: Any) -> Manifest:
         created=str(raw.get("created") or ""),
         updated=str(raw.get("updated") or ""),
         python=str(raw.get("python") or ""),
+        # An older manifest has no toolkit key at all, and every project
+        # written before the Qt target is Tk — so the default is the answer,
+        # not a guess.
+        toolkit=str(raw.get("toolkit") or "tk"),
     )
+
+
+def toolkit_of(pdir: Any) -> str:
+    """The toolkit a project's code is ACTUALLY written in, read from app.py.
+
+    The manifest records the intent; app.py is the fact, because it is created
+    once and never rewritten. They can disagree in exactly one way that matters
+    — someone edits the manifest of an existing project — and the result would
+    be a ui/ the app.py cannot drive. Reading it back is what lets Generate
+    refuse with a sentence instead of emitting that.
+
+    Returns "" when there is no app.py yet, which is a NEW project: the
+    manifest is then free to say what it likes.
+    """
+    app = Path(pdir) / "app.py"
+    try:
+        src = app.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    if "PySide6" in src:
+        return "qt"
+    if "tkinter" in src:
+        return "tk"
+    return ""
 
 
 def save_manifest(pdir: Any, m: Manifest) -> None:

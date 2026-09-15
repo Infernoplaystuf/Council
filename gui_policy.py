@@ -65,6 +65,46 @@ LINKED_MODULES = frozenset({
 # Third-party packages both modes may use.
 THIRD_PARTY = frozenset({"pandas", "numpy", "matplotlib", "PIL", "pillow"})
 
+# ---- the Qt target -----------------------------------------------------
+# PySide6 IS NOT ADMITTED BY ROOT NAME, and that distinction is the whole
+# point. Every other rule in this module keys on the root of a dotted import
+# (_check_import sees "PySide6", never "PySide6.QtNetwork"), so putting
+# "PySide6" on an allowlist would admit the entire binding in one step —
+# measured against this gate before the rule below existed:
+#
+#     requires: PySide6   ->   QProcess, QtNetwork, QDesktopServices,
+#                              QSettings, QPluginLoader, QtQml and QtSql
+#                              all passed unchallenged.
+#
+# QtNetwork, QtQml/QtQuick, QtSql and QtDBus all ship inside
+# PySide6-Essentials, so they are present on any machine that can run a Qt
+# project. A generated app needs exactly three modules.
+TOOLKIT_ROOTS = frozenset({"PySide6"})
+QT_SUBMODULES_OK = frozenset({"QtCore", "QtGui", "QtWidgets"})
+
+# A second Qt binding cannot share a process with PySide6 — it loads its own
+# copy of the Qt libraries and the app dies on import. These are refused by
+# name so a declaration cannot smuggle one in.
+FOREIGN_QT = frozenset({"PyQt5", "PyQt6", "PySide2", "qtpy"})
+
+# Names denied wherever they are spelled, for the same reason DENIED_ATTRS
+# exists: a capability reached through an attribute is the same capability.
+# Each of these escapes the process, reaches the network, writes the registry,
+# loads native code, or deletes a tree.
+DENIED_QT_NAMES = frozenset({
+    "QProcess", "QProcessEnvironment",          # a shell by another name
+    "QLibrary", "QPluginLoader",                # loads arbitrary native code
+    "QDesktopServices",                         # openUrl launches a browser
+    "QSettings",                                # writes the Windows registry
+    "QNetworkAccessManager", "QNetworkRequest", "QTcpSocket", "QUdpSocket",
+    "QSslSocket", "QLocalSocket", "QWebSocket",
+    "QSharedMemory",                            # cross-process memory
+    "removeRecursively",                        # QDir's spelling of rmtree
+    "QQmlEngine", "QJSEngine",                  # evaluate arbitrary JS
+    "QSqlDatabase", "QSqlQuery",
+    "QUiLoader",                                # loads UI from a file
+})
+
 # The generated project's own modules.
 # "main" is the entry point since the launch.py -> main.py rename, and the
 # launch.py shim left in older projects is literally `from main import main`.
@@ -142,7 +182,8 @@ def _roots(names: Sequence[str]) -> Set[str]:
     return {str(n).strip().split(".")[0] for n in names if str(n).strip()}
 
 
-def allowed_modules(mode: str, extra: Sequence[str] = ()) -> Set[str]:
+def allowed_modules(mode: str, extra: Sequence[str] = (),
+                    toolkit: str = "tk") -> Set[str]:
     """Every root module name importable in ``mode``.
 
     ``extra`` is the project's declared `requires` — a camera app's SDK — plus,
@@ -151,6 +192,12 @@ def allowed_modules(mode: str, extra: Sequence[str] = ()) -> Set[str]:
     can never re-admit a denied module, nor an app module into a standalone
     project: those subtractions happen last."""
     base = _stdlib_names() | set(THIRD_PARTY) | set(PROJECT_MODULES)
+    if (toolkit or "tk").strip().lower() in ("qt", "pyside6"):
+        # The ROOT only. Which submodules may follow it is _check_qt's job,
+        # and a Qt project does not have to declare its own toolkit in
+        # `requires` — `requires` is for what the APP needs, not the frame
+        # the designer generated it into.
+        base |= set(TOOLKIT_ROOTS)
     if mode == "linked":
         base |= set(LINKED_MODULES)
     # Council code is never admitted this way (check_requires says why).
@@ -223,6 +270,16 @@ def check_requires(names: Sequence[str], mode: str = "linked") -> List[str]:
         if root in DENIED_MODULES:
             errs.append(f"requires {name!r}: {root!r} is never permitted in a "
                         f"generated app, declared or not")
+        elif root in FOREIGN_QT:
+            errs.append(f"requires {name!r}: the Qt target is PySide6, and two "
+                        f"Qt bindings cannot share one process")
+        elif root in TOOLKIT_ROOTS:
+            # Declaring the toolkit would be a way to ask for the whole binding
+            # on a Tk project. A Qt project gets PySide6 from its TARGET, and
+            # only QtCore/QtGui/QtWidgets even then.
+            errs.append(f"requires {name!r}: the toolkit is not declared here — "
+                        f"a Qt project gets PySide6 from its emit target, and "
+                        f"only {', '.join(sorted(QT_SUBMODULES_OK))} with it")
         elif root == "council_engine":
             errs.append("requires 'council_engine': it would build a second "
                         "GGUF singleton inside the app")
@@ -242,7 +299,8 @@ def check_requires(names: Sequence[str], mode: str = "linked") -> List[str]:
 
 
 def validate(code: str, mode: str = "linked",
-             extra_modules: Sequence[str] = ()) -> Tuple[bool, List[str]]:
+             extra_modules: Sequence[str] = (),
+             toolkit: str = "tk") -> Tuple[bool, List[str]]:
     """(ok, errors) for one source file.
 
     Returns EVERY fault, like gui_spec.validate — a user fixing generated or
@@ -257,7 +315,7 @@ def validate(code: str, mode: str = "linked",
     except SyntaxError as exc:
         return False, [f"does not parse: line {exc.lineno}: {exc.msg}"]
 
-    allowed = allowed_modules(mode, extra_modules)
+    allowed = allowed_modules(mode, extra_modules, toolkit)
 
     for node in ast.walk(tree):
         # ---- imports ----
@@ -265,10 +323,12 @@ def validate(code: str, mode: str = "linked",
             for a in node.names:
                 root = a.name.split(".")[0]
                 _check_import(root, node, mode, allowed, errs)
+                _check_qt(a.name, node, errs)
         elif isinstance(node, ast.ImportFrom):
             root = (node.module or "").split(".")[0]
             if root and not node.level:     # relative: inside the project
                 _check_import(root, node, mode, allowed, errs)
+                _check_qt(node.module or "", node, errs)
             # `from os import system` binds the denied attribute to a plain
             # name, and a plain name is never checked again — so the IMPORTED
             # NAMES are checked here, relative imports included.
@@ -280,6 +340,21 @@ def validate(code: str, mode: str = "linked",
                     errs.append(f"line {line}: `from {node.module} import *` "
                                 f"is not permitted in a generated app — "
                                 f"import the names it uses")
+                elif ((node.module or "") in TOOLKIT_ROOTS
+                      and not node.level
+                      and a.name not in QT_SUBMODULES_OK):
+                    # `from PySide6 import QtNetwork` — the submodule arrives as
+                    # an imported NAME, not as part of the module path, so the
+                    # dotted-name rule never sees it.
+                    errs.append(
+                        f"line {line}: {node.module}.{a.name} is not permitted "
+                        f"in a generated app — only "
+                        f"{', '.join(sorted(QT_SUBMODULES_OK))} are")
+                elif a.name in DENIED_QT_NAMES:
+                    errs.append(f"line {line}: importing {a.name!r} from "
+                                f"{node.module or '.'} is not permitted in a "
+                                f"generated app — it escapes the process, "
+                                f"reaches the network, or loads native code")
                 elif a.name in DENIED_BUILTINS or (
                         a.name in DENIED_ATTRS
                         and not (a.name in ("load", "loads")
@@ -290,7 +365,13 @@ def validate(code: str, mode: str = "linked",
 
         # ---- attribute access: CALLED OR NOT ----
         elif isinstance(node, ast.Attribute):
-            if node.attr in DENIED_ATTRS:
+            if node.attr in DENIED_QT_NAMES:
+                recv = _receiver_name(node.value)
+                where = f"{recv}." if recv else ""
+                errs.append(
+                    f"line {getattr(node, 'lineno', 0)}: {where}{node.attr} is "
+                    f"not permitted in a generated app")
+            elif node.attr in DENIED_ATTRS:
                 recv = _receiver_name(node.value)
                 if node.attr in ("load", "loads") and recv in SAFE_LOAD_RECEIVERS:
                     continue
@@ -301,7 +382,12 @@ def validate(code: str, mode: str = "linked",
 
         # ---- name-level ----
         elif isinstance(node, ast.Name):
-            if node.id in DENIED_BUILTINS:
+            if node.id in DENIED_QT_NAMES:
+                # `from PySide6.QtCore import QProcess` is caught above, but a
+                # name bound any other way is the same capability.
+                errs.append(f"line {getattr(node, 'lineno', 0)}: "
+                            f"{node.id} is not permitted in a generated app")
+            elif node.id in DENIED_BUILTINS:
                 call = "" if node.id.startswith("__b") else "()"
                 errs.append(f"line {getattr(node, 'lineno', 0)}: "
                             f"{node.id}{call} is not permitted")
@@ -313,7 +399,8 @@ def validate(code: str, mode: str = "linked",
                     and len(node.args) >= 2:
                 arg = node.args[1]
                 if isinstance(arg, ast.Constant) and isinstance(arg.value, str) \
-                        and arg.value in (DENIED_ATTRS | DENIED_BUILTINS):
+                        and arg.value in (DENIED_ATTRS | DENIED_BUILTINS
+                                          | DENIED_QT_NAMES):
                     errs.append(
                         f"line {getattr(node, 'lineno', 0)}: "
                         f"getattr(..., {arg.value!r}) reaches a denied "
@@ -348,6 +435,40 @@ def _check_import(root: str, node: ast.AST, mode: str, allowed: Set[str],
         return
     errs.append(f"line {line}: {root!r} is not on the {mode} allowlist — if "
                 f"the app needs it, add it to the project's requires")
+
+
+def _check_qt(full_name: str, node: ast.AST, errs: List[str]) -> None:
+    """Judge a Qt import by its FULL dotted name, not its root.
+
+    This is the one rule in this module that cannot be expressed as a root-name
+    allowlist, and it exists because the root-name allowlist is exactly what
+    made `requires: PySide6` open QtNetwork, QProcess and QtQml at once.
+
+    A foreign binding (PyQt5/6, PySide2, qtpy) is refused outright: two
+    bindings in one process each load their own Qt libraries and the app dies
+    on import, so there is no version of this that works.
+    """
+    line = getattr(node, "lineno", 0)
+    parts = [p for p in str(full_name or "").split(".") if p]
+    if not parts:
+        return
+    root = parts[0]
+    if root in FOREIGN_QT:
+        errs.append(
+            f"line {line}: {root!r} is not permitted in a generated app — the "
+            f"Qt target is PySide6, and two Qt bindings cannot share one "
+            f"process")
+        return
+    if root not in TOOLKIT_ROOTS or len(parts) < 2:
+        return
+    sub = parts[1]
+    if sub not in QT_SUBMODULES_OK:
+        errs.append(
+            f"line {line}: {root}.{sub} is not permitted in a generated app — "
+            f"only {', '.join(sorted(QT_SUBMODULES_OK))} are. "
+            f"({sub} ships inside PySide6-Essentials, so it is importable on "
+            f"any machine that can run this app; that is why it is denied by "
+            f"name rather than assumed absent.)")
 
 
 def _receiver_name(node: ast.AST) -> str:
@@ -398,17 +519,19 @@ def project_modules(pdir) -> List[str]:
 
 
 def validate_dir(pdir, mode: str = "linked",
-                 extra_modules: Sequence[str] = ()) -> Tuple[bool, List[str]]:
+                 extra_modules: Sequence[str] = (),
+                 toolkit: str = "tk") -> Tuple[bool, List[str]]:
     """The gate over a whole project directory. The one call Generate, Run
     and run_example_gui all make, so they cannot disagree about a project."""
     return validate_project(project_sources(pdir), mode, extra_modules,
-                            local_modules=project_modules(pdir), root=pdir)
+                            local_modules=project_modules(pdir), root=pdir,
+                            toolkit=toolkit)
 
 
 def validate_project(paths: Sequence, mode: str = "linked",
                      extra_modules: Sequence[str] = (),
-                     local_modules: Sequence[str] = (), root=None
-                     ) -> Tuple[bool, List[str]]:
+                     local_modules: Sequence[str] = (), root=None,
+                     toolkit: str = "tk") -> Tuple[bool, List[str]]:
     """Validate several files, prefixing each fault with its filename (its
     path under ``root`` when given, so ui/app.py and app.py stay distinct).
 
@@ -427,6 +550,6 @@ def validate_project(paths: Sequence, mode: str = "linked",
         except OSError as exc:
             all_errs.append(f"{name}: cannot read ({exc})")
             continue
-        ok, errs = validate(src, mode, importable)
+        ok, errs = validate(src, mode, importable, toolkit)
         all_errs.extend(f"{name}: {e}" for e in errs)
     return (not all_errs), all_errs

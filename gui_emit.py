@@ -51,6 +51,45 @@ LINKED_ALLOWLIST = (
     "frame_timing", "frame_roi", "frame_classes",
 )
 
+# ============================================================
+# Emit targets
+# ============================================================
+# THIS MODULE IS STILL THE TK BACKEND. The Qt templates live in gui_emit_qt,
+# which imports the neutral helpers from here rather than copying them — one
+# copy of _py/_prop/_ordered/handler_stub/the region machinery, two backends.
+#
+# Deliberately NOT a split into gui_emit_tk.py yet: two efforts are in flight on
+# this file, and a whole-file move would conflict with both. Once they land, the
+# move is a mechanical commit the golden files (tests/test_gui_emit_golden.py)
+# prove byte-for-byte.
+#
+# Tk stays the default until the Qt target reaches the parity checklist in
+# docs/qt_migration_plan.md — a new target must not change what an existing
+# project regenerates into.
+
+TARGETS = ("tk", "qt")
+DEFAULT_TARGET = "tk"
+
+# Every backend names itself, so emit() can say which toolkit a project is
+# already written in without a second lookup table.
+NAME = "tk"
+
+
+def _backend(target: str):
+    """The module that writes source for ``target``.
+
+    Imported lazily: gui_emit_qt imports gui_emit for the neutral helpers, so a
+    module-level import here would be a cycle — and a Tk-only run would pay for
+    templates it never emits."""
+    t = (target or DEFAULT_TARGET).strip().lower()
+    if t in ("tk", "tkinter", ""):
+        import gui_emit as be              # this module IS the Tk backend
+        return be
+    if t in ("qt", "pyside6"):
+        import gui_emit_qt as be
+        return be
+    raise ValueError(f"unknown emit target {target!r}; expected one of {TARGETS}")
+
 
 @dataclass
 class EmitResult:
@@ -686,6 +725,10 @@ _COMPOSITE_KINDS = {
     "file_picker": "FilePicker", "status_bar": "StatusBar",
     "toolbar": "Toolbar",
 }
+
+# Both backends answer to the same attribute name in emit(); the Tk one keeps
+# its historical private spelling so nothing that reads it has to change.
+COMPOSITE_KINDS = _COMPOSITE_KINDS
 
 
 # ============================================================
@@ -2541,7 +2584,8 @@ if __name__ == "__main__":
 '''
 
 
-def _requires_block(requires: Sequence[str]) -> str:
+def _requires_block(requires: Sequence[str],
+                    target: str = DEFAULT_TARGET) -> str:
     """Startup check for the project's declared packages.
 
     Every entry is a STATIC import, so it passes the policy gate on exactly
@@ -2575,25 +2619,31 @@ def _requires_block(requires: Sequence[str]) -> str:
           "                  \"this one.\")",
           r'    _MSG = "\n".join(_LINES)',
           "    if sys.stderr is not None:     # None under pythonw",
-          r'        sys.stderr.write(_MSG + "\n")',
-          "    import os as _os",
-          "    if not (_os.environ.get('COUNCIL_PREVIEW_CONTROL')",
-          "            or _os.environ.get('COUNCIL_NO_DIALOGS')):",
-          "        try:",
-          "            import tkinter as _tk",
-          "            from tkinter import messagebox as _mb",
-          "            _r = _tk.Tk()",
-          "            _r.withdraw()",
-          "            _mb.showerror('Missing packages', _MSG)",
-          "            _r.destroy()",
-          "        except Exception:",
-          "            pass",
-          "    raise SystemExit(3)",
+          r'        sys.stderr.write(_MSG + "\n")']
+    # THE DIALOG IS TOOLKIT-SPECIFIC, and a Qt project must not reach for
+    # tkinter to say that PySide6 is missing — which is precisely the case that
+    # would fire. The Qt target reports to stderr and exits 3, which is what the
+    # designer's log already renders well.
+    if (target or DEFAULT_TARGET).strip().lower() in ("tk", "tkinter", ""):
+        L += ["    import os as _os",
+              "    if not (_os.environ.get('COUNCIL_PREVIEW_CONTROL')",
+              "            or _os.environ.get('COUNCIL_NO_DIALOGS')):",
+              "        try:",
+              "            import tkinter as _tk",
+              "            from tkinter import messagebox as _mb",
+              "            _r = _tk.Tk()",
+              "            _r.withdraw()",
+              "            _mb.showerror('Missing packages', _MSG)",
+              "            _r.destroy()",
+              "        except Exception:",
+              "            pass"]
+    L += ["    raise SystemExit(3)",
           ""]
     return "\n".join(L)
 
 
-def emit_main_py(spec: Spec, project_dir: Path) -> str:
+def emit_main_py(spec: Spec, project_dir: Path,
+                 target: str = DEFAULT_TARGET) -> str:
     """The entry point: `python main.py`.
 
     REGENERATED every time, on purpose. The sys.path block below depends on
@@ -2645,7 +2695,7 @@ from pathlib import Path
 {note}
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 {path_block}
-{_requires_block(spec.requires)}
+{_requires_block(spec.requires, target)}
 from app import main
 
 if __name__ == "__main__":
@@ -2659,7 +2709,8 @@ if __name__ == "__main__":
 
 def emit(spec: Spec, project_path: Any, *,
          preserve_regions: Optional[Dict[str, str]] = None,
-         aliases: Optional[Dict[str, str]] = None) -> EmitResult:
+         aliases: Optional[Dict[str, str]] = None,
+         target: str = DEFAULT_TARGET) -> EmitResult:
     """Write the project. ui/ is overwritten; app.py and handlers.py are not.
 
     Sentinel-region bodies are read from the EXISTING ui/ files before anything
@@ -2680,21 +2731,37 @@ def emit(spec: Spec, project_path: Any, *,
             existing.read_text(encoding="utf-8", errors="replace")))
     regions.update(dict(preserve_regions or {}))
 
-    known = set(spec.widget_names) | set(_COMPOSITE_KINDS.values())
+    be = _backend(target)
+
+    # THE TOOLKIT IS WRITE-ONCE PER PROJECT, and this is where that is enforced.
+    # app.py builds the root window and runs the event loop, and it is created
+    # once and NEVER rewritten (below) — so regenerating ui/ for a different
+    # toolkit would leave a project whose app.py cannot drive its own UI. It
+    # would fail at the first import, with a traceback about a module the user
+    # never mentioned. Refusing here says the actual problem instead.
+    was = _toolkit_of_app(root)
+    if was and was != be.NAME:
+        raise ValueError(
+            f"{root / 'app.py'} is a {was} app, so this project cannot be "
+            f"regenerated as {be.NAME}. app.py is written once and never "
+            f"rewritten — generate a new project for the other toolkit, or "
+            f"move your handlers into one.")
+
+    known = set(spec.widget_names) | set(be.COMPOSITE_KINDS.values())
     res.orphaned_regions = {k: v for k, v in regions.items()
                             if k not in known and v.strip()}
 
     _write(ui / "__init__.py", '"""Generated UI package."""\n', res)
-    _write(ui / "widgets.py", WIDGETS_PY, res, regions=regions)
-    _write(ui / "ports.py", emit_ports(spec, aliases), res)
-    _write(ui / "main_ui.py", emit_main_ui(spec, regions), res)
+    _write(ui / "widgets.py", be.WIDGETS_PY, res, regions=regions)
+    _write(ui / "ports.py", be.emit_ports(spec, aliases), res)
+    _write(ui / "main_ui.py", be.emit_main_ui(spec, regions), res)
 
     # app.py / handlers.py: created once, never rewritten (spec 7.1).
     app = root / "app.py"
     if app.exists():
         res.files_skipped.append(str(app))
     else:
-        _write(app, emit_app_py(spec), res)
+        _write(app, be.emit_app_py(spec), res)
 
     handlers = root / "handlers.py"
     if handlers.exists():
@@ -2729,7 +2796,7 @@ def emit(spec: Spec, project_path: Any, *,
         _write(handlers, emit_handlers_py(spec), res)
         res.handlers_added.extend(spec.handlers)
 
-    _write(root / "main.py", emit_main_py(spec, root), res)
+    _write(root / "main.py", emit_main_py(spec, root, target=target), res)
     import gui_spec as _gsp
     res.warnings.extend(_gsp.script_warnings(spec))
 
@@ -2755,6 +2822,25 @@ def emit(spec: Spec, project_path: Any, *,
             f"{len(res.orphaned_regions)} custom region(s) no longer match a "
             f"widget; saved to {out}")
     return res
+
+
+def _toolkit_of_app(root: Path) -> str:
+    """The toolkit an existing app.py is written in, or "" for a new project.
+
+    Read from the file rather than the manifest on purpose: the manifest
+    records intent and can be hand-edited, while app.py is the code that will
+    actually run. gui_projects.toolkit_of answers the same question for callers
+    that already have a project open."""
+    try:
+        src = (Path(root) / "app.py").read_text(encoding="utf-8",
+                                                errors="replace")
+    except OSError:
+        return ""
+    if "PySide6" in src:
+        return "qt"
+    if "tkinter" in src:
+        return "tk"
+    return ""
 
 
 def _write(path: Path, text: str, res: EmitResult,
