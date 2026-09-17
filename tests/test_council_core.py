@@ -854,3 +854,196 @@ def test_the_engine_keeps_the_names_the_smoke_suite_uses():
     for name in ("_search_vault_filenames", "_compile_name_pattern",
                  "_name_matches_pattern"):
         assert f"as {name}," in source, f"{name} is no longer importable"
+
+
+# ================================================================= vault_jobs
+
+from council_core import vault_jobs  # noqa: E402
+
+
+def test_none_of_the_vault_job_modules_call_a_model():
+    """The claim this module exists to correct.
+
+    I told the user three Vault operations were blocked on the Council tab's
+    model plumbing. They are not: the modules behind them make no model call
+    at all. Asserted here rather than left as a paragraph, because the next
+    person to read "Council" in a docstring will make the same mistake.
+    """
+    import ast
+    calls = []
+    for name in ("vault_collections.py", "deferred_tasks.py",
+                 "derived_results.py"):
+        path = ROOT / name
+        if not path.exists():
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Call):
+                target = node.func
+                label = getattr(target, "attr", None) or getattr(target, "id", "")
+                if label in ("local_chat", "respond", "chat", "generate"):
+                    calls.append(f"{name}:{node.lineno} {label}()")
+    assert not calls, f"a model call after all: {calls}"
+
+
+def test_vault_jobs_needs_no_toolkit():
+    source = (ROOT / "council_core" / "vault_jobs.py").read_text(encoding="utf-8")
+    for toolkit in ("tkinter", "PySide6", "messagebox", "QMessageBox"):
+        assert toolkit not in source
+
+
+# -- the deferred run ---------------------------------------------------------
+
+def test_a_task_that_is_a_note_is_refused_with_advice(monkeypatch):
+    """A tool request is logged for the developer. Saying only that it cannot
+    run leaves the user with no next step; Done is the next step."""
+    import types
+    task = types.SimpleNamespace(kind="tool_request", id="t1")
+    fake = types.SimpleNamespace(
+        DeferredTaskStore=lambda d: types.SimpleNamespace(get=lambda i: task),
+        RUNNABLE_KINDS=("bigger_summary", "deeper_stats"),
+        KIND_BIGGER_SUMMARY="bigger_summary")
+    monkeypatch.setitem(sys.modules, "deferred_tasks", fake)
+    found, problem = vault_jobs.check_deferred_runnable(ROOT, "t1")
+    assert found is None
+    assert "Done when handled" in problem
+
+
+def test_selecting_nothing_says_so():
+    found, problem = vault_jobs.check_deferred_runnable(ROOT, None)
+    assert found is None and "Select a task" in problem
+
+
+def test_a_missing_task_tells_you_to_refresh(monkeypatch):
+    import types
+    monkeypatch.setitem(sys.modules, "deferred_tasks", types.SimpleNamespace(
+        DeferredTaskStore=lambda d: types.SimpleNamespace(get=lambda i: None),
+        RUNNABLE_KINDS=(), KIND_BIGGER_SUMMARY="bigger_summary"))
+    found, problem = vault_jobs.check_deferred_runnable(ROOT, "gone")
+    assert found is None and "refresh" in problem.lower()
+
+
+def test_the_output_is_named_after_the_question_not_the_id(monkeypatch):
+    """A vault full of opaque hashes is a vault nobody browses."""
+    import types
+    monkeypatch.setitem(sys.modules, "deferred_tasks",
+                        types.SimpleNamespace(KIND_BIGGER_SUMMARY="bigger_summary"))
+    task = types.SimpleNamespace(kind="bigger_summary", folder="Q3",
+                                 question="a much bigger summary of sales.csv",
+                                 id="abcd1234wxyz")
+    name = vault_jobs.deferred_output_name(task)
+    assert name.startswith("summary__Q3__")
+    assert "bigger_summary_of_sales" in name
+    assert name.endswith("wxyz"), "runs of the same task would collide"
+
+
+def test_a_task_with_no_folder_still_gets_a_name(monkeypatch):
+    import types
+    monkeypatch.setitem(sys.modules, "deferred_tasks",
+                        types.SimpleNamespace(KIND_BIGGER_SUMMARY="bigger_summary"))
+    task = types.SimpleNamespace(kind="deeper_stats", folder=None,
+                                 question=None, id="zz99")
+    assert vault_jobs.deferred_output_name(task) == "stats__deferred__zz99"
+
+
+# -- collections --------------------------------------------------------------
+
+def test_discover_without_a_name_is_refused():
+    result = vault_jobs.propose_collection_members(ROOT, "  ")
+    assert not result.ok and "Name the collection" in result.message
+
+
+def test_discover_finding_nothing_says_what_would_help(monkeypatch):
+    """An empty result leaves the user guessing; naming the keyword index as
+    the thing that would widen the search does not."""
+    import types
+    monkeypatch.setitem(sys.modules, "vault_collections", types.SimpleNamespace(
+        propose_members=lambda d, t, index=None: []))
+    result = vault_jobs.propose_collection_members(ROOT, "Job Blue")
+    assert result.ok and result.rows == []
+    assert "keyword index" in result.message
+
+
+def test_a_proposal_carries_the_reason_for_each_file(monkeypatch):
+    """The reason is most of the value: it tells the user whether to trust the
+    suggestion without opening the file."""
+    import types
+    monkeypatch.setitem(sys.modules, "vault_collections", types.SimpleNamespace(
+        propose_members=lambda d, t, index=None: [
+            ("q3/sales.csv", 4.0, ["value match", "column Job ID"])]))
+    result = vault_jobs.propose_collection_members(ROOT, "Job Blue")
+    assert result.rows[0][2] == ["value match", "column Job ID"]
+
+
+def test_saving_under_a_new_name_renames_rather_than_forking(monkeypatch):
+    """The edit dialog changes a name. Upserting without renaming leaves two
+    collections where the user expected one."""
+    import types
+    events = []
+    store = types.SimpleNamespace(
+        rename=lambda old, new: events.append(("rename", old, new)),
+        upsert=lambda name, files: events.append(("upsert", name, len(files))))
+    monkeypatch.setitem(sys.modules, "vault_collections",
+                        types.SimpleNamespace(CollectionStore=lambda d: store))
+    result = vault_jobs.save_collection(ROOT, "Job Green", ["a.csv"],
+                                        renaming_from="Job Blue")
+    assert result.ok
+    assert events == [("rename", "Job Blue", "Job Green"),
+                      ("upsert", "Job Green", 1)]
+
+
+def test_saving_under_the_same_name_does_not_rename(monkeypatch):
+    import types
+    events = []
+    store = types.SimpleNamespace(
+        rename=lambda old, new: events.append("rename"),
+        upsert=lambda name, files: events.append("upsert"))
+    monkeypatch.setitem(sys.modules, "vault_collections",
+                        types.SimpleNamespace(CollectionStore=lambda d: store))
+    vault_jobs.save_collection(ROOT, "Job Blue", [], renaming_from="Job Blue")
+    assert events == ["upsert"]
+
+
+def test_summarizing_an_empty_collection_is_refused(monkeypatch):
+    import types
+    monkeypatch.setitem(sys.modules, "vault_collections", types.SimpleNamespace(
+        CollectionStore=lambda d: types.SimpleNamespace(abs_paths=lambda n: [])))
+    result = vault_jobs.summarize_collection(ROOT, "Empty")
+    assert not result.ok and "No existing files" in result.message
+
+
+def test_summarizing_nothing_selected_is_refused():
+    result = vault_jobs.summarize_collection(ROOT, "")
+    assert not result.ok and "Select a collection" in result.message
+
+
+def test_candidate_files_use_forward_slashes(tmp_path, monkeypatch):
+    """These strings are stored in the collection and compared as text. A
+    collection built on Windows must still match on the same vault elsewhere."""
+    import types
+    data_in = tmp_path / "data_in"
+    (data_in / "q3").mkdir(parents=True)
+    (data_in / "q3" / "sales.csv").write_text("x")
+    (data_in / ".hidden").mkdir()
+    (data_in / ".hidden" / "skip.csv").write_text("x")
+    monkeypatch.setitem(sys.modules, "data_index",
+                        types.SimpleNamespace(input_dir=lambda d: data_in))
+    found = vault_jobs.collection_candidate_files(tmp_path)
+    assert found == ["q3/sales.csv"]
+
+
+# -- both sides ---------------------------------------------------------------
+
+@pytest.mark.parametrize("operation", ["run_deferred_task",
+                                       "summarize_collection"])
+def test_the_jobs_are_used_by_both_front_ends(operation):
+    tk_src = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
+    qt_src = (ROOT / "council_qt" / "tabs" / "vault.py").read_text(encoding="utf-8")
+    assert f"vault_jobs.{operation}(" in tk_src
+    assert f"vault_jobs.{operation}(" in qt_src
+
+
+def test_the_qt_tab_no_longer_claims_these_need_the_council_tab():
+    """Three user-visible messages said so, and they were wrong."""
+    qt_src = (ROOT / "council_qt" / "tabs" / "vault.py").read_text(encoding="utf-8")
+    assert "needs the Council tab" not in qt_src
+    assert "the council propose members" not in qt_src

@@ -24,25 +24,50 @@ both front ends import.
 | `council_core/vault_data.py` | deferred tasks, collections, delete, RAG misses, Mongo — 239 |
 | `council_core/vault_search.py` | instant search, by name and by indexed content — 158 |
 
-All 29 Vault commands the Tk tab wires have a Qt handler. Three of them
-(`on_run_deferred`, `on_new_collection`, `on_summarize_collection`) report in the log
-that they cannot finish yet, because they drive the Council tab's model plumbing, which
-is phase 6. They are counted as unfinished, not as coverage.
+All 29 Vault commands the Tk tab wires have a Qt handler.
+
+> **Correction, made during phase 6.** This section originally said three of them
+> (`on_run_deferred`, `on_new_collection`, `on_summarize_collection`) could not finish
+> because they drive the Council tab's model plumbing. That was wrong, and it was my
+> error: I read "Council" in `_vmgr_new_collection`'s docstring as the model council
+> and assumed a dependency that does not exist. It means the application.
+>
+> Checked the second time instead of assumed: `vault_collections.py`,
+> `deferred_tasks.py` and `derived_results.py` contain no model call of any kind, and
+> `propose_members` is deterministic scoring over filename slugs and index lookups.
+> All three operations are pandas and disk. They are now extracted into
+> `council_core/vault_jobs.py` and wired into both front ends, so the Vault tab is
+> complete at 29/29 with nothing deferred.
+>
+> The multiplier below is unaffected — it counts lines, and these lines were always
+> counted. What changes is that phase 6 no longer carries a Vault dependency.
 
 ---
 
 ## 2. The measured numbers
 
 ```
-Tk toolkit lines replaced (the estimate's own probe)  :  485
-Qt lines written to replace them                      :  924
-Multiplier                                            : 1.91
-Logic lifted into council_core on the way             : 1001
-Tests, offscreen                                      :  190 passing
+Tk toolkit lines replaced (the estimate's own probe)  :  482
+Qt view written (the tab and its dialog)              : 1140
+Multiplier                                            : 2.37
+Logic lifted into council_core on the way             : 1272
+Tests, offscreen                                      :  246 passing
 ```
 
 **The multiplier is the number that matters.** The scope document is denominated in Tk
-toolkit lines, so 1.91 is what converts the remaining surface into work.
+toolkit lines, so 2.37 is what converts the remaining surface into work.
+
+> **These numbers went UP after the correction above, and that is the honest reading.**
+> The first version of this document measured 1.91, on a tab that was missing three
+> operations I had wrongly deferred. Finishing them added 216 Qt lines and 271 core
+> lines against the same toolkit surface. The 1.91 was not wrong arithmetic — it was
+> arithmetic over incomplete work, which is the more dangerous kind, because it looks
+> finished.
+>
+> A ~24% optimistic multiplier taken from a pilot is exactly how a port ends up over
+> budget, so the rest of this document uses 2.37. If anything it is still generous:
+> `collection_dialog.py` is the first modal dialog of the ~20 the app has, and the
+> first one is always the cheapest.
 
 ### What these numbers are not
 
@@ -72,17 +97,18 @@ toolkit line, with the extraction counted separately. Don't apply it twice.
 
 ### The extraction ratio will not hold
 
-1,001 logic lines came out of 485 toolkit lines — a ratio of 2.06. The Vault is the most
+1,272 logic lines came out of 482 toolkit lines — a ratio of 2.62. The Vault is the most
 logic-heavy tab in the app; it is the tab where files move, indexes build and things get
-deleted. Applying 2.06 to the Changelog tab would be nonsense. Extraction should be
+deleted. Applying 2.62 to the Changelog tab would be nonsense. Extraction should be
 forecast per area from what each area actually contains, not from this ratio.
 
 ---
 
 ## 4. Defects, which is the other thing a pilot is for
 
-Six real defects surfaced. They divide into three kinds, and the split is more useful
-than the count.
+Six real defects surfaced during the pilot itself. They divide into three kinds, and the
+split is more useful than the count. (Phase 6's reconnaissance then found roughly forty
+more across the Council, Grapher and Dream3D tabs — recorded separately.)
 
 **Inherited — in the Tk app today, found by moving the code:**
 
@@ -143,7 +169,9 @@ Remaining toolkit surface, measured now (`port_surface.py`):
 
 ¹ Per your correction: those six modules are other branches' features, not dead code.
 
-At the measured 1.91, the remaining translation is **≈7,570 lines of Qt to write**.
+At the measured 2.37, the remaining translation is **≈9,320 lines of Qt to write** —
+about 1,750 lines more than the first version of this document projected, entirely
+because that version measured an unfinished tab.
 
 Converting that to time is the part this pilot cannot do for you, so here is the
 conversion with the rate left open. Pick the row that matches your own experience of how
@@ -172,10 +200,10 @@ the row you picked.
 
 The reasons to continue are specific:
 
-- The multiplier came in at 1.91, not the 3–4× that hand-written Qt views can cost. The
+- The multiplier came in at 2.37, not the 3–4× that hand-written Qt views can cost. The
   Vault was chosen as the pilot because it is the superset of mechanisms — tree,
-  paned layout, forms, three dialogs, worker traffic — so 1.91 is a *hard* case, and
-  easier tabs should beat it.
+  paned layout, forms, dialogs, worker traffic — so 2.37 is a *hard* case, and easier
+  tabs should beat it. Note this is the corrected figure; see §2.
 - Coverage reached 29/29 without inventing anything: the view is written against the
   extracted functions, and the three unfinished handlers are unfinished for one reason
   that phase 6 removes.
@@ -192,6 +220,8 @@ alternatives in §9 of the scope document rather than to push on.
 
 ## 7. Still not verified
 
+- **The 1.91 figure appears in two commit messages on this branch** (`5cc04dd`,
+  `995404f`) and cannot be edited out of history. This document is the correction.
 - **The full 1,048-test suite has not been run since the engine edits.** It opens
   windows, and testing the generated GUIs is deliberately deferred until the port is
   done. 190 tests pass offscreen; that is the extracted logic and the Qt shell, not the

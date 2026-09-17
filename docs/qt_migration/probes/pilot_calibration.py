@@ -108,11 +108,24 @@ def needs_council_tab(qt_src: str) -> list:
     for node in ast.walk(ast.parse(qt_src)):
         if not isinstance(node, ast.FunctionDef) or not node.name.startswith("on_"):
             continue
-        for literal in ast.walk(node):
-            if isinstance(literal, ast.Constant) and isinstance(literal.value, str):
-                if "Council tab" in literal.value:
+        # Skip the docstring. A handler may legitimately DISCUSS the Council
+        # tab — one of them documents that it used to claim a dependency on it
+        # and does not have one — and counting that as a stub is how a probe
+        # reports work as undone after it is done.
+        body = node.body[1:] if (node.body
+                                 and isinstance(node.body[0], ast.Expr)
+                                 and isinstance(node.body[0].value, ast.Constant)
+                                 and isinstance(node.body[0].value.value, str)
+                                 ) else node.body
+        for statement in body:
+            for literal in ast.walk(statement):
+                if (isinstance(literal, ast.Constant)
+                        and isinstance(literal.value, str)
+                        and "Council tab" in literal.value):
                     out.append(node.name)
                     break
+            if out and out[-1] == node.name:
+                break
     return out
 
 
@@ -124,11 +137,12 @@ def main() -> int:
     qt_tab = ROOT / "council_qt" / "tabs" / "vault.py"
     core = [ROOT / "council_core" / n for n in
             ("vault_ops.py", "vault_import.py", "vault_data.py",
-             "vault_search.py")]
+             "vault_search.py", "vault_jobs.py")]
 
     tk_surface = vault_surface_from_the_estimates_probe()
     cross_check = toolkit_lines(region)
-    qt_written = code_lines(qt_tab)
+    qt_files = [qt_tab, ROOT / "council_qt" / "tabs" / "collection_dialog.py"]
+    qt_written = sum(code_lines(f) for f in qt_files if f.exists())
     core_written = sum(code_lines(p) for p in core if p.exists())
 
     print("=" * 68)
@@ -136,7 +150,10 @@ def main() -> int:
     print("=" * 68)
     print(f"Tk toolkit lines (the estimate's own probe)         : {tk_surface:>6}")
     print(f"   cross-check, this probe's simpler rule            : {cross_check:>6}")
-    print(f"Qt tab written (council_qt/tabs/vault.py)           : {qt_written:>6}")
+    print(f"Qt view written (tab + its dialog)                  : {qt_written:>6}")
+    for f in qt_files:
+        if f.exists():
+            print(f"    {f.name:<20} {code_lines(f):>6}")
     print(f"Logic extracted to council_core                      : {core_written:>6}")
     for p in core:
         if p.exists():

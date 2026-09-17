@@ -16347,134 +16347,32 @@ class CouncilConsole(tk.Tk):
         self._vmgr_refresh_deferred()
 
     def _vmgr_run_deferred(self):
-        """Run a runnable deferred task (bigger summary / deeper stats) with
-        the full deterministic tooling, write the result under
-        data_in/.deferred_results/, and mark it done. Tool-requests / other
-        kinds aren't auto-runnable."""
+        """Run a runnable deferred task and file the result.
+
+        The run itself is council_core.vault_jobs — pandas over the vault's
+        data files, no model — so the Qt tab does the same work.
+        """
         import threading as _th
+        from council_core import vault_jobs
+
         tid = self._vmgr_selected_deferred()
         if not tid:
             return
-        try:
-            import deferred_tasks as _dt
-            store = _dt.DeferredTaskStore(VAULT_DIR)
-            task = store.get(tid)
-        except Exception as exc:
-            self._defer_status.set(f"Load failed: {exc!r}")
-            return
-        if task is None:
-            self._defer_status.set("Task not found (refresh).")
-            return
-        if task.kind not in _dt.RUNNABLE_KINDS:
-            self._defer_status.set(
-                "This is a tool request / note — it's logged for the developer, "
-                "not auto-runnable. Use ✓ Done when handled.")
+        task, problem = vault_jobs.check_deferred_runnable(VAULT_DIR, tid)
+        if problem:
+            self._defer_status.set(problem)
             return
         self._defer_status.set("Running…")
 
         def _worker():
-            try:
-                import vault_analyst as _va
-                in_dir = data_index.input_dir(VAULT_DIR)
-                target = in_dir
-                if task.folder:
-                    cand = in_dir / task.folder
-                    if cand.exists():
-                        target = cand
-                # NON-hidden folder on purpose: a ".deferred_results" dot-dir
-                # is skipped by the vault index/analyst, so the council could
-                # never find the saved result. This way, re-asking the same
-                # question surfaces it (see the precomputed-answer route in
-                # _run_analyst_step_impl).
-                # Computed outputs live in data_in/derived/ (searchable, but
-                # excluded from the source-data census) and are catalogued in
-                # the DerivedStore with their source fingerprint for
-                # staleness-safe reuse.
-                import derived_results as _drv
-                out_dir = _drv.derived_dir(VAULT_DIR)
-                # Human-readable filename derived from the task itself, not the
-                # opaque internal id. e.g. a "bigger summary of sales.csv" task
-                # over folder Q3 -> "summary__Q3__bigger_summary_of_sales__a1b2.csv".
-                import re as _re
-                _desc = (task.question or task.folder or "deferred").strip().lower()
-                _slug = _re.sub(r"[^a-z0-9]+", "_", _desc).strip("_")[:48] or "deferred"
-                _fold = (_re.sub(r"[^A-Za-z0-9]+", "_", task.folder).strip("_")
-                         if task.folder else "")
-                _short = task.id[-4:]      # keep runs unique without being noisy
-                _kindword = ("summary" if task.kind == _dt.KIND_BIGGER_SUMMARY
-                             else "stats")
-                _name = "__".join(p for p in (_kindword, _fold, _slug, _short) if p)
-                op = out_dir / f"{_name}.csv"
-                # SCOPE to the files the task is actually about. The capture
-                # dialog resolves filenames from the question into task.files;
-                # without this the run summarised the WHOLE folder regardless
-                # of which file the user asked about ("wrong files").
-                import pandas as _pd_run
-                want = {f.lower() for f in (task.files or []) if f}
-                named_paths = []
-                if want:
-                    # list_data_files = CSV ∪ Excel (superset of list_csv_files),
-                    # so a CSV-only re-walk fallback was logically dead — a name
-                    # that didn't match here can't match the CSV subset.
-                    for _p in _va.list_data_files([target]):
-                        if _p.name.lower() in want:
-                            named_paths.append(_p)
-
-                if task.kind == _dt.KIND_BIGGER_SUMMARY:
-                    if named_paths:
-                        # Per-COLUMN profile of each named file — a genuinely
-                        # "bigger" summary than chat gave, on the right files.
-                        frames = [_va.summarize_csv(p) for p in named_paths]
-                        df = (_pd_run.concat(frames, ignore_index=True)
-                              if frames else _va.folder_data_summary([target]))
-                        summary = (f"profiled {len(named_paths)} named file(s): "
-                                   + ", ".join(p.name for p in named_paths[:5]))
-                    else:
-                        df = _va.folder_data_summary([target])
-                        summary = (f"{len(df)} file(s) profiled"
-                                   + (" (named file(s) not found — used the "
-                                      "whole folder)" if want else ""))
-                else:   # deeper_stats
-                    df = _va.folder_column_stats(VAULT_DIR, [target])
-                    if want and "file" in df.columns:
-                        sub = df[df["file"].str.lower().isin(want)]
-                        if not sub.empty:
-                            df = sub.reset_index(drop=True)
-                    nfiles = int(df["file"].nunique()) if "file" in df else 0
-                    summary = f"stats for {nfiles} file(s)"
-                df.to_csv(op, index=False)
-                store.mark_done(task.id, result_path=str(op),
-                                result_summary=summary)
-                # Catalogue the computed output with its SOURCE FINGERPRINT so
-                # a future re-ask reuses it ONLY while the sources are unchanged
-                # (staleness-safe). The precomputed-answer route in
-                # _run_analyst_step_impl reads this via DerivedStore.find_fresh.
-                try:
-                    _srcs = ([str(p) for p in named_paths] if named_paths
-                             else [str(target)])
-                    _drv.DerivedStore(VAULT_DIR).record(
-                        label=(task.question or task.label() or _name),
-                        output=str(op), sources=_srcs,
-                        operation=task.kind,
-                        columns=[str(c) for c in df.columns],
-                        rows=int(len(df)))
-                except Exception:
-                    pass
-                # Refresh FIRST (it resets the status line), THEN show the
-                # completion message so it isn't immediately overwritten.
-                self.after(0, lambda: (
-                    self._vmgr_refresh_deferred(),
-                    self._defer_status.set(
-                        f"Done — {summary} → {op.name} (in "
-                        "data_in/derived/). Re-ask in the Council tab "
-                        "to use it.")))
-            except Exception as exc:
-                self.after(0, lambda: self._defer_status.set(
-                    f"Run failed: {exc!r}"))
+            result = vault_jobs.run_deferred_task(VAULT_DIR, tid)
+            # Refresh FIRST (it resets the status line), THEN show the
+            # message so it isn't immediately overwritten.
+            self.after(0, lambda: (self._vmgr_refresh_deferred(),
+                                   self._defer_status.set(result.message)))
 
         _th.Thread(target=_worker, daemon=True).start()
 
-    # ── Collections (virtual projects over the vault) ───────────
     def _vmgr_refresh_collections(self):
         from council_core import vault_data
 
@@ -16664,55 +16562,22 @@ class CouncilConsole(tk.Tk):
             side="right", padx=6)
 
     def _vmgr_summarize_collection(self):
-        """Profile every file in the selected collection (per-column) and
-        write the result to data_in/derived/collection__<name>.csv, recording
-        it in the DerivedStore so a re-ask reuses it while sources are fresh."""
+        """Profile every file in the selected collection into one derived CSV.
+
+        council_core.vault_jobs owns the work; both front ends call it.
+        """
         import threading as _th
+        from council_core import vault_jobs
+
         name = self._vmgr_selected_collection()
         if not name:
             return
         self._coll_status.set("Summarizing…")
 
         def _w():
-            try:
-                import vault_collections as _vc
-                import vault_analyst as _va
-                import pandas as _pd
-                import re as _re
-                paths = _vc.CollectionStore(VAULT_DIR).abs_paths(name)
-                if not paths:
-                    self.after(0, lambda: self._coll_status.set(
-                        "No existing files in that collection."))
-                    return
-                frames = []
-                for p in paths:
-                    try:
-                        frames.append(_va.summarize_csv(p))
-                    except Exception:
-                        pass
-                df = (_pd.concat(frames, ignore_index=True)
-                      if frames else _pd.DataFrame())
-                import derived_results as _drv
-                out = _drv.derived_dir(VAULT_DIR)
-                slug = _re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") \
-                    or "collection"
-                op = out / f"collection__{slug}.csv"
-                df.to_csv(op, index=False)
-                try:
-                    _drv.DerivedStore(VAULT_DIR).record(
-                        label=f"summary of the {name} collection",
-                        output=str(op), sources=[str(p) for p in paths],
-                        operation="collection_summary",
-                        columns=[str(c) for c in df.columns],
-                        rows=int(len(df)))
-                except Exception:
-                    pass
-                self.after(0, lambda: self._coll_status.set(
-                    f"Summarized {len(paths)} file(s) → "
-                    f"data_in/derived/{op.name}"))
-            except Exception as exc:
-                self.after(0, lambda: self._coll_status.set(
-                    f"Summarize failed: {exc!r}"))
+            result = vault_jobs.summarize_collection(VAULT_DIR, name)
+            self.after(0, lambda: self._coll_status.set(result.message))
+
         _th.Thread(target=_w, daemon=True).start()
 
     def _vmgr_convert_mongo(self, scan_all: bool = False):

@@ -265,6 +265,40 @@ class VaultActions:
         from council_core import vault_data
         return vault_data.all_collections(self.vault_dir)
 
+    def run_deferred(self, task_id):
+        from council_core import vault_jobs
+        return vault_jobs.run_deferred_task(self.vault_dir, task_id)
+
+    def propose_members(self, name: str):
+        from council_core import vault_jobs
+        return vault_jobs.propose_collection_members(
+            self.vault_dir, name, index=self._data_index())
+
+    def candidate_files(self):
+        from council_core import vault_jobs
+        return vault_jobs.collection_candidate_files(self.vault_dir)
+
+    def save_collection(self, name: str, files, *, renaming_from=None):
+        from council_core import vault_jobs
+        return vault_jobs.save_collection(self.vault_dir, name, files,
+                                          renaming_from=renaming_from)
+
+    def summarize_collection(self, name: str):
+        from council_core import vault_jobs
+        return vault_jobs.summarize_collection(self.vault_dir, name)
+
+    def collection_files(self, name: str):
+        """The files a collection already holds, as stored relative paths."""
+        try:
+            import vault_collections
+            store = vault_collections.CollectionStore(self.vault_dir)
+            for collection in store.all():
+                if collection.name == name:
+                    return list(collection.files)
+        except Exception:                                 # noqa: BLE001
+            pass
+        return []
+
     def delete_collection(self, name):
         from council_core import vault_data
         return vault_data.delete_collection(self.vault_dir, name)
@@ -546,8 +580,9 @@ class VaultTab(QWidget):
     def _collections_box(self) -> QGroupBox:
         box = QGroupBox("📁 Collections (projects)")
         layout = QVBoxLayout(box)
-        blurb = QLabel("Group disparate files that belong together. New… lets "
-                       "the council propose members; you confirm.")
+        blurb = QLabel("Group disparate files that belong together. New… can "
+                       "propose members from their names and contents; you "
+                       "confirm.")
         blurb.setWordWrap(True)
         blurb.setStyleSheet(f"color: {self._tokens['muted_fg']};")
         layout.addWidget(blurb)
@@ -564,6 +599,13 @@ class VaultTab(QWidget):
         self._button(row, "✗ Delete", self.on_delete_collection)
         row.addStretch(1)
         layout.addLayout(row)
+        # The deferred box has one of these and the collections box did not,
+        # so "Summarizing…" and its result had nowhere to go but the activity
+        # log — a different place from where the user is looking.
+        self.coll_status = QLabel("")
+        self.coll_status.setWordWrap(True)
+        self.coll_status.setStyleSheet("color: #cba6f7;")
+        layout.addWidget(self.coll_status)
         return box
 
     def _stats_box(self) -> QGroupBox:
@@ -1004,13 +1046,38 @@ class VaultTab(QWidget):
             self.on_refresh_deferred()
 
     def on_run_deferred(self) -> None:
-        """Running a deferred task drives the Council's analyst pipeline, which
-        is 127 lines of model calls and transcript writes on the Tk shell. It
-        is the one Vault action whose logic is not extractable without the
-        Council tab, so it waits for that phase."""
-        self.defer_status.setText(
-            "Running a deferred task needs the Council tab, which is not ported "
-            "yet — see docs/qt_full_port_scope.md.")
+        """Run the selected deferred task and file the result.
+
+        This used to say it needed the Council tab. It does not: the run is
+        pandas over the vault's data files and makes no model call at all.
+        See council_core.vault_jobs.
+        """
+        from council_core import vault_jobs
+
+        task_id = self._selected_task()
+        task, problem = vault_jobs.check_deferred_runnable(
+            self.actions.vault_dir, task_id)
+        if problem:
+            self.defer_status.setText(problem)
+            return
+        self.defer_status.setText("Running…")
+
+        def work() -> None:
+            result = self.actions.run_deferred(task_id)
+
+            def show() -> None:
+                # Refresh FIRST — it resets the status line — then say what
+                # happened, so the message is not immediately overwritten.
+                self.on_refresh_deferred()
+                self.defer_status.setText(result.message)
+                self.append(result.message, "ok" if result.ok else "err")
+                if result.ok:
+                    self.refresh_tree()
+
+            self._to_ui(show)
+
+        threading.Thread(target=work, name="vault-deferred",
+                         daemon=True).start()
 
     # -- collections ------------------------------------------------------
     def on_refresh_collections(self) -> None:
@@ -1047,14 +1114,43 @@ class VaultTab(QWidget):
             self.on_refresh_collections()
 
     def on_new_collection(self, edit: bool = False) -> None:
-        """Building a collection asks the council to propose members, so it
-        needs the model plumbing the Council tab owns."""
-        self.append("Creating a collection needs the Council tab, which is not "
-                    "ported yet — see docs/qt_full_port_scope.md.", "err")
+        """Create or edit a collection, with a Discover that proposes members.
+
+        Discover is deterministic scoring over filenames and the data index —
+        no model, despite what this method used to claim.
+        """
+        from .collection_dialog import CollectionDialog
+
+        existing = self._selected_collection() if edit else None
+        if edit and not existing:
+            self.append("Select a collection to edit first.", "err")
+            return
+        dialog = CollectionDialog(self.actions, existing=existing, parent=self)
+        if dialog.exec():
+            self.coll_status.setText(dialog.result_message)
+            self.on_refresh_collections()
 
     def on_summarize_collection(self) -> None:
-        self.append("Summarising a collection needs the Council tab, which is "
-                    "not ported yet — see docs/qt_full_port_scope.md.", "err")
+        """Profile every file in the collection into one derived CSV."""
+        name = self._selected_collection()
+        if not name:
+            self.append("Select a collection first.", "err")
+            return
+        self.coll_status.setText("Summarizing…")
+
+        def work() -> None:
+            result = self.actions.summarize_collection(name)
+
+            def show() -> None:
+                self.coll_status.setText(result.message)
+                self.append(result.message, "ok" if result.ok else "err")
+                if result.ok:
+                    self.refresh_tree()
+
+            self._to_ui(show)
+
+        threading.Thread(target=work, name="vault-collection-summary",
+                         daemon=True).start()
 
     # -- RAG misses -------------------------------------------------------
     def on_rag_misses(self) -> None:

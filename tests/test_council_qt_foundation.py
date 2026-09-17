@@ -713,3 +713,57 @@ def test_every_worker_a_tab_starts_is_one_the_check_can_see(title, factory,
         f"{title} starts {started} thread(s) but only {visible} worker "
         f"function(s) are named one of {sorted(_WORKER_NAMES)} — the rest are "
         f"invisible to the off-thread check")
+
+
+@pytest.mark.parametrize("title,factory,eager", REGISTERED, ids=REGISTERED_IDS)
+def test_every_widget_a_tab_reaches_for_exists(window, title, factory, eager):
+    """`self.coll_status.setText(...)` in a handler, with no `self.coll_status`
+    anywhere — an AttributeError at click time, on a tab that built cleanly.
+
+    This is the same failure the connect() check finds, one level deeper: Qt
+    verifies neither the signal target nor the attribute, so both land in front
+    of the user. It caught exactly this: the deferred box had a status label
+    and the collections box did not, so a summarize result had nowhere to go.
+
+    Scoped to `self.NAME.something(...)` — a plain `self.NAME` read is usually
+    a lazily-set list guarded by getattr, and flagging those would train
+    everyone to ignore this test.
+    """
+    import ast
+    import inspect
+
+    widget = factory(window)
+    module = inspect.getmodule(factory)
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    assigned = set()
+    for node in ast.walk(tree):
+        targets = []
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            targets = [node.target]
+        for target in targets:
+            if (isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"):
+                assigned.add(target.attr)
+
+    used = {}
+    for node in ast.walk(tree):
+        # self.NAME.something — NAME is being treated as an object with an API
+        if not (isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Attribute)
+                and isinstance(node.value.value, ast.Name)
+                and node.value.value.id == "self"):
+            continue
+        name = node.value.attr
+        used.setdefault(name, node.lineno)
+
+    missing = sorted(
+        f"self.{name} (line {line})" for name, line in used.items()
+        if name not in assigned and not hasattr(widget, name))
+    assert not missing, (
+        f"{title} reaches for attributes that are never set and do not exist "
+        f"on the widget: {missing}")
