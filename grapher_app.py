@@ -1028,7 +1028,16 @@ class GrapherApp:
         mpl_r = ge.MatplotlibRenderer()
         fig   = mpl_r.render(spec, ds)
         if fig:
-            saved = mpl_r.save(fig, Path(path_str))
+            try:
+                saved = mpl_r.save(fig, Path(path_str))
+            except ge.ExportRefused as exc:
+                # The renderer drew a figure that SAYS it failed. This used to
+                # save it and print a tick; making save() refuse turned that
+                # lie into an uncaught exception here, which is a regression I
+                # introduced by fixing the other front end and not checking
+                # this one.
+                self._show_stats(f"✗ Export failed — {exc}")
+                return
             self._show_stats(f"✓ Exported: {saved}")
         else:
             self._show_stats("✗ Export failed — matplotlib could not render this plot type.")

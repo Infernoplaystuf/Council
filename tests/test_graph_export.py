@@ -147,24 +147,54 @@ def test_an_unsupported_type_still_returns_none(renderer):
 
 # -- both front ends ----------------------------------------------------------
 
-def test_the_tk_export_handles_the_refusal():
-    """It is being deprecated, but until it is, it must not print a tick over
-    a raised refusal — an uncaught exception there is a worse outcome than the
-    original bug."""
-    source = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
-    assert "ExportRefused" in source
-    index = source.index("saved = mpl_r.save(fig, Path(path_str))")
-    window = source[index - 200:index + 400]
-    assert "except ge.ExportRefused" in window
+#: Every module that calls MatplotlibRenderer.save. Found by searching rather
+#: than remembered — the first version of this file had a section headed "both
+#: front ends" that only ever read council_gui_engine.py, and missed that
+#: grapher_app.py has the identical bare save(). Making save() refuse turned a
+#: lie into an uncaught exception there, in a module nobody had checked.
+EXPORT_CALLERS = ("council_gui_engine.py", "grapher_app.py")
+
+
+def test_every_module_that_saves_a_figure_is_known_to_this_file():
+    """The list above must not go stale silently.
+
+    A new caller that saves without catching the refusal gets an uncaught
+    exception where the old code got a wrong tick, and nothing would say so.
+    """
+    import ast
+    found = []
+    for path in sorted(ROOT.glob("*.py")):
+        if path.name.startswith("test_"):
+            continue
+        source = path.read_text(encoding="utf-8", errors="replace")
+        if "mpl_r.save(" in source or ".save(fig" in source:
+            found.append(path.name)
+    unknown = sorted(set(found) - set(EXPORT_CALLERS))
+    assert not unknown, (
+        f"these save a figure and are not covered here: {unknown}")
+
+
+@pytest.mark.parametrize("module", EXPORT_CALLERS)
+def test_every_export_call_site_handles_the_refusal(module):
+    """Tk is being deprecated, but until it is, a caller must not meet a raised
+    refusal with nothing — an uncaught exception in a button handler is a worse
+    outcome than the original wrong tick."""
+    source = (ROOT / module).read_text(encoding="utf-8")
+    assert "ExportRefused" in source, f"{module} does not know about it"
+    index = source.index("mpl_r.save(fig, Path(path_str))")
+    window = source[index - 300:index + 500]
+    assert "except ge.ExportRefused" in window, (
+        f"{module} saves without catching the refusal")
     assert "Export failed" in window
 
 
-def test_the_success_message_comes_after_the_save_not_before():
-    """Ordering is the whole bug. A tick printed before or regardless of the
-    write is a tick that means nothing."""
-    source = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
-    save_at = source.index("saved = mpl_r.save(fig, Path(path_str))")
+@pytest.mark.parametrize("module", EXPORT_CALLERS)
+def test_the_tick_is_guarded_by_the_refusal_handler(module):
+    """Ordering is the whole bug. A tick printed regardless of the write is a
+    tick that means nothing."""
+    source = (ROOT / module).read_text(encoding="utf-8")
+    save_at = source.index("mpl_r.save(fig, Path(path_str))")
     tick_at = source.index("Exported: {saved}", save_at)
-    refusal_at = source.index("except ge.ExportRefused", save_at - 200)
+    refusal_at = source.index("except ge.ExportRefused", save_at - 300)
     assert save_at < refusal_at < tick_at, (
-        "the success line is not guarded by the refusal handler")
+        f"{module}'s success line is not guarded by the refusal handler")
