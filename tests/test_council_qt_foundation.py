@@ -306,6 +306,49 @@ def test_the_application_actually_exits(tmp_path):
     assert "exited 0" in done.stdout, (done.stdout, done.stderr)
 
 
+def test_the_standalone_host_matches_the_tk_contract(qapp):
+    """council_modules.StandaloneHost is the contract a family of tab modules is
+    written against — tab_grapher here, tab_ideas and tab_video on other
+    branches. A ported tab module must be able to change which host it imports
+    without changing how it talks to one, so the surface has to match.
+
+    The model slots are checked by name because a tab module branches on them
+    (`if self.writer is None:`), which makes a missing or renamed slot a
+    behaviour change in a module this package cannot see."""
+    import inspect
+
+    import council_modules
+    from council_qt.host import MODEL_ROLES, StandaloneHost
+
+    tk_src = inspect.getsource(council_modules.StandaloneHost.__init__)
+    for role in MODEL_ROLES:
+        assert f'"{role}"' in tk_src, f"{role} is not a role on the Tk host"
+
+    host = StandaloneHost(title="test")
+    for role in MODEL_ROLES:
+        assert getattr(host, role) is None
+    assert host.root is host.window
+    assert host.ui_q is host.bridge.q
+    assert (host.nb, host.tab_council, host.input) == (None, None, None)
+    host.window.request_close()
+
+
+def test_the_standalone_host_schedules_safely_from_a_worker(qapp):
+    """The Tk host delegates after() straight to root.after, which is only safe
+    on the UI thread. Moving to Qt makes a tab module that was quietly wrong
+    right — provided the host routes through the bridge."""
+    from council_qt.host import StandaloneHost
+    host = StandaloneHost(title="test")
+    seen = []
+    t = threading.Thread(target=lambda: host.after(0, seen.append, "worker"),
+                         daemon=True)
+    t.start()
+    t.join()
+    assert _pump(qapp, lambda: seen)
+    assert seen == ["worker"]
+    host.window.request_close()
+
+
 def test_the_diagnostics_tab_builds_and_reports(qapp):
     """The first real tab, end to end: a worker gathers, the bridge delivers."""
     from council_qt.tabs.diagnostics import build_diagnostics

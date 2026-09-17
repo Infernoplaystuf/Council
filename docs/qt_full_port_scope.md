@@ -22,8 +22,25 @@ An AST walk over the real code today. Every later number is a function of this t
 |---|---|---|
 | `council_gui_engine.py` | 22,610 | **2,695** (11%) |
 | 13 live modules (canvas, splash, onboarding, panels, wizards) | 9,502 | **1,216** |
-| **total to rewrite** | ~32,000 | **~3,911** |
-| 6 dead modules never loaded by the app | 3,282 | 548 — **delete, don't port** |
+| 6 modules unreferenced *on this branch* (see below) | 3,282 | **548** |
+| **total to rewrite** | ~35,000 | **~4,459** |
+
+> **Correction (2026-09-17).** An earlier version of this document called those six
+> modules dead and recommended deleting them. That was wrong, and the mistake is worth
+> recording because it came from looking at one branch. `agent_panel`, `system_panel`,
+> `grapher_app`, `tab_grapher`, `council_modules` and `phase1_ai_model_council` are
+> **cut-off sections of features that live on other branches**, and they are all in
+> scope for the port.
+>
+> Verified across the remotes: `grapher_app` and `council_modules` exist on 8 branches;
+> `council_modules` has three importers on `main` and on `odysseus-council` —
+> `tab_grapher.py`, **`tab_ideas.py` and `tab_video.py`**, two tab modules that do not
+> exist on Work-Build at all. `agent_panel` and `system_panel` are imported by
+> `inferno_local` tests, all 176 of which pass today.
+>
+> So `council_modules` is not leftover code: it is the **standalone-tab architecture**
+> (`StandaloneHost` + `PALETTE`) that other branches build features on. Porting it is
+> what lets those branches' tabs be ported later — see §3, phase 2a.
 
 Inside `council_gui_engine.py`, attributing every method to a tab by following both
 calls **and** the handlers wired by `command=self.x` / `bind(..., self.x)`:
@@ -112,7 +129,8 @@ did before. Days are `likely` at the rate justified in §6.
 
 | # | phase | what it covers | days |
 |---|---|---|---|
-| **0** | **Prune and prepare** | Delete the 6 dead modules (3,282 lines, 548 toolkit lines — 14% of the surface, removed for free). Install and pin PySide6-Essentials 6.10.2 on the 3.11 floor. | 2–3 |
+| **0** | **Prepare** | Install and pin PySide6-Essentials 6.10.2 on the 3.11 floor. (No deletions — see the correction in §1.) | 1 |
+| **2a** | **The standalone-tab host** | `council_modules.StandaloneHost` + `PALETTE` as Qt: a host that runs one tab module on its own (its own window, queue, theme, model slots). The `council_qt` foundation already is this shape; it needs the compatible API. Unblocks porting `tab_grapher`, and `tab_ideas`/`tab_video` when those branches are merged. | 2–4 |
 | **1** | **Make the suite able to fail** | See §5. Without this, every later green run is uninterpretable. | 3–5 |
 | **2** | **Foundation** | `council_qt/` skeleton, the thread bridge, theme, dialog + variable shims, transcript widget. ~2,000–3,300 lines of new infrastructure with no Tk counterpart. | 26–36 |
 | **3** | **Extraction** | `council_core` behind the view interface. Ships on Tk alone. Can overlap phase 2. | 8–18 |
@@ -174,16 +192,21 @@ screen — because there are no UI tests to verify for you.
 
 | component | likely days | basis |
 |---|---|---|
-| translation of 3,911 toolkit lines | 87 | 3,911 ÷ 45 |
+| translation of 4,459 toolkit lines | 99 | 4,459 ÷ 45 |
 | foundation (phase 2) | 30 | new infrastructure, not line-costed |
 | extraction (phase 3) | 12 | 34 entry points behind a view interface |
 | test infrastructure (phases 1, 4) | 20 | harness + replay parity |
 | manual regression | 16 | ~2 days × 8 shipped phases |
 | packaging and CI | 7 | measured bundle work |
-| post-cutover defects | 18 | 20% of translation |
-| **subtotal** | **190** | |
-| contingency @25% | 48 | untested UI, God class, live bugs |
-| **total** | **~238** | range **150–370** |
+| post-cutover defects | 20 | 20% of translation |
+| **subtotal** | **204** | |
+| contingency @25% | 51 | untested UI, God class, live bugs |
+| **total** | **~255** | range **165–395** |
+
+Those totals went up when the six "dead" modules came back into scope (+548 toolkit
+lines, +12 translation days, +contingency). They will go up again if the tab modules on
+other branches — `tab_ideas`, `tab_video` — are merged in before the port finishes;
+each is a separate surface this measurement has never seen.
 
 At 70% utilisation: **13 months solo at the likely case, 20 at the pessimistic.** Two
 developers do not halve it — the foundation is one person's work and the tabs share
