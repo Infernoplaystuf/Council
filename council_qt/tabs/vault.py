@@ -152,8 +152,6 @@ class VaultActions:
             f"CouncilConsole). Extracting it is phase 3 — see "
             f"docs/qt_full_port_scope.md.")
 
-    def clone(self, url, subfolder, branch):        self._later("Clone")
-    def pull(self):                                 self._later("Pull updates")
     def import_zip(self, path, subfolder):          self._later("Extract zip")
     def import_zip_folder(self, folder):            self._later("Extract all zips")
     def import_folder(self, folder):                self._later("Copy folder")
@@ -176,6 +174,34 @@ class VaultActions:
         from council_core import vault_ops
         return vault_ops.build_keyword_index(self.vault_index(),
                                              on_progress=on_progress)
+
+    def build_descriptions(self, on_progress=None):
+        from council_core import vault_ops
+        return vault_ops.build_descriptions(self.vault_index(),
+                                            on_progress=on_progress)
+
+    def starting_descriptions(self):
+        from council_core import vault_ops
+        return vault_ops.starting_descriptions(self.vault_index())
+
+    def build_embeddings(self, on_progress=None):
+        from council_core import vault_ops
+        return vault_ops.build_embeddings(self.vault_index(),
+                                          on_progress=on_progress)
+
+    def starting_embeddings(self):
+        from council_core import vault_ops
+        return vault_ops.starting_embeddings(self.vault_index())
+
+    def clone(self, url, subfolder=None, branch=None, log=None):
+        from council_core import vault_ops
+        return vault_ops.clone(url, vault_dir=self.vault_dir,
+                               subfolder=subfolder or None,
+                               branch=branch or None, log=log)
+
+    def pull(self, subfolder, log=None):
+        from council_core import vault_ops
+        return vault_ops.pull(self.vault_dir, subfolder, log=log)
 
     def build_descriptions(self):                   self._later("Descriptions")
     def build_embeddings(self):                     self._later("Embeddings")
@@ -675,12 +701,51 @@ class VaultTab(QWidget):
 
     # -- operational buttons, all still behind the extraction line --------
     def on_clone(self) -> None:
-        self._run("Clone", lambda: self.actions.clone(
-            self.url_edit.text(), self.subfolder_edit.text(),
-            self.branch_edit.text()))
+        """Clone, on a worker, reporting through the bridge.
+
+        Validation happens on the UI thread because it is instant and its
+        answer is a message, not an operation — the same order the Tk shell
+        uses, and the same wording, because both read it from vault_ops."""
+        from council_core import vault_ops
+
+        url = self.url_edit.text()
+        problem = vault_ops.check_clone_url(url)
+        if problem:
+            self.append(problem, "err")
+            return
+        self.append(f"Cloning {url} …")
+
+        def work() -> None:
+            result = self.actions.clone(
+                url, self.subfolder_edit.text(), self.branch_edit.text(),
+                log=lambda m: self._to_ui(lambda m=m: self.append(m)))
+            self._to_ui(lambda: self._finish_repo(result))
+
+        threading.Thread(target=work, name="vault-clone", daemon=True).start()
 
     def on_pull(self) -> None:
-        self._run("Pull", self.actions.pull)
+        """Pull the repo whose folder is selected in the tree.
+
+        WHICH folder is a view question, so it is answered here; the pull
+        itself is not, so it is not."""
+        path = self.selected_path()
+        if path is None:
+            self.append("✗ Select a repo folder in the tree first.", "err")
+            return
+        subfolder = (path if path.is_dir() else path.parent).name
+        self.append(f"Pulling updates for {subfolder} …")
+
+        def work() -> None:
+            result = self.actions.pull(
+                subfolder, log=lambda m: self._to_ui(lambda m=m: self.append(m)))
+            self._to_ui(lambda: self._finish_repo(result))
+
+        threading.Thread(target=work, name="vault-pull", daemon=True).start()
+
+    def _finish_repo(self, result) -> None:
+        self.append(result.message, "ok" if result.ok else "err")
+        if result.ok:
+            self.refresh_tree()
 
     def on_import_zip(self) -> None:
         self._run("Extract zip", lambda: self.actions.import_zip(
@@ -737,10 +802,44 @@ class VaultTab(QWidget):
             button.setEnabled(enabled)
 
     def on_descriptions(self) -> None:
-        self._run("Descriptions", self.actions.build_descriptions)
+        from council_core import vault_ops
+        self._index_run(
+            self.actions.starting_descriptions(),
+            lambda p: self.actions.build_descriptions(on_progress=p),
+            lambda i, total: vault_ops.describing_line(i, total),
+            every=3)
 
     def on_embeddings(self) -> None:
-        self._run("Embeddings", self.actions.build_embeddings)
+        from council_core import vault_ops
+        self._index_run(
+            self.actions.starting_embeddings(),
+            lambda p: self.actions.build_embeddings(on_progress=p),
+            lambda i, total: vault_ops.embedding_line(i, total),
+            every=10)
+
+    def _index_run(self, start, run, line_for, every: int) -> None:
+        """The shape all three index layers share: say what is about to happen,
+        stop if there is nothing to do, then run on a worker and report.
+
+        The throttle (`every`) is the one thing that differs between them —
+        descriptions tick every 3 files, embeddings every 10 — because each
+        file costs seconds rather than milliseconds."""
+        self.index_status.setText(start.message)
+        self.append(start.message, "ok" if start.ok else "err")
+        if not start.ok or start.total == 0:
+            return
+        self._set_index_buttons(False)
+
+        def work() -> None:
+            def on_progress(i, total, name) -> None:
+                if i % every == 0 or i == total:
+                    line = line_for(i, total)
+                    self._to_ui(lambda: self.index_status.setText(line))
+
+            result = run(on_progress)
+            self._to_ui(lambda: self._finish_index(result))
+
+        threading.Thread(target=work, name="vault-index", daemon=True).start()
 
     def on_convert_mongo(self, scan_all: bool = False) -> None:
         self._run("Convert Mongo", lambda: self.actions.convert_mongo(

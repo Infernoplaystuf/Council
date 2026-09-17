@@ -400,11 +400,13 @@ def test_an_unextracted_action_says_so_instead_of_doing_nothing(qapp, tmp_path):
     from council_qt.tabs.vault import VaultActions, VaultTab
     window = CouncilWindow()
     tab = VaultTab(window, VaultActions(tmp_path))
-    # Clone, not the keyword index — that one has since been extracted, which
-    # is exactly the transition this test is here to survive.
-    tab.on_clone()
+    # Zip import: still on the Tk side. This test has now been re-pointed twice
+    # as the boundary moved (keyword index, then clone), which is the sign it is
+    # measuring the right thing — it should keep moving until there is nothing
+    # left behind the line, and then be deleted.
+    tab.on_import_zip()
     log = tab.log.toPlainText()
-    assert "Clone" in log and "phase 3" in log
+    assert "Extract zip" in log and "phase 3" in log
     window.request_close()
 
 

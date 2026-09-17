@@ -4815,85 +4815,16 @@ def _vmgr_clone_repo(
     depth: int = 1,
     log_cb=None,
 ) -> Path:
+    """Clone or update a GitHub repo and copy indexable files into vault_dir.
+
+    MOVED to council_core.vault_ops.clone_repo, where the Qt front end can
+    reach it too. This name stays because other call sites use it, and because
+    it had never contained a line of Tk — it was shared logic living in the
+    shell by accident.
     """
-    Clone or update a GitHub repo and copy indexable files into vault_dir.
-    log_cb(msg) is called with progress strings for the GUI log.
-    Returns the destination vault subfolder Path.
-    """
-    import re as _re
-    import shutil as _shutil
-    import subprocess as _sp
-
-    def _log(m):
-        if log_cb:
-            log_cb(m)
-        else:
-            print(m)
-
-    INDEXABLE = {
-        ".py", ".md", ".txt", ".json", ".yaml", ".yml",
-        ".html", ".rst", ".csv", ".log", ".toml", ".ini",
-    }
-    SKIP_DIRS  = {".git", ".github", "__pycache__", "node_modules",
-                  ".tox", "dist", "build", ".venv", "venv", "env",
-                  ".eggs", ".mypy_cache", ".pytest_cache"}
-    SKIP_FILES = {".gitignore", ".gitattributes", ".gitmodules",
-                  "poetry.lock", "package-lock.json", "yarn.lock",
-                  "Pipfile.lock", ".DS_Store"}
-    MAX_BYTES  = 500_000
-
-    if not subfolder:
-        name = url.rstrip("/").rstrip(".git").rsplit("/", 1)[-1]
-        subfolder = _re.sub(r"[^A-Za-z0-9._-]", "_", name) or "repo"
-
-    clone_dir = vault_dir / ".git_clones" / subfolder
-    dest_dir  = vault_dir / subfolder
-
-    if clone_dir.exists():
-        _log(f"Updating existing clone: {subfolder}")
-        r = _sp.run(["git", "pull"], cwd=str(clone_dir),
-                    capture_output=True, text=True, timeout=120,
-                    encoding="utf-8", errors="replace")
-        _log(r.stdout.strip() or r.stderr.strip() or "Already up to date.")
-    else:
-        clone_dir.parent.mkdir(parents=True, exist_ok=True)
-        cmd = ["git", "clone", f"--depth={depth}"]
-        if branch:
-            cmd += ["--branch", branch]
-        cmd += [url, str(clone_dir)]
-        _log(f"Cloning {url} …")
-        r = _sp.run(cmd, capture_output=True, text=True, timeout=300,
-                    encoding="utf-8", errors="replace")
-        if r.returncode != 0:
-            raise RuntimeError(r.stderr.strip() or "git clone failed")
-        _log(f"Cloned to {clone_dir.name}")
-
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    copied = skipped = 0
-    for src in clone_dir.rglob("*"):
-        if not src.is_file():
-            continue
-        parts = set(src.relative_to(clone_dir).parts)
-        if parts & SKIP_DIRS or src.name in SKIP_FILES:
-            skipped += 1
-            continue
-        if src.suffix.lower() not in INDEXABLE:
-            skipped += 1
-            continue
-        try:
-            if src.stat().st_size > MAX_BYTES:
-                skipped += 1
-                continue
-        except OSError:
-            skipped += 1
-            continue
-        dst = dest_dir / src.relative_to(clone_dir)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        _shutil.copy2(src, dst)
-        copied += 1
-
-    _log(f"Copied {copied} files → vault/{subfolder}  ({skipped} skipped)")
-    return dest_dir
+    from council_core import vault_ops
+    return vault_ops.clone_repo(url, vault_dir=vault_dir, subfolder=subfolder,
+                                branch=branch, depth=depth, log=log_cb)
 
 
 # ── Shared import filters (zip + folder import both use these) ──────────
@@ -16273,20 +16204,15 @@ class CouncilConsole(tk.Tk):
         self._vmgr_append("📊 building data stats (incremental — only new "
                           "files)…", "info")
 
+        from council_core import vault_ops
+
         def _worker():
-            try:
-                def _prog(i, total, name):
-                    if total and (i == total or i % 25 == 0):
-                        self.ui_q.put(("agent_phase", "stats_index",
-                                       f"  stats: {i}/{total} ({name})"))
-                res = self._build_stats_index(on_progress=_prog)
-                self.ui_q.put(("agent_phase", "stats_index",
-                               f"✓ data stats ready — processed "
-                               f"{res['processed']} new, {res['already_current']} "
-                               f"already cached ({res['seen']} CSVs)."))
-            except Exception as exc:
-                self.ui_q.put(("agent_phase", "stats_index",
-                               f"✗ stats build failed: {exc!r}"))
+            def _line(text):
+                self.ui_q.put(("agent_phase", "stats_index", text))
+
+            result = vault_ops.build_stats(self._build_stats_index,
+                                           on_line=_line)
+            _line(result.message)
 
         import threading as _th
         _th.Thread(target=_worker, daemon=True).start()
@@ -16487,37 +16413,26 @@ class CouncilConsole(tk.Tk):
 
     def _vmgr_build_descriptions(self):
         """Generate per-file LLM descriptions for every record without one.
-        Requires the keyword index to exist; takes ~3-10s per file on a 7B GGUF."""
+
+        The operation is council_core.vault_ops.build_descriptions, which the Qt
+        front end calls too; what stays here is the thread and the after(0) hop.
+        """
+        from council_core import vault_ops
+
         idx = _get_vault_index()
-        if idx is None:
-            self._idx_status_var.set("Vault index unavailable.")
-            return
-        try:
-            idx.rebuild()
-        except Exception:
-            pass
-        pending = sum(1 for r in idx.records.values()
-                      if not r.get("description"))
-        if pending == 0:
-            self._idx_status_var.set(
-                f"All {len(idx.records)} files already have descriptions.")
-            return
-        self._idx_status_var.set(
-            f"Generating descriptions for {pending} files… (each ~3-10s)")
+        start = vault_ops.starting_descriptions(idx)
+        self._idx_status_var.set(start.message)
+        if not start.ok or start.total == 0:
+            return                      # unavailable, or nothing left to do
 
         def _worker():
             def _progress(i, total, name):
                 if i % 3 == 0 or i == total:
-                    self.after(0, lambda: self._idx_status_var.set(
-                        f"Descriptions: {i}/{total}…"))
-            try:
-                n = idx.generate_descriptions(on_progress=_progress)
-            except Exception as exc:
-                self.after(0, lambda exc=exc: self._idx_status_var.set(
-                    f"Description build failed: {exc!r}"))
-                return
-            self.after(0, lambda: self._idx_status_var.set(
-                f"Descriptions complete — {n} files summarized."))
+                    line = vault_ops.describing_line(i, total)
+                    self.after(0, lambda: self._idx_status_var.set(line))
+
+            result = vault_ops.build_descriptions(idx, on_progress=_progress)
+            self.after(0, lambda: self._idx_status_var.set(result.message))
 
         import threading as _th
         _th.Thread(target=_worker, daemon=True).start()
@@ -16525,37 +16440,22 @@ class CouncilConsole(tk.Tk):
     def _vmgr_build_embeddings(self):
         """Build vector embeddings for every record (one-time, then mtime-incremental).
         Downloads sentence-transformers model on first run (~80 MB)."""
+        from council_core import vault_ops
+
         idx = _get_vault_index()
-        if idx is None:
-            self._idx_status_var.set("Vault index unavailable.")
-            return
-        try:
-            idx.rebuild()
-        except Exception:
-            pass
-        emb = idx.embeddings()
-        if emb is None:
-            self._idx_status_var.set(
-                "sentence-transformers not available — pip install it first.")
-            return
-        self._idx_status_var.set(
-            f"Embedding {len(idx.records)} files (model: {emb.model_name})…")
+        start = vault_ops.starting_embeddings(idx)
+        self._idx_status_var.set(start.message)
+        if not start.ok:
+            return                      # no index, or no sentence-transformers
 
         def _worker():
             def _progress(i, total, name):
                 if i % 10 == 0 or i == total:
-                    self.after(0, lambda: self._idx_status_var.set(
-                        f"Embeddings: {i}/{total}…"))
-            try:
-                n = idx.build_embeddings(on_progress=_progress)
-            except Exception as exc:
-                self.after(0, lambda exc=exc: self._idx_status_var.set(
-                    f"Embedding build failed: {exc!r}"))
-                return
-            stats = emb.stats()
-            self.after(0, lambda: self._idx_status_var.set(
-                f"Vectors ready — {stats['vectors']} files "
-                f"({stats['dim']}-dim, {stats['size_kb']} KB on disk)."))
+                    line = vault_ops.embedding_line(i, total)
+                    self.after(0, lambda: self._idx_status_var.set(line))
+
+            result = vault_ops.build_embeddings(idx, on_progress=_progress)
+            self.after(0, lambda: self._idx_status_var.set(result.message))
 
         import threading as _th
         _th.Thread(target=_worker, daemon=True).start()
@@ -16563,32 +16463,26 @@ class CouncilConsole(tk.Tk):
     def _vmgr_clone(self):
         """Clone a GitHub repo into the vault in a background thread."""
         import threading
+
+        from council_core import vault_ops
+
         url       = self._vmgr_url_var.get().strip()
         subfolder = self._vmgr_subfolder_var.get().strip() or None
         branch    = self._vmgr_branch_var.get().strip() or None
 
-        if not url:
-            self._vmgr_append("✗ Please enter a GitHub URL.", "err")
+        problem = vault_ops.check_clone_url(url)
+        if problem:
+            self._vmgr_append(problem, "err")
             return
-        if not url.startswith("http"):
-            self._vmgr_append("✗ URL must start with https://", "err")
-            return
-
         self._vmgr_append(f"Cloning {url} …", "info")
 
         def worker():
-            try:
-                dest = _vmgr_clone_repo(
-                    url,
-                    vault_dir=VAULT_DIR,
-                    subfolder=subfolder,
-                    branch=branch,
-                    log_cb=lambda m: self.ui_q.put(("vault_mgr_log", m)),
-                )
-                self.ui_q.put(("vault_mgr_log", f"✓ Done → {dest.name}"))
+            result = vault_ops.clone(
+                url, vault_dir=VAULT_DIR, subfolder=subfolder, branch=branch,
+                log=lambda m: self.ui_q.put(("vault_mgr_log", m)))
+            self.ui_q.put(("vault_mgr_log", result.message))
+            if result.ok:
                 self.ui_q.put(("vault_mgr_refresh", None))
-            except Exception as e:
-                self.ui_q.put(("vault_mgr_log", f"✗ Clone failed: {e}"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -16603,39 +16497,18 @@ class CouncilConsole(tk.Tk):
         if not p.is_dir():
             p = p.parent
         subfolder = p.name
-        clone_dir = VAULT_DIR / ".git_clones" / subfolder
-        if not clone_dir.exists():
-            self._vmgr_append(
-                f"✗ No git clone found for '{subfolder}'. "
-                "Use Clone Repo first.", "err")
-            return
+
+        from council_core import vault_ops
 
         self._vmgr_append(f"Pulling updates for {subfolder} …", "info")
 
         def worker():
-            try:
-                import subprocess
-                r = subprocess.run(
-                    ["git", "pull"], cwd=str(clone_dir),
-                    capture_output=True, text=True, timeout=120,
-                    encoding="utf-8", errors="replace")
-                msg = r.stdout.strip() or r.stderr.strip() or "Done."
-                self.ui_q.put(("vault_mgr_log", f"git pull: {msg}"))
-                # Re-copy updated files
-                rc2, url, _ = (lambda r2: (r2.returncode, r2.stdout.strip(), ""))(
-                    subprocess.run(["git", "remote", "get-url", "origin"],
-                                   cwd=str(clone_dir),
-                                   capture_output=True, text=True, timeout=15,
-                                   encoding="utf-8", errors="replace"))
-                if rc2 == 0 and url:
-                    _vmgr_clone_repo(
-                        url, vault_dir=VAULT_DIR, subfolder=subfolder,
-                        log_cb=lambda m: self.ui_q.put(("vault_mgr_log", m)),
-                    )
-                self.ui_q.put(("vault_mgr_log", f"✓ {subfolder} updated"))
+            result = vault_ops.pull(
+                VAULT_DIR, subfolder,
+                log=lambda m: self.ui_q.put(("vault_mgr_log", m)))
+            self.ui_q.put(("vault_mgr_log", result.message))
+            if result.ok:
                 self.ui_q.put(("vault_mgr_refresh", None))
-            except Exception as e:
-                self.ui_q.put(("vault_mgr_log", f"✗ Pull failed: {e}"))
 
         threading.Thread(target=worker, daemon=True).start()
 
