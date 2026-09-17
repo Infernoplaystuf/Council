@@ -21,8 +21,11 @@ module exists before any widget does.
 HOW IT WORKS
     * One `queue.Queue` survives from the Tk design. It is already thread-safe
       and toolkit-neutral, and its drain-everything-then-update-once shape is
-      load-bearing: the transcript coalesces ~100 tokens/sec into one scroll,
-      which per-message signal delivery would undo.
+      load-bearing: the LIVE STREAM BOX takes ~100 tokens/sec and scrolls once
+      per drain, which per-message signal delivery would undo. (Not the
+      transcript — an AST pass over all 285 `_append_transcript` call sites
+      shows kind="token" is never passed to it. The tokens go to
+      `_append_stream_box`, and this rationale used to name the wrong widget.)
     * A Qt Signal with a queued connection is the wake-up. Emitting a signal is
       safe from any thread; the slot runs on the thread that owns the object —
       here, the GUI thread.
@@ -34,8 +37,10 @@ HOW IT WORKS
 """
 from __future__ import annotations
 
+import collections
 import queue
 import threading
+import traceback
 from typing import Any, Callable, Optional
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
@@ -44,6 +49,7 @@ from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
 # collide with one of the dispatcher's 33 real kinds.
 _AFTER = "__council_after__"
 _CALL = "__council_call__"
+_CANCEL = "__council_cancel__"
 
 
 class UiBridge(QObject):
@@ -57,7 +63,21 @@ class UiBridge(QObject):
         super().__init__(parent)
         self.q: "queue.Queue" = queue.Queue()
         self._dispatch = dispatch
+        # Items that arrived before anything was listening. The Tk ui_q always
+        # has _poll_ui_queue on the other end; here, nothing assigned a
+        # dispatcher for the whole of phase 5 and every posted item was
+        # silently dropped on the floor. Holding them means a tab that posts
+        # during construction is not punished for being early.
+        self._undispatched: "collections.deque" = collections.deque(maxlen=512)
+        self._dropped = 0
+        self._warned_no_dispatch = False
         self._timers: dict = {}
+        # Tokens cancelled before their timer was created. A cross-thread
+        # after() mints its token and POSTS the request, so there is a window
+        # in which the token is real and the QTimer is not — and a cancel
+        # arriving in that window used to pop nothing and be silently ignored,
+        # after which the callback fired anyway.
+        self._cancelled: set = set()
         self._token = 0
         self._lock = threading.Lock()
         # QueuedConnection is what moves the call onto the GUI thread. Without
@@ -92,13 +112,32 @@ class UiBridge(QObject):
             return None                     # Tk's sleeping form; unused here
         if self.on_ui_thread():
             return self._start_timer(ms, fn, args)
-        self.post((_AFTER, ms, fn, args))
-        return None                         # a cross-thread after is fire-and-forget
+        # A cross-thread after still gets a token. Returning None meant a
+        # worker could schedule something and then had no way to cancel it —
+        # and `after_cancel(None)` is a silent no-op, so the caller could not
+        # even tell. The token is minted here and the timer is created under it
+        # when the drain reaches the UI thread.
+        token = self._mint_token()
+        self.post((_AFTER, ms, fn, args, token))
+        return token
 
     def after_cancel(self, token: Any) -> None:
+        """Cancel a scheduled callback. Safe from any thread.
+
+        A QTimer belongs to the thread that created it, and stopping one from
+        elsewhere is undefined — so an off-thread cancel is posted rather than
+        performed. This used to call stop() and deleteLater() on whatever
+        thread asked.
+        """
         if not token:
             return
-        timer = self._timers.pop(token, None)
+        if not self.on_ui_thread():
+            self.post((_CANCEL, token))
+            return
+        with self._lock:
+            timer = self._timers.pop(token, None)
+            if timer is None:
+                self._cancelled.add(token)    # it has not been created yet
         if timer is not None:
             timer.stop()
             timer.deleteLater()
@@ -124,19 +163,32 @@ class UiBridge(QObject):
                 f"use bridge.call_on_ui(...) or bridge.post(...)")
 
     # -- draining (always on the GUI thread) ----------------------------
-    def _start_timer(self, ms: int, fn: Callable, args: tuple) -> Any:
+    def _mint_token(self) -> str:
         with self._lock:
             self._token += 1
-            token = f"after#{self._token}"
+            return f"after#{self._token}"
+
+    def _start_timer(self, ms: int, fn: Callable, args: tuple,
+                     token: Optional[str] = None) -> Any:
+        """Create the QTimer. Always on the UI thread — see after_cancel."""
+        token = token or self._mint_token()
+        with self._lock:
+            if token in self._cancelled:
+                self._cancelled.discard(token)
+                return token                  # cancelled while in the queue
         timer = QTimer(self)
         timer.setSingleShot(True)
 
         def _fire():
-            self._timers.pop(token, None)
+            with self._lock:
+                self._timers.pop(token, None)
             self._safely(fn, args, {})
 
         timer.timeout.connect(_fire)
-        self._timers[token] = timer
+        # Under the lock: _fire and after_cancel both mutate this from
+        # timer callbacks, and a plain dict is not safe against that.
+        with self._lock:
+            self._timers[token] = timer
         timer.start(max(0, int(ms)))
         return token
 
@@ -148,8 +200,12 @@ class UiBridge(QObject):
         one message rather than every message after it."""
         try:
             fn(*args, **kwargs)
-        except Exception as exc:                        # noqa: BLE001
-            print(f"[ui] callback failed: {exc!r}")
+        except Exception:                               # noqa: BLE001
+            # A traceback, not a bare repr. Tk's report_callback_exception
+            # prints the full stack, and "[ui] callback failed:
+            # KeyError('rows')" with no frames is close to useless for a
+            # callback three layers inside a tab.
+            traceback.print_exc()
 
     def _drain(self) -> None:
         """Empty the queue, then let the caller update once.
@@ -167,15 +223,45 @@ class UiBridge(QObject):
                     _, fn, args, kwargs = item
                     self._safely(fn, args, kwargs)
                 elif isinstance(item, tuple) and item and item[0] == _AFTER:
-                    _, ms, fn, args = item
-                    self._start_timer(ms, fn, args)
+                    _, ms, fn, args, token = item
+                    self._start_timer(ms, fn, args, token)
+                elif isinstance(item, tuple) and item and item[0] == _CANCEL:
+                    self.after_cancel(item[1])
                 elif self._dispatch is not None:
                     self._dispatch(item)
+                else:
+                    self._hold(item)
             except Exception as exc:                    # noqa: BLE001
                 print(f"[ui] queue handler failed: {exc!r}")
 
+    def _hold(self, item: Any) -> None:
+        """Keep an item nobody is listening for yet, and say so once."""
+        if len(self._undispatched) == self._undispatched.maxlen:
+            self._dropped += 1
+        self._undispatched.append(item)
+        if not self._warned_no_dispatch:
+            self._warned_no_dispatch = True
+            print("[ui] no dispatcher set — holding queued items until one is "
+                  "(bridge.set_dispatch)")
+
     def set_dispatch(self, dispatch: Callable[[Any], None]) -> None:
+        """Install the handler, and deliver whatever arrived before it."""
         self._dispatch = dispatch
+        if not dispatch:
+            return
+        held, self._undispatched = list(self._undispatched), \
+            collections.deque(maxlen=self._undispatched.maxlen)
+        if self._dropped:
+            print(f"[ui] {self._dropped} queued item(s) were lost before a "
+                  "dispatcher was set")
+            self._dropped = 0
+        for item in held:
+            self._safely(dispatch, (item,), {})
+
+    @property
+    def pending(self) -> int:
+        """How many items are waiting for a dispatcher. For tests, mostly."""
+        return len(self._undispatched)
 
     def stop(self) -> None:
         self._pump.stop()

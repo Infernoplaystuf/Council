@@ -17391,51 +17391,18 @@ class CouncilConsole(tk.Tk):
             widget.configure(state="disabled")
 
     def _on_app_close(self):
-        """Flush conversation logs, run the self-improvement analyzers,
-        and dispose cached DB engines before the window closes. Engine
-        disposal returns the pooled SQLAlchemy connections to the
-        underlying DB cleanly instead of relying on socket teardown."""
+        """Flush conversation logs, run the self-improvement analyzers, and
+        dispose cached DB engines before the window closes.
+
+        The work itself is council_core.shutdown, so the Qt build does the same
+        four jobs — it was doing none of them.
+        """
         try:
-            if hasattr(self, "conv_logger") and self.conv_logger:
-                self.conv_logger.end_session("user_close")
-        except Exception:
-            pass
-        # Clean shutdown ⇒ the GPU load/inference didn't crash this run, so
-        # clear the GPU-crash sentinel. (A real CUDA core dump never reaches
-        # this handler, so its sentinel correctly survives to force CPU next
-        # launch.)
-        try:
-            import council_engine as _ce_close
-            _ce_close.gpu_clear_attempt()
-        except Exception:
-            pass
-        # ── Auto-analyze on close ────────────────────────────────────
-        # Aggregate this session's tool gaps + failure signatures into
-        # human-reviewed proposals so they accumulate without anyone
-        # remembering to press the panel button. Deterministic templates
-        # only (no model call — the model may already be unloaded and
-        # close must stay fast); both analyzers dedup against the queue
-        # so closing the app twice never writes a proposal twice.
-        try:
-            import tool_gap_analyzer as _tga
-            from tool_registry import ToolRegistry as _TReg
-            _tmp = _TReg(); _tmp.freeze()
-            _gap_rep = _tga.ToolGapAnalyzer(
-                _tmp.view(), threshold=2).analyze()
-            _fail_rep = _tga.FailureAnalyzer(threshold=3).analyze()
-            _new = _gap_rep.proposals_written + _fail_rep.proposals_written
-            if _new:
-                print(f"[shutdown] self-improvement: {_new} new proposal(s) "
-                      "drafted — review in the Agent panel next launch.",
-                      flush=True)
-        except Exception:
-            pass
-        try:
-            import db_connections as _db
-            n = _db.dispose_engines()
-            if n:
-                print(f"[shutdown] disposed {n} cached DB engine(s)",
-                      flush=True)
+            from council_core import shutdown as _shutdown
+            report = _shutdown.close_session(
+                getattr(self, "conv_logger", None))
+            for line in report.lines():
+                print(line, flush=True)
         except Exception:
             pass
         try:

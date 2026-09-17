@@ -60,8 +60,12 @@ class StandaloneHost:
 
         self._owns_app = QApplication.instance() is None
         self.app = QApplication.instance() or QApplication([])
-        if self._owns_app:
-            theme.apply(self.app, theme_name)
+        self.theme_name = theme_name
+        # Applied whether or not we made the QApplication. Guarding this on
+        # _owns_app meant StandaloneHost(theme_name="light") inside an existing
+        # application silently stayed dark, and theme_name was stored nowhere
+        # and read by nothing.
+        theme.apply(self.app, theme_name)
 
         self.window = CouncilWindow(theme=theme_name)
         self.window.setWindowTitle(title)
@@ -81,7 +85,13 @@ class StandaloneHost:
         self.container = QWidget()
         self._layout = QVBoxLayout(self.container)
         self._layout.setContentsMargins(0, 0, 0, 0)
-        self.window.setCentralWidget(self.container)
+        # Hosted AS A TAB, not as the central widget. setCentralWidget evicted
+        # CouncilWindow's QTabWidget — the window still held it, still parented
+        # it, and never showed it again, so anything the hosted module added
+        # through the window went nowhere. The tab bar is hidden when there is
+        # only one, so a standalone module still looks standalone.
+        self.window.add_tab(title, lambda: self.container, eager=True)
+        self._hide_lone_tab_bar()
 
         for role in MODEL_ROLES:
             setattr(self, role, None)
@@ -92,6 +102,13 @@ class StandaloneHost:
         self.nb = None
         self.tab_council = None
         self.input = None
+
+    def _hide_lone_tab_bar(self) -> None:
+        """One tab is not a tab bar; it is a title the user cannot click."""
+        try:
+            self.window.tabs.tabBar().setVisible(self.window.tabs.count() > 1)
+        except Exception:                                 # noqa: BLE001
+            pass
 
     # -- the delegation a tab module uses ------------------------------
     def after(self, ms: int, fn=None, *args):

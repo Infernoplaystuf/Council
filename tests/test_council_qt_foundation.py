@@ -111,8 +111,10 @@ def test_after_on_the_ui_thread_can_be_cancelled(qapp):
 def test_the_queue_is_drained_in_order_and_without_loss(qapp):
     """Several workers, many messages: nothing lost, per-thread order kept.
 
-    The transcript coalescing depends on draining everything available in one
-    pass rather than one message per tick."""
+    The live stream box depends on draining everything available in one pass
+    rather than one message per tick — it takes ~100 tokens/sec and scrolls
+    once per drain. (The transcript never sees a token; that claim was in this
+    docstring and was wrong.)"""
     got = []
     bridge = UiBridge(dispatch=got.append)
 
@@ -767,3 +769,176 @@ def test_every_widget_a_tab_reaches_for_exists(window, title, factory, eager):
     assert not missing, (
         f"{title} reaches for attributes that are never set and do not exist "
         f"on the widget: {missing}")
+
+
+# ============================================================
+# The bugs phase 6's reconnaissance found in the PORT
+# ============================================================
+# Not inherited from Tk — these were mine, and an agent reproduced four of
+# them by running this foundation offscreen. Tk is being deprecated, so the
+# only place they matter is here.
+
+def test_a_message_posted_before_anyone_is_listening_is_not_lost(qapp):
+    """`host.ui_q.put(...)` used to vanish.
+
+    The Tk ui_q always has _poll_ui_queue on the other end. Here nothing
+    assigned a dispatcher — set_dispatch had no caller outside tests — so the
+    drain hit `elif self._dispatch is not None` and fell off the end of the
+    loop. Every item posted by every tab went nowhere, quietly.
+    """
+    bridge = UiBridge()                       # no dispatcher, deliberately
+    bridge.post(("agent_phase", "rag_index"))
+    bridge.post(("done", None))
+    _pump(qapp, lambda: bridge.pending == 2)
+    assert bridge.pending == 2, "posted items were dropped again"
+
+    got = []
+    bridge.set_dispatch(got.append)
+    assert [item[0] for item in got] == ["agent_phase", "done"]
+    assert bridge.pending == 0
+    bridge.stop()
+
+
+def test_holding_is_bounded_and_says_when_it_overflowed(qapp):
+    """Holding forever would be a leak in an app nobody ever wired up."""
+    bridge = UiBridge()
+    for i in range(700):
+        bridge.q.put(("x", i))
+    bridge._drain()
+    assert bridge.pending == 512, "the hold is unbounded"
+    got = []
+    bridge.set_dispatch(got.append)
+    assert len(got) == 512
+    bridge.stop()
+
+
+def test_an_after_scheduled_from_a_worker_can_be_cancelled(qapp):
+    """It returned None, so a worker could schedule and never unschedule —
+    and after_cancel(None) is a silent no-op, so it could not even tell."""
+    fired = []
+    bridge = UiBridge()
+    token = {}
+
+    def worker():
+        token["value"] = bridge.after(50, lambda: fired.append(1))
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+
+    assert token["value"], "a cross-thread after still returns no token"
+    bridge.after_cancel(token["value"])
+    _pump(qapp, lambda: False, timeout=0.4)
+    assert fired == [], "the cancelled callback fired anyway"
+    bridge.stop()
+
+
+def test_cancelling_from_a_worker_thread_does_not_touch_the_timer(qapp):
+    """A QTimer belongs to the thread that made it; stopping one from
+    elsewhere is undefined. The cancel is posted instead."""
+    fired = []
+    bridge = UiBridge()
+    token = bridge.after(120, lambda: fired.append(1))
+
+    def worker():
+        bridge.after_cancel(token)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+    _pump(qapp, lambda: False, timeout=0.4)
+    assert fired == [], "the cross-thread cancel did not take effect"
+    bridge.stop()
+
+
+def test_a_failing_callback_prints_a_traceback(qapp, capsys):
+    """Tk's report_callback_exception prints the stack. "[ui] callback failed:
+    KeyError('rows')" with no frames is close to useless for a callback three
+    layers inside a tab."""
+    bridge = UiBridge()
+
+    def boom():
+        raise KeyError("rows")
+
+    bridge.call_on_ui(boom)
+    _pump(qapp, lambda: False, timeout=0.3)
+    captured = capsys.readouterr()
+    assert "KeyError" in (captured.out + captured.err)
+    assert "Traceback" in (captured.out + captured.err), "no stack was printed"
+    bridge.stop()
+
+
+def test_the_standalone_host_does_not_evict_the_tab_widget(qapp):
+    """setCentralWidget replaced CouncilWindow's QTabWidget. The window still
+    held it and never showed it again, so anything a hosted module added
+    through the window went to a widget nobody could see."""
+    from council_qt.host import StandaloneHost
+
+    host = StandaloneHost(title="Probe")
+    assert host.window.centralWidget() is host.window.tabs, (
+        "the tab widget was evicted again")
+    assert host.window.tabs.count() >= 1
+    assert host.container.isVisibleTo(host.window)
+    host.window.request_close()
+
+
+def test_a_single_hosted_module_shows_no_tab_bar(qapp):
+    """One tab is not a tab bar; it is a title the user cannot click."""
+    from council_qt.host import StandaloneHost
+
+    host = StandaloneHost(title="Probe")
+    assert not host.window.tabs.tabBar().isVisible()
+    host.window.request_close()
+
+
+def test_the_host_applies_the_theme_it_was_given(qapp):
+    """Guarded on _owns_app, so StandaloneHost(theme_name="light") inside an
+    existing QApplication silently stayed dark — and theme_name was stored
+    nowhere and read by nothing."""
+    from council_qt.host import StandaloneHost
+
+    host = StandaloneHost(title="Probe", theme_name="light")
+    assert host.theme_name == "light"
+    window_colour = qapp.palette().window().color().lightness()
+    assert window_colour > 127, "the light theme was not applied"
+    host.window.request_close()
+    theme.apply(qapp, "dark")                 # leave the session as we found it
+
+
+def test_a_tab_that_is_absent_is_distinguishable_from_one_not_yet_built(qapp):
+    """tab() returns None for both, and the engine needs to say "that tab is
+    not in this build" rather than fail silently on one the user has not
+    opened."""
+    window = CouncilWindow(theme="dark")
+    # A first tab, because adding one makes it current and a current tab is
+    # built — so "Lazy" has to be second to actually stay lazy.
+    window.add_tab("First", lambda: QLabel("here"), eager=True)
+    window.add_tab("Lazy", lambda: QLabel("later"), eager=False)
+    assert window.has_tab("Lazy")
+    assert window.tab("Lazy") is None, "the lazy tab was built eagerly"
+    assert not window.has_tab("Never registered")
+    window.request_close()
+
+
+# -- the close-time work ------------------------------------------------------
+
+def test_the_qt_build_runs_the_close_work_at_all():
+    """It ran none of it: on_close is an empty base method and nothing ever
+    assigned it. Four invisible jobs — ending the conversation log, clearing
+    the GPU-crash sentinel, the analyzers, disposing DB engines — were simply
+    skipped every time the app closed."""
+    import ast
+    source = (Path(__file__).resolve().parent.parent / "council_qt.py"
+              ).read_text(encoding="utf-8")
+    assert "window.on_close" in source, "on_close is still never assigned"
+    tree = ast.parse(source)
+    names = {node.name for node in ast.walk(tree)
+             if isinstance(node, ast.FunctionDef)}
+    assert "_shutdown" in names
+
+
+def test_the_close_work_is_shared_with_the_tk_shell():
+    root = Path(__file__).resolve().parent.parent
+    for name in ("council_qt.py", "council_gui_engine.py"):
+        source = (root / name).read_text(encoding="utf-8")
+        assert "close_session(" in source, f"{name} does not use it"

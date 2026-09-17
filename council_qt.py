@@ -33,6 +33,14 @@ def main() -> int:
 
     window = CouncilWindow()
     _register_tabs(window)
+    # WITHOUT THIS, CLOSING THE QT APP DID NONE OF THE CLOSE-TIME WORK.
+    # `on_close` is an empty base method and nothing assigned it, so the
+    # conversation log was never ended, the GPU-crash sentinel survived a clean
+    # run (forcing CPU on the next launch), the self-improvement analyzers
+    # never ran, and pooled DB connections were left to socket teardown. All
+    # four are invisible, which is why it went unnoticed for the whole of
+    # phase 5.
+    window.on_close = _shutdown
     # THE PROCESS MUST ACTUALLY EXIT. Measured while building this: quitting
     # with the bridge's pump timer still running left the interpreter alive
     # after exec() returned — a window the user closed, and a process still in
@@ -44,6 +52,24 @@ def main() -> int:
     code = app.exec()
     window.request_close()          # idempotent; covers exec() returning early
     return code
+
+
+def _shutdown() -> None:
+    """The close-time work, shared with the Tk shell.
+
+    Never raises: a user who clicks X and gets a traceback, or a window that
+    refuses to close because an optional analyzer is unhappy, is worse than any
+    of these jobs being skipped.
+    """
+    try:
+        from council_core import shutdown
+        report = shutdown.close_session()
+        for line in report.lines():
+            print(line, flush=True)
+        for failure in report.failures:
+            print(f"[shutdown] skipped — {failure}", flush=True)
+    except Exception as exc:                              # noqa: BLE001
+        print(f"[shutdown] failed: {exc!r}", flush=True)
 
 
 def _register_tabs(window) -> None:

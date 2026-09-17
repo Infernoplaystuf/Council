@@ -109,6 +109,17 @@ class CouncilWindow(QMainWindow):
                 self.tabs.setCurrentIndex(i)
                 return
 
+    def has_tab(self, title: str) -> bool:
+        """Whether this build has that tab at all.
+
+        Separate from tab(), which returns None both for "never registered"
+        and for "registered but not built yet". The engine needs to tell those
+        apart to say "that tab is not in this build" rather than failing
+        silently on a tab the user simply has not opened.
+        """
+        return any(self.tabs.tabText(i) == title
+                   for i in range(self.tabs.count()))
+
     def tab(self, title: str) -> Optional[QWidget]:
         """The built page, or None if it has not been shown yet."""
         return self._built.get(title)
