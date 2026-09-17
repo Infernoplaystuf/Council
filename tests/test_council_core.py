@@ -1047,3 +1047,158 @@ def test_the_qt_tab_no_longer_claims_these_need_the_council_tab():
     qt_src = (ROOT / "council_qt" / "tabs" / "vault.py").read_text(encoding="utf-8")
     assert "needs the Council tab" not in qt_src
     assert "the council propose members" not in qt_src
+
+
+# ================================================================ specialists
+
+from council_core import specialists_ops as so  # noqa: E402
+
+
+class _Spec:
+    def __init__(self, id, icon, name, enabled=True):
+        self.id, self.icon, self.name, self.enabled = id, icon, name, enabled
+
+
+def _registry(monkeypatch, items, raises=None):
+    import types
+
+    class Registry:
+        def __init__(self, vault_dir):
+            if raises:
+                raise raises
+            self.vault_dir = vault_dir
+
+        def all(self):
+            return items
+
+    monkeypatch.setitem(sys.modules, "specialists",
+                        types.SimpleNamespace(SpecialistRegistry=Registry))
+
+
+def test_the_registry_is_given_the_vault_directory(monkeypatch, tmp_path):
+    """The defect this module was written for. The Qt Council tab called
+    SpecialistRegistry() with no argument, the constructor requires vault_dir,
+    and a bare `except Exception: return []` turned every TypeError into an
+    empty list — so the Ask: pin had been empty since it was written, and an
+    empty dropdown caused by a swallowed error looks exactly like one caused
+    by having no specialists."""
+    seen = {}
+    import types
+
+    class Registry:
+        def __init__(self, vault_dir):
+            seen["vault_dir"] = vault_dir
+
+        def all(self):
+            return []
+
+    monkeypatch.setitem(sys.modules, "specialists",
+                        types.SimpleNamespace(SpecialistRegistry=Registry))
+    so.load(tmp_path)
+    assert seen["vault_dir"] == tmp_path
+
+
+def test_a_registry_that_will_not_load_says_so(monkeypatch, tmp_path):
+    """"There are none" and "it would not load" need different words."""
+    _registry(monkeypatch, [], raises=TypeError("missing vault_dir"))
+    listing = so.load(tmp_path)
+    assert not listing.ok
+    assert "Could not load" in listing.message
+    assert listing.error is not None
+
+
+def test_an_empty_registry_says_what_to_do(monkeypatch, tmp_path):
+    _registry(monkeypatch, [])
+    listing = so.load(tmp_path)
+    assert listing.ok
+    assert "Specialists tab" in listing.message
+
+
+def test_the_pin_label_matches_the_tk_shell_exactly(monkeypatch, tmp_path):
+    """Tk builds f"{icon} {name}". Two front ends offering different text for
+    the same registry is what council_options.specialist_choices warns about
+    in its own comment — and the Qt tab was using the bare name."""
+    _registry(monkeypatch, [_Spec("sales", "💰", "Sales Specialist")])
+    listing = so.load(tmp_path)
+    assert listing.labels == ["💰 Sales Specialist"]
+
+
+def test_a_label_resolves_to_an_id_and_not_to_a_name(monkeypatch, tmp_path):
+    """The previous map was {name: name}, so even with entries it pinned a
+    NAME where the resolver wants an ID."""
+    _registry(monkeypatch, [_Spec("sales", "💰", "Sales Specialist")])
+    listing = so.load(tmp_path)
+    assert so.pinned_id("💰 Sales Specialist", listing) == "sales"
+
+
+def test_automatic_is_not_a_specialist(monkeypatch, tmp_path):
+    """A front end that forgets this pins a specialist called Auto onto every
+    query."""
+    _registry(monkeypatch, [_Spec("sales", "💰", "Sales Specialist")])
+    listing = so.load(tmp_path)
+    assert so.choices(listing)[0] == so.AUTO_LABEL
+    assert so.pinned_id(so.AUTO_LABEL, listing) is None
+    assert so.pinned_id("", listing) is None
+
+
+def test_a_label_naming_nothing_resolves_to_nothing(monkeypatch, tmp_path):
+    _registry(monkeypatch, [])
+    assert so.pinned_id("🦄 Gone", so.load(tmp_path)) is None
+
+
+def test_disabled_specialists_stay_out_of_the_pin(monkeypatch, tmp_path):
+    """Turning one off in the Specialists tab has to remove it from the
+    chooser, or the user can pin something that will not run."""
+    _registry(monkeypatch, [_Spec("a", "🅰", "Alpha"),
+                            _Spec("b", "🅱", "Beta", enabled=False)])
+    listing = so.load(tmp_path)
+    assert listing.labels == ["🅰 Alpha"]
+
+
+def test_the_registry_order_is_preserved(monkeypatch, tmp_path):
+    """Not sorted: the order is meaningful, and re-sorting it in a view is how
+    two front ends end up offering different lists."""
+    _registry(monkeypatch, [_Spec("z", "🅩", "Zulu"), _Spec("a", "🅰", "Alpha")])
+    assert so.load(tmp_path).labels == ["🅩 Zulu", "🅰 Alpha"]
+
+
+def test_the_qt_tab_no_longer_builds_its_own_label_map():
+    """Checked by PARSING, not by searching the text.
+
+    The first version of this test failed on the docstring that EXPLAINS the
+    bug — it says `SpecialistRegistry()` while describing what went wrong.
+    A source search cannot tell a call from a mention, and this is the second
+    time that has caught something in this port (a probe counted a handler as
+    an unfinished stub for discussing the Council tab).
+    """
+    import ast
+    source = (ROOT / "council_qt" / "tabs" / "council.py").read_text(
+        encoding="utf-8")
+    tree = ast.parse(source)
+
+    bad_calls = [
+        node.lineno for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and getattr(node.func, "attr", getattr(node.func, "id", "")) ==
+        "SpecialistRegistry"
+        and not node.args and not node.keywords
+    ]
+    assert not bad_calls, (
+        f"SpecialistRegistry is called with no vault_dir at {bad_calls}")
+
+    # The bug was `{name: name for name in ...}` — an identity map, which is
+    # what you write when you have confused a label with an id. Banning every
+    # dict comprehension was my first attempt and it flagged the options
+    # snapshot, which builds one legitimately: a rule wide enough to catch
+    # innocent code is a rule people learn to ignore.
+    identity_maps = [
+        node.lineno for node in ast.walk(tree)
+        if isinstance(node, ast.DictComp)
+        and isinstance(node.key, ast.Name)
+        and isinstance(node.value, ast.Name)
+        and node.key.id == node.value.id
+    ]
+    assert not identity_maps, (
+        f"the tab builds an identity label map at {identity_maps}; a label is "
+        f"not an id, and the registry builds the real map")
+    assert "specialists_ops" in source

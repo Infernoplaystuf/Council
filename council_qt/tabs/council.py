@@ -104,17 +104,18 @@ class CouncilActions:
         self._models_problem = ""
 
     # -- implemented -----------------------------------------------------
-    def specialist_names(self) -> List[str]:
-        """The specialists the registry offers, in its own order.
+    def specialists(self):
+        """The registry as the pin needs it: labels to show, ids to act on.
 
-        Not sorted here: the registry's order is meaningful, and re-sorting in
-        the view is how two front ends end up offering different lists.
+        This replaces a specialist_names() that had been returning [] since it
+        was written: it called SpecialistRegistry() with no argument, the
+        constructor requires vault_dir, and a bare `except Exception` turned
+        the TypeError into an empty list. An empty dropdown caused by a
+        swallowed error looks exactly like an empty dropdown caused by having
+        no specialists.
         """
-        try:
-            import specialists
-            return [s.name for s in specialists.SpecialistRegistry().all()]
-        except Exception:                                 # noqa: BLE001
-            return []
+        from council_core import specialists_ops
+        return specialists_ops.load(self.vault_dir)
 
     def save_answer(self, text: str, path: Path) -> str:
         """Write the last answer out. Returns a line for the transcript."""
@@ -227,6 +228,7 @@ class CouncilTab(ViewHelpers, QWidget):
 
         self._turn_active = False
         self._checkboxes = {}
+        self._specialists = None
         self._opts = council_options.CouncilOptions.defaults(
             demo_mode=self.demo_mode)
         for field in PER_TURN_FIELDS:
@@ -704,14 +706,29 @@ class CouncilTab(ViewHelpers, QWidget):
         self.input.clear()
 
     def refresh_specialists(self) -> None:
-        names = self.actions.specialist_names()
+        """Fill the Ask: pin, and say so when the registry will not load.
+
+        A registry that fails is not the same as a registry that is empty, and
+        the Tk shell's version of this cannot tell them apart either.
+        """
+        from council_core import specialists_ops
+
+        self._specialists = self.actions.specialists()
         self.specialist_box.clear()
-        self.specialist_box.addItems(council_options.specialist_choices(names))
+        self.specialist_box.addItems(specialists_ops.choices(self._specialists))
+        if not self._specialists.ok:
+            self.append("Council", self._specialists.message, "observation")
 
     def pinned_specialist(self) -> Optional[str]:
-        return council_options.pinned_specialist_id(
-            self.specialist_box.currentText(),
-            {name: name for name in self.actions.specialist_names()})
+        """The specialist ID to force onto this query, or None for automatic.
+
+        Resolved through the map the labels were BUILT from. The previous
+        version built {name: name}, so even with entries it would have pinned
+        a NAME where the resolver wants an ID.
+        """
+        from council_core import specialists_ops
+        return specialists_ops.pinned_id(self.specialist_box.currentText(),
+                                         self._specialists)
 
     def backend_override(self) -> Optional[str]:
         return council_options.backend_override(self.backend_box.currentText())
