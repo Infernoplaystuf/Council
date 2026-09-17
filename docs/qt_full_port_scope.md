@@ -42,6 +42,31 @@ An AST walk over the real code today. Every later number is a function of this t
 > (`StandaloneHost` + `PALETTE`) that other branches build features on. Porting it is
 > what lets those branches' tabs be ported later — see §3, phase 2a.
 
+### 1.1 The target is Work-Build **plus the other branches' tabs**
+
+Measured by reading each branch out of git and applying the same metric. These are UI
+modules that exist on some branch and not on Work-Build:
+
+| module | lines | tk-lines | lives on |
+|---|---|---|---|
+| `tab_ideas.py` | 2,033 | 366 | main, odysseus-council |
+| `tab_video.py` | 1,399 | 346 | main, odysseus-council, game-dev |
+| `council_gui.py` | 334 | 78 | **every branch except Work-Build** |
+| `database_grabber.py` | 373 | 66 | Database-grabber |
+| `diff_view.py` | 440 | 60 | odysseus-council, game-dev |
+| **added by other branches** | **4,579** | **916** | |
+
+**Total port surface: 5,375 toolkit-bound lines** (4,459 on Work-Build + 916 elsewhere).
+
+Two consequences for sequencing:
+
+* `tab_ideas` and `tab_video` are written against `council_modules.StandaloneHost`, so
+  **phase 2a (the Qt host) must land before them** — which is why it is early rather
+  than filed under "later". It is already built.
+* These modules cannot be ported from this branch: the code has to be merged first.
+  Porting them against a branch that later diverges would be doing the work twice, so
+  each one's port should follow its merge, not precede it.
+
 Inside `council_gui_engine.py`, attributing every method to a tab by following both
 calls **and** the handlers wired by `command=self.x` / `bind(..., self.x)`:
 
@@ -192,21 +217,26 @@ screen — because there are no UI tests to verify for you.
 
 | component | likely days | basis |
 |---|---|---|
-| translation of 4,459 toolkit lines | 99 | 4,459 ÷ 45 |
+| translation of 5,375 toolkit lines | 119 | 5,375 ÷ 45 |
 | foundation (phase 2) | 30 | new infrastructure, not line-costed |
 | extraction (phase 3) | 12 | 34 entry points behind a view interface |
 | test infrastructure (phases 1, 4) | 20 | harness + replay parity |
 | manual regression | 16 | ~2 days × 8 shipped phases |
 | packaging and CI | 7 | measured bundle work |
-| post-cutover defects | 20 | 20% of translation |
-| **subtotal** | **204** | |
-| contingency @25% | 51 | untested UI, God class, live bugs |
-| **total** | **~255** | range **165–395** |
+| manual regression | 18 | ~2 days × 9 shipped phases |
+| post-cutover defects | 24 | 20% of translation |
+| **subtotal** | **230** | |
+| contingency @25% | 58 | untested UI, God class, live bugs |
+| **total** | **~288** | range **255–377** |
 
-Those totals went up when the six "dead" modules came back into scope (+548 toolkit
-lines, +12 translation days, +contingency). They will go up again if the tab modules on
-other branches — `tab_ideas`, `tab_video` — are merged in before the port finishes;
-each is a separate surface this measurement has never seen.
+At 70% utilisation that is **17–25 months solo**, ~19 at the likely rate.
+
+The number has moved twice, both times because the target grew rather than because the
+method changed — 238 days when six modules were wrongly called dead, 255 once they were
+counted, 288 once the other branches' tabs were included. That is worth watching: the
+estimate is stable per line of surface (45/day) and unstable in the surface itself. Any
+further branch merged before the port finishes moves it again, which is an argument for
+settling what ships before committing to the calendar, not after.
 
 At 70% utilisation: **13 months solo at the likely case, 20 at the pessimistic.** Two
 developers do not halve it — the foundation is one person's work and the tabs share
