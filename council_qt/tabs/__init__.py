@@ -19,7 +19,9 @@ from __future__ import annotations
 
 from .council import build_council
 from .diagnostics import build_diagnostics
+from .forge import build_forge
 from .lens import build_lens
+from .speech import build_speech
 from .vault import build_vault
 
 #: (title, factory, eager). Factories take the CouncilWindow.
@@ -27,8 +29,11 @@ REGISTRY = [
     ("⚖ Council", build_council, True),
     ("🗄 Vault", build_vault, False),
     ("🔍 Lens", build_lens, False),
+    ("🛠 Tool Creation", build_forge, False),
+    ("🎙 Speech", build_speech, False),
     ("Diagnostics", build_diagnostics, False),
 ]
 
 __all__ = ["REGISTRY", "build_council", "build_diagnostics",
-           "build_lens", "build_vault"]
+           "build_forge", "build_lens", "build_speech",
+           "build_vault"]
