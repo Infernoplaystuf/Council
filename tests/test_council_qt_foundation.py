@@ -400,14 +400,33 @@ def test_an_unextracted_action_says_so_instead_of_doing_nothing(qapp, tmp_path):
     from council_qt.tabs.vault import VaultActions, VaultTab
     window = CouncilWindow()
     tab = VaultTab(window, VaultActions(tmp_path))
-    # Zip import: still on the Tk side. This test has now been re-pointed twice
-    # as the boundary moved (keyword index, then clone), which is the sign it is
-    # measuring the right thing — it should keep moving until there is nothing
-    # left behind the line, and then be deleted.
-    tab.on_import_zip()
-    log = tab.log.toPlainText()
-    assert "Extract zip" in log and "phase 3" in log
+    # Written to survive the boundary moving. It has already been re-pointed
+    # three times (keyword index, clone, zip import) as operations crossed the
+    # line, so instead of naming one, it asks the actions object which ones are
+    # still behind it and checks that EVERY one reports honestly.
+    unextracted = [name for name in dir(tab.actions)
+                   if not name.startswith("_")
+                   and callable(getattr(tab.actions, name))
+                   and _still_behind_the_line(tab.actions, name)]
+    assert unextracted, ("nothing is unextracted any more — delete this test "
+                         "and the NotYetExtracted machinery with it")
+    for name in unextracted:
+        with pytest.raises(VaultActions.NotYetExtracted) as exc:
+            getattr(tab.actions, name)()
+        assert "phase 3" in str(exc.value), name
     window.request_close()
+
+
+def _still_behind_the_line(actions, name):
+    """Whether calling this action raises NotYetExtracted with no arguments."""
+    from council_qt.tabs.vault import VaultActions
+    try:
+        getattr(actions, name)()
+    except VaultActions.NotYetExtracted:
+        return True
+    except Exception:                                   # noqa: BLE001
+        return False                                    # needs args, or works
+    return False
 
 
 def test_the_extracted_action_is_wired_to_the_shared_function(qapp, tmp_path):

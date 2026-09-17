@@ -4831,164 +4831,17 @@ def _vmgr_clone_repo(
 # Widened from the original code-repo allow-list to include the DATA formats
 # the analyst actually reads (Excel / Parquet / SQLite / DuckDB / BSON / TSV
 # / NDJSON / images / PDF), so importing a zip or folder of data isn't lossy.
-_IMPORT_INDEXABLE = {
-    # text / code / config
-    ".py", ".md", ".txt", ".json", ".yaml", ".yml", ".html", ".rst",
-    ".csv", ".log", ".toml", ".ini", ".xml", ".cfg", ".conf", ".tex",
-    ".r", ".m", ".ipynb",
-    # tabular / structured data the analyst reads
-    ".tsv", ".xlsx", ".xls", ".xlsm", ".parquet", ".feather", ".orc",
-    ".arrow", ".db", ".sqlite", ".sqlite3", ".duckdb", ".bson",
-    ".jsonl", ".ndjson", ".gz",
-    # images (parsed for metadata / vision)
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff",
-    # documents
-    ".pdf",
-}
-_IMPORT_SKIP_DIRS = {"__pycache__", "node_modules", ".git", ".venv", "venv",
-                     "dist", "build", ".eggs", ".tox", ".idea", ".vscode"}
+# Moved to council_core.vault_import so the Qt front end can reach
+# them without importing this module. Same objects, same names.
+from council_core.vault_import import (  # noqa: E402
+    _IMPORT_INDEXABLE, _IMPORT_SKIP_DIRS, _import_max_bytes,
+    _vmgr_copy_folder, _vmgr_extract_zip)
 
 
-def _import_max_bytes() -> int:
-    """Max size of a SINGLE file kept on import — a runaway guard, NOT a data
-    limit. Default 1 GiB (vs the old 500 KB, which silently dropped any real
-    data file). Override with COUNCIL_IMPORT_MAX_MB; set it very high to
-    effectively disable the cap."""
-    import os as _os
-    ov = _os.environ.get("COUNCIL_IMPORT_MAX_MB", "").strip()
-    if ov:
-        try:
-            return max(1, int(ov)) * 1024 * 1024
-        except ValueError:
-            pass
-    return 1024 * 1024 * 1024
 
 
-def _vmgr_extract_zip(
-    zip_path: Path,
-    *,
-    vault_dir: Path,
-    subfolder: str | None = None,
-    log_cb=None,
-) -> tuple:
-    """
-    Extract a zip archive into a vault subfolder, keeping only indexable files.
-    Returns (dest_dir, copied_count, skipped_count).
-    """
-    import zipfile
-    import shutil as _shutil
-    import re as _re
-
-    def _log(m):
-        if log_cb: log_cb(m)
-        else: print(m)
-
-    INDEXABLE = _IMPORT_INDEXABLE
-    SKIP_DIRS = _IMPORT_SKIP_DIRS
-    MAX_BYTES = _import_max_bytes()
-
-    if not subfolder:
-        subfolder = zip_path.stem
-    subfolder = _re.sub(r"[^A-Za-z0-9._-]", "_", subfolder) or "import"
-    dest_dir = vault_dir / subfolder
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    _dest_root = dest_dir.resolve()   # Zip Slip containment boundary
-
-    if not zipfile.is_zipfile(zip_path):
-        raise ValueError(f"{zip_path.name} is not a valid zip file")
-
-    copied = skipped = 0
-    with zipfile.ZipFile(zip_path, "r") as zf:
-        members = [m for m in zf.infolist() if not m.filename.endswith("/")]
-        _log(f"  {len(members)} files in archive")
-
-        # Detect common top-level prefix to strip (e.g. "repo-main/")
-        all_parts = [Path(m.filename).parts for m in members]
-        strip_prefix = ""
-        if all_parts and len(set(p[0] for p in all_parts if p)) == 1:
-            strip_prefix = all_parts[0][0]
-
-        for member in members:
-            parts = Path(member.filename).parts
-            if any(p in SKIP_DIRS for p in parts): skipped += 1; continue
-            if any(p.startswith(".") for p in parts): skipped += 1; continue
-            if Path(member.filename).suffix.lower() not in INDEXABLE: skipped += 1; continue
-            if member.file_size > MAX_BYTES:
-                _log(f"  SKIP (too large {member.file_size//1024}KB): {member.filename}")
-                skipped += 1; continue
-
-            # Strip the common prefix so files land at vault/subfolder/file, not vault/subfolder/repo-main/file
-            rel_parts = parts[1:] if (strip_prefix and parts and parts[0] == strip_prefix) else parts
-            if not rel_parts:
-                rel_parts = (Path(member.filename).name,)
-            dest_file = dest_dir / Path(*rel_parts)
-            # ── Zip Slip guard ──────────────────────────────────────────
-            # zf.open()+manual write bypasses ZipFile.extractall()'s built-in
-            # sanitisation, so a crafted entry with an ABSOLUTE path (pathlib
-            # resets the join) or ../ / symlink parts could write OUTSIDE the
-            # target. Refuse anything that doesn't resolve inside dest_dir.
-            try:
-                _resolved = dest_file.resolve()
-                _resolved.relative_to(_dest_root)
-            except (ValueError, OSError):
-                _log(f"  SKIP (unsafe path escapes target): {member.filename}")
-                skipped += 1
-                continue
-            dest_file = _resolved
-            dest_file.parent.mkdir(parents=True, exist_ok=True)
-            with zf.open(member) as src, open(dest_file, "wb") as dst:
-                _shutil.copyfileobj(src, dst)
-            copied += 1
-
-    return dest_dir, copied, skipped
 
 
-def _vmgr_copy_folder(
-    src: Path,
-    *,
-    vault_dir: Path,
-    subfolder: str | None = None,
-    log_cb=None,
-) -> tuple:
-    """
-    Copy a local folder into the vault, keeping only indexable files.
-    Returns (dest_dir, copied_count, skipped_count).
-    """
-    import shutil as _shutil
-    import re as _re
-
-    def _log(m):
-        if log_cb: log_cb(m)
-        else: print(m)
-
-    INDEXABLE = _IMPORT_INDEXABLE
-    SKIP_DIRS = _IMPORT_SKIP_DIRS
-    MAX_BYTES = _import_max_bytes()
-
-    if not subfolder:
-        subfolder = src.name
-    subfolder = _re.sub(r"[^A-Za-z0-9._-]", "_", subfolder) or "import"
-    dest_dir = vault_dir / subfolder
-    dest_dir.mkdir(parents=True, exist_ok=True)
-
-    copied = skipped = 0
-    for src_file in src.rglob("*"):
-        if not src_file.is_file(): continue
-        rel = src_file.relative_to(src)
-        if any(p in SKIP_DIRS for p in rel.parts): skipped += 1; continue
-        if any(p.startswith(".") for p in rel.parts): skipped += 1; continue
-        if src_file.suffix.lower() not in INDEXABLE: skipped += 1; continue
-        try:
-            if src_file.stat().st_size > MAX_BYTES: skipped += 1; continue
-        except OSError:
-            skipped += 1; continue
-        dest_file = dest_dir / rel
-        dest_file.parent.mkdir(parents=True, exist_ok=True)
-        _shutil.copy2(src_file, dest_file)
-        copied += 1
-
-    _log(f"  Copied {copied} files from {src.name}")
-    return dest_dir, copied, skipped
 
 
 # ── All persistent data lives under VAULT_DIR ─────────────────
@@ -17071,37 +16924,32 @@ class CouncilConsole(tk.Tk):
     def _vmgr_import_zip(self):
         """Extract a zip file into a vault subfolder, keeping only indexable files."""
         import threading
+
+        from council_core import vault_import
+
         zip_path  = self._vmgr_zip_var.get().strip()
         subfolder = self._vmgr_zip_subfolder_var.get().strip()
 
-        if not zip_path:
-            self._vmgr_append("✗ Please select a zip file first.", "err")
+        problem = vault_import.check_zip(zip_path)
+        if problem:
+            self._vmgr_append(problem, "err")
             return
-        if not Path(zip_path).exists():
-            self._vmgr_append(f"✗ File not found: {zip_path}", "err")
-            return
-
-        if not subfolder:
-            subfolder = Path(zip_path).stem
-
-        self._vmgr_append(f"Extracting {Path(zip_path).name} → vault/{subfolder} …", "info")
+        self._vmgr_append(
+            f"Extracting {Path(zip_path).name} → "
+            f"vault/{subfolder or Path(zip_path).stem} …", "info")
 
         def worker():
-            try:
-                dest, copied, skipped = _vmgr_extract_zip(
-                    Path(zip_path),
-                    vault_dir=VAULT_DIR,
-                    subfolder=subfolder,
-                    log_cb=lambda m: self.ui_q.put(("vault_mgr_log", m)),
-                )
-                self.ui_q.put(("vault_mgr_log",
-                    f"✓ Extracted {copied} files → vault/{dest.name}  ({skipped} skipped)"))
+            result = vault_import.import_zip(
+                zip_path, vault_dir=VAULT_DIR, subfolder=subfolder,
+                log=lambda m: self.ui_q.put(("vault_mgr_log", m)))
+            self.ui_q.put(("vault_mgr_log", result.message))
+            if result.ok:
                 self.ui_q.put(("vault_mgr_refresh", None))
-                # Clear fields
-                self._vmgr_zip_var.set("")
-                self._vmgr_zip_subfolder_var.set("")
-            except Exception as e:
-                self.ui_q.put(("vault_mgr_log", f"✗ Extraction failed: {e}"))
+                # THE CLEAR GOES THROUGH THE QUEUE. It used to be
+                # self._vmgr_zip_var.set("") called straight from this worker —
+                # a Tk variable written off the UI thread, which is one of the
+                # unsafe patterns this port is meant to remove, not carry over.
+                self.ui_q.put(("vault_mgr_clear_zip", None))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -17128,96 +16976,46 @@ class CouncilConsole(tk.Tk):
             self._vmgr_append(f"✗ Folder not found: {folder}", "err")
             return
 
+        from council_core import vault_import
+
         def worker():
-            import zipfile as _zf
             # Extract into data_in/ (the analyst/index scope) so the files are
             # usable by the council, not the vault root.
             try:
-                _indir = data_index.input_dir(VAULT_DIR)
-                _indir.mkdir(parents=True, exist_ok=True)
+                indir = data_index.input_dir(VAULT_DIR)
             except Exception:
-                _indir = VAULT_DIR
-            try:
-                zips = sorted(src.rglob("*.zip"))
-            except Exception as e:
-                self.ui_q.put(("vault_mgr_log", f"✗ Could not scan folder: {e}"))
-                return
-            if not zips:
-                self.ui_q.put(("vault_mgr_log",
-                               f"No .zip files found under {src.name}."))
-                return
-            self.ui_q.put(("vault_mgr_log",
-                           f"Found {len(zips)} zip(s) under {src.name} — extracting…"))
-            ok = total_copied = failed = 0
-            used: set = set()
-            for i, zp in enumerate(zips, 1):
-                # Validate BEFORE extracting so a corrupt/.zip-misnamed file
-                # doesn't leave an empty subfolder behind.
-                if not _zf.is_zipfile(zp):
-                    failed += 1
-                    self.ui_q.put((
-                        "vault_mgr_log",
-                        f"  [{i}/{len(zips)}] ✗ {zp.name}: not a valid zip — skipped"))
-                    continue
-                # Unique subfolder per zip (two zips can share a stem).
-                sub = zp.stem
-                while sub in used:
-                    sub = f"{zp.stem}_{i}"
-                used.add(sub)
-                try:
-                    dest, copied, skipped = _vmgr_extract_zip(
-                        zp, vault_dir=_indir, subfolder=sub,
-                        log_cb=lambda m: self.ui_q.put(("vault_mgr_log", m)))
-                    ok += 1
-                    total_copied += copied
-                    self.ui_q.put((
-                        "vault_mgr_log",
-                        f"  [{i}/{len(zips)}] ✓ {zp.name} → data_in/{dest.name} "
-                        f"({copied} files, {skipped} skipped)"))
-                except Exception as e:
-                    failed += 1
-                    self.ui_q.put((
-                        "vault_mgr_log",
-                        f"  [{i}/{len(zips)}] ✗ {zp.name}: {e}"))
-            self.ui_q.put((
-                "vault_mgr_log",
-                f"Done — {ok}/{len(zips)} zip(s) extracted, {total_copied} "
-                f"files total" + (f", {failed} failed" if failed else "") + "."))
+                indir = VAULT_DIR
+            result = vault_import.import_zip_folder(
+                src, input_dir=indir,
+                log=lambda m: self.ui_q.put(("vault_mgr_log", m)))
+            self.ui_q.put(("vault_mgr_log", result.message))
             self.ui_q.put(("vault_mgr_refresh", None))
-            self._vmgr_zipdir_var.set("")
+            self.ui_q.put(("vault_mgr_clear_field", "_vmgr_zipdir_var"))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _vmgr_import_folder(self):
         """Copy a local folder into the vault, keeping only indexable files."""
         import threading
-        folder_path = self._vmgr_folder_var.get().strip()
 
-        if not folder_path:
-            self._vmgr_append("✗ Please select a folder first.", "err")
+        from council_core import vault_import
+
+        folder_path = self._vmgr_folder_var.get().strip()
+        problem = vault_import.check_folder(folder_path)
+        if problem:
+            self._vmgr_append(problem, "err")
             return
         src = Path(folder_path)
-        if not src.exists() or not src.is_dir():
-            self._vmgr_append(f"✗ Folder not found: {folder_path}", "err")
-            return
-
-        subfolder = src.name
-        self._vmgr_append(f"Copying {src.name} → vault/{subfolder} …", "info")
+        self._vmgr_append(f"Copying {src.name} → vault/{src.name} …", "info")
 
         def worker():
-            try:
-                dest, copied, skipped = _vmgr_copy_folder(
-                    src,
-                    vault_dir=VAULT_DIR,
-                    subfolder=subfolder,
-                    log_cb=lambda m: self.ui_q.put(("vault_mgr_log", m)),
-                )
-                self.ui_q.put(("vault_mgr_log",
-                    f"✓ Copied {copied} files → vault/{dest.name}  ({skipped} skipped)"))
+            result = vault_import.import_folder(
+                src, vault_dir=VAULT_DIR,
+                log=lambda m: self.ui_q.put(("vault_mgr_log", m)))
+            self.ui_q.put(("vault_mgr_log", result.message))
+            if result.ok:
                 self.ui_q.put(("vault_mgr_refresh", None))
-                self._vmgr_folder_var.set("")
-            except Exception as e:
-                self.ui_q.put(("vault_mgr_log", f"✗ Copy failed: {e}"))
+                self.ui_q.put(("vault_mgr_clear_field", "_vmgr_folder_var"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -20929,6 +20727,20 @@ class CouncilConsole(tk.Tk):
                 elif kind == "vault_mgr_refresh":
                     if hasattr(self, "_vmgr_tree"):
                         self._vmgr_refresh_tree()
+
+                elif kind == "vault_mgr_clear_zip":
+                    # An import finished; blank the fields it consumed. Routed
+                    # through the queue because the worker that finishes the
+                    # import must not touch a Tk variable itself.
+                    if hasattr(self, "_vmgr_zip_var"):
+                        self._vmgr_zip_var.set("")
+                        self._vmgr_zip_subfolder_var.set("")
+
+                elif kind == "vault_mgr_clear_field":
+                    _, var_name = item
+                    var = getattr(self, var_name, None)
+                    if var is not None:
+                        var.set("")
 
                 elif kind == "apoth_out":
                     _, text = item

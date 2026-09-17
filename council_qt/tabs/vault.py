@@ -152,9 +152,31 @@ class VaultActions:
             f"CouncilConsole). Extracting it is phase 3 — see "
             f"docs/qt_full_port_scope.md.")
 
-    def import_zip(self, path, subfolder):          self._later("Extract zip")
-    def import_zip_folder(self, folder):            self._later("Extract all zips")
-    def import_folder(self, folder):                self._later("Copy folder")
+    def import_zip(self, path, subfolder, log=None):
+        from council_core import vault_import
+        return vault_import.import_zip(path, vault_dir=self.vault_dir,
+                                       subfolder=subfolder, log=log)
+
+    def import_folder(self, folder, log=None):
+        from council_core import vault_import
+        return vault_import.import_folder(folder, vault_dir=self.vault_dir,
+                                          log=log)
+
+    def input_dir(self) -> Path:
+        """Where a batch zip import lands: data_in/, the analyst's scope.
+
+        Files extracted to the vault root are not picked up by the index, which
+        is why the Tk handler goes out of its way to find this directory."""
+        try:
+            import data_index
+            return Path(data_index.input_dir(self.vault_dir))
+        except Exception:                                # noqa: BLE001
+            return self.vault_dir
+
+    def import_zip_folder(self, folder, log=None):
+        from council_core import vault_import
+        return vault_import.import_zip_folder(folder, input_dir=self.input_dir(),
+                                              log=log)
     # EXTRACTED — this one is real. The operation lives in
     # council_core.vault_ops and the Tk shell calls the same function, so the
     # two front ends cannot drift about what indexing means.
@@ -748,16 +770,59 @@ class VaultTab(QWidget):
             self.refresh_tree()
 
     def on_import_zip(self) -> None:
-        self._run("Extract zip", lambda: self.actions.import_zip(
-            self.zip_edit.text(), self.zip_subfolder_edit.text()))
+        from council_core import vault_import
+        path = self.zip_edit.text()
+        problem = vault_import.check_zip(path)
+        if problem:
+            self.append(problem, "err")
+            return
+        sub = self.zip_subfolder_edit.text().strip() or Path(path.strip()).stem
+        self.append(f"Extracting {Path(path.strip()).name} → vault/{sub} …")
+        self._import(lambda log: self.actions.import_zip(
+            path, self.zip_subfolder_edit.text(), log=log),
+            clear=(self.zip_edit, self.zip_subfolder_edit))
 
     def on_import_zip_folder(self) -> None:
-        self._run("Extract all zips",
-                  lambda: self.actions.import_zip_folder(self.zipdir_edit.text()))
+        from council_core import vault_import
+        folder = self.zipdir_edit.text()
+        problem = vault_import.check_folder(folder, what="zips")
+        if problem:
+            self.append(problem, "err")
+            return
+        self._import(lambda log: self.actions.import_zip_folder(folder, log=log),
+                     clear=(self.zipdir_edit,))
 
     def on_import_folder(self) -> None:
-        self._run("Copy folder",
-                  lambda: self.actions.import_folder(self.folder_edit.text()))
+        from council_core import vault_import
+        folder = self.folder_edit.text()
+        problem = vault_import.check_folder(folder)
+        if problem:
+            self.append(problem, "err")
+            return
+        src = Path(folder.strip())
+        self.append(f"Copying {src.name} → vault/{src.name} …")
+        self._import(lambda log: self.actions.import_folder(folder, log=log),
+                     clear=(self.folder_edit,))
+
+    def _import(self, run, clear=()) -> None:
+        """The shape all three imports share: run on a worker, log every line
+        as it arrives, then refresh and blank the fields the import consumed.
+
+        The clearing happens HERE, on the UI thread. The Tk handlers used to do
+        it from inside the worker — a variable written off the UI thread, which
+        is undefined behaviour in both toolkits and silent in Qt."""
+        def work() -> None:
+            result = run(lambda m: self._to_ui(lambda m=m: self.append(m)))
+            self._to_ui(lambda: self._finish_import(result, clear))
+
+        threading.Thread(target=work, name="vault-import", daemon=True).start()
+
+    def _finish_import(self, result, clear) -> None:
+        self.append(result.message, "ok" if result.ok else "err")
+        if result.ok:
+            for edit in clear:
+                edit.clear()
+            self.refresh_tree()
 
     def on_keyword_index(self) -> None:
         """The first extracted operation, end to end.

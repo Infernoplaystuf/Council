@@ -387,3 +387,141 @@ def test_the_engine_no_longer_carries_its_own_clone_implementation():
     assert "vault_ops.clone_repo" in body
     assert "git clone" not in body, "the engine still runs git itself"
     assert fn.end_lineno - fn.lineno < 30, "the 88-line copy is still there"
+
+
+# ================================================================ vault_import
+
+from council_core import vault_import  # noqa: E402
+
+
+def _zip_of(tmp_path, name, files):
+    import zipfile
+    path = tmp_path / name
+    with zipfile.ZipFile(path, "w") as zf:
+        for inner, text in files.items():
+            zf.writestr(inner, text)
+    return path
+
+
+def test_the_import_filter_moved_with_the_code():
+    """The filter rules are the accumulated answer to 'what is worth keeping'.
+    They were moved verbatim, so the extension set has to still be the big one
+    — an earlier 500 KB cap silently dropped real data files, and the comment
+    on it is part of why."""
+    assert ".parquet" in vault_import.INDEXABLE
+    assert ".pdf" in vault_import.INDEXABLE
+    assert "node_modules" in vault_import.SKIP_DIRS
+    assert vault_import.max_bytes() >= 1_000_000_000
+
+
+def test_a_zip_is_extracted_and_filtered(tmp_path):
+    archive = _zip_of(tmp_path, "data.zip", {
+        "keep.csv": "id,v\n1,2\n",
+        "notes.md": "# hi",
+        "node_modules/dep.js": "x",
+    })
+    vault = tmp_path / "vault"
+    lines = []
+    result = vault_import.import_zip(archive, vault_dir=vault,
+                                     log=lines.append)
+    assert result.ok, result.message
+    kept = {p.name for p in (vault / "data").rglob("*") if p.is_file()}
+    assert "keep.csv" in kept and "notes.md" in kept
+    assert "dep.js" not in kept
+
+
+def test_a_missing_zip_is_refused_before_any_work(tmp_path):
+    result = vault_import.import_zip(tmp_path / "nope.zip", vault_dir=tmp_path)
+    assert not result.ok and "not found" in result.message
+    assert vault_import.check_zip("") == "✗ Please select a zip file first."
+
+
+def test_a_folder_is_copied_and_filtered(tmp_path):
+    src = tmp_path / "project"
+    (src / "sub").mkdir(parents=True)
+    (src / "a.py").write_text("print(1)")
+    (src / "sub" / "b.csv").write_text("x\n")
+    (src / "__pycache__").mkdir()
+    (src / "__pycache__" / "junk.pyc").write_bytes(b"\x00")
+    vault = tmp_path / "vault"
+    result = vault_import.import_folder(src, vault_dir=vault)
+    assert result.ok, result.message
+    kept = {p.name for p in (vault / "project").rglob("*") if p.is_file()}
+    assert kept == {"a.py", "b.csv"}
+
+
+def test_a_batch_skips_a_corrupt_zip_and_imports_the_rest(tmp_path):
+    """One bad zip is logged and skipped. A batch that aborts on the first
+    failure is why people stop using batches."""
+    folder = tmp_path / "zips"
+    folder.mkdir()
+    _zip_of(folder, "good_one.zip", {"a.csv": "1\n"})
+    _zip_of(folder, "good_two.zip", {"b.csv": "2\n"})
+    (folder / "broken.zip").write_text("this is not a zip")
+
+    out = tmp_path / "data_in"
+    lines = []
+    result = vault_import.import_zip_folder(folder, input_dir=out,
+                                            log=lines.append)
+    assert result.failed == 1
+    assert "2/3 zip(s) extracted" in result.message
+    assert (out / "good_one" / "a.csv").exists()
+    assert (out / "good_two" / "b.csv").exists()
+    assert any("not a valid zip" in line for line in lines)
+    # And nothing was left behind for the corrupt one.
+    assert not (out / "broken").exists()
+
+
+def test_two_zips_sharing_a_stem_get_separate_folders(tmp_path):
+    """A stem collision would otherwise have the second import overwrite the
+    first, silently."""
+    folder = tmp_path / "zips"
+    (folder / "one").mkdir(parents=True)
+    (folder / "two").mkdir()
+    _zip_of(folder / "one", "data.zip", {"a.csv": "1\n"})
+    _zip_of(folder / "two", "data.zip", {"b.csv": "2\n"})
+    out = tmp_path / "data_in"
+    result = vault_import.import_zip_folder(folder, input_dir=out)
+    assert result.ok
+    folders = {p.name for p in out.iterdir() if p.is_dir()}
+    assert len(folders) == 2, folders
+
+
+def test_an_empty_zip_folder_says_so_rather_than_failing(tmp_path):
+    folder = tmp_path / "zips"
+    folder.mkdir()
+    result = vault_import.import_zip_folder(folder, input_dir=tmp_path / "out")
+    assert result.ok
+    assert "No .zip files found" in result.message
+
+
+def test_the_engine_no_longer_carries_the_import_helpers():
+    """152 lines of filtering that had no Tk in them, moved out."""
+    src = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    defined = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
+    assert "_vmgr_extract_zip" not in defined
+    assert "_vmgr_copy_folder" not in defined
+    assert "from council_core.vault_import import" in src
+
+
+def test_the_import_workers_no_longer_touch_tk_variables():
+    """They used to call self._vmgr_zip_var.set("") from inside the worker — a
+    Tk variable written off the UI thread. The clear now goes through the
+    queue, like every other UI update from a worker."""
+    src = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    cls = next(n for n in tree.body
+               if isinstance(n, ast.ClassDef) and n.name == "CouncilConsole")
+    for name in ("_vmgr_import_zip", "_vmgr_import_zip_folder",
+                 "_vmgr_import_folder"):
+        method = next(n for n in cls.body
+                      if isinstance(n, ast.FunctionDef) and n.name == name)
+        body = ast.get_source_segment(src, method) or ""
+        worker = body.split("def worker", 1)[-1]
+        # Comments stripped: the replacement carries a comment QUOTING the old
+        # off-thread call so the reason survives, and a naive text search finds
+        # its own explanation.
+        code = "\n".join(line.split("#", 1)[0] for line in worker.splitlines())
+        assert "_var.set(" not in code, (
+            f"{name}'s worker still writes a Tk variable directly")
