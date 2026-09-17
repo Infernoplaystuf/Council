@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Must happen before PySide6 is imported by anything, including the fixture.
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+# AND THIS ONE, OR THE SUITE HANGS. Firing a generated event port runs the real
+# handler; with no folder chosen the linked script fails, MainUi.report_error
+# does its job, and QMessageBox.critical blocks for a click that a test run will
+# never make. Measured: bare `pytest` stopped dead on the tenth test here with
+# no output and no timeout.
+#
+# COUNCIL_NO_DIALOGS is exactly the switch the generated apps carry for
+# unattended runs, so setting it is using the feature rather than working
+# around it — and one test below deliberately checks that it is honoured.
+os.environ.setdefault("COUNCIL_NO_DIALOGS", "1")
 
 pytest.importorskip(
     "PySide6",
@@ -178,11 +190,25 @@ def test_enable_reaches_the_widget(ui):
     assert ui.ports.scan_for_bad_timings.widget.isEnabled()
 
 
-def test_read_and_apply_round_trip_the_whole_window(ui):
-    ui.ports.apply({"capture_folder": "D:/scan", "exposure_ms": 12})
+def test_read_snapshots_the_whole_window(ui):
+    ui.ports.capture_folder.set("D:/scan")
+    ui.ports.exposure_ms.set(12)
     snapshot = ui.ports.read()
     assert snapshot["capture_folder"] == "D:/scan"
     assert snapshot["exposure_ms"] == 12
+
+
+def test_apply_refuses_to_write_an_input_only_port(ui):
+    """apply() writes out/inout ports and skips `in` ones — the same rule the
+    Tk runtime has. A file picker the USER fills is an input, so an app that
+    could overwrite it from apply() would fight the person using it.
+
+    Worth a test rather than a comment: the first version of this test assumed
+    apply() wrote everything, and the port was right."""
+    ui.ports.capture_folder.set("D:/chosen-by-the-user")
+    ui.ports.apply({"capture_folder": "D:/from-the-app"})
+    assert ui.ports.capture_folder.get() == "D:/chosen-by-the-user"
+    assert ui.ports.capture_folder.direction == "i"
 
 
 # -------------------------------------------------------------- the canvas
@@ -236,6 +262,29 @@ def test_a_degenerate_roi_is_refused(ui):
 
 # ------------------------------------------------------------ frame browser
 
+def _browser_of(ui):
+    return next(getattr(ui.ports, n) for n in dir(ui.ports)
+                if n.startswith("browse_"))
+
+
+def _load_folder(ui, qapp, folder):
+    """Point the app at a folder the way a user does, and let it settle.
+
+    NOT by calling browser.reload() directly: construction schedules its own
+    deferred reload, which then reads the still-empty folder port and clears
+    the list straight back out. Driving the PORT is both what the user does and
+    what the debounce is written for."""
+    ui.ports.capture_folder.set(str(folder))
+    browser = _browser_of(ui)
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        qapp.processEvents()
+        if browser.count():
+            break
+        time.sleep(0.02)
+    return browser
+
+
 def test_the_frame_browser_lists_and_shows_a_folder(ui, qapp, tmp_path):
     """Folder -> natural-sorted files -> index -> exactly one decoded image."""
     Image = pytest.importorskip("PIL.Image")
@@ -244,10 +293,7 @@ def test_the_frame_browser_lists_and_shows_a_folder(ui, qapp, tmp_path):
     for i in (1, 2, 10):                      # 10 must sort after 2, not after 1
         Image.new("L", (32, 24)).save(folder / f"frame_{i}.png")
 
-    browser = next(getattr(ui.ports, n) for n in dir(ui.ports)
-                   if n.startswith("browse_"))
-    browser.reload(str(folder))
-    qapp.processEvents()
+    browser = _load_folder(ui, qapp, folder)
     assert browser.count() == 3
     assert [Path(p).name for p in browser.files] == [
         "frame_1.png", "frame_2.png", "frame_10.png"]
@@ -260,10 +306,7 @@ def test_scrubbing_moves_to_another_frame(ui, qapp, tmp_path):
     folder.mkdir()
     for i in range(1, 6):
         Image.new("L", (32, 24)).save(folder / f"frame_{i}.png")
-    browser = next(getattr(ui.ports, n) for n in dir(ui.ports)
-                   if n.startswith("browse_"))
-    browser.reload(str(folder))
-    qapp.processEvents()
+    browser = _load_folder(ui, qapp, folder)
     browser.show(3)
     assert Path(browser.path(3)).name == "frame_4.png"
 
@@ -279,13 +322,13 @@ def test_an_empty_folder_clears_rather_than_leaving_the_last_frame(ui, qapp,
     empty = tmp_path / "empty"
     empty.mkdir()
 
-    browser = next(getattr(ui.ports, n) for n in dir(ui.ports)
-                   if n.startswith("browse_"))
-    browser.reload(str(full))
-    qapp.processEvents()
+    browser = _load_folder(ui, qapp, full)
     assert ui.ports.live_view.widget._base is not None
-    browser.reload(str(empty))
-    qapp.processEvents()
+    ui.ports.capture_folder.set(str(empty))
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and browser.count():
+        qapp.processEvents()
+        time.sleep(0.02)
     assert browser.count() == 0
     assert ui.ports.live_view.widget._base is None
 

@@ -158,7 +158,7 @@ did before. Days are `likely` at the rate justified in §6.
 | **2a** | **The standalone-tab host** | `council_modules.StandaloneHost` + `PALETTE` as Qt: a host that runs one tab module on its own (its own window, queue, theme, model slots). The `council_qt` foundation already is this shape; it needs the compatible API. Unblocks porting `tab_grapher`, and `tab_ideas`/`tab_video` when those branches are merged. | 2–4 |
 | **1** | **Make the suite able to fail** | See §5. Without this, every later green run is uninterpretable. | 3–5 |
 | **2** | **Foundation** | `council_qt/` skeleton, the thread bridge, theme, dialog + variable shims, transcript widget. ~2,000–3,300 lines of new infrastructure with no Tk counterpart. | 26–36 |
-| **3** | **Extraction** | `council_core` behind the view interface. Ships on Tk alone. Can overlap phase 2. | 8–18 |
+| **3** | **Extraction** | `council_core` behind the view interface. Ships on Tk alone. Can overlap phase 2. **Started:** `council_core/vault_ops.py` holds the keyword index, and both front ends call it. | 8–18 |
 | **4** | **Test harness** | Offscreen Qt fixture; "every tab builds and every wired name resolves"; queue-replay parity. | 16–24 |
 | **5** | **Pilot: Vault (calibration gate)** | 491 toolkit lines, the superset of mechanisms (Treeview, PanedWindow, forms, worker traffic, 3 dialogs). **Exit criterion is a re-forecast**, not a working tab. | 12–20 |
 | **6** | **Council + Grapher + Dream3D** | 773 toolkit lines. Carries the transcript (the hardest widget in the app) and matplotlib. | 17–28 |

@@ -157,7 +157,26 @@ class VaultActions:
     def import_zip(self, path, subfolder):          self._later("Extract zip")
     def import_zip_folder(self, folder):            self._later("Extract all zips")
     def import_folder(self, folder):                self._later("Copy folder")
-    def build_keyword_index(self):                  self._later("Keyword index")
+    # EXTRACTED — this one is real. The operation lives in
+    # council_core.vault_ops and the Tk shell calls the same function, so the
+    # two front ends cannot drift about what indexing means.
+    def vault_index(self):
+        """The VaultIndex for this vault, or None.
+
+        Mirrors the shell's lazy getter: construction failure is an answer, not
+        an exception, because an unreadable vault is a normal thing to report."""
+        try:
+            import vault_index
+            return vault_index.VaultIndex(self.vault_dir)
+        except Exception as exc:                        # noqa: BLE001
+            print(f"[VaultIndex] init failed: {exc!r}", file=sys.stderr)
+            return None
+
+    def build_keyword_index(self, on_progress=None):
+        from council_core import vault_ops
+        return vault_ops.build_keyword_index(self.vault_index(),
+                                             on_progress=on_progress)
+
     def build_descriptions(self):                   self._later("Descriptions")
     def build_embeddings(self):                     self._later("Embeddings")
     def convert_mongo(self, path, csv, schema, text, scan_all=False):
@@ -333,9 +352,15 @@ class VaultTab(QWidget):
         self.index_status.setStyleSheet("color: #cba6f7;")
         layout.addWidget(self.index_status)
         row = QHBoxLayout()
-        self._button(row, "1. Build Keyword Index", self.on_keyword_index)
-        self._button(row, "2. Build Descriptions", self.on_descriptions)
-        self._button(row, "3. Build Vector Embeddings", self.on_embeddings)
+        # Kept as attributes because a run disables all three — a second walk
+        # over the same vault while the first is going is not a second result,
+        # it is two threads writing one index.
+        self._btn_keyword = self._button(row, "1. Build Keyword Index",
+                                         self.on_keyword_index)
+        self._btn_descriptions = self._button(row, "2. Build Descriptions",
+                                              self.on_descriptions)
+        self._btn_embeddings = self._button(row, "3. Build Vector Embeddings",
+                                            self.on_embeddings)
         row.addStretch(1)
         layout.addLayout(row)
         return box
@@ -670,7 +695,46 @@ class VaultTab(QWidget):
                   lambda: self.actions.import_folder(self.folder_edit.text()))
 
     def on_keyword_index(self) -> None:
-        self._run("Keyword index", self.actions.build_keyword_index)
+        """The first extracted operation, end to end.
+
+        The worker calls the shared function; every update comes back through
+        the bridge. Note what this method does NOT contain: any knowledge of
+        what indexing is, or how to word the result. Both live in
+        council_core.vault_ops, where the Tk shell reads them too."""
+        from council_core import vault_ops
+
+        self.index_status.setText("Walking vault…")
+        self.append("keyword index: walking the vault …")
+        self._set_index_buttons(False)
+
+        def work() -> None:
+            def on_progress(done: int, total: int, name: str) -> None:
+                line = vault_ops.progress_line(done, total, name)
+                self._to_ui(lambda: self.index_status.setText(line))
+
+            try:
+                result = self.actions.build_keyword_index(on_progress=on_progress)
+            except VaultActions.NotYetExtracted as exc:
+                self._to_ui(lambda: self._finish_index(
+                    vault_ops.IndexResult(False, str(exc))))
+                return
+            self._to_ui(lambda: self._finish_index(result))
+
+        threading.Thread(target=work, name="keyword-index", daemon=True).start()
+
+    def _finish_index(self, result) -> None:
+        self.index_status.setText(result.message)
+        self.append(result.message, "ok" if result.ok else "err")
+        self._set_index_buttons(True)
+        if result.ok:
+            self.refresh_tree()
+
+    def _set_index_buttons(self, enabled: bool) -> None:
+        """A second click while the walk is running would start a second walk
+        over the same vault."""
+        for button in (self._btn_keyword, self._btn_descriptions,
+                       self._btn_embeddings):
+            button.setEnabled(enabled)
 
     def on_descriptions(self) -> None:
         self._run("Descriptions", self.actions.build_descriptions)

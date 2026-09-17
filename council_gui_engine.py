@@ -16458,7 +16458,16 @@ class CouncilConsole(tk.Tk):
     # ---- Index & Vectorize button handlers ----
 
     def _vmgr_build_keyword_index(self):
-        """Walk the vault and (re)build the keyword index. Fast — no LLM."""
+        """Walk the vault and (re)build the keyword index. Fast — no LLM.
+
+        The operation itself lives in council_core.vault_ops, which the Qt
+        front end calls too — one copy of what "build the keyword index" means,
+        so a fix here is a fix there. What stays in this method is the part
+        that is genuinely Tk: the worker thread and bouncing each update back
+        to the UI thread, because Tk widgets are not thread-safe.
+        """
+        from council_core import vault_ops
+
         idx = _get_vault_index()
         if idx is None:
             self._idx_status_var.set("Vault index unavailable.")
@@ -16467,21 +16476,11 @@ class CouncilConsole(tk.Tk):
 
         def _worker():
             def _on_progress(done: int, total: int, name: str):
-                # Trim very long filenames so the status bar doesn't
-                # wrap or look ugly. Bounce to the UI thread via
-                # self.after — Tk widgets are not thread-safe.
-                short = name if len(name) <= 48 else name[:45] + "…"
-                self.after(0, lambda: self._idx_status_var.set(
-                    f"Indexing {done}/{total} — {short}"))
-            try:
-                n = idx.rebuild(progress=_on_progress)
-            except Exception as exc:
-                self.after(0, lambda exc=exc: self._idx_status_var.set(
-                    f"Keyword index failed: {exc!r}"))
-                return
-            self.after(0, lambda: self._idx_status_var.set(
-                f"Keyword index built — {n} files (re)indexed, "
-                f"{len(idx.records)} total."))
+                line = vault_ops.progress_line(done, total, name)
+                self.after(0, lambda: self._idx_status_var.set(line))
+
+            result = vault_ops.build_keyword_index(idx, on_progress=_on_progress)
+            self.after(0, lambda: self._idx_status_var.set(result.message))
 
         import threading as _th
         _th.Thread(target=_worker, daemon=True).start()

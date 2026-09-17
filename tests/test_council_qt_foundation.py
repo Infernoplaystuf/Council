@@ -400,10 +400,38 @@ def test_an_unextracted_action_says_so_instead_of_doing_nothing(qapp, tmp_path):
     from council_qt.tabs.vault import VaultActions, VaultTab
     window = CouncilWindow()
     tab = VaultTab(window, VaultActions(tmp_path))
-    tab.on_keyword_index()
+    # Clone, not the keyword index — that one has since been extracted, which
+    # is exactly the transition this test is here to survive.
+    tab.on_clone()
     log = tab.log.toPlainText()
-    assert "Keyword index" in log and "phase 3" in log
+    assert "Clone" in log and "phase 3" in log
     window.request_close()
+
+
+def test_the_extracted_action_is_wired_to_the_shared_function(qapp, tmp_path):
+    """The keyword index is the first operation to cross the line: the Qt tab
+    asks council_core, which the Tk shell also asks."""
+    from council_core import vault_ops
+    from council_qt.tabs.vault import VaultActions
+
+    calls = []
+
+    class FakeIndex:
+        records = {"a": {}}
+
+        def rebuild(self, *, progress=None, **_kw):
+            calls.append(True)
+            if progress:
+                progress(1, 1, "a.csv")
+            return 1
+
+    actions = VaultActions(tmp_path)
+    actions.vault_index = lambda: FakeIndex()
+    seen = []
+    result = actions.build_keyword_index(on_progress=lambda *a: seen.append(a))
+    assert calls == [True]
+    assert seen == [(1, 1, "a.csv")]
+    assert result.ok and isinstance(result, vault_ops.IndexResult)
 
 
 def test_ampersands_survive_in_captions(qapp, tmp_path):
