@@ -18,10 +18,12 @@ default tabs, then the Designer, then advanced.
 from __future__ import annotations
 
 from .diagnostics import build_diagnostics
+from .vault import build_vault
 
 #: (title, factory, eager). Factories take the CouncilWindow.
 REGISTRY = [
+    ("🗄 Vault", build_vault, False),
     ("Diagnostics", build_diagnostics, False),
 ]
 
-__all__ = ["REGISTRY", "build_diagnostics"]
+__all__ = ["REGISTRY", "build_diagnostics", "build_vault"]

@@ -360,3 +360,61 @@ def test_the_diagnostics_tab_builds_and_reports(qapp):
     assert _pump(qapp, lambda: "python" in output.toPlainText())
     assert "PySide6" in output.toPlainText()
     window.request_close()
+
+
+# ------------------------------------------------------------- the Vault tab
+
+def test_the_vault_tab_builds_and_lists_a_vault(qapp, tmp_path):
+    """The pilot tab, against a real folder."""
+    from council_qt.tabs.vault import VaultActions, VaultTab
+    (tmp_path / "data_in").mkdir()
+    (tmp_path / "data_in" / "orders.csv").write_text("id,total\n1,5\n")
+    (tmp_path / "top.txt").write_text("hello")
+
+    window = CouncilWindow()
+    tab = VaultTab(window, VaultActions(tmp_path))
+    assert tab.tree.topLevelItemCount() == 2          # data_in/ and top.txt
+    names = {tab.tree.topLevelItem(i).text(0) for i in range(2)}
+    assert names == {"data_in", "top.txt"}
+    window.request_close()
+
+
+def test_selecting_a_file_previews_it(qapp, tmp_path):
+    from council_qt.tabs.vault import VaultActions, VaultTab
+    (tmp_path / "notes.md").write_text("# Notes\nthe warehouse export")
+    window = CouncilWindow()
+    tab = VaultTab(window, VaultActions(tmp_path))
+    item = tab.tree.topLevelItem(0)
+    tab.tree.setCurrentItem(item)
+    qapp.processEvents()
+    assert "warehouse export" in tab.preview.toPlainText()
+    window.request_close()
+
+
+def test_an_unextracted_action_says_so_instead_of_doing_nothing(qapp, tmp_path):
+    """The extraction boundary has to be visible to the user, not silent.
+
+    A button that looks live and does nothing is the failure this whole design
+    is trying to avoid — the same reason the generated apps report a failed
+    script link in the window rather than on a console."""
+    from council_qt.tabs.vault import VaultActions, VaultTab
+    window = CouncilWindow()
+    tab = VaultTab(window, VaultActions(tmp_path))
+    tab.on_keyword_index()
+    log = tab.log.toPlainText()
+    assert "Keyword index" in log and "phase 3" in log
+    window.request_close()
+
+
+def test_ampersands_survive_in_captions(qapp, tmp_path):
+    """Qt eats & as a mnemonic; Tk does not. Measured on this very tab, whose
+    'Index & Vectorize' box first rendered as 'Index _Vectorize'."""
+    from PySide6.QtWidgets import QGroupBox
+
+    from council_qt.tabs.vault import VaultActions, VaultTab, amp
+    assert amp("Index & Vectorize") == "Index && Vectorize"
+    window = CouncilWindow()
+    tab = VaultTab(window, VaultActions(tmp_path))
+    titles = [box.title() for box in tab.findChildren(QGroupBox)]
+    assert any("&&" in t for t in titles), titles
+    window.request_close()
