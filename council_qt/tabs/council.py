@@ -109,6 +109,7 @@ class CouncilActions:
     def __init__(self, vault_dir: Optional[Path] = None, demo_mode: bool = False):
         self.vault_dir = Path(vault_dir or Path.home() / "council_vault")
         self.demo_mode = bool(demo_mode)
+        self._models = None
 
     # -- implemented -----------------------------------------------------
     def specialist_names(self) -> List[str]:
@@ -141,17 +142,69 @@ class CouncilActions:
         except Exception:                                 # noqa: BLE001
             return []
 
-    # -- not extracted ---------------------------------------------------
-    def send(self, typed_text: str, options, *, on_event=None):
-        """Run one turn.
+    # -- the turn --------------------------------------------------------
+    def models(self):
+        """The object carrying the personality model slots.
+
+        Loaded lazily and kept: constructing the slots costs real time, and a
+        tab the user never sends from should not pay for it.
+        """
+        if self._models is None:
+            try:
+                import council_engine
+                self._models = council_engine
+            except Exception:                             # noqa: BLE001
+                return None
+        return self._models
+
+    def send(self, typed_text: str, options, *, on_event=None,
+             on_token=None):
+        """Run one turn through council_core.council_turn.
 
         Takes the TYPED text and a frozen options snapshot — never a widget and
         never the augmented text (A1, A5). Reports progress by calling
         ``on_event``; the caller decides which thread that lands on.
         """
-        raise self.NotYetExtracted(
-            "the deliberation is not extracted yet — it is the rest of "
-            "phase 6 (see docs/qt_migration/phase6_port_requirements.md)")
+        from council_core import council_turn
+
+        models = self.models()
+        if models is None:
+            return council_turn.TurnResult(
+                False,
+                message="The model engine is not available, so there is "
+                        "nothing to ask. Check the Models tab.")
+
+        if not getattr(options, "deliberate", True):
+            # The fast path: one personality, no panel, no verdict. It is a
+            # real answer and it is NOT a deliberation, so it produces no
+            # verdict id — which is what keeps the verdict bar honest (A3).
+            return self._direct(typed_text, models, on_event=on_event)
+
+        return council_turn.run_turn(
+            typed_text, models,
+            enable_tools=bool(getattr(options, "tools", False)),
+            on_event=on_event,
+            on_token=on_token if getattr(options, "stream", True) else None)
+
+    def _direct(self, typed_text: str, models, *, on_event=None):
+        """One personality answering directly, with no council."""
+        from council_core import council_turn
+        from council_core.deliberation import AgentEvent
+
+        writer = getattr(models, "writer", None)
+        if writer is None:
+            return council_turn.TurnResult(
+                False, message="No writer model is loaded.")
+        try:
+            answer = writer.respond(typed_text)
+        except Exception as exc:                          # noqa: BLE001
+            return council_turn.TurnResult(
+                False, message=f"The answer failed: {exc!r}", error=exc)
+        event = AgentEvent("Writer", "final", answer)
+        if on_event is not None:
+            on_event(event)
+        return council_turn.TurnResult(True, answer=answer, route="direct",
+                                       events=[event])
 
     def record_verdict_response(self, verdict_id: str, agreed: bool,
                                 objection: str = ""):
@@ -516,9 +569,14 @@ class CouncilTab(QWidget):
 
         def work() -> None:
             try:
-                self.actions.send(typed, options,
-                                  on_event=lambda ev: self._to_ui(
-                                      lambda ev=ev: self.on_event(ev)))
+                result = self.actions.send(
+                    typed, options,
+                    on_event=lambda ev: self._to_ui(
+                        lambda ev=ev: self.on_event(ev)),
+                    on_token=lambda who, tok: self._to_ui(
+                        lambda who=who, tok=tok: self.on_token(who, tok)))
+                if result is not None:
+                    self._to_ui(lambda: self.finish_turn(result))
             except CouncilActions.NotYetExtracted as exc:
                 self._to_ui(lambda: self.append("Council", str(exc),
                                                 "observation"))
@@ -546,6 +604,36 @@ class CouncilTab(QWidget):
             return
         self.append(getattr(event, "who", "Council"),
                     getattr(event, "text", str(event)), "observation")
+
+    def on_token(self, who: str, token: str) -> None:
+        """One streamed token. The stream box, never the transcript.
+
+        The transcript does not see tokens in either front end — an AST pass
+        over all 285 `_append_transcript` call sites in the Tk engine confirms
+        kind="token" is never passed to it.
+        """
+        self.stream_box.append_token(who, token)
+        self.stream_box.flush()
+
+    def finish_turn(self, result) -> None:
+        """Render what the turn produced, on the GUI thread."""
+        if not result.ok:
+            self.append("Council", result.message or "The turn failed.",
+                        "observation")
+            return
+        if result.answer:
+            self.append("Writer", result.answer, "final")
+        if result.critique:
+            self.set_judge(result.critique)
+        if result.route == "direct" and result.answer:
+            # Only a fast answer can be expanded, and only until the next turn
+            # resets it (A4).
+            self._last_fast_question = self._last_query
+            self.expand_btn.setEnabled(True)
+        self._last_route = result.route
+        # A3: the bar follows the verdict id, which a turn without a verdict
+        # does not have.
+        self.show_verdict_bar(result.verdict_id)
 
     def flush(self) -> None:
         """Called once per queue drain — see the stream box's own note."""
