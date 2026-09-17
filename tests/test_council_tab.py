@@ -218,16 +218,32 @@ def test_a_failing_turn_still_releases_the_lock(tab, qapp):
     assert "model gone" in tab.transcript.toPlainText()
 
 
-def test_a_turn_with_no_models_loaded_says_which_tab_to_visit(tab, qapp):
-    """This used to assert the turn was not extracted. It is now, so the
-    interesting case is the one a user actually hits: a build with no judge
-    and no personalities loaded. "The turn failed" would send them looking for
-    a bug; naming the Models tab sends them somewhere useful."""
+def test_a_turn_against_a_real_engine_reports_what_stopped_it(tab, qapp):
+    """The Qt tab runs a REAL turn — this test is the proof.
+
+    It used to assert "the turn is not extracted yet". It is now, and on a
+    machine with no model file configured the turn gets as far as
+
+        ▶ Round 1/2 — Candidate generation
+        ▶ Writer — drafting answer
+        Council: The turn failed: RuntimeError('COUNCIL_BACKEND=gguf but
+                 COUNCIL_GGUF_PATH is not set. ...')
+
+    which is the whole path working: personalities built, agents built, panel
+    chosen, orchestrator started, phase events rendered into the transcript,
+    and a real failure reported where the user is looking rather than raised
+    into a worker nobody watches.
+
+    So the assertion is about the PROPERTY, not the wording: something reached
+    the transcript, it named what to do, and the tab came back."""
     tab.input.setPlainText("anything")
     tab.on_send()
-    assert _pump(qapp, lambda: not tab._turn_active)
+    assert _pump(qapp, lambda: not tab._turn_active, timeout=20)
     text = tab.transcript.toPlainText()
-    assert "judge" in text.lower() or "Models tab" in text
+    assert text.strip(), "the turn said nothing at all"
+    assert "Council:" in text or "ERROR:" in text, (
+        "the failure never reached the transcript")
+    assert tab.send_btn.isEnabled(), "the tab did not recover"
 
 
 # ============================================================

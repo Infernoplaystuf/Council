@@ -110,6 +110,7 @@ class CouncilActions:
         self.vault_dir = Path(vault_dir or Path.home() / "council_vault")
         self.demo_mode = bool(demo_mode)
         self._models = None
+        self._models_problem = ""
 
     # -- implemented -----------------------------------------------------
     def specialist_names(self) -> List[str]:
@@ -144,18 +145,24 @@ class CouncilActions:
 
     # -- the turn --------------------------------------------------------
     def models(self):
-        """The object carrying the personality model slots.
+        """(personalities, problem). Exactly one is meaningful.
 
-        Loaded lazily and kept: constructing the slots costs real time, and a
-        tab the user never sends from should not pay for it.
+        Loaded lazily and kept: building the personalities loads models from
+        disk, and a tab the user never sends from should not pay for it.
+
+        The first version of this returned the `council_engine` MODULE, on the
+        assumption that the slots were attributes on it. They are not — the
+        module exposes build_personalities(), which returns a dict that the Tk
+        console unpacks onto itself. Every turn would have reported "No judge
+        model is loaded", and no test caught it because they all inject
+        stand-ins. See council_core.council_turn.Personalities.
         """
-        if self._models is None:
-            try:
-                import council_engine
-                self._models = council_engine
-            except Exception:                             # noqa: BLE001
-                return None
-        return self._models
+        from council_core import council_turn
+
+        if self._models is None and not self._models_problem:
+            self._models, self._models_problem = (
+                council_turn.load_personalities(self.vault_dir))
+        return self._models, self._models_problem
 
     def send(self, typed_text: str, options, *, on_event=None,
              on_token=None):
@@ -167,12 +174,9 @@ class CouncilActions:
         """
         from council_core import council_turn
 
-        models = self.models()
+        models, problem = self.models()
         if models is None:
-            return council_turn.TurnResult(
-                False,
-                message="The model engine is not available, so there is "
-                        "nothing to ask. Check the Models tab.")
+            return council_turn.TurnResult(False, message=problem)
 
         if not getattr(options, "deliberate", True):
             # The fast path: one personality, no panel, no verdict. It is a

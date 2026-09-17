@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .deliberation import AgentEvent, DeliberationOrchestrator, ModelAgent
@@ -252,3 +253,91 @@ def run_turn(question: str, models: Any, *,
         return result
     except Exception as exc:                              # noqa: BLE001
         return TurnResult(False, message=f"The turn failed: {exc!r}", error=exc)
+
+
+# ============================================================
+# Loading the personalities
+# ============================================================
+
+#: Roles a build cannot run without. `build_personalities` may return more, and
+#: the optional ones are used when present — but a missing REQUIRED role is a
+#: configuration error, not a degraded mode, and saying so early beats an
+#: AttributeError six frames into a worker.
+REQUIRED_ROLES = ("judge", "writer", "peasant", "intern", "coder", "artist")
+
+#: Roles used when the pins provide them. `sage` is reached through a wrapper
+#: in some builds — see build_agents.
+OPTIONAL_ROLES = ("skeptic", "sage", "strategist", "librarian", "content",
+                  "director", "algorithm", "coach")
+
+
+class Personalities:
+    """The model slots, as an object the rest of this module can read.
+
+    THIS IS A REAL SEAM AND I GOT IT WRONG ONCE. The Qt tab's first wiring
+    handed `council_engine` itself to `run_turn` as the models object, on the
+    assumption that the slots were module attributes. They are not: the module
+    exposes `build_personalities(...)`, which RETURNS a dict, and the Tk
+    console unpacks that dict onto itself in `_unpack_personalities`. With the
+    module passed instead, `build_agents` found no slots and every turn
+    reported "No judge model is loaded" — and no test caught it, because every
+    test injects a stand-in and none of them exercised the real path.
+
+    So the unpacking lives here, once, and both front ends get the same object.
+    """
+
+    def __init__(self, models: Dict[str, Any]):
+        self.personalities = dict(models or {})
+        for role in REQUIRED_ROLES + OPTIONAL_ROLES:
+            setattr(self, role, self.personalities.get(role))
+        self.sage_agent_obj = None
+
+    @property
+    def missing(self) -> List[str]:
+        return [role for role in REQUIRED_ROLES
+                if self.personalities.get(role) is None]
+
+    def __bool__(self) -> bool:
+        return not self.missing
+
+
+def load_personalities(vault_dir: Any, *, pins: Optional[Dict[str, str]] = None,
+                       session_id: str = "qt",
+                       dispatcher: Any = None) -> Tuple[Optional[Personalities], str]:
+    """(personalities, problem). Exactly one is meaningful.
+
+    Never raises. Building the personalities loads models from disk and can
+    fail for a dozen ordinary reasons — a missing pin, a moved file, a GGUF
+    that will not map — and a front end needs to say which, not show a
+    traceback.
+    """
+    try:
+        import council_engine
+    except Exception as exc:                              # noqa: BLE001
+        return None, f"The model engine is not importable: {exc!r}"
+
+    vault_dir = Path(vault_dir)
+    try:
+        if pins is None:
+            # `personality_backends.json` in the vault is the pin file. The Tk
+            # console reads it through the same function; guessed the name once
+            # (`load_pins`) and it does not exist, which would have failed at
+            # run time on a path no test walks.
+            pins = council_engine.load_personality_pins(
+                vault_dir / "personality_backends.json")
+    except Exception:                                     # noqa: BLE001
+        pins = {}
+
+    try:
+        models = council_engine.build_personalities(
+            pins=pins, vault_dir=vault_dir, session_id=session_id,
+            trace=False, dispatcher=dispatcher)
+    except Exception as exc:                              # noqa: BLE001
+        return None, f"The personalities could not be built: {exc!r}"
+
+    loaded = Personalities(models)
+    if loaded.missing:
+        return None, ("Missing required personalities: "
+                      f"{', '.join(loaded.missing)}. Check the model pins in "
+                      "the Models tab.")
+    return loaded, ""
