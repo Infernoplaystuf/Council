@@ -567,3 +567,51 @@ def test_the_deferred_turn_is_still_captured(engine_transcript):
 def test_phases_and_tokens_stay_out_of_the_stored_conversation(engine_transcript):
     """Four entries went in; the phase and the token are progress noise."""
     assert engine_transcript["stored"] == 2
+
+
+# -- the speaker names the recon found diverging ------------------------------
+
+def test_the_application_speaking_has_its_own_colour():
+    """55 of 285 transcript entries in the Tk engine are written as "Council" —
+    the second most common speaker in the app — and it was not a ROLE_COLORS
+    key, so every one of them rendered in the default grey, in a widget whose
+    only job is telling speakers apart."""
+    assert core.role_tag("Council") == "who_council"
+    assert core.TAGS["who_council"].foreground != core.DEFAULT_COLOR
+
+
+def test_the_same_human_is_one_colour():
+    """The engine writes the user as "User" 3 times and "You" 3 times."""
+    assert core.role_tag("You") == core.role_tag("User") == "who_user"
+
+
+def test_an_alias_does_not_invent_a_tag():
+    """An alias must point at a role that exists, or it silently degrades to
+    grey and the alias table is a lie."""
+    for alias, canonical in core.ROLE_ALIASES.items():
+        assert canonical in core.ROLE_COLORS, (
+            f"{alias!r} aliases {canonical!r}, which is not a role")
+
+
+def test_every_speaker_the_engine_actually_uses_has_a_colour():
+    """Read the call sites rather than trusting the list. A new speaker added
+    in the engine with no colour here is exactly how Council ended up grey."""
+    import ast
+    engine = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
+    speakers = set()
+    for node in ast.walk(ast.parse(engine)):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_append_transcript"):
+            continue
+        if node.args and isinstance(node.args[0], ast.Constant) \
+                and isinstance(node.args[0].value, str):
+            speakers.add(node.args[0].value)
+
+    # ERROR is written through kind="error" and is coloured by that, not by
+    # its name. Everything else should resolve to a real role.
+    grey = sorted(s for s in speakers
+                  if s not in ("ERROR",) and core.role_tag(s) == "who_default")
+    assert not grey, (
+        f"these speakers render in the default grey: {grey} — give them a "
+        f"colour in ROLE_COLORS or an entry in ROLE_ALIASES")

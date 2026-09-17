@@ -63,6 +63,31 @@ ROLE_COLORS: Dict[str, str] = {
     "Orchestrator": "#b0bec5",   # grey
     "Librarian":    "#80cbc4",   # teal
     "Apothecary":   "#bcaaa4",   # brown-ish
+    # The application's own voice. 55 of the 285 transcript entries in the Tk
+    # engine are written as "Council" — the second most common speaker in the
+    # app — and it was not a key here, so all 55 rendered in the default grey.
+    # Its own colour, because "the app is telling you something" and "a
+    # personality is answering" are different things to a reader.
+    "Council":      "#89b4fa",   # periwinkle
+}
+
+#: Names that mean a speaker already in ROLE_COLORS. The Tk engine writes the
+#: user as "User" 3 times and "You" 3 times; same human, and without this one
+#: of those is blue and the other is grey.
+#:
+#: "Workflow" and "Agent" join them: both are the application reporting on
+#: something it is doing rather than a personality answering, which is exactly
+#: what the Council colour means. A test reads every _append_transcript call
+#: site in the engine and fails if any speaker resolves to the default grey,
+#: because "Council rendered grey for 55 entries" was not noticed by anyone
+#: reading the code — it was found by counting.
+ROLE_ALIASES = {
+    "you": "User",
+    "me": "User",
+    "system": "Council",
+    "app": "Council",
+    "workflow": "Council",
+    "agent": "Council",
 }
 
 PHASE_COLOR = "#78909c"
@@ -121,13 +146,17 @@ def role_tag(who: str) -> str:
     default and lost its colour, in a widget whose whole job is telling
     speakers apart.
 
+    Also resolves ROLE_ALIASES, so "You" and "User" — the same human, written
+    both ways by the engine — are one colour rather than two.
+
     Changed rather than preserved because the blast radius is one colour: this
     can only turn the default grey into the role's own colour, never one role's
     colour into another's, and never touches anything on disk.
     """
     if not who:
         return "who_default"
-    name = _tag_name(who)
+    canonical = ROLE_ALIASES.get(who.strip().lower(), who)
+    name = _tag_name(canonical)
     return name if name in TAGS else "who_default"
 
 
