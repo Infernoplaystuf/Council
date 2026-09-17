@@ -379,3 +379,191 @@ def test_the_entry_is_rendered_once_for_all_views(qapp):
                    and n.func.attr == "render"
                    for loop in loops for n in ast.walk(loop)), (
         "render() is being called inside the per-view loop")
+
+
+# ============================================================
+# Both front ends
+# ============================================================
+
+def test_the_tk_shell_renders_through_the_shared_module():
+    """The whole point. If the Tk shell keeps its own copy of the formatting,
+    the two transcripts drift and nobody notices until a user switches."""
+    engine = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
+    assert "transcript_core.render(" in engine
+    assert "transcript_core.stream_segments(" in engine
+    assert "transcript_core.role_tag(" in engine
+
+
+@pytest.mark.parametrize("predicate", [
+    "logs_to_session", "stores_in_history", "records_provenance",
+    "is_user_question", "is_final_answer",
+])
+def test_every_policy_decision_is_made_in_one_place(predicate):
+    engine = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
+    assert f"transcript_core.{predicate}(" in engine, (
+        f"the Tk shell still decides {predicate} for itself")
+
+
+def test_the_tk_shell_no_longer_repaints_an_error_after_writing_it():
+    engine = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
+    assert 'tag_add("error"' not in engine
+
+
+def test_both_transcripts_are_configured_from_the_same_description():
+    """The Dream3D mirror used to read the Council transcript's foregrounds
+    back out and force bold on all of them."""
+    engine = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
+    assert engine.count("_apply_transcript_tags(") == 3     # def + 2 calls
+    assert "tag_cget" not in engine
+
+
+def test_the_tk_helpers_apply_segments_without_reinterpreting_them():
+    """_insert_segments must not decide anything — no kind checks, no role
+    lookups. The moment it does, there are two renderers again."""
+    import ast
+    engine = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
+    tree = ast.parse(engine)
+    fn = next(n for n in tree.body
+              if isinstance(n, ast.FunctionDef) and n.name == "_insert_segments")
+    source = ast.get_source_segment(engine, fn)
+    for forbidden in ("kind", "role_tag", "who"):
+        assert forbidden not in source, (
+            f"_insert_segments looks at {forbidden!r} — it is re-deciding what "
+            f"render() already decided")
+
+
+# ============================================================
+# The real Tk method, against a fake widget
+# ============================================================
+
+ENGINE_PROBE = '''
+import sys
+sys.path.insert(0, %(root)r)
+import council_gui_engine as cge
+
+class FakeText:
+    """Records what a Tk Text would have been told, in order."""
+    def __init__(self): self.calls = []; self.state = None
+    def configure(self, **kw): self.state = kw.get("state", self.state)
+    def insert(self, where, text, *tags):
+        self.calls.append((text, tags[0] if tags else None))
+    def see(self, where): pass
+
+class FakeConsole:
+    _append_transcript = cge.CouncilConsole._append_transcript
+    _role_tag = cge.CouncilConsole._role_tag
+    def __init__(self):
+        self.transcript = FakeText()
+        self.dream3d_transcript = FakeText()
+        self.conv_logger = None
+        self.provenance = None
+        self.stored = []
+        self.session_id = "s1"
+        self.librarian = type("L", (), {"log_event": lambda s, w, t: None})()
+        self.convo_store = type("C", (), {
+            "append": lambda s, sid, rec: self.stored.append(rec)})()
+
+c = FakeConsole()
+c._append_transcript("Writer", "  an answer  ", "final")
+c._append_transcript("", "deliberating", "phase")
+c._append_transcript("Writer", "tok", "token")
+c._append_transcript("ERROR", "it broke", "error")
+
+import json
+print("RESULT" + json.dumps({
+    "calls": c.transcript.calls,
+    "mirror": c.dream3d_transcript.calls,
+    "state": c.transcript.state,
+    "last_answer": getattr(c, "_last_answer", None),
+    "stored": len(c.stored),
+}))
+'''
+
+
+@pytest.fixture(scope="module")
+def engine_transcript():
+    """Run the REAL `_append_transcript` against a fake widget, in a subprocess.
+
+    Worth the four seconds the engine takes to import: every other test here
+    checks the shared module or the Qt view, and this is the only one that
+    proves the Tk shell still produces the same characters after the rewire.
+
+    A subprocess because importing the engine prints backend banners and sets a
+    Windows AppUserModelID — side effects that do not belong in a pytest
+    session shared with other files. Safe to import: a static check (see
+    test_the_engine_builds_no_widget_at_import) confirms it constructs no Tk
+    object at module level, so nothing is displayed.
+    """
+    import json
+    import subprocess
+    import tempfile
+    import textwrap
+
+    code = ENGINE_PROBE % {"root": str(ROOT)}
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False,
+                                     encoding="utf-8") as handle:
+        handle.write(textwrap.dedent(code))
+        path = handle.name
+
+    env = dict(os.environ, COUNCIL_NO_DIALOGS="1", QT_QPA_PLATFORM="offscreen")
+    proc = subprocess.run([sys.executable, path], capture_output=True,
+                          text=True, timeout=300, env=env)
+    Path(path).unlink(missing_ok=True)
+    if proc.returncode != 0:
+        pytest.fail(f"the engine no longer imports or the method raised:\n"
+                    f"{proc.stdout[-2000:]}\n{proc.stderr[-3000:]}")
+    line = next((ln for ln in proc.stdout.splitlines()
+                 if ln.startswith("RESULT")), None)
+    assert line, f"probe produced no result:\n{proc.stdout[-2000:]}"
+    return json.loads(line[len("RESULT"):])
+
+
+def test_the_engine_builds_no_widget_at_import():
+    """What makes importing it in a test safe, and worth keeping true."""
+    import ast
+    tree = ast.parse((ROOT / "council_gui_engine.py").read_text(encoding="utf-8"))
+    built = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef, ast.Import,
+                             ast.ImportFrom)):
+            continue
+        for inner in ast.walk(node):
+            if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
+                if inner.func.attr in ("Tk", "Toplevel", "StringVar",
+                                       "BooleanVar", "IntVar"):
+                    built.append(f"line {inner.lineno}: {inner.func.attr}")
+    assert not built, f"importing the engine would build a widget: {built}"
+
+
+def test_the_tk_shell_writes_exactly_what_render_says(engine_transcript):
+    """The characters and tags the real method produces, end to end."""
+    calls = [tuple(c) for c in engine_transcript["calls"]]
+    assert calls == [
+        ("\nWriter:\n", "who_writer"),
+        ("an answer\n", None),
+        ("  deliberating\n", "phase"),
+        ("tok", "token"),
+        ("\nERROR:\n", "error"),
+        ("it broke\n", "error"),
+    ]
+
+
+def test_the_two_transcripts_receive_identical_writes(engine_transcript):
+    assert engine_transcript["calls"] == engine_transcript["mirror"]
+
+
+def test_the_widget_is_left_read_only(engine_transcript):
+    """A transcript left in state="normal" is a transcript the user can type
+    into, and the next insert lands wherever their cursor went."""
+    assert engine_transcript["state"] == "disabled"
+
+
+def test_the_deferred_turn_is_still_captured(engine_transcript):
+    """"⤓ Defer to Vault" sends the exact turn the model could not satisfy, so
+    this tracking is the feature, not bookkeeping."""
+    assert engine_transcript["last_answer"] == "  an answer  "
+
+
+def test_phases_and_tokens_stay_out_of_the_stored_conversation(engine_transcript):
+    """Four entries went in; the phase and the token are progress noise."""
+    assert engine_transcript["stored"] == 2

@@ -4847,22 +4847,41 @@ except Exception:
 # Colour / tag constants for the transcript
 # ============================================================
 
-ROLE_COLORS = {
-    "User":        "#4fc3f7",   # light blue
-    "Judge":       "#ef9a9a",   # red-ish
-    "Writer":      "#a5d6a7",   # green
-    "Coder": "#ce93d8",   # purple
-    "Intern":      "#ffe082",   # yellow
-    "Peasant":     "#ffcc80",   # orange
-    "Artist":      "#f48fb1",   # pink
-    "Orchestrator":"#b0bec5",   # grey
-    "Librarian":   "#80cbc4",   # teal
-    "Apothecary":  "#bcaaa4",   # brown-ish
-}
+# The council's personalities and the colour each speaks in. Moved to
+# council_core.transcript so the Qt front end colours a speaker the same way;
+# the names stay here because this module's own code and its tests use them.
+from council_core import transcript as transcript_core   # noqa: E402
 
-PHASE_COLOR   = "#78909c"
-TOKEN_COLOR   = "#e0e0e0"
-DEFAULT_COLOR = "#cfd8dc"
+ROLE_COLORS   = transcript_core.ROLE_COLORS
+PHASE_COLOR   = transcript_core.PHASE_COLOR
+TOKEN_COLOR   = transcript_core.TOKEN_COLOR
+DEFAULT_COLOR = transcript_core.DEFAULT_COLOR
+
+
+def _apply_transcript_tags(widget):
+    """Configure one Tk Text from council_core.transcript.TAGS.
+
+    Both transcripts go through this. The Dream3D mirror used to configure
+    itself by reading the Council transcript's foregrounds back out and then
+    forcing ("Consolas", 10, "bold") onto every tag — which rendered phase
+    markers bold instead of italic-9 and tokens bold instead of plain. Two
+    widgets built from one description cannot drift like that.
+    """
+    for style in transcript_core.TAGS.values():
+        weights = " ".join(name for name, on in (("bold", style.bold),
+                                                 ("italic", style.italic)) if on)
+        font = ((style.family, style.size, weights) if weights
+                else (style.family, style.size))
+        widget.tag_configure(style.name, foreground=style.foreground, font=font)
+
+
+def _insert_segments(widget, segments):
+    """Write rendered segments into a Tk Text. The caller owns the state flip."""
+    for segment in segments:
+        if segment.tag:
+            widget.insert("end", segment.text, segment.tag)
+        else:
+            widget.insert("end", segment.text)
 
 
 # ============================================================
@@ -10369,13 +10388,7 @@ class CouncilConsole(tk.Tk):
                          width=16, state="readonly").pack(side="left", padx=(0, 6))
 
     def _register_transcript_tags(self):
-        self.transcript.tag_configure("phase",   foreground=PHASE_COLOR,   font=("Consolas", 9, "italic"))
-        self.transcript.tag_configure("token",   foreground=TOKEN_COLOR)
-        for role, color in ROLE_COLORS.items():
-            tag = f"who_{role.lower().replace('-','_').replace(' ','_')}"
-            self.transcript.tag_configure(tag, foreground=color, font=("Consolas", 10, "bold"))
-        self.transcript.tag_configure("who_default", foreground=DEFAULT_COLOR, font=("Consolas", 10, "bold"))
-        self.transcript.tag_configure("error", foreground="#f38ba8")
+        _apply_transcript_tags(self.transcript)
 
     # ---- Dream3D tab ----
     # A split view: chat mirror on the left, pipeline visualization on the
@@ -10398,15 +10411,9 @@ class CouncilConsole(tk.Tk):
 
         ttk.Label(left, text="Chat (mirrors Council)").pack(anchor="w")
         self.dream3d_transcript = self._make_text(left, wrap="word", state="disabled")
-        # Reuse the same role-tag config the Council transcript uses
-        try:
-            for tag in self.transcript.tag_names():
-                cfg = self.transcript.tag_cget(tag, "foreground")
-                if cfg:
-                    self.dream3d_transcript.tag_configure(tag, foreground=cfg,
-                                                          font=("Consolas", 10, "bold"))
-        except Exception:
-            pass
+        # Same description the Council transcript is built from, rather than
+        # its foregrounds read back out — see _apply_transcript_tags.
+        _apply_transcript_tags(self.dream3d_transcript)
 
         d3d_sb = ttk.Scrollbar(left, command=self.dream3d_transcript.yview)
         self.dream3d_transcript.configure(yscrollcommand=d3d_sb.set)
@@ -17493,11 +17500,15 @@ class CouncilConsole(tk.Tk):
     # ============================
 
     def _role_tag(self, who: str) -> str:
-        key = who.lower().replace("-", "_").replace(" ", "_")
-        tag = f"who_{key}"
-        if tag in ROLE_COLORS or who in ROLE_COLORS:
-            return tag
-        return "who_default"
+        """The tag a speaker's name is written in.
+
+        Delegates, which also fixes it: the test here was
+        `if tag in ROLE_COLORS or who in ROLE_COLORS`, whose first half can
+        never be true (tag is "who_writer", the keys are "Writer"), leaving an
+        exact case-sensitive match — so a speaker named "writer" lost its
+        colour. See council_core.transcript.role_tag.
+        """
+        return transcript_core.role_tag(who)
 
     def _set_text(self, widget: tk.Text, text: str):
         widget.configure(state="normal")
@@ -17714,7 +17725,8 @@ class CouncilConsole(tk.Tk):
         # never reads conversation_logs/). This runs before the UI write
         # so even if rendering fails we still capture the event.
         try:
-            if hasattr(self, "conv_logger") and self.conv_logger and kind not in ("token",):
+            if (getattr(self, "conv_logger", None)
+                    and transcript_core.logs_to_session(kind)):
                 self.conv_logger.log_event(
                     kind=kind, who=who, text=text,
                     meta={"session": getattr(self, "session_id", "")},
@@ -17725,9 +17737,9 @@ class CouncilConsole(tk.Tk):
         # "Defer to Vault" action can capture the exact turn the model
         # couldn't satisfy (e.g. "give me a much bigger summary").
         try:
-            if who == "User":
+            if transcript_core.is_user_question(who, kind):
                 self._last_user_text = text
-            elif who == "Writer" and kind == "final":
+            elif transcript_core.is_final_answer(who, kind):
                 self._last_answer = text
         except Exception:
             pass
@@ -17736,33 +17748,28 @@ class CouncilConsole(tk.Tk):
         # not phase/token streams) so "where did X come from" can scan
         # them later.
         try:
-            if (hasattr(self, "provenance") and self.provenance
-                    and kind in ("final", "observation")
-                    and who not in ("User",)):
+            if (getattr(self, "provenance", None)
+                    and transcript_core.records_provenance(who, kind)):
                 self.provenance.add_response(who, text)
         except Exception:
             pass
 
-        tag = self._role_tag(who)   # loop-invariant — compute once, not per widget
+        # Rendered once, not per widget: what an entry looks like is the same
+        # question for both transcripts and for the Qt front end.
+        segments = transcript_core.render(who, text, kind)
         for widget in (getattr(self, "transcript", None),
                        getattr(self, "dream3d_transcript", None)):
             if widget is None:
                 continue
             try:
                 widget.configure(state="normal")
-                if kind == "phase":
-                    widget.insert("end", f"  {text}\n", "phase")
-                elif kind == "token":
-                    widget.insert("end", text, "token")
-                else:
-                    widget.insert("end", f"\n{who}:\n", tag)
-                    widget.insert("end", text.strip() + "\n")
+                _insert_segments(widget, segments)
                 widget.see("end")
                 widget.configure(state="disabled")
             except tk.TclError:
                 pass  # widget may have been destroyed
 
-        if kind not in ("token", "phase", "thought"):
+        if transcript_core.stores_in_history(kind):
             self.librarian.log_event(who, text)
             self.convo_store.append(self.session_id, {"ts": now_iso(), "who": who, "text": text})
 
@@ -17780,14 +17787,13 @@ class CouncilConsole(tk.Tk):
             self.stream_box.configure(state="normal")
         except tk.TclError:
             return
-        if who not in self._stream_buffers:
-            # New speaker — add header. The dict is used only as a SET of
-            # speakers-seen (this membership test); the per-token text value is
-            # never read (it's .pop()/.clear()-ed), so we don't accumulate it —
-            # that += was an O(N^2) string realloc on the hottest UI path.
-            self._stream_buffers[who] = ""
-            self.stream_box.insert("end", f"\n{who}: ", self._role_tag(who))
-        self.stream_box.insert("end", token)
+        # The dict is used only as a SET of speakers-seen; the per-token text
+        # value is never read (it's .pop()/.clear()-ed), so we don't accumulate
+        # it — that += was an O(N^2) string realloc on the hottest UI path.
+        _insert_segments(self.stream_box,
+                         transcript_core.stream_segments(who, token,
+                                                         self._stream_buffers))
+        self._stream_buffers[who] = ""
         self._stream_box_dirty = True
 
     def _flush_stream_box(self):
@@ -20710,8 +20716,13 @@ class CouncilConsole(tk.Tk):
                         self._render_error_coach_button(_coach)
                         self._set_status("● needs attention", "#f9e2af")
                     else:
-                        self._append_transcript("ERROR", msg, "final")
-                        self.transcript.tag_add("error", "end-2l", "end")
+                        # "error" is a kind now: the entry is written red in
+                        # one pass. The old form wrote it normally and then
+                        # repainted the last two lines, which assumed the entry
+                        # was exactly two lines and needed after-the-fact range
+                        # tagging — the one Tk Text idiom Qt has no cheap
+                        # answer for.
+                        self._append_transcript("ERROR", msg, "error")
                         self._set_status("● error", "#f38ba8")
 
         except queue.Empty:
