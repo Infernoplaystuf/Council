@@ -14236,7 +14236,15 @@ class CouncilConsole(tk.Tk):
         mpl_r = ge.MatplotlibRenderer()
         fig   = mpl_r.render(spec, ds)
         if fig:
-            saved = mpl_r.save(fig, Path(path_str))
+            try:
+                saved = mpl_r.save(fig, Path(path_str))
+            except ge.ExportRefused as exc:
+                # The renderer drew a figure that SAYS it failed.
+                # Reporting "Exported" here handed the user a PNG of an
+                # error message and told them it worked.
+                self._grapher_show_stats(
+                    f"✗ Export failed — {exc}")
+                return
             self._grapher_show_stats(f"\u2713 Exported: {saved}")
         else:
             # Reachable now that the static renderer returns None for a type it

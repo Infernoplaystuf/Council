@@ -99,6 +99,30 @@ PLOT_TYPES = [
     "facet",
 ]
 
+#: Set on a Figure that reports a failure instead of drawing data. An attribute
+#: rather than a wrapper type because a Figure is passed to matplotlib, to Tk
+#: and to Qt canvases, all of which would reject anything else.
+_ERROR_ATTR = "_council_plot_error"
+
+
+class ExportRefused(RuntimeError):
+    """Raised by save() when asked to write an error figure to disk."""
+
+
+def mark_error(fig, message: str):
+    """Record that this figure reports a failure rather than showing data."""
+    try:
+        setattr(fig, _ERROR_ATTR, str(message))
+    except Exception:                                     # noqa: BLE001
+        pass                                              # marking is best-effort
+    return fig
+
+
+def error_of(fig) -> str:
+    """The failure this figure reports, or "" if it is a real chart."""
+    return str(getattr(fig, _ERROR_ATTR, "") or "")
+
+
 class UnsupportedPlotType(ValueError):
     """A renderer has no implementation for this plot type.
 
@@ -819,6 +843,12 @@ class MatplotlibRenderer:
     }
 
     def render(self, spec: PlotSpec, ds: DataSet) -> Optional[Figure]:
+        """Draw the chart, or a figure that says why it could not.
+
+        An unsupported plot type returns None. A plotting FAILURE returns a
+        figure carrying the error — see `mark_error` / `error_of`. Callers that
+        display it should; callers that write a file must check first.
+        """
         if not _MPL_OK:
             return None
         if ds.df is None:
@@ -834,11 +864,16 @@ class MatplotlibRenderer:
                 # the truth, instead of writing a PNG of the wrong chart.
                 return None
             except Exception as e:
+                # An ERROR FIGURE, marked as one. Showing it in the pane is
+                # right — a message beats a blank chart — but exporting it and
+                # reporting success is not, and the caller could not tell the
+                # difference because a truthy Figure was all it got.
                 fig, ax = plt.subplots(figsize=(8, 4))
                 ax.text(0.5, 0.5, f"Plot error:\n{e}",
                         ha="center", va="center", transform=ax.transAxes,
                         color="red", fontsize=12)
                 ax.axis("off")
+                mark_error(fig, str(e))
 
         if fig and spec.title:
             fig.suptitle(spec.title or f"{spec.plot_type.replace('_',' ').title()} — {ds.name}",
@@ -1059,7 +1094,20 @@ class MatplotlibRenderer:
         return fig
 
     def save(self, fig: Figure, path: Path, dpi: int = 150) -> Path:
-        """Save figure to file. Supports PNG, SVG, PDF."""
+        """Save figure to file. Supports PNG, SVG, PDF.
+
+        REFUSES AN ERROR FIGURE. `_grapher_export` used to see a truthy figure,
+        save it, and print "✓ Exported" — handing the user a PNG of an error
+        message and telling them it worked. Raising here means every caller, in
+        both front ends, gets it right by default rather than by remembering to
+        check. `to_bytes` deliberately does NOT refuse: that path is for
+        showing the figure on screen, where the message is what you want.
+        """
+        problem = error_of(fig)
+        if problem:
+            raise ExportRefused(
+                "the chart could not be drawn, so there is nothing to "
+                f"export: {problem}")
         path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(str(path), dpi=dpi, bbox_inches="tight")
         plt.close(fig)
