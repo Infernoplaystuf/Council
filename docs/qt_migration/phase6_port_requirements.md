@@ -16,6 +16,29 @@ Everything here carries a `file:line` that an auditor verified by reading. Five 
 were rejected on that pass and are listed at the end, because a finding nobody
 re-checked is a rumour.
 
+> ### ⚠ The line numbers below have moved, and by a varying amount
+>
+> Every `council_gui_engine.py:NNNN` in this document was correct when it was written
+> and is wrong now. Extracting the deliberation took **1,062 lines** out of that file
+> (21,980 → 20,918), so everything after the cut shifted — `_send`, for one, moved from
+> `:19236` to `:18008`.
+>
+> This is my error in the document's design, not a drift I failed to chase: **a line
+> number is not a stable address in a file that is actively being emptied**, and I cited
+> about ninety of them. A reader who opens the file at a cited line finds unrelated code
+> and cannot tell whether the finding was wrong or the line moved — which is worse than
+> citing nothing.
+>
+> The symbol names are stable. To find any of them:
+>
+> ```bash
+> python docs/qt_migration/probes/where.py _grapher_export
+> ```
+>
+> It parses rather than greps, so it gives you the definition and its span rather than
+> every mention. Section B's numbers are being re-derived as the Grapher is ported;
+> sections A, C and D still carry the original ones and should be read through `where.py`.
+
 ---
 
 ## A. Defects that would silently survive the port
