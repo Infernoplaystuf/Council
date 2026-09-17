@@ -467,3 +467,249 @@ def test_ampersands_survive_in_captions(qapp, tmp_path):
     titles = [box.title() for box in tab.findChildren(QGroupBox)]
     assert any("&&" in t for t in titles), titles
     window.request_close()
+
+
+# ======================================================= every registered tab
+
+# These are parametrised over council_qt.tabs.REGISTRY rather than written one
+# per tab, so a tab added in a later phase is covered the moment it is
+# registered and nobody has to remember to write these four tests again. The
+# Tk shell has no equivalent: 3 of its 34 test files reference the console at
+# all, which is how a tab can be broken for a release without a red run.
+
+from council_qt import tabs as tab_registry  # noqa: E402
+
+REGISTERED = [(title, factory, eager)
+              for title, factory, eager in tab_registry.REGISTRY]
+REGISTERED_IDS = [title for title, _, _ in REGISTERED]
+
+
+#: Nested functions handed to `threading.Thread(target=...)` in this codebase.
+#: `run` is deliberately absent: in the Diagnostics tab that is the CLICK
+#: handler, which runs on the UI thread and is allowed to touch widgets.
+_WORKER_NAMES = {"work", "worker", "_work"}
+
+#: Widget calls that must not happen off the UI thread. Narrow on purpose —
+#: these are the ones this codebase actually makes.
+_FORBIDDEN_OFF_THREAD = (
+    "setText", "append", "appendHtml", "appendPlainText", "setEnabled",
+    "addTopLevelItem", "clear", "setPlainText", "setCurrentIndex",
+    "insertPlainText", "setValue", "setChecked", "takeTopLevelItem",
+)
+
+#: How a worker legitimately hands work back to the UI thread.
+_UI_HOPS = ("_to_ui", "call_on_ui", "after", "emit", "post")
+
+
+def _worker_ui_violations(source: str):
+    """Widget calls made directly from a worker body, as 'line N: …' strings.
+
+    Anything passed to a hop — a named nested function or a lambda — is exempt
+    along with its whole subtree, because that code runs on the UI thread.
+    """
+    import ast
+
+    tree = ast.parse(source)
+    offenders = []
+
+    for worker in ast.walk(tree):
+        if not isinstance(worker, ast.FunctionDef):
+            continue
+        if worker.name not in _WORKER_NAMES:
+            continue
+
+        # Everything handed to a hop, by name or inline.
+        marshalled_names, exempt = set(), set()
+        for node in ast.walk(worker):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in _UI_HOPS):
+                continue
+            for arg in list(node.args) + [kw.value for kw in node.keywords]:
+                if isinstance(arg, ast.Name):
+                    marshalled_names.add(arg.id)
+                for inner in ast.walk(arg):
+                    exempt.add(id(inner))
+
+        # …and the bodies of the nested functions named in those hops.
+        for node in ast.walk(worker):
+            if isinstance(node, ast.FunctionDef) and node.name in marshalled_names:
+                for inner in ast.walk(node):
+                    exempt.add(id(inner))
+
+        for call in ast.walk(worker):
+            if id(call) in exempt:
+                continue
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute):
+                if call.func.attr in _FORBIDDEN_OFF_THREAD:
+                    offenders.append(
+                        f"line {call.lineno}: {worker.name}() calls "
+                        f".{call.func.attr}() directly")
+    return offenders
+
+
+@pytest.fixture
+def window(qapp, tmp_path, monkeypatch):
+    """A window whose tabs build against a scratch vault, not the real one."""
+    monkeypatch.setenv("COUNCIL_VAULT_DIR", str(tmp_path / "vault"))
+    monkeypatch.setenv("COUNCIL_NO_DIALOGS", "1")
+    win = CouncilWindow(theme="dark")
+    yield win
+    win.request_close()
+
+
+@pytest.mark.parametrize("title,factory,eager", REGISTERED, ids=REGISTERED_IDS)
+def test_every_registered_tab_builds(window, title, factory, eager):
+    """A tab that raises while building takes the whole window down with it,
+    and lazy building means that happens when the user first clicks it —
+    after the app looked fine."""
+    widget = factory(window)
+    assert widget is not None, f"{title} built nothing"
+    assert widget.metaObject() is not None
+
+
+@pytest.mark.parametrize("title,factory,eager", REGISTERED, ids=REGISTERED_IDS)
+def test_every_registered_tab_survives_being_shown(window, title, factory,
+                                                   eager):
+    """Building is not the same as being laid out. A size policy or a layout
+    that only resolves on show is a real crash the build test cannot see."""
+    widget = factory(window)
+    window.add_tab(title, lambda w=widget: w, eager=True)
+    window.show_tab(title)
+    qapp = QApplication.instance()
+    qapp.processEvents()
+    assert widget.isVisible() or widget.isVisibleTo(window)
+
+
+@pytest.mark.parametrize("title,factory,eager", REGISTERED, ids=REGISTERED_IDS)
+def test_every_wired_name_on_a_tab_resolves(window, title, factory, eager):
+    """Qt does not check a connect() target the way it cannot check a Tk
+    `command=`: a typo'd method name raises at CLICK time, in front of the
+    user, on a tab that built cleanly. So resolve every name this tab connects
+    to, here, before a release does it."""
+    import ast
+    import inspect
+
+    widget = factory(window)
+    # The FACTORY's module, not the widget's type: a tab that returns a plain
+    # QWidget would otherwise send us reading a PySide6 .pyd.
+    module = inspect.getmodule(factory)
+    source = Path(module.__file__).read_text(encoding="utf-8")
+
+    wanted = set()
+    for node in ast.walk(ast.parse(source)):
+        # `something.clicked.connect(self.on_thing)` / `.connect(self._thing)`
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "connect"):
+            continue
+        for arg in node.args:
+            target = arg
+            if isinstance(target, ast.Attribute) and \
+                    isinstance(target.value, ast.Name) and \
+                    target.value.id == "self":
+                wanted.add(target.attr)
+
+    missing = sorted(name for name in wanted if not hasattr(widget, name))
+    assert not missing, (
+        f"{title} connects to names that do not exist on it: {missing}")
+
+
+@pytest.mark.parametrize("title,factory,eager", REGISTERED, ids=REGISTERED_IDS)
+def test_no_tab_writes_a_widget_from_a_worker_thread(title, factory, eager):
+    """The rule the whole bridge exists for, checked at the source level.
+
+    A worker touching a widget directly is undefined behaviour in Qt exactly as
+    it is in Tk, and Qt will not warn — the symptom is a crash on someone
+    else's machine, weeks later.
+
+    The check is POSITIONAL, not a keyword search. The shape this codebase uses
+    is::
+
+        def work():
+            result = do_the_slow_thing()
+            self._to_ui(lambda: self.append(result))
+
+    so anything passed to a hop — a named nested function or a lambda — is
+    exempt along with everything inside it, and the rest of the worker's body
+    is checked. Two earlier cuts of this test were wrong in opposite
+    directions: one exempted a whole worker if the word `_to_ui` appeared
+    anywhere in it (which exempted all seven Vault workers and asserted
+    nothing), and one failed to exempt lambdas (which reported all seven as
+    violations). Both are the same mistake — matching on text instead of on
+    where the call actually sits.
+    """
+    import ast
+    import inspect
+
+    module = inspect.getmodule(factory)
+    source = Path(module.__file__).read_text(encoding="utf-8")
+
+    offenders = _worker_ui_violations(source)
+    assert not offenders, (
+        f"{title} touches widgets from a worker without a hop to the UI "
+        f"thread:\n  " + "\n  ".join(offenders))
+
+
+def test_the_worker_check_catches_a_real_violation():
+    """The check above is only worth running if it can fail.
+
+    Every tab passes it, which is either good news or a broken check, and from
+    a green run those look identical. So: hand it a worker that does the wrong
+    thing and require that it says so.
+    """
+    bad = '''
+import threading
+def build(window):
+    def on_click():
+        def work():
+            text = slow_thing()
+            output.setPlainText(text)          # straight from the worker
+        threading.Thread(target=work).start()
+'''
+    assert _worker_ui_violations(bad), "the check cannot see a direct write"
+
+    good = '''
+import threading
+def build(window):
+    def on_click():
+        def work():
+            text = slow_thing()
+            window.bridge.call_on_ui(lambda: output.setPlainText(text))
+        threading.Thread(target=work).start()
+'''
+    assert not _worker_ui_violations(good), "the check flags a correct hop"
+
+
+@pytest.mark.parametrize("title,factory,eager", REGISTERED, ids=REGISTERED_IDS)
+def test_every_worker_a_tab_starts_is_one_the_check_can_see(title, factory,
+                                                            eager):
+    """A worker named something the check does not recognise is not checked at
+    all, and the run stays green. Count the threads a tab starts against the
+    worker functions the check knows how to read."""
+    import ast
+    import inspect
+
+    module = inspect.getmodule(factory)
+    source = Path(module.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    started = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(
+            func, "id", "")
+        if name == "Thread":
+            started += 1
+
+    visible = sum(1 for node in ast.walk(tree)
+                  if isinstance(node, ast.FunctionDef)
+                  and node.name in _WORKER_NAMES)
+
+    assert visible >= started, (
+        f"{title} starts {started} thread(s) but only {visible} worker "
+        f"function(s) are named one of {sorted(_WORKER_NAMES)} — the rest are "
+        f"invisible to the off-thread check")
