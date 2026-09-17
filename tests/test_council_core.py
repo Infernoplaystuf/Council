@@ -716,3 +716,141 @@ def test_the_data_operations_are_used_by_both_front_ends(operation):
     alias = {"delete_path": "delete"}.get(operation, operation)
     assert operation in tk_src, f"the Tk shell does not use {operation}"
     assert alias in qt_src, f"the Qt tab does not use {alias}"
+
+
+# ================================================================ vault_search
+
+from council_core import vault_search  # noqa: E402
+
+
+def _vault(tmp_path, *names):
+    for name in names:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("x", encoding="utf-8")
+    return tmp_path
+
+
+# -- by name ------------------------------------------------------------------
+
+def test_every_word_of_the_term_must_appear(tmp_path):
+    root = _vault(tmp_path, "job_blue_2024.csv", "job_red_2024.csv")
+    hits = vault_search.search_vault_filenames(root, "job blue")
+    assert [Path(p).name for p, _ in hits] == ["job_blue_2024.csv"]
+
+
+def test_a_wildcard_means_shape_not_spelling(tmp_path):
+    """Users name files by shape — job_#### is "job_ then any four". Plain
+    substring matching treated # as a literal and found nothing."""
+    root = _vault(tmp_path, "job_1234.csv", "job_0087.csv", "job_123.csv",
+                  "sales.csv")
+    hits = vault_search.search_vault_filenames(root, "job_####")
+    assert sorted(Path(p).name for p, _ in hits) == ["job_0087.csv",
+                                                     "job_1234.csv"]
+    assert all(reason == "pattern match" for _, reason in hits)
+
+
+def test_generated_output_folders_are_not_searched(tmp_path):
+    """Otherwise every search returns its own past results."""
+    root = _vault(tmp_path, "report_q3.csv", "derived/report_q3.csv",
+                  "converted_mongo/report_q3.json", ".vault_index/report_q3")
+    hits = vault_search.search_vault_filenames(root, "report")
+    assert len(hits) == 1
+    assert Path(hits[0][0]).parent == root
+
+
+def test_an_empty_term_matches_nothing(tmp_path):
+    root = _vault(tmp_path, "anything.csv")
+    assert vault_search.search_vault_filenames(root, "") == []
+    assert vault_search.search_vault("   ", root).hits == []
+
+
+# -- name plus content --------------------------------------------------------
+
+class _FakeDataIndex:
+    """A data_index-shaped stand-in. The real one needs files parsed."""
+
+    def __init__(self, values=(), columns=(), explode=False):
+        self._values, self._columns, self._explode = values, columns, explode
+
+    def _check(self):
+        if self._explode:
+            raise RuntimeError("index is half-built")
+
+    def refresh(self):
+        self._check()
+
+    def search_value(self, term, max_per_file=1):
+        self._check()
+        return [{"file": name} for name in self._values]
+
+    def find_files_with_column(self, term):
+        self._check()
+        import types
+        return [(types.SimpleNamespace(name=name), exact)
+                for name, exact in self._columns]
+
+
+def test_content_hits_carry_the_reason_they_matched(tmp_path):
+    """"acme.csv — contains "Acme"" answers the question a bare filename
+    leaves open: why is this file in my results?"""
+    root = _vault(tmp_path, "invoices_2024.csv")
+    index = _FakeDataIndex(values=["invoices_2024.csv"],
+                       columns=[("invoices_2024.csv", "Job ID")])
+    result = vault_search.search_vault("Acme", root, index=index)
+    reasons = {reason for _, reason in result.hits}
+    assert any("contains" in r and "Acme" in r for r in reasons)
+
+
+def test_a_file_matching_twice_is_listed_once(tmp_path):
+    root = _vault(tmp_path, "acme_report.csv")
+    index = _FakeDataIndex(values=["acme_report.csv"],
+                       columns=[("acme_report.csv", "acme")])
+    result = vault_search.search_vault("acme", root, index=index)
+    assert len(result.hits) == 1, "the same file came back three ways"
+
+
+def test_a_broken_index_still_returns_the_name_matches(tmp_path):
+    """A half-built index is the normal state right after an import. It must
+    cost the content half of one search, not the search."""
+    root = _vault(tmp_path, "acme_report.csv")
+    result = vault_search.search_vault("acme", root,
+                                       index=_FakeDataIndex(explode=True))
+    assert len(result.hits) == 1
+    assert not result.searched_content
+
+
+def test_no_index_says_why_content_was_not_searched(tmp_path):
+    """Silence here reads as "that term is not in your vault", which is a
+    different and wrong answer."""
+    root = _vault(tmp_path, "unrelated.csv")
+    result = vault_search.search_vault("acme", root, index=None)
+    assert result.hits == []
+    assert "build the keyword index" in result.message
+
+
+def test_a_found_term_does_not_explain_itself(tmp_path):
+    root = _vault(tmp_path, "acme_report.csv")
+    result = vault_search.search_vault("acme", root, index=None)
+    assert result.message == "1 match(es)"
+
+
+# -- both sides ---------------------------------------------------------------
+
+def test_both_front_ends_search_through_the_shared_module():
+    tk_src = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
+    qt_src = (ROOT / "council_qt" / "tabs" / "vault.py").read_text(encoding="utf-8")
+    for src, who in ((tk_src, "the Tk shell"), (qt_src, "the Qt tab")):
+        assert "vault_search.search_vault(" in src, f"{who} searches on its own"
+
+
+def test_the_engine_keeps_the_names_the_smoke_suite_uses():
+    """tests/smoke_test.py reaches for cge._search_vault_filenames and the two
+    pattern helpers. Moving the bodies must not break the names."""
+    import importlib
+    spec = importlib.util.find_spec("council_gui_engine")
+    assert spec is not None
+    source = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
+    for name in ("_search_vault_filenames", "_compile_name_pattern",
+                 "_name_matches_pattern"):
+        assert f"as {name}," in source, f"{name} is no longer importable"

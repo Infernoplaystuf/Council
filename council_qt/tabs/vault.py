@@ -82,8 +82,9 @@ class VaultActions:
     class NotYetExtracted(RuntimeError):
         pass
 
-    def __init__(self, vault_dir: Path):
+    def __init__(self, vault_dir: Path, index=None):
         self.vault_dir = Path(vault_dir)
+        self._index = index          # data_index.DataIndex, built on first use
 
     # -- implemented -----------------------------------------------------
     def walk(self, root: Optional[Path] = None):
@@ -119,22 +120,38 @@ class VaultActions:
             text += f"\n\n… truncated at {_human(len(raw))}"
         return text
 
-    def search(self, term: str) -> List[Path]:
-        """Find vault files by NAME. The Tk tab also searches indexed CONTENT
-        through data_index; that half needs the index and is left to the
-        extracted actions."""
-        term = (term or "").strip().lower()
-        if not term:
-            return []
-        hits: List[Path] = []
-        for base, dirs, names in os.walk(self.vault_dir):
-            dirs[:] = [d for d in dirs if not d.startswith(".")]
-            for name in names:
-                if term in name.lower():
-                    hits.append(Path(base) / name)
-                    if len(hits) >= 500:
-                        return hits
-        return hits
+    def search(self, term: str):
+        """Find vault files by name or by indexed content.
+
+        Both halves, the same as the Tk tab: this used to search filenames
+        only, which is the same box and button quietly giving a different
+        answer.
+        """
+        from council_core import vault_search
+        try:
+            import data_index
+            in_dir = data_index.input_dir(self.vault_dir)
+        except Exception:                                 # noqa: BLE001
+            in_dir = self.vault_dir
+        return vault_search.search_vault(term, in_dir, index=self._data_index())
+
+    def _data_index(self):
+        """The data index, built on first use and kept.
+
+        Built lazily because opening the Vault tab should not pay for an index
+        the user may never search, and because a failure here must cost the
+        content half of one search, not the tab.
+        """
+        if self._index is None:
+            try:
+                import data_index
+                self._index = data_index.DataIndex(
+                    search_roots=[data_index.input_dir(self.vault_dir),
+                                  data_index.bundled_samples_dir()],
+                    write_root=data_index.output_dir(self.vault_dir))
+            except Exception:                             # noqa: BLE001
+                return None
+        return self._index
 
     def open_folder(self, path: Optional[Path] = None) -> None:
         target = Path(path or self.vault_dir)
@@ -635,9 +652,12 @@ class VaultTab(QWidget):
 
     # ------------------------------------------------------------- logging
     def append(self, message: str, level: str = "info") -> None:
-        """The activity log. Same three levels the Tk tab tags."""
+        """The activity log. The Tk tab's three levels, plus a dim one
+        for the detail under a result."""
         colour = {"ok": self._tokens["success"],
-                  "err": self._tokens["error"]}.get(level, self._tokens["accent"])
+                  "err": self._tokens["error"],
+                  "dim": self._tokens["muted_fg"]}.get(level,
+                                                       self._tokens["accent"])
         safe = (str(message).rstrip().replace("&", "&amp;")
                 .replace("<", "&lt;").replace(">", "&gt;"))
         self.log.appendHtml(f'<span style="color:{colour}">{safe}</span>')
@@ -728,17 +748,20 @@ class VaultTab(QWidget):
         self.append(f"searching for {term!r} …")
 
         def work() -> None:
-            hits = self.actions.search(term)
+            result = self.actions.search(term)
 
             def show() -> None:
-                if not hits:
-                    self.append(f"no file name matches {term!r}", "err")
+                if not result.hits:
+                    self.append(result.message, "err")
                     return
-                self.append(f"{len(hits)} match(es):", "ok")
-                for hit in hits[:50]:
-                    self.append(f"   {hit}")
-                if len(hits) > 50:
-                    self.append(f"   … and {len(hits) - 50} more")
+                self.append(result.message, "ok")
+                for path, reason in result.hits[:50]:
+                    # The reason is most of the answer when the match came from
+                    # inside a spreadsheet rather than from the file's name.
+                    self.append(f"   {Path(path).name}   —   {reason}")
+                    self.append(f"      {path}", "dim")
+                if len(result.hits) > 50:
+                    self.append(f"   … and {len(result.hits) - 50} more")
 
             self._to_ui(show)
 

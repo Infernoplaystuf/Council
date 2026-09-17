@@ -21,4 +21,4 @@ council_core is held to the same rule in tests/test_council_core.py.
 """
 from __future__ import annotations
 
-__all__ = ["vault_ops"]
+__all__ = ["vault_data", "vault_import", "vault_ops", "vault_search"]

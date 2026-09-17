@@ -640,52 +640,13 @@ def _build_answer_report_md(question, answer, table, sources):
     return "\n".join(lines)
 
 
-# ── Filename wildcard patterns ──────────────────────────────────────────────
-# Users reference files by shape, not spelling: "job_####" means "job_ then any
-# four characters" (job_1234, job_0087, job_ab12), and "report_*" means "report_
-# then anything". The resolvers below used pure substring matching, so `#`/`*`
-# were treated as literal characters and never matched. `_compile_name_pattern`
-# turns such a token into a safe, anchored, case-insensitive regex:
-#   #  → any single character        (the user's "any 4 characters")
-#   *  → any run of characters (incl. empty)
-#   ?  → any single character
-# It returns None when the token has no `#`/`*` wildcard, so callers keep their
-# plain-substring behaviour for ordinary names. Pure stdlib, fully offline. The
-# generated regex has no nested quantifiers, so there is no catastrophic-
-# backtracking risk regardless of user input.
-_NAME_WILDCARD_CHARS = ("#", "*")
-
-
-def _compile_name_pattern(token):
-    """Compile a filename-wildcard token to a case-insensitive ``re.Pattern``,
-    or return ``None`` when ``token`` contains no ``#``/``*`` wildcard."""
-    token = (token or "").strip().strip("'\"`")
-    if not token:
-        return None
-    if not any(c in token for c in _NAME_WILDCARD_CHARS):
-        return None
-    parts = []
-    for ch in token:
-        if ch == "#" or ch == "?":
-            parts.append(".")          # any single character
-        elif ch == "*":
-            parts.append(".*")         # any run (incl. empty)
-        else:
-            parts.append(_re.escape(ch))
-    try:
-        return _re.compile("".join(parts), _re.IGNORECASE)
-    except _re.error:
-        return None
-
-
-def _name_matches_pattern(pat, filename: str) -> bool:
-    """True when ``filename`` matches the compiled pattern. Anchored: the
-    pattern must span the whole basename OR the whole stem (so ``job_####``
-    matches ``job_1234.csv`` via the stem and ``job_####.csv`` via the name)."""
-    if pat is None or not filename:
-        return False
-    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
-    return bool(pat.fullmatch(filename) or pat.fullmatch(stem))
+# ── Filename wildcard patterns ─────────────────────────────────────────
+# Moved to council_core.vault_search, with the explanation of what `#` and
+# `*` mean; both front ends resolve a name the same way.
+from council_core.vault_search import (           # noqa: E402
+    compile_name_pattern as _compile_name_pattern,
+    name_matches_pattern as _name_matches_pattern,
+)
 
 
 def _tokenize_ident(s) -> list:
@@ -767,53 +728,11 @@ def _files_associated_with(in_dir, entity, *, limit: int = 3000):
     return out
 
 
-def _search_vault_filenames(in_dir, term, limit: int = 200):
-    """Files under ``in_dir`` whose path/name contains every word of ``term``
-    (case-insensitive), OR whose basename matches a ``#``/``*`` wildcard
-    pattern in ``term`` (e.g. ``job_####``). App-generated output dirs are
-    skipped. Returns a list of (abs_path, reason). Pure + UI-free so it's
-    unit-testable."""
-    import os as _os
-    skip = {"derived", "deferred_results", "converted_mongo", "__pycache__",
-            ".vault_index", ".stats_cache", "conversation_logs", ".git"}
-    # Wildcard mode: match the compiled pattern against each basename. This
-    # takes precedence because re.findall(r"[a-z0-9]+", ...) below would
-    # silently drop `#`/`*`/`_` and collapse "job_####" to just "job".
-    pat = _compile_name_pattern(term)
-    out = []
-    if pat is not None:
-        try:
-            for dp, dn, fn in _os.walk(str(in_dir)):
-                dn[:] = [d for d in dn if d not in skip and not d.startswith(".")]
-                for f in fn:
-                    if f.startswith("."):
-                        continue
-                    if _name_matches_pattern(pat, f):
-                        out.append((_os.path.join(dp, f), "pattern match"))
-                        if len(out) >= limit:
-                            return out
-        except Exception:
-            pass
-        return out
-    words = [w for w in _re.findall(r"[a-z0-9]+", (term or "").lower())
-             if len(w) > 0]
-    if not words:
-        return []
-    try:
-        for dp, dn, fn in _os.walk(str(in_dir)):
-            dn[:] = [d for d in dn if d not in skip and not d.startswith(".")]
-            for f in fn:
-                if f.startswith("."):
-                    continue
-                full = _os.path.join(dp, f)
-                full_lc = full.lower()   # lower once per file, not per word
-                if all(w in full_lc for w in words):
-                    out.append((full, "name match"))
-                    if len(out) >= limit:
-                        return out
-    except Exception:
-        pass
-    return out
+# Moved to council_core.vault_search so the Qt tab searches the same way.
+# The private names stay: other call sites and the smoke suite use them.
+from council_core.vault_search import (           # noqa: E402
+    search_vault_filenames as _search_vault_filenames,
+)
 
 
 def _coach_for_error(msg: str):
@@ -12807,7 +12726,12 @@ class CouncilConsole(tk.Tk):
     def _vmgr_instant_search(self):
         """Find vault files by NAME or CONTENT (indexed values / column names),
         instantly and with no model. Pops a clickable results list whose items
-        preview on double-click."""
+        preview on double-click.
+
+        The searching itself is council_core.vault_search, so the Qt tab
+        answers the same term the same way.
+        """
+        from council_core import vault_search
         term = (self._vmgr_search_var.get() or "").strip()
         if not term:
             return
@@ -12815,41 +12739,9 @@ class CouncilConsole(tk.Tk):
             in_dir = data_index.input_dir(VAULT_DIR)
         except Exception:
             in_dir = VAULT_DIR
-        results = []   # (path, reason)
-        seen = set()
-
-        def _add(path, reason):
-            try:
-                key = str(Path(path).resolve()).lower()
-            except Exception:
-                key = str(path).lower()
-            if key not in seen:
-                seen.add(key)
-                results.append((str(path), reason))
-
-        # 1) filename / path matches (no index needed)
-        for full, reason in _search_vault_filenames(in_dir, term):
-            _add(full, reason)
-        # 2) content matches via the data index (best-effort; refresh lazily)
-        try:
-            self.data_index.refresh()
-            for h in (self.data_index.search_value(term, max_per_file=1) or []):
-                name = h.get("file") if isinstance(h, dict) else None
-                if name:
-                    hit = in_dir / name
-                    _add(hit if hit.exists() else name,
-                         f"contains “{term}”")
-        except Exception:
-            pass
-        try:
-            for prof, exact in (self.data_index.find_files_with_column(term)
-                                or []):
-                hit = in_dir / prof.name
-                _add(hit if hit.exists() else prof.name, f"column “{exact}”")
-        except Exception:
-            pass
-
-        self._show_file_results(f"Find: {term}", results)
+        result = vault_search.search_vault(term, in_dir,
+                                           index=getattr(self, "data_index", None))
+        self._show_file_results(f"Find: {term}", result.hits)
 
     def _show_file_results(self, title, results):
         """A clickable results list of (path, reason). Double-click or Preview
