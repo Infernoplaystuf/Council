@@ -229,10 +229,52 @@ class VaultActions:
     def build_embeddings(self):                     self._later("Embeddings")
     def convert_mongo(self, path, csv, schema, text, scan_all=False):
         self._later("Mongo conversion")
-    def build_stats(self):                          self._later("Data stats")
-    def deferred(self):                             self._later("Deferred tasks")
-    def collections(self):                          self._later("Collections")
-    def delete(self, path):                         self._later("Delete item")
+    def build_stats(self):
+        # The only one still behind the line: the shell's _build_stats_index
+        # reaches into CouncilConsole's own caches, so the operation cannot be
+        # called from here until that is extracted too.
+        self._later("Data stats")
+
+    # -- extracted: the store-backed data ---------------------------------
+    def pending_tasks(self):
+        from council_core import vault_data
+        return vault_data.pending_tasks(self.vault_dir)
+
+    def set_task_status(self, task_id, status):
+        from council_core import vault_data
+        return vault_data.set_task_status(self.vault_dir, task_id, status)
+
+    def all_collections(self):
+        from council_core import vault_data
+        return vault_data.all_collections(self.vault_dir)
+
+    def delete_collection(self, name):
+        from council_core import vault_data
+        return vault_data.delete_collection(self.vault_dir, name)
+
+    def delete(self, path):
+        from council_core import vault_data
+        return vault_data.delete_path(path, self.vault_dir)
+
+    def read_misses(self):
+        from council_core import vault_data
+        return vault_data.read_misses(self.vault_dir)
+
+    def clear_misses(self):
+        from council_core import vault_data
+        return vault_data.clear_misses(self.vault_dir)
+
+    def convert_mongo(self, selected, csv, schema, text, scan_all=False,
+                      on_progress=None):
+        from council_core import vault_data
+        out_root = self.vault_dir / "data_in" / "converted_mongo"
+        if scan_all:
+            files = vault_data.find_mongo_files(self.input_dir(), out_root)
+        else:
+            files = [Path(str(selected).strip())]
+        return vault_data.convert_mongo(files, out_root, want_csv=csv,
+                                        want_schema=schema, want_text=text,
+                                        on_progress=on_progress)
 
 
 class VaultTab(QWidget):
@@ -247,6 +289,8 @@ class VaultTab(QWidget):
         self._tokens = theme.tokens("dark")
         self._build()
         self.refresh_tree()
+        self.on_refresh_deferred()
+        self.on_refresh_collections()
 
     # ---------------------------------------------------------------- build
     def _build(self) -> None:
@@ -906,12 +950,6 @@ class VaultTab(QWidget):
 
         threading.Thread(target=work, name="vault-index", daemon=True).start()
 
-    def on_convert_mongo(self, scan_all: bool = False) -> None:
-        self._run("Convert Mongo", lambda: self.actions.convert_mongo(
-            self.mongo_edit.text(), self.mongo_csv.isChecked(),
-            self.mongo_schema.isChecked(), self.mongo_text.isChecked(),
-            scan_all=scan_all))
-
     def on_open_converted(self) -> None:
         self._run("Open output", lambda: self.actions.open_folder(
             self.actions.vault_dir / "data_in" / "converted_mongo"))
@@ -919,26 +957,125 @@ class VaultTab(QWidget):
     def on_build_stats(self) -> None:
         self._run("Data stats", self.actions.build_stats)
 
+    # -- deferred tasks ---------------------------------------------------
     def on_refresh_deferred(self) -> None:
-        self._run("Deferred tasks", self.actions.deferred)
+        result = self.actions.pending_tasks()
+        self.defer_status.setText(result.message)
+        if not result.ok:
+            return
+        self.defer_tree.clear()
+        self._defer_ids = []
+        for row, task_id in zip(result.rows, result.ids):
+            QTreeWidgetItem(self.defer_tree, list(row))
+            self._defer_ids.append(task_id)
 
-    def on_run_deferred(self) -> None:
-        self._run("Run deferred", self.actions.deferred)
+    def _selected_task(self):
+        index = self.defer_tree.indexOfTopLevelItem(self.defer_tree.currentItem())
+        ids = getattr(self, "_defer_ids", [])
+        return ids[index] if 0 <= index < len(ids) else None
 
     def on_set_deferred(self, state: str) -> None:
-        self._run(f"Mark {state}", self.actions.deferred)
+        result = self.actions.set_task_status(self._selected_task(), state)
+        self.defer_status.setText(result.message)
+        if result.ok:
+            self.on_refresh_deferred()
 
-    def on_new_collection(self, edit: bool = False) -> None:
-        self._run("Collections", self.actions.collections)
+    def on_run_deferred(self) -> None:
+        """Running a deferred task drives the Council's analyst pipeline, which
+        is 127 lines of model calls and transcript writes on the Tk shell. It
+        is the one Vault action whose logic is not extractable without the
+        Council tab, so it waits for that phase."""
+        self.defer_status.setText(
+            "Running a deferred task needs the Council tab, which is not ported "
+            "yet — see docs/qt_full_port_scope.md.")
 
-    def on_summarize_collection(self) -> None:
-        self._run("Summarize collection", self.actions.collections)
+    # -- collections ------------------------------------------------------
+    def on_refresh_collections(self) -> None:
+        result = self.actions.all_collections()
+        if not result.ok:
+            self.append(result.message, "err")
+            return
+        self.coll_tree.clear()
+        self._coll_names = []
+        for row, name in zip(result.rows, result.ids):
+            QTreeWidgetItem(self.coll_tree, list(row))
+            self._coll_names.append(name)
+
+    def _selected_collection(self):
+        index = self.coll_tree.indexOfTopLevelItem(self.coll_tree.currentItem())
+        names = getattr(self, "_coll_names", [])
+        return names[index] if 0 <= index < len(names) else None
 
     def on_delete_collection(self) -> None:
-        self._run("Delete collection", self.actions.collections)
+        from council_core import vault_data
 
+        from .. import dialogs
+        name = self._selected_collection()
+        if not name:
+            self.append("Select a collection first.", "err")
+            return
+        if not dialogs.askyesno("Delete collection",
+                                vault_data.confirm_delete_collection(name),
+                                parent=self):
+            return
+        result = self.actions.delete_collection(name)
+        self.append(result.message, "ok" if result.ok else "err")
+        if result.ok:
+            self.on_refresh_collections()
+
+    def on_new_collection(self, edit: bool = False) -> None:
+        """Building a collection asks the council to propose members, so it
+        needs the model plumbing the Council tab owns."""
+        self.append("Creating a collection needs the Council tab, which is not "
+                    "ported yet — see docs/qt_full_port_scope.md.", "err")
+
+    def on_summarize_collection(self) -> None:
+        self.append("Summarising a collection needs the Council tab, which is "
+                    "not ported yet — see docs/qt_full_port_scope.md.", "err")
+
+    # -- RAG misses -------------------------------------------------------
     def on_rag_misses(self) -> None:
-        self._run("RAG misses", lambda: self.actions._later("RAG misses"))
+        """What the vault does not cover. Shown in the preview pane rather than
+        a popup: it is a list to read against the tree, not a modal."""
+        result = self.actions.read_misses()
+        if not result.ok:
+            self.append(result.message, "err")
+            return
+        lines = [result.message, ""]
+        lines += [f"{stamp}  {query}" for stamp, query in result.rows]
+        self.preview.setPlainText("\n".join(lines))
+        self.append(f"RAG misses: {len(result.rows)} recorded")
+
+    # -- Mongo conversion -------------------------------------------------
+    def on_convert_mongo(self, scan_all: bool = False) -> None:
+        from council_core import vault_data
+        problem = vault_data.check_mongo_request(
+            self.mongo_edit.text(), self.mongo_csv.isChecked(),
+            self.mongo_schema.isChecked(), self.mongo_text.isChecked(),
+            scan_all)
+        if problem:
+            self.mongo_status.setText(problem)
+            return
+        self.mongo_status.setText("Converting…")
+
+        def work() -> None:
+            def on_progress(done, total, name):
+                line = vault_data.converting_line(done, total, name)
+                self._to_ui(lambda: self.mongo_status.setText(line))
+
+            result = self.actions.convert_mongo(
+                self.mongo_edit.text(), self.mongo_csv.isChecked(),
+                self.mongo_schema.isChecked(), self.mongo_text.isChecked(),
+                scan_all=scan_all, on_progress=on_progress)
+            self._to_ui(lambda: self._finish_mongo(result))
+
+        threading.Thread(target=work, name="mongo-convert", daemon=True).start()
+
+    def _finish_mongo(self, result) -> None:
+        self.mongo_status.setText(result.message)
+        self.append(result.message, "ok" if result.ok else "err")
+        if result.ok:
+            self.refresh_tree()
 
 
 def _default_vault_dir() -> Path:

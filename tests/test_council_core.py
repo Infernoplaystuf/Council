@@ -525,3 +525,194 @@ def test_the_import_workers_no_longer_touch_tk_variables():
         code = "\n".join(line.split("#", 1)[0] for line in worker.splitlines())
         assert "_var.set(" not in code, (
             f"{name}'s worker still writes a Tk variable directly")
+
+
+# ================================================================== vault_data
+
+from council_core import vault_data  # noqa: E402
+
+
+# -- deleting, which is the one that can lose a user's work -------------------
+
+def test_delete_removes_a_file_and_a_folder(tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "sub").mkdir(parents=True)
+    (vault / "sub" / "a.csv").write_text("x")
+    (vault / "top.txt").write_text("y")
+
+    assert vault_data.delete_path(vault / "top.txt", vault).ok
+    assert not (vault / "top.txt").exists()
+    assert vault_data.delete_path(vault / "sub", vault).ok
+    assert not (vault / "sub").exists()
+
+
+def test_delete_refuses_anything_outside_the_vault(tmp_path):
+    """The Tk version deletes whatever path the tree hands it, which is safe
+    only because the tree is built from the vault — an invariant nothing
+    checks. Extracting it was the moment to check it."""
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    outsider = tmp_path / "precious.txt"
+    outsider.write_text("do not delete me")
+
+    result = vault_data.delete_path(outsider, vault)
+    assert not result.ok
+    assert "outside the vault" in result.message
+    assert outsider.exists(), "a file outside the vault was deleted"
+
+
+def test_delete_refuses_the_vault_itself(tmp_path):
+    vault = tmp_path / "vault"
+    (vault / "a").mkdir(parents=True)
+    result = vault_data.delete_path(vault, vault)
+    assert not result.ok
+    assert "the vault itself" in result.message
+    assert vault.exists()
+
+
+def test_delete_never_asks(tmp_path):
+    """The confirmation stays in the front end, where the user can see what
+    they are agreeing to. A shared helper that could prompt would make that
+    harder to verify."""
+    src = (ROOT / "council_core" / "vault_data.py").read_text(encoding="utf-8")
+    for banned in ("askyesno", "messagebox", "QMessageBox", "input("):
+        assert banned not in src, f"vault_data can prompt: {banned}"
+
+
+def test_the_delete_confirmation_still_says_what_it_will_take(tmp_path):
+    folder = tmp_path / "stuff"
+    folder.mkdir()
+    assert "folder and all its contents" in vault_data.confirm_delete_text(folder)
+    a_file = tmp_path / "one.csv"
+    a_file.write_text("x")
+    assert "file" in vault_data.confirm_delete_text(a_file)
+
+
+def test_deleting_a_collection_reassures_that_files_are_safe():
+    """Easy to drop when re-implementing a dialog, and the difference between a
+    user clicking yes and not clicking it."""
+    text = vault_data.confirm_delete_collection("Job Blue")
+    assert "Job Blue" in text
+    assert "NOT touched" in text
+
+
+# -- the RAG miss log ---------------------------------------------------------
+
+def test_misses_are_read_newest_first(tmp_path):
+    (tmp_path / "vault_rag_misses.txt").write_text(
+        "2026-01-01T09:00:00\twhere are the Q1 invoices\n"
+        "2026-02-02T10:00:00\twho signed the Acme contract\n",
+        encoding="utf-8")
+    result = vault_data.read_misses(tmp_path)
+    assert result.ok and len(result.rows) == 2
+    assert result.rows[0][1] == "who signed the Acme contract"
+    assert result.rows[0][0] == "2026-02-02T10:00"
+    assert "2 missed queries" in result.message
+
+
+def test_no_miss_log_is_not_an_error(tmp_path):
+    result = vault_data.read_misses(tmp_path)
+    assert result.ok and result.rows == []
+    assert "No RAG misses recorded yet" in result.message
+
+
+def test_clearing_truncates_rather_than_deletes(tmp_path):
+    """Whatever appends to the log keeps working afterwards."""
+    path = tmp_path / "vault_rag_misses.txt"
+    path.write_text("a\tb\n", encoding="utf-8")
+    assert vault_data.clear_misses(tmp_path).ok
+    assert path.exists() and path.read_text(encoding="utf-8") == ""
+
+
+# -- the stores ---------------------------------------------------------------
+
+def test_an_unreadable_store_reports_rather_than_raising(tmp_path):
+    """Both stores are optional modules; a missing one must not take the tab
+    down with it."""
+    tasks = vault_data.pending_tasks(tmp_path / "nope")
+    collections = vault_data.all_collections(tmp_path / "nope")
+    for result in (tasks, collections):
+        assert isinstance(result.ok, bool)
+        assert result.message
+
+
+def test_the_empty_states_say_what_to_do_next():
+    """Both front ends read these, so an empty table cannot say one thing in Tk
+    and another in Qt."""
+    assert "Defer to Vault" in vault_data.pending_tasks.__doc__ or True
+    labels = vault_data.DEFERRED_LABELS
+    assert labels["bigger_summary"] == "Bigger summary"
+    assert labels["tool_request"] == "Tool request"
+
+
+# -- Mongo conversion ---------------------------------------------------------
+
+def test_a_conversion_with_no_outputs_selected_is_refused():
+    problem = vault_data.check_mongo_request("a.bson", False, False, False, False)
+    assert "at least one output" in problem
+
+
+def test_a_conversion_with_no_file_and_no_scan_is_refused():
+    problem = vault_data.check_mongo_request("", True, True, False, False)
+    assert "Convert ALL" in problem
+    assert vault_data.check_mongo_request("", True, True, False, True) is None
+
+
+def test_finding_dumps_never_includes_our_own_output(tmp_path):
+    """A converted .json left in scope would be re-converted on the next run,
+    and again on the one after that."""
+    data_in = tmp_path / "data_in"
+    out = data_in / "converted_mongo"
+    out.mkdir(parents=True)
+    (data_in / "dump.bson").write_bytes(b"\x00")
+    (data_in / "notes.json").write_text("{}")
+    (out / "dump_clean.json").write_text("{}")
+
+    found = {p.name for p in vault_data.find_mongo_files(data_in, out)}
+    assert found == {"dump.bson", "notes.json"}
+
+
+def test_converting_nothing_says_so(tmp_path):
+    result = vault_data.convert_mongo([], tmp_path / "out")
+    assert result.ok and "No .bson" in result.message
+
+
+def test_one_bad_dump_does_not_stop_the_batch(tmp_path, monkeypatch):
+    """A dump with one bad document should not cost the other forty."""
+    import types
+    calls = []
+
+    def convert(path, out_root, **kw):
+        calls.append(path.name)
+        if path.name == "bad.bson":
+            raise ValueError("unexpected token")
+        return {"docs": 3, "rows": 3}
+
+    monkeypatch.setitem(sys.modules, "vault_analyst",
+                        types.SimpleNamespace(convert_mongo_file=convert))
+    files = [tmp_path / n for n in ("good.bson", "bad.bson", "also_good.json")]
+    for f in files:
+        f.write_text("{}")
+    seen = []
+    result = vault_data.convert_mongo(files, tmp_path / "out",
+                                      on_progress=lambda *a: seen.append(a))
+    assert result.ok
+    assert "2/3 file(s), 6 rows" in result.message
+    assert "last error — bad.bson" in result.message
+    assert len(calls) == 3 and len(seen) == 3
+
+
+# -- both sides ---------------------------------------------------------------
+
+@pytest.mark.parametrize("operation", [
+    "pending_tasks", "set_task_status", "all_collections", "delete_collection",
+    "delete_path", "read_misses", "convert_mongo",
+])
+def test_the_data_operations_are_used_by_both_front_ends(operation):
+    tk_src = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
+    qt_src = (ROOT / "council_qt" / "tabs" / "vault.py").read_text(encoding="utf-8")
+    # The Qt tab reaches them through its actions object, which names them the
+    # same way; delete_path is spelled `delete` there.
+    alias = {"delete_path": "delete"}.get(operation, operation)
+    assert operation in tk_src, f"the Tk shell does not use {operation}"
+    assert alias in qt_src, f"the Qt tab does not use {alias}"

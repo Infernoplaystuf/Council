@@ -16082,44 +16082,39 @@ class CouncilConsole(tk.Tk):
         self._vmgr_log.configure(state="disabled")
 
     def _show_rag_misses(self):
-        """Popup: vault_rag_misses.txt — queries that found no vault context."""
-        miss_path = VAULT_DIR / "vault_rag_misses.txt"
+        """Popup: vault_rag_misses.txt — queries that found no vault context.
+
+        The reading lives in council_core.vault_data so the Qt tab shows the
+        same queries, in the same order, under the same sentence.
+        """
+        from council_core import vault_data
+        result = vault_data.read_misses(VAULT_DIR)
         win = tk.Toplevel(self)
         win.title("RAG Miss Log — Vault Gaps")
         win.configure(bg="#1a1414")
         win.geometry("740x420")
-        if not miss_path.exists():
-            ttk.Label(win, text="No RAG misses recorded yet.\n"
-                           "Misses are logged when RAG finds no relevant vault context.",
-                      wraplength=600).pack(padx=20, pady=20)
+        if not result.rows:
+            ttk.Label(win, text=result.message, wraplength=600).pack(
+                padx=20, pady=20)
             return
-        try:
-            lines = miss_path.read_text(encoding="utf-8").splitlines()
-        except Exception as e:
-            ttk.Label(win, text="Error reading miss log: " + str(e)).pack(padx=20, pady=20)
-            return
-        ttk.Label(win,
-                  text=str(len(lines)) + " missed queries — these topics are not covered by your vault.",
-                  foreground="#f38ba8").pack(anchor="w", padx=10, pady=(8, 2))
+        ttk.Label(win, text=result.message, foreground="#f38ba8").pack(
+            anchor="w", padx=10, pady=(8, 2))
         ttk.Separator(win, orient="horizontal").pack(fill="x", padx=10, pady=4)
         box = self._make_text(win, height=18, wrap="word", state="normal")
         box.pack(fill="both", expand=True, padx=10, pady=(0, 4))
-        for ln in reversed(lines):
-            parts = ln.split("\t", 1)
-            ts    = parts[0] if len(parts) > 0 else ""
-            query = parts[1] if len(parts) > 1 else ln
-            box.insert("end", ts[:16] + "  ", "dim")
+        for stamp, query in result.rows:
+            box.insert("end", stamp + "  ", "dim")
             box.insert("end", query + "\n")
         box.tag_configure("dim", foreground="#6c7086")
         box.configure(state="disabled")
+
         def _clear():
-            try:
-                miss_path.write_text("", encoding="utf-8")
-                box.configure(state="normal")
-                box.delete("1.0", "end")
-                box.configure(state="disabled")
-            except Exception:
-                pass
+            if not vault_data.clear_misses(VAULT_DIR).ok:
+                return
+            box.configure(state="normal")
+            box.delete("1.0", "end")
+            box.configure(state="disabled")
+
         ttk.Button(win, text="Clear Miss Log", command=_clear).pack(
             anchor="e", padx=10, pady=(0, 8))
 
@@ -16205,22 +16200,22 @@ class CouncilConsole(tk.Tk):
 
     def _vmgr_delete(self):
         import tkinter.messagebox as mb
+
+        from council_core import vault_data
+
         sel = self._vmgr_tree.selection()
         if not sel:
             return
         p = Path(sel[0])
-        what = "folder and all its contents" if p.is_dir() else "file"
-        if mb.askyesno("Confirm Delete", f"Delete {what}:\n{p.name}?"):
-            try:
-                import shutil
-                if p.is_dir():
-                    shutil.rmtree(p)
-                else:
-                    p.unlink()
-                self._vmgr_append(f"✓ Deleted: {p.name}")
-                self._vmgr_refresh_tree()
-            except Exception as e:
-                self._vmgr_append(f"✗ Delete failed: {e}")
+        if not mb.askyesno("Confirm Delete", vault_data.confirm_delete_text(p)):
+            return
+        # The confirmation stays HERE, where the user can see what they are
+        # agreeing to; delete_path never asks, and refuses anything outside the
+        # vault, which this tree could not previously guarantee on its own.
+        result = vault_data.delete_path(p, VAULT_DIR)
+        self._vmgr_append(result.message)
+        if result.ok:
+            self._vmgr_refresh_tree()
 
     def _vmgr_copy_path(self):
         sel = self._vmgr_tree.selection()
@@ -16419,30 +16414,19 @@ class CouncilConsole(tk.Tk):
     # ── Deferred tasks (sent from the Council tab) ──────────────
     def _vmgr_refresh_deferred(self):
         """Reload the pending deferred tasks into the Vault-tab table."""
+        from council_core import vault_data
+
         tree = getattr(self, "_defer_tree", None)
         if tree is None:
             return
-        try:
-            import deferred_tasks as _dt
-            pend = _dt.DeferredTaskStore(VAULT_DIR).pending()
-        except Exception as exc:
-            self._defer_status.set(f"Could not load tasks: {exc!r}")
+        result = vault_data.pending_tasks(VAULT_DIR)
+        self._defer_status.set(result.message)
+        if not result.ok:
             return
         tree.delete(*tree.get_children())
         self._defer_ids = {}
-        _labels = {
-            "bigger_summary": "Bigger summary",
-            "deeper_stats": "Deeper stats",
-            "tool_request": "Tool request",
-            "other": "Other",
-        }
-        for t in pend:
-            iid = tree.insert("", "end",
-                              values=(_labels.get(t.kind, t.kind), t.label()))
-            self._defer_ids[iid] = t.id
-        self._defer_status.set(
-            f"{len(pend)} pending task(s)." if pend
-            else "No pending tasks. Send some from the Council tab (⤓ Defer to Vault).")
+        for row, task_id in zip(result.rows, result.ids):
+            self._defer_ids[tree.insert("", "end", values=row)] = task_id
 
     def _vmgr_selected_deferred(self):
         sel = self._defer_tree.selection()
@@ -16452,18 +16436,14 @@ class CouncilConsole(tk.Tk):
         return self._defer_ids.get(sel[0])
 
     def _vmgr_set_deferred(self, status: str):
+        from council_core import vault_data
+
         tid = self._vmgr_selected_deferred()
         if not tid:
             return
-        try:
-            import deferred_tasks as _dt
-            store = _dt.DeferredTaskStore(VAULT_DIR)
-            if status == "done":
-                store.mark_done(tid)
-            else:
-                store.dismiss(tid)
-        except Exception as exc:
-            self._defer_status.set(f"Update failed: {exc!r}")
+        result = vault_data.set_task_status(VAULT_DIR, tid, status)
+        if not result.ok:
+            self._defer_status.set(result.message)
             return
         self._vmgr_refresh_deferred()
 
@@ -16597,23 +16577,19 @@ class CouncilConsole(tk.Tk):
 
     # ── Collections (virtual projects over the vault) ───────────
     def _vmgr_refresh_collections(self):
+        from council_core import vault_data
+
         tree = getattr(self, "_coll_tree", None)
         if tree is None:
             return
-        try:
-            import vault_collections as _vc
-            cols = _vc.CollectionStore(VAULT_DIR).all()
-        except Exception as exc:
-            self._coll_status.set(f"Could not load collections: {exc!r}")
+        result = vault_data.all_collections(VAULT_DIR)
+        self._coll_status.set(result.message)
+        if not result.ok:
             return
         tree.delete(*tree.get_children())
         self._coll_names = {}
-        for c in sorted(cols, key=lambda c: c.name.lower()):
-            iid = tree.insert("", "end", values=(c.name, len(c.files)))
-            self._coll_names[iid] = c.name
-        self._coll_status.set(
-            f"{len(cols)} collection(s)." if cols else
-            "No collections yet. ➕ New… groups files into a project.")
+        for row, name in zip(result.rows, result.ids):
+            self._coll_names[tree.insert("", "end", values=row)] = name
 
     def _vmgr_selected_collection(self):
         sel = self._coll_tree.selection()
@@ -16624,19 +16600,18 @@ class CouncilConsole(tk.Tk):
 
     def _vmgr_delete_collection(self):
         from tkinter import messagebox
+
+        from council_core import vault_data
+
         name = self._vmgr_selected_collection()
         if not name:
             return
-        if not messagebox.askyesno(
-                "Delete collection",
-                f"Delete the collection “{name}”?\n(The files themselves are "
-                "NOT touched — this only removes the grouping.)"):
+        if not messagebox.askyesno("Delete collection",
+                                   vault_data.confirm_delete_collection(name)):
             return
-        try:
-            import vault_collections as _vc
-            _vc.CollectionStore(VAULT_DIR).delete(name)
-        except Exception as exc:
-            self._coll_status.set(f"Delete failed: {exc!r}")
+        result = vault_data.delete_collection(VAULT_DIR, name)
+        if not result.ok:
+            self._coll_status.set(result.message)
             return
         self._vmgr_refresh_collections()
 
@@ -16866,58 +16841,26 @@ class CouncilConsole(tk.Tk):
             return
         self._mongo_status_var.set("Converting…")
 
+        from council_core import vault_data
+
         def _worker():
-            try:
-                import vault_analyst as _va
-                out_root = self._converted_mongo_dir()
-                out_root.mkdir(parents=True, exist_ok=True)
+            out_root = self._converted_mongo_dir()
+            if scan_all:
+                files = vault_data.find_mongo_files(
+                    data_index.input_dir(VAULT_DIR), out_root)
+            else:
+                files = [Path(sel)]
 
-                if scan_all:
-                    in_dir = data_index.input_dir(VAULT_DIR)
-                    files = []
-                    for ext in ("*.bson", "*.json", "*.jsonl"):
-                        files += list(in_dir.rglob(ext))
-                    # Never re-convert our own outputs.
-                    files = [f for f in files
-                             if out_root not in f.parents and f.parent != out_root]
-                else:
-                    files = [Path(sel)]
+            def _progress(done, total, name):
+                line = vault_data.converting_line(done, total, name)
+                self.after(0, lambda: self._mongo_status_var.set(line))
 
-                if not files:
-                    self.after(0, lambda: self._mongo_status_var.set(
-                        "No .bson/.json/.jsonl files found in the vault."))
-                    return
-
-                done = ok = total_rows = 0
-                last_err = ""
-                for fp in files:
-                    try:
-                        # Streaming, bounded-memory conversion — never loads
-                        # the whole dump (that OOM-crashed the app on Linux).
-                        summary = _va.convert_mongo_file(
-                            fp, out_root,
-                            want_csv=want_csv, want_schema=want_schema,
-                            want_text=want_text)
-                        if summary.get("docs"):
-                            total_rows += summary.get("rows", 0)
-                            ok += 1
-                    except Exception as fe:
-                        last_err = f"{fp.name}: {fe!r}"
-                    done += 1
-                    self.after(0, lambda d=done, t=len(files), n=fp.name:
-                               self._mongo_status_var.set(
-                                   f"Converting {d}/{t} — {n[:40]}"))
-
-                tail = f"  (last error — {last_err})" if last_err else ""
-                self.after(0, lambda: self._mongo_status_var.set(
-                    f"Done — {ok}/{len(files)} file(s), {total_rows} rows → "
-                    f"data_in/converted_mongo/.{tail}  "
-                    "Run “1. Build Keyword Index” to make it searchable."))
-                # Refresh the tree so the new files show up.
+            result = vault_data.convert_mongo(
+                files, out_root, want_csv=want_csv, want_schema=want_schema,
+                want_text=want_text, on_progress=_progress)
+            self.after(0, lambda: self._mongo_status_var.set(result.message))
+            if result.ok:
                 self.after(0, self._vmgr_refresh_tree)
-            except Exception as exc:
-                self.after(0, lambda exc=exc: self._mongo_status_var.set(
-                    f"Convert failed: {exc!r}"))
 
         _th.Thread(target=_worker, daemon=True).start()
 
