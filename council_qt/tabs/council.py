@@ -63,17 +63,8 @@ from council_core import council_options
 from council_core import transcript as transcript_core
 
 from .. import theme
+from ..view import ViewHelpers, amp
 from ..widgets.transcript import StreamView, TranscriptView
-
-
-def amp(text: str) -> str:
-    """Escape & so Qt shows it instead of eating it as a mnemonic.
-
-    Same rule as the Vault tab: Qt reads & in any caption as "underline the
-    next letter" and Tk does not, so every caption carried across is a
-    candidate and the failure is silent.
-    """
-    return text.replace("&", "&&")
 
 
 #: Every field a turn sets. `reset_turn()` clears exactly these, and a test
@@ -222,7 +213,7 @@ class CouncilActions:
             "recording a verdict response needs the verdict store extracted")
 
 
-class CouncilTab(QWidget):
+class CouncilTab(ViewHelpers, QWidget):
     """The transcript, the judge panel, the stream, and the input bar."""
 
     def __init__(self, window=None, actions: Optional[CouncilActions] = None,
@@ -487,23 +478,6 @@ class CouncilTab(QWidget):
         return row
 
     # -- small helpers ---------------------------------------------------
-    def _button(self, layout, text: str, slot: Callable) -> QPushButton:
-        button = QPushButton(text)
-        button.clicked.connect(slot)
-        layout.addWidget(button)
-        return button
-
-    def _shortcut(self, keys: str, slot: Callable, parent: QWidget) -> None:
-        shortcut = QShortcut(QKeySequence(keys), parent)
-        shortcut.activated.connect(slot)
-
-    def _to_ui(self, fn: Callable) -> None:
-        """Hand a worker's result back to the GUI thread."""
-        if self.bridge is not None:
-            self.bridge.call_on_ui(fn)
-        else:
-            fn()
-
     # ==================================================================
     # The turn
     # ==================================================================

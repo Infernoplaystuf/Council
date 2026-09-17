@@ -30,7 +30,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6", reason="the Qt shell needs PySide6 installed")
 
 from PySide6.QtCore import QTimer  # noqa: E402
-from PySide6.QtWidgets import QApplication, QLabel, QWidget  # noqa: E402
+from PySide6.QtWidgets import (QApplication, QLabel,  # noqa: E402
+                               QVBoxLayout, QWidget)
 
 from council_qt import theme  # noqa: E402
 from council_qt.bridge import UiBridge  # noqa: E402
@@ -942,3 +943,95 @@ def test_the_close_work_is_shared_with_the_tk_shell():
     for name in ("council_qt.py", "council_gui_engine.py"):
         source = (root / name).read_text(encoding="utf-8")
         assert "close_session(" in source, f"{name} does not use it"
+
+
+# ============================================================
+# The shared view helpers
+# ============================================================
+
+def test_only_one_definition_of_each_shared_helper():
+    """Three views in, amp() was defined twice, _button twice and _to_ui
+    THREE times. Phases 7, 8 and 10 add roughly a dozen more views, and the
+    one that was already at three copies is the thread hop.
+
+    A view whose _to_ui quietly differs is a view where a worker touches a
+    widget — which Qt does not warn about and which fails on someone else's
+    machine weeks later."""
+    import ast
+    root = Path(__file__).resolve().parent.parent / "council_qt"
+    counts = {}
+    for path in root.rglob("*.py"):
+        if path.name == "view.py":
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.FunctionDef) and node.name in (
+                    "amp", "_button", "_to_ui", "_shortcut"):
+                counts.setdefault(node.name, []).append(
+                    f"{path.name}:{node.lineno}")
+    assert not counts, (
+        f"these are defined outside council_qt/view.py: {counts}")
+
+
+def test_the_shared_amp_keeps_the_safer_of_the_two_it_replaced(qapp):
+    """The two copies had ALREADY diverged: the Vault tab's coerced with
+    str(), the Council tab's did not — so a caption that was not a string
+    crashed in one tab and not the other. Found while deduplicating them,
+    which is the argument for having done it."""
+    from council_qt.view import amp
+    assert amp("Index & Vectorize") == "Index && Vectorize"
+    assert amp(42) == "42", "a non-string caption is no longer coerced"
+
+
+def test_a_dialog_with_no_bridge_of_its_own_finds_its_parents(qapp):
+    """A dialog opened from a tab has no bridge. Giving it one would mean
+    remembering to pass it at every call site, which is how the third copy of
+    _to_ui came to exist in the first place."""
+    from council_qt.view import ViewHelpers
+
+    class FakeBridge:
+        def __init__(self):
+            self.ran = []
+
+        def call_on_ui(self, fn, *a, **kw):
+            self.ran.append(fn)
+            fn(*a, **kw)
+
+    class Holder(QWidget):
+        pass
+
+    class Child(ViewHelpers, QWidget):
+        pass
+
+    parent = Holder()
+    parent.bridge = FakeBridge()
+    child = Child(parent)
+
+    done = []
+    child._to_ui(lambda: done.append(1))
+    assert done == [1]
+    assert parent.bridge.ran, "the dialog did not find its parent's bridge"
+
+
+def test_no_bridge_anywhere_still_runs_the_callback(qapp):
+    """How the views behave under test and when hosted outside CouncilWindow.
+    Safe only because those callers are already on the GUI thread."""
+    from council_qt.view import ViewHelpers
+
+    class Orphan(ViewHelpers, QWidget):
+        pass
+
+    done = []
+    Orphan()._to_ui(lambda: done.append(1))
+    assert done == [1]
+
+
+def test_a_button_built_through_the_helper_is_escaped(qapp):
+    from council_qt.view import ViewHelpers
+
+    class View(ViewHelpers, QWidget):
+        pass
+
+    view = View()
+    layout = QVBoxLayout(view)
+    button = view._button(layout, "Find & Chart", lambda: None)
+    assert button.text() == "Find && Chart"

@@ -21,13 +21,15 @@ import threading
 from typing import List, Optional
 
 from PySide6.QtCore import Qt
+
+from ..view import ViewHelpers
 from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDialog,
                                QDialogButtonBox, QGridLayout, QHBoxLayout,
                                QLabel, QLineEdit, QListWidget,
                                QListWidgetItem, QPushButton, QVBoxLayout)
 
 
-class CollectionDialog(QDialog):
+class CollectionDialog(ViewHelpers, QDialog):
     """Name a collection, choose its files, save it."""
 
     def __init__(self, actions, existing: Optional[str] = None, parent=None):
@@ -148,20 +150,6 @@ class CollectionDialog(QDialog):
 
         threading.Thread(target=work, name="collection-discover",
                          daemon=True).start()
-
-    def _to_ui(self, fn) -> None:
-        """Hand a worker's result back to the GUI thread.
-
-        Through the parent tab's bridge when there is one, exactly as the tab
-        itself does — a worker touching a widget is undefined behaviour in Qt
-        and Qt will not warn.
-        """
-        parent = self.parent()
-        bridge = getattr(parent, "bridge", None)
-        if bridge is not None:
-            bridge.call_on_ui(fn)
-        else:
-            fn()
 
     # -- saving ---------------------------------------------------------
     def on_save(self) -> None:

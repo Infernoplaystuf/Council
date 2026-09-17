@@ -42,24 +42,12 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QFileDialog,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from .. import theme
+from ..view import ViewHelpers, amp
 
 #: How much of a file the preview pane reads. The Tk tab reads the head of the
 #: file too — a vault holds multi-GB CSVs and previewing one whole would hang
 #: the UI thread for minutes.
 PREVIEW_BYTES = 64_000
-
-
-def amp(text: str) -> str:
-    """Escape & so Qt shows it instead of eating it as a mnemonic.
-
-    Measured the first time this tab rendered: the group box titled
-    "Index & Vectorize" came out as "Index _Vectorize", because Qt reads & in
-    any button, label, tab or group-box title as "underline the next letter".
-    Tk has no such rule, so EVERY caption carried across from the Tk shell is a
-    candidate — and the failure is silent and cosmetic, which is how it survives
-    review.
-    """
-    return str(text).replace("&", "&&")
 
 
 def _human(size: int) -> str:
@@ -328,7 +316,7 @@ class VaultActions:
                                         on_progress=on_progress)
 
 
-class VaultTab(QWidget):
+class VaultTab(ViewHelpers, QWidget):
     """The Vault manager as a Qt widget."""
 
     def __init__(self, window, actions: Optional[VaultActions] = None,
@@ -661,12 +649,6 @@ class VaultTab(QWidget):
         return split
 
     # -- small builders ---------------------------------------------------
-    def _button(self, layout, text: str, slot: Callable) -> QPushButton:
-        button = QPushButton(text)
-        button.clicked.connect(slot)
-        layout.addWidget(button)
-        return button
-
     def _inline(self, layout, label: str, width: int) -> QLineEdit:
         layout.addWidget(QLabel(label))
         edit = QLineEdit()
@@ -808,17 +790,6 @@ class VaultTab(QWidget):
             self._to_ui(show)
 
         threading.Thread(target=work, name="vault-search", daemon=True).start()
-
-    def _to_ui(self, fn: Callable) -> None:
-        """Hand a result back to the GUI thread.
-
-        Always through the bridge when there is one: a worker touching a widget
-        is undefined behaviour in Qt exactly as it is in Tk, and Qt will not
-        warn."""
-        if self.bridge is not None:
-            self.bridge.call_on_ui(fn)
-        else:
-            fn()
 
     def on_delete(self) -> None:
         path = self.selected_path()
