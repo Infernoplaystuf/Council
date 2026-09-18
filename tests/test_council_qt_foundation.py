@@ -353,14 +353,26 @@ def test_the_standalone_host_schedules_safely_from_a_worker(qapp):
 
 
 def test_the_diagnostics_tab_builds_and_reports(qapp):
-    """The first real tab, end to end: a worker gathers, the bridge delivers."""
+    """The first real tab, end to end: a worker gathers, the bridge delivers.
+
+    The timeout is deliberately generous. This flaked twice under random test
+    ordering — `platform.platform()` and the disk probes in `_report()` are
+    not fast, and by the time this runs the session may have built and closed
+    fifty windows for the parametrised per-tab checks. A five-second budget for
+    a real worker round-trip is a race, and a flaky test in the harness is
+    worse than a slow one: it trains you to re-run rather than to look.
+    """
     from council_qt.tabs.diagnostics import build_diagnostics
     window = CouncilWindow()
     window.add_tab("Diagnostics", lambda: build_diagnostics(window), eager=True)
     page = window.tab("Diagnostics")
     from PySide6.QtWidgets import QPlainTextEdit
     output = page.findChild(QPlainTextEdit)
-    assert _pump(qapp, lambda: "python" in output.toPlainText())
+    arrived = _pump(qapp, lambda: "python" in output.toPlainText(),
+                    timeout=20.0)
+    assert arrived, (
+        "the worker's report never reached the widget; the pane holds "
+        f"{output.toPlainText()!r}")
     assert "PySide6" in output.toPlainText()
     window.request_close()
 
