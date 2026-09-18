@@ -93,6 +93,18 @@ def detect_hardware(*, force: bool = False) -> Hardware:
     not the explanation for the suite.
 
     ``force`` re-probes, for a machine where something really did change.
+
+    ONE RISK THIS MOVE INTRODUCES, RECORDED RATHER THAN CLAIMED FIXED.
+    `hardware_detect._fill_gpu` tries nvidia-smi first and falls back to
+    `import torch`. Importing heavy native extensions from a NON-MAIN thread
+    has produced a Windows access violation in this environment before — it
+    happened once during this very session, in a worker importing numpy. On
+    this machine the fallback never runs, because nvidia-smi answers, so I
+    could NOT reproduce it here: four worker-thread probes in a row succeeded.
+    On a machine without nvidia-smi the torch path would run on the worker.
+
+    `warm()` exists for that: call it once on the main thread during startup
+    and every later probe is a cache read. Phase 10 should.
     """
     global _DETECTED
     if _DETECTED is not None and not force:
@@ -106,6 +118,19 @@ def detect_hardware(*, force: bool = False) -> Hardware:
                          vram_gb=raw.get("vram_gb"), ram_gb=raw.get("ram_gb"),
                          raw=raw)
     return _DETECTED
+
+
+def warm() -> None:
+    """Probe once, from wherever it is safe to do so.
+
+    Meant for the startup chain, on the MAIN thread, so the tab's worker never
+    triggers the torch fallback — see detect_hardware for why that matters.
+    Safe to call more than once, and safe to skip entirely.
+    """
+    try:
+        detect_hardware()
+    except Exception:                                     # noqa: BLE001
+        pass
 
 
 @dataclass

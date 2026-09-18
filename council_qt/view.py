@@ -90,10 +90,43 @@ class ViewHelpers:
         thread; it is not a licence to run a view without a bridge in the app.
         """
         bridge = getattr(self, "bridge", None) or self._find_bridge()
+        guarded = self._guard(fn)
         if bridge is not None:
-            bridge.call_on_ui(fn, *args, **kwargs)
+            bridge.call_on_ui(guarded, *args, **kwargs)
         else:
-            fn(*args, **kwargs)
+            guarded(*args, **kwargs)
+
+    def _guard(self, fn: Callable) -> Callable:
+        """Wrap a callback so it does nothing once this view is gone.
+
+        A WORKER CAN OUTLIVE ITS WIDGET, and two tabs start one in their
+        CONSTRUCTOR — so a tab that is built, shown and closed inside a second
+        leaves a thread holding a closure over `self`. When that closure lands
+        and touches a QWidget whose C++ object has been destroyed, Qt does not
+        raise: it is an access violation that takes the process with it.
+
+        Observed exactly that way — an intermittent Windows access violation in
+        the per-tab harness check that builds and shows every registered tab.
+
+        `shiboken6.isValid` answers whether the C++ side is still there. When
+        it is not, the callback is dropped: a result nobody can see is not
+        worth a crash.
+        """
+        def deliver(*args, **kwargs):
+            try:
+                import shiboken6
+                if not shiboken6.isValid(self):
+                    return
+            except Exception:                             # noqa: BLE001
+                pass              # no shiboken: fall through and try anyway
+            try:
+                return fn(*args, **kwargs)
+            except RuntimeError as exc:
+                # "Internal C++ object already deleted" — the same race,
+                # caught on the Python side when Qt is kind enough to raise.
+                if "already deleted" not in str(exc):
+                    raise
+        return deliver
 
     def _find_bridge(self):
         """Walk up to a parent that has one.

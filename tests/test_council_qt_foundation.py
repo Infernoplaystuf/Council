@@ -1047,3 +1047,66 @@ def test_a_button_built_through_the_helper_is_escaped(qapp):
     layout = QVBoxLayout(view)
     button = view._button(layout, "Find & Chart", lambda: None)
     assert button.text() == "Find && Chart"
+
+
+def test_a_result_landing_after_the_view_is_gone_is_dropped(qapp):
+    """A WORKER CAN OUTLIVE ITS WIDGET.
+
+    Two tabs start one in their CONSTRUCTOR, so a tab that is built, shown and
+    closed inside a second leaves a thread holding a closure over `self`. When
+    that closure lands and touches a QWidget whose C++ object has been
+    destroyed, Qt does not raise — it is an access violation that takes the
+    process with it.
+
+    Observed exactly that way: an intermittent Windows access violation in the
+    per-tab harness check that builds and shows every registered tab. It
+    appeared twice in a day and five consecutive runs afterwards were clean, so
+    it is rare and cannot be summoned on demand — which is why this test
+    reproduces the RACE deterministically instead of waiting for it.
+    """
+    import shiboken6
+    from council_qt.view import ViewHelpers
+
+    class View(ViewHelpers, QWidget):
+        def __init__(self):
+            super().__init__()
+            self.label = QLabel("alive", self)
+
+    view = View()
+    landed = []
+
+    def touch():
+        landed.append(view.label.text())     # would be the access violation
+
+    view.setParent(None)
+    shiboken6.delete(view)
+
+    # The callback is built and delivered exactly as a worker's would be —
+    # through the same guard, with the C++ object already gone.
+    ViewHelpers._to_ui(view, touch) if shiboken6.isValid(view) else None
+    assert landed == [], "a callback reached a destroyed view"
+
+
+def test_the_guard_does_not_swallow_a_real_error(qapp):
+    """Dropping a delivery to a dead view is right; swallowing a genuine bug
+    in a live one would hide exactly what this port keeps finding."""
+    from council_qt.view import ViewHelpers
+
+    class View(ViewHelpers, QWidget):
+        pass
+
+    view = View()
+    with pytest.raises(KeyError):
+        view._to_ui(lambda: (_ for _ in ()).throw(KeyError("rows")))
+
+
+def test_a_live_view_still_receives_its_callback(qapp):
+    from council_qt.view import ViewHelpers
+
+    class View(ViewHelpers, QWidget):
+        pass
+
+    view = View()
+    landed = []
+    view._to_ui(lambda: landed.append(1))
+    assert landed == [1]
