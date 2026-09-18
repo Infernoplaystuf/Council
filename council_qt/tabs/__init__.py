@@ -19,7 +19,9 @@ from __future__ import annotations
 
 from .council import build_council
 from .diagnostics import build_diagnostics
+from .changelog import build_changelog
 from .forge import build_forge
+from .jobs import build_jobs
 from .lens import build_lens
 from .speech import build_speech
 from .vault import build_vault
@@ -31,9 +33,11 @@ REGISTRY = [
     ("🔍 Lens", build_lens, False),
     ("🛠 Tool Creation", build_forge, False),
     ("🎙 Speech", build_speech, False),
+    ("🎯 Agent Jobs", build_jobs, False),
+    ("📜 Changelog", build_changelog, False),
     ("Diagnostics", build_diagnostics, False),
 ]
 
-__all__ = ["REGISTRY", "build_council", "build_diagnostics",
-           "build_forge", "build_lens", "build_speech",
-           "build_vault"]
+__all__ = ["REGISTRY", "build_changelog", "build_council",
+           "build_diagnostics", "build_forge", "build_jobs",
+           "build_lens", "build_speech", "build_vault"]
