@@ -8,4 +8,5 @@ mechanism in the app.
 """
 from __future__ import annotations
 
-__all__ = ["transcript", "painter", "designer_canvas", "inspector"]
+__all__ = ["transcript", "painter", "designer_canvas", "inspector", "runwith",
+           "plots_pane"]
