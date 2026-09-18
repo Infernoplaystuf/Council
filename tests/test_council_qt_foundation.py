@@ -1267,3 +1267,43 @@ def test_no_tab_test_constructs_a_tab_with_no_actions():
     assert not offenders, (
         "these build a tab with no actions, so it makes its own against the "
         "real vault:\n" + "\n".join(offenders))
+
+
+def test_no_deferred_callback_reads_an_except_name():
+    """`except ... as exc` UNBINDS exc at the end of the block, so a lambda
+    that closes over it and runs later raises NameError instead of showing the
+    error it was written to show.
+
+    Three of these were live — two in the Council tab's turn worker, one in the
+    Vault tab's index worker — and every one was on an ERROR path, so the only
+    symptom was that a failure produced no message. They passed their tests
+    because `_to_ui` used to call back SYNCHRONOUSLY when a view had no bridge,
+    which is the test path and never the app's: with a bridge the delivery is
+    queued, and by then the name is gone.
+    """
+    import ast
+
+    root = Path(__file__).resolve().parent.parent / "council_qt"
+    offenders = []
+    for path in sorted(root.rglob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ExceptHandler) or not node.name:
+                continue
+            for inner in ast.walk(node):
+                if not isinstance(inner, ast.Lambda):
+                    continue
+                used = {n.id for n in ast.walk(inner)
+                        if isinstance(n, ast.Name)}
+                bound = ({a.arg for a in inner.args.args}
+                         | {a.arg for a in inner.args.kwonlyargs})
+                if node.name in used and node.name not in bound:
+                    offenders.append(
+                        f"{path.name}:{inner.lineno} captures {node.name!r}")
+    assert not offenders, (
+        "these lambdas read an except-name that is gone by the time they "
+        "run — bind it as a default argument instead:\n"
+        + "\n".join(offenders))

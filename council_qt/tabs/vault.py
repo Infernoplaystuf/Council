@@ -924,8 +924,11 @@ class VaultTab(ViewHelpers, QWidget):
             try:
                 result = self.actions.build_keyword_index(on_progress=on_progress)
             except VaultActions.NotYetExtracted as exc:
-                self._to_ui(lambda: self._finish_index(
-                    vault_ops.IndexResult(False, str(exc))))
+                # Bound now: `exc` is unbound the moment this block ends, and
+                # this lambda runs later.
+                said = str(exc)
+                self._to_ui(lambda said=said: self._finish_index(
+                    vault_ops.IndexResult(False, said)))
                 return
             self._to_ui(lambda: self._finish_index(result))
 

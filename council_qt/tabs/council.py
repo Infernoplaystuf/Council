@@ -558,11 +558,19 @@ class CouncilTab(ViewHelpers, QWidget):
                         lambda who=who, tok=tok: self.on_token(who, tok)))
                 if result is not None:
                     self._to_ui(lambda: self.finish_turn(result))
+            # THE MESSAGE IS BOUND HERE, NOT READ LATER. Python deletes the
+            # `except ... as exc` name at the end of the block, so a lambda
+            # that closes over `exc` and runs later raises NameError instead of
+            # showing the error. It worked only while `_to_ui` called back
+            # synchronously — which is the test path, never the app's.
             except CouncilActions.NotYetExtracted as exc:
-                self._to_ui(lambda: self.append("Council", str(exc),
-                                                "observation"))
+                said = str(exc)
+                self._to_ui(lambda said=said: self.append("Council", said,
+                                                          "observation"))
             except Exception as exc:                      # noqa: BLE001
-                self._to_ui(lambda: self.append("ERROR", repr(exc), "error"))
+                said = repr(exc)
+                self._to_ui(lambda said=said: self.append("ERROR", said,
+                                                          "error"))
             finally:
                 self._to_ui(self.end_turn)
 
