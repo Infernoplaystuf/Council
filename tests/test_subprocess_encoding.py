@@ -106,20 +106,52 @@ def test_git_log_is_actually_readable_now():
     assert r.stdout.strip(), "expected some history"
 
 
-def test_the_locale_default_still_breaks_on_this_repo():
-    """Guards the guard. If this ever stops failing, the repo no longer
-    contains a subject that reproduces the bug, and the test above has quietly
-    stopped proving anything — so it should be re-pointed at a crafted input
-    rather than deleted."""
-    if not (ROOT / ".git").exists():
-        pytest.skip("not a git checkout")
+def test_the_locale_default_still_breaks_on_a_crafted_input():
+    """Guards the guard, on an input that cannot drift.
+
+    THIS TEST USED TO READ THE REPO'S OWN HISTORY and it stopped failing, which
+    is exactly the outcome its previous docstring predicted and told the next
+    person to fix this way rather than by deleting it.
+
+    The reason is narrower than "the history changed". cp1252 maps almost every
+    byte to SOMETHING — an em-dash comes back as mojibake ("â€”"), not as an
+    error — and only five byte values are undefined: 0x81, 0x8d, 0x8f, 0x90 and
+    0x9d. Forty commit subjects full of em-dashes, ticks and emoji contain none
+    of them, so the decode quietly succeeded and produced nonsense.
+
+    That is worth knowing on its own: the failure this guards is not "non-ASCII
+    input", it is the handful of bytes that have no cp1252 meaning. Cyrillic Ё
+    is U+0401, which encodes as d0 81 — so it carries one of the five, and it
+    will keep carrying it whatever anybody commits.
+    """
     import locale
     if (locale.getpreferredencoding() or "").lower().replace("-", "") in (
             "utf8", "cp65001"):
         pytest.skip("locale is already UTF-8; nothing to break")
-    r = subprocess.run(
-        ["git", "log", "--pretty=format:%h|%s", "-40"],
-        cwd=str(ROOT), capture_output=True, text=True, timeout=30)
+
+    # A subprocess that writes one byte cp1252 has no meaning for.
+    emitter = (
+        "import sys;"
+        "sys.stdout.buffer.write('Ё subject line'.encode('utf-8'));"
+        "sys.stdout.buffer.flush()"
+    )
+    r = subprocess.run([sys.executable, "-c", emitter],
+                       capture_output=True, text=True, timeout=30)
     assert r.stdout is None, (
-        "expected the locale decode to kill the reader thread on this repo's "
-        "own history; if the history changed, re-point this at a crafted input")
+        "the locale decode no longer kills the reader thread even on a byte "
+        "cp1252 cannot represent — the guard above has stopped proving "
+        "anything and needs rewriting, not deleting")
+
+
+def test_the_crafted_input_really_does_carry_an_undefined_byte():
+    """So the test above cannot pass for the wrong reason.
+
+    If Ё's encoding ever stopped containing one of the five, the guard would
+    start skipping silently.
+    """
+    UNDECODABLE = {0x81, 0x8d, 0x8f, 0x90, 0x9d}
+    assert set("Ё".encode("utf-8")) & UNDECODABLE
+
+    for byte in UNDECODABLE:
+        with pytest.raises(UnicodeDecodeError):
+            bytes([byte]).decode("cp1252")
