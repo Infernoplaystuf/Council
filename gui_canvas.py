@@ -53,6 +53,7 @@ from council_core.designer_scene import (          # noqa: E402,F401
     HANDLES, snap_to_grid,
 )
 from council_core import designer_paint as _paint  # noqa: E402
+RENDERERS = _paint.RENDERERS
 
 _BORDER = _paint._BORDER
 _BUTTON_BG = _paint._BUTTON_BG
@@ -866,22 +867,6 @@ class DesignerCanvas(ttk.Frame):
 
 
 
-RENDERERS: Dict[str, Callable[[tk.Canvas, "_Ctx"], None]] = {
-    "frame": _render_frame, "labelframe": _render_labelframe,
-    "notebook": _render_notebook, "panedwindow": _render_panedwindow,
-    "freeform": _render_freeform,
-    "label": _render_label, "button": _render_button, "entry": _render_entry,
-    "text": _render_text, "checkbutton": _render_checkbutton,
-    "radiobutton": _render_radiobutton, "combobox": _render_combobox,
-    "listbox": _render_listbox, "spinbox": _render_spinbox,
-    "scale": _render_scale, "progressbar": _render_progressbar,
-    "separator": _render_separator, "treeview": _render_treeview,
-    "image_canvas": _render_image_canvas, "chart_panel": _render_chart_panel,
-    "scrubber": _render_scrubber, "log_pane": _render_log_pane,
-    "file_picker": _render_file_picker, "status_bar": _render_status_bar,
-    "toolbar": _render_toolbar, "menubar": _render_menubar,
-    GENERIC_KIND: _render_generic,
-}
 
 
 # ============================================================

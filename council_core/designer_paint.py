@@ -36,7 +36,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from gui_shapes import Shape
+from gui_shapes import GENERIC_KIND, Shape
 
 from .designer_scene import THEME
 
@@ -569,3 +569,24 @@ def _render_generic(c, ctx):
         _tx(c, ctx.x + ctx.w / 2, ctx.y + ctx.h / 2,
             ctx.label or "?", fill=THEME["subtext"],
             anchor="center", size=9, width=max(20, ctx.w - 8))
+
+
+#: kind -> renderer. The dispatch belongs WITH the renderers: it lived in
+#: gui_canvas, so the Qt canvas fell back to _render_generic for every
+#: shape and every widget drew as a plain box. Caught by rendering one.
+RENDERERS: Dict[str, Any] = {
+    "frame": _render_frame, "labelframe": _render_labelframe,
+    "notebook": _render_notebook, "panedwindow": _render_panedwindow,
+    "freeform": _render_freeform,
+    "label": _render_label, "button": _render_button, "entry": _render_entry,
+    "text": _render_text, "checkbutton": _render_checkbutton,
+    "radiobutton": _render_radiobutton, "combobox": _render_combobox,
+    "listbox": _render_listbox, "spinbox": _render_spinbox,
+    "scale": _render_scale, "progressbar": _render_progressbar,
+    "separator": _render_separator, "treeview": _render_treeview,
+    "image_canvas": _render_image_canvas, "chart_panel": _render_chart_panel,
+    "scrubber": _render_scrubber, "log_pane": _render_log_pane,
+    "file_picker": _render_file_picker, "status_bar": _render_status_bar,
+    "toolbar": _render_toolbar, "menubar": _render_menubar,
+    GENERIC_KIND: _render_generic,
+}
