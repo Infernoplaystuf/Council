@@ -23,6 +23,7 @@ from .changelog import build_changelog
 from .forge import build_forge
 from .jobs import build_jobs
 from .lens import build_lens
+from .models import build_models
 from .sessions import build_sessions
 from .specialists import build_specialists
 from .speech import build_speech
@@ -39,10 +40,11 @@ REGISTRY = [
     ("📜 Changelog", build_changelog, False),
     ("🕓 Sessions", build_sessions, False),
     ("🎓 Specialists", build_specialists, False),
+    ("🇺🇸 Models", build_models, False),
     ("Diagnostics", build_diagnostics, False),
 ]
 
 __all__ = ["REGISTRY", "build_changelog", "build_council",
            "build_diagnostics", "build_forge", "build_jobs",
-           "build_lens", "build_sessions", "build_specialists",
-           "build_speech", "build_vault"]
+           "build_lens", "build_models", "build_sessions",
+           "build_specialists", "build_speech", "build_vault"]
