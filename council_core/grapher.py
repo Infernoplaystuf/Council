@@ -70,6 +70,11 @@ class Session:
         self.transforms: List[Dict[str, Any]] = []
         self.overlay: Any = None
         self.overlay_paths: List[Path] = []
+        #: The loaded dataset with its string date columns parsed. Computed at
+        #: load, because the coercion COPIES the frame and `working()` runs
+        #: once per chart. None until something is loaded, and identical to
+        #: `dataset` when nothing needed coercing.
+        self._dated: Any = None
         #: Set when a load failed, so a view can say what happened rather than
         #: showing an empty file list and letting the user conclude there is
         #: no data.
@@ -103,6 +108,7 @@ class Session:
             self.load_error = f"{path.name}: {error}"
             return False, self.load_error
         self.dataset = dataset
+        self._dated = _dated_copy(dataset)
         self.load_error = ""
         return True, f"loaded {getattr(dataset, 'name', path.name)}"
 
@@ -141,13 +147,16 @@ class Session:
         if self.dataset is None:
             return Working()
 
-        result = Working(dataset=self.dataset)
-        frame = getattr(self.dataset, "df", None)
+        # The date coercion happened once, at load. Doing it here would copy
+        # the whole frame on every render, and `working()` is called per chart.
+        base = self._dated if self._dated is not None else self.dataset
+        result = Working(dataset=base)
+        frame = getattr(base, "df", None)
         if self.transforms and frame is not None:
             # A SHALLOW copy of the dataset with a new df: the DataSet carries
             # its name, path and column summary, and a transform changes none
             # of those. Deep-copying would duplicate the whole frame twice.
-            working = copy.copy(self.dataset)
+            working = copy.copy(base)
             try:
                 working.df, log = graph_engine.apply_transforms(
                     frame, self.transforms)
@@ -237,3 +246,152 @@ def scan(vault_dir: Any) -> List[Path]:
         return list(graph_data.scan_vault_for_data(Path(vault_dir)))
     except Exception:                                     # noqa: BLE001
         return []
+
+
+# ============================================================
+# The inline (offline) plot path
+# ============================================================
+# The one that works air-gapped: an Agg figure drawn straight onto the canvas.
+# No browser, no JavaScript, nothing to fetch. `plot_registry` decides which
+# plots a column selection can actually produce, so the picker cannot offer one
+# that will fail.
+
+@dataclass(frozen=True)
+class PlotChoice:
+    """One offerable plot: what it is called, and what to call for it.
+
+    The KEY travels beside the label rather than being parsed back out of it.
+    The Tk picker builds "Density (KDE)  (kde)" and recovers the key with
+    `rsplit("(", 1)`, which happens to work for all 31 current labels — checked,
+    not assumed — but only because no key contains a parenthesis. It is one
+    label away from silently building the wrong chart.
+    """
+    key: str
+    label: str
+    group: str = ""
+    requires: str = ""
+
+    @property
+    def caption(self) -> str:
+        return f"{self.label}  ({self.key})"
+
+
+def _dated_copy(dataset: Any) -> Any:
+    """The dataset with its date columns parsed, or the same object.
+
+    The SAME object when nothing changed, so a caller can still tell the
+    working dataset is the loaded one — and so a frame with no dates is not
+    copied at all.
+    """
+    frame = getattr(dataset, "df", None)
+    dated = _with_real_dates(frame)
+    if dated is None or dated is frame:
+        return dataset
+    try:
+        if list(dated.dtypes) == list(frame.dtypes):
+            # coerce_datetime_columns always copies; if no dtype changed there
+            # was nothing to coerce and the copy is pure cost.
+            return dataset
+    except Exception:                                     # noqa: BLE001
+        pass
+    updated = copy.copy(dataset)
+    updated.df = dated
+    return updated
+
+
+def _with_real_dates(frame: Any) -> Any:
+    """A frame whose string date columns are real datetimes.
+
+    `coerce_datetime_columns` RETURNS A COPY — it does not mutate. Calling it
+    and discarding the result leaves every date a string, which classifies as
+    categorical and makes the whole time-series half of the registry
+    unofferable on CSVs, the file type the Grapher is most used with. I wrote
+    exactly that bug and caught it by looking at the roles rather than
+    believing the call.
+
+    Done here rather than in the inline path alone, so the export and browser
+    renderers get the same frame — which is what `working()` promises.
+    """
+    import plot_roles
+
+    if frame is None:
+        return None
+    try:
+        return plot_roles.coerce_datetime_columns(frame)
+    except Exception:                                     # noqa: BLE001
+        return frame
+
+
+def roles_for(frame: Any) -> Dict[str, str]:
+    """Each column's role — numeric, categorical, datetime, boolean, text."""
+    import plot_roles
+
+    if frame is None:
+        return {}
+    try:
+        return plot_roles.infer_roles(frame)
+    except Exception:                                     # noqa: BLE001
+        return {}
+
+
+def choices_for(frame: Any, columns: Sequence[str]) -> List[PlotChoice]:
+    """Only the plots this selection can actually draw.
+
+    Offering a plot that cannot be built is a button that produces an error
+    message, and the registry already knows the answer.
+    """
+    import plot_registry
+
+    if frame is None or not columns:
+        return []
+    try:
+        kinds = plot_registry.applicable(roles_for(frame), list(columns))
+    except Exception:                                     # noqa: BLE001
+        return []
+    return [PlotChoice(k.key, k.label, k.group, k.requires) for k in kinds]
+
+
+def hint_for(columns: Sequence[str], choices: Sequence[PlotChoice]) -> str:
+    """What the line under the picker says.
+
+    "No plot fits" alone leaves the user guessing; naming the kind of column
+    that would help is the difference between a dead end and a next step.
+    """
+    if not columns:
+        return "Select one or more columns."
+    if not choices:
+        return (f"No plot fits {len(columns)} column(s) of those types — "
+                f"try adding a numeric or category column.")
+    return f"{len(choices)} plot(s) fit this selection."
+
+
+@dataclass
+class FigureResult:
+    ok: bool
+    figure: Any = None
+    message: str = ""
+
+
+def build_figure(frame: Any, key: str, columns: Sequence[str],
+                 **options: Any) -> FigureResult:
+    """Draw one inline plot. NEVER raises.
+
+    A builder raises a plain-English reason — "Density (KDE) needs seaborn,
+    which isn't installed." — and that sentence is the thing worth showing. A
+    traceback is not, and a half-drawn chart is worse than either.
+    """
+    import plot_registry
+
+    if frame is None:
+        return FigureResult(False, message="Load a data file first.")
+    if not key or not columns:
+        return FigureResult(False, message="Pick columns and a plot type "
+                                           "first.")
+    try:
+        figure = plot_registry.build(key, frame, list(columns), **options)
+    except Exception as exc:                              # noqa: BLE001
+        return FigureResult(False, message=f"✗ {exc}")
+    if figure is None:
+        return FigureResult(False, message=f"✗ {key} produced no figure.")
+    return FigureResult(True, figure,
+                        f"{key}: {', '.join(str(c) for c in columns)}")

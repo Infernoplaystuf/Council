@@ -425,3 +425,129 @@ def test_a_failed_load_does_not_become_the_current_dataset(session, tmp_path):
     ok, _message = session.load(tmp_path / "definitely-missing.csv")
     assert not ok
     assert session.dataset is good, "a failed load replaced the good dataset"
+
+
+# ============================================================
+# Dates that arrived as strings
+# ============================================================
+
+def test_a_csv_date_column_becomes_a_real_datetime(tmp_path):
+    """CSVs are read without parse_dates, so a timestamp column arrives as
+    text and classifies as categorical — which makes the whole time-series
+    half of the registry unofferable on the file type the Grapher is most used
+    with.
+
+    `coerce_datetime_columns` RETURNS A COPY. I first called it and discarded
+    the result, which left every date a string and every time plot missing, and
+    caught it by looking at the inferred roles rather than believing the call.
+    """
+    path = tmp_path / "dated.csv"
+    pd.DataFrame({"when": pd.date_range("2024-01-01", periods=10),
+                  "v": range(10)}).to_csv(path, index=False)
+    s = grapher.Session()
+    s.load(path)
+    assert grapher.roles_for(s.working().df)["when"] == "datetime"
+
+
+def test_the_time_series_plots_become_offerable(tmp_path):
+    path = tmp_path / "dated.csv"
+    pd.DataFrame({"when": pd.date_range("2024-01-01", periods=10),
+                  "v": range(10)}).to_csv(path, index=False)
+    s = grapher.Session()
+    s.load(path)
+    keys = {c.key for c in grapher.choices_for(s.working().df, ["when", "v"])}
+    assert "timeseries" in keys
+
+
+def test_the_loaded_frame_keeps_its_original_types(tmp_path):
+    """The coercion belongs to the WORKING frame. Rewriting the loaded one
+    would make "what did this file contain" unanswerable."""
+    path = tmp_path / "dated.csv"
+    pd.DataFrame({"when": pd.date_range("2024-01-01", periods=5),
+                  "v": range(5)}).to_csv(path, index=False)
+    s = grapher.Session()
+    s.load(path)
+    s.working()
+    assert str(s.dataset.df["when"].dtype) in ("object", "str")
+
+
+def test_a_frame_with_no_dates_is_not_copied(session):
+    """`coerce_datetime_columns` always copies, and `working()` runs once per
+    chart — so copying a large frame when nothing needed coercing is pure
+    cost, every render."""
+    assert session.working().dataset is session.dataset
+
+
+def test_a_coercion_that_cannot_run_leaves_the_frame_alone(session,
+                                                           monkeypatch):
+    import plot_roles
+
+    def _boom(_frame):
+        raise ValueError("pandas is unhappy")
+
+    monkeypatch.setattr(plot_roles, "coerce_datetime_columns", _boom)
+    s = grapher.Session()
+    s.dataset = session.dataset
+    assert grapher._dated_copy(session.dataset) is session.dataset
+
+
+# ============================================================
+# Which plots are offered
+# ============================================================
+
+def test_only_plots_the_columns_can_draw_are_offered(session):
+    """Offering one that cannot be built is a button that produces an error
+    message, and the registry already knows the answer."""
+    frame = session.working().df
+    for choice in grapher.choices_for(frame, ["v"]):
+        assert grapher.build_figure(frame, choice.key, ["v"]).ok or \
+            "isn't installed" in grapher.build_figure(frame, choice.key,
+                                                      ["v"]).message
+
+
+def test_no_columns_offers_no_plots(session):
+    assert grapher.choices_for(session.working().df, []) == []
+
+
+def test_the_choice_carries_its_key_beside_its_label(session):
+    """The Tk picker builds "Density (KDE)  (kde)" and recovers the key with
+    rsplit — which works for all 31 current labels, checked rather than
+    assumed, but only because no key contains a parenthesis."""
+    choice = grapher.choices_for(session.working().df, ["v"])[0]
+    assert choice.key and choice.key in choice.caption
+    assert choice.label in choice.caption
+
+
+def test_the_hint_says_what_would_help(session):
+    """"No plot fits" alone leaves the user guessing."""
+    hint = grapher.hint_for(["v"], [])
+    assert "numeric" in hint or "category" in hint
+
+
+def test_the_hint_for_no_selection_asks_for_one(session):
+    assert "Select" in grapher.hint_for([], [])
+
+
+def test_a_builder_failure_shows_its_own_sentence(session):
+    """"Density (KDE) needs seaborn, which isn't installed." is the thing
+    worth showing. A traceback is not."""
+    result = grapher.build_figure(session.working().df, "kde", ["v"])
+    if result.ok:
+        pytest.skip("seaborn is installed here")
+    assert "seaborn" in result.message
+
+
+def test_an_unknown_plot_key_is_refused_cleanly(session):
+    result = grapher.build_figure(session.working().df, "no_such_plot", ["v"])
+    assert not result.ok
+    assert "unknown plot type" in result.message
+
+
+def test_building_with_no_data_says_to_load_a_file():
+    assert "Load a data file" in grapher.build_figure(None, "line", ["a"]).message
+
+
+def test_building_with_no_columns_says_to_pick_some(session):
+    result = grapher.build_figure(session.working().df, "line", [])
+    assert not result.ok
+    assert "Pick columns" in result.message
