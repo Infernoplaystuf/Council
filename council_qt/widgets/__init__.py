@@ -8,4 +8,4 @@ mechanism in the app.
 """
 from __future__ import annotations
 
-__all__ = ["transcript"]
+__all__ = ["transcript", "painter", "designer_canvas", "inspector"]
