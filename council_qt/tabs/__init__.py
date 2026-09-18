@@ -18,6 +18,7 @@ default tabs, then the Designer, then advanced.
 from __future__ import annotations
 
 from .council import build_council
+from .designer import build_designer
 from .diagnostics import build_diagnostics
 from .changelog import build_changelog
 from .forge import build_forge
@@ -41,10 +42,12 @@ REGISTRY = [
     ("🕓 Sessions", build_sessions, False),
     ("🎓 Specialists", build_specialists, False),
     ("🇺🇸 Models", build_models, False),
+    ("🎨 GUI Designer", build_designer, False),
     ("Diagnostics", build_diagnostics, False),
 ]
 
 __all__ = ["REGISTRY", "build_changelog", "build_council",
-           "build_diagnostics", "build_forge", "build_jobs",
+           "build_designer", "build_diagnostics", "build_forge",
+           "build_jobs",
            "build_lens", "build_models", "build_sessions",
            "build_specialists", "build_speech", "build_vault"]

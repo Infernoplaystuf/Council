@@ -74,6 +74,9 @@ class Scene:
         self.active_kind: Optional[str] = None
         self.undo = (UndoStack(self.shapes) if undo_depth is None
                      else UndoStack(self.shapes, undo_depth))
+        #: Unsaved changes. Set by every commit, cleared by load and
+        #: mark_saved — the two moments at which the scene and the file agree.
+        self.dirty = False
 
         self._mode: Optional[str] = None
         self._handle: Optional[str] = None
@@ -95,11 +98,52 @@ class Scene:
                 if s is not None]
 
     def export(self) -> List[Shape]:
-        return list(self.shapes)
+        """A DEEP copy, so a caller cannot edit the scene through what it saved.
+
+        `save` hands these straight to the project; a shallow list would let a
+        later drag mutate the shapes a save already wrote.
+        """
+        return copy.deepcopy(self.shapes)
+
+    # -- the project lifecycle -------------------------------------------
+    def load(self, shapes: Sequence[Shape]) -> None:
+        """Replace the scene. RESETS UNDO.
+
+        A freshly opened project has no history, and offering to undo into the
+        previous project's shapes is worse than offering nothing.
+        """
+        self.shapes = copy.deepcopy(list(shapes))
+        self.selection = []
+        self.undo = UndoStack(self.shapes)
+        self.dirty = False
+        self._mode = None
+
+    def add_shapes(self, shapes: Sequence[Shape]) -> Outcome:
+        """Append shapes above the existing scene, as ONE undoable step.
+
+        The non-destructive counterpart to `load`. load() replaces everything
+        and resets undo, so using it to drop a wizard's output onto a canvas
+        the user had already drawn on would destroy that work with no way back.
+        This is the seam any scripted mutation should come through.
+        """
+        if not shapes:
+            return Outcome()
+        base = self._next_z()
+        added = copy.deepcopy(list(shapes))
+        for offset, shape in enumerate(added):
+            shape.z = base + offset
+        self.shapes.extend(added)
+        self.selection = [s.id for s in added]
+        return self.commit()
+
+    def mark_saved(self) -> None:
+        """The scene and the file now agree."""
+        self.dirty = False
 
     # -- undo -----------------------------------------------------------
     def commit(self) -> Outcome:
         self.undo.push(self.shapes)
+        self.dirty = True
         return Outcome(redraw=True, show_inspector=True, committed=True)
 
     def undo_once(self) -> Outcome:
