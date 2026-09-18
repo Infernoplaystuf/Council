@@ -20,6 +20,7 @@ from __future__ import annotations
 from .council import build_council
 from .designer import build_designer
 from .diagnostics import build_diagnostics
+from .librarian import build_librarian
 from .changelog import build_changelog
 from .forge import build_forge
 from .jobs import build_jobs
@@ -46,7 +47,24 @@ REGISTRY = [
     ("Diagnostics", build_diagnostics, False),
 ]
 
-__all__ = ["REGISTRY", "build_changelog", "build_council",
+#: The advanced tabs, gated exactly as the Tk shell gates them: either
+#: COUNCIL_ADVANCED=1 or --advanced. Six tabs live here — Librarian, Nodes,
+#: Agents, Vault Health, Apothecary and the IDE — and every one of them
+#: commits the whole vault to git, SSHes into a Raspberry Pi, or rewrites the
+#: model registry. Registering them unconditionally would not be a port; it
+#: would put those operations in front of users who never asked for them.
+ADVANCED_REGISTRY = [
+    ("📚 Librarian", build_librarian, False),
+]
+
+
+def registry(advanced: bool = False):
+    """The tabs this build shows."""
+    return list(REGISTRY) + (list(ADVANCED_REGISTRY) if advanced else [])
+
+
+__all__ = ["REGISTRY", "ADVANCED_REGISTRY", "registry",
+           "build_changelog", "build_council", "build_librarian",
            "build_designer", "build_diagnostics", "build_forge",
            "build_jobs",
            "build_lens", "build_models", "build_sessions",

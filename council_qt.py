@@ -64,8 +64,11 @@ def _register_tabs(window) -> None:
     port shippable in phases rather than as one flip. The Tk shell already does
     the same thing for advanced mode, where six tabs are absent.
     """
-    from council_qt.tabs import REGISTRY
-    for title, factory, eager in REGISTRY:
+    from council_core import modes
+    from council_qt.tabs import registry
+    # Advanced mode ADDS tabs; it does not unlock a setting. The six behind it
+    # commit the vault to git, SSH into a Pi, or rewrite the model registry.
+    for title, factory, eager in registry(advanced=modes.advanced()):
         window.add_tab(title, lambda f=factory, w=window: f(w), eager=eager)
 
 
