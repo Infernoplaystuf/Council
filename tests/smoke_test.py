@@ -76,6 +76,39 @@ def _check(name: str, condition: bool, detail: str = "") -> None:
         print(f"  ✗ {name}   {detail}")
 
 
+try:
+    import pytest as _pytest
+except Exception:                                  # pragma: no cover
+    _pytest = None                                 # script mode, no pytest
+
+
+if _pytest is not None:
+    @_pytest.fixture(autouse=True)
+    def _check_failures_fail_the_test():
+        """Make a failed `_check` actually fail the test under pytest.
+
+        THE WHOLE FILE WAS VACUOUS UNDER PYTEST. `_check` appends to `_FAILS`
+        and PRINTS; it never raises. pytest sees no exception, so 166 of these
+        169 test functions reported green no matter how many checks inside them
+        failed — the suite's largest file was reporting on nothing.
+
+        Script mode (`python tests/smoke_test.py`) always worked: main() reads
+        `_FAILS` at the end and returns 1. So the checks were real and only the
+        pytest reporting was not, which is exactly why nobody noticed.
+
+        Snapshotting the length rather than clearing the list keeps script mode
+        byte-identical: the totals main() prints are still the totals.
+        """
+        before = len(_FAILS)
+        yield
+        new = _FAILS[before:]
+        if new:
+            _pytest.fail(
+                f"{len(new)} check(s) failed:\n"
+                + "\n".join(f"  - {name}: {detail}" for name, detail in new),
+                pytrace=False)
+
+
 def _run(label: str, fn) -> None:
     print(f"\n── {label} ──")
     try:
@@ -84,6 +117,20 @@ def _run(label: str, fn) -> None:
         _FAILS.append((label, repr(exc)))
         print(f"  ✗ {label} raised: {exc!r}")
         traceback.print_exc()
+
+
+_ABSENT_OPTIONAL = "isn't installed"
+
+
+def _needs_absent_optional(exc: Exception) -> bool:
+    """Whether this failure is just an optional library that is not here.
+
+    plot_registry raises ValueError("... needs seaborn, which isn't
+    installed.") on purpose: the plot stays listed so the user can find it and
+    be told what to install. That sentence is the feature, so a test must not
+    read it as a broken renderer — but it must still fail on anything else.
+    """
+    return isinstance(exc, ValueError) and _ABSENT_OPTIONAL in str(exc)
 
 
 def _raises(exc_type, callable_obj) -> bool:
@@ -3979,6 +4026,7 @@ def test_plot_registry_renders_all() -> None:
     before = len(plt.get_fignums())
     failures = []
     untested = []
+    skipped = []
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         for key in sorted(have):
@@ -3998,8 +4046,20 @@ def test_plot_registry_renders_all() -> None:
                     raise AssertionError(
                         "applies() rejects the selection it was built for")
             except Exception as exc:
+                # An OPTIONAL library that is not installed is not a broken
+                # plot. The registry lists these on purpose so the user can
+                # discover them and be told exactly what to install — the
+                # message is the feature. The registration check above already
+                # makes the same allowance; this one did not, which is what
+                # surfaced the moment a failed _check started failing the test.
+                if _needs_absent_optional(exc):
+                    skipped.append(f"{key}: {exc}")
+                    continue
                 failures.append(f"{key}: {type(exc).__name__}: {exc}")
 
+    if skipped:
+        print(f"    (not installed here, so not rendered: "
+              f"{', '.join(sorted(s.split(':')[0] for s in skipped))})")
     _check(f"every registered plot renders to a PNG ({failures})",
            not failures)
     _check(f"no registered plot is left untested ({untested})", not untested)
