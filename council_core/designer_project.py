@@ -376,3 +376,47 @@ def review_prompt(project_dir: Any) -> str:
     if not sources:
         return ""
     return REVIEW_PROMPT + sources[:REVIEW_SOURCE_LIMIT]
+
+
+# ============================================================
+# Which Python runs the preview
+# ============================================================
+# Per project, in its manifest. A camera app needs its SDK's environment, not
+# the Council's own Python — that is the whole reason the setting exists.
+
+def interpreter_of(project_dir: Any) -> str:
+    """The project's chosen interpreter spec, or "" for the default.
+
+    Never raises. A manifest that cannot be read means "no choice recorded",
+    which is the same thing the default means — and a picker that threw while
+    merely DISPLAYING a setting would take the tab down on a project the user
+    could otherwise still open.
+    """
+    if not project_dir:
+        return ""
+    try:
+        import gui_projects
+        return gui_projects.load_manifest(Path(project_dir)).python or ""
+    except Exception:                                    # noqa: BLE001
+        return ""
+
+
+def set_interpreter(project_dir: Any, spec: str) -> ProjectResult:
+    """Record which Python runs this project's preview.
+
+    Refused with no project open, because the choice is SAVED WITH THE PROJECT
+    and there is nowhere to put it otherwise. Silently accepting it would look
+    like it worked and be gone on the next open.
+    """
+    if not project_dir:
+        return ProjectResult(False, "Open or create a project first — the "
+                                    "choice is saved with the project.")
+    try:
+        import gui_projects
+        directory = Path(project_dir)
+        manifest = gui_projects.load_manifest(directory)
+        manifest.python = spec
+        gui_projects.save_manifest(directory, manifest)
+    except Exception as exc:                             # noqa: BLE001
+        return ProjectResult(False, str(exc))
+    return ProjectResult(True, "")

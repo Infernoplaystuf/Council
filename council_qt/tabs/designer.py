@@ -43,6 +43,7 @@ from .. import theme
 from ..view import ViewHelpers, amp
 from ..widgets.designer_canvas import DesignerCanvas, in_scroll_area
 from ..widgets.inspector import InspectorView
+from ..widgets.runwith import RunWithBox
 
 
 class DesignerActions:
@@ -140,6 +141,12 @@ class DesignerTab(ViewHelpers, QWidget):
                               ("Review with Council", self.on_review),
                               ("Detach", self.on_detach)):
             self._button(bar, caption, slot)
+        # Which Python runs the preview — per project, in its manifest. A
+        # camera app needs its SDK's environment, not the Council's own.
+        self.runwith = RunWithBox(lambda: self.actions.project_dir(self.project))
+        self.runwith.logged.connect(self.log)
+        bar.addSpacing(12)
+        bar.addWidget(self.runwith)
         bar.addStretch(1)
         self.status = QLabel("no project")
         bar.addWidget(self.status)
@@ -264,6 +271,10 @@ class DesignerTab(ViewHelpers, QWidget):
         self.canvas.scene.load(shapes)
         self.canvas.update()
         self._show_selection()
+        # The interpreter is per PROJECT, so every path that changes which
+        # project is open has to re-read it. The Tk tab calls sync() from four
+        # separate places for this reason.
+        self.runwith.sync()
         self._refresh_status()
 
     # ==================================================================

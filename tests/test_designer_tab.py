@@ -484,3 +484,126 @@ def test_no_worker_touches_a_widget_directly(tab):
         for forbidden in ("self.log(", "self.status.setText", "self.canvas"):
             assert forbidden not in inner, (
                 f"{worker}'s worker touches a widget directly")
+
+
+# ============================================================
+# Which Python runs the preview
+# ============================================================
+# Per project, in its manifest. A generated app that imports pypylon must run
+# in the environment that HAS pypylon, which is not the Council's own Python.
+
+def test_the_interpreter_picker_is_on_the_bar(tab):
+    assert tab.runwith is not None
+    assert tab.runwith.box.count() >= 1
+
+
+def test_it_shows_the_default_with_no_project(tab):
+    import python_envs as envs
+    assert tab.runwith.box.currentText() == envs.DEFAULT_LABEL
+
+
+def test_choosing_one_with_no_project_open_is_refused(tab):
+    """The choice is SAVED WITH THE PROJECT, so there is nowhere to put it.
+    Accepting it silently would look like it worked and be gone on the next
+    open."""
+    import python_envs as envs
+    choices = [c for c in envs.choices(envs.DEFAULT_LABEL)
+               if c not in (envs.DEFAULT_LABEL, envs.BROWSE_LABEL)]
+    if not choices:
+        pytest.skip("no alternative interpreter on this machine")
+    tab.runwith.box.setCurrentText(choices[0])
+    assert "Open or create a project first" in log_text(tab)
+
+
+def test_a_choice_is_saved_with_the_project(tab):
+    import gui_projects
+    import python_envs as envs
+    choices = [c for c in envs.choices(envs.DEFAULT_LABEL)
+               if c not in (envs.DEFAULT_LABEL, envs.BROWSE_LABEL)]
+    if not choices:
+        pytest.skip("no alternative interpreter on this machine")
+    pdir = make_project(tab, "demo")
+    tab.runwith.box.setCurrentText(choices[0])
+    assert gui_projects.load_manifest(pdir).python == \
+        envs.spec_from_choice(choices[0])
+
+
+def test_opening_another_project_shows_its_own_interpreter(tab):
+    """It is per project. A picker still showing the last one's is a setting
+    the user will trust and be wrong about."""
+    import python_envs as envs
+    from council_core import designer_project as dp
+
+    choices = [c for c in envs.choices(envs.DEFAULT_LABEL)
+               if c not in (envs.DEFAULT_LABEL, envs.BROWSE_LABEL)]
+    if not choices:
+        pytest.skip("no alternative interpreter on this machine")
+    first = make_project(tab, "first")
+    dp.set_interpreter(first, envs.spec_from_choice(choices[0]))
+    tab.on_save()
+    make_project(tab, "second")
+    tab.on_save()
+    assert tab.runwith.box.currentText() == envs.DEFAULT_LABEL
+    tab.answers["choice"].append("first")
+    tab.on_open()
+    assert tab.runwith.box.currentText() == envs.display(
+        envs.spec_from_choice(choices[0]))
+
+
+def test_rebuilding_the_list_does_not_save_anything(tab, monkeypatch):
+    """Adding items fires currentTextChanged for EACH one, so a picker that
+    saved on those would write every entry in the list in turn.
+
+    Counted rather than compared: `sync` sets the right value back last, so the
+    end state matches either way and an end-state check cannot see the writes.
+    """
+    from council_core import designer_project as dp
+
+    make_project(tab, "demo")
+    writes = []
+    monkeypatch.setattr(dp, "set_interpreter",
+                        lambda d, s: writes.append(s) or dp.ProjectResult(True))
+    tab.runwith.fill()
+    tab.runwith.sync()
+    assert writes == [], f"rebuilding the list wrote {writes}"
+
+
+def test_cancelling_the_browse_dialog_changes_nothing(tab):
+    """A cancelled file dialog means "leave it alone", not "set it to nothing".
+
+    Starts from a project that ALREADY has an interpreter set: on a fresh one
+    the setting is "" and clearing it looks identical to leaving it alone.
+    """
+    import gui_projects
+    import python_envs as envs
+    from council_core import designer_project as dp
+
+    pdir = make_project(tab, "demo")
+    dp.set_interpreter(pdir, "C:/envs/pylon/python.exe")
+    tab.runwith.sync()
+    tab.runwith._ask_path = lambda: ""
+    tab.runwith.box.setCurrentText(envs.BROWSE_LABEL)
+    assert gui_projects.load_manifest(pdir).python == "C:/envs/pylon/python.exe"
+
+
+def test_a_browsed_path_is_saved_verbatim(tab):
+    """A path the user picked is the answer. Re-deriving it through the
+    choice list would turn an explicit exe into "Council's Python"."""
+    import gui_projects
+    import python_envs as envs
+    pdir = make_project(tab, "demo")
+    tab.runwith._ask_path = lambda: "C:/envs/pylon/python.exe"
+    tab.runwith.box.setCurrentText(envs.BROWSE_LABEL)
+    assert gui_projects.load_manifest(pdir).python == "C:/envs/pylon/python.exe"
+
+
+def test_the_picker_never_runs_anything(tab):
+    """Run does that, through python_envs.preflight. A picker that launched
+    the app would make choosing an environment a destructive act."""
+    from tests.source_checks import code_of
+    source = (ROOT / "council_qt" / "widgets" / "runwith.py").read_text(
+        encoding="utf-8")
+    for name in ("_picked", "sync", "fill"):
+        body = code_of(source, name)
+        for forbidden in ("subprocess", "preflight", "run_checked", "Popen"):
+            assert forbidden not in body, f"{name} runs something"
