@@ -69,7 +69,20 @@ def tab(qapp, tmp_path):
                        confirm=confirm)
     view.answers = answers
     yield view
+    # Drain before deleting. `_busy` clears inside the marshalled callback, so
+    # a test that stops pumping there leaves the worker thread itself still
+    # unwinding — and deleting the widget then destroys the C++ object out from
+    # under it. On Windows that is an access violation, not an exception: the
+    # process dies with no traceback from the test that caused it.
+    import threading
+    deadline = time.time() + 5.0
+    while any(t.name.startswith("designer-") and t.is_alive()
+              for t in threading.enumerate()) and time.time() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    qapp.processEvents()
     view.deleteLater()
+    qapp.processEvents()
 
 
 def make_project(tab, name="demo", shapes=()):

@@ -44,10 +44,41 @@ def qapp():
 
 
 @pytest.fixture
-def tab(qapp):
-    widget = CouncilTab()
+def tab(qapp, tmp_path):
+    """A tab over a TEMP vault.
+
+    `CouncilActions()` defaults to ~/council_vault — the user's real one. Any
+    test here that reaches a live path (on_send does, unless it replaces
+    `actions`) therefore built personalities against real data and created
+    directories in it. Harmless by luck, since ConversationStore.mkdir passes
+    exist_ok, and wrong regardless: a test suite must not be able to touch the
+    vault. It is also where the whole run aborted — a worker deep in
+    build_personalities while the main thread pumped Qt events.
+    """
+    widget = CouncilTab(actions=CouncilActions(vault_dir=tmp_path / "vault"))
     yield widget
+    # Drain first. Several tests here pump only until their worker STARTS —
+    # `_pump(qapp, lambda: "text" in seen)` returns on the worker's first line —
+    # so deleting the widget straight afterwards destroys the C++ object out
+    # from under a thread that is still running and about to post back to it.
+    # That is a Windows access violation, not an exception: the process dies
+    # mid-suite with no traceback from the test that caused it, and the one
+    # reported is whichever test happened to be pumping when the queued call
+    # was delivered.
+    # Wait on the THREAD, not on `_turn_active`: one test sets that flag by
+    # hand with no worker behind it, and waiting on it there costs the full
+    # timeout for nothing.
+    def _worker_alive():
+        return any(t.name == "council-turn" and t.is_alive()
+                   for t in threading.enumerate())
+
+    deadline = time.monotonic() + 5.0
+    while _worker_alive() and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    qapp.processEvents()
     widget.deleteLater()
+    qapp.processEvents()
 
 
 def _pump(app, predicate, timeout=3.0):
@@ -356,6 +387,16 @@ def test_expanding_with_no_fast_answer_is_refused(tab):
 
 
 def test_a_new_turn_resets_the_previous_one(tab, qapp):
+    # A stand-in, like every other send test here. Without one this ran the
+    # REAL turn: a worker in build_personalities, loading models from disk,
+    # while the main thread pumped Qt events — which is what it was actually
+    # asserting on, and it is not what this test is about.
+    class Recording(CouncilActions):
+        def send(self, typed_text, options, *, on_event=None, on_token=None):
+            from council_core import council_turn
+            return council_turn.TurnResult(True, message="done")
+
+    tab.actions = Recording(vault_dir=tab.actions.vault_dir)
     tab._last_fast_question = "an old question"
     tab.expand_btn.setEnabled(True)
     tab.input.setPlainText("something new")

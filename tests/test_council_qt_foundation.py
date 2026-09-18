@@ -1110,3 +1110,74 @@ def test_a_live_view_still_receives_its_callback(qapp):
     landed = []
     view._to_ui(lambda: landed.append(1))
     assert landed == [1]
+
+
+def _bare_calls(path):
+    """Every `Name()` called with no arguments, EXCLUDING names the file
+    defines itself.
+
+    An AST walk, not a regex over lines: both of these checks first matched
+    their own docstrings, which is the third time in this port a source
+    assertion has tripped on the prose explaining it.
+
+    The local-definition filter is the other half. A test file that subclasses
+    LensActions into its own `Actions` and constructs it bare is a stand-in
+    with everything overridden, not a route to the real vault — and flagging
+    it would have made this check something people learn to ignore.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+    except SyntaxError:
+        return []
+    local = {node.name for node in ast.walk(tree)
+             if isinstance(node, ast.ClassDef)}
+    found = []
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Call) and not node.args and not node.keywords
+                and isinstance(node.func, ast.Name)
+                and node.func.id not in local):
+            found.append((node.func.id, getattr(node, "lineno", 0)))
+    return found
+
+
+def test_no_tab_test_builds_actions_against_the_real_vault():
+    """Every *Actions class defaults vault_dir to ~/council_vault.
+
+    A test that constructs one bare therefore runs against the user's real
+    data. test_council_tab did, and a worker then built personalities from it,
+    loading models from disk. That was also where a full suite run aborted —
+    a worker deep in ConversationStore.mkdir while the main thread pumped Qt
+    events.
+
+    Nothing was damaged, because mkdir passes exist_ok and nothing there
+    writes. That is luck, not a design: the suite must not be ABLE to reach the
+    vault.
+    """
+    tests_dir = Path(__file__).resolve().parent
+    offenders = [f"{path.name}:{line}  {name}()"
+                 for path in sorted(tests_dir.glob("test_*.py"))
+                 for name, line in _bare_calls(path)
+                 if name.endswith("Actions")]
+    assert not offenders, (
+        "these build an Actions with the DEFAULT vault — the user's real one:\n"
+        + "\n".join(offenders))
+
+
+def test_no_tab_test_constructs_a_tab_with_no_actions():
+    """The same hole one level up: a tab built with no actions makes its own,
+    and those default to the real vault."""
+    from council_qt.tabs import REGISTRY
+
+    tab_classes = {
+        factory.__name__.replace("build_", "").title().replace("_", "") + "Tab"
+        for _title, factory, _eager in REGISTRY}
+    tests_dir = Path(__file__).resolve().parent
+    offenders = [f"{path.name}:{line}  {name}()"
+                 for path in sorted(tests_dir.glob("test_*.py"))
+                 for name, line in _bare_calls(path)
+                 if name in tab_classes]
+    assert not offenders, (
+        "these build a tab with no actions, so it makes its own against the "
+        "real vault:\n" + "\n".join(offenders))
