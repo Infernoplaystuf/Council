@@ -55,3 +55,82 @@ def code_of(source_or_node, name=None):
     if not body:
         return ""
     return "\n".join(ast.unparse(statement) for statement in body)
+
+
+def widget_touches_in_worker(source: str, func_name: str,
+                             widgets) -> list:
+    """Named widgets a worker touches OUTSIDE the marshalling seam.
+
+    WHY AN AST AND NOT A STRING SPLIT
+    Five test files check this by slicing the function text between "def work"
+    and "def show" and searching for `self.<widget>.`. That only works when the
+    worker happens to define an inner `show`; a worker that marshals with
+    `self._to_ui(lambda: self.pane.setText(x))` has its widget call inside the
+    seam and the slice reports it as a violation. It did, for the Grapher's
+    stats refresh, where the code was right and the check was wrong.
+
+    TWO SHAPES OF SEAM, AND THE FIRST VERSION OF THIS ONLY KNEW ONE
+    `_to_ui(lambda: ...)` passes the body inline; `_to_ui(show)` passes a
+    nested function BY NAME, and walking the argument then reaches a bare Name
+    and none of the code it stands for. Both are exempt here.
+
+    `widgets` is the list of attribute names that are actually widgets. Asked
+    for rather than guessed: `self.actions.session` is `self.<x>.<y>` too, and
+    a check that flagged it would be one people learn to ignore.
+    """
+    import ast
+
+    tree = ast.parse(source)
+    target = None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))                 and node.name == func_name:
+            target = node
+            break
+    if target is None:
+        raise AssertionError(f"no function named {func_name!r}")
+
+    nested = {n.name: n for n in ast.walk(target)
+              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+              and n is not target}
+    if not nested:
+        return []
+
+    exempt_nodes = set()
+    exempt_names = set()
+    for node in ast.walk(target):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_to_ui"):
+            continue
+        for argument in list(node.args) + [k.value for k in node.keywords]:
+            if isinstance(argument, ast.Name):
+                exempt_names.add(argument.id)          # _to_ui(show)
+            elif isinstance(argument, ast.Attribute):
+                exempt_names.add(argument.attr)        # _to_ui(self.done)
+            for inner in ast.walk(argument):
+                exempt_nodes.add(id(inner))            # _to_ui(lambda: ...)
+
+    # A function passed to _to_ui by NAME is usually nested INSIDE the worker,
+    # so walking the worker descends into it. Its whole subtree is exempt, not
+    # just its definition — which is the difference between this reporting the
+    # Grapher's interactive path as a violation and not.
+    for name, function in nested.items():
+        if name in exempt_names:
+            for inner in ast.walk(function):
+                exempt_nodes.add(id(inner))
+
+    wanted = set(widgets)
+    found = []
+    for name, worker in nested.items():
+        if name in exempt_names:
+            continue
+        for node in ast.walk(worker):
+            if id(node) in exempt_nodes:
+                continue
+            if (isinstance(node, ast.Attribute)
+                    and isinstance(node.value, ast.Attribute)
+                    and isinstance(node.value.value, ast.Name)
+                    and node.value.value.id == "self"
+                    and node.value.attr in wanted):
+                found.append(f"self.{node.value.attr}.{node.attr}")
+    return sorted(set(found))

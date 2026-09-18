@@ -395,3 +395,117 @@ def build_figure(frame: Any, key: str, columns: Sequence[str],
         return FigureResult(False, message=f"✗ {key} produced no figure.")
     return FigureResult(True, figure,
                         f"{key}: {', '.join(str(c) for c in columns)}")
+
+
+# ============================================================
+# The interactive (browser) path
+# ============================================================
+# Plotly writes HTML and the system browser draws it. NOT embedded: the Tk
+# build's embedded HTML widget has no JavaScript engine — its own comment says
+# it "can only ever show a static shell" — so the browser is the only route
+# that has ever produced an interactive chart here.
+
+def plotly_types() -> frozenset:
+    """Plot types the Plotly renderer can actually draw.
+
+    Read from its dispatch rather than listed here, so a renderer that gains a
+    type is offered it without anyone remembering, and one that loses a type
+    stops being offered it. The alternative is a picker that offers a chart
+    whose only output is "Unknown plot type".
+    """
+    import inspect
+    import re
+
+    import graph_engine
+
+    try:
+        source = inspect.getsource(graph_engine.PlotlyRenderer._dispatch)
+    except (OSError, TypeError):                          # pragma: no cover
+        return frozenset()
+    return frozenset(re.findall(r'if t == "([a-z_0-9]+)"', source))
+
+
+def spec_for(key: str, frame: Any, columns: Sequence[str], *,
+             title: str = "", theme: str = "plotly_dark") -> Any:
+    """A PlotSpec from a column selection.
+
+    The two halves of this tab speak different vocabularies: the offline pane
+    picks a `plot_registry` key, the interactive one wants a PlotSpec with
+    named x/y/colour columns. Mapping the first onto the second is the only
+    reason a user can press either button with one selection.
+
+    X is the first column, Y the second. That is the order the pickers list
+    them in and the order every plot in the registry reads them.
+    """
+    import graph_engine
+
+    columns = list(columns)
+    roles = roles_for(frame)
+    # A datetime column is the X axis whatever position it was picked in — a
+    # time series plotted with time on Y is not a chart anyone wanted.
+    dated = [c for c in columns if roles.get(c) == "datetime"]
+    ordered = dated + [c for c in columns if c not in dated]
+    return graph_engine.PlotSpec(
+        plot_type=key,
+        x_col=ordered[0] if ordered else None,
+        y_col=ordered[1] if len(ordered) > 1 else None,
+        color_col=ordered[2] if len(ordered) > 2 else None,
+        columns=list(ordered),
+        title=title,
+        theme=theme,
+        renderer="plotly")
+
+
+@dataclass
+class HtmlResult:
+    ok: bool
+    path: Optional[Path] = None
+    message: str = ""
+
+
+def render_html(session: "Session", key: str, columns: Sequence[str],
+                out_dir: Any, *, title: str = "") -> HtmlResult:
+    """Write an interactive chart and say where it went. NEVER raises.
+
+    Drawn from `working()`, so the interactive chart is the SAME data as the
+    offline one. In the Tk tab only this path applies the transforms, which is
+    how the two views come to disagree.
+    """
+    import datetime
+
+    import graph_engine
+
+    columns = list(columns)
+    if not key or not columns:
+        return HtmlResult(False, message="Pick columns and a plot type first.")
+    if key not in plotly_types():
+        return HtmlResult(
+            False, message=f"{key} has no interactive version — it is an "
+                           f"offline plot. Use Plot for it.")
+
+    working = session.working()
+    if working.df is None:
+        return HtmlResult(False, message="Load a data file first.")
+
+    spec = spec_for(key, working.df, columns, title=title)
+    overlay, blocked = session._overlay_for(spec)
+    try:
+        renderer = graph_engine.PlotlyRenderer()
+        if overlay is not None:
+            html = renderer._overlay_render(spec, working.dataset, overlay)
+        else:
+            html = renderer.render(spec, working.dataset)
+    except Exception as exc:                              # noqa: BLE001
+        return HtmlResult(False, message=f"Could not render: {exc}")
+
+    try:
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.datetime.now().strftime("%H%M%S")
+        path = out_dir / f"plot_{stamp}_{key}.html"
+        path.write_text(html, encoding="utf-8")
+    except OSError as exc:
+        return HtmlResult(False, message=f"Could not save the chart: {exc}")
+
+    note = f" — {blocked}" if blocked else ""
+    return HtmlResult(True, path, f"opened {path.name}{note}")
