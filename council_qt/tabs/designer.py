@@ -318,22 +318,37 @@ class DesignerTab(ViewHelpers, QWidget):
         self._load(result.shapes)
 
     def on_wizard(self) -> None:
-        """Guided start. Wired by the host, because the wizard is its own
-        dialog; without one this says so rather than doing nothing."""
+        """Guided start.
+
+        The wizard WRITES NOTHING — it hands back a layout and `on_wizard_done`
+        applies it — so cancelling leaves no half-made project behind.
+
+        A host may substitute its own by setting `open_gui_wizard`; that is the
+        seam the tests use, and it is why this never constructs a dialog when
+        one has been supplied.
+        """
         opener = getattr(self.window, "open_gui_wizard", None)
         if opener is None:
-            self.log("wizard unavailable in this build")
-            return
-        opener(on_done=self.on_wizard_done, log=self.log,
-               existing=self.actions.list_names())
+            from ..wizard import open_wizard
+            opener = open_wizard
+        self._wizard = opener(parent=self, on_done=self.on_wizard_done,
+                              log=self.log,
+                              existing=self.actions.list_names())
 
     def on_wizard_done(self, result) -> None:
+        """Apply a finished wizard.
+
+        Always a NEW project, which is what makes the destructive `load` safe
+        here: there is nothing on the canvas to destroy.
+        """
         applied = dp.create_from_wizard(result, self.actions.vault_dir)
         self.log(applied.message)
         if not applied.ok:
             return
         self.project = applied.name
         self._load(applied.shapes)
+        self.canvas.scene.mark_saved()
+        self._refresh_status()
 
     def on_save(self) -> None:
         if not self.project:
