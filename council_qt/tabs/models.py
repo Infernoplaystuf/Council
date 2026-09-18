@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (QCheckBox, QHBoxLayout, QHeaderView, QLabel,
                                QVBoxLayout, QWidget)
 
 from council_core import model_jobs
+from council_core import paths
 
 from .. import dialogs, theme
 from ..view import ViewHelpers, amp
@@ -39,7 +40,7 @@ class ModelsActions:
     """What the Models tab can ask the application to do."""
 
     def __init__(self, vault_dir: Optional[Path] = None):
-        self.vault_dir = Path(vault_dir or Path.home() / "council_vault")
+        self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
 
     def detect(self):
         return model_jobs.detect_hardware()

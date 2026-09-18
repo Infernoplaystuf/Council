@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (QGroupBox, QHBoxLayout, QLabel, QListWidget,
 from PySide6.QtCore import Qt
 
 from council_core import forge_jobs
+from council_core import paths
 
 from .. import theme
 from ..view import ViewHelpers
@@ -33,7 +34,7 @@ class ForgeActions:
     """What the Tool Creation tab can ask the application to do."""
 
     def __init__(self, vault_dir: Optional[Path] = None):
-        self.vault_dir = Path(vault_dir or Path.home() / "council_vault")
+        self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
 
     def list_tools(self):
         return forge_jobs.list_tools(self.vault_dir)

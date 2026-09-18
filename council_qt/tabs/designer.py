@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (QGroupBox, QHBoxLayout, QLabel, QListWidget,
                                QPlainTextEdit, QSplitter, QVBoxLayout, QWidget)
 
 from council_core import designer_form as form
+from council_core import paths
 from council_core import designer_project as dp
 from council_core.designer_editor import Scene
 from gui_shapes import PALETTE
@@ -53,7 +54,7 @@ class DesignerActions:
     """
 
     def __init__(self, vault_dir: Optional[Path] = None):
-        self.vault_dir = Path(vault_dir or Path.home() / "council_vault")
+        self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
 
     def project_dir(self, name: str) -> Optional[Path]:
         if not name:

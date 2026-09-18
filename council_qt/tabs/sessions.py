@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (QGroupBox, QHBoxLayout, QLabel, QLineEdit,
                                QWidget)
 
 from council_core import sessions as sessions_core
+from council_core import paths
 
 from .. import theme
 from ..view import ViewHelpers
@@ -35,7 +36,7 @@ class SessionsActions:
 
     def __init__(self, vault_dir: Optional[Path] = None, store=None,
                  models=None):
-        self.vault_dir = Path(vault_dir or Path.home() / "council_vault")
+        self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
         self._store = store
         self.models = models
 

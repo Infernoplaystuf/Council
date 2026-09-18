@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (QComboBox, QGroupBox, QHBoxLayout, QLabel,
 from PySide6.QtCore import Qt
 
 from council_core import specialists_ops as ops
+from council_core import paths
 
 from .. import dialogs, theme
 from ..view import ViewHelpers
@@ -46,7 +47,7 @@ class SpecialistsActions:
     """What the Specialists tab can ask the application to do."""
 
     def __init__(self, vault_dir: Optional[Path] = None):
-        self.vault_dir = Path(vault_dir or Path.home() / "council_vault")
+        self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
 
     def load(self):
         return ops.load(self.vault_dir, enabled_only=False)

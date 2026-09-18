@@ -34,6 +34,8 @@ from typing import Optional
 
 from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
 
+from council_core import paths
+
 from . import theme
 from .window import CouncilWindow
 
@@ -55,7 +57,7 @@ class StandaloneHost:
                  title: str = "Council Module",
                  geometry: str = "1100x760",
                  theme_name: str = "dark"):
-        self.vault_dir = Path(vault_dir or Path.home() / "council_vault")
+        self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
         self.vault_dir.mkdir(parents=True, exist_ok=True)
 
         self._owns_app = QApplication.instance() is None

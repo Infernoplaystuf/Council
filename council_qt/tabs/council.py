@@ -60,6 +60,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFrame,
                                QTextEdit, QVBoxLayout, QWidget)
 
 from council_core import council_options
+from council_core import paths
 from council_core import transcript as transcript_core
 
 from .. import theme
@@ -98,7 +99,7 @@ class CouncilActions:
         pass
 
     def __init__(self, vault_dir: Optional[Path] = None, demo_mode: bool = False):
-        self.vault_dir = Path(vault_dir or Path.home() / "council_vault")
+        self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
         self.demo_mode = bool(demo_mode)
         self._models = None
         self._models_problem = ""

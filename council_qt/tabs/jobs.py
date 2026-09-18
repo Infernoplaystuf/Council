@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (QGroupBox, QHBoxLayout, QHeaderView, QLabel,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from council_core import jobs as jobs_core
+from council_core import paths
 
 from .. import theme
 from ..view import ViewHelpers
@@ -37,7 +38,7 @@ class JobsActions:
     """What the Agent Jobs tab can ask the application to do."""
 
     def __init__(self, runner=None, vault_dir: Optional[Path] = None):
-        self.vault_dir = Path(vault_dir or Path.home() / "council_vault")
+        self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
         self._runner = runner
 
     def runner(self):

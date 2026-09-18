@@ -48,9 +48,9 @@ class LensActions:
         from council_core import council_turn
 
         if self._models is None and not self._problem:
-            from pathlib import Path
+            from council_core import paths
             self._models, self._problem = council_turn.load_personalities(
-                Path.home() / "council_vault")
+                paths.vault_dir())
         return self._models, self._problem
 
     def available_roles(self) -> Dict[str, bool]:

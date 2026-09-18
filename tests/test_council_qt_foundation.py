@@ -309,7 +309,7 @@ def test_the_application_actually_exits(tmp_path):
     assert "exited 0" in done.stdout, (done.stdout, done.stderr)
 
 
-def test_the_standalone_host_matches_the_tk_contract(qapp):
+def test_the_standalone_host_matches_the_tk_contract(qapp, tmp_path):
     """council_modules.StandaloneHost is the contract a family of tab modules is
     written against — tab_grapher here, tab_ideas and tab_video on other
     branches. A ported tab module must be able to change which host it imports
@@ -327,7 +327,7 @@ def test_the_standalone_host_matches_the_tk_contract(qapp):
     for role in MODEL_ROLES:
         assert f'"{role}"' in tk_src, f"{role} is not a role on the Tk host"
 
-    host = StandaloneHost(title="test")
+    host = StandaloneHost(title="test", vault_dir=tmp_path)
     for role in MODEL_ROLES:
         assert getattr(host, role) is None
     assert host.root is host.window
@@ -336,12 +336,12 @@ def test_the_standalone_host_matches_the_tk_contract(qapp):
     host.window.request_close()
 
 
-def test_the_standalone_host_schedules_safely_from_a_worker(qapp):
+def test_the_standalone_host_schedules_safely_from_a_worker(qapp, tmp_path):
     """The Tk host delegates after() straight to root.after, which is only safe
     on the UI thread. Moving to Qt makes a tab module that was quietly wrong
     right — provided the host routes through the bridge."""
     from council_qt.host import StandaloneHost
-    host = StandaloneHost(title="test")
+    host = StandaloneHost(title="test", vault_dir=tmp_path)
     seen = []
     t = threading.Thread(target=lambda: host.after(0, seen.append, "worker"),
                          daemon=True)
@@ -881,13 +881,13 @@ def test_a_failing_callback_prints_a_traceback(qapp, capsys):
     bridge.stop()
 
 
-def test_the_standalone_host_does_not_evict_the_tab_widget(qapp):
+def test_the_standalone_host_does_not_evict_the_tab_widget(qapp, tmp_path):
     """setCentralWidget replaced CouncilWindow's QTabWidget. The window still
     held it and never showed it again, so anything a hosted module added
     through the window went to a widget nobody could see."""
     from council_qt.host import StandaloneHost
 
-    host = StandaloneHost(title="Probe")
+    host = StandaloneHost(title="Probe", vault_dir=tmp_path)
     assert host.window.centralWidget() is host.window.tabs, (
         "the tab widget was evicted again")
     assert host.window.tabs.count() >= 1
@@ -895,22 +895,22 @@ def test_the_standalone_host_does_not_evict_the_tab_widget(qapp):
     host.window.request_close()
 
 
-def test_a_single_hosted_module_shows_no_tab_bar(qapp):
+def test_a_single_hosted_module_shows_no_tab_bar(qapp, tmp_path):
     """One tab is not a tab bar; it is a title the user cannot click."""
     from council_qt.host import StandaloneHost
 
-    host = StandaloneHost(title="Probe")
+    host = StandaloneHost(title="Probe", vault_dir=tmp_path)
     assert not host.window.tabs.tabBar().isVisible()
     host.window.request_close()
 
 
-def test_the_host_applies_the_theme_it_was_given(qapp):
+def test_the_host_applies_the_theme_it_was_given(qapp, tmp_path):
     """Guarded on _owns_app, so StandaloneHost(theme_name="light") inside an
     existing QApplication silently stayed dark — and theme_name was stored
     nowhere and read by nothing."""
     from council_qt.host import StandaloneHost
 
-    host = StandaloneHost(title="Probe", theme_name="light")
+    host = StandaloneHost(title="Probe", theme_name="light", vault_dir=tmp_path)
     assert host.theme_name == "light"
     window_colour = qapp.palette().window().color().lightness()
     assert window_colour > 127, "the light theme was not applied"
@@ -1162,6 +1162,31 @@ def test_no_tab_test_builds_actions_against_the_real_vault():
                  if name.endswith("Actions")]
     assert not offenders, (
         "these build an Actions with the DEFAULT vault — the user's real one:\n"
+        + "\n".join(offenders))
+
+
+def test_no_test_builds_a_standalone_host_without_a_vault():
+    """StandaloneHost MKDIRS whatever vault it is given, and with
+    council_core.paths fixed that default is now the user's real one. Five
+    tests here did exactly that — harmless only because the directory already
+    existed."""
+    import ast
+
+    tests_dir = Path(__file__).resolve().parent
+    offenders = []
+    for path in sorted(tests_dir.glob("test_*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "StandaloneHost"
+                    and not any(k.arg == "vault_dir" for k in node.keywords)):
+                offenders.append(f"{path.name}:{node.lineno}")
+    assert not offenders, (
+        "these build a host that will mkdir the real vault:\n"
         + "\n".join(offenders))
 
 

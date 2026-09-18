@@ -1172,12 +1172,13 @@ def _default_vault_dir() -> Path:
     """Where the vault is, without importing the engine.
 
     council_gui_engine sets VAULT_DIR at import, and importing it costs ~4
-    seconds and builds the backend banner. If it is already loaded, use its
-    answer; otherwise use the documented default.
+    seconds and builds the backend banner. `council_core.paths` asks it if it
+    is already loaded and otherwise derives the same answer — including the
+    two environment variables, which this function's own hard-coded default
+    silently ignored.
     """
-    engine = sys.modules.get("council_gui_engine")
-    vault = getattr(engine, "VAULT_DIR", None) if engine else None
-    return Path(str(vault)) if vault else Path.home() / ".council" / "vault"
+    from council_core import paths
+    return paths.vault_dir()
 
 
 def build_vault(window) -> QWidget:
