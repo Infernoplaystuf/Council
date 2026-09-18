@@ -21,6 +21,7 @@ from .council import build_council
 from .designer import build_designer
 from .diagnostics import build_diagnostics
 from .librarian import build_librarian
+from .nodes import build_nodes
 from .changelog import build_changelog
 from .forge import build_forge
 from .jobs import build_jobs
@@ -55,6 +56,7 @@ REGISTRY = [
 #: would put those operations in front of users who never asked for them.
 ADVANCED_REGISTRY = [
     ("📚 Librarian", build_librarian, False),
+    ("🖧 Nodes", build_nodes, False),
 ]
 
 
@@ -64,7 +66,7 @@ def registry(advanced: bool = False):
 
 
 __all__ = ["REGISTRY", "ADVANCED_REGISTRY", "registry",
-           "build_changelog", "build_council", "build_librarian",
+           "build_changelog", "build_council", "build_librarian", "build_nodes",
            "build_designer", "build_diagnostics", "build_forge",
            "build_jobs",
            "build_lens", "build_models", "build_sessions",
