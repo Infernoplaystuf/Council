@@ -7,6 +7,11 @@ untouched and stays the shipping app until the port is finished.
 Both entry points read the same vault and the same engine, so run ONE at a time.
 There is no single-instance guard in this project yet (there never was), and two
 copies would mean two chromadb clients on one store and two GGUF loads.
+
+The startup chain — crash hooks, splash, reveal, onboarding — lives in
+`council_qt.launch`, over the decisions in `council_core.startup`. It is out of
+this file because a launch nobody can drive is a launch nobody checks, and this
+is the one code path where every failure is invisible: no window, no error.
 """
 from __future__ import annotations
 
@@ -23,39 +28,19 @@ def main() -> int:
     import branding
     branding.set_app_user_model_id()
 
-    from PySide6.QtWidgets import QApplication
-
-    from council_qt import theme
-    from council_qt.window import CouncilWindow
-
-    app = QApplication(sys.argv)
-    theme.apply(app, "dark")
-
-    window = CouncilWindow()
-    _register_tabs(window)
-    # WITHOUT THIS, CLOSING THE QT APP DID NONE OF THE CLOSE-TIME WORK.
-    # `on_close` is an empty base method and nothing assigned it, so the
-    # conversation log was never ended, the GPU-crash sentinel survived a clean
-    # run (forcing CPU on the next launch), the self-improvement analyzers
-    # never ran, and pooled DB connections were left to socket teardown. All
-    # four are invisible, which is why it went unnoticed for the whole of
-    # phase 5.
-    window.on_close = _shutdown
-    # THE PROCESS MUST ACTUALLY EXIT. Measured while building this: quitting
-    # with the bridge's pump timer still running left the interpreter alive
-    # after exec() returned — a window the user closed, and a process still in
-    # Task Manager. aboutToQuit fires however the app was ended (the window's X,
-    # quit(), or a session logout), so the teardown hangs off that rather than
-    # off one code path remembering to call it.
-    app.aboutToQuit.connect(window.request_close)
-    window.show()
-    code = app.exec()
-    window.request_close()          # idempotent; covers exec() returning early
-    return code
+    from council_qt.launch import launch
+    return launch(sys.argv, register=_register_tabs, shutdown=_shutdown)
 
 
 def _shutdown() -> None:
     """The close-time work, shared with the Tk shell.
+
+    WITHOUT THIS, CLOSING THE QT APP DID NONE OF IT. `on_close` is an empty
+    base method and nothing assigned it, so the conversation log was never
+    ended, the GPU-crash sentinel survived a clean run (forcing CPU on the next
+    launch), the self-improvement analyzers never ran, and pooled DB
+    connections were left to socket teardown. All four are invisible, which is
+    why it went unnoticed for the whole of phase 5.
 
     Never raises: a user who clicks X and gets a traceback, or a window that
     refuses to close because an optional analyzer is unhappy, is worse than any

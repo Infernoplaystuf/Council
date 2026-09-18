@@ -935,17 +935,44 @@ def test_a_tab_that_is_absent_is_distinguishable_from_one_not_yet_built(qapp):
 
 # -- the close-time work ------------------------------------------------------
 
-def test_the_qt_build_runs_the_close_work_at_all():
+def test_the_qt_build_runs_the_close_work_at_all(qapp, tmp_path, monkeypatch):
     """It ran none of it: on_close is an empty base method and nothing ever
     assigned it. Four invisible jobs — ending the conversation log, clearing
     the GPU-crash sentinel, the analyzers, disposing DB engines — were simply
-    skipped every time the app closed."""
+    skipped every time the app closed.
+
+    This used to assert `"window.on_close" in council_qt.py`. That passed for
+    the right reason and then failed for the wrong one the moment the wiring
+    moved into council_qt.launch — a string check on a file cannot tell those
+    apart. So it drives the chain instead and asks the window what it got.
+    """
     import ast
+
+    from PySide6.QtWidgets import QMainWindow
+
+    from council_qt.launch import build
+
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(tmp_path / "vault"))
+    monkeypatch.setenv("COUNCIL_NO_SPLASH", "1")
+
+    class Probe(QMainWindow):
+        def __init__(self):
+            super().__init__()
+            self.on_close = None
+
+        def request_close(self):
+            pass
+
+    called = []
+    _app, window, _plan = build([], window_factory=Probe,
+                                shutdown=lambda: called.append(1))
+    assert window.on_close is not None, "on_close is still never assigned"
+    window.on_close()
+    assert called == [1], "the close-time work was wired to nothing"
+
     source = (Path(__file__).resolve().parent.parent / "council_qt.py"
               ).read_text(encoding="utf-8")
-    assert "window.on_close" in source, "on_close is still never assigned"
-    tree = ast.parse(source)
-    names = {node.name for node in ast.walk(tree)
+    names = {node.name for node in ast.walk(ast.parse(source))
              if isinstance(node, ast.FunctionDef)}
     assert "_shutdown" in names
 
