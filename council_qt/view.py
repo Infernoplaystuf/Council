@@ -23,6 +23,8 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
+from PySide6.QtCore import (QCoreApplication, QObject, Qt, QThread,
+                            Signal)
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import QPushButton, QWidget
 
@@ -44,6 +46,38 @@ def amp(text: str) -> str:
     # caption that was not a string crashed in one tab and not the other.
     # Found while deduplicating them, which is the argument for doing it.
     return str(text).replace("&", "&&")
+
+
+def _on_gui_thread() -> bool:
+    """Whether the caller is the thread that owns the widgets.
+
+    `QCoreApplication.instance()` is None before an app exists — at import
+    time, or in a test that has not built one — and there is no GUI thread to
+    be off in that case, so the answer is yes.
+    """
+    app = QCoreApplication.instance()
+    return app is None or QThread.currentThread() is app.thread()
+
+
+class _Marshal(QObject):
+    """One queued signal, so a worker's callback runs on the GUI thread.
+
+    Deliberately tiny: no queue, no pump timer, no dispatcher. A view without a
+    bridge has no message STREAM to coalesce — it has individual callbacks, and
+    a queued signal is exactly the right size for that. UiBridge stays the road
+    for a view that is part of the app.
+    """
+
+    fire = Signal(object)
+
+    def __init__(self, parent: Optional[QObject] = None):
+        super().__init__(parent)
+        # QueuedConnection is the whole mechanism: the slot runs on the thread
+        # that owns this object, whichever thread does the emitting.
+        self.fire.connect(self._run, Qt.ConnectionType.QueuedConnection)
+
+    def _run(self, fn) -> None:
+        fn()
 
 
 class ViewHelpers:
@@ -84,17 +118,54 @@ class ViewHelpers:
         will not raise — it corrupts quietly. Every worker in every view hands
         its result back through here.
 
-        Falls back to calling directly when there is no bridge, which is how
-        the views behave under test and when hosted outside CouncilWindow. That
-        fallback is safe only because those callers are already on the GUI
-        thread; it is not a licence to run a view without a bridge in the app.
+        WITH NO BRIDGE THIS USED TO CALL DIRECTLY, ON THE CALLER'S THREAD.
+        The rationale said that was safe "because those callers are already on
+        the GUI thread" — and that is exactly false for the case it exists to
+        serve. A view constructed without a bridge (every test, and any module
+        hosted outside CouncilWindow) had EVERY worker touching widgets from
+        the worker thread. It survives most of the time and then does not: a
+        Windows access violation inside the harness that builds all thirteen
+        tabs, reproduced roughly one run in three once three tabs with
+        constructor-time workers were added.
+
+        So the fallback now checks. On the GUI thread, calling directly is
+        genuinely right and costs nothing. Off it, the call goes through a
+        queued signal — the same mechanism UiBridge uses, without its queue or
+        its 50 ms pump, because a bridgeless view has no message stream to
+        coalesce.
         """
-        bridge = getattr(self, "bridge", None) or self._find_bridge()
         guarded = self._guard(fn)
+        bridge = getattr(self, "bridge", None) or self._find_bridge()
         if bridge is not None:
             bridge.call_on_ui(guarded, *args, **kwargs)
-        else:
+            return
+        if _on_gui_thread():
             guarded(*args, **kwargs)
+            return
+        self._marshal().fire.emit(lambda: guarded(*args, **kwargs))
+
+    def _marshal(self) -> "_Marshal":
+        """This view's queued-signal hop, built once.
+
+        THE FIRST VERSION OF THIS BUILT A WHOLE UiBridge, LAZILY, AND LOST
+        EVERY MESSAGE. A UiBridge starts a QTimer and connects a queued signal
+        to itself — and built from inside a worker it belongs to that worker,
+        whose thread has no event loop. That is precisely the trap bridge.py's
+        own docstring opens with, walked into from the other direction.
+
+        So this is moved onto the GUI thread when a worker is the one that
+        needs it first. A queued connection delivers to the receiver's thread
+        as it is at EMIT time, so moving after connecting is what makes the hop
+        land in the right place.
+        """
+        marshal = getattr(self, "_private_marshal", None)
+        if marshal is None:
+            marshal = _Marshal()
+            app = QCoreApplication.instance()
+            if app is not None and QThread.currentThread() is not app.thread():
+                marshal.moveToThread(app.thread())
+            self._private_marshal = marshal
+        return marshal
 
     def _guard(self, fn: Callable) -> Callable:
         """Wrap a callback so it does nothing once this view is gone.

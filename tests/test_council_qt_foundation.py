@@ -565,12 +565,46 @@ def _worker_ui_violations(source: str):
 
 @pytest.fixture
 def window(qapp, tmp_path, monkeypatch):
-    """A window whose tabs build against a scratch vault, not the real one."""
-    monkeypatch.setenv("COUNCIL_VAULT_DIR", str(tmp_path / "vault"))
+    """A window whose tabs build against a scratch vault, not the real one.
+
+    THE VARIABLE WAS WRONG. This set `COUNCIL_VAULT_DIR`, and nothing reads
+    that — the engine and `council_core.paths` both read COUNCIL_VAULT_ROOT —
+    so every tab in this harness has been building against the user's real
+    vault. Harmless while the tabs only listed models; not once tabs arrived
+    that walk the vault on construction.
+
+    AND IT DID NOT WAIT FOR THE WORKERS. Three tabs start one in __init__, and
+    this fixture destroyed the window while they ran. A worker's callback
+    reaching a destroyed widget is a Windows access violation, not an
+    exception: the process dies mid-suite, naming whichever test happened to be
+    running. Reproduced one run in three once those three tabs existed.
+    """
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(tmp_path / "vault"))
     monkeypatch.setenv("COUNCIL_NO_DIALOGS", "1")
     win = CouncilWindow(theme="dark")
     yield win
+    _drain_tab_workers(qapp)
     win.request_close()
+    qapp.processEvents()
+
+
+#: Worker threads the tabs start, by the names they give them.
+TAB_WORKERS = ("vault-health", "nodes-", "librarian-", "designer-", "forge",
+               "council-turn", "models", "jobs", "sessions", "lens")
+
+
+def _drain_tab_workers(qapp, seconds: float = 10.0) -> None:
+    """Wait for any tab worker to finish, pumping so its callback lands."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        alive = [t for t in threading.enumerate()
+                 if t.is_alive() and any(t.name.startswith(prefix)
+                                         for prefix in TAB_WORKERS)]
+        if not alive:
+            break
+        qapp.processEvents()
+        time.sleep(0.01)
+    qapp.processEvents()
 
 
 @pytest.mark.parametrize("title,factory,eager", REGISTERED, ids=REGISTERED_IDS)

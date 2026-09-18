@@ -41,6 +41,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QFileDialog,
                                QScrollArea, QSplitter, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
+from council_core import vault_health
+
 from .. import theme
 from ..view import ViewHelpers, amp
 
@@ -50,12 +52,9 @@ from ..view import ViewHelpers, amp
 PREVIEW_BYTES = 64_000
 
 
-def _human(size: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024 or unit == "GB":
-            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
-        size /= 1024.0
-    return f"{size:.1f} GB"
+#: One formatter, shared with the Vault Health tab. The Tk build has two —
+#: this one and `_fmt_bytes`, which stops at MB and reports 5 GiB as "5MB".
+_human = vault_health.human_size
 
 
 class VaultActions:

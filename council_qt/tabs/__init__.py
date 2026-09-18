@@ -22,6 +22,7 @@ from .designer import build_designer
 from .diagnostics import build_diagnostics
 from .librarian import build_librarian
 from .nodes import build_nodes
+from .vault_health import build_vault_health
 from .changelog import build_changelog
 from .forge import build_forge
 from .jobs import build_jobs
@@ -57,6 +58,7 @@ REGISTRY = [
 ADVANCED_REGISTRY = [
     ("📚 Librarian", build_librarian, False),
     ("🖧 Nodes", build_nodes, False),
+    ("🩺 Vault Health", build_vault_health, False),
 ]
 
 
@@ -66,7 +68,7 @@ def registry(advanced: bool = False):
 
 
 __all__ = ["REGISTRY", "ADVANCED_REGISTRY", "registry",
-           "build_changelog", "build_council", "build_librarian", "build_nodes",
+           "build_changelog", "build_council", "build_librarian", "build_nodes", "build_vault_health",
            "build_designer", "build_diagnostics", "build_forge",
            "build_jobs",
            "build_lens", "build_models", "build_sessions",
