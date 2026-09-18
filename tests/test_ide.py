@@ -202,13 +202,19 @@ def test_a_name_is_made_safe():
 
 
 def test_the_extension_is_stripped_before_the_truncation():
-    """THE DEFECT. Tk cuts to 60 and THEN strips ".py", so a 61-character name
-    ending in ".py" is cut mid-extension, the strip never matches, and the file
-    is called `..._p`."""
-    name = "a" * 61 + ".py"
+    """THE DEFECT. Tk cuts to 60 and THEN strips ".py", so the cut can land
+    INSIDE the extension, the strip never matches, and the file is called
+    `...aa.p`.
+
+    The stem is 58 characters, so the whole name is 61 and Tk's truncation
+    lands between the "p" and the "y". A 61-character STEM would not show it:
+    both orders give the same 60 a's, which is what my first version tested
+    and why the mutation survived.
+    """
+    name = "a" * 58 + ".py"
     result = ide_jobs.script_basename(name)
-    assert not result.endswith("p" * 2)
-    assert result == "a" * ide_jobs.MAX_NAME
+    assert result == "a" * 58, result
+    assert not result.endswith(".p")
 
 
 def test_a_name_is_never_empty():
@@ -519,13 +525,20 @@ def test_output_does_not_steal_the_scrollbar(tab, qapp):
 
 
 def test_output_follows_when_the_reader_is_at_the_bottom(tab, qapp):
+    """Enough new lines that "did not move" and "moved to the end" are far
+    apart. Appending ONE line grows the maximum by about one line, so a pane
+    that never scrolls still lands within a few pixels of the bottom — which
+    is what my first version measured."""
     for i in range(400):
         tab.append(f"line {i}")
     qapp.processEvents()
     bar = tab.output.verticalScrollBar()
     bar.setValue(bar.maximum())
-    tab.append("the newest line")
+    before = bar.value()
+    for i in range(400):
+        tab.append(f"later line {i}")
     qapp.processEvents()
+    assert bar.value() > before + 50, "the pane did not follow the output"
     assert bar.value() >= bar.maximum() - 4
 
 
@@ -537,7 +550,12 @@ def test_a_snapshot_reports_where_it_went(tab, qapp, tmp_path):
             saved.write_text(code, encoding="utf-8")
             return saved
 
+    import threading
+    ran_on = []
     tab.actions._librarian = Librarian()
+    real = tab.actions.snapshot
+    tab.actions.snapshot = lambda code: (
+        ran_on.append(threading.current_thread().name), real(code))[1]
     tab.code.setPlainText("print(1)")
     tab.on_snapshot()
     deadline = time.time() + 5
@@ -546,6 +564,8 @@ def test_a_snapshot_reports_where_it_went(tab, qapp, tmp_path):
         time.sleep(0.005)
     assert "snapshot saved" in tab.output.toPlainText()
     assert saved.exists()
+    # It is a disk write, which the Tk tab does on the GUI thread.
+    assert ran_on and ran_on[0] != "MainThread"
 
 
 def test_snapshotting_an_empty_buffer_says_so(tab, qapp):
