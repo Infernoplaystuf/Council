@@ -385,8 +385,45 @@ def _self_attrs_and_handlers(src: str) -> tuple:
             attrs.append((node.attr, getattr(node, "lineno", 0)))
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if node.name.startswith("on_"):
-                handlers.append((node.name, getattr(node, "lineno", 0)))
+                handlers.append((node.name, getattr(node, "lineno", 0),
+                                 _is_empty_stub(node)))
     return attrs, handlers
+
+
+def _is_empty_stub(node) -> bool:
+    """Whether this handler still does nothing.
+
+    Generate WRITES these — an `on_btn_start` whose whole body is a TODO
+    docstring and a `pass` — into handlers.py, and that file is then
+    hand-written territory. So the orphan check saw the generator's own stub,
+    called it hand-written code,
+    and refused: draw a button, Generate, rename the button, Generate again,
+    and the Designer blocked on a handler the user had never seen, let alone
+    written. That is the flagship flow, blocked out of the box on every project.
+
+    A handler with no statements in it cannot be broken by a rename, because
+    there is nothing in it to break. One the user has filled in still blocks —
+    that is the promise, and it is unchanged.
+    """
+    body = list(node.body)
+    if body and isinstance(body[0], ast.Expr) and isinstance(
+            body[0].value, ast.Constant) and isinstance(
+            body[0].value.value, str):
+        body = body[1:]                      # its docstring
+    for statement in body:
+        if isinstance(statement, ast.Pass):
+            continue
+        if isinstance(statement, ast.Expr) and isinstance(
+                statement.value, ast.Constant) and \
+                statement.value.value is Ellipsis:
+            continue
+        if isinstance(statement, ast.Return) and (
+                statement.value is None
+                or (isinstance(statement.value, ast.Constant)
+                    and statement.value.value is None)):
+            continue
+        return False
+    return True
 
 
 def port_references(pdir: Any) -> List[Tuple[str, str, int]]:
@@ -480,8 +517,14 @@ def find_orphans(pdir: Any, new_widget_names: Iterable[str], *,
                 continue
             seen.add(attr)
             out.append(Orphan("widget", attr, fname, line))
-        for h, line in handlers:
+        for h, line, empty in handlers:
             if h in implied or h in seen:
+                continue
+            # An untouched stub is not hand-written code. Generate writes these
+            # itself, so counting them blocked the flagship flow — draw,
+            # Generate, rename, Generate — on every project, citing a handler
+            # the user had never seen. One with a body in it still blocks.
+            if empty:
                 continue
             # A handler with no widget is not automatically an orphan — the
             # user may call it themselves — so it is reported only when its
