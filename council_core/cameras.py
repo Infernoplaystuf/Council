@@ -37,12 +37,26 @@ the frame rate it buys, which you only get if the sensor reads out less. So
   user dragging a box on screen gets the nearest legal AOI instead of an error
   dialog.
 
-A GRAB RESULT'S ARRAY IS A VIEW INTO A BUFFER THE SDK TAKES BACK
-`grab.Array` does not own its memory. Release() returns that buffer to the
-pool, the next grab writes over it, and any array still referring to it changes
-underneath the reader — which looks like working code right up until the
-display shows a frame that is half old and half new. Every frame leaving this
-module is a copy, and Release happens in a `finally`.
+A TIMED-OUT GRAB IS NOT None, AND THAT IS THE EASY BUG HERE
+`RetrieveResult(timeout, TimeoutHandling_Return)` NEVER returns None. On a
+timeout it returns a perfectly ordinary GrabResult whose `IsValid()` is False —
+measured against the emulator. Testing `if grab is None` therefore never fires,
+and the next line calls `GrabSucceeded()` on an empty result, which throws. On
+a live view the first dropped frame kills the grab loop.
+
+`grab.Array` IS ALREADY A COPY, which this file previously got backwards. The
+docstring here used to claim it was a view into a recycled buffer and defended
+it with `numpy.array(..., copy=True)`. Measured: an array taken from a grab
+result and held across Release() and five further grabs was unchanged. At
+5328x3040 Mono12 that mistaken defence was a 32 MB memcpy per frame on a camera
+rated ~150 fps. Release() still happens in a `finally`, because the RESULT
+must go back to the pool even though the pixels are ours.
+
+A MISSING FEATURE IS NOT None EITHER
+`getattr(camera, "NoSuchFeature", None)` returns a PlaceholderParameter whose
+IsValid() is False — never None. Every `if node is None` guard written against
+the obvious assumption is dead code, and the exception then surfaces from
+SetValue as "the camera refused that area", blaming the camera for a typo.
 """
 from __future__ import annotations
 
@@ -340,8 +354,18 @@ class BaslerBackend(Backend):
                 break
         if target is None:
             raise CameraError(f"camera {info.key!r} is no longer attached")
-        camera = pylon.InstantCamera(tlf.CreateDevice(target))
-        camera.Open()
+        try:
+            camera = pylon.InstantCamera(tlf.CreateDevice(target))
+            camera.Open()
+        except Exception as exc:                            # noqa: BLE001
+            # The characteristic CoaXPress failure is the card already being
+            # held — by the pylon Viewer, or by a previous run of this app
+            # that exited without DestroyDevice. It arrives as a raw GenICam
+            # exception, which every `except CameraError` in the app misses.
+            raise CameraError(
+                f"could not open {info.label}: {exc}. On a CoaXPress camera "
+                f"this usually means something else is holding the frame "
+                f"grabber — close the pylon Viewer and try again") from exc
         return BaslerDevice(info, camera, pylon)
 
 
@@ -357,7 +381,19 @@ class BaslerDevice(Device):
 
     # -- node map helpers ------------------------------------------------
     def _node(self, name: str) -> Any:
-        return getattr(self._cam, name, None)
+        """A camera feature, or None if this model has not got it.
+
+        `getattr` alone is not enough: pypylon answers an unknown feature name
+        with a PlaceholderParameter rather than raising or returning None, and
+        IsValid() is the only thing that tells them apart. Measured.
+        """
+        node = getattr(self._cam, name, None)
+        if node is None:
+            return None
+        valid = getattr(node, "IsValid", None)
+        if valid is not None and not valid():
+            return None
+        return node
 
     def _value(self, name: str, default: Any = 0) -> Any:
         node = self._node(name)
@@ -369,10 +405,26 @@ class BaslerDevice(Device):
             return default
 
     def _set(self, name: str, value: Any) -> None:
+        """Write a feature this camera actually has. Absent ones are skipped.
+
+        Skipping matters: a feature name this model lacks would otherwise
+        throw out of SetValue and be reported as "the camera refused that
+        area" — blaming the camera for a feature it was never asked about.
+        """
         node = self._node(name)
         if node is None:
             return
+        writable = getattr(node, "IsWritable", None)
+        if writable is not None and not writable():
+            return
         node.SetValue(value)
+
+    def _try_set(self, name: str, value: Any) -> None:
+        """Best-effort write for a prerequisite, never fatal."""
+        try:
+            self._set(name, value)
+        except Exception:                                   # noqa: BLE001
+            pass
 
     def limits(self) -> Limits:
         def bound(name: str, getter: str, default: Any) -> Any:
@@ -427,6 +479,15 @@ class BaslerDevice(Device):
         return self.roi()
 
     def set_exposure_us(self, value: float) -> float:
+        """Exposure in microseconds, with the auto loop turned off first.
+
+        With ExposureAuto left Continuous the camera either refuses the write
+        or overwrites it on its next frame, and the control appears to do
+        nothing at all. Both prerequisites exist on the emulator and on the
+        boA5320; a model without them skips the write harmlessly.
+        """
+        self._try_set("ExposureAuto", "Off")
+        self._try_set("ExposureMode", "Timed")
         try:
             self._set("ExposureTime", float(value))
         except Exception as exc:                            # noqa: BLE001
@@ -434,6 +495,8 @@ class BaslerDevice(Device):
         return float(self._value("ExposureTime", value))
 
     def set_gain(self, value: float) -> float:
+        """Gain, with the auto loop turned off first — as for exposure."""
+        self._try_set("GainAuto", "Off")
         try:
             self._set("Gain", float(value))
         except Exception as exc:                            # noqa: BLE001
@@ -460,18 +523,34 @@ class BaslerDevice(Device):
             pass
 
     def read(self, timeout_ms: int = 1000) -> Optional[Frame]:
-        """One frame, COPIED out of the pylon buffer before it is returned."""
-        handling = getattr(self._pylon, "TimeoutHandling_Return", 0)
+        """One frame, or None if none arrived inside the timeout."""
+        if not self._started:
+            # RetrieveResult on a camera that is not grabbing throws. read()
+            # is public and a view can call it once more while stopping.
+            return None
+        handling = self._pylon.TimeoutHandling_Return
         grab = self._cam.RetrieveResult(int(timeout_ms), handling)
         if grab is None:
             return None
         try:
+            # A TIMEOUT IS AN INVALID RESULT, NOT None. Measured: three
+            # 1 ms retrievals against the emulator returned GrabResult
+            # objects with IsValid() False. Calling GrabSucceeded() on one
+            # throws, so without this the first slow frame ends the loop.
+            valid = getattr(grab, "IsValid", None)
+            if valid is not None and not valid():
+                return None
             if not grab.GrabSucceeded():
                 said = _call(grab, "GetErrorDescription") or "grab failed"
                 raise CameraError(str(said))
-            # .Array is a VIEW into a buffer Release() hands back to the pool.
-            # Without this copy the display races the next grab.
-            image = _numpy().array(grab.Array, copy=True)
+            # NOT copied again: .Array already owns its pixels (measured — an
+            # array held across Release() and five further grabs was
+            # unchanged). The copy this line used to make was 32 MB per frame
+            # on a full-frame Mono12 boA5320.
+            image = grab.Array
+            # A tick count, not microseconds — and the boost CXP models do
+            # not support Timestamp at all, so this is 0 on a boA5320. Kept
+            # because other Basler families do fill it in.
             stamp = int(_call(grab, "GetTimeStamp") or 0)
         finally:
             try:
@@ -483,11 +562,23 @@ class BaslerDevice(Device):
                      meta={"kind": "frame"})
 
     def close(self) -> None:
+        """Close the camera AND release the underlying pylon device.
+
+        Close() alone leaves the device attached to the InstantCamera until
+        Python happens to collect it. On CoaXPress the grabber channel is
+        exclusive per process, so that can leave the camera unopenable by the
+        next run — or by the pylon Viewer — until the interpreter exits.
+        pypylon's own context manager calls both, for this reason.
+        """
         self.stop()
-        try:
-            self._cam.Close()
-        except Exception:                                   # noqa: BLE001
-            pass
+        for step in ("Close", "DestroyDevice"):
+            fn = getattr(self._cam, step, None)
+            if fn is None:
+                continue
+            try:
+                fn()
+            except Exception:                               # noqa: BLE001
+                pass
 
 
 # ======================================================================
@@ -499,13 +590,24 @@ class EvkBackend(Backend):
     An EVK4 is a USB3 device carrying an IMX636 sensor: 1280x720, and no
     frames anywhere in its output. What comes back is a CD (contrast
     detection) event stream, which this backend bins into images so the same
-    viewer can show it — see `accumulate_events`.
+    viewer can show it -- see `accumulate_events`.
+
+    THIS PATH HAS NEVER RUN AGAINST HARDWARE OR THE REAL SDK. The Metavision
+    SDK is not on PyPI (installer-only), so unlike the Basler path -- which is
+    verified end to end against real pypylon via its camera emulator -- every
+    call here is written from the published API reference. The first version
+    was WRONG in a way that mattered: it pulled events with a
+    `decoder.get_cd_events()` that does not exist, through a helper that
+    swallowed the AttributeError, so a healthy camera would have opened,
+    reported 1280x720 and then reported silence for ever. That is why nothing
+    critical here goes through a defaulting helper any more.
     """
 
     name = "prophesee"
     kind = "event"
-    install_hint = ("install the Metavision SDK from Prophesee; its Python "
-                    "bindings are built for one specific Python version")
+    install_hint = ("install the Metavision SDK from Prophesee (it is not on "
+                    "PyPI); its Python bindings are built for one specific "
+                    "Python version")
 
     def __init__(self, sdk: Any = None):
         self._sdk = sdk
@@ -514,7 +616,6 @@ class EvkBackend(Backend):
         if self._sdk is not None:
             return self._sdk
         try:
-            from metavision_core.event_io import raw_reader  # noqa: F401
             import metavision_hal
         except ImportError as exc:
             raise CameraError(f"the Metavision SDK is not installed: {exc}") from exc
@@ -552,12 +653,35 @@ class EvkBackend(Backend):
         return EvkDevice(info, device)
 
 
+def _required(device: Any, *names: str) -> Any:
+    """An SDK interface that MUST be there, or a CameraError naming it.
+
+    The opposite of `_call`. Optional accessors differ between SDK versions
+    and a missing one is not a reason to fail a scan -- but an interface the
+    whole backend is built on is different, and defaulting it to None is how
+    the first version of this file turned a fatal mistake into a camera that
+    looked healthy and produced nothing.
+    """
+    for name in names:
+        got = _interface(device, name)
+        if got is not None:
+            return got
+    raise CameraError(
+        f"this Metavision device exposes none of {', '.join(names)} -- the "
+        f"SDK version may not match what this build expects")
+
+
 class EvkDevice(Device):
     """An open EVK4, presented as accumulated images.
 
     `accumulate_ms` is the window each returned image covers. It is NOT an
     exposure: the sensor is free-running and asynchronous, and a longer window
     collects more events rather than more light.
+
+    DECODING IS PUSHED, NOT PULLED. `I_EventsStreamDecoder` has no method that
+    hands back the events it decoded; `decode()` fans them out to callbacks
+    registered on the CD decoder. So the callback is registered once, here,
+    and `read()` drains what it has collected.
     """
 
     def __init__(self, info: CameraInfo, device: Any,
@@ -568,12 +692,49 @@ class EvkDevice(Device):
         self._started = False
         self._roi = Roi()
         self.accumulate_ms = float(accumulate_ms)
-        geo = _interface(device, "get_i_geometry")
+
+        geo = _required(device, "get_i_geometry")
         self._width = int(_call(geo, "get_width") or 1280)
         self._height = int(_call(geo, "get_height") or 720)
-        self._decoder = _interface(device, "get_i_events_stream_decoder")
-        self._stream = _interface(device, "get_i_events_stream")
 
+        self._stream = _required(device, "get_i_events_stream")
+        self._decoder = _required(device, "get_i_events_stream_decoder",
+                                  "get_i_decoder")
+        # The CD decoder is a SEPARATE interface from the stream decoder, and
+        # it is the only place decoded events are delivered.
+        self._cd = _required(device, "get_i_event_cd_decoder",
+                             "get_i_cd_decoder")
+
+        self._pending: List[Any] = []
+        self._pending_lock = threading.Lock()
+        try:
+            self._cd.add_event_buffer_callback(self._on_events)
+        except Exception as exc:                            # noqa: BLE001
+            raise CameraError(f"could not subscribe to CD events: {exc}") from exc
+
+    # ------------------------------------------------------------------
+    def _on_events(self, buffer: Any) -> None:
+        """Called by the decoder, on its own thread, with a RECYCLED buffer.
+
+        The copy is not optional: the decoder owns that memory and hands the
+        same block to the next callback. This is the pylon Release() hazard
+        again, on the other vendor's SDK.
+        """
+        np = _numpy()
+        try:
+            taken = np.array(buffer, copy=True)
+        except Exception:                                   # noqa: BLE001
+            return
+        if taken.size:
+            with self._pending_lock:
+                self._pending.append(taken)
+
+    def _drain(self) -> List[Any]:
+        with self._pending_lock:
+            got, self._pending = self._pending, []
+        return got
+
+    # ------------------------------------------------------------------
     def limits(self) -> Limits:
         # An event sensor has no exposure and no gain, and its ROI is a plain
         # pixel window. Reporting zero ranges is how a view knows not to draw
@@ -590,18 +751,30 @@ class EvkDevice(Device):
         """Set the sensor's own ROI, so unwanted pixels stop emitting.
 
         This is not a crop. An event camera's bottleneck is event RATE, and a
-        hardware ROI stops the masked pixels producing events at all — which
+        hardware ROI stops the masked pixels producing events at all -- which
         is the difference between a usable stream and a saturated link when
         only part of the scene matters.
+
+        THE RETURN VALUES ARE CHECKED. `set_window` and `enable` report
+        success as a bool rather than raising, so ignoring them makes a
+        refused ROI indistinguishable from an applied one -- and the refused
+        one would then have its width and height used to size every image.
         """
         wanted = fit_roi(roi, self.limits())
         i_roi = _interface(self._dev, "get_i_roi")
         if i_roi is None:
             raise CameraError("this device exposes no ROI control")
         try:
+            mode = getattr(i_roi, "set_mode", None)
+            if mode is not None and hasattr(i_roi, "Mode"):
+                mode(i_roi.Mode.ROI)
             window = i_roi.Window(wanted.x, wanted.y, wanted.w, wanted.h)
-            i_roi.set_window(window)
-            i_roi.enable(True)
+            if i_roi.set_window(window) is False:
+                raise CameraError("the camera refused that window")
+            if i_roi.enable(True) is False:
+                raise CameraError("the camera refused to enable the window")
+        except CameraError:
+            raise
         except Exception as exc:                            # noqa: BLE001
             raise CameraError(f"the camera refused that area: {exc}") from exc
         self._roi = wanted
@@ -611,9 +784,7 @@ class EvkDevice(Device):
         if self._started:
             return
         try:
-            if self._stream is not None:
-                self._stream.start()
-            _call(self._dev, "start")
+            self._stream.start()
         except Exception as exc:                            # noqa: BLE001
             raise CameraError(f"could not start the stream: {exc}") from exc
         self._started = True
@@ -621,11 +792,10 @@ class EvkDevice(Device):
     def stop(self) -> None:
         self._started = False
         try:
-            if self._stream is not None:
-                self._stream.stop()
-            _call(self._dev, "stop")
+            self._stream.stop()
         except Exception:                                   # noqa: BLE001
             pass
+        self._drain()
 
     def read(self, timeout_ms: int = 1000) -> Optional[Frame]:
         """Events for one window, binned into an image.
@@ -635,14 +805,23 @@ class EvkDevice(Device):
         out". The event COUNT and the window travel in `meta`, because an
         image of an event stream on its own is not a measurement.
         """
+        np = _numpy()
         batch = self._poll(timeout_ms)
         if batch is None:
             return None
         xs, ys, pols, stamps = batch
         roi = self.roi()
-        image = accumulate_events(xs, ys, pols, roi.w, roi.h)
+        # EVENTS CARRY ABSOLUTE SENSOR COORDINATES. I_ROI masks pixels in
+        # place; it does not renumber what the survivors report. Binning raw
+        # x/y into an image the size of the window would put every event
+        # outside it -- a blank picture from a working camera, the moment the
+        # window's origin is not (0, 0). int64 first: the SDK's x/y are
+        # unsigned and would wrap on the subtraction.
+        xs = np.asarray(xs, dtype=np.int64) - int(roi.x)
+        ys = np.asarray(ys, dtype=np.int64) - int(roi.y)
+        image = accumulate_events(xs, ys, pols, roi.w, roi.h, np)
         self._index += 1
-        span_us = (int(max(stamps)) - int(min(stamps))) if len(stamps) else 0
+        span_us = (int(stamps.max()) - int(stamps.min())) if len(stamps) else 0
         rate = (len(xs) / (span_us / 1e6)) if span_us > 0 else 0.0
         return Frame(image=image, index=self._index,
                      timestamp_us=int(stamps[-1]) if len(stamps) else 0,
@@ -651,17 +830,27 @@ class EvkDevice(Device):
                            "span_us": span_us, "event_rate_hz": rate})
 
     def _poll(self, timeout_ms: int):
-        """Drain the decoder for one accumulation window."""
-        if self._stream is None:
-            return None
+        """Pump the stream for one accumulation window.
+
+        VECTORISED THROUGHOUT. An EVK4 can emit events in the hundreds of
+        millions per second; a Python loop that calls int() four times per
+        event cannot come close, and the buffers the SDK hands over are
+        structured numpy arrays already.
+        """
+        np = _numpy()
         deadline = time.monotonic() + (self.accumulate_ms / 1000.0)
-        xs: List[int] = []
-        ys: List[int] = []
-        pols: List[int] = []
-        stamps: List[int] = []
         waited = 0.0
         while time.monotonic() < deadline:
-            if _call(self._stream, "poll_buffer", default=0) <= 0:
+            ready = self._stream.poll_buffer()
+            if ready < 0:
+                # NEGATIVE IS NOT "QUIET". The stream has ended -- the camera
+                # was unplugged or a file ran out. Treating it as no-data-yet
+                # spins at a kilohertz for ever while reporting a healthy
+                # camera that simply has nothing to say.
+                self._started = False
+                raise CameraError("the event stream ended -- the camera was "
+                                  "disconnected")
+            if ready == 0:
                 waited += 0.001
                 if waited * 1000.0 >= timeout_ms:
                     break
@@ -670,15 +859,17 @@ class EvkDevice(Device):
             raw = self._stream.get_latest_raw_data()
             if raw is None:
                 continue
+            # decode() does not return events; it fans them out to the CD
+            # callback registered in __init__.
             self._decoder.decode(raw)
-            for ev in _call(self._decoder, "get_cd_events", default=()) or ():
-                xs.append(int(ev[0]))
-                ys.append(int(ev[1]))
-                pols.append(int(ev[2]))
-                stamps.append(int(ev[3]))
-        if not xs:
+
+        buffers = self._drain()
+        if not buffers:
             return None
-        return xs, ys, pols, stamps
+        events = buffers[0] if len(buffers) == 1 else np.concatenate(buffers)
+        if not len(events):
+            return None
+        return (events["x"], events["y"], events["p"], events["t"])
 
     def close(self) -> None:
         self.stop()
@@ -820,9 +1011,13 @@ def discover(known: Optional[Sequence[Backend]] = None) -> Discovery:
             continue
         if not cameras and backend.name == "basler":
             found.notes.append(
-                "basler: pypylon is installed but no camera enumerated — a "
-                "CoaXPress camera needs its frame-grabber driver installed "
-                "and the camera bound to a grabber port")
+                "basler: pypylon is installed but no camera enumerated. For a "
+                "CoaXPress camera (boost series, e.g. boA5320-150cm) the pip "
+                "wheel is not enough: since pypylon 4.0.0 the CXP GenTL "
+                "producer was dropped from the Windows wheel, so install the "
+                "pylon Software Suite with 'CXP Camera Support' ticked, and "
+                "make sure the interface card's applet matches the number of "
+                "CXP cables in use")
         elif not cameras:
             found.notes.append(f"{backend.name}: no cameras found")
         found.cameras.extend(cameras)

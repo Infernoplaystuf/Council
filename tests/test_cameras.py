@@ -82,6 +82,7 @@ class FakeCamera:
         self.Gain = FakeNode(0.0, low=0.0, high=24.0)
         self.grabbing = False
         self.closed = False
+        self.destroyed = False
         self.strategy = None
         self._buffer = np.zeros((4, 4), np.uint8)
 
@@ -101,6 +102,9 @@ class FakeCamera:
     def Close(self):
         self.closed = True
 
+    def DestroyDevice(self):
+        self.destroyed = True
+
     def StartGrabbing(self, strategy=None):
         self.grabbing, self.strategy = True, strategy
 
@@ -113,15 +117,25 @@ class FakeCamera:
 
 
 class FakeGrab:
-    """A grab result whose buffer is REUSED once released."""
+    """A grab result shaped like the real one.
 
-    def __init__(self, buffer, ok=True):
-        self._buffer, self._ok = buffer, ok
+    `.Array` returns a COPY, which is what pypylon actually does — measured:
+    an array held across Release() and five further grabs was unchanged. And
+    a TIMEOUT is a valid Python object whose IsValid() is False, never None.
+    This fake asserted both the other way round, which is how the backend
+    came to test `if grab is None` (dead code) and pay for a second memcpy.
+    """
+
+    def __init__(self, buffer, ok=True, valid=True):
+        self._buffer, self._ok, self._valid = buffer, ok, valid
         self.released = False
+
+    def IsValid(self):
+        return self._valid
 
     @property
     def Array(self):
-        return self._buffer          # a view, not a copy — as in pypylon
+        return self._buffer.copy()   # pypylon hands back pixels you own
 
     def GrabSucceeded(self):
         return self._ok
@@ -283,16 +297,51 @@ def test_set_roi_reports_what_the_camera_took_not_what_was_asked():
 # ======================================================================
 # The buffer-reuse trap
 # ======================================================================
-def test_read_copies_the_frame_out_of_the_pylon_buffer():
-    """The frame must survive Release handing its buffer to the next grab."""
+def test_read_returns_the_pixels_that_were_grabbed():
+    """And they survive Release, because .Array already owns them."""
     backend, pylon = basler()
     device = backend.open(CameraInfo("basler", "40012345"))
     device.start()
     frame = device.read()
     assert frame is not None
-    assert int(frame.image[0][0]) == 7          # what the grab held
-    # Release already overwrote the buffer with 99. A view would show 99.
-    assert not np.any(frame.image == 99), "frame is a view into a reused buffer"
+    assert int(frame.image[0][0]) == 7
+    assert not np.any(frame.image == 99), "the frame tracked a reused buffer"
+
+
+def test_a_timed_out_grab_is_none_rather_than_an_exception():
+    """A TIMEOUT IS NOT None — it is a result whose IsValid() is False.
+
+    Measured: three 1 ms retrievals against the pylon emulator each returned
+    a GrabResult object, never None. Calling GrabSucceeded() on one throws,
+    so a backend that only tests `grab is None` dies on its first slow frame
+    — which on a live view is the first frame the display cannot keep up with.
+    """
+    backend, pylon = basler()
+    device = backend.open(CameraInfo("basler", "40012345"))
+    device.start()
+    timed_out = FakeGrab(np.zeros((2, 2), np.uint8), valid=False)
+    pylon.camera.RetrieveResult = lambda t, h: timed_out
+    assert device.read() is None
+    assert timed_out.released, "a timed-out result was never released"
+
+
+def test_reading_a_stopped_camera_is_none_not_an_exception():
+    """RetrieveResult on a camera that is not grabbing throws."""
+    backend, _ = basler()
+    device = backend.open(CameraInfo("basler", "40012345"))
+    assert device.read() is None
+
+
+def test_close_releases_the_device_not_just_the_camera():
+    """On CoaXPress the grabber channel is exclusive per process.
+
+    Close() alone leaves the device attached until Python collects it, which
+    can leave the camera unopenable by the next run or the pylon Viewer.
+    """
+    backend, pylon = basler()
+    device = backend.open(CameraInfo("basler", "40012345"))
+    device.close()
+    assert pylon.camera.closed and pylon.camera.destroyed
 
 
 def test_read_releases_the_grab_even_when_it_failed():
@@ -306,6 +355,7 @@ def test_read_releases_the_grab_even_when_it_failed():
         return held["grab"]
 
     pylon.camera.RetrieveResult = retrieve
+    device.start()
     with pytest.raises(CameraError):
         device.read()
     assert held["grab"].released, "a failed grab was never released"
@@ -336,7 +386,11 @@ def test_pypylon_present_but_nothing_enumerated_names_the_grabber():
     backend = cameras.BaslerBackend(sdk=FakePylon(devices=[]))
     found = cameras.discover([backend])
     assert found.cameras == []
-    assert any("grabber" in n for n in found.notes), found.notes
+    said = " ".join(found.notes)
+    # Naming the ACTUAL missing piece. Since pypylon 4.0.0 the CXP GenTL
+    # producer is not in the Windows wheel, so "install the driver" is not
+    # the advice that unblocks anyone.
+    assert "pylon Software Suite" in said and "CXP Camera Support" in said, said
 
 
 def test_discovery_finds_a_basler_and_labels_it():
@@ -375,26 +429,116 @@ def test_accumulate_with_no_events_is_a_neutral_field():
 # ======================================================================
 # Prophesee
 # ======================================================================
-class FakeRoi:
+# THESE FAKES MODEL THE DOCUMENTED API, NOT THE ONE THIS FILE FIRST INVENTED.
+# The first version of the backend pulled events with decoder.get_cd_events(),
+# which does not exist, and the fake implemented it -- so the tests passed
+# while a real EVK4 would have opened, reported 1280x720 and then reported
+# silence for ever. Decoding is PUSH: decode() fans buffers out to callbacks
+# registered on the CD decoder, events carry ABSOLUTE sensor coordinates, and
+# the ROI setters report success as a bool rather than raising.
+EVENT_DTYPE = np.dtype([("x", "<u2"), ("y", "<u2"),
+                        ("p", "<i2"), ("t", "<i8")])
+
+
+def events(*triples, t0=1000):
+    """Build a CD buffer: (x, y, polarity) triples."""
+    buf = np.zeros(len(triples), dtype=EVENT_DTYPE)
+    for i, (x, y, p) in enumerate(triples):
+        buf[i] = (x, y, p, t0 + i)
+    return buf
+
+
+class FakeCdDecoder:
+    """I_EventCDDecoder: callbacks in, nothing out."""
+
     def __init__(self):
+        self.callbacks = []
+
+    def add_event_buffer_callback(self, fn):
+        self.callbacks.append(fn)
+
+
+class FakeStreamDecoder:
+    """I_EventsStreamDecoder.decode() dispatches; it returns nothing."""
+
+    def __init__(self, cd, script=()):
+        self._cd = cd
+        self.script = list(script)
+        self.decoded = 0
+
+    def decode(self, raw):
+        self.decoded += 1
+        if not self.script:
+            return                      # decoded nothing; delivers nothing
+        buf = self.script.pop(0)
+        for fn in self._cd.callbacks:
+            fn(buf)
+
+
+class FakeStream:
+    """I_EventsStream: poll_buffer() < 0 means the stream ENDED."""
+
+    def __init__(self, polls=None):
+        self.polls = list(polls) if polls is not None else [1]
+        self.started = False
+        self.stopped = False
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.stopped = True
+
+    def poll_buffer(self):
+        # QUIET once the script runs out, not "data ready" for ever: the real
+        # loop runs for the whole accumulation window, so a fake that always
+        # has data decodes thousands of times and no count is predictable.
+        return self.polls.pop(0) if self.polls else 0
+
+    def get_latest_raw_data(self):
+        return b"raw"
+
+
+class FakeRoi:
+    class Mode:
+        ROI = "roi"
+
+    def __init__(self, accept=True):
         self.window = None
         self.enabled = False
+        self.mode = None
+        self._accept = accept
+
+    def set_mode(self, mode):
+        self.mode = mode
 
     def Window(self, x, y, w, h):
         return (x, y, w, h)
 
     def set_window(self, window):
+        if not self._accept:
+            return False
         self.window = window
+        return True
 
     def enable(self, on):
+        if not self._accept:
+            return False
         self.enabled = bool(on)
+        return True
 
 
 class FakeEvkDevice:
-    def __init__(self, w=1280, h=720):
-        self._roi = FakeRoi()
+    def __init__(self, w=1280, h=720, polls=None, script=(), accept=True,
+                 omit=()):
+        self._roi = FakeRoi(accept)
         self._geo = type("G", (), {"get_width": lambda s: w,
                                    "get_height": lambda s: h})()
+        self._cd = FakeCdDecoder()
+        self._stream = FakeStream(polls)
+        self._decoder = FakeStreamDecoder(self._cd, script)
+        for name in omit:                 # simulate an SDK that lacks one
+            setattr(self, name, None)
 
     def get_i_roi(self):
         return self._roi
@@ -403,34 +547,137 @@ class FakeEvkDevice:
         return self._geo
 
     def get_i_events_stream(self):
-        return None
+        return self._stream
 
     def get_i_events_stream_decoder(self):
-        return None
+        return self._decoder
+
+    def get_i_event_cd_decoder(self):
+        return self._cd
+
+
+def evk(**kw):
+    raw = FakeEvkDevice(**kw)
+    return cameras.EvkDevice(CameraInfo("prophesee", "s", kind="event"),
+                             raw), raw
 
 
 def test_evk_geometry_is_the_imx636_sensor():
-    device = cameras.EvkDevice(CameraInfo("prophesee", "s", kind="event"),
-                               FakeEvkDevice())
+    device, _ = evk()
     limits = device.limits()
     assert (limits.width, limits.height) == (1280, 720)
 
 
+def test_evk_reports_no_exposure_range():
+    """An event sensor has no exposure; a view must be able to tell."""
+    device, _ = evk()
+    assert device.limits().exposure_us == (0.0, 0.0)
+
+
+def test_evk_subscribes_to_cd_events_when_it_opens():
+    """The ONLY way decoded events are delivered.
+
+    Without this the pipeline runs end to end and produces nothing, which is
+    exactly what the first version of this backend did.
+    """
+    _, raw = evk()
+    assert raw._cd.callbacks, "no CD callback was ever registered"
+
+
+def test_a_missing_interface_is_refused_loudly():
+    """Not defaulted to None.
+
+    Silently defaulting is how a fatal mistake became a camera that looked
+    healthy and stayed quiet.
+    """
+    with pytest.raises(CameraError, match="get_i_event_cd_decoder"):
+        evk(omit=("get_i_event_cd_decoder",))
+
+
 def test_evk_roi_is_written_to_the_sensor_and_enabled():
     """A hardware ROI stops masked pixels emitting; a crop would not."""
-    raw = FakeEvkDevice()
-    device = cameras.EvkDevice(CameraInfo("prophesee", "s", kind="event"), raw)
+    device, raw = evk()
     got = device.set_roi(Roi(100, 50, 200, 100))
     assert raw._roi.window == (100, 50, 200, 100)
     assert raw._roi.enabled is True
+    assert raw._roi.mode == FakeRoi.Mode.ROI
     assert got.as_tuple() == (100, 50, 200, 100)
 
 
-def test_evk_reports_no_exposure_range():
-    """An event sensor has no exposure; a view must be able to tell."""
-    device = cameras.EvkDevice(CameraInfo("prophesee", "s", kind="event"),
-                               FakeEvkDevice())
-    assert device.limits().exposure_us == (0.0, 0.0)
+def test_a_refused_roi_is_not_reported_as_applied():
+    """set_window/enable report failure with a BOOL, not an exception.
+
+    Ignoring it makes a refused window indistinguishable from an applied one
+    — and the refused one's size would then be used to shape every image.
+    """
+    device, _ = evk(accept=False)
+    with pytest.raises(CameraError, match="refused"):
+        device.set_roi(Roi(100, 50, 200, 100))
+    assert device.roi().as_tuple() == (0, 0, 1280, 720)
+
+
+def test_events_are_binned_relative_to_the_roi_origin():
+    """IMX636 masks pixels in place; survivors keep ABSOLUTE coordinates.
+
+    Binning raw x/y into a window-sized image puts every event outside it —
+    a blank picture from a working camera, the moment the origin is not 0,0.
+    """
+    device, _ = evk(script=[events((105, 55, 1), (106, 56, 0))])
+    device.set_roi(Roi(100, 50, 40, 20))
+    device.start()
+    frame = device.read(50)
+    assert frame is not None, "a working camera produced no frame"
+    assert frame.image.shape == (20, 40)
+    assert frame.image[5][5] == 255, "the positive event landed nowhere"
+    assert frame.image[6][6] == 0
+
+
+def test_a_lost_camera_is_reported_not_treated_as_quiet():
+    """poll_buffer() < 0 means the stream ended.
+
+    Treating it as no-data-yet spins at a kilohertz for ever while reporting
+    a healthy camera that simply has nothing to say.
+    """
+    device, _ = evk(polls=[-1])
+    device.start()
+    with pytest.raises(CameraError, match="disconnected"):
+        device.read(50)
+
+
+def test_a_quiet_window_is_none_rather_than_a_blank_image():
+    device, _ = evk(polls=[0, 0, 0, 0])
+    device.start()
+    assert device.read(5) is None
+
+
+def test_the_event_buffer_is_copied_out_of_the_decoder():
+    """The decoder owns that memory and hands the same block to the next
+    callback — the pylon Release() hazard, on the other vendor's SDK."""
+    device, raw = evk()
+    buf = events((1, 1, 1))
+    for fn in raw._cd.callbacks:
+        fn(buf)
+    buf["x"] = 999                      # the decoder reuses it
+    held = device._drain()
+    assert held and int(held[0]["x"][0]) == 1, "the backend kept a view"
+
+
+def test_event_frames_carry_the_event_count_and_rate():
+    device, _ = evk(script=[events((10, 10, 1), (11, 11, 1), (12, 12, 0))])
+    device.start()
+    frame = device.read(50)
+    assert frame.meta["kind"] == "event"
+    assert frame.meta["events"] == 3
+    assert frame.meta["window_ms"] == cameras.DEFAULT_ACCUMULATE_MS
+
+
+def test_stopping_drops_events_that_arrived_too_late():
+    device, raw = evk()
+    device.start()
+    for fn in raw._cd.callbacks:
+        fn(events((1, 1, 1)))
+    device.stop()
+    assert device._drain() == []
 
 
 # ======================================================================

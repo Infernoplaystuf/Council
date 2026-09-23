@@ -53,8 +53,20 @@ def test_a_missing_sdk_is_explained_in_the_notes():
     """An empty list with no reason sends the user to check cables."""
     listed = frame_camera.list_cameras()
     notes = listed["notes"]
-    assert "pypylon" in notes or "basler" in notes.lower()
-    assert "prophesee" in notes.lower() or "Metavision" in notes
+    joined = " ".join(notes).lower()
+    assert "pypylon" in joined or "basler" in joined
+    assert "prophesee" in joined or "metavision" in joined
+
+
+def test_the_notes_are_a_list_of_lines_not_one_string():
+    """They go to a LISTBOX port, whose set() iterates what it is given.
+
+    A string becomes one row per character — measured, the first time this
+    ran against a real camera the panel showed 'p', 'r', 'o', ...
+    """
+    notes = frame_camera.list_cameras()["notes"]
+    assert isinstance(notes, list)
+    assert all(isinstance(n, str) and len(n) > 1 for n in notes), notes
 
 
 def test_every_row_carries_its_position():

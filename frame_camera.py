@@ -113,7 +113,11 @@ def list_cameras() -> Dict[str, Any]:
     found = cameras.discover()
     _LIVE.found = found
     rows = [_row(i, c) for i, c in enumerate(found.cameras)]
-    notes = "\n".join(found.notes) or "Every backend was searched."
+    # A LIST, not a joined string. These go to a listbox port, whose
+    # set() iterates what it is given -- a string becomes one row PER
+    # CHARACTER, which is exactly what it did the first time this ran
+    # against a real camera: the panel showed "p", "r", "o", ...
+    notes = list(found.notes) or ["Every backend was searched."]
     if found.cameras:
         summary = f"{len(found.cameras)} camera(s) found."
     else:

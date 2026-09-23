@@ -589,8 +589,79 @@ def window(qapp, tmp_path, monkeypatch):
 
 
 #: Worker threads the tabs start, by the names they give them.
-TAB_WORKERS = ("vault-health", "nodes-", "librarian-", "designer-", "forge",
-               "council-turn", "models", "jobs", "sessions", "lens")
+#
+# EVERY PREFIX HERE MUST ACTUALLY MATCH SOMETHING. This list said "models"
+# for four threads all named "model-<something>", so it matched none of them
+# and the drain never waited for a hardware probe that models.py itself
+# documents as "nearly six seconds, measured". The window was torn down
+# mid-probe and the callback landed on a destroyed widget: a Windows access
+# violation roughly one run in three, blamed on whichever test was running.
+# `test_the_drain_list_covers_every_worker_a_tab_starts` keeps it honest.
+TAB_WORKERS = (
+    "camera-", "capture", "changelog", "collection-", "council-turn",
+    "designer-", "diagnostics", "dream3d-", "forge", "grapher-", "ide-",
+    "jobs-", "keyword-index", "lens-", "librarian-", "model-",
+    "mongo-convert", "nodes-", "sessions-", "tts-", "vault-",
+)
+
+
+def _worker_names_in_source() -> set:
+    """Every literal thread name a tab can end up starting.
+
+    council_core is scanned too: a tab that calls CaptureSession.start()
+    starts a thread named there, and it is no less able to outlive the window
+    for being defined in another package.
+
+    A `name=` that is a VARIABLE is invisible here — designer.py passes one
+    through a helper — so any `name="..."` literal in the same file counts as
+    well. Loose in the safe direction: an extra candidate can only make the
+    drain list more complete.
+    """
+    import ast
+
+    found = set()
+    files = (list(Path("council_qt/tabs").glob("*.py"))
+             + [Path("council_core/capture.py")])
+    for path in sorted(files):
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        threaded = False
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "Thread"):
+                continue
+            threaded = True
+            for kw in node.keywords:
+                if kw.arg == "name" and isinstance(kw.value, ast.Constant)                         and isinstance(kw.value.value, str):
+                    found.add(kw.value.value)
+        if threaded:
+            # Names handed to a helper rather than written at the call.
+            for node in ast.walk(tree):
+                if (isinstance(node, ast.keyword) and node.arg == "name"
+                        and isinstance(node.value, ast.Constant)
+                        and isinstance(node.value.value, str)):
+                    found.add(node.value.value)
+    return found
+
+
+def test_the_drain_list_covers_every_worker_a_tab_starts():
+    """A prefix that matches nothing is worse than no prefix at all.
+
+    It reads as covered, and the crash it was supposed to prevent comes back
+    intermittently — which is exactly what happened with "models".
+    """
+    missed = sorted(n for n in _worker_names_in_source()
+                    if not any(n.startswith(p) for p in TAB_WORKERS))
+    assert not missed, f"no TAB_WORKERS prefix matches: {missed}"
+
+
+def test_every_drain_prefix_matches_a_real_worker():
+    """The other direction: a stale prefix is a lie about what is waited for."""
+    names = _worker_names_in_source()
+    dead = sorted(p for p in TAB_WORKERS
+                  if not any(n.startswith(p) for n in names))
+    assert not dead, f"TAB_WORKERS prefixes that match nothing: {dead}"
 
 
 def _drain_tab_workers(qapp, seconds: float = 10.0) -> None:
