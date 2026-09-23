@@ -17,9 +17,11 @@ default tabs, then the Designer, then advanced.
 """
 from __future__ import annotations
 
+from .capture import build_capture
 from .council import build_council
 from .designer import build_designer
 from .diagnostics import build_diagnostics
+from .dream3d import build_dream3d
 from .librarian import build_librarian
 from .nodes import build_nodes
 from .ide import build_ide
@@ -38,6 +40,7 @@ from .vault import build_vault
 #: (title, factory, eager). Factories take the CouncilWindow.
 REGISTRY = [
     ("⚖ Council", build_council, True),
+    ("📷 Capture", build_capture, False),
     ("🗄 Vault", build_vault, False),
     ("🔍 Lens", build_lens, False),
     ("🛠 Tool Creation", build_forge, False),
@@ -48,6 +51,7 @@ REGISTRY = [
     ("🎓 Specialists", build_specialists, False),
     ("🇺🇸 Models", build_models, False),
     ("📊 Grapher", build_grapher, False),
+    ("🧊 Dream3D", build_dream3d, False),
     ("🎨 GUI Designer", build_designer, False),
     ("Diagnostics", build_diagnostics, False),
 ]
@@ -71,9 +75,9 @@ def registry(advanced: bool = False):
     return list(REGISTRY) + (list(ADVANCED_REGISTRY) if advanced else [])
 
 
-__all__ = ["REGISTRY", "ADVANCED_REGISTRY", "registry",
+__all__ = ["REGISTRY", "ADVANCED_REGISTRY", "registry", "build_capture",
            "build_changelog", "build_council", "build_librarian", "build_ide", "build_nodes", "build_vault_health",
-           "build_designer", "build_diagnostics", "build_forge", "build_grapher",
+           "build_designer", "build_diagnostics", "build_dream3d", "build_forge", "build_grapher",
            "build_jobs",
            "build_lens", "build_models", "build_sessions",
            "build_specialists", "build_speech", "build_vault"]
