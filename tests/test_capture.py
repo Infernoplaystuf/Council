@@ -115,6 +115,37 @@ def test_recorded_files_are_named_by_frame_index_so_gaps_are_visible(tmp_path):
     assert names == ["frame_000001", "frame_000004"]
 
 
+def test_the_default_recorder_writes_images_the_toolchain_can_read(tmp_path):
+    """A capture written as .npy is invisible to every Barbie handler.
+
+    frame_roi, frame_timing and frame_classes all discover frames by
+    IMAGE_SUFFIXES and open them with Pillow.
+    """
+    import frame_classes
+    import frame_timing
+
+    rec = Recorder(tmp_path)
+    rec.open()
+    rec.write(frame(1))
+    written = list(tmp_path.iterdir())
+    assert [p.suffix for p in written] == [".png"]
+    # Not just "a file exists" -- the handlers must actually open it.
+    assert frame_classes.thumbnail(written[0]).shape == (32 * 32,)
+    assert frame_timing.count_bad_frames(tmp_path) == 0
+
+
+def test_a_twelve_bit_frame_keeps_its_pixels(tmp_path):
+    """The file IS the data. Rescaling to look right would measure wrong."""
+    from PIL import Image
+
+    rec = Recorder(tmp_path)
+    rec.open()
+    rec.write(cameras.Frame(image=np.full((4, 4), 4000, np.uint16), index=1))
+    back = np.asarray(Image.open(tmp_path / "frame_000001.png"))
+    assert back.dtype == np.uint16
+    assert back.max() == 4000, "the camera's pixel values were altered"
+
+
 def test_recording_stops_on_the_first_write_failure(tmp_path):
     """A capture with an unreported hole in it is worse than one that ended."""
     def explode(img, path):

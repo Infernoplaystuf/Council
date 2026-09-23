@@ -48,7 +48,7 @@ REGION_CLOSE = re.compile(r"^\s*#\s*endregion\b")
 LINKED_ALLOWLIST = (
     "image_stats", "image_index", "plot_registry", "plots_pane", "graph_data",
     "vault_analyst", "data_index", "df_cache", "stats_cache", "provenance",
-    "frame_timing", "frame_roi", "frame_classes",
+    "frame_timing", "frame_roi", "frame_classes", "frame_camera",
 )
 
 # ============================================================

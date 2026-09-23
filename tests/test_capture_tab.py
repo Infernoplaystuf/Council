@@ -313,7 +313,7 @@ def test_recording_writes_frames(tab, tmp_path):
         for _ in range(30):
             QApplication.processEvents()
             time.sleep(0.01)
-        assert list(tmp_path.glob("frame_*.npy")), "nothing was written"
+        assert list(tmp_path.glob("frame_*.png")), "nothing was written"
     finally:
         tab.on_stop()
 

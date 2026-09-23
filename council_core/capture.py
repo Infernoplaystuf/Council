@@ -103,6 +103,39 @@ class LatestFrame:
         return frame
 
 
+def write_image(image: Any, path: Path) -> None:
+    """A frame as an image file the rest of the Barbie toolchain can read.
+
+    PNG, because `frame_roi`, `frame_timing` and `frame_classes` all discover
+    frames by IMAGE_SUFFIXES and open them with Pillow. A capture written as
+    .npy is invisible to every one of them.
+
+    THE PIXELS ARE WRITTEN AS THE CAMERA PRODUCED THEM. A 12-bit Basler frame
+    arrives as uint16 holding 0..4095, and it is saved as a 16-bit PNG holding
+    0..4095 -- verified lossless round-trip. Rescaling it to fill the 16-bit
+    range would make the picture look right and the MEASUREMENT wrong, and
+    this is a capture app: the file is the data.
+
+    (Known consequence, deliberately not papered over: frame_classes.thumbnail
+    scales 16-bit input by 1/256 on the assumption it fills the full range, so
+    a 12-bit frame reads dark to the classifier. That is a conversion bug in
+    the reader, not a reason for the writer to alter the user's pixels.)
+    """
+    from PIL import Image
+
+    import numpy as np
+    data = np.asarray(image)
+    if data.ndim == 2 and data.dtype == np.uint16:
+        # NO mode= argument. Pillow infers "I;16" from the dtype, and passing
+        # the mode explicitly is deprecated for removal in Pillow 13
+        # (2026-10-15) -- which would break capture outright, not warn.
+        Image.fromarray(data).save(str(path))
+        return
+    if data.ndim == 2 and data.dtype != np.uint8:
+        data = np.clip(data, 0, 255).astype(np.uint8)
+    Image.fromarray(data).save(str(path))
+
+
 class Recorder:
     """Frames to disk, one file each, numbered in grab order.
 
@@ -114,12 +147,14 @@ class Recorder:
     """
 
     def __init__(self, out_dir: Any, stem: str = "frame",
-                 writer: Optional[Callable[[Any, Path], None]] = None):
+                 writer: Optional[Callable[[Any, Path], None]] = None,
+                 suffix: Optional[str] = None):
         self.dir = Path(out_dir)
         self.stem = str(stem) or "frame"
         self.written = 0
-        self._writer = writer or _write_npy
-        self._suffix = ".npy" if writer is None else ""
+        self._writer = writer or write_image
+        self._suffix = suffix if suffix is not None else (
+            ".png" if writer is None else "")
 
     def open(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
@@ -129,11 +164,6 @@ class Recorder:
         self._writer(frame.image, path)
         self.written += 1
         return path
-
-
-def _write_npy(image: Any, path: Path) -> None:
-    import numpy
-    numpy.save(str(path), image)
 
 
 class CaptureSession:
