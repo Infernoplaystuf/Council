@@ -314,7 +314,23 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
             out.say(f"note: ui/ edits will be overwritten: "
                     f"{', '.join(edited)} (backed up first)")
         gui_projects.backup(project_dir)
-        written = gui_emit.emit(spec, project_dir, aliases=plan.aliases)
+        # WHICH TOOLKIT. app.py is created once and never rewritten, so a
+        # project that already HAS one can only be regenerated into the same
+        # toolkit — emitting a Qt ui/ beside a Tk app.py would produce a
+        # project that cannot start, and the failure would look like a bug in
+        # the wireframe. A new project takes the manifest's intent.
+        built_as = gui_projects.toolkit_of(project_dir)
+        wanted = (getattr(manifest, "toolkit", "") or "tk")
+        if built_as and built_as != wanted:
+            out.say(f"this project's app.py is written in {built_as}, but its "
+                    f"manifest asks for {wanted} — regenerating would leave a "
+                    f"ui/ that app.py cannot drive. Create a new project "
+                    f"instead.")
+            out.blocked = True
+            return out
+        target = built_as or wanted
+        written = gui_emit.emit(spec, project_dir, aliases=plan.aliases,
+                                target=target)
         out.say(f"wrote {len(written.files_written)} file(s); "
                 f"kept {len(written.files_skipped)} hand-written")
         if written.handlers_added:

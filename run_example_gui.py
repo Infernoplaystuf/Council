@@ -45,7 +45,7 @@ import gui_spec as gsp         # noqa: E402
 
 
 def build(name: str, *, project: str = "", force: bool = False,
-          vault_dir=None, python: str = "") -> Path:
+          vault_dir=None, python: str = "", target: str = "tk") -> Path:
     """Materialise example ``name`` as a generated project. Returns its dir.
 
     ``python`` is recorded in the project's manifest (see python_envs), so the
@@ -67,7 +67,7 @@ def build(name: str, *, project: str = "", force: bool = False,
                 f"alongside it.\nNOTE: --force deletes app.py and handlers.py "
                 f"too, which regeneration would normally never touch.")
         shutil.rmtree(pdir)
-    gpj.create(project, mode="linked", vault_dir=vault_dir)
+    gpj.create(project, mode="linked", vault_dir=vault_dir, toolkit=target)
 
     # The wireframe goes in first, so the project opens in the designer and
     # can be edited and regenerated like any other.
@@ -87,7 +87,7 @@ def build(name: str, *, project: str = "", force: bool = False,
         raise SystemExit("this example does not validate:\n  "
                          + "\n  ".join(errs))
 
-    res = ge.emit(spec, pdir)
+    res = ge.emit(spec, pdir, target=target)
     man = gpj.load_manifest(pdir)
     man.port_names = spec.port_registry() if hasattr(spec, "port_registry") else {}
     man.widget_names = spec.name_registry()
@@ -120,6 +120,10 @@ def main(argv=None) -> int:
                          "(e.g. pylon) or a path to python.exe. Default: "
                          "this Python. Saved with the project, so the GUI "
                          "Designer's Run uses it too.")
+    ap.add_argument("--target", default="tk", choices=("tk", "qt"),
+                    help="the toolkit to generate into: tk (default) or qt "
+                         "(PySide6). Recorded in the project's manifest, and "
+                         "fixed once app.py exists.")
     args = ap.parse_args(argv)
 
     if not args.example:
@@ -142,12 +146,13 @@ def main(argv=None) -> int:
         args.python = str(Path(args.python).expanduser().absolute())
 
     pdir = build(args.example, project=args.project, force=args.force,
-                 python=args.python)
+                 python=args.python, target=args.target)
     entry = pdir / "main.py"
     # The same preflight the designer's Run makes — policy gate (this path
     # used to have none at all), interpreter, self-check.
     pf = pe.preflight(pdir, args.python, gpj.load_manifest(pdir).mode,
-                      _requires_of(pdir))
+                      _requires_of(pdir),
+                      toolkit=gpj.toolkit_for(pdir))
     print()
     for line in pf.lines:
         print(line)

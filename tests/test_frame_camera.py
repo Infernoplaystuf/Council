@@ -169,20 +169,38 @@ def test_captured_frames_are_readable_by_the_other_handlers(tmp_path):
 
 
 def test_a_second_run_never_overwrites_the_first(tmp_path):
-    """This module cannot delete anything, and must not need to."""
+    """This module cannot delete anything, and must not need to.
+
+    RECONNECTING between the runs is the point. A device numbers frames from
+    its own counter, so two runs on ONE open camera get 1..n then n+1..m and
+    never collide whatever the stem is. Close the camera and reopen it — an
+    app restarted, which is the normal case — and the counter starts at 1
+    again. Only a per-run stem saves the first capture then.
+    """
     connected()
     frame_camera.start(str(tmp_path))
     settle()
     frame_camera.stop()
     first = {p.name for p in tmp_path.glob("*.png")}
     assert first
+    stamps = {p.name: p.stat().st_mtime_ns for p in tmp_path.glob("*.png")}
 
+    frame_camera.disconnect()    # the frame counter restarts from here
     time.sleep(1.1)              # the run stamp has one-second resolution
+    connected()
     frame_camera.start(str(tmp_path))
     settle()
     frame_camera.stop()
     after = {p.name for p in tmp_path.glob("*.png")}
-    assert first < after, "the second run overwrote the first"
+    assert len(after) > len(first), "the second run wrote nothing"
+    # NOT a content check. The simulated camera restarts its counter AND
+    # regenerates identical pixels, so an overwritten frame_000001.png is
+    # byte-identical to the one it replaced — a hash comparison passes while
+    # the first run is being destroyed. The modification time is what
+    # actually distinguishes "still there" from "written over".
+    for name, when in stamps.items():
+        assert (tmp_path / name).stat().st_mtime_ns == when, (
+            f"{name} from the first run was written over")
 
 
 def test_starting_without_a_folder_says_so():

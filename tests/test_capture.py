@@ -220,6 +220,41 @@ def test_a_single_frame_has_no_rate_yet():
 # ======================================================================
 # Start and stop
 # ======================================================================
+def test_starting_warms_the_imports_before_acquisition(monkeypatch):
+    """A free-running camera does not wait for `import numpy`.
+
+    That import happens inside device.read(), and measured cold it took
+    547 ms. If acquisition has already begun, that is half a second of the
+    sensor producing frames nobody is reading.
+    """
+    order = []
+    monkeypatch.setattr(capture, "warm_imports", lambda: order.append("warm"))
+
+    class Recording(FakeDevice):
+        def start(self):
+            order.append("acquire")
+            super().start()
+
+    session = CaptureSession(Recording(total=1))
+    session.start()
+    session.stop()
+    assert order[:2] == ["warm", "acquire"], order
+
+
+def test_warming_never_raises(monkeypatch):
+    """A missing package is the real call's problem, not the warmer's."""
+    import builtins
+    real = builtins.__import__
+
+    def refuse(name, *a, **k):
+        if name in ("numpy", "PIL"):
+            raise ImportError("gone")
+        return real(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", refuse)
+    capture.warm_imports()
+
+
 def test_stop_joins_the_grab_thread_and_says_so():
     session = CaptureSession(FakeDevice(total=3))
     session.start()

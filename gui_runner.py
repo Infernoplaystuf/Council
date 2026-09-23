@@ -368,7 +368,10 @@ def run_checked(project, *, python_spec: str = "", mode: str = "linked",
 
     def _check():
         try:
-            pf = python_envs.preflight(project, python_spec, mode, requires)
+            import gui_projects
+            pf = python_envs.preflight(
+                project, python_spec, mode, requires,
+                toolkit=gui_projects.toolkit_for(project))
         except Exception as exc:
             # Without this the worker died silently and Run sat at
             # "checking ..." for ever, with no message and no preview.

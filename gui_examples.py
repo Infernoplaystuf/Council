@@ -98,6 +98,19 @@ NOTES: Dict[str, str] = {
         "current frame, train and predict; soft results (the class list) "
         "and hard failures (no class picked) handled differently."
     ),
+    "barbie_capture_v4": (
+        "v3 with a LIVE CAMERA driving it — Basler (pypylon) or a Prophesee "
+        "EVK4 (Metavision), through frame_camera. Generate it for Qt: "
+        "`--target qt`, because the live view needs the Qt ImageCanvas's "
+        "set_array. Shows: a camera reached through a top-level allowlisted "
+        "module rather than council_core, which the policy gate refuses; a "
+        "listbox of cameras whose SELECTION (a list) is the script link's "
+        "input; the capture folder doubling as the browse folder, so the "
+        "scrubber reviews what was just captured; the ROI entry driving the "
+        "camera's own AOI, so future frames ARE that size rather than being "
+        "cropped afterwards. The live view itself needs one line in app.py: "
+        "`frame_camera.attach(self)`."
+    ),
 }
 
 # The examples sent to a model when none is named. The newest version teaches

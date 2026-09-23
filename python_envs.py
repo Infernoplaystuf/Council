@@ -171,12 +171,18 @@ def _note(path, text):
 
 out = {"version": "%d.%d.%d" % tuple(sys.version_info[:3]),
        "executable": sys.executable, "tkinter": "", "tkinter_error": "",
+       "pyside6": "", "pyside6_error": "",
        "missing": {}, "not_found": [], "compile_errors": {}}
 try:
     import tkinter
     out["tkinter"] = str(tkinter.TkVersion)
 except Exception as exc:
     out["tkinter_error"] = "%s: %s" % (type(exc).__name__, exc)
+try:
+    import PySide6
+    out["pyside6"] = str(getattr(PySide6, "__version__", "") or "yes")
+except Exception as exc:
+    out["pyside6_error"] = "%s: %s" % (type(exc).__name__, exc)
 for name in req.get("modules", []):
     # Noted BEFORE the import: a native crash kills this process with no
     # chance to report, and the last note is then the only way to say WHICH
@@ -220,6 +226,7 @@ class Probe:
     missing: Dict[str, str] = field(default_factory=dict)
     compile_errors: Dict[str, str] = field(default_factory=dict)
     error: str = ""        # the interpreter itself could not be run
+    pyside6: str = ""      # the Qt target's equivalent of `tkinter`
 
 
 NOT_FOUND = "the app imports it at startup, and this Python does not have it"
@@ -232,9 +239,33 @@ def _read(path: Path) -> str:
         return ""
 
 
+def wants_qt(toolkit: str) -> bool:
+    return (toolkit or "tk").strip().lower() in ("qt", "pyside6")
+
+
+def toolkit_missing(found: Dict[str, Any], toolkit: str = "tk") -> str:
+    """Why this interpreter cannot run a `toolkit` app — or "" if it can.
+
+    THE TOOLKIT THE APP IS WRITTEN IN IS THE ONE THAT MUST BE THERE, and that
+    is the whole point of this function. A PySide6 app never touches tkinter,
+    and a vendor-SDK environment — the one holding pypylon or the Metavision
+    bindings, which is exactly the interpreter a camera app has to run under —
+    very often has no tkinter at all. Demanding tkinter there would refuse to
+    start the app under the only Python that can reach the camera.
+    """
+    if wants_qt(toolkit):
+        if str(found.get("pyside6") or ""):
+            return ""
+        return "it has no PySide6: " + str(found.get("pyside6_error") or "")
+    if str(found.get("tkinter") or ""):
+        return ""
+    return "it has no tkinter: " + str(found.get("tkinter_error") or "")
+
+
 def probe(python: str, *, modules: Sequence[str] = (),
           files: Sequence[str] = (), locate: Sequence[str] = (),
           path: Sequence[str] = (), cwd: Optional[str] = None,
+          toolkit: str = "tk",
           timeout: float = PROBE_TIMEOUT) -> Probe:
     """Ask ``python`` about itself. Never raises.
 
@@ -298,10 +329,12 @@ def probe(python: str, *, modules: Sequence[str] = (),
         missing.setdefault(str(name), NOT_FOUND)
     compile_errors = dict(d.get("compile_errors") or {})
     tk = str(d.get("tkinter") or "")
-    ok = bool(tk) and not missing and not compile_errors
-    pr = Probe(ok, str(d.get("version") or ""), tk, missing, compile_errors)
-    if not tk:
-        pr.error = "it has no tkinter: " + str(d.get("tkinter_error") or "")
+    qt = str(d.get("pyside6") or "")
+    said = toolkit_missing(d, toolkit)
+    ok = not said and not missing and not compile_errors
+    pr = Probe(ok, str(d.get("version") or ""), tk, missing, compile_errors,
+               pyside6=qt)
+    pr.error = said
     return pr
 
 
@@ -360,7 +393,8 @@ class Preflight:
 
 
 def preflight(pdir, spec: str, mode: str = "linked",
-              requires: Sequence[str] = ()) -> Preflight:
+              requires: Sequence[str] = (),
+              toolkit: str = "tk") -> Preflight:
     """The whole pre-launch check, in the order a user needs the answers:
 
       1. the policy gate — with the project's `requires` on its allowlist
@@ -371,7 +405,11 @@ def preflight(pdir, spec: str, mode: str = "linked",
     cannot disagree about whether a project may start."""
     import gui_policy
     requires = gui_policy.as_requires(requires)
-    ok, errs = gui_policy.validate_dir(pdir, mode, requires)
+    # WITHOUT THE TOOLKIT THIS GATE REFUSES EVERY QT PROJECT. PySide6 is
+    # admitted by the toolkit argument alone and never by `requires`, so a
+    # correctly generated Qt app fails its own gate with "'PySide6' is not on
+    # the linked allowlist" — measured, before this argument existed.
+    ok, errs = gui_policy.validate_dir(pdir, mode, requires, toolkit=toolkit)
     if not ok:
         return Preflight(False, "", ["Not started: the policy gate refused "
                                      "this code:"] + ["  - " + e for e in errs])
@@ -386,7 +424,7 @@ def preflight(pdir, spec: str, mode: str = "linked",
         pr = probe(res.python, modules=requires, files=files,
                    locate=[m for m in startup_imports(files)
                            if m not in requires],
-                   path=path, cwd=str(pdir))
+                   path=path, cwd=str(pdir), toolkit=toolkit)
     good = not res.error and pr is not None and pr.ok
     return Preflight(good, res.python if good else "", describe(res, pr))
 

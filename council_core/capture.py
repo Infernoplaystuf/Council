@@ -136,6 +136,41 @@ def write_image(image: Any, path: Path) -> None:
     Image.fromarray(data).save(str(path))
 
 
+def warm_imports() -> None:
+    """Pay for numpy and Pillow BEFORE acquisition begins.
+
+    WHAT THIS DOES NOT DO is make Start faster — the import has to happen
+    somewhere, and measured end to end the time from Start to the first frame
+    is the same either way. The first guess here was wrong about that and the
+    measurement corrected it.
+
+    WHAT IT DOES FIX is a stale first frame. `import numpy` happens inside
+    `device.read()`, and a free-running camera does not wait: with acquisition
+    already started, the first read took 547 ms cold and 0 ms warmed. On a
+    real camera that half-second is the sensor producing frames nobody is
+    reading — discarded under LatestImageOnly, or backing up an event stream —
+    so the first frame actually delivered is half a second old. Warming before
+    `device.start()` means acquisition begins only once the loop can keep up.
+
+    (The second read costs 0 ms, which is why this is a first-frame problem
+    and not a throughput one. Pillow adds ~125 ms on the first write: 31 to
+    import and 94 for `Image.init()`, which builds the plugin registry and is
+    not paid by the import alone.)
+
+    Never raises: a missing package is reported by the real call, which fails
+    loudly. This is an optimisation, not a check.
+    """
+    try:
+        import numpy                                       # noqa: F401
+    except Exception:                                      # noqa: BLE001
+        pass
+    try:
+        from PIL import Image
+        Image.init()
+    except Exception:                                      # noqa: BLE001
+        pass
+
+
 class Recorder:
     """Frames to disk, one file each, numbered in grab order.
 
@@ -158,6 +193,7 @@ class Recorder:
 
     def open(self) -> None:
         self.dir.mkdir(parents=True, exist_ok=True)
+        warm_imports()
 
     def write(self, frame: cameras.Frame) -> Path:
         path = self.dir / f"{self.stem}_{frame.index:06d}{self._suffix}"
@@ -211,6 +247,8 @@ class CaptureSession:
         if self.running:
             return
         self._stopping.clear()
+        # Before the thread, not inside it: see warm_imports.
+        warm_imports()
         self.device.start()
         self._thread = threading.Thread(target=self._loop, name="capture",
                                         daemon=True)

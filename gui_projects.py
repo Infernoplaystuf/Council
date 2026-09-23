@@ -219,18 +219,44 @@ def save_manifest(pdir: Any, m: Manifest) -> None:
 # Lifecycle
 # ============================================================
 
+#: The toolkits a project may be generated into. Mirrors gui_emit.TARGETS,
+#: restated here so creating a project does not import the emitter.
+TOOLKITS = ("tk", "qt")
+
+
+def toolkit_for(pdir: Any) -> str:
+    """The toolkit to TREAT this project as — the fact, else the intent.
+
+    `toolkit_of` reads app.py, which is the fact and is never rewritten;
+    the manifest records what was asked for. Generate and Run both go through
+    here so they cannot disagree about which toolkit a project is, which is
+    the disagreement that ends in a ui/ its app.py cannot drive.
+    """
+    found = toolkit_of(pdir)
+    if found:
+        return found
+    try:
+        return load_manifest(pdir).toolkit or "tk"
+    except Exception:                                     # noqa: BLE001
+        return "tk"
+
+
 def create(name: str, mode: str = "linked",
-           vault_dir: Optional[Any] = None) -> Path:
+           vault_dir: Optional[Any] = None,
+           toolkit: str = "tk") -> Path:
     """Create a project directory and return it. Refuses to overwrite."""
     if mode not in MODES:
         raise ProjectError(f"unknown mode {mode!r}; expected one of {MODES}")
+    if toolkit not in TOOLKITS:
+        raise ProjectError(f"unknown toolkit {toolkit!r}; expected one of "
+                           f"{TOOLKITS}")
     pdir = project_path(name, vault_dir)
     if pdir.exists():
         raise ProjectError(f"project {name!r} already exists at {pdir}")
     (pdir / UI_DIRNAME).mkdir(parents=True)
     (pdir / BACKUPS_DIRNAME).mkdir(exist_ok=True)
     save_manifest(pdir, Manifest(name=_validate_name(name), mode=mode,
-                                 created=_now_stamp()))
+                                 created=_now_stamp(), toolkit=toolkit))
     save_gspec(pdir / GSPEC_NAME,
                Project(project=_validate_name(name), mode=mode))
     return pdir

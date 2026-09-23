@@ -121,6 +121,13 @@ def list_cameras() -> Dict[str, Any]:
     return {"rows": rows, "summary": summary, "notes": notes}
 
 
+def _picked(selection: Any) -> str:
+    """A listbox port's value is its SELECTION (a list); accept a str too."""
+    if isinstance(selection, (list, tuple)):
+        return str(selection[0]).strip() if selection else ""
+    return str(selection if selection is not None else "").strip()
+
+
 def _row(index: int, info: Any) -> str:
     """One line in the camera list.
 
@@ -143,7 +150,11 @@ def _chosen(which: Any) -> Any:
     if found is None or not found.cameras:
         raise RuntimeError("scan for cameras first")
 
-    raw = str(which if which is not None else "").strip()
+    # A LISTBOX PORT'S VALUE IS ITS SELECTION, AND THAT IS A LIST. The
+    # generated handler passes self.ports.cameras.get() straight in, and
+    # str() of a list is "['1. ...']" — which parses as no camera at all.
+    # frame_classes._picked is the same rule for the same reason.
+    raw = _picked(which)
     if not raw:
         raise RuntimeError("choose a camera in the list first")
 
@@ -324,6 +335,71 @@ def pump(show: Callable[[Any], Any],
         if session is not None:
             say(_status_line(session.stats(), frame))
     return frame is not None
+
+
+def attach(app: Any, view: str = "live_view",
+           status: str = "capture_status",
+           interval_ms: int = LIVE_MS) -> Any:
+    """Start the live view. ONE line in app.py, which is never regenerated::
+
+        class App(HandlerMixin, MainUi):
+            def __init__(self, parent=None, **kw):
+                super().__init__(parent)
+                frame_camera.attach(self)
+
+    Everything Qt lives here rather than in the generated project, so the app
+    stays what the wireframe produced. This module may import PySide6 because
+    the policy gate scans the PROJECT directory, not the Council modules a
+    linked app reaches — and the import is lazy, so a Tk app that calls
+    nothing here never pays for it.
+
+    CALL IT FROM THE UI THREAD. It creates a QTimer, and a QTimer created on a
+    worker belongs to that worker's event loop — which a grab thread does not
+    have, so it would simply never fire. `App.__init__` is the UI thread.
+    """
+    from PySide6.QtCore import QTimer
+
+    canvas = _port_widget(app, view)
+    show = getattr(canvas, "set_array", None)
+    if not callable(show):
+        raise RuntimeError(f"the {view!r} port is not an image canvas")
+    say = getattr(_port(app, status), "set", None) if status else None
+
+    timer = QTimer(app)
+    timer.setInterval(int(interval_ms))
+    timer.timeout.connect(lambda: pump(show, say))
+    timer.start()
+    # HELD ON THE APP ON PURPOSE. A QTimer whose last reference goes out of
+    # scope is collected and silently stops firing — the live view would work
+    # for as long as this function's frame existed and then quietly die.
+    app._frame_camera_live = timer
+
+    # A grab thread that outlives its window crashes the application on exit.
+    # Joining it is not the app author's job to remember.
+    instance = getattr(app, "parent", None)
+    try:
+        from PySide6.QtWidgets import QApplication
+        running = QApplication.instance()
+        if running is not None:
+            running.aboutToQuit.connect(shutdown)
+    except Exception:                                     # noqa: BLE001
+        pass
+    return timer
+
+
+def _port(app: Any, name: str) -> Any:
+    ports = getattr(app, "ports", None)
+    found = getattr(ports, name, None) if ports is not None else None
+    if found is None:
+        raise RuntimeError(f"this app has no {name!r} port")
+    return found
+
+
+def _port_widget(app: Any, name: str) -> Any:
+    widget = getattr(_port(app, name), "widget", None)
+    if widget is None:
+        raise RuntimeError(f"the {name!r} port has no widget")
+    return widget
 
 
 def _status_line(stats: Any, frame: Any) -> str:
