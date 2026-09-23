@@ -707,6 +707,8 @@ class EvkDevice(Device):
 
         self._pending: List[Any] = []
         self._pending_lock = threading.Lock()
+        #: Set when poll_buffer reports the source is finished.
+        self._ended = False
         try:
             self._cd.add_event_buffer_callback(self._on_events)
         except Exception as exc:                            # noqa: BLE001
@@ -791,6 +793,7 @@ class EvkDevice(Device):
 
     def stop(self) -> None:
         self._started = False
+        self._ended = False
         try:
             self._stream.stop()
         except Exception:                                   # noqa: BLE001
@@ -843,13 +846,20 @@ class EvkDevice(Device):
         while time.monotonic() < deadline:
             ready = self._stream.poll_buffer()
             if ready < 0:
-                # NEGATIVE IS NOT "QUIET". The stream has ended -- the camera
-                # was unplugged or a file ran out. Treating it as no-data-yet
-                # spins at a kilohertz for ever while reporting a healthy
+                # NEGATIVE IS NOT "QUIET". Measured against a real stream:
+                # poll_buffer goes 0 (nothing yet), 1 (data ready), then -1
+                # for ever once the source is finished. Treating -1 as
+                # no-data-yet spins at a kilohertz while reporting a healthy
                 # camera that simply has nothing to say.
+                #
+                # BUT IT IS NOT AN IMMEDIATE RAISE EITHER. Raising here threw
+                # away whatever this window had already decoded -- the last
+                # events before a camera was unplugged, which are the ones
+                # most worth having. Mark it, deliver the final frame, and
+                # report the end on the next read once nothing is left.
                 self._started = False
-                raise CameraError("the event stream ended -- the camera was "
-                                  "disconnected")
+                self._ended = True
+                break
             if ready == 0:
                 waited += 0.001
                 if waited * 1000.0 >= timeout_ms:
@@ -865,6 +875,10 @@ class EvkDevice(Device):
 
         buffers = self._drain()
         if not buffers:
+            if self._ended:
+                raise CameraError(
+                    "the event stream ended — the recording finished, or the "
+                    "camera was disconnected")
             return None
         events = buffers[0] if len(buffers) == 1 else np.concatenate(buffers)
         if not len(events):

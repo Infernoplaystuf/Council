@@ -644,6 +644,23 @@ def test_a_lost_camera_is_reported_not_treated_as_quiet():
         device.read(50)
 
 
+def test_the_last_events_before_the_end_are_not_thrown_away():
+    """poll_buffer going negative must not discard what was already decoded.
+
+    Measured against a real stream: it goes 0, 1, then -1 for ever. Raising
+    the moment -1 appears threw away that window's events — the last ones
+    before a camera was unplugged, which are the ones most worth having.
+    """
+    device, _ = evk(polls=[1, -1], script=[events((5, 5, 1), (6, 6, 0))])
+    device.start()
+    frame = device.read(50)
+    assert frame is not None, "the final window was discarded"
+    assert frame.meta["events"] == 2
+    # Only once nothing is left does it report the end.
+    with pytest.raises(CameraError, match="ended"):
+        device.read(50)
+
+
 def test_a_quiet_window_is_none_rather_than_a_blank_image():
     device, _ = evk(polls=[0, 0, 0, 0])
     device.start()
