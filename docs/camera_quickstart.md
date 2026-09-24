@@ -1,8 +1,12 @@
 # Running Barbie Capture / Typhon against a real camera
 
 `barbie_capture_v5` is the Barbie GUI with a live camera driving it and a
-setup wizard that runs the first time it opens. `typhon` is the same app under
-another name, in `#045f80`. This is what to do on a machine with a camera.
+setup wizard that runs the first time it opens. `typhon` began as the same app
+in `#045f80` and has since gained what the first EVK4 test asked for: frames
+saved without slowing the camera, the EVK4's `.raw` recorded alongside them,
+and a slider that follows the capture, plays like a video and swaps between
+the PNGs and the raw. **Use Typhon**; v5 has none of that. This is what to do
+on a machine with a camera.
 
 ## What is verified, and what is not
 
@@ -15,8 +19,11 @@ boA5320's own node set.
 **Prophesee / Metavision — verified against a real Metavision build, not a
 camera.** OpenEB was built from source and the backend driven through a
 synthetic EVT2 recording: callback registration, decoding, event fields and
-coordinates, end of stream. Still unproven: enumerating and opening a live
-USB EVK4.
+coordinates, end of stream. The **raw recording** was checked the same way:
+the `.raw` Typhon writes is byte-for-byte what the camera sent, it plays back
+with every event, each window drawn exactly as the live view drew it, and
+PNG ↔ raw lands on the same moment (to the microsecond). Still unproven:
+enumerating and opening a live USB EVK4, and a real EVK4's EVT3 stream.
 
 ## 1. Get the branch
 
@@ -138,12 +145,71 @@ two emulated Basler cameras — the whole workflow can be tried without hardware
 
 1. **Scan for cameras**, select one, **Connect** — the status line reports the
    sensor size.
-2. Pick a **capture folder** with the folder picker at the top left.
-3. **Start capture** — the live view runs and frames are written to that folder
-   as PNGs.
+2. Pick a **capture folder** with the folder picker at the top left. **Make it
+   a folder on this computer**, not a network drive — see below.
+3. **Start capture** — the live view runs and frames are written to that
+   folder.
+4. **Stop capture** when done, then copy the run wherever it needs to go.
 
-The capture folder *is* the browse folder, so the scrubber, **Scan for bad
-timings** and the classifier all work on what you just captured.
+### Save locally, copy afterwards
+
+A network share cannot keep up with a camera. The first EVK4 test saved to a
+NAS and the capture crawled. Frames are now saved on their own thread, so a
+slow disk no longer slows the camera — but frames the disk cannot take in time
+are **not saved**, and the status line counts them (`12 NOT saved (storage too
+slow)`). While capturing into a network share, the status line says so
+(`NETWORK FOLDER: save locally, copy after`).
+
+So: capture into a local folder, press **Stop**, then copy the whole run to
+the NAS. Everything is closed at Stop, so nothing is locked while you copy.
+
+### What a run writes
+
+Each run is named after the time it started, and everything it writes sits
+side by side in the capture folder:
+
+| File | What it is |
+|---|---|
+| `<run>_frame_000001.png` … | What the camera looked like, one per frame (an event camera: one per 20 ms window). |
+| `<run>_frames.csv` | One row per saved PNG: file, frame index, camera timestamp, and for an event camera the event count and where that PNG falls in the `.raw`. |
+| `<run>_events.raw` | **EVK4 only.** Every event the sensor sent, in Prophesee's own format — opens in Metavision Studio and Prophesee's tools. |
+
+The `.raw` is the event camera's real data. A PNG is a 20 ms *picture* of it,
+and PNGs can be skipped when storage falls behind; the `.raw` loses nothing.
+It grows with how much is changing in the scene, so check free space before a
+long run. A second run never overwrites the first — two runs started in the
+same second get `_2`, `_3` on the name.
+
+### The slider
+
+- **While capturing**, the slider's right-hand end is **live**: the view line
+  above the picture says `Live · 240 saved` and the slider grows as frames are
+  saved.
+- **Drag it back** to look at a frame already saved — the capture carries on
+  underneath, and your place stays put while the slider keeps growing. The
+  view line says `PNG 12 / 300 · capturing`. Drag to the end to be live again.
+- **Play / Pause** plays the frames like a video, about 30 a second, from
+  where the slider is; pressing it at the end starts again from the
+  beginning. Played during a capture it becomes live if it catches up, which
+  it only does with a camera slower than that. An EVK4 makes 50 PNGs a
+  second, so drag to the end to go straight to live.
+- **PNG / Raw** (EVK4 runs) swaps to the run's `.raw` **at the same moment**
+  as the PNG on screen, and back again. The raw view is every event in 20 ms
+  windows and plays in real time. It opens straight away and fills in while
+  the file is read; the view line says `reading` until it has all of it. It
+  opens once a run is stopped (the file is still being written until then).
+  Viewing a `.raw` needs the Metavision SDK on that computer.
+
+**Mark this frame** and **Predict this frame** use the PNG on screen; while
+live or in the raw view there is no file on screen for them to use.
+
+### Cropping to a region and saving it
+
+Draw a box on the picture with **Draw ROI** (or type `x, y, w, h` into the ROI
+box), choose **Save cropped frames to**, and press **Save cropped frames**:
+every PNG in the capture folder is cropped to that box and saved there, with
+the originals untouched. It works on the PNGs — during a capture, after it, on
+an EVK4 run as well as a Basler one. It does not crop the `.raw`.
 
 ### The area of interest (Basler)
 
@@ -151,7 +217,8 @@ Type `x, y, w, h` into the ROI box, or drag a rectangle on the live view, then
 **Apply area to camera**. This sets the camera's **own AOI**, so frames arrive
 at that size and are saved at that size. It is snapped to what the sensor
 accepts, and the status line says so when it had to move. **Full sensor** puts
-it back.
+it back. (On an EVK4 run, stop the capture first: changing the area restarts
+the camera, which would cut the `.raw` short, so Typhon refuses.)
 
 ### Reading the status line
 
@@ -159,7 +226,12 @@ it back.
 
 - **dropped** counts frames the *display* never showed — normal and deliberate,
   and shown so the number is never a lie about what the camera did.
-- **saved** never drops. If a write fails, recording stops and says so.
+- **saved** is frames on disk. **waiting to save** appears when the disk is
+  behind; **NOT saved (storage too slow)** counts frames it could not take at
+  all. If a write *fails* (disk full, folder gone), recording stops and says so.
+- **Stop** gives the disk a second to catch up and then hands the window back.
+  Anything still waiting keeps saving and the status line counts it down
+  (`Stopped — still saving`); closing the app waits for it.
 
 An event camera reports events per window and the event rate instead of frames
 per second: it has no frames.
@@ -186,6 +258,11 @@ so a 12-bit frame reads dark *to the classifier*.
 | EVK4: connected, but hardly any events | Expected with a still camera on a still scene: an event camera only reports *change*. Wave a hand in front of it. |
 | EVK4: "Metavision SDK installed" fails | Not installed, or installed for a different Python than the app runs under (3.10–3.12 only). |
 | Camera connects, live view stays blank | Check the AOI — **Full sensor** resets it. |
+| `NOT saved (storage too slow)` in the status line | The folder is on a disk (usually a network share) that cannot keep up. Capture to a local folder and copy the run afterwards. |
+| **PNG / Raw** says `Raw opens after Stop` | The `.raw` is still being recorded. Stop the capture first. |
+| **PNG / Raw** says `No raw file for this run` | A Basler run (only event cameras record a `.raw`), or the `.raw` was not copied along with the PNGs. |
+| **PNG / Raw** says the raw view needs the Metavision SDK | Viewing a `.raw` uses Prophesee's SDK; install it on this computer (Camera setup…, EVK4). |
+| "stop the capture before changing the camera's area" | EVK4 only — see *The area of interest*. |
 
 For an EVK4 the **official installer is the lower-risk route**: it installs the
 USB driver and registers where its plugins live, which removes three of the

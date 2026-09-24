@@ -442,3 +442,223 @@ def test_council_core_would_have_been_refused():
     assert gui_policy.is_council_module("council_core") is True
     assert "council_core" not in gui_policy.allowed_modules("linked", [])
     assert "frame_camera" in gui_policy.allowed_modules("linked", [])
+
+
+# ======================================================================
+# The raw recording, the run index, and the status line
+# ======================================================================
+class RawRecordingCamera(cameras.SyntheticDevice):
+    """The simulated event camera, plus the raw-recording surface EvkDevice
+    has. The real one is verified against OpenEB in test_cameras and
+    test_event_playback; this checks what frame_camera does with it."""
+
+    records_raw = True
+
+    def __init__(self, info):
+        super().__init__(info)
+        self._raw = None
+        self.calls = []
+
+    @property
+    def raw_path(self):
+        return self._raw
+
+    def start_raw(self, path):
+        path = Path(path)
+        if path.exists():
+            raise cameras.CameraError(f"{path.name} already exists")
+        path.write_bytes(b"% end\n")
+        self._raw = path
+        self.calls.append("start_raw")
+        return path
+
+    def stop_raw(self):
+        path, self._raw = self._raw, None
+        if path is not None:
+            self.calls.append("stop_raw")
+        return path
+
+    def start(self):
+        self.calls.append("start")
+        super().start()
+
+    def stop(self):
+        self.stop_raw()
+        super().stop()
+
+
+def connected_raw():
+    from council_core import capture
+
+    info = cameras.CameraInfo("prophesee", "sim-raw", model="EVK4 (simulated)",
+                              kind="event")
+    device = RawRecordingCamera(info)
+    with frame_camera._LOCK:
+        frame_camera._LIVE.device = device
+        frame_camera._LIVE.info = info
+        frame_camera._LIVE.session = capture.CaptureSession(device)
+        frame_camera._LIVE.reported = True
+    return device
+
+
+def test_an_event_run_records_its_raw_beside_the_frames(tmp_path):
+    device = connected_raw()
+    out = frame_camera.start(str(tmp_path))
+    run = out["run"]
+    assert out["raw"] == str(tmp_path / f"{run}_events.raw")
+    assert "Raw:" in out["summary"]
+    settle()
+    stopped = frame_camera.stop()
+    assert (tmp_path / f"{run}_events.raw").exists()
+    assert f"raw {run}_events.raw" in stopped["summary"]
+    # Before the stream, so the file holds the whole run; finished on Stop.
+    assert device.calls[:2] == ["start_raw", "start"]
+    assert device.calls[-1] == "stop_raw"
+
+
+def test_a_frame_camera_run_has_no_raw(tmp_path):
+    connected()
+    out = frame_camera.start(str(tmp_path))
+    settle()
+    frame_camera.stop()
+    assert out["raw"] == ""
+    assert not list(tmp_path.glob("*.raw"))
+
+
+def test_every_run_writes_a_frames_index(tmp_path):
+    import csv
+
+    connected("event")
+    run = frame_camera.start(str(tmp_path))["run"]
+    settle()
+    frame_camera.stop()
+    with open(tmp_path / f"{run}_frames.csv", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    pngs = sorted(p.name for p in tmp_path.glob("*.png"))
+    assert sorted(r["file"] for r in rows) == pngs
+    assert all(r["events"] for r in rows), "event counts missing"
+
+
+def test_two_runs_in_the_same_second_get_different_names(tmp_path, monkeypatch):
+    """The raw log truncates silently, so a clash would destroy the first
+    run's .raw — the name must move, not the file."""
+    monkeypatch.setattr(frame_camera.time, "strftime",
+                        lambda fmt: "20260101_000000")
+    assert frame_camera._unique_run(tmp_path) == "20260101_000000"
+    (tmp_path / "20260101_000000_events.raw").write_bytes(b"x")
+    assert frame_camera._unique_run(tmp_path) == "20260101_000000_2"
+    (tmp_path / "20260101_000000_2_frame_000001.png").write_bytes(b"x")
+    assert frame_camera._unique_run(tmp_path) == "20260101_000000_3"
+
+
+def test_a_folder_that_does_not_exist_yet_names_the_run_plainly(tmp_path):
+    assert frame_camera._unique_run(tmp_path / "new")
+
+
+def test_starting_twice_is_refused(tmp_path):
+    connected()
+    frame_camera.start(str(tmp_path))
+    with pytest.raises(RuntimeError, match="already capturing"):
+        frame_camera.start(str(tmp_path))
+    frame_camera.stop()
+
+
+def test_the_area_cannot_change_under_a_raw_recording(tmp_path):
+    """Changing the area restarts the stream, and that ends the .raw — the
+    rest of the run would silently be missing from it."""
+    connected_raw()
+    frame_camera.start(str(tmp_path))
+    with pytest.raises(RuntimeError, match="stop the capture"):
+        frame_camera.set_area("0, 0, 64, 64")
+    frame_camera.stop()
+    assert frame_camera.set_area("0, 0, 64, 64")["area"]
+
+
+def test_the_status_line_is_left_alone_when_nothing_is_live(tmp_path):
+    """The pump used to write the numbers thirty times a second whenever a
+    camera was open, overwriting "Connected to ..." and every other message
+    the moment it appeared."""
+    connected()
+    said = []
+    for _ in range(5):
+        frame_camera.pump(lambda a: None, said.append)
+    assert said == [], "an idle camera overwrote the status line"
+
+    frame_camera.start(str(tmp_path))
+    settle()
+    for _ in range(5):
+        frame_camera.pump(lambda a: None, said.append)
+    assert any("fps" in s for s in said)
+
+    frame_camera.stop()
+    said.clear()
+    for _ in range(10):
+        frame_camera.pump(lambda a: None, said.append)
+    assert len(said) == 1 and said[0].startswith("Stopped"), said
+
+
+def test_a_quick_stop_does_not_wait_for_a_slow_disk(tmp_path, monkeypatch):
+    """Stop hands the window back; what is still queued keeps saving, the
+    status line counts it down, and nothing grabbed is lost."""
+    from council_core import capture
+
+    real = capture.write_image
+
+    def slow(image, path):
+        time.sleep(0.15)
+        real(image, path)
+
+    monkeypatch.setattr(capture, "write_image", slow)
+    connected("event")
+    frame_camera.start(str(tmp_path))
+    settle(0.5)
+    began = time.monotonic()
+    out = frame_camera.stop()
+    assert time.monotonic() - began < frame_camera.STOP_DRAIN_SECONDS + 1.5
+    assert "still saving" in out["summary"], out["summary"]
+    recorded_by_now = frame_camera._LIVE.session
+    frame_camera.disconnect()                     # waits for the rest
+    stats = recorded_by_now.stats()
+    assert stats.waiting == 0
+    assert len(list(tmp_path.glob("*.png"))) == stats.recorded
+
+
+def test_a_network_share_is_recognised():
+    assert frame_camera._on_network_share(Path("\\\\server\\share\\runs"))
+    assert frame_camera._on_network_share(Path("//server/share/runs"))
+
+
+def test_a_local_folder_is_not_a_network_share(tmp_path):
+    assert not frame_camera._on_network_share(tmp_path)
+
+
+def test_capturing_into_a_network_share_is_said_while_it_runs(tmp_path,
+                                                              monkeypatch):
+    """Start's own message is overwritten by the live numbers within one
+    tick, so the warning has to live in the live line itself."""
+    monkeypatch.setattr(frame_camera, "_on_network_share", lambda path: True)
+    connected()
+    assert "network share" in frame_camera.start(str(tmp_path))["summary"]
+    settle()
+    said = []
+    frame_camera.pump(lambda a: None, said.append)
+    frame_camera.stop()
+    assert "NETWORK FOLDER" in said[-1]
+
+
+def test_a_local_capture_carries_no_network_warning(tmp_path):
+    connected()
+    frame_camera.start(str(tmp_path))
+    settle()
+    said = []
+    frame_camera.pump(lambda a: None, said.append)
+    frame_camera.stop()
+    assert said and "NETWORK" not in said[-1]
+
+
+def test_play_and_toggle_need_a_slider(monkeypatch):
+    monkeypatch.setattr(frame_camera._LIVE, "reviewer", None)
+    with pytest.raises(RuntimeError, match="no capture slider"):
+        frame_camera.play_pause()
+    with pytest.raises(RuntimeError, match="no capture slider"):
+        frame_camera.toggle_view()

@@ -104,15 +104,32 @@ def test_the_setup_button_is_linked_to_the_wizard():
     assert button["script"]["outputs"]["cameras"] == "rows"
 
 
-def test_typhon_is_v5_in_teal():
+def test_typhon_is_v5_in_teal_plus_the_capture_review_controls():
+    """Typhon began as v5 in #045f80. Since the first EVK4 test it alone has
+    the slider that follows a capture: no generated browser on it, a view
+    line above the picture, Play / Pause and PNG / Raw. Nothing else moved."""
     v5, typhon = gspec("barbie_capture_v5"), gspec("typhon")
     assert typhon["window"]["bg"] == TYPHON_BG
     assert typhon["window"]["fg"] == v5["window"]["fg"]
     assert typhon["window"]["title"] == "Typhon"
-    # Same layout, same wiring: only names and colour differ.
-    strip = lambda d: [{k: v for k, v in s.items() if k != "label"}
-                       for s in d["shapes"]]
-    assert strip(typhon) == strip(v5)
+    old = {s["id"]: s for s in v5["shapes"]}
+    new = {s["id"]: s for s in typhon["shapes"]}
+    assert sorted(set(new) - set(old)) == ["s55", "s56"]
+    strip = lambda s: {k: v for k, v in s.items() if k != "label"}
+    changed = sorted(k for k in old if strip(old[k]) != strip(new[k]))
+    assert changed == ["s09", "s11", "s23"]
+    assert new["s11"]["drives"] == {}, "a generated browser would own the slider"
+    assert new["s09"]["port"] == {"name": "view_status"}
+    assert new["s55"]["script"]["function"] == "play_pause"
+    assert new["s56"]["script"]["function"] == "toggle_view"
+
+
+def test_the_review_controls_fit_beside_the_slider():
+    shapes = {s["id"]: s for s in gspec("typhon")["shapes"]}
+    row = [shapes[k] for k in ("s11", "s55", "s56")]
+    for left, right in zip(row, row[1:]):
+        assert left["x"] + left["w"] <= right["x"], (left["id"], right["id"])
+    assert row[-1]["x"] + row[-1]["w"] <= shapes["s10"]["x"] + shapes["s10"]["w"]
 
 
 def test_typhon_says_typhon_inside_the_window_too():
@@ -214,6 +231,19 @@ def test_the_setup_answer_is_kept_beside_app_py(
         qapp, typhon_dir, forget_generated):
     construct(typhon_dir)
     assert frame_camera._LIVE.setup_path == typhon_dir.resolve() / cs.SETUP_FILE
+
+
+def test_the_play_and_png_raw_buttons_work(qapp, typhon_dir, forget_generated,
+                                           tmp_path):
+    """Pressed in the generated app, with nothing captured yet: each says
+    what it can do in the view line rather than failing."""
+    ui = construct(typhon_dir)
+    ui.ports.capture_folder.set(str(tmp_path))
+    _pump_until(lambda: False, seconds=0.3)
+    ui.on_btn_play_pause()
+    assert "No frames" in ui.ports.view_status.get()
+    ui.on_btn_png_raw()
+    assert "No raw file" in ui.ports.view_status.get()
 
 
 def test_the_setup_button_works(qapp, typhon_dir, forget_generated):

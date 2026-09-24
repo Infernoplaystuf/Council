@@ -63,6 +63,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 #: What an event camera's accumulated image uses for "no event here".
@@ -244,6 +245,24 @@ class Device:
     """One opened camera. Subclasses talk to an SDK; this defines the shape."""
 
     info: CameraInfo
+
+    #: Whether this camera can record its own raw stream to a file. True for
+    #: event cameras, whose .raw is every event the sensor sent; a frame
+    #: camera has no such stream, and its saved frames ARE the data.
+    records_raw = False
+
+    def start_raw(self, path: Any) -> Path:
+        """Begin recording the camera's raw stream into `path`."""
+        raise CameraError("this camera has no raw stream to record")
+
+    def stop_raw(self) -> Optional[Path]:
+        """Finish the raw recording. Returns its path, or None if none ran."""
+        return None
+
+    @property
+    def raw_path(self) -> Optional[Path]:
+        """The raw recording in progress, or None."""
+        return None
 
     def limits(self) -> Limits:
         raise NotImplementedError
@@ -682,6 +701,50 @@ def _required(device: Any, *names: str) -> Any:
         f"SDK version may not match what this build expects")
 
 
+#: How long stopping a raw recording keeps pulling what the SDK has queued.
+#: stream.stop() DISCARDS buffers nobody pulled, and the log is written only
+#: as buffers are pulled — so without this the last moments of a run are
+#: missing from the .raw. Pulling without decoding is fast (0.1 ms per 14 MB
+#: measured), so this is a backstop, not an expected wait.
+RAW_DRAIN_SECONDS = 2.0
+
+
+class _EventSink:
+    """Where the CD decoder delivers events. Deliberately NOT the device.
+
+    Registering a bound method of the device as the decoder callback creates
+    a reference cycle through C++ that Python's garbage collector cannot see:
+    measured on OpenEB 5.2, the device was never freed, and a .raw it was
+    logging stayed open and locked with its tail unwritten (118,576 of
+    119,988 bytes) until the process exited. The sink holds only the events.
+    """
+
+    def __init__(self) -> None:
+        self.pending: List[Any] = []
+        self.lock = threading.Lock()
+
+    def on_events(self, buffer: Any) -> None:
+        """Called by the decoder, on its own thread, with a RECYCLED buffer.
+
+        The copy is not optional: the decoder owns that memory and hands the
+        same block to the next callback. This is the pylon Release() hazard
+        again, on the other vendor's SDK.
+        """
+        np = _numpy()
+        try:
+            taken = np.array(buffer, copy=True)
+        except Exception:                                   # noqa: BLE001
+            return
+        if taken.size:
+            with self.lock:
+                self.pending.append(taken)
+
+    def drain(self) -> List[Any]:
+        with self.lock:
+            got, self.pending = self.pending, []
+        return got
+
+
 class EvkDevice(Device):
     """An open EVK4, presented as accumulated images.
 
@@ -716,36 +779,100 @@ class EvkDevice(Device):
         self._cd = _required(device, "get_i_event_cd_decoder",
                              "get_i_cd_decoder")
 
-        self._pending: List[Any] = []
-        self._pending_lock = threading.Lock()
+        self._sink = _EventSink()
         #: Set when poll_buffer reports the source is finished.
         self._ended = False
+        #: The .raw being written, and the sensor time of its first event.
+        self._raw: Optional[Path] = None
+        self._raw_origin: Optional[int] = None
         try:
-            self._cd.add_event_buffer_callback(self._on_events)
+            self._cd.add_event_buffer_callback(self._sink.on_events)
         except Exception as exc:                            # noqa: BLE001
             raise CameraError(f"could not subscribe to CD events: {exc}") from exc
 
     # ------------------------------------------------------------------
-    def _on_events(self, buffer: Any) -> None:
-        """Called by the decoder, on its own thread, with a RECYCLED buffer.
-
-        The copy is not optional: the decoder owns that memory and hands the
-        same block to the next callback. This is the pylon Release() hazard
-        again, on the other vendor's SDK.
-        """
-        np = _numpy()
-        try:
-            taken = np.array(buffer, copy=True)
-        except Exception:                                   # noqa: BLE001
-            return
-        if taken.size:
-            with self._pending_lock:
-                self._pending.append(taken)
-
     def _drain(self) -> List[Any]:
-        with self._pending_lock:
-            got, self._pending = self._pending, []
-        return got
+        return self._sink.drain()
+
+    # ------------------------------------------------------------------
+    # The raw recording
+    # ------------------------------------------------------------------
+    records_raw = True
+
+    @property
+    def raw_path(self) -> Optional[Path]:
+        return self._raw
+
+    def start_raw(self, path: Any) -> Path:
+        """Record every byte the camera sends into `path`, alongside the view.
+
+        START IT BEFORE start(). The SDK writes each buffer as it is pulled,
+        so a log started mid-stream begins at a buffer boundary, and a replay
+        drops everything before the file's first time marker — several ms on
+        an EVK4. Started first, the file has the whole run.
+
+        IT NEVER OVERWRITES. The SDK's log_raw_data silently truncates an
+        existing file (measured: 1,700,147 bytes to 208), so an existing path
+        is refused here before the SDK is asked.
+
+        THE NAME MUST END IN .raw. The HAL accepts anything, but Metavision's
+        own readers treat any other name as a camera serial number and fail.
+        """
+        target = Path(str(path))
+        if target.suffix.lower() != ".raw":
+            raise CameraError(f"{target.name}: a raw recording must end in "
+                              f".raw — Metavision's readers refuse any other name")
+        if target.exists():
+            raise CameraError(f"{target.name} already exists, and a raw "
+                              f"recording never overwrites one")
+        if self._raw is not None:
+            self.stop_raw()
+        stream = self._stream
+        try:
+            ok = stream.log_raw_data(str(target))
+        except Exception as exc:                            # noqa: BLE001
+            raise CameraError(f"could not start the raw recording: {exc}") from exc
+        if ok is False:
+            # False, not an exception: a missing folder, or no permission.
+            raise CameraError(f"could not create {target}")
+        self._raw = target
+        self._raw_origin = None
+        return target
+
+    def stop_raw(self) -> Optional[Path]:
+        """Finish the .raw: pull what is still queued, then close the file.
+
+        Call it while the stream is still running and nothing else is reading
+        it. stream.stop() discards buffers that were never pulled, and only a
+        pulled buffer reaches the file. The file is complete and unlocked the
+        moment stop_log_raw_data returns.
+        """
+        target = self._raw
+        if target is None:
+            return None
+        self._raw = None
+        if self._started:
+            self._drain_to_log()
+        try:
+            self._stream.stop_log_raw_data()
+        except Exception as exc:                            # noqa: BLE001
+            raise CameraError(f"could not finish {target.name}: {exc}") from exc
+        return target
+
+    def _drain_to_log(self) -> None:
+        deadline = time.monotonic() + RAW_DRAIN_SECONDS
+        stream = self._stream
+        while time.monotonic() < deadline:
+            try:
+                ready = stream.poll_buffer()
+            except Exception:                               # noqa: BLE001
+                return
+            if ready <= 0:
+                return
+            # The pull IS the write: get_latest_raw_data logs the buffer it
+            # hands back. Not decoding it only means the last few ms are in
+            # the .raw and not in a PNG.
+            stream.get_latest_raw_data()
 
     # ------------------------------------------------------------------
     def limits(self) -> Limits:
@@ -803,6 +930,12 @@ class EvkDevice(Device):
         self._started = True
 
     def stop(self) -> None:
+        # The raw file first, while the stream is still running: stopping the
+        # stream throws away whatever has not been pulled into it yet.
+        try:
+            self.stop_raw()
+        except CameraError:
+            pass
         self._started = False
         self._ended = False
         try:
@@ -837,11 +970,21 @@ class EvkDevice(Device):
         self._index += 1
         span_us = (int(stamps.max()) - int(stamps.min())) if len(stamps) else 0
         rate = (len(xs) / (span_us / 1e6)) if span_us > 0 else 0.0
+        meta = {"kind": "event", "events": int(len(xs)),
+                "window_ms": self.accumulate_ms,
+                "span_us": span_us, "event_rate_hz": rate}
+        if self._raw is not None and len(stamps):
+            # WHERE THIS PICTURE IS IN THE .raw, as time since its first
+            # event. The live clock and the file's clock differ: a replay is
+            # time-shifted to start near zero, and an EVT3 file started after
+            # the 24-bit clock wrapped reads k*16.78 s behind the camera.
+            # Relative to the first event, both agree.
+            if self._raw_origin is None:
+                self._raw_origin = int(stamps.min())
+            meta["raw_t_us"] = int(stamps[-1]) - self._raw_origin
         return Frame(image=image, index=self._index,
                      timestamp_us=int(stamps[-1]) if len(stamps) else 0,
-                     meta={"kind": "event", "events": int(len(xs)),
-                           "window_ms": self.accumulate_ms,
-                           "span_us": span_us, "event_rate_hz": rate})
+                     meta=meta)
 
     def _poll(self, timeout_ms: int):
         """Pump the stream for one accumulation window.
@@ -898,6 +1041,9 @@ class EvkDevice(Device):
 
     def close(self) -> None:
         self.stop()
+        # Let go of the SDK objects. A HAL device that is still referenced
+        # keeps the camera claimed and any file it touched open on Windows.
+        self._dev = self._stream = self._decoder = self._cd = None
 
 
 # ======================================================================
@@ -931,9 +1077,18 @@ class SyntheticBackend(Backend):
 
 
 class SyntheticDevice(Device):
-    """A moving bar, as frames or as events."""
+    """A moving bar, as frames or as events.
+
+    PACED LIKE A CAMERA. Unpaced, it handed out frames as fast as they were
+    asked for — 2,500 a second measured in Typhon — which filled a folder
+    with 1,500 PNGs in three seconds and reported most of them "NOT saved".
+    Nothing real behaves like that, and a simulation that does teaches the
+    wrong numbers. The event camera delivers one window per `accumulate_ms`,
+    as the EVK4 path does; the frame camera runs at FRAME_FPS.
+    """
 
     WIDTH, HEIGHT = 640, 480
+    FRAME_FPS = 30.0
 
     def __init__(self, info: CameraInfo):
         self.info = info
@@ -941,6 +1096,12 @@ class SyntheticDevice(Device):
         self._index = 0
         self._started = False
         self.accumulate_ms = DEFAULT_ACCUMULATE_MS
+        self._due = 0.0
+
+    def _interval(self) -> float:
+        if self.info.kind == "event":
+            return max(0.001, self.accumulate_ms / 1000.0)
+        return 1.0 / self.FRAME_FPS
 
     def limits(self) -> Limits:
         """The limits of whichever sensor this one is standing in for.
@@ -979,6 +1140,14 @@ class SyntheticDevice(Device):
 
     def read(self, timeout_ms: int = 1000) -> Optional[Frame]:
         np = _numpy()
+        now = time.monotonic()
+        wait = self._due - now
+        if wait > 0:
+            if wait > timeout_ms / 1000.0:
+                time.sleep(timeout_ms / 1000.0)
+                return None
+            time.sleep(wait)
+        self._due = max(self._due, now) + self._interval()
         roi = self._roi
         self._index += 1
         column = (self._index * 7) % max(1, roi.w)

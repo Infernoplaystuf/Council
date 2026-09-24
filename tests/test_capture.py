@@ -154,10 +154,12 @@ def test_recording_stops_on_the_first_write_failure(tmp_path):
     session = CaptureSession(FakeDevice())
     session.record_to(Recorder(tmp_path, writer=explode))
     session._took(frame(1))
+    session.flush(5)                 # the write happens on the writer thread
+    assert "disk full" in session.stats().recording_failed
 
+    session._took(frame(2))          # the next frame finds the failure
     stats = session.stats()
     assert session.recorder is None, "recording carried on after a failure"
-    assert "disk full" in stats.recording_failed
     assert "disk full" in stats.last_error
     assert stats.errors == 1
 
@@ -179,6 +181,7 @@ def test_successful_frames_are_counted_as_recorded(tmp_path):
     session.record_to(Recorder(tmp_path, writer=lambda i, p: p.write_bytes(b"x")))
     session._took(frame(1))
     session._took(frame(2))
+    session.flush(5)
     assert session.stats().recorded == 2
 
 
@@ -375,3 +378,212 @@ def test_close_stops_the_device_and_closes_it():
     time.sleep(0.03)
     session.close()
     assert session.device.closed is True
+
+
+# ======================================================================
+# The writer thread — saving must never stall the camera
+# ======================================================================
+def slow_writer(seconds):
+    def write(img, path):
+        time.sleep(seconds)
+        path.write_bytes(b"x")
+    return write
+
+
+def test_a_slow_disk_does_not_stall_the_grab_loop(tmp_path):
+    """Measured on a real EVK4 writing to a NAS: an inline write made the
+    capture crawl and smeared the event windows. The grab loop must hand the
+    frame over and go straight back to the camera."""
+    session = CaptureSession(FakeDevice())
+    session.record_to(Recorder(tmp_path, writer=slow_writer(0.3)))
+    started = time.monotonic()
+    for i in range(1, 6):
+        session._took(frame(i))
+    assert time.monotonic() - started < 0.1, "the grab loop waited for the disk"
+    session.record_to(None)
+
+
+def test_stopping_a_recording_waits_for_the_queued_frames(tmp_path):
+    """What was grabbed is the user's data; Stop must let it land."""
+    session = CaptureSession(FakeDevice())
+    session.record_to(Recorder(tmp_path, writer=slow_writer(0.05)))
+    for i in range(1, 6):
+        session._took(frame(i))
+    assert session.record_to(None) is True
+    assert len(list(tmp_path.iterdir())) == 5
+    assert session.stats().recorded == 5
+
+
+def test_a_drain_that_runs_out_of_time_says_so(tmp_path):
+    session = CaptureSession(FakeDevice())
+    session.record_to(Recorder(tmp_path, writer=slow_writer(0.3)))
+    for i in range(1, 5):
+        session._took(frame(i))
+    assert session.record_to(None, drain_timeout=0.05) is False
+    assert session.stats().waiting > 0, "unsaved frames were not reported"
+
+
+def test_frames_past_the_byte_budget_are_skipped_and_counted(tmp_path):
+    """Storage too slow for the camera loses frames either way. Counting
+    them is the honest version; stalling the camera hid them."""
+    import numpy as np
+
+    session = CaptureSession(FakeDevice())
+    session.record_to(Recorder(tmp_path, writer=slow_writer(0.5)))
+    session.writer.budget = 2 * 1000          # room for two 1000-byte frames
+    for i in range(1, 8):
+        session._took(cameras.Frame(image=np.zeros(1000, np.uint8), index=i))
+    stats = session.stats()
+    assert stats.skipped >= 4, stats
+    assert "NOT saved" in stats.line()
+    session.record_to(None, drain_timeout=5)
+
+
+def test_one_frame_larger_than_the_whole_budget_is_still_saved(tmp_path):
+    """Otherwise a big enough camera could never save anything."""
+    import numpy as np
+
+    session = CaptureSession(FakeDevice())
+    session.record_to(Recorder(tmp_path, writer=lambda i, p: p.write_bytes(b"x")))
+    session.writer.budget = 10
+    session._took(cameras.Frame(image=np.zeros(1000, np.uint8), index=1))
+    session.flush(5)
+    assert session.stats().recorded == 1 and session.stats().skipped == 0
+
+
+def test_the_writer_lists_what_it_wrote_in_order(tmp_path):
+    """A viewer follows the capture from this list, not by rescanning."""
+    session = CaptureSession(FakeDevice())
+    session.record_to(Recorder(tmp_path, writer=lambda i, p: p.write_bytes(b"x")))
+    for i in (3, 1, 2):
+        session._took(frame(i))
+    session.flush(5)
+    assert [p.name for p in session.writer.paths] == [
+        "frame_000003", "frame_000001", "frame_000002"]
+
+
+def test_counts_survive_the_end_of_a_recording(tmp_path):
+    session = CaptureSession(FakeDevice())
+    session.record_to(Recorder(tmp_path, writer=lambda i, p: p.write_bytes(b"x")))
+    session._took(frame(1))
+    session.record_to(None)
+    assert session.stats().recorded == 1
+
+
+# ======================================================================
+# The run's frame index (CSV)
+# ======================================================================
+def read_index(path):
+    import csv
+    with open(path, newline="", encoding="utf-8") as handle:
+        return list(csv.DictReader(handle))
+
+
+def test_every_saved_frame_gets_a_row_in_the_index(tmp_path):
+    session = CaptureSession(FakeDevice())
+    session.record_to(Recorder(tmp_path, stem="run_frame",
+                               index_name="run_frames.csv"))
+    for i in (1, 2, 3):
+        session._took(cameras.Frame(image=np.zeros((4, 4), np.uint8), index=i,
+                                    timestamp_us=1000 * i,
+                                    meta={"events": 10 * i, "raw_t_us": 500 * i}))
+    session.record_to(None)
+    rows = read_index(tmp_path / "run_frames.csv")
+    assert [r["file"] for r in rows] == [
+        "run_frame_000001.png", "run_frame_000002.png", "run_frame_000003.png"]
+    assert [r["raw_t_us"] for r in rows] == ["500", "1000", "1500"]
+    assert [r["events"] for r in rows] == ["10", "20", "30"]
+    assert rows[2]["timestamp_us"] == "3000"
+
+
+def test_a_frame_camera_leaves_the_event_columns_empty(tmp_path):
+    rec = Recorder(tmp_path, index_name="i.csv")
+    rec.open()
+    rec.write(cameras.Frame(image=np.zeros((4, 4), np.uint8), index=1))
+    rec.close()
+    row = read_index(tmp_path / "i.csv")[0]
+    assert row["raw_t_us"] == "" and row["events"] == ""
+
+
+def test_an_existing_index_is_appended_to_never_truncated(tmp_path):
+    """The name is per run, but a file already there is the user's data."""
+    (tmp_path / "i.csv").write_text("file,index\nkept.png,7\n", encoding="utf-8")
+    rec = Recorder(tmp_path, index_name="i.csv")
+    rec.open()
+    rec.write(cameras.Frame(image=np.zeros((4, 4), np.uint8), index=1))
+    rec.close()
+    text = (tmp_path / "i.csv").read_text(encoding="utf-8")
+    assert text.startswith("file,index\nkept.png,7\n")
+    assert "frame_000001.png" in text
+
+
+def test_the_index_is_closed_when_the_recording_ends(tmp_path):
+    """An open handle keeps the file locked on Windows — "copy the run to the
+    NAS afterwards" would fail on the CSV."""
+    rec = Recorder(tmp_path, index_name="i.csv")
+    session = CaptureSession(FakeDevice())
+    session.record_to(rec)
+    session._took(frame(1))
+    session.record_to(None)
+    assert rec._index_file is None
+    (tmp_path / "i.csv").rename(tmp_path / "moved.csv")      # not locked
+
+
+def test_the_index_is_closed_when_writing_fails(tmp_path):
+    def explode(image, path):
+        raise OSError("disk full")
+    rec = Recorder(tmp_path, writer=explode, index_name="i.csv")
+    session = CaptureSession(FakeDevice())
+    session.record_to(rec)
+    session._took(frame(1))
+    session.flush(5)
+    deadline = time.monotonic() + 5
+    while rec._index_file is not None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert rec._index_file is None
+
+
+# ======================================================================
+# What a viewer following the capture reads
+# ======================================================================
+def test_written_hands_over_new_files_from_a_position(tmp_path):
+    session = CaptureSession(FakeDevice())
+    session.record_to(Recorder(tmp_path, writer=lambda i, p: p.write_bytes(b"x")))
+    for i in (1, 2, 3):
+        session._took(frame(i))
+    session.flush(5)
+    assert len(session.written()) == 3
+    assert [p.name for p in session.written(2)] == ["frame_000003"]
+
+
+def test_written_still_answers_after_the_recording_ends(tmp_path):
+    """After Stop the last frames may still be landing; a viewer wants them."""
+    session = CaptureSession(FakeDevice())
+    session.record_to(Recorder(tmp_path, writer=lambda i, p: p.write_bytes(b"x")))
+    session._took(frame(1))
+    session.record_to(None)
+    assert [p.name for p in session.written()] == ["frame_000001"]
+
+
+def test_saving_is_true_only_while_frames_are_queued(tmp_path):
+    session = CaptureSession(FakeDevice())
+    assert session.saving is False
+    session.record_to(Recorder(tmp_path, writer=slow_writer(0.2)))
+    session._took(frame(1))
+    session._took(frame(2))
+    assert session.saving is True
+    session.record_to(None, drain_timeout=5)
+    assert session.saving is False
+
+
+def test_close_waits_for_frames_a_quick_stop_left_saving(tmp_path):
+    """Stop hands the UI back after a second; closing the app must still let
+    the rest land rather than killing the writer thread with the process."""
+    session = CaptureSession(FakeDevice())
+    session.record_to(Recorder(tmp_path, writer=slow_writer(0.05)))
+    for i in range(1, 11):
+        session._took(frame(i))
+    session.record_to(None, drain_timeout=0.01)
+    assert session.stats().waiting > 0
+    session.close()
+    assert len(list(tmp_path.iterdir())) == 10

@@ -272,7 +272,9 @@
       "min_h": 0,
       "min_w": 0,
       "note": "",
-      "port": {},
+      "port": {
+        "name": "view_status"
+      },
       "props": {
         "anchor": "w",
         "text": "",
@@ -280,7 +282,7 @@
       },
       "resize": "auto",
       "script": {},
-      "w": 200,
+      "w": 296,
       "x": 512,
       "y": 72,
       "z": 10
@@ -317,12 +319,7 @@
     },
     {
       "bg": "",
-      "drives": {
-        "current": "current_frame",
-        "folder": "capture_folder",
-        "roi": "roi",
-        "target": "live_view"
-      },
+      "drives": {},
       "fg": "",
       "font": "",
       "freeform": false,
@@ -344,7 +341,7 @@
       },
       "resize": "auto",
       "script": {},
-      "w": 600,
+      "w": 392,
       "x": 512,
       "y": 568,
       "z": 12
@@ -690,8 +687,8 @@
       },
       "resize": "auto",
       "script": {},
-      "w": 392,
-      "x": 720,
+      "w": 296,
+      "x": 816,
       "y": 72,
       "z": 24
     },
@@ -1608,6 +1605,64 @@
       "x": 264,
       "y": 780,
       "z": 55
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s55",
+      "kind": "button",
+      "label": "Play / Pause",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "play_pause",
+        "inputs": [],
+        "module": "frame_camera",
+        "outputs": {
+          "view_status": "view"
+        }
+      },
+      "w": 96,
+      "x": 912,
+      "y": 572,
+      "z": 56
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s56",
+      "kind": "button",
+      "label": "PNG / Raw",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "toggle_view",
+        "inputs": [],
+        "module": "frame_camera",
+        "outputs": {
+          "view_status": "view"
+        }
+      },
+      "w": 96,
+      "x": 1016,
+      "y": 572,
+      "z": 57
     }
   ],
   "window": {

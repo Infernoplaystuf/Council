@@ -15,6 +15,7 @@ hardware verification, and no test here claims a camera was attached.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -448,6 +449,14 @@ def events(*triples, t0=1000):
     return buf
 
 
+def stamped(*quads):
+    """Build a CD buffer with explicit times: (x, y, polarity, t) tuples."""
+    buf = np.zeros(len(quads), dtype=EVENT_DTYPE)
+    for i, quad in enumerate(quads):
+        buf[i] = quad
+    return buf
+
+
 class FakeCdDecoder:
     """I_EventCDDecoder: callbacks in, nothing out."""
 
@@ -476,18 +485,28 @@ class FakeStreamDecoder:
 
 
 class FakeStream:
-    """I_EventsStream: poll_buffer() < 0 means the stream ENDED."""
+    """I_EventsStream: poll_buffer() < 0 means the stream ENDED.
 
-    def __init__(self, polls=None):
+    `calls` records the order of everything that matters to a raw recording.
+    Like the real SDK, log_raw_data returns a bool and creates the file, and
+    only a PULLED buffer (get_latest_raw_data) reaches it.
+    """
+
+    def __init__(self, polls=None, log_ok=True):
         self.polls = list(polls) if polls is not None else [1]
         self.started = False
         self.stopped = False
+        self.calls = []
+        self.logging = None
+        self.log_ok = log_ok
 
     def start(self):
         self.started = True
+        self.calls.append("start")
 
     def stop(self):
         self.stopped = True
+        self.calls.append("stop")
 
     def poll_buffer(self):
         # QUIET once the script runs out, not "data ready" for ever: the real
@@ -496,7 +515,23 @@ class FakeStream:
         return self.polls.pop(0) if self.polls else 0
 
     def get_latest_raw_data(self):
+        self.calls.append("pull")
+        if self.logging is not None:
+            with open(self.logging, "ab") as handle:
+                handle.write(b"raw")
         return b"raw"
+
+    def log_raw_data(self, path):
+        self.calls.append("log")
+        if not self.log_ok:
+            return False
+        open(path, "wb").close()
+        self.logging = path
+        return True
+
+    def stop_log_raw_data(self):
+        self.calls.append("stop_log")
+        self.logging = None
 
 
 class FakeRoi:
@@ -530,12 +565,12 @@ class FakeRoi:
 
 class FakeEvkDevice:
     def __init__(self, w=1280, h=720, polls=None, script=(), accept=True,
-                 omit=()):
+                 omit=(), log_ok=True):
         self._roi = FakeRoi(accept)
         self._geo = type("G", (), {"get_width": lambda s: w,
                                    "get_height": lambda s: h})()
         self._cd = FakeCdDecoder()
-        self._stream = FakeStream(polls)
+        self._stream = FakeStream(polls, log_ok=log_ok)
         self._decoder = FakeStreamDecoder(self._cd, script)
         for name in omit:                 # simulate an SDK that lacks one
             setattr(self, name, None)
@@ -698,6 +733,118 @@ def test_stopping_drops_events_that_arrived_too_late():
 
 
 # ======================================================================
+# EVK: recording the .raw
+# ======================================================================
+def test_a_frame_camera_has_no_raw_stream():
+    assert cameras.Device.records_raw is False
+    with pytest.raises(CameraError, match="no raw stream"):
+        cameras.Device().start_raw("x.raw")
+    assert cameras.Device().stop_raw() is None
+
+
+def test_an_event_camera_records_its_raw(tmp_path):
+    device, raw = evk()
+    assert device.records_raw is True
+    path = device.start_raw(tmp_path / "run_events.raw")
+    assert path.exists() and device.raw_path == path
+
+
+def test_the_raw_log_starts_before_the_stream(tmp_path):
+    """Started mid-stream, the file begins at a buffer boundary and a replay
+    drops everything before its first time marker. Started first, it has the
+    whole run."""
+    device, raw = evk()
+    device.start_raw(tmp_path / "r.raw")
+    device.start()
+    assert raw._stream.calls[:2] == ["log", "start"]
+
+
+def test_an_existing_file_is_never_overwritten(tmp_path):
+    """log_raw_data truncates silently: measured 1,700,147 bytes to 208."""
+    target = tmp_path / "r.raw"
+    target.write_bytes(b"the user data")
+    device, raw = evk()
+    with pytest.raises(CameraError, match="already exists"):
+        device.start_raw(target)
+    assert target.read_bytes() == b"the user data"
+    assert "log" not in raw._stream.calls
+
+
+def test_a_raw_recording_must_end_in_dot_raw(tmp_path):
+    """Metavision's readers treat any other name as a camera serial."""
+    device, _ = evk()
+    with pytest.raises(CameraError, match="must end in .raw"):
+        device.start_raw(tmp_path / "r.bin")
+
+
+def test_a_refused_log_is_an_error_not_a_silent_nothing(tmp_path):
+    device, _ = evk(log_ok=False)
+    with pytest.raises(CameraError, match="could not create"):
+        device.start_raw(tmp_path / "r.raw")
+    assert device.raw_path is None
+
+
+def test_stopping_pulls_what_is_queued_into_the_raw_first(tmp_path):
+    """stream.stop() DISCARDS buffers nobody pulled, and only a pulled buffer
+    reaches the file. So the tail of the run is pulled, then the log is
+    closed, and only then is the stream stopped."""
+    device, raw = evk(polls=[])
+    target = device.start_raw(tmp_path / "r.raw")
+    device.start()
+    raw._stream.polls = [1, 1, 0]            # two buffers still queued
+    device.stop()
+    assert raw._stream.calls[-4:] == ["pull", "pull", "stop_log", "stop"]
+    assert target.read_bytes() == b"rawraw"
+    assert device.raw_path is None
+
+
+def test_stop_raw_on_its_own_leaves_the_stream_running(tmp_path):
+    device, raw = evk(polls=[])
+    device.start_raw(tmp_path / "r.raw")
+    device.start()
+    assert device.stop_raw() == tmp_path / "r.raw"
+    assert "stop" not in raw._stream.calls
+    assert device.stop_raw() is None                 # nothing left to finish
+
+
+def test_windows_say_where_they_fall_in_the_raw(tmp_path):
+    """Time since the .raw's first event: the one clock the live view and a
+    time-shifted replay of the file agree on."""
+    device, raw = evk(polls=[1],
+                      script=[stamped((1, 1, 1, 5000)),
+                              stamped((2, 2, 1, 5100), (3, 3, 0, 25000))])
+    device.start_raw(tmp_path / "r.raw")
+    device.start()
+    first = device.read(5)
+    raw._stream.polls = [1]          # the second buffer, in the next window
+    second = device.read(5)
+    assert first.meta["raw_t_us"] == 0
+    assert second.meta["raw_t_us"] == 20000
+
+
+def test_without_a_raw_recording_windows_carry_no_raw_time():
+    device, _ = evk(script=[events((1, 1, 1))])
+    device.start()
+    assert "raw_t_us" not in device.read(50).meta
+
+
+def test_the_decoder_callback_does_not_hold_the_device():
+    """A bound method of the device, registered with the C++ decoder, is a
+    cycle Python cannot collect: measured, the device was never freed and its
+    .raw stayed locked with the tail unwritten until the process exited."""
+    device, raw = evk()
+    assert raw._cd.callbacks
+    for fn in raw._cd.callbacks:
+        assert getattr(fn, "__self__", None) is not device
+
+
+def test_closing_lets_go_of_the_sdk_objects():
+    device, _ = evk()
+    device.close()
+    assert device._dev is None and device._stream is None
+
+
+# ======================================================================
 # Synthetic
 # ======================================================================
 def test_the_simulated_backend_is_always_available():
@@ -708,6 +855,29 @@ def test_the_simulated_cameras_are_labelled_simulated():
     """It must never be mistakable for a real camera."""
     for info in cameras.SyntheticBackend().discover():
         assert "simulated" in info.label.lower()
+
+
+def test_the_simulated_event_camera_is_paced_like_one():
+    """Unpaced it produced 2,500 windows a second and filled a folder with
+    1,500 PNGs in three seconds. An EVK4 gives one window per 20 ms."""
+    backend = cameras.SyntheticBackend()
+    info = [c for c in backend.discover() if c.kind == "event"][0]
+    device = backend.open(info)
+    device.start()
+    began = time.monotonic()
+    for _ in range(6):
+        assert device.read() is not None
+    elapsed = time.monotonic() - began
+    assert 0.08 <= elapsed <= 0.5, elapsed
+
+
+def test_a_simulated_read_honours_its_timeout():
+    backend = cameras.SyntheticBackend()
+    info = [c for c in backend.discover() if c.kind == "frame"][0]
+    device = backend.open(info)
+    device.start()
+    device.read()
+    assert device.read(timeout_ms=1) is None        # next frame is 33 ms away
 
 
 def test_simulated_event_frames_carry_an_event_count():

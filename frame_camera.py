@@ -40,13 +40,30 @@ Nothing ever touches a widget off-thread, and the missing marshalling API stops
 mattering instead of being worked around.
 
 WHERE THE FRAMES GO, AND WHY THAT IS THE SAME FOLDER YOU BROWSE
-The capture folder IS the browse folder. Frames are written into it as PNGs,
-and the generated app's _FrameBrowser already lists that folder, sorts it
-naturally and drives the scrubber from it. So "review what I just captured" is
-not a feature anyone has to build: it is what the existing panel does once the
-frames land there. PNG specifically, because frame_timing, frame_roi and
-frame_classes all discover frames by IMAGE_SUFFIXES and open them with Pillow —
-a capture written as .npy is invisible to every one of them.
+The capture folder IS the browse folder. Each run writes, side by side:
+
+    <run>_frame_000001.png ...   what the camera looked like, one per frame
+    <run>_frames.csv             one row per saved PNG: when, how many events,
+                                 and where it falls in the .raw
+    <run>_events.raw             EVENT CAMERAS ONLY: every event the sensor
+                                 sent, in Prophesee's own format
+
+PNG specifically, because frame_timing, frame_roi and frame_classes all
+discover frames by IMAGE_SUFFIXES and open them with Pillow — a capture
+written as .npy is invisible to every one of them. The .raw is the event
+camera's real data: a PNG is a 20 ms picture of it, and PNGs may be skipped
+when storage falls behind, but the .raw is written as the SDK hands the bytes
+over and loses nothing.
+
+Save to a LOCAL folder and copy the run afterwards. A network share could not
+keep up with a real EVK4.
+
+THE SLIDER FOLLOWS THE CAPTURE
+In an app with a "frame" slider and no generated browser on it (Typhon), attach
+puts a CaptureReviewer in charge of the canvas: the slider grows as frames are
+saved, its last position is live, dragging back reviews a saved frame while
+the capture carries on, Play plays, and PNG / Raw swaps to the .raw of the
+same run. See council_qt/widgets/capture_review.py.
 
 NOTHING HERE EVER DELETES
 A generated app is forbidden from even SPELLING remove/unlink/rmtree (the gate
@@ -87,6 +104,20 @@ class _Live:
         #: camera_setup.json for the attached app. Survives disconnect: it
         #: is about the app, not about the open camera.
         self.setup_path: Optional[Path] = None
+        #: The .raw of the latest run, or None (a frame camera has none).
+        self.raw_path: Optional[Path] = None
+        #: The attached app's slider controller. About the app, like
+        #: setup_path, so it survives disconnect.
+        self.reviewer: Any = None
+        #: Whether the status line has said its last word about the latest
+        #: run. The pump writes the live numbers only while there is
+        #: something live to report; otherwise it would overwrite every other
+        #: message in that line thirty times a second.
+        self.reported = True
+        #: The run is being saved to a network share. Said in the live
+        #: status line, because a message returned by Start is overwritten
+        #: by the live numbers within one tick.
+        self.network = False
 
     def clear(self) -> None:
         self.device = None
@@ -94,6 +125,9 @@ class _Live:
         self.info = None
         self.folder = None
         self.run = ""
+        self.raw_path = None
+        self.reported = True
+        self.network = False
 
 
 _LIVE = _Live()
@@ -207,6 +241,7 @@ def connect(which: Any) -> Dict[str, Any]:
         _LIVE.device = device
         _LIVE.info = info
         _LIVE.session = capture.CaptureSession(device)
+        _LIVE.reported = True
 
     limits = device.limits()
     area = device.roi()
@@ -246,19 +281,30 @@ def shutdown() -> Dict[str, Any]:
 # ======================================================================
 # Capturing
 # ======================================================================
+#: How long Stop waits for queued frames before handing the UI back. Frames
+#: still queued after that keep saving in the background, and the status line
+#: counts them down; the app waits for them in full when it quits.
+STOP_DRAIN_SECONDS = 1.0
+
+
 def start(folder: Any, exposure: Any = "", gain: Any = "") -> Dict[str, Any]:
     """Begin the live view, and save every frame into `folder`.
 
-    `folder` is the SAME folder the frame browser is pointed at, which is what
-    makes the scrubber a review of what was just captured.
+    `folder` is the SAME folder the slider shows, which is what makes the
+    slider a review of what is being captured.
 
-    Each run writes under its own stamped stem, so starting a second run into
+    Each run writes under its own stamped name, so starting a second run into
     the same folder adds to it and can never overwrite the first — this module
     has no way to delete anything and should not have one.
+
+    AN EVENT CAMERA ALSO RECORDS ITS .raw, started BEFORE the stream so the
+    file holds the whole run (see EvkDevice.start_raw).
     """
     from council_core import capture
 
     session = _require_session()
+    if session.running:
+        raise RuntimeError("already capturing — stop first")
     where = str(folder or "").strip().strip('"')
     if not where:
         raise RuntimeError("choose a folder to save frames into first")
@@ -271,33 +317,86 @@ def start(folder: Any, exposure: Any = "", gain: Any = "") -> Dict[str, Any]:
     if str(gain or "").strip():
         set_gain(gain)
 
-    run = time.strftime("%Y%m%d_%H%M%S")
-    recorder = capture.Recorder(out, stem=f"{run}_frame")
+    run = _unique_run(out)
+    recorder = capture.Recorder(out, stem=f"{run}_frame",
+                                index_name=f"{run}_frames.csv")
     try:
         session.record_to(recorder)
     except OSError as exc:
         raise RuntimeError(f"cannot save frames into {out}: {exc}") from exc
+
+    device = session.device
+    raw = None
+    if getattr(device, "records_raw", False):
+        try:
+            raw = device.start_raw(out / f"{run}_events.raw")
+        except Exception as exc:                          # noqa: BLE001
+            session.record_to(None)
+            raise RuntimeError(f"cannot record the raw file: {exc}") from exc
     _LIVE.folder = out
     _LIVE.run = run
-    session.start()
-    return {"summary": f"Capturing into {out}.", "folder": str(out),
-            "run": run}
+    _LIVE.raw_path = raw
+    _LIVE.reported = False
+    _LIVE.network = _on_network_share(out)
+    try:
+        session.start()
+    except Exception:
+        if raw is not None:
+            try:
+                device.stop_raw()
+            except Exception:                             # noqa: BLE001
+                pass
+        session.record_to(None)
+        raise
+
+    said = f"Capturing into {out}."
+    if raw is not None:
+        said += f" Raw: {raw.name}."
+    if _LIVE.network:
+        said += (" This folder is on a network share — save to a local "
+                 "folder and copy the run afterwards, or frames will be "
+                 "skipped.")
+    return {"summary": said, "folder": str(out), "run": run,
+            "raw": str(raw) if raw is not None else ""}
 
 
 def stop() -> Dict[str, Any]:
-    """End the run. Returns whether the grab thread actually stopped."""
+    """End the run. Returns whether the grab thread actually stopped.
+
+    Stopping the camera also finishes the .raw (EvkDevice.stop). Saving the
+    PNGs still queued is given STOP_DRAIN_SECONDS; anything left after that
+    carries on in the background and the status line counts it down, so a
+    slow disk never freezes the window.
+    """
     session = _LIVE.session
     if session is None:
         return {"summary": "Not capturing."}
     ended = session.stop()
-    session.record_to(None)
+    session.record_to(None, drain_timeout=STOP_DRAIN_SECONDS)
     stats = session.stats()
     if not ended:
         # The truth, not a hopeful message. Something is still holding the
         # camera, and the next start would be racing it.
         return {"summary": "The camera did not stop cleanly.",
                 "status": stats.line()}
-    return {"summary": f"Stopped. {stats.line()}", "status": stats.line()}
+    line = _stopped_line(session)
+    return {"summary": line, "status": stats.line()}
+
+
+def _stopped_line(session: Any) -> str:
+    """What the status line says once a run is over — or nearly over."""
+    stats = session.stats()
+    line = f"Stopped. {stats.line()}"
+    if stats.waiting:
+        line = f"Stopped — still saving. {stats.line()}"
+    raw = _LIVE.raw_path
+    if raw is not None:
+        try:
+            size = raw.stat().st_size / (1024 * 1024)
+            line += f" · raw {raw.name} ({size:.1f} MB)"
+        except OSError:
+            line += f" · raw {raw.name} MISSING"
+    return line
 
 
 def status() -> Dict[str, Any]:
@@ -354,17 +453,44 @@ def pump(show: Callable[[Any], Any],
     frame = latest()
     if frame is not None:
         show(frame.image)
-    if say is not None:
-        session = _LIVE.session
-        if session is not None:
-            say(_status_line(session.stats(), frame))
+    _report(say, frame)
     return frame is not None
+
+
+def _report(say: Optional[Callable[[str], Any]], frame: Any) -> None:
+    """The status line: live numbers while capturing or saving, then one
+    final line, then silence — so "Connected to ..." and every other message
+    written there stays readable."""
+    session = _LIVE.session
+    if say is None or session is None:
+        return
+    if session.running or session.saving:
+        say(_status_line(session.stats(), frame))
+        _LIVE.reported = False
+    elif not _LIVE.reported:
+        say(_stopped_line(session))
+        _LIVE.reported = True
+
+
+def _tick(show: Callable[[Any], Any], say: Optional[Callable[[str], Any]],
+          reviewer: Any) -> None:
+    """One timer tick: the newest frame to the reviewer (or straight to the
+    canvas when the app has none), then the status line."""
+    if reviewer is None:
+        pump(show, say)
+        return
+    frame = latest()
+    reviewer.tick(frame)
+    _report(say, frame)
 
 
 def attach(app: Any, view: str = "live_view",
            status: str = "capture_status",
            interval_ms: int = LIVE_MS, first_run: bool = True,
-           wizard: Optional[Callable[[Any], Any]] = None) -> Any:
+           wizard: Optional[Callable[[Any], Any]] = None,
+           scrubber: str = "frame", folder: str = "capture_folder",
+           current: str = "current_frame", roi: str = "roi",
+           view_status: str = "view_status") -> Any:
     """Start the live view. ONE line in app.py, which is never regenerated::
 
         class App(HandlerMixin, MainUi):
@@ -393,8 +519,13 @@ def attach(app: Any, view: str = "live_view",
     that it is installed. Cancelling it means it is offered again next time.
     `first_run=False` or COUNCIL_NO_DIALOGS skips it; `wizard` replaces it,
     so a test can see it scheduled without a window appearing.
+
+    THE SLIDER. When the app has a `scrubber` port and a `folder` port, and no
+    generated browser already drives that slider, a CaptureReviewer takes the
+    canvas: it follows the capture, plays, and swaps PNG / raw. `current`,
+    `roi` and `view_status` are used when the app has them.
     """
-    from PySide6.QtCore import QTimer
+    from PySide6.QtCore import Qt, QTimer
 
     canvas = _port_widget(app, view)
     show = getattr(canvas, "set_array", None)
@@ -408,9 +539,17 @@ def attach(app: Any, view: str = "live_view",
     if held is not None:
         return held
 
+    reviewer = _reviewer_for(app, canvas, scrubber, folder, current, roi,
+                             view_status)
+    _LIVE.reviewer = reviewer
+    app._capture_review = reviewer
+
     timer = QTimer(app)
     timer.setInterval(int(interval_ms))
-    timer.timeout.connect(lambda: pump(show, say))
+    # PRECISE: Windows rounds coarse timers to its ~15.6 ms tick, which
+    # turned a 33 ms timer into ~20 updates a second.
+    timer.setTimerType(Qt.TimerType.PreciseTimer)
+    timer.timeout.connect(lambda: _tick(show, say, reviewer))
     timer.start()
     # HELD ON THE APP ON PURPOSE. A QTimer whose last reference goes out of
     # scope is collected and silently stops firing — the live view would work
@@ -434,6 +573,130 @@ def attach(app: Any, view: str = "live_view",
         # to sit over.
         QTimer.singleShot(0, lambda: (wizard or _first_run)(app))
     return timer
+
+
+def _reviewer_for(app: Any, canvas: Any, scrubber: str, folder: str,
+                  current: str, roi: str, view_status: str) -> Any:
+    """A CaptureReviewer for this app, or None when it should not have one.
+
+    None when a generated _FrameBrowser already drives the slider (it is
+    stored as ports.browse_<slider port>): two controllers drawing into one
+    canvas is how a frame you scrubbed to gets replaced by a live one.
+    """
+    ports = getattr(app, "ports", None)
+    if ports is None or getattr(ports, f"browse_{scrubber}", None) is not None:
+        return None
+    slider = getattr(getattr(ports, scrubber, None), "widget", None)
+    where = getattr(ports, folder, None)
+    if where is None or not all(callable(getattr(slider, name, None))
+                                for name in ("set_range", "on_step", "set")):
+        return None
+    from council_core import cameras
+    from council_qt.widgets.capture_review import CaptureReviewer
+
+    return CaptureReviewer(
+        canvas=canvas, scrubber=slider, folder=where,
+        current=getattr(ports, current, None) if current else None,
+        roi=getattr(ports, roi, None) if roi else None,
+        view=getattr(ports, view_status, None) if view_status else None,
+        feed=_Feed(), window_us=int(cameras.DEFAULT_ACCUMULATE_MS * 1000),
+        parent=app)
+
+
+class _Feed:
+    """What the reviewer is told about the capture. Read on the UI thread."""
+
+    def capturing(self) -> bool:
+        session = _LIVE.session
+        return bool(session is not None and session.running)
+
+    def saving(self) -> bool:
+        session = _LIVE.session
+        return bool(session is not None and session.saving)
+
+    def run(self) -> str:
+        return _LIVE.run
+
+    def written(self, start: int = 0) -> List[Any]:
+        session = _LIVE.session
+        return session.written(start) if session is not None else []
+
+    def raw_growing(self, path: Any) -> bool:
+        """Is `path` the .raw the camera is writing right now?"""
+        device = _LIVE.device
+        live = getattr(device, "raw_path", None) if device is not None else None
+        if live is None:
+            return False
+        try:
+            return Path(str(path)).resolve() == Path(str(live)).resolve()
+        except OSError:
+            return str(path) == str(live)
+
+
+def play_pause() -> Dict[str, Any]:
+    """Play the slider like a video, or pause it. Script-linkable."""
+    reviewer = _require_reviewer()
+    said = reviewer.play_pause()
+    return {"summary": said, "view": reviewer.view_text()}
+
+
+def toggle_view() -> Dict[str, Any]:
+    """Swap the slider between the saved PNGs and the run's .raw."""
+    reviewer = _require_reviewer()
+    said = reviewer.toggle_view()
+    return {"summary": said, "view": reviewer.view_text()}
+
+
+def _require_reviewer() -> Any:
+    reviewer = _LIVE.reviewer
+    if reviewer is None:
+        raise RuntimeError("this app has no capture slider to play")
+    return reviewer
+
+
+def _unique_run(out: Path) -> str:
+    """The run's name: the time it started, made unique if a run started in
+    the same second is already in the folder. The raw log would otherwise
+    truncate the first run's .raw, silently."""
+    import os
+
+    base = time.strftime("%Y%m%d_%H%M%S")
+    try:
+        names = [e.name for e in os.scandir(out)] if out.is_dir() else []
+    except OSError:
+        names = []
+    taken = set()
+    for name in names:
+        for marker in ("_frame_", "_events.raw", "_frames.csv"):
+            head, found, _ = name.partition(marker)
+            if found:
+                taken.add(head)
+    run, n = base, 1
+    while run in taken:
+        n += 1
+        run = f"{base}_{n}"
+    return run
+
+
+def _on_network_share(path: Path) -> bool:
+    """Is `path` on a network share (a UNC path or a mapped network drive)?"""
+    import os
+
+    text = str(path.absolute())
+    if text.startswith(("\\\\", "//")):
+        return True
+    if os.name != "nt":
+        return False
+    drive = os.path.splitdrive(text)[0]
+    if not drive or not drive.endswith(":"):
+        return False
+    try:
+        import ctypes
+
+        DRIVE_REMOTE = 4
+        return ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == DRIVE_REMOTE
+    except Exception:                                     # noqa: BLE001
+        return False
 
 
 # ======================================================================
@@ -540,6 +803,8 @@ def _status_line(stats: Any, frame: Any) -> str:
         rate = meta.get("event_rate_hz") or 0.0
         if rate:
             line += f" · {rate / 1000.0:.1f} kev/s"
+    if _LIVE.network:
+        line += " · NETWORK FOLDER: save locally, copy after"
     return line
 
 
@@ -564,6 +829,11 @@ def set_area(area: Any) -> Dict[str, Any]:
         raise RuntimeError("type the area as x, y, w, h")
 
     was_running = _LIVE.session is not None and _LIVE.session.running
+    if was_running and getattr(device, "raw_path", None) is not None:
+        # Changing the area restarts the stream, and restarting the stream
+        # ends the .raw — the rest of the run would be missing from it.
+        raise RuntimeError("stop the capture before changing the camera's "
+                           "area — it would cut the raw recording short")
     if was_running:
         _LIVE.session.stop()
     try:
