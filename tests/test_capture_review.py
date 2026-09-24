@@ -422,7 +422,7 @@ def test_png_playback_runs_near_thirty_frames_a_second(ui, tmp_path):
     rv.play_pause()
     pump(1.0)
     rv.play_pause()
-    assert rv.scrubber.get() >= 22, rv.scrubber.get()
+    assert rv.scrubber.get() >= 26, rv.scrubber.get()
 
 
 def test_nothing_to_play_says_so(ui, tmp_path):
@@ -727,3 +727,68 @@ def test_the_raw_view_is_anchored_at_the_runs_origin(ui, tmp_path):
     with_playback(rv, playback)
     rv.toggle_view()
     assert playback.opened_with == {"origin_us": 0 - 20_000}
+
+
+
+# ======================================================================
+# Pop out, and the run's own window in the raw view
+# ======================================================================
+def test_pop_out_copies_the_picture_into_its_own_window(ui, tmp_path):
+    from council_qt.widgets import pop_out as popping
+
+    saved_run(tmp_path, count=3)
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    canvas = ui.ports.live_view.widget
+    out = frame_camera.pop_out()
+    window = frame_camera._LIVE.popouts[-1]
+    assert "Popped out" in out["summary"]
+    assert window.windowTitle() == f"{RUN}_frame_000001.png"
+    assert window.canvas._base == canvas._base            # same pixels ...
+    drag(ui._capture_review, 2)
+    pump(0.1)
+    assert window.canvas._base != canvas._base            # ... its own copy
+    window.close()
+
+
+def test_a_popped_out_window_goes_full_screen_and_back(ui, tmp_path):
+    saved_run(tmp_path, count=2)
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    frame_camera.pop_out()
+    window = frame_camera._LIVE.popouts[-1]
+    window.toggle_full_screen()
+    pump(0.05)
+    assert window.isFullScreen()
+    window.leave_full_screen()
+    pump(0.05)
+    assert not window.isFullScreen()
+    window.close()
+
+
+def test_nothing_to_pop_out_says_so(ui, tmp_path):
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    assert "Nothing to pop out" in frame_camera.pop_out()["summary"]
+
+
+def test_the_raw_view_uses_the_runs_own_window(ui, tmp_path):
+    """A run captured at 200 fps has 5 ms pictures; its raw view too."""
+    rv = ui._capture_review
+    saved_run(tmp_path)
+    text = (tmp_path / f"{RUN}_frames.csv").read_text()
+    lines = text.splitlines()
+    lines[0] += ",window_us"
+    lines[1:] = [l + ",5000" for l in lines[1:]]
+    (tmp_path / f"{RUN}_frames.csv").write_text("\n".join(lines) + "\n")
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    opened = []
+
+    def opener(path, window_us, **kw):
+        opened.append(window_us)
+        return FakePlayback(50, window_us=window_us)
+
+    rv._open_raw = opener
+    rv.toggle_view()
+    assert opened == [5000]

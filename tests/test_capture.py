@@ -814,3 +814,36 @@ def test_a_recording_that_fails_freezes_its_counts(tmp_path):
     assert session.run_stats().grabbed == 1
     assert session.stats().grabbed == 8
     assert "disk full" in session.run_stats().recording_failed
+
+
+
+# ======================================================================
+# Using the machine: writers and memory
+# ======================================================================
+def test_the_writer_pool_scales_with_the_machine():
+    import os
+
+    assert 1 <= capture.DEFAULT_WRITERS <= 8
+    assert capture.DEFAULT_WRITERS == max(1, min(8, (os.cpu_count() or 2) - 2))
+
+
+def test_the_write_budget_scales_with_memory_within_bounds():
+    budget = capture.WRITE_BUDGET_BYTES
+    assert 512 << 20 <= budget <= 8 << 30
+    ram = capture._physical_memory()
+    if ram:
+        assert budget == min(8 << 30, max(512 << 20, ram // 4))
+
+
+def test_the_run_index_records_each_pictures_window(tmp_path):
+    rec = Recorder(tmp_path, index_name="i.csv")
+    rec.open()
+    rec.write(cameras.Frame(image=np.zeros((4, 4), np.uint8), index=1,
+                            meta={"window_ms": 5.0, "events": 3}))
+    rec.close()
+    assert read_index(tmp_path / "i.csv")[0]["window_us"] == "5000"
+
+
+def test_a_view_can_name_display_drops_in_its_own_words():
+    line = Stats(grabbed=5, dropped=3, rate=30.0).line("not drawn (screen only)")
+    assert "3 not drawn (screen only)" in line and "dropped" not in line

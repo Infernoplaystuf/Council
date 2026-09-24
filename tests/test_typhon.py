@@ -105,28 +105,33 @@ def test_the_setup_button_is_linked_to_the_wizard():
 
 
 def test_typhon_is_v5_in_teal_plus_the_capture_review_controls():
-    """Typhon began as v5 in #045f80. Since the first EVK4 test it alone has
-    the slider that follows a capture: no generated browser on it, a view
-    line above the picture, Play / Pause and PNG / Raw. Nothing else moved."""
+    """Typhon began as v5 in #045f80. Since the first EVK4 tests it alone has
+    the slider that follows a capture (no generated browser on it), a view
+    line above the picture, Play / Pause, PNG / Raw and Pop out, a frame rate
+    where v3's unwired "Frame count" was, and real exposure and gain ranges.
+    Nothing else moved."""
     v5, typhon = gspec("barbie_capture_v5"), gspec("typhon")
     assert typhon["window"]["bg"] == TYPHON_BG
     assert typhon["window"]["fg"] == v5["window"]["fg"]
     assert typhon["window"]["title"] == "Typhon"
     old = {s["id"]: s for s in v5["shapes"]}
     new = {s["id"]: s for s in typhon["shapes"]}
-    assert sorted(set(new) - set(old)) == ["s55", "s56"]
+    assert sorted(set(new) - set(old)) == ["s55", "s56", "s57"]
     strip = lambda s: {k: v for k, v in s.items() if k != "label"}
     changed = sorted(k for k in old if strip(old[k]) != strip(new[k]))
-    assert changed == ["s09", "s11", "s23"]
+    assert changed == ["s04", "s06", "s08", "s09", "s11", "s23", "s46"]
     assert new["s11"]["drives"] == {}, "a generated browser would own the slider"
     assert new["s09"]["port"] == {"name": "view_status"}
     assert new["s55"]["script"]["function"] == "play_pause"
     assert new["s56"]["script"]["function"] == "toggle_view"
+    assert new["s57"]["script"]["function"] == "pop_out"
+    assert new["s08"]["port"] == {"name": "frame_rate"}
+    assert new["s46"]["script"]["inputs"][-1] == "frame_rate"
 
 
 def test_the_review_controls_fit_beside_the_slider():
     shapes = {s["id"]: s for s in gspec("typhon")["shapes"]}
-    row = [shapes[k] for k in ("s11", "s55", "s56")]
+    row = [shapes[k] for k in ("s11", "s55", "s56", "s57")]
     for left, right in zip(row, row[1:]):
         assert left["x"] + left["w"] <= right["x"], (left["id"], right["id"])
     assert row[-1]["x"] + row[-1]["w"] <= shapes["s10"]["x"] + shapes["s10"]["w"]
@@ -310,3 +315,31 @@ def test_first_run_fills_the_camera_panel(qapp, typhon_dir, monkeypatch,
     frame_camera._first_run(ui)
     assert ui.ports.cameras.items()
     assert ui.ports.capture_status.get()
+
+
+
+def test_exposure_is_not_capped_at_100_microseconds():
+    """v3's spin boxes ran 0..100, so a Basler could never be exposed longer
+    than 100 us from the app."""
+    shapes = {s["id"]: s for s in gspec("typhon")["shapes"]}
+    assert shapes["s04"]["props"]["to"] >= 1_000_000
+    assert shapes["s06"]["props"]["to"] >= 24
+    assert shapes["s08"]["props"]["to"] >= 1000
+
+
+def test_the_pop_out_button_opens_a_copy(qapp, typhon_dir, forget_generated,
+                                         tmp_path):
+    import numpy as np
+    from PIL import Image
+
+    Image.fromarray(np.full((48, 64), 77, np.uint8)).save(
+        tmp_path / "20260924_120000_frame_000001.png")
+    ui = construct(typhon_dir)
+    ui.ports.capture_folder.set(str(tmp_path))
+    _pump_until(lambda: False, seconds=0.4)
+    ui.on_btn_pop_out()
+    windows = [w for w in frame_camera._LIVE.popouts if w.isVisible()]
+    assert windows, ui.ports.view_status.get()
+    assert windows[-1].windowTitle() == "20260924_120000_frame_000001.png"
+    for w in windows:
+        w.close()

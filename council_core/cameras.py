@@ -72,6 +72,10 @@ EVENT_MID = 128
 #: Default accumulation window for an event stream, in milliseconds.
 DEFAULT_ACCUMULATE_MS = 20.0
 
+#: The shortest window an event camera is asked for: 1 ms, 1000 pictures a
+#: second. Shorter windows hold too few events to show anything.
+MIN_ACCUMULATE_MS = 1.0
+
 
 class CameraError(Exception):
     """A camera could not do what was asked."""
@@ -284,6 +288,11 @@ class Device:
         return 0.0
 
     def set_gain(self, value: float) -> float:
+        return 0.0
+
+    def set_frame_rate(self, fps: float) -> float:
+        """Ask for `fps` pictures a second; 0 means the camera's own default.
+        Returns the rate actually in effect, 0.0 if this camera cannot say."""
         return 0.0
 
     def start(self) -> None:
@@ -538,6 +547,50 @@ class BaslerDevice(Device):
         except Exception as exc:                            # noqa: BLE001
             raise CameraError(f"gain refused: {exc}") from exc
         return float(self._value("Gain", value))
+
+    def set_frame_rate(self, fps: float) -> float:
+        """Cap the camera at `fps`; 0 lifts the cap (as fast as it can).
+
+        A boA5320 free-runs at up to ~150 fps of 49 MB frames, far more than
+        any disk saves as PNG. Capping the camera at a rate the disk can take
+        is the difference between a complete capture and one full of "NOT
+        saved". SFNC-2 cameras call the node AcquisitionFrameRate; older GigE
+        models AcquisitionFrameRateAbs. The request is clamped to the range
+        the camera reports, and the rate it actually runs at is returned.
+        """
+        fps = float(fps)
+        if fps <= 0:
+            self._try_set("AcquisitionFrameRateEnable", False)
+            return self.frame_rate()
+        name = next((n for n in ("AcquisitionFrameRate",
+                                 "AcquisitionFrameRateAbs")
+                     if self._node(n) is not None), None)
+        if name is None:
+            raise CameraError("this camera has no frame-rate control")
+        node = self._node(name)
+        try:
+            low, high = float(node.GetMin()), float(node.GetMax())
+            fps = max(low, min(high, fps))
+        except Exception:                                   # noqa: BLE001
+            pass
+        try:
+            self._set("AcquisitionFrameRateEnable", True)
+            self._set(name, fps)
+        except Exception as exc:                            # noqa: BLE001
+            raise CameraError(f"frame rate refused: {exc}") from exc
+        return self.frame_rate()
+
+    def frame_rate(self) -> float:
+        """The rate the camera says it will run at, 0.0 if it cannot say."""
+        for name in ("ResultingFrameRate", "ResultingFrameRateAbs",
+                     "AcquisitionFrameRate", "AcquisitionFrameRateAbs"):
+            value = self._value(name, None)
+            if value is not None:
+                try:
+                    return float(value)
+                except (TypeError, ValueError):
+                    continue
+        return 0.0
 
     def start(self) -> None:
         if self._started:
@@ -992,6 +1045,21 @@ class EvkDevice(Device):
         self._roi = wanted
         return wanted
 
+    def set_frame_rate(self, fps: float) -> float:
+        """Pictures a second = how long each window collects events.
+
+        An event camera has no frames: `fps` sets the window each picture
+        covers (50 fps = 20 ms windows; 0 = the default). Safe while
+        streaming — the next window uses it. The .raw is unaffected: it has
+        every event whatever the windows are.
+        """
+        fps = float(fps)
+        if fps <= 0:
+            self.accumulate_ms = DEFAULT_ACCUMULATE_MS
+        else:
+            self.accumulate_ms = max(MIN_ACCUMULATE_MS, 1000.0 / fps)
+        return 1000.0 / self.accumulate_ms
+
     def start(self) -> None:
         if self._started:
             return
@@ -1178,12 +1246,22 @@ class SyntheticDevice(Device):
         self._index = 0
         self._started = False
         self.accumulate_ms = DEFAULT_ACCUMULATE_MS
+        self._fps = self.FRAME_FPS
         self._due = 0.0
 
     def _interval(self) -> float:
         if self.info.kind == "event":
             return max(0.001, self.accumulate_ms / 1000.0)
-        return 1.0 / self.FRAME_FPS
+        return 1.0 / self._fps
+
+    def set_frame_rate(self, fps: float) -> float:
+        fps = float(fps)
+        if self.info.kind == "event":
+            self.accumulate_ms = (DEFAULT_ACCUMULATE_MS if fps <= 0 else
+                                  max(MIN_ACCUMULATE_MS, 1000.0 / fps))
+            return 1000.0 / self.accumulate_ms
+        self._fps = self.FRAME_FPS if fps <= 0 else min(1000.0, fps)
+        return self._fps
 
     def limits(self) -> Limits:
         """The limits of whichever sensor this one is standing in for.

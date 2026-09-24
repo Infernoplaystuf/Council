@@ -378,3 +378,14 @@ def test_a_real_recording_plays_back_exactly(tmp_path):
     assert sorted(os.listdir(tmp_path)) == ["rec_events.raw"], \
         "something was written beside the recording"
     os.rename(path, tmp_path / "moved.raw")               # not locked
+
+
+
+def test_the_runs_window_is_read_from_its_csv(tmp_path):
+    index = tmp_path / "run_frames.csv"
+    index.write_text("file,index,timestamp_us,raw_t_us,events,window_us\n"
+                     "a.png,1,1500000,20000,5,5000\n", encoding="utf-8")
+    assert ep.run_window_us(index) == 5000
+    index.write_text("file,index,timestamp_us,raw_t_us,events\n"
+                     "a.png,1,1500000,20000,5\n", encoding="utf-8")
+    assert ep.run_window_us(index) is None

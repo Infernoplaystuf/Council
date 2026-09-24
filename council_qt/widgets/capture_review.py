@@ -255,6 +255,7 @@ class CaptureReviewer(QObject):
         self._note = ""
         self._note_until = 0.0
         self._play_anchor = (0.0, 0)
+        self._png_due = 0.0
         self._roi_syncing = False
         #: Set while THIS code moves the slider. The generated Scrubber
         #: reports a clamped QSlider as a user move: shrinking its range
@@ -265,6 +266,8 @@ class CaptureReviewer(QObject):
         self._end_after_save = False
         #: The raw window to show once the reader has got that far.
         self._raw_target: Optional[int] = None
+        #: The window the open raw view uses (the run's own, from its CSV).
+        self._raw_window = int(window_us)
         self._raw_seen = -1
         self._raw_finished = False
 
@@ -564,6 +567,7 @@ class CaptureReviewer(QObject):
                 self._slider_to(0)
         self.playing = True
         self._play_anchor = (time.monotonic(), self.scrubber.get())
+        self._png_due = time.monotonic() + PNG_PLAY_MS / 1000.0
         self._show_now()
         self._play.start(PNG_PLAY_MS if self.mode == PNG else RAW_PLAY_MS)
         self._say()
@@ -586,13 +590,23 @@ class CaptureReviewer(QObject):
                     self._set_current("")
                 self._say()
                 return
-            began = time.monotonic()
+            now = time.monotonic()
+            if now < self._png_due - 0.002:
+                self._play.start(max(1, int((self._png_due - now) * 1000)))
+                return
             self._slider_to(index)
             self._show_png(index)
-            # The decode is part of the frame's time, not added to it: a
-            # fixed 33 ms AFTER each decode measured 17 fps, not 30.
-            spent_ms = (time.monotonic() - began) * 1000.0
-            self._play.start(max(1, int(PNG_PLAY_MS - spent_ms)))
+            # ON A SCHEDULE: each frame is due 33 ms after the previous one
+            # was DUE, not after it was shown. Measured, a fixed 33 ms after
+            # each decode gave 17 fps, and timing from the moment shown still
+            # gave 21 under load — Windows timers fire up to ~15 ms late, and
+            # that lateness was added to every frame. A player behind by more
+            # than a few frames restarts its schedule rather than bursting.
+            self._png_due += PNG_PLAY_MS / 1000.0
+            now = time.monotonic()
+            if self._png_due < now - 0.1:
+                self._png_due = now + PNG_PLAY_MS / 1000.0
+            self._play.start(max(1, int((self._png_due - now) * 1000)))
             return
         if self.raw is None:
             self._stop_playing()
@@ -637,11 +651,14 @@ class CaptureReviewer(QObject):
             return self._note_for("Raw opens after Stop")
         from council_core import event_playback
 
-        origin = event_playback.raw_origin(
-            Path(self.root) / f"{run_of_raw(path)}_frames.csv")
+        index = Path(self.root) / f"{run_of_raw(path)}_frames.csv"
+        origin = event_playback.raw_origin(index)
         extra = {} if origin is None else {"origin_us": origin}
+        # The run's own window: a run captured at 200 fps has 5 ms pictures,
+        # and its raw view should show the same.
+        self._raw_window = event_playback.run_window_us(index) or self.window_us
         try:
-            playback = self._open_raw(path, self.window_us, **extra)
+            playback = self._open_raw(path, self._raw_window, **extra)
         except Exception as exc:                            # noqa: BLE001
             return self._note_for(f"Cannot open raw: {exc}")
 
@@ -725,7 +742,7 @@ class CaptureReviewer(QObject):
         name = os.path.basename(shown)
         for raw_t, file in self._times(run_of_raw(path)):
             if file == name:
-                return event_playback.window_for(raw_t, self.window_us)
+                return event_playback.window_for(raw_t, self._raw_window)
         return 0
 
     def _png_index_for(self, run: str, window: int, count: int) -> int:
@@ -735,7 +752,7 @@ class CaptureReviewer(QObject):
 
         members = [i for i, f in enumerate(self.files) if run_of(f) == run]
         name = event_playback.nearest_frame(
-            self._times(run), (int(window) + 1) * self.window_us)
+            self._times(run), (int(window) + 1) * self._raw_window)
         if name:
             for i in members:
                 if os.path.basename(self.files[i]) == name:
@@ -779,6 +796,20 @@ class CaptureReviewer(QObject):
         self._note_until = time.monotonic() + NOTE_SECONDS
         self._say()
         return self._note
+
+    def describe_shown(self) -> str:
+        """What is on screen, in words — the title of a popped-out copy."""
+        if self.mode == RAW and self.raw is not None:
+            at = self.scrubber.get() * self.raw.window_us / 1e6
+            name = self.raw_file.name if self.raw_file else "raw"
+            return f"{name} at {at:.3f} s"
+        if self._shown and self._shown[0] == PNG:
+            return os.path.basename(self._shown[2])
+        if self.live:
+            return f"Live · {time.strftime('%H:%M:%S')}"
+        if self._previewing:
+            return f"Preview · {time.strftime('%H:%M:%S')}"
+        return "Picture"
 
     def view_text(self) -> str:
         """The one line under "Live view": where the slider is, and what it shows."""

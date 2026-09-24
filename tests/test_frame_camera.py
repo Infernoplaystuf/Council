@@ -237,7 +237,7 @@ def test_stopping_reports_the_measured_rate_and_the_drops(tmp_path):
     settle()
     out = frame_camera.stop()
     assert "fps" in out["status"]
-    assert "dropped" in out["status"]
+    assert "dropped" in out["status"]           # Stats.line itself, unchanged
 
 
 def test_stopping_when_not_started_is_not_an_error():
@@ -1039,21 +1039,69 @@ def test_the_preview_waits_for_a_stopped_run_to_finish_saving(tmp_path, monkeypa
     real = capture.write_image
 
     def slow(image, path):
-        time.sleep(0.4)
+        # Slow enough that even eight writers are still busy after Stop's
+        # one-second grace.
+        time.sleep(2.0)
         real(image, path)
 
     monkeypatch.setattr(capture, "write_image", slow)
     connected()
     frame_camera.start(str(tmp_path))
-    settle(0.4)
+    settle(0.6)
     frame_camera.stop()
     session = frame_camera._LIVE.session
     assert session.saving
     ticks(ViewerStub(), seconds=0.2)
     assert not frame_camera._LIVE.previewing, "previewed while still saving"
-    session.flush(20)
-    deadline = time.monotonic() + 20
+    session.flush(30)
+    deadline = time.monotonic() + 30
     while session.saving and time.monotonic() < deadline:
         time.sleep(0.05)
     ticks(ViewerStub(), seconds=0.2)
     assert frame_camera._LIVE.previewing
+
+
+
+# ======================================================================
+# Frame rate, and saying what display drops are
+# ======================================================================
+def test_start_applies_the_frame_rate(tmp_path):
+    connected("event")
+    frame_camera.start(str(tmp_path), frame_rate=100)
+    assert frame_camera._LIVE.device.accumulate_ms == pytest.approx(10.0)
+    frame_camera.stop()
+
+
+def test_a_frame_rate_of_zero_is_the_cameras_default(tmp_path):
+    from council_core import cameras as cams
+
+    connected("event")
+    frame_camera.set_frame_rate(200)
+    frame_camera.start(str(tmp_path), frame_rate=0)
+    assert frame_camera._LIVE.device.accumulate_ms == cams.DEFAULT_ACCUMULATE_MS
+    frame_camera.stop()
+
+
+def test_set_frame_rate_says_the_windows_for_an_event_camera():
+    connected("event")
+    out = frame_camera.set_frame_rate("250")
+    assert out["frame_rate"] == "250.0"
+    assert "4.0 ms windows" in out["summary"]
+
+
+def test_a_nonsense_frame_rate_is_refused_readably():
+    connected()
+    with pytest.raises(RuntimeError, match="frame rate"):
+        frame_camera.set_frame_rate("fast")
+
+
+def test_the_status_line_says_display_drops_are_screen_only(tmp_path):
+    """'157 dropped' was read as frames lost."""
+    connected("event")
+    frame_camera.start(str(tmp_path))
+    settle()
+    said = []
+    frame_camera.pump(lambda a: None, said.append)
+    frame_camera.stop()
+    assert "not drawn (screen only)" in said[-1]
+    assert "dropped" not in said[-1]

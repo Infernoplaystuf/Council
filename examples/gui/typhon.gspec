@@ -103,7 +103,7 @@
       "h": 24,
       "id": "s03",
       "kind": "label",
-      "label": "Exposure (us)",
+      "label": "Exposure µs (0 = keep)",
       "min_h": 0,
       "min_w": 0,
       "note": "",
@@ -139,8 +139,8 @@
       "props": {
         "command": "",
         "from_": 0,
-        "increment": 1,
-        "to": 100
+        "increment": 100,
+        "to": 10000000
       },
       "resize": "auto",
       "script": {},
@@ -158,7 +158,7 @@
       "h": 24,
       "id": "s05",
       "kind": "label",
-      "label": "Gain",
+      "label": "Gain dB (0 = keep)",
       "min_h": 0,
       "min_w": 0,
       "note": "",
@@ -195,7 +195,7 @@
         "command": "",
         "from_": 0,
         "increment": 1,
-        "to": 100
+        "to": 48
       },
       "resize": "auto",
       "script": {},
@@ -213,7 +213,7 @@
       "h": 24,
       "id": "s07",
       "kind": "label",
-      "label": "Frame count",
+      "label": "Frame rate fps (0 = auto)",
       "min_h": 0,
       "min_w": 0,
       "note": "",
@@ -244,13 +244,13 @@
       "min_w": 0,
       "note": "",
       "port": {
-        "name": "frame_count"
+        "name": "frame_rate"
       },
       "props": {
         "command": "",
         "from_": 0,
         "increment": 1,
-        "to": 100
+        "to": 1000
       },
       "resize": "auto",
       "script": {},
@@ -341,7 +341,7 @@
       },
       "resize": "auto",
       "script": {},
-      "w": 392,
+      "w": 288,
       "x": 512,
       "y": 568,
       "z": 12
@@ -1380,7 +1380,8 @@
         "inputs": [
           "capture_folder",
           "exposure",
-          "gain"
+          "gain",
+          "frame_rate"
         ],
         "module": "frame_camera",
         "outputs": {
@@ -1631,7 +1632,7 @@
         }
       },
       "w": 96,
-      "x": 912,
+      "x": 808,
       "y": 572,
       "z": 56
     },
@@ -1660,9 +1661,38 @@
         }
       },
       "w": 96,
-      "x": 1016,
+      "x": 912,
       "y": 572,
       "z": 57
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s57",
+      "kind": "button",
+      "label": "Pop out",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "pop_out",
+        "inputs": [],
+        "module": "frame_camera",
+        "outputs": {
+          "view_status": "view"
+        }
+      },
+      "w": 96,
+      "x": 1016,
+      "y": 572,
+      "z": 58
     }
   ],
   "window": {

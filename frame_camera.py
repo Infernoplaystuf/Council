@@ -124,6 +124,10 @@ class _Live:
         #: The attached app's slider controller. About the app, like
         #: setup_path, so it survives disconnect.
         self.reviewer: Any = None
+        #: The attached app's picture, for Pop out, and the windows popped
+        #: out of it (held so they are not garbage-collected shut).
+        self.canvas: Any = None
+        self.popouts: List[Any] = []
         #: Whether the status line has said its last word about the latest
         #: run. The pump writes the live numbers only while there is
         #: something live to report; otherwise it would overwrite every other
@@ -326,7 +330,8 @@ def shutdown() -> Dict[str, Any]:
 STOP_DRAIN_SECONDS = 1.0
 
 
-def start(folder: Any, exposure: Any = "", gain: Any = "") -> Dict[str, Any]:
+def start(folder: Any, exposure: Any = "", gain: Any = "",
+          frame_rate: Any = None) -> Dict[str, Any]:
     """Begin the live view, and save every frame into `folder`.
 
     `folder` is the SAME folder the slider shows, which is what makes the
@@ -338,6 +343,10 @@ def start(folder: Any, exposure: Any = "", gain: Any = "") -> Dict[str, Any]:
 
     AN EVENT CAMERA ALSO RECORDS ITS .raw, started BEFORE the stream so the
     file holds the whole run (see EvkDevice.start_raw).
+
+    EXPOSURE, GAIN AND FRAME RATE of 0 (or blank) leave the camera as it is —
+    a spin box always has a number in it. A frame rate of 0 is the camera's
+    own default: free-running for a frame camera, 20 ms windows for an EVK4.
 
     FROM THE PREVIEW. A frame camera's preview is stopped and the camera
     started again for the capture. An EVK4's stream is left running and the
@@ -362,6 +371,8 @@ def start(folder: Any, exposure: Any = "", gain: Any = "") -> Dict[str, Any]:
         set_exposure(exposure)
     if str(gain or "").strip():
         set_gain(gain)
+    if frame_rate is not None and str(frame_rate).strip():
+        set_frame_rate(frame_rate)
 
     device = session.device
     restartable = getattr(device, "restartable", True)
@@ -646,8 +657,8 @@ def _manage_preview(want: bool) -> None:
         # has stopped is never started again on this connection.
         if _LIVE.previewing or _LIVE.idle in ("", "preview-off", "stopped"):
             _LIVE.previewing = False
-            reason = session.stats().last_error or "no reason given"
-            _LIVE.idle = f"Live preview stopped: {reason} — {_DEAD_STREAM}"
+            reason = session.stats().last_error or "it stopped sending"
+            _LIVE.idle = f"Camera stopped: {reason}. Disconnect and Connect again."
             _LIVE.reported = False
         return
     if _LIVE.previewing and not session.running:
@@ -781,6 +792,7 @@ def attach(app: Any, view: str = "live_view",
     reviewer = _reviewer_for(app, canvas, scrubber, folder, current, roi,
                              view_status)
     _LIVE.reviewer = reviewer
+    _LIVE.canvas = canvas
     app._capture_review = reviewer
 
     timer = QTimer(app)
@@ -1036,8 +1048,14 @@ def _port_widget(app: Any, name: str) -> Any:
     return widget
 
 
+#: What the display-drop count is called in the status line. "dropped" was
+#: read as frames LOST; they are frames the screen did not redraw — every one
+#: of them is still saved.
+SCREEN_DROPS = "not drawn (screen only)"
+
+
 def _status_line(stats: Any, frame: Any) -> str:
-    line = stats.line()
+    line = stats.line(SCREEN_DROPS)
     meta = getattr(frame, "meta", None) or {}
     if meta.get("kind") == "event":
         # An event camera has no frame rate. What the number above counts is
@@ -1143,6 +1161,60 @@ def set_gain(value: Any) -> Dict[str, Any]:
     device = _require_device()
     got = device.set_gain(_number(value, "gain"))
     return {"gain": f"{got:.2f}", "summary": f"Gain {got:.2f}."}
+
+
+def set_frame_rate(value: Any) -> Dict[str, Any]:
+    """Pictures a second. 0 is the camera's default.
+
+    A frame camera is capped at this rate — the way to capture at a rate the
+    disk can keep up with. An event camera has no frames: this sets how long
+    each picture collects events (50 fps = 20 ms), and its .raw still has
+    every event.
+    """
+    device = _require_device()
+    try:
+        got = float(device.set_frame_rate(_number(value, "frame rate")))
+    except Exception as exc:                              # noqa: BLE001
+        raise RuntimeError(f"frame rate: {exc}") from exc
+    said = f"{got:.1f} fps" if got else "the camera's own rate"
+    if getattr(getattr(device, "info", None), "kind", "") == "event" and got:
+        said += f" ({1000.0 / got:.1f} ms windows)"
+    return {"frame_rate": f"{got:.1f}", "summary": f"Frame rate: {said}."}
+
+
+# ======================================================================
+# Pop out
+# ======================================================================
+def pop_out() -> Dict[str, Any]:
+    """Copy the picture on screen into a window of its own. Script-linkable.
+
+    The window can go full screen (F11) on any monitor while the app carries
+    on; each press opens another with its own copy.
+    """
+    canvas = _LIVE.canvas
+    if canvas is None:
+        raise RuntimeError("this app has no picture to pop out")
+    from council_qt.widgets import pop_out as popping
+
+    reviewer = _LIVE.reviewer
+    title = reviewer.describe_shown() if reviewer is not None else "Camera"
+    window = popping.pop_out(canvas, title)
+    if window is None:
+        said = "Nothing to pop out yet — the picture is empty."
+    else:
+        _LIVE.popouts = [w for w in _LIVE.popouts if _alive(w)] + [window]
+        said = f"Popped out: {title}"
+    view = said
+    if reviewer is not None:
+        view = reviewer._note_for(said[:60])
+    return {"summary": said, "view": view}
+
+
+def _alive(window: Any) -> bool:
+    try:
+        return bool(window.isVisible())
+    except RuntimeError:                                  # already deleted
+        return False
 
 
 def _number(value: Any, what: str) -> float:

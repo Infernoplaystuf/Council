@@ -190,10 +190,39 @@ slow)`). While capturing into a network share, the status line says so
 (`NETWORK FOLDER: save locally, copy after`).
 
 PNGs are written by several writers at once, with fast (still lossless)
-compression. Measured on EVK4-sized frames, one writer managed as few as 14 a
-second in a busy scene; four writers at the fast setting manage over 200 — the
-EVK4 makes 50. They finish out of order but are numbered, listed and indexed
-in the order the camera took them.
+compression, sized to the machine: one writer per core up to 8 (leaving two
+cores for the camera and the window), and a queue of up to a quarter of the
+RAM (between 512 MB and 8 GB) to ride out bursts. Measured on EVK4-sized
+frames, one writer managed as few as 14 a second in a busy scene; four
+writers at the fast setting manage over 200 — the EVK4 makes 50. They finish
+out of order but are numbered, listed and indexed in the order the camera
+took them.
+
+**If frames are still "NOT saved", lower the frame rate** (below). A
+full-frame boA5320 frame is about 49 MB; no disk saves 150 of those a second
+as PNG, and capping the camera at a rate the disk can take gives a complete
+capture instead of one with gaps.
+
+### Exposure, gain and frame rate
+
+Set these before **Start capture**; they are applied when it starts. **0 means
+"leave it as the camera has it"** (a spin box always has a number in it):
+
+- **Exposure µs** — up to 10 s. Basler only; an event camera has no exposure.
+- **Gain dB** — up to 48. Basler only.
+- **Frame rate fps** — how many pictures a second. On a **Basler** it caps
+  the camera (0 = as fast as it goes). On an **EVK4** it sets how long each
+  picture collects events: 50 fps = 20 ms windows (the default), 200 fps =
+  5 ms, up to 1000 fps = 1 ms. The `.raw` has every event whatever this is,
+  and the raw view uses the same window as the run's PNGs.
+
+### Pop out
+
+**Pop out** copies the picture on screen — a saved PNG, a raw window, or the
+camera live — into a window of its own. Move it to another monitor and press
+**Full screen** (or F11; Esc leaves full screen). The main window carries on
+capturing or playing meanwhile. Each press opens another window with its own
+copy; scroll to zoom, drag to pan, **Fit** to see all of it.
 
 So: capture into a local folder, press **Stop**, then copy the whole run to
 the NAS. Everything is closed at Stop, so nothing is locked while you copy.
@@ -257,10 +286,12 @@ the camera, which would cut the `.raw` short, so Typhon refuses.)
 
 ### Reading the status line
 
-`60.0 fps · 242 grabbed · 157 dropped · 242 saved`
+`60.0 fps · 242 grabbed · 157 not drawn (screen only) · 242 saved`
 
-- **dropped** counts frames the *display* never showed — normal and deliberate,
-  and shown so the number is never a lie about what the camera did.
+- **not drawn (screen only)** counts frames the *screen* did not redraw — the
+  display shows about 30 a second, whatever the camera does. Normal and
+  deliberate; **every one of them is still saved.** Only **NOT saved** means
+  frames missing from disk.
 - **saved** is frames on disk. **waiting to save** appears when the disk is
   behind; **NOT saved (storage too slow)** counts frames it could not take at
   all. If a write *fails* (disk full, folder gone), recording stops and says so.

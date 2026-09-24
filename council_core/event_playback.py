@@ -356,6 +356,20 @@ def raw_origin(index_csv: Any) -> Optional[int]:
     return None
 
 
+def run_window_us(index_csv: Any) -> Optional[int]:
+    """How long each of the run's pictures collected events, from its CSV;
+    None if it does not say (a frame camera, or an older capture)."""
+    try:
+        with open(str(index_csv), newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                value = str(row.get("window_us") or "").strip()
+                if value.isdigit() and int(value) > 0:
+                    return int(value)
+    except (OSError, csv.Error, UnicodeDecodeError):
+        return None
+    return None
+
+
 def open_raw(path: Any, window_us: int = DEFAULT_WINDOW_US, **kw: Any) -> RawPlayback:
     """Start reading `path`. Raises RawUnavailable at once if the SDK is
     missing, rather than handing back a playback that will only ever fail."""

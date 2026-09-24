@@ -929,6 +929,55 @@ def test_the_simulated_cameras_are_labelled_simulated():
         assert "simulated" in info.label.lower()
 
 
+def test_an_event_cameras_frame_rate_is_its_window():
+    """50 fps = 20 ms windows; 0 = the default; never shorter than 1 ms."""
+    device, _ = evk()
+    assert device.set_frame_rate(200) == pytest.approx(200)
+    assert device.accumulate_ms == pytest.approx(5.0)
+    device.set_frame_rate(0)
+    assert device.accumulate_ms == cameras.DEFAULT_ACCUMULATE_MS
+    assert device.set_frame_rate(1_000_000) == pytest.approx(1000)
+
+
+def test_a_basler_is_capped_at_the_frame_rate_asked_for():
+    backend, pylon = basler()
+    pylon.camera.AcquisitionFrameRateEnable = FakeNode(False)
+    pylon.camera.AcquisitionFrameRate = FakeNode(150.0, low=1.0, high=150.0)
+    device = backend.open(backend.discover()[0])
+    assert device.set_frame_rate(40) == pytest.approx(40.0)
+    assert bool(pylon.camera.AcquisitionFrameRateEnable.GetValue())
+    assert device.set_frame_rate(10_000) == pytest.approx(150.0)   # clamped
+    device.set_frame_rate(0)
+    assert not pylon.camera.AcquisitionFrameRateEnable.GetValue()
+
+
+def test_an_older_gige_basler_uses_the_abs_frame_rate_node():
+    backend, pylon = basler()
+    pylon.camera.AcquisitionFrameRateEnable = FakeNode(False)
+    pylon.camera.AcquisitionFrameRateAbs = FakeNode(30.0, low=1.0, high=100.0)
+    device = backend.open(backend.discover()[0])
+    assert device.set_frame_rate(25) == pytest.approx(25.0)
+
+
+def test_a_basler_without_a_frame_rate_node_says_so():
+    backend, _ = basler()
+    device = backend.open(backend.discover()[0])
+    with pytest.raises(CameraError, match="no frame-rate control"):
+        device.set_frame_rate(30)
+
+
+def test_the_simulated_camera_follows_its_frame_rate():
+    backend = cameras.SyntheticBackend()
+    info = [c for c in backend.discover() if c.kind == "frame"][0]
+    device = backend.open(info)
+    device.set_frame_rate(100)
+    device.start()
+    began = time.monotonic()
+    for _ in range(11):
+        device.read()
+    assert time.monotonic() - began < 0.25            # ~0.1 s at 100 fps
+
+
 def test_the_simulated_event_camera_is_paced_like_one():
     """Unpaced it produced 2,500 windows a second and filled a folder with
     1,500 PNGs in three seconds. An EVK4 gives one window per 20 ms."""

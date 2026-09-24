@@ -72,15 +72,17 @@ class Stats:
     #: Frames grabbed and queued, not yet on disk.
     waiting: int = 0
 
-    def line(self) -> str:
+    def line(self, dropped_label: str = "dropped") -> str:
         """The one line a status bar shows.
 
         The drop count is always present, including at zero. A number that
         only appears once it is bad is a number nobody is watching when it
-        goes bad.
+        goes bad. `dropped_label` lets a view say what it means in its own
+        words ("not drawn (screen only)" in Typhon, where "dropped" was read
+        as frames lost).
         """
         bits = [f"{self.rate:.1f} fps", f"{self.grabbed} grabbed",
-                f"{self.dropped} dropped"]
+                f"{self.dropped} {dropped_label}"]
         if self.recorded:
             bits.append(f"{self.recorded} saved")
         if self.waiting:
@@ -196,8 +198,11 @@ def warm_imports() -> None:
         pass
 
 
-#: The columns of a run's frame index (Recorder `index_name`).
-INDEX_COLUMNS = ("file", "index", "timestamp_us", "raw_t_us", "events")
+#: The columns of a run's frame index (Recorder `index_name`). window_us is
+#: how long each event-camera picture collected events — the raw view uses
+#: the same window, whatever frame rate the run was captured at.
+INDEX_COLUMNS = ("file", "index", "timestamp_us", "raw_t_us", "events",
+                 "window_us")
 
 
 class Recorder:
@@ -257,9 +262,11 @@ class Recorder:
         self.written += 1
         if self._index_rows is not None:
             meta = frame.meta or {}
+            window = meta.get("window_ms")
             self._index_rows.writerow((
                 path.name, frame.index, frame.timestamp_us,
-                meta.get("raw_t_us", ""), meta.get("events", "")))
+                meta.get("raw_t_us", ""), meta.get("events", ""),
+                int(round(float(window) * 1000)) if window else ""))
 
     def write(self, frame: cameras.Frame) -> Path:
         path = self.path_for(frame)
@@ -288,19 +295,60 @@ class Recorder:
                 pass
 
 
+def _physical_memory() -> int:
+    """Bytes of RAM in this machine, or 0 if it cannot be read."""
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _Status(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            status = _Status()
+            status.dwLength = ctypes.sizeof(_Status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.ullTotalPhys)
+            return 0
+        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES"))
+    except Exception:                                      # noqa: BLE001
+        return 0
+
+
+def _write_budget() -> int:
+    """A quarter of this machine's RAM, between 512 MB and 8 GB.
+
+    A fixed 512 MB held about ten full-frame boA5320 frames (49 MB each at
+    12 bits) — a burst the disk could not absorb became "NOT saved" while
+    most of the machine's memory sat unused. Big enough to ride out bursts,
+    small enough to leave the rest of the machine alone.
+    """
+    quarter = _physical_memory() // 4
+    return int(min(8 << 30, max(512 << 20, quarter)))
+
+
 #: How many bytes of frames may wait to be written before new frames are
 #: skipped. A budget in BYTES, not frames: an EVK4 window is under 1 MB and a
-#: full-frame boA5320 frame is about 32 MB, so a frame count that suited one
+#: full-frame boA5320 frame is about 49 MB, so a frame count that suited one
 #: would be either useless or gigabytes for the other.
-WRITE_BUDGET_BYTES = 512 * 1024 * 1024
+WRITE_BUDGET_BYTES = _write_budget()
 
 #: How long stopping a recording waits for queued frames to reach the disk.
 DRAIN_TIMEOUT = 30.0
 
 #: How many frames are encoded at once. PNG encoding releases the GIL, so
 #: threads scale: measured on EVK4 windows, 4 writers were 3.6x one writer.
-#: One core is left for the camera and one for the window.
-DEFAULT_WRITERS = max(1, min(4, (os.cpu_count() or 2) - 2))
+#: Up to 8 — a machine with cores to spare should spend them here rather
+#: than report frames "NOT saved" — leaving one core for the camera and one
+#: for the window.
+DEFAULT_WRITERS = max(1, min(8, (os.cpu_count() or 2) - 2))
 
 
 class FrameWriter:
