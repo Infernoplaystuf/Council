@@ -58,6 +58,21 @@ over and loses nothing.
 Save to a LOCAL folder and copy the run afterwards. A network share could not
 keep up with a real EVK4.
 
+A LIVE PREVIEW BEFORE ANYTHING IS SAVED
+Connected but not capturing, with nothing in the folder to review, the camera
+streams and the picture shows what it sees — to aim and focus by — while
+nothing is written anywhere: no PNG, no CSV, no .raw. Start turns it into a
+capture. Only apps with a capture slider (Typhon) get it; see
+`_manage_preview`.
+
+A FRAME CAMERA IS STOPPED AND STARTED; AN EVK4'S STREAM NEVER IS
+A Basler's grabs are independent, so its preview stops when there is nothing
+to show it on, and Start restarts it for the capture. An EVK4's stream must not
+be restarted on the same connection (Device.restartable, and EvkDevice for
+the measurements): it starts once and runs until Disconnect. Its capture is
+the .raw opening and closing inside the running stream, and when the preview
+is not wanted it simply is not drawn.
+
 THE SLIDER FOLLOWS THE CAPTURE
 In an app with a "frame" slider and no generated browser on it (Typhon), attach
 puts a CaptureReviewer in charge of the canvas: the slider grows as frames are
@@ -118,6 +133,24 @@ class _Live:
         #: status line, because a message returned by Start is overwritten
         #: by the live numbers within one tick.
         self.network = False
+        #: Between Start and Stop. The session RUNNING is not enough to tell:
+        #: the preview runs it too, without recording.
+        self.capturing = False
+        #: The session is running only to show the camera, recording nothing.
+        self.previewing = False
+        #: A preview that failed to start is retried from here, not every tick.
+        self.preview_retry_at = 0.0
+        #: Why the status line went quiet: "stopped" after a capture,
+        #: "ended" when a capture's camera stopped by itself (see
+        #: idle_reason), "preview-off" when the folder has frames, or a
+        #: complete message to show as it is.
+        self.idle = ""
+        self.idle_reason = ""
+        #: A camera that must not be restarted (an EVK4) has had its stream
+        #: started on this connection. Once that stream is not running, it
+        #: is dead for the rest of the connection: shown, hidden or
+        #: recording, nothing may start it again.
+        self.stream_started = False
 
     def clear(self) -> None:
         self.device = None
@@ -128,6 +161,12 @@ class _Live:
         self.raw_path = None
         self.reported = True
         self.network = False
+        self.capturing = False
+        self.previewing = False
+        self.preview_retry_at = 0.0
+        self.idle = ""
+        self.idle_reason = ""
+        self.stream_started = False
 
 
 _LIVE = _Live()
@@ -299,11 +338,18 @@ def start(folder: Any, exposure: Any = "", gain: Any = "") -> Dict[str, Any]:
 
     AN EVENT CAMERA ALSO RECORDS ITS .raw, started BEFORE the stream so the
     file holds the whole run (see EvkDevice.start_raw).
+
+    FROM THE PREVIEW. A frame camera's preview is stopped and the camera
+    started again for the capture. An EVK4's stream is left running and the
+    .raw opens inside it — restarting would carry stale decoder state into
+    the capture (EvkDevice.restartable). Everything that can refuse (the
+    folder, exposure, gain) is checked BEFORE anything stops, so a refused
+    Start leaves the picture running.
     """
     from council_core import capture
 
     session = _require_session()
-    if session.running:
+    if _LIVE.capturing:
         raise RuntimeError("already capturing — stop first")
     where = str(folder or "").strip().strip('"')
     if not where:
@@ -317,15 +363,24 @@ def start(folder: Any, exposure: Any = "", gain: Any = "") -> Dict[str, Any]:
     if str(gain or "").strip():
         set_gain(gain)
 
+    device = session.device
+    restartable = getattr(device, "restartable", True)
+    if _stream_dead(session):
+        raise RuntimeError(_DEAD_STREAM)
+    if session.running and restartable:
+        _stop_preview(session)
+
     run = _unique_run(out)
     recorder = capture.Recorder(out, stem=f"{run}_frame",
                                 index_name=f"{run}_frames.csv")
     try:
-        session.record_to(recorder)
+        # reset: this run's numbers only — frames the preview showed were
+        # never meant to be saved, and counting them would read as frames the
+        # capture lost. In the same step as the switch (see record_to).
+        session.record_to(recorder, reset=True)
     except OSError as exc:
         raise RuntimeError(f"cannot save frames into {out}: {exc}") from exc
 
-    device = session.device
     raw = None
     if getattr(device, "records_raw", False):
         try:
@@ -338,16 +393,20 @@ def start(folder: Any, exposure: Any = "", gain: Any = "") -> Dict[str, Any]:
     _LIVE.raw_path = raw
     _LIVE.reported = False
     _LIVE.network = _on_network_share(out)
-    try:
-        session.start()
-    except Exception:
-        if raw is not None:
-            try:
-                device.stop_raw()
-            except Exception:                             # noqa: BLE001
-                pass
-        session.record_to(None)
-        raise
+    if not session.running:
+        try:
+            session.start()
+        except Exception:
+            if raw is not None:
+                try:
+                    device.stop_raw()
+                except Exception:                         # noqa: BLE001
+                    pass
+            session.record_to(None)
+            raise
+        _started_stream(session)
+    _LIVE.capturing = True
+    _LIVE.previewing = False
 
     said = f"Capturing into {out}."
     if raw is not None:
@@ -363,7 +422,9 @@ def start(folder: Any, exposure: Any = "", gain: Any = "") -> Dict[str, Any]:
 def stop() -> Dict[str, Any]:
     """End the run. Returns whether the grab thread actually stopped.
 
-    Stopping the camera also finishes the .raw (EvkDevice.stop). Saving the
+    A frame camera is stopped. An EVK4 keeps streaming: its PNGs stop and
+    its .raw is closed inside the running stream (EvkDevice.finish_raw), so
+    the next capture or the preview carries on without a restart. Saving the
     PNGs still queued is given STOP_DRAIN_SECONDS; anything left after that
     carries on in the background and the status line counts it down, so a
     slow disk never freezes the window.
@@ -371,9 +432,28 @@ def stop() -> Dict[str, Any]:
     session = _LIVE.session
     if session is None:
         return {"summary": "Not capturing."}
-    ended = session.stop()
-    session.record_to(None, drain_timeout=STOP_DRAIN_SECONDS)
-    stats = session.stats()
+    if not _LIVE.capturing:
+        if _LIVE.previewing:
+            return {"summary": "Not capturing — that is the live preview, and "
+                               "nothing is being saved. Start capture saves."}
+        return {"summary": "Not capturing."}
+    _LIVE.capturing = False
+    _LIVE.idle = "stopped"
+    device = session.device
+    if getattr(device, "restartable", True):
+        ended = session.stop()
+        session.record_to(None, drain_timeout=STOP_DRAIN_SECONDS)
+    else:
+        ended = True
+        session.record_to(None, drain_timeout=STOP_DRAIN_SECONDS)
+        finish = getattr(device, "finish_raw", None)
+        if callable(finish):
+            try:
+                finish()
+            except Exception as exc:                      # noqa: BLE001
+                _LIVE.idle = (f"Stopped, but the raw file did not close "
+                              f"cleanly: {exc}")
+    stats = session.run_stats()
     if not ended:
         # The truth, not a hopeful message. Something is still holding the
         # camera, and the next start would be racing it.
@@ -385,7 +465,7 @@ def stop() -> Dict[str, Any]:
 
 def _stopped_line(session: Any) -> str:
     """What the status line says once a run is over — or nearly over."""
-    stats = session.stats()
+    stats = session.run_stats()
     line = f"Stopped. {stats.line()}"
     if stats.waiting:
         line = f"Stopped — still saving. {stats.line()}"
@@ -450,6 +530,7 @@ def pump(show: Callable[[Any], Any],
     and it is the cheap path: the generated to_qimage sends an array straight
     to QImage with no PIL round trip.
     """
+    _watch_capture()
     frame = latest()
     if frame is not None:
         show(frame.image)
@@ -464,21 +545,179 @@ def _report(say: Optional[Callable[[str], Any]], frame: Any) -> None:
     session = _LIVE.session
     if say is None or session is None:
         return
-    if session.running or session.saving:
+    if _LIVE.capturing or session.saving:
         say(_status_line(session.stats(), frame))
         _LIVE.reported = False
+    elif _LIVE.previewing and session.running:
+        say(_preview_line(session.stats(), frame))
+        _LIVE.reported = False
     elif not _LIVE.reported:
-        say(_stopped_line(session))
+        say(_idle_line(session))
         _LIVE.reported = True
+
+
+def _preview_line(stats: Any, frame: Any) -> str:
+    """Said while previewing: that NOTHING is being saved comes first. Short:
+    the line is one row, and Connect already said which camera it is."""
+    line = f"Preview — not saving · {stats.rate:.1f} fps"
+    meta = getattr(frame, "meta", None) or {}
+    if meta.get("kind") == "event":
+        line += f" · {meta.get('events', 0)} events/window"
+    return line
+
+
+def _idle_line(session: Any) -> str:
+    """Said once when the camera goes quiet, saying why."""
+    if _LIVE.idle == "stopped":
+        return _stopped_line(session)
+    if _LIVE.idle == "ended":
+        return (f"Capture ended — {_LIVE.idle_reason}. "
+                f"{session.run_stats().line()}")
+    label = getattr(_LIVE.info, "label", "") or "camera"
+    if _LIVE.idle == "preview-off":
+        return (f"Connected to {label}. The live preview shows while the "
+                f"folder has no frames; Start capture saves.")
+    if _LIVE.idle:
+        return _LIVE.idle
+    return f"Connected to {label}."
+
+
+_DEAD_STREAM = ("the camera stopped sending, and its stream cannot be "
+                "restarted on the same connection — Disconnect and Connect "
+                "again")
+
+
+def _started_stream(session: Any) -> None:
+    """Remember that a one-stream camera's stream has been started."""
+    if not getattr(session.device, "restartable", True):
+        _LIVE.stream_started = True
+
+
+def _stream_dead(session: Any) -> bool:
+    """A one-stream camera whose stream was started and is not running."""
+    return (not getattr(session.device, "restartable", True)
+            and _LIVE.stream_started and not session.running)
+
+
+def _watch_capture() -> None:
+    """End a capture whose camera stopped by itself, and say why.
+
+    Otherwise the app still believed it was capturing: the status line froze
+    on the last frame rate and Start was refused until Stop was pressed.
+    """
+    session = _LIVE.session
+    if session is None or not _LIVE.capturing or session.running:
+        return
+    _LIVE.capturing = False
+    reason = session.stats().last_error or "the camera stopped sending"
+    # Release the device side (a frame camera stops grabbing; an EVK4's .raw
+    # is closed) and stop recording WITHOUT waiting: what is still queued
+    # keeps saving and the status line counts it down.
+    try:
+        session.stop()
+    except Exception:                                     # noqa: BLE001
+        pass
+    session.record_to(None, drain_timeout=0)
+    if not getattr(session.device, "restartable", True):
+        reason += " — Disconnect and Connect again"
+    _LIVE.idle = "ended"
+    _LIVE.idle_reason = reason
+    _LIVE.reported = False
+
+
+#: How long a preview that failed to start waits before trying again.
+PREVIEW_RETRY_SECONDS = 5.0
+
+
+def _manage_preview(want: bool) -> None:
+    """Run the camera without recording while the viewer wants to show it.
+
+    Called every tick from the UI thread, as are Start and Stop, so nothing
+    here races them. `want` comes from the reviewer: connected, not
+    capturing, and nothing in the folder to review.
+    """
+    session = _LIVE.session
+    if session is None or _LIVE.capturing:
+        return
+    now = time.monotonic()
+    restartable = getattr(session.device, "restartable", True)
+    if _stream_dead(session):
+        # Shown, hidden or after a capture: a one-stream camera whose stream
+        # has stopped is never started again on this connection.
+        if _LIVE.previewing or _LIVE.idle in ("", "preview-off", "stopped"):
+            _LIVE.previewing = False
+            reason = session.stats().last_error or "no reason given"
+            _LIVE.idle = f"Live preview stopped: {reason} — {_DEAD_STREAM}"
+            _LIVE.reported = False
+        return
+    if _LIVE.previewing and not session.running:
+        # It ended by itself: the camera was unplugged, or failed.
+        _LIVE.previewing = False
+        reason = session.stats().last_error or "the camera stopped sending"
+        _LIVE.idle = f"Live preview stopped: {reason}"
+        _LIVE.reported = False
+        _LIVE.preview_retry_at = now + PREVIEW_RETRY_SECONDS
+        return
+    if want and session.running:
+        if not _LIVE.previewing:
+            # An EVK4 kept streaming while there was nothing to show it on.
+            _LIVE.previewing = True
+            _LIVE.idle = ""
+        return
+    if want and not session.running:
+        if now < _LIVE.preview_retry_at:
+            return
+        if session.saving:
+            # The stopped run is still landing: starting the preview now
+            # would reset the counts and hide "N waiting to save".
+            return
+        try:
+            session.record_to(None)
+            session.reset_stats()
+            session.start()
+        except Exception as exc:                          # noqa: BLE001
+            _LIVE.idle = f"Live preview stopped: {type(exc).__name__}: {exc}"
+            _LIVE.reported = False
+            _LIVE.preview_retry_at = now + PREVIEW_RETRY_SECONDS
+            return
+        _started_stream(session)
+        _LIVE.previewing = True
+        _LIVE.idle = ""
+    elif not want and _LIVE.previewing:
+        if restartable:
+            _stop_preview(session)
+        else:
+            # Not stopped — never restart this stream — just not drawn.
+            _LIVE.previewing = False
+        _LIVE.idle = "preview-off"
+        _LIVE.reported = False
+
+
+def _stop_preview(session: Any) -> None:
+    if not session.stop():
+        raise RuntimeError("the camera did not stop its live preview cleanly")
+    _LIVE.previewing = False
 
 
 def _tick(show: Callable[[Any], Any], say: Optional[Callable[[str], Any]],
           reviewer: Any) -> None:
-    """One timer tick: the newest frame to the reviewer (or straight to the
-    canvas when the app has none), then the status line."""
+    """One timer tick: start or stop the preview, the newest frame to the
+    reviewer (or straight to the canvas when the app has none), then the
+    status line."""
     if reviewer is None:
         pump(show, say)
         return
+    if reviewer is not _LIVE.reviewer:
+        # A window that is no longer the attached one (closed, or replaced by
+        # a later attach) must not start and stop the shared camera — two
+        # viewers disagreeing would toggle the preview every tick.
+        return
+    _watch_capture()
+    try:
+        _manage_preview(bool(reviewer.wants_preview()))
+    except Exception as exc:                              # noqa: BLE001
+        _LIVE.idle = f"Live preview: {exc}"
+        _LIVE.reported = False
     frame = latest()
     reviewer.tick(frame)
     _report(say, frame)
@@ -608,7 +847,11 @@ class _Feed:
 
     def capturing(self) -> bool:
         session = _LIVE.session
-        return bool(session is not None and session.running)
+        return bool(_LIVE.capturing and session is not None and session.running)
+
+    def previewing(self) -> bool:
+        session = _LIVE.session
+        return bool(_LIVE.previewing and session is not None and session.running)
 
     def saving(self) -> bool:
         session = _LIVE.session
@@ -834,12 +1077,15 @@ def set_area(area: Any) -> Dict[str, Any]:
         # ends the .raw — the rest of the run would be missing from it.
         raise RuntimeError("stop the capture before changing the camera's "
                            "area — it would cut the raw recording short")
-    if was_running:
-        _LIVE.session.stop()
+    # A frame camera's AOI can only change while it is not grabbing. An
+    # EVK4's window is set live — its stream is never restarted.
+    restart = was_running and getattr(device, "restartable", True)
+    if restart and not _LIVE.session.stop():
+        raise RuntimeError("the camera did not stop cleanly to change its area")
     try:
         got = device.set_roi(cameras.Roi(*box))
     finally:
-        if was_running:
+        if restart:
             _LIVE.session.start()
 
     text = _area_text(got)

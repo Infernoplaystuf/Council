@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import collections
 import csv
+import os
 import threading
 import time
 from dataclasses import dataclass, field, replace
@@ -120,6 +121,13 @@ class LatestFrame:
         return frame
 
 
+#: zlib level for saved PNGs. 1, not Pillow's default 6: measured on EVK4
+#: windows (1280x720, busy scattered scene) level 6 managed 14 PNGs a second
+#: on one thread and level 1 managed 61 — and PNG is lossless at every level,
+#: so the pixels are identical; only the file is bigger (about 2x at worst).
+PNG_COMPRESS_LEVEL = 1
+
+
 def write_image(image: Any, path: Path) -> None:
     """A frame as an image file the rest of the Barbie toolchain can read.
 
@@ -146,11 +154,11 @@ def write_image(image: Any, path: Path) -> None:
         # NO mode= argument. Pillow infers "I;16" from the dtype, and passing
         # the mode explicitly is deprecated for removal in Pillow 13
         # (2026-10-15) -- which would break capture outright, not warn.
-        Image.fromarray(data).save(str(path))
+        Image.fromarray(data).save(str(path), compress_level=PNG_COMPRESS_LEVEL)
         return
     if data.ndim == 2 and data.dtype != np.uint8:
         data = np.clip(data, 0, 255).astype(np.uint8)
-    Image.fromarray(data).save(str(path))
+    Image.fromarray(data).save(str(path), compress_level=PNG_COMPRESS_LEVEL)
 
 
 def warm_imports() -> None:
@@ -235,16 +243,40 @@ class Recorder:
             if fresh:
                 self._index_rows.writerow(INDEX_COLUMNS)
 
-    def write(self, frame: cameras.Frame) -> Path:
-        path = self.dir / f"{self.stem}_{frame.index:06d}{self._suffix}"
+    def path_for(self, frame: cameras.Frame) -> Path:
+        return self.dir / f"{self.stem}_{frame.index:06d}{self._suffix}"
+
+    def save(self, frame: cameras.Frame, path: Path) -> None:
+        """Encode and write one frame. Safe to call from several threads at
+        once: it touches nothing but its own file."""
         self._writer(frame.image, path)
+
+    def log(self, frame: cameras.Frame, path: Path) -> None:
+        """Count a saved frame and give it its index row. NOT thread-safe:
+        FrameWriter calls it one frame at a time, in grab order."""
         self.written += 1
         if self._index_rows is not None:
             meta = frame.meta or {}
             self._index_rows.writerow((
                 path.name, frame.index, frame.timestamp_us,
                 meta.get("raw_t_us", ""), meta.get("events", "")))
+
+    def write(self, frame: cameras.Frame) -> Path:
+        path = self.path_for(frame)
+        self.save(frame, path)
+        self.log(frame, path)
         return path
+
+    def flush_index(self) -> None:
+        """Put published rows on disk now, not at the next 8 KB boundary:
+        the raw view reads the run's origin from this file while the tail of
+        the run may still be saving."""
+        handle = self._index_file
+        if handle is not None:
+            try:
+                handle.flush()
+            except (OSError, ValueError):
+                pass
 
     def close(self) -> None:
         """Finish the index. Safe to call twice."""
@@ -265,9 +297,14 @@ WRITE_BUDGET_BYTES = 512 * 1024 * 1024
 #: How long stopping a recording waits for queued frames to reach the disk.
 DRAIN_TIMEOUT = 30.0
 
+#: How many frames are encoded at once. PNG encoding releases the GIL, so
+#: threads scale: measured on EVK4 windows, 4 writers were 3.6x one writer.
+#: One core is left for the camera and one for the window.
+DEFAULT_WRITERS = max(1, min(4, (os.cpu_count() or 2) - 2))
+
 
 class FrameWriter:
-    """Writes frames on its OWN thread, so saving can never stall the camera.
+    """Saves frames on its OWN threads, so saving can never stall the camera.
 
     WHY THIS EXISTS — MEASURED ON A REAL EVK4
     Saving used to happen inline in the grab loop. Pointed at a network share
@@ -277,6 +314,15 @@ class FrameWriter:
     "20 ms of camera time". The grab loop now hands frames here and goes
     straight back to the camera.
 
+    SEVERAL WRITERS, ONE ORDER
+    One writer thread could not keep up with a busy EVK4 scene (14 PNGs a
+    second measured, against 50 windows a second), so `threads` writers take
+    frames off one queue and encode them at the same time. They FINISH out of
+    order, but nothing downstream sees that: a finished frame waits until
+    every frame grabbed before it is done, and only then is it counted, given
+    its CSV row and added to `paths`. The slider, the CSV and the counts are
+    in grab order exactly as with one writer.
+
     WHEN STORAGE CANNOT KEEP UP, FRAMES ARE SKIPPED — AND COUNTED
     The queue has a byte budget. Past it, new frames are not saved and
     `skipped` says how many. That is a deliberate change from "never drop a
@@ -285,36 +331,55 @@ class FrameWriter:
     A counted skip is the honest version of the same loss.
 
     THE FIRST WRITE FAILURE STOPS IT, as before: a capture with holes that
-    nothing reports is worse than one that ended.
+    nothing reports is worse than one that ended. Frames already being written
+    by the other writers still land and are counted; nothing new starts.
     """
 
     def __init__(self, recorder: Recorder,
-                 budget_bytes: int = WRITE_BUDGET_BYTES):
+                 budget_bytes: int = WRITE_BUDGET_BYTES,
+                 threads: int = DEFAULT_WRITERS):
         self.recorder = recorder
         self.budget = int(budget_bytes)
         self.written = 0
         self.skipped = 0
         self.failed = ""
-        #: Every file written, in order — append-only, so a viewer can pick up
-        #: new frames without rescanning a folder of thousands.
+        #: Every file written, in GRAB order — append-only, so a viewer can
+        #: pick up new frames without rescanning a folder of thousands.
         self.paths: List[Path] = []
         self._queue: collections.deque = collections.deque()
         self._queued_bytes = 0
-        self._inflight = 0          # taken off the queue, not yet on disk
+        self._inflight = 0          # taken off the queue, not yet published
         self._closing = False
         self._cond = threading.Condition()
-        self._thread = threading.Thread(target=self._run,
-                                        name="capture-writer", daemon=True)
-        self._thread.start()
+        self._submitted = 0         # sequence number of the next frame
+        self._published = 0         # sequence number of the next to publish
+        #: Finished frames waiting for an earlier one: seq -> (stub, path),
+        #: path None for a frame that was not saved. The stub is the frame
+        #: WITHOUT its image: measured, one stalled write let the other
+        #: writers park 796 MB of finished images here against a 16 MB
+        #: budget, because nothing was bounding them.
+        self._finished: Dict[int, Any] = {}
+        #: One writer at a time writes index rows, outside the lock, in order.
+        self._publishing = False
+        self._in_publish = 0
+        self._running = max(1, int(threads))
+        self._threads = [threading.Thread(target=self._run, daemon=True,
+                                          name=f"capture-writer-{i + 1}")
+                         for i in range(self._running)]
+        for thread in self._threads:
+            thread.start()
 
     @property
     def pending(self) -> int:
+        """Frames not yet counted as saved: queued, being written, or written
+        and waiting for an earlier one to be published."""
         with self._cond:
-            return len(self._queue) + self._inflight
+            return (len(self._queue) + self._inflight + len(self._finished)
+                    + self._in_publish)
 
     @property
     def alive(self) -> bool:
-        return self._thread.is_alive()
+        return any(t.is_alive() for t in self._threads)
 
     def submit(self, frame: cameras.Frame) -> bool:
         """Queue `frame` for saving. False if it will not be saved."""
@@ -328,7 +393,8 @@ class FrameWriter:
             if self._queue and self._queued_bytes + size > self.budget:
                 self.skipped += 1
                 return False
-            self._queue.append(frame)
+            self._queue.append((self._submitted, frame))
+            self._submitted += 1
             self._queued_bytes += size
             self._cond.notify()
         return True
@@ -336,30 +402,93 @@ class FrameWriter:
     def _run(self) -> None:
         while True:
             with self._cond:
-                while not self._queue and not self._closing:
+                while not self._queue and not self._closing and not self.failed:
                     self._cond.wait()
                 if not self._queue:
-                    self._close_recorder()      # closing, and nothing left
-                    return
-                frame = self._queue.popleft()
-                self._queued_bytes -= int(getattr(frame.image, "nbytes", 0) or 0)
-                self._inflight = 1
-            try:
-                path = self.recorder.write(frame)
-            except Exception as exc:                        # noqa: BLE001
-                with self._cond:
-                    self.failed = f"{type(exc).__name__}: {exc}"
-                    self._queue.clear()
-                    self._queued_bytes = 0
-                    self._inflight = 0
+                    # Nothing left for this writer. The LAST one out closes
+                    # the index: by then every frame has been published.
+                    self._running -= 1
+                    last = self._running == 0
                     self._cond.notify_all()
-                self._close_recorder()
-                return
+                    break
+                seq, frame = self._queue.popleft()
+                self._queued_bytes -= int(getattr(frame.image, "nbytes", 0) or 0)
+                self._inflight += 1
+            path: Optional[Path] = None
+            error = ""
+            try:
+                path = self.recorder.path_for(frame)
+                self.recorder.save(frame, path)
+            except Exception as exc:                        # noqa: BLE001
+                path = None
+                error = f"{type(exc).__name__}: {exc}"
             with self._cond:
-                self.written += 1
-                self.paths.append(path)
-                self._inflight = 0
+                self._inflight -= 1
+                self._finished[seq] = (_without_image(frame), path)
+                if error and not self.failed:
+                    self._fail(error)
                 self._cond.notify_all()
+            del frame                   # the image is saved; let it go
+            self._publish()
+        if last:
+            self._close_recorder()
+
+    def _fail(self, error: str) -> None:
+        """Stop taking frames. Called with the lock held."""
+        self.failed = error
+        # Frames still queued will never be written; mark them so the ones
+        # finished after them can still be published in order.
+        for seq, frame in self._queue:
+            self._finished[seq] = (None, None)
+        self._queue.clear()
+        self._queued_bytes = 0
+
+    def _publish(self) -> None:
+        """Count, index and list finished frames in grab order.
+
+        The index rows are written OUTSIDE the lock. Written under it, one
+        slow flush of the CSV (a stalled share, an antivirus scan) blocked
+        the grab loop and the UI thread for the whole flush — measured 1 s —
+        because both take this lock to hand a frame over or read a count.
+        One writer at a time publishes (`_publishing`), which keeps the rows
+        in order without holding the lock across the file write.
+        """
+        while True:
+            with self._cond:
+                if self._publishing or self._published not in self._finished:
+                    return
+                batch = []
+                while self._published in self._finished:
+                    batch.append(self._finished.pop(self._published))
+                    self._published += 1
+                self._publishing = True
+                self._in_publish = len(batch)
+            error = ""
+            for stub, path in batch:
+                if path is None:
+                    continue
+                try:
+                    self.recorder.log(stub, path)
+                except Exception as exc:                    # noqa: BLE001
+                    # The PNG is on disk but its row could not be written:
+                    # the index would have a hole nobody sees. Same rule as
+                    # a failed write.
+                    error = error or f"{type(exc).__name__}: {exc}"
+            flush = getattr(self.recorder, "flush_index", None)
+            if callable(flush):
+                flush()
+            with self._cond:
+                for stub, path in batch:
+                    if path is not None:
+                        self.written += 1
+                        self.paths.append(path)
+                self._in_publish = 0
+                self._publishing = False
+                if error and not self.failed:
+                    self._fail(error)
+                self._cond.notify_all()
+            # Loop: frames that finished while this batch was being written
+            # were left for us, since only one writer publishes at a time.
 
     def _close_recorder(self) -> None:
         closer = getattr(self.recorder, "close", None)
@@ -373,7 +502,8 @@ class FrameWriter:
         """Block until everything queued is on disk. False on timeout."""
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._cond:
-            while (self._queue or self._inflight) and self._thread.is_alive():
+            while ((self._queue or self._inflight or self._finished
+                    or self._publishing) and self._running):
                 left = None if deadline is None else deadline - time.monotonic()
                 if left is not None and left <= 0:
                     return False
@@ -383,15 +513,25 @@ class FrameWriter:
     def close(self, timeout: Optional[float] = DRAIN_TIMEOUT) -> bool:
         """Accept nothing more, finish what is queued, stop.
 
-        Returns whether it finished inside `timeout`. If not, the thread
-        carries on writing in the background and `pending` says how much is
-        left — the caller should say so rather than claim the run is saved.
+        Returns whether it finished inside `timeout`. If not, the writers
+        carry on in the background and `pending` says how much is left — the
+        caller should say so rather than claim the run is saved.
         """
         with self._cond:
             self._closing = True
             self._cond.notify_all()
-        self._thread.join(timeout)
-        return not self._thread.is_alive()
+        deadline = None if timeout is None else time.monotonic() + timeout
+        for thread in self._threads:
+            left = None if deadline is None else max(0.0, deadline - time.monotonic())
+            thread.join(left)
+        return not self.alive
+
+
+def _without_image(frame: cameras.Frame) -> cameras.Frame:
+    """What the index row needs, and nothing that holds the pixels."""
+    return cameras.Frame(image=None, index=frame.index,
+                         timestamp_us=frame.timestamp_us,
+                         meta=dict(frame.meta or {}))
 
 
 class CaptureSession:
@@ -412,10 +552,14 @@ class CaptureSession:
         self.writer: Optional[FrameWriter] = None
         #: Every writer this session has had, so the counts survive Stop.
         self._writers: List[FrameWriter] = []
+        #: Writers before this one belong to an earlier run (reset_stats).
+        self._counted_from = 0
+        #: The camera's numbers when the last recording ended (run_stats).
+        self._ended_stats: Optional[Stats] = None
         self._clock = clock
         self._thread: Optional[threading.Thread] = None
         self._stopping = threading.Event()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()   # re-entrant: _took holds it across _record
         self._stats = Stats()
         self._marks: List[float] = []
 
@@ -425,8 +569,24 @@ class CaptureSession:
         thread = self._thread
         return bool(thread and thread.is_alive())
 
+    def reset_stats(self) -> None:
+        """Start counting afresh — for a new run, or a preview.
+
+        Earlier writers are still waited for on close (their frames are the
+        user's data); they just stop counting towards this run.
+        """
+        with self._lock:
+            self._reset_locked()
+
+    def _reset_locked(self) -> None:
+        self._stats = Stats()
+        self._marks = []
+        self.mailbox.dropped = 0
+        self._counted_from = len(self._writers)
+        self._ended_stats = None
+
     def stats(self) -> Stats:
-        writers = list(self._writers)
+        writers = list(self._writers)[self._counted_from:]
         failed = next((w.failed for w in writers if w.failed), "")
         with self._lock:
             base = self._stats
@@ -438,27 +598,58 @@ class CaptureSession:
             recording_failed=base.recording_failed or failed)
 
     def record_to(self, recorder: Optional[Recorder],
-                  drain_timeout: Optional[float] = DRAIN_TIMEOUT) -> bool:
+                  drain_timeout: Optional[float] = DRAIN_TIMEOUT,
+                  reset: bool = False) -> bool:
         """Start writing frames to disk, or stop and let what is queued land.
 
         Called while running: the grab loop picks it up on its next frame.
         Returns False only when stopping, if frames were still waiting to be
         written when `drain_timeout` ran out — they carry on in the
         background, and `stats().waiting` says how many.
+
+        `reset` starts the counts afresh IN THE SAME STEP as the switch. With
+        the camera already streaming (an EVK4 going from preview to capture)
+        doing the two separately let a frame land between them, counted as
+        grabbed and never recorded — measured: "11 grabbed, 10 saved".
         """
         finished = True
-        old = self.writer
+        writer = None
         if recorder is not None:
             recorder.open()
             writer = FrameWriter(recorder)
-            self._writers.append(writer)
-            self.writer = writer
-        else:
-            self.writer = None
-        self.recorder = recorder
+        with self._lock:
+            # The grab loop records and counts each frame under this lock,
+            # so it sees either the old writer and old counts or the new.
+            if reset:
+                self._reset_locked()
+            old = self.writer
+            if writer is not None:
+                self._writers.append(writer)
+                self.writer = writer
+                self._ended_stats = None
+            else:
+                self.writer = None
+                if old is not None:
+                    # Frozen HERE: a camera that keeps streaming after the
+                    # recording (an EVK4) would otherwise count frames
+                    # grabbed after Stop as grabbed-and-not-saved.
+                    self._ended_stats = self.stats()
+            self.recorder = recorder
         if old is not None:
             finished = old.close(drain_timeout)
         return finished
+
+    def run_stats(self) -> Stats:
+        """The latest recording's numbers: the camera's counts as they were
+        when it ended, the saving counts as they are now (frames may still
+        be landing). While recording, or with none ended, `stats()`."""
+        live = self.stats()
+        frozen = self._ended_stats
+        if frozen is None or self.writer is not None:
+            return live
+        return replace(frozen, recorded=live.recorded, skipped=live.skipped,
+                       waiting=live.waiting,
+                       recording_failed=live.recording_failed)
 
     def flush(self, timeout: Optional[float] = None) -> bool:
         """Wait until every queued frame is on disk. False on timeout."""
@@ -559,8 +750,10 @@ class CaptureSession:
             self._took(frame)
 
     def _took(self, frame: cameras.Frame) -> None:
-        self._record(frame)
         with self._lock:
+            # Recorded and counted as one step (see record_to's `reset`).
+            # submit() only queues, so the lock is held for microseconds.
+            self._record(frame)
             self._stats = replace(
                 self._stats, grabbed=self._stats.grabbed + 1,
                 rate=self._rate())
@@ -586,6 +779,10 @@ class CaptureSession:
                 self._stats = replace(self._stats, recording_failed=said,
                                       last_error=f"recording stopped: {said}",
                                       errors=self._stats.errors + 1)
+                # The recording ended here, not at Stop: freeze its counts,
+                # or a camera that keeps streaming (an EVK4) would count
+                # every later frame as grabbed-and-not-saved.
+                self._ended_stats = self.stats()
             return False
         return writer.submit(frame)
 

@@ -143,13 +143,42 @@ two emulated Basler cameras — the whole workflow can be tried without hardware
 
 ## Using it
 
-1. **Scan for cameras**, select one, **Connect** — the status line reports the
-   sensor size.
-2. Pick a **capture folder** with the folder picker at the top left. **Make it
+1. Pick a **capture folder** with the folder picker at the top left. **Make it
    a folder on this computer**, not a network drive — see below.
-3. **Start capture** — the live view runs and frames are written to that
-   folder.
+2. **Scan for cameras**, select one, **Connect**. If the folder has no frames
+   in it yet, the picture now shows what the camera sees — the **live
+   preview** — so you can aim, focus and set the area first. **Nothing is
+   saved** during the preview; the line above the picture says
+   `Preview · not saving`.
+3. **Start capture** — frames are written to that folder (and, for an EVK4,
+   the `.raw`).
 4. **Stop capture** when done, then copy the run wherever it needs to go.
+
+### The live preview
+
+The preview runs while a camera is connected, nothing is being captured, and
+the folder has no frames to look at. Choose a folder that already has frames
+and the picture shows those instead (the camera goes quiet, so it does not
+slow playback down); choose an empty folder again and the preview comes back.
+**Stop capture** during the preview does nothing — there is nothing to stop.
+Exposure and gain are applied when you press **Start capture**.
+
+**An EVK4 streams from the moment the preview first starts until you press
+Disconnect.** Its stream is never stopped and restarted in between: measured
+against Prophesee's SDK, a restarted EVK4 stream can come back with its
+clock running backwards or 16.8 s ahead, with false events, or not start at
+all — and the Python SDK has no way to reset it. So Start and Stop open and
+close the `.raw` inside the running stream, exactly as Prophesee's own
+recorder does, and a folder with frames only hides the preview. Two things
+follow:
+
+- a capture started **from the preview** can lack up to about 4 ms of events
+  at the very start of its `.raw` (the SDK starts a file at its next time
+  marker); a capture started straight after **Connect** lacks nothing;
+- if an EVK4 stops sending (unplugged, or it fails), press **Disconnect** and
+  **Connect** again — a fresh connection is the only clean restart.
+
+A Basler camera has none of this: it is stopped and started freely.
 
 ### Save locally, copy afterwards
 
@@ -159,6 +188,12 @@ slow disk no longer slows the camera — but frames the disk cannot take in time
 are **not saved**, and the status line counts them (`12 NOT saved (storage too
 slow)`). While capturing into a network share, the status line says so
 (`NETWORK FOLDER: save locally, copy after`).
+
+PNGs are written by several writers at once, with fast (still lossless)
+compression. Measured on EVK4-sized frames, one writer managed as few as 14 a
+second in a busy scene; four writers at the fast setting manage over 200 — the
+EVK4 makes 50. They finish out of order but are numbered, listed and indexed
+in the order the camera took them.
 
 So: capture into a local folder, press **Stop**, then copy the whole run to
 the NAS. Everything is closed at Stop, so nothing is locked while you copy.

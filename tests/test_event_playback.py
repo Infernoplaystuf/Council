@@ -247,6 +247,63 @@ def test_no_sdk_is_said_plainly(monkeypatch, tmp_path):
 
 
 # ======================================================================
+# Anchored at the capture's own origin
+# ======================================================================
+def play_from(tmp_path, origin, *batches):
+    raw = tmp_path / "run_events.raw"
+    raw.write_bytes(b"% end\n")
+    hal = FakeHal(batches)
+    playback = ep.RawPlayback(raw, window_us=20_000, hal=hal, origin_us=origin)
+    assert playback.wait_done(10)
+    return playback, hal
+
+
+def test_given_the_origin_the_file_is_read_on_the_camera_clock(tmp_path):
+    pb, hal = play_from(tmp_path, 1_000, batch((1, 1, 1, 50_000)))
+    assert hal.opened[0][1].do_time_shifting is False
+    assert hal.opened[0][1].build_index is False
+    pb.close()
+
+
+def test_windows_start_at_the_origin_not_at_the_files_first_event(tmp_path):
+    """A .raw opened inside a running stream loses up to 4.1 ms at its head;
+    anchored at its own first event, every window would be that far off."""
+    pb, _ = play_from(tmp_path, 10_000,
+                      batch((1, 1, 1, 13_000), (2, 2, 1, 29_999), (3, 3, 1, 30_000)))
+    assert pb.count == 2
+    assert pb.frame(0)[1, 1] == 255 and pb.frame(0)[2, 2] == 255
+    assert pb.frame(1)[3, 3] == 255 and pb.frame(1)[2, 2] == 128
+    pb.close()
+
+
+def test_the_evt3_wrap_between_file_and_camera_clocks_is_put_back(tmp_path):
+    """Measured: an EVT3 file decodes k x 16,777,216 us behind the live
+    view. The origin (camera clock) tells how many wraps to add back."""
+    wrap = ep.TIME_WRAP_US
+    origin = 3 * wrap + 5_000
+    pb, _ = play_from(tmp_path, origin,
+                      batch((1, 1, 1, 5_000 + 100), (2, 2, 1, 5_000 + 25_000)))
+    assert pb.count == 2
+    assert pb.frame(0)[1, 1] == 255 and pb.frame(1)[2, 2] == 255
+    pb.close()
+
+
+def test_the_origin_is_read_from_the_frames_csv(tmp_path):
+    index = tmp_path / "run_frames.csv"
+    index.write_text("file,index,timestamp_us,raw_t_us,events\n"
+                     "a.png,1,1500000,20000,5\n", encoding="utf-8")
+    assert ep.raw_origin(index) == 1_480_000
+
+
+def test_a_csv_without_raw_times_gives_no_origin(tmp_path):
+    index = tmp_path / "run_frames.csv"
+    index.write_text("file,index,timestamp_us,raw_t_us,events\n"
+                     "a.png,1,0,,\n", encoding="utf-8")
+    assert ep.raw_origin(index) is None
+    assert ep.raw_origin(tmp_path / "missing.csv") is None
+
+
+# ======================================================================
 # The frames CSV: where each PNG falls in the .raw
 # ======================================================================
 def test_frame_times_reads_the_csv_sorted_and_skips_rows_without_a_time(tmp_path):

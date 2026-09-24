@@ -18,6 +18,12 @@ capture carries on underneath. The range keeps growing and your position stays
 where you left it. Drag to the end, or Play until you reach it, and you are
 live again.
 
+BEFORE A CAPTURE: THE LIVE PREVIEW
+Connected, not capturing, and nothing in the folder to review: the picture
+shows what the camera sees, and nothing is saved. `wants_preview` is the whole
+rule; frame_camera starts and stops the camera from it, and this draws what
+arrives. With frames in the folder the slider shows those instead.
+
 PNG AND RAW ARE TWO VIEWS OF ONE RUN
 The PNGs are what the camera looked like, one accumulation window each. They
 are written through a queue that may skip frames when storage falls behind.
@@ -198,6 +204,9 @@ class _NoFeed:
     def raw_growing(self, path: Any) -> bool:
         return False
 
+    def previewing(self) -> bool:
+        return False
+
 
 class CaptureReviewer(QObject):
     """The canvas, the slider and the ROI box, for one capture folder.
@@ -238,6 +247,8 @@ class CaptureReviewer(QObject):
         self.raw_file: Optional[Path] = None
         self._capturing = False
         self._growing = False
+        #: The camera is running for the preview (see wants_preview).
+        self._previewing = False
         self._run = ""
         self._seen = 0
         self._shown: Any = None
@@ -346,6 +357,11 @@ class CaptureReviewer(QObject):
     # ==================================================================
     # The capture
     # ==================================================================
+    def wants_preview(self) -> bool:
+        """Show the camera live without saving? Only with nothing to review:
+        no frames in the folder, no capture running, not in the raw view."""
+        return self.mode == PNG and not self._capturing and not self.files
+
     def tick(self, frame: Any = None) -> bool:
         """Called ~30 times a second with the camera's newest frame, or None.
 
@@ -375,11 +391,31 @@ class CaptureReviewer(QObject):
             # told to, so without this an old note stays up indefinitely.
             self._say()
 
+        previewing = bool(getattr(self.feed, "previewing", lambda: False)())
+        if previewing != self._previewing:
+            self._previewing = previewing
+            if not previewing and self.wants_preview():
+                # The preview ended (camera disconnected, or it failed) with
+                # nothing to review: do not leave its last frame looking live.
+                self._clear_canvas()
+            self._say()
+
         if self.live and self.mode == PNG and frame is not None:
             self.canvas.set_array(frame.image)
             self._shown = None
             return True
+        if previewing and frame is not None and self.wants_preview():
+            self.canvas.set_array(frame.image)
+            self._shown = None
+            return True
         return False
+
+    def _clear_canvas(self) -> None:
+        self._shown = None
+        try:
+            self.canvas.set_image(None)
+        except Exception:                                   # noqa: BLE001
+            pass
 
     def _began(self) -> None:
         self._stop_playing()
@@ -464,12 +500,10 @@ class CaptureReviewer(QObject):
 
     def _show_png(self, index: int) -> None:
         if not self.files:
-            self._shown = None
             self._set_current("")
-            try:
-                self.canvas.set_image(None)
-            except Exception:                               # noqa: BLE001
-                pass
+            if not self._previewing:
+                # Nothing to show — unless the preview is about to draw here.
+                self._clear_canvas()
             self._say()
             return
         index = max(0, min(int(index), len(self.files) - 1))
@@ -601,8 +635,13 @@ class CaptureReviewer(QObject):
             return self._note_for("No raw file for this run")
         if self.feed.raw_growing(path):
             return self._note_for("Raw opens after Stop")
+        from council_core import event_playback
+
+        origin = event_playback.raw_origin(
+            Path(self.root) / f"{run_of_raw(path)}_frames.csv")
+        extra = {} if origin is None else {"origin_us": origin}
         try:
-            playback = self._open_raw(path, self.window_us)
+            playback = self._open_raw(path, self.window_us, **extra)
         except Exception as exc:                            # noqa: BLE001
             return self._note_for(f"Cannot open raw: {exc}")
 
@@ -755,6 +794,8 @@ class CaptureReviewer(QObject):
             return f"Raw {at:.2f} / {total:.2f} s{playing}"
         if self.live:
             return f"Live · {len(self.files)} saved"
+        if self._previewing and self.wants_preview():
+            return "Preview · not saving"
         if not self.files:
             return "No frames yet" if self.root else "Choose a folder"
         where = f"PNG {self.scrubber.get() + 1} / {len(self.files)}"
@@ -820,7 +861,7 @@ def _close(playback: Any) -> None:
             pass
 
 
-def _default_open_raw(path: Any, window_us: int) -> Any:
+def _default_open_raw(path: Any, window_us: int, **kw: Any) -> Any:
     from council_core import event_playback
 
-    return event_playback.open_raw(path, window_us=window_us)
+    return event_playback.open_raw(path, window_us=window_us, **kw)

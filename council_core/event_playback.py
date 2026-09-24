@@ -31,10 +31,17 @@ windows it has finished are usable while it carries on, so a long recording
 opens at once and fills in.
 
 TIME
-The file is read time-shifted, so its clock starts near zero, and windows are
-counted from its FIRST EVENT. A live frame knows its place on that same clock
-(meta["raw_t_us"], set by EvkDevice while it records), which is what lets a
-viewer swap from a PNG to the raw at the same moment.
+Windows are counted from the CAPTURE'S ORIGIN — the first event the live view
+saw after the .raw began — which each PNG's row in the frames CSV is measured
+from (raw_t_us). That is what lets a viewer swap from a PNG to the raw at the
+same moment. Given the origin (`origin_us`, the camera's clock), the file is
+read on the camera's clock too: unshifted, with the EVT3 24-bit wrap put back
+(an EVT3 file decodes k x 16.78 s behind the live view, measured). This
+matters for a .raw started while the stream was already running: a replay
+drops the events before the file's first time marker (up to 4.1 ms), so
+anchoring at the file's first event would put every window up to 4 ms off.
+Without an origin (a run with no CSV) the file is read time-shifted and
+windows start at its first event.
 
 A FILE STILL BEING WRITTEN is readable only up to what has been flushed, and
 the last window may be partial. Callers should open a .raw once it is closed.
@@ -59,6 +66,10 @@ DEFAULT_WINDOW_US = int(cameras.DEFAULT_ACCUMULATE_MS * 1000)
 
 #: How long close() waits for the reading thread before giving up on it.
 CLOSE_TIMEOUT = 5.0
+
+#: EVT3 timestamps are 24-bit: an EVT3 file decodes a whole number of these
+#: behind the live camera's clock.
+TIME_WRAP_US = 1 << 24
 
 
 class RawUnavailable(RuntimeError):
@@ -104,9 +115,12 @@ class RawPlayback:
     """
 
     def __init__(self, path: Any, window_us: int = DEFAULT_WINDOW_US,
-                 hal: Any = None, np_mod: Any = None):
+                 hal: Any = None, np_mod: Any = None,
+                 origin_us: Optional[int] = None):
         self.path = Path(str(path))
         self.window_us = max(1, int(window_us))
+        #: The capture's origin on the camera's clock, or None.
+        self.origin_us = None if origin_us is None else int(origin_us)
         self._hal_mod = hal
         self._np = np_mod or cameras._numpy()
         self.width = 0
@@ -208,7 +222,9 @@ class RawPlayback:
             # build_index=False: a default open writes "<name>.raw.tmp_index"
             # into the capture folder, and Python cannot use it anyway.
             config.build_index = False
-            config.do_time_shifting = True
+            # On the camera's own clock when the capture's origin is known;
+            # otherwise shifted to start near zero.
+            config.do_time_shifting = self.origin_us is None
             try:
                 device = hal.DeviceDiscovery.open_raw_file(str(self.path), config)
             except Exception as exc:                        # noqa: BLE001
@@ -227,6 +243,7 @@ class RawPlayback:
 
             stream.start()
             origin: Optional[int] = None
+            offset = 0
             carry = None
             next_k = 0
             while not self._stop.is_set():
@@ -242,7 +259,24 @@ class RawPlayback:
                     continue
                 events = batches[0] if len(batches) == 1 else np.concatenate(batches)
                 if origin is None:
-                    origin = int(events["t"][0])
+                    first = int(events["t"][0])
+                    if self.origin_us is None:
+                        origin = first
+                    else:
+                        origin = self.origin_us
+                        # The whole number of 24-bit wraps between the file's
+                        # clock and the camera's (0 for an EVT2 file).
+                        offset = int(round((origin - first) / TIME_WRAP_US)) * TIME_WRAP_US
+                if offset:
+                    events = events.copy()
+                    events["t"] = events["t"].astype(np.int64) + offset
+                before = events["t"] < origin
+                if before.any():
+                    # Only possible if the file began before the origin the
+                    # CSV records; those events belong to no window.
+                    events = events[~before]
+                    if not len(events):
+                        continue
                 if carry is not None and len(carry):
                     events = np.concatenate([carry, events])
                 ks = (events["t"].astype(np.int64) - origin) // self.window_us
@@ -304,6 +338,22 @@ class RawPlayback:
             self._out.flush()
         self._index.append((self._written, len(values)))
         self._written += len(data)
+
+
+def raw_origin(index_csv: Any) -> Optional[int]:
+    """The capture's origin on the camera's clock, from its frames CSV:
+    timestamp_us - raw_t_us of any row that has both. None if there is none
+    (a frame camera's run, or an older capture)."""
+    try:
+        with open(str(index_csv), newline="", encoding="utf-8") as handle:
+            for row in csv.DictReader(handle):
+                stamp = str(row.get("timestamp_us") or "").strip()
+                raw_t = str(row.get("raw_t_us") or "").strip()
+                if stamp.lstrip("-").isdigit() and raw_t.lstrip("-").isdigit():
+                    return int(stamp) - int(raw_t)
+    except (OSError, csv.Error, UnicodeDecodeError):
+        return None
+    return None
 
 
 def open_raw(path: Any, window_us: int = DEFAULT_WINDOW_US, **kw: Any) -> RawPlayback:

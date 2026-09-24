@@ -587,3 +587,230 @@ def test_close_waits_for_frames_a_quick_stop_left_saving(tmp_path):
     assert session.stats().waiting > 0
     session.close()
     assert len(list(tmp_path.iterdir())) == 10
+
+
+# ======================================================================
+# Several writers, one order
+# ======================================================================
+def paced_writer(delays):
+    """A writer whose time per frame is set by the frame's pixel value, so a
+    test can make a LATER frame finish FIRST."""
+    def write(img, path):
+        time.sleep(delays.get(int(img.flat[0]), 0.0))
+        path.write_bytes(b"x")
+    return write
+
+
+def valued(index):
+    return cameras.Frame(image=np.full((4, 4), index, np.uint8), index=index,
+                         meta={"events": index, "raw_t_us": 1000 * index})
+
+
+def test_frames_finishing_out_of_order_are_published_in_grab_order(tmp_path):
+    """Frame 1 takes longest; with four writers 2..5 are done first. The
+    slider, the CSV and the counts must still see 1, 2, 3, 4, 5."""
+    rec = Recorder(tmp_path, writer=paced_writer({1: 0.3, 2: 0.1}),
+                   index_name="i.csv")
+    rec.open()
+    writer = capture.FrameWriter(rec, threads=4)
+    for i in range(1, 6):
+        writer.submit(valued(i))
+    time.sleep(0.15)
+    assert writer.paths == [], "published a frame before frame 1 was down"
+    assert writer.close(5)
+    assert [p.name for p in writer.paths] == [f"frame_00000{i}" for i in range(1, 6)]
+    rows = read_index(tmp_path / "i.csv")
+    assert [r["index"] for r in rows] == ["1", "2", "3", "4", "5"]
+    assert writer.written == 5
+
+
+def test_several_writers_really_write_at_once(tmp_path):
+    rec = Recorder(tmp_path, writer=slow_writer(0.2))
+    rec.open()
+    writer = capture.FrameWriter(rec, threads=4)
+    began = time.monotonic()
+    for i in range(1, 9):
+        writer.submit(frame(i))
+    assert writer.close(10)
+    assert time.monotonic() - began < 1.2, "eight 0.2 s frames took serial time"
+    assert writer.written == 8
+
+
+def test_a_failure_among_several_writers_stops_it_and_keeps_order(tmp_path):
+    def flaky(img, path):
+        if int(img.flat[0]) == 3:
+            raise OSError("disk full")
+        time.sleep(0.05)
+        path.write_bytes(b"x")
+
+    rec = Recorder(tmp_path, writer=flaky, index_name="i.csv")
+    rec.open()
+    writer = capture.FrameWriter(rec, threads=2)
+    for i in range(1, 7):
+        writer.submit(valued(i))
+    assert writer.close(5)
+    assert "disk full" in writer.failed
+    names = [p.name for p in writer.paths]
+    assert names == sorted(names), "published out of order"
+    assert "frame_000003" not in names
+    assert writer.submit(valued(9)) is False, "took a frame after failing"
+    assert rec._index_file is None, "the index was left open"
+
+
+def test_the_default_pool_has_at_least_one_writer():
+    assert capture.DEFAULT_WRITERS >= 1
+
+
+def test_the_saved_png_is_lossless_at_the_fast_compression_level(tmp_path):
+    """Level 1 is a speed choice; PNG is lossless at every level, and the
+    capture is the data."""
+    from PIL import Image
+
+    rng = np.random.default_rng(4)
+    twelve_bit = rng.integers(0, 4096, (120, 160)).astype(np.uint16)
+    capture.write_image(twelve_bit, tmp_path / "mono12.png")
+    back = np.asarray(Image.open(tmp_path / "mono12.png"))
+    assert np.array_equal(back.astype(np.uint16), twelve_bit)
+
+    events = cameras.accumulate_events(rng.integers(0, 160, 3000),
+                                       rng.integers(0, 120, 3000),
+                                       rng.integers(0, 2, 3000), 160, 120, np)
+    capture.write_image(events, tmp_path / "events.png")
+    assert np.array_equal(np.asarray(Image.open(tmp_path / "events.png")), events)
+
+
+# ======================================================================
+# A camera that keeps streaming after Stop (an EVK4)
+# ======================================================================
+def test_starting_a_recording_with_reset_counts_only_that_recording(tmp_path):
+    session = CaptureSession(FakeDevice())
+    for i in range(1, 6):
+        session._took(frame(i))                  # the preview
+    session.record_to(Recorder(tmp_path, writer=lambda i, p: p.write_bytes(b"x")),
+                      reset=True)
+    session._took(frame(6))
+    session.flush(5)
+    stats = session.stats()
+    assert stats.grabbed == 1 and stats.recorded == 1
+
+
+def test_frames_grabbed_after_stop_are_not_counted_against_the_run(tmp_path):
+    """The camera keeps streaming after Stop; those frames were never meant
+    to be saved and must not read as frames the capture lost."""
+    session = CaptureSession(FakeDevice())
+    session.record_to(Recorder(tmp_path, writer=lambda i, p: p.write_bytes(b"x")),
+                      reset=True)
+    for i in range(1, 4):
+        session._took(frame(i))
+    session.record_to(None)
+    for i in range(4, 9):
+        session._took(frame(i))                  # still streaming
+    run = session.run_stats()
+    assert run.grabbed == 3 and run.recorded == 3
+    assert session.stats().grabbed == 8
+
+
+def test_run_stats_follow_frames_still_landing_after_stop(tmp_path):
+    session = CaptureSession(FakeDevice())
+    session.record_to(Recorder(tmp_path, writer=slow_writer(0.1)), reset=True)
+    for i in range(1, 5):
+        session._took(frame(i))
+    session.record_to(None, drain_timeout=0.01)
+    assert session.run_stats().waiting > 0
+    session.close()
+    assert session.run_stats().recorded == 4 and session.run_stats().waiting == 0
+
+
+# ======================================================================
+# Review findings, each reproduced before it was fixed
+# ======================================================================
+def test_a_stalled_write_does_not_park_images_outside_the_budget(tmp_path):
+    """One write stalls; the others keep finishing. Measured before the fix:
+    796 MB of finished images held against a 16 MB budget, and the status
+    line said '1 waiting'."""
+    import threading
+
+    gate = threading.Event()
+
+    def stall_first(img, path):
+        if int(img.flat[0]) == 1:
+            gate.wait(5)
+        path.write_bytes(b"x")
+
+    rec = Recorder(tmp_path, writer=stall_first)
+    rec.open()
+    writer = capture.FrameWriter(rec, threads=4)
+    for i in range(1, 41):
+        writer.submit(valued(i))
+    deadline = time.monotonic() + 5
+    while len(writer._finished) < 39 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert all(stub is None or stub.image is None
+               for stub, _ in writer._finished.values()), "images kept"
+    assert writer.pending >= 39, f"'waiting' said {writer.pending}"
+    gate.set()
+    assert writer.close(5) and writer.written == 40
+
+
+def test_a_slow_index_write_does_not_block_handing_frames_over(tmp_path):
+    """Measured before the fix: one slow CSV flush held the writer's lock,
+    and the grab loop waited 984 ms to hand over a single frame."""
+    class SlowIndex(Recorder):
+        slowed = False
+
+        def log(self, frame, path):
+            if not SlowIndex.slowed:
+                SlowIndex.slowed = True
+                time.sleep(1.0)
+            super().log(frame, path)
+
+    rec = SlowIndex(tmp_path, writer=lambda i, p: p.write_bytes(b"x"),
+                    index_name="i.csv")
+    rec.open()
+    writer = capture.FrameWriter(rec, threads=2)
+    writer.submit(valued(1))
+    time.sleep(0.1)                       # the first row is now being written
+    worst = 0.0
+    for i in range(2, 20):
+        began = time.monotonic()
+        writer.submit(valued(i))
+        _ = writer.pending                # what the UI reads each tick
+        worst = max(worst, time.monotonic() - began)
+    assert worst < 0.1, f"handing a frame over took {worst:.3f} s"
+    assert writer.close(5)
+    assert [r["index"] for r in read_index(tmp_path / "i.csv")] == [
+        str(i) for i in range(1, 20)]
+
+
+def test_published_rows_are_on_disk_while_the_run_is_still_open(tmp_path):
+    """The raw view reads the run's origin from the CSV, possibly while the
+    tail of the run is still saving."""
+    rec = Recorder(tmp_path, writer=lambda i, p: p.write_bytes(b"x"),
+                   index_name="i.csv")
+    rec.open()
+    writer = capture.FrameWriter(rec, threads=2)
+    writer.submit(valued(1))
+    writer.wait_empty(5)
+    rows = read_index(tmp_path / "i.csv")        # the writer is still open
+    assert [r["file"] for r in rows] == ["frame_000001"]
+    writer.close(5)
+
+
+def test_a_recording_that_fails_freezes_its_counts(tmp_path):
+    """The camera keeps streaming after a failed recording (an EVK4 does);
+    later frames must not read as grabbed-and-not-saved."""
+    def explode(image, path):
+        raise OSError("disk full")
+
+    session = CaptureSession(FakeDevice())
+    session.record_to(Recorder(tmp_path, writer=explode), reset=True)
+    session._took(frame(1))
+    session.flush(5)
+    session._took(frame(2))                   # finds the failure
+    for i in range(3, 9):
+        session._took(frame(i))               # still streaming
+    # Frozen when the failure was found, as frame 2 arrived: the run
+    # grabbed one frame, whose write failed. Nothing after it counts.
+    assert session.run_stats().grabbed == 1
+    assert session.stats().grabbed == 8
+    assert "disk full" in session.run_stats().recording_failed

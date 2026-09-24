@@ -24,9 +24,11 @@ def clean():
     """Module-level state means every test must start from nothing."""
     frame_camera.disconnect()
     frame_camera._LIVE.found = None
+    frame_camera._LIVE.reviewer = None
     yield
     frame_camera.disconnect()
     frame_camera._LIVE.found = None
+    frame_camera._LIVE.reviewer = None
 
 
 def connected(kind="frame"):
@@ -483,6 +485,7 @@ class RawRecordingCamera(cameras.SyntheticDevice):
         super().start()
 
     def stop(self):
+        self.calls.append("stop")
         self.stop_raw()
         super().stop()
 
@@ -605,7 +608,9 @@ def test_a_quick_stop_does_not_wait_for_a_slow_disk(tmp_path, monkeypatch):
     real = capture.write_image
 
     def slow(image, path):
-        time.sleep(0.15)
+        # Slow enough that even several writers cannot finish inside
+        # STOP_DRAIN_SECONDS (0.15 s did, once saving went parallel).
+        time.sleep(0.6)
         real(image, path)
 
     monkeypatch.setattr(capture, "write_image", slow)
@@ -662,3 +667,393 @@ def test_play_and_toggle_need_a_slider(monkeypatch):
         frame_camera.play_pause()
     with pytest.raises(RuntimeError, match="no capture slider"):
         frame_camera.toggle_view()
+
+
+# ======================================================================
+# The live preview: connected, not capturing, nothing to review
+# ======================================================================
+class ViewerStub:
+    """Stands in for Typhon's CaptureReviewer: it says whether it wants the
+    preview, and collects what it is handed."""
+
+    def __init__(self, want=True):
+        self.want = want
+        self.frames = []
+
+    def wants_preview(self):
+        return self.want
+
+    def tick(self, frame):
+        if frame is not None:
+            self.frames.append(frame)
+        return False
+
+
+def ticks(viewer, seconds=0.4, said=None):
+    frame_camera._LIVE.reviewer = viewer        # as attach() does
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        frame_camera._tick(lambda image: None,
+                           said.append if said is not None else None, viewer)
+        time.sleep(0.02)
+
+
+def test_a_connected_camera_is_previewed_when_the_viewer_wants_it():
+    connected("event")
+    viewer = ViewerStub()
+    ticks(viewer)
+    assert frame_camera._LIVE.session.running
+    assert frame_camera._LIVE.previewing
+    assert viewer.frames, "the preview showed nothing"
+
+
+def test_the_preview_saves_nothing(tmp_path):
+    device = connected_raw()
+    ticks(ViewerStub())
+    session = frame_camera._LIVE.session
+    assert session.writer is None and session.stats().recorded == 0
+    assert "start_raw" not in device.calls, "the preview recorded a .raw"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_the_preview_says_it_is_not_saving():
+    connected()
+    said = []
+    ticks(ViewerStub(), said=said)
+    assert said and all(s.startswith("Preview — not saving") for s in said)
+
+
+def test_starting_from_the_preview_starts_the_raw_before_the_stream(tmp_path):
+    """The .raw must begin before the stream does: the preview stream is
+    stopped, the raw started, and the stream started again."""
+    device = connected_raw()
+    ticks(ViewerStub())
+    assert device.calls == ["start"]
+    frame_camera.start(str(tmp_path))
+    assert device.calls == ["start", "stop", "start_raw", "start"]
+    assert frame_camera._LIVE.capturing and not frame_camera._LIVE.previewing
+    frame_camera.stop()
+
+
+def test_a_capture_counts_only_its_own_frames(tmp_path):
+    """The frames the preview showed were never meant to be saved; counted,
+    they would read as frames the capture lost."""
+    connected("event")
+    ticks(ViewerStub(), seconds=0.5)
+    assert frame_camera._LIVE.session.stats().grabbed > 10
+    frame_camera.start(str(tmp_path))
+    assert frame_camera._LIVE.session.stats().grabbed <= 2
+    frame_camera.stop()
+
+
+def test_a_refused_start_leaves_the_preview_running(tmp_path):
+    connected()
+    ticks(ViewerStub())
+    with pytest.raises(RuntimeError, match="folder"):
+        frame_camera.start("   ")
+    assert frame_camera._LIVE.previewing and frame_camera._LIVE.session.running
+
+
+def test_the_preview_stops_when_the_viewer_has_frames_to_show():
+    """A hidden stream would only compete with playback for the CPU."""
+    connected()
+    viewer = ViewerStub()
+    ticks(viewer)
+    viewer.want = False
+    said = []
+    ticks(viewer, seconds=0.2, said=said)
+    assert not frame_camera._LIVE.session.running
+    assert not frame_camera._LIVE.previewing
+    assert len(said) == 1 and "no frames" in said[0], said
+
+
+def test_stop_during_the_preview_is_not_a_capture_stop():
+    connected()
+    ticks(ViewerStub())
+    out = frame_camera.stop()
+    assert "live preview" in out["summary"]
+    assert frame_camera._LIVE.session.running, "Stop killed the preview"
+
+
+def test_no_preview_runs_during_a_capture(tmp_path):
+    connected()
+    frame_camera.start(str(tmp_path))
+    viewer = ViewerStub()
+    ticks(viewer, seconds=0.3)
+    assert frame_camera._LIVE.capturing and not frame_camera._LIVE.previewing
+    frame_camera.stop()
+    assert frame_camera._LIVE.session.stats().recorded > 0
+
+
+def test_the_preview_comes_back_after_a_capture_when_wanted(tmp_path):
+    connected()
+    frame_camera.start(str(tmp_path))
+    settle()
+    frame_camera.stop()
+    ticks(ViewerStub(), seconds=0.3)
+    assert frame_camera._LIVE.previewing and frame_camera._LIVE.session.running
+
+
+def test_a_preview_that_cannot_start_is_retried_later_not_every_tick(monkeypatch):
+    connected()
+    device = frame_camera._LIVE.device
+    tries = []
+
+    def refuse():
+        tries.append(1)
+        raise cameras.CameraError("the camera is busy")
+
+    monkeypatch.setattr(device, "start", refuse)
+    said = []
+    ticks(ViewerStub(), seconds=0.4, said=said)
+    assert len(tries) == 1, f"retried {len(tries)} times in 0.4 s"
+    assert [s for s in said if "camera is busy" in s] == [
+        "Live preview stopped: CameraError: the camera is busy"], said
+
+
+def test_a_preview_that_ends_by_itself_is_reported(monkeypatch):
+    connected()
+    viewer = ViewerStub()
+    ticks(viewer, seconds=0.2)
+    device = frame_camera._LIVE.device
+
+    def gone(timeout_ms=1000):
+        raise cameras.CameraEnded("the camera was disconnected")
+
+    monkeypatch.setattr(device, "read", gone)
+    said = []
+    ticks(viewer, seconds=0.4, said=said)
+    assert not frame_camera._LIVE.previewing
+    assert any("disconnected" in s for s in said), said
+
+
+def test_an_app_without_a_capture_slider_gets_no_preview():
+    """Barbie v4/v5 have a generated browser on their canvas; a preview drawn
+    there would fight it."""
+    connected()
+    for _ in range(5):
+        frame_camera.pump(lambda image: None)
+        time.sleep(0.02)
+    assert not frame_camera._LIVE.session.running
+
+
+def test_the_area_can_be_set_during_the_preview():
+    """Aiming and framing is what the preview is for."""
+    connected()
+    ticks(ViewerStub())
+    assert frame_camera.set_area("0, 0, 320, 240")["area"] == "0, 0, 320, 240"
+    assert frame_camera._LIVE.session.running and frame_camera._LIVE.previewing
+
+
+def test_only_the_attached_viewer_drives_the_preview():
+    """A closed or replaced window must not start and stop the shared camera:
+    two viewers disagreeing would toggle the preview every tick."""
+    connected()
+    current = ViewerStub(want=True)
+    ticks(current, seconds=0.2)
+    stale = ViewerStub(want=False)
+    for _ in range(5):
+        frame_camera._tick(lambda image: None, None, stale)
+    assert frame_camera._LIVE.previewing and frame_camera._LIVE.session.running
+
+
+
+# ======================================================================
+# A camera whose stream must not be restarted (an EVK4)
+# ======================================================================
+class OneStreamCamera(RawRecordingCamera):
+    """The simulated event camera with EvkDevice's rule: never restarted on
+    the same connection, the .raw closed inside the running stream."""
+
+    restartable = False
+
+    def finish_raw(self, timeout=None):
+        self.calls.append("finish_raw")
+        path, self._raw = self._raw, None
+        return path
+
+
+def connected_one_stream():
+    from council_core import capture
+
+    info = cameras.CameraInfo("prophesee", "sim-evk", model="EVK4 (simulated)",
+                              kind="event")
+    device = OneStreamCamera(info)
+    with frame_camera._LOCK:
+        frame_camera._LIVE.device = device
+        frame_camera._LIVE.info = info
+        frame_camera._LIVE.session = capture.CaptureSession(device)
+        frame_camera._LIVE.reported = True
+    return device
+
+
+def test_a_one_stream_camera_goes_from_preview_to_capture_without_a_restart(tmp_path):
+    device = connected_one_stream()
+    viewer = ViewerStub()
+    ticks(viewer, seconds=0.3)
+    frame_camera.start(str(tmp_path))
+    assert device.calls == ["start", "start_raw"], "the stream was restarted"
+    assert frame_camera._LIVE.session.running
+    settle(0.3)
+    frame_camera.stop()
+    assert device.calls == ["start", "start_raw", "finish_raw"]
+    assert frame_camera._LIVE.session.running, "Stop stopped the stream"
+    assert list(tmp_path.glob("*.png")), "nothing was saved"
+
+
+def test_a_capture_straight_after_connecting_logs_before_the_stream(tmp_path):
+    """No preview yet: the stream has not started, so the .raw can begin
+    before it and lose nothing."""
+    device = connected_one_stream()
+    frame_camera.start(str(tmp_path))
+    assert device.calls == ["start_raw", "start"]
+    frame_camera.stop()
+
+
+def test_a_second_capture_on_the_same_connection_does_not_restart(tmp_path):
+    device = connected_one_stream()
+    viewer = ViewerStub()
+    for _ in range(2):
+        frame_camera.start(str(tmp_path))
+        settle(0.2)
+        frame_camera.stop()
+        ticks(viewer, seconds=0.1)
+    assert device.calls.count("start") == 1
+    assert "stop" not in device.calls
+
+
+def test_a_one_stream_camera_is_hidden_not_stopped_when_there_is_nothing_to_show():
+    device = connected_one_stream()
+    viewer = ViewerStub()
+    ticks(viewer, seconds=0.2)
+    viewer.want = False
+    ticks(viewer, seconds=0.2)
+    assert frame_camera._LIVE.session.running
+    assert not frame_camera._LIVE.previewing
+    viewer.want = True
+    ticks(viewer, seconds=0.2)
+    assert frame_camera._LIVE.previewing
+    assert device.calls == ["start"]
+
+
+def test_a_hidden_stream_says_nothing_in_the_status_line_after_one_line():
+    connected_one_stream()
+    viewer = ViewerStub(want=False)
+    frame_camera._LIVE.reviewer = viewer
+    frame_camera._manage_preview(True)          # started for a preview once
+    said = []
+    ticks(viewer, seconds=0.3, said=said)
+    assert len(said) == 1 and "no frames" in said[0], said
+
+
+def test_a_one_stream_camera_that_dies_is_not_restarted(monkeypatch):
+    """Only a new connection starts its stream clean."""
+    device = connected_one_stream()
+    viewer = ViewerStub()
+    ticks(viewer, seconds=0.2)
+
+    def gone(timeout_ms=1000):
+        raise cameras.CameraEnded("the camera was disconnected")
+
+    monkeypatch.setattr(device, "read", gone)
+    said = []
+    ticks(viewer, seconds=0.5, said=said)
+    assert device.calls.count("start") == 1, "restarted a dead stream"
+    assert any("Connect again" in s for s in said), said
+
+
+def test_a_one_stream_cameras_area_is_set_live_during_the_preview():
+    device = connected_one_stream()
+    ticks(ViewerStub(), seconds=0.2)
+    frame_camera.set_area("0, 0, 320, 240")
+    assert "stop" not in device.calls and frame_camera._LIVE.session.running
+
+
+# ======================================================================
+# Review findings: states the camera can die in
+# ======================================================================
+def _dies(monkeypatch, device):
+    def gone(timeout_ms=1000):
+        raise cameras.CameraEnded("the camera was disconnected")
+    monkeypatch.setattr(device, "read", gone)
+
+
+def test_a_capture_whose_camera_dies_ends_and_says_why(tmp_path, monkeypatch):
+    """Before: the app still thought it was capturing — the status line froze
+    and Start was refused until Stop was pressed."""
+    connected()
+    frame_camera.start(str(tmp_path))
+    settle()
+    _dies(monkeypatch, frame_camera._LIVE.device)
+    said = []
+    ticks(ViewerStub(want=False), seconds=0.5, said=said)
+    assert not frame_camera._LIVE.capturing
+    assert any(s.startswith("Capture ended — the camera was disconnected")
+               for s in said), said
+    monkeypatch.undo()
+    frame_camera.start(str(tmp_path))            # a frame camera may restart
+    frame_camera.stop()
+
+
+def test_a_hidden_one_stream_camera_that_dies_is_not_restarted(monkeypatch):
+    """The never-restart rule also covers a stream that dies while hidden."""
+    device = connected_one_stream()
+    viewer = ViewerStub()
+    ticks(viewer, seconds=0.2)
+    viewer.want = False
+    ticks(viewer, seconds=0.1)                   # hidden, still streaming
+    _dies(monkeypatch, device)
+    ticks(viewer, seconds=0.2)
+    viewer.want = True
+    said = []
+    ticks(viewer, seconds=0.3, said=said)
+    assert device.calls.count("start") == 1, "restarted a dead stream"
+    assert any("Connect again" in s for s in said), said
+
+
+def test_start_refuses_to_restart_a_dead_one_stream_camera(tmp_path, monkeypatch):
+    device = connected_one_stream()
+    ticks(ViewerStub(), seconds=0.2)
+    _dies(monkeypatch, device)
+    ticks(ViewerStub(), seconds=0.2)
+    with pytest.raises(RuntimeError, match="Connect again"):
+        frame_camera.start(str(tmp_path))
+    assert device.calls.count("start") == 1
+
+
+def test_a_one_stream_capture_whose_camera_dies_says_reconnect(tmp_path, monkeypatch):
+    device = connected_one_stream()
+    frame_camera.start(str(tmp_path))
+    settle()
+    _dies(monkeypatch, device)
+    said = []
+    ticks(ViewerStub(), seconds=0.5, said=said)
+    assert any("Capture ended" in s and "Connect again" in s for s in said), said
+    assert device.calls.count("start") == 1
+
+
+def test_the_preview_waits_for_a_stopped_run_to_finish_saving(tmp_path, monkeypatch):
+    """Starting it at once reset the counts and hid 'N waiting to save'."""
+    from council_core import capture
+
+    real = capture.write_image
+
+    def slow(image, path):
+        time.sleep(0.4)
+        real(image, path)
+
+    monkeypatch.setattr(capture, "write_image", slow)
+    connected()
+    frame_camera.start(str(tmp_path))
+    settle(0.4)
+    frame_camera.stop()
+    session = frame_camera._LIVE.session
+    assert session.saving
+    ticks(ViewerStub(), seconds=0.2)
+    assert not frame_camera._LIVE.previewing, "previewed while still saving"
+    session.flush(20)
+    deadline = time.monotonic() + 20
+    while session.saving and time.monotonic() < deadline:
+        time.sleep(0.05)
+    ticks(ViewerStub(), seconds=0.2)
+    assert frame_camera._LIVE.previewing

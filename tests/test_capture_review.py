@@ -64,6 +64,7 @@ def ui(qapp, typhon_dir):
     app.resize(1504, 1016)
     pump(0.05)
     yield app
+    app._frame_camera_live.stop()           # this window's tick, for good
     frame_camera.disconnect()
     app._capture_review.close()
     app.close()
@@ -142,8 +143,9 @@ class FakePlayback:
 def with_playback(rv, playback):
     opened = []
 
-    def opener(path, window_us):
+    def opener(path, window_us, **kw):
         opened.append(Path(path))
+        playback.opened_with = kw
         return playback
 
     rv._open_raw = opener
@@ -540,7 +542,7 @@ def test_a_raw_that_cannot_be_opened_says_why(ui, tmp_path):
     ui.ports.capture_folder.set(str(tmp_path))
     pump(0.3)
 
-    def refuse(path, window_us):
+    def refuse(path, window_us, **kw):
         raise event_playback.RawUnavailable("the raw view needs the Metavision SDK")
 
     rv._open_raw = refuse
@@ -630,3 +632,98 @@ def test_a_run_name_is_read_from_its_files():
     assert cr.run_of("20260924_120000_2_frame_000003.png") == "20260924_120000_2"
     assert cr.run_of("holiday.png") == ""
     assert cr.run_of_raw("20260924_120000_2_events.raw") == "20260924_120000_2"
+
+
+# ======================================================================
+# The live preview inside Typhon
+# ======================================================================
+def connect_event_camera():
+    rows = frame_camera.list_cameras()["rows"]
+    frame_camera.connect(next(r for r in rows if r.endswith("event")))
+
+
+def test_connected_with_an_empty_folder_shows_the_camera_live(ui, tmp_path):
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    connect_event_camera()
+    canvas = ui.ports.live_view.widget
+    assert pump_until(lambda: canvas._base is not None), "no preview frame"
+    assert ui.ports.view_status.get() == "Preview · not saving"
+    assert ui.ports.current_frame.get() == ""
+    assert ui.ports.capture_status.get().startswith("Preview — not saving")
+    pump(0.3)
+    assert list(tmp_path.iterdir()) == [], "the preview saved something"
+
+
+def test_a_folder_with_frames_shows_them_not_the_camera(ui, tmp_path):
+    saved_run(tmp_path)
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    connect_event_camera()
+    pump(0.4)
+    assert not frame_camera._LIVE.session.running
+    assert ui.ports.view_status.get().startswith("PNG 1 / 10")
+
+
+def test_choosing_an_empty_folder_starts_the_preview(ui, tmp_path):
+    saved_run(tmp_path / "old")
+    ui.ports.capture_folder.set(str(tmp_path / "old"))
+    pump(0.3)
+    connect_event_camera()
+    pump(0.2)
+    (tmp_path / "new").mkdir()
+    ui.ports.capture_folder.set(str(tmp_path / "new"))
+    assert pump_until(lambda: frame_camera._LIVE.previewing)
+    assert pump_until(lambda: ui.ports.view_status.get() == "Preview · not saving")
+
+
+def test_start_capture_from_the_preview_goes_live_and_saves(ui, tmp_path):
+    rv = ui._capture_review
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    connect_event_camera()
+    assert pump_until(lambda: frame_camera._LIVE.previewing)
+    frame_camera.start(str(tmp_path))
+    assert pump_until(lambda: len(rv.files) >= 5)
+    assert rv.live and ui.ports.view_status.get().startswith("Live")
+    frame_camera.stop()
+    assert pump_until(lambda: not frame_camera._LIVE.session.running), \
+        "the preview came back although the folder now has frames"
+
+
+def test_disconnecting_during_the_preview_clears_the_picture(ui, tmp_path):
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    connect_event_camera()
+    canvas = ui.ports.live_view.widget
+    assert pump_until(lambda: canvas._base is not None)
+    frame_camera.disconnect()
+    pump(0.2)
+    assert canvas._base is None, "the last preview frame was left looking live"
+    assert ui.ports.view_status.get() == "No frames yet"
+
+
+def test_the_raw_view_turns_the_preview_off(ui, tmp_path):
+    """No preview over a raw file being looked at."""
+    rv = ui._capture_review
+    (tmp_path / f"{RUN}_events.raw").write_bytes(b"% end\n")
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    connect_event_camera()
+    assert pump_until(lambda: frame_camera._LIVE.previewing)
+    with_playback(rv, FakePlayback(20))
+    rv.toggle_view()
+    assert pump_until(lambda: not frame_camera._LIVE.session.running)
+    assert rv.mode == cr.RAW
+
+
+def test_the_raw_view_is_anchored_at_the_runs_origin(ui, tmp_path):
+    """The origin comes from the run's CSV (timestamp_us - raw_t_us)."""
+    rv = ui._capture_review
+    saved_run(tmp_path)
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    playback = FakePlayback(50)
+    with_playback(rv, playback)
+    rv.toggle_view()
+    assert playback.opened_with == {"origin_us": 0 - 20_000}

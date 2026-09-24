@@ -845,6 +845,78 @@ def test_closing_lets_go_of_the_sdk_objects():
 
 
 # ======================================================================
+# EVK: one stream per connection
+# ======================================================================
+def test_an_event_camera_says_its_stream_must_not_be_restarted():
+    """Its decoder carries state across a restart that Python cannot reset:
+    measured, time ran backwards or jumped 16.78 s, and fake events appeared."""
+    device, _ = evk()
+    assert device.restartable is False
+    assert cameras.Device.restartable is True
+
+
+def test_finishing_the_raw_while_streaming_closes_it_in_the_grab_loop(tmp_path):
+    """At a moment the SDK's queue is empty: every buffer up to then was
+    pulled (so logged) AND decoded. Pulling the tail from another thread
+    would leave the decoder out of step."""
+    import threading
+
+    device, raw = evk(polls=[])
+    device.start_raw(tmp_path / "r.raw")
+    device.start()
+    done = []
+    finisher = threading.Thread(
+        target=lambda: done.append(device.finish_raw(timeout=5)))
+    finisher.start()
+    time.sleep(0.05)
+    raw._stream.polls = [1, 1, 0]
+    device.read(50)                         # the grab loop's next window
+    finisher.join(5)
+    assert done == [tmp_path / "r.raw"]
+    assert raw._stream.calls.count("stop_log") == 1
+    assert "stop" not in raw._stream.calls, "the stream was stopped"
+    assert device.raw_path is None
+
+
+def test_a_raw_the_loop_never_gets_to_close_is_closed_after_the_timeout(tmp_path):
+    """A file source never runs dry; nor might a very busy camera."""
+    device, raw = evk(polls=[])
+    device.start_raw(tmp_path / "r.raw")
+    device.start()
+    began = time.monotonic()
+    assert device.finish_raw(timeout=0.1) == tmp_path / "r.raw"
+    assert time.monotonic() - began < 1.0
+    assert raw._stream.calls.count("stop_log") == 1
+    assert device.raw_path is None
+
+
+def test_finishing_the_raw_of_a_stopped_stream_drains_and_closes_it(tmp_path):
+    device, raw = evk(polls=[])
+    device.start_raw(tmp_path / "r.raw")
+    assert device.finish_raw(timeout=5) == tmp_path / "r.raw"
+    assert raw._stream.calls == ["log", "stop_log"]
+
+
+def test_the_stream_is_stopped_once_however_often_stop_is_called():
+    """On a live EVK4 each stop() is a round of USB register writes to the
+    sensor, and close() calls stop() again."""
+    device, raw = evk()
+    device.start()
+    device.stop()
+    device.close()
+    assert raw._stream.calls.count("stop") == 1
+
+
+def test_a_stream_that_ended_is_still_stopped_once(tmp_path):
+    device, raw = evk(polls=[-1])
+    device.start()
+    with pytest.raises(CameraError):
+        device.read(50)
+    device.close()
+    assert raw._stream.calls.count("stop") == 1
+
+
+# ======================================================================
 # Synthetic
 # ======================================================================
 def test_the_simulated_backend_is_always_available():

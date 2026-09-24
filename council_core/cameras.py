@@ -251,6 +251,12 @@ class Device:
     #: camera has no such stream, and its saved frames ARE the data.
     records_raw = False
 
+    #: Whether stop() then start() on the same open device is safe. A frame
+    #: camera's grabs are independent, so yes. An EVK4's decoder carries its
+    #: state across a restart and Python cannot reset it (see EvkDevice), so
+    #: its stream runs from the first start until the device is closed.
+    restartable = True
+
     def start_raw(self, path: Any) -> Path:
         """Begin recording the camera's raw stream into `path`."""
         raise CameraError("this camera has no raw stream to record")
@@ -785,6 +791,14 @@ class EvkDevice(Device):
         #: The .raw being written, and the sensor time of its first event.
         self._raw: Optional[Path] = None
         self._raw_origin: Optional[int] = None
+        #: stream.start() succeeded and stream.stop() has not been called.
+        #: Not `_started`, which also goes False when the stream ENDS: a
+        #: stream that ended still needs its stop(), exactly once.
+        self._streaming = False
+        #: finish_raw asks the grab loop to close the .raw at a quiet moment.
+        self._raw_lock = threading.Lock()
+        self._finish_wanted = False
+        self._raw_finished = threading.Event()
         try:
             self._cd.add_event_buffer_callback(self._sink.on_events)
         except Exception as exc:                            # noqa: BLE001
@@ -793,6 +807,21 @@ class EvkDevice(Device):
     # ------------------------------------------------------------------
     def _drain(self) -> List[Any]:
         return self._sink.drain()
+
+    # ------------------------------------------------------------------
+    # One stream per connection
+    # ------------------------------------------------------------------
+    #: NEVER stop and start this stream again on the same open device.
+    #: Measured against OpenEB 5.2: I_EventsStream.start/stop leave the
+    #: decoder's state alone — the last time-high, the EVT3 wrap counter, a
+    #: half-decoded vector group, a leftover byte — and on a live EVK4 stop()
+    #: really stops the sensor's time base. Fed a restarted stream, that
+    #: stale state made time run backwards ("NonMonotonicTimeHigh"), jump
+    #: 16.78 s forward, or produced fake events. Prophesee's own SDK resets
+    #: the decoder on every start; the Python bindings expose no way to. So
+    #: the stream starts once, and the .raw opens and closes INSIDE it, which
+    #: is how Prophesee's own recording works (Camera::start_recording).
+    restartable = False
 
     # ------------------------------------------------------------------
     # The raw recording
@@ -806,10 +835,14 @@ class EvkDevice(Device):
     def start_raw(self, path: Any) -> Path:
         """Record every byte the camera sends into `path`, alongside the view.
 
-        START IT BEFORE start(). The SDK writes each buffer as it is pulled,
-        so a log started mid-stream begins at a buffer boundary, and a replay
-        drops everything before the file's first time marker — several ms on
-        an EVK4. Started first, the file has the whole run.
+        BEFORE start() WHEN IT CAN BE. The SDK writes each buffer as it is
+        pulled, so a log started mid-stream begins at a buffer boundary, and a
+        replay drops the events before the file's first time marker: at most
+        one EVT3 time-high period, 4.1 ms, measured. Started before the
+        stream, the file has everything. Started while the stream runs (a
+        capture begun from the live preview), it loses at most that — the
+        same as Prophesee's own recorder, and far better than restarting the
+        stream to avoid it (see `restartable`).
 
         IT NEVER OVERWRITES. The SDK's log_raw_data silently truncates an
         existing file (measured: 1,700,147 bytes to 208), so an existing path
@@ -828,16 +861,56 @@ class EvkDevice(Device):
         if self._raw is not None:
             self.stop_raw()
         stream = self._stream
-        try:
-            ok = stream.log_raw_data(str(target))
-        except Exception as exc:                            # noqa: BLE001
-            raise CameraError(f"could not start the raw recording: {exc}") from exc
-        if ok is False:
-            # False, not an exception: a missing folder, or no permission.
-            raise CameraError(f"could not create {target}")
-        self._raw = target
-        self._raw_origin = None
+        with self._raw_lock:
+            # The log call and the grab loop's pulls share the SDK's own
+            # log mutex; this lock only keeps OUR bookkeeping consistent.
+            try:
+                ok = stream.log_raw_data(str(target))
+            except Exception as exc:                        # noqa: BLE001
+                raise CameraError(
+                    f"could not start the raw recording: {exc}") from exc
+            if ok is False:
+                # False, not an exception: a missing folder, or no permission.
+                raise CameraError(f"could not create {target}")
+            self._raw = target
+            self._raw_origin = None
+            self._finish_wanted = False
+            self._raw_finished.clear()
         return target
+
+    def finish_raw(self, timeout: float = None) -> Optional[Path]:
+        """Close the .raw while the stream keeps running.
+
+        The grab loop closes it itself, the next time the SDK's queue is
+        empty: every buffer up to then has been pulled — so written — AND
+        decoded. Pulling the tail from here instead would take buffers away
+        from the decoder and leave it out of step with the stream. If the
+        loop does not get there within `timeout` (a file source never runs
+        dry), the file is closed from here; the SDK serialises that with the
+        loop's writes.
+        """
+        target = self._raw
+        if target is None:
+            return None
+        if not self._started:
+            return self.stop_raw()
+        with self._raw_lock:
+            self._finish_wanted = True
+        wait = RAW_DRAIN_SECONDS if timeout is None else float(timeout)
+        if not self._raw_finished.wait(wait):
+            self._close_raw_now()
+        return target
+
+    def _close_raw_now(self) -> None:
+        with self._raw_lock:
+            if self._raw is None:
+                return
+            try:
+                self._stream.stop_log_raw_data()
+            finally:
+                self._raw = None
+                self._finish_wanted = False
+                self._raw_finished.set()
 
     def stop_raw(self) -> Optional[Path]:
         """Finish the .raw: pull what is still queued, then close the file.
@@ -850,11 +923,10 @@ class EvkDevice(Device):
         target = self._raw
         if target is None:
             return None
-        self._raw = None
         if self._started:
             self._drain_to_log()
         try:
-            self._stream.stop_log_raw_data()
+            self._close_raw_now()
         except Exception as exc:                            # noqa: BLE001
             raise CameraError(f"could not finish {target.name}: {exc}") from exc
         return target
@@ -928,6 +1000,7 @@ class EvkDevice(Device):
         except Exception as exc:                            # noqa: BLE001
             raise CameraError(f"could not start the stream: {exc}") from exc
         self._started = True
+        self._streaming = True
 
     def stop(self) -> None:
         # The raw file first, while the stream is still running: stopping the
@@ -938,10 +1011,14 @@ class EvkDevice(Device):
             pass
         self._started = False
         self._ended = False
-        try:
-            self._stream.stop()
-        except Exception:                                   # noqa: BLE001
-            pass
+        if self._streaming:
+            # Once. On a live EVK4 each stop() is a round of USB register
+            # writes to the sensor, and close() calls stop() again.
+            self._streaming = False
+            try:
+                self._stream.stop()
+            except Exception:                               # noqa: BLE001
+                pass
         self._drain()
 
     def read(self, timeout_ms: int = 1000) -> Optional[Frame]:
@@ -1015,6 +1092,11 @@ class EvkDevice(Device):
                 self._ended = True
                 break
             if ready == 0:
+                if self._finish_wanted:
+                    # Everything queued has been pulled, logged and decoded:
+                    # the one moment the .raw can end without the decoder
+                    # missing a buffer.
+                    self._close_raw_now()
                 waited += 0.001
                 if waited * 1000.0 >= timeout_ms:
                     break
