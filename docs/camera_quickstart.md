@@ -181,6 +181,12 @@ so a 12-bit frame reads dark *to the classifier*.
 |---|---|
 | Basler: empty camera list | Rerun **Camera setup…** and read the Check page. For a boA5320 it is almost always missing CoaXPress support. |
 | "could not open … something else is holding the frame grabber" | The pylon Viewer, or a previous run, still owns the card. Close it. |
-| EVK4: empty list with the camera plugged in | The USB driver, almost always (Prophesee step 3). The SDK cannot tell "no driver" from "no camera" — both are an empty list. |
+| EVK4: empty list with the camera plugged in | The USB driver, almost always (Prophesee step 3). The SDK cannot tell "no driver" from "no camera" — both are an empty list. Other causes that look identical: Metavision Studio or another program has the camera open (close it); on an OpenEB build, `MV_HAL_PLUGIN_PATH` not set or `libusb-1.0.dll` not on `PATH` (run the build's `utils\scripts\setup_env.bat` first); camera firmware older than 3.8. |
+| EVK4: finding out *why* it was skipped | Start the app with `MV_LOG_LEVEL=TRACE` set and read the console — the SDK only explains a skipped camera there. |
+| EVK4: connected, but hardly any events | Expected with a still camera on a still scene: an event camera only reports *change*. Wave a hand in front of it. |
 | EVK4: "Metavision SDK installed" fails | Not installed, or installed for a different Python than the app runs under (3.10–3.12 only). |
 | Camera connects, live view stays blank | Check the AOI — **Full sensor** resets it. |
+
+For an EVK4 the **official installer is the lower-risk route**: it installs the
+USB driver and registers where its plugins live, which removes three of the
+silent causes above. OpenEB works, but those three become your job.
