@@ -171,6 +171,7 @@ class FakeDeviceInfo:
 
 class FakePylon:
     GrabStrategy_LatestImageOnly = "latest"
+    GrabStrategy_OneByOne = "onebyone"
     TimeoutHandling_Return = "return"
 
     def __init__(self, devices=None, camera=None):
@@ -1018,3 +1019,216 @@ def test_simulated_frames_follow_the_roi():
     device.set_roi(Roi(0, 0, 64, 32))
     device.start()
     assert device.read().size == (64, 32)
+
+
+
+# ======================================================================
+# Basler compatibility (from the setup-wizard scan research)
+# ======================================================================
+class _Placeholder:
+    """pypylon's answer for a feature the model lacks."""
+
+    def IsValid(self):
+        return False
+
+
+def older_gige_camera():
+    """An ace GigE of the older naming: ExposureTimeAbs / GainRaw, and no
+    ExposureTime / Gain at all."""
+    cam = FakeCamera()
+    cam.ExposureTime = _Placeholder()
+    cam.Gain = _Placeholder()
+    cam.ExposureTimeAbs = FakeNode(3000.0, low=10.0, high=1_000_000.0)
+    cam.GainRaw = FakeNode(0, low=0, high=512)
+    return cam
+
+
+def test_an_older_gige_ace_is_exposed_through_its_own_node():
+    """Writing ExposureTime on these silently did nothing."""
+    backend, pylon = basler(camera=older_gige_camera())
+    device = backend.open(backend.discover()[0])
+    assert device.set_exposure_us(20000) == pytest.approx(20000)
+    assert pylon.camera.ExposureTimeAbs.GetValue() == pytest.approx(20000)
+    assert device.limits().exposure_us == (10.0, 1_000_000.0)
+
+
+def test_an_older_gige_ace_gain_is_written_in_raw_units():
+    backend, pylon = basler(camera=older_gige_camera())
+    device = backend.open(backend.discover()[0])
+    device.set_gain(12.6)
+    assert pylon.camera.GainRaw.GetValue() == 13
+    assert device.limits().gain == (0.0, 512.0)
+
+
+def test_a_camera_with_no_exposure_says_so():
+    cam = FakeCamera()
+    cam.ExposureTime = _Placeholder()
+    backend, _ = basler(camera=cam)
+    device = backend.open(backend.discover()[0])
+    with pytest.raises(CameraError, match="no exposure control"):
+        device.set_exposure_us(1000)
+
+
+class NaDeviceInfo(FakeDeviceInfo):
+    """pylon answers a missing property with the string "N/A"."""
+
+    def GetSerialNumber(self):
+        return "N/A"
+
+    def GetFullName(self):
+        return f"Basler {self._model} at {self._serial}"
+
+
+def test_cameras_without_a_serial_do_not_share_the_key_na():
+    devices = [NaDeviceInfo("usb-1"), NaDeviceInfo("usb-2")]
+    backend, _ = basler(devices=devices)
+    keys = [c.key for c in backend.discover()]
+    assert "N/A" not in keys and len(set(keys)) == 2
+    assert backend.open(backend.discover()[1]).info.key == keys[1]
+
+
+def test_open_applies_pylons_continuous_configuration():
+    """Without it a camera whose startup settings are hardware-triggered
+    gives no frames and no error (measured on the emulator)."""
+    applied = []
+    backend, pylon = basler()
+    pylon.AcquireContinuousConfiguration = type(
+        "Cfg", (), {"ApplyConfiguration": staticmethod(applied.append)})
+    pylon.camera.GetNodeMap = lambda: "nodemap"
+    backend.open(backend.discover()[0])
+    assert applied == ["nodemap"]
+
+
+class ClDeviceInfo(FakeDeviceInfo):
+    def to_dict(self):
+        return {"SerialNumber": self._serial, "ModelName": self._model,
+                "DeviceClass": "BaslerCameraLink"}
+
+
+def test_a_camera_link_camera_is_refused_with_the_reason():
+    backend, _ = basler(devices=[ClDeviceInfo("cl-1", "acA2040-180km")])
+    with pytest.raises(CameraError, match="Camera Link"):
+        backend.open(backend.discover()[0])
+
+
+def test_a_camera_held_by_another_program_says_so_not_frame_grabber():
+    backend, pylon = basler()
+
+    def refuse():
+        raise RuntimeError("Device is exclusively opened by another client")
+
+    pylon.camera.Open = refuse
+    pylon.IsDeviceAccessibleInfo = lambda info: (False, 3)
+    with pytest.raises(CameraError, match="another program") as got:
+        backend.open(backend.discover()[0])
+    assert "frame grabber" not in str(got.value)
+
+
+def test_moving_the_area_turns_centring_off_first():
+    cam = FakeCamera()
+    cam.CenterX = FakeNode(True)
+    cam.CenterY = FakeNode(True)
+    backend, _ = basler(camera=cam)
+    device = backend.open(backend.discover()[0])
+    device.set_roi(Roi(400, 200, 1024, 800))
+    assert not cam.CenterX.GetValue() and not cam.CenterY.GetValue()
+
+
+def test_a_boost_reports_its_achievable_rate_not_the_cap():
+    backend, pylon = basler()
+    pylon.camera.BslResultingAcquisitionFrameRate = FakeNode(72.5)
+    pylon.camera.AcquisitionFrameRate = FakeNode(150.0, low=1.0, high=150.0)
+    device = backend.open(backend.discover()[0])
+    assert device.frame_rate() == pytest.approx(72.5)
+
+
+def test_recording_grabs_one_by_one_and_live_keeps_the_newest():
+    backend, pylon = basler()
+    pylon.camera.PayloadSize = FakeNode(49_000_000)
+    pylon.camera.MaxNumBuffer = FakeNode(10)
+    device = backend.open(backend.discover()[0])
+    device.start()
+    assert pylon.camera.strategy == "latest"
+    device.stop()
+    device.prepare(True)
+    device.start()
+    assert pylon.camera.strategy == "onebyone"
+    # ~1 GB of 49 MB frames.
+    assert pylon.camera.MaxNumBuffer.GetValue() == 21
+    device.stop()
+
+
+class SkippingGrab(FakeGrab):
+    def GetNumberOfSkippedImages(self):
+        return 4
+
+
+def test_frames_the_camera_dropped_are_counted_and_shown():
+    from council_core.capture import CaptureSession
+
+    backend, pylon = basler()
+    pylon.camera.RetrieveResult = lambda t, h: SkippingGrab(np.zeros((4, 4), np.uint8))
+    device = backend.open(backend.discover()[0])
+    device.start()
+    frame = device.read(10)
+    assert frame.meta["skipped_by_camera"] == 4
+    session = CaptureSession(device)
+    session._took(frame)
+    assert session.stats().camera_skipped == 4
+    assert "4 lost by the camera/driver" in session.stats().line()
+
+
+class ArrayGrab(FakeGrab):
+    def __init__(self, array, pixel_type="pt"):
+        super().__init__(array)
+        self._array = array
+        self._pt = pixel_type
+
+    @property
+    def Array(self):
+        if isinstance(self._array, Exception):
+            raise self._array
+        return self._array
+
+    def GetPixelType(self):
+        return self._pt
+
+
+def test_bgr_frames_are_swapped_to_rgb():
+    backend, pylon = basler()
+    bgr = np.zeros((2, 2, 3), np.uint8)
+    bgr[..., 0] = 200                               # blue first
+    pylon.IsBGR = lambda pt: True
+    pylon.camera.RetrieveResult = lambda t, h: ArrayGrab(bgr)
+    device = backend.open(backend.discover()[0])
+    device.start()
+    image = device.read(10).image
+    assert image[0, 0, 2] == 200 and image[0, 0, 0] == 0
+
+
+def test_an_unsavable_format_is_converted_not_fatal():
+    backend, pylon = basler()
+    pylon.camera.RetrieveResult = lambda t, h: ArrayGrab(ValueError("BGRA"))
+    pylon.IsColorImage = lambda pt: True
+    pylon.BitDepth = lambda pt: 8
+    pylon.PixelType_RGB8packed = "rgb8"
+
+    class Converter:
+        OutputPixelFormat = None
+
+        def Convert(self, grab):
+            return type("Img", (), {"GetArray": lambda s: np.full((2, 2, 3), 9, np.uint8)})()
+
+    pylon.ImageFormatConverter = Converter
+    device = backend.open(backend.discover()[0])
+    device.start()
+    assert device.read(10).image.shape == (2, 2, 3)
+
+
+def test_a_format_nothing_can_convert_names_itself():
+    backend, pylon = basler()
+    pylon.camera.RetrieveResult = lambda t, h: ArrayGrab(ValueError("odd"), "YCbCr")
+    device = backend.open(backend.discover()[0])
+    device.start()
+    with pytest.raises(CameraError, match="YCbCr"):
+        device.read(10)

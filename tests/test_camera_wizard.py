@@ -51,8 +51,15 @@ def settle(wizard, seconds=5.0):
     assert wizard.check.readiness is not None, "the check never came back"
 
 
-def wizard_at(qapp, choice, checker=ok_checker, current=None):
-    w = cw.CameraSetupWizard(checker=checker, python=PYTHON, current=current)
+def no_cameras():
+    from council_core import basler_scan as bs
+    return bs.ScanReport(pylon_version="test")
+
+
+def wizard_at(qapp, choice, checker=ok_checker, current=None,
+              scanner=no_cameras):
+    w = cw.CameraSetupWizard(checker=checker, python=PYTHON, current=current,
+                             scanner=scanner)
     w.restart()
     if choice:
         w.choose.buttons[choice].setChecked(True)
@@ -360,3 +367,123 @@ def test_a_cancelled_setup_says_nothing_changed(clean_camera, tmp_path,
     frame_camera._LIVE.setup_path = cs.setup_path(tmp_path)
     monkeypatch.setattr(cw, "run_wizard", lambda parent, p, **kw: None)
     assert "nothing changed" in frame_camera.setup()["summary"]
+
+
+
+# ======================================================================
+# The Basler scan on the Check page
+# ======================================================================
+def a_report():
+    from council_core import basler_scan as bs
+
+    good = bs.CameraReport("40012345", "boA5320-150cm", "boost", "40012345",
+                           "CoaXPress", bs.CXP_CLASS, "free")
+    good.checks = [bs.Check(bs.PASS, "Test grab", "10/10 frames")]
+    bad = bs.CameraReport("7", "acA1300-30gm", "ace", "7", "GigE Vision",
+                          "BaslerGigE", "free")
+    bad.checks = [bs.Check(bs.FAIL, "Network", "on another subnet",
+                           "Use the pylon IP Configurator.")]
+    return bs.ScanReport(pylon_version="12.3", cameras=[good, bad],
+                         notes=[bs.Check(bs.WARN, "CoaXPress support", "none",
+                                         "Install the CXP option.")])
+
+
+def settle_scan(wizard, seconds=5.0):
+    deadline = time.monotonic() + seconds
+    while wizard.check.scan_report is None and time.monotonic() < deadline:
+        QApplication.processEvents()
+        time.sleep(0.01)
+    assert wizard.check.scan_report is not None, "the scan never came back"
+
+
+def test_choosing_basler_scans_its_cameras_off_the_ui_thread(qapp):
+    seen = {}
+
+    def scanner():
+        seen["thread"] = threading.current_thread().name
+        return a_report()
+
+    w = wizard_at(qapp, "basler", scanner=scanner)
+    w.next()
+    w.next()
+    settle_scan(w)
+    assert seen["thread"] != threading.main_thread().name
+    assert w.check.scan_view.isVisibleTo(w.check)
+
+
+def test_the_scan_says_what_works_what_does_not_and_what_to_do(qapp):
+    w = wizard_at(qapp, "basler", scanner=a_report)
+    w.next()
+    w.next()
+    settle_scan(w)
+    text = w.check.scan_view.toPlainText()
+    assert "Ready to capture" in text and "boA5320-150cm" in text
+    assert "Will not work yet" in text and "IP Configurator" in text
+    assert "Install the CXP option" in text          # the machine-level note
+
+
+def test_an_evk4_setup_has_no_basler_scan(qapp):
+    called = []
+    w = wizard_at(qapp, "prophesee", scanner=lambda: called.append(1))
+    w.next()
+    w.next()
+    settle(w)
+    assert not w.check.scan_btn.isVisibleTo(w.check)
+    assert called == []
+
+
+def test_scan_again_reruns_it(qapp):
+    runs = []
+
+    def scanner():
+        runs.append(1)
+        return a_report()
+
+    w = wizard_at(qapp, "basler", scanner=scanner)
+    w.next()
+    w.next()
+    settle_scan(w)
+    w.check.scan_btn.click()
+    settle_scan(w)
+    assert len(runs) == 2
+
+
+def test_a_scanner_that_crashes_is_reported_not_raised(qapp):
+    def scanner():
+        raise RuntimeError("pylon exploded")
+
+    w = wizard_at(qapp, "basler", scanner=scanner)
+    w.next()
+    w.next()
+    deadline = time.monotonic() + 5
+    while w.check.scanning and time.monotonic() < deadline:
+        QApplication.processEvents()
+        time.sleep(0.01)
+    QApplication.processEvents()
+    for _ in range(10):
+        QApplication.processEvents()
+        time.sleep(0.02)
+    assert "pylon exploded" in w.check.scan_view.toPlainText()
+    assert w.check.scan_btn.isEnabled()
+
+
+def test_scan_text_is_escaped_not_interpreted():
+    from council_core import basler_scan as bs
+
+    cam = bs.CameraReport("k", "<b>evil</b>", "f", "s", "USB3 Vision",
+                          "BaslerUsb", "free")
+    cam.checks = [bs.Check(bs.FAIL, "x", "<i>no</i>", "<script>")]
+    html_text = cw.render_scan(bs.ScanReport(cameras=[cam]))
+    assert "<b>evil</b>" not in html_text and "&lt;b&gt;evil" in html_text
+
+
+def test_the_scan_is_told_which_camera_the_app_has_open(clean_camera,
+                                                        tmp_path, monkeypatch):
+    """A second open of a camera the app holds fails on real hardware."""
+    monkeypatch.setattr(frame_camera._LIVE, "setup_path", tmp_path / "s.json")
+    rows = [r for r in frame_camera.list_cameras()["rows"] if r.endswith("frame")]
+    frame_camera.connect(rows[0])
+    frame_camera.setup()
+    assert cw.held_keys() == [frame_camera._LIVE.info.key]
+    frame_camera.disconnect()
+    assert cw.held_keys() == []

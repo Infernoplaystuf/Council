@@ -405,6 +405,7 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     _LIVE.reported = False
     _LIVE.network = _on_network_share(out)
     if not session.running:
+        _prepare(device, recording=True)
         try:
             session.start()
         except Exception:
@@ -685,6 +686,7 @@ def _manage_preview(want: bool) -> None:
         try:
             session.record_to(None)
             session.reset_stats()
+            _prepare(session.device, recording=False)
             session.start()
         except Exception as exc:                          # noqa: BLE001
             _LIVE.idle = f"Live preview stopped: {type(exc).__name__}: {exc}"
@@ -702,6 +704,17 @@ def _manage_preview(want: bool) -> None:
             _LIVE.previewing = False
         _LIVE.idle = "preview-off"
         _LIVE.reported = False
+
+
+def _prepare(device: Any, recording: bool) -> None:
+    """Tell the camera, before it starts, whether frames will be recorded
+    (keep every one) or only shown (the newest will do)."""
+    prepare = getattr(device, "prepare", None)
+    if callable(prepare):
+        try:
+            prepare(recording)
+        except Exception:                                 # noqa: BLE001
+            pass
 
 
 def _stop_preview(session: Any) -> None:
@@ -976,6 +989,7 @@ def setup(parent: Any = None) -> Dict[str, Any]:
 
     path = _LIVE.setup_path or _fallback_setup_path()
     _LIVE.setup_path = path
+    _tell_the_scan_what_is_open()
     if _dialogs_disabled():
         said = "Camera setup skipped — dialogs are disabled."
     else:
@@ -990,6 +1004,17 @@ def setup(parent: Any = None) -> Dict[str, Any]:
     listed = list_cameras()
     listed["summary"] = f"{said} {listed['summary']}"
     return listed
+
+
+def _tell_the_scan_what_is_open() -> None:
+    """The wizard's Basler scan must not open the camera this app already has
+    open: a second open fails on real hardware (the emulator allows it)."""
+    try:
+        from council_qt.widgets import camera_wizard
+    except Exception:                                     # noqa: BLE001
+        return
+    camera_wizard.held_keys = (
+        lambda: [_LIVE.info.key] if _LIVE.info is not None else [])
 
 
 def _first_run(app: Any) -> None:

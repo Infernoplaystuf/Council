@@ -295,6 +295,10 @@ class Device:
         Returns the rate actually in effect, 0.0 if this camera cannot say."""
         return 0.0
 
+    def prepare(self, recording: bool) -> None:
+        """Say before start() whether every frame will be RECORDED (keep them
+        all) or only shown (the newest will do). Most cameras do not care."""
+
     def start(self) -> None:
         raise NotImplementedError
 
@@ -377,14 +381,14 @@ class BaslerBackend(Backend):
         except Exception as exc:                            # noqa: BLE001
             raise CameraError(f"pylon could not enumerate: {exc}") from exc
         out: List[CameraInfo] = []
-        for dev in devices or []:
-            serial = _call(dev, "GetSerialNumber")
+        for n, dev in enumerate(devices or []):
+            props = _device_props(dev)
             out.append(CameraInfo(
                 backend=self.name,
-                key=serial or _call(dev, "GetFullName") or "?",
-                model=_call(dev, "GetModelName"),
-                serial=serial,
-                vendor=_call(dev, "GetVendorName") or "Basler",
+                key=_basler_key(props, f"#{n + 1}"),
+                model=props.get("ModelName", ""),
+                serial=props.get("SerialNumber", ""),
+                vendor=props.get("VendorName", "Basler"),
                 kind="frame"))
         return out
 
@@ -392,30 +396,60 @@ class BaslerBackend(Backend):
         pylon = self.sdk()
         tlf = pylon.TlFactory.GetInstance()
         target = None
-        for dev in tlf.EnumerateDevices() or []:
-            if (_call(dev, "GetSerialNumber") == info.key
-                    or _call(dev, "GetFullName") == info.key):
+        for n, dev in enumerate(tlf.EnumerateDevices() or []):
+            props = _device_props(dev)
+            if (_basler_key(props, f"#{n + 1}") == info.key
+                    or props.get("FullName") == info.key):
                 target = dev
                 break
         if target is None:
             raise CameraError(f"camera {info.key!r} is no longer attached")
+        cls = _device_props(target).get("DeviceClass", "")
+        if cls == "BaslerCameraLink":
+            raise CameraError(
+                f"{info.label} is a Camera Link camera: pylon can configure it "
+                f"but images come through the frame grabber's own software")
         try:
             camera = pylon.InstantCamera(tlf.CreateDevice(target))
             camera.Open()
         except Exception as exc:                            # noqa: BLE001
-            # The characteristic CoaXPress failure is the card already being
-            # held — by the pylon Viewer, or by a previous run of this app
-            # that exited without DestroyDevice. It arrives as a raw GenICam
-            # exception, which every `except CameraError` in the app misses.
-            raise CameraError(
-                f"could not open {info.label}: {exc}. On a CoaXPress camera "
-                f"this usually means something else is holding the frame "
-                f"grabber — close the pylon Viewer and try again") from exc
+            # It arrives as a raw GenICam exception, which every `except
+            # CameraError` in the app misses. The wording follows what pylon
+            # says about the camera, not a guess: the grabber is mentioned
+            # only for CoaXPress, where it is the usual cause.
+            held = _ask(tlf, "IsDeviceAccessibleInfo", target)
+            code = held[1] if isinstance(held, (tuple, list)) and len(held) > 1 else 0
+            if code in (2, 3):
+                why = ("another program is using it — close the pylon Viewer "
+                       "or other camera software and try again")
+            elif "CXP" in cls:
+                why = ("on a CoaXPress camera this usually means something "
+                       "else is holding the frame grabber — close the pylon "
+                       "Viewer and try again")
+            else:
+                why = "run the setup wizard's Basler scan to see why"
+            raise CameraError(f"could not open {info.label}: {exc}. {why}") from exc
+        # EXPLICIT, though pypylon registers it by default: pylon's
+        # AcquireContinuousConfiguration turns trigger mode off and sets
+        # continuous acquisition. Without it, a camera whose startup settings
+        # are hardware-triggered gives 0 frames and no error (measured).
+        config = getattr(getattr(pylon, "AcquireContinuousConfiguration", None),
+                         "ApplyConfiguration", None)
+        if callable(config):
+            try:
+                config(camera.GetNodeMap())
+            except Exception:                               # noqa: BLE001
+                pass
         return BaslerDevice(info, camera, pylon)
 
 
 class BaslerDevice(Device):
     """An open pylon InstantCamera."""
+
+    #: Pylon buffers while recording, as a byte budget. The grab loop hands
+    #: frames on at once, so these only ride out a hiccup; the save queue
+    #: (capture.WRITE_BUDGET_BYTES) is the big buffer.
+    RECORD_BUFFER_BYTES = 1 << 30
 
     def __init__(self, info: CameraInfo, camera: Any, pylon: Any):
         self.info = info
@@ -423,6 +457,8 @@ class BaslerDevice(Device):
         self._pylon = pylon
         self._index = 0
         self._started = False
+        self._recording = False
+        self._converters: Dict[Any, Any] = {}
 
     # -- node map helpers ------------------------------------------------
     def _node(self, name: str) -> Any:
@@ -471,6 +507,13 @@ class BaslerDevice(Device):
         except Exception:                                   # noqa: BLE001
             pass
 
+    def _first_node(self, *names: str) -> Optional[str]:
+        """The first of `names` this camera has. Basler's families disagree:
+        SFNC 2 cameras (ace 2, boost, dart, pulse, ace USB) say ExposureTime
+        and Gain; the older ace GigE says ExposureTimeAbs and GainRaw — where
+        writing ExposureTime silently did nothing."""
+        return next((n for n in names if self._node(n) is not None), None)
+
     def limits(self) -> Limits:
         def bound(name: str, getter: str, default: Any) -> Any:
             node = self._node(name)
@@ -481,6 +524,8 @@ class BaslerDevice(Device):
             except Exception:                               # noqa: BLE001
                 return default
 
+        exposure = self._first_node("ExposureTime", "ExposureTimeAbs") or "ExposureTime"
+        gain = self._first_node("Gain", "GainAbs", "GainRaw") or "Gain"
         width = int(self._value("WidthMax", 0) or bound("Width", "GetMax", 0))
         height = int(self._value("HeightMax", 0)
                      or bound("Height", "GetMax", 0))
@@ -492,10 +537,10 @@ class BaslerDevice(Device):
             inc_h=int(bound("Height", "GetInc", 1) or 1),
             min_w=int(bound("Width", "GetMin", 1) or 1),
             min_h=int(bound("Height", "GetMin", 1) or 1),
-            exposure_us=(float(bound("ExposureTime", "GetMin", 0.0)),
-                         float(bound("ExposureTime", "GetMax", 0.0))),
-            gain=(float(bound("Gain", "GetMin", 0.0)),
-                  float(bound("Gain", "GetMax", 0.0))))
+            exposure_us=(float(bound(exposure, "GetMin", 0.0)),
+                         float(bound(exposure, "GetMax", 0.0))),
+            gain=(float(bound(gain, "GetMin", 0.0)),
+                  float(bound(gain, "GetMax", 0.0))))
 
     def roi(self) -> Roi:
         return Roi(int(self._value("OffsetX", 0)),
@@ -512,6 +557,10 @@ class BaslerDevice(Device):
         overlap — which is most of the time.
         """
         wanted = fit_roi(roi, self.limits())
+        # With CenterX/CenterY on (ace), the offsets are read-only and the box
+        # silently cannot move.
+        self._try_set("CenterX", False)
+        self._try_set("CenterY", False)
         try:
             self._set("OffsetX", 0)
             self._set("OffsetY", 0)
@@ -533,20 +582,29 @@ class BaslerDevice(Device):
         """
         self._try_set("ExposureAuto", "Off")
         self._try_set("ExposureMode", "Timed")
+        name = self._first_node("ExposureTime", "ExposureTimeAbs")
+        if name is None:
+            raise CameraError("this camera has no exposure control")
         try:
-            self._set("ExposureTime", float(value))
+            self._set(name, float(value))
         except Exception as exc:                            # noqa: BLE001
             raise CameraError(f"exposure refused: {exc}") from exc
-        return float(self._value("ExposureTime", value))
+        return float(self._value(name, value))
 
     def set_gain(self, value: float) -> float:
         """Gain, with the auto loop turned off first — as for exposure."""
         self._try_set("GainAuto", "Off")
+        self._try_set("GainSelector", "All")
+        name = self._first_node("Gain", "GainAbs", "GainRaw")
+        if name is None:
+            raise CameraError("this camera has no gain control")
+        # GainRaw is an integer in the camera's own units, not dB.
+        wanted = int(round(float(value))) if name == "GainRaw" else float(value)
         try:
-            self._set("Gain", float(value))
+            self._set(name, wanted)
         except Exception as exc:                            # noqa: BLE001
             raise CameraError(f"gain refused: {exc}") from exc
-        return float(self._value("Gain", value))
+        return float(self._value(name, value))
 
     def set_frame_rate(self, fps: float) -> float:
         """Cap the camera at `fps`; 0 lifts the cap (as fast as it can).
@@ -582,8 +640,12 @@ class BaslerDevice(Device):
 
     def frame_rate(self) -> float:
         """The rate the camera says it will run at, 0.0 if it cannot say."""
-        for name in ("ResultingFrameRate", "ResultingFrameRateAbs",
-                     "AcquisitionFrameRate", "AcquisitionFrameRateAbs"):
+        # BslResultingAcquisitionFrameRate first: boost (the boA5320) and
+        # ace 2 report their achievable rate there, and would otherwise fall
+        # through to the requested cap.
+        for name in ("BslResultingAcquisitionFrameRate", "ResultingFrameRate",
+                     "ResultingFrameRateAbs", "AcquisitionFrameRate",
+                     "AcquisitionFrameRateAbs"):
             value = self._value(name, None)
             if value is not None:
                 try:
@@ -592,12 +654,32 @@ class BaslerDevice(Device):
                     continue
         return 0.0
 
+    def prepare(self, recording: bool) -> None:
+        self._recording = bool(recording)
+
     def start(self) -> None:
+        """Grab. What pylon keeps when the app falls behind depends on why:
+
+        LIVE (preview): LatestImageOnly. A live view that queues frames
+        shows an ever-growing lag and calls it live.
+
+        RECORDING: OneByOne, with enough buffers to ride out a hiccup.
+        LatestImageOnly while recording discarded frames INSIDE pylon,
+        before the app's save queue ever saw them — memory and CPU sat idle
+        while frames went missing (measured: 27 silent skips in 2 s with a
+        half-speed consumer). Anything the camera or driver still has to
+        drop is counted (Frame.meta["skipped_by_camera"]).
+        """
         if self._started:
             return
-        strategy = getattr(self._pylon, "GrabStrategy_LatestImageOnly", None)
-        # LatestImageOnly, deliberately: a live view that queues frames shows
-        # an ever-growing lag behind the sensor and calls it "live".
+        name = ("GrabStrategy_OneByOne" if self._recording
+                else "GrabStrategy_LatestImageOnly")
+        strategy = getattr(self._pylon, name, None)
+        if self._recording:
+            payload = int(self._value("PayloadSize", 0) or 0)
+            if payload > 0:
+                count = max(10, min(200, self.RECORD_BUFFER_BYTES // payload))
+                self._try_set("MaxNumBuffer", int(count))
         if strategy is None:
             self._cam.StartGrabbing()
         else:
@@ -632,23 +714,77 @@ class BaslerDevice(Device):
             if not grab.GrabSucceeded():
                 said = _call(grab, "GetErrorDescription") or "grab failed"
                 raise CameraError(str(said))
-            # NOT copied again: .Array already owns its pixels (measured — an
-            # array held across Release() and five further grabs was
-            # unchanged). The copy this line used to make was 32 MB per frame
-            # on a full-frame Mono12 boA5320.
-            image = grab.Array
+            image = self._pixels(grab)
             # A tick count, not microseconds — and the boost CXP models do
             # not support Timestamp at all, so this is 0 on a boA5320. Kept
             # because other Basler families do fill it in.
             stamp = int(_call(grab, "GetTimeStamp") or 0)
+            skipped = int(_call(grab, "GetNumberOfSkippedImages") or 0)
         finally:
             try:
                 grab.Release()
             except Exception:                               # noqa: BLE001
                 pass
         self._index += 1
+        meta: Dict[str, Any] = {"kind": "frame"}
+        if skipped:
+            meta["skipped_by_camera"] = skipped
         return Frame(image=image, index=self._index, timestamp_us=stamp,
-                     meta={"kind": "frame"})
+                     meta=meta)
+
+    def _pixels(self, grab: Any) -> Any:
+        """The frame as an array the app can show and save losslessly.
+
+        Mono8..Mono16 (packed ones unpacked by pypylon), RGB8 and raw Bayer
+        come straight from grab.Array — NOT copied again: it already owns its
+        pixels (measured; the copy this used to make was 32 MB a frame on a
+        full-frame boA5320). BGR8 is swapped to RGB. Anything pypylon cannot
+        turn into a savable array (BGRA/RGBA, YUV, 10/12-bit colour) goes
+        through pylon's ImageFormatConverter; before, grab.Array raised and
+        ended the capture, or YUV saved as a two-channel non-picture.
+        """
+        pylon = self._pylon
+        pixel_type = _call(grab, "GetPixelType")
+        array = None
+        try:
+            array = grab.Array
+        except Exception:                                   # noqa: BLE001
+            array = None
+        if array is not None and _savable(array):
+            if array.ndim == 3 and _ask(pylon, "IsBGR", pixel_type):
+                return array[..., ::-1].copy()
+            return array
+        converted = self._convert(grab, pixel_type)
+        if converted is not None:
+            return converted
+        name = (_ask(getattr(pylon, "PixelTypeMapper", None),
+                      "GetNameByPixelType", pixel_type) or str(pixel_type))
+        raise CameraError(
+            f"the camera's pixel format ({name}) cannot be saved — choose "
+            f"Mono8, Mono12 or RGB8 (the setup wizard's Basler scan lists "
+            f"what this camera offers)")
+
+    def _convert(self, grab: Any, pixel_type: Any) -> Any:
+        pylon = self._pylon
+        make = getattr(pylon, "ImageFormatConverter", None)
+        if make is None:
+            return None
+        colour = bool(_ask(pylon, "IsColorImage", pixel_type))
+        deep = (_ask(pylon, "BitDepth", pixel_type) or 8) > 8
+        target = getattr(pylon, "PixelType_RGB8packed" if colour else
+                         ("PixelType_Mono16" if deep else "PixelType_Mono8"), None)
+        if target is None:
+            return None
+        converter = self._converters.get((pixel_type, target))
+        try:
+            if converter is None:
+                converter = make()
+                converter.OutputPixelFormat = target
+                self._converters[(pixel_type, target)] = converter
+            array = converter.Convert(grab).GetArray()
+        except Exception:                                   # noqa: BLE001
+            return None
+        return array if _savable(array) else None
 
     def close(self) -> None:
         """Close the camera AND release the underlying pylon device.
@@ -740,6 +876,50 @@ class EvkBackend(Backend):
         if device is None:
             raise CameraError(f"could not open {info.key!r}")
         return EvkDevice(info, device)
+
+
+def _device_props(info: Any) -> Dict[str, str]:
+    """pylon DeviceInfo properties that are actually set. A missing one reads
+    back as the string "N/A" through Get*() (measured) — truthy, so it slipped
+    through `or` fallbacks; to_dict() lists only what is there."""
+    got = None
+    to_dict = getattr(info, "to_dict", None)
+    if callable(to_dict):
+        try:
+            got = to_dict()
+        except Exception:                                   # noqa: BLE001
+            got = None
+    if isinstance(got, dict):
+        return {str(k): str(v) for k, v in got.items() if str(v) not in ("", "N/A")}
+    out = {}
+    for key in ("SerialNumber", "FullName", "ModelName", "VendorName",
+                "DeviceClass"):
+        value = _call(info, f"Get{key}")
+        if value not in (None, "", "N/A"):
+            out[key] = str(value)
+    return out
+
+
+def _basler_key(props: Dict[str, str], fallback: str) -> str:
+    """Serial if pylon gave one, else FullName — never "N/A", which every
+    serial-less camera would share (reproduced)."""
+    for name in ("SerialNumber", "FullName"):
+        value = props.get(name, "").strip()
+        if value and value != "N/A":
+            return value
+    return fallback
+
+
+def _savable(array: Any) -> bool:
+    """What capture.write_image saves losslessly: 2-D uint8/uint16, or
+    3-channel uint8."""
+    try:
+        if array.ndim == 2:
+            return array.dtype.name in ("uint8", "uint16")
+        return (array.ndim == 3 and array.shape[2] == 3
+                and array.dtype.name == "uint8")
+    except AttributeError:
+        return False
 
 
 def _required(device: Any, *names: str) -> Any:
@@ -1390,6 +1570,20 @@ def open_camera(info: CameraInfo,
 # ======================================================================
 # Small helpers
 # ======================================================================
+def _ask(obj: Any, name: str, *args: Any) -> Any:
+    """obj.name(*args), or None if it is missing or raises. Unlike `_call`,
+    which calls with NO arguments and whose third parameter is the DEFAULT:
+    `_call(pylon, "IsBGR", pixel_type)` called IsBGR() bare, failed, and
+    returned pixel_type — truthy — so every colour frame was "BGR"."""
+    fn = getattr(obj, name, None)
+    if not callable(fn):
+        return None
+    try:
+        return fn(*args)
+    except Exception:                                       # noqa: BLE001
+        return None
+
+
 def _call(obj: Any, name: str, default: Any = "") -> Any:
     """Call an optional SDK accessor, or return `default`.
 

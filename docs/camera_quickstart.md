@@ -13,8 +13,12 @@ on a machine with a camera.
 **Basler / pypylon — verified end to end** through pylon's camera emulator
 (`PYLON_CAMEMU`): enumeration, opening, the node map, AOI, exposure, gain,
 grabbing, Mono12 → uint16, and a lossless 16-bit PNG round trip — on numpy 1.x
-and 2.x. The emulator cannot prove the CoaXPress transport itself or the
-boA5320's own node set.
+and 2.x. Every pixel format the emulator offers was grabbed and saved; colour
+order was checked against a known red picture served by the emulator (RGB8,
+BGR8 and BGRA8 all come out red-first). The **Basler scan** runs end to end on
+it. The emulator cannot prove the CoaXPress transport itself, the boA5320's
+own node set, or a card: the scan's **CoaXPress card, link and power checks
+come from Basler's documentation and are untested** until a card is fitted.
 
 **Prophesee / Metavision — verified against a real Metavision build, not a
 camera.** OpenEB was built from source and the backend driven through a
@@ -129,6 +133,8 @@ The first time, a **Camera setup** wizard opens over the window:
    `✗ Missing`, each with the step that fixes it. **Check again** after
    installing.
 
+For a Basler, the same page also runs **Scan Basler cameras** — see below.
+
 **Finish** is never blocked — finish before the camera is even unpacked if you
 like. The choice is saved beside `app.py` as `camera_setup.json`; cancelling
 saves nothing, so it is offered again next launch. **Camera setup…** (next to
@@ -140,6 +146,53 @@ simulated cameras, which are always there for trying things out), so the
 
 No camera yet? Set `PYLON_CAMEMU=2` before starting the app and pylon presents
 two emulated Basler cameras — the whole workflow can be tried without hardware.
+
+### Scan Basler cameras
+
+Runs by itself when the wizard reaches its check page with Basler chosen, and
+again from its button. Every Basler camera this PC can see gets a verdict —
+**✓ Ready to capture**, **⚠ Works, with limits** or **✗ Will not work yet** —
+and every check under it says what it found and, for a problem, *what to do*.
+It takes about a second plus a fraction of a second per camera, off the
+window's thread.
+
+**The PC first** (top of the report):
+
+- which pylon interfaces exist — no CoaXPress means a boA5320 cannot appear;
+  with a CoaXPress card fitted that is a failure, not a warning
+- a Basler USB camera or CXP card that **Windows has a driver problem with** —
+  pylon cannot see those at all, so without this check the scan could only say
+  "none found"
+- the CXP card's **PCIe slot**: a slot with fewer lanes (or an older
+  generation) than the card returns incomplete full frames at speed
+- camera software **installed after the app started** — close the app (and
+  the terminal it came from) and start it again
+- the card itself: its applet, over-current on a port, cameras it is only
+  *simulating*, and whether its 6-pin power is connected
+
+**Then each camera**, found without opening it: interface, family, and
+whether it can work at all — **Camera Link** (pylon only configures it; the
+images come through the grabber maker's software), **3D** cameras, a GigE
+camera on **another subnet** (found anyway: pylon's normal listing hides
+those), one **in use** by another program, or one already **connected in
+Typhon** (reported, never opened twice).
+
+**Then opened as it is** — pylon's usual clean-up is held back so the scan
+sees what the camera will really start with: trigger mode on any selector,
+acquisition mode, exposure mode and auto exposure, the frame-rate limit and
+what the camera expects to reach, exposure longer than a second, the pixel
+format (and every format it offers, judged by what Typhon actually saves),
+link speed — USB speed, **the CoaXPress link against the one the camera is made
+for** (a boA5320-150 reaches 149.81 fps full frame on 2 links, 75.71 on 1 link
+with its own power, 38.09 on 1 link powered over CXP), throughput limits, the
+GigE driver and packet size — test pattern, binning, a centred area, the
+startup user set, the card's pixel format and applet, temperature.
+
+**Then a test grab**, run the way Typhon runs the camera, for at most about two
+seconds: frames arrive, none fail, no buffers lost. A camera limited to under
+one frame every two seconds is not test-grabbed; it is reported instead, since
+the live view will be that slow too. The camera is **released** afterwards —
+Typhon can connect straight away.
 
 ## Using it
 
@@ -288,6 +341,12 @@ the camera, which would cut the `.raw` short, so Typhon refuses.)
 
 `60.0 fps · 242 grabbed · 157 not drawn (screen only) · 242 saved`
 
+- **lost by the camera/driver** (Basler) counts frames pylon itself threw away
+  before the app saw them — invisible before this. While **recording**, pylon
+  queues frames (about 1 GB of them) instead of keeping only the newest, so
+  this should stay at zero; it can appear in the live view, which only ever
+  wants the newest frame. If it grows while recording, the link or the PC
+  cannot keep up — the Basler scan's link checks say which.
 - **not drawn (screen only)** counts frames the *screen* did not redraw — the
   display shows about 30 a second, whatever the camera does. Normal and
   deliberate; **every one of them is still saved.** Only **NOT saved** means
@@ -309,7 +368,17 @@ the capture with one clear message rather than an endless stream of errors.
 ## Pixel depth
 
 A Mono12 frame arrives as `uint16` holding 0–4095 and is saved as a 16-bit PNG
-with those values **unaltered** (verified lossless). One known consequence:
+with those values **unaltered** (verified lossless).
+
+| Basler pixel format | Saved as |
+|---|---|
+| Mono8, Mono10/12/16 (and their packed forms) | 8- or 16-bit grey PNG, lossless |
+| RGB8, BGR8 | colour PNG, lossless — BGR8 is put red-first as it is saved |
+| Bayer (colour cameras' raw) | the raw mosaic as a grey PNG — lossless, not in colour |
+| BGRA8, RGB16, YUV, 10/12-bit colour | converted to 8-bit RGB as each frame is saved (extra CPU; 16-bit colour loses its low bits) |
+| anything pylon cannot convert | the capture stops with a message naming the format |
+
+The Basler scan shows this for every format the connected camera offers. One known consequence:
 `frame_classes.thumbnail` scales 16-bit input as if it filled the full range,
 so a 12-bit frame reads dark *to the classifier*.
 
@@ -317,7 +386,8 @@ so a 12-bit frame reads dark *to the classifier*.
 
 | What you see | What it means |
 |---|---|
-| Basler: empty camera list | Rerun **Camera setup…** and read the Check page. For a boA5320 it is almost always missing CoaXPress support. |
+| Basler: empty camera list | Rerun **Camera setup…** and read the **Basler scan** at the top: missing CoaXPress support, a driver problem, a card in the wrong slot or without power, a GigE camera on another subnet. |
+| Basler: `lost by the camera/driver` in the status line | pylon dropped frames before the app got them. Zero while recording is normal; if not, run the Basler scan and read the link checks (CXP cables and applet, USB port, GigE packet size and driver). |
 | "could not open … something else is holding the frame grabber" | The pylon Viewer, or a previous run, still owns the card. Close it. |
 | EVK4: empty list with the camera plugged in | The USB driver, almost always (Prophesee step 3). The SDK cannot tell "no driver" from "no camera" — both are an empty list. Other causes that look identical: Metavision Studio or another program has the camera open (close it); on an OpenEB build, `MV_HAL_PLUGIN_PATH` not set or `libusb-1.0.dll` not on `PATH` (run the build's `utils\scripts\setup_env.bat` first); camera firmware older than 3.8. |
 | EVK4: finding out *why* it was skipped | Start the app with `MV_LOG_LEVEL=TRACE` set and read the console — the SDK only explains a skipped camera there. |

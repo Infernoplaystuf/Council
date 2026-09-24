@@ -32,13 +32,13 @@ import html
 import os
 import sys
 import threading
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (QButtonGroup, QHBoxLayout, QLabel, QPushButton,
-                               QRadioButton, QVBoxLayout, QWidget, QWizard,
-                               QWizardPage)
+                               QRadioButton, QTextBrowser, QVBoxLayout, QWidget,
+                               QWizard, QWizardPage)
 
 from council_core import camera_setup as cs
 
@@ -142,9 +142,19 @@ class InstallPage(QWizardPage):
 
 
 class CheckPage(QWizardPage):
-    def __init__(self, checker: Callable[[str], "cs.Readiness"]):
+    """Is the software installed — and, for a Basler, every camera it can see
+    and whether each will actually run (council_core.basler_scan).
+
+    BOTH RUN OFF THE UI THREAD and are collected on a timer, the same pull
+    the live view uses: pylon walks every transport layer (GigE discovery
+    alone is ~255 ms) and the scan opens each camera and test-grabs from it.
+    """
+
+    def __init__(self, checker: Callable[[str], "cs.Readiness"],
+                 scanner: Optional[Callable[[], Any]] = None):
         super().__init__()
         self.checker = checker
+        self.scanner = scanner or _default_scanner
         self.setTitle("Is everything installed?")
         self.setSubTitle("This asks the installed software what it can "
                          "actually do.")
@@ -162,20 +172,83 @@ class CheckPage(QWizardPage):
         self.again_btn = QPushButton("Check again")
         self.again_btn.clicked.connect(self.run_check)
         row.addWidget(self.again_btn)
+        self.scan_btn = QPushButton("Scan Basler cameras")
+        self.scan_btn.setToolTip(
+            "Every Basler camera this PC can see, and whether each one will "
+            "run: interface, drivers, link, pixel format, trigger mode, and "
+            "a short test grab.")
+        self.scan_btn.clicked.connect(self.run_scan)
+        row.addWidget(self.scan_btn)
         row.addStretch(1)
         layout.addLayout(row)
-        layout.addStretch(1)
+        # The large field the scan fills: one block per camera, every check
+        # with its fix. Scrolls; selectable so a fix can be copied.
+        self.scan_view = QTextBrowser()
+        self.scan_view.setOpenExternalLinks(False)
+        self.scan_view.setMinimumHeight(300)
+        layout.addWidget(self.scan_view, 1)
 
         self.readiness: Optional[cs.Readiness] = None
+        self.scan_report: Any = None
         self._slot: list = []
+        self._scan_slot: list = []
         self._lock = threading.Lock()
         self._timer = QTimer(self)
         self._timer.setInterval(POLL_MS)
         self._timer.timeout.connect(self._collect)
+        self._scan_timer = QTimer(self)
+        self._scan_timer.setInterval(POLL_MS)
+        self._scan_timer.timeout.connect(self._collect_scan)
         self._worker: Optional[threading.Thread] = None
+        self._scan_worker: Optional[threading.Thread] = None
 
     def initializePage(self) -> None:                      # noqa: N802
+        basler = self.wizard().choice() == "basler"
+        self.scan_btn.setVisible(basler)
+        self.scan_view.setVisible(basler)
         self.run_check()
+        if basler:
+            self.run_scan()
+
+    @property
+    def scanning(self) -> bool:
+        return self._scan_worker is not None and self._scan_worker.is_alive()
+
+    def run_scan(self) -> None:
+        if self.scanning:
+            return
+        self.scan_report = None
+        self.scan_view.setHtml("<p><i>Scanning for Basler cameras — each one "
+                               "is opened briefly and test-grabbed…</i></p>")
+        self.scan_btn.setEnabled(False)
+
+        def work() -> None:
+            try:
+                got = self.scanner()
+            except Exception as exc:                        # noqa: BLE001
+                got = exc
+            with self._lock:
+                self._scan_slot.append(got)
+
+        self._scan_worker = threading.Thread(target=work, daemon=True,
+                                             name="basler-scan")
+        self._scan_worker.start()
+        self._scan_timer.start()
+
+    def _collect_scan(self) -> None:
+        with self._lock:
+            got = self._scan_slot.pop() if self._scan_slot else None
+        if got is None:
+            return
+        self._scan_timer.stop()
+        self.scan_btn.setEnabled(True)
+        if isinstance(got, Exception):
+            self.scan_view.setHtml(
+                f"<p><b>The scan itself failed:</b> "
+                f"{html.escape(type(got).__name__)}: {html.escape(str(got))}</p>")
+            return
+        self.scan_report = got
+        self.scan_view.setHtml(render_scan(got))
 
     @property
     def checking(self) -> bool:
@@ -227,7 +300,8 @@ class CameraSetupWizard(QWizard):
     def __init__(self, parent: Optional[QWidget] = None, *,
                  app_name: str = "", current: Optional[str] = None,
                  checker: Optional[Callable[[str], "cs.Readiness"]] = None,
-                 python: Optional[str] = None):
+                 python: Optional[str] = None,
+                 scanner: Optional[Callable[[], Any]] = None):
         super().__init__(parent)
         self.setWindowTitle(f"{app_name} — camera setup" if app_name
                             else "Camera setup")
@@ -235,10 +309,10 @@ class CameraSetupWizard(QWizard):
         # and behaves differently offscreen, which is where it is tested.
         self.setWizardStyle(QWizard.WizardStyle.ModernStyle)
         self.setOption(QWizard.WizardOption.NoBackButtonOnStartPage, True)
-        self.setMinimumSize(640, 480)
+        self.setMinimumSize(760, 640)
         self.choose = ChoosePage(current)
         self.install = InstallPage(python or sys.executable)
-        self.check = CheckPage(checker or cs.check)
+        self.check = CheckPage(checker or cs.check, scanner)
         for page in (self.choose, self.install, self.check):
             self.addPage(page)
 
@@ -287,6 +361,93 @@ def render_steps(g: "cs.Guide") -> str:
                      f"padding:2px 4px'>{lines}</code>")
         items.append(f"<li style='margin-bottom:8px'>{body}</li>")
     return f"<ol>{''.join(items)}</ol>"
+
+
+#: The scan's levels, marked like the checks above: symbol and word first.
+SCAN_MARKS = {
+    "pass": ("✓", "OK", "#2da44e"),
+    "warn": ("⚠", "Warning", "#c69026"),
+    "fail": ("✗", "Problem", "#e5534b"),
+    "info": ("·", "Note", "#8b949e"),
+}
+VERDICT_MARKS = {
+    "works": ("✓", "Ready to capture", "#2da44e"),
+    "works with limits": ("⚠", "Works, with limits", "#c69026"),
+    "will not work": ("✗", "Will not work yet", "#e5534b"),
+}
+
+
+#: Who is holding a camera open in this app right now — the scan must not
+#: try to open it again (a second open fails on real hardware).
+held_keys: Callable[[], List[str]] = lambda: []
+
+
+def _default_scanner() -> Any:
+    from council_core import basler_scan
+
+    return basler_scan.scan(held_keys=held_keys())
+
+
+def _scan_line(c: Any) -> str:
+    symbol, word, colour = SCAN_MARKS.get(c.level, SCAN_MARKS["info"])
+    line = (f"<span style='color:{colour}'><b>{symbol} {word}</b></span>"
+            f" &nbsp;<b>{html.escape(c.label)}</b>")
+    if c.detail:
+        line += f" — {html.escape(c.detail)}"
+    out = f"<p style='margin:0 0 2px 0'>{line}</p>"
+    if c.fix and c.level in ("warn", "fail"):
+        out += (f"<p style='margin:0 0 4px 26px'><i>What to do:</i> "
+                f"{html.escape(c.fix)}</p>")
+    return out
+
+
+def _capability_line(caps: Dict[str, Any]) -> str:
+    bits = []
+    sensor = caps.get("max") or (None, None)
+    if sensor[0]:
+        bits.append(f"sensor {sensor[0]}×{sensor[1]}")
+    aoi = caps.get("aoi") or ()
+    if aoi and aoi[0]:
+        bits.append(f"area {aoi[0]}×{aoi[1]}")
+    formats = caps.get("formats") or {}
+    good = [f for f, (v, _) in formats.items() if v == "yes"]
+    if good:
+        bits.append("saves " + ", ".join(good[:6]) + ("…" if len(good) > 6 else ""))
+    rng = caps.get("exposure_range")
+    if rng:
+        bits.append(f"exposure {rng[0]:g}–{rng[1]:g} µs")
+    rng = caps.get("gain_range")
+    if rng:
+        bits.append(f"gain {rng[0]:g}–{rng[1]:g}")
+    if caps.get("resulting_fps"):
+        bits.append(f"up to {caps['resulting_fps']:.1f} fps")
+    return " · ".join(bits)
+
+
+def render_scan(report: Any) -> str:
+    """The scan as one readable page: the machine first, then each camera
+    with its verdict, every check, and what to do about each problem."""
+    parts = [f"<p><b>{html.escape(report.summary())}</b>"
+             + (f" &nbsp;<span style='color:#8b949e'>(pylon "
+                f"{html.escape(report.pylon_version)}, "
+                f"{report.seconds:.1f} s)</span>" if report.pylon_version else "")
+             + "</p>"]
+    for note in report.notes:
+        parts.append(_scan_line(note))
+    for cam in report.cameras:
+        symbol, word, colour = VERDICT_MARKS.get(
+            cam.verdict, VERDICT_MARKS["will not work"])
+        parts.append("<hr>")
+        parts.append(f"<p style='margin:4px 0'><span style='color:{colour}; "
+                     f"font-size:14px'><b>{symbol} {word}</b></span> &nbsp; "
+                     f"<b>{html.escape(cam.label)}</b></p>")
+        caps = _capability_line(cam.capabilities)
+        if caps:
+            parts.append(f"<p style='margin:0 0 6px 0; color:#8b949e'>"
+                         f"{html.escape(caps)}</p>")
+        for c in cam.checks:
+            parts.append(_scan_line(c))
+    return "".join(parts)
 
 
 def render_checks(r: "cs.Readiness") -> str:

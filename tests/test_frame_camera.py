@@ -1105,3 +1105,38 @@ def test_the_status_line_says_display_drops_are_screen_only(tmp_path):
     frame_camera.stop()
     assert "not drawn (screen only)" in said[-1]
     assert "dropped" not in said[-1]
+
+
+
+# ======================================================================
+# The camera is told whether a start is a recording
+# ======================================================================
+class PreparedCamera(cameras.SyntheticDevice):
+    def __init__(self, info):
+        super().__init__(info)
+        self.prepared = []
+
+    def prepare(self, recording):
+        self.prepared.append(recording)
+
+
+def connected_prepared():
+    from council_core import capture
+
+    info = cameras.CameraInfo("simulated", "sim-prep", kind="frame")
+    device = PreparedCamera(info)
+    with frame_camera._LOCK:
+        frame_camera._LIVE.device = device
+        frame_camera._LIVE.info = info
+        frame_camera._LIVE.session = capture.CaptureSession(device)
+        frame_camera._LIVE.reported = True
+    return device
+
+
+def test_a_capture_starts_the_camera_as_a_recording(tmp_path):
+    """A Basler then keeps every frame (OneByOne) instead of the newest."""
+    device = connected_prepared()
+    ticks(ViewerStub(), seconds=0.2)                  # the preview
+    frame_camera.start(str(tmp_path))
+    frame_camera.stop()
+    assert device.prepared == [False, True]

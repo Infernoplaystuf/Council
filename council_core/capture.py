@@ -71,6 +71,9 @@ class Stats:
     skipped: int = 0
     #: Frames grabbed and queued, not yet on disk.
     waiting: int = 0
+    #: Frames the camera or its driver dropped before the app ever saw them
+    #: (pylon's skipped-image count). Real loss, unlike `dropped`.
+    camera_skipped: int = 0
 
     def line(self, dropped_label: str = "dropped") -> str:
         """The one line a status bar shows.
@@ -89,6 +92,8 @@ class Stats:
             bits.append(f"{self.waiting} waiting to save")
         if self.skipped:
             bits.append(f"{self.skipped} NOT saved (storage too slow)")
+        if self.camera_skipped:
+            bits.append(f"{self.camera_skipped} lost by the camera/driver")
         if self.errors:
             bits.append(f"{self.errors} error(s)")
         return " · ".join(bits)
@@ -802,8 +807,10 @@ class CaptureSession:
             # Recorded and counted as one step (see record_to's `reset`).
             # submit() only queues, so the lock is held for microseconds.
             self._record(frame)
+            lost = int((frame.meta or {}).get("skipped_by_camera", 0) or 0)
             self._stats = replace(
                 self._stats, grabbed=self._stats.grabbed + 1,
+                camera_skipped=self._stats.camera_skipped + lost,
                 rate=self._rate())
         self.mailbox.put(frame)
         if self.on_frame is not None:
