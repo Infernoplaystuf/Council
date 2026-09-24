@@ -837,7 +837,25 @@ def _widget_imports(kinds) -> set:
 # app.py — hand-written, created once, never rewritten
 # ============================================================
 
+def links_frame_camera(spec: Spec) -> bool:
+    """Whether any widget's script link calls into frame_camera."""
+    return any((getattr(w, "script", None) or {}).get("module") == "frame_camera"
+               for w in spec.widgets)
+
+
+#: What app.py gains when the wireframe drives a camera. Emitted rather than
+#: left to the user because the live view AND the first-run camera setup
+#: wizard both start here — an app that needs a hand edit before it can show
+#: its own setup wizard has not really got one.
+FRAME_CAMERA_ATTACH = '''
+        # The live camera view, and the camera setup wizard on first run.
+        # Written because this wireframe links buttons to frame_camera.
+        import frame_camera
+        frame_camera.attach(self)'''
+
+
 def emit_app_py(spec: Spec) -> str:
+    attach = FRAME_CAMERA_ATTACH if links_frame_camera(spec) else ""
     return f'''"""Hand-written application code for {spec.project}.
 
 This file is created ONCE and never rewritten by the designer. Put behaviour
@@ -862,7 +880,7 @@ from ui.main_ui import MainUi
 
 class App(HandlerMixin, MainUi):
     def __init__(self, parent=None, **kw):
-        super().__init__(parent)
+        super().__init__(parent){attach}
 
 
 def main() -> None:

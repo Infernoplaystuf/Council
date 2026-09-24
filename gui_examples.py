@@ -111,6 +111,22 @@ NOTES: Dict[str, str] = {
         "cropped afterwards. The live view itself needs one line in app.py: "
         "`frame_camera.attach(self)`."
     ),
+    "barbie_capture_v5": (
+        "v4 with a camera setup wizard. Generate it for Qt (`--target qt`). "
+        "On first run it asks which camera the app is for — Basler or a "
+        "Prophesee EVK4 — shows what to install, with the exact command for "
+        "the Python the app runs under, and then checks the installed "
+        "software can actually reach that camera. `Camera setup…` reruns it. "
+        "Shows: a button whose script link takes NO inputs and refreshes "
+        "three ports from one call; app.py written with "
+        "`frame_camera.attach(self)` already in it, because the wireframe "
+        "links frame_camera."
+    ),
+    "typhon": (
+        "Barbie Capture v5 under another name, in #045f80. Same layout, "
+        "same wiring, same setup wizard; white text on this teal measures "
+        "7.1:1 against the pink's 3.0:1. Generate it for Qt (`--target qt`)."
+    ),
 }
 
 # The examples sent to a model when none is named. The newest version teaches

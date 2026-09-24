@@ -84,6 +84,9 @@ class _Live:
         self.found = None          # the last scan, for resolving a choice
         self.folder: Optional[Path] = None
         self.run = ""
+        #: camera_setup.json for the attached app. Survives disconnect: it
+        #: is about the app, not about the open camera.
+        self.setup_path: Optional[Path] = None
 
     def clear(self) -> None:
         self.device = None
@@ -110,7 +113,7 @@ def list_cameras() -> Dict[str, Any]:
     """
     from council_core import cameras
 
-    found = cameras.discover()
+    found = cameras.discover(_backends_for(current_choice()))
     _LIVE.found = found
     rows = [_row(i, c) for i, c in enumerate(found.cameras)]
     # A LIST, not a joined string. These go to a listbox port, whose
@@ -123,6 +126,23 @@ def list_cameras() -> Dict[str, Any]:
     else:
         summary = "No cameras found — see the notes."
     return {"rows": rows, "summary": summary, "notes": notes}
+
+
+def _backends_for(choice: Optional[str]):
+    """The backends to search for a set-up app, or None for all of them.
+
+    An app set up for a Basler has no business reporting that the Metavision
+    SDK is missing — that note is noise to someone who will never plug in an
+    event camera. The simulated cameras stay in every list: they are how the
+    app is explored before the hardware arrives.
+    """
+    from council_core import cameras
+
+    if choice == "basler":
+        return [cameras.BaslerBackend(), cameras.SyntheticBackend()]
+    if choice == "prophesee":
+        return [cameras.EvkBackend(), cameras.SyntheticBackend()]
+    return None
 
 
 def _picked(selection: Any) -> str:
@@ -343,7 +363,8 @@ def pump(show: Callable[[Any], Any],
 
 def attach(app: Any, view: str = "live_view",
            status: str = "capture_status",
-           interval_ms: int = LIVE_MS) -> Any:
+           interval_ms: int = LIVE_MS, first_run: bool = True,
+           wizard: Optional[Callable[[Any], Any]] = None) -> Any:
     """Start the live view. ONE line in app.py, which is never regenerated::
 
         class App(HandlerMixin, MainUi):
@@ -360,6 +381,18 @@ def attach(app: Any, view: str = "live_view",
     CALL IT FROM THE UI THREAD. It creates a QTimer, and a QTimer created on a
     worker belongs to that worker's event loop — which a grab thread does not
     have, so it would simply never fire. `App.__init__` is the UI thread.
+
+    SAFE TO CALL TWICE. Projects generated now get this line written into
+    app.py for them; projects generated earlier had it added by hand, and a
+    user following the old instructions on a new project would add it a
+    second time. The second call returns the first timer rather than
+    starting two live views and two setup wizards.
+
+    FIRST RUN. If this app has never been set up, the camera setup wizard
+    opens once the window is up — which camera, what to install, and a check
+    that it is installed. Cancelling it means it is offered again next time.
+    `first_run=False` or COUNCIL_NO_DIALOGS skips it; `wizard` replaces it,
+    so a test can see it scheduled without a window appearing.
     """
     from PySide6.QtCore import QTimer
 
@@ -368,6 +401,12 @@ def attach(app: Any, view: str = "live_view",
     if not callable(show):
         raise RuntimeError(f"the {view!r} port is not an image canvas")
     say = getattr(_port(app, status), "set", None) if status else None
+
+    # Checked AFTER the arguments: a second call is harmless, a wrong one is
+    # still wrong.
+    held = getattr(app, "_frame_camera_live", None)
+    if held is not None:
+        return held
 
     timer = QTimer(app)
     timer.setInterval(int(interval_ms))
@@ -380,7 +419,6 @@ def attach(app: Any, view: str = "live_view",
 
     # A grab thread that outlives its window crashes the application on exit.
     # Joining it is not the app author's job to remember.
-    instance = getattr(app, "parent", None)
     try:
         from PySide6.QtWidgets import QApplication
         running = QApplication.instance()
@@ -388,7 +426,93 @@ def attach(app: Any, view: str = "live_view",
             running.aboutToQuit.connect(shutdown)
     except Exception:                                     # noqa: BLE001
         pass
+
+    _LIVE.setup_path = _setup_path_for(app)
+    if first_run and current_choice() is None and not _dialogs_disabled():
+        # After the window is up, not inside __init__: a modal dialog opened
+        # while the main window is still being built has no window on screen
+        # to sit over.
+        QTimer.singleShot(0, lambda: (wizard or _first_run)(app))
     return timer
+
+
+# ======================================================================
+# Camera setup — which camera this app is for, and what it needs
+# ======================================================================
+def current_choice() -> Optional[str]:
+    """The camera this app is set up for ("basler", "prophesee") or None."""
+    from council_core import camera_setup
+
+    path = _LIVE.setup_path
+    return camera_setup.load_choice(path) if path is not None else None
+
+
+def setup(parent: Any = None) -> Dict[str, Any]:
+    """Run the camera setup wizard, then list the chosen camera's devices.
+
+    Script-linkable: a "Camera setup…" button calls this with no inputs and
+    gets the same rows/notes/summary a scan returns, so finishing the wizard
+    refreshes the camera list for the camera just chosen.
+    """
+    from council_core import camera_setup
+
+    path = _LIVE.setup_path or _fallback_setup_path()
+    _LIVE.setup_path = path
+    if _dialogs_disabled():
+        said = "Camera setup skipped — dialogs are disabled."
+    else:
+        from PySide6.QtWidgets import QApplication
+        from council_qt.widgets import camera_wizard
+
+        window = parent or QApplication.activeWindow()
+        title = window.windowTitle() if window is not None else ""
+        chosen = camera_wizard.run_wizard(window, path, app_name=title)
+        said = (f"Set up for {camera_setup.label(chosen)}." if chosen else
+                "Camera setup cancelled — nothing changed.")
+    listed = list_cameras()
+    listed["summary"] = f"{said} {listed['summary']}"
+    return listed
+
+
+def _first_run(app: Any) -> None:
+    """The wizard, then the camera list it implies, straight into the panel."""
+    out = setup(parent=app)
+    for port, key in (("cameras", "rows"), ("camera_notes", "notes"),
+                      ("capture_status", "summary")):
+        target = getattr(getattr(app, "ports", None), port, None)
+        if target is not None:
+            try:
+                target.set(out[key])
+            except Exception:                             # noqa: BLE001
+                pass
+
+
+def _setup_path_for(app: Any) -> Path:
+    """camera_setup.json beside the app's own app.py."""
+    import inspect
+
+    from council_core import camera_setup
+
+    try:
+        return camera_setup.setup_path(
+            Path(inspect.getfile(type(app))).resolve().parent)
+    except (TypeError, OSError):
+        return _fallback_setup_path()
+
+
+def _fallback_setup_path() -> Path:
+    """Beside the script that was run: a generated app's main.py."""
+    import sys
+
+    from council_core import camera_setup
+
+    return camera_setup.setup_path(Path(sys.argv[0] or ".").resolve().parent)
+
+
+def _dialogs_disabled() -> bool:
+    import os
+
+    return bool(os.environ.get("COUNCIL_NO_DIALOGS"))
 
 
 def _port(app: Any, name: str) -> Any:
