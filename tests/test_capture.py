@@ -313,6 +313,53 @@ def test_a_camera_error_is_counted_and_the_loop_carries_on():
     assert stats.grabbed >= 2, "the loop gave up after a recoverable error"
 
 
+def test_a_finished_stream_ends_the_loop_instead_of_spinning():
+    """CameraEnded is NOT "try the next frame".
+
+    Measured against a real Metavision recording: treating the end of a
+    stream as recoverable logged 737,070 errors in six seconds, because
+    every subsequent read raised the same thing as fast as the CPU allowed.
+    """
+    script = [cameras.CameraEnded("the stream ended")]
+    session = CaptureSession(FakeDevice(script=script, total=0))
+    session.start()
+    time.sleep(0.15)
+    assert session.running is False, "the loop carried on past the end"
+    assert session.stats().errors == 1, session.stats()
+    assert "ended" in session.stats().last_error
+
+
+def test_an_endless_run_of_errors_gives_up():
+    """A fault that repeats every read must not spin for ever either."""
+    class AlwaysFails(FakeDevice):
+        def read(self, timeout_ms=1000):
+            raise cameras.CameraError("still broken")
+
+    session = CaptureSession(AlwaysFails())
+    session.start()
+    time.sleep(0.5)
+    session.stop()
+    assert session.running is False
+    # Capped, not unbounded: the cap plus the one line that reports giving up.
+    assert session.stats().errors <= capture.MAX_CONSECUTIVE_ERRORS + 1
+    assert "giving up" in session.stats().last_error
+
+
+def test_a_good_frame_forgives_earlier_failures():
+    """The cap counts CONSECUTIVE failures, not failures for all time.
+
+    A camera that hiccups once a minute for an hour is still working.
+    """
+    script = ([cameras.CameraError("blip")] * 10 + [frame(1)]
+              + [cameras.CameraError("blip")] * 10 + [frame(2)])
+    session = CaptureSession(FakeDevice(script=script, total=0))
+    session.start()
+    time.sleep(0.3)
+    session.stop()
+    assert session.stats().grabbed >= 2, "the cap ended a recoverable run"
+    assert "giving up" not in session.stats().last_error
+
+
 def test_an_unexpected_exception_ends_the_loop_but_reports_first():
     session = CaptureSession(FakeDevice(script=[RuntimeError("sdk blew up")]))
     session.start()

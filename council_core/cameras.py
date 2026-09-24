@@ -76,6 +76,17 @@ class CameraError(Exception):
     """A camera could not do what was asked."""
 
 
+class CameraEnded(CameraError):
+    """The source is FINISHED — not "this grab failed, try again".
+
+    A grab loop's natural reflex is to carry on after an error, and for one
+    bad frame that is right. For a camera that has been unplugged, or a
+    recording that has run out, every subsequent read raises the same thing
+    and "carry on" becomes a spin. Measured: 737,070 errors in six seconds
+    when a finished recording was treated as recoverable.
+    """
+
+
 # ======================================================================
 # Value types
 # ======================================================================
@@ -876,7 +887,7 @@ class EvkDevice(Device):
         buffers = self._drain()
         if not buffers:
             if self._ended:
-                raise CameraError(
+                raise CameraEnded(
                     "the event stream ended — the recording finished, or the "
                     "camera was disconnected")
             return None

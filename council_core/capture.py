@@ -43,6 +43,10 @@ STOP_TIMEOUT = 3.0
 #: The window the measured rate is averaged over, in seconds.
 RATE_WINDOW = 1.0
 
+#: How many consecutive failed reads end a capture. A backstop for any fault
+#: that repeats every time rather than clearing.
+MAX_CONSECUTIVE_ERRORS = 50
+
 
 @dataclass(frozen=True)
 class Stats:
@@ -283,11 +287,28 @@ class CaptureSession:
 
     # ------------------------------------------------------------------
     def _loop(self) -> None:
+        misses = 0
         while not self._stopping.is_set():
             try:
                 frame = self.device.read(self.timeout_ms)
-            except cameras.CameraError as exc:
+            except cameras.CameraEnded as exc:
+                # NOT recoverable. The camera is gone or the recording is
+                # over, so every further read raises the same thing.
                 self._note_error(str(exc))
+                break
+            except cameras.CameraError as exc:
+                # One bad grab is not a reason to end a capture — but an
+                # endless run of them is. Without this cap a fault that
+                # repeats every read spins the loop as fast as the CPU
+                # allows, which is how a finished stream logged 737,070
+                # errors in six seconds.
+                misses += 1
+                self._note_error(str(exc))
+                if misses >= MAX_CONSECUTIVE_ERRORS:
+                    self._note_error(
+                        f"giving up after {misses} failed reads in a row: "
+                        f"{exc}")
+                    break
                 continue
             except Exception as exc:                        # noqa: BLE001
                 # An SDK raising something unexpected ends the loop rather
@@ -296,6 +317,7 @@ class CaptureSession:
                 break
             if frame is None:
                 continue
+            misses = 0
             self._took(frame)
 
     def _took(self, frame: cameras.Frame) -> None:
