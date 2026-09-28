@@ -18,6 +18,7 @@ default tabs, then the Designer, then advanced.
 from __future__ import annotations
 
 from .agents import build_agents
+from .apothecary import build_apothecary
 from .capture import build_capture
 from .council import build_council
 from .designer import build_designer
@@ -66,6 +67,7 @@ ADVANCED_REGISTRY = [
     ("📚 Librarian", build_librarian, False),
     ("🖧 Nodes", build_nodes, False),
     ("🤖 Agents", build_agents, False),
+    ("🔧 Apothecary", build_apothecary, False),
     ("🩺 Vault Health", build_vault_health, False),
 ]
 
@@ -76,9 +78,10 @@ def registry(advanced: bool = False):
 
 
 __all__ = ["REGISTRY", "ADVANCED_REGISTRY", "registry", "build_agents",
+           "build_apothecary",
            "build_capture",
            "build_changelog", "build_council", "build_librarian", "build_ide", "build_nodes", "build_vault_health",
-           "build_designer", "build_diagnostics","build_forge", "build_grapher",
+           "build_designer", "build_diagnostics", "build_forge", "build_grapher",
            "build_jobs",
            "build_lens", "build_models", "build_sessions",
            "build_specialists", "build_speech", "build_vault"]

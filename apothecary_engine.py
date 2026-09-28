@@ -573,6 +573,14 @@ class ApothecaryEngine:
                     raise TimeoutError(f"Command timed out after {timeout_s}s.")
                 time.sleep(0.05)
 
+            # Drain what is still buffered. The loop reads at most one 4 KB
+            # chunk per pass, so a command that had already exited got one
+            # read and everything past 4096 bytes was silently dropped.
+            while chan.recv_ready():
+                stdout_chunks.append(chan.recv(4096).decode("utf-8", errors="replace"))
+            while chan.recv_stderr_ready():
+                stderr_chunks.append(chan.recv_stderr(4096).decode("utf-8", errors="replace"))
+
             rc = chan.recv_exit_status()
             stdout = "".join(stdout_chunks)
             stderr = "".join(stderr_chunks)
@@ -703,29 +711,41 @@ class PiHealthMonitor:
         Called by the dispatcher whenever a Pi node handles a request.
         Keeps the last 50 entries per node.
         """
+        # This called self._get / self.upsert_node — Apothecary's methods, not
+        # this class's — inside `except Exception: pass`, so every call was a
+        # silent no-op and the Model Inventory call log was always empty.
         try:
-            node = self._get(node_name)
+            node = next((n for n in self.registry.list_nodes()
+                         if n.name == node_name), None)
+            if node is None:
+                return
             entry = {"ts": now_iso(), "model": model, "role": role}
             if not isinstance(node.model_log, list):
                 node.model_log = []
             node.model_log.append(entry)
             node.model_log = node.model_log[-50:]  # keep last 50
             node.active_model = model
-            self.upsert_node(node)
+            self.registry.upsert(node)
         except Exception:
             pass
 
     def refresh_installed_models(self, node: NodeEntry,
-                                  password_override: Optional[str] = None) -> List[str]:
+                                  password_override: Optional[str] = None,
+                                  strict: bool = False) -> List[str]:
         """
         SSH into the node, run `ollama list`, parse the model names,
         and store them in node.installed_models. Returns the list.
+
+        strict=True raises instead of returning the stored list, so a caller
+        that shows the result can tell "refreshed" from "could not refresh".
         """
         try:
             rc, out, _ = self.engine.run_ssh(
                 node, "ollama list 2>/dev/null", password_override, timeout_s=15
             )
             if rc != 0 or not out.strip():
+                if strict:
+                    raise RuntimeError(f"`ollama list` failed (rc={rc})")
                 return node.installed_models or []
             models = []
             for line in out.strip().splitlines()[1:]:  # skip header
@@ -734,9 +754,13 @@ class PiHealthMonitor:
                     models.append(parts[0])
             node.installed_models = models
             node.last_status_check = now_iso()
-            self.upsert_node(node)
+            # Was self.upsert_node — not a method of this class — so the
+            # AttributeError was swallowed below and the STALE list returned.
+            self.registry.upsert(node)
             return models
         except Exception:
+            if strict:
+                raise
             return node.installed_models or []
 
     def _check_node(self, node: NodeEntry):
@@ -820,6 +844,27 @@ class Apothecary:
 
     def delete_node(self, name: str) -> None:
         self.registry.delete(name)
+
+    def save_node(self, entry: NodeEntry,
+                  previous_name: Optional[str] = None) -> None:
+        """Upsert, and on a rename remove the old record. The registry is
+        keyed by name, so an edit that changed the name used to leave the
+        original behind as a duplicate."""
+        if previous_name and previous_name != entry.name:
+            self.registry.delete(previous_name)
+        self.upsert_node(entry)
+
+    def refresh_installed_models(self, node: NodeEntry,
+                                 password_override: Optional[str] = None
+                                 ) -> List[str]:
+        """`ollama list` on the node. Raises when it cannot be refreshed.
+
+        The Model Inventory's Refresh button called this on Apothecary, where
+        it did not exist — it lives on the monitor — so the AttributeError
+        killed the worker and the button did nothing.
+        """
+        return self.monitor.refresh_installed_models(
+            node, password_override, strict=True)
 
     def test(
         self, name: str, password_override: Optional[str] = None, timeout_s: int = 10
@@ -908,6 +953,22 @@ class Apothecary:
         raise KeyError(f"Node not found: {name}")
 
 
+# Pure data, so it lives outside the `if _TK_OK:` block — inside it, a
+# Qt-only build lost both the badge colours and the icons.
+STATUS_COLOR = {
+    "online":  "#a6e3a1",
+    "offline": "#f38ba8",
+    "degraded":"#fab387",
+    "unknown": "#6c7086",
+}
+STATUS_ICON = {
+    "online":  "●",   # filled circle
+    "offline": "○",   # empty circle
+    "degraded":"◐",   # half circle
+    "unknown": "?",
+}
+
+
 # ============================================================
 # GUI Console Widget
 # ============================================================
@@ -925,18 +986,8 @@ except Exception:
 
 
 if _TK_OK:
-    _STATUS_COLOR = {
-        "online":  "#a6e3a1",
-        "offline": "#f38ba8",
-        "degraded":"#fab387",
-        "unknown": "#6c7086",
-    }
-    _STATUS_ICON = {
-        "online":  "\u25cf",   # filled circle
-        "offline": "\u25cb",   # empty circle
-        "degraded":"\u25d0",   # half circle
-        "unknown": "?",
-    }
+    _STATUS_COLOR = STATUS_COLOR
+    _STATUS_ICON = STATUS_ICON
 
     class ApothecaryConsole(ttk.Frame):
         def __init__(self, parent, apothecary: Apothecary, ui_queue=None):
@@ -1410,8 +1461,10 @@ if _TK_OK:
                     pi_model=v_pimodel.get(),
                     has_ai_hat=bool(v_aihat.get()),
                     ai_hat_tops=26.0 if v_aihat.get() else 0.0,
-                    ram_gb=int(v_pimodel.get().replace("GB)", "").split("(")[-1])
-                           if "GB)" in v_pimodel.get() else 0,
+                    # The old replace/split raised ValueError for both
+                    # "+ AI HAT+" models, so Save silently did nothing.
+                    ram_gb=int(_re.search(r"\((\d+)GB\)", v_pimodel.get()).group(1))
+                           if _re.search(r"\((\d+)GB\)", v_pimodel.get()) else 0,
                     council_role=v_role.get(),
                     model=getattr(existing, "model", "") if existing else "",
                     installed_models=getattr(existing, "installed_models", []) if existing else [],
@@ -1494,7 +1547,12 @@ if _TK_OK:
             def _refresh_models():
                 self._emit(f"Refreshing model list from {node.name}...")
                 def _t():
-                    models = self.apoth.refresh_installed_models(node)
+                    try:
+                        models = self.apoth.refresh_installed_models(node)
+                    except Exception as e:
+                        win.after(0, lambda e=e: self._emit(
+                            f"✗ {node.name}: could not refresh models: {e}", True))
+                        return
                     def _done():
                         inst_box.configure(state="normal")
                         inst_box.delete("1.0", "end")
