@@ -1,5 +1,15 @@
 # The eight remaining tabs — what the Qt port must do
 
+> **Status 2026-09-28: all eight are ported.** Agents, Apothecary and Dream3D
+> were the last three (`council_qt/tabs/agents.py`, `apothecary.py` +
+> `apothecary_dialogs.py`, `dream3d.py`); every defect in their tables below is
+> designed out and pinned by a test (`tests/test_agents_tab.py`,
+> `test_apothecary.py`, `test_dream3d_tab.py`). Not carried over from Dream3D's
+> chat router: `download <repo> <file>.gguf` and `peek <file>` — neither is a
+> pipeline command (see §dream3d). What is left of the port is no longer tabs:
+> making Qt the default launch, packaging PySide6 into the .exe, the
+> toolkit-aware `python_envs` probe, and retiring the Tk shell.
+
 Produced 2026-09-18 by a 16-agent reconnaissance: one reader per tab, then an
 adversarial verifier per map that re-checked every API signature against the
 source and tried to REFUTE every claimed defect.

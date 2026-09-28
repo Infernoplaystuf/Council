@@ -65,7 +65,8 @@ from council_core import transcript as transcript_core
 
 from .. import theme
 from ..view import ViewHelpers, amp
-from ..widgets.transcript import StreamView, TranscriptView
+from ..widgets.transcript import (MirroredTranscript, StreamView,
+                                  TranscriptView)
 
 
 #: Every field a turn sets. `reset_turn()` clears exactly these, and a test
@@ -234,6 +235,14 @@ class CouncilTab(ViewHelpers, QWidget):
             demo_mode=self.demo_mode)
         for field in PER_TURN_FIELDS:
             setattr(self, field, None)
+
+        # Other views that show this transcript too — the Dream3D chat adds
+        # itself. Empty until one does, which costs nothing.
+        self.mirror = MirroredTranscript()
+        # Called (on the GUI thread) after a pipeline command created or
+        # modified a pipeline, so a picker can rescan.
+        self.pipelines_changed: List[Callable[[], None]] = []
+        self._pipeline_chat = None
 
         self._build()
         self.refresh_specialists()
@@ -539,6 +548,8 @@ class CouncilTab(ViewHelpers, QWidget):
         typed = self.input.toPlainText().strip()
         if not typed:
             return
+        if self._send_pipeline_command(typed):
+            return
         if not self.begin_turn():
             return
         self.reset_turn()
@@ -575,6 +586,48 @@ class CouncilTab(ViewHelpers, QWidget):
                 self._to_ui(self.end_turn)
 
         threading.Thread(target=work, name="council-turn", daemon=True).start()
+
+    def pipeline_chat(self):
+        """The pipeline-command responder, built on first use."""
+        if self._pipeline_chat is None:
+            from council_core import dream3d
+            self._pipeline_chat = dream3d.PipelineChat(
+                self.actions.vault_dir,
+                say=lambda who, text, kind: self._to_ui(
+                    self.append, who, text, kind),
+                on_changed=lambda: self._to_ui(self._pipelines_changed))
+        return self._pipeline_chat
+
+    def _pipelines_changed(self) -> None:
+        for hook in list(self.pipelines_changed):
+            hook()
+
+    def _send_pipeline_command(self, typed: str) -> bool:
+        """Answer "list pipelines", "convert X to python", ... without the
+        council, as Tk's _send does before deliberating. True if handled.
+
+        Deciding is fast (regexes, at most a folder scan); the answer can call
+        a model or the DREAM3D-NX env, so it runs on a worker.
+        """
+        try:
+            job = self.pipeline_chat().plan(typed)
+        except Exception:                                 # noqa: BLE001
+            return False              # a broken scanner must not block chat
+        if job is None:
+            return False
+        self.append("User", typed)
+        self.input.clear()
+
+        def work() -> None:
+            try:
+                job()
+            except Exception as exc:                      # noqa: BLE001
+                self._to_ui(self.append, "Writer",
+                            f"That pipeline command failed: {exc!r}", "final")
+
+        threading.Thread(target=work, name="council-pipeline",
+                         daemon=True).start()
+        return True
 
     def on_event(self, event) -> None:
         """One progress event from the turn, always on the GUI thread."""
@@ -638,6 +691,7 @@ class CouncilTab(ViewHelpers, QWidget):
         Dream3D mirror and the Tk shell all say the same thing.
         """
         self.transcript.append_entry(who, text, kind)
+        self.mirror.append_entry(who, text, kind)
         if transcript_core.is_final_answer(who, kind):
             self._last_answer = text
             self.save_frame.show()
