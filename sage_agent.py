@@ -139,11 +139,13 @@ class SageKnowledge:
                 if rec["record_type"] == "correction" and w in rec.get("query","").lower():
                     score += idf * 0.5
 
-                # Boost high-confidence facts
-                if rec.get("confidence") == "high":
-                    score *= 1.2
-                elif rec.get("confidence") == "low":
-                    score *= 0.8
+            # Boost high-confidence facts — ONCE per record. Inside the term
+            # loop it compounded per matched word (1.2**4 for four matches),
+            # turning a confidence weight into a term-count weight.
+            if rec.get("confidence") == "high":
+                score *= 1.2
+            elif rec.get("confidence") == "low":
+                score *= 0.8
 
             if score > 0:
                 scored.append((score, rec))
