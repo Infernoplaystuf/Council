@@ -10,10 +10,13 @@ REM    3. Picks a GGUF model:
 REM        - honours an externally-set COUNCIL_GGUF_PATH
 REM        - else first .gguf in .\models\ or %USERPROFILE%\models\
 REM    4. Exports sensible Windows defaults (GPU offload, n_ctx debug)
-REM    5. Launches the GUI
+REM    5. Launches the GUI — the Qt app (council_qt.py) by default; the
+REM       classic Tk app (council_gui_engine.py) with --tk or COUNCIL_UI=tk,
+REM       or automatically when PySide6 is not installed.
 REM
 REM  Usage:
 REM    run-windows.bat
+REM    run-windows.bat --tk                     :: the classic Tk UI
 REM    set COUNCIL_GGUF_PATH=C:\path\to\model.gguf && run-windows.bat
 REM    set COUNCIL_GGUF_GPU_LAYERS=0 && run-windows.bat   :: force CPU
 REM ============================================================
@@ -27,6 +30,7 @@ REM `run-windows.bat --check` resolves the env + reports GPU readiness, then
 REM exits WITHOUT launching — a quick "did my setup work?" command.
 set "CHECK_ONLY="
 if /i "%~1"=="--check" set "CHECK_ONLY=1"
+if /i "%~1"=="--tk" set "COUNCIL_UI=tk"
 
 REM ── Resolve the Python interpreter ───────────────────────────
 REM Order: (0) .council_python marker written by setup_council.py, so
@@ -110,9 +114,21 @@ if not defined COUNCIL_TESSERACT_CMD (
 echo [run-windows] GPU layers: %COUNCIL_GGUF_GPU_LAYERS%   backend: %COUNCIL_BACKEND%
 REM Honest one-line GPU readiness heads-up (non-fatal; skip with COUNCIL_SKIP_GPU_CHECK=1)
 if not defined COUNCIL_SKIP_GPU_CHECK "!PYEXE!" gpu_check.py --quiet
-echo [run-windows] launching council_gui_engine.py ...
 
-"!PYEXE!" council_gui_engine.py
+REM ── Which UI: Qt by default, Tk on request or when Qt is missing ──
+set "COUNCIL_ENTRY=council_qt.py"
+if /i "%COUNCIL_UI%"=="tk" set "COUNCIL_ENTRY=council_gui_engine.py"
+if "!COUNCIL_ENTRY!"=="council_qt.py" (
+    "!PYEXE!" -c "import PySide6" >nul 2>&1
+    if errorlevel 1 (
+        echo [run-windows] PySide6 is not installed in this environment, so the classic Tk UI is starting.
+        echo [run-windows] For the new UI:  "!PYEXE!" -m pip install PySide6
+        set "COUNCIL_ENTRY=council_gui_engine.py"
+    )
+)
+echo [run-windows] launching !COUNCIL_ENTRY! ...
+
+"!PYEXE!" !COUNCIL_ENTRY!
 set "EXIT=%ERRORLEVEL%"
 
 if not "%EXIT%"=="0" (
@@ -121,7 +137,7 @@ if not "%EXIT%"=="0" (
     if not "%COUNCIL_GGUF_GPU_LAYERS%"=="0" (
         echo [run-windows] Retrying once with COUNCIL_GGUF_GPU_LAYERS=0 (CPU only)...
         set "COUNCIL_GGUF_GPU_LAYERS=0"
-        "!PYEXE!" council_gui_engine.py
+        "!PYEXE!" !COUNCIL_ENTRY!
         set "EXIT=!ERRORLEVEL!"
     )
 )

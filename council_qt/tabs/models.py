@@ -51,6 +51,14 @@ class ModelsActions:
     def upgrade(self, hardware):
         return model_jobs.upgrade_banner(hardware)
 
+    def models_dir(self) -> Path:
+        try:
+            path = model_jobs.models_dir()
+            path.mkdir(parents=True, exist_ok=True)
+            return path
+        except Exception:                                 # noqa: BLE001
+            return self.vault_dir
+
     def download(self, row, *, on_progress=None, should_cancel=None):
         return model_jobs.download_and_switch(
             row, self.vault_dir, on_progress=on_progress,
@@ -220,14 +228,17 @@ class ModelsTab(ViewHelpers, QWidget):
 
     def _download(self, row: model_jobs.ModelRow) -> None:
         size = row.raw.get("size_gb")
-        problem = model_jobs.check_space(self.actions.vault_dir, size)
+        dest = self.actions.models_dir()
+        # The folder the file lands in, not the vault — they can be on
+        # different drives, and the vault check passed a full models drive.
+        problem = model_jobs.check_space(dest, size)
         if problem:
             # Checked BEFORE the download, not discovered at 90%.
             self.status.setText(problem)
             return
         if not dialogs.askyesno(
                 "Download model",
-                model_jobs.confirm_download_text(row.cells[0], size),
+                model_jobs.confirm_download_text(row.cells[0], size, dest),
                 parent=self):
             return
 

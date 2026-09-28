@@ -86,7 +86,18 @@ cd "$SCRIPT_DIR"
 say "GPU layers: $COUNCIL_GGUF_GPU_LAYERS"
 [ -n "${COUNCIL_GGUF_PATH:-}" ] && say "model: $COUNCIL_GGUF_PATH"
 
-python council_gui_engine.py
+# Which UI: the Qt app by default; the classic Tk app with --tk or
+# COUNCIL_UI=tk, or automatically when PySide6 is not installed.
+[ "${1:-}" = "--tk" ] && COUNCIL_UI=tk
+COUNCIL_ENTRY=council_qt.py
+[ "${COUNCIL_UI:-}" = "tk" ] && COUNCIL_ENTRY=council_gui_engine.py
+if [ "$COUNCIL_ENTRY" = "council_qt.py" ] && ! python -c "import PySide6" >/dev/null 2>&1; then
+    warn "PySide6 is not installed in this environment, so the classic Tk UI is starting."
+    warn "For the new UI:  python -m pip install PySide6"
+    COUNCIL_ENTRY=council_gui_engine.py
+fi
+say "launching $COUNCIL_ENTRY ..."
+python "$COUNCIL_ENTRY"
 EXIT=$?
 
 case "$EXIT" in
@@ -97,7 +108,7 @@ case "$EXIT" in
     if [ "${COUNCIL_GGUF_GPU_LAYERS}" != "0" ]; then
         warn "Retrying once with COUNCIL_GGUF_GPU_LAYERS=0 (CPU only)..."
         export COUNCIL_GGUF_GPU_LAYERS=0
-        python council_gui_engine.py
+        python "$COUNCIL_ENTRY"
         EXIT=$?
     fi
     ;;

@@ -19,6 +19,13 @@
 PyYAML>=6.0
 requests>=2.31
 
+# ---- The UI ----
+# The Qt app (council_qt.py) is what the run-* launchers start. Without
+# PySide6 they fall back to the classic Tk app (council_gui_engine.py),
+# which needs nothing from here. 6.10 is the version the Qt port is tested
+# against.
+PySide6>=6.6
+
 # ---- Data ingestion / display ----
 #
 # numpy / pandas pinned BELOW 2.3 ONLY when dream3dnx is also in

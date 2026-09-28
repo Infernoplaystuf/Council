@@ -114,7 +114,18 @@ fi
 # build/driver can raise:
 #   132 SIGILL · 133 SIGTRAP · 134 SIGABRT (CUDA assert/abort — the
 #   "CUDA error … core dumped" case) · 135 SIGBUS · 136 SIGFPE · 139 SIGSEGV
-python council_gui_engine.py
+# Which UI: the Qt app by default; the classic Tk app with --tk or
+# COUNCIL_UI=tk, or automatically when PySide6 is not installed.
+[ "${1:-}" = "--tk" ] && COUNCIL_UI=tk
+COUNCIL_ENTRY=council_qt.py
+[ "${COUNCIL_UI:-}" = "tk" ] && COUNCIL_ENTRY=council_gui_engine.py
+if [ "$COUNCIL_ENTRY" = "council_qt.py" ] && ! python -c "import PySide6" >/dev/null 2>&1; then
+    warn "PySide6 is not installed in this environment, so the classic Tk UI is starting."
+    warn "For the new UI:  python -m pip install PySide6"
+    COUNCIL_ENTRY=council_gui_engine.py
+fi
+say "launching $COUNCIL_ENTRY ..."
+python "$COUNCIL_ENTRY"
 EXIT=$?
 
 case "$EXIT" in
@@ -126,7 +137,7 @@ case "$EXIT" in
         warn "If this works, the issue is a CUDA wheel / driver mismatch."
         warn "See installs.txt — 'Illegal instruction / CUDA core dumped'."
         export COUNCIL_GGUF_GPU_LAYERS=0
-        python council_gui_engine.py
+        python "$COUNCIL_ENTRY"
         EXIT=$?
     fi
     ;;

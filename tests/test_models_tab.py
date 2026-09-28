@@ -243,6 +243,47 @@ def test_a_model_with_no_repo_is_refused(tmp_path):
     assert "no download source" in result.message
 
 
+def faithful_downloader(target, calls=None):
+    """A model_downloader stand-in whose download_gguf BINDS its arguments
+    against the real function's signature and returns the real shape (a
+    dict). The old stand-in took **kw and returned a Path, so a call with
+    two wrong keyword names and a wrong return type passed for months."""
+    import inspect
+    import types
+    import model_downloader as real
+    sig = inspect.signature(real.download_gguf)
+
+    def download_gguf(*args, **kwargs):
+        bound = sig.bind(*args, **kwargs)          # TypeError on a bad call
+        if calls is not None:
+            calls.append(bound.arguments)
+        return {"path": str(target), "bytes": 1, "skipped": False,
+                "resumed": False}
+
+    return types.SimpleNamespace(download_gguf=download_gguf,
+                                 default_models_dir=lambda: target.parent)
+
+
+def test_download_calls_the_real_downloader_signature(tmp_path, monkeypatch):
+    target = tmp_path / "model.gguf"
+    target.write_text("x")
+    calls = []
+    monkeypatch.setitem(sys.modules, "model_downloader",
+                        faithful_downloader(target, calls))
+    seen = []
+    path = mj.download("owner/repo", "m.gguf",
+                       on_progress=lambda d, t: seen.append(d), size_gb=4.0)
+    assert path == target
+    args = calls[0]
+    assert args["repo"] == "owner/repo" and args["filename"] == "m.gguf"
+    assert args["dest_dir"] == tmp_path and args["expected_size_gb"] == 4.0
+    assert callable(args["progress"])
+
+
+def test_the_confirmation_names_the_real_destination(tmp_path):
+    assert str(tmp_path) in mj.confirm_download_text("M", 1.0, tmp_path)
+
+
 def test_a_download_that_lands_but_cannot_switch_says_where_the_file_is(
         tmp_path, monkeypatch):
     """Losing track of a multi-gigabyte file the user just waited for is a
@@ -250,8 +291,8 @@ def test_a_download_that_lands_but_cannot_switch_says_where_the_file_is(
     import types
     target = tmp_path / "model.gguf"
     target.write_text("x")
-    monkeypatch.setitem(sys.modules, "model_downloader", types.SimpleNamespace(
-        download_gguf=lambda **kw: target))
+    monkeypatch.setitem(sys.modules, "model_downloader",
+                        faithful_downloader(target))
     monkeypatch.setitem(sys.modules, "onboarding", types.SimpleNamespace(
         save_gguf_path=lambda *a, **k: (_ for _ in ()).throw(
             OSError("read-only vault"))))

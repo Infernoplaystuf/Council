@@ -419,8 +419,16 @@ order. After that:
 
 ```bat
 set COUNCIL_GGUF_PATH=C:\models\phi-4-Q4_K_M.gguf
-python council_gui_engine.py
+python council_qt.py
 ```
+
+`run-windows.bat` (or `run-linux.sh` / `run-wsl.sh`) does the same with the
+environment already resolved. The Qt app is the default UI; the classic Tk
+app is still there — `run-windows.bat --tk`, `COUNCIL_UI=tk`, or
+`python council_gui_engine.py` — and the launchers fall back to it on their
+own if PySide6 is not installed.
+
+The `.exe` build below still packages the classic Tk app.
 
 For a packaged `.exe`:
 

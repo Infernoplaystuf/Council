@@ -1,6 +1,8 @@
 """
-council_qt.py — the Qt entry point. The Tk one (council_gui_engine.py) is
-untouched and stays the shipping app until the port is finished.
+council_qt.py — the Qt entry point, and the app the run-* launchers start.
+The Tk one (council_gui_engine.py) is untouched and still runs: the launchers
+use it with --tk / COUNCIL_UI=tk, or when PySide6 is not installed, and the
+.exe build still packages it.
 
     python council_qt.py
 

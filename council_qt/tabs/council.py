@@ -243,6 +243,7 @@ class CouncilTab(ViewHelpers, QWidget):
         # modified a pipeline, so a picker can rescan.
         self.pipelines_changed: List[Callable[[], None]] = []
         self._pipeline_chat = None
+        self._model_chat = None
 
         self._build()
         self.refresh_specialists()
@@ -548,7 +549,7 @@ class CouncilTab(ViewHelpers, QWidget):
         typed = self.input.toPlainText().strip()
         if not typed:
             return
-        if self._send_pipeline_command(typed):
+        if self._send_command(typed):
             return
         if not self.begin_turn():
             return
@@ -602,17 +603,30 @@ class CouncilTab(ViewHelpers, QWidget):
         for hook in list(self.pipelines_changed):
             hook()
 
-    def _send_pipeline_command(self, typed: str) -> bool:
-        """Answer "list pipelines", "convert X to python", ... without the
-        council, as Tk's _send does before deliberating. True if handled.
+    def model_chat(self):
+        """The model-catalog responder ("what models can I download?")."""
+        if self._model_chat is None:
+            from council_core import model_chat
+            self._model_chat = model_chat.ModelChat(
+                say=lambda who, text, kind: self._to_ui(
+                    self.append, who, text, kind))
+        return self._model_chat
+
+    def _send_command(self, typed: str) -> bool:
+        """Answer app commands — pipelines, then models — without the council,
+        as Tk's _send does before deliberating. True if handled.
 
         Deciding is fast (regexes, at most a folder scan); the answer can call
-        a model or the DREAM3D-NX env, so it runs on a worker.
+        a model, the DREAM3D-NX env or the network, so it runs on a worker.
         """
-        try:
-            job = self.pipeline_chat().plan(typed)
-        except Exception:                                 # noqa: BLE001
-            return False              # a broken scanner must not block chat
+        job = None
+        for responder in (self.pipeline_chat, self.model_chat):
+            try:
+                job = responder().plan(typed)
+            except Exception:                             # noqa: BLE001
+                job = None            # a broken responder must not block chat
+            if job is not None:
+                break
         if job is None:
             return False
         self.append("User", typed)
@@ -623,9 +637,9 @@ class CouncilTab(ViewHelpers, QWidget):
                 job()
             except Exception as exc:                      # noqa: BLE001
                 self._to_ui(self.append, "Writer",
-                            f"That pipeline command failed: {exc!r}", "final")
+                            f"That command failed: {exc!r}", "final")
 
-        threading.Thread(target=work, name="council-pipeline",
+        threading.Thread(target=work, name="council-command",
                          daemon=True).start()
         return True
 

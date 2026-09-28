@@ -300,31 +300,63 @@ def check_space(target_dir: Any, needed_gb: Optional[float]) -> Optional[str]:
     return None
 
 
-def confirm_download_text(name: str, size_gb: Optional[float]) -> str:
+def confirm_download_text(name: str, size_gb: Optional[float],
+                          dest: Optional[Path] = None) -> str:
     size = f"about {size_gb:.1f} GB" if size_gb else "a large file"
+    where = f"It downloads to {dest}" if dest else "It downloads"
     return (f"Download {name} ({size}) and switch to it?\n\n"
-            "It downloads to your vault and becomes the active model. "
+            f"{where} and becomes the active model. "
             "Nothing else is changed — your existing model file is left "
             "where it is.")
 
 
+def models_dir() -> Path:
+    """Where downloads land — model_downloader's per-OS folder, NOT the vault
+    (%LOCALAPPDATA%\\Council\\models on Windows, ~/.council/models elsewhere,
+    COUNCIL_MODELS_DIR to override). The space check has to look here."""
+    import model_downloader
+    return model_downloader.default_models_dir()
+
+
+def download(repo: str, filename: str, *,
+             on_progress: Optional[Callable[[int, Optional[int]], None]] = None,
+             should_cancel: Optional[Callable[[], bool]] = None,
+             size_gb: Optional[float] = None) -> Path:
+    """Fetch one GGUF into models_dir(). BLOCKING. Returns the file's path.
+
+    THE FIRST VERSION NEVER DOWNLOADED ANYTHING. It called
+    `download_gguf(vault_dir=..., on_progress=...)`; the real parameters are
+    `dest_dir` and `progress`, so every call died with a TypeError, and the
+    function returns a summary DICT, not a path. The test that should have
+    caught it used a stand-in accepting `**kw` and returning a Path — a fake
+    shaped like the assumption instead of the code. The test now binds the
+    call against the real signature.
+    """
+    import model_downloader
+    result = model_downloader.download_gguf(
+        repo, filename, models_dir(), progress=on_progress,
+        should_cancel=should_cancel, expected_size_gb=size_gb)
+    return Path(result["path"])
+
+
 def download_and_switch(row: ModelRow, vault_dir: Any, *,
-                        on_progress: Optional[Callable[[str], None]] = None,
+                        on_progress: Optional[Callable[[int, Optional[int]],
+                                                       None]] = None,
                         should_cancel: Optional[Callable[[], bool]] = None
                         ) -> SwitchResult:
     """Fetch a GGUF and make it the active model. BLOCKING — use a worker.
 
     Changes the PATH, not the pins. See this module's header for why that
     distinction decides whether "takes effect immediately" is true.
+    ``on_progress(done_bytes, total_bytes)`` is the downloader's own shape.
     """
     if not row or not row.repo:
         return SwitchResult(False, "That model has no download source listed.")
     vault_dir = Path(vault_dir)
     try:
-        import model_downloader
-        path = model_downloader.download_gguf(
-            repo=row.repo, filename=row.filename, vault_dir=vault_dir,
-            on_progress=on_progress, should_cancel=should_cancel)
+        path = download(row.repo, row.filename, on_progress=on_progress,
+                        should_cancel=should_cancel,
+                        size_gb=row.raw.get("size_gb"))
     except Exception as exc:                              # noqa: BLE001
         return SwitchResult(False, f"Download failed: {exc}", error=exc)
 
