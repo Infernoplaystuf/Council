@@ -66,13 +66,32 @@ def check_goal(goal: str) -> Optional[str]:
     return None
 
 
-def start(runner: Any, goal: str, steps: Any) -> JobResult:
-    """Submit a job. ``runner`` is an agent_jobs_runner.JobRunner."""
+#: What the "connected tasks" option does, said once for every front end.
+CHAIN_NOTE = ("Connected tasks: the Strategist plans up to 5 small steps, each "
+              "is done by the Intern's model and checked by the Judge (a "
+              "failed step is retried once), then the Writer answers from the "
+              "checked steps. Slower than one agent, and more careful.")
+
+#: Marks a chain job in the list.
+CHAIN_MARK = "⛓ "
+
+
+def start(runner: Any, goal: str, steps: Any, *,
+          chain: bool = False) -> JobResult:
+    """Submit a job. ``runner`` is an agent_jobs_runner.JobRunner.
+
+    ``chain`` runs it as connected tasks (council_core.task_chain); ``steps``
+    is then each worker's step budget.
+    """
     problem = check_goal(goal)
     if problem:
         return JobResult(False, problem)
     try:
-        job_id = runner.submit(goal.strip(), max_steps=clamp_steps(steps))
+        # `mode` only when it is not the default, so a runner that predates
+        # chains (or a stand-in for one) keeps working for single jobs.
+        extra = {"mode": "chain"} if chain else {}
+        job_id = runner.submit(goal.strip(), max_steps=clamp_steps(steps),
+                               **extra)
     except Exception as exc:                              # noqa: BLE001
         return JobResult(False, f"Could not start the job: {exc!r}", error=exc)
     return JobResult(True, f"Started {job_id}. Watch the step log below.",
@@ -107,10 +126,12 @@ def listing(runner: Any) -> JobListResult:
 
     rows, ids = [], []
     for job in jobs:
-        job_id = getattr(job, "id", "") or ""
+        job_id = _job_id(job)
         status = getattr(job, "status", "") or "?"
         goal = (getattr(job, "goal", "") or "")[:80]
-        done = getattr(job, "steps_done", None)
+        if getattr(job, "mode", "single") == "chain":
+            goal = CHAIN_MARK + goal
+        done = _steps_done(job)
         budget = getattr(job, "max_steps", None)
         steps = ("" if done is None else
                  f"{done}/{budget}" if budget else str(done))
@@ -124,10 +145,26 @@ def listing(runner: Any) -> JobListResult:
         rows=rows, ids=ids)
 
 
+def _job_id(job: Any) -> str:
+    """agent_jobs.AgentJob calls it `job_id`. This module read `id`, which
+    AgentJob does not have — so every row's id was "", and Cancel, Open report
+    and Remove finished could never find the job the user selected. The tests
+    used a stand-in that HAD `id`, which is how it survived."""
+    return getattr(job, "job_id", None) or getattr(job, "id", "") or ""
+
+
+def _steps_done(job: Any) -> Optional[int]:
+    """AgentJob keeps its steps as a list; there is no `steps_done` field."""
+    steps = getattr(job, "steps", None)
+    if isinstance(steps, list):
+        return len(steps)
+    return getattr(job, "steps_done", None)
+
+
 def finished_ids(runner: Any) -> List[str]:
     """Jobs that will not change again, for "Remove finished"."""
     try:
-        return [getattr(j, "id", "") for j in runner.store.all()
+        return [_job_id(j) for j in runner.store.all()
                 if (getattr(j, "status", "") or "").lower()
                 in ("done", "failed", "cancelled", "error")]
     except Exception:                                     # noqa: BLE001

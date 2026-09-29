@@ -473,10 +473,15 @@ def default_tools(policy: AgentPolicy) -> Dict[str, Tool]:
         "run_pandas_analysis": Tool(
             name="run_pandas_analysis",
             fn=_tool_run_pandas_analysis,
-            description="Execute a sandboxed pandas snippet through the "
-                        "vault_analyst sandbox. The code is statically "
-                        "validated before execution; restricted builtins; "
-                        "DATA_FOLDER preloaded to file_root.",
+            # The last sentence is the whole interface: the sandbox returns
+            # only what the snippet puts in `result_df` or prints, and a
+            # model not told so stored its answer in another variable and
+            # got "Code did not create `result_df`" back.
+            description="Run a pandas snippet in a read-only sandbox. `pd` "
+                        "is available; read files by name, e.g. "
+                        "pd.read_csv('sales.csv'). Put the result in "
+                        "`result_df` (a DataFrame, Series or dict) or print "
+                        "it — nothing else is returned.",
             schema={"code": "str"},
             timeout_s=60.0,
         ),
@@ -626,7 +631,8 @@ def _strip_code_fences(s: str) -> str:
     return s
 
 
-def parse_action(reply: str) -> Dict[str, Any]:
+def parse_action(reply: str,
+                 tool_names: Optional[Any] = None) -> Dict[str, Any]:
     """Parse the model's action JSON tolerantly.
 
     Returns one of:
@@ -638,7 +644,18 @@ def parse_action(reply: str) -> Dict[str, Any]:
         - Always returns a dict whose "action" is "tool" or "final".
         - If parsing fails entirely, the reply itself becomes the final
           answer text (graceful degrade per the brief).
+
+    THE SHORTHAND. Asked for {"action": "tool", "tool": "read_local_file",
+    "args": {"path": "x"}}, Granite 3.1 8B answers
+    {"action": "read_local_file", "path": "x"} — the tool's name in "action"
+    and its arguments beside it. That fell through to "final", so the agent
+    handed back its own tool call as the answer and never read anything;
+    measured on the first real connected-tasks run, every step, every retry.
+    When ``tool_names`` is given and "action" is one of them, it is that tool
+    call. Only a KNOWN name counts, so a stray "action" key in a real answer
+    cannot turn into a tool call.
     """
+    known = {str(n) for n in (tool_names or ())}
     if not (reply or "").strip():
         return {"action": "final", "answer": ""}
 
@@ -679,6 +696,12 @@ def parse_action(reply: str) -> Dict[str, Any]:
                 args = {"_raw": args}
             if name:
                 return {"action": "tool", "tool": name, "args": args}
+        raw_action = str(obj.get("action", "")).strip()
+        if raw_action in known:
+            args = obj.get("args")
+            if not isinstance(args, dict):
+                args = {k: v for k, v in obj.items() if k != "action"}
+            return {"action": "tool", "tool": raw_action, "args": args}
 
     # No action key — try the legacy `{"tool": ...}` shape one last time.
     legacy = parse_tool_calls(reply)
@@ -804,7 +827,7 @@ class ConstrainedAgent:
                 self._finalise(run, used, missing)
                 return run
 
-            action = parse_action(reply)
+            action = parse_action(reply, tool_names=tools.keys())
             ev = StepEvent(step=step, raw_reply=reply, action=action["action"],
                             elapsed_s=time.time() - t0)
 

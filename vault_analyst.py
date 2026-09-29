@@ -3806,10 +3806,50 @@ class _BudgetedPandas:
     points the model at the bounded per-file helpers instead.
     """
 
-    def __init__(self, real, budget_bytes: int, state: dict) -> None:
+    def __init__(self, real, budget_bytes: int, state: dict,
+                 roots: Iterable[Path] = ()) -> None:
         self._real = real
         self._budget = int(budget_bytes)
         self._state = state          # {"used": int}
+        self._roots = [Path(str(r)) for r in roots]
+
+    def _resolve(self, a: tuple, k: dict):
+        """Point a RELATIVE file path at the data folder.
+
+        Models write `pd.read_csv('sales.csv')`, not the preloaded
+        DATA_FOLDER form. A bare name resolved against the app's working
+        directory and failed — and a small model read "file not found" as
+        "the file does not exist" and gave up. Measured on the first real
+        connected-tasks run: every step. Only a path that EXISTS under an
+        allowed folder and stays inside it is rewritten; anything else passes
+        through untouched, so nothing new becomes reachable.
+        """
+        if not self._roots:
+            return a, k
+        key, value = None, None
+        if a and isinstance(a[0], (str, Path)):
+            value = a[0]
+        else:
+            for name in ("filepath_or_buffer", "io", "path"):
+                if isinstance(k.get(name), (str, Path)):
+                    key, value = name, k[name]
+                    break
+        if value is None:
+            return a, k
+        p = Path(str(value))
+        if p.is_absolute() or "://" in str(value):
+            return a, k
+        for root in self._roots:
+            try:
+                cand = (root / p).resolve()
+                cand.relative_to(root.resolve())
+            except (OSError, ValueError):
+                continue
+            if cand.is_file():
+                if key is None:
+                    return (str(cand),) + tuple(a[1:]), k
+                return a, {**k, key: str(cand)}
+        return a, k
 
     def _account(self, df):
         try:
@@ -3836,6 +3876,7 @@ class _BudgetedPandas:
         real_attr = getattr(self._real, name)
         if name in _BUDGETED_READERS and callable(real_attr):
             def _guarded(*a, **k):
+                a, k = self._resolve(a, k)
                 return self._account(real_attr(*a, **k))
             _guarded.__name__ = name
             return _guarded
@@ -3860,7 +3901,8 @@ def execute_pandas_code(
     # guards `pd`; the import hook hands the SAME proxy back for any
     # `import pandas` so model code can't sidestep the cap by re-importing.
     _read_state = {"used": 0}
-    _budgeted_pd = _BudgetedPandas(pd, _analyst_read_budget_bytes(), _read_state)
+    _budgeted_pd = _BudgetedPandas(pd, _analyst_read_budget_bytes(), _read_state,
+                                   roots=normalized_folders)
 
     # ── Safe, READ-ONLY directory helpers ───────────────────────────────
     # The sandbox blocks `import os`, so model code that tried os.listdir /

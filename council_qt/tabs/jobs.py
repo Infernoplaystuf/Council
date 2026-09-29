@@ -23,8 +23,8 @@ import threading
 from pathlib import Path
 from typing import List, Optional
 
-from PySide6.QtWidgets import (QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-                               QPlainTextEdit, QSpinBox, QTreeWidget,
+from PySide6.QtWidgets import (QCheckBox, QGroupBox, QHBoxLayout, QHeaderView,
+                               QLabel, QPlainTextEdit, QSpinBox, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from council_core import jobs as jobs_core
@@ -40,6 +40,10 @@ class JobsActions:
     def __init__(self, runner=None, vault_dir: Optional[Path] = None):
         self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
         self._runner = runner
+        #: Where the runner posts ("job_step" | "job_status" | "job_done", ...)
+        #: tuples. The tab sets it before the runner is built; without it the
+        #: step log only ever showed what the tab itself wrote.
+        self.feed = None
 
     def runner(self):
         """The job runner, built on first use.
@@ -49,11 +53,20 @@ class JobsActions:
         """
         if self._runner is None:
             import agent_jobs_runner
-            self._runner = agent_jobs_runner.JobRunner(vault_dir=self.vault_dir)
+            self._runner = agent_jobs_runner.JobRunner(vault_dir=self.vault_dir,
+                                                       ui_q=self.feed)
         return self._runner
 
-    def start(self, goal: str, steps):
-        return jobs_core.start(self.runner(), goal, steps)
+    def start(self, goal: str, steps, chain: bool = False):
+        return jobs_core.start(self.runner(), goal, steps, chain=chain)
+
+    def remove_finished(self) -> int:
+        runner = self.runner()
+        removed = 0
+        for job_id in jobs_core.finished_ids(runner):
+            if job_id and runner.store.delete(job_id):
+                removed += 1
+        return removed
 
     def cancel(self, job_id):
         return jobs_core.cancel(self.runner(), job_id)
@@ -65,6 +78,31 @@ class JobsActions:
         return jobs_core.report_path(self.runner(), job_id)
 
 
+class _Feed:
+    """The runner's `ui_q`: a `put()` it calls from its worker thread.
+
+    Each message hops to the GUI thread through the tab's `_to_ui`, which also
+    drops it if the tab has been closed. The three kinds are the runner's own
+    (agent_jobs_runner._post).
+    """
+
+    def __init__(self, tab: "JobsTab"):
+        self.tab = tab
+
+    def put(self, msg) -> None:
+        kind = msg[0] if msg else ""
+        tab = self.tab
+        if kind == "job_step" and len(msg) >= 3:
+            step = msg[2] if isinstance(msg[2], dict) else {}
+            tab._to_ui(tab.on_job_step, msg[1], step.get("index", "?"),
+                       step.get("label", ""))
+        elif kind == "job_status" and len(msg) >= 3:
+            tab._to_ui(tab.on_job_status, msg[1], str(msg[2]))
+        elif kind == "job_done" and len(msg) >= 3:
+            tab._to_ui(tab.on_job_done, msg[1],
+                       " ".join(str(m) for m in msg[2:]))
+
+
 class JobsTab(ViewHelpers, QWidget):
     """A goal box, a queue, and a live step log."""
 
@@ -73,6 +111,8 @@ class JobsTab(ViewHelpers, QWidget):
         self.window = window
         self.bridge = getattr(window, "bridge", None)
         self.actions = actions or JobsActions()
+        if getattr(self.actions, "feed", False) is None:
+            self.actions.feed = _Feed(self)
         self._tokens = theme.tokens("dark")
         self._ids: List[str] = []
         self._build()
@@ -113,6 +153,11 @@ class JobsTab(ViewHelpers, QWidget):
         self.status.setStyleSheet(f"color: {self._tokens['success']};")
         row.addWidget(self.status)
         outer.addLayout(row)
+
+        self.chain = QCheckBox("Connected tasks — plan, small workers, "
+                               "checks, one answer")
+        self.chain.setToolTip(jobs_core.CHAIN_NOTE)
+        outer.addWidget(self.chain)
 
         self.queue = QTreeWidget()
         self.queue.setColumnCount(3)
@@ -163,9 +208,10 @@ class JobsTab(ViewHelpers, QWidget):
             self.status.setText(problem)
             return
         steps = self.steps.value()        # on the GUI thread, before the work
+        chain = self.chain.isChecked()
 
         def work() -> None:
-            result = self.actions.start(goal, steps)
+            result = self.actions.start(goal, steps, chain=chain)
 
             def show() -> None:
                 self.status.setText(result.message)
@@ -203,7 +249,16 @@ class JobsTab(ViewHelpers, QWidget):
             self.status.setText(f"Could not open it: {exc}")
 
     def on_remove_finished(self) -> None:
-        self.status.setText("Removing finished jobs is not ported yet.")
+        def work() -> None:
+            removed = self.actions.remove_finished()
+
+            def show() -> None:
+                self.status.setText(f"Removed {removed} finished job(s).")
+                self.refresh()
+
+            self._to_ui(show)
+
+        threading.Thread(target=work, name="jobs-remove", daemon=True).start()
 
     # -- the live feed --------------------------------------------------
     def append_log(self, line: str) -> None:

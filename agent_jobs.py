@@ -79,6 +79,10 @@ class AgentJob:
     result_summary: str = ""
     report_path: str = ""
     stopped_reason: str = ""
+    # "single": one agent pursues the goal. "chain": council_core.task_chain —
+    # a plan, a small worker per step, checks, one answer. Older records have
+    # no mode and load as "single".
+    mode: str = "single"
     created_ts: float = field(default_factory=time.time)
     updated_ts: float = field(default_factory=time.time)
 
