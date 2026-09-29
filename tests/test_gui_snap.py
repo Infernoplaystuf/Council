@@ -101,6 +101,35 @@ def test_partial_capture_is_repaired():
     assert any("peers" in n for n in notes)
 
 
+def test_peers_split_across_sibling_panels_are_not_a_partial_capture():
+    """Two panels, each with its own rows at the same x, is a layout — not a
+    frame that swallowed part of one group. Copied from a Phi-4 preferences
+    window: "Host"/"Port" in one tab page and "Log" in the page below it.
+    Both pages were shrunk to 16 px and everything in them fell out."""
+    book = mk("notebook", 24, 24, 1056, 576)
+    top = mk("frame", 560, 48, 512, 264)
+    bottom = mk("frame", 560, 312, 512, 256)
+    labels = [mk("label", 576, 72, 200, 16, "Host"),
+              mk("label", 576, 144, 200, 16, "Port"),
+              mk("label", 576, 336, 200, 16, "Log")]
+    out, notes = sn.snap([book, top, bottom] + labels, canvas_w=1100,
+                         canvas_h=700)
+    frames = [s for s in out if s.kind == "frame"]
+    assert [f.h for f in frames] == [264, 256], notes
+    assert not any("peers" in n for n in notes)
+
+
+def test_a_group_left_partly_at_the_root_is_still_a_partial_capture():
+    """The rule the exception above must not swallow: one peer in a frame,
+    the others loose on the window."""
+    frame = mk("frame", 0, 0, 1280, 80)
+    other = mk("frame", 600, 300, 300, 300)          # holds none of them
+    rows = [mk("label", 10, y, 100, 20, f"V{i}")
+            for i, y in enumerate((50, 90, 130))]
+    out, notes = sn.snap([frame, other] + rows)
+    assert any("peers" in n for n in notes)
+
+
 def test_overlapping_siblings_are_separated():
     """An image panel spanning y10..800 with a slider at y770..800 draws the
     slider on top of the image."""

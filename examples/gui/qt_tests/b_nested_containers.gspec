@@ -1,0 +1,283 @@
+{
+  "canvas": {
+    "grid_snap": 8,
+    "h": 700,
+    "w": 1100
+  },
+  "clarifications": [],
+  "gspec_version": 2,
+  "mode": "linked",
+  "project": "Nested Panels",
+  "shapes": [
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 648,
+      "id": "9f6f4e2d75aa5e349125da1cade07c6c",
+      "kind": "frame",
+      "label": "Outer",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "borderwidth": 0,
+        "relief": "groove"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 1048,
+      "x": 24,
+      "y": 24,
+      "z": 1
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 600,
+      "id": "8588d73515b25fe79f5fdad870c697f2",
+      "kind": "labelframe",
+      "label": "Source",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "labelanchor": "nw",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 488,
+      "x": 48,
+      "y": 48,
+      "z": 2
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 600,
+      "id": "0275f198c0ee5272863da0eb28c660ae",
+      "kind": "labelframe",
+      "label": "Target",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "labelanchor": "nw",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 488,
+      "x": 560,
+      "y": 48,
+      "z": 3
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "9fd5f2f5544d588e9b57c0a4accf9023",
+      "kind": "label",
+      "label": "Source path",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 160,
+      "x": 72,
+      "y": 80,
+      "z": 4
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "53999cf44712585cb2e146c720e1e35c",
+      "kind": "entry",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "source_path"
+      },
+      "props": {
+        "justify": "left",
+        "placeholder": "",
+        "show": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 440,
+      "x": 72,
+      "y": 112,
+      "z": 5
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 464,
+      "id": "e3f851ec87d350ea8d789f447cc56475",
+      "kind": "listbox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "source_files"
+      },
+      "props": {
+        "selectmode": "browse"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 440,
+      "x": 72,
+      "y": 160,
+      "z": 6
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "77b4a6d298695bfc8418fafb403344cd",
+      "kind": "label",
+      "label": "Target path",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 160,
+      "x": 584,
+      "y": 80,
+      "z": 7
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "bc1ae8a7e25b556aa9e393fa04226d43",
+      "kind": "entry",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "target_path"
+      },
+      "props": {
+        "justify": "left",
+        "placeholder": "",
+        "show": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 440,
+      "x": 584,
+      "y": 112,
+      "z": 8
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "934e4abf073c5bf1883a6ab9203b0d90",
+      "kind": "button",
+      "label": "Copy",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 160,
+      "x": 584,
+      "y": 160,
+      "z": 9
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "d56dcc52c7db5635917b6dfb04e67a97",
+      "kind": "progressbar",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "copy_progress"
+      },
+      "props": {
+        "mode": "determinate",
+        "orient": "horizontal"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 440,
+      "x": 584,
+      "y": 208,
+      "z": 10
+    }
+  ],
+  "window": {
+    "bg": "",
+    "fg": "",
+    "font": "",
+    "min_h": 600,
+    "min_w": 900,
+    "title": "Copy Files"
+  }
+}

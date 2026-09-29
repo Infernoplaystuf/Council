@@ -1,0 +1,102 @@
+{
+  "canvas": {
+    "grid_snap": 8,
+    "h": 700,
+    "w": 1100
+  },
+  "clarifications": [],
+  "gspec_version": 2,
+  "mode": "linked",
+  "project": "Text Editor",
+  "shapes": [
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 40,
+      "id": "7acd886f1b835f6483c37b040fc02115",
+      "kind": "toolbar",
+      "label": "Main tools",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "buttons": [
+          "New",
+          "Open",
+          "Save"
+        ]
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 1096,
+      "x": 0,
+      "y": 0,
+      "z": 1
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 608,
+      "id": "f1dc0c0d6ef95d09ad28337c7673d694",
+      "kind": "text",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "body"
+      },
+      "props": {
+        "readonly": false,
+        "wrap": "word"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 1096,
+      "x": 0,
+      "y": 48,
+      "z": 2
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "400b8fc6ab375a5686222f4f79f89b62",
+      "kind": "status_bar",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "status"
+      },
+      "props": {
+        "progress": false
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 1096,
+      "x": 0,
+      "y": 664,
+      "z": 3
+    }
+  ],
+  "window": {
+    "bg": "",
+    "fg": "",
+    "font": "",
+    "min_h": 600,
+    "min_w": 900,
+    "title": "Text Editor"
+  }
+}

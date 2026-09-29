@@ -233,6 +233,18 @@ def fix_partial_capture(shapes: Sequence[Any],
             inside = [s for s in g if _contains(c, s, tol=2)]
             if not inside or len(inside) == len(g):
                 continue                      # all or nothing: fine either way
+            # The peers this container does NOT hold are all held by OTHER
+            # containers (ones that are not its ancestors): two panels, each
+            # with its own rows — not a frame that swallowed part of one
+            # group. MEASURED on a described preferences window: "Host" and
+            # "Port" in one tab page and "Log" in the page below it share an
+            # x, so both pages were shrunk to 16 px and every widget in them
+            # fell out into the notebook as nine "pages".
+            rest = [s for s in g if s not in inside]
+            if all(any(o is not c and _contains(o, s, tol=2)
+                       and not _contains(o, c, tol=2) for o in containers)
+                   for s in rest):
+                continue
             # Partial. Shrink the container to clear the topmost captured peer.
             top_capture = min(int(s.y) for s in inside)
             new_h = top_capture - MARGIN - int(c.y)

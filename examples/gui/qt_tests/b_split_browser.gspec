@@ -1,0 +1,129 @@
+{
+  "canvas": {
+    "grid_snap": 8,
+    "h": 700,
+    "w": 1100
+  },
+  "clarifications": [],
+  "gspec_version": 2,
+  "mode": "linked",
+  "project": "Split Browser",
+  "shapes": [
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "227b65f55f0d53b1ba0875603fa432cd",
+      "kind": "label",
+      "label": "Library",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 240,
+      "x": 24,
+      "y": 16,
+      "z": 1
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 624,
+      "id": "70916f0e7c995722a73f99400e03a1db",
+      "kind": "panedwindow",
+      "label": "Split",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "orient": "horizontal"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 1048,
+      "x": 24,
+      "y": 48,
+      "z": 2
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 576,
+      "id": "fafe5c0680965c4090d40ca3b6e6df07",
+      "kind": "listbox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "folders"
+      },
+      "props": {
+        "selectmode": "browse"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 304,
+      "x": 48,
+      "y": 72,
+      "z": 3
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 576,
+      "id": "0d150bdeaf755603b8d0be821879066d",
+      "kind": "treeview",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "files"
+      },
+      "props": {
+        "columns": [
+          "Name",
+          "Size",
+          "Modified"
+        ],
+        "mode": "table",
+        "show_headings": true
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 672,
+      "x": 376,
+      "y": 72,
+      "z": 4
+    }
+  ],
+  "window": {
+    "bg": "",
+    "fg": "",
+    "font": "",
+    "min_h": 600,
+    "min_w": 900,
+    "title": "Split Browser"
+  }
+}

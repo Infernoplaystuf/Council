@@ -315,9 +315,17 @@ writes a complete PySide6 project from an unmodified `.gspec`.
 - **No `.load` anywhere in emitted code.** `QPixmap.load(path)` is the natural
   spelling and the gate refuses it; `QPixmap(path)` does the same job.
 
-**Not done yet** (the rest of Stage 2): the designer UI for choosing the target,
-the toolkit-aware `python_envs` probe (it still requires tkinter of every
-interpreter, so a Qt project cannot yet be Run from the Designer against a
-Qt-only env), the camera/thread worker API, and packaging. Grid-heavy layouts are
-also under-exercised: all four examples are freeform designs, so `_place` carries
-18-42 widgets each and `_cell` only one.
+**Since done:** the Designer asks for the toolkit at New and in the wizard (it is
+write-once, so it cannot be asked later), and Generate checks the policy as the
+toolkit it emitted. The `python_envs` probe is toolkit-aware. Grid layouts and
+every palette kind are now exercised on Qt: `examples/gui/qt_tests/` holds 17
+tiered wireframes that tests/test_qt_wireframes.py generates, constructs and
+measures against the Tk rendering, and tests/test_gui_emit_qt_kinds.py drives
+each kind's handler at runtime. "Describe it" (gui_describe.py) turns plain
+English into a checked wireframe; `run_describe_prompts.py` grades it against a
+real model with the prompts in `examples/gui/describe_prompts/`.
+
+**Not done yet** (the rest of Stage 2): the camera/thread worker API, and
+packaging. One Qt-only loss remains pinned as a strict xfail: a stretched Qt grid
+column honours minimums, not size hints, so an empty notebook drawn 544 wide
+renders narrower than Tk's (see examples/gui/qt_tests/README.md).

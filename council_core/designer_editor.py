@@ -136,6 +136,44 @@ class Scene:
         self.selection = [s.id for s in added]
         return self.commit()
 
+    def replace_all(self, shapes: Sequence[Shape]) -> Outcome:
+        """Swap the whole scene for `shapes`, as ONE undoable step.
+
+        What "Describe it" needs when the canvas already has a wireframe on
+        it. `load` would do the swap but RESET UNDO, so the user's own drawing
+        would be gone with no way back; `add_shapes` keeps it, but drops a
+        full-window layout on top of another one, and every shape then
+        overlaps something. This is the third case: replace, and let Undo put
+        it back.
+
+        The STACKING the caller gave is kept: shapes are ordered by their own
+        (z, id) and only then renumbered 1..n. gui_describe returns shapes in
+        the order the model LISTED them, with the checked stacking in z —
+        containers under their children, notebook pages left to right, which
+        is the order the tab titles are matched in. Renumbering by list
+        position instead put a frame listed after its buttons on top of them
+        (unclickable) and gave a notebook's pages the wrong titles.
+
+        A gesture in progress is ended, as load() ends it. The result arrives
+        from a worker and can land mid-drag; left armed, the next Escape would
+        restore the drag's starting shapes — the OLD drawing — with no commit.
+        """
+        replaced = sorted(copy.deepcopy(list(shapes)),
+                          key=lambda s: (s.z, s.id))
+        for z, shape in enumerate(replaced, start=1):
+            shape.z = z
+        self.shapes = replaced
+        self.selection = []
+        self._end_gesture()
+        return self.commit()
+
+    def _end_gesture(self) -> None:
+        """Forget any press/drag in progress without applying or restoring it."""
+        self._mode = None
+        self._handle = None
+        self._start = []
+        self._draw_sticky = False
+
     def mark_saved(self) -> None:
         """The scene and the file now agree."""
         self.dirty = False

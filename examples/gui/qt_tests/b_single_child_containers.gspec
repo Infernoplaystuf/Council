@@ -1,0 +1,202 @@
+{
+  "canvas": {
+    "grid_snap": 8,
+    "h": 700,
+    "w": 1100
+  },
+  "clarifications": [],
+  "gspec_version": 2,
+  "mode": "linked",
+  "project": "Single Child",
+  "shapes": [
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 560,
+      "id": "a0fdd0bb32a85f0d840eb4a0378e0e1d",
+      "kind": "frame",
+      "label": "Preview",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "borderwidth": 0,
+        "relief": "sunken"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 336,
+      "x": 24,
+      "y": 24,
+      "z": 1
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 560,
+      "id": "d07f75609e605cd3b1f245232f196651",
+      "kind": "labelframe",
+      "label": "Notes",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "labelanchor": "nw",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 336,
+      "x": 384,
+      "y": 24,
+      "z": 2
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 560,
+      "id": "113dc87154e75aaa8c8d51f43290e6cb",
+      "kind": "freeform",
+      "label": "Scratch",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {},
+      "w": 328,
+      "x": 744,
+      "y": 24,
+      "z": 3
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 512,
+      "id": "578a1efb02c255e889119604edab5b48",
+      "kind": "image_canvas",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "preview"
+      },
+      "props": {
+        "colormap": "",
+        "overlay": false,
+        "overlay_alpha": 0.5,
+        "roi": false,
+        "zoom_to_fit": true
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 288,
+      "x": 48,
+      "y": 48,
+      "z": 4
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 504,
+      "id": "d8ade99f2eb056ae97b2df9011e7e65f",
+      "kind": "text",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "notes"
+      },
+      "props": {
+        "readonly": false,
+        "wrap": "word"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 288,
+      "x": 408,
+      "y": 56,
+      "z": 5
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "49b43f7f37ce5086aaed4ac88ad95b8b",
+      "kind": "button",
+      "label": "Stamp",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 160,
+      "x": 768,
+      "y": 48,
+      "z": 6
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "5b10b8d12a965258ab96648404054e8d",
+      "kind": "button",
+      "label": "Done",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 160,
+      "x": 24,
+      "y": 608,
+      "z": 7
+    }
+  ],
+  "window": {
+    "bg": "",
+    "fg": "",
+    "font": "",
+    "min_h": 600,
+    "min_w": 900,
+    "title": "Single Child"
+  }
+}

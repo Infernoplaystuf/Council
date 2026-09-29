@@ -1,0 +1,129 @@
+{
+  "canvas": {
+    "grid_snap": 8,
+    "h": 700,
+    "w": 1100
+  },
+  "clarifications": [],
+  "gspec_version": 2,
+  "mode": "linked",
+  "project": "Console Split",
+  "shapes": [
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 592,
+      "id": "bfa491ff3cd85308968a7dbe8d0fe9f0",
+      "kind": "panedwindow",
+      "label": "Console",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "orient": "vertical"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 1048,
+      "x": 24,
+      "y": 24,
+      "z": 1
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 352,
+      "id": "25fe60a07d8b539aada5684f90d70869",
+      "kind": "text",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "script"
+      },
+      "props": {
+        "readonly": false,
+        "wrap": "word"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 1000,
+      "x": 48,
+      "y": 48,
+      "z": 2
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 168,
+      "id": "51992e5a384f582ab85298f1a3a40acb",
+      "kind": "log_pane",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "output"
+      },
+      "props": {
+        "autoscroll": true,
+        "levels": [
+          "info",
+          "warn",
+          "error"
+        ]
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 1000,
+      "x": 48,
+      "y": 424,
+      "z": 3
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "fb20add0ac5b560f9cf73b4327b062e5",
+      "kind": "button",
+      "label": "Run",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 160,
+      "x": 24,
+      "y": 640,
+      "z": 4
+    }
+  ],
+  "window": {
+    "bg": "",
+    "fg": "",
+    "font": "",
+    "min_h": 600,
+    "min_w": 900,
+    "title": "Console"
+  }
+}

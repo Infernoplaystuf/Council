@@ -1,0 +1,317 @@
+{
+  "canvas": {
+    "grid_snap": 8,
+    "h": 700,
+    "w": 1100
+  },
+  "clarifications": [],
+  "gspec_version": 2,
+  "mode": "linked",
+  "project": "Tabbed Settings",
+  "shapes": [
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 560,
+      "id": "575d6de477035139a336461ac6d224f8",
+      "kind": "notebook",
+      "label": "Sections",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "tabs": [
+          "General",
+          "Display",
+          "Advanced"
+        ]
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 1048,
+      "x": 24,
+      "y": 24,
+      "z": 1
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 496,
+      "id": "2d475b530bd654789c6b2e97c3c8b453",
+      "kind": "frame",
+      "label": "General page",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "borderwidth": 0,
+        "relief": "flat"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 320,
+      "x": 48,
+      "y": 64,
+      "z": 2
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 496,
+      "id": "60afde55e0145becb83fd9fb5fd01530",
+      "kind": "frame",
+      "label": "Display page",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "borderwidth": 0,
+        "relief": "flat"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 320,
+      "x": 392,
+      "y": 64,
+      "z": 3
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 496,
+      "id": "ae550a4171685c67a2eef652660c6433",
+      "kind": "frame",
+      "label": "Advanced page",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "borderwidth": 0,
+        "relief": "flat"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 320,
+      "x": 736,
+      "y": 64,
+      "z": 4
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "1c776b9bcadc591f95117ed81a47db94",
+      "kind": "label",
+      "label": "Name",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 240,
+      "x": 72,
+      "y": 88,
+      "z": 5
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "fe6d259c7d345d2a931c19b7f7ab6925",
+      "kind": "entry",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "user_name"
+      },
+      "props": {
+        "justify": "left",
+        "placeholder": "",
+        "show": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 272,
+      "x": 72,
+      "y": 120,
+      "z": 6
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "d923b6abfe56594f839b15300944e1c7",
+      "kind": "checkbutton",
+      "label": "Dark mode",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "default": false,
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 240,
+      "x": 416,
+      "y": 88,
+      "z": 7
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "bb73f257d75b574cb3faf3fbc9f7ff6d",
+      "kind": "combobox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "text_size"
+      },
+      "props": {
+        "command": "",
+        "readonly": true,
+        "values": [
+          "Small",
+          "Medium",
+          "Large"
+        ]
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 240,
+      "x": 416,
+      "y": 128,
+      "z": 8
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "a05b128883ba5fd6868b766f38e72088",
+      "kind": "spinbox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "threads"
+      },
+      "props": {
+        "command": "",
+        "from_": 1,
+        "increment": 1,
+        "to": 16
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 160,
+      "x": 760,
+      "y": 88,
+      "z": 9
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "10a9fd3ceedb55d29857fc3fd5c546c0",
+      "kind": "button",
+      "label": "Reset",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 160,
+      "x": 760,
+      "y": 144,
+      "z": 10
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "ead2439ef4e95cd2b3222e8c81ea5f4d",
+      "kind": "button",
+      "label": "Save settings",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 160,
+      "x": 24,
+      "y": 608,
+      "z": 11
+    }
+  ],
+  "window": {
+    "bg": "",
+    "fg": "",
+    "font": "",
+    "min_h": 600,
+    "min_w": 900,
+    "title": "Settings"
+  }
+}

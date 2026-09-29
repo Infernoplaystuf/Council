@@ -1,0 +1,193 @@
+{
+  "canvas": {
+    "grid_snap": 8,
+    "h": 700,
+    "w": 1100
+  },
+  "clarifications": [],
+  "gspec_version": 2,
+  "mode": "linked",
+  "project": "Image Viewer",
+  "shapes": [
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "3eb4958202e15e1eac5b7aa70a8c1eb2",
+      "kind": "label",
+      "label": "Folder",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 160,
+      "x": 24,
+      "y": 24,
+      "z": 1
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "f858c6441f4b51049f0b40cf566c31a9",
+      "kind": "file_picker",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "folder"
+      },
+      "props": {
+        "command": "",
+        "filetypes": [],
+        "mode": "folder"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 520,
+      "x": 24,
+      "y": 56,
+      "z": 2
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 472,
+      "id": "f7240c2b7db95d24babda39251887400",
+      "kind": "image_canvas",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "view"
+      },
+      "props": {
+        "colormap": "",
+        "overlay": false,
+        "overlay_alpha": 0.5,
+        "roi": false,
+        "zoom_to_fit": true
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 1048,
+      "x": 24,
+      "y": 112,
+      "z": 3
+    },
+    {
+      "bg": "",
+      "drives": {
+        "current": "current_file",
+        "folder": "folder",
+        "status": "status",
+        "target": "view"
+      },
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 40,
+      "id": "fc2f859d079a505aa072955f70e5427b",
+      "kind": "scrubber",
+      "label": "Frame",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "frame"
+      },
+      "props": {
+        "command": "",
+        "from_": 0,
+        "show_total": true,
+        "to": 100
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 720,
+      "x": 24,
+      "y": 608,
+      "z": 4
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "2dafa1835b015be191d6d688fd3eec20",
+      "kind": "label",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "current_file"
+      },
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 304,
+      "x": 768,
+      "y": 616,
+      "z": 5
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "bb1bcb5acad75ac098ca9b056b29543d",
+      "kind": "status_bar",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "status"
+      },
+      "props": {
+        "progress": false
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 1096,
+      "x": 0,
+      "y": 672,
+      "z": 6
+    }
+  ],
+  "window": {
+    "bg": "",
+    "fg": "",
+    "font": "",
+    "min_h": 600,
+    "min_w": 900,
+    "title": "Image Viewer"
+  }
+}

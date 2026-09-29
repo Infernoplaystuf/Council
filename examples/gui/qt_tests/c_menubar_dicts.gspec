@@ -1,0 +1,101 @@
+{
+  "canvas": {
+    "grid_snap": 8,
+    "h": 700,
+    "w": 1100
+  },
+  "clarifications": [],
+  "gspec_version": 2,
+  "mode": "linked",
+  "project": "Menu Dicts",
+  "shapes": [
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "6e2fc528c7c95b2ba15c23bbef092a10",
+      "kind": "menubar",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "menus": [
+          {
+            "items": [
+              "New",
+              "Open",
+              "-",
+              "Quit"
+            ],
+            "title": "File"
+          },
+          {
+            "items": [
+              "Undo",
+              {
+                "items": [
+                  "Upper case",
+                  "Lower case"
+                ],
+                "title": "Transform"
+              }
+            ],
+            "title": "Edit"
+          },
+          {
+            "items": [
+              "About"
+            ],
+            "title": "Help"
+          }
+        ]
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 1096,
+      "x": 0,
+      "y": 0,
+      "z": 1
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 624,
+      "id": "55064b0ebc445c408c955d5383cc6bd5",
+      "kind": "text",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "document"
+      },
+      "props": {
+        "readonly": false,
+        "wrap": "word"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 1048,
+      "x": 24,
+      "y": 48,
+      "z": 2
+    }
+  ],
+  "window": {
+    "bg": "",
+    "fg": "",
+    "font": "",
+    "min_h": 600,
+    "min_w": 900,
+    "title": "Menus"
+  }
+}

@@ -1,0 +1,101 @@
+{
+  "canvas": {
+    "grid_snap": 8,
+    "h": 700,
+    "w": 1100
+  },
+  "clarifications": [],
+  "gspec_version": 1,
+  "mode": "linked",
+  "project": "Menu Titles",
+  "shapes": [
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "7a536f876d245be6bdc7156365028a17",
+      "kind": "menubar",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "menus": [
+          "File",
+          "View",
+          "Help"
+        ]
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 1096,
+      "x": 0,
+      "y": 0,
+      "z": 1
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "ff50dec96a7558d38deaf19a0e421759",
+      "kind": "label",
+      "label": "These menus have no items yet",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 480,
+      "x": 24,
+      "y": 48,
+      "z": 2
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "65b7ee019b0a5024b7a7eb1ed009ec6f",
+      "kind": "button",
+      "label": "Go",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 160,
+      "x": 24,
+      "y": 88,
+      "z": 3
+    }
+  ],
+  "window": {
+    "bg": "",
+    "fg": "",
+    "font": "",
+    "min_h": 600,
+    "min_w": 900,
+    "title": "Menus"
+  }
+}

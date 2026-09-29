@@ -418,3 +418,186 @@ def test_a_handler_that_does_anything_at_all_is_not_a_stub():
                  'raise NotImplementedError'):
         node = ast.parse(f"def on_x(self):\n    {body}\n").body[0]
         assert not _is_empty_stub(node), body
+
+
+# ============================================================
+# The toolkit, chosen at creation
+# ============================================================
+
+def test_a_new_project_records_the_toolkit_it_was_made_for(vault):
+    assert dp.create("q", "standalone", vault, "qt").ok
+    pdir = gui_projects.project_path("q", vault)
+    assert gui_projects.load_manifest(pdir).toolkit == "qt"
+    assert dp.toolkit_label(pdir) == "Qt"
+
+
+def test_a_new_project_defaults_to_tk(vault):
+    """Every caller that predates the choice keeps making what it made."""
+    pdir = project(vault)
+    assert gui_projects.load_manifest(pdir).toolkit == "tk"
+    assert dp.toolkit_label(pdir) == "Tk"
+
+
+def test_an_unknown_toolkit_is_refused_and_leaves_nothing(vault):
+    result = dp.create("q", "standalone", vault, "pyside6")
+    assert not result.ok and "toolkit" in result.message
+    assert not gui_projects.project_path("q", vault).exists()
+
+
+def test_a_new_project_is_drawn_on_the_canvas_the_user_drags_on(vault):
+    """gui_projects' default is 1280x800. Layout inference measures edge
+    anchoring against the canvas, so New used to infer "anchored right" for a
+    shape 180 px short of the edge the user could see."""
+    project(vault)
+    saved = gui_projects.open_project("demo", vault_dir=vault)
+    assert (saved.canvas.w, saved.canvas.h) == (dp.CANVAS_W, dp.CANVAS_H)
+
+
+def test_a_wizard_result_carries_its_toolkit(vault):
+    class _Result:
+        name, mode, title, toolkit = "wiz", "standalone", "t", "qt"
+        min_w, min_h = 400, 300
+        shapes = [mk(label="One")]
+
+    assert dp.create_from_wizard(_Result(), vault).ok
+    pdir = gui_projects.project_path("wiz", vault)
+    assert gui_projects.load_manifest(pdir).toolkit == "qt"
+
+
+def test_a_wizard_apply_that_fails_half_way_can_be_retried(vault):
+    """The directory is made first. A failure after that used to strand it,
+    and the obvious retry — same answers — said "already exists"."""
+
+    class _Broken:
+        name, mode, title = "wiz", "standalone", "t"
+        min_w, min_h = 400, 300
+        shapes = 5                                  # list(5) raises
+
+    assert not dp.create_from_wizard(_Broken(), vault).ok
+    assert not gui_projects.project_path("wiz", vault).exists()
+
+    class _Fixed(_Broken):
+        shapes = [mk()]
+
+    assert dp.create_from_wizard(_Fixed(), vault).ok
+
+
+def test_the_cleanup_leaves_a_directory_it_did_not_make_alone(vault):
+    """Only what create() wrote is ever removed. A directory with anything
+    else in it is somebody's work."""
+    project(vault)
+    pdir = gui_projects.project_path("demo", vault)
+    (pdir / "notes.txt").write_text("mine", encoding="utf-8")
+    dp._discard_new("demo", vault)
+    assert (pdir / "notes.txt").exists()
+
+
+def test_a_qt_project_passes_the_policy_gate_at_generate(vault):
+    """Checked as Tk, every correct Qt project said "policy REFUSED —
+    'PySide6' is not on the linked allowlist" here, while Run — which passes
+    the toolkit — launched it without complaint."""
+    dp.create("q", "standalone", vault, "qt")
+    pdir = gui_projects.project_path("q", vault)
+    result = dp.generate("q", [mk()], pdir, vault)
+    assert result.ok, result.lines
+    assert gui_projects.toolkit_of(pdir) == "qt"
+    assert "policy: OK" in result.lines, result.lines
+    assert not any("REFUSED" in line for line in result.lines)
+
+
+def test_a_qt_review_is_not_told_it_is_reading_tkinter(vault):
+    dp.create("q", "standalone", vault, "qt")
+    pdir = gui_projects.project_path("q", vault)
+    dp.generate("q", [mk()], pdir, vault)
+    prompt = dp.review_prompt(pdir)
+    assert prompt.startswith(dp.REVIEW_PROMPT_QT)
+    assert "Tkinter" not in prompt.split("\n", 1)[0]
+    assert "Do not rewrite it" in dp.REVIEW_PROMPT_QT
+
+
+def test_the_two_review_headers_share_a_cap():
+    """The cap test measures against REVIEW_PROMPT; the Qt header must not be
+    the one that overflows it."""
+    assert len(dp.REVIEW_PROMPT_QT) <= len(dp.REVIEW_PROMPT) + 16
+
+
+# ============================================================
+# The Council review backend
+# ============================================================
+
+class _Models:
+    judge = object()
+    coder = object()
+    writer = object()
+
+
+def test_review_asks_the_coder_and_the_writer_for_one_round(monkeypatch):
+    from council_core import deliberation
+    from council_core.deliberation import AgentEvent
+    seen = {}
+
+    class _Orch:
+        def __init__(self, judge_model, agents, max_rounds, debate_turns):
+            seen.update(agents=sorted(agents), rounds=max_rounds,
+                        turns=debate_turns)
+
+        def run(self, prompt, panel, synth):
+            seen.update(prompt=prompt, panel=panel, synth=synth)
+            return [AgentEvent(who="Writer", kind="final",
+                               text="pad the buttons")]
+
+    monkeypatch.setattr(deliberation, "DeliberationOrchestrator", _Orch)
+    assert dp.review("look at this", _Models()) == "pad the buttons"
+    assert seen["agents"] == ["coder", "writer"]
+    assert (seen["rounds"], seen["turns"], seen["synth"]) == (1, 1, "writer")
+
+
+def test_review_with_no_judge_says_so_rather_than_raising():
+    class _NoJudge(_Models):
+        judge = None
+
+    assert "no judge" in dp.review("x", _NoJudge())
+
+
+def test_review_with_no_writer_says_so_rather_than_raising():
+    class _NoWriter(_Models):
+        writer = None
+
+    assert "no writer" in dp.review("x", _NoWriter())
+
+
+# ============================================================
+# Describe it
+# ============================================================
+
+def test_describe_designs_for_the_projects_toolkit_and_the_real_canvas(
+        vault, monkeypatch):
+    import gui_describe
+    seen = {}
+    monkeypatch.setattr(gui_describe, "describe",
+                        lambda text, **kw: seen.update(text=text, **kw) or "r")
+    dp.create("q", "standalone", vault, "qt")
+    out = dp.describe("a login form", gui_projects.project_path("q", vault),
+                      model_call=lambda p: "{}")
+    assert out == "r"
+    assert seen["toolkit"] == "qt"
+    assert (seen["canvas_w"], seen["canvas_h"]) == (dp.CANVAS_W, dp.CANVAS_H)
+
+
+def test_describe_never_reaches_a_model_it_was_not_given(vault, monkeypatch):
+    """The default call is the engine's; a test must be able to replace it."""
+    import gui_describe
+    calls = []
+    monkeypatch.setattr(gui_describe, "describe",
+                        lambda text, **kw: calls.append(kw["model_call"]))
+    stub = lambda p: "{}"                               # noqa: E731
+    dp.describe("x", None, model_call=stub)
+    assert calls == [stub]
+
+
+def test_the_describe_call_is_budgeted_for_a_whole_wireframe():
+    """700 tokens — the classifier's — cuts a 20-shape reply off mid-list."""
+    assert dp.DESCRIBE_NUM_PREDICT >= 1500
+    assert dp.DESCRIBE_ROLE == "coder"
+    import gui_describe
+    assert dp.DESCRIBE_NUM_PREDICT == gui_describe.REPLY_TOKENS

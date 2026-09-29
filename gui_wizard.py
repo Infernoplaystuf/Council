@@ -57,6 +57,9 @@ class WizardResult:
     min_h: int = DEFAULT_MIN_H
     template: str = "blank"
     shapes: List[Shape] = field(default_factory=list)
+    #: 'tk' or 'qt' (gui_projects.TOOLKITS). Last, and defaulted to Tk, so the
+    #: Tk wizard — which never asks — keeps making exactly what it always made.
+    toolkit: str = "tk"
 
 
 def build_shapes(template: str, options: Dict[str, Any],

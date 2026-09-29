@@ -1,0 +1,183 @@
+{
+  "canvas": {
+    "grid_snap": 8,
+    "h": 700,
+    "w": 1100
+  },
+  "clarifications": [],
+  "gspec_version": 2,
+  "mode": "linked",
+  "project": "Login Form",
+  "shapes": [
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "21e7d89728315e5a86d5468b7f32b5b1",
+      "kind": "label",
+      "label": "Username",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 160,
+      "x": 384,
+      "y": 192,
+      "z": 1
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "269a8e7cc0175d32af15505117bd6e48",
+      "kind": "entry",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "user_name"
+      },
+      "props": {
+        "justify": "left",
+        "placeholder": "",
+        "show": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 336,
+      "x": 384,
+      "y": 224,
+      "z": 2
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "ff03a52a9a4753fdabd0392f633dd786",
+      "kind": "label",
+      "label": "Password",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 160,
+      "x": 384,
+      "y": 272,
+      "z": 3
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "2a04d42590c455058d5eaf4733cbb0c0",
+      "kind": "entry",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "password"
+      },
+      "props": {
+        "justify": "left",
+        "placeholder": "",
+        "show": "*"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 336,
+      "x": 384,
+      "y": 304,
+      "z": 4
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "46a10e14a7485ab789c5ea318ec53849",
+      "kind": "button",
+      "label": "Sign in",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 160,
+      "x": 384,
+      "y": 360,
+      "z": 5
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "b42e4dfd45315b04b26e1ca3c59789bc",
+      "kind": "label",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "message"
+      },
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 336,
+      "x": 384,
+      "y": 416,
+      "z": 6
+    }
+  ],
+  "window": {
+    "bg": "",
+    "fg": "",
+    "font": "",
+    "min_h": 600,
+    "min_w": 900,
+    "title": "Sign in"
+  }
+}

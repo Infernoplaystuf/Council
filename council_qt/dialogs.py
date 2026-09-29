@@ -100,6 +100,24 @@ def askstring(title: str = "", prompt: str = "", initialvalue: str = "",
     return text if ok else None
 
 
+def askchoice(title: str = "", prompt: str = "",
+              choices: Sequence[str] = (), parent=None,
+              **_kw) -> Optional[str]:
+    """One of `choices`, or None on cancel.
+
+    tkinter has no such dialog, so there is no convention to keep. This one
+    follows askstring's: None is cancel, and a caller that treats cancel as
+    "pick the first" makes the choice the user backed out of. Not editable,
+    so the answer is always one of the choices offered.
+    """
+    items = [str(c) for c in choices or ()]
+    if not items:
+        return None
+    text, ok = QInputDialog.getItem(parent, str(title), str(prompt), items,
+                                    0, False)
+    return text if ok and text in items else None
+
+
 def askinteger(title: str = "", prompt: str = "", initialvalue: int = 0,
                minvalue: int = -2147483647, maxvalue: int = 2147483647,
                parent=None, **_kw) -> Optional[int]:

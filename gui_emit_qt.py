@@ -47,10 +47,25 @@ WHAT IS GENUINELY DIFFERENT, AND WHY
   project's own policy gate refuses it: `.load` is denied unless the receiver is
   in SAFE_LOAD_RECEIVERS, and a local variable name can never be in that set.
   The constructor form QPixmap(path) does the same job and passes.
+* HANDLERS ARE CONNECTED, NOT PASSED. Tk hands `command=self.on_<name>` to the
+  constructor. A Qt widget takes no command, so MainUi._build connects each
+  COMMAND_KINDS widget's signal to on_<name> once every port exists (see
+  _COMMAND_SIGNAL for which signal, and why it is not always the obvious one).
+  Before this only a button with an event port ever reached its handler: a
+  checkbox, radio, combobox, spinbox, scale, scrubber, file picker, toolbar,
+  menu item, or a button whose port was switched off, did nothing at all.
+* TWO QT CLASSES GAIN A SIGNAL. Where Tk's widget has a callback Qt's has no
+  signal for, main_ui.py defines a subclass that adds it, and construct()
+  names it: _SpinBox's `committed` is Tk's Spinbox command= (a step, not a
+  keystroke), and _MenuBar's `fired` is the Toolbar's, so a menubar's port
+  reaches its on_fire subscribers. Subclasses, so a stylesheet selector
+  naming the Qt class, isinstance and findChildren all still match.
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence
+import math
+import textwrap
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import gui_colors as _gcol
 from gui_emit import _c, _ordered, _prop, _py, _region, _text_of
@@ -123,7 +138,7 @@ def construct(w: WidgetSpec, parent: str) -> str:
     if k == "listbox":
         return f"QListWidget({parent})"
     if k == "spinbox":
-        return f"QSpinBox({parent})"
+        return f"_SpinBox({parent})"    # QSpinBox + Tk's command= signal
     if k == "scale":
         orient = _prop(w, "orient", "horizontal")
         axis = "Horizontal" if orient == "horizontal" else "Vertical"
@@ -135,7 +150,7 @@ def construct(w: WidgetSpec, parent: str) -> str:
     if k == "treeview":
         return f"QTreeWidget({parent})"
     if k == "menubar":
-        return f"QMenuBar({parent})"
+        return f"_MenuBar({parent})"    # QMenuBar + the Toolbar's `fired`
     # ---- composites (ui/widgets.py) ----
     if k == "image_canvas":
         return (f"ImageCanvas({parent}, "
@@ -246,15 +261,38 @@ def configure_lines(w: WidgetSpec, ind: str) -> List[str]:
                  "extended": "ExtendedSelection"}.get(mode, "SingleSelection")
         L.append(f"{ind}{ref}.setSelectionMode("
                  f"QAbstractItemView.SelectionMode.{qmode})")
-    elif k == "spinbox":
-        L.append(f"{ind}{ref}.setRange({int(_prop(w, 'from_', 0) or 0)}, "
-                 f"{int(_prop(w, 'to', 100) or 0)})")
-        step = int(_prop(w, "increment", 1) or 1)
-        if step != 1:
-            L.append(f"{ind}{ref}.setSingleStep({step})")
-    elif k == "scale":
-        L.append(f"{ind}{ref}.setRange({int(_prop(w, 'from_', 0) or 0)}, "
-                 f"{int(_prop(w, 'to', 100) or 0)})")
+    elif k in ("spinbox", "scale"):
+        # QSpinBox and QSlider hold WHOLE numbers; Tk's Spinbox and Scale take
+        # fractions. A fractional bound is truncated toward zero, as int()
+        # always did here, and the generated file now says so on the line
+        # before — a range that quietly moved is found by reading, not by
+        # dragging. (QDoubleSpinBox would keep the fraction, but the spinbox
+        # port writes int() and the stylesheet selector names QSpinBox, so
+        # that is a widget swap across three places, not a fix to this one.)
+        # A bound that is not a number at all used to kill emit with
+        # ValueError; it now falls back to the DEFAULT the inspector shows
+        # (from_ 0, to 100) and says so. `to` once fell back to 0 instead:
+        # setRange(0, 0), a widget that cannot move, under a comment saying
+        # the default was used.
+        cls = "QSpinBox" if k == "spinbox" else "QSlider"
+        lo, why_lo = _whole(_prop(w, "from_", 0), 0, cls)
+        hi, why_hi = _whole(_prop(w, "to", 100), 100, cls)
+        for key, why in (("from_", why_lo), ("to", why_hi)):
+            if why:
+                L += _note(ind, f"{key}: {why}")
+        L.append(f"{ind}{ref}.setRange({lo}, {hi})")
+        if k == "spinbox":
+            step, why = _whole(_prop(w, "increment", 1), 1, cls)
+            if not step:
+                # An increment of 0.1 truncates to 0, and setSingleStep(0)
+                # leaves arrows that do nothing at all. 1 is the smallest
+                # step a QSpinBox can take, so it is the honest nearest one.
+                dead = "a step of 0 would leave the arrows dead, so it is 1"
+                step, why = 1, (f"{why}; {dead}" if why else dead)
+            if why:
+                L += _note(ind, f"increment: {why}")
+            if step != 1:
+                L.append(f"{ind}{ref}.setSingleStep({step})")
     elif k == "progressbar":
         if str(_prop(w, "mode", "determinate")) == "indeterminate":
             # Qt's busy indicator IS an empty range.
@@ -286,31 +324,222 @@ def configure_lines(w: WidgetSpec, ind: str) -> List[str]:
     return L
 
 
+def _note(ind: str, text: str) -> List[str]:
+    """``text`` as comment lines at ``ind``, wrapped to 79 columns the way
+    grid_lines wraps its notes. Never inside a word or at a hyphen, so a
+    number or "32-bit" is always read whole."""
+    return [f"{ind}# {line}" for line in textwrap.wrap(
+        text, 79 - len(ind) - 2, break_long_words=False,
+        break_on_hyphens=False)]
+
+
+#: The range of the C int a QSpinBox or QSlider holds. PySide6 refuses a
+#: Python int past it, so a bound of 1e12 — a byte count, say — emitted as
+#: setRange(0, 1000000000000) killed _build with OverflowError (measured,
+#: PySide6 6.10.2: "libshiboken: Overflow ... exceeds limits of type [signed]
+#: int (4bytes)") and the window never opened.
+_INT32 = (-2 ** 31, 2 ** 31 - 1)
+
+
+def _whole(value: Any, fallback: int, cls: str) -> Tuple[int, str]:
+    """(a numeric prop as a whole number a ``cls`` can hold, why it is not
+    the number given — a whole sentence for the generated file, or "").
+
+    The reason is "" when the value was already a whole number in range, so
+    such a prop emits exactly what it always did. A prop that is not there
+    (None, blank) is the default, silently; a 0 IS there — `to` of 0 is a
+    real bound, and reading it as missing would turn -10..0 into -10..100. A
+    fraction truncates toward zero, as int() always did. A non-number falls
+    back to the default instead of raising out of emit, and a number past
+    32 bits is clamped instead of raising out of _build.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return fallback, ""
+    if isinstance(value, int):         # bool included, as int(True) was
+        n, why = int(value), ""
+    else:
+        try:
+            n, why = int(str(value).strip()), ""
+        except ValueError:
+            try:
+                f = float(value)
+            except (TypeError, ValueError):
+                return fallback, (f"{value!r} is not a number, so {fallback} "
+                                  f"is used")
+            if math.isnan(f) or math.isinf(f):
+                return fallback, (f"{value!r} is not a finite number, so "
+                                  f"{fallback} is used")
+            n = int(f)
+            why = ("" if n == f else
+                   f"{value!r} is truncated to {n} — {cls} holds whole "
+                   f"numbers")
+    lo, hi = _INT32
+    if not lo <= n <= hi:
+        n = max(lo, min(hi, n))
+        why = (f"{value!r} is past the 32-bit int a {cls} holds, so {n} is "
+               f"used — the number itself raises OverflowError in _build")
+    return n, why
+
+
+# ============================================================
+# Menus
+# ============================================================
+#
+# `menus` is typed "tree" in gui_shapes and nothing between a hand-edited .gspec
+# and here checks its shape — gui_describe insists on [{"title", "items"}], but
+# only for a model-authored description. The designer's own canvas
+# (designer_paint._render_menubar) happily draws a plain list of titles, so a
+# wireframe can look right and still carry one. Measured before this existed:
+# menus=["File", "Edit"] killed emit with "AttributeError: 'str' object has no
+# attribute 'get'", and the old code imported gui_shapes.menu_tree, which has
+# never existed, so its try/except hid that the "normalised" path never ran.
+
+#: A node in the normalised tree: "-" is a separator, a str is an item, and a
+#: (title, children) pair is a submenu.
+_MenuNode = Union[str, Tuple[str, list]]
+
+_MENU_TITLE_KEYS = ("title", "label", "name", "text")
+
+#: Keys that say what a menu dict IS, so a one-key dict holding one of them
+#: is never read as {title: items}. That reading used to come first: measured,
+#: {"title": ""} became a menu called "title", {"items": [...]} one called
+#: "items", and {"separator": True} / {"type": "separator"} submenus called
+#: "separator" and "type". Exact keys, as _menu_title reads them — {"Type":
+#: [...]} is still a menu someone called Type.
+_MENU_KEYS = frozenset(_MENU_TITLE_KEYS) | {"items", "separator", "type"}
+
+
+def _menu_title(d: Dict[str, Any]) -> str:
+    for key in _MENU_TITLE_KEYS:
+        if d.get(key):
+            return str(d[key])
+    return ""
+
+
+def _is_menu_rule(d: Dict[str, Any]) -> bool:
+    """{"separator": True} or {"type": "separator"} — Tk's add_separator."""
+    return (bool(d.get("separator"))
+            or str(d.get("type") or "").strip().lower() == "separator")
+
+
+def _titled(d: Dict[str, Any]) -> Optional[Tuple[str, Any]]:
+    """{"Recent": ["a.txt"]} as ("Recent", ["a.txt"]) — a menu named by its
+    only key — or None when that key is blank or says what the dict is."""
+    if len(d) != 1:
+        return None
+    (key, sub), = d.items()
+    title = str(key).strip()
+    if not title or key in _MENU_KEYS:
+        return None
+    return title, sub
+
+
+def _menu_children(raw: Any) -> List[_MenuNode]:
+    """The items under one menu, normalised."""
+    if raw is None:
+        return []
+    if isinstance(raw, (str, dict)):
+        raw = [raw]
+    out: List[_MenuNode] = []
+    for item in list(raw) if isinstance(raw, (list, tuple)) else []:
+        if item is None:
+            continue
+        if isinstance(item, dict):
+            title = _menu_title(item)
+            titled = None if title else _titled(item)
+            if _is_menu_rule(item):
+                out.append("-")
+            elif titled is not None:
+                out.append((titled[0], _menu_children(titled[1])))
+            elif "items" in item:
+                out.append((title or "Menu", _menu_children(item["items"])))
+            elif title.strip():
+                out.append("-" if set(title.strip()) == {"-"} else title)
+            continue
+        if isinstance(item, (list, tuple, set)):
+            continue                   # no reading of a bare nested list
+        label = str(item).strip()
+        if not label:
+            continue
+        # "-" and "---" both read as a rule to whoever typed them.
+        out.append("-" if set(label) == {"-"} else label)
+    return out
+
+
+def _menu_tree(menus: Any) -> List[Tuple[str, List[_MenuNode]]]:
+    """A menubar's `menus` prop as [(title, children)], whatever form it took.
+
+    Accepted: the canonical [{"title": str, "items": [...]}]; a plain list of
+    titles, each a top-level menu with no items yet; a {title: [items]}
+    mapping (the "{menu: [items]} tree" gui_shapes' catalogue describes); and
+    a comma-separated string of titles, the spelling the designer's canvas
+    reads a menubar's label in. Anything unreadable is skipped rather than
+    fatal — a menubar that shows fewer menus is still a window that opens.
+    """
+    if not menus:
+        return []
+    if isinstance(menus, str):
+        menus = [t.strip() for t in menus.split(",") if t.strip()]
+    if isinstance(menus, dict):
+        menus = [{"title": k, "items": v} for k, v in menus.items()]
+    out: List[Tuple[str, List[_MenuNode]]] = []
+    for i, menu in enumerate(list(menus) if isinstance(menus, (list, tuple))
+                             else []):
+        if isinstance(menu, dict):
+            if _is_menu_rule(menu):
+                # A rule BETWEEN menus: the designer's canvas draws nothing
+                # for it, and a menu bar is not a menu to rule off.
+                continue
+            title = _menu_title(menu)
+            titled = None if title else _titled(menu)
+            if titled is not None:
+                out.append((titled[0], _menu_children(titled[1])))
+                continue
+            out.append((title or f"Menu {i + 1}",
+                        _menu_children(menu.get("items"))))
+        elif isinstance(menu, (str, int, float)) and str(menu).strip():
+            out.append((str(menu).strip(), []))
+    return out
+
+
 def _menu_lines(w: WidgetSpec, ind: str, ref: str) -> List[str]:
     """A menubar's declared tree as addMenu/addAction calls.
 
-    Every leaf routes to the widget's single handler with its label, the same
-    shape the Tk target uses, so handlers.py sees one on_<name>(label).
+    Every leaf is added through _MenuBar.item, which makes choosing it fire
+    the bar's ``fired`` signal with its label — the Toolbar's shape. From
+    there it reaches ONE handler, on_menu(label), connected in _handler_lines
+    after the ports exist, and every ports.<menubar>.on_fire subscriber,
+    through the _EventPort that connects to ``fired``. The leaves used to
+    connect straight to _command(self, "on_menu", label), which reached the
+    handler but no subscriber: QMenuBar has no clicked and no fired, so the
+    port had nothing to connect to (measured: on_fire never ran). Before
+    that, `self.on_menu(_n)` named a method nothing defined, and every menu
+    click raised AttributeError; MainUi now defines an on_menu stub whenever
+    the window has a menubar, the way it always defined on_toolbar.
     """
     out: List[str] = []
-    try:
-        from gui_shapes import menu_tree
-        tree = menu_tree(_prop(w, "menus", []) or [])
-    except Exception:
-        tree = list(_prop(w, "menus", []) or [])
-    handler = w.handler or "on_menu"
-    for i, menu in enumerate(tree):
-        title = str((menu or {}).get("title") or f"Menu {i + 1}")
+
+    def items(var: str, children: List[_MenuNode]) -> None:
+        for j, node in enumerate(children):
+            if isinstance(node, tuple):
+                title, sub = node
+                child = f"{var}_{j}"
+                out.append(f"{ind}{child} = {var}.addMenu({_py(title)})")
+                items(child, sub)
+            elif node == "-":
+                out.append(f"{ind}{var}.addSeparator()")
+            else:
+                out.append(f"{ind}{ref}.item({var}, {_py(node)})")
+
+    for i, (title, children) in enumerate(_menu_tree(_prop(w, "menus", []))):
+        if not children:
+            # A title with nothing under it yet: a menu that opens empty,
+            # which is what the wireframe says. No variable, or it is unused.
+            out.append(f"{ind}{ref}.addMenu({_py(title)})")
+            continue
         var = f"_menu_{i}"
         out.append(f"{ind}{var} = {ref}.addMenu({_py(title)})")
-        for item in (menu or {}).get("items") or []:
-            label = str(item)
-            if label == "-":
-                out.append(f"{ind}{var}.addSeparator()")
-                continue
-            out.append(f"{ind}{var}.addAction({_py(label)}).triggered.connect(")
-            out.append(f"{ind}    lambda _checked=False, _n={_py(label)}: "
-                       f"self.{handler}(_n))")
+        items(var, children)
     return out
 
 
@@ -372,12 +601,14 @@ def _qt_class_of(kind: str) -> str:
 # ============================================================
 
 def place_call(w: WidgetSpec, parent_layout: str) -> str:
-    """The layout call for one widget, as Tk's geometry manager would place it."""
+    """The layout call for one widget, as Tk's geometry manager would place it.
+
+    Every parent layout this is handed is a QGridLayout — `_root`, or the
+    `_lay_<name>` each container gets; notebook and panedwindow children never
+    reach here. So a pack has to be a grid cell too (see _pack).
+    """
     if w.manager == "pack":
-        return (f"{parent_layout}.addWidget(self.{w.name}, 1)"
-                if w.padx == 0 and w.pady == 0 else
-                f"_pad({parent_layout}, self.{w.name}, "
-                f"{w.padx}, {w.pady}, stretch=1)")
+        return f"_pack({parent_layout}, self.{w.name}, {w.padx}, {w.pady})"
     if w.manager == "place":
         # Tk's place has no Qt equivalent: _Rel keeps the child at a fraction of
         # its parent's size by following the parent's resize events.
@@ -386,6 +617,15 @@ def place_call(w: WidgetSpec, parent_layout: str) -> str:
     return (f"_cell({parent_layout}, self.{w.name}, {w.row}, {w.column}, "
             f"{w.rowspan}, {w.columnspan}, {_py(w.sticky)}, "
             f"{w.padx}, {w.pady})")
+
+
+def _request_call(made: str, width: int, height: int) -> str:
+    """construct()'s ``Class(args)``, built through the generated _requested
+    helper so the widget ASKS for ``width`` x ``height`` rather than being
+    held at least that big. Only an empty container gets here, and every
+    container kind constructs as a plain ``Class(args)`` call."""
+    cls, args = made.split("(", 1)
+    return f"_requested({width}, {height}, {cls}, {args}"
 
 
 def _grid_config(target: str, rows: Sequence[int], cols: Sequence[int],
@@ -409,6 +649,99 @@ def _grid_config(target: str, rows: Sequence[int], cols: Sequence[int],
         if ms:
             out.append(f"{indent}{target}.setColumnMinimumWidth({i}, {ms})")
     return out
+
+
+def _window_menu_bar(spec: Spec) -> Optional[WidgetSpec]:
+    """The menubar emit_main_ui hands to setMenuBar, or None: the first in
+    build order drawn on the WINDOW itself, with no container around it.
+
+    A menubar drawn inside a panel belongs to the panel, and setMenuBar would
+    lift it out to the top of the window. It used to be taken anyway when it
+    came first in build order — a panel is built before a menubar drawn on
+    the window after it — and the window's own menubar then went into a grid
+    cell as "A SECOND menu bar" (measured). A menubar in any container is now
+    laid out in that container, as a tab page's and a pane's always were.
+    """
+    for w in _ordered(spec):
+        if w.kind == "menubar" and not w.parent:
+            return w
+    return None
+
+
+def _fills(sticky: str, axis: str) -> bool:
+    """Whether ``sticky`` stretches a widget along ``axis`` ("row" is down,
+    "col" across) — the reading _sticky_policy gives it at run time, and the
+    one gui_layout's _sticky_for writes from the resolved resize."""
+    s = (sticky or "").lower()
+    ends = "ns" if axis == "row" else "we"
+    return ends[0] in s and ends[1] in s
+
+
+def _lift_menu_bar(spec: Spec, bar: WidgetSpec, rows: Sequence[int],
+                   cols: Sequence[int], row_min: Sequence[int],
+                   col_min: Sequence[int]):
+    """The grid ``bar`` was drawn in, once setMenuBar has lifted it out:
+    (rows, cols, row_min, col_min, notes for the generated file).
+
+    gui_layout lays the menubar out as a cell, which is what the drawing
+    shows, and weights its bands with it. setMenuBar then takes it OUT of the
+    grid, and the stretch it brought stays behind: measured on
+    qt_tests/c_menubar_dicts, the two columns only the menubar spanned became
+    EMPTY elastic columns either side of the text, and the text got 356 of
+    1100 px; with those stretches at 0 it gets 1074. On c_menubar_titles the
+    menubar's own row held the only row stretch, and the label drawn at y=48
+    sat at y=611; it now sits at y=60. So the stretch is worked
+    out again from what is still in the grid, by gui_layout's own rule (a
+    band stretches when a widget spanning it fills along that axis), and a
+    band only the menubar held keeps neither stretch nor minimum — its
+    minimum was the menubar's own.
+
+    gui_layout never leaves an axis with no stretch, and neither does this:
+    when nothing left fills along one, the slack goes to one EMPTY band past
+    the last, which is where Tk's grid (anchored nw) leaves it. Measured with
+    every stretch 0 instead, Qt spread the widgets across the window. The
+    widest band — gui_layout's own choice — cannot be picked here: the spec
+    keeps no band sizes.
+    """
+    others = [w for w in spec.widgets
+              if w.parent == bar.parent and w.name != bar.name
+              and w.manager == "grid"]
+    got: Dict[str, Tuple[List[int], List[int]]] = {}
+    slack: List[str] = []             # the axes given a band past the last
+    for axis, weights, mins in (("row", rows, row_min),
+                                ("col", cols, col_min)):
+        first = bar.row if axis == "row" else bar.column
+        span = bar.rowspan if axis == "row" else bar.columnspan
+        held, elastic = set(), set()
+        for w in others:
+            at = w.row if axis == "row" else w.column
+            band = range(at, at + (w.rowspan if axis == "row"
+                                   else w.columnspan))
+            held.update(band)
+            if _fills(w.sticky, axis):
+                elastic.update(band)
+        emptied = set(range(first, first + span)) - held
+        # Along an axis the menubar filled, every band it spanned was made
+        # elastic by it; along any other, only an emptied band loses stretch.
+        keep = (elastic if _fills(bar.sticky, axis)
+                else set(range(len(weights))) - emptied)
+        new = [wgt if i in keep else 0 for i, wgt in enumerate(weights)]
+        if not any(new):
+            new.append(1)
+            slack.append(axis)
+        got[axis] = (new, [0 if i in emptied else m
+                           for i, m in enumerate(mins)])
+    notes = [f"{bar.name} is window chrome (setMenuBar below), not a cell: "
+             f"the stretch its bands had is left out, or they would sit "
+             f"empty and take space from the widgets."]
+    if slack:
+        ways = " or ".join({"row": "down", "col": "across"}[a] for a in slack)
+        bands = " and ".join({"row": "row", "col": "column"}[a]
+                             for a in slack)
+        notes.append(f"Nothing left in this grid stretches {ways}, so the "
+                     f"slack goes to an empty {bands} after the last, and "
+                     f"every widget stays where it was drawn.")
+    return got["row"][0], got["col"][0], got["row"][1], got["col"][1], notes
 
 
 # ============================================================
@@ -567,13 +900,70 @@ def _cell(grid, widget, row, column, rowspan, columnspan, sticky, padx, pady):
         grid.addWidget(widget, row, column, rowspan, columnspan, align)
 
 
-def _pad(box, widget, padx, pady, stretch=0):
-    """The pack equivalent: one widget in a margin-carrying sub-layout."""
-    from PySide6.QtWidgets import QVBoxLayout
-    inner = QVBoxLayout()
-    inner.setContentsMargins(padx, pady, padx, pady)
-    inner.addWidget(widget)
-    box.addLayout(inner, stretch)
+def _pack(grid, widget, padx, pady):
+    """Tk's pack(fill="both", expand=True): a container's ONLY child.
+
+    gui_layout packs a sole child rather than gridding it — the root window's
+    one shape, or the one widget inside a frame, labelframe or freeform area.
+    Every layout here is a QGridLayout, which has no pack. The old emission
+    called addWidget(w, 1) / addLayout(inner, 1), overloads only a box layout
+    has; measured: a window holding one frame with one label died in _build
+    with "QGridLayout.addLayout(): not enough arguments". One cell that fills
+    AND stretches is what pack(fill="both", expand=True) means.
+    """
+    grid.setRowStretch(0, 1)
+    grid.setColumnStretch(0, 1)
+    _cell(grid, widget, 0, 0, 1, 1, "nsew", padx, pady)
+
+
+def _requested(width, height, cls, *args):
+    """``cls(*args)`` asking for ``width`` x ``height``: Tk's
+    configure(width=, height=) on an EMPTY container, which would otherwise
+    collapse to nothing and lose the region that was drawn.
+
+    Tk's is a REQUEST — the window opens at it where there is room, and the
+    grid shrinks it where there is not. setMinimumSize, the spelling this
+    replaces, is a FLOOR: measured, one empty notebook drawn 544x360 held its
+    window at 1100x780 when it was resized to the 1100x700 it was drawn on.
+    Qt's request is sizeHint(), which has no setter, only an answer — so the
+    widget is made from a subclass of its own class that answers it. Its
+    minimum stays the class's own, so the window can still shrink, and a
+    stylesheet selector naming the Qt class still matches it.
+    """
+    from PySide6.QtCore import QSize
+
+    class _Requesting(cls):
+        def sizeHint(self):
+            return QSize(width, height)
+
+    return _Requesting(*args)
+
+
+def _command(ui, handler, *fixed):
+    """A slot that runs ui.<handler> — Tk's command=self.on_<name>, for Qt.
+
+    LATE LOOKUP, for the reason _EventPort uses it: App(HandlerMixin, MainUi)
+    puts the handlers.py body ahead of MainUi's stub, and resolving the name
+    at the moment of the click also lets an override made after construction
+    win. A name that resolves to nothing is a click that does nothing, never
+    an AttributeError — the menubar used to call self.on_menu directly, which
+    nothing defined, so every menu click raised.
+
+    ``fixed`` replaces the signal's own arguments: a menu item's triggered
+    carries a checked flag, and the handler wants the item's label.
+
+    An exception from the handler is deliberately NOT caught here. PySide6
+    prints the full traceback to stderr — the designer's log — and keeps the
+    window running, which is what Tk's report_callback_exception does for a
+    command=. Measured on PySide6 6.10.2: a slot that raised printed its
+    traceback and click() returned normally. Catching it would only trade the
+    traceback for a one-line repr.
+    """
+    def _slot(*args):
+        method = getattr(ui, handler, None)
+        if callable(method):
+            method(*(fixed or args))
+    return _slot
 
 
 def _place(widget, relx, rely, relwidth, relheight):
@@ -612,11 +1002,95 @@ def _place(widget, relx, rely, relwidth, relheight):
 '''
 
 
+# Qt classes given the one signal Tk's version of the widget has and Qt's has
+# not. Subclasses, not wrappers: a QSS type selector matches a subclass (Qt
+# walks the metaobject chain), so the `QSpinBox#name` / `QMenuBar#name` rule
+# _style_lines writes still colours them — measured on the palette the rule
+# sets, which a selector naming another class leaves alone — and isinstance,
+# findChildren and layout().menuBar() see the class they always saw.
+
+SPIN_BOX = '''
+
+class _SpinBox(QSpinBox):
+    """A QSpinBox with the signal Tk's Spinbox command= fires on.
+
+    Tk runs command= for an arrow and never for a keystroke. QSpinBox has no
+    such signal: valueChanged fires per KEY while a number is typed (keyboard
+    tracking — measured, typing 12 is valueChanged(1), then (12)), on every
+    setValue, and once more on Return. So ``committed`` fires for a step —
+    an arrow, Up/Down, PageUp/PageDown, the wheel, stepUp() — and for a typed
+    value once it is committed, by Return or by leaving the box, if it
+    differs from the value before typing began. MainUi connects on_<name> to
+    it. valueChanged is untouched, so the port's on_change still follows
+    every keystroke and every write, as it always has.
+    """
+
+    committed = Signal(int)
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        # _settled: the value before typing began. _seen: the last value.
+        self._settled = self._seen = self.value()
+        self.valueChanged.connect(self._follow)
+        self.editingFinished.connect(self._commit_typed)
+
+    def stepBy(self, steps):
+        super().stepBy(steps)
+        self._settled = self.value()
+        self.committed.emit(self._settled)
+
+    def _follow(self, value):
+        # A write that did not come from typing moves _settled. Typing
+        # leaves the line edit modified until the value is committed;
+        # setValue, setRange's clamp and a step rewrite the edit, which
+        # clears that (measured, PySide6 6.10.2). Return re-emits the value
+        # typing already reached with the edit no longer modified, so only a
+        # CHANGE counts — or that echo would settle the typed value before
+        # editingFinished could see that it moved.
+        if value != self._seen and not self.lineEdit().isModified():
+            self._settled = value
+        self._seen = value
+
+    def _commit_typed(self):
+        # editingFinished: Return, and EVERY focus loss — so it is compared.
+        if self.value() != self._settled:
+            self._settled = self.value()
+            self.committed.emit(self._settled)
+'''
+
+MENU_BAR = '''
+
+class _MenuBar(QMenuBar):
+    """A QMenuBar whose items fire ``fired(label)``, as a Toolbar's buttons do.
+
+    _EventPort connects a widget's `clicked` or `fired`, and QMenuBar has
+    neither, so ports.<menubar>.on_fire(f) subscribers never ran. With
+    ``fired`` the menubar is wired exactly as the toolbar is: the port runs
+    its subscribers for every item chosen, MainUi connects fired to
+    on_menu(label) once, and the port's own handler is "" for both, so
+    ports.<name>.fire() runs the subscribers and not the handler.
+    """
+
+    fired = Signal(str)
+
+    def item(self, menu, label):
+        """Add ``label`` to ``menu``; choosing it fires ``label``."""
+        menu.addAction(label).triggered.connect(
+            lambda _checked=False: self.fired.emit(label))
+'''
+
+#: kind -> the generated subclass its construct() names.
+_SUBCLASSES = {"spinbox": SPIN_BOX, "menubar": MENU_BAR}
+
+
 def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
     r = dict(regions or {})
     composites = sorted({w.kind for w in spec.widgets
                          if w.kind in COMPOSITE_KINDS})
     used = {w.kind for w in spec.widgets}
+    # Only the subclasses this window builds: an unused class, like an unused
+    # import, would misstate what the window contains.
+    subclasses = [_SUBCLASSES[k] for k in sorted(used & set(_SUBCLASSES))]
     L: List[str] = [
         '"""Generated by the GUI Designer. DO NOT EDIT — regeneration',
         'overwrites this file. Behaviour belongs in app.py; small in-place',
@@ -624,7 +1098,7 @@ def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
         '"""',
         "from __future__ import annotations",
         "",
-        "from PySide6.QtCore import Qt",
+        "from PySide6.QtCore import Qt" + (", Signal" if subclasses else ""),
         "from PySide6.QtWidgets import (" + ", ".join(sorted(
             _widget_imports(used))) + ")",
         "",
@@ -636,6 +1110,7 @@ def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
     L.append("from .ports import Ports")
     L.append(STOP_WATCHER.rstrip())
     L.append(LAYOUT_HELPERS.rstrip())
+    L += [s.rstrip() for s in subclasses]
     L.append("")
 
     root_bg = _gcol.normalise(spec.root_bg) if spec.root_bg else ""
@@ -675,6 +1150,18 @@ def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
         "        if self._closing:",
         "            return",
         "        self._closing = True",
+        "        # A value still being TYPED is committed first, so its handler",
+        "        # runs before on_close rather than after it. Measured: a spinbox",
+        "        # holding a typed 9 at Stop ran on_close and THEN its handler,",
+        "        # because hiding the window is what took focus from the box -",
+        "        # a handler reaching hardware on_close had already released.",
+        "        try:",
+        "            from PySide6.QtWidgets import QApplication",
+        "            focused = QApplication.focusWidget()",
+        "            if focused is not None and self.isAncestorOf(focused):",
+        "                focused.clearFocus()",
+        "        except Exception:",
+        "            pass",
         "        try:",
         "            self.on_close()",
         "        except Exception as exc:",
@@ -748,8 +1235,25 @@ def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
         L.append(f"{ind}self.setObjectName('_MainUi')")
         L.append(f"{ind}self.setAutoFillBackground(True)")
         L.append(f"{ind}self.setStyleSheet({_py(css)})")
-    L += _grid_config("_root", spec.root_row_weights, spec.root_col_weights,
-                      spec.root_row_minsizes, spec.root_col_minsizes, ind)
+    # The menubar that takes the window's one menu-bar slot, known up front:
+    # the grid it was drawn in is configured before the menubar is reached.
+    menu_bar = _window_menu_bar(spec)
+    menu_bar_of_window = menu_bar.name if menu_bar is not None else ""
+
+    def grid_lines(target: str, holder: Optional[str], rows, cols, row_min,
+                   col_min) -> List[str]:
+        notes: List[str] = []
+        if (menu_bar is not None and menu_bar.parent == holder
+                and menu_bar.manager == "grid"):
+            rows, cols, row_min, col_min, notes = _lift_menu_bar(
+                spec, menu_bar, rows, cols, row_min, col_min)
+        out = [f"{ind}# {line}" for note in notes
+               for line in textwrap.wrap(note, 79 - len(ind) - 2)]
+        return out + _grid_config(target, rows, cols, row_min, col_min, ind)
+
+    L += grid_lines("_root", None, spec.root_row_weights,
+                    spec.root_col_weights, spec.root_row_minsizes,
+                    spec.root_col_minsizes)
     L.append("")
 
     layouts: Dict[str, str] = {}      # widget name -> the layout of its children
@@ -761,7 +1265,13 @@ def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
         parent_kind = parent_spec.kind if parent_spec else ""
         parent_layout = layouts.get(w.parent or "", "_root")
         L.append(f"{ind}# {w.kind}: {_c(w.label or w.name)}")
-        L.append(f"{ind}self.{w.name} = {construct(w, parent)}")
+        made = construct(w, parent)
+        if w.is_container and w.explicit_w and w.explicit_h:
+            # EMPTY: gui_layout sizes only an empty container, at the size it
+            # was drawn. Asked for, not imposed — see _requested. This line
+            # used to be setMinimumSize after placement, a floor Tk never had.
+            made = _request_call(made, w.explicit_w, w.explicit_h)
+        L.append(f"{ind}self.{w.name} = {made}")
         L.extend(configure_lines(w, ind))
         if parent_kind == "notebook":
             i = _tab_index.get(w.parent, 0)
@@ -771,11 +1281,30 @@ def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
             L.append(f"{ind}{parent}.addTab(self.{w.name}, {_py(title)})")
         elif parent_kind == "panedwindow":
             L.append(f"{ind}{parent}.addWidget(self.{w.name})")
-        elif w.kind == "menubar":
-            # A menu bar is chrome, not a cell: Tk attaches it to the window and
-            # skips the geometry manager entirely, and setMenuBar is the same
-            # move — it works on a plain QWidget's layout.
+        elif w.name == menu_bar_of_window:
+            # A menu bar is chrome, not a cell: Tk's spelling is the window's
+            # menu= slot, outside the geometry manager, and setMenuBar is the
+            # same move — it works on a plain QWidget's layout. The grid it was
+            # drawn in was configured without it (_lift_menu_bar). (The Tk
+            # TARGET does not do this yet: measured, it grids its tk.Menu and
+            # _build dies with "can't manage ...: it's a top-level window".)
             L.append(f"{ind}_root.setMenuBar(self.{w.name})")
+        elif w.kind == "menubar" and w.parent:
+            # Drawn inside a container, so it is that container's: the
+            # window's menu-bar slot would lift it to the top of the window.
+            L += _note(ind, f"Drawn inside {w.parent}, so laid out there, "
+                            f"not given the window's menu-bar slot, which "
+                            f"would lift it to the top of the window.")
+            L.append(f"{ind}{place_call(w, parent_layout)}")
+        elif w.kind == "menubar":
+            # A window has ONE menu-bar slot. A second setMenuBar would replace
+            # the first without a word and one drawn menubar would vanish, so
+            # this one is laid out where it was drawn, like any other widget.
+            L.append(f"{ind}# A SECOND menu bar. {menu_bar_of_window} already "
+                     f"holds the window's one")
+            L.append(f"{ind}# menu-bar slot, so this one is laid out where it "
+                     f"was drawn.")
+            L.append(f"{ind}{place_call(w, parent_layout)}")
         else:
             L.append(f"{ind}{place_call(w, parent_layout)}")
         if w.is_container:
@@ -784,11 +1313,9 @@ def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
             if w.kind not in ("notebook", "panedwindow"):
                 L.append(f"{ind}{lay} = QGridLayout(self.{w.name})")
                 if w.row_weights or w.col_weights:
-                    L += _grid_config(lay, w.row_weights, w.col_weights,
-                                      w.row_minsizes, w.col_minsizes, ind)
-            if w.explicit_w and w.explicit_h:
-                L.append(f"{ind}self.{w.name}.setMinimumSize("
-                         f"{w.explicit_w}, {w.explicit_h})")
+                    L += grid_lines(lay, w.name, w.row_weights,
+                                    w.col_weights, w.row_minsizes,
+                                    w.col_minsizes)
         L += _region(w.name, ind, r.pop(w.name, ""))
         L.append("")
 
@@ -796,17 +1323,120 @@ def emit_main_ui(spec: Spec, regions: Optional[Dict[str, str]] = None) -> str:
     L.append(f"{ind}self.ports = Ports(self)")
     L.append("")
 
+    wiring = _handler_lines(spec, ind)
+    if wiring:
+        L.append(f"{ind}# -- handlers: Tk's command=self.on_<name> -----------")
+        L.append(f"{ind}# Connected AFTER the ports: a port seeding its default")
+        L.append(f"{ind}# must not run a handler while the window is half built.")
+        L += wiring
+        L.append("")
+
+    hooks = spec.handlers + ["on_toolbar"]
+    hooks += [h for h in _menu_handlers(spec) if h not in hooks]
     L += [
         "    # -- handler hooks -------------------------------------------",
         "    # Defined here so main_ui is runnable on its own; app.py overrides",
         "    # them. Without these a preview of the raw UI would die on the",
         "    # first click with an AttributeError.",
     ]
-    for h in spec.handlers + ["on_toolbar"]:
+    for h in hooks:
         L.append(f"    def {h}(self, *args) -> None:")
         L.append("        pass")
         L.append("")
     return "\n".join(L).rstrip() + "\n"
+
+
+#: kind -> the signal MainUi connects to on_<name>: what Tk's command= fires on.
+#:
+#: Tk's command= runs on a USER action and never on a programmatic write —
+#: ports.<name>.set() does not call it, and handlers.py is written against that.
+#: Where Qt has a signal that means exactly "the user did it", that is the one
+#: used; measured on PySide6 6.10.2, offscreen:
+#:   QCheckBox     setChecked -> toggled only;  click() -> toggled AND clicked
+#:   QRadioButton  click() on the checked one again -> clicked only (Tk's
+#:                 command fires on every click too; toggled would not)
+#:   QComboBox     setCurrentIndex -> currentTextChanged only;
+#:                 a Down key -> currentTextChanged, activated, textActivated
+#: So `toggled` / `currentTextChanged` would ALSO run the handler whenever the
+#: app or a port default wrote the widget. Measured with toggled connected at
+#: build time: the first radio of EVERY group (gui_ports gives each group a
+#: default) and a checkbox with a port default both ran their handler inside
+#: Ports(self), where self.ports does not exist yet — the very thing a
+#: script-linked handler reads first.
+#:
+#: QSpinBox and QSlider have no user-only value signal (setValue, stepUp and a
+#: key press all emit valueChanged and nothing else). QSlider uses
+#: valueChanged, connected after the ports are built so construction never
+#: fires it. The difference from Tk that remains THERE: a later programmatic
+#: write — a port set, or a frame browser resizing its index — runs its
+#: handler too.
+#:
+#: The spinbox no longer does. On valueChanged its handler ran once per
+#: KEYSTROKE with a partial number — measured, typing 12 ran it with 1 and
+#: then 12, and Return ran it with 12 again — where Tk's Spinbox runs
+#: command= for an arrow only. It is built as the generated _SpinBox
+#: (SPIN_BOX), whose `committed` fires for a step, or for a typed value once
+#: Return or leaving the box commits it and it differs from what was there;
+#: never for a keystroke or a programmatic write. The one difference from Tk
+#: left: Tk runs nothing for a committed typed value at all.
+#:
+#: Scrubber and FilePicker are ours (WIDGETS_PY), so they carry the user-only
+#: signal Tk's versions have as command=: `stepped` and `chosen`. Their
+#: `changed` fires on every set, and Scrubber.set emits it even when the value
+#: did not change, so a handler that wrote its own scrubber re-enters itself
+#: until the stack runs out — measured: 332 nested calls, then RecursionError.
+_COMMAND_SIGNAL = {
+    "button": "clicked",
+    "checkbutton": "clicked",
+    "radiobutton": "clicked",
+    "combobox": "textActivated",
+    "spinbox": "committed",
+    "scale": "valueChanged",
+    "scrubber": "stepped",
+    "file_picker": "chosen",
+}
+
+
+def _handler_lines(spec: Spec, ind: str) -> List[str]:
+    """The connect() lines that make each widget reach its handler.
+
+    A button WITH an event port is skipped: its _EventPort already connects
+    clicked to the handler (and to every on_fire subscriber), and a second
+    connection would run the handler twice per click. A button whose port is
+    switched off has no _EventPort, and before this line existed no click on
+    it reached anything.
+
+    The toolbar is not a COMMAND_KIND — its _EventPort gets handler "" — but
+    Tk passes it command=self.on_toolbar, and MainUi has always defined an
+    on_toolbar stub for it to reach. It did not reach it on Qt until now.
+    The menubar is wired the same way, through the `fired` signal _MenuBar
+    gives it, so its port reaches its subscribers exactly as a toolbar's does.
+    """
+    out: List[str] = []
+    for w in _ordered(spec):
+        if w.kind == "toolbar":
+            out.append(f"{ind}self.{w.name}.fired.connect("
+                       f"_command(self, {_py('on_toolbar')}))")
+            continue
+        if w.kind == "menubar":
+            out.append(f"{ind}self.{w.name}.fired.connect("
+                       f"_command(self, {_py(w.handler or 'on_menu')}))")
+            continue
+        signal = _COMMAND_SIGNAL.get(w.kind)
+        if not signal or not w.handler:
+            continue
+        if (w.kind == "button" and w.port is not None
+                and w.port.binder == "event"):
+            continue
+        out.append(f"{ind}self.{w.name}.{signal}.connect("
+                   f"_command(self, {_py(w.handler)}))")
+    return out
+
+
+def _menu_handlers(spec: Spec) -> List[str]:
+    """The handler names menu items call, for MainUi's stubs."""
+    return sorted({w.handler or "on_menu" for w in spec.widgets
+                   if w.kind == "menubar"})
 
 
 def _widget_imports(kinds) -> set:
@@ -921,7 +1551,7 @@ extension.
 """
 from __future__ import annotations
 
-from PySide6.QtCore import QPoint, QRect, Qt, Signal
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, Signal
 from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QFileDialog, QFrame, QHBoxLayout,
                                QLabel, QLineEdit, QProgressBar, QPushButton,
@@ -1365,6 +1995,16 @@ class _Viewport(QWidget):
         self.setMouseTracking(False)
         self.setMinimumSize(40, 40)
 
+    def sizeHint(self):
+        """What the Tk version's Canvas asks for: Tk's default 10c x 7c, which
+        is 378x265 at 96 dpi. A plain QWidget asks for nothing, so the hint
+        fell to the 40x40 minimum, and wherever gui_layout does not stretch
+        the canvas (a "fixed" frame holding it) that IS its size: measured, a
+        frame drawn 336x560 rendered 66x66 on Qt and 382x269 on Tk. Only the
+        hint, not the minimum — a request the layout can shrink, as Tk's is.
+        """
+        return QSize(378, 265)
+
     def paintEvent(self, event):
         painter = QPainter(self)
         try:
@@ -1450,9 +2090,27 @@ class ChartPanel(QWidget):
 
 
 class Scrubber(QWidget):
-    """Slider + index box + prev/next + total, bound to one integer index."""
+    """Slider + index box + prev/next + total, bound to one integer index.
+
+    TWO SIGNALS, ON PURPOSE. ``changed`` fires on EVERY set — programmatic
+    ones included, and even when the value did not move — because that is
+    what a port's on_change must see. ``stepped`` fires only when the USER
+    moved it (prev/next, a drag, a typed index): that is what Tk's command=
+    fires on, and what MainUi connects on_<name> to. A handler on ``changed``
+    that set its own scrubber re-entered itself 332 times, then RecursionError.
+
+    THE INDEX BOX. Tk binds its <Return> and nothing else, and runs command=
+    for it whether or not the index moved; returnPressed is that. Leaving the
+    box is Qt's editingFinished too, and Qt 6 emits it on focus loss whenever
+    the text changed since it last fired — which set() does on every write,
+    so a set(4) by the app and a click through the box ran the handler with
+    4, and Return then leaving ran it twice (measured). Leaving now commits
+    a typed index so the box never shows one number and the slider another,
+    and runs the handler only if the index MOVED.
+    """
 
     changed = Signal(int)
+    stepped = Signal(int)
 
     def __init__(self, parent=None, *, from_: int = 0, to: int = 100,
                  show_total: bool = True):
@@ -1480,12 +2138,20 @@ class Scrubber(QWidget):
         self._prev.clicked.connect(lambda: self.step(-1))
         self._next.clicked.connect(lambda: self.step(1))
         self.slider.valueChanged.connect(self._from_slider)
-        self.entry.editingFinished.connect(self._from_entry)
+        self.entry.returnPressed.connect(self._from_entry)
+        self.entry.editingFinished.connect(self._left_entry)
         self.set(self._lo)
 
     def set_range(self, lo: int, hi: int) -> None:
         self._lo, self._hi = int(lo), int(hi)
+        # BLOCKED, as in set(). setRange clamps the slider's value and emits
+        # valueChanged, which _from_slider takes for a drag: measured, a
+        # scrubber at 5 given set_range(0, 2) ran its handler with 2 — and
+        # _FrameBrowser.reload calls this on every folder load and once at
+        # startup. The set() below moves slider, box and `changed` together.
+        was = self.slider.blockSignals(True)
         self.slider.setRange(self._lo, self._hi)
+        self.slider.blockSignals(was)
         self.total.setText(f"/ {self._hi}")
         self.set(min(max(self.get(), self._lo), self._hi))
 
@@ -1513,6 +2179,7 @@ class Scrubber(QWidget):
         self._listener = fn
 
     def _fire(self, value) -> None:
+        self.stepped.emit(value)
         fn = getattr(self, "_listener", None)
         if fn is not None:
             try:
@@ -1526,10 +2193,23 @@ class Scrubber(QWidget):
             self.set(v, notify=True)
 
     def _from_entry(self) -> None:
+        """Return: Tk's <Return> binding, which notifies moved or not."""
         try:
             self.set(int(self.entry.text()), notify=True)
         except ValueError:
             self.set(self.get())
+
+    def _left_entry(self) -> None:
+        """editingFinished: after Return (whose _from_entry already made the
+        value match the box, so this does nothing) or on leaving the box."""
+        try:
+            v = max(self._lo, min(self._hi, int(self.entry.text())))
+        except ValueError:
+            v = self._value
+        if v != self._value:
+            self.set(v, notify=True)
+        elif self.entry.text() != str(v):
+            self.entry.setText(str(v))  # unreadable or past the end: re-show
 
     # region: custom:Scrubber -- preserved across regeneration
     # endregion
@@ -1577,9 +2257,15 @@ class LogPane(QWidget):
 
 
 class FilePicker(QWidget):
-    """Entry + Browse, for a file, a folder, or a save target."""
+    """Entry + Browse, for a file, a folder, or a save target.
+
+    ``changed`` follows the text (every keystroke, every set) for the port.
+    ``chosen`` fires only when Browse picked a path — the one moment Tk's
+    FilePicker calls its command=, and what MainUi connects on_<name> to.
+    """
 
     changed = Signal(str)
+    chosen = Signal(str)
 
     def __init__(self, parent=None, *, mode: str = "file", filetypes=None):
         super().__init__(parent)
@@ -1610,6 +2296,7 @@ class FilePicker(QWidget):
             path, _ = QFileDialog.getOpenFileName(self, "Choose a file", "", ft)
         if path:
             self.set(path)
+            self.chosen.emit(path)
 
     # region: custom:FilePicker -- preserved across regeneration
     # endregion
@@ -1703,8 +2390,11 @@ port has:
 
 An event port (button/toolbar/menubar) exposes:
 
-    .on_fire(f)   f() runs when the button is pressed
-    .fire()       call the handler as if the user pressed it
+    .on_fire(f)   f() runs when the button is pressed, or a toolbar button
+                  or menu item chosen
+    .fire()       run the subscribers — and a button's handler — as if the
+                  user pressed it. A toolbar's on_toolbar and a menubar's
+                  on_menu take the label chosen, which fire() has not got
     .enable(b)
 
 Ports as a whole exposes:
@@ -1898,9 +2588,16 @@ class _WidgetPort(_Port):
 
 
 class _RadioPort(_Port):
-    """One value shared by a group of QRadioButtons."""
+    """One value shared by a group of QRadioButtons.
 
-    __slots__ = ("_group", "_values", "_subs", "_last")
+    `_pending` IS IN __slots__. _Port declares slots, so an attribute missing
+    from them cannot be set at all — and gui_ports gives every radio group a
+    default (the first radio's value), so `self._pending = default` ran for
+    every group. Measured: any window with a radiobutton died inside
+    Ports(self) with "'_RadioPort' object has no attribute '_pending'".
+    """
+
+    __slots__ = ("_group", "_values", "_subs", "_last", "_pending")
 
     def __init__(self, name, widget, *, type, direction, default=None):
         from PySide6.QtWidgets import QButtonGroup
@@ -1909,14 +2606,16 @@ class _RadioPort(_Port):
         self._values = {}
         self._subs = []
         self._last = None
-        if default is not None:
-            self._pending = default
+        self._pending = default
+        # ONCE, here. Connected in add() it was connected once per radio, and
+        # Qt keeps every duplicate: measured, one switch in a three-radio
+        # group ran _on_toggle six times (three per toggled button).
+        self._group.idToggled.connect(self._on_toggle)
 
     def add(self, button, value) -> None:
         ident = len(self._values)
         self._values[ident] = value
         self._group.addButton(button, ident)
-        self._group.idToggled.connect(self._on_toggle)
         pending = getattr(self, "_pending", None)
         if pending is not None and str(pending) == str(value):
             button.setChecked(True)
@@ -2491,10 +3190,14 @@ def emit_ports(spec: Spec, aliases: Optional[Dict[str, str]] = None) -> str:
         label = _c(primary.label or p.name)
 
         if p.binder == "event":
+            # A menubar's handler is connected in MainUi (_handler_lines), as
+            # on_toolbar is, so its port calls none — naming it here too would
+            # run every menu item twice.
+            handler = "" if primary.kind == "menubar" else primary.handler
             L.append(f"        # {p.kind}: {label} -> event")
             L.append(f"        self.{p.name} = _EventPort(\n"
                      f"            {_py(p.name)}, {wname}, ui=ui, "
-                     f"handler={_py(primary.handler or '')})")
+                     f"handler={_py(handler or '')})")
         elif p.binder == "text":
             L.append(f"        # {p.kind}: {label} -> str")
             L.append(f"        self.{p.name} = _TextPort(\n"

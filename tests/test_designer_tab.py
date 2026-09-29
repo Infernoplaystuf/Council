@@ -85,9 +85,9 @@ def tab(qapp, tmp_path):
     qapp.processEvents()
 
 
-def make_project(tab, name="demo", shapes=()):
+def make_project(tab, name="demo", shapes=(), toolkit="tk"):
     tab.answers["text"].append(name)
-    tab.answers["choice"].append("standalone")
+    tab.answers["choice"].extend(["standalone", toolkit])
     tab.on_new()
     if shapes:
         tab.canvas.scene.load(list(shapes))
@@ -477,7 +477,7 @@ def test_no_worker_touches_a_widget_directly(tab):
 
     source = (ROOT / "council_qt" / "tabs" / "designer.py").read_text(
         encoding="utf-8")
-    for worker in ("on_generate", "on_review"):
+    for worker in ("on_generate", "on_review", "on_describe"):
         body = code_of(source, worker)
         assert "_to_ui" in body, f"{worker} has no marshalling seam"
         inner = body.split("def work", 1)[1].split("def show", 1)[0]
@@ -607,3 +607,287 @@ def test_the_picker_never_runs_anything(tab):
         body = code_of(source, name)
         for forbidden in ("subprocess", "preflight", "run_checked", "Popen"):
             assert forbidden not in body, f"{name} runs something"
+
+
+# ============================================================
+# The toolkit, asked at New
+# ============================================================
+
+def test_new_asks_for_the_toolkit_and_records_it(tab):
+    pdir = make_project(tab, "q", toolkit="qt")
+    assert gui_projects.load_manifest(pdir).toolkit == "qt"
+    assert "[Qt]" in tab.status.text()
+
+
+def test_cancelling_the_toolkit_creates_nothing(tab):
+    """It cannot be changed later, so it cannot be guessed now."""
+    tab.answers["text"].append("demo")
+    tab.answers["choice"].append("standalone")
+    tab.on_new()
+    assert tab.actions.list_names() == []
+
+
+def test_the_toolkit_offered_is_one_create_accepts(tab):
+    """'pyside6' is what the emitter calls it and create() refuses it."""
+    offered = []
+
+    def ask_choice(_title, _prompt, options):
+        offered.append(list(options))
+        return None if len(offered) > 1 else "standalone"
+
+    tab.answers["text"].append("demo")
+    tab.ask_choice = ask_choice
+    tab.on_new()
+    assert set(offered[1]) == set(gui_projects.TOOLKITS)
+
+
+def test_opening_a_project_shows_its_toolkit(tab):
+    make_project(tab, "q", toolkit="qt")
+    tab.on_save()
+    make_project(tab, "t", toolkit="tk")
+    tab.on_save()
+    assert "[Tk]" in tab.status.text()
+    tab.answers["choice"].append("q")
+    tab.on_open()
+    assert "[Qt]" in tab.status.text()
+
+
+def test_a_qt_project_generates_with_the_policy_passing(tab, qapp):
+    make_project(tab, "q", shapes=[mk(label="Start")], toolkit="qt")
+    tab.on_generate()
+    pump(qapp, tab)
+    assert "policy: OK" in log_text(tab), log_text(tab)
+
+
+def test_a_generate_that_raises_still_clears_busy(tab, qapp):
+    """Otherwise every later job says "Already working" with nothing running."""
+    make_project(tab, "demo", shapes=[mk()])
+
+    def _boom(*_a):
+        raise RuntimeError("disk on fire")
+
+    tab.actions.generate = _boom
+    tab.on_generate()
+    pump(qapp, tab)
+    assert "generate failed" in log_text(tab)
+    assert "disk on fire" in log_text(tab)
+
+
+def test_generate_hands_the_worker_a_copy_not_the_live_shapes(tab, qapp):
+    """A drag moves the live Shape objects in place while the worker reads."""
+    from council_core import designer_project as dp
+    got = []
+
+    def watched(name, shapes):
+        got.append(shapes)
+        return dp.GenerateResult(ok=True)
+
+    make_project(tab, "demo", shapes=[mk()])
+    tab.actions.generate = watched
+    tab.on_generate()
+    pump(qapp, tab)
+    assert got and got[0][0] is not tab.canvas.scene.shapes[0]
+
+
+# ============================================================
+# Review with no host hook
+# ============================================================
+
+def test_review_falls_back_to_the_councils_own_panel(tab, qapp):
+    """Nothing in the real app defined review_with_council, so every Review
+    said "unavailable". The actions object is the fallback now."""
+    make_project(tab, "demo", shapes=[mk()])
+    tab.on_generate()
+    pump(qapp, tab)
+    tab.actions.review = lambda prompt: "from the panel"
+    tab.on_review()
+    pump(qapp, tab)
+    assert "from the panel" in log_text(tab)
+
+
+# ============================================================
+# Describe it
+# ============================================================
+
+class _Described:
+    """A DescribeResult-shaped stand-in."""
+
+    def __init__(self, ok=True, shapes=(), errors=(), notes=(), window=None,
+                 attempts=1):
+        self.ok, self.shapes = ok, list(shapes)
+        self.errors, self.notes = list(errors), list(notes)
+        self.window, self.attempts = window or {}, attempts
+
+
+def describe_with(tab, qapp, result, text="a login form"):
+    seen = []
+
+    def fake(name, typed):
+        import threading
+        seen.append((name, typed, threading.current_thread().name))
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    tab.actions.describe = fake
+    tab.describe_view.setPlainText(text)
+    tab.on_describe()
+    pump(qapp, tab)
+    return seen
+
+
+def test_describing_with_no_text_says_what_to_do(tab):
+    make_project(tab, "demo")
+    tab.on_describe()
+    assert "Describe the window first" in log_text(tab)
+
+
+def test_describing_with_no_project_says_open_one(tab):
+    tab.describe_view.setPlainText("a login form")
+    tab.on_describe()
+    assert "Open or create a project first" in log_text(tab)
+
+
+def test_a_description_is_drawn_on_an_empty_canvas(tab, qapp):
+    make_project(tab, "demo")
+    seen = describe_with(tab, qapp, _Described(
+        shapes=[mk(label="Sign in"), mk("entry", "User", x=40, y=120)]))
+    assert seen[0][:2] == ("demo", "a login form")
+    # A set: the scene orders by the stacking the result carries (z), and
+    # these stand-ins all have z=0.
+    assert {s.label for s in tab.canvas.scene.shapes} == {"Sign in", "User"}
+    assert tab.canvas.scene.dirty
+    assert "drew 2 shape(s)" in log_text(tab)
+
+
+def test_describing_runs_off_the_gui_thread(tab, qapp):
+    make_project(tab, "demo")
+    seen = describe_with(tab, qapp, _Described(shapes=[mk()]))
+    assert seen[0][2].startswith("designer-")
+
+
+def test_a_description_over_a_drawing_asks_first(tab, qapp):
+    make_project(tab, "demo", shapes=[mk(label="Mine")])
+    describe_with(tab, qapp, _Described(shapes=[mk(label="Theirs")]))
+    assert [s.label for s in tab.canvas.scene.shapes] == ["Mine"]
+    assert "Kept the current wireframe" in log_text(tab)
+
+
+def test_a_confirmed_description_replaces_and_undo_brings_it_back(tab, qapp):
+    make_project(tab, "demo", shapes=[mk(label="Mine")])
+    tab.answers["confirm"].append(True)
+    describe_with(tab, qapp, _Described(shapes=[mk(label="Theirs")]))
+    assert [s.label for s in tab.canvas.scene.shapes] == ["Theirs"]
+    tab.canvas._obey(tab.canvas.scene.undo_once())
+    assert [s.label for s in tab.canvas.scene.shapes] == ["Mine"]
+
+
+def test_a_refused_description_says_why_and_changes_nothing(tab, qapp):
+    make_project(tab, "demo")
+    describe_with(tab, qapp, _Described(
+        ok=False, errors=["shape 2 (button 'Go'): overlaps shape 1"]))
+    assert tab.canvas.scene.shapes == []
+    assert "Could not turn that into a wireframe" in log_text(tab)
+    assert "overlaps shape 1" in log_text(tab)
+
+
+def test_a_describe_that_raises_is_reported_and_clears_busy(tab, qapp):
+    make_project(tab, "demo")
+    describe_with(tab, qapp, RuntimeError("model fell over"))
+    assert "describe failed" in log_text(tab)
+    assert "model fell over" in log_text(tab)
+
+
+def test_the_suggested_title_is_reported_not_applied(tab, qapp):
+    """Applying it would save the project behind the user's back."""
+    make_project(tab, "demo")
+    describe_with(tab, qapp, _Described(shapes=[mk()],
+                                        window={"title": "Sign in"}))
+    assert "suggested window title: 'Sign in'" in log_text(tab)
+
+
+def test_a_description_for_a_project_no_longer_open_is_not_applied(tab, qapp):
+    """The user opened another project while the model was thinking."""
+    import threading
+    make_project(tab, "first")
+    tab.on_save()
+    make_project(tab, "second")
+    tab.on_save()
+    gate = threading.Event()
+
+    def slow(name, typed):
+        gate.wait(5)
+        return _Described(shapes=[mk(label="Late")])
+
+    tab.actions.describe = slow
+    tab.describe_view.setPlainText("anything")
+    tab.on_describe()
+    tab.answers["choice"].append("first")
+    tab.on_open()
+    gate.set()
+    pump(qapp, tab)
+    assert "no longer open" in log_text(tab)
+    assert "Late" not in [s.label for s in tab.canvas.scene.shapes]
+
+
+# ============================================================
+# Production dialogs
+# ============================================================
+
+def test_the_factory_supplies_real_dialogs(qapp, monkeypatch):
+    """The tab's defaults mean "cancelled". Nothing replaced them in the real
+    app, so New and Open did nothing and Detach was always declined."""
+    from council_qt import dialogs
+    calls = []
+    monkeypatch.setattr(dialogs, "askstring",
+                        lambda *a, **k: calls.append(("text", a, k)) or "x")
+    monkeypatch.setattr(dialogs, "askchoice",
+                        lambda *a, **k: calls.append(("choice", a, k)) or "qt")
+    monkeypatch.setattr(dialogs, "askyesno",
+                        lambda *a, **k: calls.append(("yes", a, k)) or True)
+    view = build_designer(None)
+    try:
+        assert view.ask_text("New", "Name:") == "x"
+        assert view.ask_choice("Toolkit", "?", ["qt", "tk"]) == "qt"
+        assert view.confirm("Detach", "?") is True
+        assert all(k["parent"] is view for _kind, _a, k in calls)
+        assert calls[1][1][2] == ["qt", "tk"]
+    finally:
+        view.deleteLater()
+        qapp.processEvents()
+
+
+def test_new_stops_the_preview_of_the_project_being_left(tab):
+    make_project(tab, "first")
+    stopped = []
+    tab.actions.stop = lambda name: stopped.append(name) or True
+    make_project(tab, "second")
+    assert stopped == ["first"]
+
+
+def test_the_wizard_stops_the_preview_of_the_project_being_left(tab):
+    from gui_wizard import WizardResult
+    make_project(tab, "first")
+    stopped = []
+    tab.actions.stop = lambda name: stopped.append(name) or True
+    tab.on_wizard_done(WizardResult(name="wiz", mode="standalone",
+                                    title="w", shapes=[mk()]))
+    assert stopped == ["first"]
+    assert tab.project == "wiz"
+
+
+def test_a_description_that_lands_mid_drag_ends_the_drag(tab, qapp):
+    """The confirm is modal and swallows the release; the drag must not stay
+    armed over a scene it no longer describes."""
+    make_project(tab, "demo", shapes=[mk(label="Mine")])
+    shape = tab.canvas.scene.shapes[0]
+    home = shape.x
+    tab.canvas.scene.press(shape.x + 4, shape.y + 4)
+    tab.canvas.scene.drag(shape.x + 64, shape.y + 4)
+    assert tab.canvas.scene.shapes[0].x != home        # the drag is live
+    describe_with(tab, qapp, _Described(shapes=[mk(label="Theirs")]))
+    assert tab.canvas.scene.mode is None
+    # Declined (no confirmation queued): the drawing stays, and the drag the
+    # dialog interrupted is abandoned rather than left half-applied.
+    assert [s.label for s in tab.canvas.scene.shapes] == ["Mine"]
+    assert tab.canvas.scene.shapes[0].x == home

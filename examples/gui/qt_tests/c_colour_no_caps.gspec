@@ -1,0 +1,269 @@
+{
+  "canvas": {
+    "grid_snap": 8,
+    "h": 700,
+    "w": 1100
+  },
+  "clarifications": [],
+  "gspec_version": 2,
+  "mode": "linked",
+  "project": "Colour Ignored",
+  "shapes": [
+    {
+      "bg": "#313244",
+      "drives": {},
+      "fg": "#f5e0dc",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "28abaa9970a65b8e80f2bde91218a0cc",
+      "kind": "label",
+      "label": "Coloured caption",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 320,
+      "x": 24,
+      "y": 24,
+      "z": 1
+    },
+    {
+      "bg": "#ff0000",
+      "drives": {},
+      "fg": "#00ff00",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "bb94c01105635c529869309570b3628e",
+      "kind": "combobox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "choice"
+      },
+      "props": {
+        "command": "",
+        "readonly": true,
+        "values": [
+          "One",
+          "Two"
+        ]
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 240,
+      "x": 24,
+      "y": 64,
+      "z": 2
+    },
+    {
+      "bg": "#ff0000",
+      "drives": {},
+      "fg": "#00ff00",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "aa6a6daf1feb5c9a8f20a5ab70d0b1b8",
+      "kind": "progressbar",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "progress"
+      },
+      "props": {
+        "mode": "determinate",
+        "orient": "horizontal"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 480,
+      "x": 24,
+      "y": 112,
+      "z": 3
+    },
+    {
+      "bg": "#ff0000",
+      "drives": {},
+      "fg": "#00ff00",
+      "font": "",
+      "freeform": false,
+      "h": 240,
+      "id": "9cef71c4a30a565e8631998f2f264a9c",
+      "kind": "treeview",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "table"
+      },
+      "props": {
+        "columns": [
+          "A",
+          "B"
+        ],
+        "mode": "table",
+        "show_headings": true
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 480,
+      "x": 24,
+      "y": 152,
+      "z": 4
+    },
+    {
+      "bg": "#ff0000",
+      "drives": {},
+      "fg": "#00ff00",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "903a4a5171ee594b9e0ec2d1db9c4acb",
+      "kind": "file_picker",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "source"
+      },
+      "props": {
+        "command": "",
+        "filetypes": [],
+        "mode": "file"
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 480,
+      "x": 24,
+      "y": 416,
+      "z": 5
+    },
+    {
+      "bg": "#ff0000",
+      "drives": {},
+      "fg": "#00ff00",
+      "font": "",
+      "freeform": false,
+      "h": 40,
+      "id": "c5bca34d5be35ddea6587bfb156c6e29",
+      "kind": "toolbar",
+      "label": "Actions",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "buttons": [
+          "One"
+        ]
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 544,
+      "x": 528,
+      "y": 24,
+      "z": 6
+    },
+    {
+      "bg": "#ff0000",
+      "drives": {},
+      "fg": "#00ff00",
+      "font": "",
+      "freeform": false,
+      "h": 360,
+      "id": "e7cb1382cca65f8dbd2134f5550ee7c4",
+      "kind": "notebook",
+      "label": "Empty tabs",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "tabs": []
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 544,
+      "x": 528,
+      "y": 88,
+      "z": 7
+    },
+    {
+      "bg": "#ff0000",
+      "drives": {},
+      "fg": "#00ff00",
+      "font": "",
+      "freeform": false,
+      "h": 40,
+      "id": "63c765fffd665492be2db0e673dbaead",
+      "kind": "scrubber",
+      "label": "Index",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "index"
+      },
+      "props": {
+        "command": "",
+        "from_": 0,
+        "show_total": true,
+        "to": 100
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 544,
+      "x": 528,
+      "y": 472,
+      "z": 8
+    },
+    {
+      "bg": "#ff0000",
+      "drives": {},
+      "fg": "#00ff00",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "874e770a76ba5f02be09f3bae86578be",
+      "kind": "status_bar",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "status"
+      },
+      "props": {
+        "progress": false
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 1096,
+      "x": 0,
+      "y": 672,
+      "z": 9
+    }
+  ],
+  "window": {
+    "bg": "#1e1e2e",
+    "fg": "#cdd6f4",
+    "font": "",
+    "min_h": 600,
+    "min_w": 900,
+    "title": "Colour Ignored"
+  }
+}

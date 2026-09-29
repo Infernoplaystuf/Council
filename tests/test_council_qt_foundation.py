@@ -1214,9 +1214,25 @@ def test_a_result_landing_after_the_view_is_gone_is_dropped(qapp):
     view.setParent(None)
     shiboken6.delete(view)
 
-    # The callback is built and delivered exactly as a worker's would be —
-    # through the same guard, with the C++ object already gone.
-    ViewHelpers._to_ui(view, touch) if shiboken6.isValid(view) else None
+    # The callback is delivered exactly as a worker's would be, with the C++
+    # object already gone — from this thread AND from a worker. This used to
+    # be skipped when the view was invalid, because _to_ui itself raised
+    # "already deleted" looking for the view's bridge, inside the worker.
+    import threading
+    ViewHelpers._to_ui(view, touch)
+    failures = []
+
+    def worker():
+        try:
+            ViewHelpers._to_ui(view, touch)
+        except Exception as exc:                          # noqa: BLE001
+            failures.append(exc)
+
+    thread = threading.Thread(target=worker, name="dead-view-worker")
+    thread.start()
+    thread.join(5)
+    qapp.processEvents()
+    assert failures == [], f"_to_ui raised in the worker: {failures}"
     assert landed == [], "a callback reached a destroyed view"
 
 

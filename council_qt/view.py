@@ -59,6 +59,17 @@ def _on_gui_thread() -> bool:
     return app is None or QThread.currentThread() is app.thread()
 
 
+def _alive(widget) -> bool:
+    """Whether ``widget``'s C++ side still exists. True when that cannot be
+    told (no shiboken6): then the guard is the only line of defence, as it
+    was before this check existed."""
+    try:
+        import shiboken6
+        return bool(shiboken6.isValid(widget))
+    except Exception:                                     # noqa: BLE001
+        return True
+
+
 class _Marshal(QObject):
     """One queued signal, so a worker's callback runs on the GUI thread.
 
@@ -134,6 +145,12 @@ class ViewHelpers:
         its 50 ms pump, because a bridgeless view has no message stream to
         coalesce.
         """
+        # A view already gone gets nothing, and is not asked anything: finding
+        # its bridge calls parent() on it, which raised "Internal C++ object
+        # already deleted" INSIDE the worker — seen as an unraisable-exception
+        # warning from the Models tab's role panel in the all-tabs harness.
+        if not _alive(self):
+            return
         guarded = self._guard(fn)
         bridge = getattr(self, "bridge", None) or self._find_bridge()
         if bridge is not None:
@@ -205,14 +222,21 @@ class ViewHelpers:
         A dialog opened from a tab has no bridge of its own, and giving it one
         would mean remembering to pass it at every call site.
         """
-        node = getattr(self, "parent", None)
-        node = node() if callable(node) else None
-        seen = 0
-        while node is not None and seen < 8:          # a window is never deep
-            bridge = getattr(node, "bridge", None)
-            if bridge is not None:
-                return bridge
-            parent = getattr(node, "parent", None)
-            node = parent() if callable(parent) else None
-            seen += 1
+        try:
+            node = getattr(self, "parent", None)
+            node = node() if callable(node) else None
+            seen = 0
+            while node is not None and seen < 8:      # a window is never deep
+                bridge = getattr(node, "bridge", None)
+                if bridge is not None:
+                    return bridge
+                parent = getattr(node, "parent", None)
+                node = parent() if callable(parent) else None
+                seen += 1
+        except RuntimeError as exc:
+            # The view or a parent was deleted between _to_ui's check and
+            # here — a worker races the GUI thread. No bridge: _to_ui then
+            # marshals, and the guard drops the call on arrival.
+            if "already deleted" not in str(exc):
+                raise
         return None

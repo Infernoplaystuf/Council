@@ -18,7 +18,12 @@ The inspector submits only the rows the user edited, so applying to a
 multi-selection no longer overwrites the shapes they never looked at.
 
 Generate runs on a worker and reports through the bridge, same as Tk. Review
-does too. Open and New take their names from the caller rather than from a
+does too, and so does Describe it — plain English in, a wireframe on the
+canvas out, through gui_describe, which checks every shape the model proposes
+against the same validator Generate uses before any of it reaches the canvas.
+
+New asks which toolkit to generate into, because it can only be asked once:
+app.py is written in it and never rewritten. Open and New take their names from the caller rather than from a
 modal typed into a dialog, so the tab itself never blocks — the host supplies
 `ask_text` / `ask_choice` / `confirm`, and a test supplies answers directly.
 That is also what keeps this file importable with no display.
@@ -36,6 +41,7 @@ from PySide6.QtWidgets import (QGroupBox, QHBoxLayout, QLabel, QListWidget,
 from council_core import designer_form as form
 from council_core import paths
 from council_core import designer_project as dp
+from council_core.wizard import TOOLKITS
 from council_core.designer_editor import Scene
 from gui_shapes import PALETTE
 
@@ -56,6 +62,7 @@ class DesignerActions:
 
     def __init__(self, vault_dir: Optional[Path] = None):
         self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
+        self._models = None
 
     def project_dir(self, name: str) -> Optional[Path]:
         if not name:
@@ -66,8 +73,30 @@ class DesignerActions:
     def list_names(self) -> List[str]:
         return dp.list_names(self.vault_dir)
 
-    def create(self, name: str, mode: str):
-        return dp.create(name, mode, self.vault_dir)
+    def create(self, name: str, mode: str, toolkit: str = "tk"):
+        return dp.create(name, mode, self.vault_dir, toolkit)
+
+    def toolkit_label(self, name: str) -> str:
+        return dp.toolkit_label(self.project_dir(name))
+
+    def describe(self, name: str, text: str):
+        """Plain English -> DescribeResult. Blocking; a worker calls it."""
+        return dp.describe(text, self.project_dir(name))
+
+    def review(self, prompt: str) -> str:
+        """The Council's critique. Blocking; a worker calls it.
+
+        The personalities are loaded on first use and kept — loading them maps
+        model files, and a user who never presses Review should not pay for
+        it.
+        """
+        if self._models is None:
+            from council_core import council_turn
+            models, problem = council_turn.load_personalities(self.vault_dir)
+            if models is None:
+                return f"review unavailable: {problem}"
+            self._models = models
+        return dp.review(prompt, self._models)
 
     def open_named(self, name: str):
         return dp.open_named(name, self.vault_dir)
@@ -103,6 +132,10 @@ class DesignerTab(ViewHelpers, QWidget):
         self.actions = actions or DesignerActions()
         self._tokens = theme.tokens("dark")
         self.project: str = ""
+        #: "Tk" / "Qt" for the open project. Read when a project is loaded, not
+        #: per status refresh: it comes off disk, and the status refreshes on
+        #: every drag.
+        self._toolkit: str = ""
         self.questions: List[Any] = []
         self._busy = False
         # Supplied by the host. Defaulting to "the user cancelled" rather than
@@ -159,13 +192,30 @@ class DesignerTab(ViewHelpers, QWidget):
         split.setSizes([180, 1100, 260])
         outer.addWidget(split, 1)
 
+        bottom = QHBoxLayout()
+        bottom.addWidget(self._describe_box(), 1)
         log_box = QGroupBox("Log / clarifications")
         log_layout = QVBoxLayout(log_box)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumHeight(150)
         log_layout.addWidget(self.log_view)
-        outer.addWidget(log_box)
+        bottom.addWidget(log_box, 1)
+        outer.addLayout(bottom)
+
+    def _describe_box(self) -> QWidget:
+        """Plain English in, a wireframe out. The model proposes; gui_describe
+        checks every shape before any of it reaches the canvas."""
+        box = QGroupBox("Describe it")
+        layout = QVBoxLayout(box)
+        self.describe_view = QPlainTextEdit()
+        self.describe_view.setPlaceholderText(
+            "e.g. A login window: a username box, a password box, and "
+            "Sign in / Cancel buttons along the bottom.")
+        self.describe_view.setMaximumHeight(110)
+        layout.addWidget(self.describe_view)
+        self._button(layout, "✨ Draw it", self.on_describe)
+        return box
 
     def _palette_box(self) -> QWidget:
         box = QGroupBox("Widgets")
@@ -264,10 +314,13 @@ class DesignerTab(ViewHelpers, QWidget):
 
     def _refresh_status(self) -> None:
         name = self.project or "no project"
+        toolkit = f" [{self._toolkit}]" if self.project and self._toolkit else ""
         dirty = " *" if getattr(self.canvas.scene, "dirty", False) else ""
-        self.status.setText(f"{name}{dirty}")
+        self.status.setText(f"{name}{toolkit}{dirty}")
 
     def _load(self, shapes: Sequence[Any]) -> None:
+        self._toolkit = (self.actions.toolkit_label(self.project)
+                         if self.project else "")
         self.canvas.scene.load(shapes)
         self.canvas.update()
         self._show_selection()
@@ -291,12 +344,32 @@ class DesignerTab(ViewHelpers, QWidget):
             ["linked", "standalone"])
         if not mode:
             return
-        result = self.actions.create(name, mode)
+        # Asked HERE because it cannot be asked later: app.py is written once,
+        # in this toolkit, and Generate refuses to put the other toolkit's ui/
+        # beside it. Cancel creates nothing, the same as the two above.
+        toolkit = self.ask_choice(
+            "Toolkit",
+            "Which toolkit the generated app is written in: qt (PySide6) or "
+            "tk (tkinter). This cannot be changed after the project is made.",
+            list(TOOLKITS))
+        if not toolkit:
+            return
+        result = self.actions.create(name, mode, toolkit)
         self.log(result.message)
         if not result.ok:
             return
+        self._leave_project()
         self.project = name
         self._load([])
+
+    def _leave_project(self) -> None:
+        """Stop a preview belonging to the project we are LEAVING. Without
+        this the old app keeps running, invisibly, and Stop no longer reaches
+        it — the tab is pointing somewhere else. New and the wizard switch
+        projects too, and until the real dialogs were wired New never ran at
+        all, so only Open did this."""
+        if self.project:
+            self.actions.stop(self.project)
 
     def on_open(self) -> None:
         names = self.actions.list_names()
@@ -306,10 +379,7 @@ class DesignerTab(ViewHelpers, QWidget):
         name = self.ask_choice("Open GUI project", "Project:", names)
         if not name:
             return
-        # Stop a preview belonging to the project we are LEAVING. Without this
-        # the old app keeps running, invisibly, and Stop no longer reaches it.
-        if self.project:
-            self.actions.stop(self.project)
+        self._leave_project()
         result = self.actions.open_named(name)
         self.log(result.message)
         if not result.ok:
@@ -345,6 +415,7 @@ class DesignerTab(ViewHelpers, QWidget):
         self.log(applied.message)
         if not applied.ok:
             return
+        self._leave_project()
         self.project = applied.name
         self._load(applied.shapes)
         self.canvas.scene.mark_saved()
@@ -365,11 +436,19 @@ class DesignerTab(ViewHelpers, QWidget):
             self.log("No project open.")
             return
         self.on_save()
-        shapes = list(self.canvas.scene.shapes)
+        # A DEEP copy. The worker reads these while the user may still be
+        # dragging, and a drag moves the live Shape objects in place.
+        shapes = self.canvas.scene.export()
         name = self.project
 
         def work() -> None:
-            result = self.actions.generate(name, shapes)
+            # Anything that escapes here would leave _busy set forever, and
+            # every later job would say "Already working" with nothing running.
+            try:
+                result = self.actions.generate(name, shapes)
+            except Exception as exc:                     # noqa: BLE001
+                result = dp.GenerateResult(
+                    lines=[f"generate failed: {exc!r}"])
 
             def show() -> None:
                 self._busy = False
@@ -391,10 +470,10 @@ class DesignerTab(ViewHelpers, QWidget):
         if not prompt:
             self.log("Generate the project first.")
             return
-        critique = getattr(self.window, "review_with_council", None)
-        if critique is None:
-            self.log("Council review unavailable in this build")
-            return
+        # A host may supply its own; otherwise a one-round Council of the
+        # coder and the writer, which is what the Tk shell ran.
+        critique = (getattr(self.window, "review_with_council", None)
+                    or self.actions.review)
 
         def work() -> None:
             try:
@@ -411,6 +490,79 @@ class DesignerTab(ViewHelpers, QWidget):
             self._to_ui(show)
 
         self._start("review…", work, name="designer-review")
+
+    def on_describe(self) -> None:
+        """Turn the description into a wireframe on this project's canvas.
+
+        Runs on a worker: it is one to three model calls. The text is read
+        HERE, on the GUI thread, and the result is applied in show() — as one
+        undoable step, so a description the user does not like is one Undo
+        away from the drawing they had.
+        """
+        text = self.describe_view.toPlainText().strip()
+        if not text:
+            self.log("Describe the window first — what is in it, and roughly "
+                     "where.")
+            return
+        if not self.project:
+            self.log("Open or create a project first — the description is "
+                     "drawn onto its canvas, in its toolkit.")
+            return
+        name = self.project
+
+        def work() -> None:
+            try:
+                result, failure = self.actions.describe(name, text), ""
+            except Exception as exc:                     # noqa: BLE001
+                result, failure = None, f"describe failed: {exc!r}"
+
+            def show() -> None:
+                self._busy = False
+                self._apply_description(name, result, failure)
+                self._refresh_status()
+
+            self._to_ui(show)
+
+        self._start("describing…", work, name="designer-describe")
+
+    def _apply_description(self, name: str, result, failure: str) -> None:
+        """Put a finished description on the canvas, or say why not."""
+        if failure:
+            self.log(failure)
+            return
+        for line in getattr(result, "notes", None) or []:
+            self.log(f"note: {line}")
+        if not getattr(result, "ok", False):
+            self.log("Could not turn that into a wireframe:")
+            for line in getattr(result, "errors", None) or []:
+                self.log(f"  {line}")
+            return
+        if name != self.project:
+            # The user opened another project while the model was thinking.
+            # Drawing the description onto THAT one would be a surprise edit.
+            self.log(f"The description was for {name}, which is no longer "
+                     f"open — not applied.")
+            return
+        # A drag the result arrived in the middle of is abandoned first: the
+        # confirm below is modal and swallows the mouse release, which would
+        # leave the gesture armed over a scene it no longer describes.
+        self.canvas._obey(self.canvas.scene.escape())
+        if self.canvas.scene.shapes and not self.confirm(
+                "Replace the wireframe?",
+                "The canvas already has a wireframe on it. Replace it with "
+                "the described one? (Undo brings it back.)"):
+            self.log("Kept the current wireframe — the description was not "
+                     "applied.")
+            return
+        self.canvas._obey(self.canvas.scene.replace_all(result.shapes))
+        attempts = getattr(result, "attempts", 0)
+        self.log(f"drew {len(result.shapes)} shape(s) from the description"
+                 + (f" ({attempts} model call(s))" if attempts else "")
+                 + " — Save to keep it, Undo to take it back.")
+        title = (getattr(result, "window", None) or {}).get("title")
+        if title:
+            self.log(f"suggested window title: {title!r} (set it in the "
+                     f"window panel — click an empty part of the canvas)")
 
     def on_run(self) -> None:
         directory = self.actions.project_dir(self.project)
@@ -458,5 +610,20 @@ class DesignerTab(ViewHelpers, QWidget):
 
 
 def build_designer(window) -> QWidget:
-    """Factory for the tab registry."""
-    return DesignerTab(window)
+    """Factory for the tab registry — the tab, with REAL dialogs.
+
+    The tab's own defaults mean "the user cancelled", which is right for a
+    test and was wrong in production: nothing supplied these, so New and Open
+    did nothing at all and Detach was always declined. The wizard was the only
+    way to make a project.
+    """
+    from .. import dialogs
+
+    tab = DesignerTab(window)
+    tab.ask_text = lambda title, prompt: dialogs.askstring(
+        title, prompt, parent=tab)
+    tab.ask_choice = lambda title, prompt, choices: dialogs.askchoice(
+        title, prompt, choices, parent=tab)
+    tab.confirm = lambda title, message: dialogs.askyesno(
+        title, message, parent=tab)
+    return tab

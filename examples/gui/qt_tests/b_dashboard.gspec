@@ -1,0 +1,160 @@
+{
+  "canvas": {
+    "grid_snap": 8,
+    "h": 700,
+    "w": 1100
+  },
+  "clarifications": [],
+  "gspec_version": 3,
+  "mode": "linked",
+  "project": "Dashboard",
+  "requires": [
+    "matplotlib"
+  ],
+  "shapes": [
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "9a306892d25d5918b823b6570dd70e04",
+      "kind": "label",
+      "label": "Throughput",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 240,
+      "x": 24,
+      "y": 16,
+      "z": 1
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 424,
+      "id": "ed81122e95c7525ca0799fa205e9d6b6",
+      "kind": "chart_panel",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "chart"
+      },
+      "props": {
+        "tight_layout": true,
+        "toolbar": false
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 696,
+      "x": 24,
+      "y": 48,
+      "z": 2
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "98d2f6182c5f5218b7b9e7af50582240",
+      "kind": "button",
+      "label": "Refresh",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 160,
+      "x": 744,
+      "y": 48,
+      "z": 3
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "11654823ffb75fd08e10efb16010001d",
+      "kind": "checkbutton",
+      "label": "Live updates",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "default": false,
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 200,
+      "x": 744,
+      "y": 96,
+      "z": 4
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 176,
+      "id": "b282e901105259c7ab65ff8b47adb250",
+      "kind": "log_pane",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "events"
+      },
+      "props": {
+        "autoscroll": true,
+        "levels": [
+          "info",
+          "warn",
+          "error"
+        ]
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 1048,
+      "x": 24,
+      "y": 496,
+      "z": 5
+    }
+  ],
+  "window": {
+    "bg": "",
+    "fg": "",
+    "font": "",
+    "min_h": 600,
+    "min_w": 900,
+    "title": "Dashboard"
+  }
+}

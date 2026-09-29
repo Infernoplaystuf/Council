@@ -28,6 +28,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence
 
+import gui_projects
 from gui_wizard import (DEFAULT_MIN_H, DEFAULT_MIN_W, MAIN_KINDS,  # noqa: F401
                         SIDE_KINDS, STEPS, WizardResult, build_shapes)
 
@@ -36,6 +37,12 @@ MIN_USABLE = 200
 
 #: Reserved frames smaller than this are not worth holding open.
 MIN_RESERVED = 24
+
+#: The toolkits a project can be generated into, in the order they are
+#: offered. Qt first: it is the toolkit this front end itself runs on, so the
+#: interpreter that runs the Council can always run the preview.
+TOOLKITS = ("qt", "tk")
+TOOLKIT_LABELS = {"qt": "Qt", "tk": "Tk"}
 
 
 @dataclass
@@ -49,6 +56,8 @@ class Answers:
     """
     name: str = ""
     mode: str = "linked"
+    #: Chosen once, here: app.py is written in it and never rewritten.
+    toolkit: str = TOOLKITS[0]
     title: str = ""
     min_w: str = str(DEFAULT_MIN_W)
     min_h: str = str(DEFAULT_MIN_H)
@@ -89,6 +98,14 @@ def validate(step: str, answers: Answers,
         name = (answers.name or "").strip()
         if not name:
             return "Give the project a name."
+        # The rule create() enforces. Checked here because Finish closes the
+        # dialog BEFORE the project is created, so a name refused there is
+        # refused after every answer has already been thrown away.
+        problem = gui_projects.name_problem(name)
+        if problem:
+            return problem
+        if answers.toolkit not in TOOLKITS:
+            return f"Choose a toolkit: {' or '.join(TOOLKITS)}."
         if name.lower() in {str(e).lower() for e in existing}:
             return f"There is already a project called {name!r}."
         if (as_int(answers.min_w, 0) < MIN_USABLE
@@ -153,14 +170,17 @@ def to_result(answers: Answers) -> WizardResult:
         min_w=max(MIN_USABLE, as_int(answers.min_w, DEFAULT_MIN_W)),
         min_h=max(MIN_USABLE, as_int(answers.min_h, DEFAULT_MIN_H)),
         template=answers.template,
-        shapes=shapes_for(answers))
+        shapes=shapes_for(answers),
+        toolkit=answers.toolkit)
 
 
 def summary(answers: Answers) -> List[str]:
     """The review step, in words — what Finish is about to make."""
     shapes = shapes_for(answers)
     reserved = max(0, as_int(answers.reserve, 0))
-    lines = [f"Project: {(answers.name or '').strip()} ({answers.mode})",
+    toolkit = TOOLKIT_LABELS.get(answers.toolkit, answers.toolkit)
+    lines = [f"Project: {(answers.name or '').strip()} ({answers.mode}, "
+             f"{toolkit})",
              f"Window: {max(MIN_USABLE, as_int(answers.min_w, DEFAULT_MIN_W))}"
              f"x{max(MIN_USABLE, as_int(answers.min_h, DEFAULT_MIN_H))}",
              f"Layout: {answers.template}",

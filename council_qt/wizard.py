@@ -1,5 +1,5 @@
 """
-council_qt.dialogs.wizard — the Designer's guided on-ramp, in Qt.
+council_qt.wizard — the Designer's guided on-ramp, in Qt.
 
 Five screens of controls over `council_core.wizard`, which decides the step
 order, what makes a step invalid, and what the answers mean. This file binds a
@@ -119,6 +119,9 @@ class GuiWizard(QDialog):
     def _page_basics(self, form) -> None:
         self._text(form, "name", "Project name")
         self._choice(form, "mode", "Import mode", ("linked", "standalone"))
+        # Write-once: app.py is generated in this toolkit and never rewritten.
+        self._choice(form, "toolkit", "Toolkit (qt = PySide6, tk = tkinter)",
+                     core.TOOLKITS)
         self._text(form, "title", "Window title (defaults to the name)")
         self._text(form, "min_w", "Minimum width")
         self._text(form, "min_h", "Minimum height")

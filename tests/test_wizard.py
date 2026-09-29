@@ -362,3 +362,56 @@ def test_it_is_modal(qapp):
     dialog = GuiWizard()
     assert dialog.isModal()
     dialog.deleteLater()
+
+
+# ============================================================
+# The toolkit, and the name rule create() enforces
+# ============================================================
+
+def test_a_name_create_would_refuse_is_refused_on_the_basics_step():
+    """Finish closes the dialog BEFORE the project is created. A name refused
+    there was refused after every answer had been thrown away."""
+    problem = core.validate("basics", answers(name="My App!"))
+    assert "invalid project name" in problem
+
+
+def test_the_toolkit_is_offered_qt_first():
+    assert core.TOOLKITS == ("qt", "tk")
+    assert core.Answers().toolkit == "qt"
+
+
+def test_an_unknown_toolkit_is_refused():
+    assert "toolkit" in core.validate("basics", answers(toolkit="pyside6"))
+
+
+def test_the_toolkit_reaches_the_result():
+    assert core.to_result(answers(toolkit="tk")).toolkit == "tk"
+    assert core.to_result(answers(toolkit="qt")).toolkit == "qt"
+
+
+def test_the_summary_names_the_toolkit():
+    assert "Qt" in core.summary(answers(toolkit="qt"))[0]
+    assert "Tk" in core.summary(answers(toolkit="tk"))[0]
+
+
+def test_the_basics_page_has_a_toolkit_choice(wizard):
+    wizard._fields["toolkit"].setCurrentText("tk")
+    assert wizard.answers.toolkit == "tk"
+
+
+def test_the_tk_wizard_result_still_defaults_to_tk():
+    """The Tk wizard never asks, so it must keep making Tk projects."""
+    from gui_wizard import WizardResult
+    assert WizardResult().toolkit == "tk"
+
+
+@pytest.mark.parametrize("name", ["demo.", "nul", "NUL.txt", "com1", "Lpt9"])
+def test_names_windows_would_not_keep_are_refused_on_the_basics_step(name):
+    """The regex allows them; Win32 does not keep them. "demo." IS the folder
+    "demo", and create() said "already exists" after the wizard had closed."""
+    assert core.validate("basics", answers(name=name))
+
+
+def test_a_name_that_merely_contains_a_device_word_is_fine():
+    assert core.validate("basics", answers(name="console app")) == ""
+    assert core.validate("basics", answers(name="nullable")) == ""

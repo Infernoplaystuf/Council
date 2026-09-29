@@ -1,0 +1,270 @@
+{
+  "canvas": {
+    "grid_snap": 8,
+    "h": 700,
+    "w": 1100
+  },
+  "clarifications": [],
+  "gspec_version": 2,
+  "mode": "linked",
+  "project": "Settings Form",
+  "shapes": [
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "cce30157050756ee97e6a2a9031b4d05",
+      "kind": "label",
+      "label": "Theme",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 200,
+      "x": 24,
+      "y": 32,
+      "z": 1
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "7efb7575b31d5423bde509211abc90c4",
+      "kind": "combobox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "theme"
+      },
+      "props": {
+        "command": "",
+        "readonly": true,
+        "values": [
+          "Light",
+          "Dark",
+          "System"
+        ]
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 240,
+      "x": 240,
+      "y": 24,
+      "z": 2
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "a3128331bc975293a7d66f490602e765",
+      "kind": "label",
+      "label": "Worker threads",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 200,
+      "x": 24,
+      "y": 80,
+      "z": 3
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "cd53c999eade5453b17ce3a718068f52",
+      "kind": "spinbox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "threads"
+      },
+      "props": {
+        "command": "",
+        "from_": 1,
+        "increment": 1,
+        "to": 32
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 240,
+      "x": 240,
+      "y": 72,
+      "z": 4
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "9195fd2ee32c5eb395561279b16b0ce0",
+      "kind": "label",
+      "label": "Quality",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 200,
+      "x": 24,
+      "y": 128,
+      "z": 5
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "8df5592804f057fca7b150aaaa9f483b",
+      "kind": "scale",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "quality"
+      },
+      "props": {
+        "command": "",
+        "from_": 0,
+        "orient": "horizontal",
+        "to": 100
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 240,
+      "x": 240,
+      "y": 120,
+      "z": 6
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 24,
+      "id": "88b83599f21e57df9b761041ad3a2ac2",
+      "kind": "label",
+      "label": "Cache size (MB)",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 200,
+      "x": 24,
+      "y": 176,
+      "z": 7
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "c71c3ee439d056f6a44bf35f8aee4811",
+      "kind": "spinbox",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "cache_mb"
+      },
+      "props": {
+        "command": "",
+        "from_": 64,
+        "increment": 64,
+        "to": 4096
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 240,
+      "x": 240,
+      "y": 168,
+      "z": 8
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "2d2c841ea8e552f5ade9423fe71f0fdf",
+      "kind": "button",
+      "label": "Apply",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "command": "",
+        "state": "normal",
+        "text": ""
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 160,
+      "x": 240,
+      "y": 232,
+      "z": 9
+    }
+  ],
+  "window": {
+    "bg": "",
+    "fg": "",
+    "font": "",
+    "min_h": 600,
+    "min_w": 900,
+    "title": "Preferences"
+  }
+}

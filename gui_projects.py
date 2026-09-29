@@ -95,6 +95,35 @@ def _validate_name(name: str) -> str:
     return n
 
 
+def name_problem(name: str) -> str:
+    """Why `name` cannot be a project name, or "" if it can.
+
+    The same rule `create` enforces, as a sentence instead of an exception, so
+    a form can refuse the name on the screen where it was typed. The Qt
+    wizard accepted "My App!", closed, and only then failed to create it —
+    with every answer the user had given gone with the dialog.
+    """
+    try:
+        n = _validate_name(name)
+    except ProjectError as exc:
+        return str(exc)
+    # Names the regex allows and Windows does not keep. Win32 drops a trailing
+    # dot, so "demo." IS the folder "demo" — create() then says "already
+    # exists" after the wizard has closed. And a device name opens the device.
+    if n.endswith("."):
+        return (f"invalid project name {name!r}: Windows drops a trailing "
+                f"'.', so it would name a different folder")
+    if n.split(".")[0].strip().lower() in _WINDOWS_DEVICES:
+        return (f"invalid project name {name!r}: {n.split('.')[0]!r} is a "
+                f"reserved device name on Windows")
+    return ""
+
+
+_WINDOWS_DEVICES = frozenset(
+    {"con", "prn", "aux", "nul"}
+    | {f"com{i}" for i in range(1, 10)} | {f"lpt{i}" for i in range(1, 10)})
+
+
 def project_path(name: str, vault_dir: Optional[Any] = None) -> Path:
     """The directory for ``name``, guaranteed to sit inside the projects root.
 

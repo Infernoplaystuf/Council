@@ -1,0 +1,51 @@
+{
+  "canvas": {
+    "grid_snap": 8,
+    "h": 700,
+    "w": 1100
+  },
+  "clarifications": [],
+  "gspec_version": 2,
+  "mode": "linked",
+  "project": "Single Shape",
+  "shapes": [
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 648,
+      "id": "04cd5edced175e368dad154799eaf3a2",
+      "kind": "image_canvas",
+      "label": "",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "picture"
+      },
+      "props": {
+        "colormap": "",
+        "overlay": false,
+        "overlay_alpha": 0.5,
+        "roi": false,
+        "zoom_to_fit": true
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 1048,
+      "x": 24,
+      "y": 24,
+      "z": 1
+    }
+  ],
+  "window": {
+    "bg": "",
+    "fg": "",
+    "font": "",
+    "min_h": 600,
+    "min_w": 900,
+    "title": "Picture"
+  }
+}

@@ -417,3 +417,55 @@ def test_lower_puts_a_shape_below_everything(scene):
 def test_select_all_takes_every_shape(scene):
     scene.select_all()
     assert len(scene.selection) == 3
+
+
+# ============================================================
+# Replacing the whole scene (Describe it)
+# ============================================================
+
+def test_replacing_the_scene_is_one_undoable_step(scene):
+    """Describe it on a canvas that already has a drawing. load() would reset
+    undo and lose the drawing for good; this must leave it one Undo away."""
+    before = [s.id for s in scene.shapes]
+    outcome = scene.replace_all([mk(x=16, y=16), mk(x=216, y=16)])
+    assert outcome.committed and scene.dirty
+    assert len(scene.shapes) == 2
+    scene.undo_once()
+    assert [s.id for s in scene.shapes] == before
+
+
+def test_replacing_keeps_the_stacking_it_was_given(scene):
+    """gui_describe returns shapes in the order the model LISTED them, with
+    the checked stacking in z. Renumbering by list position put a frame
+    listed after its buttons on top of them, and gave notebook pages the
+    wrong tab titles."""
+    button, frame = mk(x=16, y=16), mk(x=0, y=0)
+    frame.z, button.z = 1, 2                  # listed child-first, stacked right
+    scene.replace_all([button, frame])
+    assert [s.id for s in scene.shapes] == [frame.id, button.id]
+    assert [s.z for s in scene.shapes] == [1, 2]
+
+
+def test_replacing_ends_a_drag_in_progress(scene):
+    """The result arrives from a worker and can land mid-drag. Left armed,
+    Escape restored the drag's starting shapes — the OLD drawing — with no
+    commit."""
+    first = scene.shapes[0]
+    scene.press(first.x + 4, first.y + 4)
+    scene.drag(first.x + 40, first.y + 4)
+    scene.replace_all([mk(x=16, y=16)])
+    scene.escape()
+    assert len(scene.shapes) == 1
+
+
+def test_replacing_clears_a_selection_of_shapes_that_are_gone(scene):
+    scene.select_all()
+    scene.replace_all([mk()])
+    assert scene.selection == []
+
+
+def test_replacing_does_not_alias_the_callers_shapes(scene):
+    given = [mk(x=16, y=16)]
+    scene.replace_all(given)
+    scene.shapes[0].x = 400
+    assert given[0].x == 16

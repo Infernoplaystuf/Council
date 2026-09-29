@@ -55,11 +55,37 @@ def default_model_call(prompt: str) -> str:
         timeout=CLASSIFY_TIMEOUT)
 
 
+#: The "Describe it" call. Its own numbers, not the classifier's: a whole
+#: wireframe is 10-40 shapes of JSON, and 700 tokens cut one off mid-list,
+#: which then fails to parse and costs a repair round to say so. `coder` is
+#: the role that writes structured output; with no slot assigned it is the
+#: main model, which is what every caller got before roles existed.
+DESCRIBE_TEMPERATURE, DESCRIBE_NUM_PREDICT, DESCRIBE_ROLE = 0.1, 1800, "coder"
+
+
+def describe_model_call(prompt: str) -> str:
+    """The Describe-it call. Separated so a test never reaches a model."""
+    import council_engine
+    return council_engine.local_chat(
+        messages=[{"role": "user", "content": prompt}],
+        temperature=DESCRIBE_TEMPERATURE, num_predict=DESCRIBE_NUM_PREDICT,
+        role=DESCRIBE_ROLE)
+
+
 #: Settings for the critique call. Advisory only — a review NEVER edits code.
 REVIEW_PROMPT = ("Critique this generated Tkinter UI for LAYOUT, ACCESSIBILITY "
                  "and RESIZE BEHAVIOUR only. Do not rewrite it; describe what "
                  "to change and why.\n\n")
+#: The same critique for a Qt project. Telling a model it is reading Tkinter
+#: while showing it QGridLayout calls gets a review of the wrong toolkit —
+#: "use grid_propagate" advice for code that has no such thing.
+REVIEW_PROMPT_QT = ("Critique this generated Qt (PySide) UI for LAYOUT, "
+                    "ACCESSIBILITY and RESIZE BEHAVIOUR only. Do not rewrite "
+                    "it; describe what to change and why.\n\n")
 REVIEW_SOURCE_LIMIT = 12000
+
+#: What the user sees for each toolkit. The values are gui_projects.TOOLKITS.
+TOOLKIT_LABELS = {"tk": "Tk", "qt": "Qt"}
 
 
 @dataclass
@@ -90,15 +116,36 @@ class ProjectResult:
 # New / open / save
 # ============================================================
 
-def create(name: str, mode: str, vault_dir: Any) -> ProjectResult:
-    """A new, empty project."""
+def create(name: str, mode: str, vault_dir: Any,
+           toolkit: str = "tk") -> ProjectResult:
+    """A new, empty project, generated into `toolkit` ('tk' or 'qt').
+
+    The toolkit is chosen HERE because it cannot be changed later: app.py is
+    written once, in one toolkit, and Generate refuses to put the other
+    toolkit's ui/ beside it. Asking at the first Generate instead would be
+    asking after the user has drawn the whole thing.
+
+    The canvas is set to the one the user drags on. gui_projects' default is
+    1280x800, and layout inference measures edge-anchoring against the canvas
+    size — so a New project used to infer "anchored right" for a shape the user
+    had put 180 px short of the edge they could see.
+    """
     import gui_projects
 
     try:
-        gui_projects.create(name, mode, vault_dir=vault_dir)
+        gui_projects.create(name, mode, vault_dir=vault_dir, toolkit=toolkit)
     except Exception as exc:
         return ProjectResult(False, str(exc))
-    return ProjectResult(True, f"created {name} ({mode})", name=name)
+    try:
+        project = gui_projects.open_project(name, vault_dir=vault_dir)
+        project.canvas.w, project.canvas.h = CANVAS_W, CANVAS_H
+        gui_projects.save_project(name, project, vault_dir=vault_dir)
+    except Exception as exc:
+        _discard_new(name, vault_dir)
+        return ProjectResult(False, str(exc))
+    return ProjectResult(
+        True, f"created {name} ({mode}, {TOOLKIT_LABELS.get(toolkit, toolkit)})",
+        name=name)
 
 
 def create_from_wizard(result: Any, vault_dir: Any) -> ProjectResult:
@@ -107,11 +154,20 @@ def create_from_wizard(result: Any, vault_dir: Any) -> ProjectResult:
     Always a NEW project, which is what makes the destructive load() and the
     widget-name registry safe here. The wizard itself writes nothing — it hands
     back a layout and this applies it — so cancelling leaves nothing behind.
+
+    A failure AFTER the directory exists removes it again. Otherwise the
+    retry — same answers, the obvious thing to do — fails with "already
+    exists" for a project that was never finished.
     """
     import gui_projects
 
+    toolkit = getattr(result, "toolkit", "") or "tk"
     try:
-        gui_projects.create(result.name, result.mode, vault_dir=vault_dir)
+        gui_projects.create(result.name, result.mode, vault_dir=vault_dir,
+                            toolkit=toolkit)
+    except Exception as exc:
+        return ProjectResult(False, str(exc))
+    try:
         project = gui_projects.open_project(result.name, vault_dir=vault_dir)
         project.window.title = result.title
         project.window.min_w, project.window.min_h = result.min_w, result.min_h
@@ -119,10 +175,50 @@ def create_from_wizard(result: Any, vault_dir: Any) -> ProjectResult:
         project.shapes = list(result.shapes)
         gui_projects.save_project(result.name, project, vault_dir=vault_dir)
     except Exception as exc:
+        _discard_new(result.name, vault_dir)
         return ProjectResult(False, str(exc))
     return ProjectResult(
-        True, f"created {result.name} ({result.mode}) from the wizard",
+        True, f"created {result.name} ({result.mode}, "
+              f"{TOOLKIT_LABELS.get(toolkit, toolkit)}) from the wizard",
         name=result.name, shapes=list(result.shapes), project=project)
+
+
+def _discard_new(name: str, vault_dir: Any) -> None:
+    """Remove a project this call JUST created and could not finish.
+
+    Only ever reached straight after gui_projects.create succeeded, so the
+    directory holds nothing but what create wrote: an empty ui/, an empty
+    backups/, a manifest and an empty .gspec. Anything else in it means it is
+    not ours, and it is left alone.
+    """
+    import shutil
+    import gui_projects
+
+    try:
+        pdir = gui_projects.project_path(name, vault_dir)
+        ours = {gui_projects.MANIFEST_NAME, gui_projects.GSPEC_NAME,
+                gui_projects.UI_DIRNAME, gui_projects.BACKUPS_DIRNAME}
+        entries = list(pdir.iterdir())
+        if any(p.name not in ours for p in entries):
+            return
+        if any(p.is_dir() and any(p.iterdir()) for p in entries):
+            return
+        shutil.rmtree(pdir)
+    except Exception:                                    # noqa: BLE001
+        pass
+
+
+def toolkit_label(project_dir: Any) -> str:
+    """"Tk" or "Qt" for a project — what it IS if generated, else what it
+    was created as. "" when there is no project to ask about."""
+    if not project_dir:
+        return ""
+    try:
+        import gui_projects
+        found = gui_projects.toolkit_for(Path(project_dir))
+    except Exception:                                    # noqa: BLE001
+        return ""
+    return TOOLKIT_LABELS.get(found, found)
 
 
 def open_named(name: str, vault_dir: Any) -> ProjectResult:
@@ -339,9 +435,13 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
 
         # The project's declared `requires` widen its allowlist — a camera
         # app's SDK — and nothing else does. Run applies the same gate, so this
-        # message is a promise rather than a warning.
+        # message is a promise rather than a warning. It is checked as the
+        # toolkit just EMITTED: checked as Tk, every correct Qt project said
+        # "policy REFUSED — the Qt binding is not on the linked allowlist"
+        # here while Run, which passes the toolkit, launched it without
+        # complaint.
         policy_ok, policy_errors = gui_policy.validate_dir(
-            project_dir, manifest.mode, spec.requires)
+            project_dir, manifest.mode, spec.requires, toolkit=target)
         out.say("policy: OK" if policy_ok
                 else "policy REFUSED — Run will not start it until this is "
                      "fixed:")
@@ -387,11 +487,87 @@ def review_sources(project_dir: Any) -> str:
 
 
 def review_prompt(project_dir: Any) -> str:
-    """The critique prompt, or "" when there is nothing to critique."""
+    """The critique prompt, or "" when there is nothing to critique.
+
+    Worded for the toolkit the project was generated in, and capped the same
+    either way: the two headers are within a few characters of each other.
+    """
     sources = review_sources(project_dir)
     if not sources:
         return ""
-    return REVIEW_PROMPT + sources[:REVIEW_SOURCE_LIMIT]
+    header = REVIEW_PROMPT
+    try:
+        import gui_projects
+        if gui_projects.toolkit_for(Path(project_dir)) == "qt":
+            header = REVIEW_PROMPT_QT
+    except Exception:                                    # noqa: BLE001
+        pass
+    return header + sources[:REVIEW_SOURCE_LIMIT]
+
+
+#: The review panel: the Tk shell's, exactly. Two voices and one round is
+#: enough for advice about padding, and a full deliberation over 12 000
+#: characters of source is minutes the user spends waiting for an opinion.
+REVIEW_PANEL, REVIEW_SYNTH = ("coder", "writer"), "writer"
+
+
+def review(prompt: str, models: Any) -> str:
+    """Run the critique through a one-round Council. Returns the text to show.
+
+    `models` is a council_turn.Personalities (or anything with the role
+    slots as attributes). Blocking, and meant for a worker thread. Raises on
+    a model failure so the caller can say "review failed" — the Designer tab
+    already turns an exception into exactly that line.
+
+    This is what the Qt Designer's Review button had no backend for: the tab
+    looked for `review_with_council` on the window, nothing defined it, and
+    every click said "Council review unavailable in this build".
+    """
+    from .council_turn import AGENT_NAMES, final_answer
+    from .deliberation import DeliberationOrchestrator, ModelAgent
+
+    judge = getattr(models, "judge", None)
+    if judge is None:
+        return "review unavailable: no judge model is loaded"
+    agents = {role: ModelAgent(AGENT_NAMES.get(role, role.title()),
+                               getattr(models, role), enable_tools=False)
+              for role in REVIEW_PANEL if getattr(models, role, None) is not None}
+    if REVIEW_SYNTH not in agents:
+        return f"review unavailable: no {REVIEW_SYNTH} model is loaded"
+    orchestrator = DeliberationOrchestrator(
+        judge_model=judge, agents=agents, max_rounds=1, debate_turns=1)
+    events = orchestrator.run(prompt, panel=list(agents), synth=REVIEW_SYNTH)
+    return final_answer(events or [], REVIEW_SYNTH) or "(no critique returned)"
+
+
+# ============================================================
+# Describe it
+# ============================================================
+
+def describe(text: str, project_dir: Any = None, *,
+             model_call: Optional[Callable[[str], str]] = None) -> Any:
+    """Plain English -> a wireframe that will generate, or the reasons not.
+
+    A thin seam over gui_describe, which owns the prompt, the checks and the
+    repair rounds. What this adds is the two things only a PROJECT knows: the
+    toolkit to design for, and the default model call. The canvas is always
+    the one the user drags on, never the project file's, for the same reason
+    `create` sets it — the shapes are about to be placed on that canvas.
+
+    Never raises; a failure is a result with ok=False and the reason.
+    """
+    import gui_describe
+
+    toolkit = "tk"
+    if project_dir:
+        try:
+            import gui_projects
+            toolkit = gui_projects.toolkit_for(Path(project_dir))
+        except Exception:                                # noqa: BLE001
+            pass
+    return gui_describe.describe(
+        text, model_call=model_call or describe_model_call,
+        canvas_w=CANVAS_W, canvas_h=CANVAS_H, toolkit=toolkit)
 
 
 # ============================================================
