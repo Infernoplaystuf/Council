@@ -45,6 +45,25 @@ def qapp():
     app.processEvents()
 
 
+@pytest.fixture(autouse=True)
+def _no_window_outlives_its_test():
+    """Every parentless window a test here makes is deleted when it ends.
+
+    Most tests in this file build a CouncilWindow (or a tab, or a host) and
+    call request_close(), which closes a window and deletes nothing. 77 of
+    them were still alive when the file finished — each one Python-owned,
+    each one freed only when the last reference went, on whatever thread that
+    happened to be, or by the cyclic collector on whatever thread IT happened
+    to run. See the `window` fixture for how that ended the full suite.
+    """
+    if QApplication.instance() is None:
+        yield                               # a source check; nothing to clear
+        return
+    before = _top_level_ids()
+    yield
+    _destroy_on_the_gui_thread(_new_top_levels(before))
+
+
 def _pump(app, predicate, timeout=5.0):
     """Run the event loop until ``predicate`` or the timeout."""
     deadline = time.monotonic() + timeout
@@ -578,14 +597,39 @@ def window(qapp, tmp_path, monkeypatch):
     reaching a destroyed widget is a Windows access violation, not an
     exception: the process dies mid-suite, naming whichever test happened to be
     running. Reproduced one run in three once those three tabs existed.
+
+    AND IT LEFT EVERY WINDOW FOR THE GARBAGE COLLECTOR, which is the crash
+    that survived both fixes above: the full suite aborting at ~94%, with the
+    faulthandler naming a gen-2 collection on a ThreadPoolExecutor worker in
+    safe_agent — dozens of files after this one. A tab keeps `self.window`,
+    and the window keeps the tab (in `_built`, or in the `lambda w=widget`
+    these tests register), so each window and its whole widget tree was one
+    reference cycle owned by nobody. Refcounting never frees a cycle; the
+    cyclic collector does, on WHICHEVER thread happens to trip its threshold,
+    and a QWidget destroyed off the GUI thread takes the process with it. Even
+    on the GUI thread, the collector's order of tearing a live widget tree
+    apart was measured to corrupt the heap (the Lens tab, shown, twice).
+    And a tab built with no parent, whose constructor started a worker, had
+    its LAST reference in that worker — so it was destroyed on the worker
+    thread the moment the worker returned.
+
+    So teardown now holds every widget the test made, waits for the workers,
+    and then deletes them explicitly, on this thread, before a collection can.
     """
     monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(tmp_path / "vault"))
     monkeypatch.setenv("COUNCIL_NO_DIALOGS", "1")
+    before = _top_level_ids()
     win = CouncilWindow(theme="dark")
+    win._harness_built = []                   # see _build_tab
     yield win
+    # Pin first: while these are referenced here, no worker finishing during
+    # the drain can be the one that drops the last reference.
+    pinned = win._harness_built + _new_top_levels(before)
     _drain_tab_workers(qapp)
     win.request_close()
     qapp.processEvents()
+    _destroy_on_the_gui_thread([win] + pinned)
+    del win, pinned
 
 
 #: Worker threads the tabs start, by the names they give them.
@@ -679,12 +723,82 @@ def _drain_tab_workers(qapp, seconds: float = 10.0) -> None:
     qapp.processEvents()
 
 
+def _build_tab(window, factory):
+    """``factory(window)``, with the widget held by the fixture until teardown.
+
+    The test's own `widget` variable dies when the test returns, which is
+    BEFORE the fixture drains the workers. For a tab whose constructor started
+    one, the worker's closure is then the last reference — and the tab is
+    destroyed on the worker thread when it returns. Holding it here closes
+    that window instead of hoping the worker loses the race.
+    """
+    widget = factory(window)
+    window._harness_built.append(widget)
+    return widget
+
+
+def _top_level_ids() -> set:
+    import shiboken6
+    return {shiboken6.getCppPointer(w)[0]
+            for w in QApplication.topLevelWidgets()}
+
+
+def _new_top_levels(before: set) -> list:
+    """Parentless windows made since ``before`` — a tab's dialog, say.
+
+    Parentless only: a top-level WITH a parent (a combo box's popup, a
+    tooltip) belongs to that parent, and deleting it separately is a double
+    delete when the parent goes.
+    """
+    import shiboken6
+    return [w for w in QApplication.topLevelWidgets()
+            if shiboken6.getCppPointer(w)[0] not in before
+            and w.parent() is None]
+
+
+def _destroy_on_the_gui_thread(widgets) -> None:
+    """Delete ``widgets`` now, here, then clear what is left.
+
+    Explicit deletion runs the C++ destructors top-down, the way Qt expects,
+    and invalidates every wrapper in the tree as it goes; what the collector
+    finds afterwards is Python objects and dead wrappers, which are safe to
+    free on any thread. The deferred deletes are flushed for the same reason:
+    left pending, they run whenever some later test first enters a real event
+    loop, and that is where UiBridge's timer double delete used to go off.
+    """
+    import gc
+
+    import shiboken6
+    from PySide6.QtCore import QCoreApplication, QEvent
+
+    if not widgets:
+        return                  # a full collection per test is not free
+    for widget in widgets:
+        # The window goes first and takes its children with it; anything
+        # already inside it is invalid by the time it comes up here.
+        if shiboken6.isValid(widget) and widget.parent() is None:
+            shiboken6.delete(widget)
+    # The dead wrappers still hold the Python half of each cycle — a tab's
+    # actions, a parentless helper QObject — and pytest keeps the window
+    # wrapper until after this fixture returns. Emptying them releases all
+    # of that by refcount, now, rather than in some later collection.
+    for widget in widgets:
+        if shiboken6.isValid(widget):
+            continue                # still owned by a parent; not ours to empty
+        try:
+            vars(widget).clear()
+        except TypeError:                       # no __dict__ to clear
+            pass
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    gc.collect()
+
+
 @pytest.mark.parametrize("title,factory,eager", REGISTERED, ids=REGISTERED_IDS)
 def test_every_registered_tab_builds(window, title, factory, eager):
     """A tab that raises while building takes the whole window down with it,
     and lazy building means that happens when the user first clicks it —
     after the app looked fine."""
-    widget = factory(window)
+    widget = _build_tab(window, factory)
     assert widget is not None, f"{title} built nothing"
     assert widget.metaObject() is not None
 
@@ -694,7 +808,7 @@ def test_every_registered_tab_survives_being_shown(window, title, factory,
                                                    eager):
     """Building is not the same as being laid out. A size policy or a layout
     that only resolves on show is a real crash the build test cannot see."""
-    widget = factory(window)
+    widget = _build_tab(window, factory)
     window.add_tab(title, lambda w=widget: w, eager=True)
     window.show_tab(title)
     qapp = QApplication.instance()
@@ -711,7 +825,7 @@ def test_every_wired_name_on_a_tab_resolves(window, title, factory, eager):
     import ast
     import inspect
 
-    widget = factory(window)
+    widget = _build_tab(window, factory)
     # The FACTORY's module, not the widget's type: a tab that returns a plain
     # QWidget would otherwise send us reading a PySide6 .pyd.
     module = inspect.getmodule(factory)
@@ -853,7 +967,7 @@ def test_every_widget_a_tab_reaches_for_exists(window, title, factory, eager):
     import ast
     import inspect
 
-    widget = factory(window)
+    widget = _build_tab(window, factory)
     module = inspect.getmodule(factory)
     source = Path(module.__file__).read_text(encoding="utf-8")
     tree = ast.parse(source)
@@ -970,6 +1084,52 @@ def test_cancelling_from_a_worker_thread_does_not_touch_the_timer(qapp):
     bridge.stop()
 
 
+def test_a_timer_does_not_keep_its_own_bridge_alive(qapp):
+    """The full-suite abort at ~94%, in its smallest form.
+
+    Each after() timer's connection held a closure over the bridge — its own
+    Qt parent. Cancel one (deleteLater), drop the bridge, and the bridge lived
+    on inside that connection. When the deferred delete finally ran, the
+    timer's destructor released the closure, the closure released the bridge,
+    and deleting the bridge deleted the timer a second time: "Fatal Python
+    error: Aborted" at whatever flush of deferred deletes came next — first
+    reproduced as `sendPostedEvents(None, DeferredDelete)` after this file.
+
+    Asserted through a weak reference, because asserting it by flushing would
+    abort the whole run instead of failing this test.
+    """
+    import weakref
+
+    from PySide6.QtCore import QCoreApplication, QEvent
+
+    bridge = UiBridge()
+    cancelled = bridge.after(50, lambda: None)
+    bridge.after(60_000, lambda: None)            # still pending when dropped
+    bridge.after_cancel(cancelled)
+    bridge.stop()
+    ref = weakref.ref(bridge)
+    del bridge
+    assert ref() is None, "a timer's connection is keeping the bridge alive"
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_a_fired_timer_is_released(qapp):
+    """A single-shot timer that has fired is finished. It used to stay a
+    child of the bridge — and a strong reference to it — for the life of the
+    window."""
+    from PySide6.QtCore import QTimer
+
+    bridge = UiBridge()
+    seen = []
+    bridge.after(0, seen.append, "fired")
+    assert _pump(qapp, lambda: seen)
+    assert not bridge._timers, "a fired timer is still tracked"
+    assert _pump(qapp, lambda: not [t for t in bridge.findChildren(QTimer)
+                                    if t is not bridge._pump]), (
+        "the fired timer was never deleted")
+    bridge.stop()
+
+
 def test_a_failing_callback_prints_a_traceback(qapp, capsys):
     """Tk's report_callback_exception prints the stack. "[ui] callback failed:
     KeyError('rows')" with no frames is close to useless for a callback three
@@ -1075,6 +1235,11 @@ def test_the_qt_build_runs_the_close_work_at_all(qapp, tmp_path, monkeypatch):
     assert window.on_close is not None, "on_close is still never assigned"
     window.on_close()
     assert called == [1], "the close-time work was wired to nothing"
+    # build() scheduled the reveal on a timer, ~1.5 s out. Let it land here,
+    # on the window it belongs to — not in some later test, after this one's
+    # window has been deleted ("[Splash] reveal failed ... already deleted").
+    assert _pump(_app, window.isVisible, timeout=10.0), (
+        "build() never revealed the window")
 
     source = (Path(__file__).resolve().parent.parent / "council_qt.py"
               ).read_text(encoding="utf-8")

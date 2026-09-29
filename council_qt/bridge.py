@@ -41,6 +41,7 @@ import collections
 import queue
 import threading
 import traceback
+import weakref
 from typing import Any, Callable, Optional
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal
@@ -71,6 +72,8 @@ class UiBridge(QObject):
         self._undispatched: "collections.deque" = collections.deque(maxlen=512)
         self._dropped = 0
         self._warned_no_dispatch = False
+        #: token -> (QTimer, fn, args). See _start_timer for why the callback
+        #: lives here and not in the timer's connection.
         self._timers: dict = {}
         # Tokens cancelled before their timer was created. A cross-thread
         # after() mints its token and POSTS the request, so there is a window
@@ -135,10 +138,11 @@ class UiBridge(QObject):
             self.post((_CANCEL, token))
             return
         with self._lock:
-            timer = self._timers.pop(token, None)
-            if timer is None:
+            entry = self._timers.pop(token, None)
+            if entry is None:
                 self._cancelled.add(token)    # it has not been created yet
-        if timer is not None:
+        if entry is not None:
+            timer = entry[0]
             timer.stop()
             timer.deleteLater()
 
@@ -170,7 +174,25 @@ class UiBridge(QObject):
 
     def _start_timer(self, ms: int, fn: Callable, args: tuple,
                      token: Optional[str] = None) -> Any:
-        """Create the QTimer. Always on the UI thread — see after_cancel."""
+        """Create the QTimer. Always on the UI thread — see after_cancel.
+
+        THE TIMER'S CONNECTION MUST NOT OWN THIS BRIDGE. `_fire` used to close
+        over `self`, `fn` and `args`, and PySide keeps a connected closure alive
+        for as long as the connection exists — so every timer held a strong
+        reference to the bridge that is its own Qt parent. A cancelled timer is
+        deleteLater()'d; when that deferred delete finally ran on a bridge
+        whose other references were gone, destroying the timer released the
+        closure, which released the last reference to the bridge, which deleted
+        the bridge — and with it, its children, INCLUDING the timer already
+        halfway through its own destructor. A double delete: "Fatal Python
+        error: Aborted" or an access violation, wherever the next flush of
+        deferred deletes happened to fall. Reproduced in twelve lines:
+        UiBridge(), after(), after_cancel(), drop the bridge, flush.
+
+        So the closure holds a weak reference and the token, nothing else.
+        The callback and its arguments live in `_timers`, where cancelling or
+        firing drops them in ordinary code rather than inside a destructor.
+        """
         token = token or self._mint_token()
         with self._lock:
             if token in self._cancelled:
@@ -178,17 +200,27 @@ class UiBridge(QObject):
                 return token                  # cancelled while in the queue
         timer = QTimer(self)
         timer.setSingleShot(True)
+        bridge_ref = weakref.ref(self)
 
         def _fire():
-            with self._lock:
-                self._timers.pop(token, None)
-            self._safely(fn, args, {})
+            bridge = bridge_ref()
+            if bridge is None:
+                return
+            with bridge._lock:
+                entry = bridge._timers.pop(token, None)
+            if entry is None:
+                return                        # cancelled after it was due
+            done, callback, callback_args = entry
+            # A fired single-shot timer is finished. Left alone it stayed a
+            # child of the bridge for the life of the window.
+            done.deleteLater()
+            bridge._safely(callback, callback_args, {})
 
         timer.timeout.connect(_fire)
         # Under the lock: _fire and after_cancel both mutate this from
         # timer callbacks, and a plain dict is not safe against that.
         with self._lock:
-            self._timers[token] = timer
+            self._timers[token] = (timer, fn, args)
         timer.start(max(0, int(ms)))
         return token
 
@@ -265,6 +297,8 @@ class UiBridge(QObject):
 
     def stop(self) -> None:
         self._pump.stop()
-        for timer in list(self._timers.values()):
+        with self._lock:
+            entries, self._timers = list(self._timers.values()), {}
+        for timer, _fn, _args in entries:
             timer.stop()
-        self._timers.clear()
+            timer.deleteLater()
