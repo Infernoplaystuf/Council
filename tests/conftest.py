@@ -27,6 +27,12 @@ from __future__ import annotations
 
 import pytest
 
+# Every test runs with the desktop's openers blocked (Explorer, browsers,
+# os.startfile, QDesktopServices) and Qt offscreen — see tests/desktop_guard.py
+# for the Explorer windows that made this necessary. Imported, not declared as
+# a plugin, so inferno_local/tests can share the same fixture the same way.
+from tests.desktop_guard import desktop_openers  # noqa: E402,F401
+
 
 @pytest.fixture(scope="session")
 def tk_root():

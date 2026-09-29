@@ -425,13 +425,21 @@ def test_selecting_a_file_previews_it(qapp, tmp_path):
     window.request_close()
 
 
-def test_an_unextracted_action_says_so_instead_of_doing_nothing(qapp, tmp_path):
+def test_an_unextracted_action_says_so_instead_of_doing_nothing(
+        qapp, tmp_path, monkeypatch):
     """The extraction boundary has to be visible to the user, not silent.
 
     A button that looks live and does nothing is the failure this whole design
     is trying to avoid — the same reason the generated apps report a failed
     script link in the window rather than on a console."""
+    import os
     from council_qt.tabs.vault import VaultActions, VaultTab
+    # The probe below calls EVERY action with no arguments, and open_folder()
+    # works — it is os.startfile(tmp_path). Measured: one Explorer window on
+    # this test's temp folder per run, 25 of them left open, each blocking
+    # pytest's cleanup of its folder. Stubbed here, where the call is made on
+    # purpose, rather than left to tests/desktop_guard.py to warn about.
+    monkeypatch.setattr(os, "startfile", lambda *a, **k: None, raising=False)
     window = CouncilWindow()
     tab = VaultTab(window, VaultActions(tmp_path))
     # Written to survive the boundary moving. It has already been re-pointed

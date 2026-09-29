@@ -159,6 +159,9 @@ def rig(rt, tk_root, tmp_path):
     tk = pytest.importorskip("tkinter")
     Image = pytest.importorskip("PIL.Image")
     root = tk.Toplevel(tk_root)
+    # A Toplevel of the withdrawn session root is NOT withdrawn itself, and
+    # update() maps it: each of these tests put a 640x480 window on screen.
+    root.withdraw()
     root.geometry("640x480")
 
     folder = tmp_path / "cap"
@@ -311,6 +314,7 @@ def test_zoom_to_fit_clears_when_there_is_no_image(rt, tk_root):
     tk = pytest.importorskip("tkinter")
     Image = pytest.importorskip("PIL.Image")
     root = tk.Toplevel(tk_root)
+    root.withdraw()                       # see rig: never map it on screen
     try:
         root.geometry("400x300")
         ic = rt["ImageCanvas"](root)
