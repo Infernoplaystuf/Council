@@ -191,6 +191,21 @@ def _council_backend() -> str:
 
 _GGUF_MODEL_INSTANCE = None
 
+# ── Per-role model slots (council_core.model_slots) ──────────────────
+# One Llama per DISTINCT GGUF file, keyed by the file's resolved path, each
+# with its own lock — so two roles on two models can generate at once, and two
+# roles on the same file share one instance and take turns. The MAIN slot's
+# instance is also _GGUF_MODEL_INSTANCE and its lock IS _INFERENCE_LOCK, so
+# every caller that imports those names (inferno_local.model_runner,
+# estimate_tokens, get_model_max_context) keeps seeing the main model.
+# With no vault/model_slots.json there is exactly one slot and the loader
+# behaves precisely as it did before slots existed.
+_SLOT_INSTANCES: Dict[str, Any] = {}          # path key -> Llama
+_SLOT_LOCKS: Dict[str, Any] = {}              # path key -> threading.Lock
+_SLOT_STATUS: Dict[str, Dict[str, Any]] = {}  # slot name -> what loaded where
+_SLOT_PLAN: Optional[Dict[str, Any]] = None   # slot name -> Placement
+_SLOT_LOAD_LOCK = threading.RLock()
+
 # ── GPU-crash sentinel ───────────────────────────────────────────────
 # A native CUDA abort inside llama-cpp (the "CUDA error → hex addresses →
 # core dumped" sequence) cannot be caught in Python — it kills the whole
@@ -218,7 +233,21 @@ def gpu_attempt_pending() -> bool:
         return False
 
 
+#: True once THIS process has written the sentinel. Its presence then means
+#: "a load is in progress here", not "the last run crashed" — which matters
+#: as soon as a second model loads before the first has finished an answer.
+_GPU_ATTEMPT_THIS_PROCESS = False
+
+
+def gpu_crashed_last_run() -> bool:
+    """A sentinel left by a PREVIOUS process — the only kind that means a
+    CUDA crash. One this process wrote is just a load in flight."""
+    return gpu_attempt_pending() and not _GPU_ATTEMPT_THIS_PROCESS
+
+
 def _gpu_mark_attempt(n_layers: int) -> None:
+    global _GPU_ATTEMPT_THIS_PROCESS
+    _GPU_ATTEMPT_THIS_PROCESS = True
     try:
         p = _gpu_sentinel_path()
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -655,9 +684,16 @@ def _diagnose_load_failure(model_path: Any, exc: BaseException) -> str:
 def _pick_vram_aware_n_ctx(metadata: Dict[str, Any],
                             model_size_bytes: int,
                             abs_max: int,
-                            margin_bytes: int) -> Tuple[Optional[int], Dict[str, Any]]:
+                            margin_bytes: int,
+                            kv_budget_bytes: Optional[int] = None,
+                            ) -> Tuple[Optional[int], Dict[str, Any]]:
     """Pick the largest power-of-two n_ctx that fits in available VRAM
     after subtracting model weights and ``margin_bytes`` safety overhead.
+
+    ``kv_budget_bytes`` replaces that arithmetic when several models share
+    the card: it is this model's share of what is left after ALL of their
+    weights (council_core.model_slots.plan). Without it the first model to
+    load would size its context to the whole free card and starve the rest.
 
     Returns ``(n_ctx_or_None, diag_dict)``. ``n_ctx_or_None`` is None
     when we can't compute a VRAM-aware value (no GPU, missing metadata,
@@ -668,20 +704,24 @@ def _pick_vram_aware_n_ctx(metadata: Dict[str, Any],
         "model_size_bytes": model_size_bytes,
         "margin_bytes":     margin_bytes,
     }
-    free_vram, vram_source = _available_gpu_bytes()
-    diag["free_vram_bytes"] = free_vram
-    diag["vram_source"] = vram_source
-    if free_vram is None:
-        # Say WHICH probe failed and why. "no CUDA GPU detected" was a lie on
-        # any machine that simply lacked torch.
-        diag["reason"] = f"free VRAM unknown ({vram_source})"
-        return None, diag
+    if kv_budget_bytes is not None:
+        diag["kv_budget_bytes"] = kv_budget_bytes
+        available_for_kv = kv_budget_bytes
+    else:
+        free_vram, vram_source = _available_gpu_bytes()
+        diag["free_vram_bytes"] = free_vram
+        diag["vram_source"] = vram_source
+        if free_vram is None:
+            # Say WHICH probe failed and why. "no CUDA GPU detected" was a lie
+            # on any machine that simply lacked torch.
+            diag["reason"] = f"free VRAM unknown ({vram_source})"
+            return None, diag
 
-    # Reserve room for model weights AND the safety margin. If the
-    # model is bigger than the free VRAM, give up — the user will be
-    # on CPU/partial-offload anyway and the KV cache lives in RAM
-    # which we don't try to bound here.
-    available_for_kv = free_vram - model_size_bytes - margin_bytes
+        # Reserve room for model weights AND the safety margin. If the
+        # model is bigger than the free VRAM, give up — the user will be
+        # on CPU/partial-offload anyway and the KV cache lives in RAM
+        # which we don't try to bound here.
+        available_for_kv = free_vram - model_size_bytes - margin_bytes
     diag["available_for_kv_bytes"] = available_for_kv
     if available_for_kv <= 0:
         diag["reason"] = "no headroom for KV cache after model + margin"
@@ -747,13 +787,8 @@ def _record_engine_failure(kind: str, message: str,
         pass
 
 
-def _get_gguf_model():
-    """Lazy-load the GGUF model singleton. Raises with a helpful message on
-    misconfiguration so the user knows what env var to set."""
-    global _GGUF_MODEL_INSTANCE
-    if _GGUF_MODEL_INSTANCE is not None:
-        return _GGUF_MODEL_INSTANCE
-
+def _main_gguf_path() -> Path:
+    """COUNCIL_GGUF_PATH, checked. Raises with the env var to set."""
     path_str = os.environ.get("COUNCIL_GGUF_PATH", "").strip()
     if not path_str:
         raise RuntimeError(
@@ -763,7 +798,28 @@ def _get_gguf_model():
     p = Path(path_str)
     if not p.exists() or not p.is_file():
         raise RuntimeError(f"GGUF model not found at: {path_str}")
+    return p
 
+
+def _get_gguf_model():
+    """The MAIN slot's model, loaded on first use. The contract every caller
+    relies on — unchanged; see _get_slot_model for the other slots."""
+    if _GGUF_MODEL_INSTANCE is not None:
+        return _GGUF_MODEL_INSTANCE
+    return _get_slot_model("main")
+
+
+def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
+               kv_budget_bytes: Optional[int] = None,
+               is_main: bool = True):
+    """Load one GGUF and return the Llama. Knows nothing about slots.
+
+    ``n_gpu_layers_cap`` 0 puts this model on the CPU (the slot planner's
+    fallback when it does not fit on the card). ``kv_budget_bytes`` bounds its
+    context to its share of VRAM. Only the MAIN model records the n_ctx the UI
+    shows and gets the optional vision adapter — both were written for one
+    model and describe the one the user picked.
+    """
     try:
         from llama_cpp import Llama
     except ImportError as exc:
@@ -853,15 +909,21 @@ def _get_gguf_model():
             model_size_bytes=model_size,
             abs_max=n_ctx_cap,
             margin_bytes=margin_bytes,
+            kv_budget_bytes=kv_budget_bytes,
         )
         if picked is not None:
             n_ctx = picked
-            n_ctx_source = (
-                f"VRAM-aware (free VRAM "
-                f"{(diag.get('free_vram_bytes') or 0) / (1024**3):.1f} GB, "
-                f"model {(diag.get('model_size_bytes') or 0) / (1024**3):.1f} GB, "
-                f"margin {margin_mb} MB)"
-            )
+            if kv_budget_bytes is not None:
+                n_ctx_source = (
+                    f"VRAM-aware, shared card (this model's context budget "
+                    f"{kv_budget_bytes / (1024**3):.1f} GB)")
+            else:
+                n_ctx_source = (
+                    f"VRAM-aware (free VRAM "
+                    f"{(diag.get('free_vram_bytes') or 0) / (1024**3):.1f} GB, "
+                    f"model {(diag.get('model_size_bytes') or 0) / (1024**3):.1f} GB, "
+                    f"margin {margin_mb} MB)"
+                )
             # `diag` already carries "picked" (set in _pick_vram_aware_n_ctx);
             # passing picked= explicitly too would raise "multiple values for
             # keyword argument 'picked'". Splat diag alone.
@@ -911,11 +973,13 @@ def _get_gguf_model():
             print("  " + repr(entry), flush=True)
 
     # Persist on the engine module so the UI can surface the chosen
-    # n_ctx + source without re-running detection.
+    # n_ctx + source without re-running detection. Main model only — the
+    # title bar describes the model the user picked.
     global _LAST_N_CTX, _LAST_N_CTX_SOURCE, _LAST_N_CTX_LADDER
-    _LAST_N_CTX = n_ctx
-    _LAST_N_CTX_SOURCE = n_ctx_source
-    _LAST_N_CTX_LADDER = ladder
+    if is_main:
+        _LAST_N_CTX = n_ctx
+        _LAST_N_CTX_SOURCE = n_ctx_source
+        _LAST_N_CTX_LADDER = ladder
 
     _LOG.info("[GGUF] n_ctx chosen = %s (source: %s)", f"{n_ctx:,}", n_ctx_source)
     print(f"[GGUF] n_ctx = {n_ctx:,}  (source: {n_ctx_source})", flush=True)
@@ -968,6 +1032,10 @@ def _get_gguf_model():
     #   Granite 3.1 8B:      ~190 MB per layer × 32 layers = ~6 GB
     # Plus KV cache (scales with n_ctx) and a small constant overhead.
     n_gpu_layers = int(os.environ.get("COUNCIL_GGUF_GPU_LAYERS", "99"))
+    if n_gpu_layers_cap is not None:
+        # The slot planner put this model on the CPU (it did not fit beside
+        # the others). The env var can only lower this, never raise it.
+        n_gpu_layers = min(n_gpu_layers, int(n_gpu_layers_cap))
 
     # Best-effort GPU sanity check — surface the actual GPU + available
     # VRAM in the startup log when one is detected, so users see why
@@ -1076,10 +1144,13 @@ def _get_gguf_model():
     # kwargs, we retry WITHOUT the handler and log the fact loudly.
     chat_handler = None
     clip_source  = ""   # "env" / "json" / "" for logging
-    clip_path_raw = os.environ.get("COUNCIL_GGUF_CLIP_PATH", "").strip()
+    # The vision adapter is paired with the main GGUF the user picked;
+    # attaching it to another slot's model is the stale-clip crash below.
+    clip_path_raw = (os.environ.get("COUNCIL_GGUF_CLIP_PATH", "").strip()
+                     if is_main else "")
     if clip_path_raw:
         clip_source = "env"
-    else:
+    elif is_main:
         # Fallback — when the env var isn't set, check the persisted
         # wizard choice in vault/backend_settings.json. Same
         # precedence as onboarding.load_clip_path uses.
@@ -1136,7 +1207,7 @@ def _get_gguf_model():
     # clean shutdown). Run on CPU this time so the app starts instead of
     # dumping again; the user re-enables GPU in ⚙ Engine once fixed.
     if n_gpu_layers > 0:
-        if gpu_attempt_pending():
+        if gpu_crashed_last_run():
             print("[GGUF] Previous GPU run did not complete (likely a CUDA "
                   "core dump). Falling back to CPU (n_gpu_layers=0) so the app "
                   "starts. Re-enable GPU in the ⚙ Engine settings once the "
@@ -1170,7 +1241,7 @@ def _get_gguf_model():
               "on" if chat_handler else "off")
 
     try:
-        _GGUF_MODEL_INSTANCE = Llama(**llama_kwargs)
+        llm = Llama(**llama_kwargs)
     except Exception as primary_exc:
         # Failure-mode (1) and (2) from the comment above: if vision
         # was attached and Llama() crashed, retry without the handler.
@@ -1199,7 +1270,7 @@ def _get_gguf_model():
                 context={"model": p.name, "clip_source": clip_source},
             )
             llama_kwargs.pop("chat_handler", None)
-            _GGUF_MODEL_INSTANCE = Llama(**llama_kwargs)
+            llm = Llama(**llama_kwargs)
             chat_handler = None   # reflect actual state for downstream code
         else:
             # No handler involved — re-raise so the user sees the real
@@ -1221,7 +1292,8 @@ def _get_gguf_model():
     # they have before raising COUNCIL_GGUF_N_CTX. This is a no-op when the
     # GGUF metadata doesn't include the field.
     try:
-        _max = get_model_max_context()
+        _max = (_gguf_max_context_from_metadata(metadata)
+                if (is_main and metadata) else None)
         if _max and _max > n_ctx:
             print(
                 f"[GGUF] Model advertises max context {_max} tokens — you may "
@@ -1231,7 +1303,189 @@ def _get_gguf_model():
             )
     except Exception:
         pass
-    return _GGUF_MODEL_INSTANCE
+    return llm
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-role model slots — which file each slot loads, where it runs, its lock
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _path_key(p: Any) -> str:
+    try:
+        return str(Path(p).resolve()).lower()
+    except Exception:
+        return str(p).lower()
+
+
+def _slot_config():
+    from council_core import model_slots
+    return model_slots.current()
+
+
+def _slot_file(cfg: Any, slot: str) -> Path:
+    """The GGUF a slot loads. Main follows COUNCIL_GGUF_PATH unless the slot
+    file names one; a missing non-main file is an error that names the slot."""
+    s = cfg.slots.get(slot) or cfg.slots["main"]
+    if s.name == "main" and not s.path:
+        return _main_gguf_path()
+    p = Path(s.path)
+    if not p.is_file():
+        raise RuntimeError(
+            f"The model for slot '{s.name}' is not on disk: {s.path}\n"
+            "Pick another file for those roles in the Models tab.")
+    return p
+
+
+def _slot_keys(cfg: Any) -> Dict[str, str]:
+    """slot -> path key, for the slots whose file resolves."""
+    out: Dict[str, str] = {}
+    for name in cfg.slots:
+        try:
+            out[name] = _path_key(_slot_file(cfg, name))
+        except Exception:
+            continue                  # a missing file fails when it is used
+    return out
+
+
+def _slot_margin_bytes() -> int:
+    try:
+        mb = int(os.environ.get("COUNCIL_GGUF_KV_VRAM_MARGIN_MB", "1024"))
+    except Exception:
+        mb = 1024
+    return max(0, mb) * 1024 * 1024
+
+
+def _slot_plan(cfg: Any) -> Dict[str, Any]:
+    """Placement for every slot, computed once per configuration.
+
+    Slots that share a file are planned once (under the first of them in
+    priority order) and inherit its placement — one file, one instance.
+    Measured before any slot loads, because refresh_backend_config drops
+    every instance when the configuration changes.
+    """
+    global _SLOT_PLAN
+    if _SLOT_PLAN is not None:
+        return _SLOT_PLAN
+    from council_core import model_slots
+    keys = _slot_keys(cfg)
+    sizes: Dict[str, int] = {}        # representative slot -> bytes
+    owner: Dict[str, str] = {}        # path key -> representative slot
+    for name in model_slots.priority(cfg):
+        key = keys.get(name)
+        if key is None or key in owner:
+            continue
+        owner[key] = name
+        try:
+            sizes[name] = int(_slot_file(cfg, name).stat().st_size)
+        except Exception:
+            sizes[name] = 0
+    try:
+        gpu_layers = int(os.environ.get("COUNCIL_GGUF_GPU_LAYERS", "99"))
+    except Exception:
+        gpu_layers = 99
+    free = None
+    if gpu_layers > 0 and not gpu_crashed_last_run():
+        free, _source = _available_gpu_bytes()
+    planned = model_slots.plan(cfg, sizes, free,
+                               margin_bytes=_slot_margin_bytes())
+    _SLOT_PLAN = {name: planned[owner[key]] for name, key in keys.items()
+                  if owner.get(key) in planned}
+    return _SLOT_PLAN
+
+
+def _get_slot_model(slot: str = "main"):
+    """The Llama for ``slot``, loaded on first use.
+
+    With one distinct file (always the case without vault/model_slots.json)
+    this is the old singleton path exactly: COUNCIL_GGUF_PATH, the env's GPU
+    layers, the VRAM-aware ladder over the whole card. With several, each
+    distinct file loads once — on the GPU if the plan found room for it, on
+    the CPU if not.
+    """
+    global _GGUF_MODEL_INSTANCE
+    with _SLOT_LOAD_LOCK:
+        cfg = _slot_config()
+        if slot not in cfg.slots:
+            slot = "main"
+        path = _slot_file(cfg, slot)
+        key = _path_key(path)
+        is_main = key == _path_key(_slot_file(cfg, "main"))
+        llm = _SLOT_INSTANCES.get(key)
+        if llm is None:
+            placement = None
+            if len(set(_slot_keys(cfg).values())) > 1:
+                placement = _slot_plan(cfg).get(slot)
+            if placement is None:
+                llm = _load_gguf(path, is_main=is_main)
+                on_gpu = int(os.environ.get(
+                    "COUNCIL_GGUF_GPU_LAYERS", "99") or 0) > 0
+                reason = ""
+            else:
+                print(f"[slots] {slot}: {path.name} -> "
+                      f"{'GPU' if placement.on_gpu else 'CPU'} "
+                      f"({placement.reason})", flush=True)
+                llm = _load_gguf(
+                    path,
+                    n_gpu_layers_cap=None if placement.on_gpu else 0,
+                    kv_budget_bytes=placement.kv_budget_bytes,
+                    is_main=is_main)
+                on_gpu, reason = placement.on_gpu, placement.reason
+            _SLOT_INSTANCES[key] = llm
+            try:
+                n_ctx = int(llm.n_ctx())
+            except Exception:
+                n_ctx = None
+            for name, k in _slot_keys(cfg).items():
+                if k == key:
+                    _SLOT_STATUS[name] = {"path": str(path), "n_ctx": n_ctx,
+                                          "on_gpu": on_gpu, "reason": reason}
+        if is_main:
+            _GGUF_MODEL_INSTANCE = llm
+        return llm
+
+
+def _slot_llm_and_lock(slot: str):
+    """(Llama, the lock that serialises calls on it) for ``slot``.
+
+    One lock per FILE: roles on different models run at the same time, roles
+    on the same model take turns. The main model's lock IS _INFERENCE_LOCK,
+    because other modules import that name to serialise against it.
+    """
+    llm = _get_slot_model(slot)
+    with _SLOT_LOAD_LOCK:
+        cfg = _slot_config()
+        name = slot if slot in cfg.slots else "main"
+        key = _path_key(_slot_file(cfg, name))
+        if key == _path_key(_slot_file(cfg, "main")):
+            return llm, _INFERENCE_LOCK
+        return llm, _SLOT_LOCKS.setdefault(key, threading.Lock())
+
+
+def slot_status() -> Dict[str, Dict[str, Any]]:
+    """What each slot loaded, where it runs, and its context — for the
+    Models tab. A slot appears once it has loaded (on its first answer)."""
+    with _SLOT_LOAD_LOCK:
+        return {k: dict(v) for k, v in _SLOT_STATUS.items()}
+
+
+def _release_slots() -> None:
+    """Forget every loaded model; the next call loads the new configuration.
+
+    The instances are dropped, NOT closed: a role may be mid-answer on another
+    thread, and freeing a Llama under a running generation is a native crash.
+    That call holds its own reference, so the memory goes when it finishes.
+    """
+    global _SLOT_PLAN
+    with _SLOT_LOAD_LOCK:
+        _SLOT_INSTANCES.clear()
+        _SLOT_LOCKS.clear()
+        _SLOT_STATUS.clear()
+        _SLOT_PLAN = None
+    try:
+        from council_core import model_slots
+        model_slots.invalidate()
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1362,6 +1616,7 @@ def context_budget_report(prompt_text: str) -> Dict[str, Any]:
 
 def _clamp_messages_to_ctx(
     messages: List[Dict[str, str]], num_predict: int,
+    model_n_ctx: Optional[int] = None,
 ) -> Tuple[List[Dict[str, str]], int]:
     """Guarantee ``prompt_tokens + reply_tokens <= n_ctx`` BEFORE handing the
     prompt to llama-cpp. An over-long prompt is the classic "exceeds context
@@ -1381,6 +1636,10 @@ def _clamp_messages_to_ctx(
         n_ctx = 4096
     if n_ctx <= 0:
         n_ctx = 4096
+    # A slot sharing the card may have loaded with a SMALLER window than the
+    # configured one (its share of VRAM). Clamp to what it actually has.
+    if model_n_ctx and 0 < int(model_n_ctx) < n_ctx:
+        n_ctx = int(model_n_ctx)
 
     def _est(s: str) -> int:
         try:
@@ -1431,18 +1690,39 @@ def _clamp_messages_to_ctx(
     return msgs, reply
 
 
+def _slot_for_role(role: Optional[str]) -> str:
+    """The slot council_core.model_slots assigns ``role``; "main" if none."""
+    if not role:
+        return "main"
+    try:
+        from council_core import model_slots
+        return model_slots.slot_for_role(role)
+    except Exception:
+        return "main"
+
+
+def _model_n_ctx(llm: Any) -> Optional[int]:
+    try:
+        return int(llm.n_ctx())
+    except Exception:
+        return None
+
+
 def _gguf_chat(
     messages: List[Dict[str, str]],
     *,
     temperature: float,
     num_predict: int,
+    slot: str = "main",
 ) -> str:
-    """Blocking GGUF chat completion using the loaded llama-cpp model."""
-    llm = _get_gguf_model()
-    messages, num_predict = _clamp_messages_to_ctx(messages, num_predict)
+    """Blocking GGUF chat completion on ``slot``'s model."""
+    llm, lock = _slot_llm_and_lock(slot)
+    messages, num_predict = _clamp_messages_to_ctx(
+        messages, num_predict, _model_n_ctx(llm))
     # Serialize against every other inference call on the same Llama
-    # instance — see _INFERENCE_LOCK docstring at module top for why.
-    with _INFERENCE_LOCK:
+    # instance — see _INFERENCE_LOCK docstring at module top for why. Each
+    # model has its own lock; the main model's is _INFERENCE_LOCK.
+    with lock:
         result = llm.create_chat_completion(
             messages=messages,
             temperature=float(temperature),
@@ -1461,17 +1741,19 @@ def _gguf_chat_stream(
     temperature: float,
     num_predict: int,
     token_callback: Optional[Callable[[str], None]],
+    slot: str = "main",
 ) -> str:
     """Streaming GGUF chat completion — emits each token via token_callback."""
-    llm = _get_gguf_model()
-    messages, num_predict = _clamp_messages_to_ctx(messages, num_predict)
+    llm, lock = _slot_llm_and_lock(slot)
+    messages, num_predict = _clamp_messages_to_ctx(
+        messages, num_predict, _model_n_ctx(llm))
     pieces: list[str] = []
     # Hold the inference lock for the entire stream. Releasing between
     # chunks would let another call slip in and corrupt the in-progress
     # KV cache. token_callback fires INSIDE the lock — callbacks should
     # be fast (queue.put_nowait or a buffer append) and must NOT call
     # back into local_chat (would deadlock).
-    with _INFERENCE_LOCK:
+    with lock:
         for chunk in llm.create_chat_completion(
             messages=messages,
             temperature=float(temperature),
@@ -1519,10 +1801,12 @@ def local_chat(
     model: Optional[str] = None,
     host: Optional[str] = None,
     timeout: int = 120,
+    role: Optional[str] = None,
 ) -> str:
     """Blocking chat call against the loaded GGUF. `model`, `host`, `timeout`
-    accepted for caller compatibility but ignored — every role uses the
-    single GGUF singleton.
+    accepted for caller compatibility but ignored. ``role`` picks the model:
+    the slot council_core.model_slots assigns it, "main" when it has none
+    (every caller that passes no role gets the main model, as before).
 
     When ``COUNCIL_AGENT_MEMORY_ENABLE`` is on, the call's
     ``(question, answer)`` is appended to the agent ConversationLog after
@@ -1530,7 +1814,7 @@ def local_chat(
     call's return value is what matters.
     """
     answer = _gguf_chat(messages, temperature=temperature,
-                        num_predict=num_predict)
+                        num_predict=num_predict, slot=_slot_for_role(role))
     if _agent_memory_enabled():
         try:
             import agent_logs
@@ -1750,15 +2034,18 @@ class LocalBackendSpec:
         max_tokens: Optional[int] = None,
         trace: bool = True,
         token_callback: Optional[Callable[[str], None]] = None,
+        role: Optional[str] = None,
     ) -> str:
         temp = self.default_temperature if temperature is None else float(temperature)
         mtok = self.default_max_tokens if max_tokens is None else int(max_tokens)
+        slot = _slot_for_role(role)
 
         if trace:
             print(
                 f"[MODEL_CALL] backend={self.key} model={self.model} "
                 f"host={self.host} temp={temp} max_tokens={mtok} "
-                f"sys_len={len(developer_instructions)} user_len={len(user_text)}"
+                f"sys_len={len(developer_instructions)} user_len={len(user_text)} "
+                f"role={role or '-'} slot={slot}"
             )
 
         messages = [
@@ -1766,17 +2053,18 @@ class LocalBackendSpec:
             {"role": "user", "content": user_text},
         ]
 
-        # Single GGUF singleton serves every role. `model`, `host`,
-        # `allow_remote` retained for trace/registry compatibility only.
+        # The role's SLOT picks the model (council_core.model_slots); with
+        # no slot file every role is on "main", the one GGUF. `model`,
+        # `host`, `allow_remote` retained for trace/registry compatibility.
         if token_callback is not None:
             return _gguf_chat_stream(
                 messages,
                 temperature=temp, num_predict=mtok,
-                token_callback=token_callback,
+                token_callback=token_callback, slot=slot,
             )
         return _gguf_chat(
             messages,
-            temperature=temp, num_predict=mtok,
+            temperature=temp, num_predict=mtok, slot=slot,
         )
 
 
@@ -3416,6 +3704,7 @@ class PersonalityModel:
             max_tokens=effective_max_tokens,
             trace=self.trace,
             token_callback=token_callback,
+            role=self.name,
         )
 
 
@@ -4774,6 +5063,9 @@ def refresh_backend_config() -> Dict[str, str]:
     """
     global DEFAULT_MODELS, _GGUF_MODEL_INSTANCE, _GPU_CONFIRMED_THIS_PROCESS
     _GGUF_MODEL_INSTANCE = None
+    # Every slot, not just main: a changed role->model map, a changed main
+    # path, or a changed GPU setting all mean "load again".
+    _release_slots()
     # A different model is about to load — let it re-prove the GPU path.
     _GPU_CONFIRMED_THIS_PROCESS = False
     DEFAULT_MODELS.clear()
@@ -4854,7 +5146,8 @@ class _DispatchedBackendSpec(LocalBackendSpec):
     def generate(self, *, developer_instructions: str, user_text: str,
                  temperature: Optional[float] = None, max_tokens: Optional[int] = None,
                  trace: bool = True,
-                 token_callback: Optional[Callable[[str], None]] = None) -> str:
+                 token_callback: Optional[Callable[[str], None]] = None,
+                 role: Optional[str] = None) -> str:
         # Multi-node inference (opt-in via COUNCIL_REMOTE_NODES). When a
         # REACHABLE, non-loopback node is chosen for this model, run the
         # inference THERE (Ollama HTTP) instead of on the local GGUF —
@@ -4900,6 +5193,7 @@ class _DispatchedBackendSpec(LocalBackendSpec):
             max_tokens=max_tokens,
             trace=trace,
             token_callback=token_callback,
+            role=role,
         )
 
 

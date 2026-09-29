@@ -285,6 +285,8 @@ def _needs_research(task: str, personality_model: Any) -> Tuple[bool, str]:
             temperature=0.0,
             max_tokens=80,   # only needs {"needs_research":true/false,"reason":"...","query":"..."}
             trace=False,
+            # The routing call runs on the Intern's own model slot.
+            role=getattr(personality_model, "name", None),
         )
     except Exception:
         # Fallback to full respond() if spec lookup fails

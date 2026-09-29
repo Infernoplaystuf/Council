@@ -68,11 +68,13 @@ class ModelsActions:
 class ModelsTab(ViewHelpers, QWidget):
     """Hardware, a ranked list, and one download."""
 
-    def __init__(self, window=None, actions: Optional[ModelsActions] = None):
+    def __init__(self, window=None, actions: Optional[ModelsActions] = None,
+                 role_actions=None):
         super().__init__()
         self.window = window
         self.bridge = getattr(window, "bridge", None)
         self.actions = actions or ModelsActions()
+        self.role_actions = role_actions
         self._tokens = theme.tokens("dark")
         self._hardware = None
         self._rows: List[model_jobs.ModelRow] = []
@@ -145,6 +147,11 @@ class ModelsTab(ViewHelpers, QWidget):
         self.progress.setStyleSheet(f"color: {self._tokens['muted_fg']};")
         actions.addWidget(self.progress)
         outer.addLayout(actions)
+
+        # Which model answers for each role — the per-role slots.
+        from ..widgets.role_models import RoleModelsPanel
+        self.roles = RoleModelsPanel(self.role_actions, parent=self)
+        outer.addWidget(self.roles)
 
     # ------------------------------------------------------------------
     def detect_hardware(self) -> None:
@@ -259,6 +266,8 @@ class ModelsTab(ViewHelpers, QWidget):
                 self.download_btn.setEnabled(True)
                 self.progress.setText("")
                 self.status.setText(result.message)
+                # A new file on disk is a new choice for every role.
+                self.roles.reload()
 
             self._to_ui(show)
 
