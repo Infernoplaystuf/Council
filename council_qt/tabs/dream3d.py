@@ -109,7 +109,18 @@ class Dream3DTab(ViewHelpers, QWidget):
 
         self._build()
         self._attach_to_council()
-        if auto_refresh:
+        # The first scan waits for the tab to be SHOWN, not built. A worker
+        # started in a constructor outlives a tab that is built and dropped —
+        # the scan creates folders, slow on a synced drive — and its last
+        # reference can go on the worker thread, which destroys the widget
+        # off the GUI thread. Measured: an access violation in the tab
+        # harness, which builds every tab without showing most of them.
+        self._scan_on_show = bool(auto_refresh)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._scan_on_show:
+            self._scan_on_show = False
             self.refresh()
 
     # ------------------------------------------------------------------

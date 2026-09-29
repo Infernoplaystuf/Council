@@ -342,6 +342,9 @@ def make_tab(qapp, tmp_path):
                 t.join(3)
         qapp.processEvents()
         view.actions.monitor.stop()
+        # The monitor's callback holds the tab: break that cycle so the tab
+        # is not left for a garbage collection on some worker thread.
+        view.actions.monitor.status_cb = None
         view.deleteLater()
     qapp.processEvents()
 
@@ -444,10 +447,11 @@ def test_the_teardown_stops_the_monitor(qapp, tmp_path):
     tab = ApothecaryTab(actions=actions)
     monitor = actions.monitor
     assert monitor.status_cb is not None
-    tab.deleteLater()
-    qapp.processEvents()
-    from PySide6.QtCore import QCoreApplication, QEvent
-    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    # Delete THIS widget now. Flushing every deferred delete in the process
+    # would also destroy widgets earlier test files left pending — some of
+    # which crash when destroyed (see the foundation harness).
+    import shiboken6
+    shiboken6.delete(tab)
     qapp.processEvents()
     assert monitor._stop.is_set() and monitor.status_cb is None
 

@@ -246,8 +246,14 @@ def gpu_crashed_last_run() -> bool:
 
 
 def _gpu_mark_attempt(n_layers: int) -> None:
-    global _GPU_ATTEMPT_THIS_PROCESS
+    global _GPU_ATTEMPT_THIS_PROCESS, _GPU_CONFIRMED_THIS_PROCESS
     _GPU_ATTEMPT_THIS_PROCESS = True
+    # Re-arm the clear. The first successful generation clears the sentinel
+    # ONCE per process; a second model loading after that wrote it again and
+    # nothing cleared it, so a clean run left it on disk and the NEXT launch
+    # read it as a CUDA crash and put every model on the CPU. Measured: a
+    # Balanced run after a clean one took 382 s for an answer that takes 3.
+    _GPU_CONFIRMED_THIS_PROCESS = False
     try:
         p = _gpu_sentinel_path()
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -1384,10 +1390,20 @@ def _slot_plan(cfg: Any) -> Dict[str, Any]:
     except Exception:
         gpu_layers = 99
     free = None
-    if gpu_layers > 0 and not gpu_crashed_last_run():
+    why_cpu = ""
+    if gpu_layers <= 0:
+        why_cpu = "GPU layers set to 0 — running on the CPU"
+    elif gpu_crashed_last_run():
+        why_cpu = ("the last GPU run did not finish (possible CUDA crash) — "
+                   "running on the CPU until GPU is re-enabled")
+    else:
         free, _source = _available_gpu_bytes()
     planned = model_slots.plan(cfg, sizes, free,
                                margin_bytes=_slot_margin_bytes())
+    if why_cpu:
+        # Say WHY. "No GPU memory information" hid a stale crash sentinel.
+        from dataclasses import replace as _replace
+        planned = {n: _replace(p, reason=why_cpu) for n, p in planned.items()}
     _SLOT_PLAN = {name: planned[owner[key]] for name, key in keys.items()
                   if owner.get(key) in planned}
     return _SLOT_PLAN

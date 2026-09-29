@@ -2100,11 +2100,24 @@ def test_gpu_crash_sentinel_lifecycle() -> None:
             _check("sentinel cleared after a successful generation",
                    not ce.gpu_attempt_pending())
 
-            # Second confirm in the same process is a no-op (guarded).
+            # A second confirm with NO new load is a no-op: the file is
+            # touched once per load, not on every generation.
+            ce._gpu_confirm_success()
+            _check("a confirm with no new load does not re-touch the file",
+                   ce._GPU_CONFIRMED_THIS_PROCESS is True)
+
+            # A NEW load re-arms it. With per-role models a second model
+            # loads after the first has answered; that load must be proved
+            # and cleared too, or a clean run leaves the sentinel behind and
+            # the next launch puts every model on the CPU.
             ce._gpu_mark_attempt(99)
-            ce._gpu_confirm_success()   # already confirmed -> must NOT clear
-            _check("confirm is once-per-process (sentinel still present)",
-                   ce.gpu_attempt_pending())
+            _check("a new load re-arms the confirm",
+                   ce._GPU_CONFIRMED_THIS_PROCESS is False
+                   and ce.gpu_attempt_pending())
+            ce._gpu_confirm_success()
+            _check("its first success clears the sentinel again",
+                   not ce.gpu_attempt_pending())
+            ce._gpu_mark_attempt(99)
 
             # Explicit clear (engine settings / clean close path).
             ce.gpu_clear_attempt()
@@ -4404,7 +4417,11 @@ def test_agent_read_budget_not_double_counted() -> None:
         return
     with tempfile.TemporaryDirectory() as td:
         folder = Path(td)
-        (folder / "data.csv").write_text("x" * 1000)   # 1000 bytes
+        # Four DIFFERENT files: the agent no longer re-runs an identical call
+        # (a small model loops on one), so four reads of one file would be
+        # one read — which is not what this test is about.
+        for n in range(1, 5):
+            (folder / f"data{n}.csv").write_text("x" * 1000)   # 1000 bytes
         policy = AgentPolicy(
             allowed_tools=("read_local_file",),
             file_root=folder, output_dir=folder, max_steps=8,
@@ -4419,7 +4436,7 @@ def test_agent_read_budget_not_double_counted() -> None:
                 self.i += 1
                 if self.i <= 4:
                     return ('{"action":"tool","tool":"read_local_file",'
-                            '"args":{"path":"data.csv"}}')
+                            '"args":{"path":"data%d.csv"}}' % self.i)
                 return '{"action":"final","answer":"done"}'
 
         run = ConstrainedAgent(FakeRunner(), reg, policy).run("read a few times")

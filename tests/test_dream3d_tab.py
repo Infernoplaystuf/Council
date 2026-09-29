@@ -409,6 +409,7 @@ def make_tab(qapp, tmp_path):
     def make(pipelines=(), window=None, **kw):
         actions = FakeActions(tmp_path, list(pipelines))
         view = Dream3DTab(window=window, actions=actions, **kw)
+        view.refresh()                 # the first scan otherwise waits for show
         pump(qapp, lambda: not view._busy)
         made.append(view)
         return view
@@ -558,4 +559,27 @@ def test_the_council_tab_answers_pipeline_commands_without_a_turn(qapp,
     assert not tab._turn_active and tab.input.toPlainText() == ""
     assert len(mirrored) == 2              # the user line and the answer
     tab.deleteLater()
+    qapp.processEvents()
+
+
+def test_building_the_tab_starts_no_worker_until_it_is_shown(qapp, tmp_path):
+    """A constructor-time scan outlived a tab that was built and dropped, and
+    its last reference went on the worker thread: an access violation."""
+    actions = FakeActions(tmp_path, [_pl("a.d3dpipeline")])
+    scans = []
+    real = actions.scan
+    actions.scan = lambda: (scans.append(1), real())[1]
+    view = Dream3DTab(actions=actions)
+    qapp.processEvents()
+    assert scans == [] and not view._busy
+    from PySide6.QtCore import Qt
+    view.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
+    view.show()
+    pump(qapp, lambda: scans and not view._busy)
+    assert view.pipelines.count() == 1
+    view.show()                        # a second show does not rescan
+    qapp.processEvents()
+    assert scans == [1]
+    view.hide()
+    view.deleteLater()
     qapp.processEvents()

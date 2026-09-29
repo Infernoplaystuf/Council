@@ -399,3 +399,27 @@ def test_a_personality_answers_on_its_roles_model(engine):
                                     session_id="t", trace=False)
     assert models["peasant"].respond("hello") == "small"
     assert models["writer"].respond("hello") == "big"
+
+
+def test_a_clean_two_model_run_leaves_no_crash_sentinel(engine):
+    """Loading the second model re-wrote the sentinel after the first answer
+    had cleared it, and nothing cleared it again — so the NEXT launch read a
+    clean run as a CUDA crash and put every model on the CPU."""
+    _write(engine, {"fast": {"path": str(engine.models / "small.gguf")}},
+           {"peasant": "fast"})
+    ce = engine.ce
+    msgs = [{"role": "user", "content": "x"}]
+    ce.local_chat(msgs, role="writer")          # load main, answer (clears)
+    ce.local_chat(msgs, role="peasant")         # load fast, answer
+    assert not ce.gpu_attempt_pending()
+
+
+def test_a_crash_sentinel_says_why_the_slots_are_on_the_cpu(engine):
+    _write(engine, {"fast": {"path": str(engine.models / "small.gguf")}},
+           {"peasant": "fast"})
+    ce = engine.ce
+    ce._gpu_sentinel_path().write_text("n_gpu_layers=99\n")
+    ce.local_chat([{"role": "user", "content": "x"}], role="peasant")
+    reason = ce.slot_status()["fast"]["reason"]
+    assert "did not finish" in reason and "CPU" in reason
+    assert not ce.slot_status()["fast"]["on_gpu"]

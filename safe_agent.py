@@ -811,6 +811,11 @@ class ConstrainedAgent:
         tools = self.registry.as_dict()
         used: List[str] = []
         missing: List[str] = []
+        # (tool, args) already run this task. A small model loops: Llama 3.2
+        # 3B called list_files with the same arguments until max_steps on
+        # every step of a real run and never read a file. A repeat is not run
+        # again; the model is told to use what it already has.
+        seen_calls: set = set()
 
         for step in range(1, self.policy.max_steps + 1):
             t0 = time.time()
@@ -872,6 +877,25 @@ class ConstrainedAgent:
                 convo.append({"role": "user",
                               "content": ev.observation})
                 continue
+
+            # ── A repeat of a call already made: do not run it again. ──
+            try:
+                call_key = name + json.dumps(args, sort_keys=True, default=str)
+            except Exception:
+                call_key = name + repr(args)
+            if call_key in seen_calls:
+                others = [n for n in tools if n != name]
+                ev.observation = (
+                    f"[repeat] You already called {name} with these exact "
+                    "arguments; its result is above. Do not call it again. "
+                    "Use that result: call a different tool ("
+                    + ", ".join(others[:4]) + ") or give your final answer.")
+                run.steps.append(ev)
+                if on_step: on_step(ev, run)
+                convo.append({"role": "assistant", "content": reply})
+                convo.append({"role": "user", "content": ev.observation})
+                continue
+            seen_calls.add(call_key)
 
             # ── Tool is allow-listed; dispatch. ──
             try:

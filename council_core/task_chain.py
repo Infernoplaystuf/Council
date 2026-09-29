@@ -40,6 +40,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 PLANNER, WORKER, CHECKER, WRITER = "strategist", "intern", "judge", "writer"
+ESCALATE = "coder"          # who retries a failed step (see TaskChain)
 
 MAX_STEPS = 5
 RESULT_FOR_NEXT = 800          # chars of a dependency's result a step sees
@@ -242,6 +243,20 @@ def needs_data(task: str) -> bool:
     return bool(_DATA_WORDS.search(task or ""))
 
 
+_ACTION_START = re.compile(r'^\s*(```\w*\s*)?\{\s*"action"\s*:', re.IGNORECASE)
+
+
+def looks_like_tool_call(answer: str) -> bool:
+    """An "answer" that is really the agent protocol — a tool call or its
+    malformed start — rather than a result."""
+    if _ACTION_START.match(answer or ""):
+        return True
+    data = first_json(answer or "")
+    return (isinstance(data, dict) and "action" in data
+            and len((answer or "").strip()) < 2000
+            and (answer or "").strip().startswith(("{", "```")))
+
+
 # ============================================================
 # The chain
 # ============================================================
@@ -255,9 +270,16 @@ class TaskChain:
                  *, on_event: Optional[Callable[[ChainEvent], None]] = None,
                  should_stop: Optional[Callable[[], bool]] = None,
                  max_steps: int = MAX_STEPS, retries: int = 1,
-                 data_overview: Optional[Callable[[], str]] = None):
+                 data_overview: Optional[Callable[[], str]] = None,
+                 escalate_role: str = ESCALATE):
         self.chat = chat
         self.work = work
+        # Who retries a failed step. Cheap first, strong second: on a real
+        # Balanced run Llama 3.2 3B (the Intern's slot) could not drive the
+        # tools at all, while Phi-4 planned well — so a retry goes to the
+        # Coder's slot, which is Phi-4 under that preset. With one model this
+        # is the same model, and nothing changes.
+        self.escalate_role = escalate_role or WORKER
         # What data exists — file names, CSV headers, row counts — read
         # deterministically. Without it the planner guessed: on the first real
         # run it invented a "Total Sales Amount" column that did not exist.
@@ -337,6 +359,11 @@ class TaskChain:
                             f"({result.stopped_reason})")
         if len((result.answer or "").strip()) < 15:
             problems.append("the answer is empty or too short to use")
+        if looks_like_tool_call(result.answer):
+            # Measured: a worker's malformed tool call came back as its
+            # "answer", and the checker PASSED it. Caught here instead.
+            problems.append("the answer is a tool call, not a result — run "
+                            "the tool and report what it returned")
         if needs_data(step.task) and not result.tools_used:
             problems.append("it answered a data question without looking at "
                             "any data")
@@ -362,12 +389,14 @@ class TaskChain:
             out.attempts = attempt + 1
             out.problems = []        # a clean retry must not inherit the old
             self._stop_check()
+            role = WORKER if attempt == 0 else self.escalate_role
             self._emit("work" if attempt == 0 else "retry",
                        f"step {step.number}/{total}: {step.task}"
-                       + (f" — retrying: {critique}" if attempt else ""),
+                       + (f" — retrying as {role}: {critique}"
+                          if attempt else ""),
                        step.number)
-            result = self.work(WORKER, self._task_text(goal, step, total, done,
-                                                       critique),
+            result = self.work(role, self._task_text(goal, step, total, done,
+                                                     critique),
                                lambda ev: self._stop_check())
             out.answer = (result.answer or "").strip()
             out.tools_used = list(result.tools_used or [])

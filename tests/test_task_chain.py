@@ -324,6 +324,20 @@ def pump(qapp, until, seconds=5.0):
     assert until(), "timed out"
 
 
+def _dispose(tab):
+    """Really destroy the tab, here on the GUI thread. deleteLater() plus
+    processEvents() deletes nothing outside an event loop, and the tab sits
+    in a cycle (tab -> actions -> feed -> tab), so it would otherwise be freed
+    by a garbage collection on the NEXT test's tool worker thread — which Qt
+    aborts the process for. Breaking the cycle and deleting it explicitly
+    frees it here, on the GUI thread."""
+    import shiboken6
+    tab.actions.feed = None
+    # Delete this widget only — flushing every deferred delete would also
+    # destroy widgets earlier test files left pending.
+    shiboken6.delete(tab)
+
+
 def test_the_tab_starts_a_chain_and_shows_its_steps_live(qapp, tmp_path):
     import agent_jobs
     from council_core import jobs as jobs_core
@@ -354,8 +368,7 @@ def test_the_tab_starts_a_chain_and_shows_its_steps_live(qapp, tmp_path):
     t.start()
     t.join(3)
     pump(qapp, lambda: "check: step 1: passed" in tab.log.toPlainText())
-    tab.deleteLater()
-    qapp.processEvents()
+    _dispose(tab)
 
 
 def test_remove_finished_removes_them(qapp, tmp_path):
@@ -369,8 +382,7 @@ def test_remove_finished_removes_them(qapp, tmp_path):
     tab.on_remove_finished()
     pump(qapp, lambda: "Removed" in tab.status.text())
     assert [j.job_id for j in store.all()] == ["b"]
-    tab.deleteLater()
-    qapp.processEvents()
+    _dispose(tab)
 
 
 # ============================================================
@@ -486,3 +498,64 @@ def test_steps_that_only_open_a_file_are_dropped_and_needs_renumbered():
 def test_a_plan_that_is_only_a_read_is_kept():
     only = tc.parse_plan('{"steps": [{"task": "Read the notes.md file"}]}')
     assert tc.prune_trivial_steps(only) == only
+
+
+# ============================================================
+# Found on the first real Balanced run (Phi-4 + Llama 3.2 3B)
+# ============================================================
+
+def test_a_retry_escalates_to_the_stronger_role():
+    """Llama 3.2 3B could not drive the tools; the retry goes to the Coder's
+    slot (Phi-4 under Balanced) instead of the same small model again."""
+    plan = json.dumps({"steps": [{"task": "Total the amount column"}]})
+    chat = Script(strategist=[plan], judge=[PASS], writer=["42"])
+    work = Workers(("I will look at the files now", []),
+                   ("The amount column totals 42", ["run_pandas_analysis"]))
+    result = tc.TaskChain(chat, work).run("sum")
+    assert [role for role, _t in work.calls] == ["intern", "coder"]
+    assert result.steps[0].verified
+
+
+@pytest.mark.parametrize("answer", [
+    '{"action": "run_pandas_analysis", "code": "df = pd.read_csv(\'s.csv\')',
+    '```json\n{"action": "list_files", "args": {}}\n```',
+])
+def test_a_tool_call_is_not_an_answer(answer):
+    step = tc.PlannedStep(1, "Total the amount column")
+    problems = tc.TaskChain(Script(), Workers()).hard_problems(
+        step, tc.WorkerResult(answer, "done", ["read_local_file"]))
+    assert any("tool call" in p for p in problems)
+
+
+def test_a_real_answer_mentioning_action_is_fine():
+    step = tc.PlannedStep(1, "Summarise the notes")
+    assert tc.TaskChain(Script(), Workers()).hard_problems(
+        step, tc.WorkerResult("The notes recommend one action: ship it.",
+                              "done", ["read_local_file"])) == []
+
+
+def test_the_agent_does_not_rerun_an_identical_tool_call(tmp_path):
+    from safe_agent import AgentPolicy, ConstrainedAgent
+    from tool_registry import build_default_registry
+    (tmp_path / "a.csv").write_text("x\n1\n")
+    policy = AgentPolicy(allowed_tools=("list_files", "read_local_file"),
+                         file_root=tmp_path, output_dir=tmp_path / "out",
+                         max_steps=5)
+    replies = iter(['{"action": "list_files", "args": {}}',
+                    '{"action": "list_files", "args": {}}',
+                    '{"action": "read_local_file", "path": "a.csv"}',
+                    '{"action": "final", "answer": "a.csv holds one row: 1"}'])
+    seen = []
+
+    class Runner:
+        def chat(self, messages, max_tokens=None):
+            seen.append(messages[-1]["content"])
+            return next(replies)
+
+    agent = ConstrainedAgent(Runner(), build_default_registry(policy), policy)
+    run = agent.run("what is in a.csv?")
+    assert run.stopped_reason == "done"
+    assert run.final_answer == "a.csv holds one row: 1"
+    assert run.tools_used == ["list_files", "read_local_file"]
+    assert seen[2].startswith("[repeat] You already called list_files")
+    assert len(run.trace.calls) == 2              # the repeat never ran
