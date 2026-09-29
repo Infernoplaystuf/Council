@@ -303,6 +303,27 @@ def test_a_download_that_lands_but_cannot_switch_says_where_the_file_is(
     assert "Engine settings" in result.message
 
 
+def test_a_switch_that_could_not_be_saved_says_so(tmp_path, monkeypatch):
+    """The switch is live for this session either way; only the file for the
+    NEXT launch can be refused (an unreadable backend_settings.json is left
+    alone). Measured: with a UTF-16 settings file the result still said
+    "Switched to Phi-4", and the next launch silently started on another
+    model."""
+    import types
+    target = tmp_path / "model.gguf"
+    target.write_text("x")
+    monkeypatch.setitem(sys.modules, "model_downloader",
+                        faithful_downloader(target))
+    monkeypatch.setitem(sys.modules, "onboarding", types.SimpleNamespace(
+        save_gguf_path=lambda *a, **k: "settings.json could not be read"))
+    monkeypatch.setitem(sys.modules, "council_engine", types.SimpleNamespace(
+        refresh_backend_config=lambda: None))
+    result = mj.download_and_switch(mj.to_row(REAL_ENTRY), tmp_path)
+    assert result.ok
+    assert "NOT saved for the next launch" in result.message
+    assert "settings.json could not be read" in result.message
+
+
 def test_progress_is_a_pure_string_builder():
     """It is called from inside the downloader's callback, on the worker.
     Anything that touched a widget there would be the defect this whole layer

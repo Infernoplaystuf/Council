@@ -235,9 +235,14 @@ def default_model_call(prompt: str) -> str:
 
 
 def _n_ctx() -> Optional[int]:
+    """The window default_model_call's prompt will be clamped to: the main
+    model's REAL n_ctx. get_n_ctx() is the configured value, 4096 with
+    COUNCIL_GGUF_N_CTX unset, so on a 16k Phi-4 the filter shortlist was cut
+    to a 9,408-char budget where 48,729 fit (nx_generate's 3.2 chars/token
+    over n_ctx - 1156)."""
     try:
         import council_engine
-        return int(council_engine.get_n_ctx())
+        return int(council_engine.effective_n_ctx("main"))
     except Exception:                                     # noqa: BLE001
         return None
 

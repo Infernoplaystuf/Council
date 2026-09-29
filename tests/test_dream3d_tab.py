@@ -103,11 +103,19 @@ class FakeBridge:
 
 
 @pytest.fixture
-def vault(tmp_path):
+def vault(tmp_path, monkeypatch):
     v = tmp_path / "vault"
     v.mkdir()
+    # write_script sizes its shortlist with council_engine.effective_n_ctx,
+    # which can read the model-slot config — from paths.vault_dir(). Unset,
+    # that is ~/.council/vault: the user's real model_slots.json, cached by
+    # model_slots.current() for every test after this one.
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(v))
     yield v
     nx_ops.invalidate_catalog(v)
+    from council_core import model_slots
+    model_slots.invalidate()             # nothing read from this tmp vault
+    #                                      outlives the test
 
 
 def test_the_catalog_is_cached_then_invalidated(vault):

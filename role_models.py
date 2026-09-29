@@ -86,24 +86,45 @@ class RoleModelRegistry:
         root = Path(vault_dir) if vault_dir is not None else _vault_root()
         self.path = root / _BACKEND_SETTINGS
 
-    def _read(self) -> Dict[str, Any]:
+    def _read(self) -> Optional[Dict[str, Any]]:
+        """The settings dict; {} when there is no file (or it is blank);
+        None when it is there but cannot be read as a JSON object.
+
+        Same rules as onboarding._read_backend_settings, which reads the same
+        file. MEASURED 2026-09-29: read as plain utf-8, a BOM file (Windows
+        PowerShell 5.1's `Set-Content -Encoding utf8`) gave {} — the Tk
+        dispatcher then ignored every role assignment — and .set() rewrote it
+        as {"role_models": {...}}, the saved main model and clip path gone."""
         try:
-            if self.path.exists():
-                d = json.loads(self.path.read_text(encoding="utf-8"))
-                return d if isinstance(d, dict) else {}
+            if not self.path.exists():
+                return {}
+            text = self.path.read_text(encoding="utf-8-sig")
+            if not text.strip():
+                return {}
+            d = json.loads(text)
         except Exception:
-            pass
-        return {}
+            return None
+        return d if isinstance(d, dict) else None
+
+    def _read_for_write(self) -> Dict[str, Any]:
+        data = self._read()
+        if data is None:
+            # Refused, loudly: nobody can bring back a file this replaced,
+            # and a user can still fix or delete one it left alone.
+            raise ValueError(
+                f"{self.path} could not be read (not a JSON object in UTF-8); "
+                "left as it is rather than replaced. Fix or delete it first.")
+        return data
 
     def all(self) -> Dict[str, str]:
-        m = self._read().get(_ROLE_KEY)
+        m = (self._read() or {}).get(_ROLE_KEY)
         return dict(m) if isinstance(m, dict) else {}
 
     def get(self, role: str) -> Optional[str]:
         return self.all().get(str(role))
 
     def set(self, role: str, gguf_path: str) -> None:
-        data = self._read()
+        data = self._read_for_write()
         roles = data.get(_ROLE_KEY)
         if not isinstance(roles, dict):
             roles = {}
@@ -112,7 +133,7 @@ class RoleModelRegistry:
         self._write(data)
 
     def remove(self, role: str) -> bool:
-        data = self._read()
+        data = self._read_for_write()
         roles = data.get(_ROLE_KEY)
         if isinstance(roles, dict) and str(role) in roles:
             del roles[str(role)]

@@ -365,7 +365,7 @@ def download_and_switch(row: ModelRow, vault_dir: Any, *,
 
     try:
         import onboarding
-        onboarding.save_gguf_path(vault_dir, str(path))
+        not_saved = onboarding.save_gguf_path(vault_dir, str(path))
         import council_engine
         council_engine.refresh_backend_config()
     except Exception as exc:                              # noqa: BLE001
@@ -375,10 +375,16 @@ def download_and_switch(row: ModelRow, vault_dir: Any, *,
             "Set the model path in Engine settings.",
             path=Path(path), error=exc)
 
-    return SwitchResult(
-        True,
-        f"Switched to {row.cells[0]}. It takes effect on the next question.",
-        path=Path(path))
+    message = (f"Switched to {row.cells[0]}. It takes effect on the next "
+               "question.")
+    if not_saved:
+        # The switch is live for this session either way (save_gguf_path sets
+        # the environment); only the file for the NEXT launch was refused.
+        # Saying "Switched" alone was measured with an unreadable settings
+        # file: the next launch then silently started on another model.
+        message = (f"Switched to {row.cells[0]} for this session, but NOT "
+                   f"saved for the next launch: {not_saved}")
+    return SwitchResult(True, message, path=Path(path))
 
 
 def progress_line(done_bytes: int, total_bytes: Optional[int],

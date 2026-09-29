@@ -50,6 +50,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -205,6 +206,13 @@ _SLOT_LOCKS: Dict[str, Any] = {}              # path key -> threading.Lock
 _SLOT_STATUS: Dict[str, Dict[str, Any]] = {}  # slot name -> what loaded where
 _SLOT_PLAN: Optional[Dict[str, Any]] = None   # slot name -> Placement
 _SLOT_LOAD_LOCK = threading.RLock()
+#: Llama -> the lock that serialises calls on it, fixed when it LOADS. The
+#: lock goes with the instance, not with whatever the slot config says the
+#: next time someone looks: model_slots.save() changes that config without
+#: this module's locks, and a dropped instance can still be answering. Weak,
+#: so a dropped instance's entry lives exactly as long as the instance.
+_INSTANCE_LOCKS: "weakref.WeakKeyDictionary[Any, Any]" = (
+    weakref.WeakKeyDictionary())
 
 # ── GPU-crash sentinel ───────────────────────────────────────────────
 # A native CUDA abort inside llama-cpp (the "CUDA error → hex addresses →
@@ -290,6 +298,17 @@ def _gpu_confirm_success() -> None:
 _LAST_N_CTX: Optional[int] = None
 _LAST_N_CTX_SOURCE: str = ""
 _LAST_N_CTX_LADDER: list = []
+#: The file (_path_key) _LAST_N_CTX was chosen for. effective_n_ctx() reuses
+#: _LAST_N_CTX only for that file: refresh_backend_config does not reset it,
+#: so after the main model changes it describes a model no longer in use.
+_LAST_N_CTX_KEY: str = ""
+#: The rest of what decided _LAST_N_CTX (see _placement_inputs). The same
+#: file under other settings loads elsewhere, with another window.
+_LAST_N_CTX_INPUTS: tuple = ()
+#: Rung 3's cap: the window the ladder takes when it cannot measure the room
+#: it has (no VRAM probe, or a CPU load). The ladder spells it out as
+#: `blind_cap = 8192`, which tests/smoke_test.py checks for in the source.
+_BLIND_N_CTX = 8192
 
 
 class _TimingScope:
@@ -836,6 +855,65 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
             "  pip install llama-cpp-python"
         ) from exc
 
+    # ── Where it runs: decided BEFORE the context is sized ────────────────
+    #
+    # n_gpu_layers default = 99 (offload every layer to GPU). Why 99 by
+    # default instead of the historical 0:
+    #
+    # llama-cpp-python's CUDA wheel quietly falls back to CPU when GPU
+    # offload isn't available — passing n_gpu_layers=99 to a CPU-only
+    # build (Section A in installs.txt) is a NO-OP, not an error. So
+    # "99 by default, fall back if needed" is strictly safer than the
+    # old "0 by default, require env var to use GPU."
+    #
+    # The previous default of 0 produced the bug the user is hitting
+    # right now: they installed the CUDA wheel via Section C / D, but
+    # without setting COUNCIL_GGUF_GPU_LAYERS the model loaded with
+    # everything on CPU and only a few cache/scratchpad operations
+    # touched the GPU — which looked like "GPU occasionally used,
+    # CPU still primary."
+    #
+    # Per-layer offload size on the common models (helpful for users
+    # tuning lower values for smaller GPUs):
+    #   Phi-4 14B Q4_K_M:    ~225 MB per layer × 40 layers = ~9 GB
+    #   Llama 3.1 8B Q5_K_M: ~190 MB per layer × 32 layers = ~6 GB
+    #   Granite 3.1 8B:      ~190 MB per layer × 32 layers = ~6 GB
+    # Plus KV cache (scales with n_ctx) and a small constant overhead.
+    #
+    # -1 is llama-cpp-python's "offload EVERY layer" (Llama() maps it to
+    # 0x7FFFFFFF), so it is a GPU load: only 0 means the CPU. Each check here
+    # used to read `> 0` / `<= 0` and so treated -1 as the CPU — rung 3's
+    # blind 8192 on a card with room for 32768, no crash sentinel, and a
+    # planner cap of min(-1, 0) = -1 that left a model planned off the card
+    # with every layer on it (tests/test_model_slots.py, "-1 GPU layers").
+    n_gpu_layers = int(os.environ.get("COUNCIL_GGUF_GPU_LAYERS", "99"))
+    if n_gpu_layers_cap is not None:
+        # The slot planner put this model on the CPU (it did not fit beside
+        # the others). The env var can only lower this, never raise it —
+        # and -1, every layer, is more than any cap.
+        cap = int(n_gpu_layers_cap)
+        if n_gpu_layers < 0 or n_gpu_layers > cap:
+            n_gpu_layers = cap
+    # A crash sentinel left by a previous process forces the CPU (see the
+    # GPU-crash sentinel block below, which reports it and arms the next one).
+    gpu_crash_fallback = n_gpu_layers != 0 and gpu_crashed_last_run()
+    if gpu_crash_fallback:
+        n_gpu_layers = 0
+    # WHY this comes first: rung 2 of the ladder sizes the KV cache to the
+    # card's FREE VRAM, which says nothing about a model that will not use
+    # the card — its KV cache lives in system RAM and every prompt token is
+    # prefilled on the CPU. The prompt clamp honours the instance's own
+    # window, so a CPU model was then fed whatever rung 2 picked. Measured
+    # (tests/test_model_slots.py: fake Llama, a header at 128 KiB of KV per
+    # token, 12-16 GB free): a slot the planner put on the CPU took 32768 —
+    # 4 GiB of RAM — and so did a lone model on the CPU through
+    # COUNCIL_GGUF_GPU_LAYERS=0 or a crash sentinel. From the real headers
+    # (read_gguf_metadata): the Balanced fast slot, Llama 3.2 3B, keeps
+    # 112 KiB a token — 3.76 GB at 32768, 0.94 GB at 8192; Phi-4 keeps
+    # 200 KiB — 3.36 GB at 16384, 1.68 GB at 8192. A CPU load takes rung 3's
+    # blind cap instead. COUNCIL_GGUF_N_CTX, when set, still wins (rung 1).
+    on_cpu = n_gpu_layers == 0
+
     # ── Auto-detect n_ctx (the ladder) ─────────────────────────────────────
     #
     # Four rungs of precedence, highest first:
@@ -845,10 +923,11 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
     #      largest power-of-two n_ctx that fits in available VRAM after
     #      reserving model weights and a safety margin
     #      (COUNCIL_GGUF_KV_VRAM_MARGIN_MB, default 1024 = 1 GB).
+    #      Skipped for a CPU load (n_gpu_layers 0 — see above).
     #   3. GGUF metadata's advertised training context_length, capped at
     #      COUNCIL_GGUF_N_CTX_MAX (default 32768). This catches the
-    #      CPU-only case (no CUDA GPU, no VRAM probe) and the
-    #      missing-architecture-metadata case.
+    #      CPU-only case (no CUDA GPU, no VRAM probe, or a CPU load) and
+    #      the missing-architecture-metadata case.
     #   4. Conservative fallback of 4096 — last-resort when metadata
     #      can't be read at all (very old GGUF / parser failure).
     #
@@ -898,8 +977,11 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
         except Exception as exc:
             _ladder_log("metadata_parse", error=repr(exc), chosen=False)
 
-    # Rung 2: VRAM-aware sizing.
-    if n_ctx is None and metadata:
+    # Rung 2: VRAM-aware sizing. Not for a CPU load (see "Where it runs").
+    if n_ctx is None and metadata and on_cpu:
+        _ladder_log("vram_aware", chosen=False, n_gpu_layers=n_gpu_layers,
+                    reason="CPU load — free VRAM does not bound its context")
+    elif n_ctx is None and metadata:
         try:
             margin_mb = int(os.environ.get(
                 "COUNCIL_GGUF_KV_VRAM_MARGIN_MB", "1024"))
@@ -955,10 +1037,11 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
             _ladder_log("metadata_context_length", error=repr(exc),
                         chosen=False)
         if model_max and model_max > 0:
-            blind_cap = 8192
+            blind_cap = 8192                # _BLIND_N_CTX; smoke_test pins it
             n_ctx = min(model_max, n_ctx_cap, blind_cap)
+            why_blind = "CPU load" if on_cpu else "VRAM unknown"
             n_ctx_source = (f"GGUF context_length "
-                            f"(advertises {model_max:,}; VRAM unknown so "
+                            f"(advertises {model_max:,}; {why_blind} so "
                             f"capped at {n_ctx:,})")
             _ladder_log("metadata_context_length",
                         model_max=model_max, capped_to=n_ctx,
@@ -981,11 +1064,17 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
     # Persist on the engine module so the UI can surface the chosen
     # n_ctx + source without re-running detection. Main model only — the
     # title bar describes the model the user picked.
-    global _LAST_N_CTX, _LAST_N_CTX_SOURCE, _LAST_N_CTX_LADDER
+    global _LAST_N_CTX, _LAST_N_CTX_SOURCE, _LAST_N_CTX_LADDER, _LAST_N_CTX_KEY
+    global _LAST_N_CTX_INPUTS
     if is_main:
         _LAST_N_CTX = n_ctx
         _LAST_N_CTX_SOURCE = n_ctx_source
         _LAST_N_CTX_LADDER = ladder
+        _LAST_N_CTX_KEY = _path_key(p)
+        try:
+            _LAST_N_CTX_INPUTS = _placement_inputs(_slot_config())
+        except Exception:                                 # noqa: BLE001
+            _LAST_N_CTX_INPUTS = ()      # matches nothing: never reused
 
     _LOG.info("[GGUF] n_ctx chosen = %s (source: %s)", f"{n_ctx:,}", n_ctx_source)
     print(f"[GGUF] n_ctx = {n_ctx:,}  (source: {n_ctx_source})", flush=True)
@@ -1014,34 +1103,7 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
     n_threads = int(os.environ.get("COUNCIL_GGUF_N_THREADS",
                                     str(_default_n_threads())))
 
-    # ── n_gpu_layers default = 99 (offload every layer to GPU) ─────
-    #
-    # Why 99 by default instead of the historical 0:
-    #
-    # llama-cpp-python's CUDA wheel quietly falls back to CPU when GPU
-    # offload isn't available — passing n_gpu_layers=99 to a CPU-only
-    # build (Section A in installs.txt) is a NO-OP, not an error. So
-    # "99 by default, fall back if needed" is strictly safer than the
-    # old "0 by default, require env var to use GPU."
-    #
-    # The previous default of 0 produced the bug the user is hitting
-    # right now: they installed the CUDA wheel via Section C / D, but
-    # without setting COUNCIL_GGUF_GPU_LAYERS the model loaded with
-    # everything on CPU and only a few cache/scratchpad operations
-    # touched the GPU — which looked like "GPU occasionally used,
-    # CPU still primary."
-    #
-    # Per-layer offload size on the common models (helpful for users
-    # tuning lower values for smaller GPUs):
-    #   Phi-4 14B Q4_K_M:    ~225 MB per layer × 40 layers = ~9 GB
-    #   Llama 3.1 8B Q5_K_M: ~190 MB per layer × 32 layers = ~6 GB
-    #   Granite 3.1 8B:      ~190 MB per layer × 32 layers = ~6 GB
-    # Plus KV cache (scales with n_ctx) and a small constant overhead.
-    n_gpu_layers = int(os.environ.get("COUNCIL_GGUF_GPU_LAYERS", "99"))
-    if n_gpu_layers_cap is not None:
-        # The slot planner put this model on the CPU (it did not fit beside
-        # the others). The env var can only lower this, never raise it.
-        n_gpu_layers = min(n_gpu_layers, int(n_gpu_layers_cap))
+    # n_gpu_layers was decided before the ladder ("Where it runs", above).
 
     # Best-effort GPU sanity check — surface the actual GPU + available
     # VRAM in the startup log when one is detected, so users see why
@@ -1172,8 +1234,12 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
             settings = vault_root / "backend_settings.json"
             if settings.is_file():
                 import json as _json
+                # utf-8-sig: Notepad and PowerShell 5's `Set-Content
+                # -Encoding utf8` save a BOM, and json.loads refuses U+FEFF —
+                # the adapter was dropped with a warning and the model loaded
+                # text-only. onboarding reads this file the same way.
                 _settings_data = _json.loads(
-                    settings.read_text(encoding="utf-8"))
+                    settings.read_text(encoding="utf-8-sig"))
                 clip_path_raw = str(
                     _settings_data.get("clip_path", "") or "").strip()
                 if clip_path_raw:
@@ -1212,16 +1278,16 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
     # sentinel is still on disk (it's only cleared on a confirmed-good run /
     # clean shutdown). Run on CPU this time so the app starts instead of
     # dumping again; the user re-enables GPU in ⚙ Engine once fixed.
-    if n_gpu_layers > 0:
-        if gpu_crashed_last_run():
-            print("[GGUF] Previous GPU run did not complete (likely a CUDA "
-                  "core dump). Falling back to CPU (n_gpu_layers=0) so the app "
-                  "starts. Re-enable GPU in the ⚙ Engine settings once the "
-                  "CUDA build/driver is fixed.", flush=True)
-            _LOG.warning("[GGUF] GPU sentinel present — forcing CPU load.")
-            n_gpu_layers = 0
-        else:
-            _gpu_mark_attempt(n_gpu_layers)
+    # (n_gpu_layers is already 0 — set before the ladder, so the context was
+    # sized for the CPU too.)
+    if gpu_crash_fallback:
+        print("[GGUF] Previous GPU run did not complete (likely a CUDA "
+              "core dump). Falling back to CPU (n_gpu_layers=0) so the app "
+              "starts. Re-enable GPU in the ⚙ Engine settings once the "
+              "CUDA build/driver is fixed.", flush=True)
+        _LOG.warning("[GGUF] GPU sentinel present — forcing CPU load.")
+    elif n_gpu_layers != 0:                     # -1 is every layer: a GPU load
+        _gpu_mark_attempt(n_gpu_layers)
 
     llama_kwargs = dict(
         model_path=str(p),
@@ -1391,7 +1457,7 @@ def _slot_plan(cfg: Any) -> Dict[str, Any]:
         gpu_layers = 99
     free = None
     why_cpu = ""
-    if gpu_layers <= 0:
+    if gpu_layers == 0:                 # -1 is every layer, not the CPU
         why_cpu = "GPU layers set to 0 — running on the CPU"
     elif gpu_crashed_last_run():
         why_cpu = ("the last GPU run did not finish (possible CUDA crash) — "
@@ -1418,7 +1484,7 @@ def _get_slot_model(slot: str = "main"):
     distinct file loads once — on the GPU if the plan found room for it, on
     the CPU if not.
     """
-    global _GGUF_MODEL_INSTANCE
+    global _GGUF_MODEL_INSTANCE, _SLOT_PLAN
     with _SLOT_LOAD_LOCK:
         cfg = _slot_config()
         if slot not in cfg.slots:
@@ -1427,6 +1493,24 @@ def _get_slot_model(slot: str = "main"):
         key = _path_key(path)
         is_main = key == _path_key(_slot_file(cfg, "main"))
         llm = _SLOT_INSTANCES.get(key)
+        if (llm is not None and is_main
+                and _registered_lock(llm) not in (None, _INFERENCE_LOCK)):
+            # This file loaded as ANOTHER slot and has since become main
+            # without a refresh: COUNCIL_GGUF_PATH moved to it (what
+            # LlamaCppRunner with a gguf_path does, and the Models tab
+            # between its save and its refresh). Its lock is that slot's, but
+            # main's instance must come with _INFERENCE_LOCK — LlamaCppRunner
+            # and estimate_tokens take that lock by name and use
+            # _GGUF_MODEL_INSTANCE. Reusing it put a runner's generation
+            # beside a fast-slot call on one KV cache (measured: 1 overlap
+            # and 1 tokenize mid-generation, tests/test_model_slots.py). And
+            # it loaded as a slot: sized to its share of the card, with no
+            # vision adapter. So main loads the file afresh; the old instance
+            # is dropped the way a refresh drops one — a call still on it
+            # keeps it, and its own lock, until it finishes. The plan was
+            # made for the old main, so it goes too.
+            llm = None
+            _SLOT_PLAN = None
         if llm is None:
             placement = None
             if len(set(_slot_keys(cfg).values())) > 1:
@@ -1434,7 +1518,7 @@ def _get_slot_model(slot: str = "main"):
             if placement is None:
                 llm = _load_gguf(path, is_main=is_main)
                 on_gpu = int(os.environ.get(
-                    "COUNCIL_GGUF_GPU_LAYERS", "99") or 0) > 0
+                    "COUNCIL_GGUF_GPU_LAYERS", "99") or 0) != 0   # -1: all
                 reason = ""
             else:
                 print(f"[slots] {slot}: {path.name} -> "
@@ -1448,6 +1532,11 @@ def _get_slot_model(slot: str = "main"):
                 on_gpu, reason = placement.on_gpu, placement.reason
             _SLOT_INSTANCES[key] = llm
             try:
+                _INSTANCE_LOCKS[llm] = _file_lock(key, is_main)
+            except TypeError:
+                pass          # not weak-referenceable: _slot_llm_and_lock
+                #               falls back to the lock by file
+            try:
                 n_ctx = int(llm.n_ctx())
             except Exception:
                 n_ctx = None
@@ -1460,21 +1549,53 @@ def _get_slot_model(slot: str = "main"):
         return llm
 
 
+def _file_lock(key: str, is_main: bool):
+    """The lock for the model file ``key``. Caller holds _SLOT_LOAD_LOCK."""
+    if is_main:
+        return _INFERENCE_LOCK
+    return _SLOT_LOCKS.setdefault(key, threading.Lock())
+
+
+def _registered_lock(llm: Any):
+    """The lock ``llm`` got when it loaded, or None (not loaded by
+    _get_slot_model, or not weak-referenceable)."""
+    try:
+        return _INSTANCE_LOCKS.get(llm)
+    except TypeError:
+        return None
+
+
 def _slot_llm_and_lock(slot: str):
     """(Llama, the lock that serialises calls on it) for ``slot``.
 
     One lock per FILE: roles on different models run at the same time, roles
     on the same model take turns. The main model's lock IS _INFERENCE_LOCK,
     because other modules import that name to serialise against it.
+
+    The lock is the one the instance got when it LOADED (_INSTANCE_LOCKS),
+    read in the same _SLOT_LOAD_LOCK section as the instance. It used to be
+    looked up again from the slot config, in a second section: a refresh
+    landing between the two (it clears the instances and the locks, and
+    model_slots.save() swaps the config without taking this lock at all)
+    paired the OLD instance with a NEW lock — or with another file's — so
+    this call generated on the old Llama while a call holding its real lock
+    was still generating on it: two generations on one KV cache. Merging the
+    two sections alone does not close it — measured with the race tests in
+    tests/test_model_slots.py, a config lookup in ONE section still ran both
+    races into an overlap; the lock fixed at load ran neither.
+    (_get_slot_model re-enters the RLock; a load in it is unchanged.)
     """
-    llm = _get_slot_model(slot)
     with _SLOT_LOAD_LOCK:
+        llm = _get_slot_model(slot)
+        lock = _registered_lock(llm)
+        if lock is not None:
+            return llm, lock
+        # Not loaded by _get_slot_model (a test or bench stands in for it) or
+        # not weak-referenceable: the lock by file, from the config.
         cfg = _slot_config()
         name = slot if slot in cfg.slots else "main"
         key = _path_key(_slot_file(cfg, name))
-        if key == _path_key(_slot_file(cfg, "main")):
-            return llm, _INFERENCE_LOCK
-        return llm, _SLOT_LOCKS.setdefault(key, threading.Lock())
+        return llm, _file_lock(key, key == _path_key(_slot_file(cfg, "main")))
 
 
 def slot_status() -> Dict[str, Dict[str, Any]]:
@@ -1490,6 +1611,9 @@ def _release_slots() -> None:
     The instances are dropped, NOT closed: a role may be mid-answer on another
     thread, and freeing a Llama under a running generation is a native crash.
     That call holds its own reference, so the memory goes when it finishes.
+    A dropped instance keeps its lock in _INSTANCE_LOCKS for as long as it
+    exists, so anything still reaching it waits on the lock its running
+    call holds, not on the fresh one the next load of the file gets.
     """
     global _SLOT_PLAN
     with _SLOT_LOAD_LOCK:
@@ -1519,13 +1643,159 @@ def _release_slots() -> None:
 # safely raise `COUNCIL_GGUF_N_CTX`.
 # ─────────────────────────────────────────────────────────────────────────────
 
+#: The window assumed when nothing better is known: no COUNCIL_GGUF_N_CTX and
+#: no loaded instance to ask. Also rung 4 of the loader's n_ctx ladder.
+_DEFAULT_N_CTX = 4096
+
+
 def get_n_ctx() -> int:
     """Return the configured context window (tokens). Reads
-    `COUNCIL_GGUF_N_CTX` so a launch-time override is reflected immediately."""
+    `COUNCIL_GGUF_N_CTX` so a launch-time override is reflected immediately.
+
+    This is the CONFIGURED value — 4096 when the env var is unset, which the
+    launchers leave it. It is not what a loaded model has: the VRAM-aware
+    ladder loads Phi-4 at 16384 on a 16 GB card. The prompt clamp therefore
+    does not use it as the window unless the env var is really set; it asks
+    the instance serving the call (see _clamp_messages_to_ctx). Code that
+    SIZES a prompt should ask effective_n_ctx() instead."""
     try:
-        return int(os.environ.get("COUNCIL_GGUF_N_CTX", "4096"))
+        return int(os.environ.get("COUNCIL_GGUF_N_CTX", str(_DEFAULT_N_CTX)))
     except Exception:
-        return 4096
+        return _DEFAULT_N_CTX
+
+
+def _env_n_ctx() -> Optional[int]:
+    """COUNCIL_GGUF_N_CTX as a window the clamp can use, or None.
+
+    None for blank or unparseable values — the loader's ladder skips those
+    (rung 1 in _load_gguf) and sizes the model itself — and for 0 or less,
+    which is not a window (0 asks llama.cpp for the model's own training
+    context). In each case the loaded instance's n_ctx() is the truth.
+    """
+    raw = os.environ.get("COUNCIL_GGUF_N_CTX", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _window_for(model_n_ctx: Optional[int]) -> int:
+    """The window a prompt must fit on an instance whose n_ctx() is
+    ``model_n_ctx`` (None or 0 when unknown). One rule, used by the clamp AND
+    by effective_n_ctx, so a prompt builder budgets for exactly the window
+    the clamp will enforce:
+      • COUNCIL_GGUF_N_CTX set → that value, bounded by ``model_n_ctx`` (a
+        slot sharing the card may have loaded smaller). The env var sized
+        the load, so this is the behaviour from before the clamp fix.
+      • not set → ``model_n_ctx``, the instance's own window.
+      • neither known → 4096.
+    """
+    try:
+        model_ctx = int(model_n_ctx) if model_n_ctx else 0
+    except Exception:
+        model_ctx = 0
+    env_ctx = _env_n_ctx()
+    if env_ctx is not None:
+        return model_ctx if 0 < model_ctx < env_ctx else env_ctx
+    return model_ctx if model_ctx > 0 else _DEFAULT_N_CTX
+
+
+#: How long effective_n_ctx() waits for _SLOT_LOAD_LOCK. _get_slot_model holds
+#: that lock for a whole model load, and a caller may be a GUI thread sizing a
+#: warning, which must not freeze behind a load; every other holder is a few
+#: dictionary operations. On a timeout the last main load's record
+#: (_LAST_N_CTX, written before Llama() is called) still answers, capped as
+#: for a released model (step 3 of effective_n_ctx).
+_PEEK_LOCK_TIMEOUT_S = 0.1
+
+
+def _placement_inputs(cfg: Any) -> tuple:
+    """What, besides the file, decides where the main model loads and so
+    the window the ladder gives it — everything but the card's free VRAM,
+    which only a probe can read: the GPU-layers setting (0 is a CPU load),
+    the ladder's cap and VRAM margin, a crash sentinel (forces the CPU), and
+    the files of the other slots (main's share of the card shrinks when one
+    is added — tests/test_model_slots.py: 32768 alone on 16 GB free, 16384
+    beside a 2.4 GB fast slot)."""
+    env = tuple(os.environ.get(name, "").strip() for name in (
+        "COUNCIL_GGUF_GPU_LAYERS", "COUNCIL_GGUF_N_CTX_MAX",
+        "COUNCIL_GGUF_KV_VRAM_MARGIN_MB"))
+    files = tuple(sorted(set(_slot_keys(cfg).values())))
+    return env + (gpu_crashed_last_run(), files)
+
+
+def effective_n_ctx(slot: str = "main") -> int:
+    """The window a prompt for ``slot`` will be clamped to, for code that
+    SIZES a prompt before the call. Never loads a model.
+
+      1. COUNCIL_GGUF_N_CTX when set — bounded by the loaded instance, as the
+         clamp bounds it (_window_for);
+      2. else n_ctx() of the instance ALREADY loaded for ``slot``;
+      3. else, when ``slot`` runs the file the last main load was for and
+         _placement_inputs still match that load's, the n_ctx it chose —
+         capped at rung 3's blind 8192. The instance is gone (a refresh
+         dropped it, or it is loading now), and the reload re-measures free
+         VRAM: measured without the cap, a released 32768 main reloaded at
+         8192 once a game took the card (9 GB free beside 8.9 GB of
+         weights). With other inputs (GPU layers 0, a fast slot added: the
+         reload got 8192 and 16384) the old value is not used at all;
+      4. else 4096.
+
+    Neither 3 nor 4 is a guarantee: a reload onto a card with little room
+    left takes rung 2's 1024-4096, and only a VRAM probe could say so — which
+    this, called from GUI threads, never runs. The prompt clamp still holds a
+    call to its real window; a builder that over-budgets gets trimmed.
+
+    With no model loaded and none loaded before, steps 2 and 3 have nothing
+    to read, so the slot config is not read either (it is read from
+    paths.vault_dir(), and model_slots.current() keeps what it read).
+
+    get_n_ctx() stays the configured value, because it also sizes the load.
+    It is 4096 with the env var unset, and the builders that sized prompts
+    with it budgeted for 4096 while the clamp let a 16k Phi-4 use its whole
+    window: nx_generate's filter shortlist got (4096 - 900 - 256) × 3.2 =
+    9,408 chars where (16384 - 1156) × 3.2 = 48,729 fit, and
+    context_budget_report called a 5,000-token prompt "over the window".
+    """
+    env_ctx = _env_n_ctx()
+    if not _SLOT_INSTANCES and _LAST_N_CTX is None:
+        return env_ctx if env_ctx is not None else _DEFAULT_N_CTX
+    try:
+        cfg = _slot_config()
+        name = slot if slot in cfg.slots else "main"
+        key: Optional[str] = _path_key(_slot_file(cfg, name))
+    except Exception:
+        cfg, key = None, None         # no model configured, so none loaded
+    loaded: Optional[int] = None
+    last, last_key, last_inputs = (_LAST_N_CTX, _LAST_N_CTX_KEY,
+                                   _LAST_N_CTX_INPUTS)
+    if key is not None and _SLOT_LOAD_LOCK.acquire(
+            timeout=_PEEK_LOCK_TIMEOUT_S):
+        try:
+            llm = _SLOT_INSTANCES.get(key)
+            # n_ctx() reads a value fixed when the context was created
+            # (llama_n_ctx); unlike tokenize it touches no KV state, so it
+            # needs no inference lock.
+            loaded = _model_n_ctx(llm) if llm is not None else None
+            last, last_key, last_inputs = (_LAST_N_CTX, _LAST_N_CTX_KEY,
+                                           _LAST_N_CTX_INPUTS)
+        finally:
+            _SLOT_LOAD_LOCK.release()
+    if loaded:
+        return _window_for(loaded)
+    if env_ctx is not None:
+        return env_ctx
+    if key is not None and key == last_key and last and last > 0:
+        try:
+            same_inputs = last_inputs == _placement_inputs(cfg)
+        except Exception:                                 # noqa: BLE001
+            same_inputs = False
+        if same_inputs:
+            return min(int(last), _BLIND_N_CTX)
+    return _DEFAULT_N_CTX
 
 
 def estimate_tokens(text: str) -> int:
@@ -1536,6 +1806,10 @@ def estimate_tokens(text: str) -> int:
 
     Never raises — returns 0 on empty input. Used purely for context-budget
     diagnostics, so over-estimating slightly is fine (and safer).
+
+    Always the MAIN model's tokenizer: a caller here has no call, so no slot.
+    The prompt clamp counts on the instance actually serving each call
+    instead (_instance_token_counter).
     """
     if not text:
         return 0
@@ -1608,8 +1882,12 @@ def context_budget_report(prompt_text: str) -> Dict[str, Any]:
 
     Used by the auto-warning in the GUI and by the `context info` chat
     intent. Fields are stable so the GUI can format them however it wants.
+
+    ``n_ctx`` is the main model's REAL window (effective_n_ctx), not the
+    configured 4096 of an unset COUNCIL_GGUF_N_CTX: on a 16k Phi-4 the
+    over_window / over_safe warnings fired at a quarter of what fits.
     """
-    n_ctx = get_n_ctx()
+    n_ctx = effective_n_ctx("main")
     used = estimate_tokens(prompt_text or "")
     # Reserve roughly 25% of the window for the model's reply. Anything that
     # eats into that reservation is what triggers truncation in practice.
@@ -1633,59 +1911,104 @@ def context_budget_report(prompt_text: str) -> Dict[str, Any]:
 def _clamp_messages_to_ctx(
     messages: List[Dict[str, str]], num_predict: int,
     model_n_ctx: Optional[int] = None,
+    *,
+    count_tokens: Optional[Callable[[str], int]] = None,
 ) -> Tuple[List[Dict[str, str]], int]:
-    """Guarantee ``prompt_tokens + reply_tokens <= n_ctx`` BEFORE handing the
-    prompt to llama-cpp. An over-long prompt is the classic "exceeds context
-    window" failure; on some llama-cpp builds that is a native abort (SIGABRT)
-    that Python cannot catch, which is exactly the kind of crash that takes the
-    whole app down mid-"build descriptions" on a small-ctx box.
+    """Fit ``messages`` + the reply into the serving model's window BEFORE
+    handing the prompt to llama-cpp. An over-long prompt is the classic
+    "exceeds context window" failure; on some llama-cpp builds that is a
+    native abort (SIGABRT) that Python cannot catch, which is exactly the kind
+    of crash that takes the whole app down mid-"build descriptions" on a
+    small-ctx box. (llama-cpp-python 0.3.31 raises ValueError for a prompt at
+    or over n_ctx, and silently cuts max_tokens when prompt + reply pass it.)
 
-    Strategy (never raises, always returns a usable pair):
-      • reserve a reply budget (capped so it can't eat the whole window),
-      • if the prompt still overflows, head+tail trim the LARGEST message
-        (with a visible marker) until it fits.
+    The WINDOW is the one the model serving this call really has
+    (_window_for): COUNCIL_GGUF_N_CTX when set, bounded by ``model_n_ctx``;
+    else ``model_n_ctx``, the serving instance's own n_ctx(); else 4096.
+    It used to be min(get_n_ctx(), model_n_ctx), and get_n_ctx() is 4096 when
+    the env var is unset — which the launchers leave it. So Phi-4, loaded at
+    16384 by the VRAM-aware ladder on an RTX 5080, was clamped to a 4096
+    window on every call: the writer's 2400-token reply cut to 2016, its
+    prompt budget to ~2016 tokens, and its own role memory trimmed in the
+    middle. Measured on the real call path (council_bench.py --setup
+    balanced --fake-llama --real-memory --only W1,C1 --modes deliberate:
+    the real personalities and role memory, _gguf_chat and this clamp, a
+    fake Llama reporting n_ctx 16384): at 9ab2270 6 of W1's 42 calls and 17
+    of C1's 54 were trimmed, and 4 and 2 of their 2400-token replies cut to
+    2016; with this fix, none.
+
+    ``count_tokens`` counts on the serving instance's tokenizer (see
+    _instance_token_counter); without it the estimate is estimate_tokens'.
+
+    What it does (never raises, always returns a usable pair), all counted
+    with that counter:
+      • caps the reply at half the window less the template margin,
+      • while content + reply + margin exceed the window, head+tail trims
+        the LARGEST message (with a visible marker) — never below 80 chars,
+      • if that is not enough, shrinks the reply (to no less than 16 tokens)
+        to what is left.
+    So content + reply + margin fit n_ctx whenever the trimmed content fits
+    beside a 16-token reply (windows under ~margin + 128 tokens aside, where
+    the 64-token prompt floor wins). It is NOT a guarantee: many messages,
+    each already under the 80-char floor, can sum past the window on their
+    own, and then the prompt goes out over it and llama-cpp refuses it.
+    Messages are not dropped to force a fit: the callers here send one
+    prompt as a system + user pair, history and context folded into the
+    text (LocalBackendSpec.generate, vault_agent), so dropping a message would
+    change what the model is asked rather than shorten a transcript.
     Returns ``(messages, safe_max_tokens)``.
     """
-    try:
-        n_ctx = int(get_n_ctx())
-    except Exception:
-        n_ctx = 4096
-    if n_ctx <= 0:
-        n_ctx = 4096
-    # A slot sharing the card may have loaded with a SMALLER window than the
-    # configured one (its share of VRAM). Clamp to what it actually has.
-    if model_n_ctx and 0 < int(model_n_ctx) < n_ctx:
-        n_ctx = int(model_n_ctx)
+    n_ctx = _window_for(model_n_ctx)
+
+    count = count_tokens or estimate_tokens
 
     def _est(s: str) -> int:
         try:
-            return max(1, int(estimate_tokens(s or "")))
+            return max(1, int(count(s or "")))
         except Exception:
             return max(1, (len(s or "") + 3) // 4)
 
     # Reply budget: honour the caller but never let it (or the margin) exceed
-    # the window. 64 tokens of slack covers chat-template / role tokens.
-    margin = 64
+    # the window. The margin is what the chat template adds around the
+    # content, which the counts above never see: a few tokens per message
+    # (Phi-4's <|im_start|>role<|im_sep|> … <|im_end|>, Llama 3's header and
+    # <|eot_id|>) plus a fixed part (BOS, the assistant header, a date line
+    # some templates insert). It was a flat 64 whatever the message count;
+    # measured with a fake Llama charging 8 template tokens per message, a
+    # 69-message prompt at the content budget then passed n_ctx by 299
+    # tokens and llama-cpp cut the 2400-token reply to 2101. 64 + 8 per
+    # message keeps a 2-message call within 16 tokens of the old budget.
+    margin = 64 + 8 * len(messages)
     reply = max(16, min(int(num_predict), max(16, (n_ctx - margin) // 2)))
     prompt_budget = max(64, n_ctx - reply - margin)
 
     msgs = [dict(m) for m in messages]
-    total = sum(_est(m.get("content", "")) for m in msgs)
-    if total <= prompt_budget:
-        return msgs, reply
 
     # Overflow — head+tail trim the largest message(s) to recover the deficit.
     # Trimming the biggest block (usually the injected context / file sample)
     # preserves short system + instruction messages.
     #
+    # Chars per token is MEASURED on the message being trimmed, not assumed to
+    # be 4. With a real tokenizer, dense text (code, CSV, numbers) runs well
+    # under 4 chars/token, so a "keep avail*4 chars" trim left the prompt over
+    # budget, and the next pass computed the same target and gave up. At a
+    # 4096 window the half-window reply reserve hid that; at 16384 with a
+    # 2400-token reply it does not — the prompt itself passes n_ctx. Measured
+    # with a 3-bytes/token counter on 150,780 chars of code (the input of
+    # test_dense_text_is_trimmed_until_it_really_fits): the old rule left
+    # 18,539 tokens of content for a 16,384 window (llama-cpp refuses it);
+    # this one keeps the content at its 13,904-token budget, so content +
+    # 2400 reply + 80 margin (two messages) is exactly 16,384.
+    # Under the chars/4 estimate the measured ratio is ~4, the old rule.
+    #
     # Termination: the marker length is SUBTRACTED from the char target, so a
-    # trimmed message is strictly within its token share (2*half + len(marker)
-    # <= target_chars). Without that, 2*half + len(marker) exceeds the target
-    # and the content can never shrink past the break threshold — an infinite
-    # loop. A hard pass cap (one trim per message + slack) is the backstop.
+    # trimmed message is within its token share (2*half + len(marker) <=
+    # avail * chars-per-token). Without that, the content can never shrink
+    # past the break threshold — an infinite loop. A hard pass cap (one trim
+    # per message + slack for the measured ratio to settle) is the backstop.
     marker = "\n…[trimmed to fit the model's context window]…\n"
     mlen = len(marker)
-    for _ in range(len(msgs) + 2):
+    for _ in range(len(msgs) + 4):
         # One estimate per message per pass, reused for total, argmax, and the
         # 'other' deficit (was tokenizing the largest message ~3x). Estimates
         # are recomputed fresh each pass, never carried across — carrying them
@@ -1693,16 +2016,26 @@ def _clamp_messages_to_ctx(
         ests = [_est(m.get("content", "")) for m in msgs]
         total = sum(ests)
         if total <= prompt_budget:
-            break
+            return msgs, reply
         big_i = max(range(len(msgs)), key=lambda i: ests[i])
         content = msgs[big_i].get("content", "") or ""
         other = total - ests[big_i]
         avail = max(24, prompt_budget - other)      # tokens this msg may keep
-        target_chars = max(80, avail * 4 - mlen)    # leave room for the marker
+        # A byte-level BPE token is at most one byte, a character at most four
+        # bytes: 0.25 chars/token is the floor of what a tokenizer can report.
+        per_tok = max(0.25, len(content) / max(1, ests[big_i]))
+        target_chars = max(80, int(avail * per_tok) - mlen)
         if len(content) <= target_chars:
             break            # can't recover more by trimming this message
         half = target_chars // 2
         msgs[big_i]["content"] = content[:half] + marker + content[-half:]
+
+    # Still over (other messages alone exceed the budget, or the pass cap was
+    # reached): give the reply only what is left, so prompt + reply + margin
+    # stay inside n_ctx. llama-cpp would otherwise cut max_tokens silently.
+    total = sum(_est(m.get("content", "")) for m in msgs)
+    if total > prompt_budget:
+        reply = max(16, min(reply, n_ctx - margin - total))
     return msgs, reply
 
 
@@ -1724,6 +2057,35 @@ def _model_n_ctx(llm: Any) -> Optional[int]:
         return None
 
 
+def _instance_token_counter(llm: Any) -> Optional[Callable[[str], int]]:
+    """Exact token counts on ``llm``'s OWN tokenizer, for the prompt clamp.
+
+    estimate_tokens always asks the MAIN model — the wrong vocabulary when
+    another slot serves the call (a Llama 3.2 3B fast slot measured with
+    Phi-4's tokenizer) — and drops to chars/4 whenever main's lock is busy,
+    which in a deliberation is most of the time: roles on one model take
+    turns, so the next role's clamp ran while the previous one generated.
+
+    The CALLER MUST HOLD that instance's lock: tokenizing while a generation
+    runs on the same Llama races llama-cpp's state (see estimate_tokens).
+    Cheap — one tokenize per message per clamp pass, and the common call is a
+    single pass. None when the instance has no tokenizer: the clamp then
+    keeps estimate_tokens.
+    """
+    tok = getattr(llm, "tokenize", None)
+    if not callable(tok):
+        return None
+
+    def _count(text: str) -> int:
+        if not text:
+            return 0
+        try:
+            return len(tok(text.encode("utf-8", errors="ignore")))
+        except Exception:
+            return max(1, (len(text) + 3) // 4)
+    return _count
+
+
 def _gguf_chat(
     messages: List[Dict[str, str]],
     *,
@@ -1733,12 +2095,17 @@ def _gguf_chat(
 ) -> str:
     """Blocking GGUF chat completion on ``slot``'s model."""
     llm, lock = _slot_llm_and_lock(slot)
-    messages, num_predict = _clamp_messages_to_ctx(
-        messages, num_predict, _model_n_ctx(llm))
     # Serialize against every other inference call on the same Llama
     # instance — see _INFERENCE_LOCK docstring at module top for why. Each
     # model has its own lock; the main model's is _INFERENCE_LOCK.
+    #
+    # The clamp runs INSIDE the lock, against THIS instance: its n_ctx() is
+    # the window (not the 4096 of an unset COUNCIL_GGUF_N_CTX) and holding
+    # the lock is what makes counting on its own tokenizer safe.
     with lock:
+        messages, num_predict = _clamp_messages_to_ctx(
+            messages, num_predict, _model_n_ctx(llm),
+            count_tokens=_instance_token_counter(llm))
         result = llm.create_chat_completion(
             messages=messages,
             temperature=float(temperature),
@@ -1761,15 +2128,17 @@ def _gguf_chat_stream(
 ) -> str:
     """Streaming GGUF chat completion — emits each token via token_callback."""
     llm, lock = _slot_llm_and_lock(slot)
-    messages, num_predict = _clamp_messages_to_ctx(
-        messages, num_predict, _model_n_ctx(llm))
     pieces: list[str] = []
     # Hold the inference lock for the entire stream. Releasing between
     # chunks would let another call slip in and corrupt the in-progress
     # KV cache. token_callback fires INSIDE the lock — callbacks should
     # be fast (queue.put_nowait or a buffer append) and must NOT call
-    # back into local_chat (would deadlock).
+    # back into local_chat (would deadlock). The clamp is inside it too,
+    # for the same reason as in _gguf_chat.
     with lock:
+        messages, num_predict = _clamp_messages_to_ctx(
+            messages, num_predict, _model_n_ctx(llm),
+            count_tokens=_instance_token_counter(llm))
         for chunk in llm.create_chat_completion(
             messages=messages,
             temperature=float(temperature),

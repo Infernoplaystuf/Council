@@ -8,7 +8,8 @@ REM    1. Activates .venv\Scripts\python.exe
 REM    2. Sets COUNCIL_BACKEND=gguf (Ollama path is dead)
 REM    3. Picks a GGUF model:
 REM        - honours an externally-set COUNCIL_GGUF_PATH
-REM        - else first .gguf in .\models\ or %USERPROFILE%\models\
+REM        - else first .gguf in .\models\ or %USERPROFILE%\models\,
+REM          marked COUNCIL_GGUF_PATH_AUTO=1 so the model saved in the app wins
 REM    4. Exports sensible Windows defaults (GPU offload, n_ctx debug)
 REM    5. Launches the GUI — the Qt app (council_qt.py) by default; the
 REM       classic Tk app (council_gui_engine.py) with --tk or COUNCIL_UI=tk,
@@ -69,16 +70,33 @@ echo [run-windows] python: !PYEXE!
 if defined CHECK_ONLY goto :do_check
 
 REM ── Pick a GGUF model if user didn't set one ─────────────────
-if not defined COUNCIL_GGUF_PATH (
-    for %%F in ("%SCRIPT_DIR%models\*.gguf") do (
-        if not defined COUNCIL_GGUF_PATH set "COUNCIL_GGUF_PATH=%%~fF"
-    )
-)
-if not defined COUNCIL_GGUF_PATH (
-    for %%F in ("%USERPROFILE%\models\*.gguf") do (
-        if not defined COUNCIL_GGUF_PATH set "COUNCIL_GGUF_PATH=%%~fF"
-    )
-)
+REM COUNCIL_GGUF_PATH_AUTO=1 tells the app the path below is OUR guess, not the
+REM user's choice. Without it the guess beat the main model saved in the app on
+REM every launch - measured 2026-09-29: always granite-3.1-8b from ~\models,
+REM whatever was picked. The app now starts on the saved model when AUTO=1
+REM and that file is on disk - onboarding.apply_saved_gguf_path.
+REM Cleared first: only this block sets it, so an inherited value can never
+REM turn a path the user set into a guess.
+REM The search runs with delayed expansion OFF. With it on, a ! in a found
+REM name was dropped - measured 2026-09-29: wow!model.gguf was exported as
+REM wowmodel.gguf, a file that does not exist. The name still crosses the
+REM endlocal through one delayed-expansion pass, which drops a lone ! and, on
+REM a line that has a !, eats every caret - so a name with a ! goes out with
+REM each caret doubled and each ! escaped, and any other name goes out as is.
+REM The escaping is jumped over when nothing was found: a %%VAR:x=y%% edit of
+REM an UNDEFINED variable breaks the line it is on - measured 2026-09-29, cmd
+REM stopped with "The syntax of the command is incorrect." even behind an
+REM `if defined` guard, because the edit is made before the IF runs.
+set "COUNCIL_GGUF_PATH_AUTO="
+setlocal disabledelayedexpansion
+set "GGUF_PICK="
+if not defined COUNCIL_GGUF_PATH for %%F in ("%SCRIPT_DIR%models\*.gguf") do if not defined GGUF_PICK set "GGUF_PICK=%%~fF"
+if not defined COUNCIL_GGUF_PATH if not defined GGUF_PICK for %%F in ("%USERPROFILE%\models\*.gguf") do if not defined GGUF_PICK set "GGUF_PICK=%%~fF"
+if not defined GGUF_PICK goto :gguf_pick_out
+if not "%GGUF_PICK%"=="%GGUF_PICK:!=%" set "GGUF_PICK=%GGUF_PICK:^=^^%"
+set "GGUF_PICK=%GGUF_PICK:!=^!%"
+:gguf_pick_out
+endlocal & if not "%GGUF_PICK%"=="" set "COUNCIL_GGUF_PATH=%GGUF_PICK%" & set "COUNCIL_GGUF_PATH_AUTO=1"
 
 if defined COUNCIL_GGUF_PATH (
     echo [run-windows] model: !COUNCIL_GGUF_PATH!
@@ -87,6 +105,7 @@ if defined COUNCIL_GGUF_PATH (
     echo [run-windows] The app will open but the model won't load until you pick
     echo [run-windows] one via Browse in the UI.
 )
+if defined COUNCIL_GGUF_PATH_AUTO echo [run-windows] that is the first .gguf found - a main model saved in the app is used instead while it is on disk.
 
 REM ── Required env: backend selection ──────────────────────────
 set "COUNCIL_BACKEND=gguf"
@@ -131,15 +150,65 @@ echo [run-windows] launching !COUNCIL_ENTRY! ...
 "!PYEXE!" !COUNCIL_ENTRY!
 set "EXIT=%ERRORLEVEL%"
 
+REM The parentheses in the Retrying echo are escaped with ^ because an
+REM unescaped ) inside a ( ) block closes it. Measured 2026-09-29 with a
+REM stub entry: unescaped, cmd rejected this whole block with "... was
+REM unexpected at this time." after EVERY run, clean or crashed - the
+REM launcher exited 255 and the CPU retry below never ran.
+REM
+REM The retry is for a NATIVE crash only - the GPU path failing: a CUDA
+REM wheel / driver mismatch, VRAM running out mid-load - as run-linux.sh and
+REM run-wsl.sh retry only on signals 132-139. On Windows a native crash exits
+REM with an NTSTATUS error code of facility 0, 0xC0000000-0xC000FFFF, which
+REM ERRORLEVEL shows as -1073741824 to -1073676289:
+REM   -1073741819  0xC0000005  access violation
+REM   -1073741795  0xC000001D  illegal instruction - a wheel built for another CPU
+REM   -1073740791  0xC0000409  fast fail - how the C runtime's abort usually ends
+REM   -1073741571  0xC00000FD  stack overflow
+REM and an abort / GGML_ABORT that does not fast-fail exits with 3. Nothing
+REM else is retried: any other exit is the app's or the user's, and retrying
+REM it reopened an app the user had just closed. Measured 2026-09-29: a
+REM Python exception at startup exits 1, taskkill /F exits 1, PowerShell's
+REM Stop-Process exits -1 0xFFFFFFFF - negative, so "any negative exit" had
+REM the app reopen on the CPU - and Ctrl+C, an unhandled KeyboardInterrupt,
+REM exits -1073741510 0xC000013A: in the range but no crash, so it is
+REM excluded by value.
+REM
+REM And only while a GPU load is unconfirmed. The engine writes .gpu_attempt
+REM in the vault before it loads a model onto the GPU, and deletes it after
+REM the first answer and at a clean close - council_engine.py
+REM _gpu_mark_attempt / _gpu_confirm_success, council_core\shutdown.py
+REM close_session. A native crash with no sentinel left - say while closing,
+REM after the model had answered - is not the GPU failing, and retrying it
+REM reopened the app the user had just closed.
+REM The engine puts it in COUNCIL_VAULT_ROOT, else in USERPROFILE\.council\vault
+REM - council_engine._gpu_sentinel_path, which, unlike council_core.paths
+REM vault_dir, ignores COUNCIL_APP_DIR - so vault_dir's COUNCIL_APP_DIR\vault
+REM is looked in as well. No vault to look in, no retry. The !VAR! form reads
+REM a folder name with ! ^ & ) in it as it is.
+set "CRASHED="
+if !EXIT! GEQ -1073741824 if !EXIT! LEQ -1073676289 if not "!EXIT!"=="-1073741510" set "CRASHED=1"
+if "!EXIT!"=="3" set "CRASHED=1"
+set "GPU_PENDING="
+if defined COUNCIL_VAULT_ROOT (
+    if exist "!COUNCIL_VAULT_ROOT!\.gpu_attempt" set "GPU_PENDING=1"
+) else (
+    if defined USERPROFILE if exist "!USERPROFILE!\.council\vault\.gpu_attempt" set "GPU_PENDING=1"
+    if defined COUNCIL_APP_DIR if exist "!COUNCIL_APP_DIR!\vault\.gpu_attempt" set "GPU_PENDING=1"
+)
+set "RETRY="
+if defined CRASHED if defined GPU_PENDING if not "!COUNCIL_GGUF_GPU_LAYERS!"=="0" set "RETRY=1"
 if not "%EXIT%"=="0" (
     echo.
     echo [run-windows] Process exited with code %EXIT%.
-    if not "%COUNCIL_GGUF_GPU_LAYERS%"=="0" (
-        echo [run-windows] Retrying once with COUNCIL_GGUF_GPU_LAYERS=0 (CPU only)...
+    if defined RETRY (
+        echo [run-windows] That is a native crash while a GPU load was unconfirmed - most often a CUDA wheel / driver mismatch, or VRAM running out.
+        echo [run-windows] Retrying once with COUNCIL_GGUF_GPU_LAYERS=0 ^(CPU only^)...
         set "COUNCIL_GGUF_GPU_LAYERS=0"
         "!PYEXE!" !COUNCIL_ENTRY!
         set "EXIT=!ERRORLEVEL!"
     )
+    if defined CRASHED if not defined GPU_PENDING echo [run-windows] That is a native crash, but no GPU load was waiting to be confirmed, so the app is not reopened.
 )
 
 endlocal & exit /b %EXIT%

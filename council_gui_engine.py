@@ -38,6 +38,14 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 
+if __name__ == "__main__":
+    # Launched as the app (not imported by a test): settle the main model
+    # BEFORE council_engine reads COUNCIL_GGUF_PATH at import. The model saved
+    # in the app beats a run-* launcher's first-found *.gguf guess; one the
+    # user exported beats both. See onboarding.apply_saved_gguf_path.
+    import onboarding as _onboarding_boot
+    _onboarding_boot.apply_saved_gguf_path()
+
 import council_engine as ce
 # apothecary_engine is lazily imported inside _build_apoth_tab so
 # consumer builds (no --advanced / COUNCIL_ADVANCED=1) never load
@@ -4026,11 +4034,15 @@ def _migrate_old_paths_to_vault() -> None:
             print(m)
 
 
-# Run migration silently on startup
-try:
-    _migrate_old_paths_to_vault()
-except Exception:
-    pass
+# Run migration silently on startup — unless told not to. The test suite
+# points the vault at a throwaway folder deleted when the session ends; a
+# migration into it MOVED the user's legacy files there and they were gone
+# after the run (measured in a scratch home). tests/sandbox_vault.py sets it.
+if os.environ.get("COUNCIL_SKIP_PATH_MIGRATION", "").strip() in ("", "0"):
+    try:
+        _migrate_old_paths_to_vault()
+    except Exception:
+        pass
 
 
 # ============================================================

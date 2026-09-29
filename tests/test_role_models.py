@@ -4,6 +4,8 @@ The Models tab's "Which model answers for each role" section
 """
 from __future__ import annotations
 
+import json
+import os
 import sys
 import threading
 import time
@@ -188,6 +190,93 @@ def test_save_writes_the_map_sets_main_and_reloads(tmp_path, monkeypatch):
     cfg = ms.load(tmp_path / "vault")
     assert cfg.slot_for("peasant") != "main" and cfg.slot_for("writer") == "main"
     assert calls == [("main", str(big)), ("refresh",)]
+
+
+# -- a backend_settings.json that cannot be read ------------------------------
+
+_KEEP = {"gguf_path": "C:/chosen.gguf", "clip_path": "C:/mmproj.gguf",
+         "role_models": {"sage": "C:/sage.gguf"}}
+#: PowerShell 5.1's Out-File / `>` default. Not UTF-8, so not readable.
+_UTF16 = json.dumps(_KEEP).encode("utf-16")
+
+
+def test_save_says_when_the_main_model_could_not_be_saved(tmp_path,
+                                                          monkeypatch):
+    """MEASURED 2026-09-29: onboarding._merge_backend_settings, which Save
+    goes through, rewrote a settings file it could not read — UTF-16,
+    truncated, cp1252 — with only the key it was saving (clip_path and
+    role_models gone), and Save said "Saved" as if the next launch would
+    start on the Writer's model. The file is now left alone and Save's line
+    says the main model was NOT saved, and where the file is."""
+    for name in ("COUNCIL_GGUF_PATH", "COUNCIL_GGUF_PATH_AUTO"):
+        monkeypatch.setenv(name, "x")        # recorded, so put back after
+        monkeypatch.delenv(name)
+    monkeypatch.setitem(sys.modules, "council_engine", SimpleNamespace(
+        refresh_backend_config=lambda: None))
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    settings = vault / "backend_settings.json"
+    settings.write_bytes(_UTF16)
+    big = tmp_path / "big.gguf"
+    line = RoleActions(vault).save({r: str(big) for r in ms.COUNCIL_ROLES})
+    assert settings.read_bytes() == _UTF16, "a file it could not read was replaced"
+    assert "NOT saved for the next launch" in line, line
+    assert str(settings) in line
+    # The role map itself was saved, and the Writer's model is live now.
+    assert ms.load(vault).slot_for("writer") == "main"
+    assert os.environ["COUNCIL_GGUF_PATH"] == str(big)
+
+
+def test_save_says_nothing_extra_when_the_settings_were_saved(tmp_path,
+                                                              monkeypatch):
+    for name in ("COUNCIL_GGUF_PATH", "COUNCIL_GGUF_PATH_AUTO"):
+        monkeypatch.setenv(name, "x")
+        monkeypatch.delenv(name)
+    monkeypatch.setitem(sys.modules, "council_engine", SimpleNamespace(
+        refresh_backend_config=lambda: None))
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    big = tmp_path / "big.gguf"
+    line = RoleActions(vault).save({r: str(big) for r in ms.COUNCIL_ROLES})
+    assert line.startswith("Saved — 1 model for the council."), line
+    data = json.loads((vault / "backend_settings.json").read_text("utf-8"))
+    assert data == {"gguf_path": str(big)}
+
+
+# role_models.RoleModelRegistry (the TOP-LEVEL role_models.py, not this
+# widget) reads and writes the same file, and had the same two faults the
+# onboarding fix removed: a BOM file read as {}, and a file it could not read
+# was replaced by one holding only the role map.
+
+def test_the_role_registry_reads_and_keeps_a_bom_settings_file(tmp_path):
+    """MEASURED 2026-09-29: with a BOM, .all() == {} and .set("judge", ...)
+    rewrote the file as {"role_models": {"judge": ...}} — gguf_path,
+    clip_path and the sage assignment gone."""
+    import role_models
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    settings = vault / "backend_settings.json"
+    settings.write_bytes(b"\xef\xbb\xbf" + json.dumps(_KEEP).encode("utf-8"))
+    registry = role_models.RoleModelRegistry(vault)
+    assert registry.all() == {"sage": "C:/sage.gguf"}
+    registry.set("judge", "C:/judge.gguf")
+    assert json.loads(settings.read_text("utf-8-sig")) == dict(
+        _KEEP, role_models={"sage": "C:/sage.gguf", "judge": "C:/judge.gguf"})
+
+
+def test_the_role_registry_never_replaces_a_file_it_could_not_read(tmp_path):
+    """MEASURED 2026-09-29: a UTF-16 file was rewritten as
+    {"role_models": {"judge": ...}}."""
+    import role_models
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    settings = vault / "backend_settings.json"
+    settings.write_bytes(_UTF16)
+    try:
+        role_models.RoleModelRegistry(vault).set("judge", "C:/judge.gguf")
+    except Exception:                                     # noqa: BLE001
+        pass           # refusing loudly is as good as refusing quietly
+    assert settings.read_bytes() == _UTF16
 
 
 def test_the_models_tab_carries_the_roles_section(qapp, tmp_path):

@@ -745,10 +745,33 @@ def _build_tab(window, factory):
     return widget
 
 
+def _top_levels() -> list:
+    """QApplication.topLevelWidgets(), with the cyclic collector held off.
+
+    Qt hands PySide a list of raw pointers, and PySide then allocates a
+    wrapper for each one. A collection triggered by one of those allocations
+    can free a Python-owned window that only a garbage cycle still holds —
+    a StandaloneHost and its window reach each other through the tab factory
+    lambda — and PySide goes on to wrap the freed pointer: a plain `QObject`
+    whose delete below ran ~QObject on freed memory (_purecall, "Fatal
+    Python error: Aborted"). Measured: 3 of 8 full runs at 9ab2270, always in
+    the teardown of test_the_standalone_host_matches_the_tk_contract, the
+    host's window freed by a gen-0 pass inside this very call. Once the list
+    exists it holds every window it names, so it is safe to collect again.
+    """
+    import gc
+    was = gc.isenabled()
+    gc.disable()
+    try:
+        return list(QApplication.topLevelWidgets())
+    finally:
+        if was:
+            gc.enable()
+
+
 def _top_level_ids() -> set:
     import shiboken6
-    return {shiboken6.getCppPointer(w)[0]
-            for w in QApplication.topLevelWidgets()}
+    return {shiboken6.getCppPointer(w)[0] for w in _top_levels()}
 
 
 def _new_top_levels(before: set) -> list:
@@ -759,7 +782,7 @@ def _new_top_levels(before: set) -> list:
     delete when the parent goes.
     """
     import shiboken6
-    return [w for w in QApplication.topLevelWidgets()
+    return [w for w in _top_levels()
             if shiboken6.getCppPointer(w)[0] not in before
             and w.parent() is None]
 

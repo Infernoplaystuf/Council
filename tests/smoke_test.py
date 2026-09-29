@@ -61,6 +61,13 @@ REPO = HERE.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
+# Run as a script (`python tests/smoke_test.py`, as installs.txt says), no
+# conftest is loaded — so the throwaway app folder and vault are set up here,
+# before any import below can find the user's real ~/.council. Measured: a run
+# of this file rewrote three index files in the real vault.
+if __name__ == "__main__":
+    import tests.sandbox_vault  # noqa: E402,F401
+
 
 # ─── Test runner ────────────────────────────────────────────────────
 _FAILS: list = []
@@ -8284,6 +8291,10 @@ def test_analyst_cached_stats_helpers() -> None:
     cached_column_stats) and their sandbox names (column_stats /
     file_stats) return exact precomputed stats and populate the cache."""
     import os as _os
+    # Restored, not popped: popping it left every LATER test in the session
+    # resolving the user's real ~/.council/vault (found by
+    # tests/test_sandbox_vault.py once conftest sets a throwaway one).
+    prev = _os.environ.get("COUNCIL_VAULT_ROOT")
     with tempfile.TemporaryDirectory() as td:
         _os.environ["COUNCIL_VAULT_ROOT"] = td
         try:
@@ -8308,7 +8319,13 @@ def test_analyst_cached_stats_helpers() -> None:
             _check("sandbox column_stats has stats rows",
                    sdf is not None and len(sdf) >= 1)
         finally:
-            _os.environ.pop("COUNCIL_VAULT_ROOT", None)
+            if prev is None:
+                _os.environ.pop("COUNCIL_VAULT_ROOT", None)
+            else:
+                _os.environ["COUNCIL_VAULT_ROOT"] = prev
+            import importlib as _il
+            import vault_analyst as _va
+            _il.reload(_va)  # and drop the temp-vault-derived cache
 
 
 def test_stats_cache_exact_and_incremental() -> None:

@@ -41,6 +41,14 @@ fi
 conda activate wizardCouncil 2>/dev/null || die "conda env 'wizardCouncil' missing. Run ./setup-linux.sh."
 
 # ── Find a GGUF model ───────────────────────────────────────
+# COUNCIL_GGUF_PATH_AUTO=1 tells the app the path is OUR guess, not the
+# user's choice, so the main model saved in the app wins over it while that
+# file is on disk (onboarding.apply_saved_gguf_path). Without it the guess
+# beat the saved choice on every launch — measured 2026-09-29 through
+# run-windows.bat: always granite-3.1-8b from ~/models, whatever was picked.
+# Unset first: only the auto-pick below sets it, so an inherited value can
+# never turn a path the user exported into a guess.
+unset COUNCIL_GGUF_PATH_AUTO
 if [ -z "${COUNCIL_GGUF_PATH:-}" ]; then
     for candidate in \
         "$HOME/models"/*.gguf \
@@ -48,7 +56,9 @@ if [ -z "${COUNCIL_GGUF_PATH:-}" ]; then
         "$PWD/models"/*.gguf; do
         if [ -f "$candidate" ]; then
             export COUNCIL_GGUF_PATH="$candidate"
+            export COUNCIL_GGUF_PATH_AUTO=1
             say "found model: $COUNCIL_GGUF_PATH"
+            say "(the first .gguf found — a main model saved in the app is used instead while it is on disk)"
             break
         fi
     done

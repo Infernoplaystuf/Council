@@ -125,10 +125,15 @@ class ModelsTab(ViewHelpers, QWidget):
         self.find_btn = self._button(controls, "🔎 Find Models", self.on_find)
         self._button(controls, "⬆ Suggest upgrades", self.on_suggest)
         controls.addStretch(1)
-        self.status = QLabel("")
-        self.status.setStyleSheet(f"color: {self._tokens['muted_fg']};")
-        controls.addWidget(self.status)
         outer.addLayout(controls)
+        # Its own row, wrapping: a switch that could not be SAVED says why,
+        # with the settings path — about 270 characters, measured. In the
+        # controls row, unwrapped, that became the row's minimum width and
+        # forced the whole window about twice as wide.
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet(f"color: {self._tokens['muted_fg']};")
+        outer.addWidget(self.status)
 
         self.results = QTreeWidget()
         self.results.setColumnCount(len(model_jobs.COLUMNS))

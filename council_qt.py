@@ -24,6 +24,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 
 def main() -> int:
+    # The main model, before anything can import council_engine. The run-*
+    # launchers export the FIRST *.gguf they find when COUNCIL_GGUF_PATH is
+    # unset, and that guess used to beat the model saved in the Models tab on
+    # every launch (measured 2026-09-29: always granite-3.1-8b from ~/models,
+    # whatever the user picked). The saved one now wins over the guess; a
+    # COUNCIL_GGUF_PATH the user exported still wins over both. Guarded like
+    # the rest of the startup chain: the app still opens on the guess (and the
+    # Models tab can fix it) if this cannot run.
+    try:
+        import onboarding
+        onboarding.apply_saved_gguf_path()
+    except Exception as exc:                              # noqa: BLE001
+        # apply_saved_gguf_path drops COUNCIL_GGUF_PATH_AUTO whatever it
+        # decides; this path is the one where it never ran (onboarding did
+        # not import). Dropped here too, by its literal name since onboarding
+        # may be what failed: left in os.environ, every child the app spawns
+        # inherits it, and a `python council_qt.py` started from that
+        # environment treats the path it was handed as a launcher's guess
+        # and swaps in the saved model.
+        import os
+        os.environ.pop("COUNCIL_GGUF_PATH_AUTO", None)
+        print(f"[startup] saved main model not applied: {exc!r}", flush=True)
+
     # Set before the first Qt import, like the Tk build does for its own
     # bootstrap: the AppUserModelID decides which taskbar button the window
     # groups under, and it has to be set before a window exists.

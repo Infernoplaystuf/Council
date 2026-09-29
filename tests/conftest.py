@@ -25,6 +25,11 @@ meant for.
 """
 from __future__ import annotations
 
+# FIRST, before anything can resolve the vault: every session writes to a
+# throwaway app folder and vault, never the user's ~/.council. See
+# tests/sandbox_vault.py. `sandbox_env` re-asserts it after every test.
+from tests.sandbox_vault import sandbox_env  # noqa: E402,F401
+
 import pytest
 
 # Every test runs with the desktop's openers blocked (Explorer, browsers,

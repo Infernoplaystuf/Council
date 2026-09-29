@@ -129,16 +129,30 @@ class RoleActions:
         """Persist the map; returns the status line. BLOCKING (engine)."""
         cfg, main_file = model_slots.from_role_files(role_files)
         model_slots.save(self.vault_dir, cfg)
+        # Why the Writer's model was not saved for the next launch, or "".
+        # onboarding leaves a backend_settings.json it cannot read as it is
+        # rather than replace it (MEASURED 2026-09-29: replacing it dropped
+        # gguf_path, clip_path and role_models), and this line is the only
+        # place the user would hear of it — "Saved" alone would be false the
+        # next time the app starts.
+        main_not_saved = ""
         if main_file:
             import onboarding
-            onboarding.save_gguf_path(self.vault_dir, main_file)
+            main_not_saved = onboarding.save_gguf_path(self.vault_dir,
+                                                       main_file) or ""
         try:
             import council_engine
             council_engine.refresh_backend_config()
         except Exception as exc:                          # noqa: BLE001
             return (f"Saved, but the engine could not reload ({exc}); "
-                    "restart the app to use it.")
+                    "restart the app to use it."
+                    + (f" The main model was NOT saved for the next "
+                       f"launch: {main_not_saved}" if main_not_saved else ""))
         n = len(cfg.slots)
+        if main_not_saved:
+            return (f"Saved — {n} model{'s' if n != 1 else ''} for the "
+                    "council from the next question, but the Writer's model "
+                    f"was NOT saved for the next launch: {main_not_saved}")
         return (f"Saved — {n} model{'s' if n != 1 else ''} for the council. "
                 "It takes effect on the next question.")
 
