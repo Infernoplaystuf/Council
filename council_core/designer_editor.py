@@ -40,7 +40,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from gui_shapes import PALETTE, Shape, new_shape
 
-from .designer_scene import (GRID_SNAP, MIN_SIZE, UndoStack, handle_at,
+from .designer_scene import (GRID_SNAP, HANDLE, MIN_SIZE, UndoStack, handle_at,
                              resize_box, shape_at, sibling_edges, snap_box,
                              snap_to_grid, snap_value)
 
@@ -230,7 +230,7 @@ class Scene:
         # A handle on an already-selected shape beats a plain hit, so grabbing
         # a corner resizes rather than starting a move.
         for shape in self.selected():
-            handle = handle_at(shape, x, y)
+            handle = handle_at(shape, x, y, self.handle_slack)
             if handle:
                 self._mode, self._handle = "resize", handle
                 self.selection = [shape.id]
@@ -506,3 +506,9 @@ class Scene:
     #: Whether the rubber-band in progress adds to the selection. Set at the
     #: press; read at the release.
     _band_additive = False
+
+    #: How close, in DESIGN pixels, a press must be to a resize handle to
+    #: grab it. A zooming view sets it to the screen distance divided by the
+    #: zoom: coordinates arrive here already in design pixels, so a fixed
+    #: slack would be a 1.5-pixel target at 25% and a 24-pixel one at 400%.
+    handle_slack: float = HANDLE + 2
