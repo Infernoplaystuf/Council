@@ -63,6 +63,11 @@ ZOOM_STEPS: Tuple[float, ...] = (0.25, 0.33, 0.5, 0.67, 0.75, 0.9, 1.0, 1.1,
 #: touchpad's many small deltas zoom smoothly instead of not at all.
 WHEEL_NOTCH, WHEEL_FACTOR = 120.0, 1.2
 
+#: More notches than it takes to cross the whole range (25% -> 400% is 15.2
+#: of them at 1.2 each). One event's delta is capped at this many; see
+#: wheel_zoom.
+WHEEL_MAX_NOTCHES = 32.0
+
 #: The smallest gap, in SCREEN pixels, between two drawn grid lines. Below it
 #: the grid stops being a grid and becomes a flat wash of its own colour —
 #: at 25% an 8 px grid is a line every 2 screen pixels.
@@ -106,9 +111,16 @@ def step_zoom(zoom: float, direction: int) -> float:
 
 
 def wheel_zoom(zoom: float, delta: float) -> float:
-    """The zoom after a Ctrl+wheel of ``delta`` units (120 per notch)."""
-    return clamp_zoom(clamp_zoom(zoom)
-                      * WHEEL_FACTOR ** (float(delta or 0) / WHEEL_NOTCH))
+    """The zoom after a Ctrl+wheel of ``delta`` units (120 per notch).
+
+    The notches are bounded BEFORE the power: 1.2 ** (delta / 120) overflows
+    a float past a delta of about 470 000, and the OverflowError would escape
+    the scroller's wheelEvent. WHEEL_MAX_NOTCHES already spans the whole
+    range, so the bound changes no zoom a real wheel can reach.
+    """
+    notches = float(delta or 0) / WHEEL_NOTCH
+    notches = max(-WHEEL_MAX_NOTCHES, min(WHEEL_MAX_NOTCHES, notches))
+    return clamp_zoom(clamp_zoom(zoom) * WHEEL_FACTOR ** notches)
 
 
 def fit_zoom(design_w: int, design_h: int, view_w: int, view_h: int) -> float:
@@ -238,11 +250,14 @@ def canvas_problem(shapes: Sequence[Any], width: Any, height: Any,
     a shape hanging off it infers anchors for a window it is not in. The
     refusal names the smallest size that works, so the fix is one retype.
 
-    Given the ``current`` size, only shapes this change would NEWLY cut off
-    count. A shape already outside (a hand-edited .gspec, a drag past the
-    edge) is not made worse by a resize, and refusing every resize because
-    of it would leave no way to grow the canvas towards it one step at a
-    time. The log still counts it after the change.
+    Given the ``current`` size, only shapes this change would cut MORE of
+    count. A shape WHOLLY outside already (a hand-edited .gspec, a drag past
+    the edge) is unreachable at either size, and refusing because of it would
+    force growing the canvas out to it just to be allowed to shrink. A shape
+    the edge merely CUTS is different: part of it is still on the canvas and
+    can be grabbed, and a shrink deeper into it is exactly how it becomes
+    unreachable — so it counts. Growing never counts. The log still names
+    whatever is outside after the change.
     """
     try:
         w, h = int(width), int(height)
@@ -254,9 +269,16 @@ def canvas_problem(shapes: Sequence[Any], width: Any, height: Any,
             return (f"canvas {label} {value} is out of range — it must be "
                     f"between {MIN_CANVAS} and {MAX_CANVAS}")
     need_w, need_h = extent(shapes)
-    already = ({s.id for s in outside(shapes, *current)}
-               if current else set())
-    cut = [s for s in outside(shapes, w, h) if s.id not in already]
+    if current:
+        cw, ch = current
+        # Still on the current canvas (at least partly), and the new size
+        # cuts deeper into it on an axis that shrank. The left and top edges
+        # never move, so an overhang there is not this resize's doing.
+        cut = [s for s in shapes
+               if s.x < cw and s.x + s.w > 0 and s.y < ch and s.y + s.h > 0
+               and ((w < cw and s.x + s.w > w) or (h < ch and s.y + s.h > h))]
+    else:
+        cut = outside(shapes, w, h)
     if cut:
         return (f"{w} x {h} would cut off {len(cut)} shape(s) "
                 f"({', '.join(s.id for s in cut[:4])}"

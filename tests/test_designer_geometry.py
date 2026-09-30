@@ -89,6 +89,14 @@ def test_one_wheel_notch_is_a_fixed_factor_and_clamps():
     assert geo.wheel_zoom(1.0, 0) == 1.0
 
 
+def test_a_huge_wheel_delta_clamps_instead_of_overflowing():
+    """Found in review: 1.2 ** (delta / 120) overflows a float past a delta
+    of about 470 000, and the OverflowError escaped the scroller's
+    wheelEvent. angleDelta is an int32, so nothing in its range may raise."""
+    assert geo.wheel_zoom(1.0, 2**31 - 1) == geo.ZOOM_MAX
+    assert geo.wheel_zoom(1.0, -2**31) == geo.ZOOM_MIN
+
+
 def test_fit_shows_all_of_typhon_in_a_laptop_sized_view():
     """The measured case: 1504 x 1016 in the 1227 x 687 view a 1600 x 1000
     Designer tab has. Height is the tighter axis."""
@@ -210,6 +218,30 @@ def test_a_shape_already_outside_does_not_block_a_resize():
     # ...but a size that NEWLY cuts off an inside shape is still refused.
     assert geo.canvas_problem(shapes, 100, 700,
                               current=(1100, 700)).startswith("100 x 700")
+
+
+def test_a_shrink_cannot_push_a_half_visible_shape_wholly_off():
+    """Found in review: a shape the edge already cuts was skipped as
+    "already outside", so a shrink could take it from half on the canvas
+    (grabbable) to wholly off it (unreachable) with no refusal — the very
+    state the refusal exists to prevent."""
+    half = mk(x=1050, y=40, w=100, h=30)          # right edge 1150 of 1100
+    problem = geo.canvas_problem([half], 900, 700, current=(1100, 700))
+    assert "cut off 1 shape(s)" in problem, problem
+    assert "1150 x" in problem
+    # One pixel deeper into it is still more of it cut off.
+    assert geo.canvas_problem([half], 1099, 700, current=(1100, 700))
+    # An axis it does not overhang is free to change, and growing is too.
+    assert geo.canvas_problem([half], 1100, 500, current=(1100, 700)) == ""
+    assert geo.canvas_problem([half], 1200, 700, current=(1100, 700)) == ""
+
+
+def test_a_shape_wholly_outside_does_not_block_a_shrink():
+    """It is unreachable at either size; refusing would force growing the
+    canvas out to it just to be allowed to shrink."""
+    stray = mk(x=1500, y=10)
+    assert geo.canvas_problem([mk(x=10, y=10), stray], 900, 700,
+                              current=(1100, 700)) == ""
 
 
 @pytest.mark.parametrize("w, h", [(10, 700), (1100, 20), (9000, 700),

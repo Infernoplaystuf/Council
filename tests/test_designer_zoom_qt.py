@@ -179,6 +179,38 @@ def test_a_handle_is_grabbable_at_25_percent(qapp):
     canvas.deleteLater()
 
 
+@pytest.mark.parametrize("zoom", [0.33, 0.6762, 0.9, 1.1, 1.5, 4.0])
+@pytest.mark.parametrize("handle", ["w", "n", "nw"])
+def test_a_west_or_north_handle_leaves_the_opposite_edge_at_any_zoom(
+        qapp, zoom, handle):
+    """Found in review: at a fractional zoom the mouse arrives as FRACTIONAL
+    design pixels, and resize_box truncated the moved edge and the width
+    separately — so dragging the west handle at 68% moved the EAST edge one
+    pixel (424 -> 423), on 118 of 360 probed drags. At 100% the positions are
+    whole numbers and it never showed."""
+    shape = mk(x=200, y=200, w=224, h=96)
+    canvas = DesignerCanvas(scene=Scene([shape]))
+    canvas.set_design_size(1504, 1016)
+    canvas.set_zoom(zoom)
+    fx, fy = {"w": (0, 0.5), "n": (0.5, 0), "nw": (0, 0)}[handle]
+    start = ((200 + 224 * fx) * zoom, (200 + 96 * fy) * zoom)
+    # Screen deltas that are FRACTIONAL design pixels at every zoom here,
+    # and never less than a grid step (a smaller drag may snap straight back
+    # to where it started, which is not a resize at all).
+    for design in (-37.0, -13.0, 7.0, 21.0):
+        delta = design * max(1.0, zoom) + 1.0
+        canvas.scene.load([shape])
+        canvas.scene.selection = [shape.id]
+        end = (start[0] + (delta if "w" in handle else 0),
+               start[1] + (delta if "n" in handle else 0))
+        drag(canvas, start, end, steps=3)
+        after = canvas.scene.shapes[0]
+        assert canvas.scene.dirty, (delta, "the handle was not grabbed")
+        assert after.x + after.w == 424, (delta, after)     # east edge kept
+        assert after.y + after.h == 296, (delta, after)     # south edge kept
+    canvas.deleteLater()
+
+
 def test_a_rubber_band_at_200_percent_selects_in_design_pixels(qapp):
     inside, outside = mk(x=40, y=40), mk(x=400, y=40)
     canvas = DesignerCanvas(scene=Scene([inside, outside]))

@@ -240,7 +240,14 @@ def resize_box(shape: Shape, handle: str, dx: float, dy: float
     Both edges are computed then normalised, so dragging a handle PAST the
     opposite edge flips the box instead of producing a negative width — which
     Tk would render as nothing at all and the user would read as the shape
-    vanishing."""
+    vanishing.
+
+    Each EDGE is rounded to a whole pixel before the width is taken. A
+    zoomed canvas hands in fractional deltas (a screen pixel at 68% is 1.48
+    design pixels), and truncating x and the width separately moved the edge
+    the user was NOT dragging: the west handle pulled the east edge in by
+    one pixel. Whole-number deltas — Tk, or Qt at 100% — round to themselves,
+    so for them nothing changes."""
     x1, y1, x2, y2 = shape.x, shape.y, shape.x2, shape.y2
     if "w" in handle:
         x1 += dx
@@ -250,10 +257,9 @@ def resize_box(shape: Shape, handle: str, dx: float, dy: float
         y1 += dy
     if "s" in handle:
         y2 += dy
-    x1, x2 = min(x1, x2), max(x1, x2)
-    y1, y2 = min(y1, y2), max(y1, y2)
-    return (int(x1), int(y1),
-            max(MIN_SIZE, int(x2 - x1)), max(MIN_SIZE, int(y2 - y1)))
+    x1, x2 = sorted((int(round(x1)), int(round(x2))))
+    y1, y2 = sorted((int(round(y1)), int(round(y2))))
+    return (x1, y1, max(MIN_SIZE, x2 - x1), max(MIN_SIZE, y2 - y1))
 def containment_map(shapes: Sequence[Shape], tol: int = 4) -> Dict[str, str]:
     """child id -> parent id, for live nesting shading.
 
