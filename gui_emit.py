@@ -97,6 +97,13 @@ class EmitResult:
     files_skipped: List[str] = field(default_factory=list)   # never rewritten
     handlers_added: List[str] = field(default_factory=list)
     handlers_upgraded: List[str] = field(default_factory=list)
+    # Untouched stubs rewritten for a changed link, and removed for a deleted
+    # widget (plan_handlers). Each is also a line in `warnings`.
+    handlers_rewired: List[str] = field(default_factory=list)
+    handlers_removed: List[str] = field(default_factory=list)
+    # Edited handlers left as they are although their link changed — each
+    # has a WARNING line in `warnings`.
+    handlers_stale: List[str] = field(default_factory=list)
     orphaned_regions: Dict[str, str] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
 
@@ -2502,45 +2509,549 @@ def upgrade_stubs(src: str, spec: Spec) -> Tuple[str, List[str], List[str]]:
     """(new source, upgraded handlers, handlers left as they are that do not
     report failures) for an existing handlers.py.
 
-    Only a script-linked handler whose WHOLE definition — found by parsing,
-    so a line appended to it is part of it — equals a _legacy_stubs text is
-    replaced, with the stub this version writes."""
+    The older, narrower name for plan_handlers, kept for callers that only
+    want the migration. It now returns plan_handlers' whole source — rewired
+    and removed stubs included — because a caller that wrote back only the
+    upgrades would write a handlers.py the rest of Generate had not planned
+    for."""
+    plan = plan_handlers(src, spec)
+    return plan.source, plan.upgraded, plan.silent
+
+
+# ============================================================
+# Which handlers are still the generator's own
+# ============================================================
+# handlers.py is the user's file, and "never rewritten" is the promise. What
+# the promise protects is code a person WROTE. A stub exactly as this emitter
+# produced it — for any link it has ever had — is not that: nothing in it was
+# typed by anyone, so replacing it loses nothing.
+#
+# The review that prompted this measured what the promise was costing:
+#   * rewiring a button in the .gspec changed NOTHING — the old stub stayed,
+#     calling the old function, and Generate said "policy: OK";
+#   * deleting a wired button was BLOCKED — "handler 'on_btn_png_raw' is used
+#     in handlers.py:224" — citing the generator's own untouched stub.
+#
+# An EXACT comparison is what keeps this safe. The link a stub was generated
+# for is read back out of the stub itself (its import, its call, its sets, its
+# report_error title), the emitter regenerates the text for that link, and
+# only a byte-for-byte match counts as untouched. One changed character — a
+# comment, a print, a renamed variable — and it is the user's, and left alone.
+
+@dataclass
+class HandlerPlan:
+    """What regeneration will do to an existing handlers.py, before it does it.
+
+    Computed without writing anything, so Generate can run its orphan and
+    port-rename checks against the file AS IT WILL BE — a stub about to be
+    removed must not block the generation that removes it."""
+    source: str
+    #: Unedited stubs from an older emitter, same link, now today's text.
+    upgraded: List[str] = field(default_factory=list)
+    #: (handler, what it called, what it calls now) — untouched stubs
+    #: rewritten because the widget's link changed.
+    rewired: List[Tuple[str, str, str]] = field(default_factory=list)
+    #: Untouched stubs whose widget is gone.
+    removed: List[str] = field(default_factory=list)
+    #: (handler, "file:line") — untouched stubs whose widget is gone but that
+    #: hand-written code still CALLS, so they were kept (_first_use).
+    kept: List[Tuple[str, str]] = field(default_factory=list)
+    #: Edited handlers that no longer match their link — the WARNING lines,
+    #: with file:line — and their names.
+    stale: List[str] = field(default_factory=list)
+    stale_names: List[str] = field(default_factory=list)
+    #: Edited, linked handlers that do not report failures (report_error).
+    silent: List[str] = field(default_factory=list)
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.upgraded or self.rewired or self.removed)
+
+    def lines(self, filename: str = "handlers.py") -> List[str]:
+        """What Generate's log says about it, one line per handler."""
+        out = []
+        if self.upgraded:
+            out.append(f"{filename}: upgraded " + ", ".join(self.upgraded)
+                       + " — unedited stubs from an older version, which left "
+                         "the previous results on screen when the call failed")
+        for name, was, now in self.rewired:
+            out.append(f"{filename}: rewired {name} — was {was}, now {now} "
+                       f"(it was the untouched generated stub, so it was "
+                       f"rewritten)")
+        for name in self.removed:
+            out.append(f"{filename}: removed {name} — its widget is gone and "
+                       f"it was the untouched generated stub (a copy is in "
+                       f".backups)")
+        out.extend(self.kept_lines(filename))
+        out.extend(self.stale)
+        for name in self.silent:
+            out.append(f"{filename}: {name} has been edited, so it was left "
+                       f"as it is — it does not call report_error, so if its "
+                       f"script fails the window will not say so")
+        return out
+
+    def kept_lines(self, filename: str = "handlers.py") -> List[str]:
+        """One line per stub kept because hand-written code calls it. Also
+        shown when Generate BLOCKS on such a stub, so the refusal names the
+        CALL, not just the generator's own def."""
+        return [f"{filename}: kept {name} — its widget is gone, but {where} "
+                f"still calls it. Take that call out, then Generate again "
+                f"to remove the stub."
+                for name, where in self.kept]
+
+
+def link_text(script: Optional[Dict[str, Any]]) -> str:
+    """"frame_camera.pop_out" for a link, "(no link — TODO stub)" for none."""
+    script = dict(script or {})
+    module = str(script.get("module") or "").strip()
+    func = str(script.get("function") or "").strip()
+    return f"{module}.{func}" if module and func else "(no link — TODO stub)"
+
+
+def _handler_methods(tree) -> Tuple[Dict[str, List[Tuple[int, int]]],
+                                     Dict[str, Any]]:
+    """(name -> [(first line, last line)], name -> def node) for every method
+    of every top-level class, decorators included in the span so it is the
+    WHOLE definition.
+
+    Top-level classes only, read in one pass: HandlerMixin is where Generate
+    writes, and two ast.walk()s over all of handlers.py were 60% of this
+    plan's cost on Typhon (5 ms of 9) — paid twice per Generate."""
+    import ast
+    spans: Dict[str, List[Tuple[int, int]]] = {}
+    nodes: Dict[str, Any] = {}
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        for item in node.body:
+            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                first = min([item.lineno] + [d.lineno for d in
+                                             item.decorator_list])
+                spans.setdefault(item.name, []).append(
+                    (first, item.end_lineno))
+                nodes[item.name] = item
+    return spans, nodes
+
+
+def _link_in_stub(node) -> Optional[Tuple[Dict[str, Any], str]]:
+    """(the link, the error title) a generated stub was written for, read
+    back from its code — or None when it is not stub-shaped at all.
+
+    Only a CANDIDATE: recover_stub checks it by regenerating the text. This
+    just has to read the four things handler_stub writes — the import, the
+    call's `self.ports.<p>.get()` arguments, the `self.ports.<p>.set(...)`
+    lines and report_error's title — in the order it writes them."""
+    import ast
+    module = func = title = ""
+    inputs: List[str] = []
+    outputs: Dict[str, Any] = {}
+    output = ""
+    for child in ast.walk(node):
+        if isinstance(child, ast.ImportFrom) and not module:
+            if child.level or len(child.names) != 1 or not child.module:
+                return None
+            module, func = child.module, child.names[0].name
+    if not module:
+        return {}, ""                       # the TODO stub, if anything
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call):
+            continue
+        target = child.func
+        if isinstance(target, ast.Name) and target.id == func and not inputs:
+            for arg in child.args:
+                port = _port_of(arg, "get")
+                if port is None:
+                    return None
+                inputs.append(port)
+        elif (isinstance(target, ast.Attribute) and target.attr == "set"
+              and _port_of(child, "set") is not None and child.args):
+            port = _port_of(child, "set")
+            arg = child.args[0]
+            if (isinstance(arg, ast.Subscript)
+                    and isinstance(arg.value, ast.Name)
+                    and arg.value.id == "result"
+                    and isinstance(arg.slice, ast.Constant)):
+                outputs[port] = arg.slice.value
+            elif isinstance(arg, ast.Name) and arg.id == "result":
+                output = port
+        elif (isinstance(target, ast.Attribute)
+              and target.attr == "report_error" and child.args
+              and isinstance(child.args[0], ast.Constant)
+              and isinstance(child.args[0].value, str)):
+            title = child.args[0].value
+    link: Dict[str, Any] = {"module": module, "function": func,
+                            "inputs": inputs, "outputs": outputs}
+    if output:
+        link["output"] = output
+    return link, title
+
+
+def _port_of(call, method: str) -> Optional[str]:
+    """``p`` for a call ``self.ports.p.<method>()``, else None."""
+    import ast
+    if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+            and call.func.attr == method):
+        return None
+    holder = call.func.value
+    if (isinstance(holder, ast.Attribute)
+            and isinstance(holder.value, ast.Attribute)
+            and holder.value.attr == "ports"
+            and isinstance(holder.value.value, ast.Name)
+            and holder.value.value.id == "self"):
+        return holder.attr
+    return None
+
+
+def recover_stub(name: str, node, text: str
+                 ) -> Optional[Tuple[Dict[str, Any], str, bool]]:
+    """(link, title, is it today's text) when ``text`` — the whole handler
+    definition — is EXACTLY a stub this emitter wrote, for some link, in
+    this version or an older one. None when it is anything else, which means
+    a person has touched it."""
+    found = _link_in_stub(node)
+    if found is None:
+        return None
+    link, title = found
+    if not text.endswith("\n"):
+        text += "\n"
+    today = handler_stub(name, link, title).lstrip("\n")
+    if text == today:
+        return link, title, True
+    if text in _legacy_stubs(name, link, title):
+        return link, title, False
+    return None
+
+
+def _same_link(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    """Whether two links generate the same call. Compares what handler_stub
+    reads, so {} and {"inputs": []} are the same (both: no link)."""
+    def key(s: Dict[str, Any]):
+        s = dict(s or {})
+        module = str(s.get("module") or "").strip()
+        func = str(s.get("function") or "").strip()
+        if not (module and func):
+            return ()
+        return (module, func,
+                tuple(str(p) for p in (s.get("inputs") or []) if str(p).strip()),
+                tuple((str(p), str(k)) for p, k in
+                      dict(s.get("outputs") or {}).items()),
+                str(s.get("output") or "").strip())
+    return key(a) == key(b)
+
+
+def _calls_in(node) -> List[str]:
+    """"module.function" for each `from module import function` inside a
+    handler — what an edited handler still calls, for the warning."""
+    import ast
+    out = []
+    for child in ast.walk(node):
+        if isinstance(child, ast.ImportFrom) and child.module and not child.level:
+            out.extend(f"{child.module}.{a.name}" for a in child.names)
+    return out
+
+
+def _mentions(node, name: str) -> bool:
+    """Whether ``name`` appears in the handler as a name, attribute or import."""
+    import ast
+    for child in ast.walk(node):
+        if isinstance(child, ast.Name) and child.id == name:
+            return True
+        if isinstance(child, ast.Attribute) and child.attr == name:
+            return True
+        if isinstance(child, ast.alias) and (child.asname or child.name) == name:
+            return True
+    return False
+
+
+def plan_handlers(src: str, spec: Spec,
+                  previous: Optional[Dict[str, Dict[str, Any]]] = None,
+                  filename: str = "handlers.py", *,
+                  callers: Optional[Dict[str, str]] = None) -> HandlerPlan:
+    """What regenerating ``spec`` does to this handlers.py. Writes nothing.
+
+    For each handler the spec binds that exists exactly once:
+      * already today's stub for its link   -> left alone
+      * an untouched stub for ANOTHER link  -> rewritten for the new one
+        (or back to the TODO stub, when the link was removed)
+      * an older version's stub, same link  -> upgraded (the migration)
+      * edited, and no longer matching      -> left alone, and NAMED with
+        file:line, because silently keeping a handler that calls the old
+        function is the bug this exists to end
+    And for each handler the spec no longer binds (its widget was deleted),
+    an untouched stub is removed — unless hand-written code still CALLS it
+    (``self.on_btn_x()`` elsewhere in handlers.py, or in ``callers``: the
+    other hand-written files' text by name, i.e. app.py). Removing one of
+    those turned a working call into an AttributeError with Generate saying
+    OK; kept, it is judged by find_orphans exactly as before this existed.
+    An edited one is left for find_orphans.
+
+    ``previous`` is the manifest's record of each handler's link at the last
+    Generate: it is what says a link CHANGED (_stale_reason).
+    """
     import ast
     try:
         tree = ast.parse(src)
     except SyntaxError:
-        return src, [], []
-    spans: Dict[str, List[Tuple[int, int]]] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef):
-            for item in node.body:
-                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    first = min([item.lineno] + [d.lineno for d in
-                                                 item.decorator_list])
-                    spans.setdefault(item.name, []).append(
-                        (first, item.end_lineno))
+        return HandlerPlan(src)
+    previous = dict(previous or {})
+    spans, nodes = _handler_methods(tree)
     lines = src.splitlines(keepends=True)
-    edits, upgraded, silent = [], [], []
+    plan = HandlerPlan(src)
+    edits: List[Tuple[int, int, str]] = []
+
+    def text_of(a: int, b: int) -> str:
+        text = "".join(lines[a - 1:b])
+        return text if text.endswith("\n") else text + "\n"
+
+    wanted = set(spec.handlers)
     for h in spec.handlers:
-        script = _script_for(spec, h)
-        if not script or len(spans.get(h, [])) != 1:
+        if len(spans.get(h, [])) != 1 or h not in nodes:
             continue
         a, b = spans[h][0]
-        current = "".join(lines[a - 1:b])
-        if not current.endswith("\n"):
-            current += "\n"
-        title = _title_for(spec, h)
+        current = text_of(a, b)
+        script, title = _script_for(spec, h), _title_for(spec, h)
         new = handler_stub(h, script, title).lstrip("\n")
         if current == new:
             continue
-        if current in _legacy_stubs(h, script, title):
-            edits.append((a, b, new))
-            upgraded.append(h)
-        elif "report_error" not in current:
-            silent.append(h)
-    for a, b, new in sorted(edits, reverse=True):
-        lines[a - 1:b] = [new]
-    return "".join(lines), upgraded, silent
+        recovered = recover_stub(h, nodes[h], current)
+        if recovered is not None:
+            old_link, _old_title, is_today = recovered
+            if not _same_link(old_link, script):
+                edits.append((a, b, new))
+                # The function's name alone says nothing when only a port
+                # moved; the whole call does.
+                same_call = link_text(old_link) == link_text(script)
+                describe = _link_detail if same_call else link_text
+                plan.rewired.append((h, describe(old_link),
+                                     describe(script)))
+            elif not is_today:
+                edits.append((a, b, new))
+                plan.upgraded.append(h)
+            # Same link, today's text, only the title differs (the button
+            # was relabelled): leave it. Nothing it DOES has changed.
+            continue
+        # A person has edited this one. Keep it — and say so when it no
+        # longer matches what the wireframe asks for.
+        stale = _stale_reason(nodes[h], script, previous.get(h))
+        if stale:
+            plan.stale.append(
+                f"WARNING: {filename}:{a} {h} was edited by hand, so "
+                f"Generate left it as it is — {stale} Edit it, or delete it "
+                f"to regenerate.")
+            plan.stale_names.append(h)
+        elif script and "report_error" not in current:
+            plan.silent.append(h)
+
+    removals: List[Tuple[int, int]] = []
+    #: Parsed only once a stub is up for removal — a Generate that removes
+    #: nothing pays nothing for it.
+    others: Optional[List[Tuple[str, Any]]] = None
+    for h, found in spans.items():
+        if h in wanted or len(found) != 1 or h not in nodes:
+            continue
+        if not _is_widget_handler(h):
+            continue
+        a, b = found[0]
+        if recover_stub(h, nodes[h], text_of(a, b)) is None:
+            continue
+        if others is None:
+            others = [(filename, tree)] + _parsed(callers)
+        where = _first_use(h, others, skip=(filename, a, b))
+        if where:
+            plan.kept.append((h, where))
+            continue
+        # The blank line handler_stub writes ABOVE each def goes with it.
+        if a >= 2 and not lines[a - 2].strip():
+            a -= 1
+        removals.append((a, b))
+        plan.removed.append(h)
+
+    plan.source = _spliced(src, edits + [(a, b, "") for a, b in removals])
+    if plan.removed:
+        try:
+            ast.parse(plan.source)
+        except SyntaxError:
+            # Removing the last method left a class with no body. Keep those
+            # stubs rather than write a handlers.py that cannot import.
+            plan.removed = []
+            plan.source = _spliced(src, edits)
+    return plan
+
+
+def _parsed(texts: Optional[Dict[str, str]]) -> List[Tuple[str, Any]]:
+    """[(file name, tree)] for each text that parses. One that does not is
+    skipped: find_orphans reads nothing from it either."""
+    import ast
+    out = []
+    for fname, text in (texts or {}).items():
+        try:
+            out.append((fname, ast.parse(text)))
+        except SyntaxError:
+            continue
+    return out
+
+
+def _first_use(name: str, trees: Sequence[Tuple[str, Any]],
+               skip: Tuple[str, int, int]) -> str:
+    """"app.py:31" — where ``name`` is first used (``self.<name>`` or a bare
+    ``<name>``), or "". Lines ``skip`` = (file, first, last) are the stub's
+    own definition, which does not count as a use of itself."""
+    import ast
+    for fname, tree in trees:
+        for node in ast.walk(tree):
+            if not ((isinstance(node, ast.Attribute) and node.attr == name)
+                    or (isinstance(node, ast.Name) and node.id == name)):
+                continue
+            line = getattr(node, "lineno", 0)
+            if fname == skip[0] and skip[1] <= line <= skip[2]:
+                continue
+            return f"{fname}:{line}"
+    return ""
+
+
+def hand_written_callers(project_path: Any) -> Dict[str, str]:
+    """{"app.py": its text} — the hand-written file besides handlers.py that
+    may call a handler (plan_handlers' ``callers``). {} when there is none."""
+    app = Path(project_path) / "app.py"
+    if not app.is_file():
+        return {}
+    return {"app.py": app.read_text(encoding="utf-8", errors="replace")}
+
+
+def _spliced(src: str, changes: List[Tuple[int, int, str]]) -> str:
+    """``src`` with lines a..b (1-based, inclusive) replaced by each text —
+    "" deletes them. Applied bottom-up so earlier line numbers stay true."""
+    lines = src.splitlines(keepends=True)
+    for a, b, new in sorted(changes, reverse=True):
+        lines[a - 1:b] = [new] if new else []
+    return "".join(lines)
+
+
+def _is_widget_handler(name: str) -> bool:
+    """on_<widget name> — the only handlers regeneration ever wrote. on_close
+    and anything the user named themselves are never candidates."""
+    import gui_projects
+    return name.startswith("on_") and gui_projects._looks_like_widget(name[3:])
+
+
+def _stale_reason(node, script: Dict[str, Any],
+                  before: Optional[Dict[str, Any]]) -> str:
+    """Why an EDITED handler no longer matches its widget's link, or "".
+
+    ONLY WHEN THE LINK CHANGED. ``before`` is the manifest's record of the
+    link this handler was last generated for (designer_project keeps the old
+    record while a handler stays stale, so the warning repeats until the
+    handler follows). When the record equals today's link, nothing in the
+    wireframe moved under the handler, and however it differs from the stub
+    is the user's own doing — a review measured the cost of judging from the
+    code alone: a handler extended with one more `self.ports.x.set(...)` was
+    named on EVERY Generate as "it fills x, but the wireframe now links it
+    to ...", with "delete it to regenerate" as the advice.
+
+    Otherwise it is judged from the handler's CODE, so a handler the user
+    brings back in line stops being reported the moment it matches:
+      * it does not mention the linked function at all — it certainly still
+        does something else;
+      * it calls the function with `self.ports.<p>.get()` arguments that are
+        not the link's inputs, or `self.ports.<p>.set(...)`s ports the link
+        does not fill — the ports moved under it. Only with a record that
+        differs: with NO record (a project built by run_example_gui, or last
+        generated before the record existed) nothing says the ports moved,
+        and an extended handler reads exactly like a stale one;
+      * the link was REMOVED and it still calls the old function — only the
+        record can say it used to be wired, rather than written that way on
+        purpose."""
+    if before is not None and _same_link(before, script):
+        return ""
+    calls = ", ".join(_calls_in(node))
+    if script and script.get("function"):
+        now = link_text(script)
+        func = str(script["function"]).strip()
+        was = calls or (link_text(before) if before else "")
+        if not _mentions(node, func):
+            if was:
+                return (f"it still calls {was}, but the wireframe now links "
+                        f"it to {now}.")
+            return (f"it does not call {now}, which the wireframe now links "
+                    f"it to.")
+        if before is None:
+            return ""
+        moved = _ports_moved(node, func, script)
+        if moved:
+            return (f"{moved}, but the wireframe now links it to "
+                    f"{_link_detail(script)}.")
+        return ""
+    old = str((before or {}).get("function") or "").strip()
+    if old and link_text(before) != link_text({}) and _mentions(node, old):
+        return (f"it still calls {calls or link_text(before)}, but the "
+                f"wireframe no longer links it to anything.")
+    return ""
+
+
+def _ports_moved(node, func: str, script: Dict[str, Any]) -> str:
+    """How an edited handler's port use differs from its link, or "".
+
+    Only what can be read for certain: a call to ``func`` whose arguments are
+    ALL `self.ports.<p>.get()` (anything computed is the user's business),
+    and the ports it `.set()` — with the result key, when it is
+    `result["<key>"]`. Silent when neither can be read."""
+    import ast
+    passed: Optional[List[str]] = None
+    filled: Dict[str, Optional[str]] = {}
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call):
+            continue
+        if (isinstance(child.func, ast.Name) and child.func.id == func
+                and passed is None):
+            ports = [_port_of(arg, "get") for arg in child.args]
+            if all(ports) and not child.keywords:
+                passed = [str(p) for p in ports]
+        port = _port_of(child, "set")
+        if port is not None and port not in filled:
+            arg = child.args[0] if child.args else None
+            filled[port] = (str(arg.slice.value)
+                            if isinstance(arg, ast.Subscript)
+                            and isinstance(arg.slice, ast.Constant) else None)
+    inputs = [str(p) for p in (script.get("inputs") or []) if str(p).strip()]
+    targets = {str(p): str(k) for p, k in
+               dict(script.get("outputs") or {}).items()}
+    if script.get("output"):
+        targets[str(script["output"])] = ""
+    if passed is not None and passed != inputs:
+        return f"it passes ({', '.join(passed)})"
+    if not filled:
+        return ""
+    for port, key in filled.items():
+        if port not in targets:
+            return f"it fills {port}"
+        if key is not None and targets[port] and key != targets[port]:
+            return f"it shows result[{key!r}] in {port}"
+    missing = [p for p in targets if p not in filled]
+    if missing:
+        return f"it never fills {', '.join(missing)}"
+    return ""
+
+
+def _link_detail(script: Dict[str, Any]) -> str:
+    """"frame_camera.start(capture_folder, gain) -> capture_status"."""
+    inputs = ", ".join(str(p) for p in (script.get("inputs") or []))
+    targets = list(dict(script.get("outputs") or {}))
+    if script.get("output"):
+        targets.append(str(script["output"]))
+    return (f"{link_text(script)}({inputs})"
+            + (f" -> {', '.join(targets)}" if targets else ""))
+
+
+def script_links(spec: Spec) -> Dict[str, Dict[str, Any]]:
+    """handler -> the link it is wired to, for the manifest's record.
+
+    Read back by plan_handlers on the next Generate for ONE question the
+    handler's code cannot answer: was this edited handler linked before, now
+    that the wireframe links it to nothing? Everything else is judged from
+    the code itself, so a handler the user brings back in line by hand stops
+    being reported the moment it matches."""
+    return {h: _script_for(spec, h) for h in spec.handlers
+            if _script_for(spec, h)}
 
 
 ON_CLOSE_STUB = '''
@@ -2710,8 +3221,13 @@ if __name__ == "__main__":
 def emit(spec: Spec, project_path: Any, *,
          preserve_regions: Optional[Dict[str, str]] = None,
          aliases: Optional[Dict[str, str]] = None,
-         target: str = DEFAULT_TARGET) -> EmitResult:
+         target: str = DEFAULT_TARGET,
+         previous_links: Optional[Dict[str, Dict[str, Any]]] = None
+         ) -> EmitResult:
     """Write the project. ui/ is overwritten; app.py and handlers.py are not.
+
+    ``previous_links`` is the manifest's record of each handler's link at the
+    last Generate (script_links); see plan_handlers for what it changes.
 
     Sentinel-region bodies are read from the EXISTING ui/ files before anything
     is written, so a region survives even though the file around it is
@@ -2766,22 +3282,22 @@ def emit(spec: Spec, project_path: Any, *,
     handlers = root / "handlers.py"
     if handlers.exists():
         src = handlers.read_text(encoding="utf-8", errors="replace")
-        # MIGRATION, the one exception to append-only: a stub an older
-        # Council wrote and nobody has edited is replaced (upgrade_stubs).
-        new_src, upgraded, silent = upgrade_stubs(src, spec)
-        if upgraded:
-            handlers.write_text(new_src, encoding="utf-8")
-            src = new_src
-            res.handlers_upgraded.extend(upgraded)
-            res.warnings.append(
-                "handlers.py: upgraded " + ", ".join(upgraded) + " — unedited "
-                "stubs from an older version, which left the previous "
-                "results on screen when the call failed")
-        for h in silent:
-            res.warnings.append(
-                f"handlers.py: {h} has been edited, so it was left as it is "
-                f"— it does not call report_error, so if its script fails the "
-                f"window will not say so")
+        # THE ONE EXCEPTION to append-only: a stub exactly as this emitter
+        # wrote it — for an older version, or for the link the widget USED to
+        # have, or for a widget that is gone — is the generator's, not the
+        # user's, and is upgraded, rewired or removed (plan_handlers). An
+        # edited one is left alone and, when it no longer matches its link,
+        # named in a WARNING line with file:line.
+        plan = plan_handlers(src, spec, previous_links,
+                             callers=hand_written_callers(root))
+        if plan.changed:
+            handlers.write_text(plan.source, encoding="utf-8")
+            src = plan.source
+        res.handlers_upgraded.extend(plan.upgraded)
+        res.handlers_rewired.extend(h for h, _was, _now in plan.rewired)
+        res.handlers_removed.extend(plan.removed)
+        res.handlers_stale.extend(plan.stale_names)
+        res.warnings.extend(plan.lines())
         missing = [h for h in spec.handlers if f"def {h}(" not in src]
         if missing:
             # APPEND, never rewrite. Existing bodies are untouched.

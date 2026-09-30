@@ -9,9 +9,10 @@ generate — is 110 lines of pipeline living in a method that needs a display to
 import.
 
 GENERATE IS THE WHOLE STORY
-classify → infer layout → build spec → validate → plan port renames →
-orphan-check → back up → emit → policy-gate → save the manifest. Nine steps,
-four of which can REFUSE, and each refusal has wording that matters:
+classify → infer layout → build spec → validate → plan handlers.py's own stub
+edits → plan port renames → orphan-check → back up → emit → policy-gate →
+save the manifest. Ten steps, four of which can REFUSE, and each refusal has
+wording that matters:
 
     BLOCKED — hand-written code still uses these: ...
 
@@ -19,6 +20,13 @@ is a promise that the user's own app.py will not be broken by a regeneration,
 and it is the only thing standing between "I renamed a button" and a traceback
 in a file the Designer never wrote. That wording is not decoration, so it lives
 here rather than being re-typed per front end.
+
+The promise protects code a PERSON wrote. A handler stub exactly as the
+emitter wrote it is not that, so a stub whose button was rewired is rewritten,
+one whose button was deleted is removed, and an EDITED one whose link changed
+is left alone and named in a WARNING line with its file:line
+(gui_emit.plan_handlers). Those edits are planned before the checks run, so
+the checks judge handlers.py as it will be.
 
 THE RESULT IS LINES PLUS QUESTIONS, NOT A LOG CALLBACK
 The Tk version appends to a list and marshals it back with after(0). Returning
@@ -35,7 +43,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 #: The design area a NEW project gets, which is what the user drags on until
 #: they change it in the window panel. NOT gui_projects' 1280x800 default:
@@ -237,6 +245,28 @@ def open_named(name: str, vault_dir: Any) -> ProjectResult:
                          project=project)
 
 
+def wiring_context(name: str, vault_dir: Any):
+    """(mode, requires, port registry) for the Designer's Wiring group.
+
+    Read once per project open (and again after Generate or a window Apply),
+    NOT per selection: it comes off disk, and a selection refresh that read
+    two files would be the slowest thing the canvas does. Never raises — a
+    project that cannot be read just offers the linked-mode defaults.
+    """
+    import gui_projects
+
+    if not name:
+        return "linked", [], {}
+    try:
+        project = gui_projects.open_project(name, vault_dir=vault_dir)
+        manifest = gui_projects.load_manifest(
+            gui_projects.project_path(name, vault_dir))
+    except Exception:                                    # noqa: BLE001
+        return "linked", [], {}
+    return (manifest.mode or "linked", list(project.requires or []),
+            dict(manifest.port_names or {}))
+
+
 def list_names(vault_dir: Any) -> List[str]:
     import gui_projects
 
@@ -396,19 +426,32 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
         for warning in tree.warnings:
             out.say(f"warning: {warning}")
 
+        new_ports = (spec.port_registry()
+                     if hasattr(spec, "port_registry") else {})
+        old_ports = getattr(manifest, "port_names", {}) or {}
         valid, errors = gui_spec.validate(spec)
         if not valid:
             out.lines.extend(f"cannot generate: {e}" for e in errors)
+            out.lines.extend(_rename_hints(errors, old_ports, new_ports))
             out.blocked = True
             return out
+
+        # handlers.py's OWN edits are planned before any check reads it: an
+        # untouched stub whose link changed is rewritten, one whose widget is
+        # gone is removed (gui_emit.plan_handlers). The checks below then see
+        # the file as it WILL be — the generator's own stub for a deleted
+        # button no longer BLOCKS the generation that deletes it, and a stub
+        # about to be rewritten for a renamed port needs no alias. Nothing is
+        # written until every refusal has had its say.
+        previous_links = dict(getattr(manifest, "script_links", {}) or {})
+        sources, kept_lines = _planned_sources(project_dir, spec,
+                                               previous_links)
 
         # Renames are planned FIRST so an aliased old name is redirected rather
         # than orphaned — otherwise renaming a port and regenerating reports
         # the user's own working code as a dangling reference.
-        new_ports = (spec.port_registry()
-                     if hasattr(spec, "port_registry") else {})
-        plan = gui_projects.plan_ports(
-            project_dir, getattr(manifest, "port_names", {}) or {}, new_ports)
+        plan = gui_projects.plan_ports(project_dir, old_ports, new_ports,
+                                       sources=sources)
         # A sequence link also puts `browse_<index>` on Ports, and path()/
         # count() on it are the natural way to name the frame you are looking
         # at. That attribute is not a PORT, so find_orphans called it dead and
@@ -416,7 +459,8 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
         valid_ports = (set(new_ports.values()) | set(plan.aliases)
                        | spec.sequence_attr_names())
         orphans = gui_projects.find_orphans(project_dir, spec.widget_names,
-                                            new_port_names=valid_ports)
+                                            new_port_names=valid_ports,
+                                            sources=sources)
         if plan.removed or plan.collisions:
             out.say("BLOCKED — port rename cannot proceed:")
             out.lines.extend("  " + o.describe() for o in plan.removed)
@@ -430,6 +474,9 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
         if orphans:
             out.say("BLOCKED — hand-written code still uses these:")
             out.lines.extend("  " + o.describe() for o in orphans)
+            # A stub kept only because hand-written code CALLS it is cited
+            # above by its own def; this names the call the user must change.
+            out.lines.extend("  " + line for line in kept_lines)
             out.blocked = True
             return out
 
@@ -454,7 +501,7 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
             return out
         target = built_as or wanted
         written = gui_emit.emit(spec, project_dir, aliases=plan.aliases,
-                                target=target)
+                                target=target, previous_links=previous_links)
         out.say(f"wrote {len(written.files_written)} file(s); "
                 f"kept {len(written.files_skipped)} hand-written")
         if written.handlers_added:
@@ -477,6 +524,9 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
 
         manifest.widget_names = spec.name_registry()
         manifest.port_names = new_ports
+        manifest.script_links = _recorded_links(
+            gui_emit.script_links(spec), previous_links,
+            written.handlers_stale)
         manifest.ui_checksums = gui_projects.ui_checksums(project_dir)
         # 'Run with' may have changed while this ran; keep it.
         manifest.python = gui_projects.load_manifest(project_dir).python
@@ -486,6 +536,67 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
         return out
     out.ok = True
     return out
+
+
+def _planned_sources(project_dir: Path, spec: Any,
+                     previous_links: Dict[str, Any]
+                     ) -> Tuple[Dict[str, str], List[str]]:
+    """({"handlers.py": its text after this generation's own stub edits},
+    the lines naming stubs kept because hand-written code calls them) — or
+    ({}, []) when there is no handlers.py yet. Pure — writes nothing; emit
+    makes the same plan again and writes it, after every refusal has passed.
+    """
+    import gui_emit
+
+    handlers = project_dir / "handlers.py"
+    if not handlers.is_file():
+        return {}, []
+    src = handlers.read_text(encoding="utf-8", errors="replace")
+    plan = gui_emit.plan_handlers(
+        src, spec, previous_links,
+        callers=gui_emit.hand_written_callers(project_dir))
+    return {"handlers.py": plan.source}, plan.kept_lines()
+
+
+def _recorded_links(links: Dict[str, Any], previous: Dict[str, Any],
+                    stale: Sequence[str]) -> Dict[str, Any]:
+    """The manifest's script_links after a Generate.
+
+    Today's link for every handler — EXCEPT one Generate had to leave stale
+    (edited by hand, and its link changed under it). That one keeps the
+    record of the link it was last generated for, so the next Generate still
+    sees the change and names it again, until the user brings the handler in
+    line or deletes it. Recording today's link instead would have made the
+    WARNING a one-off, and every later Generate a silent "policy: OK" over a
+    handler that still calls the old thing. With no old record there is
+    nothing to keep, and the handler goes unrecorded (judged from its code).
+    """
+    out = dict(links)
+    for name in stale:
+        if name in previous:
+            out[name] = previous[name]
+        else:
+            out.pop(name, None)
+    return out
+
+
+def _rename_hints(errors: Sequence[str], old_ports: Dict[str, str],
+                  new_ports: Dict[str, str]) -> List[str]:
+    """A line for each refusal that names a port this wireframe RENAMED.
+
+    "frame_camera needs a port named 'live_view'" is true and leaves the user
+    to remember what they did. The manifest knows: the shape that had that
+    port still exists, under another name — so say which.
+    """
+    renamed = {old: new_ports[key] for key, old in old_ports.items()
+               if key in new_ports and new_ports[key] != old}
+    hints = []
+    for old, new in sorted(renamed.items()):
+        if any(repr(old) in error for error in errors):
+            hints.append(f"  note: the port {old!r} was renamed to {new!r} "
+                         f"in this wireframe — rename it back, or update "
+                         f"what still asks for {old!r}.")
+    return hints
 
 
 def describe_questions(questions: Sequence[Any]) -> List[str]:

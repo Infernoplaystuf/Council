@@ -9,6 +9,7 @@ and very nearly keeps. Every decision is somewhere else:
     designer_editor   press / drag / release / escape, and the commands
     designer_form     which rows the inspector shows, and what they mean
     designer_geometry the design area's size, the zoom, a shape's box
+    designer_wiring   what a button runs: modules, functions, ports, checks
     designer_project  new / open / save / generate / detach / review
     gui_layout        infers the grid        gui_spec    validates
     gui_emit          writes                 gui_policy  gates
@@ -42,10 +43,12 @@ from typing import Any, Callable, List, Optional, Sequence
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QGroupBox, QHBoxLayout, QLabel, QListWidget,
-                               QPlainTextEdit, QSplitter, QVBoxLayout, QWidget)
+                               QPlainTextEdit, QScrollArea, QSplitter,
+                               QVBoxLayout, QWidget)
 
 from council_core import designer_form as form
 from council_core import designer_geometry as geometry
+from council_core import designer_wiring as wiring
 from council_core import paths
 from council_core import designer_project as dp
 from council_core.wizard import TOOLKITS
@@ -57,6 +60,7 @@ from ..view import ViewHelpers, amp
 from ..widgets.designer_canvas import DesignerCanvas, in_scroll_area
 from ..widgets.inspector import InspectorView
 from ..widgets.runwith import RunWithBox
+from ..widgets.wiring import WiringView
 
 
 class DesignerActions:
@@ -108,6 +112,11 @@ class DesignerActions:
     def open_named(self, name: str):
         return dp.open_named(name, self.vault_dir)
 
+    def wiring_context(self, name: str):
+        """(mode, requires, port registry) — what the Wiring group needs to
+        know about the project that is not on the canvas."""
+        return dp.wiring_context(name, self.vault_dir)
+
     def save(self, name: str, shapes: Sequence[Any]):
         return dp.save(name, shapes, self.vault_dir)
 
@@ -145,6 +154,9 @@ class DesignerTab(ViewHelpers, QWidget):
         self._toolkit: str = ""
         self.questions: List[Any] = []
         self._busy = False
+        #: (mode, requires, port registry) of the open project, for the
+        #: Wiring group. Read when a project is loaded, not per selection.
+        self._wiring_ctx = ("linked", [], {})
         # Supplied by the host. Defaulting to "the user cancelled" rather than
         # to a dialog keeps this file importable, and testable, with no display.
         self.ask_text = ask_text or (lambda *a, **k: None)
@@ -283,8 +295,24 @@ class DesignerTab(ViewHelpers, QWidget):
         layout = QVBoxLayout(box)
         self.inspector = InspectorView()
         self.inspector.applied.connect(self.on_apply_props)
-        layout.addWidget(self.inspector)
+        # A splitter, so the user decides how much of the column each gets:
+        # a wired button's outputs can be four rows deep.
+        column = QSplitter(Qt.Orientation.Vertical)
+        column.addWidget(self.inspector)
+        column.addWidget(self._wiring_box())
+        column.setChildrenCollapsible(False)
+        layout.addWidget(column)
         return box
+
+    def _wiring_box(self) -> QWidget:
+        """What the selected button runs. Its own group — see wiring.py."""
+        self.wiring = WiringView()
+        self.wiring.applied.connect(self.on_apply_wiring)
+        scroller = QScrollArea()
+        scroller.setWidgetResizable(True)
+        scroller.setFrameShape(QScrollArea.NoFrame)
+        scroller.setWidget(self.wiring)
+        return scroller
 
     # ==================================================================
     # The canvas and the inspector
@@ -310,6 +338,7 @@ class DesignerTab(ViewHelpers, QWidget):
         place the window's title, size and colour can be edited at all.
         """
         shapes = self._selected_shapes()
+        self._show_wiring(shapes)
         if not shapes:
             self.inspector.show_fields(self._window_fields(),
                                        empty_text="(no project open)")
@@ -324,6 +353,43 @@ class DesignerTab(ViewHelpers, QWidget):
             fields += form.colour_fields(shapes[0])
         banner = (f"{len(shapes)} shapes selected" if len(shapes) > 1 else "")
         self.inspector.show_fields(fields, banner=banner)
+
+    def _show_wiring(self, shapes: Sequence[Any]) -> None:
+        """The Wiring group for ONE selected widget that can run a link.
+
+        The port list is recomputed here because any edit may have changed
+        it — 0.4 ms on Typhon, measured — while the project's mode, requires
+        and registry come from `_wiring_ctx`, read once per project open.
+        """
+        shape = shapes[0] if len(shapes) == 1 else None
+        if shape is None or not wiring.linkable(shape.kind):
+            self.wiring.show_shape(None)
+            return
+        mode, requires, registry = self._wiring_ctx
+        ports = wiring.project_ports(self.canvas.scene.shapes, registry)
+        self.wiring.show_shape(shape, ports, mode, requires)
+
+    def on_apply_wiring(self, link: dict) -> None:
+        """Store the link on the selected shape — one undoable step.
+
+        Saying what happens NEXT matters here: the link lives in the .gspec,
+        and the handler that calls it is only rewritten when Generate runs.
+        """
+        shapes = self._selected_shapes()
+        if len(shapes) != 1:
+            return
+        outcome = self.canvas.scene.set_script(link)
+        if not outcome.committed:
+            return
+        self.canvas._obey(outcome)
+        what = shapes[0].label or shapes[0].kind
+        if link:
+            self.log(f"wired {what}: {wiring.describe(link)} — Save, then "
+                     f"Generate to rewrite its handler")
+        else:
+            self.log(f"unwired {what} — Generate turns its handler back "
+                     f"into a stub, unless you have edited it")
+        self._refresh_status()
 
     def _window_fields(self) -> List[form.Field]:
         if not self.project:
@@ -349,6 +415,8 @@ class DesignerTab(ViewHelpers, QWidget):
         if self._selected_shapes():
             self.canvas._obey(self.canvas.scene.apply_props(
                 geometry.normalise_box(changes)))
+            if "port" in changes:
+                self._warn_required_ports()
             return
         result = self.actions.apply_window(self.project, changes,
                                            self.canvas.scene.shapes)
@@ -358,7 +426,23 @@ class DesignerTab(ViewHelpers, QWidget):
             # zoom mode the user had: Fit stays Fit on the new size.
             self._set_design(*self._design_size(result.project),
                              reopen=False)
+        # `requires` may have changed, and it widens what a link may import.
+        self._wiring_ctx = self.actions.wiring_context(self.project)
         self._refresh_status()
+
+    def _warn_required_ports(self) -> None:
+        """Say NOW that Generate will refuse, not after the user presses it.
+
+        A linked module that looks a port up by name (frame_camera's
+        live_view) is not named by any link, so renaming that port updates
+        nothing and breaks the app at startup. Generate refuses it; this is
+        the same fact, at the moment the user caused it.
+        """
+        missing = wiring.missing_required(self.canvas.scene.shapes,
+                                          self._wiring_ctx[2])
+        for module, port in missing:
+            self.log(f"note: {module} needs a port named {port!r} — Generate "
+                     f"will refuse until one exists")
 
     # ==================================================================
     # Status and log
@@ -389,7 +473,9 @@ class DesignerTab(ViewHelpers, QWidget):
         """
         self._toolkit = (self.actions.toolkit_label(self.project)
                          if self.project else "")
+        self._wiring_ctx = self.actions.wiring_context(self.project)
         self.canvas.scene.load(shapes)
+        self.canvas.scene.port_registry = dict(self._wiring_ctx[2])
         self._set_design(*self._design_size(project))
         self._show_selection()
         # The interpreter is per PROJECT, so every path that changes which
@@ -552,6 +638,12 @@ class DesignerTab(ViewHelpers, QWidget):
                 self.questions = list(result.questions)
                 for line in dp.describe_questions(self.questions):
                     self.log(line)
+                if result.ok and name == self.project:
+                    # The manifest's port registry was just rewritten, and
+                    # it is what decides whether a later edit is a rename.
+                    self._wiring_ctx = self.actions.wiring_context(name)
+                    self.canvas.scene.port_registry = dict(
+                        self._wiring_ctx[2])
                 self._refresh_status()
 
             self._to_ui(show)

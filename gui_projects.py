@@ -176,6 +176,14 @@ class Manifest:
     # toolkit_of() reads the truth back out of app.py, and Generate refuses on
     # a mismatch rather than writing a project that cannot start.
     toolkit: str = "tk"
+    # handler name -> the script link its widget had at the last Generate.
+    # handlers.py is hand-written territory, so a handler the user EDITED is
+    # never rewritten. When the wireframe then UNLINKS that widget, only this
+    # record can tell "it used to be wired" from "the user wrote a handler
+    # that calls something, on purpose" — and so whether the handler is named
+    # in a WARNING line (gui_emit.plan_handlers). A real field, because
+    # load_manifest drops unknown keys.
+    script_links: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -208,6 +216,9 @@ def load_manifest(pdir: Any) -> Manifest:
         # written before the Qt target is Tk — so the default is the answer,
         # not a guess.
         toolkit=str(raw.get("toolkit") or "tk"),
+        script_links={str(k): dict(v) for k, v in
+                      (raw.get("script_links") or {}).items()
+                      if isinstance(v, dict)},
     )
 
 
@@ -481,7 +492,26 @@ def _is_empty_stub(node) -> bool:
     return True
 
 
-def port_references(pdir: Any) -> List[Tuple[str, str, int]]:
+def _source(d: Path, fname: str,
+            sources: Optional[Dict[str, str]] = None) -> Optional[str]:
+    """A hand-written file's text — as it WILL be, when the caller knows.
+
+    ``sources`` maps a file name to the text this generation is about to
+    give it. Generate plans handlers.py's own edits first (an untouched stub
+    rewired or removed — gui_emit.plan_handlers) and asks every check here
+    about the result: a stub about to be deleted must not block the
+    generation that deletes it, and a port name only an about-to-be-rewritten
+    stub uses needs no alias. None when the file does not exist."""
+    if sources and fname in sources:
+        return sources[fname]
+    f = d / fname
+    if not f.is_file():
+        return None
+    return f.read_text(encoding="utf-8", errors="replace")
+
+
+def port_references(pdir: Any, *, sources: Optional[Dict[str, str]] = None
+                    ) -> List[Tuple[str, str, int]]:
     """(file, port_name, line) for every ``self.ports.<name>`` and
     ``self.ports["<name>"]`` in app.py / handlers.py.
 
@@ -498,11 +528,11 @@ def port_references(pdir: Any) -> List[Tuple[str, str, int]]:
     out: List[Tuple[str, str, int]] = []
     d = Path(pdir)
     for fname in ("app.py", "handlers.py"):
-        f = d / fname
-        if not f.is_file():
+        text = _source(d, fname, sources)
+        if text is None:
             continue
         try:
-            tree = ast.parse(f.read_text(encoding="utf-8", errors="replace"))
+            tree = ast.parse(text)
         except SyntaxError:
             continue
         for node in ast.walk(tree):
@@ -540,7 +570,8 @@ def _string_key(node) -> Optional[str]:
 
 
 def find_orphans(pdir: Any, new_widget_names: Iterable[str], *,
-                 new_port_names: Iterable[str] = ()) -> List[Orphan]:
+                 new_port_names: Iterable[str] = (),
+                 sources: Optional[Dict[str, str]] = None) -> List[Orphan]:
     """Widgets/handlers/ports hand-written code still uses that the new spec
     drops.
 
@@ -550,7 +581,8 @@ def find_orphans(pdir: Any, new_widget_names: Iterable[str], *,
     turns a working app into an AttributeError inside a callback.
 
     ``new_port_names`` is keyword-only so existing single-arg callers keep
-    working; step 7 wires the tab through."""
+    working; step 7 wires the tab through. ``sources`` is the text a file
+    will have once this generation's own handlers.py edits land (_source)."""
     d = Path(pdir)
     names: Set[str] = {str(n) for n in new_widget_names}
     port_names: Set[str] = {str(n) for n in new_port_names}
@@ -559,11 +591,10 @@ def find_orphans(pdir: Any, new_widget_names: Iterable[str], *,
     out: List[Orphan] = []
 
     for fname in ("app.py", "handlers.py"):
-        f = d / fname
-        if not f.is_file():
+        text = _source(d, fname, sources)
+        if text is None:
             continue
-        attrs, handlers = _self_attrs_and_handlers(
-            f.read_text(encoding="utf-8", errors="replace"))
+        attrs, handlers = _self_attrs_and_handlers(text)
         seen: Set[str] = set()
         for attr, line in attrs:
             # Only widget-shaped attributes: a known kind prefix. Without this
@@ -591,7 +622,7 @@ def find_orphans(pdir: Any, new_widget_names: Iterable[str], *,
 
     # Ports live on a different attribute, so they need their own scan.
     seen_ports: Set[str] = set()
-    for fname, pname, line in port_references(d):
+    for fname, pname, line in port_references(d, sources=sources):
         if pname in port_names or pname in seen_ports:
             continue
         seen_ports.add(pname)
@@ -618,7 +649,8 @@ class PortPlan:
 
 
 def plan_ports(pdir: Any, old_registry: Dict[str, str],
-               new_registry: Dict[str, str]) -> PortPlan:
+               new_registry: Dict[str, str], *,
+               sources: Optional[Dict[str, str]] = None) -> PortPlan:
     """Compare the manifest's port_names to the newly built one; decide
     which are renames (alias the old name), which are removed (block), and
     which would collide with a still-live port (block, no silent shadow).
@@ -626,11 +658,16 @@ def plan_ports(pdir: Any, old_registry: Dict[str, str],
     Rename detection is keyed on the shape id (or, for a radio group, the
     ``group:<parent>/<name>`` key gui_spec.port_registry emits) — same key on
     both sides means the port was RENAMED, not deleted-and-re-added, and a
-    stable identity is what makes the alias safe."""
+    stable identity is what makes the alias safe.
+
+    ``sources`` (see _source) is what keeps a rename and its links consistent:
+    an untouched stub that Generate is about to rewrite for the new port name
+    no longer references the old one, so the old name is not aliased on its
+    account — the alias is for hand-written code, which is left alone."""
     plan = PortPlan()
     d = Path(pdir)
     live_new = set(new_registry.values())
-    refs = port_references(d)
+    refs = port_references(d, sources=sources)
     referenced = {pname for _f, pname, _l in refs}
 
     for key, old_name in old_registry.items():

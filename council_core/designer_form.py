@@ -125,8 +125,21 @@ def fields_for(shapes: Sequence[Shape]) -> List[Field]:
 
 
 def schema_fields(shape: Shape) -> List[Field]:
-    """The palette's own declared properties for this widget kind."""
-    schema = (PALETTE.get(shape.kind, {}) or {}).get("prop_schema") or {}
+    """The palette's own declared properties for this widget kind.
+
+    Handler-typed props ("command") are NOT offered. Nothing reads them:
+    gui_spec gives every pressable widget the handler on_<name> whatever the
+    prop says, gui_emit binds that, and gui_describe already drops the prop
+    from a model's output with "generation wires every callback itself". A row
+    that accepts a function name and then does nothing with it is a control
+    that lies — the user types `start`, Generate says OK, and the button still
+    runs its TODO stub. What a button RUNS is set in the Wiring group (a
+    script link), which Generate does honour.
+    """
+    schema = {name: spec for name, spec in
+              ((PALETTE.get(shape.kind, {}) or {}).get("prop_schema")
+               or {}).items()
+              if spec.get("type") != "handler"}
     if not schema:
         return []
     rows: List[Field] = [Field("", f"{shape.kind} properties", TEXT,
@@ -416,5 +429,33 @@ def collect_all(fields: Sequence[Field],
             raw = ""
         ports[row.key] = raw
     if ports:
+        # ONLY the edited rows. The receiver MERGES them into the shape's
+        # existing port (merge_port) — see there for what replacing did.
         changes["port"] = ports
     return changes
+
+
+def merge_port(current: Optional[Dict[str, Any]],
+               edited: Dict[str, Any]) -> Dict[str, Any]:
+    """The shape's port after the Binding rows in ``edited`` are applied.
+
+    MERGED, not replaced. The panel submits only the rows the user touched —
+    that is what makes a multi-selection edit safe — and the receiver used to
+    setattr the result straight onto shape.port. Measured on Typhon's s14:
+    typing only Default "7" turned {"dir": "io", "name": "bad_count"} into
+    {"default": "7"}, so the port lost its name (renamed to a derived one,
+    breaking both script links that name bad_count) and its direction (the
+    generated ports.py then said "i").
+
+    A blank value means UNSET — a derived name, no default — and removes the
+    key rather than storing "". That is the rule the Tk panel's _apply_props
+    has always applied (it is what its [reset] relies on), so a .gspec edited
+    in either shell reads the same.
+    """
+    merged = dict(current or {})
+    for key, value in (edited or {}).items():
+        if value == "" or value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = value
+    return merged
