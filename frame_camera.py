@@ -164,6 +164,13 @@ class _Live:
         #: is dead for the rest of the connection: shown, hidden or
         #: recording, nothing may start it again.
         self.stream_started = False
+        #: What the FPS box last asked for, said in the LIVE line until
+        #: rate_note_until. The box's own reply goes to the same status line,
+        #: and while the camera streams that line is rewritten thirty times a
+        #: second — so the live line has to carry the change itself, or the
+        #: user never sees that the box did anything.
+        self.rate_note = ""
+        self.rate_note_until = 0.0
 
     def clear(self) -> None:
         self.device = None
@@ -180,6 +187,8 @@ class _Live:
         self.idle = ""
         self.idle_reason = ""
         self.stream_started = False
+        self.rate_note = ""
+        self.rate_note_until = 0.0
 
 
 _LIVE = _Live()
@@ -356,6 +365,9 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     EXPOSURE, GAIN AND FRAME RATE of 0 (or blank) leave the camera as it is —
     a spin box always has a number in it. A frame rate of 0 is the camera's
     own default: free-running for a frame camera, 20 ms windows for an EVK4.
+    The FPS box also applies its rate the moment it changes
+    (apply_frame_rate); Start passes it again, so a rate chosen before a
+    camera was connected is not lost.
 
     FROM THE PREVIEW. A frame camera's preview is stopped and the camera
     started again for the capture. An EVK4's stream is left running and the
@@ -580,7 +592,7 @@ def _report(say: Optional[Callable[[str], Any]], frame: Any) -> None:
 def _preview_line(stats: Any, frame: Any) -> str:
     """Said while previewing: that NOTHING is being saved comes first. Short:
     the line is one row, and Connect already said which camera it is."""
-    line = f"Preview — not saving · {stats.rate:.1f} fps"
+    line = f"Preview — not saving · {stats.rate:.1f} fps{_rate_note()}"
     meta = getattr(frame, "meta", None) or {}
     if meta.get("kind") == "event":
         line += f" · {meta.get('events', 0)} events/window"
@@ -1090,6 +1102,12 @@ SCREEN_DROPS = "not drawn (screen only)"
 
 def _status_line(stats: Any, frame: Any) -> str:
     line = stats.line(SCREEN_DROPS)
+    note = _rate_note()
+    if note:
+        # Beside the MEASURED rate, so the two can be compared while the
+        # sliding window catches up with the new one.
+        head, sep, rest = line.partition(" · ")
+        line = f"{head}{note}{sep}{rest}"
     meta = getattr(frame, "meta", None) or {}
     if meta.get("kind") == "event":
         # An event camera has no frame rate. What the number above counts is
@@ -1214,6 +1232,102 @@ def set_frame_rate(value: Any) -> Dict[str, Any]:
     if getattr(getattr(device, "info", None), "kind", "") == "event" and got:
         said += f" ({1000.0 / got:.1f} ms windows)"
     return {"frame_rate": f"{got:.1f}", "summary": f"Frame rate: {said}."}
+
+
+#: How long the live status line says what the FPS box just set. Long enough
+#: for the measured rate beside it (a sliding window, capture.RATE_WINDOW) to
+#: have caught up, so the user sees the new number arrive.
+RATE_NOTE_SECONDS = 4.0
+
+#: A camera rate this far from what was asked for is said to differ — the
+#: camera's limit at this exposure and area, not float noise.
+RATE_TOLERANCE = 0.02
+
+
+def apply_frame_rate(frame_rate: Any = 0) -> Dict[str, Any]:
+    """The FPS box: frames per second, applied to the camera NOW.
+
+    Script-linkable, and meant for the FPS spin box itself, so a change takes
+    effect as it is made — while capturing too — rather than only at the next
+    Start. Start still passes the same box, so a rate set before any camera
+    is connected is not lost.
+
+    0 is the camera's own rate: free-running for a frame camera, 20 ms
+    windows for an EVK4.
+
+    NOT CONNECTED IS NOT AN ERROR HERE. The box can be changed at any time,
+    and an error dialog for every arrow click before Connect would be noise:
+    it says the rate will apply at Start instead. Everything else the camera
+    refuses (no frame-rate control at all) is raised, as set_frame_rate does.
+
+    WHERE THE ANSWER SHOWS. The summary goes to the status line, which the
+    live view rewrites thirty times a second while the camera streams; so
+    the live line itself carries the change for RATE_NOTE_SECONDS, beside the
+    measured rate, and the two never fight over the line. Idle, the summary
+    simply stays.
+
+    MEASURED, not assumed, through this function mid-capture: on the pylon
+    emulator AcquisitionFrameRate stays writable while grabbing
+    (TLParamsLocked = 1), each write took under 0.4 ms, and the delivered
+    rate went 9.9 -> 25.0 -> 10.0 -> 62.5 fps (0 = free-running) with every
+    frame saved; the simulated camera did the same, 10.0 -> 25.0 -> 10.0 ->
+    30.0.
+    """
+    fps = _number(frame_rate if str(frame_rate or "").strip() else 0,
+                  "frame rate")
+    if fps < 0:
+        raise RuntimeError(f"frame rate must be 0 or more, not {fps:g}")
+    wanted = _fps_text(fps)
+    device = _LIVE.device
+    if device is None:
+        return {"frame_rate": f"{fps:.1f}",
+                "summary": f"FPS {wanted} — no camera connected yet; it is "
+                           f"applied when you press Start capture."}
+    try:
+        got = float(device.set_frame_rate(fps))
+    except Exception as exc:                              # noqa: BLE001
+        raise RuntimeError(f"frame rate: {exc}") from exc
+
+    event = getattr(getattr(device, "info", None), "kind", "") == "event"
+    if fps <= 0:
+        # No number: a camera whose cap was just lifted may still report the
+        # old setpoint as its rate (the emulator does), and "own rate (25)"
+        # would be read as a cap that is still there.
+        said = "0 (the camera's own rate)"
+        note = "camera's own rate"
+    else:
+        said = f"{got:.1f}" if got else wanted
+        note = f"set to {said}"
+        if event and got:
+            said += f" ({1000.0 / got:.1f} ms windows)"
+        elif got and abs(got - fps) > RATE_TOLERANCE * fps:
+            said = (f"{wanted} asked — the camera says it will run at "
+                    f"{got:.1f} fps (its limit at this exposure and area)")
+
+    session = _LIVE.session
+    live = session is not None and session.running and (
+        _LIVE.capturing or _LIVE.previewing)
+    _LIVE.rate_note = note
+    _LIVE.rate_note_until = time.monotonic() + RATE_NOTE_SECONDS
+    if _LIVE.capturing:
+        summary = f"FPS now {said}; the capture carries on at the new rate."
+    elif live:
+        summary = f"FPS now {said}."
+    else:
+        summary = f"FPS {said}, set on the camera."
+    return {"frame_rate": f"{got:.1f}", "summary": summary}
+
+
+def _fps_text(fps: float) -> str:
+    """25 -> "25", 12.5 -> "12.5": what the user typed, not "25.0"."""
+    return f"{fps:g}"
+
+
+def _rate_note() -> str:
+    """" (set to 25.0)" for a few seconds after the FPS box changed, else ""."""
+    if not _LIVE.rate_note or time.monotonic() >= _LIVE.rate_note_until:
+        return ""
+    return f" ({_LIVE.rate_note})"
 
 
 # ======================================================================

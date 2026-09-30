@@ -107,16 +107,17 @@ def test_the_setup_button_is_linked_to_the_wizard():
 def test_typhon_is_v5_in_teal_plus_the_capture_review_controls():
     """Typhon began as v5 in #045f80. Since the first EVK4 tests it alone has
     the slider that follows a capture (no generated browser on it), a view
-    line above the picture, Play / Pause, PNG / Raw and Pop out, a frame rate
-    where v3's unwired "Frame count" was, and real exposure and gain ranges.
-    Nothing else moved."""
+    line above the picture, Play / Pause, PNG / Raw and Pop out, an FPS box
+    where v3's unwired "Frame count" was (wired, so it applies as it
+    changes), real exposure and gain ranges, and Settings in the top right
+    corner. Nothing else moved."""
     v5, typhon = gspec("barbie_capture_v5"), gspec("typhon")
     assert typhon["window"]["bg"] == TYPHON_BG
     assert typhon["window"]["fg"] == v5["window"]["fg"]
     assert typhon["window"]["title"] == "Typhon"
     old = {s["id"]: s for s in v5["shapes"]}
     new = {s["id"]: s for s in typhon["shapes"]}
-    assert sorted(set(new) - set(old)) == ["s55", "s56", "s57"]
+    assert sorted(set(new) - set(old)) == ["s55", "s56", "s57", "s58"]
     strip = lambda s: {k: v for k, v in s.items() if k != "label"}
     changed = sorted(k for k in old if strip(old[k]) != strip(new[k]))
     assert changed == ["s04", "s06", "s08", "s09", "s11", "s23", "s46"]
@@ -127,6 +128,69 @@ def test_typhon_is_v5_in_teal_plus_the_capture_review_controls():
     assert new["s57"]["script"]["function"] == "pop_out"
     assert new["s08"]["port"] == {"name": "frame_rate"}
     assert new["s46"]["script"]["inputs"][-1] == "frame_rate"
+    assert new["s58"]["script"]["module"] == "gui_settings"
+
+
+# ======================================================================
+# The FPS box and the Settings button
+# ======================================================================
+def test_the_fps_box_says_fps_not_frame_count():
+    """The user's Typhon still read "Frame count": the box must say FPS."""
+    shapes = {s["id"]: s for s in gspec("typhon")["shapes"]}
+    assert shapes["s07"]["label"].startswith("FPS")
+    assert "count" not in shapes["s07"]["label"].lower()
+
+
+def test_the_fps_box_applies_its_rate_as_it_changes():
+    """It used to take effect only at Start. Wired to apply_frame_rate, it
+    reaches the camera on every committed change; Start still passes it."""
+    shapes = {s["id"]: s for s in gspec("typhon")["shapes"]}
+    link = shapes["s08"]["script"]
+    assert (link["module"], link["function"]) == ("frame_camera",
+                                                  "apply_frame_rate")
+    assert link["inputs"] == ["frame_rate"]
+    assert link["outputs"] == {"capture_status": "summary"}
+    assert "frame_rate" in shapes["s46"]["script"]["inputs"]
+
+
+def test_settings_sits_in_the_top_right_corner_and_overlaps_nothing():
+    """In the free band right of the title, its right edge on the right
+    column's (1480), clear of every other shape."""
+    shapes = {s["id"]: s for s in gspec("typhon")["shapes"]}
+    button = shapes["s58"]
+    assert button["label"].startswith("Settings")
+    assert (button["x"], button["y"], button["w"], button["h"]) == \
+        (1376, 16, 104, 32)
+    right_column = shapes["s24"]
+    assert button["x"] + button["w"] == right_column["x"] + right_column["w"]
+    assert button["y"] + button["h"] <= right_column["y"]
+    title = shapes["s00"]
+    assert button["x"] >= title["x"] + title["w"]
+
+    def overlaps(a, b):
+        return not (a["x"] >= b["x"] + b["w"] or b["x"] >= a["x"] + a["w"]
+                    or a["y"] >= b["y"] + b["h"] or b["y"] >= a["y"] + a["h"])
+    assert [k for k, s in shapes.items()
+            if k != "s58" and overlaps(button, s)] == []
+    assert button["script"] == {"function": "settings_menu", "inputs": [],
+                                "module": "gui_settings", "outputs": {}}
+
+
+def test_settings_is_drawn_in_the_top_right_of_the_generated_window(
+        qapp, typhon_dir, forget_generated):
+    """The layout inference keeps it there: top right, the rest unmoved."""
+    from PySide6.QtWidgets import QPushButton
+    ui = construct(typhon_dir)
+    ui.resize(1504, 1016)
+    ui.grab()
+    button = next(b for b in ui.findChildren(QPushButton)
+                  if b.text().startswith("Settings"))
+    g = button.geometry()
+    assert g.y() < 40 and ui.width() - (g.x() + g.width()) < 40
+    start = next(b for b in ui.findChildren(QPushButton)
+                 if b.text() == "Start capture")
+    assert start.geometry().y() > 900
+    assert hasattr(ui, "on_btn_settings")
 
 
 def test_the_review_controls_fit_beside_the_slider():

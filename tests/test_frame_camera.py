@@ -1140,3 +1140,156 @@ def test_a_capture_starts_the_camera_as_a_recording(tmp_path):
     frame_camera.start(str(tmp_path))
     frame_camera.stop()
     assert device.prepared == [False, True]
+
+
+# ======================================================================
+# The FPS box: the rate applied as it changes, capturing or not
+# ======================================================================
+def delivered(seconds=1.0):
+    """Frames a second the camera actually handed over, counted after the
+    change has had a moment to reach it."""
+    session = frame_camera._LIVE.session
+    time.sleep(0.3)
+    first, began = session.stats().grabbed, time.monotonic()
+    time.sleep(seconds)
+    return (session.stats().grabbed - first) / (time.monotonic() - began)
+
+
+def test_the_fps_box_before_connect_says_start_and_does_not_raise():
+    """An error dialog for every arrow click before Connect would be noise."""
+    out = frame_camera.apply_frame_rate("25")
+    assert "Start capture" in out["summary"]
+    assert "25" in out["summary"]
+    assert frame_camera._LIVE.device is None
+
+
+def test_the_fps_box_sets_an_idle_camera_and_its_answer_stays(tmp_path):
+    connected()
+    out = frame_camera.apply_frame_rate(12)
+    assert frame_camera._LIVE.device._fps == pytest.approx(12.0)
+    assert out["summary"] == "FPS 12.0, set on the camera."
+    said = []
+    for _ in range(5):
+        frame_camera.pump(lambda a: None, said.append)
+    assert said == [], "an idle camera's status line must keep the answer"
+
+
+def test_the_fps_box_changes_the_recording_rate_mid_capture(tmp_path):
+    """The user's request: the box changes how many frames a second the
+    camera records — while it records, not only at the next Start."""
+    connected()
+    frame_camera.set_area("0, 0, 64, 64")
+    frame_camera.start(str(tmp_path), frame_rate=10)
+    try:
+        slow = delivered()
+        out = frame_camera.apply_frame_rate(25)
+        fast = delivered()
+    finally:
+        frame_camera.stop()
+    assert 7.5 <= slow <= 12.5, slow
+    assert 21.0 <= fast <= 29.0, fast
+    assert "capture carries on" in out["summary"]
+    saved = list(tmp_path.glob("*_frame_*.png"))
+    assert len(saved) >= 30, "the frames at the new rate were not saved"
+
+
+def test_while_capturing_the_live_line_carries_the_new_rate(tmp_path):
+    """The box's reply goes to the status line, which the live view rewrites
+    thirty times a second — so the live line itself says what was set,
+    beside the measured rate, until the note expires."""
+    connected()
+    frame_camera.start(str(tmp_path), frame_rate=10)
+    try:
+        frame_camera.apply_frame_rate(20)
+        settle()
+        said = []
+        frame_camera.pump(lambda a: None, said.append)
+        assert said and said[-1].split(" · ")[0].endswith("(set to 20.0)"), said
+        frame_camera._LIVE.rate_note_until = time.monotonic() - 1
+        frame_camera.pump(lambda a: None, said.append)
+        assert "set to" not in said[-1]
+    finally:
+        frame_camera.stop()
+
+
+def test_the_preview_line_carries_the_new_rate_too():
+    connected()
+    ticks(ViewerStub(), seconds=0.2)
+    frame_camera.apply_frame_rate(15)
+    said = []
+    ticks(ViewerStub(), seconds=0.1, said=said)
+    assert any("(set to 15.0)" in s and s.startswith("Preview") for s in said)
+
+
+def test_an_event_cameras_windows_change_while_streaming(tmp_path):
+    connected("event")
+    frame_camera.start(str(tmp_path))
+    try:
+        out = frame_camera.apply_frame_rate(100)
+        assert frame_camera._LIVE.device.accumulate_ms == pytest.approx(10.0)
+        assert "10.0 ms windows" in out["summary"]
+    finally:
+        frame_camera.stop()
+
+
+def test_zero_gives_the_camera_its_own_rate_without_a_stale_number():
+    connected()
+    frame_camera.apply_frame_rate(12)
+    out = frame_camera.apply_frame_rate(0)
+    assert frame_camera._LIVE.device._fps == cameras.SyntheticDevice.FRAME_FPS
+    assert "own rate" in out["summary"] and "12" not in out["summary"]
+
+
+class CappedCamera(cameras.SyntheticDevice):
+    """A camera whose limit at this exposure is 40 fps, as a boA5320 at
+    full frame has one — it takes the request and runs slower."""
+
+    def set_frame_rate(self, fps):
+        return min(float(fps), 40.0) if fps else 30.0
+
+
+class NoRateCamera(cameras.SyntheticDevice):
+    def set_frame_rate(self, fps):
+        raise cameras.CameraError("this camera has no frame-rate control")
+
+
+def connected_as(cls):
+    from council_core import capture
+
+    info = cameras.CameraInfo("simulated", "sim-x", kind="frame")
+    device = cls(info)
+    with frame_camera._LOCK:
+        frame_camera._LIVE.device = device
+        frame_camera._LIVE.info = info
+        frame_camera._LIVE.session = capture.CaptureSession(device)
+    return device
+
+
+def test_a_camera_that_runs_slower_than_asked_says_so():
+    connected_as(CappedCamera)
+    out = frame_camera.apply_frame_rate(100)
+    assert "100 asked" in out["summary"]
+    assert "will run at 40.0 fps" in out["summary"]
+
+
+def test_a_camera_without_a_rate_control_is_a_real_error():
+    connected_as(NoRateCamera)
+    with pytest.raises(RuntimeError, match="frame rate: .*no frame-rate"):
+        frame_camera.apply_frame_rate(25)
+
+
+@pytest.mark.parametrize("bad", ["fast", "-5"])
+def test_a_nonsense_fps_is_refused_readably(bad):
+    connected()
+    with pytest.raises(RuntimeError, match="frame rate"):
+        frame_camera.apply_frame_rate(bad)
+
+
+def test_the_fps_box_function_is_offered_to_the_wiring_editor():
+    """Found by parsing, as the Designer finds it: one input, a summary."""
+    from council_core import designer_wiring as wiring
+
+    fn = wiring.module_info("frame_camera").function("apply_frame_rate")
+    assert fn is not None and fn.params == ("frame_rate",)
+    assert fn.required == 0
+    assert "summary" in fn.result_keys
