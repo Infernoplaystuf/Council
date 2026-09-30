@@ -48,8 +48,13 @@ class OutputRow(QWidget):
     removed = Signal(object)
 
     def __init__(self, ports: Sequence[str], port: str = "", key: str = "",
-                 keys: Sequence[str] = (), parent: Optional[QWidget] = None):
+                 keys: Sequence[str] = (), parent: Optional[QWidget] = None,
+                 whole: bool = False):
         super().__init__(parent)
+        #: This row is a link's older single `output` — the port is set to
+        #: the WHOLE result, not result[key]. Left blank, the key keeps
+        #: meaning that (see WiringView.link).
+        self.whole = False
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
         self.port = QComboBox()
@@ -63,16 +68,19 @@ class OutputRow(QWidget):
         row.addWidget(QLabel("←"))
         row.addWidget(self.key, 2)
         row.addWidget(drop)
-        self.reset(ports, port, key, keys)
+        self.reset(ports, port, key, keys, whole)
         self.port.currentTextChanged.connect(lambda _t: self.changed.emit())
         self.key.editTextChanged.connect(lambda _t: self.changed.emit())
         drop.clicked.connect(lambda: self.removed.emit(self))
 
     def reset(self, ports: Sequence[str], port: str = "", key: str = "",
-              keys: Sequence[str] = ()) -> None:
+              keys: Sequence[str] = (), whole: bool = False) -> None:
         """Show another output in this row. Rows are REUSED across
         selections: building one (an editable combo makes a line edit and a
         completer) cost ~1 ms, which is the whole budget of a refresh."""
+        self.whole = bool(whole)
+        self.key.lineEdit().setPlaceholderText(
+            "(whole result)" if self.whole else "")
         names = list(ports)
         if port and port not in names:
             # A link naming a port that no longer exists still SHOWS it —
@@ -241,7 +249,12 @@ class WiringView(QGroupBox):
             for port, key in link.get("outputs", {}).items():
                 self._add_output(port, key, keys)
             if link.get("output"):
-                self._add_output(link["output"], "", keys)
+                # The older single-output form: the WHOLE result goes to the
+                # port. Shown as a row with a blank key that reads back as
+                # `output` — as an ordinary row it read back as result[""],
+                # which Apply (rightly) refused, so the link could not be
+                # edited at all without changing what it shows.
+                self._add_output(link["output"], "", keys, whole=True)
             self.remove_button.setEnabled(bool(link))
         finally:
             self._loading = False
@@ -358,18 +371,19 @@ class WiringView(QGroupBox):
     # Outputs
     # ==================================================================
     def _add_output(self, port: str = "", key: str = "",
-                    keys: Optional[Sequence[str]] = None) -> None:
+                    keys: Optional[Sequence[str]] = None,
+                    whole: bool = False) -> None:
         names = [p.name for p in self._ports if p.showable]
         port = port if isinstance(port, str) else ""   # clicked(bool)
         keys = self._result_keys() if keys is None else keys
         if self._spare:
             row = self._spare.pop(0)
-            row.reset(names, port, key, keys)
+            row.reset(names, port, key, keys, whole)
             # To the END of the layout, so the order on screen is the order
             # the link writes its outputs in.
             self._outputs.removeWidget(row)
         else:
-            row = OutputRow(names, port, key, keys)
+            row = OutputRow(names, port, key, keys, whole=whole)
             row.changed.connect(self._revalidate)
             row.removed.connect(self._drop_output)
         self._rows.append(row)
@@ -394,19 +408,35 @@ class WiringView(QGroupBox):
     def link(self) -> Dict[str, Any]:
         """The link the controls describe, normalised; {} when empty."""
         outputs: Dict[str, str] = {}
+        whole = ""
         for row in self._rows:
             port, key = row.value()
-            if port:
+            if not port:
+                continue
+            if row.whole and not key:
+                whole = port
+            else:
                 outputs[port] = key
-        return wiring.normalise({
+        raw: Dict[str, Any] = {
             "module": self.module.currentText(),
             "function": self.function.currentText(),
-            "inputs": self.input_names(), "outputs": outputs})
+            "inputs": self.input_names(), "outputs": outputs}
+        if whole:
+            raw["output"] = whole
+        return wiring.normalise(raw)
 
     def current_problems(self) -> List[str]:
-        return wiring.problems(self.link(), self._ports, self._kind,
-                               self._mode, self._requires,
-                               info=self._info(self.module.currentText()))
+        found = wiring.problems(self.link(), self._ports, self._kind,
+                                self._mode, self._requires,
+                                info=self._info(self.module.currentText()))
+        # link() keeps ONE output per port — a dict — so a second row for
+        # the same port would be dropped on Apply without a word. Only the
+        # rows can see it.
+        ports = [row.value()[0] for row in self._rows if row.value()[0]]
+        for port in sorted({p for p in ports if ports.count(p) > 1}):
+            found.append(f"Output {port!r} is on more than one row — a port "
+                         f"shows one result; remove the extra row.")
+        return found
 
     def _revalidate(self) -> None:
         if self._loading:

@@ -2553,6 +2553,9 @@ class HandlerPlan:
     rewired: List[Tuple[str, str, str]] = field(default_factory=list)
     #: Untouched stubs whose widget is gone.
     removed: List[str] = field(default_factory=list)
+    #: (handler, "file:line") — untouched stubs whose widget is gone but that
+    #: hand-written code still CALLS, so they were kept (_first_use).
+    kept: List[Tuple[str, str]] = field(default_factory=list)
     #: Edited handlers that no longer match their link — the WARNING lines,
     #: with file:line — and their names.
     stale: List[str] = field(default_factory=list)
@@ -2579,12 +2582,22 @@ class HandlerPlan:
             out.append(f"{filename}: removed {name} — its widget is gone and "
                        f"it was the untouched generated stub (a copy is in "
                        f".backups)")
+        out.extend(self.kept_lines(filename))
         out.extend(self.stale)
         for name in self.silent:
             out.append(f"{filename}: {name} has been edited, so it was left "
                        f"as it is — it does not call report_error, so if its "
                        f"script fails the window will not say so")
         return out
+
+    def kept_lines(self, filename: str = "handlers.py") -> List[str]:
+        """One line per stub kept because hand-written code calls it. Also
+        shown when Generate BLOCKS on such a stub, so the refusal names the
+        CALL, not just the generator's own def."""
+        return [f"{filename}: kept {name} — its widget is gone, but {where} "
+                f"still calls it. Take that call out, then Generate again "
+                f"to remove the stub."
+                for name, where in self.kept]
 
 
 def link_text(script: Optional[Dict[str, Any]]) -> str:
@@ -2752,7 +2765,8 @@ def _mentions(node, name: str) -> bool:
 
 def plan_handlers(src: str, spec: Spec,
                   previous: Optional[Dict[str, Dict[str, Any]]] = None,
-                  filename: str = "handlers.py") -> HandlerPlan:
+                  filename: str = "handlers.py", *,
+                  callers: Optional[Dict[str, str]] = None) -> HandlerPlan:
     """What regenerating ``spec`` does to this handlers.py. Writes nothing.
 
     For each handler the spec binds that exists exactly once:
@@ -2764,13 +2778,15 @@ def plan_handlers(src: str, spec: Spec,
         file:line, because silently keeping a handler that calls the old
         function is the bug this exists to end
     And for each handler the spec no longer binds (its widget was deleted),
-    an untouched stub is removed; an edited one is left for find_orphans.
+    an untouched stub is removed — unless hand-written code still CALLS it
+    (``self.on_btn_x()`` elsewhere in handlers.py, or in ``callers``: the
+    other hand-written files' text by name, i.e. app.py). Removing one of
+    those turned a working call into an AttributeError with Generate saying
+    OK; kept, it is judged by find_orphans exactly as before this existed.
+    An edited one is left for find_orphans.
 
     ``previous`` is the manifest's record of each handler's link at the last
-    Generate. An edited handler is judged from its own code (_stale_reason);
-    the record answers the one thing code cannot — that a handler calling a
-    function while its widget is linked to nothing used to BE linked, rather
-    than having been written that way on purpose.
+    Generate: it is what says a link CHANGED (_stale_reason).
     """
     import ast
     try:
@@ -2827,6 +2843,9 @@ def plan_handlers(src: str, spec: Spec,
             plan.silent.append(h)
 
     removals: List[Tuple[int, int]] = []
+    #: Parsed only once a stub is up for removal — a Generate that removes
+    #: nothing pays nothing for it.
+    others: Optional[List[Tuple[str, Any]]] = None
     for h, found in spans.items():
         if h in wanted or len(found) != 1 or h not in nodes:
             continue
@@ -2834,6 +2853,12 @@ def plan_handlers(src: str, spec: Spec,
             continue
         a, b = found[0]
         if recover_stub(h, nodes[h], text_of(a, b)) is None:
+            continue
+        if others is None:
+            others = [(filename, tree)] + _parsed(callers)
+        where = _first_use(h, others, skip=(filename, a, b))
+        if where:
+            plan.kept.append((h, where))
             continue
         # The blank line handler_stub writes ABOVE each def goes with it.
         if a >= 2 and not lines[a - 2].strip():
@@ -2851,6 +2876,46 @@ def plan_handlers(src: str, spec: Spec,
             plan.removed = []
             plan.source = _spliced(src, edits)
     return plan
+
+
+def _parsed(texts: Optional[Dict[str, str]]) -> List[Tuple[str, Any]]:
+    """[(file name, tree)] for each text that parses. One that does not is
+    skipped: find_orphans reads nothing from it either."""
+    import ast
+    out = []
+    for fname, text in (texts or {}).items():
+        try:
+            out.append((fname, ast.parse(text)))
+        except SyntaxError:
+            continue
+    return out
+
+
+def _first_use(name: str, trees: Sequence[Tuple[str, Any]],
+               skip: Tuple[str, int, int]) -> str:
+    """"app.py:31" — where ``name`` is first used (``self.<name>`` or a bare
+    ``<name>``), or "". Lines ``skip`` = (file, first, last) are the stub's
+    own definition, which does not count as a use of itself."""
+    import ast
+    for fname, tree in trees:
+        for node in ast.walk(tree):
+            if not ((isinstance(node, ast.Attribute) and node.attr == name)
+                    or (isinstance(node, ast.Name) and node.id == name)):
+                continue
+            line = getattr(node, "lineno", 0)
+            if fname == skip[0] and skip[1] <= line <= skip[2]:
+                continue
+            return f"{fname}:{line}"
+    return ""
+
+
+def hand_written_callers(project_path: Any) -> Dict[str, str]:
+    """{"app.py": its text} — the hand-written file besides handlers.py that
+    may call a handler (plan_handlers' ``callers``). {} when there is none."""
+    app = Path(project_path) / "app.py"
+    if not app.is_file():
+        return {}
+    return {"app.py": app.read_text(encoding="utf-8", errors="replace")}
 
 
 def _spliced(src: str, changes: List[Tuple[int, int, str]]) -> str:
@@ -2873,35 +2938,53 @@ def _stale_reason(node, script: Dict[str, Any],
                   before: Optional[Dict[str, Any]]) -> str:
     """Why an EDITED handler no longer matches its widget's link, or "".
 
-    Judged from the handler's CODE wherever the code can say, so a handler
-    the user brings back in line by hand stops being reported the moment it
-    matches:
+    ONLY WHEN THE LINK CHANGED. ``before`` is the manifest's record of the
+    link this handler was last generated for (designer_project keeps the old
+    record while a handler stays stale, so the warning repeats until the
+    handler follows). When the record equals today's link, nothing in the
+    wireframe moved under the handler, and however it differs from the stub
+    is the user's own doing — a review measured the cost of judging from the
+    code alone: a handler extended with one more `self.ports.x.set(...)` was
+    named on EVERY Generate as "it fills x, but the wireframe now links it
+    to ...", with "delete it to regenerate" as the advice.
+
+    Otherwise it is judged from the handler's CODE, so a handler the user
+    brings back in line stops being reported the moment it matches:
       * it does not mention the linked function at all — it certainly still
         does something else;
       * it calls the function with `self.ports.<p>.get()` arguments that are
         not the link's inputs, or `self.ports.<p>.set(...)`s ports the link
-        does not fill — the ports moved under it.
-    Only "the link was REMOVED" needs the manifest's record (``before``):
-    a handler calling a function with no link might have been written that
-    way on purpose, and only the record says it used to be wired."""
-    was = ", ".join(_calls_in(node)) or (link_text(before) if before else "")
+        does not fill — the ports moved under it. Only with a record that
+        differs: with NO record (a project built by run_example_gui, or last
+        generated before the record existed) nothing says the ports moved,
+        and an extended handler reads exactly like a stale one;
+      * the link was REMOVED and it still calls the old function — only the
+        record can say it used to be wired, rather than written that way on
+        purpose."""
+    if before is not None and _same_link(before, script):
+        return ""
+    calls = ", ".join(_calls_in(node))
     if script and script.get("function"):
         now = link_text(script)
         func = str(script["function"]).strip()
+        was = calls or (link_text(before) if before else "")
         if not _mentions(node, func):
             if was:
                 return (f"it still calls {was}, but the wireframe now links "
                         f"it to {now}.")
             return (f"it does not call {now}, which the wireframe now links "
                     f"it to.")
+        if before is None:
+            return ""
         moved = _ports_moved(node, func, script)
         if moved:
             return (f"{moved}, but the wireframe now links it to "
                     f"{_link_detail(script)}.")
         return ""
-    if before and link_text(before) != link_text({}) and was:
-        return (f"it still calls {was}, but the wireframe no longer links "
-                f"it to anything.")
+    old = str((before or {}).get("function") or "").strip()
+    if old and link_text(before) != link_text({}) and _mentions(node, old):
+        return (f"it still calls {calls or link_text(before)}, but the "
+                f"wireframe no longer links it to anything.")
     return ""
 
 
@@ -3205,7 +3288,8 @@ def emit(spec: Spec, project_path: Any, *,
         # user's, and is upgraded, rewired or removed (plan_handlers). An
         # edited one is left alone and, when it no longer matches its link,
         # named in a WARNING line with file:line.
-        plan = plan_handlers(src, spec, previous_links)
+        plan = plan_handlers(src, spec, previous_links,
+                             callers=hand_written_callers(root))
         if plan.changed:
             handlers.write_text(plan.source, encoding="utf-8")
             src = plan.source

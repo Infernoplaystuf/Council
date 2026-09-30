@@ -602,6 +602,153 @@ def test_the_manifest_records_each_handlers_link(vault):
 
 
 # ============================================================
+# Found in review
+# ============================================================
+
+def _add_a_line_to_the_stub(pdir):
+    """The user extends their handler: one more port set after the call."""
+    handlers = pdir / "handlers.py"
+    src = handlers.read_text(encoding="utf-8")
+    edited = src.replace(
+        '            self.ports.result.set(result["count"])\n',
+        '            self.ports.result.set(result["count"])\n'
+        "            self.ports.folder.set('scanned')\n")
+    assert edited != src
+    handlers.write_text(edited, encoding="utf-8")
+
+
+def test_an_edited_handler_whose_link_never_changed_is_not_named(vault):
+    """REVIEW: a handler the user EXTENDED — one more port set — was named
+    in a WARNING on every Generate ("... it fills folder, but the wireframe
+    now links it to ...") although nobody had touched its link, and the
+    advice was to delete it: the user's own work."""
+    pdir, shapes = scan_project(vault)
+    assert dp.generate("demo", shapes, pdir, vault).ok
+    _add_a_line_to_the_stub(pdir)
+    for _ in range(2):
+        again = dp.generate("demo", shapes, pdir, vault)
+        assert again.ok, again.lines
+        assert not any(l.startswith("WARNING") for l in again.lines), \
+            again.lines
+
+
+def test_with_no_link_record_only_a_missing_call_is_named(vault):
+    """A project built by run_example_gui, or generated before the manifest
+    kept links, has no record — so nothing says the link CHANGED, and an
+    extended handler must not be read as a stale one."""
+    pdir, shapes = scan_project(vault)
+    assert dp.generate("demo", shapes, pdir, vault).ok
+    manifest = gui_projects.load_manifest(pdir)
+    manifest.script_links = {}
+    gui_projects.save_manifest(pdir, manifest)
+    _add_a_line_to_the_stub(pdir)
+    again = dp.generate("demo", shapes, pdir, vault)
+    assert again.ok and not any(l.startswith("WARNING")
+                                for l in again.lines), again.lines
+
+
+def test_a_stale_handler_is_named_until_it_follows_its_link(vault):
+    """The warning repeats while the handler still does the old thing —
+    the record keeps the link it was last generated for, so a second
+    Generate still knows the link changed under it."""
+    pdir, shapes = scan_project(vault)
+    assert dp.generate("demo", shapes, pdir, vault).ok
+    _edit_handler(pdir)
+    by_id(shapes, "b1").script["outputs"] = {"result": "names"}
+    for _ in range(2):
+        again = dp.generate("demo", shapes, pdir, vault)
+        assert any(l.startswith("WARNING") and "on_btn_scan" in l
+                   for l in again.lines), again.lines
+
+
+def test_an_unlinked_edited_handler_is_named_until_it_stops_calling(vault):
+    pdir, shapes = scan_project(vault)
+    assert dp.generate("demo", shapes, pdir, vault).ok
+    handlers = _edit_handler(pdir)
+    by_id(shapes, "b1").script = {}
+    for _ in range(2):
+        again = dp.generate("demo", shapes, pdir, vault)
+        assert any(l.startswith("WARNING") and "no longer links it" in l
+                   for l in again.lines), again.lines
+    # The user takes the call out: nothing is stale any more.
+    src = handlers.read_text(encoding="utf-8")
+    handlers.write_text(src.replace(
+        "            from frame_timing import scan_report\n", "").replace(
+        "            result = scan_report(self.ports.folder.get())\n",
+        "            result = {'count': 0}\n"), encoding="utf-8")
+    again = dp.generate("demo", shapes, pdir, vault)
+    assert again.ok and not any(l.startswith("WARNING")
+                                for l in again.lines), again.lines
+
+
+def _call_the_stub_from_app_py(pdir):
+    with (pdir / "app.py").open("a", encoding="utf-8") as fh:
+        fh.write("\n\ndef scan_again(self):\n    self.on_btn_scan()\n")
+
+
+def test_a_wired_stub_that_app_py_calls_is_not_removed(vault):
+    """REVIEW: app.py calling self.on_btn_scan(); deleting the button
+    removed the untouched stub, Generate said OK, and the call then raised
+    AttributeError in the running app. Hand-written code USES that stub, so
+    today's BLOCKED protection applies — and the log says where the call is.
+    """
+    pdir, shapes = scan_project(vault)
+    assert dp.generate("demo", shapes, pdir, vault).ok
+    _call_the_stub_from_app_py(pdir)
+    again = dp.generate("demo", [s for s in shapes if s.id != "b1"], pdir,
+                        vault)
+    assert again.blocked and not again.ok, again.lines
+    assert handler_text(pdir) is not None
+    assert any("on_btn_scan" in l and "app.py:" in l
+               for l in again.lines), again.lines
+
+
+def test_an_unwired_stub_that_app_py_calls_is_kept(vault):
+    """The TODO stub has nothing in it to break, so Generate goes ahead (as
+    it always did) — but keeps the stub the call needs."""
+    pdir, shapes = scan_project(vault, link={})
+    assert dp.generate("demo", shapes, pdir, vault).ok
+    _call_the_stub_from_app_py(pdir)
+    again = dp.generate("demo", [s for s in shapes if s.id != "b1"], pdir,
+                        vault)
+    assert again.ok, again.lines
+    assert handler_text(pdir) is not None
+    assert any("kept on_btn_scan" in l and "app.py:" in l
+               for l in again.lines), again.lines
+
+
+def test_a_whole_result_beside_keyed_outputs_is_a_problem():
+    """REVIEW: handler_stub fills `outputs` OR the single `output`, never
+    both — with both, the whole-result port was silently never filled. The
+    panel can now show an older link's whole-result row next to new keyed
+    rows, so the mix is refused where it is made."""
+    link = {"module": "frame_camera", "function": "status", "inputs": [],
+            "outputs": {"capture_status": "summary"},
+            "output": "view_status"}
+    ports = wiring.project_ports(typhon_shapes())
+    assert any("whole result" in p for p in wiring.problems(link, ports))
+    del link["outputs"]
+    assert wiring.problems(link, ports) == []
+
+
+def test_a_stub_called_from_elsewhere_in_handlers_py_is_kept():
+    spec = gui_spec.Spec(project="p")
+    stub = gui_emit.handler_stub("on_btn_go").lstrip("\n")
+    src = ("class HandlerMixin:\n" + stub + "\n"
+           "    def on_close(self) -> None:\n"
+           "        self.on_btn_go()\n")
+    plan = gui_emit.plan_handlers(src, spec)
+    assert plan.removed == [] and plan.source == src
+    alone = ("class HandlerMixin:\n" + stub + "\n"
+             "    def on_close(self) -> None:\n"
+             "        pass\n")
+    assert gui_emit.plan_handlers(alone, spec).removed == ["on_btn_go"]
+    kept = gui_emit.plan_handlers(
+        alone, spec, callers={"app.py": "def f(self):\n    self.on_btn_go()\n"})
+    assert kept.removed == [] and kept.source == alone
+
+
+# ============================================================
 # The stub reader itself
 # ============================================================
 

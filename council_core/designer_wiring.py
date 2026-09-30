@@ -450,6 +450,12 @@ def problems(link: Any, ports: Sequence[PortInfo], kind: str = "button",
     targets = list(link["outputs"].items())
     if link.get("output"):
         targets.append((link["output"], "(whole result)"))
+        if link["outputs"]:
+            # gui_emit.handler_stub writes the keyed sets OR the whole-result
+            # set, never both, so the whole-result port would never be filled.
+            out.append(f"Output {link['output']!r} shows the whole result, "
+                       f"and a link can fill either the whole result or "
+                       f"keys of it, not both — give it a key too.")
     for name, key in targets:
         port = by_name.get(name)
         if port is None:

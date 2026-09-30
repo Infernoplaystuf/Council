@@ -43,7 +43,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 #: The canvas the user actually drags on. NOT gui_projects' 1280x800 default:
 #: layout inference measures edge-anchoring against these numbers, so a project
@@ -416,7 +416,8 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
         # about to be rewritten for a renamed port needs no alias. Nothing is
         # written until every refusal has had its say.
         previous_links = dict(getattr(manifest, "script_links", {}) or {})
-        sources = _planned_sources(project_dir, spec, previous_links)
+        sources, kept_lines = _planned_sources(project_dir, spec,
+                                               previous_links)
 
         # Renames are planned FIRST so an aliased old name is redirected rather
         # than orphaned — otherwise renaming a port and regenerating reports
@@ -445,6 +446,9 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
         if orphans:
             out.say("BLOCKED — hand-written code still uses these:")
             out.lines.extend("  " + o.describe() for o in orphans)
+            # A stub kept only because hand-written code CALLS it is cited
+            # above by its own def; this names the call the user must change.
+            out.lines.extend("  " + line for line in kept_lines)
             out.blocked = True
             return out
 
@@ -492,7 +496,9 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
 
         manifest.widget_names = spec.name_registry()
         manifest.port_names = new_ports
-        manifest.script_links = gui_emit.script_links(spec)
+        manifest.script_links = _recorded_links(
+            gui_emit.script_links(spec), previous_links,
+            written.handlers_stale)
         manifest.ui_checksums = gui_projects.ui_checksums(project_dir)
         # 'Run with' may have changed while this ran; keep it.
         manifest.python = gui_projects.load_manifest(project_dir).python
@@ -505,18 +511,45 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
 
 
 def _planned_sources(project_dir: Path, spec: Any,
-                     previous_links: Dict[str, Any]) -> Dict[str, str]:
-    """{"handlers.py": its text after this generation's own stub edits}, or
-    {} when there is no handlers.py yet. Pure — writes nothing; emit makes
-    the same plan again and writes it, after every refusal has passed."""
+                     previous_links: Dict[str, Any]
+                     ) -> Tuple[Dict[str, str], List[str]]:
+    """({"handlers.py": its text after this generation's own stub edits},
+    the lines naming stubs kept because hand-written code calls them) — or
+    ({}, []) when there is no handlers.py yet. Pure — writes nothing; emit
+    makes the same plan again and writes it, after every refusal has passed.
+    """
     import gui_emit
 
     handlers = project_dir / "handlers.py"
     if not handlers.is_file():
-        return {}
+        return {}, []
     src = handlers.read_text(encoding="utf-8", errors="replace")
-    return {"handlers.py": gui_emit.plan_handlers(src, spec,
-                                                  previous_links).source}
+    plan = gui_emit.plan_handlers(
+        src, spec, previous_links,
+        callers=gui_emit.hand_written_callers(project_dir))
+    return {"handlers.py": plan.source}, plan.kept_lines()
+
+
+def _recorded_links(links: Dict[str, Any], previous: Dict[str, Any],
+                    stale: Sequence[str]) -> Dict[str, Any]:
+    """The manifest's script_links after a Generate.
+
+    Today's link for every handler — EXCEPT one Generate had to leave stale
+    (edited by hand, and its link changed under it). That one keeps the
+    record of the link it was last generated for, so the next Generate still
+    sees the change and names it again, until the user brings the handler in
+    line or deletes it. Recording today's link instead would have made the
+    WARNING a one-off, and every later Generate a silent "policy: OK" over a
+    handler that still calls the old thing. With no old record there is
+    nothing to keep, and the handler goes unrecorded (judged from its code).
+    """
+    out = dict(links)
+    for name in stale:
+        if name in previous:
+            out[name] = previous[name]
+        else:
+            out.pop(name, None)
+    return out
 
 
 def _rename_hints(errors: Sequence[str], old_ports: Dict[str, str],

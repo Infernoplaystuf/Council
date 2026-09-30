@@ -187,6 +187,41 @@ def test_rows_are_reused_not_rebuilt_across_selections(tab):
     assert len(first) == 3
 
 
+def test_a_whole_result_output_survives_the_panel(tab):
+    """REVIEW: a link in the older single-output form — "output": port, the
+    WHOLE result — showed as an output row with a blank key, and Apply then
+    refused it ("needs the result key it shows"). The only way to change its
+    function was to change what it shows."""
+    from council_core import designer_wiring as wiring
+    legacy = {"module": "frame_camera", "function": "status", "inputs": [],
+              "output": "view_status"}
+    shape(tab, "s57").script = dict(legacy)
+    select(tab, "s57")
+    assert tab.wiring.current_problems() == []
+    assert tab.wiring.link() == wiring.normalise(legacy)
+    tab.wiring.function.setCurrentText("pop_out")
+    tab.wiring._apply()
+    got = shape(tab, "s57").script
+    assert got["function"] == "pop_out" and got["output"] == "view_status"
+    assert got["outputs"] == {}
+    # A row reused for another button is an ordinary keyed output again.
+    select(tab, "s43")
+    assert tab.wiring.link()["outputs"] == shape(tab, "s43").script["outputs"]
+    assert "output" not in tab.wiring.link()
+
+
+def test_two_rows_for_one_output_port_are_a_problem(tab):
+    """REVIEW: two rows naming the same port read back as ONE output — the
+    first row's key was dropped on Apply with nothing on screen to say so."""
+    select(tab, "s46")
+    tab.wiring._add_output("capture_status", "notes")
+    assert any("more than one row" in p
+               for p in tab.wiring.current_problems())
+    tab.wiring._apply()
+    assert shape(tab, "s46").script["outputs"] == {"capture_status":
+                                                   "summary"}
+
+
 def test_remove_wiring_clears_the_link(tab):
     select(tab, "s57")
     tab.wiring._remove()
