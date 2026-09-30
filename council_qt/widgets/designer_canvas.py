@@ -28,14 +28,15 @@ from __future__ import annotations
 
 from typing import Callable, List, Optional, Sequence
 
-from PySide6.QtCore import QPoint, Qt, Signal
+from PySide6.QtCore import QEvent, QPoint, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
-from PySide6.QtWidgets import QScrollArea, QWidget
+from PySide6.QtWidgets import QScrollArea, QToolTip, QWidget
 
 from council_core import designer_paint as paint
+from council_core import designer_wiring
 from council_core.designer_editor import Outcome, Scene
 from council_core.designer_scene import (GRID_SNAP, HANDLE, THEME,
-                                         containment_map)
+                                         containment_map, shape_at)
 
 from .painter import QtPainter
 
@@ -43,6 +44,9 @@ from .painter import QtPainter
 #: window, because a .gspec's coordinates are absolute — a canvas that resized
 #: would move every shape relative to the design.
 CANVAS_W, CANVAS_H = 1100, 700
+
+#: The wired-widget mark's size in px, before it shrinks to fit a small shape.
+WIRED_MARK = 6
 
 
 class DesignerCanvas(QWidget):
@@ -59,6 +63,9 @@ class DesignerCanvas(QWidget):
         self.scene = scene or Scene()
         self._preview = None
         self._guides: List = []
+        #: Made once: a colour per wired shape per repaint is garbage for
+        #: nothing.
+        self._wired_colour = QColor(THEME["green"])
         self.setFixedSize(CANVAS_W, CANVAS_H)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(False)
@@ -133,6 +140,30 @@ class DesignerCanvas(QWidget):
     def close_label_editor(self) -> None:
         """Overridden by a view that has one. Here so `_obey` can always ask."""
 
+    def tooltip_at(self, x: float, y: float) -> str:
+        """What the widget under the point runs, or "" when it runs nothing.
+
+        The other half of the wired mark: the mark says THAT it is wired,
+        this says to WHAT, without selecting it.
+        """
+        shape = shape_at(self.scene.shapes, x, y)
+        if shape is None or not shape.script:
+            return ""
+        return (f"{shape.label or shape.kind} runs "
+                f"{designer_wiring.describe(shape.script)}")
+
+    def event(self, event) -> bool:
+        if event.type() == QEvent.ToolTip:
+            point = event.pos()
+            text = self.tooltip_at(point.x(), point.y())
+            if text:
+                QToolTip.showText(event.globalPos(), text, self)
+            else:
+                QToolTip.hideText()
+                event.ignore()
+            return True
+        return super().event(event)
+
     # ==================================================================
     # Painting
     # ==================================================================
@@ -177,8 +208,28 @@ class DesignerCanvas(QWidget):
             renderer = paint.RENDERERS.get(shape.kind, paint._render_generic) \
                 if hasattr(paint, "RENDERERS") else paint._render_generic
             renderer(surface, ctx)
+            if shape.script:
+                self._paint_wired(surface.painter, shape)
             if shape.id in self.scene.selection:
                 self._paint_handles(surface, shape)
+
+    def _paint_wired(self, painter: QPainter, shape) -> None:
+        """A small square in the top-right corner: this widget runs a function.
+
+        So a wired button can be told from a stub at a glance — which,
+        before, meant opening the .gspec. ONE fillRect per wired shape and
+        nothing else, because the canvas repaints on every mouse move of a
+        drag. Measured on Typhon's 20 wired buttons: a filled triangle
+        (QPolygon + drawPolygon + pen/brush) cost 1.1 ms a frame; this costs
+        0.15 ms, against ~57 ms for the whole 1100x700 frame. What it runs is
+        in the tooltip and the Wiring group, not drawn — text would need a
+        font metric per shape per frame.
+        """
+        size = min(WIRED_MARK, shape.w // 3, shape.h // 2)
+        if size < 3:
+            return
+        painter.fillRect(shape.x + shape.w - 1 - size, shape.y + 2, size,
+                         size, self._wired_colour)
 
     def _paint_handles(self, surface: QtPainter, shape) -> None:
         colour = THEME["blue"]

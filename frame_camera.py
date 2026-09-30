@@ -98,6 +98,15 @@ from typing import Any, Callable, Dict, List, Optional
 #: thirty frames a second no matter what the sensor does.
 LIVE_MS = 33
 
+#: The ports `attach` looks up BY NAME and cannot run without: the picture
+#: (`view`, through _port_widget) and the status line (`status`, through
+#: _port) — both raise "this app has no ... port". Every other name attach
+#: reads (frame, capture_folder, current_frame, roi, view_status) is optional:
+#: it is fetched with getattr(..., None) and the feature it serves is skipped.
+#: Read by gui_spec with ast, never by importing this module, so Generate
+#: refuses a wireframe that links here and has renamed either of them.
+COUNCIL_REQUIRED_PORTS = ("live_view", "capture_status")
+
 
 class _Live:
     """The one open camera, its grab loop, and where its frames are going.

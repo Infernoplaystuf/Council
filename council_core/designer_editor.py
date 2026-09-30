@@ -77,6 +77,11 @@ class Scene:
         #: Unsaved changes. Set by every commit, cleared by load and
         #: mark_saved — the two moments at which the scene and the file agree.
         self.dirty = False
+        #: The project's manifest port_names (shape id -> port name). Port
+        #: names are registry-first at Generate, so without this a port whose
+        #: name was never typed would look renamed whenever its label changed.
+        #: Set by the view when a project is opened or regenerated.
+        self.port_registry: Dict[str, str] = {}
 
         self._mode: Optional[str] = None
         self._handle: Optional[str] = None
@@ -491,16 +496,62 @@ class Scene:
         to every shape overwrites the labels of all but the one whose label was
         showing. Passing only what changed is the difference between editing a
         selection and flattening it.
+
+        The PORT is merged, not replaced (designer_form.merge_port says what
+        replacing did to Typhon). And a port whose NAME this changes takes
+        every link that names it along, in the same undoable step: a script
+        link's inputs and outputs and a sequence link's roles are port names,
+        so renaming the port alone left each of them pointing at nothing, and
+        the next Generate refused with "names no port" about a widget the
+        user had not touched.
         """
+        from . import designer_wiring
+        from .designer_form import merge_port
+
         selected = self.selected()
         if not selected or not changes:
             return Outcome()
+        # A label (or a radio's group, in props) is what an UNNAMED port is
+        # derived from, so those rename a port too. ~0.4 ms each way on
+        # Typhon's 58 shapes; nothing else in an Apply comes close.
+        names_move = bool({"port", "label", "props"} & set(changes))
+        before = (designer_wiring.port_names_by_key(self.shapes,
+                                                     self.port_registry)
+                  if names_move else {})
         for shape in selected:
             for key, value in changes.items():
                 if key == "props":
                     shape.props.update(copy.deepcopy(value))
+                elif key == "port":
+                    shape.port = merge_port(getattr(shape, "port", None),
+                                            copy.deepcopy(value))
                 elif hasattr(shape, key):
                     setattr(shape, key, value)
+        if before:
+            after = designer_wiring.port_names_by_key(self.shapes,
+                                                      self.port_registry)
+            designer_wiring.rename_ports(
+                self.shapes, designer_wiring.renames_between(before, after))
+        return self.commit()
+
+    def set_script(self, link: Dict[str, Any]) -> Outcome:
+        """Wire the ONE selected shape to a function — or, with {}, unwire it.
+
+        One undoable step that marks the project dirty, like every other edit.
+        Only for a single selection: "what does this run" is an answer about
+        one widget, and applying one link to five buttons would make five
+        handlers call the same function with nothing on screen to say so.
+        """
+        from . import designer_wiring
+
+        selected = self.selected()
+        if len(selected) != 1:
+            return Outcome()
+        shape = selected[0]
+        wanted = designer_wiring.normalise(link)
+        if wanted == designer_wiring.normalise(getattr(shape, "script", None)):
+            return Outcome()
+        shape.script = copy.deepcopy(wanted)
         return self.commit()
 
     #: Whether the rubber-band in progress adds to the selection. Set at the

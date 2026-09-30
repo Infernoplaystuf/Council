@@ -1,0 +1,424 @@
+"""
+council_qt.widgets.wiring — the Designer's Wiring group, in Qt.
+
+What the selected button RUNS: a module, a function in it, the ports whose
+values it is handed, and the ports its result fills. Until this existed the
+only way to set any of that was to edit the .gspec's JSON by hand — the
+Properties panel had no row for it, and the one row that looked like it
+might (a button's "command") was read by nothing.
+
+EVERY DECISION IS IN council_core.designer_wiring. Which modules to offer,
+what functions each one has (read by PARSING its source — frame_camera is
+never imported just to fill a dropdown), which ports can be read or filled,
+what "match parameters" picks and what is wrong with a link are all answered
+there, with no display. This file builds the controls and reads them back.
+
+A GROUP OF ITS OWN, NOT ROWS IN THE INSPECTOR
+The inspector is a flat list of `designer_form.Field` rows, one control each.
+A link is not that shape: an ordered list with move up/down, and a variable
+number of output rows each holding two controls. Forcing it into Field rows
+would have meant new Field kinds that only this group uses, so it sits beside
+the inspector instead — and a change to the inspector's rows (a Geometry
+group, say) never has to touch this file.
+
+NOTHING IS SAVED UNTIL APPLY, AND APPLY REFUSES A LINK THAT CANNOT GENERATE
+The problems are shown as the user edits, in plain words, and Apply with any
+of them on screen does nothing but say so again. A link Generate would refuse
+is not written into the scene, because the next person to find it is the user
+reading Generate's log and working backwards to which button it meant.
+"""
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional, Sequence
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (QComboBox, QGroupBox, QHBoxLayout, QLabel,
+                               QListWidget, QPushButton, QVBoxLayout, QWidget)
+
+from council_core import designer_wiring as wiring
+from council_core.designer_scene import THEME
+
+from ..view import amp
+
+
+class OutputRow(QWidget):
+    """One output: which port shows it, and which key of the result."""
+
+    changed = Signal()
+    removed = Signal(object)
+
+    def __init__(self, ports: Sequence[str], port: str = "", key: str = "",
+                 keys: Sequence[str] = (), parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        self.port = QComboBox()
+        self.key = QComboBox()
+        self.key.setEditable(True)
+        self.key.setToolTip("The key of the dict the function returns")
+        drop = QPushButton("✕")
+        drop.setFixedWidth(28)
+        drop.setToolTip("Remove this output")
+        row.addWidget(self.port, 3)
+        row.addWidget(QLabel("←"))
+        row.addWidget(self.key, 2)
+        row.addWidget(drop)
+        self.reset(ports, port, key, keys)
+        self.port.currentTextChanged.connect(lambda _t: self.changed.emit())
+        self.key.editTextChanged.connect(lambda _t: self.changed.emit())
+        drop.clicked.connect(lambda: self.removed.emit(self))
+
+    def reset(self, ports: Sequence[str], port: str = "", key: str = "",
+              keys: Sequence[str] = ()) -> None:
+        """Show another output in this row. Rows are REUSED across
+        selections: building one (an editable combo makes a line edit and a
+        completer) cost ~1 ms, which is the whole budget of a refresh."""
+        names = list(ports)
+        if port and port not in names:
+            # A link naming a port that no longer exists still SHOWS it —
+            # dropping it silently would be the quietest possible edit, and
+            # the problems line names it so the user can pick another.
+            names.append(port)
+        self.port.blockSignals(True)
+        self.port.clear()
+        self.port.addItems(names)
+        if port:
+            self.port.setCurrentText(port)
+        self.port.blockSignals(False)
+        self.set_keys(keys, key)
+
+    def set_keys(self, keys: Sequence[str], keep: Optional[str] = None) -> None:
+        """Offer ``keys`` as suggestions without losing what is typed."""
+        typed = self.key.currentText() if keep is None else keep
+        self.key.blockSignals(True)
+        self.key.clear()
+        self.key.addItems([k for k in keys if k])
+        self.key.setCurrentText(typed or "")
+        self.key.blockSignals(False)
+
+    def value(self):
+        return self.port.currentText().strip(), self.key.currentText().strip()
+
+
+class WiringView(QGroupBox):
+    """The Wiring group. Shown for one selected widget that can run a link."""
+
+    #: The link to store on the shape — {} means "remove the wiring". Only
+    #: emitted for a link with no problems.
+    applied = Signal(dict)
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__("Wiring", parent)
+        self._kind = "button"
+        self._ports: List[wiring.PortInfo] = []
+        self._mode, self._requires = "linked", []
+        #: Output rows on screen, in link order — and hidden ones kept for
+        #: reuse (see OutputRow.reset).
+        self._rows: List[OutputRow] = []
+        self._spare: List[OutputRow] = []
+        #: module -> ModuleInfo for THIS selection. Each lookup reads the
+        #: module's source to see whether it changed (~1 ms for
+        #: frame_camera); one refresh used to make five of them.
+        self._infos: Dict[str, wiring.ModuleInfo] = {}
+        self._loading = False
+        self._build()
+        self.show_shape(None)
+
+    # ==================================================================
+    # Building
+    # ==================================================================
+    def _build(self) -> None:
+        layout = QVBoxLayout(self)
+        self.summary = QLabel()
+        self.summary.setWordWrap(True)
+        layout.addWidget(self.summary)
+
+        layout.addWidget(QLabel("Module"))
+        self.module = QComboBox()
+        self.module.setEditable(True)
+        layout.addWidget(self.module)
+        layout.addWidget(QLabel("Function"))
+        self.function = QComboBox()
+        self.function.setEditable(True)
+        layout.addWidget(self.function)
+        self.hint = QLabel()
+        self.hint.setWordWrap(True)
+        self.hint.setStyleSheet(f"color: {THEME['subtext']};")
+        layout.addWidget(self.hint)
+
+        layout.addWidget(QLabel("Inputs — passed to it in this order"))
+        self.inputs = QListWidget()
+        self.inputs.setMaximumHeight(96)
+        layout.addWidget(self.inputs)
+        pick = QHBoxLayout()
+        self.input_pick = QComboBox()
+        pick.addWidget(self.input_pick, 1)
+        pick.addWidget(self._small("Add", self._add_input))
+        layout.addLayout(pick)
+        moves = QHBoxLayout()
+        for caption, slot in (("Remove", self._remove_input),
+                              ("Up", lambda: self._move_input(-1)),
+                              ("Down", lambda: self._move_input(1))):
+            moves.addWidget(self._small(caption, slot))
+        self.match_button = self._small("Match parameters",
+                                        self._match_parameters)
+        self.match_button.setToolTip(
+            "Fill the inputs from the function's parameter names")
+        moves.addWidget(self.match_button)
+        layout.addLayout(moves)
+
+        layout.addWidget(QLabel("Outputs — port ← result key"))
+        self._outputs = QVBoxLayout()
+        self._outputs.setContentsMargins(0, 0, 0, 0)
+        layout.addLayout(self._outputs)
+        layout.addWidget(self._small("Add output", self._add_output),
+                         0, Qt.AlignLeft)
+
+        self.problems = QLabel()
+        self.problems.setWordWrap(True)
+        self.problems.setStyleSheet(f"color: {THEME['red']};")
+        layout.addWidget(self.problems)
+        buttons = QHBoxLayout()
+        self.apply_button = self._small("Apply wiring", self._apply)
+        self.remove_button = self._small("Remove wiring", self._remove)
+        buttons.addWidget(self.apply_button)
+        buttons.addWidget(self.remove_button)
+        buttons.addStretch(1)
+        layout.addLayout(buttons)
+
+        self.module.currentTextChanged.connect(self._module_changed)
+        self.function.currentTextChanged.connect(self._function_changed)
+
+    @staticmethod
+    def _small(caption: str, slot) -> QPushButton:
+        button = QPushButton(amp(caption))
+        button.clicked.connect(slot)
+        return button
+
+    # ==================================================================
+    # Showing a shape
+    # ==================================================================
+    def show_shape(self, shape: Any, ports: Sequence[wiring.PortInfo] = (),
+                   mode: str = "linked", requires: Sequence[str] = ()) -> None:
+        """Show ``shape``'s link, or hide the group when it cannot have one.
+
+        ``ports`` is designer_wiring.project_ports for the whole wireframe —
+        computed by the caller, which already has the shapes and the
+        project's port registry.
+        """
+        if shape is None or not wiring.linkable(getattr(shape, "kind", "")):
+            self.setVisible(False)
+            return
+        self.setVisible(True)
+        self._loading = True
+        self._infos = {}
+        try:
+            self._kind = shape.kind
+            self._ports = list(ports)
+            self._mode, self._requires = mode, list(requires or [])
+            link = wiring.normalise(getattr(shape, "script", None))
+            what = shape.label or shape.kind
+            self.summary.setText(
+                f"{what} runs {wiring.describe(link)}" if link else
+                f"{what} is not wired — it runs its handler stub. Pick a "
+                f"function for it to call.")
+
+            self.module.clear()
+            self.module.addItems(wiring.linkable_modules(mode, requires))
+            self.module.setCurrentText(link.get("module", ""))
+            self._fill_functions(link.get("module", ""))
+            self.function.setCurrentText(link.get("function", ""))
+
+            readable = [p.name for p in self._ports if p.readable]
+            self.input_pick.clear()
+            self.input_pick.addItems(readable)
+            self.inputs.clear()
+            self.inputs.addItems(link.get("inputs", []))
+
+            for row in list(self._rows):
+                self._drop_row(row)
+            keys = self._result_keys()
+            for port, key in link.get("outputs", {}).items():
+                self._add_output(port, key, keys)
+            if link.get("output"):
+                self._add_output(link["output"], "", keys)
+            self.remove_button.setEnabled(bool(link))
+        finally:
+            self._loading = False
+        self._describe_function()
+        self._revalidate()
+
+    def _info(self, module: str) -> wiring.ModuleInfo:
+        module = module.strip()
+        if module not in self._infos:
+            self._infos[module] = (wiring.module_info(module) if module
+                                   else wiring.ModuleInfo(""))
+        return self._infos[module]
+
+    # ==================================================================
+    # Module and function
+    # ==================================================================
+    def _fill_functions(self, module: str) -> None:
+        info = self._info(module)
+        typed = self.function.currentText()
+        self.function.blockSignals(True)
+        self.function.clear()
+        self.function.addItems(info.function_names)
+        self.function.setCurrentText(typed)
+        self.function.blockSignals(False)
+
+    def _module_changed(self, text: str) -> None:
+        if self._loading:
+            return
+        self._fill_functions(text.strip())
+        self._describe_function()
+        self._revalidate()
+
+    def _function_changed(self, _text: str) -> None:
+        if self._loading:
+            return
+        self._describe_function()
+        self._revalidate()
+
+    def _function_info(self) -> Optional[wiring.FunctionInfo]:
+        info = self._info(self.module.currentText())
+        return info.function(self.function.currentText().strip()) \
+            if info.found else None
+
+    def _result_keys(self) -> List[str]:
+        fn = self._function_info()
+        return list(fn.result_keys) if fn else []
+
+    def _describe_function(self) -> None:
+        """The hint: the signature, the docstring's first line, and what it
+        returns — so the user sees what the inputs feed and the outputs read."""
+        fn = self._function_info()
+        module = self.module.currentText().strip()
+        if fn is None:
+            info = self._info(module) if module else None
+            self.hint.setText(
+                "" if info is None or info.found or not module else
+                f"{module} is not a Council module, so its functions cannot "
+                f"be listed — type the function name.")
+            self.match_button.setEnabled(False)
+        else:
+            returns = (f"\nReturns: {', '.join(fn.result_keys)}"
+                       if fn.result_keys else "")
+            self.hint.setText(f"{fn.signature()}\n{fn.summary}{returns}")
+            self.match_button.setEnabled(bool(fn.params))
+        keys = self._result_keys()
+        for row in self._rows:
+            row.set_keys(keys)
+
+    # ==================================================================
+    # Inputs
+    # ==================================================================
+    def input_names(self) -> List[str]:
+        return [self.inputs.item(i).text() for i in range(self.inputs.count())]
+
+    def _add_input(self) -> None:
+        name = self.input_pick.currentText().strip()
+        if name:
+            self.inputs.addItem(name)
+            self.inputs.setCurrentRow(self.inputs.count() - 1)
+            self._revalidate()
+
+    def _remove_input(self) -> None:
+        row = self.inputs.currentRow()
+        if row >= 0:
+            self.inputs.takeItem(row)
+            self._revalidate()
+
+    def _move_input(self, step: int) -> None:
+        row = self.inputs.currentRow()
+        target = row + step
+        if row < 0 or not 0 <= target < self.inputs.count():
+            return
+        item = self.inputs.takeItem(row)
+        self.inputs.insertItem(target, item)
+        self.inputs.setCurrentRow(target)
+        self._revalidate()
+
+    def _match_parameters(self) -> None:
+        fn = self._function_info()
+        if fn is None:
+            return
+        wired, unmatched = wiring.match_parameters(
+            fn, [p.name for p in self._ports if p.readable])
+        self.inputs.clear()
+        self.inputs.addItems(wired)
+        self._revalidate()
+        if unmatched:
+            self.problems.setText(
+                self.problems.text() + ("\n" if self.problems.text() else "")
+                + f"No port matches {', '.join(unmatched)} — add "
+                  f"{'it' if len(unmatched) == 1 else 'them'} by hand.")
+
+    # ==================================================================
+    # Outputs
+    # ==================================================================
+    def _add_output(self, port: str = "", key: str = "",
+                    keys: Optional[Sequence[str]] = None) -> None:
+        names = [p.name for p in self._ports if p.showable]
+        port = port if isinstance(port, str) else ""   # clicked(bool)
+        keys = self._result_keys() if keys is None else keys
+        if self._spare:
+            row = self._spare.pop(0)
+            row.reset(names, port, key, keys)
+            # To the END of the layout, so the order on screen is the order
+            # the link writes its outputs in.
+            self._outputs.removeWidget(row)
+        else:
+            row = OutputRow(names, port, key, keys)
+            row.changed.connect(self._revalidate)
+            row.removed.connect(self._drop_output)
+        self._rows.append(row)
+        self._outputs.addWidget(row)
+        row.setVisible(True)
+        if not self._loading:
+            self._revalidate()
+
+    def _drop_output(self, row: OutputRow) -> None:
+        self._drop_row(row)
+        self._revalidate()
+
+    def _drop_row(self, row: OutputRow) -> None:
+        if row in self._rows:
+            self._rows.remove(row)
+        row.setVisible(False)
+        self._spare.append(row)
+
+    # ==================================================================
+    # Reading back
+    # ==================================================================
+    def link(self) -> Dict[str, Any]:
+        """The link the controls describe, normalised; {} when empty."""
+        outputs: Dict[str, str] = {}
+        for row in self._rows:
+            port, key = row.value()
+            if port:
+                outputs[port] = key
+        return wiring.normalise({
+            "module": self.module.currentText(),
+            "function": self.function.currentText(),
+            "inputs": self.input_names(), "outputs": outputs})
+
+    def current_problems(self) -> List[str]:
+        return wiring.problems(self.link(), self._ports, self._kind,
+                               self._mode, self._requires,
+                               info=self._info(self.module.currentText()))
+
+    def _revalidate(self) -> None:
+        if self._loading:
+            return
+        self.problems.setText("\n".join(self.current_problems()))
+
+    def _apply(self) -> None:
+        found = self.current_problems()
+        if found:
+            self.problems.setText("Not applied:\n" + "\n".join(found))
+            return
+        self.applied.emit(self.link())
+
+    def _remove(self) -> None:
+        self.applied.emit({})

@@ -463,16 +463,101 @@ def _bound_names(stmts, out: set, plain: Optional[set] = None) -> bool:
     return True
 
 
+#: The app root, resolved once. resolve() is a filesystem walk on Windows, and
+#: this is asked on every script link at Generate and on every selection of a
+#: wired button in the Designer.
+_HERE = None
+
+
 def _module_file(module: str, root: Any = None):
     """The .py (or package __init__.py) for ``module`` under ``root``
     (default: beside this one), or None."""
+    global _HERE
     from pathlib import Path as _Path
-    base = _Path(root) if root else _Path(__file__).resolve().parent
+    if root:
+        base = _Path(root)
+    else:
+        if _HERE is None:
+            _HERE = _Path(__file__).resolve().parent
+        base = _HERE
     rel = module.replace(".", "/")
     for p in (base / f"{rel}.py", base / rel / "__init__.py"):
         if p.is_file():
             return p
     return None
+
+
+#: path -> (source text, parsed tree). Keyed on the TEXT, not the mtime: a
+#: test (or an editor) can rewrite a file inside one mtime tick, and a stale
+#: tree would then answer for code that is no longer there. Comparing 50 KB of
+#: text is microseconds; parsing frame_camera again is milliseconds, paid on
+#: every Generate and — through the Designer's wiring editor — every time a
+#: wired button is selected.
+_PARSED: Dict[str, Tuple[str, Any]] = {}
+
+
+def parsed_module(module: str, root: Any = None):
+    """The ast.Module for an app-root module, or None (not a file here, or it
+    does not parse). PARSED, never imported: a linked module's top level may
+    reach for a camera SDK, and neither validation nor the Designer should run
+    it to find out what it offers."""
+    import ast as _ast
+    p = _module_file(module, root)
+    if p is None:
+        return None
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    key = str(p)
+    held = _PARSED.get(key)
+    if held is not None and held[0] == text:
+        return held[1]
+    try:
+        tree = _ast.parse(text)
+    except SyntaxError:
+        return None
+    _PARSED[key] = (text, tree)
+    return tree
+
+
+#: The module-level constant a linkable module uses to say which port names it
+#: looks up BY NAME when the app runs — frame_camera.attach finds the picture
+#: as ports.live_view, and an app without one stops at startup. A script link
+#: names its ports explicitly; these are the ones nobody names, so without the
+#: declaration a rename passes Generate and the app dies on launch.
+REQUIRED_PORTS_NAME = "COUNCIL_REQUIRED_PORTS"
+
+
+def required_ports(module: str, root: Any = None) -> Tuple[str, ...]:
+    """The port names ``module`` declares it needs, from REQUIRED_PORTS_NAME.
+
+    Read with ast, never imported. Only a literal tuple/list/set of strings
+    counts: a computed value cannot be known without running the module, and
+    guessing would refuse (or pass) Generate for a reason nobody can see."""
+    tree = parsed_module(module, root)
+    return () if tree is None else required_ports_in(tree)
+
+
+def required_ports_in(tree: Any) -> Tuple[str, ...]:
+    """REQUIRED_PORTS_NAME read from an already-parsed module."""
+    import ast as _ast
+    for node in tree.body:
+        if isinstance(node, _ast.Assign):
+            targets = node.targets
+        elif isinstance(node, _ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+        else:
+            continue
+        if not any(isinstance(t, _ast.Name) and t.id == REQUIRED_PORTS_NAME
+                   for t in targets):
+            continue
+        if not isinstance(node.value, (_ast.Tuple, _ast.List, _ast.Set)):
+            return ()
+        return tuple(e.value for e in node.value.elts
+                     if isinstance(e, _ast.Constant)
+                     and isinstance(e.value, str) and e.value)
+    return ()
 
 
 def _module_names(module: str, root: Any = None):
@@ -481,12 +566,8 @@ def _module_names(module: str, root: Any = None):
     the module is not a file in ``root`` (default: beside this one) — a
     vendor package, which is then not checked."""
     import ast as _ast
-    p = _module_file(module, root)
-    if p is None:
-        return None
-    try:
-        tree = _ast.parse(p.read_text(encoding="utf-8", errors="replace"))
-    except SyntaxError:
+    tree = parsed_module(module, root)
+    if tree is None:
         return None
     out: set = set()
     plain: set = set()
@@ -615,6 +696,44 @@ def script_warnings(spec: "Spec") -> List[str]:
                            f"call fails it keeps showing the previous "
                            f"value (a label or entry can be cleared)")
     return out
+
+
+def linked_modules(spec: Spec) -> List[str]:
+    """Every module a script link in ``spec`` names, sorted, once each."""
+    found = set()
+    for w in spec.widgets:
+        sc = getattr(w, "script", None)
+        if isinstance(sc, dict) and sc:
+            module = str(sc.get("module") or "").strip()
+            if module:
+                found.add(module)
+    return sorted(found)
+
+
+def missing_required_ports(spec: Spec,
+                           port_of: Optional[Dict[str, Any]] = None
+                           ) -> List[str]:
+    """One refusal per port a linked module needs and this spec lacks.
+
+    A REFUSAL, not a warning. Measured before this existed: renaming Typhon's
+    live_view port passed Generate, and the app then stopped at startup with
+    "this app has no 'live_view' port" — frame_camera.attach looks the picture
+    up by that name, and no script link mentions it, so nothing checked it.
+    The module says what it needs (REQUIRED_PORTS_NAME); this holds the
+    wireframe to it."""
+    if port_of is None:
+        port_of = {w.port.name: w for w in spec.widgets if w.port}
+    errs: List[str] = []
+    for module in linked_modules(spec):
+        for need in required_ports(module):
+            if need not in port_of:
+                errs.append(
+                    f"{module} needs a port named {need!r}, and this "
+                    f"wireframe has none. {module} looks that port up by "
+                    f"name when the app starts, so the app would stop there. "
+                    f"Name a port {need!r} again, or remove the {module} "
+                    f"links.")
+    return errs
 
 
 def validate(spec: Spec) -> Tuple[bool, List[str]]:
@@ -806,6 +925,8 @@ def validate(spec: Spec) -> Tuple[bool, List[str]]:
             dups = sorted({v for v in p.choices if p.choices.count(v) > 1})
             errs.append(f"{where}: duplicate radio value(s) {dups} in group "
                         f"{p.group!r} — var.get() would be ambiguous")
+
+    errs.extend(missing_required_ports(spec, port_of))
 
     # ---- structural traps that emit fine and render as NOTHING ----------
     #
