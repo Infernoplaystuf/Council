@@ -135,3 +135,44 @@ def test_recording_sizes_pylons_buffers_from_the_frame_size(device):
         assert device._cam.MaxNumBuffer.GetValue() == want
     finally:
         device.stop()
+
+
+@pytest.fixture
+def changing_camera(device, tmp_path):
+    """The emulator cycling through distinct pictures (a folder of them), so
+    a frame overwritten by a later one is visible."""
+    from PIL import Image
+
+    for k in range(6):
+        Image.fromarray(np.full((64, 64), 20 + 30 * k, np.uint8)).save(
+            tmp_path / f"p{k}.png")
+    cam = device._cam
+    cam.TestImageSelector.SetValue("Off")
+    cam.ImageFileMode.SetValue("On")
+    cam.ImageFilename.SetValue(str(tmp_path))
+    cam.PixelFormat.SetValue("Mono8")
+    return device
+
+
+def test_frames_kept_by_the_app_are_never_overwritten(changing_camera):
+    """Frame arrays are reused (FramePool) — but only once nothing holds
+    them. Keep some frames, read many more, and the kept ones must still
+    hold exactly what they held when they arrived."""
+    dev = changing_camera
+    dev.prepare(True)
+    dev.start()
+    try:
+        kept = []
+        for _ in range(40):
+            frame = dev.read(2000)
+            if frame is None:
+                continue
+            if len(kept) < 5:
+                kept.append((frame, frame.image.copy()))
+        values = {int(f.image[0, 0]) for f, _ in kept}
+        assert len(values) > 1, "the emulator served one picture only"
+        for frame, snapshot in kept:
+            assert np.array_equal(frame.image, snapshot)
+        assert dev._pool.reused > 0, "no array was ever reused"
+    finally:
+        dev.stop()

@@ -25,6 +25,17 @@ with zlib's adler32/crc32 (which release the GIL), and handed to the OS in one
 write. The buffers are kept per thread and reused: allocating 32-64 MB per
 frame was measured to serialise writer threads on Windows.
 
+COMPRESSED ONLY WHEN IT IS CHEAP AND PAYS
+Some frames DO compress well — an EVK4 event picture is mid-grey with sparse
+black and white pixels — and for those deflate is both small and fast:
+measured on 1280x720 windows, zlib level 1 made them 1-11% of raw in 2.6-7.8
+ms, where Pillow took 11-37 ms for 2-20%. On a Basler frame the same call
+costs 360-1120 ms. So `compress="auto"` compresses a ~64 KB sample of the rows
+first (0.3-2.5 ms) and compresses the frame only if the sample shrank to
+COMPRESS_IF_RATIO or less: every EVK4 case measured was <= 0.11, every Basler
+case >= 0.44 (a dark scene's sensor noise still defeats deflate), and the
+sample predicted the whole frame's ratio within 0.03.
+
 WHAT IT TAKES
 2-D uint8 / uint16 (grey), and H x W x 3 or x 4 uint8 / uint16 (RGB / RGBA),
 in any memory layout (crops and views included). Anything else raises
@@ -49,6 +60,11 @@ _SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _ZLIB_HEADER = b"\x78\x01"
 #: PNG colour types by channel count.
 _COLOUR = {1: 0, 3: 2, 4: 6}
+
+#: Compress a frame whose row sample shrinks to this fraction or less.
+COMPRESS_IF_RATIO = 0.25
+#: How much of the frame the sample compresses, in bytes of rows.
+SAMPLE_BYTES = 64 * 1024
 
 _local = threading.local()
 
@@ -90,17 +106,12 @@ def _chunk(tag: bytes, data: bytes) -> bytes:
     return _chunk_head(tag, len(data)) + data + struct.pack(">I", crc)
 
 
-def encode_into(image: np.ndarray) -> memoryview:
-    """The whole PNG file for `image`, in this thread's reusable buffer.
-
-    Valid until this thread encodes again — write it out before that.
-    """
+def _rows(image: np.ndarray) -> Tuple[np.ndarray, Tuple[int, int, int, int]]:
+    """The image as PNG rows, each led by its filter byte (0 = None), in
+    this thread's reusable buffer; and its (h, w, channels, depth bytes)."""
     h, w, channels, depth_bytes = _layout(image)
     row = w * channels * depth_bytes
-    raw_len = h * (row + 1)
-
-    # Rows, each led by its filter byte (0 = None).
-    raw = _buffer("raw", raw_len).reshape(h, row + 1)
+    raw = _buffer("raw", h * (row + 1)).reshape(h, row + 1)
     raw[:, 0] = 0
     if depth_bytes == 1:
         np.copyto(raw[:, 1:].reshape(image.shape), image, casting="no")
@@ -108,15 +119,52 @@ def encode_into(image: np.ndarray) -> memoryview:
         # PNG is big-endian; the cast happens during the copy, not after it.
         np.copyto(raw[:, 1:].view(">u2").reshape(image.shape), image,
                   casting="equiv")
+    return raw, (h, w, channels, depth_bytes)
+
+
+def worth_compressing(raw: np.ndarray) -> bool:
+    """Whether deflate will shrink these rows a lot — decided on a sample of
+    evenly spaced rows, never the whole frame (see the module notes)."""
+    h, width = raw.shape
+    take = max(1, min(h, SAMPLE_BYTES // max(1, width)))
+    sample = np.ascontiguousarray(raw[::max(1, h // take)][:take])
+    return len(zlib.compress(sample, 1)) <= COMPRESS_IF_RATIO * sample.nbytes
+
+
+def _ihdr(h: int, w: int, channels: int, depth_bytes: int) -> bytes:
+    return _chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8 * depth_bytes,
+                                       _COLOUR[channels], 0, 0, 0))
+
+
+def encode_into(image: np.ndarray, compress: Any = "auto") -> memoryview:
+    """The whole PNG file for `image`.
+
+    `compress`: "auto" (the module notes), True or False. A stored file is
+    laid out in this thread's reusable buffer and is valid until this thread
+    encodes again — write it out before that.
+    """
+    raw, (h, w, channels, depth_bytes) = _rows(image)
+    if compress == "auto":
+        compress = worth_compressing(raw)
+    if compress:
+        idat = zlib.compress(raw, 1)                 # releases the GIL
+        return memoryview(_SIGNATURE + _ihdr(h, w, channels, depth_bytes)
+                          + _chunk(b"IDAT", idat) + _chunk(b"IEND", b""))
+    return _stored(raw, h, w, channels, depth_bytes)
+
+
+def _stored(raw: np.ndarray, h: int, w: int, channels: int,
+            depth_bytes: int) -> memoryview:
+    """The file with the rows in stored (uncompressed) deflate blocks."""
     flat = raw.reshape(-1)
+    raw_len = flat.size
 
     full, last = divmod(raw_len, BLOCK)
     blocks = full + (1 if last else 0)
     zlen = len(_ZLIB_HEADER) + raw_len + 5 * blocks + 4
 
-    ihdr = _chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8 * depth_bytes,
-                                       _COLOUR[channels], 0, 0, 0))
-    head = _SIGNATURE + ihdr + _chunk_head(b"IDAT", zlen)
+    head = (_SIGNATURE + _ihdr(h, w, channels, depth_bytes)
+            + _chunk_head(b"IDAT", zlen))
     tail_len = 4 + 12                        # IDAT CRC + IEND chunk
     total = len(head) + zlen + tail_len
     out = _buffer("out", total)
@@ -153,15 +201,15 @@ def encode_into(image: np.ndarray) -> memoryview:
     return memoryview(out)
 
 
-def write_png(image: np.ndarray, path: Any) -> int:
+def write_png(image: np.ndarray, path: Any, compress: Any = "auto") -> int:
     """Write `image` to `path` as a lossless PNG; the number of bytes written.
 
     TypeError for an image this writer does not take (see the module notes),
-    so the caller can fall back to a general encoder. Writes `path` directly:
-    a caller that must never leave a partial file writes to a temporary name
-    and renames.
+    raised BEFORE the file is opened, so the caller can fall back to a
+    general encoder. Writes `path` directly: a caller that must never leave a
+    partial file writes to a temporary name and renames.
     """
-    data = encode_into(image)
+    data = encode_into(image, compress)
     with open(Path(path), "wb", buffering=0) as f:
         written = 0
         while written < len(data):

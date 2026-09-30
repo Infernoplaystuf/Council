@@ -128,10 +128,9 @@ class LatestFrame:
         return frame
 
 
-#: zlib level for saved PNGs. 1, not Pillow's default 6: measured on EVK4
-#: windows (1280x720, busy scattered scene) level 6 managed 14 PNGs a second
-#: on one thread and level 1 managed 61 — and PNG is lossless at every level,
-#: so the pixels are identical; only the file is bigger (about 2x at worst).
+#: zlib level for PNGs Pillow writes — now only the layouts fast_png does not
+#: take. 1, not Pillow's default 6: measured on EVK4 windows level 6 managed
+#: 14 PNGs a second on one thread and level 1 managed 61.
 PNG_COMPRESS_LEVEL = 1
 
 
@@ -141,6 +140,15 @@ def write_image(image: Any, path: Path) -> None:
     PNG, because `frame_roi`, `frame_timing` and `frame_classes` all discover
     frames by IMAGE_SUFFIXES and open them with Pillow. A capture written as
     .npy is invisible to every one of them.
+
+    WRITTEN BY council_core.fast_png, NOT PILLOW. Pillow took 615 ms to write
+    one full-frame boA5320 Mono8 PNG and ~1 s for 16-bit, so eight writers
+    saved 5-12 of the 30 frames a second while the PC sat mostly idle
+    (measured end to end: an 8 s capture took 49 s / 117 s to finish saving).
+    fast_png writes the same standard PNG in 20 / 50 ms — stored when deflate
+    would not pay (camera frames), compressed when it is cheap and does (EVK4
+    pictures: smaller AND faster than Pillow was). Pillow is kept for any
+    layout fast_png refuses, which it does before touching the file.
 
     THE PIXELS ARE WRITTEN AS THE CAMERA PRODUCED THEM. A 12-bit Basler frame
     arrives as uint16 holding 0..4095, and it is saved as a 16-bit PNG holding
@@ -153,18 +161,23 @@ def write_image(image: Any, path: Path) -> None:
     a 12-bit frame reads dark to the classifier. That is a conversion bug in
     the reader, not a reason for the writer to alter the user's pixels.)
     """
+    import numpy as np
+
+    from . import fast_png
+
+    data = np.asarray(image)
+    if data.ndim == 2 and data.dtype not in (np.uint8, np.uint16):
+        data = np.clip(data, 0, 255).astype(np.uint8)
+    try:
+        fast_png.write_png(data, path)
+        return
+    except TypeError:
+        pass                    # a layout it does not take: Pillow below
     from PIL import Image
 
-    import numpy as np
-    data = np.asarray(image)
-    if data.ndim == 2 and data.dtype == np.uint16:
-        # NO mode= argument. Pillow infers "I;16" from the dtype, and passing
-        # the mode explicitly is deprecated for removal in Pillow 13
-        # (2026-10-15) -- which would break capture outright, not warn.
-        Image.fromarray(data).save(str(path), compress_level=PNG_COMPRESS_LEVEL)
-        return
-    if data.ndim == 2 and data.dtype != np.uint8:
-        data = np.clip(data, 0, 255).astype(np.uint8)
+    # NO mode= argument. Pillow infers "I;16" from a uint16 dtype, and passing
+    # the mode explicitly is deprecated for removal in Pillow 13 (2026-10-15)
+    # -- which would break capture outright, not warn.
     Image.fromarray(data).save(str(path), compress_level=PNG_COMPRESS_LEVEL)
 
 
@@ -348,8 +361,9 @@ WRITE_BUDGET_BYTES = _write_budget()
 #: How long stopping a recording waits for queued frames to reach the disk.
 DRAIN_TIMEOUT = 30.0
 
-#: How many frames are encoded at once. PNG encoding releases the GIL, so
-#: threads scale: measured on EVK4 windows, 4 writers were 3.6x one writer.
+#: How many frames are encoded at once. The heavy work (numpy copies, zlib,
+#: the file write) releases the GIL, so threads scale: fast_png encoded 266
+#: Mono8 / 141 16-bit boA5320 frames a second on 8 threads (measured).
 #: Up to 8 — a machine with cores to spare should spend them here rather
 #: than report frames "NOT saved" — leaving one core for the camera and one
 #: for the window.

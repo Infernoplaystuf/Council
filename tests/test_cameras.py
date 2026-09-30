@@ -1232,3 +1232,116 @@ def test_a_format_nothing_can_convert_names_itself():
     device.start()
     with pytest.raises(CameraError, match="YCbCr"):
         device.read(10)
+
+
+# ======================================================================
+# Reused frame arrays (FramePool) and the zero-copy read
+# ======================================================================
+from council_core.cameras import Frame, FramePool
+
+
+def test_a_pool_reuses_an_array_once_nothing_holds_it():
+    pool = FramePool(1 << 20)
+    first = pool.take((4, 4), np.uint16)
+    ident = id(first)
+    del first
+    assert id(pool.take((4, 4), np.uint16)) == ident
+    assert pool.reused == 1 and pool.made == 1
+
+
+def test_a_held_frame_is_never_handed_out_again():
+    """The whole safety argument: anything that still refers to the pixels —
+    a queued Frame, a view, a list — keeps them from being overwritten."""
+    pool = FramePool(1 << 20)
+    held = Frame(pool.take((4, 4), np.uint8))
+    view_of = pool.take((4, 4), np.uint8)[1:3]
+    kept = [pool.take((4, 4), np.uint8)]
+    fresh = pool.take((4, 4), np.uint8)
+    for other in (held.image, view_of.base, kept[0]):
+        assert fresh is not other
+    assert pool.made == 4 and pool.reused == 0
+
+
+def test_a_new_size_starts_over_and_the_limit_is_kept():
+    pool = FramePool(3 * 16)                 # room for three 4x4 uint8 arrays
+    held = [pool.take((4, 4), np.uint8) for _ in range(5)]
+    assert len(pool._arrays) == 3            # the rest were not kept
+    del held
+    pool.take((2, 4), np.uint8)
+    assert pool._arrays[0].shape == (2, 4) and len(pool._arrays) == 1
+    pool.clear()
+    assert pool._arrays == []
+
+
+class ZeroCopyGrab(FakeGrab):
+    """A grab that also offers pypylon's zero-copy view of its buffer."""
+
+    def __init__(self, buffer, pixel_type="pt"):
+        super().__init__(buffer)
+        self._pt = pixel_type
+
+    def GetPixelType(self):
+        return self._pt
+
+    def GetHeight(self):
+        return self._buffer.shape[0]
+
+    def GetWidth(self):
+        return self._buffer.shape[1]
+
+    def GetArrayZeroCopy(self):
+        import contextlib
+
+        return contextlib.nullcontext(self._buffer)
+
+
+def zero_copy_device(buffers, **pylon_attrs):
+    backend, pylon = basler()
+    for name, value in pylon_attrs.items():
+        setattr(pylon, name, value)
+    feed = iter(buffers)
+    pylon.camera.RetrieveResult = lambda t, h: ZeroCopyGrab(next(feed))
+    device = backend.open(backend.discover()[0])
+    device.start()
+    return device
+
+
+def test_frames_are_copied_once_into_reused_arrays():
+    buffers = [np.full((6, 8), v, np.uint8) for v in (10, 20, 30)]
+    device = zero_copy_device(buffers)
+    first = device.read(10).image
+    # The fake overwrites its buffer on Release, as pylon reuses it: the
+    # frame survived that, so it is a copy.
+    assert int(buffers[0][0, 0]) == 99 and int(first[0, 0]) == 10
+    ident = id(first)
+    del first
+    second = device.read(10).image
+    assert id(second) == ident and int(second[0, 0]) == 20   # reused, refilled
+    third = device.read(10).image                            # second still held
+    assert third is not second and int(second[0, 0]) == 20
+    assert int(third[0, 0]) == 30
+
+
+def test_bgr_is_swapped_in_the_same_copy():
+    bgr = np.zeros((2, 2, 3), np.uint8)
+    bgr[..., 0] = 200                                        # blue first
+    device = zero_copy_device([bgr], IsBGR=lambda pt: True)
+    image = device.read(10).image
+    assert image[0, 0].tolist() == [0, 0, 200]
+
+
+def test_a_packed_format_never_takes_the_zero_copy_path():
+    """A packed buffer is bytes, not pixels, and can LOOK like an 8-bit
+    image. grab.Array unpacks it; the pool must not copy it as it is."""
+    packed = np.arange(12, dtype=np.uint8).reshape(2, 6)
+    device = zero_copy_device([packed], IsPacked=lambda pt: True)
+    device.read(10)
+    assert device._pool.made == 0
+
+
+def test_stopping_lets_the_arrays_go():
+    device = zero_copy_device([np.zeros((4, 4), np.uint8)] * 2)
+    device.read(10)
+    assert device._pool._arrays
+    device.stop()
+    assert device._pool._arrays == []

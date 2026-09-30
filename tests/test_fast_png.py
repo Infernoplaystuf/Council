@@ -164,3 +164,44 @@ def test_a_full_boa5320_frame_in_both_depths(tmp_path):
     roundtrip(mono8, tmp_path, "m8.png")
     mono12 = rng.integers(0, 4095, (3040, 5328), endpoint=True).astype(np.uint16)
     roundtrip(mono12, tmp_path, "m12.png")
+
+
+# ======================================================================
+# Compressed only when it is cheap and pays
+# ======================================================================
+def event_picture(w=1280, h=720, fraction=0.02):
+    """An EVK4 window as capture draws it: mid-grey, sparse black/white."""
+    img = np.full((h, w), 128, np.uint8)
+    n = int(w * h * fraction)
+    ys, xs = rng.integers(0, h, n), rng.integers(0, w, n)
+    img[ys, xs] = np.where(rng.random(n) < 0.5, 255, 0).astype(np.uint8)
+    return img
+
+
+def test_an_event_picture_is_compressed_and_reads_back_exactly(tmp_path):
+    img = event_picture()
+    path = roundtrip(img, tmp_path, "evk.png")
+    # Stored would be ~0.92 MB; measured ~11% of raw at 5% events.
+    assert path.stat().st_size < 0.25 * img.nbytes
+
+
+def test_a_noisy_camera_frame_is_stored_not_compressed(tmp_path):
+    """Deflate on sensor noise costs ~40x the time for a few percent."""
+    frame = np.clip(rng.normal(40, 8, (600, 800)), 0, 4095).astype(np.uint16)
+    path = roundtrip(frame, tmp_path, "noisy.png")
+    assert path.stat().st_size > frame.nbytes            # stored: raw + framing
+
+
+@pytest.mark.parametrize("compress", [True, False])
+def test_forced_either_way_is_still_exact(compress, tmp_path):
+    for img in (event_picture(), rng.integers(0, 4095, (97, 131), endpoint=True).astype(np.uint16)):
+        path = tmp_path / f"f{compress}.png"
+        fast_png.write_png(img, path, compress=compress)
+        assert np.array_equal(decode(path.read_bytes()), img)
+        assert np.array_equal(np.asarray(Image.open(path)), img)
+
+
+def test_the_sample_decides_like_the_whole_frame():
+    assert fast_png.worth_compressing(fast_png._rows(event_picture())[0])
+    noisy = np.clip(rng.normal(3, 2, (400, 600)), 0, 255).astype(np.uint8)
+    assert not fast_png.worth_compressing(fast_png._rows(noisy)[0])

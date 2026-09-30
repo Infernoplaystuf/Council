@@ -60,6 +60,7 @@ SetValue as "the camera refused that area", blaming the camera for a typo.
 """
 from __future__ import annotations
 
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -240,6 +241,74 @@ def _numpy() -> Any:
     except ImportError as exc:                              # pragma: no cover
         raise CameraError("numpy is required to handle camera frames") from exc
     return numpy
+
+
+def _holders(arrays: List[Any], i: int) -> int:
+    """References to arrays[i], as sys.getrefcount counts them from here."""
+    return sys.getrefcount(arrays[i])
+
+
+#: What `_holders` says for an array nothing but the pool list holds — found
+#: by asking, not assumed: getrefcount's baseline differs between Python
+#: versions, and the same call path makes the same count.
+_FREE = _holders([object()], 0)
+
+
+class FramePool:
+    """Frame arrays, reused once nothing else holds them.
+
+    WHY. pypylon's grab.Array copies every frame into a NEW array, and a new
+    32 MB array is 32 MB of fresh pages the OS must hand over and zero:
+    measured at boA5320 size, 13.1 ms a Mono12 frame against 3.0 ms copying
+    into an array kept from before — the difference between pulling ~72 and
+    ~200+ frames a second off the camera while the writers are busy.
+
+    SAFE BY CONSTRUCTION. An array is handed out again only when the pool's
+    own list is the ONLY thing referring to it. A frame waiting in the save
+    queue, the mailbox, a view that sliced it, a QImage keeping it as its
+    buffer — each holds a reference, so its pixels are never overwritten
+    underneath it. No release protocol for anyone to forget.
+
+    BOUNDED. At most `limit_bytes` of arrays are kept; frames beyond that
+    (a save queue backed up behind a slow disk) get ordinary new arrays, as
+    before. `clear()` lets them all go — the device does that when it stops,
+    so memory a capture needed is not held by an idle app.
+
+    One thread takes (the grab loop); any thread may drop references.
+    """
+
+    def __init__(self, limit_bytes: int):
+        self.limit = int(limit_bytes)
+        self._arrays: List[Any] = []
+        self._key: Any = None
+        self._next = 0
+        #: How many takes reused an array / needed a new one.
+        self.reused = 0
+        self.made = 0
+
+    def take(self, shape: Sequence[int], dtype: Any) -> Any:
+        """An array of this shape and dtype that nobody else holds."""
+        np = _numpy()
+        key = (tuple(int(n) for n in shape), np.dtype(dtype).str)
+        if key != self._key:
+            # A new size or format: the old arrays go as their holders let go.
+            self._arrays, self._key, self._next = [], key, 0
+        arrays = self._arrays
+        count = len(arrays)
+        for step in range(count):
+            i = (self._next + step) % count
+            if _holders(arrays, i) <= _FREE:
+                self._next = (i + 1) % count
+                self.reused += 1
+                return arrays[i]
+        array = np.empty(key[0], dtype=key[1])
+        self.made += 1
+        if (count + 1) * array.nbytes <= self.limit:
+            arrays.append(array)
+        return array
+
+    def clear(self) -> None:
+        self._arrays, self._key, self._next = [], None, 0
 
 
 # ======================================================================
@@ -450,6 +519,10 @@ class BaslerDevice(Device):
     #: frames on at once, so these only ride out a hiccup; the save queue
     #: (capture.WRITE_BUDGET_BYTES) is the big buffer.
     RECORD_BUFFER_BYTES = 1 << 30
+    #: Frame arrays kept for reuse (FramePool). Enough for a save queue that
+    #: keeps pace with the camera many times over; a queue backed up past it
+    #: behind a slow disk just gets new arrays for the excess.
+    POOL_BYTES = 2 << 30
 
     def __init__(self, info: CameraInfo, camera: Any, pylon: Any):
         self.info = info
@@ -459,6 +532,7 @@ class BaslerDevice(Device):
         self._started = False
         self._recording = False
         self._converters: Dict[Any, Any] = {}
+        self._pool = FramePool(self.POOL_BYTES)
 
     # -- node map helpers ------------------------------------------------
     def _node(self, name: str) -> Any:
@@ -692,6 +766,9 @@ class BaslerDevice(Device):
             self._cam.StopGrabbing()
         except Exception:                                   # noqa: BLE001
             pass
+        # The arrays a capture needed are let go, not held by an idle app;
+        # any still being saved stay alive through their frames.
+        self._pool.clear()
 
     def read(self, timeout_ms: int = 1000) -> Optional[Frame]:
         """One frame, or None if none arrived inside the timeout."""
@@ -735,16 +812,21 @@ class BaslerDevice(Device):
     def _pixels(self, grab: Any) -> Any:
         """The frame as an array the app can show and save losslessly.
 
-        Mono8..Mono16 (packed ones unpacked by pypylon), RGB8 and raw Bayer
-        come straight from grab.Array — NOT copied again: it already owns its
-        pixels (measured; the copy this used to make was 32 MB a frame on a
-        full-frame boA5320). BGR8 is swapped to RGB. Anything pypylon cannot
-        turn into a savable array (BGRA/RGBA, YUV, 10/12-bit colour) goes
-        through pylon's ImageFormatConverter; before, grab.Array raised and
-        ended the capture, or YUV saved as a two-channel non-picture.
+        FIRST, COPIED ONCE INTO A REUSED ARRAY (`_pooled`): the fast path for
+        everything savable as it comes — Mono8..Mono16, RGB8, raw Bayer, and
+        BGR8 swapped to RGB during that same copy.
+
+        Otherwise grab.Array (which also unpacks packed formats), and for
+        anything pypylon cannot turn into a savable array (BGRA/RGBA, YUV,
+        10/12-bit colour) pylon's ImageFormatConverter; before, grab.Array
+        raised and ended the capture, or YUV saved as a two-channel
+        non-picture.
         """
         pylon = self._pylon
         pixel_type = _call(grab, "GetPixelType")
+        pooled = self._pooled(grab, pixel_type)
+        if pooled is not None:
+            return pooled
         array = None
         try:
             array = grab.Array
@@ -763,6 +845,38 @@ class BaslerDevice(Device):
             f"the camera's pixel format ({name}) cannot be saved — choose "
             f"Mono8, Mono12 or RGB8 (the setup wizard's Basler scan lists "
             f"what this camera offers)")
+
+    def _pooled(self, grab: Any, pixel_type: Any) -> Any:
+        """The frame copied out of pylon's buffer into a FramePool array, or
+        None to take the ordinary path.
+
+        GetArrayZeroCopy is a view into pylon's own buffer, valid only until
+        the grab is released — so it is copied, once, into an array nobody
+        else holds (3.0 ms for a 32 MB frame, against grab.Array's 13.1 ms
+        into a new one, measured). Where a zero-copy view is not available
+        (packed formats, older pypylon, fakes) the ordinary path is used.
+        """
+        zero_copy = getattr(grab, "GetArrayZeroCopy", None)
+        if not callable(zero_copy):
+            return None
+        if _ask(self._pylon, "IsPacked", pixel_type):
+            # A packed buffer (Mono12p...) is bytes, not pixels — it can even
+            # look like a valid 8-bit image. grab.Array unpacks it.
+            return None
+        want = (_call(grab, "GetHeight"), _call(grab, "GetWidth"))
+        np = _numpy()
+        try:
+            with zero_copy() as view:
+                if not _savable(view) or (
+                        all(want) and tuple(view.shape[:2]) != want):
+                    return None
+                swap = view.ndim == 3 and bool(_ask(self._pylon, "IsBGR",
+                                                    pixel_type))
+                out = self._pool.take(view.shape, view.dtype)
+                np.copyto(out, view[..., ::-1] if swap else view)
+        except Exception:                                   # noqa: BLE001
+            return None
+        return out
 
     def _convert(self, grab: Any, pixel_type: Any) -> Any:
         pylon = self._pylon
