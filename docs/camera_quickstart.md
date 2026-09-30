@@ -120,6 +120,40 @@ buttons to `frame_camera` is generated with `frame_camera.attach(self)` already
 written in. (A project built from v4 before this change still needs the line;
 adding it to a new one as well is harmless — the second call does nothing.)
 
+### Already have a Typhon? Update it from inside the Council
+
+A project built from an example keeps the example as it was **that day**. A
+Typhon built before the FPS box still says **Frame count**, and has no
+**Settings** button. To bring it up to date without losing your own code:
+
+1. **GUI Designer → Open**, pick your Typhon (`example_typhon` if you used the
+   command above).
+2. **Update from example…**. A project that does not record which example it
+   came from asks — `typhon` is offered first when the name says so.
+3. Read the confirmation and press **Yes**. It says what happens:
+   - the **drawn layout** — every shape, the window settings, the canvas size
+     and the packages it needs — is replaced with the example's current one;
+   - **`handlers.py` and `app.py` are kept.** Generate then rewrites only the
+     handler stubs nobody has edited (Start gains `frame_rate`, the FPS box and
+     Settings get theirs), adds stubs for new widgets, and names — with
+     `handlers.py:<line>` — any handler **you edited** whose link changed, so
+     you can bring it in line yourself;
+   - the old `project.gspec` is copied to `project.gspec.<time>.bak` in the
+     project folder first. Copy it back over `project.gspec` to undo.
+4. The log says what changed in a few lines (shapes added, rewired, relabelled;
+   the port `frame_count` renamed to `frame_rate`) and ends `policy: OK`.
+   **Run** starts the updated app. Unsaved edits on the canvas are saved first,
+   so the backup holds them.
+
+The same from a terminal, deleting nothing (unlike `--force`):
+
+```bash
+python run_example_gui.py typhon --target qt --update --no-run
+```
+
+`--project NAME` updates a project with another name. Measured on the old
+"Frame count" Typhon: the update and its Generate take about 0.3–0.5 s.
+
 ## 4. Run it — the setup wizard
 
 ```bash
@@ -218,7 +252,8 @@ the folder has no frames to look at. Choose a folder that already has frames
 and the picture shows those instead (the camera goes quiet, so it does not
 slow playback down); choose an empty folder again and the preview comes back.
 **Stop capture** during the preview does nothing — there is nothing to stop.
-Exposure and gain are applied when you press **Start capture**.
+Exposure and gain are applied when you press **Start capture**; the **FPS**
+box applies the moment you change it (below).
 
 **An EVK4 streams from the moment the preview first starts until you press
 Disconnect.** Its stream is never stopped and restarted in between: measured
@@ -260,18 +295,73 @@ full-frame boA5320 frame is about 49 MB; no disk saves 150 of those a second
 as PNG, and capping the camera at a rate the disk can take gives a complete
 capture instead of one with gaps.
 
-### Exposure, gain and frame rate
+### Exposure, gain and FPS
 
-Set these before **Start capture**; they are applied when it starts. **0 means
-"leave it as the camera has it"** (a spin box always has a number in it):
+Exposure and gain are applied when **Start capture** starts. **0 means "leave
+it as the camera has it"** (a spin box always has a number in it):
 
 - **Exposure µs** — up to 10 s. Basler only; an event camera has no exposure.
 - **Gain dB** — up to 48. Basler only.
-- **Frame rate fps** — how many pictures a second. On a **Basler** it caps
-  the camera (0 = as fast as it goes). On an **EVK4** it sets how long each
-  picture collects events: 50 fps = 20 ms windows (the default), 200 fps =
-  5 ms, up to 1000 fps = 1 ms. The `.raw` has every event whatever this is,
-  and the raw view uses the same window as the run's PNGs.
+
+**FPS (0 = camera default)** is how many frames a second the camera records,
+and it is applied **the moment you change it** — an arrow click, the mouse
+wheel, or a typed number once you press Enter or leave the box — while
+capturing too, not only at Start. (Start passes it again, so a rate chosen
+before **Connect** is not lost; with no camera connected the status line just
+says it will apply at Start.)
+
+- On a **Basler** it caps the camera: 0 = as fast as it goes. If the camera
+  cannot reach the rate at this exposure and area, the status line says what
+  it will actually run at.
+- On an **EVK4** it sets how long each picture collects events: 50 fps = 20 ms
+  windows (the default), 200 fps = 5 ms, up to 1000 fps = 1 ms. The `.raw` has
+  every event whatever this is, and the raw view uses the same window as the
+  run's PNGs.
+
+While the camera streams, the status line is rewritten thirty times a second,
+so the new rate is shown *in* the live line for a few seconds, beside the
+measured one — `13.2 fps (set to 25.0) · 28 grabbed · …` just after the
+change — and the measured number reaches it within about a second (it is
+averaged over the last second).
+
+Measured mid-capture through the function the box is wired to
+(`frame_camera.apply_frame_rate`), on a 320 x 240 area:
+
+| Camera | Box 10 → 25 → 10 → 0 | Saved |
+|---|---|---|
+| Simulated | 10.0 → 25.0 → 10.0 → 30.0 fps delivered | 188 of 188 |
+| pylon emulator (`PYLON_CAMEMU=1`, `BaslerDevice`) | 9.9 → 25.0 → 10.0 → 62.5 fps delivered (0 = free-running) | 268 of 268 |
+
+On the emulator `AcquisitionFrameRate` stays **writable while grabbing**
+(`TLParamsLocked` = 1), and each change took under 0.4 ms. A real boost
+camera's rate is also limited by exposure and the CoaXPress link — the status
+line reports what the camera says it will reach.
+
+### Settings → Python Scripts
+
+**Settings ▾** (top right) drops a menu; **Python Scripts** opens a window
+listing every Python file the app uses — for debugging, or for a bug report:
+
+- the **Python** running the app (version and path) and the app's folder, at
+  the top;
+- **this app's own files**: `main.py` (starts the app), `app.py` (the window —
+  written once, never regenerated), `handlers.py` (what each button does —
+  yours to edit), `ui/*.py` (the generated layout — rewritten by every
+  Generate, don't edit);
+- the **Council modules it links to** (`frame_camera`, `gui_settings`,
+  `frame_roi`, …) and **the ones those use** (`council_core.cameras`,
+  `council_core.capture`, …), each with what it does and whether it has been
+  loaded yet.
+
+Type in the filter box to narrow it; **Copy all** puts the whole list,
+interpreter first, on the clipboard; Ctrl+C copies selected rows; **Refresh**
+looks again. The window is not modal — it stays open while the app captures.
+The list is read from the files (nothing is imported to describe it) and
+takes about 0.2 s the first time, 20–30 ms after that; the menu warms it up
+while it is open.
+
+Any Designer project can have the same menu: put a button anywhere and, in
+the **Wiring** panel, link it to `gui_settings` → `settings_menu`.
 
 ### Pop out
 
@@ -398,6 +488,8 @@ so a 12-bit frame reads dark *to the classifier*.
 | EVK4: connected, but hardly any events | Expected with a still camera on a still scene: an event camera only reports *change*. Wave a hand in front of it. |
 | EVK4: "Metavision SDK installed" fails | Not installed, or installed for a different Python than the app runs under (3.10–3.12 only). |
 | Camera connects, live view stays blank | Check the AOI — **Full sensor** resets it. |
+| The box under Gain says **Frame count**, or there is no **Settings** button | Your Typhon was built from an older example. **GUI Designer → Open → Update from example…** (see *Already have a Typhon?*). |
+| Which file does what, or which Python is this? | **Settings → Python Scripts**. |
 | `NOT saved (storage too slow)` in the status line | The folder is on a disk (usually a network share) that cannot keep up. Capture to a local folder and copy the run afterwards. |
 | **PNG / Raw** says `Raw opens after Stop` | The `.raw` is still being recorded. Stop the capture first. |
 | **PNG / Raw** says `No raw file for this run` | A Basler run (only event cameras record a `.raw`), or the `.raw` was not copied along with the PNGs. |

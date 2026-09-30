@@ -25,6 +25,13 @@ it refuses to clobber: a project of the same name that already exists is left
 alone unless you pass --force, because that directory may contain app.py and
 handlers.py you have edited by hand — the two files regeneration never
 rewrites, and the two most expensive to lose.
+
+    python run_example_gui.py typhon --target qt --update
+
+gives an EXISTING project the example's current layout instead, keeping its
+app.py and handlers.py (the old project.gspec is backed up beside the new
+one) and generating it — what the GUI Designer's "Update from example…" does.
+Nothing is deleted.
 """
 from __future__ import annotations
 
@@ -91,6 +98,37 @@ def build(name: str, *, project: str = "", force: bool = False,
     return pdir
 
 
+def update(name: str, *, project: str = "", vault_dir=None,
+           python: str = "") -> Path:
+    """Give the EXISTING project ``project`` example ``name``'s current
+    layout, then generate it. Returns its dir. Deletes nothing.
+
+    council_core.designer_examples.update_from_example is the pipeline — the
+    one the Designer's "Update from example…" runs — so the two cannot
+    differ. ``python``, when given, is recorded as a build would record it."""
+    if name not in gx.names():
+        raise SystemExit(f"no such example: {name!r}\n"
+                         f"available: {', '.join(gx.names()) or '(none)'}")
+    project = project or dx.default_project(name)
+    pdir = gpj.project_path(project, vault_dir)
+    if not pdir.exists():
+        raise SystemExit(
+            f"there is no project {project!r} to update at\n  {pdir}\n"
+            f"Build it first (the same command without --update), or name "
+            f"the one to update with --project NAME.")
+    res = dx.update_from_example(project, name, vault_dir)
+    for line in res.lines:
+        print(line)
+    if not res.ok:
+        raise SystemExit(f"{project!r} was not updated and generated — see "
+                         f"above.")
+    if python:
+        man = gpj.load_manifest(pdir)
+        man.python = python
+        gpj.save_manifest(pdir, man)
+    return pdir
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description="Build and run a shipped example GUI.")
@@ -112,6 +150,11 @@ def main(argv=None) -> int:
                     help="the toolkit to generate into: tk (default) or qt "
                          "(PySide6). Recorded in the project's manifest, and "
                          "fixed once app.py exists.")
+    ap.add_argument("--update", action="store_true",
+                    help="give an EXISTING project this example's current "
+                         "layout, keeping its app.py and handlers.py (the "
+                         "old project.gspec is backed up), then generate. "
+                         "Deletes nothing.")
     args = ap.parse_args(argv)
 
     if not args.example:
@@ -133,8 +176,16 @@ def main(argv=None) -> int:
         raise SystemExit(f"--python {args.python!r}: {problem}")
     args.python = spec
 
-    pdir = build(args.example, project=args.project, force=args.force,
-                 python=args.python, target=args.target)
+    if args.update and args.force:
+        raise SystemExit("--update keeps the project and --force replaces "
+                         "it — use one or the other.")
+    if args.update:
+        pdir = update(args.example, project=args.project, python=args.python)
+        # The interpreter the project already records, unless one was given.
+        args.python = gpj.load_manifest(pdir).python
+    else:
+        pdir = build(args.example, project=args.project, force=args.force,
+                     python=args.python, target=args.target)
     entry = pdir / "main.py"
     # The same preflight the designer's Run makes — policy gate (this path
     # used to have none at all), interpreter, self-check.

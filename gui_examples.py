@@ -123,9 +123,13 @@ NOTES: Dict[str, str] = {
         "links frame_camera."
     ),
     "typhon": (
-        "Barbie Capture v5 under another name, in #045f80. Same layout, "
-        "same wiring, same setup wizard; white text on this teal measures "
-        "7.1:1 against the pink's 3.0:1. Generate it for Qt (`--target qt`)."
+        "Barbie Capture v5 under another name, in #045f80, grown into the "
+        "capture tool: a slider that follows the capture, the EVK4's raw "
+        "recording, an FPS box that changes the camera's rate while it "
+        "records, and Settings -> Python Scripts. White text on this teal "
+        "measures 7.1:1 against the pink's 3.0:1. Generate it for Qt "
+        "(`--target qt`); an older Typhon catches up with the Designer's "
+        "Update from example."
     ),
 }
 

@@ -103,7 +103,7 @@
       "h": 24,
       "id": "s03",
       "kind": "label",
-      "label": "Exposure µs (0 = keep)",
+      "label": "Exposure (us)",
       "min_h": 0,
       "min_w": 0,
       "note": "",
@@ -139,8 +139,8 @@
       "props": {
         "command": "",
         "from_": 0,
-        "increment": 100,
-        "to": 10000000
+        "increment": 1,
+        "to": 100
       },
       "resize": "auto",
       "script": {},
@@ -158,7 +158,7 @@
       "h": 24,
       "id": "s05",
       "kind": "label",
-      "label": "Gain dB (0 = keep)",
+      "label": "Gain",
       "min_h": 0,
       "min_w": 0,
       "note": "",
@@ -195,7 +195,7 @@
         "command": "",
         "from_": 0,
         "increment": 1,
-        "to": 48
+        "to": 100
       },
       "resize": "auto",
       "script": {},
@@ -213,7 +213,7 @@
       "h": 24,
       "id": "s07",
       "kind": "label",
-      "label": "FPS (0 = camera default)",
+      "label": "Frame count",
       "min_h": 0,
       "min_w": 0,
       "note": "",
@@ -244,25 +244,16 @@
       "min_w": 0,
       "note": "",
       "port": {
-        "name": "frame_rate"
+        "name": "frame_count"
       },
       "props": {
         "command": "",
         "from_": 0,
         "increment": 1,
-        "to": 1000
+        "to": 100
       },
       "resize": "auto",
-      "script": {
-        "function": "apply_frame_rate",
-        "inputs": [
-          "frame_rate"
-        ],
-        "module": "frame_camera",
-        "outputs": {
-          "capture_status": "summary"
-        }
-      },
+      "script": {},
       "w": 224,
       "x": 24,
       "y": 376,
@@ -350,7 +341,7 @@
       },
       "resize": "auto",
       "script": {},
-      "w": 288,
+      "w": 392,
       "x": 512,
       "y": 568,
       "z": 12
@@ -1389,8 +1380,7 @@
         "inputs": [
           "capture_folder",
           "exposure",
-          "gain",
-          "frame_rate"
+          "gain"
         ],
         "module": "frame_camera",
         "outputs": {
@@ -1641,7 +1631,7 @@
         }
       },
       "w": 96,
-      "x": 808,
+      "x": 912,
       "y": 572,
       "z": 56
     },
@@ -1670,65 +1660,9 @@
         }
       },
       "w": 96,
-      "x": 912,
-      "y": 572,
-      "z": 57
-    },
-    {
-      "bg": "",
-      "drives": {},
-      "fg": "",
-      "font": "",
-      "freeform": false,
-      "h": 32,
-      "id": "s57",
-      "kind": "button",
-      "label": "Pop out",
-      "min_h": 0,
-      "min_w": 0,
-      "note": "",
-      "port": {},
-      "props": {},
-      "resize": "auto",
-      "script": {
-        "function": "pop_out",
-        "inputs": [],
-        "module": "frame_camera",
-        "outputs": {
-          "view_status": "view"
-        }
-      },
-      "w": 96,
       "x": 1016,
       "y": 572,
-      "z": 58
-    },
-    {
-      "bg": "",
-      "drives": {},
-      "fg": "",
-      "font": "",
-      "freeform": false,
-      "h": 32,
-      "id": "s58",
-      "kind": "button",
-      "label": "Settings ▾",
-      "min_h": 0,
-      "min_w": 0,
-      "note": "",
-      "port": {},
-      "props": {},
-      "resize": "auto",
-      "script": {
-        "function": "settings_menu",
-        "inputs": [],
-        "module": "gui_settings",
-        "outputs": {}
-      },
-      "w": 104,
-      "x": 1376,
-      "y": 16,
-      "z": 59
+      "z": 57
     }
   ],
   "window": {

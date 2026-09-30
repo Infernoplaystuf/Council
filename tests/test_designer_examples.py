@@ -291,7 +291,7 @@ def test_export_writes_the_shapes_it_is_given(tmp_path):
     assert raw["shapes"][0]["label"] == "edited on the canvas"
     assert raw["window"]["min_w"] == 1400
     # and the vault's own copy is untouched
-    assert len(gpj.open_project("p", tmp_path).shapes) == 58
+    assert len(gpj.open_project("p", tmp_path).shapes) == 59
 
 
 def test_a_failed_export_leaves_the_old_file_whole(tmp_path, monkeypatch):
@@ -428,7 +428,7 @@ def test_new_from_example_builds_typhon_and_opens_it_as_qt(tab, qapp):
     pdir = build_typhon(qapp, tab)
     assert tab.project == "example_typhon"
     assert "[Qt]" in tab.status.text()
-    assert len(tab.canvas.scene.shapes) == 58
+    assert len(tab.canvas.scene.shapes) == 59
     assert not tab.canvas.scene.dirty
     app = (pdir / "app.py").read_text(encoding="utf-8")
     assert "setMinimumSize(1400, 820)" in app
@@ -555,7 +555,7 @@ def test_export_of_unchanged_typhon_reproduces_the_example(tab, qapp,
     tab.script["save"].append(str(dest))
     tab.on_export()
     assert dest.read_bytes() == (EXAMPLES / "typhon.gspec").read_bytes()
-    assert "exported example_typhon (58 shape(s))" in log_text(tab)
+    assert "exported example_typhon (59 shape(s))" in log_text(tab)
 
 
 def test_export_over_a_file_asks_and_no_writes_nothing(tab, qapp, tmp_path):

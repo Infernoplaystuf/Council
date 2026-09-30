@@ -44,6 +44,11 @@ here. It never replaces a project: a taken name is refused. "Export .gspec…"
 writes the open design to a file the user picks, in the examples' own format,
 asking before it replaces one. Both dialogs come from the host too
 (`ask_example` / `ask_save_path`), for the same reasons.
+
+"Update from example…" gives an EXISTING project its example's current layout
+(a Typhon built before the FPS box and the Settings menu), after a confirm
+that says handlers.py and app.py are kept; the old project.gspec is backed
+up beside the new one, and Generate runs on a worker as usual.
 """
 from __future__ import annotations
 
@@ -147,6 +152,23 @@ class DesignerActions:
         """An example -> a new project. Blocking; a worker calls it."""
         return dx.build(answers, self.vault_dir)
 
+    def recorded_example(self, name: str) -> str:
+        return dx.recorded_example(self.project_dir(name))
+
+    def guess_example(self, name: str) -> str:
+        return dx.guess_example(self.project_dir(name))
+
+    def example_names(self) -> List[str]:
+        return [info.name for info in dx.offered()]
+
+    def update_problem(self, name: str, example: str) -> str:
+        return dx.update_problem(name, example, self.vault_dir)
+
+    def update_from_example(self, name: str, example: str):
+        """The example's current layout into this project, then Generate.
+        Blocking; a worker calls it."""
+        return dx.update_from_example(name, example, self.vault_dir)
+
     def export_default(self, name: str):
         return dx.export_default(self.project_dir(name))
 
@@ -218,6 +240,8 @@ class DesignerTab(ViewHelpers, QWidget):
         for caption, slot in (("✨ Start with a wizard", self.on_wizard),
                               ("New", self.on_new),
                               ("New from example…", self.on_new_from_example),
+                              ("Update from example…",
+                               self.on_update_from_example),
                               ("Open", self.on_open),
                               ("Save", self.on_save),
                               ("Export .gspec…", self.on_export),
@@ -671,6 +695,107 @@ class DesignerTab(ViewHelpers, QWidget):
             return
         self.project = name
         self._load(opened.shapes)
+
+    def on_update_from_example(self) -> None:
+        """Give the open project its example's CURRENT layout, then Generate.
+
+        For a project built from an example that has since grown — a Typhon
+        from before the FPS box and the Settings menu. The drawing (shapes,
+        window, canvas, requires) is replaced; app.py and handlers.py are
+        kept, and Generate treats them as it always does: untouched stubs
+        follow their buttons' new links, edited ones are named if their link
+        changed. The old project.gspec is copied beside the new one first.
+
+        Which example: the manifest's record (projects built by New from
+        example). An older project is ASKED, with a guess from its name
+        offered first — a wrong silent guess would replace the drawing with
+        a different app's.
+
+        Unsaved canvas edits are saved before the update, so the backup
+        holds them rather than losing them.
+        """
+        if self._busy:
+            self.log("Already working — wait for it to finish.")
+            return
+        if not self.project:
+            self.log("No project open.")
+            return
+        name = self.project
+        example = self.actions.recorded_example(name)
+        if not example:
+            guess = self.actions.guess_example(name)
+            names = self.actions.example_names()
+            if guess in names:
+                names = [guess] + [n for n in names if n != guess]
+            example = self.ask_choice(
+                "Update from example",
+                f"{name} does not record which example it was built from. "
+                f"Which example's current layout should replace its "
+                f"drawing?", names)
+            if not example:
+                return
+        problem = self.actions.update_problem(name, example)
+        if problem:
+            self.log(problem)
+            return
+        dirty = bool(getattr(self.canvas.scene, "dirty", False))
+        # The confirm is modal and swallows a mouse release, as in
+        # _open_built: a drag in progress is abandoned first.
+        self.canvas._obey(self.canvas.scene.escape())
+        unsaved = ("\n\nThe canvas has unsaved changes. They are saved first, "
+                   "so the backup has them." if dirty else "")
+        if not self.confirm(
+                "Update from example?",
+                f"Replace {name}'s drawn layout with the {example} example's "
+                f"current version?\n\nEvery shape, the window settings, the "
+                f"canvas size and the packages it needs are replaced. "
+                f"handlers.py and app.py are KEPT: Generate then rewrites "
+                f"only the handler stubs nobody has edited, adds stubs for "
+                f"new widgets, and names any edited handler whose link "
+                f"changed.\n\nThe current project.gspec is copied to "
+                f"project.gspec.<time>.bak in the project folder first."
+                f"{unsaved}"):
+            self.log(f"not updated — {name} was left as it was")
+            return
+        if dirty:
+            self.on_save()
+
+        def work() -> None:
+            try:
+                result = self.actions.update_from_example(name, example)
+            except Exception as exc:                     # noqa: BLE001
+                result = dx.ExampleUpdate(
+                    name=name, lines=[f"update failed: {exc!r}"])
+
+            def show() -> None:
+                self._busy = False
+                for line in result.lines:
+                    self.log(line)
+                if result.replaced and name == self.project:
+                    self._show_updated(name)
+                self._refresh_status()
+
+            self._to_ui(show)
+
+        self._start("updating from example…", work, name="designer-update")
+
+    def _show_updated(self, name: str) -> None:
+        """Put the updated layout on the canvas — asking first if the user
+        drew on the old one while the update ran, as _open_built does."""
+        if getattr(self.canvas.scene, "dirty", False):
+            self.canvas._obey(self.canvas.scene.escape())
+            if not self.confirm(
+                    "Show the updated layout?",
+                    f"{name} was updated, but the canvas has changes made "
+                    f"while it ran. Show the updated layout and lose them? "
+                    f"(No keeps them on the canvas — saving them would undo "
+                    f"the update's layout.)"):
+                self.log("the canvas still shows the old layout — Open the "
+                         "project to see the updated one")
+                return
+        opened = self.actions.open_named(name)
+        if opened.ok:
+            self._load(opened.shapes, opened.project)
 
     def on_export(self) -> None:
         """Write the open design to a .gspec the user picks.

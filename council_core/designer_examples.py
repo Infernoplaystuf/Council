@@ -32,6 +32,23 @@ There is no default destination that gets written without a choice: the
 caller supplies a path the user picked, and the caller confirms an overwrite.
 This module refuses nothing on that score because it cannot ask — the same
 split designer_project.detach makes.
+
+UPDATE FROM EXAMPLE: A NEWER EXAMPLE INTO AN EXISTING PROJECT
+A project built from an example never hears about the example again: Typhon
+gained a frame-rate box, then a live FPS box and a Settings menu, and a
+Typhon built before that still showed "Frame count". The only way to catch
+up was the CLI's --force — which deletes app.py and handlers.py.
+
+    update_from_example(...)   the project's DRAWN LAYOUT (shapes, window,
+                               canvas, requires) replaced with the example's
+                               current one, then Generate
+
+It never touches app.py or handlers.py itself. Generate does what it always
+does with them: a handler stub nobody edited is rewritten for its button's
+new link, an edited one is kept and named in a WARNING line when its link
+changed, and new widgets get new stubs. The old project.gspec is copied
+beside the new one first, with a timestamp in its name, so the drawing can
+be put back. Asking first is the caller's job, as it is for export.
 """
 from __future__ import annotations
 
@@ -39,7 +56,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 #: What the dialog's toolkit box shows until the user picks one, for an
 #: example whose intended toolkit is not recorded. Not a toolkit, so a build
@@ -353,6 +370,364 @@ def build(answers: ExampleAnswers, vault_dir: Any) -> ExampleBuild:
     out.lines.extend("  " + e for e in policy_errors)
     if python:
         out.say(f"Run with: {python}")
+    out.ok = True
+    return out
+
+
+# ============================================================
+# Update from example
+# ============================================================
+
+#: At most this many shapes are NAMED per kind of change in the log; the rest
+#: are counted. The log is a summary, not a diff.
+NAMED_PER_CHANGE = 6
+
+
+@dataclass
+class LayoutChanges:
+    """What replacing one drawing with another changes, by shape id."""
+    added: List[str] = field(default_factory=list)
+    removed: List[str] = field(default_factory=list)
+    #: "Start capture (s46): now frame_camera.start(capture_folder, ...)"
+    rewired: List[str] = field(default_factory=list)
+    #: "s08: port frame_count -> frame_rate"
+    ports: List[str] = field(default_factory=list)
+    relabelled: List[str] = field(default_factory=list)
+    moved: int = 0
+    #: Any other difference: props, colours, fonts, resize.
+    other: int = 0
+    #: Window, canvas and requires, one sentence each.
+    window: List[str] = field(default_factory=list)
+
+    @property
+    def any(self) -> bool:
+        return bool(self.added or self.removed or self.rewired or self.ports
+                    or self.relabelled or self.moved or self.other
+                    or self.window)
+
+    def lines(self) -> List[str]:
+        """A short summary: counts, then a few names per kind of change."""
+        if not self.any:
+            return ["  the layout already matches the example — nothing "
+                    "changed"]
+        counts = [f"{len(self.added)} added", f"{len(self.removed)} removed",
+                  f"{len(self.rewired)} rewired",
+                  f"{len(self.relabelled)} relabelled",
+                  f"{self.moved} moved or resized"]
+        if self.other:
+            counts.append(f"{self.other} restyled")
+        out = ["  shapes: " + ", ".join(counts)]
+        for title, items in (("added", self.added), ("removed", self.removed),
+                             ("rewired", self.rewired),
+                             ("ports", self.ports),
+                             ("relabelled", self.relabelled)):
+            if not items:
+                continue
+            shown = items[:NAMED_PER_CHANGE]
+            more = len(items) - len(shown)
+            out.append(f"  {title}: " + "; ".join(shown)
+                       + (f"; … and {more} more" if more else ""))
+        out.extend(f"  {line}" for line in self.window)
+        return out
+
+
+def _shape_name(shape: Any) -> str:
+    label = str(getattr(shape, "label", "") or "").strip()
+    return f"{label} ({shape.id})" if label else f"{shape.kind} {shape.id}"
+
+
+def _link_text(script: Any) -> str:
+    """"frame_camera.start(capture_folder, frame_rate)", or "no link"."""
+    from . import designer_wiring as wiring
+
+    link = wiring.normalise(script)
+    if not link:
+        return "no link"
+    return f"{link['module']}.{link['function']}({', '.join(link['inputs'])})"
+
+
+def layout_changes(old: Sequence[Any], new: Sequence[Any]) -> LayoutChanges:
+    """How `new` differs from `old`, shape by shape (matched by id).
+
+    Ids are what the manifest keys widget and port names by, so a shape that
+    kept its id keeps its widget, its port and its handler — which is what
+    makes "rewired" mean "the same button now calls something else"."""
+    from . import designer_wiring as wiring
+
+    out = LayoutChanges()
+    before = {s.id: s for s in old}
+    after = {s.id: s for s in new}
+    out.added = [_shape_name(after[k]) for k in after if k not in before]
+    out.removed = [_shape_name(before[k]) for k in before if k not in after]
+    for key, now in after.items():
+        was = before.get(key)
+        if was is None:
+            continue
+        if wiring.normalise(was.script) != wiring.normalise(now.script):
+            out.rewired.append(f"{_shape_name(now)}: "
+                               f"{_link_text(was.script)} → "
+                               f"{_link_text(now.script)}")
+        old_port = str((was.port or {}).get("name") or "")
+        new_port = str((now.port or {}).get("name") or "")
+        if old_port != new_port:
+            out.ports.append(f"{key}: port {old_port or '(derived)'} → "
+                             f"{new_port or '(derived)'}")
+        if (was.label or "") != (now.label or ""):
+            out.relabelled.append(f"{key}: {was.label!r} → {now.label!r}")
+        if (was.x, was.y, was.w, was.h) != (now.x, now.y, now.w, now.h):
+            out.moved += 1
+        if any(getattr(was, f) != getattr(now, f)
+               for f in ("kind", "props", "bg", "fg", "font", "resize",
+                         "min_w", "min_h", "freeform", "drives", "note",
+                         "z")) or ({k: v for k, v in (was.port or {}).items()
+                                    if k != "name"}
+                                   != {k: v for k, v in (now.port or {}).items()
+                                       if k != "name"}):
+            out.other += 1
+    return out
+
+
+def _window_changes(old: Any, new: Any) -> List[str]:
+    """One sentence each for the window, the canvas and the requires."""
+    lines = []
+    ow, nw = old.window, new.window
+    diffs = [f"{f} {getattr(ow, f)!r} → {getattr(nw, f)!r}"
+             for f in ("title", "bg", "fg", "font")
+             if getattr(ow, f) != getattr(nw, f)]
+    if (ow.min_w, ow.min_h) != (nw.min_w, nw.min_h):
+        diffs.append(f"minimum size {ow.min_w} x {ow.min_h} → "
+                     f"{nw.min_w} x {nw.min_h}")
+    if diffs:
+        lines.append("window: " + ", ".join(diffs))
+    if (old.canvas.w, old.canvas.h) != (new.canvas.w, new.canvas.h):
+        lines.append(f"canvas: {old.canvas.w} x {old.canvas.h} → "
+                     f"{new.canvas.w} x {new.canvas.h}")
+    gained = [r for r in new.requires if r not in old.requires]
+    lost = [r for r in old.requires if r not in new.requires]
+    if gained or lost:
+        lines.append("requires: "
+                     + ", ".join([f"+{r}" for r in gained]
+                                 + [f"-{r}" for r in lost]))
+    return lines
+
+
+def guess_example(project_dir: Any) -> str:
+    """The example a project was built from, "" when it cannot be told.
+
+    The manifest says, for a project built since "New from example" existed.
+    An older one is guessed from its name — run_example_gui builds into
+    example_<name>, and a name that contains an example's ("my_typhon") is
+    most likely that one; the longest such name wins, so barbie_capture_v5
+    is not taken for barbie_capture. Only a DEFAULT: the user confirms it.
+    """
+    import gui_examples as gx
+
+    names = gx.names()
+    if not project_dir:
+        return ""
+    directory = Path(project_dir)
+    try:
+        recorded = _manifest_example(directory)
+    except Exception:                                    # noqa: BLE001
+        recorded = ""
+    if recorded in names:
+        return recorded
+    name = directory.name.lower()
+    stripped = name[len("example_"):] if name.startswith("example_") else name
+    if stripped in names:
+        return stripped
+    inside = [n for n in names if n.lower() in name]
+    return max(inside, key=len) if inside else ""
+
+
+def _manifest_example(directory: Path) -> str:
+    import gui_projects as gpj
+    return gpj.load_manifest(directory).example
+
+
+def recorded_example(project_dir: Any) -> str:
+    """The example the manifest RECORDS, "" for none (or not an example)."""
+    import gui_examples as gx
+
+    if not project_dir:
+        return ""
+    try:
+        found = _manifest_example(Path(project_dir))
+    except Exception:                                    # noqa: BLE001
+        return ""
+    return found if found in gx.names() else ""
+
+
+def update_problem(name: str, example: str, vault_dir: Any) -> str:
+    """Why `name` cannot be updated from `example`, or "" when it can."""
+    import gui_examples as gx
+    import gui_projects as gpj
+
+    if not name:
+        return "No project open."
+    if example not in gx.names():
+        return (f"no such example: {example!r} — have "
+                f"{', '.join(gx.names()) or '(none)'}")
+    try:
+        pdir = gpj.project_path(name, vault_dir)
+        manifest = gpj.load_manifest(pdir)
+    except Exception as exc:                             # noqa: BLE001
+        return str(exc)
+    if manifest.detached:
+        return ("this project is detached — its layout no longer generates, "
+                "so there is nothing to update")
+    return ""
+
+
+@dataclass
+class ExampleUpdate:
+    """What an update said. Never raises — a refusal is ok=False."""
+    ok: bool = False
+    lines: List[str] = field(default_factory=list)
+    name: str = ""
+    example: str = ""
+    #: The old project.gspec, copied beside the new one.
+    backup: Optional[Path] = None
+    #: The layout now saved — what the Designer puts on its canvas.
+    shapes: List[Any] = field(default_factory=list)
+    changes: Optional[LayoutChanges] = None
+    #: The layout was replaced (True even when Generate then BLOCKED).
+    replaced: bool = False
+    seconds: float = 0.0
+
+    def say(self, line: str) -> None:
+        self.lines.append(line)
+
+
+def links_before(old_shapes: Sequence[Any], manifest: Any) -> Dict[str, Any]:
+    """The manifest's script_links, completed from the drawing being
+    replaced.
+
+    A project built by run_example_gui — the user's Typhon — has no record
+    at all (only a Designer Generate writes one), and without it Generate
+    cannot tell a hand-edited handler whose link changed under it from one
+    the user extended on purpose (gui_emit._stale_reason). So an edited
+    Start, whose link just gained frame_rate, passed with no WARNING —
+    measured. The old drawing says what each handler was generated for;
+    it fills in only handlers with no record, and an existing record (the
+    last Generate's) wins.
+    """
+    import gui_spec
+
+    from . import designer_wiring as wiring
+
+    links = dict(getattr(manifest, "script_links", {}) or {})
+    names = dict(getattr(manifest, "widget_names", {}) or {})
+    for shape in old_shapes:
+        link = wiring.normalise(getattr(shape, "script", None))
+        widget = names.get(shape.id)
+        if link and widget and shape.kind in gui_spec.COMMAND_KINDS:
+            links.setdefault(f"on_{widget}", link)
+    return links
+
+
+def backup_gspec(project_dir: Any, stamp: str = "") -> Path:
+    """Copy project.gspec to project.gspec.<stamp>.bak beside it.
+
+    In the project folder, not .backups/, so it is found by anyone looking
+    for the file it replaced; a second update in the same second gets _2
+    rather than overwriting the first backup."""
+    import shutil
+
+    import gui_projects as gpj
+
+    directory = Path(project_dir)
+    source = directory / gpj.GSPEC_NAME
+    stamp = stamp or time.strftime("%Y%m%d_%H%M%S")
+    target = directory / f"{gpj.GSPEC_NAME}.{stamp}.bak"
+    n = 1
+    while target.exists():
+        n += 1
+        target = directory / f"{gpj.GSPEC_NAME}.{stamp}_{n}.bak"
+    shutil.copy2(source, target)
+    return target
+
+
+def update_from_example(name: str, example: str, vault_dir: Any, *,
+                        model_call: Any = None,
+                        stamp: str = "") -> ExampleUpdate:
+    """Replace project `name`'s layout with `example`'s current one, then
+    Generate. Never raises. The caller has asked the user first.
+
+    Kept: the project's name, its mode (the manifest's, which the gate
+    enforces), app.py, handlers.py and everything else in the folder.
+    Replaced: the shapes, the window, the canvas, `requires` and the
+    clarifications — the whole drawing, so the project IS the example again.
+    The manifest records the example, so the next update needs no guess.
+
+    Blocking — a whole Generate — so the Designer runs it on a worker.
+    """
+    import gui_examples as gx
+    import gui_projects as gpj
+    import gui_shapes as gs
+
+    from . import designer_project as dp
+
+    out = ExampleUpdate(name=str(name or ""), example=str(example or ""))
+    why = update_problem(out.name, out.example, vault_dir)
+    if why:
+        out.say(why)
+        return out
+    started = time.perf_counter()
+    try:
+        pdir = gpj.project_path(out.name, vault_dir)
+        old = gpj.open_project(out.name, vault_dir=vault_dir)
+        fresh = gs.load_gspec(gx.EXAMPLES_DIR / f"{out.example}.gspec")
+    except Exception as exc:                             # noqa: BLE001
+        out.say(f"cannot update {out.name}: {exc}")
+        return out
+
+    changes = layout_changes(old.shapes, fresh.shapes)
+    changes.window = _window_changes(old, fresh)
+    out.changes = changes
+    try:
+        out.backup = backup_gspec(pdir, stamp)
+        new = gs.Project(project=old.project or out.name, mode=old.mode,
+                         canvas=fresh.canvas, window=fresh.window,
+                         shapes=list(fresh.shapes),
+                         clarifications=list(fresh.clarifications),
+                         requires=list(fresh.requires))
+        gpj.save_project(out.name, new, vault_dir=vault_dir)
+        manifest = gpj.load_manifest(pdir)
+        manifest.example = out.example
+        manifest.script_links = links_before(old.shapes, manifest)
+        gpj.save_manifest(pdir, manifest)
+    except Exception as exc:                             # noqa: BLE001
+        kept = (f" — the old drawing is in {out.backup.name}"
+                if out.backup is not None else " — nothing was replaced")
+        out.say(f"cannot update {out.name}: {exc!r}{kept}")
+        return out
+    out.replaced = True
+    out.shapes = list(new.shapes)
+    out.say(f"updated {out.name} from example {out.example}: the layout is "
+            f"now the example's ({len(fresh.shapes)} shapes, was "
+            f"{len(old.shapes)}); the old one is {out.backup.name}")
+    out.lines.extend(changes.lines())
+    toolkit = gpj.toolkit_for(pdir)
+    warning = toolkit_warning(out.example, toolkit)
+    if warning:
+        out.say(f"note: {warning}")
+
+    out.say("── Generate ──")
+    try:
+        generated = dp.generate(out.name, new.shapes, pdir, vault_dir,
+                                model_call=model_call)
+    except Exception as exc:                             # noqa: BLE001
+        generated = dp.GenerateResult(lines=[f"generate failed: {exc!r}"])
+    out.lines.extend(generated.lines)
+    out.seconds = time.perf_counter() - started
+    if not generated.ok:
+        out.say(f"The new layout is saved but did not generate. Fix what is "
+                f"listed and press Generate — or copy {out.backup.name} back "
+                f"over {gpj.GSPEC_NAME} to return to the old drawing.")
+        return out
+    out.say(f"updated and generated in {out.seconds:.2f}s — handlers.py and "
+            f"app.py were kept")
     out.ok = True
     return out
 

@@ -187,12 +187,13 @@ def test_the_outside_line_names_the_shapes_and_how_to_fix_it():
 
 
 def test_typhon_does_not_fit_the_old_fixed_canvas():
-    """The measured bug, pinned: 39 of 58 Typhon shapes are not wholly
-    inside 1100 x 700, and every one is inside Typhon's own canvas."""
+    """The measured bug, pinned: 39 of 58 Typhon shapes were not wholly
+    inside 1100 x 700 (40 of 59 since the Settings button took the top
+    right corner), and every one is inside Typhon's own canvas."""
     project = gui_shapes.load_gspec(TYPHON)
     assert (project.canvas.w, project.canvas.h) == (1504, 1016)
-    assert len(project.shapes) == 58
-    assert len(geo.outside(project.shapes, 1100, 700)) == 39
+    assert len(project.shapes) == 59
+    assert len(geo.outside(project.shapes, 1100, 700)) == 40
     assert geo.outside(project.shapes, 1504, 1016) == []
 
 
