@@ -111,6 +111,10 @@ python run_example_gui.py typhon --target qt --python camera --no-run
 camera` records that environment in the project, so the GUI Designer's **Run**
 uses it too. The command prints the project directory and the line to run it.
 
+Inside the Council instead: **GUI Designer → New from example…**, pick
+`typhon` (Qt is already chosen), type `camera` under **Run with**, and
+**Build**. The project opens on the canvas when it is built.
+
 There is **no longer an `app.py` line to add by hand**: a wireframe that links
 buttons to `frame_camera` is generated with `frame_camera.attach(self)` already
 written in. (A project built from v4 before this change still needs the line;

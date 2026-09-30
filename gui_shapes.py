@@ -591,16 +591,25 @@ def _project_to_dict(p: Project) -> Dict[str, Any]:
     }
 
 
-def save_gspec(path: Any, project: Project) -> None:
+def save_gspec(path: Any, project: Project, *,
+               ascii_only: bool = True) -> None:
     """Write ``project`` to ``path`` as .gspec JSON.
 
     sort_keys is deliberate: a byte-identical file for an unchanged project is
     what makes "save, reopen, save again" verifiable, and it keeps a .gspec
-    diffable in version control."""
+    diffable in version control.
+
+    ``ascii_only=False`` writes "—" as "—" rather than "\\u2014". The shipped
+    examples are stored that way (Typhon's "Exposure µs", "Camera setup…"), so
+    it is what the Designer's Export uses: with the default, an unchanged
+    Typhon exported back over examples/gui/typhon.gspec came out as a
+    four-line diff that changed nothing. Both spellings load identically; the
+    vault's own files keep the default."""
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(
-        json.dumps(_project_to_dict(project), indent=2, sort_keys=True) + "\n",
+        json.dumps(_project_to_dict(project), indent=2, sort_keys=True,
+                   ensure_ascii=ascii_only) + "\n",
         encoding="utf-8",
     )
 

@@ -176,6 +176,11 @@ class Manifest:
     # toolkit_of() reads the truth back out of app.py, and Generate refuses on
     # a mismatch rather than writing a project that cannot start.
     toolkit: str = "tk"
+    # Which shipped example (examples/gui/<name>.gspec) this project was built
+    # from, "" for one the user drew. So the Designer's Export can offer to
+    # write an edited example back to its own file rather than making the
+    # user find it. Provenance only: nothing reads it to decide how to build.
+    example: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -208,6 +213,7 @@ def load_manifest(pdir: Any) -> Manifest:
         # written before the Qt target is Tk — so the default is the answer,
         # not a guess.
         toolkit=str(raw.get("toolkit") or "tk"),
+        example=str(raw.get("example") or ""),
     )
 
 
