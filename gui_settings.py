@@ -191,7 +191,7 @@ def _warm_up() -> None:
 
     The first list reads and parses every file (0.2-0.26 s for Typhon's 24,
     measured, nearly all of it ast.parse); a later one only stats them
-    (20-30 ms). The user takes longer than that to move to "Python Scripts",
+    (about 30 ms in a running Typhon with 1,400 modules loaded). The user takes longer than that to move to "Python Scripts",
     so parsing while the menu is up makes the window's FIRST open the cheap
     one. Results go into _PARSED only — nothing on the worker touches Qt —
     and a second parse of the same file by the UI thread is merely wasted,
@@ -303,9 +303,14 @@ def scripts_in_use(app_dir: Any = None, council_root: Any = None,
     if app is not None:
         for path in _app_files(app):
             rel = path.relative_to(app).as_posix()
-            what = GENERATED_ROLES.get(rel) or (
-                _UI_DEFAULT if rel.startswith("ui/") else
-                _info(path)[1] or "Your own module (it has no docstring).")
+            role = GENERATED_ROLES.get(rel) or (
+                _UI_DEFAULT if rel.startswith("ui/") else "")
+            problem = _info(path)[3]
+            # A generated file keeps its fixed words, with a parse error in
+            # front of them: a handlers.py broken while the app runs is
+            # exactly what this window is opened to find.
+            what = (f"{problem} {role}".strip() if role else
+                    _what(path, _OWN_UNDESCRIBED))
             add(path, rel, APP, what)
 
     while queue:
@@ -317,12 +322,11 @@ def scripts_in_use(app_dir: Any = None, council_root: Any = None,
             where, dotted = target
             if where[0] == app:
                 add(where[1], where[1].relative_to(app).as_posix(), APP,
-                    _info(where[1])[1] or "Your own module (it has no "
-                                          "docstring).")
+                    _what(where[1], _OWN_UNDESCRIBED))
             else:
                 group = LINKED if dotted.split(".")[0] in linked else COUNCIL
                 add(where[1], dotted, group,
-                    _info(where[1])[1] or "(no description in the file)")
+                    _what(where[1], _UNDESCRIBED))
 
     for path in _loaded_under(loaded, roots):
         if _key(path) in found:
@@ -332,10 +336,13 @@ def scripts_in_use(app_dir: Any = None, council_root: Any = None,
         group = APP if in_app else (
             LINKED if dotted.split(".")[0] in linked else COUNCIL)
         name = path.relative_to(app).as_posix() if in_app else dotted
-        found[_key(path)] = Script(
-            name, path, _info(path)[1] or "(no description in the file)",
-            group, True)
+        found[_key(path)] = Script(name, path, _what(path, _UNDESCRIBED),
+                                   group, True)
     return _ordered(found.values())
+
+
+_OWN_UNDESCRIBED = "Your own module (it has no docstring)."
+_UNDESCRIBED = "(no description in the file)"
 
 
 def _app_files(app: Path) -> List[Path]:
@@ -374,31 +381,42 @@ def _linked_names() -> frozenset:
 # ----------------------------------------------------------------------
 # Reading a file: its imports and its first sentence, cached
 # ----------------------------------------------------------------------
-#: path key -> ((size, mtime_ns), (imports, summary, is_marker)).
-_PARSED: Dict[str, Tuple[Tuple[int, int], Tuple[Tuple[Tuple[str, str, int], ...], str, bool]]] = {}
+#: (imports, summary, is a package marker, why it could not be parsed).
+_Info = Tuple[Tuple[Tuple[str, str, int], ...], str, bool, str]
+
+#: path key -> ((size, mtime_ns), _Info).
+_PARSED: Dict[str, Tuple[Tuple[int, int], _Info]] = {}
 
 
-def _info(path: Path) -> Tuple[Tuple[Tuple[str, str, int], ...], str, bool]:
-    """(imports, one-sentence summary, is a package marker) for a file.
+def _info(path: Path) -> _Info:
+    """(imports, one-sentence summary, is a package marker, problem) for a
+    file.
 
     Imports are (module, name, level) triples — `from a import b` is
     ("a", "b", 0), `import a.b` is ("a.b", "", 0) — every one in the file,
-    inside functions too. A file that cannot be read or parsed has none.
+    inside functions too. A file that cannot be read or parsed has none, and
+    says why in `problem` ("Does not parse: invalid syntax (line 3)."): the
+    window is for debugging, and a module with a syntax error in it is the
+    likeliest thing being debugged — it used to read "it has no docstring".
     """
     key = _key(path)
     try:
         st = path.stat()
         stamp = (st.st_size, st.st_mtime_ns)
     except OSError:
-        return (), "", False
+        return (), "", False, ""
     held = _PARSED.get(key)
     if held is not None and held[0] == stamp:
         return held[1]
     try:
         tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
-    except (OSError, SyntaxError, ValueError):
-        got: Tuple[Tuple[Tuple[str, str, int], ...], str, bool] = (
-            (), "", False)
+    except (OSError, SyntaxError, ValueError) as exc:
+        if isinstance(exc, SyntaxError):
+            where = f" (line {exc.lineno})" if exc.lineno else ""
+            problem = f"Does not parse: {exc.msg}{where}."
+        else:
+            problem = f"Cannot be read: {exc}."
+        got: _Info = ((), "", False, problem)
         _PARSED[key] = (stamp, got)
         return got
     imports: List[Tuple[str, str, int]] = []
@@ -410,9 +428,16 @@ def _info(path: Path) -> Tuple[Tuple[Tuple[str, str, int], ...], str, bool]:
                 imports.append((node.module or "", a.name, node.level or 0))
     name = path.stem if path.name != "__init__.py" else path.parent.name
     got = (tuple(imports), summarise(ast.get_docstring(tree) or "", name),
-           _is_marker(tree))
+           _is_marker(tree), "")
     _PARSED[key] = (stamp, got)
     return got
+
+
+def _what(path: Path, fallback: str) -> str:
+    """What a file is for: its problem first when it has one, else its
+    first sentence, else `fallback`."""
+    _imports, summary, _marker, problem = _info(path)
+    return problem or summary or fallback
 
 
 #: The fields of a compound statement that hold more statements.
@@ -568,33 +593,46 @@ def _key(path: Any) -> str:
     return os.path.normcase(os.path.abspath(str(path)))
 
 
-def _loaded_files(modules: Mapping[str, Any]) -> Dict[str, Path]:
-    """normcased path -> Path of every loaded module that is a .py file."""
-    out: Dict[str, Path] = {}
+def _loaded_files(modules: Mapping[str, Any]) -> Dict[str, str]:
+    """normcased path -> path of every loaded module that is a .py file.
+
+    Plain strings, no Path objects: a running Typhon has ~1,150 of these
+    (PySide6, numpy, PIL, sklearn) and only a dozen are under the app's or
+    the Council's folder. Measured in an updated Typhon, building a Path for
+    each and comparing it with both roots by Path.relative_to was 50-70 ms
+    of a 90 ms warm list."""
+    out: Dict[str, str] = {}
     for module in list(modules.values()):
-        path = getattr(module, "__file__", None)
+        # From the module's own dict: a lazy module's __getattr__ is never
+        # asked for a __file__ it does not have.
+        found = getattr(module, "__dict__", None)
+        path = found.get("__file__") if isinstance(found, dict) else None
         # Absolute only. PySide6's shibokensupport modules carry RELATIVE
         # made-up paths ("shibokensupport/__init__.py"), which abspath
         # resolved against the working directory — measured: a Typhon
         # started from the Council's folder listed eleven of them as
         # Council modules.
-        if path and str(path).endswith(".py") and os.path.isabs(str(path)):
-            out[_key(path)] = Path(str(path))
+        if isinstance(path, str) and path.endswith(".py") \
+                and os.path.isabs(path):
+            out[_key(path)] = path
     return out
 
 
-def _loaded_under(loaded: Dict[str, Path], roots: List[Path]) -> List[Path]:
+def _loaded_under(loaded: Dict[str, str], roots: List[Path]) -> List[Path]:
     """Loaded files inside a root — not in a hidden folder (.venv, .claude)
-    or an installed package, and not a package marker."""
+    or an installed package, and not a package marker. Matched on the
+    normcased keys by prefix, so a module elsewhere costs one startswith."""
+    prefixes = [_key(root).rstrip(os.sep) + os.sep for root in roots]
     out = []
-    for path in loaded.values():
-        root = next((r for r in roots if _inside(path, r)), None)
-        if root is None:
+    for key, raw in loaded.items():
+        prefix = next((p for p in prefixes if key.startswith(p)), None)
+        if prefix is None:
             continue
-        rel = path.relative_to(root).parts
+        rel = key[len(prefix):].split(os.sep)
         if any(p.startswith(".") or p in ("site-packages", "__pycache__")
                for p in rel):
             continue
+        path = Path(raw)
         if not path.is_file():
             continue
         if path.name == "__init__.py" and _info(path)[2]:

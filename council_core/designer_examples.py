@@ -43,7 +43,9 @@ up was the CLI's --force — which deletes app.py and handlers.py.
                                canvas, requires) replaced with the example's
                                current one, then Generate
 
-It never touches app.py or handlers.py itself. Generate does what it always
+Shapes the user drew in the Designer themselves are not the example's to
+replace: they are kept on top of it (drawn_by_user), so the code written for
+them still has its widget. It never touches app.py or handlers.py itself. Generate does what it always
 does with them: a handler stub nobody edited is rewritten for its button's
 new link, an edited one is kept and named in a WARNING line when its link
 changed, and new widgets get new stubs. The old project.gspec is copied
@@ -53,6 +55,7 @@ be put back. Asking first is the caller's job, as it is for export.
 from __future__ import annotations
 
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -383,11 +386,34 @@ def build(answers: ExampleAnswers, vault_dir: Any) -> ExampleBuild:
 NAMED_PER_CHANGE = 6
 
 
+#: The id gui_shapes.new_shape gives a shape drawn in the Designer: a uuid4
+#: hex. Every shipped example numbers its own s00, s01, ... — so a shape
+#: with a Designer id in a project built from an example is one the USER
+#: drew, never one an example shipped (or later dropped).
+_DRAWN_ID = re.compile(r"[0-9a-f]{32}")
+
+
+def drawn_by_user(shapes: Sequence[Any], example: Sequence[Any]) -> List[Any]:
+    """The shapes in `shapes` the user drew in the Designer — which an
+    update keeps, on top of the example's layout.
+
+    Measured before this: a Typhon with a button of the user's own lost it
+    to the update, and Generate then BLOCKED on the handler the user had
+    written for it ("hand-written code still uses these") — the project
+    replaced but not generated. Their button and their code belong to them,
+    as handlers.py does."""
+    ids = {s.id for s in example}
+    return [s for s in shapes
+            if s.id not in ids and _DRAWN_ID.fullmatch(str(s.id or ""))]
+
+
 @dataclass
 class LayoutChanges:
     """What replacing one drawing with another changes, by shape id."""
     added: List[str] = field(default_factory=list)
     removed: List[str] = field(default_factory=list)
+    #: The user's own shapes, carried over (drawn_by_user).
+    kept: List[str] = field(default_factory=list)
     #: "Start capture (s46): now frame_camera.start(capture_folder, ...)"
     rewired: List[str] = field(default_factory=list)
     #: "s08: port frame_count -> frame_rate"
@@ -407,9 +433,10 @@ class LayoutChanges:
 
     def lines(self) -> List[str]:
         """A short summary: counts, then a few names per kind of change."""
+        kept = self._named("kept, drawn by you", self.kept)
         if not self.any:
             return ["  the layout already matches the example — nothing "
-                    "changed"]
+                    "changed"] + kept
         counts = [f"{len(self.added)} added", f"{len(self.removed)} removed",
                   f"{len(self.rewired)} rewired",
                   f"{len(self.relabelled)} relabelled",
@@ -421,14 +448,20 @@ class LayoutChanges:
                              ("rewired", self.rewired),
                              ("ports", self.ports),
                              ("relabelled", self.relabelled)):
-            if not items:
-                continue
-            shown = items[:NAMED_PER_CHANGE]
-            more = len(items) - len(shown)
-            out.append(f"  {title}: " + "; ".join(shown)
-                       + (f"; … and {more} more" if more else ""))
+            out.extend(self._named(title, items))
+        out.extend(kept)
         out.extend(f"  {line}" for line in self.window)
         return out
+
+    @staticmethod
+    def _named(title: str, items: Sequence[str]) -> List[str]:
+        """"  title: a; b; … and 3 more", or nothing for no items."""
+        if not items:
+            return []
+        shown = list(items[:NAMED_PER_CHANGE])
+        more = len(items) - len(shown)
+        return [f"  {title}: " + "; ".join(shown)
+                + (f"; … and {more} more" if more else "")]
 
 
 def _shape_name(shape: Any) -> str:
@@ -655,10 +688,14 @@ def update_from_example(name: str, example: str, vault_dir: Any, *,
     Generate. Never raises. The caller has asked the user first.
 
     Kept: the project's name, its mode (the manifest's, which the gate
-    enforces), app.py, handlers.py and everything else in the folder.
-    Replaced: the shapes, the window, the canvas, `requires` and the
-    clarifications — the whole drawing, so the project IS the example again.
-    The manifest records the example, so the next update needs no guess.
+    enforces), app.py, handlers.py and everything else in the folder — and
+    the shapes the user drew in the Designer themselves (drawn_by_user),
+    on top of the example's layout, so the code they wrote for them still
+    has its widget.
+    Replaced: the example's shapes, the window, the canvas, `requires` and
+    the clarifications — so the project IS the example again, plus the
+    user's own additions. The manifest records the example, so the next
+    update needs no guess.
 
     Blocking — a whole Generate — so the Designer runs it on a worker.
     """
@@ -682,14 +719,17 @@ def update_from_example(name: str, example: str, vault_dir: Any, *,
         out.say(f"cannot update {out.name}: {exc}")
         return out
 
-    changes = layout_changes(old.shapes, fresh.shapes)
+    own = drawn_by_user(old.shapes, fresh.shapes)
+    shapes = list(fresh.shapes) + list(own)
+    changes = layout_changes(old.shapes, shapes)
+    changes.kept = [_shape_name(s) for s in own]
     changes.window = _window_changes(old, fresh)
     out.changes = changes
     try:
         out.backup = backup_gspec(pdir, stamp)
         new = gs.Project(project=old.project or out.name, mode=old.mode,
                          canvas=fresh.canvas, window=fresh.window,
-                         shapes=list(fresh.shapes),
+                         shapes=shapes,
                          clarifications=list(fresh.clarifications),
                          requires=list(fresh.requires))
         gpj.save_project(out.name, new, vault_dir=vault_dir)
@@ -704,8 +744,9 @@ def update_from_example(name: str, example: str, vault_dir: Any, *,
         return out
     out.replaced = True
     out.shapes = list(new.shapes)
+    yours = f" + {len(own)} of your own" if own else ""
     out.say(f"updated {out.name} from example {out.example}: the layout is "
-            f"now the example's ({len(fresh.shapes)} shapes, was "
+            f"now the example's ({len(fresh.shapes)} shapes{yours}, was "
             f"{len(old.shapes)}); the old one is {out.backup.name}")
     out.lines.extend(changes.lines())
     toolkit = gpj.toolkit_for(pdir)

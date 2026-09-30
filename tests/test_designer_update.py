@@ -257,6 +257,47 @@ def test_an_edited_handler_whose_link_changed_is_kept_and_named(
     assert re.search(r"handlers\.py:\d+ on_btn_start_capture", warning)
 
 
+def test_shapes_the_user_drew_in_the_designer_are_kept(tmp_path,
+                                                      monkeypatch):
+    """A Typhon the user added a button of their own to, with its handler
+    written: the update dropped the button with the rest of the old drawing,
+    and Generate then BLOCKED on the handler it left behind ("hand-written
+    code still uses these: on_btn_snapshot") — measured — leaving the
+    project replaced but not generated. A shape drawn in the Designer (a
+    uuid id; the examples' are s00...) is the user's, not the example's: it
+    stays, and so does the code behind it."""
+    from council_core import designer_project as dp
+
+    vault = tmp_path / "vault"
+    pdir = build_old(vault, monkeypatch)
+    project = gpj.open_project("example_typhon", vault_dir=vault)
+    mine = gs.new_shape("button", 600, 960, label="Snapshot")
+    project.shapes.append(mine)
+    gpj.save_project("example_typhon", project, vault_dir=vault)
+    assert dp.generate("example_typhon", project.shapes, pdir, vault).ok
+    path = pdir / "handlers.py"
+    source = path.read_text(encoding="utf-8")
+    stub = method(source, "on_btn_snapshot")
+    # Real code, not a comment: a comment-only edit is still the stub.
+    edited = stub.replace("        pass\n", "        print('snap')\n")
+    assert edited != stub
+    path.write_text(source.replace(stub, edited), encoding="utf-8")
+
+    out = dx.update_from_example("example_typhon", "typhon", vault)
+    said = "\n".join(out.lines)
+    assert out.ok, said
+    shapes = {s.id: s for s in gpj.open_project("example_typhon",
+                                                vault_dir=vault).shapes}
+    assert mine.id in shapes and shapes[mine.id].label == "Snapshot"
+    assert len(shapes) == len(gs.load_gspec(EXAMPLE).shapes) + 1
+    assert mine.id in {s.id for s in out.shapes}, "the canvas shows it too"
+    assert "kept, drawn by you: Snapshot" in said
+    assert out.changes.removed == [], "the user's own shape is not removed"
+    handlers = (pdir / "handlers.py").read_text(encoding="utf-8")
+    assert method(handlers, "on_btn_snapshot") == edited
+    assert shapes["s58"].script["module"] == "gui_settings"
+
+
 def test_a_second_update_keeps_the_first_backup(tmp_path, monkeypatch):
     vault = tmp_path / "vault"
     pdir = build_old(vault, monkeypatch)

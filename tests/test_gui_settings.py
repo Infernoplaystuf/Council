@@ -290,6 +290,53 @@ def test_python_scripts_gives_a_listbox_its_rows():
     assert isinstance(out["rows"], list) and "Python files" in out["summary"]
 
 
+def test_a_warm_list_does_not_pay_for_every_module_the_app_loaded(
+        typhon_dir):
+    """A running Typhon has ~1,400 modules in sys.modules (PySide6, numpy,
+    PIL, sklearn from main.py's check), and every one's path was compared
+    with both roots by Path.relative_to: measured in an updated Typhon, the
+    warm list took 90 ms, 50-70 of them there — for the dozen files that
+    live under the roots. The test above passes modules={} and never saw it.
+    """
+    elsewhere = ROOT.parent / "elsewhere"
+    fake = {f"pkg{i}": SimpleNamespace(__file__=str(elsewhere / f"m{i}.py"))
+            for i in range(3000)}
+    gst.scripts_in_use(typhon_dir, modules=fake)          # parse once
+    started = time.perf_counter()
+    rows = gst.scripts_in_use(typhon_dir, modules=fake)
+    warm = time.perf_counter() - started
+    print(f"\nwarm list with 3,000 other modules loaded: {warm * 1000:.0f} ms")
+    assert [s.name for s in rows] == [
+        s.name for s in gst.scripts_in_use(typhon_dir, modules={})]
+    assert warm < 0.1, f"{warm * 1000:.0f} ms"
+
+
+def test_a_file_that_does_not_parse_says_why(tmp_path):
+    """The window is for debugging, and a module with a syntax error is the
+    commonest thing to debug — it was described "it has no docstring"."""
+    app, root = make_app(tmp_path, (
+        "class HandlerMixin:\n"
+        "    def on_btn(self):\n"
+        "        import mine\n"
+        "        import linked_mod\n"), {
+        "linked_mod.py": '"""linked_mod — does a thing."""\ndef f(:\n'})
+    (app / "mine.py").write_text('"""mine.py — my helper."""\n\n'
+                                 'def broken(:\n    pass\n', encoding="utf-8")
+    rows = {s.name: s for s in gst.scripts_in_use(app, council_root=root,
+                                                  modules={})}
+    for name, line in (("mine.py", 3), ("linked_mod", 2)):
+        what = rows[name].what
+        assert "no docstring" not in what and "no description" not in what
+        assert what.startswith("Does not parse") and f"line {line}" in what
+
+    (app / "handlers.py").write_text("def on_btn(:\n", encoding="utf-8")
+    rows = {s.name: s for s in gst.scripts_in_use(app, council_root=root,
+                                                  modules={})}
+    what = rows["handlers.py"].what
+    assert what.startswith("Does not parse") and "line 1" in what
+    assert "Yours to edit" in what, "the fixed wording is kept after it"
+
+
 # ======================================================================
 # The menu and the window — offscreen
 # ======================================================================
@@ -435,6 +482,33 @@ def test_the_pressed_button_is_found_from_a_child_or_the_focus(corner):
     assert view.first_button([None, left]) is left
     assert view.first_button([window, None]) is None, \
         "a window is not a button, and its parents are not searched for one"
+
+
+def test_a_keyboard_press_drops_the_menu_under_the_focused_button(
+        corner, monkeypatch, qapp):
+    """Space on a focused Settings button while the mouse rests over another
+    button (Open sits right under Typhon's Settings): the menu dropped under
+    the button the MOUSE was over. A click on that button would have given
+    it the focus — a button takes focus on a click — so when the focus is
+    on a different button, that one was pressed from the keyboard."""
+    from council_qt.widgets import python_scripts as view
+    _window, left, right = corner
+    at = {"mouse": left, "focus": right}
+    monkeypatch.setattr(view, "QApplication", SimpleNamespace(
+        instance=lambda: qapp, widgetAt=lambda *a: at["mouse"],
+        focusWidget=lambda: at["focus"]))
+    assert view.pressed_button() is right, "keyboard: the focused button"
+    at["mouse"] = right
+    assert view.pressed_button() is right, "a click: under the mouse"
+    at["mouse"], at["focus"] = left, None
+    assert view.pressed_button() is left
+    at["mouse"], at["focus"] = None, right
+    assert view.pressed_button() is right
+    # A button that takes no focus on a click keeps the old focus elsewhere:
+    # the mouse is the only witness, so it is believed.
+    left.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+    at["mouse"], at["focus"] = left, right
+    assert view.pressed_button() is left
 
 
 def test_python_scripts_opens_a_non_modal_window_that_stays(

@@ -747,8 +747,9 @@ class DesignerTab(ViewHelpers, QWidget):
         if not self.confirm(
                 "Update from example?",
                 f"Replace {name}'s drawn layout with the {example} example's "
-                f"current version?\n\nEvery shape, the window settings, the "
-                f"canvas size and the packages it needs are replaced. "
+                f"current version?\n\nEvery shape from the example, the "
+                f"window settings, the canvas size and the packages it needs "
+                f"are replaced; shapes you drew yourself are kept on top. "
                 f"handlers.py and app.py are KEPT: Generate then rewrites "
                 f"only the handler stubs nobody has edited, adds stubs for "
                 f"new widgets, and names any edited handler whose link "

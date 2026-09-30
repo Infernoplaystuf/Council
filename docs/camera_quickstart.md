@@ -131,8 +131,12 @@ Typhon built before the FPS box still says **Frame count**, and has no
 2. **Update from example…**. A project that does not record which example it
    came from asks — `typhon` is offered first when the name says so.
 3. Read the confirmation and press **Yes**. It says what happens:
-   - the **drawn layout** — every shape, the window settings, the canvas size
-     and the packages it needs — is replaced with the example's current one;
+   - the **drawn layout** — every shape from the example, the window
+     settings, the canvas size and the packages it needs — is replaced with
+     the example's current one. Shapes **you drew yourself** in the Designer
+     are kept on top of it (the log lists them under `kept, drawn by you`), so
+     a handler you wrote for one of them still has its button — but an
+     example shape you moved or relabelled goes back to the example's;
    - **`handlers.py` and `app.py` are kept.** Generate then rewrites only the
      handler stubs nobody has edited (Start gains `frame_rate`, the FPS box and
      Settings get theirs), adds stubs for new widgets, and names — with
@@ -356,9 +360,11 @@ listing every Python file the app uses — for debugging, or for a bug report:
 Type in the filter box to narrow it; **Copy all** puts the whole list,
 interpreter first, on the clipboard; Ctrl+C copies selected rows; **Refresh**
 looks again. The window is not modal — it stays open while the app captures.
-The list is read from the files (nothing is imported to describe it) and
-takes about 0.2 s the first time, 20–30 ms after that; the menu warms it up
-while it is open.
+The list is read from the files (nothing is imported to describe it) and,
+measured in a running Typhon, takes about 0.25 s the first time and about
+30 ms after that (the window opens in about 50 ms); the menu warms it up
+while it is open. A file that does not parse says so in its row, with the
+line — the likeliest thing you opened the window to find.
 
 Any Designer project can have the same menu: put a button anywhere and, in
 the **Wiring** panel, link it to `gui_settings` → `settings_menu`.

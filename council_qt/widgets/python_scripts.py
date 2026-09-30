@@ -13,8 +13,9 @@ one — a Settings menu left open would freeze the picture. popup() returns at
 once and the app carries on underneath.
 
 UNDER THE BUTTON THAT WAS PRESSED. A script link cannot pass its widget, so
-the menu looks for it: the button under the mouse, else the button with the
-keyboard focus (Space on a focused button), else it opens at the mouse. It
+the menu looks for it: the button under the mouse — unless the keyboard
+focus is on another button, which was then pressed with Space (see
+pressed_button) — else it opens at the mouse. It
 drops down from the button's bottom edge, and right-aligned when a left
 alignment would run off the window — a Settings button lives in a top-right
 corner.
@@ -45,12 +46,25 @@ NAME, WHAT, LOADED, PATH = range(4)
 # The menu
 # ======================================================================
 def pressed_button() -> Optional[QAbstractButton]:
-    """The button that was just pressed, as far as it can be told: the one
-    under the mouse, else the one with the keyboard focus."""
+    """The button that was just pressed, as far as it can be told.
+
+    The one under the mouse and the one with the keyboard focus are the
+    witnesses. For a click they agree: a button takes the focus when it is
+    clicked. When they DISAGREE, the button under the mouse was not clicked
+    — or it would have the focus — so the focused one was pressed from the
+    keyboard (Space, with the mouse resting over some other button). Only a
+    button that takes no focus on a click leaves the focus elsewhere when it
+    is clicked; then the mouse is believed.
+    """
     if QApplication.instance() is None:
         return None
-    return first_button([QApplication.widgetAt(QCursor.pos()),
-                         QApplication.focusWidget()])
+    under = first_button([QApplication.widgetAt(QCursor.pos())])
+    focus = first_button([QApplication.focusWidget()])
+    if under is None or focus is None or under is focus:
+        return under or focus
+    takes_click_focus = bool(under.focusPolicy()
+                             & Qt.FocusPolicy.ClickFocus)
+    return focus if takes_click_focus else under
 
 
 def first_button(candidates: Sequence[Optional[QWidget]]
