@@ -37,9 +37,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-#: The canvas the user actually drags on. NOT gui_projects' 1280x800 default:
+#: The design area a NEW project gets, which is what the user drags on until
+#: they change it in the window panel. NOT gui_projects' 1280x800 default:
 #: layout inference measures edge-anchoring against these numbers, so a project
-#: created with the default infers anchors for a canvas nobody drew on.
+#: created with the default infers anchors for a canvas nobody drew on. An
+#: existing project keeps its own (Typhon's is 1504 x 1016) — the Designer's
+#: canvas takes its size from the project, not from here.
 CANVAS_W, CANVAS_H = 1100, 700
 
 #: The classification call, exactly as the Tk shell makes it.
@@ -260,19 +263,43 @@ def save(name: str, shapes: Sequence[Any], vault_dir: Any) -> ProjectResult:
 
 def apply_window(name: str, values: Dict[str, Any], shapes: Sequence[Any],
                  vault_dir: Any) -> ProjectResult:
-    """The window panel's Apply: title, min size, colours, and `requires`.
+    """The window panel's Apply: title, min size, colours, `requires`, and
+    the canvas — the design area's own size.
 
     Saved through the same helper as everything else so bg / title / min size
     survive a regeneration.
+
+    A canvas size that would cut off a shape REFUSES THE WHOLE APPLY, with
+    nothing written (see designer_geometry.canvas_problem for why refuse
+    rather than warn). Whole, not "everything but the canvas": the panel
+    keeps what the user typed, so fixing the one number and pressing Apply
+    again sends the rest with it — whereas half an Apply that said "refused"
+    would leave the user unsure which half landed.
     """
     import gui_policy
     import gui_projects
+
+    from . import designer_geometry as geometry
 
     if not name:
         return ProjectResult(False, "No project open.")
     try:
         project = gui_projects.open_project(name, vault_dir=vault_dir)
+        if any(key in values for key in geometry.CANVAS_KEYS):
+            current = (project.canvas.w, project.canvas.h)
+            wanted_w = values.get("canvas_w", project.canvas.w)
+            wanted_h = values.get("canvas_h", project.canvas.h)
+            problem = geometry.canvas_problem(shapes, wanted_w, wanted_h,
+                                              current=current)
+            if problem:
+                return ProjectResult(False, f"canvas not changed — "
+                                            f"{problem.rstrip('.')}. Nothing "
+                                            f"else was applied.",
+                                     name=name, project=project)
+            project.canvas.w, project.canvas.h = int(wanted_w), int(wanted_h)
         for key, value in values.items():
+            if key in geometry.CANVAS_KEYS:
+                continue
             if key == "requires":
                 # Project-level, but edited in this panel because it is the
                 # only place the user ever sees the window's own settings.
@@ -288,7 +315,8 @@ def apply_window(name: str, values: Dict[str, Any], shapes: Sequence[Any],
              for problem in gui_policy.check_requires(project.requires)]
     requires = ", ".join(getattr(project, "requires", []) or []) or "(none)"
     notes.append(f"window: bg={project.window.bg or '(none)'} "
-                 f"title={project.window.title!r} requires={requires}")
+                 f"title={project.window.title!r} requires={requires} "
+                 f"canvas={project.canvas.w} x {project.canvas.h}")
     return ProjectResult(True, "\n".join(notes), name=name, project=project)
 
 
@@ -549,25 +577,49 @@ def describe(text: str, project_dir: Any = None, *,
     """Plain English -> a wireframe that will generate, or the reasons not.
 
     A thin seam over gui_describe, which owns the prompt, the checks and the
-    repair rounds. What this adds is the two things only a PROJECT knows: the
-    toolkit to design for, and the default model call. The canvas is always
-    the one the user drags on, never the project file's, for the same reason
-    `create` sets it — the shapes are about to be placed on that canvas.
+    repair rounds. What this adds is what only a PROJECT knows: the toolkit
+    to design for, the canvas, and the default model call.
+
+    The canvas is the PROJECT's. It used to be the fixed 1100 x 700 the
+    Designer's widget was, on the grounds that the shapes are about to be
+    placed on the canvas the user drags on — and now that the widget takes
+    the project's size, the project's size IS that canvas. Describing into
+    Typhon's 1504 x 1016 with 1100 x 700 would draw the new wireframe into
+    the top-left two-thirds of the window.
 
     Never raises; a failure is a result with ok=False and the reason.
     """
     import gui_describe
 
     toolkit = "tk"
+    canvas_w, canvas_h = CANVAS_W, CANVAS_H
     if project_dir:
         try:
             import gui_projects
             toolkit = gui_projects.toolkit_for(Path(project_dir))
         except Exception:                                # noqa: BLE001
             pass
+        canvas_w, canvas_h = canvas_of(project_dir)
     return gui_describe.describe(
         text, model_call=model_call or describe_model_call,
-        canvas_w=CANVAS_W, canvas_h=CANVAS_H, toolkit=toolkit)
+        canvas_w=canvas_w, canvas_h=canvas_h, toolkit=toolkit)
+
+
+def canvas_of(project_dir: Any) -> tuple:
+    """(w, h) of a project's design area; the new-project size if unreadable.
+
+    Never raises: it is asked while a panel is being DRAWN, and a canvas that
+    fails to open because its .gspec is damaged leaves the user nothing to
+    repair the file with.
+    """
+    try:
+        import gui_projects
+        import gui_shapes
+        project = gui_shapes.load_gspec(Path(project_dir)
+                                        / gui_projects.GSPEC_NAME)
+        return int(project.canvas.w), int(project.canvas.h)
+    except Exception:                                    # noqa: BLE001
+        return CANVAS_W, CANVAS_H
 
 
 # ============================================================

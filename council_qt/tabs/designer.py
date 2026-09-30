@@ -8,6 +8,7 @@ and very nearly keeps. Every decision is somewhere else:
     designer_paint    the 26 renderers
     designer_editor   press / drag / release / escape, and the commands
     designer_form     which rows the inspector shows, and what they mean
+    designer_geometry the design area's size, the zoom, a shape's box
     designer_project  new / open / save / generate / detach / review
     gui_layout        infers the grid        gui_spec    validates
     gui_emit          writes                 gui_policy  gates
@@ -16,6 +17,11 @@ and very nearly keeps. Every decision is somewhere else:
 WHAT IS DIFFERENT FROM THE TK TAB
 The inspector submits only the rows the user edited, so applying to a
 multi-selection no longer overwrites the shapes they never looked at.
+
+The canvas is the PROJECT's size, drawn at a zoom (Fit / 100% / − / + and
+Ctrl+wheel), and every path that changes which project is open — New, Open,
+the wizard — re-sizes it, as do the window panel's canvas rows and a
+described wireframe. A project that does not fit the view opens at Fit.
 
 Generate runs on a worker and reports through the bridge, same as Tk. Review
 does too, and so does Describe it — plain English in, a wireframe on the
@@ -39,6 +45,7 @@ from PySide6.QtWidgets import (QGroupBox, QHBoxLayout, QLabel, QListWidget,
                                QPlainTextEdit, QSplitter, QVBoxLayout, QWidget)
 
 from council_core import designer_form as form
+from council_core import designer_geometry as geometry
 from council_core import paths
 from council_core import designer_project as dp
 from council_core.wizard import TOOLKITS
@@ -187,7 +194,7 @@ class DesignerTab(ViewHelpers, QWidget):
 
         split = QSplitter(Qt.Orientation.Horizontal)
         split.addWidget(self._palette_box())
-        split.addWidget(in_scroll_area(self._make_canvas()))
+        split.addWidget(self._canvas_box())
         split.addWidget(self._inspector_box())
         split.setSizes([180, 1100, 260])
         outer.addWidget(split, 1)
@@ -235,6 +242,42 @@ class DesignerTab(ViewHelpers, QWidget):
         self.canvas.edited.connect(self._refresh_status)
         return self.canvas
 
+    def _canvas_box(self) -> QWidget:
+        """The canvas, its scroller, and the zoom controls above them.
+
+        Their own row rather than more buttons on the main bar: zoom is about
+        the VIEW, the main bar is about the project, and that bar is already
+        as wide as a laptop screen.
+        """
+        box = QWidget()
+        layout = QVBoxLayout(box)
+        layout.setContentsMargins(0, 0, 0, 0)
+        row = QHBoxLayout()
+        self.scroller = in_scroll_area(self._make_canvas())
+        for caption, slot, tip in (
+                ("Fit", self.scroller.fit, "The whole design in view"),
+                ("100%", self.scroller.actual_size, "Actual size"),
+                ("−", self.scroller.zoom_out, "Zoom out (Ctrl+wheel)"),
+                ("+", self.scroller.zoom_in, "Zoom in (Ctrl+wheel)")):
+            self._button(row, caption, slot).setToolTip(tip)
+        self.zoom_label = QLabel(geometry.percent(self.canvas.zoom))
+        self.zoom_label.setMinimumWidth(48)
+        row.addWidget(self.zoom_label)
+        row.addStretch(1)
+        self.size_label = QLabel()
+        self.size_label.setStyleSheet(f"color: {self._tokens['muted_fg']};")
+        row.addWidget(self.size_label)
+        layout.addLayout(row)
+        layout.addWidget(self.scroller, 1)
+        self.canvas.zoom_changed.connect(self._show_zoom)
+        self._show_zoom(self.canvas.zoom)
+        return box
+
+    def _show_zoom(self, zoom: float) -> None:
+        self.zoom_label.setText(geometry.percent(zoom))
+        self.size_label.setText(f"design {self.canvas.design_w} × "
+                                f"{self.canvas.design_h}")
+
     def _inspector_box(self) -> QWidget:
         box = QGroupBox("Properties")
         layout = QVBoxLayout(box)
@@ -272,6 +315,10 @@ class DesignerTab(ViewHelpers, QWidget):
                                        empty_text="(no project open)")
             return
         fields = list(form.fields_for(shapes))
+        # Its own group, for ONE shape only: one X applied to three shapes
+        # would stack them. Typed values land exactly, as one undo step — see
+        # designer_geometry for why they are not snapped.
+        fields += geometry.geometry_fields(shapes)
         if form.shows_single_shape_blocks(shapes):
             fields += form.port_fields(shapes[0])
             fields += form.colour_fields(shapes[0])
@@ -284,8 +331,10 @@ class DesignerTab(ViewHelpers, QWidget):
         result = self.actions.open_named(self.project)
         if not result.ok or result.project is None:
             return []
-        return form.window_fields(result.project.window,
-                                  getattr(result.project, "requires", []) or [])
+        return (form.window_fields(result.project.window,
+                                   getattr(result.project, "requires", [])
+                                   or [])
+                + geometry.canvas_fields(result.project.canvas))
 
     def on_apply_props(self, changes: dict) -> None:
         """Apply what the panel submitted.
@@ -298,11 +347,17 @@ class DesignerTab(ViewHelpers, QWidget):
         if not changes:
             return
         if self._selected_shapes():
-            self.canvas._obey(self.canvas.scene.apply_props(changes))
+            self.canvas._obey(self.canvas.scene.apply_props(
+                geometry.normalise_box(changes)))
             return
         result = self.actions.apply_window(self.project, changes,
                                            self.canvas.scene.shapes)
         self.log(result.message)
+        if result.ok and result.project is not None:
+            # The canvas rows may have changed the design area. Keep the
+            # zoom mode the user had: Fit stays Fit on the new size.
+            self._set_design(*self._design_size(result.project),
+                             reopen=False)
         self._refresh_status()
 
     # ==================================================================
@@ -316,19 +371,59 @@ class DesignerTab(ViewHelpers, QWidget):
         name = self.project or "no project"
         toolkit = f" [{self._toolkit}]" if self.project and self._toolkit else ""
         dirty = " *" if getattr(self.canvas.scene, "dirty", False) else ""
-        self.status.setText(f"{name}{toolkit}{dirty}")
+        # Counted on every refresh, which is every committed edit: a drag can
+        # carry a shape past the edge, and the status is where that shows.
+        # One pass over the shapes — nothing next to the repaint it follows.
+        off = (len(geometry.outside(self.canvas.scene.shapes,
+                                    self.canvas.design_w,
+                                    self.canvas.design_h))
+               if self.project else 0)
+        outside = f" — {off} outside the canvas" if off else ""
+        self.status.setText(f"{name}{toolkit}{dirty}{outside}")
 
-    def _load(self, shapes: Sequence[Any]) -> None:
+    def _load(self, shapes: Sequence[Any], project: Any = None) -> None:
+        """Put a project's shapes on the canvas, at the project's size.
+
+        ``project`` is the opened Project when the caller has one; without
+        it the size is read from the project's .gspec.
+        """
         self._toolkit = (self.actions.toolkit_label(self.project)
                          if self.project else "")
         self.canvas.scene.load(shapes)
-        self.canvas.update()
+        self._set_design(*self._design_size(project))
         self._show_selection()
         # The interpreter is per PROJECT, so every path that changes which
         # project is open has to re-read it. The Tk tab calls sync() from four
         # separate places for this reason.
         self.runwith.sync()
         self._refresh_status()
+
+    def _design_size(self, project: Any = None):
+        """(w, h) of the open project's design area."""
+        canvas = getattr(project, "canvas", None)
+        if canvas is not None:
+            return int(canvas.w), int(canvas.h)
+        if self.project:
+            return dp.canvas_of(self.actions.project_dir(self.project))
+        return geometry.DEFAULT_W, geometry.DEFAULT_H
+
+    def _set_design(self, width: int, height: int, *,
+                    reopen: bool = True) -> None:
+        """Size the canvas to the design and say what does not fit in it.
+
+        ``reopen`` starts the zoom over — 100% if the design fits the view,
+        else Fit — which is right for a project just opened. A resize of the
+        SAME project keeps the zoom the user chose, and keeps Fit fitting.
+        """
+        self.canvas.set_design_size(width, height)
+        if reopen:
+            self.scroller.open_zoom()
+        else:
+            self.scroller.reapply()
+        line = geometry.describe_outside(self.canvas.scene.shapes,
+                                         width, height)
+        if line and self.project:
+            self.log(line)
 
     # ==================================================================
     # Actions
@@ -385,7 +480,7 @@ class DesignerTab(ViewHelpers, QWidget):
         if not result.ok:
             return
         self.project = name
-        self._load(result.shapes)
+        self._load(result.shapes, result.project)
 
     def on_wizard(self) -> None:
         """Guided start.
@@ -417,7 +512,7 @@ class DesignerTab(ViewHelpers, QWidget):
             return
         self._leave_project()
         self.project = applied.name
-        self._load(applied.shapes)
+        self._load(applied.shapes, applied.project)
         self.canvas.scene.mark_saved()
         self._refresh_status()
 
@@ -555,6 +650,10 @@ class DesignerTab(ViewHelpers, QWidget):
                      "applied.")
             return
         self.canvas._obey(self.canvas.scene.replace_all(result.shapes))
+        # Described FOR the project's canvas (designer_project.describe), so
+        # this normally finds nothing outside; re-read anyway, because the
+        # size on disk is what Generate will lay the new shapes out against.
+        self._set_design(*self._design_size(), reopen=False)
         attempts = getattr(result, "attempts", 0)
         self.log(f"drew {len(result.shapes)} shape(s) from the description"
                  + (f" ({attempts} model call(s))" if attempts else "")
