@@ -394,6 +394,31 @@ def export_default(project_dir: Any) -> Tuple[str, str]:
     return "", f"{directory.name}.gspec"
 
 
+def _spelled_as_on_disk(target: Path) -> Path:
+    """`target`, spelled the way the file it names is ALREADY spelled.
+
+    On a case-insensitive file system "Typhon.gspec" names the existing
+    typhon.gspec. Writing it in place would keep that spelling; renaming a
+    temp file over it (which export does, so a failure cannot half-write a
+    shipped example) takes the typed one instead — and gui_examples keys an
+    example's notes and toolkit by its file's stem, so Typhon became an
+    example with no notes and no Qt default. A name with no existing file, or
+    an exact match, is returned as given.
+    """
+    try:
+        if not target.exists():
+            return target
+        for entry in target.parent.iterdir():
+            if entry.name == target.name:
+                return target
+            if (entry.name.casefold() == target.name.casefold()
+                    and os.path.samefile(entry, target)):
+                return entry
+    except OSError:
+        pass
+    return target
+
+
 def export_gspec(name: str, shapes: Sequence[Any], vault_dir: Any,
                  dest: Any) -> ExportResult:
     """Write project `name`, with `shapes`, to `dest` as a .gspec.
@@ -417,7 +442,7 @@ def export_gspec(name: str, shapes: Sequence[Any], vault_dir: Any,
     import gui_projects as gpj
     import gui_shapes as gs
 
-    target = Path(dest)
+    target = _spelled_as_on_disk(Path(dest))
     if not name:
         return ExportResult(False, "No project open.")
     started = time.perf_counter()

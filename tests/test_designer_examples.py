@@ -310,6 +310,35 @@ def test_a_failed_export_leaves_the_old_file_whole(tmp_path, monkeypatch):
     assert not list(tmp_path.glob("keep.gspec.tmp"))
 
 
+def _case_insensitive(folder: Path) -> bool:
+    probe = folder / "case_probe.txt"
+    probe.write_text("", encoding="utf-8")
+    try:
+        return (folder / "CASE_PROBE.TXT").exists()
+    finally:
+        probe.unlink()
+
+
+def test_export_over_a_file_spelled_in_another_case_keeps_its_name(tmp_path):
+    """Windows: the user types "Typhon" over the offered typhon.gspec. The
+    temp-file-and-rename used to rename the shipped example to Typhon.gspec,
+    and gui_examples keys NOTES / INTENDED_TOOLKIT by the file's stem — so
+    Typhon lost its notes and its Qt default in "New from example"."""
+    if not _case_insensitive(tmp_path):
+        pytest.skip("a case-sensitive file system has two files here")
+    dx.build(answers(project="p"), tmp_path)
+    folder = tmp_path / "examples"
+    folder.mkdir()
+    (folder / "typhon.gspec").write_text("old\n", encoding="utf-8")
+    shapes = gpj.open_project("p", tmp_path).shapes
+    result = dx.export_gspec("p", shapes, tmp_path, folder / "Typhon.gspec")
+    assert result.ok, result.message
+    assert [p.name for p in folder.iterdir()] == ["typhon.gspec"]
+    assert json.loads((folder / "typhon.gspec").read_text(
+        encoding="utf-8"))["project"] == "typhon"
+    assert result.path.name == "typhon.gspec"
+
+
 def test_export_offers_an_examples_own_file(tmp_path):
     built = dx.build(answers(), tmp_path)
     assert dx.export_default(built.project_dir) == (str(gx.EXAMPLES_DIR),
@@ -475,6 +504,32 @@ def test_a_finished_build_asks_before_discarding_canvas_edits(tab, qapp):
     assert tab.project == "drawing"
     assert "Open it when you are ready" in log_text(tab)
     assert gpj.project_path("example_typhon", tab.actions.vault_dir).exists()
+
+
+def test_a_build_landing_mid_drag_disarms_the_drag_before_it_asks(tab, qapp):
+    """The "open it and lose your edits?" confirm is modal and swallows the
+    mouse release. On "No" the move used to stay armed, with the shape left
+    wherever the drag had reached — moved, but never committed, so Undo
+    could not take it back. _apply_description escapes first for the same
+    reason; this path did not."""
+    from gui_shapes import new_shape
+    gpj.create("drawing", vault_dir=tab.actions.vault_dir)
+    tab.project = "drawing"
+    scene = tab.canvas.scene
+    tab.canvas._obey(scene.add_shapes([new_shape("button", 16, 16)]))
+    shape = scene.shapes[0]
+    home = (shape.x, shape.y, shape.w, shape.h)
+    cx, cy = shape.x + shape.w // 2, shape.y + shape.h // 2
+    scene.press(cx, cy)
+    scene.drag(cx + 96, cy + 64)
+    assert scene.mode == "move"
+    assert (scene.shapes[0].x, scene.shapes[0].y) != home[:2]
+    tab.script["confirm"].append(False)
+    build_typhon(qapp, tab)
+    assert tab.project == "drawing"
+    assert scene.mode is None
+    back = scene.shapes[0]
+    assert (back.x, back.y, back.w, back.h) == home
 
 
 def test_export_with_no_project_says_so(tab):

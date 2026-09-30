@@ -469,6 +469,12 @@ class DesignerTab(ViewHelpers, QWidget):
         away edits made while it was building. The build took seconds, and
         the user was free to keep drawing on the project that was open."""
         if getattr(self.canvas.scene, "dirty", False):
+            # A drag the build landed in the middle of is abandoned first, as
+            # _apply_description does: the confirm is modal and swallows the
+            # mouse release, so on "No" the gesture stayed armed and the shape
+            # stayed wherever the drag had reached — moved, but never
+            # committed, so Undo could not take it back.
+            self.canvas._obey(self.canvas.scene.escape())
             if not self.confirm(
                     "Open the new project?",
                     f"{name} is built. The canvas"
