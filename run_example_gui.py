@@ -36,12 +36,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-import gui_emit as ge          # noqa: E402
 import gui_examples as gx      # noqa: E402
-import gui_layout as gl        # noqa: E402
 import gui_projects as gpj     # noqa: E402
 import gui_shapes as gs        # noqa: E402
-import gui_spec as gsp         # noqa: E402
+from council_core import designer_examples as dx  # noqa: E402
 
 
 def build(name: str, *, project: str = "", force: bool = False,
@@ -49,14 +47,19 @@ def build(name: str, *, project: str = "", force: bool = False,
     """Materialise example ``name`` as a generated project. Returns its dir.
 
     ``python`` is recorded in the project's manifest (see python_envs), so the
-    designer's Run uses the same interpreter afterwards."""
+    designer's Run uses the same interpreter afterwards.
+
+    The pipeline itself is council_core.designer_examples.build_project — the
+    one the GUI Designer's "New from example" runs too, so a project built
+    here and one built there cannot differ (they used to be able to: this
+    copy never passed the window's minimum size, so every example opened at
+    gui_spec's 900x600). What stays HERE is --force: the Designer never
+    replaces a project, so deleting one is a decision made on this command
+    line and nowhere else."""
     if name not in gx.names():
         raise SystemExit(f"no such example: {name!r}\n"
                          f"available: {', '.join(gx.names()) or '(none)'}")
-    project = project or f"example_{name}"
-
-    src = gx.EXAMPLES_DIR / f"{name}.gspec"
-    proj = gs.load_gspec(src)
+    project = project or dx.default_project(name)
 
     pdir = gpj.project_path(project, vault_dir)
     if pdir.exists():
@@ -67,39 +70,24 @@ def build(name: str, *, project: str = "", force: bool = False,
                 f"alongside it.\nNOTE: --force deletes app.py and handlers.py "
                 f"too, which regeneration would normally never touch.")
         shutil.rmtree(pdir)
-    gpj.create(project, mode="linked", vault_dir=vault_dir, toolkit=target)
 
-    # The wireframe goes in first, so the project opens in the designer and
-    # can be edited and regenerated like any other.
-    proj.project = project
-    gpj.save_project(project, proj, vault_dir=vault_dir)
-
-    tree = gl.infer(proj.shapes, proj.canvas.w, proj.canvas.h)
-    spec = gsp.build(proj.shapes, tree, project=project,
-                     title=proj.window.title,
-                     root_bg=proj.window.bg, root_fg=proj.window.fg,
-                     root_font=proj.window.font,
-                     requires=proj.requires)
-    ok, errs = gsp.validate(spec)
-    if not ok:
-        # An example that cannot generate is a bug in the example, and saying
-        # so plainly beats emitting a broken project.
-        raise SystemExit("this example does not validate:\n  "
-                         + "\n  ".join(errs))
-
-    res = ge.emit(spec, pdir, target=target)
-    man = gpj.load_manifest(pdir)
-    man.port_names = spec.port_registry() if hasattr(spec, "port_registry") else {}
-    man.widget_names = spec.name_registry()
-    man.ui_checksums = gpj.ui_checksums(pdir)
-    man.python = str(python or "")
-    gpj.save_manifest(pdir, man)
+    try:
+        res = dx.build_project(name, project, vault_dir, python=python,
+                               toolkit=target)
+    except dx.ExampleError as exc:
+        raise SystemExit(str(exc))
 
     print(f"built {project!r}")
     for f in res.files_written:
         print(f"  wrote  {Path(f).relative_to(pdir)}")
     for f in res.files_skipped:
         print(f"  kept   {Path(f).relative_to(pdir)}  (never regenerated)")
+    note = dx.toolkit_warning(name, target)
+    if note:
+        # Said, not enforced: the default stays tk so an existing command line
+        # builds what it always built.
+        print(f"note: {note} Pass --target {gx.intended_toolkit(name)} to "
+              f"build it as intended.")
     return pdir
 
 
@@ -134,16 +122,16 @@ def main(argv=None) -> int:
         return 0
 
     import python_envs as pe
-    res = pe.resolve(args.python)
-    if res.error:
+    # The check the Designer's "New from example" dialog makes too. A path is
+    # saved ABSOLUTE: it goes in the manifest, and the designer's Run resolves
+    # it from wherever the Council was started.
+    spec, problem = dx.check_python(args.python)
+    if problem:
         # Refuse BEFORE building: a --force build deletes app.py and
         # handlers.py, and must not do that for an interpreter that is not
         # even there.
-        raise SystemExit(f"--python {args.python!r}: {res.error}")
-    if pe.looks_like_path(args.python):
-        # Saved in the manifest, and the designer's Run resolves it from
-        # wherever the Council was started — so never a relative path.
-        args.python = str(Path(args.python).expanduser().absolute())
+        raise SystemExit(f"--python {args.python!r}: {problem}")
+    args.python = spec
 
     pdir = build(args.example, project=args.project, force=args.force,
                  python=args.python, target=args.target)

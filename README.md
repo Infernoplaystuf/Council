@@ -512,6 +512,16 @@ That lists them. To build one and launch it:
 python run_example_gui.py barbie_capture_v3
 ```
 
+**Or without leaving the Council:** in the GUI Designer, **New from example…**
+lists the same examples with their notes, asks for a project name, the toolkit
+(Typhon and the v4/v5 camera forms come up as Qt, the toolkit they need) and the
+Python that will run the app, builds it on a background thread and opens it on
+the canvas. It never replaces a project — a name that is already taken is
+refused. **Export .gspec…** writes the open design back out (offering the
+example's own file in `examples/gui/`, and asking before it replaces one) in the
+same format the examples are stored in, so an unchanged example exports to an
+unchanged file.
+
 `barbie_capture_v3` is the current version: everything in v2, in **Arial**,
 plus a **frame classifier**. Type a class name and **Add class** (e.g. *good*,
 *bad timing*); pick a class in the list, scrub to a frame and **Mark this

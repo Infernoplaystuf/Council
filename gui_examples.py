@@ -129,6 +129,26 @@ NOTES: Dict[str, str] = {
     ),
 }
 
+# The toolkit each example is MEANT to be generated into, where that is known.
+# The notes above say it in prose ("Generate it for Qt"); this says it as data,
+# so the Designer's "New from example" can default to it. The camera examples
+# need Qt: their live view draws through the Qt ImageCanvas's set_array, and
+# frame_camera.attach is only written into a Qt app.py. An example that is
+# not listed has no recorded intent, and the user is ASKED — the toolkit
+# cannot be changed once app.py exists, so a guess would be a guess made
+# permanent.
+INTENDED_TOOLKIT: Dict[str, str] = {
+    "barbie_capture_v4": "qt",
+    "barbie_capture_v5": "qt",
+    "typhon": "qt",
+}
+
+
+def intended_toolkit(name: str) -> str:
+    """"qt" / "tk" for an example meant for one toolkit, else ""."""
+    return INTENDED_TOOLKIT.get(name, "")
+
+
 # The examples sent to a model when none is named. The newest version teaches
 # everything the older ones do; sending all of them tripled the context for
 # no new signal. Older versions remain loadable by name.

@@ -23,11 +23,25 @@ and to decide modality, which is the same job.
 """
 from __future__ import annotations
 
+import os
 from typing import Any, List, Optional, Sequence, Tuple
 
 from PySide6.QtWidgets import QFileDialog, QInputDialog, QMessageBox
 
 _Btn = QMessageBox.StandardButton
+
+
+def disabled() -> bool:
+    """COUNCIL_NO_DIALOGS — set for unattended and offscreen runs, where a
+    modal would wait forever for a click nobody can make.
+
+    Checked by the openers written since the flag existed (the Designer's
+    "New from example" and "Export .gspec"), which then answer "cancelled".
+    The functions below predate it and do not check it: their callers were
+    written against tkinter's always-ask behaviour, and changing that for all
+    73 at once is not a side effect to slip into a new feature.
+    """
+    return bool(os.environ.get("COUNCIL_NO_DIALOGS"))
 
 
 def _box(icon, title: str, message: str, parent=None) -> QMessageBox:
@@ -166,12 +180,18 @@ def askopenfilenames(title: str = "Open", initialdir: str = "",
 
 def asksaveasfilename(title: str = "Save as", initialdir: str = "",
                       initialfile: str = "", defaultextension: str = "",
-                      filetypes=None, parent=None, **_kw) -> str:
+                      filetypes=None, parent=None,
+                      confirmoverwrite: bool = True, **_kw) -> str:
+    """`confirmoverwrite` is tkinter's option of the same name. False when the
+    caller asks about an existing file itself — in words that say what will be
+    lost — so the user is not asked twice."""
     start = str(initialdir or "")
     if initialfile:
         start = f"{start}/{initialfile}" if start else str(initialfile)
+    options = (QFileDialog.Option(0) if confirmoverwrite
+               else QFileDialog.Option.DontConfirmOverwrite)
     path, _ = QFileDialog.getSaveFileName(parent, str(title), start,
-                                          _filters(filetypes))
+                                          _filters(filetypes), "", options)
     if path and defaultextension and "." not in path.rsplit("/", 1)[-1]:
         path += defaultextension
     return path or ""

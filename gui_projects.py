@@ -184,6 +184,11 @@ class Manifest:
     # in a WARNING line (gui_emit.plan_handlers). A real field, because
     # load_manifest drops unknown keys.
     script_links: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Which shipped example (examples/gui/<name>.gspec) this project was built
+    # from, "" for one the user drew. So the Designer's Export can offer to
+    # write an edited example back to its own file rather than making the
+    # user find it. Provenance only: nothing reads it to decide how to build.
+    example: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -219,6 +224,7 @@ def load_manifest(pdir: Any) -> Manifest:
         script_links={str(k): dict(v) for k, v in
                       (raw.get("script_links") or {}).items()
                       if isinstance(v, dict)},
+        example=str(raw.get("example") or ""),
     )
 
 

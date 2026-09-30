@@ -11,6 +11,7 @@ and very nearly keeps. Every decision is somewhere else:
     designer_geometry the design area's size, the zoom, a shape's box
     designer_wiring   what a button runs: modules, functions, ports, checks
     designer_project  new / open / save / generate / detach / review
+    designer_examples new from a shipped example / export .gspec
     gui_layout        infers the grid        gui_spec    validates
     gui_emit          writes                 gui_policy  gates
     gui_runner        previews
@@ -34,6 +35,15 @@ app.py is written in it and never rewritten. Open and New take their names from 
 modal typed into a dialog, so the tab itself never blocks — the host supplies
 `ask_text` / `ask_choice` / `confirm`, and a test supplies answers directly.
 That is also what keeps this file importable with no display.
+
+EXAMPLES COME IN, AND GO BACK OUT
+"New from example…" builds a shipped example (Typhon, the capture forms) into
+a new project through the same pipeline run_example_gui runs, on a worker,
+and opens it — so an example no longer needs a command line to be edited
+here. It never replaces a project: a taken name is refused. "Export .gspec…"
+writes the open design to a file the user picks, in the examples' own format,
+asking before it replaces one. Both dialogs come from the host too
+(`ask_example` / `ask_save_path`), for the same reasons.
 """
 from __future__ import annotations
 
@@ -46,6 +56,7 @@ from PySide6.QtWidgets import (QGroupBox, QHBoxLayout, QLabel, QListWidget,
                                QPlainTextEdit, QScrollArea, QSplitter,
                                QVBoxLayout, QWidget)
 
+from council_core import designer_examples as dx
 from council_core import designer_form as form
 from council_core import designer_geometry as geometry
 from council_core import designer_wiring as wiring
@@ -129,6 +140,19 @@ class DesignerActions:
     def detach(self, name: str):
         return dp.detach(self.project_dir(name))
 
+    def example_problem(self, answers) -> str:
+        return dx.problem(answers, self.vault_dir)
+
+    def build_example(self, answers):
+        """An example -> a new project. Blocking; a worker calls it."""
+        return dx.build(answers, self.vault_dir)
+
+    def export_default(self, name: str):
+        return dx.export_default(self.project_dir(name))
+
+    def export_gspec(self, name: str, shapes: Sequence[Any], dest):
+        return dx.export_gspec(name, shapes, self.vault_dir, dest)
+
     def stop(self, name: str) -> bool:
         import gui_runner
         directory = self.project_dir(name)
@@ -141,7 +165,9 @@ class DesignerTab(ViewHelpers, QWidget):
     def __init__(self, window=None, actions: Optional[DesignerActions] = None,
                  ask_text: Optional[Callable] = None,
                  ask_choice: Optional[Callable] = None,
-                 confirm: Optional[Callable] = None):
+                 confirm: Optional[Callable] = None,
+                 ask_example: Optional[Callable] = None,
+                 ask_save_path: Optional[Callable] = None):
         super().__init__()
         self.window = window
         self.bridge = getattr(window, "bridge", None)
@@ -162,6 +188,10 @@ class DesignerTab(ViewHelpers, QWidget):
         self.ask_text = ask_text or (lambda *a, **k: None)
         self.ask_choice = ask_choice or (lambda *a, **k: None)
         self.confirm = confirm or (lambda *a, **k: False)
+        #: () -> ExampleAnswers or None. The "New from example" dialog.
+        self.ask_example = ask_example or (lambda *a, **k: None)
+        #: (title, folder, file name) -> a path, or "" for cancelled.
+        self.ask_save_path = ask_save_path or (lambda *a, **k: "")
 
         self._build()
         self._refresh_status()
@@ -186,8 +216,11 @@ class DesignerTab(ViewHelpers, QWidget):
 
         bar = QHBoxLayout()
         for caption, slot in (("✨ Start with a wizard", self.on_wizard),
-                              ("New", self.on_new), ("Open", self.on_open),
+                              ("New", self.on_new),
+                              ("New from example…", self.on_new_from_example),
+                              ("Open", self.on_open),
                               ("Save", self.on_save),
+                              ("Export .gspec…", self.on_export),
                               ("⚙ Generate", self.on_generate),
                               ("▶ Run", self.on_run), ("■ Stop", self.on_stop),
                               ("Review with Council", self.on_review),
@@ -568,6 +601,115 @@ class DesignerTab(ViewHelpers, QWidget):
         self.project = name
         self._load(result.shapes, result.project)
 
+    def on_new_from_example(self) -> None:
+        """Build a shipped example into a NEW project, then open it.
+
+        The answers are checked again here, not only in the dialog: the host
+        may supply them from anywhere, and a name that was free when the
+        dialog opened may not be now. The build itself refuses a taken name
+        as well — nothing on this path can replace a project.
+
+        The build is a whole generate (layout, spec, seven files), so it runs
+        on a worker and the tab stays usable; the new project is opened when
+        it finishes.
+        """
+        if self._busy:
+            # Before the dialog, not after it: answering four questions only
+            # to be told "Already working" wastes them.
+            self.log("Already working — wait for it to finish.")
+            return
+        answers = self.ask_example()
+        if not answers:
+            return
+        problem = self.actions.example_problem(answers)
+        if problem:
+            self.log(problem)
+            return
+
+        def work() -> None:
+            try:
+                result = self.actions.build_example(answers)
+            except Exception as exc:                     # noqa: BLE001
+                result = dx.ExampleBuild(
+                    lines=[f"building the example failed: {exc!r}"])
+
+            def show() -> None:
+                self._busy = False
+                for line in result.lines:
+                    self.log(line)
+                if result.ok:
+                    self._open_built(result.name)
+                self._refresh_status()
+
+            self._to_ui(show)
+
+        self._start("building example…", work, name="designer-example")
+
+    def _open_built(self, name: str) -> None:
+        """Open a project a build just finished — unless that would throw
+        away edits made while it was building. The build took seconds, and
+        the user was free to keep drawing on the project that was open."""
+        if getattr(self.canvas.scene, "dirty", False):
+            # A drag the build landed in the middle of is abandoned first, as
+            # _apply_description does: the confirm is modal and swallows the
+            # mouse release, so on "No" the gesture stayed armed and the shape
+            # stayed wherever the drag had reached — moved, but never
+            # committed, so Undo could not take it back.
+            self.canvas._obey(self.canvas.scene.escape())
+            if not self.confirm(
+                    "Open the new project?",
+                    f"{name} is built. The canvas"
+                    f"{' (' + self.project + ')' if self.project else ''} has "
+                    f"unsaved changes — open {name} anyway and lose them? "
+                    f"(Save first to keep them.)"):
+                self.log(f"{name} is built — Open it when you are ready.")
+                return
+        self._leave_project()
+        opened = self.actions.open_named(name)
+        self.log(opened.message)
+        if not opened.ok:
+            return
+        self.project = name
+        self._load(opened.shapes)
+
+    def on_export(self) -> None:
+        """Write the open design to a .gspec the user picks.
+
+        Nothing is written without a path from the save dialog, and an
+        existing file is replaced only after a yes — the offered destination
+        for an example is its own file in examples/gui/, which is exactly the
+        file a reflex click would destroy. What is written is the canvas as
+        shown; everything else comes from the project.
+        """
+        if not self.project:
+            self.log("No project open.")
+            return
+        folder, filename = self.actions.export_default(self.project)
+        chosen = self.ask_save_path("Export .gspec", folder, filename)
+        if not chosen:
+            return
+        dest = Path(chosen)
+        if not dest.suffix:
+            dest = dest.with_name(dest.name + ".gspec")
+        if dest.exists() and not self.confirm(
+                "Replace the file?",
+                f"{dest} already exists.\n\nReplace it with the "
+                f"{self.project} wireframe? The file there now is not "
+                f"kept."):
+            self.log(f"not exported — {dest.name} was left as it was")
+            return
+        # The live shapes, not scene.export()'s deep copy: this runs to the
+        # end on the GUI thread, so nothing can drag them mid-write, and the
+        # copy was a fifth of the handler's time on Typhon's 58 shapes
+        # (profiled). export_gspec only reads them.
+        result = self.actions.export_gspec(
+            self.project, list(self.canvas.scene.shapes), dest)
+        self.log(result.message)
+        if result.ok and getattr(self.canvas.scene, "dirty", False):
+            self.log("note: exported the canvas as shown — the project "
+                     "itself still has unsaved changes; Save keeps them "
+                     "there too.")
+
     def on_wizard(self) -> None:
         """Guided start.
 
@@ -817,4 +959,11 @@ def build_designer(window) -> QWidget:
         title, prompt, choices, parent=tab)
     tab.confirm = lambda title, message: dialogs.askyesno(
         title, message, parent=tab)
+    # Both answer "cancelled" under COUNCIL_NO_DIALOGS rather than opening a
+    # modal nobody can close.
+    from ..widgets.example_dialog import ask_example, ask_export_path
+    tab.ask_example = lambda: ask_example(parent=tab,
+                                          vault_dir=tab.actions.vault_dir)
+    tab.ask_save_path = lambda title, folder, filename: ask_export_path(
+        tab, title, folder, filename)
     return tab
