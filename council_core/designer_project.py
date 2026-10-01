@@ -962,6 +962,16 @@ def role_model(role: str = DESCRIBE_ROLE) -> Dict[str, Any]:
         info["id"] = path
     except Exception:                                    # noqa: BLE001
         pass
+    if not info["id"]:
+        # Nothing assigned: ask the engine which model its routing will
+        # use (on this PC that is an auto-picked localhost Ollama model).
+        try:
+            import council_engine as _engine
+            served = getattr(_engine, "served_model", None)
+            if callable(served):
+                info["id"] = served(info["slot"]) or ""
+        except Exception:                                # noqa: BLE001
+            pass
     model_id = str(info["id"] or "")
     if model_id.startswith("ollama:"):
         info["name"] = model_id.split(":", 1)[1]

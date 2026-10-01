@@ -2063,6 +2063,18 @@ def effective_n_ctx(slot: str = "main") -> int:
         ollama_window = _OLLAMA_WINDOWS.get(slot or "main")
     if ollama_window:
         return int(ollama_window)
+    # A slot Ollama WILL serve, before its first call: the num_ctx it will
+    # be sent. Only what is known with no network and no config read — the
+    # backend is forced to Ollama, or the automatic pick is already made
+    # (served_model / an earlier call) and this interpreter has no llama_cpp
+    # to try first. Without this Describe budgeted its first prompt for 4096
+    # while Ollama was then sent 8192, and shed its worked examples.
+    with _ROUTE_LOCK:
+        picked = _AUTO_PICK
+    if _council_backend() == "ollama" or (
+            picked and _ollama_fallback_enabled()
+            and _ilu_fw.find_spec("llama_cpp") is None):
+        return _ollama_num_ctx(slot or "main", None)
     env_ctx = _env_n_ctx()
     if not _SLOT_INSTANCES and _LAST_N_CTX is None:
         return env_ctx if env_ctx is not None else _DEFAULT_N_CTX
@@ -2863,6 +2875,45 @@ def _target_for(slot: str, model: Optional[str] = None) -> Tuple[str, str]:
     return "gguf", ""
 
 
+def served_model(slot: str = "main") -> str:
+    """The model id that WOULD answer a call on ``slot`` right now —
+    "ollama:<name>" or a GGUF path — or "" when nothing can.
+
+    For callers that size their work by the model BEFORE its first call:
+    Describe picks tree or pixel mode and how many candidates from the
+    model's size, and on this PC's default setup (no llama_cpp, no slot
+    file) the slot path is empty while a localhost Ollama model answers —
+    it profiled that as "size unknown". Follows the same routing as a real
+    call; never loads a model, at most asks the local Ollama for its list
+    (cached)."""
+    try:
+        kind, name = _target_for(slot)
+    except Exception:                                     # noqa: BLE001
+        return ""
+    if kind == "ollama":
+        return f"ollama:{name}"
+    path = ""
+    try:
+        cfg = _slot_config()
+        s = cfg.slots.get(slot) or cfg.slots.get("main")
+        path = (s.path if s is not None else "") or ""
+    except Exception:                                     # noqa: BLE001
+        path = ""
+    if not path:
+        path = os.environ.get("COUNCIL_GGUF_PATH", "").strip()
+    if path and _ilu_fw.find_spec("llama_cpp") is not None \
+            and Path(path).is_file():
+        return path
+    if _ollama_fallback_enabled():
+        try:
+            from council_core import local_models
+            if local_models.ollama_reachable(local_models.ollama_host()):
+                return f"ollama:{_pick_default_ollama_model()}"
+        except Exception:                                 # noqa: BLE001
+            pass
+    return path
+
+
 def _fallback_to_ollama(slot: str, exc: BaseException) -> str:
     """The Ollama model to serve ``slot`` now that its GGUF cannot load —
     or ``exc`` again when the fallback is off or no server answers."""
@@ -2904,6 +2955,38 @@ def _ollama_num_ctx(slot: str, entry: Optional[Dict[str, Any]]) -> int:
     if isinstance(ctx, int) and ctx > 0:
         want = min(want, ctx)
     return max(512, int(want))
+
+
+#: Model families whose thinking cannot be switched off, only turned down
+#: (Ollama's "think" takes "low" | "medium" | "high" for them).
+_THINK_LEVEL_FAMILIES = ("gptoss", "gpt-oss")
+
+
+def ollama_think(entry: Optional[Dict[str, Any]]) -> Any:
+    """The "think" value to send for this model, or None to send nothing.
+
+    The Council's model calls are structured, short-reply tasks (a
+    wireframe, one function, a cited answer), where thinking mostly costs
+    time and reply budget. So: a model that can switch thinking OFF gets
+    False; gpt-oss, which cannot, gets its lowest level ("low"; Ollama's
+    default is "medium"). COUNCIL_OLLAMA_THINK overrides: "low" / "medium" /
+    "high" for gpt-oss, "1"/"on" to let other models think. A model that
+    does not think gets nothing at all — some servers reject the field.
+    """
+    caps = (entry or {}).get("capabilities") or []
+    if "thinking" not in caps:
+        return None
+    want = os.environ.get("COUNCIL_OLLAMA_THINK", "").strip().lower()
+    who = f"{(entry or {}).get('family', '')} {(entry or {}).get('name', '')}"
+    if any(f in who.lower() for f in _THINK_LEVEL_FAMILIES):
+        return want if want in ("low", "medium", "high") else "low"
+    return want in ("1", "true", "on", "yes")
+
+
+def _think_headroom() -> int:
+    """Extra num_predict for a call whose model will think first."""
+    raw = os.environ.get("COUNCIL_OLLAMA_THINK_HEADROOM", "").strip()
+    return int(raw) if raw.isdigit() else 768
 
 
 class _OllamaHTTPError(RuntimeError):
@@ -2953,6 +3036,7 @@ def _ollama_stream(host: str, name: str, messages: List[Dict[str, Any]], *,
                    timeout: Optional[float] = None,
                    token_callback: Optional[Callable[[str], None]] = None,
                    tools: Optional[List[Dict[str, Any]]] = None,
+                   think: Any = None,
                    ) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]]]:
     """One streamed /api/chat call: (text, stats, tool_calls).
 
@@ -2988,6 +3072,8 @@ def _ollama_stream(host: str, name: str, messages: List[Dict[str, Any]], *,
         payload["format"] = fmt
     if tools:
         payload["tools"] = tools
+    if think is not None:
+        payload["think"] = think
     body = json.dumps(payload).encode("utf-8")
     u = urllib.parse.urlsplit(host)
     path = (u.path or "").rstrip("/") + "/api/chat"
@@ -3209,6 +3295,12 @@ def _ollama_local(
     num_ctx = _ollama_num_ctx(slot, entry)
     with _ROUTE_LOCK:
         _OLLAMA_WINDOWS[slot] = num_ctx
+    think = ollama_think(entry)
+    if think not in (None, False):
+        # Thinking tokens count against num_predict: without room for them
+        # a structured reply is cut off mid-object (gpt-oss spent 285 of its
+        # tokens thinking on a short warm call, measured).
+        num_predict = int(num_predict) + _think_headroom()
     msgs, num_predict = _clamp_messages_to_ctx(
         messages, num_predict, num_ctx, count_tokens=_ollama_count)
     fmts: List[Any] = [json_schema, "json", None] if json_schema is not None \
@@ -3220,7 +3312,7 @@ def _ollama_local(
                 host, entry["name"], msgs, temperature=temperature,
                 num_predict=num_predict, num_ctx=num_ctx, fmt=fmt, seed=seed,
                 stop=stop, should_stop=should_stop, timeout=timeout,
-                token_callback=token_callback, tools=tools)
+                token_callback=token_callback, tools=tools, think=think)
         except _OllamaHTTPError as exc:
             low = exc.text.lower()
             if fmt is not None and exc.status >= 400 and any(

@@ -466,8 +466,17 @@ def run_gui_case(case: Dict[str, Any], backend: Backend, *,
     misses = acceptance_misses(case.get("expect") or {}, shapes)
     if misses:
         counts = [m for m in misses if _count_miss(m)]
-        row.update(category="count_bounds" if counts and len(counts) == len(misses)
-                   else "missing_required", detail="; ".join(misses)[:300],
+        category = ("count_bounds" if counts and len(counts) == len(misses)
+                    else "missing_required")
+        # Describe now SALVAGES a reply cut off mid-object (the complete
+        # shapes before the cut). The widgets that are then missing were
+        # never written: the cause is the token limit, not the model's
+        # understanding — count it where it belongs.
+        import gui_describe as gd
+        if any(gd._looks_cut_off(c.reply or "")
+               for c in backend.calls[start:]):
+            category = "truncated"
+        row.update(category=category, detail="; ".join(misses)[:300],
                    faults=misses)
         row["seconds"] = round(time.perf_counter() - t0, 2)
         return row

@@ -396,7 +396,8 @@ def bench_runner() -> Optional[Callable[..., Any]]:
     if _BENCH_RUNNER is not None:
         return _BENCH_RUNNER
     try:
-        from . import llm_bench  # type: ignore[attr-defined]
+        import importlib
+        llm_bench = importlib.import_module(f"{__package__}.llm_bench")
     except Exception:                                     # noqa: BLE001
         return None
     fn = getattr(llm_bench, "check_this_pc", None)

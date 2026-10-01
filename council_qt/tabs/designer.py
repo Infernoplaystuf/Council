@@ -199,9 +199,9 @@ class DesignerActions:
     code_model = None
 
     def plan_code(self, name: str, shapes: Sequence[Any], shape_id: str,
-                  request: dict):
+                  request: dict, should_stop=None):
         """Decide the signature, the file and what may be replaced. Reads
-        files only."""
+        files only — and asks the documentation servers, so Stop counts."""
         from council_core import designer_codebehind as dc
         return dc.plan(dc.Request(
             project_dir=self.project_dir(name), shapes=list(shapes),
@@ -210,7 +210,7 @@ class DesignerActions:
             inputs=list(request.get("inputs") or []),
             outputs=dict(request.get("outputs") or {}),
             function=request.get("function") or "",
-            n_best=request.get("n_best")))
+            n_best=request.get("n_best"), should_stop=should_stop))
 
     def write_code(self, plan, *, should_stop=None, on_progress=None):
         """The model, the gates, the smoke run. Blocking; a worker calls it.
@@ -561,7 +561,8 @@ class DesignerTab(ViewHelpers, QWidget):
             plan = review = None
             failure = ""
             try:
-                plan = self.actions.plan_code(name, snapshot, sid, request)
+                plan = self.actions.plan_code(name, snapshot, sid, request,
+                                              should_stop=stop.is_set)
                 if plan.ok:
                     review = self.actions.write_code(
                         plan, should_stop=stop.is_set, on_progress=progress)

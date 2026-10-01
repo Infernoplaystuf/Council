@@ -88,6 +88,11 @@ class Request:
     function: str = ""
     #: First-round samples; None = from the model's size.
     n_best: Optional[int] = None
+    #: Stop, honoured from planning on: planning asks the documentation
+    #: servers, and a wedged one held the writer for a whole server timeout
+    #: (the bundled server's is 120 s) before Stop was looked at.
+    should_stop: Optional[Callable[[], bool]] = field(
+        default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -284,7 +289,9 @@ def packages_named(instruction: str, requires: Sequence[str]) -> List[str]:
 
 
 def docs_for(instruction: str, requires: Sequence[str],
-             max_chars: int = 3000) -> Tuple[List[Dict[str, str]], str]:
+             max_chars: int = 3000,
+             should_stop: Optional[Callable[[], bool]] = None
+             ) -> Tuple[List[Dict[str, str]], str]:
     """(snippets, a note) from council_core.docs_qa when the task names a
     package and that module exists. Never raises; [] is the normal answer."""
     packages = packages_named(instruction, requires)
@@ -294,16 +301,24 @@ def docs_for(instruction: str, requires: Sequence[str],
         from council_core import docs_qa
     except Exception:                                    # noqa: BLE001
         return [], ""
-    try:
-        got = docs_qa.docs_context(instruction, packages=tuple(packages),
-                                   max_chars=int(max_chars))
-    except TypeError:
+    attempts = (
+        dict(packages=tuple(packages), max_chars=int(max_chars),
+             should_stop=should_stop),
+        # A docs_qa without Stop support still gets the packages: dropping
+        # them asked every server about every package.
+        dict(packages=tuple(packages), max_chars=int(max_chars)),
+        {})
+    got = None
+    for kwargs in attempts:
         try:
-            got = docs_qa.docs_context(instruction)
-        except Exception:                                # noqa: BLE001
-            return [], ""
-    except Exception as exc:                             # noqa: BLE001
-        return [], f"documentation lookup failed: {exc!r}"
+            got = docs_qa.docs_context(instruction, **kwargs)
+            break
+        except TypeError:
+            continue
+        except Exception as exc:                         # noqa: BLE001
+            return [], f"documentation lookup failed: {exc!r}"
+    else:
+        return [], ""
     out = []
     for s in got or []:
         if isinstance(s, dict) and str(s.get("text") or "").strip():
@@ -638,7 +653,8 @@ def _plan(out: Plan, req: Request) -> None:
     target.shortlist = gcb.shortlist(f"{req.instruction} {out.label}", infos)
     budget = gcb.budget_chars(n_ctx_for_coder())
     docs, note = docs_for(req.instruction, requires,
-                          max_chars=min(6000, budget // 3))
+                          max_chars=min(6000, budget // 3),
+                          should_stop=req.should_stop)
     target.docs = docs
     if note:
         out.notes.append(note)
