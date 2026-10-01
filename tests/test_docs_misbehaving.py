@@ -232,6 +232,8 @@ class _Http:
     def __init__(self, mode="json", mb=0.0):
         owner = self
         self.mode, self.mb = mode, mb
+        #: Set it and every later POST hangs: a wedged server.
+        self.wedged = threading.Event()
 
         class H(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -245,6 +247,9 @@ class _Http:
             def do_POST(self):
                 msg = json.loads(self.rfile.read(
                     int(self.headers["Content-Length"])))
+                if owner.wedged.is_set():
+                    time.sleep(30)
+                    return
                 if "id" not in msg:
                     self._send(202, b"")
                     return
@@ -295,6 +300,31 @@ def test_an_oversized_http_answer_is_refused(monkeypatch, mode):
             with pytest.raises(mc.McpConnectionError) as err:
                 c.call_tool("search_docs", {"query": "x"})
         assert "larger than 1 MB" in str(err.value)
+    finally:
+        h.close()
+
+
+def test_stop_and_timeout_are_prompt_against_a_wedged_http_server():
+    """The cancel notification was POSTed on the caller's thread with a 10 s
+    socket timeout: MEASURED Stop at 0.5 s -> 10.6 s, a 1 s timeout ->
+    11 s, against a server that stopped answering."""
+    h = _Http()
+    try:
+        c = mc.McpClient.http(f"http://127.0.0.1:{h.port}/x",
+                              timeout=1.0).connect()
+        h.wedged.set()
+        t0 = time.monotonic()
+        with pytest.raises(mc.McpTimeout):
+            c.call_tool("search_docs", {"query": "x"})
+        assert time.monotonic() - t0 < 3
+        stop = threading.Event()
+        threading.Timer(0.3, stop.set).start()
+        t0 = time.monotonic()
+        with pytest.raises(mc.McpCancelled):
+            c.call_tool("search_docs", {"query": "x"}, timeout=60,
+                        should_stop=stop.is_set)
+        assert time.monotonic() - t0 < 2.5
+        c.close()
     finally:
         h.close()
 

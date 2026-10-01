@@ -630,6 +630,14 @@ class HttpTransport(_Transport):
                                  daemon=True)
             t.start()
             return
+        if message.get("method") == "notifications/cancelled":
+            # Best effort, and never on the caller's clock: it is sent
+            # because the caller gave up — MEASURED, posting it inline to a
+            # wedged server turned Stop at 0.5 s into 10.6 s (the socket
+            # timeout) and a 1 s timeout into 11 s.
+            threading.Thread(target=self._post_inline, args=(message,),
+                             name="mcp-http-cancel", daemon=True).start()
+            return
         self._post_inline(message)
 
     def _post_inline(self, message: dict) -> None:

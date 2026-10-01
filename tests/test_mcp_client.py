@@ -365,7 +365,13 @@ def test_http_timeout_cancels_on_the_server(http_json):
         with pytest.raises(mc.McpTimeout):
             c.call_tool("slow", {"seconds": 5}, timeout=0.4)
         assert time.monotonic() - t0 < 1.5
-        seen = json.loads(c.call_tool("cancellations").text)
+        # The cancel is posted off the caller's thread (a wedged server must
+        # not hold Stop up), so it may land a moment after the timeout.
+        deadline = time.monotonic() + 3
+        seen = []
+        while not seen and time.monotonic() < deadline:
+            seen = json.loads(c.call_tool("cancellations").text)
+            time.sleep(0.05)
         assert seen, "the cancel notification never reached the server"
 
 
