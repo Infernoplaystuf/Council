@@ -892,7 +892,10 @@ def describe(text: str, project_dir: Any = None, *,
         toolkit=toolkit, profile=profile, should_stop=should_stop)
     line = stats_line(stats)
     if line and hasattr(result, "notes"):
-        result.notes.append(line)
+        # FIRST, not last: run_describe_prompts keeps notes[:8], and this is
+        # the only way the cost of each call reaches its jsonl — appended,
+        # a reply with a few synonyms and moved props pushed it out.
+        result.notes.insert(0, line)
     return result
 
 

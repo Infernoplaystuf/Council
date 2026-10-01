@@ -851,3 +851,37 @@ def test_a_failed_call_does_not_report_the_previous_calls_stats(
     line = next(n for n in result.notes if n.startswith("model calls:"))
     assert line.startswith("model calls: 1 on phi3.5"), line
     assert "2000 prompt + 6 reply tokens" in line, line
+
+
+def test_the_cost_line_survives_the_graded_harness_note_cut(
+        vault, monkeypatch):
+    """REVIEW: run_describe_prompts records ``notes[:8]`` — the only place
+    the per-call tokens and seconds reach its jsonl — and the cost line was
+    appended LAST, so a small model's reply with a few synonyms and moved
+    props pushed it out of what the measuring phase keeps."""
+    import json
+    from council_core import model_slots
+    monkeypatch.setattr(model_slots, "current",
+                        _FakeSlots("ollama:phi3.5").current)
+    eng = _fake_engine([{"id": "ollama:phi3.5", "params_b": 3.8}], 4096)
+    sloppy = {"window": {"title": "Login"}, "layout": {
+        "kind": "column", "children": [
+            {"kind": "dropdown", "label": "Mode", "values": ["A", "B"]},
+            {"kind": "textbox", "label": "Name", "x": 10, "y": 10},
+            {"kind": "password", "label": "Secret"},
+            {"kind": "checkbox", "label": "Remember", "text": "Remember"},
+            {"kind": "btn", "label": "Sign in", "script": "x.y"},
+            {"kind": "toolbar", "label": "Tools",
+             "children": ["Open", "Save"]}]}}
+
+    def local_chat(messages, **_kw):
+        return json.dumps(sloppy)
+    eng.local_chat = local_chat
+    eng.last_call_stats = lambda role=None: {
+        "backend": "ollama", "model": "phi3.5", "prompt_tokens": 2000,
+        "gen_tokens": 120, "seconds": 3.0, "constrained": True}
+    monkeypatch.setitem(sys.modules, "council_engine", eng)
+    result = dp.describe("a login form", project(vault, name="q"))
+    assert result.ok, result.errors
+    assert len(result.notes) > 8, result.notes
+    assert any(n.startswith("model calls:") for n in result.notes[:8]),         result.notes
