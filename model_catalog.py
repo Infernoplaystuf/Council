@@ -18,11 +18,24 @@ download dialog, and the README generator):
 
 Add a model by appending one ModelSpec entry. No other file needs editing —
 the wizard and docs read from MODELS directly.
+
+OLLAMA TAGS AND THE 8 GB TIER
+Each entry also names its Ollama tag (`ollama`), so the Models tab can say a
+candidate is ALREADY on this PC — on the RTX 4070 Laptop this was built on,
+the council env has no llama-cpp-python and Ollama is the runtime that works.
+`good_for` lists the extra council roles a general model is a strong pick for
+("code", "docs"), so a role-aware search finds them. For an 8 GB card with
+32 GB of RAM the US candidates are: Llama 3.1 8B (fits fully, native tool
+calling), Phi-4 14B and Gemma 3 12B (partial offload — some layers in RAM,
+several times slower), and gpt-oss-20b (an MoE: ~3.6B parameters active per
+token, so it spills to RAM far more cheaply than a dense model). Nothing here
+is downloaded by being listed.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -42,6 +55,24 @@ class ModelSpec:
     blurb: str             # one-line for menus / READMEs
     is_default: bool = False
     tags: List[str] = field(default_factory=list)
+    ollama: str = ""       # the same model's Ollama tag ("llama3.1:8b")
+    good_for: Tuple[str, ...] = ()   # extra council roles: "code", "docs"
+    active_params_b: Optional[float] = None   # MoE: parameters per token
+
+    @property
+    def is_moe(self) -> bool:
+        return bool(self.active_params_b) and \
+            self.active_params_b < self.params_b
+
+    @property
+    def effective_params_b(self) -> float:
+        """A dense-equivalent size for ranking: an MoE's quality sits between
+        its active and total counts (the geometric mean is the usual rule of
+        thumb), so gpt-oss-20b (3.6B active) is not ranked above a dense
+        14B by its 20.9B total."""
+        if self.is_moe:
+            return round(math.sqrt(self.params_b * self.active_params_b), 1)
+        return self.params_b
 
 
 # ============================================================
@@ -67,9 +98,8 @@ MODELS: List[ModelSpec] = [
         blurb="Solid general baseline. Conservative refusals; good with tabular data.",
         is_default=True,
         tags=["default", "balanced"],
+        ollama="granite3.1-dense:8b",
     ),
-
-    # ─── Meta Llama family ─────────────────────────────────
     ModelSpec(
         id="llama-3.1-8b-q5",
         name="Meta Llama 3.1 8B Instruct (Q5_K_M)",
@@ -82,6 +112,8 @@ MODELS: List[ModelSpec] = [
         license="Llama 3.1 Community License",
         blurb="Long-context generalist. Best for big folder dumps / multi-CSV context.",
         tags=["long-context"],
+        ollama="llama3.1:8b-instruct-q5_K_M",
+        good_for=("code", "docs"),
     ),
     ModelSpec(
         id="llama-3.2-3b-q5",
@@ -95,6 +127,7 @@ MODELS: List[ModelSpec] = [
         license="Llama 3.2 Community License",
         blurb="Fast, fits 8 GB cards comfortably. Good for routing / classification.",
         tags=["small", "fast"],
+        ollama="llama3.2:3b",
     ),
     ModelSpec(
         id="llama-3.2-1b-q8",
@@ -108,6 +141,7 @@ MODELS: List[ModelSpec] = [
         license="Llama 3.2 Community License",
         blurb="Tiny. CPU-friendly. Use for quick demos or constrained boxes.",
         tags=["tiny", "cpu-friendly"],
+        ollama="llama3.2:1b",
     ),
 
     # ─── Microsoft Phi family ──────────────────────────────
@@ -121,8 +155,12 @@ MODELS: List[ModelSpec] = [
         hf_repo="bartowski/phi-4-GGUF",
         hf_file="phi-4-Q4_K_M.gguf",
         license="MIT",
-        blurb="Best reasoning at this VRAM tier. Pick for analyst Q&A on dense data.",
+        blurb="Best reasoning at this VRAM tier. Pick for analyst Q&A on dense "
+              "data. On an 8 GB card it runs with partial offload (about 24 "
+              "of 40 layers on the GPU at 8K), several times slower.",
         tags=["reasoning", "recommended-16gb"],
+        ollama="phi4:14b",
+        good_for=("code",),
     ),
     ModelSpec(
         id="phi-3.5-mini-q5",
@@ -136,6 +174,7 @@ MODELS: List[ModelSpec] = [
         license="MIT",
         blurb="Compact, strong reasoning. Great middle-ground for 8 GB VRAM.",
         tags=["small", "reasoning"],
+        ollama="phi3.5",
     ),
 
     # ─── Google Gemma ──────────────────────────────────────
@@ -151,12 +190,18 @@ MODELS: List[ModelSpec] = [
         license="Gemma Terms of Use",
         blurb="Polished prose; helpful for write-ups. Short native context.",
         tags=["writing"],
+        ollama="gemma2:9b",
     ),
 
-    # ─── Coder models (Council's Coder role) ───────────────
+    # ─── Coder role ────────────────────────────────────────
+    # The id is kept (settings may name it) but the entry is no longer
+    # BOGUS: it was "IBM Granite 3.0 8B Code Instruct" — no such model —
+    # pointing at granite-3.0-8b-instruct, a general instruct model. It is
+    # labelled as what the file is; the Coder role's stronger picks come in
+    # through `good_for` (Llama 3.1 8B, Phi-4, gpt-oss-20b).
     ModelSpec(
         id="granite-3-8b-code-q4",
-        name="IBM Granite 3.0 8B Code Instruct (Q4_K_M)",
+        name="IBM Granite 3.0 8B Instruct (Q4_K_M)",
         org="IBM",
         role="code",
         params_b=8.0, quant="Q4_K_M", size_gb=4.6, context_k=128,
@@ -164,8 +209,11 @@ MODELS: List[ModelSpec] = [
         hf_repo="bartowski/granite-3.0-8b-instruct-GGUF",
         hf_file="granite-3.0-8b-instruct-Q4_K_M.gguf",
         license="Apache-2.0",
-        blurb="Code-friendly IBM model. Wire into the Coder role if you have RAM headroom for a second hot model.",
+        blurb="General IBM instruct model trained with a large code share "
+              "(not a code-specialised model). A Coder-role option when "
+              "Llama 3.1 8B is not wanted.",
         tags=["code"],
+        ollama="granite3-dense:8b",
     ),
 
     # ─── AllenAI OLMo 2 — fully open US model ─────────────
@@ -181,6 +229,75 @@ MODELS: List[ModelSpec] = [
         license="Apache-2.0",
         blurb="Fully open weights + training data (Allen Institute). Pick for transparency.",
         tags=["fully-open", "transparent"],
+        ollama="olmo2:13b",
+    ),
+
+    # ─── Added for the 8 GB-card tier (2026-10) ─────────────
+    # Appended, as this module asks: the first nine keep their order.
+    ModelSpec(
+        id="llama-3.1-8b-q4",
+        name="Meta Llama 3.1 8B Instruct (Q4_K_M)",
+        org="Meta",
+        role="general",
+        params_b=8.0, quant="Q4_K_M", size_gb=4.9, context_k=128,
+        vram_gb_q4=6.2,
+        hf_repo="bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
+        hf_file="Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        license="Llama 3.1 Community License",
+        blurb="The 8 GB-card pick: fits the GPU with an 8K window, native "
+              "tool calling in Ollama (the docs role's documentation "
+              "server), good at code.",
+        tags=["recommended-8gb", "tools"],
+        ollama="llama3.1:8b",
+        good_for=("code", "docs"),
+    ),
+    ModelSpec(
+        id="gemma-3-4b-q4",
+        name="Google Gemma 3 4B Instruct (Q4_K_M)",
+        org="Google",
+        role="general",
+        params_b=4.3, quant="Q4_K_M", size_gb=2.5, context_k=128,
+        vram_gb_q4=3.6,
+        hf_repo="bartowski/google_gemma-3-4b-it-GGUF",
+        hf_file="google_gemma-3-4b-it-Q4_K_M.gguf",
+        license="Gemma Terms of Use",
+        blurb="Small and quick with a long window; a fast-role pick for 8 GB.",
+        tags=["small", "fast"],
+        ollama="gemma3:4b",
+    ),
+    ModelSpec(
+        id="gemma-3-12b-q4",
+        name="Google Gemma 3 12B Instruct (Q4_K_M)",
+        org="Google",
+        role="general",
+        params_b=12.2, quant="Q4_K_M", size_gb=7.3, context_k=128,
+        vram_gb_q4=9.5,
+        hf_repo="bartowski/google_gemma-3-12b-it-GGUF",
+        hf_file="google_gemma-3-12b-it-Q4_K_M.gguf",
+        license="Gemma Terms of Use",
+        blurb="Strong writer for 12 GB cards; partial offload on 8 GB.",
+        tags=["writing"],
+        ollama="gemma3:12b",
+    ),
+
+    ModelSpec(
+        id="gpt-oss-20b",
+        name="OpenAI gpt-oss-20b (MXFP4)",
+        org="OpenAI",
+        role="general",
+        params_b=20.9, quant="MXFP4", size_gb=12.8, context_k=128,
+        vram_gb_q4=14.0,
+        hf_repo="ggml-org/gpt-oss-20b-GGUF",
+        hf_file="gpt-oss-20b-mxfp4.gguf",
+        license="Apache-2.0",
+        blurb="Mixture of experts: ~3.6B parameters active per token, so with "
+              "the experts in RAM it runs on an 8 GB card + 32 GB RAM (Ollama "
+              "places them; llama-cpp-python 0.3.35 offloads whole layers "
+              "only). Native tool calling; strong at code.",
+        tags=["moe", "tools", "reasoning"],
+        ollama="gpt-oss:20b",
+        good_for=("code", "docs"),
+        active_params_b=3.6,
     ),
 ]
 
@@ -206,12 +323,31 @@ def fits(spec: ModelSpec, vram_gb: float) -> bool:
     return spec.vram_gb_q4 + 1.5 <= vram_gb
 
 
+def serves(spec: ModelSpec, role: str) -> bool:
+    """The entry's own role, or one it is listed as good for."""
+    return spec.role == role or role in spec.good_for
+
+
+def fit_kind(spec: ModelSpec, vram_gb: Optional[float],
+             ram_gb: Optional[float] = None) -> str:
+    """'gpu' (fits() — weights, a 4K window and the margin on the card),
+    'partial' (some layers on the card, the rest in system RAM — needs a
+    usable GPU and the weights within 60% of RAM), else 'cpu'."""
+    if vram_gb and fits(spec, vram_gb):
+        return "gpu"
+    if vram_gb and vram_gb >= 4 and (not ram_gb
+                                     or spec.size_gb <= ram_gb * 0.6):
+        return "partial"
+    return "cpu"
+
+
 def for_vram(vram_gb: float, *, role: str = "general") -> List[ModelSpec]:
     """Return models that fit a VRAM budget for the requested role,
     sorted by recommendation strength (defaults first, then by params
     descending — bigger models within budget are usually preferred)."""
-    out = [m for m in MODELS if m.role == role and fits(m, vram_gb)]
-    return sorted(out, key=lambda m: (not m.is_default, -m.params_b))
+    out = [m for m in MODELS if serves(m, role) and fits(m, vram_gb)]
+    return sorted(out, key=lambda m: (not m.is_default,
+                                      -m.effective_params_b))
 
 
 def download_command(spec: ModelSpec, *, dest: str = "./models") -> str:

@@ -41,28 +41,177 @@ def detect() -> Dict[str, Any]:
         gpu_name:          full GPU model string (or None)
         vram_gb:           VRAM in GB on the primary GPU (or None)
         cuda_max:          max CUDA version the driver supports, e.g. 12.4 (or None)
+        vram_free_gb:      free VRAM right now (nvidia-smi), or None
+        gpu_mem_clock_mhz: the GPU's max memory clock (nvidia-smi), or None
+        cpu_p_cores:       performance cores on a hybrid CPU (Windows), or None
+        cpu_e_cores:       efficiency cores on a hybrid CPU, or None
+        cpu_logical:       logical processors
+        ram_speed_mts:     DIMM speed in MT/s (Windows), or None
         recommended:       sub-dict with "model_tier", "cuda_tier", "n_ctx_max"
         notes:             list of human-readable observations
     """
+    split = cpu_core_split()
+    # The RAM-speed query is a PowerShell CIM call (~1.5-2 s measured; wmic
+    # is gone on this Windows 11). Run it beside the other probes instead of
+    # after them: detect() measured 3.1 s before it, 5.0 s run serially.
+    import threading
+    speed: Dict[str, Optional[int]] = {}
+    speed_thread = threading.Thread(
+        target=lambda: speed.__setitem__("mts", _ram_speed_mts()),
+        name="ram-speed-probe", daemon=True)
+    speed_thread.start()
     info: Dict[str, Any] = {
         "os":           _detect_os(),
         "os_version":   _os_version(),
         "python":       platform.python_version(),
         "cpu_brand":    _cpu_brand(),
         "cpu_cores":    _cpu_cores(),
+        "cpu_p_cores":  split.get("p_cores"),
+        "cpu_e_cores":  split.get("e_cores"),
+        "cpu_logical":  split.get("logical"),
         "ram_gb":       _ram_gb(),
+        "ram_speed_mts": None,
         "has_avx2":     False,
         "has_f16c":     False,
         "gpu_vendor":   None,
         "gpu_name":     None,
         "vram_gb":      None,
+        "vram_free_gb": None,
+        "gpu_mem_clock_mhz": None,
         "cuda_max":     None,
         "notes":        [],
     }
     _fill_cpu_features(info)
     _fill_gpu(info)
     info["recommended"] = _recommend(info)
+    speed_thread.join(timeout=7)
+    info["ram_speed_mts"] = speed.get("mts")
     return info
+
+
+# ============================================================
+# P-cores / E-cores (hybrid Intel CPUs)
+# ============================================================
+
+def cpu_core_split() -> Dict[str, Optional[int]]:
+    """{"p_cores", "e_cores", "physical", "logical"} — stdlib only.
+
+    WHY: llama.cpp splits each matrix evenly across its threads, so on a
+    hybrid CPU one E-core thread holds the P-core threads up every token.
+    psutil cannot tell the two apart (it reports 20 "physical" cores on the
+    i7-14700HX: 8 P + 12 E). Windows can: GetLogicalProcessorInformationEx
+    gives each core an EfficiencyClass, and the P-cores are the highest.
+    On a CPU with one class (most AMD and pre-12th-gen Intel) p_cores is
+    every physical core and e_cores is 0. Never raises; unknowns are None.
+    """
+    out: Dict[str, Optional[int]] = {"p_cores": None, "e_cores": None,
+                                     "physical": None,
+                                     "logical": os.cpu_count()}
+    if sys.platform.startswith("win"):
+        try:
+            classes, logical = _win_core_classes()
+            if classes:
+                top = max(classes)
+                out["physical"] = sum(classes.values())
+                out["p_cores"] = classes[top]
+                out["e_cores"] = out["physical"] - classes[top]
+                out["logical"] = logical or out["logical"]
+                return out
+        except Exception:
+            pass
+    phys = _cpu_cores()
+    out["physical"] = phys
+    out["p_cores"] = phys
+    out["e_cores"] = 0 if phys else None
+    return out
+
+
+def _win_core_classes():
+    """({efficiency class: core count}, logical processors) from
+    GetLogicalProcessorInformationEx(RelationProcessorCore).
+
+    Record layout (winnt.h): DWORD Relationship, DWORD Size, then a
+    PROCESSOR_RELATIONSHIP — BYTE Flags, BYTE EfficiencyClass,
+    BYTE Reserved[20], WORD GroupCount, then GROUP_AFFINITY entries
+    (KAFFINITY Mask, WORD Group, WORD Reserved[3]) aligned to 8.
+    """
+    import ctypes
+    import struct
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    fn = k32.GetLogicalProcessorInformationEx
+    fn.argtypes = [ctypes.c_int, ctypes.c_void_p,
+                   ctypes.POINTER(wintypes.DWORD)]
+    fn.restype = wintypes.BOOL
+    relation_processor_core = 0
+    size = wintypes.DWORD(0)
+    fn(relation_processor_core, None, ctypes.byref(size))
+    if not size.value:
+        return {}, 0
+    buf = ctypes.create_string_buffer(size.value)
+    if not fn(relation_processor_core, buf, ctypes.byref(size)):
+        return {}, 0
+    raw = buf.raw[:size.value]
+    ptr_size = ctypes.sizeof(ctypes.c_void_p)
+    classes: Dict[int, int] = {}
+    logical = 0
+    off = 0
+    while off + 8 <= len(raw):
+        rel, rec_size = struct.unpack_from("<II", raw, off)
+        if rec_size <= 0:
+            break
+        if rel == relation_processor_core:
+            eff = raw[off + 9]
+            groups = struct.unpack_from("<H", raw, off + 8 + 22)[0]
+            mask_off = off + 8 + 24
+            for g in range(max(1, groups)):
+                fmt = "<Q" if ptr_size == 8 else "<I"
+                mask = struct.unpack_from(fmt, raw,
+                                          mask_off + g * (ptr_size + 8))[0]
+                logical += bin(mask).count("1")
+            classes[eff] = classes.get(eff, 0) + 1
+        off += rec_size
+    return classes, logical
+
+
+def quick_memory():
+    """(total VRAM GB, total RAM GB) without the rest of detect() — what the
+    engine needs to pick a default model that fits. One nvidia-smi call."""
+    vram = None
+    try:
+        exe = shutil.which("nvidia-smi")
+        if exe:
+            r = subprocess.run(
+                [exe, "--query-gpu=memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            first = (r.stdout or "").strip().splitlines()
+            if first and first[0].strip().isdigit():
+                vram = round(int(first[0].strip()) / 1024, 1)
+    except Exception:
+        vram = None
+    return vram, _ram_gb()
+
+
+def _ram_speed_mts() -> Optional[int]:
+    """Configured DIMM speed (MT/s) — the number that bounds CPU-side token
+    generation (DDR5-5600 dual channel ≈ 89.6 GB/s). Windows only; one
+    PowerShell CIM query, so detect() stays on a worker."""
+    if not sys.platform.startswith("win"):
+        return None
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-CimInstance Win32_PhysicalMemory | "
+             "Measure-Object -Property ConfiguredClockSpeed -Maximum)"
+             ".Maximum"],
+            capture_output=True, text=True, timeout=6,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        v = (r.stdout or "").strip().splitlines()
+        return int(v[-1]) if v and v[-1].strip().isdigit() else None
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -321,7 +470,8 @@ def _try_nvidia_smi(info: Dict[str, Any]) -> bool:
         # Query GPU name + total memory in MB
         r = subprocess.run(
             ["nvidia-smi",
-             "--query-gpu=name,memory.total,driver_version",
+             "--query-gpu=name,memory.total,driver_version,memory.free,"
+             "clocks.max.memory",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=4,
         )
@@ -334,6 +484,19 @@ def _try_nvidia_smi(info: Dict[str, Any]) -> bool:
             info["gpu_name"]   = parts[0]
             try:
                 info["vram_gb"] = round(float(parts[1]) / 1024, 1)
+            except Exception:
+                pass
+        # Free VRAM (what a model can actually have now) and the memory
+        # clock (decode speed is bounded by memory bandwidth). "[N/A]" on
+        # GPUs that do not report one — left as None.
+        if len(parts) >= 4:
+            try:
+                info["vram_free_gb"] = round(float(parts[3]) / 1024, 1)
+            except Exception:
+                pass
+        if len(parts) >= 5:
+            try:
+                info["gpu_mem_clock_mhz"] = int(float(parts[4]))
             except Exception:
                 pass
         # Parse "CUDA Version: 12.4" from the smi header
@@ -404,19 +567,15 @@ def _recommend(info: Dict[str, Any]) -> Dict[str, Any]:
     # driver overhead.
     if vram >= 22:
         model_tier = "large"      # 30-70B class
-        model_pick = "Llama 3.3 70B Q4 (or stay with Phi-4 14B for speed)"
     elif vram >= 12:
         model_tier = "medium"     # 14B class
-        model_pick = "Phi-4 14B Q4_K_M"
     elif vram >= 7:
         model_tier = "small"      # 7-9B class
-        model_pick = "Llama 3.1 8B Instruct Q5_K_M  (or Gemma 2 9B)"
     elif vram >= 4 or ram >= 16:
         model_tier = "tiny"       # 3B class
-        model_pick = "Llama 3.2 3B Instruct Q4_K_M"
     else:
         model_tier = "cpu_only"
-        model_pick = "Llama 3.2 3B Instruct Q4_K_M  (CPU inference)"
+    model_pick = _catalog_pick(vram if has_gpu else 0)
 
     # n_ctx ceiling — proportional to VRAM after subtracting model
     # weights. Powers of two so it lines up with the engine's
@@ -438,6 +597,26 @@ def _recommend(info: Dict[str, Any]) -> Dict[str, Any]:
         "model_pick":  model_pick,
         "n_ctx_max":   n_ctx_max,
     }
+
+
+def _catalog_pick(vram_gb: float) -> str:
+    """The pick, from model_catalog.fits — the SAME rule the Models tab ranks
+    with. It used to be a hard-coded string per tier, and for 8 GB it named
+    "Llama 3.1 8B Q5_K_M (or Gemma 2 9B)" — both of which the catalog rejects
+    on 8 GB (7.0 and 7.5 GB + the 1.5 GB margin). Now the first two general
+    models that fit, defaults first; with no usable GPU, the smallest."""
+    try:
+        import model_catalog as mc
+    except Exception:
+        return "Llama 3.2 3B Instruct Q4_K_M"
+    fitting = mc.for_vram(vram_gb, role="general") if vram_gb else []
+    if fitting:
+        names = [m.name for m in fitting[:2]]
+        return names[0] + (f"  (or {names[1]})" if len(names) > 1 else "")
+    small = sorted((m for m in mc.MODELS if m.role == "general"),
+                   key=lambda m: m.size_gb)
+    return (small[0].name + "  (CPU inference)") if small else \
+        "Llama 3.2 3B Instruct Q4_K_M  (CPU inference)"
 
 
 # ============================================================

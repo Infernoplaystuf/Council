@@ -94,7 +94,15 @@ class UiBridge(QObject):
     def post(self, item: Any) -> None:
         """Queue a message for the dispatcher. Safe from any thread."""
         self.q.put(item)
-        self.wake.emit()
+        try:
+            self.wake.emit()
+        except RuntimeError:
+            # "Signal source has been deleted": the window that owned this
+            # bridge closed while a worker was finishing. Nothing will drain
+            # the queue now, so there is nothing to wake — and the worker
+            # must not die of it. Seen in the all-tabs harness from the
+            # Models tab's model-assess worker once detect() got slower.
+            pass
 
     def call_on_ui(self, fn: Callable, *args, **kwargs) -> None:
         """Run ``fn`` on the GUI thread, soon. Safe from any thread.

@@ -106,14 +106,45 @@ def fits_hardware(vram_gb: Optional[float], ram_gb: Optional[float],
 
 # ---- catalog ranking (offline, authoritative) ----
 
+#: Council role -> the catalog role it is ranked as. The Coder and Docs roles
+#: write code; everything else is general.
+CATALOG_ROLE_FOR = {"coder": "code", "code": "code", "docs": "docs"}
+
+
+def catalog_role(role: str) -> str:
+    return CATALOG_ROLE_FOR.get((role or "").lower(), role or "general")
+
+
+def role_for_task(task: str) -> str:
+    """The Models tab's free-text Task box -> a catalog role. It used to reach
+    only the online Hugging Face query, so typing "coding" never changed the
+    offline ranking at all."""
+    t = (task or "").lower()
+    if re.search(r"\b(doc|docs|documentation|api reference|mcp|library "
+                 r"docs|package docs)\b", t):
+        return "docs"
+    if re.search(r"\b(cod(e|ing|er)|program\w*|python|script\w*|gui|handler"
+                 r"|function)\b", t):
+        return "code"
+    return "general"
+
+
 def recommend_from_catalog(vram_gb: Optional[float] = None,
                            ram_gb: Optional[float] = None,
                            role: str = "general",
                            limit: int = 5) -> List[Dict[str, Any]]:
     """Rank the curated US-only catalog by fit for this machine + role.
     Always returns SOMETHING runnable: if nothing fits VRAM, the smallest
-    models are returned (they'll run on CPU)."""
-    role_models = [m for m in _cat.MODELS if m.role == role] or list(_cat.MODELS)
+    models are returned (they'll run on CPU).
+
+    A model that fits the card fully comes first; after those, models that
+    run with PARTIAL offload (an MoE first — only its active experts run per
+    token, so it spills cheaply). ``role`` matches an entry's own role or its
+    `good_for` list, so "code" finds Llama 3.1 8B and gpt-oss-20b, not only
+    the one entry labelled code."""
+    role = catalog_role(role)
+    role_models = ([m for m in _cat.MODELS if _cat.serves(m, role)]
+                   or list(_cat.MODELS))
     budget = vram_gb if vram_gb else (ram_gb * 0.5 if ram_gb else 0)
 
     def _fits(m) -> bool:
@@ -123,7 +154,12 @@ def recommend_from_catalog(vram_gb: Optional[float] = None,
     if fitting:
         # biggest model that fits first (better quality within budget),
         # defaults nudged up.
-        ranked = sorted(fitting, key=lambda m: (not m.is_default, -m.params_b))
+        ranked = sorted(fitting, key=lambda m: (not m.is_default,
+                                                -m.effective_params_b))
+        partial = [m for m in role_models if m not in fitting and
+                   _cat.fit_kind(m, vram_gb, ram_gb) == "partial"]
+        ranked += sorted(partial, key=lambda m: (not m.is_moe,
+                                                 -m.effective_params_b))
     else:
         # nothing fits VRAM — smallest first (CPU fallback).
         ranked = sorted(role_models, key=lambda m: m.params_b)
@@ -137,6 +173,9 @@ def recommend_from_catalog(vram_gb: Optional[float] = None,
             "license": m.license, "blurb": m.blurb,
             "origin": "us", "origin_verified": True,
             "fits_vram": bool(vram_gb and (m.vram_gb_q4 + 1.5) <= vram_gb),
+            "fit": _cat.fit_kind(m, vram_gb, ram_gb),
+            "ollama": m.ollama, "good_for": list(m.good_for),
+            "effective_params_b": m.effective_params_b,
             "source": "catalog",
         })
     return out
@@ -213,7 +252,8 @@ def search_huggingface(vram_gb: Optional[float] = None,
 def find_models(hardware: Optional[Dict[str, Any]] = None,
                 role: str = "general",
                 prefer_online: bool = True,
-                query: str = "") -> Dict[str, Any]:
+                query: str = "",
+                limit: int = 5) -> Dict[str, Any]:
     """Recommend US-origin models for this machine + role.
 
     Returns {"hardware": {...}, "catalog": [...], "online": [...],
@@ -229,7 +269,7 @@ def find_models(hardware: Optional[Dict[str, Any]] = None,
     vram = hardware.get("vram_gb")
     ram = hardware.get("ram_gb")
 
-    catalog = recommend_from_catalog(vram, ram, role=role)
+    catalog = recommend_from_catalog(vram, ram, role=role, limit=limit)
     online: List[Dict[str, Any]] = []
     if prefer_online:
         online = search_huggingface(vram, ram, query=query)
@@ -296,13 +336,17 @@ def assess_upgrade(hardware: Optional[Dict[str, Any]] = None,
 
     fitting = [m for m in pool if _fits(m)]
 
+    # Compared by the dense-equivalent size: an MoE's total (gpt-oss-20b's
+    # 20.9B, 3.6B active) is not a 1.5x upgrade over a dense 14B.
     if cur_params:
         upgrades = [m for m in fitting
-                    if m["params_b"] >= cur_params * min_gain]
+                    if m.get("effective_params_b", m["params_b"])
+                    >= cur_params * min_gain]
     else:
         upgrades = fitting        # unknown current size — just show fits
 
-    upgrades = sorted(upgrades, key=lambda m: -m["params_b"])[:limit]
+    upgrades = sorted(upgrades, key=lambda m: -m.get(
+        "effective_params_b", m["params_b"]))[:limit]
     can_upgrade = bool(upgrades) and bool(cur_params)
 
     if not budget:

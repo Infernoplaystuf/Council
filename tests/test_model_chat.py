@@ -163,8 +163,10 @@ def test_a_failed_download_says_so(chat):
 
 def test_catalog_matching_is_whole_words():
     assert model_chat.catalog_matches("gem") == []       # not a substring
-    assert [m.id for m in model_chat.catalog_matches("gemma")] == \
-        ["gemma-2-9b-q4"]
+    # Every Gemma in the catalog (Gemma 3 4B / 12B joined it for the 8 GB
+    # tier), and nothing that merely contains the letters.
+    assert sorted(m.id for m in model_chat.catalog_matches("gemma")) == \
+        ["gemma-2-9b-q4", "gemma-3-12b-q4", "gemma-3-4b-q4"]
 
 
 # ============================================================

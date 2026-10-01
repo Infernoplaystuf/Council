@@ -43,7 +43,12 @@ class ModelsActions:
         self.vault_dir = Path(vault_dir) if vault_dir else paths.vault_dir()
 
     def detect(self):
-        return model_jobs.detect_hardware()
+        hardware = model_jobs.detect_hardware()
+        # Warm the installed-model list (Ollama's tags, GGUF headers) on THIS
+        # worker, so the find that follows — which marks rows "On this PC" —
+        # reads caches instead of starting the same scan on a second thread.
+        model_jobs.warm_local_models()
+        return hardware
 
     def find(self, hardware, task="", online=False):
         return model_jobs.find(hardware, task=task, online=online)
@@ -63,6 +68,14 @@ class ModelsActions:
         return model_jobs.download_and_switch(
             row, self.vault_dir, on_progress=on_progress,
             should_cancel=should_cancel)
+
+    def check_this_pc(self, *, on_progress=None, should_stop=None):
+        """The "Check this PC" benchmark (council_core.llm_bench, wired in
+        through model_jobs.check_this_pc). BLOCKING — the tab runs it on a
+        worker."""
+        return model_jobs.check_this_pc(vault_dir=self.vault_dir,
+                                        on_progress=on_progress,
+                                        should_stop=should_stop)
 
 
 class ModelsTab(ViewHelpers, QWidget):
@@ -124,6 +137,11 @@ class ModelsTab(ViewHelpers, QWidget):
         controls.addWidget(self.online)
         self.find_btn = self._button(controls, "🔎 Find Models", self.on_find)
         self._button(controls, "⬆ Suggest upgrades", self.on_suggest)
+        # Measures the installed models on THIS machine (load time, tokens/s,
+        # structured-output pass rate) — model_jobs.check_this_pc, which the
+        # benchmark branch (council_core.llm_bench) plugs into.
+        self.check_btn = self._button(controls, "🩺 Check this PC",
+                                      self.on_check_pc)
         controls.addStretch(1)
         outer.addLayout(controls)
         # Its own row, wrapping: a switch that could not be SAVED says why,
@@ -223,6 +241,37 @@ class ModelsTab(ViewHelpers, QWidget):
             self._to_ui(show)
 
         threading.Thread(target=work, name="model-assess", daemon=True).start()
+
+    def on_check_pc(self) -> None:
+        """Run the benchmark on a worker; a second press while it runs asks
+        it to stop."""
+        if getattr(self, "_checking", False):
+            self._check_stop = True
+            self.status.setText("Stopping the check…")
+            return
+        self._checking, self._check_stop = True, False
+        self.check_btn.setText(amp("■ Stop the check"))
+        self.status.setText("Checking this PC…")
+
+        def work() -> None:
+            def progress(line) -> None:
+                self._to_ui(self.progress.setText, str(line))
+
+            result = self.actions.check_this_pc(
+                on_progress=progress,
+                should_stop=lambda: self._check_stop)
+
+            def show() -> None:
+                self._checking = False
+                self.check_btn.setText(amp("🩺 Check this PC"))
+                self.progress.setText("")
+                self.status.setText(result.message)
+                self.roles.reload()
+
+            self._to_ui(show)
+
+        threading.Thread(target=work, name="model-check-pc",
+                         daemon=True).start()
 
     def on_download(self) -> None:
         """The upgrade banner's button."""

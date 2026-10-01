@@ -1,16 +1,29 @@
 """
 council_qt.widgets.role_models — which model answers for each role.
 
-The Models tab's second half. A model choice per council role, the Balanced
-preset (Phi-4 14B for the thinking roles, Llama 3.2 3B for the quick ones),
-"one model for all", and a line saying where each model will run — GPU while
-it fits, CPU after (council_core.model_slots.plan).
+The Models tab's second half. A model choice per council role — including
+"Docs", the model that answers from a documentation server and writes code
+from what it read — the Balanced preset (Phi-4 14B for the thinking roles,
+Llama 3.2 3B for the quick ones), "Suggest for this PC" (the best INSTALLED
+US-origin models, nothing downloaded), "one model for all", and a line saying
+where each model will run — GPU while it fits, CPU after
+(council_core.model_slots.plan) — or that Ollama runs it.
+
+TWO KINDS OF MODEL IN ONE LIST
+GGUF files in the model folders, and the models a localhost Ollama server
+already has (council_core.local_models). On the RTX 4070 Laptop this was built
+on, the council env has no llama-cpp-python, so the Ollama models are the
+ones that actually answer. Each entry says who made it and whether it is
+US-origin; a non-US model is listed as "not US — measure only" and is never
+suggested, but the user may still pick it.
 
 WHAT SAVE DOES
 Writes vault/model_slots.json, makes the Writer's model the active GGUF (the
 "main" slot follows COUNCIL_GGUF_PATH, so the rest of the app — Download &
 switch, the title bar, the Tk shell — keeps meaning the same thing), and tells
 the engine to drop its loaded models. The next question loads the new map.
+When the Writer's choice is an Ollama model there is no file to make active:
+main names the Ollama model and COUNCIL_GGUF_PATH is left alone.
 
 THE ESTIMATE ADDS BACK WHAT IS ALREADY LOADED
 Free VRAM is read now, while the council's current models may already occupy
@@ -25,12 +38,12 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtWidgets import (QComboBox, QGridLayout, QGroupBox, QHBoxLayout,
                                QLabel, QVBoxLayout, QWidget)
 
-from council_core import model_jobs, model_slots, paths
+from council_core import local_models, model_jobs, model_slots, paths
 
 from .. import dialogs, theme
 from ..view import ViewHelpers, amp
@@ -55,6 +68,17 @@ def display_name(path: Path, names: Optional[Dict[str, str]] = None) -> str:
         return f"{base}  ({size:.1f} GB)"
     except OSError:
         return f"{base}  (missing)"
+
+
+def entry_label(entry: Dict[str, Any],
+                names: Optional[Dict[str, str]] = None) -> str:
+    """A combo label for a list_local_models() entry: who made it, whether
+    it is US-origin, and which runtime serves it."""
+    if entry.get("backend") == "gguf" and entry.get("path"):
+        base = display_name(Path(entry["path"]), names)
+        tail = local_models.origin_label(entry.get("origin") or "unknown")
+        return f"{base} — {entry.get('maker', 'unknown')} · {tail} · GGUF"
+    return local_models.describe(entry)
 
 
 def _nvidia_free_bytes() -> Optional[int]:
@@ -103,8 +127,27 @@ class RoleActions:
         also = [self.main_path()] + [s.path for s in cfg.slots.values()]
         return model_slots.known_files(also=also)
 
+    def models(self) -> List[Dict[str, Any]]:
+        """Every runnable model — GGUF files AND the localhost Ollama
+        server's. BLOCKING (a header read per new file, one /api/tags
+        request): call it on a worker."""
+        cfg = self.config()
+        also = [self.main_path()] + [s.path for s in cfg.slots.values()]
+        return local_models.list_local_models(also=also)
+
+    def hardware(self) -> Tuple[Optional[float], Optional[float]]:
+        """(total VRAM GB, RAM GB) for ranking suggestions. BLOCKING."""
+        hw = getattr(model_jobs, "_DETECTED", None)
+        if hw is not None and (hw.vram_gb or hw.ram_gb):
+            return hw.vram_gb, hw.ram_gb
+        try:
+            import hardware_detect
+            return hardware_detect.quick_memory()
+        except Exception:                                 # noqa: BLE001
+            return None, None
+
     def role_files(self) -> Dict[str, str]:
-        """Each council role's current model file."""
+        """Each council role's current model file (or "ollama:<name>")."""
         cfg, main = self.config(), self.main_path()
         return {role: cfg.slots[cfg.slot_for(role)].resolved_path(main)
                 for role in model_slots.COUNCIL_ROLES}
@@ -124,6 +167,16 @@ class RoleActions:
                 pass
         return free
 
+    def last_call(self) -> Dict[str, Any]:
+        """The engine's last_call_stats(), when the engine is loaded — never
+        imported just for this."""
+        engine = sys.modules.get("council_engine")
+        fn = getattr(engine, "last_call_stats", None) if engine else None
+        try:
+            return dict(fn() or {}) if callable(fn) else {}
+        except Exception:                                 # noqa: BLE001
+            return {}
+
     # -- writing -----------------------------------------------------------
     def save(self, role_files: Dict[str, str]) -> str:
         """Persist the map; returns the status line. BLOCKING (engine)."""
@@ -136,7 +189,7 @@ class RoleActions:
         # place the user would hear of it — "Saved" alone would be false the
         # next time the app starts.
         main_not_saved = ""
-        if main_file:
+        if main_file and not model_slots.is_ollama(main_file):
             import onboarding
             main_not_saved = onboarding.save_gguf_path(self.vault_dir,
                                                        main_file) or ""
@@ -175,6 +228,30 @@ class RoleActions:
         return out
 
 
+def stats_line(stats: Dict[str, Any]) -> str:
+    """'Last answer: llama3.1:8b via Ollama — 812 tokens at 41.2 tok/s ...'
+    from last_call_stats(); "" when nothing has answered yet."""
+    if not stats or not stats.get("backend") or stats["backend"] == "unknown":
+        return ""
+    bits = [f"Last answer: {stats.get('model') or '?'} via "
+            f"{'Ollama' if stats['backend'] == 'ollama' else 'GGUF'}"]
+    gen, rate = stats.get("gen_tokens"), stats.get("gen_tok_s")
+    if gen:
+        bits.append(f"{gen} tokens" + (f" at {rate:g} tok/s" if rate else ""))
+    prompt, prate = stats.get("prompt_tokens"), stats.get("prompt_tok_s")
+    if prompt:
+        bits.append(f"prompt {prompt}" + (f" at {prate:g} tok/s"
+                                          if prate else ""))
+    if stats.get("seconds") is not None:
+        bits.append(f"{stats['seconds']:.1f} s")
+    if stats.get("constrained"):
+        bits.append(f"output constrained ({stats.get('constraint')})")
+    if stats.get("schema_valid") is False:
+        bits.append("reply did NOT match its schema")
+    return " — ".join(bits[:1]) + (" — " + ", ".join(bits[1:])
+                                   if len(bits) > 1 else "")
+
+
 class RoleModelsPanel(ViewHelpers, QGroupBox):
     """A model per role, the presets, and where each model will run."""
 
@@ -189,6 +266,8 @@ class RoleModelsPanel(ViewHelpers, QGroupBox):
         self._busy = False
         self._free: Optional[int] = None
         self._names = _catalog_names()
+        self._entries: Dict[str, Dict[str, Any]] = {}
+        self._hw: Tuple[Optional[float], Optional[float]] = (None, None)
         self.combos: Dict[str, QComboBox] = {}
         self._build()
         if auto_load:
@@ -217,8 +296,12 @@ class RoleModelsPanel(ViewHelpers, QGroupBox):
         outer.addWidget(self.plan_label)
 
         row = QHBoxLayout()
+        self.suggest_btn = self._button(
+            row, "💡 Suggest for this PC (installed, US-made)",
+            self.on_suggest)
         self.balanced_btn = self._button(
-            row, "⚖ Balanced (Phi-4 14B + Llama 3.2 3B)", self.on_balanced)
+            row, "⚖ Balanced (Phi-4 14B + Llama 3.2 3B, 16 GB card)",
+            self.on_balanced)
         self._button(row, "One model for all", self.on_one_model)
         self._button(row, "↻ Rescan", self.reload)
         row.addStretch(1)
@@ -230,9 +313,15 @@ class RoleModelsPanel(ViewHelpers, QGroupBox):
         self.status.setStyleSheet(f"color: {self._tokens['muted_fg']};")
         outer.addWidget(self.status)
 
+        self.stats_label = QLabel("")
+        self.stats_label.setWordWrap(True)
+        self.stats_label.setStyleSheet(f"color: {self._tokens['muted_fg']};")
+        outer.addWidget(self.stats_label)
+
     # -- reading -----------------------------------------------------------
     def reload(self) -> None:
-        """Rescan files and the current map; free VRAM on a worker."""
+        """Rescan files and the current map now; Ollama's models, free VRAM
+        and the hardware on a worker (each can take a moment)."""
         files = self.actions.files()
         current = self.actions.role_files()
         for role, combo in self.combos.items():
@@ -244,21 +333,55 @@ class RoleModelsPanel(ViewHelpers, QGroupBox):
             combo.blockSignals(False)
         problem = self.actions.problem()
         if not files:
-            self.status.setText("No models downloaded yet — use Balanced, "
-                                "or download one above.")
+            self.status.setText("No GGUF files yet — Ollama models appear "
+                                "here as soon as the scan finishes.")
         elif problem:
             self.status.setText(problem)
+        self.stats_label.setText(stats_line(self.actions.last_call()))
         self._update_plan()
 
         def work() -> None:
             free = self.actions.free_vram()
-            self._to_ui(self._got_free, free)
+            try:
+                models = list(self.actions.models())
+            except Exception:                             # noqa: BLE001
+                models = []
+            try:
+                hw = self.actions.hardware()
+            except Exception:                             # noqa: BLE001
+                hw = (None, None)
+            self._to_ui(self._got_scan, free, models, hw)
 
         threading.Thread(target=work, name="model-roles-vram",
                          daemon=True).start()
 
-    def _got_free(self, free: Optional[int]) -> None:
+    def _got_scan(self, free: Optional[int], models: List[Dict[str, Any]],
+                  hw: Tuple[Optional[float], Optional[float]]) -> None:
         self._free = free
+        self._hw = hw or (None, None)
+        self._entries = {model_slots._key(m["id"]): m for m in models}
+        for combo in self.combos.values():
+            keep = combo.currentData() or ""
+            combo.blockSignals(True)
+            have = {model_slots._key(combo.itemData(i))
+                    for i in range(combo.count())}
+            for m in models:
+                key = model_slots._key(m["id"])
+                if key not in have:
+                    combo.addItem(entry_label(m, self._names), m["id"])
+                    have.add(key)
+            # Relabel what the file scan added, now that origin is known.
+            for i in range(combo.count()):
+                e = self._entries.get(model_slots._key(combo.itemData(i)))
+                if e is not None:
+                    combo.setItemText(i, entry_label(e, self._names))
+            self._select(combo, keep)
+            combo.blockSignals(False)
+        n_ollama = sum(1 for m in models if m.get("backend") == "ollama")
+        if n_ollama and (not self.status.text()
+                         or self.status.text().startswith("No GGUF files")):
+            self.status.setText(f"{n_ollama} Ollama model(s) found on this "
+                                "PC.")
         self._update_plan()
 
     def _select(self, combo: QComboBox, path: str) -> None:
@@ -269,7 +392,14 @@ class RoleModelsPanel(ViewHelpers, QGroupBox):
             if model_slots._key(combo.itemData(i)) == want:
                 combo.setCurrentIndex(i)
                 return
-        combo.addItem(display_name(Path(path), self._names), path)
+        if model_slots.is_ollama(path):
+            e = self._entries.get(want)
+            label = (entry_label(e, self._names) if e else
+                     f"{local_models.ollama_name(path)} — Ollama (not "
+                     "found yet)")
+        else:
+            label = display_name(Path(path), self._names)
+        combo.addItem(label, path)
         combo.setCurrentIndex(combo.count() - 1)
 
     def role_files(self) -> Dict[str, str]:
@@ -283,17 +413,50 @@ class RoleModelsPanel(ViewHelpers, QGroupBox):
             return
         cfg, main = model_slots.from_role_files(chosen)
         sizes, labels = {}, {}
-        for name in cfg.slots:
-            path = Path(cfg.slots[name].path or main)
+        ollama_bits: List[str] = []
+        warn: List[str] = []
+        for name, slot in cfg.slots.items():
+            ident = slot.path or main
+            if model_slots.is_ollama(ident):
+                e = self._entries.get(model_slots._key(ident)) or {}
+                where = local_models.fit(e, *self._hw) if e else "unknown"
+                size = (e.get("size_bytes") or 0) / GB
+                ollama_bits.append(
+                    f"{local_models.ollama_name(ident)} → Ollama "
+                    + (f"({size:.1f} GB, " if size else "(")
+                    + {"gpu": "fits the GPU", "partial": "part GPU, part RAM",
+                       "cpu": "CPU", "too big": "too big for this PC",
+                       "unknown": "size unknown"}.get(where, where) + ")")
+                if e and e.get("origin") != "US":
+                    warn.append(f"{e.get('name')} is "
+                                f"{local_models.origin_label(e.get('origin'))}")
+                continue
+            path = Path(ident)
             try:
                 sizes[name] = path.stat().st_size
             except OSError:
                 continue
             labels[name] = display_name(path, self._names).split("  (")[0]
-        placements = model_slots.plan(cfg, sizes, self._free)
+            e = self._entries.get(model_slots._key(str(path)))
+            if e and e.get("origin") != "US":
+                warn.append(f"{labels[name]} is "
+                            f"{local_models.origin_label(e.get('origin'))}")
+        gguf_cfg = model_slots.SlotConfig(
+            {n: s for n, s in cfg.slots.items() if n in sizes} or
+            {model_slots.MAIN: model_slots.Slot(model_slots.MAIN)},
+            {r: s for r, s in cfg.roles.items() if s in sizes})
+        placements = model_slots.plan(gguf_cfg, sizes, self._free) \
+            if sizes else {}
         line = model_slots.summary(placements, labels, self._free)
-        if self._free is None:
+        if ollama_bits:
+            line = "   ".join(([line] if line else []) + ollama_bits)
+            if len({b.split(' → ')[0] for b in ollama_bits}) > 1:
+                line += ("   ·   several Ollama models: each switch between "
+                         "them reloads weights unless all fit at once")
+        if sizes and self._free is None:
             line += "   ·   (free GPU memory not known yet)"
+        if warn:
+            line += "   ·   " + "; ".join(warn)
         self.plan_label.setText(line)
 
     # -- presets -----------------------------------------------------------
@@ -309,6 +472,36 @@ class RoleModelsPanel(ViewHelpers, QGroupBox):
             self.apply_role_files({r: writer for r in self.combos})
             self.status.setText("Every role on the Writer's model — Save to "
                                 "use it.")
+
+    def on_suggest(self) -> None:
+        """Fill every role from what is INSTALLED: the best US-origin model
+        for this PC per role (local_models.rank_for_role — a full GPU fit
+        first, native tool calling for Docs). Nothing is downloaded or
+        saved; the user reviews and presses Save."""
+        models = list(self._entries.values())
+        if not models:
+            self.status.setText("Still scanning for installed models — try "
+                                "again in a moment (or ↻ Rescan).")
+            return
+        picks = model_slots.suggest_role_models(
+            models, vram_gb=self._hw[0], ram_gb=self._hw[1],
+            roles=tuple(self.combos))
+        if not picks:
+            self.status.setText(
+                "No installed US-origin model to suggest. Install one "
+                "yourself — e.g. `ollama pull llama3.1:8b` — then ↻ Rescan.")
+            return
+        self.apply_role_files({r: mid for r, (mid, _why) in picks.items()})
+        writer_id, why = picks.get("writer") or next(iter(picks.values()))
+        docs = picks.get("docs")
+        name = (self._entries.get(model_slots._key(writer_id)) or {}).get(
+            "name", writer_id)
+        line = f"Suggested {name} ({why})"
+        if docs and docs[0] != writer_id:
+            dname = (self._entries.get(model_slots._key(docs[0])) or {}).get(
+                "name", docs[0])
+            line += f"; Docs: {dname} ({docs[1]})"
+        self.status.setText(line + " — Save to use it.")
 
     def on_balanced(self) -> None:
         preset = model_slots.BALANCED
@@ -387,3 +580,4 @@ class RoleModelsPanel(ViewHelpers, QGroupBox):
         self._busy = busy
         self.save_btn.setEnabled(not busy)
         self.balanced_btn.setEnabled(not busy)
+        self.suggest_btn.setEnabled(not busy)
