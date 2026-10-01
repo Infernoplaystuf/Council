@@ -279,6 +279,43 @@ def fakes_for(modules: Sequence[str], root: Any = None
     return out
 
 
+#: Committed memory one smoke run may use (MB). Three tiny sample files need
+#: a fraction of this; a candidate allocating more gets a MemoryError (a
+#: fault the model is told about) instead of draining the machine's commit,
+#: which every later process needs to start at all.
+MEMORY_LIMIT_MB = 4096
+
+
+def _spawn(argv: List[str], cwd: str, env: Dict[str, str], stdin: str,
+           timeout: float) -> Dict[str, Any]:
+    """{returncode, stderr, timed_out, infra}. Through
+    council_core.child_proc when it is there — the child and everything it
+    starts in a Job Object, killed together on a timeout, and a process the
+    machine could not start reported as such (``infra``) — else a plain
+    subprocess.run."""
+    try:
+        from council_core import child_proc
+    except Exception:                                    # noqa: BLE001
+        child_proc = None
+    if child_proc is not None:
+        r = child_proc.run(argv, cwd=cwd, env=env, timeout=timeout,
+                           input=stdin, memory_limit_mb=MEMORY_LIMIT_MB,
+                           retries=1, commit_wait=20.0)
+        return {"returncode": r.returncode, "stderr": r.stderr,
+                "timed_out": r.timed_out, "infra": r.infra}
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        proc = subprocess.run(argv, cwd=cwd, env=env, input=stdin,
+                              capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              timeout=timeout, creationflags=flags)
+    except subprocess.TimeoutExpired:
+        return {"returncode": None, "stderr": "", "timed_out": True,
+                "infra": ""}
+    return {"returncode": proc.returncode, "stderr": proc.stderr or "",
+            "timed_out": False, "infra": ""}
+
+
 def run_job(job: Dict[str, Any], *, python: str = "",
             timeout: float = DEFAULT_TIMEOUT) -> SmokeResult:
     """Run one job in a fresh sandbox and subprocess. NEVER RAISES.
@@ -316,29 +353,33 @@ def run_job(job: Dict[str, Any], *, python: str = "",
                 "TMP": str(scratch), "TEMP": str(scratch),
                 "TMPDIR": str(scratch)})
             env.pop("PYTHONPATH", None)
-            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
             # On stdin, not in the job file: the candidate can read the
             # sandbox, and the child consumes stdin before it runs.
             nonce = secrets.token_hex(16)
-            try:
-                proc = subprocess.run(
-                    [python, str(Path(__file__).resolve()), str(job_path)],
-                    cwd=sandbox, env=env, input=nonce + "\n",
-                    capture_output=True, text=True, encoding="utf-8",
-                    errors="replace", timeout=timeout, creationflags=flags)
-                stderr = proc.stderr or ""
-            except subprocess.TimeoutExpired:
+            argv = [python, str(Path(__file__).resolve()), str(job_path)]
+            ran = _spawn(argv, sandbox, env, nonce + "\n", timeout)
+            if ran.get("infra"):
+                # The MACHINE could not start the run (out of virtual
+                # memory: 0xC0000142 and friends, measured in the phi4
+                # benchmark). Not the candidate's fault — blaming it would
+                # spend a repair round on nothing.
+                res.skipped = (f"this PC could not start the smoke run "
+                               f"({ran['infra']})")
+                res.seconds = time.perf_counter() - t0
+                return res
+            if ran.get("timed_out"):
                 res.ran = True
                 res.timed_out = True
                 res.seconds = time.perf_counter() - t0
                 res.error = f"timed out after {timeout:.0f} s"
                 return res
+            stderr = ran.get("stderr") or ""
             res.ran = True
             res.seconds = time.perf_counter() - t0
             if not out_path.is_file():
                 tail = [ln for ln in stderr.strip().splitlines() if ln.strip()]
                 res.error = tail[-1] if tail else (
-                    f"the smoke run exited with code {proc.returncode} "
+                    f"the smoke run exited with code {ran.get('returncode')} "
                     f"and no verdict")
                 return res
             try:

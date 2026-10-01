@@ -368,10 +368,11 @@ def upgrade_banner(hardware: Hardware, *, current: Optional[str] = None,
 # ============================================================
 # "Check this PC" — the benchmark hook
 # ============================================================
-# The benchmark harness lives on another branch (council_core.llm_bench). The
-# Models tab's button calls check_this_pc(); it resolves the runner at CALL
-# time, so the merge has to add nothing here: a registered runner wins, else
-# council_core.llm_bench.check_this_pc, else a clear "not in this build".
+# The Models tab's button calls check_this_pc(); it resolves the runner at
+# CALL time: a registered runner wins, else council_core.llm_bench.
+# check_this_pc (council_core.pc_check: warm speed, placement and a quick
+# reliability probe per installed model, ranked per role, written to
+# <vault>/model_bench.json), else a clear "not in this build".
 
 @dataclass
 class CheckResult:

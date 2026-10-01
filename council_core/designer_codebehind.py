@@ -232,8 +232,14 @@ def coder_params_b() -> Optional[float]:
         ident = ""
     try:
         import council_engine
+        from council_core.designer_project import _same_ollama
         for m in council_engine.list_local_models() or []:
-            if ident and m.get("id") in (ident, f"ollama:{ident}"):
+            # "ollama:phi3.5" is "ollama:phi3.5:latest" — list ids always
+            # carry the tag. Matched by id alone, an untagged slot read as
+            # "size unknown" and got ONE sample where Describe, which
+            # already normalised it, gave the same model three.
+            if ident and (m.get("id") in (ident, f"ollama:{ident}")
+                          or _same_ollama(ident, m.get("id"))):
                 if m.get("params_b"):
                     return float(m["params_b"])
     except Exception:                                    # noqa: BLE001

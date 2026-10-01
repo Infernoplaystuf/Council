@@ -274,18 +274,37 @@ qapp.processEvents()
 '''
 
 
+#: Committed memory the probed app may use (MB): a generated Qt window is
+#: ~150 MB; anything near this is a runaway, not an app.
+RUNTIME_MEMORY_MB = 4096
+
+
 def run_generated(pdir: Path, python: str = sys.executable) -> Dict[str, Any]:
-    """Construct the generated App offscreen, in its own process."""
-    try:
-        proc = subprocess.run(
-            [python, "-c", RUNTIME_PROBE, str(pdir),
-             str(RUNTIME_TIMEOUT - 10)], capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            timeout=RUNTIME_TIMEOUT, cwd=str(pdir))
-    except subprocess.TimeoutExpired:
+    """Construct the generated App offscreen, in its own process.
+
+    Through council_core.child_proc: the app and anything it starts live in
+    a Job Object (killed together on the timeout), the machine's commit
+    headroom is checked first, and a process the MACHINE could not start —
+    0xC0000142 (STATUS_DLL_INIT_FAILED), which every probe late in the
+    phi4 benchmark exited with when the PC ran out of virtual memory — is
+    returned as {"ok": False, "infra": why}, never as the app's failure."""
+    from council_core import child_proc
+    env = child_proc.child_env({"QT_QPA_PLATFORM": "offscreen",
+                                "COUNCIL_NO_DIALOGS": "1"})
+    ran = child_proc.run(
+        [python, "-c", RUNTIME_PROBE, str(pdir), str(RUNTIME_TIMEOUT - 10)],
+        cwd=str(pdir), env=env, timeout=RUNTIME_TIMEOUT,
+        memory_limit_mb=RUNTIME_MEMORY_MB)
+    if ran.infra:
+        return {"ok": False, "infra": ran.infra,
+                "detail": f"not graded — {ran.infra}"[:400]}
+    if ran.timed_out:
         return {"ok": False, "detail": f"timed out after {RUNTIME_TIMEOUT}s "
                                        f"(a modal dialog?)"}
-    out, err = proc.stdout, proc.stderr
+    if ran.error and ran.returncode is None:
+        return {"ok": False, "detail": ran.error[:400]}
+    proc = ran
+    out, err = ran.stdout, ran.stderr
     built = next((line for line in out.splitlines()
                   if line.startswith("BUILT")), "")
     # Tracebacks, and the ports runtime's own "handler raised" / "callback
@@ -303,7 +322,10 @@ def run_generated(pdir: Path, python: str = sys.executable) -> Dict[str, Any]:
         why = bad[0] if bad else (err.strip().splitlines() or
                                   ["(no stderr)"])[-1]
         detail += " :: " + why.strip()
-    return {"ok": ok, "detail": detail[:400]}
+    out = {"ok": ok, "detail": detail[:400], "seconds": ran.seconds}
+    if ran.leaked:
+        out["leaked"] = ran.leaked          # killed; said, not hidden
+    return out
 
 
 def generate_project(name: str, pdir: Path, shapes,
