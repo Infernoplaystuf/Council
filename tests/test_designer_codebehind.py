@@ -657,6 +657,13 @@ def test_documentation_is_asked_for_only_when_a_package_is_named(
 
 
 def test_documentation_degrades_to_nothing(monkeypatch):
+    import council_core
+    # Once the docs track is merged, an earlier test (the Qt app imports the
+    # Docs tab) leaves docs_qa as an ATTRIBUTE of the package, and `from
+    # council_core import docs_qa` takes that before sys.modules — so the
+    # "absent" half ran the real bundled docs server (seen on a trial merge
+    # of the four llm/* branches). Absent means both.
+    monkeypatch.delattr(council_core, "docs_qa", raising=False)
     monkeypatch.setitem(sys.modules, "council_core.docs_qa", None)
     assert dc.docs_for("use pandas to read it", []) == ([], "")
 
