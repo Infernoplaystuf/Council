@@ -511,7 +511,11 @@ def parse_search(server: str, result: ToolResult) -> List[Hit]:
     text = result.text
     if _NO_RESULTS.match(text or ""):
         return []
-    obj = _json_any(text)
+    # Only a reply that IS JSON is read as data. A Markdown page of results
+    # is documentation: an example object inside it must not stand in for
+    # the pages it lists, and scanning prose for JSON is what was slow.
+    body = re.sub(r"^```[A-Za-z]*\s*", "", (text or "").lstrip())
+    obj = _json_any(text) if body[:1] in ("{", "[") else None
     if isinstance(obj, dict):
         for value in obj.values():
             if isinstance(value, list) and value and isinstance(value[0],
@@ -747,10 +751,15 @@ def retrieve(question: str, queries: Sequence[str], *,
         fetched.append((hit, text))
     out.fetch_s = time.perf_counter() - t1
     # Share the budget: a short page gives its unused share to the next.
+    # Each page gets at least 400 chars when the budget allows — a sliver of
+    # a page is no use — but never more than is left: the budget is the
+    # caller's prompt room (docs_context's max_chars), not a suggestion.
     remaining = budget
     for i, (hit, text) in enumerate(fetched):
+        if remaining <= 0:
+            break
         share = remaining // max(1, len(fetched) - i)
-        trimmed = focus(text, q_terms, max(400, share))
+        trimmed = focus(text, q_terms, min(remaining, max(400, share)))
         remaining -= len(trimmed)
         out.pages.append(Source(len(out.pages) + 1, hit.server, hit.ref,
                                 hit.title, trimmed, hit.uri))
@@ -827,6 +836,14 @@ def _json_object(text: str) -> Optional[dict]:
     return obj if isinstance(obj, dict) else None
 
 
+#: How many opening brackets _json_any tries before giving up. Each try scans
+#: to the bracket's match — or to the end of the text when there is none, so
+#: without a cap a text full of unmatched braces cost O(n^2): MEASURED 14 s
+#: for a 39 KB documentation page with one stray quote. A model's JSON is the
+#: first or second object in its reply; 25 tries is generous.
+_JSON_TRIES = 25
+
+
 def _json_any(text: str) -> Any:
     """json.loads, else the first balanced {...} or [...] in the text, with
     fences, comments and trailing commas forgiven — an unconstrained small
@@ -836,12 +853,14 @@ def _json_any(text: str) -> Any:
     s = text.strip()
     try:
         return json.loads(s)
-    except ValueError:
+    except (ValueError, RecursionError):
         pass
     s = re.sub(r"^```[A-Za-z]*\s*|\s*```$", "", s)
     for opener, closer in (("{", "}"), ("[", "]")):
         start = s.find(opener)
-        while start != -1:
+        tries = 0
+        while start != -1 and tries < _JSON_TRIES:
+            tries += 1
             depth, in_str, esc = 0, False, False
             for i in range(start, len(s)):
                 ch = s[i]
@@ -865,7 +884,7 @@ def _json_any(text: str) -> Any:
                                                         chunk)):
                             try:
                                 return json.loads(candidate)
-                            except ValueError:
+                            except (ValueError, RecursionError):
                                 continue
                         break
             start = s.find(opener, start + 1)
@@ -906,7 +925,26 @@ def _as_bool(value: Any, default: bool = True) -> bool:
 
 #: A citation is [n] standing alone — not `samples[0]` or `x[1][2]`, which a
 #: code-ish answer is full of and which must not be read (or deleted) as one.
-CITATION = re.compile(r"(?<![\w\]\)'\"])\[(\d{1,2})\]")
+#: It is matched as a RUN, because models write "[1][2]": the second [n]
+#: follows a ']' exactly as an index does, and read one at a time it was
+#: neither counted nor — when invented, "[1][7]" — removed. A run is a
+#: citation when its start is; every [n] in it is then a citation.
+CITATION_RUN = re.compile(r"(?<![\w\]\)'\"])(?:\[\d{1,2}\])+")
+_ONE_CITATION = re.compile(r"\[(\d{1,2})\]")
+
+
+def citations(text: str) -> List[int]:
+    """Every cited number in `text`, in order (runs like [1][2] included)."""
+    return [int(n) for run in CITATION_RUN.findall(text or "")
+            for n in _ONE_CITATION.findall(run)]
+
+
+def sub_citations(text: str, replace: Callable[[int, str], str]) -> str:
+    """`text` with each cited [n] replaced by replace(n, "[n]")."""
+    return CITATION_RUN.sub(
+        lambda run: _ONE_CITATION.sub(
+            lambda one: replace(int(one.group(1)), one.group(0)),
+            run.group(0)), text or "")
 
 _NOT_COVERED_TEXT = re.compile(
     r"(doesn'?t|does not|do not|don'?t) (cover|contain|mention|say|include)"
@@ -975,7 +1013,7 @@ def parse_answer(text: str, n_sources: int, write_code: bool) -> dict:
             code = m.group(2).strip("\n")
             prose = (prose[:m.start()] + prose[m.end():]).strip()
     return {"answer": prose.strip(),
-            "sources": [int(x) for x in CITATION.findall(prose)],
+            "sources": citations(prose),
             "covered": not _NOT_COVERED_TEXT.search(prose or ""),
             "code": code, "format": "text"}
 
@@ -985,12 +1023,12 @@ def apply_citation_rules(parsed: dict, n_sources: int,
     """(answer text, cited numbers): only pages that exist may be cited."""
     valid = set(range(1, n_sources + 1))
     answer = parsed["answer"]
-    inline = [int(x) for x in CITATION.findall(answer)]
+    inline = citations(answer)
     claimed = inline + list(parsed["sources"])
     bad = sorted({k for k in claimed if k not in valid})
     if bad:
-        answer = CITATION.sub(lambda m: m.group(0) if int(m.group(1)) in valid
-                              else "", answer)
+        answer = sub_citations(answer, lambda n, text: text if n in valid
+                               else "")
         answer = re.sub(r"[ \t]+([.,;:])", r"\1", answer)
         answer = re.sub(r"[ \t]{2,}", " ", answer)
         notes.append(f"Removed citation(s) {', '.join(f'[{b}]' for b in bad)}"
@@ -1135,6 +1173,23 @@ def _dotted(node: ast.AST) -> Optional[List[str]]:
     return None
 
 
+#: Members of the builtin types a documented FUNCTION may return. What a
+#: function returns is not known here, so `rows = led.entries();
+#: rows.copy()` cannot be judged — and flagging it cost two repair calls that
+#: rewrote correct code. An instance made by calling a CLASS (a capitalised
+#: name, `Ledger()`) is known, and stays strictly checked.
+_BUILTIN_MEMBERS = frozenset().union(*(dir(t) for t in (
+    str, bytes, bytearray, list, dict, set, frozenset, tuple, int, float,
+    complex, bool, range, memoryview)))
+
+
+def _returned_by_function(path: Sequence[str]) -> bool:
+    """`path` (alias-resolved, "()" marking a call) ends in a call to
+    something that is not a class."""
+    return (len(path) >= 2 and path[-1] == "()"
+            and not path[-2][:1].isupper())
+
+
 def _suggest(name: str, idents: Iterable[str]) -> str:
     pool = [i for i in idents if len(i) > 2]
     close = difflib.get_close_matches(name, pool, n=1, cutoff=0.6)
@@ -1238,6 +1293,9 @@ def check_code(code: str, pages: Sequence[Source],
                 if part == "()":
                     continue
                 checked += 1
+                owner = full[:len(full) - len(written) + i]
+                if part in _BUILTIN_MEMBERS and _returned_by_function(owner):
+                    continue
                 if part not in idents:
                     shown = ".".join(p for p in full[:len(full) - len(
                         written) + i + 1] if p != "()")
@@ -1510,6 +1568,39 @@ def _run_tool_call(name: str, args: dict, question: str,
     return f"There is no tool called {name!r}."
 
 
+def _tool_reply(out: Any) -> Tuple[List[dict], str]:
+    """(calls, content) from whatever chat_tools returned.
+
+    The contract says {"content", "tool_calls": [{"name", "arguments":
+    dict}]}, but the calls are a small model's output: arguments arrive as a
+    JSON string, a list or null, a call as a bare tool name, the reply as
+    plain text. Each became an AttributeError that ended the question; each
+    is now read as the nearest thing it can mean."""
+    if isinstance(out, str):
+        return [], out
+    if not isinstance(out, dict):
+        return [], ""
+    raw = out.get("tool_calls") or []
+    if isinstance(raw, dict):
+        raw = [raw]
+    calls: List[dict] = []
+    for c in raw if isinstance(raw, list) else []:
+        if isinstance(c, str):
+            c = {"name": c}
+        if not isinstance(c, dict):
+            continue
+        fn = c.get("function") if isinstance(c.get("function"), dict) else {}
+        name = str(c.get("name") or fn.get("name") or "")
+        args = c.get("arguments", fn.get("arguments"))
+        if isinstance(args, str):
+            args = _json_object(args)
+        if name:
+            calls.append({"name": name,
+                          "arguments": args if isinstance(args, dict)
+                          else {}})
+    return calls, str(out.get("content") or "")
+
+
 def _engine_chat_tools() -> Optional[Callable]:
     try:
         import council_engine
@@ -1580,21 +1671,16 @@ def _ask_with_tools(question: str, result: DocsAnswer, *, servers, packages,
                                        seed=SEED)
         t_model += time.perf_counter() - t
         result.model_calls += 1
-        calls = list((out or {}).get("tool_calls") or [])
-        content = str((out or {}).get("content") or "")
+        calls, content = _tool_reply(out)
         if not calls:
             final = content
             break
         messages.append({"role": "assistant", "content": content,
                          "tool_calls": [{"function": {
-                             "name": c.get("name"),
-                             "arguments": c.get("arguments") or {}}}
+                             "name": c["name"], "arguments": c["arguments"]}}
                              for c in calls]})
         for c in calls[:3]:
-            name = str(c.get("name") or "")
-            args = c.get("arguments") or {}
-            if isinstance(args, str):
-                args = _json_object(args) or {}
+            name, args = c["name"], c["arguments"]
             try:
                 reply = _run_tool_call(name, args, question, packages, pkg,
                                        spec, client, roles, pages, budget,
@@ -1733,12 +1819,34 @@ def assign_docs_model(model_id: str, vault_dir=None) -> str:
     return f"Docs questions now go to {model_label(model_id)}."
 
 
+def model_origin(model_id: str, origin: Any = "") -> str:
+    """"US", "non-US" or "unknown" — the one spelling everything here uses.
+
+    Recommending is allowed only for "US", so this must never turn doubt into
+    "US": a name model_finder knows as non-US (qwen, mistral, deepseek…) is
+    non-US whatever a list said; a stated origin is read in any spelling
+    ("non_us" is model_finder's, "non-US" the contract's); otherwise the
+    name decides, and a name nobody knows is "unknown", not recommendable."""
+    stated = re.sub(r"[^a-z]", "", str(origin or "").lower())
+    try:
+        import model_finder
+        named = model_finder.classify_origin(str(model_id or ""))
+    except Exception:                                     # noqa: BLE001
+        named = "unknown"
+    if named == "non_us" or stated == "nonus":
+        return "non-US"
+    if stated == "us" or named == "us":
+        return "US"
+    return "unknown"
+
+
 def list_models() -> List[dict]:
     """Models a user can pick for the docs role.
 
     council_engine.list_local_models() when the engine has it (Ollama and
     GGUF, with origin); otherwise the GGUF files in the model folders. Every
-    entry: {id, name, backend, origin, size_bytes}."""
+    entry: {id, name, backend, origin, size_bytes}, origin normalised by
+    model_origin."""
     try:
         import council_engine
         lister = getattr(council_engine, "list_local_models", None)
@@ -1746,14 +1854,17 @@ def list_models() -> List[dict]:
             out = []
             for m in lister() or []:
                 if isinstance(m, dict) and m.get("id"):
-                    out.append(dict(m))
+                    m = dict(m)
+                    m["origin"] = model_origin(
+                        f"{m['id']} {m.get('name') or ''}", m.get("origin"))
+                    out.append(m)
             return out
     except Exception:                                     # noqa: BLE001
         pass
     try:
         from . import model_slots
         return [{"id": str(p), "name": p.stem, "backend": "gguf",
-                 "origin": "unknown",
+                 "origin": model_origin(p.name),
                  "size_bytes": p.stat().st_size if p.exists() else 0}
                 for p in model_slots.known_files()]
     except Exception:                                     # noqa: BLE001
@@ -1764,4 +1875,5 @@ __all__ = ["ask", "docs_context", "DocsAnswer", "Source", "NOT_COVERED",
            "derive_queries", "keyword_query", "retrieve", "check_code",
            "parse_answer", "answer_schema", "engine_model_call",
            "answering_role", "assign_docs_model", "role_model", "model_label",
-           "list_models", "call_supported", "focus", "QUERY_SCHEMA"]
+           "list_models", "model_origin", "call_supported", "focus",
+           "QUERY_SCHEMA", "citations", "sub_citations"]

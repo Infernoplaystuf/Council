@@ -94,6 +94,11 @@ class ServerSpec:
         known = {f for f in cls.__dataclass_fields__}       # noqa: SLF001
         clean = {k: v for k, v in data.items() if k in known}
         spec = cls(**clean)
+        # The file is hand-editable, and bool("false") is True: a quoted
+        # "allow_remote": "false" switched remote access ON.
+        for flag in ("allow_remote", "enabled", "bundled"):
+            if flag in clean:
+                setattr(spec, flag, _flag(clean[flag]))
         spec.args = [str(a) for a in (spec.args or [])]
         spec.env = {str(k): str(v) for k, v in (spec.env or {}).items()}
         spec.packages = [str(p) for p in (spec.packages or [])]
@@ -119,6 +124,19 @@ class ServerSpec:
         return json.dumps([self.transport, self.command, self.args, self.env,
                            self.cwd, self.url, self.allow_remote],
                           sort_keys=True)
+
+
+def _flag(value: Any) -> bool:
+    """A saved true/false, strictly: only a real true or an unmistakable
+    "true"/"yes"/"on"/"1" is true. Anything else — "false", "no", null, a
+    typo — is false, the safe side for allow_remote."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "on", "1")
+    return False
 
 
 def _python_arg(args: Sequence[str]) -> str:
@@ -206,7 +224,8 @@ def load(path: Optional[Path] = None) -> List[ServerSpec]:
         return default_servers()
 
 
-def problem(path: Optional[Path] = None) -> str:
+def _damage(path: Optional[Path] = None) -> str:
+    """Why the saved file cannot be read ("" when it can, or is absent)."""
     p = config_path(path)
     if not p.exists():
         return ""
@@ -216,7 +235,25 @@ def problem(path: Optional[Path] = None) -> str:
             ServerSpec.from_json(s)
         return ""
     except Exception as exc:                              # noqa: BLE001
-        return f"{p.name} could not be read ({exc}); using the default."
+        return f"{p.name} could not be read ({exc})"
+
+
+def problem(path: Optional[Path] = None) -> str:
+    damage = _damage(path)
+    return f"{damage}; using the default." if damage else ""
+
+
+def _editable(path: Optional[Path]) -> None:
+    """Refuse to change a file that could not be read.
+
+    load() answers a damaged file with the default list so the tab keeps
+    working; saving that list back would replace every server the user had
+    with the default — what add() used to do. So a change waits until the
+    file is fixed or deleted, and nothing is lost."""
+    damage = _damage(path)
+    if damage:
+        raise ValueError(f"{damage}, so it was left as it is. Fix it or "
+                         f"delete it, then try again.")
 
 
 def save(servers: Sequence[ServerSpec], path: Optional[Path] = None) -> Path:
@@ -258,6 +295,7 @@ def validate(spec: ServerSpec) -> str:
 
 
 def add(spec: ServerSpec, path: Optional[Path] = None) -> List[ServerSpec]:
+    _editable(path)
     servers = load(path)
     if any(s.name == spec.name for s in servers):
         raise ValueError(f"There is already a server called {spec.name!r}.")
@@ -270,6 +308,7 @@ def add(spec: ServerSpec, path: Optional[Path] = None) -> List[ServerSpec]:
 
 
 def remove(name: str, path: Optional[Path] = None) -> List[ServerSpec]:
+    _editable(path)
     servers = [s for s in load(path) if s.name != name]
     save(servers, path)
     release(name)
@@ -277,6 +316,7 @@ def remove(name: str, path: Optional[Path] = None) -> List[ServerSpec]:
 
 
 def update(spec: ServerSpec, path: Optional[Path] = None) -> List[ServerSpec]:
+    _editable(path)
     servers = load(path)
     out = [spec if s.name == spec.name else s for s in servers]
     if not any(s.name == spec.name for s in servers):

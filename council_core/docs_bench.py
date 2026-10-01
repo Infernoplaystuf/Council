@@ -104,25 +104,55 @@ def citation_ok(item: dict, ans: docs_qa.DocsAnswer) -> bool:
     return False
 
 
-#: Run before the model's code: no writes outside the temp folder, no new
-#: processes, no network, no deletes. Imports the hook can't see (C code)
-#: are not the risk here; a model writing `shutil.rmtree` is.
+#: Run before the model's code: no writes, creates, deletes or renames
+#: outside the temp folder (inside it they are fine — a solution may use a
+#: temp file), no new processes, no network. The Docs tab's capability check
+#: runs one code task, so this guards the user's machine, not just a CLI.
+#:
+#: The low-level doors are shut too: os.open with write flags, os.truncate,
+#: os.mkdir and _winapi.CreateProcess all went past the first version (each
+#: emptied or created a file outside the sandbox, or ran cmd.exe). What an
+#: audit hook cannot stop is C code — ctypes, an extension module — so this
+#: fences off careless code, not code written to escape; that is the honest
+#: limit, and why only the bundled invented package is ever imported here.
 FENCE = r'''
 import os, sys
 sys.dont_write_bytecode = True
-_ROOT = os.path.abspath(os.getcwd())
+_ROOT = os.path.normcase(os.path.abspath(os.getcwd()))
+_NEVER = ("subprocess.Popen", "os.system", "os.exec", "os.spawn",
+          "os.posix_spawn", "os.startfile", "os.kill", "os.symlink",
+          "os.link", "socket.connect", "socket.getaddrinfo", "socket.bind",
+          "socket.sendto", "socket.sendmsg", "webbrowser.open")
+_NEVER_PREFIX = ("_winapi.", "winreg.Create", "winreg.Delete", "winreg.Set",
+                 "winreg.Save", "winreg.Load", "winreg.Connect")
+_PATHS = ("os.remove", "os.unlink", "os.rmdir", "os.rename", "os.replace",
+          "shutil.rmtree", "shutil.move", "os.mkdir", "os.truncate",
+          "os.chmod", "sqlite3.connect")
+_WRITE = (os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC)
+def _inside(p):
+    if isinstance(p, int) or p is None or p == ":memory:":
+        return True
+    try:
+        t = os.path.normcase(os.path.abspath(os.fsdecode(os.fspath(p))))
+    except TypeError:
+        return False
+    return t == _ROOT or t.startswith(_ROOT + os.sep)
 def _fence(event, args):
-    if event in ("subprocess.Popen", "os.system", "os.exec", "os.spawn",
-                 "os.posix_spawn", "os.startfile", "socket.connect",
-                 "socket.getaddrinfo", "os.remove", "os.unlink", "os.rmdir",
-                 "os.rename", "os.replace", "shutil.rmtree", "shutil.move",
-                 "webbrowser.open"):
+    if event in _NEVER or event.startswith(_NEVER_PREFIX):
         raise PermissionError(f"blocked in the docs benchmark: {event}")
-    if event == "open" and len(args) > 1 and args[1] and any(
-            c in str(args[1]) for c in "wax+"):
-        target = os.path.abspath(str(args[0]))
-        if not target.startswith(_ROOT):
-            raise PermissionError(f"blocked write outside the sandbox: {target}")
+    if event in _PATHS:
+        for p in args[:2]:
+            if isinstance(p, (str, bytes, os.PathLike)) and not _inside(p):
+                raise PermissionError(
+                    f"blocked {event} outside the sandbox: {p}")
+    if event == "open" and args:
+        mode, flags = (args[1] if len(args) > 1 else None,
+                       args[2] if len(args) > 2 else 0)
+        writes = (any(c in str(mode) for c in "wax+") if mode
+                  else bool((flags or 0) & _WRITE))
+        if writes and not _inside(args[0]):
+            raise PermissionError(
+                f"blocked write outside the sandbox: {args[0]}")
 sys.addaudithook(_fence)
 '''
 
@@ -139,9 +169,15 @@ def run_code_test(code: str, item: dict, *, timeout: float = CODE_TIMEOUT,
                   + FENCE + "\nfrom solution import *\n"
                   + item["hidden_test"] + "\nprint('PASS')\n")
         Path(tmp, "runner.py").write_text(runner, encoding="utf-8")
+        # tempfile inside the sandbox too, so a solution's temp file is a
+        # write the fence allows rather than one it has to block.
+        scratch = Path(tmp, "tmp")
+        scratch.mkdir()
+        env = dict(os.environ, TEMP=str(scratch), TMP=str(scratch),
+                   TMPDIR=str(scratch))
         try:
             out = subprocess.run(
-                [sys.executable, "-I", "-B", "runner.py"], cwd=tmp,
+                [sys.executable, "-I", "-B", "runner.py"], cwd=tmp, env=env,
                 capture_output=True, text=True, timeout=timeout,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             text = (out.stdout + out.stderr).strip()
@@ -170,6 +206,8 @@ class ItemResult:
     code: str = ""
     detail: str = ""
     notes: List[str] = field(default_factory=list)
+    #: The model the ENGINE says answered (last_call_stats), "" if unknown.
+    served_by: str = ""
 
 
 @dataclass
@@ -206,8 +244,30 @@ class BenchReport:
         return bool(self.items) and not self.stopped and self.rate >= GOOD_RATE
 
     @property
+    def origin_class(self) -> str:
+        """"US" / "non-US" / "unknown" — see docs_qa.model_origin."""
+        return docs_qa.model_origin(self.model, self.origin)
+
+    @property
     def recommendable(self) -> bool:
-        return self.good and self.origin.lower() != "non-us"
+        # Only a model known to be US-made is ever recommended. "Not non-US"
+        # let an unknown origin through — every GGUF in the fallback picker,
+        # qwen included, and any id spelled differently in two lists.
+        return self.good and self.origin_class == "US"
+
+    @property
+    def served_by(self) -> List[str]:
+        return sorted({i.served_by for i in self.items if i.served_by})
+
+    def _served_elsewhere(self) -> List[str]:
+        """Models the engine reports that the label does not name — the sign
+        that a requested model was ignored and another one measured."""
+        label = (self.model or "").lower()
+        if not label:
+            return []
+        return [s for s in self.served_by
+                if s.lower() not in label
+                and docs_qa.model_label(s).lower() not in label]
 
     def summary(self) -> Dict[str, Any]:
         qs, ns, cs = self._of("question"), self._of("negative"), \
@@ -228,8 +288,8 @@ class BenchReport:
                                       / max(1, len(self.items)), 2),
             "constrained": any(i.constrained for i in self.items),
             "good": self.good, "recommendable": self.recommendable,
-            "origin": self.origin, "stopped": self.stopped,
-            "started": self.started,
+            "origin": self.origin_class, "stopped": self.stopped,
+            "started": self.started, "served_by": self.served_by,
         }
 
     def lines(self) -> List[str]:
@@ -239,16 +299,22 @@ class BenchReport:
         verdict = ("stopped" if self.stopped else
                    "not reliable enough" if not self.good else
                    "good for docs questions" if self.recommendable else
-                   "scored well, but non-US: measured only, not recommended")
+                   "scored well, but non-US: measured only, not recommended"
+                   if self.origin_class == "non-US" else
+                   "scored well, but its origin is unknown: not recommended")
         out = [f"{self.model or 'model'}: {s['passed']}/{s['total']} passed "
-               f"({s['rate']:.0%}) — {verdict}",
-               f"questions {s['questions']}, citations right "
-               f"{s['citations_right']}, 'not covered' right "
-               f"{s['not_covered_right']}, code {s['code']}",
-               f"{s['mean_seconds']:.1f} s per item, "
-               f"{s['mean_model_calls']:.1f} model calls per item"
-               + ("" if s["constrained"] else
-                  " (output was not schema-constrained)")]
+               f"({s['rate']:.0%}) — {verdict}"]
+        elsewhere = self._served_elsewhere()
+        if elsewhere:
+            out.append(f"⚠ the engine says {', '.join(elsewhere)} answered, "
+                       f"not {self.model} — this score is not that model's")
+        out += [f"questions {s['questions']}, citations right "
+                f"{s['citations_right']}, 'not covered' right "
+                f"{s['not_covered_right']}, code {s['code']}",
+                f"{s['mean_seconds']:.1f} s per item, "
+                f"{s['mean_model_calls']:.1f} model calls per item"
+                + ("" if s["constrained"] else
+                   " (output was not schema-constrained)")]
         for i in self.items:
             if not i.passed:
                 out.append(f"  ✗ {i.id} ({i.kind}): {i.detail[:160]}")
@@ -303,6 +369,7 @@ def run(model_call: Optional[docs_qa.ModelCall] = None, *,
             if progress:
                 progress(f"Check {n}/{len(chosen)}: {item['id']}…")
             question = item.get("question") or item.get("task", "")
+            docs_qa._INFO.value = {}         # noqa: SLF001 — no stale stats
             ans = docs_qa.ask(question, servers=[server],
                               packages=[bench["package"]],
                               write_code=(kind == "code"),
@@ -311,7 +378,11 @@ def run(model_call: Optional[docs_qa.ModelCall] = None, *,
             if ans.stopped:
                 report.stopped = True
                 break
-            report.items.append(_grade(kind, item, ans))
+            graded = _grade(kind, item, ans)
+            # Same thread as the engine call, so this is that call's stats.
+            stats = docs_qa.last_call_info().get("stats") or {}
+            graded.served_by = str(stats.get("model") or "")
+            report.items.append(graded)
     except Exception as exc:                              # noqa: BLE001
         report.error = f"{type(exc).__name__}: {exc}"
     report.seconds = time.perf_counter() - t0
@@ -351,7 +422,7 @@ def capability_check(model_call: Optional[docs_qa.ModelCall] = None, *,
     """The Docs tab's quick check: 5 items, model-derived queries."""
     report = run(model_call, items="quick", should_stop=should_stop,
                  progress=progress, model_label=model_label)
-    report.origin = origin
+    report.origin = docs_qa.model_origin(report.model, origin)
     return report
 
 

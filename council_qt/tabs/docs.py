@@ -125,6 +125,9 @@ class DocsActions:
                            if m.get("id") == model_id), "")
         except Exception:                                 # noqa: BLE001
             origin = ""
+        # The list may spell a GGUF path differently, or not know the model:
+        # the name then decides, and doubt stays "unknown", never "US".
+        origin = docs_qa.model_origin(model_id, origin)
         report = docs_bench.capability_check(
             self.model_call, should_stop=should_stop, progress=progress,
             model_label=docs_qa.model_label(model_id), origin=origin)
@@ -150,9 +153,9 @@ def render_answer(ans: docs_qa.DocsAnswer, muted: str = "#888",
         parts.append(f"<p style='color:{error}'>{esc(ans.error)}</p>")
     if ans.answer:
         body = esc(ans.answer)
-        body = docs_qa.CITATION.sub(
-            lambda m: (f"<a href='src:{m.group(1)}'>[{m.group(1)}]</a>"
-                       if int(m.group(1)) in valid else m.group(0)), body)
+        body = docs_qa.sub_citations(
+            body, lambda n, text: (f"<a href='src:{n}'>[{n}]</a>"
+                                   if n in valid else text))
         parts.append("<p>" + body.replace("\n", "<br>") + "</p>")
     if ans.sources:
         rows = []
@@ -409,10 +412,15 @@ class DocsTab(ViewHelpers, QWidget):
             -float(r.get("rate") or 0), float(r.get("mean_seconds") or 0)))
         lines = ["Checked so far:"]
         for r in ranked[:5]:
-            if str(r.get("origin") or "").lower() == "non-us":
+            origin = docs_qa.model_origin(str(r.get("model") or ""),
+                                          r.get("origin"))
+            if origin == "non-US":
                 verdict = "non-US, measured only"
+            elif not r.get("good"):
+                verdict = "weak"
             else:
-                verdict = "good" if r.get("good") else "weak"
+                verdict = ("good" if origin == "US"
+                           else "scored well, origin unknown — not recommended")
             lines.append(f"• {r.get('model')}: {r.get('passed')}/"
                          f"{r.get('total')}, {r.get('mean_seconds')} s/item "
                          f"— {verdict}")
@@ -434,12 +442,13 @@ class DocsTab(ViewHelpers, QWidget):
         for m in models or []:
             label = str(m.get("name") or docs_qa.model_label(m["id"]))
             backend = m.get("backend") or ""
-            origin = str(m.get("origin") or "unknown")
+            origin = docs_qa.model_origin(f"{m['id']} {label}",
+                                          m.get("origin"))
             text = f"{label}  [{backend}]" if backend else label
-            if origin.lower() == "non-us":
+            if origin == "non-US":
                 # Listed so it can be measured; never marked as a good pick.
                 text += "  — non-US: for measurement only"
-            elif docs_qa.model_label(m["id"]) in passed:
+            elif origin == "US" and docs_qa.model_label(m["id"]) in passed:
                 text += "  ★ passed the docs check"
             self.model_combo.addItem(text, m["id"])
             if m["id"] == current:
@@ -595,6 +604,20 @@ class DocsTab(ViewHelpers, QWidget):
             show(MODELS_TAB)
 
     def on_check(self) -> None:
+        # The check measures the model that ANSWERS docs questions. Under a
+        # picker showing another one, "Check this model" would measure the
+        # wrong model — so say what to do instead of guessing.
+        if self.model_combo.count():
+            picked = str(self.model_combo.currentData() or "")
+            _role, current = self.actions.answering()
+            saved = current if self.actions.docs_assigned() else ""
+            if picked != saved:
+                self.status.setText(
+                    f"Press “Use for docs” first: the check runs the model "
+                    f"that answers docs questions "
+                    f"({docs_qa.model_label(current)}), not "
+                    f"{docs_qa.model_label(picked)}.")
+                return
         stop = self._stop_flag()
         self._start("Checking the docs model — 5 questions…",
                     lambda: self.actions.capability_check(

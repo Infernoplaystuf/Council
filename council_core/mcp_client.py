@@ -48,6 +48,7 @@ import itertools
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -253,10 +254,19 @@ class StdioTransport(_Transport):
         env.setdefault("PYTHONUNBUFFERED", "1")
         env.setdefault("PYTHONIOENCODING", "utf-8")
         try:
-            self.proc = subprocess.Popen(
-                argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, cwd=self.cwd, env=env,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            try:
+                self.proc = self._popen(argv, env)
+            except FileNotFoundError:
+                # Windows: CreateProcess finds `name.exe` but not
+                # `name.cmd`, and npx — how most published MCP servers
+                # start — is npx.cmd. shutil.which honours PATHEXT. Only
+                # tried after the plain start failed, so a command that
+                # worked before ("python" = the app's own) is unchanged.
+                found = (shutil.which(self.command, path=env.get("PATH"))
+                         if not os.path.dirname(self.command) else None)
+                if not found:
+                    raise
+                self.proc = self._popen([found] + self.args, env)
         except FileNotFoundError:
             raise McpConnectionError(
                 f"Could not start the server: the command {self.command!r} "
@@ -271,6 +281,13 @@ class StdioTransport(_Transport):
             t = threading.Thread(target=target, name=name, daemon=True)
             t.start()
             self._threads.append(t)
+
+    def _popen(self, argv: List[str], env: Dict[str, str]
+               ) -> subprocess.Popen:
+        return subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, cwd=self.cwd, env=env,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
     def _read_stdout(self) -> None:
         proc = self.proc
@@ -553,8 +570,13 @@ class HttpTransport(_Transport):
             if resp.status == 404 and self.session_id:
                 resp.read()
                 self.session_id = None
-                self._fault(rid, "The server forgot this session (HTTP 404); "
-                                 "reconnect to start a new one.")
+                # The session is over (spec: the client MUST start a new
+                # one). Closing — not just failing this request — is what
+                # lets a pool see `connected` turn False and reconnect;
+                # otherwise every later question failed against a session
+                # the server had forgotten. Fails this request too.
+                self.on_closed("The server forgot this session (HTTP 404); "
+                               "reconnect to start a new one.")
                 return
             if resp.status >= 400:
                 body = resp.read(2000).decode("utf-8", "replace")
