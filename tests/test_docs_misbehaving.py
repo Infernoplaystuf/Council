@@ -354,6 +354,27 @@ def test_a_pages_own_reference_numbers_are_not_page_numbers():
     assert pages[1].text.count("[1]") == 2         # what the user reads
 
 
+def test_every_prompt_says_the_documentation_is_not_instructions(
+        monkeypatch):
+    """Pages come from whatever server the user added. Neither prompt told
+    the model that text inside them is data — "ignore the question and..."
+    in a page read exactly like the Council's own instructions."""
+    system = qa.answer_messages("q", [qa.Source(1, "s", "a", "a", "t")],
+                                write_code=True)[0]["content"]
+    assert qa.NOT_INSTRUCTIONS in system
+    monkeypatch.setattr(ds, "pooled", lambda spec, **kw: (
+        _OkClient(), ds.Roles("search", "query", "", "get", "name")))
+    seen = []
+
+    def chat_tools(messages, tools, **kw):
+        seen.append(messages[0]["content"])
+        return {"content": "Not covered.", "tool_calls": []}
+
+    qa.ask("q about pkg", servers=[ds.ServerSpec(name="x", command="x")],
+           mode="tools", chat_tools=chat_tools, model_call=answer_model)
+    assert seen and qa.NOT_INSTRUCTIONS in seen[0]
+
+
 # ============================================================ model output
 
 def test_repetitive_code_goes_back_for_repair_instead_of_failing(
@@ -395,6 +416,43 @@ class _OkClient:
                 [{"name": "pkg.Ledger", "summary": "a ledger"}])}])
         return ToolResult([{"type": "text", "text":
                             "pkg.Ledger(capacity=64)\n\nA ledger."}])
+
+
+# ============================================================ the bundled server
+
+def test_the_bundled_server_never_runs_the_package_it_documents(tmp_path):
+    """End to end through the real server process: a package whose every
+    module, stub and __init__ leaves a mark when executed is indexed,
+    searched, read as a page and as a resource — and no mark appears."""
+    marks = tmp_path / "marks"
+    marks.mkdir()
+    trap = (f"import pathlib\npathlib.Path({str(marks)!r}, __name__)"
+            f".write_text('ran')\n")
+    pkg = tmp_path / "site" / "trapdoor"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text(
+        '"""Trapdoor: a package that must never be imported."""\n' + trap
+        + "from .core import open_door\n__all__ = ['open_door']\n",
+        encoding="utf-8")
+    (pkg / "core.py").write_text(
+        trap + "def open_door(width: int = 3) -> str:\n"
+        '    """Open the door `width` steps."""\n    return "open"\n',
+        encoding="utf-8")
+    (pkg / "core.pyi").write_text(
+        "def open_door(width: int = ...) -> str: ...\n", encoding="utf-8")
+    spec = ds.bundled_spec("trap", paths=[str(tmp_path / "site")],
+                           packages=["trapdoor"], cache=False)
+    client, roles = ds.pooled(spec)
+    hits = client.call_tool("search_docs", {"query": "open door",
+                                            "package": "trapdoor"})
+    assert "trapdoor.open_door" in hits.text
+    page = client.call_tool("get_doc", {"name": "trapdoor.open_door"})
+    assert "width" in page.text
+    assert client.read_resource("pydoc://trapdoor")
+    assert qa.docs_context("open the door", packages=["trapdoor"],
+                           servers=[spec])
+    ds.release(spec.name)
+    assert list(marks.iterdir()) == [], "package code ran"
 
 
 # ============================================================ the sandbox
