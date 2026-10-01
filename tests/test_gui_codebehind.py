@@ -394,6 +394,23 @@ def count_images(folder):
     assert cand.stage == gcb.STAGE_SMOKE, cand.faults
 
 
+@pytest.mark.parametrize("body", [
+    "import numpy as np\n    np.ctypeslib.load_library('x', folder)",
+    "import numpy as np\n    k = np.ctypeslib.ctypes.windll.kernel32",
+    "from numpy import ctypeslib\n    ctypeslib.as_array",
+])
+def test_ctypes_reached_through_another_module_is_refused(body):
+    """Review: gui_policy denies `import ctypes`, but numpy hands it over as
+    an attribute (np.ctypeslib.ctypes.windll...) — native calls the smoke
+    fence does not watch (it cannot refuse ctypes without breaking the
+    libraries that load native code lazily) and that passed every gate."""
+    reply = fence(f"def count_images(folder):\n    {body}\n"
+                  f"    return {{'status': '', 'files': []}}")
+    cand = gcb.check(reply, fn_target())
+    assert cand.stage == gcb.STAGE_POLICY, (cand.stage, cand.faults)
+    assert any("ctypes" in f for f in cand.faults), cand.faults
+
+
 def test_abort_on_something_else_is_not_an_exit():
     reply = fence('''
 def count_images(folder):

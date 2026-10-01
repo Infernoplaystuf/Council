@@ -180,6 +180,13 @@ LOW_LEVEL_MODULES = frozenset({"_winapi", "nt", "posix", "msvcrt",
 #: worker is a second Python no fence watches, and in the app the window
 #: cannot report what a worker raises.
 WORKER_MODULES = frozenset({"_thread", "concurrent"})
+#: ctypes by another door: gui_policy denies `import ctypes`, but numpy
+#: hands it over as np.ctypeslib.ctypes. The smoke fence cannot refuse
+#: native calls (libraries load native code lazily), so these names are
+#: refused wherever they are spelled.
+CTYPES_NAMES = frozenset({"ctypes", "ctypeslib", "windll", "cdll", "oledll",
+                          "pydll", "pythonapi", "WinDLL", "CDLL", "OleDLL",
+                          "PyDLL", "LoadLibrary"})
 WORKER_NAMES = frozenset({"Thread", "ThreadPoolExecutor",
                           "ProcessPoolExecutor", "start_new_thread"})
 #: inspect's frame-returning calls, by receiver (np.stack is not one).
@@ -1145,6 +1152,11 @@ def policy_faults(code: str, target: Target) -> List[str]:
                 and any(a.name == "pyplot" for a in node.names):
             faults.append(f"line {line}: no matplotlib.pyplot — use "
                           f"matplotlib.figure.Figure")
+        if (isinstance(node, ast.Attribute) and node.attr in CTYPES_NAMES) \
+                or (isinstance(node, ast.ImportFrom) and any(
+                    a.name in CTYPES_NAMES for a in node.names)):
+            faults.append(f"line {line}: no ctypes (native calls) — code "
+                          f"behind a widget uses Python libraries")
         if isinstance(node, ast.ImportFrom) and not node.level:
             for a in node.names:
                 if a.name in WORKER_NAMES:
