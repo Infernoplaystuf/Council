@@ -251,6 +251,118 @@ def test_starting_a_process_is_blocked():
     assert not r.ok and any("subprocess.Popen" in b for b in r.blocked)
 
 
+def test_a_worker_process_is_blocked(victim):
+    """Review: a ProcessPoolExecutor started a second Python with NO fence —
+    multiprocessing creates its worker through _winapi.CreateProcess, not
+    subprocess.Popen — and the worker ran model code that wrote outside the
+    sandbox. concurrent.futures passes gui_policy (only multiprocessing is
+    denied by name)."""
+    r = function(f"""
+import concurrent.futures as cf
+
+def work(path):
+    with open(path, "w") as fh:
+        fh.write("written by an unfenced worker")
+    return 1
+
+def f():
+    with cf.ProcessPoolExecutor(max_workers=1) as ex:
+        return {{"n": ex.submit(work, {str(victim)!r}).result()}}
+""", [], {"n": "number"}, timeout=20)
+    assert not r.ok, r.summary()
+    # The pool's pipe (_winapi.CreateNamedPipe) is refused before its
+    # CreateProcess is reached; a fork on POSIX.
+    assert any("_winapi." in b or "fork" in b for b in r.blocked), \
+        r.summary()
+    assert not victim.exists()
+
+
+def test_a_database_outside_the_sandbox_is_blocked(tmp_path):
+    """Review: sqlite3 opens its file in C (no 'open' audit event), so a
+    database anywhere on the disk was created or changed unfenced."""
+    db = tmp_path / "outside.db"
+    r = function(f"""
+def f():
+    import sqlite3
+    con = sqlite3.connect({str(db)!r})
+    con.execute("create table t (x)")
+    con.commit()
+    con.close()
+    return {{"n": 1}}
+""", [], {"n": "number"})
+    assert not r.ok and any("sqlite3.connect" in b for b in r.blocked), \
+        r.summary()
+    assert not db.exists()
+
+
+def test_a_database_inside_the_sandbox_or_in_memory_is_fine():
+    r = function("""
+def f(out):
+    import os
+    import sqlite3
+    mem = sqlite3.connect(":memory:")
+    mem.execute("create table t (x)")
+    con = sqlite3.connect(os.path.join(out, "results.db"))
+    con.execute("create table t (x)")
+    con.commit()
+    con.close()
+    return {"n": 2}
+""", ["<OUT>"], {"n": "number"})
+    assert r.ok, r.summary()
+
+
+def test_nothing_the_candidate_leaves_behind_runs_after_the_fence(victim):
+    """Review: the fence was DISARMED after the call, and the interpreter
+    then ran the candidate's exit handlers with nothing watching — a write
+    outside the sandbox from atexit landed on disk."""
+    r = function(f"""
+def f():
+    import atexit
+
+    def later():
+        with open({str(victim)!r}, "w") as fh:
+            fh.write("after the fence")
+    atexit.register(later)
+    return {{"n": 1}}
+""", [], {"n": "number"})
+    assert not victim.exists(), r.summary()
+
+
+def test_the_returned_value_is_inspected_inside_the_fence(victim):
+    """Review: repr()/str() of the returned value — the preview and the
+    port checks — ran the candidate's own __repr__ after the fence was
+    disarmed."""
+    r = function(f"""
+class Count:
+    def __repr__(self):
+        with open({str(victim)!r}, "w") as fh:
+            fh.write("from __repr__")
+        return "Count()"
+
+def f():
+    return {{"n": Count()}}
+""", [], {"n": "any"})
+    assert not r.ok and any("writes outside" in b for b in r.blocked), \
+        r.summary()
+    assert not victim.exists()
+
+
+def test_a_verdict_the_candidate_wrote_itself_is_not_believed():
+    """Review: the verdict file lives in the sandbox, which the candidate
+    may write. Writing {"ok": true} there and leaving before the harness
+    did turned a function that does nothing into 'smoke run passed'."""
+    r = function("""
+def f():
+    import json
+    from os import _exit
+    with open("_smoke_out.json", "w") as fh:
+        json.dump({"ok": True, "result_keys": ["n"]}, fh)
+    _exit(0)
+""", [], {"n": "number"})
+    assert not r.ok, r.summary()
+    assert "verdict" in r.error
+
+
 def test_the_network_is_blocked():
     r = handler("""
     def on_btn_go(self, *args) -> None:

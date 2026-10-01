@@ -46,7 +46,18 @@ TypeError the real _ProxyPort raises.
 ANSWERS THROUGH A FILE, NOT STDOUT
 The child writes its verdict to a JSON file in the sandbox, the lesson
 python_envs.probe learned: a package printing while it imports, or a helper
-process holding the pipe, made stdout markers unreliable there.
+process holding the pipe, made stdout markers unreliable there. The sandbox
+is the one place the candidate MAY write, so the verdict carries a nonce the
+parent hands the child on stdin (read before the candidate exists): a
+verdict without it — one the candidate wrote, then left before the harness
+did — is not believed.
+
+THE FENCE NEVER COMES DOWN
+It stays armed from before the candidate is imported until the process
+ends: the returned value's repr() and the port checks call the candidate's
+own __repr__/__str__, and those run fenced too. The child ends with
+os._exit after the verdict is written, so exit handlers and finalizers the
+candidate registered never run — there is no unfenced moment left for them.
 
 Stdlib only, and the child half (``python gui_smoke.py <job.json>``) needs
 nothing from the Council at all, so it runs under whichever interpreter the
@@ -57,6 +68,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import secrets
 import struct
 import subprocess
 import sys
@@ -303,10 +315,13 @@ def run_job(job: Dict[str, Any], *, python: str = "",
                 "TMPDIR": str(scratch)})
             env.pop("PYTHONPATH", None)
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            # On stdin, not in the job file: the candidate can read the
+            # sandbox, and the child consumes stdin before it runs.
+            nonce = secrets.token_hex(16)
             try:
                 proc = subprocess.run(
                     [python, str(Path(__file__).resolve()), str(job_path)],
-                    cwd=sandbox, env=env, stdin=subprocess.DEVNULL,
+                    cwd=sandbox, env=env, input=nonce + "\n",
                     capture_output=True, text=True, encoding="utf-8",
                     errors="replace", timeout=timeout, creationflags=flags)
                 stderr = proc.stderr or ""
@@ -324,7 +339,15 @@ def run_job(job: Dict[str, Any], *, python: str = "",
                     f"the smoke run exited with code {proc.returncode} "
                     f"and no verdict")
                 return res
-            got = json.loads(out_path.read_text(encoding="utf-8"))
+            try:
+                got = json.loads(out_path.read_text(encoding="utf-8"))
+            except ValueError:
+                got = None
+            if not isinstance(got, dict) or got.get("nonce") != nonce:
+                res.error = ("the smoke run's verdict was not the harness's "
+                             "own — the code wrote over it or ended the run "
+                             "before the harness could answer")
+                return res
     except Exception as exc:                             # noqa: BLE001
         res.error = res.error or f"smoke harness failed: {exc!r}"
         res.seconds = time.perf_counter() - t0
@@ -475,6 +498,12 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
     import io
     import traceback
 
+    # The parent's nonce, before anything else runs (see the module
+    # docstring). Run by hand, stdin may be absent: no nonce, same verdict.
+    try:
+        nonce = (sys.stdin.readline() if sys.stdin else "").strip()
+    except Exception:                                    # noqa: BLE001
+        nonce = ""
     job = json.loads(Path(job_path).read_text(encoding="utf-8"))
     sandbox = os.path.realpath(job["sandbox"])
     out_path = os.path.join(sandbox, "_smoke_out.json")
@@ -525,7 +554,9 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
     _realpath = os.path.realpath
     _normcase = os.path.normcase
     _fspath = os.fspath
+    _fsdecode = os.fsdecode
     _sep = os.sep
+    _exit = os._exit
     norm_box = _normcase(sandbox)
     devnull = _normcase(_realpath(os.devnull))
     armed = [False]
@@ -534,6 +565,14 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
         "os.system", "subprocess.Popen", "os.exec", "os.spawn",
         "os.posix_spawn", "os.startfile", "os.kill", "os.chdir",
         "os.symlink", "os.link", "os.truncate",
+        # A process by the primitives under subprocess: multiprocessing and
+        # concurrent.futures' ProcessPoolExecutor start their workers with
+        # _winapi.CreateProcess (Windows) or a fork — and a worker is a
+        # second Python with no fence at all.
+        "_winapi.CreateProcess", "_winapi.OpenProcess",
+        "_winapi.TerminateProcess", "_winapi.CreateJunction",
+        "_winapi.CreateFile", "_winapi.CreateNamedPipe",
+        "os.fork", "os.forkpty", "_posixsubprocess.fork_exec",
         "socket.connect", "socket.bind", "socket.getaddrinfo",
         "socket.gethostbyname", "socket.sendto", "urllib.Request",
         "http.client.connect", "ftplib.connect", "smtplib.connect",
@@ -556,7 +595,9 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
 
     def inside(path: Any) -> bool:
         try:
-            p = _normcase(_realpath(_fspath(path)))
+            p = _fspath(path)
+            p = _normcase(_realpath(_fsdecode(p) if isinstance(p, bytes)
+                                    else p))
         except Exception:                                # noqa: BLE001
             return False
         return p == norm_box or p.startswith(norm_box + _sep) \
@@ -587,6 +628,16 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
                     and not inside(target):
                 why = f"{event}({os.fspath(target)!r}) writes outside the " \
                       f"folders it was given"
+        elif event == "sqlite3.connect":
+            # SQLite opens its file in C: no "open" event. In memory, or a
+            # file inside the sandbox, only; a "file:" URI can say anything.
+            db = args[0] if args else ""
+            text = _fsdecode(db) if isinstance(db, (bytes, os.PathLike)) \
+                else str(db)
+            if text not in ("", ":memory:") and (
+                    text.lower().startswith("file:") or not inside(text)):
+                why = (f"sqlite3.connect({text!r}) writes outside the "
+                       f"folders it was given")
         elif event == "import" and args:
             root = str(args[0]).split(".")[0]
             if root in blocked_imports:
@@ -721,7 +772,8 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
             t0 = time.perf_counter()
             result = fn(*args)
             verdict["call_seconds"] = time.perf_counter() - t0
-            armed[0] = False
+            # Still armed: repr()/str()/get() below call the candidate's own
+            # methods on what it returned.
             expect = job.get("expect") or {}
             if not isinstance(result, dict):
                 record["problems"].append(
@@ -758,7 +810,6 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
             t0 = time.perf_counter()
             getattr(app, job["handler"])()
             verdict["call_seconds"] = time.perf_counter() - t0
-            armed[0] = False
             if record["errors"]:
                 first = record["errors"][0]
                 verdict.update(where=first["where"],
@@ -771,7 +822,6 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
         verdict["ok"] = not (record["problems"] or record["blocked"]
                              or verdict.get("error"))
     except BaseException as exc:                         # noqa: BLE001
-        armed[0] = False
         verdict["call_seconds"] = time.perf_counter() - t0
         tb = traceback.extract_tb(exc.__traceback__)
         own = [f for f in tb if os.path.basename(f.filename) in
@@ -796,7 +846,6 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
                                 f"{own[-1].lineno}")
             verdict["line_text"] = own[-1].line or ""
     finally:
-        armed[0] = False
         sys.stdout, sys.stderr = real_stdout, real_stderr
     verdict["blocked"] = record["blocked"]
     verdict["problems"] = [p for p in record["problems"] if p]
@@ -805,8 +854,18 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
     verdict["stdout"] = captured.getvalue()[:MAX_STDOUT]
     if verdict["blocked"]:
         verdict["ok"] = False
+    verdict["nonce"] = nonce
+    # Still armed (the sandbox is where this file lives, so the fence lets
+    # it through). Then out, at once: no exit handler or finalizer the
+    # candidate left behind gets a turn — and none would be fenced-free.
     with open(out_path, "w", encoding="utf-8") as fh:
         json.dump(verdict, fh, default=str)
+    try:
+        real_stdout.flush()
+        real_stderr.flush()
+    except Exception:                                    # noqa: BLE001
+        pass
+    _exit(0)
 
 
 if __name__ == "__main__":                          # pragma: no cover - child
