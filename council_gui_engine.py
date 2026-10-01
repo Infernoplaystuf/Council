@@ -10169,7 +10169,8 @@ class CouncilConsole(tk.Tk):
                 for w in tree.warnings:
                     out.append(f"warning: {w}")
 
-                ok, errs = _gsp.validate(spec)
+                # pdir: a link may name the project's own logic.py.
+                ok, errs = _gsp.validate(spec, pdir)
                 if not ok:
                     out.extend(f"cannot generate: {e}" for e in errs)
                     return (out, questions)

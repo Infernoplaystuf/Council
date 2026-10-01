@@ -587,11 +587,22 @@ def _top_level_defs(module: str, root: Any = None) -> Optional[set]:
 
 
 def _script_errors(w, where: str, port_of: Dict[str, Any], spec: "Spec",
-                   gpol, cache: Dict[str, Optional[set]]) -> List[str]:
+                   gpol, cache: Dict[Any, Optional[set]],
+                   local: Sequence[str] = (), project_dir: Any = None
+                   ) -> List[str]:
     """Everything wrong with one widget's script link, one message each.
 
     Reports a malformed link rather than raising on it: a model writing
-    "outputs": ["count"] used to crash validate() with an AttributeError."""
+    "outputs": ["count"] used to crash validate() with an AttributeError.
+
+    ``local`` are the project's own modules (gui_policy.project_modules) —
+    logic.py, where the code writer puts model-written functions, or a
+    helper the user wrote. They are linkable like a Council module, and
+    read from ``project_dir``, not from beside this file: the generated
+    main.py puts the project folder on sys.path, and the policy gate already
+    reads every .py in it (gui_policy.validate_dir). Refusing them made the
+    only workaround declaring the module in `requires`, which imports it at
+    startup for no reason."""
     sc = getattr(w, "script", None) or {}
     if not isinstance(sc, dict):
         return [f"{where}: script link must be an object with module, "
@@ -609,24 +620,28 @@ def _script_errors(w, where: str, port_of: Dict[str, Any], spec: "Spec",
         errs.append(f"{where}: script link names no valid function ({func!r})")
         return errs
     root = module.split(".")[0]
-    if root not in gpol.allowed_modules(spec.mode, spec.requires):
+    is_local = root in local and project_dir is not None
+    base = project_dir if is_local else None
+    if not is_local and root not in gpol.allowed_modules(spec.mode,
+                                                         spec.requires):
         fix = ("switch the project to linked mode"
                if spec.mode != "linked" and (root in gpol.LINKED_MODULES
                                              or gpol.is_council_module(root))
                else "add it to the project's requires")
         errs.append(f"{where}: script module {module!r} is not allowed in "
                     f"{spec.mode} mode — {fix}")
-    elif "." in module and _module_file(root) is not None \
-            and _module_file(module) is None:
+    elif "." in module and _module_file(root, base) is not None \
+            and _module_file(module, base) is None:
         # 'frame_timing.count_bad_frames': the function written into the
         # module path. The allowlist sees only the root, so this passed and
         # then failed on the first press with ModuleNotFoundError.
         errs.append(f"{where}: {module!r} is not a module — did you mean "
                     f"module {module.rsplit('.', 1)[0]!r}, function "
                     f"{module.rsplit('.', 1)[1]!r}?")
-    if module not in cache:
-        cache[module] = _module_names(module)
-    names = cache[module]
+    key = (module, str(base) if base else "")
+    if key not in cache:
+        cache[key] = _module_names(module, base)
+    names = cache[key]
     if names is not None and func not in names[0]:
         errs.append(f"{where}: {module} has no function {func!r}")
     elif names is not None and func in names[1]:
@@ -736,17 +751,34 @@ def missing_required_ports(spec: Spec,
     return errs
 
 
-def validate(spec: Spec) -> Tuple[bool, List[str]]:
+def validate(spec: Spec, project_dir: Any = None) -> Tuple[bool, List[str]]:
     """(ok, errors). EVERY fault, not the first.
 
     A generator that stopped at the first problem would make the user fix one
     thing, regenerate, and discover the next — turning a five-minute correction
-    into five rounds."""
+    into five rounds.
+
+    ``project_dir`` lets a script link name one of the project's OWN modules
+    (logic.py — see _script_errors). Without it, only Council modules and
+    declared packages are linkable, as before."""
     # A declared package widens this project's policy allowlist, so the
     # declaration is gated too: no denied module, no council_engine.
     import gui_policy as _gpol
     errs: List[str] = list(_gpol.check_requires(spec.requires, spec.mode))
-    _module_defs: Dict[str, Optional[set]] = {}     # per-validate AST cache
+    _module_defs: Dict[Any, Optional[set]] = {}     # per-validate AST cache
+    local: List[str] = []
+    if project_dir is not None:
+        try:
+            # The generated files are not link targets; a project's own
+            # helper modules are — unless one is named like a Council
+            # module: a linked main.py puts the Council's folder FIRST on
+            # sys.path, so that name would import the Council's file, not
+            # the one this check read.
+            local = [m for m in _gpol.project_modules(project_dir)
+                     if m not in _gpol.PROJECT_MODULES
+                     and not _gpol.is_council_module(m)]
+        except OSError:
+            local = []
     seen: Dict[str, str] = {}
     seen_ports: Dict[str, str] = {}   # port name -> shape id
     driven_sinks: Dict[str, str] = {}  # target port name -> driving widget
@@ -801,7 +833,7 @@ def validate(spec: Spec) -> Tuple[bool, List[str]]:
         # module, function or port name surfaced only when the button was
         # pressed, as a print to a console nobody reads.
         errs.extend(_script_errors(w, where, port_of, spec, _gpol,
-                                   _module_defs))
+                                   _module_defs, local, project_dir))
 
         # -- sequence link (drives) --------------------------------------
         #

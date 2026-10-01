@@ -49,6 +49,16 @@ asking before it replaces one. Both dialogs come from the host too
 (a Typhon built before the FPS box and the Settings menu), after a confirm
 that says handlers.py and app.py are kept; the old project.gspec is backed
 up beside the new one, and Generate runs on a worker as usual.
+
+THE CODE BEHIND A BUTTON
+"Write it with the model…" in the Wiring group (council_core.
+designer_codebehind, gui_codebehind, gui_smoke): the coder model writes one
+function into the project's logic.py — or, for UI glue, the body of an
+untouched handler stub — on a worker, through static gates and a sandboxed
+smoke run. The review (`review_code`, host-supplied like the other dialogs,
+"not accepted" by default) shows the diff; only Accept writes, and in
+function mode the widget is then wired to logic.<function> through the
+Scene, so Undo takes the wiring back and Generate writes the handler.
 """
 from __future__ import annotations
 
@@ -180,6 +190,37 @@ class DesignerActions:
         directory = self.project_dir(name)
         return bool(directory and gui_runner.stop(directory))
 
+    # -- "Write it with the model…" (council_core.designer_codebehind) ----
+    #: The code writer's model call; None is the coder role through
+    #: local_chat. A test sets a scripted stub here.
+    code_model = None
+
+    def plan_code(self, name: str, shapes: Sequence[Any], shape_id: str,
+                  request: dict):
+        """Decide the signature, the file and what may be replaced. Reads
+        files only."""
+        from council_core import designer_codebehind as dc
+        return dc.plan(dc.Request(
+            project_dir=self.project_dir(name), shapes=list(shapes),
+            shape_id=shape_id, instruction=request.get("instruction", ""),
+            mode=request.get("mode") or "function",
+            inputs=list(request.get("inputs") or []),
+            outputs=dict(request.get("outputs") or {}),
+            function=request.get("function") or "",
+            n_best=request.get("n_best")))
+
+    def write_code(self, plan, *, should_stop=None, on_progress=None):
+        """The model, the gates, the smoke run. Blocking; a worker calls it.
+        Writes nothing to the project."""
+        from council_core import designer_codebehind as dc
+        return dc.run(plan, model_call=self.code_model,
+                      should_stop=should_stop, on_progress=on_progress)
+
+    def apply_code(self, review):
+        """The only writer: backup, atomic write, manifest record."""
+        from council_core import designer_codebehind as dc
+        return dc.apply(review)
+
 
 class DesignerTab(ViewHelpers, QWidget):
     """A palette, a canvas, an inspector and a log."""
@@ -189,7 +230,8 @@ class DesignerTab(ViewHelpers, QWidget):
                  ask_choice: Optional[Callable] = None,
                  confirm: Optional[Callable] = None,
                  ask_example: Optional[Callable] = None,
-                 ask_save_path: Optional[Callable] = None):
+                 ask_save_path: Optional[Callable] = None,
+                 review_code: Optional[Callable] = None):
         super().__init__()
         self.window = window
         self.bridge = getattr(window, "bridge", None)
@@ -205,6 +247,11 @@ class DesignerTab(ViewHelpers, QWidget):
         #: (mode, requires, port registry) of the open project, for the
         #: Wiring group. Read when a project is loaded, not per selection.
         self._wiring_ctx = ("linked", [], {})
+        #: The open project's folder, for the same reason: project_path
+        #: resolve()s, a filesystem walk on Windows, and the Wiring group
+        #: needs it on every selection (the project's own logic.py is
+        #: linkable).
+        self._project_path: Optional[Path] = None
         # Supplied by the host. Defaulting to "the user cancelled" rather than
         # to a dialog keeps this file importable, and testable, with no display.
         self.ask_text = ask_text or (lambda *a, **k: None)
@@ -214,6 +261,12 @@ class DesignerTab(ViewHelpers, QWidget):
         self.ask_example = ask_example or (lambda *a, **k: None)
         #: (title, folder, file name) -> a path, or "" for cancelled.
         self.ask_save_path = ask_save_path or (lambda *a, **k: "")
+        #: designer_codebehind.Review -> True to write it. The default is
+        #: "not accepted": model-written code nobody looked at is never
+        #: written, by a test or by a host that forgot to supply a dialog.
+        self.review_code = review_code or (lambda *a, **k: False)
+        #: Set by the Wiring group's Stop while the code writer runs.
+        self._code_stop: Optional[threading.Event] = None
 
         self._build()
         self._refresh_status()
@@ -365,6 +418,8 @@ class DesignerTab(ViewHelpers, QWidget):
         """What the selected button runs. Its own group — see wiring.py."""
         self.wiring = WiringView()
         self.wiring.applied.connect(self.on_apply_wiring)
+        self.wiring.write_requested.connect(self.on_write_code)
+        self.wiring.write_stopped.connect(self.on_stop_code)
         scroller = QScrollArea()
         scroller.setWidgetResizable(True)
         scroller.setFrameShape(QScrollArea.NoFrame)
@@ -424,7 +479,8 @@ class DesignerTab(ViewHelpers, QWidget):
             return
         mode, requires, registry = self._wiring_ctx
         ports = wiring.project_ports(self.canvas.scene.shapes, registry)
-        self.wiring.show_shape(shape, ports, mode, requires)
+        self.wiring.show_shape(shape, ports, mode, requires,
+                               self._project_path)
 
     def on_apply_wiring(self, link: dict) -> None:
         """Store the link on the selected shape — one undoable step.
@@ -447,6 +503,113 @@ class DesignerTab(ViewHelpers, QWidget):
             self.log(f"unwired {what} — Generate turns its handler back "
                      f"into a stub, unless you have edited it")
         self._refresh_status()
+
+    # ==================================================================
+    # Write it with the model
+    # ==================================================================
+    def on_write_code(self, request: dict) -> None:
+        """The model writes the code behind the selected widget.
+
+        On a worker: plan (the signature, the file), the model, every gate,
+        the sandboxed smoke run. The review comes back here, and only an
+        Accept writes anything — through designer_codebehind.apply, which
+        backs up and refuses if the file changed meanwhile. In function
+        mode the widget is then wired to logic.<function> the same way the
+        Apply button wires it: one undoable step on the Scene.
+        """
+        if not self.project:
+            self.log("Open or create a project first.")
+            return
+        shapes = self._selected_shapes()
+        if len(shapes) != 1:
+            self.log("Select the one widget to write code for.")
+            return
+        if self._busy:
+            self.log("Already working — wait for it to finish.")
+            return
+        name, sid = self.project, shapes[0].id
+        # A DEEP copy: the user may keep dragging while the model thinks.
+        snapshot = self.canvas.scene.export()
+        stop = threading.Event()
+        self._code_stop = stop
+
+        def progress(text: str) -> None:
+            self._to_ui(lambda: self.wiring.set_writing(True, text))
+
+        def work() -> None:
+            plan = review = None
+            failure = ""
+            try:
+                plan = self.actions.plan_code(name, snapshot, sid, request)
+                if plan.ok:
+                    review = self.actions.write_code(
+                        plan, should_stop=stop.is_set, on_progress=progress)
+            except Exception as exc:                     # noqa: BLE001
+                failure = f"writing code failed: {exc!r}"
+
+            def show() -> None:
+                self._busy = False
+                self._code_stop = None
+                self.wiring.set_writing(False)
+                self._finish_code(name, sid, plan, review, failure)
+                self._refresh_status()
+
+            self._to_ui(show)
+
+        self._start("writing code…", work, name="designer-code")
+        if self._busy:
+            self.wiring.set_writing(True, "asking the model…")
+
+    def on_stop_code(self) -> None:
+        """Stop the code writer: the model call in progress is told to stop
+        (when the engine can), and no further candidate is asked for."""
+        if self._code_stop is not None:
+            self._code_stop.set()
+            self.log("stopping the code writer…")
+
+    def _finish_code(self, name: str, sid: str, plan, review,
+                     failure: str) -> None:
+        """Show what the writer found, ask for the review, and on Accept
+        write it and wire the widget."""
+        if failure:
+            self.log(failure)
+            return
+        if plan is None or not plan.ok:
+            for line in (plan.problems if plan is not None else []):
+                self.log(line)
+            return
+        for line in review.report():
+            self.log(line)
+        if not review.ok:
+            self.wiring.write_status.setText(
+                "Not offered — see the log for what the best attempt still "
+                "had wrong.")
+            return
+        if name != self.project:
+            self.log(f"The code was for {name}, which is no longer open — "
+                     f"nothing was written.")
+            return
+        if not self.review_code(review):
+            self.log("not written — the review was not accepted")
+            self.wiring.write_status.setText("Not written.")
+            return
+        applied = self.actions.apply_code(review)
+        self.log(applied.message)
+        self.wiring.write_status.setText(applied.message if applied.ok
+                                         else "Not written.")
+        if not (applied.ok and applied.link):
+            return
+        shape = next((s for s in self.canvas.scene.shapes if s.id == sid),
+                     None)
+        if shape is None:
+            self.log("the widget is gone from the canvas — wire it to "
+                     f"logic.{applied.link.get('function')} by hand")
+            return
+        self.canvas.scene.selection = [sid]
+        outcome = self.canvas.scene.set_script(applied.link)
+        if outcome.committed:
+            self.canvas._obey(outcome)
+        self._show_selection()
 
     def _window_fields(self) -> List[form.Field]:
         if not self.project:
@@ -531,6 +694,8 @@ class DesignerTab(ViewHelpers, QWidget):
         self._toolkit = (self.actions.toolkit_label(self.project)
                          if self.project else "")
         self._wiring_ctx = self.actions.wiring_context(self.project)
+        self._project_path = (self.actions.project_dir(self.project)
+                              if self.project else None)
         self.canvas.scene.load(shapes)
         self.canvas.scene.port_registry = dict(self._wiring_ctx[2])
         self._set_design(*self._design_size(project))
@@ -1092,4 +1257,8 @@ def build_designer(window) -> QWidget:
                                           vault_dir=tab.actions.vault_dir)
     tab.ask_save_path = lambda title, folder, filename: ask_export_path(
         tab, title, folder, filename)
+    # The code writer's review. "No" under COUNCIL_NO_DIALOGS, like the two
+    # above: unattended, nothing a model wrote is ever accepted.
+    from ..widgets.wiring import ask_accept
+    tab.review_code = lambda review: ask_accept(review, parent=tab)
     return tab

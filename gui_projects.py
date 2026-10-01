@@ -48,6 +48,9 @@ GSPEC_NAME = "project.gspec"
 TRASH_DIRNAME = ".trash"
 BACKUPS_DIRNAME = ".backups"
 UI_DIRNAME = "ui"
+#: The project module the code writer puts model-written functions in
+#: (gui_codebehind). Hand-written territory, like handlers.py.
+LOGIC_NAME = "logic.py"
 
 # Import modes (spec 8). Recorded at creation, enforced by gui_policy.
 MODES = ("linked", "standalone")
@@ -189,6 +192,16 @@ class Manifest:
     # write an edited example back to its own file rather than making the
     # user find it. Provenance only: nothing reads it to decide how to build.
     example: str = ""
+    # What the local model wrote and the user accepted, by where it lives:
+    # "on_btn_go" for a handler body in handlers.py, "logic.<fn>" for a
+    # function in logic.py. Each record carries the sha256 of the text AS
+    # WRITTEN (plus widget, instruction, model, when). That fingerprint is
+    # the whole point: while the text still matches it, the code is the
+    # generator's — plan_handlers may remove it with its widget, and a later
+    # "Write it with the model" may replace it. One edited character and it
+    # no longer matches, so it is the user's and neither happens. A real
+    # field, because load_manifest drops unknown keys.
+    ai_handlers: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -225,7 +238,22 @@ def load_manifest(pdir: Any) -> Manifest:
                       (raw.get("script_links") or {}).items()
                       if isinstance(v, dict)},
         example=str(raw.get("example") or ""),
+        ai_handlers={str(k): dict(v) for k, v in
+                     (raw.get("ai_handlers") or {}).items()
+                     if isinstance(v, dict)},
     )
+
+
+def ai_bodies(m: Manifest) -> Dict[str, str]:
+    """handler name -> sha256 of the model-written body recorded for it —
+    what gui_emit.plan_handlers needs to tell an untouched model body from
+    a hand-edited one. Function records (logic.<fn>) are not handlers."""
+    out: Dict[str, str] = {}
+    for key, rec in (getattr(m, "ai_handlers", None) or {}).items():
+        if isinstance(rec, dict) and rec.get("kind") == "handler" \
+                and rec.get("sha256"):
+            out[str(key)] = str(rec["sha256"])
+    return out
 
 
 def toolkit_of(pdir: Any) -> str:
@@ -405,14 +433,17 @@ def backup(pdir: Any) -> Path:
 
     Taken BEFORE any regeneration writes a byte. Cheap insurance: the whole
     point of the two-file split is that regeneration is safe, and a backup is
-    what makes that claim testable rather than merely asserted."""
+    what makes that claim testable rather than merely asserted.
+
+    logic.py too: it is where the model-written functions go, and a write
+    there is backed up the same way a regeneration is."""
     d = Path(pdir)
     dest = d / BACKUPS_DIRNAME / _now_stamp()
     dest.mkdir(parents=True, exist_ok=True)
     src_ui = d / UI_DIRNAME
     if src_ui.is_dir():
         shutil.copytree(src_ui, dest / UI_DIRNAME, dirs_exist_ok=True)
-    for extra in ("app.py", "handlers.py", GSPEC_NAME):
+    for extra in ("app.py", "handlers.py", LOGIC_NAME, GSPEC_NAME):
         s = d / extra
         if s.is_file():
             shutil.copy2(s, dest / extra)

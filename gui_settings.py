@@ -50,6 +50,10 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 #: import, live. A generated main.py puts it on sys.path for the same reason.
 COUNCIL_ROOT = Path(__file__).resolve().parent
 
+#: Its functions open windows (the Settings menu), so the code writer's
+#: smoke run (gui_smoke) uses a stand-in instead. Read with ast.
+COUNCIL_SMOKE_FAKE = True
+
 #: The one item the Settings menu has, for now.
 PYTHON_SCRIPTS = "Python Scripts"
 
