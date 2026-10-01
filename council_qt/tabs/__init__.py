@@ -23,6 +23,7 @@ from .capture import build_capture
 from .council import build_council
 from .designer import build_designer
 from .diagnostics import build_diagnostics
+from .docs import build_docs
 from .dream3d import build_dream3d
 from .librarian import build_librarian
 from .nodes import build_nodes
@@ -52,6 +53,7 @@ REGISTRY = [
     ("🕓 Sessions", build_sessions, False),
     ("🎓 Specialists", build_specialists, False),
     ("🇺🇸 Models", build_models, False),
+    ("📖 Docs", build_docs, False),
     ("📊 Grapher", build_grapher, False),
     ("🧊 Dream3D", build_dream3d, False),
     ("🎨 GUI Designer", build_designer, False),
@@ -83,7 +85,7 @@ __all__ = ["REGISTRY", "ADVANCED_REGISTRY", "registry", "build_agents",
            "build_apothecary",
            "build_capture",
            "build_changelog", "build_council", "build_librarian", "build_ide", "build_nodes", "build_vault_health",
-           "build_designer", "build_diagnostics", "build_dream3d", "build_forge", "build_grapher",
+           "build_designer", "build_diagnostics", "build_docs", "build_dream3d", "build_forge", "build_grapher",
            "build_jobs",
            "build_lens", "build_models", "build_sessions",
            "build_specialists", "build_speech", "build_vault"]
