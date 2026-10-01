@@ -372,6 +372,10 @@ class Node:
     # Filled by layout(), in GRID UNITS.
     nat_w: int = 0
     nat_h: int = 0
+    #: The least room that still holds every descendant INSIDE its
+    #: container: insets and gaps, one unit per widget (see _distribute).
+    min_w: int = 1
+    min_h: int = 1
     gx: bool = False
     gy: bool = False
     x: int = 0
@@ -768,6 +772,18 @@ def _seq_measure(kids: Sequence[Node], axis: str, ctx: _Ctx
             sum(k.nat_h for k in kids) + ctx.gap * (len(kids) - 1))
 
 
+def _seq_min(kids: Sequence[Node], axis: str, ctx: _Ctx) -> Tuple[int, int]:
+    """_seq_measure over the children's MINIMUM sizes."""
+    if not kids:
+        return 1, 1
+    gaps = ctx.gap * (len(kids) - 1)
+    if axis == ROW:
+        return (sum(k.min_w for k in kids) + gaps,
+                max(k.min_h for k in kids))
+    return (max(k.min_w for k in kids),
+            sum(k.min_h for k in kids) + gaps)
+
+
 def _align_form_rows(node: Node, ctx: _Ctx) -> None:
     """Rows of a column that look like a FORM — two or more rows of the same
     length — get the same width per position, so the captions line up and
@@ -801,12 +817,14 @@ def _measure(node: Node, ctx: _Ctx) -> None:
         w, h = _leaf_px(node)
         node.nat_w = max(_u(w), ctx.min_w)
         node.nat_h = max(_u(h), ctx.min_h)
+        node.min_w = node.min_h = 1
         node.gx, node.gy = _default_grow(node)
         return
     if node.is_layout:
         if node.kind == COLUMN:
             _align_form_rows(node, ctx)
         node.nat_w, node.nat_h = _seq_measure(node.children, node.kind, ctx)
+        node.min_w, node.min_h = _seq_min(node.children, node.kind, ctx)
         node.gx = any(c.gx for c in node.children)
         node.gy = any(c.gy for c in node.children)
         if node.grow is True:
@@ -818,6 +836,7 @@ def _measure(node: Node, ctx: _Ctx) -> None:
     if not node.children:
         pal = PALETTE[kind]
         node.nat_w, node.nat_h = _u(pal["default_w"]), _u(pal["default_h"])
+        node.min_w = node.min_h = 1
         node.gx = node.gy = node.grow is not False
         return
     if kind == "notebook":
@@ -828,32 +847,42 @@ def _measure(node: Node, ctx: _Ctx) -> None:
         # wide" when the app it generates is not.
         cw = max(k.nat_w for k in node.children)
         ch = max(k.nat_h for k in node.children)
+        # ...but never narrower than its pages side by side can be.
+        mw, mh = _seq_min(node.children, ROW, ctx)
         node.gx = node.gy = node.grow is not False
     elif kind == "panedwindow":
         axis = COLUMN if _orient(node) == "vertical" else ROW
         cw, ch = _seq_measure(node.children, axis, ctx)
+        mw, mh = _seq_min(node.children, axis, ctx)
         node.gx = node.gy = node.grow is not False
     else:
         holder = Node(kind=COLUMN, children=node.children)
         _align_form_rows(holder, ctx)
         cw, ch = _seq_measure(node.children, COLUMN, ctx)
+        mw, mh = _seq_min(node.children, COLUMN, ctx)
         node.gx = any(c.gx for c in node.children)
         node.gy = any(c.gy for c in node.children)
         if node.grow is True:
             node.gx = node.gy = True
         elif node.grow is False:
             node.gx = node.gy = False
-    node.nat_w = cw + 2 * ins
-    node.nat_h = ch + _top(kind) + ins
+    node.nat_w = max(cw, mw) + 2 * ins
+    node.nat_h = max(ch, mh) + _top(kind) + ins
+    node.min_w = mw + 2 * ins
+    node.min_h = mh + _top(kind) + ins
 
 
-def _distribute(nat: Sequence[int], grows: Sequence[bool], avail: int
-                ) -> List[int]:
+def _distribute(nat: Sequence[int], grows: Sequence[bool], avail: int,
+                mins: Optional[Sequence[int]] = None) -> List[int]:
     """Main-axis sizes (units) for children with natural sizes ``nat``.
 
     Room to spare goes to the children that grow, evenly; none growing, it
     stays at the end. Too little room squeezes every child in proportion to
-    its natural size, never below one unit."""
+    what it has ABOVE its minimum (``mins``, default one unit), never below
+    it. Squeezed by natural size alone, a container could get less than
+    its own insets: a labelframe's toolbar came out 8 px tall against its
+    bottom border, and a notebook nested in a notebook's page placed a
+    widget OUTSIDE its page (review finding, fuzzed)."""
     total = sum(nat)
     if total <= avail:
         sizes = list(nat)
@@ -864,15 +893,17 @@ def _distribute(nat: Sequence[int], grows: Sequence[bool], avail: int
             for n, i in enumerate(growers):
                 sizes[i] += share + (1 if n < rem else 0)
         return sizes
-    sizes = [max(1, (n * avail) // total) for n in nat]
-    over = sum(sizes) - avail
-    # Rounding up to one unit can overshoot; take it back from the largest.
-    while over > 0:
-        i = max(range(len(sizes)), key=lambda j: sizes[j])
-        if sizes[i] <= 1:
-            break
-        sizes[i] -= 1
-        over -= 1
+    floor = [min(max(1, int(m)), n)
+             for m, n in zip(mins or [1] * len(nat), nat)]
+    spare = avail - sum(floor)
+    if spare <= 0:
+        return floor                     # seq() reports it as cramped
+    give = [n - f for n, f in zip(nat, floor)]
+    room = sum(give)
+    sizes = [f + (g * spare) // room for f, g in zip(floor, give)]
+    left = avail - sum(sizes)
+    for i in sorted(range(len(sizes)), key=lambda j: -give[j])[:left]:
+        sizes[i] += 1
     return sizes
 
 
@@ -882,6 +913,9 @@ class _Placer:
         self.rows: List[Dict[str, Any]] = []
         self.paths: List[str] = []
         self.notes: List[str] = []
+        #: The first container given less room than its own insets and gaps
+        #: need: its children could only be placed OUTSIDE it (see seq).
+        self.cramped: Optional[Node] = None
 
     def place(self, node: Node, x: int, y: int, w: int, h: int) -> None:
         node.x, node.y, node.w, node.h = x, y, max(1, w), max(1, h)
@@ -911,9 +945,19 @@ class _Placer:
         main = (w if row else h) - gap * (len(kids) - 1)
         nat = [k.nat_w if row else k.nat_h for k in kids]
         grows = [fill or (k.gx if row else k.gy) for k in kids]
-        if main < len(kids):
-            main = len(kids)
-        sizes = _distribute(nat, grows, main)
+        mins = [k.min_w if row else k.min_h for k in kids]
+        cmin = max(k.min_h if row else k.min_w for k in kids)
+        if main < sum(mins) or (h if row else w) < cmin:
+            # Less room than the children's insets and gaps: whatever is
+            # placed lands outside ``owner``. MAX_SQUEEZE bounds only the
+            # root, and a notebook in a notebook's page divides its width
+            # twice (every page is drawn side by side) — the gate then
+            # miscounted pages the model had written correctly (review
+            # finding, fuzzed). layout() refuses it; it is never handed on.
+            if self.cramped is None:
+                self.cramped = owner
+            main = max(main, sum(mins))
+        sizes = _distribute(nat, grows, main, mins)
         pos = x if row else y
         cross = h if row else w
         # In a row, one-line widgets share one height — a 24 px caption
@@ -1042,6 +1086,8 @@ def layout(root: Node, canvas_w: int, canvas_h: int,
                 w = aw if root.gx else min(root.nat_w, aw)
                 h = ah if root.gy else min(root.nat_h, ah)
                 placer.place(root, m, m, w, h)
+            if placer.cramped is not None:
+                break                      # a wider gap only cramps it more
             if _grid_clean(placer.rows, canvas_w, canvas_h):
                 break
             placer = None
@@ -1055,6 +1101,15 @@ def layout(root: Node, canvas_w: int, canvas_h: int,
                 f"the layout is {' and '.join(what)} at its natural size, "
                 f"but the window is {canvas_w} x {canvas_h} — put some of it "
                 f"in a notebook's pages, or use fewer widgets side by side")
+            return out
+        if placer is not None and placer.cramped is not None:
+            out.faults.append(
+                f"{_short(placer.cramped.path)}: too small for what is inside "
+                f"it in a {canvas_w} x {canvas_h} window — the designer draws "
+                f"every notebook page side by side, so pages share their "
+                f"notebook's width; use fewer pages or fewer widgets side by "
+                f"side, or do not put a notebook inside another notebook's "
+                f"page")
             return out
         if placer is None:
             out.faults.append(

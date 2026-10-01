@@ -120,6 +120,9 @@ def assert_clean_geometry(shapes, canvas):
             p = by_id[parent]
             for c in sibs:
                 assert c.x - p.x >= gt.INSET and p.x + p.w - (c.x + c.w) >= 0
+                # And vertically (REVIEW: only x was checked, and a squeezed
+                # labelframe's child sat below it).
+                assert c.y - p.y >= gt.INSET and p.y + p.h - (c.y + c.h) >= 0
 
 
 def fixture_tree(name):
@@ -447,7 +450,33 @@ def test_seeded_random_trees_never_raise_and_every_accepted_one_generates():
         ok, errs, _t = gate(checked.shapes, checked.window, canvas)
         assert ok, (errs, tree)
         assert_clean_geometry(checked.shapes, canvas)
+        assert_parents_kept(tree, checked.shapes, canvas)
     assert accepted >= 120, accepted
+
+
+def assert_parents_kept(tree, shapes, canvas):
+    """Every widget is inside the container the TREE put it in — not just
+    inside something: a child placed outside its container is re-parented
+    by gui_layout, and what Generate builds is then not the design the
+    model wrote. REVIEW: pins the layouter's promise for every accepted
+    random tree (a squeezed container used to be able to break it)."""
+    parsed = gt.parse(json.loads(tree_reply(tree)))
+    lay = gt.layout(parsed.root, *canvas, window=parsed.window)
+    paths = lay.paths
+    assert len(paths) == len(shapes)
+    kids = gl.build_containment_tree(shapes, warnings=[])
+    actual = {i: p for p, ids in kids.items() for i in ids}
+    index = {s.id: n for n, s in enumerate(shapes)}
+    for n, s in enumerate(shapes):
+        # The intended parent: the last row emitted before this one whose
+        # path is this one's ancestor (a wrapped page shares its child's).
+        want = None
+        for j in range(n - 1, -1, -1):
+            if paths[n] == paths[j] or paths[n].startswith(paths[j] + " > "):
+                want = j
+                break
+        got = actual.get(s.id)
+        assert (index[got] if got else None) == want, (paths[n], canvas)
 
 
 def test_a_layout_far_too_big_is_a_fault_that_says_what_to_do():
@@ -455,6 +484,42 @@ def test_a_layout_far_too_big_is_a_fault_that_says_what_to_do():
     checked = gd.check_reply(tree_reply(col(wide)))
     assert not checked.ok and checked.stage == gd.STAGE_GATE
     assert any("notebook" in f and "px wide" in f for f in checked.faults)
+
+
+def test_a_container_squeezed_past_its_insets_is_a_layout_fault():
+    """REVIEW (fuzzed): the root may be within MAX_SQUEEZE while a notebook
+    nested in a notebook's page — every page drawn side by side, so widths
+    divide twice — is squeezed below its own insets. The layouter then put
+    a widget OUTSIDE its page, and the gate said 'props.tabs has 2 title(s)
+    but 3 page(s)' about a notebook the model wrote with two pages: a fault
+    a small model cannot act on, spending its repair rounds. Refused by the
+    layouter instead, naming the container and what to do."""
+    inner = {"kind": "notebook", "label": "Inner", "children": [
+        leaf("listbox", "lb", grow=False), leaf("spinbox", "sp", grow=False)]}
+    pane = {"kind": "panedwindow", "label": "pw",
+            "props": {"orient": "vertical"}, "children": [
+                {"kind": "freeform", "label": "x", "children": [
+                    leaf("scrubber", "Save as"), leaf("image_canvas", "img")]}]}
+    group = {"kind": "labelframe", "label": "LF", "grow": False, "children": [
+        leaf("button", "B" * 60), leaf("file_picker", "fp"),
+        leaf("log_pane", "x"), leaf("label", "lab")]}
+    form = {"kind": "frame", "label": "OK", "grow": False, "children": [
+        leaf("combobox", "x", grow=False), leaf("text", "OK"),
+        leaf("combobox", "Name")]}
+    tree = col({"kind": "notebook", "label": "Outer", "grow": True,
+                "children": [
+                    {"kind": "page", "label": "P1", "children": [pane]},
+                    {"kind": "page", "label": "P2", "children": [
+                        col(group, form)]},
+                    {"kind": "page", "label": "P3", "children": [inner]}]},
+               leaf("button", "Go"))
+    checked = gd.check_reply(tree_reply(tree), canvas_w=800, canvas_h=1200)
+    if checked.ok:
+        assert_clean_geometry(checked.shapes, (800, 1200))
+        return
+    assert not any("props.tabs" in f for f in checked.faults), checked.faults
+    assert any("too small" in f and "Inner" in f for f in checked.faults), \
+        checked.faults
 
 
 def test_a_slightly_too_big_layout_is_squeezed_with_a_note():
