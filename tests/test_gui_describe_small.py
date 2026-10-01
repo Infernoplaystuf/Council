@@ -282,6 +282,21 @@ def test_a_request_with_exact_positions_keeps_pixel_mode():
     assert gd.profile_for(3.8, text="a login form").mode == "tree"
 
 
+@pytest.mark.parametrize("text, exact", [
+    ("A stage panel: X and Y coordinates entries and a Move button", False),
+    ("A GPS logger showing coordinates in a table", False),
+    ("Enter the ROI coordinates, then press Crop", False),
+    ("Put the logo at pixel coordinates 16, 16", True),
+    ("use exact coordinates for every widget", True),
+    ("the OK button at screen coordinates (40, 600)", True)])
+def test_coordinates_as_data_do_not_force_pixel_mode(text, exact):
+    """REVIEW: any "coordinates" sent a 3.8B model to pixel mode — and a
+    stage's or an ROI's coordinates are what this user's apps edit."""
+    assert gd.wants_exact_positions(text) is exact
+    assert gd.profile_for(3.8, text=text).mode == ("pixel" if exact
+                                                   else "tree")
+
+
 @pytest.mark.parametrize("name, size", [
     ("ollama:llama3.1:8b", 8.0), ("ollama:phi3.5", 3.8),
     ("Phi-3.5-mini-instruct-Q4_K_M", 3.8), ("phi-4-Q4_K_M", 14.7),
@@ -540,6 +555,22 @@ def test_near_json_is_read_without_spending_a_round():
 def test_a_strict_reply_is_never_rewritten():
     payload, notes, salvaged = gd.parse_reply(json.dumps(PIXEL_FORM))
     assert payload == PIXEL_FORM and notes == [] and not salvaged
+
+
+@pytest.mark.parametrize("prose", [
+    "Here's the layout you asked for:\n",
+    "Sure! Here's it:\n```json\n",
+    "The users' window:\n"])
+def test_an_apostrophe_in_the_prose_before_the_json_does_not_hide_it(prose):
+    """REVIEW: the clean-up read the apostrophe in "Here's" as the start of a
+    single-quoted string, so the whole JSON after it became one string and
+    a reply with a trailing comma — or one cut off — lost its round."""
+    sloppy = tree_reply(FORM_TREE).replace("}]", "},]")
+    assert gd.check_reply(prose + sloppy).ok
+    full = tree_reply(FORM_TREE)
+    cut = full[:full.index('"Password"') - 30]
+    checked = gd.check_reply(prose + cut)
+    assert checked.ok and checked.salvaged, checked.faults
 
 
 def test_a_cut_off_reply_is_held_while_calls_remain_then_used():

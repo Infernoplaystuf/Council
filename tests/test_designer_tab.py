@@ -835,6 +835,23 @@ def test_undoing_the_description_drops_its_window_style(tab, qapp):
     assert tab.actions.open_named("demo").project.window.bg == ""
 
 
+def test_a_window_setting_the_user_applies_beats_the_described_one(tab,
+                                                                    qapp):
+    """REVIEW: the described style waited for Save, and the window panel's
+    Apply saves AT ONCE — so a title the user typed after describing was
+    overwritten by the model's at the next Save. The user's own choice wins;
+    what they did not touch still comes from the description."""
+    make_project(tab, "demo")
+    describe_with(tab, qapp, _Described(
+        shapes=[mk()], window={"title": "Sign in", "bg": "#1e1e2e"}))
+    assert not tab._selected_shapes()
+    tab.on_apply_props({"title": "My login"})
+    assert tab.actions.open_named("demo").project.window.title == "My login"
+    tab.on_save()
+    window = tab.actions.open_named("demo").project.window
+    assert (window.title, window.bg) == ("My login", "#1e1e2e")
+
+
 def test_stop_ends_a_description_in_progress(tab, qapp):
     """A small model makes several calls; Stop reaches the worker."""
     import threading

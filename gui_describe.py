@@ -338,13 +338,16 @@ class Profile:
 LEGACY = Profile()
 
 #: Requests that give exact positions keep pixel mode at any model size: a
-#: tree cannot say "at x = 40".
+#: tree cannot say "at x = 40". "Coordinates" alone is not one: a stage's
+#: X/Y, an ROI's or a GPS fix's coordinates are DATA the app edits, and
+#: matching the bare word sent those requests to pixel mode on a 3.8B model
+#: (review finding) — only coordinates ON the window or canvas count.
 _EXACT = re.compile(
     r"\b\d{1,4}\s*(?:px|pixels?)\b"
     r"|\b[xy]\s*[=:]\s*\d"
     r"|\(\s*\d{1,4}\s*,\s*\d{1,4}\s*\)"
-    r"|\bexact(?:ly)?\s+(?:position|coordinates|placement)"
-    r"|\bcoordinates?\b",
+    r"|\bexact(?:ly)?\s+(?:positions?|coordinates?|placement)"
+    r"|\b(?:pixel|screen|canvas|window)\s+(?:coordinates?|positions?)\b",
     re.IGNORECASE)
 
 
@@ -1156,8 +1159,14 @@ def _clean_json(text: str) -> str:
     Each of these cost a whole round before (STAGE_NO_JSON, "use double
     quotes, no trailing commas and no comments") for an answer whose
     content was fine. Only used when strict parsing has already failed, so
-    a reply that parses is never rewritten."""
-    out: List[str] = []
+    a reply that parses is never rewritten.
+
+    Prose before the first "{" is kept as written, and an apostrophe inside
+    a word is not a quote: "Here's the layout:" opened a single-quoted
+    string that swallowed the whole JSON after it (review finding)."""
+    start = text.find("{")
+    head, text = (text[:start], text[start:]) if start > 0 else ("", text)
+    out: List[str] = [head]
     i, n = 0, len(text)
     quote = ""
     while i < n:
@@ -1177,6 +1186,10 @@ def _clean_json(text: str) -> str:
                 out.append('\\"')
             else:
                 out.append(ch)
+            i += 1
+            continue
+        if ch == "'" and i and text[i - 1].isalnum():
+            out.append(ch)               # an apostrophe: "you'd", "users'"
             i += 1
             continue
         if ch in "\"'":

@@ -499,6 +499,8 @@ class DesignerTab(ViewHelpers, QWidget):
         result = self.actions.apply_window(self.project, changes,
                                            self.canvas.scene.shapes)
         self.log(result.message)
+        if result.ok:
+            self._keep_users_window(changes)
         if result.ok and result.project is not None:
             # The canvas rows may have changed the design area. Keep the
             # zoom mode the user had: Fit stays Fit on the new size.
@@ -928,6 +930,19 @@ class DesignerTab(ViewHelpers, QWidget):
         self._show_selection()
         self._refresh_status()
         return True
+
+    def _keep_users_window(self, changes: dict) -> None:
+        """The user just applied ``changes`` to the window themselves: the
+        pending described style must not overwrite them at the next Save.
+        This Apply saves at once, so without this a title typed after Draw
+        it was replaced by the model's (review finding). What the user did
+        not touch is still applied with the drawing."""
+        pending = self._pending_window
+        if not pending or pending[0] != self.project:
+            return
+        name, values, ids = pending
+        kept = {k: v for k, v in values.items() if k not in changes}
+        self._pending_window = (name, kept, ids) if kept else None
 
     def _apply_classified(self, classified) -> None:
         """Show the kinds Generate wrote back into the .gspec on the canvas,

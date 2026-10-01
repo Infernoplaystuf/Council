@@ -386,3 +386,24 @@ def test_only_real_answers_are_persistable():
     cls = [gcl.Classification("a", "entry", 0.9),
            gcl.Classification("b", "label", 0.0, flagged=True)]
     assert gcl.persistable(cls) == {"a": {"kind": "entry", "props": {}}}
+
+
+def test_a_repair_names_only_the_boxes_it_asks_about():
+    """REVIEW: a repair asks about the boxes still wrong — its BOXES list and
+    its schema's box enum hold only those — but the faults were checked
+    against EVERY box, so round 3 told the model "box 1: no classification
+    returned" about a box it was not shown and the schema forbade."""
+    model = Model(
+        reply({"box": 1, "kind": "entry", "confidence": 0.9},
+              {"box": 2, "kind": "button", "confidence": 0.9,
+               "props": {"colour": "red"}}),
+        reply({"box": 2, "kind": "button", "confidence": 0.9,
+               "props": {"size": 3}}),
+        reply({"box": 2, "kind": "button", "confidence": 0.9}))
+    cls, _ = gcl.classify([generic("a"), generic("b", y=200)], None, model)
+    assert [(c.kind, c.flagged) for c in cls] == [("entry", False),
+                                                  ("button", False)]
+    assert len(model.prompts) == 3
+    third = model.prompts[2].split("WHAT IS WRONG", 1)[1].split(
+        "You are labelling")[0]
+    assert "box 2" in third and "box 1" not in third, third

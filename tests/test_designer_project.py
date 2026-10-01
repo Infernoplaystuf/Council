@@ -821,3 +821,33 @@ def test_the_described_window_skips_the_placeholder_title():
     assert dp.described_window({"title": "Untitled", "bg": "#112233",
                                 "fg": "", "font": ""}) == {"bg": "#112233"}
     assert dp.described_window(None) == {}
+
+
+def test_a_failed_call_does_not_report_the_previous_calls_stats(
+        vault, monkeypatch):
+    """REVIEW: the stats were read in a ``finally`` after EVERY call, and a
+    call that raised (timeout, Stop, a dead server) records nothing — so the
+    log counted the PREVIOUS call twice and called it this one's cost."""
+    from council_core import model_slots
+    monkeypatch.setattr(model_slots, "current",
+                        _FakeSlots("ollama:phi3.5").current)
+    eng = _fake_engine([{"id": "ollama:phi3.5", "params_b": 3.8}], 4096)
+    calls = []
+
+    def local_chat(messages, *, temperature=0.2, num_predict=600, model=None,
+                   host=None, timeout=120, role=None, json_schema=None,
+                   seed=None, stop=None, should_stop=None):
+        calls.append(seed)
+        if len(calls) == 1:
+            return "I cannot draw that."
+        raise TimeoutError("no progress for 300 s")
+    eng.local_chat = local_chat
+    eng.last_call_stats = lambda role=None: {
+        "backend": "ollama", "model": "phi3.5", "prompt_tokens": 2000,
+        "gen_tokens": 6, "seconds": 2.0, "constrained": True}
+    monkeypatch.setitem(sys.modules, "council_engine", eng)
+    result = dp.describe("a login form", project(vault, name="q"))
+    assert not result.ok and len(calls) == 2
+    line = next(n for n in result.notes if n.startswith("model calls:"))
+    assert line.startswith("model calls: 1 on phi3.5"), line
+    assert "2000 prompt + 6 reply tokens" in line, line

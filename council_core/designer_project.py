@@ -1036,23 +1036,37 @@ def _recording(call: Callable[..., str], stats: List[Dict[str, Any]]
                ) -> Callable[..., str]:
     """``call`` that also appends council_engine.last_call_stats() (shared
     contract) after each call, when the engine has it. Keeps the wrapped
-    call's keywords visible to gui_describe.call_model's signature check."""
+    call's keywords visible to gui_describe.call_model's signature check.
+
+    Only stats the call itself RECORDED count: last_call_stats is "the most
+    recent call", and a call that raised (a stall timeout, Stop, a dead
+    server) may record nothing — reading it regardless counted the previous
+    call twice and reported its cost as this one's (review finding)."""
     import functools
+
+    def latest() -> Dict[str, Any]:
+        try:
+            import council_engine
+            fn = getattr(council_engine, "last_call_stats", None)
+            got = fn(role=DESCRIBE_ROLE) if callable(fn) else None
+        except Exception:                                # noqa: BLE001
+            return {}
+        return dict(got) if isinstance(got, dict) else {}
 
     @functools.wraps(call)
     def wrapped(prompt: str, **kwargs: Any) -> str:
+        before = latest()
         try:
-            return call(prompt, **kwargs)
-        finally:
-            try:
-                import council_engine
-                fn = getattr(council_engine, "last_call_stats", None)
-                if callable(fn):
-                    got = fn(role=DESCRIBE_ROLE)
-                    if isinstance(got, dict) and got:
-                        stats.append(dict(got))
-            except Exception:                            # noqa: BLE001
-                pass
+            reply = call(prompt, **kwargs)
+        except BaseException:
+            after = latest()
+            if after and after != before:   # it did record, e.g. a partial
+                stats.append(after)
+            raise
+        after = latest()
+        if after:
+            stats.append(after)
+        return reply
     return wrapped
 
 

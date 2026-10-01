@@ -467,7 +467,11 @@ def classify(shapes: Sequence[Shape], layout_tree: Any = None,
         if raw_payload is None:
             errors = ["the reply contained no JSON object"]
         else:
-            got, clean, errors = validate_answer(raw_payload, wanted, numbers)
+            # Checked against the boxes THIS call asked about: a repair shows
+            # only those and its schema allows only their numbers, so "box 1:
+            # no classification returned" about a box already answered was a
+            # fault the model could not act on (review finding).
+            got, clean, errors = validate_answer(raw_payload, asked, numbers)
             accepted.update(got)
             clean_ids |= clean
             # Stop only when every shape came back with NO fault. A shape whose
