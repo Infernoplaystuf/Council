@@ -57,21 +57,51 @@ kept OUT of props in gui_shapes precisely so that a model-authored import
 target, sequence link, binding or package allowlist is structurally impossible.
 They are ignored with a note, never applied — and the worked example has them
 stripped, so the model is not taught to write them.
+
+SMALL MODELS: A PROFILE, A SCHEMA, A TREE, AND MORE THAN ONE TRY
+----------------------------------------------------------------
+Everything above was measured on Phi-4 14B, which does not fit an 8 GB card.
+What a 3.8-8B model gets instead is chosen by a Profile (profile_for):
+
+  * a JSON SCHEMA (wireframe_schema / gui_describe_tree.tree_schema) passed
+    to the model call as json_schema=, so a constrained backend cannot emit a
+    fence, a trailing comma, a made-up kind or prop, or a colour name. The
+    reply is still checked here: the schema decides what CAN be written,
+    check_reply what is ACCEPTED.
+  * TREE mode below 10B parameters: the model writes rows, columns and
+    containers, and gui_describe_tree places them. Pixel mode stays for large
+    models and for requests that give exact positions.
+  * BEST-OF-N on round 1 with distinct seeds and temperatures, the validator
+    as judge; repairs never re-ask identically.
+  * worked examples chosen PER REQUEST from wireframes that were built,
+    generated and run (examples/gui/qt_tests), each one gate-checked at the
+    project's canvas before a model sees it, budgeted to the real window.
+
+describe() without a profile keeps the calls exactly as they were: pixel
+mode, one call per round, the prompt alone with no keyword arguments, and
+the 4096-token budget. Only the worked examples differ — chosen for the
+request, and image_viewer (the old fixed one) when nothing matches.
 """
 from __future__ import annotations
 
 import difflib
+import functools
+import hashlib
+import inspect
 import json
 import math
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import gui_colors
+import gui_describe_tree as gtree
 import gui_examples
 import gui_layout
 import gui_snap
 import gui_spec
-from gui_shapes import CONTAINER_KINDS, GENERIC_KIND, PALETTE, Shape, new_shape
+from gui_shapes import (CONTAINER_KINDS, GENERIC_KIND, PALETTE, Shape,
+                        load_gspec, new_shape)
 
 try:                                    # the balanced-brace scanner, reused
     from nx_generate import extract_json as _nx_extract_json
@@ -127,6 +157,12 @@ MAX_PIXELS = 100_000
 INT32 = (-2 ** 31, 2 ** 31 - 1)
 MAX_FONT_SIZE = 200
 MAX_FAULT_CHARS = 240           # one fault echoes model values; keep it short
+#: Lists and objects inside each other. A real reply needs about 20 (a tree
+#: MAX_DEPTH deep, a menu prop at the bottom); past this it is a model stuck
+#: repeating "[" until the token limit — and json.loads, the prop checks and
+#: the repair prompt all RECURSE, so a 3000-deep reply raised RecursionError
+#: out of describe and classify instead of costing one round.
+MAX_JSON_DEPTH = 48
 
 # The worked example. image_viewer and not PROMPT_EXAMPLES' barbie_capture_v2:
 # it is half the size, all root-level (no nesting to rescale), and it still
@@ -175,6 +211,29 @@ STAGE_SCHEMA = 1
 STAGE_GATE = 2
 STAGE_OK = 3
 
+MODES = ("pixel", "tree")
+#: Below this many billion parameters a model designs in TREE mode. Every
+#: recorded pixel-mode failure was geometry, measured on a 14B model; the
+#: models that fit an 8 GB card are 3.8-8B.
+SMALL_MODEL_B = 10.0
+#: At or below this, three round-1 candidates instead of two: a 3.8B model's
+#: run-to-run variance is the thing best-of-N turns into pass rate.
+TINY_MODEL_B = 4.5
+#: What a tree reply needs. Minified (constrained) trees measure ~20 tokens
+#: per widget against ~39 for a pixel row (phi3.5 tokenizer), so 40 widgets
+#: fit in 1200 with room for the window and the nesting.
+TREE_REPLY_TOKENS = 1200
+#: A repair round's temperature, raised by REPEAT_STEP each time the model
+#: sends back an answer it already sent — re-asking identically is how the
+#: Phi-4 M2 fixture got "this same answer three rounds running".
+REPAIR_TEMPERATURE = 0.1
+REPEAT_STEP = 0.25
+#: Seeds are fixed so a run can be reproduced: candidate k of round 1 gets
+#: BASE_SEED + k, repair round r gets BASE_SEED + 100 * r (+ repeats).
+BASE_SEED = 1
+#: Worked examples per prompt, budget permitting.
+MAX_EXAMPLES = 3
+
 
 # ============================================================
 # Result types
@@ -194,8 +253,14 @@ class DescribeResult:
     window: Dict[str, Any] = field(default_factory=dict)
     notes: List[str] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
+    #: Model CALLS made — one per round without a profile; best-of-N makes
+    #: several in round 1. The Designer logs it as "N model call(s)".
     attempts: int = 0
     raw: str = ""
+    #: "pixel" or "tree": how the ACCEPTED (or best) reply was written.
+    mode: str = ""
+    #: Rounds: the first request plus each repair.
+    rounds: int = 0
 
 
 @dataclass
@@ -210,6 +275,10 @@ class Checked:
     notes: List[str] = field(default_factory=list)
     #: Rows that passed the schema, even when others did not.
     accepted: int = 0
+    #: The reply was a layout TREE (payload is the tree, not shape rows).
+    tree: bool = False
+    #: The reply was cut off and closed after its last complete widget.
+    salvaged: bool = False
 
     @property
     def ok(self) -> bool:
@@ -225,6 +294,240 @@ class Checked:
         # bad rows and became the next repair prompt's starting point.
         has_rows = 1 if (self.stage > STAGE_SCHEMA or self.accepted) else 0
         return (self.stage, has_rows, -len(self.faults))
+
+
+# ============================================================
+# Profile — what a model of THIS size is asked for, and how
+# ============================================================
+
+@dataclass(frozen=True)
+class Profile:
+    """How describe() talks to one model.
+
+    The default is today's behaviour exactly — pixel mode, one call per
+    round, no keyword arguments reach the model call — so a caller that
+    passes no profile (every test stub, the Tk shell) sees no change.
+    profile_for() builds the one a real model gets."""
+    mode: str = "pixel"
+    #: Round-1 candidates; the validator picks among them.
+    n_best: int = 1
+    #: One temperature per round-1 candidate. () = the caller's own default.
+    temperatures: Tuple[float, ...] = ()
+    #: Base seed; None = no seed is passed (the engine's own random seed).
+    seed: Optional[int] = None
+    #: Pass json_schema= to the model call.
+    constrained: bool = False
+    #: The window the prompt and reply must share (tokens).
+    n_ctx: int = N_CTX
+    #: num_predict for each call. Pixel mode keeps REPLY_TOKENS.
+    reply_tokens: int = REPLY_TOKENS
+    #: Shapes the schema allows (maxItems); the reply budget is sized to it.
+    max_shapes: int = MAX_SHAPES
+    params_b: Optional[float] = None
+    model: str = ""
+    #: One line for the log: why this profile.
+    reason: str = ""
+
+    @property
+    def budget_chars(self) -> int:
+        """Characters the PROMPT may use: the window minus the reply and the
+        chat template, at the measured CHARS_PER_TOKEN."""
+        return max(1500, int((self.n_ctx - self.reply_tokens - SLACK_TOKENS)
+                             * CHARS_PER_TOKEN))
+
+    @property
+    def custom(self) -> bool:
+        """Anything beyond the plain one-call-per-round default."""
+        return self != LEGACY
+
+
+LEGACY = Profile()
+
+#: Requests that give exact positions keep pixel mode at any model size: a
+#: tree cannot say "at x = 40". "Coordinates" alone is not one: a stage's
+#: X/Y, an ROI's or a GPS fix's coordinates are DATA the app edits, and
+#: matching the bare word sent those requests to pixel mode on a 3.8B model
+#: (review finding) — only coordinates ON the window or canvas count.
+_EXACT = re.compile(
+    r"\b\d{1,4}\s*(?:px|pixels?)\b"
+    r"|\b[xy]\s*[=:]\s*\d"
+    r"|\(\s*\d{1,4}\s*,\s*\d{1,4}\s*\)"
+    r"|\bexact(?:ly)?\s+(?:positions?|coordinates?|placement)"
+    r"|\b(?:pixel|screen|canvas|window)\s+(?:coordinates?|positions?)\b",
+    re.IGNORECASE)
+
+
+def wants_exact_positions(text: str) -> bool:
+    return bool(_EXACT.search(text or ""))
+
+
+_SIZE_RE = re.compile(r"(?<![\w.])(\d{1,3}(?:\.\d{1,2})?)\s*[bB](?![a-zA-Z])")
+#: Ollama names that carry no size: the family's default tag. US-origin
+#: models only — a non-US model is never chosen for the user, so it needs no
+#: entry here (its size still parses from a tag like ":7b").
+KNOWN_SIZES_B = {"phi3.5": 3.8, "phi3": 3.8, "phi4-mini": 3.8, "phi4": 14.7,
+                 "llama3.2": 3.2, "llama3.1": 8.0, "llama3": 8.0,
+                 "gemma3": 4.3, "gemma2": 9.2, "granite3.3": 8.2}
+#: The same families as GGUF file names spell them (dashes, no tag),
+#: most specific first.
+_KNOWN_PREFIXES = (("phi-4-mini", 3.8), ("phi-3.5-mini", 3.8),
+                   ("phi-3-mini", 3.8), ("phi-4", 14.7))
+
+
+def parse_params_b(name: str) -> Optional[float]:
+    """Billions of parameters from a model name — "llama3.1:8b" -> 8.0,
+    "Llama-3.2-3B-Instruct-Q5_K_M" -> 3.0, "ollama:phi3.5" -> 3.8 and
+    "Phi-3.5-mini-instruct-Q4_K_M" -> 3.8 by family. None when the name
+    does not say."""
+    s = str(name or "").strip()
+    base = s.split("ollama:", 1)[-1]
+    found = _SIZE_RE.findall(base.replace("_", " ").replace("-", " "))
+    sizes = [float(f) for f in found if 0.1 <= float(f) <= 1000]
+    if sizes:
+        return sizes[-1]
+    family = base.split(":", 1)[0].lower()
+    if family in KNOWN_SIZES_B:
+        return KNOWN_SIZES_B[family]
+    stem = family.replace("_", "-")
+    return next((b for p, b in _KNOWN_PREFIXES if stem.startswith(p)), None)
+
+
+def profile_for(params_b: Optional[float] = None, *,
+                n_ctx: Optional[int] = None, text: str = "",
+                model: str = "", mode: Optional[str] = None,
+                n_best: Optional[int] = None,
+                constrained: bool = True) -> Profile:
+    """The profile for a model of ``params_b`` billion parameters.
+
+      * below SMALL_MODEL_B (or unknown): TREE mode, schema-constrained,
+        best of 2 (3 at TINY_MODEL_B and under), 40 shapes at most;
+      * SMALL_MODEL_B and up: pixel mode, constrained, one candidate;
+      * a request with exact positions: pixel mode at any size.
+
+    Unknown size counts as small: the models this was written for are the
+    ones that fit an 8 GB card, and a tree is laid out correctly whatever
+    the model's size — the cost of guessing small is a coarser layout, the
+    cost of guessing large is a geometry failure."""
+    exact = wants_exact_positions(text)
+    small = params_b is None or params_b < SMALL_MODEL_B
+    tiny = params_b is not None and params_b <= TINY_MODEL_B
+    if mode not in MODES:
+        mode = "pixel" if (exact or not small) else "tree"
+    if n_best is None:
+        n_best = 3 if tiny else (2 if small else 1)
+    n_best = max(1, min(5, int(n_best)))
+    temps = {1: (0.1,), 2: (0.2, 0.6), 3: (0.2, 0.5, 0.8)}.get(
+        n_best, tuple(round(0.2 + 0.15 * i, 2) for i in range(n_best)))
+    max_shapes = 40 if (small and mode == "tree") else MAX_SHAPES
+    reply = TREE_REPLY_TOKENS if mode == "tree" else REPLY_TOKENS
+    window = int(n_ctx) if n_ctx else N_CTX
+    size = (f"{params_b:g}B" if params_b is not None else "size unknown")
+    why = (f"{model or 'the model'} ({size}): {mode} mode"
+           + (" (the request gives exact positions)" if exact and small
+              and mode == "pixel" else "")
+           + (f", best of {n_best}" if n_best > 1 else "")
+           + (", schema-constrained" if constrained else "")
+           + f", {window}-token window")
+    return Profile(mode=mode, n_best=n_best, temperatures=temps,
+                   seed=BASE_SEED, constrained=bool(constrained),
+                   n_ctx=window, reply_tokens=reply, max_shapes=max_shapes,
+                   params_b=params_b, model=model, reason=why)
+
+
+def call_model(model_call: Callable[..., str], prompt: str,
+               **opts: Any) -> str:
+    """Call ``model_call(prompt, **opts)`` with only the options it accepts.
+
+    The model call is injected, and the ones that exist take different
+    things: a test stub takes the prompt alone, designer_project's takes
+    json_schema / seed / temperature / num_predict, and an engine without
+    the schema contract yet takes neither. None values are never passed —
+    "no seed" means the callee's default, not seed=None. Read from the
+    signature first so a TypeError raised INSIDE the model is not mistaken
+    for an unsupported keyword; the retry covers callables whose signature
+    cannot be read."""
+    opts = {k: v for k, v in opts.items() if v is not None}
+    if not opts:
+        return model_call(prompt)
+    try:
+        params = inspect.signature(model_call).parameters.values()
+        if not any(p.kind is p.VAR_KEYWORD for p in params):
+            names = {p.name for p in params}
+            opts = {k: v for k, v in opts.items() if k in names}
+    except (TypeError, ValueError):
+        pass
+    if not opts:
+        return model_call(prompt)
+    try:
+        return model_call(prompt, **opts)
+    except TypeError as exc:
+        if "unexpected keyword" not in str(exc):
+            raise
+    return model_call(prompt)
+
+
+# ============================================================
+# The reply schema (constrained decoding)
+# ============================================================
+
+def wireframe_schema(canvas_w: int = CANVAS_W, canvas_h: int = CANVAS_H,
+                     max_shapes: int = MAX_SHAPES) -> Dict[str, Any]:
+    """The pixel-mode reply as JSON Schema, from PALETTE.
+
+    One variant per kind, "kind" first, so everything after it is typed for
+    that kind: its own props only (handler props left out), colour only
+    where gui_colors says the kind takes it, a font only on text widgets.
+    Geometry is integer with the canvas as its bounds — honoured by
+    jsonschema and by llama.cpp's C++ converter (Ollama); the
+    llama-cpp-python converter ignores minimum/maximum and caps an integer
+    at 16 digits, and check_reply refuses anything past MAX_PIXELS. Bounded
+    everywhere else (maxItems, maxLength) so a constrained reply cannot run
+    on until num_predict cuts it off."""
+    kinds = list(KINDS)
+    defs = gtree.shared_defs(kinds)
+    defs["x"] = {"type": "integer", "minimum": 0, "maximum": int(canvas_w)}
+    defs["y"] = {"type": "integer", "minimum": 0, "maximum": int(canvas_h)}
+    defs["w"] = {"type": "integer", "minimum": MIN_SIZE,
+                 "maximum": int(canvas_w)}
+    defs["h"] = {"type": "integer", "minimum": MIN_SIZE,
+                 "maximum": int(canvas_h)}
+    variants = []
+    for k in kinds:
+        props = {"kind": {"const": k}, "label": {"$ref": "#/$defs/label"},
+                 "x": {"$ref": "#/$defs/x"}, "y": {"$ref": "#/$defs/y"},
+                 "w": {"$ref": "#/$defs/w"}, "h": {"$ref": "#/$defs/h"},
+                 "props": {"$ref": f"#/$defs/props-{k}"}}
+        props.update(gtree.style_props(k))
+        variants.append({"type": "object", "properties": props,
+                         "required": ["kind", "label", "x", "y", "w", "h"],
+                         "additionalProperties": False})
+    defs["shape"] = {"anyOf": variants}
+    return {"$defs": defs, "type": "object",
+            "properties": {
+                "window": {"$ref": "#/$defs/window"},
+                "shapes": {"type": "array", "items": {"$ref": "#/$defs/shape"},
+                           "minItems": 1,
+                           "maxItems": max(1, min(int(max_shapes),
+                                                  MAX_SHAPES))}},
+            "required": ["window", "shapes"], "additionalProperties": False}
+
+
+@functools.lru_cache(maxsize=16)
+def _schema_json(mode: str, canvas_w: int, canvas_h: int,
+                 max_shapes: int) -> str:
+    if mode == "tree":
+        return json.dumps(gtree.tree_schema())
+    return json.dumps(wireframe_schema(canvas_w, canvas_h, max_shapes))
+
+
+def reply_schema(profile: Profile, canvas_w: int = CANVAS_W,
+                 canvas_h: int = CANVAS_H) -> Dict[str, Any]:
+    """The schema for ``profile``'s mode — a fresh dict each call (built
+    from a cached string, so a caller that edits it cannot poison the next
+    describe), and identical JSON each time, so an engine that caches its
+    grammar by the schema's hash compiles it once."""
+    return json.loads(_schema_json(profile.mode, int(canvas_w),
+                                   int(canvas_h), int(profile.max_shapes)))
 
 
 # ============================================================
@@ -307,13 +610,14 @@ KIND_HINTS = {
 }
 
 
-def _catalogue(detail: bool) -> str:
+def _catalogue(detail: bool, kinds: Sequence[str] = KINDS,
+               head: str = "") -> str:
     """The closed vocabulary. Always EVERY kind — only the prop detail sheds.
 
     Handler-typed props ("command") are never listed: generation wires every
     callback itself as on_<name>, and nothing downstream reads the prop."""
     lines = []
-    for k in KINDS:
+    for k in kinds:
         tag = " [container]" if k in CONTAINER_KINDS else ""
         if k in KIND_HINTS:
             tag += f" = {KIND_HINTS[k]}"
@@ -325,7 +629,8 @@ def _catalogue(detail: bool) -> str:
                  if d.get("type") != "handler"]
         lines.append(f"- {k}{tag}" + (" — props: " + ", ".join(props)
                                       if props else ""))
-    head = "You may ONLY use these widget kinds, spelled exactly as written:"
+    head = head or ("You may ONLY use these widget kinds, spelled exactly as "
+                    "written:")
     return "WIDGETS\n" + head + "\n" + "\n".join(lines)
 
 
@@ -333,28 +638,95 @@ def _q(v: float) -> int:
     return int(round(float(v) / GRID) * GRID)
 
 
-def example_wireframe(canvas_w: int = CANVAS_W, canvas_h: int = CANVAS_H
-                      ) -> Optional[Dict[str, Any]]:
-    """The worked example, in gui_examples._compact form, RESCALED to this
-    canvas, with every refused key stripped. None if it is not on disk.
+# ============================================================
+# Worked examples — chosen per request
+# ============================================================
+# MEASURED: the one fixed example (image_viewer) has no containers at all,
+# and the requests that fail on real models are exactly the ones with tabs,
+# labelled groups, menus and toolbars — taught to the model only by prose
+# rules, which this project measured do not work (gui_examples' docstring).
+# So the example is now picked FOR the request, from wireframes that were
+# built, generated and run by tests/test_qt_wireframes.py — the A and B
+# tiers; C is degraded on purpose.
+
+QT_TESTS_DIR = gui_examples.EXAMPLES_DIR / "qt_tests"
+
+#: name -> words in a request that make it relevant. Order is the tie-break.
+EXAMPLE_POOL: Tuple[Tuple[str, Tuple[str, ...]], ...] = (
+    ("b_notebook_tabs", ("tab", "tabs", "tabbed", "notebook", "pages",
+                         "preferences", "sections")),
+    ("b_options_group", ("group", "grouped", "options", "radio", "choose",
+                         "choice", "labelled", "labeled", "labelframe",
+                         "checkbox", "checkboxes", "resize")),
+    ("b_nested_containers", ("panel", "panels", "nested", "source",
+                             "target", "copy", "two sides", "left and right",
+                             "labelframe")),
+    ("b_toolbar_editor", ("toolbar", "tool bar", "editor", "status bar",
+                          "status", "document", "notes", "notepad")),
+    ("b_split_browser", ("split", "splitter", "browser", "library", "table",
+                         "columns", "left", "right", "side by side",
+                         "treeview", "files")),
+    ("b_paned_vertical", ("console", "pane", "paned", "divider", "output",
+                          "terminal", "above", "below")),
+    ("b_dashboard", ("dashboard", "chart", "plot", "graph", "monitor",
+                     "live", "log", "logs", "throughput")),
+    ("b_settings_form", ("settings", "form", "fields", "config",
+                         "configuration", "threads", "spinbox", "slider",
+                         "dropdown", "combobox", "quality", "number")),
+    ("a_login_form", ("login", "log in", "sign in", "signin", "password",
+                      "username", "user name", "credentials")),
+    ("a_image_viewer", ("image", "images", "viewer", "picture", "photo",
+                        "frames", "frame by frame", "folder", "scrub",
+                        "scrubber", "preview")),
+    ("a_list_editor", ("list", "listbox", "add", "remove", "items",
+                       "todo", "to-do", "entries")),
+    (EXAMPLE_NAME, ("capture", "exposure", "camera", "bad timing",
+                    "mistimed", "numeric rows")),
+)
+#: When nothing in the request matches: today's single example in pixel
+#: mode (so a default prompt is unchanged), and in tree mode the two that
+#: show the commonest shapes — rows of label + field, and a labelled group.
+DEFAULT_EXAMPLES = {"pixel": (EXAMPLE_NAME,),
+                    "tree": ("b_settings_form", "b_options_group")}
+
+
+def _example_source(name: str) -> Optional[Dict[str, Any]]:
+    path = QT_TESTS_DIR / f"{name}.gspec"
+    try:
+        if path.is_file():
+            return json.loads(path.read_text(encoding="utf-8"))
+        return gui_examples.load(name)
+    except Exception:
+        return None
+
+
+def _rescaled(raw: Dict[str, Any], canvas_w: int, canvas_h: int
+              ) -> Dict[str, Any]:
+    """An example in gui_examples._compact form, fitted to this canvas.
+
+    Shrunk to fit, never stretched past the designer's own CANVAS_W x
+    CANVAS_H: MEASURED, image_viewer stretched to Typhon's 1504 x 1016
+    fails the gate ('label "Frames on a bad timing" and entry overlap'), and
+    so does its own native 1280 x 800; its 1100 x 700 version passes at
+    1100 x 700. Whether a fitting passes at THIS canvas is _fitted's
+    question — gui_layout's tolerance grows with the canvas, so even the
+    1100 x 700 drawing does not pass at 1504 x 1016.
 
     Rescaled by EDGES, not by origin-and-size. Scaling y and h separately and
-    snapping each rounds them independently, and on this example it turned
+    snapping each rounds them independently, and on image_viewer it turned
     "Exposure (ms)" at 136..160 and its spinbox at 152..184 into an overlap
     that the source did not have. Snapping both edges and taking the
     difference is monotone, so shapes that did not overlap still do not."""
-    try:
-        raw = gui_examples.load(EXAMPLE_NAME)
-    except Exception:
-        return None
     canvas = raw.get("canvas") or {}
-    sx = float(canvas_w) / float(canvas.get("w") or 1280)
-    sy = float(canvas_h) / float(canvas.get("h") or 800)
+    src_w = float(canvas.get("w") or 1280)
+    src_h = float(canvas.get("h") or 800)
+    sx = min(float(canvas_w), float(CANVAS_W), src_w) / src_w
+    sy = min(float(canvas_h), float(CANVAS_H), src_h) / src_h
     compact = gui_examples._compact(raw)
     win_in = compact.get("window") or {}
-    # Structure only — no colour and no font. The example is a Barbie capture
-    # tool, pink with a Magneto face, and a small model copies what it is
-    # shown: left in, every described window would come back pink.
+    # Structure only — no colour and no font. image_viewer is a Barbie
+    # capture tool, pink with a Magneto face, and a small model copies what
+    # it is shown: left in, every described window would come back pink.
     window = {k: win_in[k] for k in WINDOW_KEYS
               if win_in.get(k) and k not in EXAMPLE_UNSTYLED}
     shapes = []
@@ -367,6 +739,132 @@ def example_wireframe(canvas_w: int = CANVAS_W, canvas_h: int = CANVAS_H
         row["y"], row["h"] = y1, max(GRID, y2 - y1)
         shapes.append(row)
     return {"window": window, "shapes": shapes}
+
+
+@functools.lru_cache(maxsize=256)
+def _checked_example(name: str, mode: str, canvas_w: int, canvas_h: int
+                     ) -> Optional[str]:
+    """The example as PROMPT TEXT for this mode and canvas, or None when it
+    is not on disk or does not pass this module's own gate there — an
+    example the validator would refuse teaches refusal. Cached: the gate
+    costs 1-7 ms an example, the same answer every time for one canvas."""
+    raw = _example_source(name)
+    if not raw:
+        return None
+    if mode == "pixel":
+        fitted = _fitted(name, canvas_w, canvas_h)
+        return render_wireframe(json.loads(fitted)) if fitted else None
+    window = _rescaled(raw, canvas_w, canvas_h)["window"]
+    try:
+        tree = gtree.tree_from_shapes(_shapes_of(raw))
+    except Exception:
+        return None
+    reply = {"window": window, "layout": tree}
+    if not check_reply(json.dumps(reply), canvas_w=canvas_w,
+                       canvas_h=canvas_h).ok:
+        return None
+    return gtree.render_reply(window, tree)
+
+
+@functools.lru_cache(maxsize=256)
+def _fitted(name: str, canvas_w: int, canvas_h: int) -> Optional[str]:
+    """A pixel example that PASSES the gate on this canvas, as JSON, or None.
+
+    The drawing itself when, shrunk to fit, it passes. Otherwise the same
+    design laid out afresh by gui_describe_tree: its tree (nesting and
+    order from the drawing) placed for THIS canvas. MEASURED: image_viewer
+    passes at 1100 x 700 and fails at Typhon's 1504 x 1016 at ANY scale —
+    gui_layout's clustering tolerance grows with the canvas, so its labels
+    8 px above their spinboxes fall into the spinboxes' rows — and the
+    layouter's 16 px gaps pass at every canvas tested."""
+    raw = _example_source(name)
+    if not raw:
+        return None
+    pixel = _rescaled(raw, canvas_w, canvas_h)
+    if check_reply(json.dumps(pixel), canvas_w=canvas_w,
+                   canvas_h=canvas_h).ok:
+        return json.dumps(pixel)
+    try:
+        parsed = gtree.parse({"window": pixel["window"],
+                              "layout": gtree.tree_from_shapes(
+                                  _shapes_of(raw))})
+        if parsed.root is None:
+            return None
+        lay = gtree.layout(parsed.root, canvas_w, canvas_h,
+                           window=pixel["window"])
+    except Exception:
+        return None
+    if lay.faults:
+        return None
+    rows = [{k: v for k, v in r.items() if v not in ("", None, {})}
+            for r in lay.payload["shapes"]]
+    for r in rows:
+        r.setdefault("label", "")
+        if isinstance(r.get("props"), dict):
+            r["props"] = gui_examples._meaningful_props(r["kind"],
+                                                        r["props"])
+            if not r["props"]:
+                r.pop("props")
+    out = {"window": pixel["window"], "shapes": rows}
+    if not check_reply(json.dumps(out), canvas_w=canvas_w,
+                       canvas_h=canvas_h).ok:
+        return None
+    return json.dumps(out)
+
+
+def _shapes_of(raw: Dict[str, Any]) -> List[Shape]:
+    """The shapes of a .gspec dict — only the fields a tree is built from.
+    The source geometry, not a rescaled one: a tree has no pixels, and its
+    nesting and order are what the drawing at its own size says."""
+    out = []
+    for i, sd in enumerate(raw.get("shapes") or []):
+        out.append(Shape(
+            id=str(sd.get("id") or f"shape{i}"),
+            kind=str(sd.get("kind") or GENERIC_KIND),
+            x=int(sd.get("x", 0)), y=int(sd.get("y", 0)),
+            w=int(sd.get("w", 0)), h=int(sd.get("h", 0)),
+            label=str(sd.get("label") or ""),
+            props=dict(sd.get("props") or {}),
+            bg=str(sd.get("bg") or ""), fg=str(sd.get("fg") or ""),
+            font=str(sd.get("font") or "")))
+    return out
+
+
+def select_examples(text: str, *, mode: str = "pixel",
+                    canvas_w: int = CANVAS_W, canvas_h: int = CANVAS_H,
+                    limit: int = MAX_EXAMPLES) -> List[str]:
+    """The example names for ``text``, most relevant first, every one of
+    which passes the gate in ``mode`` at this canvas.
+
+    Relevance is a word match against EXAMPLE_POOL — deliberately dumb: it
+    costs microseconds, it is predictable, and a test can say which request
+    gets which example. Nothing matching falls back to DEFAULT_EXAMPLES."""
+    low = " " + re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()) + " "
+    scored = []
+    for order, (name, words) in enumerate(EXAMPLE_POOL):
+        hits = sum(1 for w in words if f" {w} " in low)
+        if hits:
+            scored.append((-hits, order, name))
+    names = [n for _h, _o, n in sorted(scored)]
+    if not names:
+        names = list(DEFAULT_EXAMPLES.get(mode, ()))
+    out = []
+    for n in names:
+        if len(out) >= max(0, int(limit)):
+            break
+        if _checked_example(n, mode, int(canvas_w), int(canvas_h)):
+            out.append(n)
+    return out
+
+
+def example_wireframe(canvas_w: int = CANVAS_W, canvas_h: int = CANVAS_H
+                      ) -> Optional[Dict[str, Any]]:
+    """The DEFAULT worked example (EXAMPLE_NAME), in gui_examples._compact
+    form, fitted to this canvas so that it passes the gate there (see
+    _fitted), with every refused key stripped. None if it is not on disk,
+    or if no fitting passes."""
+    fitted = _fitted(EXAMPLE_NAME, int(canvas_w), int(canvas_h))
+    return json.loads(fitted) if fitted else None
 
 
 def render_wireframe(payload: Any) -> str:
@@ -384,13 +882,21 @@ def render_wireframe(payload: Any) -> str:
     return "\n".join(["{"] + head + [' "shapes": ['] + body + [" ]", "}"])
 
 
-def _example_block(canvas_w: int, canvas_h: int) -> str:
-    ex = example_wireframe(canvas_w, canvas_h)
-    if not ex:
+def _examples_block(names: Sequence[str], mode: str, canvas_w: int,
+                    canvas_h: int) -> str:
+    texts = [t for t in (_checked_example(n, mode, canvas_w, canvas_h)
+                         for n in names) if t]
+    if not texts:
         return ""
-    return ("EXAMPLE — a correct wireframe on this canvas, for a different "
-            "request. Copy its structure and spacing, not its content.\n"
-            + render_wireframe(ex))
+    what = "wireframe" if mode == "pixel" else "layout"
+    if len(texts) == 1:
+        head = (f"EXAMPLE — a correct {what} on this canvas, for a different "
+                f"request. Copy its structure and spacing, not its content.")
+    else:
+        head = (f"EXAMPLES — correct {what}s on this canvas, for OTHER "
+                f"requests. Copy their structure and spacing, not their "
+                f"content.")
+    return head + "\n" + "\n\n".join(texts)
 
 
 _SKELETON = """Reply with ONLY a JSON object in this exact shape. No prose, no code fence:
@@ -400,16 +906,54 @@ _SKELETON = """Reply with ONLY a JSON object in this exact shape. No prose, no c
  ]}
 "bg" and "props" are optional."""
 
+# ---- tree mode --------------------------------------------------------
+
+_TREE_ROLE = ("You design GUI layouts for a desktop app designer. You "
+              "describe the window as a TREE: rows, columns and containers "
+              "holding widgets from a fixed catalogue. The designer computes "
+              "every position and size, so you never write x, y, w or h.")
+
+_TREE_NODES = """NODES
+- {"kind": "column", "children": [...]} stacks its children top to bottom.
+- {"kind": "row", "children": [...]} puts its children side by side, left to right.
+- {"kind": "frame" | "labelframe" | "freeform", "label": "...", "children": [...]} a container; its children stack top to bottom. labelframe = a bordered group with its label as the caption.
+- {"kind": "notebook", "label": "...", "children": [{"kind": "page", "label": "<tab title>", "children": [...]}, ...]} one page per tab.
+- {"kind": "panedwindow", "label": "...", "props": {"orient": "horizontal"}, "children": [<pane>, <pane>]} panes split by a draggable divider.
+- A widget: {"kind": "<a widget kind>", "label": "<caption>", "props": {...}}.
+- "grow": true on any node gives it the spare room; false keeps it at its natural size. Tables, text, images, charts, logs and lists grow by themselves."""
+
+_TREE_RULES = """RULES
+- The outermost node is usually a column. A menubar or toolbar goes first in it, a status_bar last.
+- Caption an input with a label widget just before it, in a row: {"kind": "row", "children": [{"kind": "label", "label": "Name"}, {"kind": "entry", "label": "Name"}]}
+- Put every action on a button. Give each widget its own label.
+- Only containers, rows and columns have "children"."""
+
+_TREE_SKELETON = """Reply with ONLY a JSON object in this exact shape. No prose, no code fence:
+{"window": {"title": "<window title>", "bg": "#rrggbb"},
+ "layout": {"kind": "column", "children": [
+  {"kind": "<a widget kind>", "label": "<caption>", "props": {}}
+ ]}}
+"bg", "props" and "grow" are optional."""
+
 
 def _compose(text: str, canvas_w: int, canvas_h: int, *, help_on: bool,
-             example: str, detail: bool) -> str:
-    canvas = (f"CANVAS\n"
-              f"- {canvas_w} x {canvas_h} px. The origin (0, 0) is the "
-              f"top-left corner; x grows right, y grows down.\n"
-              f"- Every x, y, w and h is an integer multiple of {GRID}.\n"
-              f"- Keep every shape at least {EDGE_MARGIN} px from the canvas "
-              f"edges.")
-    parts = [_ROLE, canvas, _catalogue(detail), _RULES]
+             example: str, detail: bool, mode: str = "pixel") -> str:
+    if mode == "tree":
+        canvas = (f"WINDOW\n- {canvas_w} x {canvas_h} px; the designer fits "
+                  f"the layout to it.")
+        parts = [_TREE_ROLE, canvas, _TREE_NODES,
+                 _catalogue(detail, gtree.LEAF_KINDS,
+                            "Widget kinds — use ONLY these, spelled exactly "
+                            "as written:"),
+                 _TREE_RULES]
+    else:
+        canvas = (f"CANVAS\n"
+                  f"- {canvas_w} x {canvas_h} px. The origin (0, 0) is the "
+                  f"top-left corner; x grows right, y grows down.\n"
+                  f"- Every x, y, w and h is an integer multiple of {GRID}.\n"
+                  f"- Keep every shape at least {EDGE_MARGIN} px from the "
+                  f"canvas edges.")
+        parts = [_ROLE, canvas, _catalogue(detail), _RULES]
     if help_on:
         parts.append(DECLARATION_HELP)
     if example:
@@ -417,42 +961,62 @@ def _compose(text: str, canvas_w: int, canvas_h: int, *, help_on: bool,
     # The request goes in VERBATIM — it is the user's own words, and it is
     # never what gets shed or cut.
     parts.append("REQUEST\n" + text)
-    parts.append(_SKELETON)
+    parts.append(_TREE_SKELETON if mode == "tree" else _SKELETON)
     return "\n\n".join(parts)
 
 
 def _assemble(text: str, *, canvas_w: int, canvas_h: int,
-              budget_chars: Optional[int]) -> Tuple[str, List[str]]:
+              budget_chars: Optional[int], mode: str = "pixel",
+              examples: Optional[Sequence[str]] = None
+              ) -> Tuple[str, List[str]]:
     """(prompt, what was shed to fit).
 
-    Shed WHOLE SECTIONS in a fixed order — declaration help, then the example,
-    then per-kind prop detail — and never cut text at a character count. A
-    hard cap slicing the prompt would stop the catalogue mid-list, and a model
-    that sees half the kinds treats the missing half as forbidden. If even the
-    leanest prompt is over budget it is still sent whole; the caller notes it.
-    """
+    Shed WHOLE SECTIONS in a fixed order — the extra examples from the least
+    relevant, then declaration help, then the last example, then per-kind
+    prop detail — and never cut text at a character count. A hard cap
+    slicing the prompt would stop the catalogue mid-list, and a model that
+    sees half the kinds treats the missing half as forbidden. If even the
+    leanest prompt is over budget it is still sent whole; the caller notes
+    it. The order means a 4096-token window still gets one example AND the
+    style help, as it always did; a bigger window buys more examples.
+
+    ``examples`` None selects them for the request (select_examples)."""
     budget = DEFAULT_BUDGET_CHARS if budget_chars is None else int(budget_chars)
-    example = _example_block(canvas_w, canvas_h)
-    plan = [
-        (True, example, True, []),
-        (False, example, True, ["style help"]),
-        (False, "", True, ["style help", "worked example"]),
-        (False, "", False, ["style help", "worked example", "prop detail"]),
-    ]
+    if examples is None:
+        examples = select_examples(text, mode=mode, canvas_w=canvas_w,
+                                   canvas_h=canvas_h)
+    names = list(examples)
+    n = len(names)
+
+    def fewer(keep: int) -> List[str]:
+        return [f"{n - keep} of {n} worked examples"] if keep < n else []
+
+    one = "worked example" if n == 1 else "worked examples"
+    plan: List[Tuple[bool, List[str], bool, List[str]]] = [
+        (True, names[:keep], True, fewer(keep))
+        for keep in range(n, 0, -1)]
+    plan.append((False, names[:1], True, fewer(min(1, n)) + ["style help"]))
+    plan.append((False, [], True, ["style help"] + ([one] if n else [])))
+    plan.append((False, [], False, ["style help"] + ([one] if n else [])
+                 + ["prop detail"]))
+    if not n:
+        plan.insert(0, (True, [], True, []))
     prompt, shed = "", []
     for help_on, ex, detail, shed in plan:
+        block = _examples_block(ex, mode, canvas_w, canvas_h) if ex else ""
         prompt = _compose(text, canvas_w, canvas_h, help_on=help_on,
-                          example=ex, detail=detail)
+                          example=block, detail=detail, mode=mode)
         if len(prompt) <= budget:
             break
-    if not example and "worked example" not in shed:
-        shed = shed + ["worked example (not on disk)"]
+    if not names and "worked example" not in shed:
+        shed = shed + ["worked example (none on disk passes at this canvas)"]
     return prompt, shed
 
 
 def build_prompt(text: str, *, canvas_w: int = CANVAS_W,
                  canvas_h: int = CANVAS_H, toolkit: str = "qt",
-                 budget_chars: Optional[int] = None) -> str:
+                 budget_chars: Optional[int] = None,
+                 mode: str = "pixel") -> str:
     """The first request for ``text``.
 
     ``toolkit`` does not change a word of it, deliberately: a .gspec is
@@ -460,7 +1024,7 @@ def build_prompt(text: str, *, canvas_w: int = CANVAS_W,
     gui_colors.COLOUR_CAPS gates both emitters), so a prompt that named either
     toolkit would steer the model toward widgets the other target lacks."""
     return _assemble(text, canvas_w=canvas_w, canvas_h=canvas_h,
-                     budget_chars=budget_chars)[0]
+                     budget_chars=budget_chars, mode=mode)[0]
 
 
 def _bullets(errors: Sequence[str], limit: int = MAX_FAULTS) -> str:
@@ -477,12 +1041,22 @@ def _bullets(errors: Sequence[str], limit: int = MAX_FAULTS) -> str:
     return "\n".join(shown)
 
 
+def _render_bad(bad: Any) -> str:
+    if gtree.looks_like_tree(bad):
+        layout = next((bad[k] for k in ("layout", "root", "tree", "ui",
+                                        "body", "main")
+                       if isinstance(bad.get(k), (dict, list))), None)
+        return gtree.render_reply(bad.get("window"), layout
+                                  if layout is not None else bad)
+    return render_wireframe(bad)
+
+
 def _shown(bad: Any, raw: str, cap: int = 3000) -> str:
     """What the model returned, capped. Cut at a LINE so the model never sees
     a shape sliced mid-object and "repairs" the slice."""
     if not isinstance(bad, dict):
         return (raw or "")[:min(1000, cap)]
-    text = render_wireframe(bad)
+    text = _render_bad(bad)
     if len(text) <= cap:
         return text
     lines, used = [], 0
@@ -498,11 +1072,18 @@ def _shown(bad: Any, raw: str, cap: int = 3000) -> str:
 #: (what-you-returned cap, bullets) tried in order until a repair prompt fits.
 _REPAIR_PLANS = ((3000, MAX_FAULTS), (1800, MAX_FAULTS), (1000, 8), (600, 4))
 
+#: Said when the model sent back an answer it had already sent: the same
+#: prompt would get the same answer, so the prompt changes too.
+REPEAT_NOTE = ("You sent this same answer before. Change it this time: fix "
+               "each point below, even if that means a different layout.")
+
 
 def repair_prompt(text: str, bad: Any, errors: Sequence[str], *,
                   raw: str = "", canvas_w: int = CANVAS_W,
                   canvas_h: int = CANVAS_H,
-                  budget_chars: Optional[int] = None) -> str:
+                  budget_chars: Optional[int] = None, mode: str = "pixel",
+                  examples: Optional[Sequence[str]] = None,
+                  repeated: bool = False) -> str:
     """One repair round: the model's own answer, every fault, then the request.
 
     Same shape as gui_classify.repair_prompt and nx_generate.repair_prompt —
@@ -517,14 +1098,20 @@ def repair_prompt(text: str, bad: Any, errors: Sequence[str], *,
     prompt was checked, the repairs never were."""
     tail = "\n\nFix every point above. Reply with ONLY the corrected JSON object."
     budget = DEFAULT_BUDGET_CHARS if budget_chars is None else int(budget_chars)
+    # Faults about a tree name nodes by their path; about a list of rows,
+    # by position — and only the latter needs saying how positions count.
+    where = ("" if gtree.looks_like_tree(bad) else
+             " (shapes are numbered from 1, in the order you listed them)")
     prompt = ""
     for cap, bullets in _REPAIR_PLANS:
         head = ("Your previous answer was rejected.\n\n"
-                "WHAT YOU RETURNED\n" + _shown(bad, raw, cap) + "\n\n"
-                "WHAT IS WRONG (shapes are numbered from 1, in the order you "
-                "listed them)\n" + _bullets(errors, bullets) + "\n\n")
+                + (REPEAT_NOTE + "\n\n" if repeated else "")
+                + "WHAT YOU RETURNED\n" + _shown(bad, raw, cap) + "\n\n"
+                "WHAT IS WRONG" + where + "\n" + _bullets(errors, bullets)
+                + "\n\n")
         body, _ = _assemble(text, canvas_w=canvas_w, canvas_h=canvas_h,
-                            budget_chars=budget - len(head) - len(tail))
+                            budget_chars=budget - len(head) - len(tail),
+                            mode=mode, examples=examples)
         prompt = head + body + tail
         if len(prompt) <= budget:
             break
@@ -547,6 +1134,187 @@ def _extract_json(text: str) -> Any:
         return json.loads(str(text).strip())
     except Exception:
         return None
+
+
+_PY_WORDS = {"True": "true", "False": "false", "None": "null"}
+
+
+def _skip_blank(text: str, j: int) -> int:
+    """The index of the next character that is not whitespace or inside a
+    comment — so "x,  /* done */ ]" is a trailing comma too."""
+    n = len(text)
+    while j < n:
+        if text[j] in " \t\r\n":
+            j += 1
+        elif text.startswith("//", j):
+            k = text.find("\n", j)
+            j = n if k < 0 else k
+        elif text.startswith("/*", j):
+            k = text.find("*/", j + 2)
+            j = n if k < 0 else k + 2
+        else:
+            break
+    return j
+
+
+def _clean_json(text: str) -> str:
+    """Near-JSON a small model writes -> JSON, outside strings only:
+    // and /* */ comments dropped, a comma before } or ] dropped, Python's
+    True / False / None spelled the JSON way, 'single' quotes made double.
+
+    Each of these cost a whole round before (STAGE_NO_JSON, "use double
+    quotes, no trailing commas and no comments") for an answer whose
+    content was fine. Only used when strict parsing has already failed, so
+    a reply that parses is never rewritten.
+
+    Prose before the first "{" is kept as written, and an apostrophe inside
+    a word is not a quote: "Here's the layout:" opened a single-quoted
+    string that swallowed the whole JSON after it (review finding)."""
+    start = text.find("{")
+    head, text = (text[:start], text[start:]) if start > 0 else ("", text)
+    out: List[str] = [head]
+    i, n = 0, len(text)
+    quote = ""
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == "\\" and i + 1 < n:
+                nxt = text[i + 1]
+                # ' is how a single-quoted string holds an apostrophe; in
+                # JSON it is not an escape at all.
+                out.append("'" if (quote == "'" and nxt == "'") else ch + nxt)
+                i += 2
+                continue
+            if ch == quote:
+                out.append('"')
+                quote = ""
+            elif ch == '"' and quote == "'":
+                out.append('\\"')
+            else:
+                out.append(ch)
+            i += 1
+            continue
+        if ch == "'" and i and text[i - 1].isalnum():
+            out.append(ch)               # an apostrophe: "you'd", "users'"
+            i += 1
+            continue
+        if ch in "\"'":
+            quote = ch
+            out.append('"')
+            i += 1
+            continue
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+            continue
+        if text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        if ch == ",":
+            j = _skip_blank(text, i + 1)
+            if j < n and text[j] in "}]":
+                i += 1
+                continue
+        if ch.isalpha():
+            j = i
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            word = text[i:j]
+            out.append(_PY_WORDS.get(word, word))
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _close_truncated(text: str) -> Optional[str]:
+    """A reply cut off by num_predict, closed after its LAST COMPLETE element
+    of a list — a whole shape row, or a whole tree node — or None.
+
+    A grammar cannot close an object the token limit cut short, and before
+    this the whole reply was discarded: a 40-widget answer lost for its 41st.
+    What survives is real model output, never invented; check_reply then
+    judges it like any other reply, and describe() notes what was lost."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    stack: List[str] = []
+    in_str = esc = False
+    cut: Optional[Tuple[int, List[str]]] = None
+    for k in range(start, len(text)):
+        ch = text[k]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append(ch)
+        elif ch in "}]":
+            if not stack:
+                return None
+            stack.pop()
+            if not stack:
+                return None                 # it closed: not truncated
+            if stack[-1] == "[":
+                cut = (k + 1, list(stack))
+    if cut is None:
+        return None
+    end, open_ = cut
+    closers = "".join("]" if c == "[" else "}" for c in reversed(open_))
+    return text[start:end] + closers
+
+
+_REPLY_KEYS = ("shapes", "layout", "window", "root", "tree", "ui")
+
+
+def _reply_like(payload: Any) -> bool:
+    """A whole reply rather than a piece of one."""
+    return isinstance(payload, dict) and (
+        any(k in payload for k in _REPLY_KEYS)
+        or gtree.looks_like_tree(payload))
+
+
+def parse_reply(text: Any) -> Tuple[Any, List[str], bool]:
+    """(payload, notes, salvaged). payload None when nothing parses.
+
+    Strict first (nx_generate's scanner); then the near-JSON clean-up; then,
+    for a reply that stops mid-object, the salvage of its complete part."""
+    raw = text if isinstance(text, str) else ("" if text is None
+                                              else str(text))
+    if _json_depth(raw) > MAX_JSON_DEPTH:
+        return None, [], False          # _no_json_fault says why
+    payload = _extract_json(raw)
+    if _reply_like(payload):
+        return payload, [], False
+    # The scanner, finding the whole object unparseable, carries on INTO it
+    # and returns the last inner object that parses — one shape, or the
+    # window. So near-JSON is tried before taking that.
+    cleaned = _clean_json(raw)
+    if cleaned != raw:
+        fixed = _extract_json(cleaned)
+        if _reply_like(fixed):
+            return fixed, ["read the reply as JSON after removing comments, "
+                           "trailing commas or Python spellings"], False
+    if payload is not None:
+        return payload, [], False
+    if _looks_cut_off(cleaned):
+        closed = _close_truncated(cleaned)
+        if closed:
+            try:
+                payload = json.loads(closed)
+            except ValueError:
+                payload = None
+            if isinstance(payload, dict):
+                return payload, [], True
+    return None, [], False
 
 
 def _looks_cut_off(text: str) -> bool:
@@ -575,8 +1343,37 @@ def _looks_cut_off(text: str) -> bool:
     return depth > 0 or in_str
 
 
+def _json_depth(text: str) -> int:
+    """How deep the reply's brackets nest, outside strings. A loop, not a
+    recursion — it is what keeps a reply nested past the interpreter's
+    recursion limit away from everything that recurses (MAX_JSON_DEPTH)."""
+    depth = deepest = 0
+    in_str = esc = False
+    for ch in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "{[":
+            depth += 1
+            if depth > deepest:
+                deepest = depth
+        elif ch in "}]":
+            depth = max(0, depth - 1)
+    return deepest
+
+
 def _no_json_fault(raw: str) -> str:
     base = "the reply contained no JSON object"
+    if _json_depth(raw) > MAX_JSON_DEPTH:
+        return (base + f" it could read — lists and objects nest more than "
+                f"{MAX_JSON_DEPTH} levels deep; reply with the flat structure "
+                f"asked for")
     if _looks_cut_off(raw):
         return (base + " — it stops before the object is closed, as if cut "
                 "off; reply with the whole object, using fewer shapes if needed")
@@ -1413,17 +2210,47 @@ def _by_position(warning: str, shapes: Sequence[Shape],
 # ============================================================
 
 def check_reply(raw: str, *, canvas_w: int = CANVAS_W,
-                canvas_h: int = CANVAS_H) -> Checked:
+                canvas_h: int = CANVAS_H,
+                tidy: Optional[bool] = None) -> Checked:
     """Take one model reply as far through the layers as it gets.
+
+    Either form is accepted whatever was asked for: a pixel reply ("shapes"
+    rows with x/y/w/h) or a layout TREE ("layout"), which gui_describe_tree
+    places and which then goes through the very same row checks and gate.
+    A model asked for one and writing the other is still read.
+
+    ``tidy`` (default: yes for pixel replies, no for trees) runs gui_snap
+    and the measured repairs. A laid-out tree is already on the grid with
+    every child inset and every sibling apart; snapping it only moved rows
+    between pages that happened to share a y.
 
     The gate runs only on a schema-clean reply: laying out a wireframe with
     rows missing reports faults about the gaps (a notebook "missing" a page
     whose row was rejected) that vanish once the row is fixed, and a model
     told to fix a phantom tends to break something real."""
     raw = raw if isinstance(raw, str) else ("" if raw is None else str(raw))
-    payload = _extract_json(raw)
+    payload, parse_notes, salvaged = parse_reply(raw)
     if payload is None:
         return Checked(STAGE_NO_JSON, [_no_json_fault(raw)], None, raw)
+    if gtree.looks_like_tree(payload):
+        out = _check_tree(payload, raw, canvas_w, canvas_h)
+    else:
+        out = _check_rows(payload, raw, canvas_w, canvas_h,
+                          tidy=True if tidy is None else bool(tidy))
+    out.notes = parse_notes + out.notes
+    if salvaged:
+        out.salvaged = True
+        what = ("widget" if out.tree else "shape")
+        out.notes.insert(0, f"the reply was cut off before it finished; kept "
+                            f"the {len(out.shapes) or out.accepted} complete "
+                            f"{what}(s) before the cut — anything after it "
+                            f"was lost, so add it by hand or describe less "
+                            f"at once")
+    return out
+
+
+def _check_rows(payload: Any, raw: str, canvas_w: int, canvas_h: int, *,
+                tidy: bool = True) -> Checked:
     faults: List[str] = []
     notes: List[str] = []
     # Flattened BEFORE the schema, and the flat payload is what a repair
@@ -1434,14 +2261,51 @@ def check_reply(raw: str, *, canvas_w: int = CANVAS_W,
     if faults:
         return Checked(STAGE_SCHEMA, faults, payload, raw, [], window, notes,
                        accepted=len(shapes))
-    shapes, wheres = _unwrap_pages(shapes, wheres, notes)
-    tidy, tidy_notes = _tidy(shapes, wheres, canvas_w, canvas_h)
-    notes.extend(tidy_notes)
-    _assign_z(tidy)
-    faults = _gate(tidy, wheres, window, canvas_w, canvas_h)
+    if tidy:
+        shapes, wheres = _unwrap_pages(shapes, wheres, notes)
+        shapes, tidy_notes = _tidy(shapes, wheres, canvas_w, canvas_h)
+        notes.extend(tidy_notes)
+    _assign_z(shapes)
+    faults = _gate(shapes, wheres, window, canvas_w, canvas_h)
     if faults:
         return Checked(STAGE_GATE, faults, payload, raw, [], window, notes)
-    return Checked(STAGE_OK, [], payload, raw, tidy, window, notes)
+    return Checked(STAGE_OK, [], payload, raw, shapes, window, notes)
+
+
+def _check_tree(payload: Any, raw: str, canvas_w: int, canvas_h: int
+                ) -> Checked:
+    """A tree reply: parse -> lay out -> the row checks and the gate.
+
+    Faults the row checks name by POSITION ("shape 4 (entry "Name")") are
+    rewritten to the tree path the model wrote (column > row 2 > entry
+    "Name"): it never saw a flat list, so a position means nothing to it.
+    The checked payload kept for a repair round is the TREE, for the same
+    reason."""
+    parsed = gtree.parse(payload)
+    if parsed.faults:
+        return Checked(STAGE_SCHEMA, parsed.faults, payload, raw, [], {},
+                       parsed.notes, accepted=parsed.good, tree=True)
+    lay = gtree.layout(parsed.root, canvas_w, canvas_h, window=parsed.window)
+    if lay.faults:
+        return Checked(STAGE_GATE, lay.faults, payload, raw, [], {},
+                       parsed.notes + lay.notes, accepted=1, tree=True)
+    inner = _check_rows(lay.payload, raw, canvas_w, canvas_h, tidy=False)
+    rows = lay.payload.get("shapes") or []
+    names = {}
+    for i, (row, path) in enumerate(zip(rows, lay.paths)):
+        names[_where(i, row.get("kind"), row.get("label"))] = \
+            gtree._short(path)
+
+    def terms(text: str) -> str:
+        for theirs in sorted(names, key=len, reverse=True):
+            if theirs in text:
+                text = text.replace(theirs, names[theirs])
+        return text
+
+    return Checked(inner.stage, [terms(f) for f in inner.faults], payload,
+                   raw, inner.shapes, inner.window,
+                   parsed.notes + lay.notes + [terms(n) for n in inner.notes],
+                   accepted=inner.accepted or len(rows), tree=True)
 
 
 # ============================================================
@@ -1449,32 +2313,80 @@ def check_reply(raw: str, *, canvas_w: int = CANVAS_W,
 # ============================================================
 
 def describe(text: str, *,
-             model_call: Optional[Callable[[str], str]] = None,
+             model_call: Optional[Callable[..., str]] = None,
              canvas_w: int = CANVAS_W, canvas_h: int = CANVAS_H,
              toolkit: str = "qt", max_attempts: int = 3,
-             budget_chars: Optional[int] = None) -> DescribeResult:
+             budget_chars: Optional[int] = None,
+             profile: Optional[Profile] = None,
+             should_stop: Optional[Callable[[], bool]] = None
+             ) -> DescribeResult:
     """A plain-English description -> a validated wireframe. NEVER RAISES.
 
     No model -> ok=False and ZERO calls, mirroring gui_classify.classify: the
     designer must keep working with no model loaded, and the caller shows the
     reason. A model that raises -> ok=False with the exception. Exhausting
-    ``max_attempts`` -> ok=False, the best attempt's faults and raw reply, and
-    NO shapes."""
+    ``max_attempts`` ROUNDS -> ok=False, the best attempt's faults and raw
+    reply, and NO shapes.
+
+    ``profile`` (profile_for) sets the mode, the schema, the round-1
+    candidates and the budget; None is the plain behaviour, one call per
+    round with the prompt alone. ``should_stop`` is checked before every
+    call, and passed to a model call that accepts it so a generation in
+    progress can be cancelled too."""
     res = DescribeResult()
     try:
         _describe(res, text, model_call, int(canvas_w), int(canvas_h),
-                  toolkit, max_attempts, budget_chars)
+                  toolkit, max_attempts, budget_chars, profile or LEGACY,
+                  should_stop)
     except Exception as exc:              # the promise is "never raises"
         res.ok = False
         res.shapes = []
+        res.window = {}
         res.errors.append(f"describe failed unexpectedly: {exc!r}")
     return res
 
 
+def _reply_key(cand: Checked) -> str:
+    """What makes two replies "the same answer": the parsed payload when
+    there is one (whitespace and key order do not count), else the text."""
+    try:
+        body = (json.dumps(cand.payload, sort_keys=True)
+                if cand.payload is not None else str(cand.raw).strip())
+    except (TypeError, ValueError):
+        body = str(cand.raw)
+    return hashlib.sha1(body.encode("utf-8", "replace")).hexdigest()
+
+
+def _call_options(prof: Profile, round_: int, k: int, repeats: int,
+                  schema: Optional[Dict[str, Any]],
+                  should_stop: Optional[Callable[[], bool]]
+                  ) -> Dict[str, Any]:
+    """The keyword arguments for one call. Round 1 candidate k gets
+    temperatures[k] and seed + k; a repair runs cold (REPAIR_TEMPERATURE)
+    unless the model has been repeating itself, which warms it by
+    REPEAT_STEP per repeat and moves the seed — the same prompt at the same
+    temperature and seed is the same answer."""
+    opts: Dict[str, Any] = {"json_schema": schema, "should_stop": should_stop}
+    if not prof.custom:
+        return opts
+    if round_ == 1 and prof.temperatures:
+        opts["temperature"] = prof.temperatures[min(k, len(prof.temperatures)
+                                                    - 1)]
+    elif round_ > 1:
+        opts["temperature"] = min(0.9, REPAIR_TEMPERATURE
+                                  + REPEAT_STEP * repeats)
+    if prof.seed is not None:
+        opts["seed"] = (prof.seed + k if round_ == 1
+                        else prof.seed + 100 * round_ + repeats)
+    opts["num_predict"] = prof.reply_tokens
+    return opts
+
+
 def _describe(res: DescribeResult, text: Any,
-              model_call: Optional[Callable[[str], str]], canvas_w: int,
+              model_call: Optional[Callable[..., str]], canvas_w: int,
               canvas_h: int, toolkit: str, max_attempts: Any,
-              budget_chars: Optional[int]) -> None:
+              budget_chars: Optional[int], prof: Profile,
+              should_stop: Optional[Callable[[], bool]]) -> None:
     if not isinstance(text, str) or not text.strip():
         res.errors = ["nothing to design — describe the GUI first"]
         return
@@ -1490,12 +2402,22 @@ def _describe(res: DescribeResult, text: Any,
         res.errors = [f"the canvas {canvas_w} x {canvas_h} is too small to "
                       f"design on"]
         return
-    attempts = max(1, int(max_attempts))
-    budget = DEFAULT_BUDGET_CHARS if budget_chars is None else int(budget_chars)
+    rounds = max(1, int(max_attempts))
+    if budget_chars is not None:
+        budget = int(budget_chars)
+    else:
+        budget = prof.budget_chars if prof.custom else DEFAULT_BUDGET_CHARS
+    mode = prof.mode if prof.mode in MODES else "pixel"
+    res.mode = mode
 
+    examples = select_examples(text, mode=mode, canvas_w=canvas_w,
+                               canvas_h=canvas_h)
     prompt, shed = _assemble(text, canvas_w=canvas_w, canvas_h=canvas_h,
-                             budget_chars=budget)
+                             budget_chars=budget, mode=mode,
+                             examples=examples)
     notes: List[str] = []
+    if prof.custom and prof.reason:
+        notes.append("design: " + prof.reason)
     if shed:
         notes.append("to fit the model's context the prompt left out: "
                      + ", ".join(shed))
@@ -1504,55 +2426,109 @@ def _describe(res: DescribeResult, text: Any,
         notes.append(f"the prompt is ~{estimate_tokens(prompt)} tokens, over "
                      f"the ~{limit}-token budget even after shedding — a "
                      f"shorter description may work better")
+    schema = reply_schema(prof, canvas_w, canvas_h) if prof.constrained \
+        else None
 
     best: Optional[Checked] = None
-    for attempt in range(1, attempts + 1):
-        try:
-            reply = model_call(prompt)
-        except Exception as exc:
-            res.attempts = attempt
-            res.errors = [f"the model call failed: {exc!r}"]
-            if best is not None:
-                res.errors += best.faults
-                res.raw = best.raw
-                notes.extend(best.notes)
-            res.notes = notes
-            return
-        res.attempts = attempt
-        cand = check_reply(reply, canvas_w=canvas_w, canvas_h=canvas_h)
-        if cand.ok:
-            res.ok = True
-            res.shapes = cand.shapes
-            res.window = cand.window
-            res.notes = notes + cand.notes
-            res.raw = cand.raw
-            return
-        # Never let a worse round replace a better one: the repair prompt is
-        # built from the BEST answer so far, so a reply that regresses to
-        # prose does not make the next round start from nothing. Ties go to
-        # the newer answer, so a model that is stuck is at least shown the
-        # answer it just gave rather than an identical prompt again.
-        if best is None or cand.rank() >= best.rank():
-            best = cand
-        if attempt < attempts:
+    # A cut-off reply whose complete part passes: kept, and returned if no
+    # WHOLE answer arrives — but while calls remain, the model is asked for
+    # the whole thing, because what was cut off is part of what the user
+    # asked for.
+    held: Optional[Checked] = None
+    seen: Dict[str, int] = {}
+    repeats = 0
+    calls = 0
+    for round_ in range(1, rounds + 1):
+        res.rounds = round_
+        tries = max(1, prof.n_best) if round_ == 1 else 1
+        for k in range(tries):
+            if should_stop is not None and should_stop():
+                res.attempts = calls
+                if held is not None:
+                    _accept(res, held, notes)
+                    return
+                res.errors = ["stopped before the model was asked again"]
+                _fail(res, best, notes, keep_errors=True)
+                return
+            opts = _call_options(prof, round_, k, repeats, schema,
+                                 should_stop)
+            try:
+                reply = call_model(model_call, prompt, **opts)
+            except Exception as exc:
+                res.attempts = calls + 1
+                if held is not None:
+                    _accept(res, held, notes + [f"the next model call failed:"
+                                                f" {exc!r}"])
+                    return
+                res.errors = [f"the model call failed: {exc!r}"]
+                _fail(res, best, notes, keep_errors=True)
+                return
+            calls += 1
+            res.attempts = calls
+            cand = check_reply(reply, canvas_w=canvas_w, canvas_h=canvas_h)
+            more = round_ < rounds or k < tries - 1
+            if cand.ok and cand.salvaged and more:
+                held = held or cand
+                cand = Checked(STAGE_NO_JSON, [_no_json_fault(cand.raw)],
+                               None, cand.raw)
+            if cand.ok:
+                if calls > 1 and prof.n_best > 1 and round_ == 1:
+                    notes.append(f"candidate {k + 1} of {tries} passed")
+                _accept(res, cand, notes)
+                return
+            key = _reply_key(cand)
+            if key in seen:
+                repeats += 1
+            seen[key] = seen.get(key, 0) + 1
+            # Never let a worse candidate replace a better one: the repair
+            # prompt is built from the BEST answer so far, so a reply that
+            # regresses to prose does not make the next round start from
+            # nothing. Ties go to the newer answer, so a model that is stuck
+            # is at least shown the answer it just gave rather than an
+            # identical prompt again.
+            if best is None or cand.rank() >= best.rank():
+                best = cand
+        if round_ < rounds:
+            repeated = seen.get(_reply_key(best), 0) > 1
             prompt = repair_prompt(text, best.payload, best.faults,
                                    raw=best.raw, canvas_w=canvas_w,
-                                   canvas_h=canvas_h, budget_chars=budget)
+                                   canvas_h=canvas_h, budget_chars=budget,
+                                   mode="tree" if best.tree else mode,
+                                   examples=examples, repeated=repeated)
             if len(prompt) > budget and not any("repair prompt" in n
                                                 for n in notes):
                 notes.append(f"a repair prompt is ~{estimate_tokens(prompt)} "
                              f"tokens, over the budget even at its leanest — "
                              f"a shorter description may work better")
+    if held is not None:
+        _accept(res, held, notes)
+        return
+    res.errors = []
+    _fail(res, best, notes, keep_errors=False)
 
-    # No shapes AND no window: a caller that applied the window title of a
-    # refused design would leave half of it on the user's canvas.
+
+def _accept(res: DescribeResult, cand: Checked, notes: List[str]) -> None:
+    res.ok = True
+    res.errors = []
+    res.shapes = cand.shapes
+    res.window = cand.window
+    res.mode = "tree" if cand.tree else "pixel"
+    res.notes = notes + cand.notes
+    res.raw = cand.raw
+
+
+def _fail(res: DescribeResult, best: Optional[Checked], notes: List[str],
+          *, keep_errors: bool) -> None:
+    """No shapes AND no window: a caller that applied the window title of a
+    refused design would leave half of it on the user's canvas."""
     res.ok = False
     res.shapes = []
     res.window = {}
     if best is not None:
-        res.errors = list(best.faults)
+        res.errors = (list(res.errors) if keep_errors else []) + best.faults
         res.raw = best.raw
-        notes.extend(best.notes)
+        res.mode = "tree" if best.tree else res.mode
+        notes = notes + best.notes
     res.notes = notes
 
 

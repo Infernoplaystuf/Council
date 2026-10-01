@@ -53,17 +53,61 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 #: canvas takes its size from the project, not from here.
 CANVAS_W, CANVAS_H = 1100, 700
 
-#: The classification call, exactly as the Tk shell makes it.
+#: The classification call's defaults. num_predict is only the FLOOR now:
+#: gui_classify sizes each call to the boxes it asks about (700 held about
+#: nine 32-token ids). `coder` — the role that writes structured output —
+#: as Describe uses; unassigned, it is the main model, as before.
 CLASSIFY_TEMPERATURE, CLASSIFY_NUM_PREDICT, CLASSIFY_TIMEOUT = 0.1, 700, 180
+CLASSIFY_ROLE = "coder"
+
+#: The engine keywords the shared contract adds (json_schema, seed, stop,
+#: should_stop). An engine from before the contract has none of them: they
+#: are dropped, not sent, and the caller's own parsing does the rest.
+CONTRACT_KEYWORDS = ("json_schema", "seed", "stop", "should_stop")
 
 
-def default_model_call(prompt: str) -> str:
+def local_chat(engine: Any, **kwargs: Any) -> str:
+    """engine.local_chat(**kwargs), TypeError-safe for the new keywords.
+
+    Read from the signature first, so a contract keyword the engine does not
+    take is dropped before the call (no wasted generation); and if it is
+    still refused — a wrapper hiding the signature — the call is retried
+    once without any of them. A TypeError from INSIDE the engine is not
+    mistaken for that: only "unexpected keyword" retries."""
+    import inspect
+    fn = engine.local_chat
+    extra = {k: kwargs.pop(k) for k in CONTRACT_KEYWORDS
+             if kwargs.get(k) is not None}
+    kwargs = {k: v for k, v in kwargs.items() if k not in CONTRACT_KEYWORDS}
+    try:
+        params = inspect.signature(fn).parameters
+        if not any(p.kind is p.VAR_KEYWORD for p in params.values()):
+            extra = {k: v for k, v in extra.items() if k in params}
+    except (TypeError, ValueError):
+        pass
+    if extra:
+        try:
+            return fn(**kwargs, **extra)
+        except TypeError as exc:
+            if "unexpected keyword" not in str(exc):
+                raise
+    return fn(**kwargs)
+
+
+def default_model_call(prompt: str, *, json_schema: Any = None,
+                       num_predict: Optional[int] = None,
+                       temperature: Optional[float] = None,
+                       seed: Optional[int] = None) -> str:
     """The classification call. Separated so a test never reaches a model."""
     import council_engine
-    return council_engine.local_chat(
+    return local_chat(
+        council_engine,
         messages=[{"role": "user", "content": prompt}],
-        temperature=CLASSIFY_TEMPERATURE, num_predict=CLASSIFY_NUM_PREDICT,
-        timeout=CLASSIFY_TIMEOUT)
+        temperature=CLASSIFY_TEMPERATURE if temperature is None
+        else temperature,
+        num_predict=max(CLASSIFY_NUM_PREDICT, int(num_predict or 0)),
+        timeout=CLASSIFY_TIMEOUT, role=CLASSIFY_ROLE,
+        json_schema=json_schema, seed=seed)
 
 
 #: The "Describe it" call. Its own numbers, not the classifier's: a whole
@@ -72,15 +116,30 @@ def default_model_call(prompt: str) -> str:
 #: the role that writes structured output; with no slot assigned it is the
 #: main model, which is what every caller got before roles existed.
 DESCRIBE_TEMPERATURE, DESCRIBE_NUM_PREDICT, DESCRIBE_ROLE = 0.1, 1800, "coder"
+#: Per call. The engine honours it under the shared contract; generous,
+#: because a CPU-placed model writing 1800 tokens is minutes, not seconds.
+DESCRIBE_TIMEOUT = 300
 
 
-def describe_model_call(prompt: str) -> str:
-    """The Describe-it call. Separated so a test never reaches a model."""
+def describe_model_call(prompt: str, *, json_schema: Any = None,
+                        seed: Optional[int] = None,
+                        temperature: Optional[float] = None,
+                        num_predict: Optional[int] = None,
+                        should_stop: Optional[Callable[[], bool]] = None
+                        ) -> str:
+    """The Describe-it call. Separated so a test never reaches a model.
+
+    Every keyword is optional and gui_describe passes only what its profile
+    sets; an engine without the schema contract gets the plain call."""
     import council_engine
-    return council_engine.local_chat(
+    return local_chat(
+        council_engine,
         messages=[{"role": "user", "content": prompt}],
-        temperature=DESCRIBE_TEMPERATURE, num_predict=DESCRIBE_NUM_PREDICT,
-        role=DESCRIBE_ROLE)
+        temperature=DESCRIBE_TEMPERATURE if temperature is None
+        else temperature,
+        num_predict=int(num_predict or DESCRIBE_NUM_PREDICT),
+        role=DESCRIBE_ROLE, timeout=DESCRIBE_TIMEOUT,
+        json_schema=json_schema, seed=seed, should_stop=should_stop)
 
 
 #: Settings for the critique call. Advisory only — a review NEVER edits code.
@@ -109,6 +168,11 @@ class GenerateResult:
     #: True when the pipeline refused rather than failed: a validation error, a
     #: port-rename collision, an orphaned reference, or a detached project.
     blocked: bool = False
+    #: shape id -> {"kind", "props"}: the classifier's answers this Generate
+    #: WROTE BACK into the .gspec, so the next one asks nothing. The Designer
+    #: applies the same to its canvas, or its next Save would write the
+    #: untyped boxes back over them.
+    classified: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def say(self, line: str) -> None:
         self.lines.append(line)
@@ -404,9 +468,15 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
             # is why the Designer works with no model loaded.
             first_pass = gui_layout.infer(shapes, project.canvas.w,
                                           project.canvas.h)
+            # The real window, so a long list of boxes keeps the props
+            # catalogue when it fits — only for the engine's own model.
+            window = None if model_call else _role_window(CLASSIFY_ROLE)
             classifications, out.questions = gui_classify.classify(
-                shapes, first_pass, model_call or default_model_call)
+                shapes, first_pass, model_call or default_model_call,
+                n_ctx=window)
             out.say(f"classified {len(classifications)} untyped shape(s)")
+            shapes = _persist_classifications(
+                name, shapes, classifications, out, vault_dir)
         else:
             out.say("no untyped shapes — generated with no model call")
 
@@ -535,6 +605,114 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
         out.say(f"generate failed: {exc!r}")
         return out
     out.ok = True
+    return out
+
+
+def _persist_classifications(name: str, shapes: Sequence[Any],
+                             classifications: Sequence[Any],
+                             out: GenerateResult, vault_dir: Any
+                             ) -> List[Any]:
+    """Write the classifier's answers back into the wireframe. Returns the
+    shapes Generate should carry on with (copies; the caller's are not
+    touched).
+
+    gui_classify's promise is that a box is asked about ONCE — but nothing
+    wrote the answer anywhere, so every Generate called the model again, and
+    could get a different kind each time: a wireframe that generated a
+    treeview yesterday and a listbox today. Now each answered box becomes
+    that kind in the .gspec, with the catalogue's default props under the
+    model's (what a palette shape gets), and a question the model was unsure
+    of is recorded as a clarification, unanswered. A FLAGGED fallback is
+    not an answer and is not written: the next Generate asks again.
+
+    A failure to save is a line in the log, never a failed Generate — the
+    classifications still apply to THIS generation.
+
+    The answers are MERGED into the .gspec as it is on disk NOW, into the
+    shapes there that are still untyped — never by saving the project
+    Generate opened BEFORE the model call with ``shapes``: the Designer lets
+    the user Save while Generate waits on the model, and that put every
+    shape and window setting saved in the meantime back (review finding).
+    A caller's unsaved shapes are not saved on its behalf."""
+    import copy
+
+    import gui_classify
+    from gui_shapes import GENERIC_KIND, Clarification
+
+    answers = gui_classify.persistable(classifications)
+    if not answers:
+        return list(shapes)
+    updated = []
+    for s in shapes:
+        s = copy.deepcopy(s)
+        got = answers.get(s.id)
+        if got is not None:
+            apply_answer(s, got)
+        updated.append(s)
+    written: Dict[str, Dict[str, Any]] = {}
+    try:
+        import gui_projects
+        fresh = gui_projects.open_project(name, vault_dir=vault_dir)
+        for s in fresh.shapes:
+            got = answers.get(s.id)
+            if got is not None and s.kind == GENERIC_KIND:
+                apply_answer(s, got)
+                written[s.id] = got
+        if written:
+            asked = {c.shape_id for c in fresh.clarifications}
+            for q in out.questions:
+                if q.shape_id in written and q.shape_id not in asked:
+                    fresh.clarifications.append(Clarification(
+                        shape_id=q.shape_id, question=q.question))
+            gui_projects.save_project(name, fresh, vault_dir=vault_dir)
+    except Exception as exc:                             # noqa: BLE001
+        out.say(f"note: could not save the classifications ({exc!r}) — the "
+                f"next Generate will ask the model again")
+        return updated
+    if not written:
+        return updated
+    out.classified = written
+    out.say(f"saved {len(written)} classification(s) into the wireframe — "
+            f"the next Generate will not ask the model about them again")
+    return updated
+
+
+def apply_answer(shape: Any, answer: Dict[str, Any]) -> None:
+    """Make an untyped ``shape`` the kind the classifier answered. In place.
+
+    Props are the catalogue's defaults, then whatever the shape had, then
+    the model's — what a palette shape of that kind would carry, so the
+    inspector shows its fields and nothing downstream reads a missing key.
+    The Designer canvas uses the same function for the same answer, so the
+    canvas and the .gspec cannot disagree."""
+    from gui_shapes import PALETTE
+
+    kind = str(answer.get("kind") or "")
+    if kind not in PALETTE:
+        return
+    schema = PALETTE[kind].get("prop_schema") or {}
+    props = {p: (list(d["default"]) if isinstance(d.get("default"), list)
+                 else d["default"])
+             for p, d in schema.items() if "default" in d}
+    props.update(dict(getattr(shape, "props", None) or {}))
+    props.update(dict(answer.get("props") or {}))
+    shape.kind, shape.props = kind, props
+
+
+def described_window(window: Any) -> Dict[str, str]:
+    """The window settings a description validated, as apply_window values:
+    title, bg, fg, font — each only when set. gui_describe's placeholder
+    title "Untitled" is not a setting; applying it would rename a project's
+    window to "Untitled" because the model wrote no title."""
+    if not isinstance(window, dict):
+        return {}
+    out = {}
+    for key in ("title", "bg", "fg", "font"):
+        value = window.get(key)
+        if isinstance(value, str) and value.strip():
+            out[key] = value.strip()
+    if out.get("title") == "Untitled":
+        out.pop("title")
     return out
 
 
@@ -684,12 +862,17 @@ def review(prompt: str, models: Any) -> str:
 # ============================================================
 
 def describe(text: str, project_dir: Any = None, *,
-             model_call: Optional[Callable[[str], str]] = None) -> Any:
+             model_call: Optional[Callable[..., str]] = None,
+             profile: Any = None,
+             should_stop: Optional[Callable[[], bool]] = None) -> Any:
     """Plain English -> a wireframe that will generate, or the reasons not.
 
     A thin seam over gui_describe, which owns the prompt, the checks and the
-    repair rounds. What this adds is what only a PROJECT knows: the toolkit
-    to design for, the canvas, and the default model call.
+    repair rounds. What this adds is what only a PROJECT and the ENGINE
+    know: the toolkit to design for, the canvas, the default model call, and
+    which model will answer — its size picks the profile (tree mode and
+    best-of-N for a small model, pixel mode for a large one) and its window
+    the prompt budget.
 
     The canvas is the PROJECT's. It used to be the fixed 1100 x 700 the
     Designer's widget was, on the grounds that the shapes are about to be
@@ -697,6 +880,10 @@ def describe(text: str, project_dir: Any = None, *,
     the project's size, the project's size IS that canvas. Describing into
     Typhon's 1504 x 1016 with 1100 x 700 would draw the new wireframe into
     the top-left two-thirds of the window.
+
+    A caller that supplies its OWN model_call gets the plain profile unless
+    it passes one: the engine's model is not the one answering, so its size
+    says nothing about it.
 
     Never raises; a failure is a result with ok=False and the reason.
     """
@@ -711,9 +898,233 @@ def describe(text: str, project_dir: Any = None, *,
         except Exception:                                # noqa: BLE001
             pass
         canvas_w, canvas_h = canvas_of(project_dir)
-    return gui_describe.describe(
-        text, model_call=model_call or describe_model_call,
-        canvas_w=canvas_w, canvas_h=canvas_h, toolkit=toolkit)
+    stats: List[Dict[str, Any]] = []
+    if model_call is None:
+        if profile is None:
+            profile = describe_profile(text)
+        model_call = _recording(describe_model_call, stats)
+    result = gui_describe.describe(
+        text, model_call=model_call, canvas_w=canvas_w, canvas_h=canvas_h,
+        toolkit=toolkit, profile=profile, should_stop=should_stop)
+    line = stats_line(stats)
+    if line and hasattr(result, "notes"):
+        # FIRST, not last: run_describe_prompts keeps notes[:8], and this is
+        # the only way the cost of each call reaches its jsonl — appended,
+        # a reply with a few synonyms and moved props pushed it out.
+        result.notes.insert(0, line)
+    return result
+
+
+# ---- which model answers, and how big it is --------------------------------
+
+#: Overrides for measuring — the GPU-owning phase runs the graded prompts
+#: with each: COUNCIL_DESCRIBE_MODE = pixel | tree | auto,
+#: COUNCIL_DESCRIBE_BEST_OF = 1..5, COUNCIL_DESCRIBE_CONSTRAINED = 0 | 1.
+ENV_MODE = "COUNCIL_DESCRIBE_MODE"
+ENV_BEST_OF = "COUNCIL_DESCRIBE_BEST_OF"
+ENV_CONSTRAINED = "COUNCIL_DESCRIBE_CONSTRAINED"
+
+
+def role_model(role: str = DESCRIBE_ROLE) -> Dict[str, Any]:
+    """{"id", "name", "params_b", "n_ctx", "slot"} for the model ``role``
+    will be answered by. Never raises, never loads a model: the slot file,
+    then the engine's list_local_models() (shared contract) when it has
+    one, then the GGUF header, then the file name. Missing pieces are None.
+    """
+    import os
+
+    info: Dict[str, Any] = {"id": "", "name": "", "params_b": None,
+                            "n_ctx": None, "slot": "main"}
+    try:
+        from . import model_slots
+        cfg = model_slots.current()
+        slot = cfg.slot_for(role)
+        info["slot"] = slot
+        s = cfg.slots.get(slot)
+        path = (s.path if s is not None else "") or (
+            os.environ.get("COUNCIL_GGUF_PATH", "").strip()
+            if slot == "main" else "")
+        info["id"] = path
+    except Exception:                                    # noqa: BLE001
+        pass
+    model_id = str(info["id"] or "")
+    if model_id.startswith("ollama:"):
+        info["name"] = model_id.split(":", 1)[1]
+    elif model_id:
+        info["name"] = Path(model_id).stem
+    try:
+        import council_engine
+    except Exception:                                    # noqa: BLE001
+        council_engine = None
+    if council_engine is not None and model_id:
+        listing = getattr(council_engine, "list_local_models", None)
+        if callable(listing):
+            try:
+                for m in listing() or []:
+                    if (_same_ollama(m.get("id"), model_id)
+                            if model_id.startswith("ollama:")
+                            else str(m.get("id")) == model_id
+                            or _same_file(m.get("id"), model_id)):
+                        info["params_b"] = m.get("params_b")
+                        info["name"] = m.get("name") or info["name"]
+                        break
+            except Exception:                            # noqa: BLE001
+                pass
+        if info["params_b"] is None and not model_id.startswith("ollama:"):
+            info["params_b"] = _gguf_params_b(council_engine, model_id)
+    if info["params_b"] is None and model_id:
+        import gui_describe
+        info["params_b"] = gui_describe.parse_params_b(info["name"]
+                                                       or model_id)
+    if council_engine is not None:
+        try:
+            info["n_ctx"] = int(council_engine.effective_n_ctx(info["slot"]))
+        except Exception:                                # noqa: BLE001
+            pass
+    return info
+
+
+def _role_window(role: str) -> Optional[int]:
+    """The context window ``role``'s model will have, or None. Never
+    raises; never loads a model (council_engine.effective_n_ctx)."""
+    try:
+        from . import model_slots
+        import council_engine
+        return int(council_engine.effective_n_ctx(
+            model_slots.slot_for_role(role)))
+    except Exception:                                    # noqa: BLE001
+        return None
+
+
+def _same_ollama(a: Any, b: Any) -> bool:
+    """"ollama:phi3.5" and "ollama:phi3.5:latest" are one model — Ollama
+    serves an untagged name as :latest, and the engine routes it so, but
+    list_local_models' ids always carry the tag (review finding)."""
+    def key(s: Any) -> str:
+        name = str(s or "").strip().lower()
+        name = name[len("ollama:"):] if name.startswith("ollama:") else name
+        return name if ":" in name else name + ":latest"
+    return str(a or "").lower().startswith("ollama:") and key(a) == key(b)
+
+
+def _same_file(a: Any, b: Any) -> bool:
+    try:
+        return Path(str(a)).resolve() == Path(str(b)).resolve()
+    except Exception:                                    # noqa: BLE001
+        return False
+
+
+def _gguf_params_b(engine: Any, path: str) -> Optional[float]:
+    """Parameters from the GGUF header: general.size_label ("8B", "3.8B")
+    when the file has one, else general.parameter_count. Header only — the
+    reader stops before the tensors."""
+    try:
+        meta = engine.read_gguf_metadata(path) or {}
+    except Exception:                                    # noqa: BLE001
+        return None
+    import gui_describe
+    label = meta.get("general.size_label")
+    if isinstance(label, str):
+        got = gui_describe.parse_params_b(label)
+        if got:
+            return got
+    count = meta.get("general.parameter_count")
+    if isinstance(count, (int, float)) and count > 0:
+        return round(float(count) / 1e9, 1)
+    return gui_describe.parse_params_b(str(meta.get("general.name") or ""))
+
+
+def describe_profile(text: str = "", role: str = DESCRIBE_ROLE) -> Any:
+    """gui_describe.profile_for the model ``role`` uses. Never raises.
+
+    The environment overrides (ENV_MODE / ENV_BEST_OF / ENV_CONSTRAINED)
+    exist so the same prompts can be measured each way on the same model."""
+    import os
+
+    import gui_describe
+
+    try:
+        info = role_model(role)
+    except Exception:                                    # noqa: BLE001
+        info = {"name": "", "params_b": None, "n_ctx": None}
+    mode = os.environ.get(ENV_MODE, "").strip().lower() or None
+    if mode == "auto":
+        mode = None
+    try:
+        best = int(os.environ.get(ENV_BEST_OF, "").strip() or 0) or None
+    except ValueError:
+        best = None
+    constrained = os.environ.get(ENV_CONSTRAINED, "1").strip() != "0"
+    # A size the engine (or a GGUF header) gave as "8.0B", NaN or 0 is read
+    # or dropped here: compared as-is it raised out of a "never raises"
+    # describe, or sent NaN to pixel mode (review finding).
+    params = info.get("params_b")
+    try:
+        params = None if params is None else float(params)
+    except (TypeError, ValueError):
+        params = gui_describe.parse_params_b(str(params))
+    if params is not None and not (0 < params < 1e5):
+        params = None
+    return gui_describe.profile_for(
+        params, n_ctx=info.get("n_ctx"), text=text,
+        model=info.get("name") or "", mode=mode, n_best=best,
+        constrained=constrained)
+
+
+# ---- what each call cost -------------------------------------------------
+
+def _recording(call: Callable[..., str], stats: List[Dict[str, Any]]
+               ) -> Callable[..., str]:
+    """``call`` that also appends council_engine.last_call_stats() (shared
+    contract) after each call, when the engine has it. Keeps the wrapped
+    call's keywords visible to gui_describe.call_model's signature check.
+
+    Only stats the call itself RECORDED count: last_call_stats is "the most
+    recent call", and a call that raised (a stall timeout, Stop, a dead
+    server) may record nothing — reading it regardless counted the previous
+    call twice and reported its cost as this one's (review finding)."""
+    import functools
+
+    def latest() -> Dict[str, Any]:
+        try:
+            import council_engine
+            fn = getattr(council_engine, "last_call_stats", None)
+            got = fn(role=DESCRIBE_ROLE) if callable(fn) else None
+        except Exception:                                # noqa: BLE001
+            return {}
+        return dict(got) if isinstance(got, dict) else {}
+
+    @functools.wraps(call)
+    def wrapped(prompt: str, **kwargs: Any) -> str:
+        before = latest()
+        try:
+            reply = call(prompt, **kwargs)
+        except BaseException:
+            after = latest()
+            if after and after != before:   # it did record, e.g. a partial
+                stats.append(after)
+            raise
+        after = latest()
+        if after:
+            stats.append(after)
+        return reply
+    return wrapped
+
+
+def stats_line(stats: Sequence[Dict[str, Any]]) -> str:
+    """One log line for the calls a describe made: tokens, seconds, speed,
+    and whether the schema actually constrained them. "" with no stats."""
+    if not stats:
+        return ""
+    gen = sum(int(s.get("gen_tokens") or 0) for s in stats)
+    prompt = sum(int(s.get("prompt_tokens") or 0) for s in stats)
+    secs = sum(float(s.get("seconds") or 0.0) for s in stats)
+    constrained = sum(1 for s in stats if s.get("constrained"))
+    model = next((str(s.get("model")) for s in stats if s.get("model")), "")
+    speed = f", {gen / secs:.1f} tok/s" if secs > 0 and gen else ""
+    return (f"model calls: {len(stats)}{' on ' + model if model else ''} — "
+            f"{prompt} prompt + {gen} reply tokens in {secs:.1f} s{speed}; "
+            f"{constrained} of {len(stats)} schema-constrained")
 
 
 def canvas_of(project_dir: Any) -> tuple:
