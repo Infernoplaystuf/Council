@@ -307,6 +307,44 @@ def test_policy_refuses(body, why):
     assert any(why in f for f in cand.faults), cand.faults
 
 
+@pytest.mark.parametrize("body", [
+    "import sys\n    sys._getframe(0)",
+    "import inspect\n    inspect.currentframe()",
+    "import inspect\n    inspect.stack()",
+    "import sys\n    sys.exc_info()[2].tb_frame",
+    "import gc\n    gc.collect()",
+    "import sys\n    sys.settrace(None)",
+    "import sys\n    sys.addaudithook(print)",
+    "import os\n    os.path.realpath = str",
+    "import json\n    json.dump = print",
+    "import json\n    setattr(json, 'dump', print)",
+    "import os.path\n    del os.path.join",
+])
+def test_reaching_into_the_interpreter_or_rebinding_a_module_is_refused(
+        body):
+    """Review: each of these passed the static gate. Code behind a widget
+    has no use for frames, the garbage collector, interpreter hooks or
+    patching a module — and in the smoke run each one reaches the harness's
+    own state (its fence and its verdict live in the caller's frame and in
+    stdlib functions it calls)."""
+    reply = fence(f"def count_images(folder):\n    {body}\n"
+                  f"    return {{'status': '', 'files': []}}")
+    cand = gcb.check(reply, fn_target())
+    assert cand.stage == gcb.STAGE_POLICY, (cand.stage, cand.faults)
+
+
+def test_ordinary_attributes_and_numpy_stack_are_not_introspection():
+    reply = fence('''
+def count_images(folder):
+    import numpy as np
+    from types import SimpleNamespace
+    box = SimpleNamespace()
+    box.total = int(np.stack([np.zeros(2), np.ones(2)]).sum())
+    return {"status": str(box.total), "files": []}''')
+    cand = gcb.check(reply, fn_target())
+    assert cand.stage == gcb.STAGE_SMOKE, cand.faults
+
+
 def test_a_broad_except_that_hides_the_failure_is_refused():
     reply = fence('''
 def count_images(folder):
@@ -435,6 +473,54 @@ def count_images(folder):
     os.listdir(folder)''')
     cand = gcb.check(reply, fn_target())
     assert cand.stage == gcb.STAGE_REFS and "never returns" in cand.faults[0]
+
+
+def test_a_function_that_only_ever_reports_an_error_is_a_fault():
+    """Review: a refusal written as `return {"error": ...}` passed every
+    gate (the smoke run calls an error key a soft pass) and was offered with
+    Accept enabled — code that never computes anything."""
+    reply = fence('''
+def count_images(folder):
+    return {"error": "I cannot do that"}''')
+    cand = gcb.check(reply, fn_target())
+    assert cand.stage == gcb.STAGE_REFS, cand.faults
+    assert any("every return is an error" in f for f in cand.faults)
+
+
+def test_a_function_that_raises_before_any_return_is_a_fault():
+    """Review: `raise ValueError(...)` with a dead return under it passed
+    the key check and was a soft pass in the smoke run — a placeholder."""
+    reply = fence('''
+def count_images(folder):
+    raise ValueError("not implemented yet")
+    return {"status": "", "files": []}''')
+    cand = gcb.check(reply, fn_target())
+    assert cand.stage == gcb.STAGE_REFS, cand.faults
+    assert any("always raises" in f for f in cand.faults)
+
+
+def test_raising_when_nothing_was_found_after_a_loop_is_fine():
+    reply = fence('''
+def count_images(folder):
+    import os
+    for name in sorted(os.listdir(folder)):
+        if name.endswith(".png"):
+            return {"status": name, "files": [name]}
+    raise ValueError("no PNG files in " + folder)''')
+    cand = gcb.check(reply, fn_target())
+    assert cand.stage == gcb.STAGE_SMOKE, cand.faults
+
+
+def test_an_error_branch_beside_a_real_result_is_fine():
+    reply = fence('''
+def count_images(folder):
+    import os
+    if not os.path.isdir(folder):
+        return {"error": "not a folder"}
+    names = sorted(os.listdir(folder))
+    return {"status": str(len(names)), "files": names}''')
+    cand = gcb.check(reply, fn_target())
+    assert cand.stage == gcb.STAGE_SMOKE, cand.faults
 
 
 def test_a_misspelt_port_is_fixed_and_a_made_up_one_is_not():
@@ -643,12 +729,85 @@ def test_stop_ends_the_loop_before_the_next_call():
     assert res.stopped and len(model.calls) == 1 and not res.ok
 
 
+def test_stop_during_a_generation_is_stopped_not_a_model_failure():
+    """Review: the engine answers should_stop() by RAISING (council_engine.
+    GenerationCancelled), and the loop reported that as 'the model call
+    failed: GenerationCancelled(...)' with stopped=False."""
+    pressed = []
+
+    def model(prompt, seed=None, temperature=None, should_stop=None):
+        pressed.append(1)                    # Stop, mid-generation
+        raise RuntimeError("generation cancelled")
+
+    res = gcb.write(fn_target(), model, should_stop=lambda: bool(pressed),
+                    max_repairs=2)
+    assert res.stopped and not res.ok
+    assert res.errors[0] == "stopped" and len(pressed) == 1
+
+
+class SoftSmoke:
+    """Passes every candidate; the ones whose code contains ``soft_on``
+    pass softly (a deliberate ValueError on the sample data)."""
+
+    def __init__(self, soft_on: str):
+        self.soft_on, self.seen = soft_on, []
+
+    def __call__(self, cand):
+        self.seen.append(cand.code)
+        soft = ("it raised ValueError on the sample data: no frames"
+                if self.soft_on in cand.code else "")
+        return SimpleNamespace(ok=True, skipped="", soft=soft, notes=[],
+                               faults=lambda: [],
+                               summary=lambda: "smoke run passed")
+
+
+SOFT = fence('''
+def count_images(folder):
+    import os
+    names = [n for n in os.listdir(folder) if n.endswith(".tif")]
+    if not names:
+        raise ValueError("no frames")
+    return {"status": str(len(names)), "files": names}''')
+
+
+def test_best_of_n_prefers_a_clean_pass_to_a_soft_one():
+    """Review: a soft pass (ValueError on the sample data the planner chose
+    for this task) ended the first round, so a candidate that looked for
+    the wrong files was offered while two more samples were never drawn."""
+    model = Script(SOFT, GOOD)
+    res = gcb.write(fn_target(), model, smoke=SoftSmoke(".tif"), n_best=3)
+    assert res.ok and res.attempts == 2
+    assert ".tif" not in res.code and ".png" in res.code
+
+
+def test_a_soft_pass_is_still_offered_when_no_sample_does_better():
+    model = Script(SOFT)
+    res = gcb.write(fn_target(), model, smoke=SoftSmoke(".tif"), n_best=2,
+                    max_repairs=3)
+    assert res.ok and ".tif" in res.code
+    assert res.attempts == 2                 # no repair spent on it
+    assert any("no frames" in n for n in res.notes)
+
+
 def test_a_smoke_runner_that_raises_does_not_break_the_promise():
     def boom(_cand):
         raise OSError("sandbox gone")
     res = gcb.write(fn_target(), Script(GOOD), smoke=boom)
     assert res.ok
     assert any("could not be made" in n for n in res.notes)
+
+
+def test_an_instruction_too_long_for_the_window_is_refused_before_any_call():
+    """Review: a 200 KB instruction (a pasted spec) built a 198k-char
+    prompt against a 9.1k budget — everything sheddable shed and still 20x
+    over, so the engine's clamp would cut the middle (the signature) out of
+    every one of up to six calls. Say so instead, and call nothing."""
+    model = Script(GOOD)
+    long = "count the PNG files in the folder and list them. " * 400
+    res = gcb.write(fn_target(instruction=long), model)
+    assert not res.ok and model.calls == [] and res.attempts == 0
+    assert "too long" in res.errors[0]
+    assert gcb.write(fn_target(), Script(GOOD)).ok      # a normal one fits
 
 
 def test_an_empty_instruction_or_no_outputs_is_refused_before_any_call():

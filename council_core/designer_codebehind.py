@@ -725,16 +725,26 @@ def _plan_function(out: Plan, req: Request, target: Any, spec: Any, w: Any,
     if wanted in taken:
         text = gcb.function_text(before, wanted)
         rec = ai.get(f"{gcb.MODULE}.{wanted}") or {}
-        if text is not None and rec.get("sha256") == gcb.sha(text):
+        # Unedited model output is replaceable only for the widget that
+        # uses it: two buttons labelled alike derive the same name, and
+        # replacing the other one's function (with another signature)
+        # breaks that button's link the moment this one is accepted.
+        users = [o.label or o.name for o in spec.widgets
+                 if o is not w and _links_to(o.script, wanted)]
+        if text is not None and rec.get("sha256") == gcb.sha(text) \
+                and not users:
             replacing = f"the model's earlier {wanted}() (unedited)"
         else:
             i = 2
             while f"{wanted}_{i}" in taken:
                 i += 1
             name = f"{wanted}_{i}"
-            out.notes.append(f"logic.py already has a {wanted}() that the "
-                             f"model did not write (or that was edited), so "
-                             f"this one is {name}()")
+            out.notes.append(
+                f"another widget ({', '.join(users[:3])}) is wired to it — "
+                f"{wanted}() in logic.py stays as it is, and this one is "
+                f"{name}()" if users else
+                f"logic.py already has a {wanted}() that the model did not "
+                f"write (or that was edited), so this one is {name}()")
     target.name = name
     target.params = params
     target.outputs = outs
@@ -746,6 +756,15 @@ def _plan_function(out: Plan, req: Request, target: Any, spec: Any, w: Any,
     out.link = {"module": gcb.MODULE, "function": name,
                 "inputs": [p.name for p in params],
                 "outputs": {o.port: o.key for o in outs}}
+
+
+def _links_to(script: Any, function: str) -> bool:
+    """Whether a widget's script link calls logic.<function>."""
+    import gui_codebehind as gcb
+    from . import designer_wiring
+    link = designer_wiring.normalise(script)
+    return link.get("module") == gcb.MODULE and \
+        link.get("function") == function
 
 
 def _plan_handler(out: Plan, req: Request, target: Any, spec: Any, w: Any,
@@ -849,8 +868,13 @@ def wrap_handler(code: str, name: str, label: str, instruction: str,
 
 
 def splice_handler(source: str, name: str, method: str) -> str:
-    """handlers.py with ``method`` replacing ``name`` or appended to the
-    class (the way Generate appends a new stub)."""
+    """handlers.py with ``method`` replacing ``name`` or added as the last
+    method of the class that holds the handlers (HandlerMixin).
+
+    Into the CLASS, not onto the end of the file: after a module-level
+    helper the user added below the class, an indented def appended at the
+    end becomes a function nested inside that helper — it parses, passes
+    policy, and the button does nothing (_propose re-checks this)."""
     import gui_emit
     import ast as _ast
     tree = _ast.parse(source)
@@ -858,8 +882,16 @@ def splice_handler(source: str, name: str, method: str) -> str:
     if name in spans and len(spans[name]) == 1:
         a, b = spans[name][0]
         return gui_emit._spliced(source, [(a, b, method)])
-    text = source if source.endswith("\n") else source + "\n"
-    return text + "\n" + method
+    classes = [n for n in tree.body if isinstance(n, _ast.ClassDef)]
+    holder = next((c for c in classes if c.name == "HandlerMixin"),
+                  classes[0] if classes else None)
+    if holder is None:
+        text = source if source.endswith("\n") else source + "\n"
+        return text + "\n" + method
+    lines = source.splitlines(keepends=True)
+    head = "".join(lines[:holder.end_lineno])
+    head = head if head.endswith("\n") else head + "\n"
+    return head + "\n" + method + "".join(lines[holder.end_lineno:])
 
 
 def _smoke_runner(p: Plan) -> Callable[[Any], Any]:
@@ -974,6 +1006,15 @@ def _propose(review: Review) -> None:
         r.errors = [f"the spliced {p.file} does not parse: line {exc.lineno}: "
                     f"{exc.msg}"]
         return
+    if p.mode == "handler":
+        import gui_emit
+        if gui_emit.handler_text(after, p.target.name) is None:
+            # Not a method of the window's class once spliced (no class to
+            # put it in): written, it would never run.
+            r.ok = False
+            r.errors = [f"{p.target.name} would not be a method of the "
+                        f"window's class in {p.file} — nothing to write"]
+            return
     ok, errs = gui_policy.validate(
         after, p.project_mode,
         gui_policy.as_requires(p.target.requires) + p.target.local_modules,

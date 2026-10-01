@@ -518,8 +518,16 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
             pass
 
     # ---- the fence ----------------------------------------------------
-    norm_box = os.path.normcase(sandbox)
-    devnull = os.path.normcase(os.path.realpath(os.devnull))
+    # Held from BEFORE the candidate runs: the inside-the-sandbox check
+    # calls these, and a candidate that rebinds os.path.realpath (or fspath,
+    # or normcase) could otherwise make a write outside look inside. The
+    # static gate refuses the rebinding too; this is the floor under it.
+    _realpath = os.path.realpath
+    _normcase = os.path.normcase
+    _fspath = os.fspath
+    _sep = os.sep
+    norm_box = _normcase(sandbox)
+    devnull = _normcase(_realpath(os.devnull))
     armed = [False]
     blocked_events = {
         "os.remove", "os.rmdir", "os.rename", "shutil.rmtree", "shutil.move",
@@ -538,13 +546,20 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
     blocked_imports = {"tkinter", "_tkinter", "PySide6", "PySide2", "PyQt5",
                        "PyQt6", "wx", "kivy", "council_engine"}
     blocked_imports |= set(job.get("block_imports") or ())
+    # The interpreter's own internals (frames, gc, settrace, addaudithook)
+    # are NOT fenced here: their audit events fire constantly inside normal
+    # libraries — numpy, Pillow and socket all read a frame or walk gc as
+    # they work — so a runtime block is false positives, not safety. The
+    # static gate (gui_codebehind.policy_faults) refuses those spellings in
+    # the CANDIDATE's own code, which is what reaches a person, and only a
+    # candidate that passed it is ever smoke-run.
 
     def inside(path: Any) -> bool:
         try:
-            p = os.path.normcase(os.path.realpath(os.fspath(path)))
+            p = _normcase(_realpath(_fspath(path)))
         except Exception:                                # noqa: BLE001
             return False
-        return p == norm_box or p.startswith(norm_box + os.sep) \
+        return p == norm_box or p.startswith(norm_box + _sep) \
             or p == devnull
 
     def hook(event: str, args: tuple) -> None:

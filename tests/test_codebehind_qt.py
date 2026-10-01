@@ -247,6 +247,17 @@ def test_an_empty_instruction_never_reaches_the_worker(tab):
     assert "Say what it should do" in tab.wiring.write_status.text()
 
 
+def test_model_text_in_the_status_line_is_never_rich_text(tab):
+    """Review: progress lines quote the model's reply (a SyntaxError line),
+    and the status QLabel was AutoText — `<img src="file:///...">` in a
+    reply was rendered as HTML, Qt reading a local file to show it."""
+    from PySide6.QtCore import Qt
+    select(tab, tab.button_id)
+    tab.wiring.set_writing(True, '  shape — line 1: invalid syntax: '
+                                 '<img src="file:///C:/x.png">')
+    assert tab.wiring.write_status.textFormat() == Qt.TextFormat.PlainText
+
+
 def test_the_worker_touches_no_widget():
     from tests.source_checks import widget_touches_in_worker
     source = (ROOT / "council_qt" / "tabs" / "designer.py").read_text(

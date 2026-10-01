@@ -202,6 +202,25 @@ def test_a_swallowed_refusal_still_fails(victim):
     assert not victim.exists()
 
 
+def test_the_fence_keeps_its_own_path_check_when_the_candidate_rebinds_os(
+        victim):
+    """Review: the fence's inside-the-sandbox test called os.path.realpath
+    at refusal time, a module attribute the candidate's own code could
+    rebind. The fence now holds the functions it relies on from before it
+    is armed (and gui_codebehind refuses the rebinding statically)."""
+    r = handler(f"""
+    def on_btn_go(self, *args) -> None:
+        import os
+        here = os.getcwd()
+        os.path.realpath = lambda p, *a, **k: os.path.join(here, "x")
+        with open({str(victim)!r}, "w") as fh:
+            fh.write("clobbered")
+""")
+    assert not r.ok
+    assert any("writes outside" in b for b in r.blocked), r.summary()
+    assert not victim.exists()
+
+
 def test_moving_a_folder_is_blocked(tmp_path):
     dest = tmp_path / "moved_here"
     r = handler(f"""

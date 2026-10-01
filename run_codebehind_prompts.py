@@ -157,7 +157,16 @@ def run_task(task: Dict[str, Any], pdir: Path, shapes: List[Any],
                      outputs=dict(task.get("outputs") or {}), n_best=n_best)
     t0 = time.perf_counter()
     plan = dc.plan(req)
-    call = model if model is not None else (lambda p, **k: task["stub"])
+    if model is None:                                    # --stub
+        call = lambda p, **k: task["stub"]               # noqa: E731
+    elif model is dc.default_model_call:
+        # Exactly the Designer's path (DesignerActions.code_model is None):
+        # run() then sizes n_best from the coder model, budgets the prompt
+        # to its real window and records its name. An explicit model_call
+        # skips all three.
+        call = None
+    else:
+        call = model
     review = dc.run(plan, model_call=call)
     seconds = time.perf_counter() - t0
     res = review.result

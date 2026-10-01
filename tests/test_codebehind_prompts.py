@@ -43,6 +43,28 @@ def test_the_stub_run_passes_end_to_end(tmp_path):
     assert all(r["prompt_chars"] > 0 for r in rows)
 
 
+def test_the_default_coder_role_runs_exactly_the_designers_path(
+        tmp_path, monkeypatch):
+    """Review: with no --model the harness handed run() default_model_call
+    as an explicit model_call, and run() then skips what the Designer does
+    for the coder role — auto n_best from the model's size, the real
+    window, the model's name — so the measuring phase would have measured
+    one candidate on a 4096 budget whatever the model. The Designer passes
+    model_call=None (DesignerActions.code_model); so must the harness."""
+    from council_core import designer_codebehind as dc
+    seen = []
+    real_run = dc.run
+
+    def spy(plan, *, model_call=None, **kw):
+        seen.append(model_call)
+        # No real model in tests: answer for it.
+        return real_run(plan, model_call=lambda p, **k: "no code", **kw)
+
+    monkeypatch.setattr(dc, "run", spy)
+    rcp.main(["--vault", str(tmp_path / "v"), "--only", "E1"])
+    assert seen == [None]
+
+
 def test_a_wrong_answer_fails_the_grade(tmp_path):
     tasks = [t for t in rcp.load_prompts() if t["id"] == "M2"]
     tasks[0]["stub"] = tasks[0]["stub"].replace("sum(values) / len(values)",

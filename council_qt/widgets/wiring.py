@@ -274,6 +274,9 @@ class WiringView(QGroupBox):
         go.addStretch(1)
         layout.addLayout(go)
         self.write_status = QLabel()
+        # Progress lines quote the model's reply; AutoText would render
+        # `<img src="file:///...">` in a reply as HTML.
+        self.write_status.setTextFormat(Qt.TextFormat.PlainText)
         self.write_status.setWordWrap(True)
         self.write_status.setStyleSheet(f"color: {THEME['subtext']};")
         layout.addWidget(self.write_status)

@@ -55,7 +55,9 @@ THE LOOP
 describe()'s contract (gui_describe): NEVER RAISES, a model that raises is a
 result, and a worse round never replaces a better one. First round: n_best
 samples with different seeds and temperatures, stopping at the first that
-passes everything. Then up to max_repairs rounds from the BEST candidate so
+passes everything (one that passes only with a caveat — a ValueError on the
+sample data chosen for the task — is held while samples remain, and offered
+if none does better). Then up to max_repairs rounds from the BEST candidate so
 far, each quoting the exact fault text and line, plus a hint keyed on the
 fault (the chart recipe for the chart TypeError, the real port names for a
 missing port...). A repair that returns the same text again is retried with
@@ -152,6 +154,21 @@ SELF_ATTRS = frozenset({"ports", "report_error", "clear_ports",
                         "request_close"})
 
 _BUILTINS = frozenset(dir(builtins))
+
+#: Interpreter internals code behind a widget never needs: live frames (and
+#: the attributes that read one), the garbage collector, and the hooks that
+#: watch the interpreter. gui_policy denies __globals__ and globals() for the
+#: same reason; these are the routes it does not spell. In the smoke run
+#: each reaches the harness's own state — its fence and its verdict live in
+#: the calling frame — and in the app they reach the window's.
+INTROSPECTION_ATTRS = frozenset({
+    "_getframe", "_current_frames", "currentframe", "settrace", "setprofile",
+    "addaudithook", "f_locals", "f_globals", "f_back", "f_builtins",
+    "f_trace", "tb_frame", "gi_frame", "cr_frame", "ag_frame"})
+INTROSPECTION_MODULES = frozenset({"gc", "sys.monitoring"})
+#: inspect's frame-returning calls, by receiver (np.stack is not one).
+INSPECT_FRAMES = frozenset({"stack", "trace", "currentframe",
+                            "getouterframes", "getinnerframes", "getframeinfo"})
 
 
 # ============================================================
@@ -1062,6 +1079,7 @@ def policy_faults(code: str, target: Target) -> List[str]:
                                    toolkit=target.toolkit)
     faults = list(errs)
     tree = ast.parse(code)
+    faults += _introspection_faults(tree)
     for node in ast.walk(tree):
         line = getattr(node, "lineno", 0)
         roots: List[str] = []
@@ -1121,6 +1139,83 @@ def policy_faults(code: str, target: Target) -> List[str]:
                           f"let it raise (or raise ValueError with a plain "
                           f"sentence)" + (" ; the app reports exceptions"
                                           if target.mode == "handler" else ""))
+    return _dedupe(faults)
+
+
+def _attr_targets(node: ast.AST):
+    """The attribute targets of an assignment/del target, tuples unpacked."""
+    if isinstance(node, ast.Attribute):
+        yield node
+    elif isinstance(node, (ast.Tuple, ast.List)):
+        for elt in node.elts:
+            yield from _attr_targets(elt)
+    elif isinstance(node, ast.Starred):
+        yield from _attr_targets(node.value)
+
+
+def _root(node: ast.AST) -> str:
+    while isinstance(node, (ast.Attribute, ast.Subscript)):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else ""
+
+
+def _introspection_faults(tree: ast.AST) -> List[str]:
+    """Frames, the garbage collector, interpreter hooks (INTROSPECTION_*),
+    and changing a module the code imported — `os.path.realpath = ...`,
+    setattr(json, ...). Patching a module changes it for the whole app (and,
+    in the smoke run, for the harness checking this code)."""
+    faults: List[str] = []
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imported.update((a.asname or a.name).split(".")[0]
+                            for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.update(a.asname or a.name for a in node.names
+                            if a.name != "*")
+    why = ("— code behind a widget has no use for the interpreter's "
+           "internals; return values instead")
+    for node in ast.walk(tree):
+        line = getattr(node, "lineno", 0)
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.split(".")[0] in INTROSPECTION_MODULES or \
+                        a.name in INTROSPECTION_MODULES:
+                    faults.append(f"line {line}: no {a.name} {why}")
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            if node.module.split(".")[0] in INTROSPECTION_MODULES or \
+                    node.module in INTROSPECTION_MODULES:
+                faults.append(f"line {line}: no {node.module} {why}")
+            for a in node.names:
+                if a.name in INTROSPECTION_ATTRS or (
+                        node.module == "inspect" and a.name in INSPECT_FRAMES):
+                    faults.append(f"line {line}: no {a.name} {why}")
+        elif isinstance(node, ast.Attribute) and \
+                node.attr in INTROSPECTION_ATTRS:
+            faults.append(f"line {line}: no .{node.attr} {why}")
+        elif isinstance(node, ast.Call):
+            f = node.func
+            if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) \
+                    and f.value.id == "inspect" and f.attr in INSPECT_FRAMES:
+                faults.append(f"line {line}: no inspect.{f.attr}() {why}")
+            elif isinstance(f, ast.Name) and f.id in ("setattr", "delattr") \
+                    and node.args and _root(node.args[0]) in imported:
+                faults.append(f"line {line}: do not change the module "
+                              f"{_root(node.args[0])} — it is shared by the "
+                              f"whole app")
+        targets: List[ast.AST] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+        elif isinstance(node, ast.Delete):
+            targets = list(node.targets)
+        for t in targets:
+            for attr in _attr_targets(t):
+                if _root(attr) in imported:
+                    faults.append(f"line {line}: do not change the module "
+                                  f"{_root(attr)} — it is shared by the "
+                                  f"whole app")
     return _dedupe(faults)
 
 
@@ -1304,6 +1399,22 @@ def _return_faults(code: str, target: Target) -> List[str]:
         faults.append(f"it never returns a value — end with "
                       f"return {{{', '.join(repr(k) + ': ...' for k in keys)}}}")
         return faults
+    # A function that cannot produce the result passed every gate before
+    # these two checks: `return {"error": "..."}` alone is a soft pass in
+    # the smoke run, and so is `raise ValueError(...)` with a dead return
+    # under it — a refusal or a placeholder, offered with Accept enabled.
+    want = f"return {{{', '.join(repr(k) + ': ...' for k in keys)}}}"
+    if all(_is_error_dict(r.value) for r in valued):
+        faults.append(f"every return is an error — at least one must give "
+                      f"the result: {want}")
+    first_return = min(r.lineno for r in rets)
+    for stmt in fn.body:
+        if isinstance(stmt, ast.Raise) and stmt.lineno < first_return:
+            faults.append(f"line {stmt.lineno}: it always raises here, "
+                          f"before any return — compute the result and "
+                          f"{want}; raise ValueError only when the input is "
+                          f"wrong")
+            break
     for r in valued:
         v = r.value
         if isinstance(v, ast.Dict):
@@ -1327,6 +1438,13 @@ def _return_faults(code: str, target: Target) -> List[str]:
                           f"— return "
                           f"{{{', '.join(repr(k) + ': ...' for k in keys)}}}")
     return faults
+
+
+def _is_error_dict(node: Optional[ast.AST]) -> bool:
+    """`{"error": ...}` written as a literal — the failure path, not a
+    result."""
+    return isinstance(node, ast.Dict) and any(
+        isinstance(k, ast.Constant) and k.value == "error" for k in node.keys)
 
 
 #: Builtins whose result is certainly not a dict — `return len(names)`.
@@ -1666,6 +1784,17 @@ def _smoke(cand: Candidate, smoke: Optional[Callable[[Candidate], Any]]
     cand.gates.append(Gate(STAGE_SMOKE, False, "; ".join(cand.faults[:3])))
 
 
+def _accept(res: CodeResult, cand: Candidate) -> None:
+    """``cand`` is what write() offers."""
+    res.ok = True
+    res.code = cand.code
+    res.raw = cand.raw
+    res.smoke = cand.smoke
+    res.notes += cand.notes
+    res.gates = [g.line() for g in cand.gates]
+    res.best = cand
+
+
 def default_n_best(params_b: Optional[float]) -> int:
     """Samples in the first round, from the model's size. Small models vary
     most run to run (Phi-4's H1/H3 failed at 3 rounds and passed on a rerun),
@@ -1736,11 +1865,28 @@ def _write(res: CodeResult, target: Target, model_call, smoke, catalogue,
     budget = budget_chars(n_ctx)
     prompt, shed = build_prompt(target, budget)
     res.prompt_chars = len(prompt)
+    if len(prompt) > budget:
+        # Everything sheddable is gone and it still does not fit: what is
+        # left is the instruction (or, in handler mode, the ports it names).
+        # Sent anyway, the engine's clamp cuts the MIDDLE out of the one
+        # message — the signature — on every call of the loop.
+        res.errors = [f"the instruction is too long for the model's window "
+                      f"(the prompt would be {len(prompt)} characters; about "
+                      f"{budget} fit beside the reply) — say it in a few "
+                      f"sentences"]
+        return
     if shed:
         res.notes.append("to fit the model's context the prompt left out: "
                          + ", ".join(shed))
     stopped = (lambda: bool(should_stop and should_stop()))
     best: Optional[Candidate] = None
+    #: A candidate that passed SOFTLY (a deliberate ValueError or an error
+    #: key on the sample data) while first-round samples remain. The sample
+    #: data was chosen for this task, so a soft pass is a yellow flag — a
+    #: candidate globbing *.tif in a folder of PNGs is one — and a clean
+    #: pass from the next seed is preferred. Offered when none comes; never
+    #: spent repairs on.
+    fallback: Optional[Candidate] = None
     seen: Dict[str, int] = {}
     n_best = max(1, min(int(n_best or 1), len(TEMPERATURES)))
     plan: List[Tuple[str, int, float]] = [
@@ -1748,7 +1894,7 @@ def _write(res: CodeResult, target: Target, model_call, smoke, catalogue,
     plan += [("repair", 100 + i, REPAIR_TEMPERATURE)
              for i in range(max(0, int(max_repairs)))]
     bump = 0.0
-    for kind, seed, temp in plan:
+    for step, (kind, seed, temp) in enumerate(plan):
         temp = min(0.9, temp + bump)
         seed = seed + int(bump * 100)
         if stopped():
@@ -1756,6 +1902,9 @@ def _write(res: CodeResult, target: Target, model_call, smoke, catalogue,
             res.errors = ["stopped"] + (best.faults if best else [])
             break
         if kind == "repair":
+            if fallback is not None:
+                _accept(res, fallback)
+                return
             if best is None:
                 break
             prompt = repair_prompt(target, best, budget)
@@ -1766,7 +1915,14 @@ def _write(res: CodeResult, target: Target, model_call, smoke, catalogue,
             raw = _call(model_call, prompt, seed, temp, should_stop)
         except Exception as exc:                         # noqa: BLE001
             res.attempts += 1
-            res.errors = [f"the model call failed: {exc!r}"]
+            if stopped():
+                # The engine answers should_stop() by raising
+                # (GenerationCancelled): that is the Stop the user pressed,
+                # not a model failure.
+                res.stopped = True
+                res.errors = ["stopped"]
+            else:
+                res.errors = [f"the model call failed: {exc!r}"]
             if best is not None:
                 res.errors += best.faults
                 res.raw = best.raw
@@ -1798,16 +1954,19 @@ def _write(res: CodeResult, target: Target, model_call, smoke, catalogue,
                           + ("" if cand.ok else
                              f" — {cand.faults[0] if cand.faults else ''}"))
         if cand.ok:
-            res.ok = True
-            res.code = cand.code
-            res.raw = cand.raw
-            res.smoke = cand.smoke
-            res.notes += cand.notes
-            res.gates = [g.line() for g in cand.gates]
-            res.best = cand
+            more = kind == "sample" and step + 1 < n_best
+            if more and getattr(cand.smoke, "soft", ""):
+                fallback = fallback or cand
+                _say(on_progress, "  passed with a caveat — trying the next "
+                                  "sample for a clean pass")
+                continue
+            _accept(res, cand)
             return
         if best is None or cand.rank() >= best.rank():
             best = cand
+    if fallback is not None and not res.stopped:
+        _accept(res, fallback)
+        return
     res.ok = False
     res.code = ""
     if best is not None:

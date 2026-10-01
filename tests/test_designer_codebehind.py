@@ -351,6 +351,55 @@ def test_a_second_write_replaces_only_the_models_unedited_function(demo):
     assert '"""Mine now."""' in text and "def count_images_2(" in text
 
 
+def test_a_function_another_widget_is_wired_to_is_never_replaced(demo):
+    """Review: a second button with the same label derived the same name,
+    and the planner offered to REPLACE the first button's (unedited) model
+    function — with a different signature, breaking the first button's
+    link the moment it was accepted."""
+    twin = mk("button", "Count images", 400, 120)
+    demo.shapes.append(twin)
+    assert generate(demo).ok
+    applied = dc.apply(dc.run(dc.plan(request(demo)), model_call=Script(GOOD),
+                              smoke=False))
+    assert applied.ok and applied.link["function"] == "count_images"
+    demo.button.script = applied.link
+    plan = dc.plan(request(demo, shape_id=twin.id, inputs=[],
+                           outputs={"status": "status"},
+                           instruction="say hello in the status label"))
+    assert plan.ok, plan.problems
+    assert plan.link["function"] == "count_images_2"
+    assert "earlier" not in plan.replacing
+    assert any("wired to it" in n for n in plan.notes), plan.notes
+    # The widget that owns it may still have it rewritten.
+    again = dc.plan(request(demo))
+    assert again.link["function"] == "count_images"
+    assert "earlier count_images() (unedited)" in again.replacing
+
+
+def test_a_new_handler_goes_into_the_class_not_after_a_helper():
+    """Review: a handler that did not exist yet (a widget drawn after the
+    last Generate) was appended at the END of handlers.py — after a
+    module-level helper it became a function nested inside that helper:
+    it parsed, passed policy, and the button did nothing."""
+    src = ('"""Handlers."""\nfrom __future__ import annotations\n\n\n'
+           'class HandlerMixin:\n'
+           '    def on_btn_a(self, *args) -> None:\n'
+           '        """TODO: implement."""\n'
+           '        pass\n\n\n'
+           'def helper(x):\n'
+           '    return x + 1\n')
+    method = dc.wrap_handler(
+        "def on_btn_new(self, *args) -> None:\n"
+        "    self.ports.status.set('hi')\n", "on_btn_new", "New", "say hi")
+    after = dc.splice_handler(src, "on_btn_new", method)
+    tree = ast.parse(after)
+    assert gui_emit.handler_text(after, "on_btn_new") is not None
+    helper = next(n for n in tree.body if isinstance(n, ast.FunctionDef))
+    assert [n.name for n in ast.walk(helper)
+            if isinstance(n, ast.FunctionDef)] == ["helper"]
+    assert after.rstrip().endswith("return x + 1")
+
+
 def test_a_smoke_failure_is_repaired_with_the_real_sandbox(demo, tmp_path):
     victim = tmp_path / "outside.txt"
     bad = f'''```python
