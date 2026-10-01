@@ -223,3 +223,25 @@ def test_the_models_tab_has_a_check_this_pc_button(qapp, tmp_path,
     assert actions.ran == "model-check-pc"
     tab.deleteLater()
     qapp.processEvents()
+
+
+def test_a_worker_finishing_after_its_window_closed_does_not_die(qapp):
+    """The all-tabs harness on this branch: the Models tab's model-assess
+    worker posted its result after the window's UiBridge was deleted, and
+    bridge.post raised "Signal source has been deleted" in the worker."""
+    import shiboken6
+    from council_qt.bridge import UiBridge
+    bridge = UiBridge()
+    shiboken6.delete(bridge)
+    errors = []
+
+    def worker():
+        try:
+            bridge.call_on_ui(lambda: None)
+        except Exception as exc:                          # noqa: BLE001
+            errors.append(exc)
+
+    t = threading.Thread(target=worker, name="late-worker")
+    t.start()
+    t.join(5)
+    assert errors == []
