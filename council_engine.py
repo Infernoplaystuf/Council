@@ -3060,12 +3060,21 @@ def _ollama_stream(host: str, name: str, messages: List[Dict[str, Any]], *,
                 break
             try:
                 obj = json.loads(a)
-            except ValueError:
+            except (ValueError, RecursionError):
+                continue
+            # Only an object is an Ollama chunk. Anything else on the line
+            # (a proxy's banner, a list, a bare string) used to raise
+            # AttributeError out of local_chat; it is skipped like a line
+            # that is not JSON at all.
+            if not isinstance(obj, dict):
                 continue
             if obj.get("error"):
                 raise RuntimeError(f"Ollama ({name}): {obj['error']}")
-            msg = obj.get("message") or {}
+            msg = obj.get("message")
+            msg = msg if isinstance(msg, dict) else {}
             tok = msg.get("content") or ""
+            if not isinstance(tok, str):
+                tok = str(tok)
             if tok:
                 if t_first is None:
                     t_first = last
@@ -3073,7 +3082,7 @@ def _ollama_stream(host: str, name: str, messages: List[Dict[str, Any]], *,
                 n_chunks += 1
                 if token_callback:
                     token_callback(tok)
-            if msg.get("tool_calls"):
+            if isinstance(msg.get("tool_calls"), list) and msg["tool_calls"]:
                 if t_first is None:
                     t_first = last
                 calls.extend(c for c in msg["tool_calls"] if isinstance(c, dict))
@@ -3435,11 +3444,17 @@ def _native_tool_calls(calls: List[Dict[str, Any]], names: List[str]
         args = fn.get("arguments")
         if isinstance(args, str):
             try:
-                args = json.loads(args)
-            except ValueError:
+                args = json.loads(args) if args.strip() else {}
+            except (ValueError, RecursionError):
                 args = {"_raw": args}
+        # The contract says a dict. A model can send a list, a number or a
+        # JSON string of one; the caller would then index a list by name.
+        if args is None:
+            args = {}
+        elif not isinstance(args, dict):
+            args = {"_raw": args}
         if name in names:
-            out.append({"name": name, "arguments": args or {}})
+            out.append({"name": name, "arguments": args})
     return out
 
 
@@ -3476,6 +3491,24 @@ def chat_tools(
         backend, name = _target_for(slot)
     except BackendUnavailable as exc:
         raise NotImplementedError(str(exc)) from exc
+    if backend == "gguf" and plain:
+        # Decide the backend NOW, the way _route_chat would: a slot whose
+        # GGUF cannot load (no llama_cpp — the council env — or no GGUF)
+        # moves to the localhost Ollama. Without this the FIRST call of a
+        # session was emulated (the move happened inside local_chat, after
+        # the native/emulated choice) and every later one native: on this
+        # PC's default setup the Docs role's first question took the other
+        # path. Loading here costs nothing extra — the call below would load
+        # the same model. With no Ollama either, nothing changes: the call
+        # below raises (or a test's stand-in answers) exactly as before.
+        try:
+            _slot_llm_and_lock(slot)
+        except BackendUnavailable as exc:
+            try:
+                name = _fallback_to_ollama(slot, exc)
+                backend = "ollama"
+            except BackendUnavailable:
+                pass
     if backend == "ollama" and plain:
         entry = local_models.ollama_model(name, max_age=60.0) or {}
         caps = entry.get("capabilities")
