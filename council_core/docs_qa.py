@@ -663,6 +663,12 @@ def retrieve(question: str, queries: Sequence[str], *,
         clients[spec.name] = (client, roles)
         out.servers_used += 1
         pkgs = list(packages) or list(spec.packages) or [""]
+        if spec.packages and packages and not set(packages) & set(
+                spec.packages):
+            # A server set up for simplnx is not asked about numpy because a
+            # model guessed "numpy" — the nxpython env has numpy too, and
+            # its pages would crowd out the ones the question needs.
+            pkgs = list(spec.packages)
         for q in queries:
             for pkg in pkgs[:3]:
                 _check_stop(should_stop)

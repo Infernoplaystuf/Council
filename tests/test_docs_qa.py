@@ -196,6 +196,13 @@ def test_a_reply_that_is_not_json_is_read_as_text(server):
     assert r.answer == "64 [1]" and r.cited == [1]
 
 
+def test_a_wrong_package_guess_does_not_redirect_a_dedicated_server(server):
+    model = Stub(q("ledger capacity", package="numpy"), ans("64 [1]"))
+    r = qa.ask("What is the default capacity of a Ledger?", servers=[server],
+               packages=(), model_call=model)
+    assert r.covered and r.sources[0].ref == "glimmerquay.Ledger"
+
+
 def test_a_server_someone_else_wrote_works_too():
     """Not the bundled server: JSON in the TEXT of its search result, and its
     own page tool. The roles are detected from its tool list."""
