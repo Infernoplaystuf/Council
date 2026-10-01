@@ -237,3 +237,152 @@ def test_apply_classifications_shapes_the_map_gui_spec_wants():
     cls = [gcl.Classification("s1", "treeview", 0.9, {"mode": "tree"})]
     assert gcl.apply_classifications(cls) == {
         "s1": {"kind": "treeview", "props": {"mode": "tree"}}}
+
+
+# ============================================================
+# Small local models
+# ============================================================
+
+class Model(Stub):
+    """A stub taking the keywords designer_project's call takes."""
+
+    def __init__(self, *replies):
+        super().__init__(*replies)
+        self.options = []
+
+    def __call__(self, prompt, *, json_schema=None, num_predict=None,
+                 temperature=None, seed=None):
+        self.options.append(dict(schema=json_schema, num_predict=num_predict,
+                                 temperature=temperature, seed=seed))
+        return super().__call__(prompt)
+
+
+def test_boxes_are_numbered_and_answers_map_back_by_number():
+    """A shape id is 32 hex characters and 32 tokens on phi3.5; ten boxes
+    cut a 700-token reply off. "box": 2 is one token and cannot be echoed
+    wrong into another box."""
+    stub = Stub(json.dumps({"shapes": [
+        {"box": 2, "kind": "entry", "confidence": 0.9},
+        {"box": 1, "kind": "button", "confidence": 0.95}]}))
+    a, b = generic("a" * 32), generic("b" * 32, x=300)
+    cls, _ = gcl.classify([a, b], None, stub)
+    assert {c.shape_id: c.kind for c in cls} == {a.id: "button",
+                                                 b.id: "entry"}
+    boxes = stub.prompts[0].split("BOXES", 1)[1]
+    assert "- box 1:" in boxes and "- box 2:" in boxes
+    assert a.id not in stub.prompts[0]
+
+
+def test_the_prompt_lists_every_kinds_props_and_names_no_toolkit():
+    stub = Stub(reply({"box": 1, "kind": "label", "confidence": 0.9}))
+    gcl.classify([generic("g1")], None, stub)
+    p = stub.prompts[0]
+    assert "Tkinter" not in p and "tkinter" not in p
+    assert "- treeview = a table (props.columns) or a tree — props: mode " \
+           "(table|tree)" in p
+    assert "command (" not in p, "callbacks are wired by generation"
+
+
+def test_a_list_prop_written_as_a_string_is_a_fault_not_characters():
+    """'values': 'Low,High' passed every check and filled the combobox with
+    L, o, w, ',', H, ..."""
+    stub = Stub(
+        reply({"box": 1, "kind": "combobox", "confidence": 0.9,
+               "props": {"values": "Low,High"}}),
+        reply({"box": 1, "kind": "combobox", "confidence": 0.9,
+               "props": {"values": ["Low", "High"]}}))
+    cls, _ = gcl.classify([generic("g1")], None, stub)
+    assert len(stub.prompts) == 2
+    assert "props.values must be a JSON list" in stub.prompts[1]
+    assert cls[0].props == {"values": ["Low", "High"]}
+
+
+def test_a_callback_prop_is_ignored_not_a_fault():
+    stub = Stub(reply({"box": 1, "kind": "button", "confidence": 0.9,
+                       "props": {"command": "on_go", "text": "Go"}}))
+    cls, _ = gcl.classify([generic("g1")], None, stub)
+    assert len(stub.prompts) == 1 and cls[0].props == {"text": "Go"}
+
+
+def test_each_call_gets_a_schema_over_the_boxes_asked_and_a_sized_reply():
+    model = Model(
+        reply({"box": 1, "kind": "entry", "confidence": 0.9},
+              {"box": 2, "kind": "holo_dial", "confidence": 0.9},
+              {"box": 3, "kind": "button", "confidence": 0.9}),
+        reply({"box": 2, "kind": "scale", "confidence": 0.9}))
+    gcl.classify([generic("a"), generic("b"), generic("c")], None, model)
+    first, second = model.options
+    assert first["schema"]["$defs"]["box"]["enum"] == [1, 2, 3]
+    assert second["schema"]["$defs"]["box"]["enum"] == [2], \
+        "the repair asks only about the box that failed"
+    assert first["num_predict"] == gcl.num_predict_for(3)
+    assert second["num_predict"] == gcl.num_predict_for(1)
+    assert first["seed"] is None and second["seed"] is not None
+
+
+def test_the_reply_budget_grows_with_the_boxes():
+    assert gcl.num_predict_for(1) == gcl.MIN_TOKENS
+    assert gcl.num_predict_for(10) > 700, "ten boxes no longer cut off"
+    assert gcl.num_predict_for(10_000) == gcl.MAX_TOKENS
+
+
+def test_answer_schema_admits_good_rows_and_refuses_bad_ones():
+    jsonschema = __import__("pytest").importorskip("jsonschema")
+    schema = gcl.answer_schema([1, 2])
+    jsonschema.validate({"shapes": [
+        {"box": 1, "kind": "treeview", "confidence": 0.9,
+         "props": {"columns": ["A", "B"]}}]}, schema)
+    for bad in ({"box": 3, "kind": "label", "confidence": 0.9},
+                {"box": 1, "kind": "generic", "confidence": 0.9},
+                {"box": 1, "kind": "label", "confidence": 0.95},
+                {"box": 1, "kind": "label", "confidence": 0.9,
+                 "props": {"colour_scheme": "x"}}):
+        with __import__("pytest").raises(jsonschema.ValidationError):
+            jsonschema.validate({"shapes": [bad]}, schema)
+
+
+def test_a_cut_off_reply_keeps_its_complete_rows():
+    """Truncated mid-row: the rows before the cut are answers, and only the
+    rest is asked again."""
+    full = reply({"box": 1, "kind": "entry", "confidence": 0.9},
+                 {"box": 2, "kind": "button", "confidence": 0.9},
+                 {"box": 3, "kind": "listbox", "confidence": 0.9})
+    cut = full[:full.index('"listbox"')]
+    stub = Stub(cut, reply({"box": 3, "kind": "listbox", "confidence": 0.9}))
+    cls, _ = gcl.classify([generic("a"), generic("b"), generic("c")], None,
+                          stub)
+    assert [c.kind for c in cls] == ["entry", "button", "listbox"]
+    assert len(stub.prompts) == 2
+    boxes = stub.prompts[1].split("BOXES", 1)[1]
+    assert "- box 3:" in boxes and "- box 1:" not in boxes
+
+
+def test_a_repeated_answer_is_never_asked_for_identically():
+    model = Model(reply({"box": 1, "kind": "holo_dial", "confidence": 0.9}))
+    gcl.classify([generic("g")], None, model, max_attempts=3)
+    asks = [(p, o["temperature"], o["seed"])
+            for p, o in zip(model.prompts, model.options)]
+    assert len(set(asks)) == 3
+    assert gcl.REPEAT_NOTE in model.prompts[2]
+
+
+def test_a_long_box_list_sheds_the_prop_detail_to_fit_the_window():
+    """Measured: 20 boxes with every kind's props are ~2,300 prompt tokens
+    plus a 1,376-token reply. Past the window the props go, never the
+    kinds, and a bigger window keeps them."""
+    boxes = [generic(f"g{i}", y=70 * i, label=f"Field {i}") for i in range(30)]
+    small = Stub(reply({"box": 1, "kind": "entry", "confidence": 0.9}))
+    gcl.classify(boxes, None, small, max_attempts=1)
+    big = Stub(reply({"box": 1, "kind": "entry", "confidence": 0.9}))
+    gcl.classify(boxes, None, big, max_attempts=1, n_ctx=16384)
+    assert "— props:" not in small.prompts[0]
+    assert "— props:" in big.prompts[0]
+    for k in gcl.CLASSIFIABLE:
+        assert f"\n- {k}" in small.prompts[0], k
+    assert gcl.fits(big.prompts[0], 30, 16384)
+
+
+def test_only_real_answers_are_persistable():
+    cls = [gcl.Classification("a", "entry", 0.9),
+           gcl.Classification("b", "label", 0.0, flagged=True)]
+    assert gcl.persistable(cls) == {"a": {"kind": "entry", "props": {}}}

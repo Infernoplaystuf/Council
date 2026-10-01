@@ -143,28 +143,44 @@ def describe_shape(s: Shape, container: Optional[Shape],
     return "\n".join(lines)
 
 
-def _catalogue() -> str:
+def _catalogue(detail: bool = True) -> str:
     """Every classifiable kind with its props and their types — the same
-    lines gui_describe shows a designing model, so the two agree."""
+    lines gui_describe shows a designing model, so the two agree. Without
+    ``detail``, the kinds alone (what a long box list sheds first)."""
     try:
         import gui_describe
         return gui_describe._catalogue(
-            True, CLASSIFIABLE,
+            detail, CLASSIFIABLE,
             "You may ONLY use these widget kinds, spelled exactly as written, "
-            "and only the props listed for each:")
+            "and only the props listed for each:" if detail else
+            "You may ONLY use these widget kinds, spelled exactly as "
+            "written:")
     except Exception:                    # pragma: no cover - always present
         return ("You may ONLY use these widget kinds, spelled exactly as "
                 "written:\n" + ", ".join(CLASSIFIABLE))
 
 
-def build_prompt(items: Sequence[str]) -> str:
+#: The window a prompt and its reply share when the caller does not say
+#: (gui_describe.N_CTX, the engine's default load). Measured: with every
+#: kind's props listed, 20 boxes estimate 2,311 prompt + 1,376 reply tokens;
+#: past that the prop detail is shed, as gui_describe sheds it.
+N_CTX, CHARS_PER_TOKEN, SLACK_TOKENS = 4096, 2.9, 256
+
+
+def fits(prompt: str, n_boxes: int, n_ctx: int = N_CTX) -> bool:
+    """Prompt (estimated) + the reply budget + template slack <= window."""
+    return (len(prompt) / CHARS_PER_TOKEN + num_predict_for(n_boxes)
+            + SLACK_TOKENS) <= n_ctx
+
+
+def build_prompt(items: Sequence[str], *, detail: bool = True) -> str:
     """The constrained request. The catalogue IS the vocabulary."""
     return f"""You are labelling boxes in a hand-drawn wireframe of a desktop app.
 
 Each box below is an UNTYPED rectangle, numbered. Decide which widget it was
 meant to be, using its label, note, size and position.
 
-{_catalogue()}
+{_catalogue(detail)}
 
 BOXES
 {chr(10).join(items)}
@@ -190,7 +206,7 @@ REPEAT_NOTE = ("You sent this same answer before. Change it this time: fix "
 
 
 def repair_prompt(items: Sequence[str], bad: Any, errors: Sequence[str],
-                  *, repeated: bool = False) -> str:
+                  *, repeated: bool = False, detail: bool = True) -> str:
     """One repair pass: hand the model its own output and the exact faults.
 
     Same shape as nx_generate.repair_prompt — showing the model what it
@@ -204,8 +220,15 @@ WHAT YOU RETURNED
 WHAT IS WRONG
 {chr(10).join('- ' + e for e in errors)}
 
-{build_prompt(items)}
+{build_prompt(items, detail=detail)}
 Fix every point above. Reply with ONLY the corrected JSON object."""
+
+
+def _prompt(make: Callable[..., str], n_boxes: int, n_ctx: int) -> str:
+    """``make(detail=True)``, or the kinds-only form when that does not fit
+    the window — never cut mid-catalogue."""
+    full = make(detail=True)
+    return full if fits(full, n_boxes, n_ctx) else make(detail=False)
 
 
 # ============================================================
@@ -374,7 +397,7 @@ def _call(model_call: Callable[..., str], prompt: str, **opts: Any) -> str:
 
 def classify(shapes: Sequence[Shape], layout_tree: Any = None,
              model_call: Optional[Callable[..., str]] = None, *,
-             max_attempts: int = 3
+             max_attempts: int = 3, n_ctx: Optional[int] = None
              ) -> Tuple[List[Classification], List[Question]]:
     """Type every generic shape. Returns (classifications, questions).
 
@@ -417,8 +440,10 @@ def classify(shapes: Sequence[Shape], layout_tree: Any = None,
     asked = list(wanted)
     seen: set = set()
     repeats = 0
+    window = int(n_ctx or N_CTX)
 
-    prompt = build_prompt(items)
+    prompt = _prompt(lambda detail: build_prompt(items, detail=detail),
+                     len(asked), window)
     attempts = max(1, max_attempts)
     for attempt in range(1, attempts + 1):
         opts: Dict[str, Any] = {
@@ -453,10 +478,12 @@ def classify(shapes: Sequence[Shape], layout_tree: Any = None,
         if attempt < attempts:
             asked = [i for i in wanted if i not in clean_ids] or list(wanted)
             remaining = [d for d, sid in zip(items, wanted) if sid in asked]
-            prompt = repair_prompt(remaining or items,
-                                   raw_payload if raw_payload is not None
-                                   else reply[:1000], errors,
-                                   repeated=repeated)
+            bad = raw_payload if raw_payload is not None else reply[:1000]
+            prompt = _prompt(
+                lambda detail: repair_prompt(remaining or items, bad, errors,
+                                             repeated=repeated,
+                                             detail=detail),
+                len(asked), window)
 
     results: List[Classification] = []
     questions: List[Question] = []

@@ -532,20 +532,22 @@ class _Parser:
         self._misplaced_props(raw, node, key)
         self._ignored_keys(raw, node, key)
 
-        if node.is_layout or kind == PAGE or kind in CONTAINER_KINDS:
+        holds = node.is_layout or kind == PAGE or kind in CONTAINER_KINDS
+        # A toolbar's "children" given as button captions were moved into
+        # props.buttons above; anything else under a widget is a mistake.
+        captions = kind == "toolbar" and all(isinstance(x, str)
+                                             for x in kids or [])
+        if holds:
             for i, child in enumerate(kids or []):
                 c = self.node(child, depth + 1, here, i)
                 if c is not None:
                     node.children.append(c)
-        elif kids and not (kind == "toolbar" and all(
-                isinstance(x, str) for x in kids)):
+        elif kids and not captions:
             self.faults.append(
                 f"{_short(here)}: a {kind} cannot hold other widgets — put "
                 f"them beside it in a row or column, or inside a frame")
-        else:
-            self.good += 1
-        if node.is_layout or kind == PAGE or kind in CONTAINER_KINDS:
-            self.good += 1
+            return node
+        self.good += 1
         return node
 
     def _misplaced_props(self, raw: Dict[str, Any], node: Node,

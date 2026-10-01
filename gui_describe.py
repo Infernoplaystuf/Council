@@ -77,8 +77,10 @@ What a 3.8-8B model gets instead is chosen by a Profile (profile_for):
     generated and run (examples/gui/qt_tests), each one gate-checked at the
     project's canvas before a model sees it, budgeted to the real window.
 
-describe() without a profile is exactly the behaviour above: one call per
-round, no keyword arguments to the model, today's single default example.
+describe() without a profile keeps the calls exactly as they were: pixel
+mode, one call per round, the prompt alone with no keyword arguments, and
+the 4096-token budget. Only the worked examples differ — chosen for the
+request, and image_viewer (the old fixed one) when nothing matches.
 """
 from __future__ import annotations
 
@@ -694,11 +696,12 @@ def _rescaled(raw: Dict[str, Any], canvas_w: int, canvas_h: int
     """An example in gui_examples._compact form, fitted to this canvas.
 
     Shrunk to fit, never stretched past the designer's own CANVAS_W x
-    CANVAS_H. MEASURED: image_viewer stretched to Typhon's 1504 x 1016 fails
-    the gate ('label "Frames on a bad timing" and entry overlap'), and so
-    does its own native 1280 x 800 — only its 1100 x 700 version passes. An
-    example drawn at 1100 x 700 is still a correct wireframe on a larger
-    canvas, in its top-left; the model is told the canvas size separately.
+    CANVAS_H: MEASURED, image_viewer stretched to Typhon's 1504 x 1016
+    fails the gate ('label "Frames on a bad timing" and entry overlap'), and
+    so does its own native 1280 x 800; its 1100 x 700 version passes at
+    1100 x 700. Whether a fitting passes at THIS canvas is _fitted's
+    question — gui_layout's tolerance grows with the canvas, so even the
+    1100 x 700 drawing does not pass at 1504 x 1016.
 
     Rescaled by EDGES, not by origin-and-size. Scaling y and h separately and
     snapping each rounds them independently, and on image_viewer it turned
@@ -1086,7 +1089,9 @@ def repair_prompt(text: str, bad: Any, errors: Sequence[str], *,
     prompt was checked, the repairs never were."""
     tail = "\n\nFix every point above. Reply with ONLY the corrected JSON object."
     budget = DEFAULT_BUDGET_CHARS if budget_chars is None else int(budget_chars)
-    where = ("" if mode == "tree" or gtree.looks_like_tree(bad) else
+    # Faults about a tree name nodes by their path; about a list of rows,
+    # by position — and only the latter needs saying how positions count.
+    where = ("" if gtree.looks_like_tree(bad) else
              " (shapes are numbered from 1, in the order you listed them)")
     prompt = ""
     for cap, bullets in _REPAIR_PLANS:

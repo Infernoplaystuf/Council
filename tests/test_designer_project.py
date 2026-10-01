@@ -601,3 +601,223 @@ def test_the_describe_call_is_budgeted_for_a_whole_wireframe():
     assert dp.DESCRIBE_ROLE == "coder"
     import gui_describe
     assert dp.DESCRIBE_NUM_PREDICT == gui_describe.REPLY_TOKENS
+
+
+# ============================================================
+# Small local models: the engine call, the profile, the classifier
+# ============================================================
+
+class _OldEngine:
+    """An engine from before the json_schema contract."""
+
+    def __init__(self):
+        self.calls = []
+
+    def local_chat(self, messages, *, temperature=0.2, num_predict=600,
+                   model=None, host=None, timeout=120, role=None):
+        self.calls.append(dict(temperature=temperature,
+                               num_predict=num_predict, timeout=timeout,
+                               role=role))
+        return "old"
+
+
+class _NewEngine(_OldEngine):
+    def local_chat(self, messages, *, temperature=0.2, num_predict=600,
+                   model=None, host=None, timeout=120, role=None,
+                   json_schema=None, seed=None, stop=None, should_stop=None):
+        self.calls.append(dict(temperature=temperature, role=role,
+                               num_predict=num_predict, seed=seed,
+                               json_schema=json_schema))
+        return "new"
+
+
+class _HiddenEngine(_OldEngine):
+    """Its signature says **kwargs, but the real callee is the old one."""
+
+    def local_chat(self, *args, **kwargs):
+        return _OldEngine.local_chat(self, *args, **kwargs)
+
+
+def test_contract_keywords_are_dropped_for_an_engine_without_them():
+    engine = _OldEngine()
+    assert dp.local_chat(engine, messages=[], role="coder", json_schema={},
+                         seed=3) == "old"
+    assert len(engine.calls) == 1, "no wasted generation on a TypeError"
+
+
+def test_contract_keywords_reach_an_engine_that_takes_them():
+    engine = _NewEngine()
+    assert dp.local_chat(engine, messages=[], json_schema={"a": 1},
+                         seed=7) == "new"
+    assert engine.calls[0]["json_schema"] == {"a": 1}
+    assert engine.calls[0]["seed"] == 7
+
+
+def test_a_hidden_signature_is_retried_once_without_the_keywords():
+    engine = _HiddenEngine()
+    assert dp.local_chat(engine, messages=[], json_schema={}) == "old"
+    assert len(engine.calls) == 1
+
+
+def test_the_describe_and_classify_calls_ask_the_coder_role(monkeypatch):
+    engine = _NewEngine()
+    monkeypatch.setitem(sys.modules, "council_engine", engine)
+    dp.describe_model_call("p", json_schema={"s": 1}, seed=2,
+                           temperature=0.5, num_predict=900)
+    dp.default_model_call("p", json_schema={"c": 1}, num_predict=2000)
+    d, c = engine.calls
+    assert (d["role"], d["seed"], d["temperature"], d["num_predict"]) == (
+        "coder", 2, 0.5, 900)
+    assert (c["role"], c["num_predict"]) == ("coder", 2000)
+    assert c["json_schema"] == {"c": 1}
+
+
+class _FakeSlots:
+    def __init__(self, path):
+        from council_core.model_slots import Slot, SlotConfig
+        self.cfg = SlotConfig({"main": Slot("main"),
+                               "small": Slot("small", path)},
+                              {"coder": "small"})
+
+    def current(self):
+        return self.cfg
+
+
+def _fake_engine(models=(), n_ctx=8192):
+    import types
+    eng = types.ModuleType("council_engine")
+    eng.list_local_models = lambda: list(models)
+    eng.effective_n_ctx = lambda slot="main": n_ctx
+    eng.read_gguf_metadata = lambda path: {}
+    return eng
+
+
+def test_the_role_model_is_read_from_the_slot_and_the_engine(monkeypatch):
+    from council_core import model_slots
+    monkeypatch.setattr(model_slots, "current",
+                        _FakeSlots("ollama:phi3.5").current)
+    monkeypatch.setitem(sys.modules, "council_engine", _fake_engine(
+        [{"id": "ollama:phi3.5", "name": "phi3.5", "params_b": 3.8}]))
+    info = dp.role_model("coder")
+    assert info["slot"] == "small" and info["params_b"] == 3.8
+    assert info["n_ctx"] == 8192 and info["name"] == "phi3.5"
+    prof = dp.describe_profile("a login form")
+    assert (prof.mode, prof.n_best, prof.n_ctx) == ("tree", 3, 8192)
+    assert "phi3.5" in prof.reason
+
+
+def test_without_list_local_models_the_size_comes_from_the_name(monkeypatch):
+    from council_core import model_slots
+    monkeypatch.setattr(model_slots, "current",
+                        _FakeSlots("ollama:llama3.1:8b").current)
+    eng = _fake_engine()
+    del eng.list_local_models
+    monkeypatch.setitem(sys.modules, "council_engine", eng)
+    assert dp.role_model("coder")["params_b"] == 8.0
+
+
+def test_the_profile_can_be_forced_for_measuring(monkeypatch):
+    from council_core import model_slots
+    monkeypatch.setattr(model_slots, "current",
+                        _FakeSlots("ollama:phi3.5").current)
+    monkeypatch.setitem(sys.modules, "council_engine", _fake_engine())
+    monkeypatch.setenv(dp.ENV_MODE, "pixel")
+    monkeypatch.setenv(dp.ENV_BEST_OF, "1")
+    monkeypatch.setenv(dp.ENV_CONSTRAINED, "0")
+    prof = dp.describe_profile("x")
+    assert (prof.mode, prof.n_best, prof.constrained) == ("pixel", 1, False)
+
+
+def test_the_engine_describe_path_detects_the_profile_and_reports_stats(
+        vault, monkeypatch):
+    """No model_call given: the profile comes from the role's model, the
+    schema reaches the engine, and the engine's own per-call stats (shared
+    contract) become one line of the result's notes."""
+    import json
+    from council_core import model_slots
+    monkeypatch.setattr(model_slots, "current",
+                        _FakeSlots("ollama:phi3.5").current)
+    eng = _fake_engine([{"id": "ollama:phi3.5", "params_b": 3.8}], 4096)
+    seen = []
+    tree = {"window": {"title": "Login"}, "layout": {
+        "kind": "column", "children": [
+            {"kind": "label", "label": "User"},
+            {"kind": "entry", "label": "User box"},
+            {"kind": "button", "label": "Sign in"}]}}
+
+    def local_chat(messages, *, temperature=0.2, num_predict=600, model=None,
+                   host=None, timeout=120, role=None, json_schema=None,
+                   seed=None, stop=None, should_stop=None):
+        seen.append(dict(schema=json_schema, seed=seed, role=role,
+                         num_predict=num_predict))
+        return json.dumps(tree)
+    eng.local_chat = local_chat
+    eng.last_call_stats = lambda role=None: {
+        "backend": "ollama", "model": "phi3.5", "prompt_tokens": 2000,
+        "gen_tokens": 120, "seconds": 3.0, "constrained": True}
+    monkeypatch.setitem(sys.modules, "council_engine", eng)
+    pdir = project(vault, name="q")
+    result = dp.describe("a login form", pdir)
+    assert result.ok, result.errors
+    assert result.mode == "tree" and len(seen) == 1
+    assert seen[0]["role"] == "coder" and seen[0]["seed"] == 1
+    assert "layout" in seen[0]["schema"]["properties"]
+    assert any(n.startswith("design: phi3.5 (3.8B): tree mode")
+               for n in result.notes)
+    assert any("1 of 1 schema-constrained" in n and "40.0 tok/s" in n
+               for n in result.notes)
+
+
+def _generic(label, x, y, w=200, h=60):
+    import uuid
+    from gui_shapes import GENERIC_KIND, Shape
+    return Shape(id=uuid.uuid4().hex, kind=GENERIC_KIND, x=x, y=y, w=w,
+                 h=h, label=label)
+
+
+def test_generate_writes_the_classifiers_answers_back_and_asks_once(vault):
+    """gui_classify promised a box is asked about once; nothing wrote the
+    answer down, so every Generate called the model again."""
+    import json
+    boxes = [_generic("Name", 40, 40), _generic("Save", 40, 140)]
+    pdir = project(vault, shapes=boxes)
+    calls = []
+
+    def model(prompt, *, json_schema=None, num_predict=None, **_kw):
+        calls.append((json_schema, num_predict))
+        return json.dumps({"shapes": [
+            {"box": 1, "kind": "entry", "confidence": 0.9},
+            {"box": 2, "kind": "button", "confidence": 0.5}]})
+
+    first = dp.generate("demo", boxes, pdir, vault, model_call=model)
+    assert first.ok, first.lines
+    assert len(calls) == 1 and calls[0][0]["properties"]["shapes"]
+    assert {v["kind"] for v in first.classified.values()} == {"entry",
+                                                              "button"}
+    saved = dp.open_named("demo", vault)
+    assert sorted(s.kind for s in saved.shapes) == ["button", "entry"]
+    entry = next(s for s in saved.shapes if s.kind == "entry")
+    assert entry.props["justify"] == "left", "catalogue defaults filled in"
+    project_file = gui_projects.open_project("demo", vault_dir=vault)
+    assert [c.shape_id for c in project_file.clarifications] == [
+        next(s.id for s in saved.shapes if s.kind == "button")], \
+        "the unsure answer is recorded as a clarification"
+    second = dp.generate("demo", saved.shapes, pdir, vault, model_call=model)
+    assert second.ok and len(calls) == 1, "the model was asked again"
+    assert any("no model call" in line for line in second.lines)
+
+
+def test_a_failed_classification_is_not_written_back(vault):
+    boxes = [_generic("???", 40, 40)]
+    pdir = project(vault, shapes=boxes)
+    result = dp.generate("demo", boxes, pdir, vault,
+                         model_call=lambda p: "no idea")
+    assert result.classified == {}
+    assert [s.kind for s in dp.open_named("demo", vault).shapes] == [
+        "generic"]
+
+
+def test_the_described_window_skips_the_placeholder_title():
+    assert dp.described_window({"title": "Untitled", "bg": "#112233",
+                                "fg": "", "font": ""}) == {"bg": "#112233"}
+    assert dp.described_window(None) == {}

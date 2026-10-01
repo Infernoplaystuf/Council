@@ -468,8 +468,12 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
             # is why the Designer works with no model loaded.
             first_pass = gui_layout.infer(shapes, project.canvas.w,
                                           project.canvas.h)
+            # The real window, so a long list of boxes keeps the props
+            # catalogue when it fits — only for the engine's own model.
+            window = None if model_call else _role_window(CLASSIFY_ROLE)
             classifications, out.questions = gui_classify.classify(
-                shapes, first_pass, model_call or default_model_call)
+                shapes, first_pass, model_call or default_model_call,
+                n_ctx=window)
             out.say(f"classified {len(classifications)} untyped shape(s)")
             shapes = _persist_classifications(
                 name, project, shapes, classifications, out, vault_dir)
@@ -958,6 +962,18 @@ def role_model(role: str = DESCRIBE_ROLE) -> Dict[str, Any]:
         except Exception:                                # noqa: BLE001
             pass
     return info
+
+
+def _role_window(role: str) -> Optional[int]:
+    """The context window ``role``'s model will have, or None. Never
+    raises; never loads a model (council_engine.effective_n_ctx)."""
+    try:
+        from . import model_slots
+        import council_engine
+        return int(council_engine.effective_n_ctx(
+            model_slots.slot_for_role(role)))
+    except Exception:                                    # noqa: BLE001
+        return None
 
 
 def _same_file(a: Any, b: Any) -> bool:

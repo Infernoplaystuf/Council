@@ -804,6 +804,86 @@ def test_the_suggested_title_is_reported_not_applied(tab, qapp):
     describe_with(tab, qapp, _Described(shapes=[mk()],
                                         window={"title": "Sign in"}))
     assert "suggested window title: 'Sign in'" in log_text(tab)
+    on_disk = tab.actions.open_named("demo").project.window
+    assert on_disk.title != "Sign in", "nothing is saved until Save"
+
+
+def test_the_described_window_style_goes_in_with_the_drawing_at_save(tab,
+                                                                     qapp):
+    """It was validated with the shapes and thrown away — the dropped
+    background colour gui_examples was written about."""
+    make_project(tab, "demo")
+    describe_with(tab, qapp, _Described(
+        shapes=[mk()], window={"title": "Sign in", "bg": "#1e1e2e",
+                               "fg": "", "font": "Arial 11"}))
+    assert "applied when you Save" in log_text(tab)
+    tab.on_save()
+    window = tab.actions.open_named("demo").project.window
+    assert (window.title, window.bg, window.font) == ("Sign in", "#1e1e2e",
+                                                      "Arial 11")
+    assert not tab.canvas.scene.dirty
+    assert "with the described window" in log_text(tab)
+
+
+def test_undoing_the_description_drops_its_window_style(tab, qapp):
+    make_project(tab, "demo", shapes=[mk(label="Mine")])
+    tab.answers["confirm"].append(True)
+    describe_with(tab, qapp, _Described(shapes=[mk(label="Theirs")],
+                                        window={"bg": "#ff00ff"}))
+    tab.canvas._obey(tab.canvas.scene.undo_once())
+    tab.on_save()
+    assert tab.actions.open_named("demo").project.window.bg == ""
+
+
+def test_stop_ends_a_description_in_progress(tab, qapp):
+    """A small model makes several calls; Stop reaches the worker."""
+    import threading
+    make_project(tab, "demo")
+    started = threading.Event()
+
+    def describe(name, text, should_stop=None):
+        started.set()
+        deadline = time.time() + 10
+        while not should_stop() and time.time() < deadline:
+            time.sleep(0.01)
+        return _Described(ok=False, errors=["stopped before the model was "
+                                            "asked again"])
+
+    tab.actions.describe = describe
+    tab.describe_view.setPlainText("a login form")
+    tab.on_describe()
+    assert started.wait(5)
+    assert tab.describe_stop_button.isEnabled()
+    t0 = time.time()
+    tab.on_stop_describe()
+    pump(qapp, tab)
+    assert time.time() - t0 < 2.0
+    assert "stopped before the model was asked again" in log_text(tab)
+    assert not tab.describe_stop_button.isEnabled()
+
+
+def test_generate_shows_the_classified_kinds_on_the_canvas(tab, qapp):
+    """Generate wrote them into the .gspec; a canvas still showing the
+    untyped boxes would write them back over the answers at the next Save."""
+    from council_core import designer_project as dp
+    from gui_shapes import GENERIC_KIND
+    make_project(tab, "demo", shapes=[mk(label="Name")])
+    box = tab.canvas.scene.shapes[0]
+    box.kind = GENERIC_KIND
+    tab.canvas.scene.mark_saved()
+
+    def generate(name, shapes):
+        return dp.GenerateResult(ok=True, lines=["classified 1"],
+                                 classified={box.id: {"kind": "entry",
+                                                      "props": {}}})
+    tab.actions.generate = generate
+    tab.actions.save = lambda name, shapes: dp.ProjectResult(True, "saved")
+    tab.on_generate()
+    pump(qapp, tab)
+    shape = tab.canvas.scene.shapes[0]
+    assert shape.kind == "entry" and shape.props["justify"] == "left"
+    assert "classified widget(s)" in log_text(tab)
+    assert not tab.canvas.scene.dirty, "the .gspec already has them"
 
 
 def test_a_description_for_a_project_no_longer_open_is_not_applied(tab, qapp):
