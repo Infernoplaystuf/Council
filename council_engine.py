@@ -166,6 +166,8 @@ def _ensure_localhost(url: str, *, allow_remote: bool = False) -> None:
 # json_schema is given. Only loopback hosts unless remote nodes are enabled.
 #   COUNCIL_OLLAMA_HOST=http://127.0.0.1:11434   COUNCIL_OLLAMA_MODEL=llama3.1:8b
 #   COUNCIL_OLLAMA_NUM_CTX=8192                  COUNCIL_OLLAMA_KEEP_ALIVE=30m
+#   COUNCIL_OLLAMA_LOAD_TIMEOUT=300  (seconds a call may wait for its first byte
+#   while Ollama loads/prefills; the caller's timeout is the stall limit after)
 #
 # Required env vars in GGUF mode:
 #   COUNCIL_BACKEND=gguf
@@ -2417,9 +2419,9 @@ def last_call_stats(role: Optional[str] = None) -> Dict[str, Any]:
     prompt_tok_s, constrained (bool — a schema or JSON grammar shaped the
     output). Also: constraint ('schema' | 'json' | 'none'), ttft_s (to the
     first token, prefill included), num_ctx, schema_valid / schema_errors
-    when a json_schema was given, load_s (Ollama: model load inside this
-    call), wait_s (GGUF: time spent waiting for another call on the same
-    model). A number that could not be measured is None.
+    when a json_schema was given, load_s (model load inside this call),
+    wait_s (GGUF: time spent waiting for another call on the same model).
+    A number that could not be measured is None.
     """
     with _STATS_LOCK:
         s = _LAST_STATS.get(_ANY_ROLE if role is None else role)
@@ -2553,6 +2555,9 @@ def _gguf_generate(
         raise GenerationCancelled("stopped before the call started")
     t_start = _time.monotonic()
     llm, lock = _slot_llm_and_lock(slot)
+    # The first call of a session LOADS the model here (seconds); that is
+    # load_s, not wait_s — wait_s is another call holding the model.
+    t_loaded = _time.monotonic()
     grammar, gkind = (None, "none")
     if json_schema is not None:
         grammar, gkind = _grammar_for_schema(json_schema)
@@ -2671,7 +2676,8 @@ def _gguf_generate(
         "backend": "gguf", "model": _slot_model_label(slot),
         "prompt_tokens": prompt_tokens, "gen_tokens": n_tok,
         "seconds": round(t_end - t_start, 3),
-        "wait_s": round(t_locked - t_start, 3),
+        "wait_s": round(t_locked - t_loaded, 3),
+        "load_s": round(t_loaded - t_start, 3),
         "ttft_s": round(ttft, 3) if ttft is not None else None,
         "gen_tok_s": _rate(n_tok - 1, gen_window),
         "prompt_tok_s": _rate(prompt_tokens, ttft),
@@ -2760,6 +2766,22 @@ def _ollama_keep_alive() -> str:
     """How long Ollama keeps the model loaded after a call. 30 minutes: a
     reload costs seconds every time, and a council turn is many calls."""
     return os.environ.get("COUNCIL_OLLAMA_KEEP_ALIVE", "").strip() or "30m"
+
+
+#: Seconds an Ollama call may wait for its FIRST byte (evict + load +
+#: prefill) before the stall limit applies — see _ollama_stream. Five
+#: minutes: 83 s measured for a cold gpt-oss:20b here, and a model read from
+#: a slower disk takes longer; a hung server is the rare case, and Stop
+#: works throughout.
+_DEFAULT_OLLAMA_LOAD_ALLOWANCE = 300.0
+
+
+def _ollama_load_allowance() -> float:
+    raw = os.environ.get("COUNCIL_OLLAMA_LOAD_TIMEOUT", "").strip()
+    try:
+        return max(0.0, float(raw)) if raw else _DEFAULT_OLLAMA_LOAD_ALLOWANCE
+    except ValueError:
+        return _DEFAULT_OLLAMA_LOAD_ALLOWANCE
 
 
 def _ollama_count(text: str) -> int:
@@ -2970,6 +2992,15 @@ def _ollama_stream(host: str, name: str, messages: List[Dict[str, Any]], *,
     u = urllib.parse.urlsplit(host)
     path = (u.path or "").rstrip("/") + "/api/chat"
     stall = float(timeout) if timeout and float(timeout) > 0 else None
+    # Before the FIRST line the limit is the cold-start allowance, not the
+    # stall limit: Ollama sends nothing while it evicts, loads and prefills,
+    # and on this PC that is minutes, not seconds (measured 2026-10-01 on the
+    # RTX 4070 Laptop: gpt-oss:20b 7 s evict + 63.6 s load + 11.8 s prefill
+    # = no byte for 83 s, so local_chat(timeout=90) failed on every cold
+    # first call and threw the load away; llama3.1:8b 45 s, against the 45 s
+    # timeouts of council_gui_engine's callers). The GGUF path does not count
+    # its load or prefill either. Stop still works throughout.
+    first_wait = max(stall, _ollama_load_allowance()) if stall else None
     q: "queue.Queue" = queue.Queue()
     box: Dict[str, Any] = {"conn": None}
     t_start = _time.monotonic()
@@ -2980,7 +3011,7 @@ def _ollama_stream(host: str, name: str, messages: List[Dict[str, Any]], *,
             cls = (http.client.HTTPSConnection if u.scheme == "https"
                    else http.client.HTTPConnection)
             conn = cls(u.hostname, u.port,
-                       timeout=(stall + 30.0) if stall else None)
+                       timeout=(first_wait + 30.0) if first_wait else None)
             box["conn"] = conn
             # Keep the SOCKET, not just the connection: on an HTTP/1.0 or
             # closing response http.client hands the socket to the response
@@ -3034,6 +3065,7 @@ def _ollama_stream(host: str, name: str, messages: List[Dict[str, Any]], *,
     n_chunks = 0
     t_first: Optional[float] = None
     last = _time.monotonic()
+    started = False
     try:
         while True:
             try:
@@ -3042,13 +3074,18 @@ def _ollama_stream(host: str, name: str, messages: List[Dict[str, Any]], *,
                 if should_stop is not None and should_stop():
                     raise GenerationCancelled("stopped by the caller",
                                               "".join(pieces))
-                if stall and _time.monotonic() - last > stall:
+                limit = stall if started else first_wait
+                if limit and _time.monotonic() - last > limit:
+                    what = (f"sent nothing for {limit:.0f} s" if started else
+                            f"did not start answering within {limit:.0f} s "
+                            "(loading or prefilling the model; "
+                            "COUNCIL_OLLAMA_LOAD_TIMEOUT raises the limit)")
                     raise LocalChatTimeout(
-                        f"Ollama ({name}) sent nothing for {stall:.0f} s; "
-                        "the request was cancelled, not re-sent.",
-                        "".join(pieces))
+                        f"Ollama ({name}) {what}; the request was "
+                        "cancelled, not re-sent.", "".join(pieces))
                 continue
             last = _time.monotonic()
+            started = True
             if kind == "http":
                 raise _OllamaHTTPError(a, b)
             if kind == "error":
@@ -3303,7 +3340,9 @@ def local_chat(
     either way, so a caller's own parsing stays the fallback when a backend
     cannot constrain (constraint 'json' or 'none' in the stats). ``seed`` and
     ``stop`` pass through. ``timeout`` is a stall limit: seconds with no new
-    output (never a re-send). ``should_stop()`` is polled between tokens and
+    output (never a re-send); the wait for the FIRST output — a model load
+    and prefill — is not counted (GGUF) or gets COUNCIL_OLLAMA_LOAD_TIMEOUT,
+    300 s by default (Ollama). ``should_stop()`` is polled between tokens and
     raises GenerationCancelled. ``model`` "ollama:<name>" overrides the
     role's model for this call (any other value is ignored, as before);
     ``host`` names the Ollama server (loopback only unless remote nodes are

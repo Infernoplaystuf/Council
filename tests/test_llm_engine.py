@@ -299,8 +299,12 @@ def test_should_stop_works_while_the_model_is_still_loading(eng):
     assert time.perf_counter() - t0 < 1.5
 
 
-def test_a_stalled_server_times_out_once_and_is_not_re_sent(eng):
+def test_a_stalled_server_times_out_once_and_is_not_re_sent(eng,
+                                                            monkeypatch):
     _slots(eng, {"a": {"path": "ollama:llama3.1:8b"}}, {"coder": "a"})
+    # The first byte gets the cold-start allowance (see
+    # test_llm_engine_review); squeeze it to the stall limit here.
+    monkeypatch.setenv("COUNCIL_OLLAMA_LOAD_TIMEOUT", "0.5")
     eng.fake.state.first_delay = 3.0
     t0 = time.perf_counter()
     with pytest.raises(TimeoutError):

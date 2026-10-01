@@ -179,6 +179,77 @@ def test_tool_choice_schema_does_not_change_the_callers_tools():
 
 
 # ============================================================
+# The stall timeout and a cold model load
+# ============================================================
+
+def test_a_cold_model_load_is_not_a_stall(eng):
+    """Ollama sends NOTHING while it loads and prefills: measured here, a
+    cold gpt-oss:20b gave no byte for 83 s, so local_chat(timeout=90) failed
+    every first call (and llama3.1:8b's 45 s cold start met the 45 s
+    timeouts of council_gui_engine's callers)."""
+    _slots(eng, {"a": {"path": "ollama:llama3.1:8b"}}, {"coder": "a"})
+    eng.fake.state.first_delay = 1.2               # "loading"
+    out = eng.ce.local_chat(MSGS, role="coder", timeout=0.4)
+    assert out == "Hello from the fake."
+    assert len(eng.fake.state.chats) == 1
+
+
+def test_a_stall_after_the_first_byte_still_times_out(eng):
+    _slots(eng, {"a": {"path": "ollama:llama3.1:8b"}}, {"coder": "a"})
+    eng.fake.state.reply = "abcd" * 3
+    eng.fake.state.token_delay = 1.5               # stuck mid-answer
+    t0 = time.perf_counter()
+    with pytest.raises(TimeoutError) as info:
+        eng.ce.local_chat(MSGS, role="coder", timeout=0.4)
+    assert time.perf_counter() - t0 < 1.4
+    assert info.value.partial == "abcd"
+    assert len(eng.fake.state.chats) == 1          # never re-sent
+
+
+def test_the_cold_start_allowance_is_bounded(eng, monkeypatch):
+    _slots(eng, {"a": {"path": "ollama:llama3.1:8b"}}, {"coder": "a"})
+    monkeypatch.setenv("COUNCIL_OLLAMA_LOAD_TIMEOUT", "0.6")
+    eng.fake.state.first_delay = 3.0               # a hung server
+    t0 = time.perf_counter()
+    with pytest.raises(TimeoutError, match="did not start answering"):
+        eng.ce.local_chat(MSGS, role="coder", timeout=0.2)
+    assert 0.5 < time.perf_counter() - t0 < 1.5
+
+
+def test_gguf_load_time_is_not_reported_as_waiting_for_the_model(
+        tmp_path, monkeypatch):
+    """Measured with phi3.5 in system Python: the first call's 4.2 s model
+    load was reported as wait_s — 'another call held the model'."""
+    import sys
+    from types import SimpleNamespace
+    import council_engine as ce
+    from tests.test_llm_engine import StreamLlama
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    model = tmp_path / "m.gguf"
+    model.write_bytes(b"x")
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(vault))
+    monkeypatch.setenv("COUNCIL_GGUF_PATH", str(model))
+
+    def slow_load(p, **kw):
+        time.sleep(0.4)
+        return StreamLlama(p, 4096)
+
+    monkeypatch.setitem(sys.modules, "llama_cpp", SimpleNamespace(Llama=None))
+    monkeypatch.setattr(ce, "_load_gguf", slow_load)
+    ce.refresh_backend_config()
+    try:
+        ce.local_chat(MSGS)
+        st = ce.last_call_stats()
+        assert st["backend"] == "gguf"
+        assert st["load_s"] >= 0.35 and st["wait_s"] < 0.2, st
+        ce.local_chat(MSGS)
+        assert ce.last_call_stats()["load_s"] < 0.2       # already loaded
+    finally:
+        ce.refresh_backend_config()
+
+
+# ============================================================
 # The first chat_tools call of a session
 # ============================================================
 
