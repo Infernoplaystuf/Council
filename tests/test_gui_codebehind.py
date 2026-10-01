@@ -333,6 +333,51 @@ def test_reaching_into_the_interpreter_or_rebinding_a_module_is_refused(
     assert cand.stage == gcb.STAGE_POLICY, (cand.stage, cand.faults)
 
 
+@pytest.mark.parametrize("body,why", [
+    ("import concurrent.futures as cf\n"
+     "    with cf.ProcessPoolExecutor() as ex:\n"
+     "        list(ex.map(len, [folder]))", "worker processes"),
+    ("from concurrent.futures import ThreadPoolExecutor\n"
+     "    with ThreadPoolExecutor() as ex:\n"
+     "        list(ex.map(len, [folder]))", "worker processes"),
+    ("import _thread\n    _thread.start_new_thread(print, ('x',))",
+     "worker processes"),
+    ("from os import _exit\n    _exit(0)", "exit()"),
+    ("import os\n    os.abort()", "exit()"),
+    ("import atexit\n    atexit.register(print, 'bye')", "atexit"),
+    ("import _winapi\n    _winapi.GetCurrentProcess()", "_winapi"),
+    ("import _ctypes", "_ctypes"),
+    ("import signal\n    signal.raise_signal(2)", "signal"),
+])
+def test_workers_exits_and_low_level_modules_are_refused(body, why):
+    """Review: each passed every static gate. A ProcessPoolExecutor's worker
+    is a second Python the smoke fence never sees (and, in the app, work
+    the window cannot report); _exit/abort end the app (and ended the smoke
+    run before the harness answered); atexit, signal, _winapi and _ctypes
+    are the OS's and the interpreter's hooks, which code behind a widget
+    has no use for — gui_policy denies ctypes, not the module under it."""
+    reply = fence(f"def count_images(folder):\n    {body}\n"
+                  f"    return {{'status': '', 'files': []}}")
+    cand = gcb.check(reply, fn_target())
+    assert cand.stage == gcb.STAGE_POLICY, (cand.stage, cand.faults)
+    assert any(why in f for f in cand.faults), cand.faults
+
+
+def test_abort_on_something_else_is_not_an_exit():
+    reply = fence('''
+def count_images(folder):
+    import os
+
+    class Job:
+        def abort(self):
+            return None
+    Job().abort()
+    names = sorted(os.listdir(folder))
+    return {"status": str(len(names)), "files": names}''')
+    cand = gcb.check(reply, fn_target())
+    assert cand.stage == gcb.STAGE_SMOKE, cand.faults
+
+
 def test_ordinary_attributes_and_numpy_stack_are_not_introspection():
     reply = fence('''
 def count_images(folder):
@@ -789,6 +834,18 @@ def test_a_soft_pass_is_still_offered_when_no_sample_does_better():
     assert any("no frames" in n for n in res.notes)
 
 
+def test_a_held_soft_pass_survives_a_later_sample_failing():
+    """Review: the soft pass held for a cleaner sample was dropped when the
+    NEXT sample's model call raised (a timeout) — a candidate that passed
+    every gate, and was offered before the hold existed, became 'the model
+    call failed' with nothing to accept."""
+    model = Script(SOFT, RuntimeError("timed out"))
+    res = gcb.write(fn_target(), model, smoke=SoftSmoke(".tif"), n_best=3)
+    assert res.ok and ".tif" in res.code, res.errors
+    assert res.attempts == 2
+    assert any("timed out" in n for n in res.notes), res.notes
+
+
 def test_a_smoke_runner_that_raises_does_not_break_the_promise():
     def boom(_cand):
         raise OSError("sandbox gone")
@@ -808,6 +865,25 @@ def test_an_instruction_too_long_for_the_window_is_refused_before_any_call():
     assert not res.ok and model.calls == [] and res.attempts == 0
     assert "too long" in res.errors[0]
     assert gcb.write(fn_target(), Script(GOOD)).ok      # a normal one fits
+
+
+def test_too_many_ports_is_not_blamed_on_a_short_instruction():
+    """Review: handler mode on a 120-port window with the instruction
+    'enable the save button' was refused as 'the instruction is too long —
+    say it in a few sentences'. The ports were what did not fit, and the
+    way out is to name the widgets it uses (only those are then listed)."""
+    ports = [gcb.PortRow(f"field_{i:03d}", "entry", "str", "var", "",
+                         f"Field {i}") for i in range(120)]
+    model = Script(GOOD)
+    res = gcb.write(h_target(ports=ports,
+                             instruction="enable the save button"), model)
+    assert not res.ok and model.calls == []
+    assert "120 ports" in res.errors[0] and "too long" not in res.errors[0]
+    # Naming the ones it uses lists only those, and it fits.
+    named = h_target(ports=ports, instruction="copy field_001 into field_002")
+    model = Script(GOOD)
+    gcb.write(named, model)
+    assert len(model.calls) >= 1
 
 
 def test_an_empty_instruction_or_no_outputs_is_refused_before_any_call():

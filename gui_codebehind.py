@@ -166,6 +166,22 @@ INTROSPECTION_ATTRS = frozenset({
     "addaudithook", "f_locals", "f_globals", "f_back", "f_builtins",
     "f_trace", "tb_frame", "gi_frame", "cr_frame", "ag_frame"})
 INTROSPECTION_MODULES = frozenset({"gc", "sys.monitoring"})
+
+#: Modules gui_policy admits as stdlib that code behind a widget has no use
+#: for: the OS's process/handle layer (_winapi, nt, posix, msvcrt,
+#: _posixsubprocess), the C half of ctypes (gui_policy denies ctypes by
+#: name, not _ctypes), and the hooks that run code later or elsewhere —
+#: atexit, signal, faulthandler. Each also ran outside the smoke fence's
+#: view (an exit handler after it, a signal around it).
+LOW_LEVEL_MODULES = frozenset({"_winapi", "nt", "posix", "msvcrt",
+                               "_posixsubprocess", "_ctypes", "atexit",
+                               "signal", "faulthandler"})
+#: Threads and worker processes by any spelling: a ProcessPoolExecutor's
+#: worker is a second Python no fence watches, and in the app the window
+#: cannot report what a worker raises.
+WORKER_MODULES = frozenset({"_thread", "concurrent"})
+WORKER_NAMES = frozenset({"Thread", "ThreadPoolExecutor",
+                          "ProcessPoolExecutor", "start_new_thread"})
 #: inspect's frame-returning calls, by receiver (np.stack is not one).
 INSPECT_FRAMES = frozenset({"stack", "trace", "currentframe",
                             "getouterframes", "getinnerframes", "getframeinfo"})
@@ -1070,6 +1086,12 @@ def _reports(handler: ast.ExceptHandler) -> bool:
     return False
 
 
+_NO_EXIT = ("no exit() — it would close the whole app; raise ValueError "
+            "instead")
+_NO_WORKERS = ("no threads or worker processes — return the result; the app "
+               "decides where it runs")
+
+
 def policy_faults(code: str, target: Target) -> List[str]:
     """Gate 2: gui_policy (the gate Run enforces) and what code behind a GUI
     must not do even where an app may."""
@@ -1096,10 +1118,24 @@ def policy_faults(code: str, target: Target) -> List[str]:
             elif r.startswith("matplotlib.pyplot"):
                 faults.append(f"line {line}: no matplotlib.pyplot (it opens "
                               f"windows) — use matplotlib.figure.Figure")
+            elif r.split(".")[0] in WORKER_MODULES:
+                faults.append(f"line {line}: {_NO_WORKERS}")
+            elif r.split(".")[0] in LOW_LEVEL_MODULES:
+                faults.append(f"line {line}: no {r.split('.')[0]} — code "
+                              f"behind a widget has no use for the OS's or "
+                              f"the interpreter's low-level hooks; return "
+                              f"values instead")
         if isinstance(node, ast.ImportFrom) and node.module == "matplotlib" \
                 and any(a.name == "pyplot" for a in node.names):
             faults.append(f"line {line}: no matplotlib.pyplot — use "
                           f"matplotlib.figure.Figure")
+        if isinstance(node, ast.ImportFrom) and not node.level:
+            for a in node.names:
+                if a.name in WORKER_NAMES:
+                    faults.append(f"line {line}: {_NO_WORKERS}")
+                elif a.name in ("_exit", "abort", "exit") and \
+                        (node.module or "") in ("os", "sys", "nt", "posix"):
+                    faults.append(f"line {line}: {_NO_EXIT}")
         if isinstance(node, (ast.Global, ast.Nonlocal)):
             faults.append(f"line {line}: no global/nonlocal — use local "
                           f"variables and return the result")
@@ -1113,9 +1149,9 @@ def policy_faults(code: str, target: Target) -> List[str]:
                 faults.append(f"line {line}: no input() — the values come "
                               f"from the parameters")
             elif name in ("exit", "quit") and isinstance(f, ast.Name) or (
-                    name in ("exit", "_exit") and recv in ("sys", "os")):
-                faults.append(f"line {line}: no exit() — it would close the "
-                              f"whole app; raise ValueError instead")
+                    name == "_exit") or (
+                    name in ("exit", "abort") and recv in ("sys", "os")):
+                faults.append(f"line {line}: {_NO_EXIT}")
             elif name == "chdir":
                 faults.append(f"line {line}: no chdir — it changes the whole "
                               f"app's working folder; use full paths")
@@ -1125,9 +1161,8 @@ def policy_faults(code: str, target: Target) -> List[str]:
                     node.args[0].value > 1:
                 faults.append(f"line {line}: no sleep({node.args[0].value}) — "
                               f"the window is frozen while this runs")
-            elif name == "Thread" or (recv == "threading"):
-                faults.append(f"line {line}: no threads — return the result; "
-                              f"the app decides where it runs")
+            elif name in WORKER_NAMES or recv in ("threading", "_thread"):
+                faults.append(f"line {line}: {_NO_WORKERS}")
         elif isinstance(node, ast.While) and _always_true(node.test):
             if not any(isinstance(n, (ast.Break, ast.Return, ast.Raise))
                        for n in ast.walk(node)):
@@ -1870,10 +1905,20 @@ def _write(res: CodeResult, target: Target, model_call, smoke, catalogue,
         # left is the instruction (or, in handler mode, the ports it names).
         # Sent anyway, the engine's clamp cuts the MIDDLE out of the one
         # message — the signature — on every call of the loop.
-        res.errors = [f"the instruction is too long for the model's window "
-                      f"(the prompt would be {len(prompt)} characters; about "
-                      f"{budget} fit beside the reply) — say it in a few "
-                      f"sentences"]
+        size = (f"(the prompt would be {len(prompt)} characters; about "
+                f"{budget} fit beside the reply)")
+        if target.mode == "handler" and \
+                len(target.instruction) < budget // 3:
+            # A short instruction on a big window: the port list is what
+            # does not fit, and it shrinks to the ports the task names.
+            res.errors = [f"this window has {len(target.ports)} ports — too "
+                          f"many to list in the model's window {size}. Name "
+                          f"the widgets it should use in the instruction "
+                          f"(only those are then listed), or use Function "
+                          f"mode"]
+        else:
+            res.errors = [f"the instruction is too long for the model's "
+                          f"window {size} — say it in a few sentences"]
         return
     if shed:
         res.notes.append("to fit the model's context the prompt left out: "
@@ -1921,6 +1966,13 @@ def _write(res: CodeResult, target: Target, model_call, smoke, catalogue,
                 # not a model failure.
                 res.stopped = True
                 res.errors = ["stopped"]
+            elif fallback is not None:
+                # A held soft pass passed every gate; a later sample's
+                # failure does not take it away.
+                fallback.notes.append(f"a further sample was not drawn — "
+                                      f"the model call failed: {exc!r}")
+                _accept(res, fallback)
+                return
             else:
                 res.errors = [f"the model call failed: {exc!r}"]
             if best is not None:
