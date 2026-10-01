@@ -1037,6 +1037,12 @@ class DesignerTab(ViewHelpers, QWidget):
                      "drawn onto its canvas, in its toolkit.")
             return
         name = self.project
+        if self._busy:
+            # Checked before the stop flag is replaced: replacing it under a
+            # describe already running would leave Stop pointing at a job
+            # that never started.
+            self.log("Already working — wait for it to finish.")
+            return
         stop = threading.Event()
         self._describe_stop = stop
         describe = self.actions.describe

@@ -854,6 +854,10 @@ def test_stop_ends_a_description_in_progress(tab, qapp):
     tab.on_describe()
     assert started.wait(5)
     assert tab.describe_stop_button.isEnabled()
+    # A second Draw it while the first runs must not swap the stop flag out
+    # from under it — Stop would then reach a job that never started.
+    tab.on_describe()
+    assert "Already working" in log_text(tab)
     t0 = time.time()
     tab.on_stop_describe()
     pump(qapp, tab)

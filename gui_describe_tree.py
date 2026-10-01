@@ -79,8 +79,10 @@ LAYOUT_KINDS = (ROW, COLUMN)
 #: Deeper than this is a mistake, not a window. Measured on the qt_tests
 #: wireframes, the deepest (b_nested_containers, b_notebook_tabs) need four.
 MAX_DEPTH = 6
-#: Per list. Bounds the grammar and the reply, not a design limit.
-MAX_CHILDREN = 16
+#: Per list. Bounds the grammar and the reply, not a design limit: a
+#: 20-row form in one column must still be writable (the qt_tests forms
+#: have 9), and the reply budget is what really caps a tree's size.
+MAX_CHILDREN = 24
 MAX_PAGES = 8
 #: Shapes a tree may expand to (pages count). gui_describe.MAX_SHAPES is the
 #: same number and a test pins the two together.
