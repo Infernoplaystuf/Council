@@ -712,13 +712,18 @@ def _plan_function(out: Plan, req: Request, target: Any, spec: Any, w: Any,
     logic = pdir / gcb.LOGIC_FILE
     before = logic.read_text(encoding="utf-8", errors="replace") \
         if logic.is_file() else ""
+    if _parse_problem(before, gcb.LOGIC_FILE, out):
+        return
     taken = set(gcb.top_level_names(before))
     ai = dict(getattr(manifest, "ai_handlers", {}) or {})
     wanted = (req.function.strip()
               or (link.get("function") if link.get("module") == gcb.MODULE
                   else "")
               or function_name(out.label, req.instruction, w.name))
-    if not wanted.isidentifier():
+    import keyword
+    # "class" is an identifier to isidentifier() and `def class(` never
+    # parses: every candidate would fail the shape gate.
+    if not wanted.isidentifier() or keyword.iskeyword(wanted):
         out.problems.append(f"{wanted!r} is not a valid function name.")
         return
     name, replacing = wanted, "nothing — a new function in logic.py"
@@ -758,6 +763,21 @@ def _plan_function(out: Plan, req: Request, target: Any, spec: Any, w: Any,
                 "outputs": {o.port: o.key for o in outs}}
 
 
+def _parse_problem(source: str, filename: str, out: Plan) -> bool:
+    """Refuse a file that does not parse before any model is asked: every
+    candidate is spliced into it and smoke-run with it, so each would fail
+    on a line the model was never shown, and the repairs would be spent on
+    it."""
+    try:
+        ast.parse(source or "")
+    except SyntaxError as exc:
+        out.problems.append(f"{filename} does not parse (line {exc.lineno}: "
+                            f"{exc.msg}) — fix it first; the model's code "
+                            f"goes into that file.")
+        return True
+    return False
+
+
 def _links_to(script: Any, function: str) -> bool:
     """Whether a widget's script link calls logic.<function>."""
     import gui_codebehind as gcb
@@ -783,7 +803,18 @@ def _plan_handler(out: Plan, req: Request, target: Any, spec: Any, w: Any,
                             "not exist yet.")
         return
     before = handlers.read_text(encoding="utf-8", errors="replace")
+    if _parse_problem(before, "handlers.py", out):
+        return
     name = w.handler
+    copies = gui_emit._handler_methods(ast.parse(before))[0].get(name, [])
+    if len(copies) > 1:
+        # handler_text() is None for this, which would read as "new" — and
+        # a third copy appended last would win over the user's.
+        out.problems.append(
+            f"{name} is defined more than once in handlers.py (lines "
+            f"{', '.join(str(a) for a, _b in copies)}) — keep one, then "
+            f"try again.")
+        return
     current = gui_emit.handler_text(before, name)
     ai = dict(getattr(manifest, "ai_handlers", {}) or {})
     if current is None:

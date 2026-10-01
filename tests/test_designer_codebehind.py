@@ -540,6 +540,50 @@ def test_handler_mode_refuses_a_wired_widget_and_a_missing_handlers_py(
     assert not plan.ok and "Generate the project first" in plan.problems[0]
 
 
+def test_a_file_that_does_not_parse_is_refused_before_any_model_call(demo):
+    """Review: a half-written logic.py (the user's, elsewhere in the file)
+    made every candidate's smoke run fail on the import, and the loop spent
+    all its repairs asking the model to fix a line it was never shown."""
+    (demo.pdir / "logic.py").write_text("def mine(:\n    pass\n",
+                                        encoding="utf-8")
+    model = Script(GOOD)
+    plan = dc.plan(request(demo))
+    assert not plan.ok and "logic.py does not parse" in plan.problems[0]
+    review = dc.run(plan, model_call=model)
+    assert model.prompts == [] and not review.ok
+    path = demo.pdir / "handlers.py"
+    path.write_text(path.read_text(encoding="utf-8") + "\ndef broken(:\n",
+                    encoding="utf-8")
+    plan = dc.plan(handler_request(demo))
+    assert not plan.ok and "handlers.py does not parse" in plan.problems[0]
+
+
+def test_a_keyword_typed_as_the_function_name_is_refused(demo):
+    """Review: the Wiring group's function box is editable; 'class' passed
+    isidentifier() and `def class(` failed every candidate's shape gate."""
+    plan = dc.plan(request(demo, function="class"))
+    assert not plan.ok and "not a valid function name" in plan.problems[0]
+
+
+def test_a_handler_defined_twice_is_not_treated_as_new(demo):
+    """Review: with the handler defined twice (one copy hand-edited),
+    handler_text() is None, so the planner called it 'new' and appended a
+    third — the last definition wins in a class body, so the model's code
+    silently replaced the user's."""
+    path = demo.pdir / "handlers.py"
+    src = path.read_text(encoding="utf-8")
+    mine = ("    def on_btn_count_images(self, *args) -> None:\n"
+            "        self.ports.status.set('mine')\n")
+    head, sep, tail = src.partition("class HandlerMixin")
+    lines = (sep + tail).split("\n")
+    lines.insert(1, mine)
+    path.write_text(head + "\n".join(lines), encoding="utf-8")
+    assert len(gui_emit._handler_methods(ast.parse(
+        path.read_text(encoding="utf-8")))[0]["on_btn_count_images"]) == 2
+    plan = dc.plan(handler_request(demo))
+    assert not plan.ok and "more than once" in plan.problems[0]
+
+
 def test_the_handler_smoke_run_presses_the_wrapped_method(demo):
     bad = BODY.replace("self.ports.status", "self.ports.result_box")
     good = BODY
