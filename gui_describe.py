@@ -157,6 +157,12 @@ MAX_PIXELS = 100_000
 INT32 = (-2 ** 31, 2 ** 31 - 1)
 MAX_FONT_SIZE = 200
 MAX_FAULT_CHARS = 240           # one fault echoes model values; keep it short
+#: Lists and objects inside each other. A real reply needs about 20 (a tree
+#: MAX_DEPTH deep, a menu prop at the bottom); past this it is a model stuck
+#: repeating "[" until the token limit — and json.loads, the prop checks and
+#: the repair prompt all RECURSE, so a 3000-deep reply raised RecursionError
+#: out of describe and classify instead of costing one round.
+MAX_JSON_DEPTH = 48
 
 # The worked example. image_viewer and not PROMPT_EXAMPLES' barbie_capture_v2:
 # it is half the size, all root-level (no nesting to rescale), and it still
@@ -1283,6 +1289,8 @@ def parse_reply(text: Any) -> Tuple[Any, List[str], bool]:
     for a reply that stops mid-object, the salvage of its complete part."""
     raw = text if isinstance(text, str) else ("" if text is None
                                               else str(text))
+    if _json_depth(raw) > MAX_JSON_DEPTH:
+        return None, [], False          # _no_json_fault says why
     payload = _extract_json(raw)
     if _reply_like(payload):
         return payload, [], False
@@ -1335,8 +1343,37 @@ def _looks_cut_off(text: str) -> bool:
     return depth > 0 or in_str
 
 
+def _json_depth(text: str) -> int:
+    """How deep the reply's brackets nest, outside strings. A loop, not a
+    recursion — it is what keeps a reply nested past the interpreter's
+    recursion limit away from everything that recurses (MAX_JSON_DEPTH)."""
+    depth = deepest = 0
+    in_str = esc = False
+    for ch in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "{[":
+            depth += 1
+            if depth > deepest:
+                deepest = depth
+        elif ch in "}]":
+            depth = max(0, depth - 1)
+    return deepest
+
+
 def _no_json_fault(raw: str) -> str:
     base = "the reply contained no JSON object"
+    if _json_depth(raw) > MAX_JSON_DEPTH:
+        return (base + f" it could read — lists and objects nest more than "
+                f"{MAX_JSON_DEPTH} levels deep; reply with the flat structure "
+                f"asked for")
     if _looks_cut_off(raw):
         return (base + " — it stops before the object is closed, as if cut "
                 "off; reply with the whole object, using fewer shapes if needed")

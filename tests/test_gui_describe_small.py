@@ -590,6 +590,35 @@ def test_a_cut_off_reply_is_held_while_calls_remain_then_used():
     assert {s.label for s in res.shapes} >= {"Name", "Name box"}
 
 
+#: Degenerate repetition — a small model stuck emitting "[" until the token
+#: limit — and a list nested deeper than the interpreter recurses.
+NESTING_BOMBS = [
+    '{"shapes": ' + "[" * 3000 + "]" * 2999,
+    tree_reply(col(leaf("combobox", "a", props={"values": "BOMB"}),
+                   leaf("button", "b"))).replace('"BOMB"',
+                                                 "[" * 900 + "]" * 900),
+    json.dumps({"window": {"title": "x"}, "shapes": [
+        {"kind": "combobox", "label": "a", "x": 16, "y": 16, "w": 160,
+         "h": 32, "props": {"values": "BOMB"}}]}).replace(
+        '"BOMB"', "[" * 900 + "]" * 900),
+]
+
+
+@pytest.mark.parametrize("bomb", NESTING_BOMBS,
+                         ids=["cut-off", "tree-prop", "pixel-prop"])
+def test_a_reply_nested_past_the_recursion_limit_costs_one_call(bomb):
+    """REVIEW: the salvage's json.loads caught only ValueError, and the prop
+    checks recurse — a RecursionError ended the WHOLE describe ("failed
+    unexpectedly") on the first such reply, with every candidate and repair
+    round still unspent. It is one bad reply, judged like any other."""
+    checked = gd.check_reply(bomb)
+    assert not checked.ok and checked.faults
+    model = Model(bomb, tree_reply(FORM_TREE))
+    res = gd.describe("a login form", model_call=model, profile=SMALL)
+    assert res.ok, res.errors
+    assert len(model.calls) == 2
+
+
 def test_a_whole_answer_after_a_cut_off_one_wins():
     full = tree_reply(FORM_TREE)
     cut = full[: len(full) // 2]

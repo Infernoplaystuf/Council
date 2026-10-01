@@ -407,3 +407,27 @@ def test_a_repair_names_only_the_boxes_it_asks_about():
     third = model.prompts[2].split("WHAT IS WRONG", 1)[1].split(
         "You are labelling")[0]
     assert "box 2" in third and "box 1" not in third, third
+
+
+def test_a_reply_nested_past_the_recursion_limit_is_one_bad_reply():
+    """REVIEW: the classifier now reads replies with gui_describe.parse_reply,
+    whose cut-off salvage let a RecursionError out — a small model stuck
+    writing "[" until the token limit made classify RAISE, and Generate fail,
+    where 1fadf49's scanner just saw no JSON and asked again."""
+    bomb = '{"shapes": ' + "[" * 3000 + "]" * 2999
+    stub = Stub(bomb, reply({"box": 1, "kind": "entry", "confidence": 0.9}))
+    cls, _ = gcl.classify([generic("a")], None, stub)
+    assert [(c.kind, c.flagged) for c in cls] == [("entry", False)]
+    assert len(stub.prompts) == 2
+
+
+def test_a_prop_nested_past_the_recursion_limit_is_never_accepted():
+    """REVIEW: _check_prop reads an exception from the type check as "fine",
+    and the check recursed — a 900-deep list came back as a combobox's
+    values, to be written into the .gspec and emitted as code no Python
+    parser accepts (it allows 200 nested brackets)."""
+    deep = "[" * 900 + "]" * 900
+    bad = reply({"box": 1, "kind": "combobox", "confidence": 0.9,
+                 "props": {"values": "DEEP"}}).replace('"DEEP"', deep)
+    cls, _ = gcl.classify([generic("a")], None, Stub(bad))
+    assert all(c.flagged or "values" not in c.props for c in cls), cls
