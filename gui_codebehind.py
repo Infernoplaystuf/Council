@@ -955,6 +955,9 @@ def shape_function(code: str, target: Target
         # Double quotes and backslashes out: an instruction ending in '"'
         # would close the docstring early, and "C:\new" would be an escape.
         doc = _q(target.instruction, 70).replace('"', "'").replace("\\", "/")
+        # A pasted instruction may carry a zero-width space; the policy
+        # gate refuses those, and the model could never "fix" this line.
+        doc = _INVISIBLE.sub("", doc)
         body = [f'{indent}"""{doc}"""'] + body
         doc_n = 1
     new = [header] + body[:doc_n] + insert + body[doc_n:]
@@ -1086,6 +1089,12 @@ def _reports(handler: ast.ExceptHandler) -> bool:
     return False
 
 
+#: Characters that make the diff a person reviews differ from the code that
+#: runs: bidirectional overrides/isolates ("Trojan Source") and zero-width
+#: or invisible marks. Code behind a widget never needs them literally.
+_INVISIBLE = re.compile("[\u200b-\u200f\u202a-\u202e\u2060-\u2064"
+                        "\u2066-\u2069\ufeff]")
+
 _NO_EXIT = ("no exit() — it would close the whole app; raise ValueError "
             "instead")
 _NO_WORKERS = ("no threads or worker processes — return the result; the app "
@@ -1100,6 +1109,13 @@ def policy_faults(code: str, target: Target) -> List[str]:
     ok, errs = gui_policy.validate(code, target.project_mode, importable,
                                    toolkit=target.toolkit)
     faults = list(errs)
+    for i, text in enumerate(code.split("\n"), 1):
+        m = _INVISIBLE.search(text)
+        if m:
+            faults.append(f"line {i}: an invisible or direction-control "
+                          f"character (U+{ord(m.group()):04X}) — the review "
+                          f"would not show this line as it runs; remove it "
+                          f"(write \\u{ord(m.group()):04x} if it is meant)")
     tree = ast.parse(code)
     faults += _introspection_faults(tree)
     for node in ast.walk(tree):

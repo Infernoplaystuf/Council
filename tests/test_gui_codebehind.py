@@ -363,6 +363,37 @@ def test_workers_exits_and_low_level_modules_are_refused(body, why):
     assert any(why in f for f in cand.faults), cand.faults
 
 
+@pytest.mark.parametrize("ch", ["\u202e", "\u2066", "\u200b", "\ufeff"])
+def test_invisible_and_direction_control_characters_are_refused(ch):
+    """Review: the person's review is the last gate, and a right-to-left
+    override (or a zero-width character) in a comment or string makes the
+    diff they read differ from the code that runs ("Trojan Source"). A
+    documentation excerpt can carry one into a reply. Code behind a widget
+    never needs them; an escape (\\u202e) says the same thing visibly."""
+    reply = fence(f'''
+def count_images(folder):
+    import os
+    names = sorted(os.listdir(folder))  # sorted{ch} names
+    return {{"status": str(len(names)), "files": names}}''')
+    cand = gcb.check(reply, fn_target())
+    assert cand.stage == gcb.STAGE_POLICY, (cand.stage, cand.faults)
+    assert any("line 4" in f and "invisible" in f for f in cand.faults), \
+        cand.faults
+
+
+def test_an_invisible_character_pasted_into_the_instruction_is_not_a_fault():
+    """The shaper writes the instruction into a missing docstring; that line
+    is ours, not the model's, so it is cleaned rather than refused."""
+    reply = fence('''
+def count_images(folder):
+    import os
+    names = sorted(os.listdir(folder))
+    return {"status": str(len(names)), "files": names}''')
+    cand = gcb.check(reply, fn_target(
+        instruction="count the\u200b PNG files in the folder"))
+    assert cand.stage == gcb.STAGE_SMOKE, cand.faults
+
+
 def test_abort_on_something_else_is_not_an_exit():
     reply = fence('''
 def count_images(folder):
