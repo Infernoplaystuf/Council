@@ -652,7 +652,7 @@ def window(qapp, tmp_path, monkeypatch):
 TAB_WORKERS = (
     "agents-", "apoth-", "camera-", "capture", "changelog", "collection-",
     "council-command", "council-turn", "designer-", "diagnostics",
-    "dream3d-", "forge", "grapher-", "ide-",
+    "docs-", "dream3d-", "forge", "grapher-", "ide-",
     "jobs-", "keyword-index", "lens-", "librarian-", "model-",
     "mongo-convert", "nodes-", "sessions-", "tts-", "vault-",
 )
