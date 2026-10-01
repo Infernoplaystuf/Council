@@ -961,9 +961,10 @@ def role_model(role: str = DESCRIBE_ROLE) -> Dict[str, Any]:
         if callable(listing):
             try:
                 for m in listing() or []:
-                    if str(m.get("id")) == model_id or (
-                            not model_id.startswith("ollama:")
-                            and _same_file(m.get("id"), model_id)):
+                    if (_same_ollama(m.get("id"), model_id)
+                            if model_id.startswith("ollama:")
+                            else str(m.get("id")) == model_id
+                            or _same_file(m.get("id"), model_id)):
                         info["params_b"] = m.get("params_b")
                         info["name"] = m.get("name") or info["name"]
                         break
@@ -993,6 +994,17 @@ def _role_window(role: str) -> Optional[int]:
             model_slots.slot_for_role(role)))
     except Exception:                                    # noqa: BLE001
         return None
+
+
+def _same_ollama(a: Any, b: Any) -> bool:
+    """"ollama:phi3.5" and "ollama:phi3.5:latest" are one model — Ollama
+    serves an untagged name as :latest, and the engine routes it so, but
+    list_local_models' ids always carry the tag (review finding)."""
+    def key(s: Any) -> str:
+        name = str(s or "").strip().lower()
+        name = name[len("ollama:"):] if name.startswith("ollama:") else name
+        return name if ":" in name else name + ":latest"
+    return str(a or "").lower().startswith("ollama:") and key(a) == key(b)
 
 
 def _same_file(a: Any, b: Any) -> bool:

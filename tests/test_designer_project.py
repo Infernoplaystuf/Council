@@ -706,6 +706,22 @@ def test_the_role_model_is_read_from_the_slot_and_the_engine(monkeypatch):
     assert "phi3.5" in prof.reason
 
 
+def test_an_untagged_ollama_name_is_the_latest_tag(monkeypatch):
+    """REVIEW: list_local_models ids carry Ollama's tag ("ollama:gpt-oss:
+    latest") and the engine serves "ollama:gpt-oss" as that same model, but
+    the slot was matched by exact string — so a slot written without the
+    tag never found its size, and a 20B model was described as "size
+    unknown" in tree mode."""
+    from council_core import model_slots
+    monkeypatch.setattr(model_slots, "current",
+                        _FakeSlots("ollama:gpt-oss").current)
+    monkeypatch.setitem(sys.modules, "council_engine", _fake_engine(
+        [{"id": "ollama:gpt-oss:latest", "name": "gpt-oss:latest",
+          "params_b": 20.9}]))
+    info = dp.role_model("coder")
+    assert info["params_b"] == 20.9 and info["name"] == "gpt-oss:latest"
+
+
 def test_without_list_local_models_the_size_comes_from_the_name(monkeypatch):
     from council_core import model_slots
     monkeypatch.setattr(model_slots, "current",
