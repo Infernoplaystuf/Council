@@ -21,6 +21,18 @@ from tests.test_llm_engine import (MSGS, DOC_TOOLS, _slots, eng,  # noqa: F401
                                    fake)
 
 
+@pytest.fixture
+def default_recursion_limit():
+    """Python's default limit, so "too deep" means the same in every run: a
+    module imported earlier in a full run may have raised it, and then 3,000
+    brackets parse fine and these tests prove nothing."""
+    import sys
+    old = sys.getrecursionlimit()
+    sys.setrecursionlimit(1000)
+    yield
+    sys.setrecursionlimit(old)
+
+
 class RawServer:
     """An Ollama-ish server whose /api/chat streams exactly ``lines``."""
 
@@ -75,8 +87,8 @@ class RawServer:
     '[1, 2]', '"text"', '5', 'null', '{"message": "str"}',
     '{"message": {"content": 5}}',
     pytest.param('[' * 5000 + ']' * 5000, id="nested-5000-deep")])
-def test_a_malformed_stream_line_is_skipped_not_a_crash(eng, monkeypatch,
-                                                        bad):
+def test_a_malformed_stream_line_is_skipped_not_a_crash(
+        eng, monkeypatch, bad, default_recursion_limit):
     """Each of these raised AttributeError / TypeError / RecursionError out
     of local_chat instead of being skipped like a non-JSON line."""
     srv = RawServer([bad, json.dumps({"message": {"content": "ok"}}),
@@ -105,7 +117,8 @@ def test_a_native_tool_call_with_non_dict_arguments_still_gives_a_dict(eng):
 # Hostile replies through the JSON helpers
 # ============================================================
 
-def test_parse_json_survives_nesting_deeper_than_the_recursion_limit():
+def test_parse_json_survives_nesting_deeper_than_the_recursion_limit(
+        default_recursion_limit):
     deep = "[" * 3000 + "]" * 3000
     value, why = so.parse_json(deep)
     assert value is None and why
@@ -114,7 +127,8 @@ def test_parse_json_survives_nesting_deeper_than_the_recursion_limit():
     assert ok is False and errs
 
 
-def test_chat_tools_survives_a_deeply_nested_reply(eng):
+def test_chat_tools_survives_a_deeply_nested_reply(eng,
+                                                   default_recursion_limit):
     _slots(eng, {"d": {"path": "ollama:phi3.5"}}, {"docs": "d"})
     eng.fake.state.json_reply = "[" * 3000 + "]" * 3000
     out = eng.ce.chat_tools(MSGS, DOC_TOOLS, role="docs")
