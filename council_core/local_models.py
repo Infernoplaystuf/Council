@@ -237,11 +237,23 @@ NON_US_MAKERS: Tuple[Tuple[str, str], ...] = (
     ("qwen", "Alibaba"), ("qwq", "Alibaba"), ("deepseek", "DeepSeek"),
     ("mixtral", "Mistral AI (France)"), ("mistral", "Mistral AI (France)"),
     ("codestral", "Mistral AI (France)"), ("ministral", "Mistral AI (France)"),
-    ("yi-", "01.AI"), ("internlm", "Shanghai AI Lab"), ("glm", "Zhipu"),
+    ("yi", "01.AI"), ("internlm", "Shanghai AI Lab"), ("glm", "Zhipu"),
     ("baichuan", "Baichuan"), ("falcon", "TII (UAE)"),
     ("command-r", "Cohere (Canada)"), ("aya", "Cohere (Canada)"),
     ("minimax", "MiniMax"), ("kimi", "Moonshot"), ("exaone", "LG (Korea)"),
+    # Llama-ARCHITECTURE models from outside the US: Ollama reports their
+    # family as "llama", which alone reads as Meta / US. Measured in review:
+    # "yi:6b", "solar", "openchat", "tinyllama", "llama-pro" all came out
+    # ('Meta', 'US') — recommendable — before these entries.
+    ("solar", "Upstage (Korea)"), ("openchat", "OpenChat (Tsinghua, China)"),
+    ("tinyllama", "TinyLlama (SUTD, Singapore)"),
+    ("llama-pro", "Tencent ARC (China)"), ("hunyuan", "Tencent (China)"),
+    ("ernie", "Baidu (China)"), ("minicpm", "OpenBMB (China)"),
+    ("jais", "G42 (UAE)"),
 )
+#: Fragments matched as a whole word, not a substring: "yi" is 01.AI's
+#: ("yi:6b", "yi-coder:9b") but also the inside of unrelated names.
+_WORD_FRAGMENTS = frozenset({"yi"})
 US_MAKERS: Tuple[Tuple[str, str], ...] = (
     ("gpt-oss", "OpenAI"), ("gptoss", "OpenAI"),
     ("phi", "Microsoft"), ("llama", "Meta"), ("gemma", "Google"),
@@ -255,7 +267,10 @@ def maker_and_origin(name: str, family: str = "",
     """(maker, origin) with origin 'US' | 'non-US' | 'unknown'."""
     hay = " ".join([name or "", family or ""] + list(families or ())).lower()
     for frag, maker in NON_US_MAKERS:
-        if frag in hay:
+        if frag in _WORD_FRAGMENTS:
+            if re.search(rf"(?<![a-z0-9]){re.escape(frag)}(?![a-z])", hay):
+                return maker, "non-US"
+        elif frag in hay:
             return maker, "non-US"
     for frag, maker in US_MAKERS:
         if frag in hay:

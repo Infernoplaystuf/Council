@@ -179,6 +179,35 @@ def test_tool_choice_schema_does_not_change_the_callers_tools():
 
 
 # ============================================================
+# Origin of llama-architecture models (US-only recommendations)
+# ============================================================
+
+@pytest.mark.parametrize("name", ["yi:6b", "yi:34b", "yi-coder:9b",
+                                  "solar:10.7b", "openchat:7b",
+                                  "tinyllama:1.1b", "llama-pro:8b"])
+def test_a_non_us_llama_architecture_model_is_not_us(name):
+    """Ollama reports these with family "llama"; they came out
+    ('Meta', 'US') and so could be suggested and auto-picked."""
+    from council_core import local_models
+    maker, origin = local_models.maker_and_origin(name, "llama", ["llama"])
+    assert origin == "non-US", (name, maker)
+    entry = {"id": f"ollama:{name}", "name": name, "origin": origin,
+             "capabilities": ["completion"], "size_bytes": 4 * 2**30,
+             "params_b": 7.0}
+    assert local_models.rank_for_role([entry], "writer", vram_gb=8.0,
+                                      ram_gb=32.0) == []
+
+
+@pytest.mark.parametrize("name,family,maker", [
+    ("llama3.1:8b", "llama", "Meta"), ("codellama:7b", "llama", "Meta"),
+    ("phi4:14b", "phi3", "Microsoft"), ("gemma3:4b", "gemma3", "Google"),
+    ("granite3.3:8b", "granite", "IBM"), ("gpt-oss:20b", "gptoss", "OpenAI")])
+def test_us_models_stay_us(name, family, maker):
+    from council_core import local_models
+    assert local_models.maker_and_origin(name, family) == (maker, "US")
+
+
+# ============================================================
 # The stall timeout and a cold model load
 # ============================================================
 
