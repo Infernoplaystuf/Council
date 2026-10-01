@@ -181,6 +181,9 @@ class BenchReport:
     stopped: bool = False
     error: str = ""
     started: str = ""
+    #: "US" / "non-US" / "" (unknown). A non-US model can be MEASURED; it is
+    #: never offered as a recommendation, however well it scores.
+    origin: str = ""
 
     def _of(self, kind: str) -> List[ItemResult]:
         return [i for i in self.items if i.kind == kind]
@@ -202,6 +205,10 @@ class BenchReport:
     def good(self) -> bool:
         return bool(self.items) and not self.stopped and self.rate >= GOOD_RATE
 
+    @property
+    def recommendable(self) -> bool:
+        return self.good and self.origin.lower() != "non-us"
+
     def summary(self) -> Dict[str, Any]:
         qs, ns, cs = self._of("question"), self._of("negative"), \
             self._of("code")
@@ -220,7 +227,8 @@ class BenchReport:
             "mean_model_calls": round(sum(i.model_calls for i in self.items)
                                       / max(1, len(self.items)), 2),
             "constrained": any(i.constrained for i in self.items),
-            "good": self.good, "stopped": self.stopped,
+            "good": self.good, "recommendable": self.recommendable,
+            "origin": self.origin, "stopped": self.stopped,
             "started": self.started,
         }
 
@@ -228,8 +236,10 @@ class BenchReport:
         s = self.summary()
         if self.error and not self.items:
             return [f"Check failed: {self.error}"]
-        verdict = ("good for docs questions" if self.good else
-                   "stopped" if self.stopped else "not reliable enough")
+        verdict = ("stopped" if self.stopped else
+                   "not reliable enough" if not self.good else
+                   "good for docs questions" if self.recommendable else
+                   "scored well, but non-US: measured only, not recommended")
         out = [f"{self.model or 'model'}: {s['passed']}/{s['total']} passed "
                f"({s['rate']:.0%}) — {verdict}",
                f"questions {s['questions']}, citations right "
@@ -337,10 +347,12 @@ def _grade(kind: str, item: dict, ans: docs_qa.DocsAnswer) -> ItemResult:
 
 def capability_check(model_call: Optional[docs_qa.ModelCall] = None, *,
                      should_stop=None, progress=None,
-                     model_label: str = "") -> BenchReport:
+                     model_label: str = "", origin: str = "") -> BenchReport:
     """The Docs tab's quick check: 5 items, model-derived queries."""
-    return run(model_call, items="quick", should_stop=should_stop,
-               progress=progress, model_label=model_label)
+    report = run(model_call, items="quick", should_stop=should_stop,
+                 progress=progress, model_label=model_label)
+    report.origin = origin
+    return report
 
 
 # ======================================================================

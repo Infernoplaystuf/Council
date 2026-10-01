@@ -166,6 +166,28 @@ def test_an_unreachable_server_is_an_error_not_an_exception():
     assert any("was not found" in n for n in r.notes)
 
 
+def test_free_text_fields_carry_no_max_length():
+    """llama.cpp's converter writes maxLength N as N nested optionals:
+    measured 34 KB of grammar for a 3000-char code field."""
+    props = qa.answer_schema(3, True)["properties"]
+    assert "maxLength" not in props["answer"]
+    assert "maxLength" not in props["code"]
+    assert props["sources"]["items"]["enum"] == [1, 2, 3]
+
+
+def test_a_reply_cut_off_by_the_token_limit_is_salvaged(server):
+    cut = ('{"answer": "Use encode_frame with checksum=\\"xor8\\" [1]", '
+           '"sources": [1], "covered": true, "code": "from glimmerquay '
+           'import encode_frame\\n\\ndef frame_hello():\\n    return enc')
+    model = Stub(q("encode_frame"), cut, cut, cut)
+    r = ask("Write frame_hello() using xor8", model, server, write_code=True)
+    assert r.answer.startswith('Use encode_frame with checksum="xor8"')
+    assert r.cited == [1]
+    assert r.code.startswith("from glimmerquay import encode_frame\n")
+    assert any("cut off" in n for n in r.notes)
+    assert r.code_ok is False, "a half-written function must not pass"
+
+
 def test_a_reply_that_is_not_json_is_read_as_text(server):
     model = Stub(q("ledger"),
                  "```json\n{\"answer\": \"64 [1]\", \"sources\": [1], "

@@ -120,9 +120,14 @@ class DocsActions:
 
     def capability_check(self, should_stop=None, progress=None):
         role, model_id = self.answering()
+        try:
+            origin = next((str(m.get("origin") or "") for m in self.models()
+                           if m.get("id") == model_id), "")
+        except Exception:                                 # noqa: BLE001
+            origin = ""
         report = docs_bench.capability_check(
             self.model_call, should_stop=should_stop, progress=progress,
-            model_label=docs_qa.model_label(model_id))
+            model_label=docs_qa.model_label(model_id), origin=origin)
         if report.items and not report.stopped:
             docs_bench.record_check(report, self.checks_path)
         return report
@@ -404,7 +409,10 @@ class DocsTab(ViewHelpers, QWidget):
             -float(r.get("rate") or 0), float(r.get("mean_seconds") or 0)))
         lines = ["Checked so far:"]
         for r in ranked[:5]:
-            verdict = "good" if r.get("good") else "weak"
+            if str(r.get("origin") or "").lower() == "non-us":
+                verdict = "non-US, measured only"
+            else:
+                verdict = "good" if r.get("good") else "weak"
             lines.append(f"• {r.get('model')}: {r.get('passed')}/"
                          f"{r.get('total')}, {r.get('mean_seconds')} s/item "
                          f"— {verdict}")
@@ -421,13 +429,18 @@ class DocsTab(ViewHelpers, QWidget):
         self.model_combo.addItem("(no model of its own — use the fallback)",
                                  "")
         chosen = 0
+        passed = {r.get("model") for r in self.actions.past_checks()
+                  if r.get("recommendable")}
         for m in models or []:
             label = str(m.get("name") or docs_qa.model_label(m["id"]))
             backend = m.get("backend") or ""
             origin = str(m.get("origin") or "unknown")
             text = f"{label}  [{backend}]" if backend else label
             if origin.lower() == "non-us":
+                # Listed so it can be measured; never marked as a good pick.
                 text += "  — non-US: for measurement only"
+            elif docs_qa.model_label(m["id"]) in passed:
+                text += "  ★ passed the docs check"
             self.model_combo.addItem(text, m["id"])
             if m["id"] == current:
                 chosen = self.model_combo.count() - 1

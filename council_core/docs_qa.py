@@ -762,10 +762,16 @@ def _check_stop(should_stop: ShouldStop) -> None:
 
 def answer_schema(n_sources: int, write_code: bool) -> dict:
     """{answer, sources, covered[, code]} with sources limited to the pages
-    that exist. Lengths are bounded so a constrained reply cannot run past
-    num_predict and be cut off mid-object (a grammar cannot close one)."""
+    that exist.
+
+    NO maxLength ON THE TEXT FIELDS, measured: llama.cpp's JSON-schema
+    converter (llama-cpp-python 0.3.35) writes maxLength N as N nested
+    optional groups, so `code` at 3000 made a 34 KB grammar three thousand
+    parentheses deep, against 1.2 KB for the query schema. The length is
+    bounded by num_predict instead, and a reply cut off by it is salvaged
+    field by field (parse_answer) rather than thrown away."""
     props: Dict[str, Any] = {
-        "answer": {"type": "string", "maxLength": 1200},
+        "answer": {"type": "string"},
         "sources": {"type": "array", "maxItems": max(1, n_sources),
                     "items": {"type": "integer",
                               "enum": list(range(1, max(1, n_sources) + 1))}},
@@ -773,7 +779,7 @@ def answer_schema(n_sources: int, write_code: bool) -> dict:
     }
     required = ["answer", "sources", "covered"]
     if write_code:
-        props["code"] = {"type": "string", "maxLength": 3000}
+        props["code"] = {"type": "string"}
         required.append("code")
     return {"type": "object", "properties": props, "required": required,
             "additionalProperties": False}
@@ -901,6 +907,38 @@ _NOT_COVERED_TEXT = re.compile(
     r"|not (covered|documented|mentioned)|no information", re.I)
 
 
+def _json_string_prefix(text: str, key: str) -> Optional[str]:
+    """The value of "key": "..." even when the string was never closed."""
+    m = re.search(r'"%s"\s*:\s*"((?:[^"\\]|\\.)*)' % re.escape(key), text,
+                  re.S)
+    if not m:
+        return None
+    raw = m.group(1)
+    for cut in range(0, 7):                 # a half-written \uXXXX escape
+        try:
+            return json.loads('"' + raw[:len(raw) - cut] + '"')
+        except ValueError:
+            continue
+    return raw
+
+
+def _salvage(text: str) -> Optional[dict]:
+    """Fields of a JSON reply cut off by num_predict — a grammar can keep a
+    reply well-formed but cannot close it once tokens run out."""
+    if '"answer"' not in text and '"code"' not in text:
+        return None
+    answer = _json_string_prefix(text, "answer")
+    if answer is None:
+        return None
+    m = re.search(r'"sources"\s*:\s*\[([\d,\s]*)', text)
+    sources = [int(x) for x in re.findall(r"\d+", m.group(1))] if m else []
+    c = re.search(r'"covered"\s*:\s*(true|false)', text)
+    return {"answer": answer.strip(), "sources": sources,
+            "covered": (c.group(1) == "true") if c else True,
+            "code": (_json_string_prefix(text, "code") or "").strip("\n"),
+            "format": "cut-off"}
+
+
 def parse_answer(text: str, n_sources: int, write_code: bool) -> dict:
     """{answer, sources, covered, code, format} from a reply of any shape."""
     obj = _json_object(text)
@@ -920,6 +958,9 @@ def parse_answer(text: str, n_sources: int, write_code: bool) -> dict:
                 "code": extract_code(code) if "```" in code else code.strip(
                     "\n"),
                 "format": "json"}
+    salvaged = _salvage(text or "")
+    if salvaged is not None:
+        return salvaged
     code = ""
     prose = text or ""
     if write_code:
@@ -1382,6 +1423,9 @@ def _answer(question: str, result: DocsAnswer, pages: List[Source], *,
     result.timings["model_s"] = round(t_model, 3)
     if parsed.get("format") == "text" and result.constrained is not False:
         result.notes.append("The reply was not JSON; it was read as text.")
+    elif parsed.get("format") == "cut-off":
+        result.notes.append("The reply was cut off by the length limit; "
+                            "what arrived was kept.")
     answer, cited = apply_citation_rules(parsed, len(pages), result.notes)
     result.covered = bool(parsed.get("covered", True)) and bool(
         answer or parsed.get("code"))

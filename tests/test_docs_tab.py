@@ -215,13 +215,40 @@ def test_the_model_picker_marks_non_us_and_saves_the_choice(qapp, make_tab,
     assert tab.role_label.text().startswith("Answers come from the docs role")
 
 
-def test_the_capability_check_reports_and_is_remembered(qapp, make_tab):
+def test_the_capability_check_reports_and_is_remembered(qapp, make_tab,
+                                                        tmp_path):
     tab = make_tab(docs_bench.oracle_model_call())
+    qa_slot = docs_qa.assign_docs_model("ollama:llama3.1:8b",
+                                        tmp_path / "vault")
+    assert "llama3.1:8b" in qa_slot
     tab.on_check()
     pump(qapp, lambda: not tab._busy, 60)
     assert "5/5 passed" in tab.check_result.text()
     assert "good for docs questions" in tab.check_result.text()
-    assert "Checked so far" in tab.checks_label.text()
+    assert "llama3.1:8b (Ollama): 5/5" in tab.checks_label.text()
+    # ...and the picker now marks it, and only it.
+    tab.refresh_models()
+    pump(qapp, lambda: tab.model_combo.count() == 3)
+    texts = [tab.model_combo.itemText(i) for i in range(3)]
+    assert "★ passed the docs check" in texts[1]
+    assert "★" not in texts[2], "a non-US model is never marked as a pick"
+
+
+def test_a_non_us_model_is_measured_but_never_recommended(qapp, make_tab,
+                                                          tmp_path):
+    tab = make_tab(docs_bench.oracle_model_call())
+    docs_qa.assign_docs_model("ollama:qwen2.5:7b", tmp_path / "vault")
+    tab.on_check()
+    pump(qapp, lambda: not tab._busy, 60)
+    assert "5/5 passed" in tab.check_result.text()
+    assert "non-US: measured only, not recommended" in \
+        tab.check_result.text()
+    assert "good for docs" not in tab.check_result.text()
+    assert "qwen2.5:7b (Ollama): 5/5" in tab.checks_label.text()
+    assert "non-US, measured only" in tab.checks_label.text()
+    tab.refresh_models()
+    pump(qapp, lambda: tab.model_combo.count() == 3)
+    assert not any("★" in tab.model_combo.itemText(i) for i in range(3))
 
 
 def test_render_answer_links_only_real_sources():
