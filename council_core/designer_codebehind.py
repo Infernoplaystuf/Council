@@ -875,9 +875,13 @@ def wrap_handler(code: str, name: str, label: str, instruction: str,
             if port not in filled:
                 filled.append(port)
     # No double quotes or backslashes inside the docstring: a '"' at the end
-    # would close it early, and "C:\new" would be an escape sequence.
+    # would close it early, and "C:\new" would be an escape sequence. And no
+    # invisible/bidi characters — the instruction is pasted text and this
+    # line goes in unseen by the candidate gate (gui_codebehind cleans the
+    # function-mode docstring the same way).
+    import gui_codebehind as _gcb
     said = " ".join(str(instruction or "").split()).replace('"', "'")
-    said = said.replace("\\", "/")
+    said = _gcb._INVISIBLE.sub("", said.replace("\\", "/"))
     doc = doc.replace('"', "'").replace("\\", "/")
     who = f"the local model ({model})" if model else "the local model"
     out = [f"    def {name}(self, *args) -> None:",

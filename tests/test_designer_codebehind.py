@@ -483,6 +483,19 @@ def test_quotes_in_the_instruction_cannot_break_handlers_py(demo):
     ast.parse(review.after)
 
 
+def test_an_invisible_character_in_the_instruction_is_cleaned_from_the_body(
+        demo):
+    """The handler docstring is built from the instruction (pasted text, or
+    an imported shape note); a bidi/zero-width character there is cleaned,
+    like the function-mode docstring, so the written method is as it reads."""
+    req = handler_request(demo)
+    req.instruction = "say \u202ehow many\u202c files\u200b there are"
+    review = dc.run(dc.plan(req), model_call=Script(BODY))
+    assert review.ok, review.result.errors
+    assert "\u202e" not in review.written and "\u200b" not in review.written
+    ast.parse(review.after)
+
+
 def test_generate_keeps_an_untouched_model_body(demo):
     dc.apply(dc.run(dc.plan(handler_request(demo)), model_call=Script(BODY)))
     before = handlers_of(demo)
