@@ -722,6 +722,21 @@ def test_an_untagged_ollama_name_is_the_latest_tag(monkeypatch):
     assert info["params_b"] == 20.9 and info["name"] == "gpt-oss:latest"
 
 
+@pytest.mark.parametrize("given, mode", [("8.0B", "tree"),
+                                          (float("nan"), "tree"),
+                                          (0, "tree"), ("14.7B", "pixel")])
+def test_a_size_given_off_contract_never_raises(monkeypatch, given, mode):
+    """REVIEW: describe_profile is "never raises", but a params_b given as
+    text ("8.0B") was compared with a float and raised out of describe; NaN
+    compared false to everything and sent a model to pixel mode."""
+    from council_core import model_slots
+    monkeypatch.setattr(model_slots, "current",
+                        _FakeSlots("ollama:x").current)
+    monkeypatch.setitem(sys.modules, "council_engine", _fake_engine(
+        [{"id": "ollama:x", "name": "x", "params_b": given}]))
+    assert dp.describe_profile("a login form").mode == mode
+
+
 def test_without_list_local_models_the_size_comes_from_the_name(monkeypatch):
     from council_core import model_slots
     monkeypatch.setattr(model_slots, "current",

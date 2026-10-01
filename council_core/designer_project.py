@@ -1055,8 +1055,18 @@ def describe_profile(text: str = "", role: str = DESCRIBE_ROLE) -> Any:
     except ValueError:
         best = None
     constrained = os.environ.get(ENV_CONSTRAINED, "1").strip() != "0"
+    # A size the engine (or a GGUF header) gave as "8.0B", NaN or 0 is read
+    # or dropped here: compared as-is it raised out of a "never raises"
+    # describe, or sent NaN to pixel mode (review finding).
+    params = info.get("params_b")
+    try:
+        params = None if params is None else float(params)
+    except (TypeError, ValueError):
+        params = gui_describe.parse_params_b(str(params))
+    if params is not None and not (0 < params < 1e5):
+        params = None
     return gui_describe.profile_for(
-        info.get("params_b"), n_ctx=info.get("n_ctx"), text=text,
+        params, n_ctx=info.get("n_ctx"), text=text,
         model=info.get("name") or "", mode=mode, n_best=best,
         constrained=constrained)
 
