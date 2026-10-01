@@ -608,6 +608,27 @@ def test_run_writes_both_suites_and_a_summary_per_pass():
     json.dumps(rep, default=str)               # the report serialises
 
 
+def test_a_recorded_run_replays_to_the_same_verdicts_without_a_model():
+    """Every reply is kept per case, so a run can be re-graded offline."""
+    be = lb.ScriptedBackend(["not json", TODO_OK,
+                             fenced(REFERENCE["K1"]), fenced(WRONG["K8"])])
+    rep = lb.run(("gui", "code"), be, only="S4,K1,K8")
+    assert rep["gui"]["passes"][0][0]["replies"] == ["not json", TODO_OK]
+    again = lb.replay(json.loads(json.dumps(rep, default=str)))
+    for suite in ("gui", "code"):
+        old = [(r["id"], r["passed"], r["category"])
+               for r in rep[suite]["passes"][0]]
+        new = [(r["id"], r["passed"], r["category"])
+               for r in again[suite]["passes"][0]]
+        assert old == new
+        assert all("recorded" in r for r in again[suite]["passes"][0])
+    # A pipeline that would need a reply nobody recorded says so.
+    short = json.loads(json.dumps(rep, default=str))
+    short["gui"]["passes"][0][0]["replies"] = ["not json"]
+    r = lb.replay(short)["gui"]["passes"][0][0]
+    assert r["category"] == "model_error" and "ran out" in r["detail"]
+
+
 def test_the_harness_never_loads_a_model_on_import():
     """Importing the bench imports no engine and no llama_cpp — a test
     collection must never start a model."""

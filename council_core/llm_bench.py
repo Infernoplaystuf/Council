@@ -46,8 +46,14 @@ CODE-BEHIND SUITE (tests/data/llm_bench/code_cases.json)
 
 WHAT IS RECORDED PER CASE
     pass/fail and why (category + detail), model calls, repair rounds, prompt
-    and output tokens, wall seconds. Output: one JSON report plus a short
-    table.
+    and output tokens, wall seconds, and every model reply. Output: one JSON
+    report plus a short table.
+
+REPLAY
+    --replay report.json re-grades a recorded run with the CURRENT code and
+    no model, feeding each case its recorded replies. A change to parsing,
+    deterministic repair or the gates is measured on real model output in
+    seconds; a change to the prompt is not (it would draw other replies).
 
 MODELS ARE OPT-IN
     Nothing here loads a model on import, and the unit tests drive every path
@@ -95,6 +101,12 @@ TIERS = ("simple", "medium", "complex")
 #: is short, so 1200 tokens is generous and still leaves a 4k context room.
 CODE_TEMPERATURE, CODE_NUM_PREDICT, CODE_ROLE = 0.1, 1200, "coder"
 TEST_TIMEOUT_S = 20
+#: A scratch vault deeper than this cannot hold a generated project on
+#: Windows without hitting MAX_PATH (see main()).
+MAX_VAULT_CHARS = 110
+#: Each reply is kept in the report up to this length (an 1800-token reply
+#: is ~6000 characters).
+MAX_REPLY_CHARS = 12000
 
 # Port kinds the code suite (and its stand-in ports) understands.
 PORT_KINDS = ("entry", "label", "spinbox", "scale", "checkbutton", "combobox",
@@ -140,6 +152,9 @@ class CallStat:
     seconds: float = 0.0
     hit_limit: bool = False
     error: str = ""
+    #: The reply itself, so a run can be re-graded offline after a pipeline
+    #: change (feed a case's replies back through ScriptedBackend).
+    reply: str = ""
 
 
 class Backend:
@@ -166,6 +181,7 @@ class Backend:
         stat.seconds = round(time.perf_counter() - t0, 3)
         stat.prompt_tokens, stat.output_tokens = int(p_tok), int(o_tok)
         stat.hit_limit = bool(hit)
+        stat.reply = str(text)[:MAX_REPLY_CHARS]
         self.calls.append(stat)
         return text
 
@@ -284,7 +300,8 @@ def _since(backend: Backend, start: int) -> Dict[str, Any]:
             "prompt_tokens": sum(c.prompt_tokens for c in calls),
             "output_tokens": sum(c.output_tokens for c in calls),
             "model_seconds": round(sum(c.seconds for c in calls), 2),
-            "hit_token_limit": sum(1 for c in calls if c.hit_limit)}
+            "hit_token_limit": sum(1 for c in calls if c.hit_limit),
+            "replies": [c.reply for c in calls]}
 
 
 # ============================================================
@@ -1018,7 +1035,62 @@ def run(suites: Sequence[str], backend: Backend, *, only: str = "",
         report["code"]["summary"] = [summarise(rs)
                                      for rs in report["code"]["passes"]]
     report["meta"].update(backend.describe())
-    report["meta"]["calls"] = [asdict(c) for c in backend.calls]
+    # Per-call cost; the replies themselves are already in each case's row.
+    report["meta"]["calls"] = [{k: v for k, v in asdict(c).items()
+                                if k != "reply"} for c in backend.calls]
+    return report
+
+
+def replay(old: Dict[str, Any], *, vault: Optional[Path] = None,
+           generate: bool = True, runtime_python: Optional[str] = None,
+           test_python: Optional[str] = None,
+           progress: Optional[Callable[[str], None]] = None
+           ) -> Dict[str, Any]:
+    """Re-grade a RECORDED run with the current pipeline and no model.
+
+    Each case's recorded replies are fed back, in order, through
+    ScriptedBackend. This measures a change to what happens AFTER the model
+    answers — parsing, deterministic repairs, the gates — on real model
+    output, in seconds. It cannot measure a change to what the model is
+    ASKED: a new prompt would have drawn different replies. A case that now
+    needs more replies than were recorded fails as model_error ("ran out of
+    replies"); token counts and seconds in a replay are not model costs."""
+    say = progress or (lambda _s: None)
+    cases = {"gui": {c["id"]: c for c in load_gui_cases()},
+             "code": {c["id"]: c for c in load_code_cases()}}
+    meta = dict(old.get("meta") or {})
+    meta.update(replayed=time.strftime("%Y-%m-%d %H:%M:%S"),
+                replay_commit=_git_head())
+    meta.pop("calls", None)
+    report: Dict[str, Any] = {"meta": meta}
+    strategy = (meta.get("code") or {}).get("strategy", "baseline")
+    for suite in ("gui", "code"):
+        if suite not in old:
+            continue
+        report[suite] = {"passes": []}
+        for p, rows in enumerate(old[suite]["passes"], 1):
+            out = []
+            for row in rows:
+                case = cases[suite].get(row["id"])
+                if case is None:
+                    continue
+                be = ScriptedBackend(row.get("replies") or [])
+                if suite == "gui":
+                    r = run_gui_case(case, be, vault=vault, generate=generate,
+                                     runtime_python=runtime_python)
+                else:
+                    r = run_code_case(case, be, strategy=strategy,
+                                      python=test_python)
+                r["recorded"] = {"passed": row.get("passed"),
+                                 "category": row.get("category")}
+                out.append(r)
+                say(f"{suite:<4} p{p} {r['id']:<4} "
+                    f"{'PASS' if r['passed'] else 'FAIL'} "
+                    f"{r.get('category', ''):<16} (recorded "
+                    f"{'PASS' if row.get('passed') else row.get('category')})")
+            report[suite]["passes"].append(out)
+        report[suite]["summary"] = [summarise(rs)
+                                    for rs in report[suite]["passes"]]
     return report
 
 
@@ -1067,24 +1139,41 @@ def main(argv: Optional[List[str]] = None) -> int:
                     help="the Python that runs hidden code tests "
                          "(default: this one)")
     ap.add_argument("--out", default="", help="write the JSON report here")
+    ap.add_argument("--replay", default="",
+                    help="re-grade this recorded report with the current "
+                         "pipeline and NO model (see replay())")
     args = ap.parse_args(argv)
 
     vault = Path(args.vault or tempfile.mkdtemp(prefix="llm_bench_vault_"))
     vault.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "win32" and len(str(vault.resolve())) > MAX_VAULT_CHARS:
+        # Measured: a vault under a 170-character scratch folder made
+        # Generate fail with "The filename or extension is too long" — a
+        # generated project nests its backups and ui/ ~120 characters deep.
+        raise SystemExit(f"--vault path is {len(str(vault.resolve()))} "
+                         f"characters; keep it under {MAX_VAULT_CHARS} "
+                         f"(Windows MAX_PATH)")
     # BEFORE the engine is imported: the slot file, the GPU-crash sentinel
     # and the main model are all resolved from here.
     os.environ["COUNCIL_VAULT_ROOT"] = str(vault.resolve())
     os.environ.setdefault("COUNCIL_NO_DIALOGS", "1")
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     sys.path.insert(0, str(APP_ROOT))
-    backend = _backend_from_args(args)
-    suites = ("gui", "code") if args.suite == "all" else (args.suite,)
-    report = run(suites, backend, only=args.only, passes=args.passes,
-                 vault=vault, generate=not args.no_generate,
-                 runtime_python=args.runtime_python or None,
-                 test_python=args.test_python or None,
-                 strategy=args.strategy,
-                 progress=lambda s: print(s, flush=True))
+    if args.replay:
+        old = json.loads(Path(args.replay).read_text(encoding="utf-8"))
+        report = replay(old, vault=vault, generate=not args.no_generate,
+                        runtime_python=args.runtime_python or None,
+                        test_python=args.test_python or None,
+                        progress=lambda s: print(s, flush=True))
+    else:
+        backend = _backend_from_args(args)
+        suites = ("gui", "code") if args.suite == "all" else (args.suite,)
+        report = run(suites, backend, only=args.only, passes=args.passes,
+                     vault=vault, generate=not args.no_generate,
+                     runtime_python=args.runtime_python or None,
+                     test_python=args.test_python or None,
+                     strategy=args.strategy,
+                     progress=lambda s: print(s, flush=True))
     report["meta"]["vault"] = str(vault)
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=1, default=str),
