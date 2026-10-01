@@ -297,7 +297,9 @@ def run_job(job: Dict[str, Any], *, python: str = "",
         with tempfile.TemporaryDirectory(prefix="cb_smoke_",
                                          ignore_cleanup_errors=True) as tmp:
             sandbox = os.path.realpath(tmp)
-            job = dict(job, sandbox=sandbox)
+            # The child's own limit too (its watchdog): the parent may be
+            # gone before its timeout fires — see _child_main.
+            job = dict(job, sandbox=sandbox, timeout=float(timeout))
             for name, text in (job.get("files") or {}).items():
                 (Path(sandbox) / name).write_text(text, encoding="utf-8")
             job_path = Path(sandbox) / "_smoke_job.json"
@@ -651,6 +653,18 @@ def _child_main(job_path: str) -> None:            # pragma: no cover - child
             raise PermissionError("smoke-run blocked: " + why)
 
     sys.addaudithook(hook)
+
+    # ---- the watchdog ----------------------------------------------------
+    # The parent's timeout is not enough on its own: the Designer runs the
+    # job on a daemon thread, so closing the Council mid-run left a looping
+    # child running forever. A second later than the parent would have.
+    # (A C call that holds the GIL can still outlast it.)
+    limit = float(job.get("timeout") or 0)
+    if limit > 0:
+        import threading
+        dog = threading.Timer(limit + 1.0, _exit, args=(124,))
+        dog.daemon = True
+        dog.start()
 
     # ---- fake ports (handler mode) -------------------------------------
     class FakeChartWidget:

@@ -490,6 +490,34 @@ def test_preload_is_only_what_the_candidate_names():
     assert gui_smoke.preload_for("def broken(:\n") == []
 
 
+def test_the_child_ends_itself_when_nobody_is_left_to_time_it_out(tmp_path):
+    """Review: only the PARENT enforced the timeout, and the Designer runs
+    the smoke job on a daemon thread — close the Council while a candidate
+    loops and the child ran on forever, a core at 100 % until someone found
+    it in Task Manager. The child now has its own watchdog. (Run here with
+    no parent timeout at all, as after the Council has gone.)"""
+    import json
+    import subprocess
+    (tmp_path / "logic.py").write_text(
+        "def f():\n    n = 0\n    while n >= 0:\n        n += 1\n",
+        encoding="utf-8")
+    job = {"mode": "function", "module": "logic", "function": "f",
+           "args": [], "expect": {}, "app_root": "", "preload": [],
+           "fakes": {}, "sandbox": str(tmp_path), "timeout": 1.5}
+    path = tmp_path / "_smoke_job.json"
+    path.write_text(json.dumps(job), encoding="utf-8")
+    t0 = time.perf_counter()
+    try:
+        proc = subprocess.run([sys.executable, str(ROOT / "gui_smoke.py"),
+                               str(path)], cwd=tmp_path, input="",
+                              capture_output=True, text=True, timeout=20)
+    except subprocess.TimeoutExpired:
+        pytest.fail("the child ran on with nobody to stop it")
+    assert proc.returncode != 0
+    assert time.perf_counter() - t0 < 10
+    assert not (tmp_path / "_smoke_out.json").exists()
+
+
 def test_the_child_half_imports_nothing_from_the_council():
     """It runs under whichever interpreter the project uses, which may have
     none of the Council's packages."""
