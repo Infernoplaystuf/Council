@@ -476,7 +476,7 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
                 n_ctx=window)
             out.say(f"classified {len(classifications)} untyped shape(s)")
             shapes = _persist_classifications(
-                name, project, shapes, classifications, out, vault_dir)
+                name, shapes, classifications, out, vault_dir)
         else:
             out.say("no untyped shapes — generated with no model call")
 
@@ -608,7 +608,7 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
     return out
 
 
-def _persist_classifications(name: str, project: Any, shapes: Sequence[Any],
+def _persist_classifications(name: str, shapes: Sequence[Any],
                              classifications: Sequence[Any],
                              out: GenerateResult, vault_dir: Any
                              ) -> List[Any]:
@@ -626,11 +626,18 @@ def _persist_classifications(name: str, project: Any, shapes: Sequence[Any],
     not an answer and is not written: the next Generate asks again.
 
     A failure to save is a line in the log, never a failed Generate — the
-    classifications still apply to THIS generation."""
+    classifications still apply to THIS generation.
+
+    The answers are MERGED into the .gspec as it is on disk NOW, into the
+    shapes there that are still untyped — never by saving the project
+    Generate opened BEFORE the model call with ``shapes``: the Designer lets
+    the user Save while Generate waits on the model, and that put every
+    shape and window setting saved in the meantime back (review finding).
+    A caller's unsaved shapes are not saved on its behalf."""
     import copy
 
     import gui_classify
-    from gui_shapes import Clarification
+    from gui_shapes import GENERIC_KIND, Clarification
 
     answers = gui_classify.persistable(classifications)
     if not answers:
@@ -642,21 +649,30 @@ def _persist_classifications(name: str, project: Any, shapes: Sequence[Any],
         if got is not None:
             apply_answer(s, got)
         updated.append(s)
+    written: Dict[str, Dict[str, Any]] = {}
     try:
         import gui_projects
-        project.shapes = list(updated)
-        asked = {c.shape_id for c in project.clarifications}
-        for q in out.questions:
-            if q.shape_id in answers and q.shape_id not in asked:
-                project.clarifications.append(
-                    Clarification(shape_id=q.shape_id, question=q.question))
-        gui_projects.save_project(name, project, vault_dir=vault_dir)
+        fresh = gui_projects.open_project(name, vault_dir=vault_dir)
+        for s in fresh.shapes:
+            got = answers.get(s.id)
+            if got is not None and s.kind == GENERIC_KIND:
+                apply_answer(s, got)
+                written[s.id] = got
+        if written:
+            asked = {c.shape_id for c in fresh.clarifications}
+            for q in out.questions:
+                if q.shape_id in written and q.shape_id not in asked:
+                    fresh.clarifications.append(Clarification(
+                        shape_id=q.shape_id, question=q.question))
+            gui_projects.save_project(name, fresh, vault_dir=vault_dir)
     except Exception as exc:                             # noqa: BLE001
         out.say(f"note: could not save the classifications ({exc!r}) — the "
                 f"next Generate will ask the model again")
         return updated
-    out.classified = answers
-    out.say(f"saved {len(answers)} classification(s) into the wireframe — "
+    if not written:
+        return updated
+    out.classified = written
+    out.say(f"saved {len(written)} classification(s) into the wireframe — "
             f"the next Generate will not ask the model about them again")
     return updated
 

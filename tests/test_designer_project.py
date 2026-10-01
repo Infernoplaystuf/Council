@@ -807,6 +807,45 @@ def test_generate_writes_the_classifiers_answers_back_and_asks_once(vault):
     assert any("no model call" in line for line in second.lines)
 
 
+def test_writing_the_answers_back_keeps_a_save_made_while_classifying(vault):
+    """REVIEW: the answers were written by saving the project Generate had
+    opened BEFORE the model call, with the shapes it was given — and the
+    Designer lets the user Save while Generate runs (a local model takes
+    tens of seconds). Every shape drawn, moved or deleted and every window
+    setting saved in that time was silently put back on disk."""
+    import json
+    from gui_shapes import new_shape
+    boxes = [_generic("Name", 40, 40), _generic("Save", 40, 140)]
+    pdir = project(vault, shapes=boxes)
+    later = new_shape("button", 400, 300)
+    later.label = "Drawn while the model thought"
+
+    def model(prompt, **_kw):
+        # The user saves a newer drawing and a new title mid-call.
+        moved = [_copy_at(boxes[0], 40, 400), boxes[1], later]
+        dp.apply_window("demo", {"title": "Mine"}, moved, vault)
+        return json.dumps({"shapes": [
+            {"box": 1, "kind": "entry", "confidence": 0.9},
+            {"box": 2, "kind": "button", "confidence": 0.9}]})
+
+    result = dp.generate("demo", boxes, pdir, vault, model_call=model)
+    assert result.ok, result.lines
+    saved = gui_projects.open_project("demo", vault_dir=vault)
+    assert saved.window.title == "Mine", "the user's window was put back"
+    by_id = {s.id: s for s in saved.shapes}
+    assert later.id in by_id, "a shape saved during Generate was lost"
+    assert by_id[boxes[0].id].y == 400, "a move saved during Generate was lost"
+    assert by_id[boxes[0].id].kind == "entry", "the answer was not written"
+    assert by_id[boxes[1].id].kind == "button"
+
+
+def _copy_at(shape, x, y):
+    import copy
+    out = copy.deepcopy(shape)
+    out.x, out.y = x, y
+    return out
+
+
 def test_a_failed_classification_is_not_written_back(vault):
     boxes = [_generic("???", 40, 40)]
     pdir = project(vault, shapes=boxes)
