@@ -1450,22 +1450,25 @@ def _answer(question: str, result: DocsAnswer, pages: List[Source], *,
 # Native tool calling (optional)
 # ======================================================================
 
+def _tool_def(name: str, description: str, arg: str) -> dict:
+    """One tool, readable two ways: Ollama/OpenAI ({type, function}) and
+    MCP ({name, description, inputSchema}). The chat_tools contract does not
+    fix the shape, and extra keys are ignored by either reader."""
+    params = {"type": "object", "properties": {arg: {"type": "string"}},
+              "required": [arg]}
+    return {"type": "function",
+            "function": {"name": name, "description": description,
+                         "parameters": params},
+            "name": name, "description": description, "inputSchema": params}
+
+
 TOOL_DEFS = [
-    {"type": "function", "function": {
-        "name": "search_docs",
-        "description": "Search the package documentation. Returns numbered "
-                       "results with names you can pass to get_doc.",
-        "parameters": {"type": "object",
-                       "properties": {"query": {"type": "string"}},
-                       "required": ["query"]}}},
-    {"type": "function", "function": {
-        "name": "get_doc",
-        "description": "Read one documentation page by a name search_docs "
-                       "returned. The reply starts with a source number "
-                       "[n] to cite.",
-        "parameters": {"type": "object",
-                       "properties": {"name": {"type": "string"}},
-                       "required": ["name"]}}},
+    _tool_def("search_docs", "Search the package documentation. Returns "
+                             "numbered results with names you can pass to "
+                             "get_doc.", "query"),
+    _tool_def("get_doc", "Read one documentation page by a name search_docs "
+                         "returned. The reply starts with a source number "
+                         "[n] to cite.", "name"),
 ]
 
 
