@@ -107,6 +107,12 @@ LIVE_MS = 33
 #: refuses a wireframe that links here and has renamed either of them.
 COUNCIL_REQUIRED_PORTS = ("live_view", "capture_status")
 
+#: Running this module's functions opens camera SDKs and a grab thread, so
+#: the code writer's smoke run (gui_smoke) replaces it with a stand-in that
+#: returns each function's documented result keys. Read with ast, like
+#: COUNCIL_REQUIRED_PORTS — a smoke run never imports this module to ask.
+COUNCIL_SMOKE_FAKE = True
+
 
 class _Live:
     """The one open camera, its grab loop, and where its frames are going.
@@ -1005,6 +1011,10 @@ def setup(parent: Any = None) -> Dict[str, Any]:
     Script-linkable: a "Camera setup…" button calls this with no inputs and
     gets the same rows/notes/summary a scan returns, so finishing the wizard
     refreshes the camera list for the camera just chosen.
+
+    Keys: rows, summary, notes
+    (stated here because the dict is built, not written as a literal, so
+    the Wiring group and the code writer could not read them otherwise)
     """
     from council_core import camera_setup
 

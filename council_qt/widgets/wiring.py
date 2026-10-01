@@ -26,14 +26,24 @@ The problems are shown as the user edits, in plain words, and Apply with any
 of them on screen does nothing but say so again. A link Generate would refuse
 is not written into the scene, because the next person to find it is the user
 reading Generate's log and working backwards to which button it meant.
+
+"WRITE IT WITH THE MODEL…" READS ITS SIGNATURE FROM THESE SAME ROWS
+The Inputs list is the function's parameters and the Outputs rows are its
+result keys and where each is shown — the person decides what goes in and
+out, the model writes what happens in between. The group only builds the
+request (`write_requested`) and shows CodeReviewDialog; the tab runs the job
+and nothing is written until the review is accepted.
 """
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (QComboBox, QGroupBox, QHBoxLayout, QLabel,
-                               QListWidget, QPushButton, QVBoxLayout, QWidget)
+from PySide6.QtGui import QFont
+from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox,
+                               QGroupBox, QHBoxLayout, QLabel, QListWidget,
+                               QPlainTextEdit, QPushButton, QSplitter,
+                               QVBoxLayout, QWidget)
 
 from council_core import designer_wiring as wiring
 from council_core.designer_scene import THEME
@@ -114,12 +124,32 @@ class WiringView(QGroupBox):
     #: The link to store on the shape — {} means "remove the wiring". Only
     #: emitted for a link with no problems.
     applied = Signal(dict)
+    #: "Write it with the model…": {instruction, mode, inputs, outputs,
+    #: function, n_best}. The tab runs it on a worker; nothing is written
+    #: until the person accepts the review.
+    write_requested = Signal(dict)
+    #: The Stop beside it.
+    write_stopped = Signal()
+
+    #: (mode key, what the switch says).
+    WRITE_MODES = (("function", "Function in logic.py (recommended)"),
+                   ("handler", "Handler body (UI glue only)"))
+    #: (n_best, what the switch says) — None is "from the model's size".
+    CANDIDATES = ((None, "Candidates: auto"), (1, "1 candidate"),
+                  (2, "2 candidates"), (3, "3 candidates"))
 
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__("Wiring", parent)
         self._kind = "button"
         self._ports: List[wiring.PortInfo] = []
         self._mode, self._requires = "linked", []
+        #: The open project's folder — its own modules (logic.py) are
+        #: linkable, and read from there.
+        self._project_dir: Any = None
+        #: designer_wiring.local_modules(_project_dir), read per selection.
+        self._local: List[str] = []
+        #: The shape on show, so its note can prefill the instruction.
+        self._shape_id = ""
         #: Output rows on screen, in link order — and hidden ones kept for
         #: reuse (see OutputRow.reset).
         self._rows: List[OutputRow] = []
@@ -193,9 +223,95 @@ class WiringView(QGroupBox):
         buttons.addWidget(self.remove_button)
         buttons.addStretch(1)
         layout.addLayout(buttons)
+        self._build_writer(layout)
 
         self.module.currentTextChanged.connect(self._module_changed)
         self.function.currentTextChanged.connect(self._function_changed)
+
+    def _build_writer(self, layout: QVBoxLayout) -> None:
+        """"Write it with the model…" — the instruction, the mode, Stop.
+
+        Function mode reads its signature from the rows above: the Inputs
+        list is the parameters, the Outputs rows are the result keys and
+        where each is shown. So the person decides what goes in and out, and
+        the model only writes what happens in between.
+        """
+        head = QLabel("Write it with the model")
+        head.setStyleSheet("font-weight: bold;")
+        layout.addWidget(head)
+        self.instruction = QPlainTextEdit()
+        self.instruction.setPlaceholderText(
+            "What should it do? e.g. Count the PNG files in the chosen "
+            "folder and list their names. (Prefilled from the widget's "
+            "note.)")
+        self.instruction.setMaximumHeight(72)
+        layout.addWidget(self.instruction)
+        row = QHBoxLayout()
+        self.write_mode = QComboBox()
+        for key, caption in self.WRITE_MODES:
+            self.write_mode.addItem(caption, key)
+        self.write_mode.setToolTip(
+            "Function: the model writes one function into logic.py and the "
+            "button is wired to it — Generate writes the tested handler. "
+            "Handler body: the model writes the handler itself, only over a "
+            "stub nobody has edited.")
+        self.candidates = QComboBox()
+        for n, caption in self.CANDIDATES:
+            self.candidates.addItem(caption, n)
+        self.candidates.setToolTip(
+            "How many first attempts to sample. Small models vary from run "
+            "to run, so auto asks a 4B model for 3 and a 14B model for 1.")
+        row.addWidget(self.write_mode, 2)
+        row.addWidget(self.candidates, 1)
+        layout.addLayout(row)
+        go = QHBoxLayout()
+        self.write_button = self._small("Write it with the model…",
+                                        self._write)
+        self.stop_button = self._small("Stop", self.write_stopped.emit)
+        self.stop_button.setEnabled(False)
+        go.addWidget(self.write_button)
+        go.addWidget(self.stop_button)
+        go.addStretch(1)
+        layout.addLayout(go)
+        self.write_status = QLabel()
+        # Progress lines quote the model's reply; AutoText would render
+        # `<img src="file:///...">` in a reply as HTML.
+        self.write_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.write_status.setWordWrap(True)
+        self.write_status.setStyleSheet(f"color: {THEME['subtext']};")
+        layout.addWidget(self.write_status)
+
+    def set_writing(self, busy: bool, status: str = "") -> None:
+        """The writer's buttons while a job runs: Write off, Stop on."""
+        self.write_button.setEnabled(not busy)
+        self.stop_button.setEnabled(busy)
+        if status or not busy:
+            self.write_status.setText(status)
+
+    def write_request(self) -> Dict[str, Any]:
+        """What "Write it with the model…" sends: the instruction, the mode,
+        and — for a function — the signature the rows above describe."""
+        # The rows themselves, not link(): with no module picked yet a link
+        # normalises to {} and would drop the outputs the user just added.
+        outputs: Dict[str, str] = {}
+        for row in self._rows:
+            port, key = row.value()
+            if port:
+                outputs[port] = key
+        function = (self.function.currentText().strip()
+                    if self.module.currentText().strip() == "logic" else "")
+        return {"instruction": self.instruction.toPlainText().strip(),
+                "mode": self.write_mode.currentData() or "function",
+                "inputs": self.input_names(), "outputs": outputs,
+                "function": function,
+                "n_best": self.candidates.currentData()}
+
+    def _write(self) -> None:
+        request = self.write_request()
+        if not request["instruction"]:
+            self.write_status.setText("Say what it should do first.")
+            return
+        self.write_requested.emit(request)
 
     @staticmethod
     def _small(caption: str, slot) -> QPushButton:
@@ -207,12 +323,14 @@ class WiringView(QGroupBox):
     # Showing a shape
     # ==================================================================
     def show_shape(self, shape: Any, ports: Sequence[wiring.PortInfo] = (),
-                   mode: str = "linked", requires: Sequence[str] = ()) -> None:
+                   mode: str = "linked", requires: Sequence[str] = (),
+                   project_dir: Any = None) -> None:
         """Show ``shape``'s link, or hide the group when it cannot have one.
 
         ``ports`` is designer_wiring.project_ports for the whole wireframe —
         computed by the caller, which already has the shapes and the
-        project's port registry.
+        project's port registry. ``project_dir`` makes the project's own
+        modules (logic.py) linkable.
         """
         if shape is None or not wiring.linkable(getattr(shape, "kind", "")):
             self.setVisible(False)
@@ -224,6 +342,15 @@ class WiringView(QGroupBox):
             self._kind = shape.kind
             self._ports = list(ports)
             self._mode, self._requires = mode, list(requires or [])
+            self._project_dir = project_dir
+            # Once per selection; every keystroke's re-check reuses it.
+            self._local = wiring.local_modules(project_dir)
+            if shape.id != self._shape_id:
+                # A new widget: its note is the instruction to start from.
+                # The same widget re-shown keeps what the user typed.
+                self._shape_id = shape.id
+                self.instruction.setPlainText(
+                    str(getattr(shape, "note", "") or ""))
             link = wiring.normalise(getattr(shape, "script", None))
             what = shape.label or shape.kind
             self.summary.setText(
@@ -232,7 +359,8 @@ class WiringView(QGroupBox):
                 f"function for it to call.")
 
             self.module.clear()
-            self.module.addItems(wiring.linkable_modules(mode, requires))
+            self.module.addItems(wiring.linkable_modules(mode, requires,
+                                                         project_dir))
             self.module.setCurrentText(link.get("module", ""))
             self._fill_functions(link.get("module", ""))
             self.function.setCurrentText(link.get("function", ""))
@@ -264,8 +392,9 @@ class WiringView(QGroupBox):
     def _info(self, module: str) -> wiring.ModuleInfo:
         module = module.strip()
         if module not in self._infos:
-            self._infos[module] = (wiring.module_info(module) if module
-                                   else wiring.ModuleInfo(""))
+            self._infos[module] = (
+                wiring.module_info_for(module, self._project_dir) if module
+                else wiring.ModuleInfo(""))
         return self._infos[module]
 
     # ==================================================================
@@ -428,7 +557,9 @@ class WiringView(QGroupBox):
     def current_problems(self) -> List[str]:
         found = wiring.problems(self.link(), self._ports, self._kind,
                                 self._mode, self._requires,
-                                info=self._info(self.module.currentText()))
+                                info=self._info(self.module.currentText()),
+                                project_dir=self._project_dir,
+                                local=self._local)
         # link() keeps ONE output per port — a dict — so a second row for
         # the same port would be dropped on Apply without a word. Only the
         # rows can see it.
@@ -452,3 +583,64 @@ class WiringView(QGroupBox):
 
     def _remove(self) -> None:
         self.applied.emit({})
+
+
+class CodeReviewDialog(QDialog):
+    """What the model wrote, before anything is written: the diff, every
+    gate it passed, the smoke run, the notes. Accept writes it; anything
+    else leaves the project exactly as it was.
+
+    Built from designer_codebehind.Review's fields only, so it is shown the
+    same way whatever produced the review — and a test can build one with
+    no model.
+    """
+
+    def __init__(self, review: Any, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        plan = review.plan
+        where = (f"logic.py — {plan.link.get('function', '')}()"
+                 if plan.mode == "function" else
+                 f"handlers.py — {plan.handler}")
+        self.setWindowTitle(f"Review: {plan.label or plan.widget} → {where}")
+        self.resize(900, 640)
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Nothing has been written yet. Read the change; Accept writes it "
+            "(after a backup into .backups/) and records its fingerprint, so "
+            "the Designer knows it is untouched model output until you edit "
+            "it.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+        split = QSplitter(Qt.Orientation.Vertical)
+        mono = QFont("Consolas")
+        mono.setStyleHint(QFont.StyleHint.Monospace)
+        self.diff = QPlainTextEdit(review.diff or "(no change)")
+        self.diff.setReadOnly(True)
+        self.diff.setFont(mono)
+        self.diff.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.report = QPlainTextEdit("\n".join(review.report()))
+        self.report.setReadOnly(True)
+        split.addWidget(self.diff)
+        split.addWidget(self.report)
+        split.setSizes([440, 180])
+        layout.addWidget(split, 1)
+        buttons = QDialogButtonBox()
+        self.accept_button = buttons.addButton(
+            "Accept — write it", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton("Reject", QDialogButtonBox.ButtonRole.RejectRole)
+        self.accept_button.setEnabled(bool(review.ok))
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
+def ask_accept(review: Any, parent: Optional[QWidget] = None) -> bool:
+    """Show the review modally; True only for Accept. Under
+    COUNCIL_NO_DIALOGS (unattended, offscreen) the answer is "no" — a modal
+    would wait for a click nobody can make, and writing code nobody read is
+    the one thing this must never do."""
+    from .. import dialogs
+    if dialogs.disabled():
+        return False
+    return CodeReviewDialog(review, parent).exec() == \
+        QDialog.DialogCode.Accepted

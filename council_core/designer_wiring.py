@@ -35,7 +35,9 @@ other.
 from __future__ import annotations
 
 import ast
+import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 #: What an empty link is. `{}` in the .gspec means "this button runs its
@@ -77,6 +79,15 @@ class FunctionInfo:
     #: Keys of the dict literals it returns — what an output can be fed from.
     result_keys: Tuple[str, ...] = ()
     line: int = 0
+    #: Each of `params`' annotation as written ("" where there is none).
+    #: The code writer shows these to a model: `folder: str` says what to
+    #: pass where `folder` alone leaves a small model guessing.
+    annotations: Tuple[str, ...] = ()
+    #: The default of each parameter that has one, as written, aligned to
+    #: the TAIL of `params` (Python's own rule).
+    defaults: Tuple[str, ...] = ()
+    #: The return annotation as written, or "".
+    returns: str = ""
 
     def signature(self) -> str:
         """"start(folder, exposure=…, gain=…, frame_rate=…)"."""
@@ -85,6 +96,23 @@ class FunctionInfo:
         if self.varargs:
             parts.append("*…")
         return f"{self.name}({', '.join(parts)})"
+
+    def typed_signature(self) -> str:
+        """"scan_report(folder: Any) -> Dict[str, Any]" — annotations and
+        defaults as written, for a reader who has to CALL it."""
+        parts = []
+        for i, p in enumerate(self.params):
+            ann = self.annotations[i] if i < len(self.annotations) else ""
+            text = f"{p}: {ann}" if ann else p
+            j = i - self.required
+            if j >= 0:
+                default = self.defaults[j] if j < len(self.defaults) else "…"
+                text += f" = {default}" if ann else f"={default}"
+            parts.append(text)
+        if self.varargs:
+            parts.append("*args")
+        ret = f" -> {self.returns}" if self.returns else ""
+        return f"{self.name}({', '.join(parts)}){ret}"
 
 
 @dataclass(frozen=True)
@@ -98,9 +126,17 @@ class ModuleInfo:
     functions: Tuple[FunctionInfo, ...] = ()
     #: COUNCIL_REQUIRED_PORTS — ports the module looks up by name at runtime.
     required_ports: Tuple[str, ...] = ()
+    #: (class name, its public fields and methods) for each top-level class —
+    #: so a function annotated `-> FolderReport` can be shown with what a
+    #: caller may read off the result (total, bad, summary(), ...).
+    classes: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
 
     def function(self, name: str) -> Optional[FunctionInfo]:
         return next((f for f in self.functions if f.name == name), None)
+
+    def members(self, cls: str) -> Tuple[str, ...]:
+        """The public fields ("total") and methods ("summary()") of ``cls``."""
+        return next((m for n, m in self.classes if n == cls), ())
 
     @property
     def function_names(self) -> List[str]:
@@ -142,9 +178,36 @@ def _describe(name: str, tree: ast.Module) -> ModuleInfo:
     functions = tuple(_function_info(node, by_name) for node in defs
                       if not node.name.startswith("_"))
     info = ModuleInfo(name, True, functions,
-                      gui_spec.required_ports_in(tree))
+                      gui_spec.required_ports_in(tree), _classes(tree.body))
     _DESCRIBED[name] = (tree, info)
     return info
+
+
+def _classes(stmts: Sequence[ast.stmt]) -> Tuple[Tuple[str, Tuple[str, ...]],
+                                                 ...]:
+    """Public members of each top-level class: annotated fields (a
+    dataclass's), then methods with "()" — what code holding an instance
+    may read."""
+    out = []
+    for node in stmts:
+        if not isinstance(node, ast.ClassDef) or node.name.startswith("_"):
+            continue
+        members: List[str] = []
+        for item in node.body:
+            if isinstance(item, ast.AnnAssign) and isinstance(item.target,
+                                                              ast.Name):
+                name = item.target.id
+            elif isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = item.name + "()"
+                if any(isinstance(d, ast.Name) and d.id == "property"
+                       for d in item.decorator_list):
+                    name = item.name
+            else:
+                continue
+            if not name.startswith("_") and name not in members:
+                members.append(name)
+        out.append((node.name, tuple(members)))
+    return tuple(out)
 
 
 def _top_level_functions(stmts: Sequence[ast.stmt]) -> List[ast.FunctionDef]:
@@ -176,15 +239,66 @@ def _top_level_functions(stmts: Sequence[ast.stmt]) -> List[ast.FunctionDef]:
 def _function_info(node: ast.FunctionDef,
                    by_name: Dict[str, ast.FunctionDef]) -> FunctionInfo:
     args = node.args
-    positional = [a.arg for a in list(args.posonlyargs) + list(args.args)]
+    pos_args = list(args.posonlyargs) + list(args.args)
+    positional = [a.arg for a in pos_args]
     doc = ast.get_docstring(node) or ""
     summary = doc.strip().splitlines()[0].strip() if doc.strip() else ""
+    keys = _result_keys(node, by_name)
+    for key in _doc_keys(doc):
+        if key not in keys:
+            keys.append(key)
     return FunctionInfo(
         name=node.name, params=tuple(positional),
         required=len(positional) - len(args.defaults),
         varargs=args.vararg is not None, summary=summary,
-        result_keys=tuple(_result_keys(node, by_name)),
-        line=getattr(node, "lineno", 0))
+        result_keys=tuple(keys),
+        line=getattr(node, "lineno", 0),
+        annotations=tuple(_unparse(a.annotation) for a in pos_args),
+        defaults=tuple(_unparse(d) for d in args.defaults),
+        returns=_unparse(node.returns))
+
+
+def _unparse(node: Optional[ast.AST]) -> str:
+    if node is None:
+        return ""
+    try:
+        return ast.unparse(node)
+    except Exception:                                    # noqa: BLE001
+        return ""
+
+
+#: "Keys: count, names" or a "Keys:" line followed by an indented list,
+#: in a docstring — for a function whose returned dict is BUILT rather than
+#: written as a literal, which _result_keys cannot read.
+_KEYS_LINE = re.compile(r"^\s*Keys\s*:\s*(.*)$")
+_KEY_WORD = re.compile(r"""^["']?([A-Za-z_][A-Za-z0-9_]*)["']?""")
+
+
+def _doc_keys(doc: str) -> List[str]:
+    """The keys a docstring declares under "Keys:", in order."""
+    lines = (doc or "").splitlines()
+    for i, line in enumerate(lines):
+        m = _KEYS_LINE.match(line)
+        if not m:
+            continue
+        inline = [w.strip().strip("'\"") for w in
+                  re.split(r"[,\s]+", m.group(1)) if w.strip()]
+        keys = [w for w in inline if w.isidentifier()]
+        if keys:
+            return keys
+        indent = len(line) - len(line.lstrip())
+        for nxt in lines[i + 1:]:
+            if not nxt.strip():
+                if keys:
+                    break
+                continue
+            if len(nxt) - len(nxt.lstrip()) <= indent:
+                break
+            found = _KEY_WORD.match(nxt.strip())
+            if found:
+                keys.append(found.group(1))
+        return keys
+    return []
 
 
 def _result_keys(node: ast.FunctionDef, by_name: Dict[str, ast.FunctionDef],
@@ -231,19 +345,63 @@ def _own_returns(node: ast.AST) -> Iterable[ast.Return]:
         yield from _own_returns(child)
 
 
+def local_modules(project_dir: Any) -> List[str]:
+    """The project's OWN linkable modules — logic.py, where the code writer
+    puts model-written functions, and any helper the user added — exactly the
+    ones gui_spec.validate(spec, project_dir) accepts: not the generated
+    files, and not one named like a Council module (a linked main.py puts the
+    Council's folder first on sys.path, so that name would import the
+    Council's file)."""
+    if not project_dir:
+        return []
+    import gui_policy
+    try:
+        # Keyed on the folder's mtime, which changes when a file is added
+        # or removed: the Wiring group re-checks on every keystroke, and a
+        # folder listing plus a stat per name each time is waste.
+        key = (str(project_dir), Path(project_dir).stat().st_mtime_ns)
+        held = _LOCAL.get(key[0])
+        if held is not None and held[0] == key[1]:
+            return list(held[1])
+        found = gui_policy.project_modules(project_dir)
+    except OSError:
+        return []
+    out = [m for m in found if m not in gui_policy.PROJECT_MODULES
+           and not gui_policy.is_council_module(m)]
+    _LOCAL[key[0]] = (key[1], tuple(out))
+    return out
+
+
+#: project folder -> (its mtime, local_modules) — see local_modules.
+_LOCAL: Dict[str, Tuple[int, Tuple[str, ...]]] = {}
+
+
+def module_info_for(module: str, project_dir: Any = None) -> ModuleInfo:
+    """module_info, read from the project folder for a project module and
+    from the Council's folder for everything else."""
+    root = str(module or "").strip().split(".")[0]
+    if project_dir and root in local_modules(project_dir):
+        return module_info(module, Path(project_dir))
+    return module_info(module)
+
+
 def linkable_modules(mode: str = "linked",
-                     requires: Sequence[str] = ()) -> List[str]:
+                     requires: Sequence[str] = (),
+                     project_dir: Any = None) -> List[str]:
     """The modules the Module dropdown offers, most useful first.
 
-    The Council modules a linked app may reach (gui_policy.LINKED_MODULES —
-    frame_camera among them), then the project's declared packages. That is
-    what gui_spec will accept as a link's module; the stdlib is technically
-    allowed too, but "os.getcwd on a button" is not what anyone opens this
-    dropdown for, and the box stays editable for whoever means it.
+    The project's own modules (logic first — the model-written functions),
+    then the Council modules a linked app may reach (gui_policy.
+    LINKED_MODULES — frame_camera among them), then the project's declared
+    packages. That is what gui_spec will accept as a link's module; the
+    stdlib is technically allowed too, but "os.getcwd on a button" is not
+    what anyone opens this dropdown for, and the box stays editable for
+    whoever means it.
     """
     import gui_policy
 
-    names: List[str] = []
+    names: List[str] = sorted(local_modules(project_dir),
+                              key=lambda m: (m != "logic", m))
     if mode == "linked":
         names.extend(sorted(gui_policy.LINKED_MODULES))
     for raw in gui_policy.as_requires(requires):
@@ -394,7 +552,9 @@ def describe(link: Any) -> str:
 
 def problems(link: Any, ports: Sequence[PortInfo], kind: str = "button",
              mode: str = "linked", requires: Sequence[str] = (),
-             info: Optional[ModuleInfo] = None) -> List[str]:
+             info: Optional[ModuleInfo] = None,
+             project_dir: Any = None,
+             local: Optional[Sequence[str]] = None) -> List[str]:
     """Everything that would stop this link generating, in plain words.
 
     Empty for a good link AND for no link — removing the wiring is always
@@ -403,6 +563,10 @@ def problems(link: Any, ports: Sequence[PortInfo], kind: str = "button",
 
     ``info`` is the link module's ModuleInfo when the caller already has it —
     the panel re-checks on every keystroke and has just read it.
+    ``project_dir`` admits the project's own modules (local_modules), as
+    gui_spec.validate does when Generate passes it the project; ``local``
+    is that list when the caller already has it (the panel reads it once
+    per selection and re-checks on every keystroke).
     """
     link = normalise(link)
     if not link:
@@ -412,16 +576,20 @@ def problems(link: Any, ports: Sequence[PortInfo], kind: str = "button",
         out.append(f"A {kind} cannot run a function — only buttons and "
                    f"other controls that are pressed or changed can.")
     module, function = link["module"], link["function"]
+    if local is None:
+        local = local_modules(project_dir) if project_dir else []
     if not module:
         out.append("Choose the module the function lives in.")
     elif not all(p.isidentifier() for p in module.split(".")):
         out.append(f"{module!r} is not a module name.")
-    elif module.split(".")[0] not in _allowed(mode, requires):
+    elif module.split(".")[0] not in _allowed(mode, requires) \
+            and module.split(".")[0] not in local:
         out.append(f"{module} is not a module this app may import in "
                    f"{mode} mode. Add it to the packages it needs (click an "
                    f"empty part of the canvas), or pick one from the list.")
     if info is None or info.name != module:
-        info = module_info(module) if module else ModuleInfo("")
+        info = (module_info_for(module, project_dir) if module
+                else ModuleInfo(""))
     fn = info.function(function) if info.found else None
     if not function:
         out.append("Choose the function to run.")

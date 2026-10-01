@@ -499,7 +499,9 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
         new_ports = (spec.port_registry()
                      if hasattr(spec, "port_registry") else {})
         old_ports = getattr(manifest, "port_names", {}) or {}
-        valid, errors = gui_spec.validate(spec)
+        # The project folder, so a link may name the project's own logic.py
+        # (the code writer's functions) — see gui_spec._script_errors.
+        valid, errors = gui_spec.validate(spec, project_dir)
         if not valid:
             out.lines.extend(f"cannot generate: {e}" for e in errors)
             out.lines.extend(_rename_hints(errors, old_ports, new_ports))
@@ -514,8 +516,11 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
         # about to be rewritten for a renamed port needs no alias. Nothing is
         # written until every refusal has had its say.
         previous_links = dict(getattr(manifest, "script_links", {}) or {})
+        # Accepted model-written bodies still as written: the generator's
+        # own, like an untouched stub (gui_emit.plan_handlers).
+        ai_bodies = gui_projects.ai_bodies(manifest)
         sources, kept_lines = _planned_sources(project_dir, spec,
-                                               previous_links)
+                                               previous_links, ai_bodies)
 
         # Renames are planned FIRST so an aliased old name is redirected rather
         # than orphaned — otherwise renaming a port and regenerating reports
@@ -571,7 +576,8 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
             return out
         target = built_as or wanted
         written = gui_emit.emit(spec, project_dir, aliases=plan.aliases,
-                                target=target, previous_links=previous_links)
+                                target=target, previous_links=previous_links,
+                                ai_bodies=ai_bodies)
         out.say(f"wrote {len(written.files_written)} file(s); "
                 f"kept {len(written.files_skipped)} hand-written")
         if written.handlers_added:
@@ -598,8 +604,15 @@ def generate(name: str, shapes: Sequence[Any], project_dir: Any,
             gui_emit.script_links(spec), previous_links,
             written.handlers_stale)
         manifest.ui_checksums = gui_projects.ui_checksums(project_dir)
-        # 'Run with' may have changed while this ran; keep it.
-        manifest.python = gui_projects.load_manifest(project_dir).python
+        # 'Run with' may have changed while this ran; keep it. So may the
+        # model-written records (an Accept while Generate ran) — and a body
+        # this Generate removed or rewired is no longer there to record.
+        fresh = gui_projects.load_manifest(project_dir)
+        manifest.python = fresh.python
+        gone = set(written.handlers_removed) | set(written.handlers_rewired)
+        manifest.ai_handlers = {
+            k: v for k, v in (getattr(fresh, "ai_handlers", {}) or {}).items()
+            if not (v.get("kind") == "handler" and k in gone)}
         gui_projects.save_manifest(project_dir, manifest)
     except Exception as exc:
         out.say(f"generate failed: {exc!r}")
@@ -717,7 +730,8 @@ def described_window(window: Any) -> Dict[str, str]:
 
 
 def _planned_sources(project_dir: Path, spec: Any,
-                     previous_links: Dict[str, Any]
+                     previous_links: Dict[str, Any],
+                     ai_bodies: Optional[Dict[str, str]] = None
                      ) -> Tuple[Dict[str, str], List[str]]:
     """({"handlers.py": its text after this generation's own stub edits},
     the lines naming stubs kept because hand-written code calls them) — or
@@ -732,7 +746,8 @@ def _planned_sources(project_dir: Path, spec: Any,
     src = handlers.read_text(encoding="utf-8", errors="replace")
     plan = gui_emit.plan_handlers(
         src, spec, previous_links,
-        callers=gui_emit.hand_written_callers(project_dir))
+        callers=gui_emit.hand_written_callers(project_dir),
+        ai_bodies=ai_bodies)
     return {"handlers.py": plan.source}, plan.kept_lines()
 
 

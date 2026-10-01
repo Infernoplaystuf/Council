@@ -2764,10 +2764,54 @@ def _mentions(node, name: str) -> bool:
     return False
 
 
+def handler_text(src: str, name: str) -> Optional[str]:
+    """The whole definition of handler ``name`` in a handlers.py, exactly as
+    plan_handlers reads it (decorators included, ending in a newline) — or
+    None when it is not defined exactly once, or the file does not parse.
+
+    The code writer fingerprints a model-written body with this text and
+    plan_handlers compares against it; reading it two different ways would
+    make every model body look hand-edited."""
+    import ast
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    spans, _nodes = _handler_methods(tree)
+    if len(spans.get(name, [])) != 1:
+        return None
+    a, b = spans[name][0]
+    text = "".join(src.splitlines(keepends=True)[a - 1:b])
+    return text if text.endswith("\n") else text + "\n"
+
+
+def is_generated_stub(name: str, src: str) -> bool:
+    """Whether handler ``name`` in ``src`` is exactly a stub this emitter
+    wrote (any version, any link) — nobody has touched it."""
+    import ast
+    text = handler_text(src, name)
+    if text is None:
+        return False
+    _spans, nodes = _handler_methods(ast.parse(src))
+    return recover_stub(name, nodes[name], text) is not None
+
+
+def _ai_body(text: str, name: str,
+             ai_bodies: Optional[Dict[str, str]]) -> bool:
+    """Whether ``text`` is the model-written body recorded for ``name``,
+    byte for byte (gui_projects.Manifest.ai_handlers)."""
+    want = (ai_bodies or {}).get(name)
+    if not want:
+        return False
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest() == want
+
+
 def plan_handlers(src: str, spec: Spec,
                   previous: Optional[Dict[str, Dict[str, Any]]] = None,
                   filename: str = "handlers.py", *,
-                  callers: Optional[Dict[str, str]] = None) -> HandlerPlan:
+                  callers: Optional[Dict[str, str]] = None,
+                  ai_bodies: Optional[Dict[str, str]] = None) -> HandlerPlan:
     """What regenerating ``spec`` does to this handlers.py. Writes nothing.
 
     For each handler the spec binds that exists exactly once:
@@ -2788,6 +2832,12 @@ def plan_handlers(src: str, spec: Spec,
 
     ``previous`` is the manifest's record of each handler's link at the last
     Generate: it is what says a link CHANGED (_stale_reason).
+
+    ``ai_bodies`` (handler -> sha256) are the model-written bodies the user
+    accepted (gui_projects.ai_bodies). One that still matches its record is
+    the generator's too: removed with its widget like a stub, and rewritten
+    into the linked stub when the widget is later wired to a function. An
+    edited one no longer matches, and is the user's like any other.
     """
     import ast
     try:
@@ -2813,6 +2863,15 @@ def plan_handlers(src: str, spec: Spec,
         script, title = _script_for(spec, h), _title_for(spec, h)
         new = handler_stub(h, script, title).lstrip("\n")
         if current == new:
+            continue
+        if _ai_body(current, h, ai_bodies):
+            # The accepted model body, untouched. With no link it IS the
+            # handler; once the widget is wired, the link wins — the same
+            # thing an untouched stub does.
+            if script:
+                edits.append((a, b, new))
+                plan.rewired.append((h, "the model-written body",
+                                     link_text(script)))
             continue
         recovered = recover_stub(h, nodes[h], current)
         if recovered is not None:
@@ -2853,7 +2912,8 @@ def plan_handlers(src: str, spec: Spec,
         if not _is_widget_handler(h):
             continue
         a, b = found[0]
-        if recover_stub(h, nodes[h], text_of(a, b)) is None:
+        if recover_stub(h, nodes[h], text_of(a, b)) is None and \
+                not _ai_body(text_of(a, b), h, ai_bodies):
             continue
         if others is None:
             others = [(filename, tree)] + _parsed(callers)
@@ -3223,12 +3283,15 @@ def emit(spec: Spec, project_path: Any, *,
          preserve_regions: Optional[Dict[str, str]] = None,
          aliases: Optional[Dict[str, str]] = None,
          target: str = DEFAULT_TARGET,
-         previous_links: Optional[Dict[str, Dict[str, Any]]] = None
+         previous_links: Optional[Dict[str, Dict[str, Any]]] = None,
+         ai_bodies: Optional[Dict[str, str]] = None
          ) -> EmitResult:
     """Write the project. ui/ is overwritten; app.py and handlers.py are not.
 
     ``previous_links`` is the manifest's record of each handler's link at the
     last Generate (script_links); see plan_handlers for what it changes.
+    ``ai_bodies`` are the accepted model-written bodies (handler -> sha256),
+    likewise.
 
     Sentinel-region bodies are read from the EXISTING ui/ files before anything
     is written, so a region survives even though the file around it is
@@ -3290,7 +3353,8 @@ def emit(spec: Spec, project_path: Any, *,
         # edited one is left alone and, when it no longer matches its link,
         # named in a WARNING line with file:line.
         plan = plan_handlers(src, spec, previous_links,
-                             callers=hand_written_callers(root))
+                             callers=hand_written_callers(root),
+                             ai_bodies=ai_bodies)
         if plan.changed:
             handlers.write_text(plan.source, encoding="utf-8")
             src = plan.source
