@@ -168,6 +168,19 @@ def test_a_server_that_stopped_reading_cannot_hang_a_request():
     assert c.transport.proc.poll() is not None
 
 
+def test_a_dead_server_leaves_no_thread_behind():
+    """The stdin writer waits on its queue; when the server dies with
+    nobody calling close(), it must end too, not linger per crash."""
+    c = evil("ok").connect()
+    c.transport.proc.kill()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and any(
+            t.is_alive() for t in c.transport._threads):
+        time.sleep(0.05)
+    assert not any(t.is_alive() for t in c.transport._threads)
+    assert not c.connected
+
+
 def test_a_wedged_server_costs_one_timeout_and_is_restarted():
     """A server that never answers cost one full timeout PER QUERY (3), then
     the same again in the second pass without the model's package guess,

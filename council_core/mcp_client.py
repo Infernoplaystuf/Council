@@ -359,6 +359,7 @@ class StdioTransport(_Transport):
                 proc.kill()
             except OSError:
                 pass
+        self._outbox.put(None)          # the writer has no one to write to
         self.on_closed(reason or self._exit_reason(wait=1.0))
 
     def _deliver(self, message: dict) -> None:
