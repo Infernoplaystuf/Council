@@ -35,6 +35,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -111,50 +112,72 @@ def citation_ok(item: dict, ans: docs_qa.DocsAnswer) -> bool:
 #:
 #: The low-level doors are shut too: os.open with write flags, os.truncate,
 #: os.mkdir and _winapi.CreateProcess all went past the first version (each
-#: emptied or created a file outside the sandbox, or ran cmd.exe). What an
-#: audit hook cannot stop is C code — ctypes, an extension module — so this
+#: emptied or created a file outside the sandbox, or ran cmd.exe).
+#:
+#: The fence's own state lives in a closure of immutable values, not in
+#: __main__: `import __main__; __main__._NEVER = ()` switched the list of
+#: blocked events off and the next line ran cmd.exe. ctypes is refused (it
+#: called kernel32.CreateFileW and WinExec straight past every check), and so
+#: is gc's object walk, the one way back to the hook function. What an audit
+#: hook still cannot stop is native code the solution brings itself — so this
 #: fences off careless code, not code written to escape; that is the honest
 #: limit, and why only the bundled invented package is ever imported here.
 FENCE = r'''
-import os, sys
-sys.dont_write_bytecode = True
-_ROOT = os.path.normcase(os.path.abspath(os.getcwd()))
-_NEVER = ("subprocess.Popen", "os.system", "os.exec", "os.spawn",
-          "os.posix_spawn", "os.startfile", "os.kill", "os.symlink",
-          "os.link", "socket.connect", "socket.getaddrinfo", "socket.bind",
-          "socket.sendto", "socket.sendmsg", "webbrowser.open")
-_NEVER_PREFIX = ("_winapi.", "winreg.Create", "winreg.Delete", "winreg.Set",
-                 "winreg.Save", "winreg.Load", "winreg.Connect")
-_PATHS = ("os.remove", "os.unlink", "os.rmdir", "os.rename", "os.replace",
-          "shutil.rmtree", "shutil.move", "os.mkdir", "os.truncate",
-          "os.chmod", "sqlite3.connect")
-_WRITE = (os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC)
-def _inside(p):
-    if isinstance(p, int) or p is None or p == ":memory:":
-        return True
-    try:
-        t = os.path.normcase(os.path.abspath(os.fsdecode(os.fspath(p))))
-    except TypeError:
-        return False
-    return t == _ROOT or t.startswith(_ROOT + os.sep)
-def _fence(event, args):
-    if event in _NEVER or event.startswith(_NEVER_PREFIX):
-        raise PermissionError(f"blocked in the docs benchmark: {event}")
-    if event in _PATHS:
-        for p in args[:2]:
-            if isinstance(p, (str, bytes, os.PathLike)) and not _inside(p):
+def _install_fence():
+    import os, sys
+    sys.dont_write_bytecode = True
+    root = os.path.normcase(os.path.abspath(os.getcwd()))
+    never = frozenset((
+        "subprocess.Popen", "os.system", "os.exec", "os.spawn",
+        "os.posix_spawn", "os.startfile", "os.kill", "os.symlink", "os.link",
+        "socket.connect", "socket.getaddrinfo", "socket.bind",
+        "socket.sendto", "socket.sendmsg", "webbrowser.open"))
+    never_prefix = ("_winapi.", "winreg.Create", "winreg.Delete",
+                    "winreg.Set", "winreg.Save", "winreg.Load",
+                    "winreg.Connect", "ctypes.", "gc.get_")
+    paths = frozenset((
+        "os.remove", "os.unlink", "os.rmdir", "os.rename", "os.replace",
+        "shutil.rmtree", "shutil.move", "os.mkdir", "os.truncate",
+        "os.chmod", "sqlite3.connect"))
+    write = (os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_TRUNC)
+    sep, normcase, abspath = os.sep, os.path.normcase, os.path.abspath
+    fsdecode, fspath, PathLike = os.fsdecode, os.fspath, os.PathLike
+
+    def inside(p):
+        if isinstance(p, int) or p is None or p == ":memory:":
+            return True
+        try:
+            t = normcase(abspath(fsdecode(fspath(p))))
+        except TypeError:
+            return False
+        return t == root or t.startswith(root + sep)
+
+    def fence(event, args):
+        if event in never or event.startswith(never_prefix):
+            raise PermissionError(f"blocked in the docs benchmark: {event}")
+        if event in paths:
+            for p in args[:2]:
+                if isinstance(p, (str, bytes, PathLike)) and not inside(p):
+                    raise PermissionError(
+                        f"blocked {event} outside the sandbox: {p}")
+        if event == "open" and args:
+            mode, flags = (args[1] if len(args) > 1 else None,
+                           args[2] if len(args) > 2 else 0)
+            writes = (any(c in str(mode) for c in "wax+") if mode
+                      else bool((flags or 0) & write))
+            if writes and not inside(args[0]):
                 raise PermissionError(
-                    f"blocked {event} outside the sandbox: {p}")
-    if event == "open" and args:
-        mode, flags = (args[1] if len(args) > 1 else None,
-                       args[2] if len(args) > 2 else 0)
-        writes = (any(c in str(mode) for c in "wax+") if mode
-                  else bool((flags or 0) & _WRITE))
-        if writes and not _inside(args[0]):
-            raise PermissionError(
-                f"blocked write outside the sandbox: {args[0]}")
-sys.addaudithook(_fence)
+                    f"blocked write outside the sandbox: {args[0]}")
+
+    sys.addaudithook(fence)
+_install_fence()
+del _install_fence
 '''
+
+#: The most of a solution's output kept for the report. A solution that
+#: printed in a loop filled the app's memory through capture_output —
+#: MEASURED +706 MB in 8 s, and the limit is 30 s.
+OUTPUT_TAIL = 64 * 1024
 
 
 def run_code_test(code: str, item: dict, *, timeout: float = CODE_TIMEOUT,
@@ -175,15 +198,36 @@ def run_code_test(code: str, item: dict, *, timeout: float = CODE_TIMEOUT,
         scratch.mkdir()
         env = dict(os.environ, TEMP=str(scratch), TMP=str(scratch),
                    TMPDIR=str(scratch))
+        proc = subprocess.Popen(
+            [sys.executable, "-I", "-B", "runner.py"], cwd=tmp, env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        tail = bytearray()
+
+        def drain() -> None:
+            # Keep only the end: what a report shows, and all PASS needs.
+            for chunk in iter(lambda: proc.stdout.read1(65536), b""):
+                tail.extend(chunk)
+                del tail[:-OUTPUT_TAIL]
+
+        reader = threading.Thread(target=drain, name="docsbench-output",
+                                  daemon=True)
+        reader.start()
         try:
-            out = subprocess.run(
-                [sys.executable, "-I", "-B", "runner.py"], cwd=tmp, env=env,
-                capture_output=True, text=True, timeout=timeout,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            text = (out.stdout + out.stderr).strip()
-            passed = out.returncode == 0 and text.endswith("PASS")
+            returncode = proc.wait(timeout=timeout)
+            timed_out = False
         except subprocess.TimeoutExpired:
-            text, passed = f"timed out after {timeout:g} s", False
+            proc.kill()
+            returncode = proc.wait()
+            timed_out = True
+        reader.join(5)
+        proc.stdout.close()
+        text = bytes(tail).decode("utf-8", "replace").replace(
+            "\r\n", "\n").strip()
+        passed = not timed_out and returncode == 0 and text.endswith("PASS")
+        if timed_out:
+            text = f"timed out after {timeout:g} s"
     return {"passed": passed, "output": text[-800:],
             "seconds": round(time.perf_counter() - t0, 3)}
 

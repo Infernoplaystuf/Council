@@ -47,6 +47,7 @@ import ipaddress
 import itertools
 import json
 import os
+import queue
 import re
 import shutil
 import socket
@@ -77,6 +78,17 @@ _POLL = 0.05
 
 #: The most pages a paginated list may have before it is called a loop.
 MAX_PAGES = 200
+
+#: The largest single message accepted from a server. MEASURED: one 200 MB
+#: search reply cost 97 s and +4.9 GB of the app's memory before docs_qa
+#: trimmed it to 6000 chars. A documentation page or a tool list is
+#: kilobytes; a server sending more than this is broken, and the request (on
+#: stdio, the connection) fails with that reason instead of being read to
+#: the end.
+MAX_MESSAGE_BYTES = 16 * 1024 * 1024
+#: How much of a body that is thrown away anyway (a 202, a 404) is read.
+#: Every request carries Connection: close, so the rest never matters.
+_DISCARD = 65536
 
 # JSON-RPC error codes this module produces or recognises.
 PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND = -32700, -32600, -32601
@@ -132,6 +144,24 @@ def _short(text: Any, limit: int = 300) -> str:
     return s if len(s) <= limit else s[:limit - 1] + "…"
 
 
+def _object(value: Any) -> Dict[str, Any]:
+    """`value` when it is a JSON object, else {} — servers send garbage."""
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _objects(value: Any) -> List[dict]:
+    """The objects in `value` when it is a list (a number or a string where
+    a list belongs raised a TypeError no caller expects)."""
+    if not isinstance(value, list):
+        return []
+    return [x for x in value if isinstance(x, dict)]
+
+
+def _too_large() -> str:
+    return (f"The server sent a message larger than "
+            f"{MAX_MESSAGE_BYTES // 2 ** 20} MB; it was not read.")
+
+
 # ======================================================================
 # Results
 # ======================================================================
@@ -161,8 +191,8 @@ def content_text(items: Sequence[Any]) -> str:
         if kind == "text":
             out.append(str(item.get("text", "")))
         elif kind == "resource":
-            res = item.get("resource") or {}
-            if "text" in res:
+            res = item.get("resource")
+            if isinstance(res, dict) and "text" in res:
                 out.append(str(res.get("text", "")))
         elif kind == "resource_link":
             out.append(f"{item.get('name') or item.get('title') or ''} "
@@ -217,8 +247,9 @@ class StdioTransport(_Transport):
     """A server subprocess; newline-delimited JSON on its stdin and stdout.
 
     Two daemon threads read stdout (messages) and stderr (kept as a ring of the
-    last lines, for error messages). Writes go under a lock, because a worker
-    sending a request and the reader answering a server ping can collide.
+    last lines, for error messages); a third is the only writer, so a worker
+    sending a request and the reader answering a server ping never collide,
+    and neither ever waits on a server that stopped reading (see send).
     """
 
     kind = "stdio"
@@ -232,7 +263,9 @@ class StdioTransport(_Transport):
         self.env = {str(k): str(v) for k, v in (env or {}).items()}
         self.cwd = cwd or None
         self.proc: Optional[subprocess.Popen] = None
-        self._write_lock = threading.Lock()
+        #: Bytes waiting for the writer thread; None ends it (see send).
+        self._outbox: "queue.Queue[Optional[bytes]]" = queue.Queue()
+        self._write_failed = ""
         self._stderr: Deque[str] = collections.deque(maxlen=40)
         #: Lines on stdout that were not JSON — a banner, a stray print. Kept
         #: because "the server printed X instead of answering" is the most
@@ -277,7 +310,8 @@ class StdioTransport(_Transport):
                 f"Could not start the server ({self.command!r}): "
                 f"{exc.strerror or exc}") from None
         for target, name in ((self._read_stdout, "mcp-stdio-out"),
-                             (self._read_stderr, "mcp-stdio-err")):
+                             (self._read_stderr, "mcp-stdio-err"),
+                             (self._write_stdin, "mcp-stdio-in")):
             t = threading.Thread(target=target, name=name, daemon=True)
             t.start()
             self._threads.append(t)
@@ -292,30 +326,57 @@ class StdioTransport(_Transport):
     def _read_stdout(self) -> None:
         proc = self.proc
         assert proc is not None and proc.stdout is not None
+        reason = ""
         try:
-            for raw in iter(proc.stdout.readline, b""):
+            while True:
+                # Bounded: an endless line is a broken server, not a reason
+                # to hold gigabytes (see MAX_MESSAGE_BYTES).
+                raw = proc.stdout.readline(MAX_MESSAGE_BYTES + 1)
+                if not raw:
+                    break
+                if len(raw) > MAX_MESSAGE_BYTES and not raw.endswith(b"\n"):
+                    reason = (f"the server sent a message larger than "
+                              f"{MAX_MESSAGE_BYTES // 2 ** 20} MB, so the "
+                              f"connection was closed.")
+                    break
                 line = raw.strip()
                 if not line:
                     continue
                 try:
                     message = json.loads(line.decode("utf-8", "replace"))
-                except ValueError:
+                except (ValueError, RecursionError):
                     self.noise.append(_short(line.decode("utf-8", "replace"),
                                              200))
                     continue
                 for one in (message if isinstance(message, list)
                             else [message]):
                     if isinstance(one, dict):
-                        self.on_message(one)
+                        self._deliver(one)
         except (OSError, ValueError):
             pass
-        self.on_closed(self._exit_reason(wait=1.0))
+        if reason:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        self.on_closed(reason or self._exit_reason(wait=1.0))
+
+    def _deliver(self, message: dict) -> None:
+        """Hand one message on. A malformed one (an id that is a list, a
+        notification whose params are a string) used to end this thread —
+        and with it every later answer, while the client still said
+        "connected" — so a fault here costs that message, nothing more."""
+        try:
+            self.on_message(message)
+        except Exception as exc:                          # noqa: BLE001
+            self.noise.append(_short(f"unreadable message ({exc}): "
+                                     f"{message}", 200))
 
     def _read_stderr(self) -> None:
         proc = self.proc
         assert proc is not None and proc.stderr is not None
         try:
-            for raw in iter(proc.stderr.readline, b""):
+            for raw in iter(lambda: proc.stderr.readline(65536), b""):
                 text = raw.decode("utf-8", "replace").rstrip()
                 if text:
                     self._stderr.append(text)
@@ -344,34 +405,58 @@ class StdioTransport(_Transport):
         return _short(" | ".join(lines), 400)
 
     def send(self, message: dict) -> None:
+        """Queue one message for the writer thread; never blocks.
+
+        A pipe write blocks once the server stops reading and its buffer is
+        full. MEASURED: a 100 KB request to a server that had stopped reading
+        hung its caller for good — the deadline and Stop are polled only
+        AFTER send returns. So the caller only queues; a write that fails
+        closes the connection, which fails every request still waiting."""
         proc = self.proc
         if proc is None or proc.stdin is None:
             raise McpConnectionError("The server has not been started.")
-        data = (json.dumps(message, ensure_ascii=False,
-                           separators=(",", ":")) + "\n").encode("utf-8")
-        with self._write_lock:
+        if self._write_failed or self._closing or proc.poll() is not None:
+            raise McpConnectionError(
+                "The server stopped: " + (self._write_failed
+                                          or self._exit_reason(wait=0.5)))
+        self._outbox.put((json.dumps(message, ensure_ascii=False,
+                                     separators=(",", ":")) + "\n"
+                          ).encode("utf-8"))
+
+    def _write_stdin(self) -> None:
+        """The only writer of the server's stdin, so messages never
+        interleave. None in the outbox is close(): stdin is closed after
+        everything queued before it, which is the spec's polite shutdown."""
+        proc = self.proc
+        assert proc is not None and proc.stdin is not None
+        while True:
+            data = self._outbox.get()
             try:
+                if data is None:
+                    proc.stdin.close()
+                    return
                 proc.stdin.write(data)
                 proc.stdin.flush()
             except (OSError, ValueError):
-                raise McpConnectionError(
-                    "The server stopped: " + self._exit_reason(wait=0.5)
-                ) from None
+                if data is None or self._closing:
+                    return
+                self._write_failed = self._exit_reason(wait=0.5)
+                self.on_closed(self._write_failed)
+                return
 
     def close(self, timeout: float = 3.0) -> None:
         """Close stdin (the spec's polite shutdown), then terminate, then kill.
 
         Each step waits a share of `timeout`. On Windows terminate() is already
-        a hard kill, so the polite step is the one that lets a server flush."""
+        a hard kill, so the polite step is the one that lets a server flush.
+        stdin is closed by the writer thread, behind what it still has to
+        write: closing it here would wait on a write the server may never
+        read, and terminate() is what ends that write."""
         self._closing = True
         proc = self.proc
         if proc is None:
             return
-        try:
-            if proc.stdin:
-                proc.stdin.close()
-        except (OSError, ValueError):
-            pass
+        self._outbox.put(None)
         for step in ("wait", "terminate", "kill"):
             try:
                 if step == "terminate":
@@ -386,7 +471,11 @@ class StdioTransport(_Transport):
                 break
         for t in self._threads:
             t.join(timeout=0.5)
-        for pipe in (proc.stdout, proc.stderr):
+        pipes = [proc.stdout, proc.stderr]
+        if not any(t.is_alive() for t in self._threads
+                   if t.name == "mcp-stdio-in"):
+            pipes.append(proc.stdin)
+        for pipe in pipes:
             try:
                 if pipe:
                     pipe.close()
@@ -483,10 +572,23 @@ class HttpTransport(_Transport):
     # -- plumbing --------------------------------------------------------
     def _connection(self, timeout: float) -> http.client.HTTPConnection:
         if self.scheme == "https":
-            return http.client.HTTPSConnection(self.host, self.port,
-                                               timeout=timeout)
-        return http.client.HTTPConnection(self.host, self.port,
-                                          timeout=timeout)
+            conn: http.client.HTTPConnection = http.client.HTTPSConnection(
+                self.host, self.port, timeout=timeout)
+        else:
+            conn = http.client.HTTPConnection(self.host, self.port,
+                                              timeout=timeout)
+        if self.host.lower().rstrip(".").endswith(".localhost"):
+            # is_local_host calls `*.localhost` this computer (RFC 6761), but
+            # Windows does not: MEASURED, getaddrinfo sends such a name to the
+            # network's DNS server — and a resolver that answers unknown names
+            # (ISP "search" pages do) would receive the question. So the
+            # socket goes to 127.0.0.1 without asking DNS; the Host header and
+            # TLS name stay the URL's.
+            def loopback(address, *args, **kwargs):
+                return socket.create_connection(("127.0.0.1", address[1]),
+                                                *args, **kwargs)
+            conn._create_connection = loopback        # type: ignore
+        return conn
 
     def _headers(self) -> Dict[str, str]:
         # Connection: close — one request per connection anyway, and it makes
@@ -539,7 +641,7 @@ class HttpTransport(_Transport):
             resp = conn.getresponse()
             unmangle(resp)
             try:
-                resp.read()
+                resp.read(_DISCARD)
             except http.client.IncompleteRead:
                 pass                       # the body of a 202 is nothing
             if resp.status >= 400 and message.get("method") != \
@@ -568,7 +670,7 @@ class HttpTransport(_Transport):
             if sid and message.get("method") == "initialize":
                 self.session_id = sid
             if resp.status == 404 and self.session_id:
-                resp.read()
+                resp.read(_DISCARD)
                 self.session_id = None
                 # The session is over (spec: the client MUST start a new
                 # one). Closing — not just failing this request — is what
@@ -584,7 +686,7 @@ class HttpTransport(_Transport):
                                                   body))
                 return
             if resp.status == 202:
-                resp.read()
+                resp.read(_DISCARD)
                 self._fault(rid, "The server accepted the request but sent "
                                  "no answer (HTTP 202).")
                 return
@@ -592,10 +694,13 @@ class HttpTransport(_Transport):
             if ctype.strip().lower() == "text/event-stream":
                 self._read_sse(resp, rid)
             else:
-                raw = resp.read()
+                raw = resp.read(MAX_MESSAGE_BYTES + 1)
+                if len(raw) > MAX_MESSAGE_BYTES:
+                    self._fault(rid, _too_large())
+                    return
                 try:
                     payload = json.loads(raw.decode("utf-8", "replace"))
-                except ValueError:
+                except (ValueError, RecursionError):
                     self._fault(rid, "The server's answer was not JSON: "
                                 + _short(raw.decode("utf-8", "replace"), 160))
                     return
@@ -605,6 +710,11 @@ class HttpTransport(_Transport):
                         self.on_message(one)
         except (OSError, http.client.HTTPException) as exc:
             self._fault(rid, self._unreachable(exc))
+        except Exception as exc:                          # noqa: BLE001
+            # Anything else a malformed reply provokes fails THIS request
+            # now, rather than leaving it to wait out its deadline.
+            self._fault(rid, f"The server's answer could not be read: "
+                             f"{_short(exc, 160)}")
         finally:
             with self._lock:
                 self._active.pop(rid, None)
@@ -631,6 +741,7 @@ class HttpTransport(_Transport):
         completes. Multi-line `data:` fields are joined with newlines, per
         the SSE format."""
         data: List[str] = []
+        size = 0
         answered = False
 
         def flush() -> bool:
@@ -640,7 +751,7 @@ class HttpTransport(_Transport):
             data.clear()
             try:
                 payload = json.loads(text)
-            except ValueError:
+            except (ValueError, RecursionError):
                 return False
             got = False
             for one in (payload if isinstance(payload, list) else [payload]):
@@ -651,15 +762,21 @@ class HttpTransport(_Transport):
             return got
 
         while True:
-            raw = resp.readline()
+            raw = resp.readline(MAX_MESSAGE_BYTES + 1)
             if not raw:
                 break
             line = raw.decode("utf-8", "replace").rstrip("\r\n")
             if line == "":
+                size = 0
                 if flush():
                     answered = True
                     break
                 continue
+            size += len(raw)
+            if size > MAX_MESSAGE_BYTES:
+                data.clear()
+                self._fault(rid, _too_large())
+                return
             if line.startswith(":"):
                 continue
             name, _, value = line.partition(":")
@@ -698,7 +815,7 @@ class HttpTransport(_Transport):
             conn = self._connection(timeout=min(timeout, 3.0))
             try:
                 conn.request("DELETE", self.path, headers=self._headers())
-                conn.getresponse().read()
+                conn.getresponse().read(_DISCARD)
             except (OSError, http.client.HTTPException):
                 pass
             finally:
@@ -786,8 +903,10 @@ class McpClient:
                     f"this Council understands {', '.join(self.protocols)}.")
             self.protocol_version = version
             self.transport.protocol_version = version
-            self.server_info = dict(result.get("serverInfo") or {})
-            self.server_capabilities = dict(result.get("capabilities") or {})
+            # Only objects are read: `"serverInfo": "abc"` made dict() raise
+            # a ValueError that no caller expects from connect().
+            self.server_info = _object(result.get("serverInfo"))
+            self.server_capabilities = _object(result.get("capabilities"))
             self.instructions = str(result.get("instructions") or "")
             self.notify("notifications/initialized")
             self._connected = True
@@ -864,7 +983,11 @@ class McpClient:
             raise McpConnectionError(
                 f"{method} failed: {reply['_closed']}")
         if "error" in reply:
-            err = reply.get("error") or {}
+            err = reply.get("error")
+            if not isinstance(err, dict):
+                # `"error": "boom"` is not JSON-RPC, but it is plainly an
+                # error; reading it as one beats an AttributeError.
+                err = {"message": str(err) if err else ""}
             text = str(err.get("message") or "unknown error")
             if reply.get(_TRANSPORT_FAULT):
                 raise McpConnectionError(text)
@@ -896,9 +1019,11 @@ class McpClient:
             return
         if method is not None:
             if method == "notifications/message":
-                self.log.append(dict(message.get("params") or {}))
+                self.log.append(_object(message.get("params")))
             return
         rid = message.get("id")
+        if not isinstance(rid, (str, int)) or isinstance(rid, bool):
+            return                  # not an id this client ever sends
         with self._lock:
             pending = self._pending.get(rid)
             if pending is None and isinstance(rid, str) and rid.isdigit():
@@ -952,11 +1077,11 @@ class McpClient:
             params = {"cursor": cursor} if cursor else None
             result = self.request(method, params, timeout=timeout,
                                   should_stop=should_stop)
-            items.extend(x for x in (result.get(key) or [])
-                         if isinstance(x, dict))
+            items.extend(_objects(result.get(key)))
             cursor = result.get("nextCursor")
             if not cursor:
                 return items
+            cursor = str(cursor)            # a cursor is opaque text
             if cursor in seen:
                 raise McpError(f"{method}: the server repeated a page "
                                f"cursor ({_short(cursor, 40)}); stopping.")
@@ -980,8 +1105,7 @@ class McpClient:
                               timeout=timeout, should_stop=should_stop)
         structured = result.get("structuredContent")
         return ToolResult(
-            content=[c for c in (result.get("content") or [])
-                     if isinstance(c, dict)],
+            content=_objects(result.get("content")),
             structured=structured if isinstance(structured, dict) else None,
             is_error=bool(result.get("isError")))
 
@@ -995,8 +1119,7 @@ class McpClient:
         """The resource's contents: [{uri, mimeType, text | blob}]."""
         result = self.request("resources/read", {"uri": uri},
                               timeout=timeout, should_stop=should_stop)
-        return [c for c in (result.get("contents") or [])
-                if isinstance(c, dict)]
+        return _objects(result.get("contents"))
 
     @property
     def has_tools(self) -> bool:

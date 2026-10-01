@@ -60,7 +60,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, \
 
 from . import docs_servers
 from .docs_servers import ServerSpec
-from .mcp_client import McpError, ToolResult, content_text
+from .mcp_client import (McpConnectionError, McpError, McpTimeout,
+                         ToolResult, content_text)
 
 NOT_COVERED = "The documentation doesn't cover this."
 DOCS_ROLE = "docs"
@@ -535,8 +536,8 @@ def parse_search(server: str, result: ToolResult) -> List[Hit]:
                             str(item.get("description") or ""),
                             uri=str(item["uri"])))
         elif item.get("type") == "resource":
-            res = item.get("resource") or {}
-            if res.get("text"):
+            res = item.get("resource")
+            if isinstance(res, dict) and res.get("text"):
                 hits.append(Hit(server, str(res.get("uri") or ""),
                                 str(res.get("uri") or "resource"),
                                 text=str(res["text"])))
@@ -617,6 +618,33 @@ class Retrieval:
     search_s: float = 0.0
     fetch_s: float = 0.0
     servers_used: int = 0
+    #: Servers given up on during this question (unreachable, timed out,
+    #: disconnected): not asked again until the next question.
+    dead: List[str] = field(default_factory=list)
+
+
+#: The most text of one page that focus() looks at.
+MAX_PAGE_CHARS = 400_000
+
+
+def _give_up(spec: ServerSpec, exc: McpError, out: Retrieval) -> bool:
+    """Whether to stop asking this server for the rest of the question.
+
+    A server that let a request time out costs the WHOLE timeout per request:
+    MEASURED, a wedged one cost 3 timeouts per question (one per query), a
+    second pass cost more, and the next question the same again, because the
+    pool kept handing out its client. So: one timeout and it is not asked
+    again this question, and its pooled client is closed, so the next
+    question starts a fresh process (a single-threaded server answers
+    nothing until its stuck request ends). A dropped connection is given up
+    on too; the pool reconnects it next time by itself."""
+    if isinstance(exc, McpTimeout):
+        docs_servers.release(spec.name)
+    elif not isinstance(exc, McpConnectionError):
+        return False
+    if spec.name not in out.dead:
+        out.dead.append(spec.name)
+    return True
 
 
 def _servers(servers: Any, path=None) -> List[ServerSpec]:
@@ -660,6 +688,12 @@ def retrieve(question: str, queries: Sequence[str], *,
         except McpError as exc:
             _check_stop(should_stop)
             out.errors.append(f"{spec.name}: {exc}")
+            out.dead.append(spec.name)
+            continue
+        except Exception as exc:                          # noqa: BLE001
+            # One server's garbage must not cost the other servers' pages.
+            out.errors.append(f"{spec.name}: {type(exc).__name__}: {exc}")
+            out.dead.append(spec.name)
             continue
         if not roles.usable:
             out.errors.append(f"{spec.name}: no search tool was found.")
@@ -673,28 +707,34 @@ def retrieve(question: str, queries: Sequence[str], *,
             # model guessed "numpy" — the nxpython env has numpy too, and
             # its pages would crowd out the ones the question needs.
             pkgs = list(spec.packages)
-        for q in queries:
-            for pkg in pkgs[:3]:
+        for q, pkg in [(q, p) for q in queries for p in pkgs[:3]]:
+            _check_stop(should_stop)
+            try:
+                result = client.call_tool(
+                    roles.search_tool, _search_args(roles, q, pkg),
+                    timeout=spec.timeout, should_stop=should_stop)
+                found = parse_search(spec.name, result)
+            except McpError as exc:
                 _check_stop(should_stop)
-                try:
-                    result = client.call_tool(
-                        roles.search_tool, _search_args(roles, q, pkg),
-                        timeout=spec.timeout, should_stop=should_stop)
-                except McpError as exc:
-                    _check_stop(should_stop)
-                    out.errors.append(f"{spec.name}: search failed: {exc}")
-                    continue
-                if result.is_error:
-                    msg = " ".join(result.text.split())[:240]
-                    if msg and msg not in out.notes:
-                        out.notes.append(f"{spec.name}: {msg}")
-                    continue
-                for rank, hit in enumerate(parse_search(spec.name, result)):
-                    key = (spec.name, hit.ref)
-                    # Reciprocal rank fusion: robust to servers whose scores
-                    # are not comparable, and to queries of uneven quality.
-                    scores[key] = scores.get(key, 0.0) + 1.0 / (10 + rank)
-                    best.setdefault(key, hit)
+                out.errors.append(f"{spec.name}: search failed: {exc}")
+                if _give_up(spec, exc, out):
+                    break
+                continue
+            except Exception as exc:                      # noqa: BLE001
+                out.errors.append(f"{spec.name}: search failed: "
+                                  f"{type(exc).__name__}: {exc}")
+                continue
+            if result.is_error:
+                msg = " ".join(result.text.split())[:240]
+                if msg and msg not in out.notes:
+                    out.notes.append(f"{spec.name}: {msg}")
+                continue
+            for rank, hit in enumerate(found):
+                key = (spec.name, hit.ref)
+                # Reciprocal rank fusion: robust to servers whose scores
+                # are not comparable, and to queries of uneven quality.
+                scores[key] = scores.get(key, 0.0) + 1.0 / (10 + rank)
+                best.setdefault(key, hit)
     out.search_s = time.perf_counter() - t0
     if not best:
         return out
@@ -724,7 +764,8 @@ def retrieve(question: str, queries: Sequence[str], *,
         if progress:
             progress(f"Reading {hit.title}…")
         text = hit.text
-        if not text and roles.fetch_tool:
+        alive = hit.server not in out.dead
+        if not text and alive and roles.fetch_tool:
             try:
                 res = client.call_tool(roles.fetch_tool,
                                        {roles.fetch_arg: hit.ref},
@@ -738,7 +779,8 @@ def retrieve(question: str, queries: Sequence[str], *,
                 _check_stop(should_stop)
                 out.errors.append(f"{hit.server}: could not read {hit.ref}: "
                                   f"{exc}")
-        elif not text and roles.via_resources and hit.uri:
+                _give_up(spec, exc, out)
+        elif not text and alive and roles.via_resources and hit.uri:
             try:
                 text = content_text(client.read_resource(
                     hit.uri, timeout=spec.timeout, should_stop=should_stop))
@@ -746,9 +788,12 @@ def retrieve(question: str, queries: Sequence[str], *,
                 _check_stop(should_stop)
                 out.errors.append(f"{hit.server}: could not read {hit.uri}: "
                                   f"{exc}")
+                _give_up(spec, exc, out)
         if not text:
             text = f"{hit.title}\n{hit.snippet}".strip()
-        fetched.append((hit, text))
+        # Only the best few thousand chars survive focus(); scanning a
+        # 200 MB "page" for them took 97 s. A page past this is cut first.
+        fetched.append((hit, text[:MAX_PAGE_CHARS]))
     out.fetch_s = time.perf_counter() - t1
     # Share the budget: a short page gives its unused share to the next.
     # Each page gets at least 400 chars when the budget allows — a sliver of
@@ -815,7 +860,18 @@ CODE_RULES = (
 
 
 def render_docs(pages: Sequence[Source]) -> str:
-    return "\n\n".join(f"[{p.n}] {p.title}\n{p.text.strip()}" for p in pages)
+    """The pages as the model reads them, each under its own "[n] title".
+
+    A page's OWN bracketed numbers are rewritten to "(ref n)" here: numpy's
+    docstrings carry reference lists (".. [1] G. Strang, ...", cited in the
+    text as "[1]_"), so page 3 could tell the model "[1]" — the Council's
+    number for a different page. The same rewrite stops a page from forging
+    another page's header (a line "[2] some.name") inside its own text.
+    Only the prompt changes; the Source text the user reads is untouched."""
+    return "\n\n".join(
+        f"[{p.n}] {p.title}\n" + sub_citations(
+            p.text.strip(), lambda n, text: f"(ref {n})")
+        for p in pages)
 
 
 def answer_messages(question: str, pages: Sequence[Source],
@@ -929,22 +985,42 @@ def _as_bool(value: Any, default: bool = True) -> bool:
 #: follows a ']' exactly as an index does, and read one at a time it was
 #: neither counted nor — when invented, "[1][7]" — removed. A run is a
 #: citation when its start is; every [n] in it is then a citation.
-CITATION_RUN = re.compile(r"(?<![\w\]\)'\"])(?:\[\d{1,2}\])+")
+#:
+#: Code is not prose either: "np.array([5])" (an argument list — "(" right
+#: after a name) and anything in `backticks` or a ``` fence hold no
+#: citation, but [5] used to be "removed as invented", leaving `np.zeros()`
+#: in the answer and a false note under it.
+CITATION_RUN = re.compile(
+    r"(?<![\w\]\)'\"])(?<![\w\])\]]\()(?:\[\d{1,2}\])+")
 _ONE_CITATION = re.compile(r"\[(\d{1,2})\]")
+_CODE_SPAN = re.compile(r"```.*?(?:```|\Z)|`[^`\n]*`", re.S)
+
+
+def _prose_runs(text: str) -> list:
+    """The citation runs (re.Match) in `text` that are not inside code."""
+    code = [m.span() for m in _CODE_SPAN.finditer(text)]
+    return [m for m in CITATION_RUN.finditer(text)
+            if not any(a <= m.start() < b for a, b in code)]
 
 
 def citations(text: str) -> List[int]:
     """Every cited number in `text`, in order (runs like [1][2] included)."""
-    return [int(n) for run in CITATION_RUN.findall(text or "")
-            for n in _ONE_CITATION.findall(run)]
+    return [int(n) for run in _prose_runs(text or "")
+            for n in _ONE_CITATION.findall(run.group(0))]
 
 
 def sub_citations(text: str, replace: Callable[[int, str], str]) -> str:
     """`text` with each cited [n] replaced by replace(n, "[n]")."""
-    return CITATION_RUN.sub(
-        lambda run: _ONE_CITATION.sub(
+    text = text or ""
+    out, last = [], 0
+    for run in _prose_runs(text):
+        out.append(text[last:run.start()])
+        out.append(_ONE_CITATION.sub(
             lambda one: replace(int(one.group(1)), one.group(0)),
-            run.group(0)), text or "")
+            run.group(0)))
+        last = run.end()
+    out.append(text[last:])
+    return "".join(out)
 
 _NOT_COVERED_TEXT = re.compile(
     r"(doesn'?t|does not|do not|don'?t) (cover|contain|mention|say|include)"
@@ -1202,15 +1278,33 @@ def check_code(code: str, pages: Sequence[Source],
 
     `packages` are the top-level names whose use is checked; names from
     anything else (the standard library, numpy when the docs are about
-    something else) are not the docs' business."""
+    something else) are not the docs' business.
+
+    Never raises. A small model stuck in a repetition loop writes
+    `x = 1 + 1 + 1 ...` or `.append(1).append(1)...` until num_predict runs
+    out; parsing or walking that raised RecursionError, and the whole answer
+    was lost instead of the code going back for a repair."""
     if not (code or "").strip():
         return CodeCheck(False, ["No code was returned."])
+    try:
+        return _check_code(code, pages, packages)
+    except (RecursionError, MemoryError):
+        return CodeCheck(False, ["The code is nested too deeply to read — "
+                                 "it looks like one expression repeated over "
+                                 "and over. Write it plainly, one step per "
+                                 "line."])
+
+
+def _check_code(code: str, pages: Sequence[Source],
+                packages: Iterable[str]) -> CodeCheck:
     try:
         tree = ast.parse(code)
     except SyntaxError as exc:
         line = (exc.text or "").strip()
         return CodeCheck(False, [f"line {exc.lineno}: SyntaxError: {exc.msg}"
                                  + (f" — `{line}`" if line else "")])
+    except ValueError as exc:               # a NUL byte, on 3.11
+        return CodeCheck(False, [f"The code cannot be parsed: {exc}"])
     issues: List[str] = []
     roots = {p.split(".")[0] for p in packages if p}
 
@@ -1403,13 +1497,20 @@ def ask(question: str, *, servers: Any = None, packages: Any = (),
                          context_chars=context_chars,
                          should_stop=should_stop, progress=progress,
                          config_path=config_path)
-        if not found.pages and hinted and not pkgs:
-            # The model's package guess may be wrong; one more pass without.
-            found = retrieve(question, result.queries, servers=servers,
+        live = [s for s in _servers(servers, config_path)
+                if s.name not in found.dead] if found.dead else servers
+        if not found.pages and hinted and not pkgs and live != []:
+            # The model's package guess may be wrong; one more pass without
+            # — but not to a server the first pass gave up on (a wedged one
+            # cost a second full timeout), and keeping what went wrong.
+            first = found
+            found = retrieve(question, result.queries, servers=live,
                              packages=(), max_pages=max_pages,
                              context_chars=context_chars,
                              should_stop=should_stop, progress=progress,
                              config_path=config_path)
+            found.errors = first.errors + found.errors
+            found.servers_used = max(found.servers_used, first.servers_used)
         result.timings["search_s"] = round(found.search_s, 3)
         result.timings["fetch_s"] = round(found.fetch_s, 3)
         result.sources = found.pages
@@ -1564,7 +1665,7 @@ def _run_tool_call(name: str, args: dict, question: str,
                      max(600, budget // 2))
         n = len(pages) + 1
         pages.append(Source(n, spec.name, ref, ref, text))
-        return f"[{n}] {ref}\n{text}"
+        return render_docs([pages[-1]])
     return f"There is no tool called {name!r}."
 
 

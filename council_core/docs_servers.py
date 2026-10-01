@@ -363,14 +363,24 @@ class Roles:
         return bool(self.search_tool and self.search_arg)
 
 
+def _schema(tool: dict) -> dict:
+    """The tool's inputSchema when it is an object. A server's tool list is
+    not trusted: `"inputSchema": ["query"]` made every question fail with
+    an AttributeError, other servers' answers included."""
+    schema = tool.get("inputSchema")
+    return schema if isinstance(schema, dict) else {}
+
+
 def _props(tool: dict) -> Dict[str, dict]:
-    schema = tool.get("inputSchema") or {}
-    props = schema.get("properties") or {}
-    return props if isinstance(props, dict) else {}
+    props = _schema(tool).get("properties") or {}
+    if not isinstance(props, dict):
+        return {}
+    return {str(k): (v if isinstance(v, dict) else {})
+            for k, v in props.items()}
 
 
 def _required(tool: dict) -> List[str]:
-    req = (tool.get("inputSchema") or {}).get("required") or []
+    req = _schema(tool).get("required") or []
     return [str(r) for r in req] if isinstance(req, list) else []
 
 
