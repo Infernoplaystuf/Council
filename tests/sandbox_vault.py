@@ -46,6 +46,13 @@ SANDBOX_ENV = {
     "COUNCIL_APP_DIR": ROOT,
     "COUNCIL_VAULT_ROOT": VAULT,
     "COUNCIL_SKIP_PATH_MIGRATION": "1",
+    # The engine answers from a localhost Ollama when no GGUF can load
+    # (council_engine._route_chat). On a developer PC that server is real and
+    # has real models, so a test that expects "no model configured" — e.g.
+    # test_council_tab's real-engine turn — would instead run a real
+    # generation. Tests of the Ollama backend turn this back on with
+    # monkeypatch and point COUNCIL_OLLAMA_HOST at a fake server.
+    "COUNCIL_OLLAMA_FALLBACK": "0",
 }
 os.environ.update(SANDBOX_ENV)
 atexit.register(shutil.rmtree, ROOT, ignore_errors=True)

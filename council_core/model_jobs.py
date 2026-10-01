@@ -46,14 +46,16 @@ COLUMNS: Tuple[Tuple[str, str], ...] = (
     ("fits", "Fits GPU?"),
     ("ctx", "Ctx(K)"),
     ("source", "Source"),
+    ("local", "On this PC"),
 )
 
 CATALOG_NOTE = (
     "Curated US-made GGUF models ranked by fit for this machine. Models that "
-    "fit your VRAM run on GPU; the rest run on CPU.\n"
+    "fit your VRAM run on GPU; \"partial\" ones split between GPU and RAM "
+    "(slower); the rest run on CPU.\n"
     "Nothing downloads automatically — pick one and fetch it from the listed "
-    "repo. US-origin is verified for the catalog; online results are a name "
-    "heuristic.")
+    "repo, or `ollama pull` its tag. US-origin is verified for the catalog; "
+    "online results are a name heuristic.")
 
 
 @dataclass
@@ -65,9 +67,19 @@ class Hardware:
 
     @property
     def summary(self) -> str:
-        return (f"Your hardware:  GPU: {self.gpu}   "
+        line = (f"Your hardware:  GPU: {self.gpu}   "
                 f"VRAM: {self.vram_gb or '—'} GB   "
                 f"RAM: {self.ram_gb or '—'} GB")
+        free = self.raw.get("vram_free_gb")
+        if free:
+            line += f"   (VRAM free now: {free} GB)"
+        p, e = self.raw.get("cpu_p_cores"), self.raw.get("cpu_e_cores")
+        if p and e:
+            line += f"   CPU: {p} P-cores + {e} E-cores"
+        speed = self.raw.get("ram_speed_mts")
+        if speed:
+            line += f"   RAM speed: {speed} MT/s"
+        return line
 
 
 PENDING_HARDWARE = "Your hardware:  detecting…"
@@ -173,6 +185,13 @@ def to_row(found: Dict[str, Any]) -> ModelRow:
     # `hf_repo` and `hf_file`, so every one of those columns rendered "—" and
     # every model claimed to be CPU-only on a machine with an RTX 4070.
     source = found.get("source") or "catalog"
+    fit = found.get("fit")
+    if found.get("fits_vram") or fit == "gpu":
+        fits = "yes"
+    elif fit == "partial":
+        fits = "partial"
+    else:
+        fits = "CPU"
     return ModelRow(
         model_id=found.get("id") or found.get("name", ""),
         cells=(
@@ -180,9 +199,10 @@ def to_row(found: Dict[str, Any]) -> ModelRow:
             _cell(found.get("org")),
             _cell(found.get("params_b")),
             _cell(found.get("vram_gb_q4") or found.get("size_gb")),
-            "yes" if found.get("fits_vram") else "CPU",
+            fits,
             _cell(found.get("context_k")),
             _cell(source),
+            found.get("installed") or "no",
         ),
         repo=found.get("hf_repo") or "",
         filename=found.get("hf_file") or "",
@@ -192,7 +212,51 @@ def to_row(found: Dict[str, Any]) -> ModelRow:
         raw=dict(found))
 
 
-def find(hardware: Hardware, *, task: str = "", online: bool = False) -> FindResult:
+def role_for_task(task: str) -> str:
+    """The Task box's text as a catalog role ("code", "docs", "general")."""
+    try:
+        import model_finder
+        fn = getattr(model_finder, "role_for_task", None)
+        return fn(task) if callable(fn) else "general"
+    except Exception:                                     # noqa: BLE001
+        return "general"
+
+
+def warm_local_models() -> None:
+    """Fill local_models' caches (Ollama tags for 5 s, GGUF headers until a
+    file changes). BLOCKING — a few hundred ms on first use; for a worker."""
+    try:
+        from . import local_models
+        local_models.list_local_models()
+    except Exception:                                     # noqa: BLE001
+        pass
+
+
+def _mark_installed(items: List[Dict[str, Any]]) -> None:
+    """Set "installed" ('Ollama' / 'GGUF') on catalog items already on this
+    PC — by Ollama tag or by GGUF file name. Never raises."""
+    try:
+        from . import local_models
+        local = local_models.list_local_models()
+    except Exception:                                     # noqa: BLE001
+        return
+    ollama = {local_models.ollama_name(m["id"]).lower() for m in local
+              if m.get("backend") == "ollama"}
+    ollama |= {n.split(":", 1)[0] + ":latest" for n in ollama if ":" not in n}
+    files = {str(m.get("file") or "").lower() for m in local
+             if m.get("backend") == "gguf"}
+    for item in items:
+        tag = str(item.get("ollama") or "").lower()
+        tags = {tag, tag + ":latest"} if tag and ":" not in tag else {tag}
+        if tag and tags & ollama:
+            item["installed"] = "Ollama"
+        elif str(item.get("hf_file") or "").lower() in files:
+            item["installed"] = "GGUF"
+
+
+def find(hardware: Hardware, *, task: str = "", online: bool = False,
+         role: Optional[str] = None, limit: int = 8,
+         mark_installed: bool = True) -> FindResult:
     """Rank models by fit. BLOCKING when ``online`` — it searches the network.
 
     `find_models` returns a DICT — {"hardware", "catalog", "online",
@@ -202,14 +266,20 @@ def find(hardware: Hardware, *, task: str = "", online: bool = False) -> FindRes
     4070. That is the third time in this port I have assumed an API instead of
     reading it, after `council_engine`'s model slots and `load_pins`.
 
+    ROLE-AWARE: the Task text picks the role ("coding" -> code, "docs" ->
+    docs) — it used to reach only the online query, so the Coder role was
+    never offered a coder. Rows already on this PC (an Ollama tag or a GGUF
+    in the model folders) say so in "On this PC".
+
     The catalog list is authoritative; online results augment it and are
     origin-classified by a name heuristic rather than verified.
     """
+    role = role or role_for_task(task)
     try:
         import model_finder
         found = model_finder.find_models(
             hardware=hardware.raw or None, query=task or "",
-            prefer_online=bool(online)) or {}
+            prefer_online=bool(online), role=role, limit=limit) or {}
     except Exception as exc:                              # noqa: BLE001
         return FindResult(False, f"Could not rank the models: {exc!r}",
                           error=exc)
@@ -220,6 +290,8 @@ def find(hardware: Hardware, *, task: str = "", online: bool = False) -> FindRes
         item.setdefault("source", "catalog")
     for item in online_hits:
         item.setdefault("source", "online")
+    if mark_installed:
+        _mark_installed(catalog)
     rows = [to_row(item) for item in catalog + online_hits]
     verified = sum(1 for r in rows if r.verified_origin)
     if not rows:
@@ -227,27 +299,138 @@ def find(hardware: Hardware, *, task: str = "", online: bool = False) -> FindRes
     tail = ("" if verified == len(rows) else
             f" — {verified} with verified US origin, "
             f"{len(rows) - verified} inferred from the name")
-    return FindResult(True, f"{len(rows)} model(s){tail}.", rows=rows)
+    for_role = "" if role in ("general", "", None) else f" for {role}"
+    return FindResult(True, f"{len(rows)} model(s){for_role}{tail}.",
+                      rows=rows)
 
 
-def upgrade_banner(hardware: Hardware) -> Tuple[str, Optional[Dict[str, Any]]]:
+def current_model() -> Tuple[str, Optional[float]]:
+    """(the main model's name, its size in B when known): the main slot's
+    Ollama model, else COUNCIL_GGUF_PATH's file. The Tk shell passed this to
+    assess_upgrade all along; the Qt banner passed nothing, so can_upgrade
+    was always False."""
+    import os
+    try:
+        from . import model_slots
+        main = model_slots.current().slots.get(model_slots.MAIN)
+        if main is not None and model_slots.is_ollama(main.path):
+            from . import local_models
+            name = local_models.ollama_name(main.path)
+            entry = local_models.ollama_model(name, max_age=60.0) or {}
+            return name, entry.get("params_b")
+    except Exception:                                     # noqa: BLE001
+        pass
+    path = os.environ.get("COUNCIL_GGUF_PATH", "").strip()
+    if not path:
+        return "", None
+    try:
+        from . import local_models
+        entry = local_models.gguf_entry(path) or {}
+        return Path(path).name, entry.get("params_b")
+    except Exception:                                     # noqa: BLE001
+        return Path(path).name, None
+
+
+def upgrade_banner(hardware: Hardware, *, current: Optional[str] = None,
+                   current_params_b: Optional[float] = None,
+                   role: str = "general"
+                   ) -> Tuple[str, Optional[Dict[str, Any]]]:
     """(the banner text, the model to offer) — or ("", None).
 
     BLOCKING. Separate from `find` because a machine with no headroom should
     not be told to look for one.
+
+    The text is assess_upgrade's "reason" — the key it really returns. This
+    read "message" / "summary" / "headline", none of which exist, so the Qt
+    banner was always blank (measured: the keys are budget_gb, can_upgrade,
+    current_model, current_params_b, current_vram_gb, headroom_gb, reason,
+    upgrades). A model is offered only when can_upgrade: the button used to
+    offer the first fitting model whatever was already running.
     """
+    if current is None:
+        current, guessed = current_model()
+        current_params_b = current_params_b or guessed
     try:
         import model_finder
         assessment = model_finder.assess_upgrade(
-            hardware=hardware.raw or None) or {}
+            hardware=hardware.raw or None, current_model=current or "",
+            current_params_b=current_params_b, role=role) or {}
     except Exception:                                     # noqa: BLE001
         return "", None
-    text = (assessment.get("message") or assessment.get("summary")
-            or assessment.get("headline") or "")
-    candidates = assessment.get("upgrades") or assessment.get("candidates") or []
-    best = candidates[0] if candidates else (assessment.get("model")
-                                             or assessment.get("candidate"))
-    return str(text), best
+    text = (assessment.get("reason") or assessment.get("message")
+            or assessment.get("summary") or "")
+    if not assessment.get("can_upgrade"):
+        return str(text), None
+    candidates = assessment.get("upgrades") or []
+    return str(text), (candidates[0] if candidates else None)
+
+
+# ============================================================
+# "Check this PC" — the benchmark hook
+# ============================================================
+# The benchmark harness lives on another branch (council_core.llm_bench). The
+# Models tab's button calls check_this_pc(); it resolves the runner at CALL
+# time, so the merge has to add nothing here: a registered runner wins, else
+# council_core.llm_bench.check_this_pc, else a clear "not in this build".
+
+@dataclass
+class CheckResult:
+    ok: bool
+    message: str
+    rows: List[Dict[str, Any]] = field(default_factory=list)
+    report_path: Optional[Path] = None
+
+
+_BENCH_RUNNER: Optional[Callable[..., Any]] = None
+
+
+def register_bench(runner: Optional[Callable[..., Any]]) -> None:
+    """Install the "Check this PC" runner: runner(models=, vault_dir=,
+    on_progress=, should_stop=) -> CheckResult | dict | list of row dicts.
+    None removes it."""
+    global _BENCH_RUNNER
+    _BENCH_RUNNER = runner
+
+
+def bench_runner() -> Optional[Callable[..., Any]]:
+    if _BENCH_RUNNER is not None:
+        return _BENCH_RUNNER
+    try:
+        from . import llm_bench  # type: ignore[attr-defined]
+    except Exception:                                     # noqa: BLE001
+        return None
+    fn = getattr(llm_bench, "check_this_pc", None)
+    return fn if callable(fn) else None
+
+
+def check_this_pc(*, models: Optional[Sequence[str]] = None,
+                  vault_dir: Any = None,
+                  on_progress: Optional[Callable[[str], None]] = None,
+                  should_stop: Optional[Callable[[], bool]] = None
+                  ) -> CheckResult:
+    """Measure the installed models on this PC. BLOCKING — use a worker.
+    ``models`` are list_local_models() ids (None: every US one)."""
+    runner = bench_runner()
+    if runner is None:
+        return CheckResult(False, "The \"Check this PC\" benchmark is not in "
+                                  "this build yet (council_core.llm_bench).")
+    try:
+        result = runner(models=list(models) if models else None,
+                        vault_dir=vault_dir, on_progress=on_progress,
+                        should_stop=should_stop)
+    except Exception as exc:                              # noqa: BLE001
+        return CheckResult(False, f"The benchmark failed: {exc!r}")
+    if isinstance(result, CheckResult):
+        return result
+    if isinstance(result, dict):
+        return CheckResult(bool(result.get("ok", True)),
+                           str(result.get("message") or "Done."),
+                           list(result.get("rows") or []),
+                           result.get("report_path"))
+    if isinstance(result, list):
+        return CheckResult(True, f"Measured {len(result)} model(s).",
+                           list(result))
+    return CheckResult(True, str(result or "Done."))
 
 
 # ============================================================

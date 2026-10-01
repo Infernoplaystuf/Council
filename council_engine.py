@@ -1,9 +1,11 @@
 # ============================================================
 # council_engine.py  —  v2  [DESKTOP BUILD: 16 GB VRAM-class card, 32 GB+ RAM]
 # ============================================================
-# Backend: GGUF via llama-cpp-python (Ollama path was removed —
-# see _council_backend() below).  Point COUNCIL_GGUF_PATH at a
-# .gguf file; full-GPU offload at COUNCIL_GGUF_GPU_LAYERS=99.
+# Backend: GGUF via llama-cpp-python, or a LOCALHOST Ollama server per
+# role (see _council_backend() and _route_chat below). Point
+# COUNCIL_GGUF_PATH at a .gguf file, or assign a role an "ollama:<name>"
+# model in the Models tab. With no llama-cpp-python in the interpreter, a
+# localhost Ollama answers instead — zero installs.
 #
 # Recommended default model (US-origin, runs comfortably in 16 GB VRAM):
 #   ibm-granite/granite-3.1-8b-instruct-GGUF (Q4_K_M, ~5 GB)
@@ -50,6 +52,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time as _time
 import weakref
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -145,15 +148,38 @@ def _ensure_localhost(url: str, *, allow_remote: bool = False) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Backend selection (Ollama vs. direct GGUF via llama-cpp-python)
+# Backend selection (GGUF in-process via llama-cpp-python, or a LOCALHOST
+# Ollama server)
 #
-# Default: Ollama. Set COUNCIL_BACKEND=gguf to load a GGUF file directly
-# (no Ollama daemon needed) — useful for air-gapped machines where a user
-# transfers a Hugging Face .gguf onto disk and points the council at it.
+# Per call, the role's slot decides (council_core.model_slots):
+#   * a slot whose model is "ollama:<name>"      → Ollama, that model;
+#   * COUNCIL_BACKEND=ollama                     → Ollama for every other
+#                                                  slot too (COUNCIL_OLLAMA_
+#                                                  MODEL, else the best
+#                                                  installed US model);
+#   * otherwise                                  → the slot's GGUF, and when
+#     llama-cpp-python is missing or no GGUF is set, a localhost Ollama if
+#     one answers (COUNCIL_OLLAMA_FALLBACK=0 disables that).
+# Ollama options always sent: num_ctx (the slot window, never more than the
+# model's own), repeat_penalty 1.0 (the server default 1.1 penalises repeated
+# JSON keys and code tokens), keep_alive, seed when given, and "format" when a
+# json_schema is given. Only loopback hosts unless remote nodes are enabled.
+#   COUNCIL_OLLAMA_HOST=http://127.0.0.1:11434   COUNCIL_OLLAMA_MODEL=llama3.1:8b
+#   COUNCIL_OLLAMA_NUM_CTX=8192                  COUNCIL_OLLAMA_KEEP_ALIVE=30m
 #
 # Required env vars in GGUF mode:
 #   COUNCIL_BACKEND=gguf
 #   COUNCIL_GGUF_PATH=C:\path\to\model.gguf
+# Load tuning (each has a retry without it if Llama() refuses it):
+#   COUNCIL_GGUF_FLASH_ATTN=0          flash attention (default ON on a GPU
+#                                        load: no n_ctx-sized KQ buffer)
+#   COUNCIL_GGUF_N_THREADS_BATCH=20    prefill threads (default: P-cores on
+#                                        a full GPU load, all physical cores
+#                                        when layers run on the CPU)
+#   COUNCIL_GGUF_PARTIAL_OFFLOAD=0     a model too big for the card loads
+#                                        with as many layers as fit (default)
+#                                        instead of all-or-nothing
+#   COUNCIL_GGUF_SEED=1234             fixed seed, for reproducible benches
 # Optional:
 #   COUNCIL_GGUF_N_CTX=4096            context window — explicit override.
 #                                        When unset, picked by the n_ctx
@@ -171,7 +197,9 @@ def _ensure_localhost(url: str, *, allow_remote: bool = False) -> None:
 #                                        every input value, every reason
 #                                        for skipping). Stdout, not just
 #                                        logging — for capture-and-send.
-#   COUNCIL_GGUF_N_THREADS=8           CPU threads (defaults to os.cpu_count())
+#   COUNCIL_GGUF_N_THREADS=8           CPU threads (default: the P-cores on a
+#                                        hybrid Intel CPU — 8 of the 14700HX's
+#                                        20 — else the physical cores)
 #   COUNCIL_GGUF_GPU_LAYERS=99         default 99 = offload every layer
 #                                        (no-op on CPU-only builds, so safe);
 #                                        set 0 to force CPU even on a GPU box
@@ -185,9 +213,42 @@ def _ensure_localhost(url: str, *, allow_remote: bool = False) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _council_backend() -> str:
-    """Always 'gguf' — Ollama was removed. Kept as a function for any
-    leftover call sites; returns the fixed string."""
-    return "gguf"
+    """'ollama' when COUNCIL_BACKEND=ollama, else 'gguf'.
+
+    'gguf' (what the launchers export) still means "GGUF in-process when
+    llama-cpp-python can load it". When it cannot — no llama_cpp in this
+    interpreter, or no GGUF configured — and a localhost Ollama answers, a
+    call is served by Ollama instead (see _route_chat): measured 2026-10-01,
+    the council conda env has no llama_cpp at all, so without that fallback
+    the Qt app reaches no model on this PC. COUNCIL_OLLAMA_FALLBACK=0 turns
+    the fallback off; a role assigned an "ollama:<name>" model always uses
+    Ollama."""
+    raw = os.environ.get("COUNCIL_BACKEND", "").strip().lower()
+    return "ollama" if raw == "ollama" else "gguf"
+
+
+class BackendUnavailable(RuntimeError):
+    """No model can serve this call on the chosen backend: llama-cpp-python is
+    not installed, no GGUF is configured, or no Ollama answers. A
+    RuntimeError, so every handler written for the old message still catches
+    it; the router catches THIS class to try the other backend."""
+
+
+class GenerationCancelled(RuntimeError):
+    """should_stop() said stop. ``partial`` is what was generated so far."""
+
+    def __init__(self, message: str = "generation cancelled",
+                 partial: str = ""):
+        super().__init__(message)
+        self.partial = partial
+
+
+class LocalChatTimeout(TimeoutError):
+    """No progress for ``timeout`` seconds. ``partial`` is what arrived."""
+
+    def __init__(self, message: str, partial: str = ""):
+        super().__init__(message)
+        self.partial = partial
 
 
 _GGUF_MODEL_INSTANCE = None
@@ -587,6 +648,17 @@ def _estimate_kv_cache_bytes(metadata: Dict[str, Any], n_ctx: int,
     embed_dim = _gguf_int_field(metadata, "embedding_length")
     if not (n_layers and n_kv_heads and n_heads and embed_dim and n_ctx > 0):
         return None
+    # attention.key_length / value_length, when the header has them, ARE the
+    # head sizes. embedding/heads is only a guess, and a wrong one on the
+    # models that set them: Gemma 2 9B gives 224 for a real 256, gpt-oss 45
+    # for a real 64 (the gpt-oss blob on this PC: key_length 64) — KV cache
+    # under-budgeted by 12-30 %.
+    k_dim = _gguf_int_field(metadata, "attention.key_length")
+    v_dim = _gguf_int_field(metadata, "attention.value_length")
+    if k_dim or v_dim:
+        k_dim = k_dim or v_dim
+        v_dim = v_dim or k_dim
+        return n_layers * n_ctx * n_kv_heads * (k_dim + v_dim) * bytes_per_elem
     head_dim = max(1, embed_dim // n_heads)
     return 2 * n_layers * n_ctx * n_kv_heads * head_dim * bytes_per_elem
 
@@ -601,24 +673,15 @@ def _available_gpu_bytes() -> Tuple[Optional[int], str]:
     the wrong culprit and sent a real debugging session after the GPU.
 
     torch is NOT a dependency of the GGUF path — llama-cpp-python is. So
-    torch is tried first (cheapest, in-process, and already loaded when the
-    RAG stack is live) and nvidia-smi is the fallback, matching how
-    gpu_check.py and hardware_detect.py already probe for GPUs.
+    nvidia-smi goes FIRST: it ships with the driver, runs out of process, and
+    leaves this process without a CUDA context. torch.cuda.mem_get_info
+    creates one — VRAM taken on an 8 GB card before the model loads, plus the
+    seconds of importing torch — so it is only the fallback for a machine
+    whose driver has no nvidia-smi on PATH.
     """
-    # 1. torch, when it happens to be installed.
-    try:
-        import torch as _t   # type: ignore[import]
-        if _t.cuda.is_available():
-            free, _total = _t.cuda.mem_get_info()
-            return int(free), "torch.cuda.mem_get_info"
-        torch_says = "torch present but torch.cuda.is_available() is False"
-    except ImportError:
-        torch_says = "torch not installed"
-    except Exception as exc:
-        torch_says = f"torch probe failed: {exc!r}"
-
-    # 2. nvidia-smi — the same query gpu_check.py uses. Present whenever the
+    # 1. nvidia-smi — the same query gpu_check.py uses. Present whenever the
     #    NVIDIA driver is, regardless of which Python packages are.
+    smi_says = ""
     try:
         import shutil as _sh
         exe = _sh.which("nvidia-smi")
@@ -627,15 +690,30 @@ def _available_gpu_bytes() -> Tuple[Optional[int], str]:
                 [exe, "--query-gpu=memory.free",
                  "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=10,
-                encoding="utf-8", errors="replace")
+                encoding="utf-8", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
             first = (r.stdout or "").strip().splitlines()
             if first and first[0].strip().isdigit():
                 # nvidia-smi reports MiB.
                 return int(first[0].strip()) * 1024 * 1024, "nvidia-smi"
-            return None, f"{torch_says}; nvidia-smi returned no usable value"
-        return None, f"{torch_says}; nvidia-smi not on PATH"
+            smi_says = "nvidia-smi returned no usable value"
+        else:
+            smi_says = "nvidia-smi not on PATH"
     except Exception as exc:
-        return None, f"{torch_says}; nvidia-smi probe failed: {exc!r}"
+        smi_says = f"nvidia-smi probe failed: {exc!r}"
+
+    # 2. torch, when it happens to be installed.
+    try:
+        import torch as _t   # type: ignore[import]
+        if _t is not None and _t.cuda.is_available():
+            free, _total = _t.cuda.mem_get_info()
+            return int(free), "torch.cuda.mem_get_info"
+        torch_says = "torch present but torch.cuda.is_available() is False"
+    except ImportError:
+        torch_says = "torch not installed"
+    except Exception as exc:
+        torch_says = f"torch probe failed: {exc!r}"
+    return None, f"{smi_says}; {torch_says}"
 
 
 def _diagnose_load_failure(model_path: Any, exc: BaseException) -> str:
@@ -816,13 +894,13 @@ def _main_gguf_path() -> Path:
     """COUNCIL_GGUF_PATH, checked. Raises with the env var to set."""
     path_str = os.environ.get("COUNCIL_GGUF_PATH", "").strip()
     if not path_str:
-        raise RuntimeError(
+        raise BackendUnavailable(
             "COUNCIL_BACKEND=gguf but COUNCIL_GGUF_PATH is not set.\n"
             "Set it to the absolute path of a .gguf model file."
         )
     p = Path(path_str)
     if not p.exists() or not p.is_file():
-        raise RuntimeError(f"GGUF model not found at: {path_str}")
+        raise BackendUnavailable(f"GGUF model not found at: {path_str}")
     return p
 
 
@@ -832,6 +910,156 @@ def _get_gguf_model():
     if _GGUF_MODEL_INSTANCE is not None:
         return _GGUF_MODEL_INSTANCE
     return _get_slot_model("main")
+
+
+#: path key -> how that file last loaded (layers, window, threads, flash
+#: attention, the partial-offload note) — for slot_status and the Models tab.
+_LAST_LOAD_INFO: Dict[str, Dict[str, Any]] = {}
+
+_OFF_VALUES = ("0", "false", "no", "off")
+
+
+def _env_off(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in _OFF_VALUES
+
+
+def _partial_offload_allowed() -> bool:
+    """Only when the layer count is the automatic one: an explicit
+    COUNCIL_GGUF_GPU_LAYERS (0, -1, 20, 99) is the user's decision."""
+    if os.environ.get("COUNCIL_GGUF_GPU_LAYERS", "").strip():
+        return False
+    return not _env_off("COUNCIL_GGUF_PARTIAL_OFFLOAD")
+
+
+def _plan_partial_offload(p: Path, metadata: Dict[str, Any], n_ctx_cap: int,
+                          *, fixed_ctx: Optional[int] = None):
+    """model_slots.plan_offload for one file, from its header and the card's
+    free VRAM — or None when either is unknown (then the ladder decides, as
+    before). Layer sizes come from the tensor table (the largest block, so
+    the heaviest layer cannot overrun); without one, the embeddings and
+    output are counted as two layers' worth."""
+    from council_core import local_models, model_slots
+    if not metadata:
+        return None
+    kv_tok = _estimate_kv_cache_bytes(metadata, 1)
+    if not kv_tok:
+        return None
+    free, _source = _available_gpu_bytes()
+    if not free:
+        return None
+    size = int(p.stat().st_size)
+    n_layers, per_layer, _other = local_models.layer_bytes(
+        local_models.read_gguf(p, tensors=True))
+    n_layers = n_layers or _gguf_int_field(metadata, "block_count") or 0
+    if not n_layers:
+        return None
+    if not per_layer:
+        per_layer = size // (n_layers + 2)
+    model_max = _gguf_max_context_from_metadata(metadata) or _BLIND_N_CTX
+    want = fixed_ctx or min(_BLIND_N_CTX, n_ctx_cap, model_max)
+    return model_slots.plan_offload(
+        file_bytes=size, n_layers=n_layers, per_layer_bytes=per_layer,
+        kv_bytes_per_token=kv_tok, free_vram_bytes=free,
+        margin_bytes=_slot_margin_bytes(), partial_ctx=want,
+        min_full_ctx=min(4096, want))
+
+
+def _cpu_split() -> Dict[str, Optional[int]]:
+    try:
+        import hardware_detect
+        return hardware_detect.cpu_core_split()
+    except Exception:                                     # noqa: BLE001
+        return {"p_cores": None, "e_cores": None, "physical": None,
+                "logical": os.cpu_count()}
+
+
+def _default_threads(*, full_gpu: bool) -> Tuple[int, int]:
+    """(n_threads, n_threads_batch).
+
+    Decode (n_threads) on the P-cores only. On a hybrid Intel CPU llama.cpp
+    splits each matrix evenly across its threads, so one E-core thread holds
+    up the eight P-core ones every token — and Windows parks background work
+    on the E-cores. psutil's physical count (20 on the 14700HX: 8P + 12E)
+    mixed them; without psutil it was os.cpu_count(), 28 with SMT siblings.
+    Prefill (n_threads_batch) is compute-bound and scales with cores, so a
+    model with layers on the CPU gets every physical core for it; a model
+    wholly on the GPU barely uses the CPU and keeps the P-cores.
+    COUNCIL_GGUF_N_THREADS / _N_THREADS_BATCH override either.
+    """
+    split = _cpu_split()
+    physical = split.get("physical") or 0
+    if not physical:
+        try:
+            import psutil as _ps   # type: ignore[import]
+            physical = int(_ps.cpu_count(logical=False) or 0)
+        except Exception:                                 # noqa: BLE001
+            physical = 0
+    physical = physical or max(1, os.cpu_count() or 4)
+    p_cores = split.get("p_cores") or physical
+    try:
+        n_threads = int(os.environ.get("COUNCIL_GGUF_N_THREADS", "") or p_cores)
+    except ValueError:
+        n_threads = p_cores
+    try:
+        n_batch = int(os.environ.get("COUNCIL_GGUF_N_THREADS_BATCH", "")
+                      or (n_threads if full_gpu else physical))
+    except ValueError:
+        n_batch = n_threads if full_gpu else physical
+    return max(1, n_threads), max(1, n_batch)
+
+
+def _load_tuning(n_gpu_layers: int, n_threads_batch: int) -> Dict[str, Any]:
+    """The Llama() kwargs added on top of the historical five. Flash
+    attention on any GPU load: without it llama.cpp reserves an n_ctx-sized
+    KQ score buffer (≈1 GiB for an 8B model at 16K) that the ladder's 1 GB
+    margin was silently expected to absorb."""
+    out: Dict[str, Any] = {"n_threads_batch": int(n_threads_batch)}
+    if n_gpu_layers != 0 and not _env_off("COUNCIL_GGUF_FLASH_ATTN"):
+        out["flash_attn"] = True
+    seed = os.environ.get("COUNCIL_GGUF_SEED", "").strip()
+    if seed.lstrip("-").isdigit():
+        out["seed"] = int(seed)
+    return out
+
+
+_GPU_DIAG: Optional[str] = None
+
+
+def _gpu_diag_line() -> str:
+    """'  GPU=<name> (<total> GB VRAM)' for the load log; nvidia-smi first so
+    no CUDA context is created here. Cached: a GPU is not hot-swapped."""
+    global _GPU_DIAG
+    if _GPU_DIAG is not None:
+        return _GPU_DIAG
+    line = ""
+    try:
+        exe = shutil.which("nvidia-smi")
+        if exe:
+            r = subprocess.run(
+                [exe, "--query-gpu=name,memory.total",
+                 "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=10,
+                encoding="utf-8", errors="replace",
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            first = (r.stdout or "").strip().splitlines()
+            parts = [x.strip() for x in first[0].split(",")] if first else []
+            if len(parts) >= 2 and parts[1].isdigit():
+                line = f"  GPU={parts[0]} ({int(parts[1]) / 1024:.1f} GB VRAM)"
+    except Exception:                                     # noqa: BLE001
+        line = ""
+    if not line:
+        try:
+            import torch as _t   # type: ignore[import]
+            if _t.cuda.is_available():
+                total = _t.cuda.get_device_properties(0).total_memory
+                line = (f"  GPU={_t.cuda.get_device_name(0)} "
+                        f"({total / (1024**3):.1f} GB VRAM)")
+            else:
+                line = "  GPU=none detected (torch.cuda.is_available()=False)"
+        except Exception:                                 # noqa: BLE001
+            line = ""
+    _GPU_DIAG = line
+    return line
 
 
 def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
@@ -848,11 +1076,13 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
     try:
         from llama_cpp import Llama
     except ImportError as exc:
-        raise RuntimeError(
+        raise BackendUnavailable(
             "llama-cpp-python is not installed. Install with:\n"
             "  conda install -c conda-forge llama-cpp-python\n"
             "or\n"
-            "  pip install llama-cpp-python"
+            "  pip install llama-cpp-python\n"
+            "(or run a localhost Ollama: the council uses it when this "
+            "interpreter cannot load a GGUF)"
         ) from exc
 
     # ── Where it runs: decided BEFORE the context is sized ────────────────
@@ -977,6 +1207,37 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
         except Exception as exc:
             _ladder_log("metadata_parse", error=repr(exc), chosen=False)
 
+    # Rung 1b: PARTIAL OFFLOAD. A lone model too big for the card at a 4096
+    # window used to load with every layer requested — rung 2 found "no
+    # headroom", rung 3 took the blind 8192 — and the outcome was a CUDA OOM
+    # at load or the Windows driver silently spilling into shared memory. On
+    # the RTX 4070 Laptop (7.9 GB free) that is Phi-4 14B (8.4 GiB), Gemma 3
+    # 12B and gpt-oss-20b. Now it gets as many layers as fit beside an 8192
+    # window and the rest run on the CPU. A model that DOES fit is untouched
+    # (full offload at 8K beats partial at 16K: the ladder still sizes it).
+    # Only for the automatic layer count — an explicit COUNCIL_GGUF_GPU_LAYERS
+    # is the user's decision — and not for a slot the planner sized.
+    offload_note = ""
+    if (not on_cpu and kv_budget_bytes is None and n_gpu_layers_cap is None
+            and _partial_offload_allowed()):
+        try:
+            offload = _plan_partial_offload(
+                p, metadata or read_gguf_metadata(p), n_ctx_cap,
+                fixed_ctx=n_ctx)
+        except Exception as exc:                          # noqa: BLE001
+            offload = None
+            _ladder_log("partial_offload", error=repr(exc), chosen=False)
+        if offload is not None and offload.n_gpu_layers != -1:
+            n_gpu_layers = offload.n_gpu_layers
+            on_cpu = n_gpu_layers == 0
+            offload_note = offload.reason
+            if n_ctx is None:
+                n_ctx = offload.n_ctx
+                n_ctx_source = offload.reason
+            _ladder_log("partial_offload", chosen=True,
+                        n_gpu_layers=n_gpu_layers, n_ctx=n_ctx,
+                        reason=offload.reason)
+
     # Rung 2: VRAM-aware sizing. Not for a CPU load (see "Where it runs").
     if n_ctx is None and metadata and on_cpu:
         _ladder_log("vram_aware", chosen=False, n_gpu_layers=n_gpu_layers,
@@ -1078,52 +1339,21 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
 
     _LOG.info("[GGUF] n_ctx chosen = %s (source: %s)", f"{n_ctx:,}", n_ctx_source)
     print(f"[GGUF] n_ctx = {n_ctx:,}  (source: {n_ctx_source})", flush=True)
-    # Default n_threads: prefer PHYSICAL cores when we can read them,
-    # otherwise fall back to logical-count (os.cpu_count()) which is
-    # what the app used historically. Note we deliberately do NOT use a
-    # "divide logical by 2" heuristic — it correctly handles classic
-    # x86 hyperthreading but undercounts on:
-    #   • Non-hyperthreaded x86 (older Athlon, Atom, some Xeons)
-    #   • Apple Silicon (no SMT — physical == logical)
-    #   • Intel 12th-gen+ hybrid CPUs (P+E cores; logical != 2×physical)
-    # When psutil isn't installed, defaulting to logical count is slower
-    # than optimal on hyperthreaded CPUs (~10-30%) but never crashes or
-    # undercounts. Users who care about peak performance can install
-    # psutil OR set COUNCIL_GGUF_N_THREADS explicitly.
-    def _default_n_threads() -> int:
-        try:
-            import psutil as _ps   # type: ignore[import]
-            n = _ps.cpu_count(logical=False)
-            if n and n >= 1:
-                return int(n)
-        except Exception:
-            pass
-        return max(1, os.cpu_count() or 4)
-
-    n_threads = int(os.environ.get("COUNCIL_GGUF_N_THREADS",
-                                    str(_default_n_threads())))
+    # Threads: the P-cores on a hybrid Intel CPU, else the physical cores
+    # (see _default_threads). n_threads_batch (prefill) is explicit too:
+    # llama-cpp-python's default is multiprocessing.cpu_count() — 28 logical
+    # threads on the 14700HX, SMT siblings and E-cores included.
+    n_blocks = (_gguf_int_field(metadata, "block_count") if metadata
+                else None) or 99
+    full_gpu = n_gpu_layers < 0 or n_gpu_layers >= min(99, n_blocks)
+    n_threads, n_threads_batch = _default_threads(full_gpu=full_gpu)
 
     # n_gpu_layers was decided before the ladder ("Where it runs", above).
 
-    # Best-effort GPU sanity check — surface the actual GPU + available
-    # VRAM in the startup log when one is detected, so users see why
-    # the model loaded on CPU vs GPU. Both probes are wrapped in try/
-    # except because either may fail on machines without torch / nvidia-
-    # smi; failure just means we don't print the extra diagnostic line.
-    gpu_diag = ""
-    try:
-        import torch as _t   # already a dep via sentence-transformers
-        if _t.cuda.is_available():
-            name = _t.cuda.get_device_name(0)
-            total_gb = _t.cuda.get_device_properties(0).total_memory / (1024**3)
-            gpu_diag = f"  GPU={name} ({total_gb:.1f} GB VRAM)"
-        else:
-            gpu_diag = "  GPU=none detected (torch.cuda.is_available()=False)"
-    except Exception:
-        # No torch installed (rare — sentence-transformers pulls it),
-        # or some other probe failure. Leave the diag empty and trust
-        # the n_gpu_layers line to tell the user what happened.
-        pass
+    # Best-effort GPU sanity check — surface the actual GPU in the startup
+    # log, so users see why the model loaded on CPU vs GPU. nvidia-smi first
+    # (no CUDA context in this process), torch only when it is missing.
+    gpu_diag = _gpu_diag_line()
 
     # ── CPU feature probe (Linux + WSL only) ────────────────────────────
     # llama-cpp-python's prebuilt wheels assume AVX2 + F16C. When the
@@ -1169,8 +1399,13 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
             _LOG.warning(warning)
             print(warning, flush=True)
 
+    tuning = _load_tuning(n_gpu_layers, n_threads_batch)
     print(f"[GGUF] Loading {p.name} (n_ctx={n_ctx:,}, n_threads={n_threads}, "
-          f"n_gpu_layers={n_gpu_layers}){gpu_diag}", flush=True)
+          f"n_threads_batch={n_threads_batch}, n_gpu_layers={n_gpu_layers}, "
+          f"flash_attn={'on' if tuning.get('flash_attn') else 'off'})"
+          f"{gpu_diag}", flush=True)
+    if offload_note:
+        print(f"[GGUF] {offload_note}", flush=True)
     if n_gpu_layers > 0 and "GPU=none" in gpu_diag:
         print("[GGUF] WARNING: n_gpu_layers > 0 but no CUDA GPU detected. "
               "llama-cpp will fall back to CPU. To force CPU only and "
@@ -1312,8 +1547,26 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
     _LOG.info("[GGUF] Llama() call starting (vision=%s)",
               "on" if chat_handler else "off")
 
+    # The tuning (flash attention, explicit prefill threads, a fixed seed)
+    # goes in first; a build or model that refuses any of it gets one retry
+    # without, so a tuning knob can cost speed but never the load.
+    llm = None
+    if tuning:
+        try:
+            llm = Llama(**dict(llama_kwargs, **tuning))
+        except Exception as tuned_exc:                    # noqa: BLE001
+            print(f"[GGUF] Load with {', '.join(sorted(tuning))} failed "
+                  f"({tuned_exc!r}); retrying without them.", flush=True)
+            _LOG.warning("[GGUF] tuned load failed (%r); retrying plain",
+                         tuned_exc)
+            _record_engine_failure(
+                "model.tuned_load_retry",
+                f"Llama() refused {sorted(tuning)}: {tuned_exc!r}",
+                context={"model": p.name})
+            tuning = {}
     try:
-        llm = Llama(**llama_kwargs)
+        if llm is None:
+            llm = Llama(**llama_kwargs)
     except Exception as primary_exc:
         # Failure-mode (1) and (2) from the comment above: if vision
         # was attached and Llama() crashed, retry without the handler.
@@ -1375,6 +1628,12 @@ def _load_gguf(p: Path, *, n_gpu_layers_cap: Optional[int] = None,
             )
     except Exception:
         pass
+    _LAST_LOAD_INFO[_path_key(p)] = {
+        "n_gpu_layers": n_gpu_layers, "n_ctx": n_ctx,
+        "n_threads": n_threads, "n_threads_batch": n_threads_batch,
+        "flash_attn": bool(tuning.get("flash_attn")),
+        "partial_offload": offload_note,
+    }
     return llm
 
 
@@ -1400,12 +1659,31 @@ def _slot_file(cfg: Any, slot: str) -> Path:
     s = cfg.slots.get(slot) or cfg.slots["main"]
     if s.name == "main" and not s.path:
         return _main_gguf_path()
+    if getattr(s, "is_ollama", False):
+        # Not a file: Ollama serves it (_route_chat never sends it here). A
+        # caller that wants the GGUF instance itself — get_runner(), the
+        # LlamaCpp runner — gets a reason, not "not on disk: ollama:…".
+        raise BackendUnavailable(
+            f"Slot '{s.name}' is served by Ollama ({s.path}), not a GGUF "
+            "file; this caller needs a GGUF.")
     p = Path(s.path)
     if not p.is_file():
         raise RuntimeError(
             f"The model for slot '{s.name}' is not on disk: {s.path}\n"
             "Pick another file for those roles in the Models tab.")
     return p
+
+
+def _main_key(cfg: Any) -> Optional[str]:
+    """main's file key, or None when main is not a GGUF (an Ollama main):
+    then no GGUF slot is "main" — it loads with its own lock, and
+    _INFERENCE_LOCK / _GGUF_MODEL_INSTANCE stay unused."""
+    try:
+        return _path_key(_slot_file(cfg, "main"))
+    except BackendUnavailable:
+        if getattr(cfg.slots.get("main"), "is_ollama", False):
+            return None
+        raise
 
 
 def _slot_keys(cfg: Any) -> Dict[str, str]:
@@ -1491,7 +1769,7 @@ def _get_slot_model(slot: str = "main"):
             slot = "main"
         path = _slot_file(cfg, slot)
         key = _path_key(path)
-        is_main = key == _path_key(_slot_file(cfg, "main"))
+        is_main = key == _main_key(cfg)
         llm = _SLOT_INSTANCES.get(key)
         if (llm is not None and is_main
                 and _registered_lock(llm) not in (None, _INFERENCE_LOCK)):
@@ -1540,10 +1818,19 @@ def _get_slot_model(slot: str = "main"):
                 n_ctx = int(llm.n_ctx())
             except Exception:
                 n_ctx = None
+            info = dict(_LAST_LOAD_INFO.get(key) or {})
+            layers = info.get("n_gpu_layers")
+            if isinstance(layers, int):
+                on_gpu = layers != 0
+                if info.get("partial_offload") and layers != 0:
+                    reason = info["partial_offload"]
             for name, k in _slot_keys(cfg).items():
                 if k == key:
                     _SLOT_STATUS[name] = {"path": str(path), "n_ctx": n_ctx,
-                                          "on_gpu": on_gpu, "reason": reason}
+                                          "on_gpu": on_gpu, "reason": reason,
+                                          "backend": "gguf", **{
+                                              k2: v for k2, v in info.items()
+                                              if k2 != "n_ctx"}}
         if is_main:
             _GGUF_MODEL_INSTANCE = llm
         return llm
@@ -1595,7 +1882,7 @@ def _slot_llm_and_lock(slot: str):
         cfg = _slot_config()
         name = slot if slot in cfg.slots else "main"
         key = _path_key(_slot_file(cfg, name))
-        return llm, _file_lock(key, key == _path_key(_slot_file(cfg, "main")))
+        return llm, _file_lock(key, key == _main_key(cfg))
 
 
 def slot_status() -> Dict[str, Dict[str, Any]]:
@@ -1615,15 +1902,23 @@ def _release_slots() -> None:
     exists, so anything still reaching it waits on the lock its running
     call holds, not on the fresh one the next load of the file gets.
     """
-    global _SLOT_PLAN
+    global _SLOT_PLAN, _AUTO_PICK
     with _SLOT_LOAD_LOCK:
         _SLOT_INSTANCES.clear()
         _SLOT_LOCKS.clear()
         _SLOT_STATUS.clear()
         _SLOT_PLAN = None
+    # Ollama routing is re-decided too: a slot that fell back because
+    # llama-cpp-python was missing tries its GGUF again, the default model is
+    # re-picked (one may have been pulled), and windows are re-read.
+    with _ROUTE_LOCK:
+        _AUTO_OLLAMA.clear()
+        _OLLAMA_WINDOWS.clear()
+        _AUTO_PICK = None
     try:
-        from council_core import model_slots
+        from council_core import local_models, model_slots
         model_slots.invalidate()
+        local_models.invalidate_cache()
     except Exception:
         pass
 
@@ -1760,6 +2055,12 @@ def effective_n_ctx(slot: str = "main") -> int:
     9,408 chars where (16384 - 1156) × 3.2 = 48,729 fit, and
     context_budget_report called a 5,000-token prompt "over the window".
     """
+    # A slot Ollama has served: the num_ctx it was sent (a dict read — no
+    # config read, no network). COUNCIL_GGUF_N_CTX does not apply to it.
+    with _ROUTE_LOCK:
+        ollama_window = _OLLAMA_WINDOWS.get(slot or "main")
+    if ollama_window:
+        return int(ollama_window)
     env_ctx = _env_n_ctx()
     if not _SLOT_INSTANCES and _LAST_N_CTX is None:
         return env_ctx if env_ctx is not None else _DEFAULT_N_CTX
@@ -2086,36 +2387,329 @@ def _instance_token_counter(llm: Any) -> Optional[Callable[[str], int]]:
     return _count
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Telemetry — what the last call cost (last_call_stats)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_STATS_LOCK = threading.Lock()
+_LAST_STATS: Dict[str, Dict[str, Any]] = {}
+_STATS_SEQ = 0
+_ANY_ROLE = "\x00any"
+
+
+def _record_stats(role: Optional[str], stats: Dict[str, Any]) -> None:
+    global _STATS_SEQ
+    s = dict(stats)
+    s["role"] = role or ""
+    with _STATS_LOCK:
+        _STATS_SEQ += 1
+        s["seq"] = _STATS_SEQ
+        _LAST_STATS[role or ""] = s
+        _LAST_STATS[_ANY_ROLE] = s
+
+
+def last_call_stats(role: Optional[str] = None) -> Dict[str, Any]:
+    """What the most recent model call cost: for ``role`` when given ({} if
+    that role has not called yet), else the most recent call of any role.
+
+    Keys, both backends: backend ('gguf' | 'ollama'), model, prompt_tokens,
+    gen_tokens, seconds (wall time of the whole call), gen_tok_s,
+    prompt_tok_s, constrained (bool — a schema or JSON grammar shaped the
+    output). Also: constraint ('schema' | 'json' | 'none'), ttft_s (to the
+    first token, prefill included), num_ctx, schema_valid / schema_errors
+    when a json_schema was given, load_s (Ollama: model load inside this
+    call), wait_s (GGUF: time spent waiting for another call on the same
+    model). A number that could not be measured is None.
+    """
+    with _STATS_LOCK:
+        s = _LAST_STATS.get(_ANY_ROLE if role is None else role)
+        return dict(s) if s else {}
+
+
+def _rate(n: Any, seconds: Any) -> Optional[float]:
+    try:
+        n, seconds = float(n), float(seconds)
+    except (TypeError, ValueError):
+        return None
+    return round(n / seconds, 2) if n > 0 and seconds > 0 else None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Structured output — json_schema -> llama.cpp grammar, cached per schema
+# ─────────────────────────────────────────────────────────────────────────────
+
+_GRAMMAR_LOCK = threading.Lock()
+_GRAMMAR_CACHE: Dict[str, Tuple[Any, str]] = {}
+
+
+def _grammar_for_schema(schema: Dict[str, Any]) -> Tuple[Any, str]:
+    """(LlamaGrammar or None, 'schema' | 'json' | 'none') for ``schema``.
+
+    Compiled once per schema hash — measured 0.8 ms for a plan-sized schema
+    in llama-cpp-python 0.3.35, more for a 26-variant wireframe schema, and
+    every Describe round would pay it again. Built with
+    LlamaGrammar.from_json_schema directly, NOT via response_format: that
+    path falls back to a generic JSON grammar SILENTLY when the converter
+    refuses a schema (llama_chat_format._grammar_for_json_schema), and a
+    caller that thinks its schema is enforced when it is not is the failure
+    this exists to prevent. Here the fallback is the same, but logged, and
+    last_call_stats says constraint='json'.
+    """
+    from council_core import structured_output as _so
+    key = _so.schema_key(schema)
+    with _GRAMMAR_LOCK:
+        hit = _GRAMMAR_CACHE.get(key)
+    if hit is not None:
+        return hit
+    try:
+        from llama_cpp import llama_grammar as _lg      # type: ignore
+    except Exception:                                     # noqa: BLE001
+        return None, "none"          # not cached: a test may install one
+    result: Tuple[Any, str] = (None, "none")
+    try:
+        result = (_lg.LlamaGrammar.from_json_schema(json.dumps(schema),
+                                                    verbose=False), "schema")
+    except Exception as exc:                              # noqa: BLE001
+        _LOG.warning(
+            "[structured] schema %s could not be compiled to a grammar (%r); "
+            "using the generic JSON grammar — the reply is still checked "
+            "against the schema afterwards", key, exc)
+        try:
+            result = (_lg.LlamaGrammar.from_string(_lg.JSON_GBNF,
+                                                   verbose=False), "json")
+        except Exception as exc2:                         # noqa: BLE001
+            _LOG.warning("[structured] the generic JSON grammar failed too "
+                         "(%r); this schema runs unconstrained", exc2)
+    with _GRAMMAR_LOCK:
+        _GRAMMAR_CACHE[key] = result
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GGUF generation (llama-cpp-python, in process)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _acquire(lock: Any, should_stop: Optional[Callable[[], bool]]) -> None:
+    """Take ``lock``; with should_stop, in short waits so a Stop pressed while
+    another call holds the model returns at once instead of after it."""
+    if should_stop is None:
+        lock.acquire()
+        return
+    while not lock.acquire(timeout=0.2):
+        if should_stop():
+            raise GenerationCancelled("stopped while waiting for the model")
+
+
+def _merge_system_into_user(messages: List[Dict[str, Any]]
+                            ) -> List[Dict[str, Any]]:
+    """For chat templates that refuse a system role (Gemma 2's raises): the
+    system text goes in front of the first user message instead."""
+    sys_text = "\n\n".join(str(m.get("content") or "") for m in messages
+                           if m.get("role") == "system")
+    rest = [dict(m) for m in messages if m.get("role") != "system"]
+    if not sys_text:
+        return rest
+    for m in rest:
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            m["content"] = sys_text + "\n\n" + m["content"]
+            return rest
+    return [{"role": "user", "content": sys_text}] + rest
+
+
+def _is_system_role_error(exc: BaseException) -> bool:
+    t = str(exc).lower()
+    return "system" in t and ("role" in t or "not supported" in t)
+
+
+def _gguf_generate(
+    messages: List[Dict[str, Any]],
+    *,
+    temperature: float,
+    num_predict: int,
+    slot: str = "main",
+    token_callback: Optional[Callable[[str], None]] = None,
+    role: Optional[str] = None,
+    json_schema: Optional[Dict[str, Any]] = None,
+    seed: Optional[int] = None,
+    stop: Any = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    timeout: Optional[float] = None,
+) -> str:
+    """One chat completion on ``slot``'s GGUF, ALWAYS streamed inside.
+
+    Streaming is what makes a generation stoppable (should_stop between
+    tokens), timeable and measurable (time to first token, tokens/s) — the
+    blocking create_chat_completion gave none of that, and a CPU-placed 14B
+    writing Describe's 1800 tokens could not be stopped. The text is the
+    same either way.
+
+    ``timeout`` is a STALL limit, the meaning every caller's number had when
+    it was written against Ollama's socket timeout: seconds without a new
+    token. Prefill runs inside llama.cpp and cannot be interrupted, so the
+    clock starts at the first token. A generation that is slow but moving is
+    never cut.
+    """
+    if should_stop is not None and should_stop():
+        raise GenerationCancelled("stopped before the call started")
+    t_start = _time.monotonic()
+    llm, lock = _slot_llm_and_lock(slot)
+    grammar, gkind = (None, "none")
+    if json_schema is not None:
+        grammar, gkind = _grammar_for_schema(json_schema)
+    extra: Dict[str, Any] = {}
+    if grammar is not None:
+        extra["grammar"] = grammar
+    if seed is not None:
+        extra["seed"] = int(seed)
+    if stop:
+        extra["stop"] = [stop] if isinstance(stop, str) else list(stop)
+    pieces: List[str] = []
+    n_tok = 0
+    t_first: Optional[float] = None
+    usage: Dict[str, Any] = {}
+    finish: Optional[str] = None
+    # Serialize against every other inference call on the same Llama
+    # instance — see _INFERENCE_LOCK docstring at module top for why. Each
+    # model has its own lock; the main model's is _INFERENCE_LOCK. The clamp
+    # runs INSIDE the lock, against THIS instance: its n_ctx() is the window
+    # and holding the lock is what makes counting on its own tokenizer safe.
+    # token_callback fires INSIDE the lock too — callbacks must be fast and
+    # must NOT call back into local_chat (would deadlock).
+    _acquire(lock, should_stop)
+    t_locked = _time.monotonic()
+    try:
+        count = _instance_token_counter(llm)
+        messages, num_predict = _clamp_messages_to_ctx(
+            messages, num_predict, _model_n_ctx(llm), count_tokens=count)
+
+        def start(msgs):
+            return llm.create_chat_completion(
+                messages=msgs, temperature=float(temperature),
+                max_tokens=int(num_predict), stream=True, **extra)
+
+        try:
+            result = start(messages)
+        except Exception as exc:
+            if not (_is_system_role_error(exc)
+                    and any(m.get("role") == "system" for m in messages)):
+                raise
+            _LOG.warning("[GGUF] the chat template refused a system message "
+                         "(%r); retrying with it folded into the user turn",
+                         exc)
+            messages = _merge_system_into_user(messages)
+            result = start(messages)
+
+        if isinstance(result, dict):
+            # A Llama stand-in that does not stream: one whole message.
+            try:
+                text = str(result["choices"][0]["message"]["content"])
+            except Exception:                             # noqa: BLE001
+                text = str(result)
+            usage = dict(result.get("usage") or {})
+            try:
+                finish = result["choices"][0].get("finish_reason")
+            except Exception:                             # noqa: BLE001
+                finish = None
+            t_first = _time.monotonic()
+            pieces.append(text)
+            n_tok = int(usage.get("completion_tokens") or 0)
+            if token_callback and text:
+                token_callback(text)
+        else:
+            it = iter(result)
+            last = _time.monotonic()
+            try:
+                for chunk in it:
+                    now = _time.monotonic()
+                    try:
+                        choice = chunk["choices"][0]
+                        delta = choice["delta"].get("content", "")
+                        finish = choice.get("finish_reason") or finish
+                    except Exception:                     # noqa: BLE001
+                        delta = ""
+                    if delta:
+                        if t_first is None:
+                            t_first = now
+                        elif timeout and now - last > float(timeout):
+                            pieces.append(delta)
+                            raise LocalChatTimeout(
+                                f"no token for {now - last:.0f} s "
+                                f"(timeout {timeout} s)", "".join(pieces))
+                        last = now
+                        pieces.append(delta)
+                        n_tok += 1
+                        if token_callback:
+                            token_callback(delta)
+                    if should_stop is not None and should_stop():
+                        raise GenerationCancelled(
+                            "stopped by the caller", "".join(pieces))
+            finally:
+                close = getattr(it, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:                     # noqa: BLE001
+                        pass
+        # Prompt tokens: the instance's own count of what it evaluated, when
+        # it exposes one (prompt + generated - 1), else the clamp's counter.
+        prompt_tokens = usage.get("prompt_tokens")
+        if prompt_tokens is None:
+            n_ctx_used = getattr(llm, "n_tokens", None)
+            if isinstance(n_ctx_used, int) and n_ctx_used > n_tok:
+                prompt_tokens = n_ctx_used - max(0, n_tok - 1)
+            elif count is not None:
+                prompt_tokens = sum(count(m["content"]) for m in messages
+                                    if isinstance(m.get("content"), str))
+    finally:
+        lock.release()
+    t_end = _time.monotonic()
+    if pieces:
+        _gpu_confirm_success()   # a generation ran — the GPU path is stable
+    gen_window = (t_end - t_first) if t_first is not None else None
+    ttft = (t_first - t_locked) if t_first is not None else None
+    _record_stats(role, {
+        "backend": "gguf", "model": _slot_model_label(slot),
+        "prompt_tokens": prompt_tokens, "gen_tokens": n_tok,
+        "seconds": round(t_end - t_start, 3),
+        "wait_s": round(t_locked - t_start, 3),
+        "ttft_s": round(ttft, 3) if ttft is not None else None,
+        "gen_tok_s": _rate(n_tok - 1, gen_window),
+        "prompt_tok_s": _rate(prompt_tokens, ttft),
+        "constrained": gkind in ("schema", "json"), "constraint": gkind,
+        "num_ctx": _model_n_ctx(llm), "max_tokens": int(num_predict),
+        # Cut off at max_tokens: a grammar cannot close a cut-off object.
+        "truncated": finish == "length",
+    })
+    return "".join(pieces)
+
+
+def _slot_model_label(slot: str) -> str:
+    try:
+        return _slot_file(_slot_config(), slot).name
+    except Exception:                                     # noqa: BLE001
+        return slot
+
+
 def _gguf_chat(
     messages: List[Dict[str, str]],
     *,
     temperature: float,
     num_predict: int,
     slot: str = "main",
+    role: Optional[str] = None,
+    json_schema: Optional[Dict[str, Any]] = None,
+    seed: Optional[int] = None,
+    stop: Any = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    timeout: Optional[float] = None,
 ) -> str:
-    """Blocking GGUF chat completion on ``slot``'s model."""
-    llm, lock = _slot_llm_and_lock(slot)
-    # Serialize against every other inference call on the same Llama
-    # instance — see _INFERENCE_LOCK docstring at module top for why. Each
-    # model has its own lock; the main model's is _INFERENCE_LOCK.
-    #
-    # The clamp runs INSIDE the lock, against THIS instance: its n_ctx() is
-    # the window (not the 4096 of an unset COUNCIL_GGUF_N_CTX) and holding
-    # the lock is what makes counting on its own tokenizer safe.
-    with lock:
-        messages, num_predict = _clamp_messages_to_ctx(
-            messages, num_predict, _model_n_ctx(llm),
-            count_tokens=_instance_token_counter(llm))
-        result = llm.create_chat_completion(
-            messages=messages,
-            temperature=float(temperature),
-            max_tokens=int(num_predict),
-        )
-    _gpu_confirm_success()   # a generation completed — GPU path is stable
-    try:
-        return str(result["choices"][0]["message"]["content"]).strip()
-    except Exception:
-        return str(result).strip()
+    """Blocking GGUF chat completion on ``slot``'s model (streamed inside,
+    see _gguf_generate). Raises BackendUnavailable when llama-cpp-python or
+    the GGUF is missing — the router's cue to try a localhost Ollama."""
+    return _gguf_generate(
+        messages, temperature=temperature, num_predict=num_predict,
+        slot=slot, role=role, json_schema=json_schema, seed=seed, stop=stop,
+        should_stop=should_stop, timeout=timeout).strip()
 
 
 def _gguf_chat_stream(
@@ -2125,36 +2719,532 @@ def _gguf_chat_stream(
     num_predict: int,
     token_callback: Optional[Callable[[str], None]],
     slot: str = "main",
+    role: Optional[str] = None,
+    json_schema: Optional[Dict[str, Any]] = None,
+    seed: Optional[int] = None,
+    stop: Any = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    timeout: Optional[float] = None,
 ) -> str:
     """Streaming GGUF chat completion — emits each token via token_callback."""
-    llm, lock = _slot_llm_and_lock(slot)
-    pieces: list[str] = []
-    # Hold the inference lock for the entire stream. Releasing between
-    # chunks would let another call slip in and corrupt the in-progress
-    # KV cache. token_callback fires INSIDE the lock — callbacks should
-    # be fast (queue.put_nowait or a buffer append) and must NOT call
-    # back into local_chat (would deadlock). The clamp is inside it too,
-    # for the same reason as in _gguf_chat.
-    with lock:
-        messages, num_predict = _clamp_messages_to_ctx(
-            messages, num_predict, _model_n_ctx(llm),
-            count_tokens=_instance_token_counter(llm))
-        for chunk in llm.create_chat_completion(
-            messages=messages,
-            temperature=float(temperature),
-            max_tokens=int(num_predict),
-            stream=True,
-        ):
+    return _gguf_generate(
+        messages, temperature=temperature, num_predict=num_predict,
+        slot=slot, token_callback=token_callback, role=role,
+        json_schema=json_schema, seed=seed, stop=stop,
+        should_stop=should_stop, timeout=timeout)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The localhost Ollama backend
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: slot -> the Ollama model serving it because its GGUF could not load.
+_AUTO_OLLAMA: Dict[str, str] = {}
+#: slot -> the num_ctx sent for it. effective_n_ctx reads this, so a prompt
+#: builder budgets for the window Ollama really has, without a config read.
+_OLLAMA_WINDOWS: Dict[str, int] = {}
+#: The installed model picked when nothing names one (cached per refresh).
+_AUTO_PICK: Optional[str] = None
+_ROUTE_LOCK = threading.Lock()
+#: The window when neither the slot nor COUNCIL_OLLAMA_NUM_CTX says: Describe
+#: needs about 2.1K prompt + 1.8K reply tokens, and Ollama's own default
+#: (2048 on many builds) silently drops the front of a longer prompt.
+_DEFAULT_OLLAMA_NUM_CTX = 8192
+
+
+def _ollama_fallback_enabled() -> bool:
+    return not _env_off("COUNCIL_OLLAMA_FALLBACK")
+
+
+def _ollama_keep_alive() -> str:
+    """How long Ollama keeps the model loaded after a call. 30 minutes: a
+    reload costs seconds every time, and a council turn is many calls."""
+    return os.environ.get("COUNCIL_OLLAMA_KEEP_ALIVE", "").strip() or "30m"
+
+
+def _ollama_count(text: str) -> int:
+    """Token estimate for clamping an Ollama prompt — no tokenizer here, so
+    3 chars a token: phi3.5 measures 2.69 on the Describe prompt and ~3 on
+    code, so 4 (estimate_tokens' fallback) let prompts past num_ctx."""
+    return max(1, (len(text or "") + 2) // 3)
+
+
+def _hardware_gb() -> Tuple[Optional[float], Optional[float]]:
+    """(total VRAM GB, RAM GB) for choosing a default model: the Models tab's
+    memoised probe when it has run, else a quick nvidia-smi + RAM read."""
+    try:
+        from council_core import model_jobs
+        hw = getattr(model_jobs, "_DETECTED", None)
+        if hw is not None and (hw.vram_gb or hw.ram_gb):
+            return hw.vram_gb, hw.ram_gb
+    except Exception:                                     # noqa: BLE001
+        pass
+    try:
+        import hardware_detect
+        return hardware_detect.quick_memory()
+    except Exception:                                     # noqa: BLE001
+        return None, None
+
+
+def _pick_default_ollama_model(host: Optional[str] = None) -> str:
+    """COUNCIL_OLLAMA_MODEL, else the best INSTALLED US-origin chat model
+    for this PC (local_models.rank_for_role — a full GPU fit first). A
+    non-US model is never picked. Raises BackendUnavailable when there is
+    no server or no such model; nothing is ever pulled."""
+    global _AUTO_PICK
+    from council_core import local_models
+    env = os.environ.get("COUNCIL_OLLAMA_MODEL", "").strip()
+    if env:
+        return local_models.ollama_name(env)
+    with _ROUTE_LOCK:
+        if _AUTO_PICK:
+            return _AUTO_PICK
+    host = host or local_models.ollama_host()
+    tags = local_models.ollama_tags(host)
+    if tags is None:
+        raise BackendUnavailable(f"No Ollama server answers at {host}.")
+    models = [local_models.ollama_entry(t, host=host) for t in tags]
+    vram, ram = _hardware_gb()
+    best = local_models.recommend_for_role(models, "writer", vram_gb=vram,
+                                           ram_gb=ram)
+    if best is None:
+        raise BackendUnavailable(
+            f"Ollama at {host} has no US-origin chat model installed. Pull "
+            "one yourself (e.g. `ollama pull llama3.1:8b`) or set "
+            "COUNCIL_OLLAMA_MODEL.")
+    with _ROUTE_LOCK:
+        _AUTO_PICK = best["name"]
+    print(f"[council] Ollama default model: {best['name']} "
+          f"({best.get('why', '')})", flush=True)
+    return best["name"]
+
+
+def _target_for(slot: str, model: Optional[str] = None) -> Tuple[str, str]:
+    """('ollama', <model name>) or ('gguf', '') for a call on ``slot``."""
+    from council_core import local_models
+    if model and local_models.is_ollama_id(model):
+        return "ollama", local_models.ollama_name(model)
+    with _ROUTE_LOCK:
+        auto = _AUTO_OLLAMA.get(slot)
+    if auto:
+        return "ollama", auto
+    try:
+        cfg = _slot_config()
+        s = cfg.slots.get(slot) or cfg.slots.get("main")
+        path = s.path if s is not None else ""
+    except Exception:                                     # noqa: BLE001
+        path = ""
+    if local_models.is_ollama_id(path):
+        return "ollama", local_models.ollama_name(path)
+    if _council_backend() == "ollama":
+        return "ollama", _pick_default_ollama_model()
+    return "gguf", ""
+
+
+def _fallback_to_ollama(slot: str, exc: BaseException) -> str:
+    """The Ollama model to serve ``slot`` now that its GGUF cannot load —
+    or ``exc`` again when the fallback is off or no server answers."""
+    if not _ollama_fallback_enabled():
+        raise exc
+    from council_core import local_models
+    host = local_models.ollama_host()
+    if not local_models.ollama_reachable(host):
+        raise exc
+    try:
+        name = _pick_default_ollama_model(host)
+    except BackendUnavailable as why:
+        raise BackendUnavailable(
+            f"{exc}\n\nTried a localhost Ollama instead: {why}") from exc
+    with _ROUTE_LOCK:
+        first = slot not in _AUTO_OLLAMA
+        _AUTO_OLLAMA[slot] = name
+    if first:
+        line = (f"[council] slot '{slot}': {str(exc).splitlines()[0]} — "
+                f"answering with Ollama ({name}) at {host} instead.")
+        print(line, flush=True)
+        _LOG.warning(line)
+    return name
+
+
+def _ollama_num_ctx(slot: str, entry: Optional[Dict[str, Any]]) -> int:
+    """The slot's window (its n_ctx, else COUNCIL_OLLAMA_NUM_CTX, else 8192),
+    never more than the model's own context length."""
+    want = None
+    try:
+        s = _slot_config().slots.get(slot)
+        want = int(s.n_ctx) if s is not None and s.n_ctx else None
+    except Exception:                                     # noqa: BLE001
+        want = None
+    if not want:
+        raw = os.environ.get("COUNCIL_OLLAMA_NUM_CTX", "").strip()
+        want = int(raw) if raw.isdigit() else _DEFAULT_OLLAMA_NUM_CTX
+    ctx = (entry or {}).get("context_length")
+    if isinstance(ctx, int) and ctx > 0:
+        want = min(want, ctx)
+    return max(512, int(want))
+
+
+class _OllamaHTTPError(RuntimeError):
+    def __init__(self, status: int, text: str):
+        super().__init__(f"Ollama HTTP {status}: {text[:500]}")
+        self.status = status
+        self.text = text or ""
+
+
+def _ollama_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """OpenAI-style messages -> Ollama's: list content (text + data-URL
+    images, what the GGUF vision path takes) becomes content + images."""
+    out = []
+    for m in messages:
+        d: Dict[str, Any] = {"role": m.get("role") or "user"}
+        content = m.get("content")
+        if isinstance(content, list):
+            texts, images = [], []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    texts.append(str(part.get("text") or ""))
+                elif part.get("type") == "image_url":
+                    url = part.get("image_url")
+                    url = url.get("url") if isinstance(url, dict) else url
+                    if isinstance(url, str) and url.startswith("data:") \
+                            and "," in url:
+                        images.append(url.split(",", 1)[1])
+            d["content"] = "\n".join(texts)
+            if images:
+                d["images"] = images
+        else:
+            d["content"] = "" if content is None else str(content)
+        for k in ("images", "tool_calls", "tool_name", "thinking"):
+            if k in m and k not in d:
+                d[k] = m[k]
+        out.append(d)
+    return out
+
+
+def _ollama_stream(host: str, name: str, messages: List[Dict[str, Any]], *,
+                   temperature: float, num_predict: int, num_ctx: int,
+                   fmt: Any = None, seed: Optional[int] = None,
+                   stop: Any = None,
+                   should_stop: Optional[Callable[[], bool]] = None,
+                   timeout: Optional[float] = None,
+                   token_callback: Optional[Callable[[str], None]] = None,
+                   tools: Optional[List[Dict[str, Any]]] = None,
+                   ) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]]]:
+    """One streamed /api/chat call: (text, stats, tool_calls).
+
+    The HTTP read runs on a helper thread and this one polls it every
+    100 ms, so should_stop() and the stall timeout are honoured even while
+    Ollama is still loading the model or prefilling (it sends nothing until
+    the first token). Stopping CLOSES the connection, which makes Ollama
+    abandon the generation — nothing is ever re-sent: the old client retried
+    a timed-out request whole while the server was still running the first.
+    """
+    import http.client
+    import queue
+    import socket
+    import urllib.parse
+
+    options: Dict[str, Any] = {
+        "temperature": float(temperature), "num_predict": int(num_predict),
+        "num_ctx": int(num_ctx),
+        # Ollama's default 1.1 penalises every repeated token — JSON keys,
+        # indentation and identifiers in code are exactly that.
+        "repeat_penalty": 1.0,
+    }
+    if seed is not None:
+        options["seed"] = int(seed)
+    if stop:
+        options["stop"] = [stop] if isinstance(stop, str) else list(stop)
+    payload: Dict[str, Any] = {
+        "model": name, "messages": _ollama_messages(messages),
+        "stream": True, "options": options,
+        "keep_alive": _ollama_keep_alive(),
+    }
+    if fmt is not None:
+        payload["format"] = fmt
+    if tools:
+        payload["tools"] = tools
+    body = json.dumps(payload).encode("utf-8")
+    u = urllib.parse.urlsplit(host)
+    path = (u.path or "").rstrip("/") + "/api/chat"
+    stall = float(timeout) if timeout and float(timeout) > 0 else None
+    q: "queue.Queue" = queue.Queue()
+    box: Dict[str, Any] = {"conn": None}
+    t_start = _time.monotonic()
+
+    def reader() -> None:
+        conn = None
+        try:
+            cls = (http.client.HTTPSConnection if u.scheme == "https"
+                   else http.client.HTTPConnection)
+            conn = cls(u.hostname, u.port,
+                       timeout=(stall + 30.0) if stall else None)
+            box["conn"] = conn
+            # Keep the SOCKET, not just the connection: on an HTTP/1.0 or
+            # closing response http.client hands the socket to the response
+            # and sets conn.sock to None, so closing the connection would
+            # leave the stream — and the server's generation — running.
+            conn.connect()
+            box["sock"] = conn.sock
+            conn.request("POST", path, body=body,
+                         headers={"Content-Type": "application/json"})
+            resp = conn.getresponse()
+            if resp.status != 200:
+                q.put(("http", resp.status,
+                       resp.read().decode("utf-8", errors="replace")))
+                return
+            while True:
+                line = resp.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if line:
+                    q.put(("line", line, None))
+            q.put(("eof", None, None))
+        except Exception as exc:                          # noqa: BLE001
+            q.put(("error", exc, None))
+        finally:
             try:
-                delta = chunk["choices"][0]["delta"].get("content", "")
-            except Exception:
-                delta = ""
-            if delta:
-                pieces.append(delta)
+                if conn is not None:
+                    conn.close()
+            except Exception:                             # noqa: BLE001
+                pass
+
+    def abort() -> None:
+        conn = box.get("conn")
+        sock = box.get("sock") or getattr(conn, "sock", None)
+        try:
+            if sock is not None:
+                sock.shutdown(socket.SHUT_RDWR)
+        except Exception:                                 # noqa: BLE001
+            pass
+        for closable in (sock, conn):
+            try:
+                if closable is not None:
+                    closable.close()
+            except Exception:                             # noqa: BLE001
+                pass
+
+    threading.Thread(target=reader, name="ollama-chat", daemon=True).start()
+    pieces: List[str] = []
+    calls: List[Dict[str, Any]] = []
+    final: Dict[str, Any] = {}
+    n_chunks = 0
+    t_first: Optional[float] = None
+    last = _time.monotonic()
+    try:
+        while True:
+            try:
+                kind, a, b = q.get(timeout=0.1)
+            except queue.Empty:
+                if should_stop is not None and should_stop():
+                    raise GenerationCancelled("stopped by the caller",
+                                              "".join(pieces))
+                if stall and _time.monotonic() - last > stall:
+                    raise LocalChatTimeout(
+                        f"Ollama ({name}) sent nothing for {stall:.0f} s; "
+                        "the request was cancelled, not re-sent.",
+                        "".join(pieces))
+                continue
+            last = _time.monotonic()
+            if kind == "http":
+                raise _OllamaHTTPError(a, b)
+            if kind == "error":
+                if isinstance(a, ConnectionRefusedError):
+                    raise BackendUnavailable(
+                        f"No Ollama server answers at {host} ({a!r}).") from a
+                raise RuntimeError(f"Ollama ({name}) call failed: {a!r}") from a
+            if kind == "eof":
+                break
+            try:
+                obj = json.loads(a)
+            except ValueError:
+                continue
+            if obj.get("error"):
+                raise RuntimeError(f"Ollama ({name}): {obj['error']}")
+            msg = obj.get("message") or {}
+            tok = msg.get("content") or ""
+            if tok:
+                if t_first is None:
+                    t_first = last
+                pieces.append(tok)
+                n_chunks += 1
                 if token_callback:
-                    token_callback(delta)
-    _gpu_confirm_success()   # a generation completed — GPU path is stable
-    return "".join(pieces)
+                    token_callback(tok)
+            if msg.get("tool_calls"):
+                if t_first is None:
+                    t_first = last
+                calls.extend(c for c in msg["tool_calls"] if isinstance(c, dict))
+            if should_stop is not None and should_stop():
+                raise GenerationCancelled("stopped by the caller",
+                                          "".join(pieces))
+            if obj.get("done"):
+                final = obj
+                break
+    except BaseException:
+        abort()
+        raise
+    t_end = _time.monotonic()
+    ns = 1e9
+
+    def secs(key: str) -> Optional[float]:
+        v = final.get(key)
+        return (v / ns) if isinstance(v, (int, float)) and v > 0 else None
+
+    gen = final.get("eval_count")
+    prompt = final.get("prompt_eval_count")
+    if isinstance(fmt, dict):
+        constraint = "schema"
+    elif fmt == "json":
+        constraint = "json"
+    else:
+        constraint = "none"
+    stats = {
+        "backend": "ollama", "model": name,
+        "prompt_tokens": prompt if isinstance(prompt, int) else None,
+        "gen_tokens": gen if isinstance(gen, int) else n_chunks,
+        "seconds": round(t_end - t_start, 3),
+        "ttft_s": round(t_first - t_start, 3) if t_first else None,
+        "gen_tok_s": _rate(gen, secs("eval_duration")),
+        "prompt_tok_s": _rate(prompt, secs("prompt_eval_duration")),
+        "load_s": round(secs("load_duration") or 0.0, 3),
+        "constrained": constraint != "none", "constraint": constraint,
+        "num_ctx": int(num_ctx), "max_tokens": int(num_predict),
+        "done_reason": final.get("done_reason"),
+        "truncated": final.get("done_reason") == "length",
+    }
+    return "".join(pieces), stats, calls
+
+
+def _ollama_local(
+    name: str,
+    messages: List[Dict[str, Any]],
+    *,
+    slot: str,
+    role: Optional[str],
+    temperature: float,
+    num_predict: int,
+    token_callback: Optional[Callable[[str], None]] = None,
+    json_schema: Optional[Dict[str, Any]] = None,
+    seed: Optional[int] = None,
+    stop: Any = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    timeout: Optional[float] = None,
+    host: Optional[str] = None,
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """A call on a LOCALHOST Ollama model: (text, native tool calls).
+
+    The window: the slot's num_ctx, capped at the model's own context
+    (from /api/tags, cached), and the prompt clamped to it here — Ollama
+    would otherwise drop the front of an over-long prompt without a word.
+    A schema the server refuses (HTTP 4xx/5xx naming the format) is retried
+    once as plain JSON mode and once unconstrained: those requests failed
+    before generating anything, so the retry is not a re-sent generation.
+    """
+    from council_core import local_models
+    if should_stop is not None and should_stop():
+        raise GenerationCancelled("stopped before the call started")
+    host = (host or local_models.ollama_host()).rstrip("/")
+    allow_remote = (_remote_nodes_enabled()
+                    and not local_models.is_loopback_url(host))
+    _ensure_localhost(host, allow_remote=allow_remote)
+    entry = local_models.ollama_model(name, host, allow_remote=allow_remote,
+                                      max_age=60.0)
+    if entry is None:
+        if local_models.ollama_tags(host, allow_remote=allow_remote) is None:
+            raise BackendUnavailable(f"No Ollama server answers at {host}.")
+        raise RuntimeError(
+            f"Ollama at {host} has no model '{name}'. Install it yourself "
+            f"(`ollama pull {name}` — the council never downloads), or pick "
+            "another model for this role in the Models tab.")
+    num_ctx = _ollama_num_ctx(slot, entry)
+    with _ROUTE_LOCK:
+        _OLLAMA_WINDOWS[slot] = num_ctx
+    msgs, num_predict = _clamp_messages_to_ctx(
+        messages, num_predict, num_ctx, count_tokens=_ollama_count)
+    fmts: List[Any] = [json_schema, "json", None] if json_schema is not None \
+        else [None]
+    last_exc: Optional[BaseException] = None
+    for fmt in fmts:
+        try:
+            text, stats, calls = _ollama_stream(
+                host, entry["name"], msgs, temperature=temperature,
+                num_predict=num_predict, num_ctx=num_ctx, fmt=fmt, seed=seed,
+                stop=stop, should_stop=should_stop, timeout=timeout,
+                token_callback=token_callback, tools=tools)
+        except _OllamaHTTPError as exc:
+            low = exc.text.lower()
+            if fmt is not None and exc.status >= 400 and any(
+                    w in low for w in ("format", "schema", "grammar", "json")):
+                _LOG.warning("[structured] Ollama refused format %s (%s); "
+                             "retrying with a looser one",
+                             "schema" if isinstance(fmt, dict) else fmt,
+                             exc.text[:200])
+                last_exc = exc
+                continue
+            if exc.status == 404:
+                raise RuntimeError(
+                    f"Ollama at {host} has no model '{name}' "
+                    f"(`ollama pull {name}` to install it).") from exc
+            raise
+        with _SLOT_LOAD_LOCK:
+            _SLOT_STATUS[slot] = {"path": local_models.ollama_id(entry["name"]),
+                                  "n_ctx": num_ctx, "on_gpu": None,
+                                  "backend": "ollama",
+                                  "reason": "served by Ollama"}
+        _record_stats(role, stats)
+        return text, calls
+    raise last_exc if last_exc else RuntimeError("Ollama call failed")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The router — one entry for local_chat and the council's backend specs
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _route_chat(
+    messages: List[Dict[str, Any]],
+    *,
+    slot: str,
+    temperature: float,
+    num_predict: int,
+    role: Optional[str] = None,
+    token_callback: Optional[Callable[[str], None]] = None,
+    json_schema: Optional[Dict[str, Any]] = None,
+    seed: Optional[int] = None,
+    stop: Any = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    timeout: Optional[float] = None,
+    model: Optional[str] = None,
+    host: Optional[str] = None,
+) -> str:
+    """Serve one chat call on the backend ``slot`` resolves to (see
+    "Backend selection" at the top of this module). GGUF first for a GGUF
+    slot; a BackendUnavailable from it (no llama_cpp, no GGUF) moves the slot
+    to a localhost Ollama for the rest of the session when one answers."""
+    extras = {k: v for k, v in (
+        ("json_schema", json_schema), ("seed", seed), ("stop", stop),
+        ("should_stop", should_stop), ("timeout", timeout)) if v is not None}
+    backend, name = _target_for(slot, model)
+    if backend == "gguf":
+        try:
+            if token_callback is not None:
+                return _gguf_chat_stream(
+                    messages, temperature=temperature,
+                    num_predict=num_predict, token_callback=token_callback,
+                    slot=slot, role=role, **extras)
+            return _gguf_chat(messages, temperature=temperature,
+                              num_predict=num_predict, slot=slot, role=role,
+                              **extras)
+        except BackendUnavailable as exc:
+            name = _fallback_to_ollama(slot, exc)
+    text, _calls = _ollama_local(
+        name, messages, slot=slot, role=role, temperature=temperature,
+        num_predict=num_predict, token_callback=token_callback, host=host,
+        **extras)
+    return text if token_callback is not None else text.strip()
 
 
 def _agent_memory_enabled() -> bool:
@@ -2187,19 +3277,44 @@ def local_chat(
     host: Optional[str] = None,
     timeout: int = 120,
     role: Optional[str] = None,
+    json_schema: Optional[Dict[str, Any]] = None,
+    seed: Optional[int] = None,
+    stop: Any = None,
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> str:
-    """Blocking chat call against the loaded GGUF. `model`, `host`, `timeout`
-    accepted for caller compatibility but ignored. ``role`` picks the model:
-    the slot council_core.model_slots assigns it, "main" when it has none
-    (every caller that passes no role gets the main model, as before).
+    """Blocking chat call. ``role`` picks the model: the slot
+    council_core.model_slots assigns it, "main" when it has none (every
+    caller that passes no role gets the main model, as before). The slot's
+    model is a GGUF (in process) or "ollama:<name>" (a localhost server);
+    see "Backend selection" at the top of this module.
+
+    ``json_schema`` constrains the reply to that schema — a grammar on the
+    GGUF path, "format" on Ollama — and the reply is validated against it
+    afterwards (last_call_stats(role)["schema_valid"]). The TEXT is returned
+    either way, so a caller's own parsing stays the fallback when a backend
+    cannot constrain (constraint 'json' or 'none' in the stats). ``seed`` and
+    ``stop`` pass through. ``timeout`` is a stall limit: seconds with no new
+    output (never a re-send). ``should_stop()`` is polled between tokens and
+    raises GenerationCancelled. ``model`` "ollama:<name>" overrides the
+    role's model for this call (any other value is ignored, as before);
+    ``host`` names the Ollama server (loopback only unless remote nodes are
+    enabled).
 
     When ``COUNCIL_AGENT_MEMORY_ENABLE`` is on, the call's
     ``(question, answer)`` is appended to the agent ConversationLog after
     completion. Failures of that side-effect are swallowed — the chat
     call's return value is what matters.
     """
-    answer = _gguf_chat(messages, temperature=temperature,
-                        num_predict=num_predict, slot=_slot_for_role(role))
+    slot = _slot_for_role(role)
+    with _STATS_LOCK:
+        seq0 = _STATS_SEQ
+    t0 = _time.monotonic()
+    answer = _route_chat(
+        messages, slot=slot, role=role, temperature=temperature,
+        num_predict=num_predict, json_schema=json_schema, seed=seed,
+        stop=stop, should_stop=should_stop, timeout=timeout, model=model,
+        host=host)
+    _finish_stats(role, seq0, t0, answer, json_schema, num_predict)
     if _agent_memory_enabled():
         try:
             import agent_logs
@@ -2222,6 +3337,249 @@ def local_chat(
     return answer
 
 
+#: schema key -> its worst-case reply in tokens (None: unbounded), and the
+#: keys already warned about, so the warning is said once, not every call.
+_WORST_CASE: Dict[str, Optional[int]] = {}
+_WORST_WARNED: set = set()
+
+
+def _finish_stats(role: Optional[str], seq0: int, t0: float, answer: str,
+                  json_schema: Optional[Dict[str, Any]],
+                  num_predict: int = 0) -> None:
+    """Make last_call_stats describe THIS call: a stand-in backend that
+    recorded nothing still gets its wall time, and a schema'd call gets the
+    validation verdict and the schema's worst-case length — the one failure
+    a grammar cannot prevent is a reply cut off at num_predict."""
+    with _STATS_LOCK:
+        fresh = _STATS_SEQ != seq0
+    if not fresh:
+        _record_stats(role, {
+            "backend": "unknown", "model": "", "prompt_tokens": None,
+            "gen_tokens": None, "seconds": round(_time.monotonic() - t0, 3),
+            "gen_tok_s": None, "prompt_tok_s": None, "constrained": False,
+            "constraint": "none"})
+    if json_schema is None:
+        return
+    try:
+        from council_core import structured_output as _so
+        ok, errors = _so.check_text(answer, json_schema)
+        key = _so.schema_key(json_schema)
+        if key not in _WORST_CASE:
+            _WORST_CASE[key] = _so.worst_case_tokens(json_schema)
+        worst = _WORST_CASE[key]
+    except Exception as exc:                              # noqa: BLE001
+        ok, errors, key, worst = (False, [f"validation failed to run: "
+                                          f"{exc!r}"], "", None)
+    if not ok:
+        _LOG.warning("[structured] reply does not match the schema: %s",
+                     "; ".join(errors[:3]))
+    if key and key not in _WORST_WARNED and (
+            worst is None or (num_predict and worst > num_predict)):
+        _WORST_WARNED.add(key)
+        _LOG.info("[structured] schema %s: longest valid reply %s tokens, "
+                  "num_predict %s — a long reply can be cut off; bound it "
+                  "(structured_output.bounded) or raise num_predict", key,
+                  "unbounded" if worst is None else f"≈{worst}", num_predict)
+    with _STATS_LOCK:
+        for k in (role or "", _ANY_ROLE):
+            s = _LAST_STATS.get(k)
+            if s is not None:
+                s["schema_valid"] = ok
+                s["schema_errors"] = errors[:5]
+                s["schema_worst_case_tokens"] = worst
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool calling — native on Ollama models that have it, emulated elsewhere
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _emulated_tool_messages(messages: List[Dict[str, Any]], tool_text: str
+                            ) -> List[Dict[str, Any]]:
+    """The conversation for a model without native tools: the tool list in
+    the system message, earlier tool calls as the JSON the model would have
+    written, tool results as user turns (chat templates without a "tool"
+    role reject one)."""
+    out: List[Dict[str, Any]] = []
+    sys_done = False
+    for m in messages:
+        role = m.get("role")
+        content = m.get("content")
+        if role == "system" and not sys_done:
+            out.append({"role": "system",
+                        "content": f"{content or ''}\n\n{tool_text}".strip()})
+            sys_done = True
+        elif role == "tool":
+            who = m.get("tool_name") or m.get("name") or "tool"
+            out.append({"role": "user",
+                        "content": f"Result of {who}:\n{content or ''}"})
+        elif role == "assistant" and m.get("tool_calls"):
+            for c in m["tool_calls"]:
+                fn = c.get("function") if isinstance(c.get("function"),
+                                                     dict) else c
+                out.append({"role": "assistant", "content": json.dumps(
+                    {"tool": fn.get("name"),
+                     "arguments": fn.get("arguments") or {}})})
+        else:
+            out.append(dict(m))
+    if not sys_done:
+        out.insert(0, {"role": "system", "content": tool_text})
+    return out
+
+
+def _native_tool_calls(calls: List[Dict[str, Any]], names: List[str]
+                       ) -> List[Dict[str, Any]]:
+    out = []
+    for c in calls:
+        fn = c.get("function") if isinstance(c.get("function"), dict) else c
+        name = str(fn.get("name") or "")
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except ValueError:
+                args = {"_raw": args}
+        if name in names:
+            out.append({"name": name, "arguments": args or {}})
+    return out
+
+
+def chat_tools(
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    *,
+    role: Optional[str] = None,
+    temperature: float = 0.2,
+    num_predict: int = 800,
+    timeout: int = 120,
+    seed: Optional[int] = None,
+) -> Dict[str, Any]:
+    """One assistant turn that may call tools:
+    {"content": str, "tool_calls": [{"name": str, "arguments": dict}]}.
+
+    ``tools`` is Ollama/OpenAI shaped ({"type": "function", "function":
+    {name, description, parameters}}) or plain ({name, description,
+    parameters}). On an Ollama model whose capabilities include "tools"
+    (llama3.1:8b and gpt-oss:20b here; not phi3.5 or phi4) the server's
+    native tool calling is used. Anywhere else — a GGUF, or a model without
+    tools — it is EMULATED: the reply is constrained by a schema with one
+    variant per tool ({"tool": <name>, "arguments": <that tool's
+    parameters>}) plus {"answer": str}, so a small model cannot invent a
+    tool or malformed arguments. Tool calls naming no known tool are
+    dropped. Raises NotImplementedError only when no model is available.
+    """
+    from council_core import local_models
+    from council_core import structured_output as _so
+    plain = _so.normalize_tools(tools)
+    names = [t["name"] for t in plain]
+    slot = _slot_for_role(role)
+    try:
+        backend, name = _target_for(slot)
+    except BackendUnavailable as exc:
+        raise NotImplementedError(str(exc)) from exc
+    if backend == "ollama" and plain:
+        entry = local_models.ollama_model(name, max_age=60.0) or {}
+        caps = entry.get("capabilities")
+        if caps is None or "tools" in caps:
+            native = [{"type": "function", "function": t} for t in plain]
+            try:
+                text, calls = _ollama_local(
+                    name, messages, slot=slot, role=role,
+                    temperature=temperature, num_predict=num_predict,
+                    seed=seed, timeout=timeout, tools=native)
+                return {"content": text.strip(),
+                        "tool_calls": _native_tool_calls(calls, names)}
+            except _OllamaHTTPError as exc:
+                if "tool" not in exc.text.lower():
+                    raise
+                _LOG.info("[tools] %s has no native tools (%s); emulating",
+                          name, exc.text[:120])
+            except BackendUnavailable as exc:
+                raise NotImplementedError(str(exc)) from exc
+    schema = _so.tool_choice_schema(plain) if plain else None
+    msgs = _emulated_tool_messages(messages, _so.tool_prompt(plain)) \
+        if plain else list(messages)
+    try:
+        text = local_chat(msgs, role=role, temperature=temperature,
+                          num_predict=num_predict, timeout=timeout, seed=seed,
+                          json_schema=schema)
+    except BackendUnavailable as exc:
+        raise NotImplementedError(str(exc)) from exc
+    if not plain:
+        return {"content": text, "tool_calls": []}
+    value, _why = _so.parse_json(text)
+    if isinstance(value, dict):
+        tool = value.get("tool")
+        if isinstance(tool, str) and tool in names:
+            args = value.get("arguments")
+            return {"content": "", "tool_calls": [
+                {"name": tool,
+                 "arguments": args if isinstance(args, dict) else {}}]}
+        if isinstance(value.get("answer"), str):
+            return {"content": value["answer"], "tool_calls": []}
+    return {"content": text, "tool_calls": []}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# What can run here
+# ─────────────────────────────────────────────────────────────────────────────
+
+def list_local_models() -> List[Dict[str, Any]]:
+    """Every model this PC can run, GGUF files and localhost Ollama models:
+    [{id, name, backend ('ollama'|'gguf'), size_bytes, params_b, quant,
+    family, maker, origin ('US'|'non-US'|'unknown'), context_length,
+    capabilities, ...}]. Ollama ids are "ollama:<name>"; GGUF ids are
+    absolute paths. Never loads a model, never downloads, never raises
+    (council_core.local_models does the work — the Roles panel calls it
+    there without importing this engine)."""
+    try:
+        from council_core import local_models, model_slots
+        also = [os.environ.get("COUNCIL_GGUF_PATH", "").strip()]
+        try:
+            also += [s.path for s in model_slots.current().slots.values()
+                     if s.path]
+        except Exception:                                 # noqa: BLE001
+            pass
+        return local_models.list_local_models(also=also)
+    except Exception as exc:                              # noqa: BLE001
+        _LOG.warning("list_local_models failed: %r", exc)
+        return []
+
+
+def _ollama_remote_call(host: str, model: str, messages: List[Dict[str, str]],
+                        *, temperature: float, num_predict: int,
+                        allow_remote: bool, timeout: Optional[float],
+                        token_callback: Optional[Callable[[str], None]]
+                        ) -> Tuple[str, Dict[str, Any]]:
+    """The multi-node path's call (a Pi or another PC running Ollama).
+
+    One retry, and ONLY when the connection was refused — nothing reached
+    the server, so nothing is generated twice. The old client also retried
+    on a TIMEOUT, re-sending the whole generation while the server was
+    still running the first one. The hard-coded "16 GB" profile (num_gpu 99,
+    num_keep 128) is gone: the node's Ollama places layers for its own
+    hardware; repeat_penalty 1.0 and keep_alive are sent as on localhost.
+    """
+    _ensure_localhost(host, allow_remote=allow_remote)
+    for attempt in (1, 2):
+        try:
+            text, stats, _calls = _ollama_stream(
+                host.rstrip("/"), model, messages, temperature=temperature,
+                num_predict=num_predict, num_ctx=_DEFAULT_OLLAMA_NUM_CTX,
+                timeout=timeout, token_callback=token_callback)
+            return text, stats
+        except BackendUnavailable as exc:
+            if attempt == 2:
+                raise RuntimeError(
+                    "Failed to reach Ollama after retry. Is it installed and "
+                    "running?\nTry: start Ollama, then `ollama list`.\n"
+                    f"Underlying error: {exc}") from exc
+            _time.sleep(3)
+        except _OllamaHTTPError as exc:
+            raise RuntimeError(f"Ollama HTTPError {exc.status}: "
+                               f"{exc.text[:800]}") from exc
+    raise RuntimeError("unreachable")                      # pragma: no cover
+
+
 def _ollama_chat(
     host: str,
     model: str,
@@ -2232,55 +3590,12 @@ def _ollama_chat(
     allow_remote: bool = False,
     timeout: int = 120,
 ) -> str:
-    """Blocking (non-streaming) Ollama /api/chat call. Returns full response text."""
-    _ensure_localhost(host, allow_remote=allow_remote)
-    url = host.rstrip("/") + "/api/chat"
-
-    payload = {
-        "model": model,
-        "messages": messages,
-        "options": {
-            "temperature": float(temperature),
-            "num_predict": int(num_predict),
-            # Laptop GPU profile ─────────────────────────────
-            "num_ctx":  8192,  # context window (16GB VRAM — full 8K)
-            "num_gpu":  99,    # offload all layers to GPU
-            "num_keep": 128,   # keep larger system prompt in VRAM
-        },
-        "stream": False,
-    }
-
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-            data = json.loads(body)
-            return data.get("message", {}).get("content", "") or ""
-    except urllib.error.HTTPError as e:
-        txt = e.read().decode("utf-8", errors="replace") if hasattr(e, "read") else str(e)
-        raise RuntimeError(f"Ollama HTTPError {e.code}: {txt[:800]}") from e
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        # Retry once after a short delay -- recovers from model cold-start
-        # timeouts which are common when Ollama is loading a 14B into VRAM.
-        import time as _t
-        _t.sleep(3)
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                body = resp.read().decode("utf-8", errors="replace")
-                data = json.loads(body)
-                return data.get("message", {}).get("content", "") or ""
-        except (urllib.error.URLError, TimeoutError, OSError) as e2:
-            raise RuntimeError(
-                "Failed to reach Ollama after retry. Is it installed and running?\n"
-                "Try: start Ollama, then `ollama list`.\n"
-                f"Underlying error: {e2}"
-            ) from e2
+    """Blocking Ollama /api/chat call (streamed inside). Returns the text."""
+    text, _stats = _ollama_remote_call(
+        host, model, messages, temperature=temperature,
+        num_predict=num_predict, allow_remote=allow_remote, timeout=timeout,
+        token_callback=None)
+    return text
 
 
 def _ollama_chat_stream(
@@ -2297,107 +3612,17 @@ def _ollama_chat_stream(
     """
     Streaming Ollama /api/chat call.
 
-    Yields tokens to `token_callback(token_str)` as they arrive.
-    Returns the full assembled response string when done.
-
-    Falls back to non-streaming if streaming fails.
+    Yields tokens to `token_callback(token_str)` as they arrive, then a
+    "\\x00tps:<n>" sentinel with the generation speed (the GUI strips and
+    routes these separately from real tokens). Returns the full text.
     """
-    _ensure_localhost(host, allow_remote=allow_remote)
-    url = host.rstrip("/") + "/api/chat"
-
-    payload = {
-        "model": model,
-        "messages": messages,
-        "options": {
-            "temperature": float(temperature),
-            "num_predict": int(num_predict),
-            # Laptop GPU profile ─────────────────────────────
-            "num_ctx":  8192,  # context window (16GB VRAM — full 8K)
-            "num_gpu":  99,    # offload all layers to GPU
-            "num_keep": 128,   # keep larger system prompt in VRAM
-        },
-        "stream": True,
-    }
-
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-
-    full_text: List[str] = []
-
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            for raw_line in resp:
-                line = raw_line.decode("utf-8", errors="replace").strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                token = obj.get("message", {}).get("content", "")
-                if token:
-                    full_text.append(token)
-                    if token_callback:
-                        token_callback(token)
-                if obj.get("done", False):
-                    # Capture timing from the final done packet
-                    _eval_count    = obj.get("eval_count", 0)
-                    _eval_duration = obj.get("eval_duration", 0)  # nanoseconds
-                    if _eval_count and _eval_duration and token_callback:
-                        _tps = round(_eval_count / (_eval_duration / 1e9), 1)
-                        # Signal tokens/s via a sentinel token starting with \x00
-                        # GUI strips and routes these separately from real tokens
-                        token_callback("\x00tps:" + str(_tps))
-                    break
-        return "".join(full_text)
-
-    except (urllib.error.URLError, TimeoutError, OSError):
-        # Transient connection error -- wait then retry stream once
-        import time as _t
-        _t.sleep(3)
-        try:
-            with urllib.request.urlopen(req, timeout=150) as resp:
-                for raw_line in resp:
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
-                    token = obj.get("message", {}).get("content", "")
-                    if token:
-                        full_text.append(token)
-                        if token_callback:
-                            token_callback(token)
-                    if obj.get("done", False):
-                        _eval_count    = obj.get("eval_count", 0)
-                        _eval_duration = obj.get("eval_duration", 0)
-                        if _eval_count and _eval_duration and token_callback:
-                            _tps = round(_eval_count / (_eval_duration / 1e9), 1)
-                            token_callback("\x00tps:" + str(_tps))
-                        break
-            return "".join(full_text)
-        except Exception:
-            # Final fallback: blocking call
-            return _ollama_chat(
-                host, model, messages,
-                temperature=temperature,
-                num_predict=num_predict,
-                allow_remote=allow_remote,
-            )
-    except Exception:
-        # Non-connection error -- fall back to blocking directly
-        return _ollama_chat(
-            host, model, messages,
-            temperature=temperature,
-            num_predict=num_predict,
-            allow_remote=allow_remote,
-        )
+    text, stats = _ollama_remote_call(
+        host, model, messages, temperature=temperature,
+        num_predict=num_predict, allow_remote=allow_remote, timeout=timeout,
+        token_callback=token_callback)
+    if token_callback and stats.get("gen_tok_s"):
+        token_callback("\x00tps:" + str(round(stats["gen_tok_s"], 1)))
+    return text
 
 
 @dataclass
@@ -2438,19 +3663,13 @@ class LocalBackendSpec:
             {"role": "user", "content": user_text},
         ]
 
-        # The role's SLOT picks the model (council_core.model_slots); with
-        # no slot file every role is on "main", the one GGUF. `model`,
-        # `host`, `allow_remote` retained for trace/registry compatibility.
-        if token_callback is not None:
-            return _gguf_chat_stream(
-                messages,
-                temperature=temp, num_predict=mtok,
-                token_callback=token_callback, slot=slot,
-            )
-        return _gguf_chat(
-            messages,
-            temperature=temp, num_predict=mtok, slot=slot,
-        )
+        # The role's SLOT picks the model (council_core.model_slots): a GGUF
+        # in process, or "ollama:<name>" on a localhost server, with the
+        # Ollama fallback when no GGUF can load (_route_chat). With no slot
+        # file every role is on "main". `model`, `host`, `allow_remote`
+        # retained for trace/registry compatibility.
+        return _route_chat(messages, slot=slot, role=role, temperature=temp,
+                           num_predict=mtok, token_callback=token_callback)
 
 
 class BackendRegistry:
@@ -5415,6 +6634,9 @@ def _build_default_models(host: str) -> Dict[str, str]:
 def _gguf_model_label() -> str:
     """Display name for the loaded GGUF — uses the filename so logs are
     readable. Same string fills every role slot."""
+    if _council_backend() == "ollama":
+        name = os.environ.get("COUNCIL_OLLAMA_MODEL", "").strip()
+        return f"ollama:{name or 'auto'}"
     path_str = os.environ.get("COUNCIL_GGUF_PATH", "").strip()
     if path_str:
         return f"gguf:{Path(path_str).name}"
@@ -5492,8 +6714,14 @@ def get_runner(config: Optional[Dict[str, Any]] = None):
 
 
 def detect_ollama_models() -> List[str]:
-    """Deprecated — Ollama was removed. Always returns []."""
-    return []
+    """Names of the models the LOCALHOST Ollama server has ([] when none
+    answers). list_local_models() is the full answer (sizes, origin)."""
+    try:
+        from council_core import local_models
+        return [str(t.get("name") or "")
+                for t in (local_models.ollama_tags() or [])]
+    except Exception:                                     # noqa: BLE001
+        return []
 
 
 def load_personality_pins(path: Path) -> Dict[str, str]:

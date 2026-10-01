@@ -21,6 +21,17 @@ in vault/model_slots.json:
   * A role not listed answers from "main".
   * No file at all == one slot, "main" == exactly the behaviour before this
     module existed. Nobody is migrated by accident.
+  * A slot's "path" may instead be "ollama:<name>" — a model a LOCALHOST
+    Ollama server already has (council_core.local_models). Measured on the
+    RTX 4070 Laptop this was built on: the council env has no
+    llama-cpp-python, so those are the models the Qt app can actually run.
+    An Ollama slot may carry "n_ctx", the window sent as num_ctx (8192 when
+    absent); a GGUF slot's window comes from the loader's ladder instead.
+
+THE ROLES
+The council's own (writer … artist) plus "docs": the model that answers
+questions from a documentation server (an MCP server holding a Python
+package's docs) and writes code from what it read.
 
 PLACEMENT (the CPU-fallback decision)
 Slots are placed on the GPU in priority order — main first, then by how many
@@ -49,13 +60,14 @@ VERSION = 1
 #: from "main" unless the file says otherwise.
 COUNCIL_ROLES: Tuple[str, ...] = (
     "writer", "judge", "coder", "skeptic", "sage", "strategist",
-    "peasant", "intern", "artist")
+    "peasant", "intern", "artist", "docs")
 
 ROLE_LABELS = {
     "writer": "Writer (synthesis)", "judge": "Judge (verdicts)",
-    "coder": "Coder", "skeptic": "Skeptic", "sage": "Sage",
+    "coder": "Coder (GUIs and code)", "skeptic": "Skeptic", "sage": "Sage",
     "strategist": "Strategist", "peasant": "Peasant (plain questions)",
     "intern": "Intern (first drafts)", "artist": "Artist",
+    "docs": "Docs (answers from documentation)",
 }
 
 GB = 1024 ** 3
@@ -64,17 +76,33 @@ DEFAULT_MARGIN_BYTES = 1 * GB
 #: A GPU slot needs at least this much left for its context (≈4k tokens on
 #: an 8-14B model); below it, the slot goes to the CPU instead.
 MIN_KV_BYTES = GB // 2
+#: llama.cpp's CUDA compute buffer with flash attention at n_ubatch 512:
+#: ≈260 MiB reported for an 8B model; rounded up. Partial offload is where the
+#: card is tightest, so it is counted there instead of left to the margin.
+COMPUTE_BYTES = 512 * 1024 ** 2
+
+OLLAMA_PREFIX = "ollama:"
+
+
+def is_ollama(path: str) -> bool:
+    return isinstance(path, str) and path.strip().lower().startswith(
+        OLLAMA_PREFIX)
 
 
 @dataclass
 class Slot:
     name: str
     path: str = ""          # "" on main: follow COUNCIL_GGUF_PATH
+    n_ctx: Optional[int] = None   # Ollama slots: num_ctx (None: the default)
 
     def resolved_path(self, main_path: str = "") -> str:
         if self.path:
             return self.path
         return main_path if self.name == MAIN else ""
+
+    @property
+    def is_ollama(self) -> bool:
+        return is_ollama(self.path)
 
 
 @dataclass
@@ -96,8 +124,13 @@ class SlotConfig:
         return len(self.slots) > 1
 
     def to_json(self) -> dict:
+        def one(s: Slot) -> dict:
+            d = {"path": s.path}
+            if s.n_ctx:
+                d["n_ctx"] = int(s.n_ctx)
+            return d
         return {"version": VERSION,
-                "slots": {n: {"path": s.path} for n, s in self.slots.items()},
+                "slots": {n: one(s) for n, s in self.slots.items()},
                 "roles": {r: s for r, s in self.roles.items()
                           if s != MAIN and s in self.slots}}
 
@@ -126,7 +159,17 @@ def parse(data: dict) -> SlotConfig:
                    else spec or "").strip()
         if name != MAIN and not path:
             raise ConfigError(f"slot '{name}' has no model file")
-        slots[name] = Slot(name, path)
+        if is_ollama(path) and not path[len(OLLAMA_PREFIX):].strip():
+            raise ConfigError(f"slot '{name}' names no Ollama model")
+        n_ctx = spec.get("n_ctx") if isinstance(spec, dict) else None
+        if n_ctx is not None:
+            try:
+                n_ctx = int(n_ctx)
+            except (TypeError, ValueError):
+                raise ConfigError(f"slot '{name}' has a bad n_ctx {n_ctx!r}")
+            if n_ctx < 512:
+                raise ConfigError(f"slot '{name}' n_ctx {n_ctx} is too small")
+        slots[name] = Slot(name, path, n_ctx)
     roles = {}
     for role, slot in (data.get("roles") or {}).items():
         if slot not in slots:
@@ -271,6 +314,57 @@ def plan(config: SlotConfig, sizes: Dict[str, int],
     return out
 
 
+@dataclass(frozen=True)
+class OffloadPlan:
+    """How many of one model's layers go on the card, and its window.
+    n_gpu_layers -1 = every layer (the ladder then sizes the window, n_ctx 0),
+    0 = the CPU, k = the last k blocks on the GPU and the rest in RAM."""
+    n_gpu_layers: int
+    n_ctx: int
+    reason: str
+    gpu_bytes: int = 0
+
+
+def plan_offload(*, file_bytes: int, n_layers: int, per_layer_bytes: int,
+                 kv_bytes_per_token: int, free_vram_bytes: int,
+                 margin_bytes: int = DEFAULT_MARGIN_BYTES,
+                 compute_bytes: int = COMPUTE_BYTES,
+                 partial_ctx: int = 8192, min_full_ctx: int = 4096,
+                 min_layers: int = 1) -> OffloadPlan:
+    """Full offload when the whole file plus a ``min_full_ctx`` window fits
+    the free VRAM (the same arithmetic as the loader's rung 2, so a model
+    that loaded fully before still does); otherwise as many blocks as fit
+    beside a ``partial_ctx`` window, each block bringing its share of the KV
+    cache with it (llama.cpp keeps a layer's KV on the layer's device).
+
+    Pure arithmetic — the engine supplies the numbers. The output and
+    embedding tensors stay on the CPU in a partial load, so only blocks are
+    counted against the card, plus the compute buffer.
+    """
+    full_need = file_bytes + margin_bytes + kv_bytes_per_token * min_full_ctx
+    if full_need <= free_vram_bytes:
+        return OffloadPlan(-1, 0, "fits on the GPU", file_bytes)
+    n_layers = max(1, int(n_layers))
+    kv_layer = kv_bytes_per_token * partial_ctx / n_layers
+    room = free_vram_bytes - margin_bytes - compute_bytes
+    per = per_layer_bytes + kv_layer
+    k = int(room // per) if room > 0 and per > 0 else 0
+    k = min(k, n_layers - 1)
+    if k < min_layers:
+        return OffloadPlan(
+            0, partial_ctx,
+            f"partial offload: {file_bytes / GB:.1f} GB of weights and no "
+            f"room for even one layer in {free_vram_bytes / GB:.1f} GB free "
+            "— running on the CPU")
+    return OffloadPlan(
+        k, partial_ctx,
+        f"partial offload: {k} of {n_layers} layers on the GPU "
+        f"({k * per / GB:.1f} GB with their context), the rest on the CPU "
+        f"— {file_bytes / GB:.1f} GB of weights, {free_vram_bytes / GB:.1f} "
+        f"GB free, window {partial_ctx:,}",
+        int(k * per))
+
+
 def summary(placements: Dict[str, Placement], labels: Dict[str, str],
             free_vram_bytes: Optional[int]) -> str:
     """One line for the Models tab: what goes where, and the total."""
@@ -303,6 +397,39 @@ BALANCED = {
     "slots": {"fast": "llama-3.2-3b-q5"},
     "roles": {"peasant": "fast", "intern": "fast", "artist": "fast"},
 }
+
+
+def suggest_role_models(models: Sequence[dict], *,
+                        vram_gb: Optional[float] = None,
+                        ram_gb: Optional[float] = None,
+                        roles: Sequence[str] = COUNCIL_ROLES
+                        ) -> Dict[str, Tuple[str, str]]:
+    """role -> (model id, why) from what is INSTALLED — the "this PC" preset.
+
+    US-origin only (local_models.rank_for_role leaves the rest out), nothing
+    downloaded. One model for every role unless a role's own ranking prefers
+    another: switching Ollama models between turns reloads weights (seconds
+    each time on an 8 GB card that cannot hold two), so a single model that
+    fits the card is the fast configuration. Empty when nothing qualifies.
+    """
+    from . import local_models
+    general = local_models.rank_for_role(models, "writer", vram_gb=vram_gb,
+                                         ram_gb=ram_gb)
+    if not general:
+        return {}
+    base = general[0]
+    out: Dict[str, Tuple[str, str]] = {}
+    for role in roles:
+        ranked = local_models.rank_for_role(models, role, vram_gb=vram_gb,
+                                            ram_gb=ram_gb)
+        pick = ranked[0] if ranked else base
+        # Same score as the shared model: keep the shared one (no reload).
+        for cand in ranked:
+            if cand["id"] == base["id"] and cand["score"] >= pick["score"]:
+                pick = cand
+                break
+        out[role] = (pick["id"], pick.get("why", ""))
+    return out
 
 
 def catalog_spec(model_id: str):
@@ -343,7 +470,7 @@ def known_files(dirs: Optional[Sequence[Path]] = None,
         except OSError:
             continue
     for p in also:
-        if p and Path(p).is_file():
+        if p and not is_ollama(p) and Path(p).is_file():
             found.setdefault(str(Path(p).resolve()).lower(), Path(p))
     return list(found.values())
 
@@ -376,21 +503,26 @@ def preset_missing(preset: dict,
 
 
 def from_role_files(role_files: Dict[str, str]) -> Tuple[SlotConfig, str]:
-    """(config, main file) from a per-role choice of FILE.
+    """(config, main file) from a per-role choice of FILE (or Ollama model).
 
     The Writer's file becomes main — it is the model the council synthesises
     with — and each other distinct file becomes a slot named after it. The
     caller makes main's file the active GGUF, so main keeps following
-    COUNCIL_GGUF_PATH.
+    COUNCIL_GGUF_PATH. When the Writer's choice is an "ollama:<name>" model
+    there is no file to make active: main names it directly, and the caller
+    must leave COUNCIL_GGUF_PATH alone (it is returned all the same, so the
+    caller can tell — is_ollama(main_file)).
     """
     main_file = role_files.get("writer") or next(iter(role_files.values()), "")
-    slots = {MAIN: Slot(MAIN)}
+    slots = {MAIN: Slot(MAIN, main_file if is_ollama(main_file) else "")}
     by_file: Dict[str, str] = {_key(main_file): MAIN}
     roles: Dict[str, str] = {}
     for role, file in role_files.items():
         key = _key(file)
         if key not in by_file:
-            name = _slot_name(Path(file).stem, slots)
+            stem = (file[len(OLLAMA_PREFIX):] if is_ollama(file)
+                    else Path(file).stem)
+            name = _slot_name(stem, slots)
             slots[name] = Slot(name, file)
             by_file[key] = name
         if by_file[key] != MAIN:
@@ -399,6 +531,12 @@ def from_role_files(role_files: Dict[str, str]) -> Tuple[SlotConfig, str]:
 
 
 def _key(path: str) -> str:
+    if is_ollama(path):
+        # Not a path: "ollama:llama3.1:8b" resolved against the cwd (or read
+        # as a drive on Windows) would compare wrongly. "phi3.5" and
+        # "phi3.5:latest" are one model.
+        name = path.strip()[len(OLLAMA_PREFIX):].strip().lower()
+        return OLLAMA_PREFIX + (name if ":" in name else name + ":latest")
     try:
         return str(Path(path).resolve()).lower()
     except Exception:                                     # noqa: BLE001
