@@ -561,6 +561,11 @@ def cmd_llama(args: argparse.Namespace) -> int:
                        "placement": _placement(gl, th, args.affinity, args.qos)}
                 if args.flash_attn:
                     cfg["placement"] += "/fa"
+                if args.threads_batch:
+                    # Prompt processing is compute-bound and decoding is
+                    # memory-bound, so they may want different counts.
+                    cfg["threads_batch"] = args.threads_batch
+                    cfg["placement"] += f"/tb{args.threads_batch}"
                 if args.hide_gpu:
                     cfg["hide_gpu"] = True
                     cfg["placement"] = cfg["placement"].replace(
@@ -638,6 +643,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--gpu-layers", default="99",
                    help="comma list; 99 = all, 0 = CPU")
     p.add_argument("--threads", default="8", help="comma list")
+    p.add_argument("--threads-batch", type=int, default=0,
+                   help="threads for prompt processing (default: --threads)")
     p.add_argument("--affinity", choices=("all", "p"), default="all")
     p.add_argument("--qos", choices=("default", "high"), default="high")
     p.add_argument("--flash-attn", action="store_true")
