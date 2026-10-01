@@ -106,9 +106,12 @@ class DesignerActions:
     def toolkit_label(self, name: str) -> str:
         return dp.toolkit_label(self.project_dir(name))
 
-    def describe(self, name: str, text: str):
-        """Plain English -> DescribeResult. Blocking; a worker calls it."""
-        return dp.describe(text, self.project_dir(name))
+    def describe(self, name: str, text: str, should_stop=None):
+        """Plain English -> DescribeResult. Blocking; a worker calls it.
+        ``should_stop`` () -> bool ends it between model calls, and inside
+        one where the engine supports cancelling."""
+        return dp.describe(text, self.project_dir(name),
+                           should_stop=should_stop)
 
     def review(self, prompt: str) -> str:
         """The Council's critique. Blocking; a worker calls it.
@@ -202,6 +205,14 @@ class DesignerTab(ViewHelpers, QWidget):
         self._toolkit: str = ""
         self.questions: List[Any] = []
         self._busy = False
+        #: Set by the Describe box's Stop; read by the describing worker.
+        self._describe_stop = threading.Event()
+        #: (project, apply_window values, ids of the described shapes) — the
+        #: window style a description validated, applied by the next Save
+        #: while any of those shapes is still on the canvas. Not applied at
+        #: once: that would save the project behind the user's back, and
+        #: Undo could not take it back.
+        self._pending_window: Optional[tuple] = None
         #: (mode, requires, port registry) of the open project, for the
         #: Wiring group. Read when a project is loaded, not per selection.
         self._wiring_ctx = ("linked", [], {})
@@ -290,7 +301,17 @@ class DesignerTab(ViewHelpers, QWidget):
             "Sign in / Cancel buttons along the bottom.")
         self.describe_view.setMaximumHeight(110)
         layout.addWidget(self.describe_view)
-        self._button(layout, "✨ Draw it", self.on_describe)
+        row = QHBoxLayout()
+        self._button(row, "✨ Draw it", self.on_describe)
+        # A small model gets several candidates and repair rounds; each is a
+        # generation the user may not want to wait for.
+        self.describe_stop_button = self._button(row, "■ Stop",
+                                                 self.on_stop_describe)
+        self.describe_stop_button.setEnabled(False)
+        self.describe_stop_button.setToolTip(
+            "Stop describing — between model calls, and inside one where "
+            "the engine can cancel it")
+        layout.addLayout(row)
         return box
 
     def _palette_box(self) -> QWidget:
@@ -874,11 +895,60 @@ class DesignerTab(ViewHelpers, QWidget):
         if not self.project:
             self.log("No project open.")
             return
+        if self._save_described_window():
+            return
         result = self.actions.save(self.project, self.canvas.scene.shapes)
         self.log(result.message)
         if result.ok:
             self.canvas.scene.mark_saved()
         self._refresh_status()
+
+    def _save_described_window(self) -> bool:
+        """Save WITH the window style a description validated, if one is
+        pending for this project and its drawing is still on the canvas.
+        True when this did the save.
+
+        "Still on the canvas" is any of the described shapes' ids (fresh
+        uuids, so nothing else has them): Undo of the description takes them
+        away, and with them the reason to restyle the window."""
+        pending, self._pending_window = self._pending_window, None
+        if not pending or pending[0] != self.project:
+            return False
+        _name, values, ids = pending
+        if not ids & {s.id for s in self.canvas.scene.shapes}:
+            return False
+        result = self.actions.apply_window(self.project, values,
+                                           self.canvas.scene.shapes)
+        if not result.ok:
+            self.log(f"window style not applied: {result.message}")
+            return False
+        self.log(f"saved {self.project} with the described window "
+                 f"({', '.join(f'{k}={v!r}' for k, v in values.items())})")
+        self.canvas.scene.mark_saved()
+        self._show_selection()
+        self._refresh_status()
+        return True
+
+    def _apply_classified(self, classified) -> None:
+        """Show the kinds Generate wrote back into the .gspec on the canvas,
+        as one undoable step. Without it the canvas keeps the untyped boxes,
+        and the next Save — every Generate starts with one — writes them back
+        over the answers, so the model is asked again."""
+        from gui_shapes import GENERIC_KIND
+        scene = self.canvas.scene
+        was_dirty = scene.dirty
+        changed = 0
+        for shape in scene.shapes:
+            got = classified.get(shape.id)
+            if got and shape.kind == GENERIC_KIND:
+                dp.apply_answer(shape, got)
+                changed += 1
+        if not changed:
+            return
+        self.canvas._obey(scene.commit())
+        if not was_dirty:
+            scene.mark_saved()          # the .gspec already has them
+        self.log(f"the canvas now shows the {changed} classified widget(s)")
 
     def on_generate(self) -> None:
         if not self.project:
@@ -906,6 +976,9 @@ class DesignerTab(ViewHelpers, QWidget):
                 self.questions = list(result.questions)
                 for line in dp.describe_questions(self.questions):
                     self.log(line)
+                if getattr(result, "classified", None) \
+                        and name == self.project:
+                    self._apply_classified(result.classified)
                 if result.ok and name == self.project:
                     # The manifest's port registry was just rewritten, and
                     # it is what decides whether a later edit is a rename.
@@ -964,21 +1037,36 @@ class DesignerTab(ViewHelpers, QWidget):
                      "drawn onto its canvas, in its toolkit.")
             return
         name = self.project
+        stop = threading.Event()
+        self._describe_stop = stop
+        describe = self.actions.describe
 
         def work() -> None:
             try:
-                result, failure = self.actions.describe(name, text), ""
+                result, failure = _describe_call(describe, name, text,
+                                                 stop.is_set), ""
             except Exception as exc:                     # noqa: BLE001
                 result, failure = None, f"describe failed: {exc!r}"
 
             def show() -> None:
                 self._busy = False
+                self.describe_stop_button.setEnabled(False)
                 self._apply_description(name, result, failure)
                 self._refresh_status()
 
             self._to_ui(show)
 
-        self._start("describing…", work, name="designer-describe")
+        if self._start("describing…", work, name="designer-describe"):
+            self.describe_stop_button.setEnabled(True)
+
+    def on_stop_describe(self) -> None:
+        """Ask the describing worker to stop. It finishes the call it is in
+        (or cancels it, where the engine can) and reports what it had."""
+        if self._describe_stop.is_set() or not self._busy:
+            return
+        self._describe_stop.set()
+        self.describe_stop_button.setEnabled(False)
+        self.log("stopping the description…")
 
     def _apply_description(self, name: str, result, failure: str) -> None:
         """Put a finished description on the canvas, or say why not."""
@@ -1015,13 +1103,26 @@ class DesignerTab(ViewHelpers, QWidget):
         # size on disk is what Generate will lay the new shapes out against.
         self._set_design(*self._design_size(), reopen=False)
         attempts = getattr(result, "attempts", 0)
+        mode = getattr(result, "mode", "")
         self.log(f"drew {len(result.shapes)} shape(s) from the description"
-                 + (f" ({attempts} model call(s))" if attempts else "")
+                 + (f" ({attempts} model call(s)"
+                    + (f", {mode} mode" if mode else "") + ")"
+                    if attempts else "")
                  + " — Save to keep it, Undo to take it back.")
-        title = (getattr(result, "window", None) or {}).get("title")
-        if title:
-            self.log(f"suggested window title: {title!r} (set it in the "
-                     f"window panel — click an empty part of the canvas)")
+        # The window style was validated with the shapes (gui_describe checks
+        # its colours and font) and used to be thrown away — "dropped the
+        # requested background colour" is one of the failures the worked
+        # examples were written for. It goes in with the drawing at Save.
+        values = dp.described_window(getattr(result, "window", None))
+        if values:
+            self._pending_window = (name, values,
+                                    {s.id for s in result.shapes})
+            if "title" in values:
+                self.log(f"suggested window title: {values['title']!r}")
+            self.log("the described window ("
+                     + ", ".join(f"{k}={v!r}" for k, v in values.items())
+                     + ") is applied when you Save the drawing — Undo the "
+                       "drawing and it is dropped")
 
     def on_run(self) -> None:
         directory = self.actions.project_dir(self.project)
@@ -1059,13 +1160,33 @@ class DesignerTab(ViewHelpers, QWidget):
         self.log(self.actions.detach(self.project).message)
 
     # ==================================================================
-    def _start(self, status: str, work, *, name: str) -> None:
+    def _start(self, status: str, work, *, name: str) -> bool:
+        """Run ``work`` on a worker thread. False when another job is
+        running and nothing was started."""
         if self._busy:
             self.log("Already working — wait for it to finish.")
-            return
+            return False
         self._busy = True
         self.status.setText(status)
         threading.Thread(target=work, name=name, daemon=True).start()
+        return True
+
+
+def _describe_call(describe: Callable, name: str, text: str,
+                   should_stop: Callable[[], bool]):
+    """``describe(name, text, should_stop=...)``, or without should_stop for
+    a describe that does not take it — a host's own, or a test's stand-in.
+    Read from the signature, so a TypeError inside describe is not retried."""
+    import inspect
+    try:
+        params = inspect.signature(describe).parameters
+        takes = "should_stop" in params or any(
+            p.kind is p.VAR_KEYWORD for p in params.values())
+    except (TypeError, ValueError):
+        takes = False
+    if takes:
+        return describe(name, text, should_stop=should_stop)
+    return describe(name, text)
 
 
 def build_designer(window) -> QWidget:

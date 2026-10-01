@@ -171,8 +171,11 @@ def test_partial_credit_keeps_the_shapes_that_worked():
     cls, _ = gcl.classify([generic("a"), generic("b"), generic("c")], None, stub)
     kinds = {c.shape_id: c.kind for c in cls}
     assert kinds == {"a": "treeview", "b": "button", "c": "entry"}
-    assert "id: a" not in stub.prompts[1], "the repair only re-asks the failures"
-    assert "id: c" in stub.prompts[1]
+    # Boxes are numbered in the prompt (an id is 32 tokens); the numbers stay
+    # those of the first prompt, so box 3 is still box 3 in the repair.
+    boxes = stub.prompts[1].split("BOXES", 1)[1]
+    assert "- box 1:" not in boxes, "the repair only re-asks the failures"
+    assert "- box 3:" in boxes
 
 
 # ============================================================

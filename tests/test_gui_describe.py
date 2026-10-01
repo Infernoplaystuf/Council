@@ -116,13 +116,17 @@ def gate(result):
 # ============================================================
 
 ALLOWED_LOCAL = {"gui_shapes", "gui_snap", "gui_layout", "gui_spec",
-                 "gui_colors", "gui_ports", "gui_examples", "nx_generate"}
+                 "gui_colors", "gui_ports", "gui_examples", "nx_generate",
+                 "gui_describe_tree"}
 
 
-def test_module_imports_only_the_stdlib_and_the_pure_designer_modules():
+@pytest.mark.parametrize("module", ["gui_describe.py", "gui_describe_tree.py"])
+def test_module_imports_only_the_stdlib_and_the_pure_designer_modules(module):
     """The moment this module reaches for a toolkit or a model loader it
-    cannot be driven by a scripted stub, which is the whole test strategy."""
-    src = (ROOT / "gui_describe.py").read_text(encoding="utf-8")
+    cannot be driven by a scripted stub, which is the whole test strategy.
+    The layout-tree module is held to the same rule: gui_describe imports
+    it, so anything it reached for, describe would load too."""
+    src = (ROOT / module).read_text(encoding="utf-8")
     mods = set()
     for node in ast.walk(ast.parse(src)):
         if isinstance(node, ast.Import):
@@ -132,8 +136,9 @@ def test_module_imports_only_the_stdlib_and_the_pure_designer_modules():
     stray = {m for m in mods
              if m not in sys.stdlib_module_names and m not in ALLOWED_LOCAL
              and m != "__future__"}
-    assert not stray, f"gui_describe imports non-pure modules: {stray}"
-    for banned in ("council_engine", "role_models", "PySide6", "tkinter"):
+    assert not stray, f"{module} imports non-pure modules: {stray}"
+    for banned in ("council_engine", "role_models", "PySide6", "tkinter",
+                   "jsonschema", "llama_cpp"):
         assert banned not in mods
 
 
