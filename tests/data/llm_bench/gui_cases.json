@@ -1,0 +1,142 @@
+{
+ "about": "The GUI suite of council_core.llm_bench: twelve plain-English app descriptions, each graded by machine after Describe it. 'expect' keys: kinds_all (each kind at least once), kinds_any (a list of alternative groups; each group needs one of its kinds), count_at_least / count_at_most ({kind: n}), labels_all (a list of alternative groups; each group must appear in some shape's label, caption text or list props), props_any ([{kind, prop, contains|equals}]), notebook_tabs, min_shapes / max_shapes, ports_min ({port type: n}, the types gui_ports derives at Generate). Every criterion is something the description asks for in words.",
+ "cases": [
+  {
+   "id": "S1", "tier": "simple", "name": "Contact form",
+   "text": "A contact form: labelled text boxes for Name, Email and Phone, a multi-line Message box, a 'Subscribe to newsletter' checkbox, and Send and Clear buttons at the bottom.",
+   "expect": {
+    "kinds_all": ["label", "entry", "text", "checkbutton", "button"],
+    "count_at_least": {"entry": 3, "button": 2},
+    "labels_all": [["name"], ["email", "e-mail"], ["phone"], ["message"], ["send"], ["clear"]],
+    "min_shapes": 9, "max_shapes": 18,
+    "ports_min": {"event": 2}
+   }
+  },
+  {
+   "id": "S2", "tier": "simple", "name": "Length converter",
+   "text": "A length converter: a box to type a number, a dropdown for the unit to convert from and a dropdown for the unit to convert to (both offering mm, cm, m and in), a Convert button, and a label that shows the result.",
+   "expect": {
+    "kinds_all": ["entry", "combobox", "button", "label"],
+    "count_at_least": {"combobox": 2},
+    "labels_all": [["convert"]],
+    "props_any": [{"kind": "combobox", "prop": "values", "contains": "cm"},
+                  {"kind": "combobox", "prop": "values", "contains": "in"}],
+    "min_shapes": 5, "max_shapes": 12
+   }
+  },
+  {
+   "id": "S3", "tier": "simple", "name": "Countdown timer",
+   "text": "A countdown timer: a spin box for minutes from 0 to 60, a large label showing the time left, a progress bar, and Start, Pause and Reset buttons in a row.",
+   "expect": {
+    "kinds_all": ["spinbox", "label", "progressbar", "button"],
+    "count_at_least": {"button": 3},
+    "labels_all": [["start"], ["pause"], ["reset"]],
+    "props_any": [{"kind": "spinbox", "prop": "to", "equals": 60}],
+    "min_shapes": 6, "max_shapes": 12
+   }
+  },
+  {
+   "id": "S4", "tier": "simple", "name": "To-do list",
+   "text": "A to-do list: a text box with an Add button beside it at the top, a list of tasks filling the middle, and Remove and Clear all buttons at the bottom.",
+   "expect": {
+    "kinds_all": ["entry", "button", "listbox"],
+    "count_at_least": {"button": 3},
+    "labels_all": [["add"], ["remove", "delete"], ["clear"]],
+    "min_shapes": 5, "max_shapes": 10
+   }
+  },
+  {
+   "id": "M1", "tier": "medium", "name": "File browser with preview",
+   "text": "A file browser with preview: a folder picker across the top, a list of the files in that folder down the left, and on the right an image preview area above a multi-line text box that shows the selected file's details. An Open button under the file list.",
+   "expect": {
+    "kinds_all": ["file_picker", "image_canvas", "text", "button"],
+    "kinds_any": [["listbox", "treeview"]],
+    "labels_all": [["open"]],
+    "min_shapes": 5, "max_shapes": 14,
+    "ports_min": {"path": 1, "image": 1}
+   }
+  },
+  {
+   "id": "M2", "tier": "medium", "name": "Settings dialog with tabs",
+   "text": "A settings dialog with three tabs: General, Display and Advanced. General has a username entry and a 'Start at login' checkbox. Display has a theme dropdown (Light, Dark) and a font size spin box. Advanced has a cache size slider and a 'Debug logging' checkbox. OK and Cancel buttons below the tabs.",
+   "expect": {
+    "kinds_all": ["notebook", "entry", "checkbutton", "combobox", "spinbox", "scale", "button"],
+    "notebook_tabs": 3,
+    "count_at_least": {"checkbutton": 2, "button": 2},
+    "labels_all": [["general"], ["display"], ["advanced"], ["ok"], ["cancel"]],
+    "props_any": [{"kind": "combobox", "prop": "values", "contains": "Dark"}],
+    "min_shapes": 10, "max_shapes": 26
+   }
+  },
+  {
+   "id": "M3", "tier": "medium", "name": "Data entry with table",
+   "text": "A data entry window: on the left, labelled fields for Part number (a text box), Material (a dropdown with Ti-6Al-4V, 316L and IN718) and Quantity (a spin box), with Add and Delete buttons under them. On the right, a table with the columns Part, Material and Qty listing the entries.",
+   "expect": {
+    "kinds_all": ["entry", "combobox", "spinbox", "button", "treeview"],
+    "count_at_least": {"button": 2},
+    "labels_all": [["part"], ["material"], ["quantity", "qty"], ["add"], ["delete", "remove"]],
+    "props_any": [{"kind": "treeview", "prop": "columns", "contains": "Material"},
+                  {"kind": "combobox", "prop": "values", "contains": "316L"}],
+    "min_shapes": 8, "max_shapes": 18,
+    "ports_min": {"rows": 1}
+   }
+  },
+  {
+   "id": "M4", "tier": "medium", "name": "Plot viewer",
+   "text": "A plot viewer: a file picker for a CSV file at the top, two dropdowns to choose the X column and the Y column, a Plot button, a large chart area, and a status bar at the bottom.",
+   "expect": {
+    "kinds_all": ["file_picker", "combobox", "button", "chart_panel", "status_bar"],
+    "count_at_least": {"combobox": 2},
+    "labels_all": [["plot"]],
+    "min_shapes": 6, "max_shapes": 14,
+    "ports_min": {"figure": 1}
+   }
+  },
+  {
+   "id": "C1", "tier": "complex", "name": "Camera capture panel",
+   "text": "A camera capture panel. A column of controls on the left: a list of cameras with Scan for cameras and Connect buttons under it, an Exposure (us) spin box from 10 to 100000, a Gain slider from 0 to 24, a label showing the frames per second, an output folder picker, and Start capture and Stop capture buttons. On the right, a large live view image area with a frame slider under it. A status bar along the bottom.",
+   "expect": {
+    "kinds_all": ["spinbox", "scale", "file_picker", "image_canvas", "button", "status_bar"],
+    "kinds_any": [["listbox", "combobox", "treeview"]],
+    "count_at_least": {"button": 4},
+    "labels_all": [["scan"], ["connect"], ["exposure"], ["gain"], ["fps", "frames per second", "frame rate"], ["start"], ["stop"]],
+    "props_any": [{"kind": "spinbox", "prop": "to", "equals": 100000}],
+    "min_shapes": 12, "max_shapes": 32
+   }
+  },
+  {
+   "id": "C2", "tier": "complex", "name": "Multi-tab dashboard",
+   "text": "A production dashboard with three tabs: Overview, Data and Logs. Overview has a chart of the last hour and four labels for Temperature, Pressure, Speed and Status. Data has a table with Time, Sensor and Value columns and an Export button. Logs has a log view and a Clear log button. A menu bar with File and Help at the top and a status bar at the bottom.",
+   "expect": {
+    "kinds_all": ["notebook", "chart_panel", "label", "treeview", "button", "log_pane", "menubar", "status_bar"],
+    "notebook_tabs": 3,
+    "count_at_least": {"label": 4, "button": 2},
+    "labels_all": [["overview"], ["logs"], ["temperature"], ["pressure"], ["export"]],
+    "props_any": [{"kind": "treeview", "prop": "columns", "contains": "Sensor"}],
+    "min_shapes": 12, "max_shapes": 32
+   }
+  },
+  {
+   "id": "C3", "tier": "complex", "name": "Image annotation tool",
+   "text": "An image annotation tool: a toolbar at the top with Open, Save, Previous and Next; a large image area on the left; on the right a dropdown to choose the class (Crack, Pore, Inclusion), an Add box button, a list of the annotations on this image, and a Delete annotation button; a frame slider under the image; a status bar at the bottom.",
+   "expect": {
+    "kinds_all": ["image_canvas", "combobox", "listbox", "button", "status_bar"],
+    "kinds_any": [["toolbar", "button"], ["scrubber", "scale"]],
+    "labels_all": [["open"], ["save"], ["next"], ["add"], ["delete"]],
+    "props_any": [{"kind": "combobox", "prop": "values", "contains": "Pore"}],
+    "min_shapes": 8, "max_shapes": 24
+   }
+  },
+  {
+   "id": "C4", "tier": "complex", "name": "Log monitor with filters",
+   "text": "A log monitor: a log file picker at the top; under it a filter row with a level dropdown (DEBUG, INFO, WARNING, ERROR), a search text box, an 'Auto-scroll' checkbox and Apply and Clear buttons; a large log view below; a status bar showing the line count at the bottom.",
+   "expect": {
+    "kinds_all": ["file_picker", "combobox", "entry", "checkbutton", "button", "log_pane", "status_bar"],
+    "count_at_least": {"button": 2},
+    "labels_all": [["apply"], ["clear"], ["auto-scroll", "auto scroll", "autoscroll"]],
+    "props_any": [{"kind": "combobox", "prop": "values", "contains": "ERROR"}],
+    "min_shapes": 8, "max_shapes": 18
+   }
+  }
+ ]
+}

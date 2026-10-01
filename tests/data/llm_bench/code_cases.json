@@ -1,0 +1,197 @@
+{
+ "about": "The code-behind suite of council_core.llm_bench. Each case is a small generated app (its ports: name, kind, type, starting value), the button whose handler the model writes, what that button must do, and a HIDDEN test the model never sees. The test runs in a fresh interpreter against council_core.bench_ports stand-ins with: app (the window; app.errors lists report_error calls), P (app.ports; port.value is the raw widget state a user would have typed, port.items()/rows() the list/table contents), clock (the fake time, when fake_clock is set), tmp (a scratch folder), num(text) (first number in a text) and norm(text) (lower-cased, spaces collapsed). 'linked' names Council modules the handler may import (the app is then a linked project).",
+ "cases": [
+  {
+   "id": "K1", "tier": "simple", "name": "Sum two numbers",
+   "handler": "on_btn_add",
+   "ports": [
+    {"name": "first_number", "kind": "entry", "type": "float", "label": "First number"},
+    {"name": "second_number", "kind": "entry", "type": "float", "label": "Second number"},
+    {"name": "result", "kind": "label", "type": "str", "label": "Result"},
+    {"name": "add", "kind": "button", "type": "event", "handler": "on_btn_add", "label": "Add"}
+   ],
+   "task": "When the Add button is pressed, show the sum of First number and Second number in the result label. If either box is blank or not a number, show the text 'Invalid input' in the result label instead.",
+   "test": [
+    "P.first_number.value = '2.5'; P.second_number.value = '4'",
+    "app.on_btn_add()",
+    "assert num(P.result.value) == 6.5, '2.5 + 4 should show 6.5; the label shows %r' % P.result.value",
+    "P.first_number.value = '-1'; P.second_number.value = '1e3'",
+    "app.on_btn_add()",
+    "assert num(P.result.value) == 999.0, '-1 + 1e3 should show 999; the label shows %r' % P.result.value",
+    "P.first_number.value = ''; P.second_number.value = '4'",
+    "app.on_btn_add()",
+    "assert 'invalid input' in norm(P.result.value), 'a blank box should show Invalid input; the label shows %r' % P.result.value",
+    "P.first_number.value = 'abc'",
+    "app.on_btn_add()",
+    "assert 'invalid input' in norm(P.result.value), \"'abc' should show Invalid input; the label shows %r\" % P.result.value"
+   ]
+  },
+  {
+   "id": "K2", "tier": "medium", "name": "Filter a list",
+   "handler": "on_btn_filter",
+   "ports": [
+    {"name": "search", "kind": "entry", "type": "str", "label": "Search"},
+    {"name": "fruits", "kind": "listbox", "type": "str", "label": "Fruits",
+     "items": ["Apple", "Banana", "Cherry", "apricot", "Grape", "Pineapple"]},
+    {"name": "count", "kind": "label", "type": "str", "label": "Count"},
+    {"name": "filter", "kind": "button", "type": "event", "handler": "on_btn_filter", "label": "Filter"}
+   ],
+   "task": "When Filter is pressed, show in the fruits list only the items of the ORIGINAL list (the items it held before the first filter) whose text contains the search text, ignoring upper/lower case and keeping their order. An empty search shows every original item again. Also show how many items are now shown in the count label, e.g. '3 items'.",
+   "test": [
+    "ORIGINAL = ['Apple', 'Banana', 'Cherry', 'apricot', 'Grape', 'Pineapple']",
+    "P.search.value = 'ap'",
+    "app.on_btn_filter()",
+    "assert P.fruits.items() == ['Apple', 'apricot', 'Grape', 'Pineapple'], \"'ap' should leave Apple, apricot, Grape, Pineapple; the list holds %r\" % P.fruits.items()",
+    "assert num(P.count.value) == 4, 'the count label should say 4; it shows %r' % P.count.value",
+    "P.search.value = 'AN'",
+    "app.on_btn_filter()",
+    "assert P.fruits.items() == ['Banana'], \"'AN' must search the ORIGINAL list, ignoring case; the list holds %r\" % P.fruits.items()",
+    "P.search.value = ''",
+    "app.on_btn_filter()",
+    "assert P.fruits.items() == ORIGINAL, 'an empty search should restore every original item; the list holds %r' % P.fruits.items()",
+    "assert num(P.count.value) == 6, 'the count label should say 6; it shows %r' % P.count.value"
+   ]
+  },
+  {
+   "id": "K3", "tier": "medium", "name": "Load a CSV into a table",
+   "handler": "on_btn_load",
+   "ports": [
+    {"name": "csv_file", "kind": "file_picker", "type": "path", "label": "CSV file"},
+    {"name": "table", "kind": "treeview", "type": "rows", "label": "Table"},
+    {"name": "status", "kind": "label", "type": "str", "label": "Status"},
+    {"name": "load_button", "kind": "button", "type": "event", "handler": "on_btn_load", "label": "Load"}
+   ],
+   "task": "When Load is pressed, read the CSV file whose path is in csv_file. Its first row is the header; put every following row into the table (each row as a list of its values) and show 'Loaded N rows' in the status label, N being the number of data rows. If the file cannot be read, call self.report_error('Load CSV', exc) with the exception and empty the table.",
+   "test": [
+    "p = tmp / 'parts.csv'",
+    "p.write_text('part,qty,material\\nbracket,4,Ti-6Al-4V\\nlug,12,316L\\n\"plate, thin\",1,IN718\\n', encoding='utf-8')",
+    "P.csv_file.value = str(p)",
+    "app.on_btn_load()",
+    "rows = [list(r) for r in P.table.rows()]",
+    "assert rows == [['bracket', '4', 'Ti-6Al-4V'], ['lug', '12', '316L'], ['plate, thin', '1', 'IN718']], 'the table should hold the 3 data rows (a quoted comma included); it holds %r' % rows",
+    "assert num(P.status.value) == 3, 'status should say Loaded 3 rows; it shows %r' % P.status.value",
+    "assert not app.errors, 'a readable file reported an error: %r' % app.errors",
+    "P.csv_file.value = str(tmp / 'missing.csv')",
+    "app.on_btn_load()",
+    "assert app.errors, 'a missing file must be reported with self.report_error'",
+    "assert P.table.rows() == [], 'the table must be emptied when the file cannot be read; it holds %r' % P.table.rows()"
+   ]
+  },
+  {
+   "id": "K4", "tier": "complex", "name": "Image statistics",
+   "handler": "on_btn_analyze",
+   "linked": ["image_stats"],
+   "ports": [
+    {"name": "image_path", "kind": "file_picker", "type": "path", "label": "Image"},
+    {"name": "brightness", "kind": "label", "type": "str", "label": "Brightness"},
+    {"name": "size", "kind": "label", "type": "str", "label": "Size"},
+    {"name": "analyze", "kind": "button", "type": "event", "handler": "on_btn_analyze", "label": "Analyze"}
+   ],
+   "task": "When Analyze is pressed, call image_stats.image_pixel_stats(path) on the path in image_path. It returns a dict with the keys 'width', 'height' and 'brightness' (a float), or a dict with an 'error' key when it fails. Show the brightness rounded to 1 decimal in the brightness label (e.g. '127.5') and the size as 'W x H' (e.g. '640 x 480') in the size label. On failure, call self.report_error('Analyze', the error text) and clear both labels.",
+   "test": [
+    "from PIL import Image",
+    "img = tmp / 'gray.png'",
+    "Image.new('RGB', (40, 20), (100, 100, 100)).save(img)",
+    "P.image_path.value = str(img)",
+    "app.on_btn_analyze()",
+    "assert num(P.brightness.value) == 100.0, 'a flat grey 100 image should show brightness 100.0; the label shows %r' % P.brightness.value",
+    "assert norm(P.size.value).replace(' ', '') == '40x20', 'size should show 40 x 20; the label shows %r' % P.size.value",
+    "P.image_path.value = str(tmp / 'nope.png')",
+    "app.on_btn_analyze()",
+    "assert app.errors, 'a failed analysis must be reported with self.report_error'",
+    "assert P.brightness.value == '' and P.size.value == '', 'both labels must be cleared on failure; they show %r and %r' % (P.brightness.value, P.size.value)"
+   ]
+  },
+  {
+   "id": "K5", "tier": "simple", "name": "Validate an email",
+   "handler": "on_btn_check",
+   "ports": [
+    {"name": "email", "kind": "entry", "type": "str", "label": "Email"},
+    {"name": "message", "kind": "label", "type": "str", "label": "Message"},
+    {"name": "check", "kind": "button", "type": "event", "handler": "on_btn_check", "label": "Check"}
+   ],
+   "task": "When Check is pressed, decide whether the text in email is a valid address: exactly one '@'; at least one character before it; after it a domain that contains a '.', where the domain does not start or end with '.'. Ignore spaces at either end of the text. Show exactly 'Valid email' or 'Invalid email' in the message label.",
+   "test": [
+    "for text, ok in [('ann@example.com', True), ('  bob@mail.co.uk ', True), ('ann.example.com', False), ('ann@example', False), ('@example.com', False), ('ann@@example.com', False), ('ann@.com', False), ('ann@example.com.', False), ('', False)]:",
+    "    P.email.value = text",
+    "    app.on_btn_check()",
+    "    want = 'valid email' if ok else 'invalid email'",
+    "    assert norm(P.message.value) == want, '%r should give %r; the label shows %r' % (text, want, P.message.value)"
+   ]
+  },
+  {
+   "id": "K6", "tier": "medium", "name": "Toggle a stopwatch",
+   "handler": "on_btn_start_stop",
+   "fake_clock": true,
+   "ports": [
+    {"name": "state", "kind": "label", "type": "str", "label": "State"},
+    {"name": "elapsed", "kind": "label", "type": "str", "label": "Elapsed"},
+    {"name": "start_stop", "kind": "button", "type": "event", "handler": "on_btn_start_stop", "label": "Start / Stop"}
+   ],
+   "task": "The Start / Stop button toggles a stopwatch. A press while stopped starts timing and shows 'Running' in the state label. A press while running stops it, shows 'Stopped' in the state label, and shows the seconds since the start press in the elapsed label with one decimal followed by ' s' (e.g. '2.5 s'). A later press starts a new timing from zero. Read the time with time.monotonic().",
+   "test": [
+    "clock.now = 100.0",
+    "app.on_btn_start_stop()",
+    "assert norm(P.state.value) == 'running', 'the first press should show Running; state shows %r' % P.state.value",
+    "clock.now = 102.5",
+    "app.on_btn_start_stop()",
+    "assert norm(P.state.value) == 'stopped', 'the second press should show Stopped; state shows %r' % P.state.value",
+    "assert norm(P.elapsed.value) == '2.5 s', 'elapsed should show 2.5 s; it shows %r' % P.elapsed.value",
+    "clock.now = 110.0",
+    "app.on_btn_start_stop()",
+    "assert norm(P.state.value) == 'running', 'a third press should start again; state shows %r' % P.state.value",
+    "clock.now = 111.04",
+    "app.on_btn_start_stop()",
+    "assert norm(P.elapsed.value) == '1.0 s', 'the new timing should start from zero (1.0 s); elapsed shows %r' % P.elapsed.value"
+   ]
+  },
+  {
+   "id": "K7", "tier": "medium", "name": "Save entries to JSON",
+   "handler": "on_btn_save",
+   "ports": [
+    {"name": "name", "kind": "entry", "type": "str", "label": "Name"},
+    {"name": "age", "kind": "entry", "type": "int", "label": "Age"},
+    {"name": "subscribed", "kind": "checkbutton", "type": "bool", "label": "Subscribed"},
+    {"name": "output_file", "kind": "file_picker", "type": "path", "label": "Output file"},
+    {"name": "status", "kind": "label", "type": "str", "label": "Status"},
+    {"name": "save", "kind": "button", "type": "event", "handler": "on_btn_save", "label": "Save"}
+   ],
+   "task": "When Save is pressed, write the JSON object {\"name\": <the name text>, \"age\": <the age as an integer>, \"subscribed\": <true or false>} to the file whose path is in output_file, and show 'Saved' in the status label. If age is blank or not a whole number, write nothing and show 'Age must be a whole number' in the status label.",
+   "test": [
+    "out = tmp / 'person.json'",
+    "P.name.value = 'Ada'; P.age.value = '36'; P.subscribed.value = True; P.output_file.value = str(out)",
+    "app.on_btn_save()",
+    "assert out.exists(), 'Save wrote no file at the output path'",
+    "data = json.loads(out.read_text(encoding='utf-8'))",
+    "assert data == {'name': 'Ada', 'age': 36, 'subscribed': True}, 'the file should hold name/age/subscribed; it holds %r' % (data,)",
+    "assert norm(P.status.value) == 'saved', 'status should show Saved; it shows %r' % P.status.value",
+    "out2 = tmp / 'bad.json'",
+    "P.age.value = 'thirty'; P.output_file.value = str(out2)",
+    "app.on_btn_save()",
+    "assert not out2.exists(), 'a file was written although age is not a whole number'",
+    "assert 'whole number' in norm(P.status.value), 'status should say Age must be a whole number; it shows %r' % P.status.value"
+   ]
+  },
+  {
+   "id": "K8", "tier": "simple", "name": "Convert units",
+   "handler": "on_btn_convert",
+   "ports": [
+    {"name": "amount", "kind": "entry", "type": "float", "label": "Amount"},
+    {"name": "from_unit", "kind": "combobox", "type": "str", "label": "From", "values": ["mm", "cm", "m", "in"], "value": "mm"},
+    {"name": "to_unit", "kind": "combobox", "type": "str", "label": "To", "values": ["mm", "cm", "m", "in"], "value": "cm"},
+    {"name": "result", "kind": "label", "type": "str", "label": "Result"},
+    {"name": "convert", "kind": "button", "type": "event", "handler": "on_btn_convert", "label": "Convert"}
+   ],
+   "task": "When Convert is pressed, convert the number in amount from the unit chosen in from_unit to the unit chosen in to_unit (the units are mm, cm, m and in; 1 in = 25.4 mm). Show the result with exactly 3 decimals, a space and the target unit, e.g. '2.540 cm'. If amount is blank or not a number, show 'Enter a number' in the result label.",
+   "test": [
+    "for v, a, b, want in [('1', 'in', 'cm', '2.540 cm'), ('100', 'mm', 'm', '0.100 m'), ('3', 'm', 'in', '118.110 in'), ('2.5', 'cm', 'cm', '2.500 cm')]:",
+    "    P.amount.value = v; P.from_unit.value = a; P.to_unit.value = b",
+    "    app.on_btn_convert()",
+    "    assert norm(P.result.value) == want, '%s %s -> %s should show %r; the label shows %r' % (v, a, b, want, P.result.value)",
+    "P.amount.value = 'x'",
+    "app.on_btn_convert()",
+    "assert norm(P.result.value) == 'enter a number', \"'x' should show Enter a number; the label shows %r\" % P.result.value"
+   ]
+  }
+ ]
+}
