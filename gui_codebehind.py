@@ -485,10 +485,14 @@ def _return_block(target: Target) -> str:
     # A raise becomes an error dialog and CLEARED outputs (the stub's
     # envelope), so a validation message the task wants shown in a label
     # was never seen — measured: 4 of 6 failing code cases on llama3.1:8b.
+    # No sample wording here: given one ("Enter a number"), llama3.1:8b
+    # wrote exactly that instead of the message each task asked for
+    # (measured, 3 of 8 cases).
     lines.append('If an INPUT is missing or invalid (a blank box, text where '
-                 'a number belongs), do not raise: return the dict with a '
-                 'short message for the user in the key shown as text (e.g. '
-                 '"Enter a number") and empty values in the others.')
+                 'a number belongs), do not raise: return the dict with the '
+                 "message for the user in the key shown as text — the TASK's "
+                 'own wording, word for word, when it gives one — and empty '
+                 'values in the others.')
     lines.append('Raise ValueError("<a plain sentence for the user>") only '
                  'for a failure the user cannot fix by changing an input (a '
                  'file that cannot be read) — and never return 0 or "" to '
@@ -545,10 +549,11 @@ def _ports_block(target: Target, mention: Sequence[str] = ()) -> str:
     lines = ["THE WINDOW'S PORTS (read and write the window ONLY through "
              "these):"] + [f"  {port_line(p)}" for p in rows]
     lines.append("Every port also has .enable(True/False) and .clear().")
-    lines.append("A blank or invalid input is the user's to fix: set a short "
-                 "message in the output label (e.g. \"Enter a number\") "
-                 "instead of raising. Do not catch other exceptions — the app "
-                 "shows them to the user.")
+    lines.append("A blank or invalid input is the user's to fix: set the "
+                 "message in the output label instead of raising — the "
+                 "TASK's own wording, word for word, when it gives one. Do "
+                 "not catch other exceptions — the app shows them to the "
+                 "user.")
     lines.append(f"To remember a value between clicks, keep it on "
                  f"self.{PRIVATE_PREFIX}<name> (e.g. self.{PRIVATE_PREFIX}"
                  f"start = time.monotonic()) and read it with getattr(self, "

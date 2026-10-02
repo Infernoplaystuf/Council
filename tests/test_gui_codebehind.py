@@ -1088,7 +1088,10 @@ def test_a_typed_number_box_is_described_as_maybe_none():
 
 def test_an_input_problem_is_a_message_not_an_exception():
     block = gcb._return_block(fn_target())
-    assert "do not raise" in block and "Enter a number" in block
+    assert "do not raise" in block and "word for word" in block
+    # No sample message to copy: the model wrote the sample instead of the
+    # task's own wording (measured).
+    assert "Enter a number" not in block
     ports = gcb._ports_block(h_target())
     assert "instead of raising" in ports and "self._ai_" in ports
 
