@@ -152,6 +152,12 @@ PARAM_TYPES = {"path": "str", "str": "str", "int": "int", "float": "float",
 #: self.<attr> a handler body may use besides self.ports and on_* handlers.
 SELF_ATTRS = frozenset({"ports", "report_error", "clear_ports",
                         "request_close"})
+#: A handler's OWN state between clicks lives under this prefix — a
+#: stopwatch's start time, the list as it was before a filter. Anything else
+#: on self is the app's, and a model writing to it (self.ports = ...,
+#: self.request_close = ...) would break the window; this prefix cannot
+#: collide with anything the emitter generates.
+PRIVATE_PREFIX = "_ai_"
 
 _BUILTINS = frozenset(dir(builtins))
 
@@ -476,8 +482,17 @@ def _return_block(target: Target) -> str:
     lines = ["RETURN a dict with exactly these keys:"]
     for o in target.outputs:
         lines.append(f'  "{o.key}"  {o.what}' if o.what else f'  "{o.key}"')
-    lines.append('On failure raise ValueError("<a plain sentence for the '
-                 'user>") — never return 0, "" or [] to mean "it failed".')
+    # A raise becomes an error dialog and CLEARED outputs (the stub's
+    # envelope), so a validation message the task wants shown in a label
+    # was never seen — measured: 4 of 6 failing code cases on llama3.1:8b.
+    lines.append('If an INPUT is missing or invalid (a blank box, text where '
+                 'a number belongs), do not raise: return the dict with a '
+                 'short message for the user in the key shown as text (e.g. '
+                 '"Enter a number") and empty values in the others.')
+    lines.append('Raise ValueError("<a plain sentence for the user>") only '
+                 'for a failure the user cannot fix by changing an input (a '
+                 'file that cannot be read) — and never return 0 or "" to '
+                 'hide a failure.')
     return "\n".join(lines)
 
 
@@ -508,7 +523,19 @@ def port_line(p: PortRow) -> str:
     if p.kind in ("label", "progressbar"):
         what = "number 0-100" if p.kind == "progressbar" else "text"
         return f"{base}.set({what})  {p.kind}{lab}"
+    if typ in ("int", "float") and p.kind not in ("spinbox", "scale"):
+        # A typed box that is blank, or holds text that is no number, is
+        # read as None (gui_emit_qt._coerce) — measured: the models wrote
+        # float(...) and crashed on a blank box.
+        typ += " or None (blank, or not a number)"
     return f"{base}.get() -> {typ}, .set(value)  {p.kind}{lab}"
+
+
+def _private_ok(attr: str) -> bool:
+    """self._ai_<name>: the handler's own state between clicks."""
+    rest = attr[len(PRIVATE_PREFIX):] if attr.startswith(PRIVATE_PREFIX) \
+        else ""
+    return bool(rest) and rest.isidentifier()
 
 
 def _ports_block(target: Target, mention: Sequence[str] = ()) -> str:
@@ -517,8 +544,16 @@ def _ports_block(target: Target, mention: Sequence[str] = ()) -> str:
         rows.sort(key=lambda p: (p.name not in mention, p.name))
     lines = ["THE WINDOW'S PORTS (read and write the window ONLY through "
              "these):"] + [f"  {port_line(p)}" for p in rows]
-    lines.append("Every port also has .enable(True/False) and .clear(). Do "
-                 "not catch exceptions — the app shows them to the user.")
+    lines.append("Every port also has .enable(True/False) and .clear().")
+    lines.append("A blank or invalid input is the user's to fix: set a short "
+                 "message in the output label (e.g. \"Enter a number\") "
+                 "instead of raising. Do not catch other exceptions — the app "
+                 "shows them to the user.")
+    lines.append(f"To remember a value between clicks, keep it on "
+                 f"self.{PRIVATE_PREFIX}<name> (e.g. self.{PRIVATE_PREFIX}"
+                 f"start = time.monotonic()) and read it with getattr(self, "
+                 f"\"{PRIVATE_PREFIX}start\", None) — never any other "
+                 f"self.<name>.")
     return "\n".join(lines)
 
 
@@ -1544,9 +1579,12 @@ def _port_faults(code: str, target: Target
         # self.<attr>
         if isinstance(holder, ast.Name) and holder.id == "self" and \
                 node.attr not in allowed_self and \
-                not node.attr.startswith("browse_"):
+                not node.attr.startswith("browse_") and \
+                not _private_ok(node.attr):
             faults.append(f"line {node.lineno}: self.{node.attr} is not part "
-                          f"of the app — use self.ports.<name>")
+                          f"of the app — use self.ports.<name>, or "
+                          f"self.{PRIVATE_PREFIX}<name> to remember a value "
+                          f"between clicks")
             continue
         # self.ports.X.<method>
         if not (isinstance(holder, ast.Attribute)
@@ -1897,6 +1935,27 @@ def write(target: Target, model_call: Optional[ModelCall], *,
     return res
 
 
+#: Model-call failures that another call cannot fix: no server, no model.
+_FATAL_CALL_ERRORS = ("BackendUnavailable", "LocalChatTimeout")
+_FATAL_CALL_TEXT = ("has no model", "not installed", "no ollama server",
+                    "no model is loaded", "cuda out of memory")
+
+
+def _worth_retrying(exc: BaseException, failures: List[str]) -> bool:
+    """Whether a failed model call deserves another try. Records it.
+
+    Not when the cause outlives the call (no server, no model, out of
+    memory — the next call fails the same way, only later), and not when the
+    same failure has just happened twice (it is not going to change)."""
+    text = repr(exc)
+    failures.append(text)
+    if type(exc).__name__ in _FATAL_CALL_ERRORS:
+        return False
+    if any(t in text.lower() for t in _FATAL_CALL_TEXT):
+        return False
+    return not (len(failures) >= 2 and failures[-1] == failures[-2])
+
+
 def _say(on_progress, text: str) -> None:
     if on_progress is not None:
         try:
@@ -1967,6 +2026,7 @@ def _write(res: CodeResult, target: Target, model_call, smoke, catalogue,
     plan += [("repair", 100 + i, REPAIR_TEMPERATURE)
              for i in range(max(0, int(max_repairs)))]
     bump = 0.0
+    call_failures: List[str] = []
     for step, (kind, seed, temp) in enumerate(plan):
         temp = min(0.9, temp + bump)
         seed = seed + int(bump * 100)
@@ -2001,6 +2061,15 @@ def _write(res: CodeResult, target: Target, model_call, smoke, catalogue,
                                       f"the model call failed: {exc!r}")
                 _accept(res, fallback)
                 return
+            elif _worth_retrying(exc, call_failures) and step + 1 < len(plan):
+                # A failure that is about THIS generation (measured: Ollama's
+                # "prediction aborted, token repeat limit reached" on the
+                # first of three samples) used to end the whole attempt with
+                # two samples and the repairs unspent. New dice, next step.
+                res.notes.append(f"a model call failed ({exc!r}); trying "
+                                 f"again with different settings")
+                bump = min(0.6, bump + 0.3)
+                continue
             else:
                 res.errors = [f"the model call failed: {exc!r}"]
             if best is not None:

@@ -1041,3 +1041,79 @@ def test_function_text_is_what_the_fingerprint_is_taken_of():
     assert gcb.function_text(src, "f") == "def f():\n    return {}\n"
     assert gcb.sha(gcb.function_text(src, "f")) == gcb.sha(
         "def f():\n    return {}\n")
+
+
+# ============================================================
+# Fixes from the measurement runs (2026-10-02)
+# ============================================================
+
+STOPWATCH = fence('''
+def on_btn_go(self, *args) -> None:
+    import time
+    start = getattr(self, "_ai_start", None)
+    if start is None:
+        self._ai_start = time.monotonic()
+        self.ports.status.set("started")
+    else:
+        self.ports.status.set(f"{time.monotonic() - start:.1f} s")
+        self._ai_start = None''')
+
+
+def _faults(raw, target):
+    return " | ".join(gcb.check(raw, target).faults)
+
+
+def test_a_handler_may_keep_private_state_between_clicks():
+    """The user allowed it: a stopwatch, or the list as it was before a
+    filter, needs a value that outlives one click."""
+    assert "_ai_start" not in _faults(STOPWATCH, h_target())
+
+
+def test_any_other_self_attribute_is_still_refused():
+    for name in ("counter", "_ai_", "ports_backup"):
+        raw = fence(f'''
+def on_btn_go(self, *args) -> None:
+    self.{name} = 1
+    self.ports.status.set("x")''')
+        faults = _faults(raw, h_target())
+        assert f"self.{name}" in faults, (name, faults)
+
+
+def test_a_typed_number_box_is_described_as_maybe_none():
+    entry = gcb.PortRow("age", "entry", "int", "var", "", "Age")
+    spin = gcb.PortRow("count", "spinbox", "int", "var", "", "Count")
+    assert "None" in gcb.port_line(entry)
+    assert "None" not in gcb.port_line(spin)        # a spinbox always has one
+
+
+def test_an_input_problem_is_a_message_not_an_exception():
+    block = gcb._return_block(fn_target())
+    assert "do not raise" in block and "Enter a number" in block
+    ports = gcb._ports_block(h_target())
+    assert "instead of raising" in ports and "self._ai_" in ports
+
+
+def test_one_failed_model_call_does_not_end_the_attempt():
+    """Measured: Ollama's 'token repeat limit reached' on the first of three
+    samples ended the case with two samples and every repair unspent."""
+    model = Script(RuntimeError("prediction aborted, token repeat limit "
+                                "reached"), GOOD)
+    res = gcb.write(fn_target(), model, n_best=3)
+    assert res.ok and len(model.calls) == 2
+    assert model.calls[1]["temperature"] != model.calls[0]["temperature"]
+    assert any("trying again" in n for n in res.notes)
+
+
+def test_a_failure_another_call_cannot_fix_is_not_retried():
+    class BackendUnavailable(Exception):
+        pass
+
+    model = Script(BackendUnavailable("No Ollama server answers"), GOOD)
+    res = gcb.write(fn_target(), model, n_best=3)
+    assert not res.ok and len(model.calls) == 1
+
+
+def test_the_same_failure_twice_stops_the_retries():
+    model = Script(RuntimeError("boom"), RuntimeError("boom"), GOOD)
+    res = gcb.write(fn_target(), model, n_best=3)
+    assert not res.ok and len(model.calls) == 2 and "boom" in res.errors[0]

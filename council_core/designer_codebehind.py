@@ -492,7 +492,8 @@ def _param_what(port: Any, widget: Any) -> str:
     if port.kind in ("spinbox", "scale"):
         return f"a number from the {port.kind} {lab}"
     if port.type in ("int", "float"):
-        return f"a number the user typed in {lab}"
+        return (f"a number the user typed in {lab} — or None when the box "
+                f"is blank or holds no number (check for None first)")
     if port.type == "path":
         return f"a path the user typed in {lab}"
     if port.kind == "text":
