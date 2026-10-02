@@ -368,6 +368,29 @@ class Device:
         """Say before start() whether every frame will be RECORDED (keep them
         all) or only shown (the newest will do). Most cameras do not care."""
 
+    # -- every setting the camera has (council_core.camera_settings) -----
+    def settings_provider(self) -> Any:
+        """This camera's settings, described by the camera itself. A device
+        type with nothing to offer has none — never invented ones."""
+        from .camera_settings import NoSettings
+        return NoSettings()
+
+    def settings(self) -> List[Any]:
+        """Every setting, with its range and current value."""
+        return self.settings_provider().describe()
+
+    def set_setting(self, key: str, value: Any) -> Any:
+        """Write one setting; returns a camera_settings.Change saying what
+        the camera actually took. Raises NeedsStop if the stream is in the
+        way."""
+        return self.settings_provider().set(key, value)
+
+    def apply_settings(self, values: Dict[str, Any],
+                       roi: Optional[Roi] = None) -> Any:
+        """Write a whole set, and optionally the area, in a safe order."""
+        from . import camera_settings
+        return camera_settings.apply(self, values, roi)
+
     def start(self) -> None:
         raise NotImplementedError
 
@@ -730,6 +753,12 @@ class BaslerDevice(Device):
 
     def prepare(self, recording: bool) -> None:
         self._recording = bool(recording)
+
+    def settings_provider(self) -> Any:
+        """The node map's features, ranges read from the nodes (see
+        camera_settings.BaslerSettings)."""
+        from .camera_settings import BaslerSettings
+        return BaslerSettings(self)
 
     def start(self) -> None:
         """Grab. What pylon keeps when the app falls behind depends on why:
@@ -1338,6 +1367,12 @@ class EvkDevice(Device):
             raise CameraError(f"the camera refused that area: {exc}") from exc
         self._roi = wanted
         return wanted
+
+    def settings_provider(self) -> Any:
+        """Biases, ERC, anti-flicker, trail filter, monitoring — whichever
+        the HAL exposes (see camera_settings.EvkSettings)."""
+        from .camera_settings import EvkSettings
+        return EvkSettings(self)
 
     def set_frame_rate(self, fps: float) -> float:
         """Pictures a second = how long each window collects events.
