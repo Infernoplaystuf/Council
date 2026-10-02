@@ -48,6 +48,8 @@ BENCH_DIR = docs_servers.APP_ROOT / "tests" / "data" / "docsbench"
 BENCH_FILE = BENCH_DIR / "bench.json"
 QUICK = ("q01", "q04", "q08", "n01", "c02")
 CODE_TIMEOUT = 30.0
+#: Committed memory one code task may use (MB) — see child_proc.
+CODE_MEMORY_MB = 2048
 #: Below this pass rate a model is not suggested for the docs role.
 GOOD_RATE = 0.8
 CHECKS_FILE = "docs_checks.json"
@@ -198,6 +200,30 @@ def run_code_test(code: str, item: dict, *, timeout: float = CODE_TIMEOUT,
         scratch.mkdir()
         env = dict(os.environ, TEMP=str(scratch), TMP=str(scratch),
                    TMPDIR=str(scratch))
+        try:
+            from . import child_proc
+        except Exception:                                 # noqa: BLE001
+            child_proc = None
+        if child_proc is not None:
+            # A Job Object (the tree dies with a timeout), a commit cap for
+            # the solution, and a process the MACHINE could not start
+            # (0xC0000142 when the PC is out of virtual memory) reported as
+            # not graded rather than as the model's failure.
+            ran = child_proc.run([sys.executable, "-I", "-B", "runner.py"],
+                                 cwd=tmp, env=env, timeout=timeout,
+                                 memory_limit_mb=CODE_MEMORY_MB, retries=1,
+                                 max_output=OUTPUT_TAIL)
+            text = (ran.stdout + ran.stderr).strip()
+            if ran.infra:
+                return {"passed": False, "infra": ran.infra,
+                        "output": f"not graded — {ran.infra}",
+                        "seconds": round(time.perf_counter() - t0, 3)}
+            passed = (not ran.timed_out and ran.returncode == 0
+                      and ran.stdout.strip().endswith("PASS"))
+            if ran.timed_out:
+                text = f"timed out after {timeout:g} s"
+            return {"passed": passed, "output": text[-800:],
+                    "seconds": round(time.perf_counter() - t0, 3)}
         proc = subprocess.Popen(
             [sys.executable, "-I", "-B", "runner.py"], cwd=tmp, env=env,
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -252,6 +278,9 @@ class ItemResult:
     notes: List[str] = field(default_factory=list)
     #: The model the ENGINE says answered (last_call_stats), "" if unknown.
     served_by: str = ""
+    #: Why this item could not be GRADED (the PC could not start the test
+    #: process), "" when it was. Not counted as passed or failed.
+    infra: str = ""
 
 
 @dataclass
@@ -268,7 +297,12 @@ class BenchReport:
     origin: str = ""
 
     def _of(self, kind: str) -> List[ItemResult]:
-        return [i for i in self.items if i.kind == kind]
+        return [i for i in self.items if i.kind == kind and not i.infra]
+
+    @property
+    def graded(self) -> List[ItemResult]:
+        """Items that were graded — not the ones the PC could not run."""
+        return [i for i in self.items if not i.infra]
 
     @property
     def passed(self) -> int:
@@ -276,7 +310,8 @@ class BenchReport:
 
     @property
     def rate(self) -> float:
-        return self.passed / len(self.items) if self.items else 0.0
+        graded = self.graded
+        return self.passed / len(graded) if graded else 0.0
 
     @property
     def mean_seconds(self) -> float:
@@ -285,7 +320,8 @@ class BenchReport:
 
     @property
     def good(self) -> bool:
-        return bool(self.items) and not self.stopped and self.rate >= GOOD_RATE
+        return (bool(self.graded) and not self.stopped
+                and self.rate >= GOOD_RATE)
 
     @property
     def origin_class(self) -> str:
@@ -319,7 +355,8 @@ class BenchReport:
         cited = [i for i in qs if i.citation_ok is not None]
         return {
             "model": self.model, "role": self.role,
-            "passed": self.passed, "total": len(self.items),
+            "passed": self.passed, "total": len(self.graded),
+            "not_graded": len(self.items) - len(self.graded),
             "rate": round(self.rate, 3),
             "questions": f"{sum(i.passed for i in qs)}/{len(qs)}",
             "citations_right": f"{sum(bool(i.citation_ok) for i in cited)}"
@@ -456,6 +493,7 @@ def _grade(kind: str, item: dict, ans: docs_qa.DocsAnswer) -> ItemResult:
     else:
         test = run_code_test(ans.code, item)
         r.passed = test["passed"]
+        r.infra = str(test.get("infra") or "")
         r.detail = "" if r.passed else test["output"][-300:]
     return r
 

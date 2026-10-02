@@ -1,9 +1,10 @@
 {
- "about": "The code-behind suite of council_core.llm_bench. Each case is a small generated app (its ports: name, kind, type, starting value), the button whose handler the model writes, what that button must do, and a HIDDEN test the model never sees. The test runs in a fresh interpreter against council_core.bench_ports stand-ins with: app (the window; app.errors lists report_error calls), P (app.ports; port.value is the raw widget state a user would have typed, port.items()/rows() the list/table contents), clock (the fake time, when fake_clock is set), tmp (a scratch folder), num(text) (first number in a text) and norm(text) (lower-cased, spaces collapsed). 'linked' names Council modules the handler may import (the app is then a linked project).",
+ "about": "The code-behind suite of council_core.llm_bench. Each case is a small generated app (its ports: name, kind, type, starting value), the button whose handler the model writes, what that button must do, and a HIDDEN test the model never sees. The test runs in a fresh interpreter against council_core.bench_ports stand-ins with: app (the window; app.errors lists report_error calls), P (app.ports; port.value is the raw widget state a user would have typed, port.items()/rows() the list/table contents), clock (the fake time, when fake_clock is set), tmp (a scratch folder), num(text) (first number in a text) and norm(text) (lower-cased, spaces collapsed). 'linked' names Council modules the handler may import (the app is then a linked project). 'codebehind' is how the case goes through the REAL code-behind writer (llm_bench --pipeline new, council_core.bench_codebehind): mode 'function' = one pure function in logic.py wired by a script link (inputs = the ports passed in, outputs = port -> result key) whose handler is Generate's linked stub; mode 'handler' = the writer's handler-body mode, for the two cases that need state between presses. 'instruction', when present, replaces the task text for the writer only where the task names handler-only API (self.report_error) — it says the function-mode equivalent, which the linked stub performs.",
  "cases": [
   {
    "id": "K1", "tier": "simple", "name": "Sum two numbers",
    "handler": "on_btn_add",
+   "codebehind": {"mode": "function", "inputs": ["first_number", "second_number"], "outputs": {"result": "result"}},
    "ports": [
     {"name": "first_number", "kind": "entry", "type": "float", "label": "First number"},
     {"name": "second_number", "kind": "entry", "type": "float", "label": "Second number"},
@@ -29,6 +30,7 @@
   {
    "id": "K2", "tier": "medium", "name": "Filter a list",
    "handler": "on_btn_filter",
+   "codebehind": {"mode": "handler"},
    "ports": [
     {"name": "search", "kind": "entry", "type": "str", "label": "Search"},
     {"name": "fruits", "kind": "listbox", "type": "str", "label": "Fruits",
@@ -55,6 +57,8 @@
   {
    "id": "K3", "tier": "medium", "name": "Load a CSV into a table",
    "handler": "on_btn_load",
+   "codebehind": {"mode": "function", "inputs": ["csv_file"], "outputs": {"table": "table", "status": "status"},
+                  "instruction": "When Load is pressed, read the CSV file whose path is in csv_file. Its first row is the header; put every following row into the table (each row as a list of its values) and show 'Loaded N rows' in the status label, N being the number of data rows. If the file cannot be read, raise an error (the app then reports it and empties the table)."},
    "ports": [
     {"name": "csv_file", "kind": "file_picker", "type": "path", "label": "CSV file"},
     {"name": "table", "kind": "treeview", "type": "rows", "label": "Table"},
@@ -81,6 +85,8 @@
    "id": "K4", "tier": "complex", "name": "Image statistics",
    "handler": "on_btn_analyze",
    "linked": ["image_stats"],
+   "codebehind": {"mode": "function", "inputs": ["image_path"], "outputs": {"brightness": "brightness", "size": "size"},
+                  "instruction": "When Analyze is pressed, call image_stats.image_pixel_stats(path) on the path in image_path. It returns a dict with the keys 'width', 'height' and 'brightness' (a float), or a dict with an 'error' key when it fails. Show the brightness rounded to 1 decimal in the brightness label (e.g. '127.5') and the size as 'W x H' (e.g. '640 x 480') in the size label. When it returns an 'error', raise ValueError with that text (the app then reports it and clears both labels)."},
    "ports": [
     {"name": "image_path", "kind": "file_picker", "type": "path", "label": "Image"},
     {"name": "brightness", "kind": "label", "type": "str", "label": "Brightness"},
@@ -105,6 +111,7 @@
   {
    "id": "K5", "tier": "simple", "name": "Validate an email",
    "handler": "on_btn_check",
+   "codebehind": {"mode": "function", "inputs": ["email"], "outputs": {"message": "message"}},
    "ports": [
     {"name": "email", "kind": "entry", "type": "str", "label": "Email"},
     {"name": "message", "kind": "label", "type": "str", "label": "Message"},
@@ -123,6 +130,7 @@
    "id": "K6", "tier": "medium", "name": "Toggle a stopwatch",
    "handler": "on_btn_start_stop",
    "fake_clock": true,
+   "codebehind": {"mode": "handler"},
    "ports": [
     {"name": "state", "kind": "label", "type": "str", "label": "State"},
     {"name": "elapsed", "kind": "label", "type": "str", "label": "Elapsed"},
@@ -148,11 +156,12 @@
   {
    "id": "K7", "tier": "medium", "name": "Save entries to JSON",
    "handler": "on_btn_save",
+   "codebehind": {"mode": "function", "inputs": ["name", "age", "subscribed", "output_file"], "outputs": {"status": "status"}},
    "ports": [
     {"name": "name", "kind": "entry", "type": "str", "label": "Name"},
     {"name": "age", "kind": "entry", "type": "int", "label": "Age"},
     {"name": "subscribed", "kind": "checkbutton", "type": "bool", "label": "Subscribed"},
-    {"name": "output_file", "kind": "file_picker", "type": "path", "label": "Output file"},
+    {"name": "output_file", "kind": "file_picker", "type": "path", "label": "Output file", "mode": "save"},
     {"name": "status", "kind": "label", "type": "str", "label": "Status"},
     {"name": "save", "kind": "button", "type": "event", "handler": "on_btn_save", "label": "Save"}
    ],
@@ -175,6 +184,7 @@
   {
    "id": "K8", "tier": "simple", "name": "Convert units",
    "handler": "on_btn_convert",
+   "codebehind": {"mode": "function", "inputs": ["amount", "from_unit", "to_unit"], "outputs": {"result": "result"}},
    "ports": [
     {"name": "amount", "kind": "entry", "type": "float", "label": "Amount"},
     {"name": "from_unit", "kind": "combobox", "type": "str", "label": "From", "values": ["mm", "cm", "m", "in"], "value": "mm"},

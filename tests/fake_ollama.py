@@ -17,6 +17,14 @@ Behaviours a test sets on ``server.state``:
   reject_format   HTTP 400 for any request with a dict "format"
   no_tools        HTTP 400 "does not support tools" when "tools" is sent
   done_reason     the final packet's done_reason ("length" = cut off)
+  reply_fn        callable(request body) -> text: the reply chosen per
+                  request (wins over reply / json_reply when it returns a
+                  str), for a test that answers several kinds of prompt
+  vram_fraction   /api/ps reports size_vram = size * this for every model
+                  a chat has loaded (1.0 = all on the GPU, 0 = CPU)
+
+/api/ps lists the models chats have "loaded"; /api/generate with keep_alive
+0 "unloads" one (the benchmark's clean-placement step).
 """
 from __future__ import annotations
 
@@ -74,6 +82,17 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(200, {"version": "0.35.0-fake"})
         elif self.path == "/api/tags":
             self._json(200, {"models": self.st.tags})
+        elif self.path == "/api/ps":
+            models = []
+            for t in self.st.tags:
+                if t["name"] in self.st.loaded:
+                    size = int(t.get("size") or 0)
+                    models.append({"name": t["name"], "model": t["name"],
+                                   "size": size,
+                                   "size_vram": int(size
+                                                    * self.st.vram_fraction),
+                                   "details": t.get("details") or {}})
+            self._json(200, {"models": models})
         else:
             self._json(404, {"error": "not found"})
 
@@ -86,6 +105,13 @@ class _Handler(BaseHTTPRequestHandler):
                                             "llama.context_length": 8192},
                              "capabilities": ["completion"]})
             return
+        if self.path == "/api/generate" and \
+                body.get("keep_alive") in (0, "0", "0s"):
+            self.st.loaded.discard(body.get("model"))
+            self.st.unloads.append(body.get("model"))
+            self._json(200, {"model": body.get("model"), "done": True,
+                             "done_reason": "unload", "response": ""})
+            return
         if self.path != "/api/chat":
             self._json(404, {"error": "not found"})
             return
@@ -95,6 +121,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": f"model '{body.get('model')}' not "
                                      "found"})
             return
+        self.st.loaded.add(body.get("model"))
         fmt = body.get("format")
         if isinstance(fmt, dict) and self.st.reject_format:
             self._json(400, {"error": "invalid format: unsupported schema"})
@@ -109,6 +136,13 @@ class _Handler(BaseHTTPRequestHandler):
             text = self.st.json_reply
         elif fmt == "json" and self.st.json_reply is not None:
             text = self.st.json_reply
+        if self.st.reply_fn is not None:
+            try:
+                got = self.st.reply_fn(body)
+            except Exception as exc:                      # noqa: BLE001
+                got = f"reply_fn raised {exc!r}"
+            if isinstance(got, str):
+                text = got
         calls = self.st.tool_calls if body.get("tools") else None
         final = {"model": body.get("model"), "done": True,
                  "done_reason": self.st.done_reason, "prompt_eval_count": 120,
@@ -161,7 +195,8 @@ class FakeOllama:
             reply="Hello from the fake.", json_reply=None, tool_calls=None,
             token_delay=0.0, first_delay=0.0, reject_format=False,
             no_tools=False, done_reason="stop", requests=[], chats=[],
-            completed=0, disconnected=0)
+            completed=0, disconnected=0, reply_fn=None, vram_fraction=1.0,
+            loaded=set(), unloads=[])
         self.httpd.state = self.state            # type: ignore[attr-defined]
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
         self._thread = threading.Thread(target=self.httpd.serve_forever,
