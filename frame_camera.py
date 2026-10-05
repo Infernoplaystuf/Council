@@ -1769,7 +1769,10 @@ def set_camera_setting(key: Any, value: Any) -> Dict[str, Any]:
         setting = provider.find(key)
     except camera_settings.SettingError as exc:
         raise RuntimeError(str(exc)) from exc
-    stop = bool(camera_settings.stops_needed(device, {key: value}))
+    # The setting just looked up, not the whole camera described again: a
+    # settings window writes one of these per step of a slider.
+    stop = bool(camera_settings.stops_needed(device, {key: value},
+                                             described=[setting]))
     if stop:
         _refuse_while_capturing(f"changing {setting.label}")
 

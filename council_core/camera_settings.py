@@ -692,32 +692,47 @@ class BaslerSettings(Provider):
 
     # -- describe --------------------------------------------------------
     def describe(self) -> List[Setting]:
-        out = []
         streaming = self._streaming()
+        out = []
         for feature in BASLER_FEATURES:
-            found = self._resolve(feature)
-            if found is None:
-                continue
-            name, node = found
-            setting = _node_setting(feature, name, node)
-            if setting is None:
-                continue
-            held = self.held_by(setting, {})
-            if feature.read_only or setting.kind == TEXT:
-                setting = replace(setting, read_only=True)
-            elif held:
-                # Owned by an auto loop: not read-only — a set that turns
-                # the loop off first still writes it.
-                setting = replace(setting, held=held)
-            elif not _writable(node):
-                if streaming:
-                    # Locked by the stream (TLParamsLocked on the emulator:
-                    # PixelFormat, ReverseX/Y, Binning — measured).
-                    setting = replace(setting, live=False)
-                else:
-                    setting = replace(setting, read_only=True)
-            out.append(setting)
+            setting = self._describe_one(feature, streaming)
+            if setting is not None:
+                out.append(setting)
         return out
+
+    def find(self, key: str) -> Setting:
+        """ONE feature's nodes, not the whole table: a settings window
+        writes one setting per step of a slider, and each write looks its
+        setting up first."""
+        setting = self._describe_one(self._feature(key), self._streaming())
+        if setting is None:
+            raise SettingError(f"this camera has no setting called {key!r}")
+        return setting
+
+    def _describe_one(self, feature: _Feature,
+                      streaming: bool) -> Optional[Setting]:
+        found = self._resolve(feature)
+        if found is None:
+            return None
+        name, node = found
+        setting = _node_setting(feature, name, node)
+        if setting is None:
+            return None
+        held = self.held_by(setting, {})
+        if feature.read_only or setting.kind == TEXT:
+            setting = replace(setting, read_only=True)
+        elif held:
+            # Owned by an auto loop: not read-only — a set that turns
+            # the loop off first still writes it.
+            setting = replace(setting, held=held)
+        elif not _writable(node):
+            if streaming:
+                # Locked by the stream (TLParamsLocked on the emulator:
+                # PixelFormat, ReverseX/Y, Binning — measured).
+                setting = replace(setting, live=False)
+            else:
+                setting = replace(setting, read_only=True)
+        return setting
 
     def read(self, key: str) -> Any:
         found = self._resolve(self._feature(key))
@@ -1010,6 +1025,27 @@ class EvkSettings(Provider):
         out.extend(self._camera())
         return out
 
+    def find(self, key: str) -> Setting:
+        """ONE facility's settings, not every facility's: on a live EVK4
+        each read is a USB round trip, and a settings window looks a setting
+        up before every write — one per step of a slider. A bias is one
+        bias (its value and its info), not all of them."""
+        group, _, rest = key.partition(".")
+        if group == "bias" and rest and self.biases is not None:
+            try:
+                value = self.biases.get(rest)
+            except Exception:                               # noqa: BLE001
+                value = None
+            if value is not None:
+                return self._bias(rest, value)
+        part = {"erc": self._erc, "afk": self._afk, "trail": self._trail,
+                "activity": self._activity, "status": self._status,
+                "camera": self._camera}.get(group)
+        for setting in (part() if part is not None else self.describe()):
+            if setting.key == key:
+                return setting
+        raise SettingError(f"this camera has no setting called {key!r}")
+
     def _biases(self) -> List[Setting]:
         if self.biases is None:
             return []
@@ -1017,22 +1053,22 @@ class EvkSettings(Provider):
             values = dict(self.biases.get_all_biases())
         except Exception:                                   # noqa: BLE001
             return []
-        out = []
-        for name, value in values.items():
-            info = _ask(self.biases, "get_bias_info", name)
-            allowed = _pair(_ask(info, "get_bias_allowed_range")) or _pair(
-                _ask(info, "get_bias_range"))
-            recommended = _pair(_ask(info, "get_bias_recommended_range"))
-            modifiable = _ask(info, "is_modifiable")
-            described = _ask(info, "get_description") or ""
-            help_text = _BIAS_HELP.get(str(name), "") or str(described)
-            out.append(Setting(
-                f"bias.{name}", str(name), G_BIASES, INT, int(value),
-                minimum=allowed[0] if allowed else None,
-                maximum=allowed[1] if allowed else None, step=1,
-                read_only=modifiable is False, help=help_text,
-                recommended=recommended))
-        return out
+        return [self._bias(name, value) for name, value in values.items()]
+
+    def _bias(self, name: Any, value: Any) -> Setting:
+        info = _ask(self.biases, "get_bias_info", name)
+        allowed = _pair(_ask(info, "get_bias_allowed_range")) or _pair(
+            _ask(info, "get_bias_range"))
+        recommended = _pair(_ask(info, "get_bias_recommended_range"))
+        modifiable = _ask(info, "is_modifiable")
+        described = _ask(info, "get_description") or ""
+        help_text = _BIAS_HELP.get(str(name), "") or str(described)
+        return Setting(
+            f"bias.{name}", str(name), G_BIASES, INT, int(value),
+            minimum=allowed[0] if allowed else None,
+            maximum=allowed[1] if allowed else None, step=1,
+            read_only=modifiable is False, help=help_text,
+            recommended=recommended)
 
     def _erc(self) -> List[Setting]:
         erc = self.erc
@@ -1213,10 +1249,8 @@ class EvkSettings(Provider):
             if direct is not None:
                 got = getattr(target, direct)()
                 return _enum_name(got) if key in _EVK_ENUMS else _plain(got)
-        for setting in self.describe():
-            if setting.key == key:
-                return setting.value
-        raise SettingError(f"this camera has no setting called {key!r}")
+        # A reading (temperature) or a camera fact: its own facility only.
+        return self.find(key).value
 
     def write(self, setting: Setting, value: Any,
               batch: Mapping[str, Any]) -> None:

@@ -712,6 +712,131 @@ def test_the_frame_rate_setting_and_the_fps_box_are_one_rate():
 
 
 # ======================================================================
+# One setting is looked up on its own — a settings window writes one per
+# step of a slider, and each write looks its setting up first
+# ======================================================================
+def counting(obj, name, calls):
+    real = getattr(obj, name)
+
+    def counted(*a, **kw):
+        calls.append(name)
+        return real(*a, **kw)
+    setattr(obj, name, counted)
+
+
+def test_one_bias_is_looked_up_without_reading_every_facility():
+    """Before: find() described the whole camera — every bias's info, the
+    ERC, anti-flicker, trail filter and the temperature — and
+    set_camera_setting described it a second time to ask whether the
+    stream was in the way. On an EVK4 each of those reads is a USB round
+    trip."""
+    dev, hal = evk()
+    calls = []
+    counting(hal.biases, "get_all_biases", calls)
+    counting(hal.biases, "get_bias_info", calls)
+    counting(hal.erc, "get_cd_event_rate", calls)
+    counting(hal.afk, "get_band_low_frequency", calls)
+    found = dev.settings_provider().find("bias.bias_fo")
+    assert (found.key, found.minimum, found.maximum) == ("bias.bias_fo",
+                                                         -35, 55)
+    assert calls == ["get_bias_info"], calls
+    calls.clear()
+    assert dev.settings_provider().find("erc.rate").maximum == 1_000_000_000
+    assert "get_all_biases" not in calls and "get_band_low_frequency" \
+        not in calls
+    with pytest.raises(cs.SettingError):
+        dev.settings_provider().find("bias.no_such_bias")
+
+
+def test_one_basler_feature_is_looked_up_without_the_whole_node_map():
+    dev, cam = basler()
+    calls = []
+    counting(cam.BlackLevel, "GetValue", calls)
+    counting(cam.PixelFormat, "GetValue", calls)
+    found = dev.settings_provider().find("Gain")
+    assert found.key == "Gain" and found.maximum == 48.0
+    assert calls == [], "other features were read to find one"
+    dev.start()
+    assert dev.settings_provider().find("PixelFormat").live is False
+    with pytest.raises(cs.SettingError):
+        dev.settings_provider().find("NoSuchFeature")
+
+
+def test_a_temperature_is_read_from_its_own_facility():
+    dev, hal = evk()
+    calls = []
+    counting(hal.biases, "get_all_biases", calls)
+    assert dev.settings_provider().read("status.temperature") == 34
+    assert calls == []
+
+
+# ======================================================================
+# The camera's own factory settings
+# ======================================================================
+class Command:
+    def __init__(self, cam):
+        self.cam = cam
+        self.runs = 0
+
+    def IsValid(self):
+        return True
+
+    def IsReadable(self):
+        return True
+
+    def IsWritable(self):
+        return True
+
+    def Execute(self):
+        self.runs += 1
+        self.cam.log.append(("UserSetLoad", self.cam.UserSetSelector.value))
+
+
+def test_a_basler_loads_its_factory_user_set_with_the_stream_stopped():
+    dev, cam = basler(UserSetSelector=Node("UserSet1", choices=(
+        "Default", "UserSet1")))
+    cam.UserSetLoad = Command(cam)
+    provider = dev.settings_provider()
+    assert provider.defaults_source() == 'UserSet "Default"'
+    dev.start()
+    with pytest.raises(cs.NeedsStop):
+        provider.load_defaults()
+    assert cam.UserSetLoad.runs == 0, "loaded while grabbing"
+    dev.stop()
+    provider.load_defaults()
+    assert cam.log[-2:] == [("UserSetSelector", "Default"),
+                            ("UserSetLoad", "Default")]
+
+
+def test_a_camera_without_a_factory_set_offers_none():
+    dev, _ = basler()
+    assert dev.settings_provider().defaults_source() == ""
+    with pytest.raises(cs.SettingError):
+        dev.settings_provider().load_defaults()
+    assert evk()[0].settings_provider().defaults_source() == ""
+
+
+def test_the_simulated_frame_camera_loads_its_defaults_like_a_basler():
+    dev = cameras.SyntheticDevice(CameraInfo("synthetic", "sim-frame",
+                                             "sim", kind="frame"))
+    dev.set_setting("Gain", 12)
+    dev.set_roi(Roi(64, 32, 128, 96))
+    provider = dev.settings_provider()
+    assert provider.defaults_source()
+    dev.start()
+    with pytest.raises(cs.NeedsStop):
+        provider.load_defaults()
+    dev.stop()
+    provider.load_defaults()
+    assert dev.state["Gain"] == 0.0
+    assert dev.roi().as_tuple() == (0, 0, dev.WIDTH, dev.HEIGHT)
+    event = cameras.SyntheticDevice(CameraInfo("synthetic", "sim-event",
+                                               "sim", kind="event"))
+    assert event.settings_provider().defaults_source() == "", \
+        "an EVK4 has no factory set to load; neither does its stand-in"
+
+
+# ======================================================================
 # The real OpenEB bindings, when they are importable here
 # ======================================================================
 def _hal():
