@@ -926,3 +926,15 @@ def test_the_picture_window_is_looked_up_without_reading_the_camera():
     assert calls == [], calls
     change = dev.set_setting("window_ms", 50)
     assert change.value == 50.0 and calls == [], calls
+
+
+def test_a_value_the_camera_cannot_take_is_no_reason_to_stop():
+    """A preset holding a pixel format this camera does not offer (or a
+    word where a number goes) is refused before any write — it stopped and
+    restarted a streaming Basler only to be refused."""
+    dev, cam = basler()
+    dev.start()
+    assert cs.stops_needed(dev, {"PixelFormat": "Mono99"}) == []
+    done = cs.apply(dev, {"PixelFormat": "Mono99", "Gain": 3.0})
+    assert [c.key for c in done.refused] == ["PixelFormat"]
+    assert cs.stops_needed(dev, {"PixelFormat": "Mono12"}) == ["PixelFormat"]

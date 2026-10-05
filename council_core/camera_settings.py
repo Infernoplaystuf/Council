@@ -484,6 +484,20 @@ def _unchanged(setting: Setting, asked: Any) -> bool:
     return same(wanted, setting.value)
 
 
+def _would_change(setting: Setting, asked: Any) -> bool:
+    """Would `asked` be WRITTEN and change this setting? Not when it is
+    already so, and not when it cannot be taken at all (a pixel format
+    this camera does not offer, a word where a number goes): that is
+    refused before any write, so it is no reason to stop the stream —
+    measured, a preset holding a format the camera no longer offers
+    stopped and restarted the live view only to be refused."""
+    try:
+        wanted, _ = coerce(setting, asked)
+    except SettingError:
+        return False
+    return not same(wanted, setting.value)
+
+
 def area_unchanged(device: Any, roi: Roi) -> bool:
     try:
         return device.roi() == fit_roi(roi, device.limits())
@@ -508,7 +522,7 @@ def stops_needed(device: Any, values: Mapping[str, Any],
     blocked = [key for key in values
                if key in by_key and not by_key[key].live
                and not by_key[key].read_only
-               and not _unchanged(by_key[key], values[key])]
+               and _would_change(by_key[key], values[key])]
     if (roi is not None and not getattr(device, "area_live", False)
             and _fits(device, roi) and not area_unchanged(device, roi)):
         # An area off the sensor is refused, not written (apply): no reason
