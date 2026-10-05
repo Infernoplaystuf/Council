@@ -1460,3 +1460,162 @@ def test_built_typhon_tags_the_classifiers_it_makes_with_its_own_project(
     assert got["bundle"] == ["typhon-frames"]
     assert Path(got["store"]) == vault / "classifiers"
     assert got["app"] == "Typhon (project typhon_cls)"
+
+
+# ============================================================
+# The Typhon wiring planned for this (not in typhon.gspec yet)
+# ============================================================
+
+#: handler -> (function, input ports, {port: result key}, button label).
+#: The UI plan, as data: each becomes a script link in typhon.gspec. New
+#: ports: classifier_filter (editable combobox: All classifiers / This app /
+#: Origin unknown, or typed "App: X", "Tag: Y"), models (listbox — a Qt
+#: combobox port takes one string, not a list, so the list of models is a
+#: listbox), new_name, tag (entries), export_to (folder picker), import_from
+#: (file picker), model_history (listbox), classified_with_line (label).
+TYPHON_LINKS = {
+    "on_classifier_filter": ("list_classifiers", ["classifier_filter"],
+                             {"models": "rows", "classifier_status": "summary"},
+                             "Show"),
+    "on_btn_refresh": ("list_classifiers", ["classifier_filter"],
+                       {"models": "rows", "classifier_status": "summary"},
+                       "Refresh"),
+    "on_btn_use_selected": ("open_classifier", ["models"],
+                            {"classifier_name": "name", "classes": "classes",
+                             "classifier_status": "summary"}, "Use selected"),
+    "on_btn_save_as": ("save_as",
+                       ["classifier_name", "new_name", "classifier_filter"],
+                       {"classifier_name": "name", "classes": "classes",
+                        "models": "rows", "classifier_status": "summary"},
+                       "Save as"),
+    "on_btn_rename": ("rename_classifier",
+                      ["models", "new_name", "classifier_name",
+                       "classifier_filter"],
+                      {"classifier_name": "name", "models": "rows",
+                       "classifier_status": "summary"}, "Rename"),
+    "on_btn_delete": ("delete_classifier",
+                      ["models", "classifier_name", "classifier_filter"],
+                      {"classifier_name": "name", "classes": "classes",
+                       "models": "rows", "classifier_status": "summary"},
+                      "Delete"),
+    "on_btn_add_tag": ("add_tag", ["models", "tag", "classifier_filter"],
+                       {"tag": "cleared", "models": "rows",
+                        "classifier_status": "summary"}, "Add tag"),
+    "on_btn_remove_tag": ("remove_tag", ["models", "tag", "classifier_filter"],
+                          {"models": "rows", "classifier_status": "summary"},
+                          "Remove tag"),
+    "on_btn_export": ("export_classifier", ["models", "export_to"],
+                      {"classifier_status": "summary"}, "Export"),
+    "on_btn_export_all_from_this_app": ("export_this_app", ["export_to"],
+                                        {"classifier_status": "summary"},
+                                        "Export all from this app"),
+    "on_btn_import": ("import_classifier",
+                      ["import_from", "new_name", "classifier_filter"],
+                      {"classifier_name": "name", "classes": "classes",
+                       "models": "rows", "classifier_status": "summary"},
+                      "Import"),
+    "on_btn_versions": ("list_versions", ["models"],
+                        {"model_history": "rows",
+                         "classifier_status": "summary"}, "Versions"),
+    "on_btn_history": ("run_history", ["models"],
+                       {"model_history": "rows",
+                        "classifier_status": "summary"}, "History"),
+    "on_btn_classified_with": ("classified_with", ["capture_folder"],
+                               {"classified_with_line": "classified_with"},
+                               "Which model?"),
+}
+
+
+class _Port:
+    def __init__(self, value):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
+
+    def clear(self):
+        self.value = None
+
+
+def test_the_planned_typhon_wiring_runs_as_generated_handlers(
+        vault, trained, tmp_path):
+    """Every planned link, written by the real emitter (gui_emit's
+    handler_stub, what Generate puts in handlers.py), passes the gate and
+    runs: inputs read from ports, result keys written to ports — a flow
+    through the whole library with no error reported."""
+    import gui_emit as ge
+    import gui_policy as pol
+    folder, _ = trained
+    stubs = "".join(ge.handler_stub(h, {"module": "frame_classes",
+                                        "function": fn, "inputs": ins,
+                                        "outputs": outs}, title)
+                    for h, (fn, ins, outs, title) in TYPHON_LINKS.items())
+    code = "class Handlers:\n" + stubs
+    ok, errs = pol.validate(code, "linked", ["numpy", "PIL", "sklearn"],
+                            toolkit="qt")
+    assert ok, errs
+    space = {}
+    exec(compile(code, "handlers.py", "exec"), space)
+    out = tmp_path / "out"
+    out.mkdir()
+    errors = []
+    h = space["Handlers"]()
+    h.ports = types.SimpleNamespace(**{n: _Port(v) for n, v in {
+        "classifier_filter": fc.FILTER_ALL, "models": [],
+        "classifier_name": "frames", "classes": [], "classifier_status": "",
+        "new_name": "", "tag": "", "export_to": str(out), "import_from": "",
+        "capture_folder": str(folder), "classified_with_line": "",
+        "model_history": []}.items()})
+    h.clear_ports = lambda *names: [getattr(h.ports, n).clear() for n in names]
+    h.report_error = lambda what, exc: errors.append(f"{what}: {exc}")
+    p = h.ports
+
+    def pick(name):                        # the user clicks a row
+        p.models.value = [r for r in p.models.value
+                          if fc._name_of(r) == name]
+
+    h.on_classifier_filter()
+    assert len(p.models.value) == 1
+    pick("frames")
+    h.on_btn_use_selected()
+    assert p.classifier_name.value == "frames"
+    assert p.classes.value == ["good", "bad timing"]
+    p.new_name.value = "frames-copy"
+    h.on_btn_save_as()
+    assert p.classifier_name.value == "frames-copy"
+    pick("frames-copy")
+    p.tag.value = "lab"
+    h.on_btn_add_tag()
+    assert p.tag.value == "" and any("tags: lab" in r for r in p.models.value)
+    p.classifier_filter.value = "Tag: lab"
+    h.on_classifier_filter()
+    assert [fc._name_of(r) for r in p.models.value] == ["frames-copy"]
+    pick("frames-copy")
+    p.new_name.value = "frames-lab"
+    h.on_btn_rename()
+    assert p.classifier_name.value == "frames-lab"   # it was the open one
+    pick("frames-lab")
+    h.on_btn_export()
+    assert p.classifier_status.value.startswith("Exported frames-lab v1 (")
+    h.on_btn_export_all_from_this_app()
+    assert "Exported 2 classifier(s)" in p.classifier_status.value
+    h.on_btn_versions()
+    assert p.model_history.value[0].startswith("v1 (")
+    pick("frames-lab")
+    h.on_btn_delete()
+    assert p.classifier_name.value == "" and p.models.value == []
+    p.import_from.value = str(out / "frames-lab-v1.typhon-classifier.zip")
+    p.classifier_filter.value = fc.FILTER_ALL
+    p.new_name.value = ""
+    h.on_btn_import()
+    assert p.classifier_name.value == "frames-lab"
+    fc.classify_folder("frames", str(folder))
+    h.on_btn_classified_with()
+    assert p.classified_with_line.value.startswith("Classified with frames v1")
+    pick("frames")
+    h.on_btn_history()
+    assert len(p.model_history.value) == 1
+    assert errors == []
