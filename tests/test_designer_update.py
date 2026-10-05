@@ -155,7 +155,13 @@ def test_the_summary_names_what_changed_between_the_two_typhons():
     old = gs.load_gspec(OLD).shapes
     new = gs.load_gspec(EXAMPLE).shapes
     changes = dx.layout_changes(old, new)
-    assert changes.added == ["Pop out (s57)", "Settings ▾ (s58)"]
+    # Pop out, Settings, then the camera's own set-up: the area line, the
+    # presets heading, the preset picker, Save preset, Camera settings.
+    assert [a.rsplit(" (", 1)[-1] for a in changes.added] == [
+        "s57)", "s58)", "s59)", "s60)", "s61)", "s62)", "s63)"]
+    assert changes.added[:2] == ["Pop out (s57)", "Settings ▾ (s58)"]
+    assert {"Preset (s61)", "Save preset (s62)",
+            "Camera settings… (s63)"} <= set(changes.added)
     assert changes.removed == []
     rewired = " | ".join(changes.rewired)
     assert "Start capture (s46)" in rewired and "frame_rate)" in rewired
@@ -167,7 +173,7 @@ def test_the_summary_names_what_changed_between_the_two_typhons():
         changes.relabelled
     lines = changes.lines()
     assert len(lines) <= 8, "a summary, not a dump"
-    assert lines[0].startswith("  shapes: 2 added, 0 removed, 5 rewired")
+    assert lines[0].startswith("  shapes: 7 added, 0 removed, 5 rewired")
 
 
 def test_an_unchanged_layout_says_nothing_changed():
@@ -228,6 +234,15 @@ def test_the_frame_count_typhon_gets_the_fps_box_and_settings(tmp_path,
     assert "self.ports.roi" not in method(handlers, "on_btn_connect")
     for name in ("on_btn_apply_area_to_camera", "on_btn_full_sensor"):
         assert 'self.ports.roi.set(result["crop"])' in method(handlers, name)
+    # The camera's own set-up: the preset picker, Save preset and Camera
+    # settings reach their frame_camera functions in the updated project.
+    assert "pick_preset(self.ports.preset.get())" in method(handlers,
+                                                            "on_cmb_preset")
+    assert "save_preset(self.ports.preset.get())" in method(
+        handlers, "on_btn_save_preset")
+    assert "camera_settings()" in method(handlers, "on_btn_camera_settings")
+    ports_py = (pdir / "ui" / "ports.py").read_text(encoding="utf-8")
+    assert "preset" in ports_py and "camera_area" in ports_py
 
     # The manifest remembers, and the port was renamed, not orphaned.
     manifest = gpj.load_manifest(pdir)
@@ -340,13 +355,20 @@ def test_the_updated_app_starts_offscreen(tmp_path, monkeypatch):
         " any('Frame count' in t for t in labels),"
         " b.geometry().x() > 1300 and b.geometry().y() < 40,"
         " callable(getattr(ui, 'on_spn_spinbox_3')))\n"
+        "print(ui.ports.preset.widget.isEditable(),"
+        " type(ui._camera_presets).__name__,"
+        " ui.ports.camera_area.get().startswith(\"Camera's area\"))\n"
         "frame_camera.disconnect()\n")
     env = dict(os.environ, QT_QPA_PLATFORM="offscreen", COUNCIL_NO_DIALOGS="1",
                COUNCIL_VAULT_ROOT=str(vault), PYTHONDONTWRITEBYTECODE="1")
     done = subprocess.run([sys.executable, "-c", code], cwd=str(pdir), env=env,
                           capture_output=True, text=True, timeout=120)
     assert done.returncode == 0, done.stderr
-    assert done.stdout.strip().splitlines()[-1] == "True False True True"
+    printed = done.stdout.strip().splitlines()
+    assert printed[-2] == "True False True True"
+    # The preset picker and the camera's area line arrive with the update,
+    # kept current by attach (app.py itself is untouched).
+    assert printed[-1] == "True PresetPicker True"
 
 
 # ============================================================
@@ -464,7 +486,7 @@ def test_update_from_example_in_the_designer(tab, qapp, monkeypatch):
     assert "handlers.py and app.py are KEPT" in message
     assert "project.gspec.<time>.bak" in message
 
-    assert len(tab.canvas.scene.shapes) == 59
+    assert len(tab.canvas.scene.shapes) == len(gs.load_gspec(EXAMPLE).shapes)
     assert not tab.canvas.scene.dirty
     log = tab.log_view.toPlainText()
     assert "updated example_typhon from example typhon" in log

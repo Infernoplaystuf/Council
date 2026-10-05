@@ -451,6 +451,86 @@ def test_first_run_fills_the_camera_panel(qapp, typhon_dir, monkeypatch,
 
 
 
+# ======================================================================
+# The camera's own set-up: area, settings, presets — in the generated app
+# ======================================================================
+def _connect(ui, kind):
+    ui.on_btn_scan_for_cameras()
+    rows = ui.ports.cameras.items()
+    ui.ports.cameras.widget.setCurrentRow(
+        next(i for i, r in enumerate(rows) if r.endswith(kind)))
+    ui.on_btn_connect()
+    assert ui.ports.capture_status.get().startswith("Connected"), \
+        ui.ports.capture_status.get()
+
+
+def test_a_preset_saved_in_typhon_is_picked_again_after_a_restart(
+        qapp, tmp_path, forget_generated):
+    """The user's bird bath, end to end through the generated window: the
+    live view runs, a box drawn on it becomes the camera's own area, a
+    setting is changed in the settings window, the set-up is saved under a
+    name typed into the preset box — then the app is closed, opened again,
+    connected again, and picking the name puts the camera back."""
+    pdir = rex.build("typhon", project="birds", vault_dir=tmp_path,
+                     target="qt")
+    ui = construct(pdir)
+    picker = ui._camera_presets
+    assert ui.ports.camera_area.get().startswith("Camera's area: —")
+    _connect(ui, "event")
+    _pump_until(lambda: frame_camera._LIVE.previewing, 2.0)
+    assert "the whole sensor" in ui.ports.camera_area.get()
+    _pump_until(lambda: frame_camera._LIVE.shown_aoi is not None, 2.0)
+
+    ui.ports.roi.set("320, 200, 160, 120")            # drawn on the picture
+    ui.on_btn_apply_area_to_camera()
+    assert ui.ports.roi.get() == "", "the crop box was cleared"
+    assert ui.ports.camera_area.get().startswith(
+        "Camera's area: 320, 200, 160, 120 of 640x480")
+
+    ui.on_btn_camera_settings()
+    window = frame_camera._LIVE.settings_window
+    assert window is not None and not window.isVisible()   # dialogs off
+    window.rows["bias.bias_diff_on"].editor.setValue(40)
+    window.flush_now()
+    assert frame_camera._LIVE.device.state["bias.bias_diff_on"] == 40
+
+    ui.ports.preset.set("Bird bath")                 # typed into the box
+    ui.on_btn_save_preset()
+    assert "Saved preset 'Bird bath'" in ui.ports.capture_status.get()
+    combo = ui.ports.preset.widget
+    assert [combo.itemText(i) for i in range(combo.count())] == ["Bird bath"]
+    assert window.preset_list.count() == 1, "the window lists it too"
+    assert (pdir / "camera_presets.json").is_file(), "kept in the project"
+
+    # Closed and opened again: a new camera object, everything as it came.
+    frame_camera.disconnect()
+    ui.close()
+    ui = construct(pdir)
+    assert ui._camera_presets is not picker
+    _connect(ui, "event")
+    assert frame_camera._LIVE.device.state["bias.bias_diff_on"] == 0
+    combo = ui.ports.preset.widget
+    assert combo.findText("Bird bath") == 0 and combo.currentIndex() == -1
+    combo.setCurrentIndex(0)
+    combo.textActivated.emit("Bird bath")            # the user's pick
+    _pump_until(lambda: frame_camera._LIVE.job is None, 2.0)
+    assert frame_camera.current_area()["area"] == "320, 200, 160, 120"
+    assert frame_camera._LIVE.device.state["bias.bias_diff_on"] == 40
+    assert "Preset 'Bird bath'" in ui.ports.capture_status.get()
+    assert ui.ports.camera_area.get().startswith(
+        "Camera's area: 320, 200, 160, 120")
+
+
+def test_a_new_name_in_the_preset_box_is_a_hint_not_an_error(
+        qapp, typhon_dir, forget_generated, capsys):
+    ui = construct(typhon_dir)
+    _connect(ui, "frame")
+    ui.ports.preset.set("Not saved yet")
+    ui.ports.preset.widget.textActivated.emit("Not saved yet")   # Return
+    assert "Save preset" in ui.ports.capture_status.get()
+    assert "failed" not in capsys.readouterr().err
+
+
 def test_exposure_is_not_capped_at_100_microseconds():
     """v3's spin boxes ran 0..100, so a Basler could never be exposed longer
     than 100 us from the app."""
