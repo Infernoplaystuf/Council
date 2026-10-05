@@ -296,10 +296,16 @@ def test_sixteen_bit_frames_are_scaled_not_clamped(tmp_path):
 
 
 def test_saves_leave_no_temp_files_behind(vault, capture):
+    """A version is written in a hidden temp folder and renamed into place;
+    neither that folder nor any temp file may be left behind."""
     _mark_some(capture[0])
     fc.train("frames")
-    left = [p.name for p in (vault / "classifiers" / "frames").iterdir()]
-    assert sorted(left) == ["classes.json", "model.npz"]
+    store = vault / "classifiers" / "frames"
+    assert sorted(p.name for p in store.iterdir()) == \
+        ["classes.json", "model.npz", "versions"]
+    assert [p.name for p in (store / "versions").iterdir()] == ["v1"]
+    assert sorted(p.name for p in (store / "versions" / "v1").iterdir()) == \
+        ["classes.json", "meta.json", "model.npz"]
 
 
 # ============================================================
