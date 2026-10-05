@@ -51,7 +51,9 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from collections import deque
+from typing import (Any, Callable, Deque, Dict, List, Optional, Sequence,
+                    Tuple)
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QKeySequence, QPalette, QShortcut
@@ -83,6 +85,9 @@ SLIDER_STEPS = 1000
 INT32 = 2 ** 31 - 1
 
 FLOAT, INT, BOOL, CHOICE, TEXT = "float", "int", "bool", "choice", "text"
+
+#: How many call timings the window keeps (see CameraSettingsWindow.timings).
+TIMINGS_KEPT = 4096
 
 #: The window's object name, which tests and the menu look it up by.
 OBJECT_NAME = "council_camera_settings"
@@ -555,9 +560,10 @@ class CameraSettingsWindow(QWidget):
         self.busy = False
         self.factory = ""
         self.as_connected: Dict[str, Any] = {}
-        #: (label, milliseconds on the UI thread) of every camera call made
-        #: from here, newest last — the measurements read it.
-        self.timings: List[Tuple[str, float]] = []
+        #: (label, milliseconds on the UI thread) of the latest camera calls
+        #: made from here, newest last — the measurements read it. Bounded:
+        #: a drag adds sixteen a second for as long as the window is open.
+        self.timings: Deque[Tuple[str, float]] = deque(maxlen=TIMINGS_KEPT)
         self._shape: Optional[tuple] = None
         self._pending: Dict[str, Any] = {}
         self._confirm_delete = ""
@@ -956,7 +962,8 @@ class CameraSettingsWindow(QWidget):
             state = "Applying… the camera is restarting its stream"
         elif self.capturing:
             state = ("Capturing — live settings still apply; the area, "
-                     "presets and settings marked 'stop' wait for Stop")
+                     "presets and settings that restart the live view wait "
+                     "for Stop")
         else:
             state = "Live view — changes show at once"
         self.state_label.setText(state)
