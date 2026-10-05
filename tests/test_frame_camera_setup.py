@@ -1091,6 +1091,39 @@ def test_without_a_change_on_the_worker_a_box_is_written_at_once():
     assert out["summary"] == "Gain 5.00." and device().state["Gain"] == 5.0
 
 
+@pytest.mark.parametrize("box, call, key", [
+    ("exposure", "set_exposure", "ExposureTime"),
+    ("gain", "set_gain", "Gain"),
+])
+def test_a_box_that_waited_for_a_preset_is_newer_than_the_preset(
+        tmp_path, box, call, key):
+    """The box was changed while a preset was restarting the camera: its
+    value waited and was written AFTER the preset, so it is what the camera
+    has. Start then said it "kept the camera's own" value because a preset
+    set it after the box changed — the box's own value, which the preset no
+    longer had. Written last, the box is the latest word (as the FPS box,
+    which stamps itself, already was)."""
+    viewer = live("frame")
+    frame_camera.set_camera_area("0, 0, 320, 240")
+    frame_camera.set_camera_setting(key, 3.0 if box == "gain" else 4000)
+    frame_camera.save_preset("Small")
+    frame_camera.set_camera_area("0, 0, 640, 480")
+    frame_camera.set_frame_rate(1)                  # a slow stop: it waits
+    ticks(viewer, 0.1)
+    out = frame_camera.apply_preset("Small")
+    assert out["pending"], out["summary"]
+    value = "6" if box == "gain" else "7000"
+    frame_camera._box_changed(box)                  # attach's port hook
+    assert "is set once" in getattr(frame_camera, call)(value)["summary"]
+    ticks(viewer, 2.0)
+    assert frame_camera._LIVE.job is None
+    assert device().state[key] == pytest.approx(float(value))
+    run = frame_camera.start(str(tmp_path / "runs"), **{box: value})
+    frame_camera.stop()
+    assert "Kept the camera's own" not in run["summary"], run["summary"]
+    assert device().state[key] == pytest.approx(float(value))
+
+
 # ======================================================================
 # Each run's camera record: <run>_camera.json
 # ======================================================================

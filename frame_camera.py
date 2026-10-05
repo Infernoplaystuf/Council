@@ -2707,7 +2707,14 @@ def _queue_behind_job(box: str, value: Any) -> str:
 def _write_queued() -> str:
     """Write what the boxes beside Start asked for while a change was on
     the worker, in a fixed order, latest value of each; what came of it, as
-    one line. Called on the UI thread once the worker is done."""
+    one line. Called on the UI thread once the worker is done.
+
+    WRITTEN LAST, SO THE LATEST WORD. A box that waited for a preset is
+    written after it, over what the preset set — so it is stamped as changed
+    now (_box_changed), after the preset's own stamp. Stamped when it was
+    typed, Start found the preset newer and said it "kept the camera's own"
+    value: the box's, which the preset no longer had. (apply_frame_rate
+    stamps the FPS box itself.)"""
     queued, _LIVE.queued = _LIVE.queued, {}
     if _LIVE.device is None or not queued:
         return ""
@@ -2721,6 +2728,8 @@ def _write_queued() -> str:
             said.append(write(queued[box])["summary"])
         except Exception as exc:                          # noqa: BLE001
             said.append(f"{box.replace('_', ' ')}: {_said(exc)}")
+            continue
+        _box_changed(box)
     return " ".join(said)
 
 
