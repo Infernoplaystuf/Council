@@ -167,7 +167,7 @@ def test_the_summary_names_what_changed_between_the_two_typhons():
         changes.relabelled
     lines = changes.lines()
     assert len(lines) <= 8, "a summary, not a dump"
-    assert lines[0].startswith("  shapes: 2 added, 0 removed, 2 rewired")
+    assert lines[0].startswith("  shapes: 2 added, 0 removed, 5 rewired")
 
 
 def test_an_unchanged_layout_says_nothing_changed():
@@ -184,7 +184,7 @@ def test_the_frame_count_typhon_gets_the_fps_box_and_settings(tmp_path,
                                                               monkeypatch):
     vault = tmp_path / "vault"
     pdir = build_old(vault, monkeypatch)
-    edited = hand_edit(pdir, "on_btn_connect")
+    edited = hand_edit(pdir, "on_btn_disconnect")
     app_before = (pdir / "app.py").read_bytes()
     old_gspec = (pdir / gpj.GSPEC_NAME).read_text(encoding="utf-8")
 
@@ -215,7 +215,7 @@ def test_the_frame_count_typhon_gets_the_fps_box_and_settings(tmp_path,
     # brought up to date and the hand edit left alone.
     assert (pdir / "app.py").read_bytes() == app_before
     handlers = (pdir / "handlers.py").read_text(encoding="utf-8")
-    assert method(handlers, "on_btn_connect") == edited
+    assert method(handlers, "on_btn_disconnect") == edited
     start = method(handlers, "on_btn_start_capture")
     assert "self.ports.frame_rate.get())" in start
     fps = method(handlers, "on_spn_spinbox_3")
@@ -223,6 +223,11 @@ def test_the_frame_count_typhon_gets_the_fps_box_and_settings(tmp_path,
     assert "self.ports.capture_status.set(result[\"summary\"])" in fps
     assert "settings_menu()" in method(handlers, "on_btn_settings")
     assert "pop_out()" in method(handlers, "on_btn_pop_out")
+    # The camera's area no longer lands in the crop box: Connect leaves the
+    # box alone, and the area buttons clear it.
+    assert "self.ports.roi" not in method(handlers, "on_btn_connect")
+    for name in ("on_btn_apply_area_to_camera", "on_btn_full_sensor"):
+        assert 'self.ports.roi.set(result["crop"])' in method(handlers, name)
 
     # The manifest remembers, and the port was renamed, not orphaned.
     manifest = gpj.load_manifest(pdir)
@@ -352,14 +357,14 @@ def test_the_cli_updates_in_place(tmp_path, monkeypatch, capsys):
     import run_example_gui as rex
     vault = tmp_path / "vault"
     pdir = build_old(vault, monkeypatch)
-    edited = hand_edit(pdir, "on_btn_connect")
+    edited = hand_edit(pdir, "on_btn_disconnect")
     monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(vault))
     assert rex.main(["typhon", "--update", "--no-run"]) == 0
     printed = capsys.readouterr().out
     assert "updated example_typhon from example typhon" in printed
     assert "ready" in printed
     handlers = (pdir / "handlers.py").read_text(encoding="utf-8")
-    assert method(handlers, "on_btn_connect") == edited
+    assert method(handlers, "on_btn_disconnect") == edited
     assert list(pdir.glob("project.gspec.*.bak"))
 
 
@@ -438,7 +443,7 @@ def test_update_from_example_in_the_designer(tab, qapp, monkeypatch):
     from example…, pick Typhon (offered first), confirm — and the canvas,
     the project and its handlers are the new ones."""
     pdir = open_old(tab, monkeypatch)
-    edited = hand_edit(pdir, "on_btn_connect")
+    edited = hand_edit(pdir, "on_btn_disconnect")
     assert len(tab.canvas.scene.shapes) == 57
     tab.script["choice"].append("typhon")
     tab.script["confirm"].append(True)
@@ -466,7 +471,7 @@ def test_update_from_example_in_the_designer(tab, qapp, monkeypatch):
     assert "rewired on_btn_start_capture" in log
     assert "policy: OK" in log
     handlers = (pdir / "handlers.py").read_text(encoding="utf-8")
-    assert method(handlers, "on_btn_connect") == edited
+    assert method(handlers, "on_btn_disconnect") == edited
     assert "on_btn_settings" in handlers
     # Recorded now: the next update asks nothing about which example.
     tab.script["asked"].clear()

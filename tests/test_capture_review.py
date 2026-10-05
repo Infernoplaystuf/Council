@@ -870,3 +870,58 @@ def test_the_raw_view_uses_the_runs_own_window(ui, tmp_path):
     rv._open_raw = opener
     rv.toggle_view()
     assert opened == [5000]
+
+
+# ======================================================================
+# The live picture and the camera's area, inside Typhon
+# ======================================================================
+def connect_frame_camera():
+    rows = frame_camera.list_cameras()["rows"]
+    frame_camera.connect(next(r for r in rows if r.endswith("frame")))
+
+
+def test_a_12_bit_live_frame_is_shown_as_the_camera_saw_it(ui, tmp_path):
+    """Before: a uint16 frame went to a Grayscale8 QImage as raw bytes —
+    the 12-bit value 640 showed as 128 and 2, side by side."""
+    rv = ui._capture_review
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    connect_frame_camera()
+    assert pump_until(lambda: rv.live)
+    frame_camera.set_camera_setting("PixelFormat", "Mono12")
+    canvas = ui.ports.live_view.widget
+    assert pump_until(lambda: rv.prep.shift == 4)
+    pump(0.1)
+    image = canvas._base
+    band = image.height() // 2                     # the +40 band, x16
+    # Many pixels, so the moving bright column cannot decide it; shown as
+    # bytes, they alternate 128 / 2.
+    values = sorted(image.pixelColor(x, band).red() for x in range(300, 341))
+    assert values[len(values) // 2] == 40, values
+    assert values.count(40) >= len(values) - 2, values
+
+
+def test_drawing_on_the_live_view_sets_that_part_of_the_sensor(ui, tmp_path):
+    """The user's flow: draw a box on the live picture, Apply area to
+    camera, then draw a smaller one inside the new picture — each lands
+    where it was drawn, and the crop box is cleared, never filled with the
+    camera's area."""
+    rv = ui._capture_review
+    canvas = ui.ports.live_view.widget
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    connect_frame_camera()
+    assert pump_until(lambda: rv.live and canvas._base is not None)
+    canvas.set_roi((100, 60, 320, 240), notify=True)
+    assert ui.ports.roi.get() == "100, 60, 320, 240"
+    ui.on_btn_apply_area_to_camera()
+    device = frame_camera._LIVE.device
+    assert device.roi().as_tuple() == (100, 60, 320, 240)
+    assert ui.ports.roi.get() == "", "the crop box kept a stale box"
+    assert pump_until(lambda: canvas._base.width() == 320)
+    pump(0.1)
+    canvas.set_roi((8, 10, 64, 32), notify=True)
+    ui.on_btn_apply_area_to_camera()
+    assert device.roi().as_tuple() == (108, 70, 64, 32)
+    ui.on_btn_full_sensor()
+    assert device.roi().as_tuple() == (0, 0, 640, 480)
