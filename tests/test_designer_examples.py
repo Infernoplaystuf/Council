@@ -39,6 +39,10 @@ import gui_shapes as gs  # noqa: E402
 from council_core import designer_examples as dx  # noqa: E402
 
 EXAMPLES = ROOT / "examples" / "gui"
+#: Typhon's shapes, counted from the example rather than written here: it
+#: grows (the preset picker and Camera settings added five).
+TYPHON_SHAPES = len(json.loads((EXAMPLES / "typhon.gspec").read_text(
+    encoding="utf-8"))["shapes"])
 
 
 def answers(example="typhon", project="example_typhon", toolkit="qt",
@@ -291,7 +295,7 @@ def test_export_writes_the_shapes_it_is_given(tmp_path):
     assert raw["shapes"][0]["label"] == "edited on the canvas"
     assert raw["window"]["min_w"] == 1400
     # and the vault's own copy is untouched
-    assert len(gpj.open_project("p", tmp_path).shapes) == 59
+    assert len(gpj.open_project("p", tmp_path).shapes) == TYPHON_SHAPES
 
 
 def test_a_failed_export_leaves_the_old_file_whole(tmp_path, monkeypatch):
@@ -428,7 +432,7 @@ def test_new_from_example_builds_typhon_and_opens_it_as_qt(tab, qapp):
     pdir = build_typhon(qapp, tab)
     assert tab.project == "example_typhon"
     assert "[Qt]" in tab.status.text()
-    assert len(tab.canvas.scene.shapes) == 59
+    assert len(tab.canvas.scene.shapes) == TYPHON_SHAPES
     assert not tab.canvas.scene.dirty
     app = (pdir / "app.py").read_text(encoding="utf-8")
     assert "setMinimumSize(1400, 820)" in app
@@ -555,7 +559,8 @@ def test_export_of_unchanged_typhon_reproduces_the_example(tab, qapp,
     tab.script["save"].append(str(dest))
     tab.on_export()
     assert dest.read_bytes() == (EXAMPLES / "typhon.gspec").read_bytes()
-    assert "exported example_typhon (59 shape(s))" in log_text(tab)
+    assert (f"exported example_typhon ({TYPHON_SHAPES} shape(s))"
+            in log_text(tab))
 
 
 def test_export_over_a_file_asks_and_no_writes_nothing(tab, qapp, tmp_path):

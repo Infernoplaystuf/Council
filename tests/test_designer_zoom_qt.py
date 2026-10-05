@@ -568,7 +568,7 @@ def test_typed_geometry_lands_exactly_as_one_undo_step(tab):
 
 def test_typhon_fits_and_its_start_button_can_be_dragged(tab, qapp, tmp_path):
     """The user's case. Build Typhon the way run_example_gui does, into this
-    test's own vault; open it; every one of its 59 shapes is inside the
+    test's own vault; open it; every one of its 64 shapes is inside the
     canvas at Fit; drag s46 "Start capture" (y=960 — past the old canvas's
     700 px edge) with real mouse events at the Fit zoom; Save; and the .gspec
     changed in exactly s46's x and y, to where the Scene's own snapping puts
@@ -592,7 +592,7 @@ def test_typhon_fits_and_its_start_button_can_be_dragged(tab, qapp, tmp_path):
     assert zoom < 1.0, "Typhon does not fit a 1600 x 1000 tab at 100%"
     assert canvas.width() <= vw and canvas.height() <= vh
     shapes = canvas.scene.shapes
-    assert len(shapes) == 59
+    assert len(shapes) == len(before["shapes"]) == 64
     for s in shapes:
         assert 0 <= s.x * zoom and s.x2 * zoom <= canvas.width(), s.id
         assert 0 <= s.y * zoom and s.y2 * zoom <= canvas.height(), s.id
