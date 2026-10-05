@@ -242,25 +242,40 @@ def test_listeners_hear_every_change_on_the_ui_thread():
     assert [h["what"] for h in heard] == ["connected", "setting", "area"]
 
 
-def test_the_settings_window_needs_a_camera_and_never_shows_offscreen(
-        monkeypatch):
-    assert "Connect a camera" in frame_camera.camera_settings()["summary"]
-    connected("event")
-    monkeypatch.setenv("COUNCIL_NO_DIALOGS", "1")
-    assert "skipped" in frame_camera.camera_settings()["summary"]
-
-
-def test_the_settings_window_is_opened_through_its_hook(monkeypatch):
+def fake_window(monkeypatch):
     opened = []
     fake = type(sys)("fake_settings_window")
-    fake.open_settings = lambda parent: opened.append(parent) or "window"
+    fake.open_settings = (lambda parent, show=True:
+                          opened.append((parent, show)) or "window")
     monkeypatch.setitem(sys.modules, "fake_settings_window", fake)
     monkeypatch.setattr(frame_camera, "SETTINGS_WINDOW_MODULE",
                         "fake_settings_window")
+    return opened
+
+
+def test_the_settings_window_needs_a_camera_and_never_shows_offscreen(
+        monkeypatch):
+    """Built but NOT shown with dialogs off — as gui_settings builds its
+    Python Scripts window — so a test can press the button and work the
+    window it would have seen."""
+    opened = fake_window(monkeypatch)
+    assert "Connect a camera" in frame_camera.camera_settings()["summary"]
+    assert opened == []
+    connected("event")
+    monkeypatch.setenv("COUNCIL_NO_DIALOGS", "1")
+    out = frame_camera.camera_settings(parent="the app")
+    assert "not shown" in out["summary"]
+    assert opened == [("the app", False)]
+    assert frame_camera._LIVE.settings_window == "window"
+
+
+def test_the_settings_window_is_opened_through_its_hook(monkeypatch):
+    opened = fake_window(monkeypatch)
     monkeypatch.delenv("COUNCIL_NO_DIALOGS", raising=False)
     connected("event")
     out = frame_camera.camera_settings(parent="the app")
-    assert opened == ["the app"] and "Camera settings" in out["summary"]
+    assert opened == [("the app", True)] and "Camera settings" in out["summary"]
+    assert "not shown" not in out["summary"]
     assert frame_camera._LIVE.settings_window == "window"
 
 

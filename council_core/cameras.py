@@ -1664,9 +1664,21 @@ class SyntheticDevice(Device):
         }
         for name in self.BIASES:
             self.state[f"bias.{name}"] = 0
+        #: How the camera came: what load_defaults puts back.
+        self._factory = dict(self.state)
         #: An event camera's area is set live, like an EVK4's; a frame
         #: camera's needs the stream stopped, like a Basler's.
         self.area_live = info.kind == "event"
+
+    def load_defaults(self) -> None:
+        """A Basler's UserSet "Default", simulated: every setting and the
+        area back as the camera came. Refused while streaming, before
+        anything changes, as camera_settings.BaslerSettings refuses it."""
+        if self._started:
+            raise NeedsStop("defaults", "the camera's defaults can only be "
+                                        "loaded while it is not streaming")
+        self.state.update(self._factory)
+        self._roi = Roi(0, 0, self.WIDTH, self.HEIGHT)
 
     @property
     def _fps(self) -> float:

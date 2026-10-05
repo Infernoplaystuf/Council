@@ -351,6 +351,23 @@ class Provider:
         """Why this setting should be left alone (auto is on), or ""."""
         return ""
 
+    # -- the camera's own factory settings ------------------------------
+    def defaults_source(self) -> str:
+        """What this camera calls its factory settings when it can load them
+        itself (a Basler's UserSet "Default"), or "" when it cannot.
+
+        An EVK4's HAL has nothing to load: its biases are the sensor's
+        defaults when the device is opened, so "as connected" (which
+        frame_camera keeps) is the nearest thing to a default it has. Saying
+        "" rather than inventing defaults keeps a settings window from
+        offering a button that cannot work."""
+        return ""
+
+    def load_defaults(self) -> None:
+        """Load the factory settings. Raises NeedsStop, before anything is
+        written, while the stream is in the way."""
+        raise SettingError("this camera has no defaults of its own to load")
+
     # ------------------------------------------------------------------
     def find(self, key: str) -> Setting:
         for setting in self.describe():
@@ -740,6 +757,46 @@ class BaslerSettings(Provider):
         if setting.kind == INT and name == "GainRaw":
             value = int(value)
         node.SetValue(value)
+
+    # -- factory settings: the user set every Basler carries -------------
+    #: The UserSetSelector entry holding the factory settings (SFNC). It is
+    #: read-only on the camera, so loading it can never be undone by a save.
+    FACTORY_SET = "Default"
+
+    def _user_set(self) -> Optional[Tuple[Any, Any]]:
+        """(UserSetSelector, UserSetLoad), when this model has both and the
+        selector offers the factory set."""
+        selector = self.device._node("UserSetSelector")
+        load = self.device._node("UserSetLoad")
+        if selector is None or load is None:
+            return None
+        try:
+            entries = {str(s) for s in selector.GetSymbolics()}
+        except Exception:                                   # noqa: BLE001
+            return None
+        return (selector, load) if self.FACTORY_SET in entries else None
+
+    def defaults_source(self) -> str:
+        return f'UserSet "{self.FACTORY_SET}"' if self._user_set() else ""
+
+    def load_defaults(self) -> None:
+        """Select the factory user set and load it.
+
+        ALWAYS WITH THE STREAM STOPPED. The set rewrites the area and the
+        pixel format, which a Basler locks while grabbing; the emulator
+        happens to leave UserSetLoad writable then (measured), and also
+        ignores the load (Gain 5 dB stayed 5 dB, measured) — so this is
+        checked against the node map's names only, never against what a
+        real camera does with them."""
+        found = self._user_set()
+        if found is None:
+            raise SettingError("this camera has no factory user set to load")
+        if self._streaming():
+            raise NeedsStop("defaults", "the camera's defaults can only be "
+                                        "loaded while it is not streaming")
+        selector, load = found
+        selector.SetValue(self.FACTORY_SET)
+        load.Execute()
 
 
 def _readable(node: Any) -> bool:
@@ -1406,3 +1463,17 @@ class SyntheticSettings(Provider):
             self.device.accumulate_ms = max(MIN_ACCUMULATE_MS, float(value))
             return
         self.device.write_setting(setting.key, value)
+
+    def defaults_source(self) -> str:
+        """The simulated frame camera has factory settings to load, as a
+        Basler does; the simulated event camera has none, as an EVK4 has
+        none."""
+        if self.device.info.kind == "event":
+            return ""
+        return "the simulated camera's defaults"
+
+    def load_defaults(self) -> None:
+        if not self.defaults_source():
+            raise SettingError("this camera has no defaults of its own to "
+                               "load")
+        self.device.load_defaults()
