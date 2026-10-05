@@ -1,0 +1,517 @@
+"""
+council_core.camera_presets — named camera set-ups (settings + the camera's
+own area), saved with the app that uses them.
+
+WHAT A PRESET IS
+One preset is everything needed to put a camera back the way it was for one
+job: every setting worth saving (camera_settings.snapshot) and the camera's
+area — the sensor ROI, so an EVK4 emits events only inside it and a Basler
+reads out only that window. "Bird bath" on a static back-yard camera is one
+preset: the biases that suit the scene, and the area around the bath.
+
+THE AREA IS IN SENSOR PIXELS, NOT PICTURE PIXELS
+The live picture of a camera with an area set IS that area, so a box drawn on
+it is relative to the area's origin. A preset stores what the camera itself
+was told — x, y, w, h on the sensor (in the camera's own AOI units, which on a
+binned Basler are binned pixels; binning is saved with it and written first).
+None means "leave the area as it is".
+
+PER PROJECT, PER CAMERA
+The file lives in the app's project folder (camera_presets.json beside
+camera_setup.json), so two apps can keep different set-ups and a project
+copied to another machine takes its presets with it. Inside, presets are kept
+per camera — backend, model and serial — because biases tuned for one EVK4
+are not automatically right for another. A camera with no preset of a name
+is offered the presets of the SAME MODEL saved on another unit (marked as
+such): a replacement camera starts from its predecessor's set-up instead of
+from nothing. Renaming and deleting only ever touch this camera's own.
+
+THE FILE IS NEVER LOST QUIETLY
+JSON, never pickle: a presets file is data a user may open, copy or mail,
+and loading it must not be able to run anything. Written whole to a
+temporary file and renamed over the old one, so a crash mid-write leaves the
+old file or the new one, never half of each. Validated on every read: a file
+that is not what this module writes raises PresetFileError and is NEVER
+overwritten by an ordinary save — `save(..., repair=True)` first moves it
+aside to camera_presets.damaged-<time>.json and says where. One bad preset
+inside a good file is skipped (and named in `problems`), not fatal, and is
+kept byte-for-byte when the file is rewritten: this module only rewrites what
+it was asked to change.
+
+NO TOOLKIT, NO DEVICE STOPS HERE
+Applying a preset is camera_settings.apply (settings in a safe order, then
+the area); whether the stream must stop first, and stopping it, is
+frame_camera's business.
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional, Tuple
+
+from .cameras import Roi
+
+#: Written in the app's project folder.
+PRESETS_FILE = "camera_presets.json"
+
+#: Bump if the saved shape changes. A file of a NEWER format is refused, not
+#: rewritten: an older app must not destroy what a newer one saved.
+FORMAT = 1
+
+#: A preset name is a label for a list, not a document.
+MAX_NAME = 60
+
+#: Bigger than any presets file this module writes by orders of magnitude;
+#: something else entirely has been saved under this name.
+MAX_FILE_BYTES = 4 * 1024 * 1024
+
+_LOCK = threading.Lock()
+
+
+class PresetError(Exception):
+    """Something about a preset the user can put right: a name that is
+    taken, empty or unknown."""
+
+
+class PresetFileError(PresetError):
+    """The presets file exists but is not one this module can trust. It is
+    left exactly as it is; `path` names it."""
+
+    def __init__(self, message: str, path: Optional[Path] = None):
+        super().__init__(message)
+        self.path = path
+
+
+# ======================================================================
+# Which camera a preset belongs to
+# ======================================================================
+@dataclass(frozen=True)
+class Identity:
+    """A camera as presets know it: backend, model and serial."""
+    backend: str
+    model: str
+    serial: str = ""
+    kind: str = "frame"
+
+    @classmethod
+    def of(cls, info: Any) -> "Identity":
+        """From a cameras.CameraInfo (or anything shaped like one)."""
+        return cls(backend=str(getattr(info, "backend", "") or ""),
+                   model=str(getattr(info, "model", "") or ""),
+                   serial=str(getattr(info, "serial", "") or ""),
+                   kind=str(getattr(info, "kind", "frame") or "frame"))
+
+    @property
+    def key(self) -> str:
+        return f"{self.backend}|{self.model}|{self.serial}"
+
+    @property
+    def model_key(self) -> str:
+        return f"{self.backend}|{self.model}"
+
+    @property
+    def label(self) -> str:
+        head = self.model or self.backend or "camera"
+        return f"{head} ({self.serial})" if self.serial else head
+
+    def as_dict(self) -> Dict[str, str]:
+        return {"backend": self.backend, "model": self.model,
+                "serial": self.serial, "kind": self.kind}
+
+
+# ======================================================================
+# A preset
+# ======================================================================
+@dataclass(frozen=True)
+class Preset:
+    name: str
+    settings: Dict[str, Any] = field(default_factory=dict)
+    #: The camera's area in sensor pixels, or None to leave it alone.
+    roi: Optional[Roi] = None
+    created: str = ""
+    updated: str = ""
+    note: str = ""
+    #: The camera it was saved on.
+    owner: Optional[Identity] = None
+    #: Saved on THIS camera, rather than another unit of the same model.
+    own: bool = True
+
+    def line(self) -> str:
+        """One row for a list: name, area, how much it sets, whose."""
+        bits = [self.name]
+        if self.roi is not None:
+            bits.append("area " + ", ".join(str(v) for v in
+                                            self.roi.as_tuple()))
+        count = len(self.settings)
+        bits.append(f"{count} setting{'s' if count != 1 else ''}")
+        text = " · ".join(bits)
+        if not self.own and self.owner is not None:
+            text += f" (saved on {self.owner.label})"
+        return text
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {"name": self.name, "settings": dict(self.settings),
+                "roi": list(self.roi.as_tuple()) if self.roi else None,
+                "created": self.created, "updated": self.updated,
+                "note": self.note, "own": self.own,
+                "camera": self.owner.as_dict() if self.owner else None,
+                "line": self.line()}
+
+
+def presets_path(project_dir: Any) -> Path:
+    return Path(project_dir) / PRESETS_FILE
+
+
+def clean_name(name: Any) -> str:
+    """A usable preset name, or PresetError saying why not."""
+    text = " ".join(str(name if name is not None else "").split())
+    if not text:
+        raise PresetError("give the preset a name")
+    if len(text) > MAX_NAME:
+        raise PresetError(f"a preset name is at most {MAX_NAME} characters")
+    if any(ord(c) < 32 for c in text):
+        raise PresetError("a preset name cannot hold control characters")
+    return text
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+# ======================================================================
+# Validation — what a read accepts
+# ======================================================================
+def _scalar(value: Any) -> bool:
+    if isinstance(value, bool) or isinstance(value, str):
+        return True
+    if isinstance(value, int):
+        return True
+    return isinstance(value, float) and math.isfinite(value)
+
+
+def _roi_from(value: Any) -> Optional[Roi]:
+    """[x, y, w, h] -> Roi; None -> None; anything else -> ValueError."""
+    if value is None:
+        return None
+    if (not isinstance(value, list) or len(value) != 4
+            or not all(isinstance(v, int) and not isinstance(v, bool)
+                       for v in value)):
+        raise ValueError("the area must be [x, y, w, h] in whole pixels")
+    x, y, w, h = value
+    if min(x, y) < 0 or w <= 0 or h <= 0:
+        raise ValueError("the area must have a size and lie on the sensor")
+    return Roi(x, y, w, h)
+
+
+def _preset_from(name: str, raw: Any, owner: Identity, own: bool) -> Preset:
+    if not isinstance(raw, dict):
+        raise ValueError("not a preset")
+    settings = raw.get("settings", {})
+    if not isinstance(settings, dict) or not all(
+            isinstance(k, str) and _scalar(v) for k, v in settings.items()):
+        raise ValueError("its settings are not plain name: value pairs")
+    texts = {k: raw.get(k, "") for k in ("created", "updated", "note")}
+    if not all(isinstance(v, str) for v in texts.values()):
+        raise ValueError("its dates or note are not text")
+    return Preset(name=name, settings=dict(settings),
+                  roi=_roi_from(raw.get("roi")), owner=owner, own=own,
+                  **texts)
+
+
+def _empty() -> Dict[str, Any]:
+    return {"format": FORMAT, "cameras": {}}
+
+
+# ======================================================================
+# The store
+# ======================================================================
+class PresetStore:
+    """One project's presets file."""
+
+    def __init__(self, path: Any):
+        self.path = Path(path)
+        #: Presets skipped by the last listing, as "name: why" lines.
+        self.problems: List[str] = []
+
+    # -- reading -------------------------------------------------------
+    def read(self) -> Dict[str, Any]:
+        """The whole document, checked. A missing file is an empty one;
+        anything this module would not have written is PresetFileError."""
+        try:
+            size = self.path.stat().st_size
+        except FileNotFoundError:
+            return _empty()
+        except OSError as exc:
+            raise PresetFileError(f"cannot read {self.path.name}: {exc}",
+                                  self.path) from exc
+        if size > MAX_FILE_BYTES:
+            raise PresetFileError(f"{self.path.name} is {size:,} bytes — not "
+                                  f"a presets file", self.path)
+        try:
+            text = self.path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise PresetFileError(f"cannot read {self.path.name}: {exc}",
+                                  self.path) from exc
+        if not text.strip():
+            raise PresetFileError(f"{self.path.name} is empty", self.path)
+        try:
+            doc = json.loads(text)
+        except ValueError as exc:
+            raise PresetFileError(f"{self.path.name} is damaged (not valid "
+                                  f"JSON: {exc})", self.path) from exc
+        if not isinstance(doc, dict) or not isinstance(doc.get("format"), int):
+            raise PresetFileError(f"{self.path.name} is not a presets file",
+                                  self.path)
+        if doc["format"] > FORMAT:
+            raise PresetFileError(f"{self.path.name} was saved by a newer "
+                                  f"version of this app (format "
+                                  f"{doc['format']})", self.path)
+        if doc["format"] < 1 or not isinstance(doc.get("cameras"), dict):
+            raise PresetFileError(f"{self.path.name} is not a presets file",
+                                  self.path)
+        return doc
+
+    def presets(self, camera: Identity) -> List[Preset]:
+        """This camera's presets, then the same model's from other units
+        whose names this camera has not used. Sorted by name in each."""
+        doc = self.read()
+        self.problems = []
+        own: List[Preset] = []
+        others: List[Preset] = []
+        for key, entry in doc["cameras"].items():
+            if not isinstance(entry, dict):
+                self.problems.append(f"{key}: not a camera entry")
+                continue
+            owner = _owner(key, entry)
+            if key == camera.key:
+                mine = True
+            elif owner.model_key == camera.model_key and owner.model:
+                mine = False
+            else:
+                continue
+            raw = entry.get("presets", {})
+            if not isinstance(raw, dict):
+                self.problems.append(f"{key}: its presets are not a list "
+                                     f"of names")
+                continue
+            for name, body in raw.items():
+                try:
+                    preset = _preset_from(str(name), body, owner, mine)
+                except ValueError as exc:
+                    self.problems.append(f"{name}: {exc}")
+                    continue
+                (own if mine else others).append(preset)
+        own.sort(key=lambda p: p.name.casefold())
+        seen = {p.name.casefold() for p in own}
+        borrowed = []
+        # Newest first within a name, then by name: of two units' presets
+        # with one name, the one saved most recently is offered.
+        others.sort(key=lambda p: p.updated, reverse=True)
+        for preset in sorted(others, key=lambda p: p.name.casefold()):
+            folded = preset.name.casefold()
+            if folded in seen:
+                continue
+            seen.add(folded)
+            borrowed.append(preset)
+        return own + borrowed
+
+    def get(self, camera: Identity, name: Any) -> Preset:
+        wanted = clean_name(name).casefold()
+        for preset in self.presets(camera):
+            if preset.name.casefold() == wanted:
+                return preset
+        raise PresetError(f"there is no preset called {clean_name(name)!r} "
+                          f"for {camera.label}")
+
+    # -- writing -------------------------------------------------------
+    def save(self, camera: Identity, name: Any, settings: Mapping[str, Any],
+             roi: Optional[Roi] = None, note: str = "",
+             repair: bool = False) -> Tuple[Preset, bool, Optional[Path]]:
+        """Save (or replace) one of this camera's presets.
+
+        Returns the preset, whether it replaced one of the same name, and
+        where a damaged file was moved to (`repair` only) or None.
+        """
+        name = clean_name(name)
+        clean = {}
+        for key, value in dict(settings).items():
+            if not isinstance(key, str) or not _scalar(value):
+                raise PresetError(f"{key!r} cannot be saved: only plain "
+                                  f"numbers, text and on/off are")
+            clean[key] = value
+        area = None if roi is None else [int(v) for v in roi.as_tuple()]
+        if area is not None:
+            _roi_from(area)                      # the same check a read uses
+        with _LOCK:
+            moved = None
+            try:
+                doc = self.read()
+                entry = doc["cameras"].get(camera.key)
+                if entry is not None and not (
+                        isinstance(entry, dict)
+                        and isinstance(entry.get("presets", {}), dict)):
+                    raise PresetFileError(
+                        f"the presets saved for {camera.label} in "
+                        f"{self.path.name} are damaged", self.path)
+            except PresetFileError:
+                if not repair or not self.path.exists():
+                    raise
+                moved = self._move_aside()
+                doc = _empty()
+            entry = _entry_for(doc, camera)
+            presets = entry["presets"]
+            old_name = _find(presets, name)
+            replaced = old_name is not None
+            created = _now()
+            if replaced:
+                body = presets.pop(old_name)
+                if isinstance(body, dict) and isinstance(body.get("created"),
+                                                         str):
+                    created = body["created"]
+            presets[name] = {"settings": clean, "roi": area,
+                             "created": created, "updated": _now(),
+                             "note": str(note or "")}
+            self._write(doc)
+        return (_preset_from(name, presets[name], camera, True), replaced,
+                moved)
+
+    def rename(self, camera: Identity, old: Any, new: Any) -> Preset:
+        old, new = clean_name(old), clean_name(new)
+        with _LOCK:
+            doc = self.read()
+            entry = doc["cameras"].get(camera.key)
+            presets = entry.get("presets") if isinstance(entry, dict) else None
+            found = _find(presets, old) if isinstance(presets, dict) else None
+            if found is None:
+                raise PresetError(self._not_own(camera, old))
+            clash = _find(presets, new)
+            if clash is not None and clash != found:
+                raise PresetError(f"there is already a preset called "
+                                  f"{clash!r}")
+            body = presets.pop(found)
+            if isinstance(body, dict):
+                body["updated"] = _now()
+            presets[new] = body
+            self._write(doc)
+        try:
+            return _preset_from(new, body, camera, True)
+        except ValueError:
+            return Preset(name=new, owner=camera)    # renamed, still unread
+
+    def delete(self, camera: Identity, name: Any) -> Preset:
+        name = clean_name(name)
+        with _LOCK:
+            doc = self.read()
+            entry = doc["cameras"].get(camera.key)
+            presets = entry.get("presets") if isinstance(entry, dict) else None
+            found = _find(presets, name) if isinstance(presets, dict) else None
+            if found is None:
+                raise PresetError(self._not_own(camera, name))
+            body = presets.pop(found)
+            self._write(doc)
+        try:
+            return _preset_from(found, body, camera, True)
+        except ValueError:
+            return Preset(name=found, owner=camera)
+
+    def _not_own(self, camera: Identity, name: str) -> str:
+        """Why a rename or delete found nothing to act on."""
+        try:
+            listed = self.presets(camera)
+        except PresetFileError:
+            listed = []
+        for preset in listed:
+            if preset.name.casefold() == name.casefold() and not preset.own:
+                return (f"{preset.name!r} was saved on {preset.owner.label}; "
+                        f"only that camera's own list can change it — save "
+                        f"it here under a name of its own instead")
+        return f"there is no preset called {name!r} for {camera.label}"
+
+    # -- the file --------------------------------------------------------
+    def _write(self, doc: Dict[str, Any]) -> None:
+        """Whole, then renamed into place. fsync'd: a laptop that sleeps
+        or loses power straight after a save keeps the save."""
+        text = json.dumps(doc, indent=2, ensure_ascii=False,
+                          allow_nan=False) + "\n"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        with open(temp, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        for attempt in range(5):
+            try:
+                os.replace(temp, self.path)
+                return
+            except PermissionError:
+                # Windows: a virus scanner or an editor holding the old file
+                # for a moment. Brief retries, then the honest error.
+                if attempt == 4:
+                    raise
+                time.sleep(0.05)
+
+    def _move_aside(self) -> Path:
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        stem = self.path.stem
+        target = self.path.with_name(f"{stem}.damaged-{stamp}.json")
+        n = 1
+        while target.exists():
+            n += 1
+            target = self.path.with_name(f"{stem}.damaged-{stamp}_{n}.json")
+        os.replace(self.path, target)
+        return target
+
+
+def _owner(key: str, entry: Mapping[str, Any]) -> Identity:
+    """The camera an entry belongs to: its own fields, else its key."""
+    parts = (str(key).split("|") + ["", "", ""])[:3]
+    return Identity(backend=str(entry.get("backend") or parts[0]),
+                    model=str(entry.get("model") or parts[1]),
+                    serial=str(entry.get("serial") or parts[2]),
+                    kind=str(entry.get("kind") or "frame"))
+
+
+def _entry_for(doc: Dict[str, Any], camera: Identity) -> Dict[str, Any]:
+    """This camera's entry, made if it has none. (A DAMAGED one never gets
+    here: save refuses it, or moves the whole file aside, first.)"""
+    entry = doc["cameras"].get(camera.key)
+    if entry is None:
+        entry = dict(camera.as_dict(), presets={})
+        doc["cameras"][camera.key] = entry
+    entry.setdefault("presets", {})
+    return entry
+
+
+def _find(presets: Mapping[str, Any], name: str) -> Optional[str]:
+    """The stored spelling of `name`, matched without regard to case."""
+    wanted = name.casefold()
+    for stored in presets:
+        if str(stored).casefold() == wanted:
+            return stored
+    return None
+
+
+# ======================================================================
+# A preset and a camera
+# ======================================================================
+def capture(device: Any, include_roi: bool = True
+            ) -> Tuple[Dict[str, Any], Optional[Roi]]:
+    """What a preset of this camera, as it is now, holds."""
+    from . import camera_settings
+
+    settings = camera_settings.snapshot(device)
+    roi = device.roi() if include_roi else None
+    return settings, roi
+
+
+def apply(device: Any, preset: Preset) -> Any:
+    """Settings in a safe order, then the area: camera_settings.apply. Raises
+    NeedsStop, before writing anything, if the stream is in the way."""
+    from . import camera_settings
+
+    return camera_settings.apply(device, preset.settings, preset.roi)
