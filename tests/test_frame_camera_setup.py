@@ -9,6 +9,7 @@ an EVK4 and refuse what those refuse while streaming.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -31,6 +32,10 @@ def clean(tmp_path):
     frame_camera._LIVE.listeners = []
     # The project folder: presets are written here, never anywhere real.
     frame_camera._LIVE.setup_path = tmp_path / "camera_setup.json"
+    # The boxes beside Start are about the app: a fresh app per test.
+    frame_camera._LIVE.box_changed = {}
+    frame_camera._LIVE.box_seen = {}
+    frame_camera._LIVE.hooked_boxes = set()
     yield
     frame_camera.disconnect()
     frame_camera._LIVE.found = None
@@ -580,3 +585,179 @@ def test_a_newer_apps_presets_file_is_said_and_never_saved_over(tmp_path):
         frame_camera.save_preset("Fresh")
     assert target.read_text(encoding="utf-8") == text
     assert not list(tmp_path.glob("camera_presets.damaged-*"))
+
+
+# -- Start, and the boxes beside it ------------------------------------
+def test_start_keeps_a_presets_frame_rate_limit(tmp_path):
+    """The bird bath, measured: pick the preset, press Start with the FPS
+    box at its 0 — and Start lifted the preset's frame-rate limit."""
+    live("frame")
+    frame_camera.apply_camera_settings({"AcquisitionFrameRateEnable": True,
+                                        "AcquisitionFrameRate": 12.0})
+    frame_camera.save_preset("Slow")
+    frame_camera.apply_camera_settings({"AcquisitionFrameRateEnable": False})
+    frame_camera.apply_preset("Slow")
+    out = frame_camera.start(str(tmp_path / "run"), 0, 0, 0)
+    try:
+        state = device().state
+        assert state["AcquisitionFrameRateEnable"] is True
+        assert state["AcquisitionFrameRate"] == 12.0
+        assert "frame rate" in out["summary"]
+    finally:
+        frame_camera.stop()
+
+
+def test_start_keeps_a_presets_picture_window_on_an_event_camera(tmp_path):
+    live("event")
+    frame_camera.set_camera_setting("window_ms", 5)
+    frame_camera.save_preset("Fast windows")
+    frame_camera.set_camera_setting("window_ms", 40)
+    frame_camera.apply_preset("Fast windows")
+    frame_camera.start(str(tmp_path / "run"), 0, 0, 0)
+    try:
+        assert device().accumulate_ms == 5.0, "Start put 20 ms windows back"
+    finally:
+        frame_camera.stop()
+
+
+def test_a_box_changed_after_the_preset_still_wins_at_start(tmp_path):
+    live("frame")
+    frame_camera.apply_camera_settings({"AcquisitionFrameRateEnable": True,
+                                        "AcquisitionFrameRate": 12.0,
+                                        "ExposureTime": 12000.0})
+    frame_camera.apply_frame_rate(25)                # the FPS box, after
+    frame_camera._box_changed("exposure")            # typed, after
+    frame_camera.start(str(tmp_path / "run"), 5000, 0, 25)
+    try:
+        state = device().state
+        assert state["AcquisitionFrameRate"] == 25.0
+        assert state["ExposureTime"] == 5000.0
+    finally:
+        frame_camera.stop()
+
+
+def test_without_a_preset_start_applies_the_boxes_as_before(tmp_path):
+    live("frame")
+    device().state["AcquisitionFrameRateEnable"] = True
+    frame_camera.start(str(tmp_path / "run"), 7000, 0, 0)
+    try:
+        state = device().state
+        assert state["AcquisitionFrameRateEnable"] is False, "0 lifts it"
+        assert state["ExposureTime"] == 7000.0
+    finally:
+        frame_camera.stop()
+
+
+def test_a_preset_exposure_is_not_overwritten_by_an_older_box(tmp_path):
+    live("frame")
+    frame_camera.apply_camera_settings({"ExposureTime": 12000.0})
+    frame_camera.start(str(tmp_path / "run"), 5000, 0, 0)
+    try:
+        assert device().state["ExposureTime"] == 12000.0
+    finally:
+        frame_camera.stop()
+
+
+def test_without_port_hooks_a_box_changed_between_starts_is_noticed(
+        tmp_path):
+    """A Tk build has no port hooks: a box is known to have changed when
+    its value differs from the last Start's."""
+    live("frame")
+    frame_camera.start(str(tmp_path / "one"), 5000, 0, 0)
+    frame_camera.stop()
+    frame_camera.apply_camera_settings({"ExposureTime": 12000.0})
+    frame_camera.start(str(tmp_path / "two"), 5000, 0, 0)
+    frame_camera.stop()
+    assert device().state["ExposureTime"] == 12000.0, "an unchanged box won"
+    frame_camera.start(str(tmp_path / "three"), 8000, 0, 0)
+    try:
+        assert device().state["ExposureTime"] == 8000.0, "a typed box lost"
+    finally:
+        frame_camera.stop()
+
+
+# -- The live view died: a change is made, not refused ------------------
+def _kill_the_grab_loop():
+    dev = device()
+
+    def unplugged(timeout_ms=1000):
+        raise ValueError("unplugged")
+
+    dev.read = unplugged
+    session = frame_camera._LIVE.session
+    end = time.monotonic() + 2.0
+    while session.running and time.monotonic() < end:
+        time.sleep(0.01)
+    assert not session.running and dev.streaming
+    del dev.read                          # the camera answers again
+
+
+def test_a_change_after_the_live_view_died_is_made_not_refused():
+    """The grab loop ended by itself and left the device marked started:
+    the area and a locked setting were refused "while streaming" — with
+    nothing streaming — until the live view's 5 s retry."""
+    viewer = live("frame")
+    _kill_the_grab_loop()
+    ticks(viewer, 0.05)
+    assert not frame_camera._LIVE.previewing
+    out = frame_camera.set_camera_area("0, 0, 320, 240")
+    assert out["area"] == "0, 0, 320, 240"
+    assert frame_camera.set_camera_setting("PixelFormat", "Mono12")["ok"]
+    ticks(viewer, 0.4)
+    assert frame_camera._LIVE.previewing, "the live view waited out its retry"
+    assert viewer.frames[-1].meta["aoi"] == (0, 0, 320, 240)
+
+
+def test_start_after_the_live_view_died_starts_the_camera_afresh(tmp_path):
+    """A Basler's start() returns at once while it is marked started, so a
+    capture begun on a dead loop kept the live view's grab strategy."""
+    viewer = live("frame")
+    _kill_the_grab_loop()
+    ticks(viewer, 0.05)
+    calls = []
+    dev = device()
+    real_stop, real_start = dev.stop, dev.start
+    dev.stop = lambda: (calls.append("stop"), real_stop())[1]
+    dev.start = lambda: (calls.append("start"), real_start())[1]
+    frame_camera.start(str(tmp_path / "run"))
+    try:
+        assert calls[:2] == ["stop", "start"], calls
+    finally:
+        frame_camera.stop()
+
+
+# -- A Tk build of the app has no QApplication ----------------------------
+NO_QT_APP = """
+import os, sys
+sys.path.insert(0, {repo!r})
+os.environ.pop("COUNCIL_NO_DIALOGS", None)
+import frame_camera
+frame_camera._LIVE.setup_path = {setup!r}
+rows = frame_camera.list_cameras()["rows"]
+frame_camera.connect(next(r for r in rows if r.endswith("frame")))
+print("SETTINGS", frame_camera.camera_settings()["summary"], flush=True)
+print("SETUP", frame_camera.setup()["summary"], flush=True)
+frame_camera.disconnect()
+print("ALIVE", flush=True)
+"""
+
+
+def test_a_tk_build_says_so_instead_of_dying(tmp_path):
+    """Typhon built for Tk (run_example_gui's default target) has the
+    Camera settings… and Camera setup… buttons too. With no QApplication a
+    Qt window aborts the whole process — measured: exit 127, nothing
+    said, the capture gone with it."""
+    import subprocess
+
+    repo = str(Path(__file__).resolve().parents[1])
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen")
+    env.pop("COUNCIL_NO_DIALOGS", None)
+    done = subprocess.run(
+        [sys.executable, "-c", NO_QT_APP.format(
+            repo=repo, setup=str(tmp_path / "camera_setup.json"))],
+        env=env, capture_output=True, text=True, timeout=120)
+    assert done.returncode == 0, (done.returncode, done.stdout, done.stderr)
+    lines = dict(line.split(" ", 1) for line in done.stdout.splitlines()
+                 if " " in line)
+    assert "Qt" in lines["SETTINGS"] and "Qt" in lines["SETUP"]
+    assert "ALIVE" in done.stdout

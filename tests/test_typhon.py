@@ -556,3 +556,26 @@ def test_the_pop_out_button_opens_a_copy(qapp, typhon_dir, forget_generated,
     assert windows[-1].windowTitle() == "20260924_120000_frame_000001.png"
     for w in windows:
         w.close()
+
+
+def test_start_uses_a_box_only_when_it_was_changed_after_the_preset(
+        qapp, tmp_path, forget_generated):
+    """attach hooks the boxes beside Start: a value typed BEFORE a preset
+    was applied is older than the preset and Start keeps the preset's; one
+    typed after it is the user's latest word and Start applies it."""
+    pdir = rex.build("typhon", project="boxes", vault_dir=tmp_path,
+                     target="qt")
+    ui = construct(pdir)
+    _connect(ui, "frame")
+    state = frame_camera._LIVE.device.state
+    ui.ports.capture_folder.set(str(tmp_path / "runs"))
+    ui.ports.exposure.widget.setValue(5000)              # typed first
+    frame_camera.apply_camera_settings({"ExposureTime": 12000.0})
+    ui.on_btn_start_capture()
+    assert state["ExposureTime"] == 12000.0
+    assert "Kept the camera's own exposure" in ui.ports.capture_status.get()
+    ui.on_btn_stop_capture()
+    ui.ports.exposure.widget.setValue(8000)              # typed after
+    ui.on_btn_start_capture()
+    assert state["ExposureTime"] == 8000.0
+    ui.on_btn_stop_capture()

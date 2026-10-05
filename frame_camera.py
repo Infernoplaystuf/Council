@@ -118,6 +118,7 @@ required to make one safe.
 """
 from __future__ import annotations
 
+import itertools
 import threading
 import time
 from pathlib import Path
@@ -228,6 +229,19 @@ class _Live:
         #: keeps what it was last given until it is powered off, so it also
         #: offers its own factory set (load_camera_defaults).
         self.as_connected: Dict[str, Any] = {}
+        #: When each box beside Start ("exposure", "gain", "frame_rate")
+        #: was last changed, and when a preset or the settings window last
+        #: set the same thing on the camera — as a running count, not a
+        #: clock (Windows' monotonic clock ticks every 15.6 ms). Start
+        #: applies a box only when it is the newer of the two (see
+        #: START_BOXES). Box changes are about the app and survive
+        #: disconnect; what the camera was set to is about the connection.
+        self.box_changed: Dict[str, int] = {}
+        self.camera_set: Dict[str, int] = {}
+        #: Each box's value at the last Start — how a change is noticed in
+        #: an app whose box has no hook (`hooked_boxes`, set by attach).
+        self.box_seen: Dict[str, str] = {}
+        self.hooked_boxes: set = set()
 
     def clear(self) -> None:
         self.device = None
@@ -250,10 +264,12 @@ class _Live:
         self.shown_aoi = None
         self.job = None
         self.as_connected = {}
+        self.camera_set = {}
 
 
 _LIVE = _Live()
 _LOCK = threading.Lock()
+_STAMPS = itertools.count(1)
 
 
 # ======================================================================
@@ -440,6 +456,13 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     (apply_frame_rate); Start passes it again, so a rate chosen before a
     camera was connected is not lost.
 
+    A PRESET IS NEWER THAN A BOX NOBODY TOUCHED SINCE. A box is skipped —
+    and the summary says so — when a preset or the settings window set the
+    same thing on the camera after the box was last changed (START_BOXES).
+    Before, picking "Bird bath" and pressing Start with the FPS box at its
+    0 lifted the preset's frame-rate limit, and put an EVK4's picture
+    window back to 20 ms (measured).
+
     FROM THE PREVIEW. A frame camera's preview is stopped and the camera
     started again for the capture. An EVK4's stream is left running and the
     .raw opens inside it — restarting would carry stale decoder state into
@@ -460,12 +483,30 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     if out.exists() and not out.is_dir():
         raise RuntimeError(f"{out} is a file, not a folder")
 
-    if str(exposure or "").strip():
-        set_exposure(exposure)
-    if str(gain or "").strip():
-        set_gain(gain)
+    for box, value in (("exposure", exposure), ("gain", gain),
+                       ("frame_rate", frame_rate)):
+        # A box whose value differs from the last Start's was changed in
+        # between — the only way to know it in an app with no port hooks
+        # (a Tk build). A hooked box (attach, Qt) was stamped WHEN it was
+        # changed, which may be before a preset: not re-stamped as now.
+        text = str(value if value is not None else "").strip()
+        if (box not in _LIVE.hooked_boxes and box in _LIVE.box_seen
+                and _LIVE.box_seen[box] != text):
+            _box_changed(box)
+        _LIVE.box_seen[box] = text
+    kept = []
+    for box, value, write in (("exposure", exposure, set_exposure),
+                              ("gain", gain, set_gain)):
+        if _box_given(value):
+            if _box_is_newer(box):
+                write(value)
+            else:
+                kept.append(box)
     if frame_rate is not None and str(frame_rate).strip():
-        set_frame_rate(frame_rate)
+        if _box_is_newer("frame_rate"):
+            set_frame_rate(frame_rate)
+        else:
+            kept.append("frame rate")
 
     device = session.device
     restartable = getattr(device, "restartable", True)
@@ -473,6 +514,8 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         raise RuntimeError(_DEAD_STREAM)
     if session.running and restartable:
         _stop_preview(session)
+    elif restartable:
+        _release_dead_stream(session)
 
     run = _unique_run(out)
     recorder = capture.Recorder(out, stem=f"{run}_frame",
@@ -516,6 +559,10 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     said = f"Capturing into {out}."
     if raw is not None:
         said += f" Raw: {raw.name}."
+    if kept:
+        said += (f" Kept the camera's own {' and '.join(kept)}: a preset or "
+                 f"the settings window set {'it' if len(kept) == 1 else 'them'}"
+                 f" after the box beside Start was last changed.")
     if _LIVE.network:
         said += (" This folder is on a network share — save to a local "
                  "folder and copy the run afterwards, or frames will be "
@@ -856,6 +903,73 @@ def _stop_preview(session: Any) -> None:
     _LIVE.previewing = False
 
 
+def _release_dead_stream(session: Any) -> None:
+    """A grab loop that ended by itself (an unplugged or failing camera)
+    leaves its device marked started: CaptureSession only stops the device
+    when asked. Then a Basler refused its area and pixel format "while
+    streaming" with nothing streaming, and its start() returned at once —
+    so a capture begun there kept the live view's grab strategy. Stopping
+    the session puts the device side right; nothing else is running."""
+    device = session.device
+    if not session.running and getattr(device, "streaming", False):
+        session.stop()
+        # Whatever stopped the live view, a change is about to be made or a
+        # capture started: try the live view again at once afterwards.
+        _LIVE.preview_retry_at = 0.0
+
+
+# ======================================================================
+# The boxes beside Start, and the camera's own settings
+# ======================================================================
+#: What each box beside Start sets, by the setting keys a preset or the
+#: settings window writes for the same thing (camera_settings keys, which
+#: are the same on a Basler, an EVK4 and the simulated cameras).
+START_BOXES: Dict[str, tuple] = {
+    "exposure": ("ExposureTime", "ExposureAuto"),
+    "gain": ("Gain", "GainAuto"),
+    "frame_rate": ("AcquisitionFrameRate", "AcquisitionFrameRateEnable",
+                   "window_ms"),
+}
+
+
+def _box_changed(box: str) -> None:
+    """A box beside Start was changed (attach's port hook; the FPS box's
+    own link). Its value is the user's latest word on that setting."""
+    _LIVE.box_changed[box] = next(_STAMPS)
+
+
+def _camera_set(keys: Any) -> None:
+    """A preset, a reset or the settings window set these keys on the
+    camera: the latest word on whichever boxes they belong to."""
+    keys = set(keys)
+    for box, owned in START_BOXES.items():
+        if keys.intersection(owned):
+            _LIVE.camera_set[box] = next(_STAMPS)
+
+
+def _box_is_newer(box: str) -> bool:
+    """Should Start apply this box? Yes unless the camera was set to the
+    same thing by a preset or the settings window after the box changed."""
+    return _LIVE.box_changed.get(box, 0) >= _LIVE.camera_set.get(box, -1)
+
+
+def _box_given(value: Any) -> bool:
+    """A box's value means "set this": not blank and not 0 ("0 = keep")."""
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return False
+    try:
+        return float(text) != 0.0
+    except ValueError:
+        return True                      # let the setter say what is wrong
+
+
+def _changed_keys(applied: Any) -> List[str]:
+    """The keys a camera_settings.Applied actually wrote."""
+    return [c.key for c in getattr(applied, "changes", [])
+            if c.ok and not c.skipped]
+
+
 def _tick(show: Callable[[Any], Any], say: Optional[Callable[[str], Any]],
           reviewer: Any) -> None:
     """One timer tick: a finished camera change reported, the live view
@@ -983,6 +1097,7 @@ def attach(app: Any, view: str = "live_view",
     except Exception:                                     # noqa: BLE001
         pass
 
+    _hook_start_boxes(app)
     _LIVE.setup_path = _setup_path_for(app)
     # After setup_path: the presets it lists are this app's project's.
     picker = _picker_for(app, presets, area)
@@ -1024,6 +1139,23 @@ def _reviewer_for(app: Any, canvas: Any, scrubber: str, folder: str,
         view=getattr(ports, view_status, None) if view_status else None,
         feed=_Feed(), window_us=int(cameras.DEFAULT_ACCUMULATE_MS * 1000),
         parent=app)
+
+
+def _hook_start_boxes(app: Any) -> None:
+    """Note each change of a box beside Start (the ports named in
+    START_BOXES), so Start can tell a box changed after a preset from one
+    left as it was before it (_box_is_newer)."""
+    ports = getattr(app, "ports", None)
+    for box in START_BOXES:
+        port = getattr(ports, box, None) if ports is not None else None
+        hook = getattr(port, "on_change", None)
+        if not callable(hook):
+            continue
+        try:
+            hook(lambda *_a, b=box: _box_changed(b))
+        except Exception:                                 # noqa: BLE001
+            continue                    # a port with no change hook
+        _LIVE.hooked_boxes.add(box)
 
 
 def _picker_for(app: Any, presets: str, area: str) -> Any:
@@ -1183,9 +1315,14 @@ def setup(parent: Any = None) -> Dict[str, Any]:
 
         window = parent or QApplication.activeWindow()
         title = window.windowTitle() if window is not None else ""
-        chosen = camera_wizard.run_wizard(window, path, app_name=title)
-        said = (f"Set up for {camera_setup.label(chosen)}." if chosen else
-                "Camera setup cancelled — nothing changed.")
+        try:
+            chosen = camera_wizard.run_wizard(window, path, app_name=title)
+        except getattr(camera_wizard, "NoQtApplication", ()) as exc:
+            chosen = None
+            said = f"Camera setup skipped — {exc}."
+        else:
+            said = (f"Set up for {camera_setup.label(chosen)}." if chosen
+                    else "Camera setup cancelled — nothing changed.")
     listed = list_cameras()
     listed["summary"] = f"{said} {listed['summary']}"
     return listed
@@ -1526,6 +1663,11 @@ def _run_change(label: str, work: Callable[[], Any],
     nothing an EVK4 offers needs it, so this is a guard, not a path.
     """
     session = _require_session()
+    if stop and not session.running and getattr(session.device,
+                                                "restartable", True):
+        # The live view died by itself: nothing streams, but the device
+        # still says it does, and would refuse the change for it.
+        _release_dead_stream(session)
     if stop and session.running:
         if not getattr(session.device, "restartable", True):
             raise RuntimeError(
@@ -1728,7 +1870,11 @@ def camera_settings(parent: Any = None) -> Dict[str, Any]:
         except Exception:                                 # noqa: BLE001
             parent = None
     hidden = _dialogs_disabled()
-    _LIVE.settings_window = module.open_settings(parent, show=not hidden)
+    try:
+        _LIVE.settings_window = module.open_settings(parent, show=not hidden)
+    except getattr(module, "NoQtApplication", ()) as exc:
+        # A Tk build: said, not a process abort (see open_settings).
+        return {"summary": f"Camera settings: {exc}."}
     label = getattr(_LIVE.info, "label", "") or "the camera"
     if hidden:
         return {"summary": f"Camera settings: {label} (not shown — dialogs "
@@ -1791,6 +1937,8 @@ def set_camera_setting(key: Any, value: Any) -> Dict[str, Any]:
             raise RuntimeError(str(exc)) from exc
 
     def finish(change: Any) -> Dict[str, Any]:
+        if change.ok and not change.skipped:
+            _camera_set([key])
         return {"change": change.as_dict(), "key": key, "value": change.value,
                 "ok": change.ok, "what": "setting", "pending": False,
                 "summary": change.line()}
@@ -1835,6 +1983,7 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
         return camera_settings.apply(device, values, roi)
 
     def finish(applied: Any) -> Dict[str, Any]:
+        _camera_set(_changed_keys(applied))
         moved = roi is not None and applied.roi is not None
         head = {"preset": f"Preset {name!r}",
                 "reset": "Settings as connected"}.get(what, "Camera settings")
@@ -1936,6 +2085,8 @@ def load_camera_defaults() -> Dict[str, Any]:
 
     def finish(area: Any) -> Dict[str, Any]:
         text = _area_text(area)
+        # Every setting went back: the latest word on all of the boxes.
+        _camera_set(key for keys in START_BOXES.values() for key in keys)
         return {"area": text, "crop": "", "ok": True, "pending": False,
                 "what": "defaults",
                 "summary": f"Loaded the camera's own defaults ({source}); "
@@ -2240,6 +2391,9 @@ def apply_frame_rate(frame_rate: Any = 0) -> Dict[str, Any]:
                   "frame rate")
     if fps < 0:
         raise RuntimeError(f"frame rate must be 0 or more, not {fps:g}")
+    # The box was just changed: at Start it is the latest word on the rate,
+    # newer than a preset applied before it (_box_is_newer).
+    _box_changed("frame_rate")
     wanted = _fps_text(fps)
     device = _LIVE.device
     if device is None:

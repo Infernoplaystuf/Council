@@ -1290,6 +1290,23 @@ def _preset_tip(detail: Dict[str, Any]) -> str:
 _HELD: Dict[str, Any] = {}
 
 
+class NoQtApplication(RuntimeError):
+    """This process has no QApplication: a Tk build of the app, whose
+    "Camera settings…" button reaches here too. A QWidget made without one
+    aborts the whole process (measured: exit 127, nothing said, a running
+    capture lost with it), so it is refused first."""
+
+
+def _require_qt_app() -> None:
+    from PySide6.QtWidgets import QApplication
+
+    if QApplication.instance() is None:
+        raise NoQtApplication(
+            "the camera settings window is part of the Qt build of this app "
+            "(run_example_gui.py typhon --target qt); presets still work "
+            "from the preset box")
+
+
 def alive(window: Any) -> bool:
     try:
         window.isVisible()
@@ -1303,7 +1320,9 @@ def open_settings(parent: Optional[QWidget] = None, show: bool = True,
     """Open the camera settings window (frame_camera.camera_settings' hook),
     or bring the open one forward, read again. Non-modal: the app — its live
     view and any capture — carries on underneath. `show` False builds it
-    without showing it (COUNCIL_NO_DIALOGS)."""
+    without showing it (COUNCIL_NO_DIALOGS). Raises NoQtApplication in a
+    process with no QApplication (a Tk build)."""
+    _require_qt_app()
     if api is None:
         import frame_camera as api                        # noqa: PLC0415
     window = _HELD.get("window")

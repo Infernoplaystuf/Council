@@ -320,6 +320,10 @@ class CameraSetupWizard(QWizard):
         return self.choose.choice()
 
 
+class NoQtApplication(RuntimeError):
+    """This process has no QApplication to show the wizard in."""
+
+
 def run_wizard(parent: Optional[QWidget], path, *, app_name: str = "",
                checker=None, python: Optional[str] = None,
                execute: Optional[Callable[[QWizard], int]] = None
@@ -331,7 +335,17 @@ def run_wizard(parent: Optional[QWidget], path, *, app_name: str = "",
 
     `execute` exists so a test can drive the wizard without a window ever
     appearing; the app leaves it alone and gets a real modal dialog.
+
+    Raises NoQtApplication in a process with no QApplication — a Tk build
+    of the app, whose "Camera setup…" button reaches here too and whose
+    process a QWizard made without one aborted outright.
     """
+    from PySide6.QtWidgets import QApplication
+
+    if QApplication.instance() is None:
+        raise NoQtApplication("the camera setup wizard is part of the Qt "
+                              "build of this app (run_example_gui.py "
+                              "<example> --target qt)")
     wizard = CameraSetupWizard(parent, app_name=app_name,
                                current=cs.load_choice(path),
                                checker=checker, python=python)
