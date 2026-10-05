@@ -658,6 +658,27 @@ def _write_json(path: Path, obj: Any) -> None:
     _atomic_write(path, lambda tmp: Path(tmp).write_text(text, encoding="utf-8"))
 
 
+#: Windows refuses a path of this many characters or more unless long paths
+#: are switched on for the whole PC — and says only "No such file or
+#: directory". MEASURED: a store under this session's temp folder (188
+#: characters deep) failed exactly so on the first Train.
+_WIN_MAX_PATH = 260
+
+
+def _os_error(exc: OSError) -> str:
+    """An OSError as words, naming the real cause when Windows refused a
+    path for its LENGTH."""
+    text = str(exc)
+    longest = max(len(str(getattr(exc, a, "") or ""))
+                  for a in ("filename", "filename2"))
+    if os.name == "nt" and longest >= _WIN_MAX_PATH:
+        text += (f" — that path is {longest} characters and Windows refuses "
+                 f"{_WIN_MAX_PATH} or more: keep the classifiers in a "
+                 f"shorter folder (see classifier_store), or use a shorter "
+                 f"name")
+    return text
+
+
 def _is_new(d: Path) -> bool:
     """Nothing of this classifier exists yet — so saving now CREATES it."""
     try:
@@ -668,18 +689,23 @@ def _is_new(d: Path) -> bool:
 
 def _save(name: Any, data: Dict[str, Any]) -> None:
     d = store_dir(name)
-    if _is_new(d):
-        # The moment a classifier comes to exist: its origin is recorded
-        # now, by the app doing it, and only now (see ORIGIN AND TAGS). The
-        # name is checked against every other whatever its case, because a
-        # store copied to Windows would merge "Frames" into "frames".
-        n = _name_of(name)
-        clash = _taken(n)
-        if clash and clash != n:
-            raise RuntimeError(_clash_text(clash))
-        _write_about(d, {"origin": _new_origin(), "lineage": [], "tags": []})
-    data["updated"] = _now()
-    _write_json(d / "classes.json", data)
+    try:
+        if _is_new(d):
+            # The moment a classifier comes to exist: its origin is recorded
+            # now, by the app doing it, and only now (see ORIGIN AND TAGS).
+            # The name is checked against every other whatever its case,
+            # because a store copied to Windows would merge "Frames" into
+            # "frames".
+            n = _name_of(name)
+            clash = _taken(n)
+            if clash and clash != n:
+                raise RuntimeError(_clash_text(clash))
+            _write_about(d, {"origin": _new_origin(), "lineage": [],
+                             "tags": []})
+        data["updated"] = _now()
+        _write_json(d / "classes.json", data)
+    except OSError as exc:
+        raise RuntimeError(f"cannot save '{d.name}': {_os_error(exc)}")
 
 
 def _now() -> str:
@@ -1194,15 +1220,23 @@ def _write_version(d: Path, model_bytes: bytes, classes_doc: Dict[str, Any],
     try:
         vroot.mkdir(parents=True, exist_ok=True)
         tmp = Path(tempfile.mkdtemp(prefix=".tmp-", dir=str(vroot)))
+        # Written straight into the temporary folder, not via _write_json's
+        # own temp file: renaming the FOLDER is the one atomic step, and a
+        # temp file inside a temp folder only made the deepest path longer
+        # (Windows refuses paths over 260 characters).
         (tmp / "model.npz").write_bytes(model_bytes)
-        _write_json(tmp / "classes.json", classes_doc)
+        (tmp / "classes.json").write_text(
+            json.dumps(classes_doc, indent=2, ensure_ascii=False),
+            encoding="utf-8")
         nums = _version_numbers(d)
         n = number or ((nums[-1] + 1) if nums else 1)
         for _ in range(1000):
             target = vroot / f"v{n}"
             if not target.exists():
                 full = dict(meta, version=n)
-                _write_json(tmp / "meta.json", full)
+                (tmp / "meta.json").write_text(
+                    json.dumps(full, indent=2, ensure_ascii=False),
+                    encoding="utf-8")
                 try:
                     os.rename(tmp, target)
                     return full, target
@@ -1212,7 +1246,8 @@ def _write_version(d: Path, model_bytes: bytes, classes_doc: Dict[str, Any],
             n += 1
         raise RuntimeError(f"cannot find a free version number in {vroot}")
     except OSError as exc:
-        raise RuntimeError(f"cannot save a new version in {vroot}: {exc}")
+        raise RuntimeError(f"cannot save a new version in {vroot}: "
+                           f"{_os_error(exc)}")
     finally:
         if tmp is not None and tmp.exists():
             shutil.rmtree(tmp, ignore_errors=True)
@@ -2037,7 +2072,8 @@ def _in_use(exc: OSError, n: str, d: Path) -> RuntimeError:
         return RuntimeError(f"'{n}' is in use by another program — a file "
                             f"inside {d} is open. Close it and try again; "
                             f"nothing was changed.")
-    return RuntimeError(f"cannot move {d}: {exc}. Nothing was changed.")
+    return RuntimeError(f"cannot move {d}: {_os_error(exc)}. Nothing was "
+                        f"changed.")
 
 
 def _copy_ignore(_dir: str, names: List[str]) -> List[str]:
@@ -2097,7 +2133,8 @@ def save_as(name: Any, new_name: Any, show: Any = "") -> Dict[str, Any]:
         except FileExistsError:
             raise RuntimeError(_clash_text(_taken(new) or new))
         except OSError as exc:
-            raise RuntimeError(f"cannot copy '{n}' to '{new}': {exc}")
+            raise RuntimeError(f"cannot copy '{n}' to '{new}': "
+                               f"{_os_error(exc)}")
     lib = _library(show)
     newest = _newest(target)
     what = (f"with its {len(_version_numbers(target))} version(s), current "
@@ -2506,7 +2543,7 @@ def export_classifier(name: Any, destination: Any) -> Dict[str, Any]:
     try:
         _atomic_write(out, lambda tmp: Path(tmp).write_bytes(data))
     except OSError as exc:
-        raise RuntimeError(f"cannot write {out}: {exc}")
+        raise RuntimeError(f"cannot write {out}: {_os_error(exc)}")
     notes = list(ex["notes"])
     if ex["bad_runs"]:
         notes.append(f"{ex['bad_runs']} unreadable line(s) of its run record "
@@ -2586,7 +2623,7 @@ def export_classifiers(destination: Any, show: Any = "") -> Dict[str, Any]:
     try:
         _atomic_write(out, _w)
     except OSError as exc:
-        raise RuntimeError(f"cannot write {out}: {exc}")
+        raise RuntimeError(f"cannot write {out}: {_os_error(exc)}")
     names = [e["name"] for e in entries]
     tail = ("" if not skipped else
             " Not in it: " + "; ".join(f"{s['name']} ({s['why']})"
@@ -2905,7 +2942,8 @@ def _import_one(got: Dict[str, Any], target: str, source: str) -> str:
     except FileExistsError:
         raise
     except OSError as exc:
-        raise RuntimeError(f"cannot import into {store_dir(target)}: {exc}")
+        raise RuntimeError(f"cannot import into {store_dir(target)}: "
+                           f"{_os_error(exc)}")
     return _vid(target, meta)
 
 
