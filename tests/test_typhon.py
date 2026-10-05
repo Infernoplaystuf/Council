@@ -110,7 +110,9 @@ def test_typhon_is_v5_in_teal_plus_the_capture_review_controls():
     line above the picture, Play / Pause, PNG / Raw and Pop out, an FPS box
     where v3's unwired "Frame count" was (wired, so it applies as it
     changes), real exposure and gain ranges, and Settings in the top right
-    corner. Nothing else moved."""
+    corner. And Connect / Apply area / Full sensor no longer write the
+    camera's area (sensor pixels) into the crop box (picture pixels): Connect
+    leaves it alone and the area buttons clear it. Nothing else moved."""
     v5, typhon = gspec("barbie_capture_v5"), gspec("typhon")
     assert typhon["window"]["bg"] == TYPHON_BG
     assert typhon["window"]["fg"] == v5["window"]["fg"]
@@ -120,7 +122,11 @@ def test_typhon_is_v5_in_teal_plus_the_capture_review_controls():
     assert sorted(set(new) - set(old)) == ["s55", "s56", "s57", "s58"]
     strip = lambda s: {k: v for k, v in s.items() if k != "label"}
     changed = sorted(k for k in old if strip(old[k]) != strip(new[k]))
-    assert changed == ["s04", "s06", "s08", "s09", "s11", "s23", "s46"]
+    assert changed == ["s04", "s06", "s08", "s09", "s11", "s23", "s44",
+                       "s46", "s49", "s50"]
+    assert "roi" not in new["s44"]["script"]["outputs"]
+    assert new["s49"]["script"]["outputs"]["roi"] == "crop"
+    assert new["s50"]["script"]["outputs"]["roi"] == "crop"
     assert new["s11"]["drives"] == {}, "a generated browser would own the slider"
     assert new["s09"]["port"] == {"name": "view_status"}
     assert new["s55"]["script"]["function"] == "play_pause"

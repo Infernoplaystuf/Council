@@ -58,20 +58,49 @@ over and loses nothing.
 Save to a LOCAL folder and copy the run afterwards. A network share could not
 keep up with a real EVK4.
 
-A LIVE PREVIEW BEFORE ANYTHING IS SAVED
-Connected but not capturing, with nothing in the folder to review, the camera
-streams and the picture shows what it sees — to aim and focus by — while
-nothing is written anywhere: no PNG, no CSV, no .raw. Start turns it into a
-capture. Only apps with a capture slider (Typhon) get it; see
-`_manage_preview`.
+CONNECTED MEANS LIVE
+Connected and not capturing, the camera streams and the picture shows what it
+sees — to aim, focus and draw the camera's area by — while nothing is written
+anywhere: no PNG, no CSV, no .raw. Whatever the folder holds: the slider's
+END is the live picture and dragging back reviews the saved frames (the DVR
+rule, capture_review). Start turns the live view into a capture; Stop turns it
+back. Only the raw view turns it off. Only apps with a capture slider (Typhon)
+get it; see `_manage_preview`.
 
 A FRAME CAMERA IS STOPPED AND STARTED; AN EVK4'S STREAM NEVER IS
-A Basler's grabs are independent, so its preview stops when there is nothing
-to show it on, and Start restarts it for the capture. An EVK4's stream must not
-be restarted on the same connection (Device.restartable, and EvkDevice for
-the measurements): it starts once and runs until Disconnect. Its capture is
-the .raw opening and closing inside the running stream, and when the preview
-is not wanted it simply is not drawn.
+A Basler's grabs are independent, so its live view stops when there is
+nothing to show it on, and Start restarts it for the capture. An EVK4's stream
+must not be restarted on the same connection (Device.restartable, and
+EvkDevice for the measurements): it starts once and runs until Disconnect. Its
+capture is the .raw opening and closing inside the running stream, and when
+the live view is not wanted it simply is not drawn.
+
+THE CAMERA'S AREA IS NOT THE CROP BOX
+Two boxes, two coordinate systems, kept apart:
+  * the CROP BOX (the "roi" port) is in IMAGE pixels of the picture it was
+    drawn on; "Save cropped frames" (frame_roi) cuts saved frames with it;
+  * the CAMERA'S AREA is in SENSOR pixels — the camera's own AOI/ROI, so an
+    EVK4 emits only there and a Basler reads only that out (`current_area`).
+The live picture of a camera with an area IS that area, so a box drawn on it
+is turned into sensor pixels by adding the origin of the area the shown frame
+was taken with (Frame.meta["aoi"]) — `set_area`. The live view is shown at
+full resolution, never decimated, so there is no display scale to undo. The
+camera's area is never written back into the crop box.
+
+ONE SET-UP PER RUN
+The camera's area, a preset and any setting the stream is in the way of are
+REFUSED while capturing, on every camera: a Basler would restart into the
+same run with frames of two sizes, and an EVK4's .raw would change meaning
+halfway. Settings that change live (exposure, gain, a bias) still apply
+mid-capture, as the FPS box always has. See `_refuse_while_capturing`.
+
+CHANGES THAT NEED THE STREAM STOPPED DO NOT FREEZE THE WINDOW
+A Basler's area or pixel format needs its grab loop stopped (which waits for
+the frame in flight, up to a second on a slow camera) and started again. That
+runs on a worker (`_Job`); the caller waits up to APPLY_WAIT_SECONDS for it
+and gets the full answer when it is quick — the usual case — or "applying…"
+and the answer in the status line, and to every `on_camera_change` listener,
+when it is not.
 
 THE SLIDER FOLLOWS THE CAPTURE
 In an app with a "frame" slider and no generated browser on it (Typhon), attach
@@ -177,6 +206,19 @@ class _Live:
         #: user never sees that the box did anything.
         self.rate_note = ""
         self.rate_note_until = 0.0
+        #: The last run's result, said in the live line for RUN_NOTE_SECONDS
+        #: after Stop — the live view comes back at once and would otherwise
+        #: replace "Stopped. 120 saved" before anyone read it.
+        self.run_note_until = 0.0
+        #: The camera area (x, y, w, h) of the newest LIVE frame on screen:
+        #: what a box drawn on the picture is relative to.
+        self.shown_aoi: Optional[tuple] = None
+        #: A camera change running on a worker (see _Job), or None.
+        self.job: Any = None
+        #: on_camera_change listeners. About the app, like the reviewer.
+        self.listeners: List[Callable[[Dict[str, Any]], Any]] = []
+        #: The open settings window, held so it is not collected shut.
+        self.settings_window: Any = None
 
     def clear(self) -> None:
         self.device = None
@@ -195,6 +237,9 @@ class _Live:
         self.stream_started = False
         self.rate_note = ""
         self.rate_note_until = 0.0
+        self.run_note_until = 0.0
+        self.shown_aoi = None
+        self.job = None
 
 
 _LIVE = _Live()
@@ -312,6 +357,7 @@ def connect(which: Any) -> Dict[str, Any]:
 
     limits = device.limits()
     area = device.roi()
+    _announce({"what": "connected", "summary": f"Connected to {info.label}."})
     return {
         "summary": (f"Connected to {info.label}. "
                     f"Sensor {limits.width}x{limits.height}."),
@@ -330,9 +376,17 @@ def disconnect() -> Dict[str, Any]:
     """Stop grabbing, release the camera, forget it."""
     with _LOCK:
         session = _LIVE.session
+        job = _LIVE.job
         _LIVE.clear()
+    if job is not None:
+        # A change still stopping or restarting the stream owns it until it
+        # is done; closing under it would race its restart. Cancelled first,
+        # so it does not start a stream that is about to be closed.
+        job.cancelled = True
+        job.done.wait(JOB_JOIN_SECONDS)
     if session is not None:
         session.close()
+        _announce({"what": "disconnected", "summary": "Disconnected."})
     return {"summary": "Disconnected.", "status": ""}
 
 
@@ -387,6 +441,7 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     session = _require_session()
     if _LIVE.capturing:
         raise RuntimeError("already capturing — stop first")
+    _refuse_while_busy("start a capture")
     where = str(folder or "").strip().strip('"')
     if not where:
         raise RuntimeError("choose a folder to save frames into first")
@@ -473,7 +528,7 @@ def stop() -> Dict[str, Any]:
         return {"summary": "Not capturing."}
     if not _LIVE.capturing:
         if _LIVE.previewing:
-            return {"summary": "Not capturing — that is the live preview, and "
+            return {"summary": "Not capturing — that is the live view, and "
                                "nothing is being saved. Start capture saves."}
         return {"summary": "Not capturing."}
     _LIVE.capturing = False
@@ -499,7 +554,27 @@ def stop() -> Dict[str, Any]:
         return {"summary": "The camera did not stop cleanly.",
                 "status": stats.line()}
     line = _stopped_line(session)
+    _LIVE.run_note_until = time.monotonic() + RUN_NOTE_SECONDS
     return {"summary": line, "status": stats.line()}
+
+
+#: How long the live line carries the last run's result after Stop.
+RUN_NOTE_SECONDS = 10.0
+
+
+def _run_note(session: Any) -> str:
+    """The last run, short: what was saved, what was not, the .raw."""
+    stats = session.run_stats()
+    bits = [f"{stats.recorded} saved"]
+    if stats.skipped:
+        bits.append(f"{stats.skipped} NOT saved")
+    raw = _LIVE.raw_path
+    if raw is not None:
+        try:
+            bits.append(f"raw {raw.stat().st_size / (1024 * 1024):.1f} MB")
+        except OSError:
+            bits.append("raw MISSING")
+    return "last run: " + ", ".join(bits)
 
 
 def _stopped_line(session: Any) -> str:
@@ -573,6 +648,7 @@ def pump(show: Callable[[Any], Any],
     frame = latest()
     if frame is not None:
         show(frame.image)
+        _LIVE.shown_aoi = _aoi_of(frame)
     _report(say, frame)
     return frame is not None
 
@@ -587,21 +663,29 @@ def _report(say: Optional[Callable[[str], Any]], frame: Any) -> None:
     if _LIVE.capturing or session.saving:
         say(_status_line(session.stats(), frame))
         _LIVE.reported = False
+    elif _LIVE.job is not None:
+        # The stream is stopped ON PURPOSE for a moment; not "quiet".
+        say(f"{_LIVE.job.label}…")
+        _LIVE.reported = False
     elif _LIVE.previewing and session.running:
-        say(_preview_line(session.stats(), frame))
+        say(_preview_line(session, session.stats(), frame))
         _LIVE.reported = False
     elif not _LIVE.reported:
         say(_idle_line(session))
         _LIVE.reported = True
 
 
-def _preview_line(stats: Any, frame: Any) -> str:
-    """Said while previewing: that NOTHING is being saved comes first. Short:
-    the line is one row, and Connect already said which camera it is."""
-    line = f"Preview — not saving · {stats.rate:.1f} fps{_rate_note()}"
+def _preview_line(session: Any, stats: Any, frame: Any) -> str:
+    """Said while the live view runs: that NOTHING is being saved comes
+    first. Short: the line is one row, and Connect already said which camera
+    it is. For a while after Stop it also carries the run's result, which
+    the live view coming back would otherwise have replaced unread."""
+    line = f"Live view — not saving · {stats.rate:.1f} fps{_rate_note()}"
     meta = getattr(frame, "meta", None) or {}
     if meta.get("kind") == "event":
         line += f" · {meta.get('events', 0)} events/window"
+    if time.monotonic() < _LIVE.run_note_until:
+        line += f" · {_run_note(session)}"
     return line
 
 
@@ -614,8 +698,8 @@ def _idle_line(session: Any) -> str:
                 f"{session.run_stats().line()}")
     label = getattr(_LIVE.info, "label", "") or "camera"
     if _LIVE.idle == "preview-off":
-        return (f"Connected to {label}. The live preview shows while the "
-                f"folder has no frames; Start capture saves.")
+        return (f"Connected to {label}. The live view is off while the raw "
+                f"file is shown; PNG view shows the camera again.")
     if _LIVE.idle:
         return _LIVE.idle
     return f"Connected to {label}."
@@ -672,11 +756,15 @@ def _manage_preview(want: bool) -> None:
     """Run the camera without recording while the viewer wants to show it.
 
     Called every tick from the UI thread, as are Start and Stop, so nothing
-    here races them. `want` comes from the reviewer: connected, not
-    capturing, and nothing in the folder to review.
+    here races them. `want` comes from the reviewer: connected and not
+    capturing, in the PNG view — whatever the folder holds.
+
+    Left alone while a camera change (_Job) has the stream stopped on
+    purpose: that is not the camera ending by itself, and restarting it
+    here would race the job's own restart.
     """
     session = _LIVE.session
-    if session is None or _LIVE.capturing:
+    if session is None or _LIVE.capturing or _LIVE.job is not None:
         return
     now = time.monotonic()
     restartable = getattr(session.device, "restartable", True)
@@ -693,7 +781,7 @@ def _manage_preview(want: bool) -> None:
         # It ended by itself: the camera was unplugged, or failed.
         _LIVE.previewing = False
         reason = session.stats().last_error or "the camera stopped sending"
-        _LIVE.idle = f"Live preview stopped: {reason}"
+        _LIVE.idle = f"Live view stopped: {reason}"
         _LIVE.reported = False
         _LIVE.preview_retry_at = now + PREVIEW_RETRY_SECONDS
         return
@@ -716,7 +804,7 @@ def _manage_preview(want: bool) -> None:
             _prepare(session.device, recording=False)
             session.start()
         except Exception as exc:                          # noqa: BLE001
-            _LIVE.idle = f"Live preview stopped: {type(exc).__name__}: {exc}"
+            _LIVE.idle = f"Live view stopped: {type(exc).__name__}: {exc}"
             _LIVE.reported = False
             _LIVE.preview_retry_at = now + PREVIEW_RETRY_SECONDS
             return
@@ -752,10 +840,11 @@ def _stop_preview(session: Any) -> None:
 
 def _tick(show: Callable[[Any], Any], say: Optional[Callable[[str], Any]],
           reviewer: Any) -> None:
-    """One timer tick: start or stop the preview, the newest frame to the
-    reviewer (or straight to the canvas when the app has none), then the
-    status line."""
+    """One timer tick: a finished camera change reported, the live view
+    started or stopped, the newest frame to the reviewer (or straight to the
+    canvas when the app has none), then the status line."""
     if reviewer is None:
+        _poll_job()
         pump(show, say)
         return
     if reviewer is not _LIVE.reviewer:
@@ -763,15 +852,26 @@ def _tick(show: Callable[[Any], Any], say: Optional[Callable[[str], Any]],
         # a later attach) must not start and stop the shared camera — two
         # viewers disagreeing would toggle the preview every tick.
         return
+    _poll_job()
     _watch_capture()
     try:
         _manage_preview(bool(reviewer.wants_preview()))
     except Exception as exc:                              # noqa: BLE001
-        _LIVE.idle = f"Live preview: {exc}"
+        _LIVE.idle = f"Live view: {exc}"
         _LIVE.reported = False
     frame = latest()
-    reviewer.tick(frame)
+    if reviewer.tick(frame):
+        _LIVE.shown_aoi = _aoi_of(frame)
     _report(say, frame)
+
+
+def _aoi_of(frame: Any) -> Optional[tuple]:
+    """The camera area a frame was taken with, or None if it does not say."""
+    aoi = (getattr(frame, "meta", None) or {}).get("aoi")
+    try:
+        return tuple(int(v) for v in aoi) if aoi is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def attach(app: Any, view: str = "live_view",
@@ -902,8 +1002,12 @@ class _Feed:
         return bool(_LIVE.capturing and session is not None and session.running)
 
     def previewing(self) -> bool:
+        """The live view runs. Still True while a camera change has the
+        stream stopped for a moment: the picture is coming straight back,
+        and the slider should not leave the live end and return."""
         session = _LIVE.session
-        return bool(_LIVE.previewing and session is not None and session.running)
+        return bool(_LIVE.previewing and session is not None
+                    and (session.running or _LIVE.job is not None))
 
     def saving(self) -> bool:
         session = _LIVE.session
@@ -1135,14 +1239,29 @@ def _status_line(stats: Any, frame: Any) -> str:
 # The area of interest
 # ======================================================================
 def set_area(area: Any) -> Dict[str, Any]:
-    """Set the camera's own AOI, so future frames ARE that size.
+    """The camera's own area, from a box drawn on (or typed for) the LIVE
+    picture — so future frames ARE that part of the sensor.
 
     Not a crop. Cropping moves every pixel over the link and throws most of
     them away; a sensor AOI reads out less, which on a boA5320-150cm is the
     frame rate, and on an event camera stops the masked pixels emitting at all.
 
-    The request is SNAPPED to what the sensor accepts and the result says what
-    was actually taken — a box that silently moves is a box the user fights.
+    THE BOX IS IN PICTURE PIXELS; THE CAMERA WANTS SENSOR PIXELS. The live
+    picture of a camera with an area set IS that area, so the box is moved
+    by the origin of the area the frame on screen was taken with
+    (Frame.meta["aoi"]). Before, it was sent as it was: after one change of
+    area, the next box drawn landed somewhere else on the sensor. A box on a
+    SAVED frame is refused — that frame's area may not be the camera's now.
+    `set_camera_area` takes sensor pixels as they are.
+
+    The request is SNAPPED to what the sensor accepts and the result says
+    what was actually taken. `crop` is "" — the crop box was drawn on the old
+    picture and means nothing on the new one — and the camera's area is never
+    written into it.
+
+    Refused while capturing (see _refuse_while_capturing).
+
+    Keys: area, crop, snapped, summary, pending
     """
     from council_core import cameras
 
@@ -1150,38 +1269,90 @@ def set_area(area: Any) -> Dict[str, Any]:
     box = _parse_area(area)
     if box is None:
         raise RuntimeError("type the area as x, y, w, h")
+    reviewer = _LIVE.reviewer
+    on_saved = getattr(reviewer, "showing_saved", None)
+    if callable(on_saved) and on_saved():
+        raise RuntimeError(
+            "that box is on a saved frame, whose area may not be the "
+            "camera's now — drag the slider to its end (live) and draw the "
+            "area on the live picture")
+    x0, y0 = _picture_origin(device)
+    return _change_area(cameras.Roi(box[0] + x0, box[1] + y0, box[2], box[3]))
 
-    was_running = _LIVE.session is not None and _LIVE.session.running
-    if was_running and getattr(device, "raw_path", None) is not None:
-        # Changing the area restarts the stream, and restarting the stream
-        # ends the .raw — the rest of the run would be missing from it.
-        raise RuntimeError("stop the capture before changing the camera's "
-                           "area — it would cut the raw recording short")
-    # A frame camera's AOI can only change while it is not grabbing. An
-    # EVK4's window is set live — its stream is never restarted.
-    restart = was_running and getattr(device, "restartable", True)
-    if restart and not _LIVE.session.stop():
-        raise RuntimeError("the camera did not stop cleanly to change its area")
-    try:
-        got = device.set_roi(cameras.Roi(*box))
-    finally:
-        if restart:
-            _LIVE.session.start()
 
-    text = _area_text(got)
-    snapped = tuple(got.as_tuple()) != tuple(box)
-    return {"area": text,
-            "summary": (f"Area set to {text}"
-                        + (" — snapped to what the sensor accepts."
-                           if snapped else ".")),
-            "snapped": snapped}
+def set_camera_area(area: Any) -> Dict[str, Any]:
+    """The camera's own area typed in SENSOR pixels (x, y, w, h), as
+    `current_area` reports it — for a "camera area" box, not a drawn one.
+
+    Keys: area, crop, snapped, summary, pending
+    """
+    from council_core import cameras
+
+    _require_device()
+    box = _parse_area(area)
+    if box is None:
+        raise RuntimeError("type the camera's area as x, y, w, h")
+    return _change_area(cameras.Roi(*box))
 
 
 def full_frame() -> Dict[str, Any]:
-    """Give the whole sensor back."""
+    """Give the whole sensor back.
+
+    Keys: area, crop, snapped, summary, pending
+    """
+    from council_core import cameras
+
     device = _require_device()
     limits = device.limits()
-    return set_area(f"0, 0, {limits.width}, {limits.height}")
+    return _change_area(cameras.Roi(0, 0, limits.width, limits.height))
+
+
+def current_area() -> Dict[str, Any]:
+    """The camera's area now, in sensor pixels, and the sensor's size."""
+    device = _require_device()
+    area, limits = device.roi(), device.limits()
+    full = area.as_tuple() == (0, 0, limits.width, limits.height)
+    text = _area_text(area)
+    return {"area": text, "sensor": f"{limits.width}x{limits.height}",
+            "full": full,
+            "summary": (f"Camera area: the whole sensor ({limits.width}x"
+                        f"{limits.height})." if full else
+                        f"Camera area: {text} of {limits.width}x"
+                        f"{limits.height}.")}
+
+
+def _picture_origin(device: Any) -> tuple:
+    """Where the live picture's (0, 0) is on the sensor: the area of the
+    frame on screen, or the camera's area if none has been shown yet."""
+    aoi = _LIVE.shown_aoi
+    if aoi is not None and len(aoi) >= 2:
+        return int(aoi[0]), int(aoi[1])
+    area = device.roi()
+    return int(area.x), int(area.y)
+
+
+def _change_area(roi: Any) -> Dict[str, Any]:
+    """Keys: area, crop, snapped, summary, pending"""
+    from council_core import camera_settings
+
+    device = _require_device()
+    _refuse_while_capturing("changing the camera's area")
+    _refuse_while_busy("change the camera's area")
+    stop = bool(camera_settings.stops_needed(device, {}, roi))
+
+    def work() -> Any:
+        return device.set_roi(roi)
+
+    def finish(got: Any) -> Dict[str, Any]:
+        text = _area_text(got)
+        snapped = tuple(got.as_tuple()) != tuple(roi.as_tuple())
+        return {"area": text, "crop": "", "snapped": snapped, "ok": True,
+                "what": "area", "pending": False,
+                "summary": (f"Camera area set to {text}"
+                            + (" — snapped to what the sensor accepts."
+                               if snapped else "."))}
+
+    return _run_change("Changing the camera's area", work, finish, stop)
 
 
 def _parse_area(value: Any):
@@ -1206,6 +1377,548 @@ def _parse_area(value: Any):
 
 def _area_text(roi: Any) -> str:
     return f"{roi.x}, {roi.y}, {roi.w}, {roi.h}"
+
+
+# ======================================================================
+# Changing the camera: the rules, and the worker for what needs a stop
+# ======================================================================
+#: How long a change that needs the stream stopped is waited for before the
+#: caller is handed "applying…" and the window carries on. The usual case
+#: finishes well inside it (a camera at 30 fps stops within a frame); a
+#: camera at 1 fps, whose grab loop waits up to a second for its frame, does
+#: not freeze the window for that second.
+APPLY_WAIT_SECONDS = 0.25
+
+#: How long Disconnect waits for a change in progress to finish.
+JOB_JOIN_SECONDS = 5.0
+
+
+def _refuse_while_capturing(what: str) -> None:
+    """ONE SET-UP PER RUN. A Basler's area change used to restart the stream
+    INTO the running capture — one run, frames of two sizes — and an EVK4's
+    .raw would change meaning halfway. So a change of area, a preset, or a
+    setting the stream is in the way of waits for Stop, on every camera."""
+    if _LIVE.capturing:
+        raise RuntimeError(
+            f"stop the capture before {what} — one run keeps one camera "
+            f"set-up, so all of its frames (and its .raw) stay comparable")
+
+
+def _refuse_while_busy(what: str) -> None:
+    job = _LIVE.job
+    if job is not None:
+        raise RuntimeError(f"{job.label} — wait for it to finish, then "
+                           f"{what}")
+
+
+class _Job:
+    """A camera change that needs the stream stopped, run off the UI thread.
+
+    Stopping a grab loop waits for the frame in flight — up to the read
+    timeout (a second) on a slow or triggered camera — and starting it again
+    is a round of SDK calls. On the UI thread that froze the window. Here
+    the worker stops the stream, makes the change, starts the live view
+    again, and the UI thread (`_poll_job`, every tick) reports the outcome.
+    While it runs, the live view is left alone (_manage_preview), Start
+    and every other change are refused, and Disconnect waits for it.
+    """
+
+    def __init__(self, label: str, work: Callable[[], Any],
+                 finish: Callable[[Any], Dict[str, Any]], session: Any):
+        self.label = label
+        self.work = work
+        self.finish = finish
+        self.session = session
+        self.result: Any = None
+        self.error: Optional[BaseException] = None
+        self.restart_error = ""
+        self.cancelled = False
+        self.done = threading.Event()
+        self.thread = threading.Thread(target=self._run,
+                                       name="camera-change", daemon=True)
+
+    def _run(self) -> None:
+        session = self.session
+        stopped = False
+        try:
+            if not session.stop():
+                raise RuntimeError("the camera did not stop its stream "
+                                   "cleanly to make the change")
+            stopped = True
+            self.result = self.work()
+        except BaseException as exc:                      # noqa: BLE001
+            self.error = exc
+        finally:
+            if stopped and not self.cancelled:
+                try:
+                    _prepare(session.device, recording=False)
+                    session.start()
+                except Exception as exc:                  # noqa: BLE001
+                    self.restart_error = (f"The live view did not restart: "
+                                          f"{exc}")
+            self.done.set()
+
+
+def _run_change(label: str, work: Callable[[], Any],
+                finish: Callable[[Any], Dict[str, Any]],
+                stop: bool) -> Dict[str, Any]:
+    """Make a change to the camera; `stop` says the stream is in the way.
+
+    Not in the way (or nothing streams): done here and now. In the way, on a
+    camera whose stream may stop: a _Job, waited for APPLY_WAIT_SECONDS. In
+    the way on a camera whose stream must never restart (an EVK4): refused —
+    nothing an EVK4 offers needs it, so this is a guard, not a path.
+    """
+    session = _require_session()
+    if stop and session.running:
+        if not getattr(session.device, "restartable", True):
+            raise RuntimeError(
+                "this camera's stream cannot be restarted on the same "
+                "connection, and this change needs it stopped — Disconnect, "
+                "Connect, then make the change before the live view starts")
+        job = _Job(label, work, finish, session)
+        _LIVE.job = job
+        job.thread.start()
+        if job.done.wait(APPLY_WAIT_SECONDS):
+            return _finish_job(job, raise_errors=True)
+        return {"summary": f"{label}… the camera is restarting its stream; "
+                           f"the result will show in the status line.",
+                "pending": True, "area": "", "crop": _current_crop(),
+                "snapped": False, "ok": True, "what": "pending"}
+    try:
+        result = work()
+    except Exception as exc:                              # noqa: BLE001
+        raise RuntimeError(_said(exc)) from exc
+    out = finish(result)
+    _announce(out)
+    return out
+
+
+def _finish_job(job: _Job, raise_errors: bool) -> Dict[str, Any]:
+    """The outcome of a finished job, said once, on the UI thread."""
+    if _LIVE.job is job:
+        _LIVE.job = None
+    if job.error is not None:
+        said = f"{job.label} failed: {_said(job.error)}"
+        if job.restart_error:
+            said += f" {job.restart_error}"
+        out = {"ok": False, "what": "failed", "summary": said,
+               "error": _said(job.error), "pending": False}
+        _announce(out)
+        if raise_errors:
+            raise RuntimeError(said) from job.error
+        _tell_status(said)
+        return out
+    out = job.finish(job.result)
+    if job.restart_error:
+        out["summary"] = f"{out['summary']} {job.restart_error}"
+    _announce(out)
+    if not raise_errors:
+        _tell_status(out["summary"])
+    return out
+
+
+def _poll_job() -> None:
+    """Every tick: report a job that finished after its caller stopped
+    waiting."""
+    job = _LIVE.job
+    if job is not None and job.done.is_set():
+        try:
+            _finish_job(job, raise_errors=False)
+        except Exception:                                 # noqa: BLE001
+            pass
+
+
+def _tell_status(text: str) -> None:
+    """Put a late answer where it will be read: the idle status line, and
+    for a while the live line (which is rewritten every tick)."""
+    _LIVE.idle = text
+    _LIVE.reported = False
+    _LIVE.rate_note = text if len(text) <= 60 else text[:57] + "…"
+    _LIVE.rate_note_until = time.monotonic() + RATE_NOTE_SECONDS
+
+
+def _said(exc: BaseException) -> str:
+    text = str(exc).strip() or type(exc).__name__
+    return text.split(" : ")[0][:300]
+
+
+def _announce(out: Dict[str, Any]) -> None:
+    for listener in list(_LIVE.listeners):
+        try:
+            listener(dict(out))
+        except Exception as exc:                          # noqa: BLE001
+            print(f"[frame_camera] a camera-change listener failed: {exc!r}")
+
+
+def on_camera_change(listener: Callable[[Dict[str, Any]], Any]
+                     ) -> Callable[[], None]:
+    """Call `listener(result)` ON THE UI THREAD after every change to the
+    camera made through this module — a setting, a preset, the area — with
+    the same dict the function returned, or the late answer of one that was
+    still "pending" when it returned; and with {"what": "connected"} /
+    {"what": "disconnected"}. For the settings window, which must show what
+    the camera actually took. Returns a function that removes the listener.
+    Not script-linkable (it takes a function)."""
+    _LIVE.listeners.append(listener)
+
+    def remove() -> None:
+        try:
+            _LIVE.listeners.remove(listener)
+        except ValueError:
+            pass
+
+    return remove
+
+
+def camera_state() -> Dict[str, Any]:
+    """What a settings window needs to enable its controls."""
+    device = _LIVE.device
+    session = _LIVE.session
+    info = _LIVE.info
+    out = {"connected": device is not None,
+           "label": getattr(info, "label", "") if info else "",
+           "kind": getattr(info, "kind", "") if info else "",
+           "capturing": bool(_LIVE.capturing),
+           "busy": _LIVE.job is not None,
+           "streaming": bool(session is not None and session.running),
+           "area": "", "sensor": "",
+           "summary": "No camera open."}
+    if device is not None:
+        limits = device.limits()
+        out.update(area=_area_text(device.roi()),
+                   sensor=f"{limits.width}x{limits.height}",
+                   summary=f"Connected to {out['label']}.")
+    return out
+
+
+def _current_crop() -> str:
+    """The crop box as it is — what a result leaves in the "roi" port when
+    the picture did not change."""
+    port = getattr(_LIVE.reviewer, "roi", None)
+    try:
+        return str(port.get() or "") if port is not None else ""
+    except Exception:                                     # noqa: BLE001
+        return ""
+
+
+# ======================================================================
+# Every setting the camera has (council_core.camera_settings)
+# ======================================================================
+#: The module whose open_settings(parent) shows the settings window. Looked
+#: up when the button is pressed, so this module never imports a window.
+SETTINGS_WINDOW_MODULE = "council_qt.widgets.camera_settings_window"
+
+
+def camera_settings(parent: Any = None) -> Dict[str, Any]:
+    """Open the camera's settings window — every setting the camera itself
+    describes, and its presets. Script-linkable: a "Camera settings…" button
+    calls this with no inputs.
+
+    The window is SETTINGS_WINDOW_MODULE.open_settings(parent), which works
+    through this module's settings_list / set_camera_setting /
+    apply_camera_settings / list_presets / apply_preset / save_preset /
+    delete_preset / rename_preset / current_area / camera_state and
+    on_camera_change.
+    """
+    if _LIVE.device is None:
+        return {"summary": "Connect a camera first — its settings come from "
+                           "the camera itself."}
+    if _dialogs_disabled():
+        return {"summary": "Camera settings skipped — dialogs are disabled."}
+    import importlib
+
+    try:
+        module = importlib.import_module(SETTINGS_WINDOW_MODULE)
+    except ImportError:
+        return {"summary": "The camera settings window is not part of this "
+                           "build."}
+    if parent is None:
+        try:
+            from PySide6.QtWidgets import QApplication
+
+            parent = QApplication.activeWindow()
+        except Exception:                                 # noqa: BLE001
+            parent = None
+    _LIVE.settings_window = module.open_settings(parent)
+    label = getattr(_LIVE.info, "label", "") or "the camera"
+    return {"summary": f"Camera settings: {label}."}
+
+
+def settings_list() -> Dict[str, Any]:
+    """Every setting the connected camera describes — key, label, group,
+    type, value, min/max/step or choices, unit, read-only, live (False:
+    the stream must stop to change it), held (why another setting owns it
+    now) — as plain dicts, in the order a set is written. `groups` is the
+    display order of the groups.
+
+    Keys: settings, groups, camera, kind, capturing, summary
+    """
+    device = _require_device()
+    try:
+        described = device.settings()
+    except Exception as exc:                              # noqa: BLE001
+        raise RuntimeError(f"the camera did not describe its settings: "
+                           f"{_said(exc)}") from exc
+    label = getattr(_LIVE.info, "label", "") or "camera"
+    return {"settings": [s.as_dict() for s in described],
+            "groups": list(dict.fromkeys(s.group for s in described)),
+            "camera": label, "kind": getattr(_LIVE.info, "kind", ""),
+            "capturing": bool(_LIVE.capturing),
+            "summary": f"{len(described)} settings on {label}."}
+
+
+def set_camera_setting(key: Any, value: Any) -> Dict[str, Any]:
+    """Write ONE setting and say what the camera took (clamped, snapped, or
+    refused — `change`). A setting the stream is in the way of stops and
+    restarts the live view (not while capturing); one that changes live
+    (exposure, gain, a bias) applies at once, mid-capture too.
+
+    Keys: change, key, value, ok, summary, pending
+    """
+    from council_core import camera_settings
+
+    device = _require_device()
+    _refuse_while_busy("change a setting")
+    key = str(key or "").strip()
+    try:
+        provider = device.settings_provider()
+        setting = provider.find(key)
+    except camera_settings.SettingError as exc:
+        raise RuntimeError(str(exc)) from exc
+    stop = bool(camera_settings.stops_needed(device, {key: value}))
+    if stop:
+        _refuse_while_capturing(f"changing {setting.label}")
+
+    def work() -> Any:
+        try:
+            return provider.set(key, value, setting=setting)
+        except camera_settings.SettingError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    def finish(change: Any) -> Dict[str, Any]:
+        return {"change": change.as_dict(), "key": key, "value": change.value,
+                "ok": change.ok, "what": "setting", "pending": False,
+                "summary": change.line()}
+
+    return _run_change(f"Changing {setting.label}", work, finish, stop)
+
+
+def apply_camera_settings(values: Any, area: Any = None) -> Dict[str, Any]:
+    """Write a whole set (a dict of key: value, as settings_list keys them)
+    and, optionally, the camera's area in SENSOR pixels — in a safe order,
+    the stream stopped once if anything in it needs that. Refused while
+    capturing. The settings window's "Apply".
+
+    Keys: applied, area, crop, ok, summary, pending
+    """
+    from council_core import cameras
+
+    if not isinstance(values, dict):
+        raise RuntimeError("settings come as a dict of name: value")
+    roi = None
+    if area not in (None, ""):
+        box = _parse_area(area)
+        if box is None:
+            raise RuntimeError("type the camera's area as x, y, w, h")
+        roi = cameras.Roi(*box)
+    return _apply_set(values, roi, "Applying the camera settings",
+                      "settings", "")
+
+
+def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
+               name: str) -> Dict[str, Any]:
+    """Keys: applied, area, crop, ok, summary, pending"""
+    from council_core import camera_settings
+
+    device = _require_device()
+    _refuse_while_capturing("applying a camera set-up" if what != "preset"
+                            else "applying a preset")
+    _refuse_while_busy("apply it")
+    stop = bool(camera_settings.stops_needed(device, values, roi))
+
+    def work() -> Any:
+        return camera_settings.apply(device, values, roi)
+
+    def finish(applied: Any) -> Dict[str, Any]:
+        moved = roi is not None and applied.roi is not None
+        head = f"Preset {name!r}" if what == "preset" else "Camera settings"
+        return {"applied": applied.as_dict(), "ok": applied.ok,
+                "area": _area_text(device.roi()),
+                "crop": "" if moved else _current_crop(),
+                "what": what, "name": name, "pending": False,
+                "summary": f"{head}: {applied.summary()}"}
+
+    return _run_change(label, work, finish, stop)
+
+
+# ======================================================================
+# Presets (council_core.camera_presets), kept in the app's project folder
+# ======================================================================
+def _project_dir() -> Path:
+    """The running app's project folder: where camera_setup.json lives."""
+    path = _LIVE.setup_path or _fallback_setup_path()
+    return Path(path).parent
+
+
+def _preset_store() -> Any:
+    from council_core import camera_presets
+
+    return camera_presets.PresetStore(
+        camera_presets.presets_path(_project_dir()))
+
+
+def _identity() -> Any:
+    from council_core import camera_presets
+
+    if _LIVE.info is None:
+        raise RuntimeError("connect the camera first — presets are kept per "
+                           "camera")
+    return camera_presets.Identity.of(_LIVE.info)
+
+
+def list_presets() -> Dict[str, Any]:
+    """This camera's presets, for a list: `presets` is the names (what a
+    listbox shows and hands back), `rows` one descriptive line each,
+    `details` everything (settings, area in sensor pixels, dates, whether
+    it was saved on another unit of the same model). A damaged presets file
+    is said in the summary and left untouched.
+
+    Keys: presets, rows, details, problems, file, summary
+    """
+    from council_core import camera_presets
+
+    if _LIVE.info is None:
+        return {"presets": [], "rows": [], "details": [], "problems": [],
+                "file": "", "summary": "Connect a camera to see its presets."}
+    store = _preset_store()
+    camera = _identity()
+    try:
+        listed = store.presets(camera)
+    except camera_presets.PresetFileError as exc:
+        return {"presets": [], "rows": [], "details": [], "problems": [],
+                "file": str(store.path),
+                "summary": (f"Presets: {exc}. It is left exactly as it is; "
+                            f"saving a preset moves it aside and starts a "
+                            f"new one.")}
+    borrowed = sum(1 for p in listed if not p.own)
+    summary = (f"{len(listed)} preset{'s' if len(listed) != 1 else ''} for "
+               f"{camera.label}")
+    if borrowed:
+        summary += f" ({borrowed} saved on another {camera.model})"
+    if store.problems:
+        summary += f"; {len(store.problems)} unreadable, skipped"
+    return {"presets": [p.name for p in listed],
+            "rows": [p.line() for p in listed],
+            "details": [p.as_dict() for p in listed],
+            "problems": list(store.problems), "file": str(store.path),
+            "summary": summary + "."}
+
+
+def save_preset(name: Any, include_roi: Any = True,
+                note: Any = "") -> Dict[str, Any]:
+    """Save the camera as it is now — every setting worth saving and, with
+    `include_roi`, its area in sensor pixels — as preset `name` of this
+    camera, in this project. A preset of the same name is replaced.
+
+    Keys: name, presets, rows, summary
+    """
+    from council_core import camera_presets
+
+    device = _require_device()
+    _refuse_while_busy("save a preset")
+    camera = _identity()
+    with_area = _truthy(include_roi)
+    try:
+        settings, roi = camera_presets.capture(device, with_area)
+        preset, replaced, moved = _preset_store().save(
+            camera, _picked(name), settings, roi, note=str(note or ""),
+            repair=True)
+    except camera_presets.PresetError as exc:
+        raise RuntimeError(str(exc)) from exc
+    said = (f"{'Replaced' if replaced else 'Saved'} preset {preset.name!r}: "
+            f"{len(settings)} settings")
+    said += (f" and the camera's area {_area_text(roi)}." if roi is not None
+             else ", area left as it is when applied.")
+    if moved is not None:
+        said += (f" The presets file was damaged: it was kept as "
+                 f"{moved.name} and a new one started.")
+    listed = list_presets()
+    return {"name": preset.name, "presets": listed["presets"],
+            "rows": listed["rows"], "summary": said}
+
+
+def apply_preset(name: Any) -> Dict[str, Any]:
+    """Put the camera back as preset `name` has it: its settings in a safe
+    order, then its area, through the camera's own ROI. Accepts a listbox
+    selection. Refused while capturing; a change the stream is in the way of
+    stops and restarts the live view (on a worker — see _Job).
+
+    Keys: applied, area, crop, ok, summary, pending
+    """
+    from council_core import camera_presets
+
+    _require_device()
+    chosen = _picked(name)
+    if not chosen:
+        raise RuntimeError("choose a preset in the list first")
+    _refuse_while_capturing("applying a preset")
+    _refuse_while_busy("apply a preset")
+    try:
+        preset = _preset_store().get(_identity(), chosen)
+    except camera_presets.PresetError as exc:
+        raise RuntimeError(str(exc)) from exc
+    return _apply_set(preset.settings, preset.roi,
+                      f"Applying preset {preset.name!r}", "preset",
+                      preset.name)
+
+
+def delete_preset(name: Any) -> Dict[str, Any]:
+    """Delete one of this camera's presets. Accepts a listbox selection.
+
+    Keys: presets, rows, summary
+    """
+    from council_core import camera_presets
+
+    chosen = _picked(name)
+    if not chosen:
+        raise RuntimeError("choose a preset in the list first")
+    try:
+        gone = _preset_store().delete(_identity(), chosen)
+    except camera_presets.PresetError as exc:
+        raise RuntimeError(str(exc)) from exc
+    listed = list_presets()
+    return {"presets": listed["presets"], "rows": listed["rows"],
+            "summary": f"Deleted preset {gone.name!r}."}
+
+
+def rename_preset(old: Any, new: Any) -> Dict[str, Any]:
+    """Rename one of this camera's presets. `old` accepts a listbox
+    selection.
+
+    Keys: name, presets, rows, summary
+    """
+    from council_core import camera_presets
+
+    chosen = _picked(old)
+    if not chosen:
+        raise RuntimeError("choose a preset in the list first")
+    try:
+        renamed = _preset_store().rename(_identity(), chosen, _picked(new))
+    except camera_presets.PresetError as exc:
+        raise RuntimeError(str(exc)) from exc
+    listed = list_presets()
+    return {"name": renamed.name, "presets": listed["presets"],
+            "rows": listed["rows"],
+            "summary": f"Renamed {chosen!r} to {renamed.name!r}."}
+
+
+def _truthy(value: Any) -> bool:
+    """A checkbox port's value, or text from a box."""
+    if isinstance(value, bool):
+        return value
+    return str(value if value is not None else "").strip().lower() not in (
+        "", "0", "false", "no", "off")
 
 
 # ======================================================================

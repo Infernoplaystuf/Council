@@ -1330,8 +1330,7 @@
         ],
         "module": "frame_camera",
         "outputs": {
-          "capture_status": "summary",
-          "roi": "area"
+          "capture_status": "summary"
         }
       },
       "w": 112,
@@ -1477,7 +1476,7 @@
         "module": "frame_camera",
         "outputs": {
           "capture_status": "summary",
-          "roi": "area"
+          "roi": "crop"
         }
       },
       "w": 296,
@@ -1507,7 +1506,7 @@
         "module": "frame_camera",
         "outputs": {
           "capture_status": "summary",
-          "roi": "area"
+          "roi": "crop"
         }
       },
       "w": 296,
