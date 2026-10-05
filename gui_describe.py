@@ -857,6 +857,98 @@ def select_examples(text: str, *, mode: str = "pixel",
     return out
 
 
+# ============================================================
+# Requested widgets — what the description names outright
+# ============================================================
+
+#: (what the user asked for, the words that name it, the kinds that count).
+#: ORDER MATTERS: each match is blanked out of the text before the later,
+#: more general patterns run, so "radio buttons" and "Check Button" do not
+#: also demand a button, nor "multi-line text box" a single-line entry.
+#: Only wording that names ONE kind of widget is here, and a phrase that
+#: two widgets can honestly answer lists both: a requirement read wrongly
+#: would rank a right design below a wrong one and spend a repair round on
+#: it. Vague words — "area", "field", "panel", "display" on their own —
+#: are deliberately left out.
+_REQUEST_WORDS: Tuple[Tuple[str, str, Tuple[str, ...]], ...] = (
+    ("radio buttons", r"radio\s?-?(?:buttons?|options?)", ("radiobutton",)),
+    ("a checkbox", r"check\s?-?(?:box(?:es)?|buttons?)|tick\s?-?box(?:es)?",
+     ("checkbutton",)),
+    ("a dropdown", r"drop\s?-?\s?downs?|combo\s?-?box(?:es)?", ("combobox",)),
+    ("a spin box", r"spin\s?-?box(?:es)?|spinners?", ("spinbox",)),
+    ("a progress bar", r"progress\s?-?bars?", ("progressbar",)),
+    ("a status bar", r"status\s?-?bars?", ("status_bar",)),
+    ("a menu bar", r"menu\s?-?bars?", ("menubar",)),
+    ("a toolbar", r"tool\s?-?bars?", ("toolbar", "button")),
+    ("a slider", r"sliders?", ("scale", "scrubber")),
+    ("tabs", r"tabs?|tabbed", ("notebook",)),
+    ("a table", r"tables?|tree\s?-?views?", ("treeview",)),
+    ("a list", r"list\s?-?box(?:es)?|list\s+of", ("listbox", "treeview",
+                                                  "combobox")),
+    ("a chart", r"charts?|graphs?|plot\s+(?:area|view|panel|window)s?",
+     ("chart_panel",)),
+    ("an image area",
+     r"image\s+(?:area|view|viewer|preview|panel|display|canvas)s?"
+     r"|live\s+view|camera\s+view|video\s+(?:view|feed|preview)",
+     ("image_canvas",)),
+    ("a log view", r"log\s+(?:view|pane|panel|window|area|output)s?",
+     ("log_pane", "text")),
+    ("a file or folder picker",
+     r"(?:file|folder|directory)\s+(?:picker|chooser|selector)s?",
+     ("file_picker",)),
+    ("a multi-line text box",
+     r"multi\s?-?\s?line(?:\s+\w+)?(?:\s+(?:box|area|field|text\s?box))?",
+     ("text", "log_pane")),
+    ("a text box",
+     r"text\s?-?box(?:es)?|text\s+fields?|input\s+(?:box|field)s?"
+     r"|search\s+box(?:es)?",
+     ("entry", "text", "combobox", "spinbox")),
+    ("a button", r"buttons?", ("button", "toolbar")),
+)
+
+_REQUEST_RES = tuple((what, re.compile(r"\b(?:" + words + r")\b",
+                                       re.IGNORECASE), kinds)
+                     for what, words, kinds in _REQUEST_WORDS)
+
+#: "no status bar", "without a menu bar": named, but NOT wanted.
+_NEGATED = re.compile(r"\b(?:no|not|without)(?:\s+(?:a|an|any|the))?\s*$",
+                      re.IGNORECASE)
+
+
+def requested_widgets(text: Any) -> List[Tuple[str, Tuple[str, ...]]]:
+    """The widgets ``text`` names outright, as (what, kinds that count),
+    in the order of _REQUEST_WORDS, each at most once.
+
+    A word match, like select_examples: dumb, predictable, testable. It is
+    used only to RANK valid designs and to say what a repair round should
+    add — a design is never refused because of it (see _describe)."""
+    s = str(text or "")
+    out: List[Tuple[str, Tuple[str, ...]]] = []
+    for what, rx, kinds in _REQUEST_RES:
+        found = False
+
+        def blank(m: "re.Match[str]") -> str:
+            nonlocal found
+            if not _NEGATED.search(s[max(0, m.start() - 16):m.start()]):
+                found = True
+            return " " * len(m.group(0))
+
+        s = rx.sub(blank, s)
+        if found:
+            out.append((what, kinds))
+    return out
+
+
+def missing_widgets(shapes: Sequence[Shape],
+                    wanted: Sequence[Tuple[str, Tuple[str, ...]]]
+                    ) -> List[str]:
+    """Each requested widget no shape answers, phrased for a person and a
+    model alike: "a progress bar (progressbar)"."""
+    have = {getattr(s, "kind", "") for s in shapes}
+    return [f"{what} ({' or '.join(kinds)})" for what, kinds in wanted
+            if not have.intersection(kinds)]
+
+
 def example_wireframe(canvas_w: int = CANVAS_W, canvas_h: int = CANVAS_H
                       ) -> Optional[Dict[str, Any]]:
     """The DEFAULT worked example (EXAMPLE_NAME), in gui_examples._compact
@@ -2428,6 +2520,9 @@ def _describe(res: DescribeResult, text: Any,
                      f"shorter description may work better")
     schema = reply_schema(prof, canvas_w, canvas_h) if prof.constrained \
         else None
+    # The widgets the description names. Only a real model's profile checks
+    # them: the plain one-call path (every stub, the Tk shell) is unchanged.
+    wanted = requested_widgets(text) if prof.custom else []
 
     best: Optional[Checked] = None
     # A cut-off reply whose complete part passes: kept, and returned if no
@@ -2435,17 +2530,49 @@ def _describe(res: DescribeResult, text: Any,
     # the whole thing, because what was cut off is part of what the user
     # asked for.
     held: Optional[Checked] = None
+    # The valid design that leaves out the fewest requested widgets, and
+    # which. Best-of-N used to take the FIRST valid candidate: phi3.5's
+    # failures were all valid layouts missing a widget the request named,
+    # while another candidate or one repair round would have had it. A
+    # valid design is still never refused for this — it is returned, with
+    # a note, when no complete one arrives.
+    short: Optional[Checked] = None
+    short_gaps: List[str] = []
     seen: Dict[str, int] = {}
     repeats = 0
     calls = 0
+
+    def fallback() -> Optional[Tuple[Checked, List[str]]]:
+        """The design to return when no complete one arrived: the valid
+        one with the fewest gaps, a whole answer winning a tie with a
+        salvaged (cut-off) one."""
+        options = []
+        if short is not None:
+            options.append((len(short_gaps), 0, short, short_gaps))
+        if held is not None:
+            gaps = missing_widgets(held.shapes, wanted)
+            options.append((len(gaps), 1, held, gaps))
+        if not options:
+            return None
+        _n, _o, cand, gaps = min(options, key=lambda o: (o[0], o[1]))
+        return cand, gaps
+
+    def gap_note(gaps: List[str]) -> List[str]:
+        if not gaps:
+            return []
+        return [f"the design leaves out {', '.join(gaps)}, which the "
+                f"description asks for — draw {'it' if len(gaps) == 1 else 'them'}"
+                f" in, or describe it again"]
+
     for round_ in range(1, rounds + 1):
         res.rounds = round_
         tries = max(1, prof.n_best) if round_ == 1 else 1
         for k in range(tries):
             if should_stop is not None and should_stop():
                 res.attempts = calls
-                if held is not None:
-                    _accept(res, held, notes)
+                fb = fallback()
+                if fb is not None:
+                    _accept(res, fb[0], notes + gap_note(fb[1]))
                     return
                 res.errors = ["stopped before the model was asked again"]
                 _fail(res, best, notes, keep_errors=True)
@@ -2456,9 +2583,10 @@ def _describe(res: DescribeResult, text: Any,
                 reply = call_model(model_call, prompt, **opts)
             except Exception as exc:
                 res.attempts = calls + 1
-                if held is not None:
-                    _accept(res, held, notes + [f"the next model call failed:"
-                                                f" {exc!r}"])
+                fb = fallback()
+                if fb is not None:
+                    _accept(res, fb[0], notes + gap_note(fb[1])
+                            + [f"the next model call failed: {exc!r}"])
                     return
                 res.errors = [f"the model call failed: {exc!r}"]
                 _fail(res, best, notes, keep_errors=True)
@@ -2472,10 +2600,24 @@ def _describe(res: DescribeResult, text: Any,
                 cand = Checked(STAGE_NO_JSON, [_no_json_fault(cand.raw)],
                                None, cand.raw)
             if cand.ok:
-                if calls > 1 and prof.n_best > 1 and round_ == 1:
-                    notes.append(f"candidate {k + 1} of {tries} passed")
-                _accept(res, cand, notes)
-                return
+                gaps = missing_widgets(cand.shapes, wanted)
+                if not gaps:
+                    if calls > 1 and prof.n_best > 1 and round_ == 1:
+                        notes.append(f"candidate {k + 1} of {tries} passed")
+                    _accept(res, cand, notes)
+                    return
+                # Ties go to the newer design: a repair round was shown
+                # the older one and asked to add what it lacked.
+                if short is None or len(gaps) <= len(short_gaps):
+                    short, short_gaps = cand, gaps
+                if not more:
+                    break
+                # Ranked as valid (its stage) with the gaps as its faults,
+                # so it outranks every invalid reply and a repair round
+                # starts from it, told exactly what to add.
+                cand = replace(cand, faults=[
+                    f"missing {g}: the description asks for it — add it, "
+                    f"and keep everything else" for g in gaps])
             key = _reply_key(cand)
             if key in seen:
                 repeats += 1
@@ -2500,8 +2642,9 @@ def _describe(res: DescribeResult, text: Any,
                 notes.append(f"a repair prompt is ~{estimate_tokens(prompt)} "
                              f"tokens, over the budget even at its leanest — "
                              f"a shorter description may work better")
-    if held is not None:
-        _accept(res, held, notes)
+    fb = fallback()
+    if fb is not None:
+        _accept(res, fb[0], notes + gap_note(fb[1]))
         return
     res.errors = []
     _fail(res, best, notes, keep_errors=False)

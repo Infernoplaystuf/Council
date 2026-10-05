@@ -758,6 +758,105 @@ def test_a_model_repeating_itself_is_never_asked_identically_again():
     assert gd.REPEAT_NOTE in model.calls[2]["prompt"]
 
 
+# ============================================================
+# The widgets the description names
+# ============================================================
+
+TIMER_TEXT = ("A countdown timer: a spin box for minutes, a progress bar, "
+              "and Start and Reset buttons.")
+TIMER_NO_BAR = col(row(leaf("label", "Minutes"), leaf("spinbox", "Minutes")),
+                   row(leaf("button", "Start"), leaf("button", "Reset")))
+TIMER_FULL = col(row(leaf("label", "Minutes"), leaf("spinbox", "Minutes")),
+                 leaf("progressbar", "Time left"),
+                 row(leaf("button", "Start"), leaf("button", "Reset")))
+
+
+def wanted_kinds(text):
+    return [kinds for _what, kinds in gd.requested_widgets(text)]
+
+
+@pytest.mark.parametrize("text, kinds", [
+    ("a spin box and a progress bar", [("spinbox",), ("progressbar",)]),
+    # the specific phrase is used up, so it does not also demand a button
+    ("three radio buttons", [("radiobutton",)]),
+    ("a 'Debug' Check Button", [("checkbutton",)]),
+    # a multi-line box is not also a single-line entry
+    ("a multi-line Message box", [("text", "log_pane")]),
+    ("a status bar but no menu bar", [("status_bar",)]),
+    ("a form without a status bar", []),
+    ("a login form", []),
+])
+def test_requested_widgets_reads_only_what_is_named(text, kinds):
+    assert wanted_kinds(text) == kinds
+
+
+def test_the_benchmark_descriptions_never_demand_a_widget_they_do_not_want():
+    """Precision over recall: a requirement read wrongly ranks a right
+    design below a wrong one and spends a repair round. Every widget read
+    from a benchmark description must be one its expectations allow."""
+    data = json.loads((ROOT / "tests" / "data" / "llm_bench" /
+                       "gui_cases.json").read_text(encoding="utf-8"))
+    for case in data["cases"]:
+        allowed = set(case["expect"].get("kinds_all", []))
+        for group in case["expect"].get("kinds_any", []):
+            allowed |= set(group)
+        for what, kinds in gd.requested_widgets(case["text"]):
+            assert allowed.intersection(kinds), (case["id"], what)
+
+
+def test_best_of_n_prefers_the_candidate_with_the_named_widgets():
+    """phi3.5's failures were valid layouts missing a widget the request
+    named; best-of-N took the first VALID candidate. The complete one wins."""
+    model = Model(tree_reply(TIMER_NO_BAR), tree_reply(TIMER_FULL))
+    res = gd.describe(TIMER_TEXT, model_call=model, profile=SMALL)
+    assert res.ok, res.errors
+    assert len(model.calls) == 2
+    assert "progressbar" in {s.kind for s in res.shapes}
+    assert any("candidate 2 of 3 passed" in n for n in res.notes)
+
+
+def test_a_repair_round_is_told_which_named_widget_to_add():
+    model = Model(tree_reply(TIMER_NO_BAR), tree_reply(TIMER_NO_BAR),
+                  tree_reply(TIMER_NO_BAR), tree_reply(TIMER_FULL))
+    res = gd.describe(TIMER_TEXT, model_call=model, profile=SMALL)
+    assert res.ok, res.errors
+    assert len(model.calls) == SMALL.n_best + 1
+    repair = model.calls[-1]["prompt"]
+    assert "missing a progress bar (progressbar)" in repair
+    assert "progressbar" in {s.kind for s in res.shapes}
+    assert not any("leaves out" in n for n in res.notes)
+
+
+def test_a_valid_design_is_never_refused_for_a_missing_widget():
+    """No complete design arrives: the valid one is returned, and the note
+    says what it leaves out — never a failure the old code would have
+    accepted."""
+    model = Model(tree_reply(TIMER_NO_BAR))
+    res = gd.describe(TIMER_TEXT, model_call=model, profile=SMALL,
+                      max_attempts=2)
+    assert res.ok and res.shapes
+    assert len(model.calls) == SMALL.n_best + 1
+    assert any("leaves out a progress bar" in n for n in res.notes)
+
+
+def test_the_design_with_fewer_gaps_is_the_one_returned():
+    neither = col(row(leaf("label", "Minutes"), leaf("entry", "Minutes")),
+                  row(leaf("button", "Start"), leaf("button", "Reset")))
+    model = Model(tree_reply(neither), tree_reply(TIMER_NO_BAR))
+    res = gd.describe(TIMER_TEXT, model_call=model,
+                      profile=gd.profile_for(3.8, n_ctx=4096, n_best=2),
+                      max_attempts=1)
+    assert res.ok
+    assert "spinbox" in {s.kind for s in res.shapes}
+
+
+def test_the_plain_path_still_takes_the_first_valid_design():
+    """No profile (stubs, the Tk shell): one call, as before."""
+    model = Model(tree_reply(TIMER_NO_BAR), tree_reply(TIMER_FULL))
+    res = gd.describe(TIMER_TEXT, model_call=model)
+    assert res.ok and len(model.calls) == 1
+
+
 def test_should_stop_ends_it_between_calls():
     asked = []
 
