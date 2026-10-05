@@ -18,11 +18,21 @@ capture carries on underneath. The range keeps growing and your position stays
 where you left it. Drag to the end, or Play until you reach it, and you are
 live again.
 
-BEFORE A CAPTURE: THE LIVE PREVIEW
-Connected, not capturing, and nothing in the folder to review: the picture
-shows what the camera sees, and nothing is saved. `wants_preview` is the whole
-rule; frame_camera starts and stops the camera from it, and this draws what
-arrives. With frames in the folder the slider shows those instead.
+CONNECTED, NOT CAPTURING: STILL LIVE
+Connected and not capturing, the picture shows what the camera sees and
+nothing is saved — whatever the folder holds. The slider then has one more
+position than there are saved frames: its END is live, and dragging back
+reviews a saved frame while the camera keeps streaming (so going back to live
+is instant). Connecting goes live; Stop comes back to live once the run's
+last frames are on disk. Only the raw view turns the live view off.
+`wants_preview` is the whole rule; frame_camera starts and stops the camera
+from it, and this draws what arrives.
+
+THE LIVE FRAME IS NOT COPIED
+An 8-bit frame is handed to the canvas as it is, and a 16-bit one is shifted
+to 8 bits off the UI thread's critical path (council_core.live_display):
+the canvas's own copy cost 9 ms a frame at 5328 x 3040, and a uint16 frame
+used to be shown as its raw bytes.
 
 PNG AND RAW ARE TWO VIEWS OF ONE RUN
 The PNGs are what the camera looked like, one accumulation window each. They
@@ -155,16 +165,20 @@ class DisplayDecoder:
     shows it almost black. Shifting by the bits it actually uses shows it as
     the camera saw it.
 
-    THE SHIFT ONLY EVER GROWS within a folder. Worked out per frame, a dark
+    THE SHIFT ONLY EVER GROWS within a RUN. Worked out per frame, a dark
     frame would get a smaller shift than its neighbours and flash brighter
-    during playback.
+    during playback. Not per folder: one folder can hold a Mono16 run and a
+    Mono10 run (a preset changes the pixel format between them), and the
+    Mono10 frames reviewed with the Mono16 run's shift were 1/64 as bright.
     """
 
     def __init__(self) -> None:
         self.shift = 0
+        self._shifts: dict = {}
 
     def reset(self) -> None:
         self.shift = 0
+        self._shifts = {}
 
     def __call__(self, path: str) -> Any:
         from PIL import Image
@@ -178,7 +192,10 @@ class DisplayDecoder:
 
                 data = np.asarray(im)
                 top = int(data.max()) if data.size else 0
-                self.shift = max(self.shift, max(0, top.bit_length() - 8))
+                run = run_of(path)
+                self.shift = max(self._shifts.get(run, 0),
+                                 max(0, top.bit_length() - 8))
+                self._shifts[run] = self.shift
                 return (data >> self.shift).astype(np.uint8)
             if im.mode == "F":
                 return im.convert("L")
@@ -234,14 +251,21 @@ class CaptureReviewer(QObject):
         self._open_raw = open_raw or _default_open_raw
         self.window_us = int(window_us)
         self.decode = DisplayDecoder()
+        from council_core.live_display import DisplayPrep
+        #: Live frames as the canvas can wrap them, without a copy.
+        self.prep = DisplayPrep()
 
         self.mode = PNG
         self.files: List[str] = []
         self._known: set = set()
         self.root = ""
         self._root_key = ""
-        #: At the end of the slider while capturing: show the camera, not a file.
+        #: At the end of the slider while the camera streams (capturing, or
+        #: the live view): show the camera, not a file.
         self.live = False
+        #: Just back from the raw view: stay on the PNG it landed on rather
+        #: than jumping to live when the live view comes back.
+        self._stay_on_png = False
         self.playing = False
         self.raw: Any = None
         self.raw_file: Optional[Path] = None
@@ -316,9 +340,11 @@ class CaptureReviewer(QObject):
         self._set_range()
         if self.mode == RAW:
             return
-        if keep and keep in self._known:
+        if self.live:
+            index = self._end_index()
+        elif keep and keep in self._known:
             index = self.files.index(keep)
-        elif at_end or self.live:
+        elif at_end:
             index = len(self.files) - 1
         else:
             index = 0
@@ -347,23 +373,44 @@ class CaptureReviewer(QObject):
         if self.mode == PNG:
             self._set_range()
             if self.live:
-                self._slider_to(len(self.files) - 1)
+                self._slider_to(self._end_index())
             elif self._end_after_save:
                 self._slider_to(len(self.files) - 1)
                 self._show_png(len(self.files) - 1)
         self._say()
 
     def _set_range(self) -> None:
-        count = self.raw.count if (self.mode == RAW and self.raw) else len(self.files)
+        if self.mode == RAW and self.raw:
+            count = self.raw.count
+        else:
+            count = len(self.files) + (1 if self._live_slot() else 0)
         self._slider_range(max(0, count - 1))
+
+    def _live_slot(self) -> bool:
+        """The slider has a position of its own for live: the live view runs
+        (not a capture — there the newest saved frame IS live, as before)."""
+        return self.mode == PNG and self._previewing and not self._capturing
+
+    def _end_index(self) -> int:
+        """The slider's last position: live."""
+        if self._live_slot():
+            return len(self.files)
+        return max(0, len(self.files) - 1)
 
     # ==================================================================
     # The capture
     # ==================================================================
     def wants_preview(self) -> bool:
-        """Show the camera live without saving? Only with nothing to review:
-        no frames in the folder, no capture running, not in the raw view."""
-        return self.mode == PNG and not self._capturing and not self.files
+        """Stream the camera without saving? Whenever it is connected and
+        not capturing, in the PNG view — whatever the folder holds. Only
+        the raw view turns it off (nothing to draw it on, and the reader
+        wants the CPU)."""
+        return self.mode == PNG and not self._capturing
+
+    def showing_saved(self) -> bool:
+        """A saved frame (a PNG, or a window of a .raw) is on screen — so a
+        box drawn now is in THAT frame's pixels, not the live picture's."""
+        return self._shown is not None and not self.live
 
     def tick(self, frame: Any = None) -> bool:
         """Called ~30 times a second with the camera's newest frame, or None.
@@ -377,6 +424,7 @@ class CaptureReviewer(QObject):
             # A new run means a new writer, whose list starts empty.
             self._run = run
             self._seen = 0
+        was_capturing = self._capturing
         if capturing and not self._capturing:
             self._began()
         self._capturing = capturing
@@ -384,7 +432,9 @@ class CaptureReviewer(QObject):
             self._take_new()
         if self._growing and not growing:
             self._finished()
-        elif not capturing and self.live:
+        elif was_capturing and not capturing and self.live:
+            # The capture just ended. (Live WITHOUT a capture is the live
+            # view, which is not a stop.)
             self._stopped()
         self._growing = growing
         if self.mode == RAW and self.raw is not None:
@@ -397,21 +447,58 @@ class CaptureReviewer(QObject):
         previewing = bool(getattr(self.feed, "previewing", lambda: False)())
         if previewing != self._previewing:
             self._previewing = previewing
-            if not previewing and self.wants_preview():
-                # The preview ended (camera disconnected, or it failed) with
-                # nothing to review: do not leave its last frame looking live.
-                self._clear_canvas()
+            if previewing:
+                self._go_live()
+            else:
+                self._live_lost()
             self._say()
 
         if self.live and self.mode == PNG and frame is not None:
-            self.canvas.set_array(frame.image)
-            self._shown = None
-            return True
-        if previewing and frame is not None and self.wants_preview():
-            self.canvas.set_array(frame.image)
+            # No copy: see council_core.live_display for why it is safe.
+            fmt = (getattr(frame, "meta", None) or {}).get("format")
+            self.canvas.set_array(self.prep(frame.image, fmt), copy=False)
             self._shown = None
             return True
         return False
+
+    def _go_live(self) -> None:
+        """The live view (re)started: connected, or back after Stop. The
+        slider gains its live end, and goes there — unless the user has just
+        come back from the raw view to a particular PNG."""
+        if self.mode != PNG or self._capturing:
+            return
+        self._set_range()
+        if self._stay_on_png:
+            self._stay_on_png = False
+            return
+        self._stop_playing()
+        self.live = True
+        self._end_after_save = False
+        self._shown = None
+        self._slider_to(self._end_index())
+        self._set_current("")
+
+    def _live_lost(self) -> None:
+        """The live view stopped (Disconnect, the camera failed, or the raw
+        view). Never leave its last frame looking live: show the newest saved
+        frame, or nothing."""
+        if self._capturing:
+            return
+        was_live = self.live
+        self.live = False
+        # The next camera (or the same one reconnected) may use other bits.
+        self.prep.reset()
+        if self.mode != PNG:
+            return
+        self._set_range()
+        if not was_live:
+            return
+        if self.files:
+            last = len(self.files) - 1
+            self._slider_to(last)
+            self._show_png(last)
+        else:
+            self._clear_canvas()
 
     def _clear_canvas(self) -> None:
         self._shown = None
@@ -421,6 +508,10 @@ class CaptureReviewer(QObject):
             pass
 
     def _began(self) -> None:
+        # Capturing from here on: the slider's end becomes the newest SAVED
+        # frame (it is live), not a position of its own.
+        self._capturing = True
+        self._stay_on_png = False
         self._stop_playing()
         self._end_after_save = False
         if self.mode == RAW:
@@ -446,9 +537,10 @@ class CaptureReviewer(QObject):
         self._say()
 
     def _finished(self) -> None:
-        """Everything is on disk. List the folder properly, keeping your place."""
+        """Everything is on disk. List the folder properly, keeping your place
+        — or staying live, when the live view is already back."""
         to_end = self.live or self._end_after_save
-        self.live = False
+        self.live = self.live and self._live_slot()
         self._end_after_save = False
         keep = self._shown[2] if self._shown and self._shown[0] == PNG else None
         if self.mode == PNG:
@@ -478,17 +570,19 @@ class CaptureReviewer(QObject):
         if self._moving:
             return
         self._end_after_save = False            # the user chose a place
+        self._stay_on_png = False
         if self.playing:
             # Playback carries on from where the user put it, rather than
             # snapping back to where the play clock thinks it should be.
             self._play_anchor = (time.monotonic(), int(index))
-        if self.mode == PNG and self._capturing:
-            live = int(index) >= len(self.files) - 1
+        if self.mode == PNG and (self._capturing or self._live_slot()):
+            live = int(index) >= self._end_index()
             if live != self.live:
                 self.live = live
                 if live:
                     self._stop_playing()
                     self._set_current("")
+                    self._shown = None
             if live:
                 self._say()
                 return
@@ -498,14 +592,14 @@ class CaptureReviewer(QObject):
         index = self.scrubber.get()
         if self.mode == RAW:
             self._show_raw(index)
-        else:
+        elif not self.live:
             self._show_png(index)
 
     def _show_png(self, index: int) -> None:
         if not self.files:
             self._set_current("")
-            if not self._previewing:
-                # Nothing to show — unless the preview is about to draw here.
+            if not self.live:
+                # Nothing to show — unless the live view is drawing here.
                 self._clear_canvas()
             self._say()
             return
@@ -584,9 +678,12 @@ class CaptureReviewer(QObject):
             index = self.scrubber.get() + 1
             if index > len(self.files) - 1:
                 self._stop_playing()
-                if self._capturing:
-                    # Caught up with the capture: that is live.
+                if self._capturing or self._live_slot():
+                    # Caught up with the capture, or the end of what was
+                    # saved with the camera live: that is live.
                     self.live = True
+                    self._shown = None
+                    self._slider_to(self._end_index())
                     self._set_current("")
                 self._say()
                 return
@@ -719,6 +816,9 @@ class CaptureReviewer(QObject):
         self._shown = None
         self._slider_to(index)
         self._show_png(index)
+        # The live view comes back now (wants_preview): it adds the live end
+        # to the slider but leaves you on this PNG, the one you came for.
+        self._stay_on_png = True
         return "PNG view"
 
     def _times(self, run: str) -> list:
@@ -807,8 +907,6 @@ class CaptureReviewer(QObject):
             return os.path.basename(self._shown[2])
         if self.live:
             return f"Live · {time.strftime('%H:%M:%S')}"
-        if self._previewing:
-            return f"Preview · {time.strftime('%H:%M:%S')}"
         return "Picture"
 
     def view_text(self) -> str:
@@ -823,15 +921,20 @@ class CaptureReviewer(QObject):
             if not self.raw.done:
                 return f"Raw {at:.2f} s · reading, {total:.1f} s so far{playing}"
             return f"Raw {at:.2f} / {total:.2f} s{playing}"
-        if self.live:
+        if self.live and self._capturing:
             return f"Live · {len(self.files)} saved"
-        if self._previewing and self.wants_preview():
-            return "Preview · not saving"
+        if self.live:
+            held = (f" · drag back for {len(self.files)} saved"
+                    if self.files else "")
+            return f"Live · not saving{held}"
         if not self.files:
             return "No frames yet" if self.root else "Choose a folder"
-        where = f"PNG {self.scrubber.get() + 1} / {len(self.files)}"
+        where = f"PNG {min(self.scrubber.get() + 1, len(self.files))} / " \
+                f"{len(self.files)}"
         if self._capturing:
             where += " · capturing"
+        elif self._live_slot():
+            where += " · live at the end"
         return where + playing
 
     def _say(self) -> None:

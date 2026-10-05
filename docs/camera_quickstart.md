@@ -29,6 +29,18 @@ with every event, each window drawn exactly as the live view drew it, and
 PNG ↔ raw lands on the same moment (to the microsecond). Still unproven:
 enumerating and opening a live USB EVK4, and a real EVK4's EVT3 stream.
 
+**Camera settings and presets.** Basler: verified on the emulator (ranges
+from its nodes, clamping, the camera's own snapping, what is locked while
+grabbing, a preset applied back with its area). EVK4: every facility name,
+method, enum member and range accessor used was checked against the OpenEB
+bindings, and a `.raw` opened as a device lists only what it has — but a
+real EVK4's biases, ERC, anti-flicker and trail filter have **not** been
+written to a sensor yet: the first real test is the first run. The
+**settings window and the preset picker** were driven offscreen in a
+generated Typhon, in two separate processes (save, quit, start again, pick):
+on both simulated cameras, and on the emulator with a real `BaslerDevice`
+(a Gain, the pixel format and the camera's area saved and put back).
+
 ## 1. Get the branch
 
 ```bash
@@ -124,7 +136,9 @@ adding it to a new one as well is harmless — the second call does nothing.)
 
 A project built from an example keeps the example as it was **that day**. A
 Typhon built before the FPS box still says **Frame count**, and has no
-**Settings** button. To bring it up to date without losing your own code:
+**Settings** button; one built before the presets has no preset picker,
+**Save preset** or **Camera settings…** button. To bring it up to date
+without losing your own code:
 
 1. **GUI Designer → Open**, pick your Typhon (`example_typhon` if you used the
    command above).
@@ -240,37 +254,55 @@ Typhon can connect straight away.
 
 1. Pick a **capture folder** with the folder picker at the top left. **Make it
    a folder on this computer**, not a network drive — see below.
-2. **Scan for cameras**, select one, **Connect**. If the folder has no frames
-   in it yet, the picture now shows what the camera sees — the **live
-   preview** — so you can aim, focus and set the area first. **Nothing is
-   saved** during the preview; the line above the picture says
-   `Preview · not saving`.
-3. **Start capture** — frames are written to that folder (and, for an EVK4,
+2. **Scan for cameras**, select one, **Connect**. The picture now shows what
+   the camera sees — the **live view** — so you can aim, focus and set the
+   camera's area first. **Nothing is saved** while it is only live; the line
+   above the picture says `Live · not saving`.
+3. Optionally set the camera up: **Camera settings…** for every setting it
+   has, a box drawn on the picture + **Apply area to camera** for its own
+   ROI — or simply **pick a preset** in the box under the status line. See
+   *Camera settings and presets* and *The bird bath* below.
+4. **Start capture** — frames are written to that folder (and, for an EVK4,
    the `.raw`).
-4. **Stop capture** when done, then copy the run wherever it needs to go.
+5. **Stop capture** when done — the picture goes back to live — then copy the
+   run wherever it needs to go.
 
-### The live preview
+### The live view
 
-The preview runs while a camera is connected, nothing is being captured, and
-the folder has no frames to look at. Choose a folder that already has frames
-and the picture shows those instead (the camera goes quiet, so it does not
-slow playback down); choose an empty folder again and the preview comes back.
-**Stop capture** during the preview does nothing — there is nothing to stop.
-Exposure and gain are applied when you press **Start capture**; the **FPS**
-box applies the moment you change it (below).
+Whenever a camera is connected and nothing is being captured, the picture is
+live — **whatever the folder holds**. The frames already in the folder are
+still there behind it: the slider's **right-hand end is live**, and dragging
+it back shows a saved frame while the camera keeps streaming, so dragging to
+the end again is instant (see *The slider*). **Start capture** records;
+**Stop capture** comes back to live once the run's last frames are on disk,
+and for ten seconds the live line still says how the run went
+(`… · last run: 240 saved, raw 31.4 MB`). Only the **raw view** turns the
+live view off — the camera goes quiet so it does not slow the raw reader
+down — and coming back to PNG brings it back. **Stop capture** while only
+live does nothing — there is nothing to stop. Exposure and gain are applied
+when you press **Start capture**; the **FPS** box applies the moment you
+change it (below).
 
-**An EVK4 streams from the moment the preview first starts until you press
+The live picture costs the window little, measured on a boA5320-size frame
+(5328 x 3040, offscreen): a Mono8 frame takes **1.5 ms** of the window's
+time to show (it was 10.7 ms — the canvas copied every frame, needlessly),
+and a Mono12 frame **9.7 ms** (it was 19.8 ms, *and* the picture was wrong:
+the 16-bit frame was drawn as its raw bytes). With the real 33 ms timer and a
+30 fps camera of that size, a frame reaches the screen in 19 ms (Mono8,
+median; 25 ms Mono12).
+
+**An EVK4 streams from the moment the live view first starts until you press
 Disconnect.** Its stream is never stopped and restarted in between: measured
 against Prophesee's SDK, a restarted EVK4 stream can come back with its
 clock running backwards or 16.8 s ahead, with false events, or not start at
 all — and the Python SDK has no way to reset it. So Start and Stop open and
 close the `.raw` inside the running stream, exactly as Prophesee's own
-recorder does, and a folder with frames only hides the preview. Two things
+recorder does, and the raw view only hides the live view. Two things
 follow:
 
-- a capture started **from the preview** can lack up to about 4 ms of events
-  at the very start of its `.raw` (the SDK starts a file at its next time
-  marker); a capture started straight after **Connect** lacks nothing;
+- a capture started **from the live view** can lack up to about 4 ms of
+  events at the very start of its `.raw` (the SDK starts a file at its next
+  time marker); a capture started straight after **Connect** lacks nothing;
 - if an EVK4 stops sending (unplugged, or it fails), press **Disconnect** and
   **Connect** again — a fresh connection is the only clean restart.
 
@@ -399,6 +431,11 @@ same second get `_2`, `_3` on the name.
 
 ### The slider
 
+- **Connected, not capturing**, the slider has one position more than there
+  are saved frames: its **right-hand end is live** (`Live · not saving ·
+  drag back for 300 saved`). Drag back to look at a saved frame — `PNG 12 /
+  300 · live at the end` — and the camera keeps streaming; Play runs to the
+  end of the saved frames and on into live.
 - **While capturing**, the slider's right-hand end is **live**: the view line
   above the picture says `Live · 240 saved` and the slider grows as frames are
   saved.
@@ -420,22 +457,219 @@ same second get `_2`, `_3` on the name.
 **Mark this frame** and **Predict this frame** use the PNG on screen; while
 live or in the raw view there is no file on screen for them to use.
 
+### Two boxes: the crop box and the camera's ROI
+
+They are different things, in different pixels, and Typhon keeps them apart:
+
+| | The **crop box** (the *Crop box* entry) | The **camera's ROI** (its own area) |
+|---|---|---|
+| Pixels | of the **picture** it was drawn on | of the **sensor** |
+| Shown in | the *Crop box (x, y, w, h)* entry | the line under *Apply area to camera* (`Camera's area: 320, 200, 160, 120 of 640x480, sensor px`) and the settings window |
+| Used by | **Save cropped frames** — cuts saved PNGs | the camera itself: an EVK4 emits events **only inside it**, a Basler **reads out only it** |
+| Changes the recording? | no — the originals are untouched | yes — frames (and the `.raw`) hold only that area |
+| Kept in a preset? | no | yes |
+
+**How the coordinates work.** A box is drawn on the picture, so it is in
+*picture* pixels. The live picture of a camera with an ROI set **is** that
+ROI, so **Apply area to camera** adds the ROI's own origin (the `x, y` of the
+area the frame on screen was taken with) to turn the box into *sensor*
+pixels: on a picture of the area `100, 60, 320, 200`, a box drawn at
+`8, 10, 64, 32` becomes the sensor area `108, 70, 64, 32`. The crop box is
+never converted — **Save cropped frames** cuts the saved PNGs in their own
+pixels. The settings window's area box and a preset's area are always
+sensor pixels; a Basler's are in its binned pixels when binning is on.
+
 ### Cropping to a region and saving it
 
-Draw a box on the picture with **Draw ROI** (or type `x, y, w, h` into the ROI
-box), choose **Save cropped frames to**, and press **Save cropped frames**:
+Draw a box on the picture with **Draw ROI** (or type `x, y, w, h` into the
+**Crop box**), choose **Save cropped frames to**, and press **Save cropped frames**:
 every PNG in the capture folder is cropped to that box and saved there, with
 the originals untouched. It works on the PNGs — during a capture, after it, on
 an EVK4 run as well as a Basler one. It does not crop the `.raw`.
 
-### The area of interest (Basler)
+### The camera's area (both cameras)
 
-Type `x, y, w, h` into the ROI box, or drag a rectangle on the live view, then
-**Apply area to camera**. This sets the camera's **own AOI**, so frames arrive
-at that size and are saved at that size. It is snapped to what the sensor
-accepts, and the status line says so when it had to move. **Full sensor** puts
-it back. (On an EVK4 run, stop the capture first: changing the area restarts
-the camera, which would cut the `.raw` short, so Typhon refuses.)
+Draw a box on the **live** picture (or type it, in the picture's pixels),
+then **Apply area to camera**. This sets the camera's **own** ROI — an EVK4
+then emits events only there (the bird bath, not the whole back yard), a
+Basler reads out only that window — so frames arrive at that size and are
+saved at that size. It is snapped to what the sensor accepts, and the status
+line says so when it had to move. **Full sensor** puts it back.
+
+- **A box drawn on an area is inside that area.** The live picture of a
+  camera with an area set *is* that area, so Typhon adds the area's own
+  origin before telling the camera: draw a smaller box inside the new
+  picture and it lands where you drew it. (Before, it was sent as it was and
+  landed somewhere else on the sensor.)
+- **Draw it on the live picture.** A box drawn on a saved frame is refused —
+  that frame may have been taken with another area. Drag the slider to its
+  end first. A box that runs past the live picture is refused too: it was not
+  drawn on it (usually the camera's own area, in sensor pixels, left in the
+  crop box by an older Typhon's hand-edited Connect or Apply-area handler,
+  which *Update from example* keeps — and warns about). Before, each press
+  moved the area by its own origin again.
+- **An area that is not on the sensor is refused, not moved.** A preset's
+  area, or one typed in sensor pixels, that lies wholly outside this camera's
+  sensor (a hand-edited file, a preset from a camera with a bigger sensor)
+  leaves the camera's area as it is and says so; the preset's settings still
+  apply. Before, it was pulled into the sensor's corner — another part of the
+  scene — and called "snapped". An area that only runs past the edge is still
+  fitted onto the sensor, as before.
+- The crop box is **cleared** when the camera's area changes (the box was in
+  the old picture's pixels), and Connect no longer fills it with the camera's
+  area — that was the sensor's numbers in a box that means picture pixels.
+- The line under the two buttons always says the camera's area **now**, in
+  sensor pixels — whichever window changed it. That includes a Basler's
+  **binning**: its area is in binned pixels, so changing the binning changes
+  the area's numbers; the line, the settings window's area box and the
+  status line say the new ones, and the crop box is cleared. (Checked on the
+  simulated camera only: pylon's emulator ignores binning.)
+- To type the area in sensor pixels instead, use the settings window's
+  **Camera's area** box.
+- **Not while capturing**, on either camera — see *One set-up per run*.
+
+### Camera settings and presets
+
+**Camera settings…** (under the status line) opens a window beside Typhon —
+not a dialog: the live view and any capture carry on underneath. It lists
+every setting the connected camera has; the camera describes them itself,
+with its own ranges, increments and units, so nothing is guessed:
+
+- **EVK4** (through the Metavision HAL, as Metavision Studio shows them): every
+  bias (`bias_diff_on`, `bias_diff_off`, `bias_fo`, `bias_hpf`, `bias_refr`, …,
+  with the allowed and the recommended range the sensor reports), the **event
+  rate controller** (on/off, rate limit), **anti-flicker** (on/off, band pass /
+  band stop, the frequency band, duty cycle, thresholds), the **event trail
+  filter** (on/off, TRAIL / STC_CUT_TRAIL / STC_KEEP_TRAIL, threshold), the
+  **event rate activity filter** where the sensor has one, the picture window
+  (ms per picture), and read-only status: temperature, pixel dead time,
+  serial, sensor, event format. A `.raw` opened as a device has none of the
+  facilities and lists only what it has.
+- **Basler** (from the node map): exposure (and auto), gain (and auto), black
+  level, gamma, digital shift, pixel format, mirror X/Y, binning and its mode,
+  decimation, the frame-rate limit, sensor readout mode, and read-only the
+  frame rate the camera will reach and its temperature — whichever the model
+  has, with the ranges its nodes report.
+
+**The window.** Settings are grouped as the camera groups them (Biases,
+Event rate controller, … / Exposure, Gain, Image, Binning, Frame rate), one
+row each: a slider and a box for a number (the slider is logarithmic for a
+long range such as an exposure of 20 µs … 10 s), a tick box for on/off, a
+list for a choice, plain text for a reading. On the right: the **camera's
+area** in sensor pixels, the **presets**, and **What the last change did**.
+
+- **Changes apply as you make them.** Dragging a slider writes the newest
+  value at most every 60 ms, and always the last one, so the live picture
+  follows the drag; a typed number is written when you press Return or
+  leave the box, never per keystroke.
+- **What the camera took is what is shown.** A value outside the range is
+  clamped before it is sent (pylon refuses rather than clamps), the camera
+  may snap it (an exposure of 5003.7 µs runs as 5004), an EVK4 may refuse a
+  bias — the control shows the camera's value and the row says
+  `The camera made it 5004 (asked 5003.7)` or `NOT changed — …`.
+- A bias outside its **recommended** range says so under its row.
+- A setting another one owns is **greyed out and says why** (`Greyed out
+  while ExposureAuto is Continuous — change that first`). One the stream is
+  in the way of (a Basler's pixel format, mirror, binning) says `Changing
+  this restarts the live view for a moment`, and does exactly that.
+- **↺** on a row puts that setting back **as the camera had it when it was
+  connected**; **Reset all (as connected)** puts them all back (not the
+  area — **Full sensor** is for that). An EVK4 is opened with its sensor's
+  default biases, so for an EVK4 this *is* the camera's default.
+- **Camera defaults** (a Basler, when its node map has `UserSetSelector`
+  "Default" and `UserSetLoad`) loads the camera's **own factory set** —
+  every setting and the area — with the live view stopped for it. The
+  emulator has the nodes but ignores the load, so this button is checked
+  against the node names only; an EVK4 has no such set and shows no button.
+
+**Presets.** A preset is one camera set-up: every setting worth saving **and
+the camera's ROI** (sensor pixels), or — untick *with the camera's area* —
+the settings alone. In the window: type a name and **Save as** (a preset of
+the same name is replaced; it works while capturing, as it only reads the
+camera), pick one and **Apply** (or double-click it), **Rename to the name
+below**, **Delete** (click twice — it asks with the button, not a dialog).
+In Typhon's own window, under the status line:
+
+- the **preset box** lists this camera's presets — **picking one applies
+  it**;
+- type a new name into the same box and press **Save preset** to save the
+  camera as it is now (its settings and its area) under that name. (Return
+  on a name that is not a preset yet only says so — it is not an error.)
+
+Both windows always list the same presets, whichever saved one.
+
+Presets are kept **in the app's project folder**, in `camera_presets.json`
+beside `camera_setup.json` — copy the project and they go with it — per
+camera (model and serial): a camera of the same model that has no preset
+of that name is offered another unit's, marked as such (it can be applied
+here, not renamed or deleted from here). The file is plain JSON, written
+safely (whole, then renamed into place); a damaged one is left exactly as it
+is and named — saving a preset then keeps it as
+`camera_presets.damaged-<time>.json` and starts a new one. A project folder
+nested so deep that the file's path passes Windows' 260 characters says so,
+rather than "No such file or directory".
+
+Applying a preset writes its settings in an order that works (auto modes off
+before the values they own, pixel format and binning before the area, the
+area before the frame-rate limit, a filter's parameters before it is
+switched on), then the area. Settings that cannot change while a Basler
+streams (pixel format, mirror, binning, the area) stop the live view for a
+moment and start it again. A very slow camera (a frame every half second)
+does not freeze the window: after 0.15 s it says `Applying…`, greys itself,
+and the answer arrives in the status line and the window when the change is
+done. An EVK4 sets everything live.
+
+**What it costs the window** (offscreen, this PC; ranges over five runs —
+the PC was busier in some, which moved every number together):
+
+| | UI thread |
+|---|---|
+| picking a preset in Typhon (pixel format + area: the live view restarts) — simulated camera / pylon emulator | 16–34 ms / 16 ms, once |
+| applying a preset that changes the area of a **5328 x 3040** live view | 7–47 ms, once (the stream stops and restarts) |
+| one setting written from a dragged slider (the whole cycle: the camera call and the window's handling) | 0.35–0.6 ms median, 1.4 ms worst; 64 writes in 4 s of dragging |
+| the live view at **5328 x 3040** (Mono8), per tick | 1.9–3.3 ms median, 2.5–4.8 ms p99 — the same with the settings window open and a slider being dragged |
+| pictures drawn a second at 5328 x 3040, window open or not | 26–28.5 |
+
+Before the window stopped re-styling every row on every write, the longest
+stall during a drag was 39 ms; it is now 5.7–9 ms. Single slow ticks of
+26–87 ms still turned up in two of the five runs, with **and** without the
+window open — the live view's own (a 16 MB picture), not the window's.
+
+The first live picture after **Connect** costs about 0.6 s once: the camera
+libraries are imported on the window's thread before the grab thread starts
+(capture.warm_imports), so the two never race for Python's import lock.
+
+### The bird bath
+
+The user's case: an EVK4 looking at a back yard, the camera never moved, and
+only the bird bath matters.
+
+1. **Connect**. The picture is live; nothing is saved.
+2. Draw a box around the bird bath on the live picture (**Draw ROI**), then
+   **Apply area to camera**. The camera now emits events **only there**: the
+   picture becomes that part of the yard, the `.raw` and the PNGs will hold
+   only it, and the line under the buttons says
+   `Camera's area: 512, 300, 160, 120 of 1280x720, sensor px`. Drawn too
+   big? Draw a smaller box on the new picture and apply again — it lands
+   where you drew it.
+3. **Camera settings…** — set the biases (`bias_diff_on` / `bias_diff_off`
+   for how strong a change must be), the trail filter, anti-flicker for a
+   pump or a lamp. The picture shows each change as you make it.
+4. Type `Bird bath` into the preset box and press **Save preset**.
+5. Another day — another run of Typhon, the same project: **Connect**, pick
+   **Bird bath** in the preset box. The biases, filters and the camera's ROI
+   are back; press **Start capture**.
+
+### One set-up per run
+
+While **capturing**, the camera's area, a preset, and any setting the
+stream is in the way of (a Basler's pixel format, mirror, binning) are
+**refused** with `stop the capture before …` — on both cameras. Before, a
+Basler's area change restarted the stream *into the same run*, leaving one
+run with frames of two sizes; an EVK4's `.raw` would change meaning
+halfway. Settings that change live — exposure, gain, an EVK4 bias, the FPS
+box — still apply mid-capture. Saving a preset only reads the camera, so it
+works while capturing too.
 
 ### Reading the status line
 
@@ -478,6 +712,15 @@ with those values **unaltered** (verified lossless).
 | BGRA8, RGB16, YUV, 10/12-bit colour | converted to 8-bit RGB as each frame is saved (extra CPU; 16-bit colour loses its low bits) |
 | anything pylon cannot convert | the capture stops with a message naming the format |
 
+On screen, a 16-bit frame is shifted down by the bits it actually uses, and
+that shift only grows (so a dark frame never flashes brighter than its
+neighbours) — **within one pixel format**. Each frame says the format it was
+taken in, so changing Mono16 → Mono12 → Mono10 in the settings window or with
+a preset starts the shift again; before, the live view kept Mono16's shift and
+showed Mono12 at 1/16 of its brightness (measured on the emulator). Saved
+frames are shifted per run, so a Mono16 run and a Mono10 run in one folder
+each fill the display when reviewed.
+
 The Basler scan shows this for every format the connected camera offers. One known consequence:
 `frame_classes.thumbnail` scales 16-bit input as if it filled the full range,
 so a 12-bit frame reads dark *to the classifier*.
@@ -495,12 +738,19 @@ so a 12-bit frame reads dark *to the classifier*.
 | EVK4: "Metavision SDK installed" fails | Not installed, or installed for a different Python than the app runs under (3.10–3.12 only). |
 | Camera connects, live view stays blank | Check the AOI — **Full sensor** resets it. |
 | The box under Gain says **Frame count**, or there is no **Settings** button | Your Typhon was built from an older example. **GUI Designer → Open → Update from example…** (see *Already have a Typhon?*). |
+| No preset box, **Save preset** or **Camera settings…** under the status line | The same: **Update from example…** brings them; your own handlers are kept. |
+| **Camera settings…** says `Connect a camera first` | The window lists what the camera describes, so it needs a connected camera. It stays open across Disconnect / Connect and fills in again. |
+| Saving a preset says the path is past 260 characters | The project folder is nested too deep for Windows. Move the project somewhere shorter (or enable long paths in Windows). |
 | Which file does what, or which Python is this? | **Settings → Python Scripts**. |
 | `NOT saved (storage too slow)` in the status line | The folder is on a disk (usually a network share) that cannot keep up. Capture to a local folder and copy the run afterwards. |
 | **PNG / Raw** says `Raw opens after Stop` | The `.raw` is still being recorded. Stop the capture first. |
 | **PNG / Raw** says `No raw file for this run` | A Basler run (only event cameras record a `.raw`), or the `.raw` was not copied along with the PNGs. |
 | **PNG / Raw** says the raw view needs the Metavision SDK | Viewing a `.raw` uses Prophesee's SDK; install it on this computer (Camera setup…, EVK4). |
-| "stop the capture before changing the camera's area" | EVK4 only — see *The area of interest*. |
+| "stop the capture before changing the camera's area" (or "… applying a preset") | One run keeps one camera set-up — see *One set-up per run*. Stop, change it, Start again. |
+| "that box is on a saved frame" | **Apply area to camera** uses a box drawn on the live picture. Drag the slider to its end and draw it there. |
+| "the box … runs past the live picture" | The crop box holds something not drawn on this picture — often the camera's own area left there by an older, hand-edited handler (see the Update log's WARNING lines). Draw the box again on the live picture. |
+| "the area … lies outside this camera's … sensor" | A preset's (or a typed) area is not on this sensor at all. The settings applied; the area was left as it is. Draw the area again and save the preset over the old one. |
+| "… — wait for it to finish" | A slow camera is still restarting after a change; the status line says when it is done. |
 
 For an EVK4 the **official installer is the lower-risk route**: it installs the
 USB driver and registers where its plugins live, which removes three of the

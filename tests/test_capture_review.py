@@ -229,15 +229,21 @@ def test_dragging_to_the_end_is_live_again(ui, tmp_path):
 
 
 def test_after_stop_the_slider_covers_every_saved_frame(ui, tmp_path):
+    """...and Stop comes back to live: the slider's end is the camera again,
+    one before it the run's last saved frame."""
     rv = ui._capture_review
     capture_into(ui, tmp_path)
     assert pump_until(lambda: len(rv.files) >= 5)
     frame_camera.stop()
     assert pump_until(lambda: not rv._growing)
+    assert pump_until(lambda: rv.live and frame_camera._LIVE.previewing)
     pump(0.1)
     on_disk = sorted(str(p) for p in tmp_path.glob("*.png"))
     assert sorted(rv.files) == on_disk
-    assert rv.scrubber._hi == len(on_disk) - 1
+    assert rv.scrubber._hi == len(on_disk), "every frame, then live"
+    assert ui.ports.view_status.get().startswith("Live · not saving")
+    drag(rv, len(on_disk) - 1)
+    pump(0.1)
     assert not rv.live
     assert ui.ports.current_frame.get() == os.path.basename(rv.files[-1])
 
@@ -647,34 +653,104 @@ def test_connected_with_an_empty_folder_shows_the_camera_live(ui, tmp_path):
     pump(0.3)
     connect_event_camera()
     canvas = ui.ports.live_view.widget
-    assert pump_until(lambda: canvas._base is not None), "no preview frame"
-    assert ui.ports.view_status.get() == "Preview · not saving"
+    assert pump_until(lambda: canvas._base is not None), "no live frame"
+    assert ui.ports.view_status.get() == "Live · not saving"
     assert ui.ports.current_frame.get() == ""
-    assert ui.ports.capture_status.get().startswith("Preview — not saving")
+    assert ui.ports.capture_status.get().startswith("Live view — not saving")
     pump(0.3)
     assert list(tmp_path.iterdir()) == [], "the preview saved something"
 
 
-def test_a_folder_with_frames_shows_them_not_the_camera(ui, tmp_path):
+def test_a_folder_with_frames_still_shows_the_camera_live(ui, tmp_path):
+    """The user's request: connected means live, whatever the folder holds.
+    The saved frames are behind it on the slider (the DVR rule)."""
+    rv = ui._capture_review
+    saved_run(tmp_path)
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    assert ui.ports.view_status.get().startswith("PNG 1 / 10")
+    connect_event_camera()
+    assert pump_until(lambda: rv.live and frame_camera._LIVE.previewing)
+    assert frame_camera._LIVE.session.running
+    assert rv.scrubber._hi == 10 and rv.scrubber.get() == 10
+    assert ui.ports.view_status.get() == \
+        "Live · not saving · drag back for 10 saved"
+    canvas = ui.ports.live_view.widget
+    assert pump_until(lambda: canvas._base is not None
+                      and canvas._base.width() == 640), "no live frame"
+    assert len(list(tmp_path.glob("*.png"))) == 10, \
+        "the live view saved something"
+
+
+def test_dragging_back_reviews_while_the_camera_stays_live(ui, tmp_path):
+    rv = ui._capture_review
     saved_run(tmp_path)
     ui.ports.capture_folder.set(str(tmp_path))
     pump(0.3)
     connect_event_camera()
-    pump(0.4)
-    assert not frame_camera._LIVE.session.running
-    assert ui.ports.view_status.get().startswith("PNG 1 / 10")
+    assert pump_until(lambda: rv.live)
+    drag(rv, 3)
+    pump(0.1)
+    assert not rv.live and rv.showing_saved()
+    assert ui.ports.current_frame.get() == os.path.basename(rv.files[3])
+    assert ui.ports.view_status.get() == "PNG 4 / 10 · live at the end"
+    assert frame_camera._LIVE.session.running, "reviewing stopped the camera"
+    canvas = ui.ports.live_view.widget
+    shown = canvas._base
+    pump(0.2)
+    assert canvas._base is shown, "a live frame replaced the reviewed one"
+    drag(rv, 10)
+    pump(0.1)
+    assert rv.live and not rv.showing_saved()
+    assert ui.ports.current_frame.get() == ""
 
 
-def test_choosing_an_empty_folder_starts_the_preview(ui, tmp_path):
+def test_playing_to_the_end_of_the_saved_frames_goes_live(ui, tmp_path):
+    rv = ui._capture_review
+    saved_run(tmp_path, count=6)
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    connect_event_camera()
+    assert pump_until(lambda: rv.live)
+    drag(rv, 2)
+    pump(0.05)
+    rv.play_pause()
+    assert pump_until(lambda: rv.live, seconds=3)
+    assert rv.scrubber.get() == 6
+
+
+def test_back_from_the_raw_view_stays_on_its_png_with_live_at_the_end(
+        ui, tmp_path):
+    rv = ui._capture_review
+    saved_run(tmp_path)
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    connect_event_camera()
+    assert pump_until(lambda: rv.live)
+    drag(rv, 4)
+    pump(0.1)
+    with_playback(rv, FakePlayback(20))
+    rv.toggle_view()
+    assert pump_until(lambda: not frame_camera._LIVE.previewing)
+    rv.toggle_view()
+    assert pump_until(lambda: frame_camera._LIVE.previewing)
+    pump(0.1)
+    assert not rv.live and rv.mode == cr.PNG
+    assert rv.scrubber._hi == 10, "the live end came back"
+    assert ui.ports.current_frame.get() != ""
+
+
+def test_choosing_another_folder_keeps_the_live_view(ui, tmp_path):
+    rv = ui._capture_review
     saved_run(tmp_path / "old")
     ui.ports.capture_folder.set(str(tmp_path / "old"))
     pump(0.3)
     connect_event_camera()
-    pump(0.2)
+    assert pump_until(lambda: rv.live)
     (tmp_path / "new").mkdir()
     ui.ports.capture_folder.set(str(tmp_path / "new"))
-    assert pump_until(lambda: frame_camera._LIVE.previewing)
-    assert pump_until(lambda: ui.ports.view_status.get() == "Preview · not saving")
+    assert pump_until(lambda: ui.ports.view_status.get() == "Live · not saving")
+    assert frame_camera._LIVE.previewing and rv.scrubber._hi == 0
 
 
 def test_start_capture_from_the_preview_goes_live_and_saves(ui, tmp_path):
@@ -687,8 +763,10 @@ def test_start_capture_from_the_preview_goes_live_and_saves(ui, tmp_path):
     assert pump_until(lambda: len(rv.files) >= 5)
     assert rv.live and ui.ports.view_status.get().startswith("Live")
     frame_camera.stop()
-    assert pump_until(lambda: not frame_camera._LIVE.session.running), \
-        "the preview came back although the folder now has frames"
+    assert pump_until(lambda: rv.live and frame_camera._LIVE.previewing), \
+        "Stop did not come back to the live view"
+    assert ui.ports.capture_status.get().startswith("Live view — not saving")
+    assert "last run:" in ui.ports.capture_status.get()
 
 
 def test_disconnecting_during_the_preview_clears_the_picture(ui, tmp_path):
@@ -792,3 +870,89 @@ def test_the_raw_view_uses_the_runs_own_window(ui, tmp_path):
     rv._open_raw = opener
     rv.toggle_view()
     assert opened == [5000]
+
+
+# ======================================================================
+# The live picture and the camera's area, inside Typhon
+# ======================================================================
+def connect_frame_camera():
+    rows = frame_camera.list_cameras()["rows"]
+    frame_camera.connect(next(r for r in rows if r.endswith("frame")))
+
+
+def test_a_12_bit_live_frame_is_shown_as_the_camera_saw_it(ui, tmp_path):
+    """Before: a uint16 frame went to a Grayscale8 QImage as raw bytes —
+    the 12-bit value 640 showed as 128 and 2, side by side."""
+    rv = ui._capture_review
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    connect_frame_camera()
+    assert pump_until(lambda: rv.live)
+    frame_camera.set_camera_setting("PixelFormat", "Mono12")
+    canvas = ui.ports.live_view.widget
+    assert pump_until(lambda: rv.prep.shift == 4)
+    pump(0.1)
+    image = canvas._base
+    band = image.height() // 2                     # the +40 band, x16
+    # Many pixels, so the moving bright column cannot decide it; shown as
+    # bytes, they alternate 128 / 2.
+    values = sorted(image.pixelColor(x, band).red() for x in range(300, 341))
+    assert values[len(values) // 2] == 40, values
+    assert values.count(40) >= len(values) - 2, values
+
+
+def test_drawing_on_the_live_view_sets_that_part_of_the_sensor(ui, tmp_path):
+    """The user's flow: draw a box on the live picture, Apply area to
+    camera, then draw a smaller one inside the new picture — each lands
+    where it was drawn, and the crop box is cleared, never filled with the
+    camera's area."""
+    rv = ui._capture_review
+    canvas = ui.ports.live_view.widget
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    connect_frame_camera()
+    assert pump_until(lambda: rv.live and canvas._base is not None)
+    canvas.set_roi((100, 60, 320, 240), notify=True)
+    assert ui.ports.roi.get() == "100, 60, 320, 240"
+    ui.on_btn_apply_area_to_camera()
+    device = frame_camera._LIVE.device
+    assert device.roi().as_tuple() == (100, 60, 320, 240)
+    assert ui.ports.roi.get() == "", "the crop box kept a stale box"
+    assert pump_until(lambda: canvas._base.width() == 320)
+    pump(0.1)
+    canvas.set_roi((8, 10, 64, 32), notify=True)
+    ui.on_btn_apply_area_to_camera()
+    assert device.roi().as_tuple() == (108, 70, 64, 32)
+    ui.on_btn_full_sensor()
+    assert device.roi().as_tuple() == (0, 0, 640, 480)
+
+
+def test_a_lower_bit_depth_after_a_higher_one_is_not_shown_dark(ui):
+    """The live view's shift is per pixel format (Frame.meta["format"]):
+    after Mono16 the same shift made a Mono12 picture 1/16 as bright."""
+    from council_core.cameras import Frame
+
+    rv = ui._capture_review
+    rv.live = True
+    canvas = ui.ports.live_view.widget
+    for fmt, value in (("Mono16", 65280), ("Mono12", 4080)):
+        frame = Frame(np.full((48, 64), value, np.uint16), 1, 0,
+                      {"kind": "frame", "format": fmt})
+        assert rv.tick(frame)
+    assert canvas._base.pixelColor(10, 10).red() == 255
+
+
+def test_saved_runs_of_two_bit_depths_each_fill_the_display(tmp_path):
+    """One folder, a Mono16 run then a Mono10 run (a preset changed the
+    format between them): reviewed with the first run's shift, the second
+    was 1/64 as bright."""
+    from PIL import Image
+
+    Image.fromarray(np.full((8, 8), 65280, np.uint16)).save(
+        tmp_path / "20261005_100000_frame_000001.png")
+    Image.fromarray(np.full((8, 8), 1020, np.uint16)).save(
+        tmp_path / "20261005_110000_frame_000001.png")
+    decode = cr.DisplayDecoder()
+    decode(str(tmp_path / "20261005_100000_frame_000001.png"))
+    shown = decode(str(tmp_path / "20261005_110000_frame_000001.png"))
+    assert int(shown.max()) == 255

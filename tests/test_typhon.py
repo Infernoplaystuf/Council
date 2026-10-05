@@ -110,17 +110,27 @@ def test_typhon_is_v5_in_teal_plus_the_capture_review_controls():
     line above the picture, Play / Pause, PNG / Raw and Pop out, an FPS box
     where v3's unwired "Frame count" was (wired, so it applies as it
     changes), real exposure and gain ranges, and Settings in the top right
-    corner. Nothing else moved."""
+    corner. And Connect / Apply area / Full sensor no longer write the
+    camera's area (sensor pixels) into the crop box (picture pixels): Connect
+    leaves it alone and the area buttons clear it. Then the camera's own
+    set-up: a line saying the camera's area, the preset picker, Save preset
+    and Camera settings (s59-s63), for which the status line moved down a
+    row (s51). Nothing else moved."""
     v5, typhon = gspec("barbie_capture_v5"), gspec("typhon")
     assert typhon["window"]["bg"] == TYPHON_BG
     assert typhon["window"]["fg"] == v5["window"]["fg"]
     assert typhon["window"]["title"] == "Typhon"
     old = {s["id"]: s for s in v5["shapes"]}
     new = {s["id"]: s for s in typhon["shapes"]}
-    assert sorted(set(new) - set(old)) == ["s55", "s56", "s57", "s58"]
+    assert sorted(set(new) - set(old)) == ["s55", "s56", "s57", "s58", "s59",
+                                           "s60", "s61", "s62", "s63"]
     strip = lambda s: {k: v for k, v in s.items() if k != "label"}
     changed = sorted(k for k in old if strip(old[k]) != strip(new[k]))
-    assert changed == ["s04", "s06", "s08", "s09", "s11", "s23", "s46"]
+    assert changed == ["s04", "s06", "s08", "s09", "s11", "s23", "s44",
+                       "s46", "s49", "s50", "s51"]
+    assert "roi" not in new["s44"]["script"]["outputs"]
+    assert new["s49"]["script"]["outputs"]["roi"] == "crop"
+    assert new["s50"]["script"]["outputs"]["roi"] == "crop"
     assert new["s11"]["drives"] == {}, "a generated browser would own the slider"
     assert new["s09"]["port"] == {"name": "view_status"}
     assert new["s55"]["script"]["function"] == "play_pause"
@@ -191,6 +201,65 @@ def test_settings_is_drawn_in_the_top_right_of_the_generated_window(
                  if b.text() == "Start capture")
     assert start.geometry().y() > 900
     assert hasattr(ui, "on_btn_settings")
+
+
+def overlapping(shapes):
+    """Pairs of shapes that overlap, by id."""
+    def overlaps(a, b):
+        return not (a["x"] >= b["x"] + b["w"] or b["x"] >= a["x"] + a["w"]
+                    or a["y"] >= b["y"] + b["h"] or b["y"] >= a["y"] + a["h"])
+    items = list(shapes.values())
+    return [(a["id"], b["id"]) for i, a in enumerate(items)
+            for b in items[i + 1:] if overlaps(a, b)]
+
+
+def test_the_camera_set_up_controls_sit_under_the_area_buttons():
+    """The camera's area line, the preset picker, Save preset and Camera
+    settings: in the middle column under Apply area / Full sensor, on the
+    Start / Stop row, inside the canvas, overlapping nothing."""
+    doc = gspec("typhon")
+    shapes = {s["id"]: s for s in doc["shapes"]}
+    assert (doc["canvas"]["w"], doc["canvas"]["h"]) == (1504, 1016)
+    assert overlapping(shapes) == []
+    middle = shapes["s10"]                       # the picture's column
+    for sid in ("s59", "s51", "s60", "s61", "s62", "s63"):
+        s = shapes[sid]
+        assert middle["x"] <= s["x"] and \
+            s["x"] + s["w"] <= middle["x"] + middle["w"], sid
+        assert s["y"] > shapes["s49"]["y"], sid
+        assert s["y"] + s["h"] <= doc["canvas"]["h"] - 16, sid
+    assert shapes["s61"]["y"] == shapes["s46"]["y"], "on the Start row"
+    row = [shapes[k] for k in ("s61", "s62", "s63")]
+    for left, right in zip(row, row[1:]):
+        assert left["x"] + left["w"] < right["x"]
+
+
+def test_the_preset_picker_and_settings_are_linked():
+    shapes = {s["id"]: s for s in gspec("typhon")["shapes"]}
+    picker = shapes["s61"]
+    assert picker["kind"] == "combobox" and picker["port"] == {
+        "name": "preset"}
+    assert picker["props"]["readonly"] is False, "type a name to save one"
+    assert picker["script"] == {"function": "pick_preset",
+                                "inputs": ["preset"],
+                                "module": "frame_camera",
+                                "outputs": {"capture_status": "summary"}}
+    assert shapes["s62"]["script"]["function"] == "save_preset"
+    assert shapes["s62"]["script"]["inputs"] == ["preset"]
+    assert shapes["s63"]["script"]["function"] == "camera_settings"
+    assert shapes["s59"]["port"] == {"name": "camera_area"}
+    # The two boxes are named apart in the window too.
+    assert shapes["s17"]["label"].startswith("Crop box")
+    assert "ROI" in shapes["s48"]["label"] and "area" in shapes["s48"][
+        "label"]
+    # Every port a link reads or writes exists.
+    ports = {s["port"].get("name") for s in shapes.values() if s["port"]}
+    for s in shapes.values():
+        link = s.get("script") or {}
+        if link.get("module") != "frame_camera":
+            continue
+        assert set(link.get("inputs", [])) <= ports, s["id"]
+        assert set(link.get("outputs", {})) <= ports, s["id"]
 
 
 def test_the_review_controls_fit_beside_the_slider():
@@ -382,6 +451,86 @@ def test_first_run_fills_the_camera_panel(qapp, typhon_dir, monkeypatch,
 
 
 
+# ======================================================================
+# The camera's own set-up: area, settings, presets — in the generated app
+# ======================================================================
+def _connect(ui, kind):
+    ui.on_btn_scan_for_cameras()
+    rows = ui.ports.cameras.items()
+    ui.ports.cameras.widget.setCurrentRow(
+        next(i for i, r in enumerate(rows) if r.endswith(kind)))
+    ui.on_btn_connect()
+    assert ui.ports.capture_status.get().startswith("Connected"), \
+        ui.ports.capture_status.get()
+
+
+def test_a_preset_saved_in_typhon_is_picked_again_after_a_restart(
+        qapp, tmp_path, forget_generated):
+    """The user's bird bath, end to end through the generated window: the
+    live view runs, a box drawn on it becomes the camera's own area, a
+    setting is changed in the settings window, the set-up is saved under a
+    name typed into the preset box — then the app is closed, opened again,
+    connected again, and picking the name puts the camera back."""
+    pdir = rex.build("typhon", project="birds", vault_dir=tmp_path,
+                     target="qt")
+    ui = construct(pdir)
+    picker = ui._camera_presets
+    assert ui.ports.camera_area.get().startswith("Camera's area: —")
+    _connect(ui, "event")
+    _pump_until(lambda: frame_camera._LIVE.previewing, 2.0)
+    assert "the whole sensor" in ui.ports.camera_area.get()
+    _pump_until(lambda: frame_camera._LIVE.shown_aoi is not None, 2.0)
+
+    ui.ports.roi.set("320, 200, 160, 120")            # drawn on the picture
+    ui.on_btn_apply_area_to_camera()
+    assert ui.ports.roi.get() == "", "the crop box was cleared"
+    assert ui.ports.camera_area.get().startswith(
+        "Camera's area: 320, 200, 160, 120 of 640x480")
+
+    ui.on_btn_camera_settings()
+    window = frame_camera._LIVE.settings_window
+    assert window is not None and not window.isVisible()   # dialogs off
+    window.rows["bias.bias_diff_on"].editor.setValue(40)
+    window.flush_now()
+    assert frame_camera._LIVE.device.state["bias.bias_diff_on"] == 40
+
+    ui.ports.preset.set("Bird bath")                 # typed into the box
+    ui.on_btn_save_preset()
+    assert "Saved preset 'Bird bath'" in ui.ports.capture_status.get()
+    combo = ui.ports.preset.widget
+    assert [combo.itemText(i) for i in range(combo.count())] == ["Bird bath"]
+    assert window.preset_list.count() == 1, "the window lists it too"
+    assert (pdir / "camera_presets.json").is_file(), "kept in the project"
+
+    # Closed and opened again: a new camera object, everything as it came.
+    frame_camera.disconnect()
+    ui.close()
+    ui = construct(pdir)
+    assert ui._camera_presets is not picker
+    _connect(ui, "event")
+    assert frame_camera._LIVE.device.state["bias.bias_diff_on"] == 0
+    combo = ui.ports.preset.widget
+    assert combo.findText("Bird bath") == 0 and combo.currentIndex() == -1
+    combo.setCurrentIndex(0)
+    combo.textActivated.emit("Bird bath")            # the user's pick
+    _pump_until(lambda: frame_camera._LIVE.job is None, 2.0)
+    assert frame_camera.current_area()["area"] == "320, 200, 160, 120"
+    assert frame_camera._LIVE.device.state["bias.bias_diff_on"] == 40
+    assert "Preset 'Bird bath'" in ui.ports.capture_status.get()
+    assert ui.ports.camera_area.get().startswith(
+        "Camera's area: 320, 200, 160, 120")
+
+
+def test_a_new_name_in_the_preset_box_is_a_hint_not_an_error(
+        qapp, typhon_dir, forget_generated, capsys):
+    ui = construct(typhon_dir)
+    _connect(ui, "frame")
+    ui.ports.preset.set("Not saved yet")
+    ui.ports.preset.widget.textActivated.emit("Not saved yet")   # Return
+    assert "Save preset" in ui.ports.capture_status.get()
+    assert "failed" not in capsys.readouterr().err
+
+
 def test_exposure_is_not_capped_at_100_microseconds():
     """v3's spin boxes ran 0..100, so a Basler could never be exposed longer
     than 100 us from the app."""
@@ -407,3 +556,26 @@ def test_the_pop_out_button_opens_a_copy(qapp, typhon_dir, forget_generated,
     assert windows[-1].windowTitle() == "20260924_120000_frame_000001.png"
     for w in windows:
         w.close()
+
+
+def test_start_uses_a_box_only_when_it_was_changed_after_the_preset(
+        qapp, tmp_path, forget_generated):
+    """attach hooks the boxes beside Start: a value typed BEFORE a preset
+    was applied is older than the preset and Start keeps the preset's; one
+    typed after it is the user's latest word and Start applies it."""
+    pdir = rex.build("typhon", project="boxes", vault_dir=tmp_path,
+                     target="qt")
+    ui = construct(pdir)
+    _connect(ui, "frame")
+    state = frame_camera._LIVE.device.state
+    ui.ports.capture_folder.set(str(tmp_path / "runs"))
+    ui.ports.exposure.widget.setValue(5000)              # typed first
+    frame_camera.apply_camera_settings({"ExposureTime": 12000.0})
+    ui.on_btn_start_capture()
+    assert state["ExposureTime"] == 12000.0
+    assert "Kept the camera's own exposure" in ui.ports.capture_status.get()
+    ui.on_btn_stop_capture()
+    ui.ports.exposure.widget.setValue(8000)              # typed after
+    ui.on_btn_start_capture()
+    assert state["ExposureTime"] == 8000.0
+    ui.on_btn_stop_capture()

@@ -325,13 +325,21 @@ def test_future_frames_are_the_size_of_the_area(tmp_path):
     assert Image.open(one).size == (320, 240)
 
 
-def test_setting_an_area_while_running_leaves_it_running(tmp_path):
+def test_the_area_cannot_change_during_a_capture(tmp_path):
+    """Before: a Basler's area change restarted the stream INTO the running
+    capture — one run, frames of two sizes. One run keeps one set-up."""
+    from PIL import Image
+
     connected()
     frame_camera.start(str(tmp_path))
     settle(0.1)
-    frame_camera.set_area("0, 0, 128, 128")
+    with pytest.raises(RuntimeError, match="stop the capture"):
+        frame_camera.set_area("0, 0, 128, 128")
     assert frame_camera._LIVE.session.running, "the capture was left stopped"
+    settle(0.1)
     frame_camera.stop()
+    sizes = {Image.open(p).size for p in tmp_path.glob("*.png")}
+    assert sizes == {(640, 480)}, sizes
 
 
 def test_full_frame_gives_the_sensor_back():
@@ -720,7 +728,8 @@ def test_the_preview_says_it_is_not_saving():
     connected()
     said = []
     ticks(ViewerStub(), said=said)
-    assert said and all(s.startswith("Preview — not saving") for s in said)
+    assert said and all(s.startswith("Live view — not saving")
+                        for s in said)
 
 
 def test_starting_from_the_preview_starts_the_raw_before_the_stream(tmp_path):
@@ -754,8 +763,9 @@ def test_a_refused_start_leaves_the_preview_running(tmp_path):
     assert frame_camera._LIVE.previewing and frame_camera._LIVE.session.running
 
 
-def test_the_preview_stops_when_the_viewer_has_frames_to_show():
-    """A hidden stream would only compete with playback for the CPU."""
+def test_the_live_view_stops_when_the_viewer_does_not_want_it():
+    """The raw view: a hidden stream would only compete with the raw reader
+    for the CPU."""
     connected()
     viewer = ViewerStub()
     ticks(viewer)
@@ -764,14 +774,14 @@ def test_the_preview_stops_when_the_viewer_has_frames_to_show():
     ticks(viewer, seconds=0.2, said=said)
     assert not frame_camera._LIVE.session.running
     assert not frame_camera._LIVE.previewing
-    assert len(said) == 1 and "no frames" in said[0], said
+    assert len(said) == 1 and "raw file" in said[0], said
 
 
 def test_stop_during_the_preview_is_not_a_capture_stop():
     connected()
     ticks(ViewerStub())
     out = frame_camera.stop()
-    assert "live preview" in out["summary"]
+    assert "live view" in out["summary"]
     assert frame_camera._LIVE.session.running, "Stop killed the preview"
 
 
@@ -808,7 +818,7 @@ def test_a_preview_that_cannot_start_is_retried_later_not_every_tick(monkeypatch
     ticks(ViewerStub(), seconds=0.4, said=said)
     assert len(tries) == 1, f"retried {len(tries)} times in 0.4 s"
     assert [s for s in said if "camera is busy" in s] == [
-        "Live preview stopped: CameraError: the camera is busy"], said
+        "Live view stopped: CameraError: the camera is busy"], said
 
 
 def test_a_preview_that_ends_by_itself_is_reported(monkeypatch):
@@ -943,7 +953,7 @@ def test_a_hidden_stream_says_nothing_in_the_status_line_after_one_line():
     frame_camera._manage_preview(True)          # started for a preview once
     said = []
     ticks(viewer, seconds=0.3, said=said)
-    assert len(said) == 1 and "no frames" in said[0], said
+    assert len(said) == 1 and "raw file" in said[0], said
 
 
 def test_a_one_stream_camera_that_dies_is_not_restarted(monkeypatch):
@@ -1218,7 +1228,8 @@ def test_the_preview_line_carries_the_new_rate_too():
     frame_camera.apply_frame_rate(15)
     said = []
     ticks(ViewerStub(), seconds=0.1, said=said)
-    assert any("(set to 15.0)" in s and s.startswith("Preview") for s in said)
+    assert any("(set to 15.0)" in s and s.startswith("Live view")
+               for s in said)
 
 
 def test_an_event_cameras_windows_change_while_streaming(tmp_path):
