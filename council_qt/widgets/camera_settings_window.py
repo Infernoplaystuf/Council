@@ -133,6 +133,16 @@ def _tone(widget: QWidget, kind: str) -> str:
             "dim": "#b0b0b0" if dark else "#5f5f5f"}.get(kind, "")
 
 
+def _colour(label: QLabel, colour: str) -> None:
+    """Set a label's text colour — only when it changes. setStyleSheet
+    re-polishes the widget even for the same sheet, and the window used to
+    do it for every row on every write of a dragged slider."""
+    sheet = f"color: {colour};" if colour else ""
+    if label.property("council_sheet") != sheet:
+        label.setProperty("council_sheet", sheet)
+        label.setStyleSheet(sheet)
+
+
 class Scale:
     """Slider position <-> value.
 
@@ -512,8 +522,7 @@ class SettingRow(QObject):
             if len(notes) > 1:
                 text = " · ".join(n for n, _ in notes)
                 tone = notes[0][1] or notes[1][1]
-            colour = _tone(self.note, tone)
-            self.note.setStyleSheet(f"color: {colour};" if colour else "")
+            _colour(self.note, _tone(self.note, tone))
             self.note.setText(text)
             self.note.setVisible(True)
         else:
@@ -1033,6 +1042,7 @@ class CameraSettingsWindow(QWidget):
             self._write_timer.start()
 
     def _flush(self) -> None:
+        began = time.perf_counter()
         pending, self._pending = self._pending, {}
         for key, value in pending.items():
             row = self.rows.get(key)
@@ -1041,11 +1051,16 @@ class CameraSettingsWindow(QWidget):
                              value)
             if out is not None:
                 self._took_setting(out)
-            elif self.last_error and row is not None                     and key not in self._pending:
+            elif (self.last_error and row is not None
+                  and key not in self._pending):
                 row.restore()
         if self._pending and not self._write_timer.isActive():
             self._write_timer.start()
         self._refresh_timer.start()
+        # The whole cycle on the UI thread: the call, and the window's own
+        # handling of its answer (measured in docs/camera_quickstart.md).
+        self.timings.append(("write cycle",
+                             (time.perf_counter() - began) * 1000.0))
 
     def flush_now(self) -> None:
         """Write what is queued at once (tests, and closing the window)."""
@@ -1168,7 +1183,10 @@ class CameraSettingsWindow(QWidget):
                 self.say(str(out["summary"]))
         if late:
             self._soon()
-        self.apply_state()
+        if late or what != "setting":
+            # One setting changes one row (done in _took_setting); every
+            # other answer can change what is enabled anywhere.
+            self.apply_state()
 
     def _took_setting(self, out: Dict[str, Any]) -> None:
         change = dict(out.get("change") or {})
@@ -1224,8 +1242,7 @@ class CameraSettingsWindow(QWidget):
         self.refresh_area()
 
     def say(self, text: str, tone: str = "") -> None:
-        colour = _tone(self.status, tone) if tone else ""
-        self.status.setStyleSheet(f"color: {colour};" if colour else "")
+        _colour(self.status, _tone(self.status, tone) if tone else "")
         self.status.setText(text)
 
     # ------------------------------------------------------------------
