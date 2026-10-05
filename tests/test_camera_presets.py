@@ -193,6 +193,23 @@ def test_a_failed_write_leaves_the_old_file(store, monkeypatch):
     assert store.path.read_text(encoding="utf-8") == before
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows' 260-character limit")
+def test_a_project_too_deep_for_windows_says_so(tmp_path):
+    """Found by the offscreen proof: a Typhon project 240 characters deep
+    saved no preset, and all it said was "[Errno 2] No such file or
+    directory" — for a folder that existed. Either the save works (long
+    paths enabled on this PC) or it says what is wrong."""
+    deep = tmp_path / ("d" * max(1, 236 - len(str(tmp_path)) - 1))
+    deep.mkdir()
+    store = cp.PresetStore(cp.presets_path(deep))
+    try:
+        store.save(EVK_A, "Bird bath", BIRD_BATH, None)
+    except cp.PresetError as exc:
+        assert "shorter folder" in str(exc) and "260" in str(exc)
+    else:
+        assert store.get(EVK_A, "Bird bath").settings == BIRD_BATH
+
+
 # ======================================================================
 # A preset and a camera
 # ======================================================================

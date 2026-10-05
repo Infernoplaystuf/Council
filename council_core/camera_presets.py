@@ -438,12 +438,19 @@ class PresetStore:
         or loses power straight after a save keeps the save."""
         text = json.dumps(doc, indent=2, ensure_ascii=False,
                           allow_nan=False) + "\n"
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         temp = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
-        with open(temp, "w", encoding="utf-8", newline="\n") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(temp, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            # Said as what it is. A project folder nested deep enough puts
+            # the temp file past Windows' 260-character limit, and all
+            # Python says then is "No such file or directory" for a folder
+            # that plainly exists (measured: a 240-character project path).
+            raise PresetError(_cannot_write(temp, exc)) from exc
         for attempt in range(5):
             try:
                 os.replace(temp, self.path)
@@ -465,6 +472,19 @@ class PresetStore:
             target = self.path.with_name(f"{stem}.damaged-{stamp}_{n}.json")
         os.replace(self.path, target)
         return target
+
+
+#: Windows' classic path limit (MAX_PATH), counting the terminating NUL.
+WINDOWS_MAX_PATH = 260
+
+
+def _cannot_write(path: Path, exc: OSError) -> str:
+    said = f"cannot save the presets file in {path.parent}: {exc.strerror or exc}"
+    if os.name == "nt" and len(str(path.absolute())) >= WINDOWS_MAX_PATH - 1:
+        said += (f" — its path is {len(str(path.absolute()))} characters, "
+                 f"past the {WINDOWS_MAX_PATH} Windows allows; move the "
+                 f"project to a shorter folder")
+    return said
 
 
 def _owner(key: str, entry: Mapping[str, Any]) -> Identity:
