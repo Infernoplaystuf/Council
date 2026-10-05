@@ -1719,6 +1719,14 @@ def camera_settings(parent: Any = None) -> Dict[str, Any]:
             parent = QApplication.activeWindow()
         except Exception:                                 # noqa: BLE001
             parent = None
+    if parent is None and _LIVE.canvas is not None:
+        # The attached app's window, so the settings window closes with it
+        # rather than outliving it (nothing is "active" offscreen, or when
+        # the press came while another program had the focus).
+        try:
+            parent = _LIVE.canvas.window()
+        except Exception:                                 # noqa: BLE001
+            parent = None
     hidden = _dialogs_disabled()
     _LIVE.settings_window = module.open_settings(parent, show=not hidden)
     label = getattr(_LIVE.info, "label", "") or "the camera"

@@ -776,6 +776,10 @@ class CameraSettingsWindow(QWidget):
             f"{label} · {state.get('kind', '')}" if self.connected else
             "No camera connected")
         if not self.connected:
+            # A value still in the throttle belonged to the camera that is
+            # gone; writing it to the next one would be wrong.
+            self._pending.clear()
+            self._write_timer.stop()
             self._clear_form("Connect a camera in the main window — its "
                              "settings come from the camera itself, and "
                              "this window fills in when it is connected.")

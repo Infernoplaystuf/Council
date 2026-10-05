@@ -444,6 +444,35 @@ def test_the_window_empties_on_disconnect_and_fills_on_connect():
     assert "bias.bias_diff_on" in w.rows
 
 
+def test_a_value_still_queued_is_not_written_to_the_next_camera():
+    connect("frame")
+    api = Counting()
+    w = csw.open_settings(show=False, api=api)
+    w.rows["Gain"].editor.setValue(9.0)          # queued, not yet written
+    frame_camera.disconnect()
+    connect("frame", live=False)
+    w.flush_now()
+    assert api.writes == [] and device().state["Gain"] == 0.0
+
+
+def test_the_window_belongs_to_the_apps_window(qapp):
+    """Nothing is active offscreen (or when another program has the focus):
+    the window must still close with the app, not outlive it."""
+    from PySide6.QtWidgets import QWidget
+    app_window = QWidget()
+    canvas = QWidget(app_window)
+    frame_camera._LIVE.canvas = canvas
+    try:
+        connect("frame", live=False)
+        frame_camera.camera_settings()
+        assert frame_camera._LIVE.settings_window.parent() is app_window
+    finally:
+        frame_camera._LIVE.canvas = None
+        csw._HELD.clear()
+        app_window.deleteLater()
+        deleted()
+
+
 def test_a_second_open_reuses_the_window():
     connect("frame")
     assert window() is window()
