@@ -191,11 +191,12 @@ def test_typhon_does_not_fit_the_old_fixed_canvas():
     inside 1100 x 700 (40 of 59 since the Settings button took the top
     right corner; 45 of 64 since the camera's area line, the preset picker,
     Save preset and Camera settings joined the bottom of the middle
+    column; 59 of 79 since the classifier library filled the right
     column), and every one is inside Typhon's own canvas."""
     project = gui_shapes.load_gspec(TYPHON)
     assert (project.canvas.w, project.canvas.h) == (1504, 1016)
-    assert len(project.shapes) == 64
-    assert len(geo.outside(project.shapes, 1100, 700)) == 45
+    assert len(project.shapes) == 79
+    assert len(geo.outside(project.shapes, 1100, 700)) == 59
     assert geo.outside(project.shapes, 1504, 1016) == []
 
 
