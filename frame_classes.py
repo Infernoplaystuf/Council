@@ -248,8 +248,8 @@ change for that:
     classifier_store.json ({"store": "classifiers"}, relative to that file)
     beside the app;
   * export_this_app (or export_classifiers with a filter) writes everything
-    one app or project made into ONE bundle, <label>-classifiers-<stamp>
-    .typhon-classifiers.zip: bundle.json (format "typhon-classifier-bundle",
+    one app or project made into ONE bundle, <label>-<stamp>.typhon-
+    classifiers.zip: bundle.json (format "typhon-classifier-bundle",
     version 1, listing each classifier, its origin and checksums), a
     README.txt, and one complete single-classifier export per classifier;
   * the independent app imports that bundle into its own store with the
@@ -665,18 +665,21 @@ def _write_json(path: Path, obj: Any) -> None:
 _WIN_MAX_PATH = 260
 
 
-def _os_error(exc: OSError) -> str:
-    """An OSError as words, naming the real cause when Windows refused a
-    path for its LENGTH."""
+def _os_error(exc: OSError,
+              fix: str = "keep the classifiers in a shorter folder (see "
+                         "classifier_store), or use a shorter name") -> str:
+    """An OSError as words, naming the real cause — and ``fix`` — when
+    Windows refused a path for its LENGTH."""
     text = str(exc)
     longest = max(len(str(getattr(exc, a, "") or ""))
                   for a in ("filename", "filename2"))
     if os.name == "nt" and longest >= _WIN_MAX_PATH:
         text += (f" — that path is {longest} characters and Windows refuses "
-                 f"{_WIN_MAX_PATH} or more: keep the classifiers in a "
-                 f"shorter folder (see classifier_store), or use a shorter "
-                 f"name")
+                 f"{_WIN_MAX_PATH} or more: {fix}")
     return text
+
+
+_SHORTER_EXPORT = "save it in a shorter folder"
 
 
 def _is_new(d: Path) -> bool:
@@ -2543,7 +2546,8 @@ def export_classifier(name: Any, destination: Any) -> Dict[str, Any]:
     try:
         _atomic_write(out, lambda tmp: Path(tmp).write_bytes(data))
     except OSError as exc:
-        raise RuntimeError(f"cannot write {out}: {_os_error(exc)}")
+        raise RuntimeError(f"cannot write {out}: "
+                           f"{_os_error(exc, _SHORTER_EXPORT)}")
     notes = list(ex["notes"])
     if ex["bad_runs"]:
         notes.append(f"{ex['bad_runs']} unreadable line(s) of its run record "
@@ -2609,7 +2613,7 @@ def export_classifiers(destination: Any, show: Any = "") -> Dict[str, Any]:
              "host": _host(), "made_by": me, "selection": lib["label"],
              "classifiers": entries, "skipped": skipped}
     stamp = time.strftime("%Y%m%d_%H%M%S")
-    out = _export_target(destination, f"{_slug(label)}-classifiers-{stamp}",
+    out = _export_target(destination, f"{_slug(label)}-{stamp}",
                          BUNDLE_SUFFIX, kind="bundle")
 
     def _w(tmp):
@@ -2623,7 +2627,8 @@ def export_classifiers(destination: Any, show: Any = "") -> Dict[str, Any]:
     try:
         _atomic_write(out, _w)
     except OSError as exc:
-        raise RuntimeError(f"cannot write {out}: {_os_error(exc)}")
+        raise RuntimeError(f"cannot write {out}: "
+                           f"{_os_error(exc, _SHORTER_EXPORT)}")
     names = [e["name"] for e in entries]
     tail = ("" if not skipped else
             " Not in it: " + "; ".join(f"{s['name']} ({s['why']})"

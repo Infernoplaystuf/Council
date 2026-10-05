@@ -1051,6 +1051,26 @@ def test_the_export_is_usable_with_nothing_but_numpy_and_scikit_learn(
             fc.predict_frame("frames", str(folder), name)["label"]
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows' 260-character limit")
+def test_a_path_too_long_for_windows_is_named_as_such(vault, trained,
+                                                      tmp_path):
+    """MEASURED: a store 188 characters deep failed its first Train with a
+    bare "No such file or directory" — Windows' word for a path too long."""
+    deep = tmp_path
+    while len(str(deep)) < 225:
+        deep = deep / ("d" * 12)
+    deep.mkdir(parents=True)
+    try:
+        (deep / ("x" * 45)).write_bytes(b"")
+    except OSError:
+        pass
+    else:
+        pytest.skip("long paths are switched on for this PC")
+    with pytest.raises(RuntimeError, match="Windows refuses 260 or more: "
+                                           "save it in a shorter folder"):
+        fc.export_classifier("frames", str(deep))
+
+
 # ============================================================
 # The run record
 # ============================================================
