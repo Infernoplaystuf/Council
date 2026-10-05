@@ -890,3 +890,23 @@ def test_a_real_recording_device_describes_without_inventing(tmp_path):
         assert found["camera.format"].value == "EVT2"
     finally:
         device.close()
+
+
+# ======================================================================
+# Review: an area off the sensor
+# ======================================================================
+def test_an_area_off_the_sensor_is_refused_and_needs_no_stop():
+    """fit_roi pulls ANY area onto the sensor — right for a drag, wrong for
+    a saved one: 5000, 4000, 64, 64 became 576, 416, 64, 64 (measured)."""
+    dev, cam = basler()
+    far = Roi(5000, 4000, 64, 64)
+    dev.start()
+    assert cs.stops_needed(dev, {}, far) == [], "stopped only to refuse it"
+    dev.stop()
+    before = dev.roi()
+    done = cs.apply(dev, {}, far)
+    assert done.roi is None and "outside" in done.roi_error
+    assert not done.ok and dev.roi() == before
+    # Overlapping the edge is still fitted, as before.
+    edge = cs.apply(dev, {}, Roi(1000, 1000, 64, 64))
+    assert edge.roi is not None and not edge.roi_error

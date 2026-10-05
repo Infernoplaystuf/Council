@@ -503,7 +503,18 @@ line says so when it had to move. **Full sensor** puts it back.
   landed somewhere else on the sensor.)
 - **Draw it on the live picture.** A box drawn on a saved frame is refused —
   that frame may have been taken with another area. Drag the slider to its
-  end first.
+  end first. A box that runs past the live picture is refused too: it was not
+  drawn on it (usually the camera's own area, in sensor pixels, left in the
+  crop box by an older Typhon's hand-edited Connect or Apply-area handler,
+  which *Update from example* keeps — and warns about). Before, each press
+  moved the area by its own origin again.
+- **An area that is not on the sensor is refused, not moved.** A preset's
+  area, or one typed in sensor pixels, that lies wholly outside this camera's
+  sensor (a hand-edited file, a preset from a camera with a bigger sensor)
+  leaves the camera's area as it is and says so; the preset's settings still
+  apply. Before, it was pulled into the sensor's corner — another part of the
+  scene — and called "snapped". An area that only runs past the edge is still
+  fitted onto the sensor, as before.
 - The crop box is **cleared** when the camera's area changes (the box was in
   the old picture's pixels), and Connect no longer fills it with the camera's
   area — that was the sensor's numbers in a box that means picture pixels.
@@ -733,6 +744,8 @@ so a 12-bit frame reads dark *to the classifier*.
 | **PNG / Raw** says the raw view needs the Metavision SDK | Viewing a `.raw` uses Prophesee's SDK; install it on this computer (Camera setup…, EVK4). |
 | "stop the capture before changing the camera's area" (or "… applying a preset") | One run keeps one camera set-up — see *One set-up per run*. Stop, change it, Start again. |
 | "that box is on a saved frame" | **Apply area to camera** uses a box drawn on the live picture. Drag the slider to its end and draw it there. |
+| "the box … runs past the live picture" | The crop box holds something not drawn on this picture — often the camera's own area left there by an older, hand-edited handler (see the Update log's WARNING lines). Draw the box again on the live picture. |
+| "the area … lies outside this camera's … sensor" | A preset's (or a typed) area is not on this sensor at all. The settings applied; the area was left as it is. Draw the area again and save the preset over the old one. |
 | "… — wait for it to finish" | A slow camera is still restarting after a change; the status line says when it is done. |
 
 For an EVK4 the **official installer is the lower-risk route**: it installs the

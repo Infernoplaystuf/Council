@@ -65,7 +65,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .cameras import (CameraError, MIN_ACCUMULATE_MS, NeedsStop, Roi, _ask,
-                      _interface, fit_roi)
+                      _interface, fit_roi, off_sensor, on_sensor)
 
 __all__ = ["Setting", "Change", "Applied", "SettingError", "NeedsStop",
            "area_unchanged",
@@ -503,9 +503,19 @@ def stops_needed(device: Any, values: Mapping[str, Any],
                and not by_key[key].read_only
                and not _unchanged(by_key[key], values[key])]
     if (roi is not None and not getattr(device, "area_live", False)
-            and not area_unchanged(device, roi)):
+            and _fits(device, roi) and not area_unchanged(device, roi)):
+        # An area off the sensor is refused, not written (apply): no reason
+        # to stop the stream for it.
         blocked.append("area")
     return blocked
+
+
+def _fits(device: Any, roi: Roi) -> bool:
+    """The area overlaps this camera's sensor (cameras.on_sensor)."""
+    try:
+        return on_sensor(roi, device.limits())
+    except Exception:                                       # noqa: BLE001
+        return True                     # cannot tell: let the camera say
 
 
 def needs_stop(device: Any, values: Mapping[str, Any],
@@ -539,6 +549,11 @@ def apply(device: Any, values: Mapping[str, Any],
     batch = dict(values)
     for key in provider.plan(values.keys(), described, roi is not None):
         if key is None:
+            if not _fits(device, roi):
+                # Written AFTER binning (plan order), so the sensor's size
+                # is in the units the area is in.
+                done.roi_error = off_sensor(roi, device.limits())
+                continue
             try:
                 if (getattr(device, "streaming", False)
                         and area_unchanged(device, roi)):

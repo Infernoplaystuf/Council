@@ -849,3 +849,45 @@ def test_saving_over_a_damaged_entry_says_the_others_are_untouched(tmp_path):
     assert "other cameras' presets are untouched" in out["summary"]
     store = camera_presets.PresetStore(tmp_path / "camera_presets.json")
     assert [p.name for p in store.presets(other)] == ["Keep me"]
+
+
+# -- An area that is not on the sensor, a box that is not on the picture --
+def test_a_presets_area_off_the_sensor_is_refused_not_moved(tmp_path):
+    """Measured before: a hand-edited (or bigger-sensor) preset's area
+    5000, 4000, 64, 64 became 576, 416, 64, 64 — another part of the
+    scene — and the preset said ok, "snapped"."""
+    from council_core import camera_presets
+
+    viewer = live("frame")
+    frame_camera.set_camera_area("100, 60, 320, 240")
+    mine = camera_presets.Identity.of(frame_camera._LIVE.info)
+    (tmp_path / "camera_presets.json").write_text(json.dumps(
+        {"format": 1, "cameras": {mine.key: dict(mine.as_dict(), presets={
+            "Far": {"settings": {"Gain": 2.0},
+                    "roi": [5000, 4000, 64, 64]}})}}), encoding="utf-8")
+    out = frame_camera.apply_preset("Far")
+    assert device().roi().as_tuple() == (100, 60, 320, 240)
+    assert out["ok"] is False and "outside" in out["summary"]
+    assert device().state["Gain"] == 2.0, "the settings still apply"
+    ticks(viewer, 0.1)
+
+
+def test_a_typed_sensor_area_off_the_sensor_is_refused():
+    live("event")
+    with pytest.raises(RuntimeError, match="outside this camera"):
+        frame_camera.set_camera_area("700, 10, 64, 64")
+    assert device().roi().as_tuple() == (0, 0, 640, 480)
+
+
+def test_a_box_past_the_live_picture_is_refused_not_walked():
+    """An older Typhon whose hand-edited Apply-area handler (kept by Update
+    from example) writes the camera's area — sensor pixels — back into the
+    crop box: each press moved the area by its own origin again."""
+    viewer = live("frame")
+    frame_camera.set_area("100, 60, 320, 240")
+    ticks(viewer, 0.2)
+    with pytest.raises(RuntimeError, match="runs past the live picture"):
+        frame_camera.set_area("100, 60, 320, 240")
+    assert device().roi().as_tuple() == (100, 60, 320, 240)
+    out = frame_camera.set_area("0, 0, 320, 240")           # all of it
+    assert out["area"] == "100, 60, 320, 240"

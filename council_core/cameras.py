@@ -234,6 +234,31 @@ def fit_roi(roi: Roi, limits: Limits) -> Roi:
     return Roi(x, y, w, h)
 
 
+def on_sensor(roi: Roi, limits: Limits) -> bool:
+    """Does `roi` overlap the sensor at all?
+
+    fit_roi turns ANY request into an area the sensor accepts — an area
+    that lies wholly off it is pulled to the nearest corner. Right for a
+    mouse drag, which cannot leave the picture; wrong for an area that
+    was TYPED or SAVED (a preset from a camera with a bigger sensor, a
+    hand-edited presets file): measured, a preset's 5000, 4000, 64, 64
+    became 576, 416, 64, 64 on a 640 x 480 sensor — another part of the
+    scene, reported as merely "snapped". Such an area is refused instead.
+    A sensor that does not say its size is given the benefit of the doubt.
+    """
+    if not limits.width or not limits.height:
+        return True
+    return (not roi.empty and roi.x < limits.width
+            and roi.y < limits.height)
+
+
+def off_sensor(roi: Roi, limits: Limits) -> str:
+    """Why `roi` is refused (see on_sensor), for a status line."""
+    area = ", ".join(str(v) for v in roi.as_tuple())
+    return (f"the area {area} lies outside this camera's {limits.width} x "
+            f"{limits.height} sensor — the camera's area was left as it is")
+
+
 def accumulate_events(xs: Sequence[int], ys: Sequence[int],
                       pols: Sequence[int], width: int, height: int,
                       np_mod: Any = None) -> Any:

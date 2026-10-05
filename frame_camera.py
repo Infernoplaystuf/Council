@@ -1438,7 +1438,10 @@ def set_area(area: Any) -> Dict[str, Any]:
     by the origin of the area the frame on screen was taken with
     (Frame.meta["aoi"]). Before, it was sent as it was: after one change of
     area, the next box drawn landed somewhere else on the sensor. A box on a
-    SAVED frame is refused — that frame's area may not be the camera's now.
+    SAVED frame is refused — that frame's area may not be the camera's now —
+    and so is a box that runs past the live picture, which was not drawn on
+    it (the camera's area in sensor pixels, left in the box by an older
+    hand-edited handler, walked across the sensor with each press).
     `set_camera_area` takes sensor pixels as they are.
 
     The request is SNAPPED to what the sensor accepts and the result says
@@ -1463,7 +1466,19 @@ def set_area(area: Any) -> Dict[str, Any]:
             "that box is on a saved frame, whose area may not be the "
             "camera's now — drag the slider to its end (live) and draw the "
             "area on the live picture")
-    x0, y0 = _picture_origin(device)
+    x0, y0, width, height = _picture_area(device)
+    if box[0] + box[2] > width or box[1] + box[3] > height:
+        # NOT A BOX ON THIS PICTURE: one drawn on it always fits inside it.
+        # Typically the camera's own area (sensor pixels) left in the crop
+        # box — by an older project's Connect or Apply-area handler that
+        # was edited by hand, so Update from example kept it. Moved by the
+        # origin anyway, each press walked the area across the sensor
+        # (measured: 100, 60, 320, 240 became 200, 120, 320, 240).
+        raise RuntimeError(
+            f"the box {box[0]}, {box[1]}, {box[2]}, {box[3]} runs past the "
+            f"live picture ({width} x {height}) — draw it on the picture; "
+            f"the camera's own area in sensor pixels is set in Camera "
+            f"settings")
     return _change_area(cameras.Roi(box[0] + x0, box[1] + y0, box[2], box[3]))
 
 
@@ -1508,23 +1523,30 @@ def current_area() -> Dict[str, Any]:
                         f"{limits.height}.")}
 
 
-def _picture_origin(device: Any) -> tuple:
-    """Where the live picture's (0, 0) is on the sensor: the area of the
-    frame on screen, or the camera's area if none has been shown yet."""
+def _picture_area(device: Any) -> tuple:
+    """The live picture on the sensor, (x, y, w, h): its (0, 0) is at x, y
+    and it is w x h pixels — the area of the frame on screen, or the
+    camera's area if none has been shown yet."""
     aoi = _LIVE.shown_aoi
-    if aoi is not None and len(aoi) >= 2:
-        return int(aoi[0]), int(aoi[1])
+    if aoi is not None and len(aoi) >= 4:
+        return tuple(int(v) for v in aoi[:4])
     area = device.roi()
-    return int(area.x), int(area.y)
+    return int(area.x), int(area.y), int(area.w), int(area.h)
 
 
 def _change_area(roi: Any) -> Dict[str, Any]:
     """Keys: area, crop, snapped, summary, pending"""
-    from council_core import camera_settings
+    from council_core import camera_settings, cameras
 
     device = _require_device()
     _refuse_while_capturing("changing the camera's area")
     _refuse_while_busy("change the camera's area")
+    limits = device.limits()
+    if not cameras.on_sensor(roi, limits):
+        # Typed in sensor pixels (the settings window's area box): an area
+        # wholly off the sensor was pulled to its corner and called
+        # "snapped" — another part of the scene.
+        raise RuntimeError(cameras.off_sensor(roi, limits))
     stop = bool(camera_settings.stops_needed(device, {}, roi))
 
     def work() -> Any:
