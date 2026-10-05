@@ -650,7 +650,6 @@ def test_a_recording_opened_as_a_device_lists_only_what_it_has():
 
 
 def test_evk_frames_carry_the_area_they_were_binned_against():
-    raw = type("R", (), {})
     dev, hal = evk()
     dev._roi = Roi(100, 50, 64, 32)
     dev._poll = lambda timeout: (np.array([110]), np.array([60]),

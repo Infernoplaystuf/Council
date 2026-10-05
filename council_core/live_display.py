@@ -35,7 +35,7 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import Any, Optional
+from typing import Any
 
 from .cameras import FramePool, _numpy
 
