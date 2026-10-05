@@ -376,6 +376,118 @@ def test_without_a_camera_the_list_says_so():
 
 
 # ======================================================================
+# The main window's picker: pick to apply, type a name to save
+# ======================================================================
+def test_picking_a_preset_applies_it_and_a_new_name_is_a_hint():
+    """The picker is an editable box, and Return in it fires the same link
+    as a pick — so a name typed to be saved must not be an error dialog."""
+    connected("event")
+    frame_camera.set_area("320, 200, 160, 120")
+    frame_camera.save_preset("Bird bath")
+    frame_camera.full_frame()
+    out = frame_camera.pick_preset("Bird bath")
+    assert out["ok"] and out["area"] == "320, 200, 160, 120"
+    hint = frame_camera.pick_preset("Feeder")
+    assert not hint["ok"] and "Save preset" in hint["summary"]
+    assert hint["area"] == "320, 200, 160, 120", "nothing was changed"
+    assert "Pick a preset" in frame_camera.pick_preset("")["summary"]
+    assert frame_camera.pick_preset("bird BATH")["ok"], "case does not matter"
+
+
+def test_picking_is_refused_while_capturing_like_applying(tmp_path):
+    connected("event")
+    frame_camera.save_preset("Bird bath")
+    frame_camera.start(str(tmp_path / "run"))
+    try:
+        with pytest.raises(RuntimeError, match="stop the capture"):
+            frame_camera.pick_preset("Bird bath")
+    finally:
+        frame_camera.stop()
+
+
+def test_preset_changes_and_the_capture_are_told_to_listeners(tmp_path):
+    """The main window's picker and an open settings window list the same
+    presets whichever of them saved one, and grey out what a capture
+    refuses."""
+    connected("event")
+    heard = []
+    frame_camera.on_camera_change(heard.append)
+    frame_camera.save_preset("Bird bath")
+    frame_camera.rename_preset("Bird bath", "Bath")
+    frame_camera.delete_preset("Bath")
+    frame_camera.start(str(tmp_path / "run"))
+    frame_camera.stop()
+    whats = [h["what"] for h in heard]
+    assert whats == ["presets", "presets", "presets", "capturing", "stopped"]
+    assert heard[0]["presets"] == ["Bird bath"] and heard[0]["name"] == \
+        "Bird bath"
+    assert heard[1]["name"] == "Bath" and heard[2]["presets"] == []
+
+
+# ======================================================================
+# Back to a known state
+# ======================================================================
+def test_reset_puts_a_setting_back_as_it_was_when_connected():
+    connected("event")
+    assert frame_camera.camera_defaults()["values"]["bias.bias_diff_on"] == 0
+    frame_camera.set_camera_setting("bias.bias_diff_on", 70)
+    out = frame_camera.reset_setting("bias.bias_diff_on")
+    assert out["ok"] and out["value"] == 0
+    assert device().state["bias.bias_diff_on"] == 0
+    with pytest.raises(RuntimeError, match="nothing to put back"):
+        frame_camera.reset_setting("status.temperature")
+
+
+def test_reset_all_puts_every_setting_back_and_leaves_the_area():
+    viewer = live("frame")
+    frame_camera.set_camera_setting("Gain", 12)
+    frame_camera.set_camera_setting("PixelFormat", "Mono12")
+    frame_camera.set_area("0, 0, 320, 240")
+    out = frame_camera.reset_camera_settings()
+    assert out["ok"], out["summary"]
+    assert out["summary"].startswith("Settings as connected")
+    assert device().state["Gain"] == 0.0
+    assert device().state["PixelFormat"] == "Mono8"
+    assert device().roi().as_tuple() == (0, 0, 320, 240)
+    ticks(viewer, 0.2)
+    assert frame_camera._LIVE.session.running
+
+
+def test_reset_all_is_refused_while_capturing(tmp_path):
+    connected("frame")
+    frame_camera.start(str(tmp_path / "run"))
+    try:
+        with pytest.raises(RuntimeError, match="stop the capture"):
+            frame_camera.reset_camera_settings()
+        with pytest.raises(RuntimeError, match="stop the capture"):
+            frame_camera.load_camera_defaults()
+    finally:
+        frame_camera.stop()
+
+
+def test_the_cameras_own_defaults_restart_a_frame_cameras_live_view():
+    """A Basler's UserSet "Default" (here, the simulated one) rewrites the
+    area and the pixel format, which the stream is in the way of: the live
+    view stops for it and comes back."""
+    viewer = live("frame")
+    frame_camera.set_camera_setting("Gain", 12)
+    frame_camera.set_area("0, 0, 320, 240")
+    assert frame_camera.camera_defaults()["factory"]
+    out = frame_camera.load_camera_defaults()
+    assert out["ok"] and out["area"] == "0, 0, 640, 480"
+    assert device().state["Gain"] == 0.0
+    ticks(viewer, 0.2)
+    assert frame_camera._LIVE.session.running
+
+
+def test_an_event_camera_has_no_defaults_of_its_own_to_load():
+    connected("event")
+    assert frame_camera.camera_defaults()["factory"] == ""
+    with pytest.raises(RuntimeError, match="no defaults of its own"):
+        frame_camera.load_camera_defaults()
+
+
+# ======================================================================
 # A change that needs the stream stopped does not freeze the window
 # ======================================================================
 def test_a_slow_camera_does_not_hold_the_window(monkeypatch):

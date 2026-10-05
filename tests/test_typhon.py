@@ -112,18 +112,22 @@ def test_typhon_is_v5_in_teal_plus_the_capture_review_controls():
     changes), real exposure and gain ranges, and Settings in the top right
     corner. And Connect / Apply area / Full sensor no longer write the
     camera's area (sensor pixels) into the crop box (picture pixels): Connect
-    leaves it alone and the area buttons clear it. Nothing else moved."""
+    leaves it alone and the area buttons clear it. Then the camera's own
+    set-up: a line saying the camera's area, the preset picker, Save preset
+    and Camera settings (s59-s63), for which the status line moved down a
+    row (s51). Nothing else moved."""
     v5, typhon = gspec("barbie_capture_v5"), gspec("typhon")
     assert typhon["window"]["bg"] == TYPHON_BG
     assert typhon["window"]["fg"] == v5["window"]["fg"]
     assert typhon["window"]["title"] == "Typhon"
     old = {s["id"]: s for s in v5["shapes"]}
     new = {s["id"]: s for s in typhon["shapes"]}
-    assert sorted(set(new) - set(old)) == ["s55", "s56", "s57", "s58"]
+    assert sorted(set(new) - set(old)) == ["s55", "s56", "s57", "s58", "s59",
+                                           "s60", "s61", "s62", "s63"]
     strip = lambda s: {k: v for k, v in s.items() if k != "label"}
     changed = sorted(k for k in old if strip(old[k]) != strip(new[k]))
     assert changed == ["s04", "s06", "s08", "s09", "s11", "s23", "s44",
-                       "s46", "s49", "s50"]
+                       "s46", "s49", "s50", "s51"]
     assert "roi" not in new["s44"]["script"]["outputs"]
     assert new["s49"]["script"]["outputs"]["roi"] == "crop"
     assert new["s50"]["script"]["outputs"]["roi"] == "crop"
@@ -197,6 +201,65 @@ def test_settings_is_drawn_in_the_top_right_of_the_generated_window(
                  if b.text() == "Start capture")
     assert start.geometry().y() > 900
     assert hasattr(ui, "on_btn_settings")
+
+
+def overlapping(shapes):
+    """Pairs of shapes that overlap, by id."""
+    def overlaps(a, b):
+        return not (a["x"] >= b["x"] + b["w"] or b["x"] >= a["x"] + a["w"]
+                    or a["y"] >= b["y"] + b["h"] or b["y"] >= a["y"] + a["h"])
+    items = list(shapes.values())
+    return [(a["id"], b["id"]) for i, a in enumerate(items)
+            for b in items[i + 1:] if overlaps(a, b)]
+
+
+def test_the_camera_set_up_controls_sit_under_the_area_buttons():
+    """The camera's area line, the preset picker, Save preset and Camera
+    settings: in the middle column under Apply area / Full sensor, on the
+    Start / Stop row, inside the canvas, overlapping nothing."""
+    doc = gspec("typhon")
+    shapes = {s["id"]: s for s in doc["shapes"]}
+    assert (doc["canvas"]["w"], doc["canvas"]["h"]) == (1504, 1016)
+    assert overlapping(shapes) == []
+    middle = shapes["s10"]                       # the picture's column
+    for sid in ("s59", "s51", "s60", "s61", "s62", "s63"):
+        s = shapes[sid]
+        assert middle["x"] <= s["x"] and \
+            s["x"] + s["w"] <= middle["x"] + middle["w"], sid
+        assert s["y"] > shapes["s49"]["y"], sid
+        assert s["y"] + s["h"] <= doc["canvas"]["h"] - 16, sid
+    assert shapes["s61"]["y"] == shapes["s46"]["y"], "on the Start row"
+    row = [shapes[k] for k in ("s61", "s62", "s63")]
+    for left, right in zip(row, row[1:]):
+        assert left["x"] + left["w"] < right["x"]
+
+
+def test_the_preset_picker_and_settings_are_linked():
+    shapes = {s["id"]: s for s in gspec("typhon")["shapes"]}
+    picker = shapes["s61"]
+    assert picker["kind"] == "combobox" and picker["port"] == {
+        "name": "preset"}
+    assert picker["props"]["readonly"] is False, "type a name to save one"
+    assert picker["script"] == {"function": "pick_preset",
+                                "inputs": ["preset"],
+                                "module": "frame_camera",
+                                "outputs": {"capture_status": "summary"}}
+    assert shapes["s62"]["script"]["function"] == "save_preset"
+    assert shapes["s62"]["script"]["inputs"] == ["preset"]
+    assert shapes["s63"]["script"]["function"] == "camera_settings"
+    assert shapes["s59"]["port"] == {"name": "camera_area"}
+    # The two boxes are named apart in the window too.
+    assert shapes["s17"]["label"].startswith("Crop box")
+    assert "ROI" in shapes["s48"]["label"] and "area" in shapes["s48"][
+        "label"]
+    # Every port a link reads or writes exists.
+    ports = {s["port"].get("name") for s in shapes.values() if s["port"]}
+    for s in shapes.values():
+        link = s.get("script") or {}
+        if link.get("module") != "frame_camera":
+            continue
+        assert set(link.get("inputs", [])) <= ports, s["id"]
+        assert set(link.get("outputs", {})) <= ports, s["id"]
 
 
 def test_the_review_controls_fit_beside_the_slider():

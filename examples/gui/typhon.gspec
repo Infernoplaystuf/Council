@@ -508,7 +508,7 @@
       "h": 24,
       "id": "s17",
       "kind": "label",
-      "label": "ROI (x, y, w, h)",
+      "label": "Crop box (x, y, w, h)",
       "min_h": 0,
       "min_w": 0,
       "note": "",
@@ -1439,7 +1439,7 @@
       "h": 24,
       "id": "s48",
       "kind": "label",
-      "label": "Area of interest — drag a box on the live view above",
+      "label": "Camera's ROI (its own area) — draw a box on the live view, then Apply",
       "min_h": 0,
       "min_w": 0,
       "note": "",
@@ -1520,7 +1520,7 @@
       "fg": "",
       "font": "",
       "freeform": false,
-      "h": 48,
+      "h": 40,
       "id": "s51",
       "kind": "label",
       "label": "",
@@ -1535,7 +1535,7 @@
       "script": {},
       "w": 600,
       "x": 512,
-      "y": 856,
+      "y": 888,
       "z": 52
     },
     {
@@ -1728,6 +1728,157 @@
       "x": 1376,
       "y": 16,
       "z": 59
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 10",
+      "freeform": false,
+      "h": 24,
+      "id": "s59",
+      "kind": "label",
+      "label": "Camera's area: — (no camera connected)",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "camera_area"
+      },
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 600,
+      "x": 512,
+      "y": 856,
+      "z": 60
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "Arial 10",
+      "freeform": false,
+      "h": 24,
+      "id": "s60",
+      "kind": "label",
+      "label": "Presets (settings + area) — pick one to apply, or type a name and Save",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {
+        "anchor": "w",
+        "text": "",
+        "wraplength": 0
+      },
+      "resize": "auto",
+      "script": {},
+      "w": 600,
+      "x": 512,
+      "y": 936,
+      "z": 61
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s61",
+      "kind": "combobox",
+      "label": "Preset",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {
+        "name": "preset"
+      },
+      "props": {
+        "command": "",
+        "readonly": false,
+        "values": []
+      },
+      "resize": "auto",
+      "script": {
+        "function": "pick_preset",
+        "inputs": [
+          "preset"
+        ],
+        "module": "frame_camera",
+        "outputs": {
+          "capture_status": "summary"
+        }
+      },
+      "w": 296,
+      "x": 512,
+      "y": 960,
+      "z": 62
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s62",
+      "kind": "button",
+      "label": "Save preset",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "save_preset",
+        "inputs": [
+          "preset"
+        ],
+        "module": "frame_camera",
+        "outputs": {
+          "capture_status": "summary"
+        }
+      },
+      "w": 144,
+      "x": 816,
+      "y": 960,
+      "z": 63
+    },
+    {
+      "bg": "",
+      "drives": {},
+      "fg": "",
+      "font": "",
+      "freeform": false,
+      "h": 32,
+      "id": "s63",
+      "kind": "button",
+      "label": "Camera settings…",
+      "min_h": 0,
+      "min_w": 0,
+      "note": "",
+      "port": {},
+      "props": {},
+      "resize": "auto",
+      "script": {
+        "function": "camera_settings",
+        "inputs": [],
+        "module": "frame_camera",
+        "outputs": {
+          "capture_status": "summary"
+        }
+      },
+      "w": 144,
+      "x": 968,
+      "y": 960,
+      "z": 64
     }
   ],
   "window": {
