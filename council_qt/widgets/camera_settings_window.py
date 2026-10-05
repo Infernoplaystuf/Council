@@ -1053,9 +1053,22 @@ class CameraSettingsWindow(QWidget):
             self._write_timer.start()
 
     def _flush(self) -> None:
+        if self.busy:
+            # A change that restarts the stream is still running, and
+            # frame_camera refuses every other change until it is done:
+            # what is queued waits for its answer (`heard` flushes it).
+            return
         began = time.perf_counter()
         pending, self._pending = self._pending, {}
-        for key, value in pending.items():
+        items = list(pending.items())
+        for index, (key, value) in enumerate(items):
+            if self.busy:
+                # The write before this one went to a worker ("pending"):
+                # these wait for its answer rather than being refused and
+                # put back — measured, a gain changed together with the
+                # pixel format was lost that way.
+                self._pending = dict(items[index:], **self._pending)
+                break
             row = self.rows.get(key)
             label = row.setting.get("label", key) if row else key
             out = self._call(f"{label}", self.api.set_camera_setting, key,
@@ -1173,9 +1186,21 @@ class CameraSettingsWindow(QWidget):
             if out.get("summary"):
                 self.say(str(out["summary"]))
             return
+        if what == "pending":
+            # A change made elsewhere (the main window's Apply area, the
+            # preset box) is restarting the stream: grey out and hold
+            # what is queued, as for one made here.
+            self.busy = True
+            self.apply_state()
+            if out.get("summary"):
+                self.say(str(out["summary"]))
+            return
         late = self.busy and what not in ("capturing", "stopped", "presets")
         if late:
             self.busy = False
+            if self._pending and not self._write_timer.isActive():
+                # Held while the stream restarted (_flush): written now.
+                self._write_timer.start()
         if what == "setting":
             self._took_setting(out)
         elif what in ("settings", "preset", "reset"):

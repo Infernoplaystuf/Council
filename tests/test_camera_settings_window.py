@@ -552,3 +552,48 @@ def test_the_picker_stops_listening_with_its_window(qapp):
     combo.deleteLater()
     deleted()
     assert made.heard not in frame_camera._LIVE.listeners
+
+
+# ======================================================================
+# Review: what the adversarial pass found
+# ======================================================================
+def test_a_write_queued_behind_a_restart_is_written_after_it_not_lost():
+    """Two controls changed inside one throttle tick on a slow camera: the
+    pixel format went to a worker ("pending"), and the gain, written
+    straight after it, was refused "wait for it to finish" and put back —
+    the user's gain lost, and the refusal gone from the status line."""
+    connect("frame")
+    frame_camera.set_frame_rate(1)
+    ticks(0.1)
+    w = window()
+    w.rows["PixelFormat"].editor.setCurrentText("Mono12")
+    w._edited("PixelFormat", "Mono12")
+    w.rows["Gain"].editor.setValue(6.0)
+    w.flush_now()
+    assert w.busy
+    deadline = time.monotonic() + 4
+    while (w.busy or w._pending) and time.monotonic() < deadline:
+        ticks(0.05)
+    assert device().state["PixelFormat"] == "Mono12"
+    assert device().state["Gain"] == 6.0, "the queued gain was lost"
+    assert w.rows["Gain"].editor.value() == 6.0
+    assert "wait for it" not in w.status.text()
+
+
+def test_a_change_pending_from_the_main_window_holds_the_windows_writes():
+    """The main window's Apply area went to the worker; the settings
+    window did not know, and every write made meanwhile was refused."""
+    connect("frame")
+    frame_camera.set_frame_rate(1)
+    ticks(0.1)
+    w = window()
+    out = frame_camera.set_area("0, 0, 128, 128")      # the main window
+    assert out["pending"] and w.busy
+    w.rows["Gain"].editor.setValue(4.0)
+    w.flush_now()
+    assert "wait for it" not in w.status.text()
+    deadline = time.monotonic() + 4
+    while (w.busy or w._pending) and time.monotonic() < deadline:
+        ticks(0.05)
+    assert device().state["Gain"] == 4.0
+    assert device().roi().as_tuple() == (0, 0, 128, 128)

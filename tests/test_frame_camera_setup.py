@@ -761,3 +761,50 @@ def test_a_tk_build_says_so_instead_of_dying(tmp_path):
                  if " " in line)
     assert "Qt" in lines["SETTINGS"] and "Qt" in lines["SETUP"]
     assert "ALIVE" in done.stdout
+
+
+class _Port:
+    def __init__(self, value=""):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
+
+
+def test_a_late_area_answer_clears_the_crop_box_as_a_quick_one_does():
+    """On a slow camera Apply area answers "pending" and leaves the crop
+    box alone; the answer came later and the box stayed — over a picture
+    it was not drawn on, so the next Apply moved the area again from
+    there."""
+    viewer = live("frame")
+    viewer.roi = _Port("10, 10, 100, 100")
+    frame_camera.set_frame_rate(1)
+    ticks(viewer, 0.1)
+    out = frame_camera.set_area(viewer.roi.get())
+    assert out["pending"] and out["crop"] == "10, 10, 100, 100"
+    ticks(viewer, 1.6)
+    assert frame_camera._LIVE.job is None
+    assert device().roi().as_tuple() == (8, 10, 100, 100)
+    assert viewer.roi.get() == "", "the box drawn on the old picture stayed"
+
+
+def test_a_late_preset_without_an_area_leaves_the_crop_box():
+    viewer = live("frame")
+    viewer.roi = _Port("10, 10, 100, 100")
+    frame_camera.set_frame_rate(1)
+    ticks(viewer, 0.1)
+    frame_camera.apply_camera_settings({"PixelFormat": "Mono12"})
+    ticks(viewer, 1.6)
+    assert viewer.roi.get() == "10, 10, 100, 100"
+
+
+def test_an_area_set_from_the_settings_window_clears_the_crop_box_too():
+    """The settings window and the preset picker write no port: the crop
+    box drawn on the old picture stayed over the new one."""
+    viewer = live("event")
+    viewer.roi = _Port("10, 10, 100, 100")
+    frame_camera.set_camera_area("64, 64, 128, 128")
+    assert viewer.roi.get() == ""

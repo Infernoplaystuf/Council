@@ -1679,10 +1679,15 @@ def _run_change(label: str, work: Callable[[], Any],
         job.thread.start()
         if job.done.wait(APPLY_WAIT_SECONDS):
             return _finish_job(job, raise_errors=True)
-        return {"summary": f"{label}… the camera is restarting its stream; "
-                           f"the result will show in the status line.",
-                "pending": True, "area": "", "crop": _current_crop(),
-                "snapped": False, "ok": True, "what": "pending"}
+        out = {"summary": f"{label}… the camera is restarting its stream; "
+                          f"the result will show in the status line.",
+               "pending": True, "area": "", "crop": _current_crop(),
+               "snapped": False, "ok": True, "what": "pending"}
+        # Told, so a settings window open beside the window that made the
+        # change greys out and holds its writes until the answer comes,
+        # rather than having each one refused "wait for it to finish".
+        _announce(out)
+        return out
     try:
         result = work()
     except Exception as exc:                              # noqa: BLE001
@@ -1697,8 +1702,27 @@ def _run_change(label: str, work: Callable[[], Any],
             return _run_change(label, work, finish, True)
         raise RuntimeError(_said(exc)) from exc
     out = finish(result)
+    _settle_crop(out)
     _announce(out)
     return out
+
+
+def _settle_crop(out: Dict[str, Any]) -> None:
+    """A change that moved the camera's area clears the crop box ("crop":
+    "") — whoever made it. A link writes "crop" to the box itself, but the
+    settings window, the preset picker and a late ("pending") answer write
+    no port: the box drawn on the old picture stayed over the new one, and
+    the next Apply area moved the camera again from there."""
+    if out.get("crop") != "" or out.get("pending"):
+        return
+    port = getattr(_LIVE.reviewer, "roi", None)
+    if port is None:
+        return
+    try:
+        if str(port.get() or ""):
+            port.set("")
+    except Exception:                                     # noqa: BLE001
+        pass
 
 
 def _finish_job(job: _Job, raise_errors: bool) -> Dict[str, Any]:
@@ -1719,6 +1743,7 @@ def _finish_job(job: _Job, raise_errors: bool) -> Dict[str, Any]:
     out = job.finish(job.result)
     if job.restart_error:
         out["summary"] = f"{out['summary']} {job.restart_error}"
+    _settle_crop(out)
     _announce(out)
     if not raise_errors:
         _tell_status(out["summary"])
@@ -1764,7 +1789,8 @@ def on_camera_change(listener: Callable[[Dict[str, Any]], Any]
     camera made through this module — a setting, a preset, the area — with
     the same dict the function returned, or the late answer of one that was
     still "pending" when it returned; and with {"what": "connected"} /
-    {"what": "disconnected"}. For the settings window, which must show what
+    {"what": "disconnected"}, and {"what": "pending"} when a change goes
+    to the worker (its answer follows). For the settings window, which must show what
     the camera actually took. Returns a function that removes the listener.
     Not script-linkable (it takes a function)."""
     if not callable(listener):
