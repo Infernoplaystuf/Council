@@ -40,6 +40,10 @@ are written through a queue that may skip frames when storage falls behind.
 The raw file is every event the sensor sent. Swapping views keeps your place
 in the run: the raw view opens at the moment the PNG on screen was taken, and
 swapping back lands on the PNG nearest the moment the raw view was showing.
+And it shows the same PICTURE: a run made with the camera's own area has a
+.raw of the whole sensor's geometry and PNGs of the area alone, so the raw
+view is opened with the area the run's camera record names (<run>_camera.json,
+council_core.camera_record); a run from before records is shown whole.
 
 ONE CONTROLLER PER CANVAS
 This owns the canvas, the slider and the ROI box. frame_camera.attach creates
@@ -746,11 +750,18 @@ class CaptureReviewer(QObject):
             return self._note_for("No raw file for this run")
         if self.feed.raw_growing(path):
             return self._note_for("Raw opens after Stop")
-        from council_core import event_playback
+        from council_core import camera_record, event_playback
 
         index = Path(self.root) / f"{run_of_raw(path)}_frames.csv"
         origin = event_playback.raw_origin(index)
         extra = {} if origin is None else {"origin_us": origin}
+        # The run's own area (its camera record): the .raw holds the whole
+        # sensor's geometry and the PNGs the area alone — shown as the PNGs
+        # show it. A run from before records is shown whole, as it was.
+        area = camera_record.area_of(
+            camera_record.read(path.parent, run_of_raw(path)))
+        if area is not None:
+            extra["area"] = area
         # The run's own window: a run captured at 200 fps has 5 ms pictures,
         # and its raw view should show the same.
         self._raw_window = event_playback.run_window_us(index) or self.window_us

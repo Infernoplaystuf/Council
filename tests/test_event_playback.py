@@ -240,6 +240,42 @@ def test_a_missing_file_is_an_error_not_a_hang(tmp_path):
     pb.close()
 
 
+def test_a_runs_area_is_drawn_as_its_pngs_were(tmp_path):
+    """A .raw holds the whole sensor's geometry, events in sensor
+    coordinates; the run's PNGs are its area alone. Given the area (from the
+    run's camera record) each window is the area, every event moved by its
+    origin and anything outside it dropped — what EvkDevice.read drew."""
+    raw = tmp_path / "run_events.raw"
+    raw.write_bytes(b"% end\n")
+    events = batch((12, 9, 1, 0), (29, 23, 0, 5000), (5, 5, 1, 6000),
+                   (31, 9, 1, 7000))
+    pb = ep.RawPlayback(raw, hal=FakeHal([events]), area=(10, 8, 20, 16))
+    assert pb.wait_done(10) and pb.error == ""
+    assert (pb.width, pb.height) == (20, 16) and pb.area == (10, 8, 20, 16)
+    image = pb.frame(0)
+    assert image.shape == (16, 20)
+    assert image[1, 2] == 255 and image[15, 19] == 0
+    assert (image == cameras.EVENT_MID).sum() == 16 * 20 - 2, \
+        "an event outside the area was drawn (wrapped or clipped in)"
+    want = cameras.accumulate_events(
+        events["x"].astype(np.int64) - 10, events["y"].astype(np.int64) - 8,
+        events["p"], 20, 16, np)
+    assert np.array_equal(image, want)
+    pb.close()
+
+
+def test_an_area_not_inside_the_file_shows_the_whole_of_it(tmp_path):
+    raw = tmp_path / "run_events.raw"
+    raw.write_bytes(b"% end\n")
+    pb = ep.RawPlayback(raw, hal=FakeHal([batch((1, 1, 1, 0))]),
+                        area=(60, 0, 20, 16))
+    assert pb.wait_done(10)
+    assert pb.area is None and (pb.width, pb.height) == (W, H)
+    assert "not inside" in pb.area_note
+    assert pb.frame(0)[1, 1] == 255
+    pb.close()
+
+
 def test_no_sdk_is_said_plainly(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "metavision_hal", None)
     with pytest.raises(ep.RawUnavailable, match="Metavision SDK"):
@@ -378,6 +414,42 @@ def test_a_real_recording_plays_back_exactly(tmp_path):
     assert sorted(os.listdir(tmp_path)) == ["rec_events.raw"], \
         "something was written beside the recording"
     os.rename(path, tmp_path / "moved.raw")               # not locked
+
+
+def test_a_real_recording_of_an_area_plays_back_as_the_area(tmp_path):
+    """The real SDK writes the whole sensor's geometry (1280 x 720) into a
+    .raw whatever the camera's area was; given the run's area, the windows
+    are that area exactly as the live view drew it."""
+    hal, stream_mod = _real_sdk()
+    rng = np.random.default_rng(11)
+    n = 5_000
+    x0, y0, w, h = 400, 200, 160, 120
+    events = np.zeros(n, EVENT_DTYPE)
+    events["t"] = np.sort(rng.integers(1_000_000, 1_100_000, n))
+    events["x"] = rng.integers(x0, x0 + w, n)
+    events["y"] = rng.integers(y0, y0 + h, n)
+    events["p"] = rng.integers(0, 2, n)
+    path = tmp_path / "rec_events.raw"
+    writer = stream_mod.RAWEvt2EventFileWriter(1280, 720, str(path))
+    writer.add_cd_events(events)
+    writer.flush()
+    writer.close()
+    del writer
+
+    with ep.open_raw(path, window_us=20_000, area=(x0, y0, w, h)) as pb:
+        assert pb.wait_done(30) and pb.error == ""
+        assert (pb.width, pb.height) == (w, h)
+        rel = events["t"] - events["t"][0]
+        for k in (0, pb.count - 1):
+            inside = events[rel // 20_000 == k]
+            want = cameras.accumulate_events(
+                inside["x"].astype(np.int64) - x0,
+                inside["y"].astype(np.int64) - y0, inside["p"], w, h, np)
+            assert np.array_equal(pb.frame(k), want), k
+    with ep.open_raw(path, window_us=20_000) as whole:
+        assert whole.wait_done(30)
+        assert (whole.width, whole.height) == (1280, 720), \
+            "a run without a record is shown as before"
 
 
 

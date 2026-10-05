@@ -43,6 +43,17 @@ anchoring at the file's first event would put every window up to 4 ms off.
 Without an origin (a run with no CSV) the file is read time-shifted and
 windows start at its first event.
 
+THE CAMERA'S AREA
+A camera with an area of its own (an EVK4's ROI) writes a .raw whose geometry
+is still the WHOLE sensor, with events in sensor coordinates — while the PNGs
+of the same run are the area alone (EvkDevice.read moves each event by the
+area's origin). Opened at the file's geometry, a bird-bath run showed a
+1280 x 720 picture with only the bath active beside 160 x 120 PNGs. Given the
+run's area (`area`, x, y, w, h in sensor pixels, from the run's camera record
+— council_core.camera_record), each window is drawn exactly as the live view
+drew it: w x h, every event moved by the area's origin, anything outside it
+dropped. Without one (a run from before records) the file's geometry is used.
+
 A FILE STILL BEING WRITTEN is readable only up to what has been flushed, and
 the last window may be partial. Callers should open a .raw once it is closed.
 """
@@ -116,11 +127,20 @@ class RawPlayback:
 
     def __init__(self, path: Any, window_us: int = DEFAULT_WINDOW_US,
                  hal: Any = None, np_mod: Any = None,
-                 origin_us: Optional[int] = None):
+                 origin_us: Optional[int] = None,
+                 area: Optional[Tuple[int, int, int, int]] = None):
         self.path = Path(str(path))
         self.window_us = max(1, int(window_us))
         #: The capture's origin on the camera's clock, or None.
         self.origin_us = None if origin_us is None else int(origin_us)
+        #: The run's area on the sensor as asked, (x, y, w, h); see THE
+        #: CAMERA'S AREA. `area` is what is used once the file is open: the
+        #: same, or None when it does not lie inside the file's geometry
+        #: (then the whole of it is shown, and `area_note` says why).
+        self._asked_area = (tuple(int(v) for v in area)
+                            if area is not None else None)
+        self.area: Optional[Tuple[int, int, int, int]] = None
+        self.area_note = ""
         self._hal_mod = hal
         self._np = np_mod or cameras._numpy()
         self.width = 0
@@ -234,6 +254,7 @@ class RawPlayback:
             geometry = device.get_i_geometry()
             self.width = int(geometry.get_width())
             self.height = int(geometry.get_height())
+            self._use_area()
             stream = device.get_i_events_stream()
             decoder = device.get_i_events_stream_decoder()
             cd = device.get_i_event_cd_decoder()
@@ -306,6 +327,22 @@ class RawPlayback:
                 pass
             self.done = True
 
+    def _use_area(self) -> None:
+        """Show the run's area rather than the file's whole geometry, when
+        the area lies inside it (see THE CAMERA'S AREA)."""
+        asked = self._asked_area
+        if asked is None:
+            return
+        x, y, w, h = asked
+        if (x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > self.width
+                or y + h > self.height):
+            self.area_note = (f"the run's area {x}, {y}, {w}, {h} is not "
+                              f"inside this file's {self.width}x"
+                              f"{self.height}; the whole of it is shown")
+            return
+        self.area = asked
+        self.width, self.height = w, h
+
     def _emit(self, events: Any, ks: Any, first: int, stop: int) -> int:
         """Store windows first..stop-1 (empty ones included). Returns stop."""
         np = self._np
@@ -325,7 +362,14 @@ class RawPlayback:
         if not len(chunk):
             self._index.append((self._written, 0))
             return
-        image = cameras.accumulate_events(chunk["x"], chunk["y"], chunk["p"],
+        xs, ys = chunk["x"], chunk["y"]
+        if self.area is not None:
+            # As EvkDevice.read does: int64 first (the SDK's x/y are
+            # unsigned and would wrap), then moved by the area's origin;
+            # accumulate_events drops what falls outside the area.
+            xs = xs.astype(np.int64) - self.area[0]
+            ys = ys.astype(np.int64) - self.area[1]
+        image = cameras.accumulate_events(xs, ys, chunk["p"],
                                           self.width, self.height, np)
         flat = image.reshape(-1)
         changed = np.flatnonzero(flat != cameras.EVENT_MID)
