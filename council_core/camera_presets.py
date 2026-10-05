@@ -33,10 +33,24 @@ temporary file and renamed over the old one, so a crash mid-write leaves the
 old file or the new one, never half of each. Validated on every read: a file
 that is not what this module writes raises PresetFileError and is NEVER
 overwritten by an ordinary save — `save(..., repair=True)` first moves it
-aside to camera_presets.damaged-<time>.json and says where. One bad preset
-inside a good file is skipped (and named in `problems`), not fatal, and is
-kept byte-for-byte when the file is rewritten: this module only rewrites what
-it was asked to change.
+aside to camera_presets.damaged-<time>.json and says where. A file a NEWER
+version wrote is not damaged and is never moved, repair or not. One bad
+preset inside a good file is skipped (and named in `problems`), not fatal,
+and is kept byte-for-byte when the file is rewritten: this module only
+rewrites what it was asked to change.
+
+A PERSON MAY EDIT IT
+Read as UTF-8 with or without a byte-order mark (Notepad's "UTF-8 with BOM"
+is the same JSON). Names are compared as a list shows them — spacing tidied,
+case ignored — so a hand-typed "Bird  bath " is the preset called Bird bath.
+
+TWO APPS, ONE PROJECT
+Every change re-reads the file, changes one entry and writes it back. Two
+Typhon windows on one project (one per camera) doing that at the same moment
+lost each other's presets (measured: one kept 3 of its 40), so a change holds
+an OS lock on a sidecar file, .camera_presets.json.lock, for its read and
+write. The OS drops the lock when the process ends, so a crash never leaves
+the project locked; the empty sidecar itself stays.
 
 NO TOOLKIT, NO DEVICE STOPS HERE
 Applying a preset is camera_settings.apply (settings in a safe order, then
@@ -50,9 +64,10 @@ import math
 import os
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
 from .cameras import Roi
 
@@ -70,6 +85,9 @@ MAX_NAME = 60
 #: something else entirely has been saved under this name.
 MAX_FILE_BYTES = 4 * 1024 * 1024
 
+#: How long a change waits for another app's change to the same file.
+LOCK_SECONDS = 10.0
+
 _LOCK = threading.Lock()
 
 
@@ -80,11 +98,14 @@ class PresetError(Exception):
 
 class PresetFileError(PresetError):
     """The presets file exists but is not one this module can trust. It is
-    left exactly as it is; `path` names it."""
+    left exactly as it is; `path` names it. `newer`: a newer version of the
+    app wrote it — not damage, so it is never moved aside."""
 
-    def __init__(self, message: str, path: Optional[Path] = None):
+    def __init__(self, message: str, path: Optional[Path] = None,
+                 newer: bool = False):
         super().__init__(message)
         self.path = path
+        self.newer = newer
 
 
 # ======================================================================
@@ -167,9 +188,19 @@ def presets_path(project_dir: Any) -> Path:
     return Path(project_dir) / PRESETS_FILE
 
 
+def _tidy(name: Any) -> str:
+    """A name as a list shows it: runs of spacing made one space."""
+    return " ".join(str(name if name is not None else "").split())
+
+
+def _fold(name: Any) -> str:
+    """A name as names are compared: tidied, case ignored."""
+    return _tidy(name).casefold()
+
+
 def clean_name(name: Any) -> str:
     """A usable preset name, or PresetError saying why not."""
-    text = " ".join(str(name if name is not None else "").split())
+    text = _tidy(name)
     if not text:
         raise PresetError("give the preset a name")
     if len(text) > MAX_NAME:
@@ -253,7 +284,9 @@ class PresetStore:
             raise PresetFileError(f"{self.path.name} is {size:,} bytes — not "
                                   f"a presets file", self.path)
         try:
-            text = self.path.read_text(encoding="utf-8")
+            # utf-8-sig: the same JSON with Notepad's byte-order mark in
+            # front was called damaged, and the next save moved it aside.
+            text = self.path.read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError) as exc:
             raise PresetFileError(f"cannot read {self.path.name}: {exc}",
                                   self.path) from exc
@@ -261,16 +294,19 @@ class PresetStore:
             raise PresetFileError(f"{self.path.name} is empty", self.path)
         try:
             doc = json.loads(text)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
+            # RecursionError: arrays nested past Python's stack, which the
+            # size limit alone does not rule out.
             raise PresetFileError(f"{self.path.name} is damaged (not valid "
-                                  f"JSON: {exc})", self.path) from exc
+                                  f"JSON: {str(exc)[:120]})",
+                                  self.path) from exc
         if not isinstance(doc, dict) or not isinstance(doc.get("format"), int):
             raise PresetFileError(f"{self.path.name} is not a presets file",
                                   self.path)
         if doc["format"] > FORMAT:
             raise PresetFileError(f"{self.path.name} was saved by a newer "
                                   f"version of this app (format "
-                                  f"{doc['format']})", self.path)
+                                  f"{doc['format']})", self.path, newer=True)
         if doc["format"] < 1 or not isinstance(doc.get("cameras"), dict):
             raise PresetFileError(f"{self.path.name} is not a presets file",
                                   self.path)
@@ -301,19 +337,37 @@ class PresetStore:
                 continue
             for name, body in raw.items():
                 try:
-                    preset = _preset_from(str(name), body, owner, mine)
+                    # Listed TIDIED, as save would have stored it: a name a
+                    # person typed into the file as "Bird  bath " is shown,
+                    # picked and found as "Bird bath". One no list could
+                    # show (blank, too long) is a problem, not a blank row.
+                    shown = clean_name(name)
+                except PresetError as exc:
+                    self.problems.append(f"{name!r}: {exc}")
+                    continue
+                try:
+                    preset = _preset_from(shown, body, owner, mine)
                 except ValueError as exc:
                     self.problems.append(f"{name}: {exc}")
                     continue
                 (own if mine else others).append(preset)
         own.sort(key=lambda p: p.name.casefold())
-        seen = {p.name.casefold() for p in own}
+        seen: set = set()
+        unique = []
+        for preset in own:
+            if _fold(preset.name) in seen:
+                self.problems.append(f"{preset.name}: another preset of "
+                                     f"this camera has the same name")
+                continue
+            seen.add(_fold(preset.name))
+            unique.append(preset)
+        own = unique
         borrowed = []
         # Newest first within a name, then by name: of two units' presets
         # with one name, the one saved most recently is offered.
         others.sort(key=lambda p: p.updated, reverse=True)
         for preset in sorted(others, key=lambda p: p.name.casefold()):
-            folded = preset.name.casefold()
+            folded = _fold(preset.name)
             if folded in seen:
                 continue
             seen.add(folded)
@@ -321,9 +375,9 @@ class PresetStore:
         return own + borrowed
 
     def get(self, camera: Identity, name: Any) -> Preset:
-        wanted = clean_name(name).casefold()
+        wanted = _fold(clean_name(name))
         for preset in self.presets(camera):
-            if preset.name.casefold() == wanted:
+            if _fold(preset.name) == wanted:
                 return preset
         raise PresetError(f"there is no preset called {clean_name(name)!r} "
                           f"for {camera.label}")
@@ -347,7 +401,7 @@ class PresetStore:
         area = None if roi is None else [int(v) for v in roi.as_tuple()]
         if area is not None:
             _roi_from(area)                      # the same check a read uses
-        with _LOCK:
+        with self._changing():
             moved = None
             try:
                 doc = self.read()
@@ -358,8 +412,10 @@ class PresetStore:
                     raise PresetFileError(
                         f"the presets saved for {camera.label} in "
                         f"{self.path.name} are damaged", self.path)
-            except PresetFileError:
-                if not repair or not self.path.exists():
+            except PresetFileError as exc:
+                # A newer app's file is not damage: moving it aside would
+                # hide every preset the newer app saved from it.
+                if exc.newer or not repair or not self.path.exists():
                     raise
                 moved = self._move_aside()
                 doc = _empty()
@@ -382,7 +438,7 @@ class PresetStore:
 
     def rename(self, camera: Identity, old: Any, new: Any) -> Preset:
         old, new = clean_name(old), clean_name(new)
-        with _LOCK:
+        with self._changing():
             doc = self.read()
             entry = doc["cameras"].get(camera.key)
             presets = entry.get("presets") if isinstance(entry, dict) else None
@@ -405,7 +461,7 @@ class PresetStore:
 
     def delete(self, camera: Identity, name: Any) -> Preset:
         name = clean_name(name)
-        with _LOCK:
+        with self._changing():
             doc = self.read()
             entry = doc["cameras"].get(camera.key)
             presets = entry.get("presets") if isinstance(entry, dict) else None
@@ -415,9 +471,9 @@ class PresetStore:
             body = presets.pop(found)
             self._write(doc)
         try:
-            return _preset_from(found, body, camera, True)
+            return _preset_from(_tidy(found), body, camera, True)
         except ValueError:
-            return Preset(name=found, owner=camera)
+            return Preset(name=_tidy(found), owner=camera)
 
     def _not_own(self, camera: Identity, name: str) -> str:
         """Why a rename or delete found nothing to act on."""
@@ -426,13 +482,20 @@ class PresetStore:
         except PresetFileError:
             listed = []
         for preset in listed:
-            if preset.name.casefold() == name.casefold() and not preset.own:
+            if _fold(preset.name) == _fold(name) and not preset.own:
                 return (f"{preset.name!r} was saved on {preset.owner.label}; "
                         f"only that camera's own list can change it — save "
                         f"it here under a name of its own instead")
         return f"there is no preset called {name!r} for {camera.label}"
 
     # -- the file --------------------------------------------------------
+    @contextmanager
+    def _changing(self) -> Iterator[None]:
+        """One read-change-write at a time: this process's threads (_LOCK)
+        and every other app on the same project (the OS lock)."""
+        with _LOCK, _project_lock(self.path, LOCK_SECONDS):
+            yield
+
     def _write(self, doc: Dict[str, Any]) -> None:
         """Whole, then renamed into place. fsync'd: a laptop that sleeps
         or loses power straight after a save keeps the save."""
@@ -508,12 +571,79 @@ def _entry_for(doc: Dict[str, Any], camera: Identity) -> Dict[str, Any]:
 
 
 def _find(presets: Mapping[str, Any], name: str) -> Optional[str]:
-    """The stored spelling of `name`, matched without regard to case."""
-    wanted = name.casefold()
+    """The stored spelling of `name`, matched as a list shows names: case
+    and runs of spacing ignored (a person may have typed the file)."""
+    wanted = _fold(name)
     for stored in presets:
-        if str(stored).casefold() == wanted:
+        if _fold(stored) == wanted:
             return stored
     return None
+
+
+# ======================================================================
+# One change at a time, across every app using the project
+# ======================================================================
+def _lock_path(path: Path) -> Path:
+    return path.with_name(f".{path.name}.lock")
+
+
+def _try_lock(handle: Any) -> bool:
+    """Take the OS lock on byte 0 of `handle` without waiting; whether it
+    was taken. msvcrt on Windows (locking past the end of an empty file is
+    allowed there), flock elsewhere."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _unlock(handle: Any) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass                      # closing the handle releases it anyway
+
+
+@contextmanager
+def _project_lock(path: Path, timeout: float) -> Iterator[None]:
+    """Hold the project's presets lock (see TWO APPS, ONE PROJECT)."""
+    lock = _lock_path(path)
+    try:
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock, "a+b")
+    except OSError as exc:
+        raise PresetError(_cannot_write(lock, exc)) from exc
+    try:
+        deadline = time.monotonic() + timeout
+        while not _try_lock(handle):
+            if time.monotonic() >= deadline:
+                raise PresetError(
+                    f"another window is changing the presets in "
+                    f"{path.parent} and has not finished — try again")
+            time.sleep(0.01)
+        try:
+            yield
+        finally:
+            _unlock(handle)
+    finally:
+        handle.close()
 
 
 # ======================================================================

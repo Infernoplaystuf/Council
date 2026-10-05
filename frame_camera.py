@@ -1989,11 +1989,13 @@ def list_presets() -> Dict[str, Any]:
     try:
         listed = store.presets(camera)
     except camera_presets.PresetFileError as exc:
+        then = ("this app will not save presets over it — use the newer "
+                "app, or move the file away" if exc.newer else
+                "saving a preset moves it aside and starts a new one")
         return {"presets": [], "rows": [], "details": [], "problems": [],
                 "file": str(store.path),
                 "summary": (f"Presets: {exc}. It is left exactly as it is; "
-                            f"saving a preset moves it aside and starts a "
-                            f"new one.")}
+                            f"{then}.")}
     borrowed = sum(1 for p in listed if not p.own)
     summary = (f"{len(listed)} preset{'s' if len(listed) != 1 else ''} for "
                f"{camera.label}")

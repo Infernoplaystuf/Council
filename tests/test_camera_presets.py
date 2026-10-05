@@ -50,7 +50,9 @@ def test_the_file_is_plain_json_beside_the_app(store, tmp_path):
     entry = doc["cameras"][EVK_A.key]
     assert entry["model"] == "EVK4" and entry["serial"] == "00051234"
     assert entry["presets"]["Bird bath"]["roi"] is None
-    assert [p.name for p in tmp_path.iterdir()] == ["camera_presets.json"], \
+    # Beside it only the empty lock sidecar (TWO APPS, ONE PROJECT).
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        ".camera_presets.json.lock", "camera_presets.json"], \
         "a temporary file was left behind"
 
 
@@ -248,3 +250,105 @@ def test_the_identity_comes_from_what_the_scan_found():
     info = cameras.CameraInfo("prophesee", "00051234", "EVK4", "00051234",
                               "Prophesee", "event")
     assert cp.Identity.of(info) == EVK_A
+
+
+# ======================================================================
+# Review: a file a person edited, a file a newer app wrote, two apps at once
+# ======================================================================
+def test_a_hand_edited_name_with_odd_spacing_can_still_be_used(store):
+    """Listed as "Bird  bath " but every lookup tidied the name it was
+    given and compared it with the untidied one: the preset showed in the
+    list and could be neither applied nor deleted."""
+    store.save(EVK_A, "Bird bath", BIRD_BATH, None)
+    doc = json.loads(store.path.read_text(encoding="utf-8"))
+    presets = doc["cameras"][EVK_A.key]["presets"]
+    presets["Bird  bath "] = presets.pop("Bird bath")
+    store.path.write_text(json.dumps(doc), encoding="utf-8")
+
+    listed = store.presets(EVK_A)
+    assert [p.name for p in listed] == ["Bird bath"]
+    assert store.get(EVK_A, listed[0].name).settings == BIRD_BATH
+    _, replaced, _ = store.save(EVK_A, "bird bath", {"window_ms": 5.0}, None)
+    assert replaced, "saved beside it instead of replacing it"
+    assert [p.name for p in store.presets(EVK_A)] == ["bird bath"]
+    store.delete(EVK_A, "Bird bath")
+    assert store.presets(EVK_A) == []
+
+
+def test_a_name_no_list_could_show_is_a_problem_not_a_blank_row(store):
+    doc = {"format": 1, "cameras": {EVK_A.key: dict(
+        EVK_A.as_dict(), presets={"   ": {"settings": {}},
+                                  "Fine": {"settings": {}}})}}
+    store.path.write_text(json.dumps(doc), encoding="utf-8")
+    assert [p.name for p in store.presets(EVK_A)] == ["Fine"]
+    assert store.problems
+
+
+def test_a_file_saved_with_a_byte_order_mark_is_read(store):
+    """Notepad's "UTF-8 with BOM": the same JSON, three bytes in front. It
+    was called damaged, and the next save moved every preset aside."""
+    store.save(EVK_A, "Bird bath", BIRD_BATH, None)
+    text = store.path.read_text(encoding="utf-8")
+    store.path.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
+    assert [p.name for p in store.presets(EVK_A)] == ["Bird bath"]
+    _, _, moved = store.save(EVK_A, "Feeder", {}, None, repair=True)
+    assert moved is None
+    assert {p.name for p in store.presets(EVK_A)} == {"Bird bath", "Feeder"}
+
+
+def test_a_newer_apps_file_is_never_moved_aside_by_a_save(store, tmp_path):
+    """"Refused, not rewritten" — but a save with repair (every save
+    frame_camera makes) moved it aside as "damaged" and started a new one,
+    so the newer app found its presets gone."""
+    text = '{"format": 2, "cameras": {}, "new": true}'
+    store.path.write_text(text, encoding="utf-8")
+    with pytest.raises(cp.PresetFileError, match="newer") as caught:
+        store.save(EVK_A, "Bird bath", BIRD_BATH, None, repair=True)
+    assert caught.value.newer
+    assert store.path.read_text(encoding="utf-8") == text
+    assert not list(tmp_path.glob("*damaged*")), "moved aside"
+
+
+def test_a_deeply_nested_file_is_refused_not_a_crash(store):
+    store.path.write_text('{"format": 1, "cameras": ' + "[" * 100_000
+                          + "]" * 100_000 + "}", encoding="utf-8")
+    with pytest.raises(cp.PresetFileError):
+        store.presets(EVK_A)
+
+
+SAVER = """
+import sys, time
+sys.path.insert(0, {repo!r})
+from council_core import camera_presets as cp
+from council_core.cameras import Roi
+store = cp.PresetStore({path!r})
+camera = cp.Identity("basler", "boA5320-150cm", {serial!r})
+while time.time() < {start}:
+    time.sleep(0.001)
+for i in range({count}):
+    store.save(camera, f"p{{i}}", {{"Gain": float(i)}}, Roi(0, 0, 64, 64))
+"""
+
+
+def test_two_apps_saving_into_one_project_at_once_lose_nothing(tmp_path):
+    """Two Typhon windows on one project (one per camera) each read the
+    file, added theirs and wrote it back: measured, one kept 3 of its 40."""
+    import subprocess
+    import time
+
+    path = cp.presets_path(tmp_path)
+    repo = str(Path(__file__).resolve().parents[1])
+    start = time.time() + 2.0
+    count = 30
+    procs = [subprocess.Popen(
+        [sys.executable, "-c", SAVER.format(repo=repo, path=str(path),
+                                            serial=serial, start=start,
+                                            count=count)])
+        for serial in ("A", "B")]
+    for proc in procs:
+        assert proc.wait(timeout=120) == 0
+    store = cp.PresetStore(path)
+    for serial in ("A", "B"):
+        camera = cp.Identity("basler", "boA5320-150cm", serial)
+        own = [p for p in store.presets(camera) if p.own]
+        assert len(own) == count, f"{serial} kept {len(own)} of {count}"

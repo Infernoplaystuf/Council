@@ -563,3 +563,20 @@ def test_a_mirrored_view_is_made_whole_rows():
     image = np.arange(48 * 64, dtype=np.uint8).reshape(48, 64)[:, ::-1]
     shown = prep(image)
     assert shown.flags["C_CONTIGUOUS"] and np.array_equal(shown, image)
+
+
+# ======================================================================
+# Review: what the adversarial pass found
+# ======================================================================
+def test_a_newer_apps_presets_file_is_said_and_never_saved_over(tmp_path):
+    text = '{"format": 2, "cameras": {}}'
+    target = tmp_path / "camera_presets.json"
+    target.write_text(text, encoding="utf-8")
+    connected("event")
+    listed = frame_camera.list_presets()
+    assert "newer version" in listed["summary"]
+    assert "moves it aside" not in listed["summary"]
+    with pytest.raises(RuntimeError, match="newer version"):
+        frame_camera.save_preset("Fresh")
+    assert target.read_text(encoding="utf-8") == text
+    assert not list(tmp_path.glob("camera_presets.damaged-*"))
