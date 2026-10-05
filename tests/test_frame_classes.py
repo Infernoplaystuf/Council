@@ -302,7 +302,7 @@ def test_saves_leave_no_temp_files_behind(vault, capture):
     fc.train("frames")
     store = vault / "classifiers" / "frames"
     assert sorted(p.name for p in store.iterdir()) == \
-        ["classes.json", "model.npz", "versions"]
+        ["about.json", "classes.json", "model.npz", "versions"]
     assert [p.name for p in (store / "versions").iterdir()] == ["v1"]
     assert sorted(p.name for p in (store / "versions" / "v1").iterdir()) == \
         ["classes.json", "meta.json", "model.npz"]
