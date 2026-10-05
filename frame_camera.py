@@ -1751,18 +1751,28 @@ def _finish_job(job: _Job, raise_errors: bool) -> Dict[str, Any]:
     """The outcome of a finished job, said once, on the UI thread."""
     if _LIVE.job is job:
         _LIVE.job = None
-    if job.error is not None:
-        said = f"{job.label} failed: {_said(job.error)}"
+    error = job.error
+    out = None
+    if error is None:
+        try:
+            out = job.finish(job.result)
+        except Exception as exc:                          # noqa: BLE001
+            # The change was made, but reading the camera back for the
+            # answer failed (unplugged in between). Said like any failure:
+            # swallowed by _poll_job, nobody heard anything, and a settings
+            # window stayed greyed at "Applying…" until Disconnect.
+            error = exc
+    if error is not None:
+        said = f"{job.label} failed: {_said(error)}"
         if job.restart_error:
             said += f" {job.restart_error}"
         out = {"ok": False, "what": "failed", "summary": said,
-               "error": _said(job.error), "pending": False}
+               "error": _said(error), "pending": False}
         _announce(out)
         if raise_errors:
-            raise RuntimeError(said) from job.error
+            raise RuntimeError(said) from error
         _tell_status(said)
         return out
-    out = job.finish(job.result)
     if job.restart_error:
         out["summary"] = f"{out['summary']} {job.restart_error}"
     _settle_crop(out)

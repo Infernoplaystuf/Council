@@ -891,3 +891,29 @@ def test_a_box_past_the_live_picture_is_refused_not_walked():
     assert device().roi().as_tuple() == (100, 60, 320, 240)
     out = frame_camera.set_area("0, 0, 320, 240")           # all of it
     assert out["area"] == "100, 60, 320, 240"
+
+
+def test_a_late_answer_that_cannot_be_read_back_is_said_not_swallowed():
+    """The job made its change, then reading the camera back for the answer
+    raised (a camera unplugged in between). _poll_job swallowed it: no
+    listener heard anything, so a settings window stayed greyed out at
+    "Applying…" until Disconnect, and the status line said nothing."""
+    viewer = live("frame")
+    frame_camera.set_frame_rate(1)
+    ticks(viewer, 0.1)
+    heard = []
+    frame_camera.on_camera_change(heard.append)
+    out = frame_camera.apply_camera_settings({"PixelFormat": "Mono12"})
+    assert out["pending"]
+    job = frame_camera._LIVE.job
+    job.done.wait(3)
+
+    def gone():
+        raise cameras.CameraError("the camera was unplugged")
+    device().roi = gone
+    said = []
+    ticks(viewer, 0.1, said=said)
+    del device().roi
+    assert frame_camera._LIVE.job is None
+    assert heard[-1]["what"] == "failed", [h["what"] for h in heard]
+    assert "unplugged" in heard[-1]["summary"]
