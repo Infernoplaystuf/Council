@@ -30,6 +30,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import time
 import types
 import zipfile
 from pathlib import Path
@@ -112,7 +113,7 @@ def test_adding_nothing_or_a_duplicate_keeps_the_list(vault):
     assert r["cleared"] == ""
 
 
-@pytest.mark.parametrize("bad", ["", "..", "a/b", r"..\x", "has space",
+@pytest.mark.parametrize("bad", ["..", "a/b", r"..\x", "has space",
                                  "-lead", "x" * 70])
 def test_a_classifier_name_cannot_reach_outside_its_folder(vault, bad):
     with pytest.raises(RuntimeError, match="not a usable classifier name"):
@@ -322,7 +323,7 @@ def test_saves_leave_no_temp_files_behind(vault, capture):
     fc.train("frames")
     store = vault / "classifiers" / "frames"
     assert sorted(p.name for p in store.iterdir()) == \
-        ["about.json", "classes.json", "model.npz", "versions"]
+        ["about.json", "classes.json", "mirror.json", "model.npz", "versions"]
     assert [p.name for p in (store / "versions").iterdir()] == ["v1"]
     assert sorted(p.name for p in (store / "versions" / "v1").iterdir()) == \
         ["classes.json", "meta.json", "model.npz"]
@@ -451,6 +452,16 @@ def test_the_generated_app_marks_trains_and_classifies(tmp_path, capture,
 
 def _store(vault):
     return vault / "classifiers"
+
+
+def _names_in(store):
+    """What a store holds besides its own hidden folders (.deleted for
+    Delete, .locks for two apps changing one classifier)."""
+    return sorted(p.name for p in store.iterdir() if not p.name.startswith("."))
+
+
+def _versions(vault, name="frames"):
+    return sorted(p.name for p in (_store(vault) / name / "versions").iterdir())
 
 
 @pytest.fixture
@@ -647,16 +658,19 @@ def test_save_as_copies_every_version_keeps_the_origin_and_records_the_copy(
 
 
 def test_save_as_and_rename_never_overwrite_whatever_the_case(vault, trained):
+    """A taken name is ASKED about — a soft result that keeps the window on
+    the open classifier (see the refused-click test) — never overwritten."""
     fc.add_class("other", "x")
     other = (_store(vault) / "other" / "classes.json").read_bytes()
     for call in (lambda: fc.save_as("frames", "other"),
                  lambda: fc.save_as("frames", "OTHER"),
-                 lambda: fc.rename_classifier("frames", "Other")):
-        with pytest.raises(RuntimeError, match="already exists .*nothing was "
-                                               "overwritten"):
-            call()
+                 lambda: fc.rename_classifier("frames", "Other", "frames")):
+        r = call()
+        assert re.search("already exists .*nothing was overwritten",
+                         r["summary"]), r["summary"]
+        assert r["name"] == "frames"
     assert (_store(vault) / "other" / "classes.json").read_bytes() == other
-    assert sorted(p.name for p in _store(vault).iterdir()) == ["frames", "other"]
+    assert _names_in(_store(vault)) == ["frames", "other"]
 
 
 def test_rename_keeps_versions_origin_and_run_record(vault, trained):
@@ -722,8 +736,9 @@ def test_the_origin_is_recorded_once_and_never_rewritten(vault, tmp_path,
     _run_as(monkeypatch, _project(apps, "example_typhon", "Typhon"))
     fc.add_class("frames", "good")
     origin = _about(vault, "frames")["origin"]
-    # Another app opens the shared classifier and works on it.
+    # Another app opens the classifier, tagged shared, and works on it.
     _run_as(monkeypatch, _project(apps, "barbie", "Barbie Capture"))
+    fc.add_tag("frames", fc.SHARED_TAG)
     fc.add_class("frames", "bad timing")
     _mark_some(folder)
     fc.train("frames")
@@ -749,19 +764,22 @@ def test_opening_says_what_happened_to_it_since(vault, trained):
 
 def test_retraining_another_apps_classifier_says_whose_model_changed(
         vault, tmp_path, monkeypatch, capture):
-    """The store is shared: a new version made from Typhon is Barbie's
-    current model too, and the person pressing Train should know."""
+    """The store is shared: a new version made from Typhon of a classifier
+    Barbie shared is Barbie's current model too, and the person pressing
+    Train should know."""
     folder, _ = capture
     apps = tmp_path / "apps"
     _run_as(monkeypatch, _project(apps, "barbie", "Barbie Capture"))
     _mark_some(folder)
     first = fc.train("frames")
-    assert "was made by" not in first["summary"]
+    assert "belongs to" not in first["summary"]
+    fc.add_tag("frames", fc.SHARED_TAG)
     _run_as(monkeypatch, _project(apps, "example_typhon", "Typhon"))
     fc.mark_frame("frames", str(folder), "frame_0011.png", ["bad timing"])
     second = fc.train("frames")
-    assert ("'frames' was made by Barbie Capture (project barbie); "
-            f"{second['version']} is its current model there too.")         in second["summary"]
+    assert ("'frames' belongs to Barbie Capture (project barbie); "
+            f"{second['version']} is its current model there too.") \
+        in second["summary"]
 
 
 def test_a_lineage_at_its_limit_stays_readable(vault, trained):
@@ -843,13 +861,16 @@ def test_the_list_filters_by_this_app_app_project_tag_and_unknown(
 
 def test_names_are_unique_whatever_their_case(vault, monkeypatch):
     """On Windows "Frames" IS "frames"; a store copied there must not hold
-    both, so no PC may make both — here, a case-sensitive one is acted out
-    by treating "Frames" as a folder that does not exist yet."""
+    both, so no PC may make both. A name typed in another case therefore
+    IS the classifier that exists — on every PC, not only where the file
+    system says so: a case-sensitive one is acted out here by hiding the
+    folder from a lookup by the typed spelling."""
     fc.add_class("frames", "x")
-    monkeypatch.setattr(fc, "_is_new", lambda d: True)
-    with pytest.raises(RuntimeError, match="'frames' already exists"):
-        fc.add_class("Frames", "y")
     assert fc._taken("FRAMES") == "frames"
+    monkeypatch.setattr(fc, "_is_new", lambda d: d.name != "frames")
+    fc.add_class("Frames", "y")
+    assert _names_in(_store(vault)) == ["frames"]
+    assert fc.open_classifier("FRAMES")["classes"] == ["x", "y"]
 
 
 # ============================================================
@@ -936,16 +957,18 @@ def test_importing_a_taken_name_asks_for_another_and_never_overwrites(
     monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(pc2))
     fc.add_class("frames", "something else")        # pc2's own "frames"
     mine = (_store(pc2) / "frames" / "classes.json").read_bytes()
-    with pytest.raises(RuntimeError, match="'frames' already exists .*type "
-                                           "another name in New name"):
-        fc.import_classifier(e["path"])
+    asked = fc.import_classifier(e["path"], "", "", "frames")
+    assert re.search("'frames' already exists .*type another name in New "
+                     "name", asked["summary"]), asked["summary"]
+    assert asked["imported"] == [] and asked["name"] == "frames"
+    assert asked["classes"] == ["something else"]   # the window keeps its own
     assert (_store(pc2) / "frames" / "classes.json").read_bytes() == mine
     r = fc.import_classifier(e["path"], "frames-lab1")
     assert r["name"] == "frames-lab1" and r["imported"] == ["frames-lab1"]
     again = fc.import_classifier(e["path"], "frames-lab1")
     assert "already is this classifier" in again["summary"]
     assert again["imported"] == []
-    assert sorted(p.name for p in _store(pc2).iterdir()) == \
+    assert _names_in(_store(pc2)) == \
         ["frames", "frames-lab1"]                   # no staging left behind
 
 
@@ -1128,7 +1151,9 @@ def test_classifying_is_recorded_in_the_store_never_in_the_capture_folder(
     assert rec["sha256"] == r["sha256"] and rec["counts"] == r["counts"]
     assert rec["runs"] == {"frame": 30} and rec["frames"] == 30
     assert rec["folder"] == str(folder.resolve()) and rec["host"] == fc._host()
-    assert set(rec["by"]) == {"app", "project", "project_id", "script"}
+    assert set(rec["by"]) == {"app", "project", "project_id", "script",
+                              "script_id"}
+    assert isinstance(rec["at"], float)             # orders one second's runs
     assert fc._run_of("20261002_101500_frame_000001.png") == "20261002_101500"
 
 
@@ -1536,6 +1561,11 @@ def test_built_typhon_tags_the_classifiers_it_makes_with_its_own_project(
 #: combobox port takes one string, not a list, so the list of models is a
 #: listbox), new_name, tag (entries), export_to (folder picker), import_from
 #: (file picker), model_history (listbox), classified_with_line (label).
+#:
+#: Every action on a row takes classifier_name too: refilling the list drops
+#: its selection, so the next press with nothing picked acts on the OPEN
+#: classifier — and a refused press echoes the open one back, so the window
+#: is never blanked by a slip (Delete alone needs a row picked).
 TYPHON_LINKS = {
     "on_classifier_filter": ("list_classifiers", ["classifier_filter"],
                              {"models": "rows", "classifier_status": "summary"},
@@ -1543,7 +1573,7 @@ TYPHON_LINKS = {
     "on_btn_refresh": ("list_classifiers", ["classifier_filter"],
                        {"models": "rows", "classifier_status": "summary"},
                        "Refresh"),
-    "on_btn_use_selected": ("open_classifier", ["models"],
+    "on_btn_use_selected": ("open_classifier", ["models", "classifier_name"],
                             {"classifier_name": "name", "classes": "classes",
                              "classifier_status": "summary"}, "Use selected"),
     "on_btn_save_as": ("save_as",
@@ -1561,26 +1591,31 @@ TYPHON_LINKS = {
                       {"classifier_name": "name", "classes": "classes",
                        "models": "rows", "classifier_status": "summary"},
                       "Delete"),
-    "on_btn_add_tag": ("add_tag", ["models", "tag", "classifier_filter"],
+    "on_btn_add_tag": ("add_tag",
+                       ["models", "tag", "classifier_filter", "classifier_name"],
                        {"tag": "cleared", "models": "rows",
                         "classifier_status": "summary"}, "Add tag"),
-    "on_btn_remove_tag": ("remove_tag", ["models", "tag", "classifier_filter"],
+    "on_btn_remove_tag": ("remove_tag",
+                          ["models", "tag", "classifier_filter",
+                           "classifier_name"],
                           {"models": "rows", "classifier_status": "summary"},
                           "Remove tag"),
-    "on_btn_export": ("export_classifier", ["models", "export_to"],
+    "on_btn_export": ("export_classifier",
+                      ["models", "export_to", "classifier_name"],
                       {"classifier_status": "summary"}, "Export"),
     "on_btn_export_all_from_this_app": ("export_this_app", ["export_to"],
                                         {"classifier_status": "summary"},
                                         "Export all from this app"),
     "on_btn_import": ("import_classifier",
-                      ["import_from", "new_name", "classifier_filter"],
+                      ["import_from", "new_name", "classifier_filter",
+                       "classifier_name"],
                       {"classifier_name": "name", "classes": "classes",
                        "models": "rows", "classifier_status": "summary"},
                       "Import"),
-    "on_btn_versions": ("list_versions", ["models"],
+    "on_btn_versions": ("list_versions", ["models", "classifier_name"],
                         {"model_history": "rows",
                          "classifier_status": "summary"}, "Versions"),
-    "on_btn_history": ("run_history", ["models"],
+    "on_btn_history": ("run_history", ["classifier_name"],
                        {"model_history": "rows",
                         "classifier_status": "summary"}, "History"),
     "on_btn_classified_with": ("classified_with", ["capture_folder"],
@@ -1590,6 +1625,8 @@ TYPHON_LINKS = {
 
 
 class _Port:
+    """An entry, label, combobox or picker port: get() is its text."""
+
     def __init__(self, value):
         self.value = value
 
@@ -1600,7 +1637,60 @@ class _Port:
         self.value = value
 
     def clear(self):
-        self.value = None
+        self.value = ""
+
+
+class _ListPort:
+    """A listbox port as the generated ui/ports.py's _ListPort behaves:
+    set() refills the rows and DROPS the selection; get() is the SELECTION,
+    not the rows. (Handing back all rows, as the first version of this test
+    did, hid that a refreshed list has nothing picked.)"""
+
+    def __init__(self, rows=()):
+        self.rows, self.selected = list(rows), []
+
+    def get(self):
+        return list(self.selected)
+
+    def items(self):
+        return list(self.rows)
+
+    def set(self, values):
+        self.rows, self.selected = [str(v) for v in (values or [])], []
+
+    def clear(self):
+        self.set([])
+
+    def pick(self, name):                   # the user clicks a row
+        self.selected = [r for r in self.rows if fc._name_of(r) == name]
+        assert self.selected, (name, self.rows)
+
+
+def _wired_code():
+    import gui_emit as ge
+    stubs = "".join(ge.handler_stub(h, {"module": "frame_classes",
+                                        "function": fn, "inputs": ins,
+                                        "outputs": outs}, title)
+                    for h, (fn, ins, outs, title) in TYPHON_LINKS.items())
+    return "class Handlers:\n" + stubs
+
+
+def _planned_app(space, folder, out, name="frames"):
+    """The generated Handlers class bound to ports that behave like the
+    real ones, the classifier ``name`` open and its classes listed."""
+    errors = []
+    h = space["Handlers"]()
+    ports = {n: _Port(v) for n, v in {
+        "classifier_filter": fc.FILTER_ALL, "classifier_name": name,
+        "classifier_status": "", "new_name": "", "tag": "",
+        "export_to": str(out), "import_from": "",
+        "capture_folder": str(folder), "classified_with_line": ""}.items()}
+    ports.update(models=_ListPort(), model_history=_ListPort(),
+                 classes=_ListPort(fc.open_classifier(name)["classes"]))
+    h.ports = types.SimpleNamespace(**ports)
+    h.clear_ports = lambda *names: [getattr(h.ports, n).clear() for n in names]
+    h.report_error = lambda what, exc: errors.append(f"{what}: {exc}")
+    return h, h.ports, errors
 
 
 def test_the_planned_typhon_wiring_runs_as_generated_handlers(
@@ -1609,14 +1699,9 @@ def test_the_planned_typhon_wiring_runs_as_generated_handlers(
     handler_stub, what Generate puts in handlers.py), passes the gate and
     runs: inputs read from ports, result keys written to ports — a flow
     through the whole library with no error reported."""
-    import gui_emit as ge
     import gui_policy as pol
     folder, _ = trained
-    stubs = "".join(ge.handler_stub(h, {"module": "frame_classes",
-                                        "function": fn, "inputs": ins,
-                                        "outputs": outs}, title)
-                    for h, (fn, ins, outs, title) in TYPHON_LINKS.items())
-    code = "class Handlers:\n" + stubs
+    code = _wired_code()
     ok, errs = pol.validate(code, "linked", ["numpy", "PIL", "sklearn"],
                             toolkit="qt")
     assert ok, errs
@@ -1624,61 +1709,790 @@ def test_the_planned_typhon_wiring_runs_as_generated_handlers(
     exec(compile(code, "handlers.py", "exec"), space)
     out = tmp_path / "out"
     out.mkdir()
-    errors = []
-    h = space["Handlers"]()
-    h.ports = types.SimpleNamespace(**{n: _Port(v) for n, v in {
-        "classifier_filter": fc.FILTER_ALL, "models": [],
-        "classifier_name": "frames", "classes": [], "classifier_status": "",
-        "new_name": "", "tag": "", "export_to": str(out), "import_from": "",
-        "capture_folder": str(folder), "classified_with_line": "",
-        "model_history": []}.items()})
-    h.clear_ports = lambda *names: [getattr(h.ports, n).clear() for n in names]
-    h.report_error = lambda what, exc: errors.append(f"{what}: {exc}")
-    p = h.ports
-
-    def pick(name):                        # the user clicks a row
-        p.models.value = [r for r in p.models.value
-                          if fc._name_of(r) == name]
+    h, p, errors = _planned_app(space, folder, out)
 
     h.on_classifier_filter()
-    assert len(p.models.value) == 1
-    pick("frames")
+    assert len(p.models.items()) == 1
+    p.models.pick("frames")
     h.on_btn_use_selected()
     assert p.classifier_name.value == "frames"
-    assert p.classes.value == ["good", "bad timing"]
+    assert p.classes.items() == ["good", "bad timing"]
     p.new_name.value = "frames-copy"
     h.on_btn_save_as()
     assert p.classifier_name.value == "frames-copy"
-    pick("frames-copy")
+    # Nothing is picked now (the list was refilled): the open one is meant.
     p.tag.value = "lab"
     h.on_btn_add_tag()
-    assert p.tag.value == "" and any("tags: lab" in r for r in p.models.value)
+    assert p.tag.value == "" and any(r.startswith("frames-copy ") and
+                                     "tags: lab" in r for r in p.models.items())
+    p.tag.value = "lab"
+    h.on_btn_remove_tag()
+    assert not any("tags: lab" in r for r in p.models.items())
+    h.on_btn_add_tag()
     p.classifier_filter.value = "Tag: lab"
     h.on_classifier_filter()
-    assert [fc._name_of(r) for r in p.models.value] == ["frames-copy"]
-    pick("frames-copy")
+    assert [fc._name_of(r) for r in p.models.items()] == ["frames-copy"]
+    p.models.pick("frames-copy")
     p.new_name.value = "frames-lab"
     h.on_btn_rename()
     assert p.classifier_name.value == "frames-lab"   # it was the open one
-    pick("frames-lab")
     h.on_btn_export()
     assert p.classifier_status.value.startswith("Exported frames-lab v1 (")
     h.on_btn_export_all_from_this_app()
-    assert "Exported 2 classifier(s)" in p.classifier_status.value
+    assert "Exported 2 classifiers" in p.classifier_status.value
     h.on_btn_versions()
-    assert p.model_history.value[0].startswith("v1 (")
-    pick("frames-lab")
+    assert p.model_history.items()[0].startswith("v1 (")
+    p.models.pick("frames-lab")
     h.on_btn_delete()
-    assert p.classifier_name.value == "" and p.models.value == []
+    assert p.classifier_name.value == "" and p.models.items() == []
     p.import_from.value = str(out / "frames-lab-v1.typhon-classifier.zip")
     p.classifier_filter.value = fc.FILTER_ALL
     p.new_name.value = ""
     h.on_btn_import()
     assert p.classifier_name.value == "frames-lab"
+    assert p.classes.items() == ["good", "bad timing"]
     fc.classify_folder("frames", str(folder))
     h.on_btn_classified_with()
     assert p.classified_with_line.value.startswith("Classified with frames v1")
-    pick("frames")
+    p.classifier_name.value = "frames"
     h.on_btn_history()
-    assert len(p.model_history.value) == 1
+    assert len(p.model_history.items()) == 1
     assert errors == []
+
+
+# ============================================================
+# What three reviews found (2026-10-05) — each test failed before its fix
+# ============================================================
+
+def test_a_refused_library_click_keeps_the_window_as_it_was(vault, trained,
+                                                            tmp_path):
+    """MEASURED before the fix, with real Qt ports: Save as with nothing
+    typed or a taken name, Delete or Use selected with nothing picked, and
+    Import with no file or a taken name each RAISED — and the generated
+    handler clears every port the link fills, so the open classifier's name
+    and classes went blank and the next Train failed on ''. Asking for a
+    name or a pick is not a failure: it comes back soft, the window as it
+    was."""
+    folder, _ = trained
+    fc.save_as("frames", "other")
+    out = tmp_path / "out"
+    out.mkdir()
+    export = fc.export_classifier("other", str(out))["path"]
+    space = {}
+    exec(compile(_wired_code(), "handlers.py", "exec"), space)
+    h, p, errors = _planned_app(space, folder, out)
+    h.on_btn_refresh()
+    rows = p.models.items()
+
+    def still_open(what):
+        assert errors == [], (what, errors)
+        assert p.classifier_name.value == "frames", \
+            (what, p.classifier_status.value)
+        assert p.classes.items() == ["good", "bad timing"], what
+        assert p.models.items() == rows, what
+
+    for what, setup, press in (
+            ("Save as, nothing typed", {"new_name": ""}, h.on_btn_save_as),
+            ("Save as, a taken name", {"new_name": "OTHER"}, h.on_btn_save_as),
+            ("Delete, nothing picked", {}, h.on_btn_delete),
+            ("Use selected, nothing picked", {}, h.on_btn_use_selected),
+            ("Rename, nothing typed", {"new_name": ""}, h.on_btn_rename),
+            ("Import, no file", {"import_from": "", "new_name": ""},
+             h.on_btn_import),
+            ("Import, a taken name", {"import_from": export,
+                                      "new_name": "frames"}, h.on_btn_import)):
+        for port, value in setup.items():
+            getattr(p, port).value = value
+        press()
+        still_open(what)
+        assert p.classifier_status.value, what       # it says what to do
+    assert "already exists" in p.classifier_status.value
+
+
+def test_importing_a_bundle_again_keeps_the_window_on_a_classifier(
+        vault, trained, tmp_path, monkeypatch):
+    """Importing a bundle again is documented as always safe. MEASURED
+    before the fix: the second import returned name '' and classes [], so
+    the planned Import link blanked the window."""
+    b = fc.export_classifiers(str(tmp_path))["path"]
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(tmp_path / "pc2"))
+    first = fc.import_classifier(b)
+    again = fc.import_classifier(b)
+    assert again["imported"] == [] and "already here 1 (frames)" in \
+        again["summary"]
+    assert (again["name"], again["classes"]) == \
+        (first["name"], first["classes"]) == ("frames", ["good", "bad timing"])
+
+
+def test_train_makes_a_new_version_past_a_damaged_newest_one(vault, trained):
+    """Every damaged-version message says "press Train", so Train has to
+    work. MEASURED before the fix: with versions/v2/meta.json cut short,
+    Train (pressed twice), list_versions, save_as, predict and export all
+    raised that same message, nothing was ever written, and Open called
+    the classifier "not trained yet"."""
+    folder, _ = trained
+    fc.mark_frame("frames", str(folder), "frame_0011.png", ["bad timing"])
+    fc.train("frames")
+    meta = _store(vault) / "frames" / "versions" / "v2" / "meta.json"
+    meta.write_text("{not json", encoding="utf-8")       # a power cut mid-write
+    opened = fc.open_classifier("frames")
+    assert "not trained yet" not in opened["summary"]
+    assert "damaged" in opened["summary"] and "Train" in opened["summary"]
+    rows = fc.list_versions("frames")["rows"]
+    assert rows[0].startswith("v2   DAMAGED") and rows[1].startswith("v1 (")
+    t = fc.train("frames")
+    assert t["version"].startswith("frames v3 (")
+    assert fc.classify_folder("frames", str(folder))["version"] == t["version"]
+    assert meta.read_text(encoding="utf-8") == "{not json"   # left as it is
+    assert _versions(vault) == ["v1", "v2", "v3"]
+
+
+def test_an_export_after_remove_class_imports_alone_and_in_a_bundle(
+        vault, capture, tmp_path, monkeypatch):
+    """Ordinary steps — mark a class, Train, re-mark that frame, Remove
+    class — leave a model that knows a class the marks no longer list.
+    MEASURED before the fix: the export said it succeeded; the other PC
+    refused it ("the model has classes its classes.json does not"), and
+    refused every classifier of a bundle that held it."""
+    folder, _ = capture
+    _mark_some(folder)
+    fc.add_class("frames", "dim")
+    fc.mark_frame("frames", str(folder), "frame_0005.png", ["dim"])
+    fc.train("frames")
+    fc.mark_frame("frames", str(folder), "frame_0005.png", ["good"])
+    assert fc.remove_class("frames", ["dim"])["summary"] == "Removed 'dim'."
+    for c in ("good", "bad timing"):
+        fc.add_class("other", c)
+    for n, c in (("frame_0003.png", "bad timing"),
+                 ("frame_0017.png", "bad timing"),
+                 ("frame_0000.png", "good"), ("frame_0008.png", "good")):
+        fc.mark_frame("other", str(folder), n, [c])
+    fc.train("other")
+    out = tmp_path / "out"
+    out.mkdir()
+    single = fc.export_classifier("frames", str(out))["path"]
+    bundle = fc.export_classifiers(str(out))["path"]
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(tmp_path / "pc2"))
+    r = fc.import_classifier(single)
+    assert r["imported"] == ["frames"] and "dim" in r["classes"]
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(tmp_path / "pc3"))
+    assert sorted(fc.import_classifier(bundle)["imported"]) == \
+        ["frames", "other"]
+    # A file written before the fix — marks without the model's class —
+    # imports too.
+    with zipfile.ZipFile(single) as zf:
+        doc = json.loads(zf.read("classes.json"))
+    doc["classes"] = [c for c in doc["classes"] if c != "dim"]
+    old = _rezip(single, tmp_path / "old.typhon-classifier.zip",
+                 change={"classes.json": json.dumps(doc).encode()})
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(tmp_path / "pc4"))
+    assert "dim" in fc.import_classifier(str(old))["classes"]
+
+
+def test_an_imported_version_number_leaves_room_to_train(vault, trained,
+                                                         tmp_path, monkeypatch):
+    """MEASURED before the fix: an import claiming v999999 (the checksums
+    are the file's own, so anyone can write one) was accepted; the next
+    Train wrote v1000000, a folder name the version reader does not match,
+    so the old model stayed current and every Open wrote one more."""
+    folder, _ = trained
+    e = fc.export_classifier("frames", str(tmp_path))["path"]
+    with zipfile.ZipFile(e) as zf:
+        meta = json.loads(zf.read("meta.json"))
+
+    def numbered(n):
+        return str(_rezip(e, tmp_path / f"v{n}.typhon-classifier.zip",
+                          change={"meta.json": json.dumps(
+                              dict(meta, version=n)).encode()},
+                          manifest={"version": n}))
+    pc2 = tmp_path / "pc2"
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(pc2))
+    with pytest.raises(RuntimeError, match="version 999999"):
+        fc.import_classifier(numbered(999999), "big")
+    top = fc._IMPORT_VERSION_MAX
+    fc.import_classifier(numbered(top), "lab")
+    fc.mark_frame("lab", str(folder), "frame_0011.png", ["bad timing"])
+    t = fc.train("lab")
+    assert t["version"].startswith(f"lab v{top + 1} (")
+    for _ in range(3):
+        assert fc.open_classifier("lab")["version"] == t["version"]
+    assert len(list((_store(pc2) / "lab" / "versions").iterdir())) == 2
+    with pytest.raises(RuntimeError, match="last version number"):
+        fc._write_version(_store(pc2) / "lab", b"", {}, {},
+                          number=fc._VERSION_MAX + 1)
+
+
+def test_about_json_from_a_newer_build_is_never_downgraded(vault, trained):
+    """A GUI made at a later day may share the vault and write a newer
+    about.json. MEASURED before the fix: one Add tag rewrote it as format 1
+    and dropped the keys this build does not know; Save as dropped them
+    from the copy."""
+    p = _store(vault) / "frames" / "about.json"
+    doc = json.loads(p.read_text(encoding="utf-8"))
+    newer = dict(doc, format_version=2, owner="lab B")
+    p.write_text(json.dumps(newer), encoding="utf-8")
+    assert "From " in fc.open_classifier("frames")["summary"]   # still read
+    for call in (lambda: fc.add_tag("frames", "rig A"),
+                 lambda: fc.save_as("frames", "copy")):
+        with pytest.raises(RuntimeError, match="newer build"):
+            call()
+    assert json.loads(p.read_text(encoding="utf-8")) == newer
+    assert _names_in(_store(vault)) == ["frames"]
+    # The same format with a key this build does not know: kept.
+    p.write_text(json.dumps(dict(doc, owner="lab B")), encoding="utf-8")
+    fc.add_tag("frames", "rig A")
+    kept = json.loads(p.read_text(encoding="utf-8"))
+    assert kept["owner"] == "lab B" and kept["tags"] == ["rig A"]
+    fc.save_as("frames", "copy")
+    assert _about(vault, "copy")["owner"] == "lab B"
+
+
+def test_paths_carried_in_by_an_import_are_never_opened_here(
+        vault, trained, tmp_path, monkeypatch):
+    """A mark or a run record from another PC names a path on THAT PC.
+    MEASURED before the fix: Train stat-ed every imported mark, and "Which
+    model?" resolved every host-less record's folder — a UNC path among
+    them is an SMB connection to whatever host the file names. And a mark
+    whose path happened to exist here was read from THIS PC's file instead
+    of the features it was trained on."""
+    folder, _ = trained
+    fc.classify_folder("frames", str(folder))
+    e = fc.export_classifier("frames", str(tmp_path))["path"]
+    unc = "\\\\attacker-host.invalid\\share"
+    with zipfile.ZipFile(e) as zf:
+        doc = json.loads(zf.read("classes.json"))
+        rec = json.loads(zf.read("runs.jsonl").decode().splitlines()[0])
+    doc["labels"][unc + "\\frame_0001.png"] = "good"
+    rec.update(folder=unc + "\\cap", host="")
+    forged = _rezip(e, tmp_path / "forged.typhon-classifier.zip", change={
+        "classes.json": json.dumps(doc).encode(),
+        "runs.jsonl": (json.dumps(rec) + "\n").encode()})
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(tmp_path / "pc2"))
+    fc.import_classifier(str(forged))
+    _good(folder / "frame_0003.png", 200)     # here, that file is another picture
+    seen = []
+
+    def guard(real, what):
+        def call(p, *a, **k):
+            if "attacker-host" in str(p):
+                seen.append((what, str(p)))
+                raise OSError(f"blocked: {p}")
+            return real(p, *a, **k)
+        return call
+    monkeypatch.setattr(os, "stat", guard(os.stat, "stat"))
+    monkeypatch.setattr(os.path, "realpath",
+                        guard(os.path.realpath, "realpath"))
+    fc.mark_frame("frames", str(folder), "frame_0011.png", ["bad timing"])
+    t = fc.train("frames")
+    fc.classified_with(str(folder))
+    fc.run_history("", str(folder))
+    assert seen == []
+    assert "Reused the stored features of 5" in t["summary"], t["summary"]
+    assert "on 6 frames" in t["summary"]
+
+
+def _bulky(vault, name, rows):
+    """A trained classifier of ``rows`` all-zero frames: a model that
+    unpacks large and compresses to almost nothing. Returns its size
+    unpacked."""
+    d = _store(vault) / name
+    d.mkdir(parents=True)
+    marks = {"classes": ["a", "b"], "labels": {}}
+    (d / "classes.json").write_text(json.dumps(dict(marks, version=1)),
+                                    encoding="utf-8")
+    fc._write_about(d, {"origin": fc._new_origin(), "lineage": [], "tags": []})
+    model = {"X": np.zeros((rows, 1092), np.float32), "y": np.arange(rows) % 2,
+             "classes": ["a", "b"], "paths": [f"p{i}" for i in range(rows)]}
+    meta = {"sha256": fc._model_sha(model), "created": fc._now(),
+            "how": "trained", "frames": rows,
+            "frames_per_class": fc._per_class(model), "classes": ["a", "b"],
+            "accuracy": "", "feature_layout": fc.FEATURE_LAYOUT,
+            "feature_length": 1092}
+    fc._write_version(d, fc._npz_bytes(model), marks, meta)
+    return rows * 1092 * 4
+
+
+def test_a_bundle_unpacks_one_model_at_a_time_within_its_cap(vault, tmp_path,
+                                                             monkeypatch):
+    """MEASURED before the fix: a 0.02 MB bundle of five such models held
+    526 MB once checked — every model unpacked and kept until the last —
+    so the 1 GB bundle cap was really 1 GB per classifier in it."""
+    import tracemalloc
+    one = 0
+    for k in range(3):
+        one = _bulky(vault, f"big{k}", 6000)
+    out = tmp_path / "out"
+    out.mkdir()
+    path = Path(fc.export_classifiers(str(out))["path"])
+    assert path.stat().st_size < one / 10
+    tracemalloc.start()
+    try:
+        _index, items = fc._read_bundle(path)
+        held, _peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert len(items) == 3 and held < one, f"held {held >> 20} MB"
+    del items
+    monkeypatch.setattr(fc, "MAX_BUNDLE_BYTES", int(one * 2.5))
+    with pytest.raises(RuntimeError, match="unpacks to more than"):
+        fc._read_bundle(path)
+
+
+def test_malformed_records_are_skipped_or_refused_never_a_crash(
+        vault, trained, tmp_path, monkeypatch):
+    """MEASURED before the fix: one run record with a NUL in its folder made
+    "Which model?" raise ValueError for EVERY folder on the PC (Delete did
+    not help: deleted classifiers' records are searched too); counts that
+    were a list, or frames_per_class that was text, raised AttributeError;
+    an import whose origin was {} was neither known nor "Origin unknown";
+    a refused write of about.json surfaced as a raw PermissionError."""
+    folder, _ = trained
+    fc.classify_folder("frames", str(folder))
+    runs = _store(vault) / "frames" / fc.RUNS
+    with open(runs, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"when": "2026-10-05 10:00:00",
+                             "folder": "C:\\cap\x00x", "host": ""}) + "\n")
+        fh.write(json.dumps({"when": "2026-10-05 10:00:01",
+                             "folder": str(folder.resolve()),
+                             "counts": ["x"]}) + "\n")
+    h = fc.run_history("frames")
+    assert len(h["records"]) == 1 and "2 line(s)" in h["summary"]
+    assert fc.classified_with(str(folder))["classified_with"].startswith(
+        "Classified with frames v1")
+    meta_p = _store(vault) / "frames" / "versions" / "v1" / "meta.json"
+    meta = json.loads(meta_p.read_text(encoding="utf-8"))
+    meta_p.write_text(json.dumps(dict(meta, frames_per_class="x")),
+                      encoding="utf-8")
+    assert fc.list_versions("frames")["rows"][0].startswith("v1 (")
+    meta_p.write_text(json.dumps(meta), encoding="utf-8")
+    e = fc.export_classifier("frames", str(tmp_path))["path"]
+    with zipfile.ZipFile(e) as zf:
+        m = json.loads(zf.read("meta.json"))
+    bad_meta = _rezip(e, tmp_path / "m.typhon-classifier.zip", change={
+        "meta.json": json.dumps(dict(m, frames_per_class="x")).encode()})
+    bad_runs = _rezip(e, tmp_path / "r.typhon-classifier.zip", change={
+        "runs.jsonl": (json.dumps({"folder": "C:\\cap\x00x", "host": ""})
+                       + "\n").encode()})
+    no_origin = _rezip(e, tmp_path / "o.typhon-classifier.zip",
+                       manifest={"origin": {}})
+    nan_origin = _rezip(e, tmp_path / "n.typhon-classifier.zip",
+                        manifest={"origin": {"app": "x", "n": float("nan")}})
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(tmp_path / "pc2"))
+    for bad, msg in ((bad_meta, "meta.json does not describe"),
+                     (bad_runs, "run record is not readable"),
+                     (nan_origin, "where it came from is not readable")):
+        with pytest.raises(RuntimeError, match=msg):
+            fc.import_classifier(str(bad))
+    fc.import_classifier(str(no_origin), "anon")
+    assert fc.list_classifiers(fc.FILTER_UNKNOWN)["names"] == ["anon"]
+    assert fc.open_classifier("anon")["origin"] == fc.UNKNOWN_ORIGIN
+
+    def refused(path, obj):
+        raise PermissionError(13, "Access is denied", str(path))
+    monkeypatch.setattr(fc, "_write_json", refused)
+    with pytest.raises(RuntimeError, match="cannot save"):
+        fc.add_tag("anon", "rig A")
+
+
+RACE = textwrap.dedent('''
+    import json, sys, time
+    from pathlib import Path
+    repo, mode, who, start, frames = sys.argv[1:6]
+    sys.path.insert(0, repo)
+    import frame_classes as fc
+    if mode == "train":
+        fc._require_sklearn()
+    out, errors = None, []
+    while time.time() < float(start):
+        time.sleep(0.001)
+    if mode == "mark":
+        for i in range(40):
+            try:
+                fc.mark_frame("frames", frames, f"{who}_{i:02d}.png",
+                              ["good" if i % 2 else "bad timing"])
+            except Exception as exc:
+                errors.append(f"{type(exc).__name__}: {exc}")
+    elif mode == "open":
+        out = fc.open_classifier("frames")["version"]
+    elif mode == "train":
+        out = fc.train("frames")["version"]
+    elif mode == "record":
+        d = fc.store_dir("frames")
+        for i in range(300):
+            why = fc._append_run(d, {"who": who, "i": i})
+            if why:
+                errors.append(why)
+    print("__OUT__" + json.dumps({"out": out, "errors": errors}))
+''')
+
+
+def _race(tmp_path, mode, who, frames=""):
+    """One process per letter of ``who``, all starting ``mode`` at the same
+    instant — apps sharing the vault."""
+    drv = tmp_path / "race.py"
+    drv.write_text(RACE, encoding="utf-8")
+    env = dict(os.environ)
+    env.pop(fc.STORE_ENV, None)
+    start = time.time() + 5.0
+    procs = [subprocess.Popen(
+        [sys.executable, str(drv), str(REPO), mode, w, str(start), str(frames)],
+        cwd=str(tmp_path), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", env=env) for w in who]
+    outs = []
+    for proc in procs:
+        so, se = proc.communicate(timeout=240)
+        assert proc.returncode == 0, se[-1500:]
+        outs.append(json.loads(next(l for l in so.splitlines()
+                                    if l.startswith("__OUT__"))[7:]))
+    return outs
+
+
+def test_two_apps_marking_one_classifier_at_once_lose_no_mark(vault, tmp_path):
+    """MEASURED before the fix: two processes marking 40 frames each of one
+    classifier at the same time kept 39 of 80 marks — 35 reported as saved
+    and silently lost — because each read, changed and wrote classes.json
+    with nothing between them."""
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    for who in "AB":
+        for i in range(40):
+            Image.new("L", (8, 8), i).save(frames / f"{who}_{i:02d}.png")
+    for c in ("good", "bad timing"):
+        fc.add_class("frames", c)
+    fc.add_tag("frames", "shared")                  # both apps may change it
+    outs = _race(tmp_path, "mark", "AB", frames)
+    assert [o["errors"] for o in outs] == [[], []]
+    labels = json.loads((_store(vault) / "frames" / "classes.json")
+                        .read_text(encoding="utf-8"))["labels"]
+    assert len(labels) == 80
+
+
+def test_two_apps_opening_or_training_at_once_make_one_version(vault, capture,
+                                                               tmp_path):
+    """"Two numbers for one model would make the run record ambiguous."
+    MEASURED before the fix: three apps opening a classifier from before
+    versions at once made v1, v2 and v3 of one model; two pressing Train
+    at once made two versions of identical content."""
+    folder, _ = capture
+    _legacy(vault, folder)                  # only model.npz: Open adopts it
+    outs = _race(tmp_path, "open", "ABC")
+    assert len({o["out"] for o in outs}) == 1 and _versions(vault) == ["v1"]
+    fc.mark_frame("frames", str(folder), "frame_0011.png", ["bad timing"])
+    outs = _race(tmp_path, "train", "AB")
+    assert len({o["out"] for o in outs}) == 1
+    assert _versions(vault) == ["v1", "v2"]
+
+
+def test_two_apps_recording_runs_at_once_lose_no_record(vault, trained,
+                                                        tmp_path):
+    """Appending is seek-to-end-then-write on Windows, not one step across
+    processes. MEASURED before the fix (in 1 run of 3): two processes
+    appending 400 records each left 799 — one written over."""
+    outs = _race(tmp_path, "record", "AB")
+    assert [o["errors"] for o in outs] == [[], []]
+    lines = (_store(vault) / "frames" / fc.RUNS).read_text(
+        encoding="utf-8").splitlines()
+    got = {(r["who"], r["i"]) for r in map(json.loads, lines)}
+    assert len(lines) == 600 and len(got) == 600
+
+
+def test_a_store_inside_the_capture_folder_never_writes_there(
+        vault, trained, tmp_path, monkeypatch):
+    """The capture folder is only ever read. MEASURED before the fix: with
+    FRAME_CLASSES_STORE pointing at a capture folder (or a relative value
+    and a shortcut starting in one), classify_folder said "recorded" and
+    the capture folder gained the record."""
+    folder, _ = trained
+    e = fc.export_classifier("frames", str(tmp_path))["path"]
+    monkeypatch.setenv(fc.STORE_ENV, str(folder))   # a slip: the capture folder
+    fc.import_classifier(e)
+    assert "capture folder" in fc.store_info()["summary"]
+
+    def snap():
+        return sorted((str(p), p.stat().st_mtime_ns) for p in folder.rglob("*"))
+    before = snap()
+    r = fc.classify_folder("frames", str(folder))
+    assert "NOT recorded" in r["summary"] and "inside" in r["summary"]
+    for call in (lambda: fc.mark_frame("frames", str(folder), "frame_0001.png",
+                                       ["good"]),
+                 lambda: fc.train("frames")):
+        with pytest.raises(RuntimeError, match="inside the capture folder"):
+            call()
+    assert snap() == before
+
+
+@pytest.mark.parametrize("stamp", ["kept", "from before stamps"])
+def test_a_crash_before_the_copy_was_refreshed_never_reverts_the_model(
+        vault, trained, stamp):
+    """The crash: v2 renamed into place, the top-level copy never refreshed.
+    MEASURED before the fix: with v1's meta.json unreadable as well, a
+    read-only Open took the stale copy of v1 for an older build's Train,
+    made it v3 and current — the user's v2 replaced with no Train."""
+    folder, _ = trained
+    d = _store(vault) / "frames"
+    root, mirror = d / "model.npz", d / "mirror.json"
+    old_bytes, st = root.read_bytes(), root.stat()
+    old_stamp = mirror.read_bytes() if mirror.exists() else None
+    fc.mark_frame("frames", str(folder), "frame_0011.png", ["bad timing"])
+    v2 = fc.train("frames")
+    root.write_bytes(old_bytes)
+    os.utime(root, ns=(st.st_atime_ns, st.st_mtime_ns))
+    if stamp == "kept" and old_stamp is not None:
+        mirror.write_bytes(old_stamp)
+    elif mirror.exists():
+        mirror.unlink()
+    (d / "versions" / "v1" / "meta.json").write_text("", encoding="utf-8")
+    assert fc.open_classifier("frames")["version"] == v2["version"]
+    assert _versions(vault) == ["v1", "v2"]
+    with np.load(root, allow_pickle=False) as m:
+        top = {k: m[k] for k in m.files}
+    assert fc._model_sha(top) == v2["sha256"]
+
+
+def test_an_older_builds_train_is_adopted_even_when_it_matches_an_old_version(
+        vault, trained):
+    """An older build knows only model.npz. MEASURED before the fix: when
+    its Train equalled an earlier version (its user put a mark back), the
+    next Open took it for a stale copy and wrote the newer version over it
+    — that build's Train silently undone."""
+    folder, _ = trained
+    d = _store(vault) / "frames"
+    v1_sha = json.loads((d / "versions" / "v1" / "meta.json")
+                        .read_text(encoding="utf-8"))["sha256"]
+    v1_bytes = (d / "versions" / "v1" / "model.npz").read_bytes()
+    fc.mark_frame("frames", str(folder), "frame_0011.png", ["bad timing"])
+    fc.train("frames")
+    tmp = d / "model.npz.older-build"
+    tmp.write_bytes(v1_bytes)
+    os.replace(tmp, d / "model.npz")                # how an older build saves
+    r = fc.open_classifier("frames")
+    assert "older build is now frames v3" in r["summary"], r["summary"]
+    assert r["version"] == f"frames v3 ({v1_sha[:8]})"
+
+
+def test_a_classifier_moved_away_mid_classify_or_train_is_not_made_again(
+        vault, trained, tmp_path, monkeypatch):
+    """MEASURED before the fix: Delete or Rename from another app while a
+    classify ran left a new "frames" folder holding only that run's record
+    — listed as a classifier of unknown origin — and the next classifier
+    made under that name never recorded its origin."""
+    folder, _ = trained
+    store = _store(vault)
+    real_load, real_accuracy = fc._load_model, fc._accuracy
+
+    def gone(to):
+        os.rename(store / "frames", tmp_path / to)    # another app deletes it
+
+    def load_then_gone(name):
+        got = real_load(name)
+        gone("deleted1")
+        return got
+    monkeypatch.setattr(fc, "_load_model", load_then_gone)
+    r = fc.classify_folder("frames", str(folder))
+    assert "NOT recorded" in r["summary"] and "moved or deleted" in r["summary"]
+    assert not (store / "frames").exists()
+    monkeypatch.setattr(fc, "_load_model", real_load)
+    os.rename(tmp_path / "deleted1", store / "frames")
+    fc.mark_frame("frames", str(folder), "frame_0011.png", ["bad timing"])
+
+    def accuracy_then_gone(X, y):
+        gone("deleted2")
+        return real_accuracy(X, y)
+    monkeypatch.setattr(fc, "_accuracy", accuracy_then_gone)
+    with pytest.raises(RuntimeError, match="moved or deleted"):
+        fc.train("frames")
+    assert not (store / "frames").exists()
+    # A stray run record alone is not a classifier: one made there now
+    # records the app that made it.
+    stray = store / "frames"
+    stray.mkdir()
+    (stray / fc.RUNS).write_text("{}\n", encoding="utf-8")
+    _run_as(monkeypatch, _project(tmp_path / "apps", "example_typhon",
+                                  "Typhon"))
+    fc.add_class("frames", "good")
+    assert _about(vault, "frames")["origin"]["app"] == "Typhon"
+
+
+def test_the_latest_record_is_the_last_one_made_within_one_second(
+        vault, trained, monkeypatch):
+    """Records said when to the second. MEASURED before the fix: two
+    classifiers classifying one folder in the same second, or classify /
+    Train / classify within one, gave "Classified with" the FIRST — a
+    stable sort kept file order among equal times."""
+    folder, _ = trained
+    fc.save_as("frames", "frames-b")
+    monkeypatch.setattr(fc, "_now", lambda: "2026-10-05 10:18:09")
+    fc.classify_folder("frames", str(folder))
+    fc.classify_folder("frames-b", str(folder))
+    assert fc.classified_with(str(folder))["classified_with"].startswith(
+        "Classified with frames-b v1")
+    fc.mark_frame("frames", str(folder), "frame_0011.png", ["bad timing"])
+    v2 = fc.train("frames")["version"]
+    fc.classify_folder("frames", str(folder))
+    assert fc.run_history("frames", str(folder))["latest"].startswith(
+        f"Classified with {v2}")
+
+
+def test_a_name_typed_in_another_case_is_the_existing_classifier(
+        vault, trained, tmp_path):
+    """MEASURED before the fix: classify_folder('FRAMES') recorded
+    'FRAMES v1 (...)' and classifier 'FRAMES' while the list said 'frames';
+    the export was FRAMES-v1 and arrived on the other PC as 'FRAMES'."""
+    folder, _ = trained
+    r = fc.classify_folder("FRAMES", str(folder))
+    assert r["version"].startswith("frames v1 (")
+    rec = json.loads((_store(vault) / "frames" / fc.RUNS)
+                     .read_text(encoding="utf-8").splitlines()[-1])
+    assert rec["classifier"] == "frames" and rec["version_id"] == r["version"]
+    e = fc.export_classifier("Frames", str(tmp_path))
+    assert Path(e["path"]).name == "frames-v1.typhon-classifier.zip"
+    assert "'frames'" in fc.add_class("FRAMES", "dim")["summary"]
+    assert _names_in(_store(vault)) == ["frames"]
+
+
+def test_an_app_does_not_change_another_apps_classifier(vault, tmp_path,
+                                                        monkeypatch, capture):
+    """Every shipped capture app names its classifier "frames" by default.
+    MEASURED before the fix (Barbie v5 and Typhon built into one vault):
+    Typhon, its name box left alone, added classes and marks to Barbie's
+    classifier and its Train became Barbie's current model — nothing asked.
+    Another app's classifier is now read-only to this one until it is
+    copied (Save as) or tagged shared."""
+    folder, _ = capture
+    apps = tmp_path / "apps"
+    _run_as(monkeypatch, _project(apps, "example_barbie_capture_v5",
+                                  "Barbie Capture v5 — live"))
+    _mark_some(folder)
+    v1 = fc.train("frames")["version"]
+    _run_as(monkeypatch, _project(apps, "example_typhon", "Typhon"))
+    marks = (_store(vault) / "frames" / "classes.json").read_bytes()
+    for call in (lambda: fc.add_class("frames", "dim"),
+                 lambda: fc.remove_class("frames", ["good"]),
+                 lambda: fc.mark_frame("frames", str(folder), "frame_0011.png",
+                                       ["bad timing"]),
+                 lambda: fc.train("frames")):
+        with pytest.raises(RuntimeError, match="belongs to Barbie Capture v5 "
+                                               "— live .*Save as"):
+            call()
+    assert (_store(vault) / "frames" / "classes.json").read_bytes() == marks
+    assert fc.open_classifier("frames")["version"] == v1      # reading is fine
+    assert fc.classify_folder("frames", str(folder))["version"] == v1
+    fc.save_as("frames", "typhon-frames")                     # Typhon's own copy
+    assert "Added 'dim'" in fc.add_class("typhon-frames", "dim")["summary"]
+    assert _about(vault, "typhon-frames")["origin"]["app"] == \
+        "Barbie Capture v5 — live"                            # still its origin
+    fc.add_tag("frames", fc.SHARED_TAG)                       # every app's now
+    fc.mark_frame("frames", str(folder), "frame_0011.png", ["bad timing"])
+    t = fc.train("frames")
+    assert "belongs to Barbie Capture v5 — live" in t["summary"]
+    assert "current model there too" in t["summary"]
+
+
+def test_which_model_resolves_only_the_folder_asked_about(vault, trained,
+                                                          tmp_path, monkeypatch):
+    """MEASURED before the fix: classified_with resolved every record's
+    folder on the UI thread — 4 s at 5,000 records, 8-15 s at 20,000."""
+    folder, _ = trained
+    fc.classify_folder("frames", str(folder))
+    runs = _store(vault) / "frames" / fc.RUNS
+    rec = json.loads(runs.read_text(encoding="utf-8").splitlines()[0])
+    with open(runs, "a", encoding="utf-8") as fh:
+        for i in range(2000):
+            fh.write(json.dumps(dict(rec, folder=str(tmp_path / f"c{i % 40}")))
+                     + "\n")
+    calls = []
+    real = os.path.realpath
+    monkeypatch.setattr(os.path, "realpath",
+                        lambda p, *a, **k: (calls.append(p), real(p, *a, **k))[1])
+    line = fc.classified_with(str(folder))["classified_with"]
+    assert line.startswith("Classified with frames v1") and len(calls) <= 2
+
+
+def test_two_standalone_apps_both_called_main_py_are_not_one_app(
+        vault, tmp_path, monkeypatch):
+    """An app of its own need not be a Designer project. MEASURED before the
+    fix: two different folders' main.py sharing the vault each listed — and
+    would have exported — the other's classifiers as "This app"."""
+    for name in ("appA", "appB", "moved/appA"):
+        (tmp_path / name).mkdir(parents=True)
+        (tmp_path / name / "main.py").write_text("", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [str(tmp_path / "appA" / "main.py")])
+    fc.add_class("a-model", "x")
+    monkeypatch.setattr(sys, "argv", [str(tmp_path / "appB" / "main.py")])
+    assert fc.list_classifiers(fc.FILTER_THIS_APP)["names"] == []
+    fc.add_class("b-model", "x")
+    assert fc.list_classifiers(fc.FILTER_THIS_APP)["names"] == ["b-model"]
+    # The same app copied to another place keeps its classifiers.
+    monkeypatch.setattr(sys, "argv", [str(tmp_path / "moved/appA" / "main.py")])
+    assert fc.list_classifiers(fc.FILTER_THIS_APP)["names"] == ["a-model"]
+
+
+def test_the_app_filter_matches_part_of_a_title_whatever_its_dashes(
+        vault, tmp_path, monkeypatch):
+    """MEASURED before the fix: for a classifier from "Barbie Capture v5 —
+    live", the filters "Barbie", "barbie capture", "App: Barbie Capture v5"
+    and "App: Barbie Capture v5 - live" all found nothing — only the exact
+    title, em dash included, did."""
+    _run_as(monkeypatch, _project(tmp_path / "apps",
+                                  "example_barbie_capture_v5",
+                                  "Barbie Capture v5 — live"))
+    fc.add_class("frames", "ok")
+    for show in ("Barbie", "barbie capture", "App: Barbie Capture v5",
+                 "App: Barbie Capture v5 - live",
+                 "app: barbie  capture v5 – live", "Project: barbie_capture"):
+        assert fc.list_classifiers(show)["names"] == ["frames"], show
+    assert fc.list_classifiers("App: Typhon")["names"] == []
+
+
+def test_library_summaries_lead_short_and_name_no_folders(vault, trained,
+                                                          tmp_path, monkeypatch):
+    """Typhon's status label is 336x72. MEASURED before the fix: the Save
+    as, Export, Export all, Delete and Import summaries were 2 to 5 times
+    its height, with full paths as single unbreakable words. The paths are
+    in the "path" and "moved_to" keys."""
+    out = tmp_path / "out"
+    out.mkdir()
+    store = str(_store(vault))
+    e = fc.export_classifier("frames", str(out))
+    texts = {"export": e["summary"],
+             "save_as": fc.save_as("frames", "frames2")["summary"],
+             "export_all": fc.export_classifiers(str(out))["summary"],
+             "delete": fc.delete_classifier(["frames2"], "frames")["summary"],
+             "rename": fc.rename_classifier("frames", "frames3",
+                                            "frames")["summary"]}
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(tmp_path / "pc2"))
+    texts["import"] = fc.import_classifier(e["path"])["summary"]
+    texts["open"] = fc.open_classifier("frames")["summary"]
+    for what, text in texts.items():
+        assert len(text) <= 160, (what, len(text), text)
+        assert store not in text and str(out) not in text, (what, text)
+
+
+def test_an_empty_name_says_to_pick_or_type_one(vault):
+    """MEASURED before the fix: "'' is not a usable classifier name — use
+    letters, digits ..." — what Use selected said with nothing picked."""
+    for call in (lambda: fc.train(""), lambda: fc.add_class("", "a"),
+                 lambda: fc.predict_frame("", "x", "y")):
+        with pytest.raises(RuntimeError, match="pick a classifier in the "
+                                               "list, or type its name"):
+            call()
+    r = fc.open_classifier("")
+    assert (r["name"], r["classes"]) == ("", [])
+    assert r["summary"].startswith("Pick a classifier")
+
+
+def test_the_list_summary_reads_as_sentences(vault, tmp_path, monkeypatch):
+    """MEASURED before the fix: "1 saved classifier: frames Kept in ..."
+    (no full stop) and "(This app (Typhon (project example_typhon)))"."""
+    own = tmp_path / "own"
+    monkeypatch.setenv(fc.STORE_ENV, str(own))
+    fc.add_class("frames", "x")
+    assert fc.list_classifiers()["summary"] == \
+        f"1 saved classifier: frames. Kept in {own} (set by {fc.STORE_ENV})."
+    _run_as(monkeypatch, _project(tmp_path / "apps", "example_typhon",
+                                  "Typhon"))
+    fc.add_class("t1", "x")
+    s = fc.list_classifiers(fc.FILTER_THIS_APP)["summary"]
+    assert s.startswith("1 of 2 saved classifiers (This app: Typhon, project "
+                        "example_typhon): t1. Kept in "), s
+    assert "((" not in s and "))" not in s
