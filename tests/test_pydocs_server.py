@@ -141,6 +141,52 @@ def test_reexports_and_dunder_all_decide_public_names(tmp_path):
         "a private name typed exactly is still found"
 
 
+def test_a_stub_declaring_an_imported_name_is_one_object(tmp_path):
+    """numpy/__init__.pyi declares `class matrix` (no docstring) while
+    __init__.py imports it from numpy.matrixlib: the index had two entries
+    and two pages for one object, and one question read both — [1]
+    numpy.matrix, "(No docstring.)", and [4] numpy.matrixlib.defmatrix.matrix.
+    The sub-package's stub importing the name back from the top (as
+    numpy/matrixlib/__init__.pyi does) must not loop."""
+    write_pkg(tmp_path, {
+        "tw/__init__.py": "from .core import Grid, blend\n",
+        "tw/__init__.pyi": "class Grid:\n    def warp(self, k: float) -> None"
+                           ": ...\ndef blend(a: int) -> int: ...\n",
+        "tw/core.py": "class Grid:\n    'A grid of cells.'\n    def warp(self,"
+                      " k=1.0):\n        'Warp the grid by k.'\n"
+                      "def blend(a):\n    'Blend a.'\n    return a\n",
+        "tw/sub/__init__.py": "from ..core import *\n",
+        "tw/sub/__init__.pyi": "from tw import Grid as Grid\n",
+    })
+    idx = pd.build_index(pd.Finder([str(tmp_path)]), "tw")
+    grid = idx.lookup("tw.Grid")
+    assert (grid["qual"], grid["public"], grid["doc"]) == (
+        "tw.core.Grid", "tw.Grid", "A grid of cells.")
+    assert idx.lookup("tw.Grid.warp")["doc"] == "Warp the grid by k."
+    assert idx.lookup("tw.blend")["doc"] == "Blend a."
+    assert idx.lookup("tw.sub.Grid")["qual"] == "tw.core.Grid"
+    found = [e["public"] for _s, e in idx.search("grid cells warp", 10)]
+    assert found.count("tw.Grid") == 1 and found.count("tw.Grid.warp") == 1, \
+        found
+    page = pd.render_page(idx, grid)
+    assert "(No docstring.)" not in page and "A grid of cells." in page
+
+
+def test_a_documented_declaration_stays(tmp_path):
+    """numpy's C types (ndarray, dtype) are declared in the stub and get
+    their docstrings from add_newdoc: there is no source definition to
+    merge them into, and they must keep their pages."""
+    write_pkg(tmp_path, {
+        "cy/__init__.py": "from ._native import Arr\n",
+        "cy/__init__.pyi": "class Arr:\n    def size(self) -> int: ...\n",
+        "cy/_docs.py": "from numpy._core.function_base import add_newdoc\n"
+                       "add_newdoc('cy', 'Arr', 'An array.')\n",
+    })
+    idx = pd.build_index(pd.Finder([str(tmp_path)]), "cy")
+    assert idx.lookup("cy.Arr")["doc"] == "An array."
+    assert idx.lookup("cy.Arr.size") is not None
+
+
 def test_add_newdoc_calls_document_compiled_functions(tmp_path):
     """numpy documents its C functions this way; read as data, not run."""
     write_pkg(tmp_path, {

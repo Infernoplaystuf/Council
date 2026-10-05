@@ -1,7 +1,7 @@
 {
-  "version": 1,
+  "version": 2,
   "package": "glimmerquay",
-  "about": "Docs benchmark: an invented package (glimmerquay) served by tools/pydocs_mcp_server.py. Questions have exact expected facts (every fact must appear in the answer; a list inside facts means any one of those spellings) and the doc page that holds them. Code tasks have hidden tests that import the package. Negatives are questions the docs do NOT answer: the right reply is 'not covered'.",
+  "about": "Docs benchmark: an invented package (glimmerquay) served by tools/pydocs_mcp_server.py. Questions have exact expected facts (every fact must appear in the answer; a list inside facts means any one of those spellings) and the doc page that holds them. Code tasks have hidden tests that import the package. Negatives are questions the docs do NOT answer: the right reply is 'not covered'. Reordered items ask a question again with the pages that hold its answer moved behind those that do not, so page [1] holds no answer; every page the answer cites must hold it.",
   "questions": [
     {"id": "q01", "question": "What is the default capacity of a glimmerquay Ledger?",
      "facts": ["64"], "sources": ["glimmerquay.Ledger"]},
@@ -23,6 +23,10 @@
      "facts": ["mV", ["uV", "microvolt"], "kV"], "sources": ["glimmerquay.to_millivolts"]},
     {"id": "q10", "question": "What does the anchor parameter of a glimmerquay Cadence default to?",
      "facts": ["epoch"], "sources": ["glimmerquay.Cadence"]}
+  ],
+  "reordered": [
+    {"id": "r01", "question": "q05"},
+    {"id": "r02", "question": "q03"}
   ],
   "negatives": [
     {"id": "n01", "question": "How do I encrypt a glimmerquay frame with AES-256?"},

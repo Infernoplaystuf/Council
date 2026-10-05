@@ -12,12 +12,17 @@ MCP server and the same docs_qa path the user's questions take.
 WHAT IS SCORED
   * questions (10)  every expected fact appears in the answer, and a cited
                     page really contains the facts (citation correctness)
+  * reordered (2)   two of those questions again, with the pages that hold
+                    the answer moved behind the ones that do not: page [1]
+                    holds no answer, and EVERY cited page must hold it (see
+                    decoys_first)
   * negatives (2)   questions the docs do not answer: the right reply is
                     "not covered", not a confident invention
   * code tasks (5)  the model's code is run against hidden tests that import
                     the package, in a subprocess with a timeout, writes and
                     process launches blocked by an audit hook
-plus seconds and model calls per item, and whether output was constrained.
+plus seconds and model calls per item, whether output was constrained, how
+often page [1] is cited, and how many cited pages are right.
 
 THE CAPABILITY CHECK is a quick subset (3 questions, 1 negative, 1 code task)
 the Docs tab runs to tell a user whether the model in the docs role is fit
@@ -95,16 +100,41 @@ def fact_found(fact: Any, text: str) -> bool:
     return False
 
 
-def citation_ok(item: dict, ans: docs_qa.DocsAnswer) -> bool:
-    """A cited page holds the facts, or is one of the expected pages."""
+def page_ok(item: dict, src: docs_qa.Source) -> bool:
+    """The page is one of the expected pages, or holds every fact."""
     expected = {s.lower() for s in item.get("sources") or []}
-    for src in ans.cited_sources():
-        if src.ref.lower() in expected or src.title.lower() in expected:
-            return True
-        facts = item.get("facts") or []
-        if facts and all(fact_found(f, src.text) for f in facts):
-            return True
-    return False
+    if src.ref.lower() in expected or src.title.lower() in expected:
+        return True
+    facts = item.get("facts") or []
+    return bool(facts) and all(fact_found(f, src.text) for f in facts)
+
+
+def citation_ok(item: dict, ans: docs_qa.DocsAnswer) -> bool:
+    """A cited page holds the facts, or is one of the expected pages.
+
+    ANY cited page: an answer citing every page passes. That is how
+    questions have always been graded, so scores stay comparable; the
+    "reordered" items are graded strictly (every cited page), and the
+    summary reports cited pages right / cited pages for all of them."""
+    return any(page_ok(item, src) for src in ans.cited_sources())
+
+
+#: Questions asked twice: as written, and with the pages reordered by
+#: decoys_first. MEASURED on the 2026-10-05 runs: llama3.1:8b cited [1] in
+#: 9 of 10 questions, phi3.5 in 10 of 10, before and after the prompt
+#: stopped showing "[1]". With the pages ranked as now, "always cite [1]"
+#: passes the citation check for all 50 recorded question sets (5 runs x 10
+#: questions; the review's strategies.py) and so does "cite every page":
+#: nothing in the bench could fail either habit. These items can: q05 and
+#: q03, the two the [1] habit failed on before the ranking fix.
+def decoys_first(item: dict) -> Callable[[List[docs_qa.Source]],
+                                         List[docs_qa.Source]]:
+    """An order_pages for docs_qa.ask: the pages that do NOT hold the
+    answer first, then those that do, each group in retrieval order."""
+    def order(pages: List[docs_qa.Source]) -> List[docs_qa.Source]:
+        return ([p for p in pages if not page_ok(item, p)]
+                + [p for p in pages if page_ok(item, p)])
+    return order
 
 
 #: Run before the model's code: no writes, creates, deletes or renames
@@ -281,6 +311,10 @@ class ItemResult:
     #: Why this item could not be GRADED (the PC could not start the test
     #: process), "" when it was. Not counted as passed or failed.
     infra: str = ""
+    #: The page numbers the answer cites, and how many of those pages hold
+    #: the answer (page_ok) — precision, which citation_ok does not see.
+    cited: List[int] = field(default_factory=list)
+    cited_right: int = 0
 
 
 @dataclass
@@ -352,7 +386,12 @@ class BenchReport:
     def summary(self) -> Dict[str, Any]:
         qs, ns, cs = self._of("question"), self._of("negative"), \
             self._of("code")
+        rs = self._of("reordered")
         cited = [i for i in qs if i.citation_ok is not None]
+        # Precision over every item whose citations can be judged: "cite
+        # every page" passes citation_ok, and phi3.5 cited all 5 pages for
+        # c02 and 16 pages on its code tasks, 8 of them right.
+        judged = qs + rs + cs
         return {
             "model": self.model, "role": self.role,
             "passed": self.passed, "total": len(self.graded),
@@ -361,6 +400,10 @@ class BenchReport:
             "questions": f"{sum(i.passed for i in qs)}/{len(qs)}",
             "citations_right": f"{sum(bool(i.citation_ok) for i in cited)}"
                                f"/{len(cited)}",
+            "reordered": f"{sum(i.passed for i in rs)}/{len(rs)}",
+            "cites_page_1": f"{sum(1 in i.cited for i in qs)}/{len(qs)}",
+            "cited_pages_right": f"{sum(i.cited_right for i in judged)}/"
+                                 f"{sum(len(i.cited) for i in judged)}",
             "not_covered_right": f"{sum(i.passed for i in ns)}/{len(ns)}",
             "code": f"{sum(i.passed for i in cs)}/{len(cs)}",
             "mean_seconds": round(self.mean_seconds, 2),
@@ -392,6 +435,9 @@ class BenchReport:
         out += [f"questions {s['questions']}, citations right "
                 f"{s['citations_right']}, 'not covered' right "
                 f"{s['not_covered_right']}, code {s['code']}",
+                f"reordered (page [1] holds no answer) {s['reordered']}, "
+                f"page [1] cited in {s['cites_page_1']} questions, cited "
+                f"pages right {s['cited_pages_right']}",
                 f"{s['mean_seconds']:.1f} s per item, "
                 f"{s['mean_model_calls']:.1f} model calls per item"
                 + ("" if s["constrained"] else
@@ -413,6 +459,11 @@ def _select(bench: dict, items: Any) -> List[tuple]:
     for q in bench.get("questions", []):
         if want is None or q["id"] in want:
             chosen.append(("question", q))
+    asked = {q["id"]: q for q in bench.get("questions", [])}
+    for r in bench.get("reordered", []):
+        if (want is None or r["id"] in want) and r["question"] in asked:
+            chosen.append(("reordered", dict(asked[r["question"]],
+                                             id=r["id"], of=r["question"])))
     for q in bench.get("negatives", []):
         if want is None or q["id"] in want:
             chosen.append(("negative", q))
@@ -420,6 +471,12 @@ def _select(bench: dict, items: Any) -> List[tuple]:
         if want is None or q["id"] in want:
             chosen.append(("code", q))
     return chosen
+
+
+def bench_items(bench: dict, items: Any = "all") -> List[tuple]:
+    """[(kind, item)] in the order run() asks them; a reordered item is its
+    question's item under its own id, with "of" naming the question."""
+    return _select(bench, items)
 
 
 def run(model_call: Optional[docs_qa.ModelCall] = None, *,
@@ -455,7 +512,9 @@ def run(model_call: Optional[docs_qa.ModelCall] = None, *,
                               packages=[bench["package"]],
                               write_code=(kind == "code"),
                               model_call=model_call, derive=derive, mode=mode,
-                              should_stop=should_stop, chat_tools=chat_tools)
+                              should_stop=should_stop, chat_tools=chat_tools,
+                              order_pages=(decoys_first(item)
+                                           if kind == "reordered" else None))
             if ans.stopped:
                 report.stopped = True
                 break
@@ -480,13 +539,27 @@ def _grade(kind: str, item: dict, ans: docs_qa.DocsAnswer) -> ItemResult:
     if ans.error and not ans.ok:
         r.detail = ans.error
         return r
-    if kind == "question":
+    r.cited = list(ans.cited)
+    if kind != "negative":
+        r.cited_right = sum(page_ok(item, s) for s in ans.cited_sources())
+    if kind in ("question", "reordered"):
         missing = [f for f in item["facts"] if not fact_found(f, ans.answer)]
-        r.citation_ok = citation_ok(item, ans)
+        wrong = [s for s in ans.cited_sources() if not page_ok(item, s)]
+        if kind == "question":
+            r.citation_ok = citation_ok(item, ans)
+        else:
+            # Strict: page [1] and the pages before the answer's hold none
+            # of it, so "cite [1]" and "cite them all" both fail here.
+            r.citation_ok = bool(ans.cited) and not wrong
+            if ans.sources and page_ok(item, ans.sources[0]):
+                r.notes.append("Every page read holds the answer: the "
+                               "order could not be tested.")
         r.passed = ans.covered and not missing and r.citation_ok
         r.detail = ("not covered (wrong)" if not ans.covered else
                     f"missing {missing}" if missing else
-                    "" if r.citation_ok else "cited the wrong page")
+                    "" if r.citation_ok else "cited the wrong page"
+                    + (f" ([{wrong[0].n}] {wrong[0].ref} does not hold the "
+                       f"answer)" if wrong else ""))
     elif kind == "negative":
         r.passed = not ans.covered
         r.detail = "" if r.passed else f"invented: {ans.answer[:120]}"
