@@ -165,16 +165,20 @@ class DisplayDecoder:
     shows it almost black. Shifting by the bits it actually uses shows it as
     the camera saw it.
 
-    THE SHIFT ONLY EVER GROWS within a folder. Worked out per frame, a dark
+    THE SHIFT ONLY EVER GROWS within a RUN. Worked out per frame, a dark
     frame would get a smaller shift than its neighbours and flash brighter
-    during playback.
+    during playback. Not per folder: one folder can hold a Mono16 run and a
+    Mono10 run (a preset changes the pixel format between them), and the
+    Mono10 frames reviewed with the Mono16 run's shift were 1/64 as bright.
     """
 
     def __init__(self) -> None:
         self.shift = 0
+        self._shifts: dict = {}
 
     def reset(self) -> None:
         self.shift = 0
+        self._shifts = {}
 
     def __call__(self, path: str) -> Any:
         from PIL import Image
@@ -188,7 +192,10 @@ class DisplayDecoder:
 
                 data = np.asarray(im)
                 top = int(data.max()) if data.size else 0
-                self.shift = max(self.shift, max(0, top.bit_length() - 8))
+                run = run_of(path)
+                self.shift = max(self._shifts.get(run, 0),
+                                 max(0, top.bit_length() - 8))
+                self._shifts[run] = self.shift
                 return (data >> self.shift).astype(np.uint8)
             if im.mode == "F":
                 return im.convert("L")
@@ -448,7 +455,8 @@ class CaptureReviewer(QObject):
 
         if self.live and self.mode == PNG and frame is not None:
             # No copy: see council_core.live_display for why it is safe.
-            self.canvas.set_array(self.prep(frame.image), copy=False)
+            fmt = (getattr(frame, "meta", None) or {}).get("format")
+            self.canvas.set_array(self.prep(frame.image, fmt), copy=False)
             self._shown = None
             return True
         return False

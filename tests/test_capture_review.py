@@ -925,3 +925,34 @@ def test_drawing_on_the_live_view_sets_that_part_of_the_sensor(ui, tmp_path):
     assert device.roi().as_tuple() == (108, 70, 64, 32)
     ui.on_btn_full_sensor()
     assert device.roi().as_tuple() == (0, 0, 640, 480)
+
+
+def test_a_lower_bit_depth_after_a_higher_one_is_not_shown_dark(ui):
+    """The live view's shift is per pixel format (Frame.meta["format"]):
+    after Mono16 the same shift made a Mono12 picture 1/16 as bright."""
+    from council_core.cameras import Frame
+
+    rv = ui._capture_review
+    rv.live = True
+    canvas = ui.ports.live_view.widget
+    for fmt, value in (("Mono16", 65280), ("Mono12", 4080)):
+        frame = Frame(np.full((48, 64), value, np.uint16), 1, 0,
+                      {"kind": "frame", "format": fmt})
+        assert rv.tick(frame)
+    assert canvas._base.pixelColor(10, 10).red() == 255
+
+
+def test_saved_runs_of_two_bit_depths_each_fill_the_display(tmp_path):
+    """One folder, a Mono16 run then a Mono10 run (a preset changed the
+    format between them): reviewed with the first run's shift, the second
+    was 1/64 as bright."""
+    from PIL import Image
+
+    Image.fromarray(np.full((8, 8), 65280, np.uint16)).save(
+        tmp_path / "20261005_100000_frame_000001.png")
+    Image.fromarray(np.full((8, 8), 1020, np.uint16)).save(
+        tmp_path / "20261005_110000_frame_000001.png")
+    decode = cr.DisplayDecoder()
+    decode(str(tmp_path / "20261005_100000_frame_000001.png"))
+    shown = decode(str(tmp_path / "20261005_110000_frame_000001.png"))
+    assert int(shown.max()) == 255

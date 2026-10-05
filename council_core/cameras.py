@@ -164,6 +164,11 @@ class Frame:
     pixels; adding this origin is what turns it into sensor pixels for the
     camera. It travels WITH the frame because the area can change between
     the frame being taken and the box being drawn on it.
+
+    `meta["format"]`, where the camera has one, is the pixel format the
+    frame was taken in ("Mono12"). Mono10, Mono12 and Mono16 all arrive as
+    uint16, so the dtype alone cannot tell a display that the bit depth
+    changed under it (live_display.DisplayPrep).
     """
     image: Any
     index: int = 0
@@ -596,6 +601,10 @@ class BaslerDevice(Device):
         #: once at start, not four node reads per frame. It cannot change
         #: while grabbing — set_roi refuses then.
         self._aoi: Optional[Tuple[int, int, int, int]] = None
+        #: The pixel format the stream was started with (Frame.meta
+        #: ["format"]), read once at start for the same reason: it is
+        #: locked while grabbing too.
+        self._format = ""
 
     # -- node map helpers ------------------------------------------------
     def _node(self, name: str) -> Any:
@@ -832,6 +841,7 @@ class BaslerDevice(Device):
                 count = max(10, min(200, self.RECORD_BUFFER_BYTES // payload))
                 self._try_set("MaxNumBuffer", int(count))
         self._aoi = self.roi().as_tuple()
+        self._format = str(self._value("PixelFormat", "") or "")
         if strategy is None:
             self._cam.StartGrabbing()
         else:
@@ -884,6 +894,8 @@ class BaslerDevice(Device):
         meta: Dict[str, Any] = {"kind": "frame"}
         if self._aoi is not None:
             meta["aoi"] = self._aoi
+        if self._format:
+            meta["format"] = self._format
         if skipped:
             meta["skipped_by_camera"] = skipped
         return Frame(image=image, index=self._index, timestamp_us=stamp,
@@ -1817,7 +1829,8 @@ class SyntheticDevice(Device):
             image = image.astype(np.uint16) << 4
         return Frame(image, self._index, self._index * 1000,
                      {"kind": "frame", "simulated": True,
-                      "aoi": roi.as_tuple()})
+                      "aoi": roi.as_tuple(),
+                      "format": str(state["PixelFormat"])})
 
 
 # ======================================================================

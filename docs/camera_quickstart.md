@@ -697,6 +697,15 @@ with those values **unaltered** (verified lossless).
 | BGRA8, RGB16, YUV, 10/12-bit colour | converted to 8-bit RGB as each frame is saved (extra CPU; 16-bit colour loses its low bits) |
 | anything pylon cannot convert | the capture stops with a message naming the format |
 
+On screen, a 16-bit frame is shifted down by the bits it actually uses, and
+that shift only grows (so a dark frame never flashes brighter than its
+neighbours) — **within one pixel format**. Each frame says the format it was
+taken in, so changing Mono16 → Mono12 → Mono10 in the settings window or with
+a preset starts the shift again; before, the live view kept Mono16's shift and
+showed Mono12 at 1/16 of its brightness (measured on the emulator). Saved
+frames are shifted per run, so a Mono16 run and a Mono10 run in one folder
+each fill the display when reviewed.
+
 The Basler scan shows this for every format the connected camera offers. One known consequence:
 `frame_classes.thumbnail` scales 16-bit input as if it filled the full range,
 so a 12-bit frame reads dark *to the classifier*.

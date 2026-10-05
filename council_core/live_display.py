@@ -66,21 +66,36 @@ class DisplayPrep:
 
     One per viewer: the 16-bit shift it learns belongs to what that viewer
     shows. `reset()` when the camera changes (a new connection).
+
+    THE SHIFT BELONGS TO ONE PIXEL FORMAT. It only grows, so that a dark
+    frame does not flash brighter than its neighbours — but a camera whose
+    pixel format changes under a running live view (the settings window, a
+    preset) changes how many bits the same uint16 holds. Measured on pylon's
+    emulator before: Mono16 then Mono12 showed the Mono12 picture at 15 of
+    255 (shift 8 kept), Mono10 at 3 — a black live view until Disconnect.
+    So the shift starts again whenever the frame's format (Frame.meta
+    ["format"], else its dtype and shape) is not the last one's.
     """
 
     def __init__(self) -> None:
         self.shift = 0
         self._pool = FramePool(POOL_BYTES)
+        self._format: Any = None
 
     def reset(self) -> None:
         self.shift = 0
+        self._format = None
         self._pool.clear()
 
-    def __call__(self, image: Any) -> Any:
+    def __call__(self, image: Any, fmt: Any = None) -> Any:
         np = _numpy()
         data = image
         if data is None:
             return None
+        kind = (fmt, data.dtype.str, data.ndim)
+        if kind != self._format:
+            self._format = kind
+            self.shift = 0
         if data.dtype == np.uint8 and (data.ndim == 2 or (
                 data.ndim == 3 and data.shape[2] in (3, 4))):
             # Wrapped as it is. A view whose rows are not contiguous (a

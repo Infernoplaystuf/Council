@@ -808,3 +808,26 @@ def test_an_area_set_from_the_settings_window_clears_the_crop_box_too():
     viewer.roi = _Port("10, 10, 100, 100")
     frame_camera.set_camera_area("64, 64, 128, 128")
     assert viewer.roi.get() == ""
+
+
+# -- A lower bit depth after a higher one is not shown dark ---------------
+def test_a_lower_bit_depth_after_a_higher_one_fills_the_display():
+    """The shift only grew: measured on pylon's emulator, Mono16 then
+    Mono12 showed the live picture at 15 of 255, Mono10 at 3 — a black live
+    view until Disconnect, after a pixel format change in the settings
+    window or a preset."""
+    prep = DisplayPrep()
+    prep(np.full((8, 8), 65280, np.uint16), "Mono16")
+    assert int(prep(np.full((8, 8), 4080, np.uint16), "Mono12").max()) == 255
+    assert int(prep(np.full((8, 8), 1020, np.uint16), "Mono10").max()) == 255
+    # Within one format the shift still only grows.
+    assert int(prep(np.full((8, 8), 200, np.uint16), "Mono10").max()) == 50
+
+
+def test_a_frame_says_the_pixel_format_it_was_taken_in():
+    viewer = live("frame")
+    assert viewer.frames[-1].meta["format"] == "Mono8"
+    frame_camera.set_camera_setting("PixelFormat", "Mono12")
+    viewer.frames.clear()
+    ticks(viewer, 0.2)
+    assert viewer.frames[-1].meta["format"] == "Mono12"

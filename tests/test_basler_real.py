@@ -349,3 +349,20 @@ def test_a_preset_saved_in_the_window_puts_the_emulator_back(
     assert cam.PixelFormat.GetValue() == "Mono12"
     assert fc.current_area()["area"] == "96, 64, 320, 240"
     assert "✓ area: 96, 64, 320, 240" in window.took_box.toPlainText()
+
+
+# ======================================================================
+# Review: what the adversarial pass found on the emulator
+# ======================================================================
+def test_a_frame_says_its_pixel_format_so_the_display_can_follow(device):
+    """Mono10/12/16 all arrive as uint16. Measured before: after Mono16,
+    the live view showed Mono12 at 15 of 255 and Mono10 at 3."""
+    from council_core.live_display import DisplayPrep
+
+    prep = DisplayPrep()
+    for fmt in ("Mono16", "Mono12", "Mono10"):
+        device._cam.Gain.SetValue(12.0)
+        frame = grab_one(device, fmt)
+        assert frame.meta["format"] == fmt
+        shown = prep(frame.image, frame.meta["format"])
+        assert int(shown.max()) >= 250, (fmt, int(shown.max()))
