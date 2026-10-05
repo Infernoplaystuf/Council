@@ -563,10 +563,11 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         session.record_to(recorder, reset=True)
     except OSError as exc:
         raise RuntimeError(f"cannot save frames into {out}: {exc}") from exc
-    # After the boxes beside Start were applied and before the stream runs
-    # for the run: the camera as every picture of this run will have it.
-    record, record_note = _write_camera_record(out, run, device)
-    _LIVE.record_path = record
+    # READ after the boxes beside Start were applied and before the stream
+    # runs for the run — the camera as every picture of this run will have
+    # it — and WRITTEN only once the capture has started, so a Start that
+    # fails below leaves no record of a run that never happened.
+    content, record_note = _camera_record(run, device)
 
     raw = None
     if getattr(device, "records_raw", False):
@@ -595,6 +596,10 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         _started_stream(session)
     _LIVE.capturing = True
     _LIVE.previewing = False
+    record = None
+    if content is not None:
+        record, record_note = _save_camera_record(out, run, content)
+    _LIVE.record_path = record
 
     said = f"Capturing into {out}."
     if raw is not None:
@@ -1372,14 +1377,16 @@ def _on_network_share(path: Path) -> bool:
 # ======================================================================
 # The run's camera record (<run>_camera.json)
 # ======================================================================
-def _write_camera_record(folder: Path, run: str, device: Any
-                         ) -> "tuple[Optional[Path], str]":
-    """Write the run's camera record; (its path, "") or (None, why not).
+def _camera_record(run: str, device: Any
+                   ) -> "tuple[Optional[Dict[str, Any]], str]":
+    """The run's camera record as it is now; (the record, "") or (None, why
+    it could not be made).
 
     NEVER A REASON NOT TO CAPTURE. The record is what lets the run be read
-    later — which camera, where on its sensor, how it was set — but a full
-    disk or a refused name is said in Start's summary, not raised: the
-    frames are the user's data and the capture goes ahead."""
+    later — which camera, where on its sensor, how it was set — but a camera
+    that cannot describe itself, a full disk or a refused name is said in
+    Start's summary, never raised: the frames are the user's data and the
+    capture goes ahead."""
     from council_core import camera_record
 
     try:
@@ -1394,16 +1401,32 @@ def _write_camera_record(folder: Path, run: str, device: Any
         camera = {k: getattr(info, k, "") for k in
                   ("backend", "model", "serial", "vendor", "kind")}
         camera["label"] = getattr(info, "label", "") or ""
-        record = camera_record.build(
+        return camera_record.build(
             run=run, camera=camera, sensor=(limits.width, limits.height),
             area=area.as_tuple(), settings=listed, settings_error=error,
             preset=preset, preset_changed=changed, app=_app_identity(),
-            software=_software(), host=_host_name())
+            software=_software(), host=_host_name()), ""
+    except Exception as exc:                              # noqa: BLE001
+        return None, _not_recorded(run, exc)
+
+
+def _save_camera_record(folder: Path, run: str, record: Dict[str, Any]
+                        ) -> "tuple[Optional[Path], str]":
+    """Write it beside the run's other files: (its path, "") or (None, why
+    not) — see _camera_record."""
+    from council_core import camera_record
+
+    try:
         return camera_record.write(folder, run, record), ""
     except Exception as exc:                              # noqa: BLE001
-        return None, (f"The run's camera record ({run}"
-                      f"{camera_record.RECORD_SUFFIX}) was NOT written: "
-                      f"{_said(exc)}.")
+        return None, _not_recorded(run, exc)
+
+
+def _not_recorded(run: str, exc: BaseException) -> str:
+    from council_core import camera_record
+
+    return (f"The run's camera record ({run}{camera_record.RECORD_SUFFIX}) "
+            f"was NOT written: {_said(exc)}.")
 
 
 def _preset_still_in_use(listed: List[Dict[str, Any]], area: Any

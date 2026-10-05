@@ -1233,6 +1233,23 @@ def test_presets_and_the_run_record_use_the_sensor_the_camera_reports(
         "IMX636", "00051234", "Prophesee")
 
 
+def test_a_start_that_fails_leaves_no_record_of_a_run(tmp_path, monkeypatch):
+    """Read before the stream starts, written only once it has: a camera
+    that refuses to start leaves no record of a run that never happened."""
+    connected("frame")
+
+    def unplugged():
+        raise cameras.CameraError("the camera was unplugged")
+
+    monkeypatch.setattr(device(), "start", unplugged)
+    runs = tmp_path / "runs"
+    with pytest.raises(Exception, match="unplugged"):
+        frame_camera.start(str(runs))
+    assert not frame_camera._LIVE.capturing
+    assert not list(runs.glob("*_camera.json"))
+    assert frame_camera._LIVE.record_path is None
+
+
 def test_a_record_that_cannot_be_written_never_stops_the_capture(
         tmp_path, monkeypatch):
     from council_core import camera_record
