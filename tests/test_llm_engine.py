@@ -55,6 +55,7 @@ def eng(tmp_path, monkeypatch, fake):
     monkeypatch.setattr(ce, "_hardware_gb", lambda: (8.0, 31.7))
     local_models.invalidate_cache()
     ce.refresh_backend_config()
+    monkeypatch.setattr(ce, "_OLLAMA_CPT", {})     # no ratio learned yet
     yield SimpleNamespace(ce=ce, vault=vault, fake=fake)
     ce.refresh_backend_config()
     local_models.invalidate_cache()
@@ -115,6 +116,83 @@ def test_an_over_long_prompt_is_clamped_before_ollama_sees_it(eng):
     total = sum(len(m["content"]) for m in sent["messages"])
     assert total < 1024 * 3, "the prompt went out over the window"
     assert "trimmed to fit" in sent["messages"][1]["content"]
+
+
+# ============================================================
+# The window: learned chars per token, and a refusal instead of a cut
+# ============================================================
+
+def _window_slot(eng, n_ctx=1024):
+    _slots(eng, {"a": {"path": "ollama:phi3.5:latest", "n_ctx": n_ctx}},
+           {"coder": "a"})
+
+
+def test_every_chat_asks_the_server_to_refuse_rather_than_cut(eng):
+    """Ollama drops the FRONT of an over-long prompt — the system prompt —
+    unless truncate is false (measured on 0.35: a 1,655-token prompt at
+    num_ctx 512 was answered from its last 258 tokens)."""
+    eng.ce.local_chat(MSGS, model="ollama:llama3.1:8b")
+    assert eng.fake.state.chats[-1]["truncate"] is False
+
+
+def test_dense_text_the_estimate_misses_is_refitted_not_cut(eng):
+    """phi3.5 counts a .gspec at 2.44 chars a token; the clamp's starting
+    3.0 lets that prompt past num_ctx. The server refuses it with the exact
+    count, the engine re-fits at that ratio, and the second request fits —
+    with the system prompt intact."""
+    eng.fake.state.chars_per_token = 2.4
+    _window_slot(eng)
+    big = [{"role": "system", "content": "RULES-AT-THE-FRONT"},
+           {"role": "user", "content": '{"k": 1}, ' * 1200}]
+    out = eng.ce.local_chat(big, role="coder", num_predict=50)
+    assert out == "Hello from the fake."
+    assert eng.fake.state.refused == 1
+    sent = eng.fake.state.chats[-1]
+    assert sent["messages"][0]["content"] == "RULES-AT-THE-FRONT"
+    assert eng.ce.last_call_stats("coder").get("prompt_refits") == 1
+
+
+def test_the_ratio_learned_from_one_call_fits_the_next_first_time(eng):
+    eng.fake.state.chars_per_token = 2.4
+    _window_slot(eng)
+    big = [{"role": "user", "content": '{"k": 1}, ' * 1200}]
+    eng.ce.local_chat(big, role="coder", num_predict=50)
+    assert eng.fake.state.refused == 1
+    eng.ce.local_chat(big, role="coder", num_predict=50)
+    assert eng.fake.state.refused == 1, "the lesson was not kept"
+
+
+def test_a_model_that_packs_text_well_gets_more_of_its_window(eng):
+    """llama3.1:8b reads code at ~4.1 chars a token: once measured, the
+    clamp keeps more of a long prompt than the flat 3.0 did."""
+    eng.fake.state.chars_per_token = 4.0
+    _window_slot(eng, 2048)
+    first = [{"role": "user", "content": "word " * 600}]       # fits
+    eng.ce.local_chat(first, role="coder", num_predict=200)
+    big = [{"role": "user", "content": "word " * 4000}]
+    eng.ce.local_chat(big, role="coder", num_predict=200)
+    kept = len(eng.fake.state.chats[-1]["messages"][0]["content"])
+    assert kept > (2048 - 200) * 3.0 * 0.9 * 1.25
+    assert eng.fake.state.refused == 0
+
+
+def test_an_implausible_count_is_not_learned(eng):
+    """A server that counted only part of a prompt (a cached prefix) would
+    teach a ratio no tokenizer has, and the next prompt would overflow."""
+    eng.ce._ollama_learn("m", 50_000, 120)
+    eng.ce._ollama_learn("m", 1_000, 80)          # 12.5: also a miscount
+    assert eng.ce._ollama_cpt("m") == eng.ce._OLLAMA_CPT_DEFAULT
+
+
+def test_a_prompt_that_cannot_fit_says_so(eng):
+    """Two re-fits, then a clear error — not an endless retry. Messages
+    each under the clamp's floor sum past the window on their own."""
+    eng.fake.state.chars_per_token = 1.0
+    _window_slot(eng, 512)
+    many = [{"role": "user", "content": "y" * 70} for _ in range(40)]
+    with pytest.raises(RuntimeError, match="does not fit"):
+        eng.ce.local_chat(many, role="coder", num_predict=50)
+    assert eng.fake.state.refused == 3
 
 
 def test_the_engine_never_routes_to_a_remote_host(eng):

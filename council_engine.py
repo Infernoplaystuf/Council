@@ -2796,11 +2796,85 @@ def _ollama_load_allowance() -> float:
         return _DEFAULT_OLLAMA_LOAD_ALLOWANCE
 
 
+#: Chars per token before a model has been measured. Measured 2026-10-05 on
+#: Ollama 0.35 (prompt_eval_count, 9,000-char samples): llama3.1:8b prose
+#: 3.76, code 4.09, a .gspec (JSON) 3.05; phi3.5 prose 3.29, code 3.26,
+#: JSON 2.44. No character rule fits both: a content-aware count still
+#: spread ~1.25x across those samples. So the clamp starts here, learns
+#: each model's own ratio from what the server counts (_ollama_learn), and
+#: a prompt that still overflows is refused by the server — never cut —
+#: and re-fitted with the exact count (_ollama_overflow).
+_OLLAMA_CPT_DEFAULT = 3.0
+#: Ratios kept per model; the LOWEST (densest content seen) is used.
+_OLLAMA_CPT_KEEP = 8
+#: Above this a "measured" ratio is a miscount, not a tokenizer.
+_OLLAMA_CPT_PLAUSIBLE = 6.0
+_OLLAMA_CPT: Dict[str, List[float]] = {}
+_OLLAMA_CPT_LOCK = threading.Lock()
+
+
 def _ollama_count(text: str) -> int:
-    """Token estimate for clamping an Ollama prompt — no tokenizer here, so
-    3 chars a token: phi3.5 measures 2.69 on the Describe prompt and ~3 on
-    code, so 4 (estimate_tokens' fallback) let prompts past num_ctx."""
-    return max(1, (len(text or "") + 2) // 3)
+    """Token estimate at the default ratio — see _OLLAMA_CPT_DEFAULT."""
+    return _ollama_counter(_OLLAMA_CPT_DEFAULT)(text)
+
+
+def _ollama_text_chars(messages: List[Dict[str, Any]]) -> int:
+    """Characters of TEXT in ``messages`` — what the clamp counts."""
+    n = 0
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, str):
+            n += len(c)
+    return n
+
+
+def _ollama_learn(name: str, chars: int, tokens: Any) -> None:
+    """Record chars/token for ``name`` from a count the server made. The
+    count includes the chat template, so the ratio is a little LOW — the
+    safe side. Tiny prompts are skipped: there the template dominates."""
+    if not isinstance(tokens, int) or tokens < 64 or chars < 256:
+        return
+    if chars / tokens > _OLLAMA_CPT_PLAUSIBLE:
+        # No tokenizer packs text that densely: the server counted only
+        # part of the prompt (a reused cache prefix, an old build). Learning
+        # it would let the next prompt past num_ctx.
+        return
+    with _OLLAMA_CPT_LOCK:
+        seen = _OLLAMA_CPT.setdefault(name, [])
+        seen.append(chars / tokens)
+        del seen[:-_OLLAMA_CPT_KEEP]
+
+
+def _ollama_cpt(name: str) -> float:
+    """Chars per token to clamp ``name``'s prompts with: the densest of its
+    recent prompts, else the default; never above 6 or below 1."""
+    with _OLLAMA_CPT_LOCK:
+        seen = list(_OLLAMA_CPT.get(name) or ())
+    cpt = min(seen) if seen else _OLLAMA_CPT_DEFAULT
+    return max(1.0, min(6.0, cpt))
+
+
+def _ollama_counter(cpt: float) -> Callable[[str], int]:
+    def count(text: str) -> int:
+        return max(1, int(-(-len(text or "") // cpt)))
+    return count
+
+
+_OVERFLOW = re.compile(r"exceed_context_size_error"
+                       r"|exceeds the available context size", re.IGNORECASE)
+_OVERFLOW_TOKENS = re.compile(r"n_prompt_tokens\W{0,4}(\d+)"
+                              r"|request \((\d+) tokens\)", re.IGNORECASE)
+
+
+def _ollama_overflow(exc: "_OllamaHTTPError") -> Optional[int]:
+    """The prompt's exact token count when the server REFUSED it for not
+    fitting num_ctx (we send truncate=false), else None."""
+    if exc.status != 400 or not _OVERFLOW.search(exc.text):
+        return None
+    m = _OVERFLOW_TOKENS.search(exc.text)
+    if not m:
+        return None
+    return int(m.group(1) or m.group(2))
 
 
 def _hardware_gb() -> Tuple[Optional[float], Optional[float]]:
@@ -3067,6 +3141,12 @@ def _ollama_stream(host: str, name: str, messages: List[Dict[str, Any]], *,
         "model": name, "messages": _ollama_messages(messages),
         "stream": True, "options": options,
         "keep_alive": _ollama_keep_alive(),
+        # Refuse an over-long prompt (HTTP 400 with its exact token count)
+        # instead of silently dropping its FRONT — the system prompt and
+        # the instructions. Measured on Ollama 0.35: without it a 1,655-
+        # token prompt at num_ctx 512 answered from the last 258 tokens.
+        # A server too old to know the field ignores it.
+        "truncate": False,
     }
     if fmt is not None:
         payload["format"] = fmt
@@ -3301,19 +3381,47 @@ def _ollama_local(
         # a structured reply is cut off mid-object (gpt-oss spent 285 of its
         # tokens thinking on a short warm call, measured).
         num_predict = int(num_predict) + _think_headroom()
+    model_name = entry["name"]
+    wanted_predict = num_predict
+    cpt = _ollama_cpt(model_name)
     msgs, num_predict = _clamp_messages_to_ctx(
-        messages, num_predict, num_ctx, count_tokens=_ollama_count)
+        messages, wanted_predict, num_ctx, count_tokens=_ollama_counter(cpt))
     fmts: List[Any] = [json_schema, "json", None] if json_schema is not None \
         else [None]
     last_exc: Optional[BaseException] = None
-    for fmt in fmts:
+    refits = 0
+    i = 0
+    while i < len(fmts):
+        fmt = fmts[i]
         try:
             text, stats, calls = _ollama_stream(
-                host, entry["name"], msgs, temperature=temperature,
+                host, model_name, msgs, temperature=temperature,
                 num_predict=num_predict, num_ctx=num_ctx, fmt=fmt, seed=seed,
                 stop=stop, should_stop=should_stop, timeout=timeout,
                 token_callback=token_callback, tools=tools, think=think)
         except _OllamaHTTPError as exc:
+            told = _ollama_overflow(exc)
+            if told is not None and refits < 2:
+                # Refused before generating anything, with the EXACT count:
+                # re-fit at this prompt's own ratio (a little under, and
+                # more so the second time) and send it again, same format.
+                refits += 1
+                sent = _ollama_text_chars(msgs)
+                _ollama_learn(model_name, sent, told)
+                cpt = max(0.5, min(cpt, sent / told) * (0.95 ** refits))
+                _LOG.info("[ollama] %s: prompt of %d tokens passed num_ctx "
+                          "%d; re-fitting at %.2f chars/token", model_name,
+                          told, num_ctx, cpt)
+                msgs, num_predict = _clamp_messages_to_ctx(
+                    messages, wanted_predict, num_ctx,
+                    count_tokens=_ollama_counter(cpt))
+                continue
+            if told is not None:
+                raise RuntimeError(
+                    f"Ollama ({model_name}): the prompt does not fit its "
+                    f"{num_ctx}-token window even after trimming ({told} "
+                    "tokens) — shorten the request, or give this role a "
+                    "larger window.") from exc
             low = exc.text.lower()
             if fmt is not None and exc.status >= 400 and any(
                     w in low for w in ("format", "schema", "grammar", "json")):
@@ -3322,12 +3430,17 @@ def _ollama_local(
                              "schema" if isinstance(fmt, dict) else fmt,
                              exc.text[:200])
                 last_exc = exc
+                i += 1
                 continue
             if exc.status == 404:
                 raise RuntimeError(
                     f"Ollama at {host} has no model '{name}' "
                     f"(`ollama pull {name}` to install it).") from exc
             raise
+        _ollama_learn(model_name, _ollama_text_chars(msgs),
+                      stats.get("prompt_tokens"))
+        if refits:
+            stats["prompt_refits"] = refits
         with _SLOT_LOAD_LOCK:
             _SLOT_STATUS[slot] = {"path": local_models.ollama_id(entry["name"]),
                                   "n_ctx": num_ctx, "on_gpu": None,

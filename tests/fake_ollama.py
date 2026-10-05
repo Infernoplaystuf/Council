@@ -22,6 +22,10 @@ Behaviours a test sets on ``server.state``:
                   str), for a test that answers several kinds of prompt
   vram_fraction   /api/ps reports size_vram = size * this for every model
                   a chat has loaded (1.0 = all on the GPU, 0 = CPU)
+  chars_per_token None = every prompt counts 120 tokens; a number = the
+                  prompt is counted at that ratio (+8 per message) and one
+                  over num_ctx sent with truncate=false is REFUSED with
+                  Ollama 0.35's 400 (counted in ``refused``)
 
 /api/ps lists the models chats have "loaded"; /api/generate with keep_alive
 0 "unloads" one (the benchmark's clean-placement step).
@@ -144,8 +148,29 @@ class _Handler(BaseHTTPRequestHandler):
             if isinstance(got, str):
                 text = got
         calls = self.st.tool_calls if body.get("tools") else None
+        prompt_tokens = 120
+        if self.st.chars_per_token:
+            chars = sum(len(m.get("content") or "")
+                        for m in body.get("messages") or []
+                        if isinstance(m.get("content"), str))
+            prompt_tokens = (-(-chars // self.st.chars_per_token)
+                             + 8 * len(body.get("messages") or []))
+            prompt_tokens = int(prompt_tokens)
+            n_ctx = int((body.get("options") or {}).get("num_ctx") or 2048)
+            if prompt_tokens > n_ctx and body.get("truncate") is False:
+                # Ollama 0.35's own refusal, byte for byte in shape.
+                inner = {"error": {
+                    "code": 400, "message": f"request ({prompt_tokens} "
+                    f"tokens) exceeds the available context size ({n_ctx} "
+                    "tokens), try increasing it",
+                    "type": "exceed_context_size_error",
+                    "n_prompt_tokens": prompt_tokens, "n_ctx": n_ctx}}
+                self.st.refused += 1
+                self._json(400, {"error": json.dumps(inner)})
+                return
         final = {"model": body.get("model"), "done": True,
-                 "done_reason": self.st.done_reason, "prompt_eval_count": 120,
+                 "done_reason": self.st.done_reason,
+                 "prompt_eval_count": prompt_tokens,
                  "prompt_eval_duration": 60_000_000, "eval_count": 40,
                  "eval_duration": 1_000_000_000,
                  "load_duration": 5_000_000, "total_duration": 1_100_000_000}
@@ -196,7 +221,7 @@ class FakeOllama:
             token_delay=0.0, first_delay=0.0, reject_format=False,
             no_tools=False, done_reason="stop", requests=[], chats=[],
             completed=0, disconnected=0, reply_fn=None, vram_fraction=1.0,
-            loaded=set(), unloads=[])
+            loaded=set(), unloads=[], chars_per_token=None, refused=0)
         self.httpd.state = self.state            # type: ignore[attr-defined]
         self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
         self._thread = threading.Thread(target=self.httpd.serve_forever,
