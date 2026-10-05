@@ -1153,6 +1153,42 @@ def test_a_record_is_never_written_over_and_its_name_is_never_reused(
     assert frame_camera._unique_run(lone) != stem
 
 
+def test_presets_and_the_run_record_use_the_sensor_the_camera_reports(
+        tmp_path, monkeypatch):
+    """Discovery no longer guesses "EVK4" (it cannot know the sensor
+    without opening the camera); Connect takes the identity the OPEN device
+    reports (cameras.identify) — what presets are kept under and what the
+    run's camera record says."""
+    import dataclasses
+
+    found = cameras.CameraInfo("prophesee", "00051234", "", "00051234",
+                               "Prophesee", "event")
+    opened = dataclasses.replace(found, model="IMX636")
+
+    def open_camera(info, known=None):
+        assert info == found
+        device = cameras.SyntheticDevice(cameras.CameraInfo(
+            "simulated", "sim-event", "Simulated event camera", "SIM-2",
+            "simulated", "event"))
+        device.info = opened
+        return device
+
+    monkeypatch.setattr(cameras, "open_camera", open_camera)
+    frame_camera._LIVE.found = cameras.Discovery([found], [])
+    out = frame_camera.connect("1. Prophesee (00051234) · event")
+    assert frame_camera._LIVE.info == opened
+    assert out["summary"].startswith("Connected to Prophesee IMX636 (00051234)")
+    frame_camera.save_preset("Bird bath")
+    doc = json.loads((tmp_path / "camera_presets.json").read_text(
+        encoding="utf-8"))
+    assert list(doc["cameras"]) == ["prophesee|IMX636|00051234"]
+    run = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    camera = _record(run)["camera"]
+    assert (camera["model"], camera["serial"], camera["vendor"]) == (
+        "IMX636", "00051234", "Prophesee")
+
+
 def test_a_record_that_cannot_be_written_never_stops_the_capture(
         tmp_path, monkeypatch):
     from council_core import camera_record

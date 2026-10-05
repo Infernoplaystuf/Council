@@ -396,6 +396,12 @@ def connect(which: Any) -> Dict[str, Any]:
             raise RuntimeError("a camera is already open — disconnect first")
         info = _chosen(which)
         device = cameras.open_camera(info)
+        # What the camera says it is once open (an event camera's sensor is
+        # read then, never at discovery — cameras.identify): the identity
+        # presets and the run's camera record use.
+        opened = getattr(device, "info", None)
+        if isinstance(opened, cameras.CameraInfo) and opened.key == info.key:
+            info = opened
         _LIVE.device = device
         _LIVE.info = info
         _LIVE.session = capture.CaptureSession(device)
