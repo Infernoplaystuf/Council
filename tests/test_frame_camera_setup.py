@@ -983,6 +983,50 @@ def test_a_set_whose_binning_moves_the_area_clears_the_crop_box(binning):
 
 
 # ======================================================================
+# The first live tick after Connect does not import Pillow on the UI thread
+# ======================================================================
+def test_the_first_live_tick_after_connect_never_waits_for_imports(
+        monkeypatch):
+    """session.start() warms numpy and Pillow before the stream may start;
+    at the first live tick that ran on the UI thread — the window's longest
+    stall after Connect (110-483 ms measured in a built Typhon, nearly all
+    Pillow's plugins). The live view now waits a tick or two for a warm-up
+    on its own thread instead."""
+    import threading
+
+    from council_core import capture
+
+    gate = threading.Event()
+    ran_on = []
+
+    def slow_warm():
+        ran_on.append(threading.current_thread().name)
+        gate.wait(2)                     # as long as the test likes
+        capture._WARMED.set()
+
+    # raising=False: on the old code (no _WARMED) this fails on what it
+    # measures — a 2 s tick, warmed on MainThread — not on a missing name.
+    monkeypatch.setattr(capture, "_WARMED", threading.Event(), raising=False)
+    monkeypatch.setattr(capture, "_WARMER", [], raising=False)
+    monkeypatch.setattr(capture, "warm_imports", slow_warm)
+    connected("frame")
+    viewer = Viewer()
+    frame_camera._LIVE.reviewer = viewer       # the attached app's viewer
+    longest = 0.0
+    for _ in range(10):
+        began = time.perf_counter()
+        frame_camera._tick(lambda image: None, None, viewer)
+        longest = max(longest, time.perf_counter() - began)
+        time.sleep(0.01)
+    assert longest < 0.05, f"a tick waited {longest * 1000:.0f} ms"
+    assert not frame_camera._LIVE.previewing, "started before it was warm"
+    assert ran_on == ["warm-imports"], "warmed on the UI thread"
+    gate.set()
+    ticks(viewer, 0.3)
+    assert frame_camera._LIVE.previewing and frame_camera._LIVE.session.running
+
+
+# ======================================================================
 # The boxes beside Start wait for a change on the worker (QUEUED_BOXES)
 # ======================================================================
 def _slow_area_change(viewer):

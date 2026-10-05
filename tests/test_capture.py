@@ -254,8 +254,36 @@ def test_warming_never_raises(monkeypatch):
             raise ImportError("gone")
         return real(name, *a, **k)
 
+    monkeypatch.setattr(capture, "_WARMED", threading.Event())  # not yet
     monkeypatch.setattr(builtins, "__import__", refuse)
     capture.warm_imports()
+
+
+def test_warming_happens_once_on_a_thread_of_its_own(monkeypatch):
+    """At the first live tick it was the window's longest stall after
+    Connect (110-483 ms measured in a built Typhon): Pillow's ~70 plugins
+    imported on the UI thread. warm_in_background does it elsewhere, once;
+    after it a call returns at once."""
+    monkeypatch.setattr(capture, "_WARMED", threading.Event())
+    monkeypatch.setattr(capture, "_WARMER", [])
+    ran_on = []
+    real = capture.warm_imports
+
+    def watched():
+        ran_on.append(threading.current_thread().name)
+        real()
+
+    monkeypatch.setattr(capture, "warm_imports", watched)
+    assert not capture.imports_warm()
+    capture.warm_in_background()
+    capture.warm_in_background()                 # a second call: no second
+    capture._WARMER[0].join(10)
+    assert ran_on == ["warm-imports"] and capture.imports_warm()
+    began = time.perf_counter()
+    real()
+    assert time.perf_counter() - began < 0.005, "warmed, yet it ran again"
+    capture.warm_in_background()
+    assert len(capture._WARMER) == 1
 
 
 def test_stop_joins_the_grab_thread_and_says_so():

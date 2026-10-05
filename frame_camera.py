@@ -391,6 +391,9 @@ def connect(which: Any) -> Dict[str, Any]:
     """Open the chosen camera and report what it is."""
     from council_core import cameras, capture
 
+    # An app that never attached (no live view, a script) warms here; one
+    # that did is warm already, and this costs nothing.
+    capture.warm_in_background()
     with _LOCK:
         if _LIVE.device is not None:
             raise RuntimeError("a camera is already open — disconnect first")
@@ -903,6 +906,15 @@ def _manage_preview(want: bool) -> None:
             # The stopped run is still landing: starting the preview now
             # would reset the counts and hide "N waiting to save".
             return
+        from council_core import capture
+        if not capture.imports_warm():
+            # session.start() would import Pillow's plugins HERE, on the UI
+            # thread, before the stream may start (capture.warm_imports):
+            # the window's longest stall after Connect. They are on their
+            # way on a thread of their own; the picture starts a tick or
+            # two later instead of the window freezing for them.
+            capture.warm_in_background()
+            return
         try:
             session.record_to(None)
             session.reset_stats()
@@ -1108,6 +1120,12 @@ def attach(app: Any, view: str = "live_view",
     held = getattr(app, "_frame_camera_live", None)
     if held is not None:
         return held
+
+    # Pillow's plugins, imported on a thread of their own while the user
+    # finds the camera — not on the UI thread at the first live tick
+    # (capture.warm_imports measures what that cost).
+    from council_core import capture
+    capture.warm_in_background()
 
     reviewer = _reviewer_for(app, canvas, scrubber, folder, current, roi,
                              view_status)

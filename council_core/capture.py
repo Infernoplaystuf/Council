@@ -204,7 +204,19 @@ def warm_imports() -> None:
 
     Never raises: a missing package is reported by the real call, which fails
     loudly. This is an optimisation, not a check.
+
+    ONCE, AND BEST OFF THE UI THREAD. Called from the UI thread (a live
+    view's first start) it was the window's longest stall after Connect:
+    MEASURED in a built Typhon, the first tick after Connect took 110-307 ms
+    (frame camera) and 113-483 ms (event camera) over five fresh starts each,
+    nearly all of it importing PIL.Image's ~70 plugins — main.py has
+    imported numpy and PIL's package by then, never PIL.Image. So
+    `warm_in_background` does it on a thread of its own as soon as an app
+    attaches a camera, `imports_warm` says when it is done, and a call made
+    after that returns at once.
     """
+    if _WARMED.is_set():
+        return
     try:
         import numpy                                       # noqa: F401
     except Exception:                                      # noqa: BLE001
@@ -214,6 +226,31 @@ def warm_imports() -> None:
         Image.init()
     except Exception:                                      # noqa: BLE001
         pass
+    _WARMED.set()
+
+
+_WARMED = threading.Event()
+_WARMER: List[threading.Thread] = []
+_WARMER_LOCK = threading.Lock()
+
+
+def warm_in_background() -> None:
+    """Start warm_imports on a thread of its own, once per process; a call
+    after the first (or once warm) does nothing."""
+    if _WARMED.is_set():
+        return
+    with _WARMER_LOCK:
+        if _WARMER:
+            return
+        thread = threading.Thread(target=warm_imports, name="warm-imports",
+                                  daemon=True)
+        _WARMER.append(thread)
+    thread.start()
+
+
+def imports_warm() -> bool:
+    """numpy and Pillow are imported and Pillow's plugins registered."""
+    return _WARMED.is_set()
 
 
 #: The columns of a run's frame index (Recorder `index_name`). window_us is
