@@ -156,24 +156,32 @@ def test_the_summary_names_what_changed_between_the_two_typhons():
     new = gs.load_gspec(EXAMPLE).shapes
     changes = dx.layout_changes(old, new)
     # Pop out, Settings, then the camera's own set-up: the area line, the
-    # presets heading, the preset picker, Save preset, Camera settings.
-    assert [a.rsplit(" (", 1)[-1] for a in changes.added] == [
-        "s57)", "s58)", "s59)", "s60)", "s61)", "s62)", "s63)"]
+    # presets heading, the preset picker, Save preset, Camera settings;
+    # then the classifier library (s64-s78).
+    assert [a.rsplit(" (", 1)[-1].rsplit(" ", 1)[-1].rstrip(")")
+            for a in changes.added] == [f"s{i}" for i in range(57, 79)]
     assert changes.added[:2] == ["Pop out (s57)", "Settings ▾ (s58)"]
     assert {"Preset (s61)", "Save preset (s62)",
             "Camera settings… (s63)"} <= set(changes.added)
+    assert {"Filter (s65)", "Save as (s67)", "Rename (s68)", "Delete (s69)",
+            "Export (s71)", "Export this app's classifiers (s72)",
+            "Import (s74)"} <= set(changes.added)
     assert changes.removed == []
     rewired = " | ".join(changes.rewired)
     assert "Start capture (s46)" in rewired and "frame_rate)" in rewired
     assert any(line.startswith("spinbox s08: no link → "
                                "frame_camera.apply_frame_rate(frame_rate)")
                for line in changes.rewired)
+    # The name box became the model dropdown, opening what is picked.
+    assert any(line.startswith("Model (s26): no link → "
+                               "frame_classes.open_classifier(")
+               for line in changes.rewired)
     assert changes.ports == ["s08: port frame_count → frame_rate"]
     assert "s07: 'Frame count' → 'FPS (0 = camera default)'" in \
         changes.relabelled
     lines = changes.lines()
     assert len(lines) <= 8, "a summary, not a dump"
-    assert lines[0].startswith("  shapes: 7 added, 0 removed, 5 rewired")
+    assert lines[0].startswith("  shapes: 22 added, 0 removed, 8 rewired")
 
 
 def test_an_unchanged_layout_says_nothing_changed():
@@ -358,6 +366,10 @@ def test_the_updated_app_starts_offscreen(tmp_path, monkeypatch):
         "print(ui.ports.preset.widget.isEditable(),"
         " type(ui._camera_presets).__name__,"
         " ui.ports.camera_area.get().startswith(\"Camera's area\"))\n"
+        "print(type(ui._classifier_picker).__name__,"
+        " type(ui.ports.classifier_name.widget).__name__,"
+        " ui.ports.classifier_name.get(),"
+        " ui.ports.classifier_filter.get() == 'All classifiers')\n"
         "frame_camera.disconnect()\n")
     env = dict(os.environ, QT_QPA_PLATFORM="offscreen", COUNCIL_NO_DIALOGS="1",
                COUNCIL_VAULT_ROOT=str(vault), PYTHONDONTWRITEBYTECODE="1")
@@ -365,10 +377,13 @@ def test_the_updated_app_starts_offscreen(tmp_path, monkeypatch):
                           capture_output=True, text=True, timeout=120)
     assert done.returncode == 0, done.stderr
     printed = done.stdout.strip().splitlines()
-    assert printed[-2] == "True False True True"
+    assert printed[-3] == "True False True True"
     # The preset picker and the camera's area line arrive with the update,
     # kept current by attach (app.py itself is untouched).
-    assert printed[-1] == "True PresetPicker True"
+    assert printed[-2] == "True PresetPicker True"
+    # So does the model dropdown: the name box is a combobox now, filled by
+    # attach, still saying the default model.
+    assert printed[-1] == "ClassifierPicker QComboBox frames True"
 
 
 # ============================================================

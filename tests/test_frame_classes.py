@@ -1175,6 +1175,24 @@ def test_the_record_answers_by_classifier_and_by_folder(vault, trained,
         fc.classified_with(str(other))["classified_with"]
 
 
+def test_classifying_says_the_classified_with_line_it_has_just_made(
+        vault, trained, monkeypatch):
+    """Typhon's Classify link fills the "classified with" line from this —
+    the same words classified_with(folder) gives afterwards, made from the
+    record just written, and said plainly when nothing could be recorded."""
+    folder, _ = trained
+    r = fc.classify_folder("frames", str(folder))
+    assert r["classified_with"] == \
+        fc.classified_with(str(folder))["classified_with"]
+    assert r["classified_with"].startswith(f"Classified with {r['version']} on")
+    inside = folder / "store"                    # a store inside the capture
+    inside.mkdir()
+    shutil.copytree(_store(vault) / "frames", inside / "frames")
+    monkeypatch.setenv(fc.STORE_ENV, str(inside))
+    r = fc.classify_folder("frames", str(folder))
+    assert "NOT recorded" in r["classified_with"]
+
+
 def test_a_partial_last_record_line_is_skipped_and_the_next_starts_afresh(
         vault, trained):
     folder, _ = trained
@@ -1551,7 +1569,9 @@ def test_built_typhon_tags_the_classifiers_it_makes_with_its_own_project(
 
 
 # ============================================================
-# The Typhon wiring planned for this (not in typhon.gspec yet)
+# The listbox wiring the library was planned against. typhon.gspec wires
+# a DROPDOWN instead (the user's choice): its real links are run below
+# (test_typhons_own_links_...); this plan stays as the listbox case.
 # ============================================================
 
 #: handler -> (function, input ports, {port: result key}, button label).
@@ -1807,6 +1827,119 @@ def test_a_refused_library_click_keeps_the_window_as_it_was(vault, trained,
         still_open(what)
         assert p.classifier_status.value, what       # it says what to do
     assert "already exists" in p.classifier_status.value
+
+
+def _typhon_links():
+    """typhon.gspec's own frame_classes links, as {handler: (function,
+    inputs, outputs, label)} — handlers named by shape id. The model box is
+    a dropdown there: its text is both the model picked and the one open."""
+    doc = json.loads((REPO / "examples" / "gui" / "typhon.gspec").read_text(
+        encoding="utf-8"))
+    return {f"on_{s['id']}": (s["script"]["function"], s["script"]["inputs"],
+                              s["script"]["outputs"], s["label"])
+            for s in doc["shapes"]
+            if (s.get("script") or {}).get("module") == "frame_classes"}
+
+
+def _typhon_app(folder, out, name="frames"):
+    """Typhon's own frame_classes handlers, as Generate writes them, bound
+    to ports shaped like the real ones: the model DROPDOWN and the filter
+    hand back their text; the lists their selection."""
+    import gui_emit as ge
+    import gui_policy as pol
+    code = "class Handlers:\n" + "".join(
+        ge.handler_stub(h, {"module": "frame_classes", "function": fn,
+                            "inputs": ins, "outputs": outs}, title)
+        for h, (fn, ins, outs, title) in _typhon_links().items())
+    ok, errs = pol.validate(code, "linked", ["numpy", "PIL", "sklearn"],
+                            toolkit="qt")
+    assert ok, errs
+    space = {}
+    exec(compile(code, "handlers.py", "exec"), space)
+    errors = []
+    h = space["Handlers"]()
+    ports = {n: _Port(v) for n, v in {
+        "classifier_name": name, "classifier_filter": fc.FILTER_ALL,
+        "classifier_status": "", "new_name": "", "tag": "", "new_class": "",
+        "export_to": str(out), "import_from": "", "current_frame": "",
+        "capture_folder": str(folder), "classified_with_line": ""}.items()}
+    ports.update(classes=_ListPort(fc.open_classifier(name)["classes"]),
+                 predictions=_ListPort())
+    h.ports = types.SimpleNamespace(**ports)
+    h.clear_ports = lambda *names: [getattr(h.ports, n).clear()
+                                    for n in names]
+    h.report_error = lambda what, exc: errors.append(f"{what}: {exc}")
+    by = {title: getattr(h, handler) for handler, (_f, _i, _o, title)
+          in _typhon_links().items()}
+    return h, h.ports, errors, by
+
+
+def test_typhons_own_links_run_the_library_with_the_dropdown(
+        vault, trained, tmp_path):
+    """typhon.gspec's links, written by the real emitter and gated: a
+    refused press keeps the window as it was; then Save as, Rename, tags,
+    Export, Export this app's classifiers, Delete, Import back and Classify
+    with its "classified with" line — no error reported."""
+    folder, _ = trained
+    fc.save_as("frames", "other")
+    out = tmp_path / "out"
+    out.mkdir()
+    taken = fc.export_classifier("other", str(out))["path"]
+    h, p, errors, press = _typhon_app(folder, out)
+    assert {"Model", "Open", "Filter", "Save as", "Rename", "Delete",
+            "Export", "Export this app's classifiers", "Import", "Add tag",
+            "Remove tag", "Classify all frames"} <= set(press)
+
+    for what, setup, button in (
+            ("Save as, nothing typed", {"new_name": ""}, "Save as"),
+            ("Save as, a taken name", {"new_name": "OTHER"}, "Save as"),
+            ("Rename, nothing typed", {"new_name": ""}, "Rename"),
+            ("Import, no file", {"import_from": ""}, "Import"),
+            ("Import, a taken name", {"import_from": taken,
+                                      "new_name": "frames"}, "Import")):
+        for port, value in setup.items():
+            getattr(p, port).value = value
+        press[button]()
+        assert errors == [], (what, errors)
+        assert p.classifier_name.value == "frames", (what,
+                                                     p.classifier_status.value)
+        assert p.classes.items() == ["good", "bad timing"], what
+        assert p.classifier_status.value, what
+    p.classifier_name.value = ""                    # an empty box
+    press["Delete"]()
+    assert "Pick the classifier to delete" in p.classifier_status.value
+    assert errors == []
+
+    p.classifier_name.value, p.new_name.value = "frames", "frames-copy"
+    p.import_from.value = ""
+    press["Save as"]()
+    assert p.classifier_name.value == "frames-copy"
+    p.new_name.value = "frames-lab"
+    press["Rename"]()
+    assert p.classifier_name.value == "frames-lab"
+    p.tag.value = "lab"
+    press["Add tag"]()
+    assert p.tag.value == "" and "Tagged 'frames-lab': lab" in \
+        p.classifier_status.value
+    p.tag.value = "lab"
+    press["Remove tag"]()
+    assert "Took 'lab' off" in p.classifier_status.value
+    press["Export"]()
+    assert p.classifier_status.value.startswith("Exported frames-lab v1 (")
+    press["Export this app's classifiers"]()
+    assert "Exported 3 classifiers" in p.classifier_status.value
+    press["Delete"]()                               # the one in the box
+    assert p.classifier_name.value == "" and p.classes.items() == []
+    p.import_from.value = str(out / "frames-lab-v1.typhon-classifier.zip")
+    p.new_name.value = ""
+    press["Import"]()
+    assert p.classifier_name.value == "frames-lab"
+    assert p.classes.items() == ["good", "bad timing"]
+    press["Classify all frames"]()
+    assert p.classified_with_line.value.startswith(
+        "Classified with frames-lab v1 (")
+    assert len(p.predictions.items()) == 30
+    assert errors == []
 
 
 def test_importing_a_bundle_again_keeps_the_window_on_a_classifier(
