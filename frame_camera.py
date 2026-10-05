@@ -1575,6 +1575,9 @@ def on_camera_change(listener: Callable[[Dict[str, Any]], Any]
     {"what": "disconnected"}. For the settings window, which must show what
     the camera actually took. Returns a function that removes the listener.
     Not script-linkable (it takes a function)."""
+    if not callable(listener):
+        raise RuntimeError("on_camera_change is for the app's own code (it "
+                           "takes a function), not for a button")
     _LIVE.listeners.append(listener)
 
     def remove() -> None:
@@ -1587,7 +1590,13 @@ def on_camera_change(listener: Callable[[Dict[str, Any]], Any]
 
 
 def camera_state() -> Dict[str, Any]:
-    """What a settings window needs to enable its controls."""
+    """What a settings window needs to enable its controls: whether a camera
+    is connected, capturing, busy with a change, streaming; its area and
+    sensor size.
+
+    Keys: connected, label, kind, capturing, busy, streaming, area, sensor,
+    summary
+    """
     device = _LIVE.device
     session = _LIVE.session
     info = _LIVE.info
