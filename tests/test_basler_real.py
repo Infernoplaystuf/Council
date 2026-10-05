@@ -176,3 +176,76 @@ def test_frames_kept_by_the_app_are_never_overwritten(changing_camera):
         assert dev._pool.reused > 0, "no array was ever reused"
     finally:
         dev.stop()
+
+
+# ======================================================================
+# Settings (council_core.camera_settings) on the emulator's node map
+# ======================================================================
+def _settings(dev):
+    return {s.key: s for s in dev.settings()}
+
+
+def test_the_emulators_settings_come_from_its_nodes(device):
+    from council_core import camera_settings as cs
+
+    found = _settings(device)
+    exposure = found["ExposureTime"]
+    assert exposure.kind == cs.FLOAT and exposure.unit == "µs"
+    node = device._cam.ExposureTime
+    assert (exposure.minimum, exposure.maximum) == (node.GetMin(),
+                                                    node.GetMax())
+    assert found["Gain"].unit == "dB" and found["Gain"].step is None
+    assert "Mono12" in found["PixelFormat"].choices
+    assert found["BinningHorizontal"].kind == cs.INT
+    assert found["ReverseX"].kind == cs.BOOL
+
+
+def test_an_out_of_range_gain_is_clamped_not_an_exception(device):
+    """pylon raises OutOfRangeException for Gain 1e9 (measured)."""
+    change = device.set_setting("Gain", 1e9)
+    assert change.ok and change.adjusted
+    assert change.value == pytest.approx(device._cam.Gain.GetMax())
+
+
+def test_the_camera_snapped_exposure_is_what_is_reported(device):
+    device.set_setting("ExposureAuto", "Off")
+    change = device.set_setting("ExposureTime", 5003.7)
+    assert change.value == pytest.approx(5004.0) and change.adjusted
+
+
+def test_locked_while_grabbing_is_refused_before_anything_is_written(device):
+    from council_core import camera_settings as cs
+
+    device._cam.PixelFormat.SetValue("Mono8")
+    gain = device._cam.Gain.GetValue()
+    device.start()
+    try:
+        assert _settings(device)["PixelFormat"].live is False
+        with pytest.raises(cs.NeedsStop):
+            device.apply_settings({"Gain": gain + 3, "PixelFormat": "Mono12"})
+        assert device._cam.Gain.GetValue() == pytest.approx(gain)
+        with pytest.raises(cs.NeedsStop):
+            device.set_roi(cameras.Roi(0, 0, 256, 256))
+        done = device.apply_settings({"Gain": gain + 3,
+                                      "PixelFormat": "Mono8"})
+        assert done.ok, "an unchanged locked format needs no stop"
+    finally:
+        device.stop()
+
+
+def test_a_snapshot_applies_back_with_its_area(device):
+    from council_core import camera_settings as cs
+
+    device._cam.PixelFormat.SetValue("Mono8")
+    device.set_roi(cameras.Roi(16, 8, 320, 240))
+    saved = cs.snapshot(device)
+    area = device.roi()
+    device.apply_settings({"PixelFormat": "Mono12", "ReverseX": True},
+                          roi=cameras.Roi(0, 0, 640, 480))
+    done = device.apply_settings(saved, roi=area)
+    assert done.ok, done.summary()
+    assert done.roi == area
+    assert device._cam.PixelFormat.GetValue() == "Mono8"
+    assert device._cam.ReverseX.GetValue() is False
+    frame = grab_one(device, "Mono8")
+    assert frame.size == (320, 240) and frame.meta["aoi"] == (16, 8, 320, 240)
