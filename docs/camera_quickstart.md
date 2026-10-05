@@ -604,15 +604,21 @@ does not freeze the window: after 0.15 s it says `Applying…`, greys itself,
 and the answer arrives in the status line and the window when the change is
 done. An EVK4 sets everything live.
 
-**What it costs the window** (offscreen, this PC):
+**What it costs the window** (offscreen, this PC; ranges over five runs —
+the PC was busier in some, which moved every number together):
 
 | | UI thread |
 |---|---|
-| picking a preset in Typhon (pixel format + area: the live view restarts) — simulated camera / pylon emulator | 19–34 ms / 16 ms, once |
-| applying a preset that changes the area of a **5328 x 3040** live view | 7–14 ms, once; longest stall 10–17 ms |
-| one setting written from a dragged slider (the whole cycle) | 0.35 ms median, 0.7 ms worst; 64 writes in 4 s of dragging |
-| the live view at **5328 x 3040** (Mono8), per tick | 1.9 ms median, 2.5 ms worst — the same with the settings window open and a slider being dragged |
-| longest stall with the window open and a slider dragged at 5328 x 3040 | 5.7 ms (28 pictures a second drawn either way) |
+| picking a preset in Typhon (pixel format + area: the live view restarts) — simulated camera / pylon emulator | 16–34 ms / 16 ms, once |
+| applying a preset that changes the area of a **5328 x 3040** live view | 7–47 ms, once (the stream stops and restarts) |
+| one setting written from a dragged slider (the whole cycle: the camera call and the window's handling) | 0.35–0.6 ms median, 1.4 ms worst; 64 writes in 4 s of dragging |
+| the live view at **5328 x 3040** (Mono8), per tick | 1.9–3.3 ms median, 2.5–4.8 ms p99 — the same with the settings window open and a slider being dragged |
+| pictures drawn a second at 5328 x 3040, window open or not | 26–28.5 |
+
+Before the window stopped re-styling every row on every write, the longest
+stall during a drag was 39 ms; it is now 5.7–9 ms. Single slow ticks of
+26–87 ms still turned up in two of the five runs, with **and** without the
+window open — the live view's own (a 16 MB picture), not the window's.
 
 The first live picture after **Connect** costs about 0.6 s once: the camera
 libraries are imported on the window's thread before the grab thread starts
