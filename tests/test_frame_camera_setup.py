@@ -26,6 +26,12 @@ from council_core.live_display import DisplayPrep
 
 @pytest.fixture(autouse=True)
 def clean(tmp_path):
+    # Pillow's plugins warmed once, as a Typhon window does when it opens:
+    # otherwise a test run on its own waits for Connect's warm-up thread and
+    # its first ticks see no preview (test_frame_camera's clean says more).
+    from council_core import capture
+
+    capture.warm_imports()
     frame_camera.disconnect()
     frame_camera._LIVE.found = None
     frame_camera._LIVE.reviewer = None

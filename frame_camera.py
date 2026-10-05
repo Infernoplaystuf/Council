@@ -554,6 +554,15 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         _release_dead_stream(session)
 
     run = _unique_run(out)
+    # READ after the boxes beside Start were applied and before the run's
+    # recording begins — the camera as every picture of this run will have
+    # it — and WRITTEN only once the capture has started, so a Start that
+    # fails below leaves no record of a run that never happened. Read
+    # BEFORE the switch below, not after it: an event camera's stream is
+    # already running, so from the switch on every moment Start spends here
+    # is frames of the run, and reading every setting of a real camera is
+    # the slow part of the record.
+    content, record_note = _camera_record(run, device)
     recorder = capture.Recorder(out, stem=f"{run}_frame",
                                 index_name=f"{run}_frames.csv")
     try:
@@ -563,11 +572,6 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         session.record_to(recorder, reset=True)
     except OSError as exc:
         raise RuntimeError(f"cannot save frames into {out}: {exc}") from exc
-    # READ after the boxes beside Start were applied and before the stream
-    # runs for the run — the camera as every picture of this run will have
-    # it — and WRITTEN only once the capture has started, so a Start that
-    # fails below leaves no record of a run that never happened.
-    content, record_note = _camera_record(run, device)
 
     raw = None
     if getattr(device, "records_raw", False):
