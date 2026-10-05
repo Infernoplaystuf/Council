@@ -352,6 +352,71 @@ def test_a_preset_saved_in_the_window_puts_the_emulator_back(
 
 
 # ======================================================================
+# typhon/followups on the emulator: the run's camera record, and a box
+# beside Start that waits for a change on the worker
+# ======================================================================
+def test_a_run_on_the_emulator_records_its_camera_its_area_and_preset(
+        emulator_window, tmp_path):
+    import json
+    import time
+
+    fc, _window, _app = emulator_window
+    fc.set_camera_area("96, 64, 320, 240")
+    fc.set_camera_setting("Gain", 6.0)
+    fc.save_preset("Bench")
+    out = fc.start(str(tmp_path / "runs"))
+    deadline = time.monotonic() + 5
+    while not fc._LIVE.session.written() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    fc.stop()
+    rec = json.loads(Path(out["record"]).read_text(encoding="utf-8"))
+    info = fc._LIVE.info
+    assert rec["camera"]["backend"] == "basler"
+    assert (rec["camera"]["model"], rec["camera"]["serial"]) == (
+        info.model, info.serial) and info.serial
+    assert rec["area"] == {"x": 96, "y": 64, "w": 320, "h": 240}
+    assert rec["sensor"]["width"] > 320 and not rec["full_sensor"]
+    assert rec["settings"]["Gain"] == pytest.approx(6.0, abs=1e-3)
+    assert "ExposureTime" in rec["settings"] and "PixelFormat" in \
+        rec["settings"]
+    assert rec["units"]["ExposureTime"] == "µs"
+    assert rec["preset"] == "Bench", rec.get("preset_changed")
+    from PIL import Image
+    png = next((tmp_path / "runs").glob(f"{out['run']}_frame_*.png"))
+    assert Image.open(png).size == (320, 240)
+
+
+def test_the_fps_box_waits_for_a_pixel_format_change_on_the_emulator(
+        emulator_window):
+    """The worker stops the emulator's stream, writes PixelFormat and starts
+    it again; the FPS box changed meanwhile used to write
+    AcquisitionFrameRate from the UI thread mid-restart. It waits, then is
+    written when the change is done."""
+    import time
+
+    fc, _window, app = emulator_window
+    cam = fc._LIVE.device._cam
+    fc.set_frame_rate(1)                    # a frame a second: a slow stop
+    fc._LIVE.session.start()
+    fc._LIVE.previewing = True
+    time.sleep(0.3)
+    out = fc.set_camera_setting("PixelFormat", "Mono12")
+    assert out["pending"], "the change finished before the box could wait"
+    said = fc.apply_frame_rate(25)["summary"]
+    assert "is set once the camera has finished changing" in said, said
+    assert cam.AcquisitionFrameRate.GetValue() == pytest.approx(1.0)
+    deadline = time.monotonic() + 5
+    while fc._LIVE.job is not None and time.monotonic() < deadline:
+        fc._poll_job()
+        app.processEvents()
+        time.sleep(0.02)
+    assert fc._LIVE.job is None
+    assert cam.PixelFormat.GetValue() == "Mono12"
+    assert cam.AcquisitionFrameRate.GetValue() == pytest.approx(25.0)
+    assert fc._LIVE.queued == {}
+
+
+# ======================================================================
 # Review: what the adversarial pass found on the emulator
 # ======================================================================
 def test_a_frame_says_its_pixel_format_so_the_display_can_follow(device):
