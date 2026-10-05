@@ -249,3 +249,103 @@ def test_a_snapshot_applies_back_with_its_area(device):
     assert device._cam.ReverseX.GetValue() is False
     frame = grab_one(device, "Mono8")
     assert frame.size == (320, 240) and frame.meta["aoi"] == (16, 8, 320, 240)
+
+
+def test_one_feature_is_looked_up_with_the_streams_lock_known(device):
+    """find() reads one feature, and still says whether the stream locks
+    it — the settings window looks a setting up before every write."""
+    provider = device.settings_provider()
+    assert provider.find("Gain").maximum == pytest.approx(
+        device._cam.Gain.GetMax())
+    device.start()
+    try:
+        assert provider.find("PixelFormat").live is False
+        assert provider.find("Gain").live is True
+    finally:
+        device.stop()
+
+
+def test_the_emulator_offers_its_factory_user_set(device):
+    """UserSetSelector "Default" + UserSetLoad exist on the emulator. It
+    ignores the load itself (Gain 5 dB stays 5 dB, measured), so only the
+    nodes and the stopped-stream rule are checked here."""
+    from council_core import camera_settings as cs
+
+    provider = device.settings_provider()
+    assert provider.defaults_source() == 'UserSet "Default"'
+    device.start()
+    try:
+        with pytest.raises(cs.NeedsStop):
+            provider.load_defaults()
+    finally:
+        device.stop()
+    provider.load_defaults()
+    assert device._cam.UserSetSelector.GetValue() == "Default"
+
+
+# ======================================================================
+# The settings window over a real BaslerDevice (frame_camera, offscreen)
+# ======================================================================
+@pytest.fixture
+def emulator_window(tmp_path, monkeypatch):
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("COUNCIL_NO_DIALOGS", "1")
+    pytest.importorskip("PySide6")
+    from PySide6.QtWidgets import QApplication
+
+    import frame_camera
+    from council_qt.widgets import camera_settings_window as csw
+
+    app = QApplication.instance() or QApplication([])
+    frame_camera.disconnect()
+    frame_camera._LIVE.listeners = []
+    frame_camera._LIVE.setup_path = tmp_path / "camera_setup.json"
+    rows = frame_camera.list_cameras()["rows"]
+    emulated = [r for r in rows if "Emulation" in r]
+    if not emulated:
+        pytest.skip("pylon's camera emulator is not enabled (PYLON_CAMEMU)")
+    frame_camera.connect(emulated[0])
+    csw._HELD.clear()
+    window = csw.open_settings(show=False, api=frame_camera)
+    yield frame_camera, window, app
+    frame_camera.disconnect()
+    frame_camera._LIVE.listeners = []
+    frame_camera._LIVE.setup_path = None
+    window.deleteLater()
+    csw._HELD.clear()
+
+
+def test_the_window_shows_the_emulators_nodes_and_writes_them(
+        emulator_window):
+    fc, window, _app = emulator_window
+    cam = fc._LIVE.device._cam
+    gain = window.rows["Gain"]
+    assert gain.editor.maximum() == pytest.approx(cam.Gain.GetMax())
+    assert gain.editor.suffix() == " dB"
+    assert window.rows["ExposureTime"].editor.suffix() == " µs"
+    assert window.factory == 'UserSet "Default"'
+    gain.editor.setValue(6.5)
+    window.flush_now()
+    assert cam.Gain.GetValue() == pytest.approx(6.5, abs=1e-3)
+    assert window.status.text() == "Gain: 6.5"
+
+
+def test_a_preset_saved_in_the_window_puts_the_emulator_back(
+        emulator_window, tmp_path):
+    fc, window, _app = emulator_window
+    cam = fc._LIVE.device._cam
+    window.rows["PixelFormat"]._from_choice("Mono12")
+    window.flush_now()
+    window.area_edit.setText("96, 64, 320, 240")
+    window.apply_area()
+    window.preset_name.setText("Bench")
+    window.save_preset()
+    assert (tmp_path / "camera_presets.json").is_file()
+    window.rows["PixelFormat"]._from_choice("Mono8")
+    window.flush_now()
+    window.full_sensor()
+    window.select_preset("Bench")
+    window.apply_preset()
+    assert cam.PixelFormat.GetValue() == "Mono12"
+    assert fc.current_area()["area"] == "96, 64, 320, 240"
+    assert "✓ area: 96, 64, 320, 240" in window.took_box.toPlainText()
