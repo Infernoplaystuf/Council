@@ -41,6 +41,20 @@ generated Typhon, in two separate processes (save, quit, start again, pick):
 on both simulated cameras, and on the emulator with a real `BaslerDevice`
 (a Gain, the pixel format and the camera's area saved and put back).
 
+**An event camera's identity** (its sensor, serial and integrator, read on
+open through `I_HW_Identification`) is checked against the OpenEB bindings
+and a real file-backed device; a live EVK4's answer is the first real test.
+**The run's camera record** and **the raw view of a run's area** were
+checked on the simulated cameras and, for the raw view, on a real OpenEB
+recording of events inside an area.
+
+**The classifier library** was driven offscreen through a built Typhon's own
+buttons and dropdown, in a temporary vault: a model made, frames marked
+through the slider, trained, a folder classified (`Classified with …`),
+exported, deleted, imported back under its name; a Barbie project's model
+listed with where it came from, the filter narrowing to each app, and
+Typhon refused to train Barbie's model but allowed to copy it.
+
 ## 1. Get the branch
 
 ```bash
@@ -360,6 +374,14 @@ measured one — `13.2 fps (set to 25.0) · 28 grabbed · …` just after the
 change — and the measured number reaches it within about a second (it is
 averaged over the last second).
 
+**While the camera is restarting for a change** (an area, a pixel format, a
+preset — the status line says `Changing the camera's area…`), the camera
+belongs to that change. A box changed meanwhile **waits** rather than writing
+to a camera mid-restart: `FPS 25 is set once the camera has finished
+changing the camera's area`, and it is set the moment that is done (the
+newest value of each box; nothing waits past Disconnect). Not an error — an
+arrow click during a restart is not something to fix.
+
 Measured mid-capture through the function the box is wired to
 (`frame_camera.apply_frame_rate`), on a 320 x 240 area:
 
@@ -422,12 +444,33 @@ side by side in the capture folder:
 | `<run>_frame_000001.png` … | What the camera looked like, one per frame (an event camera: one per 20 ms window). |
 | `<run>_frames.csv` | One row per saved PNG: file, frame index, camera timestamp, and for an event camera the event count and where that PNG falls in the `.raw`. |
 | `<run>_events.raw` | **EVK4 only.** Every event the sensor sent, in Prophesee's own format — opens in Metavision Studio and Prophesee's tools. |
+| `<run>_camera.json` | **The run's camera record**: which camera, where on its sensor the pictures are, and how it was set at Start (below). |
 
 The `.raw` is the event camera's real data. A PNG is a 20 ms *picture* of it,
 and PNGs can be skipped when storage falls behind; the `.raw` loses nothing.
 It grows with how much is changing in the scene, so check free space before a
 long run. A second run never overwrites the first — two runs started in the
 same second get `_2`, `_3` on the name.
+
+**The camera record.** A bird-bath run's PNGs are 160 x 120 — but which 160 x
+120 of the sensor? `<run>_camera.json` says, written once at **Start** (after
+the exposure, gain and FPS boxes are applied, before the run's first frame):
+
+| Key | What it says |
+|---|---|
+| `camera` | backend, model, serial, vendor, kind, label — the camera as it identified itself when opened (an EVK4's model is the sensor it reports, e.g. `IMX636`) |
+| `sensor`, `area`, `full_sensor` | the sensor's size, and the camera's own area (ROI) at Start in **sensor pixels** — where on the sensor every picture of the run is (a run keeps one area: see *One set-up per run*) |
+| `settings`, `units`, `read_only` | every setting the camera described at Start (as the settings window keys them), the units, and which are readings (a temperature) |
+| `preset` | the preset applied (or saved) last — **only while the camera is still as it left it**, checked at Start against every setting and the area; otherwise `""` and `preset_changed` says which preset and what no longer matches (an exposure typed after it, say) |
+| `app` | the app that ran it: window title, Designer project, the example it was built from, when it was last generated |
+| `software` | the Council's version, the source commit it runs from (read from its git folder, `""` in a build without one), the record writer's version, Python |
+| `host`, `written`, `at` | which PC, and when |
+
+It is plain JSON (`"format": "typhon-camera-record"`), written whole to a
+temporary name and renamed into place, and **never written over**: a record
+already there is left as it is. A record that cannot be written (a full disk)
+is said in the status line, and the capture goes ahead — the frames come
+first. Runs from before records simply have none.
 
 ### The slider
 
@@ -453,9 +496,79 @@ same second get `_2`, `_3` on the name.
   the file is read; the view line says `reading` until it has all of it. It
   opens once a run is stopped (the file is still being written until then).
   Viewing a `.raw` needs the Metavision SDK on that computer.
+- **The raw view shows the same picture as the PNGs.** A `.raw` always holds
+  the whole sensor's geometry (1280 x 720) with events in sensor
+  coordinates, while a run made with the camera's own area has PNGs of that
+  area alone. The raw view reads the area from the run's camera record and
+  draws each window exactly as the live view drew it — the bird bath, not a
+  1280 x 720 yard with only the bath active. A run from before camera records
+  is shown whole, as before.
 
 **Mark this frame** and **Predict this frame** use the PNG on screen; while
 live or in the raw view there is no file on screen for them to use.
+
+### The classifier: saved models
+
+The right-hand column trains a small classifier on frames you mark ("good",
+"bad timing", …) and applies it to a whole folder. Its models are **saved and
+kept**, shared by every app on this PC, each saying where it came from.
+
+- **Model** is a **dropdown of the saved models.** Pick one to open it (its
+  classes fill the list below), or type a new name and press Return — it is
+  made when its first class is added. The open list shows each model's whole
+  row: current version, classes, frames marked, **where it came from**
+  (`from Typhon (birdlab)`, `from Barbie Capture v5 — live (barbie_lab)`), its
+  tags, when it last changed. It is read again each time it opens, so a model
+  another app saved a minute ago is there.
+- **Show** narrows the list: *All classifiers*, *This app*, *App: …*,
+  *Project: …*, *Tag: …*, *Origin unknown* (models made before origins were
+  recorded) — or type part of a name.
+- **New name** + **Save as** copies the open model (classes, marks, every
+  version, its origin; not its run record) and opens the copy. **Rename**
+  renames it (its versions, origin and run record go with it). **Delete**
+  *moves* it to `<store>/.deleted/<name>_<time>` and says so — move it back
+  to restore it. None of them ever overwrites a model: a taken name is asked
+  about, never replaced.
+- **Export** writes the open model as **one file**,
+  `<name>-v<N>.typhon-classifier.zip`, into the folder beside it — the model,
+  its marks, its origin, tags and its record of what it classified;
+  everything another PC needs, without the frames. **Import** reads such a
+  file back (under its own name, or the name typed in *New name*), checking
+  all of it first; it never overwrites. **Export this app's classifiers**
+  writes everything this app made into one bundle,
+  `<project>-<time>.typhon-classifiers.zip`, which **Import** also reads.
+- **Tag** + **Add tag** / **Remove tag**: words of your own (`rig A`,
+  `night shift`) that *Show* can filter by; they never change the origin.
+- **Train** makes a new **version** (`birds v3 (1a2b3c4d)` — number and the
+  first 8 characters of its checksum) only when the marks changed; every
+  version is kept.
+- **"Classified with"** — the line under the library — says which model
+  version last classified the frames in the **capture folder**, and when:
+  `Classified with birds v1 (98f54722) on 2026-10-05 15:54 — good 5, bad
+  timing 3`. **Classify all frames** records each run it classifies (in the
+  store — the capture folder is only ever read), and the line follows the
+  folder box. A deleted model still answers (`since deleted`); another PC's
+  records never answer for a folder here.
+
+**Whose it is.** Every shipped app calls its first model `frames`, so in a
+shared store one app's could be another's by accident. Only the app a model
+belongs to — the one that made it, or made its copy or import — may **Add
+class**, **Remove class**, **Mark** or **Train** it; any app may open it,
+predict and classify with it, tag it, copy it and export it. Another app's
+model says whose it is and offers the two ways on: **Save as** (a copy of
+your own, keeping where it came from) or the tag `shared` (every app may
+change it). "This app" and **Export this app's classifiers** go by where a
+model came from, so a copy of Barbie's model still counts as Barbie's.
+
+**Where they are kept.** In **one store**, `<vault>/classifiers` (the
+Council's vault, `~/.council/vault` unless `COUNCIL_VAULT_ROOT` says
+otherwise) — never beside the frames. An app that leaves the Council
+(Typhon spun off on its own, or a GUI made later) keeps classifiers of its
+own: set `FRAME_CLASSES_STORE`, or put `classifier_store.json`
+(`{"store": "classifiers"}`, relative to that file) beside the app; then
+**Import** the bundle **Export this app's classifiers** wrote from the shared
+store. Each import adds itself to the model's history; the origin stays where
+it was made.
 
 ### Two boxes: the crop box and the camera's ROI
 
@@ -602,7 +715,15 @@ Presets are kept **in the app's project folder**, in `camera_presets.json`
 beside `camera_setup.json` — copy the project and they go with it — per
 camera (model and serial): a camera of the same model that has no preset
 of that name is offered another unit's, marked as such (it can be applied
-here, not renamed or deleted from here). The file is plain JSON, written
+here, not renamed or deleted from here). **An event camera's model is the
+sensor it reports when it is opened** (`IMX636`, `Gen4.1`, `GenX320` — read
+from the camera, never assumed), so biases tuned for one Prophesee sensor
+are never offered to another as "the same model". The scan list shows
+`Prophesee (<serial>)` until **Connect** has asked the camera; **Connected
+to Prophesee IMX636 (<serial>)** after. Presets an older Typhon saved for an
+EVK4 (it called every Metavision camera "EVK4") are still that camera's own
+by its serial, and are moved under its sensor's name the next time one of
+them changes. The file is plain JSON, written
 safely (whole, then renamed into place); a damaged one is left exactly as it
 is and named — saving a preset then keeps it as
 `camera_presets.damaged-<time>.json` and starts a new one. A project folder
@@ -635,9 +756,16 @@ stall during a drag was 39 ms; it is now 5.7–9 ms. Single slow ticks of
 26–87 ms still turned up in two of the five runs, with **and** without the
 window open — the live view's own (a 16 MB picture), not the window's.
 
-The first live picture after **Connect** costs about 0.6 s once: the camera
-libraries are imported on the window's thread before the grab thread starts
-(capture.warm_imports), so the two never race for Python's import lock.
+**The first live picture after Connect no longer freezes the window.** The
+picture libraries (Pillow's ~70 image plugins) must be loaded before a
+camera starts streaming; that used to happen on the window's thread at the
+first live tick — measured in a built Typhon, the first tick after Connect
+took 110–307 ms (simulated frame camera) and 113–483 ms (simulated event
+camera), each time the longest stall after Connect, and longer on a cold
+start. They are now loaded on a thread of their own as soon as the window
+opens, and the live view waits a tick for them if Connect comes first: the
+first tick after Connect is 6–8 ms, and it is still the longest of the next
+three seconds (five fresh starts per camera, offscreen).
 
 ### The bird bath
 
@@ -659,6 +787,10 @@ only the bird bath matters.
 5. Another day — another run of Typhon, the same project: **Connect**, pick
    **Bird bath** in the preset box. The biases, filters and the camera's ROI
    are back; press **Start capture**.
+6. The run's `<run>_camera.json` says `"preset": "Bird bath"` and the area
+   `512, 300, 160, 120` of the 1280 x 720 sensor — where its 160 x 120
+   pictures came from — and **PNG / Raw** shows the `.raw` as that same
+   area.
 
 ### One set-up per run
 
@@ -739,6 +871,13 @@ so a 12-bit frame reads dark *to the classifier*.
 | Camera connects, live view stays blank | Check the AOI — **Full sensor** resets it. |
 | The box under Gain says **Frame count**, or there is no **Settings** button | Your Typhon was built from an older example. **GUI Designer → Open → Update from example…** (see *Already have a Typhon?*). |
 | No preset box, **Save preset** or **Camera settings…** under the status line | The same: **Update from example…** brings them; your own handlers are kept. |
+| The classifier name is a plain box, not a dropdown of saved models; no **Save as / Export / Import** | The same: **Update from example…** brings the library (the old name box becomes the dropdown, still on `frames`). |
+| "'frames' belongs to Barbie … not to this app" on **Add class**, **Mark** or **Train** | The model was made by another app sharing the store. **Save as** a copy of your own, or tag it `shared` (Tag + **Add tag**) to let every app change it. |
+| The model dropdown is empty and its tooltip says the saved models cannot be read | A `classifier_store.json` beside the app names no folder, or cannot be read; fix it or move it away (nothing is looked for elsewhere on purpose). |
+| **Import** says a name is taken | Nothing was overwritten. Type another name in **New name** (for a bundle, a prefix such as `lab2-`) and press **Import** again. |
+| "classified with" says `Not classified yet` after classifying on another PC | Run records are per PC: a folder is a path on one computer. **Classify all frames** here records it here. |
+| The run's `_camera.json` is missing | A run from before camera records, or the status line at **Start** said the record was NOT written (a full disk). The raw view then shows the whole sensor. |
+| A box beside Start says `… is set once the camera has finished …` | A change was restarting the camera's stream; the value is written when it is done. |
 | **Camera settings…** says `Connect a camera first` | The window lists what the camera describes, so it needs a connected camera. It stays open across Disconnect / Connect and fills in again. |
 | Saving a preset says the path is past 260 characters | The project folder is nested too deep for Windows. Move the project somewhere shorter (or enable long paths in Windows). |
 | Which file does what, or which Python is this? | **Settings → Python Scripts**. |
