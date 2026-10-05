@@ -898,7 +898,10 @@ def open_classifier(name: Any) -> Dict[str, Any]:
     """Load a classifier's classes, creating nothing until something is added.
 
     A model trained before versions existed becomes v1 here, the first time
-    it is opened. Keys: name, classes, version, summary."""
+    it is opened.
+
+    Keys: name, classes, version, summary
+    """
     n = _name_of(name)
     d = store_dir(name)
     data = _load(name)
@@ -977,7 +980,8 @@ def train(name: Any) -> Dict[str, Any]:
     A marked frame whose file is gone keeps counting: its features come from
     the current version, which stored them when it was trained. Marks that
     give exactly the current model make no new version (see VERSIONS).
-    Keys: summary, version, sha256."""
+    Keys: summary, version, sha256
+    """
     import numpy as np
     n = _name_of(name)
     d = store_dir(name)
@@ -1076,7 +1080,8 @@ def _share_text(proba) -> Tuple[int, str]:
 
 def predict_frame(name: Any, folder: Any, frame: Any) -> Dict[str, Any]:
     """The frame on screen's likely class, with the version that said so.
-    Keys: label, version, summary."""
+    Keys: label, version, summary
+    """
     forest, X, classes, paths, meta, notes = _load_model(name)
     p = _frame_path(folder, frame)
     x = features(p)
@@ -1135,7 +1140,8 @@ def classify_folder(name: Any, folder: Any) -> Dict[str, Any]:
     Each call is RECORDED in the classifier's runs.jsonl (in the vault —
     the capture folder is only read): when, the folder, each capture run in
     it, the version id and sha, and the count per class.
-    Keys: rows, counts, version, sha256, summary."""
+    Keys: rows, counts, version, sha256, summary
+    """
     n = _name_of(name)
     d = store_dir(name)
     with _using(d):
@@ -1281,9 +1287,13 @@ def list_classifiers() -> Dict[str, Any]:
     """Every saved classifier: its name, whether it is trained, its current
     version, its classes, how many frames are marked, when it last changed.
 
-    Keys: rows (one line each, for a listbox — the name comes first), table
-    (name, version, classes, frames, updated — for a table), names, details
-    (a dict per classifier, for code), summary."""
+    "rows" is one line each, for a listbox (the name comes first, so a
+    picked row names its classifier); "table" is (name, version, classes,
+    frames, updated) for a table; "details" is a dict per classifier, for
+    code.
+
+    Keys: rows, table, names, details, summary
+    """
     lib = _library()
     k = len(lib["names"])
     summary = (f"{k} saved classifier{'' if k == 1 else 's'}: "
@@ -1356,7 +1366,8 @@ def save_as(name: Any, new_name: Any) -> Dict[str, Any]:
     version — and switch to the copy. Never replaces an existing
     classifier. The run record stays with the original: it is the
     original's history.
-    Keys: name, classes, rows, table, names, summary."""
+    Keys: name, classes, rows, table, names, summary
+    """
     n, d = _existing(name, "copy")
     new, target = _free_target(new_name, "press Save as")
     _load(n)                      # a damaged classes.json is reported, not copied
@@ -1395,7 +1406,8 @@ def rename_classifier(name: Any, new_name: Any,
     training or classifying. ``current`` is the name the window has open:
     "name" comes back as the new name when that was the one renamed, so the
     name box follows it — and unchanged otherwise.
-    Keys: name, rows, table, names, summary."""
+    Keys: name, rows, table, names, summary
+    """
     n, d = _existing(name, "rename")
     new = _name_of(new_name)
     if not new:
@@ -1428,7 +1440,8 @@ def delete_classifier(name: Any, current: Any = "") -> Dict[str, Any]:
     ``current`` is the name the window has open: when that is the one
     deleted, "name" and "classes" come back empty so the window stops
     showing it; otherwise they are the open classifier's.
-    Keys: name, classes, moved_to, rows, table, names, summary."""
+    Keys: name, classes, moved_to, rows, table, names, summary
+    """
     n, d = _existing(name, "delete")
     _refuse_if_busy(d, n, "delete it")
     bin_dir = _classifiers_root() / DELETED
@@ -1463,7 +1476,10 @@ def delete_classifier(name: Any, current: Any = "") -> Dict[str, Any]:
 def list_versions(name: Any) -> Dict[str, Any]:
     """Every version of a classifier, newest first: number, id, when, how
     many frames of each class, and the accuracy measured when it was made.
-    Keys: rows, versions (the meta of each), current, summary."""
+    "versions" is the meta.json of each, for code.
+
+    Keys: rows, versions, current, summary
+    """
     n, d = _existing(name, "list the versions of")
     notes = _reconcile(d, n)
     rows, metas = [], []
@@ -1552,7 +1568,8 @@ def export_classifier(name: Any, destination: Any) -> Dict[str, Any]:
     classifier.zip, never over an existing file) or a file name (".typhon-
     classifier.zip" is added when it has no .zip; an existing file is
     replaced only when it is itself a classifier export).
-    Keys: path, version, sha256, summary."""
+    Keys: path, version, sha256, summary
+    """
     n, d = _existing(name, "export")
     with _using(d):
         notes = _reconcile(d, n)
@@ -1756,7 +1773,8 @@ def import_classifier(path: Any, new_name: Any = "") -> Dict[str, Any]:
     next free "<name>-2", saying so. Never overwrites. The version keeps its
     number and sha, so "frames v3 (1a2b3c4d)" is the same model on both
     PCs; where it came from is kept with it.
-    Keys: name, classes, version, rows, table, names, summary."""
+    Keys: name, classes, version, rows, table, names, summary
+    """
     text = str(path or "").strip().strip('"')
     if not text:
         raise RuntimeError("choose the exported classifier file "
@@ -1895,7 +1913,8 @@ def run_history(name: Any = "", folder: Any = "") -> Dict[str, Any]:
     """Which classifier version classified which capture runs — newest
     first. By classifier, by folder, or both; with no classifier named,
     every classifier's record is searched (deleted ones included).
-    Keys: rows, records, latest, summary."""
+    Keys: rows, records, latest, summary
+    """
     n = _name_of(name)
     f = str(folder or "").strip().strip('"')
     if not n and not f:
@@ -1934,7 +1953,8 @@ def classified_with(folder: Any) -> Dict[str, Any]:
     """One line for the window: which version last classified this folder,
     and when — from every classifier's record. A blank folder is not an
     error (this may run as soon as a folder box changes): it just says so.
-    Keys: classified_with, rows, records, summary."""
+    Keys: classified_with, rows, records, summary
+    """
     if not str(folder or "").strip():
         return {"classified_with": "", "rows": [], "records": [],
                 "summary": "Choose a folder of frames to see what classified "
