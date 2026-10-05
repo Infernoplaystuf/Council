@@ -737,6 +737,44 @@ def test_the_origin_is_recorded_once_and_never_rewritten(vault, tmp_path,
     assert _about(vault, "frames-b")["origin"] == origin
 
 
+def test_opening_says_what_happened_to_it_since(vault, trained):
+    fc.save_as("frames", "frames2")
+    fc.rename_classifier("frames2", "frames3")
+    r = fc.open_classifier("frames3")
+    assert [h.split(" on ")[0] for h in r["history"]] == [
+        f"copied from frames v1 ({r['version'].split('(')[1]}",
+        "renamed from frames2"]
+    assert "; renamed from frames2 on " in r["summary"]
+
+
+def test_retraining_another_apps_classifier_says_whose_model_changed(
+        vault, tmp_path, monkeypatch, capture):
+    """The store is shared: a new version made from Typhon is Barbie's
+    current model too, and the person pressing Train should know."""
+    folder, _ = capture
+    apps = tmp_path / "apps"
+    _run_as(monkeypatch, _project(apps, "barbie", "Barbie Capture"))
+    _mark_some(folder)
+    first = fc.train("frames")
+    assert "was made by" not in first["summary"]
+    _run_as(monkeypatch, _project(apps, "example_typhon", "Typhon"))
+    fc.mark_frame("frames", str(folder), "frame_0011.png", ["bad timing"])
+    second = fc.train("frames")
+    assert ("'frames' was made by Barbie Capture (project barbie); "
+            f"{second['version']} is its current model there too.")         in second["summary"]
+
+
+def test_a_lineage_at_its_limit_stays_readable(vault, trained):
+    d = _store(vault) / "frames"
+    about = fc._read_about(d)
+    many = [{"event": "renamed", "from": f"n{i}"} for i in range(fc._LINEAGE_MAX)]
+    fc._write_about(d, dict(about, lineage=many))
+    fc.rename_classifier("frames", "frames-x")      # one more than the limit
+    lineage = fc._read_about(_store(vault) / "frames-x")["lineage"]
+    assert len(lineage) == fc._LINEAGE_MAX
+    assert lineage[-1]["from"] == "frames" and lineage[0]["from"] == "n1"
+
+
 def test_a_classifier_from_before_origin_tags_is_unknown_never_guessed(
         vault, tmp_path, monkeypatch, capture):
     d = _legacy(vault, capture[0])
@@ -1214,6 +1252,7 @@ def test_everything_one_app_made_goes_into_one_bundle_and_a_store_of_its_own(
     ("an unlisted member", "does not list exactly"),
     ("an altered classifier", "does not match its checksum"),
     ("a path outside", "not part of it"),
+    ("a name that cannot be one", "cannot be a classifier name"),
 ])
 def test_a_bundle_is_checked_whole_before_anything_is_imported(
         vault, trained, tmp_path, monkeypatch, how, msg):
@@ -1228,6 +1267,10 @@ def test_a_bundle_is_checked_whole_before_anything_is_imported(
         members[one] = members[one][:-10] + b"0123456789"
     elif how == "a path outside":
         members["classifiers/../../x.typhon-classifier.zip"] = members[one]
+    elif how == "a name that cannot be one":
+        index = json.loads(members["bundle.json"])
+        index["classifiers"][0]["name"] = "CON"
+        members["bundle.json"] = json.dumps(index).encode()
     bad = tmp_path / "bad.typhon-classifiers.zip"
     with zipfile.ZipFile(bad, "w") as zf:
         for k, v in members.items():

@@ -890,9 +890,12 @@ def _write_about(d: Path, about: Dict[str, Any]) -> None:
         if old["origin"] != about["origin"]:
             raise RuntimeError(f"the origin of '{d.name}' is recorded once "
                                f"and never rewritten — nothing was saved")
+    # A reader refuses more than _LINEAGE_MAX entries (they come from other
+    # PCs' files too), so the oldest go before that — a thousand copies,
+    # renames and imports in, not a case a person reaches.
     _write_json(p, {"format": ABOUT_FORMAT, "format_version": 1,
                     "origin": about["origin"],
-                    "lineage": list(about.get("lineage") or []),
+                    "lineage": list(about.get("lineage") or [])[-_LINEAGE_MAX:],
                     "tags": list(about.get("tags") or [])})
 
 
@@ -1470,10 +1473,12 @@ def open_classifier(name: Any) -> Dict[str, Any]:
     """Load a classifier's classes, creating nothing until something is added.
 
     Says where it came from — in a store many apps share, the classifier
-    called "frames" may be another app's. A model trained before versions
-    existed becomes v1 here, the first time it is opened.
+    called "frames" may be another app's — and what happened to it since
+    ("history": "copied from frames v2 (...) on ...", one line each, for a
+    list). A model trained before versions existed becomes v1 here, the
+    first time it is opened.
 
-    Keys: name, classes, version, origin, tags, summary
+    Keys: name, classes, version, origin, tags, history, summary
     """
     n = _name_of(name)
     d = store_dir(name)
@@ -1487,7 +1492,7 @@ def open_classifier(name: Any) -> Dict[str, Any]:
         note = " ".join(notes)
     except RuntimeError as exc:
         note = f"The trained model has a problem: {exc}"
-    origin, tags = "", []
+    origin, tags, history = "", [], []
     if _is_new(d):
         made = (f" It is new: it will be recorded as made by "
                 f"{_app_label(_this_app())} when its first class is added.")
@@ -1495,14 +1500,16 @@ def open_classifier(name: Any) -> Dict[str, Any]:
         try:
             about = _read_about(d)
             origin, tags = _origin_text(about["origin"]), about["tags"]
+            history = [_event_text(e) for e in about["lineage"]]
             made = (f" From {origin}"
+                    + (f"; {history[-1]}" if history else "")
                     + (f"; tags {', '.join(tags)}" if tags else "") + ".")
         except RuntimeError as exc:
             made = f" Where it came from cannot be read: {exc}"
     trained = (f" — trained, current model {version}" if version
                else " — not trained yet")
     return {"name": n, "classes": list(data["classes"]), "version": version,
-            "origin": origin, "tags": list(tags),
+            "origin": origin, "tags": list(tags), "history": history,
             "summary": (f"Classifier '{n}': {len(data['labels'])} frame(s) "
                         f"marked ({_counts_text(data)}){trained}.{made}"
                         + (f" {note}" if note else ""))}
@@ -1656,6 +1663,17 @@ def train(name: Any) -> Dict[str, Any]:
         mirror = _write_mirror(d, vdir)
         if mirror:
             notes.append(mirror)
+    if not (prior and prior[0]["sha256"] == sha):
+        try:
+            origin = _read_about(d)["origin"]
+        except RuntimeError:
+            origin = {}
+        if (origin and not origin.get("unknown")
+                and (origin.get("app") or origin.get("script"))
+                and not _same_app(origin, _this_app())):
+            # The store is shared: the current version is every app's.
+            notes.append(f"'{n}' was made by {_app_label(origin)}; {vid} is "
+                         f"its current model there too.")
     note = (" " + " ".join(notes)) if notes else ""
     return {"summary": f"{head} {quality}{extra}{tail}{note}",
             "version": vid, "sha256": sha}
@@ -2820,10 +2838,18 @@ def _read_bundle(p: Path) -> Tuple[Dict[str, Any],
                                    List[Tuple[Dict[str, Any], Dict[str, Any]]]]:
     """A bundle's index and every classifier in it, ALL checked before
     anything is imported — a bundle with one bad member imports nothing."""
-    raw = _read_capped(p, MAX_BUNDLE_BYTES, "classifier bundle")
     try:
-        zf = zipfile.ZipFile(io.BytesIO(raw))
-    except (zipfile.BadZipFile, ValueError) as exc:
+        size = p.stat().st_size
+    except OSError as exc:
+        raise RuntimeError(f"cannot read {p}: {exc}")
+    if size > MAX_BUNDLE_BYTES:
+        raise RuntimeError(f"{p.name} is {size >> 20} MB — larger than any "
+                           f"classifier bundle; refused")
+    try:
+        # Read from the file: the members are read (capped) one by one, so
+        # a whole second copy of the bundle is never held as well.
+        zf = zipfile.ZipFile(p)
+    except (zipfile.BadZipFile, ValueError, OSError) as exc:
         raise RuntimeError(f"{p.name} is not a classifier bundle ({exc})")
     try:
         with zf:
@@ -2865,6 +2891,11 @@ def _read_bundle(p: Path) -> Tuple[Dict[str, Any],
         raise RuntimeError(f"{p.name}: bundle.json does not list exactly the "
                            f"classifiers in it — refused, nothing was "
                            f"imported")
+    for e in entries:
+        nm = str(e.get("name") or "")
+        if not _NAME_RE.match(nm) or nm.lower() in _DEVICE_NAMES:
+            raise RuntimeError(f"{p.name}: {nm!r} cannot be a classifier "
+                               f"name — refused, nothing was imported")
     out = []
     for e in entries:
         data = blobs[e["file"]]
