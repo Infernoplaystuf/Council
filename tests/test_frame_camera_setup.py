@@ -980,3 +980,190 @@ def test_a_set_whose_binning_moves_the_area_clears_the_crop_box(binning):
     out = frame_camera.apply_camera_settings({"BinningHorizontal": 2})
     assert out["crop"] == "" and viewer.roi.get() == ""
     assert out["area"] == "50, 60, 160, 240"
+
+
+# ======================================================================
+# The boxes beside Start wait for a change on the worker (QUEUED_BOXES)
+# ======================================================================
+def _slow_area_change(viewer):
+    """A 1 fps camera whose area change is still on the worker."""
+    frame_camera.set_frame_rate(1)
+    ticks(viewer, 0.1)
+    out = frame_camera.set_area("0, 0, 128, 128")
+    assert out["pending"] and frame_camera._LIVE.job is not None
+    return out
+
+
+@pytest.mark.parametrize("box, call, value, key", [
+    ("exposure", "set_exposure", "7000", "ExposureTime"),
+    ("gain", "set_gain", "6", "Gain"),
+    ("frame_rate", "apply_frame_rate", "25", "AcquisitionFrameRate"),
+])
+def test_a_box_changed_during_a_change_on_the_worker_waits_for_it(
+        box, call, value, key):
+    """The FPS box (and exposure and gain, through any link) wrote the camera
+    from the UI thread while the worker was stopping, changing and restarting
+    its stream. Now the value waits — said, never refused — and is written
+    on the UI thread once the worker is done, never while it runs."""
+    viewer = live("frame")
+    _slow_area_change(viewer)
+    writes = []
+    setter = {"exposure": "set_exposure_us", "gain": "set_gain",
+              "frame_rate": "set_frame_rate"}[box]
+    real = getattr(device(), setter)
+
+    def watched(v):
+        writes.append(frame_camera._LIVE.job is not None)
+        return real(v)
+
+    setattr(device(), setter, watched)
+    before = device().state[key]
+    out = getattr(frame_camera, call)(value)
+    assert "is set once the camera has finished changing the camera's area" \
+        in out["summary"], out["summary"]
+    assert writes == [] and device().state[key] == before, "written mid-job"
+    said = []
+    ticks(viewer, 2.0, said=said)
+    assert frame_camera._LIVE.job is None
+    assert writes == [False], "written while the job ran, or not at all"
+    assert device().state[key] == pytest.approx(float(value))
+    assert any("Camera area set to 0, 0, 128, 128" in s for s in said), said
+    assert frame_camera._LIVE.queued == {}
+
+
+def test_only_the_latest_value_of_a_box_waits_and_disconnect_drops_it():
+    viewer = live("frame")
+    _slow_area_change(viewer)
+    frame_camera.set_gain(2)
+    frame_camera.set_gain(4)
+    assert frame_camera._LIVE.queued == {"gain": 4.0}
+    frame_camera.disconnect()
+    assert frame_camera._LIVE.queued == {}, "a value outlived its camera"
+
+
+def test_without_a_change_on_the_worker_a_box_is_written_at_once():
+    live("frame")
+    out = frame_camera.set_gain(5)
+    assert out["summary"] == "Gain 5.00." and device().state["Gain"] == 5.0
+
+
+# ======================================================================
+# Each run's camera record: <run>_camera.json
+# ======================================================================
+def _record(out):
+    path = Path(out["record"])
+    assert path.is_file(), out
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_a_bird_bath_run_says_where_on_the_sensor_its_frames_came_from(
+        tmp_path):
+    """The user's bird bath: an event camera kept to the area around the
+    bath, its set-up saved as a preset — then a run. The run's record says
+    which camera, the area in SENSOR pixels (the PNGs are that area alone),
+    every setting as it was at Start, that the preset was still as applied,
+    the app and the software."""
+    connected("event")
+    frame_camera.set_camera_area("100, 60, 160, 120")
+    frame_camera.set_camera_setting("bias.bias_diff_on", 40)
+    frame_camera.save_preset("Bird bath")
+    out = frame_camera.start(str(tmp_path / "runs"))
+    deadline = time.monotonic() + 3
+    while not frame_camera._LIVE.session.written() and \
+            time.monotonic() < deadline:
+        time.sleep(0.02)
+    frame_camera.stop()
+    rec = _record(out)
+    assert Path(out["record"]).name == f"{out['run']}_camera.json"
+    assert rec["format"] == "typhon-camera-record" and rec["run"] == out["run"]
+    assert rec["camera"]["model"] == "Simulated event camera"
+    assert rec["camera"]["serial"] == "SIM-2"
+    assert rec["camera"]["kind"] == "event"
+    assert rec["sensor"] == {"width": 640, "height": 480}
+    assert rec["area"] == {"x": 100, "y": 60, "w": 160, "h": 120}
+    assert rec["full_sensor"] is False
+    assert rec["settings"]["bias.bias_diff_on"] == 40
+    assert rec["settings"]["window_ms"] == 20.0
+    assert "status.temperature" in rec["read_only"]
+    assert rec["units"]["window_ms"] == "ms"
+    assert rec["preset"] == "Bird bath" and "preset_changed" not in rec
+    assert rec["software"]["council_version"]
+    assert rec["software"]["frame_camera"] == frame_camera.RECORD_WRITER
+    assert rec["app"]["folder"] == str(tmp_path)
+    # The PNGs of the run are the area alone.
+    from PIL import Image
+    png = sorted((tmp_path / "runs").glob(f"{out['run']}_frame_*.png"))[0]
+    assert Image.open(png).size == (160, 120)
+
+
+def test_a_preset_changed_since_it_was_applied_is_not_claimed(tmp_path):
+    connected("frame")
+    frame_camera.set_camera_setting("Gain", 3)
+    frame_camera.save_preset("Day")
+    frame_camera.set_camera_setting("Gain", 9)          # changed since
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    rec = _record(out)
+    assert rec["preset"] == ""
+    assert rec["preset_changed"] == {"name": "Day", "differs": ["Gain"]}
+    # Put back exactly: the preset is in use again, whatever did it.
+    frame_camera.set_camera_setting("Gain", 3)
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    assert _record(out)["preset"] == "Day"
+
+
+def test_an_applied_preset_is_named_and_a_box_at_start_can_change_it(
+        tmp_path):
+    connected("frame")
+    frame_camera.set_camera_setting("ExposureTime", 4000)
+    frame_camera.save_preset("Dim")
+    frame_camera.set_camera_setting("ExposureTime", 9000)
+    frame_camera.apply_preset("Dim")
+    out = frame_camera.start(str(tmp_path / "runs"), exposure="0")
+    frame_camera.stop()
+    assert _record(out)["preset"] == "Dim"
+    frame_camera._box_changed("exposure")      # typed after the preset
+    out = frame_camera.start(str(tmp_path / "runs"), exposure="6000")
+    frame_camera.stop()
+    rec = _record(out)
+    assert rec["preset"] == "" and rec["preset_changed"]["name"] == "Dim"
+    assert rec["settings"]["ExposureTime"] == 6000.0
+
+
+def test_a_record_is_never_written_over_and_its_name_is_never_reused(
+        tmp_path):
+    from council_core import camera_record
+
+    connected("frame")
+    runs = tmp_path / "runs"
+    first = frame_camera.start(str(runs))
+    frame_camera.stop()
+    path = Path(first["record"])
+    text = path.read_bytes()
+    with pytest.raises(camera_record.RecordExists):
+        camera_record.write(runs, first["run"], {"format": "other"})
+    assert path.read_bytes() == text
+    assert not list(runs.glob(".*.tmp")), "a temporary file was left behind"
+    # Only a record of that name in the folder: still a taken run name.
+    lone = runs / "solo"
+    lone.mkdir()
+    stem = time.strftime("%Y%m%d_%H%M%S")
+    (lone / f"{stem}_camera.json").write_text("{}", encoding="utf-8")
+    assert frame_camera._unique_run(lone) != stem
+
+
+def test_a_record_that_cannot_be_written_never_stops_the_capture(
+        tmp_path, monkeypatch):
+    from council_core import camera_record
+
+    def refuse(*_a, **_k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(camera_record, "write", refuse)
+    connected("frame")
+    out = frame_camera.start(str(tmp_path / "runs"))
+    assert frame_camera._LIVE.capturing
+    assert "camera record" in out["summary"] and "NOT written" in out["summary"]
+    assert out["record"] == ""
+    frame_camera.stop()
