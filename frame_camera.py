@@ -1065,7 +1065,9 @@ def attach(app: Any, view: str = "live_view",
            scrubber: str = "frame", folder: str = "capture_folder",
            current: str = "current_frame", roi: str = "roi",
            view_status: str = "view_status", presets: str = "preset",
-           area: str = "camera_area") -> Any:
+           area: str = "camera_area", models: str = "classifier_name",
+           model_filter: str = "classifier_filter",
+           classified: str = "classified_with_line") -> Any:
     """Start the live view. ONE line in app.py, which is never regenerated::
 
         class App(HandlerMixin, MainUi):
@@ -1106,6 +1108,15 @@ def attach(app: Any, view: str = "live_view",
     label saying the camera's area in sensor pixels — after every change,
     from this window or the settings window (on_camera_change). A link can
     only write the box's text, never its list. Optional, like the slider.
+
+    THE MODEL DROPDOWN. When the app's `models` port (the classifier name)
+    is a COMBOBOX, a ClassifierPicker (council_qt.widgets.
+    classifier_picker) keeps its list the saved classifiers of the shared
+    store — read again as it opens, so another app's are there too — the
+    `model_filter` box's list the filters that exist, and the `classified`
+    line saying which model version classified the capture folder. Every
+    action on a model stays a frame_classes script link. An app whose name
+    port is an entry (the Barbie apps) is left as it is.
     """
     from PySide6.QtCore import Qt, QTimer
 
@@ -1163,6 +1174,8 @@ def attach(app: Any, view: str = "live_view",
         _LIVE.picker.close()           # an earlier window's, now replaced
     _LIVE.picker = picker
     app._camera_presets = picker
+    app._classifier_picker = _models_for(app, models, model_filter,
+                                         classified, folder)
     if first_run and current_choice() is None and not _dialogs_disabled():
         # After the window is up, not inside __init__: a modal dialog opened
         # while the main window is still being built has no window on screen
@@ -1232,6 +1245,23 @@ def _picker_for(app: Any, presets: str, area: str) -> Any:
 
     return PresetPicker(sys.modules[__name__], combo=combo, area=line,
                         parent=app)
+
+
+def _models_for(app: Any, models: str, model_filter: str, classified: str,
+                folder: str) -> Any:
+    """A ClassifierPicker for this app's model dropdown, or None when its
+    model-name port is not a dropdown (or frame_classes cannot be had)."""
+    ports = getattr(app, "ports", None)
+    if ports is None or not models:
+        return None
+    try:
+        import frame_classes
+        from council_qt.widgets import classifier_picker
+    except ImportError:
+        return None
+    return classifier_picker.attach_to(frame_classes, ports, models,
+                                       model_filter, classified, folder,
+                                       parent=app)
 
 
 class _Feed:

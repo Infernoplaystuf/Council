@@ -115,19 +115,25 @@ def test_typhon_is_v5_in_teal_plus_the_capture_review_controls():
     leaves it alone and the area buttons clear it. Then the camera's own
     set-up: a line saying the camera's area, the preset picker, Save preset
     and Camera settings (s59-s63), for which the status line moved down a
-    row (s51). Nothing else moved."""
+    row (s51). Then the classifier library (s64-s78): the name box became
+    the model dropdown (s26, s27 fills it), the class controls moved down
+    under the library (s28-s40), and the camera notes (s52, s53) moved to
+    the free space in the left column to make the room. Nothing else
+    moved."""
     v5, typhon = gspec("barbie_capture_v5"), gspec("typhon")
     assert typhon["window"]["bg"] == TYPHON_BG
     assert typhon["window"]["fg"] == v5["window"]["fg"]
     assert typhon["window"]["title"] == "Typhon"
     old = {s["id"]: s for s in v5["shapes"]}
     new = {s["id"]: s for s in typhon["shapes"]}
-    assert sorted(set(new) - set(old)) == ["s55", "s56", "s57", "s58", "s59",
-                                           "s60", "s61", "s62", "s63"]
+    assert sorted(set(new) - set(old)) == [f"s{i}" for i in range(55, 79)]
     strip = lambda s: {k: v for k, v in s.items() if k != "label"}
     changed = sorted(k for k in old if strip(old[k]) != strip(new[k]))
-    assert changed == ["s04", "s06", "s08", "s09", "s11", "s23", "s44",
-                       "s46", "s49", "s50", "s51"]
+    assert changed == ["s04", "s06", "s08", "s09", "s11", "s23", "s26",
+                       "s27", "s28", "s29", "s30", "s31", "s32", "s33",
+                       "s34", "s35", "s36", "s37", "s38", "s39", "s40",
+                       "s44", "s46", "s49", "s50", "s51", "s52", "s53"]
+    assert new["s25"]["label"].startswith("Model"), "only relabelled"
     assert "roi" not in new["s44"]["script"]["outputs"]
     assert new["s49"]["script"]["outputs"]["roi"] == "crop"
     assert new["s50"]["script"]["outputs"]["roi"] == "crop"
@@ -260,6 +266,98 @@ def test_the_preset_picker_and_settings_are_linked():
             continue
         assert set(link.get("inputs", [])) <= ports, s["id"]
         assert set(link.get("outputs", {})) <= ports, s["id"]
+
+
+#: The classifier library's controls in typhon.gspec: shape -> (kind,
+#: label, port, frame_classes function or None).
+LIBRARY = {
+    "s26": ("combobox", "Model", "classifier_name", "open_classifier"),
+    "s27": ("button", "Open", None, "open_classifier"),
+    "s64": ("label", "Show", None, None),
+    "s65": ("combobox", "Show", "classifier_filter", "list_classifiers"),
+    "s66": ("entry", "", "new_name", None),
+    "s67": ("button", "Save as", None, "save_as"),
+    "s68": ("button", "Rename", None, "rename_classifier"),
+    "s69": ("button", "Delete", None, "delete_classifier"),
+    "s70": ("file_picker", "", "export_to", None),
+    "s71": ("button", "Export", None, "export_classifier"),
+    "s72": ("button", "Export this app's classifiers", None,
+            "export_this_app"),
+    "s73": ("file_picker", "", "import_from", None),
+    "s74": ("button", "Import", None, "import_classifier"),
+    "s75": ("entry", "", "tag", None),
+    "s76": ("button", "Add tag", None, "add_tag"),
+    "s77": ("button", "Remove tag", None, "remove_tag"),
+    "s78": ("label", "", "classified_with_line", None),
+}
+
+
+def test_the_classifier_library_sits_in_the_right_column_overlapping_nothing():
+    """The user's dropdown of saved models, its filter, Save as / Rename /
+    Delete, Export / Export this app's classifiers / Import, tags and the
+    "classified with" line — in the right column with the class controls
+    under them, inside the 1504 x 1016 canvas, overlapping nothing."""
+    doc = gspec("typhon")
+    shapes = {s["id"]: s for s in doc["shapes"]}
+    assert (doc["canvas"]["w"], doc["canvas"]["h"]) == (1504, 1016)
+    assert overlapping(shapes) == []
+    column = shapes["s24"]                       # the "Classifier" heading
+    for sid in [*LIBRARY, *(f"s{i}" for i in range(28, 41))]:
+        s = shapes[sid]
+        assert column["x"] <= s["x"] and \
+            s["x"] + s["w"] <= column["x"] + column["w"], sid
+        assert s["y"] > column["y"], sid
+        assert s["y"] + s["h"] <= doc["canvas"]["h"] - 16, sid
+    # The library first, the class controls under it, the predictions last.
+    assert max(shapes[k]["y"] for k in LIBRARY) < shapes["s28"]["y"]
+    assert shapes["s40"]["y"] == max(shapes[f"s{i}"]["y"]
+                                     for i in range(28, 41))
+    # The camera notes, moved for the room: left column, above the cameras.
+    for sid in ("s52", "s53"):
+        assert shapes[sid]["x"] + shapes[sid]["w"] <= shapes["s10"]["x"]
+        assert shapes[sid]["y"] + shapes[sid]["h"] < shapes["s41"]["y"]
+    assert shapes["s53"]["port"] == {"name": "camera_notes"}
+
+
+def test_the_classifier_library_is_linked_to_frame_classes():
+    shapes = {s["id"]: s for s in gspec("typhon")["shapes"]}
+    ports = {s["port"].get("name") for s in shapes.values() if s["port"]}
+    for sid, (kind, label, port, function) in LIBRARY.items():
+        s = shapes[sid]
+        assert (s["kind"], s["label"]) == (kind, label), sid
+        if port:
+            assert s["port"]["name"] == port, sid
+        link = s.get("script") or {}
+        if function is None:
+            assert link == {}, sid
+            continue
+        assert (link["module"], link["function"]) == ("frame_classes",
+                                                      function), sid
+        assert set(link["inputs"]) <= ports, sid
+        assert set(link["outputs"]) <= ports, sid
+    model = shapes["s26"]
+    assert model["props"]["readonly"] is False, "type a new model's name"
+    assert model["port"]["default"] == "frames"
+    assert model["script"]["outputs"]["classifier_name"] == "name"
+    assert shapes["s65"]["port"]["default"] == "All classifiers"
+    assert shapes["s70"]["props"]["mode"] == "folder"
+    assert shapes["s73"]["props"]["mode"] == "file"
+    # The existing controls still act on the box's model; Classify fills
+    # the "classified with" line too.
+    for sid in ("s30", "s33", "s34", "s35", "s36", "s38"):
+        assert "classifier_name" in shapes[sid]["script"]["inputs"], sid
+    assert shapes["s38"]["script"]["outputs"]["classified_with_line"] == \
+        "classified_with"
+    # Every frame_classes link in Typhon names a function that exists and a
+    # result key it documents (what the Wiring editor offers).
+    from council_core import designer_wiring as dw
+    info = {f.name: f for f in dw.module_info("frame_classes").functions}
+    for s in shapes.values():
+        link = s.get("script") or {}
+        if link.get("module") != "frame_classes":
+            continue
+        keys = set(info[link["function"]].result_keys)
+        assert set(link["outputs"].values()) <= keys, (s["id"], keys)
 
 
 def test_the_review_controls_fit_beside_the_slider():
@@ -579,3 +677,365 @@ def test_start_uses_a_box_only_when_it_was_changed_after_the_preset(
     ui.on_btn_start_capture()
     assert state["ExposureTime"] == 8000.0
     ui.on_btn_stop_capture()
+
+
+# ======================================================================
+# The classifier library, end to end in the generated window
+# ======================================================================
+def _frames(folder, count=8):
+    """Frames whose timing is good (a bright band in the middle) or bad
+    (the band low and dim) — every third one bad."""
+    import numpy as np
+    from PIL import Image
+
+    folder.mkdir(parents=True, exist_ok=True)
+    for i in range(count):
+        image = np.full((48, 64), 20, np.uint8)
+        if i % 3 == 0:
+            image[36:44, :] = 70
+        else:
+            image[18:30, :] = 160 + 8 * i
+        Image.fromarray(image).save(folder / f"20261005_120000_frame_{i:06d}.png")
+    return sorted(p.name for p in folder.glob("*.png"))
+
+
+def _pick_model(ui, name):
+    """What the user does: pick `name` in the model dropdown's open list."""
+    combo = ui.ports.classifier_name.widget
+    ui._classifier_picker.refresh()          # as the press that opens it does
+    index = combo.findText(name)
+    assert index >= 0, (name, ui._classifier_picker.items())
+    combo.setCurrentIndex(index)
+    combo.textActivated.emit(name)
+
+
+def _status(ui):
+    return ui.ports.classifier_status.get()
+
+
+@pytest.fixture
+def library_vault(tmp_path, monkeypatch):
+    """A vault of its own: the shared classifier store is <vault>/classifiers
+    (frame_classes.classifier_store), never anywhere real."""
+    vault = tmp_path / "vault"
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(vault))
+    monkeypatch.delenv("FRAME_CLASSES_STORE", raising=False)
+    return vault
+
+
+def test_the_model_dropdown_end_to_end_in_a_built_typhon(
+        qapp, tmp_path, library_vault, forget_generated):
+    """The user's classifier library, through Typhon's own generated
+    handlers and the dropdown attach fills: make a model, mark, train,
+    classify a folder and see "classified with"; export it, delete it,
+    import it back under the same name; and a second app's model listed
+    with where it came from — the store is shared, every model says whose."""
+    import subprocess
+
+    import frame_classes as fc
+    from council_qt.widgets import classifier_picker as cpk
+
+    pdir = rex.build("typhon", project="birdlab", vault_dir=library_vault,
+                     target="qt")
+    ui = construct(pdir)
+    p = ui.ports
+    picker = ui._classifier_picker
+    assert isinstance(picker, cpk.ClassifierPicker)
+    combo = p.classifier_name.widget
+    assert combo.isEditable() and combo.currentText() == "frames"
+    assert picker.items() == [] and fc.classifier_store() == \
+        library_vault / "classifiers"
+    frames = tmp_path / "run"
+    names = _frames(frames)
+
+    # Create: a new name typed into the box (Return), then its classes.
+    combo.lineEdit().setText("birds")
+    combo.textActivated.emit("birds")
+    assert "'birds' is new" in _status(ui)
+    for cls in ("good", "bad timing"):
+        p.new_class.set(cls)
+        ui.on_btn_add_class()
+    assert p.classes.items() == ["good", "bad timing"]
+
+    # Mark the frames on screen, through the slider and the Mark button.
+    p.capture_folder.set(str(frames))
+    _pump_until(lambda: len(ui._capture_review.files) == len(names), 2.0)
+    rv = ui._capture_review
+    for index, name in enumerate(names):
+        rv.scrubber.set(index, notify=True)
+        _pump_until(lambda: p.current_frame.get() == name, 1.0)
+        p.classes.widget.setCurrentRow(1 if index % 3 == 0 else 0)
+        ui.on_btn_mark_this_frame()
+        assert "marked" in _status(ui), _status(ui)
+
+    # Train, classify the folder: the line says which model version did it.
+    ui.on_btn_train()
+    assert "Saved as birds v1 (" in _status(ui), _status(ui)
+    ui.on_btn_classify_all_frames()
+    line = p.classified_with_line.get()
+    assert line.startswith("Classified with birds v1 ("), line
+    assert "bad timing 3" in line and "good 5" in line
+    assert len(p.predictions.items()) == len(names)
+
+    # The dropdown lists it, its row saying where it came from.
+    picker.refresh()
+    assert picker.items() == ["birds"]
+    row = picker.row_of("birds")
+    assert row.startswith("birds   v1 (") and "from Typhon (birdlab)" in row
+
+    # Export one file, Delete (moved aside), Import it back by that name.
+    out = tmp_path / "out"
+    out.mkdir()
+    p.export_to.set(str(out))
+    ui.on_btn_export()
+    assert _status(ui).startswith("Exported birds v1 ("), _status(ui)
+    exported = next(out.glob("birds-v1.typhon-classifier.zip"))
+    ui.on_btn_delete()
+    assert combo.currentText() == "" and p.classes.items() == []
+    assert "moved aside" in _status(ui)
+    picker.refresh()
+    assert picker.items() == []
+    assert list((fc.classifier_store() / ".deleted").iterdir())
+    p.import_from.set(str(exported))
+    p.new_name.set("")
+    ui.on_btn_import_()
+    assert combo.currentText() == "birds", _status(ui)
+    assert p.classes.items() == ["good", "bad timing"]
+    assert _status(ui).startswith("Imported birds v1 ("), _status(ui)
+    picker.refresh()
+    assert picker.items() == ["birds"]
+    # The record of what classified the folder survived the round trip.
+    p.capture_folder.set(str(tmp_path))                 # another folder ...
+    _pump_until(lambda: "Not classified" in p.classified_with_line.get(),
+                2.0)
+    p.capture_folder.set(str(frames))                   # ... and back
+    _pump_until(lambda: p.classified_with_line.get().startswith(
+        "Classified with birds v1"), 2.0)
+    assert p.classified_with_line.get().startswith("Classified with birds v1")
+
+    # A second app on this PC (a Barbie project) makes a model of its own.
+    other = rex.build("barbie_capture_v5", project="barbie_lab",
+                      vault_dir=library_vault, target="qt")
+    driver = (f"import sys; sys.argv[0] = {str(other / 'main.py')!r}; "
+              f"sys.path.insert(0, {str(Path(fc.__file__).parent)!r}); "
+              f"import frame_classes as fc; "
+              f"print(fc.add_class('barbie-frames', 'good')['summary'])")
+    env = dict(os.environ, COUNCIL_VAULT_ROOT=str(library_vault))
+    env.pop("FRAME_CLASSES_STORE", None)
+    made = subprocess.run([sys.executable, "-c", driver], cwd=str(other),
+                          capture_output=True, text=True, timeout=120,
+                          env=env)
+    assert made.returncode == 0, made.stderr[-2000:]
+    _pick_model(ui, "birds")                 # the list is read as it opens
+    assert picker.items() == ["barbie-frames", "birds"]
+    theirs = picker.row_of("barbie-frames")
+    assert "from Barbie" in theirs and "(barbie_lab)" in theirs, theirs
+    assert "from Typhon (birdlab)" in picker.row_of("birds")
+    # Show: This app, or that app's name, narrows the list.
+    p.classifier_filter.set("This app")
+    p.classifier_filter.widget.textActivated.emit("This app")
+    assert picker.items() == ["birds"]
+    filters = [p.classifier_filter.widget.itemText(i)
+               for i in range(p.classifier_filter.widget.count())]
+    barbie = next(f for f in filters if f.startswith("App: Barbie"))
+    p.classifier_filter.set(barbie)
+    p.classifier_filter.widget.textActivated.emit(barbie)
+    assert picker.items() == ["barbie-frames"]
+    # Whose it is: Typhon may open, copy and tag Barbie's model, not train it.
+    _pick_model(ui, "barbie-frames")
+    assert "From Barbie" in _status(ui), _status(ui)
+    refused = []
+    ui.report_error = lambda what, exc: refused.append(f"{what}: {exc}")
+    p.new_class.set("bad timing")
+    ui.on_btn_add_class()
+    assert len(refused) == 1 and "belongs to Barbie" in refused[0], refused
+    p.new_name.set("barbie-copy")
+    ui.on_btn_save_as()
+    assert combo.currentText() == "barbie-copy", _status(ui)
+    assert "from Barbie" in (picker.refresh() or picker.row_of("barbie-copy"))
+    # Everything this app MADE, in one bundle — by origin: a copy of
+    # Barbie's model keeps Barbie as where it came from.
+    ui.on_btn_export_this_app_s_classifiers()
+    assert _status(ui).startswith("Exported 1 classifier (This app: Typhon"), \
+        _status(ui)
+    assert next(out.glob("birdlab-*.typhon-classifiers.zip"))
+    assert refused == [refused[0]], "nothing else was refused"
+    ui.close()
+
+
+# ----------------------------------------------------------------------
+# The model dropdown's helper on its own (council_qt.widgets.
+# classifier_picker), against a stand-in for frame_classes
+# ----------------------------------------------------------------------
+class _Library:
+    """frame_classes' list_classifiers / classified_with, counted."""
+
+    def __init__(self):
+        self.models = {"frames": "frames   v2 (1a2b3c4d) · 2 classes · from "
+                                 "Typhon (lab)",
+                       "night": "night   not trained · 1 class · from "
+                                "Barbie (b5)"}
+        self.listed, self.asked = [], []
+        self.broken = ""
+
+    def list_classifiers(self, show=""):
+        self.listed.append(show)
+        if self.broken:
+            raise RuntimeError(self.broken)
+        names = sorted(n for n in self.models
+                       if show in ("", "All classifiers") or show in n)
+        return {"names": names, "rows": [self.models[n] for n in names],
+                "filters": ["All classifiers", "This app", "App: Barbie"]}
+
+    def classified_with(self, folder):
+        self.asked.append(folder)
+        return {"classified_with": f"Classified with frames v2 — {folder}"
+                if folder else ""}
+
+
+class _ComboPort:
+    def __init__(self, combo):
+        self.widget = combo
+
+    def get(self):
+        return self.widget.currentText()
+
+
+class _LinePort:
+    def __init__(self, value=""):
+        self.value, self.hooks = value, []
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
+        for hook in self.hooks:
+            hook(value)
+
+    def on_change(self, hook):
+        self.hooks.append(hook)
+
+
+def _picker(qapp):
+    from PySide6.QtWidgets import QComboBox
+
+    from council_qt.widgets import classifier_picker as cpk
+
+    model, show = QComboBox(), QComboBox()
+    for box in (model, show):
+        box.setEditable(True)
+        box.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen)
+    activated = []
+    model.textActivated.connect(activated.append)
+    library, line, folder = _Library(), _LinePort(), _LinePort()
+    made = cpk.ClassifierPicker(library, combo=_ComboPort(model),
+                                show=_ComboPort(show), line=line,
+                                folder=folder)
+    return made, model, show, library, line, folder, activated
+
+
+from PySide6.QtCore import QEvent, QPointF, Qt  # noqa: E402
+from PySide6.QtGui import QKeyEvent, QMouseEvent  # noqa: E402
+
+
+def test_the_dropdown_lists_names_and_draws_whole_rows(qapp):
+    from PySide6.QtWidgets import QStyleOptionViewItem
+
+    made, model, show, library, *_ , activated = _picker(qapp)
+    assert made.items() == ["frames", "night"]
+    assert [show.itemText(i) for i in range(show.count())] == [
+        "All classifiers", "This app", "App: Barbie"]
+    # The open list draws each item as its whole row; the box keeps names.
+    option = QStyleOptionViewItem()
+    model.itemDelegate().initStyleOption(option, model.model().index(1, 0))
+    assert option.text == library.models["night"]
+    assert model.itemData(1, Qt.ItemDataRole.ToolTipRole) == \
+        library.models["night"]
+    model.setCurrentIndex(1)
+    assert model.currentText() == "night"
+    assert activated == [], "filling the list opened a model"
+
+
+def test_the_list_is_read_as_it_opens_never_on_a_timer(qapp):
+    made, model, show, library, *_ = _picker(qapp)
+    before = len(library.listed)
+    _pump_until(lambda: False, seconds=0.3)
+    assert len(library.listed) == before, "read while nobody looked"
+    library.models["fresh"] = "fresh   not trained · from Typhon (lab)"
+    press = QMouseEvent(QEvent.Type.MouseButtonPress, QPointF(5, 5),
+                        QPointF(5, 5), Qt.MouseButton.LeftButton,
+                        Qt.MouseButton.LeftButton,
+                        Qt.KeyboardModifier.NoModifier)
+    assert made.eventFilter(model, press) is False       # never consumed
+    assert made.items() == ["frames", "fresh", "night"]
+    del library.models["fresh"]
+    for key, mods in ((Qt.Key.Key_F4, Qt.KeyboardModifier.NoModifier),
+                      (Qt.Key.Key_Down, Qt.KeyboardModifier.AltModifier)):
+        library.models[f"k{int(key)}"] = "k"
+        made.eventFilter(model, QKeyEvent(QEvent.Type.KeyPress, key, mods))
+        assert f"k{int(key)}" in made.items()
+    count = len(library.listed)
+    made.eventFilter(model, QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_A,
+                                      Qt.KeyboardModifier.NoModifier))
+    assert len(library.listed) == count, "a keystroke read the store"
+
+
+def test_the_filter_narrows_the_list(qapp):
+    made, model, show, library, *_ = _picker(qapp)
+    show.setEditText("night")
+    show.textActivated.emit("night")
+    assert library.listed[-1] == "night" and made.items() == ["night"]
+
+
+def test_a_name_being_typed_survives_a_refill(qapp):
+    made, model, show, library, *_ , activated = _picker(qapp)
+    model.lineEdit().setText("bir")
+    model.lineEdit().setCursorPosition(2)
+    made.refresh()
+    assert model.currentText() == "bir" and model.currentIndex() == -1
+    assert model.lineEdit().cursorPosition() == 2
+    model.setCurrentIndex(made.items().index("night"))
+    made.refresh()
+    assert model.currentText() == "night"
+    assert activated == []
+
+
+def test_a_store_that_cannot_be_read_says_why_and_keeps_the_box(qapp):
+    made, model, show, library, *_ = _picker(qapp)
+    model.setEditText("frames")
+    library.broken = "classifier_store.json names no folder"
+    made.refresh()
+    assert made.items() == [] and model.currentText() == "frames"
+    assert "names no folder" in model.toolTip()
+    library.broken = ""
+    made.refresh()
+    assert "cannot be read" not in model.toolTip()
+
+
+def test_the_classified_with_line_follows_the_folder_once_typing_stops(qapp):
+    from council_qt.widgets import classifier_picker as cpk
+
+    made, model, show, library, line, folder, _ = _picker(qapp)
+    asked = len(library.asked)
+    for partial in ("C", "C:", "C:/r", "C:/run"):        # typed, key by key
+        folder.set(partial)
+    assert len(library.asked) == asked, "searched the store per keystroke"
+    _pump_until(lambda: line.get().endswith("C:/run"),
+                cpk.LINE_DELAY_MS / 1000 + 1.0)
+    assert line.get() == "Classified with frames v2 — C:/run"
+    assert library.asked[asked:] == ["C:/run"]
+
+
+def test_an_app_whose_name_box_is_an_entry_gets_no_dropdown(qapp):
+    from types import SimpleNamespace
+
+    from PySide6.QtWidgets import QLineEdit
+
+    from council_qt.widgets import classifier_picker as cpk
+
+    ports = SimpleNamespace(classifier_name=SimpleNamespace(
+        widget=QLineEdit()))
+    assert cpk.attach_to(_Library(), ports, "classifier_name",
+                         "classifier_filter", "classified_with_line",
+                         "capture_folder") is None

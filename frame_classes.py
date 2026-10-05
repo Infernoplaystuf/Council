@@ -2427,8 +2427,12 @@ def classify_folder(name: Any, folder: Any) -> Dict[str, Any]:
     Each call is RECORDED in the classifier's runs.jsonl (in the store —
     the capture folder is only read): when, the folder, each capture run in
     it, the version id and sha, the count per class, this PC and the app.
+    "classified_with" is the line classified_with(folder) gives from now
+    on, made from the record just written (no store search), so one link
+    can fill the window's "classified with" line too; a run that could not
+    be recorded says so there.
 
-    Keys: rows, counts, version, sha256, summary
+    Keys: rows, counts, version, sha256, classified_with, summary
     """
     d = store_dir(name)
     n = d.name
@@ -2469,8 +2473,9 @@ def classify_folder(name: Any, folder: Any) -> Dict[str, Any]:
                 tally[cls] += 1
                 rows.append(f"{nm}   {cls}" + ("" if pr[best] >= 0.8 else f"  ({share})"))
     vid = _vid(n, meta)
-    recorded = ""
+    recorded = line = ""
     if rows:
+        record: Dict[str, Any] = {}
         if _inside(d, f):
             # MEASURED before: with the store pointed into the capture
             # folder, this said "recorded" and the folder gained the record.
@@ -2482,7 +2487,7 @@ def classify_folder(name: Any, folder: Any) -> Dict[str, Any]:
                 run = _run_of(nm)
                 runs[run] = runs.get(run, 0) + 1
             me = _this_app()
-            why = _append_run(d, {
+            record = {
                 "when": _now(), "at": time.time(), "folder": str(f.resolve()),
                 "runs": runs, "frames": len(rows), "unreadable": unreadable,
                 "classifier": n, "version": meta["version"],
@@ -2490,15 +2495,19 @@ def classify_folder(name: Any, folder: Any) -> Dict[str, Any]:
                 "host": _host(),
                 "by": {k: str(me.get(k) or "") for k in
                        ("app", "project", "project_id", "script",
-                        "script_id")}})
+                        "script_id")}}
+            why = _append_run(d, record)
         recorded = (f" — classified with {vid}, recorded." if not why else
                     f" — classified with {vid} (NOT recorded: {why}).")
+        line = (_latest_text(record) if not why else
+                f"Classified with {vid} just now — NOT recorded: {why}")
     summary = (f"{len(rows)} frames: "
                + ", ".join(f"{c} {k}" for c, k in tally.items())
                + (f"; {unreadable} unreadable" if unreadable else "")
                + recorded + ((" " + " ".join(notes)) if notes else ""))
     return {"rows": rows, "counts": tally, "version": vid,
-            "sha256": meta["sha256"], "summary": summary}
+            "sha256": meta["sha256"], "classified_with": line,
+            "summary": summary}
 
 
 # ============================================================
@@ -4166,6 +4175,18 @@ def _run_line(rec: Dict[str, Any], with_folder: bool) -> str:
     return text
 
 
+def _latest_text(r: Dict[str, Any]) -> str:
+    """"Classified with frames v3 (1a2b3c4d) on 2026-10-02 14:03 — good 110,
+    bad timing 10": one record as the window's line. One wording for
+    run_history's "latest" and classify_folder's own answer."""
+    counts = ", ".join(f"{c} {k}" for c, k in (r.get("counts") or {}).items())
+    return (f"Classified with {r.get('version_id', '?')}"
+            f"{' (since deleted)' if r.get('deleted') else ''} on "
+            f"{str(r.get('when', '?'))[:16]}"
+            + ("" if _here(r) else f" on {r.get('host')}")
+            + f" — {counts}")
+
+
 def run_history(name: Any = "", folder: Any = "") -> Dict[str, Any]:
     """Which classifier version classified which capture runs — newest
     first. By classifier, by folder, or both; with no classifier named,
@@ -4196,15 +4217,7 @@ def run_history(name: Any = "", folder: Any = "") -> Dict[str, Any]:
     found.sort(key=lambda t: (t[0], t[1]), reverse=True)
     records = [r for _t, _s, r in found]
     rows = [_run_line(r, with_folder=not f) for r in records]
-    latest = ""
-    if records:
-        r = records[0]
-        counts = ", ".join(f"{c} {k}" for c, k in (r.get("counts") or {}).items())
-        latest = (f"Classified with {r.get('version_id', '?')}"
-                  f"{' (since deleted)' if r.get('deleted') else ''} on "
-                  f"{str(r.get('when', '?'))[:16]}"
-                  + ("" if _here(r) else f" on {r.get('host')}")
-                  + f" — {counts}")
+    latest = _latest_text(records[0]) if records else ""
     where = f" for {Path(f).name or f}" if f else ""
     who = f" by '{n}'" if n else ""
     summary = (f"{len(records)} classified run(s){who}{where}."
