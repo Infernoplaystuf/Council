@@ -40,6 +40,12 @@ the caller's decision (frame_camera stops, writes, starts again). An EVK4's
 facilities are all set live, and its stream is never restarted anyway
 (cameras.EvkDevice.restartable).
 
+`apply` raises NeedsStop BEFORE writing anything — a set is never left half
+applied because the stream was in the way halfway through. And a locked
+setting whose value would not change is not a reason to stop: a preset that
+saves PixelFormat Mono8, applied to a camera already in Mono8, changes only
+what it changes, live (`stops_needed`).
+
 A SAFE ORDER FOR A SET
 `apply` writes a preset in an order that works: auto loops off before the
 values they would overwrite; pixel format and binning before the area (binning
@@ -58,7 +64,11 @@ import math
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from .cameras import (CameraError, MIN_ACCUMULATE_MS, Roi, _ask, _interface)
+from .cameras import (CameraError, MIN_ACCUMULATE_MS, NeedsStop, Roi, _ask,
+                      _interface, fit_roi)
+
+__all__ = ["Setting", "Change", "Applied", "SettingError", "NeedsStop",
+           "coerce", "apply", "snapshot", "needs_stop", "stops_needed"]
 
 #: What a setting holds.
 FLOAT, INT, BOOL, CHOICE, TEXT = "float", "int", "bool", "choice", "text"
@@ -67,16 +77,6 @@ FLOAT, INT, BOOL, CHOICE, TEXT = "float", "int", "bool", "choice", "text"
 class SettingError(CameraError):
     """A setting that does not exist here, cannot be written, or was given
     something it cannot take."""
-
-
-class NeedsStop(CameraError):
-    """The camera refuses this change while it streams. Stop the stream,
-    write it, and start the stream again."""
-
-    def __init__(self, key: str, message: str = ""):
-        super().__init__(message or f"{key} can only change while the camera "
-                                    f"is not streaming")
-        self.key = key
 
 
 # ======================================================================
@@ -223,10 +223,27 @@ def same(a: Any, b: Any) -> bool:
     """Equal as settings: floats within float noise (a gain written as 3.0
     reads back 2.999994 on the emulator — measured — which is not a change
     anyone asked about)."""
+    # What was TYPED or saved may be text ("5000", "on"): compare it as the
+    # value it stands for, or every typed number reads as "adjusted".
+    if isinstance(a, str) != isinstance(b, str):
+        text, other = (a, b) if isinstance(a, str) else (b, a)
+        lowered = text.strip().lower()
+        if isinstance(other, bool):
+            return other is True and lowered in _TRUE or (
+                other is False and lowered in _FALSE)
+        if isinstance(other, (int, float)):
+            try:
+                a, b = float(lowered), float(other)
+            except ValueError:
+                return False
     if isinstance(a, bool) or isinstance(b, bool):
         return a == b
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
         return math.isclose(float(a), float(b), rel_tol=1e-5, abs_tol=1e-6)
+    if isinstance(a, str) and isinstance(b, str):
+        # A choice is matched without regard to case (coerce), so "mono8"
+        # taking as "Mono8" is not an adjustment.
+        return a.strip().lower() == b.strip().lower()
     return a == b
 
 
@@ -426,6 +443,52 @@ def _why(exc: BaseException) -> str:
 # ======================================================================
 # Applying a set, and taking one
 # ======================================================================
+def _unchanged(setting: Setting, asked: Any) -> bool:
+    """Would writing `asked` leave this setting as it is?"""
+    try:
+        wanted, _ = coerce(setting, asked)
+    except SettingError:
+        return False
+    return same(wanted, setting.value)
+
+
+def _area_unchanged(device: Any, roi: Roi) -> bool:
+    try:
+        return device.roi() == fit_roi(roi, device.limits())
+    except Exception:                                       # noqa: BLE001
+        return False
+
+
+def stops_needed(device: Any, values: Mapping[str, Any],
+                 roi: Optional[Roi] = None,
+                 described: Optional[Sequence[Setting]] = None) -> List[str]:
+    """What in this set the stream is in the way of, by key ("area" for the
+    area) — empty when it can all be written live, or nothing streams.
+
+    Only CHANGES count: a locked setting asked for the value it already has
+    is left alone by `apply`, so it is not a reason to stop the stream.
+    """
+    if not getattr(device, "streaming", False):
+        return []
+    if described is None:
+        described = device.settings_provider().describe()
+    by_key = {s.key: s for s in described}
+    blocked = [key for key in values
+               if key in by_key and not by_key[key].live
+               and not by_key[key].read_only
+               and not _unchanged(by_key[key], values[key])]
+    if (roi is not None and not getattr(device, "area_live", False)
+            and not _area_unchanged(device, roi)):
+        blocked.append("area")
+    return blocked
+
+
+def needs_stop(device: Any, values: Mapping[str, Any],
+               roi: Optional[Roi] = None) -> bool:
+    """Would applying this set need the stream stopped?"""
+    return bool(stops_needed(device, values, roi))
+
+
 def apply(device: Any, values: Mapping[str, Any],
           roi: Optional[Roi] = None) -> Applied:
     """Write `values` (and the area, if given) in a safe order.
@@ -433,19 +496,30 @@ def apply(device: Any, values: Mapping[str, Any],
     Every key is accounted for in the result: written, adjusted, skipped
     (auto is on) or refused (`ok` False) — including keys this camera does
     not have, which happens when a preset made on another model of camera is
-    applied. NeedsStop is NOT caught: the caller should have stopped the
-    stream first (frame_camera does for a restartable camera); it is raised
-    so a half-applied set is never mistaken for a whole one.
+    applied.
+
+    NeedsStop is raised BEFORE ANYTHING IS WRITTEN when the stream is in the
+    way of any change in the set (`stops_needed`), so a half-applied set is
+    never mistaken for a whole one: the caller stops the stream and calls
+    again (frame_camera does that for a restartable camera).
     """
     provider = device.settings_provider()
     described = provider.describe()
+    blocked = stops_needed(device, values, roi, described)
+    if blocked:
+        raise NeedsStop(blocked[0], f"{', '.join(blocked)} can only change "
+                                    f"while the camera is not streaming")
     by_key = {s.key: s for s in described}
     done = Applied(roi_asked=roi)
     batch = dict(values)
     for key in provider.plan(values.keys(), described, roi is not None):
         if key is None:
             try:
-                done.roi = device.set_roi(roi)
+                if (getattr(device, "streaming", False)
+                        and _area_unchanged(device, roi)):
+                    done.roi = device.roi()     # already so: nothing to stop
+                else:
+                    done.roi = device.set_roi(roi)
             except Exception as exc:                        # noqa: BLE001
                 done.roi_error = _why(exc)
             continue
@@ -461,9 +535,15 @@ def apply(device: Any, values: Mapping[str, Any],
                                        + (f" ({setting.help})"
                                           if setting.help else "")))
             continue
+        if not setting.live and _unchanged(setting, asked):
+            # Locked by the stream and already as asked: nothing to write.
+            done.changes.append(Change(key, asked, setting.value))
+            continue
         try:
             done.changes.append(provider.set(key, asked, batch=batch,
                                              setting=setting))
+        except NeedsStop:
+            raise
         except SettingError as exc:
             done.changes.append(Change(key, asked, setting.value, ok=False,
                                        note=str(exc)))
@@ -475,13 +555,6 @@ def snapshot(device: Any) -> Dict[str, Any]:
     camera has it now. Readings (a temperature) and labels are left out."""
     return {s.key: s.value for s in device.settings_provider().describe()
             if s.savable and s.value is not None}
-
-
-def needs_stop(device: Any, keys: Iterable[str]) -> bool:
-    """Would writing any of `keys` need the stream stopped?"""
-    wanted = set(keys)
-    return any(s.key in wanted and not s.live
-               for s in device.settings_provider().describe())
 
 
 # ======================================================================
@@ -1053,10 +1126,28 @@ class EvkSettings(Provider):
 
     # -- read / write ----------------------------------------------------
     def read(self, key: str) -> Any:
+        """One value, read straight from its facility.
+
+        Not by describing everything: on a live EVK4 every facility read is
+        a USB register round trip, and the read-back after each write would
+        otherwise re-read every bias and filter on the camera.
+        """
         if key.startswith("bias."):
             return int(self.biases.get(key[5:]))
         if key == "window_ms":
             return float(self.device.accumulate_ms)
+        module, _, part = key.partition(".")
+        target = {"erc": self.erc, "afk": self.afk, "trail": self.trail,
+                  "activity": self.activity}.get(module)
+        if target is not None:
+            if part == "enabled":
+                return bool(target.is_enabled())
+            if module == "activity" and part in ACTIVITY_FIELDS:
+                return int(getattr(target.get_thresholds(), part))
+            direct = _EVK_READERS.get(key)
+            if direct is not None:
+                got = getattr(target, direct)()
+                return _enum_name(got) if key in _EVK_ENUMS else _plain(got)
         for setting in self.describe():
             if setting.key == key:
                 return setting.value
@@ -1085,9 +1176,13 @@ class EvkSettings(Provider):
                 _enum_value(getattr(type(target), "AntiFlickerMode", None),
                             target.get_filtering_mode(), value)), setting)
         elif key in ("afk.low_hz", "afk.high_hz"):
-            low = int(value) if key == "afk.low_hz" else int(batch.get(
+            # ONE CALL SETS BOTH ENDS (set_frequency_band(min, max)), so the
+            # other end comes from the same set when it has one — otherwise
+            # moving a band upwards would be refused for crossing the old
+            # upper end on its way.
+            low = int(value) if key == "afk.low_hz" else _whole(batch.get(
                 "afk.low_hz", target.get_band_low_frequency()))
-            high = int(value) if key == "afk.high_hz" else int(batch.get(
+            high = int(value) if key == "afk.high_hz" else _whole(batch.get(
                 "afk.high_hz", target.get_band_high_frequency()))
             if low > high:
                 raise SettingError(f"the band must run from low to high, "
@@ -1111,6 +1206,30 @@ class EvkSettings(Provider):
             _accepted(target.set_thresholds(now), setting)
         else:
             raise SettingError(f"{setting.label} cannot be set")
+
+
+#: Facility getters for EvkSettings.read, by key (the enable flags and the
+#: activity thresholds are handled there).
+_EVK_READERS: Dict[str, str] = {
+    "erc.rate": "get_cd_event_rate",
+    "afk.mode": "get_filtering_mode",
+    "afk.low_hz": "get_band_low_frequency",
+    "afk.high_hz": "get_band_high_frequency",
+    "afk.duty_cycle": "get_duty_cycle",
+    "afk.start_threshold": "get_start_threshold",
+    "afk.stop_threshold": "get_stop_threshold",
+    "trail.type": "get_type",
+    "trail.threshold": "get_threshold",
+}
+_EVK_ENUMS = ("afk.mode", "trail.type")
+
+
+def _whole(value: Any) -> int:
+    """An int from whatever a set holds ("150", 150.0, 150)."""
+    try:
+        return int(round(float(str(value).strip())))
+    except (TypeError, ValueError):
+        raise SettingError(f"{value!r} is not a number") from None
 
 
 def _accepted(result: Any, setting: Setting) -> None:
@@ -1275,4 +1394,7 @@ class SyntheticSettings(Provider):
 
     def write(self, setting: Setting, value: Any,
               batch: Mapping[str, Any]) -> None:
+        if setting.key == "window_ms":
+            self.device.accumulate_ms = max(MIN_ACCUMULATE_MS, float(value))
+            return
         self.device.write_setting(setting.key, value)

@@ -82,6 +82,21 @@ class CameraError(Exception):
     """A camera could not do what was asked."""
 
 
+class NeedsStop(CameraError):
+    """The camera refuses this change while it streams. Stop the stream,
+    make the change, and start the stream again.
+
+    Raised BEFORE anything is written, so the caller can stop and retry the
+    whole change rather than finish half of it. Nothing in this module stops
+    a stream by itself: the grab thread belongs to capture.CaptureSession,
+    and stopping it is the caller's decision (see frame_camera)."""
+
+    def __init__(self, key: str, message: str = ""):
+        super().__init__(message or f"{key} can only change while the camera "
+                                    f"is not streaming")
+        self.key = key
+
+
 class CameraEnded(CameraError):
     """The source is FINISHED — not "this grab failed, try again".
 
@@ -143,6 +158,12 @@ class Frame:
 
     `image` is always a numpy array this module owns outright — never a view
     into an SDK buffer.
+
+    `meta["aoi"]` is the camera area (x, y, w, h, in the camera's own AOI
+    pixels) the frame was taken with. A box drawn on the picture is in IMAGE
+    pixels; adding this origin is what turns it into sensor pixels for the
+    camera. It travels WITH the frame because the area can change between
+    the frame being taken and the box being drawn on it.
     """
     image: Any
     index: int = 0
@@ -330,6 +351,17 @@ class Device:
     #: its stream runs from the first start until the device is closed.
     restartable = True
 
+    #: Whether set_roi works while the camera streams. An EVK4's I_ROI is
+    #: written live (the masked pixels just stop emitting); a Basler's Width
+    #: and Height are locked while grabbing (TLParamsLocked — measured on the
+    #: pylon emulator), so its area needs the stream stopped first.
+    area_live = False
+
+    @property
+    def streaming(self) -> bool:
+        """The camera has been started and not stopped."""
+        return bool(getattr(self, "_started", False))
+
     def start_raw(self, path: Any) -> Path:
         """Begin recording the camera's raw stream into `path`."""
         raise CameraError("this camera has no raw stream to record")
@@ -350,7 +382,9 @@ class Device:
         raise NotImplementedError
 
     def set_roi(self, roi: Roi) -> Roi:
-        """Apply an AOI and return what the camera actually took."""
+        """Apply an AOI and return what the camera actually took. Raises
+        NeedsStop, before writing anything, when the camera streams and its
+        area cannot change live (`area_live`)."""
         raise NotImplementedError
 
     def set_exposure_us(self, value: float) -> float:
@@ -387,7 +421,9 @@ class Device:
 
     def apply_settings(self, values: Dict[str, Any],
                        roi: Optional[Roi] = None) -> Any:
-        """Write a whole set, and optionally the area, in a safe order."""
+        """Write a whole set, and optionally the area, in a safe order.
+        Raises NeedsStop before writing anything if the stream is in the
+        way of any of it."""
         from . import camera_settings
         return camera_settings.apply(self, values, roi)
 
@@ -556,6 +592,10 @@ class BaslerDevice(Device):
         self._recording = False
         self._converters: Dict[Any, Any] = {}
         self._pool = FramePool(self.POOL_BYTES)
+        #: The area the stream was started with (Frame.meta["aoi"]): read
+        #: once at start, not four node reads per frame. It cannot change
+        #: while grabbing — set_roi refuses then.
+        self._aoi: Optional[Tuple[int, int, int, int]] = None
 
     # -- node map helpers ------------------------------------------------
     def _node(self, name: str) -> Any:
@@ -653,6 +693,14 @@ class BaslerDevice(Device):
         moving the origin back is refused by the camera whenever the two
         overlap — which is most of the time.
         """
+        if self._started:
+            # REFUSED, NOT HALF-DONE. While grabbing, Width and Height are
+            # locked but OffsetX/Y are not (both measured on the emulator),
+            # and _set skips a locked node silently — so a write here moved
+            # the box without resizing it, and reported that as what the
+            # camera took.
+            raise NeedsStop("area", "the camera's area can only change while "
+                                    "it is not streaming")
         wanted = fit_roi(roi, self.limits())
         # With CenterX/CenterY on (ace), the offsets are read-only and the box
         # silently cannot move.
@@ -783,6 +831,7 @@ class BaslerDevice(Device):
             if payload > 0:
                 count = max(10, min(200, self.RECORD_BUFFER_BYTES // payload))
                 self._try_set("MaxNumBuffer", int(count))
+        self._aoi = self.roi().as_tuple()
         if strategy is None:
             self._cam.StartGrabbing()
         else:
@@ -833,6 +882,8 @@ class BaslerDevice(Device):
                 pass
         self._index += 1
         meta: Dict[str, Any] = {"kind": "frame"}
+        if self._aoi is not None:
+            meta["aoi"] = self._aoi
         if skipped:
             meta["skipped_by_camera"] = skipped
         return Frame(image=image, index=self._index, timestamp_us=stamp,
@@ -1199,6 +1250,10 @@ class EvkDevice(Device):
     #: is how Prophesee's own recording works (Camera::start_recording).
     restartable = False
 
+    #: I_ROI is written while the stream runs: the masked pixels simply stop
+    #: emitting, and read() bins the survivors against the new origin.
+    area_live = True
+
     # ------------------------------------------------------------------
     # The raw recording
     # ------------------------------------------------------------------
@@ -1446,7 +1501,8 @@ class EvkDevice(Device):
         rate = (len(xs) / (span_us / 1e6)) if span_us > 0 else 0.0
         meta = {"kind": "event", "events": int(len(xs)),
                 "window_ms": self.accumulate_ms,
-                "span_us": span_us, "event_rate_hz": rate}
+                "span_us": span_us, "event_rate_hz": rate,
+                "aoi": roi.as_tuple()}
         if self._raw is not None and len(stamps):
             # WHERE THIS PICTURE IS IN THE .raw, as time since its first
             # event. The live clock and the file's clock differ: a replay is
@@ -1569,19 +1625,69 @@ class SyntheticDevice(Device):
     WIDTH, HEIGHT = 640, 480
     FRAME_FPS = 30.0
 
+    # -- the settings a settings window and presets are exercised against --
+    #: An IMX636's biases (the EVK4's sensor), by the names its HAL uses.
+    BIASES: Tuple[str, ...] = ("bias_diff_on", "bias_diff_off", "bias_fo",
+                               "bias_hpf", "bias_refr")
+    #: I_EventTrailFilterModule.Type's members, in their enum order.
+    TRAIL_TYPES: Tuple[str, ...] = ("TRAIL", "STC_CUT_TRAIL", "STC_KEEP_TRAIL")
+    #: Two formats: one 8-bit, one that arrives as uint16 like a Mono12 Basler.
+    PIXEL_FORMATS: Tuple[str, ...] = ("Mono8", "Mono12")
+    #: Every range the simulated sensor reports. The settings provider READS
+    #: these (camera_settings.SyntheticSettings), as it reads a real node map.
+    RANGES: Dict[str, Tuple[float, float]] = {
+        "ExposureTime": (20.0, 100000.0), "Gain": (0.0, 24.0),
+        "BlackLevel": (0, 64), "AcquisitionFrameRate": (1.0, 1000.0),
+        "bias.bias_diff_on": (-85, 140), "bias.bias_diff_off": (-35, 190),
+        "bias.bias_fo": (-35, 55), "bias.bias_hpf": (0, 120),
+        "bias.bias_refr": (-20, 235),
+        "erc.rate": (0, 1_000_000_000), "trail.threshold": (1, 100_000),
+    }
+    #: What a real Basler refuses while grabbing (measured on the emulator).
+    LOCKED_WHILE_STREAMING: Tuple[str, ...] = ("PixelFormat", "ReverseX")
+
     def __init__(self, info: CameraInfo):
         self.info = info
         self._roi = Roi(0, 0, self.WIDTH, self.HEIGHT)
         self._index = 0
         self._started = False
         self.accumulate_ms = DEFAULT_ACCUMULATE_MS
-        self._fps = self.FRAME_FPS
         self._due = 0.0
+        self.state: Dict[str, Any] = {
+            "ExposureTime": 5000.0, "Gain": 0.0, "BlackLevel": 0,
+            "PixelFormat": "Mono8", "ReverseX": False,
+            "AcquisitionFrameRateEnable": False,
+            "AcquisitionFrameRate": self.FRAME_FPS,
+            "erc.enabled": False, "erc.rate": 20_000_000,
+            "trail.enabled": False, "trail.type": "TRAIL",
+            "trail.threshold": 10_000,
+        }
+        for name in self.BIASES:
+            self.state[f"bias.{name}"] = 0
+        #: An event camera's area is set live, like an EVK4's; a frame
+        #: camera's needs the stream stopped, like a Basler's.
+        self.area_live = info.kind == "event"
+
+    @property
+    def _fps(self) -> float:
+        if self.state["AcquisitionFrameRateEnable"]:
+            return float(self.state["AcquisitionFrameRate"])
+        return self.FRAME_FPS
 
     def _interval(self) -> float:
         if self.info.kind == "event":
             return max(0.001, self.accumulate_ms / 1000.0)
         return 1.0 / self._fps
+
+    def write_setting(self, key: str, value: Any) -> None:
+        """One setting, as camera_settings.SyntheticSettings writes it:
+        already coerced to its type and range. Refuses what a Basler refuses
+        while grabbing, the way a Basler does — before changing anything."""
+        if key not in self.state:
+            raise CameraError(f"this camera has no setting called {key!r}")
+        if self._started and key in self.LOCKED_WHILE_STREAMING:
+            raise NeedsStop(key)
+        self.state[key] = value
 
     def set_frame_rate(self, fps: float) -> float:
         fps = float(fps)
@@ -1589,8 +1695,17 @@ class SyntheticDevice(Device):
             self.accumulate_ms = (DEFAULT_ACCUMULATE_MS if fps <= 0 else
                                   max(MIN_ACCUMULATE_MS, 1000.0 / fps))
             return 1000.0 / self.accumulate_ms
-        self._fps = self.FRAME_FPS if fps <= 0 else min(1000.0, fps)
+        if fps <= 0:
+            self.state["AcquisitionFrameRateEnable"] = False
+        else:
+            low, high = self.RANGES["AcquisitionFrameRate"]
+            self.state["AcquisitionFrameRate"] = max(low, min(high, fps))
+            self.state["AcquisitionFrameRateEnable"] = True
         return self._fps
+
+    def settings_provider(self) -> Any:
+        from .camera_settings import SyntheticSettings
+        return SyntheticSettings(self)
 
     def limits(self) -> Limits:
         """The limits of whichever sensor this one is standing in for.
@@ -1603,23 +1718,32 @@ class SyntheticDevice(Device):
                       inc_w=4, inc_h=2, min_w=16, min_h=16)
         if self.info.kind == "event":
             return Limits(**common)
-        return Limits(exposure_us=(20.0, 100000.0), gain=(0.0, 24.0),
-                      **common)
+        return Limits(exposure_us=self.RANGES["ExposureTime"],
+                      gain=self.RANGES["Gain"], **common)
 
     def roi(self) -> Roi:
         return self._roi
 
     def set_roi(self, roi: Roi) -> Roi:
+        if self._started and not self.area_live:
+            raise NeedsStop("area", "the camera's area can only change while "
+                                    "it is not streaming")
         self._roi = fit_roi(roi, self.limits())
         return self._roi
 
     def set_exposure_us(self, value: float) -> float:
         low, high = self.limits().exposure_us
-        return max(low, min(high, float(value)))
+        got = max(low, min(high, float(value)))
+        if self.info.kind != "event":
+            self.state["ExposureTime"] = got
+        return got
 
     def set_gain(self, value: float) -> float:
         low, high = self.limits().gain
-        return max(low, min(high, float(value)))
+        got = max(low, min(high, float(value)))
+        if self.info.kind != "event":
+            self.state["Gain"] = got
+        return got
 
     def start(self) -> None:
         self._started = True
@@ -1640,21 +1764,48 @@ class SyntheticDevice(Device):
         roi = self._roi
         self._index += 1
         column = (self._index * 7) % max(1, roi.w)
+        state = self.state
         if self.info.kind == "event":
             # Only the moving edge emits, which is what an event camera does.
-            xs = [column] * roi.h + [(column + 1) % roi.w] * roi.h
-            ys = list(range(roi.h)) * 2
-            pols = [1] * roi.h + [0] * roi.h
+            # The settings are honoured roughly as the sensor would: a higher
+            # contrast threshold fires fewer pixels, the trail filter drops
+            # the edge's trailing OFF events, and the ERC caps the count.
+            every = 1 + max(0, int(state["bias.bias_diff_on"])) // 40
+            ys_on = list(range(0, roi.h, every))
+            xs = [column] * len(ys_on)
+            ys = list(ys_on)
+            pols = [1] * len(ys_on)
+            if not state["trail.enabled"]:
+                xs += [(column + 1) % roi.w] * len(ys_on)
+                ys += ys_on
+                pols += [0] * len(ys_on)
+            if state["erc.enabled"]:
+                cap = int(state["erc.rate"] * self.accumulate_ms / 1000.0)
+                xs, ys, pols = xs[:cap], ys[:cap], pols[:cap]
             image = accumulate_events(xs, ys, pols, roi.w, roi.h, np)
             return Frame(image, self._index, self._index * 1000,
                          {"kind": "event", "events": len(xs),
                           "window_ms": self.accumulate_ms,
-                          "simulated": True})
+                          "simulated": True, "aoi": roi.as_tuple()})
+        # Brighter with exposure and gain, lifted by the black level,
+        # mirrored by ReverseX, and 12 bits in a uint16 for Mono12 — so a
+        # preset that changes them is visibly applied.
+        scale = (float(state["ExposureTime"]) / 5000.0
+                 * 10 ** (float(state["Gain"]) / 20.0))
         image = np.zeros((roi.h, roi.w), dtype=np.uint8)
         image[:, column] = 255
-        image[roi.h // 3: 2 * roi.h // 3, :] += 40
+        band = int(min(200.0, 40 * scale))
+        image[roi.h // 3: 2 * roi.h // 3, :] += np.uint8(band)
+        black = int(state["BlackLevel"])
+        if black:
+            image = np.maximum(image, np.uint8(min(255, black)))
+        if state["ReverseX"]:
+            image = np.ascontiguousarray(image[:, ::-1])
+        if state["PixelFormat"] == "Mono12":
+            image = image.astype(np.uint16) << 4
         return Frame(image, self._index, self._index * 1000,
-                     {"kind": "frame", "simulated": True})
+                     {"kind": "frame", "simulated": True,
+                      "aoi": roi.as_tuple()})
 
 
 # ======================================================================
