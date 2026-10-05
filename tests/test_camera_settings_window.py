@@ -547,6 +547,67 @@ def test_the_picker_lists_this_cameras_presets_and_never_picks_by_itself(
     made.close()
 
 
+def _type(combo, text, cursor=None):
+    """What typing into the editable box leaves: its text, and the cursor."""
+    combo.lineEdit().setText(text)
+    combo.lineEdit().setCursorPosition(len(text) if cursor is None
+                                       else cursor)
+
+
+def test_a_name_being_typed_survives_presets_changed_elsewhere(qapp):
+    """Half-way through typing a new preset name in the main window, the
+    settings window saved a preset, then renamed one: each refill of the list
+    cleared the box (the typed name was not in the new list) or put the
+    name just saved there in its place."""
+    made, combo, area, activated = picker(qapp)
+    connect("frame", live=False)
+    frame_camera.save_preset("Day")
+    _type(combo, "Bird b", cursor=4)
+    w = window()
+    frame_camera.save_preset("Night")          # as the settings window does
+    assert [combo.itemText(i) for i in range(combo.count())] == ["Day",
+                                                                  "Night"]
+    assert combo.currentText() == "Bird b" and combo.currentIndex() == -1
+    assert combo.lineEdit().cursorPosition() == 4, "the cursor moved"
+    frame_camera.rename_preset("Night", "Dusk")
+    assert combo.currentText() == "Bird b"
+    frame_camera.delete_preset("Dusk")
+    assert combo.currentText() == "Bird b"
+    assert w.preset_list.count() == 1, "the window has its own list"
+    assert activated == [], "a refill picked a preset"
+    # Finished and saved from this box: now it is a preset, and picked.
+    _type(combo, "Bird bath")
+    frame_camera.save_preset(combo.currentText())
+    assert combo.currentText() == "Bird bath" and combo.currentIndex() >= 0
+    made.close()
+
+
+def test_a_name_being_typed_survives_connect_and_disconnect(qapp):
+    made, combo, area, activated = picker(qapp)
+    _type(combo, "Feeder")
+    connect("event", live=False)
+    assert combo.currentText() == "Feeder"
+    frame_camera.disconnect()
+    assert combo.currentText() == "Feeder"
+    assert activated == []
+    made.close()
+
+
+def test_a_preset_shown_and_then_deleted_elsewhere_still_leaves_the_box(qapp):
+    """Kept apart from typing: a box SHOWING a preset that is gone is
+    emptied, as before."""
+    made, combo, area, _ = picker(qapp)
+    connect("frame", live=False)
+    frame_camera.save_preset("Day")
+    frame_camera.save_preset("Night")
+    frame_camera.apply_preset("Day")
+    assert combo.currentText() == "Day"
+    frame_camera.delete_preset("Day")
+    assert combo.currentText() == "" and combo.count() == 1
+    frame_camera.rename_preset("Night", "Dusk")
+    made.close()
+
+
 def test_the_picker_stops_listening_with_its_window(qapp):
     made, combo, area, _ = picker(qapp)
     assert made.heard in frame_camera._LIVE.listeners

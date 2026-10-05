@@ -146,18 +146,41 @@ class PresetPicker(QObject):
 
     # -- the box ----------------------------------------------------------
     def fill(self, names: List[str], select: str = "") -> None:
-        """Put `names` in the box. The text in it stays when it is still one
-        of them (or `select`, after a save or a rename); otherwise the box
-        is left showing its placeholder."""
+        """Put `names` in the box. The preset shown stays when it is still
+        one of them (or `select`, after a save or a rename); one that is
+        gone leaves the placeholder.
+
+        A NAME BEING TYPED IS NEVER TAKEN AWAY. Text in the box that is not
+        one of the presets listed is the user typing a new name — to save
+        under, half-way through. The list is refilled whenever the camera
+        changes anywhere (the settings window saving or renaming a preset,
+        Connect), and each refill used to clear it (it was not in the new
+        list) or replace it with the name just saved there. It now stays,
+        cursor and all; `select` applies only to a box showing a preset."""
         combo = self.combo
         if combo is None:
             return
         self.fills += 1
+        listed = {combo.itemText(i).casefold() for i in range(combo.count())}
+        typed = combo.currentText() if combo.isEditable() else ""
+        typing = bool(typed.strip()) and typed.casefold() not in listed
+        line = combo.lineEdit() if typing else None
+        cursor = line.cursorPosition() if line is not None else 0
         keep = select or combo.currentText()
         blocker = QSignalBlocker(combo)
         try:
             combo.clear()
             combo.addItems([str(n) for n in names])
+            if typing:
+                # Saved from this box just now: it is a preset, picked.
+                index = combo.findText(typed.strip(),
+                                       Qt.MatchFlag.MatchFixedString)
+                combo.setCurrentIndex(index)
+                if index < 0:
+                    combo.setEditText(typed)
+                    if line is not None:
+                        line.setCursorPosition(min(cursor, len(typed)))
+                return
             index = combo.findText(keep, Qt.MatchFlag.MatchFixedString) \
                 if keep else -1
             combo.setCurrentIndex(index)
