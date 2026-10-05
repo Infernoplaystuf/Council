@@ -1224,6 +1224,8 @@ ALONE = textwrap.dedent('''
     from pathlib import Path
     alone, frames_dir, repo = map(Path, sys.argv[1:4])
     sys.path.insert(0, str(alone))
+    if sys.argv[4] == "reachable":
+        sys.path.append(str(repo))          # there, and still not used
     import numpy as np
     from PIL import Image
     import frame_classes as fc
@@ -1242,7 +1244,8 @@ ALONE = textwrap.dedent('''
     for i in (1, 2, 4):
         fc.mark_frame("frames", str(frames_dir), f"f{i}.png", ["good"])
     out = {"train": fc.train("frames")["summary"],
-           "classify": fc.classify_folder("frames", str(frames_dir))["counts"]}
+           "classify": fc.classify_folder("frames", str(frames_dir))["counts"],
+           "store": str(fc.classifier_store())}
     e = fc.export_classifier("frames", str(alone))
     os.environ["FRAME_CLASSES_STORE"] = str(alone / "second_store")
     out["import"] = fc.import_classifier(e["path"])["imported"]
@@ -1255,21 +1258,24 @@ ALONE = textwrap.dedent('''
 ''')
 
 
-def test_frame_classes_runs_with_no_council_module_at_all(tmp_path):
+@pytest.mark.parametrize("council", ["absent", "reachable"])
+def test_frame_classes_runs_with_no_council_module_at_all(tmp_path, council):
     """An app that leaves the Council carries this one file. Run from a
     folder holding nothing else, in an isolated interpreter (-I: no
     PYTHONPATH, no user site, not even the current folder on sys.path), it
     makes, trains, classifies, exports and imports — and no module of the
-    Council's is ever loaded."""
+    Council's is ever loaded: not when the Council is absent, and not when
+    it is on sys.path either (a `try: import gui_projects` would pass the
+    first and fail the second)."""
     alone = tmp_path / "alone"
     alone.mkdir()
     shutil.copy(REPO / "frame_classes.py", alone / "frame_classes.py")
     driver = tmp_path / "drive.py"
     driver.write_text(ALONE, encoding="utf-8")
-    env = dict(os.environ, FRAME_CLASSES_STORE=str(alone / "store"),
-               COUNCIL_VAULT_ROOT=str(tmp_path / "no_vault"))
+    env = dict(os.environ, COUNCIL_VAULT_ROOT=str(tmp_path / "vault"))
+    env.pop(fc.STORE_ENV, None)     # the vault's store first, then its own
     r = subprocess.run([sys.executable, "-I", str(driver), str(alone),
-                        str(tmp_path / "frames"), str(REPO)],
+                        str(tmp_path / "frames"), str(REPO), council],
                        cwd=str(tmp_path), capture_output=True, text=True,
                        encoding="utf-8", errors="replace", timeout=180,
                        env=env)
@@ -1280,7 +1286,8 @@ def test_frame_classes_runs_with_no_council_module_at_all(tmp_path):
     assert out["classify"] == {"good": 5, "bad": 3}
     assert out["import"] == ["frames"] and out["list"] == ["frames"]
     assert out["council"] == []
-    assert not (tmp_path / "no_vault").exists()
+    assert Path(out["store"]) == tmp_path / "vault" / "classifiers"
+    assert (alone / "second_store" / "frames" / "about.json").is_file()
     assert "imports nothing of the Council's" in fc.__doc__
 
 
