@@ -35,7 +35,11 @@ grabbing, a preset applied back with its area). EVK4: every facility name,
 method, enum member and range accessor used was checked against the OpenEB
 bindings, and a `.raw` opened as a device lists only what it has — but a
 real EVK4's biases, ERC, anti-flicker and trail filter have **not** been
-written to a sensor yet: the first real test is the first run.
+written to a sensor yet: the first real test is the first run. The
+**settings window and the preset picker** were driven offscreen in a
+generated Typhon, in two separate processes (save, quit, start again, pick):
+on both simulated cameras, and on the emulator with a real `BaslerDevice`
+(a Gain, the pixel format and the camera's area saved and put back).
 
 ## 1. Get the branch
 
@@ -132,7 +136,9 @@ adding it to a new one as well is harmless — the second call does nothing.)
 
 A project built from an example keeps the example as it was **that day**. A
 Typhon built before the FPS box still says **Frame count**, and has no
-**Settings** button. To bring it up to date without losing your own code:
+**Settings** button; one built before the presets has no preset picker,
+**Save preset** or **Camera settings…** button. To bring it up to date
+without losing your own code:
 
 1. **GUI Designer → Open**, pick your Typhon (`example_typhon` if you used the
    command above).
@@ -252,9 +258,13 @@ Typhon can connect straight away.
    the camera sees — the **live view** — so you can aim, focus and set the
    camera's area first. **Nothing is saved** while it is only live; the line
    above the picture says `Live · not saving`.
-3. **Start capture** — frames are written to that folder (and, for an EVK4,
+3. Optionally set the camera up: **Camera settings…** for every setting it
+   has, a box drawn on the picture + **Apply area to camera** for its own
+   ROI — or simply **pick a preset** in the box under the status line. See
+   *Camera settings and presets* and *The bird bath* below.
+4. **Start capture** — frames are written to that folder (and, for an EVK4,
    the `.raw`).
-4. **Stop capture** when done — the picture goes back to live — then copy the
+5. **Stop capture** when done — the picture goes back to live — then copy the
    run wherever it needs to go.
 
 ### The live view
@@ -447,20 +457,32 @@ same second get `_2`, `_3` on the name.
 **Mark this frame** and **Predict this frame** use the PNG on screen; while
 live or in the raw view there is no file on screen for them to use.
 
-### Two boxes: the crop box and the camera's area
+### Two boxes: the crop box and the camera's ROI
 
 They are different things, in different pixels, and Typhon keeps them apart:
 
-| | The **crop box** (the ROI entry) | The **camera's area** |
+| | The **crop box** (the *Crop box* entry) | The **camera's ROI** (its own area) |
 |---|---|---|
 | Pixels | of the **picture** it was drawn on | of the **sensor** |
+| Shown in | the *Crop box (x, y, w, h)* entry | the line under *Apply area to camera* (`Camera's area: 320, 200, 160, 120 of 640x480, sensor px`) and the settings window |
 | Used by | **Save cropped frames** — cuts saved PNGs | the camera itself: an EVK4 emits events **only inside it**, a Basler **reads out only it** |
 | Changes the recording? | no — the originals are untouched | yes — frames (and the `.raw`) hold only that area |
+| Kept in a preset? | no | yes |
+
+**How the coordinates work.** A box is drawn on the picture, so it is in
+*picture* pixels. The live picture of a camera with an ROI set **is** that
+ROI, so **Apply area to camera** adds the ROI's own origin (the `x, y` of the
+area the frame on screen was taken with) to turn the box into *sensor*
+pixels: on a picture of the area `100, 60, 320, 200`, a box drawn at
+`8, 10, 64, 32` becomes the sensor area `108, 70, 64, 32`. The crop box is
+never converted — **Save cropped frames** cuts the saved PNGs in their own
+pixels. The settings window's area box and a preset's area are always
+sensor pixels; a Basler's are in its binned pixels when binning is on.
 
 ### Cropping to a region and saving it
 
-Draw a box on the picture with **Draw ROI** (or type `x, y, w, h` into the ROI
-box), choose **Save cropped frames to**, and press **Save cropped frames**:
+Draw a box on the picture with **Draw ROI** (or type `x, y, w, h` into the
+**Crop box**), choose **Save cropped frames to**, and press **Save cropped frames**:
 every PNG in the capture folder is cropped to that box and saved there, with
 the originals untouched. It works on the PNGs — during a capture, after it, on
 an EVK4 run as well as a Basler one. It does not crop the `.raw`.
@@ -482,15 +504,21 @@ line says so when it had to move. **Full sensor** puts it back.
 - **Draw it on the live picture.** A box drawn on a saved frame is refused —
   that frame may have been taken with another area. Drag the slider to its
   end first.
-- The ROI entry is **cleared** when the camera's area changes (the box was in
+- The crop box is **cleared** when the camera's area changes (the box was in
   the old picture's pixels), and Connect no longer fills it with the camera's
   area — that was the sensor's numbers in a box that means picture pixels.
+- The line under the two buttons always says the camera's area **now**, in
+  sensor pixels — whichever window changed it.
+- To type the area in sensor pixels instead, use the settings window's
+  **Camera's area** box.
 - **Not while capturing**, on either camera — see *One set-up per run*.
 
 ### Camera settings and presets
 
-Every setting the connected camera has can be read and changed — the camera
-describes them itself, with its own ranges, so nothing is guessed:
+**Camera settings…** (under the status line) opens a window beside Typhon —
+not a dialog: the live view and any capture carry on underneath. It lists
+every setting the connected camera has; the camera describes them itself,
+with its own ranges, increments and units, so nothing is guessed:
 
 - **EVK4** (through the Metavision HAL, as Metavision Studio shows them): every
   bias (`bias_diff_on`, `bias_diff_off`, `bias_fo`, `bias_hpf`, `bias_refr`, …,
@@ -508,31 +536,108 @@ describes them itself, with its own ranges, so nothing is guessed:
   frame rate the camera will reach and its temperature — whichever the model
   has, with the ranges its nodes report.
 
-What the camera **took** is what is shown: a value outside the range is
-clamped before it is sent (pylon refuses rather than clamps), the camera may
-snap it (an exposure of 5003.7 µs runs as 5004), an EVK4 may refuse a bias —
-each is said, never hidden.
+**The window.** Settings are grouped as the camera groups them (Biases,
+Event rate controller, … / Exposure, Gain, Image, Binning, Frame rate), one
+row each: a slider and a box for a number (the slider is logarithmic for a
+long range such as an exposure of 20 µs … 10 s), a tick box for on/off, a
+list for a choice, plain text for a reading. On the right: the **camera's
+area** in sensor pixels, the **presets**, and **What the last change did**.
 
-A **preset** is one camera set-up: every setting worth saving **and the
-camera's area** (in sensor pixels, or "leave the area as it is"). Save one
-for "bird bath", apply it again later in one step. Presets are kept **in the
-app's project folder**, in `camera_presets.json` beside `camera_setup.json`,
-per camera (model and serial): a camera of the same model that has no preset
-of that name is offered another unit's, marked as such. The file is plain
-JSON, written safely (whole, then renamed into place); a damaged one is left
-exactly as it is and named — saving a preset then keeps it as
-`camera_presets.damaged-<time>.json` and starts a new one.
+- **Changes apply as you make them.** Dragging a slider writes the newest
+  value at most every 60 ms, and always the last one, so the live picture
+  follows the drag; a typed number is written when you press Return or
+  leave the box, never per keystroke.
+- **What the camera took is what is shown.** A value outside the range is
+  clamped before it is sent (pylon refuses rather than clamps), the camera
+  may snap it (an exposure of 5003.7 µs runs as 5004), an EVK4 may refuse a
+  bias — the control shows the camera's value and the row says
+  `The camera made it 5004 (asked 5003.7)` or `NOT changed — …`.
+- A bias outside its **recommended** range says so under its row.
+- A setting another one owns is **greyed out and says why** (`Greyed out
+  while ExposureAuto is Continuous — change that first`). One the stream is
+  in the way of (a Basler's pixel format, mirror, binning) says `Changing
+  this restarts the live view for a moment`, and does exactly that.
+- **↺** on a row puts that setting back **as the camera had it when it was
+  connected**; **Reset all (as connected)** puts them all back (not the
+  area — **Full sensor** is for that). An EVK4 is opened with its sensor's
+  default biases, so for an EVK4 this *is* the camera's default.
+- **Camera defaults** (a Basler, when its node map has `UserSetSelector`
+  "Default" and `UserSetLoad`) loads the camera's **own factory set** —
+  every setting and the area — with the live view stopped for it. The
+  emulator has the nodes but ignores the load, so this button is checked
+  against the node names only; an EVK4 has no such set and shows no button.
+
+**Presets.** A preset is one camera set-up: every setting worth saving **and
+the camera's ROI** (sensor pixels), or — untick *with the camera's area* —
+the settings alone. In the window: type a name and **Save as** (a preset of
+the same name is replaced; it works while capturing, as it only reads the
+camera), pick one and **Apply** (or double-click it), **Rename to the name
+below**, **Delete** (click twice — it asks with the button, not a dialog).
+In Typhon's own window, under the status line:
+
+- the **preset box** lists this camera's presets — **picking one applies
+  it**;
+- type a new name into the same box and press **Save preset** to save the
+  camera as it is now (its settings and its area) under that name. (Return
+  on a name that is not a preset yet only says so — it is not an error.)
+
+Both windows always list the same presets, whichever saved one.
+
+Presets are kept **in the app's project folder**, in `camera_presets.json`
+beside `camera_setup.json` — copy the project and they go with it — per
+camera (model and serial): a camera of the same model that has no preset
+of that name is offered another unit's, marked as such (it can be applied
+here, not renamed or deleted from here). The file is plain JSON, written
+safely (whole, then renamed into place); a damaged one is left exactly as it
+is and named — saving a preset then keeps it as
+`camera_presets.damaged-<time>.json` and starts a new one. A project folder
+nested so deep that the file's path passes Windows' 260 characters says so,
+rather than "No such file or directory".
 
 Applying a preset writes its settings in an order that works (auto modes off
 before the values they own, pixel format and binning before the area, the
 area before the frame-rate limit, a filter's parameters before it is
 switched on), then the area. Settings that cannot change while a Basler
 streams (pixel format, mirror, binning, the area) stop the live view for a
-moment and start it again — measured on pylon's emulator, **35 ms** of the
-window's time for a preset changing the format and the area, **3.6 ms** for
-one of live settings only. A very slow camera (a frame every half second)
-does not freeze the window: the change finishes in the background and the
-status line says how it went. An EVK4 sets everything live.
+moment and start it again. A very slow camera (a frame every half second)
+does not freeze the window: after 0.15 s it says `Applying…`, greys itself,
+and the answer arrives in the status line and the window when the change is
+done. An EVK4 sets everything live.
+
+**What it costs the window** (offscreen, this PC):
+
+| | UI thread |
+|---|---|
+| picking a preset in Typhon (pixel format + area: the live view restarts) — simulated camera / pylon emulator | 19–34 ms / 16 ms, once |
+| applying a preset that changes the area of a **5328 x 3040** live view | 7–14 ms, once; longest stall 10–17 ms |
+| one setting written from a dragged slider (the whole cycle) | 0.35 ms median, 0.7 ms worst; 64 writes in 4 s of dragging |
+| the live view at **5328 x 3040** (Mono8), per tick | 1.9 ms median, 2.5 ms worst — the same with the settings window open and a slider being dragged |
+| longest stall with the window open and a slider dragged at 5328 x 3040 | 5.7 ms (28 pictures a second drawn either way) |
+
+The first live picture after **Connect** costs about 0.6 s once: the camera
+libraries are imported on the window's thread before the grab thread starts
+(capture.warm_imports), so the two never race for Python's import lock.
+
+### The bird bath
+
+The user's case: an EVK4 looking at a back yard, the camera never moved, and
+only the bird bath matters.
+
+1. **Connect**. The picture is live; nothing is saved.
+2. Draw a box around the bird bath on the live picture (**Draw ROI**), then
+   **Apply area to camera**. The camera now emits events **only there**: the
+   picture becomes that part of the yard, the `.raw` and the PNGs will hold
+   only it, and the line under the buttons says
+   `Camera's area: 512, 300, 160, 120 of 1280x720, sensor px`. Drawn too
+   big? Draw a smaller box on the new picture and apply again — it lands
+   where you drew it.
+3. **Camera settings…** — set the biases (`bias_diff_on` / `bias_diff_off`
+   for how strong a change must be), the trail filter, anti-flicker for a
+   pump or a lamp. The picture shows each change as you make it.
+4. Type `Bird bath` into the preset box and press **Save preset**.
+5. Another day — another run of Typhon, the same project: **Connect**, pick
+   **Bird bath** in the preset box. The biases, filters and the camera's ROI
+   are back; press **Start capture**.
 
 ### One set-up per run
 
@@ -603,6 +708,9 @@ so a 12-bit frame reads dark *to the classifier*.
 | EVK4: "Metavision SDK installed" fails | Not installed, or installed for a different Python than the app runs under (3.10–3.12 only). |
 | Camera connects, live view stays blank | Check the AOI — **Full sensor** resets it. |
 | The box under Gain says **Frame count**, or there is no **Settings** button | Your Typhon was built from an older example. **GUI Designer → Open → Update from example…** (see *Already have a Typhon?*). |
+| No preset box, **Save preset** or **Camera settings…** under the status line | The same: **Update from example…** brings them; your own handlers are kept. |
+| **Camera settings…** says `Connect a camera first` | The window lists what the camera describes, so it needs a connected camera. It stays open across Disconnect / Connect and fills in again. |
+| Saving a preset says the path is past 260 characters | The project folder is nested too deep for Windows. Move the project somewhere shorter (or enable long paths in Windows). |
 | Which file does what, or which Python is this? | **Settings → Python Scripts**. |
 | `NOT saved (storage too slow)` in the status line | The folder is on a disk (usually a network share) that cannot keep up. Capture to a local folder and copy the run afterwards. |
 | **PNG / Raw** says `Raw opens after Stop` | The `.raw` is still being recorded. Stop the capture first. |
