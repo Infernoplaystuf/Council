@@ -1028,14 +1028,7 @@ class EvkSettings(Provider):
         out.extend(self._afk())
         out.extend(self._trail())
         out.extend(self._activity())
-        out.append(Setting("window_ms", "Picture window", G_VIEW, FLOAT,
-                           float(getattr(self.device, "accumulate_ms", 20.0)),
-                           minimum=MIN_ACCUMULATE_MS, maximum=MAX_WINDOW_MS,
-                           unit="ms",
-                           help="How long each picture collects events "
-                                "(1000 / pictures a second). The live view "
-                                "and the PNGs only — the .raw has every "
-                                "event."))
+        out.append(self._window())
         out.extend(self._status())
         out.extend(self._camera())
         return out
@@ -1053,6 +1046,11 @@ class EvkSettings(Provider):
                 value = None
             if value is not None:
                 return self._bias(rest, value)
+        if key == "window_ms":
+            # The app's own setting: no facility to read at all. It fell
+            # through to describe() — every bias and filter, dozens of USB
+            # reads on a live EVK4 — once per step of its slider.
+            return self._window()
         part = {"erc": self._erc, "afk": self._afk, "trail": self._trail,
                 "activity": self._activity, "status": self._status,
                 "camera": self._camera}.get(group)
@@ -1060,6 +1058,16 @@ class EvkSettings(Provider):
             if setting.key == key:
                 return setting
         raise SettingError(f"this camera has no setting called {key!r}")
+
+    def _window(self) -> Setting:
+        return Setting("window_ms", "Picture window", G_VIEW, FLOAT,
+                       float(getattr(self.device, "accumulate_ms", 20.0)),
+                       minimum=MIN_ACCUMULATE_MS, maximum=MAX_WINDOW_MS,
+                       unit="ms",
+                       help="How long each picture collects events "
+                            "(1000 / pictures a second). The live view "
+                            "and the PNGs only — the .raw has every "
+                            "event.")
 
     def _biases(self) -> List[Setting]:
         if self.biases is None:

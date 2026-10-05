@@ -910,3 +910,19 @@ def test_an_area_off_the_sensor_is_refused_and_needs_no_stop():
     # Overlapping the edge is still fitted, as before.
     edge = cs.apply(dev, {}, Roi(1000, 1000, 64, 64))
     assert edge.roi is not None and not edge.roi_error
+
+
+def test_the_picture_window_is_looked_up_without_reading_the_camera():
+    """window_ms is the app's own setting, but find() fell through to
+    describe(): every bias, the ERC, anti-flicker and trail filter read for
+    each step of the picture-window slider (USB round trips on an EVK4)."""
+    dev, hal = evk()
+    calls = []
+    counting(hal.biases, "get_all_biases", calls)
+    counting(hal.biases, "get_bias_info", calls)
+    counting(hal.erc, "get_cd_event_rate", calls)
+    found = dev.settings_provider().find("window_ms")
+    assert found.key == "window_ms" and found.unit == "ms"
+    assert calls == [], calls
+    change = dev.set_setting("window_ms", 50)
+    assert change.value == 50.0 and calls == [], calls
