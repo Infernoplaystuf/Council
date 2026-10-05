@@ -213,6 +213,24 @@ def test_a_locked_setting_restarts_the_live_view_and_takes():
     assert viewer.frames and viewer.frames[-1].image.dtype == np.uint16
 
 
+def test_asking_a_locked_setting_for_what_it_has_is_not_an_error():
+    """Found on the emulator: PixelFormat Mono8 over Mono8 while grabbing
+    went straight to the camera, which refused it."""
+    live("frame")
+    out = frame_camera.set_camera_setting("PixelFormat", "mono8")
+    assert out["ok"] and out["value"] == "Mono8"
+    assert frame_camera._LIVE.job is None, "stopped the stream for nothing"
+
+
+def test_full_sensor_on_a_full_sensor_live_view_is_not_an_error():
+    """Found on the emulator: the area it already had was still written,
+    and a streaming camera refused it."""
+    live("frame")
+    out = frame_camera.full_frame()
+    assert out["area"] == "0, 0, 640, 480" and not out["snapped"]
+    assert frame_camera._LIVE.session.running
+
+
 def test_listeners_hear_every_change_on_the_ui_thread():
     heard = []
     remove = frame_camera.on_camera_change(heard.append)

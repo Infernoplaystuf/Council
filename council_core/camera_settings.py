@@ -68,6 +68,7 @@ from .cameras import (CameraError, MIN_ACCUMULATE_MS, NeedsStop, Roi, _ask,
                       _interface, fit_roi)
 
 __all__ = ["Setting", "Change", "Applied", "SettingError", "NeedsStop",
+           "area_unchanged",
            "coerce", "apply", "snapshot", "needs_stop", "stops_needed"]
 
 #: What a setting holds.
@@ -248,8 +249,10 @@ def same(a: Any, b: Any) -> bool:
 
 
 def show(value: Any) -> str:
+    """A value for a person. Floats lose their read-back noise (a gain of 3
+    reads back 2.999994 on the emulator — said as 3, not 2.99999)."""
     if isinstance(value, float):
-        return f"{value:g}"
+        return f"{round(value, 4):g}"
     return str(value)
 
 
@@ -364,6 +367,11 @@ class Provider:
             why = f" — {setting.help}" if setting.help else ""
             raise SettingError(f"{setting.label} cannot be changed{why}")
         wanted, note = coerce(setting, value)
+        if not setting.live and same(wanted, setting.value):
+            # Locked by the stream and already as asked (measured on the
+            # emulator: writing PixelFormat Mono8 over Mono8 while grabbing
+            # is still refused). Nothing to write, so nothing to stop for.
+            return Change(key, value, setting.value)
         batch = batch if batch is not None else {}
         held = self.held_by(setting, batch)
         if held:
@@ -452,7 +460,7 @@ def _unchanged(setting: Setting, asked: Any) -> bool:
     return same(wanted, setting.value)
 
 
-def _area_unchanged(device: Any, roi: Roi) -> bool:
+def area_unchanged(device: Any, roi: Roi) -> bool:
     try:
         return device.roi() == fit_roi(roi, device.limits())
     except Exception:                                       # noqa: BLE001
@@ -478,7 +486,7 @@ def stops_needed(device: Any, values: Mapping[str, Any],
                and not by_key[key].read_only
                and not _unchanged(by_key[key], values[key])]
     if (roi is not None and not getattr(device, "area_live", False)
-            and not _area_unchanged(device, roi)):
+            and not area_unchanged(device, roi)):
         blocked.append("area")
     return blocked
 
@@ -516,7 +524,7 @@ def apply(device: Any, values: Mapping[str, Any],
         if key is None:
             try:
                 if (getattr(device, "streaming", False)
-                        and _area_unchanged(device, roi)):
+                        and area_unchanged(device, roi)):
                     done.roi = device.roi()     # already so: nothing to stop
                 else:
                     done.roi = device.set_roi(roi)
