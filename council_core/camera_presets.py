@@ -33,8 +33,10 @@ temporary file and renamed over the old one, so a crash mid-write leaves the
 old file or the new one, never half of each. Validated on every read: a file
 that is not what this module writes raises PresetFileError and is NEVER
 overwritten by an ordinary save — `save(..., repair=True)` first moves it
-aside to camera_presets.damaged-<time>.json and says where. A file a NEWER
-version wrote is not damaged and is never moved, repair or not. One bad
+aside to camera_presets.damaged-<time>.json and says where. When only the
+saving camera's own entry is damaged, the file is COPIED there instead and
+only that entry starts again: the other cameras' presets stay listed. A file
+a NEWER version wrote is not damaged and is never moved, repair or not. One bad
 preset inside a good file is skipped (and named in `problems`), not fatal,
 and is kept byte-for-byte when the file is rewritten: this module only
 rewrites what it was asked to change.
@@ -268,6 +270,11 @@ class PresetStore:
         self.path = Path(path)
         #: Presets skipped by the last listing, as "name: why" lines.
         self.problems: List[str] = []
+        #: What the last save(repair=True) set aside: "file" (the whole file
+        #: was damaged, moved aside, a new one started), "entry" (only this
+        #: camera's entry was; the file was copied aside and only that entry
+        #: started again), or "".
+        self.repaired = ""
 
     # -- reading -------------------------------------------------------
     def read(self) -> Dict[str, Any]:
@@ -403,22 +410,34 @@ class PresetStore:
             _roi_from(area)                      # the same check a read uses
         with self._changing():
             moved = None
+            self.repaired = ""
             try:
                 doc = self.read()
-                entry = doc["cameras"].get(camera.key)
-                if entry is not None and not (
-                        isinstance(entry, dict)
-                        and isinstance(entry.get("presets", {}), dict)):
-                    raise PresetFileError(
-                        f"the presets saved for {camera.label} in "
-                        f"{self.path.name} are damaged", self.path)
             except PresetFileError as exc:
                 # A newer app's file is not damage: moving it aside would
                 # hide every preset the newer app saved from it.
                 if exc.newer or not repair or not self.path.exists():
                     raise
                 moved = self._move_aside()
+                self.repaired = "file"
                 doc = _empty()
+            entry = doc["cameras"].get(camera.key)
+            if entry is not None and not (
+                    isinstance(entry, dict)
+                    and isinstance(entry.get("presets", {}), dict)):
+                if not repair:
+                    raise PresetFileError(
+                        f"the presets saved for {camera.label} in "
+                        f"{self.path.name} are damaged", self.path)
+                # ONLY THIS CAMERA'S ENTRY IS DAMAGED. The rest of the file
+                # is good — other cameras' presets, another Typhon's on the
+                # same project — and moving the whole file aside hid every
+                # one of them (measured: the other camera then listed
+                # none). The file as it was is COPIED aside, so the damaged
+                # entry is kept too, and only that entry starts again.
+                moved = self._copy_aside()
+                self.repaired = "entry"
+                del doc["cameras"][camera.key]
             entry = _entry_for(doc, camera)
             presets = entry["presets"]
             old_name = _find(presets, name)
@@ -525,7 +544,7 @@ class PresetStore:
                     raise
                 time.sleep(0.05)
 
-    def _move_aside(self) -> Path:
+    def _aside_name(self) -> Path:
         stamp = time.strftime("%Y%m%d_%H%M%S")
         stem = self.path.stem
         target = self.path.with_name(f"{stem}.damaged-{stamp}.json")
@@ -533,7 +552,20 @@ class PresetStore:
         while target.exists():
             n += 1
             target = self.path.with_name(f"{stem}.damaged-{stamp}_{n}.json")
+        return target
+
+    def _move_aside(self) -> Path:
+        target = self._aside_name()
         os.replace(self.path, target)
+        return target
+
+    def _copy_aside(self) -> Path:
+        """The file as it is, copied — byte for byte — beside it."""
+        target = self._aside_name()
+        try:
+            target.write_bytes(self.path.read_bytes())
+        except OSError as exc:
+            raise PresetError(_cannot_write(target, exc)) from exc
         return target
 
 

@@ -352,3 +352,41 @@ def test_two_apps_saving_into_one_project_at_once_lose_nothing(tmp_path):
         camera = cp.Identity("basler", "boA5320-150cm", serial)
         own = [p for p in store.presets(camera) if p.own]
         assert len(own) == count, f"{serial} kept {len(own)} of {count}"
+
+
+# ======================================================================
+# Review: one camera's entry damaged, the rest of the file good
+# ======================================================================
+def _one_entry_damaged(store):
+    store.save(BASLER, "Keep me", {"Gain": 3.0}, Roi(0, 0, 64, 64))
+    doc = json.loads(store.path.read_text(encoding="utf-8"))
+    doc["cameras"][EVK_A.key] = dict(EVK_A.as_dict(), presets=["oops"])
+    text = json.dumps(doc)
+    store.path.write_text(text, encoding="utf-8")
+    return text
+
+
+def test_a_damaged_entry_is_refused_without_repair_and_left_alone(store):
+    text = _one_entry_damaged(store)
+    with pytest.raises(cp.PresetFileError, match="damaged"):
+        store.save(EVK_A, "Bird bath", BIRD_BATH, None)
+    assert store.path.read_text(encoding="utf-8") == text
+
+
+def test_repairing_one_damaged_entry_keeps_the_other_cameras_presets(store):
+    """Before: the whole file was moved aside, and the Basler's presets —
+    nothing wrong with them — were listed no more (its Typhon on the same
+    project showed an empty list)."""
+    text = _one_entry_damaged(store)
+    _, _, moved = store.save(EVK_A, "Bird bath", BIRD_BATH, None,
+                             repair=True)
+    assert [p.name for p in store.presets(BASLER)] == ["Keep me"]
+    assert [p.name for p in store.presets(EVK_A)] == ["Bird bath"]
+    assert moved is not None and moved.read_text(encoding="utf-8") == text
+    assert store.repaired == "entry"
+
+
+def test_repairing_a_damaged_file_still_moves_it_aside(store):
+    store.path.write_text("{not json", encoding="utf-8")
+    store.save(EVK_A, "Bird bath", BIRD_BATH, None, repair=True)
+    assert store.repaired == "file"

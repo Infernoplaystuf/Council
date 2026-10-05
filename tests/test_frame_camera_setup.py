@@ -831,3 +831,21 @@ def test_a_frame_says_the_pixel_format_it_was_taken_in():
     viewer.frames.clear()
     ticks(viewer, 0.2)
     assert viewer.frames[-1].meta["format"] == "Mono12"
+
+
+def test_saving_over_a_damaged_entry_says_the_others_are_untouched(tmp_path):
+    from council_core import camera_presets
+
+    connected("frame")
+    other = camera_presets.Identity("basler", "acA1920", "123", "frame")
+    mine = camera_presets.Identity.of(frame_camera._LIVE.info)
+    (tmp_path / "camera_presets.json").write_text(json.dumps(
+        {"format": 1, "cameras": {
+            mine.key: dict(mine.as_dict(), presets=["oops"]),
+            other.key: dict(other.as_dict(), presets={
+                "Keep me": {"settings": {}, "roi": None}})}}),
+        encoding="utf-8")
+    out = frame_camera.save_preset("New")
+    assert "other cameras' presets are untouched" in out["summary"]
+    store = camera_presets.PresetStore(tmp_path / "camera_presets.json")
+    assert [p.name for p in store.presets(other)] == ["Keep me"]

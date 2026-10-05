@@ -2201,9 +2201,10 @@ def save_preset(name: Any, include_roi: Any = True,
     _refuse_while_busy("save a preset")
     camera = _identity()
     with_area = _truthy(include_roi)
+    store = _preset_store()
     try:
         settings, roi = camera_presets.capture(device, with_area)
-        preset, replaced, moved = _preset_store().save(
+        preset, replaced, moved = store.save(
             camera, _picked(name), settings, roi, note=str(note or ""),
             repair=True)
     except camera_presets.PresetError as exc:
@@ -2212,7 +2213,11 @@ def save_preset(name: Any, include_roi: Any = True,
             f"{len(settings)} settings")
     said += (f" and the camera's area {_area_text(roi)}." if roi is not None
              else ", area left as it is when applied.")
-    if moved is not None:
+    if moved is not None and store.repaired == "entry":
+        said += (f" This camera's presets in the file were damaged: the "
+                 f"file as it was is kept as {moved.name}; the other "
+                 f"cameras' presets are untouched.")
+    elif moved is not None:
         said += (f" The presets file was damaged: it was kept as "
                  f"{moved.name} and a new one started.")
     return _presets_changed(preset.name, said)
