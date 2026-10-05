@@ -29,6 +29,14 @@ with every event, each window drawn exactly as the live view drew it, and
 PNG ↔ raw lands on the same moment (to the microsecond). Still unproven:
 enumerating and opening a live USB EVK4, and a real EVK4's EVT3 stream.
 
+**Camera settings and presets.** Basler: verified on the emulator (ranges
+from its nodes, clamping, the camera's own snapping, what is locked while
+grabbing, a preset applied back with its area). EVK4: every facility name,
+method, enum member and range accessor used was checked against the OpenEB
+bindings, and a `.raw` opened as a device lists only what it has — but a
+real EVK4's biases, ERC, anti-flicker and trail filter have **not** been
+written to a sensor yet: the first real test is the first run.
+
 ## 1. Get the branch
 
 ```bash
@@ -240,37 +248,51 @@ Typhon can connect straight away.
 
 1. Pick a **capture folder** with the folder picker at the top left. **Make it
    a folder on this computer**, not a network drive — see below.
-2. **Scan for cameras**, select one, **Connect**. If the folder has no frames
-   in it yet, the picture now shows what the camera sees — the **live
-   preview** — so you can aim, focus and set the area first. **Nothing is
-   saved** during the preview; the line above the picture says
-   `Preview · not saving`.
+2. **Scan for cameras**, select one, **Connect**. The picture now shows what
+   the camera sees — the **live view** — so you can aim, focus and set the
+   camera's area first. **Nothing is saved** while it is only live; the line
+   above the picture says `Live · not saving`.
 3. **Start capture** — frames are written to that folder (and, for an EVK4,
    the `.raw`).
-4. **Stop capture** when done, then copy the run wherever it needs to go.
+4. **Stop capture** when done — the picture goes back to live — then copy the
+   run wherever it needs to go.
 
-### The live preview
+### The live view
 
-The preview runs while a camera is connected, nothing is being captured, and
-the folder has no frames to look at. Choose a folder that already has frames
-and the picture shows those instead (the camera goes quiet, so it does not
-slow playback down); choose an empty folder again and the preview comes back.
-**Stop capture** during the preview does nothing — there is nothing to stop.
-Exposure and gain are applied when you press **Start capture**; the **FPS**
-box applies the moment you change it (below).
+Whenever a camera is connected and nothing is being captured, the picture is
+live — **whatever the folder holds**. The frames already in the folder are
+still there behind it: the slider's **right-hand end is live**, and dragging
+it back shows a saved frame while the camera keeps streaming, so dragging to
+the end again is instant (see *The slider*). **Start capture** records;
+**Stop capture** comes back to live once the run's last frames are on disk,
+and for ten seconds the live line still says how the run went
+(`… · last run: 240 saved, raw 31.4 MB`). Only the **raw view** turns the
+live view off — the camera goes quiet so it does not slow the raw reader
+down — and coming back to PNG brings it back. **Stop capture** while only
+live does nothing — there is nothing to stop. Exposure and gain are applied
+when you press **Start capture**; the **FPS** box applies the moment you
+change it (below).
 
-**An EVK4 streams from the moment the preview first starts until you press
+The live picture costs the window little, measured on a boA5320-size frame
+(5328 x 3040, offscreen): a Mono8 frame takes **1.5 ms** of the window's
+time to show (it was 10.7 ms — the canvas copied every frame, needlessly),
+and a Mono12 frame **9.7 ms** (it was 19.8 ms, *and* the picture was wrong:
+the 16-bit frame was drawn as its raw bytes). With the real 33 ms timer and a
+30 fps camera of that size, a frame reaches the screen in 19 ms (Mono8,
+median; 25 ms Mono12).
+
+**An EVK4 streams from the moment the live view first starts until you press
 Disconnect.** Its stream is never stopped and restarted in between: measured
 against Prophesee's SDK, a restarted EVK4 stream can come back with its
 clock running backwards or 16.8 s ahead, with false events, or not start at
 all — and the Python SDK has no way to reset it. So Start and Stop open and
 close the `.raw` inside the running stream, exactly as Prophesee's own
-recorder does, and a folder with frames only hides the preview. Two things
+recorder does, and the raw view only hides the live view. Two things
 follow:
 
-- a capture started **from the preview** can lack up to about 4 ms of events
-  at the very start of its `.raw` (the SDK starts a file at its next time
-  marker); a capture started straight after **Connect** lacks nothing;
+- a capture started **from the live view** can lack up to about 4 ms of
+  events at the very start of its `.raw` (the SDK starts a file at its next
+  time marker); a capture started straight after **Connect** lacks nothing;
 - if an EVK4 stops sending (unplugged, or it fails), press **Disconnect** and
   **Connect** again — a fresh connection is the only clean restart.
 
@@ -399,6 +421,11 @@ same second get `_2`, `_3` on the name.
 
 ### The slider
 
+- **Connected, not capturing**, the slider has one position more than there
+  are saved frames: its **right-hand end is live** (`Live · not saving ·
+  drag back for 300 saved`). Drag back to look at a saved frame — `PNG 12 /
+  300 · live at the end` — and the camera keeps streaming; Play runs to the
+  end of the saved frames and on into live.
 - **While capturing**, the slider's right-hand end is **live**: the view line
   above the picture says `Live · 240 saved` and the slider grows as frames are
   saved.
@@ -420,6 +447,16 @@ same second get `_2`, `_3` on the name.
 **Mark this frame** and **Predict this frame** use the PNG on screen; while
 live or in the raw view there is no file on screen for them to use.
 
+### Two boxes: the crop box and the camera's area
+
+They are different things, in different pixels, and Typhon keeps them apart:
+
+| | The **crop box** (the ROI entry) | The **camera's area** |
+|---|---|---|
+| Pixels | of the **picture** it was drawn on | of the **sensor** |
+| Used by | **Save cropped frames** — cuts saved PNGs | the camera itself: an EVK4 emits events **only inside it**, a Basler **reads out only it** |
+| Changes the recording? | no — the originals are untouched | yes — frames (and the `.raw`) hold only that area |
+
 ### Cropping to a region and saving it
 
 Draw a box on the picture with **Draw ROI** (or type `x, y, w, h` into the ROI
@@ -428,14 +465,85 @@ every PNG in the capture folder is cropped to that box and saved there, with
 the originals untouched. It works on the PNGs — during a capture, after it, on
 an EVK4 run as well as a Basler one. It does not crop the `.raw`.
 
-### The area of interest (Basler)
+### The camera's area (both cameras)
 
-Type `x, y, w, h` into the ROI box, or drag a rectangle on the live view, then
-**Apply area to camera**. This sets the camera's **own AOI**, so frames arrive
-at that size and are saved at that size. It is snapped to what the sensor
-accepts, and the status line says so when it had to move. **Full sensor** puts
-it back. (On an EVK4 run, stop the capture first: changing the area restarts
-the camera, which would cut the `.raw` short, so Typhon refuses.)
+Draw a box on the **live** picture (or type it, in the picture's pixels),
+then **Apply area to camera**. This sets the camera's **own** ROI — an EVK4
+then emits events only there (the bird bath, not the whole back yard), a
+Basler reads out only that window — so frames arrive at that size and are
+saved at that size. It is snapped to what the sensor accepts, and the status
+line says so when it had to move. **Full sensor** puts it back.
+
+- **A box drawn on an area is inside that area.** The live picture of a
+  camera with an area set *is* that area, so Typhon adds the area's own
+  origin before telling the camera: draw a smaller box inside the new
+  picture and it lands where you drew it. (Before, it was sent as it was and
+  landed somewhere else on the sensor.)
+- **Draw it on the live picture.** A box drawn on a saved frame is refused —
+  that frame may have been taken with another area. Drag the slider to its
+  end first.
+- The ROI entry is **cleared** when the camera's area changes (the box was in
+  the old picture's pixels), and Connect no longer fills it with the camera's
+  area — that was the sensor's numbers in a box that means picture pixels.
+- **Not while capturing**, on either camera — see *One set-up per run*.
+
+### Camera settings and presets
+
+Every setting the connected camera has can be read and changed — the camera
+describes them itself, with its own ranges, so nothing is guessed:
+
+- **EVK4** (through the Metavision HAL, as Metavision Studio shows them): every
+  bias (`bias_diff_on`, `bias_diff_off`, `bias_fo`, `bias_hpf`, `bias_refr`, …,
+  with the allowed and the recommended range the sensor reports), the **event
+  rate controller** (on/off, rate limit), **anti-flicker** (on/off, band pass /
+  band stop, the frequency band, duty cycle, thresholds), the **event trail
+  filter** (on/off, TRAIL / STC_CUT_TRAIL / STC_KEEP_TRAIL, threshold), the
+  **event rate activity filter** where the sensor has one, the picture window
+  (ms per picture), and read-only status: temperature, pixel dead time,
+  serial, sensor, event format. A `.raw` opened as a device has none of the
+  facilities and lists only what it has.
+- **Basler** (from the node map): exposure (and auto), gain (and auto), black
+  level, gamma, digital shift, pixel format, mirror X/Y, binning and its mode,
+  decimation, the frame-rate limit, sensor readout mode, and read-only the
+  frame rate the camera will reach and its temperature — whichever the model
+  has, with the ranges its nodes report.
+
+What the camera **took** is what is shown: a value outside the range is
+clamped before it is sent (pylon refuses rather than clamps), the camera may
+snap it (an exposure of 5003.7 µs runs as 5004), an EVK4 may refuse a bias —
+each is said, never hidden.
+
+A **preset** is one camera set-up: every setting worth saving **and the
+camera's area** (in sensor pixels, or "leave the area as it is"). Save one
+for "bird bath", apply it again later in one step. Presets are kept **in the
+app's project folder**, in `camera_presets.json` beside `camera_setup.json`,
+per camera (model and serial): a camera of the same model that has no preset
+of that name is offered another unit's, marked as such. The file is plain
+JSON, written safely (whole, then renamed into place); a damaged one is left
+exactly as it is and named — saving a preset then keeps it as
+`camera_presets.damaged-<time>.json` and starts a new one.
+
+Applying a preset writes its settings in an order that works (auto modes off
+before the values they own, pixel format and binning before the area, the
+area before the frame-rate limit, a filter's parameters before it is
+switched on), then the area. Settings that cannot change while a Basler
+streams (pixel format, mirror, binning, the area) stop the live view for a
+moment and start it again — measured on pylon's emulator, **35 ms** of the
+window's time for a preset changing the format and the area, **3.6 ms** for
+one of live settings only. A very slow camera (a frame every half second)
+does not freeze the window: the change finishes in the background and the
+status line says how it went. An EVK4 sets everything live.
+
+### One set-up per run
+
+While **capturing**, the camera's area, a preset, and any setting the
+stream is in the way of (a Basler's pixel format, mirror, binning) are
+**refused** with `stop the capture before …` — on both cameras. Before, a
+Basler's area change restarted the stream *into the same run*, leaving one
+run with frames of two sizes; an EVK4's `.raw` would change meaning
+halfway. Settings that change live — exposure, gain, an EVK4 bias, the FPS
+box — still apply mid-capture. Saving a preset only reads the camera, so it
+works while capturing too.
 
 ### Reading the status line
 
@@ -500,7 +608,9 @@ so a 12-bit frame reads dark *to the classifier*.
 | **PNG / Raw** says `Raw opens after Stop` | The `.raw` is still being recorded. Stop the capture first. |
 | **PNG / Raw** says `No raw file for this run` | A Basler run (only event cameras record a `.raw`), or the `.raw` was not copied along with the PNGs. |
 | **PNG / Raw** says the raw view needs the Metavision SDK | Viewing a `.raw` uses Prophesee's SDK; install it on this computer (Camera setup…, EVK4). |
-| "stop the capture before changing the camera's area" | EVK4 only — see *The area of interest*. |
+| "stop the capture before changing the camera's area" (or "… applying a preset") | One run keeps one camera set-up — see *One set-up per run*. Stop, change it, Start again. |
+| "that box is on a saved frame" | **Apply area to camera** uses a box drawn on the live picture. Drag the slider to its end and draw it there. |
+| "… — wait for it to finish" | A slow camera is still restarting after a change; the status line says when it is done. |
 
 For an EVK4 the **official installer is the lower-risk route**: it installs the
 USB driver and registers where its plugins live, which removes three of the

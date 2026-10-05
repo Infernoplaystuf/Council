@@ -1494,6 +1494,15 @@ def _run_change(label: str, work: Callable[[], Any],
     try:
         result = work()
     except Exception as exc:                              # noqa: BLE001
+        from council_core.cameras import NeedsStop
+
+        if (isinstance(exc, NeedsStop) and not stop and session.running
+                and getattr(session.device, "restartable", True)
+                and not _LIVE.capturing):
+            # The camera refused live what it described as live (a node's
+            # writability is the camera's to change): the same change, with
+            # the stream stopped. NeedsStop is raised before any write.
+            return _run_change(label, work, finish, True)
         raise RuntimeError(_said(exc)) from exc
     out = finish(result)
     _announce(out)
