@@ -171,6 +171,42 @@ def test_a_loaded_module_no_import_reaches_is_listed_too(typhon_dir):
     assert rows["gui_layout"].loaded and rows["gui_layout"].group == gst.COUNCIL
 
 
+def test_typhons_settings_window_is_listed_before_it_is_opened(typhon_dir):
+    """frame_camera opens it as importlib.import_module(
+    SETTINGS_WINDOW_MODULE), never with an import statement, so it was
+    missing from the list until the button had been pressed."""
+    rows = {s.name: s for s in gst.scripts_in_use(typhon_dir, modules={})}
+    window = rows.get("council_qt.widgets.camera_settings_window")
+    assert window is not None, sorted(rows)
+    assert window.group == gst.COUNCIL and not window.loaded
+    assert window.what.startswith("Every setting the connected camera has")
+
+
+def test_a_module_imported_by_name_is_followed(tmp_path):
+    """import_module with a literal, or with a name set at the top of the
+    file; a name built at run time cannot be known and is left alone."""
+    app, root = make_app(tmp_path, (
+        "class HandlerMixin:\n"
+        "    def on_btn(self):\n"
+        "        import linked_mod\n"), {
+        "linked_mod.py": ('"""linked_mod.py — opens windows by name."""\n'
+                          'import importlib\n'
+                          'WINDOW_MODULE = "pkg.window"\n'
+                          'def run(which):\n'
+                          '    importlib.import_module(WINDOW_MODULE)\n'
+                          '    importlib.import_module("pkg.other")\n'
+                          '    importlib.import_module(f"pkg.{which}")\n'),
+        "pkg/__init__.py": '"""A package."""\n',
+        "pkg/window.py": '"""pkg.window: the window. More words."""\n',
+        "pkg/other.py": '"""pkg.other: another one. More words."""\n',
+        "pkg/never.py": '"""pkg.never: nothing names it. More words."""\n',
+    })
+    names = [s.name for s in gst.scripts_in_use(app, council_root=root,
+                                                modules={})]
+    assert "pkg.window" in names and "pkg.other" in names
+    assert "pkg.never" not in names
+
+
 def test_made_up_relative_module_paths_are_ignored(typhon_dir):
     """PySide6's shibokensupport modules carry "shibokensupport/..." as
     __file__; resolved against the working directory they were listed as
@@ -297,18 +333,84 @@ def test_a_warm_list_does_not_pay_for_every_module_the_app_loaded(
     with both roots by Path.relative_to: measured in an updated Typhon, the
     warm list took 90 ms, 50-70 of them there — for the dozen files that
     live under the roots. The test above passes modules={} and never saw it.
-    """
+
+    MEASURED AGAINST THE SAME LIST WITH NO OTHER MODULES, NOT A CLOCK. It
+    first asserted an absolute 100 ms, which held when written (90 ms) and
+    later failed on the same code on this PC (156-177 ms) — a slower
+    machine, not a regression. What it means is RELATIVE: 3,000 modules
+    elsewhere may add a few microseconds each, never many times what the
+    list itself costs. So the same warm list is timed with none (the
+    baseline, on this machine, in this run) and with 3,000, best of several
+    each; the old per-module Path and relative_to is put back below to show
+    the test still catches it."""
     elsewhere = ROOT.parent / "elsewhere"
     fake = {f"pkg{i}": SimpleNamespace(__file__=str(elsewhere / f"m{i}.py"))
             for i in range(3000)}
     gst.scripts_in_use(typhon_dir, modules=fake)          # parse once
-    started = time.perf_counter()
-    rows = gst.scripts_in_use(typhon_dir, modules=fake)
-    warm = time.perf_counter() - started
-    print(f"\nwarm list with 3,000 other modules loaded: {warm * 1000:.0f} ms")
-    assert [s.name for s in rows] == [
-        s.name for s in gst.scripts_in_use(typhon_dir, modules={})]
-    assert warm < 0.1, f"{warm * 1000:.0f} ms"
+
+    def best(modules, runs=7):
+        took = []
+        for _ in range(runs):
+            started = time.perf_counter()
+            rows = gst.scripts_in_use(typhon_dir, modules=modules)
+            took.append(time.perf_counter() - started)
+        return min(took), rows
+
+    base, plain = best({})
+    warm, rows = best(fake)
+    extra = warm - base
+    print(f"\nwarm list: {base * 1000:.0f} ms alone, {warm * 1000:.0f} ms "
+          f"with 3,000 other modules loaded (+{extra * 1000:.1f} ms)")
+    assert [s.name for s in rows] == [s.name for s in plain]
+    assert extra < MOST_ADDED_BY_3000_MODULES * base, (
+        f"3,000 other modules added {extra * 1000:.0f} ms to a "
+        f"{base * 1000:.0f} ms warm list")
+
+
+#: What 3,000 modules elsewhere may add to a warm list, as a multiple of the
+#: list's own time on the same machine. MEASURED on this PC (best of 9,
+#: three trials, 2026-10-05): a 29 ms list, +15 ms (about 50%) with the
+#: per-module strings, +166 ms (about 550%) with a Path and relative_to per
+#: module, the old code put back in the test below. Twice the list's own
+#: time is far from both, and both scale with the machine.
+MOST_ADDED_BY_3000_MODULES = 2.0
+
+
+def test_the_warm_list_test_still_catches_a_path_per_module(
+        typhon_dir, monkeypatch):
+    """The relative test above, against the code it was written to stop: a
+    Path built for every loaded module and compared with each root by
+    Path.relative_to (gui_settings before 1a4a68e). It must fail."""
+    def old_loaded_files(modules):
+        out = {}
+        for module in list(modules.values()):
+            path = getattr(module, "__file__", None)
+            if path and str(path).endswith(".py") and os.path.isabs(str(path)):
+                out[gst._key(path)] = Path(str(path))
+        return out
+
+    def old_loaded_under(loaded, roots):
+        out = []
+        for path in loaded.values():
+            root = next((r for r in roots if gst._inside(path, r)), None)
+            if root is None:
+                continue
+            rel = path.relative_to(root).parts
+            if any(p.startswith(".") or p in ("site-packages", "__pycache__")
+                   for p in rel):
+                continue
+            if not path.is_file():
+                continue
+            if path.name == "__init__.py" and gst._info(path)[2]:
+                continue
+            out.append(path)
+        return sorted(out)
+
+    monkeypatch.setattr(gst, "_loaded_files", old_loaded_files)
+    monkeypatch.setattr(gst, "_loaded_under", old_loaded_under)
+    with pytest.raises(AssertionError, match="3,000 other modules added"):
+        test_a_warm_list_does_not_pay_for_every_module_the_app_loaded(
+            typhon_dir)
 
 
 def test_a_file_that_does_not_parse_says_why(tmp_path):
