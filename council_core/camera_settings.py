@@ -74,6 +74,13 @@ __all__ = ["Setting", "Change", "Applied", "SettingError", "NeedsStop",
 #: What a setting holds.
 FLOAT, INT, BOOL, CHOICE, TEXT = "float", "int", "bool", "choice", "text"
 
+#: Groups whose settings change the camera's AREA itself, not only the
+#: picture: a binned (or decimated) Basler's AOI — offsets, width, height
+#: and the sensor's own size — is in binned pixels, so changing the binning
+#: changes every one of those numbers. Whoever shows the area, or holds a
+#: box drawn on the old picture, has to hear about it (frame_camera).
+AREA_GROUPS = frozenset({"Binning"})
+
 
 class SettingError(CameraError):
     """A setting that does not exist here, cannot be written, or was given

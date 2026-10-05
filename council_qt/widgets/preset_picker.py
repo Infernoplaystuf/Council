@@ -128,7 +128,9 @@ class PresetPicker(QObject):
                       select=str(out.get("name") or ""))
         elif what == "preset" and out.get("ok", True):
             self.select(str(out.get("name") or ""))
-        if what in AREA_EVENTS:
+        if what in AREA_EVENTS or out.get("area_moved"):
+            # area_moved: a single setting that changed the area's own
+            # numbers (a Basler's binning) — rare, so read only then.
             self.show_area()
 
     def refresh(self) -> None:

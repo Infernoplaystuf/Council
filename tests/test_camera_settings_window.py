@@ -27,6 +27,7 @@ from PySide6.QtCore import QEvent
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox,
                                QDoubleSpinBox, QLabel, QSpinBox)
 
+from council_core import cameras
 from council_qt.widgets import camera_settings_window as csw
 from council_qt.widgets import preset_picker as pp
 
@@ -597,3 +598,15 @@ def test_a_change_pending_from_the_main_window_holds_the_windows_writes():
         ticks(0.05)
     assert device().state["Gain"] == 4.0
     assert device().roi().as_tuple() == (0, 0, 128, 128)
+
+
+def test_the_area_line_follows_a_setting_that_moved_the_area(qapp):
+    """Binning changes the area's numbers; the area line only re-read on
+    area, preset and reset answers, so it kept the old ones."""
+    made, combo, area, _ = picker(qapp)
+    connect("frame", live=False)
+    device()._roi = cameras.Roi(0, 0, 320, 240)      # as binning leaves it
+    made.heard({"what": "setting", "key": "BinningHorizontal",
+                "area_moved": True})
+    assert area.value.startswith("Camera's area: 0, 0, 320, 240 of")
+    made.close()

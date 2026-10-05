@@ -1251,6 +1251,9 @@ class CameraSettingsWindow(QWidget):
             if row.kind in (BOOL, CHOICE):
                 # An auto mode or an enable flag: what it owns changes now.
                 self._refresh_timer.start()
+        if out.get("area_moved"):
+            # Binning changed the area's own numbers: the area box too.
+            self.refresh_area()
         ok = bool(out.get("ok", True))
         self.say(str(out.get("summary") or ""),
                  tone="" if ok and not change.get("adjusted") else

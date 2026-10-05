@@ -1592,6 +1592,14 @@ def _area_text(roi: Any) -> str:
     return f"{roi.x}, {roi.y}, {roi.w}, {roi.h}"
 
 
+def _roi_or_none(device: Any) -> Any:
+    """The camera's area now, or None when it cannot say."""
+    try:
+        return device.roi()
+    except Exception:                                     # noqa: BLE001
+        return None
+
+
 # ======================================================================
 # Changing the camera: the rules, and the worker for what needs a stop
 # ======================================================================
@@ -1987,6 +1995,11 @@ def set_camera_setting(key: Any, value: Any) -> Dict[str, Any]:
                                              described=[setting]))
     if stop:
         _refuse_while_capturing(f"changing {setting.label}")
+    # Binning changes the area's own numbers (AREA_GROUPS). Read before and
+    # after for those only: the area is four node reads, and a slider
+    # writes one setting per step.
+    moves_area = setting.group in camera_settings.AREA_GROUPS
+    before = _roi_or_none(device) if moves_area else None
 
     def work() -> Any:
         try:
@@ -1997,9 +2010,18 @@ def set_camera_setting(key: Any, value: Any) -> Dict[str, Any]:
     def finish(change: Any) -> Dict[str, Any]:
         if change.ok and not change.skipped:
             _camera_set([key])
-        return {"change": change.as_dict(), "key": key, "value": change.value,
-                "ok": change.ok, "what": "setting", "pending": False,
-                "summary": change.line()}
+        out = {"change": change.as_dict(), "key": key, "value": change.value,
+               "ok": change.ok, "what": "setting", "pending": False,
+               "summary": change.line()}
+        now = _roi_or_none(device) if moves_area else None
+        if now is not None and now != before:
+            # The picture's pixels changed under the crop box: cleared, as
+            # for any change of area (_settle_crop), and the area line and
+            # the settings window's area box read again (area_moved).
+            out.update(area=_area_text(now), crop="", area_moved=True)
+            out["summary"] += (f" — the camera's area is now "
+                               f"{_area_text(now)} (in its new pixels)")
+        return out
 
     return _run_change(f"Changing {setting.label}", work, finish, stop)
 
@@ -2036,13 +2058,16 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
                             else "applying a preset")
     _refuse_while_busy("apply it")
     stop = bool(camera_settings.stops_needed(device, values, roi))
+    before = _roi_or_none(device)
 
     def work() -> Any:
         return camera_settings.apply(device, values, roi)
 
     def finish(applied: Any) -> Dict[str, Any]:
         _camera_set(_changed_keys(applied))
-        moved = roi is not None and applied.roi is not None
+        # Moved by its own area, or by binning in a set without one.
+        moved = (roi is not None and applied.roi is not None) or (
+            before is not None and _roi_or_none(device) != before)
         head = {"preset": f"Preset {name!r}",
                 "reset": "Settings as connected"}.get(what, "Camera settings")
         return {"applied": applied.as_dict(), "ok": applied.ok,

@@ -519,7 +519,11 @@ line says so when it had to move. **Full sensor** puts it back.
   the old picture's pixels), and Connect no longer fills it with the camera's
   area — that was the sensor's numbers in a box that means picture pixels.
 - The line under the two buttons always says the camera's area **now**, in
-  sensor pixels — whichever window changed it.
+  sensor pixels — whichever window changed it. That includes a Basler's
+  **binning**: its area is in binned pixels, so changing the binning changes
+  the area's numbers; the line, the settings window's area box and the
+  status line say the new ones, and the crop box is cleared. (Checked on the
+  simulated camera only: pylon's emulator ignores binning.)
 - To type the area in sensor pixels instead, use the settings window's
   **Camera's area** box.
 - **Not while capturing**, on either camera — see *One set-up per run*.

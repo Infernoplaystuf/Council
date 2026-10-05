@@ -917,3 +917,66 @@ def test_a_late_answer_that_cannot_be_read_back_is_said_not_swallowed():
     assert frame_camera._LIVE.job is None
     assert heard[-1]["what"] == "failed", [h["what"] for h in heard]
     assert "unplugged" in heard[-1]["summary"]
+
+
+# -- Binning changes the area's own numbers ---------------------------------
+@pytest.fixture
+def binning(monkeypatch):
+    """The simulated frame camera given a Basler's horizontal binning, which
+    puts the area — offsets, width, the sensor's size — in binned pixels
+    (the emulator ignores binning, so it cannot show this)."""
+    from council_core import camera_settings as cs
+
+    real_describe, real_write = (cs.SyntheticSettings.describe,
+                                 cs.SyntheticSettings.write)
+
+    def describe(self):
+        out = real_describe(self)
+        if self.device.info.kind == "frame":
+            out.append(cs.Setting("BinningHorizontal", "Binning (horizontal)",
+                                  "Binning", cs.INT,
+                                  self.device.state["BinningHorizontal"],
+                                  1, 2, 1))
+        return out
+
+    def write(self, setting, value, batch):
+        if setting.key != "BinningHorizontal":
+            return real_write(self, setting, value, batch)
+        dev, old = self.device, self.device.state["BinningHorizontal"]
+        dev.state["BinningHorizontal"] = int(value)
+        r = dev._roi
+        dev._roi = cameras.Roi(r.x * old // int(value), r.y,
+                               r.w * old // int(value), r.h)
+
+    monkeypatch.setattr(cs.SyntheticSettings, "describe", describe)
+    monkeypatch.setattr(cs.SyntheticSettings, "write", write)
+
+
+def test_a_binning_change_says_the_new_area_and_clears_the_crop_box(binning):
+    """A single binning change moved the camera's area (its numbers are in
+    binned pixels) but said nothing about it: the area line kept the old
+    numbers and the crop box drawn on the unbinned picture stayed over the
+    binned one, where the next Apply area used it."""
+    viewer = live("frame")
+    device().state["BinningHorizontal"] = 1
+    frame_camera.set_camera_area("100, 60, 320, 240")
+    viewer.roi = _Port("10, 10, 100, 100")
+    heard = []
+    frame_camera.on_camera_change(heard.append)
+    out = frame_camera.set_camera_setting("BinningHorizontal", 2)
+    assert device().roi().as_tuple() == (50, 60, 160, 240)
+    assert out["area_moved"] and out["area"] == "50, 60, 160, 240"
+    assert viewer.roi.get() == "", "the crop box of the old picture stayed"
+    assert heard[-1].get("area_moved")
+    out = frame_camera.set_camera_setting("Gain", 3)
+    assert "area_moved" not in out, "a gain does not move the area"
+
+
+def test_a_set_whose_binning_moves_the_area_clears_the_crop_box(binning):
+    viewer = live("frame")
+    device().state["BinningHorizontal"] = 1
+    frame_camera.set_camera_area("100, 60, 320, 240")
+    viewer.roi = _Port("10, 10, 100, 100")
+    out = frame_camera.apply_camera_settings({"BinningHorizontal": 2})
+    assert out["crop"] == "" and viewer.roi.get() == ""
+    assert out["area"] == "50, 60, 160, 240"
