@@ -1066,8 +1066,7 @@ def run_docs(backend: Backend, *, items: Any = "all",
                          should_stop=should_stop, progress=mark)
     d = rep.to_dict()
     texts = {q["id"]: (q.get("question") or q.get("task") or "")
-             for key in ("questions", "negatives", "code_tasks")
-             for q in bench.get(key, [])}
+             for _kind, q in docs_bench.bench_items(bench)}
     rows = []
     for i, item in enumerate(d["items"]):
         start = marks[i] if i < len(marks) else len(backend.calls)
@@ -1187,7 +1186,10 @@ def format_table(report: Dict[str, Any]) -> str:
                            f"{ds.get('questions')}, citations right "
                            f"{ds.get('citations_right')}, 'not covered' "
                            f"right {ds.get('not_covered_right')}, code "
-                           f"{ds.get('code')}")
+                           f"{ds.get('code')}, reordered "
+                           f"{ds.get('reordered')}, page [1] cited "
+                           f"{ds.get('cites_page_1')}, cited pages right "
+                           f"{ds.get('cited_pages_right')}")
     if meta.get("interrupted"):
         out.append(f"\nINTERRUPTED: {meta['interrupted']}")
     return "\n".join(out)
@@ -1206,7 +1208,7 @@ def _docs_ids(only: str) -> Optional[List[str]]:
     wanted = [s.strip() for s in (only or "").split(",") if s.strip()]
     if not wanted:
         return None
-    return [w for w in wanted if re.fullmatch(r"[qnc]\d\d", w)]
+    return [w for w in wanted if re.fullmatch(r"[qncr]\d\d", w)]
 
 
 def _line(suite: str, p: int, r: Dict[str, Any]) -> str:

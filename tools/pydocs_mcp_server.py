@@ -73,7 +73,9 @@ SERVER_VERSION = "1.0"
 SUPPORTED_PROTOCOLS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
 #: structuredContent and outputSchema arrived in this version.
 STRUCTURED_SINCE = "2025-06-18"
-INDEX_FORMAT = 3
+#: Bumped when what an index holds changes: 4 merges stub twins (see
+#: build_index), so a cache written by 3 is rebuilt, not served.
+INDEX_FORMAT = 4
 
 MAX_MODULES = 4000          # per package — a safety net, not a target
 MAX_FILE_BYTES = 4_000_000
@@ -379,6 +381,11 @@ class ModuleReader:
         self.members: Dict[str, List[dict]] = {}  # class qual -> entries
         self.imports: Dict[str, str] = {}       # local name -> dotted target
         self.stars: List[str] = []
+        #: What the .py alone imports, and the names only the .pyi defines:
+        #: see build_index's stub twins.
+        self.source_imports: Dict[str, str] = {}
+        self.source_stars: List[str] = []
+        self.stub_defs: Set[str] = set()
         self.all: Optional[List[str]] = None
         self.newdocs: List[Tuple[str, str, str]] = []
         self.doc = ""
@@ -425,9 +432,14 @@ class ModuleReader:
                 for alias in node.names:
                     if alias.name == "*":
                         self.stars.append(target)
+                        if not stub:
+                            self.source_stars.append(target)
                     else:
-                        self.imports[alias.asname or alias.name] = (
+                        local = alias.asname or alias.name
+                        self.imports[local] = (
                             f"{target}.{alias.name}" if target else alias.name)
+                        if not stub:
+                            self.source_imports[local] = self.imports[local]
             elif isinstance(node, ast.Import):
                 for alias in node.names:
                     if alias.asname:
@@ -475,6 +487,8 @@ class ModuleReader:
                 existing["sig"] = sig
             existing["overloads"] = existing.get("overloads", 1) + 1
             return
+        if stub and name not in self.defs:
+            self.stub_defs.add(name)
         self.defs[name] = _entry(qual, "function", self.module, sig, doc,
                                  path, node.lineno, returns=returns)
 
@@ -493,6 +507,8 @@ class ModuleReader:
             entry = _entry(qual, "class", self.module, "", doc, path,
                            node.lineno, bases=bases)
             if not prefix:
+                if stub and name not in self.defs:
+                    self.stub_defs.add(name)
                 self.defs[name] = entry
         members = self.members.setdefault(qual, [])
         have = {m["name"] for m in members}
@@ -560,6 +576,8 @@ class ModuleReader:
             kind = "constant" if t.id.isupper() else "data"
             ann = getattr(node, "annotation", None)
             if t.id not in self.defs:
+                if stub:
+                    self.stub_defs.add(t.id)
                 self.defs[t.id] = _entry(
                     f"{self.module}.{t.id}", kind, self.module, "", "", path,
                     node.lineno, value=_unparse(value, 80) if value is not None
@@ -775,6 +793,34 @@ def _public(name: str) -> bool:
                    for p in name.split("."))
 
 
+def _source_def(readers: Dict[str, "ModuleReader"], module: str, name: str,
+                depth: int = 0) -> Optional[dict]:
+    """The definition `module.name` is when the package RUNS: the .py's own
+    definition, else where the .py's imports and star-imports lead. A
+    stub's imports are not followed: numpy/matrixlib/__init__.pyi's `from
+    numpy import matrix` points straight back at the declaration in
+    numpy/__init__.pyi."""
+    r = readers.get(module)
+    if r is None or depth > 12:
+        return None
+    e = r.defs.get(name)
+    if e is not None and name not in r.stub_defs:
+        return e
+    target = r.source_imports.get(name)
+    if target is not None:
+        tmod, _, tname = target.rpartition(".")
+        return _source_def(readers, tmod, tname, depth + 1)
+    if name.startswith("_"):
+        return None
+    for star in r.source_stars:
+        sr = readers.get(star)
+        if sr is not None and (sr.all is None or name in sr.all):
+            hit = _source_def(readers, star, name, depth + 1)
+            if hit is not None:
+                return hit
+    return None
+
+
 def build_index(finder: Finder, package: str) -> PackageIndex:
     t0 = time.perf_counter()
     readers: Dict[str, ModuleReader] = {}
@@ -819,6 +865,36 @@ def build_index(finder: Finder, package: str) -> PackageIndex:
                 leftover.append((mod, name, text))
             elif not target.get("doc"):
                 target["doc"] = _clean_doc(text)
+
+    # -- stub twins ----------------------------------------------------
+    # A .pyi that DECLARES a name its .py IMPORTS declares the same object:
+    # numpy/__init__.pyi has `class matrix(...)`, no docstring, while
+    # __init__.py does `from .matrixlib import matrix`. Both were entries -
+    # numpy.matrix, a "(No docstring.)" page with the stub's members, and
+    # numpy.matrixlib.defmatrix.matrix, the documented class — and one
+    # question read both (the review: "the inverse of a matrix" read [1]
+    # numpy.matrix and [4] the class again; "mean along an axis" read
+    # matrix.mean twice). When the import leads to a definition WITH a
+    # docstring, the declaration and its members go and its name becomes an
+    # alias of that definition, as a re-export's always was. A declaration
+    # that is documented stays: numpy's C types (ndarray, dtype) get their
+    # docstrings from add_newdoc, on the declaration, just above.
+    twins: Dict[str, str] = {}
+    for module, r in readers.items():
+        for name in sorted(r.stub_defs):
+            stub = r.defs.get(name)
+            target = r.source_imports.get(name)
+            if stub is None or target is None or stub.get("doc"):
+                continue
+            tmod, _, tname = target.rpartition(".")
+            real = _source_def(readers, tmod, tname)
+            if real is not None and real.get("doc") and \
+                    real["qual"] != stub["qual"] and real["qual"] in entries:
+                twins[stub["qual"]] = real["qual"]
+    for stub_qual in twins:
+        for q in [q for q in entries
+                  if q == stub_qual or q.startswith(stub_qual + ".")]:
+            del entries[q]
 
     # -- re-exports ----------------------------------------------------
     resolving: Set[Tuple[str, str]] = set()
@@ -880,11 +956,13 @@ def build_index(finder: Finder, package: str) -> PackageIndex:
     aliases: Dict[str, str] = {}
     for qual in entries:
         aliases[qual] = qual
+    aliases.update(twins)
     for module in readers:
         if not _public(module):
             continue
         for name in exports(module):
             qual = resolve(module, name)
+            qual = twins.get(qual or "", qual)
             if qual and qual in entries:
                 aliases.setdefault(f"{module}.{name}", qual)
 
