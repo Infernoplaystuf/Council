@@ -23,6 +23,32 @@ from council_core.pi_setup import remote  # noqa: E402
 PI_FACTS = "council-pi-1\naarch64\n8046508\nDebian GNU/Linux 13 (trixie)\nRaspberry Pi 5 Model B Rev 1.1\n"
 
 
+class _AckTransport(paramiko.Transport):
+    """A server transport that says when it has ACKNOWLEDGED a channel
+    request. paramiko sends the exec request's success reply only after
+    check_channel_exec_request returns; a fake that answered (and closed the
+    channel) from a thread started inside that callback could close it
+    before the reply went out, and the client's exec_command then failed
+    with 'Channel closed.' — MEASURED: 3-8 of these 30 tests failed per run.
+    A real sshd acknowledges exec before any output, so the fake waits for
+    the acknowledgement too."""
+
+    def __init__(self, sock):
+        super().__init__(sock)
+        self._acks = {}
+        self._acks_lock = threading.Lock()
+
+    def ack_event(self, remote_chanid: int) -> threading.Event:
+        with self._acks_lock:
+            return self._acks.setdefault(remote_chanid, threading.Event())
+
+    def _send_user_message(self, data):
+        super()._send_user_message(data)
+        raw = data.asbytes() if hasattr(data, "asbytes") else bytes(data)
+        if raw[:1] == paramiko.common.cMSG_CHANNEL_SUCCESS and len(raw) >= 5:
+            self.ack_event(int.from_bytes(raw[1:5], "big")).set()
+
+
 class FakePi:
     def __init__(self, user="council", password="pw-123456"):
         pem, self.host_public = pi_secrets.host_keypair()
@@ -53,7 +79,7 @@ class FakePi:
 
     def _session(self, conn):
         pi = self
-        t = paramiko.Transport(conn)
+        t = _AckTransport(conn)
         t.add_server_key(self.host_key)
 
         class Srv(paramiko.ServerInterface):
@@ -88,6 +114,9 @@ class FakePi:
 
     def _answer(self, channel, cmd):
         try:
+            # Only after the exec request has been acknowledged (see _AckTransport).
+            if not channel.get_transport().ack_event(channel.remote_chanid).wait(10):
+                return
             self._reply(channel, cmd)
         except (OSError, EOFError, paramiko.SSHException):
             pass          # the client hung up first — fine for a fake
