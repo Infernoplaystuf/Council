@@ -32,7 +32,7 @@ def test_every_edge_joins_two_known_nodes_with_known_values():
     for e in m.edges:
         assert e.src in m.nodes and e.dst in m.nodes
         assert e.layer in cm.LAYERS
-        assert e.qt in cm.STATUSES and e.tk in cm.STATUSES
+        assert e.status in cm.STATUSES
         assert e.data
     for n in m.nodes.values():
         assert n.kind in cm.KINDS
@@ -41,12 +41,15 @@ def test_every_edge_joins_two_known_nodes_with_known_values():
 def test_not_live_links_say_why_or_where():
     """A red or green line with no reason is a line nobody can act on."""
     m = cm.static_map()
-    for fe in cm.FRONT_ENDS:
-        for e in m.gaps(fe):
-            assert e.note or e.cite, (e.src, e.dst)
-        for e in m.edges:
-            if e.status(fe) in ("broken", "partial", "proposed"):
-                assert e.note, (e.src, e.dst, fe)
+    for e in m.gaps():
+        assert e.note and e.cite, (e.src, e.dst)
+
+
+def test_no_link_cites_the_retired_tk_shell():
+    """The map is of the Qt app; council_gui_engine.py is a relic."""
+    m = cm.static_map()
+    cites = [x.cite for x in m.edges] + [n.cite for n in m.nodes.values()]
+    assert not [c for c in cites if "council_gui_engine" in c]
 
 
 def test_coder_talks_to_the_judge_the_floor_and_the_librarian_only():
@@ -60,36 +63,35 @@ def test_coder_talks_to_the_judge_the_floor_and_the_librarian_only():
 def test_the_facts_the_map_is_for():
     m = cm.static_map()
     # The judge sees no vault evidence — only a proposal.
-    assert _edge(m, "librarian", "judge", "evidence").tk == "proposed"
-    # Both front ends hand the coder its tools.
-    tools = _edge(m, "tools", "coder")
-    assert (tools.qt, tools.tk) == ("live", "live")
-    # The Sage knowledge base never reaches the sage.
-    sage = _edge(m, "sage_kb", "sage")
-    assert (sage.qt, sage.tk) == ("broken", "broken")
-    # The librarian briefing is Tk only.
-    brief = _edge(m, "librarian", "writer")
-    assert (brief.qt, brief.tk) == ("missing", "live")
-    # The critique reaches the members once on Qt, never on Tk.
-    loop = _edge(m, "judge", "debate", "REQUIRED_CHANGES")
-    assert (loop.qt, loop.tk) == ("partial", "broken")
+    assert _edge(m, "librarian", "judge", "evidence").status == "proposed"
+    # The coder gets its tools.
+    assert _edge(m, "tools", "coder").status == "live"
+    # The Sage knowledge base is not used by the turn.
+    assert _edge(m, "sage_kb", "sage").status == "proposed"
+    # Nothing feeds the vault into the turn.
+    assert _edge(m, "librarian", "writer").status == "proposed"
+    assert _edge(m, "vault_search", "question").status == "proposed"
+    # Low-confidence gaps are collected and never written.
+    assert _edge(m, "debate", "wishlist").status == "broken"
+    # The critique reaches the members once.
+    assert _edge(m, "judge", "debate", "REQUIRED_CHANGES").status == "partial"
 
 
 def test_visible_edges_filters_by_layer_and_status():
     m = cm.static_map()
-    tools = m.visible_edges("qt", layers=["tools"])
+    tools = m.visible_edges(layers=["tools"])
     assert tools and all(e.layer == "tools" for e in tools)
-    gaps = m.visible_edges("qt", statuses=["proposed"])
-    assert gaps and all(e.status("qt") == "proposed" for e in gaps)
-    assert m.visible_edges("qt", layers=[]) == []
+    gaps = m.visible_edges(statuses=["proposed"])
+    assert gaps and all(e.status == "proposed" for e in gaps)
+    assert m.visible_edges(layers=[]) == []
 
 
 def test_gaps_report_lists_worst_first():
     m = cm.static_map()
-    report = cm.gaps_report(m, "qt")
-    assert report.index("Broken") < report.index("Missing here") \
+    report = cm.gaps_report(m)
+    assert report.index("Broken") < report.index("Partial") \
         < report.index("Proposed")
-    assert "SageAgent" in report
+    assert "_low_conf_gaps" in report
 
 
 def test_model_label():
@@ -108,9 +110,9 @@ def _slots():
 def test_live_overlay_ties_roles_to_models_and_this_pc():
     m = cm.live_overlay(cm.static_map(), _slots(), [])
     assert m.nodes["model:fast"].label == "llama3.2:3b"
-    assert _edge(m, "peasant", "model:fast").qt == "live"
-    assert _edge(m, "judge", "model:main").qt == "live"
-    assert _edge(m, "model:main", cm.THIS_PC).qt == "live"
+    assert _edge(m, "peasant", "model:fast").status == "live"
+    assert _edge(m, "judge", "model:main").status == "live"
+    assert _edge(m, "model:main", cm.THIS_PC).status == "live"
     assert any("Refresh" in n for n in m.notes)
 
 
@@ -127,9 +129,9 @@ def test_remote_machine_with_a_slots_model_is_only_proposed():
     m = cm.live_overlay(cm.static_map(), _slots(), statuses)
     assert "machine:http://localhost:11434" not in m.nodes
     share = _edge(m, "model:fast", "machine:http://pi1:11434")
-    assert share.qt == "proposed" and "binding" in share.note
+    assert share.status == "proposed" and "binding" in share.note
     assert "running phi3" in m.nodes["machine:http://pi1:11434"].summary
-    assert _edge(m, "machine:http://pi2:11434", cm.THIS_PC).qt == "proposed"
+    assert _edge(m, "machine:http://pi2:11434", cm.THIS_PC).status == "proposed"
 
 
 def test_live_overlay_without_slots_says_so():
@@ -158,10 +160,10 @@ def test_layout_is_deterministic_and_keeps_the_spine():
 
 def test_describe_lists_links_both_ways():
     m = cm.static_map()
-    text = cm.describe(m, "judge", "qt")
+    text = cm.describe(m, "judge")
     assert "Receives from" in text and "Sends to" in text
     assert "Writer" in text
-    assert cm.describe(m, "nope", "qt") == ""
+    assert cm.describe(m, "nope") == ""
 
 
 # ---- the tab ---------------------------------------------------------------
@@ -200,7 +202,7 @@ def test_tab_draws_and_filters(qapp):
         tab.layer_boxes["memory"].setChecked(False)
         assert 0 < len(tab.canvas.edges) < all_edges
         tab.gaps_only.setChecked(True)
-        assert all(e.status("qt") != "live" for e in tab.canvas.edges)
+        assert all(e.status != "live" for e in tab.canvas.edges)
         assert "What is missing" in tab.details.toPlainText()
         tab.grab()                           # paints without raising
     finally:
@@ -208,16 +210,14 @@ def test_tab_draws_and_filters(qapp):
         tab.deleteLater()
 
 
-def test_tab_click_shows_the_node_and_front_end_switch(qapp):
+def test_tab_click_shows_the_node_and_empty_space_shows_the_gaps(qapp):
     tab = _tab(qapp, [])
     try:
         tab.canvas.node_clicked.emit("coder")
         assert tab.details.toPlainText().startswith("Coder")
-        assert "Missing here" in tab.details.toPlainText()
-        tab.canvas.selected = "coder"
-        tab.front_end.setCurrentIndex(cm.FRONT_ENDS.index("tk"))
-        assert tab.canvas.front_end == "tk"
-        assert "Missing here" not in tab.details.toPlainText()
+        assert "Proposed" in tab.details.toPlainText()
+        tab.canvas.node_clicked.emit("")
+        assert tab.details.toPlainText().startswith("What is missing")
     finally:
         tab.close()
         tab.deleteLater()

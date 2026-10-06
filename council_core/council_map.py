@@ -10,28 +10,21 @@ that could be".
 
 THE GRAPH IS WRITTEN DOWN, NOT DISCOVERED
 The links are read from the code by hand and cited (file:line), because the
-interesting ones are not visible at runtime: a briefing patched into five
-roles' context, a knowledge base that is built and then bypassed, a feedback
+interesting ones are not visible at runtime: low-confidence gaps collected
+and never written anywhere, a knowledge base the turn never asks, a feedback
 loop whose round count is fixed before the code that extends it runs. A
 tracer would see the calls that happen; this map is just as much about the
 calls that do not. When the wiring changes, change the table here — the
-tests pin the facts that matter (the judge gets no vault evidence, the Qt
-turn passes no tools) so a fix shows up as a failing test to update.
+tests pin the facts that matter (the judge gets no vault evidence, the coder
+gets its tools) so a fix shows up as a failing test to update.
 
-TWO FRONT ENDS, ONE MAP
-The Tk shell (council_gui_engine.py) runs the whole pipeline: a pre-pass that
-augments the question, the librarian briefing, the tools. The Qt Council tab
-(council_qt/tabs/council.py) sends the typed text straight to
-council_turn.run_turn. Every link says which front ends it is real in, and
-the map is drawn for one of them at a time: a Tk-only link drawn on the Qt
-map is a link the Qt app is MISSING.
-
-Statuses, per front end:
+The map is of the Qt app's council turn (council_qt/tabs/council.py →
+council_core/council_turn.run_turn). Statuses:
   live      happens on every turn that reaches it
   partial   happens, but not always (one feedback round; skipped on a branch)
   broken    the code is there and never takes effect
-  missing   the other front end has it; this one does not
-  proposed  nothing does this yet — a suggested improvement, with the reason
+  proposed  nothing does this yet — a suggested improvement, with the reason;
+            where a reusable module already does the work, the cite names it
 
 No Qt, no network, no model here: `live_overlay` takes plain data (a slot
 config, NodeStatus-like objects) so a test can hand it anything.
@@ -43,9 +36,6 @@ import random
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-
-FRONT_ENDS = ("qt", "tk")
-FRONT_END_LABELS = {"qt": "Qt app (this window)", "tk": "Tk app (classic)"}
 
 #: Node kinds, in legend order.
 KINDS = ("io", "judge", "member", "agent", "supplier", "store", "model",
@@ -64,10 +54,9 @@ LAYER_LABELS = {
     "tools": "Tools", "memory": "Memory", "network": "Models & machines",
 }
 
-STATUSES = ("live", "partial", "broken", "missing", "proposed")
+STATUSES = ("live", "partial", "broken", "proposed")
 STATUS_LABELS = {
     "live": "Live", "partial": "Partial", "broken": "Broken (never fires)",
-    "missing": "Missing here (other app has it)",
     "proposed": "Proposed (would improve the council)",
 }
 
@@ -87,21 +76,17 @@ class Edge:
     dst: str
     data: str                       # what travels along the link
     layer: str
-    qt: str = "missing"             # status on the Qt map
-    tk: str = "missing"             # status on the Tk map
+    status: str = "proposed"
     note: str = ""                  # why it is partial / broken / proposed
     cite: str = ""
     both_ways: bool = False
-
-    def status(self, front_end: str) -> str:
-        return self.tk if front_end == "tk" else self.qt
 
 
 @dataclass
 class CouncilMap:
     nodes: Dict[str, Node] = field(default_factory=dict)
     edges: List[Edge] = field(default_factory=list)
-    #: What the live overlay could not read, in words; "" when it all worked.
+    #: What the live overlay could not read, in words.
     notes: List[str] = field(default_factory=list)
 
     def add(self, node: Node) -> None:
@@ -114,37 +99,34 @@ class CouncilMap:
     def edges_of(self, node_id: str) -> List[Edge]:
         return [e for e in self.edges if node_id in (e.src, e.dst)]
 
-    def visible_edges(self, front_end: str,
-                      layers: Optional[Iterable[str]] = None,
+    def visible_edges(self, layers: Optional[Iterable[str]] = None,
                       statuses: Optional[Iterable[str]] = None) -> List[Edge]:
         layers = set(LAYERS if layers is None else layers)
         statuses = set(STATUSES if statuses is None else statuses)
         return [e for e in self.edges
-                if e.layer in layers and e.status(front_end) in statuses]
+                if e.layer in layers and e.status in statuses]
 
-    def gaps(self, front_end: str) -> List[Edge]:
-        """Every link that is not simply live on this front end, worst first."""
-        order = {"broken": 0, "missing": 1, "partial": 2, "proposed": 3}
-        out = [e for e in self.edges if e.status(front_end) != "live"]
-        return sorted(out, key=lambda e: (order.get(e.status(front_end), 9),
-                                          e.layer, e.src, e.dst))
+    def gaps(self) -> List[Edge]:
+        """Every link that is not simply live, worst first."""
+        order = {"broken": 0, "partial": 1, "proposed": 2}
+        out = [e for e in self.edges if e.status != "live"]
+        return sorted(out, key=lambda e: (order.get(e.status, 9), e.layer,
+                                          e.src, e.dst))
 
 
 # ============================================================
 # The written-down topology
 # ============================================================
 
-#: The panel members (council_core.model_slots.COUNCIL_ROLES minus the judge,
-#: the writer and docs, which have their own places in the map).
+#: The panel members on the ring (council_core.model_slots.COUNCIL_ROLES
+#: minus the judge, the writer and docs, which have their own places).
 MEMBERS = ("coder", "skeptic", "sage", "strategist", "intern", "artist")
 
 _NODES: Tuple[Node, ...] = (
     Node("question", "Your question", "io",
-         "What you typed. On the Tk app the pre-pass turns it into an "
-         "AUGMENTED question (task memo, analyst result, vault matches) "
-         "that every agent, the judge included, receives. On the Qt app it "
-         "is the typed text only.",
-         "council_gui_engine.py:1910-1935; council_qt/tabs/council.py:166-185"),
+         "What you typed. It reaches every agent as it is: nothing adds a "
+         "task memo, vault matches or an analyst result to it first.",
+         "council_qt/tabs/council.py:202"),
     Node("answer", "Final answer", "io",
          "The synthesizer's draft once the judge's critique says PASS (or "
          "the rounds run out).", "council_core/deliberation.py:858-895"),
@@ -155,28 +137,30 @@ _NODES: Tuple[Node, ...] = (
          "council_engine.py:6531-6700; council_engine.py:5608"),
     Node("writer", "Writer", "member",
          "The default synthesizer: writes the one answer from every "
-         "candidate, rebuttal, the discussion, the judge's ranking and the "
-         "previous critique.",
-         "council_core/council_turn.py:57-70; council_core/deliberation.py:290-390"),
+         "candidate, rebuttal, the discussion, the judge's ranking, the "
+         "previous critique and any tool outputs.",
+         "council_core/council_turn.py:57-70; "
+         "council_core/deliberation.py:290-390"),
     Node("peasant", "Peasant", "member",
          "Cross-examines each candidate with two plain questions; may argue "
          "against the winner. Not part of rebuttal or cross-fire.",
          "council_core/deliberation.py:589-624, 796-826"),
     Node("coder", "Coder", "member",
-         "Writes code and GUIs. On Tk it is a CoderAgent (write → run → fix, "
-         "up to 8 tries) with tools.", "coder_agent.py; council_gui_engine.py:18737"),
+         "Writes code and GUIs; may call tools when Tools is on. "
+         "coder_agent.py has a write → run → fix loop the turn does not use.",
+         "council_core/council_turn.py:108; coder_agent.py"),
     Node("skeptic", "Skeptic", "member",
          "Attacks the question. Given no vault and no history on purpose.",
          "council_engine.py:5591"),
     Node("sage", "Sage", "member",
-         "Long-view answers. Has a knowledge base (SageAgent) that the "
-         "deliberation never uses.", "sage_agent.py:311-332"),
-    Node("strategist", "Strategist", "member", "Plans; full vault context.",
+         "Long-view answers. Has a knowledge base (SageAgent) the turn never "
+         "uses.", "sage_agent.py:311-332"),
+    Node("strategist", "Strategist", "member", "Plans.",
          "council_engine.py:5584"),
     Node("intern", "Intern", "member",
-         "Fast first drafts. On Tk can research the web first.",
-         "intern_agent.py; council_gui_engine.py:18744"),
-    Node("artist", "Artist", "member", "Creative answers; no vault context.",
+         "Fast first drafts; may call tools when Tools is on.",
+         "council_core/council_turn.py:108; intern_agent.py"),
+    Node("artist", "Artist", "member", "Creative answers.",
          "council_engine.py:5588"),
     Node("docs", "Docs", "member",
          "Answers from documentation servers in the Docs tab. Not on the "
@@ -187,31 +171,35 @@ _NODES: Tuple[Node, ...] = (
          "synthesizer reads all of it.",
          "council_core/deliberation.py:633-764"),
     Node("librarian", "Librarian", "agent",
-         "Ranks raw RAG hits into an access list and briefs the panel; logs "
-         "what the vault is missing; can add roles to the panel.",
-         "council_gui_engine.py:4485, 18812-18870"),
+         "Could rank vault search hits into a short briefing for the panel "
+         "and log what the vault is missing. Not part of the turn today; "
+         "the Librarian tab manages the vault's files.",
+         "council_core/librarian.py; council_qt/tabs/librarian.py"),
     Node("analyst", "Analyst", "agent",
-         "Writes pandas code from the question and runs it in a sandbox over "
-         "the vault's data files.", "vault_analyst.py; council_gui_engine.py:2835, 18190"),
+         "Writes pandas code from a question and runs it in a sandbox over "
+         "the vault's data files. Not part of the turn today.",
+         "vault_analyst.py"),
     Node("task_memo", "Task memo", "agent",
-         "Condenses the question into a [TASK MEMO] note.",
-         "task_memory.py; council_gui_engine.py:18169"),
+         "Condenses a question into a short [TASK MEMO] note. Not part of "
+         "the turn today.", "task_memory.py:363, 459"),
     Node("vault", "Vault", "supplier", "Your documents and data files.",
          "council_core/paths.py"),
     Node("vault_rag", "Vault RAG", "supplier",
-         "Semantic search over vault chunks.", "vault_rag.py; council_gui_engine.py:3640"),
+         "Semantic search over vault chunks (indexed from the Agents tab).",
+         "vault_rag.py:650; council_core/rag_jobs.py"),
     Node("vault_search", "Vault search", "supplier",
-         "data_index / vault search: [VAULT MATCH], [FILE], [FOLDER] blocks.",
-         "data_index.py; council_gui_engine.py:18256"),
+         "data_index / vault search: matching files and folders.",
+         "data_index.py; council_core/vault_search.py"),
     Node("tools", "Tools", "supplier",
          "run_python, vault_save/list/read/search, api_search, api_signature. "
          "Only the coder and intern may call them, and only with Tools on.",
          "council_core/council_tools.py; council_core/council_turn.py:108"),
-    Node("web", "Web research", "supplier", "crawl4ai pages for the intern.",
+    Node("web", "Web research", "supplier",
+         "crawl4ai page research (intern_agent.py). Not part of the turn.",
          "intern_agent.py"),
     Node("sage_kb", "Sage knowledge", "supplier",
-         "The sage_knowledge base SageAgent.respond would inject.",
-         "sage_agent.py:326-332"),
+         "The sage_knowledge base SageAgent.respond injects.",
+         "sage_agent.py:320-332"),
     Node("mcp_docs", "Doc servers (MCP)", "supplier",
          "Python package documentation served over MCP.",
          "council_core/docs_servers.py; council_core/mcp_client.py"),
@@ -220,21 +208,12 @@ _NODES: Tuple[Node, ...] = (
          "recent history and the prior-session summary — added to every "
          "respond() call.", "council_engine.py:5645-5770"),
     Node("wishlist", "Librarian wishlist", "store",
-         "Gaps the vault should fill: low-confidence members and the "
-         "librarian's WISHLIST_ENTRY lines.",
-         "council_engine.py:6723; council_gui_engine.py:18832, 19104"),
+         "librarian_wishlist.md: what the vault should hold.",
+         "council_engine.py:6723-6750"),
     Node("council_memory", "Past deliberations", "store",
          "council_memory (record and retrieve past deliberations). Only "
          "safe_agent uses it.", "council_memory.py; safe_agent.py"),
 )
-
-_MEMBER_CONTEXT = {
-    # role: (Tk vault context from ROLE_CONTEXT_PROFILES, librarian briefing)
-    "writer": ("full", True), "coder": ("full", True), "sage": ("full", True),
-    "strategist": ("full", True), "peasant": ("lite", True),
-    "intern": ("none", False), "artist": ("none", False),
-    "skeptic": ("none", False),
-}
 
 
 def _edges() -> List[Edge]:
@@ -242,144 +221,139 @@ def _edges() -> List[Edge]:
     out: List[Edge] = [
         # -- routing and the round --------------------------------------
         E("question", "judge", "the question, to route", "deliberation",
-          "live", "live", cite="council_core/council_turn.py:222-226"),
+          "live", cite="council_core/council_turn.py:222-226"),
         E("judge", "writer", "ranking + winner + critique + REQUIRED_CHANGES",
-          "deliberation", "live", "live",
-          cite="council_core/deliberation.py:768-830"),
+          "deliberation", "live", cite="council_core/deliberation.py:768-830"),
         E("writer", "judge", "the synthesized draft, for critique",
-          "deliberation", "live", "live",
-          cite="council_core/deliberation.py:858"),
+          "deliberation", "live", cite="council_core/deliberation.py:858"),
         E("judge", "answer", "PASS verdict → the answer", "deliberation",
-          "live", "live", cite="council_core/deliberation.py:858-895"),
+          "live", cite="council_core/deliberation.py:858-895"),
         E("peasant", "debate", "two questions per candidate; a challenge "
-          "to the winner", "deliberation", "live", "live",
+          "to the winner", "deliberation", "live",
           cite="council_core/deliberation.py:589-624, 796-826"),
         E("debate", "writer", "every candidate, rebuttal and the discussion",
-          "deliberation", "live", "live",
-          cite="council_core/deliberation.py:290-390"),
+          "deliberation", "live", cite="council_core/deliberation.py:290-390"),
         E("debate", "judge", "candidates + peasant questions + rebuttals + "
-          "self-confidence, to rank", "deliberation", "live", "live",
+          "self-confidence, to rank", "deliberation", "live",
           cite="council_core/deliberation.py:768"),
+        E("debate", "peasant", "each candidate, to question", "deliberation",
+          "live", cite="council_core/deliberation.py:589-624"),
+        E("judge", "peasant", "picked for the panel", "deliberation", "live",
+          cite="council_core/council_turn.py:57-70"),
         # -- the judge's feedback -----------------------------------------
+        E("judge", "debate", "REQUIRED_CHANGES → a second round",
+          "deliberation", "partial",
+          note="run_turn allows two rounds, so the critique reaches the "
+               "members once. The low-confidence branch raises max_rounds "
+               "after range() is fixed, so its extra round never runs, and "
+               "it is exactly that branch that skips REQUIRED_CHANGES.",
+          cite="council_core/council_turn.py:186; "
+               "council_core/deliberation.py:516, 882-888"),
         E("judge", "debate", "critique + ranking into rebuttal and "
-          "cross-fire", "deliberation", "proposed", "proposed",
+          "cross-fire", "deliberation",
           note="Rebuttal and cross-fire prompts never include the judge's "
                "ranking or critique, so members argue without knowing "
                "who is winning or why.",
           cite="council_core/deliberation.py:637-713"),
-        # -- vault and context (Tk pre-pass) -------------------------------
-        E("vault", "vault_rag", "chunks", "context", "missing", "live",
-          cite="vault_rag.py"),
-        E("vault", "vault_search", "file index", "context", "missing", "live",
+        # -- vault and context ---------------------------------------------
+        E("vault", "vault_rag", "chunks", "context", "live",
+          cite="vault_rag.py:650; council_core/rag_jobs.py"),
+        E("vault", "vault_search", "file index", "context", "live",
           cite="data_index.py"),
-        E("vault", "analyst", "data files", "context", "missing", "live",
+        E("vault", "analyst", "data files", "context", "live",
           cite="vault_analyst.py"),
-        E("vault_rag", "librarian", "raw chunks", "context", "missing",
-          "live", cite="council_gui_engine.py:3640, 18661"),
-        E("vault_search", "question", "[VAULT MATCH] / [FILE] / [FOLDER]",
-          "context", "missing", "live",
-          cite="council_gui_engine.py:18256, 18354"),
-        E("analyst", "question", "[ANALYST RESULT]", "context", "missing",
-          "live", cite="council_gui_engine.py:18190"),
-        E("task_memo", "question", "[TASK MEMO]", "context", "missing", "live",
-          cite="council_gui_engine.py:18169"),
-        E("question", "task_memo", "the typed question", "context",
-          "missing", "live", cite="council_gui_engine.py:18169"),
-        E("question", "analyst", "the typed question", "context", "missing",
-          "live", cite="council_gui_engine.py:18190"),
-        E("librarian", "wishlist", "WISHLIST_ENTRY lines", "context",
-          "missing", "live", cite="council_gui_engine.py:18832"),
-        E("librarian", "judge", "PANEL_ADD — adds roles to the panel",
-          "context", "missing", "live", cite="council_gui_engine.py:18858"),
+        E("vault_rag", "librarian", "the chunks that match the question",
+          "context",
+          note="The index exists and nothing in the turn searches it.",
+          cite="vault_rag.py:650"),
+        E("vault_search", "question", "matching files and folders",
+          "context",
+          note="The question reaches the council without any vault matches.",
+          cite="council_core/vault_search.py"),
+        E("question", "analyst", "the question", "context",
+          note="A numbers question is answered from the model's memory, "
+               "not from the data files the analyst could compute over.",
+          cite="vault_analyst.py"),
+        E("analyst", "question", "[ANALYST RESULT]: computed figures",
+          "context", note="See question → analyst.", cite="vault_analyst.py"),
+        E("question", "task_memo", "the question", "context",
+          note="A follow-up question loses what the conversation was "
+               "about; the memo would carry it.", cite="task_memory.py:363"),
+        E("task_memo", "question", "[TASK MEMO]", "context",
+          note="See question → task memo.", cite="task_memory.py:459"),
         E("librarian", "judge", "evidence, to check claims against",
-          "context", "proposed", "proposed",
-          note="The judge ranks and critiques with use_vault 'none' and no "
-               "librarian briefing: it cannot tell a cited answer from a "
-               "confident one.",
-          cite="council_engine.py:5608; council_gui_engine.py:18879"),
+          "context",
+          note="The judge ranks and critiques with no vault context: it "
+               "cannot tell a cited answer from a confident one.",
+          cite="council_engine.py:5608"),
+        E("librarian", "wishlist", "what the vault could not answer",
+          "context", note="Nothing logs vault gaps during a turn.",
+          cite="council_engine.py:6736"),
         E("sage_kb", "sage", "knowledge-base passages", "context",
-          "broken", "broken",
-          note="Tk wraps sage_agent_obj.model, not the SageAgent, so "
-               "SageAgent.respond's injection never runs; Qt sets "
-               "sage_agent_obj = None.",
-          cite="council_gui_engine.py:18908; council_core/council_turn.py:294"),
+          note="The turn wraps the plain sage model (sage_agent_obj is "
+               "None), so SageAgent.respond's injection never runs.",
+          cite="council_core/council_turn.py:293; sage_agent.py:320-332"),
         E("mcp_docs", "docs", "documentation pages", "context", "live",
-          "live", cite="council_core/docs_qa.py:2034-2052"),
+          cite="council_core/docs_qa.py:2034-2052"),
         E("docs", "coder", "API docs for the code it writes", "context",
-          "proposed", "proposed",
           note="The docs role reads real package documentation but the "
                "council's coder never asks it; the coder guesses APIs.",
           cite="council_core/docs_qa.py:262"),
-        E("web", "intern", "researched pages", "context", "missing", "live",
-          cite="intern_agent.py; council_gui_engine.py:18744"),
+        E("web", "intern", "researched pages", "context",
+          note="intern_agent.py can research the web before drafting; the "
+               "turn does not use it.", cite="intern_agent.py"),
         # -- tools ---------------------------------------------------------
         E("tools", "coder", "tool results (run_python, vault_*, api_*), "
-          "when Tools is on", "tools", "live", "live",
+          "when Tools is on", "tools", "live",
           cite="council_core/council_tools.py; "
-               "council_qt/tabs/council.py (CouncilActions.tools)"),
+               "council_qt/tabs/council.py:162"),
         E("tools", "intern", "tool results, when Tools is on", "tools",
-          "live", "live", cite="council_core/council_turn.py:108-109"),
-        E("tools", "writer", "PRIOR TOOL OUTPUTS", "tools", "live", "live",
-          cite="council_core/deliberation.py:290-390"),
+          "live", cite="council_core/council_turn.py:108-109"),
+        E("tools", "writer", "PRIOR TOOL OUTPUTS", "tools", "live",
+          cite="council_core/deliberation.py:314-361"),
         # -- memory --------------------------------------------------------
         E("debate", "wishlist", "low-confidence members (≤4/10) as gaps",
-          "memory", "missing", "live",
-          cite="council_core/deliberation.py:778-794; "
-               "council_gui_engine.py:19104"),
-        E("answer", "role_memory", "final answer + critique (writer and "
-          "judge do not write)", "memory", "missing", "live",
-          cite="council_gui_engine.py:20062-20135; council_engine.py:6012"),
+          "memory", "broken",
+          note="The deliberation collects them in ctx.shared"
+               "['_low_conf_gaps'] and nothing reads that list, so no gap "
+               "is ever written.",
+          cite="council_core/deliberation.py:786-801"),
+        E("answer", "role_memory", "what this turn decided", "memory",
+          note="Nothing writes role or project memory after a turn, so "
+               "the memory every role reads never grows.",
+          cite="council_engine.py:5654, 5728"),
         E("council_memory", "judge", "how similar questions were decided",
-          "memory", "proposed", "proposed",
+          "memory",
           note="Past deliberations are recorded nowhere the council reads; "
                "only safe_agent uses council_memory.",
           cite="council_memory.py; safe_agent.py"),
         E("answer", "council_memory", "this turn's verdict, for next time",
-          "memory", "proposed", "proposed",
-          note="Nothing records a deliberation for retrieval.",
+          "memory", note="Nothing records a deliberation for retrieval.",
           cite="council_memory.py"),
     ]
 
     for role in MEMBERS:
         out.append(E("judge", role, "picked for the panel", "deliberation",
-                     "live", "live", cite="council_core/council_turn.py:57-70"))
+                     "live", cite="council_core/council_turn.py:57-70"))
         out.append(E(role, "debate", "candidate + confidence; rebuttal; "
-                     "AGREE/DISAGREE/ADD", "deliberation", "live", "live",
+                     "AGREE/DISAGREE/ADD", "deliberation", "live",
                      cite="council_core/deliberation.py:530-764"))
         out.append(E("debate", role, "others' answers + the peasant's "
-                     "questions", "deliberation", "live", "live",
+                     "questions", "deliberation", "live",
                      cite="council_core/deliberation.py:633-713"))
-    out.append(E("judge", "peasant", "picked for the panel", "deliberation",
-                 "live", "live", cite="council_core/council_turn.py:57-70"))
-    out.append(E("debate", "peasant", "each candidate, to question",
-                 "deliberation", "live", "live",
-                 cite="council_core/deliberation.py:589-624"))
-    out.append(E("judge", "debate", "REQUIRED_CHANGES → a second round",
-                 "deliberation", "partial", "broken",
-                 note="Tk runs max_rounds=1 and range() is fixed before the "
-                      "low-confidence branch raises it, so the critique "
-                      "never reaches the members. Qt (max_rounds=2) gets one "
-                      "feedback round, and REQUIRED_CHANGES is skipped in "
-                      "exactly the low-confidence branch.",
-                 cite="council_gui_engine.py:18957; "
-                      "council_core/deliberation.py:516, 882-888"))
-
-    for role, (vault, briefed) in _MEMBER_CONTEXT.items():
-        if briefed:
-            what = ("short peasant briefing" if role == "peasant"
-                    else "librarian access-list briefing")
-            out.append(E("librarian", role, what, "context", "missing", "live",
-                         cite="council_gui_engine.py:18879-18889"))
-        elif role in ("skeptic", "intern"):
-            out.append(E("librarian", role, "evidence to attack / build on",
-                         "context", "proposed", "proposed",
-                         note=f"The {role} gets no vault context at all "
-                              f"(use_vault 'none'), so it argues from the "
-                              f"model's memory alone.",
-                         cite="council_engine.py:5587-5592"))
+    for role in ("writer", "coder", "sage", "strategist", "peasant",
+                 "skeptic", "intern"):
+        why = {
+            "skeptic": "The skeptic argues from the model's memory alone; "
+                       "evidence would give it something real to attack.",
+            "intern": "The intern drafts from the model's memory alone.",
+        }.get(role, f"The {role} answers without the vault's documents.")
+        out.append(E("librarian", role,
+                     "a short briefing: the vault passages that matter",
+                     "context", note=why, cite="council_engine.py:5579-5609"))
     for role in ("judge", "writer") + MEMBERS + ("peasant",):
         out.append(E("role_memory", role, "own + project memory, profile, "
-                     "history, prior session", "memory", "live", "live",
+                     "history, prior session", "memory", "live",
                      cite="council_engine.py:5645-5770"))
     return out
 
@@ -440,7 +414,7 @@ def live_overlay(m: CouncilMap, slots: Any = None,
     the map then says so in `notes` and shows what it has.
 
     The council runs every role on THIS machine: a call leaves it only with
-    COUNCIL_REMOTE_NODES=1 and an ollama: slot, and the Qt council builds no
+    COUNCIL_REMOTE_NODES=1 and an ollama: slot, and the council tab builds no
     dispatcher at all. So role → model → this PC is live, and a remote
     machine that already has a slot's model is drawn as a PROPOSED link —
     there is no role → machine binding to send work there.
@@ -465,13 +439,13 @@ def live_overlay(m: CouncilMap, slots: Any = None,
             m.add(Node(nid, label, "model",
                        f"Slot '{name}': {path or '(COUNCIL_GGUF_PATH unset)'}",
                        "council_core/model_slots.py:92-120"))
-            m.link(Edge(nid, THIS_PC, "runs on", "network", "live", "live",
+            m.link(Edge(nid, THIS_PC, "runs on", "network", "live",
                         cite="council_engine.py:4016-4050"))
             for role in roles:
                 try:
                     if slots.slot_for(role) == name:
                         m.link(Edge(role, nid, f"answers with slot '{name}'",
-                                    "network", "live", "live",
+                                    "network", "live",
                                     cite="council_core/model_slots.py:113"))
                 except Exception:                         # noqa: BLE001
                     continue
@@ -505,17 +479,17 @@ def live_overlay(m: CouncilMap, slots: Any = None,
                 continue                      # already drawn as 'runs on'
             m.link(Edge(f"model:{name}", nid,
                         "has this model installed — could share the load",
-                        "network", "proposed", "proposed",
+                        "network", "proposed",
                         note="No role → machine binding exists (Slot has "
-                             "name, path and n_ctx only) and the Qt council "
+                             "name, path and n_ctx only) and the council tab "
                              "builds no dispatcher, so this machine is "
                              "never asked.",
                         cite="council_core/model_slots.py:93-96; "
-                             "council_qt/tabs/council.py:158"))
+                             "council_qt/tabs/council.py:159"))
         if not local and up and not any(
                 e.dst == nid for e in m.edges):
             m.link(Edge(nid, THIS_PC, "idle: no slot's model is installed "
-                        "here", "network", "proposed", "proposed",
+                        "here", "network", "proposed",
                         note="Install a slot's model here, or bind a role "
                              "to this machine, to use it.",
                         cite="council_core/apothecary.py"))
@@ -649,9 +623,9 @@ def layout(m: CouncilMap, edges: Sequence[Edge], width: float = 1400.0,
     return {nid: (p[0], p[1]) for nid, p in pos.items()}
 
 
-def describe(m: CouncilMap, node_id: str, front_end: str) -> str:
+def describe(m: CouncilMap, node_id: str) -> str:
     """A node's details as plain text: what it is, and every link in and out
-    with what travels on it and its status on this front end."""
+    with what travels on it and its status."""
     node = m.nodes.get(node_id)
     if node is None:
         return ""
@@ -666,7 +640,7 @@ def describe(m: CouncilMap, node_id: str, front_end: str) -> str:
             return
         lines.append(title)
         for e in edges:
-            st = e.status(front_end)
+            st = e.status
             lines.append(f"  {'⇄' if e.both_ways else '•'} "
                          f"{m.nodes[other(e)].label}: {e.data}"
                          f"  [{STATUS_LABELS[st]}]")
@@ -681,11 +655,11 @@ def describe(m: CouncilMap, node_id: str, front_end: str) -> str:
     return "\n".join(lines).rstrip()
 
 
-def gaps_report(m: CouncilMap, front_end: str) -> str:
-    """Everything not live on this front end, as a plain-text list."""
-    lines = [f"What is missing on the {FRONT_END_LABELS[front_end]}:", ""]
-    for e in m.gaps(front_end):
-        st = e.status(front_end)
+def gaps_report(m: CouncilMap) -> str:
+    """Everything not live, as a plain-text list."""
+    lines = ["What is missing or not working:", ""]
+    for e in m.gaps():
+        st = e.status
         lines.append(f"[{STATUS_LABELS[st]}] {m.nodes[e.src].label} → "
                      f"{m.nodes[e.dst].label}: {e.data}")
         if e.note:
@@ -695,7 +669,7 @@ def gaps_report(m: CouncilMap, front_end: str) -> str:
     return "\n".join(lines)
 
 
-__all__ = ["Node", "Edge", "CouncilMap", "FRONT_ENDS", "FRONT_END_LABELS",
+__all__ = ["Node", "Edge", "CouncilMap",
            "KINDS", "KIND_LABELS", "LAYERS", "LAYER_LABELS", "STATUSES",
            "STATUS_LABELS", "MEMBERS", "THIS_PC", "static_map",
            "live_overlay", "gather", "layout", "describe", "gaps_report",

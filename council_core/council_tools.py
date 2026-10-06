@@ -7,9 +7,8 @@ returns (ok, message for the model, payload). ModelAgent.act runs them when
 the coder or intern answers with tool JSON, and the payloads reach the
 synthesizer as PRIOR TOOL OUTPUTS.
 
-Moved here from council_gui_engine.py so the Qt Council tab can hand the same
-tools to council_turn.run_turn — before this, its Tools switch passed
-tools=None and no member could call anything. No tkinter here.
+The Council tab builds them (CouncilActions.tools) and hands them to
+council_turn.run_turn when its Tools switch is on.
 """
 from __future__ import annotations
 

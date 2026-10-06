@@ -7,10 +7,10 @@ Morphik draws its knowledge graph: drag the background to pan, the wheel to
 zoom, drag a node to move it. Hover a node to light up its links; click it
 to read every link in and out, with the code it comes from.
 
-The colour of a line is its status on the front end chosen at the top (see
-council_core.council_map): grey live, amber partial, red dashed broken or
-missing, green dashed proposed — the green lines are the map's suggestions
-for what would make the council better. "What's missing" lists them all.
+The colour of a line is its status (see council_core.council_map): grey
+live, amber partial, red dashed broken, green dashed proposed — the green
+lines are the map's suggestions for what would make the council better.
+"What's missing" lists every line that is not live.
 
 Read-only. The topology is in council_core.council_map; the only live reads
 are the model-slot file (on open) and, when Refresh is pressed, one probe of
@@ -22,7 +22,7 @@ import threading
 from typing import Dict, List
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QLabel,
+from PySide6.QtWidgets import (QCheckBox, QHBoxLayout, QLabel,
                                QPlainTextEdit, QSplitter, QVBoxLayout,
                                QWidget)
 
@@ -56,21 +56,14 @@ class CouncilMapTab(ViewHelpers, QWidget):
             "How the council's agents connect: what each one receives, from "
             "whom, and what it passes on. Green dashed lines are links that "
             "do not exist yet and would improve the council; red ones are "
-            "broken or missing in the app you are looking at. Click a node "
+            "wired but never take effect. Click a node "
             "for its links and the code they come from.")
         blurb.setWordWrap(True)
         blurb.setStyleSheet(f"color: {self._tokens['muted_fg']};")
         outer.addWidget(blurb)
 
         row = QHBoxLayout()
-        row.addWidget(QLabel("Show the wiring of:"))
-        self.front_end = QComboBox()
-        for fe in cm.FRONT_ENDS:
-            self.front_end.addItem(cm.FRONT_END_LABELS[fe], fe)
-        self.front_end.currentIndexChanged.connect(
-            lambda _i: self.redraw(relayout=False))
-        row.addWidget(self.front_end)
-        row.addSpacing(12)
+        row.addWidget(QLabel("Show:"))
         self.layer_boxes: Dict[str, QCheckBox] = {}
         for layer in cm.LAYERS:
             box = QCheckBox(amp(cm.LAYER_LABELS[layer]))
@@ -118,32 +111,26 @@ class CouncilMapTab(ViewHelpers, QWidget):
         t = self._tokens
         lines = (f"<span style='color:{t['muted_fg']}'>━ live</span> "
                  f"<span style='color:{t['warning']}'>━ partial</span> "
-                 f"<span style='color:{t['error']}'>┅ broken/missing</span> "
+                 f"<span style='color:{t['error']}'>┅ broken</span> "
                  f"<span style='color:{t['success']}'>┅ proposed</span>")
         label = QLabel(f"{dots}<br>{lines}")
         label.setTextFormat(Qt.TextFormat.RichText)
         return label
 
     # ------------------------------------------------------------------
-    def current_front_end(self) -> str:
-        return self.front_end.currentData() or "qt"
-
     def visible_edges(self) -> List[cm.Edge]:
         layers = [k for k, box in self.layer_boxes.items() if box.isChecked()]
         statuses = ([s for s in cm.STATUSES if s != "live"]
                     if self.gaps_only.isChecked() else None)
-        return self.map.visible_edges(self.current_front_end(), layers,
-                                      statuses)
+        return self.map.visible_edges(layers, statuses)
 
     def redraw(self, relayout: bool = False) -> None:
-        fe = self.current_front_end()
         edges = self.visible_edges()
-        self.canvas.set_graph(self.map, edges, fe, relayout=relayout)
-        gaps = self.map.gaps(fe)
-        counts = {s: sum(1 for e in gaps if e.status(fe) == s)
-                  for s in ("broken", "missing", "partial", "proposed")}
-        summary = (f"{len(self.map.nodes)} nodes, {len(edges)} links shown. "
-                   f"On the {cm.FRONT_END_LABELS[fe]}: "
+        self.canvas.set_graph(self.map, edges, relayout=relayout)
+        gaps = self.map.gaps()
+        counts = {s: sum(1 for e in gaps if e.status == s)
+                  for s in ("broken", "partial", "proposed")}
+        summary = (f"{len(self.map.nodes)} nodes, {len(edges)} links shown; "
                    + ", ".join(f"{n} {s}" for s, n in counts.items() if n)
                    + ".")
         notes = " ".join(self.map.notes)
@@ -158,11 +145,11 @@ class CouncilMapTab(ViewHelpers, QWidget):
             self.show_gaps()
             return
         self.details.setPlainText(
-            cm.describe(self.map, node_id, self.current_front_end()))
+            cm.describe(self.map, node_id))
 
     def show_gaps(self) -> None:
         self.details.setPlainText(
-            cm.gaps_report(self.map, self.current_front_end()))
+            cm.gaps_report(self.map))
 
     # ------------------------------------------------------------------
     def refresh(self) -> None:

@@ -162,10 +162,9 @@ class CouncilActions:
     def tools(self):
         """The coder's and intern's tools, built on the first turn that asks.
 
-        The same set the Tk council hands out (council_core.council_tools).
-        Without it the Tools switch reached run_turn as enable_tools with
-        tools=None, and ModelAgent ran with an empty tool table: the switch
-        did nothing.
+        council_core.council_tools, over this vault. Without it the Tools
+        switch reached run_turn as enable_tools with tools=None, and
+        ModelAgent ran with an empty tool table: the switch did nothing.
         """
         if self._tools is None:
             import council_engine

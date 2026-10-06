@@ -2,7 +2,7 @@
 council_qt.widgets.graph_canvas — a painted, pannable, zoomable node graph.
 
 Draws a council_core.council_map.CouncilMap: nodes coloured by kind, links
-coloured by their status on one front end, parallel links bent apart so both
+coloured by their status, parallel links bent apart so both
 show. Drag the background to pan, the wheel to zoom, a node to move it; hover
 a node to light its links and their labels; click it to select it
 (`node_clicked` carries its id, or "" for empty space).
@@ -39,14 +39,12 @@ DEFAULT_RADIUS = 15
 def status_pen(status: str, tokens: dict, width: float = 1.4) -> QPen:
     colour = {
         "live": tokens["muted_fg"], "partial": tokens["warning"],
-        "broken": tokens["error"], "missing": tokens["error"],
+        "broken": tokens["error"],
         "proposed": tokens["success"],
     }.get(status, tokens["muted_fg"])
     pen = QPen(QColor(colour), width)
     if status in ("broken", "proposed"):
         pen.setStyle(Qt.PenStyle.DashLine)
-    elif status == "missing":
-        pen.setStyle(Qt.PenStyle.DotLine)
     return pen
 
 
@@ -62,7 +60,6 @@ class GraphCanvas(QWidget):
         self._tokens = theme.tokens("dark")
         self.map: Optional[cm.CouncilMap] = None
         self.edges: List[cm.Edge] = []
-        self.front_end = "qt"
         self.pos: Dict[str, Tuple[float, float]] = {}
         self.scale = 1.0
         self.offset = QPointF(0, 0)
@@ -74,8 +71,8 @@ class GraphCanvas(QWidget):
 
     # -- data ------------------------------------------------------------
     def set_graph(self, m: cm.CouncilMap, edges: List[cm.Edge],
-                  front_end: str, relayout: bool = True) -> None:
-        self.map, self.edges, self.front_end = m, edges, front_end
+                  relayout: bool = True) -> None:
+        self.map, self.edges = m, edges
         missing = [n for n in m.nodes if n not in self.pos]
         if relayout or missing:
             self.pos = cm.layout(m, edges)
@@ -166,7 +163,7 @@ class GraphCanvas(QWidget):
                     lit: bool, labelled: bool) -> None:
         a = self.to_screen(*self.pos[e.src])
         b = self.to_screen(*self.pos[e.dst])
-        status = e.status(self.front_end)
+        status = e.status
         pen = status_pen(status, self._tokens, 2.2 if labelled else 1.3)
         colour = pen.color()
         colour.setAlpha(255 if lit else 40)
