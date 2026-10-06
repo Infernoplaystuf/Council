@@ -850,7 +850,8 @@ def _snippet(line: str, limit: int = 200) -> str:
 def field_value_locations(path: Any, field: str, *,
                           max_values: int = 5000,
                           kind: Optional[str] = None,
-                          exact: bool = False) -> List[Dict[str, Any]]:
+                          exact: bool = False,
+                          pages: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """Every value of the labelled ``field`` in ONE file, with where it is.
 
     The knowledge graph cites every fact, so a value alone is not enough: this
@@ -864,8 +865,10 @@ def field_value_locations(path: Any, field: str, *,
     Values are split exactly as in search (``_split_values``); ``kind``
     (PERSON / PART / PROJECT) tells the splitter whether 'Last, First' can be
     meant. ``exact`` makes a text key count only when it IS the label (the
-    knowledge graph's rule; search matches looser). Read-only and bounded; an
-    unreadable file gives ``[]``."""
+    knowledge graph's rule; search matches looser). ``pages``: a text
+    document's text already read (one string per PDF page, or one string),
+    so a caller asking for many fields reads the file once. Read-only and
+    bounded; an unreadable file gives ``[]``."""
     p = Path(path)
     fn = _norm_key(field)
     if not fn:
@@ -897,11 +900,8 @@ def field_value_locations(path: Any, field: str, *,
                     if len(out) >= max_values:
                         return out
         return out
-    if suf == ".pdf":
-        pages = _pdf_pages(p)
-    else:
-        text = _read_text(p, max_chars=5_000_000)
-        pages = [text] if text else []
+    if pages is None:
+        pages = document_pages(p)
     for pno, text in enumerate(pages, start=1):
         lines = text.splitlines()
         js = _json_field_values(text, fn, exact=exact)
@@ -929,6 +929,16 @@ def field_value_locations(path: Any, field: str, *,
             if len(out) >= max_values:
                 return out
     return out
+
+
+def document_pages(p: Path) -> List[str]:
+    """A text-like document's text as field_value_locations reads it: one
+    string per page for a PDF (so a citation can name the page), else one
+    string (``[]`` when empty or unreadable)."""
+    if Path(p).suffix.lower() == ".pdf":
+        return _pdf_pages(Path(p))
+    text = _read_text(Path(p), max_chars=5_000_000)
+    return [text] if text else []
 
 
 def _table_frames(p: Path, *, strict: bool = False):

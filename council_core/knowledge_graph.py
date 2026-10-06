@@ -428,8 +428,12 @@ def _text_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]
     longer label wins."""
     import field_search as fs
     best: Dict[tuple, Value] = {}
+    # Read ONCE for every rule: field_value_locations read and parsed the
+    # file again per rule — MEASURED 16 reads of each PDF per rebuild.
+    pages = fs.document_pages(p)
     for r in rules:
-        for loc in fs.field_value_locations(p, r.label, kind=r.type, exact=True):
+        for loc in fs.field_value_locations(p, r.label, kind=r.type, exact=True,
+                                            pages=pages):
             key = (loc.get("page"), loc.get("line"), loc["value"])
             prev = best.get(key)
             if prev is None or len(r.label) > len(prev.rule.label):
@@ -1095,6 +1099,20 @@ class KnowledgeGraph:
             if len(alias) < 4 or len(alias.split()) == 1 and not looks_like_code(alias):
                 continue        # single bare words are too noisy to search
             terms.append((_term_re(alias), r["entity_id"], alias))
+        # Index the terms by their first token. A term can match a line only
+        # where that token is a whole token of the line (the term's own
+        # boundaries guarantee it), so each line is tested against the few
+        # terms whose first token it holds instead of every term — MEASURED:
+        # one regex per alias per line was 12.1 M searches and 67 of a 104 s
+        # rebuild on 310 files. Same matches, in the same order.
+        by_token: Dict[str, List[int]] = {}
+        always: List[int] = []
+        for i, (_rx, _eid, alias) in enumerate(terms):
+            m = _TOKEN_RE.match(alias)
+            if m:
+                by_token.setdefault(m.group(0).lower(), []).append(i)
+            else:
+                always.append(i)
         # Initial forms of every full-named person: 'D. Whitfield'.
         initials: Dict[str, List[str]] = {}
         for r in self.db.execute("SELECT id, key FROM entities WHERE type='PERSON'"):
@@ -1116,7 +1134,11 @@ class KnowledgeGraph:
                 loc = {"line": line}
                 if page is not None:
                     loc["page"] = page
-                for rx, eid, alias in terms:
+                cand = set(always)
+                for tok in _TOKEN_RE.findall(text):
+                    cand.update(by_token.get(tok.lower(), ()))
+                for i in sorted(cand):
+                    rx, eid, alias = terms[i]
                     if rx.search(text) and not self._has_mention(eid, did, loc):
                         self._mention(eid, did, loc, alias, _snip(text), "gazetteer", run_id)
                         n += 1
@@ -1363,6 +1385,8 @@ def source_context(root: Any, rel_path: str, locator: Any, *, radius: int = 3
 
 
 _INITIAL_NAME_RE = re.compile(r"\b([A-Z])\.\s+([A-Z][A-Za-zÀ-ÿ'’\-]+)")
+#: A run of the characters _term_re treats as part of a token.
+_TOKEN_RE = re.compile(r"[\w/\-]+")
 
 
 def _term_re(alias: str) -> re.Pattern:

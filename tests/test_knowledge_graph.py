@@ -543,6 +543,51 @@ def test_a_rebuild_over_the_corpus_equals_a_fresh_build(tmp_path):
             assert _snapshot(kg) == _snapshot(fresh)
 
 
+def test_a_rebuild_reads_each_text_document_twice_not_once_per_rule(tmp_path, monkeypatch):
+    # Once for its labelled fields (all rules), once for the gazetteer —
+    # field_value_locations re-read and re-parsed it per rule (16 reads of
+    # each PDF per rebuild, measured).
+    import collections
+    import field_search as fs
+    v = _tiny(tmp_path, {"a.md": "Project: PRJ-1\nProgram Lead: Carol Lee\n",
+                         "b.txt": "Owner: Dan Smith\nPart: PN-1/A\n"})
+    reads = collections.Counter()
+    real = fs._read_text
+
+    def counting(p, *a, **k):
+        reads[Path(p).name] += 1
+        return real(p, *a, **k)
+    monkeypatch.setattr(fs, "_read_text", counting)
+    with _graph(v) as kg:
+        assert len(kg.field_rules("confirmed")) >= 10
+        kg.seed()
+    assert reads == {"a.md": 2, "b.txt": 2}
+
+
+def test_the_gazetteer_tries_only_names_whose_first_word_is_on_the_line(tmp_path, monkeypatch):
+    rows = "".join(f"PRJ-{i},Person{i} Surname{i},PN-{i}/A\n" for i in range(60))
+    memo = "Nothing to see here today.\n" * 100 + "Met Person7 Surname7 about PN-9/A.\n"
+    v = _tiny(tmp_path, {"t.csv": "Project,Owner,Part Number\n" + rows, "memo.txt": memo})
+    calls = []
+    real = kgm._term_re
+
+    class Counting:
+        def __init__(self, alias):
+            self.rx, self.alias = real(alias), alias
+
+        def search(self, text):
+            calls.append(self.alias)
+            return self.rx.search(text)
+    monkeypatch.setattr(kgm, "_term_re", Counting)
+    with _graph(v) as kg:
+        kg.seed()
+        found = {(m["surface"], m["where"]) for e in ("Person7 Surname7", "PN-9/A")
+                 for m in kg.mentions(kg.search(e)[0]["id"]) if m["method"] == "gazetteer"}
+    assert found == {("Person7 Surname7", "line 101"), ("PN-9/A", "line 101")}
+    # 180 names x 101 lines was 18,180 searches; now only the line's own.
+    assert sorted(calls) == ["PN-9/A", "Person7 Surname7"]
+
+
 def test_a_windows_1252_csv_is_read(tmp_path):
     # Excel's plain "CSV" save on Windows writes cp1252; field search read it,
     # the graph's reader returned nothing and did not list it as unreadable.
