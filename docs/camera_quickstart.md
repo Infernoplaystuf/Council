@@ -513,43 +513,65 @@ The right-hand column trains a small classifier on frames you mark ("good",
 "bad timing", …) and applies it to a whole folder. Its models are **saved and
 kept**, shared by every app on this PC, each saying where it came from.
 
-- **Model** is a **dropdown of the saved models.** Pick one to open it (its
-  classes fill the list below), or type a new name and press Return — it is
-  made when its first class is added. The open list shows each model's whole
-  row: current version, classes, frames marked, **where it came from**
-  (`from Typhon (birdlab)`, `from Barbie Capture v5 — live (barbie_lab)`), its
-  tags, when it last changed. It is read again each time it opens, so a model
-  another app saved a minute ago is there.
+- **Model** is a **dropdown of the saved models**, empty until you pick one
+  (no model is chosen for you: in a shared store a model called `frames` may
+  be another app's). Pick one to open it (its classes fill the list below),
+  or type a new name and press Return — it is made when its first class is
+  added. What you type is what Return opens: the box never finishes a name
+  for you, so `bird` does not become `birds`, and ` birds ` or `BIRDS` opens
+  `birds`. The open list shows each model's whole row: current version,
+  classes, frames marked, **where it came from** (`from Typhon (birdlab)`,
+  `from Barbie Capture v5 — live (barbie_lab)`), its tags, when it last
+  changed. It is read again before it opens, before the arrow keys or the
+  mouse wheel move through it, and after every classifier button — so a
+  model another app saved a minute ago is there, and one renamed or deleted
+  is gone. Only the files that changed are read again (about 0.3 ms a saved
+  model, measured).
 - **Show** narrows the list: *All classifiers*, *This app*, *App: …*,
   *Project: …*, *Tag: …*, *Origin unknown* (models made before origins were
   recorded) — or type part of a name.
 - **New name** + **Save as** copies the open model (classes, marks, every
   version, its origin; not its run record) and opens the copy. **Rename**
   renames it (its versions, origin and run record go with it). **Delete**
-  *moves* it to `<store>/.deleted/<name>_<time>` and says so — move it back
-  to restore it. None of them ever overwrites a model: a taken name is asked
-  about, never replaced.
+  asks first — the button reads *Sure?* and the status line says what it does
+  — and a second press within 4 seconds *moves* it to
+  `<store>/.deleted/<name>_<time>` and says so; move it back to restore it.
+  None of them ever overwrites a model: a taken name is asked about, never
+  replaced. *New name* is emptied once a name is used, and kept when the press
+  asks for another.
+- **A slip never empties the window.** A name that cannot be one (`my birds`,
+  `a/b`), a taken name, a file to import that is not there or not an export,
+  or another app's model refusing a change: each is answered in the status
+  line, with the open model, its classes and what you typed left as they
+  were.
 - **Export** writes the open model as **one file**,
   `<name>-v<N>.typhon-classifier.zip`, into the folder beside it (the box
-  that says *Folder to export into*) — the model, its marks, its origin, tags
-  and its record of what it classified; everything another PC needs, without
-  the frames. **Import** reads such a file back — the one chosen in the box
-  that says *Classifier .zip to import* — under its own name, or the name
-  typed in *New name*, checking all of it first; it never overwrites. **Export this app's classifiers**
-  writes everything this app made into one bundle,
+  that says *Folder to export into*; a folder that is not there is refused,
+  never taken for a file name) — the model, its marks, its origin, tags and
+  its record of what it classified; everything another PC needs, without the
+  frames. **Import** reads such a file back — the one chosen in the box that
+  says *Classifier .zip to import* — under its own name, or the name typed
+  in *New name* (the status line then says what the file calls it), checking
+  all of it first; it never overwrites. **Export this app's classifiers**
+  writes everything that **belongs to** this app into one bundle,
   `<project>-<time>.typhon-classifiers.zip`, which **Import** also reads.
 - **Tag** + **Add tag** / **Remove tag**: words of your own (`rig A`,
   `night shift`) that *Show* can filter by; they never change the origin.
 - **Train** makes a new **version** (`birds v3 (1a2b3c4d)` — number and the
   first 8 characters of its checksum) only when the marks changed; every
   version is kept.
-- **"Classified with"** — the two-line note under the library — says which model
+- **"Classified with"** — the note under the library — says which model
   version last classified the frames in the **capture folder**, and when:
   `Classified with birds v1 (98f54722) on 2026-10-05 15:54 — good 5, bad
   timing 3`. **Classify all frames** records each run it classifies (in the
-  store — the capture folder is only ever read), and the line follows the
-  folder box. A deleted model still answers (`since deleted`); another PC's
-  records never answer for a folder here.
+  store — the capture folder is only ever read). The note is per **run**: a
+  run captured into the folder since then is added — `· not classified yet:
+  run 20261005_130000 (8 frames)`. A renamed model is named as it is called
+  now (`hawks v1 (98f54722; then called birds)`), a deleted one still answers
+  (`since deleted`), and another PC's records never answer for a folder here.
+  The note is read again when the folder box changes, when a capture's last
+  frame is on disk, and after every classifier button (a failed one puts it
+  back rather than leaving it blank).
 
 **Whose it is.** Every shipped app calls its first model `frames`, so in a
 shared store one app's could be another's by accident. Only the app a model
@@ -558,8 +580,11 @@ class**, **Remove class**, **Mark** or **Train** it; any app may open it,
 predict and classify with it, tag it, copy it and export it. Another app's
 model says whose it is and offers the two ways on: **Save as** (a copy of
 your own, keeping where it came from) or the tag `shared` (every app may
-change it). "This app" and **Export this app's classifiers** go by where a
-model came from, so a copy of Barbie's model still counts as Barbie's.
+change it). The same goes for **Rename** and **Delete**: Barbie would find
+its model gone. "This app" and **Export this app's classifiers** go by whose
+a model is, not where it came from: Typhon's own copy of Barbie's model is
+Typhon's (and Barbie's "This app" no longer lists it) — so a Typhon going its
+own way takes every model it can change.
 
 **Where they are kept.** In **one store**, `<vault>/classifiers` (the
 Council's vault, `~/.council/vault` unless `COUNCIL_VAULT_ROOT` says
@@ -872,8 +897,9 @@ so a 12-bit frame reads dark *to the classifier*.
 | Camera connects, live view stays blank | Check the AOI — **Full sensor** resets it. |
 | The box under Gain says **Frame count**, or there is no **Settings** button | Your Typhon was built from an older example. **GUI Designer → Open → Update from example…** (see *Already have a Typhon?*). |
 | No preset box, **Save preset** or **Camera settings…** under the status line | The same: **Update from example…** brings them; your own handlers are kept. |
-| The classifier name is a plain box, not a dropdown of saved models; no **Save as / Export / Import** | The same: **Update from example…** brings the library (the old name box becomes the dropdown, still on `frames`). |
-| "'frames' belongs to Barbie … not to this app" on **Add class**, **Mark** or **Train** | The model was made by another app sharing the store. **Save as** a copy of your own, or tag it `shared` (Tag + **Add tag**) to let every app change it. |
+| The classifier name is a plain box, not a dropdown of saved models; no **Save as / Export / Import** | The same: **Update from example…** brings the library. The old name box becomes the dropdown — named afresh as a fresh build names it (`cmb_model`; the update's log says so) — and starts empty: pick your model in it. |
+| "'frames' belongs to Barbie … not to this app" on **Add class**, **Remove class**, **Mark**, **Train**, **Rename** or **Delete** | The model was made by another app sharing the store. **Save as** a copy of your own, or tag it `shared` (Tag + **Add tag**) to let every app change it. |
+| **Delete** did nothing but say "Press Delete again" | It asks first: press it again within 4 seconds, on the same model. |
 | The model dropdown is empty and its tooltip says the saved models cannot be read | A `classifier_store.json` beside the app names no folder, or cannot be read; fix it or move it away (nothing is looked for elsewhere on purpose). |
 | **Import** says a name is taken | Nothing was overwritten. Type another name in **New name** (for a bundle, a prefix such as `lab2-`) and press **Import** again. |
 | "classified with" says `Not classified yet` after classifying on another PC | Run records are per PC: a folder is a path on one computer. **Classify all frames** here records it here. |

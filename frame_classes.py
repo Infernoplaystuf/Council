@@ -2142,7 +2142,7 @@ def open_classifier(name: Any, current: Any = "") -> Dict[str, Any]:
             origin, tags = _origin_text(about["origin"]), about["tags"]
             history = [_event_text(e) for e in about["lineage"]]
             # The origin's date is left to the "origin" key when a later
-            # event is shown: the status line is short (Typhon's is 336x72).
+            # event is shown: the status line is short (Typhon's is 336x96).
             made = (f" From {_origin_text(about['origin'], dated=not history)}"
                     + (f"; {history[-1]}" if history else "")
                     + (f"; tags {', '.join(tags)}" if tags else "") + ".")
