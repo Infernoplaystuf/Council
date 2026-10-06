@@ -72,6 +72,31 @@ INDEXABLE_EXTENSIONS = TEXT_LIKE_EXTENSIONS | EXTRACTABLE_EXTENSIONS
 SKIP_PATTERNS = {".git", "__pycache__", ".chromadb", "node_modules"}
 
 
+def extract_pdf_pages(p: Path, *, max_pages: Optional[int] = None) -> List[str]:
+    """A PDF's text ONE STRING PER PAGE, index 0 = page 1, so a citation can
+    name the page. _extract_text joins the pages (and stops at 50), which
+    loses the page; the knowledge graph needs it. A page with no text layer
+    (a scan) is kept as '' so later page numbers stay right. No cap unless
+    ``max_pages`` is given. ``[]`` when pypdf is missing or the file can't be
+    read."""
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        return []
+    try:
+        reader = PdfReader(str(p))
+        pages = reader.pages if max_pages is None else reader.pages[:max_pages]
+        out = []
+        for page in pages:
+            try:
+                out.append(page.extract_text() or "")
+            except Exception:
+                out.append("")
+        return out
+    except Exception:
+        return []
+
+
 def _extract_text(p: Path) -> str:
     """Best-effort text extraction for analyst formats (PDF/DOCX/XLSX).
 
