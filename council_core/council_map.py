@@ -357,11 +357,12 @@ def _edges() -> List[Edge]:
                "council_qt/widgets/placement_review.py"),
         E("judge", "apothecary", "which machine should hold which model",
           "network", "partial",
-          note="Shown as advice and as install / remove commands for you "
-               "to run: a role cannot be pinned to another machine yet, and "
-               "the Council never installs or removes models itself.",
+          note="A role move to a machine set up in Machines & roles can be "
+               "applied; to any other machine it is advice. Installs and "
+               "removals are commands for you to run: the Council never "
+               "installs or removes models itself.",
           cite="council_core/placement.py (check); "
-               "docs/specialized_nodes.md §7 Stage 1"),
+               "council_core/node_routing.py"),
     ]
     for role in ("judge", "writer") + MEMBERS + ("peasant",):
         out.append(E(role, "usage_log", "each call's model, machine, tokens "
@@ -442,7 +443,7 @@ def _is_local_host(host: str) -> bool:
 
 def live_overlay(m: CouncilMap, slots: Any = None,
                  statuses: Sequence[Any] = (),
-                 main_path: str = "") -> CouncilMap:
+                 main_path: str = "", routing: Any = None) -> CouncilMap:
     """Add model and machine nodes to `m` (in place) and return it.
 
     `slots` is a model_slots.SlotConfig (or anything with .slots, .roles and
@@ -450,16 +451,21 @@ def live_overlay(m: CouncilMap, slots: Any = None,
     reachable, installed_models, active_model_names). Either may be missing:
     the map then says so in `notes` and shows what it has.
 
-    The council runs every role on THIS machine: a call leaves it only with
-    COUNCIL_REMOTE_NODES=1 and an ollama: slot, and the council tab builds no
-    dispatcher at all. So role → model → this PC is live, and a remote
-    machine that already has a slot's model is drawn as a PROPOSED link —
-    there is no role → machine binding to send work there.
+    A role runs on THIS machine unless node_routing binds it to another
+    (routing on, the machine enabled): then its model → that machine is
+    live. A machine that has a slot's model but no role bound to it is drawn
+    as a PROPOSED link — it could share the load.
     """
+    if routing is None:
+        try:
+            from . import node_routing
+            routing = node_routing.current()
+        except Exception:                                 # noqa: BLE001
+            routing = None
     m.add(Node(THIS_PC, "This PC", "machine",
-               "Where every council call runs today (local GGUF or "
-               "localhost Ollama).",
-               "council_engine.py:4016-4050, 139"))
+               "Runs every role that is not sent to another machine (an "
+               "in-app .gguf model or this PC's Ollama).",
+               "council_engine.py (_route_chat)"))
 
     if slots is None:
         m.notes.append("Model slots could not be read; showing the "
@@ -486,6 +492,16 @@ def live_overlay(m: CouncilMap, slots: Any = None,
                                     cite="council_core/model_slots.py:113"))
                 except Exception:                         # noqa: BLE001
                     continue
+
+    # Roles bound to another machine (node_routing): role → its model →
+    # that machine.
+    routed: Dict[str, List[str]] = {}            # url -> roles
+    if routing is not None and getattr(routing, "routing_enabled", False):
+        for role, binding in routing.roles.items():
+            node = routing.nodes.get(binding.node)
+            if node is not None and node.enabled:
+                routed.setdefault(node.url, []).append(role)
+    routed_urls = list(routed)
 
     if not statuses:
         m.notes.append("No machines probed yet — press Refresh to ask "
@@ -514,23 +530,50 @@ def live_overlay(m: CouncilMap, slots: Any = None,
                 continue
             if local:
                 continue                      # already drawn as 'runs on'
+            if any(_url_key(u) == _url_key(host) for u in routed_urls):
+                continue                      # drawn below as routed
             m.link(Edge(f"model:{name}", nid,
                         "has this model installed — could share the load",
                         "network", "proposed",
-                        note="No role → machine binding exists (Slot has "
-                             "name, path and n_ctx only) and the council tab "
-                             "builds no dispatcher, so this machine is "
-                             "never asked.",
-                        cite="council_core/model_slots.py:93-96; "
-                             "council_qt/tabs/council.py:159"))
+                        note="No role has a binding to this machine. Set "
+                             "one up in Machines & roles to send a role's "
+                             "calls here.",
+                        cite="council_core/node_routing.py"))
         if not local and up and not any(
-                e.dst == nid for e in m.edges):
+                e.dst == nid for e in m.edges) and not any(
+                _url_key(u) == _url_key(host) for u in routed_urls):
             m.link(Edge(nid, THIS_PC, "idle: no slot's model is installed "
                         "here", "network", "proposed",
                         note="Install a slot's model here, or bind a role "
                              "to this machine, to use it.",
                         cite="council_core/apothecary.py"))
+    for url, roles in routed.items():
+        nid = next((n for n in m.nodes if n.startswith("machine:")
+                    and _url_key(n[len("machine:"):]) == _url_key(url)),
+                   f"machine:{url}")
+        name = next(n.name for n in routing.nodes.values() if n.url == url)
+        probed = m.nodes.get(nid)
+        # Replaces the probe's node (named by address) with the routing
+        # name, keeping what the probe saw.
+        m.nodes[nid] = Node(
+            nid, name, "machine",
+            f"Answers for: {', '.join(sorted(roles))} (Machines & roles). "
+            f"{url}" + (f"\n{probed.summary}" if probed else ""),
+            "council_core/node_routing.py")
+        for role in roles:
+            slot_name = slots.slot_for(role) if slots is not None else ""
+            src = f"model:{slot_name}" if f"model:{slot_name}" in m.nodes \
+                else role
+            m.link(Edge(src, nid, f"runs on {name} for the {role}",
+                        "network", "live",
+                        cite="council_core/node_routing.py; "
+                             "council_engine.py (_route_to_node)"))
     return m
+
+
+def _url_key(url: str) -> str:
+    u = str(url or "").strip().lower().rstrip("/")
+    return u.split("//", 1)[-1]
 
 
 def gather(probe: bool = False, dispatcher: Any = None) -> CouncilMap:
@@ -784,14 +827,19 @@ GUIDE: Tuple[GuideStep, ...] = (
         "Refresh.\n"
         "  • SSH, port 22, from the 🔧 Apothecary: to set a Pi up and check "
         "on it every 60 seconds.\n\n"
-        "Today the machines are watched, not used: every council answer is "
-        "made on this PC. Sending a call elsewhere is blocked unless "
-        "COUNCIL_REMOTE_NODES=1 is set, and even then all calls go to one "
-        "machine — a role cannot be given its own machine yet.",
+        "Out of the box every answer is made on this PC. To use another "
+        "machine, open 'Machines & roles': turn routing on, add the machine "
+        "(or import it from the Apothecary), enable it, and bind a role to "
+        "it. That role's calls then go to that machine's Ollama, with its "
+        "own model; if the machine does not answer, the role answers here "
+        "instead (or shows the error, if you chose 'fail') and the machine "
+        "rests for a while. Each machine runs only as many calls at once as "
+        "you allow.\n\n"
+        "Any other address is refused: nothing leaves this PC except to a "
+        "machine you registered and enabled.",
         ("kind:machine", "kind:model", "apothecary"),
-        "council_engine.py (_ensure_localhost, LoadAwareDispatcher.probe_all); "
-        "apothecary_engine.py (SSH health monitor); "
-        "docs/specialized_nodes.md"),
+        "council_core/node_routing.py; council_engine.py (_route_to_node, "
+        "_ensure_localhost); apothecary_engine.py (SSH health monitor)"),
     GuideStep(
         "The weekly placement review",
         "Every model call is metered — which role, which model, which "

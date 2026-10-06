@@ -137,6 +137,7 @@ class NodesTab(ViewHelpers, QWidget):
         self.apply_btn = self._button(row, amp("Apply && Rebuild"),
                                       self.on_apply)
         self._button(row, amp("Refresh Now"), lambda: self.refresh(force=True))
+        self._button(row, "Machines & roles…", self.open_routing)
         outer.addLayout(row)
 
         self.note = QLabel(nodes.hosts_are_temporary())
@@ -225,6 +226,14 @@ class NodesTab(ViewHelpers, QWidget):
 
         threading.Thread(target=work, name="nodes-rebuild",
                          daemon=True).start()
+
+    def open_routing(self) -> None:
+        """Bind roles to machines (council_core.node_routing). The host box
+        above only says which machines to watch; this says which to use."""
+        from ..widgets.machine_routing import MachineRoutingDialog
+        dialog = MachineRoutingDialog(self.window or self)
+        dialog.open()
+        self._routing_dialog = dialog
 
     def _report(self, message: str) -> None:
         append = getattr(self.window, "append_transcript", None)

@@ -383,3 +383,40 @@ def test_scheduler_runs_only_when_due(qapp, vault):
     finally:
         win.close()
         win.deleteLater()
+
+
+# ---- routed machines: a move can be applied ---------------------------------
+
+def _routing(vault, enabled=True):
+    from council_core import node_routing as nr
+    r = nr.Routing(True, {"kitchen": nr.Node(
+        "kitchen", "http://192.168.1.50:11434", enabled, 1)}, {})
+    nr.save(vault, r)
+    return r
+
+
+def test_a_move_to_a_routed_machine_can_be_applied(vault):
+    from council_core import node_routing as nr
+    ms.save(vault, _slots())
+    proposal = {"rearrange": True, "summary": "s", "install": [],
+                "remove": [], "role_changes": [
+                    {"role": "intern", "model": "llama3.2:3b",
+                     "machine": "pi-kitchen", "reason": "idle Pi"}]}
+    report = _report(vault)
+    assert pl.check(proposal, report).advice                 # no routing
+    assert pl.check(proposal, report, _routing(vault, False)).advice
+    checked = pl.check(proposal, report, _routing(vault))
+    assert [c.node for c in checked.apply_now] == ["kitchen"]
+    assert "on pi-kitchen" in checked.text()
+    done = pl.apply_role_changes(vault, checked.apply_now)
+    assert done and "on pi-kitchen" in done[0]
+    routing = nr.load(vault)
+    assert routing.roles["intern"].node == "kitchen"
+    assert routing.roles["intern"].fallback == "here"
+    cfg = ms.load(vault)
+    assert cfg.slots[cfg.roles["intern"]].path == "ollama:llama3.2:3b"
+    # Moving it back to this PC removes the binding.
+    back = pl.Change("role", role="intern", model="llama3.1:8b",
+                     machine=pl.THIS_PC)
+    pl.apply_role_changes(vault, [back])
+    assert "intern" not in nr.load(vault).roles

@@ -100,6 +100,7 @@ class CouncilMapTab(ViewHelpers, QWidget):
         self.refresh_btn = self._button(
             row2, "Refresh models & machines", self.refresh)
         self._button(row2, "Placement review…", self.open_placement)
+        self._button(row2, "Machines & roles…", self.open_routing)
         row2.addStretch(1)
         row2.addWidget(self._legend())
         outer.addLayout(row2)
@@ -350,6 +351,14 @@ class CouncilMapTab(ViewHelpers, QWidget):
         dialog.finished.connect(lambda _r: self._after_placement())
         dialog.open()
         self._placement_dialog = dialog
+
+    def open_routing(self) -> None:
+        """Which role answers on which machine (node_routing.json)."""
+        from ..widgets.machine_routing import MachineRoutingDialog
+        dialog = MachineRoutingDialog(self.window or self)
+        dialog.finished.connect(lambda _r: self._after_placement())
+        dialog.open()
+        self._routing_dialog = dialog
 
     def _after_placement(self) -> None:
         # Applied role changes rewrite model_slots.json: show the new roles,

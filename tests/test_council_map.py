@@ -18,6 +18,15 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from council_core import council_map as cm  # noqa: E402
+from council_core import node_routing as nr  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _routing_off():
+    """The map reads node_routing.current(); pin it, never the real vault."""
+    nr.set_current(nr.Routing())
+    yield
+    nr.invalidate()
 from council_core import model_slots as ms  # noqa: E402
 
 
@@ -257,7 +266,7 @@ def test_every_guide_step_lights_real_nodes():
 def test_the_guide_explains_users_turns_models_and_machines():
     text = "\n".join(cm.guide_text(i) for i in range(len(cm.GUIDE)))
     for must in ("Council tab", "Judge", "Debate floor", "Ollama",
-                 "port 11434", "SSH", "COUNCIL_REMOTE_NODES",
+                 "port 11434", "SSH", "Machines & roles",
                  "_route_chat", "Placement review", "What's missing"):
         assert must in text, must
     assert cm.guide_text(0).startswith(f"How it works — 1 of {len(cm.GUIDE)}")
@@ -328,3 +337,23 @@ def test_role_specs_view_fills_from_a_worker_and_lights_the_role(qapp):
     finally:
         tab.close()
         tab.deleteLater()
+
+
+def test_a_routed_role_runs_on_its_machine_on_the_map():
+    url = "http://192.168.1.50:11434"
+    routing = nr.Routing(True, {"kitchen": nr.Node("kitchen", url, True)},
+                         {"peasant": nr.Binding("kitchen")})
+    statuses = [NS(host=url, reachable=True,
+                   installed_models=["llama3.2:3b"], active_model_names=[])]
+    m = cm.live_overlay(cm.static_map(), _slots(), statuses, routing=routing)
+    machine = "machine:" + url
+    assert m.nodes[machine].label == "kitchen"
+    runs = _edge(m, "model:fast", machine, "for the peasant")
+    assert runs.status == "live"
+    # No "could share the load" proposal for a machine already in use.
+    assert not [e for e in m.edges if e.dst == machine
+                and e.status == "proposed"]
+    # Routing off: back to a proposal.
+    off = cm.live_overlay(cm.static_map(), _slots(), statuses,
+                          routing=nr.Routing())
+    assert _edge(off, "model:fast", machine).status == "proposed"

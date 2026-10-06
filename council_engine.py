@@ -3427,9 +3427,52 @@ def _ollama_local(
     if should_stop is not None and should_stop():
         raise GenerationCancelled("stopped before the call started")
     host = (host or local_models.ollama_host()).rstrip("/")
-    allow_remote = (_remote_nodes_enabled()
-                    and not local_models.is_loopback_url(host))
+    remote = not local_models.is_loopback_url(host)
+    allow_remote = remote and (_remote_nodes_enabled()
+                               or _routing_allows(host))
     _ensure_localhost(host, allow_remote=allow_remote)
+    from council_core import node_routing
+    with node_routing.host_slot(host):
+        return _ollama_local_gated(
+            name, messages, host=host, remote=remote,
+            allow_remote=allow_remote, slot=slot, role=role,
+            temperature=temperature, num_predict=num_predict,
+            token_callback=token_callback, json_schema=json_schema,
+            seed=seed, stop=stop, should_stop=should_stop, timeout=timeout,
+            tools=tools)
+
+
+def _routing_allows(host: str) -> bool:
+    """A registered, enabled node with routing on (council_core.
+    node_routing) — the user's opt-in for that one machine."""
+    try:
+        from council_core import node_routing
+        return node_routing.is_allowed_host(host)
+    except Exception:                                     # noqa: BLE001
+        return False
+
+
+def _ollama_local_gated(
+    name: str,
+    messages: List[Dict[str, Any]],
+    *,
+    host: str,
+    remote: bool,
+    allow_remote: bool,
+    slot: str,
+    role: Optional[str],
+    temperature: float,
+    num_predict: int,
+    token_callback: Optional[Callable[[str], None]] = None,
+    json_schema: Optional[Dict[str, Any]] = None,
+    seed: Optional[int] = None,
+    stop: Any = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    timeout: Optional[float] = None,
+    tools: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """_ollama_local's body, inside the machine's call gate."""
+    from council_core import local_models
     entry = local_models.ollama_model(name, host, allow_remote=allow_remote,
                                       max_age=60.0)
     if entry is None:
@@ -3461,11 +3504,15 @@ def _ollama_local(
     while i < len(fmts):
         fmt = fmts[i]
         try:
+            node_limits = ({"first_reply": _node_first_reply_s(),
+                            "connect_timeout": _node_connect_timeout_s()}
+                           if remote else {})
             text, stats, calls = _ollama_stream(
                 host, model_name, msgs, temperature=temperature,
                 num_predict=num_predict, num_ctx=num_ctx, fmt=fmt, seed=seed,
                 stop=stop, should_stop=should_stop, timeout=timeout,
-                token_callback=token_callback, tools=tools, think=think)
+                token_callback=token_callback, tools=tools, think=think,
+                **node_limits)
         except _OllamaHTTPError as exc:
             told = _ollama_overflow(exc)
             if told is not None and refits < 2:
@@ -3561,9 +3608,80 @@ def _route_chat(
                               **extras)
         except BackendUnavailable as exc:
             name = _fallback_to_ollama(slot, exc)
+    if host is None:
+        target = _node_target(role)
+        if target is not None:
+            return _route_to_node(
+                target, name, messages, slot=slot, role=role,
+                temperature=temperature, num_predict=num_predict,
+                token_callback=token_callback, extras=extras)
     text, _calls = _ollama_local(
         name, messages, slot=slot, role=role, temperature=temperature,
         num_predict=num_predict, token_callback=token_callback, host=host,
+        **extras)
+    return text if token_callback is not None else text.strip()
+
+
+def _node_target(role: Optional[str]):
+    """The machine `role` is bound to (council_core.node_routing), or None
+    for this PC. Never raises: a routing problem keeps the call here."""
+    try:
+        from council_core import node_routing
+        return node_routing.route(role)
+    except Exception:                                     # noqa: BLE001
+        return None
+
+
+def _route_to_node(target, name: str, messages: List[Dict[str, Any]], *,
+                   slot: str, role: Optional[str], temperature: float,
+                   num_predict: int,
+                   token_callback: Optional[Callable[[str], None]],
+                   extras: Dict[str, Any]) -> str:
+    """One call on the role's machine, with the fallback the user chose.
+
+    Falls back ONLY when nothing was generated: the node refused, did not
+    answer, lacks the model, or did not start within its first-reply limit.
+    Output already produced is never re-sent — that error is raised. A node
+    that fails rests (node_routing.mark_failed), so the next calls go
+    straight to the fallback until it has cooled down."""
+    from council_core import node_routing
+    produced = []
+
+    def track(tok: str) -> None:
+        produced.append(1)
+        if token_callback is not None:
+            token_callback(tok)
+
+    resting = node_routing.cooling(target.url)
+    if resting <= 0:
+        try:
+            text, _calls = _ollama_local(
+                name, messages, slot=slot, role=role,
+                temperature=temperature, num_predict=num_predict,
+                token_callback=track, host=target.url, **extras)
+            node_routing.mark_ok(target.url)
+            return text if token_callback is not None else text.strip()
+        except GenerationCancelled:
+            raise
+        except Exception as exc:                          # noqa: BLE001
+            partial = getattr(exc, "partial", "")
+            if produced or partial:
+                raise
+            resting = node_routing.mark_failed(target.url)
+            _LOG.warning("[nodes] %s on %s failed before answering (%s); "
+                         "resting it %.0f s", role, target.node, exc, resting)
+            if target.fallback == "fail":
+                raise BackendUnavailable(
+                    f"The {role} is bound to {target.node}, which did not "
+                    f"answer ({exc}); its fallback is 'fail'.") from exc
+    elif target.fallback == "fail":
+        raise BackendUnavailable(
+            f"The {role} is bound to {target.node}, which is resting after "
+            f"a failure ({resting:.0f} s left); its fallback is 'fail'.")
+    # Fallback "here": the role's own model on this PC's Ollama.
+    text, _calls = _ollama_local(
+        name, messages, slot=slot, role=role, temperature=temperature,
+        num_predict=num_predict, token_callback=token_callback, host=None,
         **extras)
     return text if token_callback is not None else text.strip()
 

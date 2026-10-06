@@ -14,9 +14,9 @@ model (a "controller" entry in model_slots.json roles picks another).
 WHAT IT MAY CHANGE, AND WHAT IT MAY NOT
   * Role → model on THIS PC: applied by writing model_slots.json, and only
     when the user presses Apply on the change. Never automatically.
-  * Role → a model that only another machine has: shown, not applied. A role
-    cannot be pinned to a machine yet (Slot has name, path and n_ctx only —
-    docs/specialized_nodes.md Stage 1).
+  * Role → a model on another machine: applied (model + binding in
+    node_routing.json) when that machine is set up in Machines & roles;
+    otherwise shown as advice.
   * Install / remove a model on a machine: written as commands for the user
     to run on that machine. The Council never downloads or deletes models
     itself.
@@ -280,8 +280,9 @@ def build_report(vault_dir: Path, *, slots: Any = None,
                 name = _model_name(path)
                 if name and name not in local.installed:
                     local.installed.append(name)       # a GGUF file here
-    notes.append("Roles cannot be pinned to another machine yet: every role "
-                 "runs on This PC. Changes for other machines are advice.")
+    notes.append("A role can be moved to another machine only if that "
+                 "machine is set up in Machines & roles (routing on, "
+                 "enabled); otherwise a move there is advice.")
     for call in calls:
         if _is_local(call.get("host", "")):
             call["host"] = THIS_PC
@@ -373,6 +374,7 @@ class Change:
     reason: str = ""
     why_not: str = ""              # set when it cannot be applied as asked
     command: str = ""              # install / remove: what the user runs
+    node: str = ""                 # role on another machine: its routing name
 
 
 @dataclass
@@ -395,10 +397,12 @@ class Checked:
                 L.append(title)
                 L.extend(f"  • {show(c)}" for c in items)
                 L.append("")
-        block("Can be applied on this PC (press Apply):", self.apply_now,
-              lambda c: f"{c.role} → {c.model}: {c.reason}")
-        block("Advice (needs a role pinned to another machine, which the "
-              "Council cannot do yet):", self.advice,
+        block("Can be applied (press Apply):", self.apply_now,
+              lambda c: f"{c.role} → {c.model}"
+                        + (f" on {c.machine}" if c.node else "")
+                        + f": {c.reason}")
+        block("Advice (that machine is not set up in Machines & roles, so "
+              "the role cannot be sent there):", self.advice,
               lambda c: f"{c.role} → {c.model} on {c.machine}: {c.reason}")
         block("Commands for you to run on the machine (the Council never "
               "installs or removes models itself):", self.commands,
@@ -443,9 +447,26 @@ def _has(installed: Sequence[str], model: str) -> bool:
 _SAFE_MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
 
 
-def check(proposal: Dict[str, Any], report: Report) -> Checked:
+def _routing_node_for(machine: Machine, routing: Any) -> str:
+    """The node_routing name of an ENABLED node at this machine's address,
+    with routing on — or "" (the change stays advice)."""
+    if routing is None or not getattr(routing, "routing_enabled", False):
+        return ""
+    for node in routing.nodes.values():
+        if node.enabled and (
+                (machine.host and _host_part(node.url) ==
+                 _host_part(machine.host))
+                or node.name == machine.name):
+            return node.name
+    return ""
+
+
+def check(proposal: Dict[str, Any], report: Report,
+          routing: Any = None) -> Checked:
     """Sort every proposed change into apply-now, advice, commands or
-    rejected, with the reason. Nothing here changes anything."""
+    rejected, with the reason. Nothing here changes anything. `routing` is
+    a node_routing.Routing: a role move to a machine it routes to can be
+    applied; to any other machine it is advice."""
     from .model_slots import COUNCIL_ROLES
     known_roles = set(COUNCIL_ROLES) | {CONTROLLER}
     out = Checked(summary=str(proposal.get("summary") or ""),
@@ -480,7 +501,10 @@ def check(proposal: Dict[str, Any], report: Report) -> Checked:
             out.apply_now.append(c)
         else:
             c.machine = machine.name
-            out.advice.append(c)
+            c.node = _routing_node_for(machine, routing)
+            # A machine set up for routing (Machines & roles) can take the
+            # role for real; any other is advice.
+            (out.apply_now if c.node else out.advice).append(c)
 
     for kind in ("install", "remove"):
         for item in proposal.get(kind) or []:
@@ -517,15 +541,27 @@ def check(proposal: Dict[str, Any], report: Report) -> Checked:
 # ============================================================
 
 def apply_role_changes(vault_dir: Path, changes: Sequence[Change]) -> List[str]:
-    """Point each role at its new model by writing model_slots.json. Only
-    Ollama models on this PC; only the changes the user approved. Returns a
-    line per change made."""
+    """Point each role at its new model by writing model_slots.json, and —
+    for a move to a routed machine — bind the role to it in
+    node_routing.json. Ollama models only; only the changes the user
+    approved. Returns a line per change made."""
     from . import model_slots as ms
+    from . import node_routing as nr
     config = ms.load(Path(vault_dir))
+    routing = nr.load(Path(vault_dir))
+    routed = False
     done: List[str] = []
     for c in changes:
-        if c.kind != "role" or c.machine != THIS_PC:
+        if c.kind != "role":
             continue
+        if c.machine != THIS_PC and c.node not in routing.nodes:
+            continue                       # advice, or routing changed since
+        if c.machine == THIS_PC and c.role in routing.roles:
+            del routing.roles[c.role]      # moved back to this PC
+            routed = True
+        elif c.machine != THIS_PC:
+            routing.roles[c.role] = nr.Binding(c.node, "here")
+            routed = True
         path = f"{ms.OLLAMA_PREFIX}{c.model}"
         slot = next((s.name for s in config.slots.values()
                      if s.path.lower() == path.lower()), None)
@@ -536,10 +572,14 @@ def apply_role_changes(vault_dir: Path, changes: Sequence[Change]) -> List[str]:
                 slot, n = f"{base}-{n}", n + 1
             config.slots[slot] = ms.Slot(slot, path)
         config.roles[c.role] = slot
-        done.append(f"{c.role} now answers with {c.model} (slot '{slot}')")
+        where = "" if c.machine == THIS_PC else f" on {c.machine}"
+        done.append(f"{c.role} now answers with {c.model}{where} "
+                    f"(slot '{slot}')")
     if done:
         ms.save(Path(vault_dir), config)
         ms.invalidate()
+    if routed:
+        nr.save(Path(vault_dir), routing)
     return done
 
 
@@ -617,7 +657,8 @@ def run_review(vault_dir: Path, *, slots: Any = None,
     proposal, checked, error = None, None, ""
     try:
         proposal = ask_controller(report, chat=chat)
-        checked = check(proposal, report)
+        from . import node_routing
+        checked = check(proposal, report, node_routing.load(vault_dir))
     except Exception as exc:                              # noqa: BLE001
         error = f"{type(exc).__name__}: {exc}"
     rid = log_review(vault_dir, report, proposal, checked, error=error,

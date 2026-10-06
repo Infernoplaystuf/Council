@@ -95,8 +95,8 @@ class PlacementReviewDialog(ViewHelpers, QDialog):
         proposal = QWidget()
         pv = QVBoxLayout(proposal)
         pv.setContentsMargins(0, 6, 0, 0)
-        pv.addWidget(QLabel("Changes the controller proposes for this PC — "
-                            "tick the ones to apply:"))
+        pv.addWidget(QLabel("Changes ready to apply — tick the ones you "
+                            "want:"))
         self.apply_list = QListWidget()
         # The dark theme draws a ticked box but not an empty one, which hides
         # that there is anything to tick.
@@ -162,7 +162,9 @@ class PlacementReviewDialog(ViewHelpers, QDialog):
         else:
             self.proposal_text.setPlainText(checked.text())
             for c in checked.apply_now:
-                item = QListWidgetItem(f"{c.role} → {c.model}   ({c.reason})")
+                where = f" on {c.machine}" if c.node else ""
+                item = QListWidgetItem(
+                    f"{c.role} → {c.model}{where}   ({c.reason})")
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(Qt.CheckState.Unchecked)
                 self.apply_list.addItem(item)
