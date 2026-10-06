@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
@@ -47,7 +48,30 @@ LogFn = Callable[[str], None]
 
 
 def _print(message: str) -> None:
-    print(message, flush=True)
+    """print, but a console that cannot show a character is not an error.
+
+    MEASURED: the move lines carry "→", and with stdout a pipe on Windows
+    (cp1252) print raised UnicodeEncodeError AFTER the files had moved — so
+    the caller saw a failed migration that had in fact happened."""
+    try:
+        print(message, flush=True)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(message.encode(encoding, "replace").decode(encoding),
+              flush=True)
+
+
+def _guarded(log: Optional[LogFn]) -> LogFn:
+    """The caller's logger (default: print). One that fails costs the line,
+    never the work it is reporting on."""
+    target = log or _print
+
+    def say(message: str) -> None:
+        try:
+            target(message)
+        except Exception:                                 # noqa: BLE001
+            pass
+    return say
 
 
 def migration_enabled() -> bool:
@@ -93,7 +117,7 @@ def migrate_legacy_paths(vault_dir: Path, *, app_dir: Path,
     kept: ensure_folders makes workspace/ before this runs in Tk's import
     order too, so an old ~/.council/workspace was never moved there either.
     """
-    log = log or _print
+    log = _guarded(log)
     vault = Path(vault_dir)
     moved: List[str] = []
     for old, new in legacy_moves(vault, app_dir=app_dir,
@@ -131,7 +155,7 @@ def prepare_data_dirs(vault_dir: Path,
     own, as there: one failing must not stop the next."""
     import data_index
 
-    log = log or _print
+    log = _guarded(log)
     vault = Path(vault_dir)
     out = DataDirs()
     try:
@@ -165,7 +189,7 @@ def prepare(vault_dir: Path, *, app_dir: Optional[Path] = None,
     then (unless COUNCIL_SKIP_PATH_MIGRATION) the legacy moves, then the data
     folders. For the Qt launch, which has no import-time half to split it
     across. Never raises: a vault that cannot be tidied still opens."""
-    log = log or _print
+    log = _guarded(log)
     vault = Path(vault_dir)
     try:
         ensure_folders(vault)

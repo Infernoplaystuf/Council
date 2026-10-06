@@ -75,6 +75,36 @@ def test_running_it_again_does_nothing(places):
     assert first and second == []
 
 
+def test_a_console_that_cannot_show_the_arrow_does_not_fail_the_move(
+        places, monkeypatch):
+    """MEASURED while checking the Tk side: the move lines carry "→", and with
+    stdout a cp1252 pipe the print raised UnicodeEncodeError AFTER the files
+    had moved. Tk's import-time caller swallowed it; prepare() would have
+    reported "[Migration] skipped" for a migration that had happened."""
+    import io
+
+    app, repo, vault = places
+    (app / "node_registry.json").write_text("{}", encoding="utf-8")
+    pipe = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", pipe)
+    moved = vault_setup.migrate_legacy_paths(vault, app_dir=app,
+                                             repo_root=repo)
+    pipe.flush()
+    assert moved and (vault / "node_registry.json").exists()
+    assert b"node_registry.json" in pipe.buffer.getvalue()
+
+
+def test_a_logger_that_raises_costs_the_line_not_the_work(places):
+    app, repo, vault = places
+    (app / "node_registry.json").write_text("{}", encoding="utf-8")
+
+    def broken(_message):
+        raise OSError("log file gone")
+
+    vault_setup.prepare(vault, app_dir=app, repo_root=repo, log=broken)
+    assert (vault / "data_in" / "README.txt").is_file()
+
+
 def test_the_data_folders_get_their_readmes(places):
     _app, _repo, vault = places
     vault_setup.prepare_data_dirs(vault, log=lambda m: None)
