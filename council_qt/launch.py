@@ -109,18 +109,25 @@ def _prepare_vault(vault) -> None:
     """logs/, workspace/, tmp/, data_in/ and data_out/ with their READMEs, and
     an older build's files moved in from the app folder — what the Tk engine
     does at import and in its console, through the same functions. Never
-    fatal (prepare never raises)."""
-    from council_core import vault_setup
-    vault_setup.prepare(vault)
+    fatal: a vault that cannot be tidied still opens."""
+    try:
+        from council_core import vault_setup
+        vault_setup.prepare(vault)
+    except Exception as exc:                             # noqa: BLE001
+        print(f"[startup] vault setup skipped: {exc!r}", flush=True)
 
 
 def _apply_engine_settings(vault) -> None:
     """The context size, GPU layers and embedding device saved in the vault,
     into the environment the engine reads — what the Tk console does at
-    startup, through the same function. Never fatal (apply_saved never
-    raises): the app opens on the engine's defaults if it cannot."""
-    from council_core import engine_settings
-    engine_settings.apply_saved(vault, log=lambda m: print(m, flush=True))
+    startup, through the same function. Never fatal: the app opens on the
+    engine's defaults if it cannot."""
+    try:
+        from council_core import engine_settings
+        engine_settings.apply_saved(vault,
+                                    log=lambda m: print(m, flush=True))
+    except Exception as exc:                             # noqa: BLE001
+        print(f"[startup] engine settings not applied: {exc!r}", flush=True)
 
 
 def _report_crash(crash_path) -> None:
