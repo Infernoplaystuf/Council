@@ -9,7 +9,9 @@
   is used once and dropped.
 * ``wifi_psk`` — the 64-hex WPA key derived from the passphrase and SSID
   (PBKDF2-HMAC-SHA1, 4096 rounds — what wpa_passphrase prints). Written in
-  place of the passphrase, so the card does not carry the Wi-Fi password.
+  place of the passphrase, so the card does not carry the passphrase itself
+  — but the key joins the network exactly as the passphrase does, so the
+  card's network-config is as sensitive as the Wi-Fi password.
 * ``council_key`` — one Ed25519 key pair for the Council, in OpenSSH format,
   kept in the app folder (never the vault) and created once. Every Pi the
   Council sets up trusts its public half, so after setup no password is
@@ -113,6 +115,11 @@ def wifi_psk(ssid: str, passphrase: str) -> str:
         raise ValueError("a Wi-Fi password may only use printable ASCII characters")
     if not 1 <= len(ssid.encode("utf-8")) <= 32:
         raise ValueError("a network name (SSID) is 1 to 32 bytes")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in ssid):
+        # A line break could close the legacy firstrun.sh heredoc and run
+        # the rest of the "name" as root on the Pi.
+        raise ValueError("a network name (SSID) may not contain a line break "
+                         "or other control character")
     return hashlib.pbkdf2_hmac("sha1", passphrase.encode("ascii"),
                                ssid.encode("utf-8"), 4096, 32).hex()
 

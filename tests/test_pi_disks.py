@@ -59,7 +59,7 @@ def test_an_sd_card_is_offered_with_a_confirm_code():
     got = by_number(REAL + [SD_CARD])
     card = got[2]
     assert card.eligible, card.why_not
-    assert card.confirm_code == "DISK 2 · 31.9 GB"
+    assert card.confirm_code == "DISK 2 - 31.9 GB" and card.confirm_code.isascii()
     assert "F: bootfs" in card.summary() and "(no letter)" in card.summary()
 
 

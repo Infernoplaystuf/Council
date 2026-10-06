@@ -59,6 +59,22 @@ def test_wifi_psk_refuses_what_a_pi_cannot_join(ssid, pw):
         ps.wifi_psk(ssid, pw)
 
 
+@pytest.mark.parametrize("ssid", ["a\nCOUNCILWIFI\ntouch /PWNED\nZ", "home\r", "tab\there",
+                                  "nul\x00", "del\x7f"])
+def test_an_ssid_with_a_control_character_is_refused(ssid):
+    # 28 bytes passed the length check, and in the legacy firstrun.sh the
+    # newline closed the quoted heredoc: 'touch /PWNED' ran as root.
+    from council_core.pi_setup import firstboot as fb
+    with pytest.raises(ValueError, match="control character"):
+        ps.wifi_psk(ssid, "password123")
+    cfg = fb.FirstBoot(hostname="council-pi-1", username="council",
+                       password="correct-horse-42", wifi_ssid=ssid,
+                       wifi_password="password123")
+    assert any("control character" in p for p in cfg.problems())
+    with pytest.raises(ValueError):
+        fb.build(cfg, fb.SYSTEMD)
+
+
 def test_council_key_is_made_once(tmp_path):
     priv, pub = ps.council_key(tmp_path)
     assert pub.startswith("ssh-ed25519 ") and pub.endswith(" council")

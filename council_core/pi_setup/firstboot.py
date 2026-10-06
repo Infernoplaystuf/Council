@@ -17,7 +17,13 @@ WHAT IS AND IS NOT ON THE CARD
 * the login password only as a SHA-512 crypt hash;
 * Wi-Fi as the 64-hex WPA key derived from the passphrase and SSID, never the
   passphrase (both cloud-init's netplan and NetworkManager accept a 64-hex
-  key; this is the one detail to confirm on the first real card);
+  key; this is the one detail to confirm on the first real card). The key
+  joins the network just as the passphrase does, and it STAYS in
+  network-config on the boot partition (readable by every account on the Pi
+  and by anyone holding the card) — see remote.scrub_firstboot_cmd;
+* the Pi's SSH host private key (cloud-init images): removed from user-data,
+  with the password hash, by the first provisioning step once the Pi is up
+  (remote.scrub_firstboot_cmd);
 * the Council's public SSH key, so after first boot the Council logs in with
   its key and the password is not needed or stored;
 * the Wi-Fi country (regulatory domain) — without it Raspberry Pi OS keeps

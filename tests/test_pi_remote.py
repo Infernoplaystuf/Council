@@ -199,7 +199,7 @@ def test_provision_runs_firewall_before_ollama_listens(pi, keys):
     seen = []
     res = remote.provision("127.0.0.1", "council", "llama3.2:3b", port=pi.port,
                            pc_ip="192.168.1.50", key_dir=keys, on_step=seen.append)
-    assert all(r.ok for r in res) and len(res) == 7
+    assert all(r.ok for r in res) and len(res) == 8      # scrub + 7
     fw = next(i for i, c in enumerate(pi.commands) if remote.FIREWALL_FILE in c)
     listen = next(i for i, c in enumerate(pi.commands) if "OLLAMA_HOST=0.0.0.0" in c)
     assert fw < listen
@@ -214,9 +214,62 @@ def test_provision_stops_at_the_first_failure(pi, keys):
     pi.fail_on = "apt-get install"
     res = remote.provision("127.0.0.1", "council", "llama3.2:3b", port=pi.port,
                            pc_ip="192.168.1.50", key_dir=keys)
-    assert [r.ok for r in res] == [True, False]
+    assert [r.ok for r in res] == [True, True, False]    # scrub, internet, nftables
     assert "something broke" in res[-1].output
     assert not any("ollama pull" in c for c in pi.commands)
+
+
+def test_provision_first_takes_the_first_boot_secrets_off_the_card(pi, keys):
+    # user-data kept the Pi's SSH HOST PRIVATE key and the password hash on
+    # the world-readable boot partition for good.
+    remote.adopt("127.0.0.1", "council", pi.password, port=pi.port, key_dir=keys,
+                 expected_host_key=pi.host_public)
+    pi.commands.clear()
+    res = remote.provision("127.0.0.1", "council", "llama3.2:3b", port=pi.port,
+                           pc_ip="192.168.1.50", key_dir=keys)
+    assert res[0].ok and res[0].label.startswith("Remove the Pi's first-boot secrets")
+    assert pi.commands[0] == remote.scrub_firstboot_cmd()
+    assert "/boot/firmware/user-data" in pi.commands[0]
+
+
+def _git_bash():
+    import shutil
+    import sys
+    b = shutil.which("bash")
+    if not b or (sys.platform == "win32" and "system32" in b.lower()):
+        pytest.skip("needs a POSIX bash (Git Bash), not WSL's launcher")
+    return b
+
+
+def test_the_scrub_rewrites_only_the_user_data_the_council_wrote(tmp_path):
+    import subprocess
+    bash = _git_bash()
+    pem, pub = pi_secrets.host_keypair()
+    files = fb.build(fb.FirstBoot(hostname="council-pi-1", username="council",
+                                  password="correct-horse-42", wifi_ssid="Home",
+                                  wifi_password="wifi-pass-123",
+                                  host_key_private=pem, host_key_public=pub), fb.CLOUDINIT)
+    assert remote.FIRSTBOOT_MARKER in files["user-data"]
+    ours, theirs = tmp_path / "ours", tmp_path / "theirs"
+    for d, user_data in ((ours, files["user-data"]),
+                         (theirs, "#cloud-config\n# the user's own\npackages: [vim]\n")):
+        d.mkdir()
+        (d / "user-data").write_text(user_data, encoding="utf-8", newline="\n")
+        (d / "meta-data").write_text(files["meta-data"], encoding="utf-8", newline="\n")
+        (d / "network-config").write_text(files["network-config"], encoding="utf-8",
+                                          newline="\n")
+    cmd = remote.scrub_firstboot_cmd((ours.as_posix(), theirs.as_posix(),
+                                      (tmp_path / "absent").as_posix()))
+    out = subprocess.run([bash, "-c", 'sudo() { "$@"; }; sync() { :; }; ' + cmd],
+                         capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    scrubbed = (ours / "user-data").read_text(encoding="utf-8")
+    assert scrubbed.startswith("#cloud-config\n") and "PRIVATE KEY" not in scrubbed
+    assert "$6$" not in scrubbed and "passwd" not in scrubbed
+    assert all(ln.startswith("#") for ln in scrubbed.splitlines())
+    assert (ours / "meta-data").read_text(encoding="utf-8") == files["meta-data"]
+    assert (theirs / "user-data").read_text(encoding="utf-8").endswith("packages: [vim]\n")
+    assert not list(tmp_path.rglob("*.council-tmp"))
 
 
 @pytest.mark.parametrize("model", ["llama3.2:3b; rm -rf /", "$(reboot)", "", "A b"])

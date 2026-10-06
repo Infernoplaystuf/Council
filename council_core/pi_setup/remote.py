@@ -223,10 +223,41 @@ def firewall_rules(pc_ip: str, port: int = 11434) -> str:
             "}\n")
 
 
+#: Every first-boot file the Council writes carries this line (firstboot.py).
+FIRSTBOOT_MARKER = "Written by The Council's Pi setup."
+_SCRUBBED_USER_DATA = (
+    "#cloud-config\n"
+    "# First boot is done. The Council removed what it had put here (the Pi's\n"
+    "# SSH host private key and the password hash). meta-data is unchanged, so\n"
+    "# cloud-init does not run first-boot setup again.\n")
+
+
+def scrub_firstboot_cmd(boot_dirs: Tuple[str, ...] = ("/boot/firmware", "/boot")) -> str:
+    """Rewrite the card's cloud-init user-data — ONLY a file the Council
+    wrote (it carries FIRSTBOOT_MARKER) — as a comment-only file once the
+    Pi is up. It held the Pi's SSH HOST PRIVATE key and the password hash
+    on the FAT boot partition, which every local account on the Pi (and
+    anyone holding the card) can read: enough to impersonate the Pi to the
+    Council, defeating the pinned host key. meta-data keeps its instance id,
+    so cloud-init's first-boot modules do not run again. network-config
+    (the Wi-Fi key) is left alone: whether cloud-init re-renders the network
+    from it on a later boot is not verified on a real Pi yet, and a Pi that
+    loses its Wi-Fi cannot be reached to fix it."""
+    q = shlex.quote
+    checks = []
+    for d in boot_dirs:
+        f = f"{d}/user-data"
+        checks.append(f"if [ -f {q(f)} ] && sudo grep -qF {q(FIRSTBOOT_MARKER)} {q(f)}; then "
+                      f"printf %s {q(_SCRUBBED_USER_DATA)} | sudo tee {q(f + '.council-tmp')} "
+                      f">/dev/null && sudo mv -f {q(f + '.council-tmp')} {q(f)} || exit 1; fi")
+    return "; ".join(checks) + "; sync"
+
+
 def provision_steps(model: str, pc_ip: str, port: int = 11434
                     ) -> List[Tuple[str, str, float]]:
-    """(what the user sees, command, timeout s). The firewall goes up BEFORE
-    Ollama listens on the network."""
+    """(what the user sees, command, timeout s). The first-boot secrets come
+    off the card first; the firewall goes up BEFORE Ollama listens on the
+    network."""
     if not _MODEL_RE.match(model or ""):
         raise ValueError(f"not a model name: {model!r}")
     rules = shlex.quote(firewall_rules(pc_ip, port))
@@ -237,6 +268,7 @@ def provision_steps(model: str, pc_ip: str, port: int = 11434
         "[Install]\nWantedBy=multi-user.target\n")
     override = shlex.quote(f"[Service]\nEnvironment=\"OLLAMA_HOST=0.0.0.0:{int(port)}\"\n")
     return [
+        ("Remove the Pi's first-boot secrets from its card", scrub_firstboot_cmd(), 60),
         ("Check the Pi can reach the internet (to install Ollama)",
          "curl -fsI --max-time 15 https://ollama.com >/dev/null && echo ok", 30),
         ("Install the firewall tool (nftables)",
@@ -296,7 +328,8 @@ def refresh_firewall(host: str, username: str, *, port: int = 22,
                      key_dir: Optional[Path] = None) -> str:
     """Re-point the Ollama firewall at this PC's current address."""
     pc_ip = this_pc_ip_toward(host)
-    label, cmd, timeout = provision_steps("llama3.2:1b", pc_ip)[2]
+    label, cmd, timeout = next(s for s in provision_steps("llama3.2:1b", pc_ip)
+                               if FIREWALL_FILE in s[1] and FIREWALL_UNIT in s[1])
     c = connect(host, username, port=port, key_dir=key_dir)
     try:
         rc, _o, err = run(c, cmd, timeout=timeout)

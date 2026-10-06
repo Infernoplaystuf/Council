@@ -383,6 +383,15 @@ def test_choosing_another_list_entry_drops_the_file_chosen_for_the_first(qapp, t
     _close(qapp, d)
 
 
+def test_the_confirm_code_can_be_typed_and_copied(qapp, dlg):
+    from PySide6.QtCore import Qt
+    dlg.on_new()
+    dlg.disk_list.setCurrentRow(2)
+    code = dlg._current_disk().confirm_code
+    assert code.isascii() and code in dlg.confirm_label.text()
+    assert dlg.confirm_label.textInteractionFlags() & Qt.TextInteractionFlag.TextSelectableByMouse
+
+
 def test_a_listed_file_carries_its_own_entrys_hash_and_format(qapp, tmp_path):
     d = PiSetupDialog(actions=_with_legacy(FakeActions(tmp_path)))
     _write_with_file(d, "2025-05-13-raspios-bookworm-arm64-lite.img.xz")

@@ -285,6 +285,7 @@ class PiSetupDialog(ViewHelpers, QDialog):
         row2 = QHBoxLayout()
         self._button(row2, "⟳ Look again", self.refresh_disks)
         self.confirm_label = QLabel("")
+        self.confirm_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         row2.addWidget(self.confirm_label, 1)
         lay.addLayout(row2)
         self.confirm_edit = QLineEdit()

@@ -14,7 +14,7 @@ only when ALL of these hold:
   * none of its volumes holds the Council's vault, the app folder, or the
     Windows / user profile folders.
 
-The user then types the disk's confirm code ("DISK 3 · 31.9 GB"), and the
+The user then types the disk's confirm code ("DISK 3 - 31.9 GB"), and the
 elevated writer re-reads the disk and refuses unless its number, unique id and
 size still match (`DiskIdentity`) — a card swapped between the click and the
 write is not written.
@@ -83,8 +83,9 @@ class Disk:
 
     @property
     def confirm_code(self) -> str:
-        """What the user types to erase this disk."""
-        return f"DISK {self.number} · {self.size / 1000 ** 3:.1f} GB"
+        """What the user types to erase this disk. Plain ASCII: the middle
+        dot it had needed Alt+0183 to type."""
+        return f"DISK {self.number} - {self.size / 1000 ** 3:.1f} GB"
 
     def identity(self) -> "DiskIdentity":
         return DiskIdentity(self.number, self.unique_id, self.serial, self.size)
