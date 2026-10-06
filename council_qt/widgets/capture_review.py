@@ -298,6 +298,8 @@ class CaptureReviewer(QObject):
         self._raw_window = int(window_us)
         self._raw_seen = -1
         self._raw_finished = False
+        #: Told each time the folder is listed again (on_reload).
+        self._reloaded: List[Callable[[], Any]] = []
 
         self._scan = QTimer(self)
         self._scan.setSingleShot(True)
@@ -357,6 +359,22 @@ class CaptureReviewer(QObject):
         if not self.live:
             self._show_png(max(0, index))
         self._say()
+        self._tell_reloaded()
+
+    def on_reload(self, fn: Callable[[], Any]) -> None:
+        """Call `fn()` whenever the folder is listed again: another folder
+        chosen, or a capture's last frame on disk (_finished) — what the
+        "classified with" line follows, so a run captured after Classify
+        shows as not classified yet. Not per frame written: a capture
+        reaches here once, when it is done."""
+        self._reloaded.append(fn)
+
+    def _tell_reloaded(self) -> None:
+        for fn in list(self._reloaded):
+            try:
+                fn()
+            except Exception as exc:                        # noqa: BLE001
+                print(f"[capture_review] a reload listener raised: {exc!r}")
 
     def _take_new(self) -> None:
         """Add the frames the writer has saved since the last look."""

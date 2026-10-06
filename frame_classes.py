@@ -3197,7 +3197,10 @@ def delete_classifier(name: Any, current: Any = "",
     if not _name_of(name):
         return ask("Pick the classifier to delete in the list, then press "
                    "Delete.")
-    n, d = _existing(name, "delete")
+    try:
+        n, d = _existing(name, "delete")
+    except RuntimeError as exc:         # a name typed that is not saved
+        return ask(f"{_sentence(exc)} Nothing was deleted.")
     refused = _owner_refusal(d, "deleted")
     if refused:
         return ask(refused)
@@ -4519,7 +4522,7 @@ def run_history(name: Any = "", folder: Any = "") -> Dict[str, Any]:
         raise RuntimeError("choose a classifier or a folder to see what was "
                            "classified")
     want = _folder_key(f) if f else ""
-    found: List[Tuple[float, int, Dict[str, Any]]] = []
+    found: List[Tuple[float, int, int, Dict[str, Any]]] = []
     bad, seq = 0, 0
     for p, deleted, called in _runs_files(n):
         recs, b = _read_runs(p)
@@ -4531,9 +4534,12 @@ def run_history(name: Any = "", folder: Any = "") -> Dict[str, Any]:
             seen = dict(rec, called=called)
             if deleted:
                 seen["deleted"] = True
-            found.append((_when(rec), seq, seen))
-    found.sort(key=lambda t: (t[0], t[1]), reverse=True)
-    records = [r for _t, _s, r in found]
+            # One run's record in a deleted classifier AND in the one
+            # imported back from its export is the same moment: the live
+            # one is named (MEASURED: "since deleted" after the Import).
+            found.append((_when(rec), 0 if deleted else 1, seq, seen))
+    found.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
+    records = [r for _t, _live, _s, r in found]
     rows = [_run_line(r, with_folder=not f) for r in records]
     latest = _latest_text(records[0]) if records else ""
     where = f" for {Path(f).name or f}" if f else ""

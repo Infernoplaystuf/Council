@@ -2716,6 +2716,11 @@ def test_a_mistake_in_a_library_press_never_blanks_the_open_model(
             (what, p.classifier_status.value)
     assert _names_in(_store(vault)) == before
     assert not list(tmp_path.parent.glob("escape.txt"))
+    # Delete of a name typed that is not saved: said, the name kept.
+    p.classifier_name.value = "ghost"
+    press["Delete"]()
+    assert errors == [] and p.classifier_name.value == "ghost"
+    assert "no classifier 'ghost'" in p.classifier_status.value
 
 
 def test_another_apps_model_refuses_a_class_change_without_blanking_it(

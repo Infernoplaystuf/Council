@@ -767,7 +767,6 @@
       "min_w": 0,
       "note": "",
       "port": {
-        "default": "frames",
         "dir": "io",
         "name": "classifier_name"
       },

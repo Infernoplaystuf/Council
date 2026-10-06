@@ -1076,7 +1076,8 @@ def attach(app: Any, view: str = "live_view",
            view_status: str = "view_status", presets: str = "preset",
            area: str = "camera_area", models: str = "classifier_name",
            model_filter: str = "classifier_filter",
-           classified: str = "classified_with_line") -> Any:
+           classified: str = "classified_with_line",
+           model_status: str = "classifier_status") -> Any:
     """Start the live view. ONE line in app.py, which is never regenerated::
 
         class App(HandlerMixin, MainUi):
@@ -1123,9 +1124,11 @@ def attach(app: Any, view: str = "live_view",
     classifier_picker) keeps its list the saved classifiers of the shared
     store — read again as it opens, so another app's are there too — the
     `model_filter` box's list the filters that exist, and the `classified`
-    line saying which model version classified the capture folder. Every
-    action on a model stays a frame_classes script link. An app whose name
-    port is an entry (the Barbie apps) is left as it is.
+    line saying which model version classified the capture folder — read
+    again after every press that writes the `model_status` line, and when
+    the slider's review lists the folder again. Every action on a model
+    stays a frame_classes script link (its Delete asks for a second press).
+    An app whose name port is an entry (the Barbie apps) is left as it is.
     """
     from PySide6.QtCore import Qt, QTimer
 
@@ -1183,8 +1186,13 @@ def attach(app: Any, view: str = "live_view",
         _LIVE.picker.close()           # an earlier window's, now replaced
     _LIVE.picker = picker
     app._camera_presets = picker
-    app._classifier_picker = _models_for(app, models, model_filter,
-                                         classified, folder)
+    models_picker = _models_for(app, models, model_filter, classified,
+                                folder, model_status)
+    app._classifier_picker = models_picker
+    if reviewer is not None and models_picker is not None:
+        # New frames in the folder (a capture's last frame on disk): the
+        # line says which runs are not classified yet.
+        reviewer.on_reload(models_picker.line_soon)
     if first_run and current_choice() is None and not _dialogs_disabled():
         # After the window is up, not inside __init__: a modal dialog opened
         # while the main window is still being built has no window on screen
@@ -1257,7 +1265,7 @@ def _picker_for(app: Any, presets: str, area: str) -> Any:
 
 
 def _models_for(app: Any, models: str, model_filter: str, classified: str,
-                folder: str) -> Any:
+                folder: str, status: str = "") -> Any:
     """A ClassifierPicker for this app's model dropdown, or None when its
     model-name port is not a dropdown (or frame_classes cannot be had)."""
     ports = getattr(app, "ports", None)
@@ -1270,7 +1278,7 @@ def _models_for(app: Any, models: str, model_filter: str, classified: str,
         return None
     return classifier_picker.attach_to(frame_classes, ports, models,
                                        model_filter, classified, folder,
-                                       parent=app)
+                                       parent=app, status=status)
 
 
 class _Feed:

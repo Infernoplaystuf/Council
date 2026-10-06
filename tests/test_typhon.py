@@ -337,7 +337,10 @@ def test_the_classifier_library_is_linked_to_frame_classes():
         assert set(link["outputs"]) <= ports, sid
     model = shapes["s26"]
     assert model["props"]["readonly"] is False, "type a new model's name"
-    assert model["port"]["default"] == "frames"
+    # No default: a fresh Typhon's box is empty, its placeholder showing —
+    # "frames" was another app's model in a shared store
+    # (test_a_fresh_typhon_has_no_model_picked).
+    assert "default" not in model["port"]
     assert model["script"]["outputs"]["classifier_name"] == "name"
     assert shapes["s65"]["port"]["default"] == "All classifiers"
     assert shapes["s70"]["props"]["mode"] == "folder"
@@ -741,9 +744,9 @@ def test_start_uses_a_box_only_when_it_was_changed_after_the_preset(
 # ======================================================================
 # The classifier library, end to end in the generated window
 # ======================================================================
-def _frames(folder, count=8):
+def _frames(folder, count=8, run="20261005_120000"):
     """Frames whose timing is good (a bright band in the middle) or bad
-    (the band low and dim) — every third one bad."""
+    (the band low and dim) — every third one bad — as capture run `run`."""
     import numpy as np
     from PIL import Image
 
@@ -754,8 +757,8 @@ def _frames(folder, count=8):
             image[36:44, :] = 70
         else:
             image[18:30, :] = 160 + 8 * i
-        Image.fromarray(image).save(folder / f"20261005_120000_frame_{i:06d}.png")
-    return sorted(p.name for p in folder.glob("*.png"))
+        Image.fromarray(image).save(folder / f"{run}_frame_{i:06d}.png")
+    return sorted(p.name for p in folder.glob(f"{run}_*.png"))
 
 
 def _pick_model(ui, name):
@@ -801,7 +804,7 @@ def test_the_model_dropdown_end_to_end_in_a_built_typhon(
     picker = ui._classifier_picker
     assert isinstance(picker, cpk.ClassifierPicker)
     combo = p.classifier_name.widget
-    assert combo.isEditable() and combo.currentText() == "frames"
+    assert combo.isEditable() and combo.currentText() == ""
     assert picker.items() == [] and fc.classifier_store() == \
         library_vault / "classifiers"
     frames = tmp_path / "run"
@@ -849,6 +852,8 @@ def test_the_model_dropdown_end_to_end_in_a_built_typhon(
     ui.on_btn_export()
     assert _status(ui).startswith("Exported birds v1 ("), _status(ui)
     exported = next(out.glob("birds-v1.typhon-classifier.zip"))
+    ui.on_btn_delete()
+    assert "Press Delete again" in _status(ui)    # it asks first
     ui.on_btn_delete()
     assert combo.currentText() == "" and p.classes.items() == []
     assert "moved aside" in _status(ui)
@@ -997,7 +1002,7 @@ def _picker(qapp):
     library, line, folder = _Library(), _LinePort(), _LinePort()
     made = cpk.ClassifierPicker(library, combo=_ComboPort(model),
                                 show=_ComboPort(show), line=line,
-                                folder=folder)
+                                folder=folder, status=_LinePort())
     return made, model, show, library, line, folder, activated
 
 
@@ -1133,3 +1138,256 @@ def test_an_app_whose_name_box_is_an_entry_gets_no_dropdown(qapp):
     assert cpk.attach_to(_Library(), ports, "classifier_name",
                          "classifier_filter", "classified_with_line",
                          "capture_folder") is None
+
+
+# ----------------------------------------------------------------------
+# The fourth review (2026-10-06): each test failed before its fix
+# ----------------------------------------------------------------------
+def _focused(widget, qapp):
+    """The widget in an ACTIVE window with the focus — the state a user
+    types in. Qt completes a typed name inline only there (see
+    test_camera_settings_window._focused: on the offscreen platform the
+    deprecated setActiveWindow is the one way, its warning expected)."""
+    import warnings
+
+    widget.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    widget.show()
+    widget.activateWindow()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        QApplication.setActiveWindow(widget)
+    widget.setFocus()
+    qapp.processEvents()
+
+
+def test_arrow_keys_and_the_wheel_read_the_list_before_they_move(qapp):
+    """MEASURED before the fix (real key presses; a wheel event): another
+    app saved 'alpha' and renamed 'night' to 'owls', and the list still
+    held 'night' — Up did nothing, Down opened the stale 'night' as a new,
+    empty model, and the wheel opened whatever it landed on. A press, F4
+    and Alt+Down read the store first; the keys and the wheel that move
+    through the list did not."""
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QWheelEvent
+    from PySide6.QtTest import QTest
+
+    made, model, show, library, *_, activated = _picker(qapp)
+    model.setCurrentIndex(model.findText("frames"))
+    library.models["alpha"] = "alpha   v1 (0a0a0a0a) · from Typhon (lab)"
+    library.models["owls"] = library.models.pop("night")
+    QTest.keyClick(model, Qt.Key.Key_Up)
+    assert activated == ["alpha"], activated
+    assert made.items() == ["alpha", "frames", "owls"]
+    QTest.keyClick(model, Qt.Key.Key_Down)
+    library.models["zebra"] = library.models.pop("owls")
+    wheel = QWheelEvent(QPointF(5, 5), QPointF(5, 5), QPoint(0, 0),
+                        QPoint(0, -120), Qt.MouseButton.NoButton,
+                        Qt.KeyboardModifier.NoModifier,
+                        Qt.ScrollPhase.NoScrollPhase, False)
+    QApplication.sendEvent(model, wheel)
+    assert activated == ["alpha", "frames", "zebra"], activated
+
+
+def test_return_opens_exactly_the_model_typed(qapp):
+    """MEASURED before the fix (real keys, the window active as a user's
+    is): ' night' or 'night ' and Return did nothing — Qt looked for the
+    text with its space, the picker for it without — and 'nig' typed for a
+    new model read 'night' (Qt's inline completion), so Return opened
+    'night'. In Show, 'Th' became 'This app' the same way."""
+    made, model, show, library, *_, activated = _picker(qapp)
+    _focused(model, qapp)
+    for typed, opened in ((" night", "night"), ("night ", "night"),
+                          ("NIGHT", "night"), ("nig", "nig"),
+                          ("fresh-one", "fresh-one"), ("night", "night")):
+        before = len(activated)
+        _type_and_return(model, typed)
+        assert activated[before:] == [opened], (typed, activated[before:])
+    assert made.items() == ["frames", "night"], "a typed name joined the list"
+    model.hide()
+    _focused(show, qapp)
+    _type_and_return(show, "Th")
+    assert library.listed[-1] == "Th", library.listed[-3:]
+    show.hide()
+
+
+def test_a_classifier_press_reads_the_list_and_the_line_again(qapp):
+    """Every frame_classes link in Typhon writes the status line, and a
+    failed one clears it: the sign that a press ran. MEASURED before the
+    fix: after Save as, Rename, Delete or Import the dropdown kept the old
+    names until it was opened, and the "classified with" line kept naming a
+    model renamed or deleted; a Classify that failed left the line blank
+    although the folder's record was there."""
+    made, model, show, library, line, folder, activated = _picker(qapp)
+    status = made.status_port
+    folder.set("C:/run")
+    _pump_until(lambda: line.get().endswith("C:/run"), 2.0)
+    asked, listed = len(library.asked), len(library.listed)
+    library.models["owls"] = "owls   v1 (0b0b0b0b) · from Typhon (lab)"
+    status.set("Saved 'frames' as 'owls' (v1). Now using 'owls'.")
+    _pump_until(lambda: len(library.asked) > asked, 1.0)
+    assert "owls" in made.items() and len(library.listed) > listed
+    assert len(library.asked) == asked + 1
+    line.set("")                        # what a failed Classify's handler
+    status.set("")                      # does: clear_ports(...)
+    _pump_until(lambda: bool(line.get()), 1.0)
+    assert line.get() == "Classified with frames v2 — C:/run"
+    assert activated == []
+
+
+def _typhon_with_birds(tmp_path, library_vault):
+    """A built Typhon, and 'birds' trained on a run of 8 frames — made as
+    Typhon (this process runs the built app once it is constructed)."""
+    import frame_classes as fc
+
+    pdir = rex.build("typhon", project="birdlab", vault_dir=library_vault,
+                     target="qt")
+    ui = construct(pdir)
+    frames = tmp_path / "run"
+    names = _frames(frames)
+    for cls in ("good", "bad timing"):
+        fc.add_class("birds", cls)
+    for i, name in enumerate(names):
+        fc.mark_frame("birds", str(frames), name,
+                      ["bad timing" if i % 3 == 0 else "good"])
+    fc.train("birds")
+    ui.ports.capture_folder.set(str(frames))
+    _pump_until(lambda: "Not classified" in
+                ui.ports.classified_with_line.get(), 2.0)
+    _pick_model(ui, "birds")
+    return ui, frames
+
+
+def test_the_classified_with_line_follows_every_classifier_press(
+        qapp, tmp_path, library_vault, forget_generated):
+    """In a built Typhon, through its own handlers. MEASURED before the fix:
+    after Rename the line still named 'birds', after Delete it did not say
+    "since deleted", a Classify that failed (no model in the box) blanked
+    it, and a kept, hand-edited Classify handler that fills only the status
+    and predictions left it saying a new run was not classified."""
+    import frame_classes as fc
+
+    ui, frames = _typhon_with_birds(tmp_path, library_vault)
+    p = ui.ports
+    picker = ui._classifier_picker
+
+    def fresh():
+        return fc.classified_with(str(frames))["classified_with"]
+
+    def settled():
+        _pump_until(lambda: p.classified_with_line.get() == fresh(), 1.5)
+        return p.classified_with_line.get()
+
+    ui.on_btn_classify_all_frames()
+    assert settled().startswith("Classified with birds v1 (")
+    out = tmp_path / "out"
+    out.mkdir()
+    p.export_to.set(str(out))
+    ui.on_btn_export()
+    p.new_name.set("hawks")
+    ui.on_btn_rename()
+    assert "then called birds" in settled(), settled()
+    assert picker.items() == ["hawks"], "the list was not read again"
+    ui.on_btn_delete()
+    ui.on_btn_delete()                    # Delete asks for a second press
+    assert "(since deleted)" in settled(), settled()
+    assert picker.items() == []
+    p.import_from.set(str(next(out.glob("*.typhon-classifier.zip"))))
+    ui.on_btn_import_()
+    _pump_until(lambda: picker.items() == ["birds"], 1.0)
+    assert picker.items() == ["birds"], _status(ui)
+    assert settled() == fresh() and "since deleted" not in fresh()
+    # A Classify that fails clears what its link fills: the line is the
+    # folder's, read again — not blank.
+    p.classifier_name.set("")
+    ui.on_btn_classify_all_frames()
+    assert settled() == fresh() and fresh().startswith("Classified with")
+    # A hand-edited Classify, kept by Update from example, that never
+    # fills the line: a new run, then that Classify — the line follows.
+    _frames(frames, run="20261005_130000")
+    picker.show_line()
+    assert "not classified yet" in p.classified_with_line.get()
+
+    def kept_classify(*_args):
+        r = fc.classify_folder("birds", p.capture_folder.get())
+        p.predictions.set(r["rows"])
+        p.classifier_status.set(r["summary"])
+
+    ui.on_btn_classify_all_frames = kept_classify
+    ui.on_btn_classify_all_frames()
+    assert "not classified yet" not in settled(), settled()
+    ui.close()
+
+
+def test_delete_asks_for_a_second_press(qapp, tmp_path, library_vault,
+                                        forget_generated, monkeypatch):
+    """MEASURED before the fix: one press moved the model in the box aside,
+    and the dropdown makes every saved model one pick away; the settings
+    window's preset Delete asks with a second click. Now the first press
+    asks (on the button and in the status line), a second press within
+    CONFIRM_MS deletes; waiting, or another model, asks again."""
+    import frame_classes as fc
+    from PySide6.QtWidgets import QPushButton
+
+    from council_qt.widgets import classifier_picker as cpk
+
+    monkeypatch.setattr(cpk, "CONFIRM_MS", 400, raising=False)
+    ui, _frames_dir = _typhon_with_birds(tmp_path, library_vault)
+    fc.add_class("owls", "good")
+    button = ui.findChild(QPushButton, "btn_delete")
+    ui.on_btn_delete()
+    assert fc._taken("birds") == "birds", "deleted with one press"
+    assert "Press Delete again" in _status(ui), _status(ui)
+    assert button.text() != "Delete"
+    _pump_until(lambda: button.text() == "Delete", 2.0)
+    assert button.text() == "Delete", "the question never went away"
+    ui.on_btn_delete()                    # asks again: it waited too long
+    assert fc._taken("birds") == "birds"
+    _pick_model(ui, "owls")               # another model: asks for it
+    ui.on_btn_delete()
+    assert fc._taken("owls") == "owls"
+    ui.on_btn_delete()
+    assert fc._taken("owls") is None and "moved aside" in _status(ui)
+    assert button.text() == "Delete"
+    ui.close()
+
+
+def test_new_runs_in_the_capture_folder_are_said_on_the_line(
+        qapp, tmp_path, library_vault, forget_generated):
+    """Typhon writes each run into the capture folder. MEASURED before the
+    fix: the line was read again only when the folder's TEXT changed, so a
+    run captured after Classify never showed on it. It is read again when
+    the review lists the folder again (as it does when a capture's last
+    frame is on disk)."""
+    ui, frames = _typhon_with_birds(tmp_path, library_vault)
+    ui.on_btn_classify_all_frames()
+    line = ui.ports.classified_with_line
+    _pump_until(lambda: line.get().startswith("Classified with"), 1.0)
+    _frames(frames, run="20261005_130000")
+    ui._capture_review.reload()
+    _pump_until(lambda: "not classified yet" in line.get(), 2.0)
+    assert "not classified yet: run 20261005_130000 (8 frames)" in \
+        line.get(), line.get()
+    ui.close()
+
+
+def test_a_fresh_typhon_has_no_model_picked(qapp, tmp_path, library_vault,
+                                            forget_generated):
+    """MEASURED before the fix: the model box's port default 'frames' put
+    'frames' in every fresh Typhon's box — its placeholder never showed —
+    and where another app had trained 'frames' in the shared store the box
+    sat on that model, its classes not shown, and the first Add class was
+    refused."""
+    import frame_classes as fc
+
+    from council_qt.widgets import classifier_picker as cpk
+
+    pdir = rex.build("typhon", project="birdlab", vault_dir=library_vault,
+                     target="qt")
+    fc.add_class("frames", "theirs")      # made by another app (this test)
+    ui = construct(pdir)
+    combo = ui.ports.classifier_name.widget
+    assert (combo.currentText(), combo.currentIndex()) == ("", -1)
+    assert combo.lineEdit().placeholderText() == cpk.PLACEHOLDER
+    assert ui._classifier_picker.items() == ["frames"], "listed, not picked"
+    assert ui.ports.classes.items() == []
+    ui.close()

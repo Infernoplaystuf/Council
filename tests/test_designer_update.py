@@ -368,7 +368,7 @@ def test_the_updated_app_starts_offscreen(tmp_path, monkeypatch):
         " ui.ports.camera_area.get().startswith(\"Camera's area\"))\n"
         "print(type(ui._classifier_picker).__name__,"
         " type(ui.ports.classifier_name.widget).__name__,"
-        " ui.ports.classifier_name.get(),"
+        " ui.ports.classifier_name.get() == '',"
         " ui.ports.classifier_filter.get() == 'All classifiers')\n"
         "frame_camera.disconnect()\n")
     env = dict(os.environ, QT_QPA_PLATFORM="offscreen", COUNCIL_NO_DIALOGS="1",
@@ -382,8 +382,9 @@ def test_the_updated_app_starts_offscreen(tmp_path, monkeypatch):
     # kept current by attach (app.py itself is untouched).
     assert printed[-2] == "True PresetPicker True"
     # So does the model dropdown: the name box is a combobox now, filled by
-    # attach, still saying the default model.
-    assert printed[-1] == "ClassifierPicker QComboBox frames True"
+    # attach, and empty until a model is picked — no default model, which in
+    # a shared store may be another app's (typhon.gspec's s26).
+    assert printed[-1] == "ClassifierPicker QComboBox True True"
 
 
 # ============================================================
