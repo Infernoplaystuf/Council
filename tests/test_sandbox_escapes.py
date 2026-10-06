@@ -81,6 +81,29 @@ def test_helper_given_an_outside_path_is_refused(box):
         assert refused(df, msg), code
 
 
+def test_stats_helpers_given_an_outside_path_are_refused(box, tmp_path, monkeypatch):
+    # file_stats / column_stats are lambdas defined inside execute_pandas_code,
+    # which _contain_helpers skips as "the sandbox's own closures"; they
+    # passed the raw path on — MEASURED: TOP-SECRET came back in the 'top'
+    # column and a .stats_cache/_ext_* shard was written into the vault.
+    data, outside = box
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(vault))
+    for code in (f"result_df = pd.DataFrame([file_stats(r'{outside / 'private.csv'}')])",
+                 f"result_df = column_stats(r'{outside}')",
+                 f"result_df = column_stats([r'{outside}'])"):
+        df, msg = run(code, data)
+        assert refused(df, msg), code
+        assert "outside" in msg, msg
+    assert not list(vault.rglob("_ext_*"))
+    # ...while the data folder's own files still get their stats.
+    df, msg = run("result_df = column_stats()", data)
+    assert df is not None and "ok.csv" in df.to_string(), msg
+    df, msg = run("result_df = pd.DataFrame([file_stats('ok.csv')])", data)
+    assert df is not None and not df.empty, msg
+
+
 def test_excel_file_outside_is_refused(box):
     pytest.importorskip("openpyxl")
     import pandas as pd

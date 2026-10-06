@@ -4229,6 +4229,21 @@ def execute_pandas_code(
             f"file access is blocked outside the data folders; {path!r} is "
             "outside them")
 
+    def _sb_column_stats(folder=None):
+        """column_stats(folder=None): one row per (file, column), from the
+        stats cache — for folders inside the data folders only."""
+        if folder is None:
+            scope = [str(p) for p in normalized_folders]
+        elif isinstance(folder, (list, tuple)):
+            scope = [str(_sb_resolve_dir(f)) for f in folder]
+        else:
+            scope = str(_sb_resolve_dir(folder))
+        return folder_column_stats(None, scope)
+
+    def _sb_file_stats(path):
+        """file_stats(path): the cached stats of one CSV in the data folders."""
+        return cached_column_stats(None, str(_sb_resolve_file(path)))
+
     def _sb_read_text(path, max_chars=200000, encoding="utf-8") -> str:
         """Read a text file: encoding-robust (never raises UnicodeDecodeError),
         size-bounded, read-only, within the data folders."""
@@ -4372,10 +4387,11 @@ def execute_pandas_code(
         # the location is the same regardless of the scope folder passed.
         #   column_stats(folder=None) -> one row per (file, column)
         #   file_stats(path)          -> dict of stats for one CSV
-        "column_stats": (lambda folder=None: folder_column_stats(
-            None, folder if folder is not None
-            else [str(p) for p in normalized_folders])),
-        "file_stats": (lambda path: cached_column_stats(None, path)),
+        # Both are closures (which _contain_helpers skips), so each contains
+        # its own argument: given the raw path they read files outside the
+        # data folders and cached their stats in the vault.
+        "column_stats": _sb_column_stats,
+        "file_stats": _sb_file_stats,
         "count_rows_per_csv": count_rows_per_csv,
         "average_numeric_column_per_csv": average_numeric_column_per_csv,
         "std_numeric_column_per_csv": std_numeric_column_per_csv,
