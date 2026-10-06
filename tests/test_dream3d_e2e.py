@@ -1225,6 +1225,26 @@ def test_a_parameter_named_in_a_comment_is_not_a_parameter(tmp_path):
     ast.parse(txt)
 
 
+def test_a_script_saved_with_a_byte_order_mark_is_staged_and_run(
+        tmp_path, monkeypatch):
+    """Python runs a file that starts with a BOM, but ast.parse refuses one
+    — and the paths are found with ast: such a script was refused as "not
+    valid Python" before anything ran."""
+    ran = []
+    monkeypatch.setattr(wr, "_run_pipeline_subprocess", _fake_runner(ran))
+    p = tmp_path / "P.py"
+    p.write_text("\ufeffimport simplnx as nx\nds = nx.DataStructure()\n"
+                 + _READ + "r1 = nx.WriteDREAM3DFilter.execute("
+                 "data_structure=ds, export_file_path='Data/x.dream3d')\n",
+                 encoding="utf-8")
+    res = wr.run_chained([p, p], _inputs(tmp_path), output_dir=tmp_path / "o")
+    assert res.success, res.summary()
+    assert len(ran) == 4
+    assert dict(ran[0][1])["file_path"] == str(tmp_path / "in" / "a.dream3d")
+    # ...and the run-end policy check, which reads it the same way, can
+    # read it (it refused a script it could not parse).
+    assert nx_policy.capability_reasons(wr._read_source(p)) == []
+
 
 @pytest.mark.parametrize("mode", ["chained", "per_file"])
 def test_a_reader_named_only_in_a_comment_is_refused(mode, tmp_path,

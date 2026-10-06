@@ -139,6 +139,14 @@ _NX_MODULES = frozenset({"simplnx", "orientationanalysis",
                          "itkimageprocessing"})
 
 
+def _read_source(path: Path) -> str:
+    """A script's text, without the byte-order mark an editor may save at
+    its start: Python runs such a file, but ast.parse refuses a BOM ("invalid
+    non-printable character U+FEFF"), and every path below is found with
+    ast — so the script would be refused as not valid Python."""
+    return path.read_text(encoding="utf-8-sig", errors="replace")
+
+
 def _imports_simplnx(source: str) -> bool:
     import ast
     try:
@@ -210,7 +218,7 @@ def _run_pipeline_subprocess(
         base.duration_s = time.monotonic() - start
         return base
     try:
-        source = pipeline_path.read_text(encoding="utf-8", errors="replace")
+        source = _read_source(pipeline_path)
     except OSError as exc:
         base.error = f"could not read the pipeline: {exc}"
         base.duration_s = time.monotonic() - start
@@ -353,8 +361,8 @@ def _stage_per_input_pipeline(
     """
     return _stage(
         pipeline_path, stage_dir, input_value=input_file,
-        input_param=_input_param(pipeline_path.read_text(
-            encoding="utf-8", errors="replace"), substitution_param)).path
+        input_param=_input_param(_read_source(pipeline_path),
+                                 substitution_param)).path
 
 
 # Parameter names a DREAM3D read/write step uses, discovered from the real
@@ -520,7 +528,7 @@ def _stage(pipeline_path: Path, stage_dir: Path, *,
 
     Only the value expressions are replaced; comments, strings and the
     rest of the script are untouched."""
-    source = pipeline_path.read_text(encoding="utf-8", errors="replace")
+    source = _read_source(pipeline_path)
     target = stage_dir / (dest_name or pipeline_path.name)
     st = _Staging(target)
     names = set(_INPUT_PARAM_CANDIDATES) | set(_OUTPUT_PARAM_CANDIDATES)
@@ -558,16 +566,17 @@ def _stage(pipeline_path: Path, stage_dir: Path, *,
     if main is not None:
         same = [s for s in outs if s.param == main.param]
         if len(same) > 1:
-            others = [d for (s, d) in edits if s in same and s is not main]
+            others = [Path(s.literal).name if s.literal else s.param
+                      for s in same if s is not main]
             st.notes.append(
                 f"{pipeline_path.name}: {main.param} is written "
                 f"{len(same)} times (lines "
                 f"{', '.join(str(s.line) for s in same)}); the last, line "
                 f"{main.line}, is what it ends with, so that is the one "
                 f"this run follows"
-                + (f"; the others go to "
-                   f"{', '.join(Path(str(d)).name for d in others)}"
-                   if others else ""))
+                + (f"; the others are kept per input as "
+                   f"{', '.join('<input>_' + o for o in others)}"
+                   if side_dir is not None else ""))
     new, limit = source, len(source)
     for site, value in sorted(edits, key=lambda e: e[0].start, reverse=True):
         if site.end > limit:
@@ -601,7 +610,7 @@ def _output_dest(pipeline_path: Path, out_dir: Path, stem: str,
     """Where this pipeline's output goes for one input: <out_dir>/<stem> with
     the suffix the script's own output path had (.dream3d, .stl, ...). None
     when the script has no output parameter to point there."""
-    source = pipeline_path.read_text(encoding="utf-8", errors="replace")
+    source = _read_source(pipeline_path)
     try:
         main = _main_output(_param_sites(source, _OUTPUT_PARAM_CANDIDATES))
     except SyntaxError:
@@ -629,7 +638,7 @@ def _input_not_redirected(pl: Path, staged: Path, src_in: Path,
     .stl files reported 4/4 ok while both runs read the path saved in the
     pipeline."""
     names = tuple(p for p in params if p) + _INPUT_PARAM_CANDIDATES
-    staged_src = staged.read_text(encoding="utf-8", errors="replace")
+    staged_src = _read_source(staged)
     try:
         sites = _param_sites(staged_src, names)
     except SyntaxError as exc:
@@ -795,8 +804,8 @@ def run_chained(
         if final:
             out_path = _output_dest(pl, out_root, stem, used)
         st = _stage(pl, file_stage, input_value=src_in, output_value=out_path,
-                    input_param=_input_param(pl.read_text(
-                        encoding="utf-8", errors="replace"), substitution_param),
+                    input_param=_input_param(_read_source(pl),
+                                             substitution_param),
                     side_dir=out_root, stem=stem, used=used,
                     dest_name=f"{idx:02d}_{pl.name}")
         if st.error:
@@ -926,7 +935,7 @@ def _run_over_inputs(pairs, *, substitution_param: str, timeout_s: int,
         label = label_of(pipeline_path, input_file)
         pdir = out_root / pipeline_path.stem
         dest = _output_dest(pipeline_path, pdir, input_file.stem, used)
-        source = pipeline_path.read_text(encoding="utf-8", errors="replace")
+        source = _read_source(pipeline_path)
         st = _stage(pipeline_path, file_stage, input_value=input_file,
                     input_param=_input_param(source, substitution_param),
                     output_value=dest, side_dir=pdir, stem=input_file.stem,
