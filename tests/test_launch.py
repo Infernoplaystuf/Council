@@ -587,6 +587,30 @@ def test_a_blank_saved_setting_is_not_applied(qapp, tmp_path, engine_env):
         assert var not in os.environ, var
 
 
+def test_the_tk_console_applies_them(tmp_path, engine_env, monkeypatch):
+    """Run, not read (found in review: the check below passed with Tk's
+    call disabled). _load_backend_settings is the console's own method; it
+    is called unbound, with only the settings path it asks its console for,
+    so no Tk window is built."""
+    import council_gui_engine as cge
+
+    monkeypatch.setenv("COUNCIL_GGUF_N_CTX", "placeholder")
+    monkeypatch.delenv("COUNCIL_GGUF_N_CTX")
+    _engine_settings(tmp_path, n_ctx="12288", gpu_layers="7",
+                     embed_device="cuda")
+    monkeypatch.setenv("COUNCIL_EMBED_DEVICE", "cpu")     # an export wins
+
+    class Console:
+        def _backend_settings_path(self):
+            return tmp_path / "vault" / "backend_settings.json"
+
+    data = cge.CouncilConsole._load_backend_settings(Console())
+    assert data["n_ctx"] == "12288"
+    assert os.environ.get("COUNCIL_GGUF_N_CTX") == "12288"
+    assert os.environ.get("COUNCIL_GGUF_GPU_LAYERS") == "7"
+    assert os.environ.get("COUNCIL_EMBED_DEVICE") == "cpu"
+
+
 def test_the_tk_console_applies_them_through_the_same_function():
     """One rule for both front ends, so they cannot disagree about which
     value wins."""

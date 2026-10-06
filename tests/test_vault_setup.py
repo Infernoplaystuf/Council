@@ -220,14 +220,66 @@ def test_the_tk_engine_calls_the_same_functions():
     body = code_of(source, "_migrate_old_paths_to_vault")
     assert "vault_setup.migrate_legacy_paths(" in body
     assert "shutil.move" not in body, "Tk still has its own copy of the moves"
+    assert "vault_setup.prepare_data_dirs(" in code_of(source,
+                                                      "_prepare_data_dirs")
     console = next(node for node in ast.parse(source).body
                    if isinstance(node, ast.ClassDef)
                    and node.name == "CouncilConsole")
-    init = ast.unparse(next(node for node in console.body
-                            if isinstance(node, ast.FunctionDef)
-                            and node.name == "__init__"))
-    assert "vault_setup.prepare_data_dirs(" in init
-    assert "data_index.init_data_dirs(" not in init
+    init = next(node for node in console.body
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "__init__")
+    assert "data_index.init_data_dirs(" not in ast.unparse(init)
+    # A STATEMENT of __init__'s own body, not merely text somewhere in it:
+    # review wrapped the call in `if False:` and every test still passed.
+    direct = [ast.unparse(stmt) for stmt in init.body
+              if isinstance(stmt, ast.Expr)]
+    assert "_prepare_data_dirs()" in direct, (
+        "CouncilConsole.__init__ no longer runs the data-folder step "
+        "unconditionally")
+
+
+# ---- the Tk side, run (found in review: only its TEXT was checked) --------
+
+@pytest.fixture
+def tk_engine(tmp_path, monkeypatch):
+    """council_gui_engine, imported in the test sandbox (no migration at
+    import — tests/sandbox_vault.py), with every folder it moves between
+    pointed at THIS test's: APP_DIR, VAULT_DIR, and __file__, whose folder is
+    the repo root the Dream3D docs are moved out of — the real one is this
+    checkout, and a move out of it into a temp vault is a move into the bin."""
+    import council_gui_engine as cge
+
+    app, vault, repo = (tmp_path / "app", tmp_path / "vault",
+                        tmp_path / "repo")
+    for folder in (app, vault, repo):
+        folder.mkdir()
+    monkeypatch.setattr(cge, "APP_DIR", app)
+    monkeypatch.setattr(cge, "VAULT_DIR", vault)
+    monkeypatch.setattr(cge, "__file__", str(repo / "council_gui_engine.py"))
+    return cge, app, vault, repo
+
+
+def test_tk_moves_an_upgraders_files(tk_engine):
+    cge, app, vault, repo = tk_engine
+    (app / "node_registry.json").write_text('{"nodes": ["pi"]}',
+                                            encoding="utf-8")
+    (repo / "vault" / "dream3d_docs").mkdir(parents=True)
+    (repo / "vault" / "dream3d_docs" / "filters.md").write_text("docs")
+    cge._migrate_old_paths_to_vault()
+    assert (vault / "node_registry.json").read_text() == '{"nodes": ["pi"]}'
+    assert (vault / "dream3d_docs" / "filters.md").is_file()
+    assert not (app / "node_registry.json").exists()
+
+
+def test_tk_sets_up_the_data_folders(tk_engine):
+    cge, _app, vault, _repo = tk_engine
+    (vault / "orders.csv").write_text("id\n1\n", encoding="utf-8")
+    (vault / "model_slots.json").write_text("{}", encoding="utf-8")
+    cge._prepare_data_dirs()
+    assert (vault / "data_in" / "README.txt").is_file()
+    assert (vault / "data_out" / "README.txt").is_file()
+    assert (vault / "data_in" / "orders.csv").is_file()
+    assert not (vault / "data_in" / "model_slots.json").exists()
 
 
 def test_the_module_imports_no_toolkit():
