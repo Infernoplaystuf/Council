@@ -241,10 +241,15 @@ class Guard:
         if self._inside(c, self.read_only):
             self.refuse(what, f"{s} is an input, and inputs are read-only")
         if os.path.isdir(c):
-            if not mkdir and not self._own(c) and _has_entries(c):
-                self.refuse(what, f"{s} is a folder that already holds files "
-                                  f"this run did not make; a writer could "
-                                  f"replace them. Write into a new folder.")
+            if not mkdir and not self._own(c):
+                if _has_entries(c):
+                    self.refuse(what, f"{s} is a folder that already holds "
+                                      f"files this run did not make; a writer "
+                                      f"could replace them. Write into a new "
+                                      f"folder.")
+                # An empty folder holds nothing to lose: what this run
+                # writes into it is the run's own from here on.
+                self.created.add(c)
         elif os.path.lexists(c):
             if not self._own(c):
                 self.refuse(what, f"{s} already exists and this run did not "

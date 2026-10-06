@@ -294,13 +294,14 @@ def _run_pipeline_subprocess(
     guarded = model or _imports_simplnx(source)
     tmp: Optional[Path] = None
     report: Optional[Path] = None
+    made_cwd: Optional[Path] = None
     cmd = [python, "-u", str(pipeline_path)]
     env = None
     if guarded:
         if model and cwd is None:
             # Never the app's own folder: relative paths land somewhere
             # this run owns.
-            cwd = _default_output_dir()
+            cwd = made_cwd = _default_output_dir()
             cwd.mkdir(parents=True, exist_ok=True)
         own_roots = list(contain.own_roots) + ([Path(cwd)] if model else [])
         tmp = Path(tempfile.mkdtemp(prefix="nxguard_"))
@@ -366,6 +367,8 @@ def _run_pipeline_subprocess(
         base.duration_s = time.monotonic() - start
         if tmp is not None:
             shutil.rmtree(tmp, ignore_errors=True)
+        if made_cwd is not None:
+            _drop_if_empty(made_cwd)
     return base
 
 

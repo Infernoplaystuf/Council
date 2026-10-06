@@ -231,6 +231,35 @@ def test_the_model_rules_still_allow_a_real_pipeline():
     assert nx_policy.validate_script(code) == (True, [])
 
 
+def _shipped_root():
+    if not NXPY:
+        return None
+    env = Path(NXPY).parent
+    for cand in (env / "Library" / "share" / "simplnx" / "pipelines",
+                 env.parent / "share" / "simplnx" / "pipelines"):
+        if cand.is_dir():
+            return cand
+    return None
+
+
+@pytest.mark.skipif(_shipped_root() is None,
+                    reason="needs the nxpython env's shipped pipelines")
+def test_every_shipped_pipeline_transpiles_to_a_script_the_model_rules_take():
+    """A transpile saved in data_out is a MODEL script by location, so the
+    tighter rules must not refuse what the transpiler writes (67 shipped
+    pipelines on the installed build)."""
+    import nx_transpile
+    pipes = sorted(_shipped_root().rglob("*.d3dpipeline"))
+    assert pipes
+    refused = {}
+    for p in pipes:
+        ok, reasons = nx_policy.validate_script(
+            nx_transpile.transpile(p, REAL_CATALOG)["code"])
+        if not ok:
+            refused[p.name] = reasons[:2]
+    assert not refused, refused
+
+
 # ============================================================
 # 2. RUN TIME: nx_guard, past the static check
 # ============================================================
@@ -504,6 +533,44 @@ def test_the_desktop_unc_and_device_paths_are_outside(tmp_path):
             g.check_write(target, "test")
         assert time.perf_counter() - t0 < 1.0, f"{target} looked something up"
     assert not (Path.home() / "Desktop" / probe).exists()
+
+
+@windows_only
+def test_a_symlink_out_of_the_output_area_is_outside(tmp_path):
+    """A directory symlink needs a privilege (or Developer Mode); skipped
+    when this account cannot make one. The junction case runs always."""
+    v = Vault(tmp_path)
+    link = v.out / "sym"
+    try:
+        os.symlink(v.root, link, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"cannot make a symlink here: {exc}")
+    try:
+        g = nx_guard.Guard(v.policy(None))
+        with pytest.raises(nx_guard.Refused, match="outside the output area"):
+            g.check_write(link / "via_symlink.dream3d", "test")
+        with pytest.raises(nx_guard.Refused):
+            g.check_write(link / "notes.txt", "test")
+    finally:
+        os.rmdir(link)
+
+
+@needs_nx
+def test_every_installed_filter_is_wrapped():
+    """All 289 filters of the installed build (and IFilter.execute2 and
+    Pipeline.execute) go through the guard — the plugins' too."""
+    code = ("import sys\nsys.path.insert(0, %r)\nimport nx_guard\n"
+            "g = nx_guard.Guard({'trust': 'user'})\n"
+            "g.patch(nx_guard._import_modules(True, False))\n"
+            "names = sorted(c.__name__ for c in g.patched)\n"
+            "print(len(names), 'IFilter' in names, 'Pipeline' in names)\n"
+            % str(Path(wr.GUARD).parent))
+    proc = subprocess.run([NXPY, "-c", code], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=300)
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    n, has_base, has_pipe = proc.stdout.split()[-3:]
+    assert int(n) == len(REAL_CATALOG["filters"]) + 2      # + IFilter, Pipeline
+    assert has_base == "True" and has_pipe == "True"
 
 
 def test_path_role_finds_every_output_in_the_installed_catalog():
