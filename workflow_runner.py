@@ -281,8 +281,21 @@ def _stage_per_input_pipeline(
 # filters (see nx_worker.path_params). The INPUT is what a Read* filter reads;
 # the OUTPUT is what a Write* filter writes. Chaining rewrites A's output to a
 # staging file and then B's input to that same file.
+#
+# Checked 2026-10-06 against the installed catalog (289 filters): the single-
+# file readers' path parameters are file_path (inside ReadDREAM3DFilter's
+# ImportData), input_file (10 readers), input_file_path (2), stl_file_path
+# (ReadStlFileFilter), input_header_file (ReadBinaryCTNorthstarFilter) and
+# vg_header_file (ReadVolumeGraphicsFileFilter). The last three were missing,
+# and a missing name was not an error: the staged copy kept its baked-in path,
+# so a chain over two different .stl files reported success while BOTH runs
+# read the same file (measured with the shipped CreateScanVectors pipeline).
+# NOT "file_name": ITKImageReaderFilter reads from it, but ITKImageWriterFilter
+# WRITES to it, so a script with only the writer would have its output pointed
+# at the user's input file.
 _INPUT_PARAM_CANDIDATES = ("file_path", "input_file_path", "input_file",
-                           "import_file_path", "input_path")
+                           "import_file_path", "input_path", "stl_file_path",
+                           "input_header_file", "vg_header_file")
 _OUTPUT_PARAM_CANDIDATES = ("export_file_path", "output_file_path", "output_file",
                             "output_path", "write_file_path", "feature_data_file")
 
