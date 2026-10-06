@@ -855,6 +855,31 @@ def test_every_registered_tab_survives_being_shown(window, title, factory,
     assert widget.isVisible() or widget.isVisibleTo(window)
 
 
+#: The default tabs and the --advanced ones (Nodes is one of those).
+EVERY_TAB = REGISTERED + [(title, factory, eager) for title, factory, eager
+                          in tab_registry.ADVANCED_REGISTRY]
+
+
+@pytest.mark.parametrize("title,factory,eager", EVERY_TAB,
+                         ids=[title for title, _, _ in EVERY_TAB])
+def test_no_caption_on_a_tab_is_escaped_twice(window, title, factory, eager):
+    """ViewHelpers._button applies amp() itself, so a caller that ALSO wraps
+    the text shows a doubled ampersand: measured in review, the Council tab's
+    "📊 Find & Chart" rendered as "Find && Chart" (text() was "Find &&&&
+    Chart"), and Nodes' "Apply && Rebuild" went through the same path. Qt
+    shows "&&" as "&", so a caption holding "&&&&" is on screen as "&&"."""
+    from PySide6.QtWidgets import QAbstractButton, QGroupBox, QLabel
+
+    widget = _build_tab(window, factory)
+    doubled = [(type(w).__name__, w.text())
+               for kind in (QAbstractButton, QLabel)
+               for w in widget.findChildren(kind) if "&&&&" in w.text()]
+    doubled += [("QGroupBox", box.title())
+                for box in widget.findChildren(QGroupBox)
+                if "&&&&" in box.title()]
+    assert not doubled, f"{title}: captions escaped twice: {doubled}"
+
+
 @pytest.mark.parametrize("title,factory,eager", REGISTERED, ids=REGISTERED_IDS)
 def test_every_wired_name_on_a_tab_resolves(window, title, factory, eager):
     """Qt does not check a connect() target the way it cannot check a Tk

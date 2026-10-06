@@ -450,7 +450,9 @@ class CouncilTab(ViewHelpers, QWidget):
     def _action_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
         self.send_btn = self._button(row, "Send  [Ctrl+Enter]", self.on_send)
-        self.find_chart_btn = self._button(row, amp("📊 Find & Chart"),
+        # The bare caption: _button escapes it. Wrapped in amp() here too it
+        # rendered as "Find && Chart" (found in review).
+        self.find_chart_btn = self._button(row, "📊 Find & Chart",
                                            self.on_find_and_chart)
         self.look_up_btn = self._button(row, amp("🔍 Look Up"),
                                         self.on_look_up)

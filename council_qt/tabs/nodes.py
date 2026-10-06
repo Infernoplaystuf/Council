@@ -134,7 +134,9 @@ class NodesTab(ViewHelpers, QWidget):
         self.hosts_box.setPlaceholderText(
             "http://pi1:11434, http://pi2:11434")
         row.addWidget(self.hosts_box, 1)
-        self.apply_btn = self._button(row, amp("Apply && Rebuild"),
+        # The bare caption: _button escapes it. It was amp("Apply && …"),
+        # escaped twice on top of a hand-escaped "&&", and showed "&&&&".
+        self.apply_btn = self._button(row, "Apply & Rebuild",
                                       self.on_apply)
         self._button(row, amp("Refresh Now"), lambda: self.refresh(force=True))
         outer.addLayout(row)
