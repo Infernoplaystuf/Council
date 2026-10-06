@@ -1308,10 +1308,13 @@ def test_a_setting_of_the_preset_the_camera_no_longer_lists_is_a_difference(
 def test_a_slow_read_of_the_camera_at_start_is_not_capture_time(
         tmp_path, monkeypatch):
     """The record's read of every setting happens BEFORE the recorder is
-    switched on (d1b7418): on an event camera, whose stream already runs,
-    a slow node-map read after the switch made its frames part of the
-    run."""
+    switched on (d1b7418): an EVK4's stream is left running through Start
+    (EvkDevice.restartable), so a slow node-map read after the switch made
+    its frames part of the run. The simulated event camera restarts its
+    stream like a frame camera — where the read comes then makes no
+    difference — so here it keeps it running, as the EVK4 does."""
     connected("event")
+    monkeypatch.setattr(device(), "restartable", False, raising=False)
     ticks(Viewer(), 0.3)
     real = frame_camera.settings_list
 
