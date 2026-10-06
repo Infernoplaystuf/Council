@@ -39,6 +39,19 @@ class StubActions(ConnectionsActions):
     def open_file(self, rel_path):
         self.opened.append(rel_path)
 
+    def local_models(self):
+        return ["llama3.1:8b", "granite3.3:8b"]
+
+    def pi_workers(self):
+        return []
+
+    def suggest(self, model, use_pis, on_progress, should_stop):
+        from tests.test_kg_suggest import oracle
+        with self.open_graph() as kg:
+            return kg.suggest_from_text({f"this PC ({model})": oracle()},
+                                        model=f"extract:{model}", on_progress=on_progress,
+                                        should_stop=should_stop)
+
 
 @pytest.fixture(scope="module")
 def qapp():
@@ -256,3 +269,40 @@ def test_phrases_and_names():
     ent = {"type": "PROJECT", "name": "PRJ-0915",
            "aliases": ["PRJ-0915", "Helios", "Helios Turbine Upgrade"]}
     assert display_name(ent) == "PRJ-0915 — Helios Turbine Upgrade"
+
+
+def test_model_suggestions_arrive_as_suggested_links(qapp, tab):
+    _rebuilt(qapp, tab)
+    assert tab.model_box.currentData() == "llama3.1:8b"
+    assert not tab.pis_box.isEnabled()                     # no Pi nodes registered
+    tab.on_suggest()
+    drive(qapp, tab)
+    assert "link(s) suggested" in tab.status.text()
+    tab.search.setText("BRG-7720")
+    tab.results.setCurrentRow(0)
+    used_in = next(i for d, t, s, w, i in _items(tab.tree) if d == 1 and "PRJ-0915" in t)
+    assert used_in.text(1) == "suggested"
+    ev = used_in.child(0)
+    assert ev.text(1) == "model" and "helios_status_2026-03.md · line 11" in ev.text(2)
+    tab.tree.setCurrentItem(used_in)
+    assert tab.accept_btn.isEnabled()
+    tab.accept_btn.click()
+    with kgm.KnowledgeGraph(tab.actions.vault_dir) as kg:
+        st = {r["status"] for r in kg.all_relations()
+              if r["object"]["name"] == "BRG-7720" and r["subject"]["name"] == "PRJ-0915"}
+    assert st == {"accepted"}
+
+
+def test_suggest_runs_off_the_gui_thread_and_can_stop(qapp, tab, monkeypatch):
+    _rebuilt(qapp, tab)
+    seen = []
+    real = tab.actions.suggest
+
+    def spy(model, use_pis, on_progress, should_stop):
+        seen.append(threading.current_thread() is threading.main_thread())
+        tab._stop.set()                     # as if Stop were pressed at once
+        return real(model, use_pis, on_progress, should_stop)
+    monkeypatch.setattr(tab.actions, "suggest", spy)
+    tab.on_suggest()
+    drive(qapp, tab)
+    assert seen == [False] and "Stopped" in tab.status.text()

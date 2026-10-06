@@ -59,7 +59,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 STORE_DIR = ".knowledge_graph"
 STORE_NAME = "graph.sqlite"
 
@@ -137,6 +137,14 @@ CREATE TABLE IF NOT EXISTS field_rules (
 CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY, kind TEXT NOT NULL, started_ts REAL NOT NULL,
     finished_ts REAL, stats TEXT
+);
+-- v2: free-text extraction progress, so a stopped run resumes and an edited
+-- document is read again (content_hash differs).
+CREATE TABLE IF NOT EXISTS extraction_done (
+    document_id TEXT NOT NULL, content_hash TEXT NOT NULL, chunk INTEGER NOT NULL,
+    model TEXT NOT NULL, ts REAL NOT NULL, links INTEGER NOT NULL,
+    error TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (document_id, content_hash, chunk, model)
 );
 """
 
@@ -496,6 +504,10 @@ class KnowledgeGraph:
                 self.db.executescript(SCHEMA_SQL)
                 self.db.execute("INSERT OR IGNORE INTO meta VALUES "
                                 "('schema_version', ?)", (str(SCHEMA_VERSION),))
+                # v1 -> v2 only ADDS a table (created above); record it.
+                self.db.execute("UPDATE meta SET value=? WHERE key='schema_version'"
+                                " AND CAST(value AS INTEGER) < ?",
+                                (str(SCHEMA_VERSION), SCHEMA_VERSION))
                 for r in DEFAULT_FIELD_RULES:
                     self.db.execute("INSERT OR IGNORE INTO field_rules VALUES "
                                     "(?, ?, 'proposed')", (r.label, r.to_json()))
@@ -779,6 +791,11 @@ class KnowledgeGraph:
                     self.db.execute("UPDATE documents SET status='missing' WHERE id=?",
                                     (r["id"],))
             stats["records"] = len(records)
+            # A model's evidence stays across rebuilds (it cost GPU time) —
+            # unless its document changed since; then it is stale and goes.
+            self.db.execute(
+                "DELETE FROM evidence WHERE method='model' AND content_hash !="
+                " (SELECT content_hash FROM documents d WHERE d.id=evidence.document_id)")
             self._seed_records(records, run_id)
             if use_collections:
                 stats["collections"] = self._seed_collections(run_id)
@@ -1052,6 +1069,182 @@ class KnowledgeGraph:
                         self._review("ambiguous_name", m.group(0), cands, did, loc,
                                      _snip(text), run_id)
         return n
+
+    # ── free-text extraction (KG2) ──
+    def text_chunks(self, max_lines: int = 40, overlap: int = 5
+                    ) -> List[Dict[str, Any]]:
+        """Every text chunk worth a model call: a PDF page, or ~40 lines with
+        a small overlap, that mentions at least TWO known entities (the
+        gazetteer and labelled-field mentions say which). Tables are skipped
+        — their links come from labelled columns."""
+        out: List[Dict[str, Any]] = []
+        docs = self.db.execute("SELECT id, path, content_hash FROM documents WHERE status='ok'"
+                               " ORDER BY path").fetchall()
+        project_terms = self._project_terms()
+        for d in docs:
+            p = self.root / d["path"]
+            if p.suffix.lower() in _TABULAR or p.suffix.lower() in _JSON:
+                continue
+            try:
+                lines = document_lines(p)
+            except Exception:
+                continue
+            ments = self.db.execute(
+                "SELECT entity_id, locator FROM mentions WHERE document_id=?", (d["id"],)).fetchall()
+            by_spot: Dict[Tuple[Optional[int], int], set] = {}
+            for m in ments:
+                loc = json.loads(m["locator"])
+                if loc.get("line"):
+                    by_spot.setdefault((loc.get("page"), int(loc["line"])), set()).add(m["entity_id"])
+            # Everything tied to the document — mentioned anywhere in it, or
+            # the project of its Collection — is offered to the model too: a
+            # one-word name ('the Helios rig') is not searched for (too noisy),
+            # yet it is exactly how prose names a project.
+            doc_ents = {m["entity_id"] for m in ments}
+            doc_ents |= {r["subject_id"] for r in self.db.execute(
+                "SELECT subject_id FROM relations WHERE predicate='DOCUMENTED_IN' AND object_id=?",
+                (d["id"],))}
+            groups: Dict[Optional[int], List[Tuple[int, str]]] = {}
+            for page, line, text in lines:
+                groups.setdefault(page, []).append((line, text))
+            n = 0
+            for page, plines in groups.items():
+                step = max(1, max_lines - overlap)
+                for start in range(0, max(1, len(plines)), step):
+                    window = plines[start:start + max_lines]
+                    if not window:
+                        break
+                    ents = set()
+                    for line, _t in window:
+                        ents |= by_spot.get((page, line), set())
+                    wtext = "\n".join(t for _l, t in window)
+                    named_projects = {pid for rx, pid in project_terms if rx.search(wtext)}
+                    if len(ents) >= 2 or (ents and named_projects - ents):
+                        ents |= named_projects
+                        out.append({"document_id": d["id"], "path": d["path"],
+                                    "content_hash": d["content_hash"], "chunk": n,
+                                    "page": page, "first_line": window[0][0],
+                                    "text": "\n".join(t for _l, t in window),
+                                    # the chunk's own entities first
+                                    "entities": (sorted(ents) + sorted(doc_ents - ents))[:60]})
+                    n += 1
+                    if start + max_lines >= len(plines):
+                        break
+        return out
+
+    _COMMON_FIRST_WORDS = {"project", "program", "programme", "the", "new", "phase",
+                           "test", "line", "pump", "turbine", "upgrade", "retrofit"}
+
+    def _project_terms(self) -> List[Tuple["re.Pattern", str]]:
+        """Projects by every alias, ONE-WORD ones included, plus the
+        distinctive first word of a multi-word name ('Atlas' of 'Atlas Test
+        Rig'): prose names projects that way. These only OFFER a project to
+        the model — the checks decide what survives; a one-word MENTION
+        would be too noisy, so the gazetteer does not do this."""
+        terms, seen = [], set()
+        for r in self.db.execute(
+                "SELECT a.entity_id, a.alias FROM aliases a JOIN entities e ON"
+                " e.id=a.entity_id WHERE e.type='PROJECT' AND e.merged_into IS NULL"):
+            words = [r["alias"]]
+            first = r["alias"].split()[0] if " " in r["alias"] else ""
+            if (len(first) >= 5 and first[:1].isupper()
+                    and first.lower() not in self._COMMON_FIRST_WORDS):
+                words.append(first)
+            for w in words:
+                if len(w) >= 4 and (w.lower(), r["entity_id"]) not in seen:
+                    seen.add((w.lower(), r["entity_id"]))
+                    terms.append((_term_re(w), r["entity_id"]))
+        return terms
+
+    def known_entities(self, ids: Iterable[str]):
+        """kg_extract.Known for these entity ids (merged ones resolved)."""
+        from council_core import kg_extract as kx
+        out = []
+        for eid in dict.fromkeys(self.resolve(i) for i in ids):
+            e = self.entity(eid)
+            if e and e["type"] in ("PERSON", "PART", "PROJECT"):
+                out.append(kx.Known(eid, e["type"], e["name"], list(e["aliases"])))
+        return out
+
+    def suggest_from_text(self, workers: Dict[str, Any], *, model: str,
+                          on_progress=None, should_stop=lambda: False,
+                          only_new: bool = True) -> Dict[str, Any]:
+        """Ask a model for links in the free text; every surviving link lands
+        as SUGGESTED (method 'model', the model's name, the quote, the line
+        the Council found). ``workers`` maps a worker name ('this PC',
+        'NodePrimus'…) to a kg_extract chat function; chunks are shared out
+        through one queue and the results written here, by one thread.
+        Resumable: chunks done for this document version and model are
+        skipped. ``should_stop()`` pauses after the chunks in flight."""
+        import queue as _queue
+        import threading as _threading
+        from council_core import kg_extract as kx
+
+        run_id = str(uuid.uuid4())
+        todo = []
+        for c in self.text_chunks():
+            done = self.db.execute(
+                "SELECT 1 FROM extraction_done WHERE document_id=? AND content_hash=? AND"
+                " chunk=? AND model=?",
+                (c["document_id"], c["content_hash"], c["chunk"], model)).fetchone()
+            if not (only_new and done):
+                c["known"] = self.known_entities(c["entities"])
+                todo.append(c)
+        stats = {"chunks": len(todo), "done": 0, "links": 0, "rejected": 0, "errors": 0,
+                 "stopped": False, "by_worker": {}}
+        with self.db:
+            self.db.execute("INSERT INTO runs (id, kind, started_ts) VALUES (?,?,?)",
+                            (run_id, f"extract:{model}", time.time()))
+        jobs: "_queue.Queue" = _queue.Queue()
+        for c in todo:
+            jobs.put(c)
+        results: "_queue.Queue" = _queue.Queue()
+
+        def work(name, chat):
+            while not should_stop():
+                try:
+                    c = jobs.get_nowait()
+                except _queue.Empty:
+                    return
+                res = kx.extract(c["text"], c["known"], chat)
+                results.put((name, c, res))
+
+        threads = [_threading.Thread(target=work, args=(n, ch), name=f"kg-extract-{n}",
+                                     daemon=True) for n, ch in workers.items()]
+        for t in threads:
+            t.start()
+        while any(t.is_alive() for t in threads) or not results.empty():
+            try:
+                name, c, res = results.get(timeout=0.2)
+            except _queue.Empty:
+                continue
+            with self.db:
+                for link in res.links:
+                    line = (c["first_line"] + (link.line or 1) - 1)
+                    loc = {"line": line}
+                    if c["page"] is not None:
+                        loc["page"] = c["page"]
+                    quote = link.quote + (f"  [{link.fixed}]" if link.fixed else "")
+                    self._relate(link.subject, link.predicate, link.object, "suggested",
+                                 doc_id=c["document_id"], content_hash=c["content_hash"],
+                                 locator=loc, quote=quote, method="model", run_id=run_id,
+                                 model=f"{model} @ {name}")
+                self.db.execute(
+                    "INSERT OR REPLACE INTO extraction_done VALUES (?,?,?,?,?,?,?)",
+                    (c["document_id"], c["content_hash"], c["chunk"], model, time.time(),
+                     len(res.links), res.error))
+            stats["done"] += 1
+            stats["links"] += len(res.links)
+            stats["rejected"] += len(res.rejected)
+            stats["errors"] += bool(res.error)
+            stats["by_worker"][name] = stats["by_worker"].get(name, 0) + 1
+            if on_progress:
+                on_progress(stats["done"], stats["chunks"], name)
+        stats["stopped"] = stats["done"] < stats["chunks"]
+        with self.db:
+            self.db.execute("UPDATE runs SET finished_ts=?, stats=? WHERE id=?",
+                            (time.time(), json.dumps(stats), run_id))
+        return stats
 
     # ── reading the graph ──
     def counts(self) -> Dict[str, Any]:

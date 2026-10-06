@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont
-from PySide6.QtWidgets import (QComboBox, QDialog, QHBoxLayout, QLabel,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem,
                                QPlainTextEdit, QSplitter, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
@@ -97,6 +97,45 @@ class ConnectionsActions:
     def context(self, rel_path: str, locator: Any):
         return kgm.source_context(self.root, rel_path, locator)
 
+    # -- free-text suggestions (KG2) --
+    def local_models(self) -> List[str]:
+        """US-origin models installed in this PC's Ollama, extractor first."""
+        from council_core import kg_extract as kx
+        from council_core.pi_setup import pi_models
+        try:
+            import council_engine as ce
+            tags = ce._ollama_tags("http://127.0.0.1:11434") or {}
+        except Exception:
+            tags = {}
+        names = [m.get("name", "") for m in tags.get("models", [])]
+        names = sorted(n for n in names if n and pi_models.is_us_origin(n))
+        best = kx.DEFAULT_EXTRACTOR
+        return ([best] if best in names else []) + [n for n in names if n != best]
+
+    def pi_workers(self) -> List[tuple]:
+        """(name, host url, model) of registered Pi nodes — only when remote
+        nodes are enabled (COUNCIL_REMOTE_NODES=1), the engine's own opt-in."""
+        try:
+            import council_engine as ce
+            if not ce._remote_nodes_enabled():
+                return []
+            from council_core import apothecary as apoth
+            reg = apoth._ae.NodeRegistry(str(apoth.registry_path(self.vault_dir)))
+            return [(n.name, f"http://{n.host}:{n.ollama_port}", n.model or n.active_model)
+                    for n in reg.list_nodes() if (n.model or n.active_model)]
+        except Exception:
+            return []
+
+    def suggest(self, model: str, use_pis: bool, on_progress, should_stop):
+        from council_core import kg_extract as kx
+        workers = {f"this PC ({model})": kx.ollama_chat(model)}
+        if use_pis:
+            for name, url, pmodel in self.pi_workers():
+                workers[f"{name} ({pmodel})"] = kx.ollama_chat(pmodel, host=url)
+        with self.open_graph() as kg:
+            return kg.suggest_from_text(workers, model=f"extract:{model}",
+                                        on_progress=on_progress, should_stop=should_stop)
+
     def open_file(self, rel_path: str) -> None:
         from .vault import VaultActions
         VaultActions(self.vault_dir).open_folder(self.root / rel_path)
@@ -116,10 +155,12 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self._kg: Optional[kgm.KnowledgeGraph] = None
         self._current: Optional[str] = None
         self._selected: Optional[Dict[str, Any]] = None
+        self._stop = threading.Event()
         self._build()
         if auto_refresh:
             self._reopen()
             self.on_search()
+            self.refresh_models()
 
     # ------------------------------------------------------------------
     def _build(self) -> None:
@@ -140,6 +181,17 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.fields_btn = self._button(row, "Fields…", self.on_fields)
         self.questions_btn = self._button(row, "Questions", self.on_questions)
         outer.addLayout(row)
+
+        srow = QHBoxLayout()
+        srow.addWidget(QLabel("Suggest links from free text with"))
+        self.model_box = QComboBox()
+        srow.addWidget(self.model_box, 1)
+        self.pis_box = QCheckBox("and my Pi nodes")
+        srow.addWidget(self.pis_box)
+        self.suggest_btn = self._button(srow, "Suggest links", self.on_suggest)
+        self.stop_btn = self._button(srow, "Stop", self.on_stop_suggest)
+        self.stop_btn.setEnabled(False)
+        outer.addLayout(srow)
 
         self.status = QLabel("")
         self.status.setWordWrap(True)
@@ -419,6 +471,69 @@ class ConnectionsTab(ViewHelpers, QWidget):
             return
         self.status.setText(f"Rebuilt from {stats['documents']} document(s) in "
                             f"{stats.get('seconds', 0):.1f} s.")
+        self.on_search()
+        if self._current:
+            self.show_entity(self._current)
+
+    def refresh_models(self) -> None:
+        self.model_box.clear()
+        for m in self.actions.local_models():
+            self.model_box.addItem(m, m)
+        pis = self.actions.pi_workers()
+        self.pis_box.setEnabled(bool(pis))
+        self.pis_box.setToolTip(
+            ", ".join(f"{n} ({m})" for n, _u, m in pis) if pis else
+            "No Pi nodes to share the work: register one (Apothecary → Set up a Pi) "
+            "and enable remote nodes (COUNCIL_REMOTE_NODES=1).")
+        self.suggest_btn.setEnabled(self.model_box.count() > 0)
+
+    def on_suggest(self) -> None:
+        """Ask the chosen model (and Pis, if ticked) for links in the free
+        text. Everything it finds lands as 'suggested' for you to accept."""
+        model = self.model_box.currentData()
+        if self._busy or not model:
+            return
+        self._busy = True
+        self._stop.clear()
+        self.suggest_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        use_pis = self.pis_box.isChecked()
+        self.status.setText(f"Reading free text with {model}…")
+        if self._kg is not None:
+            self._kg.close()
+            self._kg = None
+
+        def progress(done, total, worker):
+            self._to_ui(self.status.setText,
+                        f"Suggesting links: {done} of {total} passages (last by {worker})")
+
+        def work() -> None:
+            try:
+                stats = self.actions.suggest(model, use_pis, progress, self._stop.is_set)
+                self._to_ui(self._suggested, stats, None)
+            except Exception as exc:                      # noqa: BLE001
+                self._to_ui(self._suggested, None, exc)
+
+        threading.Thread(target=work, name="kg-suggest", daemon=True).start()
+
+    def on_stop_suggest(self) -> None:
+        self._stop.set()
+        self.status.setText("Stopping after the passages in progress — run again to continue.")
+
+    def _suggested(self, stats, exc) -> None:
+        self._busy = False
+        self.suggest_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self._reopen()
+        if exc is not None:
+            self.status.setText(f"Suggesting failed: {exc}")
+            return
+        word = "Stopped" if stats["stopped"] else "Done"
+        self.status.setText(
+            f"{word}: {stats['done']} of {stats['chunks']} passages read, {stats['links']} "
+            f"link(s) suggested, {stats['rejected']} rejected by the checks"
+            + (f", {stats['errors']} unreadable answer(s)" if stats["errors"] else "")
+            + ". Suggested links wait for you (✓ Accept / ✗ Reject).")
         self.on_search()
         if self._current:
             self.show_entity(self._current)
