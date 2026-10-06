@@ -25,11 +25,13 @@ import contextlib
 import io
 import socket
 import sys
+import time
 from types import SimpleNamespace
 
 import pytest
 
 from tests.fake_ollama import FakeOllama, loopback_alias, refuse_egress, tag
+from tests.test_llm_engine import MSGS, _slots, eng, fake  # noqa: F401
 
 SENTINEL = "SENTINEL-7f3a-this-must-not-leave-the-pc"
 MEMBERS = ("writer", "peasant", "coder", "sage")
@@ -85,9 +87,10 @@ def _council(env, monkeypatch, label):
     ce = env.ce
     monkeypatch.setattr(ce, "DEFAULT_MODELS",
                         {slot: label for slot in ce._ROLE_SLOTS})
+    env.dispatcher = ce.build_dispatcher()
     return ce.build_personalities(pins={}, vault_dir=env.vault,
                                   session_id="t", trace=False,
-                                  dispatcher=ce.build_dispatcher())
+                                  dispatcher=env.dispatcher)
 
 
 def _chats(server):
@@ -252,6 +255,196 @@ def test_a_member_whose_node_dies_mid_answer_answers_locally(
     assert out == "LOCAL ANSWER"                       # not "Answered"
     assert nodes.pi.state.dropped == 1
     assert len(nodes.local) == 1
+
+
+def _local_that_streams(env):
+    """The member's local path, streaming its answer the way _route_chat
+    does when it is given a token_callback."""
+    def answer(messages, token_callback=None, **_kw):
+        env.local.append(messages)
+        for tok in ("LOCAL ", "ANSWER"):
+            if token_callback is not None:
+                token_callback(tok)
+        return "LOCAL ANSWER"
+    return answer
+
+
+def _shown(tokens):
+    """What a stream box shows: every token but the \\x00 sentinels."""
+    return "".join(t for t in tokens if not t.startswith("\x00"))
+
+
+def test_a_streamed_answer_the_node_cut_off_is_marked_before_the_local_one(
+        nodes, monkeypatch):
+    """The node streams "Answ", "ered" and closes; the member answers
+    locally. The stream box used to show "AnsweredLOCAL ANSWER" — two
+    answers glued into one with nothing to say so. The switch is now named
+    in the stream; the returned text (the transcript's) is the local one."""
+    monkeypatch.setattr(nodes.ce, "_route_chat", _local_that_streams(nodes))
+    nodes.pi.state.drop_after = 2
+    members = _council(nodes, monkeypatch, "ollama:llama3.2:3b")
+    tokens = []
+    out = members["writer"].respond(f"Plan it. {SENTINEL}",
+                                    token_callback=tokens.append)
+    assert out == "LOCAL ANSWER"
+    shown = _shown(tokens)
+    assert shown.startswith("Answered")
+    assert shown.endswith("LOCAL ANSWER")
+    notice = shown[len("Answered"):-len("LOCAL ANSWER")]
+    assert nodes.pi.url in notice and "this PC" in notice, shown
+    assert len(nodes.local) == 1
+
+
+def test_a_node_that_fails_before_its_first_token_leaves_the_stream_clean(
+        nodes, monkeypatch):
+    """Nothing reached the stream box from the node, so there is nothing to
+    explain: the box shows the local answer alone."""
+    monkeypatch.setattr(nodes.ce, "_route_chat", _local_that_streams(nodes))
+    nodes.pi.state.chat_error = (500, "model requires more system memory")
+    members = _council(nodes, monkeypatch, "ollama:llama3.2:3b")
+    tokens = []
+    out = members["writer"].respond(f"Plan it. {SENTINEL}",
+                                    token_callback=tokens.append)
+    assert out == "LOCAL ANSWER"
+    assert _shown(tokens) == "LOCAL ANSWER"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_this_pcs_ollama_closing_mid_answer_is_an_error_too(eng, stream):
+    """The per-role path (local_chat -> _ollama_local) had the same hole
+    as the node path: a localhost Ollama that closed the stream without its
+    final packet (crashed, restarted, killed by the user) returned the half
+    that had arrived — "The comp" — as the role's whole answer."""
+    eng.fake.state.reply = "The complete local answer, many chunks long."
+    eng.fake.state.drop_after = 2
+    _slots(eng, {"a": {"path": "ollama:llama3.1:8b"}}, {"writer": "a"})
+    got = []
+    with pytest.raises(RuntimeError, match="final packet"):
+        if stream:
+            eng.ce._route_chat(MSGS, slot=eng.ce._slot_for_role("writer"),
+                               role="writer", temperature=0.2,
+                               num_predict=50, token_callback=got.append)
+        else:
+            eng.ce.local_chat(MSGS, role="writer", num_predict=50)
+    assert eng.fake.state.dropped == 1
+    assert len(eng.fake.state.chats) == 1                # not re-sent
+
+
+# ============================================================
+# A node that does not answer, or keeps failing
+# ============================================================
+
+def test_a_node_that_does_not_start_answering_is_given_up_on_at_its_limit(
+        nodes, monkeypatch):
+    """COUNCIL_NODE_FIRST_REPLY_S is the node path's own first-reply limit,
+    taken as given. COUNCIL_OLLAMA_LOAD_TIMEOUT could not shorten it: the
+    wait was max(stall timeout, allowance), never under 120 s (150 s
+    streaming), 300 s by default — a member held that long by a node that
+    accepted the connection and said nothing (measured: 300.2 s)."""
+    monkeypatch.setenv("COUNCIL_NODE_FIRST_REPLY_S", "1")
+    nodes.pi.state.first_delay = 8
+    members = _council(nodes, monkeypatch, "ollama:llama3.2:3b")
+    t0 = time.monotonic()
+    out = members["writer"].respond(f"Plan it. {SENTINEL}")
+    took = time.monotonic() - t0
+    assert out == "LOCAL ANSWER"
+    assert took < 6, f"held for {took:.1f} s"
+    assert len(nodes.pi.state.chats) == 1                 # sent once
+
+
+@pytest.mark.parametrize("raw,want", [("", None), ("garbage", None),
+                                      ("0", None), ("-5", None),
+                                      ("45", 45.0), ("2.5", 2.5)])
+def test_the_first_reply_limit_unset_means_the_engines_own(raw, want,
+                                                           monkeypatch):
+    """Unset (or unusable) keeps the localhost rule — the stall timeout or
+    the 300 s load allowance, whichever is longer: a Pi 5 reading a 4k-token
+    council prompt needs minutes before its first token
+    (docs/specialized_nodes.md section 2)."""
+    import council_engine as ce
+    monkeypatch.setenv("COUNCIL_NODE_FIRST_REPLY_S", raw)
+    assert ce._node_first_reply_s() == want
+
+
+def test_a_node_connection_gets_a_short_connect_timeout(nodes, monkeypatch):
+    """The connect used the read timeout — first-reply limit + 30 s, 330 s
+    — so a node that went off between the probe and the call held the
+    member until the OS gave up. A LAN connect takes milliseconds."""
+    ce, pi = nodes.ce, nodes.pi
+    port = int(pi.url.rsplit(":", 1)[1])
+    seen = []
+    guarded = socket.create_connection           # refuse_egress's guard
+
+    def spy(address, timeout=None, *a, **kw):
+        seen.append((address, timeout))
+        return guarded(address, timeout, *a, **kw)
+
+    monkeypatch.setattr(socket, "create_connection", spy)
+    out = ce._ollama_chat(pi.url, "llama3.2:3b", _msgs(), temperature=0.2,
+                          num_predict=20, allow_remote=True)
+    assert out == "Answered on the pi."
+    assert [t for (a, t) in seen if a[1] == port] == [5.0]
+    monkeypatch.setenv("COUNCIL_NODE_CONNECT_TIMEOUT", "2")
+    seen.clear()
+    ce._ollama_chat(pi.url, "llama3.2:3b", _msgs(), temperature=0.2,
+                    num_predict=20, allow_remote=True)
+    assert [t for (a, t) in seen if a[1] == port] == [2.0]
+
+
+def test_a_node_that_just_failed_is_not_sent_the_next_members_prompt(
+        nodes, monkeypatch):
+    """Measured before: the node answered every chat with HTTP 500, and
+    writer, peasant and coder each sent it the full prompt in turn, then
+    answered locally — three prompts out, three failures. A failure now
+    rests the node (30 s, doubling to 5 min) before it is asked again."""
+    nodes.pi.state.chat_error = (500, "model requires more system memory")
+    members = _council(nodes, monkeypatch, "ollama:llama3.2:3b")
+    for role in ("writer", "peasant", "coder"):
+        assert members[role].respond(f"Plan it. {SENTINEL}") == "LOCAL ANSWER"
+    assert len(nodes.pi.state.chats) == 1
+    assert len(nodes.local) == 3
+
+
+def test_the_rest_after_a_failure_ends_doubles_and_resets(nodes):
+    ce, here, pi = nodes.ce, nodes.here, nodes.pi
+    disp = ce.LoadAwareDispatcher([here.url, pi.url])
+    now = [1000.0]
+    disp.clock = lambda: now[0]
+    assert disp.best_host_for("llama3.2:3b") == pi.url
+    disp.mark_failed(pi.url)                      # rests 30 s
+    assert disp.best_host_for("llama3.2:3b") is None   # only the pi has it
+    now[0] += 31
+    assert disp.best_host_for("llama3.2:3b") == pi.url
+    disp.mark_failed(pi.url)                      # again: 60 s
+    now[0] += 31
+    assert disp.best_host_for("llama3.2:3b") is None
+    now[0] += 30
+    assert disp.best_host_for("llama3.2:3b") == pi.url
+    for _ in range(10):                           # capped at 5 minutes
+        disp.mark_failed(pi.url)
+    now[0] += 299
+    assert disp.best_host_for("llama3.2:3b") is None
+    now[0] += 2
+    assert disp.best_host_for("llama3.2:3b") == pi.url
+    disp.mark_ok(pi.url)                          # a success forgets it
+    disp.mark_failed(pi.url)
+    now[0] += 31
+    assert disp.best_host_for("llama3.2:3b") == pi.url
+
+
+def test_a_member_that_succeeds_on_the_node_clears_its_rest(nodes,
+                                                           monkeypatch):
+    members = _council(nodes, monkeypatch, "ollama:llama3.2:3b")
+    disp = nodes.dispatcher
+    nodes.pi.state.chat_error = (500, "busy")
+    assert members["writer"].respond(f"Plan it. {SENTINEL}") == "LOCAL ANSWER"
+    assert disp.cooling_down(nodes.pi.url)
+    later = time.monotonic() + 31
+    disp.clock = lambda: later
+    nodes.pi.state.chat_error = None
+    assert members["peasant"].respond(
+        f"Plan it. {SENTINEL}") == "Answered on the pi."
+    assert not disp.cooling_down(nodes.pi.url)
 
 
 # ============================================================

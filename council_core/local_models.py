@@ -116,6 +116,36 @@ def require_local(url: str, *, allow_remote: bool = False) -> None:
             "Only a localhost Ollama is used unless remote nodes are enabled.")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 3xx is an error, not a hop. Ollama never redirects, and whatever
+    else answers on a loopback port could point the call at another
+    machine — urllib would re-send the request there."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None          # -> the default handler raises HTTPError
+
+
+#: The opener for every call to a model server: NO proxy, NO redirects.
+#: urllib.request.urlopen asks for a proxy on every call — HTTP_PROXY, or on
+#: Windows the system proxy, whose "bypass for local addresses" exempts
+#: "localhost" but not "127.0.0.1" — and then opens the connection to the
+#: PROXY and hands it the request. So a URL the loopback guard approved still
+#: left the PC: measured 2026-10-05 with a recording proxy, it got the whole
+#: /api/chat body from llm_bench and /api/version, /api/tags and /api/show
+#: from here (and, unable to reach its own 127.0.0.1, answered 502, so the
+#: app said "No Ollama server answers" with Ollama up). The chat stream in
+#: council_engine is http.client, which never used a proxy.
+_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                      _NoRedirect())
+
+
+def open_direct(req: Any, timeout: float):
+    """urllib.request.urlopen(req, timeout=timeout) without proxies or
+    redirects — for this PC's Ollama and for nodes the user listed, which
+    the chat itself (http.client) also reaches directly."""
+    return _DIRECT.open(req, timeout=timeout)
+
+
 # ============================================================
 # Ollama metadata (never /api/chat or /api/generate here)
 # ============================================================
@@ -138,7 +168,7 @@ def _get_json(url: str, timeout: float, body: Optional[dict] = None) -> Any:
     req = urllib.request.Request(
         url, data=data, method="GET" if body is None else "POST",
         headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with open_direct(req, timeout) as resp:
         return json.loads(resp.read().decode("utf-8", errors="replace"))
 
 

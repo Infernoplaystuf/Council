@@ -3123,6 +3123,8 @@ def _ollama_stream(host: str, name: str, messages: List[Dict[str, Any]], *,
                    token_callback: Optional[Callable[[str], None]] = None,
                    tools: Optional[List[Dict[str, Any]]] = None,
                    think: Any = None,
+                   first_reply: Optional[float] = None,
+                   connect_timeout: Optional[float] = None,
                    ) -> Tuple[str, Dict[str, Any], List[Dict[str, Any]]]:
     """One streamed /api/chat call: (text, stats, tool_calls).
 
@@ -3132,6 +3134,11 @@ def _ollama_stream(host: str, name: str, messages: List[Dict[str, Any]], *,
     the first token). Stopping CLOSES the connection, which makes Ollama
     abandon the generation — nothing is ever re-sent: the old client retried
     a timed-out request whole while the server was still running the first.
+
+    ``first_reply`` replaces the wait for the first line (normally the stall
+    timeout or the load allowance, whichever is longer), taken as given —
+    the node path's own limit. ``connect_timeout`` bounds the TCP connect
+    alone; the socket then gets the read timeout. Both None: as on localhost.
     """
     import http.client
     import queue
@@ -3179,6 +3186,13 @@ def _ollama_stream(host: str, name: str, messages: List[Dict[str, Any]], *,
     # timeouts of council_gui_engine's callers). The GGUF path does not count
     # its load or prefill either. Stop still works throughout.
     first_wait = max(stall, _ollama_load_allowance()) if stall else None
+    if first_reply is not None:
+        first_wait = float(first_reply)
+    # The socket's own timeout is a backstop behind the poll loop's limits,
+    # so it must outlast the longer of them (a first_reply can be shorter
+    # than the stall limit that applies once tokens flow).
+    longest = max((w for w in (first_wait, stall) if w), default=None)
+    read_timeout = (longest + 30.0) if longest else None
     q: "queue.Queue" = queue.Queue()
     box: Dict[str, Any] = {"conn": None}
     t_start = _time.monotonic()
@@ -3189,13 +3203,15 @@ def _ollama_stream(host: str, name: str, messages: List[Dict[str, Any]], *,
             cls = (http.client.HTTPSConnection if u.scheme == "https"
                    else http.client.HTTPConnection)
             conn = cls(u.hostname, u.port,
-                       timeout=(first_wait + 30.0) if first_wait else None)
+                       timeout=connect_timeout or read_timeout)
             box["conn"] = conn
             # Keep the SOCKET, not just the connection: on an HTTP/1.0 or
             # closing response http.client hands the socket to the response
             # and sets conn.sock to None, so closing the connection would
             # leave the stream — and the server's generation — running.
             conn.connect()
+            if connect_timeout:
+                conn.sock.settimeout(read_timeout)
             box["sock"] = conn.sock
             conn.request("POST", path, body=body,
                          headers={"Content-Type": "application/json"})
@@ -3346,6 +3362,20 @@ def _ollama_stream(host: str, name: str, messages: List[Dict[str, Any]], *,
     return "".join(pieces), stats, calls
 
 
+def _require_final_packet(stats: Dict[str, Any], text: str, who: str) -> None:
+    """Raise unless the stream ended with Ollama's final packet ("done":
+    true). Without it the server CLOSED the connection mid-answer — it
+    crashed, was restarted or stopped, or a node lost the network — and
+    ``text`` is only the part that got through, which reads like a whole
+    reply (measured: "The comp" from a localhost role, "Answered" from a
+    node). Both paths — this PC's Ollama and a node's — check it."""
+    if not stats.get("done"):
+        raise RuntimeError(
+            f"{who} closed the answer before its final packet "
+            f"({len(text)} characters had arrived); the partial answer is "
+            "not used.")
+
+
 def _ollama_local(
     name: str,
     messages: List[Dict[str, Any]],
@@ -3453,6 +3483,8 @@ def _ollama_local(
                     f"Ollama at {host} has no model '{name}' "
                     f"(`ollama pull {name}` to install it).") from exc
             raise
+        # Not re-sent: the server got the request and was generating.
+        _require_final_packet(stats, text, f"Ollama ({model_name}) at {host}")
         _ollama_learn(model_name, _ollama_text_chars(msgs),
                       stats.get("prompt_tokens"))
         if refits:
@@ -3838,6 +3870,46 @@ def list_local_models() -> List[Dict[str, Any]]:
         return []
 
 
+#: Seconds a node's TCP connect may take. A LAN connect takes milliseconds,
+#: and the dispatcher's probe (4 s) reached the node moments before. The
+#: connect used to share the read timeout — first-reply limit + 30 s, 330 s
+#: — so a node that went off between the probe and the call held the member
+#: until the OS gave up.
+_DEFAULT_NODE_CONNECT_TIMEOUT = 5.0
+
+
+def _node_connect_timeout_s() -> float:
+    """COUNCIL_NODE_CONNECT_TIMEOUT (seconds, > 0), else 5."""
+    raw = os.environ.get("COUNCIL_NODE_CONNECT_TIMEOUT", "").strip()
+    try:
+        value = float(raw) if raw else _DEFAULT_NODE_CONNECT_TIMEOUT
+    except ValueError:
+        return _DEFAULT_NODE_CONNECT_TIMEOUT
+    return value if value > 0 else _DEFAULT_NODE_CONNECT_TIMEOUT
+
+
+def _node_first_reply_s() -> Optional[float]:
+    """COUNCIL_NODE_FIRST_REPLY_S: how long a NODE may take to start
+    answering, taken as given — or None (unset, unusable, <= 0) for the
+    localhost rule: the stall timeout or the load allowance
+    (COUNCIL_OLLAMA_LOAD_TIMEOUT, 300 s), whichever is longer. That rule
+    could not be shortened for nodes: the allowance only ever RAISES the
+    limit, so the wait never went under 120 s (150 s streaming).
+
+    No shorter default, on purpose: a Pi 5 reading a 4k-token council
+    prompt with a 3B model needs about four minutes before its first token
+    (docs/specialized_nodes.md, section 2), and until it answers that looks
+    exactly like a hung server. A user whose nodes are fast sets this low.
+    A node that fails then rests (LoadAwareDispatcher.mark_failed), so a
+    hung node costs one member this wait, not every member in the turn."""
+    raw = os.environ.get("COUNCIL_NODE_FIRST_REPLY_S", "").strip()
+    try:
+        value = float(raw) if raw else 0.0
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 def _ollama_remote_call(host: str, model: str, messages: List[Dict[str, str]],
                         *, temperature: float, num_predict: int,
                         allow_remote: bool, timeout: Optional[float],
@@ -3856,19 +3928,22 @@ def _ollama_remote_call(host: str, model: str, messages: List[Dict[str, str]],
     answer: a node whose Ollama dies (or is restarted, or loses the network)
     mid-answer closes the connection cleanly, and the old client returned
     the half it had as if it were the whole reply.
+
+    The connect has its own short limit (_node_connect_timeout_s), and the
+    wait for the first token is COUNCIL_NODE_FIRST_REPLY_S when set
+    (_node_first_reply_s).
     """
     _ensure_localhost(host, allow_remote=allow_remote)
+    first_reply = _node_first_reply_s()
+    connect_timeout = _node_connect_timeout_s()
     for attempt in (1, 2):
         try:
             text, stats, _calls = _ollama_stream(
                 host.rstrip("/"), model, messages, temperature=temperature,
                 num_predict=num_predict, num_ctx=_DEFAULT_OLLAMA_NUM_CTX,
-                timeout=timeout, token_callback=token_callback)
-            if not stats.get("done"):
-                raise RuntimeError(
-                    f"Ollama node {host} closed the answer before its final "
-                    f"packet ({len(text)} characters had arrived); the "
-                    "partial answer is not used.")
+                timeout=timeout, token_callback=token_callback,
+                first_reply=first_reply, connect_timeout=connect_timeout)
+            _require_final_packet(stats, text, f"Ollama node {host}")
             return text, stats
         except BackendUnavailable as exc:
             if attempt == 2:
@@ -4004,24 +4079,28 @@ class BackendRegistry:
 # Pi / Remote node probing
 # ============================================================
 
-def _ollama_ps(host: str, timeout_s: int = 5) -> Optional[Dict[str, Any]]:
-    url = host.rstrip("/") + "/api/ps"
-    req = urllib.request.Request(url, method="GET")
+def _ollama_get(host: str, path: str, timeout_s: float
+                ) -> Optional[Dict[str, Any]]:
+    """GET one Ollama metadata endpoint, or None. Directly — no proxy, no
+    redirect (local_models.open_direct): the chat itself is http.client and
+    reaches the node directly, so a probe through a proxy could call a node
+    reachable that the chat cannot reach (or the reverse), and it sent this
+    PC's /api/ps and /api/tags to the proxy."""
+    from council_core import local_models
+    req = urllib.request.Request(host.rstrip("/") + path, method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        with local_models.open_direct(req, timeout_s) as resp:
             return json.loads(resp.read().decode("utf-8", errors="replace"))
     except Exception:
         return None
+
+
+def _ollama_ps(host: str, timeout_s: int = 5) -> Optional[Dict[str, Any]]:
+    return _ollama_get(host, "/api/ps", timeout_s)
 
 
 def _ollama_tags(host: str, timeout_s: int = 5) -> Optional[Dict[str, Any]]:
-    url = host.rstrip("/") + "/api/tags"
-    req = urllib.request.Request(url, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            return json.loads(resp.read().decode("utf-8", errors="replace"))
-    except Exception:
-        return None
+    return _ollama_get(host, "/api/tags", timeout_s)
 
 
 @dataclass
@@ -4111,17 +4190,55 @@ class LoadAwareDispatcher:
     """
     Picks the best available Ollama host for a given model at call time.
     Caches probe results for `cache_ttl_s` seconds.
+
+    A host whose call failed RESTS before it is picked again (mark_failed):
+    30 s, doubling with each failure in a row up to 5 minutes; a success
+    clears it (mark_ok). Without it every council member re-sent its full
+    prompt to a node that had just failed — measured: three members, three
+    prompts to a node answering HTTP 500, three local fallbacks — and a
+    hung node held each member in turn for the whole first-reply limit.
     """
+
+    #: First rest after a failure, and the most it doubles to.
+    FAILURE_REST_S = 30.0
+    FAILURE_REST_MAX_S = 300.0
 
     def __init__(self, hosts: List[str], cache_ttl_s: float = 10.0, probe_timeout_s: int = 4):
         self.hosts = list(hosts)
         self.cache_ttl_s = cache_ttl_s
         self.probe_timeout_s = probe_timeout_s
         self._cache: Dict[str, tuple] = {}
+        #: The time source for the probe cache and the rests (a test sets it).
+        self.clock: Callable[[], float] = _time.monotonic
+        # host -> (resting until, length of the last rest). Members can call
+        # from several threads (the Tk console's workers), hence the lock.
+        self._rest: Dict[str, Tuple[float, float]] = {}
+        self._rest_lock = threading.Lock()
+
+    def mark_failed(self, host: str) -> float:
+        """A call on ``host`` failed: rest it, and forget its probe. Returns
+        the rest in seconds."""
+        with self._rest_lock:
+            _until, last = self._rest.get(host, (0.0, 0.0))
+            rest = (min(self.FAILURE_REST_MAX_S, last * 2.0) if last
+                    else self.FAILURE_REST_S)
+            self._rest[host] = (self.clock() + rest, rest)
+        self.invalidate(host)
+        return rest
+
+    def mark_ok(self, host: str) -> None:
+        """A call on ``host`` succeeded: the next failure rests it 30 s."""
+        with self._rest_lock:
+            self._rest.pop(host, None)
+
+    def cooling_down(self, host: str) -> bool:
+        """Is ``host`` resting after a failure?"""
+        with self._rest_lock:
+            hit = self._rest.get(host)
+        return bool(hit) and self.clock() < hit[0]
 
     def _get_status(self, host: str) -> NodeStatus:
-        import time
-        now = time.monotonic()
+        now = self.clock()
         cached = self._cache.get(host)
         if cached:
             status, ts = cached
@@ -4145,19 +4262,26 @@ class LoadAwareDispatcher:
         label no node has ("gguf:unset"), so the full council prompt went to
         whichever node was least busy, the node answered 404, and the member
         fell back to the local model — the prompt had left the PC for
-        nothing. None sends nothing anywhere."""
+        nothing. None sends nothing anywhere.
+
+        A host resting after a failure (mark_failed) is not even probed."""
         if not model or not model.strip():
             return None
         want = _ollama_full_name(model)
-        reachable = [s for s in self.probe_all() if s.reachable]
+        resting = [h for h in self.hosts if self.cooling_down(h)]
+        reachable = [s for s in (self._get_status(h) for h in self.hosts
+                                 if h not in resting)
+                     if s.reachable]
         has_model = [s for s in reachable
                      if any(_ollama_full_name(m) == want
                             for m in s.installed_models)]
         if not has_model:
+            rest_note = (f", {len(resting)} resting after a failure"
+                         if resting else "")
             print(_ascii_line(
                 f"[DISPATCHER] model={model}: no node has it "
-                f"({len(reachable)} of {len(self.hosts)} reachable) - "
-                "running locally, nothing sent"), flush=True)
+                f"({len(reachable)} of {len(self.hosts)} reachable"
+                f"{rest_note}) - running locally, nothing sent"), flush=True)
             return None
         has_model.sort(key=lambda s: (s.active_models, s.latency_ms))
         chosen = has_model[0]
@@ -6889,11 +7013,10 @@ DEFAULT_PI_HOSTS: List[str] = [h.strip() for h in _PI_HOSTS_RAW.split(",") if h.
 #
 # Override any model via environment variable (see names below).
 def _detect_ollama_models(host: str) -> List[str]:
-    """Return list of model names currently installed on the Ollama host."""
+    """Return list of model names currently installed on the Ollama host
+    (directly, never through a proxy — see _ollama_get)."""
     try:
-        url = host.rstrip("/") + "/api/tags"
-        with urllib.request.urlopen(url, timeout=5) as resp:
-            data = json.loads(resp.read().decode())
+        data = _ollama_get(host, "/api/tags", 5) or {}
         return [m["name"] for m in data.get("models", [])]
     except Exception:
         return []
@@ -7114,6 +7237,14 @@ class _DispatchedBackendSpec(LocalBackendSpec):
         name = local_models.ollama_name(self.model)
         return _ollama_full_name(name) if name else None
 
+    def _tell_dispatcher(self, what: str, host: str) -> float:
+        """dispatcher.mark_failed / mark_ok, when the dispatcher keeps
+        score — a stand-in that only picks hosts (best_host_for) still
+        works. Returns mark_failed's rest, else 0."""
+        fn = getattr(self._dispatcher, what, None)
+        out = fn(host) if callable(fn) else None
+        return float(out) if isinstance(out, (int, float)) else 0.0
+
     def generate(self, *, developer_instructions: str, user_text: str,
                  temperature: Optional[float] = None, max_tokens: Optional[int] = None,
                  trace: bool = True,
@@ -7149,25 +7280,51 @@ class _DispatchedBackendSpec(LocalBackendSpec):
                 {"role": "system", "content": developer_instructions},
                 {"role": "user", "content": user_text},
             ]
+            # Count what reached the stream box (not the \x00 sentinels):
+            # if the node fails AFTER that, the box already holds part of
+            # its answer, and the local answer must not run on from it.
+            shown = [0]
+            relay: Optional[Callable[[str], None]] = None
+            if token_callback is not None:
+                def relay(tok: str) -> None:
+                    if not tok.startswith("\x00"):
+                        shown[0] += 1
+                    token_callback(tok)
             try:
                 if trace:
                     print(_ascii_line(
                         f"[REMOTE] {self.key} model={name} -> {host}"),
                         flush=True)
-                if token_callback is not None:
-                    return _ollama_chat_stream(
+                if relay is not None:
+                    text = _ollama_chat_stream(
                         host, name, messages,
                         temperature=temp, num_predict=mtok,
-                        allow_remote=True, token_callback=token_callback)
-                return _ollama_chat(
-                    host, name, messages,
-                    temperature=temp, num_predict=mtok, allow_remote=True)
+                        allow_remote=True, token_callback=relay)
+                else:
+                    text = _ollama_chat(
+                        host, name, messages,
+                        temperature=temp, num_predict=mtok, allow_remote=True)
             except Exception as exc:
                 # Remote node failed mid-call — fall back to the local
-                # GGUF so the user still gets an answer.
+                # model so the user still gets an answer, and rest the node
+                # so the next member does not send it the prompt again.
+                rest = self._tell_dispatcher("mark_failed", host)
                 print(_ascii_line(
                     f"[REMOTE] node {host} failed ({exc!r}); "
-                    "falling back to local model."), flush=True)
+                    "falling back to local model"
+                    + (f" (node rests {rest:.0f} s)." if rest else ".")),
+                    flush=True)
+                if shown[0] and token_callback is not None:
+                    # Both front ends print tokens verbatim and cannot take
+                    # text back, so the switch is SAID: the stream used to
+                    # read "Answered on Answered HERE." — half the node's
+                    # answer run into the local one. The transcript gets
+                    # only the local answer (the return value).
+                    token_callback(f"\n\n[{host} stopped mid-answer - the "
+                                   "answer below is from this PC]\n\n")
+            else:
+                self._tell_dispatcher("mark_ok", host)
+                return text
         return super().generate(
             developer_instructions=developer_instructions,
             user_text=user_text,
