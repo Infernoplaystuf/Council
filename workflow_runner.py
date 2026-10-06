@@ -29,7 +29,20 @@ through a route that hides which filter runs.
 In the directory modes each run's outputs land in ``output_dir`` (one file
 per input, never the path baked into the script), so N inputs make N
 outputs instead of overwriting one, and nothing lands wherever the app
-happened to be started.
+happened to be started. That holds for EVERY writer a script has, not just
+the first: a second WriteDREAM3D (a checkpoint) or a feature CSV is written
+to <output_dir>/<input stem>_<its file name>, and each run works in its own
+folder, <output_dir>/<input stem>/, so a relative path the runner does not
+recognise lands there instead of on top of another input's file.
+result.outputs lists every file a writer was pointed at and every file a run
+left in its working folder (not a writer's companion, such as the .xdmf
+WriteDREAM3D puts next to its .dream3d).
+
+Paths are found in the script's SYNTAX TREE — keyword arguments
+(f(file_path=...)), attribute and plain assignments (v.input_file_path = ...)
+— never by a text search: a comment or a string that mentions
+`file_path = ...` used to be what got rewritten, and every input then read
+the same baked file.
 """
 
 from __future__ import annotations
@@ -70,8 +83,13 @@ class WorkflowResult:
     duration_s: float
     step_results: List[StepResult] = field(default_factory=list)
     error: Optional[str] = None    # high-level reason if the run aborted
-    # Where each input's final result was written (directory modes).
+    # Every file the runs wrote (directory modes): each input's final
+    # result, every other writer's file, anything written in a run's own
+    # working folder.
     outputs: List[Path] = field(default_factory=list)
+    # What the runner decided that the user should know (e.g. which of two
+    # writers it handed on).
+    notes: List[str] = field(default_factory=list)
 
     def summary(self) -> str:
         lines = [
@@ -81,11 +99,20 @@ class WorkflowResult:
         ]
         if self.error:
             lines.append(f"  error: {self.error}")
+        for n in self.notes:
+            lines.append(f"  note: {n}")
         if self.outputs:
-            lines.append(f"  outputs ({len(self.outputs)}) in "
-                         f"{self.outputs[0].parent}:")
+            try:
+                root = Path(os.path.commonpath(
+                    [str(o.parent) for o in self.outputs]))
+            except ValueError:                  # different drives
+                root = self.outputs[0].parent
+            lines.append(f"  outputs ({len(self.outputs)}) in {root}:")
             for o in self.outputs[:20]:
-                lines.append(f"    {o.name}")
+                try:
+                    lines.append(f"    {o.relative_to(root).as_posix()}")
+                except ValueError:
+                    lines.append(f"    {o}")
             if len(self.outputs) > 20:
                 lines.append(f"    ... and {len(self.outputs) - 20} more")
         for s in self.step_results:
@@ -324,11 +351,10 @@ def _stage_per_input_pipeline(
     baked into it, for every input. The copy is still made, but the callers
     check it (_input_not_redirected) and refuse to run it.
     """
-    staged, _out = _stage_chain_pipeline(
+    return _stage(
         pipeline_path, stage_dir, input_value=input_file,
         input_param=_input_param(pipeline_path.read_text(
-            encoding="utf-8", errors="replace"), substitution_param))
-    return staged
+            encoding="utf-8", errors="replace"), substitution_param)).path
 
 
 # Parameter names a DREAM3D read/write step uses, discovered from the real
@@ -354,13 +380,76 @@ _OUTPUT_PARAM_CANDIDATES = ("export_file_path", "output_file_path", "output_file
                             "output_path", "write_file_path", "feature_data_file")
 
 
+@dataclass
+class _Site:
+    """One place a script gives a path parameter its value."""
+    param: str
+    start: int                    # character offsets of the VALUE
+    end: int
+    line: int
+    literal: Optional[str]        # the value, when it is a string literal
+
+
+def _param_sites(source: str, names) -> List[_Site]:
+    """Every place ``source`` gives one of ``names`` a value, in source
+    order: a keyword argument (``f(file_path=...)``), an attribute
+    assignment (``v.input_file_path = ...``) or a plain one
+    (``input_file = ...``).
+
+    Read from the syntax tree, so a comment or a string that mentions
+    ``file_path = ...`` is not a site. The regex this replaces matched
+    those: a top comment "Settings: file_path = the .dream3d to read" was
+    rewritten instead of the reader, and every input read the same file
+    (measured: identical Centroids for two inputs, chain reported 4/4 ok).
+    Raises SyntaxError."""
+    import ast
+    tree = ast.parse(source)
+    names = set(names)
+    lines = source.split("\n")
+    starts = [0]
+    for ln in lines[:-1]:
+        starts.append(starts[-1] + len(ln) + 1)
+
+    def offset(lineno: int, col: int) -> int:
+        # ast columns are UTF-8 byte offsets within the line
+        line = lines[lineno - 1]
+        return starts[lineno - 1] + len(
+            line.encode("utf-8")[:col].decode("utf-8", errors="replace"))
+
+    sites: List[_Site] = []
+
+    def add(param: str, value) -> None:
+        lit = value.value if isinstance(value, ast.Constant) \
+            and isinstance(value.value, str) else None
+        sites.append(_Site(param, offset(value.lineno, value.col_offset),
+                           offset(value.end_lineno, value.end_col_offset),
+                           value.lineno, lit))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg in names:
+            add(node.arg, node.value)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)) \
+                and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) \
+                else [node.target]
+            for t in targets:
+                name = t.attr if isinstance(t, ast.Attribute) else (
+                    t.id if isinstance(t, ast.Name) else None)
+                if name in names:
+                    add(name, node.value)
+                    break
+    sites.sort(key=lambda s: s.start)
+    return sites
+
+
 def _first_param_present(source: str, candidates) -> Optional[str]:
-    """The first `param = ` assignment present in the pipeline source."""
-    import re as _re
-    for c in candidates:
-        if _re.search(rf"\b{_re.escape(c)}\s*=\s*", source, _re.MULTILINE):
-            return c
-    return None
+    """The first of ``candidates`` (in their order) the script gives a
+    value — in its syntax, not in a comment."""
+    try:
+        present = {s.param for s in _param_sites(source, candidates)}
+    except SyntaxError:
+        return None
+    return next((c for c in candidates if c in present), None)
 
 
 def _input_param(source: str, substitution_param: str) -> Optional[str]:
@@ -370,52 +459,123 @@ def _input_param(source: str, substitution_param: str) -> Optional[str]:
         if _first_param_present(source, (substitution_param,)) else None
 
 
-def _value_span(source: str, param: str) -> Optional[Tuple[int, int, str]]:
-    """(start, end, prefix) of the value in the first `param = <value>`."""
-    import re as _re
-    from pipeline_editor import _value_text_end
-    m = _re.compile(rf"\b{_re.escape(param)}\s*=\s*", _re.MULTILINE).search(
-        source)
-    if not m:
-        return None
-    # stop_at_newline: in a transpiled script a path can be a property
-    # assignment (v.input_file_path = '...') as well as an execute() keyword.
-    end = _value_text_end(source, m.end(), stop_at_newline=True)
-    return m.end(), end, m.group(0)
+def _main_output(sites: List[_Site]) -> Optional[_Site]:
+    """The output a pipeline ENDS with: the first output name (in
+    _OUTPUT_PARAM_CANDIDATES order) it has, at its LAST site. A pipeline that
+    writes a checkpoint and then its result has export_file_path twice; the
+    first one used to be handed on, so the next pipeline read the
+    checkpoint — without what was computed after it — and the chain
+    reported success."""
+    for c in _OUTPUT_PARAM_CANDIDATES:
+        mine = [s for s in sites if s.param == c]
+        if mine:
+            return mine[-1]
+    return None
 
 
-def _sub_param(source: str, param: str, value: Any) -> Tuple[str, bool]:
-    """Replace ``param = <value>`` in ``source``. Returns (new_source, matched).
-
-    Uses the real matched prefix (including the spaces around ``=``) so the
-    apply_edits find-string matches the exact source text."""
-    from pipeline_editor import apply_edits
-    span = _value_span(source, param)
-    if span is None:
-        return source, False
-    start, end, prefix = span
-    result = apply_edits(source, [{
-        "op": "replace_text",
-        "find": prefix + source[start:end],
-        "replace": prefix + repr(str(value)),
-        "max_count": 1,
-    }])
-    if not result.succeeded:
-        return source, False
-    return result.new_source, True
+def _side_dest(side_dir: Path, stem: Optional[str], site: _Site,
+               used: set) -> Path:
+    """Where a writer other than the main output goes for one input:
+    <side_dir>/<stem>_<the file name it had> (a.dream3d's checkpoint
+    'Data/ckpt.dream3d' -> a_ckpt.dream3d)."""
+    base = Path(site.literal).name if site.literal else ""
+    base = base or site.param
+    dest = side_dir / (f"{stem}_{base}" if stem else base)
+    n = 2
+    while dest in used:
+        p = Path(base)
+        dest = side_dir / (f"{stem}_{p.stem}_{n}{p.suffix}" if stem
+                           else f"{p.stem}_{n}{p.suffix}")
+        n += 1
+    used.add(dest)
+    return dest
 
 
-def _baked_value(source: str, param: str) -> Optional[str]:
-    """The string literal a `param = '<literal>'` holds, or None."""
-    import ast
-    span = _value_span(source, param)
-    if span is None:
-        return None
+@dataclass
+class _Staging:
+    path: Path
+    out_param: Optional[str] = None      # the parameter pointed at output_value
+    out_line: Optional[int] = None
+    side_outputs: List[Path] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+    error: Optional[str] = None          # the script is not valid Python
+
+
+def _stage(pipeline_path: Path, stage_dir: Path, *,
+           input_value: Optional[Path] = None,
+           input_param: Optional[str] = None,
+           output_value: Optional[Path] = None,
+           side_dir: Optional[Path] = None,
+           stem: Optional[str] = None,
+           used: Optional[set] = None,
+           dest_name: Optional[str] = None) -> _Staging:
+    """Copy a pipeline with its paths pointed where this run needs them.
+
+      * the input: the first site of ``input_param`` (else of the first
+        reader name in _INPUT_PARAM_CANDIDATES it has) -> ``input_value``;
+      * the main output (_main_output: the LAST writer) -> ``output_value``;
+      * with ``side_dir``: every OTHER writer -> <side_dir>/<stem>_<name>.
+        Those kept their baked path, so each input overwrote the previous
+        one's file (one features.csv for two inputs, not in the outputs).
+
+    Only the value expressions are replaced; comments, strings and the
+    rest of the script are untouched."""
+    source = pipeline_path.read_text(encoding="utf-8", errors="replace")
+    target = stage_dir / (dest_name or pipeline_path.name)
+    st = _Staging(target)
+    names = set(_INPUT_PARAM_CANDIDATES) | set(_OUTPUT_PARAM_CANDIDATES)
+    if input_param:
+        names.add(input_param)
     try:
-        v = ast.literal_eval(source[span[0]:span[1]].strip())
-    except Exception:                                     # noqa: BLE001
-        return None
-    return v if isinstance(v, str) else None
+        sites = _param_sites(source, names)
+    except SyntaxError as exc:
+        target.write_text(source, encoding="utf-8")
+        st.error = (f"{pipeline_path.name} is not valid Python (line "
+                    f"{exc.lineno}: {exc.msg}), so its file paths can't be "
+                    f"found or pointed anywhere.")
+        return st
+    edits: List[Tuple[_Site, Any]] = []
+    if input_value is not None:
+        order = (input_param,) if input_param else _INPUT_PARAM_CANDIDATES
+        ip = next((n for n in order if any(s.param == n for s in sites)),
+                  None)
+        if ip:
+            edits.append((next(s for s in sites if s.param == ip),
+                          input_value))
+    outs = [s for s in sites if s.param in _OUTPUT_PARAM_CANDIDATES
+            and s.param != input_param]
+    main = _main_output(outs) if output_value is not None else None
+    if main is not None:
+        edits.append((main, output_value))
+        st.out_param, st.out_line = main.param, main.line
+    if side_dir is not None:
+        used = used if used is not None else set()
+        for s in outs:
+            if s is not main:
+                dest = _side_dest(side_dir, stem, s, used)
+                edits.append((s, dest))
+                st.side_outputs.append(dest)
+    if main is not None:
+        same = [s for s in outs if s.param == main.param]
+        if len(same) > 1:
+            others = [d for (s, d) in edits if s in same and s is not main]
+            st.notes.append(
+                f"{pipeline_path.name}: {main.param} is written "
+                f"{len(same)} times (lines "
+                f"{', '.join(str(s.line) for s in same)}); the last, line "
+                f"{main.line}, is what it ends with, so that is the one "
+                f"this run follows"
+                + (f"; the others go to "
+                   f"{', '.join(Path(str(d)).name for d in others)}"
+                   if others else ""))
+    new, limit = source, len(source)
+    for site, value in sorted(edits, key=lambda e: e[0].start, reverse=True):
+        if site.end > limit:
+            continue                     # nested in a value already replaced
+        new = new[:site.start] + repr(str(value)) + new[site.end:]
+        limit = site.start
+    target.write_text(new, encoding="utf-8")
+    return st
 
 
 def _stage_chain_pipeline(pipeline_path: Path, stage_dir: Path, *,
@@ -430,21 +590,10 @@ def _stage_chain_pipeline(pipeline_path: Path, stage_dir: Path, *,
     output-path parameter could be found to override — the caller needs that to
     know whether A's output was actually redirected to the staging file it will
     hand to B."""
-    source = pipeline_path.read_text(encoding="utf-8", errors="replace")
-    if input_value is not None:
-        ip = input_param or _first_param_present(source, _INPUT_PARAM_CANDIDATES) \
-            or "file_path"
-        source, _ = _sub_param(source, ip, input_value)
-    out_used: Optional[str] = None
-    if output_value is not None:
-        op = _first_param_present(source, _OUTPUT_PARAM_CANDIDATES)
-        if op:
-            source, ok = _sub_param(source, op, output_value)
-            if ok:
-                out_used = op
-    target = stage_dir / (dest_name or pipeline_path.name)
-    target.write_text(source, encoding="utf-8")
-    return target, out_used
+    st = _stage(pipeline_path, stage_dir, input_value=input_value,
+                input_param=input_param, output_value=output_value,
+                dest_name=dest_name)
+    return st.path, st.out_param
 
 
 def _output_dest(pipeline_path: Path, out_dir: Path, stem: str,
@@ -453,10 +602,13 @@ def _output_dest(pipeline_path: Path, out_dir: Path, stem: str,
     the suffix the script's own output path had (.dream3d, .stl, ...). None
     when the script has no output parameter to point there."""
     source = pipeline_path.read_text(encoding="utf-8", errors="replace")
-    op = _first_param_present(source, _OUTPUT_PARAM_CANDIDATES)
-    if not op:
+    try:
+        main = _main_output(_param_sites(source, _OUTPUT_PARAM_CANDIDATES))
+    except SyntaxError:
         return None
-    suffix = Path(_baked_value(source, op) or "").suffix or ".dream3d"
+    if main is None:
+        return None
+    suffix = Path(main.literal or "").suffix or ".dream3d"
     dest, n = out_dir / f"{stem}{suffix}", 2
     while dest in used:                 # a.dream3d and a.stl in one folder
         dest, n = out_dir / f"{stem}_{n}{suffix}", n + 1
@@ -464,21 +616,70 @@ def _output_dest(pipeline_path: Path, out_dir: Path, stem: str,
     return dest
 
 
-def _input_not_redirected(pl: Path, staged: Path,
-                          src_in: Path) -> Optional[str]:
+def _input_not_redirected(pl: Path, staged: Path, src_in: Path,
+                          params=()) -> Optional[str]:
     """Why the staged copy would NOT read ``src_in``, or None.
 
-    A reader whose parameter is not a recognised name is staged with its
-    baked-in path untouched, so the run "succeeds" on the wrong file -- every
-    input the same file. Measured: a chain over two different .stl files
-    reported 4/4 ok while both runs read the path saved in the pipeline."""
+    Checked on the staged copy's syntax tree: a reader parameter (one of
+    ``params`` or _INPUT_PARAM_CANDIDATES) must now hold exactly
+    ``src_in``. A text search for the path passed when the path landed in a
+    comment. A reader whose parameter is not a recognised name is staged
+    with its baked-in path untouched, so the run "succeeds" on the wrong
+    file -- every input the same file. Measured: a chain over two different
+    .stl files reported 4/4 ok while both runs read the path saved in the
+    pipeline."""
+    names = tuple(p for p in params if p) + _INPUT_PARAM_CANDIDATES
     staged_src = staged.read_text(encoding="utf-8", errors="replace")
-    if repr(str(src_in)) in staged_src:
+    try:
+        sites = _param_sites(staged_src, names)
+    except SyntaxError as exc:
+        return (f"{pl.name} is not valid Python (line {exc.lineno}: "
+                f"{exc.msg}), so it can't be pointed at {src_in.name}.")
+    if any(s.literal == str(src_in) for s in sites):
         return None
     return (f"{pl.name} has no recognized input-path parameter "
-            f"(looked for {', '.join(_INPUT_PARAM_CANDIDATES)}), "
+            f"(looked for {', '.join(names)}), "
             f"so it can't be pointed at {src_in.name}; it would "
             f"read the path saved in it instead.")
+
+
+def _work_dir(base: Path, used: set) -> Path:
+    """A run's own working folder, not shared with another input's."""
+    d, n = base, 2
+    while d in used:
+        d, n = base.with_name(f"{base.name}_{n}"), n + 1
+    used.add(d)
+    return d
+
+
+def _record_outputs(result: "WorkflowResult", paths, work: Optional[Path]
+                    ) -> None:
+    """List every file a run wrote: the files its writers were pointed at
+    (a writer pointed at a folder: the files in it) and anything it wrote in
+    its own working folder."""
+    seen = set(result.outputs)
+
+    def add(p: Path) -> None:
+        if p not in seen:
+            seen.add(p)
+            result.outputs.append(p)
+    for p in paths:
+        if p.is_file():
+            add(p)
+        elif p.is_dir():
+            for f in sorted(p.rglob("*")):
+                if f.is_file():
+                    add(f)
+    if work is not None and work.is_dir():
+        for f in sorted(work.rglob("*")):
+            if f.is_file():
+                add(f)
+
+
+def _add_notes(result: "WorkflowResult", notes) -> None:
+    for n in notes:
+        if n not in result.notes:
+            result.notes.append(n)
 
 
 def _not_run(idx: int, pl: Path, label: str, error: str) -> StepResult:
@@ -534,15 +735,19 @@ def run_chained(
     A non-final pipeline MUST expose an output-path parameter (so its output can
     be redirected to a staging file and handed on); if none is found the chain
     stops with a clear error rather than silently running the next pipeline on
-    the wrong input.
+    the wrong input. What is handed on is the LAST writer of that parameter —
+    what the pipeline ends with, not a checkpoint written halfway — and the
+    step fails, naming itself, if it did not write that file.
 
     The FINAL pipeline's output goes to ``output_dir``/<input stem><suffix>
     (a fresh temp folder when None; result.outputs lists the files). It used
     to keep the path baked into the script, resolved against wherever the app
     was started — outside the vault's output area — and in per_file mode every
     input overwrote the same file: two inputs, one surviving output. Every
-    step runs with ``output_dir`` as its working directory, so a relative path
-    the script still holds lands there too.
+    other writer of every pipeline goes to ``output_dir``/<stem>_<its file
+    name>, and each input's steps run in their own working folder,
+    ``output_dir``/<stem>/, so a relative path a script still holds lands
+    there, per input, too.
     """
     overall_start = time.monotonic()
     inputs = _list_directory_inputs(input_dir, pattern=pattern,
@@ -572,6 +777,7 @@ def run_chained(
     out_root = Path(output_dir) if output_dir else _default_output_dir()
     out_root.mkdir(parents=True, exist_ok=True)
     used: set = set()
+    works: Dict[str, Path] = {}         # input stem -> its working folder
     step_counter = 0
 
     def _emit(step: StepResult) -> None:
@@ -584,33 +790,49 @@ def run_chained(
                 pass
 
     def _run_one(pl: Path, src_in: Path, out_path: Optional[Path],
-                 file_stage: Path, label: str, idx: int,
-                 final_stem: Optional[str] = None) -> StepResult:
-        final = final_stem is not None
+                 file_stage: Path, label: str, idx: int, stem: str,
+                 final: bool) -> StepResult:
         if final:
-            out_path = _output_dest(pl, out_root, final_stem, used)
-        staged, out_used = _stage_chain_pipeline(
-            pl, file_stage, input_value=src_in, output_value=out_path,
-            input_param=_input_param(pl.read_text(
-                encoding="utf-8", errors="replace"), substitution_param),
-            dest_name=f"{idx:02d}_{pl.name}")
+            out_path = _output_dest(pl, out_root, stem, used)
+        st = _stage(pl, file_stage, input_value=src_in, output_value=out_path,
+                    input_param=_input_param(pl.read_text(
+                        encoding="utf-8", errors="replace"), substitution_param),
+                    side_dir=out_root, stem=stem, used=used,
+                    dest_name=f"{idx:02d}_{pl.name}")
+        if st.error:
+            return _not_run(idx, pl, label, st.error)
         # A non-final pipeline whose output we could not redirect leaves us not
         # knowing what to feed onward — fail loudly instead of chaining garbage.
-        if not final and out_path is not None and out_used is None:
+        if not final and out_path is not None and st.out_param is None:
             return _not_run(idx, pl, label,
                             f"{pl.name} has no recognized output-path parameter "
                             f"(looked for {', '.join(_OUTPUT_PARAM_CANDIDATES)}), "
                             f"so its result can't be chained into the next "
                             f"pipeline.")
-        why = _input_not_redirected(pl, staged, src_in)
+        why = _input_not_redirected(pl, st.path, src_in, (substitution_param,))
         if why:
             return _not_run(idx, pl, label, why)
-        step = _run_pipeline_subprocess(staged, timeout_s=timeout_s,
-                                        cwd=out_root)
+        _add_notes(result, st.notes)
+        if stem not in works:
+            works[stem] = _work_dir(out_root / stem, used)
+        work = works[stem]
+        work.mkdir(parents=True, exist_ok=True)
+        step = _run_pipeline_subprocess(st.path, timeout_s=timeout_s,
+                                        cwd=work)
         step.step_index = idx
         step.input_label = label
-        if final and out_used and step.success:
-            result.outputs.append(out_path)
+        if step.success and not final and not out_path.is_file():
+            # The next pipeline would fail on a missing file and the error
+            # would name IT; the fault is here.
+            step.success = False
+            step.error = (f"{pl.name} finished without writing "
+                          f"{out_path.name}, the file the next pipeline "
+                          f"reads: its {st.out_param} (line {st.out_line}) "
+                          f"was pointed there and nothing was written")
+        if step.success:
+            _record_outputs(result, ([out_path] if final and st.out_param
+                                     else []) + st.side_outputs, work)
+        _drop_if_empty(work)
         return step
 
     try:
@@ -627,7 +849,7 @@ def run_chained(
                     out_path = None if is_last else out_dir / f"{src_in.stem}.dream3d"
                     step = _run_one(pl, src_in, out_path, out_dir,
                                     f"{pl.name} <- {src_in.name}", step_counter,
-                                    final_stem=src_in.stem if is_last else None)
+                                    src_in.stem, is_last)
                     _emit(step)
                     if not step.success:
                         result.success = False
@@ -650,8 +872,7 @@ def run_chained(
                         file_stage / f"{src_file.stem}_step{j}.dream3d"
                     step = _run_one(pl, prev, out_path, file_stage,
                                     f"{pl.name} <- {prev.name}", step_counter,
-                                    final_stem=src_file.stem if is_last
-                                    else None)
+                                    src_file.stem, is_last)
                     _emit(step)
                     if not step.success:
                         result.success = False
@@ -693,33 +914,40 @@ def _run_over_inputs(pairs, *, substitution_param: str, timeout_s: int,
                      stage_dir: Path, out_root: Path,
                      result: WorkflowResult, label_of, fail_msg,
                      on_step) -> bool:
-    """Run each (pipeline, input) with its input pointed at the input file and
-    its output at <out_root>/<pipeline stem>/<input stem><suffix>. False on
-    the first failure (result.error says which)."""
+    """Run each (pipeline, input) with its input pointed at the input file,
+    its output at <out_root>/<pipeline stem>/<input stem><suffix>, every
+    other writer at <out_root>/<pipeline stem>/<input stem>_<file name>, in
+    its own working folder <out_root>/<pipeline stem>/<input stem>/. False
+    on the first failure (result.error says which)."""
     used: set = set()
     for step_counter, (pipeline_path, input_file) in enumerate(pairs, start=1):
         file_stage = stage_dir / input_file.stem
         file_stage.mkdir(parents=True, exist_ok=True)
         label = label_of(pipeline_path, input_file)
-        dest = _output_dest(pipeline_path, out_root / pipeline_path.stem,
-                            input_file.stem, used)
-        if dest is not None:
-            dest.parent.mkdir(parents=True, exist_ok=True)
+        pdir = out_root / pipeline_path.stem
+        dest = _output_dest(pipeline_path, pdir, input_file.stem, used)
         source = pipeline_path.read_text(encoding="utf-8", errors="replace")
-        staged, out_used = _stage_chain_pipeline(
-            pipeline_path, file_stage, input_value=input_file,
-            input_param=_input_param(source, substitution_param),
-            output_value=dest)
-        why = _input_not_redirected(pipeline_path, staged, input_file)
+        st = _stage(pipeline_path, file_stage, input_value=input_file,
+                    input_param=_input_param(source, substitution_param),
+                    output_value=dest, side_dir=pdir, stem=input_file.stem,
+                    used=used)
+        why = st.error or _input_not_redirected(
+            pipeline_path, st.path, input_file, (substitution_param,))
         if why:
             step = _not_run(step_counter, pipeline_path, label, why)
         else:
-            step = _run_pipeline_subprocess(staged, timeout_s=timeout_s,
-                                            cwd=out_root)
+            _add_notes(result, st.notes)
+            work = _work_dir(pdir / input_file.stem, used)
+            work.mkdir(parents=True, exist_ok=True)
+            step = _run_pipeline_subprocess(st.path, timeout_s=timeout_s,
+                                            cwd=work)
             step.step_index = step_counter
             step.input_label = label
-            if step.success and out_used:
-                result.outputs.append(dest)
+            if step.success:
+                _record_outputs(result, ([dest] if st.out_param else [])
+                                + st.side_outputs, work)
+            _drop_if_empty(work)
+            _drop_if_empty(pdir)
         result.step_results.append(step)
         result.steps_run += 1
         if on_step:

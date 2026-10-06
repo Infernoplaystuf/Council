@@ -947,7 +947,10 @@ def test_every_input_gets_its_own_output(mode, tmp_path, monkeypatch):
     res = wr.run_workflow(spec)
     assert res.success, res.summary()
     assert all("baked" not in o for _n, o, _c in ran)
-    assert all(c == out for _n, _o, c in ran)
+    # Each run works in its own folder under output_dir, so a relative path
+    # a script still holds cannot collide with another input's.
+    assert all(c.parent in (out, out / "P1", out / "P2") and c.name in "ab"
+               for _n, _o, c in ran), ran
     finals = sorted(o.relative_to(out).as_posix() for o in res.outputs)
     if mode == "chained":
         assert finals == ["a.stl", "b.stl"]           # the baked suffix kept
@@ -955,6 +958,199 @@ def test_every_input_gets_its_own_output(mode, tmp_path, monkeypatch):
         assert finals == ["P1/a.stl", "P1/b.stl", "P2/a.stl", "P2/b.stl"]
     assert all(o.exists() for o in res.outputs)
     assert "outputs (" in res.summary()
+
+
+def _writes(src):
+    """Every export/feature/file path a staged script now holds, in order."""
+    tree = ast.parse(src)
+    return [(k.arg, k.value.value) for k in ast.walk(tree)
+            if isinstance(k, ast.keyword) and isinstance(k.value, ast.Constant)
+            and k.arg in ("export_file_path", "feature_data_file",
+                          "file_path", "file_name")]
+
+
+def _fake_runner(ran, write=True):
+    """Stands in for simplnx: records each staged script and creates every
+    file it writes (a relative one under the step's working folder)."""
+    def fake(staged, timeout_s=600, cwd=None):
+        src = staged.read_text(encoding="utf-8")
+        ran.append((staged.name, _writes(src), cwd))
+        for param, val in _writes(src):
+            if param in ("file_path",) or not write:
+                continue
+            dest = Path(val) if Path(val).is_absolute() else Path(cwd) / val
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text("x", encoding="utf-8")
+        return wr.StepResult(-1, staged.name, "", True, 0, 0.0, "", "",
+                             pipeline_path=staged)
+    return fake
+
+
+_READ = ("r0 = nx.ReadDREAM3DFilter.execute(data_structure=ds, "
+         "import_data_object=nx.Dream3dImportParameter.ImportData("
+         "file_path='Data/baked_in.dream3d'))\n")
+
+
+def _inputs(tmp_path):
+    inp = tmp_path / "in"
+    inp.mkdir()
+    for n in ("a", "b"):
+        (inp / f"{n}.dream3d").write_text("d", encoding="utf-8")
+    return inp
+
+
+def test_chain_hands_on_the_last_writer_and_keeps_every_other_per_input(
+        tmp_path, monkeypatch):
+    """P1 wrote a checkpoint, then its final file. Only the FIRST
+    export_file_path was redirected, so P2 read the checkpoint (it lacked
+    what P1 computes after it) and the chain reported success, while P1's
+    real output went to its baked path, once for every input."""
+    ran = []
+    monkeypatch.setattr(wr, "_run_pipeline_subprocess", _fake_runner(ran))
+    p1 = tmp_path / "P1.py"
+    p1.write_text("import simplnx as nx\nds = nx.DataStructure()\n" + _READ
+                  + "r1 = nx.WriteDREAM3DFilter.execute(data_structure=ds, "
+                    "export_file_path='Data/Output/ckpt.dream3d')\n"
+                    "r2 = nx.ComputeFeatureSizesFilter.execute(data_structure=ds)\n"
+                    "r3 = nx.WriteDREAM3DFilter.execute(data_structure=ds, "
+                    "export_file_path='Data/Output/final.dream3d')\n",
+                  encoding="utf-8")
+    p2 = tmp_path / "P2.py"
+    p2.write_text("import simplnx as nx\nds = nx.DataStructure()\n" + _READ
+                  + "r1 = nx.WriteDREAM3DFilter.execute(data_structure=ds, "
+                    "export_file_path='Data/Output/p2.dream3d')\n",
+                  encoding="utf-8")
+    out = tmp_path / "o"
+    stage = tmp_path / "st"
+    res = wr.run_chained([p1, p2], _inputs(tmp_path), scope="per_file",
+                         stage_dir=stage, output_dir=out)
+    assert res.success, res.summary()
+    p1_runs = [w for n, w, _c in ran if n.endswith("P1.py")]
+    p2_runs = [w for n, w, _c in ran if n.endswith("P2.py")]
+    for p1w, p2w, stem in zip(p1_runs, p2_runs, "ab"):
+        ckpt, final = [v for k, v in p1w if k == "export_file_path"]
+        assert Path(final).name == f"{stem}_step1.dream3d"      # handed on
+        assert Path(ckpt) == out / f"{stem}_ckpt.dream3d"        # kept, per input
+        assert dict(p2w)["file_path"] == final                   # P2 reads it
+    assert sorted(o.name for o in res.outputs) == [
+        "a.dream3d", "a_ckpt.dream3d", "b.dream3d", "b_ckpt.dream3d"]
+    assert not (out / "Data").exists()
+    assert any("written 2 times" in n for n in res.notes), res.notes
+    assert "written 2 times" in res.summary()
+
+
+def test_a_parameter_named_in_a_comment_is_not_a_parameter(tmp_path):
+    """The path rewrite ran a regex over the raw text: a comment naming
+    file_path / export_file_path was rewritten instead of the real call."""
+    p = tmp_path / "p.py"
+    baked = str(tmp_path / "in" / "a.dream3d")
+    p.write_text("# Settings: file_path = the .dream3d to read\n"
+                 "# Output: export_file_path = Data/x.dream3d\n"
+                 "import simplnx as nx\nds = nx.DataStructure()\n"
+                 "r0 = nx.ReadDREAM3DFilter.execute(data_structure=ds, "
+                 "import_data_object=nx.Dream3dImportParameter.ImportData("
+                 f"file_path={baked!r}))\n"
+                 "note = 'export_file_path = not this either'\n"
+                 "r1 = nx.WriteDREAM3DFilter.execute(data_structure=ds, "
+                 "export_file_path='Data/x.dream3d')\n", encoding="utf-8")
+    staged, used = wr._stage_chain_pipeline(
+        p, tmp_path, dest_name="s.py", input_value=tmp_path / "in" / "b.dream3d",
+        output_value=tmp_path / "hand.dream3d")
+    txt = staged.read_text(encoding="utf-8")
+    assert txt.startswith("# Settings: file_path = the .dream3d to read\n"
+                          "# Output: export_file_path = Data/x.dream3d\n")
+    assert "note = 'export_file_path = not this either'" in txt
+    w = dict(_writes(txt))
+    assert w["file_path"] == str(tmp_path / "in" / "b.dream3d")
+    assert w["export_file_path"] == str(tmp_path / "hand.dream3d")
+    assert used == "export_file_path"
+    ast.parse(txt)
+
+
+@pytest.mark.parametrize("mode", ["chained", "per_file"])
+def test_a_reader_named_only_in_a_comment_is_refused(mode, tmp_path,
+                                                     monkeypatch):
+    """The input guard looked for the path ANYWHERE in the staged text. A
+    script whose only `file_path =` is in a comment passed it: every input
+    read the same baked file and the run reported success."""
+    def never(*_a, **_k):
+        raise AssertionError("nothing should have been run")
+    monkeypatch.setattr(wr, "_run_pipeline_subprocess", never)
+    p = tmp_path / "p.py"
+    p.write_text("# file_path = the .dream3d to read\n"
+                 "import simplnx as nx\nds = nx.DataStructure()\n"
+                 "r0 = nx.ReadDREAM3DFilter.execute(data_structure=ds, "
+                 "import_data_object=nx.Dream3dImportParameter.ImportData("
+                 "'Data/baked.dream3d'))\n"
+                 "r1 = nx.WriteDREAM3DFilter.execute(data_structure=ds, "
+                 "export_file_path='Data/x.dream3d')\n", encoding="utf-8")
+    spec = wr.WorkflowSpec([p, p] if mode == "chained" else [p], mode=mode,
+                           input_dir=_inputs(tmp_path), pattern="*.dream3d",
+                           output_dir=tmp_path / "o")
+    res = wr.run_workflow(spec)
+    assert not res.success
+    assert "input-path parameter" in res.error and "a.dream3d" in res.error
+
+
+def test_a_step_that_does_not_write_its_hand_off_fails_and_names_itself(
+        tmp_path, monkeypatch):
+    """P1 "succeeded" without writing the staged file; the runner went on
+    and P2 failed with "Path ... does not exist" — the error named P2."""
+    ran = []
+    monkeypatch.setattr(wr, "_run_pipeline_subprocess",
+                        _fake_runner(ran, write=False))
+    p1, p2 = tmp_path / "P1.py", tmp_path / "P2.py"
+    for p in (p1, p2):
+        p.write_text("import simplnx as nx\nds = nx.DataStructure()\n" + _READ
+                     + "r1 = nx.WriteDREAM3DFilter.execute(data_structure=ds, "
+                       "export_file_path='Data/o.dream3d')\n", encoding="utf-8")
+    res = wr.run_chained([p1, p2], _inputs(tmp_path), output_dir=tmp_path / "o")
+    assert not res.success
+    assert [n for n, _w, _c in ran] == ["01_P1.py"]          # P2 never ran
+    bad = res.step_results[-1]
+    assert bad.pipeline_name.endswith("P1.py") and "a_step1.dream3d" in bad.error
+    assert "P1.py" in res.error
+
+
+@pytest.mark.parametrize("mode", ["chained", "per_file", "per_step"])
+def test_every_writer_gets_its_own_file_per_input(mode, tmp_path, monkeypatch):
+    """Only the first output parameter was redirected: a second writer kept
+    its baked path, so each input overwrote the previous one's file (one
+    features.csv for two inputs) and it was not in result.outputs."""
+    ran = []
+    monkeypatch.setattr(wr, "_run_pipeline_subprocess", _fake_runner(ran))
+    p1 = tmp_path / "P1.py"
+    p1.write_text("import simplnx as nx\nds = nx.DataStructure()\n" + _READ
+                  + "r1 = nx.WriteDREAM3DFilter.execute(data_structure=ds, "
+                    "export_file_path='Data/Output/p1.dream3d')\n",
+                  encoding="utf-8")
+    p2 = tmp_path / "P2.py"
+    p2.write_text("import simplnx as nx\nimport itkimageprocessing as nxitk\n"
+                  "ds = nx.DataStructure()\n" + _READ
+                  + "r1 = nx.WriteDREAM3DFilter.execute(data_structure=ds, "
+                    "export_file_path='Data/Output/p2.dream3d')\n"
+                    "r2 = nx.WriteFeatureDataCSVFilter.execute(data_structure=ds, "
+                    "feature_data_file='features.csv')\n"
+                    # not an output-path name the runner knows: lands in the
+                    # run's own working folder
+                    "r3 = nxitk.ITKImageWriterFilter.execute(data_structure=ds, "
+                    "file_name='slice.png')\n", encoding="utf-8")
+    out = tmp_path / "o"
+    spec = wr.WorkflowSpec([p1, p2], mode=mode, input_dir=_inputs(tmp_path),
+                           pattern="*.dream3d", output_dir=out)
+    res = wr.run_workflow(spec)
+    assert res.success, res.summary()
+    got = sorted(o.relative_to(out).as_posix() for o in res.outputs)
+    if mode == "chained":
+        assert got == ["a.dream3d", "a/slice.png", "a_features.csv",
+                       "b.dream3d", "b/slice.png", "b_features.csv"]
+    else:
+        assert got == ["P1/a.dream3d", "P1/b.dream3d",
+                       "P2/a.dream3d", "P2/a/slice.png", "P2/a_features.csv",
+                       "P2/b.dream3d", "P2/b/slice.png", "P2/b_features.csv"]
+    assert all(o.is_file() for o in res.outputs)
+    assert not list(out.rglob("features.csv"))
+    assert not (out / "Data").exists()
 
 
 # ============================================================
@@ -1119,6 +1315,102 @@ def test_chain_feeds_p1s_staged_output_to_p2(chain, scope):
         rec = rep[str(o)]
         assert rec["errors"] == []
         assert all(rec["has"].values()), rec["has"]   # (03)'s AND (04)'s arrays
+
+
+def _variant(catalog, rel, dest: Path, edit) -> Path:
+    """A shipped pipeline changed by ``edit(pipeline_json)``, transpiled."""
+    d = json.loads((SHIPPED / rel).read_text(encoding="utf-8"))
+    edit(d)
+    res = nx_transpile.transpile(d, catalog)
+    assert not res["unknown"] and not res["warnings"], res
+    dest.write_text(res["code"], encoding="utf-8")
+    return dest
+
+
+def _with_checkpoint(after: int):
+    """(03) with a second WriteDREAM3D (a checkpoint) after step ``after``."""
+    def edit(d):
+        ck = json.loads(json.dumps(d["pipeline"][-1]))
+        ck["args"]["export_file_path"]["value"] = \
+            "Data/Output/Statistics/ckpt.dream3d"
+        ck["args"]["write_xdmf_file"]["value"] = False
+        d["pipeline"].insert(after + 1, ck)
+    return edit
+
+
+@needs_nx
+def test_chain_hands_on_what_p1_ends_with(chain, catalog):
+    """(03) with a checkpoint after step [6], chained into (04): P2 read the
+    checkpoint, so the final files lacked Sphericity (computed by (03) after
+    it) — reported 4/4 ok."""
+    _p1, p2, inp, tmp = chain
+    p1 = _variant(catalog, P03, tmp / "P1ck.py", _with_checkpoint(6))
+    out = tmp / "out"
+    res = wr.run_chained([p1, p2], inp, scope="per_file", pattern="*.dream3d",
+                         stage_dir=tmp / "st", output_dir=out, timeout_s=300)
+    assert res.success, res.summary()
+    names = sorted(o.name for o in res.outputs)
+    assert names == ["a.dream3d", "a_ckpt.dream3d", "b.dream3d",
+                     "b_ckpt.dream3d"], names
+    assert not (out / "Data").exists() and not (tmp / "Data").exists()
+    finals = [out / "a.dream3d", out / "b.dream3d"]
+    rep = _nx([HELPERS / "nx_probe.py", *finals])
+    for f in finals:
+        rec = rep[str(f)]
+        assert rec["errors"] == [] and all(rec["has"].values()), rec
+
+
+@needs_nx
+def test_chain_reads_each_input_with_a_parameter_named_in_a_comment(
+        chain, catalog):
+    """A top comment `Settings: file_path = ...` above a reader with an
+    absolute baked path (as model scripts write them): the comment was
+    rewritten, every input read the baked file — identical Centroids for a
+    and b, 4/4 ok."""
+    p1, p2, inp, tmp = chain
+    src = p1.read_text(encoding="utf-8").replace(
+        "file_path='Data/Output/Reconstruction/SmallIN100_Final.dream3d'",
+        f"file_path={str(inp / 'a.dream3d')!r}")
+    p1.write_text("# Morphological statistics. Settings: file_path = the "
+                  ".dream3d to read (edit below)\n" + src, encoding="utf-8")
+    out = tmp / "out"
+    res = wr.run_chained([p1, p2], inp, scope="per_file", pattern="*.dream3d",
+                         stage_dir=tmp / "st", output_dir=out, timeout_s=300)
+    assert res.success, res.summary()
+    rep = _nx([HELPERS / "nx_probe.py", out / "a.dream3d", out / "b.dream3d"])
+    shas = {Path(f).stem: r["centroids_sha"] for f, r in rep.items()}
+    assert shas["a"] and shas["b"] and shas["a"] != shas["b"], shas
+
+
+@needs_nx
+def test_chain_writes_each_inputs_csv(chain, catalog):
+    """(04) plus the shipped WriteFeatureDataCSV step: one features.csv in
+    output_dir for two inputs (b's overwrote a's), not in result.outputs."""
+    p1, _p2, inp, tmp = chain
+    csv_uuid = _uuid("WriteFeatureDataCSVFilter")
+
+    def add_csv(d):
+        ap = json.loads((SHIPPED / "OrientationAnalysis/EBSD_File_Processing/"
+                         "aptr12_Analysis.d3dpipeline").read_text(
+                             encoding="utf-8"))
+        node = next(n for n in ap["pipeline"]
+                    if n["filter"]["uuid"] == csv_uuid)
+        node["args"]["cell_feature_attribute_matrix_path"]["value"] = \
+            "DataContainer/Cell Feature Data"
+        node["args"]["feature_data_file"]["value"] = "features.csv"
+        d["pipeline"].append(node)
+    p2 = _variant(catalog, P04, tmp / "P2csv.py", add_csv)
+    out = tmp / "out"
+    res = wr.run_chained([p1, p2], inp, scope="per_file", pattern="*.dream3d",
+                         stage_dir=tmp / "st", output_dir=out, timeout_s=300)
+    assert res.success, res.summary()
+    names = sorted(o.name for o in res.outputs)
+    assert names == ["a.dream3d", "a_features.csv", "b.dream3d",
+                     "b_features.csv"], names
+    a = (out / "a_features.csv").read_text(encoding="utf-8")
+    b = (out / "b_features.csv").read_text(encoding="utf-8")
+    assert a and b and a != b
+    assert not (out / "features.csv").exists()
 
 
 @needs_nx
