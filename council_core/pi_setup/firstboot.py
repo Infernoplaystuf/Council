@@ -63,6 +63,10 @@ class FirstBoot:
     ssh_public_keys: List[str] = field(default_factory=list)
     timezone: str = ""
     allow_password_ssh: bool = True
+    #: A host key the Council generated (pi_secrets.host_keypair) so it can
+    #: pin the Pi's identity before first boot. cloud-init images only.
+    host_key_private: str = ""
+    host_key_public: str = ""
 
     def problems(self) -> List[str]:
         """Everything that would stop the Pi coming up, in plain words."""
@@ -125,6 +129,10 @@ users:
     ssh_authorized_keys:''' + keys) if keys else ''}
 ssh_pwauth: {"true" if cfg.allow_password_ssh else "false"}
 """
+    if cfg.host_key_private and cfg.host_key_public:
+        pem = "".join(f"    {ln}\n" for ln in cfg.host_key_private.strip().splitlines())
+        user_data += ("ssh_keys:\n  ed25519_private: |\n" + pem
+                      + f"  ed25519_public: {_yaml_str(cfg.host_key_public.strip())}\n")
     if cfg.timezone:
         user_data += f"timezone: {_yaml_str(cfg.timezone)}\n"
     run = ["systemctl enable --now ssh"]

@@ -117,6 +117,21 @@ def wifi_psk(ssid: str, passphrase: str) -> str:
                                ssid.encode("utf-8"), 4096, 32).hex()
 
 
+def host_keypair() -> Tuple[str, str]:
+    """A fresh Ed25519 SSH HOST key for a Pi the Council images: (private key
+    in OpenSSH PEM, public line). It goes on the card in cloud-init's
+    ``ssh_keys``, so the Council knows the Pi's identity BEFORE it boots and
+    can recognise it on the network — no trust-on-first-use guess."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    key = Ed25519PrivateKey.generate()
+    pem = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH,
+                            serialization.NoEncryption()).decode("ascii")
+    pub = key.public_key().public_bytes(serialization.Encoding.OpenSSH,
+                                        serialization.PublicFormat.OpenSSH).decode("ascii")
+    return pem, pub
+
+
 def app_key_dir() -> Path:
     """%LOCALAPPDATA%/Council/keys (or ~/.council_keys elsewhere) — the
     app folder, NOT the vault: a vault is searched, synced and shared."""
