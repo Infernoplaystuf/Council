@@ -43,6 +43,11 @@ class Switch:
     #: Which toolbar row it belongs to. Row 2 is the personality controls.
     row: int = 1
     hint: str = ""
+    #: False while no turn reads it. The switch is still SHOWN — a removed
+    #: control is a feature nobody can tell is coming — but disabled, saying
+    #: "not available in this build yet": a live checkbox that changes
+    #: nothing reads as a broken one.
+    available: bool = True
 
 
 #: The Council toolbar, in the order the Tk shell packs it. Order is part of the
@@ -58,9 +63,13 @@ SWITCHES: Tuple[Switch, ...] = (
                 "answers. Unchecking skips it on the next message while "
                 "learning continues underneath."),
     Switch("adversarial", "Adversarial", False, shown_in_demo=False),
-    Switch("judge_panel", "Judge panel ✦", False, shown_in_demo=False),
+    # Neither is read by the turn yet (the per-role context carrier, Batch 3
+    # in docs/qt_migration/remaining_scope_2026-10-06.md).
+    Switch("judge_panel", "Judge panel ✦", False, shown_in_demo=False,
+           available=False),
     Switch("robust_voices", "Robust voices ✦", False, shown_in_demo=False, row=2,
-           hint="gives each personality a distinct character and tone"),
+           hint="gives each personality a distinct character and tone",
+           available=False),
 )
 
 SWITCHES_BY_KEY: Dict[str, Switch] = {s.key: s for s in SWITCHES}

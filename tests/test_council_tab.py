@@ -27,7 +27,7 @@ os.environ.setdefault("COUNCIL_NO_DIALOGS", "1")
 
 pytest.importorskip("PySide6", reason="the Qt tab needs PySide6")
 
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QPushButton  # noqa: E402
 
 from council_core import council_options  # noqa: E402
 from council_qt.tabs.council import (CouncilActions, CouncilTab,  # noqa: E402
@@ -692,5 +692,123 @@ def test_a_call_from_before_the_turn_is_not_this_turns_speed(
     try:
         _ask(qapp, view, "anything")
         assert view.tps_label.text() == "", view.tps_label.text()
+    finally:
+        window.request_close()
+
+
+# ============================================================
+# Controls that do nothing yet say so
+# ============================================================
+# They looked live. A click did nothing, or wrote "<what> needs the
+# deliberation extracted — it is the rest of phase 6" into the transcript —
+# the porter's to-do list, not something a user can act on. They are kept
+# (a removed button is a feature nobody can tell is coming) but disabled,
+# with a tooltip that says "not available in this build yet".
+
+UNAVAILABLE = "not available in this build yet"
+
+
+def _full(qapp, tmp_path):
+    """The non-DEMO tab: the judge side and the personality switches too."""
+    return CouncilTab(actions=CouncilActions(vault_dir=tmp_path / "vault"),
+                      demo_mode=False)
+
+
+def _check_labelled(widget, name):
+    assert not widget.isEnabled(), f"{name} is still clickable"
+    assert UNAVAILABLE in widget.toolTip(), (
+        f"{name} does not say why: {widget.toolTip()!r}")
+
+
+def test_the_unwired_controls_are_disabled_and_say_why(qapp, tmp_path):
+    view = _full(qapp, tmp_path)
+    try:
+        for name in ("find_chart_btn", "look_up_btn", "defer_btn",
+                     "expand_btn", "inst_name", "inst_text", "inst_add_btn",
+                     "inst_manage_btn", "content_style_btn", "backend_box",
+                     "vfb_agree", "vfb_disagree", "redeliberate_btn"):
+            _check_labelled(getattr(view, name), name)
+        for key in ("judge_panel", "robust_voices"):
+            _check_labelled(view._checkboxes[key], key)
+    finally:
+        view.deleteLater()
+
+
+def test_they_are_labelled_in_the_default_build_too(qapp, tmp_path):
+    view = CouncilTab(actions=CouncilActions(vault_dir=tmp_path / "vault",
+                                             demo_mode=True), demo_mode=True)
+    try:
+        for name in ("find_chart_btn", "look_up_btn", "defer_btn",
+                     "expand_btn", "inst_text", "content_style_btn",
+                     "backend_box"):
+            _check_labelled(getattr(view, name), name)
+    finally:
+        view.deleteLater()
+
+
+def test_the_controls_that_work_are_left_alone(qapp, tmp_path):
+    """Labelling must not spread: these all do something today."""
+    view = _full(qapp, tmp_path)
+    try:
+        for widget in (view.send_btn, view.save_btn, view.input,
+                       view.specialist_box):
+            assert widget.isEnabled(), widget
+        for key in ("deliberate", "tools", "stream"):
+            assert view._checkboxes[key].isEnabled(), key
+            assert UNAVAILABLE not in view._checkboxes[key].toolTip()
+    finally:
+        view.deleteLater()
+
+
+def test_reaching_one_anyway_says_not_available_not_phase_6(tab):
+    for handler in (tab.on_find_and_chart, tab.on_look_up,
+                    tab.on_defer_to_vault, tab.on_add_instruction,
+                    tab.on_manage_instructions, tab.on_content_style):
+        handler()
+    text = tab.transcript.toPlainText()
+    assert "deliberation extracted" not in text
+    assert "phase 6" not in text
+    assert text.count(UNAVAILABLE) == 6, text
+
+
+def test_no_message_in_the_tab_says_needs_the_deliberation_extracted():
+    """Read from the string constants, not the comments explaining why."""
+    import ast
+    tree = ast.parse((ROOT / "council_qt" / "tabs" / "council.py").read_text(
+        encoding="utf-8"))
+    docstrings = {id(node.body[0].value) for node in ast.walk(tree)
+                  if isinstance(node, (ast.FunctionDef, ast.ClassDef,
+                                       ast.Module))
+                  and node.body and isinstance(node.body[0], ast.Expr)}
+    said = [node.value for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and id(node) not in docstrings]
+    assert not [s for s in said if "deliberation extracted" in s]
+
+
+def test_a_refused_second_turn_does_not_point_at_a_missing_stop_button(tab):
+    """"Wait for it to finish, or press Stop" — and there is no Stop."""
+    tab._turn_active = True
+    tab.begin_turn()
+    text = tab.transcript.toPlainText()
+    assert "already running" in text
+    assert "Stop" not in text
+    assert not [b for b in tab.findChildren(QPushButton)
+                if "stop" in b.text().lower()], "there IS a Stop button now"
+
+
+def test_expand_stays_disabled_after_a_fast_answer(qapp, monkeypatch,
+                                                   tmp_path):
+    """It used to light up after every fast answer, and a click re-asked the
+    same question the same way: the same single answer, twice."""
+    from tests.test_council_turn import FakeModel, Models
+
+    window, view = _council(qapp, monkeypatch, tmp_path,
+                            Models(writer=FakeModel("a fast answer")),
+                            demo_mode=True)
+    try:
+        _ask(qapp, view, "quick one")
+        assert view._last_fast_question == "quick one"
+        _check_labelled(view.expand_btn, "expand_btn")
     finally:
         window.request_close()

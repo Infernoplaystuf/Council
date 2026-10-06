@@ -90,6 +90,14 @@ PER_TURN_FIELDS = (
     "_turn_stats_floor",    # the engine's stats seq when the turn began
 )
 
+#: What a control that does nothing yet says when hovered. It is DISABLED
+#: and says this rather than being removed: a removed button is a feature
+#: the user cannot tell is coming, and a live one that does nothing — or
+#: answers a click with "needs the deliberation extracted" in the transcript
+#: — reads as broken. docs/qt_migration/remaining_scope_2026-10-06.md lists
+#: which batch wires each; its line in _label_unavailable goes when it is.
+NOT_AVAILABLE = "{what} — not available in this build yet."
+
 #: Speakers the "▶ who" label names. The orchestrator's phase markers name a
 #: role ("▶ Writer — drafting answer") or a stage ("▶ Round 1/2 — …"); only
 #: the first kind is an active personality.
@@ -257,6 +265,8 @@ class CouncilTab(ViewHelpers, QWidget):
 
         self._turn_active = False
         self._checkboxes = {}
+        #: what -> the widgets labelled "not available in this build yet".
+        self.unavailable = {}
         self._specialists = None
         self._opts = council_options.CouncilOptions.defaults(
             demo_mode=self.demo_mode)
@@ -297,6 +307,42 @@ class CouncilTab(ViewHelpers, QWidget):
         outer.addWidget(split, 1)
 
         outer.addWidget(self._input_side())
+        self._label_unavailable()
+
+    def _label_unavailable(self) -> None:
+        """Disable every control that does nothing yet, and say so on hover.
+
+        Each of these used to look live: a click either did nothing or put
+        "<what> needs the deliberation extracted — it is the rest of phase 6"
+        into the transcript. The handlers stay (a later batch fills them in);
+        only the controls' state changes."""
+        def label(what: str, *widgets, why: str = "") -> None:
+            tip = NOT_AVAILABLE.format(what=what) + (f" {why}" if why else "")
+            for widget in widgets:
+                widget.setEnabled(False)
+                widget.setToolTip(tip)
+            self.unavailable.setdefault(what, []).extend(widgets)
+
+        label("Find & Chart", self.find_chart_btn)
+        label("Look Up", self.look_up_btn)
+        label("Defer to Vault", self.defer_btn)
+        label("Expand with council", self.expand_btn,
+              why="It would re-ask the same question the same way and "
+                  "repeat the answer: this build has no way yet to send a "
+                  "fast question to the full council.")
+        label("Council instructions", self.inst_name, self.inst_text,
+              self.inst_add_btn, self.inst_manage_btn)
+        label("Content style", self.content_style_btn)
+        label("The per-role model override", self.backend_box,
+              why="Every role answers from the model set in the Models tab.")
+        label("Responding to a verdict", self.vfb_agree, self.vfb_disagree,
+              self.redeliberate_btn,
+              why="Verdicts are not recorded yet, so there is nothing for "
+                  "an answer to attach to.")
+        for switch in council_options.SWITCHES:
+            box = self._checkboxes.get(switch.key)
+            if box is not None and not switch.available:
+                label(switch.label.replace("✦", "").strip(), box)
 
     def _transcript_side(self) -> QWidget:
         panel = QWidget()
@@ -349,8 +395,9 @@ class CouncilTab(ViewHelpers, QWidget):
         self.objection.setMaximumHeight(70)
         layout.addWidget(self.objection)
         row = QHBoxLayout()
-        self._button(row, amp("↩ Re-deliberate with objection"),
-                     self.on_disagree_submit)
+        self.redeliberate_btn = self._button(
+            row, amp("↩ Re-deliberate with objection"),
+            self.on_disagree_submit)
         self._button(row, "Cancel", self.on_disagree_cancel)
         hint = QLabel("Ctrl+Enter to submit")
         hint.setStyleSheet(f"color: {self._tokens['muted_fg']};")
@@ -385,10 +432,13 @@ class CouncilTab(ViewHelpers, QWidget):
     def _action_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
         self.send_btn = self._button(row, "Send  [Ctrl+Enter]", self.on_send)
-        self._button(row, amp("📊 Find & Chart"), self.on_find_and_chart)
-        self._button(row, amp("🔍 Look Up"), self.on_look_up)
+        self.find_chart_btn = self._button(row, amp("📊 Find & Chart"),
+                                           self.on_find_and_chart)
+        self.look_up_btn = self._button(row, amp("🔍 Look Up"),
+                                        self.on_look_up)
         self._button(row, "Clear", self.on_clear_input)
-        self._button(row, amp("⤓ Defer to Vault"), self.on_defer_to_vault)
+        self.defer_btn = self._button(row, amp("⤓ Defer to Vault"),
+                                      self.on_defer_to_vault)
         # Enabled only after a fast answer — re-asks the SAME question through
         # the full council. A4: its enabled state is per-turn and is reset in
         # reset_turn() with everything else.
@@ -462,9 +512,12 @@ class CouncilTab(ViewHelpers, QWidget):
             "e.g. always show your working as a table")
         row.addWidget(self.inst_text, 1)
         self.inst_text.returnPressed.connect(self.on_add_instruction)
-        self._button(row, "Add  [Enter]", self.on_add_instruction)
-        self._button(row, amp("Manage…"), self.on_manage_instructions)
-        self._button(row, amp("Content Style…"), self.on_content_style)
+        self.inst_add_btn = self._button(row, "Add  [Enter]",
+                                         self.on_add_instruction)
+        self.inst_manage_btn = self._button(row, amp("Manage…"),
+                                            self.on_manage_instructions)
+        self.content_style_btn = self._button(row, amp("Content Style…"),
+                                              self.on_content_style)
         self.inst_active = QLabel("")
         self.inst_active.setStyleSheet(f"color: {self._tokens['success']};")
         row.addWidget(self.inst_active)
@@ -552,8 +605,11 @@ class CouncilTab(ViewHelpers, QWidget):
         Refusing silently would read as a broken button, so it says so.
         """
         if self._turn_active:
-            self.append("Council", "A turn is already running — wait for it to "
-                                   "finish, or press Stop.", "observation")
+            # No "or press Stop": this tab has no Stop button (stopping a
+            # running turn is not built in either shell yet), and pointing
+            # at a control that is not there is worse than saying nothing.
+            self.append("Council", "A turn is already running — wait for it "
+                                   "to finish.", "observation")
             return False
         self._turn_active = True
         self.send_btn.setEnabled(False)
@@ -779,9 +835,13 @@ class CouncilTab(ViewHelpers, QWidget):
             self.set_judge(result.critique)
         if result.route == "direct" and result.answer:
             # Only a fast answer can be expanded, and only until the next turn
-            # resets it (A4).
+            # resets it (A4). The question is kept; the BUTTON stays disabled
+            # (_label_unavailable): nothing in this build can send a fast
+            # question to the full council yet — _force_full_council is reset
+            # before the options are taken and the actions never read it, and
+            # DEMO_MODE forces deliberation off — so enabling it here made a
+            # click repeat the same answer.
             self._last_fast_question = self._last_query
-            self.expand_btn.setEnabled(True)
         self._last_route = result.route
         # A3: the bar follows the verdict id, which a turn without a verdict
         # does not have.
@@ -984,11 +1044,14 @@ class CouncilTab(ViewHelpers, QWidget):
         self.clarif_frame.hide()
         self.clarif_answer.clear()
 
-    # -- not extracted, and saying so ------------------------------------
+    # -- not available yet, and saying so --------------------------------
     def _not_yet(self, what: str) -> None:
-        self.append("Council",
-                    f"{what} needs the deliberation extracted — it is the "
-                    "rest of phase 6.", "observation")
+        """What one of these says if it is reached at all — the controls are
+        disabled (_label_unavailable), so only code can get here. It used to
+        say "needs the deliberation extracted — it is the rest of phase 6",
+        which is the porter's to-do list, not something a user can act on."""
+        self.append("Council", NOT_AVAILABLE.format(what=what),
+                    "observation")
 
     def on_find_and_chart(self) -> None:
         self._not_yet("Find & Chart")
