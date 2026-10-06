@@ -160,6 +160,20 @@ def test_automatic_mode_still_waits_on_an_objection(qapp, make_tab):
     assert tab.actions.store.requests()[0].status == "rejected"
 
 
+def test_setting_says_drafts_are_test_run_and_reject_says_what_happened(qapp, make_tab):
+    import app_built_tools as abt
+    tab, _ = make_tab(verdicts={"judge": [False], "skeptic": [False]})
+    assert "sandbox" in tab.attach_box.itemText(0)
+    tab.on_new()
+    tab.tool_request.setPlainText("count the rows")
+    tab.on_build_tool()
+    drive(qapp, tab)
+    tab.requests.setCurrentRow(0)
+    tab.reject_btn.click()
+    assert "not added to Tool Creation" in tab.status.text()
+    assert abt.list_tools(tab.actions.vault_dir) == []
+
+
 def test_delete_asks_first(qapp, make_tab):
     tab, _ = make_tab(confirm=False)
     tab.on_new()

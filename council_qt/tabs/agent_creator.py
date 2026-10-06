@@ -10,8 +10,12 @@ built; then try the agent on a goal.
 
 The setting at the top decides what happens when the council finishes a tool:
 "Wait for my approval" (the default) or "Add automatically when every
-reviewer approves". Automatic never attaches a tool a reviewer objected to or
-whose sandbox test failed — those always wait.
+reviewer approves". Automatic never attaches a tool a reviewer objected to,
+raised a concern about, or whose sandbox test failed — those always wait.
+Either way a draft that needs no arguments is test-run in the read-only
+sandbox while the council works, so the setting's label says so. Drafts
+are not saved to Tool Creation; an approved tool is copied there under a
+name no other tool has.
 
 All logic is council_core.agent_profiles; this view collects choices and runs
 the council and the agent on worker threads ("agent-creator-*").
@@ -35,7 +39,8 @@ from council_core.model_slots import COUNCIL_ROLES, ROLE_LABELS
 from .. import dialogs, theme
 from ..view import ViewHelpers, amp
 
-ATTACH_CHOICES = (("approve", "Wait for my approval"),
+ATTACH_CHOICES = (("approve", "Wait for my approval (drafts are still test-run in "
+                              "the read-only sandbox)"),
                   ("automatic", "Add automatically when every reviewer approves"))
 STATUS_TEXT = {"drafting": "being written", "reviewing": "being reviewed",
                "waiting": "waiting for you", "attached": "attached",
@@ -388,7 +393,8 @@ class AgentCreatorTab(ViewHelpers, QWidget):
         if req is None:
             return
         self.actions.store.reject(req.id)
-        self.status.setText("Rejected. The tool stays in Tool Creation, unattached.")
+        self.status.setText("Rejected. Nothing was attached, and the draft was not "
+                            "added to Tool Creation.")
         self._fill_requests(select=req.id)
 
     # ------------------------------------------------------------------

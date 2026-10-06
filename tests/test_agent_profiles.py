@@ -235,3 +235,82 @@ def test_graph_tools_read_the_knowledge_graph(tmp_path):
 def test_entry_params_schema():
     assert ap.entry_params('def f(column: str, limit=10):\n    pass') == {
         "column": "str (required)", "limit": "value (optional, default 10)"}
+
+
+# ── review fixes (merge of knowledge-graph into qt-migration) ─────────────
+@pytest.mark.parametrize("verdict", ['{"approve": "false", "concerns": ["do not attach"]}',
+                                     '{"approve": "no", "concerns": ["x"]}',
+                                     '{"approve": [false], "concerns": []}',
+                                     '{"approve": 1, "concerns": []}',
+                                     '{"approve": "true", "concerns": []}'])
+def test_only_a_json_true_is_an_approval(verdict):
+    r = ap._parse_review("judge", verdict, 1)
+    assert r.approve is False and r.error
+
+
+def test_automatic_mode_does_not_attach_over_a_string_no(store, profile):
+    store.set_tool_attach_mode("automatic")
+    no = '{"approve": "false", "concerns": ["do not attach"]}'
+    council = Council([GOOD_TOOL], {"judge": [no], "skeptic": [no]})
+    req = ap.build_tool(store, profile.id, "count rows", chat=council)
+    assert req.status == "waiting" and req.decided_by == ""
+    assert store.get(profile.id).tools == []
+
+
+def test_automatic_mode_needs_approvals_without_concerns(store, profile):
+    store.set_tool_attach_mode("automatic")
+    hedged = '{"approve": true, "concerns": ["it reads every file in the folder"]}'
+    council = Council([GOOD_TOOL], {"judge": [True], "skeptic": [hedged]})
+    req = ap.build_tool(store, profile.id, "count rows", chat=council)
+    assert req.status == "waiting"
+    assert store.get(profile.id).tools == []
+
+
+USER_TOOL = 'def count_rows(name="ok.csv"):\n    return pd.DataFrame({"rows": [42]})'
+
+
+def test_a_council_draft_never_overwrites_a_users_tool(store, profile):
+    import app_built_tools as abt
+    import tool_forge
+    ok, _msg, _name = tool_forge.save_edited_tool(USER_TOOL, author="user",
+                                                  vault_dir=store.vault)
+    assert ok
+    before = abt.get_tool_code("count_rows", store.vault)
+    council = Council([GOOD_TOOL, FIXED_TOOL], {"judge": [False], "skeptic": [False]})
+    req = ap.build_tool(store, profile.id, "count rows", chat=council)
+    assert req.status == "waiting" and "Rows in a CSV" in req.code
+    # The user's tool is untouched, still theirs, and the draft is not installed.
+    assert abt.get_tool_code("count_rows", store.vault) == before
+    assert abt.get_tool("count_rows", store.vault)["author"] == "user"
+    assert [t["name"] for t in abt.list_tools(store.vault)] == ["count_rows"]
+    store.reject(req.id)
+    assert [t["name"] for t in abt.list_tools(store.vault)] == ["count_rows"]
+    df, msg = abt.run_tool("count_rows", {}, vault_dir=store.vault)
+    assert df is not None and df.to_dict(orient="records") == [{"rows": 42}], msg
+
+
+def test_an_approved_council_tool_joins_tool_creation_under_a_free_name(store, profile):
+    import app_built_tools as abt
+    import tool_forge
+    tool_forge.save_edited_tool(USER_TOOL, author="user", vault_dir=store.vault)
+    council = Council([GOOD_TOOL], {"judge": [True], "skeptic": [True]})
+    req = ap.build_tool(store, profile.id, "count rows", chat=council)
+    store.approve(req.id)
+    names = {t["name"]: t for t in abt.list_tools(store.vault)}
+    assert names["count_rows"]["author"] == "user"
+    council_copy = [n for n, t in names.items() if t["author"].startswith("council")]
+    assert council_copy and council_copy[0] != "count_rows"
+    assert store.get_request(req.id).library_name == council_copy[0]
+    # The agent still runs its pinned code under the tool's own name.
+    tool = store.get(profile.id).tools[0]
+    assert tool.name == "count_rows"
+    assert ap.run_attached_tool(tool, {}, [store.vault / "data_in"])["preview"] == [{"rows": 3}]
+
+
+def test_a_failed_draft_leaves_nothing_in_tool_creation(store, profile):
+    import app_built_tools as abt
+    broken = '```python\ndef count_rows(name="missing.csv"):\n    return pd.read_csv(name)\n```'
+    council = Council([broken], {"judge": [True], "skeptic": [True]})
+    req = ap.build_tool(store, profile.id, "count rows", chat=council)
+    assert req.status == "failed"
+    assert abt.list_tools(store.vault) == []

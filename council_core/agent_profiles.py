@@ -4,9 +4,12 @@ A profile is what the user called an agent: a model (by role), the roles
 connected to it, the tools it may use, a step budget and instructions. The user
 can also describe a tool they want, and the council builds it:
 
-  1. the drafter role (coder) writes it — tool_forge.generate_tool, which
-     validates it in the analyst sandbox and test-runs it when it needs no
-     arguments, fixing errors up to three times;
+  1. the drafter role (coder) writes it — tool_forge.generate_tool(save=False),
+     which validates it in the analyst sandbox and test-runs it from memory
+     when it needs no arguments, fixing errors up to three times. The draft
+     is NOT saved to the shared App_Built_tools library (save_tool overwrites
+     by name, so a draft could replace a user's tool and stay runnable after
+     a rejection); an approved tool is copied there under a free name;
   2. each connected role (judge and skeptic by default) reviews the code
      against the request and the sandbox rules and answers approve /
      concerns, as JSON;
@@ -16,8 +19,9 @@ can also describe a tool they want, and the council builds it:
      user's setting ``tool_attach``:
        "approve"   (default) every council-made tool waits for the user;
        "automatic" attached at once — but ONLY when every reviewer approved
-                   and the sandbox test passed (or the tool needs arguments
-                   and so could not be test-run); anything else still waits.
+                   with a JSON ``true`` and no concerns, and the sandbox test
+                   passed (or the tool needs arguments and so could not be
+                   test-run); anything else still waits.
 
 What an agent may use, and why it is safe:
   * built-in tools are the READ-ONLY ones (list / search / read files, the
@@ -141,6 +145,7 @@ class ToolRequest:
     decided_by: str = ""            # user | automatic
     created_ts: float = field(default_factory=time.time)
     decided_ts: float = 0.0
+    library_name: str = ""          # its copy in Tool Creation, once approved
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "ToolRequest":
@@ -153,6 +158,14 @@ class ToolRequest:
     def all_approved(self) -> bool:
         last = _last_round(self.reviews)
         return bool(last) and all(r.approve and not r.error for r in last)
+
+    @property
+    def approved_without_concerns(self) -> bool:
+        """What automatic attachment needs: every reviewer approved AND none
+        raised a concern (the review prompt says concerns are empty when
+        approving; an approval with concerns is a hedge for the user)."""
+        return self.all_approved and not any(
+            c for r in _last_round(self.reviews) for c in r.concerns)
 
     @property
     def test_ok(self) -> bool:
@@ -317,8 +330,23 @@ class ProfileStore:
             approved_by=by, request_id=req.id))
         self.save(prof)
         req.status, req.decided_by, req.decided_ts = "attached", by, time.time()
+        req.library_name = self._add_to_library(req)
         self.put_request(req)
         return prof
+
+    def _add_to_library(self, req: ToolRequest) -> str:
+        """A copy of the approved tool in Tool Creation (App_Built_tools),
+        under a name no other tool has — never over a tool someone else
+        made. Best effort: the agent runs its pinned copy either way."""
+        try:
+            import app_built_tools as abt
+            name = abt.free_name(req.tool_name, self.vault)
+            ok, _msg, saved = abt.save_tool(name, req.description, req.code,
+                                            author=f"council:{DRAFTER_ROLE}",
+                                            vault_dir=self.vault)
+            return (saved or "") if ok else ""
+        except Exception:                                 # noqa: BLE001
+            return ""
 
     def reject(self, rid: str) -> None:
         req = self.get_request(rid)
@@ -371,8 +399,15 @@ def _parse_review(role: str, reply: str, rnd: int) -> Review:
     try:
         m = re.search(r"\{.*\}", reply or "", re.S)
         d = json.loads(m.group(0) if m else reply)
-        return Review(role=role, approve=bool(d.get("approve")),
-                      concerns=[str(c) for c in (d.get("concerns") or [])][:6], round=rnd)
+        verdict = d.get("approve")
+        concerns = d.get("concerns") or []
+        if not isinstance(verdict, bool) or not isinstance(concerns, list):
+            # Only a JSON true approves. bool("false") is True — MEASURED: a
+            # backend that cannot enforce the schema answered
+            # {"approve": "false"} and the tool was attached automatically.
+            raise ValueError(f"approve is {verdict!r}, not true or false")
+        return Review(role=role, approve=verdict,
+                      concerns=[str(c) for c in concerns][:6], round=rnd)
     except Exception:
         # An unreadable review is not an approval.
         return Review(role=role, approve=False, round=rnd,
@@ -402,11 +437,14 @@ def build_tool(store: ProfileStore, profile_id: str, description: str, *,
 
     def draft(task: str) -> bool:
         say(f"The {DRAFTER_ROLE} is writing the tool…")
+        # save=False: the draft lives only in this request until someone
+        # approves it (see ProfileStore.approve), so it can never replace a
+        # tool in the shared library or stay runnable after a rejection.
         ok, msg, name, code = tool_forge.generate_tool(
             task, lambda prompt: chat(DRAFTER_ROLE, [{"role": "user", "content": prompt}],
                                       max_tokens=700),
             description=description, author=f"council:{DRAFTER_ROLE}",
-            vault_dir=store.vault)
+            vault_dir=store.vault, save=False)
         req.code, req.message = code or req.code, msg
         if not ok or not name:
             req.status = "failed"
@@ -449,7 +487,8 @@ def build_tool(store: ProfileStore, profile_id: str, description: str, *,
 
     req.status = "waiting"
     store.put_request(req)
-    if store.tool_attach_mode() == "automatic" and req.all_approved and req.test_ok:
+    if (store.tool_attach_mode() == "automatic" and req.approved_without_concerns
+            and req.test_ok):
         say("Every reviewer approved and the sandbox test passed; attaching.")
         store.approve(req.id, by="automatic")
         return store.get_request(req.id)
