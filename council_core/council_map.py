@@ -135,9 +135,10 @@ _NODES: Tuple[Node, ...] = (
          "the rounds run out).", "council_core/deliberation.py:858-895"),
     Node("judge", "Judge", "judge",
          "Routes the question to a panel, ranks the candidates, critiques "
-         "the synthesis (PASS / NEEDS_WORK + REQUIRED_CHANGES). Deliberately "
-         "given no vault, history or prior-session context.",
-         "council_engine.py:6531-6700; council_engine.py:5608"),
+         "the synthesis (PASS / NEEDS_WORK + REQUIRED_CHANGES). Routes "
+         "with no context, on purpose; ranks and critiques with the vault's "
+         "evidence when 📚 Vault found some.",
+         "council_engine.py (JudgeModel); council_core/deliberation.py"),
     Node("writer", "Writer", "member",
          "The default synthesizer: writes the one answer from every "
          "candidate, rebuttal, the discussion, the judge's ranking, the "
@@ -156,8 +157,9 @@ _NODES: Tuple[Node, ...] = (
          "Attacks the question. Given no vault and no history on purpose.",
          "council_engine.py:5591"),
     Node("sage", "Sage", "member",
-         "Long-view answers. Has a knowledge base (SageAgent) the turn never "
-         "uses.", "sage_agent.py:311-332"),
+         "Long-view answers, from its own knowledge base (taught in the "
+         "Agents tab) as well as the vault; logs what it admits it lacks.",
+         "sage_agent.py; council_core/vault_context.py (sage_block)"),
     Node("strategist", "Strategist", "member", "Plans.",
          "council_engine.py:5584"),
     Node("intern", "Intern", "member",
@@ -303,18 +305,19 @@ def _edges() -> List[Edge]:
                "about; the memo would carry it.", cite="task_memory.py:363"),
         E("task_memo", "question", "[TASK MEMO]", "context",
           note="See question → task memo.", cite="task_memory.py:459"),
-        E("librarian", "judge", "evidence, to check claims against",
-          "context",
-          note="The judge ranks and critiques with no vault context: it "
-               "cannot tell a cited answer from a confident one.",
-          cite="council_engine.py:5608"),
+        E("librarian", "judge", "evidence from the vault, to check claims "
+          "against — when ranking and critiquing only", "context", "live",
+          cite="council_core/vault_context.py (evidence); "
+               "council_core/deliberation.py (judge_evidence)"),
         E("librarian", "wishlist", "what the vault could not answer",
           "context", note="Nothing logs vault gaps during a turn.",
           cite="council_engine.py:6736"),
-        E("sage_kb", "sage", "knowledge-base passages", "context",
-          note="The turn wraps the plain sage model (sage_agent_obj is "
-               "None), so SageAgent.respond's injection never runs.",
-          cite="council_core/council_turn.py:293; sage_agent.py:320-332"),
+        E("sage_kb", "sage", "its domains, facts and your corrections "
+          "for the question", "context", "live",
+          cite="council_core/vault_context.py (sage_block)"),
+        E("sage", "sage_kb", "the gaps it admits (GAP: …), after the "
+          "answer", "memory", "live",
+          cite="council_core/after_turn.py (log_sage_gap)"),
         E("mcp_docs", "docs", "documentation pages", "context", "live",
           cite="council_core/docs_qa.py:2034-2052"),
         E("docs", "coder", "API docs for the code it writes", "context",
@@ -927,14 +930,15 @@ GUIDE: Tuple[GuideStep, ...] = (
         "council_qt/tabs/fanout.py"),
     GuideStep(
         "What is not connected yet",
-        "The green dashed lines are the map's suggestions: the Judge "
-        "checking answers against the vault's evidence, the Sage's "
-        "knowledge base, past debates being remembered. A red "
+        "The green dashed lines are the map's suggestions: past debates "
+        "being remembered, the Docs role helping the Coder, the Analyst "
+        "computing figures from your data files, evidence for the Skeptic. "
+        "A red "
         "line, if any, is wired but never takes effect.\n\n"
         "Press 'What's missing' for the full list with the reason for each, "
         "or tick 'Only what is not live' to see just those lines.",
-        ("librarian", "vault_rag", "vault_search", "sage_kb",
-         "council_memory", "wishlist", "analyst", "task_memo"),
+        ("council_memory", "docs", "coder", "analyst", "task_memo",
+         "skeptic", "librarian"),
         "council_core/council_map.py (the table of links)"),
 )
 

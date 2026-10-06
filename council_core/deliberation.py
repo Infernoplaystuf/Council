@@ -849,7 +849,16 @@ class DeliberationOrchestrator:
 
             # 4) Judge ranks
             self._phase("Judge — ranking candidates")
-            rank_json = self.judge.rank_candidates(user_text, candidates)
+            # The vault's evidence, for ranking and critique only (never for
+            # routing): ctx.shared["judge_evidence"], set by the front end
+            # (council_core.vault_context.evidence). Passed only when there
+            # is some, so a judge without the keyword still works.
+            _evidence = str(ctx.shared.get("judge_evidence") or "")
+            if _evidence:
+                rank_json = self.judge.rank_candidates(
+                    user_text, candidates, extra_context=_evidence)
+            else:
+                rank_json = self.judge.rank_candidates(user_text, candidates)
             ctx.shared["judge_ranking"] = rank_json
             try:
                 import json as _rj
@@ -939,7 +948,10 @@ class DeliberationOrchestrator:
 
             # 6) Judge critiques
             self._phase("Judge — critiquing synthesis")
-            critique = self.judge.critique(user_text, synth_final, extra_context=f"Ranking:\n{rank_json}", query_mode=ctx.shared.get("query_mode", ""))
+            _crit_ctx = f"Ranking:\n{rank_json}"
+            if _evidence:
+                _crit_ctx += f"\n\n{_evidence}"
+            critique = self.judge.critique(user_text, synth_final, extra_context=_crit_ctx, query_mode=ctx.shared.get("query_mode", ""))
             ctx.shared["judge_critique"] = critique
             ev = AgentEvent("Judge", "observation", critique)
             emit(ev)

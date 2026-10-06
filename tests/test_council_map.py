@@ -80,12 +80,13 @@ def test_the_judge_is_the_controller_of_placement():
 
 def test_the_facts_the_map_is_for():
     m = cm.static_map()
-    # The judge sees no vault evidence — only a proposal.
-    assert _edge(m, "librarian", "judge", "evidence").status == "proposed"
+    # The judge ranks and critiques with the vault's evidence.
+    assert _edge(m, "librarian", "judge", "evidence").status == "live"
     # The coder gets its tools.
     assert _edge(m, "tools", "coder").status == "live"
-    # The Sage knowledge base is not used by the turn.
-    assert _edge(m, "sage_kb", "sage").status == "proposed"
+    # The Sage reads its knowledge base and logs its gaps there.
+    assert _edge(m, "sage_kb", "sage").status == "live"
+    assert _edge(m, "sage", "sage_kb").status == "live"
     # The vault reaches the turn — in full for the writer, partly for the
     # peasant, not at all for the skeptic and the judge.
     assert _edge(m, "librarian", "writer").status == "live"

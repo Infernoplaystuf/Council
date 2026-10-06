@@ -196,15 +196,28 @@ class CouncilActions:
         # The vault passages this question needs, for this question only
         # (council_core.vault_context). Which roles see them is the engine's
         # per-role rule; the transcript says what was found.
-        block = ""
+        block, judge_evidence = "", ""
         if getattr(options, "vault", True):
             brief = self.vault_brief(typed_text)
             block = brief.text
+            judge_evidence = vault_context.evidence(brief)
             if on_event is not None:
                 from council_core.deliberation import AgentEvent
                 on_event(AgentEvent("Librarian", "observation", brief.note()))
 
-        with vault_context.applied(vault_context.turn_models(models), block):
+        # The Sage's own knowledge base, for the Sage alone.
+        sage = getattr(models, "sage", None)
+        sage_kb = vault_context.sage_block(typed_text, self.vault_dir) \
+            if sage is not None else ""
+        if sage_kb and on_event is not None:
+            from council_core.deliberation import AgentEvent
+            n = sum(1 for line in sage_kb.splitlines()
+                    if line.strip().startswith(("[", "•")))
+            on_event(AgentEvent("Librarian", "observation",
+                                f"Sage: {n} item(s) from its knowledge base."))
+
+        with vault_context.applied(vault_context.turn_models(models), block), \
+                vault_context.applied([sage] if sage_kb else [], sage_kb):
             if not getattr(options, "deliberate", True):
                 # The fast path: one personality, no panel, no verdict. It is
                 # a real answer and it is NOT a deliberation, so it produces
@@ -217,6 +230,8 @@ class CouncilActions:
                 enable_tools=enable_tools,
                 tools=self.tools() if enable_tools else None,
                 parallel_members=bool(getattr(options, "parallel", False)),
+                extra_ctx=({"judge_evidence": judge_evidence}
+                           if judge_evidence else None),
                 on_event=on_event,
                 on_token=on_token if getattr(options, "stream", True)
                 else None)
@@ -660,6 +675,7 @@ class CouncilTab(ViewHelpers, QWidget):
                 return
             if learned is not None and (learned.roles_updated
                                         or learned.gaps_logged
+                                        or learned.sage_gap
                                         or learned.errors):
                 said = "Kept from this question: " + learned.summary()
                 self._to_ui(lambda: self.append("Librarian", said,

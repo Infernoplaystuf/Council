@@ -16,9 +16,9 @@ WHO SEES IT is the engine's existing rule, not a new one: each model's
 standing extra_context is folded into every respond(), and
 council_engine.ROLE_CONTEXT_PROFILES gates a "VAULT CONTEXT:" block per role
 — in full for the Writer, Coder, Sage and Strategist, the first 1,500
-characters for the Peasant, none for the Intern, Artist, Skeptic and Judge
-(the Judge stays evidence-blind by design; giving it evidence is a separate
-step).
+characters for the Peasant, none for the Intern, Artist, Skeptic and Judge.
+The Judge gets the same passages another way (`evidence`): only when it
+ranks and critiques, never when it routes.
 
 THE SEARCH: semantic when the vault already has a semantic index (the
 Agents tab builds it); otherwise keyword (TF-IDF) search, which loads no
@@ -172,6 +172,38 @@ def build(question: str, vault_dir: Path, *, rag: Any = None,
     return Brief("".join(parts).rstrip(), sources, backend)
 
 
+EVIDENCE_MARKER = "EVIDENCE FROM THE USER'S VAULT:"
+EVIDENCE_HEADER = (
+    EVIDENCE_MARKER + "\nUse these passages to check the candidates' facts. "
+    "Prefer an answer the evidence supports; name any claim it contradicts; "
+    "an answer that ignores evidence which bears on the question should not "
+    "win. If the passages do not bear on the question, ignore them.\n")
+
+
+def evidence(brief: Brief) -> str:
+    """The same passages, worded for the Judge. A different marker on
+    purpose: the engine strips a VAULT CONTEXT block from the Judge (it
+    routes without context, by design), but ranking and critique are where
+    evidence belongs. Passed through ctx.shared["judge_evidence"]."""
+    text = getattr(brief, "text", "") or ""
+    if not text.startswith(HEADER):
+        return ""
+    return EVIDENCE_HEADER + text[len(HEADER):]
+
+
+def sage_block(question: str, vault_dir: Path) -> str:
+    """What the Sage's own knowledge base (<vault>/sage_knowledge, taught
+    in the Agents tab) holds for this question — its domains, facts and the
+    user's corrections — or "". The SageAgent wrapper injected this; the Qt
+    turn never used that wrapper, so the base was built and never read."""
+    try:
+        import sage_agent
+        kb = sage_agent.SageKnowledge(Path(vault_dir) / "sage_knowledge")
+        return kb.build_context_block(question or "")
+    except Exception:                                     # noqa: BLE001
+        return ""
+
+
 _apply_lock = threading.Lock()
 
 
@@ -214,4 +246,5 @@ def turn_models(models: Any, roles: Optional[Iterable[str]] = None
     return [m for m in out if m is not None]
 
 
-__all__ = ["MARKER", "Brief", "build", "applied", "turn_models"]
+__all__ = ["MARKER", "EVIDENCE_MARKER", "Brief", "build", "applied",
+           "turn_models", "evidence", "sage_block"]

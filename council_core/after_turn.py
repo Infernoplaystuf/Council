@@ -44,6 +44,7 @@ def memory_enabled() -> bool:
 @dataclass
 class Learned:
     gaps_logged: int = 0
+    sage_gap: str = ""
     roles_updated: List[str] = field(default_factory=list)
     project_updated_by: str = ""
     errors: List[str] = field(default_factory=list)
@@ -56,6 +57,9 @@ class Learned:
             parts.append(f"project notes by the {self.project_updated_by}")
         if self.gaps_logged:
             parts.append(f"{self.gaps_logged} gap(s) added to the wishlist")
+        if self.sage_gap:
+            parts.append(f"the Sage noted a gap in its knowledge "
+                         f"({self.sage_gap})")
         text = "; ".join(parts) or "nothing new to keep"
         if self.errors:
             text += f" ({len(self.errors)} problem(s): {self.errors[0]})"
@@ -86,6 +90,27 @@ def log_gaps(vault_dir: Path, gaps: Sequence[Dict[str, Any]],
     return n
 
 
+def log_sage_gap(result: Any, vault_dir: Path, knowledge: Any = None) -> str:
+    """If the Sage's answer says it lacks something ("GAP: …", "I don't
+    know…" — sage_agent.detect_gap), log it to the Sage's own gaps
+    (<vault>/sage_knowledge/gaps.jsonl, shown in the Agents tab). Returns
+    the reason, or "". SageAgent.respond did this; the Qt turn did not."""
+    answers = [e.text for e in getattr(result, "events", []) or []
+               if getattr(e, "who", "") == "Sage"
+               and getattr(e, "kind", "") == "final"]
+    if not answers:
+        return ""
+    import sage_agent
+    reason = sage_agent.detect_gap(answers[-1])
+    if not reason:
+        return ""
+    if knowledge is None:
+        knowledge = sage_agent.SageKnowledge(Path(vault_dir) /
+                                             "sage_knowledge")
+    knowledge.log_gap(_question(result), reason=reason)
+    return reason
+
+
 def _memory_manager(models: Any) -> Any:
     for name in ("writer", "judge", "coder", "intern"):
         model = getattr(models, name, None)
@@ -107,6 +132,11 @@ def learn(models: Any, result: Any, vault_dir: Path, *,
                                                       []) or [], librarian)
     except Exception as exc:                              # noqa: BLE001
         out.errors.append(f"wishlist: {exc}")
+
+    try:
+        out.sage_gap = log_sage_gap(result, vault_dir)
+    except Exception as exc:                              # noqa: BLE001
+        out.errors.append(f"sage gaps: {exc}")
 
     if not (memory_enabled() if memory is None else memory):
         return out
@@ -156,5 +186,5 @@ def _question(result: Any) -> str:
     return str(getattr(result, "question", "") or "")
 
 
-__all__ = ["learn", "log_gaps", "memory_enabled", "Learned",
+__all__ = ["learn", "log_gaps", "log_sage_gap", "memory_enabled", "Learned",
            "OBSERVER_ORDER"]
