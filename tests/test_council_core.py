@@ -139,10 +139,11 @@ def test_long_names_are_trimmed_the_same_way_for_both_front_ends():
 # ==================================================== descriptions / embeddings
 
 class _DescIndex:
-    def __init__(self, described=0, total=3, fail=False):
+    def __init__(self, described=0, total=3, fail=False, unanswered=0):
         self.records = {f"f{i}.csv": ({"description": "x"} if i < described
                                       else {}) for i in range(total)}
         self.fail = fail
+        self.unanswered = unanswered
         self.rebuilt = 0
 
     def rebuild(self, **_kw):
@@ -150,10 +151,15 @@ class _DescIndex:
         return 0
 
     def generate_descriptions(self, on_progress=None):
+        """As VaultIndex's does: writes each record's description, and with
+        ``unanswered`` stores an EMPTY one for those and still counts them
+        as updated — the real method's behaviour when no model answers."""
         if self.fail:
             raise RuntimeError("the model is not loaded")
         pending = [k for k, v in self.records.items() if not v.get("description")]
         for i, name in enumerate(pending, 1):
+            unanswered = i <= self.unanswered
+            self.records[name]["description"] = "" if unanswered else "a table"
             if on_progress:
                 on_progress(i, len(pending), name)
         return len(pending)
@@ -191,27 +197,85 @@ def test_build_descriptions_reports_a_failure_rather_than_raising():
     assert not result.ok and "Description build failed" in result.message
 
 
+def test_files_no_model_described_are_counted_as_failures_not_successes():
+    """generate_descriptions counts a file whose model call failed as
+    updated. The result is read from the records, so "3 files summarized"
+    with two empty descriptions cannot be said."""
+    result = vault_ops.build_descriptions(_DescIndex(total=3, unanswered=2))
+    assert not result.ok, result.message
+    assert "1 of 3 files summarized" in result.message, result.message
+    assert "2 could not be described" in result.message, result.message
+    assert "Models tab" in result.message
+    assert result.indexed == 1
+
+
+def test_a_stored_describe_error_is_the_reason_given():
+    index = _DescIndex(total=1, unanswered=1)
+    real = index.generate_descriptions
+
+    def with_error(on_progress=None):
+        done = real(on_progress)
+        for record in index.records.values():
+            record["_describe_error"] = "ConnectionRefusedError(10061)"
+        return done
+
+    index.generate_descriptions = with_error
+    result = vault_ops.build_descriptions(index)
+    assert not result.ok and "ConnectionRefusedError" in result.message
+
+
 class _EmbIndex:
     class _Emb:
         model_name = "all-MiniLM-L6-v2"
+        vectors = 2
 
         def stats(self):
-            return {"vectors": 2, "dim": 384, "size_kb": 12}
+            return {"vectors": self.vectors,
+                    "dim": 384 if self.vectors else None,
+                    "size_kb": 12 if self.vectors else 0}
 
-    def __init__(self, available=True):
+    def __init__(self, available=True, vectors=2, error=None):
         self.records = {"a.csv": {}, "b.csv": {}}
         self._available = available
+        self._emb = self._Emb()
+        self._emb.vectors = vectors
+        self._error = error
 
     def rebuild(self, **_kw):
         return 0
 
     def embeddings(self):
-        return self._Emb() if self._available else None
+        return self._emb if self._available else None
 
     def build_embeddings(self, on_progress=None):
+        """VaultIndex's: an error is printed and kept, never raised."""
+        self.last_embedding_error = self._error
+        if self._error is not None:
+            return 0
         if on_progress:
             on_progress(2, 2, "b.csv")
         return 2
+
+
+def test_an_embedding_error_the_index_kept_is_reported_as_a_failure():
+    """VaultIndex.build_embeddings prints its error and returns 0. That came
+    back as "Vectors ready — 0 files (None-dim, 0 KB on disk)" in green."""
+    error = RuntimeError("Could not load embedding model 'all-MiniLM-L6-v2': "
+                         "offline\n\nFix one of these:\n  1. …")
+    result = vault_ops.build_embeddings(_EmbIndex(vectors=0, error=error))
+    assert not result.ok, result.message
+    assert result.message == ("Embedding build failed: Could not load "
+                              "embedding model 'all-MiniLM-L6-v2': offline")
+    assert result.error is error
+
+
+def test_files_with_no_vectors_after_a_build_is_a_failure():
+    """An index object that does not keep its error still cannot report
+    success for a vault whose files got no vectors."""
+    result = vault_ops.build_embeddings(_EmbIndex(vectors=0))
+    assert not result.ok, result.message
+    assert "No vectors were built for the 2 files" in result.message
+    assert "Vectors ready" not in result.message
 
 
 def test_a_missing_optional_dependency_is_a_sentence_not_a_traceback():

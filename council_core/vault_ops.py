@@ -125,8 +125,8 @@ def build_descriptions(index: Any,
     except Exception:                                     # noqa: BLE001
         pass
     records = getattr(index, "records", {}) or {}
-    pending = sum(1 for r in records.values() if not r.get("description"))
-    if pending == 0:
+    pending = [r for r in records.values() if not r.get("description")]
+    if not pending:
         return IndexResult(True,
                            f"All {len(records)} files already have descriptions.",
                            indexed=0, total=len(records))
@@ -134,6 +134,24 @@ def build_descriptions(index: Any,
         done = index.generate_descriptions(on_progress=on_progress)
     except Exception as exc:                              # noqa: BLE001
         return IndexResult(False, f"Description build failed: {exc!r}", error=exc)
+    # COUNTED FROM THE RECORDS, NOT FROM `done`. generate_descriptions counts
+    # a file as updated when its model call failed too — it swallows the
+    # error and stores an empty description — so with no model set every text
+    # file came back "summarized", in success green, and the next click
+    # offered to describe the same files again. Measured in review: a .txt,
+    # no model, "Descriptions complete — 1 files summarized.", description ""
+    # on disk.
+    missing = [r for r in pending if not r.get("description")]
+    if missing:
+        described = len(pending) - len(missing)
+        reason = next((str(r["_describe_error"]) for r in missing
+                       if r.get("_describe_error")), "")
+        return IndexResult(
+            False,
+            f"Descriptions: {described} of {len(pending)} files summarized; "
+            f"{len(missing)} could not be described — is a model set in the "
+            f"Models tab?" + (f" ({reason})" if reason else ""),
+            indexed=described, total=len(records))
     return IndexResult(True, f"Descriptions complete — {done} files summarized.",
                        indexed=done, total=len(records))
 
@@ -182,7 +200,26 @@ def build_embeddings(index: Any,
         done = index.build_embeddings(on_progress=on_progress)
     except Exception as exc:                              # noqa: BLE001
         return IndexResult(False, f"Embedding build failed: {exc!r}", error=exc)
+    # VaultIndex.build_embeddings does not raise: it prints the error to
+    # stderr and returns 0. So a model that could not load (offline, not
+    # cached) came back as "Vectors ready — 0 files (None-dim, 0 KB on
+    # disk)." at success level. It keeps the error it printed, and the first
+    # line of it is the sentence (the rest is a numbered how-to, already in
+    # the console). An index that does not keep it still cannot call a vault
+    # with files and no vectors "ready".
+    error = getattr(index, "last_embedding_error", None)
     stats = embeddings.stats()
+    records = getattr(index, "records", {}) or {}
+    if error is not None:
+        first = (str(error).strip().splitlines() or [repr(error)])[0]
+        return IndexResult(False, f"Embedding build failed: {first}",
+                           indexed=0, total=stats["vectors"], error=error)
+    if records and not stats["vectors"]:
+        return IndexResult(
+            False,
+            f"No vectors were built for the {len(records)} files — the "
+            f"embedding model ({embeddings.model_name}) could not be used; "
+            f"the console says why.", indexed=0, total=0)
     return IndexResult(
         True,
         f"Vectors ready — {stats['vectors']} files "

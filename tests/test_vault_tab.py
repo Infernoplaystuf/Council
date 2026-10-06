@@ -195,3 +195,78 @@ def test_the_failure_is_reported_as_one(tab, qapp, monkeypatch):
     assert _pump(qapp, lambda: _all_enabled(tab))
     assert any("disk gone" in message and level == "err"
                for message, level in levels), levels
+
+
+# ============================================================
+# A failure the operation does NOT raise is still a failure
+# ============================================================
+# The two real failures a user meets — no model to describe a text file, an
+# embedding model that cannot load (offline, not cached) — never raise:
+# VaultIndex swallows them. generate_descriptions stores an empty
+# description and counts the file as "updated"; build_embeddings prints to
+# stderr and returns 0. So both came back as green success ("Descriptions
+# complete — 1 files summarized.", "Vectors ready — 0 files (None-dim…)"),
+# and the next click offered the same work again. Driven through the REAL
+# VaultIndex; only the model call is stood in.
+
+def _levels(tab, monkeypatch):
+    levels = []
+    real_append = tab.append
+    monkeypatch.setattr(tab, "append",
+                        lambda message, level="info": (
+                            levels.append((message, level)),
+                            real_append(message, level)))
+    return levels
+
+
+def test_a_text_file_no_model_could_describe_is_not_summarized(
+        tab, qapp, vault, monkeypatch):
+    import council_engine
+
+    (vault / "data_in" / "notes.txt").write_text(
+        "Shift notes: press 4 was down for two hours on Tuesday.\n",
+        encoding="utf-8")
+    assert tab.actions.build_keyword_index().ok
+
+    def _no_model(*_a, **_k):
+        raise council_engine.BackendUnavailable("no model is set")
+
+    monkeypatch.setattr(council_engine, "local_chat", _no_model)
+    levels = _levels(tab, monkeypatch)
+    tab.on_descriptions()
+    assert _pump(qapp, lambda: _all_enabled(tab))
+
+    said = tab.index_status.text()
+    assert "Descriptions complete" not in said, said
+    assert "1 could not be described" in said, said
+    assert "1 of 2 files summarized" in said, said    # the CSV needs no model
+    assert any("could not be described" in message and level == "err"
+               for message, level in levels), levels
+    notes = [r for r in tab.actions.vault_index().records.values()
+             if r.get("name") == "notes.txt"]
+    assert notes and not notes[0].get("description"), notes
+
+
+def test_an_embedding_model_that_cannot_load_is_a_failure(
+        tab, qapp, monkeypatch):
+    import vault_embeddings
+
+    assert tab.actions.build_keyword_index().ok
+
+    def _offline(self):
+        raise RuntimeError(
+            f"Could not load embedding model {self.model_name!r}: "
+            "huggingface.co is unreachable\n\nFix one of these: …")
+
+    monkeypatch.setattr(vault_embeddings.EmbeddingIndex, "_get_model",
+                        _offline)
+    levels = _levels(tab, monkeypatch)
+    tab.on_embeddings()
+    assert _pump(qapp, lambda: _all_enabled(tab))
+
+    said = tab.index_status.text()
+    assert "Vectors ready" not in said, said
+    assert "Could not load embedding model" in said, said
+    assert "Fix one of these" not in said, "the status line is one line"
+    assert any("Could not load embedding model" in message and level == "err"
+               for message, level in levels), levels
