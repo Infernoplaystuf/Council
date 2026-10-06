@@ -58,9 +58,11 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import ipaddress
 import json
 import os
 import random
+import re
 import statistics
 import subprocess
 import sys
@@ -375,9 +377,32 @@ def run_llama(cfg: Dict[str, Any]) -> Dict[str, Any]:
 # Ollama — one run against the server
 # ============================================================
 
+_LOOPBACK = re.compile(
+    r"^https?://(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\])(:\d+)?(/|$)",
+    re.IGNORECASE)
+
+
+def _is_loopback_url(url: str) -> bool:
+    """council_core.local_models.is_loopback_url, copied: this tool runs as
+    a script from tools/, where council_core is not importable. The host is
+    matched WHOLE — the startswith test this replaces passed
+    http://localhost.evil.example and http://localhost@evil.example (a user
+    name; the host is evil.example), and _post sends whole prompts."""
+    m = _LOOPBACK.match((url or "").strip())
+    if m is None:
+        return False
+    host = m.group(1)
+    if host[0].isdigit():
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:          # "127.999.0.1" would be looked up by NAME
+            return False
+    return True
+
+
 def _post(path: str, payload: Dict[str, Any], host: str = OLLAMA_HOST,
           timeout: int = 900) -> Dict[str, Any]:
-    if not host.startswith(("http://127.0.0.1", "http://localhost")):
+    if not _is_loopback_url(host):
         raise SystemExit(f"refusing non-local Ollama host {host}")
     req = urllib.request.Request(
         host.rstrip("/") + path, data=json.dumps(payload).encode(),

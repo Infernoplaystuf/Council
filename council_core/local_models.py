@@ -33,6 +33,7 @@ and cached by digest.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import os
@@ -86,7 +87,25 @@ _LOOPBACK = re.compile(
 
 
 def is_loopback_url(url: str) -> bool:
-    return bool(_LOOPBACK.match((url or "").strip()))
+    """Is ``url``'s host this PC? The host is matched WHOLE — up to the port
+    or the first "/" — so "localhost.evil.example", "127.0.0.1.evil.example"
+    and "localhost@evil.example" (userinfo; the host is evil.example) are
+    other machines. No DNS: a name that merely resolves to 127.0.0.1 is not
+    trusted, since it can resolve elsewhere by the time the call connects.
+
+    A dotted quad must also BE an address: "127.999.0.1" fits the pattern
+    but no IP parser accepts it, so the OS would look it up as a host NAME
+    — which a hosts file or a LAN's DNS can point anywhere."""
+    m = _LOOPBACK.match((url or "").strip())
+    if m is None:
+        return False
+    host = m.group(1)
+    if host[0].isdigit():
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return False
+    return True
 
 
 def require_local(url: str, *, allow_remote: bool = False) -> None:

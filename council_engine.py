@@ -137,10 +137,21 @@ def safe_name(s: str, maxlen: int = 128) -> str:
 # ============================================================
 
 def _ensure_localhost(url: str, *, allow_remote: bool = False) -> None:
-    """Guard against accidental remote calls unless explicitly opted in."""
-    u = url.lower().strip()
-    is_local = u.startswith("http://localhost") or u.startswith("http://127.0.0.1")
-    if not is_local and not allow_remote:
+    """Refuse a model endpoint off this PC unless the caller opted in.
+
+    The HOST is matched whole, by the one rule the rest of the app uses
+    (council_core.local_models.is_loopback_url: localhost, a 127.x address
+    or [::1], an optional port, then "/" or the end). This used to test the
+    START of the URL string, which passed "http://localhost.evil.example"
+    and "http://127.0.0.1.evil.example" (other machines, found through DNS)
+    and "http://localhost@evil.example" (there "localhost" is a user name and
+    the host is evil.example), and refused "http://[::1]:11434" — this PC.
+
+    allow_remote=True lets any host through, as before: the caller has
+    opted in to remote nodes (COUNCIL_REMOTE_NODES and a host the user
+    listed), so this guard is about the default, not about which remote."""
+    from council_core.local_models import is_loopback_url
+    if not allow_remote and not is_loopback_url(url):
         raise RuntimeError(
             f"Refusing non-local model endpoint: {url}\n"
             "Pass allow_remote=True to LocalBackendSpec to enable Pi/remote hosts."
@@ -2432,8 +2443,9 @@ def last_call_stats(role: Optional[str] = None) -> Dict[str, Any]:
     output). Also: constraint ('schema' | 'json' | 'none'), ttft_s (to the
     first token, prefill included), num_ctx, schema_valid / schema_errors
     when a json_schema was given, load_s (model load inside this call),
-    wait_s (GGUF: time spent waiting for another call on the same model).
-    A number that could not be measured is None.
+    wait_s (GGUF: time spent waiting for another call on the same model),
+    done (Ollama: the stream ended with the server's final packet, not a
+    closed connection). A number that could not be measured is None.
     """
     with _STATS_LOCK:
         s = _LAST_STATS.get(_ANY_ROLE if role is None else role)
@@ -3326,6 +3338,10 @@ def _ollama_stream(host: str, name: str, messages: List[Dict[str, Any]], *,
         "num_ctx": int(num_ctx), "max_tokens": int(num_predict),
         "done_reason": final.get("done_reason"),
         "truncated": final.get("done_reason") == "length",
+        # Whether Ollama's final packet ("done": true) arrived. Without it
+        # the stream simply ENDED — the server closed the connection
+        # mid-answer — and the text is however much got through.
+        "done": bool(final),
     }
     return "".join(pieces), stats, calls
 
@@ -3835,6 +3851,11 @@ def _ollama_remote_call(host: str, model: str, messages: List[Dict[str, str]],
     still running the first one. The hard-coded "16 GB" profile (num_gpu 99,
     num_keep 128) is gone: the node's Ollama places layers for its own
     hardware; repeat_penalty 1.0 and keep_alive are sent as on localhost.
+
+    A stream that ends without Ollama's final packet is an ERROR, not an
+    answer: a node whose Ollama dies (or is restarted, or loses the network)
+    mid-answer closes the connection cleanly, and the old client returned
+    the half it had as if it were the whole reply.
     """
     _ensure_localhost(host, allow_remote=allow_remote)
     for attempt in (1, 2):
@@ -3843,6 +3864,11 @@ def _ollama_remote_call(host: str, model: str, messages: List[Dict[str, str]],
                 host.rstrip("/"), model, messages, temperature=temperature,
                 num_predict=num_predict, num_ctx=_DEFAULT_OLLAMA_NUM_CTX,
                 timeout=timeout, token_callback=token_callback)
+            if not stats.get("done"):
+                raise RuntimeError(
+                    f"Ollama node {host} closed the answer before its final "
+                    f"packet ({len(text)} characters had arrived); the "
+                    "partial answer is not used.")
             return text, stats
         except BackendUnavailable as exc:
             if attempt == 2:
@@ -4044,14 +4070,41 @@ def _remote_nodes_enabled() -> bool:
 
 
 def _is_remote_host(host: str) -> bool:
-    """True for a real remote node — i.e. NOT loopback. A localhost pick
-    (the dispatcher's no-reachable-node fallback) must run on the local
-    GGUF, not via an Ollama HTTP call to a server that isn't there."""
-    h = (host or "").lower()
+    """True for a real remote node — i.e. NOT loopback. A pick of this PC's
+    own Ollama must run through the local path (the role's slot), not as a
+    node call. Decided by the same whole-host rule as _ensure_localhost
+    (local_models.is_loopback_url); this used to look for "localhost",
+    "127.0.0.1" or "::1" ANYWHERE in the string, so
+    http://localhost.evil.example counted as this PC and http://127.0.0.2
+    as another machine. 0.0.0.0 ("every interface") is never a node."""
+    from council_core.local_models import is_loopback_url
+    h = (host or "").strip()
     if not h:
         return False
-    return not any(tok in h for tok in
-                   ("localhost", "127.0.0.1", "::1", "0.0.0.0"))
+    try:
+        if (urllib.parse.urlsplit(h).hostname or "") == "0.0.0.0":
+            return False
+    except ValueError:
+        pass
+    return not is_loopback_url(h)
+
+
+def _ollama_full_name(name: str) -> str:
+    """'phi3.5' -> 'phi3.5:latest': Ollama's own rule for a name without a
+    tag (the tag is after the last ':' of the last '/' part — a registry
+    'host:5000/model' still has none). The dispatcher compares and sends
+    names in this form so 'phi3.5' finds a node listing 'phi3.5:latest'
+    while 'phi3' never matches 'phi3.5:latest'."""
+    n = (name or "").strip()
+    return n if ":" in n.rsplit("/", 1)[-1] else n + ":latest"
+
+
+def _ascii_line(text: str) -> str:
+    """``text`` safe to print anywhere. A console launch prints UTF-8, but
+    stdout redirected to a file or pipe on Windows is cp1252 with strict
+    errors, where an arrow — or a node's error message in another
+    language — raises UnicodeEncodeError out of the call that printed it."""
+    return text.encode("ascii", "backslashreplace").decode("ascii")
 
 
 class LoadAwareDispatcher:
@@ -4081,21 +4134,38 @@ class LoadAwareDispatcher:
     def probe_all(self) -> List[NodeStatus]:
         return [self._get_status(h) for h in self.hosts]
 
-    def best_host_for(self, model: str) -> str:
-        statuses = self.probe_all()
-        reachable = [s for s in statuses if s.reachable]
-        if not reachable:
-            print(f"[DISPATCHER] No reachable hosts — falling back to localhost:11434")
-            return "http://localhost:11434"
-        has_model = [s for s in reachable if any(model in m for m in s.installed_models)]
-        candidates = has_model if has_model else reachable
-        candidates.sort(key=lambda s: (s.active_models, s.latency_ms))
-        chosen = candidates[0].host
-        print(
-            f"[DISPATCHER] model={model} → {chosen} "
-            f"(active={candidates[0].active_models}, latency={candidates[0].latency_ms:.0f}ms)"
-        )
-        return chosen
+    def best_host_for(self, model: str) -> Optional[str]:
+        """The least busy reachable host whose /api/tags lists ``model`` —
+        an Ollama model NAME, e.g. "llama3.2:3b" — or None: run it locally.
+
+        The WHOLE name must match (an untagged name means ":latest", as in
+        Ollama). This used to be a substring test, so "llama3" matched a
+        node holding only "llama3.2:3b"; and when nothing matched it fell
+        back to ANY reachable host. Every council member's model was one
+        label no node has ("gguf:unset"), so the full council prompt went to
+        whichever node was least busy, the node answered 404, and the member
+        fell back to the local model — the prompt had left the PC for
+        nothing. None sends nothing anywhere."""
+        if not model or not model.strip():
+            return None
+        want = _ollama_full_name(model)
+        reachable = [s for s in self.probe_all() if s.reachable]
+        has_model = [s for s in reachable
+                     if any(_ollama_full_name(m) == want
+                            for m in s.installed_models)]
+        if not has_model:
+            print(_ascii_line(
+                f"[DISPATCHER] model={model}: no node has it "
+                f"({len(reachable)} of {len(self.hosts)} reachable) - "
+                "running locally, nothing sent"), flush=True)
+            return None
+        has_model.sort(key=lambda s: (s.active_models, s.latency_ms))
+        chosen = has_model[0]
+        print(_ascii_line(
+            f"[DISPATCHER] model={model} -> {chosen.host} "
+            f"(active={chosen.active_models}, "
+            f"latency={chosen.latency_ms:.0f}ms)"), flush=True)
+        return chosen.host
 
     def invalidate(self, host: Optional[str] = None) -> None:
         if host:
@@ -7033,6 +7103,17 @@ class _DispatchedBackendSpec(LocalBackendSpec):
     """LocalBackendSpec that resolves its host at call time via LoadAwareDispatcher."""
     _dispatcher: LoadAwareDispatcher
 
+    def _node_model(self) -> Optional[str]:
+        """The Ollama model a NODE would run for this spec — "llama3.2:3b"
+        for the label "ollama:llama3.2:3b", with Ollama's implicit ":latest"
+        written out — or None when the label is not an Ollama model (a GGUF
+        runs in this process only; no node can serve it)."""
+        from council_core import local_models
+        if not local_models.is_ollama_id(self.model):
+            return None
+        name = local_models.ollama_name(self.model)
+        return _ollama_full_name(name) if name else None
+
     def generate(self, *, developer_instructions: str, user_text: str,
                  temperature: Optional[float] = None, max_tokens: Optional[int] = None,
                  trace: bool = True,
@@ -7046,13 +7127,22 @@ class _DispatchedBackendSpec(LocalBackendSpec):
         # IMPORTANT: only probe hosts when remote nodes are actually
         # enabled. Otherwise best_host_for() would hit localhost:11434
         # (Ollama) on EVERY model call — a wasted connection attempt that
-        # prints "[DISPATCHER] No reachable hosts — falling back to
-        # localhost:11434" and adds latency, even though we always run the
-        # local GGUF anyway. Single-machine = straight to local, no probe.
-        if _remote_nodes_enabled():
-            self.host = self._dispatcher.best_host_for(self.model)
-            self.allow_remote = True
-        if _remote_nodes_enabled() and _is_remote_host(self.host):
+        # prints a [DISPATCHER] line and adds latency, even though we
+        # always run the local GGUF anyway. Single-machine = straight to
+        # local, no probe.
+        #
+        # Only a model a node can actually serve is sent: the label must be
+        # "ollama:<name>" and some reachable node's /api/tags must list that
+        # exact name (best_host_for). A GGUF label ("gguf:unset", the same
+        # for every role) names nothing a node has, so asking a node to run
+        # it only handed the node the whole prompt before its 404. The pick
+        # stays in locals: a spec is shared by every member pinned to it,
+        # and writing the chosen host onto it let one call's pick steer
+        # another's send.
+        name = self._node_model()
+        host = (self._dispatcher.best_host_for(name)
+                if name and _remote_nodes_enabled() else None)
+        if host and _is_remote_host(host):
             temp = self.default_temperature if temperature is None else float(temperature)
             mtok = self.default_max_tokens if max_tokens is None else int(max_tokens)
             messages = [
@@ -7061,21 +7151,23 @@ class _DispatchedBackendSpec(LocalBackendSpec):
             ]
             try:
                 if trace:
-                    print(f"[REMOTE] {self.key} model={self.model} -> {self.host}",
-                          flush=True)
+                    print(_ascii_line(
+                        f"[REMOTE] {self.key} model={name} -> {host}"),
+                        flush=True)
                 if token_callback is not None:
                     return _ollama_chat_stream(
-                        self.host, self.model, messages,
+                        host, name, messages,
                         temperature=temp, num_predict=mtok,
                         allow_remote=True, token_callback=token_callback)
                 return _ollama_chat(
-                    self.host, self.model, messages,
+                    host, name, messages,
                     temperature=temp, num_predict=mtok, allow_remote=True)
             except Exception as exc:
                 # Remote node failed mid-call — fall back to the local
                 # GGUF so the user still gets an answer.
-                print(f"[REMOTE] node {self.host} failed ({exc!r}); "
-                      "falling back to local model.", flush=True)
+                print(_ascii_line(
+                    f"[REMOTE] node {host} failed ({exc!r}); "
+                    "falling back to local model."), flush=True)
         return super().generate(
             developer_instructions=developer_instructions,
             user_text=user_text,

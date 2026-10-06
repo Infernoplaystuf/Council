@@ -26,13 +26,26 @@ Behaviours a test sets on ``server.state``:
                   prompt is counted at that ratio (+8 per message) and one
                   over num_ctx sent with truncate=false is REFUSED with
                   Ollama 0.35's 400 (counted in ``refused``)
+  drop_after      a number = stream that many chunks, then close the
+                  connection cleanly WITHOUT the final done packet (a node
+                  that dies mid-answer; counted in ``dropped``)
+  chat_error      (status, message) = answer every /api/chat with that HTTP
+                  error, after recording the request
 
 /api/ps lists the models chats have "loaded"; /api/generate with keep_alive
 0 "unloads" one (the benchmark's clean-placement step).
+
+``FakeOllama(host="127.0.0.2")`` (or "::1") listens on another loopback
+address — a second machine's stand-in that is still this PC. Windows and
+Linux route all of 127.0.0.0/8 to loopback; ``loopback_alias()`` says which
+address to use where they do not (macOS has only 127.0.0.1 by default).
 """
 from __future__ import annotations
 
+import ipaddress
 import json
+import socket
+import socketserver
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -120,6 +133,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(404, {"error": "not found"})
             return
         self.st.chats.append(body)
+        if self.st.chat_error is not None:
+            status, message = self.st.chat_error
+            self._json(int(status), {"error": message})
+            return
         names = [t["name"] for t in self.st.tags]
         if body.get("model") not in names:
             self._json(404, {"error": f"model '{body.get('model')}' not "
@@ -191,7 +208,15 @@ class _Handler(BaseHTTPRequestHandler):
                                         "tool_calls": calls},
                             "done": False})
             else:
-                for i in range(0, len(text), 4):
+                for n, i in enumerate(range(0, len(text), 4)):
+                    if self.st.drop_after is not None \
+                            and n >= self.st.drop_after:
+                        # Return without the final packet: HTTP/1.0, so the
+                        # handler closing the socket IS the end of the body
+                        # — a clean FIN, exactly what a node whose Ollama
+                        # died (or was restarted) mid-answer looks like.
+                        self.st.dropped += 1
+                        return
                     self._line({"message": {"role": "assistant",
                                             "content": text[i:i + 4]},
                                 "done": False})
@@ -209,11 +234,32 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
-class FakeOllama:
-    """``with FakeOllama() as srv: srv.url`` — a running fake server."""
+class _Server(ThreadingHTTPServer):
+    def server_bind(self):
+        """TCPServer's bind without HTTPServer's socket.getfqdn(host): that
+        is a reverse name lookup, and for 127.0.0.2 it took 4.97 s on this
+        PC (measured 2026-10-05) — a name query sent out for an address
+        that never leaves the machine. Nothing here reads server_name."""
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = str(self.server_address[0])
+        self.server_port = self.server_address[1]
 
-    def __init__(self, tags: List[Dict[str, Any]] = None):
-        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+
+class _V6Server(_Server):
+    address_family = socket.AF_INET6
+
+
+class FakeOllama:
+    """``with FakeOllama() as srv: srv.url`` — a running fake server.
+
+    ``host`` is the loopback address to listen on: "127.0.0.1" (default),
+    another 127.x address, or "::1". Never a LAN address — a test server must
+    not be reachable from another machine."""
+
+    def __init__(self, tags: List[Dict[str, Any]] = None, *,
+                 host: str = "127.0.0.1"):
+        server_cls = _V6Server if ":" in host else _Server
+        self.httpd = server_cls((host, 0), _Handler)
         self.httpd.daemon_threads = True
         self.state = SimpleNamespace(
             tags=list(tags if tags is not None else DEFAULT_TAGS),
@@ -221,9 +267,12 @@ class FakeOllama:
             token_delay=0.0, first_delay=0.0, reject_format=False,
             no_tools=False, done_reason="stop", requests=[], chats=[],
             completed=0, disconnected=0, reply_fn=None, vram_fraction=1.0,
-            loaded=set(), unloads=[], chars_per_token=None, refused=0)
+            loaded=set(), unloads=[], chars_per_token=None, refused=0,
+            drop_after=None, dropped=0, chat_error=None)
         self.httpd.state = self.state            # type: ignore[attr-defined]
-        self.url = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+        port = self.httpd.server_address[1]
+        self.url = (f"http://[{host}]:{port}" if ":" in host
+                    else f"http://{host}:{port}")
         self._thread = threading.Thread(target=self.httpd.serve_forever,
                                         name="fake-ollama", daemon=True)
 
@@ -234,3 +283,59 @@ class FakeOllama:
     def __exit__(self, *exc) -> None:
         self.httpd.shutdown()
         self.httpd.server_close()
+
+
+def loopback_alias() -> str:
+    """127.0.0.2 when this machine can listen on it (Windows and Linux route
+    all of 127.0.0.0/8 to loopback; measured on this PC 2026-10-05), else
+    127.0.0.1. A "second machine" on its own address makes a test's
+    "which server got the prompt" assertions unmistakable."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.2", 0))
+        return "127.0.0.2"
+    except OSError:
+        return "127.0.0.1"
+
+
+#: The real Ollama's port on a developer PC. A test must never reach it.
+REAL_OLLAMA_PORT = 11434
+
+
+def _loopback_literal(host: str) -> bool:
+    """localhost or a loopback IP LITERAL — never a name to look up
+    ("127.999.0.1" is not an address, so the OS would resolve it)."""
+    h = str(host).strip("[]").lower()
+    if h == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
+
+
+def refuse_egress(monkeypatch) -> List[Any]:
+    """Make every outgoing TCP connection outside loopback — and any to the
+    real Ollama's port — fail the test instead of happening.
+
+    http.client and urllib both connect through socket.create_connection, so
+    guarding it covers the engine's Ollama calls, the dispatcher's probes and
+    the benchmark tools. A refused address is recorded (the returned list) and
+    raises AssertionError BEFORE the name is looked up: a test of a disguised
+    host such as http://localhost.evil.example must not even send a DNS
+    query. The real Ollama's port is refused too: a test that reached it
+    would run a real generation."""
+    refused: List[Any] = []
+    real = socket.create_connection
+
+    def guarded(address, *args, **kwargs):
+        host, port = address[0], address[1]
+        if not _loopback_literal(host) or port == REAL_OLLAMA_PORT:
+            refused.append(address)
+            raise AssertionError(
+                f"a test tried to connect to {host}:{port} — only the fakes "
+                "on loopback may be reached")
+        return real(address, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "create_connection", guarded)
+    return refused
