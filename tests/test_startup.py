@@ -325,6 +325,167 @@ def test_only_a_model_the_engine_would_pick_counts(
         assert "US-origin" in decided.onboarding_reason
 
 
+# ---- the roles that answer, on this PC (found in review) ------------------
+
+def _hardware(monkeypatch, vram_gb, ram_gb):
+    """The figures the engine sizes its Ollama pick by (_hardware_gb): the
+    Models tab's probe when it has run — held off here — else
+    hardware_detect.quick_memory."""
+    import hardware_detect
+    from council_core import model_jobs
+    monkeypatch.setattr(model_jobs, "_DETECTED", None, raising=False)
+    monkeypatch.setattr(hardware_detect, "quick_memory",
+                        lambda: (vram_gb, ram_gb))
+
+
+def test_a_main_model_that_is_missing_is_named_though_another_slot_works(
+        tmp_path, nothing_configured, monkeypatch):
+    """Review: main = an Ollama model that is not pulled, a "coding" slot
+    with one that is (only the coder uses it), .onboarded present. The check
+    took ANY slot that resolved and said ready; every answer then failed with
+    "Ollama ... has no model mistral-large:latest" — the Writer and the Judge
+    are on main."""
+    import json
+
+    from tests.fake_ollama import FakeOllama
+    with FakeOllama() as server:
+        monkeypatch.setenv("COUNCIL_OLLAMA_HOST", server.url)
+        (tmp_path / ".onboarded").write_text("{}", encoding="utf-8")
+        (tmp_path / "model_slots.json").write_text(json.dumps({
+            "version": 1,
+            "slots": {"main": {"path": "ollama:mistral-large:latest"},
+                      "coding": {"path": "ollama:llama3.1:8b"}},
+            "roles": {"coder": "coding"}}), encoding="utf-8")
+        decided = startup.plan(tmp_path)
+        assert decided.onboarding, "the Writer cannot answer and it said OK"
+        assert "mistral-large" in decided.onboarding_reason
+
+
+def test_a_role_on_a_working_slot_is_ready(tmp_path, nothing_configured,
+                                           monkeypatch):
+    """The other way round: main is unusable, but every role that answers
+    is mapped to a slot that works."""
+    import json
+
+    from council_core import model_ready
+    from tests.fake_ollama import FakeOllama
+    with FakeOllama() as server:
+        monkeypatch.setenv("COUNCIL_OLLAMA_HOST", server.url)
+        (tmp_path / "model_slots.json").write_text(json.dumps({
+            "version": 1,
+            "slots": {"main": {"path": "ollama:not-pulled:7b"},
+                      "fast": {"path": "ollama:llama3.1:8b"}},
+            "roles": {"writer": "fast", "judge": "fast"}}), encoding="utf-8")
+        ready = model_ready.check(tmp_path, roles=("writer", "judge"))
+        assert ready.usable, ready.reason
+        assert ready.model == "ollama:llama3.1:8b"
+
+
+def test_a_model_too_big_for_this_pc_does_not_count(tmp_path,
+                                                    nothing_configured,
+                                                    monkeypatch):
+    """Review: the only installed US model was 400 GB. The check ranked
+    without the PC's memory and said ready; the engine ranks WITH it, found
+    nothing that fits, and raised "has no US-origin chat model installed"."""
+    from tests.fake_ollama import FakeOllama, tag
+    huge = tag("llama3.1:405b", size=400_000_000_000, family="llama",
+               params="405B", quant="Q8_0")
+    _hardware(monkeypatch, 8.0, 32.0)
+    with FakeOllama(tags=[huge]) as server:
+        monkeypatch.setenv("COUNCIL_OLLAMA_HOST", server.url)
+        monkeypatch.setenv("COUNCIL_OLLAMA_FALLBACK", "1")
+        decided = startup.plan(tmp_path)
+        assert decided.onboarding, "a model this PC cannot run counted"
+        assert "llama3.1:405b" in decided.onboarding_reason
+        assert "fits" in decided.onboarding_reason
+
+
+@pytest.mark.parametrize("tags_kind", ["default", "too_big"])
+def test_the_check_picks_what_the_engine_would(tmp_path, nothing_configured,
+                                               monkeypatch, tags_kind):
+    """The fallback pick, held to council_engine._pick_default_ollama_model
+    on the same server and the same memory figures: the same model, or both
+    unable to pick."""
+    import council_engine as ce
+
+    from council_core import model_ready
+    from tests.fake_ollama import DEFAULT_TAGS, FakeOllama, tag
+    tags = (DEFAULT_TAGS if tags_kind == "default" else
+            [tag("llama3.1:405b", size=400_000_000_000, family="llama",
+                 params="405B", quant="Q8_0")])
+    _hardware(monkeypatch, 8.0, 32.0)
+    monkeypatch.setattr(ce, "_AUTO_PICK", None)
+    with FakeOllama(tags=tags) as server:
+        monkeypatch.setenv("COUNCIL_OLLAMA_HOST", server.url)
+        monkeypatch.setenv("COUNCIL_OLLAMA_FALLBACK", "1")
+        ready = model_ready.check(tmp_path)
+        try:
+            picked = "ollama:" + ce._pick_default_ollama_model(server.url)
+        except ce.BackendUnavailable:
+            picked = ""
+        monkeypatch.setattr(ce, "_AUTO_PICK", None)
+        assert (ready.model if ready.usable else "") == picked, (
+            ready, picked)
+        assert not [r for r in server.state.requests if r[1] == "/api/chat"]
+
+
+# ---- an Ollama that is not running yet (found in review) ------------------
+
+@pytest.fixture
+def closed_port():
+    """A loopback port with nothing listening on it."""
+    import socket
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    return f"http://127.0.0.1:{port}"
+
+
+@pytest.mark.parametrize("named", ["", "llama3.1:8b"])
+def test_an_ollama_that_is_not_running_is_named(tmp_path, nothing_configured,
+                                                monkeypatch, closed_port,
+                                                named):
+    """Onboarded, answering through the Ollama fallback (or a named
+    COUNCIL_OLLAMA_MODEL), started before Ollama: the notice said "no model
+    is configured yet", which sends the user to set a model they have."""
+    monkeypatch.setenv("COUNCIL_OLLAMA_HOST", closed_port)
+    monkeypatch.setenv("COUNCIL_OLLAMA_FALLBACK", "1")
+    if named:
+        monkeypatch.setenv("COUNCIL_OLLAMA_MODEL", named)
+    (tmp_path / ".onboarded").write_text("{}", encoding="utf-8")
+    decided = startup.plan(tmp_path)
+    assert decided.onboarding
+    assert f"no Ollama server answers at {closed_port}" in \
+        decided.onboarding_reason, decided.onboarding_reason
+    assert "no model is configured yet" not in decided.onboarding_reason
+    if named:
+        assert named in decided.onboarding_reason
+
+
+def test_the_check_leaves_no_unreachable_verdict_for_the_engine(
+        tmp_path, nothing_configured, monkeypatch):
+    """local_models caches "unreachable" for 10 s, and the engine reads that
+    cache before each call. The startup check wrote it — so an Ollama that
+    came up a moment after the launch was treated as absent for the first
+    seconds of the session (review: False on the branch, True on the base,
+    one second after the server started)."""
+    from council_core import local_models
+    from tests.fake_ollama import FakeOllama
+
+    server = FakeOllama()                # bound, not serving yet
+    try:
+        monkeypatch.setenv("COUNCIL_OLLAMA_HOST", server.url)
+        monkeypatch.setenv("COUNCIL_OLLAMA_FALLBACK", "1")
+        local_models.invalidate_cache()
+        assert startup.plan(tmp_path).onboarding
+        server.__enter__()               # Ollama comes up
+        assert local_models.ollama_reachable(server.url), (
+            "the engine was handed the startup check's stale 'unreachable'")
+    finally:
+        server.__exit__(None, None, None)
+        local_models.invalidate_cache()
+
+
 def test_a_vault_that_cannot_be_read_does_not_force_setup(tmp_path,
                                                           monkeypatch):
     """Showing the wizard because a path could not be read walks a configured

@@ -163,6 +163,20 @@ def invalidate_cache() -> None:
         _REACH_CACHE.clear()
 
 
+def forget_host(host: Optional[str] = None) -> None:
+    """Drop what is cached about ``host``'s reachability and model list.
+
+    For a one-off probe that must not leave a verdict behind: the startup
+    readiness check (council_core.model_ready) runs before Ollama may be up,
+    and the "unreachable" it cached was what the engine read for the next
+    10 s — so an Ollama started just after the app was treated as absent
+    (found in review)."""
+    host = (host or ollama_host()).rstrip("/")
+    with _CACHE_LOCK:
+        _REACH_CACHE.pop(host, None)
+        _TAGS_CACHE.pop(host, None)
+
+
 def _get_json(url: str, timeout: float, body: Optional[dict] = None) -> Any:
     data = None if body is None else json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
