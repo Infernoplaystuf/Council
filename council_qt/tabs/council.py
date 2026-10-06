@@ -40,11 +40,13 @@ The five that are designed out here, rather than fixed later:
       names and never the same variable.
 
 WHAT IS AND IS NOT HERE
-The VIEW is complete. The deliberation is not extracted — that is the rest of
-phase 6 — so `CouncilActions.send` raises `NotYetExtracted` and the tab says so
-in the transcript, where the user is already looking. Everything that does not
-need the model works: the transcript, the stream box, the toggles, the
-instruction bar, the specialist pin, saving an answer, the question history.
+The VIEW is complete and the turn is real: `CouncilActions.send` runs
+council_core.council_turn (or one Writer, on the fast path). What is not wired
+yet — Look Up, Find & Chart, Defer to Vault, instructions, content style, the
+per-role override, verdict responses, Expand, two of the switches — is shown
+DISABLED with a "not available in this build yet" tooltip (_label_unavailable)
+rather than looking live; docs/qt_migration/remaining_scope_2026-10-06.md says
+which batch wires each.
 """
 from __future__ import annotations
 
@@ -109,9 +111,9 @@ _SPEAKERS = frozenset({"Writer", "Peasant", "Intern", "Coder", "Artist",
 class CouncilActions:
     """What the Council tab can ask the application to do.
 
-    The deliberation is not extracted yet. Rather than let a button do nothing,
-    `send` raises and the view reports it in the transcript — which is both
-    honest and, when the extraction lands, one method to replace.
+    `send` runs a real turn. What is still missing raises NotYetExtracted
+    (recording a verdict response), and the view reports it rather than doing
+    nothing — one method to replace when it lands.
     """
 
     class NotYetExtracted(RuntimeError):
