@@ -49,6 +49,10 @@ PROTECTED_SUBDIRS: tuple = (
     # query_history_search bypasses vault_index (reads conversations/
     # directly), so excluding the folder here doesn't break that feature.
     "conversations",
+    # The knowledge graph's own store and exports (council_core/
+    # knowledge_graph.py). Its JSON/CSV exports quote the user's documents,
+    # so a vault search must not find them as if they were documents.
+    ".knowledge_graph",
 )
 
 # Lowercased once at import for the per-path membership test in

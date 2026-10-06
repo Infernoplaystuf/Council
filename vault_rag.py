@@ -97,6 +97,37 @@ def extract_pdf_pages(p: Path, *, max_pages: Optional[int] = None) -> List[str]:
         return []
 
 
+def _docx_text_stdlib(p: Path) -> str:
+    """A .docx's paragraph text using only the standard library — the
+    fallback when python-docx is not installed (it is missing from both of
+    this desktop's Pythons, so every Word file read as empty). A .docx is a
+    zip whose word/document.xml holds <w:p> paragraphs of <w:t> runs; tabs
+    and breaks become spaces / newlines. Same output shape as the python-docx
+    path: one line per non-empty paragraph."""
+    import zipfile
+    import xml.etree.ElementTree as ET
+    w = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    try:
+        with zipfile.ZipFile(p) as z:
+            root = ET.fromstring(z.read("word/document.xml"))
+    except Exception:
+        return ""
+    lines = []
+    for par in root.iter(f"{w}p"):
+        bits = []
+        for el in par.iter():
+            if el.tag == f"{w}t" and el.text:
+                bits.append(el.text)
+            elif el.tag == f"{w}tab":
+                bits.append("\t")
+            elif el.tag in (f"{w}br", f"{w}cr"):
+                bits.append("\n")
+        text = "".join(bits)
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
+
+
 def _extract_text(p: Path) -> str:
     """Best-effort text extraction for analyst formats (PDF/DOCX/XLSX).
 
@@ -124,7 +155,7 @@ def _extract_text(p: Path) -> str:
             try:
                 from docx import Document
             except Exception:
-                return ""
+                return _docx_text_stdlib(p)
             doc = Document(str(p))
             return "\n".join(par.text for par in doc.paragraphs if par.text)
         if suf in (".xlsx", ".xlsm", ".xls"):
