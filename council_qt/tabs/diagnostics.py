@@ -31,6 +31,18 @@ from .. import theme
 from ..view import amp
 
 
+def _toolkit_lines() -> list:
+    """This front end's toolkit versions — here, because council_core
+    imports no toolkit."""
+    try:
+        import PySide6
+        from PySide6 import QtCore
+        return [f"PySide6          : {PySide6.__version__}",
+                f"Qt               : {QtCore.qVersion()}"]
+    except Exception as exc:                              # noqa: BLE001
+        return [f"PySide6          : unavailable ({exc!r})"]
+
+
 def build_diagnostics(window) -> QWidget:
     """The tab. ``window`` is the CouncilWindow, for the bridge and status."""
     tokens = theme.tokens("dark")
@@ -66,7 +78,7 @@ def build_diagnostics(window) -> QWidget:
 
         def work() -> None:
             from council_core import diagnostics
-            report = diagnostics.gather()
+            report = diagnostics.gather(toolkit_lines=_toolkit_lines())
 
             def deliver() -> None:
                 output.setPlainText(report.text)

@@ -29,6 +29,7 @@ import platform
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Sequence
 
 #: Package versions worth a line of their own: the ones whose version is the
 #: first question when a chart or a model load fails.
@@ -49,13 +50,6 @@ class Report:
 
 def _versions() -> list:
     lines = []
-    try:
-        import PySide6
-        from PySide6 import QtCore
-        lines.append(f"PySide6          : {PySide6.__version__}")
-        lines.append(f"Qt               : {QtCore.qVersion()}")
-    except Exception as exc:                              # noqa: BLE001
-        lines.append(f"PySide6          : unavailable ({exc!r})")
     import importlib.util
     for name in PACKAGES:
         try:
@@ -83,9 +77,13 @@ def _vault_lines() -> list:
     return lines
 
 
-def gather(toolkit: str = "PySide6 (Qt)") -> Report:
+def gather(toolkit: str = "PySide6 (Qt)",
+           toolkit_lines: Sequence[str] = ()) -> Report:
     """The whole report. Slow-ish (imports, disk probes): call it on a
-    worker. Never raises — a diagnostics panel that fails is the worst kind."""
+    worker. Never raises — a diagnostics panel that fails is the worst kind.
+
+    ``toolkit_lines`` are the front end's own version lines (PySide6 / Qt):
+    this package imports no toolkit, so the view that has one says which."""
     lines = [
         "Data's Inferno — diagnostics",
         "",
@@ -94,6 +92,7 @@ def gather(toolkit: str = "PySide6 (Qt)") -> Report:
         f"({platform.architecture()[0]})",
         f"executable       : {sys.executable}",
     ]
+    lines += list(toolkit_lines)
     lines += _versions()
     lines.append("")
     lines += _vault_lines()
