@@ -315,6 +315,29 @@ def test_newer_schema_is_refused(tmp_path):
         kgm.KnowledgeGraph(v)
 
 
+def test_a_newer_store_is_refused_before_anything_is_written(tmp_path):
+    # The schema script and default rules ran BEFORE the version check: the
+    # dropped table came back, the deleted rule was re-inserted.
+    v = tmp_path / "v"
+    kgm.KnowledgeGraph(v).close()
+    p = kgm.store_path(v)
+    db = sqlite3.connect(p)
+    db.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
+    db.execute("DROP TABLE runs")
+    db.execute("DELETE FROM field_rules WHERE label='Owner'")
+    db.commit()
+    db.close()
+    before = hashlib.sha256(p.read_bytes()).hexdigest()
+    with pytest.raises(kgm.KnowledgeGraphDamaged, match="newer"):
+        kgm.KnowledgeGraph(v)
+    assert hashlib.sha256(p.read_bytes()).hexdigest() == before
+    db = sqlite3.connect(p)
+    assert db.execute("SELECT 1 FROM sqlite_master WHERE name='runs'").fetchone() is None
+    assert db.execute("SELECT 1 FROM field_rules WHERE label='Owner'").fetchone() is None
+    db.close()
+    p.unlink()              # nothing still holds the file open
+
+
 def test_missing_reader_is_reported_not_silent(tmp_path, monkeypatch):
     import importlib.util
     real = importlib.util.find_spec

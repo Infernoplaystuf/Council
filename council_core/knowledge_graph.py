@@ -500,16 +500,13 @@ class KnowledgeGraph:
         #: During seed(): the entities this run supports (see seed).
         self._live: Optional[set] = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        existed = self.path.exists()
+        if self.path.exists():
+            self._check_before_writing()
+        self.db = None
         try:
             self.db = sqlite3.connect(str(self.path))
             self.db.row_factory = sqlite3.Row
             self.db.execute("PRAGMA foreign_keys = ON")
-            if existed:
-                self.db.execute("PRAGMA schema_version").fetchone()
-                ok = self.db.execute("PRAGMA quick_check").fetchone()[0]
-                if ok != "ok":
-                    raise sqlite3.DatabaseError(ok)
             with self.db:
                 self.db.executescript(SCHEMA_SQL)
                 self.db.execute("INSERT OR IGNORE INTO meta VALUES "
@@ -518,14 +515,43 @@ class KnowledgeGraph:
                     self.db.execute("INSERT OR IGNORE INTO field_rules VALUES "
                                     "(?, ?, 'proposed')", (r.label, r.to_json()))
         except sqlite3.DatabaseError as exc:
+            if self.db is not None:
+                self.db.close()
             raise KnowledgeGraphDamaged(
                 f"the knowledge graph store {self.path} could not be read "
                 f"({exc}); it was left untouched") from exc
-        ver = self.meta("schema_version")
-        if ver and int(ver) > SCHEMA_VERSION:
+
+    def _check_before_writing(self) -> None:
+        """An existing store is checked over a READ-ONLY connection before
+        anything is written: a damaged one, or one a newer Council wrote, is
+        refused with its bytes untouched. The schema script and the default
+        rules used to run first — MEASURED: a 'newer' store got its dropped
+        tables recreated and a deleted rule re-inserted, then was refused."""
+        try:
+            ro = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)
+        except sqlite3.Error as exc:
+            raise KnowledgeGraphDamaged(
+                f"the knowledge graph store {self.path} could not be read "
+                f"({exc}); it was left untouched") from exc
+        try:
+            ok = ro.execute("PRAGMA quick_check").fetchone()[0]
+            if ok != "ok":
+                raise sqlite3.DatabaseError(ok)
+            has_meta = ro.execute("SELECT 1 FROM sqlite_master WHERE type='table'"
+                                  " AND name='meta'").fetchone()
+            row = (ro.execute("SELECT value FROM meta WHERE key='schema_version'")
+                   .fetchone() if has_meta else None)
+            ver = int(row[0]) if row else None
+        except (sqlite3.DatabaseError, ValueError) as exc:
+            raise KnowledgeGraphDamaged(
+                f"the knowledge graph store {self.path} could not be read "
+                f"({exc}); it was left untouched") from exc
+        finally:
+            ro.close()
+        if ver is not None and ver > SCHEMA_VERSION:
             raise KnowledgeGraphDamaged(
                 f"{self.path} was written by a newer Council (schema {ver}); "
-                f"this one reads up to {SCHEMA_VERSION}")
+                f"this one reads up to {SCHEMA_VERSION}; it was left untouched")
 
     def close(self) -> None:
         self.db.close()
