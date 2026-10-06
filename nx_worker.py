@@ -224,6 +224,30 @@ def _set_path(pf, key: str, kind: str, value: str) -> bool:
 # handlers
 # ============================================================
 
+PLUGIN_MODULES = ("orientationanalysis", "itkimageprocessing")
+
+
+def _load_plugins() -> dict:
+    """Import the filter plugins so a saved pipeline can name their filters.
+
+    Pipeline.from_file creates each step from its UUID through the filter
+    registry, and a plugin's filters are only in it once its module has been
+    imported. This worker imported simplnx alone, so describe, preflight and
+    run_folder failed with "Failed to create filter 'nx::core::
+    ComputeShapesFilter' from UUID" on every pipeline using one of the 135
+    OrientationAnalysis / ITKImageProcessing filters — the Small IN100 series
+    included. A plugin that will not import is reported, not fatal: a
+    pipeline that never names its filters still runs."""
+    loaded = {}
+    for m in PLUGIN_MODULES:
+        try:
+            __import__(m)
+            loaded[m] = True
+        except Exception as exc:                          # noqa: BLE001
+            loaded[m] = f"{type(exc).__name__}: {exc}"
+    return loaded
+
+
 def h_ping(job) -> dict:
     import simplnx as nx
     mods = {}
@@ -244,6 +268,7 @@ def h_catalog(job) -> dict:
 def h_describe(job) -> dict:
     """What a .d3dpipeline contains, and where its file paths live."""
     import simplnx as nx
+    _load_plugins()
     p = nx.Pipeline.from_file(str(job["pipeline"]))
     steps = _describe(p)
     denied = []
@@ -267,6 +292,7 @@ def h_run_folder(job) -> dict:
     gate on every run.
     """
     import simplnx as nx
+    _load_plugins()
 
     pipeline_path = Path(job["pipeline"])
     in_dir = Path(job["in_dir"])
@@ -365,6 +391,7 @@ def h_preflight(job) -> dict:
     up as a dry-run.
     """
     import simplnx as nx
+    _load_plugins()
     p = nx.Pipeline.from_file(str(job["pipeline"]))
     _check_capability(p)
     ds = nx.DataStructure()

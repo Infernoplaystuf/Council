@@ -196,11 +196,6 @@ def test_validate_rejects_a_value_of_the_wrong_type():
     assert nx_generate.validate(pipe, _mini_catalog())
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "KNOWN GAP: compound *.ValueType / ReadCSVDataParameter / "
-    "ArrayThresholdSet args are rendered as a plain dict with NO warning, and "
-    "simplnx rejects them at run time ('Unable to cast Python instance of type "
-    "dict'). 39 of the 67 shipped pipelines carry one; 26 die on it."))
 def test_transpile_flags_or_types_a_compound_value():
     pipe = {"pipeline": [{
         "filter": {"uuid": "eea49b17-0db2-5bbc-80ef-f44249cc8d55"},
@@ -362,12 +357,6 @@ def test_chain_runs_simplnx_scripts_with_an_interpreter_that_has_simplnx(
 # ============================================================
 
 @needs_nx
-@pytest.mark.xfail(strict=True, reason=(
-    "KNOWN GAP: nx_worker imports only simplnx, so Pipeline.from_file cannot "
-    "create any OrientationAnalysis / ITKImageProcessing filter (135 of 289): "
-    "describe, preflight and run_folder fail with \"Failed to create filter "
-    "... from UUID\". Importing the two plugin modules first fixes it "
-    "(verified: run_folder of (03) went 0/2 -> 2/2)."))
 def test_worker_loads_a_pipeline_that_uses_plugin_filters():
     d = nx_bridge.describe_pipeline(SHIPPED / P03)
     assert d["size"] == 10
