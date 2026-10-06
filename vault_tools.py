@@ -29,6 +29,15 @@ except Exception:  # pragma: no cover - defensive
         return False
 
 
+def _protected(p: Path, folder: Path) -> bool:
+    """is_protected_path for a walk rooted at ``folder``: checked against the
+    folder's parent (a data folder inside the vault) AND the folder itself (a
+    walk rooted at the vault, where the parent check resolved against the
+    vault's PARENT and stopped matching — a vault-wide grep found the
+    knowledge graph's exports, which quote the documents, 7 times out of 8)."""
+    return is_protected_path(p, folder.parent) or is_protected_path(p, folder)
+
+
 # ============================================================
 # Vault stats
 # ============================================================
@@ -205,7 +214,7 @@ def find_files_containing_text(
         if p.suffix.lower() not in _GREPPABLE_SUFFIXES:
             continue
         try:
-            if is_protected_path(p, folder.parent):
+            if _protected(p, folder):
                 continue
         except Exception:
             pass
@@ -314,7 +323,7 @@ def recent_files(
         if st.st_mtime < cutoff:
             continue
         try:
-            if is_protected_path(p, folder.parent):
+            if _protected(p, folder):
                 continue
         except Exception:
             pass
@@ -396,7 +405,7 @@ def find_roman_numerals(
         if not p.is_file() or p.suffix.lower() not in _GREPPABLE_SUFFIXES:
             continue
         try:
-            if is_protected_path(p, folder.parent):
+            if _protected(p, folder):
                 continue
         except Exception:
             pass
@@ -485,7 +494,7 @@ def find_money_amounts(folder: Any, *, max_hits: int = 200) -> List[Dict[str, An
         if not p.is_file() or p.suffix.lower() not in _GREPPABLE_SUFFIXES:
             continue
         try:
-            if is_protected_path(p, folder.parent):
+            if _protected(p, folder):
                 continue
         except Exception:
             pass
@@ -527,7 +536,7 @@ def _pattern_scan(folder: Path, pattern: "re.Pattern",
         if not p.is_file() or p.suffix.lower() not in _GREPPABLE_SUFFIXES:
             continue
         try:
-            if is_protected_path(p, folder.parent):
+            if _protected(p, folder):
                 continue
         except Exception:
             pass
@@ -747,7 +756,7 @@ def find_atomic_elements_in_folder(
         suf = p.suffix.lower()
         # Skip protected paths so conversation logs don't leak into results
         try:
-            if is_protected_path(p, folder.parent):
+            if _protected(p, folder):
                 continue
         except Exception:
             pass

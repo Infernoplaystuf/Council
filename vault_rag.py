@@ -256,11 +256,22 @@ def _chunk_text(text: str, source: str, chunk_size: int = CHUNK_SIZE,
 def _collect_files(vault_dir: Path) -> List[Path]:
     """Walk vault_dir and collect indexable files."""
     files: List[Path] = []
+    try:
+        from conversation_logger import is_protected_path
+    except Exception:                                     # pragma: no cover
+        def is_protected_path(_p, _v):
+            return False
     for p in vault_dir.rglob("*"):
         # Skip hidden/system dirs
         if any(part in SKIP_PATTERNS for part in p.parts):
             continue
         if not p.is_file():
+            continue
+        # The vault's one guard for app folders and state files (the
+        # knowledge graph's dot-folder, whose JSON/CSV exports quote the
+        # user's documents, conversation logs, ...): VaultRAG is rooted at
+        # the vault and indexed them as if they were documents.
+        if is_protected_path(p, vault_dir):
             continue
         if p.suffix.lower() not in INDEXABLE_EXTENSIONS:
             continue

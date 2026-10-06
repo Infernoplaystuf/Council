@@ -293,6 +293,22 @@ def test_store_is_hidden_from_vault_searches(tmp_path):
     assert pc.read_text(encoding="utf-8").startswith("subject_type,subject,predicate")
 
 
+def test_the_real_vault_walkers_do_not_read_the_graphs_exports(tmp_path):
+    # is_protected_path alone was checked; VaultRAG (rooted at the vault)
+    # indexed graph.json / relations.csv, and a vault-rooted grep found
+    # "Carol Lee" 8 times - 7 of them in the exports, which quote the docs.
+    import vault_rag
+    import vault_tools
+    v = _tiny(tmp_path, {"memo.md": "Project: PRJ-1\nProgram Lead: Carol Lee\n"})
+    with _graph(v) as kg:
+        kg.seed()
+        kg.write_exports()
+    rag = [p.relative_to(v).as_posix() for p in vault_rag._collect_files(v)]
+    assert rag == ["data_in/memo.md"]
+    hits = vault_tools.find_files_containing_text(v, "Carol Lee")
+    assert [h["path"].replace("\\", "/") for h in hits] == ["data_in/memo.md"]
+
+
 def test_damaged_store_is_reported_and_left_alone(tmp_path):
     v = tmp_path / "v"
     p = kgm.store_path(v)
