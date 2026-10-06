@@ -138,6 +138,13 @@ CREATE TABLE IF NOT EXISTS runs (
     id TEXT PRIMARY KEY, kind TEXT NOT NULL, started_ts REAL NOT NULL,
     finished_ts REAL, stats TEXT
 );
+-- v2: the user's answers about names ('D. Whitfield' is Dana - here, or
+-- everywhere; or neither). entity_id '' = a different, separate person.
+CREATE TABLE IF NOT EXISTS name_decisions (
+    surface_norm TEXT NOT NULL, document_id TEXT NOT NULL,   -- '' = everywhere
+    entity_id TEXT NOT NULL, ts REAL NOT NULL,
+    PRIMARY KEY (surface_norm, document_id)
+);
 -- v2: free-text extraction progress, so a stopped run resumes and an edited
 -- document is read again (content_hash differs).
 CREATE TABLE IF NOT EXISTS extraction_done (
@@ -698,6 +705,7 @@ class KnowledgeGraph:
         return eid
 
     def _alias(self, eid: str, alias: str, source: str) -> None:
+        eid = self.resolve(eid)          # a merged entity's names live on its survivor
         alias = " ".join(str(alias).split())
         if alias:
             self.db.execute("INSERT OR IGNORE INTO aliases VALUES (?,?,?,?)",
@@ -875,6 +883,9 @@ class KnowledgeGraph:
         key = person_key(v.raw)
         if not is_initial_form(key):
             return self._entity("PERSON", v.raw), False
+        dec = self.decided_name(v.raw, did)
+        if dec is not None:
+            return (self.resolve(dec) if dec else self._entity("PERSON", v.raw)), False
         confirmed = self._confirmed_alias(v.raw)
         if confirmed:
             return confirmed, False
@@ -921,6 +932,7 @@ class KnowledgeGraph:
             (eid, did, _loc_json(loc))).fetchone() is not None
 
     def _mention(self, eid, did, loc, surface, snippet, method, run_id) -> None:
+        eid = self.resolve(eid)
         self.db.execute(
             "INSERT OR IGNORE INTO mentions (entity_id, document_id, locator, surface,"
             " snippet, method, run_id) VALUES (?,?,?,?,?,?,?)",
@@ -1059,6 +1071,13 @@ class KnowledgeGraph:
                         n += 1
                 for m in _INITIAL_NAME_RE.finditer(text):
                     key = f"{m.group(1).lower()} {fold(m.group(2))}"
+                    dec = self.decided_name(m.group(0), did)
+                    if dec is not None:
+                        if dec and not self._has_mention(dec, did, loc):
+                            self._mention(dec, did, loc, m.group(0), _snip(text),
+                                          "gazetteer", run_id)
+                            n += 1
+                        continue
                     cands = sorted(initials.get(key, []))
                     if len(cands) == 1:
                         if not self._has_mention(cands[0], did, loc):
@@ -1069,6 +1088,104 @@ class KnowledgeGraph:
                         self._review("ambiguous_name", m.group(0), cands, did, loc,
                                      _snip(text), run_id)
         return n
+
+    # ── the user's answers (KG3) ──
+    def decided_name(self, surface: str, document_id: str) -> Optional[str]:
+        """What the user said ``surface`` means in this document: an entity
+        id, '' for "neither, a different person", or None (not asked yet).
+        An answer for this document beats one for everywhere."""
+        for doc in (document_id or "", ""):
+            row = self.db.execute("SELECT entity_id FROM name_decisions WHERE"
+                                  " surface_norm=? AND document_id=?",
+                                  (fold(surface), doc)).fetchone()
+            if row is not None:
+                return row[0]
+        return None
+
+    def answer_review(self, review_id: int, entity_id: Optional[str], *,
+                      everywhere: bool = False) -> None:
+        """Settle an open question. ``entity_id`` None = neither (the name is
+        a different person). Kept in the decision log and across rebuilds;
+        call seed() to apply it."""
+        r = self.db.execute("SELECT * FROM review WHERE id=?", (review_id,)).fetchone()
+        if r is None:
+            raise KeyError(review_id)
+        if entity_id is not None and self.entity(entity_id) is None:
+            raise KeyError(entity_id)
+        doc = "" if everywhere else (r["document_id"] or "")
+        with self.db:
+            self.db.execute("INSERT OR REPLACE INTO name_decisions VALUES (?,?,?,?)",
+                            (fold(r["surface"]), doc, entity_id or "", time.time()))
+            q = "UPDATE review SET status='resolved' WHERE status='open' AND surface=?"
+            args: tuple = (r["surface"],)
+            if not everywhere:
+                q += " AND document_id IS ?"
+                args += (r["document_id"],)
+            self.db.execute(q, args)
+            self.db.execute("UPDATE review SET status='resolved' WHERE id=?", (review_id,))
+            self._decide("name", {"surface": r["surface"], "entity_id": entity_id,
+                                  "document_id": doc or None, "review_id": review_id})
+
+    def merge(self, keep_id: str, absorb_id: str) -> None:
+        """``absorb_id`` is the same thing as ``keep_id`` (two spellings of one
+        person, a part listed twice). Its aliases, mentions, links and the
+        user's decisions on them move to ``keep_id``; undo with `unmerge`."""
+        keep_id, absorb_id = self.resolve(keep_id), self.resolve(absorb_id)
+        k, a = self.entity(keep_id), self.entity(absorb_id)
+        if k is None or a is None:
+            raise KeyError(keep_id if k is None else absorb_id)
+        if keep_id == absorb_id:
+            raise ValueError("that is the same entity")
+        if k["type"] != a["type"] or k["type"] == "DOCUMENT":
+            raise ValueError(f"cannot merge a {a['type']} into a {k['type']}")
+        rank = {"accepted": 3, "rejected": 2, "seeded": 1, "suggested": 0}
+        with self.db:
+            self.db.execute("UPDATE entities SET merged_into=? WHERE id=?", (keep_id, absorb_id))
+            self.db.execute("UPDATE entities SET merged_into=? WHERE merged_into=?",
+                            (keep_id, absorb_id))
+            for al in self.db.execute("SELECT * FROM aliases WHERE entity_id=?",
+                                      (absorb_id,)).fetchall():
+                self._alias(keep_id, al["alias"], al["source"])
+            self.db.execute("UPDATE OR IGNORE mentions SET entity_id=? WHERE entity_id=?",
+                            (keep_id, absorb_id))
+            self.db.execute("DELETE FROM mentions WHERE entity_id=?", (absorb_id,))
+            for r in self.db.execute("SELECT * FROM relations WHERE subject_id=? OR object_id=?",
+                                     (absorb_id, absorb_id)).fetchall():
+                s_ = keep_id if r["subject_id"] == absorb_id else r["subject_id"]
+                o_ = keep_id if r["object_id"] == absorb_id else r["object_id"]
+                if s_ != o_:
+                    new_id = relation_id(s_, r["predicate"], o_)
+                    have = self.db.execute("SELECT status FROM relations WHERE id=?",
+                                           (new_id,)).fetchone()
+                    if have is None:
+                        self.db.execute("INSERT INTO relations VALUES (?,?,?,?,?,?,?)",
+                                        (new_id, s_, r["predicate"], o_, r["status"],
+                                         r["created_ts"], time.time()))
+                    elif rank[r["status"]] > rank[have["status"]]:
+                        self.db.execute("UPDATE relations SET status=? WHERE id=?",
+                                        (r["status"], new_id))
+                    self.db.execute("UPDATE OR IGNORE evidence SET relation_id=? WHERE"
+                                    " relation_id=?", (new_id, r["id"]))
+                self.db.execute("DELETE FROM evidence WHERE relation_id=?", (r["id"],))
+                self.db.execute("DELETE FROM relations WHERE id=?", (r["id"],))
+            self._decide("merge", {"keep": keep_id, "absorb": absorb_id,
+                                   "keep_name": k["name"], "absorb_name": a["name"]})
+
+    def unmerge(self, absorb_id: str) -> None:
+        """Undo a merge. Links from labels and Collections come back apart at
+        the next rebuild; links a model suggested while merged stay with the
+        entity they were moved to."""
+        row = self.db.execute("SELECT merged_into FROM entities WHERE id=?",
+                              (absorb_id,)).fetchone()
+        if row is None or not row["merged_into"]:
+            raise ValueError("that entity is not merged into another")
+        with self.db:
+            self.db.execute("UPDATE entities SET merged_into=NULL WHERE id=?", (absorb_id,))
+            self._decide("unmerge", {"entity": absorb_id, "was_in": row["merged_into"]})
+
+    def merged_into_me(self, eid: str) -> List[Dict[str, Any]]:
+        return [self.entity(r[0]) for r in self.db.execute(
+            "SELECT id FROM entities WHERE merged_into=?", (eid,))]
 
     # ── free-text extraction (KG2) ──
     def text_chunks(self, max_lines: int = 40, overlap: int = 5

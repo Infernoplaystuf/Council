@@ -306,3 +306,40 @@ def test_suggest_runs_off_the_gui_thread_and_can_stop(qapp, tab, monkeypatch):
     tab.on_suggest()
     drive(qapp, tab)
     assert seen == [False] and "Stopped" in tab.status.text()
+
+
+def test_answer_a_question_and_it_is_applied(qapp, tab):
+    _rebuilt(qapp, tab)
+    tab.on_questions()
+    q = next(i for d, t, s, w, i in _items(tab.tree) if "D. Whitfield" in t)
+    tab.tree.setCurrentItem(q)
+    assert tab.answer_row.isVisibleTo(tab)
+    choices = [tab.answer_box.itemText(i) for i in range(tab.answer_box.count())]
+    assert set(choices) >= {"Dana Whitfield", "Dan Whitfield", "Neither — a different person"}
+    tab.answer_box.setCurrentIndex(choices.index("Dana Whitfield"))
+    tab.on_answer()
+    drive(qapp, tab)
+    tab.on_questions()
+    assert not any("D. Whitfield" in t for d, t, *_ in _items(tab.tree))
+
+
+def test_same_as_merges_after_confirming(qapp, vault):
+    asked = []
+    view = ConnectionsTab(actions=StubActions(vault),
+                          ask_string=lambda *a, **k: "Caroline",
+                          ask_yes_no=lambda *a, **k: asked.append(a) or True)
+    try:
+        _rebuilt(qapp, view)
+        view._kg._entity("PERSON", "Caroline Lee")
+        view._kg.db.commit()
+        view.search.setText("Carol Lee")
+        view.results.setCurrentRow(0)
+        carol = view._current
+        view.on_merge()
+        assert asked and view._kg.resolve(view._kg.search("Caroline Lee")[0]["id"]) == carol
+        assert view.split_btn.isEnabled()
+    finally:
+        _wait_threads(qapp)
+        view.close()
+        view.deleteLater()
+        qapp.processEvents()

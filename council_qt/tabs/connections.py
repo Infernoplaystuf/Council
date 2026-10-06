@@ -145,7 +145,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
     """Search, links with evidence, and a source preview."""
 
     def __init__(self, window=None, actions: Optional[ConnectionsActions] = None,
-                 auto_refresh: bool = True):
+                 auto_refresh: bool = True, ask_string=None, ask_yes_no=None):
         super().__init__()
         self.window = window
         self.bridge = getattr(window, "bridge", None)
@@ -156,6 +156,9 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self._current: Optional[str] = None
         self._selected: Optional[Dict[str, Any]] = None
         self._stop = threading.Event()
+        from .. import dialogs as _dialogs
+        self.ask_string = ask_string or _dialogs.askstring
+        self.ask_yes_no = ask_yes_no or _dialogs.askyesno
         self._build()
         if auto_refresh:
             self._reopen()
@@ -234,6 +237,24 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.reject_btn = self._button(btns, "✗ Reject link", lambda: self._decide("rejected"))
         btns.addStretch(1)
         rl.addLayout(btns)
+
+        # KG3: answering a question / merging duplicates
+        self.answer_row = QWidget()
+        ar = QHBoxLayout(self.answer_row)
+        ar.setContentsMargins(0, 0, 0, 0)
+        ar.addWidget(QLabel("It is"))
+        self.answer_box = QComboBox()
+        ar.addWidget(self.answer_box, 1)
+        self.everywhere_box = QCheckBox("everywhere this name appears")
+        ar.addWidget(self.everywhere_box)
+        self.answer_btn = self._button(ar, "Answer", self.on_answer)
+        rl.addWidget(self.answer_row)
+        self.answer_row.setVisible(False)
+        mrow = QHBoxLayout()
+        self.merge_btn = self._button(mrow, "Same as…", self.on_merge)
+        self.split_btn = self._button(mrow, "Split off a merged name", self.on_unmerge)
+        mrow.addStretch(1)
+        rl.addLayout(mrow)
         split.addWidget(right)
         split.setSizes([230, 520, 420])
         outer.addWidget(split, 1)
@@ -383,7 +404,10 @@ class ConnectionsTab(ViewHelpers, QWidget):
         kind = item.data(0, ROLE_KIND)
         data = item.data(0, ROLE_DATA)
         self._selected = {"kind": kind, "data": data} if kind else None
-        if kind in ("evidence", "mention"):
+        self.answer_row.setVisible(kind == "question")
+        if kind == "question":
+            self._fill_answers(data["review"])
+        if kind in ("evidence", "mention", "question"):
             self._preview(data["path"], data["locator"], data.get("where", ""))
         elif kind == "relation" and data.get("evidence"):
             ev = data["evidence"][0]
@@ -409,8 +433,11 @@ class ConnectionsTab(ViewHelpers, QWidget):
             f"{'▶' if hit else ' '} {g.rjust(width)} │ {t}" for g, t, hit in lines))
 
     def _enable_actions(self) -> None:
+        cur = self._kg.entity(self._current) if (self._kg and self._current) else None
+        self.merge_btn.setEnabled(bool(cur and cur["type"] != "DOCUMENT"))
+        self.split_btn.setEnabled(bool(cur and self._kg.merged_into_me(self._current)))
         sel = self._selected or {}
-        has_file = sel.get("kind") in ("evidence", "mention", "relation")
+        has_file = sel.get("kind") in ("evidence", "mention", "relation", "question")
         self.open_btn.setEnabled(bool(has_file and getattr(self, "_preview_path", None)))
         is_rel = sel.get("kind") == "relation"
         status = (sel.get("data") or {}).get("status") if is_rel else None
@@ -593,10 +620,71 @@ class ConnectionsTab(ViewHelpers, QWidget):
                  else f"'{r['surface']}' was read as {names} — right?")
             item = QTreeWidgetItem([q, r["kind"].replace("_", " "),
                                     f"{r['path']} · {r['where']}"])
-            item.setData(0, ROLE_KIND, "mention")
+            item.setData(0, ROLE_KIND, "question")
             item.setData(0, ROLE_DATA, {"path": r["path"], "locator": r["locator"],
-                                        "where": r["where"]})
+                                        "where": r["where"], "review": r})
             self.tree.addTopLevelItem(item)
+
+    # -- KG3 ---------------------------------------------------------------
+    def _fill_answers(self, review) -> None:
+        self.answer_box.clear()
+        for c in review["candidates"]:
+            if c:
+                self.answer_box.addItem(display_name(c), c["id"])
+        self.answer_box.addItem("Neither — a different person", None)
+        self.everywhere_box.setChecked(review["kind"] == "inferred_alias")
+
+    def on_answer(self) -> None:
+        sel = self._selected or {}
+        if sel.get("kind") != "question" or self._kg is None:
+            return
+        review = sel["data"]["review"]
+        eid = self.answer_box.currentData()
+        self._kg.answer_review(review["id"], eid, everywhere=self.everywhere_box.isChecked())
+        who = self.answer_box.currentText()
+        self.answer_row.setVisible(False)
+        self.status.setText(f"'{review['surface']}' is {who}"
+                            + (" everywhere" if self.everywhere_box.isChecked() else
+                               " in that document") + ". Rebuilding to apply it…")
+        self.on_rebuild()
+
+    def on_merge(self) -> None:
+        """Merge another entity INTO the one shown (two spellings, one thing)."""
+        if self._kg is None or not self._current:
+            return
+        cur = self._kg.entity(self._current)
+        text = self.ask_string("Same as…", f"Which entry is the same {cur['type'].lower()} "
+                               f"as {display_name(cur)}? Type its name:", parent=self)
+        if not text:
+            return
+        hits = [h for h in self._kg.search(text, cur["type"]) if h["id"] != self._current]
+        if len(hits) != 1:
+            self.status.setText(f"{len(hits)} entries match '{text}' — type more of the name.")
+            return
+        other = self._kg.entity(hits[0]["id"])
+        if not self.ask_yes_no("Merge?", f"Treat '{display_name(other)}' as "
+                               f"'{display_name(cur)}'? Its names and links move here; you "
+                               "can split it off again.", parent=self):
+            return
+        self._kg.merge(self._current, other["id"])
+        self.status.setText(f"'{display_name(other)}' merged into '{display_name(cur)}'.")
+        self.show_entity(self._current)
+        self.on_search()
+
+    def on_unmerge(self) -> None:
+        if self._kg is None or not self._current:
+            return
+        merged = self._kg.merged_into_me(self._current)
+        if not merged:
+            return
+        m = merged[0]
+        if not self.ask_yes_no("Split off?", f"Make '{display_name(m)}' its own entry "
+                               "again? Links from labels come back apart at the next "
+                               "rebuild.", parent=self):
+            return
+        self._kg.unmerge(m["id"])
+        self.status.setText(f"'{display_name(m)}' split off. Rebuilding…")
+        self.on_rebuild()
 
     def closeEvent(self, event) -> None:          # noqa: N802 — Qt's name
         if self._kg is not None:
