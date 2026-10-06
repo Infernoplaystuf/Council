@@ -315,8 +315,11 @@ class Value:
 @dataclass
 class Record:
     path: str                    # relative to the scanned root
-    kind: str                    # row | record | document
+    kind: str                    # row | record | document | skipped
     values: List[Value] = field(default_factory=list)
+    #: kind 'skipped': a table row that could not be read (more cells than
+    #: the header), reported in the run's coverage instead of vanishing.
+    skipped_row: int = 0
 
 
 _TABULAR = {".csv", ".tsv", ".xlsx", ".xlsm", ".xls"}
@@ -338,12 +341,17 @@ def _table_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record
     import field_search as fs
     by_norm = _rule_index(rules)
     out: List[Record] = []
-    for sheet, frame in fs._table_frames(p):
+    # strict: a table that cannot be read raises, so seed() lists it as
+    # unreadable instead of counting it as a document with no facts.
+    for sheet, frame in fs._table_frames(p, strict=True):
+        for rowno in frame.attrs.get("skipped_rows", []):
+            out.append(Record(rel, "skipped", [], skipped_row=rowno))
         cols = [(c, by_norm.get(fs._norm_key(c))) for c in frame.columns]
         cols = [(c, r) for c, r in cols if r is not None]
         if not cols:
             continue
-        for idx, row in enumerate(frame.itertuples(index=False, name=None)):
+        # The index is the row a person sees (blank and bad lines counted).
+        for rowno, row in zip(frame.index, frame.itertuples(index=False, name=None)):
             rowd = dict(zip(frame.columns, row))
             rec = Record(rel, "row")
             for c, r in cols:
@@ -353,7 +361,7 @@ def _table_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record
                 raw = str(raw).strip()
                 if not raw or raw.lower() == "nan":
                     continue
-                loc = {"row": idx + 2, "column": str(c)}
+                loc = {"row": int(rowno), "column": str(c)}
                 if sheet is not None:
                     loc["sheet"] = sheet
                 for one in (fs._split_values(raw, r.label, r.type) or [raw]):
@@ -751,7 +759,8 @@ class KnowledgeGraph:
         rules = [r for r, _s in self.field_rules("confirmed")]
         files = self.document_files()
         stats: Dict[str, Any] = {"documents": len(files), "records": 0,
-                                 "unreadable": [], "rules": len(rules)}
+                                 "unreadable": [], "skipped_rows": [],
+                                 "rules": len(rules)}
         with self.db:
             self.db.execute("INSERT INTO runs (id, kind, started_ts) VALUES (?,?,?)",
                             (run_id, "seed", t0))
@@ -775,6 +784,11 @@ class KnowledgeGraph:
                                         " WHERE id=?", (did,))
                         continue
                     for rec in read_records(p, self._rel(p), rules):
+                        if rec.kind == "skipped":
+                            stats["skipped_rows"].append(
+                                f"{rec.path}: row {rec.skipped_row} has more cells "
+                                "than the header")
+                            continue
                         records.append((rec, did, h))
                 except Exception as exc:
                     stats["unreadable"].append(f"{self._rel(p)}: {exc.__class__.__name__}")
@@ -1172,6 +1186,7 @@ class KnowledgeGraph:
         return {"documents": total, "with_facts": with_fact,
                 "with_mentions": with_mention,
                 "unreadable": st.get("unreadable", []),
+                "skipped_rows": st.get("skipped_rows", []),
                 "last_run": last["finished_ts"] if last else None}
 
     def all_relations(self, include_rejected: bool = False) -> List[Dict[str, Any]]:
@@ -1253,10 +1268,11 @@ def source_context(root: Any, rel_path: str, locator: Any, *, radius: int = 3
             for sheet, frame in fs._table_frames(p):
                 if locator.get("sheet") not in (None, sheet):
                     continue
-                i = int(locator["row"]) - 2
-                if not 0 <= i < len(frame):
+                # The frame's index is the row number a person sees.
+                rowno = int(locator["row"])
+                if rowno not in frame.index:
                     return []
-                row = frame.iloc[i]
+                row = frame.loc[rowno]
                 marked = set(locator.get("columns") or [locator.get("column")])
                 out = [("", f"{'sheet ' + str(sheet) + ', ' if sheet else ''}"
                             f"row {locator['row']}", False)]

@@ -881,14 +881,15 @@ def field_value_locations(path: Any, field: str, *,
                 col = None
             if col is None:
                 continue
-            for idx, raw in enumerate(frame[col].tolist()):
+            # The index is the row a person sees (see _table_frames).
+            for rowno, raw in zip(frame.index, frame[col].tolist()):
                 if raw is None or (isinstance(raw, float) and raw != raw):
                     continue
                 raw = str(raw).strip()
                 if not raw:
                     continue
                 for one in (_split_values(raw, field, kind) or [raw]):
-                    loc = {"value": one, "kind": "row", "row": idx + 2,
+                    loc = {"value": one, "kind": "row", "row": int(rowno),
                            "column": str(col), "snippet": _snippet(raw)}
                     if sheet is not None:
                         loc["sheet"] = sheet
@@ -930,23 +931,86 @@ def field_value_locations(path: Any, field: str, *,
     return out
 
 
-def _table_frames(p: Path):
+def _table_frames(p: Path, *, strict: bool = False):
     """``[(sheet_name_or_None, DataFrame)]`` — EVERY sheet of a workbook (a
     tracker's people are often on the second tab), or the one frame of a
-    CSV/TSV/Parquet. Cells are read as text so part codes keep leading zeros."""
+    CSV/TSV/Parquet. Cells are read as text so part codes keep leading zeros.
+
+    Each frame's INDEX is the row number a person sees (header = row 1), so a
+    citation names the right row even when a CSV has blank or malformed lines
+    (see _csv_frame). A CSV's skipped rows are in ``frame.attrs
+    ["skipped_rows"]``. An unreadable file gives ``[]``, or raises with
+    ``strict`` (the knowledge graph then lists it as unreadable)."""
     suf = p.suffix.lower()
     try:
         import pandas as pd
         if suf in (".xlsx", ".xlsm", ".xls"):
             book = pd.read_excel(p, sheet_name=None, dtype=str)
-            return list(book.items())
+            out = []
+            for name, fr in book.items():
+                fr.index = range(2, len(fr) + 2)
+                out.append((name, fr))
+            return out
         if suf in (".csv", ".tsv"):
-            return [(None, pd.read_csv(p, sep="\t" if suf == ".tsv" else ",",
-                                       dtype=str, on_bad_lines="skip"))]
+            return [(None, _csv_frame(p, "\t" if suf == ".tsv" else ","))]
         import vault_analyst as va
-        return [(None, va.read_table(p).astype(str))]
+        fr = va.read_table(p).astype(str)
+        fr.index = range(2, len(fr) + 2)
+        return [(None, fr)]
     except Exception:
+        if strict:
+            raise
         return []
+
+
+def _csv_frame(p: Path, sep: str):
+    """A CSV/TSV as text cells, indexed by the row a person sees.
+
+    pandas' read_csv was used with its defaults: a Windows-1252 file (Excel's
+    plain "CSV" save) raised UnicodeDecodeError and the caller saw no rows at
+    all; skip_blank_lines and on_bad_lines='skip' shifted every later row
+    number (a lead on row 5 was cited as row 3) and dropped a malformed row
+    without a word. Here the bytes are decoded as UTF-8 (BOM allowed), else
+    cp1252, else latin-1; blank rows are counted but hold no data; a row with
+    more non-empty cells than the header is skipped and its number recorded
+    in ``attrs["skipped_rows"]``."""
+    import csv as _csv
+    import io as _io
+    import pandas as pd
+    raw = p.read_bytes()
+    for enc in ("utf-8-sig", "cp1252", "latin-1"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    header: Optional[List[str]] = None
+    rows: List[List[Optional[str]]] = []
+    index: List[int] = []
+    skipped: List[int] = []
+    for rowno, rec in enumerate(_csv.reader(_io.StringIO(text, newline=""),
+                                            delimiter=sep), start=1):
+        if not any(c.strip() for c in rec):
+            continue                                  # blank row: counted only
+        if header is None:
+            header, seen = [], {}
+            for i, c in enumerate(rec):
+                name = c if c.strip() else f"Unnamed: {i}"
+                n = seen.get(name, 0)
+                seen[name] = n + 1
+                header.append(name if n == 0 else f"{name}.{n}")
+            continue
+        if len(rec) > len(header):
+            if any(c.strip() for c in rec[len(header):]):
+                skipped.append(rowno)
+                continue
+            rec = rec[:len(header)]
+        rows.append([c if c.strip() else None for c in rec]
+                    + [None] * (len(header) - len(rec)))
+        index.append(rowno)
+    fr = pd.DataFrame(rows, columns=header or [], index=index, dtype=object)
+    fr.attrs["skipped_rows"] = skipped
+    return fr
 
 
 def _pdf_pages(p: Path) -> List[str]:

@@ -225,6 +225,10 @@ class ConnectionsTab(ViewHelpers, QWidget):
             text += (f" NOT READ: {len(cov['unreadable'])} file(s) — "
                      + "; ".join(cov["unreadable"][:3])
                      + (" …" if len(cov["unreadable"]) > 3 else ""))
+        skipped = cov.get("skipped_rows") or []
+        if skipped:
+            text += (f" ROWS NOT READ: {len(skipped)} — " + "; ".join(skipped[:3])
+                     + (" …" if len(skipped) > 3 else ""))
         if not confirmed:
             text += " No field labels are ticked yet (Fields…)."
         self.coverage.setText(text)

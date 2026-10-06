@@ -236,6 +236,14 @@ def test_unreadable_files_are_named_in_the_coverage(qapp, tab, monkeypatch):
     assert "ecn_0915_014.pdf" in tab.coverage.text()
 
 
+def test_rows_that_could_not_be_read_are_named_in_the_coverage(qapp, tab, vault):
+    (vault / "data_in" / "bad_rows.csv").write_text(
+        "Project,Program Lead\nPRJ-7,Ann Stone\nPRJ-8,a,b,c\n", encoding="utf-8")
+    _rebuilt(qapp, tab)
+    assert "ROWS NOT READ: 1" in tab.coverage.text()
+    assert "bad_rows.csv: row 3" in tab.coverage.text()
+
+
 def test_damaged_store_is_reported_not_rebuilt(qapp, tmp_path):
     v = tmp_path / "v"
     p = kgm.store_path(v)

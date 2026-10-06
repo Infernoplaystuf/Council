@@ -440,3 +440,35 @@ def test_a_json_value_is_cited_on_its_own_line(tmp_path):
         sup = next(r for r in kg.all_relations() if r["predicate"] == "SUPERSEDES")
         ev = kg.evidence(sup["id"])
         assert [e["locator"].get("line") for e in ev] == [want]
+
+
+def test_a_windows_1252_csv_is_read(tmp_path):
+    # Excel's plain "CSV" save on Windows writes cp1252; field search read it,
+    # the graph's reader returned nothing and did not list it as unreadable.
+    import field_search as fs
+    body = "Project,Program Lead\r\nPRJ-1,Tomás Echeverría\r\nPRJ-2,Carol Lee\r\n"
+    v = _tiny(tmp_path, {"tracker.csv": body.encode("cp1252")})
+    locs = fs.field_value_locations(v / "data_in" / "tracker.csv", "Program Lead")
+    assert [(l["value"], l["row"]) for l in locs] == [("Tomás Echeverría", 2),
+                                                     ("Carol Lee", 3)]
+    with _graph(v) as kg:
+        stats = kg.seed()
+        assert stats["unreadable"] == []
+        assert _links(kg) == [("Carol Lee", "LEADS", "PRJ-2", "seeded"),
+                              ("Tomás Echeverría", "LEADS", "PRJ-1", "seeded")]
+
+
+def test_csv_rows_are_numbered_as_in_the_file_and_bad_rows_are_reported(tmp_path):
+    import field_search as fs
+    body = "Project,Program Lead\nPRJ-1,Carol Lee\n\nPRJ-X,a,b,c\nPRJ-2,Dan Smith\n"
+    v = _tiny(tmp_path, {"t.csv": body})
+    locs = fs.field_value_locations(v / "data_in" / "t.csv", "Program Lead")
+    assert [(l["value"], l["row"]) for l in locs] == [("Carol Lee", 2), ("Dan Smith", 5)]
+    with _graph(v) as kg:
+        stats = kg.seed()
+        dan = next(r for r in kg.all_relations() if r["subject"]["name"] == "Dan Smith")
+        assert [e["locator"]["row"] for e in kg.evidence(dan["id"])] == [5]
+        assert stats["skipped_rows"] == ["t.csv: row 4 has more cells than the header"]
+        assert kg.coverage()["skipped_rows"] == stats["skipped_rows"]
+        ctx = kgm.source_context(v / "data_in", "t.csv", {"row": 5, "column": "Program Lead"})
+        assert ("Program Lead", "Dan Smith", True) in ctx
