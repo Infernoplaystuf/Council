@@ -262,6 +262,163 @@ def test_check_script_accepts_a_correct_script():
     assert nx_policy.validate_script(GOOD_SCRIPT)[0]
 
 
+_PRE = "import simplnx as nx\nds = nx.DataStructure()\n"
+_G = "nx.CreateImageGeometryFilter"
+_BOGUS = "has no parameter 'bogus'"
+
+
+@pytest.mark.parametrize("code, expect", [
+    # A keyword set passed with **. The checker used to skip every **
+    # keyword and switch the required-parameter check off; each of these was
+    # accepted and raised TypeError / "Unable to cast" in simplnx.
+    (_PRE + "params = {'dims': [2, 2, 2], 'output_image_geometry_path': 'Geom'}\n"
+     f"r = {_G}.execute(data_structure=ds, **params)\n",
+     "has no parameter 'dims'. Did you mean dimensions?"),
+    (_PRE + "params = {'dimensions': [2, 2, 2], 'output_image_geometry_path': 'Geom'}\n"
+     f"r = {_G}.execute(data_structure=ds, **params)\n",
+     "wrap the string: nx.DataPath"),
+    (_PRE + f"r = {_G}.execute(data_structure=ds, **{{'bogus': 1}})\n", _BOGUS),
+    (_PRE + f"r = {_G}.execute(data_structure=ds, **{{'dimensions': 'abc'}})\n",
+     "dimensions is a list[int]"),
+    (_PRE + f"kw = dict(bogus=1)\nr = {_G}.execute(data_structure=ds, **kw)\n",
+     _BOGUS),
+    (_PRE + f"r = {_G}.execute(**{{'dimensions': [2, 2, 2]}})\n",
+     "missing data_structure=ds"),
+    # ...and one it cannot read is reported, not passed.
+    (_PRE + f"kw = {{}}\nkw['bogus'] = 1\nr = {_G}.execute(data_structure=ds, **kw)\n",
+     "cannot be checked"),
+    (_PRE + f"def make():\n    return {{}}\n"
+     f"r = {_G}.execute(data_structure=ds, **make())\n", "cannot be checked"),
+    (_PRE + f"args = [ds]\nr = {_G}.execute(*args)\n", "cannot be checked"),
+    # The filter held any way but one plain assignment got no execute()
+    # check at all, so not even the keyword NAMES were checked.
+    (_PRE + f"F = nx.CreateDataArrayFilter\nF = {_G}\n"
+     "r = F.execute(data_structure=ds, bogus=1)\n", _BOGUS),
+    (_PRE + f"F, H = {_G}, nx.CreateDataArrayFilter\n"
+     "r = F.execute(data_structure=ds, bogus=1)\n", _BOGUS),
+    (_PRE + f"F: object = {_G}\nr = F.execute(data_structure=ds, bogus=1)\n",
+     _BOGUS),
+    (_PRE + f"if (F := {_G}):\n    r = F.execute(data_structure=ds, bogus=1)\n",
+     _BOGUS),
+    (_PRE + f"fs = [{_G}]\nr = fs[0].execute(data_structure=ds, bogus=1)\n",
+     _BOGUS),
+    (_PRE + f"fs = {{'g': {_G}}}\nr = fs['g'].execute(data_structure=ds, bogus=1)\n",
+     _BOGUS),
+    (_PRE + f"r = ({_G} if True else nx.CreateDataArrayFilter).execute("
+     "data_structure=ds, bogus=1)\n", _BOGUS),
+    (_PRE + f"for F in ({_G},):\n    r = F.execute(data_structure=ds, bogus=1)\n",
+     _BOGUS),
+    (_PRE + f"fs = [{_G}]\nfor F in fs:\n"
+     "    r = F.execute(data_structure=ds, bogus=1)\n", _BOGUS),
+    (_PRE + f"for name, F in [('g', {_G})]:\n"
+     "    r = F.execute(data_structure=ds, bogus=1)\n", _BOGUS),
+    (_PRE + f"rs = [F.execute(data_structure=ds, bogus=1) for F in ({_G},)]\n",
+     _BOGUS),
+    (_PRE + "def run(f, **k):\n    return f.execute(data_structure=ds, **k)\n"
+     f"r = run({_G}, bogus=1)\n", _BOGUS),
+    (_PRE + "def run(f):\n    return f.execute(data_structure=ds, bogus=1)\n"
+     f"r = run({_G})\n", _BOGUS),
+    # One helper, two call sites: each checked with its own filter.
+    (_PRE + "def run(f, **k):\n    return f.execute(data_structure=ds, **k)\n"
+     "run(nx.CreateDataArrayFilter, component_count=1)\n"
+     f"run({_G}, component_count=1)\n",
+     "CreateImageGeometryFilter.execute() has no parameter 'component_count'"),
+    # A filter it cannot identify is an error, not a pass.
+    (_PRE + "def pick():\n    return nx.CreateDataArrayFilter\n"
+     "r = pick().execute(data_structure=ds)\n", "cannot identify"),
+    (_PRE + "def run(f):\n    return f.execute(data_structure=ds)\n"
+     f"for r in map(run, [{_G}]):\n    pass\n", "cannot identify"),
+    # execute2 / preflight2 belong to a filter OBJECT: on the class they
+    # fail with "incompatible function arguments" whatever they are given.
+    (_PRE + f"r = {_G}.execute2(data_structure=ds, dimensions=[2, 2, 2])\n",
+     "execute2 is not how a script runs a filter"),
+    (_PRE + f"F = {_G}\nF = nx.CreateDataArrayFilter\nr = F.preflight2(ds)\n",
+     "preflight2 is not how a script runs a filter"),
+])
+def test_check_script_follows_every_way_a_script_holds_a_filter(code, expect):
+    errs = nx_ground.check_script(code, REAL_CATALOG)["errors"]
+    assert any(expect in e for e in errs), errs
+
+
+# Every indirect form the checker now follows, written correctly: no false
+# positive, and it really runs (test_an_indirect_script_the_checker_accepts_runs).
+GOOD_INDIRECT_SCRIPT = '''\
+import simplnx as nx
+
+ds = nx.DataStructure()
+
+# A keyword set held in a dict, and the filter behind an alias.
+geom = {"dimensions": [4, 3, 2], "origin": [0.0, 0.0, 0.0],
+        "spacing": [1.0, 1.0, 1.0],
+        "output_image_geometry_path": nx.DataPath("Geom")}
+Make = nx.CreateImageGeometryFilter
+r = Make.execute(data_structure=ds, **geom)
+assert not r.errors, r.errors
+
+
+def run(f, **params):
+    result = f.execute(data_structure=ds, **params)
+    assert not result.errors, result.errors
+    return result
+
+
+# Each step: a filter and its keywords, run through the helper.
+steps = [
+    (nx.CreateDataArrayFilter, dict(numeric_type_index=nx.NumericType.float32,
+                                    output_array_path=nx.DataPath("A"),
+                                    tuple_dimensions=[[5]], component_count=1)),
+    (nx.CreateDataArrayFilter, {"numeric_type_index": nx.NumericType.int32,
+                                "output_array_path": nx.DataPath("B"),
+                                "tuple_dimensions": [[3]],
+                                "component_count": 2}),
+]
+for f, kw in steps:
+    run(f, **kw)
+run(nx.CreateDataArrayFilter, numeric_type_index=nx.NumericType.uint8,
+    output_array_path=nx.DataPath("C"), tuple_dimensions=[[2]],
+    component_count=1)
+
+# One name rebound from filter to filter, each call right for the one it
+# holds at that point.
+F = nx.CreateDataArrayFilter
+r = F.execute(data_structure=ds, numeric_type_index=nx.NumericType.int8,
+              output_array_path=nx.DataPath("D"), tuple_dimensions=[[1]],
+              component_count=1)
+assert not r.errors, r.errors
+F = nx.CreateImageGeometryFilter
+r = F.execute(data_structure=ds, dimensions=[2, 2, 2],
+              output_image_geometry_path=nx.DataPath("Geom2"))
+assert not r.errors, r.errors
+for name in ("A", "B", "C", "D", "Geom2"):
+    assert ds.exists(nx.DataPath(name)), name
+print("indirect ok")
+'''
+
+
+def test_check_script_accepts_correct_indirect_calls():
+    assert nx_ground.check_script(GOOD_INDIRECT_SCRIPT,
+                                  REAL_CATALOG)["errors"] == []
+    assert nx_policy.validate_script(GOOD_INDIRECT_SCRIPT)[0]
+
+
+@pytest.mark.parametrize("code", [
+    # The two write_script accepted on the first attempt (ok=True).
+    "import simplnx as nx\nds = nx.DataStructure()\n"
+    "params = {'dims': [2, 2, 2], 'output_image_geometry_path': 'Geom'}\n"
+    "result = nx.CreateImageGeometryFilter.execute(data_structure=ds, **params)\n",
+    "import simplnx as nx\nds = nx.DataStructure()\n"
+    "for f in [nx.CreateImageGeometryFilter]:\n"
+    "    result = f.execute(data_structure=ds, dims=[2, 2, 2], "
+    "output_image_geometry_path='Geom')\n",
+])
+def test_write_script_refuses_a_script_that_hides_its_filter_or_keywords(code):
+    res = nx_generate.write_script("create a 2x2x2 image geometry",
+                                   REAL_CATALOG, lambda _p: code,
+                                   max_attempts=1, n_ctx=8192)
+    assert res["ok"] is False
+    assert any("'dims'" in e for e in res["errors"]), res["errors"]
+
+
 def test_write_script_rejects_a_filter_the_catalog_does_not_have():
     code = ("import simplnx as nx\nds = nx.DataStructure()\n"
             "r = nx.TotallyMadeUpFilter.execute(data_structure=ds, bogus='x')\n")
@@ -828,6 +985,16 @@ def test_a_script_the_checker_accepts_runs(tmp_path):
                           timeout=300)
     assert proc.returncode == 0, proc.stderr[-1500:]
     assert "wrote True" in proc.stdout
+
+
+@needs_nx
+def test_an_indirect_script_the_checker_accepts_runs(tmp_path):
+    (tmp_path / "ind.py").write_text(GOOD_INDIRECT_SCRIPT, encoding="utf-8")
+    proc = subprocess.run([NXPY, "ind.py"], cwd=tmp_path, capture_output=True,
+                          text=True, encoding="utf-8", errors="replace",
+                          timeout=300)
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    assert "indirect ok" in proc.stdout
 
 
 # ============================================================
