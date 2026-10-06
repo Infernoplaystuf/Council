@@ -667,8 +667,12 @@ class CouncilTab(ViewHelpers, QWidget):
         if not self.begin_turn():
             return
         self.reset_turn()
-        # Only calls made from here on describe THIS turn's speed.
+        # Only calls made from here on describe THIS turn's speed, and the
+        # label is cleared with the rates it shows: kept, the previous turn's
+        # "Writer 40 tok/s" stood all through a turn that then failed — and
+        # after it — under a tooltip that says "this turn" (found in review).
         self._turn_stats_floor = self.actions.last_call_stats().get("seq") or 0
+        self.tps_label.setText("")
         self._last_query = typed
         self.append("User", typed)
         self.input.clear()

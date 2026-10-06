@@ -675,6 +675,54 @@ def test_the_speed_label_shows_what_the_engine_measured(qapp, monkeypatch,
         window.request_close()
 
 
+def test_a_failed_turn_does_not_show_the_previous_turns_speed(
+        qapp, monkeypatch, tmp_path):
+    """The label says "this turn" (its tooltip). Measured in review: turn 1
+    ended on "Writer 40 tok/s", turn 2 failed with an HTTP 500, and the label
+    said "Writer 40 tok/s" all through turn 2 and after it."""
+    import threading as _threading
+
+    ce = _engine()
+
+    from tests.test_council_turn import FakeModel, Models
+
+    in_second = _threading.Event()
+    release = _threading.Event()
+
+    class FastThenBroken(FakeModel):
+        def respond(self, prompt, **kwargs):
+            self.asked.append(prompt)
+            if len(self.asked) == 1:
+                ce._record_stats("writer", {"backend": "ollama",
+                                            "model": "fake",
+                                            "gen_tok_s": 40.0})
+                return "the first answer"
+            in_second.set()
+            release.wait(5.0)
+            raise RuntimeError("Ollama answered HTTP 500")
+
+    window, view = _council(qapp, monkeypatch, tmp_path,
+                            Models(writer=FastThenBroken()), demo_mode=True)
+    try:
+        _ask(qapp, view, "first")
+        assert view.tps_label.text() == "Writer 40 tok/s"
+        view.input.setPlainText("second")
+        view.on_send()
+        assert _pump(qapp, in_second.is_set, timeout=10)
+        assert view.tps_label.text() == "", (
+            f"during turn 2 the label said {view.tps_label.text()!r}")
+        release.set()
+        assert _pump(qapp, lambda: not view._turn_active, timeout=10)
+        for _ in range(20):
+            qapp.processEvents()
+        assert "HTTP 500" in view.transcript.toPlainText()
+        assert view.tps_label.text() == "", (
+            f"after the failed turn the label said {view.tps_label.text()!r}")
+    finally:
+        release.set()
+        window.request_close()
+
+
 def test_a_call_from_before_the_turn_is_not_this_turns_speed(
         qapp, monkeypatch, tmp_path):
     """The engine's stats are "the most recent call", whoever made it — a
