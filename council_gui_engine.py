@@ -3998,40 +3998,17 @@ def _migrate_old_paths_to_vault() -> None:
     """
     One-time migration: move data from old scattered locations into vault.
     Safe to run repeatedly — skips anything already moved.
+
+    MOVED to council_core.vault_setup.migrate_legacy_paths, unchanged, so the
+    Qt launch runs the same moves (it ran none: an upgrader starting in Qt
+    found their node registry and model pins still in the old app folder,
+    unread). The list there is this one: the log, node registry, model pins,
+    workspace, graph output and Chroma store from APP_DIR, and the Dream3D
+    docs scraped next to this script.
     """
-    import shutil
-
-    migrations = [
-        # (old_path,                          new_path,           is_dir)
-        (APP_DIR / "council.log",             LOG_PATH,           False),
-        (APP_DIR / "node_registry.json",      REGISTRY_PATH,      False),
-        (APP_DIR / "personality_backends.json", PINS_PATH,        False),
-        (APP_DIR / "workspace",               WORKSPACE_DIR,      True),
-        (APP_DIR / "graph_output",            VAULT_DIR / "graph_output", True),
-        (APP_DIR / ".chromadb",               VAULT_DIR / ".chromadb",    True),
-        # dream3d docs scraped next to the script
-        (Path(__file__).parent / "vault" / "dream3d_docs",
-         VAULT_DIR / "dream3d_docs", True),
-    ]
-
-    moved = []
-    for old, new, is_dir in migrations:
-        if not old.exists() or old == new:
-            continue
-        if new.exists():
-            # destination already has content — don't overwrite
-            continue
-        try:
-            new.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(old), str(new))
-            moved.append(f"  {old.name} → vault/{new.relative_to(VAULT_DIR)}")
-        except Exception as e:
-            print(f"[Migration] Could not move {old.name}: {e}")
-
-    if moved:
-        print("[Migration] Moved old data into vault:")
-        for m in moved:
-            print(m)
+    from council_core import vault_setup
+    vault_setup.migrate_legacy_paths(VAULT_DIR, app_dir=APP_DIR,
+                                     repo_root=Path(__file__).parent)
 
 
 # Run migration silently on startup — unless told not to. The test suite
@@ -4264,29 +4241,15 @@ class CouncilConsole(tk.Tk):
         # never overwrites or deletes anything in there). Derived
         # outputs go to vault/data_out/. The DataIndex constructor
         # validates the two never overlap.
-        data_index.init_data_dirs(VAULT_DIR)
-        # Sweep: an earlier version of the migration helper copied
-        # app-internal config files (specialists.json, node_registry.json,
-        # etc.) into data_in/. Clean them out here so the dropdown stays
-        # showing only real user data.
-        try:
-            cleaned = data_index.cleanup_misplaced_internals(VAULT_DIR)
-            if cleaned:
-                print(f"[DataIndex] Removed {len(cleaned)} stray app-config "
-                      f"file(s) from data_in/")
-        except Exception as e:
-            print(f"[DataIndex] Cleanup skipped: {e}")
-        # One-time migration: copy any loose user CSV/JSON at the vault
-        # root into data_in/ so they're discoverable. Originals stay
-        # put — we never silently move user data. App-internal config
-        # filenames are excluded.
-        try:
-            migrated = data_index.migrate_loose_vault_files(VAULT_DIR)
-            if migrated:
-                print(f"[DataIndex] Copied {len(migrated)} loose data file(s) "
-                      f"from vault root into data_in/")
-        except Exception as e:
-            print(f"[DataIndex] Migration skipped: {e}")
+        # Three steps, through council_core.vault_setup.prepare_data_dirs so
+        # the Qt launch runs the same ones (it ran none, and a fresh Qt vault
+        # had no data_in/): create data_in/ + data_out/ with a README each;
+        # sweep app-internal config files an earlier migration copied into
+        # data_in/ (byte-identical copies only); and copy any loose user
+        # CSV/TSV/JSON at the vault root into data_in/ so they are
+        # discoverable — originals stay put, we never silently move user data.
+        from council_core import vault_setup as _vault_setup
+        _vault_setup.prepare_data_dirs(VAULT_DIR)
 
         self.data_index = data_index.DataIndex(
             search_roots=[

@@ -58,6 +58,9 @@ def build(argv: Optional[list] = None, *,
     # BEFORE the GUI exists, so a failure during construction is captured
     # rather than printed to a console the user may not have.
     _install_crash_hooks(vault)
+    # The vault's folders and an upgrader's old files, before anything reads
+    # the vault — the Tk engine does both at startup too.
+    _prepare_vault(vault)
     # Before the window, and so before any tab can build personalities: the
     # engine reads these when it loads a model.
     _apply_engine_settings(vault)
@@ -100,6 +103,15 @@ def _install_crash_hooks(vault) -> None:
         crash_reporter.install(paths.ensure(vault), on_crash=_report_crash)
     except Exception as exc:                             # noqa: BLE001
         print(f"[startup] crash hooks unavailable: {exc!r}", flush=True)
+
+
+def _prepare_vault(vault) -> None:
+    """logs/, workspace/, tmp/, data_in/ and data_out/ with their READMEs, and
+    an older build's files moved in from the app folder — what the Tk engine
+    does at import and in its console, through the same functions. Never
+    fatal (prepare never raises)."""
+    from council_core import vault_setup
+    vault_setup.prepare(vault)
 
 
 def _apply_engine_settings(vault) -> None:

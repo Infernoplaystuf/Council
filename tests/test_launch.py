@@ -321,6 +321,62 @@ def test_the_vault_is_created_if_it_is_not_there(qapp, tmp_path):
 
 
 # ============================================================
+# The vault's folders, and an upgrader's old files
+# ============================================================
+
+@pytest.fixture
+def upgrader(tmp_path, monkeypatch):
+    """An app folder from an older build, with its files where it kept them,
+    and the migration switched on — pointed at THIS test's folders only. The
+    repo root is redirected too: the real one is this checkout, and a move
+    out of it into a temp vault would be a move into the bin."""
+    from council_core import vault_setup
+    app = tmp_path / "app"
+    app.mkdir()
+    (app / "node_registry.json").write_text('{"nodes": ["pi"]}',
+                                            encoding="utf-8")
+    (app / "personality_backends.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("COUNCIL_APP_DIR", str(app))
+    monkeypatch.setenv("COUNCIL_SKIP_PATH_MIGRATION", "0")
+    monkeypatch.setattr(vault_setup, "REPO_ROOT", tmp_path / "repo")
+    return app
+
+
+def test_a_launch_moves_an_upgraders_files_into_the_vault(qapp, tmp_path,
+                                                          upgrader):
+    """The Tk engine does this at import; the Qt launch never did, so a user
+    upgrading straight into Qt found their node registry and model pins
+    "gone" — still in the old app folder, unread."""
+    build()
+    vault = tmp_path / "vault"
+    assert (vault / "node_registry.json").read_text() == '{"nodes": ["pi"]}'
+    assert (vault / "personality_backends.json").exists()
+    assert not (upgrader / "node_registry.json").exists()
+
+
+def test_a_launch_sets_up_the_data_folders(qapp, tmp_path):
+    """data_in/ is where every message about adding data points; a fresh Qt
+    vault did not have one."""
+    vault = tmp_path / "vault"
+    vault.mkdir(parents=True)
+    (vault / "orders.csv").write_text("id\n1\n", encoding="utf-8")
+    build()
+    assert (vault / "data_in" / "README.txt").is_file()
+    assert (vault / "data_out" / "README.txt").is_file()
+    assert (vault / "data_in" / "orders.csv").is_file()
+    for folder in ("logs", "workspace", "tmp"):
+        assert (vault / folder).is_dir(), folder
+
+
+def test_a_launch_respects_the_skip_switch(qapp, tmp_path, upgrader,
+                                           monkeypatch):
+    monkeypatch.setenv("COUNCIL_SKIP_PATH_MIGRATION", "1")
+    build()
+    assert (upgrader / "node_registry.json").exists()
+    assert not (tmp_path / "vault" / "node_registry.json").exists()
+
+
+# ============================================================
 # The saved engine settings
 # ============================================================
 
