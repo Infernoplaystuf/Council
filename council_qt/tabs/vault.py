@@ -229,10 +229,14 @@ class VaultActions:
         from council_core import vault_ops
         return vault_ops.pull(self.vault_dir, subfolder, log=log)
 
-    def build_descriptions(self):                   self._later("Descriptions")
-    def build_embeddings(self):                     self._later("Embeddings")
-    def convert_mongo(self, path, csv, schema, text, scan_all=False):
-        self._later("Mongo conversion")
+    # NO STUBS FOR build_descriptions / build_embeddings HERE. There were two
+    # — one-line `self._later(...)` definitions below the real methods above —
+    # and a later `def` of the same name replaces the earlier one, so the
+    # stubs won. The tab calls build_descriptions(on_progress=...), the stub
+    # took no such argument, and the worker died of a TypeError with all
+    # three index buttons left disabled for the session. A dead stub for
+    # convert_mongo sat here too, shadowed in turn by the real one below.
+    # tests/test_vault_tab.py drives the real tab against these.
     def build_stats(self):
         # The only one still behind the line: the shell's _build_stats_index
         # reaches into CouncilConsole's own caches, so the operation cannot be
@@ -916,23 +920,46 @@ class VaultTab(ViewHelpers, QWidget):
         self.append("keyword index: walking the vault …")
         self._set_index_buttons(False)
 
+        def on_progress(done: int, total: int, name: str) -> None:
+            line = vault_ops.progress_line(done, total, name)
+            self._to_ui(lambda: self.index_status.setText(line))
+
+        self._start_index_worker(
+            lambda: self.actions.build_keyword_index(on_progress=on_progress),
+            what="Keyword index", name="keyword-index")
+
+    def _start_index_worker(self, run: Callable, *, what: str,
+                            name: str) -> None:
+        """Run one index layer on a worker and ALWAYS give the buttons back.
+
+        The caller has already disabled all three buttons. Whatever happens in
+        ``run`` — a result, NotYetExtracted, an exception nobody expected — the
+        `finally` posts `_finish_index`, which re-enables them. The workers
+        used to call `run` bare: anything that escaped killed the thread before
+        the re-enable was posted, and the three buttons stayed disabled for the
+        rest of the session with nothing in the log to say why (the stub
+        TypeError, measured, was exactly that).
+        """
+        from council_core import vault_ops
+
         def work() -> None:
-            def on_progress(done: int, total: int, name: str) -> None:
-                line = vault_ops.progress_line(done, total, name)
-                self._to_ui(lambda: self.index_status.setText(line))
-
+            outcome = None
             try:
-                result = self.actions.build_keyword_index(on_progress=on_progress)
+                outcome = run()
             except VaultActions.NotYetExtracted as exc:
-                # Bound now: `exc` is unbound the moment this block ends, and
-                # this lambda runs later.
-                said = str(exc)
-                self._to_ui(lambda said=said: self._finish_index(
-                    vault_ops.IndexResult(False, said)))
-                return
-            self._to_ui(lambda: self._finish_index(result))
+                outcome = vault_ops.IndexResult(False, f"{what}: {exc}")
+            except Exception as exc:                      # noqa: BLE001
+                outcome = vault_ops.IndexResult(
+                    False, f"{what} failed: {exc!r}", error=exc)
+            finally:
+                # Bound as a default: the posted call runs after this frame
+                # has gone, and a BaseException (no outcome) still needs the
+                # buttons back.
+                done = outcome or vault_ops.IndexResult(
+                    False, f"{what} stopped without a result.")
+                self._to_ui(lambda done=done: self._finish_index(done))
 
-        threading.Thread(target=work, name="keyword-index", daemon=True).start()
+        threading.Thread(target=work, name=name, daemon=True).start()
 
     def _finish_index(self, result) -> None:
         self.index_status.setText(result.message)
@@ -951,7 +978,7 @@ class VaultTab(ViewHelpers, QWidget):
     def on_descriptions(self) -> None:
         from council_core import vault_ops
         self._index_run(
-            self.actions.starting_descriptions(),
+            "Descriptions", self.actions.starting_descriptions,
             lambda p: self.actions.build_descriptions(on_progress=p),
             lambda i, total: vault_ops.describing_line(i, total),
             every=3)
@@ -959,34 +986,40 @@ class VaultTab(ViewHelpers, QWidget):
     def on_embeddings(self) -> None:
         from council_core import vault_ops
         self._index_run(
-            self.actions.starting_embeddings(),
+            "Embeddings", self.actions.starting_embeddings,
             lambda p: self.actions.build_embeddings(on_progress=p),
             lambda i, total: vault_ops.embedding_line(i, total),
             every=10)
 
-    def _index_run(self, start, run, line_for, every: int) -> None:
+    def _index_run(self, what: str, start, run, line_for, every: int) -> None:
         """The shape all three index layers share: say what is about to happen,
         stop if there is nothing to do, then run on a worker and report.
 
         The throttle (`every`) is the one thing that differs between them —
         descriptions tick every 3 files, embeddings every 10 — because each
-        file costs seconds rather than milliseconds."""
-        self.index_status.setText(start.message)
-        self.append(start.message, "ok" if start.ok else "err")
-        if not start.ok or start.total == 0:
+        file costs seconds rather than milliseconds.
+
+        ``start`` is called here rather than by the caller so that a failure
+        reading the pending count is a line in the log, not a traceback out of
+        a click handler."""
+        from council_core import vault_ops
+        try:
+            begun = start()
+        except Exception as exc:                          # noqa: BLE001
+            begun = vault_ops.IndexResult(False, f"{what} failed: {exc!r}")
+        self.index_status.setText(begun.message)
+        self.append(begun.message, "ok" if begun.ok else "err")
+        if not begun.ok or begun.total == 0:
             return
         self._set_index_buttons(False)
 
-        def work() -> None:
-            def on_progress(i, total, name) -> None:
-                if i % every == 0 or i == total:
-                    line = line_for(i, total)
-                    self._to_ui(lambda: self.index_status.setText(line))
+        def on_progress(i, total, name) -> None:
+            if i % every == 0 or i == total:
+                line = line_for(i, total)
+                self._to_ui(lambda: self.index_status.setText(line))
 
-            result = run(on_progress)
-            self._to_ui(lambda: self._finish_index(result))
-
-        threading.Thread(target=work, name="vault-index", daemon=True).start()
+        self._start_index_worker(lambda: run(on_progress), what=what,
+                                 name="vault-index")
 
     def on_open_converted(self) -> None:
         self._run("Open output", lambda: self.actions.open_folder(
