@@ -442,6 +442,68 @@ def test_a_json_value_is_cited_on_its_own_line(tmp_path):
         assert [e["locator"].get("line") for e in ev] == [want]
 
 
+def _snapshot(kg):
+    return (sorted((r[0], r[1]) for r in kg.db.execute(
+                "SELECT type, name FROM entities WHERE type != 'DOCUMENT'")),
+            _links(kg))
+
+
+def _fresh(tmp_path, v, name):
+    """A store built from scratch over the same documents as ``v``."""
+    import shutil
+    w = tmp_path / name
+    shutil.copytree(v / "data_in", w / "data_in")
+    kg = _graph(w)
+    kg.seed()
+    return kg
+
+
+def test_a_person_no_document_names_any_more_goes_away(tmp_path):
+    # Old entities were deleted only at the END of seed, so during the run a
+    # stale 'Dana Whitfield' still made the initials table and gave herself
+    # a gazetteer mention ('D. Whitfield') - and so survived every rebuild.
+    v = _tiny(tmp_path, {"a.md": "Project: PRJ-1\nProgram Lead: Dana Whitfield\n",
+                         "memo.txt": "Notes\nSpoke with D. Whitfield about it.\n"})
+    with _graph(v) as kg:
+        kg.seed()
+        assert _people(kg) == ["Dana Whitfield"]
+        (v / "data_in" / "a.md").write_text("Project: PRJ-1\nProgram Lead: Carol Lee\n",
+                                            encoding="utf-8")
+        for _ in range(3):
+            kg.seed()
+            assert _people(kg) == ["Carol Lee"]
+        with _fresh(tmp_path, v, "fresh") as fresh:
+            assert _snapshot(kg) == _snapshot(fresh)
+
+
+def test_a_link_goes_back_to_suggested_when_its_evidence_weakens(tmp_path):
+    v = _tiny(tmp_path, {"memo.md": "Project: PRJ-1\nProgram Lead: Carol Lee\n"})
+    with _graph(v) as kg:
+        kg.seed()
+        assert _links(kg) == [("Carol Lee", "LEADS", "PRJ-1", "seeded")]
+        (v / "data_in" / "memo.md").write_text(
+            "Project: PRJ-1\nProject: PRJ-2\nProgram Lead: Carol Lee\n", encoding="utf-8")
+        kg.seed()
+        assert _links(kg) == [("Carol Lee", "LEADS", "PRJ-1", "suggested"),
+                              ("Carol Lee", "LEADS", "PRJ-2", "suggested")]
+        with _fresh(tmp_path, v, "fresh") as fresh:
+            assert _snapshot(kg) == _snapshot(fresh)
+        # ...and firms up again when the document is about one project.
+        (v / "data_in" / "memo.md").write_text(
+            "Project: PRJ-2\nProgram Lead: Carol Lee\n", encoding="utf-8")
+        kg.seed()
+        assert _links(kg) == [("Carol Lee", "LEADS", "PRJ-2", "seeded")]
+
+
+def test_a_rebuild_over_the_corpus_equals_a_fresh_build(tmp_path):
+    v, _key = _vault(tmp_path)
+    with _graph(v) as kg:
+        kg.seed()
+        kg.seed()
+        with _fresh(tmp_path, v, "fresh") as fresh:
+            assert _snapshot(kg) == _snapshot(fresh)
+
+
 def test_a_windows_1252_csv_is_read(tmp_path):
     # Excel's plain "CSV" save on Windows writes cp1252; field search read it,
     # the graph's reader returned nothing and did not list it as unreadable.

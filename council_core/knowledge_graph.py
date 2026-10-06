@@ -67,6 +67,9 @@ ENTITY_TYPES = ("PERSON", "PART", "PROJECT", "DOCUMENT")
 PREDICATES = ("LEADS", "CONTACT_FOR", "WORKS_ON", "OWNS", "USES_PART",
               "SUPERSEDES", "DOCUMENTED_IN")
 STATUSES = ("seeded", "suggested", "accepted", "rejected")
+#: Inside one seed() transaction only: a derived link not yet re-supported by
+#: this run's evidence. Never committed (seed resolves or deletes every one).
+_PENDING = "pending"
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -494,6 +497,8 @@ class KnowledgeGraph:
         self.vault = Path(vault)
         self.root = Path(root) if root is not None else self.vault / "data_in"
         self.path = store_path(self.vault)
+        #: During seed(): the entities this run supports (see seed).
+        self._live: Optional[set] = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         existed = self.path.exists()
         try:
@@ -686,6 +691,8 @@ class KnowledgeGraph:
                 *, key: Optional[str] = None, alias_source: str = "field") -> str:
         key = key if key is not None else entity_key(etype, raw)
         eid = entity_id(etype, key)
+        if self._live is not None:
+            self._live.add(eid)
         name = display or (person_display(raw) if etype == "PERSON" else str(raw).strip())
         row = self.db.execute("SELECT name FROM entities WHERE id=?", (eid,)).fetchone()
         if row is None:
@@ -727,10 +734,13 @@ class KnowledgeGraph:
         if row is None:
             self.db.execute("INSERT INTO relations VALUES (?,?,?,?,?,?,?)",
                             (rid, s, pred, o, status, now, now))
-        elif row["status"] == "suggested" and status == "seeded":
-            # Firmer evidence arrived; the user's accept/reject is never touched.
-            self.db.execute("UPDATE relations SET status='seeded', updated_ts=? "
-                            "WHERE id=?", (now, rid))
+        elif row["status"] == _PENDING or (row["status"] == "suggested"
+                                           and status == "seeded"):
+            # First evidence this run (seed() marked every derived status
+            # pending), or firmer evidence; the user's accept/reject is never
+            # touched.
+            self.db.execute("UPDATE relations SET status=?, updated_ts=? "
+                            "WHERE id=?", (status, now, rid))
         self.db.execute(
             "INSERT OR IGNORE INTO evidence (relation_id, document_id, content_hash,"
             " locator, quote, method, model, run_id) VALUES (?,?,?,?,?,?,?,?)",
@@ -761,70 +771,91 @@ class KnowledgeGraph:
         stats: Dict[str, Any] = {"documents": len(files), "records": 0,
                                  "unreadable": [], "skipped_rows": [],
                                  "rules": len(rules)}
-        with self.db:
-            self.db.execute("INSERT INTO runs (id, kind, started_ts) VALUES (?,?,?)",
-                            (run_id, "seed", t0))
-            # Derived rows are rebuilt; decisions and user statuses are kept.
-            self.db.execute("DELETE FROM evidence WHERE method != 'model'")
-            self.db.execute("DELETE FROM mentions")
-            self.db.execute("DELETE FROM review WHERE status='open'")
-            self.db.execute("DELETE FROM aliases WHERE source != 'user'")
-            seen_paths = set()
-            records: List[Tuple[Record, str, str]] = []
-            for n, p in enumerate(files):
-                if on_progress:
-                    on_progress(n, len(files))
-                try:
-                    did, h = self._document(p, run_id)
-                    seen_paths.add(self._rel(p))
-                    why = missing_reader(p)
-                    if why:
-                        stats["unreadable"].append(f"{self._rel(p)}: {why}")
-                        self.db.execute("UPDATE documents SET status='unreadable'"
-                                        " WHERE id=?", (did,))
-                        continue
-                    for rec in read_records(p, self._rel(p), rules):
-                        if rec.kind == "skipped":
-                            stats["skipped_rows"].append(
-                                f"{rec.path}: row {rec.skipped_row} has more cells "
-                                "than the header")
+        try:
+            with self.db:
+                self.db.execute("INSERT INTO runs (id, kind, started_ts) VALUES (?,?,?)",
+                                (run_id, "seed", t0))
+                # Derived rows are rebuilt; decisions and user statuses are kept.
+                self.db.execute("DELETE FROM evidence WHERE method != 'model'")
+                self.db.execute("DELETE FROM mentions")
+                self.db.execute("DELETE FROM review WHERE status='open'")
+                self.db.execute("DELETE FROM aliases WHERE source != 'user'")
+                # Every derived status is worked out again from THIS run's
+                # evidence: a link once 'seeded' stayed seeded after its document
+                # came to name several projects, so the user was never asked.
+                self.db.execute(f"UPDATE relations SET status='{_PENDING}'"
+                                " WHERE status IN ('seeded','suggested')")
+                # Only entities this run supports (plus the user's: merged,
+                # aliased by hand, in an accepted link) may explain an initial or
+                # give the gazetteer a name. A stale 'Dana Whitfield' otherwise
+                # gave herself a mention for 'D. Whitfield' and never went away.
+                self._live = {r[0] for r in self.db.execute(
+                    "SELECT entity_id FROM aliases WHERE source='user'"
+                    " UNION SELECT merged_into FROM entities WHERE merged_into IS NOT NULL"
+                    " UNION SELECT subject_id FROM relations WHERE status='accepted'"
+                    " UNION SELECT object_id FROM relations WHERE status='accepted'")}
+                seen_paths = set()
+                records: List[Tuple[Record, str, str]] = []
+                for n, p in enumerate(files):
+                    if on_progress:
+                        on_progress(n, len(files))
+                    try:
+                        did, h = self._document(p, run_id)
+                        seen_paths.add(self._rel(p))
+                        why = missing_reader(p)
+                        if why:
+                            stats["unreadable"].append(f"{self._rel(p)}: {why}")
+                            self.db.execute("UPDATE documents SET status='unreadable'"
+                                            " WHERE id=?", (did,))
                             continue
-                        records.append((rec, did, h))
-                except Exception as exc:
-                    stats["unreadable"].append(f"{self._rel(p)}: {exc.__class__.__name__}")
-            # Gone since the last run: kept (decisions may cite them), marked.
-            for r in self.db.execute("SELECT id, path FROM documents").fetchall():
-                if r["path"] not in seen_paths:
-                    self.db.execute("UPDATE documents SET status='missing' WHERE id=?",
-                                    (r["id"],))
-            stats["records"] = len(records)
-            self._seed_records(records, run_id)
-            if use_collections:
-                stats["collections"] = self._seed_collections(run_id)
-            if gazetteer:
-                stats["gazetteer_mentions"] = self._gazetteer(files, run_id)
-            # A seeded/suggested relation whose evidence is all gone (the
-            # document changed or the rule was withdrawn) goes too; the user's
-            # accepted/rejected ones stay.
-            self.db.execute(
-                "DELETE FROM relations WHERE status IN ('seeded','suggested') AND id"
-                " NOT IN (SELECT relation_id FROM evidence)")
-            # An entity nothing supports any more (its only document changed)
-            # goes too, unless the user touched it: merged, merged into, or
-            # given an alias by hand.
-            self.db.execute(
-                "DELETE FROM entities WHERE type != 'DOCUMENT' AND merged_into IS NULL"
-                " AND id NOT IN (SELECT entity_id FROM mentions)"
-                " AND id NOT IN (SELECT subject_id FROM relations)"
-                " AND id NOT IN (SELECT object_id FROM relations)"
-                " AND id NOT IN (SELECT merged_into FROM entities"
-                "                WHERE merged_into IS NOT NULL)"
-                " AND id NOT IN (SELECT entity_id FROM aliases WHERE source='user')")
-            self.db.execute("DELETE FROM aliases WHERE entity_id NOT IN"
-                            " (SELECT id FROM entities)")
-            stats.update(self.counts())
-            self.db.execute("UPDATE runs SET finished_ts=?, stats=? WHERE id=?",
-                            (time.time(), json.dumps(stats), run_id))
+                        for rec in read_records(p, self._rel(p), rules):
+                            if rec.kind == "skipped":
+                                stats["skipped_rows"].append(
+                                    f"{rec.path}: row {rec.skipped_row} has more cells "
+                                    "than the header")
+                                continue
+                            records.append((rec, did, h))
+                    except Exception as exc:
+                        stats["unreadable"].append(f"{self._rel(p)}: {exc.__class__.__name__}")
+                # Gone since the last run: kept (decisions may cite them), marked.
+                for r in self.db.execute("SELECT id, path FROM documents").fetchall():
+                    if r["path"] not in seen_paths:
+                        self.db.execute("UPDATE documents SET status='missing' WHERE id=?",
+                                        (r["id"],))
+                stats["records"] = len(records)
+                self._seed_records(records, run_id)
+                if use_collections:
+                    stats["collections"] = self._seed_collections(run_id)
+                if gazetteer:
+                    stats["gazetteer_mentions"] = self._gazetteer(files, run_id)
+                # Still pending: no document gave evidence this run. One a model
+                # proposed (KG2 evidence is kept across runs) is a suggestion; the
+                # rest - the document changed or the rule was withdrawn - go. The
+                # user's accepted/rejected ones stay.
+                self.db.execute(
+                    f"UPDATE relations SET status='suggested' WHERE status='{_PENDING}'"
+                    " AND id IN (SELECT relation_id FROM evidence)")
+                self.db.execute(
+                    "DELETE FROM relations WHERE status IN ('seeded','suggested',"
+                    f" '{_PENDING}') AND id NOT IN (SELECT relation_id FROM evidence)")
+                # An entity nothing supports any more (its only document changed)
+                # goes too, unless the user touched it: merged, merged into, or
+                # given an alias by hand.
+                self.db.execute(
+                    "DELETE FROM entities WHERE type != 'DOCUMENT' AND merged_into IS NULL"
+                    " AND id NOT IN (SELECT entity_id FROM mentions)"
+                    " AND id NOT IN (SELECT subject_id FROM relations)"
+                    " AND id NOT IN (SELECT object_id FROM relations)"
+                    " AND id NOT IN (SELECT merged_into FROM entities"
+                    "                WHERE merged_into IS NOT NULL)"
+                    " AND id NOT IN (SELECT entity_id FROM aliases WHERE source='user')")
+                self.db.execute("DELETE FROM aliases WHERE entity_id NOT IN"
+                                " (SELECT id FROM entities)")
+                stats.update(self.counts())
+                self.db.execute("UPDATE runs SET finished_ts=?, stats=? WHERE id=?",
+                                (time.time(), json.dumps(stats), run_id))
+        finally:
+            self._live = None
         stats["seconds"] = round(time.time() - t0, 3)
         return stats
 
@@ -904,6 +935,8 @@ class KnowledgeGraph:
         out = []
         for r in self.db.execute("SELECT id, key FROM entities WHERE type='PERSON'"
                                  " AND merged_into IS NULL"):
+            if self._live is not None and r["id"] not in self._live:
+                continue        # left over from an earlier run (see seed)
             toks = r["key"].split()
             if (len(toks) >= 2 and toks[-1] == surname and toks[0].startswith(ini)
                     and len(toks[0]) > 1):
@@ -1039,6 +1072,8 @@ class KnowledgeGraph:
         # Initial forms of every full-named person: 'D. Whitfield'.
         initials: Dict[str, List[str]] = {}
         for r in self.db.execute("SELECT id, key FROM entities WHERE type='PERSON'"):
+            if self._live is not None and r["id"] not in self._live:
+                continue        # left over from an earlier run (see seed)
             toks = r["key"].split()
             if len(toks) >= 2 and len(toks[0]) > 1:
                 initials.setdefault(f"{toks[0][0]} {toks[-1]}", []).append(r["id"])
