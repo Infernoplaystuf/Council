@@ -42,6 +42,25 @@ CANDIDATE_MODULES = [
     ("simplnxreview", "nxrev"),
 ]
 
+# Bumped whenever the catalog gains a field something downstream relies on.
+# The app refuses a cached catalog with a lower number and builds a fresh one
+# (council_core.nx_ops.catalog via nx_bridge.catalog_stale_reason).
+#   1  filters, enums, pipeline_api
+#   2  + module_names, filter_attrs, classes, dataobject_attrs: what a
+#      model-written script is checked against (nx_ground) and what the
+#      transpiler builds compound parameter values from (nx_transpile)
+CATALOG_SCHEMA = 2
+
+# Classes a script or a compound value touches that no filter signature names
+# directly: thresholds sit in an ArrayThresholdSet typed as IArrayThreshold,
+# and ds / an execute() result / a DataPath are what every script handles.
+EXTRA_CLASSES = (
+    "simplnx.DataStructure",
+    "simplnx.DataPath",
+    "simplnx.ArrayThreshold",
+    "simplnx.IFilter.ExecuteResult",
+)
+
 
 def looks_like_filter(obj) -> bool:
     """A filter duck-types as uuid + human_name + execute."""
@@ -130,7 +149,12 @@ def parse_execute_signature(doc: str) -> dict:
             "name": name,
             "type": typ,
             "default": default,
-            "required": default is None and name != "data_structure",
+            # No default = the call fails without it. On the installed build
+            # that is data_structure and nothing else (the other 1972
+            # parameters all have one). It used to exclude data_structure as
+            # well, which made the flag False on every parameter of every
+            # filter, so every check built on it was dead.
+            "required": default is None,
         })
     return out
 
@@ -204,17 +228,179 @@ def collect_enums(mod, mod_name: str, out: dict) -> None:
                 out[f"{mod_name}.{attr}.{sub}"] = sm
 
 
+def _return_type(doc) -> str:
+    """'(self: X) -> list[str]' -> 'list[str]'."""
+    line = (doc or "").strip().splitlines()[0] if (doc or "").strip() else ""
+    return line.split("->", 1)[1].strip() if "->" in line else ""
+
+
+def _init_signatures(cls) -> list:
+    """Every __init__ overload's parameters (self dropped), from pybind11's
+    docstring. [] when the docstring carries no signature."""
+    try:
+        doc = cls.__init__.__doc__ or ""
+    except Exception:
+        return []
+    plain, numbered = [], []
+    for line in doc.splitlines():
+        s = line.strip()
+        bucket = plain
+        if s[:1].isdigit() and ". " in s:
+            s = s.split(". ", 1)[1]          # '2. __init__(...)' overloads
+            bucket = numbered
+        if not s.startswith("__init__("):
+            continue
+        params = parse_execute_signature(s).get("params", [])
+        bucket.append([p for p in params if p["name"] != "self"])
+    # An overloaded constructor's docstring opens with a generic
+    # '__init__(*args, **kwargs)' line; the numbered ones are the real ones.
+    return numbered or plain
+
+
+def describe_class(cls) -> dict:
+    """A parameter class as a script has to use it: its constructor
+    overloads, its properties (with type and whether they can be set) and its
+    methods. Walks the MRO, so ArrayThresholdSet shows the inverted / union_op
+    it inherits from IArrayThreshold.
+
+    vars(), never getattr: see collect_enums for the pybind11 class attribute
+    that kills this interpreter when read with getattr."""
+    props, readonly, methods, dunders = {}, [], [], set()
+    try:
+        mro = [k for k in cls.__mro__
+               if k.__name__ not in ("object", "pybind11_object")]
+    except Exception:
+        mro = [cls]
+    for k in mro:
+        try:
+            items = dict(vars(k))
+        except Exception:
+            continue
+        # Which protocols it supports: ds[path] reads (getitem) but
+        # ds[path] = ... does not exist (no setitem) — a model wrote that.
+        dunders |= {n for n in items
+                    if n in ("__getitem__", "__setitem__", "__delitem__",
+                             "__iter__", "__len__", "__contains__")}
+        for name, v in items.items():
+            if name.startswith("_") or name in props or name in methods:
+                continue
+            if isinstance(v, property):
+                props[name] = _return_type(getattr(v.fget, "__doc__", ""))
+                if v.fset is None:
+                    readonly.append(name)
+            elif isinstance(v, type):
+                continue                     # a nested enum or class
+            elif callable(v) or isinstance(v, (staticmethod, classmethod)):
+                methods.append(name)
+    bases = []
+    for k in mro[1:]:
+        try:
+            bases.append(f"{k.__module__}.{k.__qualname__}")
+        except Exception:
+            continue
+    return {"init": _init_signatures(cls), "props": props,
+            "readonly": sorted(readonly), "methods": sorted(methods),
+            # An ArrayThreshold goes where an IArrayThreshold is asked for.
+            "bases": bases, "dunders": sorted(dunders)}
+
+
+def _resolve(modules: dict, path: str):
+    """'simplnx.CalculatorParameter.ValueType' -> the class, or None."""
+    parts = path.split(".")
+    obj = modules.get(parts[0])
+    for i, part in enumerate(parts[1:]):
+        if obj is None:
+            return None
+        try:
+            obj = (getattr(obj, part, None) if i == 0
+                   else dict(vars(obj)).get(part))
+        except Exception:
+            return None
+    return obj if isinstance(obj, type) else None
+
+
+def _class_refs(type_str: str) -> list:
+    """Dotted class names inside a type string: 'list[simplnx.X.ValueType]'
+    -> ['simplnx.X.ValueType']."""
+    import re
+    return re.findall(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+", type_str or "")
+
+
+def collect_classes(modules: dict, result: dict) -> dict:
+    """Every non-enum class a filter parameter is typed as, plus EXTRA_CLASSES,
+    plus whatever their properties are typed as, described by describe_class.
+
+    The transpiler builds compound values (ReadCSVDataParameter,
+    ArrayThresholdSet, CalculatorParameter.ValueType...) from this, and the
+    script checker checks a model's attribute assignments against it. Without
+    it both used to emit a dict, which simplnx refuses at run time."""
+    enums = result.get("enums", {})
+    todo = list(EXTRA_CLASSES)
+    for f in result.get("filters", []):
+        for p in (f.get("execute") or {}).get("params", []):
+            todo.extend(_class_refs(p.get("type")))
+    out = {}
+    while todo:
+        path = todo.pop(0)
+        if path in out or path in enums \
+                or path.split(".")[0] not in modules:
+            continue
+        cls = _resolve(modules, path)
+        if cls is None:
+            continue
+        out[path] = describe_class(cls)
+        for t in out[path]["props"].values():
+            todo.extend(_class_refs(t))
+    return out
+
+
+def dataobject_attrs(nx) -> list:
+    """Every public attribute of every simplnx DataObject class (ImageGeom,
+    AttributeMatrix, the DataArray types, ...): what `ds[path].<attr>` can
+    possibly be, whatever is stored at the path. vars() over the MRO, never
+    getattr (see collect_enums)."""
+    if nx is None:
+        return []
+    base = dict(vars(nx)).get("DataObject")
+    names = set()
+    for obj in dict(vars(nx)).values():
+        if not isinstance(obj, type):
+            continue
+        try:
+            mro = obj.__mro__
+        except Exception:
+            continue
+        if base is None or base not in mro:
+            continue
+        for k in mro:
+            try:
+                names |= {n for n in dict(vars(k)) if not n.startswith("_")}
+            except Exception:
+                continue
+    return sorted(names)
+
+
 def catalog() -> dict:
     result = {
+        "catalog_schema": CATALOG_SCHEMA,
         "python": sys.version,
         "modules_loaded": [],
         "modules_missing": [],
         "enums": {},
         "filters": [],
+        # Every public name each module exports: a script that writes
+        # nx.ImageGeometry (the real one is ImageGeom) is told so before it
+        # runs, instead of dying with AttributeError after it was "accepted".
+        "module_names": {},
+        # What a filter CLASS exposes (execute, uuid, ...). The same binding
+        # backs every filter.
+        "filter_attrs": [],
+        "classes": {},
         # The two things the spec says to confirm from real data rather than
         # memory: how a pipeline is executed, and what it returns.
         "pipeline_api": {},
     }
+    modules = {}
     for mod_name, alias in CANDIDATE_MODULES:
         try:
             mod = importlib.import_module(mod_name)
@@ -222,7 +408,10 @@ def catalog() -> dict:
             result["modules_missing"].append(
                 {"module": mod_name, "error": f"{type(e).__name__}: {e}"})
             continue
+        modules[mod_name] = mod
         result["modules_loaded"].append(mod_name)
+        result["module_names"][mod_name] = sorted(
+            d for d in dir(mod) if not d.startswith("_"))
         collect_enums(mod, mod_name, result["enums"])
         for attr in dir(mod):
             try:
@@ -256,6 +445,18 @@ def catalog() -> dict:
             entry["execute_doc"] = doc
             entry["execute"] = parse_execute_signature(doc)
             result["filters"].append(entry)
+            if not result["filter_attrs"]:
+                result["filter_attrs"] = sorted(
+                    d for d in dir(obj) if not d.startswith("_"))
+
+    try:
+        result["classes"] = collect_classes(modules, result)
+    except Exception as e:
+        result["classes_error"] = f"{type(e).__name__}: {e}"
+    try:
+        result["dataobject_attrs"] = dataobject_attrs(modules.get("simplnx"))
+    except Exception as e:
+        result["dataobject_attrs_error"] = f"{type(e).__name__}: {e}"
 
     # Probe the pipeline surface itself.
     try:

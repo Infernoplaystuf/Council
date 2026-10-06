@@ -15,7 +15,10 @@ Moved from the Tk engine's `_nx_check_env` / `_nx_catalog` /
     data_out/dream3d/nx_catalog.json with no way to clear either, so after an
     nx reinstall every generated script was grounded on filters that might no
     longer exist. `invalidate_catalog()` clears both, and `check_env()` — the
-    button a user presses after reinstalling — calls it.
+    button a user presses after reinstalling — calls it. That still relied on
+    the user pressing it: `catalog()` now also refuses a cached copy whose
+    schema, python or dream3dnx version no longer matches the env
+    (nx_bridge.catalog_stale_reason), with no subprocess.
   * A REFUSED SCRIPT WAS "SAVED". write_script returns code=None when no filter
     matches; nothing was written, yet the report said "It is saved for you to
     read at <path>". The report now names a path only when a file exists there.
@@ -87,25 +90,71 @@ def _catalog_path(vault_dir: Path) -> Optional[Path]:
         return None
 
 
+def _stale(cat: dict, bridge: Any) -> Optional[str]:
+    """Why ``cat`` no longer matches the installed env (None = still good).
+
+    Asks the bridge, because only it knows where the env is; a bridge without
+    the check (a test double) keeps the old behaviour."""
+    check = getattr(bridge, "catalog_stale_reason", None)
+    if check is None:
+        return None
+    try:
+        return check(cat)
+    except Exception:                                     # noqa: BLE001
+        return None
+
+
+# Why the last catalog() call rebuilt instead of using its cache, per vault.
+last_rebuild_reason: Dict[Path, str] = {}
+
+
 def catalog(vault_dir: Path, *, force: bool = False,
             bridge: Any = None) -> dict:
-    """The INSTALLED package's filter catalog: memory, then disk, then nx."""
+    """The INSTALLED package's filter catalog: memory, then disk, then nx.
+
+    A cached copy is used only while it still describes the installed env
+    (nx_bridge.catalog_stale_reason: schema, python and dream3dnx version,
+    and every installed plugin imported when it was built). It used to be
+    used for good, so after an nx reinstall every script was checked against
+    filters that might no longer exist.
+
+    A rebuild whose simplnx did not import (or that lists no filters) raises
+    NxError and leaves the saved catalog as it was."""
+    if bridge is None:
+        import nx_bridge as bridge
     key = Path(vault_dir).resolve()
+    reason = "forced" if force else "nothing cached"
     with _catalog_lock:
-        if not force and _catalog_mem.get(key):
-            return _catalog_mem[key]
+        mem = None if force else _catalog_mem.get(key)
+        if mem:
+            why = _stale(mem, bridge)
+            if why is None:
+                return mem
+            reason = f"the cached catalog is stale: {why}"
+            _catalog_mem.pop(key, None)
         path = _catalog_path(vault_dir)
         if not force and path is not None and path.exists():
             try:
                 cached = json.loads(path.read_text(encoding="utf-8"))
-                if cached.get("filters"):
+                why = _stale(cached, bridge) if cached.get("filters") \
+                    else "it is empty"
+                if why is None:
                     _catalog_mem[key] = cached
                     return cached
+                reason = f"the saved catalog is stale: {why}"
             except Exception:                             # noqa: BLE001
-                pass
-    if bridge is None:
-        import nx_bridge as bridge
+                reason = "the saved catalog is unreadable"
+    last_rebuild_reason[key] = reason
     fresh = bridge.catalog()
+    # Built by an interpreter without simplnx, or empty: never saved over
+    # the previous catalog, never served. It was: 0 filters, transpile
+    # "succeeded" with every step commented out. (nx_bridge.catalog raises
+    # on this itself; a bridge that does not is checked here.)
+    import nx_bridge as _nb
+    why = _nb.catalog_unusable_reason(fresh)
+    if why:
+        raise _nb.NxError(f"The DREAM3D-NX filter catalog could not be "
+                          f"built: {why}. The saved catalog was kept.")
     with _catalog_lock:
         _catalog_mem[key] = fresh
         if path is not None:
@@ -251,11 +300,36 @@ def script_stem(task: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", task.lower())[:40] or "pipeline"
 
 
+# Windows without LongPathsEnabled refuses a path of 260+ characters; keep
+# the saved script's full path under this.
+_MAX_PATH = 250
+
+
+def _script_name(task: str, vault_dir: Path) -> str:
+    """task_<stem>.py, the stem cut so the whole path stays under _MAX_PATH.
+
+    The 40-character stem under a deep vault made the path 260+ characters
+    on a PC with LongPathsEnabled=0: the write raised, and a script that had
+    passed every check was reported "nx: failed" and lost."""
+    stem = script_stem(task)
+    try:
+        folder = len(str(out_dir(vault_dir) / SUBFOLDER)) + 1
+    except Exception:                                     # noqa: BLE001
+        folder = 0
+    room = _MAX_PATH - folder - len("task_.py")
+    if len(stem) > room:
+        import hashlib
+        tag = hashlib.sha1(task.encode("utf-8")).hexdigest()[:6]
+        stem = (stem[:max(0, room - 7)].rstrip("_") + "_" + tag)[-max(6, room):]
+    return f"task_{stem}.py"
+
+
 def write_script(task: str, vault_dir: Path, *,
                  model_call: Callable[[str], str] = default_model_call,
                  generator: Any = None, bridge: Any = None) -> NxResult:
     """Plain English -> a simplnx script, grounded on the installed catalog
-    and gated by nx_policy. Saved and shown whenever there is code."""
+    (nx_ground) and gated by nx_policy. Saved and shown whenever there is
+    code — and shown even when saving fails, rather than lost."""
     task = (task or "").strip()
     if not task:
         return NxResult("nx: waiting",
@@ -266,22 +340,33 @@ def write_script(task: str, vault_dir: Path, *,
             import nx_generate as generator
         res = generator.write_script(task, catalog(vault_dir, bridge=bridge),
                                      model_call, n_ctx=_n_ctx())
-        code = res.get("code") or ""
-        out = None
-        if code:
-            out = safe_out_path(vault_dir, f"task_{script_stem(task)}.py")
-            out.write_text(code, encoding="utf-8")
-        if res.get("ok"):
-            return NxResult(f"nx: written ({res.get('attempts')} attempt(s))",
-                            f"# saved to: {out}\n\n{code}", path=out)
-        body = ("The generated script was NOT accepted, so the app will not "
-                "run it:\n\n"
-                + "\n".join(f"  - {e}" for e in res.get("errors", [])))
-        if out is not None:
-            body += f"\n\nIt is saved for you to read at:\n  {out}\n\n{code}"
-        else:
-            body += "\n\nNo script was produced, so nothing was saved."
-        return NxResult("nx: refused", body, ok=False, path=out)
     except Exception as exc:                              # noqa: BLE001
         return NxResult("nx: failed", f"Could not write a pipeline.\n\n{exc}",
                         ok=False)
+    code = res.get("code") or ""
+    out = None
+    save_error = ""
+    if code:
+        try:
+            out = safe_out_path(vault_dir, _script_name(task, vault_dir))
+            out.write_text(code, encoding="utf-8")
+        except Exception as exc:                          # noqa: BLE001
+            out = None
+            save_error = (f"\n\n(It could not be saved: {exc}. The script is "
+                          f"below — copy it from here.)")
+    if res.get("ok"):
+        head = f"# saved to: {out}" if out is not None else \
+            "# NOT saved" + save_error.replace("\n\n", " ")
+        return NxResult(f"nx: written ({res.get('attempts')} attempt(s))"
+                        + ("" if out is not None else ", not saved"),
+                        f"{head}\n\n{code}", path=out)
+    body = ("The generated script was NOT accepted, so the app will not "
+            "run it:\n\n"
+            + "\n".join(f"  - {e}" for e in res.get("errors", [])))
+    if out is not None:
+        body += f"\n\nIt is saved for you to read at:\n  {out}\n\n{code}"
+    elif code:
+        body += f"{save_error}\n\n{code}"
+    else:
+        body += "\n\nNo script was produced, so nothing was saved."
+    return NxResult("nx: refused", body, ok=False, path=out)

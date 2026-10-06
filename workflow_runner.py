@@ -15,8 +15,34 @@ Stop-on-first-failure semantics throughout. The runner returns a
 WorkflowResult with per-step logs so the GUI can show exactly which step
 broke and why.
 
-Pipelines execute as subprocesses using sys.executable so they pick up
-the same conda env the council was launched from (simplnx, h5py, etc.).
+Pipelines execute as subprocesses. A script that imports simplnx (or its
+plugins) runs with the DREAM3D-NX env's interpreter (nx_bridge.find_python):
+simplnx lives in that separate env by design, and running every pipeline
+with sys.executable — the app's own env — made every simplnx workflow die
+with "No module named 'simplnx'". Anything else still runs with
+sys.executable.
+
+Before anything runs, every script passes nx_policy.capability_reasons: no
+workflow runs Execute Process or the Python-codegen filter, by name or
+through a route that hides which filter runs.
+
+In the directory modes each run's outputs land in ``output_dir`` (one file
+per input, never the path baked into the script), so N inputs make N
+outputs instead of overwriting one, and nothing lands wherever the app
+happened to be started. That holds for EVERY writer a script has, not just
+the first: a second WriteDREAM3D (a checkpoint) or a feature CSV is written
+to <output_dir>/<input stem>_<its file name>, and each run works in its own
+folder, <output_dir>/<input stem>/, so a relative path the runner does not
+recognise lands there instead of on top of another input's file.
+result.outputs lists every file a writer was pointed at and every file a run
+left in its working folder (not a writer's companion, such as the .xdmf
+WriteDREAM3D puts next to its .dream3d).
+
+Paths are found in the script's SYNTAX TREE — keyword arguments
+(f(file_path=...)), attribute and plain assignments (v.input_file_path = ...)
+— never by a text search: a comment or a string that mentions
+`file_path = ...` used to be what got rewritten, and every input then read
+the same baked file.
 """
 
 from __future__ import annotations
@@ -28,7 +54,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 # ============================================================
@@ -57,6 +83,13 @@ class WorkflowResult:
     duration_s: float
     step_results: List[StepResult] = field(default_factory=list)
     error: Optional[str] = None    # high-level reason if the run aborted
+    # Every file the runs wrote (directory modes): each input's final
+    # result, every other writer's file, anything written in a run's own
+    # working folder.
+    outputs: List[Path] = field(default_factory=list)
+    # What the runner decided that the user should know (e.g. which of two
+    # writers it handed on).
+    notes: List[str] = field(default_factory=list)
 
     def summary(self) -> str:
         lines = [
@@ -66,6 +99,22 @@ class WorkflowResult:
         ]
         if self.error:
             lines.append(f"  error: {self.error}")
+        for n in self.notes:
+            lines.append(f"  note: {n}")
+        if self.outputs:
+            try:
+                root = Path(os.path.commonpath(
+                    [str(o.parent) for o in self.outputs]))
+            except ValueError:                  # different drives
+                root = self.outputs[0].parent
+            lines.append(f"  outputs ({len(self.outputs)}) in {root}:")
+            for o in self.outputs[:20]:
+                try:
+                    lines.append(f"    {o.relative_to(root).as_posix()}")
+                except ValueError:
+                    lines.append(f"    {o}")
+            if len(self.outputs) > 20:
+                lines.append(f"    ... and {len(self.outputs) - 20} more")
         for s in self.step_results:
             status = "ok " if s.success else "FAIL"
             lines.append(
@@ -86,6 +135,58 @@ class WorkflowResult:
 # Subprocess execution
 # ============================================================
 
+_NX_MODULES = frozenset({"simplnx", "orientationanalysis",
+                         "itkimageprocessing"})
+
+
+def _read_source(path: Path) -> str:
+    """A script's text, without the byte-order mark an editor may save at
+    its start: Python runs such a file, but ast.parse refuses a BOM ("invalid
+    non-printable character U+FEFF"), and every path below is found with
+    ast — so the script would be refused as not valid Python."""
+    return path.read_text(encoding="utf-8-sig", errors="replace")
+
+
+def _imports_simplnx(source: str) -> bool:
+    import ast
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            if any(a.name.split(".")[0] in _NX_MODULES for a in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] in _NX_MODULES:
+                return True
+    return False
+
+
+def interpreter_for(source: str) -> Tuple[Optional[str], Optional[str]]:
+    """(python executable, None) to run ``source`` with, or (None, why).
+
+    A simplnx script needs an interpreter that has simplnx: this one if it
+    does (the app was started inside the nx env), else the nx env's
+    (nx_bridge.find_python, which honours COUNCIL_NX_PYTHON)."""
+    if not _imports_simplnx(source):
+        return sys.executable, None
+    import importlib.util
+    if importlib.util.find_spec("simplnx") is not None:
+        return sys.executable, None
+    try:
+        import nx_bridge
+        py = nx_bridge.find_python()
+    except Exception:                                     # noqa: BLE001
+        py = None
+    if py:
+        return py, None
+    return None, ("this script imports simplnx, which this interpreter does "
+                  "not have, and the DREAM3D-NX env was not found. Create it "
+                  "(conda create -n nxpython python=3.12 dream3dnx -c "
+                  "conda-forge) or point COUNCIL_NX_PYTHON at its python.exe.")
+
+
 def _run_pipeline_subprocess(
     pipeline_path: Path,
     timeout_s: int = 600,
@@ -96,6 +197,9 @@ def _run_pipeline_subprocess(
     Returns a StepResult that the caller fills in step_index / input_label
     fields on. This function only sets success, return_code, duration,
     stdout, stderr, error.
+
+    Refuses, before launching anything, a script nx_policy says the app must
+    never run (Execute Process and friends — see capability_reasons).
     """
     start = time.monotonic()
     base = StepResult(
@@ -114,8 +218,28 @@ def _run_pipeline_subprocess(
         base.duration_s = time.monotonic() - start
         return base
     try:
+        source = _read_source(pipeline_path)
+    except OSError as exc:
+        base.error = f"could not read the pipeline: {exc}"
+        base.duration_s = time.monotonic() - start
+        return base
+    import nx_policy
+    refused = nx_policy.capability_reasons(source)
+    if refused:
+        base.error = ("refused, nothing was run: "
+                      + "; ".join(refused[:3])
+                      + (f" (+{len(refused) - 3} more)"
+                         if len(refused) > 3 else ""))
+        base.duration_s = time.monotonic() - start
+        return base
+    python, why = interpreter_for(source)
+    if python is None:
+        base.error = why
+        base.duration_s = time.monotonic() - start
+        return base
+    try:
         proc = subprocess.run(
-            [sys.executable, "-u", str(pipeline_path)],
+            [python, "-u", str(pipeline_path)],
             cwd=str(cwd) if cwd else None,
             capture_output=True,
             text=True,
@@ -227,100 +351,240 @@ def _stage_per_input_pipeline(
     *,
     substitution_param: str = "file_path",
 ) -> Path:
-    """Make a temp copy of `pipeline_path` with the configured input path
-    substituted. The substitution is the simplest reasonable default:
-    replace the value of the first parameter named `substitution_param` on
-    the first ReadDREAM3DFilter / ReadCSVFile / Import* filter.
+    """Make a temp copy of `pipeline_path` with its input path pointed at
+    `input_file`: the first `substitution_param = <value>` when the script
+    has one, else the first real reader parameter (_INPUT_PARAM_CANDIDATES).
+
+    A script with neither used to be copied as-is and run — reading the path
+    baked into it, for every input. The copy is still made, but the callers
+    check it (_input_not_redirected) and refuse to run it.
     """
-    from pipeline_editor import apply_edits, _value_text_end
-
-    source = pipeline_path.read_text(encoding="utf-8", errors="replace")
-
-    # Find the first occurrence of `<substitution_param> [whitespace] = [whitespace] <value>`.
-    # We capture the EXACT matched prefix (including any spaces around `=`)
-    # so the apply_edits find-string matches the real source text — building
-    # a synthetic prefix with bare `=` misses `param = "value"` style.
-    import re as _re
-    pat = _re.compile(rf"\b{_re.escape(substitution_param)}\s*=\s*", _re.MULTILINE)
-    m = pat.search(source)
-    if not m:
-        # Nothing to substitute — copy as-is.
-        target = stage_dir / pipeline_path.name
-        target.write_text(source, encoding="utf-8")
-        return target
-
-    matched_prefix = m.group(0)              # e.g. 'file_path = '
-    start = m.end()
-    end = _value_text_end(source, start)
-    old_value_text = source[start:end]
-    new_value_text = repr(str(input_file))   # repr handles backslashes safely
-
-    result = apply_edits(source, [{
-        "op": "replace_text",
-        "find": matched_prefix + old_value_text,
-        "replace": matched_prefix + new_value_text,
-        "max_count": 1,
-    }])
-    if not result.succeeded:
-        # Fall back to raw copy with a comment header so the user can see
-        # what went wrong without crashing the whole workflow.
-        target = stage_dir / pipeline_path.name
-        target.write_text(
-            f"# [workflow_runner] could not substitute {substitution_param}: "
-            f"{result.error or 'unknown'}\n" + source,
-            encoding="utf-8",
-        )
-        return target
-
-    target = stage_dir / pipeline_path.name
-    target.write_text(result.new_source, encoding="utf-8")
-    return target
+    return _stage(
+        pipeline_path, stage_dir, input_value=input_file,
+        input_param=_input_param(_read_source(pipeline_path),
+                                 substitution_param)).path
 
 
 # Parameter names a DREAM3D read/write step uses, discovered from the real
 # filters (see nx_worker.path_params). The INPUT is what a Read* filter reads;
 # the OUTPUT is what a Write* filter writes. Chaining rewrites A's output to a
 # staging file and then B's input to that same file.
+#
+# Checked 2026-10-06 against the installed catalog (289 filters): the single-
+# file readers' path parameters are file_path (inside ReadDREAM3DFilter's
+# ImportData), input_file (10 readers), input_file_path (2), stl_file_path
+# (ReadStlFileFilter), input_header_file (ReadBinaryCTNorthstarFilter) and
+# vg_header_file (ReadVolumeGraphicsFileFilter). The last three were missing,
+# and a missing name was not an error: the staged copy kept its baked-in path,
+# so a chain over two different .stl files reported success while BOTH runs
+# read the same file (measured with the shipped CreateScanVectors pipeline).
+# NOT "file_name": ITKImageReaderFilter reads from it, but ITKImageWriterFilter
+# WRITES to it, so a script with only the writer would have its output pointed
+# at the user's input file.
 _INPUT_PARAM_CANDIDATES = ("file_path", "input_file_path", "input_file",
-                           "import_file_path", "input_path")
+                           "import_file_path", "input_path", "stl_file_path",
+                           "input_header_file", "vg_header_file")
 _OUTPUT_PARAM_CANDIDATES = ("export_file_path", "output_file_path", "output_file",
                             "output_path", "write_file_path", "feature_data_file")
 
 
+@dataclass
+class _Site:
+    """One place a script gives a path parameter its value."""
+    param: str
+    start: int                    # character offsets of the VALUE
+    end: int
+    line: int
+    literal: Optional[str]        # the value, when it is a string literal
+
+
+def _param_sites(source: str, names) -> List[_Site]:
+    """Every place ``source`` gives one of ``names`` a value, in source
+    order: a keyword argument (``f(file_path=...)``), an attribute
+    assignment (``v.input_file_path = ...``) or a plain one
+    (``input_file = ...``).
+
+    Read from the syntax tree, so a comment or a string that mentions
+    ``file_path = ...`` is not a site. The regex this replaces matched
+    those: a top comment "Settings: file_path = the .dream3d to read" was
+    rewritten instead of the reader, and every input read the same file
+    (measured: identical Centroids for two inputs, chain reported 4/4 ok).
+    Raises SyntaxError."""
+    import ast
+    tree = ast.parse(source)
+    names = set(names)
+    lines = source.split("\n")
+    starts = [0]
+    for ln in lines[:-1]:
+        starts.append(starts[-1] + len(ln) + 1)
+
+    def offset(lineno: int, col: int) -> int:
+        # ast columns are UTF-8 byte offsets within the line
+        line = lines[lineno - 1]
+        return starts[lineno - 1] + len(
+            line.encode("utf-8")[:col].decode("utf-8", errors="replace"))
+
+    sites: List[_Site] = []
+
+    def add(param: str, value) -> None:
+        lit = value.value if isinstance(value, ast.Constant) \
+            and isinstance(value.value, str) else None
+        sites.append(_Site(param, offset(value.lineno, value.col_offset),
+                           offset(value.end_lineno, value.end_col_offset),
+                           value.lineno, lit))
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.keyword) and node.arg in names:
+            add(node.arg, node.value)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)) \
+                and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) \
+                else [node.target]
+            for t in targets:
+                name = t.attr if isinstance(t, ast.Attribute) else (
+                    t.id if isinstance(t, ast.Name) else None)
+                if name in names:
+                    add(name, node.value)
+                    break
+    sites.sort(key=lambda s: s.start)
+    return sites
+
+
 def _first_param_present(source: str, candidates) -> Optional[str]:
-    """The first `param = ` assignment present in the pipeline source."""
-    import re as _re
-    for c in candidates:
-        if _re.search(rf"\b{_re.escape(c)}\s*=\s*", source, _re.MULTILINE):
-            return c
+    """The first of ``candidates`` (in their order) the script gives a
+    value — in its syntax, not in a comment."""
+    try:
+        present = {s.param for s in _param_sites(source, candidates)}
+    except SyntaxError:
+        return None
+    return next((c for c in candidates if c in present), None)
+
+
+def _input_param(source: str, substitution_param: str) -> Optional[str]:
+    """The user's substitution_param when the script has it, else None (so
+    the staging falls back to the real reader names)."""
+    return substitution_param \
+        if _first_param_present(source, (substitution_param,)) else None
+
+
+def _main_output(sites: List[_Site]) -> Optional[_Site]:
+    """The output a pipeline ENDS with: the first output name (in
+    _OUTPUT_PARAM_CANDIDATES order) it has, at its LAST site. A pipeline that
+    writes a checkpoint and then its result has export_file_path twice; the
+    first one used to be handed on, so the next pipeline read the
+    checkpoint — without what was computed after it — and the chain
+    reported success."""
+    for c in _OUTPUT_PARAM_CANDIDATES:
+        mine = [s for s in sites if s.param == c]
+        if mine:
+            return mine[-1]
     return None
 
 
-def _sub_param(source: str, param: str, value: Any) -> Tuple[str, bool]:
-    """Replace ``param = <value>`` in ``source``. Returns (new_source, matched).
+def _side_dest(side_dir: Path, stem: Optional[str], site: _Site,
+               used: set) -> Path:
+    """Where a writer other than the main output goes for one input:
+    <side_dir>/<stem>_<the file name it had> (a.dream3d's checkpoint
+    'Data/ckpt.dream3d' -> a_ckpt.dream3d)."""
+    base = Path(site.literal).name if site.literal else ""
+    base = base or site.param
+    dest = side_dir / (f"{stem}_{base}" if stem else base)
+    n = 2
+    while dest in used:
+        p = Path(base)
+        dest = side_dir / (f"{stem}_{p.stem}_{n}{p.suffix}" if stem
+                           else f"{p.stem}_{n}{p.suffix}")
+        n += 1
+    used.add(dest)
+    return dest
 
-    Same find-the-real-prefix approach as _stage_per_input_pipeline so the
-    apply_edits find-string matches the exact source text (including the spaces
-    around ``=``)."""
-    import re as _re
-    from pipeline_editor import apply_edits, _value_text_end
-    pat = _re.compile(rf"\b{_re.escape(param)}\s*=\s*", _re.MULTILINE)
-    m = pat.search(source)
-    if not m:
-        return source, False
-    matched_prefix = m.group(0)
-    start = m.end()
-    end = _value_text_end(source, start)
-    old_value_text = source[start:end]
-    result = apply_edits(source, [{
-        "op": "replace_text",
-        "find": matched_prefix + old_value_text,
-        "replace": matched_prefix + repr(str(value)),
-        "max_count": 1,
-    }])
-    if not result.succeeded:
-        return source, False
-    return result.new_source, True
+
+@dataclass
+class _Staging:
+    path: Path
+    out_param: Optional[str] = None      # the parameter pointed at output_value
+    out_line: Optional[int] = None
+    side_outputs: List[Path] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
+    error: Optional[str] = None          # the script is not valid Python
+
+
+def _stage(pipeline_path: Path, stage_dir: Path, *,
+           input_value: Optional[Path] = None,
+           input_param: Optional[str] = None,
+           output_value: Optional[Path] = None,
+           side_dir: Optional[Path] = None,
+           stem: Optional[str] = None,
+           used: Optional[set] = None,
+           dest_name: Optional[str] = None) -> _Staging:
+    """Copy a pipeline with its paths pointed where this run needs them.
+
+      * the input: the first site of ``input_param`` (else of the first
+        reader name in _INPUT_PARAM_CANDIDATES it has) -> ``input_value``;
+      * the main output (_main_output: the LAST writer) -> ``output_value``;
+      * with ``side_dir``: every OTHER writer -> <side_dir>/<stem>_<name>.
+        Those kept their baked path, so each input overwrote the previous
+        one's file (one features.csv for two inputs, not in the outputs).
+
+    Only the value expressions are replaced; comments, strings and the
+    rest of the script are untouched."""
+    source = _read_source(pipeline_path)
+    target = stage_dir / (dest_name or pipeline_path.name)
+    st = _Staging(target)
+    names = set(_INPUT_PARAM_CANDIDATES) | set(_OUTPUT_PARAM_CANDIDATES)
+    if input_param:
+        names.add(input_param)
+    try:
+        sites = _param_sites(source, names)
+    except SyntaxError as exc:
+        target.write_text(source, encoding="utf-8")
+        st.error = (f"{pipeline_path.name} is not valid Python (line "
+                    f"{exc.lineno}: {exc.msg}), so its file paths can't be "
+                    f"found or pointed anywhere.")
+        return st
+    edits: List[Tuple[_Site, Any]] = []
+    if input_value is not None:
+        order = (input_param,) if input_param else _INPUT_PARAM_CANDIDATES
+        ip = next((n for n in order if any(s.param == n for s in sites)),
+                  None)
+        if ip:
+            edits.append((next(s for s in sites if s.param == ip),
+                          input_value))
+    outs = [s for s in sites if s.param in _OUTPUT_PARAM_CANDIDATES
+            and s.param != input_param]
+    main = _main_output(outs) if output_value is not None else None
+    if main is not None:
+        edits.append((main, output_value))
+        st.out_param, st.out_line = main.param, main.line
+    if side_dir is not None:
+        used = used if used is not None else set()
+        for s in outs:
+            if s is not main:
+                dest = _side_dest(side_dir, stem, s, used)
+                edits.append((s, dest))
+                st.side_outputs.append(dest)
+    if main is not None:
+        same = [s for s in outs if s.param == main.param]
+        if len(same) > 1:
+            others = [Path(s.literal).name if s.literal else s.param
+                      for s in same if s is not main]
+            st.notes.append(
+                f"{pipeline_path.name}: {main.param} is written "
+                f"{len(same)} times (lines "
+                f"{', '.join(str(s.line) for s in same)}); the last, line "
+                f"{main.line}, is what it ends with, so that is the one "
+                f"this run follows"
+                + (f"; the others are kept per input as "
+                   f"{', '.join('<input>_' + o for o in others)}"
+                   if side_dir is not None else ""))
+    new, limit = source, len(source)
+    for site, value in sorted(edits, key=lambda e: e[0].start, reverse=True):
+        if site.end > limit:
+            continue                     # nested in a value already replaced
+        new = new[:site.start] + repr(str(value)) + new[site.end:]
+        limit = site.start
+    target.write_text(new, encoding="utf-8")
+    return st
 
 
 def _stage_chain_pipeline(pipeline_path: Path, stage_dir: Path, *,
@@ -335,21 +599,121 @@ def _stage_chain_pipeline(pipeline_path: Path, stage_dir: Path, *,
     output-path parameter could be found to override — the caller needs that to
     know whether A's output was actually redirected to the staging file it will
     hand to B."""
-    source = pipeline_path.read_text(encoding="utf-8", errors="replace")
-    if input_value is not None:
-        ip = input_param or _first_param_present(source, _INPUT_PARAM_CANDIDATES) \
-            or "file_path"
-        source, _ = _sub_param(source, ip, input_value)
-    out_used: Optional[str] = None
-    if output_value is not None:
-        op = _first_param_present(source, _OUTPUT_PARAM_CANDIDATES)
-        if op:
-            source, ok = _sub_param(source, op, output_value)
-            if ok:
-                out_used = op
-    target = stage_dir / (dest_name or pipeline_path.name)
-    target.write_text(source, encoding="utf-8")
-    return target, out_used
+    st = _stage(pipeline_path, stage_dir, input_value=input_value,
+                input_param=input_param, output_value=output_value,
+                dest_name=dest_name)
+    return st.path, st.out_param
+
+
+def _output_dest(pipeline_path: Path, out_dir: Path, stem: str,
+                 used: set) -> Optional[Path]:
+    """Where this pipeline's output goes for one input: <out_dir>/<stem> with
+    the suffix the script's own output path had (.dream3d, .stl, ...). None
+    when the script has no output parameter to point there."""
+    source = _read_source(pipeline_path)
+    try:
+        main = _main_output(_param_sites(source, _OUTPUT_PARAM_CANDIDATES))
+    except SyntaxError:
+        return None
+    if main is None:
+        return None
+    suffix = Path(main.literal or "").suffix or ".dream3d"
+    dest, n = out_dir / f"{stem}{suffix}", 2
+    while dest in used:                 # a.dream3d and a.stl in one folder
+        dest, n = out_dir / f"{stem}_{n}{suffix}", n + 1
+    used.add(dest)
+    return dest
+
+
+def _input_not_redirected(pl: Path, staged: Path, src_in: Path,
+                          params=()) -> Optional[str]:
+    """Why the staged copy would NOT read ``src_in``, or None.
+
+    Checked on the staged copy's syntax tree: a reader parameter (one of
+    ``params`` or _INPUT_PARAM_CANDIDATES) must now hold exactly
+    ``src_in``. A text search for the path passed when the path landed in a
+    comment. A reader whose parameter is not a recognised name is staged
+    with its baked-in path untouched, so the run "succeeds" on the wrong
+    file -- every input the same file. Measured: a chain over two different
+    .stl files reported 4/4 ok while both runs read the path saved in the
+    pipeline."""
+    names = tuple(p for p in params if p) + _INPUT_PARAM_CANDIDATES
+    staged_src = _read_source(staged)
+    try:
+        sites = _param_sites(staged_src, names)
+    except SyntaxError as exc:
+        return (f"{pl.name} is not valid Python (line {exc.lineno}: "
+                f"{exc.msg}), so it can't be pointed at {src_in.name}.")
+    if any(s.literal == str(src_in) for s in sites):
+        return None
+    return (f"{pl.name} has no recognized input-path parameter "
+            f"(looked for {', '.join(names)}), "
+            f"so it can't be pointed at {src_in.name}; it would "
+            f"read the path saved in it instead.")
+
+
+def _work_dir(base: Path, used: set) -> Path:
+    """A run's own working folder, not shared with another input's."""
+    d, n = base, 2
+    while d in used:
+        d, n = base.with_name(f"{base.name}_{n}"), n + 1
+    used.add(d)
+    return d
+
+
+def _record_outputs(result: "WorkflowResult", paths, work: Optional[Path]
+                    ) -> None:
+    """List every file a run wrote: the files its writers were pointed at
+    (a writer pointed at a folder: the files in it) and anything it wrote in
+    its own working folder."""
+    seen = set(result.outputs)
+
+    def add(p: Path) -> None:
+        if p not in seen:
+            seen.add(p)
+            result.outputs.append(p)
+    for p in paths:
+        if p.is_file():
+            add(p)
+        elif p.is_dir():
+            for f in sorted(p.rglob("*")):
+                if f.is_file():
+                    add(f)
+    if work is not None and work.is_dir():
+        for f in sorted(work.rglob("*")):
+            if f.is_file():
+                add(f)
+
+
+def _add_notes(result: "WorkflowResult", notes) -> None:
+    for n in notes:
+        if n not in result.notes:
+            result.notes.append(n)
+
+
+def _not_run(idx: int, pl: Path, label: str, error: str) -> StepResult:
+    bad = StepResult(step_index=idx, pipeline_name=pl.name, input_label=label,
+                     success=False, return_code=None, duration_s=0.0,
+                     stdout="", stderr="", pipeline_path=pl)
+    bad.error = error
+    return bad
+
+
+def _default_output_dir() -> Path:
+    """A fresh folder for a run's outputs when the caller names none. NOT the
+    staging area: that is deleted when the run ends."""
+    import tempfile
+    import uuid
+    return (Path(tempfile.gettempdir()) / "council_wf_out"
+            / uuid.uuid4().hex[:12])
+
+
+def _drop_if_empty(folder: Path) -> None:
+    try:
+        if folder.is_dir() and not any(folder.iterdir()):
+            folder.rmdir()
+    except OSError:
+        pass
 
 
 def run_chained(
@@ -362,6 +726,7 @@ def run_chained(
     substitution_param: str = "file_path",
     timeout_s: int = 600,
     stage_dir: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
     on_step: Optional[Callable[[StepResult], None]] = None,
 ) -> WorkflowResult:
     """Chain pipelines so each one reads the PREVIOUS pipeline's OUTPUT.
@@ -379,7 +744,19 @@ def run_chained(
     A non-final pipeline MUST expose an output-path parameter (so its output can
     be redirected to a staging file and handed on); if none is found the chain
     stops with a clear error rather than silently running the next pipeline on
-    the wrong input.
+    the wrong input. What is handed on is the LAST writer of that parameter —
+    what the pipeline ends with, not a checkpoint written halfway — and the
+    step fails, naming itself, if it did not write that file.
+
+    The FINAL pipeline's output goes to ``output_dir``/<input stem><suffix>
+    (a fresh temp folder when None; result.outputs lists the files). It used
+    to keep the path baked into the script, resolved against wherever the app
+    was started — outside the vault's output area — and in per_file mode every
+    input overwrote the same file: two inputs, one surviving output. Every
+    other writer of every pipeline goes to ``output_dir``/<stem>_<its file
+    name>, and each input's steps run in their own working folder,
+    ``output_dir``/<stem>/, so a relative path a script still holds lands
+    there, per input, too.
     """
     overall_start = time.monotonic()
     inputs = _list_directory_inputs(input_dir, pattern=pattern,
@@ -406,6 +783,10 @@ def run_chained(
             _cleanup_stage_dir(stage_dir)
         return result
 
+    out_root = Path(output_dir) if output_dir else _default_output_dir()
+    out_root.mkdir(parents=True, exist_ok=True)
+    used: set = set()
+    works: Dict[str, Path] = {}         # input stem -> its working folder
     step_counter = 0
 
     def _emit(step: StepResult) -> None:
@@ -418,25 +799,49 @@ def run_chained(
                 pass
 
     def _run_one(pl: Path, src_in: Path, out_path: Optional[Path],
-                 file_stage: Path, label: str, idx: int) -> StepResult:
-        staged, out_used = _stage_chain_pipeline(
-            pl, file_stage, input_value=src_in, output_value=out_path,
-            dest_name=f"{idx:02d}_{pl.name}")
+                 file_stage: Path, label: str, idx: int, stem: str,
+                 final: bool) -> StepResult:
+        if final:
+            out_path = _output_dest(pl, out_root, stem, used)
+        st = _stage(pl, file_stage, input_value=src_in, output_value=out_path,
+                    input_param=_input_param(_read_source(pl),
+                                             substitution_param),
+                    side_dir=out_root, stem=stem, used=used,
+                    dest_name=f"{idx:02d}_{pl.name}")
+        if st.error:
+            return _not_run(idx, pl, label, st.error)
         # A non-final pipeline whose output we could not redirect leaves us not
         # knowing what to feed onward — fail loudly instead of chaining garbage.
-        if out_path is not None and out_used is None:
-            bad = StepResult(step_index=idx, pipeline_name=pl.name,
-                             input_label=label, success=False, return_code=None,
-                             duration_s=0.0, stdout="", stderr="",
-                             pipeline_path=pl)
-            bad.error = (f"{pl.name} has no recognized output-path parameter "
-                         f"(looked for {', '.join(_OUTPUT_PARAM_CANDIDATES)}), "
-                         f"so its result can't be chained into the next "
-                         f"pipeline.")
-            return bad
-        step = _run_pipeline_subprocess(staged, timeout_s=timeout_s)
+        if not final and out_path is not None and st.out_param is None:
+            return _not_run(idx, pl, label,
+                            f"{pl.name} has no recognized output-path parameter "
+                            f"(looked for {', '.join(_OUTPUT_PARAM_CANDIDATES)}), "
+                            f"so its result can't be chained into the next "
+                            f"pipeline.")
+        why = _input_not_redirected(pl, st.path, src_in, (substitution_param,))
+        if why:
+            return _not_run(idx, pl, label, why)
+        _add_notes(result, st.notes)
+        if stem not in works:
+            works[stem] = _work_dir(out_root / stem, used)
+        work = works[stem]
+        work.mkdir(parents=True, exist_ok=True)
+        step = _run_pipeline_subprocess(st.path, timeout_s=timeout_s,
+                                        cwd=work)
         step.step_index = idx
         step.input_label = label
+        if step.success and not final and not out_path.is_file():
+            # The next pipeline would fail on a missing file and the error
+            # would name IT; the fault is here.
+            step.success = False
+            step.error = (f"{pl.name} finished without writing "
+                          f"{out_path.name}, the file the next pipeline "
+                          f"reads: its {st.out_param} (line {st.out_line}) "
+                          f"was pointed there and nothing was written")
+        if step.success:
+            _record_outputs(result, ([out_path] if final and st.out_param
+                                     else []) + st.side_outputs, work)
+        _drop_if_empty(work)
         return step
 
     try:
@@ -452,7 +857,8 @@ def run_chained(
                     step_counter += 1
                     out_path = None if is_last else out_dir / f"{src_in.stem}.dream3d"
                     step = _run_one(pl, src_in, out_path, out_dir,
-                                    f"{pl.name} <- {src_in.name}", step_counter)
+                                    f"{pl.name} <- {src_in.name}", step_counter,
+                                    src_in.stem, is_last)
                     _emit(step)
                     if not step.success:
                         result.success = False
@@ -474,7 +880,8 @@ def run_chained(
                     out_path = None if is_last else \
                         file_stage / f"{src_file.stem}_step{j}.dream3d"
                     step = _run_one(pl, prev, out_path, file_stage,
-                                    f"{pl.name} <- {prev.name}", step_counter)
+                                    f"{pl.name} <- {prev.name}", step_counter,
+                                    src_file.stem, is_last)
                     _emit(step)
                     if not step.success:
                         result.success = False
@@ -486,6 +893,8 @@ def run_chained(
     finally:
         if owned_stage:
             _cleanup_stage_dir(stage_dir)
+        if output_dir is None:
+            _drop_if_empty(out_root)
     result.duration_s = time.monotonic() - overall_start
     return result
 
@@ -510,6 +919,59 @@ def _cleanup_stage_dir(stage_dir: Path) -> None:
         pass
 
 
+def _run_over_inputs(pairs, *, substitution_param: str, timeout_s: int,
+                     stage_dir: Path, out_root: Path,
+                     result: WorkflowResult, label_of, fail_msg,
+                     on_step) -> bool:
+    """Run each (pipeline, input) with its input pointed at the input file,
+    its output at <out_root>/<pipeline stem>/<input stem><suffix>, every
+    other writer at <out_root>/<pipeline stem>/<input stem>_<file name>, in
+    its own working folder <out_root>/<pipeline stem>/<input stem>/. False
+    on the first failure (result.error says which)."""
+    used: set = set()
+    for step_counter, (pipeline_path, input_file) in enumerate(pairs, start=1):
+        file_stage = stage_dir / input_file.stem
+        file_stage.mkdir(parents=True, exist_ok=True)
+        label = label_of(pipeline_path, input_file)
+        pdir = out_root / pipeline_path.stem
+        dest = _output_dest(pipeline_path, pdir, input_file.stem, used)
+        source = _read_source(pipeline_path)
+        st = _stage(pipeline_path, file_stage, input_value=input_file,
+                    input_param=_input_param(source, substitution_param),
+                    output_value=dest, side_dir=pdir, stem=input_file.stem,
+                    used=used)
+        why = st.error or _input_not_redirected(
+            pipeline_path, st.path, input_file, (substitution_param,))
+        if why:
+            step = _not_run(step_counter, pipeline_path, label, why)
+        else:
+            _add_notes(result, st.notes)
+            work = _work_dir(pdir / input_file.stem, used)
+            work.mkdir(parents=True, exist_ok=True)
+            step = _run_pipeline_subprocess(st.path, timeout_s=timeout_s,
+                                            cwd=work)
+            step.step_index = step_counter
+            step.input_label = label
+            if step.success:
+                _record_outputs(result, ([dest] if st.out_param else [])
+                                + st.side_outputs, work)
+            _drop_if_empty(work)
+            _drop_if_empty(pdir)
+        result.step_results.append(step)
+        result.steps_run += 1
+        if on_step:
+            try:
+                on_step(step)
+            except Exception:
+                pass
+        if not step.success:
+            result.success = False
+            result.error = step.error if why else fail_msg(
+                step_counter, pipeline_path, input_file)
+            return False
+    return True
+
+
 def run_per_file(
     pipelines: List[Path],
     input_dir: Path,
@@ -519,64 +981,20 @@ def run_per_file(
     substitution_param: str = "file_path",
     timeout_s: int = 600,
     stage_dir: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
     on_step: Optional[Callable[[StepResult], None]] = None,
 ) -> WorkflowResult:
-    """For each input file in directory: run the whole pipeline list."""
-    overall_start = time.monotonic()
-    inputs = _list_directory_inputs(input_dir, pattern=pattern, recursive=recursive)
-    owned_stage = stage_dir is None
-    if stage_dir is None:
-        stage_dir = _default_stage_dir()
-    stage_dir.mkdir(parents=True, exist_ok=True)
+    """For each input file in directory: run the whole pipeline list.
 
-    total_steps = len(pipelines) * len(inputs)
-    result = WorkflowResult(success=True, total_steps=total_steps, steps_run=0,
-                            duration_s=0.0)
-    if not inputs:
-        result.success = False
-        result.error = f"no input files matched {pattern!r} under {input_dir}"
-        result.duration_s = time.monotonic() - overall_start
-        if owned_stage:
-            _cleanup_stage_dir(stage_dir)
-        return result
+    Each run reads that input and writes <output_dir>/<pipeline stem>/<input
+    stem><suffix>: one output per input, never the script's baked path (which
+    every input used to overwrite)."""
+    return _run_directory_mode(
+        pipelines, input_dir, by_file=True, pattern=pattern,
+        recursive=recursive, substitution_param=substitution_param,
+        timeout_s=timeout_s, stage_dir=stage_dir, output_dir=output_dir,
+        on_step=on_step)
 
-    step_counter = 0
-    try:
-        for input_file in inputs:
-            file_stage = stage_dir / input_file.stem
-            file_stage.mkdir(parents=True, exist_ok=True)
-            for j, pipeline_path in enumerate(pipelines, start=1):
-                step_counter += 1
-                staged = _stage_per_input_pipeline(
-                    pipeline_path, input_file, file_stage,
-                    substitution_param=substitution_param,
-                )
-                step = _run_pipeline_subprocess(staged, timeout_s=timeout_s)
-                step.step_index = step_counter
-                step.input_label = input_file.name
-                result.step_results.append(step)
-                result.steps_run += 1
-                if on_step:
-                    try:
-                        on_step(step)
-                    except Exception:
-                        pass
-                if not step.success:
-                    result.success = False
-                    result.error = (f"step #{step_counter} ({pipeline_path.name}) "
-                                    f"failed on input {input_file.name}")
-                    result.duration_s = time.monotonic() - overall_start
-                    return result
-    finally:
-        if owned_stage:
-            _cleanup_stage_dir(stage_dir)
-    result.duration_s = time.monotonic() - overall_start
-    return result
-
-
-# ============================================================
-# Per-step directory runner (full directory per pipeline)
-# ============================================================
 
 def run_per_step(
     pipelines: List[Path],
@@ -587,9 +1005,21 @@ def run_per_step(
     substitution_param: str = "file_path",
     timeout_s: int = 600,
     stage_dir: Optional[Path] = None,
+    output_dir: Optional[Path] = None,
     on_step: Optional[Callable[[StepResult], None]] = None,
 ) -> WorkflowResult:
-    """For each pipeline: run it on every input file. Then move to next pipeline."""
+    """For each pipeline: run it on every input file. Then move to next
+    pipeline. Outputs as run_per_file."""
+    return _run_directory_mode(
+        pipelines, input_dir, by_file=False, pattern=pattern,
+        recursive=recursive, substitution_param=substitution_param,
+        timeout_s=timeout_s, stage_dir=stage_dir, output_dir=output_dir,
+        on_step=on_step)
+
+
+def _run_directory_mode(pipelines, input_dir, *, by_file: bool, pattern,
+                        recursive, substitution_param, timeout_s, stage_dir,
+                        output_dir, on_step) -> WorkflowResult:
     overall_start = time.monotonic()
     inputs = _list_directory_inputs(input_dir, pattern=pattern, recursive=recursive)
     owned_stage = stage_dir is None
@@ -608,37 +1038,36 @@ def run_per_step(
             _cleanup_stage_dir(stage_dir)
         return result
 
-    step_counter = 0
+    out_root = Path(output_dir) if output_dir else _default_output_dir()
+    out_root.mkdir(parents=True, exist_ok=True)
+    if by_file:
+        pairs = [(p, f) for f in inputs for p in pipelines]
+
+        def label_of(p, f):
+            return f.name
+
+        def fail_msg(n, p, f):
+            return f"step #{n} ({p.name}) failed on input {f.name}"
+    else:
+        pairs = [(p, f) for p in pipelines for f in inputs]
+
+        def label_of(p, f):
+            return f"{p.name} <- {f.name}"
+
+        def fail_msg(n, p, f):
+            return (f"step #{n}: pipeline {p.name} failed on input "
+                    f"{f.name}")
     try:
-        for j, pipeline_path in enumerate(pipelines, start=1):
-            for input_file in inputs:
-                step_counter += 1
-                file_stage = stage_dir / input_file.stem
-                file_stage.mkdir(parents=True, exist_ok=True)
-                staged = _stage_per_input_pipeline(
-                    pipeline_path, input_file, file_stage,
-                    substitution_param=substitution_param,
-                )
-                step = _run_pipeline_subprocess(staged, timeout_s=timeout_s)
-                step.step_index = step_counter
-                step.input_label = f"{pipeline_path.name} <- {input_file.name}"
-                result.step_results.append(step)
-                result.steps_run += 1
-                if on_step:
-                    try:
-                        on_step(step)
-                    except Exception:
-                        pass
-                if not step.success:
-                    result.success = False
-                    result.error = (f"step #{step_counter}: pipeline "
-                                    f"{pipeline_path.name} failed on "
-                                    f"input {input_file.name}")
-                    result.duration_s = time.monotonic() - overall_start
-                    return result
+        _run_over_inputs(pairs, substitution_param=substitution_param,
+                         timeout_s=timeout_s, stage_dir=stage_dir,
+                         out_root=out_root, result=result,
+                         label_of=label_of, fail_msg=fail_msg,
+                         on_step=on_step)
     finally:
         if owned_stage:
             _cleanup_stage_dir(stage_dir)
+        if output_dir is None:
+            _drop_if_empty(out_root)
     result.duration_s = time.monotonic() - overall_start
     return result
 
@@ -657,6 +1086,9 @@ class WorkflowSpec:
     substitution_param: str = "file_path"
     timeout_s: int = 600
     chain_scope: str = "per_file"  # for mode="chained": "per_file" | "folder"
+    # Directory modes: where each input's outputs go (a temp folder if None).
+    # The app passes a folder under the vault's data_out.
+    output_dir: Optional[Path] = None
 
 
 def run_workflow(spec: WorkflowSpec,
@@ -673,20 +1105,23 @@ def run_workflow(spec: WorkflowSpec,
         return run_per_file(
             spec.pipeline_paths, spec.input_dir, pattern=spec.pattern,
             recursive=spec.recursive, substitution_param=spec.substitution_param,
-            timeout_s=spec.timeout_s, on_step=on_step,
+            timeout_s=spec.timeout_s, output_dir=spec.output_dir,
+            on_step=on_step,
         )
     if spec.mode == "per_step":
         return run_per_step(
             spec.pipeline_paths, spec.input_dir, pattern=spec.pattern,
             recursive=spec.recursive, substitution_param=spec.substitution_param,
-            timeout_s=spec.timeout_s, on_step=on_step,
+            timeout_s=spec.timeout_s, output_dir=spec.output_dir,
+            on_step=on_step,
         )
     if spec.mode == "chained":
         return run_chained(
             spec.pipeline_paths, spec.input_dir, scope=spec.chain_scope,
             pattern=spec.pattern, recursive=spec.recursive,
             substitution_param=spec.substitution_param,
-            timeout_s=spec.timeout_s, on_step=on_step,
+            timeout_s=spec.timeout_s, output_dir=spec.output_dir,
+            on_step=on_step,
         )
     r = WorkflowResult(success=False, total_steps=0, steps_run=0, duration_s=0.0)
     r.error = f"unknown workflow mode: {spec.mode}"

@@ -8925,6 +8925,18 @@ class CouncilConsole(tk.Tk):
 
         import workflow_runner as _wr
         spec = _wr.parse_workflow_request(single_line, VAULT_DIR)
+        if spec.mode != "linear":
+            # Each input's results land in the vault's output area, one file
+            # per input — not at the path baked into the last script,
+            # resolved against wherever the app was started.
+            try:
+                import data_index as _di
+                import time as _time
+                spec.output_dir = (Path(_di.output_dir(VAULT_DIR))
+                                   / "workflows"
+                                   / _time.strftime("%Y%m%d_%H%M%S"))
+            except Exception:
+                spec.output_dir = None
         if not spec.pipeline_paths:
             self._append_transcript(
                 "Writer",
@@ -9465,8 +9477,11 @@ class CouncilConsole(tk.Tk):
         thread only."""
         import json as _json
         import nx_bridge as _nb
+        # A cached catalog is used only while it still describes the installed
+        # env (schema, python, dream3dnx version — no subprocess); it used to
+        # be used for good, whatever the env became.
         cached = getattr(self, "_nx_catalog_cache", None)
-        if cached:
+        if cached and _nb.catalog_stale_reason(cached) is None:
             return cached
         try:
             path = self.data_index.safe_write_path(
@@ -9476,11 +9491,13 @@ class CouncilConsole(tk.Tk):
         if path and path.exists():
             try:
                 cached = _json.loads(path.read_text(encoding="utf-8"))
-                if cached.get("filters"):
+                if _nb.catalog_stale_reason(cached) is None:
                     self._nx_catalog_cache = cached
                     return cached
             except Exception:
                 pass
+        # Raises NxError (nothing cached or saved) when the interpreter it ran
+        # has no simplnx: an empty catalog used to replace the good one.
         cached = _nb.catalog()
         self._nx_catalog_cache = cached
         if path:

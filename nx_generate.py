@@ -3,6 +3,14 @@ nx_generate.py — a DREAM3D-NX pipeline from a natural-language request.
 
 Runs in the APP env (pure: catalog + text), so it is testable without simplnx.
 
+TWO PATHS, AND ONLY ONE IS SHIPPED. The Dream3D tab's "Write pipeline" button
+(council_core.nx_ops.write_script) and the pipeline chat's "create pipeline"
+(pipeline_editor.generate_pipeline_from_description) both call write_script():
+the model writes Python, nx_policy gates it and nx_ground checks every filter,
+keyword and stated value against the installed catalog. generate() /
+render_from_selection() below — the model picks filters as JSON — have no
+caller in the app today; what follows describes them.
+
 The model is kept on rails. It never writes code and never recalls a binding
 from memory: it PICKS from a shortlist of filters retrieved out of the catalog
 of the INSTALLED binary, and every UUID and argument key it emits is checked
@@ -97,6 +105,74 @@ def filter_text(entry: dict) -> str:
     return " ".join(p for p in parts if p)
 
 
+# Stemmed, as _tokens yields them: 'writing'/'writes' stem to 'writ' while
+# 'write' stays whole, and 'saving'/'saved' to 'sav'.
+_READ_VERBS = {"read", "load", "import", "open", "ingest"}
+_WRITE_VERBS = {"write", "writ", "save", "sav", "export", "dump"}
+# Words that say nothing about WHICH reader or writer: "write it to the
+# current folder" must not pick a filter for having "it" or "folder" in it.
+_PIN_IGNORE = {_stem(w) for w in (
+    "as", "it", "is", "at", "by", "be", "this", "that", "these", "them",
+    "new", "out", "use", "using", "result", "results", "everything",
+    "current", "folder", "filter", "number", "numbers", "every")}
+
+
+def io_pins(catalog: dict, query: str) -> List[dict]:
+    """The reader / writer the request names, so the shortlist always has
+    them.
+
+    The lexical rank alone crowded them out: for "Read the DREAM3D file ...
+    compute the feature centroids and sizes ... write out.dream3d" every
+    "Compute ..." filter outscored them, ReadDREAM3DFilter came 13th and
+    WriteDREAM3DFilter 16th, k=12 cut both, and the model (llama3.1:8b)
+    invented ImportData(...).execute to read the file.
+
+    For each read/write verb in the request, the words after it (up to the
+    next verb) name the format; the reader/writer whose own name shares the
+    rarest of those words is pinned. Never a denied filter."""
+    seq = _tokens(query)
+    pool = nx_policy.permitted_filters(catalog)
+    names = [(e, set(_tokens(e.get("human_name") or ""))
+              | set(_tokens(_split_camel(e.get("py_attr") or ""))))
+             for e in pool]
+    df: Dict[str, int] = {}
+    for _e, nt in names:
+        for t in nt:
+            df[t] = df.get(t, 0) + 1
+    n = len(names) + 1
+
+    def idf(t: str) -> float:
+        import math
+        return math.log(n / (df.get(t, 0) + 1)) + 1.0
+
+    pins: List[dict] = []
+    for i, t in enumerate(seq):
+        if t in _READ_VERBS:
+            canon = {"read", "import"}
+        elif t in _WRITE_VERBS:
+            canon = {"write", "writ", "export"}
+        else:
+            continue
+        window = []
+        for u in seq[i + 1:i + 9]:
+            if u in _READ_VERBS or u in _WRITE_VERBS:
+                break
+            window.append(u)
+        obj = set(window) - _PIN_IGNORE
+        best = None
+        for e, nt in names:
+            shared = nt & obj
+            if not (nt & canon) or not shared:
+                continue
+            score = sum(idf(x) for x in shared) \
+                - 0.01 * len(e.get("human_name") or "")
+            if best is None or score > best[0]:
+                best = (score, e)
+        if best and best[1] not in pins:
+            pins.append(best[1])
+    return pins[:4]
+
+
 def retrieve(catalog: dict, query: str, k: int = 12) -> List[dict]:
     """The k filters most likely to serve ``query``.
 
@@ -104,10 +180,14 @@ def retrieve(catalog: dict, query: str, k: int = 12) -> List[dict]:
     lexical score over human_name/tags/class-name is enough and — unlike an
     embedding index — needs no model call, no warm-up and no cache, which
     matters when a single in-process GGUF serializes all inference.
+
+    The reader and writer the request names come first (io_pins), whatever
+    their lexical rank: without them the model improvises the I/O.
     """
     q = set(_tokens(query))
     if not q:
         return []
+    pins = io_pins(catalog, query)[:k]
     scored = []
     for e in catalog.get("filters", []):
         if nx_policy.is_denied(e.get("uuid")):
@@ -127,7 +207,8 @@ def retrieve(catalog: dict, query: str, k: int = 12) -> List[dict]:
         score -= 0.01 * len(entry_name)
         scored.append((score, e))
     scored.sort(key=lambda t: (-t[0], t[1].get("py_attr") or ""))
-    return [e for _s, e in scored[:k]]
+    rest = [e for _s, e in scored if e not in pins]
+    return (pins + rest)[:k]
 
 
 def _params_of(entry: dict) -> List[dict]:
@@ -135,15 +216,28 @@ def _params_of(entry: dict) -> List[dict]:
             if p.get("name") not in IMPLICIT_ARGS]
 
 
-def describe_filter(entry: dict) -> str:
+def describe_filter(entry: dict, enums: Optional[dict] = None) -> str:
     """One filter, as the model should see it: real name, real UUID, real
-    parameter keys and types."""
+    parameter keys and types — and, for an enum-typed parameter, the members
+    to choose from (the binding refuses the int a saved pipeline stores)."""
     lines = [f"- {entry.get('human_name') or entry.get('py_attr')}",
              f"  uuid: {entry.get('uuid')}",
              f"  class: {entry.get('alias', 'nx')}.{entry.get('py_attr')}"]
     for p in _params_of(entry):
         req = "required" if p.get("required") else f"default={p.get('default')}"
-        lines.append(f"    {p['name']}: {p.get('type')}  ({req})")
+        line = f"    {p['name']}: {p.get('type')}  ({req})"
+        if str(p.get("default")) in ("DataPath('')", 'DataPath("")',
+                                     "DataPath()"):
+            # Copied as-is, an empty path fails at run time ("Geometry Path
+            # cannot be empty"): llama3.1:8b did exactly that, 3 runs of 4.
+            line += "  empty: give the path from your data"
+        members = (enums or {}).get(p.get("type") or "")
+        if members:
+            import nx_ground
+            line += (f"  one of: " + ", ".join(
+                f"{nx_ground.py_name(p['type'])}.{m}"
+                for m in nx_ground._members({"enums": enums}, p["type"])))
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -240,9 +334,19 @@ def _balanced_end(s: str, start: int) -> Optional[int]:
 def validate(pipeline: Any, catalog: dict) -> List[str]:
     """Every reason ``pipeline`` could not run against the INSTALLED package.
 
-    Empty list means it is structurally sound: real UUIDs, real argument keys.
+    Empty list means it is structurally sound: real UUIDs, real argument
+    keys, and values of the type each parameter takes (nx_ground's
+    json_value_problem — 'banana' for a NumericType, 12345 for a DataPath).
     It does NOT mean the pipeline is sensible — that is what the trial run is
-    for."""
+    for.
+
+    On the required check below, plainly: a parameter is required when its
+    signature has no default, and on the installed build that is
+    data_structure and nothing else (0 of the other 1972 parameters). This
+    JSON never carries data_structure — the renderer supplies it — so the
+    check cannot fire against the real catalog. It stays because it is the
+    rule, and a build that adds a parameter without a default would need it;
+    what actually catches a bad argument here is the value check."""
     errors: List[str] = []
     idx = {f["uuid"]: f for f in nx_policy.permitted_filters(catalog)}
     if isinstance(pipeline, dict):
@@ -295,15 +399,27 @@ def validate(pipeline: Any, catalog: dict) -> List[str]:
             errors.append(f"step {i} ({entry['py_attr']}): 'args' must be an "
                           f"object")
             continue
-        valid = {p["name"] for p in _params_of(entry)}
+        import nx_ground
+        params = {p["name"]: p for p in _params_of(entry)}
         for k in args:
             if k in NON_PARAM_KEYS or k in IMPLICIT_ARGS:
                 continue
-            if k not in valid:
-                near = ", ".join(sorted(valid)[:8]) or "(none)"
+            if k not in params:
+                near = ", ".join(sorted(params)[:8]) or "(none)"
                 errors.append(
                     f"step {i} ({entry['py_attr']}): {k!r} is not a parameter "
                     f"of this filter. Valid keys: {near}")
+                continue
+            v = args[k]
+            if isinstance(v, dict) and set(v) == {"value", "version"}:
+                v = v["value"]          # a saved pipeline's envelope
+            if v is None and params[k].get("required"):
+                continue                # the required check says so below
+            t = params[k].get("type") or ""
+            why = nx_ground.json_value_problem(v, t, catalog)
+            if why:
+                errors.append(f"step {i} ({entry['py_attr']}): {k!r} "
+                              f"({t}) {why}")
         for p in _params_of(entry):
             if not p.get("required"):
                 continue
@@ -397,29 +513,92 @@ def render_from_selection(query: str, catalog: dict,
             "render_warnings": rendered.get("warnings", [])}
 
 
-def build_script_prompt(query: str, candidates: List[dict]) -> str:
-    """Ask for a real simplnx script, grounded on real signatures."""
-    cat = "\n".join(describe_filter(e) for e in candidates)
+def _compound_lines(candidates: List[dict], catalog: Optional[dict]) -> List[str]:
+    """How to build each compound parameter value the shortlist takes
+    (ReadCSVDataParameter, ArrayThresholdSet, ...), from the catalog's
+    record of the class. A model left to guess passes a dict, which the
+    binding refuses ('Unable to cast Python instance of type dict')."""
+    if not catalog or not catalog.get("classes"):
+        return []
+    import nx_ground
+    classes = catalog["classes"]
+    seen: List[str] = []
+    for e in candidates:
+        for p in _params_of(e):
+            kind, arg = nx_ground.classify(p.get("type"), catalog)
+            if kind == "list":
+                kind, arg = nx_ground.classify(arg, catalog)
+            if kind != "object" or arg not in classes or arg in seen \
+                    or arg.endswith("Dream3dImportParameter.ImportData"):
+                continue
+            seen.append(arg)
+            # What goes INTO it: a list of an abstract base (IArrayThreshold)
+            # is filled with its concrete subclasses (ArrayThreshold).
+            for t in (classes[arg].get("props") or {}).values():
+                k2, a2 = nx_ground.classify(t, catalog)
+                if k2 == "list":
+                    k2, a2 = nx_ground.classify(a2, catalog)
+                if k2 != "object":
+                    continue
+                for c, rec in classes.items():
+                    if c not in seen and (c == a2 and rec.get("init")
+                                          or a2 in (rec.get("bases") or [])):
+                        seen.append(c)
+    return [f"    a {c} -> {nx_ground.construct_hint(c, catalog)}"
+            for c in seen]
+
+
+def build_script_prompt(query: str, candidates: List[dict],
+                        catalog: Optional[dict] = None) -> str:
+    """Ask for a real simplnx script, grounded on real signatures.
+
+    States the import lines and the call form outright. The prompt used to
+    show nx.X.execute(...) and never say `import simplnx as nx`; with
+    llama3.1:8b 7 of 12 scripts died on NameError/ImportError for nx, and
+    others instantiated filters and set attributes on them."""
+    enums = (catalog or {}).get("enums")
+    cat = "\n".join(describe_filter(e, enums) for e in candidates)
     allowed = ", ".join(sorted(nx_policy.ALLOWED_IMPORT_ROOTS))
+    mods = {e.get("module") or "simplnx" for e in candidates}
+    imports = ["    import simplnx as nx"]
+    if "orientationanalysis" in mods:
+        imports.append("    import orientationanalysis as nxor")
+    if "itkimageprocessing" in mods:
+        imports.append("    import itkimageprocessing as nxitk")
+    imports.append("    import numpy as np          # only if you use numpy")
+    compound = _compound_lines(candidates, catalog)
+    compound_block = ("\n".join(compound) + "\n") if compound else ""
     return f"""You write DREAM3D-NX pipelines as Python, using the simplnx API.
 
 These filters were read from the package installed on this machine. Their
 parameter names, types and defaults are exact. Use only these, and call them
-exactly as shown.
+exactly as shown. Your script is checked against the installed package before
+it is accepted: a filter, parameter or attribute that does not exist, or a
+value of the wrong type, is sent back to you.
 
 AVAILABLE FILTERS
 {cat}
 
+THE SCRIPT STARTS WITH
+{chr(10).join(imports)}
+
+    ds = nx.DataStructure()
+
 HOW A FILTER IS CALLED
+A filter is a class; call its execute() directly. Never create a filter
+object and never set attributes on one: every parameter is a keyword argument
+of execute(), and data_structure=ds is always the first.
     result = nx.<FilterName>.execute(data_structure=ds, <param>=<value>, ...)
     assert not result.errors, result.errors
 
-TYPED VALUES (get these right — they are not plain strings)
-    a data path      -> nx.DataPath("Some/Path")
-    a numeric type   -> nx.NumericType.float32
+TYPED VALUES (get these right — the binding converts nothing)
+    a data path      -> nx.DataPath("Some/Path")       never a bare string
+    a numeric type   -> nx.NumericType.float32          never an int like 8
     a dream3d import -> nx.Dream3dImportParameter.ImportData(file_path="C:/x.dream3d")
     a file path      -> a plain string
-
+    an int           -> 3, never 3.0
+    a list[int] / list[float] / list[list[float]] -> exactly that nesting
+{compound_block}
 WRITING DATA INTO AN ARRAY (there is no zero-copy wrap; you must copy)
     view = ds[nx.DataPath("Values")].npview()
     view[:] = np.loadtxt("C:/data/in.csv", delimiter=",")
@@ -438,6 +617,31 @@ Reply with ONLY the Python, no prose, no code fence.
 """
 
 
+def script_repair_prompt(query: str, candidates: List[dict], code: str,
+                         errors: List[str], extra: List[dict],
+                         catalog: Optional[dict] = None) -> str:
+    """The script, the exact faults, and the real signatures of the filters
+    the faults point at — the ones the model reached for and the nearest
+    real ones to what it invented — ahead of the original request."""
+    enums = (catalog or {}).get("enums")
+    shown = list(errors[:25])
+    if len(errors) > 25:
+        shown.append(f"... and {len(errors) - 25} more")
+    have = {e.get("uuid") for e in candidates}
+    more = [e for e in extra if e.get("uuid") not in have][:4]
+    ref = ""
+    if more:
+        ref = ("\nREAL FILTERS THE ERRORS POINT AT (exact signatures)\n"
+               + "\n".join(describe_filter(e, enums) for e in more) + "\n")
+    return (f"Your script was checked against the DREAM3D-NX package "
+            f"installed on this machine and refused.\n\n"
+            f"YOUR SCRIPT\n{(code or '')[:3000]}\n\n"
+            f"WHAT IS WRONG\n"
+            f"{chr(10).join('- ' + e for e in shown)}\n{ref}\n"
+            f"{build_script_prompt(query, candidates, catalog)}"
+            f"Fix every point above. Reply with ONLY the corrected Python.")
+
+
 def extract_code(text: str) -> str:
     """The Python out of a model reply, tolerating a code fence."""
     if not text:
@@ -451,7 +655,10 @@ def extract_code(text: str) -> str:
 
 def _fit_candidates_to_ctx(query: str, candidates: List[dict],
                            n_ctx: Optional[int], *,
-                           num_predict: int = 900) -> List[dict]:
+                           num_predict: int = 900,
+                           catalog: Optional[dict] = None,
+                           build: Optional[Callable[[List[dict]], str]] = None
+                           ) -> List[dict]:
     """Drop the lowest-ranked filters until the prompt fits the model's window.
 
     The generation prompt lists every retrieved filter with its full signature
@@ -467,12 +674,21 @@ def _fit_candidates_to_ctx(query: str, candidates: List[dict],
     single most relevant filter is always kept, because a shorter shortlist is
     recoverable but an empty one is not. Conservative on chars-per-token (3.2,
     not the clamp's optimistic 4.0) because filter text is dense with
-    identifiers and punctuation, which tokenizes finer than prose."""
+    identifiers and punctuation, which tokenizes finer than prose. (Measured
+    2026-10-06 over 23 real llama3.1:8b prompts: 3.36-3.55 chars per token,
+    so 3.2 over-budgets by 5-10% — safe.)
+
+    ``build`` renders the prompt for a given shortlist (default: the first
+    request); the repair round passes its own, which also carries the
+    previous script and the errors."""
     if not n_ctx or n_ctx <= 0 or len(candidates) <= 1:
         return candidates
+    if build is None:
+        def build(cur):
+            return build_script_prompt(query, cur, catalog)
     budget_chars = int(max(256, n_ctx - num_predict - 256) * 3.2)
     cur = list(candidates)
-    while len(cur) > 1 and len(build_script_prompt(query, cur)) > budget_chars:
+    while len(cur) > 1 and len(build(cur)) > budget_chars:
         cur = cur[:-1]          # retrieve() ranked best-first, so drop the tail
     return cur
 
@@ -489,9 +705,20 @@ def write_script(query: str, catalog: dict, model_fn: Callable[[str], str], *,
 
     It is grounded, not trusted. The prompt carries the REAL signatures of the
     retrieved filters (from the installed binary, so the model is not recalling
-    an API), and the result is gated by nx_policy.validate_script before this
-    app would run it — the same shape as vault_analyst.validate_generated_code,
-    which already gates every model-authored tool here.
+    an API), and the result passes two gates before `ok`:
+
+      * nx_policy.validate_script — may the app run it at all (the same shape
+        as vault_analyst.validate_generated_code, which gates every
+        model-authored tool here);
+      * nx_ground.check_script — does every nx.<Filter> exist in the
+        installed catalog, is every execute() keyword a real parameter of that
+        filter, and is every value the source states of the type the catalog
+        gives. This was missing: a call to nx.TotallyMadeUpFilter with a bogus
+        keyword was ok=True, and with llama3.1:8b 12 of 12 accepted scripts
+        failed to run.
+
+    A refused script goes back to the model with the exact faults, the
+    nearest real names, and the signatures of the real filters it reached for.
 
     The gate is on EXECUTION, not on authorship: the script is returned either
     way, and a user reading and running it themselves is their call. `ok` says
@@ -499,6 +726,7 @@ def write_script(query: str, catalog: dict, model_fn: Callable[[str], str], *,
 
     Returns {"ok", "code", "errors", "attempts", "candidates", "raw"}.
     """
+    import nx_ground
     candidates = retrieve(catalog, query, k=k)
     if not candidates:
         return {"ok": False, "code": None, "attempts": 0, "candidates": [],
@@ -506,23 +734,32 @@ def write_script(query: str, catalog: dict, model_fn: Callable[[str], str], *,
                            "request."]}
     # Size the shortlist to the model's window so the prompt is never silently
     # trimmed mid-list. No-op when n_ctx is ample or unknown.
-    candidates = _fit_candidates_to_ctx(query, candidates, n_ctx)
-    prompt = build_script_prompt(query, candidates)
+    candidates = _fit_candidates_to_ctx(query, candidates, n_ctx,
+                                        catalog=catalog)
+    prompt = build_script_prompt(query, candidates, catalog)
     errors: List[str] = []
     code = ""
+    raw = ""
     for attempt in range(1, max_attempts + 1):
         raw = model_fn(prompt) or ""
         code = extract_code(raw)
         ok, errors = nx_policy.validate_script(code)
-        if ok:
+        grounded = nx_ground.check_script(code, catalog)
+        errors = list(errors) + [e for e in grounded["errors"]
+                                 if e not in errors]
+        if not errors:
             return {"ok": True, "code": code, "errors": [],
                     "attempts": attempt,
                     "candidates": [c["uuid"] for c in candidates], "raw": raw}
         if attempt < max_attempts:
-            prompt = (f"Your script was refused:\n"
-                      f"{chr(10).join('- ' + e for e in errors)}\n\n"
-                      f"{build_script_prompt(query, candidates)}"
-                      f"Fix every point above. Reply with ONLY the Python.")
+            extra = grounded["suggest"]
+
+            def _repair(cur, _code=code, _errors=errors, _extra=extra):
+                return script_repair_prompt(query, cur, _code, _errors,
+                                            _extra, catalog)
+            fitted = _fit_candidates_to_ctx(query, candidates, n_ctx,
+                                            catalog=catalog, build=_repair)
+            prompt = _repair(fitted)
     return {"ok": False, "code": code, "errors": errors,
             "attempts": max_attempts,
-            "candidates": [c["uuid"] for c in candidates]}
+            "candidates": [c["uuid"] for c in candidates], "raw": raw}

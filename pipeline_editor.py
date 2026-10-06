@@ -454,70 +454,77 @@ Plain-English description:"""
 # Pipeline generation from a natural-language description
 # ============================================================
 
-_PIPELINE_GEN_PROMPT = """You are writing a Dream3D / simplnx Python
-pipeline from a user request. Output ONLY Python code — no markdown
-fences, no commentary outside the code.
-
-User request:
-{request}
-
-Required structure:
-  - import simplnx as nx
-  - create one DataStructure
-  - one or more nx.<Filter>.execute(...) calls
-  - check result.valid() after each filter
-  - save final state with nx.WriteDREAM3DFilter if the user wants output
-
-Use the simplnx API patterns you know. Be precise with parameter names
-(snake_case) and DataPath usage. The script must be self-contained and
-runnable.
-
-Now write the pipeline. Output only code."""
-
-
 def generate_pipeline_from_description(
     description: str,
     vault_dir: Path,
     *,
     suggested_name: Optional[str] = None,
     num_predict: int = 1200,
+    model_call: Optional[Any] = None,
+    catalog: Optional[dict] = None,
 ) -> Tuple[Optional[Path], str]:
     """Ask the model to write a brand-new pipeline. Saves to
     vault/pipelines/in/<name>.py and returns (path, generation_log).
 
-    The generation log surfaces any problem (model unreachable, code
-    syntax error, etc.) so the GUI can show a helpful failure message.
+    The generation log surfaces any problem (model unreachable, no catalog,
+    a script that was refused, etc.) so the GUI can show a helpful failure
+    message.
+
+    This goes through nx_generate.write_script — the same grounded, gated
+    path as the Dream3D tab's "Write pipeline". It used to be a second,
+    ungated model-writes-Python path: its own prompt ("use the simplnx API
+    patterns you know"), no catalog, and only an ast.parse check, saving
+    straight into pipelines/in — the folder the workflow runner executes. A
+    reply naming ExecuteProcessFilter was saved there. Now a script is saved
+    only when nx_policy and nx_ground both pass it.
     """
-    import council_engine as ce
     from pipeline_scanner import vault_pipelines_in_dir
 
     if not (description or "").strip():
         return None, "empty request"
 
-    prompt = _PIPELINE_GEN_PROMPT.format(request=description.strip())
+    if catalog is None:
+        try:
+            from council_core import nx_ops
+            catalog = nx_ops.catalog(vault_dir)
+        except Exception as exc:
+            return None, ("the DREAM3D-NX filter catalog is unavailable, and a "
+                          "pipeline is only written against the installed "
+                          f"package ({exc}). Run 'Check env' in the Dream3D "
+                          "tab.")
+    if model_call is None:
+        import council_engine as ce
+
+        def model_call(prompt: str) -> str:
+            return ce.local_chat(
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.10,
+                num_predict=num_predict,
+                timeout=240,
+            )
     try:
-        raw = ce.local_chat(
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.10,
-            num_predict=num_predict,
-            timeout=240,
-        )
+        from council_core import nx_ops as _ops
+        n_ctx = _ops._n_ctx()
+    except Exception:
+        n_ctx = None
+
+    import nx_generate
+    try:
+        res = nx_generate.write_script(description.strip(), catalog,
+                                       model_call, n_ctx=n_ctx)
     except Exception as exc:
         return None, f"model call failed: {exc!r}"
-
-    # extract_python_code lives in vault_analyst — was used here without an
-    # import, so this line raised NameError whenever the model returned
-    # output (the whole pipeline-edit feature was dead). Import lazily to
-    # avoid pulling pandas at module load.
-    from vault_analyst import extract_python_code
-    code = extract_python_code(raw or "")
-    if not code.strip():
-        return None, "model returned empty output"
-
-    try:
-        ast.parse(code)
-    except SyntaxError as exc:
-        return None, f"generated code has syntax error: {exc.msg} at line {exc.lineno}"
+    code = res.get("code") or ""
+    if not res.get("ok"):
+        if not code.strip():
+            return None, ("; ".join(res.get("errors") or [])
+                          or "model returned empty output")
+        errs = res.get("errors") or []
+        return None, ("the generated script was refused, so it was not "
+                      "saved to pipelines/in:\n  - "
+                      + "\n  - ".join(errs[:8])
+                      + (f"\n  ... and {len(errs) - 8} more"
+                         if len(errs) > 8 else ""))
 
     # Build a non-clobbering filename
     base = safe_suffix(suggested_name or "generated_pipeline", max_len=50)
@@ -529,6 +536,19 @@ def generate_pipeline_from_description(
         n += 1
     target.write_text(code, encoding="utf-8")
     return target, f"ok: {target.relative_to(vault_dir) if vault_dir in target.parents else target}"
+
+
+def _new_policy_reasons(before: str, after: str) -> List[str]:
+    """nx_policy.validate_script reasons ``after`` has that ``before`` did
+    not (compared without their line numbers, which an edit shifts)."""
+    import re as _re
+    import nx_policy
+
+    def strip(r: str) -> str:
+        return _re.sub(r"^line \d+: ", "", r)
+    old = {strip(r) for r in nx_policy.validate_script(before)[1]}
+    return [r for r in nx_policy.validate_script(after)[1]
+            if strip(r) not in old]
 
 
 @dataclass
@@ -602,6 +622,19 @@ def modify_pipeline_by_request(
             success=False, pipeline=pipeline, source_path=pipeline_path,
             new_path=None, edits=edits, log=result.log,
             error=result.error,
+        )
+
+    # The model's edits are model-written code too. What the user's own
+    # script already does is theirs; what an edit ADDS must pass the same
+    # gate as a generated script (nx_policy) — or a "modify" could splice
+    # an Execute Process call into a pipeline the workflow runner then runs.
+    added = _new_policy_reasons(source, result.new_source)
+    if added:
+        return ModifyResult(
+            success=False, pipeline=pipeline, source_path=pipeline_path,
+            new_path=None, edits=edits, log=result.log,
+            error=("the edit was refused — it adds what a pipeline may not "
+                   "do:\n  " + "\n  ".join(added[:6])),
         )
 
     new_path = save_modified_pipeline(

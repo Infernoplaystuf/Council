@@ -27,11 +27,19 @@ and turns a fragment into something runnable.
 WHY SIGNATURES ARE EXTRACTED HERE TOO
 -------------------------------------
 A signature is a fill-in-the-blanks template: the call structure is fixed and
-only the argument VALUES vary. That is exactly how nx_transpile already renders
-DREAM3D filters from nx_introspect's parsed signatures — the model never writes
-the call, it supplies arguments that are checked against the real parameter
-list. Generalising that to arbitrary Python needs the function's parameters,
-their annotations and their defaults, which this walk already has in hand.
+only the argument VALUES vary. nx_transpile works that way for DREAM3D: it
+renders each call of a SAVED .d3dpipeline from nx_introspect's parsed
+signatures, dropping (with a warning) any argument key the installed filter
+does not have and typing each value from the catalog — but no model is
+involved there. Where a model IS involved (nx_generate.write_script, the
+Dream3D tab's "Write pipeline"), the model writes the calls itself, and
+nx_ground.check_script checks them afterwards: every filter name, every
+keyword and every value type the source states, against the catalog. An
+earlier version of this paragraph said the model "never writes the call" and
+that its arguments were "checked against the real parameter list"; neither was
+true of the path the app ships. Generalising either approach to arbitrary
+Python needs the function's parameters, their annotations and their defaults,
+which this walk already has in hand.
 
 Python is parsed properly with ast. Other languages fall back to a brace/blank
 line heuristic, and anything unparseable returns None so the caller can use its
@@ -80,9 +88,10 @@ class Signature:
 
     This is the mad-libs record: `name` and `params` are fixed by the source,
     and a caller supplies only the argument values — which can then be checked
-    back against `params` before anything is emitted, the same way
-    nx_generate.validate checks every emitted arg key against the installed
-    filter catalogue."""
+    back against `params` before anything is emitted, as nx_ground.check_script
+    checks a model-written DREAM3D script's keywords and value types against
+    the installed filter catalogue. (Nothing in this module does that check
+    yet: render_call only renders.)"""
     name: str
     qualname: str
     kind: str                  # function | method | class

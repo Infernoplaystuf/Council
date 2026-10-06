@@ -72,6 +72,29 @@ DENIED_CLASS_NAMES = frozenset({
     "ExecuteProcessFilter", "CreatePythonSkeletonFilter",
 })
 
+# Ways to reach a filter WITHOUT naming its class, which the class-name list
+# above cannot see. Measured on the installed build: nx.get_filters() returns
+# all 154 simplnx filter classes, ExecuteProcessFilter and
+# CreatePythonSkeletonFilter among them, so `nx.get_filters()[i].execute(...)`
+# reached the shell past every check here. A saved pipeline (Pipeline.from_file,
+# or one assembled with Pipeline.append) can hold either filter too, and the
+# plugin loaders load Python. A pipeline script needs none of them — filters
+# are called by name — so a script may not touch them at all. (nx_worker runs
+# a SAVED pipeline itself and checks every step's uuid before anything runs.)
+FILTER_ROUTE_NAMES = frozenset({
+    "get_filters", "get_python_filter_ids", "get_python_plugins",
+    "load_python_plugin", "reload_python_plugins", "unload_python_plugins",
+    "PythonPlugin", "AbstractPlugin", "ManualImportFinder",
+    "Pipeline", "PipelineFilter", "AbstractPipelineNode", "test_filter",
+})
+
+# numpy is allowed for the array copy, and two corners of it run native code
+# or unpickle (= run) arbitrary objects: ctypeslib.load_library loads a DLL,
+# and np.load(..., allow_pickle=True) executes whatever the file says.
+NATIVE_CODE_NAMES = frozenset({"ctypeslib", "load_library", "f2py",
+                               "distutils"})
+DENIED_KWARGS = frozenset({"allow_pickle"})
+
 # Attribute-based escapes: __globals__ -> builtins -> anything.
 _DUNDER_OK = frozenset({"__init__", "__name__", "__file__", "__doc__"})
 
@@ -112,10 +135,13 @@ def validate_script(code: str) -> Tuple[bool, List[str]]:
     The model is free to write real Python here — execute() lines, numpy glue,
     the npview[:] = np.loadtxt(...) copy the spec requires, loops over files.
     What it may not do is reach outside that: no shell, no filesystem module,
-    no dynamic attribute lookup, and none of the two filters whose capability
-    is arbitrary code execution.
+    no dynamic attribute lookup, none of the two filters whose capability is
+    arbitrary code execution, and none of the routes that reach a filter
+    without naming it (FILTER_ROUTE_NAMES).
+
+    This is about permission, not correctness: whether the filters and
+    parameters the script names exist is nx_ground.check_script's job.
     """
-    reasons: List[str] = []
     if not (code or "").strip():
         return False, ["the script is empty"]
     try:
@@ -123,6 +149,9 @@ def validate_script(code: str) -> Tuple[bool, List[str]]:
     except SyntaxError as exc:
         return False, [f"syntax error: {exc}"]
 
+    # The capability rule first: the same check workflow_runner applies to
+    # every script it runs, whoever wrote it.
+    reasons: List[str] = _capability_reasons(tree)
     for node in ast.walk(tree):
         # ---- imports: allowlist ---------------------------------------
         if isinstance(node, ast.Import):
@@ -133,22 +162,20 @@ def validate_script(code: str) -> Tuple[bool, List[str]]:
                         f"line {node.lineno}: import {a.name!r} is not "
                         f"allowed. Allowed: "
                         f"{', '.join(sorted(ALLOWED_IMPORT_ROOTS))}")
+                elif set(a.name.split(".")) & NATIVE_CODE_NAMES:
+                    reasons.append(f"line {node.lineno}: import {a.name!r} "
+                                   f"is not allowed (it loads native code)")
         elif isinstance(node, ast.ImportFrom):
             root = (node.module or "").split(".")[0]
             if node.level or root not in ALLOWED_IMPORT_ROOTS:
                 reasons.append(
                     f"line {node.lineno}: from {node.module!r} import ... is "
                     f"not allowed")
-            # The imported NAME matters, not just the module. simplnx is
-            # allowed, so `from simplnx import ExecuteProcessFilter as EP`
-            # passed the module check, and `EP.execute(...)` never mentions the
-            # denied class at the call site — the alias walked the shell
-            # straight through a denylist that only ever saw call sites.
             for a in node.names:
-                if a.name in DENIED_CLASS_NAMES:
-                    reasons.append(
-                        f"line {node.lineno}: importing {a.name} is refused — "
-                        f"{reason_for_class(a.name)}")
+                if a.name in NATIVE_CODE_NAMES or set(
+                        (node.module or "").split(".")) & NATIVE_CODE_NAMES:
+                    reasons.append(f"line {node.lineno}: importing {a.name} "
+                                   f"is not allowed (it loads native code)")
         # ---- calls ------------------------------------------------------
         elif isinstance(node, ast.Call):
             fn = node.func
@@ -159,25 +186,90 @@ def validate_script(code: str) -> Tuple[bool, List[str]]:
                 name = fn.attr
             if name in DENIED_CALLS:
                 reasons.append(f"line {node.lineno}: {name}() is not allowed")
-            if name in DENIED_CLASS_NAMES:
-                reasons.append(
-                    f"line {node.lineno}: {name} is refused — "
-                    f"{reason_for_class(name)}")
+            for kw in node.keywords:
+                if kw.arg in DENIED_KWARGS and not (
+                        isinstance(kw.value, ast.Constant)
+                        and kw.value.value is False):
+                    reasons.append(
+                        f"line {node.lineno}: {kw.arg}= is not allowed "
+                        f"(unpickling a file runs whatever code it holds)")
         # ---- attributes -------------------------------------------------
         elif isinstance(node, ast.Attribute):
-            if node.attr in DENIED_CLASS_NAMES:
-                reasons.append(
-                    f"line {node.lineno}: {node.attr} is refused — "
-                    f"{reason_for_class(node.attr)}")
+            if node.attr in NATIVE_CODE_NAMES:
+                reasons.append(f"line {node.lineno}: {node.attr} is not "
+                               f"allowed (it loads native code)")
             elif (node.attr.startswith("__") and node.attr.endswith("__")
                     and node.attr not in _DUNDER_OK):
                 reasons.append(
                     f"line {node.lineno}: {node.attr} is not allowed "
                     f"(dunder access reaches the interpreter)")
-        elif isinstance(node, ast.Name) and node.id in DENIED_CLASS_NAMES:
-            reasons.append(f"line {node.lineno}: {node.id} is refused — "
-                           f"{reason_for_class(node.id)}")
     return (not reasons), reasons
+
+
+def _capability_reasons(tree: ast.AST) -> List[str]:
+    """Every place ``tree`` names a denied filter, or a route that reaches a
+    filter without naming it (FILTER_ROUTE_NAMES), or carries a denied
+    filter's uuid as text."""
+    reasons: List[str] = []
+    seen = set()
+
+    def add(node, text: str) -> None:
+        key = (getattr(node, "lineno", 0), text)
+        if key not in seen:
+            seen.add(key)
+            reasons.append(f"line {key[0]}: {text}")
+
+    def name_hit(node, name: str, verb: str = "") -> None:
+        if name in DENIED_CLASS_NAMES:
+            add(node, f"{verb}{name} is refused — {reason_for_class(name)}")
+        elif name in FILTER_ROUTE_NAMES:
+            add(node, f"{verb}{name} is not allowed: it reaches filters "
+                      f"without naming them (a filter list, a saved "
+                      f"pipeline or a plugin loader), so this check could "
+                      f"not see what it runs. Call each filter by name: "
+                      f"nx.<Filter>.execute(data_structure=ds, ...)")
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            # The imported NAME matters, not just the module. simplnx is
+            # allowed, so `from simplnx import ExecuteProcessFilter as EP`
+            # passed the module check, and `EP.execute(...)` never mentions
+            # the denied class at the call site — the alias walked the shell
+            # straight through a denylist that only ever saw call sites.
+            for a in node.names:
+                name_hit(node, a.name, "importing ")
+        elif isinstance(node, ast.Attribute):
+            name_hit(node, node.attr)
+        elif isinstance(node, ast.Name):
+            name_hit(node, node.id)
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            for uuid in DENIED_UUIDS:
+                if uuid in node.value.lower():
+                    add(node, f"the text names a refused filter's uuid "
+                              f"({uuid}) — {DENIED_UUIDS[uuid]}")
+    return reasons
+
+
+def capability_reasons(code: str) -> List[str]:
+    """Why the app must not run ``code`` at all, whoever wrote it — [] if it
+    may.
+
+    The run-end check for scripts (workflow_runner), the counterpart of
+    nx_worker._check_capability for saved pipelines: a denied filter by class
+    name, a route to filters that hides which one runs, a denied uuid in the
+    text. It is NOT validate_script: a script the user put in their pipelines
+    folder may import what it likes — that is their call — but no script the
+    app runs reaches Execute Process.
+
+    A script that does not parse here is refused too: this interpreter may be
+    older than the one that runs it (3.11 vs the nx env's 3.12), and a script
+    this check cannot read is one it cannot vouch for."""
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError as exc:
+        return [f"the script could not be checked (syntax error here: "
+                f"{exc.msg}, line {exc.lineno})"]
+    return _capability_reasons(tree)
 
 
 def reason_for_class(class_name: str) -> str:
