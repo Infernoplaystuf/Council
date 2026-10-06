@@ -4843,13 +4843,11 @@ class CouncilConsole(tk.Tk):
             os.environ["COUNCIL_GGUF_PATH"] = str(data["gguf_path"])
         # Apply persisted engine knobs (set from the Engine settings dialog)
         # to the environment, with the same "env always wins" precedence —
-        # a shell/launcher export overrides the saved value.
-        for _key, _env in (("n_ctx", "COUNCIL_GGUF_N_CTX"),
-                           ("gpu_layers", "COUNCIL_GGUF_GPU_LAYERS"),
-                           ("embed_device", "COUNCIL_EMBED_DEVICE")):
-            _val = data.get(_key)
-            if _val not in (None, "") and not os.environ.get(_env, "").strip():
-                os.environ[_env] = str(_val)
+        # a shell/launcher export overrides the saved value. Through
+        # council_core.engine_settings, which the Qt launch calls too: the
+        # Qt app used to skip this, so a context size saved here was dropped.
+        from council_core import engine_settings as _engine_settings
+        _engine_settings.apply(data)
         return data
 
     def _save_backend_settings(self):

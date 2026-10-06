@@ -318,3 +318,75 @@ def test_the_vault_is_created_if_it_is_not_there(qapp, tmp_path):
     nothing made the directory is a worse first run than no vault at all."""
     build()
     assert (tmp_path / "vault").is_dir()
+
+
+# ============================================================
+# The saved engine settings
+# ============================================================
+
+ENGINE_VARS = ("COUNCIL_GGUF_N_CTX", "COUNCIL_GGUF_GPU_LAYERS",
+               "COUNCIL_EMBED_DEVICE")
+
+
+@pytest.fixture
+def engine_env(monkeypatch):
+    """The three engine variables unset for the test AND put back after it.
+    setenv first, so monkeypatch records the original state: delenv alone
+    records nothing for a variable that was absent, and whatever the launch
+    set would then leak into every later test."""
+    for var in ENGINE_VARS:
+        monkeypatch.setenv(var, "placeholder")
+        monkeypatch.delenv(var)
+
+
+def _engine_settings(tmp_path, **saved):
+    import json
+    vault = tmp_path / "vault"
+    vault.mkdir(parents=True, exist_ok=True)
+    (vault / "backend_settings.json").write_text(json.dumps(saved),
+                                                 encoding="utf-8")
+
+
+def test_the_engine_settings_saved_in_the_vault_are_applied(qapp, tmp_path,
+                                                            engine_env):
+    """A context size saved in Tk's Engine dialog was silently dropped by the
+    Qt app: the Tk console copies the saved knobs into the environment the
+    engine reads at model load, and the Qt launch never did."""
+    _engine_settings(tmp_path, n_ctx="16384", gpu_layers="20",
+                     embed_device="cuda")
+    build()
+    assert os.environ.get("COUNCIL_GGUF_N_CTX") == "16384"
+    assert os.environ.get("COUNCIL_GGUF_GPU_LAYERS") == "20"
+    assert os.environ.get("COUNCIL_EMBED_DEVICE") == "cuda"
+
+
+def test_an_exported_engine_setting_beats_the_saved_one(qapp, tmp_path,
+                                                        engine_env,
+                                                        monkeypatch):
+    """Tk's precedence, kept: a launch-time export is how a user gets out of
+    a saved setting that crashes the GPU."""
+    _engine_settings(tmp_path, n_ctx="16384", gpu_layers="20")
+    monkeypatch.setenv("COUNCIL_GGUF_GPU_LAYERS", "0")
+    build()
+    assert os.environ.get("COUNCIL_GGUF_GPU_LAYERS") == "0"
+    assert os.environ.get("COUNCIL_GGUF_N_CTX") == "16384"
+
+
+def test_a_blank_saved_setting_is_not_applied(qapp, tmp_path, engine_env):
+    """The Engine dialog saves "" for a field left blank."""
+    _engine_settings(tmp_path, n_ctx="", gpu_layers="", embed_device="")
+    build()
+    for var in ENGINE_VARS:
+        assert var not in os.environ, var
+
+
+def test_the_tk_console_applies_them_through_the_same_function():
+    """One rule for both front ends, so they cannot disagree about which
+    value wins."""
+    from tests.source_checks import code_of
+
+    source = (ROOT / "council_gui_engine.py").read_text(encoding="utf-8")
+    body = code_of(source, "_load_backend_settings")
+    assert "engine_settings.apply(" in body
+    assert "COUNCIL_GGUF_N_CTX" not in body, (
+        "the Tk console still applies the knobs with its own loop")

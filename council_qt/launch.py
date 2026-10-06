@@ -58,6 +58,9 @@ def build(argv: Optional[list] = None, *,
     # BEFORE the GUI exists, so a failure during construction is captured
     # rather than printed to a console the user may not have.
     _install_crash_hooks(vault)
+    # Before the window, and so before any tab can build personalities: the
+    # engine reads these when it loads a model.
+    _apply_engine_settings(vault)
 
     app = QApplication.instance() or QApplication(list(argv or sys.argv))
     theme.apply(app, "dark")
@@ -97,6 +100,15 @@ def _install_crash_hooks(vault) -> None:
         crash_reporter.install(paths.ensure(vault), on_crash=_report_crash)
     except Exception as exc:                             # noqa: BLE001
         print(f"[startup] crash hooks unavailable: {exc!r}", flush=True)
+
+
+def _apply_engine_settings(vault) -> None:
+    """The context size, GPU layers and embedding device saved in the vault,
+    into the environment the engine reads — what the Tk console does at
+    startup, through the same function. Never fatal (apply_saved never
+    raises): the app opens on the engine's defaults if it cannot."""
+    from council_core import engine_settings
+    engine_settings.apply_saved(vault, log=lambda m: print(m, flush=True))
 
 
 def _report_crash(crash_path) -> None:
