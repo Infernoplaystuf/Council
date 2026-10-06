@@ -141,9 +141,11 @@ class ClassifierPicker(QObject):
             self._dress(self.combo, TIP, PLACEHOLDER)
             self.combo.setItemDelegate(_RowDelegate(self.combo))
             self.combo.installEventFilter(self)
+            _activate_on_return(self.combo)
         if self.filter_box is not None:
             self._dress(self.filter_box, FILTER_TIP, "")
             self.filter_box.installEventFilter(self)
+            _activate_on_return(self.filter_box)
             # A filter picked, or typed and Return: the list follows it.
             self.filter_box.textActivated.connect(lambda *_: self.refresh())
         hook = getattr(folder, "on_change", None)
@@ -301,6 +303,30 @@ class ClassifierPicker(QObject):
 def _combobox(port: Any) -> Optional[QComboBox]:
     widget = getattr(port, "widget", None)
     return widget if isinstance(widget, QComboBox) else None
+
+
+def _activate_on_return(combo: QComboBox) -> None:
+    """Return on text that is not in the list "activates" it, as picking an
+    item does — so the box's link runs (open_classifier for a new model's
+    name, list_classifiers for a typed filter).
+
+    MEASURED (PySide6 6.10, offscreen, real key presses): an editable
+    QComboBox with NoInsert — which these are, so a typed name is never
+    added to the list as if it were a saved model — emits textActivated on
+    Return only for text that matches an item. A new model's name typed and
+    Return did nothing at all, and neither did part of a name typed into
+    Show. A listed name is left to Qt, which activates it itself, so it is
+    never said twice."""
+    line = combo.lineEdit() if combo.isEditable() else None
+    if line is None:
+        return
+
+    def typed() -> None:
+        text = combo.currentText().strip()
+        if text and combo.findText(text, Qt.MatchFlag.MatchFixedString) < 0:
+            combo.textActivated.emit(text)
+
+    line.returnPressed.connect(typed)
 
 
 def _opens(event: Any) -> bool:

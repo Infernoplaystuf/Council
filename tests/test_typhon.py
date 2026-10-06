@@ -807,10 +807,10 @@ def test_the_model_dropdown_end_to_end_in_a_built_typhon(
     frames = tmp_path / "run"
     names = _frames(frames)
 
-    # Create: a new name typed into the box (Return), then its classes.
-    combo.lineEdit().setText("birds")
-    combo.textActivated.emit("birds")
-    assert "'birds' is new" in _status(ui)
+    # Create: a new name typed into the box, Return, then its classes.
+    combo.lineEdit().clear()
+    _type_and_return(combo, "birds")
+    assert "'birds' is new" in _status(ui), _status(ui)
     for cls in ("good", "bad timing"):
         p.new_class.set(cls)
         ui.on_btn_add_class()
@@ -1045,6 +1045,34 @@ def test_the_filter_narrows_the_list(qapp):
     show.setEditText("night")
     show.textActivated.emit("night")
     assert library.listed[-1] == "night" and made.items() == ["night"]
+
+
+def _type_and_return(box, text):
+    """What the user does, key by key, into an editable box. To the BOX: it
+    is its line edit's focus proxy, so a real key press reaches the box and
+    the box hands it on — sent to the line edit itself, a Return reached it
+    twice (once there, once handed on by the box it went up to)."""
+    from PySide6.QtTest import QTest
+
+    box.lineEdit().clear()
+    QTest.keyClicks(box, text)
+    QTest.keyClick(box, Qt.Key.Key_Return)
+
+
+def test_return_on_a_typed_name_or_filter_acts_on_it_once(qapp):
+    """MEASURED with real key presses: with NoInsert (a typed name must not
+    join the list as if it were a saved model) Qt activates only text that
+    matches an item — a new model's name typed and Return, or part of a
+    name typed into Show and Return, did nothing at all. Now each is acted
+    on once; a listed name is still activated by Qt alone, never twice."""
+    made, model, show, library, *_ , activated = _picker(qapp)
+    _type_and_return(model, "birds")
+    assert activated == ["birds"], "a new name typed and Return was ignored"
+    _type_and_return(model, "night")
+    assert activated == ["birds", "night"], "a listed name, said once"
+    assert made.items() == ["frames", "night"], "a typed name joined the list"
+    _type_and_return(show, "nig")
+    assert library.listed[-1] == "nig" and made.items() == ["night"]
 
 
 def test_a_name_being_typed_survives_a_refill(qapp):
