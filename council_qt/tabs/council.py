@@ -62,6 +62,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QFileDialog, QFrame,
                                QTextEdit, QVBoxLayout, QWidget)
 
 from council_core import council_options
+from council_core import council_turn
 from council_core import paths
 from council_core import transcript as transcript_core
 
@@ -100,12 +101,11 @@ PER_TURN_FIELDS = (
 #: which batch wires each; its line in _label_unavailable goes when it is.
 NOT_AVAILABLE = "{what} — not available in this build yet."
 
-#: Speakers the "▶ who" label names. The orchestrator's phase markers name a
-#: role ("▶ Writer — drafting answer") or a stage ("▶ Round 1/2 — …"); only
-#: the first kind is an active personality.
-_SPEAKERS = frozenset({"Writer", "Peasant", "Intern", "Coder", "Artist",
-                       "Skeptic", "Sage", "Strategist", "Content", "Director",
-                       "Judge"})
+#: Speakers the "▶ who" label names: the personalities' display names, from
+#: the one table the transcript uses, and the Judge. The orchestrator's phase
+#: markers name a role ("▶ Writer — drafting answer") or a stage ("▶ Round
+#: 1/2 — …"); only the first kind is an active personality.
+_SPEAKERS = frozenset(council_turn.AGENT_NAMES.values()) | {"Judge"}
 
 
 class CouncilActions:
@@ -441,9 +441,10 @@ class CouncilTab(ViewHelpers, QWidget):
         self._button(row, "Clear", self.on_clear_input)
         self.defer_btn = self._button(row, amp("⤓ Defer to Vault"),
                                       self.on_defer_to_vault)
-        # Enabled only after a fast answer — re-asks the SAME question through
-        # the full council. A4: its enabled state is per-turn and is reset in
-        # reset_turn() with everything else.
+        # Meant to re-ask the last FAST question through the full council
+        # (A4: per-turn state, reset in reset_turn()). Disabled and labelled
+        # in _label_unavailable until a turn can be sent to the full council
+        # on request — see finish_turn.
         self.expand_btn = self._button(row, amp("⤢ Expand with council"),
                                        self.on_expand_with_council)
         self.expand_btn.setEnabled(False)
@@ -798,7 +799,6 @@ class CouncilTab(ViewHelpers, QWidget):
         rate, seq = stats.get("gen_tok_s"), stats.get("seq")
         if not rate or seq is None or seq <= (self._turn_stats_floor or 0):
             return
-        from council_core import council_turn
         role = str(stats.get("role") or "")
         name = council_turn.AGENT_NAMES.get(role, role.title() or "Model")
         rates = dict(self._turn_rates or {})
