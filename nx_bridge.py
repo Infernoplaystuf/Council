@@ -46,7 +46,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 NX_ENV = os.environ.get("COUNCIL_NX_ENV", "nxpython")
 WORKER = Path(__file__).resolve().parent / "nx_worker.py"
@@ -155,8 +155,16 @@ def catalog(*, env: str = NX_ENV, timeout: int = 900) -> Dict[str, Any]:
     (catalog_stale_reason says when: the result carries the env fingerprint
     it was built from)."""
     cat = run_job({"action": "catalog"}, env=env, timeout=timeout)
-    if isinstance(cat, dict):
-        cat["env"] = env_fingerprint(env)
+    # An interpreter without simplnx (COUNCIL_NX_PYTHON at the wrong python)
+    # still answers: 0 filters, every module in modules_missing. That was
+    # saved over the good cache and served — transpile "succeeded" with every
+    # step commented out. Refuse it, and say why.
+    why = catalog_unusable_reason(cat)
+    if why:
+        raise NxError(f"The DREAM3D-NX filter catalog could not be built: "
+                      f"{why}. Point COUNCIL_NX_PYTHON at the nx env's "
+                      f"python (found: {find_python(env) or 'none'}).")
+    cat["env"] = env_fingerprint(env)
     return cat
 
 
@@ -205,6 +213,41 @@ def env_fingerprint(env: str = NX_ENV) -> Optional[Dict[str, Any]]:
     return fp
 
 
+def catalog_unusable_reason(cat: Any) -> Optional[str]:
+    """Why a catalog cannot be used at all (simplnx itself did not import,
+    or it lists no filters), or None. A fresh one like that is refused, not
+    saved; a cached one is stale."""
+    if not isinstance(cat, dict):
+        return "the nx worker returned no catalog"
+    for m in cat.get("modules_missing") or []:
+        if isinstance(m, dict) and m.get("module") == "simplnx":
+            py = str(cat.get("python") or "?").split()[0]
+            return (f"simplnx did not import in that interpreter (python "
+                    f"{py}): {m.get('error')}")
+    if not cat.get("filters"):
+        return "it lists no filters"
+    return None
+
+
+def plugin_import_failures(cat: Any) -> List[Tuple[str, str]]:
+    """[(module, error)] for each plugin that is INSTALLED but did not import
+    when ``cat`` was built. "No module named '<that module>'" means it is not
+    installed (this build has no simplnxreview) — not a failure; anything
+    else (a DLL that would not load, a dependency missing) is."""
+    out: List[Tuple[str, str]] = []
+    if not isinstance(cat, dict):
+        return out
+    for m in cat.get("modules_missing") or []:
+        if not isinstance(m, dict):
+            continue
+        mod, err = str(m.get("module") or ""), str(m.get("error") or "")
+        if mod == "simplnx" or err.startswith(
+                f"ModuleNotFoundError: No module named '{mod}'"):
+            continue
+        out.append((mod, err))
+    return out
+
+
 def catalog_stale_reason(cat: Any, *, env: str = NX_ENV,
                          fingerprint: Any = "probe") -> Optional[str]:
     """Why a cached catalog no longer describes the installed env, or None.
@@ -228,6 +271,18 @@ def catalog_stale_reason(cat: Any, *, env: str = NX_ENV,
     if schema < CATALOG_SCHEMA:
         return (f"it was built by an older version of this app (schema "
                 f"{schema}, now {CATALOG_SCHEMA})")
+    why = catalog_unusable_reason(cat)
+    if why:
+        return why
+    # A plugin that failed to import when the catalog was built: its filters
+    # are missing from it, and nothing about the fingerprint changes when the
+    # import starts working again — so it was served for good. Rebuilt on
+    # every use until the plugin imports (check_env shows the error).
+    failed = plugin_import_failures(cat)
+    if failed:
+        mod, err = failed[0]
+        return (f"it was built while {mod} failed to import ({err[:160]}), so "
+                f"{mod}'s filters are missing from it")
     fp = env_fingerprint(env) if fingerprint == "probe" else fingerprint
     if not fp:
         return None

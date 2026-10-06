@@ -694,6 +694,114 @@ def test_the_saved_catalog_is_rebuilt_when_the_env_changed(tmp_path,
         nx_ops.invalidate_catalog(vault)
 
 
+_NO_SIMPLNX = [{"module": m, "error": f"ModuleNotFoundError: No module named '{m}'"}
+               for m in ("simplnx", "orientationanalysis", "itkimageprocessing")]
+
+
+def test_a_catalog_built_without_simplnx_is_refused(monkeypatch):
+    """COUNCIL_NX_PYTHON at an interpreter without simplnx: the worker
+    returns 0 filters with every module in modules_missing, and that was
+    saved over the good cache and served."""
+    monkeypatch.setattr(nx_bridge, "run_job", lambda *a, **k: {
+        "catalog_schema": 2, "python": "3.11.14 (main)", "filters": [],
+        "modules_loaded": [], "modules_missing": _NO_SIMPLNX})
+    with pytest.raises(nx_bridge.NxError, match="simplnx did not import"):
+        nx_bridge.catalog()
+
+
+def test_a_failed_rebuild_keeps_the_saved_catalog_and_says_why(tmp_path,
+                                                               monkeypatch):
+    from types import SimpleNamespace
+    from council_core import nx_ops
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(vault))
+    bad = {"catalog_schema": 2, "python": "3.11.14 (main)", "filters": [],
+           "modules_loaded": [], "modules_missing": _NO_SIMPLNX,
+           "env": {"python_exe": "C:/council/python.exe", "packages": {}}}
+
+    class Bridge:                     # what the real bridge returned
+        def catalog(self):
+            return json.loads(json.dumps(bad))
+
+        def catalog_stale_reason(self, cat):
+            return "it was built in python 3.12.13, and the nx env now has " \
+                   "python 3.11.14"
+
+        def transpile(self, *_a, **_k):
+            raise AssertionError("must not transpile against no catalog")
+    try:
+        path = nx_ops.safe_out_path(vault, nx_ops.CATALOG_FILE)
+        saved = json.dumps(_cat(filters=[{"uuid": "good"}]))
+        path.write_text(saved, encoding="utf-8")
+        with pytest.raises(nx_bridge.NxError, match="simplnx did not import"):
+            nx_ops.catalog(vault, bridge=Bridge())
+        assert path.read_text(encoding="utf-8") == saved     # not overwritten
+        pl = SimpleNamespace(path=str(tmp_path / "p.d3dpipeline"),
+                             name="p.d3dpipeline")
+        r = nx_ops.transpile(pl, vault, bridge=Bridge())
+        assert not r.ok and r.status == "nx: failed"
+        assert "simplnx did not import" in r.body
+        r = nx_ops.write_script("make a geometry", vault, bridge=Bridge(),
+                                model_call=lambda _p: "")
+        assert not r.ok and "simplnx did not import" in r.body
+    finally:
+        nx_ops.invalidate_catalog(vault)
+
+
+@pytest.mark.parametrize("missing, stale", [
+    # installed, but its import failed when the catalog was built
+    ([{"module": "itkimageprocessing",
+       "error": "ImportError: DLL load failed while importing "
+                "itkimageprocessing"}], "itkimageprocessing"),
+    ([{"module": "orientationanalysis",
+       "error": "ModuleNotFoundError: No module named 'numpy'"}],
+     "orientationanalysis"),
+    # simply not installed (this build has no simplnxreview): still good
+    ([{"module": "simplnxreview",
+       "error": "ModuleNotFoundError: No module named 'simplnxreview'"}], None),
+])
+def test_a_catalog_built_while_a_plugin_failed_to_import_is_stale(missing,
+                                                                  stale):
+    """Staleness was the fingerprint alone: a catalog saved while one
+    plugin failed to import was served for good (207 filters, and a real
+    ITKImageReaderFilter call refused as not installed)."""
+    reason = nx_bridge.catalog_stale_reason(_cat(modules_missing=missing),
+                                            fingerprint=FP)
+    if stale is None:
+        assert reason is None
+    else:
+        assert reason and stale in reason, reason
+
+
+def test_a_catalog_built_by_the_wrong_interpreter_is_refused_for_real(
+        tmp_path, monkeypatch):
+    """The review's case, with a real subprocess: COUNCIL_NX_PYTHON at the
+    app's own interpreter (no simplnx). Transpile reported 'nx: transpiled'
+    with every step commented out, and the saved catalog became empty."""
+    from types import SimpleNamespace
+    from council_core import nx_ops
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(vault))
+    monkeypatch.setenv("COUNCIL_NX_PYTHON", sys.executable)
+    try:
+        path = nx_ops.safe_out_path(vault, nx_ops.CATALOG_FILE)
+        saved = json.dumps(_cat(filters=[{"uuid": "good"}]))
+        path.write_text(saved, encoding="utf-8")
+        src = tmp_path / "p.d3dpipeline"
+        src.write_text(json.dumps({"pipeline": [
+            {"filter": {"uuid": CREATE_DATA_ARRAY}, "args": {}}]}),
+            encoding="utf-8")
+        r = nx_ops.transpile(SimpleNamespace(path=str(src),
+                                             name="p.d3dpipeline"), vault)
+        assert not r.ok and r.status == "nx: failed", (r.status, r.body)
+        assert "simplnx did not import" in r.body
+        assert path.read_text(encoding="utf-8") == saved
+    finally:
+        nx_ops.invalidate_catalog(vault)
+
+
 def test_env_fingerprint_reads_conda_meta_without_starting_python(tmp_path,
                                                                   monkeypatch):
     env = tmp_path / "envs" / "nxpython"

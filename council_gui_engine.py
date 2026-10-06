@@ -9535,6 +9535,8 @@ class CouncilConsole(tk.Tk):
                     return cached
             except Exception:
                 pass
+        # Raises NxError (nothing cached or saved) when the interpreter it ran
+        # has no simplnx: an empty catalog used to replace the good one.
         cached = _nb.catalog()
         self._nx_catalog_cache = cached
         if path:

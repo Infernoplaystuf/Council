@@ -113,9 +113,13 @@ def catalog(vault_dir: Path, *, force: bool = False,
     """The INSTALLED package's filter catalog: memory, then disk, then nx.
 
     A cached copy is used only while it still describes the installed env
-    (nx_bridge.catalog_stale_reason: schema, python and dream3dnx version).
-    It used to be used for good, so after an nx reinstall every script was
-    checked against filters that might no longer exist."""
+    (nx_bridge.catalog_stale_reason: schema, python and dream3dnx version,
+    and every installed plugin imported when it was built). It used to be
+    used for good, so after an nx reinstall every script was checked against
+    filters that might no longer exist.
+
+    A rebuild whose simplnx did not import (or that lists no filters) raises
+    NxError and leaves the saved catalog as it was."""
     if bridge is None:
         import nx_bridge as bridge
     key = Path(vault_dir).resolve()
@@ -142,6 +146,15 @@ def catalog(vault_dir: Path, *, force: bool = False,
                 reason = "the saved catalog is unreadable"
     last_rebuild_reason[key] = reason
     fresh = bridge.catalog()
+    # Built by an interpreter without simplnx, or empty: never saved over
+    # the previous catalog, never served. It was: 0 filters, transpile
+    # "succeeded" with every step commented out. (nx_bridge.catalog raises
+    # on this itself; a bridge that does not is checked here.)
+    import nx_bridge as _nb
+    why = _nb.catalog_unusable_reason(fresh)
+    if why:
+        raise _nb.NxError(f"The DREAM3D-NX filter catalog could not be "
+                          f"built: {why}. The saved catalog was kept.")
     with _catalog_lock:
         _catalog_mem[key] = fresh
         if path is not None:
