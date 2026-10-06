@@ -608,6 +608,102 @@ def test_a_preset_shown_and_then_deleted_elsewhere_still_leaves_the_box(qapp):
     made.close()
 
 
+def _focused(combo, qapp):
+    """The box in an ACTIVE window with the focus — the state a user types
+    in. Qt completes a typed name only there: without it the inline
+    completer never ran and the tests of typed names passed by luck.
+
+    The offscreen platform never makes a window active by itself
+    (activateWindow, requestActivate and qWaitForWindowActive all leave
+    activeWindow() None, MEASURED), so the deprecated setActiveWindow is
+    the one way — its warning is expected here."""
+    import warnings
+
+    from PySide6.QtCore import Qt
+
+    combo.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    combo.show()
+    combo.activateWindow()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        QApplication.setActiveWindow(combo)
+    combo.setFocus()
+    qapp.processEvents()
+    assert QApplication.activeWindow() is combo
+
+
+def test_a_new_name_typed_is_what_the_box_holds_not_a_preset_it_starts(
+        qapp):
+    """MEASURED in a built Typhon with its window active: typing 'Bird' (a
+    new preset) made the box read 'Bird bath' — Qt's inline completion —
+    and Save preset then saved over 'Bird bath', with no 'Bird' made."""
+    from PySide6.QtTest import QTest
+
+    made, combo, area, activated = picker(qapp)
+    connect("frame", live=False)
+    frame_camera.set_camera_setting("Gain", 1.0)
+    frame_camera.save_preset("Bird bath")
+    frame_camera.set_camera_setting("Gain", 7.0)
+    _focused(combo, qapp)
+    combo.setCurrentIndex(-1)
+    combo.setEditText("")
+    QTest.keyClicks(combo, "Bird")
+    assert combo.currentText() == "Bird", "the box finished the name itself"
+    frame_camera.save_preset(combo.currentText())
+    gains = {d["name"]: d["settings"].get("Gain")
+             for d in frame_camera.list_presets()["details"]}
+    assert gains == {"Bird": 7.0, "Bird bath": 1.0}
+    # ... and part of a name, a refill, more typing: what was typed.
+    combo.setCurrentIndex(-1)
+    combo.setEditText("")
+    QTest.keyClicks(combo, "Bi")
+    frame_camera.delete_preset("Bird")         # as the settings window does
+    QTest.keyClicks(combo, "x")
+    assert combo.currentText() == "Bix"
+    assert activated == []
+    combo.hide()
+    made.close()
+
+
+def test_a_late_preset_answer_leaves_a_name_typed_while_it_ran(qapp):
+    """Focus stays in the box after a pick; a slow camera's restart takes
+    0.15-1 s. A new name typed meanwhile was replaced by the preset's name
+    when the late answer came (select() had no typing rule; fill() had)."""
+    from PySide6.QtTest import QTest
+
+    made, combo, area, _ = picker(qapp)
+    connect("frame")
+    frame_camera.set_camera_area("0, 0, 320, 240")
+    ticks(0.3)
+    frame_camera.save_preset("Small")
+    frame_camera.full_frame()
+    ticks(0.3)
+    frame_camera.set_frame_rate(1)
+    ticks(1.2)
+    combo.setCurrentIndex(combo.findText("Small"))
+    out = frame_camera.pick_preset("Small")
+    assert out["pending"], "the preset was applied at once: not a late answer"
+    _focused(combo, qapp)
+    combo.lineEdit().selectAll()
+    QTest.keyClicks(combo, "Xmas eve")
+    assert frame_camera._LIVE.job is not None
+    deadline = time.monotonic() + 4
+    while frame_camera._LIVE.job is not None and time.monotonic() < deadline:
+        ticks(0.05)
+    assert frame_camera._LIVE.job is None
+    assert combo.currentText() == "Xmas eve"
+    # Not typing (the box not edited since it was filled): an applied
+    # preset is shown, as before.
+    combo.setEditText("")
+    frame_camera.apply_preset("Small")
+    deadline = time.monotonic() + 4
+    while frame_camera._LIVE.job is not None and time.monotonic() < deadline:
+        ticks(0.05)
+    assert combo.currentText() == "Small"
+    combo.hide()
+    made.close()
+
+
 def test_the_picker_stops_listening_with_its_window(qapp):
     made, combo, area, _ = picker(qapp)
     assert made.heard in frame_camera._LIVE.listeners
