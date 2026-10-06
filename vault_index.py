@@ -1724,7 +1724,13 @@ class VaultIndex:
         on_progress=None,
     ) -> int:
         """Refresh the vector cache for every changed record. Returns the
-        count of records re-embedded this call."""
+        count of records re-embedded this call.
+
+        A failure is printed and KEPT in ``last_embedding_error`` (None after
+        a build that worked), not raised — callers that count on 0-not-raise
+        stay as they were, and council_core.vault_ops reads it so the Vault
+        tab says "failed" instead of "Vectors ready — 0 files"."""
+        self.last_embedding_error = None
         emb = self.embeddings()
         if emb is None:
             return 0
@@ -1734,6 +1740,7 @@ class VaultIndex:
             import sys as _sys
             print(f"[VaultIndex] embedding build failed: {exc!r}",
                   file=_sys.stderr)
+            self.last_embedding_error = exc
             return 0
         return n
 
