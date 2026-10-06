@@ -296,7 +296,16 @@ def _scalars(o):
         yield str(o)
 
 
-def _json_field_values(text: str, fn: str):
+def _label_exact(text, fn: str) -> bool:
+    """True when ``text`` IS the label ``fn`` (after the same clean-up as
+    _label_is) — not a longer key that contains it. The knowledge graph needs
+    this: 'Project Manager: Ann Stone' is not a Project, 'Part Qty: 4' not a
+    Part, 'Owner Email' not an Owner. Search keeps the looser _label_is."""
+    t = _norm_key(_EMPH_RE.sub("", _BULLET_RE.sub("", str(text or ""))))
+    return bool(t) and t == fn
+
+
+def _json_field_values(text: str, fn: str, *, exact: bool = False):
     """Values for field ``fn`` read STRUCTURALLY out of JSON, or None if the
     text isn't JSON.
 
@@ -305,11 +314,12 @@ def _json_field_values(text: str, fn: str):
     says a field's value is anything else in the record, and first-separator
     splitting sees a key of '{"job"'. Parsing gives the exact key->value
     mapping, so 'point_of_contact' is Bob no matter what else the record says
-    about Alice."""
+    about Alice. ``exact``: keys must BE the label (see _label_exact)."""
     t = (text or "").strip()
     if not t or t[0] not in "[{":
         return None
     vals: List[str] = []
+    _label_is = _label_exact if exact else globals()["_label_is"]
 
     def walk(o):
         if isinstance(o, dict):
@@ -722,11 +732,13 @@ def _field_values_in_text(text: str, fn: str, *, max_hits: int = 100):
 
 
 def _located_text_values(text: str, fn: str, *, max_hits: int = 100,
-                         kind: Optional[str] = None):
+                         kind: Optional[str] = None, exact: bool = False):
     """The line rules of _field_values_in_text, keeping WHERE each value was:
     ``[(value, line_index)]`` with a 0-based index into ``text.splitlines()``.
     The index is the line holding the VALUE — for a heading-style field that is
-    the line after the label, which is the line a person would be shown."""
+    the line after the label, which is the line a person would be shown.
+    ``exact``: the key must BE the label (see _label_exact)."""
+    _label_is = _label_exact if exact else globals()["_label_is"]
     vals: List[Tuple[str, int]] = []
     lines = text.splitlines()
     for i, raw in enumerate(lines):
@@ -764,6 +776,63 @@ def _located_text_values(text: str, fn: str, *, max_hits: int = 100,
     return vals
 
 
+def json_pair_line(text: str, key: str, value: Any, start: int = 0) -> Tuple[int, int]:
+    """Where ``"key": value`` is written in JSON ``text``, searching from
+    character ``start``: ``(0-based line, end offset)``, or ``(-1, start)``.
+
+    The key and the quoted value are matched TOGETHER. Searching for the bare
+    value cited a Supersedes 'PN-1234' on the line of the earlier
+    '"Part": "PN-1234/A"' (and 'Lee' inside 'Leeds Upgrade'). Not found from
+    ``start`` (a nested object written before its parent's later keys), the
+    whole text is searched."""
+    forms = []
+    for asc in (False, True):
+        try:
+            forms.append(re.escape(json.dumps(key, ensure_ascii=asc)) + r"\s*:\s*"
+                         + re.escape(json.dumps(value, ensure_ascii=asc)))
+        except (TypeError, ValueError):
+            return -1, start
+    rx = re.compile("|".join(dict.fromkeys(forms)))
+    m = rx.search(text, start) or rx.search(text)
+    if m is None:
+        return -1, start
+    return text.count("\n", 0, m.start()), m.end()
+
+
+def _json_located(text: str, fn: str, *, exact: bool = False) -> List[Tuple[str, int]]:
+    """_json_field_values for one parseable JSON document, with each value's
+    0-based line found by json_pair_line (key and value together). ``[]``
+    when the text is not one JSON document."""
+    try:
+        data = json.loads((text or "").strip())
+    except Exception:
+        return []
+    label = _label_exact if exact else _label_is
+    lines = text.splitlines()
+    out: List[Tuple[str, int]] = []
+    cursor = [0]
+
+    def walk(o):
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if label(k, fn):
+                    if isinstance(v, (dict, list, tuple)):
+                        for leaf in _scalars(v):        # placed by value alone
+                            out.append((leaf, _line_of(lines, leaf)))
+                    elif v is not None and not isinstance(v, bool):
+                        i, end = json_pair_line(text, k, v, cursor[0])
+                        if i >= 0:
+                            cursor[0] = end
+                        out.append((str(v), i))
+                else:
+                    walk(v)
+        elif isinstance(o, (list, tuple)):
+            for v in o:
+                walk(v)
+    walk(data)
+    return out
+
+
 def _line_of(lines: List[str], value: str, start: int = 0) -> int:
     """0-based index of the first line at/after ``start`` containing
     ``value``, or -1. Used to place JSON values, which are read structurally."""
@@ -780,7 +849,8 @@ def _snippet(line: str, limit: int = 200) -> str:
 
 def field_value_locations(path: Any, field: str, *,
                           max_values: int = 5000,
-                          kind: Optional[str] = None) -> List[Dict[str, Any]]:
+                          kind: Optional[str] = None,
+                          exact: bool = False) -> List[Dict[str, Any]]:
     """Every value of the labelled ``field`` in ONE file, with where it is.
 
     The knowledge graph cites every fact, so a value alone is not enough: this
@@ -793,7 +863,9 @@ def field_value_locations(path: Any, field: str, *,
 
     Values are split exactly as in search (``_split_values``); ``kind``
     (PERSON / PART / PROJECT) tells the splitter whether 'Last, First' can be
-    meant. Read-only and bounded; an unreadable file gives ``[]``."""
+    meant. ``exact`` makes a text key count only when it IS the label (the
+    knowledge graph's rule; search matches looser). Read-only and bounded; an
+    unreadable file gives ``[]``."""
     p = Path(path)
     fn = _norm_key(field)
     if not fn:
@@ -831,18 +903,21 @@ def field_value_locations(path: Any, field: str, *,
         pages = [text] if text else []
     for pno, text in enumerate(pages, start=1):
         lines = text.splitlines()
-        js = _json_field_values(text, fn)
+        js = _json_field_values(text, fn, exact=exact)
         if js is not None:
-            located, cursor = [], 0
-            for v in js:
-                i = _line_of(lines, v, cursor)
-                if i < 0:
-                    i = _line_of(lines, v)
-                else:
-                    cursor = i
-                located.append((v, i))
+            located = _json_located(text, fn, exact=exact)
+            if [v for v, _i in located] != js:      # not one parseable document
+                located, cursor = [], 0
+                for v in js:
+                    i = _line_of(lines, v, cursor)
+                    if i < 0:
+                        i = _line_of(lines, v)
+                    else:
+                        cursor = i
+                    located.append((v, i))
         else:
-            located = _located_text_values(text, fn, max_hits=max_values, kind=kind)
+            located = _located_text_values(text, fn, max_hits=max_values, kind=kind,
+                                           exact=exact)
         for v, i in located:
             loc = {"value": v, "kind": "line",
                    "line": (i + 1) if i >= 0 else None,

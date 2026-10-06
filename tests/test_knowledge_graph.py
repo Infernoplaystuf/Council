@@ -401,3 +401,42 @@ def test_a_list_of_people_and_a_pair_of_projects_stay_separate(tmp_path):
         kg.seed()
         assert _people(kg) == ["Alice", "Bob", "Carol", "Carol Lee"]
         assert _names(kg, "PROJECT") == ["Atlas", "Helios", "Northwind"]
+
+
+def _links(kg):
+    return sorted((r["subject"]["name"], r["predicate"], r["object"]["name"], r["status"])
+                  for r in kg.all_relations() if r["predicate"] != "DOCUMENTED_IN")
+
+
+def test_text_labels_must_be_the_rule_label_not_contain_it(tmp_path):
+    # 'Project Manager' is not a 'Project', 'Part Qty' not a 'Part', 'Owner
+    # Email' not an 'Owner' — the table reader already required the exact
+    # header; text read any key up to 3 words longer than the label.
+    v = _tiny(tmp_path, {"status.md": "Project: PRJ-1\nProject Manager: Ann Stone\n"
+                                      "Project Status: Green\n"
+                                      "Part Description: Bearing housing\nPart Qty: 4\n"
+                                      "Program Lead: Carol Lee\n"
+                                      "Owner Email: carol.lee@example.com\n"})
+    with _graph(v) as kg:
+        kg.seed()
+        assert _names(kg, "PROJECT") == ["PRJ-1"]
+        assert _names(kg, "PART") == []
+        assert _people(kg) == ["Carol Lee"]
+        assert _links(kg) == [("Carol Lee", "LEADS", "PRJ-1", "seeded")]
+
+
+def test_a_json_value_is_cited_on_its_own_line(tmp_path):
+    import field_search as fs
+    body = json.dumps([{"Project": "PRJ-9", "Part": "PN-1234/A",
+                        "Supersedes": "PN-1234"}], indent=2)
+    v = _tiny(tmp_path, {"parts.json": body})
+    lines = body.splitlines()
+    want = next(i for i, ln in enumerate(lines, 1) if '"Supersedes"' in ln)
+    assert [(l["value"], l["line"]) for l in
+            fs.field_value_locations(v / "data_in" / "parts.json", "Supersedes")] \
+        == [("PN-1234", want)]
+    with _graph(v) as kg:
+        kg.seed()
+        sup = next(r for r in kg.all_relations() if r["predicate"] == "SUPERSEDES")
+        ev = kg.evidence(sup["id"])
+        assert [e["locator"].get("line") for e in ev] == [want]
