@@ -118,9 +118,13 @@ chunk went to the model; the desktop's GPU will differ — measure in KG0.
 4. Find the real vault: normally `%USERPROFILE%\.council\vault` (on the laptop
    `~/council_vault` is a decoy the Qt port made — don't delete it without asking).
    Count its documents by type, and **ask the user** the open questions in §6 before KG1.
-5. Run the existing tests that cover what you will touch (`tests/test_field_search*`,
-   `tests/smoke_test.py` field-search parts, `tests/test_vault*`, `tests/test_council_turn.py`,
-   `tests/test_data_index*`) to get a baseline.
+5. Run the existing tests that cover what you will touch, for a baseline. There are no
+   dedicated field-search or data-index test files: `field_search`, `data_index` and
+   `vault_collections` are tested inside **`tests/smoke_test.py`** (run it offscreen;
+   `-k field` narrows it), plus `tests/test_council_core.py` (collections, vault index),
+   `tests/test_council_turn.py` and `tests/test_vault_health.py`. Add a dedicated
+   `tests/test_knowledge_graph.py` (and `tests/test_field_search.py` for the split /
+   locator fixes) as you go.
 
 ## 5. Rules (the user's standing instructions)
 
