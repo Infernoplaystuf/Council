@@ -44,10 +44,13 @@ prompt can show their signatures.
 
 Which filter a call runs, and which keywords it passes, are followed through
 every way a script holds them (_Flow): an alias however it is bound (plain,
-annotated, walrus, tuple unpacking, rebound — checked against every value it
-may hold), a list / tuple / dict of filters and an index into it, a loop over
-filters, `A if c else B`, a helper `def run(f, **kw): f.execute(...)` (checked
-per call site), and `**params` built from a dict literal or dict(...). These
+annotated, walrus, tuple unpacking, rebound — checked against the binding
+that reaches the call when straight-line code makes that certain, else
+against every value it may hold, needing to fit one), a list / tuple / dict
+of filters and an index into it, a loop over filters, `A if c else B`, a
+helper `def run(f, **kw): f.execute(...)` (checked per call site; a method's
+callers are unknown, so it is reported), and `**params` built from a dict
+literal or dict(...). These
 all used to skip the check: `F, H = nx.A, nx.B; F.execute(bogus=1)` and
 `nx.A.execute(data_structure=ds, **{'dims': ...})` were accepted and died
 with TypeError in simplnx. What it still cannot follow — a filter or a
@@ -306,10 +309,15 @@ def _and_nearest(name: str, pool, n: int = 3) -> str:
 _SCOPE_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 _FUNC_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
 _COMP_NODES = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
-# Methods that change a dict in place: a ** dict changed after it is built
-# cannot be read off its literal.
-_DICT_MUTATORS = frozenset({"update", "setdefault", "pop", "popitem",
-                            "clear", "__setitem__", "__delitem__"})
+# Methods that change a dict / list / set in place: one changed after it is
+# built cannot be read off its literal (`fs = []; fs.append(nx.X)`).
+_MUTATORS = frozenset({"update", "setdefault", "pop", "popitem", "clear",
+                       "__setitem__", "__delitem__", "append", "extend",
+                       "insert", "remove", "sort", "reverse", "add",
+                       "discard", "__iadd__"})
+# Builtins whose elements are the elements of their argument(s).
+_PASS_THROUGH = frozenset({"list", "tuple", "reversed", "sorted", "set",
+                           "frozenset", "iter"})
 _MAX_ENVS = 64          # loop iterations x call sites checked per call
 _MAX_DEPTH = 8          # bindings followed through
 
@@ -353,6 +361,9 @@ class _Flow:
             for ch in ast.iter_child_nodes(p):
                 self.parent[ch] = p
         self.records: Dict[Tuple[int, str], List[tuple]] = {}
+        # Parallel to records: (the statement that binds, whether the name
+        # is that statement's own target) for each record.
+        self.where: Dict[Tuple[int, str], List[Tuple[Any, bool]]] = {}
         self.mutated: set = set()
         self._globals: Dict[int, set] = {}
         for node in ast.walk(tree):
@@ -391,6 +402,88 @@ class _Flow:
         if scope is not self.tree and name in self._globals.get(id(scope), ()):
             scope = self.tree
         self.records.setdefault((id(scope), name), []).append(rec)
+        stmt = self.stmt_of(at)
+        self.where.setdefault((id(scope), name), []).append(
+            (stmt, self._is_target(stmt, at)))
+
+    def stmt_of(self, node):
+        """The statement ``node`` is part of (itself, if it is one)."""
+        while node is not None and not isinstance(node, ast.stmt):
+            node = self.parent.get(node)
+        return node
+
+    @staticmethod
+    def _is_target(stmt, at) -> bool:
+        """Is ``at`` what ``stmt`` itself binds — an assignment's target, an
+        import, a def — rather than a walrus or a comprehension inside it?"""
+        if at is stmt:
+            return isinstance(stmt, (ast.Import, ast.ImportFrom,
+                                     ast.FunctionDef, ast.AsyncFunctionDef,
+                                     ast.ClassDef))
+        if isinstance(stmt, ast.Assign):
+            roots = stmt.targets
+        elif isinstance(stmt, ast.AnnAssign):
+            roots = [stmt.target]
+        else:
+            return False
+        return any(n is at for r in roots for n in ast.walk(r))
+
+    def within(self, node, container) -> bool:
+        while node is not None:
+            if node is container:
+                return True
+            node = self.parent.get(node)
+        return False
+
+    def reaching(self, use: ast.Name, recs: List[tuple]
+                 ) -> Optional[List[tuple]]:
+        """The bindings of a REBOUND name that reach ``use``, when straight-
+        line code makes that certain; None when it does not (a branch, a
+        loop, a binding in an enclosing scope), and then every binding counts.
+
+        `F = nx.A`, then `F = nx.B`, then `F.execute(...)` runs B. Counting
+        every binding made the call pass if it fit EITHER filter, so one of
+        A's keywords passed to B was accepted — and so was a `params` dict
+        with a typo whenever a later `params = {...}` happened to fit; both
+        raise TypeError in simplnx."""
+        key = (id(self.scope_of(use)), use.id)
+        if self.records.get(key) is not recs or len(recs) < 2:
+            return None                   # bound in an enclosing scope
+        where = self.where.get(key) or []
+        stmts = [w[0] for w in where]
+        u = self.stmt_of(use)
+        if u is None or any(self.within(s, u) for s in stmts):
+            return None                   # bound in the same statement
+        cur = u
+        while True:
+            par = self.parent.get(cur)
+            if par is None:
+                return None
+            block = next((getattr(par, f) for f in ("body", "orelse",
+                                                    "finalbody")
+                          if isinstance(getattr(par, f, None), list)
+                          and any(x is cur for x in getattr(par, f))), None)
+            if block is not None:
+                i = next(j for j, x in enumerate(block) if x is cur)
+                for s in reversed(block[:i]):
+                    direct = [r for r, (st, d) in zip(recs, where)
+                              if st is s and d]
+                    if direct:
+                        return direct
+                    if any(self.within(st, s) for st in stmts):
+                        return None       # bound inside a branch or a loop
+            if isinstance(par, _SCOPE_NODES + (ast.Module, ast.ClassDef)):
+                return None               # nothing binds it before the use
+            if isinstance(par, (ast.For, ast.AsyncFor, ast.While)):
+                # The loop comes round again: a binding anywhere in it (its
+                # target, a statement after the use) may be the one.
+                if any(self.within(st, par) for st in stmts):
+                    return None
+            elif any(self.within(st, par) and not any(
+                    self.within(st, x) for x in (block or [cur]))
+                    for st in stmts):
+                return None               # bound in a test or another branch
+            cur = par
 
     def _bind(self, target, value, path: tuple, is_iter: bool) -> None:
         if isinstance(target, ast.Name):
@@ -450,7 +543,7 @@ class _Flow:
                 self.mutated.add(node.value.id)
             elif isinstance(node, ast.Call) \
                     and isinstance(node.func, ast.Attribute) \
-                    and node.func.attr in _DICT_MUTATORS \
+                    and node.func.attr in _MUTATORS \
                     and isinstance(node.func.value, ast.Name):
                 self.mutated.add(node.func.value.id)
 
@@ -491,6 +584,7 @@ class _Flow:
             if kind == "recs":
                 if any(r[0] == "import" for r in data):
                     return [(expr, strict, env)], []
+                data = self.reaching(expr, data) or data
                 loose = len(data) > 1
                 out, whys = [], []
                 for rec in data:
@@ -546,10 +640,26 @@ class _Flow:
                  index: Optional[int] = None):
         """The elements of a literal list / tuple / set ``expr`` evaluates
         to (only element ``index`` when given): ([(node, strict, env)],
-        [why])."""
+        [why]). enumerate / zip / d.items() and list(...)-style wrappers
+        of a literal are followed too."""
+        if depth > _MAX_DEPTH:
+            return [], ["it is bound through too many steps"]
+        if isinstance(expr, ast.Name) and expr.id in self.mutated:
+            return [], [f"{expr.id} is changed after it is built"]
         conts, whys = self.values(expr, env, strict, depth + 1)
         out = []
         for c, st, e in conts:
+            if isinstance(c, ast.Call):
+                items, w = self._call_elements(c, e, st, depth + 1)
+                whys += w
+                if items is not None:
+                    if index is None:
+                        out += items
+                    elif -len(items) <= index < len(items):
+                        out.append(items[index])
+                    else:
+                        whys.append("it unpacks a sequence of another length")
+                    continue
             if isinstance(c, (ast.List, ast.Tuple, ast.Set)):
                 if any(isinstance(x, ast.Starred) for x in c.elts):
                     whys.append("it comes out of a *-unpacked sequence")
@@ -566,11 +676,70 @@ class _Flow:
                 whys.append("it comes out of a sequence built at run time")
         return out, whys
 
+    def _call_elements(self, call: ast.Call, env, strict: bool, depth: int):
+        """(elements, [why]) of enumerate(x) / zip(a, b) / d.items() /
+        d.values() / d.keys() / list(x)-style calls over literals, with
+        synthesized tuples where Python yields them; (None, []) for any
+        other call."""
+        f = call.func
+        if isinstance(f, ast.Name) and not call.keywords \
+                and self.lookup(f.id, call, env)[0] == "free":
+            if f.id in _PASS_THROUGH and len(call.args) == 1:
+                return self.elements(call.args[0], env, strict, depth + 1)
+            if f.id == "enumerate" and len(call.args) in (1, 2):
+                start = 0
+                if len(call.args) == 2:
+                    a = call.args[1]
+                    if not (isinstance(a, ast.Constant)
+                            and isinstance(a.value, int)):
+                        return [], ["enumerate starts at a computed index"]
+                    start = a.value
+                els, whys = self.elements(call.args[0], env, strict,
+                                          depth + 1)
+                return [(ast.Tuple(elts=[ast.Constant(start + i), x],
+                                   ctx=ast.Load()), st, e)
+                        for i, (x, st, e) in enumerate(els)], whys
+            if f.id == "zip" and call.args:
+                cols, whys = [], []
+                for a in call.args:
+                    els, w = self.elements(a, env, strict, depth + 1)
+                    whys += w
+                    cols.append(els)
+                if whys:
+                    return [], whys
+                rows = []
+                for row in zip(*cols):
+                    # the elements may come from different envs; zip pairs
+                    # literals, which need none
+                    rows.append((ast.Tuple(elts=[x for x, _s, _e in row],
+                                           ctx=ast.Load()),
+                                 all(s for _x, s, _e in row), row[0][2]))
+                return rows, []
+        if isinstance(f, ast.Attribute) and not call.args \
+                and f.attr in ("items", "values", "keys"):
+            conts, whys = self.values(f.value, env, strict, depth + 1)
+            if isinstance(f.value, ast.Name) and f.value.id in self.mutated:
+                return [], [f"{f.value.id} is changed after it is built"]
+            out = []
+            for c, st, e in conts:
+                if not isinstance(c, ast.Dict) or any(k is None
+                                                      for k in c.keys):
+                    whys.append("it iterates a dict built at run time")
+                    continue
+                for k, v in zip(c.keys, c.values):
+                    x = {"items": ast.Tuple(elts=[k, v], ctx=ast.Load()),
+                         "values": v, "keys": k}[f.attr]
+                    out.append((x, st, e))
+            return out, whys
+        return None, []
+
     def _subscript_values(self, expr: ast.Subscript, env, strict: bool,
                           depth: int):
         sl = expr.slice
         if isinstance(sl, ast.Slice):
             return [], ["it is a slice"]
+        if isinstance(expr.value, ast.Name) and expr.value.id in self.mutated:
+            return [], [f"{expr.value.id} is changed after it is built"]
         key = sl.value if isinstance(sl, ast.Constant) else None
         conts, whys = self.values(expr.value, env, strict, depth + 1)
         out = []
@@ -631,6 +800,7 @@ class _Flow:
             if kind == "recs":
                 if any(r[0] == "import" for r in data):
                     return [], [f"{expr.id} is imported"]
+                data = self.reaching(expr, data) or data
                 loose = len(data) > 1
                 opts, whys = [], []
                 for rec in data:
@@ -757,8 +927,11 @@ class _Flow:
 
     def call_sites(self, fn) -> Optional[List[ast.Call]]:
         """Every `fn(...)` call, or None when fn is also used some other way
-        (passed to map(), decorated, rebound) — its callers are unknown."""
-        if fn.decorator_list:
+        (passed to map(), decorated, rebound) — its callers are unknown.
+        A method is called through an object (r.run(...)), never by its bare
+        name, so its callers are unknown too: taken as "nobody calls it",
+        `class R: def run(self, f, **k): f.execute(...)` was never checked."""
+        if fn.decorator_list or isinstance(self.parent.get(fn), ast.ClassDef):
             return None
         recs = self.records.get((id(self.scope_of(fn)), fn.name)) or []
         if len(recs) != 1:

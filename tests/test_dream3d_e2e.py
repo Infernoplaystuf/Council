@@ -314,6 +314,18 @@ _BOGUS = "has no parameter 'bogus'"
      "    r = F.execute(data_structure=ds, bogus=1)\n", _BOGUS),
     (_PRE + f"rs = [F.execute(data_structure=ds, bogus=1) for F in ({_G},)]\n",
      _BOGUS),
+    (_PRE + f"for i, F in enumerate([{_G}]):\n"
+     "    r = F.execute(data_structure=ds, bogus=1)\n", _BOGUS),
+    (_PRE + f"for name, F in {{'g': {_G}}}.items():\n"
+     "    r = F.execute(data_structure=ds, bogus=1)\n", _BOGUS),
+    (_PRE + f"for F, kw in zip([{_G}], [{{'bogus': 1}}]):\n"
+     "    r = F.execute(data_structure=ds, **kw)\n", _BOGUS),
+    # A list filled after it is built is not its literal: reported, where
+    # it used to resolve to nothing and pass.
+    (_PRE + f"fs = []\nfs.append({_G})\nfor F in fs:\n"
+     "    r = F.execute(data_structure=ds, bogus=1)\n", "cannot identify"),
+    (_PRE + f"fs = [nx.CreateDataArrayFilter]\nfs[0] = {_G}\n"
+     "r = fs[0].execute(data_structure=ds, bogus=1)\n", "cannot identify"),
     (_PRE + "def run(f, **k):\n    return f.execute(data_structure=ds, **k)\n"
      f"r = run({_G}, bogus=1)\n", _BOGUS),
     (_PRE + "def run(f):\n    return f.execute(data_structure=ds, bogus=1)\n"
@@ -328,6 +340,27 @@ _BOGUS = "has no parameter 'bogus'"
      "r = pick().execute(data_structure=ds)\n", "cannot identify"),
     (_PRE + "def run(f):\n    return f.execute(data_structure=ds)\n"
      f"for r in map(run, [{_G}]):\n    pass\n", "cannot identify"),
+    # A method is called through an object, never by its bare name: it was
+    # taken as never called, so this was accepted (TypeError in simplnx).
+    (_PRE + "class R:\n    def run(self, f, **k):\n"
+     "        return f.execute(data_structure=ds, **k)\n"
+     f"R().run({_G}, bogus=1)\n", "cannot identify"),
+    # A rebound name in straight-line code holds its LAST value. Counting
+    # every value let a call pass that fit an earlier one (both TypeError in
+    # simplnx): A's keyword given to B, a typo'd params dict that a later
+    # params = {...} fit.
+    (_PRE + f"F = nx.CreateDataArrayFilter\nF = {_G}\n"
+     "r = F.execute(data_structure=ds, component_count=1)\n",
+     "CreateImageGeometryFilter.execute() has no parameter 'component_count'"),
+    (_PRE + f"params = {{'dims': [1, 1, 1]}}\n"
+     f"r = {_G}.execute(data_structure=ds, **params)\n"
+     f"params = {{'dimensions': [2, 2, 2]}}\n"
+     f"r = {_G}.execute(data_structure=ds, **params)\n",
+     "has no parameter 'dims'. Did you mean dimensions?"),
+    (_PRE + "def main():\n    F = nx.CreateDataArrayFilter\n"
+     f"    F = {_G}\n    if True:\n"
+     "        r = F.execute(data_structure=ds, component_count=1)\nmain()\n",
+     "CreateImageGeometryFilter.execute() has no parameter 'component_count'"),
     # execute2 / preflight2 belong to a filter OBJECT: on the class they
     # fail with "incompatible function arguments" whatever they are given.
     (_PRE + f"r = {_G}.execute2(data_structure=ds, dimensions=[2, 2, 2])\n",
@@ -377,6 +410,12 @@ for f, kw in steps:
 run(nx.CreateDataArrayFilter, numeric_type_index=nx.NumericType.uint8,
     output_array_path=nx.DataPath("C"), tuple_dimensions=[[2]],
     component_count=1)
+for i, (f, kw) in enumerate(steps):
+    run(f, **{**kw, "output_array_path": nx.DataPath(f"E{i}")})
+for name, f in {"G3": nx.CreateImageGeometryFilter}.items():
+    r = f.execute(data_structure=ds, dimensions=[1, 1, 1],
+                  output_image_geometry_path=nx.DataPath(name))
+    assert not r.errors, r.errors
 
 # One name rebound from filter to filter, each call right for the one it
 # holds at that point.
@@ -389,7 +428,18 @@ F = nx.CreateImageGeometryFilter
 r = F.execute(data_structure=ds, dimensions=[2, 2, 2],
               output_image_geometry_path=nx.DataPath("Geom2"))
 assert not r.errors, r.errors
-for name in ("A", "B", "C", "D", "Geom2"):
+
+# One keyword dict reused for each filter, as models write it.
+params = {"dimensions": [1, 2, 1],
+          "output_image_geometry_path": nx.DataPath("P1")}
+r = nx.CreateImageGeometryFilter.execute(data_structure=ds, **params)
+assert not r.errors, r.errors
+params = {"numeric_type_index": nx.NumericType.uint16,
+          "output_array_path": nx.DataPath("P2"), "tuple_dimensions": [[4]],
+          "component_count": 1}
+r = nx.CreateDataArrayFilter.execute(data_structure=ds, **params)
+assert not r.errors, r.errors
+for name in ("A", "B", "C", "D", "E0", "E1", "G3", "Geom2", "P1", "P2"):
     assert ds.exists(nx.DataPath(name)), name
 print("indirect ok")
 '''
@@ -1173,6 +1223,7 @@ def test_a_parameter_named_in_a_comment_is_not_a_parameter(tmp_path):
     assert w["export_file_path"] == str(tmp_path / "hand.dream3d")
     assert used == "export_file_path"
     ast.parse(txt)
+
 
 
 @pytest.mark.parametrize("mode", ["chained", "per_file"])
