@@ -429,7 +429,15 @@ class ModelAgent:
                 if not isinstance(args, dict):
                     obs_lines.append(f"[{i}] ERROR: args must be a dict")
                     continue
-                ok, msg, payload = self.tools[tool_name](args)
+                # A tool that raises (run_python past its timeout raises
+                # TimeoutExpired; a vault read of a missing file raises) is a
+                # failed call the model can see and work around — not the end
+                # of the whole turn, which is what letting it escape meant.
+                try:
+                    ok, msg, payload = self.tools[tool_name](args)
+                except Exception as exc:                  # noqa: BLE001
+                    ok, msg, payload = (False, f"the tool raised "
+                                        f"{type(exc).__name__}: {exc}", {})
                 obs_lines.append(f"[{i}] {tool_name}: {'OK' if ok else 'FAIL'}\n{msg}")
                 if payload:
                     payloads[f"{tool_name}_{i}"] = payload
