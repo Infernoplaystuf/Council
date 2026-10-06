@@ -202,6 +202,7 @@ class CouncilActions:
             typed_text, models,
             enable_tools=enable_tools,
             tools=self.tools() if enable_tools else None,
+            parallel_members=bool(getattr(options, "parallel", False)),
             on_event=on_event,
             on_token=on_token if getattr(options, "stream", True) else None)
 

@@ -802,10 +802,14 @@ GUIDE: Tuple[GuideStep, ...] = (
         "council_core/council_turn.py (PANEL_FOR_ROUTE)"),
     GuideStep(
         "Each member writes an answer",
-        "The members answer one at a time, not all at once. Each gets the "
-        "question plus its own memory, the project memory, your profile and "
-        "recent conversation (Role memory), writes a full answer, and rates "
-        "how sure it is from 1 to 10.\n\n"
+        "Each member gets the question plus its own memory, the project "
+        "memory, your profile and recent conversation (Role memory), writes "
+        "a full answer, and rates how sure it is from 1 to 10.\n\n"
+        "By default they answer one at a time, and each later member also "
+        "reads the answers before it. With 'Parallel members' on (Council "
+        "tab), they all answer at once, each without seeing the others — "
+        "faster when their models are on different machines, and the first "
+        "drafts are independent.\n\n"
         "Every answer goes onto the Debate floor: the shared record of this "
         "round that every member and the Judge can read.",
         MEMBERS + ("role_memory", "debate"),

@@ -59,6 +59,12 @@ SWITCHES: Tuple[Switch, ...] = (
                 "learning continues underneath."),
     Switch("adversarial", "Adversarial", False, shown_in_demo=False),
     Switch("judge_panel", "Judge panel ✦", False, shown_in_demo=False),
+    Switch("parallel", "Parallel members", False, shown_in_demo=False,
+           hint="Members draft and rebut at the same time. Their first "
+                "drafts are then independent — none reads another's before "
+                "the rebuttals. Faster only when their models are on "
+                "different machines (Machines & roles) or are different "
+                "in-app models; token streaming pauses meanwhile."),
     Switch("robust_voices", "Robust voices ✦", False, shown_in_demo=False, row=2,
            hint="gives each personality a distinct character and tone"),
 )
@@ -88,6 +94,7 @@ class CouncilOptions:
     use_profile: bool = True
     adversarial: bool = False
     judge_panel: bool = False
+    parallel: bool = False
     robust_voices: bool = False
 
     @classmethod

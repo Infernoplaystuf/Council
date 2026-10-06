@@ -192,7 +192,8 @@ def run_turn(question: str, models: Any, *,
              clarification_cb: Optional[Callable[[str, str], None]] = None,
              pause_event: Optional[threading.Event] = None,
              answer_getter: Optional[Callable[[], str]] = None,
-             extra_ctx: Optional[Dict[str, Any]] = None) -> TurnResult:
+             extra_ctx: Optional[Dict[str, Any]] = None,
+             parallel_members: bool = False) -> TurnResult:
     """Run one full deliberation and dig the result out of it.
 
     Never raises. A turn that fails comes back as ``ok=False`` with the reason
@@ -236,7 +237,8 @@ def run_turn(question: str, models: Any, *,
             judge_model=judge, agents=agents,
             max_rounds=max_rounds, debate_turns=debate_turns,
             event_callback=collect, clarification_cb=clarification_cb,
-            pause_event=pause_event, answer_getter=answer_getter)
+            pause_event=pause_event, answer_getter=answer_getter,
+            parallel_members=parallel_members)
         events = orchestrator.run(question, panel=panel, synth=synth,
                                   extra_ctx=extra_ctx) or collected
 

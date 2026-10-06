@@ -25,10 +25,10 @@ WHERE THE NUMBERS COME FROM
 
 DUPLICATES
 A duplicate of a role — a second copy answering at the same time — only
-helps when two calls to that role can run at once. Today they cannot: the
-members answer one at a time and the Council tab runs one question at a time
-(docs/specialized_nodes.md Stage 3 plans parallel members). Each card says
-what a duplicate would buy once that exists, and what it costs: with Ollama
+helps when two calls to that role can run at once: in the Fan-out tab, or
+with 'Parallel members' on when the members' models sit on different
+machines. The Council tab still runs one question at a time. Each card says
+what a duplicate would buy and what it costs: with Ollama
 one loaded model can serve two requests at once (OLLAMA_NUM_PARALLEL, extra
 context memory only); an in-app .gguf model serves one call at a time, so a
 duplicate there is a second copy of the weights.
@@ -117,9 +117,9 @@ SPECS: Tuple[RoleSpec, ...] = (
         "Already used by the 🧩 Fan-out tab: several Coder workers run at "
         "once on different parts of a bigger change, one per machine. More "
         "machines with the Coder's model (Machines & roles) means more units "
-        "in parallel. In a council question it would help once members run "
-        "in parallel: the Coder is the slowest member, so it holds the "
-        "others up most."),
+        "in parallel. In a council question, Parallel members helps most "
+        "when the Coder has its own machine: it is the slowest member, so "
+        "one at a time it holds the others up most."),
     RoleSpec(
         "docs", "Docs", "Answers from documentation servers in the Docs tab "
         "and writes code from what it read.",
@@ -141,7 +141,7 @@ SPECS: Tuple[RoleSpec, ...] = (
         Tier("gpt-oss:20b", "reasoning"),
         ("Shares a model with the Judge happily: different job, same "
          "strength.",),
-        "Helps once members run in parallel."),
+        "Helps with Parallel members on, when it has its own machine."),
     RoleSpec(
         "sage", "Sage", "Long-view answers: context, history, consequences.",
         3, "≈5 per round",
@@ -149,7 +149,7 @@ SPECS: Tuple[RoleSpec, ...] = (
         Tier("llama3.1:8b", "solid general model"),
         Tier("gemma3:12b", "larger, tagged for writing"),
         Tier("gpt-oss:20b", "broadest knowledge in the catalog"),
-        (), "Helps once members run in parallel."),
+        (), "Helps with Parallel members on, when it has its own machine."),
     RoleSpec(
         "skeptic", "Skeptic", "Attacks the question and the answers.",
         3, "≈5 per round, short replies",
@@ -159,7 +159,7 @@ SPECS: Tuple[RoleSpec, ...] = (
         Tier("phi4:14b", "reasoning: finds the real flaws"),
         ("A different model from the Writer gives genuinely different "
          "objections.",),
-        "Helps once members run in parallel."),
+        "Helps with Parallel members on, when it has its own machine."),
     RoleSpec(
         "artist", "Artist", "Creative answers and alternatives.",
         4, "≈5 per round",
@@ -167,7 +167,7 @@ SPECS: Tuple[RoleSpec, ...] = (
         Tier("llama3.2:3b", "fast and fluent"),
         Tier("gemma3:12b", "tagged for writing"),
         Tier("gemma3:12b", "same"),
-        (), "Helps once members run in parallel."),
+        (), "Helps with Parallel members on, when it has its own machine."),
     RoleSpec(
         "intern", "Intern", "Fast first drafts; with Tools on, can run code "
         "and search the vault.",
@@ -178,7 +178,7 @@ SPECS: Tuple[RoleSpec, ...] = (
         Tier("llama3.1:8b", "more is wasted on first drafts"),
         ("A good role for a small, fast model — or a second machine once "
          "roles can be pinned to one.",),
-        "Helps once members run in parallel."),
+        "Helps with Parallel members on, when it has its own machine."),
     RoleSpec(
         "peasant", "Peasant", "Asks two plain questions about every answer.",
         4, "1–2 per candidate, plus cross-fire questions — the most calls of "
@@ -376,9 +376,9 @@ def card_text(a: Assessment) -> str:
     if s.duplicate:
         L += ["", "A DUPLICATE (a second copy running at the same time)",
               f"  {s.duplicate}",
-              "  In a council question the members still answer one at a "
-              "time; across machines, calls do run side by side (Machines & "
-              "roles, and the Fan-out tab). Cost on one machine: with "
+              "  Calls run side by side across machines (Machines & roles), "
+              "in the Fan-out tab, and between members with 'Parallel "
+              "members' on. Cost on one machine: with "
               "Ollama, one loaded model can serve two calls "
               "(OLLAMA_NUM_PARALLEL — extra context memory only); an in-app "
               ".gguf model needs a second copy of its weights."]

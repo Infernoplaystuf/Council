@@ -473,8 +473,14 @@ class DeliberationOrchestrator:
         clarification_cb: Optional[Callable[[str, str], None]] = None,
         pause_event: Optional[threading.Event] = None,
         answer_getter: Optional[Callable[[], str]] = None,
+        parallel_members: bool = False,
     ):
         self.judge = judge_model
+        #: Draft and rebut side by side (see _draft_all). Off by default: it
+        #: only saves time when the members' models are on different
+        #: machines or are different in-app models — calls to the same
+        #: model or machine still queue (node_routing.host_slot).
+        self.parallel_members = bool(parallel_members)
         self.agents = agents
         self.max_rounds = max_rounds
         self.debate_turns = max(1, int(debate_turns))
@@ -486,6 +492,56 @@ class DeliberationOrchestrator:
 
     def _emit(self, event: AgentEvent) -> None:
         self.event_callback(event)
+
+    # -- members side by side ---------------------------------------------
+    def _draft_one(self, key: str, ctx: AgentContext,
+                   emit: Optional[Callable[[AgentEvent], None]] = None):
+        """One member's answer and its self-rated confidence:
+        (events, answer, confidence). With `emit`, the answer's events go
+        out as soon as they exist (the one-at-a-time path)."""
+        evs = self.agents[key].act(ctx)
+        if emit is not None:
+            for ev in evs:
+                emit(ev)
+        answer = next((e.text for e in reversed(evs) if e.kind == "final"), "")
+        # ── #8 Self-reported confidence ─────────────────────────────
+        # Ask each candidate to rate their own confidence 1-10.
+        # A single cheap token call — models are usually well-calibrated
+        # at distinguishing "I'm guessing" from "I'm certain".
+        conf = 5  # default if call fails
+        try:
+            raw = self.agents[key].model.respond(
+                "Rate your confidence in the answer you just gave, 1–10. "
+                "Reply with ONLY the single digit — no words, no punctuation.\n\n"
+                f"YOUR ANSWER (first 400 chars):\n{answer[:400]}",
+                max_tokens=5,
+            ).strip()
+            conf = int(raw[0]) if raw and raw[0].isdigit() else 5
+            conf = max(1, min(10, conf))
+        except Exception:
+            pass
+        return evs, answer, conf
+
+    def _side_by_side(self, keys: List[str], fn: Callable[[str], Any]
+                      ) -> Dict[str, Any]:
+        """fn(key) for every key at once; results by key. Token streaming
+        is off meanwhile — two members streaming together would interleave
+        in one view — and the first error is raised once all have finished,
+        as the one-at-a-time path would have raised it."""
+        from . import node_routing
+        saved = {k: self.agents[k].token_callback for k in keys}
+        for k in keys:
+            self.agents[k].token_callback = None
+        try:
+            outcomes = node_routing.run_parallel(
+                [(lambda k=k: fn(k)) for k in keys])
+        finally:
+            for k, cb in saved.items():
+                self.agents[k].token_callback = cb
+        for o in outcomes:
+            if not o.ok:
+                raise o.error
+        return {k: o.value for k, o in zip(keys, outcomes)}
 
     def _phase(self, label: str) -> None:
         self._emit(AgentEvent("Orchestrator", "phase", f"▶ {label}"))
@@ -535,34 +591,37 @@ class DeliberationOrchestrator:
             discussion_lines: List[str] = []
 
             # 1) Candidates + Peasant cross-exam
+            # Parallel: every member drafts at once, then the drafts are
+            # taken in panel order below — clarifications and the Peasant's
+            # cross-examination stay one at a time, since each builds on the
+            # last.
+            # THIS CHANGES THE DEBATE, deliberately: one at a time, each
+            # member drafts after reading the earlier members' answers and
+            # the Peasant's questions about them (_compose_prompt reads
+            # ctx.shared["candidates"]), so later members can anchor on the
+            # first. Side by side, the drafts are independent and the members
+            # first meet each other's answers in the rebuttal. A
+            # clarification then reaches the next round, not the members
+            # drafting alongside.
+            drafts: Dict[str, Any] = {}
+            if self.parallel_members and len(panel) > 1:
+                self._phase(f"Drafting — {len(panel)} members at once")
+                drafts = self._side_by_side(
+                    list(panel), lambda k: self._draft_one(k, ctx))
             for key in panel:
-                self._phase(f"{key.capitalize()} — drafting answer")
-                evs = self.agents[key].act(ctx)
-                for ev in evs:
-                    emit(ev)
-                answer = next((e.text for e in reversed(evs) if e.kind == "final"), "")
+                if key in drafts:
+                    evs, answer, _self_conf = drafts[key]
+                    for ev in evs:
+                        emit(ev)
+                else:
+                    self._phase(f"{key.capitalize()} — drafting answer")
+                    evs, answer, _self_conf = self._draft_one(key, ctx, emit)
                 # Strip code from candidate answers on conversational routes
                 # so they don't contaminate what other panel members read.
                 _qmode = ctx.shared.get("query_mode", "")
                 _stored_answer = answer
                 if _qmode == "conversational":
                     _stored_answer = _strip_code_blocks(answer)
-                # ── #8 Self-reported confidence ─────────────────────────────
-                # Ask each candidate to rate their own confidence 1-10.
-                # A single cheap token call — models are usually well-calibrated
-                # at distinguishing "I'm guessing" from "I'm certain".
-                _self_conf = 5  # default if call fails
-                try:
-                    _conf_raw = self.agents[key].model.respond(
-                        "Rate your confidence in the answer you just gave, 1–10. "
-                        "Reply with ONLY the single digit — no words, no punctuation.\n\n"
-                        f"YOUR ANSWER (first 400 chars):\n{answer[:400]}",
-                        max_tokens=5,
-                    ).strip()
-                    _self_conf = int(_conf_raw[0]) if _conf_raw and _conf_raw[0].isdigit() else 5
-                    _self_conf = max(1, min(10, _self_conf))
-                except Exception:
-                    pass
                 candidates[key] = {
                     "answer": _stored_answer,
                     "peasant_q": "", "rebuttal": "", "discussion": "",
@@ -638,9 +697,8 @@ class DeliberationOrchestrator:
             if self._pause_event and not self._pause_event.is_set():
                 self._pause_event.wait(timeout=300)
             self._phase("Rebuttal round")
-            for key in panel:
-                if key == "peasant" or key not in candidates:
-                    continue
+
+            def _rebuttal_context(key: str) -> str:
                 other_roles = [r for r in candidates if r != key]
                 debate_lines = [
                     "DEBATE CONTEXT:",
@@ -670,13 +728,31 @@ class DeliberationOrchestrator:
                     "- Keep under 12 bullet points.",
                     "- Do NOT introduce code unless this is a TECHNICAL query.",
                 ]
-                extra_context = "\n".join(debate_lines)
-                self._phase(f"{key.capitalize()} — rebuttal")
-                rebuttal_text = self.agents[key].model.respond(
-                    "Produce your rebuttal now.", extra_context=extra_context,
+                return "\n".join(debate_lines)
+
+            def _rebut(key: str) -> str:
+                return self.agents[key].model.respond(
+                    "Produce your rebuttal now.",
+                    extra_context=_rebuttal_context(key),
                     token_callback=self.agents[key]._make_token_cb(),
                     max_tokens=600,  # rebuttals must be concise bullets, not essays
                 )
+
+            rebutters = [k for k in panel
+                         if k != "peasant" and k in candidates]
+            # Each rebuttal reads only the finished drafts and the Peasant's
+            # questions — never another rebuttal — so writing them side by
+            # side changes nothing but the time it takes.
+            rebuttals: Dict[str, str] = {}
+            if self.parallel_members and len(rebutters) > 1:
+                self._phase(f"Rebuttals — {len(rebutters)} members at once")
+                rebuttals = self._side_by_side(rebutters, _rebut)
+            for key in rebutters:
+                if key in rebuttals:
+                    rebuttal_text = rebuttals[key]
+                else:
+                    self._phase(f"{key.capitalize()} — rebuttal")
+                    rebuttal_text = _rebut(key)
                 candidates[key]["rebuttal"] = rebuttal_text
                 ev = AgentEvent(key.capitalize(), "observation", f"Rebuttal:\n{rebuttal_text}")
                 emit(ev)
