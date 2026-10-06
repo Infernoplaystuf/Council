@@ -155,6 +155,7 @@ def test_run_folder_accepts_an_output_dir_under_a_short_name_vault(
     monkeypatch.setattr(nx_bridge, "run_job",
                         lambda job, **_k: sent.update(job) or {"ok": 0})
     out = data_index.output_dir(short) / "dream3d" / "runs"
+    out.mkdir(parents=True)     # an existing folder resolves to \\?\<long>
     nx_bridge.run_folder("p.d3dpipeline", short, out, vault_dir=short)
     assert sent["action"] == "run_folder"
     with pytest.raises(nx_bridge.NxError, match="outside the vault output"):
