@@ -356,7 +356,7 @@ def _table_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record
                 loc = {"row": idx + 2, "column": str(c)}
                 if sheet is not None:
                     loc["sheet"] = sheet
-                for one in (fs._split_values(raw) or [raw]):
+                for one in (fs._split_values(raw, r.label, r.type) or [raw]):
                     rec.values.append(Value(r, one, loc, raw))
             if rec.values:
                 out.append(rec)
@@ -392,7 +392,7 @@ def _json_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]
                     cursor[0] = i
                 loc = {"line": i + 1} if i >= 0 else {}
                 snip = fs._snippet(lines[i]) if i >= 0 else raw
-                for one in (fs._split_values(raw) or [raw]):
+                for one in (fs._split_values(raw, r.label, r.type) or [raw]):
                     rec.values.append(Value(r, one, loc, snip))
             if rec.values:
                 out.append(rec)
@@ -413,7 +413,7 @@ def _text_records(p: Path, rel: str, rules: Sequence[FieldRule]) -> List[Record]
     import field_search as fs
     best: Dict[tuple, Value] = {}
     for r in rules:
-        for loc in fs.field_value_locations(p, r.label):
+        for loc in fs.field_value_locations(p, r.label, kind=r.type):
             key = (loc.get("page"), loc.get("line"), loc["value"])
             prev = best.get(key)
             if prev is None or len(r.label) > len(prev.rule.label):

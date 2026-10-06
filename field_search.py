@@ -44,7 +44,7 @@ _CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 # One field may list several values: 'Bob Smith, Alice Jones', 'Bob and Alice',
 # 'Bob; Alice'. _split_values applies these in order with guards.
 _SEMI_RE = re.compile(r"\s*;\s*")
-_AND_SPLIT_RE = re.compile(r"\s+(?:and|&)\s+", re.I)
+_AND_CAPTURE_RE = re.compile(r"(\s+(?:and|&)\s+)", re.I)
 _COMMA_RE = re.compile(r"\s*,\s*")
 _SLASH_RE = re.compile(r"\s*/\s*")
 _GROUP_NOUN_RE = re.compile(
@@ -104,34 +104,104 @@ def _ends_in_group_noun(s: str) -> bool:
     return bool(_GROUP_NOUN_RE.search(str(s or "").strip()))
 
 
+# Labels that name people. Only under one of these may a value be written
+# 'Last, First'; under any other label ('Project: Helios, Atlas') a comma
+# separates values, as it always did.
+_PERSON_LABEL_WORDS = frozenset((
+    "contact", "contacts", "poc", "owner", "owners", "lead", "leads", "leader",
+    "manager", "managers", "engineer", "engineers", "author", "authors",
+    "reviewer", "reviewers", "approver", "approvers", "assignee", "assignees",
+    "assigned", "responsible", "name", "names", "person", "people", "sponsor",
+    "champion", "technician", "inspector", "operator", "analyst", "director",
+    "chair", "pm", "attendee", "attendees", "member", "members", "participant",
+    "participants", "recipient", "recipients", "requester", "requestor",
+    "supervisor", "signatory", "by", "cc", "staff", "who"))
+# ...and the ones that LIST people: 'Attendees: Bob, Alice' is two people.
+_PERSON_LIST_WORDS = frozenset((
+    "contacts", "owners", "leads", "managers", "engineers", "authors",
+    "reviewers", "approvers", "assignees", "names", "people", "attendees",
+    "members", "participants", "recipients", "cc", "staff"))
+
+
+def _reads_last_first(field: Optional[str] = None, kind: Optional[str] = None) -> bool:
+    """May a value of this field be written 'Last, First'?
+
+    'Lee, Carol' (Outlook and directory exports) is one person, but 'Bob,
+    Alice' under 'Attendees' is two and 'Helios, Atlas' under 'Project' is two
+    projects — the same shape. So the reading needs a field that names ONE
+    person: ``kind`` 'PERSON' (the knowledge graph knows each rule's type), or
+    a person label such as Point of Contact, Owner or Lead. A label that lists
+    people (Attendees, Members…) or names anything else splits on the comma.
+    With neither given (a bare value) the shape alone decides."""
+    if kind is not None and str(kind).upper() != "PERSON":
+        return False
+    if field is None:
+        return True
+    toks = _norm_key(field).split()
+    if toks and toks[-1] in _PERSON_LIST_WORDS:
+        return False
+    return kind is not None or any(t in _PERSON_LABEL_WORDS for t in toks)
+
+
 def _looks_last_first(left: str, right: str) -> bool:
-    """'Lee' + 'Carol' / 'Carol A.' / 'D.' — the two halves of 'Lee, Carol'."""
+    """'Lee' + 'Carol' / 'Carol A.' / 'John Jr.' / 'D.' — the two halves of
+    'Lee, Carol'. Not 'Bob' + 'Alice Smith': a first name AND a surname after
+    the comma is a second person, not the first one's given name."""
     lw, rw = left.split(), right.split()
-    return (len(lw) == 1 and bool(_NAME_WORD_RE.match(lw[0]))
-            and 1 <= len(rw) <= 2
-            and all(_NAME_WORD_RE.match(w) or _INITIAL_RE.match(w)
-                    for w in rw))
+    if len(lw) != 1 or not _NAME_WORD_RE.match(lw[0]) or not 1 <= len(rw) <= 2:
+        return False
+    if not (_NAME_WORD_RE.match(rw[0]) or _INITIAL_RE.match(rw[0])):
+        return False
+    return len(rw) == 1 or bool(_INITIAL_RE.match(rw[1]) or _SUFFIX_RE.match(rw[1]))
 
 
-def _comma_split(piece: str) -> List[str]:
+def _comma_split(piece: str, *, last_first: bool = True,
+                 names: bool = True) -> List[str]:
     """Split on commas, but keep 'Last, First' and 'Name, Jr.' whole.
 
-    A lone initial or suffix after a comma always joins the name before it.
-    'Last, First' is only assumed when the piece has exactly two comma parts:
-    'Bob, Alice, Carol' stays a list of three, while 'Lee, Carol' — the form
-    Outlook and directory exports write — stays one person. Two bare first
-    names ('Bob, Alice') read the same way and are kept together too; the
-    graph can still tell them apart later, a split name cannot be rejoined."""
+    A lone initial or suffix after a comma joins the name before it (unless
+    ``names`` is False: the field holds parts or projects). 'Last, First' is
+    only assumed when ``last_first`` allows it (see _reads_last_first) and the
+    piece has exactly two comma parts: 'Bob, Alice, Carol' stays a list of
+    three, while 'Lee, Carol' stays one person. A trailing comma ('Alice,
+    Bob,' before an 'and') marks a list."""
+    trailing = piece.rstrip().endswith(",")
     parts = [p.strip() for p in _COMMA_RE.split(piece)]
     parts = [p for p in parts if p]
-    if len(parts) == 2 and _looks_last_first(*parts):
+    if (last_first and not trailing and len(parts) == 2
+            and _looks_last_first(*parts)):
         return [f"{parts[0]}, {parts[1]}"]
     out: List[str] = []
     for p in parts:
-        if out and (_SUFFIX_RE.match(p) or _INITIAL_RE.match(p)):
+        if names and out and (_SUFFIX_RE.match(p) or _INITIAL_RE.match(p)):
             out[-1] = f"{out[-1]}, {p}"
         else:
             out.append(p)
+    return out
+
+
+def _and_split(piece: str) -> List[str]:
+    """Split on a spaced 'and' / '&', except where it joins the words of ONE
+    group's name: 'Bearings & Seals Program', 'Research and Development
+    Project'. The guard looks only at the two sides of that 'and', up to the
+    nearest comma — so 'Carol Lee and Tomas Echeverria, Test Team' still
+    splits — and it does not hold when the left side is a group of its own
+    ('Ops Team and QA Team') or the right side starts with 'the' ('Bob Smith
+    and the Test Team'). An unspaced '&' ('R&D') never splits."""
+    bits = _AND_CAPTURE_RE.split(piece)
+    out: List[str] = []
+    cur = bits[0]
+    for i in range(1, len(bits) - 1, 2):
+        sep, nxt = bits[i], bits[i + 1]
+        left = cur.rsplit(",", 1)[-1].strip()
+        right = nxt.split(",", 1)[0].strip()
+        if (left and _ends_in_group_noun(right) and not _ends_in_group_noun(left)
+                and not right.lower().startswith("the ")):
+            cur = cur + sep + nxt
+        else:
+            out.append(cur)
+            cur = nxt
+    out.append(cur)
     return out
 
 
@@ -145,7 +215,7 @@ def _slash_split(piece: str) -> List[str]:
     return [piece]
 
 
-def _split_values(v: str):
+def _split_values(v: str, field: Optional[str] = None, kind: Optional[str] = None):
     """One field's value text -> the individual values it lists.
 
     Stops at the point another field begins: 'Bob; Reviewer: Alice' is Bob, not
@@ -155,15 +225,25 @@ def _split_values(v: str):
     Splits on ';' first, then a spaced 'and' / '&', then ',' and '/', each with
     a guard, because the knowledge graph turns every piece into a person, part
     or project: splitting blindly made 'Lee, Carol' two people, 'PN-1234/A' two
-    parts and 'Bearings & Seals Program' two projects. 'and' / '&' do not split
-    a value that ends in a group noun (Program, Project, Team, Inc…), and an
-    unspaced '&' ('R&D') never splits."""
+    parts and 'Bearings & Seals Program' two projects. The guards (see
+    _and_split, _comma_split, _reads_last_first) are scoped so they do not fuse
+    real lists either: 'Alice, Bob and Carol' is three people, 'Carol Lee and
+    Tomas Echeverria, Test Team' three values, 'Bob, Alice Smith' two people.
+
+    ``field`` (the label) and ``kind`` (PERSON / PART / PROJECT, when known)
+    decide whether 'Last, First' is a possible reading. Splitting is
+    idempotent: splitting a value it produced gives that value back, which
+    field_value_file_rows relies on (it re-splits extracted values)."""
+    last_first = _reads_last_first(field, kind)
+    names = kind is None or str(kind).upper() == "PERSON"
     out = []
     for semi in _SEMI_RE.split(str(v or "")):
-        ands = ([semi] if _ends_in_group_noun(semi)
-                else _AND_SPLIT_RE.split(semi))
+        ands = _and_split(semi)
+        # 'Smith, Bob and Lee, Carol' is two 'Last, First' people; in 'Alice,
+        # Bob and Carol' the comma is a list, because a sibling has no comma.
+        lf = last_first and (len(ands) == 1 or all("," in a for a in ands))
         for a in ands:
-            for c in _comma_split(a):
+            for c in _comma_split(a, last_first=lf, names=names):
                 for part in _slash_split(c):
                     part = _EMPH_RE.sub("", part).strip()
                     # A trailing '.' is sentence punctuation, unless it closes
@@ -641,7 +721,8 @@ def _field_values_in_text(text: str, fn: str, *, max_hits: int = 100):
     return [v for v, _i in _located_text_values(text, fn, max_hits=max_hits)]
 
 
-def _located_text_values(text: str, fn: str, *, max_hits: int = 100):
+def _located_text_values(text: str, fn: str, *, max_hits: int = 100,
+                         kind: Optional[str] = None):
     """The line rules of _field_values_in_text, keeping WHERE each value was:
     ``[(value, line_index)]`` with a 0-based index into ``text.splitlines()``.
     The index is the line holding the VALUE — for a heading-style field that is
@@ -661,13 +742,13 @@ def _located_text_values(text: str, fn: str, *, max_hits: int = 100):
                 if _label_is(cell, fn):
                     nxt = cells[j + 1].strip()
                     if nxt and not _RULE_RE.match(nxt):
-                        vals.extend((v, i) for v in _split_values(nxt))
+                        vals.extend((v, i) for v in _split_values(nxt, fn, kind))
             continue
         pairs = _kv_pairs(line)
         if pairs:
             for key, val in pairs:
                 if val and _label_is(key, fn):
-                    vals.extend((v, i) for v in _split_values(val))
+                    vals.extend((v, i) for v in _split_values(val, fn, kind))
             continue
         # heading style: the line IS the label -> value on the next non-empty
         # line, unless that line starts a different field.
@@ -678,7 +759,7 @@ def _located_text_values(text: str, fn: str, *, max_hits: int = 100):
                     continue
                 if nxt.startswith("|") or _kv_pairs(nxt):
                     break        # the next field began; this heading has no value
-                vals.extend((v, j) for v in _split_values(nxt))
+                vals.extend((v, j) for v in _split_values(nxt, fn, kind))
                 break
     return vals
 
@@ -698,7 +779,8 @@ def _snippet(line: str, limit: int = 200) -> str:
 
 
 def field_value_locations(path: Any, field: str, *,
-                          max_values: int = 5000) -> List[Dict[str, Any]]:
+                          max_values: int = 5000,
+                          kind: Optional[str] = None) -> List[Dict[str, Any]]:
     """Every value of the labelled ``field`` in ONE file, with where it is.
 
     The knowledge graph cites every fact, so a value alone is not enough: this
@@ -709,8 +791,9 @@ def field_value_locations(path: Any, field: str, *,
       * ``"line"`` — text: ``line`` (1-based), plus ``page`` (1-based) for a
         PDF, read page by page so the page is known.
 
-    Values are split exactly as in search (``_split_values``). Read-only and
-    bounded; an unreadable file gives ``[]``."""
+    Values are split exactly as in search (``_split_values``); ``kind``
+    (PERSON / PART / PROJECT) tells the splitter whether 'Last, First' can be
+    meant. Read-only and bounded; an unreadable file gives ``[]``."""
     p = Path(path)
     fn = _norm_key(field)
     if not fn:
@@ -732,7 +815,7 @@ def field_value_locations(path: Any, field: str, *,
                 raw = str(raw).strip()
                 if not raw:
                     continue
-                for one in (_split_values(raw) or [raw]):
+                for one in (_split_values(raw, field, kind) or [raw]):
                     loc = {"value": one, "kind": "row", "row": idx + 2,
                            "column": str(col), "snippet": _snippet(raw)}
                     if sheet is not None:
@@ -759,7 +842,7 @@ def field_value_locations(path: Any, field: str, *,
                     cursor = i
                 located.append((v, i))
         else:
-            located = _located_text_values(text, fn, max_hits=max_values)
+            located = _located_text_values(text, fn, max_hits=max_values, kind=kind)
         for v, i in located:
             loc = {"value": v, "kind": "line",
                    "line": (i + 1) if i >= 0 else None,
@@ -1063,7 +1146,7 @@ def find_files_with_field_value(root: Any, field: str, value: str, *,
                     # Alice Smith: a person who is not on it, invented out of
                     # two who are. The text path split; this one did not, and
                     # the two drifted apart.
-                    for one in (_split_values(v) or [v]):
+                    for one in (_split_values(v, field) or [v]):
                         ok, note = _match_detail(one, value)
                         if ok:
                             # Report the value ACTUALLY in the cell, and name
@@ -1226,7 +1309,7 @@ def field_value_file_rows(root: Any, field: str, *,
         seen_here = set()
         had_one = False
         for raw in vals:
-            for one in (_split_values(raw) or [raw]):
+            for one in (_split_values(raw, field) or [raw]):
                 one = str(one).strip()
                 key = _norm(one)
                 if not key or key in seen_here:

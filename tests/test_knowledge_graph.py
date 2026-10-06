@@ -366,3 +366,38 @@ def test_a_spot_is_cited_once(tmp_path):
     for eid, in kg.db.execute("SELECT id FROM entities WHERE type != 'DOCUMENT'"):
         spots = [(m["path"], m["where"]) for m in kg.mentions(eid)]
         assert len(spots) == len(set(spots))
+
+
+# ── review fixes (merge of knowledge-graph into qt-migration) ─────────────
+def _tiny(tmp_path, files, name="tiny"):
+    """A vault whose data_in holds exactly ``files`` ({relative path: text or
+    bytes}), every rule confirmed."""
+    v = tmp_path / name
+    for rel, body in files.items():
+        f = v / "data_in" / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(body, bytes):
+            f.write_bytes(body)
+        else:
+            f.write_text(body, encoding="utf-8")
+    return v
+
+
+def _people(kg):
+    return sorted(r[0] for r in kg.db.execute(
+        "SELECT name FROM entities WHERE type='PERSON'"))
+
+
+def _names(kg, etype):
+    return sorted(r[0] for r in kg.db.execute(
+        "SELECT name FROM entities WHERE type=?", (etype,)))
+
+
+def test_a_list_of_people_and_a_pair_of_projects_stay_separate(tmp_path):
+    v = _tiny(tmp_path, {"tracker.csv": 'Project,Point of Contact\n'
+                                         'Northwind,"Alice, Bob and Carol"\n'
+                                         '"Helios, Atlas","Lee, Carol"\n'})
+    with _graph(v) as kg:
+        kg.seed()
+        assert _people(kg) == ["Alice", "Bob", "Carol", "Carol Lee"]
+        assert _names(kg, "PROJECT") == ["Atlas", "Helios", "Northwind"]
