@@ -240,3 +240,87 @@ def test_cancel_stops_the_write(tmp_path):
     (job.parent / "cancel").write_text("", encoding="utf-8")
     final = fh.run(job, FakeOps(tmp_path, [SD]))
     assert not final["ok"] and "cancelled" in final["message"]
+
+
+# ── review fixes (merge of knowledge-graph into qt-migration) ─────────────
+def _argv(command_line: str):
+    """How a Windows program splits its command line (CommandLineToArgvW)."""
+    import ctypes
+    from ctypes import wintypes
+    f = ctypes.windll.shell32.CommandLineToArgvW
+    f.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+    f.restype = ctypes.POINTER(wintypes.LPWSTR)
+    n = ctypes.c_int()
+    arr = f(command_line, ctypes.byref(n))
+    try:
+        return [arr[i] for i in range(n.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(arr)
+
+
+def test_the_elevated_launch_passes_paths_with_spaces_and_apostrophes_whole(
+        tmp_path, monkeypatch):
+    # Start-Process joins an -ArgumentList ARRAY with spaces and quotes
+    # nothing: a profile 'C:\Users\John Smith' reached the helper as two
+    # arguments, and an apostrophe in the interpreter's path ('O'Brien')
+    # broke the -FilePath string. PowerShell itself evaluates the command
+    # here, with Start-Process replaced by a function that only prints what
+    # it was given - nothing is started, nothing is elevated.
+    import base64
+    import shutil
+    import subprocess
+    import sys
+    if sys.platform != "win32" or not shutil.which("powershell"):
+        pytest.skip("Windows PowerShell only")
+    job = tmp_path / "John Smith's PC" / "jobs" / "1c0e8a4e-7a43-4e0a-9d43-2b8f0c1a2b3c" / "job.json"
+    fake_python = r"C:\Users\O'Brien Smith\miniconda3\envs\council\python.exe"
+    monkeypatch.setattr(sys, "executable", fake_python)
+    scripts = []
+    monkeypatch.setattr(fh, "_ps", lambda script, timeout=120: scripts.append(script) or "")
+    fh.start_elevated(job)
+    assert scripts[0].startswith("Start-Process ")
+    # Renamed so the test's desktop guard does not take it for an opener;
+    # the name does not change how PowerShell parses the arguments.
+    script = "Show-StartArgs " + scripts[0][len("Start-Process "):]
+    # One line per token it was given; an array is joined with spaces, as
+    # Start-Process joins an -ArgumentList array.
+    shim = "function Show-StartArgs { foreach ($a in $args) { Write-Output \"$a\" } }\n"
+    enc = base64.b64encode((shim + script).encode("utf-16-le")).decode("ascii")
+    out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", enc],
+                         capture_output=True, text=True, timeout=120)
+    # (stderr may carry a CLIXML progress record; only errors count)
+    assert out.returncode == 0 and 'S="Error"' not in out.stderr, out.stderr
+    toks = out.stdout.splitlines()
+    got = {toks[i].rstrip(":").lower(): toks[i + 1] for i in range(0, len(toks) - 1, 2)}
+    assert got["-filepath"] == fake_python and got["-verb"] == "RunAs"
+    assert Path(got["-workingdirectory"]) == Path(fh.__file__).resolve().parents[2]
+    assert _argv('"x.exe" ' + got["-argumentlist"])[1:] == [
+        "-m", "council_core.pi_setup.flash_helper", str(job)]
+
+
+def test_the_helper_refuses_a_path_that_is_not_a_job_and_writes_nothing(tmp_path, monkeypatch):
+    # A mangled path ('C:\Users\John') made the elevated helper write
+    # status.json as administrator into the parent folder.
+    ran = []
+    monkeypatch.setattr(fh, "run", lambda p, ops=None: ran.append(p) or {"ok": True})
+    (tmp_path / "Users").mkdir()
+    before = sorted(tmp_path.rglob("*"))
+    for bad in (tmp_path / "Users" / "John", tmp_path / "Users" / "job.json",
+                tmp_path / "jobs" / "not-a-uuid" / "job.json"):
+        assert fh.main(["flash_helper", str(bad)]) != 0
+    assert fh.main(["flash_helper"]) != 0
+    assert ran == [] and sorted(tmp_path.rglob("*")) == before
+    good = tmp_path / "pi_setup" / "jobs" / "1c0e8a4e-7a43-4e0a-9d43-2b8f0c1a2b3c" / "job.json"
+    good.parent.mkdir(parents=True)
+    good.write_text("{}", encoding="utf-8")
+    assert fh.main(["flash_helper", str(good)]) == 0 and ran == [good]
+
+
+def test_first_boot_files_must_be_known_names(tmp_path):
+    boot = tmp_path / "boot"
+    boot.mkdir()
+    (boot / "cmdline.txt").write_text("console=tty1\n", encoding="utf-8")
+    for bad in ("C:evil.txt", "autorun.inf", "user-data:stream"):
+        with pytest.raises(ValueError):
+            fb.apply(boot, {bad: "x"}, fb.CLOUDINIT)
+    assert sorted(p.name for p in boot.iterdir()) == ["cmdline.txt"]

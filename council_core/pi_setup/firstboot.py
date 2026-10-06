@@ -216,6 +216,10 @@ def _systemd(cfg: FirstBoot, pw_hash: str, psk: str) -> Dict[str, str]:
             "ssh": ""}
 
 
+#: Every file build() can produce, for either format.
+FIRSTBOOT_NAMES = frozenset({"user-data", "network-config", "meta-data", "ssh",
+                             "firstrun.sh", "userconf.txt"})
+
 CMDLINE_HOOK = (" systemd.run=/boot/firmware/firstrun.sh systemd.run_success_action=reboot "
                 "systemd.unit=kernel-command-line.target")
 
@@ -239,9 +243,13 @@ def apply(boot_dir: Path, files: Dict[str, str], init_format: str) -> List[str]:
         raise FileNotFoundError(f"{boot_dir} is not a Raspberry Pi boot partition "
                                 "(no cmdline.txt)")
     written = []
+    # Only the names build() makes: the elevated helper writes these, and a
+    # name such as 'C:evil.txt' passed the old '/', '\\', '.' check and
+    # resolved outside the card (PureWindowsPath('F:/') / 'C:evil.txt').
+    bad = [n for n in files if n not in FIRSTBOOT_NAMES]
+    if bad:
+        raise ValueError(f"bad first-boot file name {bad[0]!r}")
     for name, text in files.items():
-        if "/" in name or "\\" in name or name.startswith("."):
-            raise ValueError(f"bad first-boot file name {name!r}")
         target = boot_dir / name
         tmp = boot_dir / (name + ".council-tmp")
         tmp.write_bytes(text.replace("\r\n", "\n").encode("utf-8"))

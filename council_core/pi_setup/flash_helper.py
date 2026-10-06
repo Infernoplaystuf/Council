@@ -27,12 +27,13 @@ them back (firstboot.verify). Any mismatch is an error, not a quiet success.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from . import disks as dk
 from . import firstboot as fb
@@ -173,15 +174,28 @@ def write_job(job_dir: Path, *, disk: dk.Disk, image: Path, init_format: str,
     return p
 
 
+def _ps_quote(s: Any) -> str:
+    """A PowerShell single-quoted string that is exactly ``s``."""
+    return "'" + str(s).replace("'", "''") + "'"
+
+
 def start_elevated(job_path: Path) -> None:
     """Start this helper as administrator — Windows shows its UAC prompt.
     Declining the prompt is reported by the caller as a status that never
-    appears (and by PowerShell's error, raised here)."""
+    appears (and by PowerShell's error, raised here).
+
+    The arguments go as ONE pre-quoted string. Start-Process joins an
+    -ArgumentList array with spaces and quotes nothing, so for a profile such
+    as C:\\Users\\John Smith the helper got 'C:\\Users\\John' and 'Smith\\...'
+    (and, elevated, wrote status.json into C:\\Users). Every string is
+    single-quote escaped — an apostrophe in the interpreter's or the repo's
+    path (O'Brien) used to end the string early. A Windows path cannot hold
+    a double quote, so wrapping the job path in "..." is exact."""
     repo = Path(__file__).resolve().parents[2]
-    args = ", ".join("'" + a.replace("'", "''") + "'" for a in
-                     ("-m", "council_core.pi_setup.flash_helper", str(job_path)))
-    _ps(f"Start-Process -FilePath '{sys.executable}' -ArgumentList @({args}) "
-        f"-WorkingDirectory '{repo}' -Verb RunAs -WindowStyle Hidden", timeout=300)
+    arglist = f'-m council_core.pi_setup.flash_helper "{Path(job_path)}"'
+    _ps(f"Start-Process -FilePath {_ps_quote(sys.executable)} "
+        f"-ArgumentList {_ps_quote(arglist)} -WorkingDirectory {_ps_quote(repo)} "
+        "-Verb RunAs -WindowStyle Hidden", timeout=300)
 
 
 def read_status(job_dir: Path) -> Optional[Dict[str, Any]]:
@@ -191,5 +205,25 @@ def read_status(job_dir: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+def is_job_path(p: Path) -> bool:
+    """True only for ``…/jobs/<uuid>/job.json`` that exists — the shape
+    setup.prepare_new_pi writes. The helper runs as administrator and writes
+    status.json beside its job, so a mangled or foreign path is refused
+    before anything is read or written."""
+    p = Path(p)
+    return (p.name == "job.json" and bool(_UUID_RE.match(p.parent.name))
+            and p.parent.parent.name == "jobs" and p.is_file())
+
+
+def main(argv: List[str]) -> int:
+    """The elevated entry point: exactly one argument, a job path."""
+    if len(argv) != 2 or not is_job_path(Path(argv[1])):
+        return 2
+    return 0 if run(Path(argv[1])).get("ok") else 1
+
+
 if __name__ == "__main__":                                 # pragma: no cover
-    sys.exit(0 if run(Path(sys.argv[1])).get("ok") else 1)
+    sys.exit(main(sys.argv))
