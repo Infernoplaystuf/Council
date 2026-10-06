@@ -15,7 +15,10 @@ Moved from the Tk engine's `_nx_check_env` / `_nx_catalog` /
     data_out/dream3d/nx_catalog.json with no way to clear either, so after an
     nx reinstall every generated script was grounded on filters that might no
     longer exist. `invalidate_catalog()` clears both, and `check_env()` — the
-    button a user presses after reinstalling — calls it.
+    button a user presses after reinstalling — calls it. That still relied on
+    the user pressing it: `catalog()` now also refuses a cached copy whose
+    schema, python or dream3dnx version no longer matches the env
+    (nx_bridge.catalog_stale_reason), with no subprocess.
   * A REFUSED SCRIPT WAS "SAVED". write_script returns code=None when no filter
     matches; nothing was written, yet the report said "It is saved for you to
     read at <path>". The report now names a path only when a file exists there.
@@ -87,24 +90,57 @@ def _catalog_path(vault_dir: Path) -> Optional[Path]:
         return None
 
 
+def _stale(cat: dict, bridge: Any) -> Optional[str]:
+    """Why ``cat`` no longer matches the installed env (None = still good).
+
+    Asks the bridge, because only it knows where the env is; a bridge without
+    the check (a test double) keeps the old behaviour."""
+    check = getattr(bridge, "catalog_stale_reason", None)
+    if check is None:
+        return None
+    try:
+        return check(cat)
+    except Exception:                                     # noqa: BLE001
+        return None
+
+
+# Why the last catalog() call rebuilt instead of using its cache, per vault.
+last_rebuild_reason: Dict[Path, str] = {}
+
+
 def catalog(vault_dir: Path, *, force: bool = False,
             bridge: Any = None) -> dict:
-    """The INSTALLED package's filter catalog: memory, then disk, then nx."""
+    """The INSTALLED package's filter catalog: memory, then disk, then nx.
+
+    A cached copy is used only while it still describes the installed env
+    (nx_bridge.catalog_stale_reason: schema, python and dream3dnx version).
+    It used to be used for good, so after an nx reinstall every script was
+    checked against filters that might no longer exist."""
+    if bridge is None:
+        import nx_bridge as bridge
     key = Path(vault_dir).resolve()
+    reason = "forced" if force else "nothing cached"
     with _catalog_lock:
-        if not force and _catalog_mem.get(key):
-            return _catalog_mem[key]
+        mem = None if force else _catalog_mem.get(key)
+        if mem:
+            why = _stale(mem, bridge)
+            if why is None:
+                return mem
+            reason = f"the cached catalog is stale: {why}"
+            _catalog_mem.pop(key, None)
         path = _catalog_path(vault_dir)
         if not force and path is not None and path.exists():
             try:
                 cached = json.loads(path.read_text(encoding="utf-8"))
-                if cached.get("filters"):
+                why = _stale(cached, bridge) if cached.get("filters") \
+                    else "it is empty"
+                if why is None:
                     _catalog_mem[key] = cached
                     return cached
+                reason = f"the saved catalog is stale: {why}"
             except Exception:                             # noqa: BLE001
-                pass
-    if bridge is None:
-        import nx_bridge as bridge
+                reason = "the saved catalog is unreadable"
+    last_rebuild_reason[key] = reason
     fresh = bridge.catalog()
     with _catalog_lock:
         _catalog_mem[key] = fresh

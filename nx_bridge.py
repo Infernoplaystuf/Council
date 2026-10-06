@@ -151,8 +151,104 @@ def ping(*, env: str = NX_ENV, timeout: int = 300) -> Dict[str, Any]:
 
 def catalog(*, env: str = NX_ENV, timeout: int = 900) -> Dict[str, Any]:
     """The full filter catalog of the INSTALLED binary — the model's only
-    source of truth about simplnx. Cache it; regenerate when the env changes."""
-    return run_job({"action": "catalog"}, env=env, timeout=timeout)
+    source of truth about simplnx. Cache it; regenerate when the env changes
+    (catalog_stale_reason says when: the result carries the env fingerprint
+    it was built from)."""
+    cat = run_job({"action": "catalog"}, env=env, timeout=timeout)
+    if isinstance(cat, dict):
+        cat["env"] = env_fingerprint(env)
+    return cat
+
+
+# ---- is a cached catalog still the installed one? --------------------------
+
+# The conda packages whose versions decide what the catalog contains. numpy
+# and the rest do not change a filter or a parameter.
+_FINGERPRINT_PACKAGES = ("python", "dream3dnx", "simplnx")
+
+
+def env_fingerprint(env: str = NX_ENV) -> Optional[Dict[str, Any]]:
+    """What the nx env's catalog depends on, read WITHOUT starting it.
+
+    A cached catalog is only worth its 0.006 s if checking it is just as
+    cheap, so this never launches the interpreter (ping costs ~1 s): for a
+    conda env it reads the package records in conda-meta (python-3.12.13-...,
+    dream3dnx-26.03.23-...), otherwise the size and mtime of the compiled
+    simplnx module. None when the env cannot be found."""
+    py = find_python(env)
+    if not py:
+        return None
+    root = Path(py).parent
+    if root.name.lower() == "bin":                # posix layout
+        root = root.parent
+    fp: Dict[str, Any] = {"python_exe": str(Path(py)), "packages": {}}
+    meta = root / "conda-meta"
+    try:
+        records = sorted(p.name[:-5] for p in meta.glob("*.json"))
+    except OSError:
+        records = []
+    for rec in records:
+        # 'python-3.12.13-h0159041_0_cpython', not 'python-dateutil-2.9.0-...'
+        for pkg in _FINGERPRINT_PACKAGES:
+            version = rec[len(pkg) + 1:]
+            if rec.startswith(pkg + "-") and version[:1].isdigit():
+                fp["packages"][pkg] = version
+    if not fp["packages"]:
+        # Not conda (a venv via COUNCIL_NX_PYTHON): the binary itself.
+        for pat in ("Lib/site-packages/simplnx*", "lib/python*/site-packages/simplnx*"):
+            for p in sorted(root.glob(pat)):
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                fp["packages"][p.name] = f"{st.st_size}:{st.st_mtime_ns}"
+    return fp
+
+
+def catalog_stale_reason(cat: Any, *, env: str = NX_ENV,
+                         fingerprint: Any = "probe") -> Optional[str]:
+    """Why a cached catalog no longer describes the installed env, or None.
+
+    Checked against the catalog's own fields: its schema (an older Council
+    built it without what the script checker needs), its "python" (the
+    interpreter it was built in) and its "env" fingerprint (the dream3dnx
+    package it was built from). Before this nothing compared them: a catalog
+    claiming python 3.9.0 and one fake filter was served for good, and every
+    generated script was grounded on it.
+
+    When the env cannot be found the cache is kept (None): the transpiler only
+    needs a catalog, and a run fails loudly on its own."""
+    try:
+        from nx_introspect import CATALOG_SCHEMA
+    except Exception:                                     # noqa: BLE001
+        CATALOG_SCHEMA = 2
+    if not isinstance(cat, dict) or not cat.get("filters"):
+        return "it is empty"
+    schema = cat.get("catalog_schema") or 1
+    if schema < CATALOG_SCHEMA:
+        return (f"it was built by an older version of this app (schema "
+                f"{schema}, now {CATALOG_SCHEMA})")
+    fp = env_fingerprint(env) if fingerprint == "probe" else fingerprint
+    if not fp:
+        return None
+    want_py = (fp.get("packages") or {}).get("python", "").split("-")[0]
+    have_py = str(cat.get("python") or "").split()[0] if cat.get("python") else ""
+    if want_py and have_py != want_py:
+        return (f"it was built in python {have_py or '?'}, and the nx env now "
+                f"has python {want_py}")
+    built = cat.get("env")
+    if not isinstance(built, dict):
+        return "it does not record which nx env it was built from"
+    if built.get("python_exe") != fp.get("python_exe"):
+        return (f"it was built from {built.get('python_exe')}, and the nx env "
+                f"is now {fp.get('python_exe')}")
+    if (built.get("packages") or {}) != (fp.get("packages") or {}):
+        old, new = built.get("packages") or {}, fp.get("packages") or {}
+        diff = ", ".join(f"{k} {old.get(k, '-')} -> {new.get(k, '-')}"
+                         for k in sorted(set(old) | set(new))
+                         if old.get(k) != new.get(k))
+        return f"the nx env changed since it was built ({diff})"
+    return None
 
 
 def describe_pipeline(pipeline: Any, *, env: str = NX_ENV,

@@ -9504,8 +9504,11 @@ class CouncilConsole(tk.Tk):
         thread only."""
         import json as _json
         import nx_bridge as _nb
+        # A cached catalog is used only while it still describes the installed
+        # env (schema, python, dream3dnx version — no subprocess); it used to
+        # be used for good, whatever the env became.
         cached = getattr(self, "_nx_catalog_cache", None)
-        if cached:
+        if cached and _nb.catalog_stale_reason(cached) is None:
             return cached
         try:
             path = self.data_index.safe_write_path(
@@ -9515,7 +9518,7 @@ class CouncilConsole(tk.Tk):
         if path and path.exists():
             try:
                 cached = _json.loads(path.read_text(encoding="utf-8"))
-                if cached.get("filters"):
+                if _nb.catalog_stale_reason(cached) is None:
                     self._nx_catalog_cache = cached
                     return cached
             except Exception:
