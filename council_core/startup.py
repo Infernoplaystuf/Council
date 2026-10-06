@@ -100,11 +100,17 @@ class Plan:
     onboarding_reason: str = ""
 
 
-def plan(vault_dir: Any, *, force_splash: Optional[bool] = None) -> Plan:
+def plan(vault_dir: Any, *, force_splash: Optional[bool] = None,
+         check_onboarding: bool = True) -> Plan:
     """Decide the launch before building anything.
 
     Deciding first, rather than checking conditions at each step, is what makes
     a launch reproducible: everything downstream reads this object.
+
+    ``check_onboarding=False`` leaves ``onboarding`` for the caller to fill
+    in from onboarding_needed() — the Qt launch does, on a worker after the
+    splash is up: the check can ask a local Ollama, and run here it delayed
+    the first pixel by up to three seconds (found in review).
     """
     interactive = is_interactive_host()
     result = Plan(
@@ -115,11 +121,13 @@ def plan(vault_dir: Any, *, force_splash: Optional[bool] = None) -> Plan:
         # the kernel about thirty seconds in.
         start_rag=not interactive,
     )
-    result.onboarding, result.onboarding_reason = _onboarding_needed(vault_dir)
+    if check_onboarding:
+        result.onboarding, result.onboarding_reason = onboarding_needed(
+            vault_dir)
     return result
 
 
-def _onboarding_needed(vault_dir: Any) -> tuple:
+def onboarding_needed(vault_dir: Any) -> tuple:
     """(needed, reason). Never raises — a broken vault must not stop a launch.
 
     NEEDED MEANS NO MODEL CAN ANSWER. This used to ask

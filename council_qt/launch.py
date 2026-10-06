@@ -22,6 +22,7 @@ no error anywhere.
 from __future__ import annotations
 
 import sys
+import threading
 import time
 from typing import Any, Callable, Optional
 
@@ -58,20 +59,30 @@ def build(argv: Optional[list] = None, *,
     # BEFORE the GUI exists, so a failure during construction is captured
     # rather than printed to a console the user may not have.
     _install_crash_hooks(vault)
-    # The vault's folders and an upgrader's old files, before anything reads
-    # the vault — the Tk engine does both at startup too.
-    _prepare_vault(vault)
     # Before the window, and so before any tab can build personalities: the
-    # engine reads these when it loads a model.
+    # engine reads these when it loads a model. A file read — no wait.
     _apply_engine_settings(vault)
 
     app = QApplication.instance() or QApplication(list(argv or sys.argv))
     theme.apply(app, "dark")
 
-    decided = startup.plan(vault)
+    # NOTHING SLOW BEFORE THE FIRST PIXEL. The readiness check can ask a
+    # local Ollama (0.9 s on a closed port, ~3 s on "localhost") and the vault
+    # setup can copy loose data into data_in/ (4.6 s for an 800 MB CSV); both
+    # ran before show_splash, which then appeared seconds late (found in
+    # review). So the plan is made without the check, the splash goes up,
+    # and the two run on workers with the cog kept turning.
+    decided = startup.plan(vault, check_onboarding=False)
     splash = (show_splash(manual=True) if decided.show_splash
               else NoSplash())
     started = time.monotonic()
+
+    # The vault's folders and an upgrader's old files — the Tk engine does
+    # both at startup too — finished before any tab reads the vault.
+    _Step(_prepare_vault, vault, name="startup-vault").wait(splash)
+    # Beside the window build; its answer is collected once the tabs exist.
+    readiness = _Step(startup.onboarding_needed, vault,
+                      name="startup-readiness")
 
     window = (window_factory or CouncilWindow)()
     if shutdown is not None:
@@ -84,6 +95,8 @@ def build(argv: Optional[list] = None, *,
     if register is not None:
         register(window)
     splash.pump()
+    decided.onboarding, decided.onboarding_reason = (
+        readiness.wait(splash) or (False, "could not check"))
 
     _schedule_reveal(window, splash, decided, started)
     if decided.onboarding:
@@ -94,6 +107,37 @@ def build(argv: Optional[list] = None, *,
 # ======================================================================
 # The steps
 # ======================================================================
+
+class _Step:
+    """``fn(*args)`` on a daemon thread, started at once; ``wait(splash)``
+    returns its result, pumping the splash until it is done.
+
+    Pumped, because the event loop is not running yet (see the module note):
+    joined plainly, the cog would freeze for exactly the stretch it covers.
+    The two startup steps run here never raise for an ordinary reason; one
+    that does anyway is reported and answers None — a launch is not stopped
+    by its own housekeeping."""
+
+    def __init__(self, fn: Callable[..., Any], *args: Any, name: str):
+        self._fn, self._args = fn, args
+        self._result: Any = None
+        self._thread = threading.Thread(target=self._run, name=name,
+                                        daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        try:
+            self._result = self._fn(*self._args)
+        except Exception as exc:                         # noqa: BLE001
+            print(f"[startup] {self._thread.name} failed: {exc!r}",
+                  flush=True)
+
+    def wait(self, splash) -> Any:
+        while self._thread.is_alive():
+            splash.pump()
+            self._thread.join(0.02)
+        return self._result
+
 
 def _install_crash_hooks(vault) -> None:
     """Never fatal. A crash reporter that stops the launch is worse than no

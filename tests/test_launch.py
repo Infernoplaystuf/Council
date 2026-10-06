@@ -284,6 +284,128 @@ def test_a_failing_wizard_is_reported_and_survived(qapp, no_model, capsys):
 
 
 # ============================================================
+# Nothing slow before the first pixel
+# ============================================================
+# Found in review: the readiness check (an Ollama probe: 0.9 s on a closed
+# 127.0.0.1 port, 2.5-3.2 s on "localhost", which tries ::1 and 127.0.0.1)
+# and the vault setup (a first-launch copy of loose data: 4.6 s with an
+# 800 MB CSV) both ran BEFORE show_splash — the batch-0 report said "during
+# the splash". Measured to the splash: 1.1 s on the base, 2.0 s on the branch.
+
+class _CountingSplash:
+    """NoSplash's surface, counting the frames it is pumped."""
+
+    def __init__(self):
+        self.pumps = 0
+        self.dismissed = False
+
+    def pump(self):
+        self.pumps += 1
+
+    def dismiss(self, on_done=None):
+        self.dismissed = True
+        if on_done:
+            on_done()
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def recorded(monkeypatch):
+    """The splash, the readiness check and the vault setup, recording when
+    each ran and on which thread. The real check and setup still run.
+    perf_counter, not monotonic: on Windows monotonic ticks every ~16 ms,
+    and two events in one tick cannot be ordered."""
+    import threading
+
+    from council_core import model_ready, vault_setup
+
+    events = []
+    splash = _CountingSplash()
+
+    def show_splash(**_kw):
+        events.append(("splash", time.perf_counter(), True))
+        return splash
+
+    def wrap(name, real, delay=0.0):
+        def recorded_call(*args, **kwargs):
+            on_main = threading.current_thread() is threading.main_thread()
+            events.append((name, time.perf_counter(), on_main))
+            time.sleep(delay)
+            try:
+                return real(*args, **kwargs)
+            finally:
+                events.append((name + " done", time.perf_counter(), on_main))
+        return recorded_call
+
+    monkeypatch.setattr(qt_launch, "show_splash", show_splash)
+    monkeypatch.setattr(model_ready, "check",
+                        wrap("check", model_ready.check, delay=0.5))
+    monkeypatch.setattr(vault_setup, "prepare",
+                        wrap("prepare", vault_setup.prepare, delay=0.3))
+    return events, splash
+
+
+def _when(events, name):
+    return next(at for what, at, _main in events if what == name)
+
+
+def test_the_splash_is_up_before_the_slow_startup_steps(qapp, recorded,
+                                                         no_model):
+    events, _splash = recorded
+    _app, window, plan = build()
+    names = [what for what, _at, _main in events]
+    assert names[0] == "splash", names
+    assert plan.onboarding, "the check's answer did not reach the plan"
+    window.request_close()
+
+
+def test_the_check_runs_beside_the_window_build_not_before_it(
+        qapp, recorded, no_model):
+    events, _splash = recorded
+    built = []
+
+    class Timed(FakeWindow):
+        def __init__(self):
+            built.append(time.perf_counter())
+            super().__init__()
+
+    _app, window, plan = build(window_factory=Timed)
+    started, finished = _when(events, "check"), _when(events, "check done")
+    assert started < built[0] < finished, (
+        "the window waited for the readiness check")
+    on_main = next(main for what, _at, main in events if what == "check")
+    assert not on_main, "the readiness check ran on the GUI thread"
+    assert plan.onboarding
+    window.request_close()
+
+
+def test_the_vault_setup_keeps_the_splash_turning(qapp, recorded):
+    events, splash = recorded
+    pumps_during = []
+    real_pump = splash.pump
+
+    def pump():
+        if _when_or_none(events, "prepare") and not _when_or_none(
+                events, "prepare done"):
+            pumps_during.append(1)
+        real_pump()
+
+    splash.pump = pump
+    _app, window, _plan = build()
+    on_main = next(main for what, _at, main in events if what == "prepare")
+    assert not on_main, "the vault setup blocked the GUI thread"
+    assert pumps_during, "the splash froze while the vault was set up"
+    assert _when(events, "prepare done") < _when(events, "splash") + 5
+    window.request_close()
+
+
+def _when_or_none(events, name):
+    return next((at for what, at, _main in events if what == name), None)
+
+
+# ============================================================
 # Tabs
 # ============================================================
 

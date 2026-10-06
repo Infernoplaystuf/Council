@@ -40,7 +40,9 @@ ONLY METADATA, ONLY LOOPBACK
 Ollama is asked /api/version and /api/tags through local_models, which refuses
 a non-loopback host — never a generation — and only when a role's GGUF does
 not already answer. A "no answer" is not left in local_models' cache (the
-engine would read it for the next 10 s).
+engine would read it for the next 10 s), and council_qt.launch runs the check
+on a worker beside the window build, after the splash is up, so a slow probe
+never holds back the first pixel.
 """
 from __future__ import annotations
 
