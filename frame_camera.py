@@ -1400,7 +1400,7 @@ def _camera_record(run: str, device: Any
         listed, error = [], _said(exc)
     try:
         limits, area = device.limits(), device.roi()
-        preset, changed = _preset_still_in_use(listed, area)
+        preset, changed = _preset_still_in_use(listed, area, error)
         info = _LIVE.info
         camera = {k: getattr(info, k, "") for k in
                   ("backend", "model", "serial", "vendor", "kind")}
@@ -1433,7 +1433,8 @@ def _not_recorded(run: str, exc: BaseException) -> str:
             f"was NOT written: {_said(exc)}.")
 
 
-def _preset_still_in_use(listed: List[Dict[str, Any]], area: Any
+def _preset_still_in_use(listed: List[Dict[str, Any]], area: Any,
+                         error: str = ""
                          ) -> "tuple[str, Optional[Dict[str, Any]]]":
     """(the preset's name, None) when the camera is still as the preset in
     use left it, else ("", {"name", "differs"}) — or ("", None) with none.
@@ -1444,17 +1445,31 @@ def _preset_still_in_use(listed: List[Dict[str, Any]], area: Any
     camera at Start catches all of them. A setting another one owns at the
     moment (an exposure time under auto exposure) is not compared: the
     camera moves it, and the preset that turned the auto loop on is still
-    what the camera is set to."""
+    what the camera is set to.
+
+    WHAT COULD NOT BE COMPARED IS NOT CONFIRMED. With the settings
+    unreadable (`error`) nothing was compared, and a key of the preset the
+    camera no longer lists cannot be compared — the record then names no
+    preset and says why, rather than the preset's name beside a camera
+    whose gain had really changed (MEASURED before: a box set the gain to
+    9 after preset "Day" (gain 3), the node map timed out at Start, and the
+    run's record said "Day")."""
     from council_core import camera_settings
 
     held = _LIVE.preset_in_use
     if not held:
         return "", None
+    if error:
+        return "", {"name": held["name"],
+                    "differs": [f"the settings could not be read: {error}"]}
     now = {str(row.get("key")): row for row in listed}
     differs = []
     for key, value in dict(held.get("settings") or {}).items():
         row = now.get(key)
-        if row is None or row.get("held") or row.get("read_only"):
+        if row is None:
+            differs.append(key)         # nothing to compare it with
+            continue
+        if row.get("held") or row.get("read_only"):
             continue
         if not camera_settings.same(value, row.get("value")):
             differs.append(key)
@@ -2646,6 +2661,11 @@ def delete_preset(name: Any) -> Dict[str, Any]:
         gone = _preset_store().delete(_identity(), chosen)
     except camera_presets.PresetError as exc:
         raise RuntimeError(str(exc)) from exc
+    held = _LIVE.preset_in_use
+    if held and str(held.get("name", "")).casefold() == gone.name.casefold():
+        # A run must never name a preset that is in no camera_presets.json —
+        # nor, later, one a new save under that name made of other settings.
+        _LIVE.preset_in_use = None
     return _presets_changed("", f"Deleted preset {gone.name!r}.")
 
 

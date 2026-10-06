@@ -914,6 +914,23 @@ def test_a_record_is_written_whole_and_read_back(tmp_path):
     assert back["full_sensor"] is False and back["preset"] == "Bird bath"
 
 
+def test_the_step_into_place_refuses_a_record_another_writer_just_made(
+        tmp_path):
+    """write() looks first, but a second writer can land between that look
+    and the rename — the RENAME itself must refuse (os.rename does on
+    Windows, a hard link elsewhere; os.replace would not). Called directly,
+    as the race leaves it: the record that won is never touched."""
+    from council_core import camera_record
+
+    final = camera_record.record_path(tmp_path, "20261005_120000")
+    final.write_bytes(b'{"theirs": true}\n')
+    temp = tmp_path / ".mine.tmp"
+    temp.write_bytes(b'{"mine": true}\n')
+    with pytest.raises(camera_record.RecordExists):
+        camera_record._publish(temp, final)
+    assert final.read_bytes() == b'{"theirs": true}\n'
+
+
 @pytest.mark.parametrize("text", [
     "", "not json", "[1, 2]", '{"format": "something else"}',
     '{"format": "typhon-camera-record", "format_version": 99}',

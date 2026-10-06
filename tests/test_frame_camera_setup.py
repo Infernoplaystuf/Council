@@ -1214,6 +1214,118 @@ def test_an_applied_preset_is_named_and_a_box_at_start_can_change_it(
     assert rec["settings"]["ExposureTime"] == 6000.0
 
 
+def test_a_preset_that_only_partly_applied_is_not_claimed(tmp_path):
+    """A preset holding a setting this camera refuses is applied in part —
+    the camera is NOT as the preset says, so no run names it. The guard is
+    in _apply_set's finish; with it broken every other test stayed green."""
+    connected("frame")
+    frame_camera.set_camera_setting("Gain", 3)
+    frame_camera.save_preset("Day")
+    path = tmp_path / "camera_presets.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    entry = next(iter(doc["cameras"].values()))
+    entry["presets"]["Day"]["settings"]["NoSuchSettingOnThisCamera"] = 1
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    frame_camera.set_camera_setting("Gain", 9)
+    applied = frame_camera.apply_preset("Day")
+    assert not applied["ok"] and "refused" in applied["summary"]
+    assert device().state["Gain"] == 3
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    assert _record(out)["preset"] == ""
+
+
+def test_a_renamed_preset_is_recorded_by_its_new_name(tmp_path):
+    connected("frame")
+    frame_camera.set_camera_setting("Gain", 3)
+    frame_camera.save_preset("Day")
+    frame_camera.rename_preset("Day", "Dusk")
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    assert _record(out)["preset"] == "Dusk"
+
+
+def test_a_deleted_preset_is_never_named_by_a_run(tmp_path):
+    """A record read months later must not name a preset that is in no
+    camera_presets.json — nor one a later save under that name made of
+    other settings."""
+    connected("frame")
+    frame_camera.set_camera_setting("Gain", 3)
+    frame_camera.save_preset("Day")
+    frame_camera.delete_preset("Day")
+    assert frame_camera.list_presets()["presets"] == []
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    rec = _record(out)
+    assert rec["preset"] == "" and "preset_changed" not in rec
+
+
+def test_settings_that_cannot_be_read_never_claim_a_preset(tmp_path,
+                                                          monkeypatch):
+    """Nothing compared is nothing confirmed: a camera that cannot describe
+    its settings at Start (its gain really changed since) does not get the
+    preset's name in the record — the record says why instead."""
+    connected("frame")
+    frame_camera.set_camera_setting("Gain", 3)
+    frame_camera.save_preset("Day")
+    frame_camera.set_gain(9)                  # the box beside Start
+    assert device().state["Gain"] == 9
+
+    def broken():
+        raise cameras.CameraError("node map timeout")
+
+    monkeypatch.setattr(device(), "settings", broken)
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    rec = _record(out)
+    assert rec["preset"] == ""
+    assert rec["preset_changed"]["name"] == "Day"
+    assert "node map timeout" in rec["settings_error"]
+    assert any("could not be read" in d
+               for d in rec["preset_changed"]["differs"]), rec
+
+
+def test_a_setting_of_the_preset_the_camera_no_longer_lists_is_a_difference(
+        tmp_path, monkeypatch):
+    connected("frame")
+    frame_camera.set_camera_setting("Gain", 3)
+    frame_camera.save_preset("Day")
+    real = frame_camera.settings_list
+
+    def without_gain():
+        out = real()
+        return dict(out, settings=[r for r in out["settings"]
+                                   if r.get("key") != "Gain"])
+
+    monkeypatch.setattr(frame_camera, "settings_list", without_gain)
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    rec = _record(out)
+    assert rec["preset"] == ""
+    assert rec["preset_changed"] == {"name": "Day", "differs": ["Gain"]}
+
+
+def test_a_slow_read_of_the_camera_at_start_is_not_capture_time(
+        tmp_path, monkeypatch):
+    """The record's read of every setting happens BEFORE the recorder is
+    switched on (d1b7418): on an event camera, whose stream already runs,
+    a slow node-map read after the switch made its frames part of the
+    run."""
+    connected("event")
+    ticks(Viewer(), 0.3)
+    real = frame_camera.settings_list
+
+    def slow():
+        time.sleep(0.3)                     # a real camera's node map, slowly
+        return real()
+
+    monkeypatch.setattr(frame_camera, "settings_list", slow)
+    frame_camera.start(str(tmp_path / "runs"))
+    grabbed = frame_camera._LIVE.session.stats().grabbed
+    frame_camera.stop()
+    assert grabbed <= 2, f"{grabbed} frames of a slow read counted in the run"
+
+
 def test_a_record_is_never_written_over_and_its_name_is_never_reused(
         tmp_path):
     from council_core import camera_record
