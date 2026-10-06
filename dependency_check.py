@@ -367,15 +367,20 @@ def system_summary() -> List[str]:
             lines.append(f"Physical CPUs: {n_phys}")
     except Exception:
         pass
-    # GGUF settings if the backend is reachable
-    try:
-        import council_engine as _ce
-        lines.append(f"GGUF n_ctx:   {_ce.get_n_ctx():,} tokens")
-        max_ctx = _ce.get_model_max_context()
-        if max_ctx:
-            lines.append(f"Model max:    {max_ctx:,} tokens")
-    except Exception:
-        pass
+    # GGUF settings if the engine is ALREADY loaded. Not imported for this:
+    # the Qt Diagnostics tab builds this report on a worker before anything
+    # has needed the engine, and importing it there costs seconds and loads
+    # the CUDA DLLs off the main thread. The Tk shell has always imported it
+    # by now, so its report is unchanged.
+    _ce = sys.modules.get("council_engine")
+    if _ce is not None:
+        try:
+            lines.append(f"GGUF n_ctx:   {_ce.get_n_ctx():,} tokens")
+            max_ctx = _ce.get_model_max_context()
+            if max_ctx:
+                lines.append(f"Model max:    {max_ctx:,} tokens")
+        except Exception:
+            pass
     return lines
 
 

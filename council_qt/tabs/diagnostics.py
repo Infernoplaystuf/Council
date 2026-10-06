@@ -7,76 +7,51 @@ scrolling report, a button that does work off the UI thread, and a status line.
 If this tab is right, the frame is right.
 
 It also earns its place permanently: the questions it answers — which Python,
-which toolkit, where the vault is, is PySide6 really the one we think — are the
-first questions asked when something is wrong on a user's machine.
+which toolkit, where the vault is, which optional features are missing and how
+to install them — are the first questions asked when something is wrong on a
+user's machine. The report itself is council_core.diagnostics; this file shows
+it, counts it, and copies it.
+
+WHAT IT USED TO MISS
+Tk's tab is the dependency report plus "Copy report". This one listed five
+package versions, had no Copy, and named the vault as "engine not loaded in
+this process" — it read the path from the Tk engine module, which the Qt app
+never imports. All three now come from council_core.diagnostics.
 """
 from __future__ import annotations
 
-import platform
-import sys
 import threading
-from pathlib import Path
 
-from PySide6.QtWidgets import (QHBoxLayout, QPlainTextEdit, QPushButton,
-                               QVBoxLayout, QWidget)
+from PySide6.QtGui import QFont
+from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel,
+                               QPlainTextEdit, QPushButton, QVBoxLayout,
+                               QWidget)
 
-
-def _report() -> str:
-    """Gathered off the UI thread — some of these touch the disk."""
-    lines = [
-        "Data's Inferno — diagnostics",
-        "",
-        f"toolkit          : PySide6 (Qt)",
-        f"python           : {sys.version.split()[0]} ({platform.architecture()[0]})",
-        f"executable       : {sys.executable}",
-        f"platform         : {platform.platform()}",
-    ]
-    try:
-        import PySide6
-        from PySide6 import QtCore
-        lines.append(f"PySide6          : {PySide6.__version__}")
-        lines.append(f"Qt               : {QtCore.qVersion()}")
-    except Exception as exc:                            # noqa: BLE001
-        lines.append(f"PySide6          : unavailable ({exc!r})")
-
-    for name in ("numpy", "PIL", "matplotlib", "pandas", "llama_cpp"):
-        try:
-            module = __import__(name)
-            version = getattr(module, "__version__", "present")
-            lines.append(f"{name:<17}: {version}")
-        except Exception:                               # noqa: BLE001
-            lines.append(f"{name:<17}: not installed")
-
-    # Deliberately NOT `import council_gui_engine` — that import builds the
-    # backend banner and costs ~4 seconds, which is a strange price for a
-    # diagnostics panel to charge. If the Tk engine is already loaded in this
-    # process, read the vault out of it; otherwise say so and move on.
-    engine = sys.modules.get("council_gui_engine")
-    vault = getattr(engine, "VAULT_DIR", None) if engine else None
-    lines.append("")
-    if vault:
-        path = Path(str(vault))
-        lines.append(f"vault            : {path}")
-        lines.append(f"vault exists     : {path.exists()}")
-    else:
-        lines.append("vault            : engine not loaded in this process")
-    return "\n".join(lines)
+from .. import theme
+from ..view import amp
 
 
 def build_diagnostics(window) -> QWidget:
     """The tab. ``window`` is the CouncilWindow, for the bridge and status."""
+    tokens = theme.tokens("dark")
     page = QWidget()
     layout = QVBoxLayout(page)
 
+    row = QHBoxLayout()
+    refresh = QPushButton(amp("⟳ Re-check"), page)
+    row.addWidget(refresh)
+    copy = QPushButton(amp("📋 Copy report"), page)
+    row.addWidget(copy)
+    row.addStretch(1)
+    status = QLabel("", page)
+    status.setStyleSheet(f"color: {tokens['muted_fg']};")
+    row.addWidget(status)
+    layout.addLayout(row)
+
     output = QPlainTextEdit(page)
     output.setReadOnly(True)
+    output.setFont(QFont("Consolas", 10))
     layout.addWidget(output, 1)
-
-    row = QHBoxLayout()
-    refresh = QPushButton("Refresh", page)
-    row.addWidget(refresh)
-    row.addStretch(1)
-    layout.addLayout(row)
 
     def run() -> None:
         """Gather on a worker, deliver through the bridge.
@@ -87,12 +62,15 @@ def build_diagnostics(window) -> QWidget:
         silently drop."""
         window.set_status("Gathering diagnostics ...")
         refresh.setEnabled(False)
+        status.setText("Checking…")
 
         def work() -> None:
-            text = _report()
+            from council_core import diagnostics
+            report = diagnostics.gather()
 
             def deliver() -> None:
-                output.setPlainText(text)
+                output.setPlainText(report.text)
+                status.setText(report.summary)
                 refresh.setEnabled(True)
                 window.set_status("Diagnostics ready")
 
@@ -100,6 +78,18 @@ def build_diagnostics(window) -> QWidget:
 
         threading.Thread(target=work, name="diagnostics", daemon=True).start()
 
+    def on_copy() -> None:
+        """The whole report as shown, for a bug report. Tk copies the
+        dependency half only; the vault path and versions above it are the
+        half a support conversation asks for first."""
+        text = output.toPlainText()
+        if not text.strip():
+            status.setText("Nothing to copy yet.")
+            return
+        QApplication.clipboard().setText(text)
+        status.setText("✓ Copied to clipboard")
+
     refresh.clicked.connect(run)
+    copy.clicked.connect(on_copy)
     run()
     return page
