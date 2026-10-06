@@ -49,6 +49,9 @@ PROTECTED_SUBDIRS: tuple = (
     # query_history_search bypasses vault_index (reads conversations/
     # directly), so excluding the folder here doesn't break that feature.
     "conversations",
+    # The model-call meter (council_core.usage_log) and the weekly placement
+    # reviews (council_core.placement): the app's bookkeeping, not documents.
+    ".council_usage",
 )
 
 # Lowercased once at import for the per-path membership test in

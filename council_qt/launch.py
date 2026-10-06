@@ -77,6 +77,7 @@ def build(argv: Optional[list] = None, *,
 
     if register is not None:
         register(window)
+    _install_placement(window, vault)
     splash.pump()
 
     _schedule_reveal(window, splash, decided, started)
@@ -97,6 +98,20 @@ def _install_crash_hooks(vault) -> None:
         crash_reporter.install(paths.ensure(vault), on_crash=_report_crash)
     except Exception as exc:                             # noqa: BLE001
         print(f"[startup] crash hooks unavailable: {exc!r}", flush=True)
+
+
+def _install_placement(window, vault) -> None:
+    """Meter every model call, and run the weekly placement review.
+
+    Never fatal, like the crash hooks: bookkeeping must not stop a launch."""
+    try:
+        from council_core import usage_log
+        usage_log.install(vault)
+        from .widgets.placement_review import PlacementScheduler
+        if PlacementScheduler.enabled():
+            window.placement_scheduler = PlacementScheduler(window, vault)
+    except Exception as exc:                             # noqa: BLE001
+        print(f"[startup] placement review unavailable: {exc!r}", flush=True)
 
 
 def _report_crash(crash_path) -> None:

@@ -83,6 +83,7 @@ class CouncilMapTab(ViewHelpers, QWidget):
         self._button(row2, "What's missing", self.show_gaps)
         self.refresh_btn = self._button(
             row2, "Refresh models & machines", self.refresh)
+        self._button(row2, "Placement review…", self.open_placement)
         row2.addStretch(1)
         row2.addWidget(self._legend())
         outer.addLayout(row2)
@@ -177,6 +178,20 @@ class CouncilMapTab(ViewHelpers, QWidget):
     def _done(self) -> None:
         self._busy = False
         self.refresh_btn.setEnabled(True)
+
+
+    def open_placement(self) -> None:
+        """The weekly placement review: the controller's proposal, Apply."""
+        from ..widgets.placement_review import PlacementReviewDialog
+        dialog = PlacementReviewDialog(self.window or self)
+        dialog.finished.connect(lambda _r: self._after_placement())
+        dialog.open()
+        self._placement_dialog = dialog
+
+    def _after_placement(self) -> None:
+        # Applied role changes rewrite model_slots.json: show the new roles,
+        # without probing the machines again.
+        self._show_map(self._gather(probe=False))
 
 
 def build_council_map(window) -> QWidget:

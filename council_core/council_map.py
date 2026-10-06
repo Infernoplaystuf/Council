@@ -210,6 +210,17 @@ _NODES: Tuple[Node, ...] = (
     Node("wishlist", "Librarian wishlist", "store",
          "librarian_wishlist.md: what the vault should hold.",
          "council_engine.py:6723-6750"),
+    Node("usage_log", "Model usage log", "store",
+         "Every model call's role, model, machine, tokens, seconds and "
+         "speed (never the text), kept for the weekly placement review.",
+         "council_core/usage_log.py"),
+    Node("apothecary", "Apothecary", "supplier",
+         "The machines: hardware, installed models, status. (Credentials "
+         "in the same file are never read by the review.)",
+         "council_core/apothecary.py; council_core/placement.py"),
+    Node("role_settings", "Role → model settings", "store",
+         "model_slots.json: which model each role answers with.",
+         "council_core/model_slots.py"),
     Node("council_memory", "Past deliberations", "store",
          "council_memory (record and retrieve past deliberations). Only "
          "safe_agent uses it.", "council_memory.py; safe_agent.py"),
@@ -331,6 +342,32 @@ def _edges() -> List[Edge]:
           "memory", note="Nothing records a deliberation for retrieval.",
           cite="council_memory.py"),
     ]
+
+    # -- the controller: the weekly placement review --------------------
+    out += [
+        E("usage_log", "judge", "a week of model usage, as the controller",
+          "network", "live", cite="council_core/placement.py "
+          "(build_report, ask_controller)"),
+        E("apothecary", "judge", "machines' hardware and installed models",
+          "network", "live", cite="council_core/placement.py "
+          "(_registry_machines)"),
+        E("judge", "role_settings", "role → model changes on this PC, "
+          "applied when you approve", "network", "live",
+          cite="council_core/placement.py (apply_role_changes); "
+               "council_qt/widgets/placement_review.py"),
+        E("judge", "apothecary", "which machine should hold which model",
+          "network", "partial",
+          note="Shown as advice and as install / remove commands for you "
+               "to run: a role cannot be pinned to another machine yet, and "
+               "the Council never installs or removes models itself.",
+          cite="council_core/placement.py (check); "
+               "docs/specialized_nodes.md §7 Stage 1"),
+    ]
+    for role in ("judge", "writer") + MEMBERS + ("peasant",):
+        out.append(E(role, "usage_log", "each call's model, machine, tokens "
+                     "and seconds", "network", "live",
+                     cite="council_engine.py (_record_stats); "
+                          "council_core/usage_log.py"))
 
     for role in MEMBERS:
         out.append(E("judge", role, "picked for the panel", "deliberation",
@@ -539,7 +576,9 @@ _ANCHORS = {
 _FIXED = {"question": (0.03, 0.45), "judge": (0.42, 0.45),
           "debate": (0.62, 0.45), "writer": (0.8, 0.45),
           "answer": (0.97, 0.45)}
-_NODE_ANCHORS = {"wishlist": (0.3, 0.06), "council_memory": (0.85, 0.12),
+_NODE_ANCHORS = {"usage_log": (0.3, 0.93), "apothecary": (0.62, 0.97),
+                 "role_settings": (0.45, 0.97),
+                 "wishlist": (0.3, 0.06), "council_memory": (0.85, 0.12),
                  "role_memory": (0.6, 0.06), "docs": (0.25, 0.85),
                  "mcp_docs": (0.08, 0.92), "tools": (0.25, 0.7)}
 _RING = (0.52, 0.47, 0.17, 0.36)        # centre x, y and radii, as fractions

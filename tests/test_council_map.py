@@ -57,7 +57,15 @@ def test_coder_talks_to_the_judge_the_floor_and_the_librarian_only():
     peers = {e.src if e.dst == "coder" else e.dst
              for e in m.edges_of("coder")}
     assert peers == {"judge", "debate", "librarian", "tools", "role_memory",
-                     "docs"}
+                     "docs", "usage_log"}
+
+
+def test_the_judge_is_the_controller_of_placement():
+    m = cm.static_map()
+    assert _edge(m, "usage_log", "judge").status == "live"
+    assert _edge(m, "apothecary", "judge").status == "live"
+    assert _edge(m, "judge", "role_settings").status == "live"
+    assert _edge(m, "judge", "apothecary").status == "partial"
 
 
 def test_the_facts_the_map_is_for():

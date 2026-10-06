@@ -2422,6 +2422,22 @@ _STATS_SEQ = 0
 _ANY_ROLE = "\x00any"
 
 
+#: Called with a copy of every call's stats (council_core.usage_log keeps
+#: them for the weekly placement review). A listener that raises is skipped:
+#: bookkeeping must never fail a model call.
+_STATS_LISTENERS: List[Callable[[Dict[str, Any]], None]] = []
+
+
+def add_stats_listener(fn: Callable[[Dict[str, Any]], None]) -> None:
+    if fn not in _STATS_LISTENERS:
+        _STATS_LISTENERS.append(fn)
+
+
+def remove_stats_listener(fn: Callable[[Dict[str, Any]], None]) -> None:
+    if fn in _STATS_LISTENERS:
+        _STATS_LISTENERS.remove(fn)
+
+
 def _record_stats(role: Optional[str], stats: Dict[str, Any]) -> None:
     global _STATS_SEQ
     s = dict(stats)
@@ -2431,6 +2447,11 @@ def _record_stats(role: Optional[str], stats: Dict[str, Any]) -> None:
         s["seq"] = _STATS_SEQ
         _LAST_STATS[role or ""] = s
         _LAST_STATS[_ANY_ROLE] = s
+    for listener in list(_STATS_LISTENERS):
+        try:
+            listener(dict(s))
+        except Exception:                                 # noqa: BLE001
+            pass
 
 
 def last_call_stats(role: Optional[str] = None) -> Dict[str, Any]:
@@ -3489,6 +3510,7 @@ def _ollama_local(
                       stats.get("prompt_tokens"))
         if refits:
             stats["prompt_refits"] = refits
+        stats["host"] = host
         with _SLOT_LOAD_LOCK:
             _SLOT_STATUS[slot] = {"path": local_models.ollama_id(entry["name"]),
                                   "n_ctx": num_ctx, "on_gpu": None,
