@@ -347,22 +347,26 @@ def test_the_window_is_asked_without_loading_a_model(engine):
     assert engine.state.loaded == {}
 
 
-def test_with_nothing_loaded_the_slot_config_is_not_read(engine,
-                                                         monkeypatch):
-    """Nothing loaded and no load remembered: the answer is the env var or
-    4096 whatever the config says, so the config is not read. It was: the
-    Dream3D tests reached effective_n_ctx through nx_ops with no vault set,
-    so model_slots.current() read ~/.council/vault/model_slots.json — the
-    real one — and kept it cached for every test after them."""
+def test_with_nothing_loaded_a_gguf_slot_gets_the_env_var_or_4096(engine,
+                                                                  monkeypatch):
+    """Nothing loaded and no load remembered, on GGUF slots: the env var or
+    4096. The slot config IS read now — only it says whether Ollama serves
+    the slot (council_engine._ollama_will_serve: "ollama:<name>", or no GGUF
+    to load) — and what is read is THIS vault's file. The Dream3D tests used
+    to reach effective_n_ctx through nx_ops with no vault set and read
+    ~/.council/vault/model_slots.json, the real one, keeping it cached for
+    every test after them."""
     from council_core import model_slots, nx_ops
     ce = engine.ce
+    _fast_slot(engine)                  # a slot only this vault's file has
     model_slots.invalidate()
     assert ce.effective_n_ctx() == 4096
     assert nx_ops._n_ctx() == 4096
     assert ce.context_budget_report("hi")["n_ctx"] == 4096
     monkeypatch.setenv("COUNCIL_GGUF_N_CTX", "8192")
     assert ce.effective_n_ctx("fast") == 8192
-    assert model_slots._current is None
+    assert "fast" in model_slots._current.slots
+    assert engine.state.loaded == {}
 
 
 def test_each_slot_reports_the_window_it_loaded_with(engine):

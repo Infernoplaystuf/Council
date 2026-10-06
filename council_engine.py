@@ -2035,6 +2035,63 @@ def _placement_inputs(cfg: Any) -> tuple:
     return env + (gpu_crashed_last_run(), files)
 
 
+def _llama_cpp_missing() -> bool:
+    """No llama_cpp this interpreter could import — so no GGUF loads here.
+
+    sys.modules first: a None entry is "not installed" (what the tests and
+    a blocked import leave), any other entry is a module that is there. Only
+    then find_spec, which raises ValueError for an entry without __spec__."""
+    if "llama_cpp" in sys.modules:
+        return sys.modules["llama_cpp"] is None
+    try:
+        return _ilu_fw.find_spec("llama_cpp") is None
+    except (ImportError, ValueError):
+        return True
+
+
+def _ollama_will_serve(slot: str) -> bool:
+    """Will a call on ``slot`` be answered by Ollama? Decided the way
+    _route_chat decides it, from what is known with no network and no load:
+
+      * the slot already fell back to Ollama (_AUTO_OLLAMA), or COUNCIL_
+        BACKEND=ollama sends every slot there;
+      * the slot's model is "ollama:<name>";
+      * the GGUF -> Ollama fallback (COUNCIL_OLLAMA_FALLBACK, on by default)
+        will take the call: this interpreter has no llama_cpp, so no GGUF
+        can load (measured 2026-10-01: the council env has none), or the
+        main slot names no GGUF file at all.
+
+    When the fallback is the route and no Ollama answers, the call fails
+    whatever window was budgeted — so answering "Ollama" is right in every
+    case where a call is served. Before this, a process's first prompt was
+    sized for 4096 (no model loaded) while Ollama was then sent num_ctx
+    8192: nx_ops._n_ctx() cut the Dream3D writer's filter shortlist to half
+    of what fit."""
+    from council_core import local_models
+    with _ROUTE_LOCK:
+        if slot in _AUTO_OLLAMA:
+            return True
+    if _council_backend() == "ollama":
+        return True
+    fallback = _ollama_fallback_enabled()
+    if fallback and _llama_cpp_missing():
+        return True
+    try:
+        cfg = _slot_config()
+        s = cfg.slots.get(slot) or cfg.slots.get("main")
+    except Exception:                                     # noqa: BLE001
+        return False
+    path = (s.path if s is not None else "") or ""
+    if local_models.is_ollama_id(path):
+        return True
+    if fallback and (s is None or s.name == "main") and not path:
+        # Main loads COUNCIL_GGUF_PATH; unset, or no such file, is the
+        # BackendUnavailable that _route_chat hands to Ollama.
+        env = os.environ.get("COUNCIL_GGUF_PATH", "").strip()
+        return not env or not Path(env).is_file()
+    return False
+
+
 def effective_n_ctx(slot: str = "main") -> int:
     """The window a prompt for ``slot`` will be clamped to, for code that
     SIZES a prompt before the call. Never loads a model.
@@ -2057,9 +2114,12 @@ def effective_n_ctx(slot: str = "main") -> int:
     this, called from GUI threads, never runs. The prompt clamp still holds a
     call to its real window; a builder that over-budgets gets trimmed.
 
-    With no model loaded and none loaded before, steps 2 and 3 have nothing
-    to read, so the slot config is not read either (it is read from
-    paths.vault_dir(), and model_slots.current() keeps what it read).
+    Before all four: a slot Ollama serves — or WILL serve, before its first
+    call (_ollama_will_serve) — gets the num_ctx Ollama is sent, not a GGUF
+    window. To know that, the slot config is read when this interpreter has
+    llama_cpp (is the slot "ollama:<name>"? does it name a GGUF at all?);
+    model_slots.current() reads it from paths.vault_dir() and keeps it, as
+    the first chat call would.
 
     get_n_ctx() stays the configured value, because it also sizes the load.
     It is 4096 with the env var unset, and the builders that sized prompts
@@ -2075,16 +2135,12 @@ def effective_n_ctx(slot: str = "main") -> int:
     if ollama_window:
         return int(ollama_window)
     # A slot Ollama WILL serve, before its first call: the num_ctx it will
-    # be sent. Only what is known with no network and no config read — the
-    # backend is forced to Ollama, or the automatic pick is already made
-    # (served_model / an earlier call) and this interpreter has no llama_cpp
-    # to try first. Without this Describe budgeted its first prompt for 4096
-    # while Ollama was then sent 8192, and shed its worked examples.
-    with _ROUTE_LOCK:
-        picked = _AUTO_PICK
-    if _council_backend() == "ollama" or (
-            picked and _ollama_fallback_enabled()
-            and _ilu_fw.find_spec("llama_cpp") is None):
+    # be sent (_ollama_will_serve says when that is known without the
+    # network). Without this Describe budgeted its first prompt for 4096
+    # while Ollama was then sent 8192, and shed its worked examples; and
+    # the Dream3D writer's first shortlist was cut to the 4096 budget on
+    # this PC's default setup (no llama_cpp, so Ollama serves every call).
+    if _ollama_will_serve(slot or "main"):
         return _ollama_num_ctx(slot or "main", None)
     env_ctx = _env_n_ctx()
     if not _SLOT_INSTANCES and _LAST_N_CTX is None:

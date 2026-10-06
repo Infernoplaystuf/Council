@@ -249,6 +249,61 @@ def test_the_fallback_can_be_turned_off(eng, monkeypatch):
     assert eng.fake.state.chats == []
 
 
+# ============================================================
+# The window a prompt BUILDER is told, before the first call
+# ============================================================
+
+def test_the_first_prompt_is_sized_for_the_window_ollama_will_be_sent(
+        eng, monkeypatch):
+    """No llama_cpp (the council env), nothing called yet in this process:
+    effective_n_ctx said 4096 — it could not see that Ollama would serve —
+    and Ollama was then sent num_ctx 8192, so nx_ops._n_ctx() cut the
+    Dream3D writer's first filter shortlist to half of what fit."""
+    from council_core import nx_ops
+    monkeypatch.setenv("COUNCIL_OLLAMA_FALLBACK", "1")   # the app default
+    ce = eng.ce
+    assert ce.effective_n_ctx("main") == 8192
+    assert nx_ops._n_ctx() == 8192
+    ce.local_chat(MSGS, num_predict=20)
+    assert eng.fake.state.chats[-1]["options"]["num_ctx"] == 8192
+    assert ce.effective_n_ctx("main") == 8192
+
+
+def test_an_ollama_slot_is_known_before_its_first_call(eng, monkeypatch,
+                                                       tmp_path):
+    """With llama_cpp present the GGUF path is tried first, so only the
+    slot itself can say Ollama serves it: "ollama:<name>"."""
+    monkeypatch.setitem(sys.modules, "llama_cpp",
+                        SimpleNamespace(Llama=None))     # installed
+    gguf = tmp_path / "main.gguf"
+    gguf.write_bytes(b"GGUF")
+    monkeypatch.setenv("COUNCIL_GGUF_PATH", str(gguf))
+    _slots(eng, {"a": {"path": "ollama:llama3.1:8b", "n_ctx": 16384}},
+           {"coder": "a"})
+    assert eng.ce.effective_n_ctx("a") == 16384
+    # main is a GGUF that has not loaded: the GGUF rule, not Ollama's.
+    assert eng.ce.effective_n_ctx("main") == 4096
+
+
+def test_no_gguf_configured_is_ollamas_window_too(eng, monkeypatch):
+    """llama_cpp present but no GGUF to load: _route_chat hands the call to
+    Ollama, so the builder is told Ollama's window."""
+    monkeypatch.setitem(sys.modules, "llama_cpp",
+                        SimpleNamespace(Llama=None))
+    monkeypatch.setenv("COUNCIL_OLLAMA_FALLBACK", "1")
+    monkeypatch.setenv("COUNCIL_OLLAMA_NUM_CTX", "12288")
+    assert eng.ce.effective_n_ctx("main") == 12288
+
+
+def test_with_the_fallback_off_a_gguf_slot_keeps_the_gguf_window(eng,
+                                                                 monkeypatch):
+    monkeypatch.setenv("COUNCIL_OLLAMA_FALLBACK", "0")
+    assert eng.ce.effective_n_ctx("main") == 4096
+    _slots(eng, {"a": {"path": "ollama:llama3.1:8b", "n_ctx": 2048}},
+           {"coder": "a"})
+    assert eng.ce.effective_n_ctx("a") == 2048      # an Ollama slot still is
+
+
 def test_council_backend_ollama_forces_it(eng, monkeypatch):
     monkeypatch.setenv("COUNCIL_BACKEND", "ollama")
     monkeypatch.setenv("COUNCIL_OLLAMA_MODEL", "phi3.5")
