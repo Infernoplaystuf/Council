@@ -181,11 +181,6 @@ def _mini_catalog():
         "enums": {}}
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "KNOWN GAP: write_script (what the Dream3D tab ships) checks security "
-    "only. A call to a filter that does not exist, or a kwarg a real filter "
-    "does not take, is ok=True. Measured with llama3.1:8b: 12/12 scripts "
-    "ok=True, 0/12 ran."))
 def test_write_script_rejects_a_filter_the_catalog_does_not_have():
     code = ("import simplnx as nx\nds = nx.DataStructure()\n"
             "r = nx.TotallyMadeUpFilter.execute(data_structure=ds, bogus='x')\n")
@@ -194,10 +189,6 @@ def test_write_script_rejects_a_filter_the_catalog_does_not_have():
     assert res["ok"] is False
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "KNOWN GAP: nx_generate.validate checks arg KEYS, never VALUES, and its "
-    "required-param check cannot fire (0 of 1972 params in the real catalog "
-    "are required: every pybind11 param has a default)."))
 def test_validate_rejects_a_value_of_the_wrong_type():
     pipe = {"pipeline": [{
         "filter": {"uuid": "67041f9b-bdc6-4122-acc6-c9fe9280e90d"},
