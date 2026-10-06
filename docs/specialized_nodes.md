@@ -134,6 +134,19 @@ these prompt speeds that caps a document at about: Gemma 3 1B 15–20k tokens, L
 Line numbers re-checked at commit 87dc535. "Measured" = run against the engine
 with `tests/fake_ollama` stand-in nodes; nothing was sent to the real Ollama.
 
+> **Update, later on 2026-10-05 (merge of `fix/localhost-guard`):** several rows below
+> are now FIXED. `_ensure_localhost` reads the whole host (`localhost.evil.example`
+> refused, `[::1]` accepted); every call to a model server bypasses proxies and
+> redirects (a system or `HTTP_PROXY` proxy used to carry "local" requests off the PC);
+> the old dispatcher sends a prompt only to a node whose `/api/tags` lists the EXACT
+> model and otherwise runs locally sending nothing; a failing node cools down (30 s,
+> doubling to 5 min); a node's connect gives up after `COUNCIL_NODE_CONNECT_TIMEOUT`
+> (5 s) and its first reply after `COUNCIL_NODE_FIRST_REPLY_S` (default still 300 s);
+> a stream that ends without Ollama's final packet is an error on both the remote and
+> the local path; the dispatcher's prints are ASCII-safe. Still as described: no
+> per-role machine setting, members run one at a time, Stop cannot cancel a remote
+> call, the Apothecary wizard is unchanged.
+
 | Piece | State | Evidence |
 |---|---|---|
 | Pin a role to a machine | **Missing.** `Slot` has only `name`, `path`, `n_ctx`; a `host` key in model_slots.json is dropped on load and save (measured). | `council_core/model_slots.py:93-96`, `parse()` ~146-178 |
