@@ -36,6 +36,13 @@ capture folder is only read). Kept current when the folder changes (a moment
 after the last keystroke, so typing a path is not a store search per key);
 "Classify all frames" writes it itself through its link.
 
+THE TWO FILE PICKERS SAY WHAT THEY ARE FOR
+A picker is an entry and a Browse button, with no label of its own, and the
+library has two of them one row apart — the folder Export writes into and
+the file Import reads. A file_picker shape has no placeholder property, so
+attach_to writes one into each (PICKER_HINTS), with a tooltip saying what
+goes there; an app without those ports is left alone.
+
 NOTHING HERE IMPORTS frame_classes
 `api` is the module, passed in by frame_camera.attach — so this file never
 imports a top-level module, and frame_classes never imports Qt.
@@ -45,7 +52,7 @@ from __future__ import annotations
 from typing import Any, Callable, List, Optional
 
 from PySide6.QtCore import QEvent, QObject, QSignalBlocker, Qt, QTimer
-from PySide6.QtWidgets import QComboBox, QStyledItemDelegate
+from PySide6.QtWidgets import QComboBox, QLineEdit, QStyledItemDelegate
 
 #: Where each item keeps its whole row (the item's text is the name).
 ROW_ROLE = int(Qt.ItemDataRole.UserRole) + 7
@@ -69,6 +76,21 @@ LINE_DELAY_MS = 300
 
 #: The open list is made wide enough for its rows, up to this.
 MAX_POPUP_WIDTH = 900
+
+#: Typhon's export folder and import file pickers: port -> (the hint shown
+#: in the empty entry, the tooltip).
+PICKER_HINTS = {
+    "export_to": (
+        "Folder to export into",
+        "Export writes the open model here as one file, "
+        "<name>-v<N>.typhon-classifier.zip; Export this app's classifiers "
+        "writes everything this app made here as one bundle."),
+    "import_from": (
+        "Classifier .zip to import",
+        "A .typhon-classifier.zip (one model) or a .typhon-classifiers.zip "
+        "(a bundle). Import checks all of it first and never overwrites a "
+        "model: a taken name is asked about."),
+}
 
 #: Keys that open a combobox's list.
 _OPENING_KEYS = (Qt.Key.Key_F4,)
@@ -300,5 +322,21 @@ def attach_to(api: Any, ports: Any, combo: str, show: str, line: str,
         return None
     pick: Callable[[str], Any] = (lambda name: getattr(ports, name, None)
                                   if name else None)
+    label_pickers(ports)
     return ClassifierPicker(api, combo=model, show=pick(show), line=pick(line),
                             folder=pick(folder), parent=parent)
+
+
+def label_pickers(ports: Any, hints: Optional[dict] = None) -> List[str]:
+    """Write each picker's hint into its empty entry, and its tooltip (see
+    THE TWO FILE PICKERS SAY WHAT THEY ARE FOR); the ports it found."""
+    done = []
+    for name, (hint, tip) in (hints or PICKER_HINTS).items():
+        widget = getattr(getattr(ports, name, None), "widget", None)
+        entry = getattr(widget, "entry", None)
+        if not isinstance(entry, QLineEdit):
+            continue
+        entry.setPlaceholderText(hint)
+        widget.setToolTip(tip)
+        done.append(name)
+    return done

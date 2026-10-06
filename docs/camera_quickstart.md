@@ -530,11 +530,12 @@ kept**, shared by every app on this PC, each saying where it came from.
   to restore it. None of them ever overwrites a model: a taken name is asked
   about, never replaced.
 - **Export** writes the open model as **one file**,
-  `<name>-v<N>.typhon-classifier.zip`, into the folder beside it — the model,
-  its marks, its origin, tags and its record of what it classified;
-  everything another PC needs, without the frames. **Import** reads such a
-  file back (under its own name, or the name typed in *New name*), checking
-  all of it first; it never overwrites. **Export this app's classifiers**
+  `<name>-v<N>.typhon-classifier.zip`, into the folder beside it (the box
+  that says *Folder to export into*) — the model, its marks, its origin, tags
+  and its record of what it classified; everything another PC needs, without
+  the frames. **Import** reads such a file back — the one chosen in the box
+  that says *Classifier .zip to import* — under its own name, or the name
+  typed in *New name*, checking all of it first; it never overwrites. **Export this app's classifiers**
   writes everything this app made into one bundle,
   `<project>-<time>.typhon-classifiers.zip`, which **Import** also reads.
 - **Tag** + **Add tag** / **Remove tag**: words of your own (`rig A`,
@@ -542,7 +543,7 @@ kept**, shared by every app on this PC, each saying where it came from.
 - **Train** makes a new **version** (`birds v3 (1a2b3c4d)` — number and the
   first 8 characters of its checksum) only when the marks changed; every
   version is kept.
-- **"Classified with"** — the line under the library — says which model
+- **"Classified with"** — the two-line note under the library — says which model
   version last classified the frames in the **capture folder**, and when:
   `Classified with birds v1 (98f54722) on 2026-10-05 15:54 — good 5, bad
   timing 3`. **Classify all frames** records each run it classifies (in the

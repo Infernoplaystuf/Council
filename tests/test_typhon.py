@@ -489,6 +489,65 @@ def test_the_setup_button_works(qapp, typhon_dir, forget_generated):
     assert ui.ports.cameras.items(), "the camera list was not refreshed"
 
 
+#: The Windows fonts, so a label is measured in the font the user sees (the
+#: offscreen platform has none of its own, and draws every glyph as a box).
+WINDOWS_FONTS = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+
+
+@pytest.mark.skipif(not (WINDOWS_FONTS / "arial.ttf").is_file(),
+                    reason="needs the Windows fonts (Arial) to measure text")
+def test_the_classified_with_line_shows_all_of_a_typical_answer(
+        typhon_dir, tmp_path):
+    """It wraps at 336 px, and a typical answer is two lines of Arial 10: at
+    one row high (24 px) the second — the counts per class — was cut off.
+    Seen in an offscreen grab of a built Typhon with the Windows fonts, and
+    measured the same way here, in a fresh interpreter given those fonts."""
+    import subprocess
+
+    code = (
+        "import sys\n"
+        f"sys.path[:0] = [{str(typhon_dir)!r}, {str(ROOT)!r}]\n"
+        "from PySide6.QtWidgets import QApplication\n"
+        "app = QApplication([])\n"
+        "import app as generated, frame_camera\n"
+        "ui = generated.App(); ui.resize(1504, 1016)\n"
+        "port = ui.ports.classified_with_line\n"
+        "port.set('Classified with birds v1 (98f54722) on 2026-10-05 15:54 "
+        "\\u2014 good 5, bad timing 3')\n"
+        "ui.grab()\n"
+        "label = port.widget\n"
+        "print(label.font().family(), label.width(), label.height(),"
+        " label.fontMetrics().height(), label.heightForWidth(label.width()))\n"
+        "frame_camera.disconnect()\n")
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen", COUNCIL_NO_DIALOGS="1",
+               QT_QPA_FONTDIR=str(WINDOWS_FONTS),
+               COUNCIL_VAULT_ROOT=str(tmp_path / "vault"),
+               PYTHONDONTWRITEBYTECODE="1")
+    done = subprocess.run([sys.executable, "-c", code], cwd=str(typhon_dir),
+                          env=env, capture_output=True, text=True,
+                          timeout=120)
+    assert done.returncode == 0, done.stderr[-2000:]
+    family, width, height, line, needs = done.stdout.split()[-5:]
+    width, height, line, needs = map(int, (width, height, line, needs))
+    assert family == "Arial" and width >= 300, done.stdout
+    assert needs > line, "one line: this test no longer shows anything"
+    assert needs <= height, f"needs {needs} px, has {height}"
+
+
+def test_the_export_and_import_pickers_say_which_is_which(
+        qapp, typhon_dir, forget_generated):
+    """Two pickers one row apart, each an entry and Browse with no label:
+    the grab showed two identical empty boxes. Each now says, while empty,
+    what goes in it."""
+    ui = construct(typhon_dir)
+    hints = {name: getattr(ui.ports, name).widget.entry.placeholderText()
+             for name in ("export_to", "import_from")}
+    assert hints == {"export_to": "Folder to export into",
+                     "import_from": "Classifier .zip to import"}
+    assert ".typhon-classifier.zip" in ui.ports.import_from.widget.toolTip()
+    ui.close()
+
+
 # ======================================================================
 # First run
 # ======================================================================
