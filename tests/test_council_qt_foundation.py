@@ -650,11 +650,11 @@ def window(qapp, tmp_path, monkeypatch):
 # violation roughly one run in three, blamed on whichever test was running.
 # `test_the_drain_list_covers_every_worker_a_tab_starts` keeps it honest.
 TAB_WORKERS = (
-    "agents-", "apoth-", "camera-", "capture", "changelog", "collection-",
+    "agent-creator", "agents-", "apoth-", "camera-", "capture", "changelog", "collection-",
     "council-command", "council-turn", "designer-", "diagnostics",
     "docs-", "dream3d-", "forge", "grapher-", "ide-",
-    "jobs-", "keyword-index", "lens-", "librarian-", "model-",
-    "mongo-convert", "nodes-", "sessions-", "tts-", "vault-",
+    "jobs-", "keyword-index", "kg-", "lens-", "librarian-", "model-",
+    "mongo-convert", "nodes-", "pi-setup", "sessions-", "tts-", "vault-",
 )
 
 

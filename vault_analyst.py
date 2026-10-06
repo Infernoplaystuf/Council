@@ -3661,7 +3661,31 @@ _SANDBOX_FORBIDDEN_ATTRS = frozenset({
     "symlink_to", "hardlink_to", "chmod", "lchmod", "open", "fdopen",
     # process / shell
     "system", "popen", "Popen",
+    # pandas readers that run code (pickle), fetch URLs (html/xml), touch the
+    # clipboard or open databases/stores the sandbox cannot contain. Every
+    # other pd.read_* is refused by _BudgetedPandas too; these names are also
+    # refused on ANY object so a stray reference cannot reach them.
+    "read_pickle", "read_clipboard", "read_html", "read_xml", "read_sql",
+    "read_sql_query", "read_sql_table", "read_hdf", "read_sas", "read_spss",
+    "read_stata", "read_gbq", "to_clipboard", "ExcelWriter", "HDFStore",
+    # numpy file I/O: np.save / savetxt / tofile / ndarray.dump WRITE
+    # anywhere; np.load(allow_pickle=True) runs code; loadtxt / genfromtxt /
+    # fromfile / memmap read anywhere; DataSource fetches URLs. Reproduced
+    # 2026-10-05 (tests/test_sandbox_escapes.py).
+    "save", "savez", "savez_compressed", "savetxt", "tofile", "dump",
+    "fromfile", "loadtxt", "genfromtxt", "memmap", "DataSource", "fromregex",
+    "savemat", "loadmat",
+    # Path's own readers take ANY path; the sandbox's read_text(path) /
+    # read_lines(path) / open() are the contained way to read a file.
+    "read_text", "read_bytes",
 })
+# Methods that RETURN a string with no target but WRITE a file when given one
+# (df.to_json('C:/x') wrote anywhere). Allowed only with no positional
+# argument and no buf / path keyword.
+_SANDBOX_BUFFER_WRITERS = frozenset({
+    "to_json", "to_html", "to_string", "to_markdown", "to_latex", "to_xml",
+})
+_SANDBOX_BUFFER_KWARGS = frozenset({"buf", "path_or_buf", "path"})
 # Introspection dunders that enable classic eval-sandbox escapes (reach os via
 # the class hierarchy, or grab __globals__ / __builtins__).
 _SANDBOX_FORBIDDEN_DUNDERS = frozenset({
@@ -3679,6 +3703,16 @@ _SANDBOX_FORBIDDEN_MODULE_ATTRS = frozenset({
     "sys", "os", "modules", "subprocess", "socket", "sqlite3", "shutil",
     "importlib", "import_module", "load_module", "builtins", "posix", "nt",
     "ctypes", "pickle", "marshal",
+    # Submodules that reach file / network I/O around the guards: pd.io
+    # (every reader unwrapped), scipy.io (savemat, wavfile.write), np.lib
+    # (npyio.load), scipy.datasets (downloads), np.ctypeslib.
+    "io", "lib", "datasets", "ctypeslib",
+})
+# Submodule names the import hook refuses (import scipy.io, from scipy import
+# io, import numpy.lib, from pandas import io).
+_SANDBOX_FORBIDDEN_SUBMODULES = frozenset({
+    "io", "lib", "datasets", "ctypeslib", "f2py", "distutils", "testing",
+    "_libs", "compat",
 })
 # The full set an attribute access — CALLED OR NOT — is checked against. A
 # blocklist is only as strong as its least-checked syntactic form, and the
@@ -3727,7 +3761,19 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
         # `pathlib.sys.modules[...]` reach a live subprocess module.
         if (isinstance(node, ast.Attribute)
                 and node.attr in _SANDBOX_FORBIDDEN_ANY_ATTR):
+            if node.attr in ("read_text", "read_bytes"):
+                return False, (f"Forbidden attribute: {node.attr} — read files "
+                               "with the sandbox's read_text(path) or "
+                               "read_lines(path), which stay inside the data "
+                               "folders")
             return False, f"Forbidden attribute: {node.attr}"
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in _SANDBOX_BUFFER_WRITERS
+                and (node.args or any(k.arg in _SANDBOX_BUFFER_KWARGS
+                                      for k in node.keywords))):
+            return False, (f"Forbidden: {node.func.attr}() with a target writes "
+                           f"a file; call {node.func.attr}() with no path to "
+                           "get the text")
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name) and node.func.id in forbidden_calls:
                 return False, f"Forbidden call: {node.func.id}"
@@ -3745,6 +3791,43 @@ def validate_generated_code(code: str) -> Tuple[bool, str]:
     return True, "ok"
 
 
+class _SandboxModule:
+    """A module as the sandbox hands it out: every attribute passes through
+    except the forbidden ones (numpy's save / load / tofile / lib …), which
+    raise. The AST validator refuses those names too; this covers the
+    routes it cannot see — `from numpy import load`, a name built at run
+    time, a module reached through a helper's return value."""
+
+    def __init__(self, real, extra_blocked=frozenset()) -> None:
+        object.__setattr__(self, "_real", real)
+        object.__setattr__(self, "_extra", frozenset(extra_blocked))
+
+    def __getattr__(self, name):
+        if (name in _SANDBOX_FORBIDDEN_ANY_ATTR or name in _SANDBOX_FORBIDDEN_SUBMODULES
+                or name in self._extra):
+            raise AttributeError(
+                f"sandbox: {getattr(self._real, '__name__', 'module')}.{name} "
+                "is blocked")
+        return getattr(self._real, name)
+
+    def __setattr__(self, name, value):
+        raise AttributeError("sandbox: modules are read-only")
+
+    def __repr__(self):
+        return f"<sandboxed {self._real!r}>"
+
+
+def _check_sandbox_import(name: str, fromlist) -> None:
+    """Refuse submodules that reach file / network I/O (scipy.io, numpy.lib,
+    pandas.io, scipy.datasets …), whether named in the import or pulled in
+    by `from x import io`."""
+    parts = name.split(".")[1:] + [str(f) for f in (fromlist or ())]
+    bad = [p for p in parts if p in _SANDBOX_FORBIDDEN_SUBMODULES
+           or p in _SANDBOX_FORBIDDEN_ANY_ATTR]
+    if bad:
+        raise ImportError(f"Import blocked by sandbox: {name} ({bad[0]})")
+
+
 def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
     # scipy added for the SPC / engineering / stats helpers — it has
     # no filesystem, network, or subprocess surface; it's a pure
@@ -3757,7 +3840,20 @@ def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
     root = name.split(".")[0]
     if root not in allowed_roots:
         raise ImportError(f"Import blocked by sandbox: {name}")
-    return __import__(name, globals, locals, fromlist, level)
+    _check_sandbox_import(name, fromlist)
+    mod = __import__(name, globals, locals, fromlist, level)
+    # `import numpy.linalg` binds the ROOT package, and numpy's root holds
+    # save/load; hand the root back sandboxed. `from numpy.linalg import x`
+    # gets the submodule itself, whose names pass through _SandboxModule's
+    # check when it is the root that was asked for.
+    if root == "numpy" and (not fromlist or name == "numpy"):
+        return _SandboxModule(mod, _NUMPY_EXTRA_BLOCKED)
+    return mod
+
+
+# numpy-only: np.load(allow_pickle=True) runs code and reads any path. Not in
+# the global list because json.load(f) on a sandbox-opened file is fine.
+_NUMPY_EXTRA_BLOCKED = frozenset({"load"})
 
 
 # Readers that pull a whole file into a DataFrame. Looping any of these
@@ -3835,21 +3931,42 @@ class _BudgetedPandas:
                     key, value = name, k[name]
                     break
         if value is None:
-            return a, k
-        p = Path(str(value))
-        if p.is_absolute() or "://" in str(value):
-            return a, k
-        for root in self._roots:
-            try:
-                cand = (root / p).resolve()
-                cand.relative_to(root.resolve())
-            except (OSError, ValueError):
-                continue
-            if cand.is_file():
-                if key is None:
-                    return (str(cand),) + tuple(a[1:]), k
-                return a, {**k, key: str(cand)}
-        return a, k
+            return a, k          # a buffer / file object: nothing to resolve
+        cand = self.contain(value)
+        if key is None:
+            return (str(cand),) + tuple(a[1:]), k
+        return a, {**k, key: str(cand)}
+
+    def contain(self, value) -> Path:
+        """The real file ``value`` names, INSIDE a data folder, or
+        PermissionError. Relative names resolve against each data folder
+        (first that exists, else the first folder); absolute paths must
+        already be inside one; URLs and UNC paths are refused outright.
+
+        This used to pass absolute paths and URLs through untouched, so
+        pd.read_csv('C:/anything') read any file on the PC (reproduced
+        2026-10-05), and a relative name that did not exist under the data
+        folder fell back to the app's working directory."""
+        s = str(value)
+        if "://" in s or s.startswith(("\\\\", "//")):
+            raise PermissionError(f"sandbox: reading {s!r} is blocked — only "
+                                  "files inside the data folders can be read")
+        p = Path(s).expanduser()
+        if p.is_absolute():
+            cands = [p.resolve()]
+        else:
+            cands = [(r / p).resolve() for r in self._roots]
+            existing = [c for c in cands if c.exists()]
+            cands = existing[:1] or cands[:1]
+        for cand in cands:
+            for root in self._roots:
+                try:
+                    cand.relative_to(root.resolve())
+                    return cand
+                except (OSError, ValueError):
+                    continue
+        raise PermissionError(f"sandbox: {s!r} is outside the data folders; "
+                              "only files inside them can be read")
 
     def _account(self, df):
         try:
@@ -3873,7 +3990,17 @@ class _BudgetedPandas:
     def __getattr__(self, name):
         # __getattr__ only fires for names not found normally, so the
         # instance attrs (_real/_budget/_state) never route through here.
+        if (name in _SANDBOX_FORBIDDEN_SUBMODULES
+                or name in _SANDBOX_FORBIDDEN_ANY_ATTR
+                or (name.startswith("read_") and name not in _BUDGETED_READERS)):
+            raise AttributeError(f"sandbox: pd.{name} is blocked")
         real_attr = getattr(self._real, name)
+        if name == "ExcelFile" and self._roots:
+            def _excel_file(path, *a, **k):
+                if isinstance(path, (str, Path)):
+                    path = str(self.contain(path))
+                return real_attr(path, *a, **k)
+            return _excel_file
         if name in _BUDGETED_READERS and callable(real_attr):
             def _guarded(*a, **k):
                 a, k = self._resolve(a, k)
@@ -3881,6 +4008,128 @@ class _BudgetedPandas:
             _guarded.__name__ = name
             return _guarded
         return real_attr
+
+
+_HELPER_FILE_PARAMS = frozenset({"path", "path_or_df", "left", "right", "a", "b",
+                                 "file_a", "file_b", "file"})
+_HELPER_DIR_PARAMS = frozenset({"data_folder", "folder", "folders"})
+
+
+def _sandbox_vault_dir() -> Optional[Path]:
+    try:
+        from council_core import paths as _paths
+        return Path(_paths.vault_dir())
+    except Exception:
+        return None
+
+
+def _contain_helpers(globals_dict: Dict[str, Any], budgeted_pd, resolve_dir,
+                     roots: List[Path]) -> None:
+    """Wrap every helper the sandbox exposes so a path it is GIVEN stays
+    inside the data folders.
+
+    The helpers are trusted code, but they open whatever path they are
+    handed: summarize_csv('C:/anything') and list_csv_files('C:/') read and
+    listed outside the data folders (reproduced 2026-10-05). Wrapping by
+    PARAMETER NAME covers the ~80 helpers and any added later:
+      file params (path, a, b, left, …) -> budgeted_pd.contain
+      folder params (data_folder, …)    -> resolve_dir
+      output_dir                        -> must be inside the vault's data_out
+      vault_dir                         -> always the real vault
+    A DataFrame or None passes through untouched. duckdb_query also gets its
+    SQL's file access limited to the data folders (DuckDB's read_csv('C:/x')
+    would otherwise read anywhere)."""
+    import functools
+    import inspect as _inspect
+
+    vault = _sandbox_vault_dir()
+    out_root = None
+    if vault is not None:
+        try:
+            import data_index as _di
+            out_root = Path(_di.output_dir(vault))
+        except Exception:
+            out_root = vault / "data_out"
+
+    def contain(value, kind):
+        if isinstance(value, (list, tuple)):
+            return type(value)(contain(v, kind) for v in value)
+        if not isinstance(value, (str, Path)):
+            return value
+        if kind == "dir":
+            return str(resolve_dir(value))
+        if kind == "out":
+            if out_root is None:
+                raise PermissionError("sandbox: no output folder is configured")
+            p = Path(str(value)).expanduser()
+            p = (p if p.is_absolute() else out_root / p).resolve()
+            try:
+                p.relative_to(out_root.resolve())
+            except ValueError:
+                raise PermissionError(
+                    f"sandbox: output_dir {str(value)!r} is outside the output "
+                    f"folder ({out_root}); write results there") from None
+            return str(p)
+        return str(budgeted_pd.contain(value))
+
+    def wrap(fn):
+        try:
+            sig = _inspect.signature(fn)
+        except (TypeError, ValueError):
+            return fn
+        names = set(sig.parameters)
+        kinds = {n: ("file" if n in _HELPER_FILE_PARAMS else
+                     "dir" if n in _HELPER_DIR_PARAMS else
+                     "out" if n == "output_dir" else
+                     "vault" if n == "vault_dir" else None) for n in names}
+        if not any(kinds.values()):
+            return fn
+
+        @functools.wraps(fn)
+        def contained(*a, **k):
+            try:
+                bound = sig.bind_partial(*a, **k)
+            except TypeError:
+                return fn(*a, **k)       # let the helper raise its own error
+            for n, v in list(bound.arguments.items()):
+                kind = kinds.get(n)
+                if kind == "vault":
+                    bound.arguments[n] = str(vault) if vault is not None else v
+                elif kind and v is not None:
+                    bound.arguments[n] = contain(v, kind)
+            return fn(*bound.args, **bound.kwargs)
+        return contained
+
+    skip = {"pd", "np", "Path", "__builtins__"}
+    for key, val in list(globals_dict.items()):
+        if key in skip or isinstance(val, type) or not callable(val):
+            continue
+        # The sandbox's own closures (read_text, list_dir, …) contain already.
+        if getattr(val, "__qualname__", "").startswith("execute_pandas_code."):
+            continue
+        globals_dict[key] = wrap(val)
+
+    if "duckdb_query" in globals_dict:
+        inner = globals_dict["duckdb_query"]
+
+        def duckdb_query(path, sql):
+            """duckdb_query with DuckDB's own file access limited to the data
+            folders (or switched off when this DuckDB cannot do that)."""
+            duckdb = _import_duckdb()
+            p = str(budgeted_pd.contain(path))
+            cfg = {"enable_external_access": False,
+                   "allowed_directories": [str(r) for r in roots]}
+            try:
+                con = duckdb.connect(p, read_only=True, config=cfg)
+            except Exception:
+                con = duckdb.connect(p, read_only=True,
+                                     config={"enable_external_access": False})
+            try:
+                return con.execute(sql).fetch_df()
+            finally:
+                con.close()
+        duckdb_query.__wrapped__ = inner
+        globals_dict["duckdb_query"] = duckdb_query
 
 
 def execute_pandas_code(
@@ -4050,9 +4299,11 @@ def execute_pandas_code(
         # Close the getattr bypass: the AST validator blocks `x.write_text(...)`
         # by name, but `getattr(x, "write_text")(...)` would sidestep it. Refuse
         # the same forbidden names + escape dunders here too.
+        # The FULL set, module routes included: getattr(pd, "io") and
+        # getattr(scipy, "io") reached file I/O the AST check refuses by name.
         if isinstance(name, str) and (
-                name in _SANDBOX_FORBIDDEN_ATTRS
-                or name in _SANDBOX_FORBIDDEN_DUNDERS):
+                name in _SANDBOX_FORBIDDEN_ANY_ATTR
+                or name in _SANDBOX_FORBIDDEN_SUBMODULES):
             raise AttributeError(
                 f"sandbox: access to attribute {name!r} is blocked")
         return getattr(obj, name, *default)
@@ -4223,6 +4474,10 @@ def execute_pandas_code(
         import sys as _sys_dbg
         print(f"[analyst] domain helpers not registered: {_ah_exc!r}",
               file=_sys_dbg.stderr)
+
+    if "np" in globals_dict:
+        globals_dict["np"] = _SandboxModule(globals_dict["np"], _NUMPY_EXTRA_BLOCKED)
+    _contain_helpers(globals_dict, _budgeted_pd, _sb_resolve_dir, normalized_folders)
 
     # CRITICAL: pass `globals_dict` as BOTH globals and locals. When
     # exec(code, globals, locals) is called with *different* dicts, Python

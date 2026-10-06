@@ -41,8 +41,21 @@ _EMPH_RE = re.compile(r"[*`]+")          # markdown emphasis; NOT '_' (_norm eat
 # camelCase / PascalCase word boundaries: pointOfContact -> point Of Contact,
 # POCName -> POC Name.
 _CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
-# One field may list several values: 'Bob, Alice', 'Bob and Alice', 'Bob; Alice'.
-_VAL_SPLIT_RE = re.compile(r"\s*(?:[,;/]|\band\b|&)\s*", re.I)
+# One field may list several values: 'Bob Smith, Alice Jones', 'Bob and Alice',
+# 'Bob; Alice'. _split_values applies these in order with guards.
+_SEMI_RE = re.compile(r"\s*;\s*")
+_AND_SPLIT_RE = re.compile(r"\s+(?:and|&)\s+", re.I)
+_COMMA_RE = re.compile(r"\s*,\s*")
+_SLASH_RE = re.compile(r"\s*/\s*")
+_GROUP_NOUN_RE = re.compile(
+    r"\b(?:program(?:me)?|project|team|group|department|dept|division|"
+    r"committee|initiative|board|lab|laboratory|inc|llc|ltd|co|corp|"
+    r"company|services|systems)\.?$", re.I)
+_NAME_WORD_RE = re.compile(r"^[A-Z][A-Za-z'’\-]*[a-z][A-Za-z'’\-]*$")
+_INITIAL_RE = re.compile(r"^[A-Z]\.?$")
+_SUFFIX_RE = re.compile(r"^(?:jr|sr|ii|iii|iv|phd|pe|md|esq)\.?$", re.I)
+_PLAIN_WORDS_RE = re.compile(r"^[A-Za-z][A-Za-z'’\- ]*[A-Za-z]$")
+_KEEP_DOT_RE = re.compile(r"(?:\b[A-Z]|\b(?:jr|sr|phd|esq))\.$", re.I)
 # A value ends where the next field starts. Only ':' / '=' — a spaced dash
 # would eat 'Bob Smith - Engineering'.
 _NEW_FIELD_RE = re.compile(r"[:=]")
@@ -87,20 +100,81 @@ def _label_is(text, fn: str) -> bool:
     return any(tt[i:i + len(ft)] == ft for i in range(len(tt) - len(ft) + 1))
 
 
+def _ends_in_group_noun(s: str) -> bool:
+    return bool(_GROUP_NOUN_RE.search(str(s or "").strip()))
+
+
+def _looks_last_first(left: str, right: str) -> bool:
+    """'Lee' + 'Carol' / 'Carol A.' / 'D.' — the two halves of 'Lee, Carol'."""
+    lw, rw = left.split(), right.split()
+    return (len(lw) == 1 and bool(_NAME_WORD_RE.match(lw[0]))
+            and 1 <= len(rw) <= 2
+            and all(_NAME_WORD_RE.match(w) or _INITIAL_RE.match(w)
+                    for w in rw))
+
+
+def _comma_split(piece: str) -> List[str]:
+    """Split on commas, but keep 'Last, First' and 'Name, Jr.' whole.
+
+    A lone initial or suffix after a comma always joins the name before it.
+    'Last, First' is only assumed when the piece has exactly two comma parts:
+    'Bob, Alice, Carol' stays a list of three, while 'Lee, Carol' — the form
+    Outlook and directory exports write — stays one person. Two bare first
+    names ('Bob, Alice') read the same way and are kept together too; the
+    graph can still tell them apart later, a split name cannot be rejoined."""
+    parts = [p.strip() for p in _COMMA_RE.split(piece)]
+    parts = [p for p in parts if p]
+    if len(parts) == 2 and _looks_last_first(*parts):
+        return [f"{parts[0]}, {parts[1]}"]
+    out: List[str] = []
+    for p in parts:
+        if out and (_SUFFIX_RE.match(p) or _INITIAL_RE.match(p)):
+            out[-1] = f"{out[-1]}, {p}"
+        else:
+            out.append(p)
+    return out
+
+
+def _slash_split(piece: str) -> List[str]:
+    """'Bob/Alice' is two values; 'PN-1234/A' and 'BRG-77/2' are one code with
+    a revision or variant after the slash. Split only when every side is a
+    plain word of two letters or more."""
+    sides = [s.strip() for s in _SLASH_RE.split(piece)]
+    if len(sides) > 1 and all(_PLAIN_WORDS_RE.match(s) for s in sides):
+        return sides
+    return [piece]
+
+
 def _split_values(v: str):
     """One field's value text -> the individual values it lists.
 
     Stops at the point another field begins: 'Bob; Reviewer: Alice' is Bob, not
     Bob AND 'Reviewer: Alice'. Only a colon/equals ends a value — a spaced dash
-    does not, or 'Bob Smith - Engineering' would be thrown away."""
+    does not, or 'Bob Smith - Engineering' would be thrown away.
+
+    Splits on ';' first, then a spaced 'and' / '&', then ',' and '/', each with
+    a guard, because the knowledge graph turns every piece into a person, part
+    or project: splitting blindly made 'Lee, Carol' two people, 'PN-1234/A' two
+    parts and 'Bearings & Seals Program' two projects. 'and' / '&' do not split
+    a value that ends in a group noun (Program, Project, Team, Inc…), and an
+    unspaced '&' ('R&D') never splits."""
     out = []
-    for part in _VAL_SPLIT_RE.split(str(v or "")):
-        part = _EMPH_RE.sub("", part).strip().strip(".").strip()
-        if not part:
-            continue
-        if _NEW_FIELD_RE.search(part):
-            break
-        out.append(part)
+    for semi in _SEMI_RE.split(str(v or "")):
+        ands = ([semi] if _ends_in_group_noun(semi)
+                else _AND_SPLIT_RE.split(semi))
+        for a in ands:
+            for c in _comma_split(a):
+                for part in _slash_split(c):
+                    part = _EMPH_RE.sub("", part).strip()
+                    # A trailing '.' is sentence punctuation, unless it closes
+                    # an initial or a suffix ('Carol A.', 'Jr.').
+                    if part.endswith(".") and not _KEEP_DOT_RE.search(part):
+                        part = part.rstrip(".").strip()
+                    if not part:
+                        continue
+                    if _NEW_FIELD_RE.search(part):
+                        return out
+                    out.append(part)
     return out
 
 
@@ -564,8 +638,15 @@ def _field_values_in_text(text: str, fn: str, *, max_hits: int = 100):
     js = _json_field_values(text, fn)
     if js is not None:
         return js[:max_hits]
+    return [v for v, _i in _located_text_values(text, fn, max_hits=max_hits)]
 
-    vals = []
+
+def _located_text_values(text: str, fn: str, *, max_hits: int = 100):
+    """The line rules of _field_values_in_text, keeping WHERE each value was:
+    ``[(value, line_index)]`` with a 0-based index into ``text.splitlines()``.
+    The index is the line holding the VALUE — for a heading-style field that is
+    the line after the label, which is the line a person would be shown."""
+    vals: List[Tuple[str, int]] = []
     lines = text.splitlines()
     for i, raw in enumerate(lines):
         if len(vals) >= max_hits:
@@ -580,13 +661,13 @@ def _field_values_in_text(text: str, fn: str, *, max_hits: int = 100):
                 if _label_is(cell, fn):
                     nxt = cells[j + 1].strip()
                     if nxt and not _RULE_RE.match(nxt):
-                        vals.extend(_split_values(nxt))
+                        vals.extend((v, i) for v in _split_values(nxt))
             continue
         pairs = _kv_pairs(line)
         if pairs:
             for key, val in pairs:
                 if val and _label_is(key, fn):
-                    vals.extend(_split_values(val))
+                    vals.extend((v, i) for v in _split_values(val))
             continue
         # heading style: the line IS the label -> value on the next non-empty
         # line, unless that line starts a different field.
@@ -597,9 +678,125 @@ def _field_values_in_text(text: str, fn: str, *, max_hits: int = 100):
                     continue
                 if nxt.startswith("|") or _kv_pairs(nxt):
                     break        # the next field began; this heading has no value
-                vals.extend(_split_values(nxt))
+                vals.extend((v, j) for v in _split_values(nxt))
                 break
     return vals
+
+
+def _line_of(lines: List[str], value: str, start: int = 0) -> int:
+    """0-based index of the first line at/after ``start`` containing
+    ``value``, or -1. Used to place JSON values, which are read structurally."""
+    for i in range(start, len(lines)):
+        if value in lines[i]:
+            return i
+    return -1
+
+
+def _snippet(line: str, limit: int = 200) -> str:
+    s = " ".join(str(line or "").split())
+    return s if len(s) <= limit else s[:limit - 1] + "…"
+
+
+def field_value_locations(path: Any, field: str, *,
+                          max_values: int = 5000) -> List[Dict[str, Any]]:
+    """Every value of the labelled ``field`` in ONE file, with where it is.
+
+    The knowledge graph cites every fact, so a value alone is not enough: this
+    returns ``[{"value", "kind", "snippet", ...locator}]`` where ``kind`` is
+
+      * ``"row"``  — tabular: ``sheet`` (Excel only), ``row`` (the 1-based row
+        a person sees in Excel, header = row 1), ``column``;
+      * ``"line"`` — text: ``line`` (1-based), plus ``page`` (1-based) for a
+        PDF, read page by page so the page is known.
+
+    Values are split exactly as in search (``_split_values``). Read-only and
+    bounded; an unreadable file gives ``[]``."""
+    p = Path(path)
+    fn = _norm_key(field)
+    if not fn:
+        return []
+    suf = p.suffix.lower()
+    out: List[Dict[str, Any]] = []
+    if suf in _TABULAR:
+        for sheet, frame in _table_frames(p):
+            try:
+                import vault_analyst as va
+                col = va.match_column_name(frame.columns, field)
+            except Exception:
+                col = None
+            if col is None:
+                continue
+            for idx, raw in enumerate(frame[col].tolist()):
+                if raw is None or (isinstance(raw, float) and raw != raw):
+                    continue
+                raw = str(raw).strip()
+                if not raw:
+                    continue
+                for one in (_split_values(raw) or [raw]):
+                    loc = {"value": one, "kind": "row", "row": idx + 2,
+                           "column": str(col), "snippet": _snippet(raw)}
+                    if sheet is not None:
+                        loc["sheet"] = sheet
+                    out.append(loc)
+                    if len(out) >= max_values:
+                        return out
+        return out
+    if suf == ".pdf":
+        pages = _pdf_pages(p)
+    else:
+        text = _read_text(p, max_chars=5_000_000)
+        pages = [text] if text else []
+    for pno, text in enumerate(pages, start=1):
+        lines = text.splitlines()
+        js = _json_field_values(text, fn)
+        if js is not None:
+            located, cursor = [], 0
+            for v in js:
+                i = _line_of(lines, v, cursor)
+                if i < 0:
+                    i = _line_of(lines, v)
+                else:
+                    cursor = i
+                located.append((v, i))
+        else:
+            located = _located_text_values(text, fn, max_hits=max_values)
+        for v, i in located:
+            loc = {"value": v, "kind": "line",
+                   "line": (i + 1) if i >= 0 else None,
+                   "snippet": _snippet(lines[i]) if 0 <= i < len(lines) else ""}
+            if suf == ".pdf":
+                loc["page"] = pno
+            out.append(loc)
+            if len(out) >= max_values:
+                return out
+    return out
+
+
+def _table_frames(p: Path):
+    """``[(sheet_name_or_None, DataFrame)]`` — EVERY sheet of a workbook (a
+    tracker's people are often on the second tab), or the one frame of a
+    CSV/TSV/Parquet. Cells are read as text so part codes keep leading zeros."""
+    suf = p.suffix.lower()
+    try:
+        import pandas as pd
+        if suf in (".xlsx", ".xlsm", ".xls"):
+            book = pd.read_excel(p, sheet_name=None, dtype=str)
+            return list(book.items())
+        if suf in (".csv", ".tsv"):
+            return [(None, pd.read_csv(p, sep="\t" if suf == ".tsv" else ",",
+                                       dtype=str, on_bad_lines="skip"))]
+        import vault_analyst as va
+        return [(None, va.read_table(p).astype(str))]
+    except Exception:
+        return []
+
+
+def _pdf_pages(p: Path) -> List[str]:
+    try:
+        import vault_rag
+        return vault_rag.extract_pdf_pages(p)
+    except Exception:
+        return []
 
 
 def _read_text(p: Path, max_chars: int = 400000) -> str:

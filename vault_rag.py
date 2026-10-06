@@ -72,6 +72,62 @@ INDEXABLE_EXTENSIONS = TEXT_LIKE_EXTENSIONS | EXTRACTABLE_EXTENSIONS
 SKIP_PATTERNS = {".git", "__pycache__", ".chromadb", "node_modules"}
 
 
+def extract_pdf_pages(p: Path, *, max_pages: Optional[int] = None) -> List[str]:
+    """A PDF's text ONE STRING PER PAGE, index 0 = page 1, so a citation can
+    name the page. _extract_text joins the pages (and stops at 50), which
+    loses the page; the knowledge graph needs it. A page with no text layer
+    (a scan) is kept as '' so later page numbers stay right. No cap unless
+    ``max_pages`` is given. ``[]`` when pypdf is missing or the file can't be
+    read."""
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        return []
+    try:
+        reader = PdfReader(str(p))
+        pages = reader.pages if max_pages is None else reader.pages[:max_pages]
+        out = []
+        for page in pages:
+            try:
+                out.append(page.extract_text() or "")
+            except Exception:
+                out.append("")
+        return out
+    except Exception:
+        return []
+
+
+def _docx_text_stdlib(p: Path) -> str:
+    """A .docx's paragraph text using only the standard library — the
+    fallback when python-docx is not installed (it is missing from both of
+    this desktop's Pythons, so every Word file read as empty). A .docx is a
+    zip whose word/document.xml holds <w:p> paragraphs of <w:t> runs; tabs
+    and breaks become spaces / newlines. Same output shape as the python-docx
+    path: one line per non-empty paragraph."""
+    import zipfile
+    import xml.etree.ElementTree as ET
+    w = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    try:
+        with zipfile.ZipFile(p) as z:
+            root = ET.fromstring(z.read("word/document.xml"))
+    except Exception:
+        return ""
+    lines = []
+    for par in root.iter(f"{w}p"):
+        bits = []
+        for el in par.iter():
+            if el.tag == f"{w}t" and el.text:
+                bits.append(el.text)
+            elif el.tag == f"{w}tab":
+                bits.append("\t")
+            elif el.tag in (f"{w}br", f"{w}cr"):
+                bits.append("\n")
+        text = "".join(bits)
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
+
+
 def _extract_text(p: Path) -> str:
     """Best-effort text extraction for analyst formats (PDF/DOCX/XLSX).
 
@@ -99,7 +155,7 @@ def _extract_text(p: Path) -> str:
             try:
                 from docx import Document
             except Exception:
-                return ""
+                return _docx_text_stdlib(p)
             doc = Document(str(p))
             return "\n".join(par.text for par in doc.paragraphs if par.text)
         if suf in (".xlsx", ".xlsm", ".xls"):
