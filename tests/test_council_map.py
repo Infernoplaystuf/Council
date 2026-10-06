@@ -61,9 +61,9 @@ def test_the_facts_the_map_is_for():
     m = cm.static_map()
     # The judge sees no vault evidence — only a proposal.
     assert _edge(m, "librarian", "judge", "evidence").tk == "proposed"
-    # Qt passes tools=None to run_turn.
+    # Both front ends hand the coder its tools.
     tools = _edge(m, "tools", "coder")
-    assert (tools.qt, tools.tk) == ("broken", "live")
+    assert (tools.qt, tools.tk) == ("live", "live")
     # The Sage knowledge base never reaches the sage.
     sage = _edge(m, "sage_kb", "sage")
     assert (sage.qt, sage.tk) == ("broken", "broken")
@@ -89,7 +89,7 @@ def test_gaps_report_lists_worst_first():
     report = cm.gaps_report(m, "qt")
     assert report.index("Broken") < report.index("Missing here") \
         < report.index("Proposed")
-    assert "tools=None" in report
+    assert "SageAgent" in report
 
 
 def test_model_label():
@@ -213,12 +213,11 @@ def test_tab_click_shows_the_node_and_front_end_switch(qapp):
     try:
         tab.canvas.node_clicked.emit("coder")
         assert tab.details.toPlainText().startswith("Coder")
-        assert "Broken" in tab.details.toPlainText()
+        assert "Missing here" in tab.details.toPlainText()
         tab.canvas.selected = "coder"
         tab.front_end.setCurrentIndex(cm.FRONT_ENDS.index("tk"))
         assert tab.canvas.front_end == "tk"
-        assert "Broken (never fires)]" not in \
-            tab.details.toPlainText().split("Tools:")[1].split("\n")[0]
+        assert "Missing here" not in tab.details.toPlainText()
     finally:
         tab.close()
         tab.deleteLater()

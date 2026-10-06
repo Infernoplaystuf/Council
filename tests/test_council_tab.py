@@ -509,3 +509,58 @@ def test_the_tab_applies_the_run_time_rule_and_not_just_the_default(qapp):
     assert demo.options().deliberate is False, (
         "the tab returned the stored value without applying the DEMO_MODE rule")
     demo.deleteLater()
+
+
+# ============================================================
+# Tools reach the turn
+# ============================================================
+
+def _send_with(tmp_path, monkeypatch, tools_on: bool):
+    """`send` with a fake run_turn: what does the turn get handed?"""
+    from council_core import council_turn
+    seen = {}
+
+    def fake_run_turn(question, models, **kwargs):
+        seen.update(kwargs)
+        return council_turn.TurnResult(True, answer="ok")
+
+    monkeypatch.setattr(council_turn, "run_turn", fake_run_turn)
+    actions = CouncilActions(vault_dir=tmp_path / "vault")
+    actions._models = object()
+    options = council_options.CouncilOptions.defaults()
+    options.tools = tools_on
+    options.deliberate = True
+    assert actions.send("why?", options).ok
+    return actions, seen
+
+
+def test_the_tools_switch_hands_the_turn_real_tools(tmp_path, monkeypatch):
+    """The Tools switch used to reach run_turn as enable_tools=True with
+    tools=None, so ModelAgent's tool table was empty and the switch did
+    nothing."""
+    actions, seen = _send_with(tmp_path, monkeypatch, tools_on=True)
+    assert seen["enable_tools"] is True
+    assert {"run_python", "vault_search", "vault_read", "api_search",
+            "api_signature"} <= set(seen["tools"])
+    # Built once and kept.
+    assert actions.tools() is seen["tools"]
+
+
+def test_tools_off_builds_nothing(tmp_path, monkeypatch):
+    actions, seen = _send_with(tmp_path, monkeypatch, tools_on=False)
+    assert seen["enable_tools"] is False and seen["tools"] is None
+    assert actions._tools is None
+
+
+def test_the_qt_tools_work_against_the_vault(tmp_path):
+    """The tools the Qt council builds run end to end in a temp vault."""
+    actions = CouncilActions(vault_dir=tmp_path / "vault")
+    tools = actions.tools()
+    ok, msg, _ = tools["vault_save"]({"name": "note.txt",
+                                      "content": "bearing torque 42 Nm"})
+    assert ok, msg
+    ok, msg, payload = tools["vault_search"]({"query": "torque"})
+    assert ok and payload["matches"], msg
+    ok, msg, payload = tools["run_python"]({"code": "print(6 * 7)"})
+    assert ok and payload["rc"] == 0 and "42" in payload["stdout"], msg
+    assert (tmp_path / "vault" / "workspace").is_dir()

@@ -104,6 +104,7 @@ class CouncilActions:
         self.demo_mode = bool(demo_mode)
         self._models = None
         self._models_problem = ""
+        self._tools = None
 
     # -- implemented -----------------------------------------------------
     def specialists(self):
@@ -158,6 +159,25 @@ class CouncilActions:
                 council_turn.load_personalities(self.vault_dir))
         return self._models, self._models_problem
 
+    def tools(self):
+        """The coder's and intern's tools, built on the first turn that asks.
+
+        The same set the Tk council hands out (council_core.council_tools).
+        Without it the Tools switch reached run_turn as enable_tools with
+        tools=None, and ModelAgent ran with an empty tool table: the switch
+        did nothing.
+        """
+        if self._tools is None:
+            import council_engine
+            from council_core import council_tools
+            runner = council_engine.LocalRunner(
+                paths.ensure(self.vault_dir / "workspace"))
+            librarian = council_engine.Librarian(
+                self.vault_dir, self.vault_dir / "logs" / "council.log")
+            self._tools = council_tools.make_tools(runner, librarian,
+                                                   self.vault_dir)
+        return self._tools
+
     def send(self, typed_text: str, options, *, on_event=None,
              on_token=None):
         """Run one turn through council_core.council_turn.
@@ -178,9 +198,11 @@ class CouncilActions:
             # verdict id — which is what keeps the verdict bar honest (A3).
             return self._direct(typed_text, models, on_event=on_event)
 
+        enable_tools = bool(getattr(options, "tools", False))
         return council_turn.run_turn(
             typed_text, models,
-            enable_tools=bool(getattr(options, "tools", False)),
+            enable_tools=enable_tools,
+            tools=self.tools() if enable_tools else None,
             on_event=on_event,
             on_token=on_token if getattr(options, "stream", True) else None)
 

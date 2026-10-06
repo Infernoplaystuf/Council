@@ -204,8 +204,9 @@ _NODES: Tuple[Node, ...] = (
          "data_index / vault search: [VAULT MATCH], [FILE], [FOLDER] blocks.",
          "data_index.py; council_gui_engine.py:18256"),
     Node("tools", "Tools", "supplier",
-         "run_python, vault_save/list/read/search, api_search, api_signature.",
-         "council_gui_engine.py:3810-3905; council_core/council_turn.py:108"),
+         "run_python, vault_save/list/read/search, api_search, api_signature. "
+         "Only the coder and intern may call them, and only with Tools on.",
+         "council_core/council_tools.py; council_core/council_turn.py:108"),
     Node("web", "Web research", "supplier", "crawl4ai pages for the intern.",
          "intern_agent.py"),
     Node("sage_kb", "Sage knowledge", "supplier",
@@ -312,16 +313,13 @@ def _edges() -> List[Edge]:
         E("web", "intern", "researched pages", "context", "missing", "live",
           cite="intern_agent.py; council_gui_engine.py:18744"),
         # -- tools ---------------------------------------------------------
-        E("tools", "coder", "tool results (run_python, vault_*, api_*)",
-          "tools", "broken", "live",
-          note="The Qt Tools toggle sets enable_tools but run_turn is "
-               "passed tools=None, so ModelAgent.tools is empty.",
-          cite="council_core/council_turn.py:108-109; "
-               "council_qt/tabs/council.py:181-185"),
-        E("tools", "intern", "tool results", "tools", "broken", "live",
-          note="Same as the coder: no tools reach run_turn on Qt.",
-          cite="council_core/council_turn.py:108-109"),
-        E("tools", "writer", "PRIOR TOOL OUTPUTS", "tools", "missing", "live",
+        E("tools", "coder", "tool results (run_python, vault_*, api_*), "
+          "when Tools is on", "tools", "live", "live",
+          cite="council_core/council_tools.py; "
+               "council_qt/tabs/council.py (CouncilActions.tools)"),
+        E("tools", "intern", "tool results, when Tools is on", "tools",
+          "live", "live", cite="council_core/council_turn.py:108-109"),
+        E("tools", "writer", "PRIOR TOOL OUTPUTS", "tools", "live", "live",
           cite="council_core/deliberation.py:290-390"),
         # -- memory --------------------------------------------------------
         E("debate", "wishlist", "low-confidence members (≤4/10) as gaps",
