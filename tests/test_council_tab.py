@@ -591,3 +591,106 @@ def test_a_deliberated_answer_appears_once(qapp, monkeypatch, tmp_path):
             f"the final answer is shown {text.count(answer)} times:\n{text}")
     finally:
         window.request_close()
+
+
+# ============================================================
+# The status widgets say something
+# ============================================================
+# agent_label and tps_label were built and never written — two empty labels
+# in the toolbar. They now follow the turn: who is being waited on, and the
+# speed the ENGINE measured for each call (council_engine.last_call_stats —
+# the real telemetry, written here the way the engine writes it after a
+# call). The models are the only stand-ins.
+
+def _engine():
+    import council_engine
+    return council_engine
+
+
+def test_the_agent_label_names_who_is_answering(qapp, monkeypatch, tmp_path):
+    import threading as _threading
+
+    from tests.test_council_turn import FakeModel, Models
+
+    waiting = _threading.Event()
+    release = _threading.Event()
+
+    class Slow(FakeModel):
+        def respond(self, prompt, **kwargs):
+            waiting.set()
+            release.wait(5.0)
+            return "done"
+
+    window, view = _council(qapp, monkeypatch, tmp_path,
+                            Models(writer=Slow()), demo_mode=True)
+    try:
+        view.input.setPlainText("why?")
+        view.on_send()
+        assert _pump(qapp, waiting.is_set, timeout=10)
+        assert _pump(qapp, lambda: view.agent_label.text() == "▶ Writer"), (
+            f"while the Writer answered, the label said "
+            f"{view.agent_label.text()!r}")
+        release.set()
+        assert _pump(qapp, lambda: not view._turn_active, timeout=10)
+        assert view.agent_label.text() == "", "the label outlived the turn"
+    finally:
+        release.set()
+        window.request_close()
+
+
+def test_a_phase_marker_moves_the_label_but_a_stage_does_not(tab):
+    from council_core.deliberation import AgentEvent
+
+    tab.on_event(AgentEvent("Orchestrator", "phase",
+                            "▶ Judge — critiquing synthesis"))
+    assert tab.agent_label.text() == "▶ Judge"
+    tab.on_event(AgentEvent("Orchestrator", "phase",
+                            "▶ Round 2/2 — Candidate generation"))
+    assert tab.agent_label.text() == "▶ Judge"
+    tab.on_event(AgentEvent("Peasant", "observation", "a question"))
+    assert tab.agent_label.text() == "▶ Peasant"
+
+
+def test_the_speed_label_shows_what_the_engine_measured(qapp, monkeypatch,
+                                                        tmp_path):
+    ce = _engine()
+
+    from tests.test_council_turn import FakeModel, Models
+
+    class Measured(FakeModel):
+        def respond(self, prompt, **kwargs):
+            # What the engine records after a real call (_record_stats).
+            ce._record_stats("writer", {"backend": "ollama", "model": "fake",
+                                        "gen_tokens": 120, "gen_tok_s": 41.5,
+                                        "seconds": 2.9})
+            return "measured answer"
+
+    window, view = _council(qapp, monkeypatch, tmp_path,
+                            Models(writer=Measured()), demo_mode=True)
+    try:
+        _ask(qapp, view, "how fast?")
+        assert view.tps_label.text() == "Writer 41.5 tok/s", (
+            view.tps_label.text())
+    finally:
+        window.request_close()
+
+
+def test_a_call_from_before_the_turn_is_not_this_turns_speed(
+        qapp, monkeypatch, tmp_path):
+    """The engine's stats are "the most recent call", whoever made it — a
+    Describe run in the Designer, the previous turn. Only calls made during
+    this turn may set the label."""
+    ce = _engine()
+    ce._record_stats("coder", {"backend": "ollama", "model": "fake",
+                               "gen_tok_s": 99.0})
+
+    from tests.test_council_turn import FakeModel, Models
+
+    window, view = _council(qapp, monkeypatch, tmp_path,
+                            Models(writer=FakeModel("unmeasured")),
+                            demo_mode=True)
+    try:
+        _ask(qapp, view, "anything")
+        assert view.tps_label.text() == "", view.tps_label.text()
+    finally:
+        window.request_close()

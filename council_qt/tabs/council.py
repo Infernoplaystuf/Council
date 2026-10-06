@@ -86,7 +86,16 @@ PER_TURN_FIELDS = (
     "_last_fast_question",  # A4 — what "Expand with council" would re-ask
     "_force_full_council",
     "_shown_finals",        # final texts already in the transcript this turn
+    "_turn_rates",          # speaker -> tokens/s, for the tps label
+    "_turn_stats_floor",    # the engine's stats seq when the turn began
 )
+
+#: Speakers the "▶ who" label names. The orchestrator's phase markers name a
+#: role ("▶ Writer — drafting answer") or a stage ("▶ Round 1/2 — …"); only
+#: the first kind is an active personality.
+_SPEAKERS = frozenset({"Writer", "Peasant", "Intern", "Coder", "Artist",
+                       "Skeptic", "Sage", "Strategist", "Content", "Director",
+                       "Judge"})
 
 
 class CouncilActions:
@@ -194,6 +203,10 @@ class CouncilActions:
         if writer is None:
             return council_turn.TurnResult(
                 False, message="No writer model is loaded.")
+        if on_event is not None:
+            # BEFORE the call, so the tab can say who is answering while it
+            # waits ("▶ Writer"). A thought: progress, never a transcript line.
+            on_event(AgentEvent("Writer", "thought", "Answering…"))
         try:
             answer = writer.respond(typed_text)
         except Exception as exc:                          # noqa: BLE001
@@ -204,6 +217,19 @@ class CouncilActions:
             on_event(event)
         return council_turn.TurnResult(True, answer=answer, route="direct",
                                        events=[event])
+
+    def last_call_stats(self) -> dict:
+        """council_engine.last_call_stats() — what the most recent model call
+        cost (gen_tok_s, role, seq) — when the engine is loaded; {} when it is
+        not. Never imports it: this is read on the GUI thread, and a turn
+        that has called a model has loaded it already."""
+        import sys
+        engine = sys.modules.get("council_engine")
+        getter = getattr(engine, "last_call_stats", None) if engine else None
+        try:
+            return dict(getter() or {}) if callable(getter) else {}
+        except Exception:                                 # noqa: BLE001
+            return {}
 
     def record_verdict_response(self, verdict_id: str, agreed: bool,
                                 objection: str = ""):
@@ -375,9 +401,16 @@ class CouncilTab(ViewHelpers, QWidget):
         self._button(row, amp("💡 What can I ask?"), self.on_examples)
         row.addStretch(1)
 
+        # Fed by the turn's own events: who is answering now ("▶ Writer",
+        # cleared when the turn ends), and how fast the models generated
+        # this turn (council_engine.last_call_stats). Tk's colours.
         self.agent_label = QLabel("")
+        self.agent_label.setStyleSheet("color: #a6e3a1;")
         row.addWidget(self.agent_label)
         self.tps_label = QLabel("")
+        self.tps_label.setStyleSheet("color: #d32f2f;")
+        self.tps_label.setToolTip("Generation speed this turn, from the "
+                                  "engine's own measurement of each call.")
         row.addWidget(self.tps_label)
         self.status = QLabel("● idle")
         self.status.setStyleSheet(f"color: {self._tokens['success']};")
@@ -531,6 +564,9 @@ class CouncilTab(ViewHelpers, QWidget):
         self._turn_active = False
         self.send_btn.setEnabled(True)
         self.set_status("● idle", self._tokens["success"])
+        # Nobody is answering any more. The speed stays: it describes the
+        # turn that just finished, which is when it is worth reading.
+        self.agent_label.setText("")
 
     def reset_turn(self) -> None:
         """Clear everything the previous turn left behind.
@@ -555,6 +591,8 @@ class CouncilTab(ViewHelpers, QWidget):
         if not self.begin_turn():
             return
         self.reset_turn()
+        # Only calls made from here on describe THIS turn's speed.
+        self._turn_stats_floor = self.actions.last_call_stats().get("seq") or 0
         self._last_query = typed
         self.append("User", typed)
         self.input.clear()
@@ -652,8 +690,15 @@ class CouncilTab(ViewHelpers, QWidget):
             who = getattr(event, "who", "Writer")
             self.stream_box.append_token(who, getattr(event, "text", ""))
             return
+        self._note_speaker(event, kind)
+        self._refresh_tps()
         if kind == "phase":
             self.append("", getattr(event, "text", ""), "phase")
+            return
+        if kind == "thought":
+            # Progress ("Generating response…"), not conversation: it moves
+            # the "▶ who" label above and stays out of the transcript, as in
+            # Tk's live_event handler.
             return
         if kind == "verdict":
             # A3: the bar appears because a verdict arrived, carrying its id.
@@ -671,6 +716,41 @@ class CouncilTab(ViewHelpers, QWidget):
         self.append(getattr(event, "who", "Council"),
                     getattr(event, "text", str(event)), "observation")
 
+    def _note_speaker(self, event, kind: str) -> None:
+        """"▶ Writer" while the Writer is the one being waited on.
+
+        Two sources, because the turn reports in two ways: the orchestrator's
+        phase markers name the role BEFORE its call ("▶ Writer — drafting
+        answer"), and an event from a personality names it directly. A stage
+        ("▶ Round 1/2 — …") or the app itself ("Orchestrator", "Council")
+        moves nothing."""
+        who = getattr(event, "who", "") or ""
+        if kind == "phase":
+            text = (getattr(event, "text", "") or "").lstrip("▶ ").strip()
+            who = text.split(" — ", 1)[0].strip()
+        if who in _SPEAKERS:
+            self.agent_label.setText(f"▶ {who}")
+
+    def _refresh_tps(self) -> None:
+        """Tokens/s from the engine's own measurement of each call this turn
+        (last_call_stats: gen_tok_s, per role). Up to the three most recent
+        speakers, as Tk's label shows them. A call from before this turn —
+        its seq at or below the floor taken in on_send — is not this turn's."""
+        stats = self.actions.last_call_stats()
+        rate, seq = stats.get("gen_tok_s"), stats.get("seq")
+        if not rate or seq is None or seq <= (self._turn_stats_floor or 0):
+            return
+        from council_core import council_turn
+        role = str(stats.get("role") or "")
+        name = council_turn.AGENT_NAMES.get(role, role.title() or "Model")
+        rates = dict(self._turn_rates or {})
+        rates.pop(name, None)                  # most recent last
+        rates[name] = rate
+        self._turn_rates = rates
+        shown = list(rates.items())[-3:]
+        self.tps_label.setText(
+            " · ".join(f"{who} {value:g}" for who, value in shown) + " tok/s")
+
     def on_token(self, who: str, token: str) -> None:
         """One streamed token. The stream box, never the transcript.
 
@@ -683,6 +763,7 @@ class CouncilTab(ViewHelpers, QWidget):
 
     def finish_turn(self, result) -> None:
         """Render what the turn produced, on the GUI thread."""
+        self._refresh_tps()
         if not result.ok:
             self.append("Council", result.message or "The turn failed.",
                         "observation")
