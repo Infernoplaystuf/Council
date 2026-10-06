@@ -77,6 +77,9 @@ PROTECTED_STATE_FILES: tuple = (
     ".agent_runs.jsonl", ".tool_gaps.jsonl", ".failures.jsonl",
     ".user_quirks.jsonl", ".tool_proposals.jsonl",
     ".onboarded", ".council_python",
+    # Agent profiles: settings, profiles and the council's tool requests
+    # (council_core/agent_profiles.py) — app state, and it quotes tool code.
+    "agent_profiles.json",
 )
 _PROTECTED_STATE_FILES_LC = frozenset(s.lower() for s in PROTECTED_STATE_FILES)
 
