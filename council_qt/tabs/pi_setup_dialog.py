@@ -12,6 +12,7 @@ the elevated helper then re-checks the same disk before touching it.
 from __future__ import annotations
 
 import threading
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -73,8 +74,18 @@ class PiSetupActions:
     def finish(self, item, **kw):
         return su.finish_new_pi(self.vault, item, **kw)
 
+    def abandon(self, job: Path, item) -> None:
+        su.abandon_job(job, item.id if item is not None else None)
+
+    def sweep(self) -> List[str]:
+        return su.sweep_jobs()
+
 
 class PiSetupDialog(ViewHelpers, QDialog):
+
+    #: No status from the card writer this long after it was started (UAC
+    #: approved) means it never ran — it writes one within a second.
+    WRITER_START_TIMEOUT_S = 120
 
     def __init__(self, parent=None, actions: Optional[PiSetupActions] = None,
                  vault_dir: Optional[Path] = None):
@@ -90,6 +101,13 @@ class PiSetupDialog(ViewHelpers, QDialog):
         self._disks: List[dk.Disk] = []
         self._images: List[images.OsImage] = []
         self._image_path: Optional[Path] = None
+        #: The list entry ``_image_path`` IS (its checksum and first-boot
+        #: format), or None for a file that is not in the list. Tied to the
+        #: file, not to the combo box: the combo's entry used to be sent with
+        #: whatever file was chosen.
+        self._image_entry: Optional[images.OsImage] = None
+        self._downloading: Optional[images.OsImage] = None
+        self._writer_started = 0.0
         self._job: Optional[Path] = None
         self._pending: Optional[su.Pending] = None
         self._approved_fp: Optional[str] = None
@@ -105,6 +123,15 @@ class PiSetupDialog(ViewHelpers, QDialog):
         self.log.setReadOnly(True)
         self.log.setMaximumHeight(170)
         outer.addWidget(self.log)
+        # Card jobs that never ran or failed: their job.json (secrets) and
+        # their "finish this Pi" entries go before the start page lists them.
+        try:
+            gone = self.actions.sweep()
+        except Exception as exc:                          # noqa: BLE001
+            gone = []
+            self.say(f"Could not tidy unfinished card jobs: {exc}")
+        if gone:
+            self.say(f"Removed {len(gone)} card job(s) that never wrote a card.")
         self.page_start = self._build_start()
         self.page_existing = self._build_existing()
         self.page_card = self._build_card()
@@ -293,18 +320,33 @@ class PiSetupDialog(ViewHelpers, QDialog):
         return self._images[i] if i is not None and 0 <= i < len(self._images) else None
 
     def _image_changed(self) -> None:
+        """The user picked a list entry: the image is now THAT entry's file
+        (if it was downloaded), never a file chosen for another entry —
+        switching entries used to keep the first file and send it with the
+        new entry's checksum and first-boot format."""
         img = self._current_image()
-        if img is None:
+        self._image_entry = img
+        self._image_path = self.actions.cached_path(img) if img is not None else None
+        self._show_image()
+
+    def _show_image(self) -> None:
+        img, path = self._image_entry, self._image_path
+        current = self._current_image()
+        self.dl_btn.setEnabled(current is not None
+                               and self.actions.cached_path(current) is None)
+        if path is not None and img is None:
+            fmt = images.release_format(path.name)
+            self.image_note.setText(
+                f"Ready: {path} · not in the official list, so it is checked only by "
+                "reading the card back · " + (f"first-boot format {fmt} (from its name)"
+                                              if fmt else "its first-boot format cannot "
+                                              "be told from its name"))
+        elif img is None:
             self.image_note.setText("No image list yet. Get the list (the only time this "
                                     "goes online), or use a file you have.")
-            self.dl_btn.setEnabled(False)
         else:
-            cached = self.actions.cached_path(img)
-            if cached and self._image_path is None:
-                self._image_path = cached
-            self.dl_btn.setEnabled(cached is None)
             self.image_note.setText(
-                f"{'Ready: ' + str(self._image_path) if self._image_path else 'Not downloaded yet'}"
+                f"{'Ready: ' + str(path) if path else 'Not downloaded yet'}"
                 f" · {img.download_size / 1e6:.0f} MB download · first-boot format "
                 f"{img.init_format}")
         self._update_card_next()
@@ -319,15 +361,19 @@ class PiSetupDialog(ViewHelpers, QDialog):
         if exc is not None:
             self.say(f"Could not get the list: {exc}")
             return
+        own = self._image_path if self._image_entry is None else None
         self._images = imgs
         self._fill_images()
         self.say(f"{len(imgs)} Raspberry Pi OS images listed.")
+        if own is not None:
+            self.use_file(own)              # keep the user's file; match it to the list
 
     def on_download(self) -> None:
         img = self._current_image()
         if self._busy or img is None:
             return
         self._cancel.clear()
+        self._downloading = img
         self.dl_bar.setVisible(True)
         self.say(f"Downloading {img.filename} from downloads.raspberrypi.com…")
 
@@ -345,9 +391,14 @@ class PiSetupDialog(ViewHelpers, QDialog):
         if exc is not None:
             self.say(f"Download failed: {exc}")
             return
-        self._image_path = Path(path)
         self.say(f"Downloaded and checked against its published checksum: {path}")
-        self._image_changed()
+        img = self._downloading
+        if img is not None and img in self._images:
+            self.image_box.blockSignals(True)
+            self.image_box.setCurrentIndex(self._images.index(img))
+            self.image_box.blockSignals(False)
+        self._image_path, self._image_entry = Path(path), img
+        self._show_image()
 
     def on_pick_file(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Raspberry Pi OS image", "",
@@ -361,13 +412,16 @@ class PiSetupDialog(ViewHelpers, QDialog):
         except (FileNotFoundError, ValueError) as exc:
             self.say(str(exc))
             return
-        self._image_path = p
         match = images.match_local(p, self._images)
         if match is not None:
+            self.image_box.blockSignals(True)
             self.image_box.setCurrentIndex(self._images.index(match))
-        self.say(f"Using {p}" + ("" if match else " (not in the official list: its first-boot "
-                                 "format is read from the card after writing)"))
-        self._image_changed()
+            self.image_box.blockSignals(False)
+        self._image_path, self._image_entry = p, match
+        self.say(f"Using {p}" + ("" if match else
+                                 " (not in the official list: its checksum is not known, "
+                                 "and its first-boot format is taken from its name)"))
+        self._show_image()
 
     def refresh_disks(self) -> None:
         try:
@@ -467,13 +521,28 @@ class PiSetupDialog(ViewHelpers, QDialog):
         if probs:
             self.say("\n".join(probs))
             return
-        disk, img = self._current_disk(), self._current_image()
-        fmt = img.init_format if img and img.init_format in fb.FORMATS else fb.CLOUDINIT
+        disk, entry, path = self._current_disk(), self._image_entry, self._image_path
+        # Checksum, size and first-boot format belong to the FILE: its own list
+        # entry, or for a file not in the list no checksum (the read-back still
+        # runs) and the format its name gives. Never the combo's entry for
+        # another file — that erased a card and then refused it, or gave a
+        # Bookworm card cloud-init files it ignores (no user, SSH or Wi-Fi).
+        if entry is not None:
+            fmt = (entry.init_format if entry.init_format in fb.FORMATS
+                   else images.release_format(entry.filename))
+            sha, size = entry.extract_sha256, entry.extract_size
+        else:
+            fmt = images.release_format(path.name) if path is not None else ""
+            sha, size = "", 0
+        if fmt not in fb.FORMATS:
+            self.say("Not written: which first-boot settings this image takes cannot be "
+                     "told (it is not in the official list and its name does not say "
+                     "Trixie or Bookworm). Get the list and use an official image.")
+            return
         try:
             out = self.actions.prepare(
-                disk=disk, typed_confirm=self.confirm_edit.text(), image=self._image_path,
-                init_format=fmt, extract_sha256=img.extract_sha256 if img else "",
-                extract_size=img.extract_size if img else 0, cfg=cfg,
+                disk=disk, typed_confirm=self.confirm_edit.text(), image=path,
+                init_format=fmt, extract_sha256=sha, extract_size=size, cfg=cfg,
                 model=self.s_model.currentData())
         except Exception as exc:                          # noqa: BLE001
             self.say(f"Not written: {exc}")
@@ -487,9 +556,24 @@ class PiSetupDialog(ViewHelpers, QDialog):
         try:
             self.actions.start_writer(self._job)
         except Exception as exc:                          # noqa: BLE001
-            self.say(f"The card writer did not start (permission declined?): {exc}")
+            self.say(f"The card writer did not start (permission declined?): {exc}. "
+                     "Nothing was erased, and the settings prepared for it were deleted.")
+            self._abandon()
             return
+        self._writer_started = time.monotonic()
         self._timer.start()
+
+    def _abandon(self) -> None:
+        """The writer never ran: delete its job (the first-boot secrets) and
+        its pending record (see setup.abandon_job)."""
+        if self._job is not None:
+            try:
+                self.actions.abandon(self._job, self._pending)
+            except Exception as exc:                      # noqa: BLE001
+                self.say(f"Could not delete the card job {self._job.parent}: {exc}")
+        self._job, self._pending = None, None
+        self.cancel_btn.setEnabled(False)
+        self._refresh_pending()
 
     # ── page: writing / finishing ──
     def _build_write(self) -> QWidget:
@@ -514,6 +598,14 @@ class PiSetupDialog(ViewHelpers, QDialog):
             return
         st = self.actions.read_status(self._job.parent)
         if not st:
+            if time.monotonic() - self._writer_started >= self.WRITER_START_TIMEOUT_S:
+                # It writes 'checking' within a second of starting, before it
+                # touches the card; none at all means it never ran (or was
+                # handed a path it refused) — do not wait forever.
+                self._timer.stop()
+                self.say("✗ The card writer never reported back, so nothing was "
+                         "erased. Its settings were deleted; try again.")
+                self._abandon()
             return
         total = int(st.get("total") or 0)
         if total:

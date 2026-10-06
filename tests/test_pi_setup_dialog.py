@@ -98,6 +98,13 @@ class FakeActions:
         self._pending = []
         return su.Outcome(True, "192.168.1.80", item.hostname, item.model, "ready")
 
+    def abandon(self, job, item):
+        self.abandoned = (job, item)
+        self._pending = []
+
+    def sweep(self):
+        return []
+
 
 @pytest.fixture
 def dlg(qapp, tmp_path):
@@ -204,3 +211,182 @@ def test_pending_pi_can_be_finished_later(qapp, tmp_path):
     d.done(0)
     d.deleteLater()
     qapp.processEvents()
+
+
+# ── review fixes (merge of knowledge-graph into qt-migration) ─────────────
+from council_qt.tabs.pi_setup_dialog import PiSetupActions  # noqa: E402
+
+
+class RealJobs(PiSetupActions):
+    """The REAL prepare / pending / abandon / sweep (temporary state and key
+    folders); fake disks and images; a writer that never starts (UAC
+    declined) or never reports back."""
+
+    def __init__(self, tmp_path, declined=True):
+        super().__init__(tmp_path / "vault")
+        self.fake = FakeActions(tmp_path)
+        self.declined = declined
+
+    def list_disks(self):
+        return self.fake.list_disks()
+
+    def catalog(self):
+        return self.fake.catalog()
+
+    def cached_path(self, img):
+        return self.fake.cached_path(img)
+
+    def start_writer(self, job):
+        if self.declined:
+            raise RuntimeError("This command cannot be run due to the error: "
+                               "The operation was canceled by the user.")
+
+    def read_status(self, job_dir):
+        return None
+
+
+@pytest.fixture
+def state(tmp_path, monkeypatch):
+    monkeypatch.setenv("COUNCIL_PI_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("COUNCIL_KEY_DIR", str(tmp_path / "keys"))
+    return tmp_path / "state"
+
+
+def _close(qapp, d):
+    drive(qapp, d)
+    d.done(0)
+    d.deleteLater()
+    qapp.processEvents()
+
+
+def test_a_declined_uac_prompt_leaves_no_secrets_and_nothing_to_finish(qapp, tmp_path, state):
+    # job.json (the Pi's SSH host PRIVATE key, the password hash, the WPA
+    # key) was deleted only by the helper, so a declined prompt left it on
+    # disk for good, and the start page offered to finish that Pi.
+    d = PiSetupDialog(actions=RealJobs(tmp_path))
+    _to_settings(d)
+    d.write_btn.click()
+    assert list(state.rglob("job.json")) == []
+    assert su.pending() == []
+    assert d.finish_btn.isHidden() and d._job is None
+    assert "did not start" in d.log.toPlainText()
+    _close(qapp, d)
+
+
+def test_a_writer_that_never_reports_back_is_given_up_and_cleaned_up(qapp, tmp_path, state):
+    d = PiSetupDialog(actions=RealJobs(tmp_path, declined=False))
+    d.WRITER_START_TIMEOUT_S = 0
+    _to_settings(d)
+    d.write_btn.click()
+    assert d._timer.isActive() and list(state.rglob("job.json"))
+    d._poll_writer()
+    assert not d._timer.isActive()
+    assert list(state.rglob("job.json")) == [] and su.pending() == []
+    assert "never reported back" in d.log.toPlainText()
+    _close(qapp, d)
+
+
+def test_opening_the_dialog_sweeps_jobs_that_never_ran_or_failed(qapp, tmp_path, state):
+    import json
+    import os
+    import time as _t
+    ids = {k: f"00000000-0000-4000-8000-00000000000{n}"
+           for n, k in enumerate(("stale", "failed", "done", "fresh"), start=1)}
+    for k, jid in ids.items():
+        jd = state / "jobs" / jid
+        jd.mkdir(parents=True)
+        if k in ("stale", "fresh"):
+            (jd / "job.json").write_text('{"secret": "ssh host key"}', encoding="utf-8")
+        if k == "stale":
+            old = _t.time() - 2 * 3600
+            os.utime(jd / "job.json", (old, old))
+        if k in ("failed", "done"):
+            (jd / "status.json").write_text(json.dumps(
+                {"phase": "error" if k == "failed" else "done"}), encoding="utf-8")
+    su._save_pending([su.Pending(id=jid, hostname=f"council-pi-{k}", username="council",
+                                 host_public="ssh-ed25519 AAAA", model="llama3.2:3b")
+                      for k, jid in ids.items()])
+    d = PiSetupDialog(actions=RealJobs(tmp_path))
+    assert sorted(p.hostname for p in su.pending()) == ["council-pi-done", "council-pi-fresh"]
+    assert sorted(p.parent.name for p in state.rglob("job.json")) == [ids["fresh"]]
+    assert d.finish_box.count() == 2
+    _close(qapp, d)
+
+
+LEGACY = {"name": "Raspberry Pi OS Lite (Legacy, 64-bit)",
+          "url": "https://downloads.raspberrypi.com/raspios_oldstable_lite_arm64/images/y/"
+                 "2025-05-13-raspios-bookworm-arm64-lite.img.xz",
+          "extract_size": 2_000_000_000, "extract_sha256": "c" * 64,
+          "image_download_size": 400_000_000, "release_date": "2025-05-13",
+          "init_format": "systemd", "devices": ["pi4-64bit"]}
+
+
+def _with_legacy(acts):
+    import copy
+    cat = copy.deepcopy(CATALOG)
+    cat["os_list"][0]["subitems"].append(dict(LEGACY))
+    acts.catalog = lambda: im.parse_catalog(cat)
+    acts.cached_path = lambda img: acts.image_file if "trixie" in img.filename else None
+    return acts
+
+
+def _write_with_file(dlg, name):
+    f = dlg.actions.tmp / name
+    f.write_bytes(b"img")
+    dlg.on_new()
+    dlg.use_file(f)
+    dlg.disk_list.setCurrentRow(2)
+    dlg.confirm_edit.setText(dlg._current_disk().confirm_code)
+    dlg.s_pass.setText("correct-horse-42")
+    dlg.s_pass2.setText("correct-horse-42")
+    dlg.on_write()
+    return f
+
+
+def test_a_file_not_in_the_list_is_not_checked_against_another_images_hash(qapp, tmp_path):
+    d = PiSetupDialog(actions=FakeActions(tmp_path))
+    f = _write_with_file(d, "my-bookworm-custom.img")
+    kw = d.actions.prepared
+    assert kw["image"] == f and kw["extract_sha256"] == "" and kw["extract_size"] == 0
+    assert kw["init_format"] == "systemd"          # Bookworm, from its name
+    _close(qapp, d)
+
+
+def test_a_file_whose_format_cannot_be_told_is_not_written(qapp, tmp_path):
+    d = PiSetupDialog(actions=FakeActions(tmp_path))
+    _write_with_file(d, "my-custom.img")
+    assert d.actions.prepared is None and "cannot be told" in d.log.toPlainText()
+    _close(qapp, d)
+
+
+def test_without_the_list_a_bookworm_file_gets_bookworm_settings(qapp, tmp_path):
+    acts = FakeActions(tmp_path)
+    acts.catalog = lambda: []
+    d = PiSetupDialog(actions=acts)
+    _write_with_file(d, "2025-05-13-raspios-bookworm-arm64-lite.img.xz")
+    assert acts.prepared["init_format"] == "systemd" and acts.prepared["extract_sha256"] == ""
+    _close(qapp, d)
+
+
+def test_choosing_another_list_entry_drops_the_file_chosen_for_the_first(qapp, tmp_path):
+    d = PiSetupDialog(actions=_with_legacy(FakeActions(tmp_path)))
+    d.on_new()
+    trixie = d._image_path
+    assert trixie is not None and "trixie" in trixie.name
+    d.image_box.setCurrentIndex(1)                  # the Legacy entry, not downloaded
+    assert d._image_path is None
+    d.disk_list.setCurrentRow(2)
+    d.confirm_edit.setText(d._current_disk().confirm_code)
+    assert not d.card_next.isEnabled()
+    d.image_box.setCurrentIndex(0)
+    assert d._image_path == trixie
+    _close(qapp, d)
+
+
+def test_a_listed_file_carries_its_own_entrys_hash_and_format(qapp, tmp_path):
+    d = PiSetupDialog(actions=_with_legacy(FakeActions(tmp_path)))
+    _write_with_file(d, "2025-05-13-raspios-bookworm-arm64-lite.img.xz")
+    kw = d.actions.prepared
+    assert kw["init_format"] == "systemd" and kw["extract_sha256"] == "c" * 64
+    assert kw["extract_size"] == 2_000_000_000
+    _close(qapp, d)

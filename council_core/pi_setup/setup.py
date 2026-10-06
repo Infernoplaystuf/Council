@@ -275,6 +275,65 @@ def prepare_new_pi(*, disk: dk.Disk, typed_confirm: str, image: Path, init_forma
     return {"job": job, "pending": item}
 
 
+_JOB_FILES = ("job.json", "cancel", "status.json", "status.json.tmp")
+
+
+def _remove_job_dir(job_dir: Path) -> None:
+    """Delete one job folder the Council made (only its own file names)."""
+    for name in _JOB_FILES:
+        try:
+            (job_dir / name).unlink()
+        except FileNotFoundError:
+            pass
+    try:
+        job_dir.rmdir()
+    except OSError:
+        pass
+
+
+def abandon_job(job: Path, pending_id: Optional[str] = None) -> None:
+    """The card writer never ran (UAC declined, the helper did not start or
+    never reported back): delete the job — job.json carries the first-boot
+    secrets (the Pi's SSH host private key, the password hash, the WPA key)
+    and only the helper deleted it, so a declined prompt left them on disk
+    for good — and drop its pending record, so nothing offers to finish a
+    Pi whose card was never written."""
+    _remove_job_dir(Path(job).parent)
+    if pending_id:
+        _save_pending([p for p in pending() if p.id != pending_id])
+
+
+#: A job.json this old was never read: the helper reads it within seconds of
+#: the UAC prompt being approved (and deletes it when it finishes).
+STALE_JOB_S = 15 * 60
+
+
+def sweep_jobs(now: Optional[float] = None) -> List[str]:
+    """Run when the dialog opens. Deletes every job.json older than
+    STALE_JOB_S (its secrets), and drops the job and its pending record when
+    the card was not written: the helper reported an error, or there is no
+    status and no job left to run. Returns the job ids removed."""
+    now = time.time() if now is None else now
+    jobs = state_dir() / "jobs"
+    removed: List[str] = []
+    if not jobs.is_dir():
+        return removed
+    for d in sorted(p for p in jobs.iterdir() if p.is_dir()):
+        job = d / "job.json"
+        try:
+            if job.is_file() and now - job.stat().st_mtime > STALE_JOB_S:
+                job.unlink()
+        except OSError:
+            pass
+        st = flash_helper.read_status(d)
+        if (st and st.get("phase") == "error") or (not st and not job.exists()):
+            _remove_job_dir(d)
+            removed.append(d.name)
+    if removed:
+        _save_pending([p for p in pending() if p.id not in removed])
+    return removed
+
+
 def finish_new_pi(vault, item: Pending, *, key_dir: Optional[Path] = None, say: Say = None, port: int = 22,
                   on_line=None, cancelled=lambda: False, finder=find_by_host_key,
                   timeout_s: float = 900) -> Outcome:

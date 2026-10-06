@@ -188,6 +188,24 @@ def local_image(path: Path) -> Path:
     return p
 
 
+#: Debian release in an official file name -> its first-boot format: Trixie
+#: images take cloud-init; the Legacy Bookworm (and Bullseye) ones a
+#: firstrun.sh run by systemd.
+_RELEASE_FORMATS = (("trixie", "cloudinit-rpi"), ("bookworm", "systemd"),
+                    ("bullseye", "systemd"))
+
+
+def release_format(filename: str) -> str:
+    """The first-boot format an image file takes, read from the release in
+    its name ('2025-05-13-raspios-bookworm-arm64-lite.img.xz' -> systemd), or
+    '' when the name does not say. For a file that is not in the official
+    list — the Council must build the right first-boot files before
+    writing, and must never guess."""
+    low = Path(filename).name.lower()
+    found = {fmt for word, fmt in _RELEASE_FORMATS if word in low}
+    return found.pop() if len(found) == 1 else ""
+
+
 def match_local(path: Path, images: List[OsImage]) -> Optional[OsImage]:
     """The catalog entry for a local file with the official name, if any —
     so its uncompressed checksum and first-boot format are known."""
