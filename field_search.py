@@ -319,12 +319,12 @@ def _json_field_values(text: str, fn: str, *, exact: bool = False):
     if not t or t[0] not in "[{":
         return None
     vals: List[str] = []
-    _label_is = _label_exact if exact else globals()["_label_is"]
+    is_label = _label_exact if exact else _label_is
 
     def walk(o):
         if isinstance(o, dict):
             for k, v in o.items():
-                if _label_is(k, fn):
+                if is_label(k, fn):
                     vals.extend(_scalars(v))
                 else:
                     walk(v)
@@ -355,7 +355,7 @@ def _json_field_values(text: str, fn: str, *, exact: bool = False):
     # (a key maps to ITS value), never proximity.
     for m in _JSON_PAIR_RE.finditer(t):
         key = m.group(1)
-        if _label_is(key, fn):
+        if is_label(key, fn):
             val = m.group(2) if m.group(2) is not None else m.group(3)
             if val:
                 vals.append(val)
@@ -738,7 +738,7 @@ def _located_text_values(text: str, fn: str, *, max_hits: int = 100,
     The index is the line holding the VALUE — for a heading-style field that is
     the line after the label, which is the line a person would be shown.
     ``exact``: the key must BE the label (see _label_exact)."""
-    _label_is = _label_exact if exact else globals()["_label_is"]
+    is_label = _label_exact if exact else _label_is
     vals: List[Tuple[str, int]] = []
     lines = text.splitlines()
     for i, raw in enumerate(lines):
@@ -751,7 +751,7 @@ def _located_text_values(text: str, fn: str, *, max_hits: int = 100,
         if line.startswith("|") and line.count("|") >= 2:
             cells = [c.strip() for c in line.strip("|").split("|")]
             for j, cell in enumerate(cells[:-1]):
-                if _label_is(cell, fn):
+                if is_label(cell, fn):
                     nxt = cells[j + 1].strip()
                     if nxt and not _RULE_RE.match(nxt):
                         vals.extend((v, i) for v in _split_values(nxt, fn, kind))
@@ -759,12 +759,12 @@ def _located_text_values(text: str, fn: str, *, max_hits: int = 100,
         pairs = _kv_pairs(line)
         if pairs:
             for key, val in pairs:
-                if val and _label_is(key, fn):
+                if val and is_label(key, fn):
                     vals.extend((v, i) for v in _split_values(val, fn, kind))
             continue
         # heading style: the line IS the label -> value on the next non-empty
         # line, unless that line starts a different field.
-        if _label_is(line, fn):
+        if is_label(line, fn):
             for j in range(i + 1, min(i + 4, len(lines))):
                 nxt = lines[j].strip()
                 if not nxt:
