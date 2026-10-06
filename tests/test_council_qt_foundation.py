@@ -455,7 +455,15 @@ def test_an_unextracted_action_says_so_instead_of_doing_nothing(
     for name in unextracted:
         with pytest.raises(VaultActions.NotYetExtracted) as exc:
             getattr(tab.actions, name)()
-        assert "phase 3" in str(exc.value), name
+        # Said to the user: what is missing, not the porter's to-do list
+        # (it used to read "… a _vmgr_* method bound to CouncilConsole.
+        # Extracting it is phase 3 — see docs/qt_full_port_scope.md.").
+        assert "not available in this build yet" in str(exc.value), name
+        assert "phase 3" not in str(exc.value), name
+        assert "_vmgr_" not in str(exc.value), name
+    # And the button that would reach it says so before it is clicked.
+    assert not tab.stats_btn.isEnabled()
+    assert "not available in this build yet" in tab.stats_btn.toolTip()
     window.request_close()
 
 

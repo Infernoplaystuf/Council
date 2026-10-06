@@ -27,8 +27,10 @@ than reading the raw switch.
 """
 from __future__ import annotations
 
+import os
+import re
 from dataclasses import dataclass, field, replace
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 
 @dataclass(frozen=True)
@@ -48,23 +50,50 @@ class Switch:
     #: "not available in this build yet": a live checkbox that changes
     #: nothing reads as a broken one.
     available: bool = True
+    #: Said after "not available in this build yet" when there is more to
+    #: say — what happens instead, so the disabled box is not misread.
+    unavailable_why: str = ""
+
+    @property
+    def name(self) -> str:
+        """The label without its decoration ("👤 Profile" -> "Profile"), for
+        sentences such as "Profile — not available in this build yet."."""
+        return re.sub(r"[^\w\s&-]", "", self.label).strip()
 
 
 #: The Council toolbar, in the order the Tk shell packs it. Order is part of the
 #: description: users find a checkbox by position, and a port that sorts them
 #: alphabetically has moved every one of them.
+#:
+#: Only Deliberation and Stream tokens are read by the Qt turn today. The rest
+#: are available=False until the per-role context carrier (Batch 3 in
+#: docs/qt_migration/remaining_scope_2026-10-06.md) wires them — measured in
+#: review: toggling Tools, Fill IDE, Profile or Adversarial left every request
+#: the models received byte-for-byte the same. Only the Qt tab reads this
+#: table; the Tk toolbar is its own code, and those switches work there.
 SWITCHES: Tuple[Switch, ...] = (
     Switch("deliberate", "Deliberation", True, shown_in_demo=False),
-    Switch("tools", "Tools", False),
-    Switch("fill_ide", "Fill IDE", True),
+    # run_turn is given enable_tools but no tool table, so nothing is called.
+    Switch("tools", "Tools", False, available=False,
+           unavailable_why="The council has no tools to call yet."),
+    Switch("fill_ide", "Fill IDE", True, available=False,
+           unavailable_why="Code in an answer is not copied to the IDE tab "
+                           "yet."),
     Switch("stream", "Stream tokens", True),
+    # Its old tooltip promised "Unchecking skips it on the next message". In
+    # Qt nothing reads the box — Tk's sets COUNCIL_QUIRKS_APPLY — so a profile
+    # the Tk app compiled reached every prompt whichever way it was ticked.
+    # The box now SHOWS what the engine does (profile_applied) and cannot be
+    # changed.
     Switch("use_profile", "👤 Profile", True,
            hint="Applies what the council has learned about how you like "
                 "answers. Unchecking skips it on the next message while "
-                "learning continues underneath."),
-    Switch("adversarial", "Adversarial", False, shown_in_demo=False),
-    # Neither is read by the turn yet (the per-role context carrier, Batch 3
-    # in docs/qt_migration/remaining_scope_2026-10-06.md).
+                "learning continues underneath.",
+           available=False,
+           unavailable_why="A learned profile is applied while "
+                           "COUNCIL_QUIRKS_APPLY is not 0, as the box shows."),
+    Switch("adversarial", "Adversarial", False, shown_in_demo=False,
+           available=False),
     Switch("judge_panel", "Judge panel ✦", False, shown_in_demo=False,
            available=False),
     Switch("robust_voices", "Robust voices ✦", False, shown_in_demo=False, row=2,
@@ -80,6 +109,17 @@ def visible_switches(demo_mode: bool, row: Optional[int] = None) -> List[Switch]
     return [s for s in SWITCHES
             if (s.shown_in_demo or not demo_mode)
             and (row is None or s.row == row)]
+
+
+def profile_applied(environ: Optional[Mapping[str, str]] = None) -> bool:
+    """Whether the engine injects a learned user profile into prompts.
+
+    The SAME rule as council_engine.user_profile_apply_enabled (on unless
+    COUNCIL_QUIRKS_APPLY is 0/false/no/off; a test holds the two together),
+    read here so the Council tab can show it without importing the engine,
+    which it otherwise loads only when a turn needs a model."""
+    env = os.environ if environ is None else environ
+    return env.get("COUNCIL_QUIRKS_APPLY", "1").strip().lower()         not in ("0", "false", "no", "off")
 
 
 @dataclass

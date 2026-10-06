@@ -720,28 +720,45 @@ def _check_labelled(widget, name):
         f"{name} does not say why: {widget.toolTip()!r}")
 
 
+#: Switches nothing in the Qt turn reads. Measured in review through the real
+#: app, engine and FakeOllama: toggling any of these left every request the
+#: models received byte-for-byte the same (Tools: 1/1 calls in the default
+#: build, 16/16 in the full one), and Profile's tooltip promised "Unchecking
+#: skips it on the next message" while the profile reached the prompt
+#: either way.
+UNREAD_SWITCHES = ("tools", "fill_ide", "use_profile", "adversarial",
+                   "judge_panel", "robust_voices")
+
+
 def test_the_unwired_controls_are_disabled_and_say_why(qapp, tmp_path):
     view = _full(qapp, tmp_path)
     try:
         for name in ("find_chart_btn", "look_up_btn", "defer_btn",
                      "expand_btn", "inst_name", "inst_text", "inst_add_btn",
                      "inst_manage_btn", "content_style_btn", "backend_box",
-                     "vfb_agree", "vfb_disagree", "redeliberate_btn"):
+                     "vfb_agree", "vfb_disagree", "redeliberate_btn",
+                     "specialist_box", "history_btn"):
             _check_labelled(getattr(view, name), name)
-        for key in ("judge_panel", "robust_voices"):
+        for key in UNREAD_SWITCHES:
             _check_labelled(view._checkboxes[key], key)
     finally:
         view.deleteLater()
 
 
 def test_they_are_labelled_in_the_default_build_too(qapp, tmp_path):
+    """The default build shows four switches; three of them (Tools, Fill IDE,
+    Profile) changed nothing and looked live."""
     view = CouncilTab(actions=CouncilActions(vault_dir=tmp_path / "vault",
                                              demo_mode=True), demo_mode=True)
     try:
         for name in ("find_chart_btn", "look_up_btn", "defer_btn",
                      "expand_btn", "inst_text", "content_style_btn",
-                     "backend_box"):
+                     "backend_box", "specialist_box", "history_btn"):
             _check_labelled(getattr(view, name), name)
+        shown = [key for key in UNREAD_SWITCHES if key in view._checkboxes]
+        assert shown == ["tools", "fill_ide", "use_profile"], shown
+        for key in shown:
+            _check_labelled(view._checkboxes[key], key)
     finally:
         view.deleteLater()
 
@@ -750,14 +767,58 @@ def test_the_controls_that_work_are_left_alone(qapp, tmp_path):
     """Labelling must not spread: these all do something today."""
     view = _full(qapp, tmp_path)
     try:
-        for widget in (view.send_btn, view.save_btn, view.input,
-                       view.specialist_box):
+        for widget in (view.send_btn, view.save_btn, view.input):
             assert widget.isEnabled(), widget
-        for key in ("deliberate", "tools", "stream"):
+        for key in ("deliberate", "stream"):
             assert view._checkboxes[key].isEnabled(), key
             assert UNAVAILABLE not in view._checkboxes[key].toolTip()
     finally:
         view.deleteLater()
+
+
+def test_the_profile_box_no_longer_promises_what_it_cannot_do(qapp, tmp_path):
+    view = _full(qapp, tmp_path)
+    try:
+        tip = view._checkboxes["use_profile"].toolTip()
+        assert "Unchecking skips it" not in tip, tip
+        assert tip.startswith("Profile — not available"), tip
+        assert "COUNCIL_QUIRKS_APPLY" in tip, "it does not say what decides"
+    finally:
+        view.deleteLater()
+
+
+@pytest.mark.parametrize("value, applied", [
+    (None, True), ("1", True), ("0", False), ("off", False), (" No ", False),
+    ("false", False), ("yes", True)])
+def test_the_profile_box_shows_what_the_engine_does(qapp, tmp_path,
+                                                    monkeypatch, value,
+                                                    applied):
+    """It cannot be changed here, so it must at least be TRUE: ticked exactly
+    when the engine injects a learned profile. The rule is read without
+    importing the engine; this holds the copy to the engine's own."""
+    ce = _engine()
+    if value is None:
+        monkeypatch.delenv("COUNCIL_QUIRKS_APPLY", raising=False)
+    else:
+        monkeypatch.setenv("COUNCIL_QUIRKS_APPLY", value)
+    assert ce.user_profile_apply_enabled() is applied
+    assert council_options.profile_applied() is applied
+    view = _full(qapp, tmp_path)
+    try:
+        assert view._checkboxes["use_profile"].isChecked() is applied
+        assert view.options().use_profile is applied
+    finally:
+        view.deleteLater()
+
+
+def test_history_reached_anyway_does_not_say_nothing_was_asked(tab):
+    """There is no question store in this build. "No questions asked yet this
+    session" — said straight after a question, in review — was false."""
+    tab.append("User", "what was Q3 revenue?")
+    tab.on_history()
+    text = tab.transcript.toPlainText()
+    assert "No questions asked yet" not in text, text
+    assert "History — not available in this build yet" in text, text
 
 
 def test_reaching_one_anyway_says_not_available_not_phase_6(tab):
