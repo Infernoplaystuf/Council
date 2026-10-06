@@ -326,6 +326,34 @@ def test_shapes_the_user_drew_in_the_designer_are_kept(tmp_path,
     assert shapes["s58"].script["module"] == "gui_settings"
 
 
+def test_a_shape_that_changed_kind_gets_a_widget_named_for_its_kind(
+        tmp_path, monkeypatch):
+    """MEASURED before the fix (a Typhon built before the classifier
+    library, then updated): s26, the model name box, became a dropdown but
+    kept the entry's widget name — a QComboBox called self.ent_entry_3, its
+    handler on_ent_entry_3 — where a fresh build calls them cmb_model and
+    on_cmb_model. Another kind of shape is another widget: it is named
+    afresh, as a fresh build names it, and the log says from what to what
+    (code that used the old name must use the new one)."""
+    vault = tmp_path / "vault"
+    pdir = build_old(vault, monkeypatch)
+    old = gpj.load_manifest(pdir).widget_names["s26"]
+    assert old.startswith("ent_"), old
+    fresh = dx.build_project("typhon", "fresh_typhon", vault, toolkit="qt")
+    wanted = gpj.load_manifest(fresh.project_dir).widget_names["s26"]
+    assert wanted == "cmb_model"
+    out = dx.update_from_example("example_typhon", "typhon", vault)
+    said = "\n".join(out.lines)
+    assert out.ok, said
+    assert gpj.load_manifest(pdir).widget_names["s26"] == wanted
+    ui = (pdir / "ui" / "main_ui.py").read_text(encoding="utf-8")
+    assert f"self.{wanted} = QComboBox" in ui and f"self.{old}" not in ui
+    assert f"def on_{wanted}(" in (pdir / "handlers.py").read_text(
+        encoding="utf-8")
+    assert "new kind: Model (s26): entry → combobox" in said, said
+    assert f"{old} → {wanted}" in said, said
+
+
 def test_a_second_update_keeps_the_first_backup(tmp_path, monkeypatch):
     vault = tmp_path / "vault"
     pdir = build_old(vault, monkeypatch)
