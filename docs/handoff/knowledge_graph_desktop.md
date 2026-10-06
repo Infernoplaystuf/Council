@@ -222,3 +222,42 @@ requirements.txt lists them; system Python 3.12 has openpyxl and pypdf.
 
 **Next.** KG0/KG2 (benchmark + model extraction on the corpus's free text), KG3 (answer
 the review questions), then the agent creator as the user described it.
+
+### 8b. Later the same session (2026-10-05/06)
+
+**User decisions.** Install the document libraries (done: openpyxl 3.1.5, pypdf 6.19.0,
+python-docx 1.2.0 in the council env). Fix the sandbox before the agent creator.
+Council-made tools: a SETTING — wait for approval (default) or attach automatically.
+Models may be pulled for testing (pulled granite3.3:8b, gemma3:12b, olmo2:13b,
+gpt-oss:20b). Raspberry Pi set-up goes on THIS branch ("more Raspberry Pis would assist
+in knowledge graph generation"), including erasing a new Pi's card and installing the OS;
+OS image: download on request or a user file; admin rights: a UAC prompt per write.
+
+**Built.**
+- Sandbox (vault_analyst): 20 reproduced escapes closed — reading any path
+  (pd.read_csv('C:/x'), Path.read_text, helpers), pickle (pd.read_pickle, np.load),
+  writes (np.save, to_json(path), split_csv_by_column), pd.io / scipy.io / numpy.lib.
+  tests/test_sandbox_escapes.py (32). Still no exec time limit.
+- Agent creator: council_core/agent_profiles.py + the Agent Creator tab. Council-built
+  tools (coder drafts, connected roles review as JSON, one revision), pinned by sha256,
+  approve-or-automatic setting (automatic only when every reviewer approves and the
+  sandbox test passes). tests: test_agent_profiles.py (16), test_agent_creator_tab.py (9).
+- Pi set-up: council_core/pi_setup/ (pi_secrets, disks, images, writer, flash_helper,
+  firstboot, remote, pi_models, setup) + council_qt/tabs/pi_setup_dialog.py, opened
+  from the Apothecary tab ("Set up a Pi", "Switch to key login"). Erasable disks only
+  (this desktop's 5 TB USB Seagate is refused), typed confirm code, the elevated helper
+  re-checks the disk; image checked against the published .sha256 and the list's
+  extract_sha256, card read back; first-boot files written in the image's own format
+  (the real Trixie image ships commented-out cloud-init files — the likely reason the
+  user's Imager set-ups lost Wi-Fi/SSH) and verified; the Pi's SSH host key is made by
+  the Council and put on the card, so the Pi is found by key; password used once,
+  nodes registered with key auth and NO password; Ollama firewalled to this PC.
+  tests: test_pi_*.py (93).
+
+**Not yet verified on hardware.** No SD card was in this PC, so the real erase/write,
+the 64-hex Wi-Fi key in netplan, and cloud-init applying ssh_keys are proven only on
+files and a loopback SSH server. First real card: run Set up a Pi with the user watching.
+
+**Network finding.** The registered Pi "NodePrimus" (192.168.1.252) still answers Ollama
+to the whole LAN (only qwen2.5:3b installed) — the §7 lock-down was not done. The new
+"Switch to key login" action fixes it from the Council.

@@ -74,6 +74,19 @@ class ApothecaryActions:
     def monitor(self):
         return self.apoth.monitor
 
+    def reload_registry(self) -> None:
+        """Re-read node_registry.json — the Pi setup writes it from its own
+        registry object, so the cached copy here is stale afterwards."""
+        self.apoth.registry.data = apoth_core._ae.safe_read_json(
+            self.apoth.registry.path, {"nodes": []})
+
+    def secure_node(self, name: str, approved_fingerprint=None):
+        """council_core.pi_setup.setup.secure_existing_node — key login, no
+        stored password, firewalled Ollama."""
+        from council_core.pi_setup import setup as pi_setup
+        return pi_setup.secure_existing_node(self.vault_dir, name,
+                                             approved_fingerprint=approved_fingerprint)
+
     # -- the registry (fast; GUI thread is fine) --------------------------
     def list_nodes(self) -> List[apoth_core.NodeEntry]:
         return self.apoth.list_nodes()
@@ -214,7 +227,9 @@ class ApothecaryTab(ViewHelpers, QWidget):
             (("Test SSH", self.on_test_ssh),
              ("Check Ollama", self.on_check_ollama),
              ("Run Command", self.on_run_command)),
-            (("🔧 Setup Pi Wizard", self.on_wizard),
+            (("🍓 Set up a Pi (new or existing)…", self.on_pi_setup),
+             ("🔒 Switch to key login", self.on_secure_node),
+             ("🔧 Setup Pi Wizard", self.on_wizard),
              ("Set Static IP", self.on_static_ip),
              ("Fix Keepalive", self.on_keepalive),
              ("Restart Ollama", self.on_restart_ollama)),
@@ -486,6 +501,43 @@ class ApothecaryTab(ViewHelpers, QWidget):
         node = self._need_node("see its models")
         if node is not None:
             self._open(InventoryDialog(node, self.actions, self.emit, self))
+
+    # -- the Pi setup (council_core.pi_setup) ---------------------------
+    def on_pi_setup(self) -> None:
+        from .pi_setup_dialog import PiSetupDialog
+        dlg = PiSetupDialog(self, vault_dir=self.actions.vault_dir)
+        dlg.finished.connect(lambda _r: (self.actions.reload_registry(), self.refresh()))
+        self._open(dlg)
+
+    def on_secure_node(self, approved_fingerprint=None) -> None:
+        """Move the selected node off its stored password to the Council's
+        key, and firewall its Ollama to this PC."""
+        node = self._need_node("switch it to key login")
+        if node is None:
+            return
+        name = node.name
+
+        def work() -> None:
+            from council_core.pi_setup import remote
+            try:
+                out = self.actions.secure_node(name, approved_fingerprint)
+            except remote.HostKeyUnknown as exc:
+                self._to_ui(self._confirm_secure, name, exc.fingerprint)
+                return
+            except Exception as exc:                      # noqa: BLE001
+                self.emit(f"✗ {name}: {exc}", True)
+                return
+            self.emit(f"✓ {out.message}")
+            self._to_ui(lambda: (self.actions.reload_registry(), self.refresh()))
+
+        self._ssh("Secure node", work)
+
+    def _confirm_secure(self, name: str, fingerprint: str) -> None:
+        if self.ask_yes_no("Is this your Pi?",
+                           f"The Council has not seen {name}'s SSH key before.\n\n"
+                           f"{fingerprint}\n\nContinue only if this is your Pi.",
+                           parent=self):
+            self.on_secure_node(approved_fingerprint=fingerprint)
 
     # -- the wizard ------------------------------------------------------
     def on_wizard(self) -> None:
