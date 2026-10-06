@@ -340,31 +340,50 @@ def test_a_warm_list_does_not_pay_for_every_module_the_app_loaded(
     machine, not a regression. What it means is RELATIVE: 3,000 modules
     elsewhere may add a few microseconds each, never many times what the
     list itself costs. So the same warm list is timed with none (the
-    baseline, on this machine, in this run) and with 3,000, best of several
-    each; the old per-module Path and relative_to is put back below to show
-    the test still catches it."""
+    baseline, on this machine, in this run) and with 3,000; the old
+    per-module Path and relative_to is put back below to show the test
+    still catches it.
+
+    IN PAIRS, THE MIDDLE PAIR JUDGED. Best-of-7 alone, then best-of-7
+    loaded, timed the two in different moments: with 84 busy processes on
+    28 CPUs a quiet moment gave the baseline 100 ms and the loaded list
+    515 ms (the usual pair: 270 and 530), and the test failed 1 run in 12
+    on unchanged code (MEASURED; 3 in 12 in the review). Several pytest
+    sessions run here at once, so a busy machine is real. Each round now
+    times the two back to back, in alternating order, and the MEDIAN of
+    the rounds' ratios is judged — one lucky or unlucky moment moves one
+    round, not the verdict."""
+    import statistics
+
     elsewhere = ROOT.parent / "elsewhere"
     fake = {f"pkg{i}": SimpleNamespace(__file__=str(elsewhere / f"m{i}.py"))
             for i in range(3000)}
     gst.scripts_in_use(typhon_dir, modules=fake)          # parse once
 
-    def best(modules, runs=7):
-        took = []
-        for _ in range(runs):
-            started = time.perf_counter()
-            rows = gst.scripts_in_use(typhon_dir, modules=modules)
-            took.append(time.perf_counter() - started)
-        return min(took), rows
+    def timed(modules):
+        started = time.perf_counter()
+        rows = gst.scripts_in_use(typhon_dir, modules=modules)
+        return time.perf_counter() - started, rows
 
-    base, plain = best({})
-    warm, rows = best(fake)
-    extra = warm - base
-    print(f"\nwarm list: {base * 1000:.0f} ms alone, {warm * 1000:.0f} ms "
-          f"with 3,000 other modules loaded (+{extra * 1000:.1f} ms)")
+    pairs, plain, rows = [], None, None
+    for i in range(9):
+        if i % 2:
+            warm, rows = timed(fake)
+            base, plain = timed({})
+        else:
+            base, plain = timed({})
+            warm, rows = timed(fake)
+        pairs.append((base, warm))
+    ratio = statistics.median((warm - base) / base for base, warm in pairs)
+    base = statistics.median(b for b, _w in pairs)
+    extra = ratio * base
+    print(f"\nwarm list: {base * 1000:.0f} ms alone, +{extra * 1000:.1f} ms "
+          f"with 3,000 other modules loaded ({ratio:.2f}x, median of "
+          f"{len(pairs)} pairs)")
     assert [s.name for s in rows] == [s.name for s in plain]
-    assert extra < MOST_ADDED_BY_3000_MODULES * base, (
+    assert ratio < MOST_ADDED_BY_3000_MODULES, (
         f"3,000 other modules added {extra * 1000:.0f} ms to a "
-        f"{base * 1000:.0f} ms warm list")
+        f"{base * 1000:.0f} ms warm list ({ratio:.1f}x)")
 
 
 #: What 3,000 modules elsewhere may add to a warm list, as a multiple of the
@@ -411,6 +430,33 @@ def test_the_warm_list_test_still_catches_a_path_per_module(
     with pytest.raises(AssertionError, match="3,000 other modules added"):
         test_a_warm_list_does_not_pay_for_every_module_the_app_loaded(
             typhon_dir)
+
+
+def test_the_warm_list_test_holds_through_a_busy_moment(
+        typhon_dir, monkeypatch):
+    """The relative test above, on unchanged code, with the machine busy for
+    a MOMENT in the middle of it: seven lists in a row, from the eighth on,
+    take four times as long — what a PC shared by several pytest sessions
+    does now and then. Timed as two blocks (the baseline, then the loaded
+    list), that moment fell on the loaded block alone and the test failed
+    code that had not changed (1 run in 12, and 3 in 12 in the review, under
+    84 busy processes). Timed in pairs, it moves a few pairs, never the
+    verdict. Deterministic, unlike the real load it stands for."""
+    real = gst.scripts_in_use
+    calls = iter(range(10 ** 6))
+
+    def busy_for_a_moment(*args, **kwargs):
+        n = next(calls)                 # 0 is the "parse once" call
+        started = time.perf_counter()
+        rows = real(*args, **kwargs)
+        if 8 <= n < 15:
+            until = time.perf_counter() + 3 * (time.perf_counter() - started)
+            while time.perf_counter() < until:
+                pass
+        return rows
+
+    monkeypatch.setattr(gst, "scripts_in_use", busy_for_a_moment)
+    test_a_warm_list_does_not_pay_for_every_module_the_app_loaded(typhon_dir)
 
 
 def test_a_file_that_does_not_parse_says_why(tmp_path):
