@@ -177,3 +177,48 @@ sudo-restarts Ollama. The user was given the fix on 2026-10-05 (bind the Pi's Ol
 ufw rule, change the Pi password, clear the stored password, reach the Pi through an SSH
 tunnel `ssh -N -L 11435:127.0.0.1:11434 <user>@<pi-ip>` if needed). If it has not been
 done, remind the user — do not change the Pi or the wizard on this branch.
+
+---
+
+## 8. Progress on the desktop (2026-10-05)
+
+**What the desktop found.** `%USERPROFILE%\.council\vault` holds 7,827 files (370 MB),
+but they are logs, GUI projects, git clones (axolotl, nanoGPT, LLMs-from-scratch) and
+ideas — no real people/parts/projects documents; the only office files are the
+synthetic `mfg_eval/` and `analyst_eval/` sets. Hardware: RTX 5080 16 GB; Ollama has
+llama3.1:8b, llama3.2, phi4:14b (no gpt-oss, Granite, OLMo or Gemma yet).
+**The council conda env has no openpyxl, pypdf or python-docx** although
+requirements.txt lists them; system Python 3.12 has openpyxl and pypdf.
+
+**The user's answers (2026-10-05).**
+- "You can create synthetic documents here to build the knowledge map creation
+  process around." -> `council_core/kg_corpus.py` (below).
+- The agent creator: "it was really just selecting a model and giving connected roles
+  and tools … in the agent creator I would like to be able to say desired tools and the
+  council as a whole creates the tool and adds it to that agent."
+- Questions 2-4 of section 6 (labels, document types, how far back) are still open; the
+  synthetic corpus stands in until real documents exist.
+
+**Built (branch `knowledge-graph`).**
+- `field_search`: values are no longer broken apart ('Lee, Carol', 'PN-1234/A',
+  'Bearings & Seals Program' stay whole); `field_value_locations()` gives sheet/row/
+  column, line, and PDF page+line; `vault_rag.extract_pdf_pages()` (no 50-page cap);
+  `.docx` text without python-docx. `tests/test_field_search.py`.
+- `council_core/kg_corpus.py`: the synthetic "Ironbridge" vault (xlsx with two sheets,
+  csv, json, md, 3-page pdf, docx, Collections) and an answer key: 8 people, 7 parts,
+  4 projects, 33 distinct labelled links + 4 free-text-only links, a 'D. Whitfield' who could be
+  Dana or Dan, a drifted 'POC' label. Dependency-free writers.
+  `python -m council_core.kg_corpus <empty-folder>` makes a demo vault.
+- `council_core/knowledge_graph.py` (KG1): the store, no-model seeding, field rules
+  that stay 'proposed' until confirmed, drifted-label suggestions, a review queue,
+  decisions kept across rebuilds, JSON/CSV export in the dot-folder, a damaged or newer
+  store reported and left alone, files the install cannot read listed as unreadable.
+  Scored on the corpus: **all labelled links found, none wrong; 0 of 4 free-text links
+  (those are KG2's job); 0.06 s for 9 documents.**
+- `council_qt/tabs/connections.py`: the **Connections** tab (registered after Vault):
+  search, links grouped by meaning with their evidence, an in-app preview of the cited
+  spot, Open file, Accept/Reject, Fields…, Questions (read-only until KG3).
+- `.knowledge_graph` added to `conversation_logger.PROTECTED_SUBDIRS`.
+
+**Next.** KG0/KG2 (benchmark + model extraction on the corpus's free text), KG3 (answer
+the review questions), then the agent creator as the user described it.

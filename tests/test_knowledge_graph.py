@@ -186,7 +186,7 @@ def test_evidence_has_sheet_row_page_and_line(tmp_path):
     dana = kg.search("Dana Whitfield", "PERSON")[0]
     leads = [n for n in kg.neighbors(dana["id"]) if n["predicate"] == "LEADS"]
     where = {(e["path"].split("/")[-1], e["where"]) for n in leads for e in n["evidence"]}
-    assert ("program_tracker.xlsx", "sheet Projects, row 2") in where
+    assert ("program_tracker.xlsx", "sheet Projects, row 2 (Program Lead, Project ID)") in where
     assert ("helios_status_2026-03.md", "line 4") in where
     shim_b = kg.search("PN-1234/B", "PART")[0]
     sup = [n for n in kg.neighbors(shim_b["id"]) if n["predicate"] == "SUPERSEDES"][0]
@@ -357,3 +357,12 @@ def test_locator_text():
         == "sheet Projects, row 2 (Owner)"
     assert kgm.locator_text('{"page": 1, "line": 5}') == "page 1, line 5"
     assert kgm.locator_text({}) == "whole document"
+
+
+def test_a_spot_is_cited_once(tmp_path):
+    v, _key = _vault(tmp_path)
+    kg = _graph(v)
+    kg.seed()
+    for eid, in kg.db.execute("SELECT id FROM entities WHERE type != 'DOCUMENT'"):
+        spots = [(m["path"], m["where"]) for m in kg.mentions(eid)]
+        assert len(spots) == len(set(spots))

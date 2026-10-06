@@ -20,6 +20,7 @@ from __future__ import annotations
 from .agents import build_agents
 from .apothecary import build_apothecary
 from .capture import build_capture
+from .connections import build_connections
 from .council import build_council
 from .designer import build_designer
 from .diagnostics import build_diagnostics
@@ -45,6 +46,7 @@ REGISTRY = [
     ("⚖ Council", build_council, True),
     ("📷 Capture", build_capture, False),
     ("🗄 Vault", build_vault, False),
+    ("🕸 Connections", build_connections, False),
     ("🔍 Lens", build_lens, False),
     ("🛠 Tool Creation", build_forge, False),
     ("🎙 Speech", build_speech, False),
@@ -83,7 +85,7 @@ def registry(advanced: bool = False):
 
 __all__ = ["REGISTRY", "ADVANCED_REGISTRY", "registry", "build_agents",
            "build_apothecary",
-           "build_capture",
+           "build_capture", "build_connections",
            "build_changelog", "build_council", "build_librarian", "build_ide", "build_nodes", "build_vault_health",
            "build_designer", "build_diagnostics", "build_docs", "build_dream3d", "build_forge", "build_grapher",
            "build_jobs",

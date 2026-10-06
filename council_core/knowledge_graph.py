@@ -273,7 +273,7 @@ def _file_hash(p: Path) -> str:
 
 
 def _loc_json(loc: Dict[str, Any]) -> str:
-    keep = {k: loc[k] for k in ("sheet", "row", "column", "page", "line")
+    keep = {k: loc[k] for k in ("sheet", "row", "column", "columns", "page", "line")
             if loc.get(k) is not None}
     return json.dumps(keep, sort_keys=True, ensure_ascii=False)
 
@@ -297,8 +297,9 @@ def locator_text(loc: Any) -> str:
     if loc.get("line"):
         bits.append(f"line {loc['line']}")
     s = ", ".join(bits) or "whole document"
-    if loc.get("column"):
-        s += f" ({loc['column']})"
+    cols = loc.get("columns") or ([loc["column"]] if loc.get("column") else [])
+    if cols:
+        s += f" ({', '.join(cols)})"
     return s
 
 
@@ -896,6 +897,12 @@ class KnowledgeGraph:
             " locator, snippet, run_id) VALUES (?,?,?,?,?,?,?)",
             (kind, surface, json.dumps(cands), did, _loc_json(loc), snippet, run_id))
 
+    def _has_mention(self, eid, did, loc) -> bool:
+        """Already cited at this spot (a labelled field found it first)."""
+        return self.db.execute(
+            "SELECT 1 FROM mentions WHERE entity_id=? AND document_id=? AND locator=?",
+            (eid, did, _loc_json(loc))).fetchone() is not None
+
     def _mention(self, eid, did, loc, surface, snippet, method, run_id) -> None:
         self.db.execute(
             "INSERT OR IGNORE INTO mentions (entity_id, document_id, locator, surface,"
@@ -923,7 +930,10 @@ class KnowledgeGraph:
             # points at the line that says it.
             loc = at.locator
             if rec.kind == "row":
+                # The row, and the two cells the link rests on.
                 loc = {k: v_s.locator.get(k) for k in ("sheet", "row")}
+                loc["columns"] = list(dict.fromkeys(
+                    [v_s.locator.get("column"), v_o.locator.get("column")]))
             quote = v_s.snippet if v_s.snippet == v_o.snippet else \
                 f"{v_s.snippet} | {v_o.snippet}"
             st = "suggested" if (s in inferred_ids or o in inferred_ids) else status
@@ -1027,16 +1037,17 @@ class KnowledgeGraph:
                 if page is not None:
                     loc["page"] = page
                 for rx, eid, alias in terms:
-                    if rx.search(text):
+                    if rx.search(text) and not self._has_mention(eid, did, loc):
                         self._mention(eid, did, loc, alias, _snip(text), "gazetteer", run_id)
                         n += 1
                 for m in _INITIAL_NAME_RE.finditer(text):
                     key = f"{m.group(1).lower()} {fold(m.group(2))}"
                     cands = sorted(initials.get(key, []))
                     if len(cands) == 1:
-                        self._mention(cands[0], did, loc, m.group(0), _snip(text),
-                                      "gazetteer", run_id)
-                        n += 1
+                        if not self._has_mention(cands[0], did, loc):
+                            self._mention(cands[0], did, loc, m.group(0), _snip(text),
+                                          "gazetteer", run_id)
+                            n += 1
                     elif len(cands) > 1:
                         self._review("ambiguous_name", m.group(0), cands, did, loc,
                                      _snip(text), run_id)
@@ -1139,6 +1150,7 @@ class KnowledgeGraph:
             out.append({"id": r["id"], "kind": r["kind"], "surface": r["surface"],
                         "candidates": [self.entity(c) for c in json.loads(r["candidates"])],
                         "path": r["path"], "where": locator_text(r["locator"]),
+                        "locator": json.loads(r["locator"] or "{}"),
                         "snippet": r["snippet"]})
         return out
 
@@ -1211,6 +1223,61 @@ class KnowledgeGraph:
             tmp.write_text(text, encoding="utf-8", newline="")
             tmp.replace(target)
         return pj, pc
+
+
+def source_context(root: Any, rel_path: str, locator: Any, *, radius: int = 3
+                   ) -> List[Tuple[str, str, bool]]:
+    """The part of a document a citation points at, for an in-app preview:
+    ``[(gutter label, text, is_the_cited_line)]``.
+
+    Text: ``radius`` lines either side of the cited line ('p2 L5'). Table:
+    the header and the cited row, one 'column: value' line per cell. No
+    locator (a Collection): the first lines. Read-only; ``[]`` when the file
+    cannot be read. A person can see the evidence without leaving the app,
+    which matters for a PDF or workbook whose viewer cannot jump to a line."""
+    import field_search as fs
+    if isinstance(locator, str):
+        try:
+            locator = json.loads(locator)
+        except Exception:
+            locator = {}
+    locator = locator or {}
+    p = Path(root) / rel_path
+    try:
+        if p.suffix.lower() in _TABULAR and locator.get("row"):
+            for sheet, frame in fs._table_frames(p):
+                if locator.get("sheet") not in (None, sheet):
+                    continue
+                i = int(locator["row"]) - 2
+                if not 0 <= i < len(frame):
+                    return []
+                row = frame.iloc[i]
+                marked = set(locator.get("columns") or [locator.get("column")])
+                out = [("", f"{'sheet ' + str(sheet) + ', ' if sheet else ''}"
+                            f"row {locator['row']}", False)]
+                for col in frame.columns:
+                    val = row[col]
+                    if val is None or (isinstance(val, float) and val != val):
+                        val = ""
+                    out.append((str(col), str(val), str(col) in marked))
+                return out
+            return []
+        if p.suffix.lower() == ".pdf":
+            pages = fs._pdf_pages(p)
+            pg = int(locator.get("page") or 1)
+            lines = pages[pg - 1].splitlines() if 0 < pg <= len(pages) else []
+            prefix = f"p{pg} "
+        else:
+            lines = fs._read_text(p, max_chars=5_000_000).splitlines()
+            prefix = ""
+    except Exception:
+        return []
+    target = int(locator.get("line") or 0)
+    if target:
+        lo, hi = max(1, target - radius), min(len(lines), target + radius)
+    else:
+        lo, hi = 1, min(len(lines), 2 * radius + 1)
+    return [(f"{prefix}L{i}", lines[i - 1], i == target) for i in range(lo, hi + 1)]
 
 
 _INITIAL_NAME_RE = re.compile(r"\b([A-Z])\.\s+([A-Z][A-Za-zÀ-ÿ'’\-]+)")
