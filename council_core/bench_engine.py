@@ -392,11 +392,15 @@ def _host() -> str:
 
 def _http(path: str, body: Optional[dict] = None, timeout: float = 30.0
           ) -> Any:
+    """One call to this PC's Ollama — never through a proxy (see
+    local_models.open_direct: with HTTP_PROXY set, /api/ps and the unload
+    request went to the proxy instead)."""
+    from . import local_models
     data = None if body is None else json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
         _host() + path, data=data, method="GET" if body is None else "POST",
         headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with local_models.open_direct(req, timeout) as resp:
         raw = resp.read().decode("utf-8", errors="replace")
     return json.loads(raw) if raw.strip() else {}
 

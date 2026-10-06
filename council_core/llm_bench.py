@@ -269,6 +269,8 @@ class OllamaBackend(Backend):
 
     def _chat(self, messages, *, temperature, num_predict, role):
         import urllib.request
+
+        from . import local_models
         payload = {"model": self.model, "messages": messages, "stream": False,
                    "options": {"temperature": float(temperature),
                                "num_predict": int(num_predict),
@@ -277,7 +279,9 @@ class OllamaBackend(Backend):
         req = urllib.request.Request(
             self.host + "/api/chat", data=json.dumps(payload).encode(),
             headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+        # Never through a proxy: the host passed _ensure_localhost, but with
+        # HTTP_PROXY set urlopen handed the whole chat to the proxy.
+        with local_models.open_direct(req, self.timeout) as resp:
             data = json.loads(resp.read().decode("utf-8", errors="replace"))
         text = (data.get("message") or {}).get("content", "") or ""
         return (text, data.get("prompt_eval_count", 0),

@@ -10,7 +10,8 @@ the trail.
 Public surface:
 
     EgressBlocked                  exception raised on any non-loopback target
-    is_loopback_host(host)         True iff host resolves to 127/8 or ::1
+    is_loopback_host(host)         True iff host is "localhost" or a
+                                   loopback IP literal (127/8, ::1)
     is_loopback_url(url)           True iff url's host is loopback
     assert_loopback(target)        raises EgressBlocked if not loopback
     install_socket_guard()         opt-in process-wide socket.connect guard
@@ -18,13 +19,18 @@ Public surface:
 
 Design choices forced by §0 of the Odysseus brief:
 
-  * No DNS resolution shortcuts — we accept a hostname only if EVERY
-    address it resolves to is in the loopback set. A name that maps to
-    both 127.0.0.1 AND a public IP is rejected (split-horizon attacks).
-
-  * Hostnames are normalised through ``socket.getaddrinfo`` and then each
-    returned address is checked with ``ipaddress.ip_address.is_loopback``,
-    not by string match — covers IPv6, decimal-128.0.0.1 tricks, etc.
+  * No DNS at all. This PC is "localhost" or a loopback IP LITERAL,
+    checked with ``ipaddress.ip_address.is_loopback`` (IPv6 too); any
+    other name is refused without being looked up — the rule
+    council_core.local_models.is_loopback_url and mcp_client already
+    follow. Resolving a name and accepting it when every answer was
+    loopback (the old rule) had two holes, both measured 2026-10-05:
+    the answer the check saw was not the one urllib connected with — it
+    resolves the name again, so a DNS answer that changed in between
+    (rebinding) took the prompt elsewhere; and "ip6-localhost" /
+    "ip6-loopback" were trusted WITHOUT a lookup, though they are Linux
+    /etc/hosts entries Windows does not know — this PC's LAN DNS
+    answered both with the router, 192.168.1.1.
 
   * No URL-fetch convenience wrappers in this module. Callers explicitly
     ask "is this OK?" then call requests / urllib themselves. That keeps
@@ -55,40 +61,22 @@ class EgressBlocked(Exception):
         self.reason = reason
 
 
-# ── Allow-listed literals (always loopback) ────────────────────────
-_LOOPBACK_HOST_LITERALS = frozenset({
-    "localhost",
-    "ip6-localhost",
-    "ip6-loopback",
-})
-
-
-def _resolve(host: str) -> List[ipaddress._BaseAddress]:
-    """Return every IP address `host` resolves to. May raise socket.gaierror.
-    We deliberately do not cache — a freshly-edited /etc/hosts must take
-    effect immediately for the audit trail to mean anything."""
-    out: List[ipaddress._BaseAddress] = []
-    try:
-        infos = socket.getaddrinfo(host, None,
-                                   proto=socket.IPPROTO_TCP)
-    except socket.gaierror as exc:
-        raise socket.gaierror(f"could not resolve {host!r}: {exc}") from exc
-    for fam, _kind, _proto, _canon, sa in infos:
-        ip_str = sa[0]
-        try:
-            out.append(ipaddress.ip_address(ip_str))
-        except ValueError:
-            continue
-    return out
+# ── The one name that is always this PC ────────────────────────────
+# "localhost" only. "ip6-localhost" and "ip6-loopback" used to be here too;
+# they are /etc/hosts conventions on Linux, and on Windows the name goes to
+# the network's DNS (this PC's answered with its router).
+_LOOPBACK_HOST_LITERALS = frozenset({"localhost"})
 
 
 def is_loopback_host(host: str) -> bool:
-    """Return True iff `host` is loopback (every resolved address is).
+    """Return True iff `host` is this PC: "localhost" or a loopback IP
+    literal (127/8, ::1, with or without brackets).
 
-    A bare IP literal is checked directly; a hostname has to resolve and
-    every returned address must be loopback. This is intentionally
-    stricter than "any answer is loopback" — split-horizon DNS that
-    returns both 127.0.0.1 and a public IP must not pass.
+    Any other NAME is refused WITHOUT a lookup, even one that resolves to
+    127.0.0.1 now: the caller's own connection resolves it again, and that
+    second answer is the one that counts (DNS rebinding). Split-horizon
+    names, hosts-file aliases and "decimal" spellings like 2130706433 are
+    refused for the same reason — a URL that means this PC can say so.
     """
     if not host:
         return False
@@ -98,17 +86,10 @@ def is_loopback_host(host: str) -> bool:
         h = h[1:-1]
     if h in _LOOPBACK_HOST_LITERALS:
         return True
-    # Try parsing as a literal address first — avoids a needless
-    # getaddrinfo round-trip and dodges DNS poisoning.
     try:
         return ipaddress.ip_address(h).is_loopback
     except ValueError:
-        pass
-    try:
-        ips = _resolve(h)
-    except socket.gaierror:
         return False
-    return bool(ips) and all(ip.is_loopback for ip in ips)
 
 
 def is_loopback_url(url: str) -> bool:
@@ -170,7 +151,7 @@ def _guarded_connect(self, address):
         try:
             ip = ipaddress.ip_address(host)
         except ValueError:
-            # Hostname — let getaddrinfo + assert_loopback handle it
+            # A name: only "localhost" passes, and nothing is looked up
             if not is_loopback_host(host):
                 raise EgressBlocked(host, "socket.connect blocked by guard")
         else:

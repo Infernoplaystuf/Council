@@ -33,6 +33,7 @@ and cached by digest.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import os
@@ -86,7 +87,25 @@ _LOOPBACK = re.compile(
 
 
 def is_loopback_url(url: str) -> bool:
-    return bool(_LOOPBACK.match((url or "").strip()))
+    """Is ``url``'s host this PC? The host is matched WHOLE — up to the port
+    or the first "/" — so "localhost.evil.example", "127.0.0.1.evil.example"
+    and "localhost@evil.example" (userinfo; the host is evil.example) are
+    other machines. No DNS: a name that merely resolves to 127.0.0.1 is not
+    trusted, since it can resolve elsewhere by the time the call connects.
+
+    A dotted quad must also BE an address: "127.999.0.1" fits the pattern
+    but no IP parser accepts it, so the OS would look it up as a host NAME
+    — which a hosts file or a LAN's DNS can point anywhere."""
+    m = _LOOPBACK.match((url or "").strip())
+    if m is None:
+        return False
+    host = m.group(1)
+    if host[0].isdigit():
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:
+            return False
+    return True
 
 
 def require_local(url: str, *, allow_remote: bool = False) -> None:
@@ -95,6 +114,36 @@ def require_local(url: str, *, allow_remote: bool = False) -> None:
         raise RuntimeError(
             f"Refusing non-local model endpoint: {url}\n"
             "Only a localhost Ollama is used unless remote nodes are enabled.")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 3xx is an error, not a hop. Ollama never redirects, and whatever
+    else answers on a loopback port could point the call at another
+    machine — urllib would re-send the request there."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None          # -> the default handler raises HTTPError
+
+
+#: The opener for every call to a model server: NO proxy, NO redirects.
+#: urllib.request.urlopen asks for a proxy on every call — HTTP_PROXY, or on
+#: Windows the system proxy, whose "bypass for local addresses" exempts
+#: "localhost" but not "127.0.0.1" — and then opens the connection to the
+#: PROXY and hands it the request. So a URL the loopback guard approved still
+#: left the PC: measured 2026-10-05 with a recording proxy, it got the whole
+#: /api/chat body from llm_bench and /api/version, /api/tags and /api/show
+#: from here (and, unable to reach its own 127.0.0.1, answered 502, so the
+#: app said "No Ollama server answers" with Ollama up). The chat stream in
+#: council_engine is http.client, which never used a proxy.
+_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                      _NoRedirect())
+
+
+def open_direct(req: Any, timeout: float):
+    """urllib.request.urlopen(req, timeout=timeout) without proxies or
+    redirects — for this PC's Ollama and for nodes the user listed, which
+    the chat itself (http.client) also reaches directly."""
+    return _DIRECT.open(req, timeout=timeout)
 
 
 # ============================================================
@@ -119,7 +168,7 @@ def _get_json(url: str, timeout: float, body: Optional[dict] = None) -> Any:
     req = urllib.request.Request(
         url, data=data, method="GET" if body is None else "POST",
         headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with open_direct(req, timeout) as resp:
         return json.loads(resp.read().decode("utf-8", errors="replace"))
 
 

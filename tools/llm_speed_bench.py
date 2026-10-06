@@ -58,9 +58,11 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import ipaddress
 import json
 import os
 import random
+import re
 import statistics
 import subprocess
 import sys
@@ -375,19 +377,64 @@ def run_llama(cfg: Dict[str, Any]) -> Dict[str, Any]:
 # Ollama — one run against the server
 # ============================================================
 
+_LOOPBACK = re.compile(
+    r"^https?://(localhost|127\.\d{1,3}\.\d{1,3}\.\d{1,3}|\[::1\])(:\d+)?(/|$)",
+    re.IGNORECASE)
+
+
+def _is_loopback_url(url: str) -> bool:
+    """council_core.local_models.is_loopback_url, copied: this tool runs as
+    a script from tools/, where council_core is not importable. The host is
+    matched WHOLE — the startswith test this replaces passed
+    http://localhost.evil.example and http://localhost@evil.example (a user
+    name; the host is evil.example), and _post sends whole prompts."""
+    m = _LOOPBACK.match((url or "").strip())
+    if m is None:
+        return False
+    host = m.group(1)
+    if host[0].isdigit():
+        try:
+            return ipaddress.ip_address(host).is_loopback
+        except ValueError:          # "127.999.0.1" would be looked up by NAME
+            return False
+    return True
+
+
+def _require_local(host: str) -> None:
+    """Every request goes through here first — _get as well as _post.
+    run_ollama's FIRST request is a _get (/api/ps, to unload), and with the
+    check only in _post a disguised host was looked up and contacted before
+    anything refused it."""
+    if not _is_loopback_url(host):
+        raise SystemExit(f"refusing non-local Ollama host {host}")
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None          # a 3xx is an error (HTTPError), not a hop
+
+
+#: council_core.local_models._DIRECT, copied (council_core is not importable
+#: from tools/): no proxy, no redirect. urlopen asks for a proxy on every
+#: call (HTTP_PROXY, the Windows system proxy), and the proxy was handed the
+#: whole 2k/6k-token prompt although the host had passed the check.
+_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                      _NoRedirect())
+
+
 def _post(path: str, payload: Dict[str, Any], host: str = OLLAMA_HOST,
           timeout: int = 900) -> Dict[str, Any]:
-    if not host.startswith(("http://127.0.0.1", "http://localhost")):
-        raise SystemExit(f"refusing non-local Ollama host {host}")
+    _require_local(host)
     req = urllib.request.Request(
         host.rstrip("/") + path, data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _DIRECT.open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8", errors="replace"))
 
 
 def _get(path: str, host: str = OLLAMA_HOST) -> Dict[str, Any]:
-    with urllib.request.urlopen(host.rstrip("/") + path, timeout=30) as resp:
+    _require_local(host)
+    with _DIRECT.open(host.rstrip("/") + path, timeout=30) as resp:
         return json.loads(resp.read().decode())
 
 
@@ -431,6 +478,7 @@ def _tokenizer(gguf: str):
 def run_ollama(cfg: Dict[str, Any]) -> Dict[str, Any]:
     rec: Dict[str, Any] = dict(cfg)
     host = cfg.get("host", OLLAMA_HOST)
+    _require_local(host)             # before the tokenizer load, not after
     model = cfg["model"]
     num_ctx = int(cfg.get("n_ctx", N_CTX))
     seed = int(cfg.get("seed", 1))
