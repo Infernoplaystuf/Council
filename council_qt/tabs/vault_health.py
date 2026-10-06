@@ -120,9 +120,17 @@ class VaultHealthTab(ViewHelpers, QWidget):
         self.status.setText("Reading…")
 
         def work() -> None:
+            # The except is the point. This was try/finally alone: a failed
+            # read released the busy flag but left "Reading…" on the status
+            # line for good, and the error went to the thread's unhandled-
+            # exception hook — a console the user does not have. The tab
+            # looked hung.
             try:
                 report = self.actions.gather()
                 self._to_ui(lambda: self._show(report))
+            except Exception as exc:                      # noqa: BLE001
+                said = f"Could not read the vault: {exc}"
+                self._to_ui(lambda said=said: self._failed(said))
             finally:
                 self._to_ui(self._done)
 
@@ -131,6 +139,15 @@ class VaultHealthTab(ViewHelpers, QWidget):
 
     def _done(self) -> None:
         self._busy = False
+
+    def _failed(self, message: str) -> None:
+        """Say the read failed, where the user is looking.
+
+        The trees and the summary keep the last good report rather than being
+        cleared: a vault that was readable a minute ago has not emptied, and
+        blanking it would read as though it had."""
+        self.status.setText(message)
+        self.status.setToolTip(message)
 
     def _show(self, report: vault_health.Report) -> None:
         self._report = report
@@ -142,6 +159,7 @@ class VaultHealthTab(ViewHelpers, QWidget):
             f"{len(report.memory)} memory file(s), "
             f"{len(report.vault)} vault entr(y/ies)"
             + (f" — {unreadable} unreadable" if unreadable else ""))
+        self.status.setToolTip("")          # an earlier failure's, if any
 
     def _fill(self, tree: QTreeWidget, entries) -> None:
         tree.clear()

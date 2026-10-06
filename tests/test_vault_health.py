@@ -437,6 +437,44 @@ def test_a_failing_gather_releases_the_busy_flag(qapp, vault, memory):
     view.deleteLater()
 
 
+def test_a_failing_gather_is_reported_in_the_tab(qapp, vault, memory):
+    """The busy flag came back, but the status line still said "Reading…" —
+    the worker was try/finally with no except, so the error went to the
+    thread's unhandled-exception hook (a console the user does not have) and
+    the tab looked hung. It must say that the read failed, and why."""
+    import threading
+
+    actions = VaultHealthActions(vault, memory)
+
+    def _boom():
+        raise OSError("disk gone")
+
+    actions.gather = _boom
+    escaped = []
+    previous = threading.excepthook
+    threading.excepthook = lambda args: escaped.append(args.exc_value)
+    try:
+        view = VaultHealthTab(actions=actions, auto_refresh=True)
+        deadline = time.time() + 5
+        while (view._busy or view.status.text() == "Reading…") \
+                and time.time() < deadline:
+            qapp.processEvents()
+            time.sleep(0.005)
+    finally:
+        threading.excepthook = previous
+    said = view.status.text()
+    assert said != "Reading…", "the tab still reads as busy after a failure"
+    assert "disk gone" in said, said
+    assert "could not" in said.lower(), said
+    assert escaped == [], f"the failure escaped the worker: {escaped}"
+    # And the tab is still usable: a later refresh that works replaces it.
+    actions.gather = lambda: vh.Report()
+    view.refresh()
+    drive(qapp, view)
+    assert "disk gone" not in view.status.text()
+    view.deleteLater()
+
+
 def test_unreadable_entries_are_counted_on_the_status_line(qapp, vault,
                                                            memory,
                                                            monkeypatch):
