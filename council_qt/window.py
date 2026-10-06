@@ -15,6 +15,7 @@ the user has looked — registers with eager=True.
 """
 from __future__ import annotations
 
+import collections
 from typing import Callable, Dict, List, Optional
 
 from PySide6.QtCore import Qt
@@ -41,6 +42,11 @@ class CouncilWindow(QMainWindow):
         self._built: Dict[str, QWidget] = {}
         self._order: List[str] = []
         self._swapping = False
+        #: Reports from other tabs that arrived before any page could show
+        #: them (see append_transcript). Bounded: a tab reporting in a loop
+        #: with no transcript to land in must not grow without limit.
+        self._held_notices: "collections.deque" = collections.deque(
+            maxlen=100)
 
         self.tabs = QTabWidget(self)
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -72,6 +78,11 @@ class CouncilWindow(QMainWindow):
     def _build(self, title: str) -> QWidget:
         page = self._factories[title]()
         self._built[title] = page
+        if self._held_notices and hasattr(page, "receive_notice"):
+            held, self._held_notices = (list(self._held_notices),
+                                        collections.deque(maxlen=100))
+            for who, text, kind, source in held:
+                self._deliver_notice(page, who, text, kind, source)
         return page
 
     def _on_tab_changed(self, index: int) -> None:
@@ -128,6 +139,52 @@ class CouncilWindow(QMainWindow):
     def set_status(self, text: str) -> None:
         """The Tk shell's _set_status, unchanged in meaning."""
         self._status.setText("" if text is None else str(text))
+
+    # -- reports from other tabs ----------------------------------------
+    def append_transcript(self, who: str, text: str, kind: str = "final",
+                          *, source: str = "") -> None:
+        """A report from another tab, written into the Council transcript.
+
+        THIS WAS MISSING, AND NOTHING SAID SO. The IDE, Librarian and Nodes
+        tabs end an operation with `getattr(window, "append_transcript",
+        None)` and return quietly when it is absent — so the snapshot path,
+        the commit receipt with its SHA and the node-rebuild result were all
+        dropped. The Tk shell writes each of them into the transcript.
+
+        Safe from any thread: off the GUI thread it hops through the bridge,
+        the one road from a worker to a widget. The page that shows it is
+        whichever built page has `receive_notice` (the Council tab), found
+        rather than named, so a build without one is not an error. Until one
+        is built the notice is HELD and handed over when it is — and shown in
+        the status bar meanwhile, so it is never silent.
+
+        ``source`` names the tab it came from, for the label.
+        """
+        if not self.bridge.on_ui_thread():
+            self.bridge.call_on_ui(self.append_transcript, who, text, kind,
+                                   source=source)
+            return
+        page = self._notice_page()
+        if page is None:
+            self._held_notices.append((who, text, kind, source))
+            self.set_status(f"{source or who}: {text}")
+            return
+        self._deliver_notice(page, who, text, kind, source)
+
+    def _notice_page(self) -> Optional[QWidget]:
+        for title in self._order:
+            page = self._built.get(title)
+            if page is not None and hasattr(page, "receive_notice"):
+                return page
+        return None
+
+    @staticmethod
+    def _deliver_notice(page, who, text, kind, source) -> None:
+        try:
+            page.receive_notice(who, text, kind, source=source)
+        except Exception as exc:                        # noqa: BLE001
+            # A report about another tab must never take this one down.
+            print(f"[window] a notice could not be shown: {exc!r}")
 
     # -- closing -------------------------------------------------------
     def closeEvent(self, event) -> None:

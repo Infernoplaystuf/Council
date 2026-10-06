@@ -268,7 +268,8 @@ class IdeTab(ViewHelpers, QWidget):
         try:
             append("Librarian",
                    f"snapshot: {result.path}" if not result.error
-                   else f"snapshot failed: {result.error}", "final")
+                   else f"snapshot failed: {result.error}", "final",
+                   source="IDE / Runner")
         except Exception:                                 # noqa: BLE001
             pass
 

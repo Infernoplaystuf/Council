@@ -725,6 +725,23 @@ class CouncilTab(ViewHelpers, QWidget):
             self._last_answer = text
             self.save_frame.show()
 
+    def receive_notice(self, who: str, text: str, kind: str = "final", *,
+                       source: str = "") -> None:
+        """A report from another tab — the IDE's snapshot path, the
+        Librarian's commit receipt, a node rebuild — via
+        CouncilWindow.append_transcript. On the GUI thread; the window
+        guarantees that.
+
+        LABELLED, AND NEVER AN ANSWER. It is the app reporting on something
+        that happened elsewhere, so it says where it came from, and it is
+        written as an observation whatever kind the caller passed: the callers
+        say "final", and a "final" from "Writer" would become the last answer
+        that Save answer writes out.
+        """
+        label = f"Notice from the {source} tab" if source else "Notice"
+        self.append(who or "Council", f"[{label}] {text}",
+                    "error" if kind == "error" else "observation")
+
     def set_status(self, text: str, colour: Optional[str] = None) -> None:
         self.status.setText(text)
         if colour:

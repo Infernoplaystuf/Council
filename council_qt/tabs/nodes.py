@@ -231,7 +231,7 @@ class NodesTab(ViewHelpers, QWidget):
         if append is None:
             return
         try:
-            append("Librarian", message, "final")
+            append("Librarian", message, "final", source="Nodes")
         except Exception:                                 # noqa: BLE001
             pass
 

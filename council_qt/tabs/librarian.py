@@ -201,7 +201,8 @@ class LibrarianTab(ViewHelpers, QWidget):
         try:
             append("Librarian",
                    f"{'OK' if result.ok else 'FAIL'}: "
-                   f"{librarian.describe(result)}", "final")
+                   f"{librarian.describe(result)}", "final",
+                   source="Librarian")
         except Exception:                                 # noqa: BLE001
             pass
 
