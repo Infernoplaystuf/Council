@@ -97,6 +97,77 @@ class TestSplitHorizonHostname(unittest.TestCase):
                 security.assert_loopback("sneaky.example")
 
 
+class TestNamesAreNotLookedUp(unittest.TestCase):
+    """Only "localhost" and loopback IP literals are this PC. Any other NAME
+    is refused without a lookup (found 2026-10-05, measured):
+
+      * "ip6-localhost" / "ip6-loopback" were trusted as literals, but they
+        are Linux /etc/hosts entries, not names Windows knows. On this PC the
+        LAN's DNS answered both with the router, 192.168.1.1 — where
+        OllamaRunner then sent the prompt.
+      * A name that resolved to 127.0.0.1 during the check was resolved
+        AGAIN by urllib when it connected; a DNS answer that changed in
+        between (rebinding) took the prompt elsewhere.
+
+    getaddrinfo is replaced in every test here so a failure cannot send a
+    real DNS query."""
+
+    def _no_lookup(self):
+        return mock.patch.object(
+            socket, "getaddrinfo",
+            side_effect=AssertionError("a name was looked up"))
+
+    def test_ip6_names_are_not_this_pc(self):
+        with self._no_lookup() as gai:
+            for name in ("ip6-localhost", "ip6-loopback", "IP6-LOCALHOST"):
+                self.assertFalse(security.is_loopback_host(name), name)
+                self.assertFalse(security.is_loopback_url(
+                    f"http://{name}:11434/api/chat"), name)
+                with self.assertRaises(security.EgressBlocked):
+                    security.assert_loopback(f"http://{name}:11434")
+            gai.assert_not_called()
+
+    def test_a_name_that_resolves_to_loopback_is_still_refused(self):
+        """No check-then-connect window: the answer the check would have
+        seen is not the one the connection is made with."""
+        loop = [(socket.AF_INET, 1, 6, "", ("127.0.0.1", 0))]
+        with mock.patch.object(socket, "getaddrinfo",
+                               return_value=loop) as gai:
+            for name in ("rebind.test", "my-ollama.local", "localhost.",
+                         "sub.localhost", "localhost.evil.example"):
+                self.assertFalse(security.is_loopback_host(name), name)
+            gai.assert_not_called()
+
+    def test_this_pc_still_passes_without_a_lookup(self):
+        with self._no_lookup() as gai:
+            for host in ("localhost", "LocalHost", "127.0.0.1", "127.3.4.5",
+                         "::1", "[::1]"):
+                self.assertTrue(security.is_loopback_host(host), host)
+            gai.assert_not_called()
+
+    def test_the_runner_refuses_an_ip6_name(self):
+        from inferno_local import model_runner
+        with self._no_lookup():
+            with self.assertRaises(security.EgressBlocked):
+                model_runner.OllamaRunner(url="http://ip6-localhost:11434",
+                                          model="llama3.1:8b")
+            with self.assertRaises(security.EgressBlocked):
+                model_runner.build_runner({"backend": "ollama",
+                                           "url": "http://rebind.test:11434",
+                                           "model": "llama3.1:8b"})
+
+    def test_the_socket_guard_refuses_a_name(self):
+        security.install_socket_guard()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            with self._no_lookup():
+                with self.assertRaises(security.EgressBlocked):
+                    s.connect(("ip6-localhost", 1))
+        finally:
+            s.close()
+            security.uninstall_socket_guard()
+
+
 class TestSocketGuard(unittest.TestCase):
 
     def tearDown(self):

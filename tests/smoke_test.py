@@ -1842,12 +1842,14 @@ def test_remote_dispatch_gating() -> None:
     _check("LAN IP IS a remote host", ce._is_remote_host("http://192.168.1.50:11434"))
 
     # Build a dispatched spec pointing at a fake remote node; mock both
-    # the local GGUF and the Ollama call so nothing real is invoked.
+    # the local GGUF and the Ollama call so nothing real is invoked. The
+    # model is an "ollama:" one: only those are ever sent to a node (a GGUF
+    # label names nothing a node can run — tests/test_node_dispatch.py).
     class _FakeDispatcher:
         def best_host_for(self, model):
             return "http://192.168.1.50:11434"
     spec = ce._DispatchedBackendSpec(
-        key="k", host="http://localhost:11434", model="granite",
+        key="k", host="http://localhost:11434", model="ollama:granite",
         tags={}, default_temperature=0.2, default_max_tokens=64,
         allow_remote=True)
     spec._dispatcher = _FakeDispatcher()
@@ -2064,9 +2066,11 @@ def test_dispatcher_no_probe_when_remote_disabled() -> None:
             return "http://localhost:11434"
 
     try:
+        # An "ollama:" model: a GGUF label is never probed for at all.
         spec = ce._DispatchedBackendSpec(
-            key="writer", host=ce.DEFAULT_OLLAMA_HOST, model="m", tags={},
-            default_temperature=0.3, default_max_tokens=32, allow_remote=True)
+            key="writer", host=ce.DEFAULT_OLLAMA_HOST, model="ollama:m",
+            tags={}, default_temperature=0.3, default_max_tokens=32,
+            allow_remote=True)
         spec._dispatcher = _FakeDisp()
 
         out = spec.generate(developer_instructions="s", user_text="hi",

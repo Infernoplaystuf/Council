@@ -52,6 +52,22 @@ from . import security
 _LOG = logging.getLogger("inferno_local.model_runner")
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """A 3xx is an error, not a hop: assert_loopback checked THIS url, and
+    a redirect would re-send the request wherever the server pointed."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+#: Every Ollama request goes through this: no proxy, no redirect. The URL
+#: passing assert_loopback did not stop urlopen from handing the request —
+#: the whole chat — to HTTP_PROXY or the Windows system proxy (measured
+#: 2026-10-05 with a recording proxy), which then connects from ITS machine.
+_LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                               _NoRedirect())
+
+
 _CLOUD_KEYWORDS = frozenset({
     "openai", "anthropic", "gemini", "google_genai", "google_ai_studio",
     "openrouter", "copilot", "azure_openai", "azureopenai",
@@ -201,7 +217,7 @@ class OllamaRunner:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=self.timeout_s) as r:
+        with _LOOPBACK_OPENER.open(req, timeout=self.timeout_s) as r:
             body = r.read().decode("utf-8", errors="replace")
         return body
 
@@ -245,7 +261,7 @@ class OllamaRunner:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+        with _LOOPBACK_OPENER.open(req, timeout=self.timeout_s) as resp:
             for raw in resp:
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line:
