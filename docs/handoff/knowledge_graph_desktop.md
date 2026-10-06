@@ -176,7 +176,9 @@ sudo-restarts Ollama. The user was given the fix on 2026-10-05 (bind the Pi's Ol
 127.0.0.1 via `/etc/systemd/system/ollama.service.d/override.conf`, remove the iptables /
 ufw rule, change the Pi password, clear the stored password, reach the Pi through an SSH
 tunnel `ssh -N -L 11435:127.0.0.1:11434 <user>@<pi-ip>` if needed). If it has not been
-done, remind the user — do not change the Pi or the wizard on this branch.
+done, remind the user. (Superseded on 2026-10-05/06: the user then decided that
+Raspberry Pi set-up goes on this branch — see §8b. The new `council_core/pi_setup/`
+wizard and "Switch to key login" are that decision, not a breach of this section.)
 
 ---
 

@@ -1,13 +1,5 @@
 # The Council — notes for Claude Code
 
-## This branch: `knowledge-graph`
-
-Work here is the **knowledge graph** (people, parts and projects across the vault
-documents), done on the user's desktop with its larger vault. **Before writing code,
-read `docs/handoff/knowledge_graph_desktop.md`** (decisions, plan, first steps,
-questions to ask) and `docs/morphik_assessment.md` (the researched plan with file:line).
-Push only this branch; the laptop merges it into `qt-migration` after review.
-
 ## Standing rules (all branches)
 
 - Offline by design: localhost only, no telemetry, no cloud LLM calls; nothing leaves
@@ -22,3 +14,9 @@ Push only this branch; the laptop merges it into `qt-migration` after review.
   windows on the user's screen unless asked.
 - Never push to `main` or `Work-Build`.
 - Tests that fail before and pass after; report results faithfully, failures included.
+
+## Where things are described
+
+- The knowledge graph (Connections tab), agent profiles (Agent Creator tab) and the
+  "Set up a Pi" wizard: `docs/handoff/knowledge_graph_desktop.md` (decisions, plan and
+  progress; it was written for the desktop's `knowledge-graph` branch).
