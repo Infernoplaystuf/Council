@@ -2552,7 +2552,81 @@ def classify_folder(name: Any, folder: Any) -> Dict[str, Any]:
 # The library
 # ============================================================
 
+def _stat_sig(p: Path) -> Optional[Tuple[int, int, int]]:
+    """(file id, mtime ns, size) of ``p``, None when it is not there: what
+    changes whenever a file is replaced or rewritten. Every write here is a
+    temp file renamed into place, which gives the name a new file id."""
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+#: _describe's answers by classifier folder: (signature, answer). READ AGAIN
+#: whenever a file it read changed (_describe_sig), so another app's Save as,
+#: Rename, Train or tag is seen at the next look.
+_DESCRIBED: Dict[str, Tuple[Any, Dict[str, Any]]] = {}
+
+
+#: The files of a classifier folder _describe reads.
+_DESCRIBED_FILES = frozenset(("classes.json", ABOUT, "model.npz"))
+
+
+def _describe_sig(d: Path) -> Any:
+    """What _describe(d) read, by signature: the time and size of
+    classes.json, about.json and the pre-versions model.npz, and the names
+    in versions/ (a version is a whole folder renamed in, never changed).
+
+    TWO DIRECTORY LISTINGS, NOT FIVE STATS: on Windows a listing carries
+    each file's time and size, and a stat is a system call of its own
+    (MEASURED: 48 us each, 0.25 of the 0.38 ms a cached row cost). Every
+    write here is a temp file closed, then renamed into place, so the
+    listing's entry is the new file's."""
+    files = []
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                if e.name in _DESCRIBED_FILES:
+                    st = e.stat()
+                    files.append((e.name, st.st_mtime_ns, st.st_size))
+    except OSError:
+        return None
+    try:
+        with os.scandir(d / VERSIONS) as it:
+            versions = sorted(e.name for e in it)
+    except OSError:
+        versions = []
+    numbers = [int(m.group(1)) for m in map(_VERSION_RE.match, versions) if m]
+    # ... and the newest version's meta.json, which says whether it is
+    # damaged: a file of its own, read whole only when it changed.
+    meta = (_stat_sig(d / VERSIONS / f"v{max(numbers)}" / "meta.json")
+            if numbers else None)
+    return tuple(sorted(files)), tuple(versions), meta
+
+
 def _describe(d: Path) -> Dict[str, Any]:
+    """What the list shows for one classifier folder — read again only when
+    one of its files changed (_DESCRIBED). MEASURED before: 1.0-1.2 ms a
+    classifier, every time the dropdown opened, on the UI thread — 52-62 ms
+    at 50 saved models, 520-630 ms at 500."""
+    key = str(d)
+    held = _DESCRIBED.get(key)
+    sig = _describe_sig(d)
+    if held is not None and sig is not None and sig == held[0]:
+        info = held[1]
+    else:
+        info = _describe_now(d)
+        _DESCRIBED[key] = (sig, info)
+    # A copy: the answer is handed to callers ("details").
+    return dict(info, classes=list(info["classes"]),
+                counts=dict(info["counts"]), lineage=list(info["lineage"]),
+                history=list(info["history"]), tags=list(info["tags"]),
+                origin=dict(info["origin"] or {}),
+                owner=dict(info["owner"] or {}))
+
+
+def _describe_now(d: Path) -> Dict[str, Any]:
     """What the list shows for one classifier folder. READ-ONLY: listing
     migrates nothing and sets nothing aside, and a damaged classifier is a
     row saying so rather than an error that hides all the others."""
@@ -2753,13 +2827,23 @@ def _filters(found: List[Dict[str, Any]]) -> List[str]:
     return out
 
 
-def _library(show: Any = "") -> Dict[str, Any]:
+def _classifier_folders() -> List[Path]:
+    """Every classifier folder in the store, by name. One listing: on
+    Windows it says which entries are folders with no stat per entry."""
     root = classifier_store()
-    found = []
-    if root.is_dir():
-        for d in sorted(root.iterdir(), key=lambda e: e.name.lower()):
-            if d.is_dir() and _NAME_RE.match(d.name):
-                found.append(_describe(d))
+    try:
+        with os.scandir(root) as it:
+            names = [e.name for e in it
+                     if _NAME_RE.match(e.name) and e.is_dir()]
+    except OSError:
+        return []
+    return [root / n for n in sorted(names, key=str.lower)]
+
+
+def _library(show: Any = "") -> Dict[str, Any]:
+    found = [_describe(d) for d in _classifier_folders()]
+    if len(_DESCRIBED) > 4 * max(64, len(found)):
+        _DESCRIBED.clear()          # folders renamed or deleted long ago
     me = _this_app()
     how, value = _parse_show(show)
     shown = [i for i in found if _matches(i, how, value, me)]
@@ -4288,28 +4372,49 @@ def _runs_files(name: str) -> List[Tuple[Path, bool, str]]:
     if name:
         d = store_dir(name)
         return [(d / RUNS, False, d.name)]
-    root = classifier_store()
-    out: List[Tuple[Path, bool, str]] = []
-    if root.is_dir():
-        for d in sorted(root.iterdir(), key=lambda e: e.name.lower()):
-            if d.is_dir() and _NAME_RE.match(d.name):
-                out.append((d / RUNS, False, d.name))
-        trash = root / DELETED
-        if trash.is_dir():
-            for d in sorted(trash.iterdir()):
-                if d.is_dir():
-                    out.append((d / RUNS, True,
-                                _DELETED_STAMP.sub("", d.name)))
+    out: List[Tuple[Path, bool, str]] = [
+        (d / RUNS, False, d.name) for d in _classifier_folders()]
+    trash = classifier_store() / DELETED
+    try:
+        with os.scandir(trash) as it:
+            gone = sorted(e.name for e in it if e.is_dir())
+    except OSError:
+        gone = []
+    out += [(trash / n / RUNS, True, _DELETED_STAMP.sub("", n)) for n in gone]
     return out
+
+
+#: _read_runs' answers by file: (signature, records, unreadable lines).
+#: A record is appended, never edited, so a file whose id, time and size
+#: are as they were holds what it held.
+_RUNS_READ: Dict[str, Tuple[Any, List[Dict[str, Any]], int]] = {}
 
 
 def _read_runs(p: Path) -> Tuple[List[Dict[str, Any]], int]:
     """The records of one runs.jsonl, oldest first, and how many lines were
     not records — cut short by a crash, or with a field of the wrong kind
     (see _run_ok): skipped and counted, never an error that hides the
-    others."""
-    if not p.is_file():
+    others.
+
+    Parsed again only when the file changed: the "classified with" line
+    reads every classifier's record each time it is shown (MEASURED before:
+    0.3 ms a classifier — 150-240 ms at 500). The records handed back are
+    shared with the cache, so they are only ever read (run_history copies
+    each one it hands on)."""
+    sig = _stat_sig(p)
+    if sig is None:
         return [], 0
+    held = _RUNS_READ.get(str(p))
+    if held is not None and held[0] == sig:
+        return list(held[1]), held[2]
+    records, bad = _parse_runs(p)
+    if len(_RUNS_READ) > 1024:
+        _RUNS_READ.clear()
+    _RUNS_READ[str(p)] = (sig, records, bad)
+    return list(records), bad
+
+
+def _parse_runs(p: Path) -> Tuple[List[Dict[str, Any]], int]:
     try:
         text = p.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:

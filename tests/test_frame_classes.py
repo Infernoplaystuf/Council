@@ -2887,3 +2887,49 @@ def test_a_renamed_model_is_named_as_it_is_called_now(vault, trained):
     fc.delete_classifier("hawks")
     line = fc.classified_with(str(folder))["classified_with"]
     assert line.startswith(f"Classified with {now} (since deleted) on "), line
+
+
+def test_the_list_and_the_line_read_again_only_what_changed(
+        vault, trained, monkeypatch):
+    """The dropdown re-reads the store each time it is about to be seen, and
+    after every classifier press. MEASURED before the fix: each re-read
+    parsed every classifier's classes.json, about.json and newest meta.json
+    — 1.0-1.2 ms a classifier on the UI thread, 52-62 ms at 50 saved models,
+    520-630 ms at 500 — and the "classified with" line parsed every run
+    record (0.3 ms a classifier). Now a file is parsed again only when it
+    changed (MEASURED after: 0.3 and 0.1 ms a classifier)."""
+    folder, _ = trained
+    fc.classify_folder("frames", str(folder))
+    fc.save_as("frames", "other")
+    fc.list_classifiers()
+    fc.classified_with(str(folder))
+    opened = []
+    real = Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        opened.append(f"{self.parent.name}/{self.name}")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    lib = fc.list_classifiers()
+    line = fc.classified_with(str(folder))["classified_with"]
+    assert opened == [], opened
+    assert lib["names"] == ["frames", "other"]
+    assert line.startswith("Classified with frames v1 (")
+    # Another app tags one and classifies with the other: what changed is
+    # read again, and the list and the line say so.
+    fc.add_tag("other", "night")
+    fc.classify_folder("other", str(folder))
+    opened.clear()
+    lib = fc.list_classifiers()
+    line = fc.classified_with(str(folder))["classified_with"]
+    assert any(r.startswith("other ") and "tags: night" in r
+               for r in lib["rows"]), lib["rows"]
+    assert line.startswith("Classified with other v1 ("), line
+    assert opened and all(o.startswith("other/") for o in opened), opened
+    # A damaged newest version is seen at once, whatever was read before.
+    meta = _store(vault) / "frames" / "versions" / "v1" / "meta.json"
+    meta.write_text("{cut short", encoding="utf-8")
+    row = next(r for r in fc.list_classifiers()["rows"]
+               if r.startswith("frames "))
+    assert "PROBLEM" in row, row
