@@ -216,7 +216,7 @@ def controller_role(slots: Any) -> str:
     return CONTROLLER if CONTROLLER in roles else "judge"
 
 
-def _role_models(slots: Any, main_path: str) -> Dict[str, str]:
+def role_models(slots: Any, main_path: str) -> Dict[str, str]:
     from .model_slots import COUNCIL_ROLES
     out: Dict[str, str] = {}
     if slots is None:
@@ -292,7 +292,7 @@ def build_report(vault_dir: Path, *, slots: Any = None,
                 call["host"] = m.name
     return Report(generated=now, days=days, usage=usage_log.summarise(calls),
                   machines=[local] + machines,
-                  roles=_role_models(slots, main_path),
+                  roles=role_models(slots, main_path),
                   controller_role=controller_role(slots), notes=notes)
 
 
@@ -627,7 +627,7 @@ def run_review(vault_dir: Path, *, slots: Any = None,
 
 __all__ = ["REVIEW_EVERY_DAYS", "THIS_PC", "CONTROLLER", "PROPOSAL_SCHEMA",
            "Machine", "Report", "Change", "Checked", "build_report",
-           "controller_role", "ask_controller", "parse_proposal", "check",
+           "controller_role", "role_models", "ask_controller", "parse_proposal", "check",
            "apply_role_changes", "log_review", "last_review", "due",
            "checked_from_dict", "log_applied",
            "run_review"]

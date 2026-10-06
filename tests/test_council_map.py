@@ -8,6 +8,7 @@ fails — update the table in council_core/council_map.py and the test together.
 from __future__ import annotations
 
 import os
+import time
 import sys
 from pathlib import Path
 from types import SimpleNamespace as NS
@@ -282,6 +283,48 @@ def test_the_tab_opens_on_the_guide_and_steps_through_it(qapp):
         assert not tab.guide_nav.isVisible()
         tab.show_guide(0)
         assert tab.details.toPlainText().startswith("How it works")
+    finally:
+        tab.close()
+        tab.deleteLater()
+
+
+# ---- role specs ------------------------------------------------------------
+
+def test_role_specs_view_fills_from_a_worker_and_lights_the_role(qapp):
+    from council_core import role_specs as rs
+    from council_qt.tabs.council_map import CouncilMapTab
+    calls = []
+
+    def specs(hardware=True):
+        calls.append(hardware)
+        roles = {"writer": "llama3.1:8b", "peasant": "llama3.2:1b"}
+        return (rs.assess(roles, vram_gb=8 if hardware else None,
+                          ram_gb=32 if hardware else None),
+                "Test GPU, 8 GB" if hardware else "")
+    tab = CouncilMapTab(gather=lambda probe=False: cm.live_overlay(
+        cm.static_map(), _slots(), []), specs=specs)
+    tab.resize(1200, 800)
+    tab.show()
+    try:
+        tab.show_specs()
+        assert tab.side_stack.currentIndex() == 1
+        assert calls[0] is False                     # instant, no hardware
+        end = time.monotonic() + 5
+        while time.monotonic() < end and not tab.hardware_summary:
+            qapp.processEvents()
+            time.sleep(0.01)
+        assert tab.hardware_summary == "Test GPU, 8 GB"
+        assert "Where to spend first" in tab.spec_card.toPlainText()
+        assert tab.specs_table.rowCount() == len(rs.SPECS)
+        row = [tab.specs_table.item(r, 0).text()
+               for r in range(tab.specs_table.rowCount())].index("Writer")
+        tab.specs_table.selectRow(row)
+        assert tab.spec_card.toPlainText().startswith("Writer")
+        assert tab.canvas.highlight == {"writer"}
+        tab.show_gaps()
+        assert tab.side_stack.currentIndex() == 0
+        assert not tab.canvas.highlight
+        tab.grab()
     finally:
         tab.close()
         tab.deleteLater()

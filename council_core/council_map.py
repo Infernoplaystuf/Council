@@ -695,7 +695,10 @@ GUIDE: Tuple[GuideStep, ...] = (
         "yet and would make the council better.\n\n"
         "Hover a node to light up its lines. Click it for everything it "
         "sends and receives. Drag to move things, scroll to zoom. Press Next "
-        "to follow one question through the council."),
+        "to follow one question through the council.\n\n"
+        "'Role specs' shows what each agent needs — the minimum, "
+        "recommended and best model and the memory each takes — against "
+        "this PC, and which agents to give more power first."),
     GuideStep(
         "You ask a question",
         "You type in the ⚖ Council tab. That is the only way in: you talk to "
