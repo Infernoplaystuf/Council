@@ -4570,16 +4570,14 @@ def _runs_in(folder: Any) -> Dict[str, int]:
     return runs
 
 
-def _few_runs(runs: List[Tuple[str, int]], most: int = 2) -> str:
-    """"run 20261005_130000 (8 frames)", or "3 runs (24 frames): a, b and
-    1 more" — short, for a line two rows high."""
-    if len(runs) == 1:
-        r, k = runs[0]
-        return f"run {r} ({k} frame{'' if k == 1 else 's'})"
+def _few_runs(runs: List[Tuple[str, int]]) -> str:
+    """"run 20261005_130000 (8 frames)", or "3 runs (24 frames)" — short:
+    Typhon's line is three rows at the window's smallest (MEASURED: run
+    names made a typical line four), and run_history names every run."""
     total = sum(k for _r, k in runs)
-    names = ", ".join(r for r, _k in runs[:most])
-    more = f" and {len(runs) - most} more" if len(runs) > most else ""
-    return f"{len(runs)} runs ({total} frames): {names}{more}"
+    if len(runs) == 1:
+        return f"run {runs[0][0]} ({total} frame{'' if total == 1 else 's'})"
+    return f"{len(runs)} runs ({total} frames)"
 
 
 def _runs_note(present: Dict[str, int],

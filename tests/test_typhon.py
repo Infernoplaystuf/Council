@@ -497,30 +497,66 @@ def test_the_setup_button_works(qapp, typhon_dir, forget_generated):
 WINDOWS_FONTS = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
 
 
+#: Real answers, the longest of each kind (MEASURED 2026-10-06 from the
+#: library's own flows, as Typhon and Barbie sharing one store).
+LONG_STATUS = (
+    "Imported hawks2 v1 (d56ef878) from birds-v1.typhon-classifier.zip "
+    "\u2014 8 frames in 3 classes, made by Barbie Capture v5 \u2014 live "
+    "(project barbie_lab). Named as typed in New name (the file calls it "
+    "'birds'). 1 classified run(s) on record. It is the same model as "
+    "'birds'.",
+    "'frames' belongs to Barbie Capture v5 \u2014 live (project "
+    "barbie_lab), not to this app \u2014 Save as to make a copy of your own "
+    "(it keeps where it came from), or tag it 'shared' to let every app "
+    "change it. Nothing was renamed.",
+    "Trained a random forest on 8 frames in 2 classes. Leave-one-out "
+    "accuracy 100% (8/8): each marked frame predicted from all the others. "
+    "Saved as frames v1 (18d88264).")
+LONG_LINE = (
+    "Classified with birds v1 (98f54722) on 2026-10-05 15:54 \u2014 good 5, "
+    "bad timing 3",
+    "Classified with hawks v1 (d56ef878; then called birds) on 2026-10-06 "
+    "09:27 \u2014 good 5, bad timing 3 \u00b7 not classified yet: run "
+    "20261005_130000 (8 frames)",
+    "Classified with frames v3 (1a2b3c4d) on 2026-10-02 14:03 on LAB-PC-2 "
+    "\u2014 good 110, bad timing 10, blurred 4")
+
+
 @pytest.mark.skipif(not (WINDOWS_FONTS / "arial.ttf").is_file(),
                     reason="needs the Windows fonts (Arial) to measure text")
-def test_the_classified_with_line_shows_all_of_a_typical_answer(
-        typhon_dir, tmp_path):
-    """It wraps at 336 px, and a typical answer is two lines of Arial 10: at
-    one row high (24 px) the second — the counts per class — was cut off.
-    Seen in an offscreen grab of a built Typhon with the Windows fonts, and
-    measured the same way here, in a fresh interpreter given those fonts."""
+@pytest.mark.parametrize("size", [(1504, 1016), (1400, 820)])
+def test_the_status_and_classified_with_lines_show_all_of_a_long_answer(
+        typhon_dir, tmp_path, size):
+    """Both wrap at their width in Arial 10 (15 px a row), and the window
+    scales them with itself down to its smallest, 1400 x 820. MEASURED
+    before the fix: at 1400 x 820 the status line (64 design px, 51 there)
+    cut 5 of 23 real answers — a Train needs 60, another app's import 75 —
+    and the "classified with" line (40 design px, 32 there) cut a typical
+    answer's last row; at one row high (24 px) it had cut the counts per
+    class at every size. Measured here as in an offscreen grab of a built
+    Typhon, in a fresh interpreter given the Windows fonts, at the design
+    size and at the smallest."""
     import subprocess
 
+    w, h = size
     code = (
-        "import sys\n"
+        "import json, sys\n"
         f"sys.path[:0] = [{str(typhon_dir)!r}, {str(ROOT)!r}]\n"
         "from PySide6.QtWidgets import QApplication\n"
         "app = QApplication([])\n"
         "import app as generated, frame_camera\n"
-        "ui = generated.App(); ui.resize(1504, 1016)\n"
-        "port = ui.ports.classified_with_line\n"
-        "port.set('Classified with birds v1 (98f54722) on 2026-10-05 15:54 "
-        "\\u2014 good 5, bad timing 3')\n"
-        "ui.grab()\n"
-        "label = port.widget\n"
-        "print(label.font().family(), label.width(), label.height(),"
-        " label.fontMetrics().height(), label.heightForWidth(label.width()))\n"
+        f"ui = generated.App(); ui.resize({w}, {h}); ui.grab()\n"
+        "out = {}\n"
+        f"for port, texts in (('classifier_status', {LONG_STATUS!r}),\n"
+        f"                    ('classified_with_line', {LONG_LINE!r})):\n"
+        "    label = getattr(ui.ports, port).widget\n"
+        "    needs = []\n"
+        "    for text in texts:\n"
+        "        label.setText(text)\n"
+        "        needs.append(label.heightForWidth(label.width()))\n"
+        "    out[port] = [label.font().family(), label.width(),\n"
+        "                 label.height(), label.fontMetrics().height(), needs]\n"
+        "print(json.dumps(out))\n"
         "frame_camera.disconnect()\n")
     env = dict(os.environ, QT_QPA_PLATFORM="offscreen", COUNCIL_NO_DIALOGS="1",
                QT_QPA_FONTDIR=str(WINDOWS_FONTS),
@@ -530,11 +566,12 @@ def test_the_classified_with_line_shows_all_of_a_typical_answer(
                           env=env, capture_output=True, text=True,
                           timeout=120)
     assert done.returncode == 0, done.stderr[-2000:]
-    family, width, height, line, needs = done.stdout.split()[-5:]
-    width, height, line, needs = map(int, (width, height, line, needs))
-    assert family == "Arial" and width >= 300, done.stdout
-    assert needs > line, "one line: this test no longer shows anything"
-    assert needs <= height, f"needs {needs} px, has {height}"
+    measured = json.loads(done.stdout.strip().splitlines()[-1])
+    for port, (family, width, height, row, needs) in measured.items():
+        assert family == "Arial" and width >= 300, (port, measured)
+        assert max(needs) >= 3 * row, f"{port}: too short to show anything"
+        assert max(needs) <= height, \
+            f"{port} at {w}x{h}: needs {needs} px, has {height}"
 
 
 def test_the_export_and_import_pickers_say_which_is_which(
