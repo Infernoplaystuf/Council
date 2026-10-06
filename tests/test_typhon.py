@@ -901,24 +901,31 @@ def test_the_model_dropdown_end_to_end_in_a_built_typhon(
     p.classifier_filter.widget.textActivated.emit(barbie)
     assert picker.items() == ["barbie-frames"]
     # Whose it is: Typhon may open, copy and tag Barbie's model, not train it.
+    # The refusal is an answer: the classes and the class typed stay.
     _pick_model(ui, "barbie-frames")
     assert "From Barbie" in _status(ui), _status(ui)
     refused = []
     ui.report_error = lambda what, exc: refused.append(f"{what}: {exc}")
     p.new_class.set("bad timing")
     ui.on_btn_add_class()
-    assert len(refused) == 1 and "belongs to Barbie" in refused[0], refused
+    assert "belongs to Barbie" in _status(ui), _status(ui)
+    assert p.classes.items() == ["good"] and p.new_class.get() == "bad timing"
     p.new_name.set("barbie-copy")
     ui.on_btn_save_as()
     assert combo.currentText() == "barbie-copy", _status(ui)
+    assert p.new_name.get() == "", "the name typed was used"
     assert "from Barbie" in (picker.refresh() or picker.row_of("barbie-copy"))
-    # Everything this app MADE, in one bundle — by origin: a copy of
-    # Barbie's model keeps Barbie as where it came from.
+    # Everything that BELONGS to this app, in one bundle: its own model and
+    # its copy of Barbie's (which keeps Barbie as where it came from) — the
+    # models a Typhon going its own way can change. The copy is untrained,
+    # so it is named as left out, not missed.
     ui.on_btn_export_this_app_s_classifiers()
     assert _status(ui).startswith("Exported 1 classifier (This app: Typhon"), \
         _status(ui)
+    assert "Not in it: barbie-copy ('barbie-copy' has no trained model" in \
+        _status(ui)
     assert next(out.glob("birdlab-*.typhon-classifiers.zip"))
-    assert refused == [refused[0]], "nothing else was refused"
+    assert refused == [], "nothing was refused with a dialog"
     ui.close()
 
 

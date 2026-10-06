@@ -2018,7 +2018,8 @@
         "outputs": {
           "classes": "classes",
           "classifier_name": "name",
-          "classifier_status": "summary"
+          "classifier_status": "summary",
+          "new_name": "cleared"
         }
       },
       "w": 72,
@@ -2057,7 +2058,8 @@
         "module": "frame_classes",
         "outputs": {
           "classifier_name": "name",
-          "classifier_status": "summary"
+          "classifier_status": "summary",
+          "new_name": "cleared"
         }
       },
       "w": 72,
@@ -2266,7 +2268,8 @@
         "outputs": {
           "classes": "classes",
           "classifier_name": "name",
-          "classifier_status": "summary"
+          "classifier_status": "summary",
+          "new_name": "cleared"
         }
       },
       "w": 104,
