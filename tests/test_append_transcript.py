@@ -181,3 +181,86 @@ def test_a_notice_before_the_council_tab_exists_is_kept_and_shown(qapp,
         assert "held for later" in _transcript(win)
     finally:
         win.request_close()
+
+
+# ============================================================
+# The Librarian's report can be sent at all
+# ============================================================
+# build_librarian made LibrarianTab(window) with no ask_text, so the tab's
+# default ("the user cancelled") answered every Commit click: no prompt, no
+# commit, no report. The IDE and Nodes notices arrived; the Librarian's could
+# never be triggered (found in review, in the real --advanced app). These go
+# through the REAL factory; only the dialog itself is stood in.
+
+def _drain_librarian(qapp, timeout=30.0):
+    deadline = time.monotonic() + timeout
+    while (any(t.name.startswith("librarian-") and t.is_alive()
+               for t in threading.enumerate())
+           and time.monotonic() < deadline):
+        qapp.processEvents()
+        time.sleep(0.01)
+    for _ in range(20):
+        qapp.processEvents()
+
+
+def test_a_librarian_commit_from_the_real_factory_is_reported(
+        qapp, window, vault, monkeypatch):
+    import shutil
+
+    from council_qt import dialogs
+    from council_qt.tabs.librarian import build_librarian
+
+    if not shutil.which("git"):
+        pytest.skip("git is not installed")
+    for key in ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"):
+        monkeypatch.setenv(key, "Council test")
+    for key in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
+        monkeypatch.setenv(key, "council-test@example.invalid")
+    (vault / "Q3 notes.md").write_text("returns booked in October\n",
+                                       encoding="utf-8")
+    monkeypatch.delenv("COUNCIL_NO_DIALOGS", raising=False)
+    asked = []
+
+    def answer(title, prompt, initialvalue="", parent=None, **_kw):
+        asked.append((title, prompt, initialvalue, parent))
+        return "snapshot from the test"
+
+    monkeypatch.setattr(dialogs, "askstring", answer)
+    lib = build_librarian(window)
+    try:
+        lib.commit_btn.click()
+        _drain_librarian(qapp)
+        assert asked, "Commit to Git asked nothing"
+        assert asked[0][3] is lib, "the prompt is not parented to the tab"
+        assert asked[0][2] == "vault snapshot", "the suggested message is lost"
+        assert _pump(qapp, lambda: "Notice from the Librarian tab"
+                     in _transcript(window)), (
+            f"the commit was never reported:\n{_transcript(window)}")
+        text = _transcript(window)
+        assert "OK:" in text, text
+    finally:
+        lib.deleteLater()
+
+
+def test_the_real_factory_opens_no_modal_when_dialogs_are_off(
+        qapp, window, monkeypatch):
+    """COUNCIL_NO_DIALOGS (offscreen and unattended runs): a modal nobody can
+    close would hang the run, so the answer is "cancelled". askstring itself
+    does not check the flag; the factory does."""
+    from council_qt import dialogs
+    from council_qt.tabs.librarian import build_librarian
+
+    monkeypatch.setenv("COUNCIL_NO_DIALOGS", "1")
+
+    def must_not_open(*_a, **_k):
+        raise AssertionError("a modal opened with COUNCIL_NO_DIALOGS set")
+
+    monkeypatch.setattr(dialogs, "askstring", must_not_open)
+    lib = build_librarian(window)
+    try:
+        lib.commit_btn.click()
+        qapp.processEvents()
+        assert not lib._busy
+        assert "Notice from the Librarian tab" not in _transcript(window)
+    finally:
+        lib.deleteLater()

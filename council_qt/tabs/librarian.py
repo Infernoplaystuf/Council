@@ -208,5 +208,25 @@ class LibrarianTab(ViewHelpers, QWidget):
 
 
 def build_librarian(window) -> QWidget:
-    """Factory for the tab registry."""
-    return LibrarianTab(window)
+    """Factory for the tab registry — the tab, with a REAL prompt.
+
+    The tab's own default for ask_text means "the user cancelled", which is
+    right for a test and was wrong here: nothing supplied it, so "Commit to
+    Git" asked nothing, committed nothing and reported nothing (found in
+    review, in the --advanced app) — the Designer's factory had the same gap
+    and the same fix. Under COUNCIL_NO_DIALOGS the answer is still
+    "cancelled": askstring does not check the flag itself, and a modal
+    nobody can close would hang an offscreen run.
+    """
+    from .. import dialogs
+
+    tab = LibrarianTab(window)
+
+    def ask_text(title, prompt, initial=""):
+        if dialogs.disabled():
+            return None
+        return dialogs.askstring(title, prompt, initialvalue=initial,
+                                 parent=tab)
+
+    tab.ask_text = ask_text
+    return tab
