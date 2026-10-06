@@ -198,15 +198,35 @@ def _chunk_text(text: str, source: str, chunk_size: int = CHUNK_SIZE,
 
 
 def _collect_files(vault_dir: Path) -> List[Path]:
-    """Walk vault_dir and collect indexable files."""
+    """Walk vault_dir and collect indexable files — the user's documents,
+    not the app's own bookkeeping.
+
+    Skipped: SKIP_PATTERNS anywhere; any dot-folder INSIDE the vault (the
+    app keeps its state there — .council_fanout holds whole copies of code
+    folders, .council_usage the model-call meter, .knowledge_graph its
+    store — and indexing them handed them to the council as "your vault");
+    and whatever conversation_logger protects (past conversations, app-state
+    files)."""
+    try:
+        from conversation_logger import is_protected_path
+    except Exception:                                     # noqa: BLE001
+        is_protected_path = None
     files: List[Path] = []
     for p in vault_dir.rglob("*"):
         # Skip hidden/system dirs
         if any(part in SKIP_PATTERNS for part in p.parts):
             continue
+        try:
+            rel_parts = p.relative_to(vault_dir).parts
+        except ValueError:
+            rel_parts = p.parts
+        if any(part.startswith(".") for part in rel_parts[:-1]):
+            continue
         if not p.is_file():
             continue
         if p.suffix.lower() not in INDEXABLE_EXTENSIONS:
+            continue
+        if is_protected_path is not None and is_protected_path(p, vault_dir):
             continue
         files.append(p)
     return sorted(files)

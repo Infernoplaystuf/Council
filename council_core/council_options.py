@@ -59,6 +59,10 @@ SWITCHES: Tuple[Switch, ...] = (
                 "learning continues underneath."),
     Switch("adversarial", "Adversarial", False, shown_in_demo=False),
     Switch("judge_panel", "Judge panel ✦", False, shown_in_demo=False),
+    Switch("vault", "📚 Vault", True,
+           hint="Give the council the passages from your vault that match "
+                "the question. The Writer, Coder, Sage and Strategist read "
+                "them in full, the Peasant in part; the others do not."),
     Switch("parallel", "Parallel members", False, shown_in_demo=False,
            hint="Members draft and rebut at the same time. Their first "
                 "drafts are then independent — none reads another's before "
@@ -89,6 +93,7 @@ class CouncilOptions:
     """
     deliberate: bool = True
     tools: bool = False
+    vault: bool = True
     fill_ide: bool = True
     stream: bool = True
     use_profile: bool = True

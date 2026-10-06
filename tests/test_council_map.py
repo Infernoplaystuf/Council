@@ -86,9 +86,11 @@ def test_the_facts_the_map_is_for():
     assert _edge(m, "tools", "coder").status == "live"
     # The Sage knowledge base is not used by the turn.
     assert _edge(m, "sage_kb", "sage").status == "proposed"
-    # Nothing feeds the vault into the turn.
-    assert _edge(m, "librarian", "writer").status == "proposed"
-    assert _edge(m, "vault_search", "question").status == "proposed"
+    # The vault reaches the turn — in full for the writer, partly for the
+    # peasant, not at all for the skeptic and the judge.
+    assert _edge(m, "librarian", "writer").status == "live"
+    assert "1,500" in _edge(m, "librarian", "peasant").data
+    assert _edge(m, "librarian", "skeptic").status == "proposed"
     # Low-confidence gaps reach the wishlist; memory is written after.
     assert _edge(m, "debate", "wishlist").status == "live"
     assert _edge(m, "answer", "role_memory").status == "live"
@@ -282,7 +284,7 @@ def test_the_tab_opens_on_the_guide_and_steps_through_it(qapp):
         assert not tab.guide_back.isEnabled()
         tab.guide_forward()
         assert tab.guide_step == 1
-        assert tab.canvas.highlight == {"question", "judge"}
+        assert tab.canvas.highlight == {"question", "judge", "librarian"}
         for _ in range(len(cm.GUIDE)):
             tab.guide_forward()
         assert tab.guide_step == len(cm.GUIDE) - 1

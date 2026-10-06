@@ -126,9 +126,10 @@ MEMBERS = ("coder", "skeptic", "sage", "strategist", "intern", "artist")
 
 _NODES: Tuple[Node, ...] = (
     Node("question", "Your question", "io",
-         "What you typed. It reaches every agent as it is: nothing adds a "
-         "task memo, vault matches or an analyst result to it first.",
-         "council_qt/tabs/council.py:202"),
+         "What you typed. With 📚 Vault on, the Librarian first finds the "
+         "vault passages that match it and hands them to the members; "
+         "nothing adds a task memo or an analyst result yet.",
+         "council_qt/tabs/council.py (CouncilActions.send)"),
     Node("answer", "Final answer", "io",
          "The synthesizer's draft once the judge's critique says PASS (or "
          "the rounds run out).", "council_core/deliberation.py:858-895"),
@@ -173,10 +174,12 @@ _NODES: Tuple[Node, ...] = (
          "synthesizer reads all of it.",
          "council_core/deliberation.py:633-764"),
     Node("librarian", "Librarian", "agent",
-         "Could rank vault search hits into a short briefing for the panel "
-         "and log what the vault is missing. Not part of the turn today; "
-         "the Librarian tab manages the vault's files.",
-         "council_core/librarian.py; council_qt/tabs/librarian.py"),
+         "Before each question (📚 Vault on), searches the vault for the "
+         "passages that match it and hands them to the council as a VAULT "
+         "CONTEXT block naming each file — for that question only. Semantic "
+         "search when the vault has a semantic index, keyword search "
+         "otherwise (no model loaded, nothing downloaded).",
+         "council_core/vault_context.py"),
     Node("analyst", "Analyst", "agent",
          "Writes pandas code from a question and runs it in a sandbox over "
          "the vault's data files. Not part of the turn today.",
@@ -282,10 +285,9 @@ def _edges() -> List[Edge]:
           cite="data_index.py"),
         E("vault", "analyst", "data files", "context", "live",
           cite="vault_analyst.py"),
-        E("vault_rag", "librarian", "the chunks that match the question",
-          "context",
-          note="The index exists and nothing in the turn searches it.",
-          cite="vault_rag.py:650"),
+        E("vault_rag", "librarian", "the passages that match the question",
+          "context", "live",
+          cite="council_core/vault_context.py (build); vault_rag.py"),
         E("vault_search", "question", "matching files and folders",
           "context",
           note="The question reaches the council without any vault matches.",
@@ -398,16 +400,26 @@ def _edges() -> List[Edge]:
         out.append(E("debate", role, "others' answers + the peasant's "
                      "questions", "deliberation", "live",
                      cite="council_core/deliberation.py:633-713"))
-    for role in ("writer", "coder", "sage", "strategist", "peasant",
-                 "skeptic", "intern"):
-        why = {
-            "skeptic": "The skeptic argues from the model's memory alone; "
-                       "evidence would give it something real to attack.",
-            "intern": "The intern drafts from the model's memory alone.",
-        }.get(role, f"The {role} answers without the vault's documents.")
-        out.append(E("librarian", role,
-                     "a short briefing: the vault passages that matter",
-                     "context", note=why, cite="council_engine.py:5579-5609"))
+    # The VAULT CONTEXT block, gated per role by the engine
+    # (ROLE_CONTEXT_PROFILES): full, the first 1,500 characters, or none.
+    for role in ("writer", "coder", "sage", "strategist"):
+        out.append(E("librarian", role, "VAULT CONTEXT: the matching "
+                     "passages, in full", "context", "live",
+                     cite="council_core/vault_context.py (applied); "
+                          "council_engine.py (ROLE_CONTEXT_PROFILES)"))
+    out.append(E("librarian", "peasant", "VAULT CONTEXT: the first 1,500 "
+                 "characters", "context", "live",
+                 cite="council_engine.py (ROLE_CONTEXT_PROFILES 'lite')"))
+    for role, why in (
+            ("skeptic", "The skeptic argues from the model's memory alone "
+                        "(use_vault 'none', on purpose, so it cannot just "
+                        "echo the vault); evidence would give it something "
+                        "real to attack."),
+            ("intern", "The intern drafts from the model's memory alone "
+                       "(use_vault 'none', to stay fast).")):
+        out.append(E("librarian", role, "the vault passages, to attack / "
+                     "build on", "context", note=why,
+                     cite="council_engine.py (ROLE_CONTEXT_PROFILES)"))
     for role in ("judge", "writer") + MEMBERS + ("peasant",):
         out.append(E("role_memory", role, "own + project memory, profile, "
                      "history, prior session", "memory", "live",
@@ -786,9 +798,11 @@ GUIDE: Tuple[GuideStep, ...] = (
         "the council, never to one model directly.\n\n"
         "With Deliberate on, the whole council works on it (the next steps). "
         "With it off, the Writer answers alone — faster, no debate, no "
-        "verdict. The Tools switch lets the Coder and Intern run code and "
+        "verdict. With 📚 Vault on, the Librarian first finds the passages "
+        "in your vault that match the question and hands them to the "
+        "members. The Tools switch lets the Coder and Intern run code and "
         "search the vault while they work.",
-        ("question", "judge"),
+        ("question", "judge", "librarian"),
         "council_qt/tabs/council.py (CouncilActions.send) → "
         "council_core/council_turn.py (run_turn)"),
     GuideStep(
@@ -913,9 +927,9 @@ GUIDE: Tuple[GuideStep, ...] = (
         "council_qt/tabs/fanout.py"),
     GuideStep(
         "What is not connected yet",
-        "The green dashed lines are the map's suggestions: the Librarian "
-        "briefing members with your vault's documents, the Judge checking "
-        "answers against evidence, past debates being remembered. A red "
+        "The green dashed lines are the map's suggestions: the Judge "
+        "checking answers against the vault's evidence, the Sage's "
+        "knowledge base, past debates being remembered. A red "
         "line, if any, is wired but never takes effect.\n\n"
         "Press 'What's missing' for the full list with the reason for each, "
         "or tick 'Only what is not live' to see just those lines.",

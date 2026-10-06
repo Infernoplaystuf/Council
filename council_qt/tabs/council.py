@@ -187,24 +187,44 @@ class CouncilActions:
         """
         from council_core import council_turn
 
+        from council_core import vault_context
+
         models, problem = self.models()
         if models is None:
             return council_turn.TurnResult(False, message=problem)
 
-        if not getattr(options, "deliberate", True):
-            # The fast path: one personality, no panel, no verdict. It is a
-            # real answer and it is NOT a deliberation, so it produces no
-            # verdict id — which is what keeps the verdict bar honest (A3).
-            return self._direct(typed_text, models, on_event=on_event)
+        # The vault passages this question needs, for this question only
+        # (council_core.vault_context). Which roles see them is the engine's
+        # per-role rule; the transcript says what was found.
+        block = ""
+        if getattr(options, "vault", True):
+            brief = self.vault_brief(typed_text)
+            block = brief.text
+            if on_event is not None:
+                from council_core.deliberation import AgentEvent
+                on_event(AgentEvent("Librarian", "observation", brief.note()))
 
-        enable_tools = bool(getattr(options, "tools", False))
-        return council_turn.run_turn(
-            typed_text, models,
-            enable_tools=enable_tools,
-            tools=self.tools() if enable_tools else None,
-            parallel_members=bool(getattr(options, "parallel", False)),
-            on_event=on_event,
-            on_token=on_token if getattr(options, "stream", True) else None)
+        with vault_context.applied(vault_context.turn_models(models), block):
+            if not getattr(options, "deliberate", True):
+                # The fast path: one personality, no panel, no verdict. It is
+                # a real answer and it is NOT a deliberation, so it produces
+                # no verdict id — which keeps the verdict bar honest (A3).
+                return self._direct(typed_text, models, on_event=on_event)
+
+            enable_tools = bool(getattr(options, "tools", False))
+            return council_turn.run_turn(
+                typed_text, models,
+                enable_tools=enable_tools,
+                tools=self.tools() if enable_tools else None,
+                parallel_members=bool(getattr(options, "parallel", False)),
+                on_event=on_event,
+                on_token=on_token if getattr(options, "stream", True)
+                else None)
+
+    def vault_brief(self, question: str):
+        """The VAULT CONTEXT for a question (blocking: a search)."""
+        from council_core import vault_context
+        return vault_context.build(question, self.vault_dir)
 
     def _direct(self, typed_text: str, models, *, on_event=None):
         """One personality answering directly, with no council."""
