@@ -15,6 +15,8 @@
 #
 # Usage:
 #   ./run-wsl.sh
+#   ./run-wsl.sh --tk                                     # the classic Tk UI
+#   ./run-wsl.sh --advanced                  # any other argument goes to the app
 #   COUNCIL_GGUF_PATH=~/models/phi-4.gguf  ./run-wsl.sh
 #   COUNCIL_GGUF_GPU_LAYERS=0              ./run-wsl.sh   # force CPU
 #   COUNCIL_UI_SCALE=1.8                   ./run-wsl.sh   # bigger text
@@ -126,7 +128,17 @@ fi
 #   "CUDA error … core dumped" case) · 135 SIGBUS · 136 SIGFPE · 139 SIGSEGV
 # Which UI: the Qt app by default; the classic Tk app with --tk or
 # COUNCIL_UI=tk, or automatically when PySide6 is not installed.
-[ "${1:-}" = "--tk" ] && COUNCIL_UI=tk
+# --tk is the launcher's own, wherever it is on the line; every OTHER argument
+# is the app's (--advanced, ...) and is passed on, in order, as typed. They
+# used to be dropped: only $1 was looked at and the app was started with no
+# arguments, so `./run-wsl.sh --advanced` opened the default build.
+APP_ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --tk) COUNCIL_UI=tk ;;
+        *) APP_ARGS+=("$arg") ;;
+    esac
+done
 COUNCIL_ENTRY=council_qt.py
 [ "${COUNCIL_UI:-}" = "tk" ] && COUNCIL_ENTRY=council_gui_engine.py
 if [ "$COUNCIL_ENTRY" = "council_qt.py" ] && ! python -c "import PySide6" >/dev/null 2>&1; then
@@ -135,7 +147,9 @@ if [ "$COUNCIL_ENTRY" = "council_qt.py" ] && ! python -c "import PySide6" >/dev/
     COUNCIL_ENTRY=council_gui_engine.py
 fi
 say "launching $COUNCIL_ENTRY ..."
-python "$COUNCIL_ENTRY"
+# ${APP_ARGS[@]+...}: under `set -u`, a bare "${APP_ARGS[@]}" of an EMPTY
+# array is an "unbound variable" error on bash before 4.4.
+python "$COUNCIL_ENTRY" ${APP_ARGS[@]+"${APP_ARGS[@]}"}
 EXIT=$?
 
 case "$EXIT" in
@@ -147,7 +161,7 @@ case "$EXIT" in
         warn "If this works, the issue is a CUDA wheel / driver mismatch."
         warn "See installs.txt — 'Illegal instruction / CUDA core dumped'."
         export COUNCIL_GGUF_GPU_LAYERS=0
-        python "$COUNCIL_ENTRY"
+        python "$COUNCIL_ENTRY" ${APP_ARGS[@]+"${APP_ARGS[@]}"}
         EXIT=$?
     fi
     ;;

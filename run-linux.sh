@@ -12,6 +12,8 @@
 #
 # Usage:
 #   ./run-linux.sh
+#   ./run-linux.sh --tk          # the classic Tk UI
+#   ./run-linux.sh --advanced    # any other argument goes to the app
 #   COUNCIL_GGUF_PATH=~/models/granite-3.1-8b.gguf ./run-linux.sh
 #   COUNCIL_GGUF_GPU_LAYERS=0 ./run-linux.sh   # force CPU
 # ============================================================
@@ -98,7 +100,17 @@ say "GPU layers: $COUNCIL_GGUF_GPU_LAYERS"
 
 # Which UI: the Qt app by default; the classic Tk app with --tk or
 # COUNCIL_UI=tk, or automatically when PySide6 is not installed.
-[ "${1:-}" = "--tk" ] && COUNCIL_UI=tk
+# --tk is the launcher's own, wherever it is on the line; every OTHER argument
+# is the app's (--advanced, ...) and is passed on, in order, as typed. They
+# used to be dropped: only $1 was looked at and the app was started with no
+# arguments, so `./run-linux.sh --advanced` opened the default build.
+APP_ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --tk) COUNCIL_UI=tk ;;
+        *) APP_ARGS+=("$arg") ;;
+    esac
+done
 COUNCIL_ENTRY=council_qt.py
 [ "${COUNCIL_UI:-}" = "tk" ] && COUNCIL_ENTRY=council_gui_engine.py
 if [ "$COUNCIL_ENTRY" = "council_qt.py" ] && ! python -c "import PySide6" >/dev/null 2>&1; then
@@ -107,7 +119,9 @@ if [ "$COUNCIL_ENTRY" = "council_qt.py" ] && ! python -c "import PySide6" >/dev/
     COUNCIL_ENTRY=council_gui_engine.py
 fi
 say "launching $COUNCIL_ENTRY ..."
-python "$COUNCIL_ENTRY"
+# ${APP_ARGS[@]+...}: under `set -u`, a bare "${APP_ARGS[@]}" of an EMPTY
+# array is an "unbound variable" error on bash before 4.4.
+python "$COUNCIL_ENTRY" ${APP_ARGS[@]+"${APP_ARGS[@]}"}
 EXIT=$?
 
 case "$EXIT" in
@@ -118,7 +132,7 @@ case "$EXIT" in
     if [ "${COUNCIL_GGUF_GPU_LAYERS}" != "0" ]; then
         warn "Retrying once with COUNCIL_GGUF_GPU_LAYERS=0 (CPU only)..."
         export COUNCIL_GGUF_GPU_LAYERS=0
-        python "$COUNCIL_ENTRY"
+        python "$COUNCIL_ENTRY" ${APP_ARGS[@]+"${APP_ARGS[@]}"}
         EXIT=$?
     fi
     ;;

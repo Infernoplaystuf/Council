@@ -1166,8 +1166,8 @@ python() {
 """
 
 
-def _run_sh(tmp_path: Path, name: str, entry_src: str = _STUB_ENTRY,
-            **env_extra):
+def _run_sh(tmp_path: Path, name: str, entry_src: str = _STUB_ENTRY, *,
+            args=(), **env_extra):
     bash = _git_bash()
     if not bash:
         pytest.skip("no bash (Git for Windows) to run the launcher with")
@@ -1189,7 +1189,7 @@ def _run_sh(tmp_path: Path, name: str, entry_src: str = _STUB_ENTRY,
                     STUB_ENTRY=entry.as_posix(), STUB_OUT=out.as_posix(),
                     STUB_REPO=ROOT.as_posix(), **env_extra)
     proc = subprocess.run(
-        [bash, (app / name).as_posix()], cwd=str(work), env=env,
+        [bash, (app / name).as_posix(), *args], cwd=str(work), env=env,
         capture_output=True, text=True, errors="replace", timeout=120,
         creationflags=_NO_WINDOW)
     return proc, out

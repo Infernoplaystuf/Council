@@ -18,20 +18,43 @@ REM
 REM  Usage:
 REM    run-windows.bat
 REM    run-windows.bat --tk                     :: the classic Tk UI
+REM    run-windows.bat --advanced               :: any other argument goes to the app
 REM    set COUNCIL_GGUF_PATH=C:\path\to\model.gguf && run-windows.bat
 REM    set COUNCIL_GGUF_GPU_LAYERS=0 && run-windows.bat   :: force CPU
 REM ============================================================
 
-setlocal enableextensions enabledelayedexpansion
+REM The arguments are read FIRST, with delayed expansion OFF, so a ! or ^ in
+REM one reaches the app as typed (the GGUF pick below explains what delayed
+REM expansion does to those).
+setlocal enableextensions disabledelayedexpansion
+
+REM --check and --tk are the launcher's own, wherever they are on the line.
+REM `run-windows.bat --check` resolves the env + reports GPU readiness, then
+REM exits WITHOUT launching - a quick "did my setup work?" command; --tk starts
+REM the classic Tk UI. Every OTHER argument is the app's (--advanced, ...) and
+REM is passed on, in order, as typed. They used to be dropped: only the first
+REM argument was looked at and the app was started with none, so
+REM `run-windows.bat --advanced` opened the default build.
+REM APP_ARGS is built WITHOUT quotes round the set, so a quoted argument keeps
+REM its quotes and a & or space inside them stays inside them. An empty ""
+REM argument ends the scan (cmd cannot tell it from the end of the line).
+REM shift /1 leaves %0 alone: %~dp0 below must still be this script's folder.
+set "CHECK_ONLY="
+set "APP_ARGS="
+:scan_args
+if "%~1"=="" goto :args_scanned
+if /i "%~1"=="--check" set "CHECK_ONLY=1" & goto :next_arg
+if /i "%~1"=="--tk" set "COUNCIL_UI=tk" & goto :next_arg
+set APP_ARGS=%APP_ARGS% %1
+:next_arg
+shift /1
+goto :scan_args
+:args_scanned
+
+setlocal enabledelayedexpansion
 
 set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
-
-REM `run-windows.bat --check` resolves the env + reports GPU readiness, then
-REM exits WITHOUT launching — a quick "did my setup work?" command.
-set "CHECK_ONLY="
-if /i "%~1"=="--check" set "CHECK_ONLY=1"
-if /i "%~1"=="--tk" set "COUNCIL_UI=tk"
 
 REM ── Resolve the Python interpreter ───────────────────────────
 REM Order: (0) .council_python marker written by setup_council.py, so
@@ -145,9 +168,11 @@ if "!COUNCIL_ENTRY!"=="council_qt.py" (
         set "COUNCIL_ENTRY=council_gui_engine.py"
     )
 )
-echo [run-windows] launching !COUNCIL_ENTRY! ...
+echo [run-windows] launching !COUNCIL_ENTRY!!APP_ARGS! ...
 
-"!PYEXE!" !COUNCIL_ENTRY!
+REM !APP_ARGS! is expanded LAST, after cmd has parsed the line, so what it
+REM holds - quotes, &, ^ - goes to the app as text, never as cmd syntax.
+"!PYEXE!" !COUNCIL_ENTRY! !APP_ARGS!
 set "EXIT=%ERRORLEVEL%"
 
 REM The parentheses in the Retrying echo are escaped with ^ because an
@@ -205,7 +230,7 @@ if not "%EXIT%"=="0" (
         echo [run-windows] That is a native crash while a GPU load was unconfirmed - most often a CUDA wheel / driver mismatch, or VRAM running out.
         echo [run-windows] Retrying once with COUNCIL_GGUF_GPU_LAYERS=0 ^(CPU only^)...
         set "COUNCIL_GGUF_GPU_LAYERS=0"
-        "!PYEXE!" !COUNCIL_ENTRY!
+        "!PYEXE!" !COUNCIL_ENTRY! !APP_ARGS!
         set "EXIT=!ERRORLEVEL!"
     )
     if defined CRASHED if not defined GPU_PENDING echo [run-windows] That is a native crash, but no GPU load was waiting to be confirmed, so the app is not reopened.
