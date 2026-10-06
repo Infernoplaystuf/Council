@@ -187,40 +187,173 @@ def test_the_splash_can_be_forced_either_way(monkeypatch, tmp_path):
 # Onboarding
 # ============================================================
 
-def test_a_fresh_vault_needs_onboarding(tmp_path, monkeypatch):
-    import onboarding
-    monkeypatch.setattr(onboarding, "needs_onboarding", lambda _v: True)
+# "Setup needed" means NO MODEL CAN ANSWER — not "the .onboarded marker is
+# missing". The marker is written only by the Tk wizard: setup.bat /
+# setup_council.py installs and Qt-first users never get one (so they were
+# told "Setup needed" with a model working), and a vault that has one but no
+# model left got no notice at all. These used to stub needs_onboarding, which
+# is exactly why they passed while the decision was wrong; they now build the
+# state on disk (and a FakeOllama on loopback) and let the real check decide.
+
+@pytest.fixture
+def nothing_configured(monkeypatch):
+    """No model exported, no backend override, the Ollama fallback off (the
+    sandbox's own default, restated so this file stands alone)."""
+    for var in ("COUNCIL_GGUF_PATH", "COUNCIL_GGUF_PATH_AUTO",
+                "COUNCIL_BACKEND", "COUNCIL_OLLAMA_MODEL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("COUNCIL_OLLAMA_FALLBACK", "0")
+    from tests.fake_ollama import refuse_egress
+    refuse_egress(monkeypatch)       # never the real Ollama, never off-box
+
+
+def _saved_model(vault: Path, path) -> None:
+    import json
+    vault.mkdir(parents=True, exist_ok=True)
+    (vault / "backend_settings.json").write_text(
+        json.dumps({"gguf_path": str(path)}), encoding="utf-8")
+
+
+def _slots(vault: Path, main: str) -> None:
+    import json
+    vault.mkdir(parents=True, exist_ok=True)
+    (vault / "model_slots.json").write_text(json.dumps(
+        {"version": 1, "slots": {"main": {"path": main}}}), encoding="utf-8")
+
+
+def _gguf(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"GGUF" + b"\0" * 64)
+    return path
+
+
+def test_a_fresh_vault_needs_setup(tmp_path, nothing_configured):
     decided = startup.plan(tmp_path)
     assert decided.onboarding
-    assert decided.onboarding_reason
+    assert decided.onboarding_reason == "no model is configured yet"
 
 
-def test_a_configured_vault_does_not(tmp_path, monkeypatch):
-    import onboarding
-    monkeypatch.setattr(onboarding, "needs_onboarding", lambda _v: False)
-    assert startup.plan(tmp_path).onboarding is False
+def test_an_onboarded_vault_with_no_model_still_needs_setup(
+        tmp_path, nothing_configured):
+    """The marker says someone finished the Tk wizard once. It does not say
+    a model is there now — the GGUF may have been deleted since."""
+    (tmp_path / ".onboarded").write_text('{"skipped": false}',
+                                         encoding="utf-8")
+    decided = startup.plan(tmp_path)
+    assert decided.onboarding, "a vault with the marker and no model said OK"
+
+
+def test_a_saved_model_that_loads_needs_no_setup_without_the_marker(
+        tmp_path, nothing_configured, monkeypatch):
+    """setup_council.py never writes .onboarded. A user it installed, with a
+    model saved in the app, was told "Setup needed" on every launch."""
+    from council_core import model_ready
+    # llama-cpp-python is not installed in the env these tests run in; this
+    # stands in for a machine where it is — the one thing not on disk here.
+    monkeypatch.setattr(model_ready, "gguf_loader_available", lambda: True)
+    _saved_model(tmp_path, _gguf(tmp_path / "models" / "granite.gguf"))
+    assert not (tmp_path / ".onboarded").exists()
+    decided = startup.plan(tmp_path)
+    assert decided.onboarding is False, decided.onboarding_reason
+
+
+def test_a_saved_model_that_is_gone_is_named(tmp_path, nothing_configured):
+    missing = tmp_path / "models" / "deleted.gguf"
+    _saved_model(tmp_path, missing)
+    decided = startup.plan(tmp_path)
+    assert decided.onboarding
+    assert "deleted.gguf" in decided.onboarding_reason
+
+
+def test_a_model_file_nothing_can_load_is_not_a_model(
+        tmp_path, nothing_configured, monkeypatch):
+    from council_core import model_ready
+    monkeypatch.setattr(model_ready, "gguf_loader_available", lambda: False)
+    _saved_model(tmp_path, _gguf(tmp_path / "models" / "granite.gguf"))
+    decided = startup.plan(tmp_path)
+    assert decided.onboarding
+    assert "llama-cpp-python" in decided.onboarding_reason
+
+
+def test_an_ollama_slot_the_server_has_needs_no_setup(
+        tmp_path, nothing_configured, monkeypatch):
+    from tests.fake_ollama import FakeOllama
+    with FakeOllama() as server:
+        monkeypatch.setenv("COUNCIL_OLLAMA_HOST", server.url)
+        _slots(tmp_path, "ollama:llama3.1:8b")
+        decided = startup.plan(tmp_path)
+        assert decided.onboarding is False, decided.onboarding_reason
+        # Metadata only: nothing was asked to generate.
+        assert not [r for r in server.state.requests if r[1] == "/api/chat"]
+
+
+def test_an_ollama_slot_the_server_lacks_is_named(
+        tmp_path, nothing_configured, monkeypatch):
+    from tests.fake_ollama import FakeOllama
+    with FakeOllama() as server:
+        monkeypatch.setenv("COUNCIL_OLLAMA_HOST", server.url)
+        _slots(tmp_path, "ollama:not-pulled:7b")
+        decided = startup.plan(tmp_path)
+        assert decided.onboarding
+        assert "not-pulled:7b" in decided.onboarding_reason
+
+
+def test_an_installed_ollama_model_counts_through_the_fallback(
+        tmp_path, nothing_configured, monkeypatch):
+    """Nothing configured in the app, but the engine answers from a localhost
+    Ollama when no GGUF can load — so an installed model is a usable one."""
+    from tests.fake_ollama import FakeOllama
+    with FakeOllama() as server:
+        monkeypatch.setenv("COUNCIL_OLLAMA_HOST", server.url)
+        monkeypatch.setenv("COUNCIL_OLLAMA_FALLBACK", "1")
+        decided = startup.plan(tmp_path)
+        assert decided.onboarding is False, decided.onboarding_reason
+
+
+def test_only_a_model_the_engine_would_pick_counts(
+        tmp_path, nothing_configured, monkeypatch):
+    """The engine's fallback never picks a non-US model, so a server holding
+    only one cannot answer — and the notice says why."""
+    from tests.fake_ollama import FakeOllama, tag
+    qwen = tag("qwen2.5:7b", size=4_683_087_332, family="qwen2",
+               params="7.6B", quant="Q4_K_M")
+    with FakeOllama(tags=[qwen]) as server:
+        monkeypatch.setenv("COUNCIL_OLLAMA_HOST", server.url)
+        monkeypatch.setenv("COUNCIL_OLLAMA_FALLBACK", "1")
+        decided = startup.plan(tmp_path)
+        assert decided.onboarding
+        assert "US-origin" in decided.onboarding_reason
 
 
 def test_a_vault_that_cannot_be_read_does_not_force_setup(tmp_path,
                                                           monkeypatch):
     """Showing the wizard because a path could not be read walks a configured
     user back through setup they already did."""
-    import onboarding
+    from council_core import model_ready
 
-    def _boom(_vault):
+    def _boom(_vault, **_kw):
         raise OSError("drive not ready")
 
-    monkeypatch.setattr(onboarding, "needs_onboarding", _boom)
+    monkeypatch.setattr(model_ready, "check", _boom)
     decided = startup.plan(tmp_path)
     assert decided.onboarding is False
     assert "could not check" in decided.onboarding_reason
 
 
 def test_a_broken_vault_does_not_stop_the_launch(tmp_path, monkeypatch):
-    import onboarding
+    from council_core import model_ready
 
-    def _boom(_vault):
+    def _boom(_vault, **_kw):
         raise OSError("drive not ready")
 
-    monkeypatch.setattr(onboarding, "needs_onboarding", _boom)
+    monkeypatch.setattr(model_ready, "check", _boom)
     startup.plan(tmp_path)          # must not raise
+
+
+def test_the_check_imports_no_toolkit_and_not_the_engine():
+    """It runs before the window exists, on every launch: importing the
+    engine there costs seconds."""
+    source = (ROOT / "council_core" / "model_ready.py").read_text(
+        encoding="utf-8")
+    for heavy in ("tkinter", "PySide6", "import council_engine"):
+        assert heavy not in source

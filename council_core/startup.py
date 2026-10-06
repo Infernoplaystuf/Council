@@ -122,17 +122,25 @@ def plan(vault_dir: Any, *, force_splash: Optional[bool] = None) -> Plan:
 def _onboarding_needed(vault_dir: Any) -> tuple:
     """(needed, reason). Never raises — a broken vault must not stop a launch.
 
+    NEEDED MEANS NO MODEL CAN ANSWER. This used to ask
+    onboarding.needs_onboarding, i.e. "is vault/.onboarded missing" — a marker
+    only the Tk wizard writes. setup_council.py installs and Qt-first users
+    never have one, so they were told "Setup needed" with a model working; a
+    vault that had one but no model left was told nothing. council_core.
+    model_ready asks the question the notice is for, the engine's way.
+
     A failure here reports "not needed" rather than "needed": showing the setup
     wizard because a path could not be read would walk a configured user back
     through setup they already did.
     """
     try:
-        import onboarding
-        if onboarding.needs_onboarding(Path(vault_dir)):
-            return True, "no model is configured yet"
+        from . import model_ready
+        ready = model_ready.check(Path(vault_dir))
     except Exception as exc:                     # noqa: BLE001
         return False, f"could not check: {exc!r}"
-    return False, ""
+    if ready.usable:
+        return False, ""
+    return True, ready.reason or "no model is configured yet"
 
 
 class Reveal:

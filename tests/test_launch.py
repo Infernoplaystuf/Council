@@ -176,33 +176,79 @@ def test_an_interactive_host_gets_no_splash_window(qapp, monkeypatch):
 # Onboarding
 # ============================================================
 
-def test_an_unconfigured_vault_is_reported_on_screen(qapp, monkeypatch):
+# "Setup needed" is decided by whether a model can answer
+# (council_core.model_ready), not by the Tk wizard's .onboarded marker. These
+# used to stub onboarding.needs_onboarding — which is why they passed while
+# the notice was wrong both ways — and now build the state on disk.
+
+@pytest.fixture
+def no_model(monkeypatch, tmp_path):
+    """Nothing that could answer: no exported or saved model, no backend
+    override, the Ollama fallback off (as the sandbox already has it)."""
+    for var in ("COUNCIL_GGUF_PATH", "COUNCIL_GGUF_PATH_AUTO",
+                "COUNCIL_BACKEND", "COUNCIL_OLLAMA_MODEL"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("COUNCIL_OLLAMA_FALLBACK", "0")
+    return tmp_path / "vault"
+
+
+def _status_of(window):
+    """FakeWindow records it; the real CouncilWindow shows it in a label."""
+    label = getattr(window, "_status", None)
+    return label.text() if label is not None else window.status
+
+
+def test_an_unconfigured_vault_is_reported_on_screen(qapp, no_model):
     """The wizard is Tk-only for now. A user left silently without a model gets
-    an app whose every answer is "no judge model is loaded", and no idea why."""
-    import onboarding
-    monkeypatch.setattr(onboarding, "needs_onboarding", lambda _v: True)
-    app, window, plan = build()
-    assert plan.onboarding
-    assert _pump_until(app, lambda: bool(window.status))
-    assert "Setup needed" in window.status
-    assert "Models tab" in window.status
+    an app whose every answer is "no judge model is loaded", and no idea why.
+
+    The real window, and a vault that HAS the Tk wizard's .onboarded marker:
+    the marker said "done", so this vault got no notice at all before."""
+    from council_qt.window import CouncilWindow
+    no_model.mkdir(parents=True, exist_ok=True)
+    (no_model / ".onboarded").write_text("{}", encoding="utf-8")
+    app, window, plan = build(window_factory=CouncilWindow)
+    try:
+        assert plan.onboarding
+        assert _pump_until(app, lambda: bool(_status_of(window)))
+        assert "Setup needed" in _status_of(window)
+        assert "Models tab" in _status_of(window)
+    finally:
+        window.request_close()
 
 
-def test_a_configured_vault_says_nothing(qapp, monkeypatch):
+def test_a_configured_vault_says_nothing(qapp, no_model, monkeypatch,
+                                         tmp_path):
     """A setup notice on an app that is already set up is noise, and noise is
-    what teaches people to ignore the status bar."""
-    import onboarding
-    monkeypatch.setattr(onboarding, "needs_onboarding", lambda _v: False)
-    app, window, _plan = build()
-    _pump_until(app, lambda: False, seconds=1.0)
-    assert window.status == ""
+    what teaches people to ignore the status bar.
+
+    The real window, a model saved in the app and NO .onboarded marker —
+    the setup_council.py install, which was told "Setup needed" every launch."""
+    import json
+
+    from council_core import model_ready
+    from council_qt.window import CouncilWindow
+    # llama-cpp-python is not installed where these tests run; this stands in
+    # for a machine where it is.
+    monkeypatch.setattr(model_ready, "gguf_loader_available", lambda: True)
+    model = tmp_path / "models" / "granite.gguf"
+    model.parent.mkdir(parents=True)
+    model.write_bytes(b"GGUF" + b"\0" * 64)
+    no_model.mkdir(parents=True, exist_ok=True)
+    (no_model / "backend_settings.json").write_text(
+        json.dumps({"gguf_path": str(model)}), encoding="utf-8")
+    app, window, plan = build(window_factory=CouncilWindow)
+    try:
+        assert not plan.onboarding, plan.onboarding_reason
+        _pump_until(app, lambda: False, seconds=1.0)
+        assert _status_of(window) == ""
+    finally:
+        window.request_close()
 
 
-def test_a_host_with_a_wizard_gets_to_use_it(qapp, monkeypatch):
+def test_a_host_with_a_wizard_gets_to_use_it(qapp, no_model):
     """The seam for the moment a Qt wizard exists: give the window an
     `open_onboarding` and it is called instead of the notice."""
-    import onboarding
-    monkeypatch.setattr(onboarding, "needs_onboarding", lambda _v: True)
     opened = []
 
     class WithWizard(FakeWindow):
@@ -214,7 +260,7 @@ def test_a_host_with_a_wizard_gets_to_use_it(qapp, monkeypatch):
     assert "vault_dir" in opened[0]
 
 
-def test_a_failing_wizard_is_reported_and_survived(qapp, monkeypatch, capsys):
+def test_a_failing_wizard_is_reported_and_survived(qapp, no_model, capsys):
     """An app that will not start because its optional setup wizard is unhappy
     has turned a nudge into a wall — but a wizard that fails SILENTLY leaves a
     user unconfigured with no idea why. So: reported, and not fatal.
@@ -223,9 +269,6 @@ def test_a_failing_wizard_is_reported_and_survived(qapp, monkeypatch, capsys):
     exception escaping a Qt slot does not disturb — so it passed with the
     handler deleted and proved nothing.
     """
-    import onboarding
-    monkeypatch.setattr(onboarding, "needs_onboarding", lambda _v: True)
-
     class Broken(FakeWindow):
         def open_onboarding(self, **_kwargs):
             raise RuntimeError("wizard is broken")
