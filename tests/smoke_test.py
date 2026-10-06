@@ -3150,7 +3150,8 @@ def test_workflow_chaining() -> None:
     saved_runner = wr._run_pipeline_subprocess
     recorded = []
 
-    def fake_run(staged_path, timeout_s=600):
+    def fake_run(staged_path, timeout_s=600, **_kw):
+        # **_kw: the runner now also passes cwd= (the run's output folder).
         src = staged_path.read_text(errors="replace")
         fin = re.search(r"file_path=([^,\)\n]+)", src)
         fout = re.search(r"export_file_path=([^,\)\n]+)", src)
@@ -3184,7 +3185,8 @@ def test_workflow_chaining() -> None:
 
             recorded.clear()
             res = wr.run_chained([p1, p2], root, scope="per_file",
-                                 pattern="*.dream3d")
+                                 pattern="*.dream3d",
+                                 output_dir=scratch / "out")
             _check("per-file chain succeeds", res.success, res.error or "")
             _check("2 files x 2 pipelines = 4 steps", res.steps_run == 4,
                    f"got {res.steps_run}")
@@ -3197,7 +3199,8 @@ def test_workflow_chaining() -> None:
 
             recorded.clear()
             res2 = wr.run_chained([p1, p2], root, scope="folder",
-                                  pattern="*.dream3d")
+                                  pattern="*.dream3d",
+                                  output_dir=scratch / "out2")
             _check("folder chain succeeds", res2.success, res2.error or "")
             _check("folder scope: P2 reads all of P1's outputs",
                    {i for n, i, o in recorded if "P2" in n}
@@ -3211,7 +3214,8 @@ def test_workflow_chaining() -> None:
                              "nx.SomeFilter.execute(data_structure=ds)\n",
                              encoding="utf-8")
             res3 = wr.run_chained([noout, p2], root, scope="per_file",
-                                  pattern="*.dream3d")
+                                  pattern="*.dream3d",
+                                  output_dir=scratch / "out3")
             _check("a non-final pipeline with no output param fails clearly",
                    not res3.success and "output" in (res3.error or "").lower())
         finally:

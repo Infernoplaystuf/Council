@@ -1,36 +1,47 @@
 """
-DREAM3D-NX end to end: the transpiler, the chained workflow runner and the
-capability policy, run against the REAL nx env when it is installed.
+DREAM3D-NX end to end: the script checker, the transpiler, the chained
+workflow runner and the capability policy, against the REAL installed build.
 
-Everything marked `needs_nx` uses the nxpython conda env (found the way the app
-finds it, nx_bridge.find_python) and the example pipelines the dream3dnx
-package ships under share/simplnx/pipelines, and SKIPS when either is missing.
-The rest is pure and always runs. No test needs a model.
+Two kinds of test:
 
-The xfail(strict=True) tests are KNOWN GAPS, measured 2026-10-06 on branch
-dream3d/e2e. Each asserts the behaviour the code should have, so it starts
-passing (and strict turns that into a failure to look at) the day the gap is
-fixed.
+  * Offline, against REAL_CATALOG — the installed build's catalog, saved by
+    tests/data/dream3d_e2e/make_catalog_fixture.py (its "fixture_note" says
+    which dream3dnx it came from). These always run: no nx env, no model.
+  * `needs_nx`: the nxpython conda env (found the way the app finds it,
+    nx_bridge.find_python) and the example pipelines the dream3dnx package
+    ships under share/simplnx/pipelines. They SKIP when either is missing.
+    One of them checks the saved catalog still IS the installed one.
+
+History: on 2026-10-06 five of these were strict xfails, each a gap measured
+on branch dream3d/e2e — write_script accepted made-up filters, validate()
+checked keys but not values, compound values were emitted as dicts, the
+workflow runner ran simplnx scripts without simplnx, and the worker could not
+load a pipeline using a plugin filter. They are fixed on dream3d/e2e-fixes and
+are plain tests now.
 """
 from __future__ import annotations
 
 import ast
-import importlib.util
 import json
 import shutil
 import struct
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 import nx_bridge
 import nx_generate
+import nx_ground
 import nx_policy
 import nx_transpile
+import pipeline_editor
 import workflow_runner as wr
 
 HELPERS = Path(__file__).resolve().parent / "data" / "dream3d_e2e"
+REAL_CATALOG = json.loads((HELPERS / "nx_catalog.json").read_text(
+    encoding="utf-8"))
 NXPY = nx_bridge.find_python()
 
 
@@ -52,8 +63,61 @@ needs_nx = pytest.mark.skipif(
            "pipelines")
 
 EXECUTE_PROCESS = "fb511a70-2175-4595-8c11-d1b5b6794221"
+CREATE_DATA_ARRAY = "67041f9b-bdc6-4122-acc6-c9fe9280e90d"
 P03 = "OrientationAnalysis/Small_IN100_Processing/(03) Small IN100 Morphological Statistics.d3dpipeline"
 P04 = "OrientationAnalysis/Small_IN100_Processing/(04) Small IN100 Crystallographic Statistics.d3dpipeline"
+
+# A script that uses every kind of value the checker types — DataPath, enum,
+# list[list[float]], a compound built by setting properties, a threshold set
+# holding a subclass, a positional-only constructor, a pathlib path, a plugin
+# filter — and that really runs (test_a_script_the_checker_accepts_runs).
+GOOD_SCRIPT = '''\
+import simplnx as nx
+import orientationanalysis as nxor
+import numpy as np
+from pathlib import Path
+
+ds = nx.DataStructure()
+out = nx.DataPath("Values")
+r0 = nx.CreateDataArrayFilter.execute(data_structure=ds,
+    numeric_type_index=nx.NumericType.float32, output_array_path=out,
+    tuple_dimensions=[[5]], component_count=1)
+assert not r0.errors, r0.errors
+view = ds[nx.DataPath("Values")].npview()
+view[:] = np.loadtxt("in.csv", delimiter=",").reshape(view.shape)
+v = nx.ReadCSVDataParameter()
+v.input_file_path = str(Path("t.csv").resolve())
+v.column_data_types = [nx.CSVType.float32, nx.CSVType.float32]
+v.header_mode = nx.ReadCSVDataParameter.HeaderMode.Line
+v.headers_line = 1
+v.start_import_row = 2
+v.tuple_dims = [2]
+v.delimiters = [","]
+v.skipped_array_mask = [False, False]
+r1 = nx.ReadCSVFileFilter.execute(data_structure=ds, read_csv_data_object=v,
+    created_data_group_path=nx.DataPath("CSV"))
+assert not r1.errors, r1.errors
+t = nx.ArrayThreshold()
+t.array_path = nx.DataPath("CSV/a")
+t.comparison = nx.ArrayThreshold.ComparisonType.GreaterThan
+t.value = 1.5
+ts = nx.ArrayThresholdSet()
+ts.thresholds = [t]
+r2 = nx.MultiThresholdObjectsFilter.execute(data_structure=ds,
+    array_thresholds_object=ts, created_mask_type=nx.DataType.uint8,
+    output_data_array_name="Mask")
+assert not r2.errors, r2.errors
+c = nx.CalculatorParameter.ValueType(nx.DataPath("CSV"), "a+b",
+    nx.CalculatorParameter.AngleUnits.Radians)
+r3 = nx.ArrayCalculatorFilter.execute(data_structure=ds, calculator_parameter=c,
+    calculated_array_path=nx.DataPath("CSV/sum"),
+    scalar_type_index=nx.NumericType.float64)
+assert not r3.errors, r3.errors
+r4 = nx.WriteDREAM3DFilter.execute(data_structure=ds,
+    export_file_path=Path("o.dream3d"), write_xdmf_file=False)
+assert not r4.errors, r4.errors
+print("wrote", Path("o.dream3d").exists(), nxor.ReadAngDataFilter.human_name())
+'''
 
 
 @pytest.fixture(scope="module")
@@ -91,8 +155,508 @@ def _transpiled(catalog, rel, dest: Path) -> Path:
     return dest
 
 
+def _uuid(attr: str) -> str:
+    return next(f["uuid"] for f in REAL_CATALOG["filters"]
+                if f["py_attr"] == attr)
+
+
 # ============================================================
-# Pure: the chain runner's parameter names (step 5)
+# Offline: the script checker against the REAL catalog (step 4)
+# ============================================================
+
+@pytest.mark.parametrize("code, expect", [
+    # Each is a failure class llama3.1:8b produced through "Write pipeline"
+    # (12 of 12 accepted, 0 of 12 ran), plus the value casts the binding
+    # refuses (each measured against the installed build).
+    ("ds = nx.DataStructure()\n",
+     "add `import simplnx as nx`"),
+    ("from simplnx import nx\nds = nx.DataStructure()\n",
+     "write `import simplnx as nx`"),
+    ("import simplnx as nx\nds = nx.DataStructure()\n"
+     "f = nx.CreateDataArrayFilter()\nf.execute(ds)\n",
+     "builds a filter object"),
+    ("import simplnx as nx\nds = nx.DataStructure()\n"
+     "ds.add_filter(nx.CreateDataArrayFilter)\n",
+     "has no attribute 'add_filter'"),
+    ("import simplnx as nx\nds = nx.DataStructure()\ng = nx.ImageGeometry(ds)\n",
+     "Nearest: ImageGeom"),
+    ("import simplnx as nx\nds = nx.DataStructure()\n"
+     "nx.CreateDataArrayFilter.execute(data_structure=ds, "
+     "numeric_type=nx.NumericType.int32)\n",
+     "Did you mean numeric_type_index"),
+    ("import simplnx as nx\nds = nx.DataStructure()\n"
+     "nx.CreateDataArrayFilter.execute(data_structure=ds, "
+     "output_array_path='Values')\n",
+     "wrap the string: nx.DataPath"),
+    ("import simplnx as nx\nds = nx.DataStructure()\n"
+     "nx.CreateDataArrayFilter.execute(data_structure=ds, numeric_type_index=8)\n",
+     "refuses a plain int"),
+    ("import simplnx as nx\nds = nx.DataStructure()\n"
+     "nx.CreateDataArrayFilter.execute(data_structure=ds, component_count=1.0)\n",
+     "is an int: write an int"),
+    ("import simplnx as nx\nds = nx.DataStructure()\n"
+     "nx.CreateDataArrayFilter.execute(data_structure=ds, tuple_dimensions=[5.0])\n",
+     "element 0"),
+    ("import simplnx as nx\nds = nx.DataStructure()\n"
+     "nx.CreateDataArrayFilter.execute(data_structure=ds, "
+     "numeric_type_index=nx.NumericType.float)\n",
+     "has no member 'float'"),
+    ("import simplnx as nx\nds = nx.DataStructure()\n"
+     "nx.ReadCSVFileFilter.execute(data_structure=ds, "
+     "read_csv_data_object={'input_file_path': 'a.csv'})\n",
+     "a dict is not converted"),
+    ("import simplnx as nx\nds = nx.DataStructure()\n"
+     "nx.ReadAngDataFilter.execute(data_structure=ds)\n",
+     "it is in orientationanalysis"),
+    ("import simplnx as nx\nnx.CreateDataArrayFilter.execute(component_count=1)\n",
+     "missing data_structure=ds"),
+    ("import simplnx as nx\nds = nx.DataStructure()\n"
+     "r = nx.CreateDataArrayFilter.execute(data_structure=ds)\nr.valid()\n",
+     "has no attribute 'valid'"),
+    ("import simplnx as nx\nds = nx.DataStructure()\n"
+     "r = nx.ReadDREAM3DFilter.execute(data_structure=ds, "
+     "import_data_object=nx.Dream3dImportParameter.ImportData("
+     "file_path='a.dream3d', data_paths=['A']))\n",
+     "element 0"),
+    ("import simplnx as nx\nv = nx.ReadCSVDataParameter()\nv.input_file = 'a'\n",
+     "has no attribute 'input_file'"),
+    ("import simplnx as nx\nc = nx.CalculatorParameter.ValueType()\n",
+     "does not take those arguments"),
+    # Three more that an accepted llama3.1:8b script died on at run time
+    # (re-run of 2026-10-06), each a way of losing the DataStructure.
+    ("import simplnx as nx\nds = nx.DataStructure()\n"
+     "ds[nx.DataPath('Grid')] = nx.CreateImageGeometryFilter.execute("
+     "data_structure=ds)\n",
+     "has no item assignment"),
+    ("import simplnx as nx\nds = nx.DataStructure()\n"
+     "ds = nx.CreateImageGeometryFilter.execute(data_structure=ds)\n"
+     "nx.WriteDREAM3DFilter.execute(data_structure=ds)\n",
+     "replaces the DataStructure with the filter's result"),
+    ("import simplnx as nx\nds = nx.DataStructure()\n"
+     "nx.InitializeImageGeomCellDataFilter.execute(data_structure=ds, "
+     "input_image_geometry_path=ds[nx.DataPath('Grid')])\n",
+     "the object stored at the path"),
+    # ...and two from a second re-run: an attribute of an execute() result
+    # held in a name reused for every filter, and an invented DataObject
+    # method on something read out of ds.
+    ("import simplnx as nx\nds = nx.DataStructure()\n"
+     "result = nx.CreateDataArrayFilter.execute(data_structure=ds)\n"
+     "result = nx.WriteDREAM3DFilter.execute(data_structure=ds)\n"
+     "x = result.data_structure\n",
+     "has no attribute 'data_structure'"),
+    ("import simplnx as nx\nds = nx.DataStructure()\n"
+     "geom = ds[nx.DataPath('Grid')]\ngeom.add_array('Counts')\n",
+     "no simplnx DataObject has an attribute 'add_array'"),
+    ("import simplnx as nx\nds = nx.DataStructure()\n"
+     "ds[nx.DataPath('Grid')].add_array('Counts')\n",
+     "no simplnx DataObject has an attribute 'add_array'"),
+])
+def test_check_script_catches_what_a_local_model_got_wrong(code, expect):
+    errs = nx_ground.check_script(code, REAL_CATALOG)["errors"]
+    assert any(expect in e for e in errs), errs
+
+
+def test_check_script_accepts_a_correct_script():
+    """No false positives on real usage of every value kind it types."""
+    assert nx_ground.check_script(GOOD_SCRIPT, REAL_CATALOG)["errors"] == []
+    assert nx_policy.validate_script(GOOD_SCRIPT)[0]
+
+
+def test_write_script_rejects_a_filter_the_catalog_does_not_have():
+    code = ("import simplnx as nx\nds = nx.DataStructure()\n"
+            "r = nx.TotallyMadeUpFilter.execute(data_structure=ds, bogus='x')\n")
+    res = nx_generate.write_script("create a data array", REAL_CATALOG,
+                                   lambda _p: code, max_attempts=1)
+    assert res["ok"] is False
+    assert any("TotallyMadeUpFilter does not exist" in e
+               for e in res["errors"]), res["errors"]
+
+
+def test_write_script_repairs_with_exact_names_and_real_signatures():
+    """The repair round carries the exact unknown names, the nearest real
+    ones and the real signature of the filter the model reached for — then
+    a corrected script is accepted."""
+    bad = ("import simplnx as nx\nds = nx.DataStructure()\n"
+           "r = nx.CreateDataArrayFilter.execute(data_structure=ds, "
+           "numeric_type=nx.NumericType.float32, output_array_path='Values')\n")
+    good = ("import simplnx as nx\nds = nx.DataStructure()\n"
+            "r = nx.CreateDataArrayFilter.execute(data_structure=ds, "
+            "numeric_type_index=nx.NumericType.float32, "
+            "output_array_path=nx.DataPath('Values'))\n"
+            "assert not r.errors, r.errors\n")
+    prompts = []
+
+    def model(p):
+        prompts.append(p)
+        return bad if len(prompts) == 1 else good
+    res = nx_generate.write_script("add a float32 array named Values",
+                                   REAL_CATALOG, model)
+    assert res["ok"] and res["attempts"] == 2, res["errors"]
+    repair = prompts[1]
+    assert "'numeric_type'" in repair and "numeric_type_index" in repair
+    assert "wrap the string: nx.DataPath" in repair
+    assert "YOUR SCRIPT" in repair and "output_array_path='Values'" in repair
+    assert "numeric_type_index: simplnx.NumericType" in repair
+
+
+def test_write_script_shows_real_signatures_of_an_invented_filters_neighbours():
+    bad = ("import simplnx as nx\nds = nx.DataStructure()\n"
+           "nx.CreateDataArayFilter.execute(data_structure=ds)\n")
+    prompts = []
+    nx_generate.write_script("compute feature sizes", REAL_CATALOG,
+                             lambda p: prompts.append(p) or bad,
+                             max_attempts=2)
+    assert "Nearest real filters: nx.CreateDataArrayFilter" in prompts[1]
+    assert "REAL FILTERS THE ERRORS POINT AT" in prompts[1]
+    assert "class: nx.CreateDataArrayFilter" in prompts[1]
+
+
+def test_script_prompt_states_the_imports_and_the_call_form():
+    cands = nx_generate.retrieve(
+        REAL_CATALOG, "read an ang file, then multi threshold objects")
+    p = nx_generate.build_script_prompt("x", cands, REAL_CATALOG)
+    assert "    import simplnx as nx" in p
+    assert "    import orientationanalysis as nxor" in p
+    assert "Never create a filter" in p
+    assert "a simplnx.ArrayThresholdSet -> a nx.ArrayThresholdSet object" in p
+    assert "a simplnx.ArrayThreshold -> " in p          # what goes inside it
+
+
+def test_retrieve_pins_the_reader_and_writer_the_request_names():
+    """ReadDREAM3DFilter ranked 13th and WriteDREAM3DFilter 16th for this
+    request, so k=12 dropped both and the model invented a reader."""
+    q = ("Read the DREAM3D file C:/x/a.dream3d. It has an image geometry "
+         "DataContainer with Cell Data/FeatureIds and a Cell Feature Data "
+         "attribute matrix. Compute the feature centroids and feature sizes, "
+         "then write the result to out.dream3d in the current folder.")
+    got = [e["py_attr"] for e in nx_generate.retrieve(REAL_CATALOG, q, k=12)]
+    assert got[:2] == ["ReadDREAM3DFilter", "WriteDREAM3DFilter"], got
+    got = [e["py_attr"] for e in nx_generate.retrieve(
+        REAL_CATALOG, "read every .dream3d and write an STL", k=12)]
+    assert got[:2] == ["ReadDREAM3DFilter", "WriteStlFileFilter"], got
+    for q in ("execute a process", "run an external program then write it"):
+        assert EXECUTE_PROCESS not in {
+            e["uuid"] for e in nx_generate.retrieve(REAL_CATALOG, q)}
+
+
+def test_a_long_vault_path_does_not_lose_a_validated_script(tmp_path,
+                                                           monkeypatch):
+    """task_<40-char stem>.py under a deep vault passed 260 characters on a
+    PC with LongPathsEnabled=0; the write raised and a script that had
+    passed every check was reported 'nx: failed' and lost."""
+    from council_core import nx_ops
+    vault = tmp_path / ("v" * 40) / ("w" * 40) / ("x" * 20) / "vault"
+    vault.mkdir(parents=True)
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(vault))
+    task = ("Read the DREAM3D file, compute the feature centroids and sizes, "
+            "then write out.dream3d")
+    folder = nx_ops.out_dir(vault) / nx_ops.SUBFOLDER
+    assert len(str(folder / f"task_{nx_ops.script_stem(task)}.py")) > 250
+
+    class Gen:
+        def write_script(self, task, catalog, model_call, n_ctx=None):
+            return {"ok": True, "code": "x = 1\n", "attempts": 1,
+                    "errors": []}
+
+    class Bridge:
+        def catalog(self):
+            return {"filters": [{"uuid": "u"}]}
+    try:
+        r = nx_ops.write_script(task, vault, generator=Gen(), bridge=Bridge())
+        assert r.ok and r.path is not None and r.path.exists(), r.body
+        assert len(str(r.path)) <= 250
+        # And when saving fails anyway, the script is shown, not lost.
+        monkeypatch.setattr(nx_ops, "safe_out_path",
+                            lambda *a, **k: (_ for _ in ()).throw(
+                                OSError("path too long")))
+        r = nx_ops.write_script(task, vault, generator=Gen(), bridge=Bridge())
+        assert r.ok and r.path is None and "x = 1" in r.body
+        assert "could not be saved" in r.body and "not saved" in r.status
+    finally:
+        nx_ops.invalidate_catalog(vault)
+
+
+# ============================================================
+# Offline: validate() values, the required-param check (honestly)
+# ============================================================
+
+def test_validate_rejects_a_value_of_the_wrong_type():
+    pipe = {"pipeline": [{
+        "filter": {"uuid": CREATE_DATA_ARRAY},
+        "args": {"numeric_type_index": "banana", "output_array_path": 12345,
+                 "component_count": {"value": 2.5, "version": 1}}}]}
+    errs = nx_generate.validate(pipe, REAL_CATALOG)
+    assert len(errs) == 3, errs
+    assert any("numeric_type_index" in e and "banana" in e for e in errs)
+    good = {"pipeline": [{
+        "filter": {"uuid": CREATE_DATA_ARRAY},
+        "args": {"numeric_type_index": 8, "output_array_path": "A/B",
+                 "component_count": 2, "tuple_dimensions": [[10.0]]}}]}
+    assert nx_generate.validate(good, REAL_CATALOG) == []
+
+
+def test_required_is_only_data_structure_and_the_script_check_enforces_it():
+    """Measured, not assumed: in the installed build every execute()
+    parameter but data_structure has a default. So validate()'s required
+    check (JSON never carries data_structure) cannot fire on this catalog —
+    its docstring says so — and the one real requirement is enforced where
+    it can be missed: a script calling execute() without data_structure."""
+    req = {p["name"] for f in REAL_CATALOG["filters"]
+           for p in f["execute"]["params"] if p["required"]}
+    assert req == {"data_structure"}
+    assert "cannot fire against the real catalog" in nx_generate.validate.__doc__
+    errs = nx_ground.check_script(
+        "import simplnx as nx\nnx.WriteDREAM3DFilter.execute("
+        "export_file_path='o.dream3d')\n", REAL_CATALOG)["errors"]
+    assert any("missing data_structure=ds" in e for e in errs)
+
+
+# ============================================================
+# Offline: compound values in the transpiler (step 3)
+# ============================================================
+
+def _one_step(attr, args):
+    return {"pipeline": [{"filter": {"uuid": _uuid(attr)}, "args": {
+        k: {"value": v, "version": 1} for k, v in args.items()}}]}
+
+
+def test_transpile_builds_compound_values_the_binding_accepts():
+    calc = nx_transpile.transpile(_one_step("ArrayCalculatorFilter", {
+        "calculator_parameter": {"equation": "a+a", "selected_group": "",
+                                 "units": 0}}), REAL_CATALOG)
+    assert ("nx.CalculatorParameter.ValueType(nx.DataPath(''), 'a+a', "
+            "nx.CalculatorParameter.AngleUnits.Radians)") in calc["code"]
+    csv = nx_transpile.transpile(_one_step("ReadCSVFileFilter", {
+        "read_csv_data_object": {
+            "Consecutive Delimiters": False, "Custom Headers": None,
+            "Data Types": [8, 9], "Delimiters": [","], "Header Line": 1,
+            "Header Mode": 0, "Input File Path": "Data/x.csv",
+            "Skipped Array Mask": [False, False], "Start Import Row": 2,
+            "Tuple Dimensions": [3]}}), REAL_CATALOG)
+    code = csv["code"]
+    assert "v0_read_csv_data_object = nx.ReadCSVDataParameter()" in code
+    assert ("v0_read_csv_data_object.column_data_types = "
+            "[nx.CSVType.float32, nx.CSVType.float64]") in code
+    assert "v0_read_csv_data_object.tuple_dims = [3]" in code
+    assert "read_csv_data_object=v0_read_csv_data_object," in code
+    thr = nx_transpile.transpile(_one_step("MultiThresholdObjectsFilter", {
+        "array_thresholds_object": {"inverted": False, "type": "collection",
+                                    "union": 0, "thresholds": [{
+                                        "array_path": "A/B", "comparison": 0,
+                                        "component_index": 0, "inverted": False,
+                                        "type": "array", "union": 0,
+                                        "value": 1.5}]}}), REAL_CATALOG)
+    assert "= nx.ArrayThreshold()" in thr["code"]
+    assert ".thresholds = [v0_array_thresholds_object_thresholds_0]" in \
+        thr["code"]
+    for res in (calc, csv, thr):
+        assert res["warnings"] == [], res["warnings"]
+        ast.parse(res["code"])
+        assert "{'" not in res["code"]                  # no dict literal left
+        assert nx_ground.check_script(res["code"], REAL_CATALOG)["errors"] == []
+
+
+def test_transpile_warns_on_a_compound_it_cannot_build():
+    res = nx_transpile.transpile(_one_step("ReadCSVFileFilter", {
+        "read_csv_data_object": {"Input File Path": "x.csv",
+                                 "Some Future Key": 1}}), REAL_CATALOG)
+    assert any("Some Future Key" in w for w in res["warnings"])
+    assert "# TODO: verify type" in res["code"]
+
+
+# ============================================================
+# Offline: the catalog cache is checked against python/version
+# ============================================================
+
+FP = {"python_exe": "C:/nx/python.exe",
+      "packages": {"python": "3.12.13-h0", "dream3dnx": "26.03.23-py312_0"}}
+
+
+def _cat(**kw):
+    c = {"catalog_schema": 2, "python": "3.12.13 | conda-forge",
+         "env": json.loads(json.dumps(FP)), "filters": [{"uuid": "u"}]}
+    c.update(kw)
+    return c
+
+
+@pytest.mark.parametrize("cat, why", [
+    (_cat(catalog_schema=1), "older version of this app"),
+    ({"python": "3.9.0 (fake)", "filters": [{"uuid": "u"}]}, "schema 1"),
+    (_cat(python="3.9.0 (default)"), "python 3.9.0"),
+    (_cat(env={"python_exe": "C:/nx/python.exe", "packages": {
+        "python": "3.12.13-h0", "dream3dnx": "25.01.01-py312_0"}}),
+     "dream3dnx 25.01.01-py312_0 -> 26.03.23-py312_0"),
+    (_cat(env=None), "does not record which nx env"),
+    ({"filters": []}, "empty"),
+])
+def test_a_stale_catalog_is_recognised(cat, why):
+    reason = nx_bridge.catalog_stale_reason(cat, fingerprint=FP)
+    assert reason and why in reason, reason
+    assert nx_bridge.catalog_stale_reason(_cat(), fingerprint=FP) is None
+
+
+def test_the_saved_catalog_is_rebuilt_when_the_env_changed(tmp_path,
+                                                           monkeypatch):
+    from council_core import nx_ops
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(vault))
+
+    class Bridge:
+        calls = 0
+
+        def catalog(self):
+            Bridge.calls += 1
+            return _cat(filters=[{"uuid": "fresh"}])
+
+        def catalog_stale_reason(self, cat):
+            return nx_bridge.catalog_stale_reason(cat, fingerprint=FP)
+    try:
+        # The verification's stale file: python 3.9.0, one fake filter.
+        path = nx_ops.safe_out_path(vault, nx_ops.CATALOG_FILE)
+        path.write_text(json.dumps({"python": "3.9.0 (fake)",
+                                    "filters": [{"uuid": "ghost"}]}),
+                        encoding="utf-8")
+        got = nx_ops.catalog(vault, bridge=Bridge())
+        assert got["filters"][0]["uuid"] == "fresh" and Bridge.calls == 1
+        assert "schema 1" in nx_ops.last_rebuild_reason[vault.resolve()]
+        # Fresh and matching: served from memory, then from disk, no rebuild.
+        assert nx_ops.catalog(vault, bridge=Bridge()) is got
+        nx_ops._catalog_mem.clear()
+        assert nx_ops.catalog(vault, bridge=Bridge())["filters"][0]["uuid"] \
+            == "fresh" and Bridge.calls == 1
+        # The env moves on (a dream3dnx upgrade): rebuilt without a button.
+        FP2 = json.loads(json.dumps(FP))
+        FP2["packages"]["dream3dnx"] = "26.09.01-py312_0"
+        Bridge.catalog_stale_reason = (
+            lambda self, cat: nx_bridge.catalog_stale_reason(
+                cat, fingerprint=FP2))
+        nx_ops.catalog(vault, bridge=Bridge())
+        assert Bridge.calls == 2
+    finally:
+        nx_ops.invalidate_catalog(vault)
+
+
+def test_env_fingerprint_reads_conda_meta_without_starting_python(tmp_path,
+                                                                  monkeypatch):
+    env = tmp_path / "envs" / "nxpython"
+    (env / "conda-meta").mkdir(parents=True)
+    (env / "python.exe").write_text("", encoding="utf-8")
+    for rec in ("python-3.12.13-h0_cpython", "python-dateutil-2.9.0-pyh_2",
+                "dream3dnx-26.03.23-py312_0", "numpy-2.5.1-py312_0"):
+        (env / "conda-meta" / f"{rec}.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setenv("COUNCIL_NX_PYTHON", str(env / "python.exe"))
+    fp = nx_bridge.env_fingerprint()
+    assert fp["packages"] == {"python": "3.12.13-h0_cpython",
+                              "dream3dnx": "26.03.23-py312_0"}
+
+
+# ============================================================
+# Offline: the capability policy's routes and gates (step 6)
+# ============================================================
+
+@pytest.mark.parametrize("code", [
+    # nx.get_filters() holds ExecuteProcessFilter (measured on the installed
+    # build); none of these names the denied class.
+    "import simplnx as nx\nnx.get_filters()[7].execute(data_structure=None)\n",
+    "import simplnx as nx\np = nx.Pipeline.from_file('x.d3dpipeline')\n",
+    "from simplnx import get_filters\n",
+    "import simplnx as nx\nnx.load_python_plugin(nx)\n",
+    "import simplnx as nx\nx = 'fb511a70-2175-4595-8c11-d1b5b6794221'\n",
+])
+def test_the_policy_refuses_routes_that_hide_which_filter_runs(code):
+    assert not nx_policy.validate_script(code)[0]
+    assert nx_policy.capability_reasons(code)
+
+
+@pytest.mark.parametrize("code", [
+    "import numpy as np\nnp.load('x.npy', allow_pickle=True)\n",
+    "import numpy as np\nnp.ctypeslib.load_library('x', '.')\n",
+    "import numpy.ctypeslib\n",
+])
+def test_the_script_gate_refuses_numpys_native_code_routes(code):
+    assert not nx_policy.validate_script(code)[0]
+
+
+def test_capability_check_leaves_a_users_own_imports_alone():
+    """The run-end check is the capability rule only: a user's script may
+    import os (their call), but may not reach Execute Process."""
+    assert nx_policy.capability_reasons("import os\nprint(os.getcwd())\n") == []
+    assert nx_policy.capability_reasons(
+        "import simplnx as nx\nnx.ExecuteProcessFilter.execute()\n")
+    assert nx_policy.capability_reasons("def (:\n")      # cannot vouch for it
+
+
+def test_the_workflow_runner_refuses_a_denied_filter_before_running(
+        tmp_path, monkeypatch):
+    def never(*_a, **_k):
+        raise AssertionError("nothing should have been launched")
+    monkeypatch.setattr(wr.subprocess, "run", never)
+    p = tmp_path / "evil.py"
+    p.write_text("import simplnx as nx\nds = nx.DataStructure()\n"
+                 "nx.ExecuteProcessFilter.execute(data_structure=ds, "
+                 "arguments='cmd /c echo hi')\n", encoding="utf-8")
+    res = wr.run_linear([p])
+    assert not res.success
+    assert "refused, nothing was run" in res.step_results[0].error
+
+
+def test_a_simplnx_script_runs_with_the_nx_interpreter(monkeypatch):
+    monkeypatch.setattr(nx_bridge, "find_python", lambda *a, **k: "C:/nx/py.exe")
+    import importlib.util as ilu
+    real = ilu.find_spec
+    monkeypatch.setattr(ilu, "find_spec",
+                        lambda n, *a, **k: None if n == "simplnx"
+                        else real(n, *a, **k))
+    assert wr.interpreter_for("import simplnx as nx\n") == ("C:/nx/py.exe",
+                                                            None)
+    assert wr.interpreter_for("from orientationanalysis import X\n")[0] == \
+        "C:/nx/py.exe"
+    assert wr.interpreter_for("import numpy\n") == (sys.executable, None)
+    monkeypatch.setattr(nx_bridge, "find_python", lambda *a, **k: None)
+    py, why = wr.interpreter_for("import simplnx\n")
+    assert py is None and "DREAM3D-NX env was not found" in why
+
+
+def test_pipeline_chat_create_is_grounded_and_gated(tmp_path):
+    """The chat's 'create pipeline' was a second, ungated model-writes-Python
+    path that saved a script naming ExecuteProcessFilter into pipelines/in.
+    It now goes through write_script."""
+    vault = tmp_path / "vault"
+    evil = ("import simplnx as nx\nds = nx.DataStructure()\n"
+            "nx.ExecuteProcessFilter.execute(data_structure=ds, arguments='x')\n")
+    path, log = pipeline_editor.generate_pipeline_from_description(
+        "create a data array, then run a process on it", vault,
+        suggested_name="s6probe",
+        model_call=lambda _p: evil, catalog=REAL_CATALOG)
+    assert path is None and "refused" in log and "ExecuteProcessFilter" in log
+    assert not list((vault / "pipelines" / "in").glob("*.py"))
+    made_up = ("import simplnx as nx\nds = nx.DataStructure()\n"
+               "nx.MakeArrayFilter.execute(data_structure=ds)\n")
+    path, log = pipeline_editor.generate_pipeline_from_description(
+        "create a data array", vault, model_call=lambda _p: made_up,
+        catalog=REAL_CATALOG)
+    assert path is None and "MakeArrayFilter does not exist" in log
+    good = ("import simplnx as nx\nds = nx.DataStructure()\n"
+            "r = nx.CreateDataArrayFilter.execute(data_structure=ds, "
+            "output_array_path=nx.DataPath('A'))\nassert not r.errors\n")
+    path, log = pipeline_editor.generate_pipeline_from_description(
+        "create a data array", vault, suggested_name="ok",
+        model_call=lambda _p: good, catalog=REAL_CATALOG)
+    assert path is not None and path.read_text(encoding="utf-8") == good.strip()
+
+
+def test_a_model_edit_may_not_add_a_denied_filter():
+    before = "import simplnx as nx\nimport os\nds = nx.DataStructure()\n"
+    after = before + "nx.ExecuteProcessFilter.execute(data_structure=ds)\n"
+    added = pipeline_editor._new_policy_reasons(before, after)
+    assert added and all("ExecuteProcessFilter" in r for r in added)
+    # What the user's script already did (import os) is not the edit's doing.
+    assert pipeline_editor._new_policy_reasons(before, before + "x = 1\n") == []
+
+
+# ============================================================
+# Offline: the workflow runner's parameter names and outputs (step 5)
 # ============================================================
 
 @pytest.mark.parametrize("param", [
@@ -132,6 +696,24 @@ def test_chain_stages_an_stl_readers_path(tmp_path):
     assert out_used == "export_file_path"
 
 
+def test_a_compound_property_path_is_staged_without_eating_the_next_lines(
+        tmp_path):
+    """A transpiled ReadCSV step holds its path in a property assignment;
+    the value scan used to run on past the newline."""
+    p = tmp_path / "p.py"
+    p.write_text("v0 = nx.ReadCSVDataParameter()\n"
+                 "v0.input_file_path = 'Data/baked.csv'\n"
+                 "v0.tuple_dims = [3]\n"
+                 "r0 = nx.ReadCSVFileFilter.execute(data_structure=ds, "
+                 "read_csv_data_object=v0)\n", encoding="utf-8")
+    staged, _ = wr._stage_chain_pipeline(p, tmp_path, dest_name="s.py",
+                                         input_value=tmp_path / "x.csv")
+    txt = staged.read_text(encoding="utf-8")
+    assert f"v0.input_file_path = {str(tmp_path / 'x.csv')!r}\n" in txt
+    assert "v0.tuple_dims = [3]\n" in txt
+    ast.parse(txt)
+
+
 def test_chain_refuses_a_reader_it_cannot_point_at_the_input(tmp_path,
                                                             monkeypatch):
     """An unrecognised reader parameter used to be staged with its baked-in
@@ -149,60 +731,103 @@ def test_chain_refuses_a_reader_it_cannot_point_at_the_input(tmp_path,
     inp.mkdir()
     (inp / "a.dat").write_text("x", encoding="utf-8")
     res = wr.run_chained([p, p], inp, pattern="*.dat",
-                         stage_dir=tmp_path / "st")
+                         stage_dir=tmp_path / "st", output_dir=tmp_path / "o")
     assert not res.success
     assert "input-path parameter" in res.error and "a.dat" in res.error
 
 
+@pytest.mark.parametrize("run", [wr.run_per_file, wr.run_per_step])
+def test_per_file_and_per_step_refuse_an_input_they_cannot_redirect(
+        run, tmp_path, monkeypatch):
+    """They copied such a script as-is and ran it: every input read the
+    same baked file."""
+    def never(*_a, **_k):
+        raise AssertionError("nothing should have been run")
+    monkeypatch.setattr(wr, "_run_pipeline_subprocess", never)
+    p = tmp_path / "p.py"
+    p.write_text("r0 = nx.SomeNewReaderFilter.execute(data_structure=ds, "
+                 "some_new_path='Data/baked.dat')\n", encoding="utf-8")
+    inp = tmp_path / "in"
+    inp.mkdir()
+    (inp / "a.dat").write_text("x", encoding="utf-8")
+    res = run([p], inp, pattern="*.dat", output_dir=tmp_path / "o")
+    assert not res.success and "a.dat" in res.error
+
+
+@pytest.mark.parametrize("mode", ["chained", "per_file", "per_step"])
+def test_every_input_gets_its_own_output(mode, tmp_path, monkeypatch):
+    """The final output used to keep the script's baked path (resolved
+    against wherever the app was started): two inputs, one surviving file,
+    outside the vault's output area."""
+    ran = []
+
+    def fake(staged, timeout_s=600, cwd=None):
+        src = staged.read_text(encoding="utf-8")
+        out = ast.literal_eval(src.split("export_file_path=", 1)[1]
+                               .split(",")[0].split(")")[0])
+        ran.append((staged.name, out, cwd))
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        Path(out).write_text("x", encoding="utf-8")
+        return wr.StepResult(-1, staged.name, "", True, 0, 0.0, "", "",
+                             pipeline_path=staged)
+    monkeypatch.setattr(wr, "_run_pipeline_subprocess", fake)
+    script = ("import simplnx as nx\nds = nx.DataStructure()\n"
+              "r0 = nx.ReadDREAM3DFilter.execute(data_structure=ds, "
+              "import_data_object=nx.Dream3dImportParameter.ImportData("
+              "file_path='baked_in.dream3d'))\n"
+              "r1 = nx.WriteDREAM3DFilter.execute(data_structure=ds, "
+              "export_file_path='Data/Output/baked.stl')\n")
+    p1, p2 = tmp_path / "P1.py", tmp_path / "P2.py"
+    p1.write_text(script, encoding="utf-8")
+    p2.write_text(script, encoding="utf-8")
+    inp = tmp_path / "in"
+    inp.mkdir()
+    for n in ("a", "b"):
+        (inp / f"{n}.dream3d").write_text("d", encoding="utf-8")
+    out = tmp_path / "vault_out"
+    spec = wr.WorkflowSpec([p1, p2], mode=mode, input_dir=inp,
+                           pattern="*.dream3d", output_dir=out)
+    res = wr.run_workflow(spec)
+    assert res.success, res.summary()
+    assert all("baked" not in o for _n, o, _c in ran)
+    assert all(c == out for _n, _o, c in ran)
+    finals = sorted(o.relative_to(out).as_posix() for o in res.outputs)
+    if mode == "chained":
+        assert finals == ["a.stl", "b.stl"]           # the baked suffix kept
+    else:
+        assert finals == ["P1/a.stl", "P1/b.stl", "P2/a.stl", "P2/b.stl"]
+    assert all(o.exists() for o in res.outputs)
+    assert "outputs (" in res.summary()
+
+
 # ============================================================
-# Pure: known gaps in the generators (offline, tiny catalogs)
+# Real env: the saved catalog is the installed one
 # ============================================================
 
-def _mini_catalog():
-    return {"filters": [{
-        "module": "simplnx", "alias": "nx", "py_attr": "CreateDataArrayFilter",
-        "uuid": "67041f9b-bdc6-4122-acc6-c9fe9280e90d",
-        "human_name": "Create Data Array", "default_tags": ["create", "array"],
-        "execute": {"params": [
-            {"name": "data_structure", "type": "simplnx.DataStructure"},
-            {"name": "numeric_type_index", "type": "simplnx.NumericType",
-             "default": "<NumericType.float32: 8>", "required": False},
-            {"name": "output_array_path", "type": "simplnx.DataPath",
-             "default": "DataPath('Data')", "required": False}]}},
-        {"module": "simplnx", "alias": "nx", "py_attr": "ArrayCalculatorFilter",
-         "uuid": "eea49b17-0db2-5bbc-80ef-f44249cc8d55",
-         "human_name": "Attribute Array Calculator", "default_tags": [],
-         "execute": {"params": [
-             {"name": "data_structure", "type": "simplnx.DataStructure"},
-             {"name": "calculator_parameter",
-              "type": "simplnx.CalculatorParameter.ValueType",
-              "default": "<simplnx.CalculatorParameter.ValueType object>",
-              "required": False}]}}],
-        "enums": {}}
+@needs_nx
+def test_the_saved_catalog_is_the_installed_catalog(catalog):
+    def sig(cat):
+        return {(f["module"], f["py_attr"], f["uuid"]): [
+            (p["name"], p["type"], p["required"])
+            for p in f["execute"]["params"]] for f in cat["filters"]}
+    assert sig(REAL_CATALOG) == sig(catalog), (
+        "the installed DREAM3D-NX changed: rerun "
+        "tests/data/dream3d_e2e/make_catalog_fixture.py")
+    assert REAL_CATALOG["classes"] == catalog["classes"]
+    assert REAL_CATALOG["module_names"] == catalog["module_names"]
+    assert nx_bridge.catalog_stale_reason(catalog) is None
 
 
-def test_write_script_rejects_a_filter_the_catalog_does_not_have():
-    code = ("import simplnx as nx\nds = nx.DataStructure()\n"
-            "r = nx.TotallyMadeUpFilter.execute(data_structure=ds, bogus='x')\n")
-    res = nx_generate.write_script("create an array", _mini_catalog(),
-                                   lambda _p: code, max_attempts=1)
-    assert res["ok"] is False
-
-
-def test_validate_rejects_a_value_of_the_wrong_type():
-    pipe = {"pipeline": [{
-        "filter": {"uuid": "67041f9b-bdc6-4122-acc6-c9fe9280e90d"},
-        "args": {"numeric_type_index": "banana", "output_array_path": 12345}}]}
-    assert nx_generate.validate(pipe, _mini_catalog())
-
-
-def test_transpile_flags_or_types_a_compound_value():
-    pipe = {"pipeline": [{
-        "filter": {"uuid": "eea49b17-0db2-5bbc-80ef-f44249cc8d55"},
-        "args": {"calculator_parameter": {"value": {
-            "equation": "a+a", "selected_group": "", "units": 0}, "version": 1}}}]}
-    res = nx_transpile.transpile(pipe, _mini_catalog())
-    assert "CalculatorParameter.ValueType(" in res["code"] or res["warnings"]
+@needs_nx
+def test_a_script_the_checker_accepts_runs(tmp_path):
+    (tmp_path / "in.csv").write_text("1\n2\n3\n4\n5\n", encoding="utf-8")
+    (tmp_path / "t.csv").write_text("a,b\n1,2\n3,4\n", encoding="utf-8")
+    (tmp_path / "good.py").write_text(GOOD_SCRIPT, encoding="utf-8")
+    proc = subprocess.run([NXPY, "good.py"], cwd=tmp_path, capture_output=True,
+                          text=True, encoding="utf-8", errors="replace",
+                          timeout=300)
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    assert "wrote True" in proc.stdout
 
 
 # ============================================================
@@ -219,6 +844,56 @@ def test_every_shipped_pipeline_transpiles_to_valid_python(catalog):
         ast.parse(res["code"])
         assert "parameters_version" not in res["code"]
         assert "'version':" not in res["code"], p.name   # envelopes unwrapped
+        assert not [w for w in res["warnings"] if "could not type" in w], (
+            p.name, res["warnings"])
+
+
+@needs_nx
+def test_the_checker_accepts_every_transpiled_shipped_pipeline():
+    """No false positives: 67 real pipelines' worth of simplnx calls, every
+    compound value included, pass both the script checker and the policy
+    gate (which the workflow runner now applies at run time)."""
+    for p in sorted(SHIPPED.rglob("*.d3dpipeline")):
+        code = nx_transpile.transpile(p, REAL_CATALOG)["code"]
+        assert nx_ground.check_script(code, REAL_CATALOG)["errors"] == [], \
+            p.name
+        assert nx_policy.validate_script(code)[0], p.name
+
+
+@needs_nx
+def test_transpiled_arguments_are_what_simplnx_itself_loads(catalog,
+                                                            tmp_path):
+    """Every argument of every shipped pipeline, compound ones included,
+    compared with simplnx's own Pipeline.from_file — without running a
+    filter, so without the data the package does not ship. 26 of these
+    pipelines died on 'Unable to cast ... dict' before."""
+    pairs = []
+    for i, p in enumerate(sorted(SHIPPED.rglob("*.d3dpipeline"))):
+        dest = tmp_path / f"p{i:02d}.py"
+        dest.write_text(nx_transpile.transpile(p, catalog)["code"],
+                        encoding="utf-8")
+        pairs += [p, dest]
+    proc = subprocess.run([NXPY, HELPERS / "nx_args_equiv.py", *pairs],
+                          capture_output=True, text=True, encoding="utf-8",
+                          errors="replace", timeout=600)
+    assert proc.returncode == 0, proc.stderr[-1500:]
+    reps = [json.loads(ln) for ln in proc.stdout.splitlines()
+            if ln.startswith("{")]
+    assert len(reps) == len(pairs) // 2
+    assert [r for r in reps if r["error"] or r["different"]] == []
+    assert sum(r["compared"] for r in reps) > 3000
+
+
+@needs_nx
+def test_a_transpiled_compound_pipeline_runs(catalog, tmp_path):
+    """ArrayCalculatorExample needs no input data and carries a
+    CalculatorParameter: it died with 'Unable to cast ... dict'."""
+    script = _transpiled(catalog, "SimplnxCore/ArrayCalculatorExample.d3dpipeline",
+                         tmp_path / "calc.py")
+    proc = subprocess.run([NXPY, script], cwd=tmp_path, capture_output=True,
+                          text=True, encoding="utf-8", errors="replace",
+                          timeout=300)
+    assert proc.returncode == 0, proc.stderr[-1500:]
 
 
 @needs_nx
@@ -240,22 +915,13 @@ def test_transpiled_pipeline_computes_what_simplnx_computes(catalog, seeds,
 
 @pytest.fixture
 def chain(catalog, seeds, tmp_path, monkeypatch):
-    """P1 = transpiled (03), P2 = transpiled (04) with its final writer pointed
-    at final.dream3d; inputs a/b.dream3d; scripts run with the nx interpreter.
-
-    The interpreter is patched because workflow_runner runs every pipeline
-    with sys.executable -- the app's own env, which has no simplnx (see the
-    xfail below)."""
+    """P1 = transpiled (03), P2 = transpiled (04); inputs a/b.dream3d. The
+    scripts run with whatever interpreter the runner picks (the nx env's —
+    the app's has no simplnx)."""
     p1 = _transpiled(catalog, P03, tmp_path / "P1.py")
     p2 = _transpiled(catalog, P04, tmp_path / "P2.py")
-    src = p2.read_text(encoding="utf-8")
-    baked = "'Data/Output/Statistics/SmallIN100_CrystalStats.dream3d'"
-    assert baked in src
-    p2.write_text(src.replace(baked, repr(str(tmp_path / "final.dream3d"))),
-                  encoding="utf-8")
     inp = tmp_path / "in"
     shutil.copytree(seeds, inp)
-    monkeypatch.setattr(wr.sys, "executable", NXPY)
     monkeypatch.chdir(tmp_path)
     return p1, p2, inp, tmp_path
 
@@ -265,8 +931,9 @@ def chain(catalog, seeds, tmp_path, monkeypatch):
 def test_chain_feeds_p1s_staged_output_to_p2(chain, scope):
     p1, p2, inp, tmp = chain
     stage = tmp / f"st_{scope}"
+    out = tmp / f"out_{scope}"
     res = wr.run_chained([p1, p2], inp, scope=scope, pattern="*.dream3d",
-                         stage_dir=stage, timeout_s=300)
+                         stage_dir=stage, output_dir=out, timeout_s=300)
     assert res.success, res.summary()
     assert res.steps_run == 4
     staged_out = {str(p) for p in stage.rglob("*.dream3d")}
@@ -276,10 +943,15 @@ def test_chain_feeds_p1s_staged_output_to_p2(chain, scope):
         lit = f.read_text(encoding="utf-8").split("file_path=", 1)[1].split(",")[0]
         p2_reads.add(ast.literal_eval(lit))
     assert p2_reads == staged_out                 # P2 read exactly P1's outputs
-    rep = _nx([HELPERS / "nx_probe.py", tmp / "final.dream3d"])
-    rec = rep[str(tmp / "final.dream3d")]
-    assert rec["errors"] == []
-    assert all(rec["has"].values()), rec["has"]   # (03)'s AND (04)'s arrays
+    # One final file PER INPUT, in output_dir — not one baked path that the
+    # second input overwrote.
+    assert sorted(o.name for o in res.outputs) == ["a.dream3d", "b.dream3d"]
+    assert not (tmp / "Data").exists()
+    rep = _nx([HELPERS / "nx_probe.py", *res.outputs])
+    for o in res.outputs:
+        rec = rep[str(o)]
+        assert rec["errors"] == []
+        assert all(rec["has"].values()), rec["has"]   # (03)'s AND (04)'s arrays
 
 
 @needs_nx
@@ -319,16 +991,15 @@ def test_chain_reads_each_stl_input_not_the_baked_path(catalog, tmp_path,
              "data_paths": [], "file_path": "in.dream3d",
              "path_import_policy": 0}, "version": 2}}},
         {"filter": {"uuid": uuid["WriteDREAM3DFilter"]},
-         "args": {"export_file_path": {"value": str(tmp_path / "q.dream3d"),
-                                       "version": 1},
+         "args": {"export_file_path": {"value": "q.dream3d", "version": 1},
                   "write_xdmf_file": {"value": False, "version": 1}}}]}, catalog)
     p2 = tmp_path / "Q2.py"
     p2.write_text(passthru["code"], encoding="utf-8")
-    monkeypatch.setattr(wr.sys, "executable", NXPY)
     monkeypatch.chdir(tmp_path)
     stage = tmp_path / "st"
     res = wr.run_chained([p1, p2], inp, scope="per_file", pattern="*.stl",
-                         stage_dir=stage, timeout_s=300)
+                         stage_dir=stage, output_dir=tmp_path / "o",
+                         timeout_s=300)
     assert res.success, res.summary()
     outs = sorted(stage.rglob("*_step1.dream3d"))
     rep = _nx([HELPERS / "nx_probe.py", *outs])
@@ -337,18 +1008,15 @@ def test_chain_reads_each_stl_input_not_the_baked_path(catalog, tmp_path,
 
 
 @needs_nx
-@pytest.mark.xfail(importlib.util.find_spec("simplnx") is None, strict=True,
-                   reason=(
-    "KNOWN GAP: workflow_runner runs every pipeline with sys.executable. The "
-    "app's env has no simplnx (it lives in the separate nx env by design), so "
-    "every linear/per-file/per-step/chained run of a simplnx script dies with "
-    "ModuleNotFoundError: No module named 'simplnx'."))
 def test_chain_runs_simplnx_scripts_with_an_interpreter_that_has_simplnx(
         catalog, seeds, tmp_path, monkeypatch):
+    """As shipped every simplnx workflow died with 'No module named simplnx':
+    the runner used sys.executable, the app's env."""
     p1 = _transpiled(catalog, P03, tmp_path / "P1.py")
     monkeypatch.chdir(tmp_path)
     res = wr.run_chained([p1], seeds, scope="per_file", pattern="a.dream3d",
-                         stage_dir=tmp_path / "st", timeout_s=300)
+                         stage_dir=tmp_path / "st", output_dir=tmp_path / "o",
+                         timeout_s=300)
     assert res.success, res.summary()
 
 
@@ -357,9 +1025,17 @@ def test_chain_runs_simplnx_scripts_with_an_interpreter_that_has_simplnx(
 # ============================================================
 
 @needs_nx
-def test_worker_loads_a_pipeline_that_uses_plugin_filters():
+def test_worker_loads_a_pipeline_that_uses_plugin_filters(seeds, tmp_path):
+    """It imported simplnx only, so every pipeline naming an
+    OrientationAnalysis / ITKImageProcessing filter failed to load."""
     d = nx_bridge.describe_pipeline(SHIPPED / P03)
     assert d["size"] == 10
+    vault = tmp_path / "vault"
+    out = vault / "data_out" / "dream3d" / "runs"
+    res = nx_bridge.run_folder(SHIPPED / P03, seeds, out, glob="*.dream3d",
+                               vault_dir=vault)
+    assert (res["total"], res["ok"]) == (2, 2), res
+    assert all(Path(r["write_set"]["dest"]).exists() for r in res["runs"])
 
 
 # ============================================================

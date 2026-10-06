@@ -83,10 +83,16 @@ def _find_filter_call_nodes(source: str) -> List[Tuple[int, str, ast.Call]]:
     return out
 
 
-def _value_text_end(call_text: str, start: int) -> int:
+def _value_text_end(call_text: str, start: int, *,
+                    stop_at_newline: bool = False) -> int:
     """Given `call_text` and `start` pointing just after `param=`, return the
     index where the value expression ends (the next top-level comma or close
-    paren). Honors brackets/braces/parens/string literals."""
+    paren). Honors brackets/braces/parens/string literals.
+
+    ``stop_at_newline`` also ends it at a newline outside any bracket — the
+    end of an assignment STATEMENT (`v.input_file_path = 'a.csv'`), which has
+    no comma or paren after it. Without it the scan ran on into the
+    following lines up to the next top-level comma."""
     depth = 0
     in_str: Optional[str] = None
     escape = False
@@ -110,6 +116,11 @@ def _value_text_end(call_text: str, start: int) -> int:
                 return i
             depth -= 1
         elif c == "," and depth == 0:
+            return i
+        elif c in "\r\n#" and depth == 0 and stop_at_newline:
+            # A comment ends the statement too; strip the spaces before it.
+            while i > start and call_text[i - 1] in " \t":
+                i -= 1
             return i
         i += 1
     return n

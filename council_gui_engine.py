@@ -8964,6 +8964,18 @@ class CouncilConsole(tk.Tk):
 
         import workflow_runner as _wr
         spec = _wr.parse_workflow_request(single_line, VAULT_DIR)
+        if spec.mode != "linear":
+            # Each input's results land in the vault's output area, one file
+            # per input — not at the path baked into the last script,
+            # resolved against wherever the app was started.
+            try:
+                import data_index as _di
+                import time as _time
+                spec.output_dir = (Path(_di.output_dir(VAULT_DIR))
+                                   / "workflows"
+                                   / _time.strftime("%Y%m%d_%H%M%S"))
+            except Exception:
+                spec.output_dir = None
         if not spec.pipeline_paths:
             self._append_transcript(
                 "Writer",
