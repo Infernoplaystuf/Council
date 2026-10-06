@@ -23,12 +23,15 @@ vault had no data_in/ — the folder every message about adding data points at.
 So the logic lives here, unchanged, and both call it: the Tk module and console
 through the same names they always used, council_qt.launch before the window.
 
-NOTHING HERE IS NEW BEHAVIOUR
+NOTHING HERE IS NEW BEHAVIOUR, WITH ONE EXCEPTION
 The move list, the "never overwrite what the vault already has" rule, and
 COUNCIL_SKIP_PATH_MIGRATION (which tests/sandbox_vault.py sets, because the
 test vault is deleted at the end of a run and a migration into it MOVED the
 user's legacy files there — measured in a scratch home) are the Tk ones,
-moved. The data-folder steps call data_index exactly as the console did.
+moved. The data-folder steps follow data_index as the console did, except
+that the loose-file copy skips the app's own vault-root state
+(VAULT_ROOT_STATE): it used to file backend_settings.json, model_slots.json
+and the vault indices in data_in/ as the user's datasets — in both shells.
 """
 from __future__ import annotations
 
@@ -147,12 +150,115 @@ class DataDirs:
     problems: List[str] = field(default_factory=list)
 
 
+#: App state the app writes to the vault ROOT, beside the user's loose data,
+#: that data_index's own skip list (_APP_INTERNAL_FILENAMES) does not name.
+#: FOUND IN REVIEW: one Qt launch copied backend_settings.json (the GGUF path),
+#: model_slots.json, vault_index.json and vault_embeddings.json into data_in/,
+#: and the data index then offered them as the user's datasets — every user
+#: who sets a model. Tk did the same through the same call; the real vault
+#: here has data_in/vault_index.json and semantic_cache.json from it.
+#: data_index.py is another branch's to change, so the extra names live here
+#: until its list is extended. Each one checked to be written at the root.
+VAULT_ROOT_STATE = frozenset({
+    "backend_settings.json",      # onboarding / engine settings
+    "model_slots.json",           # council_core.model_slots
+    "model_bench.json",           # council_core.pc_check
+    "vault_index.json",           # vault_index.INDEX_FILENAME
+    "vault_embeddings.json",      # vault_embeddings.EMBEDDINGS_FILENAME
+    "semantic_cache.json",        # vault_index.SEMANTIC_CACHE_FILENAME
+    "fuzzy_denylist.json",        # vault_index.DENYLIST_FILENAME
+    "graph_presets.json",         # the Grapher's presets
+})
+
+
+def app_state_names() -> frozenset:
+    """Every basename at the vault root that is the app's, not the user's:
+    VAULT_ROOT_STATE, data_index's skip list, and
+    conversation_logger.PROTECTED_STATE_FILES — the list the vault search
+    already treats as app state (vault_index reads it the same way), so a
+    name added there is never copied in as data either. Lower-cased."""
+    names = set(VAULT_ROOT_STATE)
+    try:
+        import data_index
+        names |= set(getattr(data_index, "_APP_INTERNAL_FILENAMES", ()))
+    except Exception:                                     # noqa: BLE001
+        pass
+    try:
+        from conversation_logger import PROTECTED_STATE_FILES
+        names |= set(PROTECTED_STATE_FILES)
+    except Exception:                                     # noqa: BLE001
+        pass
+    return frozenset(name.lower() for name in names)
+
+
+def copy_loose_data_files(vault_dir: Path) -> List[Path]:
+    """data_index.migrate_loose_vault_files' rule — CSV/TSV/JSON files at
+    the vault root (not in a subfolder) copied into data_in/, the originals
+    kept, nothing in data_in/ overwritten — skipping app_state_names().
+    Returns the root files copied. Written out here rather than called
+    because that function has no way to be told about more names."""
+    import data_index
+
+    vault = Path(vault_dir)
+    if not vault.is_dir():
+        return []
+    skip = app_state_names()
+    target = data_index.input_dir(vault)
+    target.mkdir(parents=True, exist_ok=True)
+    copied: List[Path] = []
+    for path in sorted(vault.iterdir()):
+        if (not path.is_file()
+                or path.suffix.lower() not in (".csv", ".tsv", ".json")
+                or path.name.lower() in skip):
+            continue
+        dest = target / path.name
+        if dest.exists():
+            continue                     # never overwrite what is in data_in/
+        try:
+            shutil.copy2(path, dest)
+            copied.append(path)
+        except Exception:                                 # noqa: BLE001
+            pass
+    return copied
+
+
+def remove_state_copies(vault_dir: Path) -> List[Path]:
+    """Take out a copy of a VAULT_ROOT_STATE file that an earlier start put
+    in data_in/ — ONLY when it is byte-identical to the app's file still at
+    the root, data_index.cleanup_misplaced_internals' proof. A data_in/ file
+    of that name with other content is the user's, and is kept."""
+    import filecmp
+
+    import data_index
+
+    vault = Path(vault_dir)
+    folder = data_index.input_dir(vault)
+    removed: List[Path] = []
+    if not folder.is_dir():
+        return removed
+    for name in sorted(VAULT_ROOT_STATE):
+        copy, original = folder / name, vault / name
+        if not copy.is_file() or not original.is_file():
+            continue
+        try:
+            if filecmp.cmp(copy, original, shallow=False):
+                copy.unlink()
+                removed.append(copy)
+        except Exception:                                 # noqa: BLE001
+            pass
+    return removed
+
+
 def prepare_data_dirs(vault_dir: Path,
                       log: Optional[LogFn] = None) -> DataDirs:
     """data_in/ and data_out/ with their READMEs, the stray-config sweep, and
     the copy of loose root data files into data_in/ — CouncilConsole.__init__'s
     three steps, in its order, with its log lines. Each step is guarded on its
-    own, as there: one failing must not stop the next."""
+    own, as there: one failing must not stop the next.
+
+    The sweep and the copy also know the app's own vault-root state
+    (VAULT_ROOT_STATE): without that, the copy filed the app's settings in
+    data_in/ as the user's data."""
     import data_index
 
     log = _guarded(log)
@@ -164,7 +270,8 @@ def prepare_data_dirs(vault_dir: Path,
         out.problems.append(f"data folders: {exc!r}")
         log(f"[DataIndex] Could not create data_in/ and data_out/: {exc}")
     try:
-        out.cleaned = list(data_index.cleanup_misplaced_internals(vault))
+        out.cleaned = (list(data_index.cleanup_misplaced_internals(vault))
+                       + remove_state_copies(vault))
         if out.cleaned:
             log(f"[DataIndex] Removed {len(out.cleaned)} stray app-config "
                 f"file(s) from data_in/")
@@ -172,7 +279,7 @@ def prepare_data_dirs(vault_dir: Path,
         out.problems.append(f"cleanup: {exc!r}")
         log(f"[DataIndex] Cleanup skipped: {exc}")
     try:
-        out.copied = list(data_index.migrate_loose_vault_files(vault))
+        out.copied = copy_loose_data_files(vault)
         if out.copied:
             log(f"[DataIndex] Copied {len(out.copied)} loose data file(s) "
                 f"from vault root into data_in/")

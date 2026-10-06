@@ -368,6 +368,35 @@ def test_a_launch_sets_up_the_data_folders(qapp, tmp_path):
         assert (vault / folder).is_dir(), folder
 
 
+def test_a_launch_does_not_file_the_apps_settings_as_data(qapp, tmp_path,
+                                                          monkeypatch):
+    """The review's probe, as a test: a model saved the way the app saves one
+    (onboarding.save_gguf_path, model_slots.save), then a Qt launch. On the
+    base there was no data_in/ at all; with batch 0 both files were copied
+    into it and the data index offered them as datasets."""
+    import onboarding
+    from council_core import model_slots
+
+    # save_gguf_path also exports the choice; recorded so it is put back.
+    monkeypatch.setenv("COUNCIL_GGUF_PATH", "placeholder")
+    monkeypatch.delenv("COUNCIL_GGUF_PATH")
+    vault = tmp_path / "vault"
+    vault.mkdir(parents=True)
+    model = tmp_path / "models" / "granite.gguf"
+    model.parent.mkdir()
+    model.write_bytes(b"GGUF" + b"\0" * 64)
+    assert onboarding.save_gguf_path(vault, str(model)) is None
+    model_slots.save(vault, model_slots.SlotConfig(slots={
+        "main": model_slots.Slot("main", str(model)),
+        "coding": model_slots.Slot("coding", "ollama:llama3.1:8b")}))
+    assert (vault / "backend_settings.json").is_file()
+    assert (vault / "model_slots.json").is_file()
+    build()
+    build()
+    landed = sorted(p.name for p in (vault / "data_in").iterdir())
+    assert landed == ["README.txt"], landed
+
+
 def test_a_launch_respects_the_skip_switch(qapp, tmp_path, upgrader,
                                            monkeypatch):
     monkeypatch.setenv("COUNCIL_SKIP_PATH_MIGRATION", "1")

@@ -119,7 +119,8 @@ def profile_applied(environ: Optional[Mapping[str, str]] = None) -> bool:
     read here so the Council tab can show it without importing the engine,
     which it otherwise loads only when a turn needs a model."""
     env = os.environ if environ is None else environ
-    return env.get("COUNCIL_QUIRKS_APPLY", "1").strip().lower()         not in ("0", "false", "no", "off")
+    return (env.get("COUNCIL_QUIRKS_APPLY", "1").strip().lower()
+            not in ("0", "false", "no", "off"))
 
 
 @dataclass

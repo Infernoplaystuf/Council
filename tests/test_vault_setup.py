@@ -133,6 +133,62 @@ def test_loose_data_at_the_vault_root_is_copied_into_data_in(places):
     assert [p.name for p in done.copied] == ["orders.csv"]
 
 
+#: App state the app keeps at the vault ROOT, beside the user's loose data.
+#: data_index's own skip list predates all of these.
+_STATE = ("backend_settings.json", "model_slots.json", "model_bench.json",
+          "vault_index.json", "vault_embeddings.json", "semantic_cache.json",
+          "question_history.json", "graph_presets.json")
+
+
+def test_the_apps_own_settings_are_not_copied_in_as_data(places):
+    """Found in review: one Qt launch over a vault holding the app's settings
+    copied backend_settings.json (with the GGUF path in it), model_slots.json,
+    vault_index.json and vault_embeddings.json into data_in/, where the data
+    index listed them as the user's datasets — every Qt user who configures
+    a model. Tk did the same through the same function."""
+    import data_index
+
+    _app, _repo, vault = places
+    for name in _STATE:
+        (vault / name).write_text('{"app": "state"}', encoding="utf-8")
+    (vault / "orders.csv").write_text("id\n1\n", encoding="utf-8")
+    (vault / "customers.json").write_text('[{"id": 1}]', encoding="utf-8")
+
+    done = vault_setup.prepare_data_dirs(vault, log=lambda m: None)
+
+    landed = sorted(p.name for p in (vault / "data_in").iterdir())
+    assert landed == ["README.txt", "customers.json", "orders.csv"], landed
+    assert sorted(p.name for p in done.copied) == ["customers.json",
+                                                   "orders.csv"]
+    for name in _STATE:
+        assert (vault / name).is_file(), f"{name} was moved"
+    found = data_index.DataIndex(
+        search_roots=[data_index.input_dir(vault)]).discover()
+    names = sorted(Path(getattr(entry, "path", entry)).name for entry in found)
+    assert names == ["customers.json", "orders.csv"], names
+
+
+def test_a_copy_an_earlier_run_made_is_removed_only_when_identical(places):
+    """The copies already made (the real vault here has data_in/
+    vault_index.json and semantic_cache.json from Tk runs) go when they are
+    byte-identical to the app's file at the root — data_index's own proof
+    for its stray-config sweep. A different file of that name is the user's,
+    and is kept."""
+    _app, _repo, vault = places
+    (vault / "data_in").mkdir()
+    (vault / "model_slots.json").write_text('{"main": "a"}', encoding="utf-8")
+    (vault / "data_in" / "model_slots.json").write_text('{"main": "a"}',
+                                                        encoding="utf-8")
+    (vault / "vault_index.json").write_text('{"v": 2}', encoding="utf-8")
+    (vault / "data_in" / "vault_index.json").write_text('{"v": 1}',
+                                                        encoding="utf-8")
+    done = vault_setup.prepare_data_dirs(vault, log=lambda m: None)
+    assert not (vault / "data_in" / "model_slots.json").exists()
+    assert (vault / "data_in" / "vault_index.json").read_text() == '{"v": 1}'
+    assert (vault / "model_slots.json").is_file()
+    assert [p.name for p in done.cleaned] == ["model_slots.json"]
+
+
 def test_the_skip_switch_is_honoured(places, monkeypatch):
     app, repo, vault = places
     (app / "node_registry.json").write_text("{}", encoding="utf-8")
