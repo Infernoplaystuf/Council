@@ -576,8 +576,9 @@ _ANCHORS = {
 _FIXED = {"question": (0.03, 0.45), "judge": (0.42, 0.45),
           "debate": (0.62, 0.45), "writer": (0.8, 0.45),
           "answer": (0.97, 0.45)}
-_NODE_ANCHORS = {"usage_log": (0.3, 0.93), "apothecary": (0.62, 0.97),
-                 "role_settings": (0.45, 0.97),
+_NODE_ANCHORS = {"usage_log": (0.28, 0.93), "apothecary": (0.95, 0.78),
+                 "role_settings": (0.45, 0.97), "sage_kb": (0.66, 0.97),
+                 "vault": (0.06, 0.72),
                  "wishlist": (0.3, 0.06), "council_memory": (0.85, 0.12),
                  "role_memory": (0.6, 0.06), "docs": (0.25, 0.85),
                  "mcp_docs": (0.08, 0.92), "tools": (0.25, 0.7)}
@@ -662,6 +663,182 @@ def layout(m: CouncilMap, edges: Sequence[Edge], width: float = 1400.0,
     return {nid: (p[0], p[1]) for nid, p in pos.items()}
 
 
+# ============================================================
+# How it works: the guided tour new users see first
+# ============================================================
+
+@dataclass(frozen=True)
+class GuideStep:
+    title: str
+    body: str
+    #: Node ids to light up; "kind:<kind>" lights every node of that kind
+    #: (the models and machines are only known at runtime).
+    nodes: Tuple[str, ...] = ()
+    #: Where it happens, for anyone who wants to read the code.
+    code: str = ""
+
+
+GUIDE: Tuple[GuideStep, ...] = (
+    GuideStep(
+        "What this map shows",
+        "Every circle and square is a part of the council, and every line is "
+        "something one part hands to another — the label on the line says "
+        "what.\n\n"
+        "  • Red circle: the Judge. Orange circles: the council members.\n"
+        "  • Purple: helper agents. Blue squares: places context comes from "
+        "(your vault, tools, documentation). Grey squares: memory and "
+        "records.\n"
+        "  • Yellow: the AI models. Green boxes: the machines they run on. "
+        "These two come from your real setup.\n\n"
+        "Lines: grey works today; amber works only some of the time; red "
+        "dashed is wired but never takes effect; green dashed does not exist "
+        "yet and would make the council better.\n\n"
+        "Hover a node to light up its lines. Click it for everything it "
+        "sends and receives. Drag to move things, scroll to zoom. Press Next "
+        "to follow one question through the council."),
+    GuideStep(
+        "You ask a question",
+        "You type in the ⚖ Council tab. That is the only way in: you talk to "
+        "the council, never to one model directly.\n\n"
+        "With Deliberate on, the whole council works on it (the next steps). "
+        "With it off, the Writer answers alone — faster, no debate, no "
+        "verdict. The Tools switch lets the Coder and Intern run code and "
+        "search the vault while they work.",
+        ("question", "judge"),
+        "council_qt/tabs/council.py (CouncilActions.send) → "
+        "council_core/council_turn.py (run_turn)"),
+    GuideStep(
+        "The Judge picks a panel",
+        "The Judge reads the question and decides what kind it is — code, "
+        "planning, a plain question — and so which members should answer. "
+        "Only those members take part.",
+        ("question", "judge") + MEMBERS + ("peasant",),
+        "council_core/council_turn.py (PANEL_FOR_ROUTE)"),
+    GuideStep(
+        "Each member writes an answer",
+        "The members answer one at a time, not all at once. Each gets the "
+        "question plus its own memory, the project memory, your profile and "
+        "recent conversation (Role memory), writes a full answer, and rates "
+        "how sure it is from 1 to 10.\n\n"
+        "Every answer goes onto the Debate floor: the shared record of this "
+        "round that every member and the Judge can read.",
+        MEMBERS + ("role_memory", "debate"),
+        "council_core/deliberation.py (DeliberationOrchestrator.run)"),
+    GuideStep(
+        "The Peasant asks, the members argue",
+        "The Peasant asks two plain questions about every answer — the "
+        "questions a sceptical outsider would ask.\n\n"
+        "Then each member reads the other answers and the Peasant's "
+        "questions and replies: it defends its answer, changes it, or agrees "
+        "with someone else (rebuttal, then cross-fire). All of it goes onto "
+        "the Debate floor.",
+        ("peasant", "debate") + MEMBERS,
+        "council_core/deliberation.py (rebuttal, cross-fire)"),
+    GuideStep(
+        "Tools, when they are on",
+        "With Tools on, the Coder and the Intern can stop mid-answer and ask "
+        "for a tool: run some Python, read or search a vault file, or look up "
+        "a function's real signature. The result goes back to them, and also "
+        "to the Writer later as 'prior tool outputs'.\n\n"
+        "A tool that fails (code that runs too long, a missing file) is "
+        "reported back to the model as a failure; it does not stop the "
+        "council.",
+        ("tools", "coder", "intern", "writer"),
+        "council_core/council_tools.py; ModelAgent.act in "
+        "council_core/deliberation.py"),
+    GuideStep(
+        "Judge ranks, Writer writes, Judge checks",
+        "The Judge ranks every answer from the Debate floor and names a "
+        "winner. The Writer then writes the one answer you see, from all of "
+        "it: the answers, the arguments, the ranking.\n\n"
+        "The Judge checks that answer. PASS — it is shown to you. NEEDS WORK "
+        "— the Judge lists what must change and the council goes round once "
+        "more.",
+        ("debate", "judge", "writer", "answer"),
+        "council_core/deliberation.py (rank, synthesise, critique)"),
+    GuideStep(
+        "How a model is actually called",
+        "Each role is not a separate program — it is a set of instructions "
+        "given to a model. Which model a role uses is set in the 🇺🇸 Models "
+        "tab (saved in model_slots.json). Several roles can share a model.\n\n"
+        "Every call from every role ends in the same place. The council finds "
+        "the role's model and either runs it inside the app (a .gguf file) "
+        "or sends one request to Ollama — a model server — on THIS PC, and "
+        "reads the reply as it streams back.\n\n"
+        "The yellow nodes are your models; the line from each role shows "
+        "which model it uses.",
+        ("kind:model", "kind:member", "judge", "machine:this-pc"),
+        "PersonalityModel.respond → LocalBackendSpec.generate → _route_chat "
+        "(council_engine.py): _gguf_chat in the app, or _ollama_local → "
+        "Ollama's /api/chat"),
+    GuideStep(
+        "How the machines talk to each other",
+        "Other machines (a Raspberry Pi, a second PC) each run their own "
+        "Ollama server. The council talks to them in two ways:\n\n"
+        "  • Ollama's web API, port 11434, over your local network: 'which "
+        "models do you have?' (/api/tags) and 'what is running?' (/api/ps). "
+        "The Nodes tab asks every 15 seconds; this map asks when you press "
+        "Refresh.\n"
+        "  • SSH, port 22, from the 🔧 Apothecary: to set a Pi up and check "
+        "on it every 60 seconds.\n\n"
+        "Today the machines are watched, not used: every council answer is "
+        "made on this PC. Sending a call elsewhere is blocked unless "
+        "COUNCIL_REMOTE_NODES=1 is set, and even then all calls go to one "
+        "machine — a role cannot be given its own machine yet.",
+        ("kind:machine", "kind:model", "apothecary"),
+        "council_engine.py (_ensure_localhost, LoadAwareDispatcher.probe_all); "
+        "apothecary_engine.py (SSH health monitor); "
+        "docs/specialized_nodes.md"),
+    GuideStep(
+        "The weekly placement review",
+        "Every model call is metered — which role, which model, which "
+        "machine, how long, how fast (never what was said) — in the Model "
+        "usage log.\n\n"
+        "Once a week the Judge, acting as controller, reads that week of "
+        "usage and the Apothecary's list of machines and models, and "
+        "proposes changes: a different model for a slow role, a model to "
+        "install where a machine sits idle.\n\n"
+        "Nothing happens by itself. Changes for this PC wait for you to tick "
+        "them and press Apply; installs and removals are commands for you to "
+        "run. Open it with 'Placement review…'.",
+        ("usage_log", "apothecary", "judge", "role_settings"),
+        "council_core/usage_log.py; council_core/placement.py"),
+    GuideStep(
+        "What is not connected yet",
+        "The green dashed lines are the map's suggestions: the Librarian "
+        "briefing members with your vault's documents, the Judge checking "
+        "answers against evidence, past debates being remembered. The red "
+        "line is wired but never takes effect.\n\n"
+        "Press 'What's missing' for the full list with the reason for each, "
+        "or tick 'Only what is not live' to see just those lines.",
+        ("librarian", "vault_rag", "vault_search", "sage_kb",
+         "council_memory", "wishlist", "analyst", "task_memo"),
+        "council_core/council_map.py (the table of links)"),
+)
+
+
+def guide_nodes(m: CouncilMap, step: GuideStep) -> List[str]:
+    """The node ids a step lights up, with 'kind:' entries resolved."""
+    out: List[str] = []
+    for item in step.nodes:
+        if item.startswith("kind:"):
+            kind = item[len("kind:"):]
+            out += [n for n, node in m.nodes.items() if node.kind == kind]
+        elif item in m.nodes:
+            out.append(item)
+    return list(dict.fromkeys(out))
+
+
+def guide_text(index: int) -> str:
+    """One step, as the details panel shows it."""
+    step = GUIDE[index]
+    lines = [f"How it works — {index + 1} of {len(GUIDE)}", "", step.title,
+             "", step.body]
+    if step.code:
+        lines += ["", f"In the code: {step.code}"]
+    return "\n".join(lines)
+
+
 def describe(m: CouncilMap, node_id: str) -> str:
     """A node's details as plain text: what it is, and every link in and out
     with what travels on it and its status."""
@@ -712,4 +889,5 @@ __all__ = ["Node", "Edge", "CouncilMap",
            "KINDS", "KIND_LABELS", "LAYERS", "LAYER_LABELS", "STATUSES",
            "STATUS_LABELS", "MEMBERS", "THIS_PC", "static_map",
            "live_overlay", "gather", "layout", "describe", "gaps_report",
-           "model_label"]
+           "model_label", "GuideStep", "GUIDE", "guide_nodes",
+           "guide_text"]

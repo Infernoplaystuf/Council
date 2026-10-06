@@ -65,6 +65,8 @@ class GraphCanvas(QWidget):
         self.offset = QPointF(0, 0)
         self.hover: Optional[str] = None
         self.selected: Optional[str] = None
+        #: Nodes a guide step lights up; hovering or selecting a node wins.
+        self.highlight: Set[str] = set()
         self._drag_node: Optional[str] = None
         self._drag_pan: Optional[QPointF] = None
         self._press_at: Optional[QPointF] = None
@@ -79,6 +81,10 @@ class GraphCanvas(QWidget):
             self.fit()
         if self.selected not in m.nodes:
             self.selected = None
+        self.update()
+
+    def set_highlight(self, ids) -> None:
+        self.highlight = set(ids or ())
         self.update()
 
     def fit(self) -> None:
@@ -140,6 +146,10 @@ class GraphCanvas(QWidget):
             return
         focus = self._focus()
         near = self._neighbours(focus)
+        lit_set = set(self.highlight) if focus is None else set()
+        # A step lighting a handful of nodes can label its lines; one that
+        # lights the whole panel would bury the picture in labels.
+        label_lit = 0 < len(lit_set) <= 5
 
         # Parallel links between the same pair bend apart so both show.
         seen: Dict[Tuple[str, str], int] = {}
@@ -149,14 +159,22 @@ class GraphCanvas(QWidget):
             key = tuple(sorted((e.src, e.dst)))
             index = seen.get(key, 0)
             seen[key] = index + 1
-            lit = focus is None or focus in (e.src, e.dst)
-            self._paint_edge(painter, e, index, lit, focus is not None and lit)
+            if focus is not None:
+                lit = focus in (e.src, e.dst)
+                labelled = lit
+            elif lit_set:
+                lit = e.src in lit_set and e.dst in lit_set
+                labelled = lit and label_lit
+            else:
+                lit, labelled = True, False
+            self._paint_edge(painter, e, index, lit, labelled)
 
         font = QFont(self.font())
         font.setPointSizeF(max(6.0, 9.0 * min(1.4, self.scale)))
         painter.setFont(font)
         for nid, (x, y) in self.pos.items():
-            dim = focus is not None and nid not in near
+            dim = ((focus is not None and nid not in near)
+                   or (bool(lit_set) and nid not in lit_set))
             self._paint_node(painter, nid, self.to_screen(x, y), dim)
 
     def _paint_edge(self, painter: QPainter, e: cm.Edge, index: int,

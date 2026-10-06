@@ -211,6 +211,8 @@ def test_tab_draws_and_filters(qapp):
         assert 0 < len(tab.canvas.edges) < all_edges
         tab.gaps_only.setChecked(True)
         assert all(e.status != "live" for e in tab.canvas.edges)
+        assert tab.details.toPlainText().startswith("How it works")
+        tab.show_gaps()
         assert "What is missing" in tab.details.toPlainText()
         tab.grab()                           # paints without raising
     finally:
@@ -235,3 +237,51 @@ def test_tab_is_registered_as_a_default_tab():
     pytest.importorskip("PySide6", reason="the Qt shell needs PySide6")
     from council_qt.tabs import REGISTRY, build_council_map
     assert any(f is build_council_map for _t, f, _e in REGISTRY)
+
+
+# ---- the guided tour -------------------------------------------------------
+
+def test_every_guide_step_lights_real_nodes():
+    m = cm.live_overlay(cm.static_map(), _slots(), [])
+    for i, step in enumerate(cm.GUIDE[1:], start=1):
+        assert cm.guide_nodes(m, step), f"step {i} lights nothing"
+        for item in step.nodes:
+            if not item.startswith("kind:"):
+                assert item in m.nodes, (i, item)
+    models = cm.guide_nodes(m, next(s for s in cm.GUIDE
+                                    if "kind:model" in s.nodes))
+    assert "model:main" in models and "model:fast" in models
+
+
+def test_the_guide_explains_users_turns_models_and_machines():
+    text = "\n".join(cm.guide_text(i) for i in range(len(cm.GUIDE)))
+    for must in ("Council tab", "Judge", "Debate floor", "Ollama",
+                 "port 11434", "SSH", "COUNCIL_REMOTE_NODES",
+                 "_route_chat", "Placement review", "What's missing"):
+        assert must in text, must
+    assert cm.guide_text(0).startswith(f"How it works — 1 of {len(cm.GUIDE)}")
+
+
+def test_the_tab_opens_on_the_guide_and_steps_through_it(qapp):
+    tab = _tab(qapp, [])
+    try:
+        assert tab.guide_step == 0 and tab.guide_nav.isVisible()
+        assert not tab.guide_back.isEnabled()
+        tab.guide_forward()
+        assert tab.guide_step == 1
+        assert tab.canvas.highlight == {"question", "judge"}
+        for _ in range(len(cm.GUIDE)):
+            tab.guide_forward()
+        assert tab.guide_step == len(cm.GUIDE) - 1
+        assert not tab.guide_next.isEnabled()
+        tab.grab()
+        tab.canvas.node_clicked.emit("")             # stray click: stays
+        assert tab.guide_step == len(cm.GUIDE) - 1
+        tab.canvas.node_clicked.emit("judge")        # a node: leaves
+        assert tab.guide_step is None and not tab.canvas.highlight
+        assert not tab.guide_nav.isVisible()
+        tab.show_guide(0)
+        assert tab.details.toPlainText().startswith("How it works")
+    finally:
+        tab.close()
+        tab.deleteLater()
