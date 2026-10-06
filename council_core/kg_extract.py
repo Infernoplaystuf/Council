@@ -50,9 +50,13 @@ MEANINGS = {
     "USES_PART": "PROJECT uses / will be fitted with / is tested with PART",
     "SUPERSEDES": "newer PART supersedes / replaces older PART",
 }
-#: The model the Connections tab offers first — set from the KG0 benchmark
-#: (council_core/kg_bench.py); see docs/handoff for the measured table.
-DEFAULT_EXTRACTOR = "llama3.1:8b"
+#: The model the Connections tab offers first, from the KG0 benchmark
+#: (council_core/kg_bench.py, 2026-10-06, RTX 5080; table in docs/handoff):
+#: phi4:14b, gpt-oss:20b and gemma3:12b tie at F1 ~0.89, but phi4 moved
+#: between identical runs (part->project recall 0.70 then 0.50) while gemma3:12b
+#: repeated exactly and finds part->project links best (0.80) — the links the
+#: user asked for — at 1.0 s per passage and 8.1 GB.
+DEFAULT_EXTRACTOR = "gemma3:12b"
 MAX_FACTS = 12
 NUM_PREDICT = 1400
 
@@ -214,7 +218,9 @@ def named_in(text: str, k: Known) -> bool:
     if k.type == "PERSON":
         forms = [f for f in forms if not kgm.is_initial_form(kgm.person_key(f))]
         # 'Raman, Priya' names Priya Raman: try the surname-first order too.
+        # person_key also drops suffixes: "Bob Smith" names "Bob Smith, Jr.".
         keys = [kgm.person_key(f).split() for f in forms]
+        forms += [" ".join(t) for t in keys if t]
         forms += [" ".join([t[-1]] + t[:-1]) for t in keys if len(t) >= 2]
     if k.type == "PROJECT":
         for f in list(forms):
@@ -257,13 +263,23 @@ def check(raw_links: Iterable[Dict[str, str]], text: str, known: Sequence[Known]
             if rs and ro and rs[0] == ro[0] and rs[1] != ro[1]:
                 if rs[1] < ro[1]:
                     s, o, fixed = o, s, "turned round (the later revision supersedes)"
-        unnamed = [e.name for e in (s, o) if not named_in(text, e)]
-        if unnamed:
-            rejected.append(Rejected(r, f"the text never names {unnamed[0]}"))
-            continue
         line = find_quote(text, str(r.get("quote", "")))
         if line is None:
             rejected.append(Rejected(r, "its quote is not in the text"))
+            continue
+        # Named NEAR the quote — the line before to two after (a pronoun in
+        # the next sentence is fine) — not merely somewhere in the passage:
+        # measured on the Ironbridge vault, phi4:14b credited "D. Whitfield
+        # will review…" (line 13) to Dana because "Whitfield, Dana" is on
+        # line 4 of the same chunk.
+        # A PROJECT may be named anywhere in the passage: notes are often
+        # about the project in their title ("Atlas sync") and never repeat it.
+        lines = text.splitlines()
+        near = "\n".join(lines[max(0, line - 2):line + 2])
+        unnamed = [e.name for e in (s, o)
+                   if not named_in(text if e.type == "PROJECT" else near, e)]
+        if unnamed:
+            rejected.append(Rejected(r, f"the text never names {unnamed[0]} near that quote"))
             continue
         k = (s.key, pred, o.key)
         if k in seen:

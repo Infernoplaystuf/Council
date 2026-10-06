@@ -26,6 +26,7 @@ def oracle(calls=None):
         ("tomas", "WORKS_ON", "helios"): "D. Whitfield will review the shim drawings with Tomás Echeverría next week.",
         ("atlas", "USES_PART", "shim_b"): "The revised shim PN-1234/B will be proven on the Atlas Test Rig",
         ("dan", "WORKS_ON", "atlas"): "Dan Whitfield reported a firmware fault on the CTL-5005 controller board.",
+        ("bob", "OWNS", "gasket"): "Bob Smith will source the PN-0088 inlet gaskets for Northwind.",
     }
 
     def chat(messages, **kw):

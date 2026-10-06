@@ -117,3 +117,22 @@ def test_a_name_the_text_never_says_is_refused():
 def test_named_in_accepts_the_ways_text_names_things(text, key):
     k = next(k for k in KNOWN if k.key == key)
     assert kx.named_in(text, k)
+
+
+def test_a_name_far_from_the_quote_does_not_count():
+    """Ironbridge, 2026-10-06: phi4:14b credited line 13's 'D. Whitfield will
+    review the shim drawings' to Dana, who is named only on line 4."""
+    text = ("Owner: Whitfield, Dana\n" + "Filler line.\n" * 8 +
+            "D. Whitfield will review the shim drawings for Helios next week.")
+    res = kx.extract(text, KNOWN, scripted([{"subject": "Dana Whitfield", "predicate": "WORKS_ON",
+                                             "object": "Helios",
+                                             "quote": "D. Whitfield will review the shim drawings for Helios next week."}]))
+    assert not res.links and "near that quote" in res.rejected[0].why
+
+
+def test_a_pronoun_in_the_next_sentence_is_fine():
+    text = "Priya Raman owns the SL-0450 seal.\nShe is also the contact for it."
+    res = kx.extract(text, KNOWN, scripted([{"subject": "Priya Raman", "predicate": "CONTACT_FOR",
+                                             "object": "SL-0450",
+                                             "quote": "She is also the contact for it."}]))
+    assert [(l.subject, l.object) for l in res.links] == [("priya", "seal")]

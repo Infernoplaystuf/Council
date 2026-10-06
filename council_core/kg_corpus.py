@@ -220,6 +220,9 @@ RELATIONS: List[tuple] = [
     ("tomas", "WORKS_ON", "helios", "free_text", "reports/helios_status_2026-03.md"),
     ("atlas", "USES_PART", "shim_b", "free_text", "reports/ecn_0915_014.pdf"),
     ("dan", "WORKS_ON", "atlas", "free_text", "notes/meeting_2026-04-02.txt"),
+    # "Bob Smith will source the PN-0088 inlet gaskets" — OWNS covers
+    # sourcing (kg_extract.MEANINGS); found by phi4:14b, missed by this key.
+    ("bob", "OWNS", "gasket", "free_text", "reports/northwind_design_review.docx"),
 ]
 
 # How a labelled field relates to the others in the same record (a table row,
