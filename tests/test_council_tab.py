@@ -564,3 +564,34 @@ def test_the_qt_tools_work_against_the_vault(tmp_path):
     ok, msg, payload = tools["run_python"]({"code": "print(6 * 7)"})
     assert ok and payload["rc"] == 0 and "42" in payload["stdout"], msg
     assert (tmp_path / "vault" / "workspace").is_dir()
+
+
+# ============================================================
+# What a question leaves behind
+# ============================================================
+
+def test_learning_runs_after_the_answer_and_says_what_it_kept(qapp, tab):
+    from council_core import after_turn
+    from council_core.council_turn import TurnResult
+    seen = []
+
+    def learn(result):
+        seen.append(result)
+        return after_turn.Learned(gaps_logged=1, roles_updated=["coder"])
+
+    tab.actions.learn = learn
+    result = TurnResult(True, answer="a", panel=["coder"])
+    tab._learn_later(result)
+    assert _pump(qapp, lambda: "Kept from this question" in
+                 tab.transcript.toPlainText())
+    assert seen == [result]
+    assert "memory updated for coder" in tab.transcript.toPlainText()
+
+
+def test_learning_is_skipped_for_a_direct_answer(qapp, tab):
+    called = []
+    tab.actions.learn = lambda r: called.append(r)
+    from council_core.council_turn import TurnResult
+    tab._learn_later(TurnResult(True, answer="a", route="direct"))
+    qapp.processEvents()
+    assert called == []

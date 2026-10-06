@@ -137,6 +137,12 @@ class TurnResult:
     events: List[AgentEvent] = field(default_factory=list)
     message: str = ""
     error: Optional[BaseException] = None
+    #: Members who rated their own answer 4/10 or lower, as the deliberation
+    #: collected them ({"who", "topic", "reason"}) — for the librarian's
+    #: wishlist (council_core.after_turn).
+    low_conf_gaps: List[Dict[str, Any]] = field(default_factory=list)
+    #: The question as asked (council_core.after_turn writes memory from it).
+    question: str = ""
 
     #: Identifies THIS turn's verdict, or "" when it produced none.
     #:
@@ -245,10 +251,13 @@ def run_turn(question: str, models: Any, *,
         critique = judge_critique(events)
         verdict = "PASS" if "Verdict: PASS" in critique else "NEEDS_WORK"
         answer = final_answer(events, synth)
+        last_ctx = getattr(orchestrator, "_last_ctx", None)
+        gaps = list((getattr(last_ctx, "shared", None) or {}).get(
+            "_low_conf_gaps", []))
         result = TurnResult(
             True, answer=answer, critique=critique, verdict=verdict,
             confidence=judge_confidence(events), route=route, panel=panel,
-            events=list(events))
+            events=list(events), low_conf_gaps=gaps, question=question)
         # A verdict id only when there IS a verdict. See TurnResult.verdict_id.
         if critique:
             result.verdict_id = f"{route or 'turn'}:{len(events)}:{verdict}"

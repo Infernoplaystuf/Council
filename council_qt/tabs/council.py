@@ -226,6 +226,15 @@ class CouncilActions:
         return council_turn.TurnResult(True, answer=answer, route="direct",
                                        events=[event])
 
+    def learn(self, result):
+        """What this answered question leaves behind (after_turn.learn).
+        Blocking: the tab calls it on a worker."""
+        from council_core import after_turn
+        models, _problem = self.models()
+        if models is None:
+            return None
+        return after_turn.learn(models, result, self.vault_dir)
+
     def record_verdict_response(self, verdict_id: str, agreed: bool,
                                 objection: str = ""):
         """Stamp a verdict BY ID.
@@ -592,6 +601,7 @@ class CouncilTab(ViewHelpers, QWidget):
                         lambda who=who, tok=tok: self.on_token(who, tok)))
                 if result is not None:
                     self._to_ui(lambda: self.finish_turn(result))
+                    self._learn_later(result)
             # THE MESSAGE IS BOUND HERE, NOT READ LATER. Python deletes the
             # `except ... as exc` name at the end of the block, so a lambda
             # that closes over `exc` and runs later raises NameError instead of
@@ -609,6 +619,34 @@ class CouncilTab(ViewHelpers, QWidget):
                 self._to_ui(self.end_turn)
 
         threading.Thread(target=work, name="council-turn", daemon=True).start()
+
+    def _learn_later(self, result) -> None:
+        """Keep what the question taught — wishlist gaps, role and project
+        memory (council_core.after_turn) — on its own worker, so the next
+        question need not wait. Its model calls queue behind any new
+        question's on the same model or machine."""
+        learn = getattr(self.actions, "learn", None)
+        if learn is None or not getattr(result, "ok", False) \
+                or not getattr(result, "panel", None):
+            return
+
+        def work() -> None:
+            try:
+                learned = learn(result)
+            except Exception as exc:                      # noqa: BLE001
+                said = f"Could not keep what this question taught: {exc!r}"
+                self._to_ui(lambda: self.append("Librarian", said,
+                                                "observation"))
+                return
+            if learned is not None and (learned.roles_updated
+                                        or learned.gaps_logged
+                                        or learned.errors):
+                said = "Kept from this question: " + learned.summary()
+                self._to_ui(lambda: self.append("Librarian", said,
+                                                "observation"))
+
+        threading.Thread(target=work, name="council-turn-learn",
+                         daemon=True).start()
 
     def pipeline_chat(self):
         """The pipeline-command responder, built on first use."""

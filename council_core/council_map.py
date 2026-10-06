@@ -333,15 +333,13 @@ def _edges() -> List[Edge]:
           cite="council_core/deliberation.py:314-361"),
         # -- memory --------------------------------------------------------
         E("debate", "wishlist", "low-confidence members (≤4/10) as gaps",
-          "memory", "broken",
-          note="The deliberation collects them in ctx.shared"
-               "['_low_conf_gaps'] and nothing reads that list, so no gap "
-               "is ever written.",
-          cite="council_core/deliberation.py:786-801"),
-        E("answer", "role_memory", "what this turn decided", "memory",
-          note="Nothing writes role or project memory after a turn, so "
-               "the memory every role reads never grows.",
-          cite="council_engine.py:5654, 5728"),
+          "memory", "live",
+          cite="council_core/deliberation.py (_low_conf_gaps); "
+               "council_core/after_turn.py (log_gaps)"),
+        E("answer", "role_memory", "what each member learned, and project "
+          "facts (after the answer, in the background)", "memory", "live",
+          cite="council_core/after_turn.py (learn); council_engine.py "
+               "(update_role_memory_after_pass)"),
         E("council_memory", "judge", "how similar questions were decided",
           "memory",
           note="Past deliberations are recorded nowhere the council reads; "
@@ -917,8 +915,8 @@ GUIDE: Tuple[GuideStep, ...] = (
         "What is not connected yet",
         "The green dashed lines are the map's suggestions: the Librarian "
         "briefing members with your vault's documents, the Judge checking "
-        "answers against evidence, past debates being remembered. The red "
-        "line is wired but never takes effect.\n\n"
+        "answers against evidence, past debates being remembered. A red "
+        "line, if any, is wired but never takes effect.\n\n"
         "Press 'What's missing' for the full list with the reason for each, "
         "or tick 'Only what is not live' to see just those lines.",
         ("librarian", "vault_rag", "vault_search", "sage_kb",

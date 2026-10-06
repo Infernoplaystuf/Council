@@ -89,8 +89,9 @@ def test_the_facts_the_map_is_for():
     # Nothing feeds the vault into the turn.
     assert _edge(m, "librarian", "writer").status == "proposed"
     assert _edge(m, "vault_search", "question").status == "proposed"
-    # Low-confidence gaps are collected and never written.
-    assert _edge(m, "debate", "wishlist").status == "broken"
+    # Low-confidence gaps reach the wishlist; memory is written after.
+    assert _edge(m, "debate", "wishlist").status == "live"
+    assert _edge(m, "answer", "role_memory").status == "live"
     # The critique reaches the members once.
     assert _edge(m, "judge", "debate", "REQUIRED_CHANGES").status == "partial"
 
@@ -107,9 +108,11 @@ def test_visible_edges_filters_by_layer_and_status():
 def test_gaps_report_lists_worst_first():
     m = cm.static_map()
     report = cm.gaps_report(m)
-    assert report.index("Broken") < report.index("Partial") \
-        < report.index("Proposed")
-    assert "_low_conf_gaps" in report
+    assert "Broken" not in report                  # nothing broken is left
+    assert report.index("Partial") < report.index("Proposed")
+    order = [e.status for e in m.gaps()]
+    assert order == sorted(order, key=["broken", "partial",
+                                       "proposed"].index)
 
 
 def test_model_label():
