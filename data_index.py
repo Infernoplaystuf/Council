@@ -41,6 +41,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import path_contain
+
 
 # ============================================================
 # Folder constants — the read/write contract
@@ -134,17 +136,15 @@ def init_data_dirs(vault_dir: Path) -> None:
 
 
 def is_under(child: Path, parent: Path) -> bool:
-    """True if `child` is the same as `parent` or nested inside it."""
-    try:
-        c = Path(child).resolve()
-        p = Path(parent).resolve()
-    except OSError:
-        return False
-    try:
-        c.relative_to(p)
-        return True
-    except ValueError:
-        return False
+    """True if `child` is the same as `parent` or nested inside it.
+
+    Both sides are read the same way (path_contain.canonical): symlinks and
+    junctions followed, 8.3 short names expanded, and the \\\\?\\ prefix that
+    Path.resolve() keeps on a long result dropped. Comparing the two resolved
+    Paths directly refused every safe_write_path under a vault reached by its
+    short name: the folder resolved to its long name, the file in it to
+    \\\\?\\<long name>\\... once that passed 260 characters."""
+    return path_contain.is_under(child, parent)
 
 
 # Filenames that are app-internal config and should never be migrated

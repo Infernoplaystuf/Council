@@ -351,7 +351,11 @@ def run_folder(pipeline: Any, in_dir: Any, out_dir: Any, *,
             allowed = Path(data_index.output_dir(vault_dir)).resolve()
         except Exception as exc:
             raise NxError(f"could not resolve the vault output dir: {exc}")
-        if not (out_dir == allowed or allowed in out_dir.parents):
+        # Both sides canonicalised (path_contain): `allowed in
+        # out_dir.parents` compared a \\?\-prefixed long result with an
+        # unprefixed one under a vault reached by its 8.3 short name.
+        import path_contain
+        if not path_contain.is_under(out_dir, allowed):
             raise NxError(
                 f"refusing to write outside the vault output area.\n"
                 f"  asked for: {out_dir}\n  allowed   : {allowed}")

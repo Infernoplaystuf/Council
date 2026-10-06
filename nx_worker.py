@@ -32,6 +32,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import nx_introspect  # noqa: E402  (same directory; pure stdlib)
 import nx_policy      # noqa: E402  (same directory; pure stdlib)
+import path_contain   # noqa: E402  (same directory; pure stdlib)
 
 
 # ============================================================
@@ -130,13 +131,13 @@ def _get_path(pf, key: str, kind: str):
 
 
 def _under(root: Path, p) -> bool:
-    """Is ``p`` inside ``root``? Resolved, so ../ cannot walk out."""
+    """Is ``p`` inside ``root``? Both canonicalised (path_contain), so ../,
+    a junction, an 8.3 short name or a \\\\?\\ prefix cannot walk out — or
+    wrongly look out."""
     try:
-        rp = Path(str(p)).resolve()
-        rr = Path(str(root)).resolve()
+        return path_contain.is_under(str(p), str(root))
     except Exception:
         return False
-    return rp == rr or rr in rp.parents
 
 
 def _check_capability(pipeline) -> None:
