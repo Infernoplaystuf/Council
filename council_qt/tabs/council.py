@@ -85,6 +85,7 @@ PER_TURN_FIELDS = (
     "_last_verdict_id",     # A3 — the bar is shown only when this is set
     "_last_fast_question",  # A4 — what "Expand with council" would re-ask
     "_force_full_council",
+    "_shown_finals",        # final texts already in the transcript this turn
 )
 
 
@@ -658,6 +659,15 @@ class CouncilTab(ViewHelpers, QWidget):
             # A3: the bar appears because a verdict arrived, carrying its id.
             self.show_verdict_bar(getattr(event, "verdict_id", None))
             return
+        if kind == "final":
+            # A "final" is shown AS a final, as Tk's live_event handler does:
+            # that is what makes the Writer's the answer (_last_answer, the
+            # save panel). Remembered, because the TurnResult carries the
+            # same text again at the end — see finish_turn.
+            text = getattr(event, "text", "")
+            self.append(getattr(event, "who", "Council"), text, "final")
+            self._shown_finals = (self._shown_finals or set()) | {text}
+            return
         self.append(getattr(event, "who", "Council"),
                     getattr(event, "text", str(event)), "observation")
 
@@ -677,7 +687,12 @@ class CouncilTab(ViewHelpers, QWidget):
             self.append("Council", result.message or "The turn failed.",
                         "observation")
             return
-        if result.answer:
+        # ONCE. The turn reports its answer twice — as the Writer's "final"
+        # event while it runs, and in the result at the end — and this used
+        # to render both, so every answer appeared twice in the transcript.
+        # The result is shown only when no event already carried it (a turn
+        # that reports no events still gets its answer on screen).
+        if result.answer and result.answer not in (self._shown_finals or ()):
             self.append("Writer", result.answer, "final")
         if result.critique:
             self.set_judge(result.critique)

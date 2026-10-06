@@ -509,3 +509,85 @@ def test_the_tab_applies_the_run_time_rule_and_not_just_the_default(qapp):
     assert demo.options().deliberate is False, (
         "the tab returned the stored value without applying the DEMO_MODE rule")
     demo.deleteLater()
+
+
+# ============================================================
+# Every answer is shown ONCE
+# ============================================================
+# The turn reports the final answer twice: as an event while it runs (the
+# Writer's "final" AgentEvent) and in the TurnResult at the end. The tab used
+# to render both — the event as an observation, then the result as the answer
+# — so every answer appeared twice in the transcript. Driven here through the
+# REAL tab and the REAL CouncilActions.send, with only the models stood in
+# (council_turn.load_personalities is the seam the actions object loads them
+# through), so the event path and the result path are both the app's own.
+
+def _council(qapp, monkeypatch, tmp_path, models, *, demo_mode):
+    """A real tab in a real window, whose actions load ``models``."""
+    from council_core import council_turn
+    from council_qt.window import CouncilWindow
+
+    monkeypatch.setattr(council_turn, "load_personalities",
+                        lambda *_a, **_k: (models, ""))
+    window = CouncilWindow()
+    view = CouncilTab(window,
+                      actions=CouncilActions(vault_dir=tmp_path / "vault",
+                                             demo_mode=demo_mode),
+                      demo_mode=demo_mode)
+    return window, view
+
+
+def _ask(qapp, view, question):
+    view.input.setPlainText(question)
+    view.on_send()
+    assert _pump(qapp, lambda: not view._turn_active, timeout=20), (
+        "the turn never finished")
+    # The end-of-turn posts are queued behind the worker's last ones.
+    for _ in range(20):
+        qapp.processEvents()
+
+
+def test_a_direct_answer_appears_once(qapp, monkeypatch, tmp_path):
+    """The default build: DEMO_MODE, one Writer, no panel."""
+    from tests.test_council_turn import FakeModel, Models
+
+    answer = "Q3 was short because the returns were booked in October."
+    window, view = _council(qapp, monkeypatch, tmp_path,
+                            Models(writer=FakeModel(answer)), demo_mode=True)
+    try:
+        _ask(qapp, view, "why is Q3 short?")
+        text = view.transcript.toPlainText()
+        assert text.count(answer) == 1, (
+            f"the answer is shown {text.count(answer)} times:\n{text}")
+        assert view._last_answer == answer
+        assert view.save_frame.isVisibleTo(view)
+    finally:
+        window.request_close()
+
+
+def test_a_deliberated_answer_appears_once(qapp, monkeypatch, tmp_path):
+    """The full council: a panel drafts, the Writer synthesises, the Judge
+    passes it. Every Writer call says something different, so the FINAL
+    answer is one string that must appear exactly once — the drafts are
+    other strings and are allowed their own lines."""
+    from tests.test_council_turn import FakeJudge, FakeModel, Models
+
+    class Counting(FakeModel):
+        def respond(self, prompt, **kwargs):
+            self.asked.append(prompt)
+            return f"Writer reply number {len(self.asked)}."
+
+    models = Models(writer=Counting(), peasant=FakeModel("a peasant draft"))
+    models.judge = FakeJudge(route="chat", critique="Verdict: PASS")
+    window, view = _council(qapp, monkeypatch, tmp_path, models,
+                            demo_mode=False)
+    try:
+        view._checkboxes["deliberate"].setChecked(True)
+        _ask(qapp, view, "why is Q3 short?")
+        answer = view._last_answer
+        assert answer and answer.startswith("Writer reply number"), answer
+        text = view.transcript.toPlainText()
+        assert text.count(answer) == 1, (
+            f"the final answer is shown {text.count(answer)} times:\n{text}")
+    finally:
+        window.request_close()
