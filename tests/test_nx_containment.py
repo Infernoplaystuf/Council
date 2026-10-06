@@ -199,6 +199,11 @@ STATIC_ATTACKS = {
     "Execute Process by uuid text": f"x = '{EXECUTE_PROCESS}'\n",
     "ctypes": "import ctypes\nctypes.CDLL('kernel32')\n",
     "subprocess": "import subprocess\nsubprocess.run(['cmd'])\n",
+    "append_to_dream3d_file": "import simplnx as nx\n"
+                              f"nx.append_to_dream3d_file({DOC!r}, None, "
+                              "None)\n",
+    "test_filter": "import simplnx as nx\n"
+                   "nx.test_filter(nx.WriteDREAM3DFilter())\n",
 }
 
 
@@ -302,6 +307,18 @@ FILTER_ATTACKS = {
     "a_stream_inside_a_file": "nx.WriteDREAM3DFilter.execute("
                               "data_structure=ds, "
                               "export_file_path=V['fresh'] + ':hidden')",
+    # vtk is installed in the nx env, and its writers write from C++.
+    "a_native_writer_package": "__import__('vtk')",
+    # simplnx's own module functions that write or run a filter past the
+    # class wrappers.
+    "append_into_a_vault_file": "nx.append_to_dream3d_file(V['notes'], ds, "
+                                "nx.DataPath('A'))",
+    "append_into_an_earlier_output": "nx.append_to_dream3d_file("
+                                     "path=V['old'], data_structure=ds, "
+                                     "data_path=nx.DataPath('A'))",
+    "test_filter_runs_unseen": "nx.test_filter(nx.WriteDREAM3DFilter())",
+    "load_a_python_plugin": "nx.load_python_plugin(nx)",
+    "reimport_simplnx_unwrapped": "reimport()",
 }
 FILTER_OK = {
     "fresh_output": "nx.WriteDREAM3DFilter.execute(data_structure=ds, "
@@ -360,7 +377,14 @@ def filter_run(tmp_path_factory):
              "        nx.WriteDREAM3DFilter.execute(data_structure=ds, "
              "export_file_path=V['vault_rebind'])",
              "    finally:",
-             "        nx.WriteDREAM3DFilter.execute = staticmethod(held)"]
+             "        nx.WriteDREAM3DFilter.execute = staticmethod(held)",
+             "def reimport():",
+             "    mods = __import__('sys').modules",
+             "    saved = mods.pop('simplnx')",
+             "    try:",
+             "        __import__('simplnx')",
+             "    finally:",
+             "        mods['simplnx'] = saved"]
     for name, call in list(FILTER_ATTACKS.items()) + list(FILTER_OK.items()):
         lines.append(f"attempt({name!r}, lambda: {call})")
     t0 = time.perf_counter()
@@ -449,6 +473,8 @@ PY_ATTACKS = {
     "subprocess": "__import__('subprocess').run(['cmd', '/c', 'echo', 'x'])",
     "ctypes": "__import__('ctypes').CDLL('kernel32')",
     "chmod_document": "os.chmod(V['notes'], 0o444)",
+    "native_writer_h5py": "__import__('h5py')",
+    "sqlite_database": "__import__('sqlite3').connect(V['notes'] + '.db')",
 }
 PY_OK = {
     "write_new_in_data_out": "Path(V['in_out_new']).write_text('mine')",

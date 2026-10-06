@@ -39,7 +39,9 @@ script (nx_policy "Two kinds of script"):
     every file change the script itself makes — open for writing, remove,
     rename, rmtree, mkdir, chmod, links — to the same rule, refuses deleting
     anything the run did not make, and refuses processes, native code
-    (ctypes), sockets and the registry.
+    (ctypes), sockets, the registry, and importing a package that writes
+    files from C where no audit event can see it (vtk — installed in the
+    nx env — h5py, PyTables, sqlite3, ...).
 
 The binding's own execute functions are held only inside the wrappers. A
 script that rebinds a class attribute (nx.WriteDREAM3DFilter.execute = ...)
@@ -436,6 +438,60 @@ class Guard:
         pipe = vars(nx).get("Pipeline")
         if pipe is not None and "execute" in vars(pipe):
             self._wrap_pipeline(pipe)
+        self._wrap_functions(nx)
+
+    def _wrap_functions(self, nx) -> None:
+        """The module-level functions that write or run filters past the
+        class wrappers (simplnx is one extension module, so its attribute is
+        the only way to them):
+
+          append_to_dream3d_file(path, ...)  writes into an existing .dream3d
+                                             from C++: its path is an output;
+          test_filter(filter)                runs a filter with arguments no
+                                             wrapper sees;
+          load_python_plugin / reload_python_plugins
+                                             load Python filters from code."""
+        guard = self
+        real_append = vars(nx).get("append_to_dream3d_file")
+        if real_append is not None:
+            def append_to_dream3d_file(*args, **kwargs):
+                if guard.model:
+                    if "path" in kwargs:
+                        kwargs["path"] = guard.check_write(
+                            kwargs["path"], "append_to_dream3d_file.path")
+                    elif args:
+                        args = (guard.check_write(
+                            args[0], "append_to_dream3d_file.path"),
+                            ) + tuple(args[1:])
+                return real_append(*args, **kwargs)
+            append_to_dream3d_file.__doc__ = real_append.__doc__
+            setattr(nx, "append_to_dream3d_file", append_to_dream3d_file)
+        real_test = vars(nx).get("test_filter")
+        if real_test is not None:
+            def test_filter(filt, *args, **kwargs):
+                guard.check_capability(type(filt),
+                                       f"test_filter({type(filt).__name__})")
+                if guard.model:
+                    guard.refuse("test_filter", "it runs a filter with "
+                                                "arguments this check "
+                                                "cannot see")
+                return real_test(filt, *args, **kwargs)
+            test_filter.__doc__ = real_test.__doc__
+            setattr(nx, "test_filter", test_filter)
+        for name in ("load_python_plugin", "reload_python_plugins"):
+            real = vars(nx).get(name)
+            if real is None:
+                continue
+
+            def make(real=real, name=name):
+                def loader(*args, **kwargs):
+                    if guard.model:
+                        guard.refuse(name, "a pipeline script the Council "
+                                           "runs may not load Python plugins")
+                    return real(*args, **kwargs)
+                loader.__doc__ = real.__doc__
+                return loader
+            setattr(nx, name, make())
 
     def _wrap_execute(self, cls: type) -> None:
         if cls in self.patched:
@@ -493,7 +549,21 @@ class Guard:
         "winreg.DeleteKey", "winreg.DeleteValue", "winreg.SetValue",
         "winreg.SaveKey", "winreg.LoadKey", "winreg.ConnectRegistry",
         "shutil.make_archive", "shutil.unpack_archive", "os.link",
-        "os.symlink",
+        "os.symlink", "sqlite3.enable_load_extension",
+        "sqlite3.load_extension",
+    })
+
+    # Packages that write files from C, where no audit event sees the write
+    # (VTK's writers, HDF5 through h5py/PyTables, ...). The import allowlist
+    # keeps them out of a model's script; this keeps them out at run time.
+    # vtk is installed in the nxpython env (measured). Writers that go
+    # through Python's open() — numpy, Pillow, matplotlib — are held by the
+    # "open" event instead.
+    _NATIVE_WRITERS = frozenset({
+        "vtk", "vtkmodules", "h5py", "tables", "netCDF4", "zarr", "pyarrow",
+        "SimpleITK", "itk", "cv2", "imageio", "tifffile", "meshio", "pandas",
+        "sqlite3", "_sqlite3", "cffi", "_cffi_backend", "win32api",
+        "win32file", "pywintypes", "pythoncom",
     })
 
     def audit(self, event: str, args: tuple) -> None:
@@ -537,6 +607,25 @@ class Guard:
             name, access = args[0], args[1] if len(args) > 1 else 0
             if access & 0x40000000:     # GENERIC_WRITE
                 self.check_write(name, f"opening {name} for writing")
+        elif event == "import":
+            root = str(args[0] or "").split(".")[0]
+            if root in self._NATIVE_WRITERS:
+                self.refuse(f"importing {args[0]}",
+                            "it writes files from native code, past this "
+                            "containment")
+            if root in NX_MODULES:
+                # Imported (and wrapped) before the script started, so a
+                # fresh import means it was taken out of sys.modules — and a
+                # single-phase extension module comes back with its original
+                # functions — or it could not be loaded then, and its filters
+                # were never wrapped.
+                self.refuse(f"importing {args[0]}",
+                            "it was not loaded and wrapped before the script "
+                            "started, so it would run outside this "
+                            "containment")
+        elif event == "sqlite3.connect":
+            if str(args[0]) != ":memory:":
+                self.check_write(args[0], f"opening the database {args[0]}")
         elif event in self._NEVER:
             self.refuse(event, "a pipeline script the Council runs may not "
                                "start processes, load native code, open "

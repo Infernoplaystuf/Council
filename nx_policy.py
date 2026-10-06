@@ -162,6 +162,8 @@ FILE_CHANGE_NAMES = frozenset({
     "tofile", "save", "savez", "savez_compressed", "savetxt", "memmap",
     "dump", "copyfile", "copytree", "move", "makedirs", "mkfifo", "mknod",
     "unpack_archive", "make_archive",
+    # simplnx's own: writes into an existing .dream3d from C++.
+    "append_to_dream3d_file",
 })
 
 # Modules the import allowlist keeps out, reached as an ATTRIBUTE of one it
