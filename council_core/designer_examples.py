@@ -418,6 +418,8 @@ class LayoutChanges:
     rewired: List[str] = field(default_factory=list)
     #: "s08: port frame_count -> frame_rate"
     ports: List[str] = field(default_factory=list)
+    #: "Model (s26): entry -> combobox" — another widget, named afresh.
+    rekinded: List[str] = field(default_factory=list)
     relabelled: List[str] = field(default_factory=list)
     moved: int = 0
     #: Any other difference: props, colours, fonts, resize.
@@ -447,6 +449,7 @@ class LayoutChanges:
         for title, items in (("added", self.added), ("removed", self.removed),
                              ("rewired", self.rewired),
                              ("ports", self.ports),
+                             ("new kind", self.rekinded),
                              ("relabelled", self.relabelled)):
             out.extend(self._named(title, items))
         out.extend(kept)
@@ -484,7 +487,9 @@ def layout_changes(old: Sequence[Any], new: Sequence[Any]) -> LayoutChanges:
 
     Ids are what the manifest keys widget and port names by, so a shape that
     kept its id keeps its widget, its port and its handler — which is what
-    makes "rewired" mean "the same button now calls something else"."""
+    makes "rewired" mean "the same button now calls something else" —
+    unless its KIND changed ("new kind"): another widget, which
+    update_from_example names afresh (_forget_rekinded)."""
     from . import designer_wiring as wiring
 
     out = LayoutChanges()
@@ -507,6 +512,9 @@ def layout_changes(old: Sequence[Any], new: Sequence[Any]) -> LayoutChanges:
                              f"{new_port or '(derived)'}")
         if (was.label or "") != (now.label or ""):
             out.relabelled.append(f"{key}: {was.label!r} → {now.label!r}")
+        if was.kind != now.kind:
+            out.rekinded.append(f"{_shape_name(now)}: {was.kind} → "
+                                f"{now.kind}")
         if (was.x, was.y, was.w, was.h) != (now.x, now.y, now.w, now.h):
             out.moved += 1
         if any(getattr(was, f) != getattr(now, f)
@@ -659,6 +667,32 @@ def links_before(old_shapes: Sequence[Any], manifest: Any) -> Dict[str, Any]:
     return links
 
 
+def _forget_rekinded(manifest: Any, old: Sequence[Any],
+                     new: Sequence[Any]) -> Dict[str, Tuple[str, str]]:
+    """Drop the recorded widget name of every shape whose KIND changed, so
+    Generate names it as a fresh build would; {shape id: (its name in the
+    log, the name dropped)}.
+
+    A widget name says its kind (ent_, cmb_, btn_ ...) and names its handler
+    (on_<name>). MEASURED before: Typhon's model box went from an entry to a
+    dropdown and kept "ent_entry_3" — a QComboBox called self.ent_entry_3
+    with its handler on_ent_entry_3, where a fresh build has cmb_model and
+    on_cmb_model. The PORT keeps its name (port_names), so links and
+    self.ports.<name> are untouched; code that used the old widget name is
+    named by Generate's own check, and the update's log says what became
+    what."""
+    was = {s.id: s.kind for s in old}
+    names = dict(getattr(manifest, "widget_names", {}) or {})
+    dropped: Dict[str, Tuple[str, str]] = {}
+    for shape in new:
+        if (shape.id in was and was[shape.id] != shape.kind
+                and shape.id in names):
+            dropped[shape.id] = (_shape_name(shape), names.pop(shape.id))
+    if dropped:
+        manifest.widget_names = names
+    return dropped
+
+
 def backup_gspec(project_dir: Any, stamp: str = "") -> Path:
     """Copy project.gspec to project.gspec.<stamp>.bak beside it.
 
@@ -736,6 +770,7 @@ def update_from_example(name: str, example: str, vault_dir: Any, *,
         manifest = gpj.load_manifest(pdir)
         manifest.example = out.example
         manifest.script_links = links_before(old.shapes, manifest)
+        renamed = _forget_rekinded(manifest, old.shapes, shapes)
         gpj.save_manifest(pdir, manifest)
     except Exception as exc:                             # noqa: BLE001
         kept = (f" — the old drawing is in {out.backup.name}"
@@ -767,6 +802,13 @@ def update_from_example(name: str, example: str, vault_dir: Any, *,
                 f"listed and press Generate — or copy {out.backup.name} back "
                 f"over {gpj.GSPEC_NAME} to return to the old drawing.")
         return out
+    names = gpj.load_manifest(pdir).widget_names
+    for sid, (label, was) in renamed.items():
+        now = names.get(sid, "")
+        if now and now != was:
+            out.say(f"{label}: another kind of widget, named afresh: {was} → "
+                    f"{now} (code of yours that used self.{was} needs "
+                    f"self.{now})")
     out.say(f"updated and generated in {out.seconds:.2f}s — handlers.py and "
             f"app.py were kept")
     out.ok = True

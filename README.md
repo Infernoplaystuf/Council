@@ -534,6 +534,11 @@ download). On the 120-frame sample capture, 3 bad-timing and 4 good marked
 frames were enough to find all 10 bad-timing frames with no false alarms.
 Classes and marks are kept in your vault under `classifiers/<name>/` — never in
 the capture folder — and a class that still labels frames cannot be removed.
+That store is shared by every app on the PC, and each classifier records the
+app it came from; **Typhon** lists them in a dropdown with Save as, Rename,
+Delete, one-file Export and Import, and says which model version classified
+the capture folder — see `docs/camera_quickstart.md`, *The classifier: saved
+models*.
 
 `barbie_capture_v2` adds a readable font and a **region of
 interest** on the live image to v1. Browse to a folder of frames, click **Draw ROI**

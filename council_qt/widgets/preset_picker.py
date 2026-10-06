@@ -24,6 +24,14 @@ The box is editable: pick a preset to apply it, or type a new name and press
 Save preset. A typed name that is not a preset yet answers with a hint
 (pick_preset), not an error dialog for typing.
 
+WHAT IS TYPED IS WHAT THE BOX HOLDS
+An editable QComboBox completes a typed name INLINE from its list. MEASURED
+in a built Typhon with its window active: "Bird" typed for a new preset read
+"Bird bath" (the rest selected), and Save preset saved over "Bird bath" —
+its gain 1.0 became 7.0, and no "Bird" was made; "Bi", a refill, then "x"
+gave "Bird bathx". So the box has no completer: the list is one click away,
+and a name to save under must be exactly the name typed.
+
 NOTHING HERE TOUCHES THE CAMERA ON A TIMER
 It reads the camera's area and the preset file only when it is told that
 something changed — never per tick, so the live view pays nothing for it.
@@ -100,6 +108,8 @@ class PresetPicker(QObject):
     @staticmethod
     def _dress(combo: QComboBox) -> None:
         combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        if combo.isEditable():
+            combo.setCompleter(None)    # see WHAT IS TYPED IS WHAT THE BOX HOLDS
         combo.setToolTip(TIP)
         if combo.isEditable() and combo.lineEdit() is not None:
             combo.lineEdit().setPlaceholderText(PLACEHOLDER)
@@ -146,18 +156,39 @@ class PresetPicker(QObject):
 
     # -- the box ----------------------------------------------------------
     def fill(self, names: List[str], select: str = "") -> None:
-        """Put `names` in the box. The text in it stays when it is still one
-        of them (or `select`, after a save or a rename); otherwise the box
-        is left showing its placeholder."""
+        """Put `names` in the box. The preset shown stays when it is still
+        one of them (or `select`, after a save or a rename); one that is
+        gone leaves the placeholder.
+
+        A NAME BEING TYPED IS NEVER TAKEN AWAY (see _typing). The list is
+        refilled whenever the camera changes anywhere (the settings window
+        saving or renaming a preset, Connect), and each refill used to clear
+        it (it was not in the new list) or replace it with the name just
+        saved there. It now stays, cursor and all; `select` applies only to
+        a box showing a preset."""
         combo = self.combo
         if combo is None:
             return
         self.fills += 1
+        typing = self._typing()
+        typed = combo.currentText() if typing else ""
+        line = combo.lineEdit() if typing else None
+        cursor = line.cursorPosition() if line is not None else 0
         keep = select or combo.currentText()
         blocker = QSignalBlocker(combo)
         try:
             combo.clear()
             combo.addItems([str(n) for n in names])
+            if typing:
+                # Saved from this box just now: it is a preset, picked.
+                index = combo.findText(typed.strip(),
+                                       Qt.MatchFlag.MatchFixedString)
+                combo.setCurrentIndex(index)
+                if index < 0:
+                    combo.setEditText(typed)
+                    if line is not None:
+                        line.setCursorPosition(min(cursor, len(typed)))
+                return
             index = combo.findText(keep, Qt.MatchFlag.MatchFixedString) \
                 if keep else -1
             combo.setCurrentIndex(index)
@@ -166,10 +197,31 @@ class PresetPicker(QObject):
         finally:
             del blocker
 
-    def select(self, name: str) -> None:
-        """Show `name` as the preset in use (after it was applied)."""
+    def _typing(self) -> bool:
+        """Whether the box holds a name the user is typing: text that is not
+        one of the presets listed (a new name, half-way through), or text
+        the user has edited since the box was last filled or picked from
+        (the line edit's modified flag: every programmatic write clears it,
+        every keystroke sets it)."""
         combo = self.combo
-        if combo is None or not name:
+        if combo is None or not combo.isEditable():
+            return False
+        typed = combo.currentText()
+        if not typed.strip():
+            return False
+        line = combo.lineEdit()
+        listed = {combo.itemText(i).casefold() for i in range(combo.count())}
+        return typed.casefold() not in listed or bool(
+            line is not None and line.isModified())
+
+    def select(self, name: str) -> None:
+        """Show `name` as the preset in use (after it was applied) — unless a
+        name is being typed. Focus stays in the box after a pick, and a slow
+        camera's restart takes 0.15-1 s: MEASURED before, "Xmas eve" typed
+        while "Small" was applying on the worker was replaced by "Small"
+        when the late answer came."""
+        combo = self.combo
+        if combo is None or not name or self._typing():
             return
         index = combo.findText(name, Qt.MatchFlag.MatchFixedString)
         if index >= 0:

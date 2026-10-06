@@ -21,7 +21,16 @@ from council_core import cameras
 
 @pytest.fixture(autouse=True)
 def clean():
-    """Module-level state means every test must start from nothing."""
+    """Module-level state means every test must start from nothing.
+
+    Except Pillow's plugins: warmed here, once, as a Typhon window warms
+    them when it opens (capture.warm_in_background). Without an attached
+    window, Connect warms them on a thread and the live view waits for
+    that — so a test run on its own, in a fresh process, saw its first
+    ~0.3 s of preview missing (5 frames where 0.5 s gives 25)."""
+    from council_core import capture
+
+    capture.warm_imports()
     frame_camera.disconnect()
     frame_camera._LIVE.found = None
     frame_camera._LIVE.reviewer = None
@@ -746,12 +755,23 @@ def test_starting_from_the_preview_starts_the_raw_before_the_stream(tmp_path):
 
 def test_a_capture_counts_only_its_own_frames(tmp_path):
     """The frames the preview showed were never meant to be saved; counted,
-    they would read as frames the capture lost."""
+    they would read as frames the capture lost.
+
+    So every frame counted once Start returns is the run's: saved, waiting
+    to be saved, or skipped by the run's own writer — the preview's ~25 are
+    in none of those. (This asserted "at most 2 grabbed", which stood for
+    the same thing while Start took under 40 ms of an event camera's 20 ms
+    windows. Start also writes the run's camera record now, fsync'd; in one
+    full run a slow disk made it 0.58 s, and a correct capture failed with
+    29 grabbed — all 29 saved.)"""
     connected("event")
     ticks(ViewerStub(), seconds=0.5)
     assert frame_camera._LIVE.session.stats().grabbed > 10
     frame_camera.start(str(tmp_path))
-    assert frame_camera._LIVE.session.stats().grabbed <= 2
+    s = frame_camera._LIVE.session.stats()
+    # One frame of slack: stats() reads the writer's counts a moment before
+    # the grab loop's, and a frame may be counted in between.
+    assert s.grabbed - (s.recorded + s.waiting + s.skipped) <= 1, s
     frame_camera.stop()
 
 

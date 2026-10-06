@@ -239,13 +239,16 @@ another name, so in a shared store one app's classifier is another's by
 accident. MEASURED (Barbie v5 and Typhon built into one vault): Typhon, its
 name box left alone, added its classes and marks to Barbie's classifier and
 its Train became Barbie's current model — nothing asked. So only the app a
-classifier BELONGS to changes it (Add class, Remove class, Mark, Train):
-the app that made it, or — for a copy — the app that made the copy (its
-latest Save as or Import, recorded in the lineage with the app's identity).
-Any app may open it, predict and classify with it, tag it, copy it, export
-it. Another app is told whose it is and offered the two ways on: Save as
-(its own copy, keeping the origin) or the tag "shared", which lets every
-app change it. A classifier whose origin is unknown is anyone's.
+classifier BELONGS to changes it (Add class, Remove class, Mark, Train) or
+renames or deletes it (the app that owns it would find it gone — MEASURED,
+2026-10-06: Typhon's dropdown put Rename and Delete one click away for
+every model in the store): the app that made it, or — for a copy — the app
+that made the copy (its latest Save as or Import, recorded in the lineage
+with the app's identity). Any app may open it, predict and classify with
+it, tag it, copy it, export it. Another app is told whose it is and offered
+the two ways on: Save as (its own copy, keeping the origin) or the tag
+"shared", which lets every app change it. A classifier whose origin is
+unknown is anyone's.
 
 What happens to a classifier afterwards is appended to its LINEAGE, never
 written over the origin: Save as keeps the origin and adds "copied from
@@ -264,9 +267,11 @@ FILTERING
 ``show`` narrows the list, so a store many apps use stays readable:
 
     "" / "All classifiers"     everything
-    "This app"                 what the running app made (same project id, or
-                               same project and app name — a rebuilt project
-                               keeps its classifiers)
+    "This app"                 what BELONGS to the running app (WHOSE IT IS):
+                               what it made, and its copies and imports of
+                               others' — same project id, or same project
+                               and app name (a rebuilt project keeps its
+                               classifiers)
     "App: Typhon"              made by any app called Typhon
     "Project: example_typhon"  made by that project
     "Tag: night shift"         tagged so by the user ("#night shift" too)
@@ -344,9 +349,10 @@ change for that:
     classifier_store.json ({"store": "classifiers"}, relative to that file)
     beside the app;
   * export_this_app (or export_classifiers with a filter) writes everything
-    one app or project made into ONE bundle, <label>-<stamp>.typhon-
-    classifiers.zip: bundle.json (format "typhon-classifier-bundle",
-    version 1, listing each classifier, its origin and checksums), a
+    that belongs to one app (see WHOSE IT IS) into ONE bundle,
+    <label>-<stamp>.typhon-classifiers.zip: bundle.json (format
+    "typhon-classifier-bundle", version 1, listing each classifier, its
+    origin and checksums), a
     README.txt, and one complete single-classifier export per classifier;
   * the independent app imports that bundle into its own store with the
     same import_classifier, keeping every origin and adding the import to
@@ -366,7 +372,11 @@ as the older), the folder, each capture run in it (the "<stamp>" of
 "<stamp>_frame_000001.png") with its frame count, the classifier, the
 version id and sha, the count per class, this PC's name and the app that
 ran it. run_history and classified_with read it back, so the app can say
-"Classified with frames v3 (1a2b3c4d) on 2026-10-02 14:03". The record lives
+"Classified with frames v3 (1a2b3c4d) on 2026-10-02 14:03" — and, a capture
+run at a time, which runs in the folder now that does not cover ("· not
+classified yet: run 20261005_130000 (8 frames)"). A record keeps the name its
+classifier had; it is shown as the classifier is called NOW ("hawks v3
+(1a2b3c4d; then called frames)" after a Rename). The record lives
 in the store: the capture folder is never written to. A folder is a path on
 ONE PC, so the record of another PC (carried in by an import) never answers
 for a folder here. Only the folder asked about is resolved; each record's
@@ -381,12 +391,18 @@ is the user deliberately changing that one label.
 
 Failures RAISE RuntimeError with a sentence a user can act on; a generated
 handler shows it in a dialog and clears what the button fills. Soft cases that
-are not failures — "Add class" with nothing typed; Save as, Rename or Import
-with no name typed or a name that is taken; Use selected or Delete with
-nothing picked; Import with no file chosen — return the open classifier and
-its classes unchanged and say what to do, so a stray click empties nothing.
-MEASURED before: each of those raised, the handler blanked the name box and
-the class list, and the next Train failed on ''. Summaries lead with one
+are not failures — "Add class" with nothing typed, or no model; Save as,
+Rename or Import with no name typed, a name that is taken or one that cannot
+be a name; Use selected or Delete with nothing picked; Import with no file
+chosen, a file that is not there or one its checks refuse; Add class, Remove
+class, Rename or Delete of another app's classifier (WHOSE IT IS) — return
+the open classifier and its classes unchanged and say what to do, so a
+stray click or a slip of the keyboard empties nothing. MEASURED before: each
+of those raised, the handler blanked the name box and the class list, and
+the next Train failed on ''. A press that takes a typed name answers
+"cleared": "" once it used the name, the name as typed when it asks for
+another — so New name never carries one press's name into the next (an
+Import named a restored model after the last Save as). Summaries lead with one
 short sentence and name files, not folders: the paths are in their own keys
 ("path", "moved_to", "store").
 
@@ -1331,25 +1347,34 @@ def _owner(about: Dict[str, Any],
     return origin
 
 
+def _owner_refusal(d: Path, doing: str) -> str:
+    """Why this app may not change the classifier in ``d`` (see WHOSE IT
+    IS) — "" when it may. The words a refusal says, whether it raises
+    (_check_owner) or answers softly (Add class, Remove class, Rename,
+    Delete: a press the window must survive)."""
+    if _is_new(d):
+        return ""
+    try:
+        about = _read_about(d)
+    except RuntimeError:
+        return ""   # a damaged record is reported where it is read; work goes on
+    owner = _owner(about)
+    if owner is None or _same_app(owner, _this_app()):
+        return ""
+    return (f"'{d.name}' belongs to {_app_label(owner)}, not to this app — "
+            f"Save as to make a copy of your own (it keeps where it came "
+            f"from), or tag it '{SHARED_TAG}' to let every app change it. "
+            f"Nothing was {doing}.")
+
+
 def _check_owner(d: Path, doing: str) -> None:
     """Refuse a change to another app's classifier (see WHOSE IT IS).
     MEASURED before: Typhon, its name box left at the shipped default,
     added its classes and marks to Barbie's "frames" and its Train became
     Barbie's current model — nothing asked."""
-    if _is_new(d):
-        return
-    try:
-        about = _read_about(d)
-    except RuntimeError:
-        return      # a damaged record is reported where it is read; work goes on
-    owner = _owner(about)
-    if owner is None or _same_app(owner, _this_app()):
-        return
-    raise RuntimeError(
-        f"'{d.name}' belongs to {_app_label(owner)}, not to this app — Save "
-        f"as to make a copy of your own (it keeps where it came from), or "
-        f"tag it '{SHARED_TAG}' to let every app change it. Nothing was "
-        f"{doing}.")
+    why = _owner_refusal(d, doing)
+    if why:
+        raise RuntimeError(why)
 
 
 def _taken(n: str) -> Optional[str]:
@@ -2117,7 +2142,7 @@ def open_classifier(name: Any, current: Any = "") -> Dict[str, Any]:
             origin, tags = _origin_text(about["origin"]), about["tags"]
             history = [_event_text(e) for e in about["lineage"]]
             # The origin's date is left to the "origin" key when a later
-            # event is shown: the status line is short (Typhon's is 336x72).
+            # event is shown: the status line is short (Typhon's is 336x96).
             made = (f" From {_origin_text(about['origin'], dated=not history)}"
                     + (f"; {history[-1]}" if history else "")
                     + (f"; tags {', '.join(tags)}" if tags else "") + ".")
@@ -2129,12 +2154,23 @@ def open_classifier(name: Any, current: Any = "") -> Dict[str, Any]:
 
 
 def add_class(name: Any, new_class: Any) -> Dict[str, Any]:
-    d = store_dir(name)
     cls = str(new_class or "").strip()
+    if not _name_of(name):
+        # No model in the box (a fresh Typhon's starts empty): asked about,
+        # and the class just typed is kept for the Add class that follows.
+        return {"classes": [], "cleared": cls,
+                "summary": "Pick a saved model, or type a new model's name, "
+                           "first — then Add class."}
+    d = store_dir(name)
     if not cls:
         return {"classes": list(_load_dir(d)["classes"]), "cleared": "",
                 "summary": "Type a class name in New class, then Add class."}
-    _check_owner(d, "added")
+    refused = _owner_refusal(d, "added")
+    if refused:
+        # An answer, like "still labels 3 frames": raising made the handler
+        # blank the class list and the class just typed (MEASURED).
+        return {"classes": list(_load_dir(d)["classes"]), "cleared": cls,
+                "summary": refused}
     with _locked(d):
         data = _load_dir(d)
         if cls in data["classes"]:
@@ -2153,7 +2189,9 @@ def remove_class(name: Any, selection: Any) -> Dict[str, Any]:
     if not cls:
         return {"classes": list(_load_dir(d)["classes"]),
                 "summary": "Pick a class in the list to remove it."}
-    _check_owner(d, "removed")
+    refused = _owner_refusal(d, "removed")
+    if refused:
+        return {"classes": list(_load_dir(d)["classes"]), "summary": refused}
     with _locked(d):
         data = _load_dir(d)
         n = _counts(data).get(cls, 0)
@@ -2427,8 +2465,12 @@ def classify_folder(name: Any, folder: Any) -> Dict[str, Any]:
     Each call is RECORDED in the classifier's runs.jsonl (in the store —
     the capture folder is only read): when, the folder, each capture run in
     it, the version id and sha, the count per class, this PC and the app.
+    "classified_with" is the line classified_with(folder) gives from now
+    on, made from the record just written (no store search), so one link
+    can fill the window's "classified with" line too; a run that could not
+    be recorded says so there.
 
-    Keys: rows, counts, version, sha256, summary
+    Keys: rows, counts, version, sha256, classified_with, summary
     """
     d = store_dir(name)
     n = d.name
@@ -2469,8 +2511,9 @@ def classify_folder(name: Any, folder: Any) -> Dict[str, Any]:
                 tally[cls] += 1
                 rows.append(f"{nm}   {cls}" + ("" if pr[best] >= 0.8 else f"  ({share})"))
     vid = _vid(n, meta)
-    recorded = ""
+    recorded = line = ""
     if rows:
+        record: Dict[str, Any] = {}
         if _inside(d, f):
             # MEASURED before: with the store pointed into the capture
             # folder, this said "recorded" and the folder gained the record.
@@ -2482,7 +2525,7 @@ def classify_folder(name: Any, folder: Any) -> Dict[str, Any]:
                 run = _run_of(nm)
                 runs[run] = runs.get(run, 0) + 1
             me = _this_app()
-            why = _append_run(d, {
+            record = {
                 "when": _now(), "at": time.time(), "folder": str(f.resolve()),
                 "runs": runs, "frames": len(rows), "unreadable": unreadable,
                 "classifier": n, "version": meta["version"],
@@ -2490,22 +2533,100 @@ def classify_folder(name: Any, folder: Any) -> Dict[str, Any]:
                 "host": _host(),
                 "by": {k: str(me.get(k) or "") for k in
                        ("app", "project", "project_id", "script",
-                        "script_id")}})
+                        "script_id")}}
+            why = _append_run(d, record)
         recorded = (f" — classified with {vid}, recorded." if not why else
                     f" — classified with {vid} (NOT recorded: {why}).")
+        line = (_latest_text(record) if not why else
+                f"Classified with {vid} just now — NOT recorded: {why}")
     summary = (f"{len(rows)} frames: "
                + ", ".join(f"{c} {k}" for c, k in tally.items())
                + (f"; {unreadable} unreadable" if unreadable else "")
                + recorded + ((" " + " ".join(notes)) if notes else ""))
     return {"rows": rows, "counts": tally, "version": vid,
-            "sha256": meta["sha256"], "summary": summary}
+            "sha256": meta["sha256"], "classified_with": line,
+            "summary": summary}
 
 
 # ============================================================
 # The library
 # ============================================================
 
+def _stat_sig(p: Path) -> Optional[Tuple[int, int, int]]:
+    """(file id, mtime ns, size) of ``p``, None when it is not there: what
+    changes whenever a file is replaced or rewritten. Every write here is a
+    temp file renamed into place, which gives the name a new file id."""
+    try:
+        st = p.stat()
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+#: _describe's answers by classifier folder: (signature, answer). READ AGAIN
+#: whenever a file it read changed (_describe_sig), so another app's Save as,
+#: Rename, Train or tag is seen at the next look.
+_DESCRIBED: Dict[str, Tuple[Any, Dict[str, Any]]] = {}
+
+
+#: The files of a classifier folder _describe reads.
+_DESCRIBED_FILES = frozenset(("classes.json", ABOUT, "model.npz"))
+
+
+def _describe_sig(d: Path) -> Any:
+    """What _describe(d) read, by signature: the time and size of
+    classes.json, about.json and the pre-versions model.npz, and the names
+    in versions/ (a version is a whole folder renamed in, never changed).
+
+    TWO DIRECTORY LISTINGS, NOT FIVE STATS: on Windows a listing carries
+    each file's time and size, and a stat is a system call of its own
+    (MEASURED: 48 us each, 0.25 of the 0.38 ms a cached row cost). Every
+    write here is a temp file closed, then renamed into place, so the
+    listing's entry is the new file's."""
+    files = []
+    try:
+        with os.scandir(d) as it:
+            for e in it:
+                if e.name in _DESCRIBED_FILES:
+                    st = e.stat()
+                    files.append((e.name, st.st_mtime_ns, st.st_size))
+    except OSError:
+        return None
+    try:
+        with os.scandir(d / VERSIONS) as it:
+            versions = sorted(e.name for e in it)
+    except OSError:
+        versions = []
+    numbers = [int(m.group(1)) for m in map(_VERSION_RE.match, versions) if m]
+    # ... and the newest version's meta.json, which says whether it is
+    # damaged: a file of its own, read whole only when it changed.
+    meta = (_stat_sig(d / VERSIONS / f"v{max(numbers)}" / "meta.json")
+            if numbers else None)
+    return tuple(sorted(files)), tuple(versions), meta
+
+
 def _describe(d: Path) -> Dict[str, Any]:
+    """What the list shows for one classifier folder — read again only when
+    one of its files changed (_DESCRIBED). MEASURED before: 1.0-1.2 ms a
+    classifier, every time the dropdown opened, on the UI thread — 52-62 ms
+    at 50 saved models, 520-630 ms at 500."""
+    key = str(d)
+    held = _DESCRIBED.get(key)
+    sig = _describe_sig(d)
+    if held is not None and sig is not None and sig == held[0]:
+        info = held[1]
+    else:
+        info = _describe_now(d)
+        _DESCRIBED[key] = (sig, info)
+    # A copy: the answer is handed to callers ("details").
+    return dict(info, classes=list(info["classes"]),
+                counts=dict(info["counts"]), lineage=list(info["lineage"]),
+                history=list(info["history"]), tags=list(info["tags"]),
+                origin=dict(info["origin"] or {}),
+                owner=dict(info["owner"] or {}))
+
+
+def _describe_now(d: Path) -> Dict[str, Any]:
     """What the list shows for one classifier folder. READ-ONLY: listing
     migrates nothing and sets nothing aside, and a damaged classifier is a
     row saying so rather than an error that hides all the others."""
@@ -2513,7 +2634,7 @@ def _describe(d: Path) -> Dict[str, Any]:
         "name": d.name, "trained": False, "version": 0, "version_id": "",
         "sha256": "", "classes": [], "frames": 0, "counts": {},
         "updated": "", "origin": _unknown_origin(), "origin_text": "",
-        "lineage": [], "history": [], "tags": [], "problem": ""}
+        "lineage": [], "history": [], "tags": [], "owner": {}, "problem": ""}
     p = d / "classes.json"
     if p.is_file():
         try:
@@ -2535,6 +2656,12 @@ def _describe(d: Path) -> Dict[str, Any]:
         info.update(origin=about["origin"], lineage=about["lineage"],
                     tags=about["tags"],
                     history=[_event_text(e) for e in about["lineage"]])
+        # The app it BELONGS to (WHOSE IT IS), "shared" or not: what "This
+        # app" lists. A copy whose maker was not recorded falls back to
+        # where it was made.
+        owner = _owner(about, honour_shared=False)
+        info["owner"] = owner if owner is not None else (
+            about["origin"] if about.get("recorded") else {})
     except RuntimeError as exc:
         info["problem"] = info["problem"] or str(exc).split(" — ")[0]
         info["origin"] = {}
@@ -2641,7 +2768,11 @@ def _matches(info: Dict[str, Any], how: str, value: str,
     if how == "all":
         return True
     if how == "this":
-        return _same_app(o, me)
+        # What BELONGS to it, not what it made: MEASURED before, Typhon's
+        # trained copy of Barbie's model was missing from "This app" and from
+        # its spin-off bundle — the one model only Typhon may change — while
+        # Barbie's "This app" listed it.
+        return _same_app(info.get("owner") or {}, me)
     if how == "unknown":
         return bool(o.get("unknown"))
     if how == "tag":
@@ -2696,13 +2827,23 @@ def _filters(found: List[Dict[str, Any]]) -> List[str]:
     return out
 
 
-def _library(show: Any = "") -> Dict[str, Any]:
+def _classifier_folders() -> List[Path]:
+    """Every classifier folder in the store, by name. One listing: on
+    Windows it says which entries are folders with no stat per entry."""
     root = classifier_store()
-    found = []
-    if root.is_dir():
-        for d in sorted(root.iterdir(), key=lambda e: e.name.lower()):
-            if d.is_dir() and _NAME_RE.match(d.name):
-                found.append(_describe(d))
+    try:
+        with os.scandir(root) as it:
+            names = [e.name for e in it
+                     if _NAME_RE.match(e.name) and e.is_dir()]
+    except OSError:
+        return []
+    return [root / n for n in sorted(names, key=str.lower)]
+
+
+def _library(show: Any = "") -> Dict[str, Any]:
+    found = [_describe(d) for d in _classifier_folders()]
+    if len(_DESCRIBED) > 4 * max(64, len(found)):
+        _DESCRIBED.clear()          # folders renamed or deleted long ago
     me = _this_app()
     how, value = _parse_show(show)
     shown = [i for i in found if _matches(i, how, value, me)]
@@ -2836,10 +2977,44 @@ def _stage_into_place(build, target: Path) -> None:
 
 def _new_name(new_name: Any) -> str:
     """The name typed for a copy, a rename or an import: "" when nothing
-    was typed, else a usable name (an unusable one RAISES — it is not a slip
-    of the mouse but a name to correct)."""
+    was typed, else a usable name (an unusable one RAISES; the library
+    presses ask about it first, see _unusable)."""
     new = _name_of(new_name)
     return _check_name(new) if new else ""
+
+
+def _unusable(new_name: Any, nothing: str) -> str:
+    """What to say when the name typed for a copy, a rename or an import
+    cannot be a name — "" when it can, or when none was typed. ASKED, not
+    raised: it is a name to correct and press again, and MEASURED before,
+    the raise made the generated handler blank the open model's name and
+    classes ('my birds' for Save as, 'a/b' for Rename)."""
+    new = _name_of(new_name)
+    if not new:
+        return ""
+    try:
+        _check_name(new)
+    except RuntimeError as exc:
+        return f"{_sentence(exc)} Nothing was {nothing}."
+    return ""
+
+
+def _sentence(exc: Any) -> str:
+    """A refusal's words as a sentence for the status line: a capital
+    first letter and a full stop ("there is no classifier 'x' to copy" ->
+    "There is no classifier 'x' to copy.")."""
+    text = str(exc).strip()
+    if not text:
+        return ""
+    text = text[0].upper() + text[1:]
+    return text if text.endswith((".", "!", "?")) else text + "."
+
+
+def _typed(new_name: Any) -> str:
+    """The New name box's text as typed — what a press that asks for
+    another name hands back as "cleared", so the box keeps it to correct."""
+    return str(new_name or "").strip() if not isinstance(
+        new_name, (list, tuple)) else _name_of(new_name)
 
 
 def save_as(name: Any, new_name: Any, show: Any = "") -> Dict[str, Any]:
@@ -2847,25 +3022,38 @@ def save_as(name: Any, new_name: Any, show: Any = "") -> Dict[str, Any]:
     version, origin and tags — and switch to the copy. The copy keeps the
     ORIGINAL's origin (it was made there) and its lineage adds "copied from
     <name> <version>"; the copy BELONGS to the app that made it (see WHOSE
-    IT IS). Never replaces an existing classifier: a taken name, or none
-    typed, is asked about — the open classifier stays open. The run record
-    stays with the original: it is the original's history.
+    IT IS). Never replaces an existing classifier: a taken name, none
+    typed, or one that cannot be a name is asked about — the open
+    classifier stays open. The run record stays with the original: it is
+    the original's history.
 
-    Keys: name, classes, rows, table, names, filters, summary
+    "cleared" is what the New name box should hold afterwards: "" once the
+    name was used, the name as typed when the press asks for another.
+
+    Keys: name, classes, cleared, rows, table, names, filters, summary
     """
+    typed = _typed(new_name)
     if not _name_of(name):
         return dict(_listed(_library(show)), name="", classes=[],
+                    cleared=typed,
                     summary="Open (or type) the classifier to copy, then "
                             "press Save as.")
-    n, d = _existing(name, "copy")
-    new = _new_name(new_name)
+    try:
+        n, d = _existing(name, "copy")
+    except RuntimeError as exc:
+        keep, classes = _echo(name)
+        return dict(_listed(_library(show)), name=keep, classes=classes,
+                    cleared=typed,
+                    summary=f"{_sentence(exc)} Nothing was copied.")
+    bad = _unusable(new_name, "copied")
+    new = "" if bad else _new_name(new_name)
     clash = _taken(new) if new else None
     if not new or clash:
         return dict(_listed(_library(show)), name=n,
-                    classes=list(_load_dir(d)["classes"]),
-                    summary=(_clash_text(clash) + "." if clash else
-                             "Type the new name in New name, then press "
-                             "Save as."))
+                    classes=list(_load_dir(d)["classes"]), cleared=typed,
+                    summary=(bad or (_clash_text(clash) + "." if clash else
+                                     "Type the new name in New name, then "
+                                     "press Save as.")))
     target = classifier_store() / new
     _load_dir(d)                  # a damaged classes.json is reported, not copied
     about = _read_about(d)        # ... and so is a damaged about.json
@@ -2892,7 +3080,7 @@ def save_as(name: Any, new_name: Any, show: Any = "") -> Dict[str, Any]:
             _stage_into_place(build, target)
         except FileExistsError:
             return dict(_listed(_library(show)), name=n,
-                        classes=list(_load_dir(d)["classes"]),
+                        classes=list(_load_dir(d)["classes"]), cleared=typed,
                         summary=_clash_text(_taken(new) or new) + ".")
         except OSError as exc:
             raise RuntimeError(f"cannot copy '{n}' to '{new}': "
@@ -2906,7 +3094,7 @@ def save_as(name: Any, new_name: Any, show: Any = "") -> Dict[str, Any]:
     source = f", copied from {copied['from_version']}" if newest else ""
     note = (" " + " ".join(notes)) if notes else ""
     return dict(_listed(lib), name=new,
-                classes=list(_load_dir(target)["classes"]),
+                classes=list(_load_dir(target)["classes"]), cleared="",
                 summary=f"Saved '{n}' as '{new}' {what}{source}; its origin "
                         f"is kept. Now using '{new}'.{note}")
 
@@ -2920,19 +3108,30 @@ def rename_classifier(name: Any, new_name: Any, current: Any = "",
     ``current`` — the name the window has open — is renamed. "name" comes
     back as the new name when the open one was renamed, so the name box
     follows it, and as the open one otherwise. Nothing typed, nothing
-    picked, or a taken name is asked about, never an error.
+    picked, a taken name or one that cannot be a name is asked about, never
+    an error — and so is another app's classifier (see WHOSE IT IS): the
+    app that owns it would find it gone. "cleared" is what the New name box
+    should hold afterwards (see save_as).
 
-    Keys: name, rows, table, names, filters, summary
+    Keys: name, cleared, rows, table, names, filters, summary
     """
     keep, _classes = _echo(current)
+    typed = _typed(new_name)
 
     def ask(text: str) -> Dict[str, Any]:
-        return dict(_listed(_library(show)), name=keep, summary=text)
+        return dict(_listed(_library(show)), name=keep, cleared=typed,
+                    summary=text)
 
     if not (_name_of(name) or _name_of(current)):
         return ask("Pick the classifier to rename in the list, then press "
                    "Rename.")
-    n, d = _existing(name if _name_of(name) else current, "rename")
+    try:
+        n, d = _existing(name if _name_of(name) else current, "rename")
+    except RuntimeError as exc:
+        return ask(f"{_sentence(exc)} Nothing was renamed.")
+    bad = _unusable(new_name, "renamed")
+    if bad:
+        return ask(bad)
     new = _new_name(new_name)
     if not new:
         return ask(f"Type the new name for '{n}' in New name, then press "
@@ -2944,6 +3143,9 @@ def rename_classifier(name: Any, new_name: Any, current: Any = "",
         clash = _taken(new)
         if clash or target.exists():
             return ask(_clash_text(clash or new) + ".")
+    refused = _owner_refusal(d, "renamed")
+    if refused:
+        return ask(refused)
     about = _read_about(d)        # damaged: refused before anything moves
     if about["newer"]:
         raise RuntimeError(_newer_text(n))
@@ -2966,6 +3168,7 @@ def rename_classifier(name: Any, new_name: Any, current: Any = "",
     lib = _library(show)
     return dict(_listed(lib),
                 name=new if not cur or cur.lower() == n.lower() else keep,
+                cleared="",
                 summary=f"Renamed '{n}' to '{new}'. Its versions, origin and "
                         f"run record went with it.{noted}")
 
@@ -2978,17 +3181,29 @@ def delete_classifier(name: Any, current: Any = "",
     a row PICKED: with none, it asks — Delete never falls back to the open
     classifier. ``current`` is the name the window has open: when that is
     the one deleted, "name" and "classes" come back empty so the window
-    stops showing it; otherwise they are the open classifier's.
+    stops showing it; otherwise they are the open classifier's. Another
+    app's classifier is not deleted (see WHOSE IT IS) — asked about, like
+    a pick that is missing: MEASURED before, Typhon deleted Barbie's
+    "frames" with one press, and Barbie's next Open said "'frames' is new".
 
     Keys: name, classes, moved_to, rows, table, names, filters, summary
     """
     keep, classes = _echo(current)
-    if not _name_of(name):
+
+    def ask(text: str) -> Dict[str, Any]:
         return dict(_listed(_library(show)), name=keep, classes=classes,
-                    moved_to="",
-                    summary="Pick the classifier to delete in the list, then "
-                            "press Delete.")
-    n, d = _existing(name, "delete")
+                    moved_to="", summary=text)
+
+    if not _name_of(name):
+        return ask("Pick the classifier to delete in the list, then press "
+                   "Delete.")
+    try:
+        n, d = _existing(name, "delete")
+    except RuntimeError as exc:         # a name typed that is not saved
+        return ask(f"{_sentence(exc)} Nothing was deleted.")
+    refused = _owner_refusal(d, "deleted")
+    if refused:
+        return ask(refused)
     _refuse_if_busy(d, n, "delete it")
     bin_dir = classifier_store() / DELETED
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -3244,7 +3459,12 @@ def _export_target(destination: Any, base: str, suffix: str = EXPORT_SUFFIX,
             k += 1
         return out
     if not p.name.lower().endswith(".zip"):
-        p = p.with_name(p.name + suffix)
+        # A FOLDER that is not there — not a file name: Typhon's export box
+        # is a folder picker, and MEASURED before, a typed folder that did
+        # not exist became "<that folder>.typhon-classifier.zip" beside it.
+        raise RuntimeError(f"{p} is not a folder — choose a folder that "
+                           f"exists, or a file name ending in .zip (nothing "
+                           f"was exported)")
     if not p.parent.is_dir():
         raise RuntimeError(f"{p.parent} is not a folder — choose a folder "
                            f"that exists")
@@ -3360,11 +3580,11 @@ def export_classifier(name: Any, destination: Any,
     row picked in the list is exported — with none picked, ``current``, the
     open one.
 
-    ``destination`` is a folder (the file is named <name>-v<N>.typhon-
-    classifier.zip, never over an existing file) or a file name (".typhon-
-    classifier.zip" is added when it has no .zip; an existing file is
-    replaced only when it is itself a classifier export). The summary names
-    the file; "path" is where it is.
+    ``destination`` is a folder that exists (the file is named <name>-v<N>.
+    typhon-classifier.zip, never over an existing file) or a file name
+    ending in .zip (an existing file is replaced only when it is itself a
+    classifier export). Anything else is a folder that is not there, and is
+    refused. The summary names the file; "path" is where it is.
 
     Keys: path, version, sha256, summary
     """
@@ -3467,8 +3687,10 @@ def export_classifiers(destination: Any, show: Any = "") -> Dict[str, Any]:
 
 
 def export_this_app(destination: Any) -> Dict[str, Any]:
-    """Everything the RUNNING app made, in one bundle — export_classifiers
-    with the "This app" filter, for a button that needs no filter box.
+    """Everything that belongs to the RUNNING app (what it made, and its
+    own copies and imports — see WHOSE IT IS), in one bundle: the models an
+    app going its own way can change. export_classifiers with the "This
+    app" filter, for a button that needs no filter box.
 
     Keys: path, names, skipped, summary
     """
@@ -3895,12 +4117,32 @@ def _import_one(got: Dict[str, Any], target: str, source: str) -> str:
     return _vid(target, meta)
 
 
-def _soft_import(text: str, show: Any, current: Any) -> Dict[str, Any]:
-    """An Import that asks for something (a file, another name): the open
-    classifier and its classes echoed back, nothing imported."""
+def _soft_import(text: str, show: Any, current: Any,
+                 cleared: str = "") -> Dict[str, Any]:
+    """An Import that asks for something (a file, another name) or could
+    not import what it was given: the open classifier and its classes
+    echoed back, nothing imported. ``cleared`` is the New name to keep."""
     keep, classes = _echo(current)
     return dict(_listed(_library(show)), name=keep, classes=classes,
-                version="", imported=[], skipped=[], summary=text)
+                version="", imported=[], skipped=[], cleared=cleared,
+                summary=text)
+
+
+def _not_imported(exc: Exception, show: Any, current: Any,
+                  typed: str) -> Dict[str, Any]:
+    """Why nothing was imported, as an answer (see AN IMPORT NEVER BLANKS
+    THE WINDOW in import_classifier)."""
+    return _soft_import(f"{_sentence(exc)} Nothing was imported.", show,
+                        current, typed)
+
+
+def _import_file(path: Any) -> Path:
+    """The file a picker names, which must be there."""
+    p = Path(_import_path(path)).expanduser()
+    if not p.is_file():
+        raise RuntimeError(f"{p.name or p} is not a file — choose the exported "
+                           f"classifier (*{EXPORT_SUFFIX})")
+    return p
 
 
 def import_classifier(path: Any, new_name: Any = "", show: Any = "",
@@ -3920,19 +4162,38 @@ def import_classifier(path: Any, new_name: Any = "", show: Any = "",
     already is this one (same model, same origin), which is said and
     changes nothing. No file chosen is asked about the same way.
 
-    Keys: name, classes, version, imported, skipped, rows, table, names, filters, summary
+    AN IMPORT NEVER BLANKS THE WINDOW. Nothing about the file chosen or the
+    name typed raises: a file that is not there, one the checks refuse (a
+    member reaching outside, not a zip, an altered checksum, ...), a name
+    that cannot be one — each is the summary, "imported" is empty, and the
+    open classifier comes back as it was. MEASURED before: each of those
+    raised, and the generated handler blanked the open model's name and
+    classes. "cleared" is what the New name box should hold afterwards: ""
+    once the name was used, the name as typed when another is asked for.
+
+    Keys: name, classes, version, imported, skipped, cleared, rows, table, names, filters, summary
     """
-    text = _import_path(path)
-    if not text:
+    typed = _typed(new_name)
+    if not _import_path(path):
         return _soft_import(f"Choose the exported classifier file "
                             f"(*{EXPORT_SUFFIX} or *{BUNDLE_SUFFIX}), then "
-                            f"press Import.", show, current)
-    p = Path(text).expanduser()
-    if not p.is_file():
-        raise RuntimeError(f"{p} is not a file")
-    if _peek_kind(p) == "bundle":
-        return import_bundle(p, new_name, show, current)
-    got = _read_export(p)
+                            f"press Import.", show, current, typed)
+    try:
+        p = _import_file(path)
+        if _peek_kind(p) == "bundle":
+            return import_bundle(p, new_name, show, current)
+        got = _read_export(p)
+        bad = _unusable(new_name, "imported")
+        if bad:
+            return _soft_import(bad, show, current, typed)
+        return _import_checked(p, got, new_name, show, current, typed)
+    except RuntimeError as exc:
+        return _not_imported(exc, show, current, typed)
+
+
+def _import_checked(p: Path, got: Dict[str, Any], new_name: Any, show: Any,
+                    current: Any, typed: str) -> Dict[str, Any]:
+    """import_classifier, once the file has passed every check."""
     manifest, meta, doc = got["manifest"], got["meta"], got["classes"]
     wanted = _new_name(new_name)
     if not wanted:
@@ -3941,36 +4202,43 @@ def import_classifier(path: Any, new_name: Any = "", show: Any = "",
             return _soft_import(f"The classifier in {p.name} is called "
                                 f"{wanted!r}, which cannot be a name here — "
                                 f"type a name in New name and press Import "
-                                f"again. Nothing was imported.", show, current)
+                                f"again. Nothing was imported.", show, current,
+                                typed)
     clash = _taken(wanted)
     if clash and _same_classifier(clash, got):
         lib = _library(show)
         return dict(_listed(lib), name=clash,
                     classes=list(_load(clash)["classes"]),
                     version=_vid(clash, meta), imported=[], skipped=[],
+                    cleared="",
                     summary=f"'{clash}' already is this classifier "
                             f"({_vid(clash, meta)}) — nothing was imported "
                             f"or changed.")
     taken = ("{} — type another name in New name and press Import again. "
              "Nothing was imported.")
     if clash:
-        return _soft_import(taken.format(_clash_head(clash)), show, current)
+        return _soft_import(taken.format(_clash_head(clash)), show, current,
+                            typed)
     try:
         vid = _import_one(got, wanted, p.name)
     except FileExistsError:
         return _soft_import(taken.format(f"'{wanted}' was taken while "
-                                         f"importing"), show, current)
+                                         f"importing"), show, current, typed)
     lib = _library(show)
     same = [i["name"] for i in lib["details"]
             if i["sha256"] == meta["sha256"] and i["name"] != wanted]
     k = len(doc["classes"])
     origin = got["about"]["origin"]
     maker = UNKNOWN_ORIGIN if origin.get("unknown") else _app_label(origin)
+    called = str(manifest.get("name") or "")
     return dict(_listed(lib), name=wanted, classes=list(doc["classes"]),
-                version=vid, imported=[wanted], skipped=[],
+                version=vid, imported=[wanted], skipped=[], cleared="",
                 summary=f"Imported {vid} from {p.name} — {got['frames']} "
                         f"frames in {k} class{'' if k == 1 else 'es'}, made "
                         f"by {maker}."
+                        + (f" Named as typed in New name (the file calls it "
+                           f"'{called}')." if called and called != wanted
+                           else "")
                         + (f" {len(got['runs'])} classified run(s) on "
                            f"record." if got["runs"] else "")
                         + (f" It is the same model as '{same[0]}'."
@@ -3990,21 +4258,31 @@ def import_bundle(path: Any, prefix: Any = "", show: Any = "",
     for names that are taken, so importing again is always safe. "name" is
     the first classifier imported — or, when none was, the first already
     here, else the window's open one (``current``): an Import never blanks
-    the window.
+    the window, a bundle the checks refuse included (see import_classifier).
+    "cleared" keeps the prefix only when nothing came in and the names are
+    still taken.
 
-    Keys: name, classes, version, imported, skipped, rows, table, names, filters, summary
+    Keys: name, classes, version, imported, skipped, cleared, rows, table, names, filters, summary
     """
-    text = _import_path(path)
-    if not text:
+    typed = _typed(prefix)
+    if not _import_path(path):
         return _soft_import(f"Choose the bundle (*{BUNDLE_SUFFIX}), then "
-                            f"press Import.", show, current)
-    p = Path(text).expanduser()
-    if not p.is_file():
-        raise RuntimeError(f"{p} is not a file")
+                            f"press Import.", show, current, typed)
+    try:
+        return _import_bundle(_import_file(path), prefix, show, current,
+                              typed)
+    except RuntimeError as exc:
+        return _not_imported(exc, show, current, typed)
+
+
+def _import_bundle(p: Path, prefix: Any, show: Any, current: Any,
+                   typed: str) -> Dict[str, Any]:
+    """import_bundle, once its file is known to be there."""
     pre = _name_of(prefix)
     if pre and not re.match(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,31}$", pre):
-        raise RuntimeError(f"'{pre}' cannot start a classifier name — use "
-                           f"letters, digits, '-' or '_' (e.g. lab2-)")
+        return _soft_import(f"'{pre}' cannot start a classifier name — use "
+                            f"letters, digits, '-' or '_' (e.g. lab2-). "
+                            f"Nothing was imported.", show, current, typed)
     index, items = _read_bundle(p)
     imported, already, clashed = [], [], []
     for entry, got in items:
@@ -4053,6 +4331,8 @@ def import_bundle(path: Any, prefix: Any = "", show: Any = "",
         shown, classes = _echo(current)
     return dict(_listed(lib), name=shown, classes=classes,
                 version="", imported=imported, skipped=clashed,
+                cleared=typed if clashed and not (imported or already)
+                else "",
                 summary=text + ". Nothing was overwritten.")
 
 
@@ -4079,33 +4359,65 @@ def _record_key(rec: Dict[str, Any]) -> str:
     return os.path.normcase(str(rec.get("folder") or ""))
 
 
-def _runs_files(name: str) -> List[Tuple[Path, bool]]:
-    """(runs.jsonl, deleted?) for one classifier, or for every one — those
-    in <store>/.deleted too: what classified a run stays true after the
-    classifier is deleted."""
+#: What Delete appends to a name in <store>/.deleted: _<YYYYmmdd_HHMMSS>,
+#: then _<k> when that second was taken (delete_classifier).
+_DELETED_STAMP = re.compile(r"_\d{8}_\d{6}(?:_\d+)?$")
+
+
+def _runs_files(name: str) -> List[Tuple[Path, bool, str]]:
+    """(runs.jsonl, deleted?, what that classifier is called NOW) for one
+    classifier, or for every one — those in <store>/.deleted too: what
+    classified a run stays true after the classifier is deleted.
+
+    The name NOW is its folder's: a record keeps the name it was written
+    under, and Rename moves the record with the folder (see _version_text).
+    A deleted one is called what it was when Delete moved it aside."""
     if name:
-        return [(store_dir(name) / RUNS, False)]
-    root = classifier_store()
-    out: List[Tuple[Path, bool]] = []
-    if root.is_dir():
-        for d in sorted(root.iterdir(), key=lambda e: e.name.lower()):
-            if d.is_dir() and _NAME_RE.match(d.name):
-                out.append((d / RUNS, False))
-        trash = root / DELETED
-        if trash.is_dir():
-            for d in sorted(trash.iterdir()):
-                if d.is_dir():
-                    out.append((d / RUNS, True))
+        d = store_dir(name)
+        return [(d / RUNS, False, d.name)]
+    out: List[Tuple[Path, bool, str]] = [
+        (d / RUNS, False, d.name) for d in _classifier_folders()]
+    trash = classifier_store() / DELETED
+    try:
+        with os.scandir(trash) as it:
+            gone = sorted(e.name for e in it if e.is_dir())
+    except OSError:
+        gone = []
+    out += [(trash / n / RUNS, True, _DELETED_STAMP.sub("", n)) for n in gone]
     return out
+
+
+#: _read_runs' answers by file: (signature, records, unreadable lines).
+#: A record is appended, never edited, so a file whose id, time and size
+#: are as they were holds what it held.
+_RUNS_READ: Dict[str, Tuple[Any, List[Dict[str, Any]], int]] = {}
 
 
 def _read_runs(p: Path) -> Tuple[List[Dict[str, Any]], int]:
     """The records of one runs.jsonl, oldest first, and how many lines were
     not records — cut short by a crash, or with a field of the wrong kind
     (see _run_ok): skipped and counted, never an error that hides the
-    others."""
-    if not p.is_file():
+    others.
+
+    Parsed again only when the file changed: the "classified with" line
+    reads every classifier's record each time it is shown (MEASURED before:
+    0.3 ms a classifier — 150-240 ms at 500). The records handed back are
+    shared with the cache, so they are only ever read (run_history copies
+    each one it hands on)."""
+    sig = _stat_sig(p)
+    if sig is None:
         return [], 0
+    held = _RUNS_READ.get(str(p))
+    if held is not None and held[0] == sig:
+        return list(held[1]), held[2]
+    records, bad = _parse_runs(p)
+    if len(_RUNS_READ) > 1024:
+        _RUNS_READ.clear()
+    _RUNS_READ[str(p)] = (sig, records, bad)
+    return list(records), bad
+
+
+def _parse_runs(p: Path) -> Tuple[List[Dict[str, Any]], int]:
     try:
         text = p.read_text(encoding="utf-8", errors="replace")
     except OSError as exc:
@@ -4148,13 +4460,29 @@ def _when(rec: Dict[str, Any]) -> float:
         return 0.0
 
 
+def _version_text(rec: Dict[str, Any]) -> str:
+    """The version a record names, called what its classifier is called
+    NOW: "hawks v2 (8296caaf; then called birds)" after birds was renamed
+    hawks. The record keeps the name it was written under (history is not
+    edited); the sha says which model it was. MEASURED before: the line
+    said "birds v2" after the rename — a name the dropdown no longer listed,
+    and, once a new 'birds' was made, another, untrained model."""
+    vid = str(rec.get("version_id") or "?")
+    now = str(rec.get("called") or "")
+    was = str(rec.get("classifier") or "")
+    if not now or not was or now == was:
+        return vid
+    sha = str(rec.get("sha256") or "")[:8]
+    return f"{now} v{rec.get('version', '?')} ({sha}; then called {was})"
+
+
 def _run_line(rec: Dict[str, Any], with_folder: bool) -> str:
     counts = ", ".join(f"{c} {k}" for c, k in (rec.get("counts") or {}).items())
     runs = list((rec.get("runs") or {}).items())
     which = ", ".join(f"{r} ({k})" for r, k in runs[:3])
     if len(runs) > 3:
         which += f" +{len(runs) - 3} more"
-    text = (f"{str(rec.get('when', '?'))[:16]}  {rec.get('version_id', '?')}"
+    text = (f"{str(rec.get('when', '?'))[:16]}  {_version_text(rec)}"
             f"{' (deleted)' if rec.get('deleted') else ''}  "
             f"{rec.get('frames', 0)} frames: {counts}")
     if which:
@@ -4164,6 +4492,18 @@ def _run_line(rec: Dict[str, Any], with_folder: bool) -> str:
     if with_folder:
         text += f"  · {rec.get('folder', '?')}"
     return text
+
+
+def _latest_text(r: Dict[str, Any]) -> str:
+    """"Classified with frames v3 (1a2b3c4d) on 2026-10-02 14:03 — good 110,
+    bad timing 10": one record as the window's line. One wording for
+    run_history's "latest" and classify_folder's own answer."""
+    counts = ", ".join(f"{c} {k}" for c, k in (r.get("counts") or {}).items())
+    return (f"Classified with {_version_text(r)}"
+            f"{' (since deleted)' if r.get('deleted') else ''} on "
+            f"{str(r.get('when', '?'))[:16]}"
+            + ("" if _here(r) else f" on {r.get('host')}")
+            + f" — {counts}")
 
 
 def run_history(name: Any = "", folder: Any = "") -> Dict[str, Any]:
@@ -4182,29 +4522,26 @@ def run_history(name: Any = "", folder: Any = "") -> Dict[str, Any]:
         raise RuntimeError("choose a classifier or a folder to see what was "
                            "classified")
     want = _folder_key(f) if f else ""
-    found: List[Tuple[float, int, Dict[str, Any]]] = []
+    found: List[Tuple[float, int, int, Dict[str, Any]]] = []
     bad, seq = 0, 0
-    for p, deleted in _runs_files(n):
+    for p, deleted, called in _runs_files(n):
         recs, b = _read_runs(p)
         bad += b
         for rec in recs:
             seq += 1            # file order breaks a tie: the later line is newer
             if f and (not want or not _here(rec) or _record_key(rec) != want):
                 continue
-            found.append((_when(rec), seq,
-                          dict(rec, deleted=True) if deleted else rec))
-    found.sort(key=lambda t: (t[0], t[1]), reverse=True)
-    records = [r for _t, _s, r in found]
+            seen = dict(rec, called=called)
+            if deleted:
+                seen["deleted"] = True
+            # One run's record in a deleted classifier AND in the one
+            # imported back from its export is the same moment: the live
+            # one is named (MEASURED: "since deleted" after the Import).
+            found.append((_when(rec), 0 if deleted else 1, seq, seen))
+    found.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
+    records = [r for _t, _live, _s, r in found]
     rows = [_run_line(r, with_folder=not f) for r in records]
-    latest = ""
-    if records:
-        r = records[0]
-        counts = ", ".join(f"{c} {k}" for c, k in (r.get("counts") or {}).items())
-        latest = (f"Classified with {r.get('version_id', '?')}"
-                  f"{' (since deleted)' if r.get('deleted') else ''} on "
-                  f"{str(r.get('when', '?'))[:16]}"
-                  + ("" if _here(r) else f" on {r.get('host')}")
-                  + f" — {counts}")
+    latest = _latest_text(records[0]) if records else ""
     where = f" for {Path(f).name or f}" if f else ""
     who = f" by '{n}'" if n else ""
     summary = (f"{len(records)} classified run(s){who}{where}."
@@ -4216,11 +4553,77 @@ def run_history(name: Any = "", folder: Any = "") -> Dict[str, Any]:
             "summary": summary}
 
 
+def _runs_in(folder: Any) -> Dict[str, int]:
+    """{capture run: frames} for the pictures in ``folder`` now — what a
+    record is compared with (_run_of names each run). Empty when it cannot
+    be listed."""
+    runs: Dict[str, int] = {}
+    try:
+        with os.scandir(str(folder).strip().strip('"')) as it:
+            for e in it:
+                if (e.name.lower().endswith(IMAGE_SUFFIXES)
+                        and e.is_file()):
+                    run = _run_of(e.name)
+                    runs[run] = runs.get(run, 0) + 1
+    except (OSError, ValueError):
+        return {}
+    return runs
+
+
+def _few_runs(runs: List[Tuple[str, int]]) -> str:
+    """"run 20261005_130000 (8 frames)", or "3 runs (24 frames)" — short:
+    Typhon's line is three rows at the window's smallest (MEASURED: run
+    names made a typical line four), and run_history names every run."""
+    total = sum(k for _r, k in runs)
+    if len(runs) == 1:
+        return f"run {runs[0][0]} ({total} frame{'' if total == 1 else 's'})"
+    return f"{len(runs)} runs ({total} frames)"
+
+
+def _runs_note(present: Dict[str, int],
+               records: List[Dict[str, Any]]) -> str:
+    """What the newest record does NOT cover of the runs in the folder now:
+    "not classified yet: run X (8 frames)", and runs an older record covers
+    ("run Y with frames v1"). "" when the newest covers them all."""
+    if not records or not present:
+        return ""
+    newest = records[0].get("runs") or {}
+    fresh: List[Tuple[str, int]] = []
+    older: Dict[str, List[str]] = {}
+    for run, k in present.items():
+        done = int(newest.get(run) or 0)
+        if done >= k:
+            continue
+        rec = next((r for r in records[1:]
+                    if int((r.get("runs") or {}).get(run) or 0) >= k), None)
+        if rec is not None and not done:
+            older.setdefault(_version_text(rec), []).append(run)
+        else:
+            fresh.append((run, k - done))
+    parts = []
+    for version, runs in older.items():
+        which = (f"run {runs[0]}" if len(runs) == 1
+                 else f"{len(runs)} runs")
+        parts.append(f"{which} with {version}")
+    if fresh:
+        parts.append(f"not classified yet: {_few_runs(sorted(fresh))}")
+    return "; ".join(parts)
+
+
 def classified_with(folder: Any) -> Dict[str, Any]:
     """One line for the window: which version last classified this folder,
-    and when — from every classifier's record on this PC. A blank folder is
+    and when — from every classifier's record on this PC — and which of the
+    capture runs in it now that record does not cover. A blank folder is
     not an error (this may run as soon as a folder box changes): it just
     says so.
+
+    PER RUN, NOT PER FOLDER. Typhon writes every run into the capture
+    folder, and a record lists the runs it classified. MEASURED before: run
+    120000 classified, then run 130000 written into the same folder — the
+    line still read "Classified with frames v1 ... — good 5, bad timing 3",
+    as if the new run had been classified too. Now it adds "· not
+    classified yet: run 20261005_130000 (6 frames)" (or the older version
+    a run was classified with).
 
     Keys: classified_with, rows, records, summary
     """
@@ -4230,5 +4633,8 @@ def classified_with(folder: Any) -> Dict[str, Any]:
                            "it."}
     h = run_history("", folder)
     line = h["latest"] or "Not classified yet — press Classify all frames."
+    note = _runs_note(_runs_in(folder), h["records"]) if h["latest"] else ""
+    if note:
+        line += f" · {note}"
     return {"classified_with": line, "rows": h["rows"],
             "records": h["records"], "summary": h["summary"]}

@@ -83,6 +83,52 @@ def test_another_unit_of_the_same_model_is_offered_them_marked_as_such(store):
     assert store.get(EVK_B, "bird bath").roi == Roi(512, 300, 160, 120)
 
 
+IMX_A = cp.Identity("prophesee", "IMX636", "00051234", "event")
+IMX_B = cp.Identity("prophesee", "IMX636", "00059999", "event")
+GEN41 = cp.Identity("prophesee", "Gen41", "00070001", "event")
+
+
+def test_presets_are_offered_to_the_same_sensor_only(store):
+    """Discovery called every Metavision camera "EVK4", so biases tuned for
+    one sensor were offered to any other as "the same model". The model is
+    the sensor the camera reports now (cameras.identify)."""
+    store.save(IMX_A, "Bird bath", BIRD_BATH, Roi(512, 300, 160, 120))
+    assert [p.name for p in store.presets(IMX_B)] == ["Bird bath"]
+    assert not store.presets(IMX_B)[0].own
+    assert store.presets(GEN41) == [], "offered across sensors"
+
+
+def test_a_units_presets_saved_as_evk4_stay_its_own(store):
+    """Saved by an older build under "prophesee|EVK4|<serial>": the same
+    unit (same serial) still lists them as its own, and its next change
+    moves them under its own key. Another unit is not offered them — which
+    sensor it had was never recorded."""
+    store.save(EVK_A, "Bird bath", BIRD_BATH, Roi(512, 300, 160, 120))
+    store.save(EVK_A, "Feeder", BIRD_BATH, None)
+    mine = store.presets(IMX_A)
+    assert [(p.name, p.own) for p in mine] == [("Bird bath", True),
+                                               ("Feeder", True)]
+    assert store.get(IMX_A, "bird bath").roi == Roi(512, 300, 160, 120)
+    assert store.presets(IMX_B) == [], "another unit's sensor is unknown"
+    store.rename(IMX_A, "Feeder", "Feeder 2")
+    doc = json.loads(store.path.read_text(encoding="utf-8"))
+    assert EVK_A.key not in doc["cameras"]
+    assert sorted(doc["cameras"][IMX_A.key]["presets"]) == ["Bird bath",
+                                                            "Feeder 2"]
+    assert doc["cameras"][IMX_A.key]["model"] == "IMX636"
+
+
+def test_a_legacy_entry_never_overwrites_the_cameras_own_preset(store):
+    store.save(IMX_A, "Bird bath", BIRD_BATH, None)
+    store.save(EVK_A, "Bird bath", {"window_ms": 50.0}, None)  # older build
+    store.save(IMX_A, "Feeder", BIRD_BATH, None)        # a change: adopts
+    doc = json.loads(store.path.read_text(encoding="utf-8"))
+    assert list(doc["cameras"]) == [IMX_A.key]
+    assert sorted(doc["cameras"][IMX_A.key]["presets"]) == ["Bird bath",
+                                                            "Feeder"]
+    assert store.get(IMX_A, "Bird bath").settings == BIRD_BATH
+
+
 def test_a_cameras_own_preset_hides_a_borrowed_one_of_the_same_name(store):
     store.save(EVK_A, "Bird bath", BIRD_BATH, None)
     store.save(EVK_B, "BIRD BATH", {"window_ms": 1.0}, None)

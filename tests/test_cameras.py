@@ -598,6 +598,152 @@ def evk(**kw):
                              raw), raw
 
 
+# ----------------------------------------------------------------------
+# Which camera it is: never "EVK4" by assumption
+# ----------------------------------------------------------------------
+class FakeSensorInfo:
+    def __init__(self, name, major, minor):
+        self.name, self.major_version, self.minor_version = name, major, minor
+
+
+class FakeIdentification:
+    """I_HW_Identification, as the OpenEB 5.2 bindings have it."""
+
+    def __init__(self, sensor, serial="00051234", integrator="Prophesee"):
+        self._sensor, self._serial, self._integrator = sensor, serial, integrator
+
+    def get_sensor_info(self):
+        return self._sensor
+
+    def get_serial(self):
+        return self._serial
+
+    def get_integrator(self):
+        return self._integrator
+
+
+class IdentifiedEvk(FakeEvkDevice):
+    def __init__(self, ident, **kw):
+        super().__init__(**kw)
+        self._ident = ident
+
+    def get_i_hw_identification(self):
+        return self._ident
+
+
+class FakeMetavision:
+    """metavision_hal's DeviceDiscovery: CameraDescription rows, and an
+    open() that is counted (a scan must not open anything)."""
+
+    def __init__(self, sources, devices=None, has_sources=True):
+        sdk = self
+        self.opened = []
+
+        class CameraDescription:
+            def __init__(self, serial, integrator):
+                self.serial, self.integrator_name = serial, integrator
+                self.plugin_name, self.connection = "hal_plugin_prophesee", 0
+
+        class DeviceDiscovery:
+            @staticmethod
+            def list():
+                return [s for s, _ in sources]
+
+            @staticmethod
+            def open(serial):
+                sdk.opened.append(serial)
+                return (devices or {}).get(serial)
+
+        if has_sources:
+            DeviceDiscovery.list_available_sources = staticmethod(
+                lambda: [CameraDescription(s, i) for s, i in sources])
+        self.DeviceDiscovery = DeviceDiscovery
+
+
+def test_evk_discovery_does_not_guess_the_model_and_opens_nothing():
+    """Every Metavision camera was "EVK4", so presets of "the same model"
+    were offered across different Prophesee sensors. Discovery knows the
+    serial and the integrator; the sensor is read once the camera is open."""
+    sdk = FakeMetavision([("00051234", "Prophesee"), ("CA0001", "CenturyArks")])
+    found = cameras.EvkBackend(sdk=sdk).discover()
+    assert [(c.key, c.serial, c.model, c.vendor, c.kind) for c in found] == [
+        ("00051234", "00051234", "", "Prophesee", "event"),
+        ("CA0001", "CA0001", "", "CenturyArks", "event")]
+    assert "EVK4" not in found[0].label and sdk.opened == []
+    # An SDK without list_available_sources: the serials, as before.
+    older = FakeMetavision([("00051234", "")], has_sources=False)
+    assert [c.vendor for c in cameras.EvkBackend(sdk=older).discover()] == [
+        "Prophesee"]
+
+
+@pytest.mark.parametrize("sensor, model", [
+    (FakeSensorInfo("IMX636", 4, 2), "IMX636"),
+    (FakeSensorInfo("GenX320", 320, 0), "GenX320"),
+    (FakeSensorInfo("", 4, 1), "Gen4.1"),
+    (FakeSensorInfo("Gen0.0", 0, 0), ""),             # a .raw's empty header
+])
+def test_an_open_evk_says_which_sensor_it_has(sensor, model):
+    ident = FakeIdentification(sensor)
+    device = IdentifiedEvk(ident)
+    sdk = FakeMetavision([("00051234", "Prophesee")],
+                         devices={"00051234": device})
+    backend = cameras.EvkBackend(sdk=sdk)
+    info = backend.discover()[0]
+    opened = backend.open(info)
+    assert opened.info.model == model and opened.info.key == "00051234"
+    assert opened.info.serial == "00051234"
+    assert opened.info.vendor == "Prophesee"
+    if model:
+        assert opened.info.label == f"Prophesee {model} (00051234)"
+
+
+def test_identification_that_fails_keeps_what_discovery_said():
+    class Broken:
+        def get_sensor_info(self):
+            raise RuntimeError("USB hiccup")
+
+        def get_serial(self):
+            return ""
+
+    info = CameraInfo("prophesee", "00051234", "", "00051234", "Prophesee",
+                      "event")
+    assert cameras.identify(info, IdentifiedEvk(Broken())) == info
+    assert cameras.identify(info, FakeEvkDevice()) == info     # none at all
+
+
+def test_identification_names_exist_in_the_real_bindings(tmp_path):
+    """Against the OpenEB build when it is importable here: the facility,
+    its methods, SensorInfo's fields, CameraDescription's — and identify on
+    a real file-backed device (no sensor in a .raw's header: no model)."""
+    try:
+        import metavision_hal as hal
+        import metavision_sdk_stream as stream_mod
+    except Exception:                                       # noqa: BLE001
+        pytest.skip("the Metavision SDK is not importable here")
+    assert hasattr(hal.Device, "get_i_hw_identification")
+    for name in ("get_sensor_info", "get_serial", "get_integrator"):
+        assert hasattr(hal.I_HW_Identification, name), name
+    for name in ("name", "major_version", "minor_version"):
+        assert hasattr(hal.SensorInfo, name), name
+    assert hasattr(hal.DeviceDiscovery, "list_available_sources")
+    for name in ("serial", "integrator_name"):
+        assert hasattr(hal.CameraDescription, name), name
+    events_ = np.zeros(10, EVENT_DTYPE)
+    events_["t"] = np.arange(10) * 100
+    path = tmp_path / "id_events.raw"
+    writer = stream_mod.RAWEvt2EventFileWriter(1280, 720, str(path))
+    writer.add_cd_events(events_)
+    writer.flush()
+    writer.close()
+    del writer
+    device = hal.DeviceDiscovery.open_raw_file(str(path))
+    info = cameras.identify(CameraInfo("prophesee", str(path), kind="event"),
+                            device)
+    assert info.model == "" and info.key == str(path)
+    assert info.vendor == "MetavisionSDK"
+    del device
+
+
 def test_evk_geometry_is_the_imx636_sensor():
     device, _ = evk()
     limits = device.limits()

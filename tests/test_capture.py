@@ -254,8 +254,36 @@ def test_warming_never_raises(monkeypatch):
             raise ImportError("gone")
         return real(name, *a, **k)
 
+    monkeypatch.setattr(capture, "_WARMED", threading.Event())  # not yet
     monkeypatch.setattr(builtins, "__import__", refuse)
     capture.warm_imports()
+
+
+def test_warming_happens_once_on_a_thread_of_its_own(monkeypatch):
+    """At the first live tick it was the window's longest stall after
+    Connect (110-483 ms measured in a built Typhon): Pillow's ~70 plugins
+    imported on the UI thread. warm_in_background does it elsewhere, once;
+    after it a call returns at once."""
+    monkeypatch.setattr(capture, "_WARMED", threading.Event())
+    monkeypatch.setattr(capture, "_WARMER", [])
+    ran_on = []
+    real = capture.warm_imports
+
+    def watched():
+        ran_on.append(threading.current_thread().name)
+        real()
+
+    monkeypatch.setattr(capture, "warm_imports", watched)
+    assert not capture.imports_warm()
+    capture.warm_in_background()
+    capture.warm_in_background()                 # a second call: no second
+    capture._WARMER[0].join(10)
+    assert ran_on == ["warm-imports"] and capture.imports_warm()
+    began = time.perf_counter()
+    real()
+    assert time.perf_counter() - began < 0.005, "warmed, yet it ran again"
+    capture.warm_in_background()
+    assert len(capture._WARMER) == 1
 
 
 def test_stop_joins_the_grab_thread_and_says_so():
@@ -847,3 +875,112 @@ def test_the_run_index_records_each_pictures_window(tmp_path):
 def test_a_view_can_name_display_drops_in_its_own_words():
     line = Stats(grabbed=5, dropped=3, rate=30.0).line("not drawn (screen only)")
     assert "3 not drawn (screen only)" in line and "dropped" not in line
+
+
+# ======================================================================
+# A run's camera record (council_core.camera_record)
+# ======================================================================
+def _a_record(**over):
+    from council_core import camera_record
+
+    kw = dict(run="20261005_120000",
+              camera={"backend": "prophesee", "model": "IMX636",
+                      "serial": "00051234", "kind": "event",
+                      "label": "Prophesee IMX636 (00051234)"},
+              sensor=(1280, 720), area=(400, 200, 320, 240),
+              settings=[{"key": "bias.bias_fo", "value": 3, "unit": ""},
+                        {"key": "window_ms", "value": 20.0, "unit": "ms"},
+                        {"key": "status.temperature", "value": float("nan"),
+                         "unit": "°C", "read_only": True}],
+              preset="Bird bath", app={"name": "Typhon"},
+              software={"council_version": "x"}, host="PC")
+    kw.update(over)
+    return camera_record.build(**kw)
+
+
+def test_a_record_is_written_whole_and_read_back(tmp_path):
+    from council_core import camera_record
+
+    rec = _a_record()
+    path = camera_record.write(tmp_path, "20261005_120000", rec)
+    assert path.name == "20261005_120000_camera.json"
+    assert sorted(p.name for p in tmp_path.iterdir()) == [path.name]
+    back = camera_record.read(tmp_path, "20261005_120000")
+    assert back["settings"] == {"bias.bias_fo": 3, "window_ms": 20.0,
+                                "status.temperature": None}, "NaN is not JSON"
+    assert back["units"] == {"window_ms": "ms", "status.temperature": "°C"}
+    assert back["read_only"] == ["status.temperature"]
+    assert camera_record.area_of(back) == (400, 200, 320, 240)
+    assert back["full_sensor"] is False and back["preset"] == "Bird bath"
+
+
+def test_the_step_into_place_refuses_a_record_another_writer_just_made(
+        tmp_path):
+    """write() looks first, but a second writer can land between that look
+    and the rename — the RENAME itself must refuse (os.rename does on
+    Windows, a hard link elsewhere; os.replace would not). Called directly,
+    as the race leaves it: the record that won is never touched."""
+    from council_core import camera_record
+
+    final = camera_record.record_path(tmp_path, "20261005_120000")
+    final.write_bytes(b'{"theirs": true}\n')
+    temp = tmp_path / ".mine.tmp"
+    temp.write_bytes(b'{"mine": true}\n')
+    with pytest.raises(camera_record.RecordExists):
+        camera_record._publish(temp, final)
+    assert final.read_bytes() == b'{"theirs": true}\n'
+
+
+@pytest.mark.parametrize("text", [
+    "", "not json", "[1, 2]", '{"format": "something else"}',
+    '{"format": "typhon-camera-record", "format_version": 99}',
+    '{"format": "typhon-camera-record", "format_version": true}'])
+def test_a_record_that_is_not_ours_reads_as_none(tmp_path, text):
+    from council_core import camera_record
+
+    (tmp_path / "r_camera.json").write_text(text, encoding="utf-8")
+    assert camera_record.read(tmp_path, "r") is None
+    assert camera_record.read(tmp_path, "missing") is None
+    assert camera_record.read(tmp_path, "") is None
+
+
+@pytest.mark.parametrize("area, sensor", [
+    ({"x": 0, "y": 0, "w": 0, "h": 10}, {"width": 64, "height": 64}),
+    ({"x": -1, "y": 0, "w": 8, "h": 8}, {"width": 64, "height": 64}),
+    ({"x": 60, "y": 0, "w": 8, "h": 8}, {"width": 64, "height": 64}),
+    ({"x": 1.5, "y": 0, "w": 8, "h": 8}, {"width": 64, "height": 64}),
+    ({"x": True, "y": 0, "w": 8, "h": 8}, {"width": 64, "height": 64}),
+    ({"x": 0, "y": 0, "w": 8}, {"width": 64, "height": 64}),
+    ({"x": 0, "y": 0, "w": 8, "h": 8}, None)])
+def test_an_area_that_cannot_be_trusted_is_none(area, sensor):
+    from council_core import camera_record
+
+    assert camera_record.area_of({"area": area, "sensor": sensor}) is None
+    assert camera_record.area_of(None) is None
+
+
+def test_the_source_commit_is_read_from_git_files_never_by_running_git(
+        tmp_path):
+    """A checkout's own HEAD (this one, a worktree or not) and the three ways
+    a ref is kept: loose, packed, a detached HEAD."""
+    import subprocess
+
+    from council_core import camera_record
+
+    root = Path(__file__).resolve().parents[1]
+    want = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+    if want:
+        assert camera_record.source_commit(root) == want
+    sha = "0123456789abcdef0123456789abcdef01234567"
+    repo = tmp_path / "repo"
+    (repo / ".git" / "refs" / "heads").mkdir(parents=True)
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (repo / ".git" / "packed-refs").write_text(
+        f"# pack-refs with: peeled\n{sha} refs/heads/main\n")
+    assert camera_record.source_commit(repo) == sha
+    (repo / ".git" / "refs" / "heads" / "main").write_text(sha[::-1] + "\n")
+    assert camera_record.source_commit(repo) == sha[::-1]
+    (repo / ".git" / "HEAD").write_text(sha + "\n")
+    assert camera_record.source_commit(repo) == sha
+    assert camera_record.source_commit(tmp_path / "nothing") == ""

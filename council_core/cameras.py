@@ -1086,17 +1086,40 @@ class EvkBackend(Backend):
         return True
 
     def discover(self) -> List[CameraInfo]:
+        """Every Metavision camera, by serial, and who made it.
+
+        THE MODEL IS NOT GUESSED. This said "EVK4" for every camera the SDK
+        listed — and presets of the SAME MODEL from another unit are offered
+        to a camera that has none of that name, so biases tuned for an
+        IMX636 would have been offered to a Gen4.1 or a GenX320 sensor as if
+        they were its own. Enumeration gives the serial and the integrator
+        (list_available_sources' CameraDescription), never the sensor; the
+        sensor is read from the camera itself once it is open
+        (I_HW_Identification, `identify`), and that is the identity presets
+        and a run's camera record use. Discovery does not open cameras to
+        ask: a scan must not take a camera another program is streaming
+        from, or the one this app has open."""
         try:
             hal = self.sdk()
         except CameraError:
             return []
+        found: List[Tuple[str, str]] = []
+        lister = getattr(hal.DeviceDiscovery, "list_available_sources", None)
         try:
-            serials = hal.DeviceDiscovery.list()
+            if callable(lister):
+                for source in lister() or []:
+                    serial = str(getattr(source, "serial", "") or "")
+                    if serial:
+                        found.append((serial, str(getattr(
+                            source, "integrator_name", "") or "")))
+            else:
+                found = [(str(s), "") for s in hal.DeviceDiscovery.list() or []]
         except Exception as exc:                            # noqa: BLE001
             raise CameraError(f"Metavision could not enumerate: {exc}") from exc
-        return [CameraInfo(backend=self.name, key=str(s), model="EVK4",
-                           serial=str(s), vendor="Prophesee", kind="event")
-                for s in (serials or [])]
+        return [CameraInfo(backend=self.name, key=serial, model="",
+                           serial=serial, vendor=vendor or "Prophesee",
+                           kind="event")
+                for serial, vendor in found]
 
     def open(self, info: CameraInfo) -> "EvkDevice":
         hal = self.sdk()
@@ -1106,7 +1129,39 @@ class EvkBackend(Backend):
             raise CameraError(f"could not open {info.key!r}: {exc}") from exc
         if device is None:
             raise CameraError(f"could not open {info.key!r}")
-        return EvkDevice(info, device)
+        return EvkDevice(identify(info, device), device)
+
+
+def identify(info: CameraInfo, device: Any) -> CameraInfo:
+    """`info` with what an open Metavision device says it is: its sensor as
+    the model ("IMX636", "Gen41", "GenX320" — what biases are tuned for, so
+    what "the same model" means to presets), its serial and its integrator.
+
+    Read through I_HW_Identification (get_sensor_info, get_serial,
+    get_integrator — checked against the OpenEB 5.2 bindings). A device
+    without it, or a value it cannot give, keeps what discovery said; the
+    key it was opened by is never changed. A sensor with no name is called
+    by its generation ("Gen4.1"); a recording's "Gen0.0" (a .raw with no
+    sensor in its header) is no model at all."""
+    from dataclasses import replace
+
+    ident = _interface(device, "get_i_hw_identification")
+    if ident is None:
+        return info
+    model = ""
+    sensor = _call(ident, "get_sensor_info", None)
+    if sensor is not None:
+        name = str(getattr(sensor, "name", "") or "").strip()
+        major = getattr(sensor, "major_version", None)
+        minor = getattr(sensor, "minor_version", None)
+        if name and name != "Gen0.0":
+            model = name
+        elif major not in (None, 0) or minor not in (None, 0):
+            model = f"Gen{major}.{minor}"
+    serial = str(_call(ident, "get_serial", "") or "").strip()
+    vendor = str(_call(ident, "get_integrator", "") or "").strip()
+    return replace(info, model=model or info.model,
+                   serial=serial or info.serial, vendor=vendor or info.vendor)
 
 
 def _device_props(info: Any) -> Dict[str, str]:

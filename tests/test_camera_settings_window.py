@@ -547,6 +547,163 @@ def test_the_picker_lists_this_cameras_presets_and_never_picks_by_itself(
     made.close()
 
 
+def _type(combo, text, cursor=None):
+    """What typing into the editable box leaves: its text, and the cursor."""
+    combo.lineEdit().setText(text)
+    combo.lineEdit().setCursorPosition(len(text) if cursor is None
+                                       else cursor)
+
+
+def test_a_name_being_typed_survives_presets_changed_elsewhere(qapp):
+    """Half-way through typing a new preset name in the main window, the
+    settings window saved a preset, then renamed one: each refill of the list
+    cleared the box (the typed name was not in the new list) or put the
+    name just saved there in its place."""
+    made, combo, area, activated = picker(qapp)
+    connect("frame", live=False)
+    frame_camera.save_preset("Day")
+    _type(combo, "Bird b", cursor=4)
+    w = window()
+    frame_camera.save_preset("Night")          # as the settings window does
+    assert [combo.itemText(i) for i in range(combo.count())] == ["Day",
+                                                                  "Night"]
+    assert combo.currentText() == "Bird b" and combo.currentIndex() == -1
+    assert combo.lineEdit().cursorPosition() == 4, "the cursor moved"
+    frame_camera.rename_preset("Night", "Dusk")
+    assert combo.currentText() == "Bird b"
+    frame_camera.delete_preset("Dusk")
+    assert combo.currentText() == "Bird b"
+    assert w.preset_list.count() == 1, "the window has its own list"
+    assert activated == [], "a refill picked a preset"
+    # Finished and saved from this box: now it is a preset, and picked.
+    _type(combo, "Bird bath")
+    frame_camera.save_preset(combo.currentText())
+    assert combo.currentText() == "Bird bath" and combo.currentIndex() >= 0
+    made.close()
+
+
+def test_a_name_being_typed_survives_connect_and_disconnect(qapp):
+    made, combo, area, activated = picker(qapp)
+    _type(combo, "Feeder")
+    connect("event", live=False)
+    assert combo.currentText() == "Feeder"
+    frame_camera.disconnect()
+    assert combo.currentText() == "Feeder"
+    assert activated == []
+    made.close()
+
+
+def test_a_preset_shown_and_then_deleted_elsewhere_still_leaves_the_box(qapp):
+    """Kept apart from typing: a box SHOWING a preset that is gone is
+    emptied, as before."""
+    made, combo, area, _ = picker(qapp)
+    connect("frame", live=False)
+    frame_camera.save_preset("Day")
+    frame_camera.save_preset("Night")
+    frame_camera.apply_preset("Day")
+    assert combo.currentText() == "Day"
+    frame_camera.delete_preset("Day")
+    assert combo.currentText() == "" and combo.count() == 1
+    frame_camera.rename_preset("Night", "Dusk")
+    made.close()
+
+
+def _focused(combo, qapp):
+    """The box in an ACTIVE window with the focus — the state a user types
+    in. Qt completes a typed name only there: without it the inline
+    completer never ran and the tests of typed names passed by luck.
+
+    The offscreen platform never makes a window active by itself
+    (activateWindow, requestActivate and qWaitForWindowActive all leave
+    activeWindow() None, MEASURED), so the deprecated setActiveWindow is
+    the one way — its warning is expected here."""
+    import warnings
+
+    from PySide6.QtCore import Qt
+
+    combo.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    combo.show()
+    combo.activateWindow()
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        QApplication.setActiveWindow(combo)
+    combo.setFocus()
+    qapp.processEvents()
+    assert QApplication.activeWindow() is combo
+
+
+def test_a_new_name_typed_is_what_the_box_holds_not_a_preset_it_starts(
+        qapp):
+    """MEASURED in a built Typhon with its window active: typing 'Bird' (a
+    new preset) made the box read 'Bird bath' — Qt's inline completion —
+    and Save preset then saved over 'Bird bath', with no 'Bird' made."""
+    from PySide6.QtTest import QTest
+
+    made, combo, area, activated = picker(qapp)
+    connect("frame", live=False)
+    frame_camera.set_camera_setting("Gain", 1.0)
+    frame_camera.save_preset("Bird bath")
+    frame_camera.set_camera_setting("Gain", 7.0)
+    _focused(combo, qapp)
+    combo.setCurrentIndex(-1)
+    combo.setEditText("")
+    QTest.keyClicks(combo, "Bird")
+    assert combo.currentText() == "Bird", "the box finished the name itself"
+    frame_camera.save_preset(combo.currentText())
+    gains = {d["name"]: d["settings"].get("Gain")
+             for d in frame_camera.list_presets()["details"]}
+    assert gains == {"Bird": 7.0, "Bird bath": 1.0}
+    # ... and part of a name, a refill, more typing: what was typed.
+    combo.setCurrentIndex(-1)
+    combo.setEditText("")
+    QTest.keyClicks(combo, "Bi")
+    frame_camera.delete_preset("Bird")         # as the settings window does
+    QTest.keyClicks(combo, "x")
+    assert combo.currentText() == "Bix"
+    assert activated == []
+    combo.hide()
+    made.close()
+
+
+def test_a_late_preset_answer_leaves_a_name_typed_while_it_ran(qapp):
+    """Focus stays in the box after a pick; a slow camera's restart takes
+    0.15-1 s. A new name typed meanwhile was replaced by the preset's name
+    when the late answer came (select() had no typing rule; fill() had)."""
+    from PySide6.QtTest import QTest
+
+    made, combo, area, _ = picker(qapp)
+    connect("frame")
+    frame_camera.set_camera_area("0, 0, 320, 240")
+    ticks(0.3)
+    frame_camera.save_preset("Small")
+    frame_camera.full_frame()
+    ticks(0.3)
+    frame_camera.set_frame_rate(1)
+    ticks(1.2)
+    combo.setCurrentIndex(combo.findText("Small"))
+    out = frame_camera.pick_preset("Small")
+    assert out["pending"], "the preset was applied at once: not a late answer"
+    _focused(combo, qapp)
+    combo.lineEdit().selectAll()
+    QTest.keyClicks(combo, "Xmas eve")
+    assert frame_camera._LIVE.job is not None
+    deadline = time.monotonic() + 4
+    while frame_camera._LIVE.job is not None and time.monotonic() < deadline:
+        ticks(0.05)
+    assert frame_camera._LIVE.job is None
+    assert combo.currentText() == "Xmas eve"
+    # Not typing (the box not edited since it was filled): an applied
+    # preset is shown, as before.
+    combo.setEditText("")
+    frame_camera.apply_preset("Small")
+    deadline = time.monotonic() + 4
+    while frame_camera._LIVE.job is not None and time.monotonic() < deadline:
+        ticks(0.05)
+    assert combo.currentText() == "Small"
+    combo.hide()
+    made.close()
+
+
 def test_the_picker_stops_listening_with_its_window(qapp):
     made, combo, area, _ = picker(qapp)
     assert made.heard in frame_camera._LIVE.listeners

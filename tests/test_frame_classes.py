@@ -972,6 +972,15 @@ def test_importing_a_taken_name_asks_for_another_and_never_overwrites(
         ["frames", "frames-lab1"]                   # no staging left behind
 
 
+def _not_imported(r, msg):
+    """An Import the checks refused: ANSWERED, never raised — an Import
+    never blanks the window (import_classifier) — with nothing imported
+    and the reason in the summary."""
+    assert r["imported"] == [], r["summary"]
+    assert re.search(msg, r["summary"]), (msg, r["summary"])
+    assert "Nothing was imported" in r["summary"], r["summary"]
+
+
 def _rezip(src, dst, change=None, drop=(), add=None, manifest=None,
            rehash=True):
     """A copy of export ``src`` with members changed, dropped or added —
@@ -1064,8 +1073,7 @@ def test_import_refuses_anything_but_an_intact_export(vault, trained, tmp_path,
         _rezip(e, bad, drop=("model.npz",))
     pc2 = tmp_path / "pc2"
     monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(pc2))
-    with pytest.raises(RuntimeError, match=msg):
-        fc.import_classifier(str(bad), "x")
+    _not_imported(fc.import_classifier(str(bad), "x"), msg)
     assert not _store(pc2).exists() or not any(_store(pc2).iterdir())
 
 
@@ -1173,6 +1181,24 @@ def test_the_record_answers_by_classifier_and_by_folder(vault, trained,
     other.mkdir()
     assert "Not classified yet" in \
         fc.classified_with(str(other))["classified_with"]
+
+
+def test_classifying_says_the_classified_with_line_it_has_just_made(
+        vault, trained, monkeypatch):
+    """Typhon's Classify link fills the "classified with" line from this —
+    the same words classified_with(folder) gives afterwards, made from the
+    record just written, and said plainly when nothing could be recorded."""
+    folder, _ = trained
+    r = fc.classify_folder("frames", str(folder))
+    assert r["classified_with"] == \
+        fc.classified_with(str(folder))["classified_with"]
+    assert r["classified_with"].startswith(f"Classified with {r['version']} on")
+    inside = folder / "store"                    # a store inside the capture
+    inside.mkdir()
+    shutil.copytree(_store(vault) / "frames", inside / "frames")
+    monkeypatch.setenv(fc.STORE_ENV, str(inside))
+    r = fc.classify_folder("frames", str(folder))
+    assert "NOT recorded" in r["classified_with"]
 
 
 def test_a_partial_last_record_line_is_skipped_and_the_next_starts_afresh(
@@ -1302,8 +1328,7 @@ def test_a_bundle_is_checked_whole_before_anything_is_imported(
             zf.writestr(k, v)
     pc2 = tmp_path / "pc2"
     monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(pc2))
-    with pytest.raises(RuntimeError, match=msg):
-        fc.import_classifier(str(bad))
+    _not_imported(fc.import_classifier(str(bad)), msg)
     assert not _store(pc2).exists() or not any(_store(pc2).iterdir())
 
 
@@ -1551,7 +1576,9 @@ def test_built_typhon_tags_the_classifiers_it_makes_with_its_own_project(
 
 
 # ============================================================
-# The Typhon wiring planned for this (not in typhon.gspec yet)
+# The listbox wiring the library was planned against. typhon.gspec wires
+# a DROPDOWN instead (the user's choice): its real links are run below
+# (test_typhons_own_links_...); this plan stays as the listbox case.
 # ============================================================
 
 #: handler -> (function, input ports, {port: result key}, button label).
@@ -1809,6 +1836,119 @@ def test_a_refused_library_click_keeps_the_window_as_it_was(vault, trained,
     assert "already exists" in p.classifier_status.value
 
 
+def _typhon_links():
+    """typhon.gspec's own frame_classes links, as {handler: (function,
+    inputs, outputs, label)} — handlers named by shape id. The model box is
+    a dropdown there: its text is both the model picked and the one open."""
+    doc = json.loads((REPO / "examples" / "gui" / "typhon.gspec").read_text(
+        encoding="utf-8"))
+    return {f"on_{s['id']}": (s["script"]["function"], s["script"]["inputs"],
+                              s["script"]["outputs"], s["label"])
+            for s in doc["shapes"]
+            if (s.get("script") or {}).get("module") == "frame_classes"}
+
+
+def _typhon_app(folder, out, name="frames"):
+    """Typhon's own frame_classes handlers, as Generate writes them, bound
+    to ports shaped like the real ones: the model DROPDOWN and the filter
+    hand back their text; the lists their selection."""
+    import gui_emit as ge
+    import gui_policy as pol
+    code = "class Handlers:\n" + "".join(
+        ge.handler_stub(h, {"module": "frame_classes", "function": fn,
+                            "inputs": ins, "outputs": outs}, title)
+        for h, (fn, ins, outs, title) in _typhon_links().items())
+    ok, errs = pol.validate(code, "linked", ["numpy", "PIL", "sklearn"],
+                            toolkit="qt")
+    assert ok, errs
+    space = {}
+    exec(compile(code, "handlers.py", "exec"), space)
+    errors = []
+    h = space["Handlers"]()
+    ports = {n: _Port(v) for n, v in {
+        "classifier_name": name, "classifier_filter": fc.FILTER_ALL,
+        "classifier_status": "", "new_name": "", "tag": "", "new_class": "",
+        "export_to": str(out), "import_from": "", "current_frame": "",
+        "capture_folder": str(folder), "classified_with_line": ""}.items()}
+    ports.update(classes=_ListPort(fc.open_classifier(name)["classes"]),
+                 predictions=_ListPort())
+    h.ports = types.SimpleNamespace(**ports)
+    h.clear_ports = lambda *names: [getattr(h.ports, n).clear()
+                                    for n in names]
+    h.report_error = lambda what, exc: errors.append(f"{what}: {exc}")
+    by = {title: getattr(h, handler) for handler, (_f, _i, _o, title)
+          in _typhon_links().items()}
+    return h, h.ports, errors, by
+
+
+def test_typhons_own_links_run_the_library_with_the_dropdown(
+        vault, trained, tmp_path):
+    """typhon.gspec's links, written by the real emitter and gated: a
+    refused press keeps the window as it was; then Save as, Rename, tags,
+    Export, Export this app's classifiers, Delete, Import back and Classify
+    with its "classified with" line — no error reported."""
+    folder, _ = trained
+    fc.save_as("frames", "other")
+    out = tmp_path / "out"
+    out.mkdir()
+    taken = fc.export_classifier("other", str(out))["path"]
+    h, p, errors, press = _typhon_app(folder, out)
+    assert {"Model", "Open", "Filter", "Save as", "Rename", "Delete",
+            "Export", "Export this app's classifiers", "Import", "Add tag",
+            "Remove tag", "Classify all frames"} <= set(press)
+
+    for what, setup, button in (
+            ("Save as, nothing typed", {"new_name": ""}, "Save as"),
+            ("Save as, a taken name", {"new_name": "OTHER"}, "Save as"),
+            ("Rename, nothing typed", {"new_name": ""}, "Rename"),
+            ("Import, no file", {"import_from": ""}, "Import"),
+            ("Import, a taken name", {"import_from": taken,
+                                      "new_name": "frames"}, "Import")):
+        for port, value in setup.items():
+            getattr(p, port).value = value
+        press[button]()
+        assert errors == [], (what, errors)
+        assert p.classifier_name.value == "frames", (what,
+                                                     p.classifier_status.value)
+        assert p.classes.items() == ["good", "bad timing"], what
+        assert p.classifier_status.value, what
+    p.classifier_name.value = ""                    # an empty box
+    press["Delete"]()
+    assert "Pick the classifier to delete" in p.classifier_status.value
+    assert errors == []
+
+    p.classifier_name.value, p.new_name.value = "frames", "frames-copy"
+    p.import_from.value = ""
+    press["Save as"]()
+    assert p.classifier_name.value == "frames-copy"
+    p.new_name.value = "frames-lab"
+    press["Rename"]()
+    assert p.classifier_name.value == "frames-lab"
+    p.tag.value = "lab"
+    press["Add tag"]()
+    assert p.tag.value == "" and "Tagged 'frames-lab': lab" in \
+        p.classifier_status.value
+    p.tag.value = "lab"
+    press["Remove tag"]()
+    assert "Took 'lab' off" in p.classifier_status.value
+    press["Export"]()
+    assert p.classifier_status.value.startswith("Exported frames-lab v1 (")
+    press["Export this app's classifiers"]()
+    assert "Exported 3 classifiers" in p.classifier_status.value
+    press["Delete"]()                               # the one in the box
+    assert p.classifier_name.value == "" and p.classes.items() == []
+    p.import_from.value = str(out / "frames-lab-v1.typhon-classifier.zip")
+    p.new_name.value = ""
+    press["Import"]()
+    assert p.classifier_name.value == "frames-lab"
+    assert p.classes.items() == ["good", "bad timing"]
+    press["Classify all frames"]()
+    assert p.classified_with_line.value.startswith(
+        "Classified with frames-lab v1 (")
+    assert len(p.predictions.items()) == 30
+    assert errors == []
+
+
 def test_importing_a_bundle_again_keeps_the_window_on_a_classifier(
         vault, trained, tmp_path, monkeypatch):
     """Importing a bundle again is documented as always safe. MEASURED
@@ -1907,8 +2047,8 @@ def test_an_imported_version_number_leaves_room_to_train(vault, trained,
                           manifest={"version": n}))
     pc2 = tmp_path / "pc2"
     monkeypatch.setenv("COUNCIL_VAULT_ROOT", str(pc2))
-    with pytest.raises(RuntimeError, match="version 999999"):
-        fc.import_classifier(numbered(999999), "big")
+    _not_imported(fc.import_classifier(numbered(999999), "big"),
+                  "version 999999")
     top = fc._IMPORT_VERSION_MAX
     fc.import_classifier(numbered(top), "lab")
     fc.mark_frame("lab", str(folder), "frame_0011.png", ["bad timing"])
@@ -2081,8 +2221,7 @@ def test_malformed_records_are_skipped_or_refused_never_a_crash(
     for bad, msg in ((bad_meta, "meta.json does not describe"),
                      (bad_runs, "run record is not readable"),
                      (nan_origin, "where it came from is not readable")):
-        with pytest.raises(RuntimeError, match=msg):
-            fc.import_classifier(str(bad))
+        _not_imported(fc.import_classifier(str(bad)), msg)
     fc.import_classifier(str(no_origin), "anon")
     assert fc.list_classifiers(fc.FILTER_UNKNOWN)["names"] == ["anon"]
     assert fc.open_classifier("anon")["origin"] == fc.UNKNOWN_ORIGIN
@@ -2366,9 +2505,15 @@ def test_an_app_does_not_change_another_apps_classifier(vault, tmp_path,
     v1 = fc.train("frames")["version"]
     _run_as(monkeypatch, _project(apps, "example_typhon", "Typhon"))
     marks = (_store(vault) / "frames" / "classes.json").read_bytes()
-    for call in (lambda: fc.add_class("frames", "dim"),
-                 lambda: fc.remove_class("frames", ["good"]),
-                 lambda: fc.mark_frame("frames", str(folder), "frame_0011.png",
+    # Add class and Remove class ANSWER (the window keeps its classes, see
+    # test_another_apps_model_refuses_a_class_change_without_blanking_it);
+    # Mark and Train fill only the status, and raise.
+    for r in (fc.add_class("frames", "dim"),
+              fc.remove_class("frames", ["good"])):
+        assert re.search("belongs to Barbie Capture v5 — live .*Save as",
+                         r["summary"]), r["summary"]
+        assert r["classes"] == ["good", "bad timing"]
+    for call in (lambda: fc.mark_frame("frames", str(folder), "frame_0011.png",
                                        ["bad timing"]),
                  lambda: fc.train("frames")):
         with pytest.raises(RuntimeError, match="belongs to Barbie Capture v5 "
@@ -2470,12 +2615,20 @@ def test_library_summaries_lead_short_and_name_no_folders(vault, trained,
 
 def test_an_empty_name_says_to_pick_or_type_one(vault):
     """MEASURED before the fix: "'' is not a usable classifier name — use
-    letters, digits ..." — what Use selected said with nothing picked."""
-    for call in (lambda: fc.train(""), lambda: fc.add_class("", "a"),
+    letters, digits ..." — what Use selected said with nothing picked.
+
+    Add class with no model ANSWERS, and keeps the class typed: a fresh
+    Typhon's model box starts empty, and a raise made the handler blank the
+    New class the user had just typed (2026-10-06)."""
+    for call in (lambda: fc.train(""),
                  lambda: fc.predict_frame("", "x", "y")):
         with pytest.raises(RuntimeError, match="pick a classifier in the "
                                                "list, or type its name"):
             call()
+    r = fc.add_class("", "a")
+    assert (r["classes"], r["cleared"]) == ([], "a")
+    assert r["summary"].startswith("Pick a saved model, or type a new")
+    assert not _store(vault).exists() or _names_in(_store(vault)) == []
     r = fc.open_classifier("")
     assert (r["name"], r["classes"]) == ("", [])
     assert r["summary"].startswith("Pick a classifier")
@@ -2496,3 +2649,292 @@ def test_the_list_summary_reads_as_sentences(vault, tmp_path, monkeypatch):
     assert s.startswith("1 of 2 saved classifiers (This app: Typhon, project "
                         "example_typhon): t1. Kept in "), s
     assert "((" not in s and "))" not in s
+
+
+# ============================================================
+# What the fourth review found (2026-10-06) — each test failed before its fix
+# ============================================================
+
+def _barbie_then_typhon(tmp_path, monkeypatch, name="theirs"):
+    """Barbie (another app on this PC) makes ``name`` with two classes;
+    this process then runs as Typhon. Returns (barbie, typhon) folders."""
+    apps = tmp_path / "apps"
+    barbie = _project(apps, "example_barbie_capture_v5",
+                      "Barbie Capture v5 — live")
+    _run_as(monkeypatch, barbie)
+    for c in ("good", "bad timing"):
+        fc.add_class(name, c)
+    typhon = _project(apps, "birdlab", "Typhon")
+    _run_as(monkeypatch, typhon)
+    return barbie, typhon
+
+
+def test_a_mistake_in_a_library_press_never_blanks_the_open_model(
+        vault, trained, tmp_path):
+    """MEASURED before the fix, through Typhon's own links: an unusable new
+    name for Save as ('my birds') or Rename ('a/b'), and an Import of a zip
+    holding '../../escape.txt', of a file that is not a zip, or of a path
+    that is not there, each RAISED — and a generated handler clears every
+    port its link fills, so the model box and the class list went blank
+    (import_bundle's docstring: "an Import never blanks the window"). Each
+    is a mistake the user corrects, so each now answers softly: the open
+    model as it was, the status saying why."""
+    folder, _ = trained
+    out = tmp_path / "out"
+    out.mkdir()
+    export = fc.export_classifier("frames", str(out))["path"]
+    escape = tmp_path / "escape.typhon-classifier.zip"
+    with zipfile.ZipFile(escape, "w") as zf:
+        zf.writestr("../../escape.txt", "x")
+    junk = tmp_path / "junk.zip"
+    junk.write_bytes(b"not a zip at all")
+    h, p, errors, press = _typhon_app(folder, out)
+    before = _names_in(_store(vault))
+    for what, setup, button, says in (
+            ("Save as, an unusable name", {"new_name": "my birds"}, "Save as",
+             "'my birds' is not a usable classifier name"),
+            ("Rename, an unusable name", {"new_name": "a/b"}, "Rename",
+             "'a/b' is not a usable classifier name"),
+            ("Import, a member outside", {"import_from": str(escape),
+                                          "new_name": ""}, "Import",
+             "Nothing was imported"),
+            ("Import, not a zip", {"import_from": str(junk)}, "Import",
+             "Nothing was imported"),
+            ("Import, no such file", {"import_from": str(tmp_path / "no.zip")},
+             "Import", "is not a file"),
+            ("Import, an unusable name", {"import_from": export,
+                                          "new_name": "has space"}, "Import",
+             "'has space' is not a usable classifier name")):
+        for port, value in setup.items():
+            getattr(p, port).value = value
+        press[button]()
+        assert errors == [], (what, errors)
+        assert p.classifier_name.value == "frames", \
+            (what, p.classifier_status.value)
+        assert p.classes.items() == ["good", "bad timing"], what
+        assert says in p.classifier_status.value, \
+            (what, p.classifier_status.value)
+    assert _names_in(_store(vault)) == before
+    assert not list(tmp_path.parent.glob("escape.txt"))
+    # Delete of a name typed that is not saved: said, the name kept.
+    p.classifier_name.value = "ghost"
+    press["Delete"]()
+    assert errors == [] and p.classifier_name.value == "ghost"
+    assert "no classifier 'ghost'" in p.classifier_status.value
+
+
+def test_another_apps_model_refuses_a_class_change_without_blanking_it(
+        vault, tmp_path, monkeypatch):
+    """MEASURED before the fix: with Barbie's model open in Typhon, Add
+    class and Remove class were refused ("belongs to Barbie") by RAISING,
+    and the handler blanked the class list and the class just typed. The
+    refusal is an answer, like "still labels 3 frames": the classes stay,
+    and so does the typed class, for the Save as the message suggests."""
+    _barbie_then_typhon(tmp_path, monkeypatch)
+    h, p, errors, press = _typhon_app(tmp_path, tmp_path, name="theirs")
+    p.new_class.value = "dim"
+    press["Add class"]()
+    assert p.classes.items() == ["good", "bad timing"]
+    assert p.new_class.value == "dim"
+    assert "belongs to Barbie Capture v5" in p.classifier_status.value
+    assert "Save as" in p.classifier_status.value
+    p.classes.pick("good")
+    press["Remove class"]()
+    assert p.classes.items() == ["good", "bad timing"]
+    assert "belongs to Barbie Capture v5" in p.classifier_status.value
+    assert errors == []
+    assert fc.open_classifier("theirs")["classes"] == ["good", "bad timing"]
+
+
+def test_rename_and_delete_leave_another_apps_model_alone(
+        vault, tmp_path, monkeypatch):
+    """MEASURED before the fix: Typhon renamed Barbie's model, and deleted
+    it, with one press each, and Barbie's next Open said "'frames' is new".
+    WHOSE IT IS guarded Add class, Remove class, Mark and Train only, and the
+    dropdown put Rename and Delete one click away for every saved model."""
+    barbie, typhon = _barbie_then_typhon(tmp_path, monkeypatch)
+    r = fc.rename_classifier("theirs", "mine", "theirs")
+    assert "belongs to Barbie Capture v5" in r["summary"], r["summary"]
+    assert "Nothing was renamed" in r["summary"] and r["name"] == "theirs"
+    r = fc.delete_classifier("theirs", "theirs")
+    assert "belongs to Barbie Capture v5" in r["summary"], r["summary"]
+    assert (r["name"], r["classes"], r["moved_to"]) == \
+        ("theirs", ["good", "bad timing"], "")
+    assert _names_in(_store(vault)) == ["theirs"]
+    # A copy of its own is Typhon's to rename and delete ...
+    fc.save_as("theirs", "mine")
+    assert "Renamed 'mine' to 'mine2'" in \
+        fc.rename_classifier("mine", "mine2")["summary"]
+    assert "moved aside" in fc.delete_classifier("mine2")["summary"]
+    # ... and one tagged "shared" is every app's.
+    fc.add_tag("theirs", fc.SHARED_TAG)
+    assert "Renamed 'theirs' to 'ours'" in \
+        fc.rename_classifier("theirs", "ours")["summary"]
+    _run_as(monkeypatch, barbie)
+    assert fc.open_classifier("ours")["classes"] == ["good", "bad timing"]
+
+
+def test_this_app_is_the_models_that_belong_to_it(vault, tmp_path, monkeypatch,
+                                                 capture):
+    """MEASURED before the fix: Typhon's Save as of Barbie's model — Typhon's
+    to train, and trained — was missing from "This app" and from "Export
+    this app's classifiers" ("no classifier matches This app ... nothing was
+    exported"): This app went by ORIGIN, while WHOSE IT IS goes by the latest
+    Save as or Import. A spun-off Typhon's bundle would have left behind the
+    very models only it can change. And by origin, Barbie's "This app" would
+    have listed Typhon's copy, which Barbie may not change."""
+    folder, _ = capture
+    apps = tmp_path / "apps"
+    barbie = _project(apps, "example_barbie_capture_v5", "Barbie Capture v5")
+    _run_as(monkeypatch, barbie)
+    _mark_some(folder)
+    fc.train("frames")
+    _run_as(monkeypatch, _project(apps, "birdlab", "Typhon"))
+    fc.save_as("frames", "mycopy")
+    fc.add_class("mycopy", "blurred")
+    assert fc.list_classifiers(fc.FILTER_THIS_APP)["names"] == ["mycopy"]
+    out = tmp_path / "out"
+    out.mkdir()
+    assert fc.export_this_app(str(out))["names"] == ["mycopy"]
+    _run_as(monkeypatch, barbie)
+    assert fc.list_classifiers(fc.FILTER_THIS_APP)["names"] == ["frames"]
+
+
+def test_a_new_name_is_cleared_once_used_and_kept_when_refused(
+        vault, trained, tmp_path):
+    """MEASURED before the fix: New name still read 'frames-night' after
+    Save as; with both models deleted, Import of frames' export brought it
+    back as 'frames-night'. Save as, Rename and Import now clear the name
+    they used, and keep one they asked to be changed."""
+    folder, _ = trained
+    out = tmp_path / "out"
+    out.mkdir()
+    export = fc.export_classifier("frames", str(out))["path"]
+    h, p, errors, press = _typhon_app(folder, out)
+    p.new_name.value = "frames-night"
+    press["Save as"]()
+    assert (p.classifier_name.value, p.new_name.value) == ("frames-night", "")
+    p.new_name.value = "FRAMES"                     # taken: fix it and retry
+    press["Rename"]()
+    assert p.new_name.value == "FRAMES" and "already exists" in \
+        p.classifier_status.value
+    p.new_name.value = "dusk"
+    press["Rename"]()
+    assert (p.classifier_name.value, p.new_name.value) == ("dusk", "")
+    press["Delete"]()
+    p.classifier_name.value = "frames"
+    press["Delete"]()
+    p.import_from.value = export
+    press["Import"]()
+    assert (p.classifier_name.value, p.new_name.value) == ("frames", "")
+    assert _names_in(_store(vault)) == ["frames"] and errors == []
+
+
+def test_export_into_a_folder_that_is_not_there_says_so(vault, trained,
+                                                        tmp_path):
+    """MEASURED before the fix: Typhon's export picker chooses a FOLDER, and
+    a typed folder that did not exist was read as a file name — "Exported
+    frames v1 (...) as no_such_dir.typhon-classifier.zip", beside it."""
+    for call in (lambda d: fc.export_classifier("frames", d),
+                 lambda d: fc.export_this_app(d)):
+        with pytest.raises(RuntimeError, match="no_such_dir is not a folder"):
+            call(str(tmp_path / "no_such_dir"))
+    assert not list(tmp_path.glob("*.zip"))
+    named = fc.export_classifier("frames", str(tmp_path / "mine.zip"))
+    assert Path(named["path"]).name == "mine.zip"   # a file name says so
+
+
+def _runs_into(folder, src, stamp, frames):
+    """Copy ``frames`` of the capture into ``folder`` as one run of
+    frame_camera's naming: <stamp>_frame_000000.png, ..."""
+    folder.mkdir(exist_ok=True)
+    for i, p in enumerate(frames):
+        shutil.copy(src / p, folder / f"{stamp}_frame_{i:06d}.png")
+
+
+def test_the_classified_with_line_says_which_runs_are_not_classified_yet(
+        vault, trained, tmp_path):
+    """Typhon writes every run into the capture folder. MEASURED before the
+    fix: run 120000 classified with frames v1, then run 130000 written into
+    the same folder — the line still read "Classified with frames v1 ... —
+    good 5, bad timing 3", as if the new run had been classified too; the
+    record listed the first run only."""
+    src, _ = trained
+    names = sorted(p.name for p in src.glob("*.png"))
+    folder = tmp_path / "runs"
+    _runs_into(folder, src, "20261005_120000", names[:8])
+    first = fc.classify_folder("frames", str(folder))["classified_with"]
+    assert fc.classified_with(str(folder))["classified_with"] == first
+    _runs_into(folder, src, "20261005_130000", names[8:14])
+    line = fc.classified_with(str(folder))["classified_with"]
+    assert line.startswith(first), line
+    assert "not classified yet: run 20261005_130000 (6 frames)" in line, line
+    assert fc.classify_folder("frames", str(folder))["classified_with"] == \
+        fc.classified_with(str(folder))["classified_with"]
+    assert "not classified" not in \
+        fc.classified_with(str(folder))["classified_with"]
+
+
+def test_a_renamed_model_is_named_as_it_is_called_now(vault, trained):
+    """MEASURED before the fix: a folder classified with birds v2, birds
+    then renamed hawks — the line and classified_with still said "birds v2",
+    a name the dropdown no longer listed; once a new 'birds' was made,
+    picking it opened a different, untrained model. The record keeps what
+    it was called then; the line names it as it is called now."""
+    folder, _ = trained
+    sha8 = fc.classify_folder("frames", str(folder))["sha256"][:8]
+    fc.rename_classifier("frames", "hawks")
+    fc.add_class("frames", "z")                 # a new model takes the name
+    now = f"hawks v1 ({sha8}; then called frames)"
+    line = fc.classified_with(str(folder))["classified_with"]
+    assert line.startswith(f"Classified with {now} on "), line
+    assert now in fc.run_history("hawks")["rows"][0]
+    fc.delete_classifier("hawks")
+    line = fc.classified_with(str(folder))["classified_with"]
+    assert line.startswith(f"Classified with {now} (since deleted) on "), line
+
+
+def test_the_list_and_the_line_read_again_only_what_changed(
+        vault, trained, monkeypatch):
+    """The dropdown re-reads the store each time it is about to be seen, and
+    after every classifier press. MEASURED before the fix: each re-read
+    parsed every classifier's classes.json, about.json and newest meta.json
+    — 1.0-1.2 ms a classifier on the UI thread, 52-62 ms at 50 saved models,
+    520-630 ms at 500 — and the "classified with" line parsed every run
+    record (0.3 ms a classifier). Now a file is parsed again only when it
+    changed (MEASURED after: 0.3 and 0.1 ms a classifier)."""
+    folder, _ = trained
+    fc.classify_folder("frames", str(folder))
+    fc.save_as("frames", "other")
+    fc.list_classifiers()
+    fc.classified_with(str(folder))
+    opened = []
+    real = Path.read_text
+
+    def read_text(self, *args, **kwargs):
+        opened.append(f"{self.parent.name}/{self.name}")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", read_text)
+    lib = fc.list_classifiers()
+    line = fc.classified_with(str(folder))["classified_with"]
+    assert opened == [], opened
+    assert lib["names"] == ["frames", "other"]
+    assert line.startswith("Classified with frames v1 (")
+    # Another app tags one and classifies with the other: what changed is
+    # read again, and the list and the line say so.
+    fc.add_tag("other", "night")
+    fc.classify_folder("other", str(folder))
+    opened.clear()
+    lib = fc.list_classifiers()
+    line = fc.classified_with(str(folder))["classified_with"]
+    assert any(r.startswith("other ") and "tags: night" in r
+               for r in lib["rows"]), lib["rows"]
+    assert line.startswith("Classified with other v1 ("), line
+    assert opened and all(o.startswith("other/") for o in opened), opened
+    # A damaged newest version is seen at once, whatever was read before.
+    meta = _store(vault) / "frames" / "versions" / "v1" / "meta.json"
+    meta.write_text("{cut short", encoding="utf-8")
+    row = next(r for r in fc.list_classifiers()["rows"]
+               if r.startswith("frames "))
+    assert "PROBLEM" in row, row

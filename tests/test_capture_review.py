@@ -872,6 +872,35 @@ def test_the_raw_view_uses_the_runs_own_window(ui, tmp_path):
     assert opened == [5000]
 
 
+def test_the_raw_view_shows_the_runs_area_from_its_camera_record(
+        ui, tmp_path):
+    """A bird-bath run: the .raw holds the whole sensor, the PNGs the area
+    around the bath. The raw view is opened with the area the run's camera
+    record names, so it shows what the PNGs show; a run with a damaged
+    record (or none — the test above) is shown whole, as before."""
+    from council_core import camera_record
+
+    rv = ui._capture_review
+    saved_run(tmp_path)
+    camera_record.write(tmp_path, RUN, camera_record.build(
+        run=RUN, camera={"model": "IMX636", "kind": "event"},
+        sensor=(1280, 720), area=(400, 200, 64, 48)))
+    ui.ports.capture_folder.set(str(tmp_path))
+    pump(0.3)
+    playback = FakePlayback(50)
+    with_playback(rv, playback)
+    rv.toggle_view()
+    assert playback.opened_with == {"origin_us": 0 - 20_000,
+                                    "area": (400, 200, 64, 48)}
+    rv.toggle_view()
+    (tmp_path / f"{RUN}_camera.json").write_text("{damaged",
+                                                 encoding="utf-8")
+    playback = FakePlayback(50)
+    with_playback(rv, playback)
+    rv.toggle_view()
+    assert playback.opened_with == {"origin_us": 0 - 20_000}
+
+
 # ======================================================================
 # The live picture and the camera's area, inside Typhon
 # ======================================================================

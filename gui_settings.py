@@ -413,7 +413,8 @@ def _info(path: Path) -> _Info:
     if held is not None and held[0] == stamp:
         return held[1]
     try:
-        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        source = path.read_text(encoding="utf-8", errors="replace")
+        tree = ast.parse(source)
     except (OSError, SyntaxError, ValueError) as exc:
         if isinstance(exc, SyntaxError):
             where = f" (line {exc.lineno})" if exc.lineno else ""
@@ -430,11 +431,61 @@ def _info(path: Path) -> _Info:
         elif isinstance(node, ast.ImportFrom):
             for a in node.names:
                 imports.append((node.module or "", a.name, node.level or 0))
+    if "import_module" in source:
+        imports.extend((dotted, "", 0) for dotted in _imported_by_name(tree))
     name = path.stem if path.name != "__init__.py" else path.parent.name
     got = (tuple(imports), summarise(ast.get_docstring(tree) or "", name),
            _is_marker(tree), "")
     _PARSED[key] = (stamp, got)
     return got
+
+
+def _imported_by_name(tree: ast.Module) -> List[str]:
+    """Modules a file imports by NAME, with importlib.import_module("a.b")
+    or import_module(SOME_MODULE) where SOME_MODULE = "a.b" is set at the
+    top of the file.
+
+    An import statement is not the only way in: frame_camera opens the
+    camera settings window as importlib.import_module(SETTINGS_WINDOW_MODULE)
+    — on purpose, so it never imports a window until the button is pressed
+    — and the window was missing from what the app can reach: listed only
+    once the button had been pressed and the module was loaded. Only files
+    whose text says "import_module" get here, and only for them is the whole
+    tree walked (see _statements for why the walk is otherwise avoided)."""
+    named: Dict[str, str] = {}
+    for node in tree.body:
+        target = value = None
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign):
+            target, value = node.target, node.value
+        if (isinstance(target, ast.Name) and isinstance(value, ast.Constant)
+                and isinstance(value.value, str)):
+            named[target.id] = value.value
+    found: List[str] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and node.args):
+            continue
+        func = node.func
+        called = (func.attr if isinstance(func, ast.Attribute) else
+                  func.id if isinstance(func, ast.Name) else "")
+        if called != "import_module":
+            continue
+        arg = node.args[0]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            dotted = arg.value
+        elif isinstance(arg, ast.Name) and arg.id in named:
+            dotted = named[arg.id]
+        else:
+            continue
+        if _DOTTED.match(dotted) and dotted not in found:
+            found.append(dotted)
+    return found
+
+
+#: What a module name looks like; anything else passed to import_module (a
+#: relative ".x", an f-string's pieces) is not followed.
+_DOTTED = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
 
 
 def _what(path: Path, fallback: str) -> str:

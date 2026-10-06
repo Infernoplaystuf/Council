@@ -26,6 +26,12 @@ from council_core.live_display import DisplayPrep
 
 @pytest.fixture(autouse=True)
 def clean(tmp_path):
+    # Pillow's plugins warmed once, as a Typhon window does when it opens:
+    # otherwise a test run on its own waits for Connect's warm-up thread and
+    # its first ticks see no preview (test_frame_camera's clean says more).
+    from council_core import capture
+
+    capture.warm_imports()
     frame_camera.disconnect()
     frame_camera._LIVE.found = None
     frame_camera._LIVE.reviewer = None
@@ -980,3 +986,435 @@ def test_a_set_whose_binning_moves_the_area_clears_the_crop_box(binning):
     out = frame_camera.apply_camera_settings({"BinningHorizontal": 2})
     assert out["crop"] == "" and viewer.roi.get() == ""
     assert out["area"] == "50, 60, 160, 240"
+
+
+# ======================================================================
+# The first live tick after Connect does not import Pillow on the UI thread
+# ======================================================================
+def test_the_first_live_tick_after_connect_never_waits_for_imports(
+        monkeypatch):
+    """session.start() warms numpy and Pillow before the stream may start;
+    at the first live tick that ran on the UI thread — the window's longest
+    stall after Connect (110-483 ms measured in a built Typhon, nearly all
+    Pillow's plugins). The live view now waits a tick or two for a warm-up
+    on its own thread instead."""
+    import threading
+
+    from council_core import capture
+
+    gate = threading.Event()
+    ran_on = []
+
+    def slow_warm():
+        ran_on.append(threading.current_thread().name)
+        gate.wait(2)                     # as long as the test likes
+        capture._WARMED.set()
+
+    # raising=False: on the old code (no _WARMED) this fails on what it
+    # measures — a 2 s tick, warmed on MainThread — not on a missing name.
+    monkeypatch.setattr(capture, "_WARMED", threading.Event(), raising=False)
+    monkeypatch.setattr(capture, "_WARMER", [], raising=False)
+    monkeypatch.setattr(capture, "warm_imports", slow_warm)
+    connected("frame")
+    viewer = Viewer()
+    frame_camera._LIVE.reviewer = viewer       # the attached app's viewer
+    longest = 0.0
+    for _ in range(10):
+        began = time.perf_counter()
+        frame_camera._tick(lambda image: None, None, viewer)
+        longest = max(longest, time.perf_counter() - began)
+        time.sleep(0.01)
+    assert longest < 0.05, f"a tick waited {longest * 1000:.0f} ms"
+    assert not frame_camera._LIVE.previewing, "started before it was warm"
+    assert ran_on == ["warm-imports"], "warmed on the UI thread"
+    gate.set()
+    ticks(viewer, 0.3)
+    assert frame_camera._LIVE.previewing and frame_camera._LIVE.session.running
+
+
+# ======================================================================
+# The boxes beside Start wait for a change on the worker (QUEUED_BOXES)
+# ======================================================================
+def _slow_area_change(viewer):
+    """A 1 fps camera whose area change is still on the worker."""
+    frame_camera.set_frame_rate(1)
+    ticks(viewer, 0.1)
+    out = frame_camera.set_area("0, 0, 128, 128")
+    assert out["pending"] and frame_camera._LIVE.job is not None
+    return out
+
+
+@pytest.mark.parametrize("box, call, value, key", [
+    ("exposure", "set_exposure", "7000", "ExposureTime"),
+    ("gain", "set_gain", "6", "Gain"),
+    ("frame_rate", "apply_frame_rate", "25", "AcquisitionFrameRate"),
+])
+def test_a_box_changed_during_a_change_on_the_worker_waits_for_it(
+        box, call, value, key):
+    """The FPS box (and exposure and gain, through any link) wrote the camera
+    from the UI thread while the worker was stopping, changing and restarting
+    its stream. Now the value waits — said, never refused — and is written
+    on the UI thread once the worker is done, never while it runs."""
+    viewer = live("frame")
+    _slow_area_change(viewer)
+    writes = []
+    setter = {"exposure": "set_exposure_us", "gain": "set_gain",
+              "frame_rate": "set_frame_rate"}[box]
+    real = getattr(device(), setter)
+
+    def watched(v):
+        writes.append(frame_camera._LIVE.job is not None)
+        return real(v)
+
+    setattr(device(), setter, watched)
+    before = device().state[key]
+    out = getattr(frame_camera, call)(value)
+    assert "is set once the camera has finished changing the camera's area" \
+        in out["summary"], out["summary"]
+    assert writes == [] and device().state[key] == before, "written mid-job"
+    said = []
+    ticks(viewer, 2.0, said=said)
+    assert frame_camera._LIVE.job is None
+    assert writes == [False], "written while the job ran, or not at all"
+    assert device().state[key] == pytest.approx(float(value))
+    assert any("Camera area set to 0, 0, 128, 128" in s for s in said), said
+    assert frame_camera._LIVE.queued == {}
+
+
+def test_only_the_latest_value_of_a_box_waits_and_disconnect_drops_it():
+    viewer = live("frame")
+    _slow_area_change(viewer)
+    frame_camera.set_gain(2)
+    frame_camera.set_gain(4)
+    assert frame_camera._LIVE.queued == {"gain": 4.0}
+    frame_camera.disconnect()
+    assert frame_camera._LIVE.queued == {}, "a value outlived its camera"
+
+
+def test_without_a_change_on_the_worker_a_box_is_written_at_once():
+    live("frame")
+    out = frame_camera.set_gain(5)
+    assert out["summary"] == "Gain 5.00." and device().state["Gain"] == 5.0
+
+
+@pytest.mark.parametrize("box, call, key", [
+    ("exposure", "set_exposure", "ExposureTime"),
+    ("gain", "set_gain", "Gain"),
+])
+def test_a_box_that_waited_for_a_preset_is_newer_than_the_preset(
+        tmp_path, box, call, key):
+    """The box was changed while a preset was restarting the camera: its
+    value waited and was written AFTER the preset, so it is what the camera
+    has. Start then said it "kept the camera's own" value because a preset
+    set it after the box changed — the box's own value, which the preset no
+    longer had. Written last, the box is the latest word (as the FPS box,
+    which stamps itself, already was)."""
+    viewer = live("frame")
+    frame_camera.set_camera_area("0, 0, 320, 240")
+    frame_camera.set_camera_setting(key, 3.0 if box == "gain" else 4000)
+    frame_camera.save_preset("Small")
+    frame_camera.set_camera_area("0, 0, 640, 480")
+    frame_camera.set_frame_rate(1)                  # a slow stop: it waits
+    ticks(viewer, 0.1)
+    out = frame_camera.apply_preset("Small")
+    assert out["pending"], out["summary"]
+    value = "6" if box == "gain" else "7000"
+    frame_camera._box_changed(box)                  # attach's port hook
+    assert "is set once" in getattr(frame_camera, call)(value)["summary"]
+    ticks(viewer, 2.0)
+    assert frame_camera._LIVE.job is None
+    assert device().state[key] == pytest.approx(float(value))
+    run = frame_camera.start(str(tmp_path / "runs"), **{box: value})
+    frame_camera.stop()
+    assert "Kept the camera's own" not in run["summary"], run["summary"]
+    assert device().state[key] == pytest.approx(float(value))
+
+
+# ======================================================================
+# Each run's camera record: <run>_camera.json
+# ======================================================================
+def _record(out):
+    path = Path(out["record"])
+    assert path.is_file(), out
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_a_bird_bath_run_says_where_on_the_sensor_its_frames_came_from(
+        tmp_path):
+    """The user's bird bath: an event camera kept to the area around the
+    bath, its set-up saved as a preset — then a run. The run's record says
+    which camera, the area in SENSOR pixels (the PNGs are that area alone),
+    every setting as it was at Start, that the preset was still as applied,
+    the app and the software."""
+    connected("event")
+    frame_camera.set_camera_area("100, 60, 160, 120")
+    frame_camera.set_camera_setting("bias.bias_diff_on", 40)
+    frame_camera.save_preset("Bird bath")
+    out = frame_camera.start(str(tmp_path / "runs"))
+    deadline = time.monotonic() + 3
+    while not frame_camera._LIVE.session.written() and \
+            time.monotonic() < deadline:
+        time.sleep(0.02)
+    frame_camera.stop()
+    rec = _record(out)
+    assert Path(out["record"]).name == f"{out['run']}_camera.json"
+    assert rec["format"] == "typhon-camera-record" and rec["run"] == out["run"]
+    assert rec["camera"]["model"] == "Simulated event camera"
+    assert rec["camera"]["serial"] == "SIM-2"
+    assert rec["camera"]["kind"] == "event"
+    assert rec["sensor"] == {"width": 640, "height": 480}
+    assert rec["area"] == {"x": 100, "y": 60, "w": 160, "h": 120}
+    assert rec["full_sensor"] is False
+    assert rec["settings"]["bias.bias_diff_on"] == 40
+    assert rec["settings"]["window_ms"] == 20.0
+    assert "status.temperature" in rec["read_only"]
+    assert rec["units"]["window_ms"] == "ms"
+    assert rec["preset"] == "Bird bath" and "preset_changed" not in rec
+    assert rec["software"]["council_version"]
+    assert rec["software"]["frame_camera"] == frame_camera.RECORD_WRITER
+    assert rec["app"]["folder"] == str(tmp_path)
+    # The PNGs of the run are the area alone.
+    from PIL import Image
+    png = sorted((tmp_path / "runs").glob(f"{out['run']}_frame_*.png"))[0]
+    assert Image.open(png).size == (160, 120)
+
+
+def test_a_preset_changed_since_it_was_applied_is_not_claimed(tmp_path):
+    connected("frame")
+    frame_camera.set_camera_setting("Gain", 3)
+    frame_camera.save_preset("Day")
+    frame_camera.set_camera_setting("Gain", 9)          # changed since
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    rec = _record(out)
+    assert rec["preset"] == ""
+    assert rec["preset_changed"] == {"name": "Day", "differs": ["Gain"]}
+    # Put back exactly: the preset is in use again, whatever did it.
+    frame_camera.set_camera_setting("Gain", 3)
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    assert _record(out)["preset"] == "Day"
+
+
+def test_an_applied_preset_is_named_and_a_box_at_start_can_change_it(
+        tmp_path):
+    connected("frame")
+    frame_camera.set_camera_setting("ExposureTime", 4000)
+    frame_camera.save_preset("Dim")
+    frame_camera.set_camera_setting("ExposureTime", 9000)
+    frame_camera.apply_preset("Dim")
+    out = frame_camera.start(str(tmp_path / "runs"), exposure="0")
+    frame_camera.stop()
+    assert _record(out)["preset"] == "Dim"
+    frame_camera._box_changed("exposure")      # typed after the preset
+    out = frame_camera.start(str(tmp_path / "runs"), exposure="6000")
+    frame_camera.stop()
+    rec = _record(out)
+    assert rec["preset"] == "" and rec["preset_changed"]["name"] == "Dim"
+    assert rec["settings"]["ExposureTime"] == 6000.0
+
+
+def test_a_preset_that_only_partly_applied_is_not_claimed(tmp_path):
+    """A preset holding a setting this camera refuses is applied in part —
+    the camera is NOT as the preset says, so no run names it. The guard is
+    in _apply_set's finish; with it broken every other test stayed green."""
+    connected("frame")
+    frame_camera.set_camera_setting("Gain", 3)
+    frame_camera.save_preset("Day")
+    path = tmp_path / "camera_presets.json"
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    entry = next(iter(doc["cameras"].values()))
+    entry["presets"]["Day"]["settings"]["NoSuchSettingOnThisCamera"] = 1
+    path.write_text(json.dumps(doc), encoding="utf-8")
+    frame_camera.set_camera_setting("Gain", 9)
+    applied = frame_camera.apply_preset("Day")
+    assert not applied["ok"] and "refused" in applied["summary"]
+    assert device().state["Gain"] == 3
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    assert _record(out)["preset"] == ""
+
+
+def test_a_renamed_preset_is_recorded_by_its_new_name(tmp_path):
+    connected("frame")
+    frame_camera.set_camera_setting("Gain", 3)
+    frame_camera.save_preset("Day")
+    frame_camera.rename_preset("Day", "Dusk")
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    assert _record(out)["preset"] == "Dusk"
+
+
+def test_a_deleted_preset_is_never_named_by_a_run(tmp_path):
+    """A record read months later must not name a preset that is in no
+    camera_presets.json — nor one a later save under that name made of
+    other settings."""
+    connected("frame")
+    frame_camera.set_camera_setting("Gain", 3)
+    frame_camera.save_preset("Day")
+    frame_camera.delete_preset("Day")
+    assert frame_camera.list_presets()["presets"] == []
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    rec = _record(out)
+    assert rec["preset"] == "" and "preset_changed" not in rec
+
+
+def test_settings_that_cannot_be_read_never_claim_a_preset(tmp_path,
+                                                          monkeypatch):
+    """Nothing compared is nothing confirmed: a camera that cannot describe
+    its settings at Start (its gain really changed since) does not get the
+    preset's name in the record — the record says why instead."""
+    connected("frame")
+    frame_camera.set_camera_setting("Gain", 3)
+    frame_camera.save_preset("Day")
+    frame_camera.set_gain(9)                  # the box beside Start
+    assert device().state["Gain"] == 9
+
+    def broken():
+        raise cameras.CameraError("node map timeout")
+
+    monkeypatch.setattr(device(), "settings", broken)
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    rec = _record(out)
+    assert rec["preset"] == ""
+    assert rec["preset_changed"]["name"] == "Day"
+    assert "node map timeout" in rec["settings_error"]
+    assert any("could not be read" in d
+               for d in rec["preset_changed"]["differs"]), rec
+
+
+def test_a_setting_of_the_preset_the_camera_no_longer_lists_is_a_difference(
+        tmp_path, monkeypatch):
+    connected("frame")
+    frame_camera.set_camera_setting("Gain", 3)
+    frame_camera.save_preset("Day")
+    real = frame_camera.settings_list
+
+    def without_gain():
+        out = real()
+        return dict(out, settings=[r for r in out["settings"]
+                                   if r.get("key") != "Gain"])
+
+    monkeypatch.setattr(frame_camera, "settings_list", without_gain)
+    out = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    rec = _record(out)
+    assert rec["preset"] == ""
+    assert rec["preset_changed"] == {"name": "Day", "differs": ["Gain"]}
+
+
+def test_a_slow_read_of_the_camera_at_start_is_not_capture_time(
+        tmp_path, monkeypatch):
+    """The record's read of every setting happens BEFORE the recorder is
+    switched on (d1b7418): an EVK4's stream is left running through Start
+    (EvkDevice.restartable), so a slow node-map read after the switch made
+    its frames part of the run. The simulated event camera restarts its
+    stream like a frame camera — where the read comes then makes no
+    difference — so here it keeps it running, as the EVK4 does."""
+    connected("event")
+    monkeypatch.setattr(device(), "restartable", False, raising=False)
+    ticks(Viewer(), 0.3)
+    real = frame_camera.settings_list
+
+    def slow():
+        time.sleep(0.3)                     # a real camera's node map, slowly
+        return real()
+
+    monkeypatch.setattr(frame_camera, "settings_list", slow)
+    frame_camera.start(str(tmp_path / "runs"))
+    grabbed = frame_camera._LIVE.session.stats().grabbed
+    frame_camera.stop()
+    assert grabbed <= 2, f"{grabbed} frames of a slow read counted in the run"
+
+
+def test_a_record_is_never_written_over_and_its_name_is_never_reused(
+        tmp_path):
+    from council_core import camera_record
+
+    connected("frame")
+    runs = tmp_path / "runs"
+    first = frame_camera.start(str(runs))
+    frame_camera.stop()
+    path = Path(first["record"])
+    text = path.read_bytes()
+    with pytest.raises(camera_record.RecordExists):
+        camera_record.write(runs, first["run"], {"format": "other"})
+    assert path.read_bytes() == text
+    assert not list(runs.glob(".*.tmp")), "a temporary file was left behind"
+    # Only a record of that name in the folder: still a taken run name.
+    lone = runs / "solo"
+    lone.mkdir()
+    stem = time.strftime("%Y%m%d_%H%M%S")
+    (lone / f"{stem}_camera.json").write_text("{}", encoding="utf-8")
+    assert frame_camera._unique_run(lone) != stem
+
+
+def test_presets_and_the_run_record_use_the_sensor_the_camera_reports(
+        tmp_path, monkeypatch):
+    """Discovery no longer guesses "EVK4" (it cannot know the sensor
+    without opening the camera); Connect takes the identity the OPEN device
+    reports (cameras.identify) — what presets are kept under and what the
+    run's camera record says."""
+    import dataclasses
+
+    found = cameras.CameraInfo("prophesee", "00051234", "", "00051234",
+                               "Prophesee", "event")
+    opened = dataclasses.replace(found, model="IMX636")
+
+    def open_camera(info, known=None):
+        assert info == found
+        device = cameras.SyntheticDevice(cameras.CameraInfo(
+            "simulated", "sim-event", "Simulated event camera", "SIM-2",
+            "simulated", "event"))
+        device.info = opened
+        return device
+
+    monkeypatch.setattr(cameras, "open_camera", open_camera)
+    frame_camera._LIVE.found = cameras.Discovery([found], [])
+    out = frame_camera.connect("1. Prophesee (00051234) · event")
+    assert frame_camera._LIVE.info == opened
+    assert out["summary"].startswith("Connected to Prophesee IMX636 (00051234)")
+    frame_camera.save_preset("Bird bath")
+    doc = json.loads((tmp_path / "camera_presets.json").read_text(
+        encoding="utf-8"))
+    assert list(doc["cameras"]) == ["prophesee|IMX636|00051234"]
+    run = frame_camera.start(str(tmp_path / "runs"))
+    frame_camera.stop()
+    camera = _record(run)["camera"]
+    assert (camera["model"], camera["serial"], camera["vendor"]) == (
+        "IMX636", "00051234", "Prophesee")
+
+
+def test_a_start_that_fails_leaves_no_record_of_a_run(tmp_path, monkeypatch):
+    """Read before the stream starts, written only once it has: a camera
+    that refuses to start leaves no record of a run that never happened."""
+    connected("frame")
+
+    def unplugged():
+        raise cameras.CameraError("the camera was unplugged")
+
+    monkeypatch.setattr(device(), "start", unplugged)
+    runs = tmp_path / "runs"
+    with pytest.raises(Exception, match="unplugged"):
+        frame_camera.start(str(runs))
+    assert not frame_camera._LIVE.capturing
+    assert not list(runs.glob("*_camera.json"))
+    assert frame_camera._LIVE.record_path is None
+
+
+def test_a_record_that_cannot_be_written_never_stops_the_capture(
+        tmp_path, monkeypatch):
+    from council_core import camera_record
+
+    def refuse(*_a, **_k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(camera_record, "write", refuse)
+    connected("frame")
+    out = frame_camera.start(str(tmp_path / "runs"))
+    assert frame_camera._LIVE.capturing
+    assert "camera record" in out["summary"] and "NOT written" in out["summary"]
+    assert out["record"] == ""
+    frame_camera.stop()

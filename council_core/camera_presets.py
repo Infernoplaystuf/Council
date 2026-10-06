@@ -90,6 +90,10 @@ MAX_FILE_BYTES = 4 * 1024 * 1024
 #: How long a change waits for another app's change to the same file.
 LOCK_SECONDS = 10.0
 
+#: What discovery called every Metavision camera before the model was read
+#: from the camera itself (see Identity.legacy_keys).
+LEGACY_EVENT_MODEL = "EVK4"
+
 _LOCK = threading.Lock()
 
 
@@ -136,6 +140,22 @@ class Identity:
     @property
     def model_key(self) -> str:
         return f"{self.backend}|{self.model}"
+
+    @property
+    def legacy_keys(self) -> Tuple[str, ...]:
+        """Keys THIS camera's presets were saved under by an older build.
+
+        Discovery used to call every Metavision camera "EVK4"; the model is
+        now the sensor the camera reports (cameras.identify). A unit's own
+        presets saved then, under "prophesee|EVK4|<its serial>", are still
+        its own — same serial, same camera — so they are listed as its own
+        and moved to its key at its next change. Another unit's "EVK4"
+        presets are NOT offered as the same model: which sensor that unit
+        had was never recorded."""
+        if (self.backend == "prophesee" and self.serial
+                and self.model != LEGACY_EVENT_MODEL):
+            return (f"prophesee|{LEGACY_EVENT_MODEL}|{self.serial}",)
+        return ()
 
     @property
     def label(self) -> str:
@@ -331,7 +351,7 @@ class PresetStore:
                 self.problems.append(f"{key}: not a camera entry")
                 continue
             owner = _owner(key, entry)
-            if key == camera.key:
+            if key == camera.key or key in camera.legacy_keys:
                 mine = True
             elif owner.model_key == camera.model_key and owner.model:
                 mine = False
@@ -438,6 +458,7 @@ class PresetStore:
                 moved = self._copy_aside()
                 self.repaired = "entry"
                 del doc["cameras"][camera.key]
+            _adopt_legacy(doc, camera)
             entry = _entry_for(doc, camera)
             presets = entry["presets"]
             old_name = _find(presets, name)
@@ -459,6 +480,7 @@ class PresetStore:
         old, new = clean_name(old), clean_name(new)
         with self._changing():
             doc = self.read()
+            _adopt_legacy(doc, camera)
             entry = doc["cameras"].get(camera.key)
             presets = entry.get("presets") if isinstance(entry, dict) else None
             found = _find(presets, old) if isinstance(presets, dict) else None
@@ -482,6 +504,7 @@ class PresetStore:
         name = clean_name(name)
         with self._changing():
             doc = self.read()
+            _adopt_legacy(doc, camera)
             entry = doc["cameras"].get(camera.key)
             presets = entry.get("presets") if isinstance(entry, dict) else None
             found = _find(presets, name) if isinstance(presets, dict) else None
@@ -589,6 +612,28 @@ def _owner(key: str, entry: Mapping[str, Any]) -> Identity:
                     model=str(entry.get("model") or parts[1]),
                     serial=str(entry.get("serial") or parts[2]),
                     kind=str(entry.get("kind") or "frame"))
+
+
+def _adopt_legacy(doc: Dict[str, Any], camera: Identity) -> None:
+    """Move this camera's presets saved under an older build's key (see
+    Identity.legacy_keys) into its own entry, in `doc` only — a change writes
+    it with the rest. A name both have keeps the newer key's preset; a
+    damaged entry, on either side, is left exactly where it is."""
+    for key in camera.legacy_keys:
+        old = doc["cameras"].get(key)
+        if not (isinstance(old, dict)
+                and isinstance(old.get("presets", {}), dict)):
+            continue
+        mine = doc["cameras"].get(camera.key)
+        if mine is not None and not (
+                isinstance(mine, dict)
+                and isinstance(mine.get("presets", {}), dict)):
+            return
+        target = _entry_for(doc, camera)["presets"]
+        for name, body in dict(old.get("presets") or {}).items():
+            if _find(target, str(name)) is None:
+                target[name] = body
+        del doc["cameras"][key]
 
 
 def _entry_for(doc: Dict[str, Any], camera: Identity) -> Dict[str, Any]:

@@ -47,6 +47,11 @@ The capture folder IS the browse folder. Each run writes, side by side:
                                  and where it falls in the .raw
     <run>_events.raw             EVENT CAMERAS ONLY: every event the sensor
                                  sent, in Prophesee's own format
+    <run>_camera.json            which camera, where on its sensor (the
+                                 camera's own area, sensor pixels), every
+                                 setting at Start, the preset if it was
+                                 still as applied, the app and the software
+                                 (council_core.camera_record) — written once
 
 PNG specifically, because frame_timing, frame_roi and frame_classes all
 discover frames by IMAGE_SUFFIXES and open them with Pillow — a capture
@@ -242,6 +247,18 @@ class _Live:
         #: an app whose box has no hook (`hooked_boxes`, set by attach).
         self.box_seen: Dict[str, str] = {}
         self.hooked_boxes: set = set()
+        #: A box beside Start ("exposure", "gain", "frame_rate") changed
+        #: while a camera change had the camera on the worker: its latest
+        #: value, written by the UI thread once the change is done
+        #: (_write_queued). About the connection: dropped at Disconnect.
+        self.queued: Dict[str, Any] = {}
+        #: The preset the camera was last put back to (or saved as): its
+        #: name, settings and area as they were then — what a run's camera
+        #: record compares the camera with at Start, to say the preset only
+        #: while nothing has changed since. About the connection.
+        self.preset_in_use: Optional[Dict[str, Any]] = None
+        #: The latest run's camera record (<run>_camera.json), or None.
+        self.record_path: Optional[Path] = None
 
     def clear(self) -> None:
         self.device = None
@@ -265,6 +282,9 @@ class _Live:
         self.job = None
         self.as_connected = {}
         self.camera_set = {}
+        self.queued = {}
+        self.preset_in_use = None
+        self.record_path = None
 
 
 _LIVE = _Live()
@@ -371,11 +391,20 @@ def connect(which: Any) -> Dict[str, Any]:
     """Open the chosen camera and report what it is."""
     from council_core import cameras, capture
 
+    # An app that never attached (no live view, a script) warms here; one
+    # that did is warm already, and this costs nothing.
+    capture.warm_in_background()
     with _LOCK:
         if _LIVE.device is not None:
             raise RuntimeError("a camera is already open — disconnect first")
         info = _chosen(which)
         device = cameras.open_camera(info)
+        # What the camera says it is once open (an event camera's sensor is
+        # read then, never at discovery — cameras.identify): the identity
+        # presets and the run's camera record use.
+        opened = getattr(device, "info", None)
+        if isinstance(opened, cameras.CameraInfo) and opened.key == info.key:
+            info = opened
         _LIVE.device = device
         _LIVE.info = info
         _LIVE.session = capture.CaptureSession(device)
@@ -463,6 +492,13 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     0 lifted the preset's frame-rate limit, and put an EVK4's picture
     window back to 20 ms (measured).
 
+    THE RUN SAYS WHERE IT CAME FROM. <run>_camera.json is written beside
+    the run's other files once the boxes are applied (council_core.
+    camera_record): the camera, its area in sensor pixels, every setting,
+    the preset when the camera is still as it left it, the app and the
+    software. A record that cannot be written is said in the summary and
+    the capture goes ahead.
+
     FROM THE PREVIEW. A frame camera's preview is stopped and the camera
     started again for the capture. An EVK4's stream is left running and the
     .raw opens inside it — restarting would carry stale decoder state into
@@ -518,6 +554,15 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         _release_dead_stream(session)
 
     run = _unique_run(out)
+    # READ after the boxes beside Start were applied and before the run's
+    # recording begins — the camera as every picture of this run will have
+    # it — and WRITTEN only once the capture has started, so a Start that
+    # fails below leaves no record of a run that never happened. Read
+    # BEFORE the switch below, not after it: an event camera's stream is
+    # already running, so from the switch on every moment Start spends here
+    # is frames of the run, and reading every setting of a real camera is
+    # the slow part of the record.
+    content, record_note = _camera_record(run, device)
     recorder = capture.Recorder(out, stem=f"{run}_frame",
                                 index_name=f"{run}_frames.csv")
     try:
@@ -555,10 +600,16 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
         _started_stream(session)
     _LIVE.capturing = True
     _LIVE.previewing = False
+    record = None
+    if content is not None:
+        record, record_note = _save_camera_record(out, run, content)
+    _LIVE.record_path = record
 
     said = f"Capturing into {out}."
     if raw is not None:
         said += f" Raw: {raw.name}."
+    if record_note:
+        said += f" {record_note}"
     if kept:
         said += (f" Kept the camera's own {' and '.join(kept)}: a preset or "
                  f"the settings window set {'it' if len(kept) == 1 else 'them'}"
@@ -571,7 +622,8 @@ def start(folder: Any, exposure: Any = "", gain: Any = "",
     # preset, a setting the stream is in the way of) from this.
     _announce({"what": "capturing", "summary": said})
     return {"summary": said, "folder": str(out), "run": run,
-            "raw": str(raw) if raw is not None else ""}
+            "raw": str(raw) if raw is not None else "",
+            "record": str(record) if record is not None else ""}
 
 
 def stop() -> Dict[str, Any]:
@@ -863,6 +915,15 @@ def _manage_preview(want: bool) -> None:
             # The stopped run is still landing: starting the preview now
             # would reset the counts and hide "N waiting to save".
             return
+        from council_core import capture
+        if not capture.imports_warm():
+            # session.start() would import Pillow's plugins HERE, on the UI
+            # thread, before the stream may start (capture.warm_imports):
+            # the window's longest stall after Connect. They are on their
+            # way on a thread of their own; the picture starts a tick or
+            # two later instead of the window freezing for them.
+            capture.warm_in_background()
+            return
         try:
             session.record_to(None)
             session.reset_stats()
@@ -1013,7 +1074,10 @@ def attach(app: Any, view: str = "live_view",
            scrubber: str = "frame", folder: str = "capture_folder",
            current: str = "current_frame", roi: str = "roi",
            view_status: str = "view_status", presets: str = "preset",
-           area: str = "camera_area") -> Any:
+           area: str = "camera_area", models: str = "classifier_name",
+           model_filter: str = "classifier_filter",
+           classified: str = "classified_with_line",
+           model_status: str = "classifier_status") -> Any:
     """Start the live view. ONE line in app.py, which is never regenerated::
 
         class App(HandlerMixin, MainUi):
@@ -1054,6 +1118,17 @@ def attach(app: Any, view: str = "live_view",
     label saying the camera's area in sensor pixels — after every change,
     from this window or the settings window (on_camera_change). A link can
     only write the box's text, never its list. Optional, like the slider.
+
+    THE MODEL DROPDOWN. When the app's `models` port (the classifier name)
+    is a COMBOBOX, a ClassifierPicker (council_qt.widgets.
+    classifier_picker) keeps its list the saved classifiers of the shared
+    store — read again as it opens, so another app's are there too — the
+    `model_filter` box's list the filters that exist, and the `classified`
+    line saying which model version classified the capture folder — read
+    again after every press that writes the `model_status` line, and when
+    the slider's review lists the folder again. Every action on a model
+    stays a frame_classes script link (its Delete asks for a second press).
+    An app whose name port is an entry (the Barbie apps) is left as it is.
     """
     from PySide6.QtCore import Qt, QTimer
 
@@ -1068,6 +1143,12 @@ def attach(app: Any, view: str = "live_view",
     held = getattr(app, "_frame_camera_live", None)
     if held is not None:
         return held
+
+    # Pillow's plugins, imported on a thread of their own while the user
+    # finds the camera — not on the UI thread at the first live tick
+    # (capture.warm_imports measures what that cost).
+    from council_core import capture
+    capture.warm_in_background()
 
     reviewer = _reviewer_for(app, canvas, scrubber, folder, current, roi,
                              view_status)
@@ -1105,6 +1186,13 @@ def attach(app: Any, view: str = "live_view",
         _LIVE.picker.close()           # an earlier window's, now replaced
     _LIVE.picker = picker
     app._camera_presets = picker
+    models_picker = _models_for(app, models, model_filter, classified,
+                                folder, model_status)
+    app._classifier_picker = models_picker
+    if reviewer is not None and models_picker is not None:
+        # New frames in the folder (a capture's last frame on disk): the
+        # line says which runs are not classified yet.
+        reviewer.on_reload(models_picker.line_soon)
     if first_run and current_choice() is None and not _dialogs_disabled():
         # After the window is up, not inside __init__: a modal dialog opened
         # while the main window is still being built has no window on screen
@@ -1174,6 +1262,23 @@ def _picker_for(app: Any, presets: str, area: str) -> Any:
 
     return PresetPicker(sys.modules[__name__], combo=combo, area=line,
                         parent=app)
+
+
+def _models_for(app: Any, models: str, model_filter: str, classified: str,
+                folder: str, status: str = "") -> Any:
+    """A ClassifierPicker for this app's model dropdown, or None when its
+    model-name port is not a dropdown (or frame_classes cannot be had)."""
+    ports = getattr(app, "ports", None)
+    if ports is None or not models:
+        return None
+    try:
+        import frame_classes
+        from council_qt.widgets import classifier_picker
+    except ImportError:
+        return None
+    return classifier_picker.attach_to(frame_classes, ports, models,
+                                       model_filter, classified, folder,
+                                       parent=app, status=status)
 
 
 class _Feed:
@@ -1248,7 +1353,8 @@ def _unique_run(out: Path) -> str:
         names = []
     taken = set()
     for name in names:
-        for marker in ("_frame_", "_events.raw", "_frames.csv"):
+        for marker in ("_frame_", "_events.raw", "_frames.csv",
+                       "_camera.json"):
             head, found, _ = name.partition(marker)
             if found:
                 taken.add(head)
@@ -1278,6 +1384,186 @@ def _on_network_share(path: Path) -> bool:
         return ctypes.windll.kernel32.GetDriveTypeW(drive + "\\") == DRIVE_REMOTE
     except Exception:                                     # noqa: BLE001
         return False
+
+
+# ======================================================================
+# The run's camera record (<run>_camera.json)
+# ======================================================================
+def _camera_record(run: str, device: Any
+                   ) -> "tuple[Optional[Dict[str, Any]], str]":
+    """The run's camera record as it is now; (the record, "") or (None, why
+    it could not be made).
+
+    NEVER A REASON NOT TO CAPTURE. The record is what lets the run be read
+    later — which camera, where on its sensor, how it was set — but a camera
+    that cannot describe itself, a full disk or a refused name is said in
+    Start's summary, never raised: the frames are the user's data and the
+    capture goes ahead."""
+    from council_core import camera_record
+
+    try:
+        listed = settings_list()["settings"]
+        error = ""
+    except Exception as exc:                              # noqa: BLE001
+        listed, error = [], _said(exc)
+    try:
+        limits, area = device.limits(), device.roi()
+        preset, changed = _preset_still_in_use(listed, area, error)
+        info = _LIVE.info
+        camera = {k: getattr(info, k, "") for k in
+                  ("backend", "model", "serial", "vendor", "kind")}
+        camera["label"] = getattr(info, "label", "") or ""
+        return camera_record.build(
+            run=run, camera=camera, sensor=(limits.width, limits.height),
+            area=area.as_tuple(), settings=listed, settings_error=error,
+            preset=preset, preset_changed=changed, app=_app_identity(),
+            software=_software(), host=_host_name()), ""
+    except Exception as exc:                              # noqa: BLE001
+        return None, _not_recorded(run, exc)
+
+
+def _save_camera_record(folder: Path, run: str, record: Dict[str, Any]
+                        ) -> "tuple[Optional[Path], str]":
+    """Write it beside the run's other files: (its path, "") or (None, why
+    not) — see _camera_record."""
+    from council_core import camera_record
+
+    try:
+        return camera_record.write(folder, run, record), ""
+    except Exception as exc:                              # noqa: BLE001
+        return None, _not_recorded(run, exc)
+
+
+def _not_recorded(run: str, exc: BaseException) -> str:
+    from council_core import camera_record
+
+    return (f"The run's camera record ({run}{camera_record.RECORD_SUFFIX}) "
+            f"was NOT written: {_said(exc)}.")
+
+
+def _preset_still_in_use(listed: List[Dict[str, Any]], area: Any,
+                         error: str = ""
+                         ) -> "tuple[str, Optional[Dict[str, Any]]]":
+    """(the preset's name, None) when the camera is still as the preset in
+    use left it, else ("", {"name", "differs"}) — or ("", None) with none.
+
+    COMPARED, NOT ASSUMED. Every way of changing the camera (a box beside
+    Start, the settings window, Apply area, a hand-written link) would
+    have to remember to forget the preset; comparing the preset with the
+    camera at Start catches all of them. A setting another one owns at the
+    moment (an exposure time under auto exposure) is not compared: the
+    camera moves it, and the preset that turned the auto loop on is still
+    what the camera is set to.
+
+    WHAT COULD NOT BE COMPARED IS NOT CONFIRMED. With the settings
+    unreadable (`error`) nothing was compared, and a key of the preset the
+    camera no longer lists cannot be compared — the record then names no
+    preset and says why, rather than the preset's name beside a camera
+    whose gain had really changed (MEASURED before: a box set the gain to
+    9 after preset "Day" (gain 3), the node map timed out at Start, and the
+    run's record said "Day")."""
+    from council_core import camera_settings
+
+    held = _LIVE.preset_in_use
+    if not held:
+        return "", None
+    if error:
+        return "", {"name": held["name"],
+                    "differs": [f"the settings could not be read: {error}"]}
+    now = {str(row.get("key")): row for row in listed}
+    differs = []
+    for key, value in dict(held.get("settings") or {}).items():
+        row = now.get(key)
+        if row is None:
+            differs.append(key)         # nothing to compare it with
+            continue
+        if row.get("held") or row.get("read_only"):
+            continue
+        if not camera_settings.same(value, row.get("value")):
+            differs.append(key)
+    roi = held.get("roi")
+    if roi is not None and tuple(roi) != tuple(area.as_tuple()):
+        differs.append("area")
+    if differs:
+        return "", {"name": held["name"], "differs": differs}
+    return str(held["name"]), None
+
+
+def _preset_now_in_use(name: str, settings: Dict[str, Any], roi: Any) -> None:
+    """The camera was just put back to (or saved as) preset `name`."""
+    _LIVE.preset_in_use = {
+        "name": name, "settings": dict(settings or {}),
+        "roi": tuple(roi.as_tuple()) if roi is not None else None}
+
+
+def _app_identity() -> Dict[str, Any]:
+    """The app running the capture, from its own project folder: the
+    window's title, the Designer project, the example it was built from and
+    when it was last generated. Fields that cannot be read are left out,
+    never guessed."""
+    import json
+
+    folder = _project_dir()
+    out: Dict[str, Any] = {"folder": str(folder)}
+    try:
+        manifest = json.loads((folder / "manifest.json").read_text(
+            encoding="utf-8"))
+    except (OSError, ValueError):
+        manifest = {}
+    try:
+        gspec = json.loads((folder / "project.gspec").read_text(
+            encoding="utf-8"))
+    except (OSError, ValueError):
+        gspec = {}
+    if isinstance(manifest, dict):
+        for key, field in (("project", "name"), ("example", "example"),
+                           ("generated", "updated"), ("created", "created"),
+                           ("toolkit", "toolkit")):
+            if manifest.get(field):
+                out[key] = str(manifest[field])
+    window = gspec.get("window") if isinstance(gspec, dict) else None
+    title = str(window.get("title") or "") if isinstance(window, dict) else ""
+    if title:
+        out["name"] = title
+    return out
+
+
+#: The camera record's own version of what frame_camera writes into it.
+RECORD_WRITER = 1
+
+
+def _software() -> Dict[str, Any]:
+    """Which software made the run: the Council's version (branding) and the
+    commit it is checked out at, read from its git folder's files — "" in a
+    build that has none."""
+    import platform
+
+    from council_core import camera_record
+
+    root = Path(__file__).resolve().parent
+    try:
+        import branding
+        version = str(getattr(branding, "VERSION", "") or "")
+    except Exception:                                     # noqa: BLE001
+        version = ""
+    return {"council_version": version,
+            "source_commit": camera_record.source_commit(root),
+            "frame_camera": RECORD_WRITER,
+            "python": platform.python_version()}
+
+
+def _host_name() -> str:
+    """This PC's name, the host name alone (as frame_classes records it)."""
+    import os
+    import socket
+
+    name = os.environ.get("COMPUTERNAME", "")
+    if not name:
+        try:
+            name = socket.gethostname()
+        except OSError:
+            name = ""
+    return name.split(".")[0].strip()
 
 
 # ======================================================================
@@ -1770,6 +2056,9 @@ def _finish_job(job: _Job, raise_errors: bool) -> Dict[str, Any]:
             # swallowed by _poll_job, nobody heard anything, and a settings
             # window stayed greyed at "Applying…" until Disconnect.
             error = exc
+    # The worker is done with the camera: the boxes beside Start that were
+    # changed meanwhile are written now, on this (the UI) thread.
+    boxes = _write_queued()
     if error is not None:
         said = f"{job.label} failed: {_said(error)}"
         if job.restart_error:
@@ -1779,14 +2068,14 @@ def _finish_job(job: _Job, raise_errors: bool) -> Dict[str, Any]:
         _announce(out)
         if raise_errors:
             raise RuntimeError(said) from error
-        _tell_status(said)
+        _tell_status(f"{said} {boxes}".strip())
         return out
     if job.restart_error:
         out["summary"] = f"{out['summary']} {job.restart_error}"
     _settle_crop(out)
     _announce(out)
     if not raise_errors:
-        _tell_status(out["summary"])
+        _tell_status(f"{out['summary']} {boxes}".strip())
     return out
 
 
@@ -2065,6 +2354,14 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
 
     def finish(applied: Any) -> Dict[str, Any]:
         _camera_set(_changed_keys(applied))
+        if what == "preset":
+            # What the camera TOOK, so a value it snapped is not "changed
+            # since" at Start; a preset only partly applied is not in use.
+            _LIVE.preset_in_use = None
+            if applied.ok:
+                _preset_now_in_use(
+                    name, {c.key: c.value for c in applied.changes if c.ok},
+                    applied.roi)
         # Moved by its own area, or by binning in a set without one.
         moved = (roi is not None and applied.roi is not None) or (
             before is not None and _roi_or_none(device) != before)
@@ -2266,6 +2563,8 @@ def save_preset(name: Any, include_roi: Any = True,
             repair=True)
     except camera_presets.PresetError as exc:
         raise RuntimeError(str(exc)) from exc
+    # Saved FROM the camera as it is: the camera is that preset now.
+    _preset_now_in_use(preset.name, settings, roi)
     said = (f"{'Replaced' if replaced else 'Saved'} preset {preset.name!r}: "
             f"{len(settings)} settings")
     said += (f" and the camera's area {_area_text(roi)}." if roi is not None
@@ -2370,6 +2669,11 @@ def delete_preset(name: Any) -> Dict[str, Any]:
         gone = _preset_store().delete(_identity(), chosen)
     except camera_presets.PresetError as exc:
         raise RuntimeError(str(exc)) from exc
+    held = _LIVE.preset_in_use
+    if held and str(held.get("name", "")).casefold() == gone.name.casefold():
+        # A run must never name a preset that is in no camera_presets.json —
+        # nor, later, one a new save under that name made of other settings.
+        _LIVE.preset_in_use = None
     return _presets_changed("", f"Deleted preset {gone.name!r}.")
 
 
@@ -2388,6 +2692,9 @@ def rename_preset(old: Any, new: Any) -> Dict[str, Any]:
         renamed = _preset_store().rename(_identity(), chosen, _picked(new))
     except camera_presets.PresetError as exc:
         raise RuntimeError(str(exc)) from exc
+    held = _LIVE.preset_in_use
+    if held and str(held.get("name", "")).casefold() == chosen.casefold():
+        held["name"] = renamed.name         # the run record says it as it is
     return _presets_changed(renamed.name,
                             f"Renamed {chosen!r} to {renamed.name!r}.")
 
@@ -2403,17 +2710,82 @@ def _truthy(value: Any) -> bool:
 # ======================================================================
 # Exposure and gain
 # ======================================================================
+#: THE BOXES BESIDE START WAIT FOR A CHANGE ON THE WORKER — QUEUED, NOT
+#: REFUSED. A change that needs the stream stopped (an area, a pixel format,
+#: a preset) runs on a worker (_Job), which owns the camera until it has
+#: stopped the stream, written and started it again. A box beside Start
+#: wrote the camera straight from the UI thread meanwhile — two threads in
+#: one SDK handle, mid-restart. Refusing would be noise: these boxes move in
+#: arrow-click steps, and an error dialog per click for the ~0.15-1 s of a
+#: restart says nothing the user can act on (the reason apply_frame_rate
+#: already treats "no camera yet" softly), and a spin box cannot retry what
+#: was refused, so the value would simply be lost. So the latest value of
+#: each box is kept, said ("waits for ..."), and written on the UI thread
+#: the moment the change is done (_write_queued, from _finish_job).
+QUEUED_BOXES = ("exposure", "gain", "frame_rate")
+
+
+def _queue_behind_job(box: str, value: Any) -> str:
+    """Keep `value` for `box` when a camera change is on the worker; the
+    line to say for it, or "" when nothing is running (write it now)."""
+    job = _LIVE.job
+    if job is None:
+        return ""
+    _LIVE.queued[box] = value
+    doing = job.label[:1].lower() + job.label[1:]
+    return f"is set once the camera has finished {doing}"
+
+
+def _write_queued() -> str:
+    """Write what the boxes beside Start asked for while a change was on
+    the worker, in a fixed order, latest value of each; what came of it, as
+    one line. Called on the UI thread once the worker is done.
+
+    WRITTEN LAST, SO THE LATEST WORD. A box that waited for a preset is
+    written after it, over what the preset set — so it is stamped as changed
+    now (_box_changed), after the preset's own stamp. Stamped when it was
+    typed, Start found the preset newer and said it "kept the camera's own"
+    value: the box's, which the preset no longer had. (apply_frame_rate
+    stamps the FPS box itself.)"""
+    queued, _LIVE.queued = _LIVE.queued, {}
+    if _LIVE.device is None or not queued:
+        return ""
+    said = []
+    for box in QUEUED_BOXES:
+        if box not in queued:
+            continue
+        write = {"exposure": set_exposure, "gain": set_gain,
+                 "frame_rate": apply_frame_rate}[box]
+        try:
+            said.append(write(queued[box])["summary"])
+        except Exception as exc:                          # noqa: BLE001
+            said.append(f"{box.replace('_', ' ')}: {_said(exc)}")
+            continue
+        _box_changed(box)
+    return " ".join(said)
+
+
 def set_exposure(value: Any) -> Dict[str, Any]:
-    """Exposure in MICROSECONDS, which is what the camera's node map takes."""
+    """Exposure in MICROSECONDS, which is what the camera's node map takes.
+    Waits for a change on the worker (QUEUED_BOXES)."""
     device = _require_device()
     micros = _number(value, "exposure")
+    waits = _queue_behind_job("exposure", micros)
+    if waits:
+        return {"exposure": f"{micros:.0f}",
+                "summary": f"Exposure {micros:.0f} µs {waits}."}
     got = device.set_exposure_us(micros)
     return {"exposure": f"{got:.0f}", "summary": f"Exposure {got:.0f} µs."}
 
 
 def set_gain(value: Any) -> Dict[str, Any]:
+    """Waits for a change on the worker (QUEUED_BOXES)."""
     device = _require_device()
-    got = device.set_gain(_number(value, "gain"))
+    gain = _number(value, "gain")
+    waits = _queue_behind_job("gain", gain)
+    if waits:
+        return {"gain": f"{gain:.2f}", "summary": f"Gain {gain:.2f} {waits}."}
+    got = device.set_gain(gain)
     return {"gain": f"{got:.2f}", "summary": f"Gain {got:.2f}."}
 
 
@@ -2423,11 +2795,16 @@ def set_frame_rate(value: Any) -> Dict[str, Any]:
     A frame camera is capped at this rate — the way to capture at a rate the
     disk can keep up with. An event camera has no frames: this sets how long
     each picture collects events (50 fps = 20 ms), and its .raw still has
-    every event.
+    every event. Waits for a change on the worker (QUEUED_BOXES).
     """
     device = _require_device()
+    fps = _number(value, "frame rate")
+    waits = _queue_behind_job("frame_rate", fps)
+    if waits:
+        return {"frame_rate": f"{fps:.1f}",
+                "summary": f"Frame rate {_fps_text(fps)} {waits}."}
     try:
-        got = float(device.set_frame_rate(_number(value, "frame rate")))
+        got = float(device.set_frame_rate(fps))
     except Exception as exc:                              # noqa: BLE001
         raise RuntimeError(f"frame rate: {exc}") from exc
     said = f"{got:.1f} fps" if got else "the camera's own rate"
@@ -2488,6 +2865,14 @@ def apply_frame_rate(frame_rate: Any = 0) -> Dict[str, Any]:
         return {"frame_rate": f"{fps:.1f}",
                 "summary": f"FPS {wanted} — no camera connected yet; it is "
                            f"applied when you press Start capture."}
+    waits = _queue_behind_job("frame_rate", fps)
+    if waits:
+        # Said in the live line too, which the status line's own message
+        # would not survive (see WHERE THE ANSWER SHOWS).
+        _LIVE.rate_note = f"{wanted} next"
+        _LIVE.rate_note_until = time.monotonic() + RATE_NOTE_SECONDS
+        return {"frame_rate": f"{fps:.1f}",
+                "summary": f"FPS {wanted} {waits}."}
     try:
         got = float(device.set_frame_rate(fps))
     except Exception as exc:                              # noqa: BLE001
