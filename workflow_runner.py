@@ -447,6 +447,22 @@ def run_chained(
                          f"so its result can't be chained into the next "
                          f"pipeline.")
             return bad
+        # The input side needs the same guard. A reader whose parameter is not
+        # a recognised name is staged with its baked-in path untouched, so the
+        # run "succeeds" on the wrong file -- every input the same file.
+        # Measured: a chain over two different .stl files reported 4/4 ok
+        # while both runs read the path saved in the pipeline.
+        staged_src = staged.read_text(encoding="utf-8", errors="replace")
+        if repr(str(src_in)) not in staged_src:
+            bad = StepResult(step_index=idx, pipeline_name=pl.name,
+                             input_label=label, success=False, return_code=None,
+                             duration_s=0.0, stdout="", stderr="",
+                             pipeline_path=pl)
+            bad.error = (f"{pl.name} has no recognized input-path parameter "
+                         f"(looked for {', '.join(_INPUT_PARAM_CANDIDATES)}), "
+                         f"so it can't be pointed at {src_in.name}; it would "
+                         f"read the path saved in it instead.")
+            return bad
         step = _run_pipeline_subprocess(staged, timeout_s=timeout_s)
         step.step_index = idx
         step.input_label = label

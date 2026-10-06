@@ -132,6 +132,28 @@ def test_chain_stages_an_stl_readers_path(tmp_path):
     assert out_used == "export_file_path"
 
 
+def test_chain_refuses_a_reader_it_cannot_point_at_the_input(tmp_path,
+                                                            monkeypatch):
+    """An unrecognised reader parameter used to be staged with its baked-in
+    path and run: a 'successful' chain over the wrong file. Now it stops
+    before anything runs."""
+    def never(*_a, **_k):
+        raise AssertionError("nothing should have been run")
+    monkeypatch.setattr(wr, "_run_pipeline_subprocess", never)
+    p = tmp_path / "p.py"
+    p.write_text("r0 = nx.SomeNewReaderFilter.execute(\n    data_structure=ds,\n"
+                 "    some_new_path='Data/baked.dat',\n)\n"
+                 "r1 = nx.WriteDREAM3DFilter.execute(\n    data_structure=ds,\n"
+                 "    export_file_path='Data/out.dream3d',\n)\n", encoding="utf-8")
+    inp = tmp_path / "in"
+    inp.mkdir()
+    (inp / "a.dat").write_text("x", encoding="utf-8")
+    res = wr.run_chained([p, p], inp, pattern="*.dat",
+                         stage_dir=tmp_path / "st")
+    assert not res.success
+    assert "input-path parameter" in res.error and "a.dat" in res.error
+
+
 # ============================================================
 # Pure: known gaps in the generators (offline, tiny catalogs)
 # ============================================================
