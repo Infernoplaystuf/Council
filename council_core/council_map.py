@@ -48,10 +48,12 @@ KIND_LABELS = {
 }
 
 #: Edge layers — the tab's filter checkboxes.
-LAYERS = ("deliberation", "context", "tools", "memory", "network")
+LAYERS = ("deliberation", "context", "tools", "memory", "network",
+          "fanout")
 LAYER_LABELS = {
     "deliberation": "Deliberation", "context": "Vault & context",
     "tools": "Tools", "memory": "Memory", "network": "Models & machines",
+    "fanout": "Fan-out coding",
 }
 
 STATUSES = ("live", "partial", "broken", "proposed")
@@ -221,6 +223,13 @@ _NODES: Tuple[Node, ...] = (
     Node("role_settings", "Role → model settings", "store",
          "model_slots.json: which model each role answers with.",
          "council_core/model_slots.py"),
+    Node("fanout", "Fan-out coders", "agent",
+         "Several coders on one task at once (the 🧩 Fan-out tab): the "
+         "Judge's model splits it into units that never share a file, a "
+         "coder works on each in its own copy — on this PC and the machines "
+         "set up in Machines & roles — then the parts are combined, tested, "
+         "fixed, reviewed, and written as a patch for you to apply.",
+         "council_core/fanout.py; council_qt/tabs/fanout.py"),
     Node("council_memory", "Past deliberations", "store",
          "council_memory (record and retrieve past deliberations). Only "
          "safe_agent uses it.", "council_memory.py; safe_agent.py"),
@@ -341,6 +350,18 @@ def _edges() -> List[Edge]:
         E("answer", "council_memory", "this turn's verdict, for next time",
           "memory", note="Nothing records a deliberation for retrieval.",
           cite="council_memory.py"),
+    ]
+
+    # -- fan-out coding ----------------------------------------------------
+    out += [
+        E("judge", "fanout", "the plan: units that never share a file",
+          "fanout", "live", cite="council_core/fanout.py (make_plan, "
+          "check_plan)"),
+        E("coder", "fanout", "its model writes every unit", "fanout", "live",
+          cite="council_core/fanout.py (run_unit)"),
+        E("fanout", "judge", "the combined change and test result, for "
+          "review", "fanout", "live", cite="council_core/fanout.py "
+          "(_review)"),
     ]
 
     # -- the controller: the weekly placement review --------------------
@@ -547,6 +568,24 @@ def live_overlay(m: CouncilMap, slots: Any = None,
                         note="Install a slot's model here, or bind a role "
                              "to this machine, to use it.",
                         cite="council_core/apothecary.py"))
+    # Fan-out workers run on this PC and on every enabled machine.
+    m.link(Edge("fanout", THIS_PC, "a worker per unit", "fanout", "live",
+                cite="council_core/fanout.py (worker_targets)"))
+    if routing is not None and getattr(routing, "routing_enabled", False):
+        for node in routing.nodes.values():
+            if not node.enabled:
+                continue
+            nid = next((n for n in m.nodes if n.startswith("machine:")
+                        and _url_key(n[len("machine:"):]) ==
+                        _url_key(node.url)), f"machine:{node.url}")
+            if nid not in m.nodes:
+                m.add(Node(nid, node.name, "machine",
+                           f"Set up in Machines & roles. {node.url}",
+                           "council_core/node_routing.py"))
+            m.link(Edge("fanout", nid, f"a worker per unit (up to "
+                        f"{node.parallel} at once)", "fanout", "live",
+                        cite="council_core/fanout.py (worker_targets)"))
+
     for url, roles in routed.items():
         nid = next((n for n in m.nodes if n.startswith("machine:")
                     and _url_key(n[len("machine:"):]) == _url_key(url)),
@@ -620,6 +659,7 @@ _FIXED = {"question": (0.03, 0.45), "judge": (0.42, 0.45),
           "debate": (0.62, 0.45), "writer": (0.8, 0.45),
           "answer": (0.97, 0.45)}
 _NODE_ANCHORS = {"usage_log": (0.28, 0.93), "apothecary": (0.95, 0.78),
+                 "fanout": (0.8, 0.72),
                  "role_settings": (0.45, 0.97), "sage_kb": (0.66, 0.97),
                  "vault": (0.06, 0.72),
                  "wishlist": (0.3, 0.06), "council_memory": (0.85, 0.12),
@@ -854,6 +894,21 @@ GUIDE: Tuple[GuideStep, ...] = (
         "run. Open it with 'Placement review…'.",
         ("usage_log", "apothecary", "judge", "role_settings"),
         "council_core/usage_log.py; council_core/placement.py"),
+    GuideStep(
+        "Fan-out coding: several coders at once",
+        "For a bigger coding job, the 🧩 Fan-out tab works like a team. The "
+        "Judge's model splits the task into units, and no two units share a "
+        "file, so the coders cannot get in each other's way. You approve the "
+        "split.\n\n"
+        "Each unit gets its own copy of the code and its own coder, all "
+        "working at the same time — one on this PC and one on each machine "
+        "set up in Machines & roles. Then the parts are put together and "
+        "your tests run; if they fail, every coder sees the failure and "
+        "fixes its own part. The Judge reviews the result, and you get a "
+        "patch file to apply yourself — your folder is never changed.",
+        ("fanout", "judge", "coder", "kind:machine"),
+        "council_core/fanout.py (make_plan, run_job); "
+        "council_qt/tabs/fanout.py"),
     GuideStep(
         "What is not connected yet",
         "The green dashed lines are the map's suggestions: the Librarian "

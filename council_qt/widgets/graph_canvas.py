@@ -192,7 +192,8 @@ class GraphCanvas(QWidget):
         dx, dy = b.x() - a.x(), b.y() - a.y()
         length = math.hypot(dx, dy) or 1.0
         nx, ny = -dy / length, dx / length
-        bend = 18 * self.scale * (index if e.src < e.dst else -index)
+        # Wide enough that two parallel lines' labels do not overlap.
+        bend = 56 * self.scale * (index if e.src < e.dst else -index)
         mid = QPointF((a.x() + b.x()) / 2 + nx * bend,
                       (a.y() + b.y()) / 2 + ny * bend)
         path = QPainterPath(a)

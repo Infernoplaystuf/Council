@@ -67,7 +67,7 @@ def test_coder_talks_to_the_judge_the_floor_and_the_librarian_only():
     peers = {e.src if e.dst == "coder" else e.dst
              for e in m.edges_of("coder")}
     assert peers == {"judge", "debate", "librarian", "tools", "role_memory",
-                     "docs", "usage_log"}
+                     "docs", "usage_log", "fanout"}
 
 
 def test_the_judge_is_the_controller_of_placement():
@@ -357,3 +357,14 @@ def test_a_routed_role_runs_on_its_machine_on_the_map():
     off = cm.live_overlay(cm.static_map(), _slots(), statuses,
                           routing=nr.Routing())
     assert _edge(off, "model:fast", machine).status == "proposed"
+
+
+def test_fan_out_workers_reach_this_pc_and_every_enabled_machine():
+    routing = nr.Routing(True, {
+        "pi": nr.Node("pi", "http://10.0.0.9:11434", True, 2),
+        "off": nr.Node("off", "http://10.0.0.8:11434", False)}, {})
+    m = cm.live_overlay(cm.static_map(), _slots(), [], routing=routing)
+    assert _edge(m, "fanout", cm.THIS_PC).status == "live"
+    assert "up to 2" in _edge(m, "fanout", "machine:http://10.0.0.9:11434").data
+    assert "machine:http://10.0.0.8:11434" not in m.nodes
+    assert _edge(m, "judge", "fanout", "never share").layer == "fanout"

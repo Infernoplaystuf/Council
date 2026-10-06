@@ -114,8 +114,12 @@ SPECS: Tuple[RoleSpec, ...] = (
          "Highest.",
          "granite3-dense:8b is a code-specialised alternative at the same "
          "size as Llama 3.1 8B."),
-        "Helps once members run in parallel: the Coder is the slowest member "
-        "(tool calls add round trips), so it holds the others up most."),
+        "Already used by the 🧩 Fan-out tab: several Coder workers run at "
+        "once on different parts of a bigger change, one per machine. More "
+        "machines with the Coder's model (Machines & roles) means more units "
+        "in parallel. In a council question it would help once members run "
+        "in parallel: the Coder is the slowest member, so it holds the "
+        "others up most."),
     RoleSpec(
         "docs", "Docs", "Answers from documentation servers in the Docs tab "
         "and writes code from what it read.",
@@ -372,10 +376,12 @@ def card_text(a: Assessment) -> str:
     if s.duplicate:
         L += ["", "A DUPLICATE (a second copy running at the same time)",
               f"  {s.duplicate}",
-              "  Not possible yet: the council answers one call at a time. "
-              "Cost when it is: with Ollama, one loaded model can serve two "
-              "calls (OLLAMA_NUM_PARALLEL — extra context memory only); an "
-              "in-app .gguf model needs a second copy of its weights."]
+              "  In a council question the members still answer one at a "
+              "time; across machines, calls do run side by side (Machines & "
+              "roles, and the Fan-out tab). Cost on one machine: with "
+              "Ollama, one loaded model can serve two calls "
+              "(OLLAMA_NUM_PARALLEL — extra context memory only); an in-app "
+              ".gguf model needs a second copy of its weights."]
     return "\n".join(L)
 
 

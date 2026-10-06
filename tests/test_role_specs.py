@@ -80,7 +80,7 @@ def test_card_explains_tiers_memory_and_duplicates():
     card = rs.card_text(_a(a, "peasant"))
     for must in ("MINIMUM", "RECOMMENDED", "BEST", "GB VRAM", "GB RAM",
                  "YOUR SETUP", "A DUPLICATE", "OLLAMA_NUM_PARALLEL",
-                 "Not possible yet"):
+                 "side by side"):
         assert must in card, must
     summary = rs.summary_text(a, "8 GB GPU")
     assert "Where to spend first" in summary and "8 GB GPU" in summary
