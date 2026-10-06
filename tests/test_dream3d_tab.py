@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import nx_policy
 from council_core import dream3d, nx_ops
 from council_core import pipeline_intent as pi
 
@@ -192,7 +193,12 @@ def test_a_refused_script_with_code_is_saved_and_says_where(vault):
         "make an stl", vault, bridge=FakeBridge(),
         generator=Generator({"ok": False, "code": "x = 1\n",
                              "errors": ["policy"]}))
-    assert res.path.read_text() == "x = 1\n"
+    saved = res.path.read_text()
+    # Saved with the model-script stamp above the code, so the workflow
+    # runner holds it to the model rules (nx_policy.script_trust).
+    assert saved.endswith("\nx = 1\n")
+    assert saved.startswith(nx_policy.MODEL_STAMP)
+    assert nx_policy.script_trust(saved) == nx_policy.MODEL
     assert str(res.path) in res.body
 
 

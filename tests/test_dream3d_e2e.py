@@ -958,7 +958,12 @@ def test_pipeline_chat_create_is_grounded_and_gated(tmp_path):
     path, log = pipeline_editor.generate_pipeline_from_description(
         "create a data array", vault, suggested_name="ok",
         model_call=lambda _p: good, catalog=REAL_CATALOG)
-    assert path is not None and path.read_text(encoding="utf-8") == good.strip()
+    assert path is not None
+    saved = path.read_text(encoding="utf-8")
+    # pipelines/in also holds the user's own scripts: the stamp says this
+    # one is a model's, and the runner gives it the model rules.
+    assert saved.endswith("\n" + good.strip())
+    assert nx_policy.script_trust(saved) == nx_policy.MODEL
 
 
 def test_a_model_edit_may_not_add_a_denied_filter():
@@ -1076,7 +1081,8 @@ def test_every_input_gets_its_own_output(mode, tmp_path, monkeypatch):
     outside the vault's output area."""
     ran = []
 
-    def fake(staged, timeout_s=600, cwd=None):
+    def fake(staged, timeout_s=600, cwd=None, **_kw):
+        # **_kw: the runner also passes contain= (where the run may write).
         src = staged.read_text(encoding="utf-8")
         out = ast.literal_eval(src.split("export_file_path=", 1)[1]
                                .split(",")[0].split(")")[0])
@@ -1130,7 +1136,7 @@ def _writes(src):
 def _fake_runner(ran, write=True):
     """Stands in for simplnx: records each staged script and creates every
     file it writes (a relative one under the step's working folder)."""
-    def fake(staged, timeout_s=600, cwd=None):
+    def fake(staged, timeout_s=600, cwd=None, **_kw):
         src = staged.read_text(encoding="utf-8")
         ran.append((staged.name, _writes(src), cwd))
         for param, val in _writes(src):

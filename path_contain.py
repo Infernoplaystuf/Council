@@ -64,6 +64,35 @@ def is_under(child: Any, parent: Any) -> bool:
     return c.startswith(p if p.endswith(os.sep) else p + os.sep)
 
 
+def network_or_device(path: Any) -> bool:
+    """Is ``path`` a UNC share (\\\\server\\share, \\\\?\\UNC\\...) or a device
+    (\\\\.\\PhysicalDrive0, NUL, CON)? Read from the spelling alone — no
+    lookup: resolving \\\\some-host\\share asks the network for the host
+    (1.3 s measured, and a name query on the LAN) before it can say no."""
+    if os.name != "nt":
+        return False
+    try:
+        s = os.fspath(path)
+    except TypeError:
+        return False
+    if isinstance(s, bytes):
+        s = os.fsdecode(s)
+    drive = os.path.splitdrive(s)[0]
+    if drive.startswith("\\\\") or drive.startswith("//"):
+        # \\?\C: is a local drive spelled long; everything else after \\ is
+        # a share or a device.
+        return not (len(drive) == 6 and drive[:4] in ("\\\\?\\", "//?/")
+                    and drive[5] == ":")
+    # A bare device name, in any folder: C:\out\NUL is NUL.
+    base = os.path.basename(s.rstrip("\\/")).split(".")[0].strip().upper()
+    return base in _DEVICE_NAMES
+
+
+_DEVICE_NAMES = frozenset({"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+                          | {f"COM{i}" for i in range(1, 10)}
+                          | {f"LPT{i}" for i in range(1, 10)})
+
+
 def has_stream_name(path: Any) -> bool:
     """Does ``path`` name an NTFS alternate data stream (``x.txt:hidden``)?
 

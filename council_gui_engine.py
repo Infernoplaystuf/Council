@@ -8925,18 +8925,13 @@ class CouncilConsole(tk.Tk):
 
         import workflow_runner as _wr
         spec = _wr.parse_workflow_request(single_line, VAULT_DIR)
-        if spec.mode != "linear":
-            # Each input's results land in the vault's output area, one file
-            # per input — not at the path baked into the last script,
-            # resolved against wherever the app was started.
-            try:
-                import data_index as _di
-                import time as _time
-                spec.output_dir = (Path(_di.output_dir(VAULT_DIR))
-                                   / "workflows"
-                                   / _time.strftime("%Y%m%d_%H%M%S"))
-            except Exception:
-                spec.output_dir = None
+        # The run belongs to this vault: its outputs land in the vault's
+        # output area (one file per input in the directory modes — not at
+        # the path baked into the last script, resolved against wherever
+        # the app was started), and a model-written pipeline writes nowhere
+        # else (workflow_runner.Containment). The runner picks a fresh
+        # data_out/workflows/<time> folder for the run.
+        spec.vault_dir = VAULT_DIR
         if not spec.pipeline_paths:
             self._append_transcript(
                 "Writer",
@@ -9650,16 +9645,26 @@ class CouncilConsole(tk.Tk):
                         messages=[{"role": "user", "content": prompt}],
                         temperature=0.2, num_predict=900, timeout=180)
 
+                import nx_policy as _np
+                from council_core import nx_ops as _nxo
                 cat = self._nx_catalog()
-                try:
-                    _nx_n_ctx = int(_ce.get_n_ctx())
-                except Exception:
-                    _nx_n_ctx = None
+                # The window the model really has (effective_n_ctx), not
+                # the configured 4096 get_n_ctx() reports with the env var
+                # unset — as the Qt "Write pipeline" sizes it.
+                _nx_n_ctx = _nxo._n_ctx()
                 res = _ng.write_script(task, cat, _model_call, n_ctx=_nx_n_ctx)
                 code = res.get("code") or ""
-                stem = _re.sub(r"[^a-z0-9]+", "_", task.lower())[:40] or "pipeline"
-                out = self.data_index.safe_write_path(
-                    f"task_{stem}.py", subfolder="dream3d")
+                if code:
+                    # Model-written: the workflow runner gives it the
+                    # model-script rules (nx_policy "Two kinds of script").
+                    code = _np.stamp_model_script(code, "nx_generate")
+                # The same MAX_PATH-safe name as the Qt tab: a 40-character
+                # stem under a deep vault passed 260 characters, the write
+                # raised, and a script that passed every check was lost.
+                name = _nxo.script_name_in(
+                    task, Path(self.data_index.write_root) / "dream3d")
+                out = self.data_index.safe_write_path(name,
+                                                      subfolder="dream3d")
                 if code:
                     out.write_text(code, encoding="utf-8")
                 if res.get("ok"):

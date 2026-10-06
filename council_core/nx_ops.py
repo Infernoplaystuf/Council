@@ -305,23 +305,34 @@ def script_stem(task: str) -> str:
 _MAX_PATH = 250
 
 
-def _script_name(task: str, vault_dir: Path) -> str:
-    """task_<stem>.py, the stem cut so the whole path stays under _MAX_PATH.
+def script_name_in(task: str, folder: Path) -> str:
+    """task_<stem>.py, the stem cut so ``folder``/<name> stays under
+    _MAX_PATH. Both "Write pipeline" buttons (this module's write_script and
+    the Tk engine's _nx_write_script) name their file with it.
 
     The 40-character stem under a deep vault made the path 260+ characters
     on a PC with LongPathsEnabled=0: the write raised, and a script that had
     passed every check was reported "nx: failed" and lost."""
     stem = script_stem(task)
     try:
-        folder = len(str(out_dir(vault_dir) / SUBFOLDER)) + 1
+        used = len(str(folder)) + 1
     except Exception:                                     # noqa: BLE001
-        folder = 0
-    room = _MAX_PATH - folder - len("task_.py")
+        used = 0
+    room = _MAX_PATH - used - len("task_.py")
     if len(stem) > room:
         import hashlib
         tag = hashlib.sha1(task.encode("utf-8")).hexdigest()[:6]
         stem = (stem[:max(0, room - 7)].rstrip("_") + "_" + tag)[-max(6, room):]
     return f"task_{stem}.py"
+
+
+def _script_name(task: str, vault_dir: Path) -> str:
+    """script_name_in for this vault's data_out/dream3d."""
+    try:
+        folder = out_dir(vault_dir) / SUBFOLDER
+    except Exception:                                     # noqa: BLE001
+        folder = Path("")
+    return script_name_in(task, folder)
 
 
 def write_script(task: str, vault_dir: Path, *,
@@ -344,6 +355,11 @@ def write_script(task: str, vault_dir: Path, *,
         return NxResult("nx: failed", f"Could not write a pipeline.\n\n{exc}",
                         ok=False)
     code = res.get("code") or ""
+    if code:
+        # Model-written: the workflow runner runs it under the model-script
+        # rules (nx_policy "Two kinds of script"), wherever it is moved.
+        import nx_policy
+        code = nx_policy.stamp_model_script(code, "nx_generate")
     out = None
     save_error = ""
     if code:

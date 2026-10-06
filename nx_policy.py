@@ -37,11 +37,54 @@ domain operations on the data structure, and an allowlist over them would have
 to be regenerated on every DREAM3D-NX update and would silently break real
 pipelines. The two entries here are the capability outliers, and they are
 outliers precisely because they escape the data structure.
+
+Two kinds of script, two rule sets
+----------------------------------
+A pipeline script the app runs (workflow_runner) is one of two kinds, and
+script_trust() says which:
+
+  MODEL — a model wrote it or edited it. Every place the app saves model code
+    (nx_ops.write_script, the Tk "Write pipeline", the chat's "create
+    pipeline", a model's "modify" edits) puts MODEL_STAMP on its first line,
+    and a script in the vault's data_out (the app's own output area) counts
+    as one whatever its first line says. Rules:
+      * validate_script, in full: imports from ALLOWED_IMPORT_ROOTS only, no
+        shell, no dynamic attribute lookup, no file-changing call (pathlib is
+        allowed for joining paths, exists() and glob(); its unlink/rename/
+        write_text are not), no route to a module the allowlist keeps out
+        (pathlib.os, typing.sys...), no dunder, no saved Pipeline and no
+        get_filters (FILTER_ROUTE_NAMES);
+      * and at run time, inside the script's own interpreter (nx_guard):
+        every OUTPUT path a filter is given must land under the vault's
+        data_out or the run's staging folder and may not replace a file the
+        run did not make; inputs are read-only; any file change the script
+        makes itself is held to the same rule, and processes, native code and
+        sockets are refused. Static checks can be evaded; that one is not
+        a check on the text.
+  USER — a script the user saved or imported themselves (no stamp, not in
+    data_out). Their machine, their call: any import, any file the script
+    chooses — as before. What still holds: no Execute Process / Python-codegen
+    filter by any name, uuid or route (capability_reasons), checked before the
+    run and again by nx_guard when a filter or a pipeline executes. A user
+    script MAY run a saved pipeline the way the simplnx tutorials do —
+    nx.Pipeline.from_file(...), set_args, execute — when the .d3dpipeline's
+    filters pass this policy: a literal path is read and checked before
+    anything runs (pipeline_file_reasons), and nx_guard checks every step's
+    uuid when Pipeline.execute runs, whatever the path was.
+
+A model's script never gets the USER rules by being moved or renamed: the
+stamp travels with the text. Deleting the stamp line is the user taking the
+script over, which is theirs to do. (Scripts a model wrote BEFORE the stamp
+existed carry none; the ones still in data_out are caught by the location
+rule, a generated one the user kept in pipelines/in is not.)
 """
 from __future__ import annotations
 
 import ast
-from typing import Dict, List, Optional, Tuple
+import json
+import os
+import re
+from typing import Dict, Iterable, List, Optional, Tuple
 
 # The model writes real Python — filters as execute() lines, plus whatever glue
 # the task needs. That is the point of the feature, and a filter-selection
@@ -97,6 +140,82 @@ DENIED_KWARGS = frozenset({"allow_pickle"})
 
 # Attribute-based escapes: __globals__ -> builtins -> anything.
 _DUNDER_OK = frozenset({"__init__", "__name__", "__file__", "__doc__"})
+# A dunder NAME (not attribute): `__builtins__["open"]`, or `x = __import__`
+# then `x("os")` — neither is an attribute, nor a call of a denied name.
+_DUNDER_NAMES_OK = frozenset({"__name__", "__file__", "__doc__"})
+
+# File-changing calls. pathlib is allowed — a pipeline joins paths, asks
+# exists(), globs a folder, reads a CSV — and every one of these is reachable
+# from a Path or a numpy array without importing anything else. Measured
+# before this list: Path(doc).unlink(), Path(doc).write_text(""),
+# Path(doc).rename(...) and np.save(doc, a) all passed validate_script, and a
+# model-written script could delete or overwrite any file the user can.
+# Refused as ANY reference, not only as a call: `w = p.write_text; w("")`.
+# Not here because the name is shared with something a pipeline needs:
+# `replace` (str.replace / Path.replace), `remove` (DataStructure.remove),
+# `copy` (ndarray.copy), `mkdir` (an output folder; nx_guard keeps it under
+# the output area). nx_guard refuses what these miss, at run time.
+FILE_CHANGE_NAMES = frozenset({
+    "unlink", "rmdir", "rename", "renames", "removedirs", "rmtree", "touch",
+    "write_text", "write_bytes", "write", "writelines", "symlink_to",
+    "hardlink_to", "link_to", "chmod", "lchmod", "chown", "truncate",
+    "tofile", "save", "savez", "savez_compressed", "savetxt", "memmap",
+    "dump", "copyfile", "copytree", "move", "makedirs", "mkfifo", "mknod",
+    "unpack_archive", "make_archive",
+})
+
+# Modules the import allowlist keeps out, reached as an ATTRIBUTE of one it
+# lets in: pathlib.os.remove(...), typing.sys.modules["shutil"].rmtree(...),
+# json.codecs.open(..., "w"), typing.types.FunctionType(...). Each is a
+# second way in to what the allowlist exists to keep out. (`code` is not
+# here: it is a simplnx property.)
+MODULE_REACH_NAMES = frozenset({
+    "os", "sys", "shutil", "subprocess", "io", "codecs", "builtins",
+    "importlib", "operator", "types", "ctypes", "nt", "posix", "_os",
+    "tempfile", "modules", "socket", "pickle", "marshal", "runpy", "inspect",
+    "gc", "multiprocessing", "threading", "_thread", "signal", "winreg",
+    "_winapi", "msvcrt", "functools", "system", "popen", "startfile",
+})
+
+# ---- provenance: who wrote a script --------------------------------------
+# The first line the app writes above every script a model wrote or edited.
+# script_trust() looks for it on any line, so a comment or shebang the user
+# adds above it does not hide it. See "Two kinds of script" above.
+MODEL_STAMP = "# council: model-"
+MODEL = "model"
+USER = "user"
+_STAMP_RE = re.compile(r"^\s*#\s*council:\s*model-(written|edited)\b",
+                       re.MULTILINE)
+
+
+def stamp_model_script(code: str, origin: str, *, edited: bool = False) -> str:
+    """``code`` with the model-script stamp on its first line (once).
+
+    ``origin`` says which part of the app saved it ("nx_generate", "the
+    pipeline chat", ...). Every save of model-written or model-edited code
+    goes through this, so the workflow runner gives it the MODEL rules."""
+    code = code or ""
+    if _STAMP_RE.search(code):
+        return code
+    kind = "edited" if edited else "written"
+    return (f"{MODEL_STAMP}{kind} ({origin}). The Council runs this under "
+            f"the model-script rules (nx_policy).\n{code}")
+
+
+def script_trust(code: str, path=None, app_roots: Iterable = ()) -> str:
+    """MODEL or USER for a script about to be run — see "Two kinds of
+    script". MODEL when the text carries the stamp, or ``path`` lies in one
+    of ``app_roots`` (the vault's data_out: what is there, the app wrote)."""
+    if _STAMP_RE.search(code or ""):
+        return MODEL
+    if path is not None:
+        try:
+            import path_contain
+            if any(path_contain.is_under(path, r) for r in app_roots if r):
+                return MODEL
+        except Exception:                                 # noqa: BLE001
+            return MODEL                # cannot tell: the stricter rules
+    return USER
 
 # uuid -> why it is refused (shown to the user; keep it plain).
 DENIED_UUIDS: Dict[str, str] = {
@@ -135,9 +254,16 @@ def validate_script(code: str) -> Tuple[bool, List[str]]:
     The model is free to write real Python here — execute() lines, numpy glue,
     the npview[:] = np.loadtxt(...) copy the spec requires, loops over files.
     What it may not do is reach outside that: no shell, no filesystem module,
-    no dynamic attribute lookup, none of the two filters whose capability is
-    arbitrary code execution, and none of the routes that reach a filter
+    no dynamic attribute lookup, no file-changing call (FILE_CHANGE_NAMES:
+    a pipeline's outputs are written by its writer filters, which nx_guard
+    holds to the output area), no route to a module the import allowlist
+    keeps out (MODULE_REACH_NAMES), none of the two filters whose capability
+    is arbitrary code execution, and none of the routes that reach a filter
     without naming it (FILTER_ROUTE_NAMES).
+
+    These are the MODEL rules (see "Two kinds of script"). The text check is
+    the first gate, not the only one: nx_guard enforces the same containment
+    at run time, where a trick this check misses still meets it.
 
     This is about permission, not correctness: whether the filters and
     parameters the script names exist is nx_ground.check_script's job.
@@ -152,30 +278,41 @@ def validate_script(code: str) -> Tuple[bool, List[str]]:
     # The capability rule first: the same check workflow_runner applies to
     # every script it runs, whoever wrote it.
     reasons: List[str] = _capability_reasons(tree)
+    seen = set(reasons)
+
+    def add(node, text: str) -> None:
+        line = f"line {getattr(node, 'lineno', 0)}: {text}"
+        if line not in seen:
+            seen.add(line)
+            reasons.append(line)
+
+    # A denied name at a call site is reported once, by the call.
+    called = {id(n.func) for n in ast.walk(tree) if isinstance(n, ast.Call)}
     for node in ast.walk(tree):
         # ---- imports: allowlist ---------------------------------------
         if isinstance(node, ast.Import):
             for a in node.names:
                 root = a.name.split(".")[0]
                 if root not in ALLOWED_IMPORT_ROOTS:
-                    reasons.append(
-                        f"line {node.lineno}: import {a.name!r} is not "
-                        f"allowed. Allowed: "
-                        f"{', '.join(sorted(ALLOWED_IMPORT_ROOTS))}")
+                    add(node, f"import {a.name!r} is not allowed. Allowed: "
+                              f"{', '.join(sorted(ALLOWED_IMPORT_ROOTS))}")
                 elif set(a.name.split(".")) & NATIVE_CODE_NAMES:
-                    reasons.append(f"line {node.lineno}: import {a.name!r} "
-                                   f"is not allowed (it loads native code)")
+                    add(node, f"import {a.name!r} is not allowed (it loads "
+                              f"native code)")
         elif isinstance(node, ast.ImportFrom):
             root = (node.module or "").split(".")[0]
             if node.level or root not in ALLOWED_IMPORT_ROOTS:
-                reasons.append(
-                    f"line {node.lineno}: from {node.module!r} import ... is "
-                    f"not allowed")
+                add(node, f"from {node.module!r} import ... is not allowed")
             for a in node.names:
                 if a.name in NATIVE_CODE_NAMES or set(
                         (node.module or "").split(".")) & NATIVE_CODE_NAMES:
-                    reasons.append(f"line {node.lineno}: importing {a.name} "
-                                   f"is not allowed (it loads native code)")
+                    add(node, f"importing {a.name} is not allowed (it loads "
+                              f"native code)")
+                elif a.name in FILE_CHANGE_NAMES:
+                    add(node, f"importing {a.name} is not allowed: "
+                              f"{_FILE_CHANGE_WHY}")
+                elif a.name in MODULE_REACH_NAMES or a.name in DENIED_CALLS:
+                    add(node, f"importing {a.name} is not allowed")
         # ---- calls ------------------------------------------------------
         elif isinstance(node, ast.Call):
             fn = node.func
@@ -185,31 +322,59 @@ def validate_script(code: str) -> Tuple[bool, List[str]]:
             elif isinstance(fn, ast.Attribute):
                 name = fn.attr
             if name in DENIED_CALLS:
-                reasons.append(f"line {node.lineno}: {name}() is not allowed")
+                add(node, f"{name}() is not allowed")
             for kw in node.keywords:
                 if kw.arg in DENIED_KWARGS and not (
                         isinstance(kw.value, ast.Constant)
                         and kw.value.value is False):
-                    reasons.append(
-                        f"line {node.lineno}: {kw.arg}= is not allowed "
-                        f"(unpickling a file runs whatever code it holds)")
+                    add(node, f"{kw.arg}= is not allowed (unpickling a file "
+                              f"runs whatever code it holds)")
+        # ---- names: a denied builtin held, not called -------------------
+        elif isinstance(node, ast.Name):
+            # `f = open; f(doc, "w")` and `i = __import__; i("os")` never
+            # call a denied name at the call site.
+            if node.id in DENIED_CALLS:
+                if id(node) not in called:
+                    add(node, f"{node.id} is not allowed")
+            elif (node.id.startswith("__") and node.id.endswith("__")
+                    and node.id not in _DUNDER_NAMES_OK):
+                add(node, f"{node.id} is not allowed (dunder access reaches "
+                          f"the interpreter)")
+        # ---- definitions: a dunder method runs when Python decides ------
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                               ast.ClassDef)):
+            if (node.name.startswith("__") and node.name.endswith("__")
+                    and node.name != "__init__"):
+                add(node, f"defining {node.name} is not allowed (the "
+                          f"interpreter calls it, not the script)")
         # ---- attributes -------------------------------------------------
         elif isinstance(node, ast.Attribute):
             if node.attr in NATIVE_CODE_NAMES:
-                reasons.append(f"line {node.lineno}: {node.attr} is not "
-                               f"allowed (it loads native code)")
+                add(node, f"{node.attr} is not allowed (it loads native code)")
             elif (node.attr.startswith("__") and node.attr.endswith("__")
                     and node.attr not in _DUNDER_OK):
-                reasons.append(
-                    f"line {node.lineno}: {node.attr} is not allowed "
-                    f"(dunder access reaches the interpreter)")
+                add(node, f"{node.attr} is not allowed (dunder access "
+                          f"reaches the interpreter)")
+            elif node.attr in FILE_CHANGE_NAMES:
+                add(node, f".{node.attr} is not allowed: {_FILE_CHANGE_WHY}")
+            elif node.attr in MODULE_REACH_NAMES:
+                add(node, f".{node.attr} is not allowed: it reaches a module "
+                          f"the import allowlist keeps out")
+            elif node.attr in DENIED_CALLS and id(node) not in called:
+                add(node, f".{node.attr} is not allowed")
     return (not reasons), reasons
 
 
-def _capability_reasons(tree: ast.AST) -> List[str]:
+_FILE_CHANGE_WHY = ("a pipeline script may not change files itself — its "
+                    "outputs are written by its writer filters (e.g. "
+                    "WriteDREAM3DFilter), into the output area")
+
+
+def _capability_reasons(tree: ast.AST,
+                        allow: frozenset = frozenset()) -> List[str]:
     """Every place ``tree`` names a denied filter, or a route that reaches a
-    filter without naming it (FILTER_ROUTE_NAMES), or carries a denied
-    filter's uuid as text."""
+    filter without naming it (FILTER_ROUTE_NAMES, minus ``allow``), or
+    carries a denied filter's uuid as text."""
     reasons: List[str] = []
     seen = set()
 
@@ -222,7 +387,7 @@ def _capability_reasons(tree: ast.AST) -> List[str]:
     def name_hit(node, name: str, verb: str = "") -> None:
         if name in DENIED_CLASS_NAMES:
             add(node, f"{verb}{name} is refused — {reason_for_class(name)}")
-        elif name in FILTER_ROUTE_NAMES:
+        elif name in FILTER_ROUTE_NAMES and name not in allow:
             add(node, f"{verb}{name} is not allowed: it reaches filters "
                       f"without naming them (a filter list, a saved "
                       f"pipeline or a plugin loader), so this check could "
@@ -282,3 +447,96 @@ def reason_for_class(class_name: str) -> str:
     if class_name == "CreatePythonSkeletonFilter":
         return DENIED_UUIDS["1a35f50d-a9f5-9ea2-af70-5b9cf894e45f"]
     return "this filter executes arbitrary code."
+
+
+# ---- what a USER script may do that a model's may not ----------------------
+
+# The simplnx tutorials run a saved pipeline: Pipeline.from_file(...), then
+# set_args on a step, then execute. A user's own tutorial-style script was
+# refused outright once Pipeline joined FILTER_ROUTE_NAMES (it hides which
+# filters run). For a USER script it is allowed again, because what it runs
+# can be checked: the file before the run (pipeline_file_reasons), every
+# step's uuid when nx_guard sees Pipeline.execute.
+USER_PIPELINE_NAMES = frozenset({"Pipeline", "PipelineFilter",
+                                 "AbstractPipelineNode"})
+
+
+def pipeline_file_uuids(text: str) -> List[str]:
+    """Every filter uuid a .d3dpipeline's JSON names (nested ones too).
+    Raises ValueError when the text is not a pipeline."""
+    data = json.loads(text)
+    if not isinstance(data, dict) or not isinstance(data.get("pipeline"),
+                                                    list):
+        raise ValueError("it has no \"pipeline\" list")
+    found: List[str] = []
+
+    def walk(v) -> None:
+        if isinstance(v, dict):
+            f = v.get("filter")
+            if isinstance(f, dict) and isinstance(f.get("uuid"), str):
+                found.append(f["uuid"].lower())
+            for x in v.values():
+                walk(x)
+        elif isinstance(v, list):
+            for x in v:
+                walk(x)
+    walk(data["pipeline"])
+    return found
+
+
+def pipeline_file_reasons(tree: ast.AST, search_dirs: Iterable = ()
+                          ) -> List[str]:
+    """Why a script's Pipeline.from_file(<literal path>) must not run: the
+    pipeline it names holds a denied filter, or is not a pipeline at all.
+
+    A relative path is looked for in ``search_dirs`` (the script's own
+    folder, then the run's working folder). A path this cannot find, or one
+    computed at run time, is not refused here: nx_guard checks every step's
+    uuid when that pipeline executes, which no path trick gets past."""
+    reasons: List[str] = []
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "from_file"):
+            continue
+        arg = node.args[0] if node.args else next(
+            (k.value for k in node.keywords if k.arg in ("path", "arg0")),
+            None)
+        if not (isinstance(arg, ast.Constant) and isinstance(arg.value, str)):
+            continue
+        raw = arg.value
+        cands = [raw] if os.path.isabs(raw) else [
+            os.path.join(str(d), raw) for d in search_dirs if d]
+        path = next((c for c in cands if os.path.isfile(c)), None)
+        if path is None:
+            continue
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                uuids = pipeline_file_uuids(fh.read())
+        except (OSError, ValueError) as exc:
+            reasons.append(f"line {node.lineno}: {raw} could not be checked "
+                           f"as a pipeline ({exc}), so it is not run")
+            continue
+        for u in uuids:
+            if is_denied(u):
+                reasons.append(f"line {node.lineno}: the pipeline {raw} "
+                               f"holds a refused filter — {reason(u)}")
+    return reasons
+
+
+def run_reasons(code: str, *, trust: str = MODEL,
+                search_dirs: Iterable = ()) -> List[str]:
+    """Why workflow_runner must not run ``code`` — [] when it may.
+
+    MODEL: validate_script in full. USER: the capability rule, with a saved
+    pipeline allowed when its filters pass (USER_PIPELINE_NAMES,
+    pipeline_file_reasons). See "Two kinds of script" at the top."""
+    if trust == MODEL:
+        return validate_script(code)[1]
+    try:
+        tree = ast.parse(code or "")
+    except SyntaxError as exc:
+        return [f"the script could not be checked (syntax error here: "
+                f"{exc.msg}, line {exc.lineno})"]
+    return (_capability_reasons(tree, allow=USER_PIPELINE_NAMES)
+            + pipeline_file_reasons(tree, search_dirs))

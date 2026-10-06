@@ -534,7 +534,12 @@ def generate_pipeline_from_description(
     while target.exists():
         target = in_dir / f"{base}_v{n}.py"
         n += 1
-    target.write_text(code, encoding="utf-8")
+    # pipelines/in is also where the user's OWN scripts live, so the folder
+    # cannot say who wrote this one: the stamp does, and the workflow runner
+    # holds it to the model-script rules (nx_policy "Two kinds of script").
+    import nx_policy
+    target.write_text(nx_policy.stamp_model_script(code, "the pipeline chat"),
+                      encoding="utf-8")
     return target, f"ok: {target.relative_to(vault_dir) if vault_dir in target.parents else target}"
 
 
@@ -637,8 +642,15 @@ def modify_pipeline_by_request(
                    "do:\n  " + "\n  ".join(added[:6])),
         )
 
+    # Saved as a MODEL script: what the model added is held to the model
+    # rules when it runs (nx_policy "Two kinds of script"), not only checked
+    # for new policy reasons here.
+    import nx_policy
     new_path = save_modified_pipeline(
-        pipeline_path, result.new_source, suffix, vault_dir,
+        pipeline_path,
+        nx_policy.stamp_model_script(result.new_source, "the pipeline chat",
+                                     edited=True),
+        suffix, vault_dir,
     )
     return ModifyResult(
         success=True, pipeline=pipeline, source_path=pipeline_path,
