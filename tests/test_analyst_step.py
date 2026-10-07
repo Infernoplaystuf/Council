@@ -137,8 +137,9 @@ def test_the_result_reaches_every_member_and_the_judge(tmp_path):
         block="[ANALYST RESULT — computed]\nmean_hours 20", table="20",
         note="Analyst: computed a 1×1 table from data_in.")
     events = []
-    result = actions.send(QUESTION, council_options.CouncilOptions
-                          .defaults(), on_event=events.append)
+    opts = council_options.CouncilOptions.defaults()
+    opts.depth = "deep"              # the Judge ranks only at depth > quick
+    result = actions.send(QUESTION, opts, on_event=events.append)
     assert result.ok, result.message
     assert any("ANALYST RESULT" in s for s in models.writer.seen)
     assert any("ANALYST RESULT" in s for s in models.peasant.seen)

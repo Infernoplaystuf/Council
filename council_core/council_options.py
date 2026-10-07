@@ -106,6 +106,9 @@ class CouncilOptions:
     judge_panel: bool = False
     parallel: bool = False
     robust_voices: bool = False
+    #: How much council a question gets: "auto" (council_core.depth
+    #: decides per question), "quick", "standard" or "deep".
+    depth: str = "auto"
 
     @classmethod
     def defaults(cls, demo_mode: bool = False,
@@ -173,6 +176,19 @@ def specialist_choices(names: List[str]) -> List[str]:
 # ============================================================
 
 #: The backends the override dropdown offers, in the Tk shell's order.
+#: The Depth box: label -> council_core.depth level.
+DEPTH_CHOICES: Tuple[Tuple[str, str], ...] = (
+    ("Auto depth", "auto"),
+    ("Quick", "quick"),
+    ("Standard", "standard"),
+    ("Deep", "deep"),
+)
+DEPTH_HINT = ("How much council a question gets. Auto decides per question: "
+              "Quick (one member answers, the Judge checks — greetings, short "
+              "plain questions), Standard (drafts, the Peasant's questions, "
+              "rebuttals, the Judge — no cross-fire), Deep (everything, for "
+              "code, data, design and planning).")
+
 BACKEND_CHOICES: Tuple[str, ...] = (
     "(default)", "local_general_primary", "local_general_alt",
     "local_coder_primary", "local_coder_fast", "local_judge_fast",

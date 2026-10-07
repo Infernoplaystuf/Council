@@ -861,7 +861,14 @@ GUIDE: Tuple[GuideStep, ...] = (
         "Then each member reads the other answers and the Peasant's "
         "questions and replies: it defends its answer, changes it, or agrees "
         "with someone else (rebuttal, then cross-fire). All of it goes onto "
-        "the Debate floor.",
+        "the Debate floor.\n\n"
+        "Not every question gets all of this. The Depth box (Auto by "
+        "default) decides: a QUICK question (thanks, a short plain question) "
+        "is answered by one member and checked by the Judge; a STANDARD one "
+        "skips the cross-fire; a DEEP one (code, data, design, planning) "
+        "gets everything. The cross-fire is also skipped when every draft "
+        "already agrees with high confidence, stops after a turn in which "
+        "nobody disagrees, and the Peasant asks about each turn in one go.",
         ("peasant", "debate") + MEMBERS,
         "council_core/deliberation.py (rebuttal, cross-fire)"),
     GuideStep(

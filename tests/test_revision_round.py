@@ -64,7 +64,7 @@ def test_a_named_fix_gets_a_revision_not_a_new_debate():
     events = []
     res = ct.run_turn("q", models(writer=writer, peasant=peasant),
                       judge=judge, max_rounds=2, debate_turns=1,
-                      on_event=events.append)
+                      on_event=events.append, depth="deep")
     assert res.ok and res.verdict == "PASS"
     # One ranking (round 1) and two critiques: round 2 did not re-rank.
     assert judge.calls == ["rank", "critique", "critique"]
@@ -80,7 +80,7 @@ def test_a_rejected_approach_gets_the_whole_panel_again():
     writer, peasant = Member("writer"), Member("peasant")
     judge = Judge([START_OVER, "Verdict: PASS"])
     ct.run_turn("q", models(writer=writer, peasant=peasant), judge=judge,
-                max_rounds=2, debate_turns=1)
+                max_rounds=2, debate_turns=1, depth="deep")
     assert judge.calls.count("rank") == 2
     assert len(writer.drafts()) == 2
 
@@ -92,7 +92,7 @@ def test_the_extra_round_for_very_low_confidence_really_runs():
     judge = Judge([NEEDS_WORK] * 5, confidence=10)
     events = []
     ct.run_turn("q", models(writer=writer), judge=judge, max_rounds=2,
-                debate_turns=1, on_event=events.append)
+                debate_turns=1, on_event=events.append, depth="deep")
     assert judge.calls.count("critique") == 3
     assert any("Round 3/3" in e.text for e in events if e.kind == "phase")
 
@@ -104,7 +104,7 @@ def test_required_changes_are_read_even_at_very_low_confidence():
     judge = Judge([NEEDS_WORK] * 5, confidence=10)
     events = []
     ct.run_turn("q", models(writer=writer), judge=judge, max_rounds=2,
-                debate_turns=1, on_event=events.append)
+                debate_turns=1, on_event=events.append, depth="deep")
     assert any("Required changes for next round" in e.text
                and "State the units" in e.text for e in events)
 

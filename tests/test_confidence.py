@@ -109,7 +109,7 @@ def test_the_draft_carries_its_confidence_and_no_extra_call_is_made():
     events = []
     res = ct.run_turn("q", _models(writer=writer, peasant=Member(pct=90)),
                       judge=judge, max_rounds=1, debate_turns=1,
-                      on_event=events.append)
+                      on_event=events.append, depth="deep")
     assert res.ok
     assert judge.seen["writer"]["self_confidence"] == 37
     assert judge.seen["writer"]["confidence_reason"] == "the 2019 units"
@@ -128,7 +128,7 @@ def test_a_draft_without_the_line_falls_back_to_one_question():
     writer = Member(pct=None)
     judge = Judge()
     ct.run_turn("q", _models(writer=writer, peasant=Member(pct=90)),
-                judge=judge, max_rounds=1, debate_turns=1)
+                judge=judge, max_rounds=1, debate_turns=1, depth="deep")
     assert judge.seen["writer"]["self_confidence"] == 55
     fallback = [p for p in writer.asked if "How confident are you" in p]
     assert len(fallback) == 1 and "The answer." in fallback[0]

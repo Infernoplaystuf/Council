@@ -185,6 +185,7 @@ def test_send_gives_the_vault_to_the_turn_and_takes_it_back(tmp_path):
         ["notes/pumps.md"], "keyword")
     events = []
     options = council_options.CouncilOptions.defaults()
+    options.depth = "deep"          # the debate itself is under test
     result = actions.send("pump size?", options, on_event=events.append)
     assert result.ok, result.message
     assert any("notes/pumps.md" in s for s in models.writer.seen)
@@ -200,6 +201,7 @@ def test_the_vault_switch_turns_it_off(tmp_path):
     asked = []
     actions.vault_brief = lambda q: asked.append(q) or vc.Brief()
     options = council_options.CouncilOptions.defaults()
+    options.depth = "deep"          # the debate itself is under test
     options.vault = False
     events = []
     actions.send("pump size?", options, on_event=events.append)
@@ -254,8 +256,9 @@ def test_the_judge_ranks_and_critiques_with_the_evidence(tmp_path):
     actions._models = models
     actions.vault_brief = lambda q: vc.build("pump size", tmp_path,
                                              rag=FakeRag(CHUNKS))
-    result = actions.send("pump size?", council_options.CouncilOptions
-                          .defaults())
+    opts = council_options.CouncilOptions.defaults()
+    opts.depth = "deep"
+    result = actions.send("pump size?", opts)
     assert result.ok, result.message
     judge = models.judge
     assert judge.ranked_with and vc.EVIDENCE_MARKER in judge.ranked_with[0]

@@ -179,8 +179,12 @@ def final_answer(events: List[AgentEvent], synth: str = "writer") -> str:
 
 
 def judge_critique(events: List[AgentEvent]) -> str:
-    return next((e.text for e in reversed(events)
-                 if e.who == "Judge" and e.kind == "observation"), "")
+    """The Judge's last critique: its last observation carrying a verdict
+    (the required-changes and code-check lines it posts after a critique
+    are not the critique)."""
+    judge = [e for e in events if e.who == "Judge" and e.kind == "observation"]
+    return next((e.text for e in reversed(judge) if "Verdict:" in e.text),
+                judge[-1].text if judge else "")
 
 
 def judge_confidence(events: List[AgentEvent]) -> int:
@@ -215,7 +219,8 @@ def run_turn(question: str, models: Any, *,
              pause_event: Optional[threading.Event] = None,
              answer_getter: Optional[Callable[[], str]] = None,
              extra_ctx: Optional[Dict[str, Any]] = None,
-             parallel_members: bool = False) -> TurnResult:
+             parallel_members: bool = False,
+             depth: str = "auto") -> TurnResult:
     """Run one full deliberation and dig the result out of it.
 
     Never raises. A turn that fails comes back as ``ok=False`` with the reason
@@ -255,6 +260,14 @@ def run_turn(question: str, models: Any, *,
             route = ""                 # an unroutable question still gets asked
         panel, synth = panel_for_route(route)
         panel = usable_panel(panel, agents)
+
+        # How much council this question gets (council_core.depth).
+        from .depth import decide
+        chosen = decide(question, route, forced=depth)
+        extra_ctx = dict(extra_ctx or {})
+        extra_ctx["depth"] = chosen
+        if on_event is not None:
+            on_event(AgentEvent("Judge", "phase", "▶ " + chosen.note()))
 
         collected: List[AgentEvent] = []
 

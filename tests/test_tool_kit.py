@@ -474,7 +474,7 @@ def test_the_judge_ranks_with_the_quote_checks(tools):
     models.peasant = Member()
     res = ct.run_turn("how do I start the pump?", models, judge=Judge(),
                       max_rounds=1, debate_turns=0, enable_tools=True,
-                      tools=tools)
+                      tools=tools, depth="deep")
     assert res.ok, res.message
     assert "QUOTE CHECKS" in seen["evidence"]
     assert "VERIFIED" in seen["evidence"]

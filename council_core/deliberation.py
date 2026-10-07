@@ -213,6 +213,68 @@ def peasant_cross_exam(
 
     return peasant_model.respond(prompt, extra_context=extra_context)
 
+def _prior_qa_block(prior_qa: Optional[List[Dict[str, str]]]) -> str:
+    if not prior_qa:
+        return ""
+    lines = ["━━━ QUESTIONS YOU HAVE ALREADY ASKED THIS SESSION ━━━",
+             "Do NOT ask any of these again, even in paraphrased form.", ""]
+    for i, item in enumerate(prior_qa[-30:], 1):
+        lines.append(f"[{i}] Q: {item['q']}")
+        if item.get("a"):
+            lines.append(f"    A: {item['a']}")
+    lines.append("━━━ END OF PRIOR Q&A ━━━")
+    return "\n".join(lines)
+
+
+def peasant_turn_questions(peasant_model, *, messages: Dict[str, str],
+                           user_text: str, turn: int,
+                           prior_qa: Optional[List[Dict[str, str]]] = None,
+                           query_mode: str = "") -> str:
+    """ONE Peasant call for a whole cross-fire turn: two questions for each
+    member's message, under a TO <ROLE>: heading. It used to be one call
+    per member per turn, plus a reformat call whenever the reply lacked
+    Q1/Q2 labels."""
+    parts = [f"ORIGINAL REQUEST:\n{user_text}\n"]
+    for role, msg in messages.items():
+        parts.append(f"{role.upper()} — CROSS-FIRE TURN {turn}:\n{msg}\n")
+    if prior := _prior_qa_block(prior_qa):
+        parts.append(prior)
+    if query_mode == "conversational":
+        parts.append("⚠ CONVERSATIONAL MODE: ask about accuracy, clarity and "
+                     "whether it answers the user — not about code.")
+    elif query_mode == "technical":
+        parts.append("⚠ TECHNICAL MODE: focus on correctness, edge cases "
+                     "and robustness.")
+    roles = ", ".join(r.upper() for r in messages)
+    prompt = (
+        f"For EACH of these members ({roles}), ask two NEW questions about "
+        "something specific in their message above. Use exactly this form "
+        "for every member:\n"
+        "TO <ROLE>:\nQ1: <question>?\nQ2: <question>?\n"
+        "Do not repeat any earlier question.")
+    return peasant_model.respond(prompt, extra_context="\n\n".join(parts),
+                                 max_tokens=160 * max(1, len(messages)))
+
+
+_TO_ROLE = re.compile(r"^\s*\**\s*TO\s+([A-Za-z_]+)\s*\**\s*:?\s*\**\s*$",
+                      re.IGNORECASE | re.MULTILINE)
+
+
+def split_turn_questions(text: str, roles: List[str]) -> Dict[str, str]:
+    """{role: its questions} from peasant_turn_questions' reply. A reply
+    without the headings goes to every member whole."""
+    marks = [(m.start(), m.end(), m.group(1).lower())
+             for m in _TO_ROLE.finditer(text or "")]
+    out: Dict[str, str] = {}
+    for i, (_s, end, role) in enumerate(marks):
+        stop = marks[i + 1][0] if i + 1 < len(marks) else len(text)
+        if role in roles:
+            out[role] = text[end:stop].strip()
+    if not out:
+        return {r: (text or "").strip() for r in roles}
+    return out
+
+
 def _looks_like_two_questions(text: str) -> bool:
     """
     Returns True if the Peasant response looks like it followed the format.
@@ -274,6 +336,18 @@ _START_OVER = re.compile(
     r"from scratch|fundamentally|misunderst|does not answer|doesn't answer|"
     r"did not answer|didn't answer|off[- ]topic|irrelevant|wrong language|"
     r"not what (the user|was) asked", re.IGNORECASE)
+
+
+def _depth_of(ctx: "AgentContext"):
+    """The question's depth (council_core.depth) from ctx.shared["depth"];
+    Deep when nobody said, which is how the council always ran."""
+    from .depth import DEEP, Depth
+    d = ctx.shared.get("depth")
+    if isinstance(d, Depth):
+        return d
+    if isinstance(d, str) and d:
+        return Depth(d, "", forced=True)
+    return Depth(DEEP, "")
 
 
 def required_changes_of(judge: Any, critique: str) -> List[str]:
@@ -634,6 +708,13 @@ class DeliberationOrchestrator:
         if synth not in self.agents:
             synth = "writer" if "writer" in self.agents else (panel[0] if panel else synth)
 
+        # A QUICK question (council_core.depth): one member — the
+        # synthesiser — answers and the Judge checks it; no Peasant, no
+        # rebuttal, no ranking, no separate synthesis.
+        _quick = _depth_of(ctx).level == "quick"
+        if _quick and synth in self.agents:
+            panel = [synth]
+
         # Accumulates every Peasant question across all rounds and cross-fire
         # turns so the model is never shown a blank slate and cannot re-ask
         # something already covered.  Each entry: {"q": <text>, "a": ""}
@@ -750,7 +831,8 @@ class DeliberationOrchestrator:
                                 ctx.user_text = user_text
                                 discussion_lines.append(_clarif_note)
 
-                    if key != "peasant" and "peasant" in self.agents:
+                    if key != "peasant" and "peasant" in self.agents \
+                            and not _quick:
                         self._phase(f"Peasant — cross-examining {key}")
                         _pexam_mode = ctx.shared.get("query_mode", "")
                         qtxt = peasant_cross_exam(
@@ -836,7 +918,8 @@ class DeliberationOrchestrator:
                     )
 
                 rebutters = [k for k in panel
-                             if k != "peasant" and k in candidates]
+                             if k != "peasant" and k in candidates
+                             and not _quick]
                 # Each rebuttal reads only the finished drafts and the Peasant's
                 # questions — never another rebuttal — so writing them side by
                 # side changes nothing but the time it takes.
@@ -867,14 +950,39 @@ class DeliberationOrchestrator:
                     ctx.shared["candidates"] = candidates
                     ctx.shared["discussion_transcript"] = "\n".join(discussion_lines[-60:])
 
-                # 3) Cross-fire
-                if self._pause_event and not self._pause_event.is_set():
-                    self._pause_event.wait(timeout=300)
-                self._phase(f"Cross-fire — {self.debate_turns} turns")
-                for turn in range(1, self.debate_turns + 1):
-                    for key in panel:
-                        if key == "peasant" or key not in candidates:
-                            continue
+                # 3) Cross-fire — council_core.depth decides whether it runs:
+                # Deep questions only (a Standard one is lifted when a
+                # member is unsure), not when the drafts already agree, and
+                # it ends after a turn in which nobody disagrees. The
+                # Peasant asks about a whole turn in ONE call.
+                from . import depth as _dp
+                _depth = _depth_of(ctx)
+                _members = [k for k in panel
+                            if k != "peasant" and k in candidates]
+                _unsure = [k for k in _members
+                           if candidates[k].get("self_confidence", 100)
+                           <= _cf_LOW]
+                _skip_cf = ""
+                if not _depth.cross_fire and not (
+                        _depth.debate and _unsure and not _depth.forced):
+                    _skip_cf = f"{_depth.level} depth"
+                elif self.debate_turns < 1 or len(_members) < 2:
+                    _skip_cf = "fewer than two members to argue"
+                else:
+                    _skip_cf = _dp.agree(candidates)
+                if _skip_cf:
+                    self._phase(f"Cross-fire skipped — {_skip_cf}")
+                else:
+                    if not _depth.cross_fire:
+                        self._phase(f"Cross-fire added — {', '.join(_unsure)} "
+                                    "unsure of its answer")
+                    self._phase(f"Cross-fire — up to {self.debate_turns} turns")
+                for turn in (range(1, self.debate_turns + 1)
+                             if not _skip_cf else ()):
+                    if self._pause_event and not self._pause_event.is_set():
+                        self._pause_event.wait(timeout=300)
+
+                    def _cf_context(turn=turn) -> str:
                         _cf_mode = ctx.shared.get("query_mode", "")
                         _cf_mode_note = (
                             "⚠ CONVERSATIONAL mode: respond in prose only, no code.\n"
@@ -882,67 +990,77 @@ class DeliberationOrchestrator:
                             "⚠ TECHNICAL mode: focus on code quality and correctness.\n"
                             if _cf_mode == "technical" else ""
                         )
-                        extra_context = (
+                        return (
                             f"CROSS-FIRE CONTEXT — Turn {turn}/{self.debate_turns}\n\n"
                             + _cf_mode_note +
                             "Rules:\n"
                             "- Write ONE short message.\n"
                             "- Include: AGREE: ... | DISAGREE: ... | ADD: ...\n"
+                            "- Write 'DISAGREE: none' if nothing is left to dispute.\n"
                             "- Address Peasant questions about your answer.\n"
                             "- Keep under 10 lines.\n\n"
                             f"Discussion so far:\n{ctx.shared.get('discussion_transcript','')}\n"
                         )
-                        self._phase(f"{key.capitalize()} — cross-fire T{turn}")
-                        msg = self.agents[key].model.respond(
-                            "Post your cross-fire message now.", extra_context=extra_context,
+
+                    def _post(key: str, turn=turn) -> str:
+                        return self.agents[key].model.respond(
+                            "Post your cross-fire message now.",
+                            extra_context=_cf_context(turn),
                             token_callback=self.agents[key]._make_token_cb(),
-                            max_tokens=400,  # cross-fire must be tight — 10 lines max
+                            max_tokens=400,  # cross-fire must be tight
                         )
+
+                    def _record(key: str, msg: str, turn=turn) -> None:
                         candidates[key]["discussion"] = (
-                            candidates[key].get("discussion", "") + f"\nTURN {turn}:\n{msg}\n"
-                        ).strip()
-                        ev = AgentEvent(key.capitalize(), "observation", f"Cross-fire T{turn}:\n{msg}")
-                        emit(ev)
-                        discussion_lines.append(f"{key.upper()} CROSS-FIRE T{turn}:\n{msg}\n")
-
-                        if "peasant" in self.agents:
-                            self._phase(f"Peasant — questions after {key} T{turn}")
-                            _cf_pmode = ctx.shared.get("query_mode", "")
-                            pq = peasant_cross_exam(
-                                self.agents["peasant"].model,
-                                candidate_role=f"{key} (T{turn})", candidate_text=msg, user_text=user_text,
-                                prior_qa=_peasant_qa_log if _peasant_qa_log else None,
-                                query_mode=_cf_pmode,
-                            )
-                            _cf_score = _peasant_quality_score(pq, msg, _peasant_qa_log)
-                            if not _looks_like_two_questions(pq):
-                                # Reformat rather than regenerate — same ideas, proper labels
-                                _cf_reformat = (
-                                    "Your response below is good but needs exactly two questions "
-                                    "labelled Q1: and Q2:. Reformat it now — keep the same ideas, "
-                                    "just add Q1: and Q2: labels and make sure each ends with '?'.\n\n"
-                                    f"YOUR RESPONSE:\n{pq}"
-                                )
-                                pq = self.agents["peasant"].model.respond(
-                                    _cf_reformat, max_tokens=300)
-                                _cf_score = _peasant_quality_score(pq, msg, _peasant_qa_log)
-                                if not _looks_like_two_questions(pq):
-                                    _axes = ", ".join(
-                                        k + ("=✓" if v else "=✗")
-                                        for k, v in _cf_score["axes"].items()
-                                    )
-                                    emit(AgentEvent("Peasant", "observation",
-                                        "⚠ CF quality low after reformat ("
-                                        + str(_cf_score["total"]) + "/4: " + _axes + ")"))
-                            _log_peasant_questions(pq)
-                            _cftag = " [q:" + str(_cf_score["total"]) + "/4]"
-                            pev = AgentEvent("Peasant", "observation",
-                                            f"Cross-fire questions after {key} T{turn}" + _cftag + ":\n" + pq)
-                            emit(pev)
-                            discussion_lines.append(f"PEASANT → {key} T{turn}:\n{pq}\n")
-
+                            candidates[key].get("discussion", "")
+                            + f"\nTURN {turn}:\n{msg}\n").strip()
+                        emit(AgentEvent(key.capitalize(), "observation",
+                                        f"Cross-fire T{turn}:\n{msg}"))
+                        discussion_lines.append(
+                            f"{key.upper()} CROSS-FIRE T{turn}:\n{msg}\n")
                         ctx.shared["candidates"] = candidates
-                        ctx.shared["discussion_transcript"] = "\n".join(discussion_lines[-80:])
+                        ctx.shared["discussion_transcript"] = \
+                            "\n".join(discussion_lines[-80:])
+
+                    # Side by side, every member of a turn reads the
+                    # discussion up to the previous turn (as rebuttals read
+                    # the drafts); one at a time, each also reads the
+                    # messages before it in this turn.
+                    msgs: Dict[str, str] = {}
+                    if self.parallel_members and len(_members) > 1:
+                        self._phase(f"Cross-fire T{turn} — "
+                                    f"{len(_members)} members at once")
+                        msgs = self._side_by_side(_members, _post)
+                        for key in _members:
+                            _record(key, msgs[key])
+                    else:
+                        for key in _members:
+                            self._phase(f"{key.capitalize()} — cross-fire T{turn}")
+                            msgs[key] = _post(key)
+                            _record(key, msgs[key])
+
+                    if "peasant" in self.agents:
+                        self._phase(f"Peasant — questions on cross-fire T{turn}")
+                        pq = peasant_turn_questions(
+                            self.agents["peasant"].model, messages=msgs,
+                            user_text=user_text, turn=turn,
+                            prior_qa=_peasant_qa_log or None,
+                            query_mode=ctx.shared.get("query_mode", ""))
+                        _log_peasant_questions(pq)
+                        for key, qs in split_turn_questions(
+                                pq, _members).items():
+                            emit(AgentEvent(
+                                "Peasant", "observation",
+                                f"Cross-fire questions for {key} T{turn}:\n{qs}"))
+                            discussion_lines.append(
+                                f"PEASANT → {key} T{turn}:\n{qs}\n")
+                        ctx.shared["discussion_transcript"] = \
+                            "\n".join(discussion_lines[-80:])
+
+                    if turn < self.debate_turns and \
+                            not _dp.has_disagreement(msgs.values()):
+                        self._phase("Cross-fire ended — no disagreements left")
+                        break
 
                 # 4) Judge ranks
                 self._phase("Judge — ranking candidates")
@@ -974,7 +1092,16 @@ class DeliberationOrchestrator:
                         emit(AgentEvent("Judge", "observation", _checks))
                         _evidence = "\n\n".join(x for x in (_evidence, _checks)
                                                  if x)
-                if _evidence:
+                if _quick:
+                    # One candidate: nothing to rank. Its own confidence
+                    # stands in for the Judge's until the critique.
+                    _only = next(iter(candidates), synth)
+                    _oc = int(candidates.get(_only, {}).get("self_confidence", 50))
+                    rank_json = json.dumps({
+                        "winner": _only, "scores": {_only: _oc},
+                        "rationale": "quick depth: one member answered",
+                        "confidence": _oc})
+                elif _evidence:
                     rank_json = self.judge.rank_candidates(
                         user_text, candidates, extra_context=_evidence)
                 else:
@@ -1046,11 +1173,19 @@ class DeliberationOrchestrator:
                                        "Adversarial: " + _adversarial_challenge))
 
             # 5) Writer synthesizes
-            self._phase("Writer — revising the answer" if _revising
-                        else "Writer — synthesizing final answer")
-            synth_evs = self.agents[synth].act(ctx)
+            _quick_answer = _quick and not _revising and synth in candidates
+            if _quick_answer:
+                # The quick answer IS the answer; its draft events are
+                # already out under the synthesiser's name.
+                synth_evs = [AgentEvent(self.agents[synth].display_name,
+                                        "final", candidates[synth]["answer"])]
+            else:
+                self._phase("Writer — revising the answer" if _revising
+                            else "Writer — synthesizing final answer")
+                synth_evs = self.agents[synth].act(ctx)
             for ev in synth_evs:
-                emit(ev)
+                if not _quick_answer:
+                    emit(ev)
             synth_final = next((e.text for e in reversed(synth_evs) if e.kind == "final"), "")
             # T1-D: Track per-round Writer output, emit unified diff on round 2+
             _round_outputs = ctx.shared.setdefault("_round_outputs", [])

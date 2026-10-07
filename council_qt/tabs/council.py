@@ -366,6 +366,7 @@ class CouncilActions:
             enable_tools=enable_tools,
             tools=self.tools() if enable_tools else None,
             parallel_members=bool(getattr(options, "parallel", False)),
+            depth=str(getattr(options, "depth", "auto") or "auto"),
             extra_ctx=({"judge_evidence": judge_evidence}
                        if judge_evidence else None),
             on_event=on_event,
@@ -695,6 +696,16 @@ class CouncilTab(ViewHelpers, QWidget):
         row.addWidget(self.backend_box)
 
         row.addSpacing(12)
+        depth = QLabel("Depth:")
+        depth.setStyleSheet(f"color: {self._tokens['muted_fg']};")
+        row.addWidget(depth)
+        self.depth_box = QComboBox()
+        for label, level in council_options.DEPTH_CHOICES:
+            self.depth_box.addItem(label, level)
+        self.depth_box.setToolTip(council_options.DEPTH_HINT)
+        row.addWidget(self.depth_box)
+
+        row.addSpacing(12)
         ask = QLabel("Ask:")
         ask.setStyleSheet(f"color: {self._tokens['muted_fg']};")
         row.addWidget(ask)
@@ -722,6 +733,9 @@ class CouncilTab(ViewHelpers, QWidget):
         for switch in council_options.SWITCHES:
             if switch.key not in self._checkboxes:
                 setattr(snapshot, switch.key, getattr(self._opts, switch.key))
+        box = getattr(self, "depth_box", None)
+        if box is not None:
+            snapshot.depth = box.currentData() or "auto"
         return snapshot.effective(self.demo_mode)
 
     def begin_turn(self) -> bool:
