@@ -22,6 +22,11 @@ DEFECTS DESIGNED OUT
 
 Also: the Transformation Cube button looked for its asset under APP_DIR — the
 state root, not the install — and could never find it in a source run.
+
+New here: a script that carries the model stamp is marked "model-written" in
+the list, and "Take over…" makes the selected one the user's — after a
+confirmation, only on its Yes (council_core.script_takeover). The same can be
+typed: "take over <script>".
 """
 from __future__ import annotations
 
@@ -37,7 +42,7 @@ from PySide6.QtWidgets import (QGroupBox, QHBoxLayout, QLabel, QLineEdit,
                                QSplitter, QVBoxLayout, QWidget)
 
 from council_core import dream3d as dream3d_core
-from council_core import nx_ops, paths
+from council_core import nx_ops, paths, pipeline_intent, script_takeover
 
 from .. import dialogs, theme
 from ..view import ViewHelpers, amp
@@ -85,6 +90,13 @@ class DreamActions:
     def cube(self) -> Optional[Path]:
         return dream3d_core.transformation_cube()
 
+    def model_stamped(self, pipeline) -> bool:
+        """Does the pipeline's file carry the model stamp? Reads the file."""
+        return script_takeover.is_stamped(pipeline.path)
+
+    def take_over_plan(self, pipeline) -> script_takeover.Plan:
+        return script_takeover.prepare(self.vault_dir, Path(pipeline.path))
+
 
 class Dream3DTab(ViewHelpers, QWidget):
     """Mirrored chat on the left, pipelines and DREAM3D-NX on the right."""
@@ -93,7 +105,8 @@ class Dream3DTab(ViewHelpers, QWidget):
                  ask_directory: Callable = dialogs.askdirectory,
                  ask_string: Callable = dialogs.askstring,
                  open_url: Callable[[QUrl], bool] = QDesktopServices.openUrl,
-                 auto_refresh: bool = True):
+                 auto_refresh: bool = True,
+                 confirm: Callable[..., bool] = dialogs.confirm):
         super().__init__()
         self.window = window
         self.bridge = getattr(window, "bridge", None)
@@ -101,8 +114,12 @@ class Dream3DTab(ViewHelpers, QWidget):
         self.ask_directory = ask_directory
         self.ask_string = ask_string
         self.open_url = open_url
+        # Asks before a take-over: Yes only on a click, COUNCIL_NO_DIALOGS
+        # answers No (dialogs.confirm).
+        self.confirm = confirm
         self._tokens = theme.tokens("dark")
         self._pipelines: List = []
+        self._stamped: List[bool] = []  # per row: carries the model stamp
         self._busy = False              # the pipeline scan
         self._nx_busy = False           # any DREAM3D-NX job (defect 4)
         self._local_chat = None
@@ -170,6 +187,13 @@ class Dream3DTab(ViewHelpers, QWidget):
         self.refresh_btn = self._button(row, "↻ Refresh", self.refresh)
         self._button(row, "Open in/ folder", self.on_open_in)
         self._button(row, "Open out/ folder", self.on_open_out)
+        # Live only while the selected script carries the model stamp.
+        self.take_over_btn = self._button(row, "Take over…",
+                                          self.on_take_over)
+        self.take_over_btn.setToolTip(
+            "Run the selected model-written script as your own: removes its "
+            "model stamp line, after asking you.")
+        self.take_over_btn.setEnabled(False)
         row.addStretch(1)
         layout.addLayout(row)
 
@@ -251,6 +275,8 @@ class Dream3DTab(ViewHelpers, QWidget):
     def _send_standalone(self, text: str) -> None:
         """No Council tab (a standalone host): pipeline commands still work."""
         self.transcript.append_entry("User", text, "final")
+        if self._take_over_typed(text):
+            return
         if self._local_chat is None:
             self._local_chat = dream3d_core.PipelineChat(
                 self.actions.vault_dir,
@@ -272,6 +298,32 @@ class Dream3DTab(ViewHelpers, QWidget):
 
         threading.Thread(target=work, name="dream3d-chat", daemon=True).start()
 
+    def _take_over_typed(self, text: str) -> bool:
+        """A take-over ("take over <script>") typed in THIS box, with no
+        Council tab to send it through (CouncilTab._take_over is the door
+        when there is one). Read before the pipeline chat sees the text,
+        which answers the same words from anywhere else without acting on
+        them. True if handled."""
+        ref = pipeline_intent.take_over_ref(text)
+        if ref is None:
+            return False
+        try:
+            plan = script_takeover.decide(self.actions.vault_dir, ref, text)
+        except Exception as exc:                          # noqa: BLE001
+            plan = script_takeover.Plan(
+                shown=ref, refusal=f"The take-over failed: {exc!r}. Nothing "
+                                   f"changed.")
+        if plan is None:
+            return False
+        said = script_takeover.run(
+            plan, self.actions.vault_dir,
+            confirm=lambda title, body: self.confirm(title, body, parent=self),
+            via=f"typed in the Dream3D chat: "
+                f"{text.splitlines()[0][:200]!r}")
+        self.transcript.append_entry("Council", said, "observation")
+        self.refresh()
+        return True
+
     # -- the picker ------------------------------------------------------
     def refresh(self) -> None:
         if self._busy:
@@ -282,7 +334,10 @@ class Dream3DTab(ViewHelpers, QWidget):
         def work() -> None:
             try:
                 folder, pipelines = self.actions.scan()
-                self._to_ui(self._show_pipelines, folder, pipelines)
+                # Which rows carry the model stamp: read here, off the GUI
+                # thread, like the scan (a synced drive is slow).
+                stamped = [self._model_stamped(pl) for pl in pipelines]
+                self._to_ui(self._show_pipelines, folder, pipelines, stamped)
             except Exception as exc:                      # noqa: BLE001
                 self._to_ui(self.set_view, f"Pipeline scan failed: {exc!r}")
             finally:
@@ -291,12 +346,22 @@ class Dream3DTab(ViewHelpers, QWidget):
         threading.Thread(target=work, name="dream3d-scan",
                          daemon=True).start()
 
+    def _model_stamped(self, pl) -> bool:
+        """Off the GUI thread (refresh's worker): reads a file, no widget."""
+        try:
+            return bool(self.actions.model_stamped(pl))
+        except Exception:                                 # noqa: BLE001
+            return False
+
     def _scanned(self) -> None:
         self._busy = False
         self.refresh_btn.setEnabled(True)
 
-    def _show_pipelines(self, folder: Path, pipelines) -> None:
+    def _show_pipelines(self, folder: Path, pipelines,
+                        stamped: Optional[List[bool]] = None) -> None:
         self._pipelines = list(pipelines)
+        self._stamped = [bool(s) for s in (stamped or [])]
+        self._stamped += [False] * (len(self._pipelines) - len(self._stamped))
         self.pipelines.blockSignals(True)
         self.pipelines.clear()
         if not self._pipelines:
@@ -304,9 +369,10 @@ class Dream3DTab(ViewHelpers, QWidget):
             item.setFlags(Qt.ItemFlag.NoItemFlags)
             self.pipelines.addItem(item)
             self.set_view(dream3d_core.empty_message(folder))
-        for pl in self._pipelines:
-            self.pipelines.addItem(dream3d_core.label_for(pl))
+        for pl, model in zip(self._pipelines, self._stamped):
+            self.pipelines.addItem(dream3d_core.label_for(pl, model=model))
         self.pipelines.blockSignals(False)
+        self.take_over_btn.setEnabled(self._selected_is_stamped())
 
     def selected(self):
         """The selected Pipeline, by ROW — never rebuilt from the label."""
@@ -314,10 +380,37 @@ class Dream3DTab(ViewHelpers, QWidget):
         return self._pipelines[row] if 0 <= row < len(self._pipelines) \
             else None
 
+    def _selected_is_stamped(self) -> bool:
+        row = self.pipelines.currentRow()
+        return 0 <= row < len(self._stamped) and self._stamped[row]
+
     def on_select(self, *_args) -> None:
+        self.take_over_btn.setEnabled(self._selected_is_stamped())
         pl = self.selected()
         if pl is not None:
             self.set_view(self.actions.render(pl))
+
+    def on_take_over(self) -> None:
+        """The Take over button: the selected model-written script becomes
+        the user's — after the confirmation, and only on its Yes
+        (council_core.script_takeover)."""
+        pl = self.selected()
+        if pl is None:
+            self.set_view("Select a model-written script in the list first.")
+            return
+        try:
+            plan = self.actions.take_over_plan(pl)
+        except Exception as exc:                          # noqa: BLE001
+            plan = script_takeover.Plan(
+                shown=pl.name, refusal=f"The take-over failed: {exc!r}. "
+                                       f"Nothing changed.")
+        said = script_takeover.run(
+            plan, self.actions.vault_dir,
+            confirm=lambda title, body: self.confirm(title, body, parent=self),
+            via="the Take over button (Dream3D tab)")
+        self.set_view(said)
+        self.say("Council", said, "observation")
+        self.refresh()
 
     def set_view(self, text: str) -> None:
         self.view.setPlainText(text)

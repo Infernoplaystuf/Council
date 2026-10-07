@@ -19,6 +19,11 @@ callback the caller supplies, and does not decide its thread.
 command, let the Council have it"; otherwise it returns a job to run on a
 worker. The decision is fast (regexes, and for to-python a directory scan, as
 in Tk); the job may call a model or the nx env and take a minute.
+
+One command is not answered here: "take over <script>". It loosens what a
+model's script may do, so it is acted on only from what the user typed, by the
+chat box's own send handler (council_core.script_takeover); plan() answers the
+phrase with how to do it and changes nothing.
 """
 from __future__ import annotations
 
@@ -58,9 +63,14 @@ def steps_note(pl) -> str:
     return f"({pl.format}, {n} step{'s' if n != 1 else ''})"
 
 
-def label_for(pl) -> str:
-    """Display only. Never parsed back — rows resolve by index."""
-    return f"{pl.name}  {steps_note(pl)}"
+#: After the label of a script that carries the model stamp.
+MODEL_MARK = "  · model-written"
+
+
+def label_for(pl, model: bool = False) -> str:
+    """Display only. Never parsed back — rows resolve by index. ``model``:
+    the script carries the model stamp (script_takeover.is_stamped)."""
+    return f"{pl.name}  {steps_note(pl)}" + (MODEL_MARK if model else "")
 
 
 def empty_message(folder: Path) -> str:
@@ -157,6 +167,8 @@ class PipelineChat:
 
     def _decide(self, intent: intents.Intent) -> Optional[Callable[[], None]]:
         a = intent.args
+        if intent.action == "take_over":
+            return self._decide_take_over(a[0], intent.text)
         if intent.action == "to_python":
             return self._decide_to_python(a[0])
         jobs = {
@@ -305,6 +317,26 @@ class PipelineChat:
             lines += ["", "Before you run it:"] + [f"  {w}" for w in warnings]
         self.say("Writer", "\n".join(lines), "final")
         self._changed()
+
+    # -- take over: never from here ------------------------------------------
+    def _decide_take_over(self, ref: str,
+                          text: str) -> Optional[Callable[[], None]]:
+        """plan() never takes a script over. Whatever holds text can call it,
+        and a take-over must be the user's own typed words or click
+        (script_takeover, "ONLY THE USER CAN ASK") — the chat box's send
+        handler has already acted on those before plan() sees them. A take-
+        over phrase that gets here came some other way: it is answered with
+        how to do it, and nothing changes. One that names no script ("take
+        over the planning") is declined, as the typed door declines it."""
+        from . import script_takeover
+        try:
+            plan = script_takeover.decide(self.vault_dir, ref, text)
+        except Exception:                                 # noqa: BLE001
+            plan = None
+        if plan is None:
+            return None
+        return lambda: self.say("Council", script_takeover.NOT_HERE,
+                                "observation")
 
     # -- to Python: the one that can decline ---------------------------------
     def _decide_to_python(self, raw: str) -> Optional[Callable[[], None]]:
