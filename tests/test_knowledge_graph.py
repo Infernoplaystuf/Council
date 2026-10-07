@@ -338,7 +338,9 @@ def test_a_newer_store_is_refused_before_anything_is_written(tmp_path):
     kgm.KnowledgeGraph(v).close()
     p = kgm.store_path(v)
     db = sqlite3.connect(p)
-    db.execute("UPDATE meta SET value='2' WHERE key='schema_version'")
+    # One past whatever this Council reads (the desktop's KG3 made v2 current).
+    db.execute("UPDATE meta SET value=? WHERE key='schema_version'",
+               (str(kgm.SCHEMA_VERSION + 1),))
     db.execute("DROP TABLE runs")
     db.execute("DELETE FROM field_rules WHERE label='Owner'")
     db.commit()

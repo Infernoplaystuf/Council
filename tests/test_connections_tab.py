@@ -39,6 +39,19 @@ class StubActions(ConnectionsActions):
     def open_file(self, rel_path):
         self.opened.append(rel_path)
 
+    def local_models(self):
+        return ["llama3.1:8b", "granite3.3:8b"]
+
+    def pi_workers(self):
+        return []
+
+    def suggest(self, model, use_pis, on_progress, should_stop):
+        from tests.test_kg_suggest import oracle
+        with self.open_graph() as kg:
+            return kg.suggest_from_text({f"this PC ({model})": oracle()},
+                                        model=f"extract:{model}", on_progress=on_progress,
+                                        should_stop=should_stop)
+
 
 @pytest.fixture(scope="module")
 def qapp():
@@ -264,3 +277,77 @@ def test_phrases_and_names():
     ent = {"type": "PROJECT", "name": "PRJ-0915",
            "aliases": ["PRJ-0915", "Helios", "Helios Turbine Upgrade"]}
     assert display_name(ent) == "PRJ-0915 — Helios Turbine Upgrade"
+
+
+def test_model_suggestions_arrive_as_suggested_links(qapp, tab):
+    _rebuilt(qapp, tab)
+    assert tab.model_box.currentData() == "llama3.1:8b"
+    assert not tab.pis_box.isEnabled()                     # no Pi nodes registered
+    tab.on_suggest()
+    drive(qapp, tab)
+    assert "link(s) suggested" in tab.status.text()
+    tab.search.setText("BRG-7720")
+    tab.results.setCurrentRow(0)
+    used_in = next(i for d, t, s, w, i in _items(tab.tree) if d == 1 and "PRJ-0915" in t)
+    assert used_in.text(1) == "suggested"
+    ev = used_in.child(0)
+    assert ev.text(1) == "model" and "helios_status_2026-03.md · line 11" in ev.text(2)
+    tab.tree.setCurrentItem(used_in)
+    assert tab.accept_btn.isEnabled()
+    tab.accept_btn.click()
+    with kgm.KnowledgeGraph(tab.actions.vault_dir) as kg:
+        st = {r["status"] for r in kg.all_relations()
+              if r["object"]["name"] == "BRG-7720" and r["subject"]["name"] == "PRJ-0915"}
+    assert st == {"accepted"}
+
+
+def test_suggest_runs_off_the_gui_thread_and_can_stop(qapp, tab, monkeypatch):
+    _rebuilt(qapp, tab)
+    seen = []
+    real = tab.actions.suggest
+
+    def spy(model, use_pis, on_progress, should_stop):
+        seen.append(threading.current_thread() is threading.main_thread())
+        tab._stop.set()                     # as if Stop were pressed at once
+        return real(model, use_pis, on_progress, should_stop)
+    monkeypatch.setattr(tab.actions, "suggest", spy)
+    tab.on_suggest()
+    drive(qapp, tab)
+    assert seen == [False] and "Stopped" in tab.status.text()
+
+
+def test_answer_a_question_and_it_is_applied(qapp, tab):
+    _rebuilt(qapp, tab)
+    tab.on_questions()
+    q = next(i for d, t, s, w, i in _items(tab.tree) if "D. Whitfield" in t)
+    tab.tree.setCurrentItem(q)
+    assert tab.answer_row.isVisibleTo(tab)
+    choices = [tab.answer_box.itemText(i) for i in range(tab.answer_box.count())]
+    assert set(choices) >= {"Dana Whitfield", "Dan Whitfield", "Neither — a different person"}
+    tab.answer_box.setCurrentIndex(choices.index("Dana Whitfield"))
+    tab.on_answer()
+    drive(qapp, tab)
+    tab.on_questions()
+    assert not any("D. Whitfield" in t for d, t, *_ in _items(tab.tree))
+
+
+def test_same_as_merges_after_confirming(qapp, vault):
+    asked = []
+    view = ConnectionsTab(actions=StubActions(vault),
+                          ask_string=lambda *a, **k: "Caroline",
+                          ask_yes_no=lambda *a, **k: asked.append(a) or True)
+    try:
+        _rebuilt(qapp, view)
+        view._kg._entity("PERSON", "Caroline Lee")
+        view._kg.db.commit()
+        view.search.setText("Carol Lee")
+        view.results.setCurrentRow(0)
+        carol = view._current
+        view.on_merge()
+        assert asked and view._kg.resolve(view._kg.search("Caroline Lee")[0]["id"]) == carol
+        assert view.split_btn.isEnabled()
+    finally:
+        _wait_threads(qapp)
+        view.close()
+        view.deleteLater()
+        qapp.processEvents()

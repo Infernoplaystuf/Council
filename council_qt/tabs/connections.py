@@ -26,7 +26,7 @@ from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont
-from PySide6.QtWidgets import (QComboBox, QDialog, QHBoxLayout, QLabel,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem,
                                QPlainTextEdit, QSplitter, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QWidget)
@@ -97,6 +97,45 @@ class ConnectionsActions:
     def context(self, rel_path: str, locator: Any):
         return kgm.source_context(self.root, rel_path, locator)
 
+    # -- free-text suggestions (KG2) --
+    def local_models(self) -> List[str]:
+        """US-origin models installed in this PC's Ollama, extractor first."""
+        from council_core import kg_extract as kx
+        from council_core.pi_setup import pi_models
+        try:
+            import council_engine as ce
+            tags = ce._ollama_tags("http://127.0.0.1:11434") or {}
+        except Exception:
+            tags = {}
+        names = [m.get("name", "") for m in tags.get("models", [])]
+        names = sorted(n for n in names if n and pi_models.is_us_origin(n))
+        best = kx.DEFAULT_EXTRACTOR
+        return ([best] if best in names else []) + [n for n in names if n != best]
+
+    def pi_workers(self) -> List[tuple]:
+        """(name, host url, model) of registered Pi nodes — only when remote
+        nodes are enabled (COUNCIL_REMOTE_NODES=1), the engine's own opt-in."""
+        try:
+            import council_engine as ce
+            if not ce._remote_nodes_enabled():
+                return []
+            from council_core import apothecary as apoth
+            reg = apoth._ae.NodeRegistry(str(apoth.registry_path(self.vault_dir)))
+            return [(n.name, f"http://{n.host}:{n.ollama_port}", n.model or n.active_model)
+                    for n in reg.list_nodes() if (n.model or n.active_model)]
+        except Exception:
+            return []
+
+    def suggest(self, model: str, use_pis: bool, on_progress, should_stop):
+        from council_core import kg_extract as kx
+        workers = {f"this PC ({model})": kx.ollama_chat(model)}
+        if use_pis:
+            for name, url, pmodel in self.pi_workers():
+                workers[f"{name} ({pmodel})"] = kx.ollama_chat(pmodel, host=url)
+        with self.open_graph() as kg:
+            return kg.suggest_from_text(workers, model=f"extract:{model}",
+                                        on_progress=on_progress, should_stop=should_stop)
+
     def open_file(self, rel_path: str) -> None:
         from .vault import VaultActions
         VaultActions(self.vault_dir).open_folder(self.root / rel_path)
@@ -106,7 +145,7 @@ class ConnectionsTab(ViewHelpers, QWidget):
     """Search, links with evidence, and a source preview."""
 
     def __init__(self, window=None, actions: Optional[ConnectionsActions] = None,
-                 auto_refresh: bool = True):
+                 auto_refresh: bool = True, ask_string=None, ask_yes_no=None):
         super().__init__()
         self.window = window
         self.bridge = getattr(window, "bridge", None)
@@ -116,10 +155,15 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self._kg: Optional[kgm.KnowledgeGraph] = None
         self._current: Optional[str] = None
         self._selected: Optional[Dict[str, Any]] = None
+        self._stop = threading.Event()
+        from .. import dialogs as _dialogs
+        self.ask_string = ask_string or _dialogs.askstring
+        self.ask_yes_no = ask_yes_no or _dialogs.askyesno
         self._build()
         if auto_refresh:
             self._reopen()
             self.on_search()
+            self.refresh_models()
 
     # ------------------------------------------------------------------
     def _build(self) -> None:
@@ -140,6 +184,17 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.fields_btn = self._button(row, "Fields…", self.on_fields)
         self.questions_btn = self._button(row, "Questions", self.on_questions)
         outer.addLayout(row)
+
+        srow = QHBoxLayout()
+        srow.addWidget(QLabel("Suggest links from free text with"))
+        self.model_box = QComboBox()
+        srow.addWidget(self.model_box, 1)
+        self.pis_box = QCheckBox("and my Pi nodes")
+        srow.addWidget(self.pis_box)
+        self.suggest_btn = self._button(srow, "Suggest links", self.on_suggest)
+        self.stop_btn = self._button(srow, "Stop", self.on_stop_suggest)
+        self.stop_btn.setEnabled(False)
+        outer.addLayout(srow)
 
         self.status = QLabel("")
         self.status.setWordWrap(True)
@@ -182,6 +237,24 @@ class ConnectionsTab(ViewHelpers, QWidget):
         self.reject_btn = self._button(btns, "✗ Reject link", lambda: self._decide("rejected"))
         btns.addStretch(1)
         rl.addLayout(btns)
+
+        # KG3: answering a question / merging duplicates
+        self.answer_row = QWidget()
+        ar = QHBoxLayout(self.answer_row)
+        ar.setContentsMargins(0, 0, 0, 0)
+        ar.addWidget(QLabel("It is"))
+        self.answer_box = QComboBox()
+        ar.addWidget(self.answer_box, 1)
+        self.everywhere_box = QCheckBox("everywhere this name appears")
+        ar.addWidget(self.everywhere_box)
+        self.answer_btn = self._button(ar, "Answer", self.on_answer)
+        rl.addWidget(self.answer_row)
+        self.answer_row.setVisible(False)
+        mrow = QHBoxLayout()
+        self.merge_btn = self._button(mrow, "Same as…", self.on_merge)
+        self.split_btn = self._button(mrow, "Split off a merged name", self.on_unmerge)
+        mrow.addStretch(1)
+        rl.addLayout(mrow)
         split.addWidget(right)
         split.setSizes([230, 520, 420])
         outer.addWidget(split, 1)
@@ -335,7 +408,10 @@ class ConnectionsTab(ViewHelpers, QWidget):
         kind = item.data(0, ROLE_KIND)
         data = item.data(0, ROLE_DATA)
         self._selected = {"kind": kind, "data": data} if kind else None
-        if kind in ("evidence", "mention"):
+        self.answer_row.setVisible(kind == "question")
+        if kind == "question":
+            self._fill_answers(data["review"])
+        if kind in ("evidence", "mention", "question"):
             self._preview(data["path"], data["locator"], data.get("where", ""))
         elif kind == "relation" and data.get("evidence"):
             ev = data["evidence"][0]
@@ -361,8 +437,11 @@ class ConnectionsTab(ViewHelpers, QWidget):
             f"{'▶' if hit else ' '} {g.rjust(width)} │ {t}" for g, t, hit in lines))
 
     def _enable_actions(self) -> None:
+        cur = self._kg.entity(self._current) if (self._kg and self._current) else None
+        self.merge_btn.setEnabled(bool(cur and cur["type"] != "DOCUMENT"))
+        self.split_btn.setEnabled(bool(cur and self._kg.merged_into_me(self._current)))
         sel = self._selected or {}
-        has_file = sel.get("kind") in ("evidence", "mention", "relation")
+        has_file = sel.get("kind") in ("evidence", "mention", "relation", "question")
         self.open_btn.setEnabled(bool(has_file and getattr(self, "_preview_path", None)))
         is_rel = sel.get("kind") == "relation"
         status = (sel.get("data") or {}).get("status") if is_rel else None
@@ -427,6 +506,69 @@ class ConnectionsTab(ViewHelpers, QWidget):
         if self._current:
             self.show_entity(self._current)
 
+    def refresh_models(self) -> None:
+        self.model_box.clear()
+        for m in self.actions.local_models():
+            self.model_box.addItem(m, m)
+        pis = self.actions.pi_workers()
+        self.pis_box.setEnabled(bool(pis))
+        self.pis_box.setToolTip(
+            ", ".join(f"{n} ({m})" for n, _u, m in pis) if pis else
+            "No Pi nodes to share the work: register one (Apothecary → Set up a Pi) "
+            "and enable remote nodes (COUNCIL_REMOTE_NODES=1).")
+        self.suggest_btn.setEnabled(self.model_box.count() > 0)
+
+    def on_suggest(self) -> None:
+        """Ask the chosen model (and Pis, if ticked) for links in the free
+        text. Everything it finds lands as 'suggested' for you to accept."""
+        model = self.model_box.currentData()
+        if self._busy or not model:
+            return
+        self._busy = True
+        self._stop.clear()
+        self.suggest_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+        use_pis = self.pis_box.isChecked()
+        self.status.setText(f"Reading free text with {model}…")
+        if self._kg is not None:
+            self._kg.close()
+            self._kg = None
+
+        def progress(done, total, worker):
+            self._to_ui(self.status.setText,
+                        f"Suggesting links: {done} of {total} passages (last by {worker})")
+
+        def work() -> None:
+            try:
+                stats = self.actions.suggest(model, use_pis, progress, self._stop.is_set)
+                self._to_ui(self._suggested, stats, None)
+            except Exception as exc:                      # noqa: BLE001
+                self._to_ui(self._suggested, None, exc)
+
+        threading.Thread(target=work, name="kg-suggest", daemon=True).start()
+
+    def on_stop_suggest(self) -> None:
+        self._stop.set()
+        self.status.setText("Stopping after the passages in progress — run again to continue.")
+
+    def _suggested(self, stats, exc) -> None:
+        self._busy = False
+        self.suggest_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
+        self._reopen()
+        if exc is not None:
+            self.status.setText(f"Suggesting failed: {exc}")
+            return
+        word = "Stopped" if stats["stopped"] else "Done"
+        self.status.setText(
+            f"{word}: {stats['done']} of {stats['chunks']} passages read, {stats['links']} "
+            f"link(s) suggested, {stats['rejected']} rejected by the checks"
+            + (f", {stats['errors']} unreadable answer(s)" if stats["errors"] else "")
+            + ". Suggested links wait for you (✓ Accept / ✗ Reject).")
+        self.on_search()
+        if self._current:
+            self.show_entity(self._current)
+
     def on_fields(self) -> None:
         if self._busy or self._kg is None:
             return
@@ -482,10 +624,71 @@ class ConnectionsTab(ViewHelpers, QWidget):
                  else f"'{r['surface']}' was read as {names} — right?")
             item = QTreeWidgetItem([q, r["kind"].replace("_", " "),
                                     f"{r['path']} · {r['where']}"])
-            item.setData(0, ROLE_KIND, "mention")
+            item.setData(0, ROLE_KIND, "question")
             item.setData(0, ROLE_DATA, {"path": r["path"], "locator": r["locator"],
-                                        "where": r["where"]})
+                                        "where": r["where"], "review": r})
             self.tree.addTopLevelItem(item)
+
+    # -- KG3 ---------------------------------------------------------------
+    def _fill_answers(self, review) -> None:
+        self.answer_box.clear()
+        for c in review["candidates"]:
+            if c:
+                self.answer_box.addItem(display_name(c), c["id"])
+        self.answer_box.addItem("Neither — a different person", None)
+        self.everywhere_box.setChecked(review["kind"] == "inferred_alias")
+
+    def on_answer(self) -> None:
+        sel = self._selected or {}
+        if sel.get("kind") != "question" or self._kg is None:
+            return
+        review = sel["data"]["review"]
+        eid = self.answer_box.currentData()
+        self._kg.answer_review(review["id"], eid, everywhere=self.everywhere_box.isChecked())
+        who = self.answer_box.currentText()
+        self.answer_row.setVisible(False)
+        self.status.setText(f"'{review['surface']}' is {who}"
+                            + (" everywhere" if self.everywhere_box.isChecked() else
+                               " in that document") + ". Rebuilding to apply it…")
+        self.on_rebuild()
+
+    def on_merge(self) -> None:
+        """Merge another entity INTO the one shown (two spellings, one thing)."""
+        if self._kg is None or not self._current:
+            return
+        cur = self._kg.entity(self._current)
+        text = self.ask_string("Same as…", f"Which entry is the same {cur['type'].lower()} "
+                               f"as {display_name(cur)}? Type its name:", parent=self)
+        if not text:
+            return
+        hits = [h for h in self._kg.search(text, cur["type"]) if h["id"] != self._current]
+        if len(hits) != 1:
+            self.status.setText(f"{len(hits)} entries match '{text}' — type more of the name.")
+            return
+        other = self._kg.entity(hits[0]["id"])
+        if not self.ask_yes_no("Merge?", f"Treat '{display_name(other)}' as "
+                               f"'{display_name(cur)}'? Its names and links move here; you "
+                               "can split it off again.", parent=self):
+            return
+        self._kg.merge(self._current, other["id"])
+        self.status.setText(f"'{display_name(other)}' merged into '{display_name(cur)}'.")
+        self.show_entity(self._current)
+        self.on_search()
+
+    def on_unmerge(self) -> None:
+        if self._kg is None or not self._current:
+            return
+        merged = self._kg.merged_into_me(self._current)
+        if not merged:
+            return
+        m = merged[0]
+        if not self.ask_yes_no("Split off?", f"Make '{display_name(m)}' its own entry "
+                               "again? Links from labels come back apart at the next "
+                               "rebuild.", parent=self):
+            return
+        self._kg.unmerge(m["id"])
+        self.status.setText(f"'{display_name(m)}' split off. Rebuilding…")
+        self.on_rebuild()
 
     def closeEvent(self, event) -> None:          # noqa: N802 — Qt's name
         if self._kg is not None:

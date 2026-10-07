@@ -263,3 +263,39 @@ files and a loopback SSH server. First real card: run Set up a Pi with the user 
 **Network finding.** The registered Pi "NodePrimus" (192.168.1.252) still answers Ollama
 to the whole LAN (only qwen2.5:3b installed) — the §7 lock-down was not done. The new
 "Switch to key login" action fixes it from the Council.
+
+### 8c. KG0, KG2, KG3 (2026-10-06)
+
+**KG0 benchmark** (`python -m council_core.kg_bench <models>`; 30 synthetic snippets,
+33 gold links; scored on links that survive the Council's checks; RTX 5080, Ollama,
+temperature 0, seed 7; one run each — phi4 varied between identical runs, the others
+repeated exactly):
+
+| model | P | R | F1 | part→project R | false links on no-link snippets | rejected by checks | s/snippet |
+|---|---|---|---|---|---|---|---|
+| phi4:14b | 0.91–0.93 | 0.85–0.91 | 0.89–0.91 | 0.50–0.70 | 1 | 3 | 0.7–1.3 |
+| gpt-oss:20b | 0.96 | 0.82 | 0.89 | 0.60 | 1 | 3 | 1.3 |
+| gemma3:12b | 0.90 | 0.85 | 0.88 | 0.80 | 1 | 2 | 1.0 |
+| llama3.1:8b | 0.79 | 0.82 | 0.81 | 0.70 | 5 | 7 | 0.8 |
+| llama3.2 (3B) | 0.72–0.76 | 0.70–0.76 | 0.71–0.76 | 0.50–0.60 | 4–6 | 22 | 0.4 |
+| gemma3:4b | 0.75 | 0.64 | 0.69 | 0.50 | 4 | 7 | 0.7 |
+| granite3.3:8b | 0.82 | 0.55 | 0.65 | 0.60 | 3 | 15 | 0.7 |
+| olmo2:13b | 0.84 | 0.48 | 0.62 | 0.40 | 0 | 2 | 0.7 |
+| llama3.2:1b | 0.57 | 0.48 | 0.52 | 0.30 | 3 | 109 | 0.7 |
+| granite3.3:2b | 0.64 | 0.27 | 0.38 | 0.30 | 4 | 17 | 0.4 |
+| gemma3:1b | 0.70 | 0.21 | 0.33 | 0.20 | 3 | 22 | 0.5 |
+
+Default extractor: **gemma3:12b** (tied top F1, stable, best part→project). For Pis the
+3–4 B models (llama3.2 3B, gemma3:4b) reach ~0.7 F1; 1–2 B models are not useful.
+The snippets are the desktop's own synthetic text — re-run on the user's documents
+(KG0 as planned) once there are real ones.
+
+**KG2** (`KnowledgeGraph.suggest_from_text`, Connections tab "Suggest links"): end to end
+on the Ironbridge vault with phi4:14b — 6 passages, ~20 s, 3 of 5 free-text links found
+(both part→project ones), 0 wrong links after the checks. The checks that mattered,
+all measured: a name must be in the passage near the quote (people/parts) or anywhere in
+it (projects); initials never resolve unless one person fits; reversed types turned
+round; SUPERSEDES by revision letters; quote must be in the text.
+
+**KG3** (`answer_review`, `merge`, `unmerge`; Connections tab Questions / "Same as…" /
+"Split off"): per-document or everywhere answers, kept across rebuilds and logged.
