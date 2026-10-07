@@ -250,6 +250,22 @@ _NODES: Tuple[Node, ...] = (
          "Similar earlier questions go to the Judge and the Writer. Keyword "
          "matching: no model, nothing downloaded.",
          "council_core/past_decisions.py"),
+    Node("answer_store", "Passed answers", "store",
+         "Every answer the Judge passed, whole, with a fingerprint of the "
+         "vault files it rested on (.council_memory/answers.jsonl). The same "
+         "question asked again is answered at once, if you choose and those "
+         "files are unchanged.",
+         "council_core/answer_reuse.py"),
+    Node("verdicts", "Who helps", "store",
+         "One line per question: route, depth, panel, winner, scores and how "
+         "much of each member's draft reached the answer "
+         "(.council_usage/verdicts-*.jsonl). The weekly review reads it.",
+         "council_core/verdict_log.py"),
+    Node("bench", "Benchmark", "agent",
+         "Asks a fixed set of questions through the council and measures "
+         "calls, seconds per step, model loads and right answers, to "
+         "compare before and after a change (Council Map ▸ Benchmark…).",
+         "council_core/council_bench.py"),
 )
 
 
@@ -370,6 +386,20 @@ def _edges() -> List[Edge]:
         E("answer", "council_memory", "this question, its verdict and the "
           "start of the answer", "memory", "live",
           cite="council_core/past_decisions.py (record)"),
+        E("answer", "answer_store", "a passed answer, whole, and its vault "
+          "files' fingerprints", "memory", "live",
+          cite="council_core/answer_reuse.py (record)"),
+        E("answer_store", "question", "the earlier answer to the same "
+          "question, offered before the council runs", "memory", "live",
+          cite="council_core/answer_reuse.py (find); council_qt/tabs/"
+               "council.py (_offer_reuse)"),
+        E("answer", "verdicts", "winner, scores and each member's influence",
+          "memory", "live", cite="council_core/verdict_log.py (entry)"),
+        E("verdicts", "judge", "who helps on each kind of question, as the "
+          "weekly controller", "network", "live",
+          cite="council_core/placement.py (WHO HELPS)"),
+        E("bench", "question", "a fixed question set, measured", "memory",
+          "live", cite="council_core/council_bench.py"),
     ]
 
     # -- fan-out coding ----------------------------------------------------
@@ -701,7 +731,9 @@ _NODE_ANCHORS = {"usage_log": (0.28, 0.93), "apothecary": (0.95, 0.78),
                  "vault": (0.06, 0.72),
                  "wishlist": (0.3, 0.06), "council_memory": (0.85, 0.12),
                  "role_memory": (0.6, 0.06), "docs": (0.25, 0.85),
-                 "mcp_docs": (0.08, 0.92), "tools": (0.25, 0.7)}
+                 "mcp_docs": (0.08, 0.92), "tools": (0.25, 0.7),
+                 "answer_store": (0.97, 0.2), "verdicts": (0.12, 0.97),
+                 "bench": (0.03, 0.2)}
 _RING = (0.52, 0.47, 0.17, 0.36)        # centre x, y and radii, as fractions
 
 
