@@ -298,6 +298,11 @@ class PipelineChat:
             return
         lines = [f"Saved new version: {self._rel(result.new_path)}", "",
                  "Edits applied:"] + [f"  • {line}" for line in result.log]
+        # A model-edited copy of the user's own script runs under the model
+        # rules (pipeline_editor._model_rules_warnings).
+        warnings = getattr(result, "warnings", None) or []
+        if warnings:
+            lines += ["", "Before you run it:"] + [f"  {w}" for w in warnings]
         self.say("Writer", "\n".join(lines), "final")
         self._changed()
 

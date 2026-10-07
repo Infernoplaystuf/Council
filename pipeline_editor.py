@@ -35,8 +35,9 @@ from __future__ import annotations
 
 import ast
 import json
+import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -556,6 +557,88 @@ def _new_policy_reasons(before: str, after: str) -> List[str]:
             if strip(r) not in old]
 
 
+def _literal_outputs(source: str) -> List[Tuple[int, str, str]]:
+    """(line, parameter, path) for each output path ``source`` hands a filter
+    as plain text: a keyword argument whose name says output/export (or an
+    image writer's file_name) given a string literal, or a module-level name
+    assigned one exactly once (OUT = '...'; export_file_path=OUT). A guess
+    for a report, not a check: nx_guard sees every real value at run time."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    literals: Dict[str, Optional[str]] = {}
+    for node in getattr(tree, "body", []):
+        if isinstance(node, ast.Assign):
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    v = node.value
+                    lit = v.value if isinstance(v, ast.Constant) \
+                        and isinstance(v.value, str) else None
+                    # Assigned twice: which value is used is not known.
+                    literals[t.id] = lit if t.id not in literals else None
+    found: List[Tuple[int, str, str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        writer = "Writ" in ast.unparse(node.func)
+        for kw in node.keywords:
+            name = (kw.arg or "").lower()
+            if not ("output" in name or "export" in name
+                    or (writer and name == "file_name")):
+                continue
+            v = kw.value
+            if isinstance(v, ast.Constant) and isinstance(v.value, str):
+                found.append((v.lineno, kw.arg, v.value))
+            elif isinstance(v, ast.Name) and literals.get(v.id):
+                found.append((v.lineno, kw.arg, literals[v.id]))
+    return found
+
+
+def _model_rules_warnings(before: str, before_path: Path, after: str,
+                          vault_dir: Path) -> List[str]:
+    """What the user must know before running a model-edited copy of THEIR
+    OWN script: the stamp puts the whole copy under the model-script rules
+    (nx_policy "Two kinds of script"), so what their script always did —
+    `import os`, writing to their own results folder — can be refused. []
+    when the script was the model's already (no rule changed)."""
+    import nx_policy
+    try:
+        import data_index
+        data_out = Path(data_index.output_dir(vault_dir))
+    except Exception:                                     # noqa: BLE001
+        data_out = Path(vault_dir) / "data_out"
+    if nx_policy.script_trust(before, before_path, [data_out]) \
+            == nx_policy.MODEL:
+        return []
+    out = [f"The model edited this copy, so the workflow runner holds it to "
+           f"the model-script rules, not the ones your own scripts run "
+           f"under: it may import only "
+           f"{', '.join(sorted(nx_policy.ALLOWED_IMPORT_ROOTS))}, may not "
+           f"change files itself, and each file it writes must be new and "
+           f"under {data_out}."]
+    static = nx_policy.run_reasons(after, trust=nx_policy.MODEL)
+    if static:
+        out.append("As saved, it will be refused before it runs:")
+        out.extend(f"  {r}" for r in static[:6])
+        if len(static) > 6:
+            out.append(f"  ... and {len(static) - 6} more")
+    try:
+        import path_contain
+        outside = [(ln, p, v) for ln, p, v in _literal_outputs(after)
+                   if os.path.isabs(v)
+                   and not path_contain.is_under(v, data_out)]
+    except Exception:                                     # noqa: BLE001
+        outside = []
+    if outside:
+        out.append("Run on its own, these writes are outside data_out and "
+                   "will be refused when they run:")
+        out.extend(f"  line {ln}: {p} = {v}" for ln, p, v in outside[:6])
+    out.append("Read the change; to run the copy as your own script, with "
+               "your own rules, delete its first line (the model stamp).")
+    return out
+
+
 @dataclass
 class ModifyResult:
     success: bool
@@ -565,6 +648,8 @@ class ModifyResult:
     edits: List[Dict[str, Any]]
     log: List[str]
     error: Optional[str] = None
+    # What to know before running new_path (_model_rules_warnings).
+    warnings: List[str] = field(default_factory=list)
 
 
 def modify_pipeline_by_request(
@@ -644,15 +729,17 @@ def modify_pipeline_by_request(
 
     # Saved as a MODEL script: what the model added is held to the model
     # rules when it runs (nx_policy "Two kinds of script"), not only checked
-    # for new policy reasons here.
+    # for new policy reasons here. For the user's own script that is a rule
+    # change for the WHOLE copy, so the result says what it means — "Saved
+    # new version" alone was said of copies that could never run.
     import nx_policy
-    new_path = save_modified_pipeline(
-        pipeline_path,
-        nx_policy.stamp_model_script(result.new_source, "the pipeline chat",
-                                     edited=True),
-        suffix, vault_dir,
-    )
+    stamped = nx_policy.stamp_model_script(result.new_source,
+                                           "the pipeline chat", edited=True)
+    new_path = save_modified_pipeline(pipeline_path, stamped, suffix,
+                                      vault_dir)
     return ModifyResult(
         success=True, pipeline=pipeline, source_path=pipeline_path,
         new_path=new_path, edits=edits, log=result.log,
+        warnings=_model_rules_warnings(source, pipeline_path, stamped,
+                                       vault_dir),
     )

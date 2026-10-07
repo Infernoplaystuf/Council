@@ -5733,6 +5733,12 @@ class CouncilConsole(tk.Tk):
         log_lines = [f"Saved new version: {rel}", "", "Edits applied:"]
         for line in result.log:
             log_lines.append(f"  • {line}")
+        # A model-edited copy of the user's own script runs under the model
+        # rules (pipeline_editor._model_rules_warnings).
+        warnings = getattr(result, "warnings", None) or []
+        if warnings:
+            log_lines += ["", "Before you run it:"]
+            log_lines += [f"  {w}" for w in warnings]
         self._append_transcript("Writer", "\n".join(log_lines), "final")
         # Refresh the Dream3D pipeline list if the tab is built.
         if hasattr(self, "_dream3d_refresh_pipelines"):

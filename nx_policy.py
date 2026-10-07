@@ -76,7 +76,12 @@ script_trust() says which:
 
 A model's script never gets the USER rules by being moved or renamed: the
 stamp travels with the text. Deleting the stamp line is the user taking the
-script over, which is theirs to do. (Scripts a model wrote BEFORE the stamp
+script over, which is theirs to do — and the app says so where it matters:
+every refusal of a MODEL script opens with why it got those rules and how
+to hand it back (model_rules_note), and a model "modify" of the user's own
+script says, when it saves the copy, what the rule change means for it
+(pipeline_editor._model_rules_warnings) — the copy's `import os` or its
+writes to the user's own folder are refused under the model rules. (Scripts a model wrote BEFORE the stamp
 existed carry none; the ones still in data_out are caught by the location
 rule, a generated one the user kept in pipelines/in is not.)
 """
@@ -220,6 +225,28 @@ def script_trust(code: str, path=None, app_roots: Iterable = ()) -> str:
         except Exception:                                 # noqa: BLE001
             return MODEL                # cannot tell: the stricter rules
     return USER
+
+
+def model_rules_note(code: str, path=None, app_roots: Iterable = ()) -> str:
+    """Why ``code`` gets the MODEL rules, and how the user hands it back to
+    their own — the first thing a refusal says, since a model-edited copy of
+    the user's own script was refused for what the user's script always did
+    ("import 'os' is not allowed") with nothing saying why. '' for a USER
+    script."""
+    code = code or ""
+    m = _STAMP_RE.search(code)
+    if m:
+        at = code.index("#", m.start())
+        line = code.count("\n", 0, at) + 1
+        return (f"line {line} carries the model stamp ('{MODEL_STAMP}"
+                f"{m.group(1)}'), so the model-script rules apply; if you "
+                f"have read the script and want it run as your own, delete "
+                f"that line")
+    if path is not None and script_trust(code, path, app_roots) == MODEL:
+        return ("the script is in the vault's data_out, where the app saves "
+                "what a model writes, so the model-script rules apply; to run "
+                "it as your own, read it and save a copy outside data_out")
+    return ""
 
 # uuid -> why it is refused (shown to the user; keep it plain).
 DENIED_UUIDS: Dict[str, str] = {

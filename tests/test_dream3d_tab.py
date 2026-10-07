@@ -327,6 +327,25 @@ def test_create_and_modify_report_and_signal_a_change(chat, vault):
     assert chat.changed == [1, 1]
 
 
+def test_modify_shows_what_rules_the_edited_copy_runs_under(chat):
+    """A model-edited copy of the user's own script runs under the model
+    rules; the reply says so instead of only "Saved new version"."""
+    class Editor:
+        def modify_pipeline_by_request(self, path, req, v):
+            return SimpleNamespace(
+                success=True, error="", log=["set x"],
+                new_path=Path(v) / "pipelines" / "o.py",
+                warnings=["The model edited this copy, so it runs under the "
+                          "model-script rules.",
+                          "line 3: import 'os' is not allowed"])
+
+    chat._editor = Editor()
+    reply = run(chat, "modify pipeline seg to use 4 threads")[1]
+    assert "Saved new version" in reply and "Edits applied" in reply
+    assert "Before you run it" in reply
+    assert "model-script rules" in reply and "import 'os'" in reply
+
+
 def test_the_cube_asset_is_found_in_a_source_run():
     """Tk looked under the STATE root and never found it."""
     html = dream3d.transformation_cube()

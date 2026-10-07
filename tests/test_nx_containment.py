@@ -966,12 +966,48 @@ def test_a_script_in_data_out_gets_the_model_rules(tmp_path, monkeypatch):
     res = wr.run_linear([p], vault_dir=vault)
     assert not res.success
     assert "refused, nothing was run" in res.step_results[0].error
+    # It says which rule made it a model script.
+    assert "data_out" in res.step_results[0].error.split(": line")[0]
     # The same script of the user's own: their call. It gets as far as the
     # launch (the stub above), where the model's copy was refused.
     mine = tmp_path / "mine.py"
     mine.write_text("import os\nos.remove('x')\n", encoding="utf-8")
     res = wr.run_linear([mine], vault_dir=vault)
     assert "nothing should have been launched" in res.step_results[0].error
+
+
+def test_a_refusal_says_why_the_model_rules_apply(tmp_path, monkeypatch):
+    """A model-edited copy of the user's own script was refused with only
+    "import 'os' is not allowed" — nothing said it was being held to the
+    model rules, or that deleting the stamp hands it back to the user."""
+    def never(*_a, **_k):
+        raise AssertionError("nothing should have been launched")
+    monkeypatch.setattr(wr.subprocess, "run", never)
+    vault = tmp_path / "vault"
+    (vault / "data_out").mkdir(parents=True)
+    p = tmp_path / "pipelines" / "in" / "mine_five.py"
+    p.parent.mkdir(parents=True)
+    p.write_text(nx_policy.stamp_model_script(
+        "import os\nprint(os.getcwd())\n", "the pipeline chat", edited=True),
+        encoding="utf-8")
+    res = wr.run_linear([p], vault_dir=vault)
+    err = res.step_results[0].error
+    assert err.startswith("refused, nothing was run (")
+    head = err.split("): ")[0]
+    assert "line 1 carries the model stamp" in head
+    assert "model-edited" in head and "delete that line" in head
+    assert "import 'os' is not allowed" in err
+    # The workflow's own error carries it too.
+    assert "model stamp" in res.error
+    # A stamp under a line the user added is found where it is.
+    p.write_text("# my notes\n\n" + p.read_text(encoding="utf-8"),
+                 encoding="utf-8")
+    err = wr.run_linear([p], vault_dir=vault).step_results[0].error
+    assert "line 3 carries the model stamp" in err
+    # Deleting the stamp is the user taking the script over: their rules.
+    p.write_text("import os\nprint(os.getcwd())\n", encoding="utf-8")
+    err = wr.run_linear([p], vault_dir=vault).step_results[0].error
+    assert "nothing should have been launched" in err
 
 
 @needs_nx
@@ -992,6 +1028,9 @@ def test_the_runner_fails_a_model_script_that_writes_to_the_vault_root(
     assert not res.success
     err = res.step_results[0].error
     assert "refused at run time" in err and "notes.txt" in err
+    # ...and it says why a script got the model rules, and how the user
+    # takes it over.
+    assert "model stamp" in err and "delete that line" in err
     assert target.read_text(encoding="utf-8") == "mine"
     # Nothing written; the run's empty working folders were dropped.
     assert not [p for p in (vault / "data_out").rglob("*") if p.is_file()]
@@ -1157,6 +1196,110 @@ def test_each_step_is_handed_its_containment(tmp_path, monkeypatch):
     assert any(path_contain.is_under(inp, r) for r in c.read_only)
     assert all(path_contain.is_under(o, vault / "data_out")
                for o in res.outputs)
+
+
+# ============================================================
+# 4b. A model's edit of the user's own script
+# ============================================================
+
+_USER_SCRIPT = (
+    "import simplnx as nx\n{extra}"
+    "OUT = {out!r}\n"
+    "ds = nx.DataStructure()\n"
+    "r = nx.CreateDataArrayFilter.execute(data_structure=ds, "
+    "output_array_path=nx.DataPath('A'), tuple_dimensions=[[3]], "
+    "component_count=1)\n"
+    "assert not r.errors, r.errors\n"
+    "r = nx.WriteDREAM3DFilter.execute(data_structure=ds, "
+    "export_file_path=OUT, write_xdmf_file=False)\n"
+    "assert not r.errors, r.errors\n")
+
+
+def _modify(vault: Path, user: Path, monkeypatch):
+    import pipeline_editor as pe
+    monkeypatch.setattr(pe, "request_edits_from_model",
+                        lambda *a, **k: {"suffix": "five", "edits": [
+                            {"op": "replace_text",
+                             "old": "tuple_dimensions=[[3]]",
+                             "new": "tuple_dimensions=[[5]]"}]})
+    return pe.modify_pipeline_by_request(user, "make the array 5 long",
+                                         vault)
+
+
+def _user_vault(tmp_path: Path, extra: str = ""):
+    vault = tmp_path / "vault"
+    (vault / "data_out").mkdir(parents=True)
+    results = tmp_path / "my_results"
+    results.mkdir()
+    user = vault / "pipelines" / "in" / "user_script.py"
+    user.parent.mkdir(parents=True)
+    user.write_text(_USER_SCRIPT.format(
+        extra=extra, out=str(results / "x.dream3d")), encoding="utf-8")
+    return vault, results, user
+
+
+def test_a_model_edit_of_a_users_script_says_what_rules_its_copy_runs_under(
+        tmp_path, monkeypatch):
+    """modify reported "Saved new version" for a copy that could never run:
+    the stamp puts the whole copy under the model rules, which refuse the
+    user's own `import os` before the run and their own output folder at
+    run time. Now the result says so, with the lines, and how to take the
+    copy over."""
+    vault, results, user = _user_vault(tmp_path, extra="import os\n")
+    m = _modify(vault, user, monkeypatch)
+    assert m.success, m.error
+    text = "\n".join(m.warnings)
+    assert "model-script rules" in text
+    assert "import 'os' is not allowed" in text          # refused statically
+    assert str(results / "x.dream3d") in text            # and at run time
+    assert "outside" in text and "data_out" in text
+    assert "delete its first line" in text
+    # The copy is still what the runner will see as model-edited.
+    assert nx_policy.script_trust(m.new_path.read_text(encoding="utf-8")) \
+        == nx_policy.MODEL
+
+
+def test_a_model_edit_that_runs_as_saved_says_only_what_changed(
+        tmp_path, monkeypatch):
+    """A user script that writes under data_out and imports nothing the
+    model rules refuse: no 'will be refused' lines, only the rule change."""
+    vault, _results, user = _user_vault(tmp_path)
+    user.write_text(user.read_text(encoding="utf-8").replace(
+        repr(str(tmp_path / "my_results" / "x.dream3d")),
+        repr(str(vault / "data_out" / "x.dream3d"))), encoding="utf-8")
+    m = _modify(vault, user, monkeypatch)
+    assert m.success, m.error
+    text = "\n".join(m.warnings)
+    assert "model-script rules" in text
+    assert "refused" not in text
+    # A script that already was the model's gets no news.
+    stamped = user.with_name("model_written.py")
+    stamped.write_text(nx_policy.stamp_model_script(
+        user.read_text(encoding="utf-8"), "a test"), encoding="utf-8")
+    m = _modify(vault, stamped, monkeypatch)
+    assert m.success and m.warnings == []
+
+
+@needs_nx
+def test_a_model_edited_copy_runs_once_the_user_takes_it_over(
+        tmp_path, monkeypatch):
+    """End to end: the copy is refused, with the reason; with its stamp
+    line deleted it runs as the user's own and writes where they said."""
+    vault, results, user = _user_vault(tmp_path)
+    assert wr.run_linear([user], vault_dir=vault).success
+    (results / "x.dream3d").unlink()
+    m = _modify(vault, user, monkeypatch)
+    res = wr.run_linear([m.new_path], vault_dir=vault)
+    assert not res.success
+    err = res.step_results[0].error
+    assert "refused at run time" in err and "model stamp" in err
+    assert not (results / "x.dream3d").exists()
+    lines = m.new_path.read_text(encoding="utf-8").split("\n")
+    assert lines[0].startswith(nx_policy.MODEL_STAMP)
+    m.new_path.write_text("\n".join(lines[1:]), encoding="utf-8")
+    res = wr.run_linear([m.new_path], vault_dir=vault)
+    assert res.success, res.summary()
+    assert (results / "x.dream3d").is_file()
 
 
 # ============================================================

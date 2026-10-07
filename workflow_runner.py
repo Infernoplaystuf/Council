@@ -217,7 +217,10 @@ class Containment:
       app_roots    a script that lives here was written by the app, so it
                    is a MODEL script whatever its first line says (data_out);
       search_dirs  where a USER script's relative Pipeline.from_file path is
-                   looked for before the run (its original folder).
+                   looked for before the run (its original folder);
+      origin       the script the user picked, when what runs is a staged
+                   copy of it in a temp folder: a refusal says why the MODEL
+                   rules apply from where the ORIGINAL lives.
     """
     trust: Optional[str] = None
     write_roots: List[Path] = field(default_factory=list)
@@ -226,10 +229,14 @@ class Containment:
     read_only: List[Path] = field(default_factory=list)
     app_roots: List[Path] = field(default_factory=list)
     search_dirs: List[Path] = field(default_factory=list)
+    origin: Optional[Path] = None
 
 
-def _refusal_text(head: str, reasons: List[str]) -> str:
-    return (head + "; ".join(reasons[:3])
+def _refusal_text(head: str, reasons: List[str], note: str = "") -> str:
+    """"<head> (<note>): <reasons>" — the note (nx_policy.model_rules_note)
+    first, so a MODEL script's refusal opens with why it got those rules and
+    how the user hands it back to theirs."""
+    return (head + (f" ({note}): " if note else ": ") + "; ".join(reasons[:3])
             + (f" (+{len(reasons) - 3} more)" if len(reasons) > 3 else ""))
 
 
@@ -280,9 +287,12 @@ def _run_pipeline_subprocess(
         source, pipeline_path, contain.app_roots)
     search = list(contain.search_dirs) + [pipeline_path.parent] + (
         [Path(cwd)] if cwd else [])
+    note = nx_policy.model_rules_note(
+        source, contain.origin or pipeline_path, contain.app_roots) \
+        if trust == nx_policy.MODEL else ""
     refused = nx_policy.run_reasons(source, trust=trust, search_dirs=search)
     if refused:
-        base.error = _refusal_text("refused, nothing was run: ", refused)
+        base.error = _refusal_text("refused, nothing was run", refused, note)
         base.duration_s = time.monotonic() - start
         return base
     python, why = interpreter_for(source)
@@ -348,7 +358,8 @@ def _run_pipeline_subprocess(
             refusals, done = nx_guard.read_report(report)
             if refusals:
                 base.success = False
-                base.error = _refusal_text("refused at run time: ", refusals)
+                base.error = _refusal_text("refused at run time", refusals,
+                                           note)
             elif model and base.success and not done:
                 # The guard writes its last line as the script ends; a
                 # script that ended the interpreter under it is not vouched
@@ -436,7 +447,8 @@ def _containment(trust: str, *, vault_dir: Optional[Path], out_root: Path,
                  stage_dir: Optional[Path], own: List[Path],
                  input_dir: Optional[Path] = None,
                  own_files: Optional[List[Path]] = None,
-                 search_dirs: Optional[List[Path]] = None) -> Containment:
+                 search_dirs: Optional[List[Path]] = None,
+                 origin: Optional[Path] = None) -> Containment:
     """The Containment for one step of this run (see Containment)."""
     data_out, data_in = _vault_areas(vault_dir)
     roots = [data_out] if data_out is not None else [out_root]
@@ -447,7 +459,7 @@ def _containment(trust: str, *, vault_dir: Optional[Path], out_root: Path,
         own_files=list(own_files or []),
         read_only=[p for p in (input_dir, data_in) if p is not None],
         app_roots=[data_out] if data_out is not None else [],
-        search_dirs=list(search_dirs or []))
+        search_dirs=list(search_dirs or []), origin=origin)
 
 
 def _trust(pl: Path, vault_dir: Optional[Path]) -> str:
@@ -523,7 +535,8 @@ def run_linear(
                 contain = _containment(
                     trust, vault_dir=vault_dir, out_root=out_root,
                     stage_dir=None,
-                    own=[work] + ([out_root] if out_fresh else []))
+                    own=[work] + ([out_root] if out_fresh else []),
+                    origin=p)
                 step = _run_pipeline_subprocess(p, timeout_s=timeout_s,
                                                 cwd=work, contain=contain)
                 if step.success:
@@ -1102,7 +1115,7 @@ def run_chained(
             stage_dir=stage_dir, input_dir=input_dir,
             own=[stage_dir, work] + ([out_root] if out_fresh else []),
             own_files=[p for p in [out_path] + st.side_outputs if p],
-            search_dirs=[pl.parent])
+            search_dirs=[pl.parent], origin=pl)
         step = _run_pipeline_subprocess(st.path, timeout_s=timeout_s,
                                         cwd=work, contain=contain)
         step.step_index = idx
@@ -1346,7 +1359,7 @@ def _run_directory_mode(pipelines, input_dir, *, by_file: bool, pattern,
             trusts[pl], vault_dir=vault_dir, out_root=out_root,
             stage_dir=stage_dir, input_dir=input_dir,
             own=[stage_dir, work] + ([out_root] if out_fresh else []),
-            own_files=own_files, search_dirs=[pl.parent])
+            own_files=own_files, search_dirs=[pl.parent], origin=pl)
 
     if by_file:
         pairs = [(p, f) for f in inputs for p in pipelines]
