@@ -1235,6 +1235,8 @@ class PresetsMixin:
         box = QGroupBox(title if title or compact else
                         "Presets — settings + area, kept in this project",
                         parent)
+        #: The main window's Presets tab: a 400 px column, not a window.
+        self._presets_compact = bool(compact)
         layout = QVBoxLayout(box)
         self.preset_list = QListWidget(box)
         self.preset_list.setSelectionMode(
@@ -1340,8 +1342,18 @@ class PresetsMixin:
             self.preset_list.blockSignals(False)
         where = listed.get("file") or ""
         said = listed.get("summary") or ""
-        self.presets_file.setText(f"{said} Kept in {where}" if where
-                                  else said)
+        if where and getattr(self, "_presets_compact", False):
+            # A PATH CANNOT WRAP. In the tab, the whole path was the widest
+            # thing on the page (507 px of a 401 px column, measured): the
+            # page was laid out wider than the tab and Delete and Save as
+            # were cut off at its edge. The name here, the path in the tip.
+            self.presets_file.setText(
+                f"{said} Kept in {os.path.basename(str(where))}, in this "
+                f"app's project folder.")
+            self.presets_file.setToolTip(str(where))
+        else:
+            self.presets_file.setText(f"{said} Kept in {where}" if where
+                                      else said)
         self.apply_state()
 
     def selected_preset(self) -> str:
@@ -1425,7 +1437,11 @@ class PresetsMixin:
             return
         if self._confirm_delete != name:
             self._confirm_delete = name
-            self.preset_delete.setText(f"Delete {name!r}? Click again")
+            # The tab's row is narrow: the name is in the list, selected.
+            self.preset_delete.setText(
+                "Sure? Click again" if getattr(self, "_presets_compact",
+                                               False)
+                else f"Delete {name!r}? Click again")
             self._confirm_timer.start()
             return
         self._cancel_delete()

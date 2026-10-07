@@ -411,7 +411,7 @@ def test_the_tabs_fit_the_smallest_window_and_the_design_size(
     code = (
         "import json, sys, time\n"
         f"sys.path[:0] = [{str(typhon_dir)!r}, {str(ROOT)!r}]\n"
-        "from PySide6.QtWidgets import QApplication\n"
+        "from PySide6.QtWidgets import QApplication, QScrollArea\n"
         "app = QApplication([])\n"
         "import app as generated, frame_camera\n"
         "from tests import fake_evk4\n"
@@ -433,9 +433,19 @@ def test_the_tabs_fit_the_smallest_window_and_the_design_size(
         "        bar = book.tabBar()\n"
         "        need = sum(bar.tabSizeHint(i).width()\n"
         "                   for i in range(bar.count()))\n"
+        "        wide = []\n"
+        "        tabs = ui._settings_tabs\n"
+        "        for page in list(tabs.pages.values()) + [tabs.presets_page]:\n"
+        "            book.setCurrentWidget(page); ui.grab()\n"
+        "            area = page.findChild(QScrollArea)\n"
+        "            least = area.widget().minimumSizeHint().width()\n"
+        "            if least > area.viewport().width():\n"
+        "                wide.append([page.property('council_tab'), least,\n"
+        "                             area.viewport().width()])\n"
+        "        book.setCurrentIndex(0); ui.grab()\n"
         "        out.append([which, w, h, need, book.width(),\n"
         "                    book.currentWidget().height(),\n"
-        "                    bar.font().family()])\n"
+        "                    bar.font().family(), wide])\n"
         "    ui.on_btn_disconnect()\n"
         "print(json.dumps(out))\n"
         "frame_camera.disconnect()\n")
@@ -447,11 +457,15 @@ def test_the_tabs_fit_the_smallest_window_and_the_design_size(
                           env=env, capture_output=True, text=True,
                           timeout=180)
     assert done.returncode == 0, done.stderr[-2000:]
-    for which, w, h, need, width, page, family in json.loads(
+    for which, w, h, need, width, page, family, wide in json.loads(
             done.stdout.strip().splitlines()[-1]):
         assert family == "Arial", family
         assert need <= width, f"{which} at {w}x{h}: {need} px of tabs in {width}"
         assert page >= 150, f"{which} at {w}x{h}: a page of {page} px"
+        # Nothing on a page is wider than the page: it scrolls down, never
+        # sideways (it has no sideways scroll bar — what is wider is cut
+        # off; the presets file's whole path cut off Delete and Save as).
+        assert wide == [], f"{which} at {w}x{h}: wider than the tab {wide}"
 
 
 # ======================================================================
