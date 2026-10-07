@@ -52,6 +52,8 @@ PROTECTED_SUBDIRS: tuple = (
     # The model-call meter (council_core.usage_log) and the weekly placement
     # reviews (council_core.placement): the app's bookkeeping, not documents.
     ".council_usage",
+    # How the council decided earlier questions (council_core.past_decisions).
+    ".council_memory",
 )
 
 # Lowercased once at import for the per-path membership test in

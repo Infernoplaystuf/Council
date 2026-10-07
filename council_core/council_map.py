@@ -187,8 +187,11 @@ _NODES: Tuple[Node, ...] = (
          "the vault's data files. Not part of the turn today.",
          "vault_analyst.py"),
     Node("task_memo", "Task memo", "agent",
-         "Condenses a question into a short [TASK MEMO] note. Not part of "
-         "the turn today.", "task_memory.py:363, 459"),
+         "Before each question, condenses it into a short [TASK MEMO] — the "
+         "goal, constraints and what to avoid — carrying the constraints "
+         "forward when the question follows up the last one. Every member "
+         "gets it for that question.",
+         "task_memory.py; council_qt/tabs/council.py (task_memo)"),
     Node("vault", "Vault", "supplier", "Your documents and data files.",
          "council_core/paths.py"),
     Node("vault_rag", "Vault RAG", "supplier",
@@ -235,9 +238,12 @@ _NODES: Tuple[Node, ...] = (
          "set up in Machines & roles — then the parts are combined, tested, "
          "fixed, reviewed, and written as a patch for you to apply.",
          "council_core/fanout.py; council_qt/tabs/fanout.py"),
-    Node("council_memory", "Past deliberations", "store",
-         "council_memory (record and retrieve past deliberations). Only "
-         "safe_agent uses it.", "council_memory.py; safe_agent.py"),
+    Node("council_memory", "Past decisions", "store",
+         "Every deliberated question, its verdict and the start of its "
+         "answer, across sessions (.council_memory/decisions.jsonl). "
+         "Similar earlier questions go to the Judge and the Writer. Keyword "
+         "matching: no model, nothing downloaded.",
+         "council_core/past_decisions.py"),
 )
 
 
@@ -300,11 +306,11 @@ def _edges() -> List[Edge]:
           cite="vault_analyst.py"),
         E("analyst", "question", "[ANALYST RESULT]: computed figures",
           "context", note="See question → analyst.", cite="vault_analyst.py"),
-        E("question", "task_memo", "the question", "context",
-          note="A follow-up question loses what the conversation was "
-               "about; the memo would carry it.", cite="task_memory.py:363"),
-        E("task_memo", "question", "[TASK MEMO]", "context",
-          note="See question → task memo.", cite="task_memory.py:459"),
+        E("question", "task_memo", "the question", "context", "live",
+          cite="council_qt/tabs/council.py (task_memo); task_memory.py"),
+        E("task_memo", "question", "[TASK MEMO]: goal, constraints, what "
+          "to avoid — to every member", "context", "live",
+          cite="council_core/vault_context.py (applied)"),
         E("librarian", "judge", "evidence from the vault, to check claims "
           "against — when ranking and critiquing only", "context", "live",
           cite="council_core/vault_context.py (evidence); "
@@ -345,14 +351,14 @@ def _edges() -> List[Edge]:
           "facts (after the answer, in the background)", "memory", "live",
           cite="council_core/after_turn.py (learn); council_engine.py "
                "(update_role_memory_after_pass)"),
-        E("council_memory", "judge", "how similar questions were decided",
-          "memory",
-          note="Past deliberations are recorded nowhere the council reads; "
-               "only safe_agent uses council_memory.",
-          cite="council_memory.py; safe_agent.py"),
-        E("answer", "council_memory", "this turn's verdict, for next time",
-          "memory", note="Nothing records a deliberation for retrieval.",
-          cite="council_memory.py"),
+        E("council_memory", "judge", "how similar questions were decided, "
+          "when ranking and critiquing", "memory", "live",
+          cite="council_core/past_decisions.py (recall, block)"),
+        E("council_memory", "writer", "how similar questions were decided",
+          "memory", "live", cite="council_core/past_decisions.py"),
+        E("answer", "council_memory", "this question, its verdict and the "
+          "start of the answer", "memory", "live",
+          cite="council_core/past_decisions.py (record)"),
     ]
 
     # -- fan-out coding ----------------------------------------------------
@@ -930,15 +936,13 @@ GUIDE: Tuple[GuideStep, ...] = (
         "council_qt/tabs/fanout.py"),
     GuideStep(
         "What is not connected yet",
-        "The green dashed lines are the map's suggestions: past debates "
-        "being remembered, the Docs role helping the Coder, the Analyst "
-        "computing figures from your data files, evidence for the Skeptic. "
-        "A red "
+        "The green dashed lines are the map's suggestions: the Docs role "
+        "helping the Coder, the Analyst computing figures from your data "
+        "files, evidence for the Skeptic and the Intern. A red "
         "line, if any, is wired but never takes effect.\n\n"
         "Press 'What's missing' for the full list with the reason for each, "
         "or tick 'Only what is not live' to see just those lines.",
-        ("council_memory", "docs", "coder", "analyst", "task_memo",
-         "skeptic", "librarian"),
+        ("docs", "coder", "analyst", "skeptic", "intern", "librarian"),
         "council_core/council_map.py (the table of links)"),
 )
 

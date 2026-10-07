@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import threading
 from pathlib import Path
-from typing import Callable, List, Optional
+from typing import Any, Callable, List, Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeySequence, QShortcut
@@ -105,6 +105,16 @@ class CouncilActions:
         self._models = None
         self._models_problem = ""
         self._tools = None
+        #: One conversation per app run, so the Sessions tab can tell runs
+        #: apart and each run's history starts clean.
+        import time as _time
+        self.session_id = "qt-" + _time.strftime("%Y%m%d-%H%M%S")
+        #: The [TASK MEMO] carried from question to question (task_memory).
+        import task_memory as _task_memory
+        self.task_memory = _task_memory.TaskMemory()
+        #: The condenser's model call, or None for the keyword rules only.
+        #: "engine" means council_engine.local_chat on a fast role.
+        self.memo_llm: Any = "engine"
 
     # -- implemented -----------------------------------------------------
     def specialists(self):
@@ -156,7 +166,8 @@ class CouncilActions:
 
         if self._models is None and not self._models_problem:
             self._models, self._models_problem = (
-                council_turn.load_personalities(self.vault_dir))
+                council_turn.load_personalities(
+                    self.vault_dir, session_id=self.session_id))
         return self._models, self._models_problem
 
     def tools(self):
@@ -216,25 +227,82 @@ class CouncilActions:
             on_event(AgentEvent("Librarian", "observation",
                                 f"Sage: {n} item(s) from its knowledge base."))
 
-        with vault_context.applied(vault_context.turn_models(models), block), \
-                vault_context.applied([sage] if sage_kb else [], sage_kb):
-            if not getattr(options, "deliberate", True):
-                # The fast path: one personality, no panel, no verdict. It is
-                # a real answer and it is NOT a deliberation, so it produces
-                # no verdict id — which keeps the verdict bar honest (A3).
-                return self._direct(typed_text, models, on_event=on_event)
+        # The [TASK MEMO]: the goal and constraints, carried forward when
+        # this is a follow-up, at the top of every member's context.
+        memo = self.task_memo(typed_text)
+        if memo and on_event is not None:
+            from council_core.deliberation import AgentEvent
+            on_event(AgentEvent("Task memo", "observation",
+                                self.task_memory.render_transcript_line()))
 
-            enable_tools = bool(getattr(options, "tools", False))
-            return council_turn.run_turn(
-                typed_text, models,
-                enable_tools=enable_tools,
-                tools=self.tools() if enable_tools else None,
-                parallel_members=bool(getattr(options, "parallel", False)),
-                extra_ctx=({"judge_evidence": judge_evidence}
-                           if judge_evidence else None),
-                on_event=on_event,
-                on_token=on_token if getattr(options, "stream", True)
-                else None)
+        # How similar questions were decided before (past_decisions): for
+        # the Judge with the evidence, and for the Writer.
+        from council_core import past_decisions
+        past = past_decisions.recall(self.vault_dir, typed_text)
+        past_block = past_decisions.block(past)
+        if past and on_event is not None:
+            from council_core.deliberation import AgentEvent
+            on_event(AgentEvent("Librarian", "observation",
+                                past_decisions.note(past)))
+        if past_block:
+            judge_evidence = "\n\n".join(
+                x for x in (judge_evidence, past_block) if x)
+        writer = getattr(models, "writer", None)
+
+        turn_models = vault_context.turn_models(models)
+        with vault_context.applied(turn_models, memo), \
+                vault_context.applied(turn_models, block), \
+                vault_context.applied([sage] if sage_kb else [], sage_kb), \
+                vault_context.applied([writer] if past_block else [],
+                                      past_block):
+            result = self._answer(typed_text, models, options, judge_evidence,
+                                  on_event=on_event, on_token=on_token)
+        # Before the next question can start: this exchange is history, and
+        # a deliberated one is a decision to remember.
+        if getattr(result, "ok", False):
+            from council_core import after_turn
+            after_turn.record_exchange(models, typed_text, result.answer)
+            if getattr(result, "critique", ""):
+                past_decisions.record(self.vault_dir, typed_text,
+                                      result.answer, result.verdict,
+                                      result.panel)
+        return result
+
+    def task_memo(self, question: str) -> str:
+        """Update the task memo from this question; its prompt block."""
+        llm = self.memo_llm
+        if llm == "engine":
+            def llm(prompt: str) -> str:
+                import council_engine
+                return council_engine.local_chat(
+                    [{"role": "user", "content": prompt}], role="intern",
+                    num_predict=200, temperature=0.0, timeout=60)
+        try:
+            self.task_memory.update(question, llm)
+            return self.task_memory.render_injection_block()
+        except Exception:                                 # noqa: BLE001
+            return ""
+
+    def _answer(self, typed_text, models, options, judge_evidence, *,
+                on_event=None, on_token=None):
+        """The answer itself: one personality, or the council."""
+        from council_core import council_turn
+        if not getattr(options, "deliberate", True):
+            # The fast path: one personality, no panel, no verdict. It is a
+            # real answer and it is NOT a deliberation, so it produces no
+            # verdict id — which keeps the verdict bar honest (A3).
+            return self._direct(typed_text, models, on_event=on_event)
+
+        enable_tools = bool(getattr(options, "tools", False))
+        return council_turn.run_turn(
+            typed_text, models,
+            enable_tools=enable_tools,
+            tools=self.tools() if enable_tools else None,
+            parallel_members=bool(getattr(options, "parallel", False)),
+            extra_ctx=({"judge_evidence": judge_evidence}
+                       if judge_evidence else None),
+            on_event=on_event,
+            on_token=on_token if getattr(options, "stream", True) else None)
 
     def vault_brief(self, question: str):
         """The VAULT CONTEXT for a question (blocking: a search)."""

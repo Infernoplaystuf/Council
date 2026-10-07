@@ -90,6 +90,31 @@ def log_gaps(vault_dir: Path, gaps: Sequence[Dict[str, Any]],
     return n
 
 
+def record_exchange(models: Any, question: str, answer: str) -> bool:
+    """Append the question and the council's answer to the conversation
+    store the personalities read their history from (writer.
+    conversation_store, under its session id). Cheap — a file append, no
+    model — so the caller does it before the next question can start, and
+    the next question's members see this one. The Qt turn never wrote it:
+    every question started from nothing and the Sessions tab never saw a Qt
+    conversation. Returns whether it was written."""
+    if not (question or "").strip() or not (answer or "").strip():
+        return False
+    writer = getattr(models, "writer", None)
+    store = getattr(writer, "conversation_store", None)
+    session = getattr(writer, "session_id", None)
+    if store is None or not session:
+        return False
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        store.append(session, {"ts": now, "who": "User", "text": question})
+        store.append(session, {"ts": now, "who": "Council", "text": answer})
+        return True
+    except Exception:                                     # noqa: BLE001
+        return False
+
+
 def log_sage_gap(result: Any, vault_dir: Path, knowledge: Any = None) -> str:
     """If the Sage's answer says it lacks something ("GAP: …", "I don't
     know…" — sage_agent.detect_gap), log it to the Sage's own gaps
@@ -186,5 +211,6 @@ def _question(result: Any) -> str:
     return str(getattr(result, "question", "") or "")
 
 
-__all__ = ["learn", "log_gaps", "log_sage_gap", "memory_enabled", "Learned",
+__all__ = ["learn", "log_gaps", "log_sage_gap", "record_exchange",
+           "memory_enabled", "Learned",
            "OBSERVER_ORDER"]
