@@ -232,9 +232,7 @@ def _schedule_onboarding(window, vault, decided) -> None:
                 # is unhappy has turned a nudge into a wall.
                 print(f"[startup] onboarding failed: {exc!r}", flush=True)
             return
-        message = (f"Setup needed — {decided.onboarding_reason}. "
-                   f"Set a model in the Models tab. "
-                   f"(The guided wizard is Tk-only for now.)")
+        message = startup.setup_notice(decided.onboarding_reason)
         print(f"[startup] {message}", flush=True)
         try:
             window.set_status(message)

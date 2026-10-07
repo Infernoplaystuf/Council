@@ -246,6 +246,51 @@ def test_a_configured_vault_says_nothing(qapp, no_model, monkeypatch,
         window.request_close()
 
 
+def test_an_ollama_that_is_not_running_is_told_to_start(qapp, no_model,
+                                                        monkeypatch):
+    """Found re-checking the review's fix: with the Ollama fallback on and
+    nothing listening, the status bar read "… is Ollama running?. Set a
+    model in the Models tab." — a doubled stop after the question, and only
+    the advice for a missing model, when the model is named and the server
+    is what is missing."""
+    import socket
+
+    from council_qt.window import CouncilWindow
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        host = f"http://127.0.0.1:{sock.getsockname()[1]}"
+    monkeypatch.setenv("COUNCIL_OLLAMA_HOST", host)
+    monkeypatch.setenv("COUNCIL_OLLAMA_FALLBACK", "1")
+    monkeypatch.setenv("COUNCIL_OLLAMA_MODEL", "llama3.1:8b")
+    no_model.mkdir(parents=True, exist_ok=True)
+    app, window, plan = build(window_factory=CouncilWindow)
+    try:
+        assert plan.onboarding
+        assert _pump_until(app, lambda: bool(_status_of(window)))
+        said = _status_of(window)
+        assert "?." not in said, said
+        assert f"no Ollama server answers at {host}" in said, said
+        assert "Start Ollama, or set a model in the Models tab." in said, said
+    finally:
+        window.request_close()
+
+
+@pytest.mark.parametrize("reason, sentence", [
+    ("no model is configured yet", "no model is configured yet."),
+    ("the model file C:\\m\\x.gguf is not on disk.",
+     "the model file C:\\m\\x.gguf is not on disk."),
+    ("", "no model is configured yet."),
+])
+def test_the_notice_ends_each_reason_once(reason, sentence):
+    """A reason gets one full stop, never a second; and one that is not
+    about a server gets the Models-tab advice alone."""
+    said = startup.setup_notice(reason)
+    assert said.startswith(f"Setup needed — {sentence} "), said
+    assert ".." not in said and "?." not in said, said
+    assert "Set a model in the Models tab." in said, said
+    assert "Start Ollama" not in said, said
+
+
 def test_a_host_with_a_wizard_gets_to_use_it(qapp, no_model):
     """The seam for the moment a Qt wizard exists: give the window an
     `open_onboarding` and it is called instead of the notice."""

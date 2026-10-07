@@ -56,6 +56,11 @@ from typing import List, Optional, Sequence, Tuple
 #: council_engine._OFF_VALUES — what switches the Ollama fallback off.
 _OFF_VALUES = ("0", "false", "no", "off")
 
+#: How a reason says the server, not the model, is what is missing.
+#: startup.setup_notice looks for it to give the right advice — start Ollama
+#: — instead of only "set a model".
+OLLAMA_NOT_RUNNING = "is Ollama running?"
+
 
 @dataclass
 class Readiness:
@@ -212,8 +217,8 @@ class _Ollama:
         return self._tags
 
     def _down(self, what: str) -> str:
-        return (f"no Ollama server answers at {self.host}{what} — is Ollama "
-                "running?")
+        return (f"no Ollama server answers at {self.host}{what} — "
+                f"{OLLAMA_NOT_RUNNING}")
 
     def has(self, name: str, problems: List[str], *, why: str = "") -> str:
         from . import local_models

@@ -151,6 +151,28 @@ def onboarding_needed(vault_dir: Any) -> tuple:
     return True, ready.reason or "no model is configured yet"
 
 
+def setup_notice(reason: str) -> str:
+    """The "Setup needed" line the Qt launch shows, from onboarding_needed's
+    reason — composed here so its wording is tested without a window.
+
+    One stop per sentence, and advice that fits the reason. Found re-checking
+    the review's fix: a reason that ends in its own question (model_ready's
+    "no Ollama server answers at … — is Ollama running?") came out as
+    "running?. Set a model in the Models tab." — a doubled stop, and only the
+    advice for a missing model when the model is named and the server is what
+    is missing.
+    """
+    from . import model_ready
+    sentence = (reason or "").strip() or "no model is configured yet"
+    if not sentence.endswith((".", "?", "!")):
+        sentence += "."
+    advice = ("Start Ollama, or set a model in the Models tab."
+              if model_ready.OLLAMA_NOT_RUNNING in sentence
+              else "Set a model in the Models tab.")
+    return (f"Setup needed — {sentence} {advice} "
+            f"(The guided wizard is Tk-only for now.)")
+
+
 class Reveal:
     """Show the window once, however many times it is asked.
 
