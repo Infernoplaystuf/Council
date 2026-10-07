@@ -180,9 +180,12 @@ def _norm_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip().lower()
 
 
-def find_quote(text: str, quote: str) -> Optional[int]:
-    """1-based line where ``quote`` starts (whitespace/case-insensitive, may
-    span lines), or None when the text does not contain it."""
+def find_quote_span(text: str, quote: str) -> Optional[Tuple[int, int]]:
+    """(first line, last line), 1-based, of ``quote`` in ``text``
+    (whitespace/case-insensitive, may span lines), or None when the text
+    does not contain it. The LAST line matters as much as the first: a
+    quote hard-wrapped over four or more lines (PDF page text has short
+    lines) names its people at its end."""
     q = _norm_ws(quote).strip(" .\"'")
     if len(q) < 8:
         return None
@@ -196,11 +199,20 @@ def find_quote(text: str, quote: str) -> Optional[int]:
     at = joined.find(q)
     if at < 0:
         return None
-    line = 0
+    end = at + len(q) - 1
+    first = last = 0
     for i, s in enumerate(starts):
         if s <= at:
-            line = i
-    return line + 1
+            first = i
+        if s <= end:
+            last = i
+    return first + 1, last + 1
+
+
+def find_quote(text: str, quote: str) -> Optional[int]:
+    """1-based line where ``quote`` starts, or None (see find_quote_span)."""
+    span = find_quote_span(text, quote)
+    return span[0] if span else None
 
 
 _FIRST_WORD_SKIP = {"project", "program", "programme", "the", "new", "phase", "test",
@@ -263,19 +275,23 @@ def check(raw_links: Iterable[Dict[str, str]], text: str, known: Sequence[Known]
             if rs and ro and rs[0] == ro[0] and rs[1] != ro[1]:
                 if rs[1] < ro[1]:
                     s, o, fixed = o, s, "turned round (the later revision supersedes)"
-        line = find_quote(text, str(r.get("quote", "")))
-        if line is None:
+        span = find_quote_span(text, str(r.get("quote", "")))
+        if span is None:
             rejected.append(Rejected(r, "its quote is not in the text"))
             continue
-        # Named NEAR the quote — the line before to two after (a pronoun in
-        # the next sentence is fine) — not merely somewhere in the passage:
-        # measured on the Ironbridge vault, phi4:14b credited "D. Whitfield
-        # will review…" (line 13) to Dana because "Whitfield, Dana" is on
-        # line 4 of the same chunk.
+        line, last = span
+        # Named NEAR the quote — the line before it to two after its LAST
+        # line (a pronoun in the next sentence is fine) — not merely
+        # somewhere in the passage: measured on the Ironbridge vault,
+        # phi4:14b credited "D. Whitfield will review…" (line 13) to Dana
+        # because "Whitfield, Dana" is on line 4 of the same chunk. The
+        # window used to end two lines after the quote's FIRST line, so a
+        # 195-character quote wrapped over lines 3-6 lost the name at its
+        # own end (review probe, 2026-10-07).
         # A PROJECT may be named anywhere in the passage: notes are often
         # about the project in their title ("Atlas sync") and never repeat it.
         lines = text.splitlines()
-        near = "\n".join(lines[max(0, line - 2):line + 2])
+        near = "\n".join(lines[max(0, line - 2):last + 2])
         unnamed = [e.name for e in (s, o)
                    if not named_in(text if e.type == "PROJECT" else near, e)]
         if unnamed:

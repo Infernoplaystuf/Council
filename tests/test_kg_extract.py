@@ -136,3 +136,41 @@ def test_a_pronoun_in_the_next_sentence_is_fine():
                                              "object": "SL-0450",
                                              "quote": "She is also the contact for it."}]))
     assert [(l.subject, l.object) for l in res.links] == [("priya", "seal")]
+
+
+# ── review fixes (2026-10-07) ─────────────────────────────────────────────
+def test_a_quote_wrapped_over_many_lines_keeps_the_names_inside_it():
+    """A 195-character quote hard-wrapped over lines 3-6 (PDF page text has
+    short lines) named Hana Kowalski on line 6; the 'near' window was
+    anchored at the quote's FIRST line (lines 2-5), so the name INSIDE the
+    quote was "never named near that quote"."""
+    known = [kx.Known("hana", "PERSON", "Hana Kowalski"),
+             kx.Known("ctl", "PART", "CTL-5005"),
+             kx.Known("atlas", "PROJECT", "PRJ-0944", ["Atlas Test Rig"])]
+    text = ("Atlas sync, 2 April\n"
+            "\n"
+            "After the second firmware fault on the bench the team agreed that the\n"
+            "CTL-5005 controller board, including its spares, its calibration\n"
+            "records and the open firmware tickets, will from now on be the\n"
+            "responsibility of one person, and that person is Hana Kowalski.\n")
+    quote = ("the CTL-5005 controller board, including its spares, its calibration records "
+             "and the open firmware tickets, will from now on be the responsibility of one "
+             "person, and that person is Hana Kowalski.")
+    assert kx.find_quote_span(text, quote) == (3, 6)
+    assert kx.find_quote(text, quote) == 3
+    links, rejected = kx.check([{"subject": "Hana Kowalski", "predicate": "OWNS",
+                                 "object": "CTL-5005", "quote": quote}], text, known)
+    assert [(l.subject, l.predicate, l.object, l.line) for l in links] == [
+        ("hana", "OWNS", "ctl", 3)], [r.why for r in rejected]
+
+
+def test_the_near_window_still_ends_two_lines_after_the_quote():
+    known = [kx.Known("hana", "PERSON", "Hana Kowalski"),
+             kx.Known("ctl", "PART", "CTL-5005")]
+    text = ("The CTL-5005 board goes to\none owner from Monday.\n"
+            "a\nb\nc\nHana Kowalski is named only here.\n")
+    links, rejected = kx.check([{"subject": "Hana Kowalski", "predicate": "OWNS",
+                                 "object": "CTL-5005",
+                                 "quote": "The CTL-5005 board goes to one owner from Monday."}],
+                               text, known)
+    assert not links and "near that quote" in rejected[0].why
