@@ -118,21 +118,27 @@ def test_typhon_is_v5_in_teal_plus_the_capture_review_controls():
     row (s51). Then the classifier library (s64-s78): the name box became
     the model dropdown (s26, s27 fills it), the class controls moved down
     under the library (s28-s40), and the camera notes (s52, s53) moved to
-    the free space in the left column to make the room. Nothing else
-    moved."""
+    the free space in the left column to make the room. Then the camera
+    settings tabs under the image folder (s79 the notebook, s80 its Basic
+    page, s81 the page's note): the exposure, gain and FPS boxes and their
+    labels (s03-s08) moved into Basic, and the bad-timings block (s12-s16)
+    and the camera notes moved 32 px down to give the tabs room. Nothing
+    else moved."""
     v5, typhon = gspec("barbie_capture_v5"), gspec("typhon")
     assert typhon["window"]["bg"] == TYPHON_BG
     assert typhon["window"]["fg"] == v5["window"]["fg"]
     assert typhon["window"]["title"] == "Typhon"
     old = {s["id"]: s for s in v5["shapes"]}
     new = {s["id"]: s for s in typhon["shapes"]}
-    assert sorted(set(new) - set(old)) == [f"s{i}" for i in range(55, 79)]
+    assert sorted(set(new) - set(old)) == [f"s{i}" for i in range(55, 82)]
     strip = lambda s: {k: v for k, v in s.items() if k != "label"}
     changed = sorted(k for k in old if strip(old[k]) != strip(new[k]))
-    assert changed == ["s04", "s06", "s08", "s09", "s11", "s23", "s26",
-                       "s27", "s28", "s29", "s30", "s31", "s32", "s33",
-                       "s34", "s35", "s36", "s37", "s38", "s39", "s40",
-                       "s44", "s46", "s49", "s50", "s51", "s52", "s53"]
+    assert changed == ["s03", "s04", "s05", "s06", "s07", "s08", "s09",
+                       "s11", "s12", "s13", "s14", "s15", "s16", "s23",
+                       "s26", "s27", "s28", "s29", "s30", "s31", "s32",
+                       "s33", "s34", "s35", "s36", "s37", "s38", "s39",
+                       "s40", "s44", "s46", "s49", "s50", "s51", "s52",
+                       "s53"]
     assert new["s25"]["label"].startswith("Model"), "only relabelled"
     assert "roi" not in new["s44"]["script"]["outputs"]
     assert new["s49"]["script"]["outputs"]["roi"] == "crop"
@@ -209,14 +215,28 @@ def test_settings_is_drawn_in_the_top_right_of_the_generated_window(
     assert hasattr(ui, "on_btn_settings")
 
 
+#: Kinds that hold other shapes: a shape drawn wholly inside one is its
+#: child (the settings notebook's Basic page and the boxes in it), not an
+#: overlap.
+CONTAINERS = ("notebook", "frame", "labelframe")
+
+
 def overlapping(shapes):
-    """Pairs of shapes that overlap, by id."""
+    """Pairs of shapes that overlap, by id — a shape inside a container
+    that holds it is not an overlap."""
     def overlaps(a, b):
         return not (a["x"] >= b["x"] + b["w"] or b["x"] >= a["x"] + a["w"]
                     or a["y"] >= b["y"] + b["h"] or b["y"] >= a["y"] + a["h"])
+
+    def holds(outer, inner):
+        return (outer["kind"] in CONTAINERS
+                and outer["x"] <= inner["x"] and outer["y"] <= inner["y"]
+                and inner["x"] + inner["w"] <= outer["x"] + outer["w"]
+                and inner["y"] + inner["h"] <= outer["y"] + outer["h"])
     items = list(shapes.values())
     return [(a["id"], b["id"]) for i, a in enumerate(items)
-            for b in items[i + 1:] if overlaps(a, b)]
+            for b in items[i + 1:]
+            if overlaps(a, b) and not holds(a, b) and not holds(b, a)]
 
 
 def test_the_camera_set_up_controls_sit_under_the_area_buttons():

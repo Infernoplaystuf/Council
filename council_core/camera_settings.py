@@ -64,8 +64,9 @@ import math
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from .cameras import (CameraError, MIN_ACCUMULATE_MS, NeedsStop, Roi, _ask,
-                      _interface, fit_roi, off_sensor, on_sensor)
+from .cameras import (CameraError, DEFAULT_PALETTE, EVENT_PALETTES,
+                      EVENT_SHOWS, MIN_ACCUMULATE_MS, SHOW_BOTH, NeedsStop,
+                      Roi, _ask, _interface, fit_roi, off_sensor, on_sensor)
 
 __all__ = ["Setting", "Change", "Applied", "SettingError", "NeedsStop",
            "area_unchanged",
@@ -343,6 +344,16 @@ class Provider:
 
     def describe(self) -> List[Setting]:
         raise NotImplementedError
+
+    def describe_groups(self, groups: Iterable[str]) -> List[Setting]:
+        """Only the settings in `groups`, in describe order.
+
+        A pop-out window shows one category and reads it again after every
+        drag; describing the WHOLE camera for that is a USB round trip per
+        bias, filter and reading on an EVK4. Providers that can read one
+        group alone override this; the default filters describe()."""
+        wanted = set(groups)
+        return [s for s in self.describe() if s.group in wanted]
 
     def read(self, key: str) -> Any:
         raise NotImplementedError
@@ -736,6 +747,19 @@ class BaslerSettings(Provider):
                 out.append(setting)
         return out
 
+    def describe_groups(self, groups: Iterable[str]) -> List[Setting]:
+        """The nodes of `groups` only — not the whole table."""
+        wanted = set(groups)
+        streaming = self._streaming()
+        out = []
+        for feature in BASLER_FEATURES:
+            if feature.group not in wanted:
+                continue
+            setting = self._describe_one(feature, streaming)
+            if setting is not None:
+                out.append(setting)
+        return out
+
     def find(self, key: str) -> Setting:
         """ONE feature's nodes, not the whole table: a settings window
         writes one setting per step of a slider, and each write looks its
@@ -984,7 +1008,9 @@ G_ERC = "Event rate controller"
 G_AFK = "Anti-flicker"
 G_TRAIL = "Event trail filter"
 G_ACTIVITY = "Event rate activity filter"
-G_VIEW = "Picture"
+#: The event picture as this app draws it (live view and PNGs, never the
+#: .raw): its window, which events it shows, and its colours.
+G_VIEW = "Display"
 G_STATUS = "Status"
 G_CAMERA = "Camera"
 
@@ -996,6 +1022,62 @@ ACTIVITY_FIELDS = ("lower_bound_start", "lower_bound_stop",
 #: this app's display setting, so this is the one bound not read from the
 #: camera.
 MAX_WINDOW_MS = 1000.0
+
+#: An event picture's display settings, by the device attribute each one
+#: is. The app's own settings, not the camera's: no facility, no USB read.
+DISPLAY_ATTRIBUTES: Dict[str, str] = {
+    "window_ms": "accumulate_ms",
+    "display.events": "display_events",
+    "display.palette": "display_palette",
+}
+
+
+def display_settings(device: Any) -> List[Setting]:
+    """An event camera's display settings, as `device` holds them now.
+
+    WHAT THE USER SEES, NOT WHAT IS RECORDED. The window, the events shown
+    and the colours shape the live picture and the PNGs saved from it; the
+    .raw has every event whatever they are, and the raw view draws it in
+    the standard grey. They are kept in presets and in a run's camera
+    record like any other setting, so a run says how its PNGs were drawn.
+    """
+    shown = str(getattr(device, "display_events", SHOW_BOTH) or SHOW_BOTH)
+    palette = str(getattr(device, "display_palette", DEFAULT_PALETTE)
+                  or DEFAULT_PALETTE)
+    return [
+        Setting("window_ms", "Picture window", G_VIEW, FLOAT,
+                float(getattr(device, "accumulate_ms", 20.0)),
+                minimum=MIN_ACCUMULATE_MS, maximum=MAX_WINDOW_MS, unit="ms",
+                help="How long each picture collects events (1000 / "
+                     "pictures a second). The live view and the PNGs only "
+                     "— the .raw has every event."),
+        Setting("display.events", "Events shown", G_VIEW, CHOICE, shown,
+                choices=EVENT_SHOWS,
+                help="Leave out one polarity: ON is brighter, OFF darker. "
+                     "The live view and the PNGs only — the .raw keeps "
+                     "both."),
+        Setting("display.palette", "Colours", G_VIEW, CHOICE, palette,
+                choices=tuple(EVENT_PALETTES),
+                help="Grey: mid-grey ground, white ON, black OFF (the "
+                     "standard picture). Dark: the events on black. "
+                     "Colour: light ON and blue OFF on dark blue (PNGs are "
+                     "then saved in colour). The .raw is unaffected."),
+    ]
+
+
+def read_display(device: Any, key: str) -> Any:
+    value = getattr(device, DISPLAY_ATTRIBUTES[key])
+    return float(value) if key == "window_ms" else str(value)
+
+
+def write_display(device: Any, key: str, value: Any) -> None:
+    """One display setting, already coerced (a choice is one of its
+    entries); the grab thread's next window is drawn with it."""
+    if key == "window_ms":
+        device.accumulate_ms = max(MIN_ACCUMULATE_MS, float(value))
+    else:
+        setattr(device, DISPLAY_ATTRIBUTES[key], str(value))
+
 
 _BIAS_HELP = {
     "bias_diff_on": "Contrast threshold for ON (brighter) events: higher "
@@ -1049,9 +1131,24 @@ class EvkSettings(Provider):
         out.extend(self._afk())
         out.extend(self._trail())
         out.extend(self._activity())
-        out.append(self._window())
+        out.extend(self._display())
         out.extend(self._status())
         out.extend(self._camera())
+        return out
+
+    def describe_groups(self, groups: Iterable[str]) -> List[Setting]:
+        """Each group's own facility, read alone (see Provider.describe_
+        groups) — in describe order."""
+        wanted = set(groups)
+        out: List[Setting] = []
+        for group, part in ((G_BIASES, self._biases), (G_ERC, self._erc),
+                            (G_AFK, self._afk), (G_TRAIL, self._trail),
+                            (G_ACTIVITY, self._activity),
+                            (G_VIEW, self._display),
+                            (G_STATUS, self._status),
+                            (G_CAMERA, self._camera)):
+            if group in wanted:
+                out.extend(part())
         return out
 
     def find(self, key: str) -> Setting:
@@ -1067,11 +1164,11 @@ class EvkSettings(Provider):
                 value = None
             if value is not None:
                 return self._bias(rest, value)
-        if key == "window_ms":
-            # The app's own setting: no facility to read at all. It fell
+        if key in DISPLAY_ATTRIBUTES:
+            # The app's own settings: no facility to read at all. It fell
             # through to describe() — every bias and filter, dozens of USB
             # reads on a live EVK4 — once per step of its slider.
-            return self._window()
+            return next(s for s in self._display() if s.key == key)
         part = {"erc": self._erc, "afk": self._afk, "trail": self._trail,
                 "activity": self._activity, "status": self._status,
                 "camera": self._camera}.get(group)
@@ -1080,15 +1177,8 @@ class EvkSettings(Provider):
                 return setting
         raise SettingError(f"this camera has no setting called {key!r}")
 
-    def _window(self) -> Setting:
-        return Setting("window_ms", "Picture window", G_VIEW, FLOAT,
-                       float(getattr(self.device, "accumulate_ms", 20.0)),
-                       minimum=MIN_ACCUMULATE_MS, maximum=MAX_WINDOW_MS,
-                       unit="ms",
-                       help="How long each picture collects events "
-                            "(1000 / pictures a second). The live view "
-                            "and the PNGs only — the .raw has every "
-                            "event.")
+    def _display(self) -> List[Setting]:
+        return display_settings(self.device)
 
     def _biases(self) -> List[Setting]:
         if self.biases is None:
@@ -1279,8 +1369,8 @@ class EvkSettings(Provider):
         """
         if key.startswith("bias."):
             return int(self.biases.get(key[5:]))
-        if key == "window_ms":
-            return float(self.device.accumulate_ms)
+        if key in DISPLAY_ATTRIBUTES:
+            return read_display(self.device, key)
         module, _, part = key.partition(".")
         target = {"erc": self.erc, "afk": self.afk, "trail": self.trail,
                   "activity": self.activity}.get(module)
@@ -1302,8 +1392,8 @@ class EvkSettings(Provider):
         if key.startswith("bias."):
             _accepted(self.biases.set(key[5:], int(value)), setting)
             return
-        if key == "window_ms":
-            self.device.accumulate_ms = max(MIN_ACCUMULATE_MS, float(value))
+        if key in DISPLAY_ATTRIBUTES:
+            write_display(self.device, key, value)
             return
         module, _, part = key.partition(".")
         target = {"erc": self.erc, "afk": self.afk, "trail": self.trail,
@@ -1486,10 +1576,7 @@ class SyntheticSettings(Provider):
             out.append(Setting("trail.threshold", "Threshold", G_TRAIL, INT,
                                state["trail.threshold"], low, high, 1,
                                unit="µs"))
-            out.append(Setting("window_ms", "Picture window", G_VIEW, FLOAT,
-                               float(dev.accumulate_ms),
-                               minimum=MIN_ACCUMULATE_MS,
-                               maximum=MAX_WINDOW_MS, unit="ms"))
+            out.extend(display_settings(dev))
             out.append(Setting("status.temperature", "Temperature", G_STATUS,
                                INT, 31, unit="°C", read_only=True))
             return out
@@ -1521,8 +1608,8 @@ class SyntheticSettings(Provider):
         return out
 
     def read(self, key: str) -> Any:
-        if key == "window_ms":
-            return float(self.device.accumulate_ms)
+        if key in DISPLAY_ATTRIBUTES:
+            return read_display(self.device, key)
         if key in self.device.state:
             return self.device.state[key]
         raise SettingError(f"this camera has no setting called {key!r}")
@@ -1537,8 +1624,8 @@ class SyntheticSettings(Provider):
 
     def write(self, setting: Setting, value: Any,
               batch: Mapping[str, Any]) -> None:
-        if setting.key == "window_ms":
-            self.device.accumulate_ms = max(MIN_ACCUMULATE_MS, float(value))
+        if setting.key in DISPLAY_ATTRIBUTES:
+            write_display(self.device, setting.key, value)
             return
         self.device.write_setting(setting.key, value)
 

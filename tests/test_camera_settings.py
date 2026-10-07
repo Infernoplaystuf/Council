@@ -645,8 +645,10 @@ def test_a_recording_opened_as_a_device_lists_only_what_it_has():
     OpenEB: get_i_ll_biases, get_i_erc_module, ... all return None)."""
     dev, _ = evk(with_=("hw",))
     keys = [s.key for s in dev.settings()]
-    assert keys == ["window_ms", "camera.serial", "camera.sensor",
-                    "camera.format"]
+    # The display settings are the app's own (how the picture is drawn),
+    # so even a recording has them.
+    assert keys == ["window_ms", "display.events", "display.palette",
+                    "camera.serial", "camera.sensor", "camera.format"]
 
 
 def test_evk_frames_carry_the_area_they_were_binned_against():

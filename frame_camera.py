@@ -228,6 +228,8 @@ class _Live:
         #: The main window's preset picker and camera-area line (attach),
         #: held for the same reason. About the app, like the reviewer.
         self.picker: Any = None
+        #: The main window's settings tabs (attach), likewise.
+        self.tabs: Any = None
         #: Every savable setting as the camera had it when it was connected
         #: — what "Reset" puts back. An EVK4 is opened with its sensor's
         #: default biases, so for it this IS the camera's default; a Basler
@@ -1077,7 +1079,9 @@ def attach(app: Any, view: str = "live_view",
            area: str = "camera_area", models: str = "classifier_name",
            model_filter: str = "classifier_filter",
            classified: str = "classified_with_line",
-           model_status: str = "classifier_status") -> Any:
+           model_status: str = "classifier_status",
+           tabs: str = "settings_tabs",
+           tabs_note: str = "settings_note") -> Any:
     """Start the live view. ONE line in app.py, which is never regenerated::
 
         class App(HandlerMixin, MainUi):
@@ -1129,6 +1133,15 @@ def attach(app: Any, view: str = "live_view",
     the slider's review lists the folder again. Every action on a model
     stays a frame_classes script link (its Delete asks for a second press).
     An app whose name port is an entry (the Barbie apps) is left as it is.
+
+    THE SETTINGS TABS. When the app has a `tabs` notebook (Typhon's, under
+    the image folder), a SettingsTabs (council_qt.widgets.settings_tabs)
+    keeps its wireframe tabs (Basic: the boxes beside Start) and adds the
+    connected camera's own categories after them — built from
+    settings_list() when a camera connects, again when it changes — each
+    with Pop out, then its presets. `tabs_note` is the Basic tab's note.
+    A wireframe can draw only the tabs every camera has; which ones a
+    camera needs is known once it is connected.
     """
     from PySide6.QtCore import Qt, QTimer
 
@@ -1193,6 +1206,11 @@ def attach(app: Any, view: str = "live_view",
         # New frames in the folder (a capture's last frame on disk): the
         # line says which runs are not classified yet.
         reviewer.on_reload(models_picker.line_soon)
+    settings_tabs = _tabs_for(app, tabs, tabs_note)
+    if _LIVE.tabs is not None and _LIVE.tabs is not settings_tabs:
+        _LIVE.tabs.close()             # an earlier window's, now replaced
+    _LIVE.tabs = settings_tabs
+    app._settings_tabs = settings_tabs
     if first_run and current_choice() is None and not _dialogs_disabled():
         # After the window is up, not inside __init__: a modal dialog opened
         # while the main window is still being built has no window on screen
@@ -1262,6 +1280,31 @@ def _picker_for(app: Any, presets: str, area: str) -> Any:
 
     return PresetPicker(sys.modules[__name__], combo=combo, area=line,
                         parent=app)
+
+
+def _tabs_for(app: Any, tabs: str, note: str) -> Any:
+    """A SettingsTabs for this app's settings notebook, or None when it has
+    none (the Barbie apps, a Typhon not yet updated from the example)."""
+    import sys
+
+    ports = getattr(app, "ports", None)
+    port = getattr(ports, tabs, None) if (ports is not None and tabs) \
+        else None
+    book = getattr(port, "widget", None)
+    if book is None or not callable(getattr(book, "insertTab", None)):
+        return None
+    from council_qt.widgets.settings_tabs import SettingsTabs
+
+    boxes = {box: getattr(ports, box, None) for box in START_BOXES}
+    font = None
+    for box in ("frame_rate", "exposure", "gain"):
+        widget = getattr(boxes.get(box), "widget", None)
+        if widget is not None:
+            font = widget.font()           # the app's own (Arial 11)
+            break
+    return SettingsTabs(sys.modules[__name__], book,
+                        note=getattr(ports, note, None) if note else None,
+                        boxes=boxes, font=font, parent=app)
 
 
 def _models_for(app: Any, models: str, model_filter: str, classified: str,
@@ -2142,7 +2185,7 @@ def camera_state() -> Dict[str, Any]:
     sensor size.
 
     Keys: connected, label, kind, capturing, busy, streaming, area, sensor,
-    summary
+    has_exposure, has_gain, summary
     """
     device = _LIVE.device
     session = _LIVE.session
@@ -2153,12 +2196,16 @@ def camera_state() -> Dict[str, Any]:
            "capturing": bool(_LIVE.capturing),
            "busy": _LIVE.job is not None,
            "streaming": bool(session is not None and session.running),
-           "area": "", "sensor": "",
-           "summary": "No camera open."}
+           "area": "", "sensor": "", "has_exposure": False,
+           "has_gain": False, "summary": "No camera open."}
     if device is not None:
         limits = device.limits()
         out.update(area=_area_text(device.roi()),
                    sensor=f"{limits.width}x{limits.height}",
+                   # As connect() says: a box beside Start that this camera
+                   # cannot honour (an event camera's exposure) is greyed.
+                   has_exposure=limits.exposure_us[1] > 0,
+                   has_gain=limits.gain[1] > 0,
                    summary=f"Connected to {out['label']}.")
     return out
 
@@ -2237,18 +2284,27 @@ def camera_settings(parent: Any = None) -> Dict[str, Any]:
     return {"summary": f"Camera settings: {label}."}
 
 
-def settings_list() -> Dict[str, Any]:
+def settings_list(groups: Any = None) -> Dict[str, Any]:
     """Every setting the connected camera describes — key, label, group,
     type, value, min/max/step or choices, unit, read-only, live (False:
     the stream must stop to change it), held (why another setting owns it
     now) — as plain dicts, in the order a set is written. `groups` is the
     display order of the groups.
 
+    `groups` (a group name, or a list of them) reads only those groups —
+    what a pop-out of one category reads after every change, rather than
+    every bias, filter and reading on the camera (a USB round trip each on
+    an EVK4).
+
     Keys: settings, groups, camera, kind, capturing, summary
     """
     device = _require_device()
+    wanted = _group_names(groups)
     try:
-        described = device.settings()
+        if wanted:
+            described = device.settings_provider().describe_groups(wanted)
+        else:
+            described = device.settings()
     except Exception as exc:                              # noqa: BLE001
         raise RuntimeError(f"the camera did not describe its settings: "
                            f"{_said(exc)}") from exc
@@ -2258,6 +2314,15 @@ def settings_list() -> Dict[str, Any]:
             "camera": label, "kind": getattr(_LIVE.info, "kind", ""),
             "capturing": bool(_LIVE.capturing),
             "summary": f"{len(described)} settings on {label}."}
+
+
+def _group_names(groups: Any) -> List[str]:
+    """A group name, or a list of them (a listbox selection), as a list."""
+    if groups is None:
+        return []
+    if isinstance(groups, str):
+        return [groups.strip()] if groups.strip() else []
+    return [str(g).strip() for g in groups if str(g).strip()]
 
 
 def set_camera_setting(key: Any, value: Any) -> Dict[str, Any]:
@@ -2321,7 +2386,7 @@ def apply_camera_settings(values: Any, area: Any = None) -> Dict[str, Any]:
     the stream stopped once if anything in it needs that. Refused while
     capturing. The settings window's "Apply".
 
-    Keys: applied, area, crop, ok, summary, pending
+    Keys: applied, area, crop, ok, summary, pending, restarted
     """
     from council_core import cameras
 
@@ -2338,15 +2403,35 @@ def apply_camera_settings(values: Any, area: Any = None) -> Dict[str, Any]:
 
 
 def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
-               name: str) -> Dict[str, Any]:
-    """Keys: applied, area, crop, ok, summary, pending"""
+               name: str, live_ok: bool = False) -> Dict[str, Any]:
+    """Write a set. `live_ok`: allowed while capturing when nothing in it
+    needs the stream stopped and it holds no area — a category's settings
+    put back as connected are then the same as changing each live, which
+    a capture allows; a preset is still refused (one set-up per run).
+
+    THE ANSWER SAYS WHAT NEEDED THE STREAM STOPPED ("restarted"), so a
+    preset that applied live reads differently from one that blanked the
+    live view for a moment, and the user knows which settings did it.
+
+    Keys: applied, area, crop, ok, summary, pending, restarted"""
     from council_core import camera_settings
 
     device = _require_device()
-    _refuse_while_capturing("applying a camera set-up" if what != "preset"
-                            else "applying a preset")
+    try:
+        described = device.settings_provider().describe()
+    except Exception:                                     # noqa: BLE001
+        described = None
+    blocked = (camera_settings.stops_needed(device, values, roi, described)
+               if described is not None else
+               camera_settings.stops_needed(device, values, roi))
+    if not (live_ok and roi is None and not blocked):
+        _refuse_while_capturing("applying a camera set-up" if what != "preset"
+                                else "applying a preset")
     _refuse_while_busy("apply it")
-    stop = bool(camera_settings.stops_needed(device, values, roi))
+    stop = bool(blocked)
+    labels = {s.key: s.label for s in described or []}
+    restarted = [labels.get(k, "the area" if k == "area" else k)
+                 for k in blocked]
     before = _roi_or_none(device)
 
     def work() -> Any:
@@ -2366,12 +2451,21 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
         moved = (roi is not None and applied.roi is not None) or (
             before is not None and _roi_or_none(device) != before)
         head = {"preset": f"Preset {name!r}",
-                "reset": "Settings as connected"}.get(what, "Camera settings")
+                "reset": (f"{name} as connected" if name else
+                          "Settings as connected")}.get(what,
+                                                        "Camera settings")
+        said = f"{head}: {applied.summary()}"
+        if restarted:
+            said += (f" The live view restarted for {', '.join(restarted)} "
+                     f"(the stream must stop to change "
+                     f"{'it' if len(restarted) == 1 else 'them'}).")
+        elif getattr(device, "streaming", False):
+            said += " Applied live."
         return {"applied": applied.as_dict(), "ok": applied.ok,
                 "area": _area_text(device.roi()),
                 "crop": "" if moved else _current_crop(),
                 "what": what, "name": name, "pending": False,
-                "summary": f"{head}: {applied.summary()}"}
+                "restarted": list(restarted), "summary": said}
 
     return _run_change(label, work, finish, stop)
 
@@ -2425,19 +2519,40 @@ def reset_setting(key: Any) -> Dict[str, Any]:
     return set_camera_setting(key, _LIVE.as_connected[key])
 
 
-def reset_camera_settings() -> Dict[str, Any]:
+def reset_camera_settings(group: Any = None) -> Dict[str, Any]:
     """Put EVERY setting back as the camera had it when it was connected, in
     one safe-ordered set (the area is left alone: Full sensor is for that).
     Refused while capturing.
 
-    Keys: applied, area, crop, ok, summary, pending
+    `group` puts back one category only (a pop-out's "Reset"): its
+    settings as connected, the rest left as they are. Allowed while
+    capturing when every one of them changes live — the same as dragging
+    each back by hand, which a capture allows.
+
+    Keys: applied, area, crop, ok, summary, pending, restarted
     """
-    _require_device()
+    device = _require_device()
     if not _LIVE.as_connected:
         raise RuntimeError("the camera's settings were not read when it was "
                            "connected — there is nothing to put back")
-    return _apply_set(dict(_LIVE.as_connected), None,
-                      "Putting the settings back as connected", "reset", "")
+    wanted = _group_names(group)
+    if not wanted:
+        return _apply_set(dict(_LIVE.as_connected), None,
+                          "Putting the settings back as connected", "reset",
+                          "")
+    try:
+        keys = {s.key for s in
+                device.settings_provider().describe_groups(wanted)}
+    except Exception as exc:                              # noqa: BLE001
+        raise RuntimeError(f"the camera did not describe its settings: "
+                           f"{_said(exc)}") from exc
+    values = {k: v for k, v in _LIVE.as_connected.items() if k in keys}
+    what = " and ".join(wanted)
+    if not values:
+        raise RuntimeError(f"{what}: nothing here was read when the camera "
+                           f"was connected — there is nothing to put back")
+    return _apply_set(values, None, f"Putting {what} back as connected",
+                      "reset", what, live_ok=True)
 
 
 def load_camera_defaults() -> Dict[str, Any]:
@@ -2600,7 +2715,7 @@ def apply_preset(name: Any) -> Dict[str, Any]:
     selection. Refused while capturing; a change the stream is in the way of
     stops and restarts the live view (on a worker — see _Job).
 
-    Keys: applied, area, crop, ok, summary, pending
+    Keys: applied, area, crop, ok, summary, pending, restarted
     """
     from council_core import camera_presets
 
@@ -2630,7 +2745,7 @@ def pick_preset(name: Any) -> Dict[str, Any]:
     here, not an error dialog for typing. Everything apply_preset refuses
     (no camera, capturing, a change still running) is still refused.
 
-    Keys: applied, area, crop, ok, summary, pending
+    Keys: applied, area, crop, ok, summary, pending, restarted
     """
     from council_core import camera_presets
 
@@ -2638,6 +2753,7 @@ def pick_preset(name: Any) -> Dict[str, Any]:
     chosen = _picked(name)
     hint = {"applied": {}, "area": _area_text(device.roi()),
             "crop": _current_crop(), "ok": False, "pending": False,
+            "restarted": [],
             "what": "hint", "name": chosen}
     if not chosen:
         return dict(hint, summary="Pick a preset in the list, or type a name "
@@ -2697,6 +2813,83 @@ def rename_preset(old: Any, new: Any) -> Dict[str, Any]:
         held["name"] = renamed.name         # the run record says it as it is
     return _presets_changed(renamed.name,
                             f"Renamed {chosen!r} to {renamed.name!r}.")
+
+
+def export_preset(name: Any, folder: Any) -> Dict[str, Any]:
+    """Write one of this camera's presets to a file of its own in `folder`
+    — "<name>.camera-preset.json" — to take to another project or PC and
+    Import there. Never over another file (camera_presets.export_preset).
+    Accepts a listbox selection.
+
+    Keys: path, summary
+    """
+    from council_core import camera_presets
+
+    chosen = _picked(name)
+    if not chosen:
+        raise RuntimeError("choose a preset to export first")
+    try:
+        preset = _preset_store().get(_identity(), chosen)
+        owner = preset.owner or _identity()
+        path = camera_presets.export_preset(preset, owner, folder)
+    except camera_presets.PresetError as exc:
+        raise RuntimeError(str(exc)) from exc
+    return {"path": str(path),
+            "summary": f"Exported preset {preset.name!r} to {path} — Import "
+                       f"it in another project or on another PC."}
+
+
+def import_preset(path: Any, name: Any = "") -> Dict[str, Any]:
+    """Add the preset in an exported file to this camera's presets, in this
+    project — under its own name, or `name`. NEVER REPLACES one already
+    here: a name in use gets " (2)", and the answer says so. Refused when
+    the file is not an exported preset, was saved on the other kind of
+    camera, or by a newer version of the app. It is not applied: pick it
+    to apply it (refused while capturing, like any preset).
+
+    Keys: name, presets, rows, summary
+    """
+    from council_core import camera_presets
+
+    _require_device()
+    camera = _identity()
+    store = _preset_store()
+    try:
+        done = camera_presets.import_preset(store, camera, _picked(path),
+                                            _picked(name), repair=True)
+    except camera_presets.PresetError as exc:
+        raise RuntimeError(str(exc)) from exc
+    preset = done.preset
+    said = f"Imported preset {preset.name!r}"
+    if done.renamed:
+        said += (f" (the file calls it {done.asked!r}; that name is taken "
+                 f"here, and an import never replaces a preset)")
+    said += f": {len(preset.settings)} settings"
+    said += (f" and the area {', '.join(str(v) for v in preset.roi.as_tuple())}"
+             if preset.roi is not None else ", area left as it is")
+    source = done.source
+    if source.model_key != camera.model_key:
+        missing = _settings_missing(preset.settings)
+        said += f"; saved on {source.label}"
+        if missing:
+            said += (f" — {len(missing)} of its settings are not on this "
+                     f"camera and will be reported, not applied "
+                     f"({', '.join(missing[:4])}"
+                     f"{', …' if len(missing) > 4 else ''})")
+    said += ". Pick it to apply it."
+    if done.moved is not None:
+        said += (f" The presets file was damaged: it was kept as "
+                 f"{done.moved.name}.")
+    return _presets_changed(preset.name, said)
+
+
+def _settings_missing(values: Dict[str, Any]) -> List[str]:
+    """The keys of `values` this camera does not describe."""
+    try:
+        have = {s.key for s in _require_device().settings()}
+    except Exception:                                     # noqa: BLE001
+        return []
+    return [k for k in values if k not in have]
 
 
 def _truthy(value: Any) -> bool:

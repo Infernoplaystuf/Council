@@ -77,6 +77,26 @@ DEFAULT_ACCUMULATE_MS = 20.0
 #: second. Shorter windows hold too few events to show anything.
 MIN_ACCUMULATE_MS = 1.0
 
+#: Which events an event camera's picture shows (its "display.events"
+#: setting). Both is the picture every run before these settings saved.
+SHOW_BOTH, SHOW_ON, SHOW_OFF = "ON and OFF", "ON only", "OFF only"
+EVENT_SHOWS: Tuple[str, ...] = (SHOW_BOTH, SHOW_ON, SHOW_OFF)
+
+#: How an event picture is drawn (its "display.palette" setting): what "no
+#: event here", an ON event and an OFF event become. A number is a grey
+#: level (the picture stays one channel, as every earlier PNG was); a triple
+#: is RGB. "Grey" is EVENT_MID / white / black — the picture as it always
+#: was, so nothing changes for anyone who leaves it alone. "Dark" puts the
+#: events on black, which makes a sparse scene easier to read; "Colour" is a
+#: dark blue ground with light ON and blue OFF events, the look event-camera
+#: viewers usually have.
+EVENT_PALETTES: Dict[str, Tuple[Any, Any, Any]] = {
+    "Grey": (EVENT_MID, 255, 0),
+    "Dark": (0, 255, 110),
+    "Colour": ((30, 37, 52), (216, 223, 236), (64, 126, 201)),
+}
+DEFAULT_PALETTE = "Grey"
+
 
 class CameraError(Exception):
     """A camera could not do what was asked."""
@@ -261,16 +281,30 @@ def off_sensor(roi: Roi, limits: Limits) -> str:
 
 def accumulate_events(xs: Sequence[int], ys: Sequence[int],
                       pols: Sequence[int], width: int, height: int,
-                      np_mod: Any = None) -> Any:
-    """Bin an event batch into a grayscale image.
+                      np_mod: Any = None, shown: str = SHOW_BOTH,
+                      palette: str = DEFAULT_PALETTE) -> Any:
+    """Bin an event batch into an image.
 
-    Mid-gray is "nothing happened here", bright is a positive contrast change,
-    dark is negative. This is a VIEWING convenience, not a measurement: an
-    event camera has no exposure and no frames, and two events at the same
-    pixel inside one window are not distinguishable in the result.
+    By default mid-gray is "nothing happened here", bright is a positive
+    contrast change, dark is negative. This is a VIEWING convenience, not a
+    measurement: an event camera has no exposure and no frames, and two
+    events at the same pixel inside one window are not distinguishable in
+    the result.
+
+    `shown` leaves out one polarity (EVENT_SHOWS) and `palette` picks the
+    colours (EVENT_PALETTES) — an event camera's display settings, which
+    shape the live picture and its PNGs, never the .raw. A palette of grey
+    levels gives a one-channel image; "Colour" gives RGB. An unknown name is
+    the default rather than an error: a picture must still be drawn.
     """
     np = np_mod or _numpy()
-    img = np.full((int(height), int(width)), EVENT_MID, dtype=np.uint8)
+    none, on, off = EVENT_PALETTES.get(palette,
+                                       EVENT_PALETTES[DEFAULT_PALETTE])
+    shape: Tuple[int, ...] = (int(height), int(width))
+    if isinstance(none, tuple):
+        shape += (3,)
+    img = np.empty(shape, dtype=np.uint8)
+    img[...] = none
     if len(xs) == 0:
         return img
     xi = np.asarray(xs, dtype=np.int64)
@@ -281,8 +315,10 @@ def accumulate_events(xs: Sequence[int], ys: Sequence[int],
     # paint speckle at the opposite side of the image.
     keep = (xi >= 0) & (xi < int(width)) & (yi >= 0) & (yi < int(height))
     xi, yi, pi = xi[keep], yi[keep], pi[keep]
-    img[yi[pi > 0], xi[pi > 0]] = 255
-    img[yi[pi <= 0], xi[pi <= 0]] = 0
+    if shown != SHOW_OFF:
+        img[yi[pi > 0], xi[pi > 0]] = on
+    if shown != SHOW_ON:
+        img[yi[pi <= 0], xi[pi <= 0]] = off
     return img
 
 
@@ -1291,6 +1327,11 @@ class EvkDevice(Device):
         self._started = False
         self._roi = Roi()
         self.accumulate_ms = float(accumulate_ms)
+        #: The picture's display settings (EVENT_SHOWS, EVENT_PALETTES):
+        #: read by the grab thread for every window, written by the UI
+        #: thread — one str each, so a window uses the old or the new.
+        self.display_events = SHOW_BOTH
+        self.display_palette = DEFAULT_PALETTE
 
         geo = _required(device, "get_i_geometry")
         self._width = int(_call(geo, "get_width") or 1280)
@@ -1587,7 +1628,9 @@ class EvkDevice(Device):
         # unsigned and would wrap on the subtraction.
         xs = np.asarray(xs, dtype=np.int64) - int(roi.x)
         ys = np.asarray(ys, dtype=np.int64) - int(roi.y)
-        image = accumulate_events(xs, ys, pols, roi.w, roi.h, np)
+        image = accumulate_events(xs, ys, pols, roi.w, roi.h, np,
+                                  shown=self.display_events,
+                                  palette=self.display_palette)
         self._index += 1
         span_us = (int(stamps.max()) - int(stamps.min())) if len(stamps) else 0
         rate = (len(xs) / (span_us / 1e6)) if span_us > 0 else 0.0
@@ -1744,6 +1787,9 @@ class SyntheticDevice(Device):
         self._index = 0
         self._started = False
         self.accumulate_ms = DEFAULT_ACCUMULATE_MS
+        #: The event picture's display settings, as an EvkDevice has them.
+        self.display_events = SHOW_BOTH
+        self.display_palette = DEFAULT_PALETTE
         self._due = 0.0
         self.state: Dict[str, Any] = {
             "ExposureTime": 5000.0, "Gain": 0.0, "BlackLevel": 0,
@@ -1886,7 +1932,9 @@ class SyntheticDevice(Device):
             if state["erc.enabled"]:
                 cap = int(state["erc.rate"] * self.accumulate_ms / 1000.0)
                 xs, ys, pols = xs[:cap], ys[:cap], pols[:cap]
-            image = accumulate_events(xs, ys, pols, roi.w, roi.h, np)
+            image = accumulate_events(xs, ys, pols, roi.w, roi.h, np,
+                                      shown=self.display_events,
+                                      palette=self.display_palette)
             return Frame(image, self._index, self._index * 1000,
                          {"kind": "event", "events": len(xs),
                           "window_ms": self.accumulate_ms,

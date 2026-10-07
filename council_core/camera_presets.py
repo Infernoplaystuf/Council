@@ -412,11 +412,19 @@ class PresetStore:
     # -- writing -------------------------------------------------------
     def save(self, camera: Identity, name: Any, settings: Mapping[str, Any],
              roi: Optional[Roi] = None, note: str = "",
-             repair: bool = False) -> Tuple[Preset, bool, Optional[Path]]:
+             repair: bool = False, unique: bool = False,
+             created: str = "") -> Tuple[Preset, bool, Optional[Path]]:
         """Save (or replace) one of this camera's presets.
 
         Returns the preset, whether it replaced one of the same name, and
         where a damaged file was moved to (`repair` only) or None.
+
+        `unique` never replaces: a name this camera already uses gets
+        " (2)", " (3)" ... — the first that is free, chosen under the same
+        lock as the write, so two windows importing at once cannot pick the
+        same one. An import is that case: a file brought from elsewhere must
+        never quietly overwrite a set-up made here. `created` keeps the date
+        the preset was first made (an import keeps the exporter's).
         """
         name = clean_name(name)
         clean = {}
@@ -461,9 +469,12 @@ class PresetStore:
             _adopt_legacy(doc, camera)
             entry = _entry_for(doc, camera)
             presets = entry["presets"]
+            if unique:
+                name = free_name(presets, name)
             old_name = _find(presets, name)
             replaced = old_name is not None
-            created = _now()
+            created = created if isinstance(created, str) and created \
+                else _now()
             if replaced:
                 body = presets.pop(old_name)
                 if isinstance(body, dict) and isinstance(body.get("created"),
@@ -657,6 +668,21 @@ def _find(presets: Mapping[str, Any], name: str) -> Optional[str]:
     return None
 
 
+def free_name(presets: Mapping[str, Any], name: str) -> str:
+    """`name`, or "name (2)", "name (3)" ... — the first no preset in
+    `presets` has (as a list compares names), at most MAX_NAME long."""
+    name = clean_name(name)
+    if _find(presets, name) is None:
+        return name
+    n = 2
+    while True:
+        tail = f" ({n})"
+        candidate = f"{name[:MAX_NAME - len(tail)].rstrip()}{tail}"
+        if _find(presets, candidate) is None:
+            return candidate
+        n += 1
+
+
 # ======================================================================
 # One change at a time, across every app using the project
 # ======================================================================
@@ -742,3 +768,181 @@ def apply(device: Any, preset: Preset) -> Any:
     from . import camera_settings
 
     return camera_settings.apply(device, preset.settings, preset.roi)
+
+
+# ======================================================================
+# One preset in a file of its own — to another project, or another PC
+# ======================================================================
+#: What an exported preset file is called: "<name>.camera-preset.json", so a
+#: folder of them reads as what they are and Import can look for them.
+EXPORT_SUFFIX = ".camera-preset.json"
+
+#: What an exported file says it is. A project's whole presets file
+#: (camera_presets.json) is a different shape, and importing one is refused
+#: with a word on what to do instead.
+EXPORT_KIND = "typhon-camera-preset"
+
+#: An exported preset is a few hundred bytes; anything this big is not one.
+MAX_EXPORT_BYTES = 1024 * 1024
+
+
+def _file_name(name: str) -> str:
+    """A preset name as a file name: what Windows forbids becomes "_"."""
+    safe = "".join("_" if c in '<>:"/\\|?*' or ord(c) < 32 else c
+                   for c in name).strip(" .")
+    return safe or "preset"
+
+
+def export_preset(preset: Preset, camera: Identity, folder: Any) -> Path:
+    """Write `preset` (saved on `camera`) to a file of its own in `folder`;
+    its path.
+
+    NEVER OVER ANOTHER FILE. Named after the preset; a name already in the
+    folder gets _2, _3 ... The file is created EXCLUSIVELY (open mode "x"),
+    so a file that appears between the check and the write is not replaced
+    either. JSON, like the presets file — data a person can read and mail,
+    that cannot run anything when it is loaded."""
+    where = Path(str(folder or "").strip().strip('"'))
+    if not str(where) or str(where) == ".":
+        raise PresetError("choose a folder to export the preset into")
+    if where.exists() and not where.is_dir():
+        raise PresetError(f"{where} is a file, not a folder")
+    doc = {"kind": EXPORT_KIND, "format": FORMAT, "exported": _now(),
+           "camera": camera.as_dict(),
+           "preset": {"name": preset.name, "settings": dict(preset.settings),
+                      "roi": (list(preset.roi.as_tuple())
+                              if preset.roi is not None else None),
+                      "note": preset.note, "created": preset.created,
+                      "updated": preset.updated}}
+    text = json.dumps(doc, indent=2, ensure_ascii=False,
+                      allow_nan=False) + "\n"
+    stem = _file_name(preset.name)
+    try:
+        where.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise PresetError(_cannot_write(where / stem, exc)) from exc
+    n = 1
+    while True:
+        tail = "" if n == 1 else f"_{n}"
+        target = where / f"{stem}{tail}{EXPORT_SUFFIX}"
+        try:
+            with open(target, "x", encoding="utf-8", newline="\n") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            return target
+        except FileExistsError:
+            n += 1
+        except OSError as exc:
+            raise PresetError(_cannot_write(target, exc)) from exc
+
+
+def read_export(path: Any) -> Tuple[Identity, Preset]:
+    """The camera an exported preset was saved on, and the preset — checked
+    as strictly as the presets file is (PresetFileError says why not)."""
+    source = Path(str(path or "").strip().strip('"'))
+    if not str(source) or str(source) == ".":
+        raise PresetError("choose an exported preset file to import")
+    try:
+        size = source.stat().st_size
+    except FileNotFoundError:
+        raise PresetFileError(f"there is no file {source}", source) from None
+    except OSError as exc:
+        raise PresetFileError(f"cannot read {source.name}: {exc}",
+                              source) from exc
+    if source.is_dir():
+        raise PresetFileError(f"{source} is a folder — choose the exported "
+                              f"preset file in it", source)
+    if size > MAX_EXPORT_BYTES:
+        raise PresetFileError(f"{source.name} is {size:,} bytes — not an "
+                              f"exported preset", source)
+    try:
+        doc = json.loads(source.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise PresetFileError(f"{source.name} is not an exported preset "
+                              f"(not readable JSON: {str(exc)[:120]})",
+                              source) from exc
+    if not isinstance(doc, dict):
+        raise PresetFileError(f"{source.name} is not an exported preset",
+                              source)
+    if doc.get("kind") != EXPORT_KIND:
+        if isinstance(doc.get("cameras"), dict) and "format" in doc:
+            raise PresetFileError(
+                f"{source.name} is a project's whole presets file, not one "
+                f"exported preset — export the preset you want from the app "
+                f"that has it", source)
+        raise PresetFileError(f"{source.name} is not an exported preset",
+                              source)
+    version = doc.get("format")
+    if not isinstance(version, int) or isinstance(version, bool) \
+            or version < 1:
+        raise PresetFileError(f"{source.name} is not an exported preset",
+                              source)
+    if version > FORMAT:
+        raise PresetFileError(f"{source.name} was exported by a newer "
+                              f"version of this app (format {version})",
+                              source, newer=True)
+    camera = doc.get("camera")
+    body = doc.get("preset")
+    if not isinstance(camera, dict) or not all(
+            isinstance(camera.get(k, ""), str)
+            for k in ("backend", "model", "serial", "kind")):
+        raise PresetFileError(f"{source.name} does not say which camera it "
+                              f"was saved on", source)
+    if not isinstance(body, dict):
+        raise PresetFileError(f"{source.name} holds no preset", source)
+    owner = Identity(backend=camera.get("backend", ""),
+                     model=camera.get("model", ""),
+                     serial=camera.get("serial", ""),
+                     kind=camera.get("kind", "") or "frame")
+    try:
+        name = clean_name(body.get("name"))
+        preset = _preset_from(name, body, owner, False)
+    except (PresetError, ValueError) as exc:
+        raise PresetFileError(f"the preset in {source.name} cannot be used: "
+                              f"{exc}", source) from exc
+    return owner, preset
+
+
+@dataclass(frozen=True)
+class Imported:
+    """What an import did."""
+    preset: Preset
+    #: The camera the file was exported from.
+    source: Identity
+    #: The name the file had (the preset was saved as `preset.name`).
+    asked: str
+    #: Where a damaged presets file was set aside (save's `repair`), or None.
+    moved: Optional[Path] = None
+
+    @property
+    def renamed(self) -> bool:
+        return _fold(self.preset.name) != _fold(self.asked)
+
+
+def import_preset(store: PresetStore, camera: Identity, path: Any,
+                  name: Any = "", repair: bool = False) -> Imported:
+    """Add the preset in an exported file to `camera`'s presets in `store`.
+
+    NEVER REPLACES a preset already here: a name in use gets " (2)" ...
+    (save(unique=True)). `name` imports it under another name. A preset
+    made on the other KIND of camera (an event camera's biases for a frame
+    camera) is refused — none of it could apply; one from another model of
+    the same kind is imported, and what this camera lacks is said when it
+    is applied (camera_settings.apply accounts for every key). `repair` as
+    for save."""
+    owner, preset = read_export(path)
+    if owner.kind and camera.kind and owner.kind != camera.kind:
+        raise PresetError(
+            f"{preset.name!r} was saved on {_a_kind(owner.kind)} camera "
+            f"({owner.label}); this is {_a_kind(camera.kind)} camera — none "
+            f"of its settings would apply")
+    wanted = clean_name(name) if str(name or "").strip() else preset.name
+    saved, _replaced, moved = store.save(
+        camera, wanted, preset.settings, preset.roi, note=preset.note,
+        repair=repair, unique=True, created=preset.created)
+    return Imported(saved, owner, wanted, moved)
+
+
+def _a_kind(kind: str) -> str:
+    return "an event" if kind == "event" else f"a {kind or 'frame'}"
