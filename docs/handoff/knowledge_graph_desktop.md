@@ -299,3 +299,10 @@ round; SUPERSEDES by revision letters; quote must be in the text.
 
 **KG3** (`answer_review`, `merge`, `unmerge`; Connections tab Questions / "Same as…" /
 "Split off"): per-document or everywhere answers, kept across rebuilds and logged.
+
+## 9. The laptop's review of 2026-10-07 — read before continuing
+
+`docs/handoff/review_2026-10-07.md`: what the laptop's review of c53698b and of
+8506f88 / 925b467 / 92699e0 found and changed, the user's decisions a-g of 2026-10-07
+(Pi setup and faster rebuilds), and what is still open. **Merge `origin/qt-migration`
+into `knowledge-graph` after the laptop pushes, before working on those files again.**
