@@ -351,7 +351,34 @@ class CouncilActions:
                 past_decisions.record(self.vault_dir, typed_text,
                                       result.answer, result.verdict,
                                       result.panel)
+                self._keep_for_reuse(typed_text, result, brief, analysis)
         return result
+
+    def _keep_for_reuse(self, question, result, brief, analysis) -> None:
+        """A passed answer, with the vault files it rested on, for
+        council_core.answer_reuse."""
+        from council_core import answer_reuse
+        try:
+            sources = answer_reuse.source_paths(
+                self.vault_dir, getattr(brief, "sources", None) or [])
+            if getattr(analysis, "block", ""):
+                import vault_analyst
+                from council_core.analyst_step import data_folder
+                sources += vault_analyst.list_data_files(
+                    [data_folder(self.vault_dir)])
+            answer_reuse.record(self.vault_dir, question, result.answer,
+                                result.verdict, sources)
+        except Exception:                                 # noqa: BLE001
+            pass
+
+    def reusable(self, question: str):
+        """An earlier passed answer to this same question whose files are
+        unchanged (council_core.answer_reuse), or None. Fast: one file."""
+        from council_core import answer_reuse
+        try:
+            return answer_reuse.find(self.vault_dir, question)
+        except Exception:                                 # noqa: BLE001
+            return None
 
     def task_memo(self, question: str) -> str:
         """Update the task memo from this question; its prompt block."""
@@ -587,8 +614,34 @@ class CouncilTab(ViewHelpers, QWidget):
         layout.addWidget(self._instruction_bar())
         layout.addWidget(self._save_panel())
         layout.addWidget(self._clarification_panel())
+        layout.addWidget(self._reuse_bar())
         layout.addLayout(self._override_row())
         return panel
+
+    def _reuse_bar(self) -> QWidget:
+        """[Use it] [Ask the council again] under an earlier answer shown
+        for a repeated question (council_core.answer_reuse)."""
+        self.reuse_frame = QFrame()
+        row = QHBoxLayout(self.reuse_frame)
+        row.setContentsMargins(0, 4, 0, 0)
+        row.addWidget(QLabel("Earlier answer shown above."))
+        self._button(row, amp("✓ Use it"), self.on_reuse_accept)
+        self._button(row, amp("↻ Ask the council again"), self.on_reuse_again)
+        row.addStretch(1)
+        self.reuse_frame.hide()
+        self._reuse_question = ""
+        return self.reuse_frame
+
+    def on_reuse_accept(self) -> None:
+        self.reuse_frame.hide()
+        self._reuse_question = ""
+
+    def on_reuse_again(self) -> None:
+        question, self._reuse_question = self._reuse_question, ""
+        self.reuse_frame.hide()
+        if question:
+            self.input.setPlainText(question)
+            self._send(reuse=False)
 
     def _action_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
@@ -793,6 +846,21 @@ class CouncilTab(ViewHelpers, QWidget):
         self.hide_verdict_bar()
         self.stream_box.clear_all()
 
+    def _offer_reuse(self, typed: str) -> bool:
+        """Show an earlier passed answer to the same question, with
+        [Use it] / [Ask the council again]. True when one was shown."""
+        find = getattr(self.actions, "reusable", None)
+        hit = find(typed) if find is not None else None
+        if hit is None:
+            return False
+        self.append("User", typed)
+        self.input.clear()
+        self.append("Librarian", hit.note(), "observation")
+        self.append("Writer", hit.answer)
+        self._reuse_question = typed
+        self.reuse_frame.show()
+        return True
+
     def _on_typing(self) -> None:
         preload = getattr(self.actions, "preload", None)
         if preload is not None and self.input.toPlainText().strip():
@@ -802,10 +870,17 @@ class CouncilTab(ViewHelpers, QWidget):
                 pass
 
     def on_send(self) -> None:
+        # No arguments: QPushButton.clicked passes `checked`, which a
+        # keyword here would swallow.
+        self._send(reuse=True)
+
+    def _send(self, *, reuse: bool) -> None:
         typed = self.input.toPlainText().strip()
         if not typed:
             return
         if self._send_command(typed):
+            return
+        if reuse and not self._turn_active and self._offer_reuse(typed):
             return
         if not self.begin_turn():
             return
