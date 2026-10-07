@@ -298,6 +298,16 @@ def _model_verdict(current: str, spec: RoleSpec) -> str:
     return "Below minimum"
 
 
+#: The US-origin families the council recommends, to suggest a different one.
+FAMILIES = ("Llama", "Gemma", "Phi", "Granite", "OLMo", "gpt-oss")
+
+
+def _other_families(model: str) -> str:
+    m = (model or "").lower().replace("-", "")
+    return ", ".join(f for f in FAMILIES
+                     if f.lower().replace("-", "") not in m)
+
+
 def assess(role_models: Dict[str, str], *, vram_gb: Optional[float] = None,
            ram_gb: Optional[float] = None,
            usage: Sequence[Dict[str, Any]] = ()) -> List[Assessment]:
@@ -306,6 +316,11 @@ def assess(role_models: Dict[str, str], *, vram_gb: Optional[float] = None,
 
     `role_models` maps role → model tag (as the placement report builds it);
     `usage` is usage_log.summarise rows."""
+    from .verdict_log import shared_models
+    try:
+        shared = shared_models(role_models) if role_models else []
+    except Exception:                                     # noqa: BLE001
+        shared = []
     out = []
     for spec in SPECS:
         a = Assessment(spec, current=role_models.get(spec.role, ""))
@@ -336,6 +351,15 @@ def assess(role_models: Dict[str, str], *, vram_gb: Optional[float] = None,
                            f"on the CPU (slow); the upgrade that pays off "
                            f"is a graphics card with "
                            f"{rec.vram_gb:g} GB or more.")
+        for route, model, roles in shared:
+            if spec.role in roles:
+                others = [r for r in roles if r != spec.role]
+                a.notes.append(
+                    f"Shares {model} with the {', '.join(others)} on the "
+                    f"{route} panel: a debate between copies of one model "
+                    "mostly repeats itself. Give one of them a different "
+                    f"family ({_other_families(model)}).")
+                break
         for u in usage:
             if u.get("role") == spec.role:
                 a.calls_7d += int(u.get("calls") or 0)

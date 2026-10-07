@@ -352,6 +352,9 @@ class CouncilActions:
                                       result.answer, result.verdict,
                                       result.panel)
                 self._keep_for_reuse(typed_text, result, brief, analysis)
+                from council_core import verdict_log
+                verdict_log.record(self.vault_dir, verdict_log.entry(
+                    result, getattr(result, "candidates", {}) or {}))
         return result
 
     def _keep_for_reuse(self, question, result, brief, analysis) -> None:

@@ -168,6 +168,9 @@ class TurnResult:
     #: The synthesising role, and who the Judge ranked first.
     synth: str = ""
     winner: str = ""
+    #: The members' drafts as the Judge saw them: {role: {"answer",
+    #: "rebuttal", "self_confidence"}} (council_core.verdict_log).
+    candidates: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     #: Identifies THIS turn's verdict, or "" when it produced none.
     #:
@@ -316,14 +319,18 @@ def run_turn(question: str, models: Any, *,
         verdict = "PASS" if "Verdict: PASS" in critique else "NEEDS_WORK"
         answer = final_answer(events, synth)
         last_ctx = getattr(orchestrator, "_last_ctx", None)
-        gaps = list((getattr(last_ctx, "shared", None) or {}).get(
-            "_low_conf_gaps", []))
+        shared = getattr(last_ctx, "shared", None) or {}
+        gaps = list(shared.get("_low_conf_gaps", []))
+        cands = {r: {"answer": str(c.get("answer", "")),
+                     "rebuttal": str(c.get("rebuttal", "")),
+                     "self_confidence": c.get("self_confidence")}
+                 for r, c in (shared.get("candidates") or {}).items()}
         result = TurnResult(
             True, answer=answer, critique=critique, verdict=verdict,
             confidence=judge_confidence(events), route=route, panel=panel,
             events=list(events), low_conf_gaps=gaps, question=question,
             meter=meter.result.as_dict(), depth=chosen.level, synth=synth,
-            winner=judge_winner(events))
+            winner=judge_winner(events), candidates=cands)
         # A verdict id only when there IS a verdict. See TurnResult.verdict_id.
         if critique:
             result.verdict_id = f"{route or 'turn'}:{len(events)}:{verdict}"

@@ -115,6 +115,10 @@ class Report:
     notes: List[str] = field(default_factory=list)
     #: usage_log.loads_by_host for the period.
     loads: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    #: verdict_log.summarise for the period: who helps, per route.
+    members: List[Dict[str, Any]] = field(default_factory=list)
+    #: verdict_log.shared_models: panels debating with copies of one model.
+    mix: List[Any] = field(default_factory=list)
 
     def machine(self, name: str) -> Optional[Machine]:
         key = _norm_machine(name)
@@ -164,6 +168,17 @@ class Report:
                                           key=lambda kv: -kv[1]))
                 L.append(f"  {host}: {h['loads']} loads, {h['load_s']} s — "
                          f"{models}")
+        if self.members:
+            from .verdict_log import summary_lines
+            L += ["", "WHO HELPS (per kind of question: how often each "
+                  "member sat on the panel, won the Judge's ranking, its "
+                  "mean score, and how much of its draft reached the final "
+                  "answer):"] + summary_lines(self.members)
+        if self.mix:
+            from .verdict_log import mix_lines
+            L += ["", "MODEL MIX (panels whose members answer with the same "
+                  "model — a debate between copies of one model mostly "
+                  "repeats itself):"] + mix_lines(self.mix)
         if self.notes:
             L += ["", "NOTES:"] + [f"  - {n}" for n in self.notes]
         return "\n".join(L)
@@ -305,10 +320,15 @@ def build_report(vault_dir: Path, *, slots: Any = None,
                       _host_part(m.host) == _host_part(call["host"])), None)
             if m is not None:
                 call["host"] = m.name
+    from . import verdict_log
+    roles = role_models(slots, main_path)
     return Report(generated=now, days=days, usage=usage_log.summarise(calls),
                   loads=usage_log.loads_by_host(calls),
+                  members=verdict_log.summarise(
+                      verdict_log.read(vault_dir, now - days * 86400, now)),
+                  mix=verdict_log.shared_models(roles) if roles else [],
                   machines=[local] + machines,
-                  roles=role_models(slots, main_path),
+                  roles=roles,
                   controller_role=controller_role(slots), notes=notes)
 
 
@@ -325,7 +345,10 @@ call to the same model, a machine that is idle while another is busy, a \
 reply cut off, a model nobody uses taking space, or a machine whose models \
 keep loading (MODEL LOADING: several models swapping in and out of its \
 memory — share one model between roles there, or move a role to another \
-machine). If things are fine, say so \
+machine). WHO HELPS shows which members earn their place on each \
+kind of question; MODEL MIX shows panels whose members share one model — \
+when a better split is possible with installed models, give one of them a \
+different family. If things are fine, say so \
 and set "rearrange" to false — changing nothing is a good answer.
 
 Rules:
