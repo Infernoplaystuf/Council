@@ -738,3 +738,28 @@ def test_the_cached_text_of_a_deleted_document_goes(tmp_path):
         assert not any("combination" in r[0]
                        for r in kg.db.execute("SELECT lines || records FROM doc_cache"))
         assert "doc_cache" not in json.dumps(kg.export_json())
+
+
+def test_the_text_of_a_deleted_document_is_gone_from_the_stores_bytes(tmp_path):
+    # Gone from every row, the text was still in graph.sqlite's free pages
+    # (secure_delete was off): MEASURED 3 copies of a line that names no
+    # entity - a line that, before doc_cache, never entered the store at all.
+    mark = "The combination is 7319-ZEBRA-QUILL."
+    v = _tiny(tmp_path, {"a.md": "Project: PRJ-1\nProgram Lead: Carol Lee\n",
+                         "secret.txt": "Owner: Dan Smith\n" + (mark + "\n") * 3
+                         + "filler line\n" * 200})
+    with _graph(v) as kg:
+        kg.seed()
+        (v / "data_in" / "secret.txt").unlink()
+        kg.seed()
+    raw = kgm.store_path(v).read_bytes()
+    assert mark.encode() not in raw
+    # ...and an edited document's old text goes the same way.
+    v2 = _tiny(tmp_path, {"b.txt": "Owner: Dan Smith\n" + (mark + "\n") * 3
+                          + "filler line\n" * 200}, name="tiny2")
+    with _graph(v2) as kg:
+        kg.seed()
+        (v2 / "data_in" / "b.txt").write_text("Owner: Dan Smith\nnothing secret\n",
+                                              encoding="utf-8")
+        kg.seed()
+    assert mark.encode() not in kgm.store_path(v2).read_bytes()

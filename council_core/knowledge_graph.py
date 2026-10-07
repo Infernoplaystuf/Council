@@ -614,6 +614,13 @@ class KnowledgeGraph:
             self.db = sqlite3.connect(str(self.path))
             self.db.row_factory = sqlite3.Row
             self.db.execute("PRAGMA foreign_keys = ON")
+            # Deleted rows are overwritten with zeros, not just unlinked. The
+            # store caches every document's text (doc_cache, decision g), and
+            # a deleted document's text stayed in the file's free pages after
+            # the rebuild that dropped its row - MEASURED: 3 copies of a
+            # marker line (review, 2026-10-07). 'FAST' would leave the freed
+            # overflow pages a long text lives in: it has to be ON.
+            self.db.execute("PRAGMA secure_delete = ON")
             with self.db:
                 self.db.executescript(SCHEMA_SQL)
                 self.db.execute("INSERT OR IGNORE INTO meta VALUES "
@@ -990,7 +997,16 @@ class KnowledgeGraph:
                         stats["documents_read"] += 1
                         readable.append((p, did, h))
                 except Exception as exc:
+                    # Listed but not readable now (held open with an exclusive
+                    # lock by another program, a parse error): 'unreadable',
+                    # with what it had - not 'missing'. It never reached
+                    # seen_paths, so it was marked missing and its model links
+                    # were deleted (review, 2026-10-07: locked once, its links
+                    # were gone for good).
                     stats["unreadable"].append(f"{rel}: {exc.__class__.__name__}")
+                    seen_paths.add(rel)
+                    self.db.execute("UPDATE documents SET status='unreadable' WHERE path=?",
+                                    (rel,))
                 n_batch += 1
                 if n_batch >= self.SEED_BATCH or time.time() - last >= self.SEED_BATCH_S:
                     self.db.commit()
@@ -1066,6 +1082,19 @@ class KnowledgeGraph:
                     "DELETE FROM evidence WHERE method='model' AND (content_hash !="
                     " (SELECT content_hash FROM documents d WHERE d.id=evidence.document_id)"
                     " OR document_id IN (SELECT id FROM documents WHERE status='missing'))")
+                # ...and what a model READ goes with what it found: those
+                # passages are read again if that content comes back (a file
+                # moved out and back, an edit undone). Kept, the passages still
+                # counted as done and the dropped links never came back
+                # (review, 2026-10-07: chunks=0, documents_skipped=1).
+                self.db.execute(
+                    "DELETE FROM extraction_done WHERE document_id NOT IN"
+                    " (SELECT id FROM documents WHERE status != 'missing') OR content_hash !="
+                    " (SELECT content_hash FROM documents d WHERE"
+                    "  d.id=extraction_done.document_id)")
+                self.db.execute(
+                    "DELETE FROM extraction_docs WHERE document_id NOT IN"
+                    " (SELECT id FROM documents WHERE status != 'missing')")
                 self._seed_records(records, run_id)
                 if use_collections:
                     stats["collections"] = self._seed_collections(run_id)
@@ -1176,17 +1205,23 @@ class KnowledgeGraph:
 
     def initial_candidates(self, key: str) -> List[str]:
         """People whose surname matches and first name starts with the
-        initial: 'd whitfield' -> Dana Whitfield, Dan Whitfield."""
+        initial: 'd whitfield' -> Dana Whitfield, Dan Whitfield.
+
+        A spelling the user merged counts for its survivor, once: 'Dana J
+        Whitfield' merged into 'Dana Whitfield' is ONE candidate. (Here the
+        merged spelling was dropped, while the gazetteer counted it as a
+        second person, so one 'D. Whitfield' line got both an inferred
+        alias and a "which one?" question naming the survivor and her own
+        merged spelling, after every rebuild - review, 2026-10-07.)"""
         ini, surname = key.split()
-        out = []
-        for r in self.db.execute("SELECT id, key FROM entities WHERE type='PERSON'"
-                                 " AND merged_into IS NULL"):
+        out = set()
+        for r in self.db.execute("SELECT id, key FROM entities WHERE type='PERSON'"):
             if self._live is not None and r["id"] not in self._live:
                 continue        # left over from an earlier run (see seed)
             toks = r["key"].split()
             if (len(toks) >= 2 and toks[-1] == surname and toks[0].startswith(ini)
                     and len(toks[0]) > 1):
-                out.append(r["id"])
+                out.add(self.resolve(r["id"]))
         return sorted(out)
 
     def _review(self, kind, surface, cands, did, loc, snippet, run_id) -> None:
@@ -1330,14 +1365,16 @@ class KnowledgeGraph:
                 by_token.setdefault(m.group(0).lower(), []).append(i)
             else:
                 always.append(i)
-        # Initial forms of every full-named person: 'D. Whitfield'.
-        initials: Dict[str, List[str]] = {}
+        # Initial forms of every full-named person: 'D. Whitfield'. A merged
+        # spelling counts for its survivor, once (see initial_candidates).
+        initials: Dict[str, set] = {}
         for r in self.db.execute("SELECT id, key FROM entities WHERE type='PERSON'"):
             if self._live is not None and r["id"] not in self._live:
                 continue        # left over from an earlier run (see seed)
             toks = r["key"].split()
             if len(toks) >= 2 and len(toks[0]) > 1:
-                initials.setdefault(f"{toks[0][0]} {toks[-1]}", []).append(r["id"])
+                initials.setdefault(f"{toks[0][0]} {toks[-1]}", set()).add(
+                    self.resolve(r["id"]))
         n = 0
         for p in files:
             if p.suffix.lower() in _TABULAR:
@@ -1417,8 +1454,12 @@ class KnowledgeGraph:
         for d in self.decisions():
             if d["action"] == "name":
                 p = d["payload"]
-                said[(_name_key(p.get("surface", "")), p.get("document_id") or "")] = \
-                    p.get("surface", "")
+                surface, doc = p.get("surface", ""), p.get("document_id") or ""
+                # Under both keys: an older Council stored the answer under
+                # fold(), and its row was listed as 'whitfield d', not as
+                # the name the user answered about.
+                for key in dict.fromkeys((_name_key(surface), fold(surface))):
+                    said[(key, doc)] = surface
         out = []
         for r in self.db.execute(
                 "SELECT nd.*, d.path FROM name_decisions nd LEFT JOIN documents d ON"
@@ -1444,9 +1485,12 @@ class KnowledgeGraph:
             # The question's own row is 'resolved', and a rebuild re-asks
             # with INSERT OR IGNORE on the same (kind, surface, document,
             # spot): it would stay answered. It goes, so it is asked again.
+            # ``key`` may be an older Council's fold() key ('whitfield d' for
+            # 'Whitfield, D.'): matched only by person_key, its question
+            # stayed answered and the name stayed unlinked for good.
             for r in self.db.execute("SELECT id, surface, document_id FROM review"
                                      " WHERE status='resolved'").fetchall():
-                if _name_key(r["surface"]) == key and (
+                if key in (_name_key(r["surface"]), fold(r["surface"])) and (
                         not document_id or r["document_id"] == document_id):
                     self.db.execute("DELETE FROM review WHERE id=?", (r["id"],))
             self._decide("name_undo", {"key": key, "document_id": document_id or None})

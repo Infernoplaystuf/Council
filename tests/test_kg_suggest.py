@@ -243,3 +243,65 @@ def test_model_evidence_from_a_deleted_file_goes(kg):
     (kg.root / "ironbridge" / "notes" / "meeting_2026-04-02.txt").unlink()
     kg.seed()
     assert ("Dan Whitfield", "WORKS_ON", "PRJ-0944") not in _model_links(kg)
+
+
+# ── review of 2026-10-07: a model's links are never lost for good ─────────
+DAN = ("Dan Whitfield", "WORKS_ON", "PRJ-0944")
+
+
+def _meeting(kg):
+    return kg.root / "ironbridge" / "notes" / "meeting_2026-04-02.txt"
+
+
+def test_a_file_moved_out_and_back_is_read_again_and_its_links_come_back(kg):
+    # Its model evidence went while it was gone, but its passages still
+    # counted as read: 'chunks=0, documents_skipped=1', the link never came
+    # back, and the tab only ever asks for new passages.
+    kg.suggest_from_text({"pc": oracle()}, model="oracle")
+    away = kg.vault / "away.txt"
+    _meeting(kg).replace(away)
+    kg.seed()
+    assert DAN not in _model_links(kg)
+    away.replace(_meeting(kg))
+    kg.seed()
+    st = kg.suggest_from_text({"pc": oracle()}, model="oracle")
+    assert st["chunks"] >= 1 and DAN in _model_links(kg)
+
+
+def test_an_edit_undone_is_read_again(kg):
+    p = _meeting(kg)
+    original = p.read_bytes()
+    kg.suggest_from_text({"pc": oracle()}, model="oracle")
+    p.write_text("Nothing was decided.\n", encoding="utf-8")
+    kg.seed()
+    assert DAN not in _model_links(kg)
+    p.write_bytes(original)
+    kg.seed()
+    kg.suggest_from_text({"pc": oracle()}, model="oracle")
+    assert DAN in _model_links(kg)
+
+
+@pytest.mark.skipif(__import__("sys").platform != "win32",
+                    reason="an exclusive lock is a Windows share mode")
+def test_a_file_locked_for_one_rebuild_keeps_its_model_links(kg):
+    # Held open by another program (no sharing), the file could not be
+    # hashed, was marked 'missing', and its model links were deleted.
+    import ctypes
+    from ctypes import wintypes
+    kg.suggest_from_text({"pc": oracle()}, model="oracle")
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateFileW.restype = wintypes.HANDLE
+    h = k32.CreateFileW(str(_meeting(kg)), 0x80000000, 0, None, 3, 0x80, None)
+    assert h not in (None, wintypes.HANDLE(-1).value)
+    try:
+        st = kg.seed()
+    finally:
+        k32.CloseHandle(h)
+    rel = _meeting(kg).relative_to(kg.root).as_posix()
+    assert any(u.startswith(rel) for u in st["unreadable"])
+    assert kg.db.execute("SELECT status FROM documents WHERE path=?",
+                         (rel,)).fetchone()[0] == "unreadable"
+    assert DAN in _model_links(kg)
+    kg.seed()
+    assert DAN in _model_links(kg)
+    assert kg.suggest_from_text({"pc": oracle()}, model="oracle")["chunks"] == 0

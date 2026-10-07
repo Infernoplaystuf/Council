@@ -314,6 +314,71 @@ def test_an_answer_can_be_forgotten(kg):
     assert [r for r in kg.reviews() if r["surface"] == "D. Whitfield"]
 
 
+def _small(tmp_path, files):
+    v = tmp_path / "small"
+    for rel, body in files.items():
+        f = v / "data_in" / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(body, encoding="utf-8")
+    g = kgm.KnowledgeGraph(v)
+    g.confirm_all_rules()
+    g.seed()
+    return g
+
+
+def test_two_people_merged_are_one_candidate_for_their_initial(tmp_path):
+    # Merged, 'Dana J Whitfield' still counted as a second person for the
+    # gazetteer's 'D. Whitfield', so every rebuild asked "which one?" naming
+    # the survivor and her own merged spelling (and the labelled line got an
+    # inferred alias too).
+    g = _small(tmp_path, {
+        "t.csv": "Project,Program Lead\nPRJ-1,Dana Whitfield\nPRJ-2,Dana J Whitfield\n",
+        "memo.txt": "Notes\nSpoke with D. Whitfield about the schedule.\n",
+        "status.md": "Project: PRJ-3\nOwner: D. Whitfield\n"})
+    try:
+        assert len([r for r in g.reviews() if r["kind"] == "ambiguous_name"]) == 2
+        g.merge(person(g, "Dana Whitfield"), person(g, "Dana J Whitfield"))
+        g.seed()
+        assert [r for r in g.reviews() if r["kind"] == "ambiguous_name"] == []
+        dana = person(g, "Dana Whitfield")
+        spots = {(m["path"], m["surface"]) for m in g.mentions(dana)}
+        assert {("memo.txt", "D. Whitfield"), ("status.md", "D. Whitfield")} <= spots
+        assert g.initial_candidates("d whitfield") == [dana]
+    finally:
+        g.close()
+
+
+def test_forgetting_an_older_councils_answer_for_a_surname_first_name_asks_again(tmp_path):
+    # An answer 92699e0 stored under fold('Whitfield, D.') = 'whitfield d'
+    # was listed under that raw key, and forgetting it matched no question
+    # (person_key gives 'd whitfield'): no question came back, and the name
+    # stayed unlinked.
+    import time
+    g = _small(tmp_path, {
+        "t.csv": "Project,Program Lead\nPRJ-1,Dana Whitfield\nPRJ-2,Dan Whitfield\n",
+        "s.md": "Project: PRJ-3\nOwner: Whitfield, D.\n"})
+    try:
+        q = review(g, "Whitfield, D.")
+        dana = person(g, "Dana Whitfield")
+        with g.db:                                  # exactly what 92699e0 wrote
+            g.db.execute("INSERT OR REPLACE INTO name_decisions VALUES (?,?,?,?)",
+                         (kgm.fold(q["surface"]), "", dana, time.time()))
+            g.db.execute("UPDATE review SET status='resolved' WHERE id=?", (q["id"],))
+            g._decide("name", {"surface": q["surface"], "entity_id": dana,
+                               "document_id": None, "review_id": q["id"]})
+        g.seed()
+        assert any((r["subject"]["name"], r["object"]["name"]) == ("Dana Whitfield", "PRJ-3")
+                   for r in g.all_relations())
+        ans = g.answers()
+        assert [(a["key"], a["surface"]) for a in ans] == [("whitfield d", "Whitfield, D.")]
+        g.forget_answer(ans[0]["key"], ans[0]["document_id"])
+        g.seed()
+        assert [r["surface"] for r in g.reviews()] == ["Whitfield, D."]
+        assert g.reviews("resolved") == []
+    finally:
+        g.close()
+
+
 def test_an_everywhere_answer_covers_the_last_first_spelling(kg):
     q = review(kg, "D. Whitfield")
     kg.answer_review(q["id"], person(kg, "Dana Whitfield"), everywhere=True)
