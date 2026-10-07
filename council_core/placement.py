@@ -113,6 +113,8 @@ class Report:
     roles: Dict[str, str]          # role -> model it answers with
     controller_role: str
     notes: List[str] = field(default_factory=list)
+    #: usage_log.loads_by_host for the period.
+    loads: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def machine(self, name: str) -> Optional[Machine]:
         key = _norm_machine(name)
@@ -149,7 +151,19 @@ class Report:
                 f"calls, {u['gen_tokens']} tokens, {u['seconds']} s, "
                 f"{_fmt(u['median_tok_s'])} tok/s, wait "
                 f"{_fmt(u['median_wait_s'])} s"
-                + (f", {u['truncated']} cut off" if u.get("truncated") else ""))
+                + (f", {u['truncated']} cut off" if u.get("truncated") else "")
+                + (f", model loaded {u['loads']} times ({u['load_s']} s)"
+                   if u.get("loads") else ""))
+        if self.loads:
+            L += ["", "MODEL LOADING (calls that had to load their model "
+                  "first; several models loading many times on one machine "
+                  "means they are swapping in and out of memory):"]
+            for host, h in self.loads.items():
+                models = ", ".join(f"{m} ×{n}" for m, n in
+                                   sorted(h["models"].items(),
+                                          key=lambda kv: -kv[1]))
+                L.append(f"  {host}: {h['loads']} loads, {h['load_s']} s — "
+                         f"{models}")
         if self.notes:
             L += ["", "NOTES:"] + [f"  - {n}" for n in self.notes]
         return "\n".join(L)
@@ -292,6 +306,7 @@ def build_report(vault_dir: Path, *, slots: Any = None,
             if m is not None:
                 call["host"] = m.name
     return Report(generated=now, days=days, usage=usage_log.summarise(calls),
+                  loads=usage_log.loads_by_host(calls),
                   machines=[local] + machines,
                   roles=role_models(slots, main_path),
                   controller_role=controller_role(slots), notes=notes)
@@ -307,7 +322,10 @@ whether the AI models should be re-arranged across the machines.
 Read the report. Recommend a change only when the usage shows a real \
 problem: a role that is slow for what it needs, a model waiting on another \
 call to the same model, a machine that is idle while another is busy, a \
-reply cut off, a model nobody uses taking space. If things are fine, say so \
+reply cut off, a model nobody uses taking space, or a machine whose models \
+keep loading (MODEL LOADING: several models swapping in and out of its \
+memory — share one model between roles there, or move a role to another \
+machine). If things are fine, say so \
 and set "rearrange" to false — changing nothing is a good answer.
 
 Rules:

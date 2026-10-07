@@ -33,6 +33,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
 DIR_NAME = ".council_usage"
+#: A call that spent at least this long loading its model counts as a load
+#: (on a machine that cannot hold every model it serves, as a swap).
+LOAD_S = 0.5
 LOCAL_HOST = "local"
 
 #: The stats keys a line keeps; anything else in the report is dropped.
@@ -164,7 +167,8 @@ def summarise(calls: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
                                     "host": key[2], "calls": 0,
                                     "gen_tokens": 0, "seconds": 0.0,
                                     "_speeds": [], "_waits": [],
-                                    "truncated": 0})
+                                    "truncated": 0, "loads": 0,
+                                    "load_s": 0.0})
         g["calls"] += 1
         g["gen_tokens"] += int(c.get("gen_tokens") or 0)
         g["seconds"] += float(c.get("seconds") or 0.0)
@@ -174,14 +178,35 @@ def summarise(calls: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
             g["_waits"].append(float(c["wait_s"]))
         if c.get("truncated"):
             g["truncated"] += 1
+        if float(c.get("load_s") or 0.0) >= LOAD_S:
+            g["loads"] += 1
+            g["load_s"] += float(c["load_s"])
     out = []
     for g in groups.values():
         speeds, waits = sorted(g.pop("_speeds")), sorted(g.pop("_waits"))
         g["median_tok_s"] = speeds[len(speeds) // 2] if speeds else None
         g["median_wait_s"] = waits[len(waits) // 2] if waits else None
         g["seconds"] = round(g["seconds"], 1)
+        g["load_s"] = round(g["load_s"], 1)
         out.append(g)
     out.sort(key=lambda g: (-g["seconds"], -g["calls"], g["role"]))
+    return out
+
+
+def loads_by_host(calls: Iterable[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Per machine: how many calls had to load their model first, the
+    seconds spent loading, and which models were loaded. Many loads of
+    several models on one machine is models swapping in and out."""
+    out: Dict[str, Dict[str, Any]] = {}
+    for c in calls:
+        if float(c.get("load_s") or 0.0) < LOAD_S:
+            continue
+        h = out.setdefault(c.get("host") or LOCAL_HOST,
+                           {"loads": 0, "load_s": 0.0, "models": {}})
+        h["loads"] += 1
+        h["load_s"] = round(h["load_s"] + float(c["load_s"]), 1)
+        m = c.get("model") or "?"
+        h["models"][m] = h["models"].get(m, 0) + 1
     return out
 
 
@@ -276,4 +301,5 @@ def summarise_tools(calls: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 __all__ = ["DIR_NAME", "LOCAL_HOST", "FIELDS", "usage_dir", "record",
            "install", "uninstall", "read", "summarise", "entry_from_stats",
-           "record_tool", "read_tools", "summarise_tools", "TOOL_FIELDS"]
+           "record_tool", "read_tools", "summarise_tools", "TOOL_FIELDS",
+           "loads_by_host", "LOAD_S"]

@@ -777,6 +777,41 @@ class DeliberationOrchestrator:
                 raise o.error
         return {k: o.value for k, o in zip(keys, outcomes)}
 
+    def _model_of(self, key: str) -> Tuple[str, str]:
+        """(machine, model) this member's calls run on — council_engine.
+        model_key for a real personality; ("", "") for anything else."""
+        import sys
+        agent = self.agents.get(key)
+        model = getattr(agent, "model", None)
+        engine = sys.modules.get("council_engine")
+        if engine is None or not isinstance(model, engine.PersonalityModel):
+            return "", ""
+        try:
+            return engine.model_key(getattr(model, "name", key))
+        except Exception:                                 # noqa: BLE001
+            return "", ""
+
+    def _swap_risk(self, role: str, others: List[str]) -> bool:
+        """Would `role` and one of `others` swap models on one machine?"""
+        where, which = self._model_of(role)
+        if not which:
+            return False
+        for k in others:
+            if k == role:
+                continue
+            w2, m2 = self._model_of(k)
+            if m2 and w2 == where and m2 != which:
+                return True
+        return False
+
+    def _group_by_model(self, keys: List[str]) -> List[str]:
+        """`keys` with members on the same model next to each other, in the
+        order each model first appears."""
+        order: Dict[Tuple[str, str], int] = {}
+        for k in keys:
+            order.setdefault(self._model_of(k), len(order))
+        return sorted(keys, key=lambda k: order[self._model_of(k)])
+
     def _phase(self, label: str) -> None:
         self._emit(AgentEvent("Orchestrator", "phase", f"▶ {label}"))
 
@@ -861,6 +896,57 @@ class DeliberationOrchestrator:
                 # first meet each other's answers in the rebuttal. A
                 # clarification then reaches the next round, not the members
                 # drafting alongside.
+                # The Peasant's questions about each draft, as soon as it is
+                # written — or, when the Peasant's model and a member's
+                # model share a machine but differ (they would unload each
+                # other at every turn: member, Peasant, member, Peasant),
+                # after all the drafts, so each model loads once
+                # (_swap_risk). Later drafts then read the earlier drafts
+                # without the Peasant's questions about them.
+                def _cross_examine(key: str, answer: str) -> None:
+                    self._phase(f"Peasant — cross-examining {key}")
+                    _pexam_mode = ctx.shared.get("query_mode", "")
+                    qtxt = peasant_cross_exam(
+                        self.agents["peasant"].model,
+                        candidate_role=key, candidate_text=answer, user_text=user_text,
+                        prior_qa=_peasant_qa_log if _peasant_qa_log else None,
+                        query_mode=_pexam_mode,
+                    )
+                    _pq_score = _peasant_quality_score(qtxt, answer, _peasant_qa_log)
+                    if not _looks_like_two_questions(qtxt):
+                        # Reformat existing answer rather than full regeneration — cheaper
+                        _reformat_prompt = (
+                            "Your response below is good but needs exactly two questions "
+                            "labelled Q1: and Q2:. Reformat it now — keep the same ideas, "
+                            "just add Q1: and Q2: labels and make sure each ends with '?'.\n\n"
+                            f"YOUR RESPONSE:\n{qtxt}"
+                        )
+                        qtxt = self.agents["peasant"].model.respond(
+                            _reformat_prompt, max_tokens=300)
+                        _pq_score = _peasant_quality_score(qtxt, answer, _peasant_qa_log)
+                        if not _looks_like_two_questions(qtxt):
+                            _axes = ", ".join(
+                                k + ("=✓" if v else "=✗")
+                                for k, v in _pq_score["axes"].items()
+                            )
+                            emit(AgentEvent("Peasant", "observation",
+                                "⚠ Quality low after reformat ("
+                                + str(_pq_score["total"]) + "/4: " + _axes + ")"))
+                    _log_peasant_questions(qtxt)
+                    candidates[key]["peasant_q"] = qtxt
+                    _stag = " [q:" + str(_pq_score["total"]) + "/4]"
+                    ev = AgentEvent("Peasant", "observation",
+                                   f"Questions about {key}" + _stag + ":\n" + qtxt)
+                    emit(ev)
+                    discussion_lines.append(f"PEASANT → {key}:\n{qtxt}\n")
+
+                _defer_exam = (not self.parallel_members and not _quick
+                               and "peasant" in self.agents
+                               and self._swap_risk("peasant", panel))
+                if _defer_exam:
+                    self._phase("Peasant questions held until every draft is "
+                                "written — its model would swap with the "
+                                "members'")
                 drafts: Dict[str, Any] = {}
                 if self.parallel_members and len(panel) > 1:
                     self._phase(f"Drafting — {len(panel)} members at once")
@@ -915,45 +1001,19 @@ class DeliberationOrchestrator:
                                 discussion_lines.append(_clarif_note)
 
                     if key != "peasant" and "peasant" in self.agents \
-                            and not _quick:
-                        self._phase(f"Peasant — cross-examining {key}")
-                        _pexam_mode = ctx.shared.get("query_mode", "")
-                        qtxt = peasant_cross_exam(
-                            self.agents["peasant"].model,
-                            candidate_role=key, candidate_text=answer, user_text=user_text,
-                            prior_qa=_peasant_qa_log if _peasant_qa_log else None,
-                            query_mode=_pexam_mode,
-                        )
-                        _pq_score = _peasant_quality_score(qtxt, answer, _peasant_qa_log)
-                        if not _looks_like_two_questions(qtxt):
-                            # Reformat existing answer rather than full regeneration — cheaper
-                            _reformat_prompt = (
-                                "Your response below is good but needs exactly two questions "
-                                "labelled Q1: and Q2:. Reformat it now — keep the same ideas, "
-                                "just add Q1: and Q2: labels and make sure each ends with '?'.\n\n"
-                                f"YOUR RESPONSE:\n{qtxt}"
-                            )
-                            qtxt = self.agents["peasant"].model.respond(
-                                _reformat_prompt, max_tokens=300)
-                            _pq_score = _peasant_quality_score(qtxt, answer, _peasant_qa_log)
-                            if not _looks_like_two_questions(qtxt):
-                                _axes = ", ".join(
-                                    k + ("=✓" if v else "=✗")
-                                    for k, v in _pq_score["axes"].items()
-                                )
-                                emit(AgentEvent("Peasant", "observation",
-                                    "⚠ Quality low after reformat ("
-                                    + str(_pq_score["total"]) + "/4: " + _axes + ")"))
-                        _log_peasant_questions(qtxt)
-                        candidates[key]["peasant_q"] = qtxt
-                        _stag = " [q:" + str(_pq_score["total"]) + "/4]"
-                        ev = AgentEvent("Peasant", "observation",
-                                       f"Questions about {key}" + _stag + ":\n" + qtxt)
-                        emit(ev)
-                        discussion_lines.append(f"PEASANT → {key}:\n{qtxt}\n")
+                            and not _quick and not _defer_exam:
+                        _cross_examine(key, answer)
 
                     ctx.shared["candidates"] = candidates
                     ctx.shared["discussion_transcript"] = "\n".join(discussion_lines[-40:])
+
+                if _defer_exam:
+                    for key in panel:
+                        if key != "peasant" and key in candidates:
+                            _cross_examine(key, candidates[key]["answer"])
+                    ctx.shared["candidates"] = candidates
+                    ctx.shared["discussion_transcript"] = \
+                        "\n".join(discussion_lines[-40:])
 
                 # 2) Rebuttals
                 if self._pause_event and not self._pause_event.is_set():
@@ -1005,6 +1065,10 @@ class DeliberationOrchestrator:
                 rebutters = [k for k in panel
                              if k != "peasant" and k in candidates
                              and not _quick]
+                # One at a time, members on the same model go one after
+                # another, so each model loads once (rebuttals are
+                # independent; the order changes nothing else).
+                rebutters = self._group_by_model(rebutters)
                 # Each rebuttal reads only the finished drafts and the Peasant's
                 # questions — never another rebuttal — so writing them side by
                 # side changes nothing but the time it takes.

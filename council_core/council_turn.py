@@ -159,6 +159,15 @@ class TurnResult:
     low_conf_gaps: List[Dict[str, Any]] = field(default_factory=list)
     #: The question as asked (council_core.after_turn writes memory from it).
     question: str = ""
+    #: What the question cost (council_core.turn_meter.Meter.as_dict):
+    #: model calls, model time, wall time, model loads.
+    meter: Dict[str, Any] = field(default_factory=dict)
+    #: The depth it was answered at (council_core.depth): quick / standard /
+    #: deep.
+    depth: str = ""
+    #: The synthesising role, and who the Judge ranked first.
+    synth: str = ""
+    winner: str = ""
 
     #: Identifies THIS turn's verdict, or "" when it produced none.
     #:
@@ -185,6 +194,19 @@ def judge_critique(events: List[AgentEvent]) -> str:
     judge = [e for e in events if e.who == "Judge" and e.kind == "observation"]
     return next((e.text for e in reversed(judge) if "Verdict:" in e.text),
                 judge[-1].text if judge else "")
+
+
+def judge_winner(events: List[AgentEvent]) -> str:
+    """The role the Judge ranked first, or "" when it did not say."""
+    import json
+    for e in reversed(events):
+        if e.who == "Judge" and e.text.startswith("Ranking:"):
+            try:
+                return str(json.loads(e.text.split("Ranking:\n", 1)[-1])
+                           .get("winner", "") or "")
+            except Exception:                             # noqa: BLE001
+                return ""
+    return ""
 
 
 def judge_confidence(events: List[AgentEvent]) -> int:
@@ -282,8 +304,13 @@ def run_turn(question: str, models: Any, *,
             event_callback=collect, clarification_cb=clarification_cb,
             pause_event=pause_event, answer_getter=answer_getter,
             parallel_members=parallel_members)
-        events = orchestrator.run(question, panel=panel, synth=synth,
-                                  extra_ctx=extra_ctx) or collected
+        from .turn_meter import TurnMeter
+        with TurnMeter() as meter:
+            events = orchestrator.run(question, panel=panel, synth=synth,
+                                      extra_ctx=extra_ctx) or collected
+        note = meter.result.note()
+        if note:
+            collect(AgentEvent("Orchestrator", "observation", note))
 
         critique = judge_critique(events)
         verdict = "PASS" if "Verdict: PASS" in critique else "NEEDS_WORK"
@@ -294,7 +321,9 @@ def run_turn(question: str, models: Any, *,
         result = TurnResult(
             True, answer=answer, critique=critique, verdict=verdict,
             confidence=judge_confidence(events), route=route, panel=panel,
-            events=list(events), low_conf_gaps=gaps, question=question)
+            events=list(events), low_conf_gaps=gaps, question=question,
+            meter=meter.result.as_dict(), depth=chosen.level, synth=synth,
+            winner=judge_winner(events))
         # A verdict id only when there IS a verdict. See TurnResult.verdict_id.
         if critique:
             result.verdict_id = f"{route or 'turn'}:{len(events)}:{verdict}"

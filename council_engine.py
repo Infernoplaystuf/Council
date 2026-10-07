@@ -57,7 +57,7 @@ import weakref
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, Generator, Iterator, List, Optional, Tuple
+from typing import Any, Callable, Dict, Generator, Iterator, List, Optional, Sequence, Tuple
 import urllib.request
 
 
@@ -2980,6 +2980,68 @@ def _target_for(slot: str, model: Optional[str] = None) -> Tuple[str, str]:
     if _council_backend() == "ollama":
         return "ollama", _pick_default_ollama_model()
     return "gguf", ""
+
+
+def model_key(role: Optional[str]) -> Tuple[str, str]:
+    """(where, which): the machine a call for `role` runs on ("local", or
+    the routed node's URL) and the model that answers it ("ollama:<name>"
+    or a GGUF path). Two roles with the same `where` and different `which`
+    swap models on that machine when it cannot hold both. Never loads a
+    model; ("local", "") when it cannot tell."""
+    try:
+        slot = _slot_for_role(role)
+        target = _node_target(role)
+        return (target.url if target is not None else "local",
+                served_model(slot))
+    except Exception:                                     # noqa: BLE001
+        return "local", ""
+
+
+def warm(roles: Sequence[str], *, timeout: float = 300.0) -> List[str]:
+    """Load the models `roles` answer with, before they are needed: an
+    Ollama model not already loaded gets a load request (an empty prompt,
+    which Ollama answers by loading it and keeping it for keep_alive); a
+    GGUF slot is loaded in process. Blocking — call it from a background
+    thread. Two roles on DIFFERENT models of the same machine: only the
+    first is warmed, so warming never itself causes a swap. Never raises;
+    returns what it did, one line each."""
+    from council_core import local_models
+    done: List[str] = []
+    seen: Dict[str, str] = {}
+    for role in dict.fromkeys(roles):
+        try:
+            where, which = model_key(role)
+            if not which:
+                continue
+            if where in seen:
+                if seen[where] != which:
+                    done.append(f"{role}: not warmed — {seen[where]} is on "
+                                "that machine and they would swap")
+                continue
+            seen[where] = which
+            slot = _slot_for_role(role)
+            backend, name = _target_for(slot)
+            if backend == "gguf":
+                _slot_llm_and_lock(slot)
+                done.append(f"{role}: {Path(which).name} loaded")
+                continue
+            host = (where if where != "local"
+                    else local_models.ollama_host()).rstrip("/")
+            if not local_models.is_loopback_url(host) and not (
+                    _remote_nodes_enabled() or _routing_allows(host)):
+                continue
+            ps = local_models._get_json(host + "/api/ps", 2.0) or {}
+            loaded = {m.get("name") for m in ps.get("models") or []}
+            if name in loaded or f"{name}:latest" in loaded:
+                done.append(f"{role}: {name} already loaded")
+                continue
+            local_models._get_json(host + "/api/generate", timeout,
+                                   {"model": name,
+                                    "keep_alive": _ollama_keep_alive()})
+            done.append(f"{role}: {name} loaded")
+        except Exception as exc:                          # noqa: BLE001
+            done.append(f"{role}: not warmed ({exc})")
+    return done
 
 
 def served_model(slot: str = "main") -> str:

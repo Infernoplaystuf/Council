@@ -135,6 +135,8 @@ class CouncilActions:
         self._models = None
         self._models_problem = ""
         self._tools = None
+        from council_core.preload import Preloader
+        self._preloader = Preloader()
         #: One conversation per app run, so the Sessions tab can tell runs
         #: apart and each run's history starts clean.
         import time as _time
@@ -199,6 +201,22 @@ class CouncilActions:
                 council_turn.load_personalities(
                     self.vault_dir, session_id=self.session_id))
         return self._models, self._models_problem
+
+    def preload(self) -> bool:
+        """Warm the Writer's and the Judge's models while the user types
+        (council_core.preload). Only once the real personalities are
+        loaded — never for stand-ins, and never by loading them itself."""
+        models = self._models
+        if models is None:
+            return False
+        import sys
+        engine = sys.modules.get("council_engine")
+        if engine is None:
+            return False
+        real = [r for r in ("writer", "judge")
+                if isinstance(getattr(models, r, None),
+                              engine.PersonalityModel)]
+        return self._preloader.kick(real) if real else False
 
     def tools(self):
         """The members' tools (a tool_kit.ToolSet: each role gets its own
@@ -558,6 +576,8 @@ class CouncilTab(ViewHelpers, QWidget):
         self.input = QPlainTextEdit()
         self.input.setMaximumHeight(96)
         layout.addWidget(self.input)
+        # Typing a question warms the models it will need (preload).
+        self.input.textChanged.connect(self._on_typing)
         self._shortcut("Ctrl+Return", self.on_send, self.input)
 
         layout.addLayout(self._action_row())
@@ -772,6 +792,14 @@ class CouncilTab(ViewHelpers, QWidget):
         self.clarif_frame.hide()
         self.hide_verdict_bar()
         self.stream_box.clear_all()
+
+    def _on_typing(self) -> None:
+        preload = getattr(self.actions, "preload", None)
+        if preload is not None and self.input.toPlainText().strip():
+            try:
+                preload()
+            except Exception:                             # noqa: BLE001
+                pass
 
     def on_send(self) -> None:
         typed = self.input.toPlainText().strip()
