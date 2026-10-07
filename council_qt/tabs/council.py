@@ -96,6 +96,28 @@ def docs_readers(models, docs) -> list:
     return docs_brief.readers(models)
 
 
+def prepare_parallel(steps):
+    """Run each non-None step at the same time; {name: result}. A step that
+    raises is left out and its error kept under "_errors", so one failed
+    lookup costs that lookup, not the question."""
+    from concurrent.futures import ThreadPoolExecutor
+    steps = {k: fn for k, fn in steps.items() if fn is not None}
+    out, errors = {}, {}
+    if not steps:
+        return out
+    with ThreadPoolExecutor(max_workers=len(steps),
+                            thread_name_prefix="council-prep") as pool:
+        futures = {k: pool.submit(fn) for k, fn in steps.items()}
+        for k, fut in futures.items():
+            try:
+                out[k] = fut.result()
+            except Exception as exc:                      # noqa: BLE001
+                errors[k] = exc
+    if errors:
+        out["_errors"] = errors
+    return out
+
+
 class CouncilActions:
     """What the Council tab can ask the application to do.
 
@@ -213,72 +235,84 @@ class CouncilActions:
         if models is None:
             return council_turn.TurnResult(False, message=problem)
 
+        # Everything gathered before the council starts — the vault brief,
+        # the Sage's knowledge base, the task memo, past decisions, the
+        # Analyst's figures and the docs — is independent, so it runs side
+        # by side (prepare_parallel); the wait is the slowest step, not the
+        # sum. Model calls among them (memo, Analyst) are serialised per
+        # model file by the engine's own locks. The transcript lines still
+        # come out in the same order as before.
+        from council_core import past_decisions
+        from council_core.deliberation import AgentEvent
+
+        def say(who: str, text: str) -> None:
+            if on_event is not None and text:
+                on_event(AgentEvent(who, "observation", text))
+
+        sage = getattr(models, "sage", None)
+        writer = getattr(models, "writer", None)
+        got = prepare_parallel({
+            "brief": ((lambda: self.vault_brief(typed_text))
+                      if getattr(options, "vault", True) else None),
+            "sage_kb": ((lambda: vault_context.sage_block(typed_text,
+                                                          self.vault_dir))
+                        if sage is not None else None),
+            "memo": lambda: self.task_memo(typed_text),
+            "past": lambda: past_decisions.recall(self.vault_dir, typed_text),
+            "analysis": lambda: self.analyst(typed_text),
+            "docs": lambda: self.docs_brief(typed_text, models),
+        })
+
         # The vault passages this question needs, for this question only
         # (council_core.vault_context). Which roles see them is the engine's
         # per-role rule; the transcript says what was found.
         block, judge_evidence = "", ""
-        if getattr(options, "vault", True):
-            brief = self.vault_brief(typed_text)
+        brief = got.get("brief")
+        if brief is not None:
             block = brief.text
             judge_evidence = vault_context.evidence(brief)
-            if on_event is not None:
-                from council_core.deliberation import AgentEvent
-                on_event(AgentEvent("Librarian", "observation", brief.note()))
+            say("Librarian", brief.note())
 
         # The Sage's own knowledge base, for the Sage alone.
-        sage = getattr(models, "sage", None)
-        sage_kb = vault_context.sage_block(typed_text, self.vault_dir) \
-            if sage is not None else ""
-        if sage_kb and on_event is not None:
-            from council_core.deliberation import AgentEvent
+        sage_kb = got.get("sage_kb") or ""
+        if sage_kb:
             n = sum(1 for line in sage_kb.splitlines()
                     if line.strip().startswith(("[", "•")))
-            on_event(AgentEvent("Librarian", "observation",
-                                f"Sage: {n} item(s) from its knowledge base."))
+            say("Librarian", f"Sage: {n} item(s) from its knowledge base.")
 
         # The [TASK MEMO]: the goal and constraints, carried forward when
         # this is a follow-up, at the top of every member's context.
-        memo = self.task_memo(typed_text)
-        if memo and on_event is not None:
-            from council_core.deliberation import AgentEvent
-            on_event(AgentEvent("Task memo", "observation",
-                                self.task_memory.render_transcript_line()))
+        memo = got.get("memo") or ""
+        if memo:
+            say("Task memo", self.task_memory.render_transcript_line())
 
         # How similar questions were decided before (past_decisions): for
         # the Judge with the evidence, and for the Writer.
-        from council_core import past_decisions
-        past = past_decisions.recall(self.vault_dir, typed_text)
+        past = got.get("past") or []
         past_block = past_decisions.block(past)
-        if past and on_event is not None:
-            from council_core.deliberation import AgentEvent
-            on_event(AgentEvent("Librarian", "observation",
-                                past_decisions.note(past)))
+        if past:
+            say("Librarian", past_decisions.note(past))
         if past_block:
             judge_evidence = "\n\n".join(
                 x for x in (judge_evidence, past_block) if x)
-        writer = getattr(models, "writer", None)
 
         # Figures computed from the data files for a numbers question
         # (analyst_step): to every member and the Judge.
-        analysis = self.analyst(typed_text)
-        if on_event is not None and (analysis.note or analysis.table):
-            from council_core.deliberation import AgentEvent
-            if analysis.note:
-                on_event(AgentEvent("Librarian", "observation",
-                                    analysis.note))
-            if analysis.table:
-                on_event(AgentEvent("Analyst", "observation",
-                                    analysis.table))
+        from council_core.analyst_step import AnalystResult
+        analysis = got.get("analysis") or AnalystResult()
+        say("Librarian", analysis.note)
+        say("Analyst", analysis.table)
         if analysis.block:
             judge_evidence = "\n\n".join(
                 x for x in (judge_evidence, analysis.block) if x)
 
         # Real documentation for a coding question (docs_brief): to the
         # Coder and the Writer, so they use the documented API.
-        docs = self.docs_brief(typed_text, models)
-        if docs.titles and on_event is not None:
-            from council_core.deliberation import AgentEvent
-            on_event(AgentEvent("Librarian", "observation", docs.note()))
+        from council_core.docs_brief import DocsBrief
+        docs = got.get("docs") or DocsBrief()
+        say("Librarian", docs.note())
+        for name, exc in got.get("_errors", {}).items():
+            say("Librarian", f"{name}: skipped ({exc})")
 
         turn_models = vault_context.turn_models(models)
         with vault_context.applied(turn_models, memo), \

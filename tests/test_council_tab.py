@@ -595,3 +595,59 @@ def test_learning_is_skipped_for_a_direct_answer(qapp, tab):
     tab._learn_later(TurnResult(True, answer="a", route="direct"))
     qapp.processEvents()
     assert called == []
+
+
+def test_the_steps_before_a_question_run_side_by_side(tmp_path):
+    """The vault brief, the Analyst and the docs used to run one after
+    another before the first member spoke; they are independent."""
+    import time
+    from types import SimpleNamespace as NS
+    from council_core import analyst_step as an
+    from council_core import council_options
+    from council_core import council_turn as ct
+    from council_core import vault_context as vc
+    from council_core.docs_brief import DocsBrief
+    from council_qt.tabs.council import CouncilActions
+    from tests.test_council_turn import FakeJudge, FakeModel
+
+    def slow(value):
+        def fn(*_a):
+            time.sleep(0.4)
+            return value
+        return fn
+
+    actions = CouncilActions(vault_dir=tmp_path)
+    models = NS(**{n: None for n in ct.AGENT_NAMES})
+    models.writer, models.judge = FakeModel(), FakeJudge()
+    actions._models = models
+    actions.memo_llm = None
+    actions.vault_brief = slow(vc.Brief())
+    actions.analyst = slow(an.AnalystResult())
+    actions.docs_brief = slow(DocsBrief())
+    t0 = time.perf_counter()
+    assert actions.send("q", council_options.CouncilOptions.defaults()).ok
+    assert time.perf_counter() - t0 < 1.0, "the three 0.4 s steps ran in turn"
+
+
+def test_a_failed_step_before_the_question_costs_only_that_step(tmp_path):
+    from types import SimpleNamespace as NS
+    from council_core import council_options
+    from council_core import council_turn as ct
+    from council_core import vault_context as vc
+    from council_qt.tabs.council import CouncilActions
+    from tests.test_council_turn import FakeJudge, FakeModel
+
+    def boom(*_a):
+        raise RuntimeError("docs server gone")
+
+    actions = CouncilActions(vault_dir=tmp_path)
+    models = NS(**{n: None for n in ct.AGENT_NAMES})
+    models.writer, models.judge = FakeModel(), FakeJudge()
+    actions._models = models
+    actions.memo_llm = None
+    actions.vault_brief = lambda q: vc.Brief()
+    actions.docs_brief = boom
+    events = []
+    assert actions.send("q", council_options.CouncilOptions.defaults(),
+                        on_event=events.append).ok
+    assert any("docs: skipped (docs server gone)" in e.text for e in events)
