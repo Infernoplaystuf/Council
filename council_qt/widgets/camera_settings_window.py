@@ -73,15 +73,17 @@ from collections import deque
 from typing import (Any, Callable, Deque, Dict, List, Optional, Sequence,
                     Tuple)
 
-from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QKeySequence, QPainter, QPalette, QShortcut
+from PySide6.QtCore import QObject, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import (QColor, QKeySequence, QPainter, QPalette,
+                           QShortcut)
 from PySide6.QtWidgets import (QAbstractItemView, QAbstractSpinBox, QCheckBox,
                                QComboBox, QDoubleSpinBox, QFileDialog,
                                QGridLayout, QGroupBox, QHBoxLayout, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem,
                                QPlainTextEdit, QPushButton, QScrollArea,
                                QSizePolicy, QSlider, QSpinBox, QSplitter,
-                               QToolButton, QVBoxLayout, QWidget)
+                               QStyle, QStyleOptionSlider, QToolButton,
+                               QVBoxLayout, QWidget)
 
 #: Throttle for a moving slider or spin box: at most one write per WRITE_MS,
 #: the newest value, and always the last one.
@@ -154,6 +156,17 @@ def _decimals(setting: Dict[str, Any]) -> int:
     return 3 if span <= 10 else 2 if span <= 1000 else 1
 
 
+def _on_dark(widget: QWidget) -> bool:
+    """Whether `widget` is drawn on a dark background (see _tone)."""
+    holder: Optional[QWidget] = widget
+    while holder is not None:
+        said = holder.property("council_dark")
+        if said is not None:
+            return bool(said)
+        holder = holder.parentWidget()
+    return widget.palette().color(QPalette.ColorRole.Window).lightness() < 128
+
+
 def _tone(widget: QWidget, kind: str) -> str:
     """A text colour readable on the widget's own background: a window takes
     the system palette (light or dark), the main window's tabs the app's
@@ -163,20 +176,37 @@ def _tone(widget: QWidget, kind: str) -> str:
     ("council_dark"): under a style sheet the palette a label reports is not
     the one it is painted on (measured: a note in Typhon's teal tabs read a
     light palette and came out dark grey on teal)."""
-    dark = None
-    holder: Optional[QWidget] = widget
-    while holder is not None:
-        said = holder.property("council_dark")
-        if said is not None:
-            dark = bool(said)
-            break
-        holder = holder.parentWidget()
-    if dark is None:
-        dark = widget.palette().color(
-            QPalette.ColorRole.Window).lightness() < 128
+    dark = _on_dark(widget)
     return {"bad": "#ff8a80" if dark else "#b3261e",
             "warn": "#ffd180" if dark else "#7a4f00",
-            "dim": "#c8d6dc" if dark else "#5f5f5f"}.get(kind, "")
+            "dim": "#c8d6dc" if dark else "#5f5f5f",
+            "good": "#8fe3a0" if dark else "#2e8540"}.get(kind, "")
+
+
+def _short(value: Any) -> str:
+    """A range end for a person: 20000000 is "20,000,000", not "2e+07"."""
+    number = _number(value)
+    if number is None:
+        return show(value)
+    if float(number).is_integer() and abs(number) >= 10000:
+        return f"{int(number):,}"
+    return show(float(number) if not float(number).is_integer()
+                else int(number))
+
+
+def range_text(setting: Dict[str, Any]) -> str:
+    """The camera's own range for a number setting, with its unit and, for
+    a bias, the sensor's recommended range: "-85 … 140" / "rec. -25 … 60".
+    "" for a setting the camera gives no range."""
+    low, high = setting.get("min"), setting.get("max")
+    if _number(low) is None or _number(high) is None:
+        return ""
+    unit = str(setting.get("unit") or "")
+    text = f"{_short(low)} … {_short(high)} {unit}".rstrip()
+    rec = setting.get("recommended")
+    if rec:
+        text += f"\nrec. {_short(rec[0])} … {_short(rec[1])}"
+    return text
 
 
 def _colour(label: QLabel, colour: str) -> None:
@@ -295,6 +325,52 @@ class ElidedLabel(QLabel):
         return QSize(min(hint.width(), 48), hint.height())
 
 
+class RangeSlider(QSlider):
+    """A slider that marks the RECOMMENDED part of its range: a bar under
+    the groove from the low to the high end of what the sensor recommends
+    (a bias's get_bias_recommended_range).
+
+    An EVK4's bias may be set far outside what works well (bias_diff_on runs
+    -85 … 140; -25 … 60 is recommended). The row already says so in words
+    once the value is outside; the bar shows where "inside" is while the
+    slider is being dragged, in a tab too narrow for the words."""
+
+    def __init__(self, orientation: Qt.Orientation, parent: QWidget):
+        super().__init__(orientation, parent)
+        #: (from, to) in slider positions, or None: nothing to mark.
+        self.recommended: Optional[Tuple[int, int]] = None
+
+    def mark(self, span: Optional[Tuple[int, int]]) -> None:
+        if span != self.recommended:
+            self.recommended = span
+            self.update()
+
+    def paintEvent(self, event: Any) -> None:            # noqa: N802
+        super().paintEvent(event)
+        if self.recommended is None or self.maximum() <= self.minimum():
+            return
+        option = QStyleOptionSlider()
+        self.initStyleOption(option)
+        style = self.style()
+        groove = style.subControlRect(QStyle.ComplexControl.CC_Slider, option,
+                                      QStyle.SubControl.SC_SliderGroove, self)
+        handle = style.subControlRect(QStyle.ComplexControl.CC_Slider, option,
+                                      QStyle.SubControl.SC_SliderHandle, self)
+        room = max(1, groove.width() - handle.width())
+        left = groove.left() + handle.width() / 2.0
+
+        def x(position: int) -> float:
+            return left + QStyle.sliderPositionFromValue(
+                self.minimum(), self.maximum(), position, room)
+
+        start, end = sorted(self.recommended)
+        painter = QPainter(self)
+        painter.fillRect(QRectF(x(start), self.height() - 3.0,
+                                max(2.0, x(end) - x(start)), 2.0),
+                         QColor(_tone(self, "good")))
+        painter.end()
+
+
 class SettingRow(QObject):
     """The widgets of one setting in its group's grid: label, slider, editor
     (with the unit), a reset button, and a note under them.
@@ -313,7 +389,12 @@ class SettingRow(QObject):
 
     `explain_read_only`: say under a read-only row why it cannot change —
     where it sits among settings that can (a group of readings says so once,
-    above them)."""
+    above them).
+
+    `show_range`: a column after the box with the camera's own range and
+    unit, and a bias's recommended range — a pop-out is where a category is
+    tuned, so the limits are on the row rather than in a tooltip. Both views
+    mark the recommended part of a slider (RangeSlider)."""
 
     edited = Signal(str, object)
     reset = Signal(str)
@@ -326,7 +407,7 @@ class SettingRow(QObject):
 
     def __init__(self, setting: Dict[str, Any], grid: QGridLayout, row: int,
                  parent: QWidget, compact: bool = False,
-                 explain_read_only: bool = False):
+                 explain_read_only: bool = False, show_range: bool = False):
         super().__init__(parent)
         self.setting = dict(setting)
         self.key = str(setting["key"])
@@ -334,6 +415,8 @@ class SettingRow(QObject):
         self.read_only = bool(setting.get("read_only"))
         self.compact = bool(compact)
         self.explain_read_only = bool(explain_read_only)
+        #: The range column (show_range), or None.
+        self.range_label: Optional[QLabel] = None
         self._quiet = False
         #: The answer to the last write, said under the row until replaced.
         self.result = ""
@@ -361,12 +444,27 @@ class SettingRow(QObject):
         self.label.setToolTip(self._tooltip())
         grid.addWidget(self.label, row, 0)
         self._build(grid, row, parent)
+        last = 3
+        if show_range:
+            last = 4
+            self.range_label = QLabel(parent)
+            self.range_label.setProperty("council_small", True)
+            small = self.range_label.font()
+            small.setPointSizeF(max(7.0, small.pointSizeF() - 1))
+            self.range_label.setFont(small)
+            _colour(self.range_label, _tone(self.range_label, "dim"))
+            self.range_label.setToolTip(
+                "The camera's own range for this setting"
+                + (" — and, under it, the range its maker recommends"
+                   if setting.get("recommended") else ""))
+            grid.addWidget(self.range_label, row, 3)
+            self._show_range()
         self.reset_button = QToolButton(parent)
         self.reset_button.setText("↺")
         self.reset_button.setAutoRaise(True)
         self.reset_button.clicked.connect(lambda: self.reset.emit(self.key))
         self.reset_button.setVisible(False)
-        grid.addWidget(self.reset_button, row, 3)
+        grid.addWidget(self.reset_button, row, last)
         self.note = QLabel(parent)
         self.note.setWordWrap(True)
         # Smaller than the row (a style sheet rule of the tabs says so too:
@@ -376,7 +474,7 @@ class SettingRow(QObject):
         font.setPointSizeF(max(7.0, font.pointSizeF() - 1))
         self.note.setFont(font)
         self.note.setVisible(False)
-        grid.addWidget(self.note, row + 1, 1, 1, 3)
+        grid.addWidget(self.note, row + 1, 1, 1, last)
         self.show_value(setting.get("value"))
 
     # -- building ----------------------------------------------------------
@@ -424,16 +522,37 @@ class SettingRow(QObject):
         low, high = _number(s.get("min")), _number(s.get("max"))
         if low is not None and high is not None and high > low:
             self.scale = Scale(low, high, self.kind, _number(s.get("step")))
-            slider = QSlider(Qt.Orientation.Horizontal, parent)
+            slider = RangeSlider(Qt.Orientation.Horizontal, parent)
             slider.setRange(0, self.scale.steps)
             slider.setMinimumWidth(self.WIDTHS[self.compact][0])
             slider.valueChanged.connect(self._from_slider)
             slider.sliderReleased.connect(self._released)
             self.slider = slider
+            self._mark_recommended()
             grid.addWidget(slider, row, 1)
             grid.addWidget(box, row, 2)
         else:
             grid.addWidget(box, row, 1, 1, 2)
+
+    def _mark_recommended(self) -> None:
+        """The recommended part of the slider (RangeSlider), from the
+        setting's own description."""
+        if not isinstance(self.slider, RangeSlider) or self.scale is None:
+            return
+        rec = self.setting.get("recommended")
+        try:
+            span = ((self.scale.position(rec[0]), self.scale.position(rec[1]))
+                    if rec else None)
+        except (TypeError, IndexError):
+            span = None
+        self.slider.mark(span)
+
+    def _show_range(self) -> None:
+        if self.range_label is not None:
+            text = (range_text(self.setting)
+                    if self.kind in (FLOAT, INT) and not self.read_only
+                    else "")
+            self.range_label.setText(text)
 
     def _number_box(self, parent: QWidget) -> QAbstractSpinBox:
         s = self.setting
@@ -551,6 +670,12 @@ class SettingRow(QObject):
                 combo.addItems([str(c) for c in setting.get("choices") or []])
             self._quietly(refill)
         self.label.setToolTip(self._tooltip())
+        if old.get("recommended") != setting.get("recommended"):
+            self._mark_recommended()
+        if (old.get("min"), old.get("max"), old.get("recommended")) != (
+                setting.get("min"), setting.get("max"),
+                setting.get("recommended")):
+            self._show_range()
         if not self.busy_editing():
             self.show_value(setting.get("value"))
 
@@ -571,6 +696,7 @@ class SettingRow(QObject):
                 and high > low:
             self.scale = Scale(low, high, self.kind, _number(s.get("step")))
             self._quietly(lambda: self.slider.setRange(0, self.scale.steps))
+            self._mark_recommended()
 
     def show_value(self, value: Any) -> None:
         """Put the camera's value in the controls, without writing it."""
@@ -670,10 +796,12 @@ def _same(a: Any, b: Any) -> bool:
 def add_group_boxes(layout: QVBoxLayout, parent: QWidget,
                     settings: Sequence[Dict[str, Any]],
                     groups: Sequence[str],
-                    keep: Callable[["SettingRow"], None]) -> None:
+                    keep: Callable[["SettingRow"], None],
+                    show_range: bool = False) -> None:
     """One box per group, in the camera's group order, each a grid of
     SettingRows — the whole window's form and a pop-out's. `keep` is told
-    of every row made (to register it and connect its signals)."""
+    of every row made (to register it and connect its signals);
+    `show_range` gives each row its range column (a pop-out)."""
     order = list(groups) + [s.get("group") for s in settings
                             if s.get("group") not in groups]
     for group in dict.fromkeys(order):
@@ -697,7 +825,8 @@ def add_group_boxes(layout: QVBoxLayout, parent: QWidget,
             first = 1
         for index, setting in enumerate(members):
             keep(SettingRow(setting, grid, first + index * 2, box,
-                            explain_read_only=not readings))
+                            explain_read_only=not readings,
+                            show_range=show_range))
         layout.addWidget(box)
 
 
@@ -986,7 +1115,8 @@ class SettingsCore:
             if out.get("summary"):
                 self.say(str(out["summary"]))
             return
-        late = self.busy and what not in ("capturing", "stopped", "presets")
+        late = self.busy and what not in ("capturing", "stopped", "presets",
+                                          "box")
         if late:
             self.busy = False
             if self._pending and not self._write_timer.isActive():
@@ -1004,6 +1134,12 @@ class SettingsCore:
             self._soon()
         elif what in ("capturing", "stopped"):
             self.capturing = what == "capturing"
+        elif what == "box":
+            # A box beside Start wrote the camera (the FPS box: a picture
+            # window, a frame-rate limit; Start: exposure and gain). Which
+            # rows that moves is the camera's business, so they are read
+            # again — once, after the clicks stop.
+            self._refresh_timer.start()
         elif what == "presets":
             self.fill_presets(select=str(out.get("name") or ""))
             if out.get("summary"):
@@ -1793,7 +1929,7 @@ class CategoryWindow(SettingsCore, QWidget):
         layout.takeAt(layout.count() - 1)
         mine = [s for s in settings if s.get("group") == self.group]
         add_group_boxes(layout, self.form, mine, [self.group],
-                        self._keep_row)
+                        self._keep_row, show_range=True)
         if not mine:
             layout.addWidget(QLabel(f"This camera has no {self.group} "
                                     f"settings.", self.form))

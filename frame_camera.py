@@ -2162,8 +2162,10 @@ def on_camera_change(listener: Callable[[Dict[str, Any]], Any]
     the same dict the function returned, or the late answer of one that was
     still "pending" when it returned; and with {"what": "connected"} /
     {"what": "disconnected"}, and {"what": "pending"} when a change goes
-    to the worker (its answer follows). For the settings window, which must show what
-    the camera actually took. Returns a function that removes the listener.
+    to the worker (its answer follows); {"what": "box", "box": ...} when a
+    box beside Start wrote the camera (_box_written). For the settings
+    window, its tabs and pop-outs, which must show what the camera actually
+    took. Returns a function that removes the listener.
     Not script-linkable (it takes a function)."""
     if not callable(listener):
         raise RuntimeError("on_camera_change is for the app's own code (it "
@@ -2417,6 +2419,15 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
     from council_core import camera_settings
 
     device = _require_device()
+    doing = ("applying a camera set-up" if what != "preset"
+             else "applying a preset")
+    if not live_ok:
+        _refuse_while_capturing(doing)
+    # BUSY BEFORE THE CAMERA IS READ. Describing it is a read of every
+    # node / facility, and a change on the worker owns the camera until it
+    # has started the stream again (_Job) — the same reason the boxes beside
+    # Start wait for it (QUEUED_BOXES).
+    _refuse_while_busy("apply it")
     try:
         described = device.settings_provider().describe()
     except Exception:                                     # noqa: BLE001
@@ -2424,10 +2435,8 @@ def _apply_set(values: Dict[str, Any], roi: Any, label: str, what: str,
     blocked = (camera_settings.stops_needed(device, values, roi, described)
                if described is not None else
                camera_settings.stops_needed(device, values, roi))
-    if not (live_ok and roi is None and not blocked):
-        _refuse_while_capturing("applying a camera set-up" if what != "preset"
-                                else "applying a preset")
-    _refuse_while_busy("apply it")
+    if live_ok and (roi is not None or blocked):
+        _refuse_while_capturing(doing)
     stop = bool(blocked)
     labels = {s.key: s.label for s in described or []}
     restarted = [labels.get(k, "the area" if k == "area" else k)
@@ -2540,6 +2549,8 @@ def reset_camera_settings(group: Any = None) -> Dict[str, Any]:
         return _apply_set(dict(_LIVE.as_connected), None,
                           "Putting the settings back as connected", "reset",
                           "")
+    # Before the group is read: a change on the worker owns the camera.
+    _refuse_while_busy("put it back")
     try:
         keys = {s.key for s in
                 device.settings_provider().describe_groups(wanted)}
@@ -2929,6 +2940,21 @@ def _queue_behind_job(box: str, value: Any) -> str:
     return f"is set once the camera has finished {doing}"
 
 
+def _box_written(box: str, out: Dict[str, Any]) -> Dict[str, Any]:
+    """`out`, once every settings view has been told a box beside Start
+    wrote the camera ({"what": "box", "box": ...}).
+
+    THE BOXES AND THE TABS SHOW ONE CAMERA. The FPS box sets an event
+    camera's picture window and a Basler's frame-rate limit; Start writes the
+    exposure and gain boxes. The same settings are rows in the tabs and the
+    pop-outs (Display's "Picture window", Exposure's "Frame rate"), which
+    showed the value from before the box until something else made them
+    read the camera again. Told, each view reads its settings once, a
+    moment later (its refresh timer), however many arrow clicks came."""
+    _announce(dict(out, what="box", box=box))
+    return out
+
+
 def _write_queued() -> str:
     """Write what the boxes beside Start asked for while a change was on
     the worker, in a fixed order, latest value of each; what came of it, as
@@ -2968,7 +2994,8 @@ def set_exposure(value: Any) -> Dict[str, Any]:
         return {"exposure": f"{micros:.0f}",
                 "summary": f"Exposure {micros:.0f} µs {waits}."}
     got = device.set_exposure_us(micros)
-    return {"exposure": f"{got:.0f}", "summary": f"Exposure {got:.0f} µs."}
+    return _box_written("exposure", {"exposure": f"{got:.0f}",
+                                     "summary": f"Exposure {got:.0f} µs."})
 
 
 def set_gain(value: Any) -> Dict[str, Any]:
@@ -2979,7 +3006,8 @@ def set_gain(value: Any) -> Dict[str, Any]:
     if waits:
         return {"gain": f"{gain:.2f}", "summary": f"Gain {gain:.2f} {waits}."}
     got = device.set_gain(gain)
-    return {"gain": f"{got:.2f}", "summary": f"Gain {got:.2f}."}
+    return _box_written("gain", {"gain": f"{got:.2f}",
+                                 "summary": f"Gain {got:.2f}."})
 
 
 def set_frame_rate(value: Any) -> Dict[str, Any]:
@@ -3003,7 +3031,8 @@ def set_frame_rate(value: Any) -> Dict[str, Any]:
     said = f"{got:.1f} fps" if got else "the camera's own rate"
     if getattr(getattr(device, "info", None), "kind", "") == "event" and got:
         said += f" ({1000.0 / got:.1f} ms windows)"
-    return {"frame_rate": f"{got:.1f}", "summary": f"Frame rate: {said}."}
+    return _box_written("frame_rate", {"frame_rate": f"{got:.1f}",
+                                       "summary": f"Frame rate: {said}."})
 
 
 #: How long the live status line says what the FPS box just set. Long enough
@@ -3098,7 +3127,8 @@ def apply_frame_rate(frame_rate: Any = 0) -> Dict[str, Any]:
         summary = f"FPS now {said}."
     else:
         summary = f"FPS {said}, set on the camera."
-    return {"frame_rate": f"{got:.1f}", "summary": summary}
+    return _box_written("frame_rate", {"frame_rate": f"{got:.1f}",
+                                       "summary": summary})
 
 
 def _fps_text(fps: float) -> str:

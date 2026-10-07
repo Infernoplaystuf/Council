@@ -285,6 +285,9 @@ class HwId:
     def get_integrator(self):
         return "Prophesee"
 
+    def get_connection_type(self):
+        return "USB"
+
 
 class Roi:
     class Mode:

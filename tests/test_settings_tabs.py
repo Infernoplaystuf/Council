@@ -176,6 +176,33 @@ def test_an_evk4s_eight_groups_share_four_tabs_and_each_keeps_its_pop_out():
     assert plan[3].groups == ("Status", "Camera")
 
 
+def test_the_fake_evk4_has_every_facility_and_method_typhon_calls():
+    """tests/fake_evk4 stands in for an EVK4 in every test here, so it must
+    offer each facility and method camera_settings calls — the list the
+    real OpenEB bindings are checked against in test_camera_settings — and,
+    where the bindings are importable (the pylon env with C:/ceb/build on
+    its paths), the enum members the real ones have."""
+    hal = fake_evk4.FakeEvk4()
+    for getter, (cls_name, methods) in camera_settings.EVK_FACILITIES.items():
+        facility = getattr(hal, getter)()
+        assert facility is not None, getter
+        missing = [m for m in methods
+                   if not callable(getattr(facility, m, None))]
+        assert not missing, f"the fake {cls_name} has no {missing}"
+    try:
+        import metavision_hal as real
+    except Exception:                                       # noqa: BLE001
+        return
+    for getter, (cls_name, methods) in camera_settings.EVK_FACILITIES.items():
+        assert hasattr(real.Device, getter), getter
+        cls = getattr(real, cls_name)
+        assert not [m for m in methods if not hasattr(cls, m)], cls_name
+    assert set(fake_evk4.AntiFlicker.AntiFlickerMode.__members__) == set(
+        real.I_AntiFlickerModule.AntiFlickerMode.__members__)
+    assert set(fake_evk4.Trail.Type.__members__) <= set(
+        real.I_EventTrailFilterModule.Type.__members__)
+
+
 def test_a_basler_gets_exposure_image_and_camera_tabs():
     from tests.test_camera_settings import basler
 
@@ -463,6 +490,118 @@ def test_a_category_pops_out_with_every_setting_and_writes_live(
     tabs.flush_now()
     assert evk4.biases.values["bias_fo"] == -20
     assert biases.rows["bias.bias_fo"].editor.value() == -20
+
+
+def good_pixels(slider):
+    """x of every pixel in the slider's bottom rows drawn in the colour
+    RangeSlider marks the recommended part with."""
+    image = slider.grab().toImage()
+    good = csw.QColor(csw._tone(slider, "good")).rgb() & 0xFFFFFF
+    return sorted({x for y in range(image.height() - 3, image.height())
+                   for x in range(image.width())
+                   if image.pixel(x, y) & 0xFFFFFF == good})
+
+
+def test_a_pop_out_shows_each_settings_range_and_a_bias_its_recommended_one(
+        clean, typhon_dir, evk4):
+    """A pop-out is where a category is tuned: each row says the camera's
+    own range and unit, and a bias the range the sensor recommends — they
+    were only in a tooltip. The recommended part of a bias's slider is
+    marked, in the pop-out and in the narrower tab."""
+    ui = construct(typhon_dir)
+    connect(ui, "00051234")
+    tabs = tabs_of(ui)
+    window = tabs.pop_out("Biases")
+    on = window.rows["bias.bias_diff_on"]
+    assert on.range_label.text() == "-85 … 140\nrec. -25 … 60"
+    assert on.slider.recommended == (on.scale.position(-25),
+                                     on.scale.position(60))
+    low = tabs.pop_out("Anti-flicker").rows["afk.low_hz"]
+    assert low.range_label.text() == "50 … 520 Hz"
+    rate = tabs.pop_out("Event rate controller").rows["erc.rate"]
+    assert rate.range_label.text() == "0 … 1,000,000,000 ev/s"
+    assert rate.slider.recommended is None, "no recommended range: no mark"
+    period = tabs.pop_out("Event rate controller").rows["erc.period"]
+    assert period.range_label.text() == "", "a reading has no range to set"
+    # The tab is too narrow for the words; its slider carries the mark.
+    row = tabs.rows["bias.bias_diff_on"]
+    assert row.range_label is None
+    assert row.slider.recommended == on.slider.recommended
+    # Drawn: under the recommended part only (-25 … 60 of -85 … 140 is
+    # the 27th to the 64th hundredth of the groove).
+    for slider in (row.slider, on.slider):
+        slider.resize(300, slider.sizeHint().height())
+        marked = good_pixels(slider)
+        assert marked, "the recommended range is not drawn"
+        width = slider.width()
+        assert 0.15 * width < marked[0] < 0.40 * width, (marked[0], width)
+        assert 0.50 * width < marked[-1] < 0.75 * width, (marked[-1], width)
+
+
+def test_the_boxes_beside_start_move_the_same_settings_in_the_tabs(
+        clean, typhon_dir, evk4, tmp_path):
+    """The FPS box sets an event camera's picture window — the Display tab's
+    first row — and Start writes the exposure and gain boxes. The tabs and
+    the pop-outs kept showing the value from before (20 ms after an arrow
+    click made it 40) until something else made them read the camera."""
+    ui = construct(typhon_dir)
+    connect(ui, "00051234")
+    tabs = tabs_of(ui)
+    window = tabs.pop_out("Display")
+    assert tabs.rows["window_ms"].editor.value() == 20.0
+    box = ui.ports.frame_rate.widget
+    box.setValue(24)
+    box.stepBy(1)                               # an arrow click: 25 fps
+    assert device().accumulate_ms == 40.0
+    assert pump(1.5, until=lambda: (
+        tabs.rows["window_ms"].editor.value() == 40.0
+        and window.rows["window_ms"].editor.value() == 40.0)), (
+        tabs.rows["window_ms"].editor.value(),
+        window.rows["window_ms"].editor.value())
+
+    ui.on_btn_disconnect()
+    connect(ui, "frame")
+    gain = tabs.pop_out("Gain")
+    ui.ports.gain.widget.setValue(6)            # written at Start
+    ui.ports.capture_folder.set(str(tmp_path / "run"))
+    ui.on_btn_start_capture()
+    try:
+        assert frame_camera._LIVE.capturing
+        assert device().state["Gain"] == 6.0
+        assert pump(1.5, until=lambda: (
+            tabs.rows["Gain"].editor.value() == 6.0
+            and gain.rows["Gain"].editor.value() == 6.0))
+    finally:
+        ui.on_btn_stop_capture()
+
+
+def test_a_set_is_refused_before_the_camera_is_read_while_it_changes(
+        clean, typhon_dir, monkeypatch):
+    """A change that restarts the stream owns the camera on the worker. A
+    preset or a category's reset pressed meanwhile described the WHOLE
+    camera (every node, every facility) from the UI thread before being
+    refused for it — the read the boxes beside Start are queued to avoid."""
+    import threading
+    from types import SimpleNamespace
+
+    ui = construct(typhon_dir)
+    connect(ui, "frame")
+    frame_camera.save_preset("Bench", include_roi=False)
+    described = []
+    original = camera_settings.SyntheticSettings.describe
+    monkeypatch.setattr(camera_settings.SyntheticSettings, "describe",
+                        lambda self: described.append(1) or original(self))
+    frame_camera._LIVE.job = SimpleNamespace(
+        label="Changing the camera's area", done=threading.Event())
+    try:
+        for call in (lambda: frame_camera.apply_preset("Bench"),
+                     lambda: frame_camera.reset_camera_settings("Gain"),
+                     frame_camera.reset_camera_settings):
+            with pytest.raises(RuntimeError, match="wait for it to finish"):
+                call()
+        assert described == [], "the camera was read mid-change"
+    finally:
+        frame_camera._LIVE.job = None
 
 
 def test_held_and_read_only_rows_are_greyed_and_say_why(clean, typhon_dir,
