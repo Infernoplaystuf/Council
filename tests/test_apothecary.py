@@ -235,8 +235,8 @@ from PySide6.QtWidgets import QApplication  # noqa: E402
 from council_qt.tabs.apothecary import (ApothecaryActions,  # noqa: E402
                                         ApothecaryTab, build_apothecary)
 from council_qt.tabs.apothecary_dialogs import (  # noqa: E402
-    DiscoverDialog, InventoryDialog, NodeDialog, RegisterDialog,
-    WizardDialog)
+    DiscoverDialog, InventoryDialog, NodeDialog, RegisterDialog)
+from council_qt.tabs.pi_setup_dialog import PiSetupDialog  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -293,12 +293,6 @@ class FakeActions(ApothecaryActions):
         if self.refresh_error:
             raise self.refresh_error
         return list(self.models)
-
-    def provision(self, name, model, desktop_ip, password, progress):
-        self._seen("provision")
-        progress("[ Check Os ]", False)
-        progress("  ✓ Check OS", False)
-        return True, "ok"
 
 
 class Window:
@@ -458,10 +452,13 @@ def test_the_teardown_stops_the_monitor(qapp, tmp_path):
 
 # -- dialogs -------------------------------------------------------------
 
-def test_discover_then_wizard_opens_for_the_saved_node(qapp, make_tab):
+def test_discover_then_wizard_opens_for_the_saved_node(qapp, make_tab, monkeypatch,
+                                                       tmp_path):
     """Defect 4: the wizard opened on "whatever is selected", which the save's
     list refresh had just cleared. Defect 8: progress arrives through the
-    GUI thread (the fake posts from the worker)."""
+    GUI thread (the fake posts from the worker). The wizard it opens is now
+    "Set up a Pi", filled in for the saved node (review, 2026-10-07)."""
+    monkeypatch.setenv("COUNCIL_PI_STATE_DIR", str(tmp_path / "pi_state"))
     tab = make_tab(answers={"yes": True})
     tab.on_discover()
     dlg = tab.dialog
@@ -473,8 +470,12 @@ def test_discover_then_wizard_opens_for_the_saved_node(qapp, make_tab):
     assert tab.actions.threads[0][1] == "apoth-discover"
     dlg.on_save()
     assert tab.actions.node("kitchen pi").host == "10.0.0.9"
-    assert isinstance(tab.dialog, WizardDialog)
-    assert tab.dialog.node.name == "kitchen pi"
+    dlg = tab.dialog
+    assert isinstance(dlg, PiSetupDialog)
+    assert dlg.pages.currentWidget() is dlg.page_existing
+    assert (dlg.ex_host.text(), dlg.ex_name.text()) == ("10.0.0.9", "kitchen pi")
+    dlg.done(0)
+    dlg.deleteLater()
 
 
 def test_rediscovering_keeps_hardware_metadata(qapp, make_tab):
@@ -544,19 +545,54 @@ def test_inventory_refresh_failure_is_not_a_success(qapp, make_tab):
     assert "found" not in tab.log.toPlainText()
 
 
-def test_the_wizard_runs_and_offers_registration(qapp, make_tab, tmp_path,
-                                                 monkeypatch):
-    bat = tmp_path / "launch_council.bat"
-    bat.write_text("set OLLAMA_MAX_LOADED_MODELS=2\n", encoding="utf-8")
-    monkeypatch.setattr(core, "find_launch_bat", lambda: bat)
-    tab = make_tab([_node("a")], answers={"yes": True})
-    tab.open_wizard("a")
-    wiz = tab.dialog
-    wiz.on_run()
-    pump(qapp, lambda: isinstance(tab.dialog, RegisterDialog))
-    assert "✓ Check OS" in wiz.progress.toPlainText()
-    tab.dialog.on_write()
-    assert "COUNCIL_PI_HOSTS=http://10.0.0.5:11434" in bat.read_text()
+def test_the_setup_button_opens_set_up_a_pi_for_the_selected_node(qapp, make_tab,
+                                                                   monkeypatch, tmp_path):
+    # The old Setup Pi Wizard ran 'curl ... install.sh | sh', opened Ollama
+    # to the LAN and pulled qwen2.5:3b (not US-origin) with no click of its
+    # own - also on a Pi "Set up a Pi" had made (review, 2026-10-07).
+    monkeypatch.setenv("COUNCIL_PI_STATE_DIR", str(tmp_path / "pi_state"))
+    tab = make_tab([_node("a", username="council")])
+    _select(tab, "a")
+    tab.on_wizard()
+    dlg = tab.dialog
+    assert isinstance(dlg, PiSetupDialog) and dlg.pages.currentWidget() is dlg.page_existing
+    assert (dlg.ex_host.text(), dlg.ex_user.text(), dlg.ex_name.text()) == (
+        "10.0.0.5", "council", "a")
+    assert dlg.ex_pass.text() == ""             # typed by the user, used once
+    assert tab.actions.threads == []            # nothing ran on the Pi
+    dlg.done(0)
+    dlg.deleteLater()
+
+
+class _RecordingEngine:
+    def __init__(self):
+        self.commands = []
+
+    def run_task_sequence(self, node, steps, pw, progress_cb):
+        self.commands += [s.cmd for s in steps]
+        return True, ""
+
+
+def test_no_wizard_path_installs_ollama_or_downloads_a_model(tmp_path):
+    # Whatever still reaches ApothecaryEngine.provision_pi (the Tk console's
+    # wizard): no 'curl | sh', no Ollama on 0.0.0.0, no 'ollama pull'.
+    every = " ".join(s.cmd for steps in ae.PROVISION_TASKS.values() for s in steps)
+    for bad in ("install.sh", "ollama pull", "0.0.0.0", "11434"):
+        assert bad not in every
+    a = core.Apothecary(registry_path=str(tmp_path / "node_registry.json"))
+    try:
+        a.registry.upsert(_node("a", auth_method="key"))
+        rec = _RecordingEngine()
+        a.engine = rec
+        lines = []
+        ok, msg = a.provision_pi("a", "qwen2.5:3b", "10.0.0.2",
+                                 progress_cb=lambda m, e: lines.append(m))
+        assert ok and rec.commands
+        assert not any("ollama" in c for c in rec.commands)
+        assert a.registry.list_nodes()[0].model != "qwen2.5:3b"
+        assert "Set up a Pi" in "\n".join(lines)
+    finally:
+        a.monitor.stop()
 
 
 def test_register_refuses_a_bat_with_no_anchor(qapp, tmp_path):

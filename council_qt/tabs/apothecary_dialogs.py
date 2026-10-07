@@ -1,9 +1,11 @@
 """
 council_qt.tabs.apothecary_dialogs — the Apothecary's six windows.
 
-Discover, Add/Edit, Model Inventory, Setup Wizard, Register-with-Council and
-Static IP: the six Toplevels of `apothecary_engine.ApothecaryConsole`, as
-QDialogs. Each collects plain values and hands them to one core call.
+Discover, Add/Edit, Model Inventory, Register-with-Council and Static IP:
+Toplevels of `apothecary_engine.ApothecaryConsole`, as QDialogs. Each
+collects plain values and hands them to one core call. The Setup Wizard
+dialog is gone: it installed Ollama with 'curl | sh' and pulled a model
+unasked; the tab opens "Set up a Pi" (pi_setup_dialog) instead.
 
 EVERY WORKER TALKS TO THE WINDOW THROUGH `_to_ui`
 The Tk Discover worker wrote its log widget straight from the thread and
@@ -385,101 +387,6 @@ class InventoryDialog(_Dialog):
             installed_text(models, self.node.active_model)
             if models else "  (no models found)")
         self.emit(f"✓ {self.node.name}: {len(models)} model(s) found", False)
-
-
-# ============================================================
-# Setup Wizard
-# ============================================================
-
-class WizardDialog(_Dialog):
-    """Install Ollama, open it to the LAN, pull a model, fix the link.
-
-    ``on_finished(ok)`` runs on the GUI thread when the run ends.
-    """
-
-    def __init__(self, node, actions, on_finished: Callable[[bool], None],
-                 parent: Optional[QWidget] = None):
-        super().__init__(f"Pi Setup Wizard — {node.name}", parent)
-        self.node = node
-        self.actions = actions
-        self.on_finished = on_finished
-        self._busy = False
-        self.resize(680, 600)
-
-        outer = QVBoxLayout(self)
-        outer.addWidget(_heading(f"Setting up:  {node.name}  "
-                                 f"({node.username}@{node.host})"))
-        outer.addWidget(_muted(
-            "This wizard will: check OS, install Ollama, configure it to "
-            "accept remote connections, pull your chosen model, and fix "
-            "ethernet stability.", self._tokens))
-        form = QFormLayout()
-        model_row = QHBoxLayout()
-        self.model = QLineEdit(node.model or apoth_core.DEFAULT_MODEL)
-        model_row.addWidget(self.model, 1)
-        self.suggest = QComboBox()
-        self.suggest.addItem("Hardware suggestions ▾")
-        self.suggest.addItems(apoth_core.PI_MODELS)
-        self.suggest.currentTextChanged.connect(self._on_suggest)
-        model_row.addWidget(self.suggest)
-        form.addRow("Model:", model_row)
-        self.desktop_ip = QLineEdit(apoth_core.desktop_ip())
-        form.addRow("Your desktop IP:", self.desktop_ip)
-        form.addRow("", _muted("The Pi pings this every 5 min to keep the "
-                               "ethernet link alive.", self._tokens))
-        self.password = _password_field()
-        self.password.setPlaceholderText("blank = use stored")
-        form.addRow("SSH password override:", self.password)
-        outer.addLayout(form)
-        outer.addWidget(QLabel("Progress:"))
-        self.progress = LogView(self._tokens)
-        outer.addWidget(self.progress, 1)
-        row = QHBoxLayout()
-        self.run_btn = self._button(row, "▶  Run Full Setup", self.on_run)
-        row.addStretch(1)
-        self._button(row, "Close", self.reject)
-        outer.addLayout(row)
-
-    def _on_suggest(self, pi_model: str) -> None:
-        recs = apoth_core.recommendations(pi_model)
-        if recs:
-            self.model.setText(recs[0])
-
-    def _prog(self, msg: str, error: bool = False) -> None:
-        self.progress.append_tagged(msg, apoth_core.wizard_tag(msg, error))
-
-    def on_run(self) -> None:
-        model = self.model.text().strip()
-        if not model:
-            self._prog("✗ Enter a model name.", True)
-            return
-        if self._busy:
-            return
-        desktop = self.desktop_ip.text().strip()
-        password = self.password.text().strip() or None
-        self._busy = True
-        self.run_btn.setEnabled(False)
-        self.progress.clear()
-        name = self.node.name
-
-        def work() -> None:
-            ok = False
-            try:
-                ok, _msg = self.actions.provision(
-                    name, model, desktop, password,
-                    lambda m, e: self._to_ui(self._prog, m, e))
-            except Exception as exc:                      # noqa: BLE001
-                self._to_ui(self._prog, f"✗ Setup error: {exc}", True)
-            finally:
-                self._to_ui(self._finished, ok)
-
-        threading.Thread(target=work, name="apoth-wizard",
-                         daemon=True).start()
-
-    def _finished(self, ok: bool) -> None:
-        self._busy = False
-        self.run_btn.setEnabled(True)
-        self.on_finished(ok)
 
 
 # ============================================================

@@ -258,6 +258,15 @@ class PiSetupDialog(ViewHelpers, QDialog):
         form.addRow(row)
         return w
 
+    def start_existing(self, *, host: str, username: str, name: str) -> None:
+        """Open on the existing-Pi page filled in for a node the Apothecary
+        knows (its "Set up the selected Pi" button and Discover's offer).
+        The password is typed here: it is used once and not saved."""
+        self.ex_host.setText(host or "")
+        self.ex_user.setText(username or "pi")
+        self.ex_name.setText(name or "")
+        self.pages.setCurrentWidget(self.page_existing)
+
     def on_setup_existing(self) -> None:
         if self._busy:
             return
