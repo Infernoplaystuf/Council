@@ -107,8 +107,8 @@ def test_gaps_reach_the_real_wishlist_file(tmp_path):
 
 class LowConfidence(FakeModel):
     def respond(self, prompt, **kw):
-        if "Rate your confidence" in prompt:
-            return "3"
+        if "CONFIDENCE: <0-100>%" in prompt:
+            return "a guess\nCONFIDENCE: 30% — the pump's size"
         return super().respond(prompt, **kw)
 
 

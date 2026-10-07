@@ -56,6 +56,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from .confidence import HIGH as _cf_HIGH, LOW as _cf_LOW, \
+    VERY_LOW as _cf_VERY_LOW
+
 
 @dataclass
 class AgentEvent:
@@ -287,7 +290,8 @@ class ModelAgent:
         # token_callback(who, token) — called for each streamed token
         self.token_callback = token_callback
 
-    def _compose_prompt(self, ctx: AgentContext) -> str:
+    def _compose_prompt(self, ctx: AgentContext, *,
+                        ask_confidence: bool = False) -> str:
         parts: List[str] = []
 
         # Inject query mode so every personality knows what type of response to give.
@@ -378,6 +382,9 @@ class ModelAgent:
             )
 
         parts.append(f"USER REQUEST:\n{ctx.user_text}")
+        if ask_confidence:
+            from .confidence import DRAFT_INSTRUCTION
+            parts += ["", DRAFT_INSTRUCTION]
 
         if self.enable_tools and self.tools:
             # A tool's one-line `help` (args and purpose) when it has one:
@@ -407,9 +414,12 @@ class ModelAgent:
             cb(who, token)
         return _cb
 
-    def act(self, ctx: AgentContext) -> List[AgentEvent]:
+    def act(self, ctx: AgentContext, *,
+            ask_confidence: bool = False) -> List[AgentEvent]:
+        """The member's answer as events. `ask_confidence`: a draft, which
+        ends with a CONFIDENCE line (council_core.confidence)."""
         events: List[AgentEvent] = []
-        prompt = self._compose_prompt(ctx)
+        prompt = self._compose_prompt(ctx, ask_confidence=ask_confidence)
 
         if not (self.enable_tools and self.tools):
             events.append(AgentEvent(self.display_name, "thought", "Generating response…"))
@@ -459,6 +469,9 @@ class ModelAgent:
                 f"TOOL RESULTS:\n{obs_text}\n\n"
                 "Now produce the best possible answer (no tool JSON unless more tools needed)."
             )
+            if ask_confidence:
+                from .confidence import DRAFT_INSTRUCTION
+                followup += "\n\n" + DRAFT_INSTRUCTION
             events.append(AgentEvent(self.display_name, "thought", "Calling model (post-tool)…"))
             text = self.model.respond(followup, token_callback=self._make_token_cb())
 
@@ -492,6 +505,7 @@ class DeliberationOrchestrator:
         self.parallel_members = bool(parallel_members)
         self.agents = agents
         self.max_rounds = max_rounds
+        self._confidence_reasons: Dict[str, str] = {}
         self.debate_turns = max(1, int(debate_turns))
         self.event_callback = event_callback or (lambda e: None)
         # Clarification pause support
@@ -508,27 +522,38 @@ class DeliberationOrchestrator:
         """One member's answer and its self-rated confidence:
         (events, answer, confidence). With `emit`, the answer's events go
         out as soon as they exist (the one-at-a-time path)."""
-        evs = self.agents[key].act(ctx)
+        from . import confidence as _cf
+        evs = self.agents[key].act(ctx, ask_confidence=True)
+        # Self-reported confidence, 0–100%, from the draft's own last line
+        # (CONFIDENCE: 85% — reason). The line is cut from the answer the
+        # others read. Only when it is missing is the member asked again,
+        # with the whole answer in view this time, not its first 400
+        # characters.
+        reason = ""
+        conf = None
+        for i in range(len(evs) - 1, -1, -1):
+            if evs[i].kind == "final":
+                cleaned, conf, reason = _cf.split_draft(evs[i].text)
+                evs[i] = AgentEvent(evs[i].who, "final", cleaned)
+                break
+        answer = next((e.text for e in reversed(evs) if e.kind == "final"), "")
         if emit is not None:
             for ev in evs:
                 emit(ev)
-        answer = next((e.text for e in reversed(evs) if e.kind == "final"), "")
-        # ── #8 Self-reported confidence ─────────────────────────────
-        # Ask each candidate to rate their own confidence 1-10.
-        # A single cheap token call — models are usually well-calibrated
-        # at distinguishing "I'm guessing" from "I'm certain".
-        conf = 5  # default if call fails
-        try:
-            raw = self.agents[key].model.respond(
-                "Rate your confidence in the answer you just gave, 1–10. "
-                "Reply with ONLY the single digit — no words, no punctuation.\n\n"
-                f"YOUR ANSWER (first 400 chars):\n{answer[:400]}",
-                max_tokens=5,
-            ).strip()
-            conf = int(raw[0]) if raw and raw[0].isdigit() else 5
-            conf = max(1, min(10, conf))
-        except Exception:
-            pass
+        if conf is None:
+            conf = _cf.DEFAULT
+            try:
+                raw = self.agents[key].model.respond(
+                    "How confident are you in this answer, from 0 to 100 "
+                    "percent? Reply with ONLY the number.\n\n"
+                    f"THE ANSWER:\n{answer[:4000]}",
+                    max_tokens=8,
+                )
+                got = _cf.parse_reply(raw)
+                conf = got if got is not None else _cf.DEFAULT
+            except Exception:
+                pass
+        self._confidence_reasons[key] = reason
         return evs, answer, conf
 
     def _side_by_side(self, keys: List[str], fn: Callable[[str], Any]
@@ -636,13 +661,16 @@ class DeliberationOrchestrator:
                     "peasant_q": "", "rebuttal": "", "discussion": "",
                     "self_confidence": _self_conf,
                 }
-                if _self_conf <= 4:
+                _why = self._confidence_reasons.get(key, "")
+                candidates[key]["confidence_reason"] = _why
+                _why_txt = f" — least sure of: {_why}" if _why else ""
+                if _self_conf <= _cf_LOW:
                     emit(AgentEvent(key.capitalize(), "observation",
-                                   f"⚠ Self-confidence: {_self_conf}/10 — answer may be weak"))
+                                   f"⚠ Self-confidence: {_self_conf}% — answer may be weak{_why_txt}"))
                 else:
                     emit(AgentEvent(key.capitalize(), "observation",
-                                   f"Confidence: {_self_conf}/10"))
-                discussion_lines.append(f"{key.upper()} CANDIDATE [conf:{_self_conf}/10]:\n{_stored_answer}\n")
+                                   f"Confidence: {_self_conf}%{_why_txt}"))
+                discussion_lines.append(f"{key.upper()} CANDIDATE [conf:{_self_conf}%]:\n{_stored_answer}\n")
 
                 # ── Clarification pause ──────────────────────────────
                 # If a non-Peasant personality asked the user a direct question,
@@ -886,23 +914,30 @@ class DeliberationOrchestrator:
             ctx.shared["judge_ranking"] = rank_json
             try:
                 import json as _rj
-                ctx.shared["judge_confidence"] = int(_rj.loads(rank_json).get("confidence", 0))
+                from .confidence import normalise_ranking as _nr
+                _robj = _nr(_rj.loads(rank_json))
+                rank_json = _rj.dumps(_robj, ensure_ascii=False)
+                ctx.shared["judge_ranking"] = rank_json
+                ctx.shared["judge_confidence"] = int(_robj.get("confidence", 0))
             except Exception:
                 ctx.shared["judge_confidence"] = 0
             ev = AgentEvent("Judge", "observation", f"Ranking:\n{rank_json}")
             emit(ev)
 
             # 4a) Low-confidence gap logging ─────────────────────────────────
-            # Roles that reported self-confidence ≤4 are flagged so the
+            # Roles that reported self-confidence ≤40% are flagged so the
             # Librarian wishlist captures what vault data would have helped.
             for _lc_role, _lc_data in candidates.items():
-                if _lc_data.get("self_confidence", 10) <= 4:
+                if _lc_data.get("self_confidence", 100) <= _cf_LOW:
                     try:
                         _lc_topic = f"{_lc_role} answer to: {user_text[:80]}"
+                        _lc_why = _lc_data.get("confidence_reason", "")
                         _lc_reason = (
                             f"{_lc_role} self-reported confidence "
-                            f"{_lc_data['self_confidence']}/10 — vault data on this topic "
-                            "would have strengthened the answer"
+                            f"{_lc_data['self_confidence']}%"
+                            + (f" — least sure of: {_lc_why}" if _lc_why
+                               else " — vault data on this topic would "
+                                    "have strengthened the answer")
                         )
                         ctx.shared.setdefault("_low_conf_gaps", []).append(
                             {"who": _lc_role, "topic": _lc_topic, "reason": _lc_reason}
@@ -985,23 +1020,23 @@ class DeliberationOrchestrator:
                 break
 
             # ── Confidence-gated early exit ──────────────────────────────
-            # Even on NEEDS_WORK, if Judge confidence is very high (≥8/10)
+            # Even on NEEDS_WORK, if Judge confidence is very high (≥80%)
             # and this is the final round, skip re-deliberation — the answer
             # is probably good enough and more rounds won't help much.
             _conf = ctx.shared.get("judge_confidence", 0)
             _is_last_round = (r == self.max_rounds - 1)
-            if _conf >= 8 and _is_last_round:
+            if _conf >= _cf_HIGH and _is_last_round:
                 self._phase(
-                    f"✓ High confidence ({_conf}/10) — accepting answer despite NEEDS_WORK"
+                    f"✓ High confidence ({_conf}%) — accepting answer despite NEEDS_WORK"
                 )
                 break
 
             # ── Confidence-gated extra round ─────────────────────────────
-            # If confidence is very low (≤2/10) on round 1, allow an extra
+            # If confidence is very low (≤20%) on round 1, allow an extra
             # round beyond max_rounds — the answer needs more work.
-            if _conf <= 2 and r == 0 and self.max_rounds < 3:
+            if _conf <= _cf_VERY_LOW and r == 0 and self.max_rounds < 3:
                 self._phase(
-                    f"⚠ Low confidence ({_conf}/10) — adding extra deliberation round"
+                    f"⚠ Low confidence ({_conf}%) — adding extra deliberation round"
                 )
                 self.max_rounds = 3
 

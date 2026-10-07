@@ -4711,7 +4711,8 @@ Give PASS generously for conversational queries — conversation need not be exh
 RANKING
 ═══════════════════════════════════════════
 Output ONLY valid JSON, no markdown fences:
-{"winner":"<role>","scores":{"<role>":0..10,...},"rationale":"<one sentence>","confidence":0..10}
+{"winner":"<role>","scores":{"<role>":0..100,...},"rationale":"<one sentence>","confidence":0..100}
+Scores and confidence are percentages: any whole number 0-100.
 """,
 
     "writer": """\
@@ -6827,11 +6828,12 @@ class JudgeModel(PersonalityModel):
     ) -> str:
         parts = [
             "Rank candidates. Output ONLY valid JSON (no markdown), format:\n"
-            '{"winner":"<role>","scores":{"<role>":0..10},"rationale":"<one sentence>","confidence":0..10}\n'
-            "confidence = your overall certainty 0 (no good answer) to 10 (clear best answer).\n"
-            "IMPORTANT: each candidate has self-reported a confidence score 1-10.\n"
-            "Weight low self-confidence answers (≤4) skeptically — they may be guessing.\n"
-            "Weight high self-confidence answers (≥8) positively — but verify they earned it.\n\n"
+            '{"winner":"<role>","scores":{"<role>":0..100},"rationale":"<one sentence>","confidence":0..100}\n'
+            "Scores and confidence are percentages (any whole number 0-100). "
+            "confidence = your overall certainty: 0 (no good answer) to 100 (clear best answer).\n"
+            "IMPORTANT: each candidate has self-reported a confidence percentage.\n"
+            "Weight low self-confidence answers (≤40%) skeptically — they may be guessing.\n"
+            "Weight high self-confidence answers (≥80%) positively — but verify they earned it.\n\n"
             f"USER REQUEST:\n{user_text}\n\nCANDIDATES:\n"
         ]
         for role, data in candidates.items():
@@ -6841,9 +6843,9 @@ class JudgeModel(PersonalityModel):
             peasant_q   = data.get("peasant_q",       "")[:600]
             rebuttal    = data.get("rebuttal",         "")[:600]
             discussion  = data.get("discussion",       "")[:400]
-            self_conf   = data.get("self_confidence",  5)
+            self_conf   = data.get("self_confidence",  50)
             parts.append(
-                f"--- {role} [self-confidence: {self_conf}/10] ---\n"
+                f"--- {role} [self-confidence: {self_conf}%] ---\n"
                 f"ANSWER:\n{answer}\n\n"
                 f"PEASANT QUESTIONS:\n{peasant_q}\n\n"
                 f"REBUTTAL:\n{rebuttal}\n\n"
@@ -6852,6 +6854,11 @@ class JudgeModel(PersonalityModel):
         raw = self.respond("\n".join(parts), extra_context=extra_context)
         # Validate and normalise — returns clean JSON string
         parsed = _parse_ranking_json(raw)
+        try:
+            from council_core.confidence import normalise_ranking
+            parsed = normalise_ranking(parsed)     # percentages, 0-100
+        except Exception:                                 # noqa: BLE001
+            pass
         import json as _json
         return _json.dumps(parsed, ensure_ascii=False)
 

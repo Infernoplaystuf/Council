@@ -55,8 +55,8 @@ class SlowModel:
             time.sleep(self.delay)
             if self.fail:
                 raise RuntimeError(f"{self.name} broke")
-            if "Rate your confidence" in prompt:
-                text = "7"
+            if "How confident are you" in prompt:
+                text = "70"
             elif "Produce your rebuttal now" in prompt:
                 text = f"{self.name} rebuts: keep it"
             else:

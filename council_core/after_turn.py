@@ -5,7 +5,7 @@ has been answered.
 Two things the old Tk shell did after every deliberation and the Qt Council
 tab never did (the Council Map showed both as missing):
 
-  * GAPS → WISHLIST. Members who rated their own answer 4/10 or lower are
+  * GAPS → WISHLIST. Members who rated their own answer 40% or lower are
     collected by the deliberation (ctx.shared["_low_conf_gaps"]); they are
     written to the librarian's wishlist (<vault>/librarian_wishlist.md) as
     what the vault should hold to answer that kind of question better.

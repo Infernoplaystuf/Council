@@ -153,7 +153,7 @@ class TurnResult:
     events: List[AgentEvent] = field(default_factory=list)
     message: str = ""
     error: Optional[BaseException] = None
-    #: Members who rated their own answer 4/10 or lower, as the deliberation
+    #: Members who rated their own answer 40% or lower, as the deliberation
     #: collected them ({"who", "topic", "reason"}) — for the librarian's
     #: wishlist (council_core.after_turn).
     low_conf_gaps: List[Dict[str, Any]] = field(default_factory=list)
@@ -184,7 +184,7 @@ def judge_critique(events: List[AgentEvent]) -> str:
 
 
 def judge_confidence(events: List[AgentEvent]) -> int:
-    """The judge's 0-10 confidence, or 0 when it did not say.
+    """The judge's confidence, 0–100%, or 0 when it did not say.
 
     Parsed defensively on purpose: it arrives as JSON inside a text event, and
     a malformed one must cost the confidence reading rather than the answer the

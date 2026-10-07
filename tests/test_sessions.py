@@ -88,7 +88,7 @@ def test_a_row_carries_its_id_beside_its_label(tmp_path):
     row = result.rows[0]
     assert row.id == "s1"
     assert row.label != row.id            # it is badged
-    assert "7/10" in row.label
+    assert "70%" in row.label
 
 
 def test_an_id_containing_the_separator_survives(tmp_path):
@@ -132,7 +132,7 @@ def test_the_badge_is_the_last_verdict_not_the_proudest(tmp_path):
     result = sessions_core.list_sessions(FakeStore(["s1"]), path)
     row = result.rows[0]
     assert row.passed is True, "the badge reported the highest-confidence run"
-    assert "6/10" in row.label
+    assert "60%" in row.label
     assert "✓" in row.label
 
 

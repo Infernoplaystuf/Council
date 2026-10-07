@@ -354,7 +354,7 @@ def _edges() -> List[Edge]:
         E("tools", "writer", "PRIOR TOOL OUTPUTS", "tools", "live",
           cite="council_core/deliberation.py:314-361"),
         # -- memory --------------------------------------------------------
-        E("debate", "wishlist", "low-confidence members (≤4/10) as gaps",
+        E("debate", "wishlist", "low-confidence members (≤40%) as gaps",
           "memory", "live",
           cite="council_core/deliberation.py (_low_conf_gaps); "
                "council_core/after_turn.py (log_gaps)"),
@@ -843,7 +843,8 @@ GUIDE: Tuple[GuideStep, ...] = (
         "Each member writes an answer",
         "Each member gets the question plus its own memory, the project "
         "memory, your profile and recent conversation (Role memory), writes "
-        "a full answer, and rates how sure it is from 1 to 10.\n\n"
+        "a full answer, and ends it with how sure it is (0–100%) and what "
+        "it is least sure of.\n\n"
         "By default they answer one at a time, and each later member also "
         "reads the answers before it. With 'Parallel members' on (Council "
         "tab), they all answer at once, each without seeing the others — "
