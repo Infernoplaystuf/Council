@@ -1246,9 +1246,10 @@ class PresetsMixin:
         self.preset_list.currentItemChanged.connect(self._preset_chosen)
         if compact:
             # A few rows, not the whole tab: the buttons under it are what
-            # a short tab must still show.
-            self.preset_list.setMinimumHeight(56)
-            self.preset_list.setMaximumHeight(96)
+            # a short tab must still show (a page is 190 px high at the
+            # smallest window).
+            self.preset_list.setMinimumHeight(48)
+            self.preset_list.setMaximumHeight(72)
         layout.addWidget(self.preset_list, 0 if compact else 1)
         row = QHBoxLayout()
         self.preset_apply = QPushButton("Apply", box)
@@ -1285,10 +1286,14 @@ class PresetsMixin:
         self.preset_with_area.setToolTip(
             "Ticked: applying the preset also sets the camera's own area "
             "(sensor px). Unticked: it leaves the area as it is.")
-        save.addWidget(self.preset_with_area, 1, 0, 1, 2)
+        # In the tab, Export and Import come straight under Save as, above
+        # the fold of a short page (190 px at the smallest window); the
+        # area tick and the note, set once, are under them.
+        below = 2 if compact else 1
+        save.addWidget(self.preset_with_area, below, 0, 1, 2)
         self.preset_note = QLineEdit(box)
         self.preset_note.setPlaceholderText("Note (optional)")
-        save.addWidget(self.preset_note, 2, 0, 1, 2)
+        save.addWidget(self.preset_note, below + 1, 0, 1, 2)
         layout.addLayout(save)
 
         files = QHBoxLayout()
@@ -1305,7 +1310,10 @@ class PresetsMixin:
             "replaces one: a name in use gets (2). Pick it to apply it.")
         self.preset_import.clicked.connect(lambda: self.import_preset())
         files.addWidget(self.preset_import)
-        layout.addLayout(files)
+        if compact:
+            save.addLayout(files, 1, 0, 1, 2)
+        else:
+            layout.addLayout(files)
         self.presets_file = QLabel(box)
         self.presets_file.setWordWrap(True)
         self.presets_file.setTextInteractionFlags(

@@ -302,12 +302,15 @@ class SettingsTabs(csw.PresetsMixin, csw.SettingsCore, QObject):
             self.pages[tab.title] = page
             parent = column.parentWidget()
             before = set(self.rows)
+            if tab.title == cats.CAMERA_TAB:
+                # THE AREA FIRST: it is what is changed here; the readings
+                # and the camera's identity under it are a glance. Last, it
+                # was below the fold of a 214 px page at 1400 x 820.
+                self._area_section(parent, column)
             for section in tab.sections:
                 self._section(parent, column, section, by_key,
                               titled=len(tab.sections) > 1 or
                               tab.title != section.group)
-            if tab.title == cats.CAMERA_TAB:
-                self._area_section(parent, column)
             column.addStretch(1)
             # One label column across the tab's sections, so the sliders
             # line up (each section is a grid of its own).
