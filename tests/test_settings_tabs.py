@@ -603,7 +603,7 @@ def test_the_tabs_know_what_the_running_stream_locks(clean, typhon_dir):
     assert pump(1.0, until=lambda: not tabs.rows["PixelFormat"].live), \
         "the tab still says the pixel format changes live"
     row = tabs.rows["PixelFormat"]
-    assert "restarts the live view" in row.note.text()
+    assert row.note.text() == "Restarts the live view", "one line in a tab"
     assert tabs.rows["Gain"].live
 
 

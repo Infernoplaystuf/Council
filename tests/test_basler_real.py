@@ -536,7 +536,7 @@ def test_the_emulators_node_map_fills_the_tabs(emulator_typhon):
     # The emulator locks its pixel format while it grabs; the tabs, built
     # at Connect before the live view started the stream, learn it.
     assert _pump(_app, 2.0, until=lambda: not tabs.rows["PixelFormat"].live)
-    assert "restarts the live view" in tabs.rows["PixelFormat"].note.text()
+    assert tabs.rows["PixelFormat"].note.text() == "Restarts the live view"
     assert tabs.rows["Gain"].live
     # A frame camera honours the boxes beside Start: none greyed.
     for port in ("exposure", "gain", "frame_rate"):

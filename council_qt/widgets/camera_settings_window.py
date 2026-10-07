@@ -764,11 +764,15 @@ class SettingRow(QObject):
             notes.append((f"Greyed out while {held} — change that first",
                           "dim"))
         elif not live and capturing:
-            notes.append(("Stop the capture to change this — one run keeps "
-                          "one set-up", "dim"))
+            # A tab's row is ~230 px of note: the short form keeps it to
+            # one line (three such rows of two lines filled a 190 px page).
+            notes.append(("Stop the capture to change this" if self.compact
+                          else "Stop the capture to change this — one run "
+                               "keeps one set-up", "dim"))
         elif not live and writable:
-            notes.append(("Changing this restarts the live view for a "
-                          "moment", "dim"))
+            notes.append(("Restarts the live view" if self.compact
+                          else "Changing this restarts the live view for a "
+                               "moment", "dim"))
         rec = s.get("recommended")
         value = _number(s.get("value"))
         if rec and value is not None and not rec[0] <= value <= rec[1]:
