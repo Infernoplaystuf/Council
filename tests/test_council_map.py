@@ -85,6 +85,8 @@ def test_the_facts_the_map_is_for():
     assert _edge(m, "librarian", "judge", "evidence").status == "live"
     # The coder gets its tools.
     assert _edge(m, "tools", "coder").status == "live"
+    # Numbers questions are computed from the data files.
+    assert _edge(m, "analyst", "question").status == "live"
     # Follow-ups: the task memo, and decisions remembered across sessions.
     assert _edge(m, "task_memo", "question").status == "live"
     assert _edge(m, "council_memory", "judge").status == "live"

@@ -257,6 +257,21 @@ class CouncilActions:
                 x for x in (judge_evidence, past_block) if x)
         writer = getattr(models, "writer", None)
 
+        # Figures computed from the data files for a numbers question
+        # (analyst_step): to every member and the Judge.
+        analysis = self.analyst(typed_text)
+        if on_event is not None and (analysis.note or analysis.table):
+            from council_core.deliberation import AgentEvent
+            if analysis.note:
+                on_event(AgentEvent("Librarian", "observation",
+                                    analysis.note))
+            if analysis.table:
+                on_event(AgentEvent("Analyst", "observation",
+                                    analysis.table))
+        if analysis.block:
+            judge_evidence = "\n\n".join(
+                x for x in (judge_evidence, analysis.block) if x)
+
         # Real documentation for a coding question (docs_brief): to the
         # Coder and the Writer, so they use the documented API.
         docs = self.docs_brief(typed_text, models)
@@ -270,7 +285,8 @@ class CouncilActions:
                 vault_context.applied([sage] if sage_kb else [], sage_kb), \
                 vault_context.applied([writer] if past_block else [],
                                       past_block), \
-                vault_context.applied(docs_readers(models, docs), docs.text):
+                vault_context.applied(docs_readers(models, docs), docs.text), \
+                vault_context.applied(turn_models, analysis.block):
             result = self._answer(typed_text, models, options, judge_evidence,
                                   on_event=on_event, on_token=on_token)
         # Before the next question can start: this exchange is history, and
@@ -319,6 +335,12 @@ class CouncilActions:
                        if judge_evidence else None),
             on_event=on_event,
             on_token=on_token if getattr(options, "stream", True) else None)
+
+    def analyst(self, question: str):
+        """Figures from the data files for a numbers question (blocking: a
+        model call and a sandboxed child process)."""
+        from council_core import analyst_step
+        return analyst_step.run(question, self.vault_dir)
 
     def docs_brief(self, question: str, models):
         """The DOCUMENTATION block for a coding question (blocking: a

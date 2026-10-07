@@ -183,9 +183,12 @@ _NODES: Tuple[Node, ...] = (
          "otherwise (no model loaded, nothing downloaded).",
          "council_core/vault_context.py"),
     Node("analyst", "Analyst", "agent",
-         "Writes pandas code from a question and runs it in a sandbox over "
-         "the vault's data files. Not part of the turn today.",
-         "vault_analyst.py"),
+         "For a numbers question: writes pandas code (the Coder's model), "
+         "runs it over <vault>/data_in in a child process — the sandbox "
+         "reads only that folder, never writes, and is stopped after 2 "
+         "minutes — and gives every member and the Judge the figures, or "
+         "tells them not to invent a number when it fails.",
+         "council_core/analyst_step.py; vault_analyst.py"),
     Node("task_memo", "Task memo", "agent",
          "Before each question, condenses it into a short [TASK MEMO] — the "
          "goal, constraints and what to avoid — carrying the constraints "
@@ -300,12 +303,12 @@ def _edges() -> List[Edge]:
           "context",
           note="The question reaches the council without any vault matches.",
           cite="council_core/vault_search.py"),
-        E("question", "analyst", "the question", "context",
-          note="A numbers question is answered from the model's memory, "
-               "not from the data files the analyst could compute over.",
-          cite="vault_analyst.py"),
-        E("analyst", "question", "[ANALYST RESULT]: computed figures",
-          "context", note="See question → analyst.", cite="vault_analyst.py"),
+        E("question", "analyst", "a question that reads as a computation",
+          "context", "live",
+          cite="council_core/analyst_step.py (looks_computational)"),
+        E("analyst", "question", "[ANALYST RESULT]: computed figures — to "
+          "every member and the Judge", "context", "live",
+          cite="council_core/analyst_step.py; council_core/analyst_child.py"),
         E("question", "task_memo", "the question", "context", "live",
           cite="council_qt/tabs/council.py (task_memo); task_memory.py"),
         E("task_memo", "question", "[TASK MEMO]: goal, constraints, what "
@@ -937,13 +940,13 @@ GUIDE: Tuple[GuideStep, ...] = (
         "council_qt/tabs/fanout.py"),
     GuideStep(
         "What is not connected yet",
-        "The green dashed lines are the map's suggestions: the Analyst "
-        "computing figures from your data files, web research for the "
-        "Intern, evidence for the Skeptic and the Intern. A red "
+        "The green dashed lines are the map's suggestions: web research "
+        "for the Intern, and vault evidence for the Skeptic and the Intern "
+        "(kept from them today on purpose). A red "
         "line, if any, is wired but never takes effect.\n\n"
         "Press 'What's missing' for the full list with the reason for each, "
         "or tick 'Only what is not live' to see just those lines.",
-        ("analyst", "web", "skeptic", "intern", "librarian"),
+        ("web", "skeptic", "intern", "librarian"),
         "council_core/council_map.py (the table of links)"),
 )
 
