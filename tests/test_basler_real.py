@@ -431,3 +431,198 @@ def test_a_frame_says_its_pixel_format_so_the_display_can_follow(device):
         assert frame.meta["format"] == fmt
         shown = prep(frame.image, frame.meta["format"])
         assert int(shown.max()) >= 250, (fmt, int(shown.max()))
+
+
+# ======================================================================
+# typhon/settings-tabs on the emulator: a built Typhon's tabs under the
+# image folder and its pop-outs, over a real BaslerDevice
+# ======================================================================
+#: The generated modules, dropped between tests so each imports its own.
+GENERATED = ("app", "handlers", "ui", "ui.main_ui", "ui.ports", "ui.widgets")
+
+
+@pytest.fixture(scope="module")
+def typhon_dir(tmp_path_factory):
+    pytest.importorskip("PySide6")
+    import run_example_gui as rex
+
+    return rex.build("typhon", project="typhon",
+                     vault_dir=tmp_path_factory.mktemp("vault"), target="qt")
+
+
+def _pump(app, seconds, until=None):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        app.processEvents()
+        if until is not None and until():
+            return True
+        time.sleep(0.01)
+    return until() if until is not None else True
+
+
+@pytest.fixture
+def emulator_typhon(typhon_dir, monkeypatch):
+    """Typhon built into a temp vault, never shown, connected to the
+    emulator through its own Scan and Connect, the live view running."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    monkeypatch.setenv("COUNCIL_NO_DIALOGS", "1")
+    from PySide6.QtWidgets import QApplication
+
+    import frame_camera
+    from council_qt.widgets import camera_settings_window as csw
+
+    app = QApplication.instance() or QApplication([])
+    frame_camera.disconnect()
+    frame_camera._LIVE.listeners = []
+    csw._HELD.clear()
+    kept = list(sys.path)
+    sys.path.insert(0, str(typhon_dir))
+    for name in GENERATED:
+        sys.modules.pop(name, None)
+    import app as generated
+
+    ui = generated.App()
+    ui.resize(1504, 1016)
+    try:
+        ui.on_btn_scan_for_cameras()
+        rows = ui.ports.cameras.items()
+        emulated = [i for i, r in enumerate(rows) if "Emulation" in r]
+        if not emulated:
+            pytest.skip("pylon's camera emulator is not enabled "
+                        "(PYLON_CAMEMU)")
+        ui.ports.cameras.widget.setCurrentRow(emulated[0])
+        ui.on_btn_connect()
+        assert _pump(app, 3.0, until=lambda: frame_camera._LIVE.previewing)
+        yield frame_camera, ui, app
+    finally:
+        frame_camera.disconnect()
+        frame_camera._LIVE.listeners = []
+        frame_camera._LIVE.setup_path = None
+        frame_camera._LIVE.tabs = None
+        frame_camera._LIVE.picker = None
+        frame_camera._LIVE.reviewer = None
+        for window in list(csw._HELD.values()):
+            if csw.alive(window):
+                window.deleteLater()
+        csw._HELD.clear()
+        ui.deleteLater()
+        app.processEvents()
+        sys.path[:] = kept
+        for name in GENERATED:
+            sys.modules.pop(name, None)
+
+
+def test_the_emulators_node_map_fills_the_tabs(emulator_typhon):
+    """A Basler's own categories, from its node map: exposure and gain with
+    their auto modes, the frame rate and the trigger in one tab; pixel
+    format, mirroring, gamma and binning in another; its area in Camera."""
+    fc, ui, _app = emulator_typhon
+    cam = fc._LIVE.device._cam
+    tabs = ui._settings_tabs
+    assert tabs.titles() == ["Basic", "Exposure", "Image", "Camera",
+                             "Presets"]
+    assert [s.group for s in tabs.plan[0].sections] == [
+        "Exposure", "Gain", "Frame rate", "Trigger"]
+    assert [s.group for s in tabs.plan[1].sections] == ["Image", "Binning"]
+    gain = tabs.rows["Gain"]
+    assert gain.editor.maximum() == pytest.approx(cam.Gain.GetMax())
+    assert gain.editor.suffix() == " dB"
+    auto = tabs.rows["ExposureAuto"].editor
+    assert {auto.itemText(i) for i in range(auto.count())} >= {
+        "Off", "Continuous"}
+    trigger = tabs.rows["TriggerSource"].editor
+    assert "Line1" in {trigger.itemText(i) for i in range(trigger.count())}
+    assert tabs.area_edit.text() == fc.current_area()["area"]
+    # A frame camera honours the boxes beside Start: none greyed.
+    for port in ("exposure", "gain", "frame_rate"):
+        assert getattr(ui.ports, port).widget.isEnabled(), port
+
+
+def test_a_gain_dragged_in_its_pop_out_reaches_the_emulator_live(
+        emulator_typhon):
+    """The pop-out writes through the throttle while the live view runs;
+    the tab shows what the camera took; the live view keeps going."""
+    fc, ui, app = emulator_typhon
+    cam = fc._LIVE.device._cam
+    tabs = ui._settings_tabs
+    window = tabs.pop_out("Gain")
+    row = window.rows["Gain"]
+    assert row.range_label.text().startswith("0 … 48")
+    row.slider.setSliderDown(True)
+    for value in (3.0, 6.0, 9.5):
+        row.slider.setValue(row.scale.position(value))
+        _pump(app, 0.08)
+    row.slider.setSliderDown(False)
+    window.flush_now()
+    assert cam.Gain.GetValue() > 9.0
+    assert cam.Gain.GetValue() == pytest.approx(row.editor.value(), abs=0.05)
+    assert tabs.rows["Gain"].editor.value() == pytest.approx(
+        cam.Gain.GetValue(), abs=0.01)
+    assert fc._LIVE.previewing and fc._LIVE.session.running
+    fc.latest()
+    assert _pump(app, 2.0, until=lambda: fc.latest() is not None), \
+        "the live view stopped"
+
+
+def test_the_pixel_format_restarts_the_stream_and_its_reset_says_so(
+        emulator_typhon):
+    """PixelFormat is locked while the emulator grabs: chosen in the Image
+    pop-out it stops the stream, writes and starts it again on the worker;
+    putting the Image category back as connected says it needed that."""
+    fc, ui, app = emulator_typhon
+    cam = fc._LIVE.device._cam
+    window = ui._settings_tabs.pop_out("Image")
+    pixel = window.rows["PixelFormat"]
+    assert not pixel.live
+    assert "restarts the live view" in pixel.note.text()
+    pixel._from_choice("Mono12")
+    window.flush_now()
+    assert _pump(app, 5.0, until=lambda: fc._LIVE.job is None
+                 and cam.PixelFormat.GetValue() == "Mono12")
+    heard = []
+    fc.on_camera_change(heard.append)
+    window.reset_group()
+    assert _pump(app, 5.0, until=lambda: any(h.get("what") == "reset"
+                                             for h in heard))
+    out = next(h for h in heard if h.get("what") == "reset")
+    assert cam.PixelFormat.GetValue() == "Mono8"
+    assert out["restarted"] == ["Pixel format"], out
+    assert "Image as connected" in out["summary"]
+    assert "The live view restarted for Pixel format" in out["summary"]
+
+
+def test_a_configuration_made_on_the_emulator_is_exported_and_imported(
+        emulator_typhon, tmp_path):
+    """Saved from a pop-out (the whole camera, not only its category),
+    exported to a file, imported into another project beside a preset of
+    the same name - never over it - and applied live from the tabs."""
+    fc, ui, app = emulator_typhon
+    cam = fc._LIVE.device._cam
+    tabs = ui._settings_tabs
+    window = tabs.pop_out("Gain")
+    window.rows["Gain"].editor.setValue(7.0)
+    window.flush_now()
+    window.preset_name.setText("Bench")
+    window.save_preset()
+    saved = fc.list_presets()["details"][0]
+    assert saved["name"] == "Bench" and saved["roi"]
+    assert saved["settings"]["Gain"] == pytest.approx(7.0, abs=0.01)
+    assert "PixelFormat" in saved["settings"], "the whole camera is saved"
+    tabs.select_preset("Bench")
+    exported = Path(tabs.export_preset(str(tmp_path / "carry")))
+    assert exported.name == "Bench.camera-preset.json"
+
+    fc._LIVE.setup_path = tmp_path / "other" / "camera_setup.json"
+    fc._LIVE.setup_path.parent.mkdir()
+    fc.set_camera_setting("Gain", 1.0)
+    fc.save_preset("Bench", include_roi=False)
+    assert tabs.import_preset(str(exported)) == "Bench (2)"
+    assert {d["name"] for d in fc.list_presets()["details"]} == {
+        "Bench", "Bench (2)"}
+    fc.set_camera_setting("Gain", 0.0)
+    tabs.select_preset("Bench (2)")
+    tabs.apply_preset()
+    assert _pump(app, 5.0, until=lambda: fc._LIVE.job is None)
+    assert cam.Gain.GetValue() == pytest.approx(7.0, abs=0.01)
+    _pump(app, 0.5)
+    assert tabs.rows["Gain"].editor.value() == pytest.approx(7.0, abs=0.01)
