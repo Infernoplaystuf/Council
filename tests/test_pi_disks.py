@@ -92,3 +92,44 @@ def test_identity_must_match_exactly():
 
 def test_single_object_json_is_a_list():
     assert len(dk.parse(json.dumps(SD_CARD))) == 1
+
+
+# ── a card that already holds files (the user's decision f, 2026-10-07) ──
+#: A new card as it comes from the shop: one exFAT volume, a few KB used.
+BLANK_CARD = {**SD_CARD, "Number": 3, "SerialNumber": "000000000921", "UniqueId": "USBSTOR-BLANK",
+              "Partitions": [{"Number": 1, "Size": 31_910_000_000, "DriveLetter": "G",
+                              "FileSystem": "exFAT", "Label": "", "Type": "IFS",
+                              "VolumeSize": 31_909_000_000,
+                              "SizeRemaining": 31_908_700_000}]}
+#: A camera card: 4.2 GB of photos on FAT32.
+CAMERA_CARD = {**BLANK_CARD, "Number": 4, "SerialNumber": "CAM", "UniqueId": "USBSTOR-CAM",
+               "Partitions": [{"Number": 1, "Size": 31_910_000_000, "DriveLetter": "H",
+                               "FileSystem": "FAT32", "Label": "EOS_DIGITAL", "Type": "IFS",
+                               "VolumeSize": 31_900_000_000,
+                               "SizeRemaining": 27_700_000_000}]}
+
+
+def test_a_blank_card_holds_nothing_to_confirm():
+    card = by_number([BLANK_CARD])[3]
+    assert card.eligible and not card.holds_files and card.contents() == []
+
+
+def test_a_card_with_files_says_what_is_on_it():
+    cam = by_number([CAMERA_CARD])[4]
+    assert cam.eligible and cam.holds_files
+    assert cam.contents() == ["H: 'EOS_DIGITAL' (FAT32, 4.2 GB used of 31.9 GB)"]
+    # An old Pi card: its boot volume, and a Linux partition Windows cannot read.
+    old = by_number([SD_CARD])[2]
+    assert old.holds_files
+    assert old.contents()[0].startswith("F: 'bootfs' (FAT32")
+    assert "cannot read" in old.contents()[1] and "31.3 GB" in old.contents()[1]
+
+
+def test_a_microsoft_reserved_partition_is_not_files():
+    d = by_number([{**BLANK_CARD, "Partitions": BLANK_CARD["Partitions"] + [
+        {"Number": 2, "Size": 16_777_216, "DriveLetter": NUL, "Type": "Reserved"}]}])[3]
+    assert not d.holds_files
+
+
+def test_the_listing_asks_windows_for_each_volumes_size():
+    assert "VolumeSize = $v.Size" in dk._PS_LIST

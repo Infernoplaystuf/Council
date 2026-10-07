@@ -527,7 +527,9 @@ class ApothecaryTab(ViewHelpers, QWidget):
             except Exception as exc:                      # noqa: BLE001
                 self.emit(f"✗ {name}: {exc}", True)
                 return
-            self.emit(f"✓ {out.message}")
+            # Not ok = the key is in and the password gone, but SSH still
+            # takes passwords (keys-only was not proven): said, not hidden.
+            self.emit(("✓ " if out.ok else "✗ ") + out.message, not out.ok)
             self._to_ui(lambda: (self.actions.reload_registry(), self.refresh()))
 
         self._ssh("Secure node", work)

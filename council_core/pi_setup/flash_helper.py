@@ -10,7 +10,18 @@ erasing, the helper lists the disks ITSELF and refuses unless exactly that
 disk is present and still passes every rule in disks.judge (removable bus,
 not system/boot, a card present, <= 256 GB, no Council or Windows folders).
 A card swapped, a reader re-enumerated as another number, or a data drive
-plugged in under the same number are all refused.
+plugged in under the same number are all refused. A card that holds files is
+refused unless the user confirmed erasing them (the job says so).
+
+THE IMAGE IS CHECKED BEFORE THE CARD IS ERASED
+The user's decision e (2026-10-07). The image file is decompressed and hashed
+first; a file whose uncompressed SHA-256 or size is not the official list's
+(``extract_sha256`` / ``extract_size``, which belong to the file chosen) is
+refused with nothing erased. It used to be found only while writing - after
+the card was already erased. A file that is not in the list has no checksum
+to meet, but its uncompressed size is still checked against the card before
+erasing. Its first-boot format is not assumed either: the job carries the
+files for both formats and the helper uses the one the written card shows.
 
 Progress goes to status.json beside the job (atomic writes); the Council's
 window polls it. A ``cancel`` file beside the job stops the write at the next
@@ -118,6 +129,21 @@ def run(job_path: Path, ops: Optional[WindowsDiskOps] = None) -> Dict[str, Any]:
                           "renumbered) — nothing was erased")
         if not disk.eligible:
             raise Refused(f"refusing to erase disk {disk.number}: {disk.why_not}")
+        if disk.holds_files and not job.get("files_confirmed"):
+            raise Refused(f"disk {disk.number} holds files you did not agree to erase ("
+                          + "; ".join(disk.contents()) + ") — nothing was erased")
+
+        def checking(_phase, done, total):
+            _status(job_dir, phase="checking-image", done=done, total=total,
+                    message=f"Checking the image file before anything is erased: "
+                            f"{done / 1e9:.2f} of {total / 1e9:.2f} GB")
+        try:
+            writer.check_image(image, expected_sha256=job.get("extract_sha256", ""),
+                               expected_size=int(job.get("extract_size") or 0),
+                               capacity=disk.size, on_progress=checking,
+                               cancelled=cancel_flag.exists)
+        except writer.WriteFailed as exc:
+            raise Refused(f"{exc} — nothing was erased") from exc
 
         _status(job_dir, phase="erasing", message=f"Erasing {disk.summary()}")
         ops.clear(disk.number)
@@ -138,7 +164,9 @@ def run(job_path: Path, ops: Optional[WindowsDiskOps] = None) -> Dict[str, Any]:
         fmt = job.get("init_format") or fb.detect_format(boot)
         if fmt not in fb.FORMATS:
             raise RuntimeError("could not tell which first-boot format this image uses")
-        files = job["firstboot_files"]
+        files = job.get("firstboot_files") or (job.get("firstboot_by_format") or {}).get(fmt)
+        if not files:
+            raise RuntimeError(f"the job has no first-boot settings for format {fmt}")
         fb.apply(boot, files, fmt)
         ops.flush(boot)
         wrong = fb.verify(boot, files, fmt)
@@ -163,14 +191,20 @@ def run(job_path: Path, ops: Optional[WindowsDiskOps] = None) -> Dict[str, Any]:
 
 def write_job(job_dir: Path, *, disk: dk.Disk, image: Path, init_format: str,
               firstboot_files: Dict[str, str], extract_sha256: str = "",
-              extract_size: int = 0) -> Path:
-    """The job file for the helper (called by the non-elevated Council)."""
+              extract_size: int = 0,
+              firstboot_by_format: Optional[Dict[str, Dict[str, str]]] = None,
+              files_confirmed: bool = False) -> Path:
+    """The job file for the helper (called by the non-elevated Council).
+    ``firstboot_by_format`` instead of ``firstboot_files`` when the image's
+    format is not known (``init_format`` ''): the helper picks by the card."""
     job_dir.mkdir(parents=True, exist_ok=True)
     p = job_dir / "job.json"
     p.write_text(json.dumps({"disk": disk.identity().to_json(), "image": str(image),
                              "init_format": init_format, "extract_sha256": extract_sha256,
                              "extract_size": extract_size,
-                             "firstboot_files": firstboot_files}), encoding="utf-8")
+                             "firstboot_files": firstboot_files,
+                             "firstboot_by_format": firstboot_by_format or {},
+                             "files_confirmed": bool(files_confirmed)}), encoding="utf-8")
     return p
 
 

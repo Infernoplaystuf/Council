@@ -3,7 +3,9 @@
 EXISTING PI — `setup_existing`:
     connect with the user's password ONCE (host key confirmed by the user, or
     already pinned) -> install the Council's key -> read the Pi's facts ->
-    provision (firewall, Ollama, model) -> register with key auth, no password.
+    provision (firewall, the pinned Ollama, Wi-Fi key off the card, SSH keys
+    only) -> register with key auth, no password. The model is NOT downloaded:
+    `download_model` runs only when the user presses "Download on the Pi".
 
 NEW PI — `prepare_new_pi`, then the elevated flash_helper, then `finish_new_pi`:
     1. the user picks an image, a card (disks.py — erasable cards only), and
@@ -24,7 +26,14 @@ NEW PI — `prepare_new_pi`, then the elevated flash_helper, then `finish_new_pi
 `secure_existing_node` upgrades a node the OLD wizard registered (password in
 plain text, Ollama open to the LAN): it uses that stored password one last
 time to install the key, re-registers with key auth and an empty password,
-and puts up the firewall. NodePrimus on this network is that case.
+puts up the firewall and turns SSH password login off. NodePrimus on this
+network is that case.
+
+A card is erased only after a second, explicit confirmation when it already
+holds files (disks.Disk.contents); the image's checksum is checked before the
+card is erased (flash_helper); a file that is not in the official list is
+written with no assumed checksum or first-boot format (the helper reads the
+format off the card; `note_written` records which).
 """
 from __future__ import annotations
 
@@ -150,6 +159,10 @@ class Outcome:
     model: str = ""
     message: str = ""
     steps: List[remote.StepResult] = field(default_factory=list)
+    username: str = ""
+    #: The model is chosen but NOT on the Pi yet: the wizard offers
+    #: "Download on the Pi" (the user's decision a, 2026-10-07).
+    model_pending: bool = False
 
 
 def _provision_and_register(vault, *, name, host, username, model, facts, port, key_dir,
@@ -159,16 +172,37 @@ def _provision_and_register(vault, *, name, host, username, model, facts, port, 
         return Outcome(False, host, name, model,
                        f"{model} is not a US-origin model; choose one of "
                        f"{', '.join(pi_models.for_ram(facts.ram_gb))}")
-    steps = remote.provision(host, username, model, port=port, key_dir=key_dir,
+    steps = remote.provision(host, username, port=port, key_dir=key_dir,
                              on_step=say, on_line=on_line)
     if not all(s.ok for s in steps):
         bad = steps[-1]
         return Outcome(False, host, name, model, f"'{bad.label}' failed: "
-                       f"{bad.output.strip()[-300:]}", steps)
+                       f"{bad.output.strip()[-300:]}", steps, username=username)
     remote.register(vault, name=name, host=host, username=username, model=model,
                     facts_=facts, key_dir=key_dir)
     return Outcome(True, host, name, model,
-                   f"{name} is ready: {model} on {host}, reachable only from this PC.", steps)
+                   f"{name} is set up on {host}: Ollama {remote.OLLAMA_PIN_VERSION}, reachable "
+                   f"only from this PC. {remote.password_login_help(username, host, key_dir)} "
+                   f"Its model is not downloaded yet: {pi_models.describe(model)}. Press "
+                   "\"Download on the Pi\" when you want it.", steps,
+                   username=username, model_pending=True)
+
+
+def download_model(*, host: str, username: str, model: str, port: int = 22,
+                   key_dir: Optional[Path] = None, on_line=None) -> Outcome:
+    """The ONE model download the Council does, and only from the user's
+    "Download on the Pi" click (decision a): US-origin models only."""
+    if not pi_models.is_us_origin(model):
+        return Outcome(False, host, "", model, f"{model} is not a US-origin model",
+                       username=username, model_pending=True)
+    step = remote.pull_model(host, username, model, port=port, key_dir=key_dir,
+                             on_line=on_line)
+    if not step.ok:
+        return Outcome(False, host, "", model, f"the download failed: "
+                       f"{step.output.strip()[-300:]}", [step], username=username,
+                       model_pending=True)
+    return Outcome(True, host, "", model, f"{model} is on the Pi at {host}.", [step],
+                   username=username)
 
 
 def setup_existing(vault, *, host: str, username: str, password: str, name: str,
@@ -207,10 +241,16 @@ def secure_existing_node(vault, node_name: str, *, approved_fingerprint: Optiona
     remote.register(vault, name=node.name, host=node.host, username=node.username,
                     model=node.model or node.active_model, facts_=adopted.facts,
                     key_dir=key_dir)
-    return Outcome(True, node.host, node.name, node.model,
+    # adopt() proved the key login; only now does SSH stop taking passwords
+    # (decision c) - checked by a new key login, undone if that fails.
+    keys = remote.keys_only(node.host, node.username, port=node.port, key_dir=key_dir)
+    tail = (remote.password_login_help(node.username, node.host, key_dir) if keys.ok else
+            f"Password login is still ON: {keys.output}")
+    return Outcome(keys.ok, node.host, node.name, node.model,
                    f"{node.name} now uses the Council's key; its stored password was "
-                   f"removed; Ollama answers only {pc_ip}. Change the Pi's password, "
-                   "since it was stored in plain text before.")
+                   f"removed; Ollama answers only {pc_ip}. {tail} Change the Pi's password "
+                   "too, since it was stored in plain text before.", [keys],
+                   username=node.username)
 
 
 # ── new Pi ───────────────────────────────────────────────────────────────
@@ -245,34 +285,67 @@ def _save_pending(items: List[Pending]) -> None:
 
 def prepare_new_pi(*, disk: dk.Disk, typed_confirm: str, image: Path, init_format: str,
                    extract_sha256: str, extract_size: int, cfg: fb.FirstBoot,
-                   model: str, key_dir: Optional[Path] = None) -> Dict[str, object]:
+                   model: str, key_dir: Optional[Path] = None,
+                   files_confirmed: bool = False) -> Dict[str, object]:
     """Check everything, build the first-boot files and the helper's job.
-    Returns {"job": path, "pending": Pending}. Nothing is erased here."""
+    Returns {"job": path, "pending": Pending}. Nothing is erased here.
+
+    ``init_format`` '' = not known (a file that is not in the official list,
+    or a list entry without one): the job carries the first-boot files for
+    BOTH formats and the helper uses the one it reads off the written card -
+    nothing is assumed from a file name. ``files_confirmed``: the user's
+    second confirmation for a card that already holds files (decision f)."""
     if not disk.eligible:
         raise ValueError(f"that disk cannot be used: {disk.why_not}")
     if typed_confirm.strip() != disk.confirm_code:
         raise ValueError(f"type exactly: {disk.confirm_code}")
+    if disk.holds_files and not files_confirmed:
+        raise ValueError("that card holds files (" + "; ".join(disk.contents())
+                         + ") - confirm that they may be erased first")
+    if init_format not in fb.FORMATS + ("",):
+        raise ValueError(f"unknown first-boot format {init_format!r}")
     if not pi_models.is_us_origin(model):
         raise ValueError(f"{model} is not a US-origin model")
     _priv, council_pub = pi_secrets.council_key(key_dir)
     if council_pub not in cfg.ssh_public_keys:
         cfg.ssh_public_keys = list(cfg.ssh_public_keys) + [council_pub]
     host_public = ""
-    if init_format == fb.CLOUDINIT:
+    if init_format in (fb.CLOUDINIT, ""):
         cfg.host_key_private, host_public = pi_secrets.host_keypair()
         cfg.host_key_public = host_public
-    files = fb.build(cfg, init_format)
+    if init_format:
+        files: Dict[str, str] = fb.build(cfg, init_format)
+        by_format: Dict[str, Dict[str, str]] = {}
+    else:
+        files, by_format = {}, {fmt: fb.build(cfg, fmt) for fmt in fb.FORMATS}
     cfg.password = ""                          # the hash is in `files`; drop the original
     cfg.wifi_password = ""
     cfg.host_key_private = ""
     job_dir = state_dir() / "jobs" / str(uuid.uuid4())
     job = flash_helper.write_job(job_dir, disk=disk, image=image, init_format=init_format,
                                  firstboot_files=files, extract_sha256=extract_sha256,
-                                 extract_size=extract_size)
+                                 extract_size=extract_size, firstboot_by_format=by_format,
+                                 files_confirmed=bool(files_confirmed))
     item = Pending(id=job_dir.name, hostname=cfg.hostname, username=cfg.username,
                    host_public=host_public, model=model)
     _save_pending([p for p in pending() if p.hostname != cfg.hostname] + [item])
     return {"job": job, "pending": item}
+
+
+def note_written(pending_id: str, init_format: str) -> Optional[Pending]:
+    """The helper wrote the card in ``init_format`` (it read it off the card
+    when the image's format was not known). A legacy (systemd) card carries
+    no pre-made host key, so the Pi cannot be found by one: its record drops
+    the key and finishing asks for 'A Pi that is already set up' instead of
+    waiting for a key that never appears."""
+    items = pending()
+    item = next((p for p in items if p.id == pending_id), None)
+    if item is None:
+        return None
+    if init_format != fb.CLOUDINIT and item.host_public:
+        item.host_public = ""
+        _save_pending(items)
+    return item
 
 
 _JOB_FILES = ("job.json", "cancel", "status.json", "status.json.tmp")

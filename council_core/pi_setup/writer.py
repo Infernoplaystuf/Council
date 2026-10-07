@@ -40,6 +40,44 @@ def _chunks(src: BinaryIO, size: int = CHUNK) -> Iterator[bytes]:
         yield b
 
 
+def check_image(image: Path, *, expected_sha256: str = "", expected_size: int = 0,
+                capacity: int = 0,
+                on_progress: Optional[Callable[[str, int, int], None]] = None,
+                cancelled: Callable[[], bool] = lambda: False) -> dict:
+    """Read the whole image (decompressing .xz) WITHOUT touching any disk,
+    and prove it is the file the official list describes: its uncompressed
+    SHA-256 and size. Run before the card is erased - the user's decision e:
+    a corrupt or different file named like an official one used to be found
+    only while writing, after the card was already erased. With no expected
+    hash (a file not in the list) only the size against ``capacity`` is
+    checked. Returns ``{"bytes": n, "sha256": hex}``; raises WriteFailed."""
+    say = on_progress or (lambda *_: None)
+    h = hashlib.sha256()
+    n = 0
+    total = expected_size or Path(image).stat().st_size
+    try:
+        with open_image(image) as src:
+            for chunk in _chunks(src):
+                if cancelled():
+                    raise Cancelled("cancelled while checking the image - nothing was erased")
+                h.update(chunk)
+                n += len(chunk)
+                if capacity and n > capacity:
+                    raise WriteFailed(f"the image is larger than the card "
+                                      f"({capacity / 1e9:.1f} GB)")
+                say("checking", n, max(total, n))
+    except (OSError, EOFError, lzma.LZMAError) as exc:
+        raise WriteFailed(f"the image file cannot be read to the end ({exc})") from exc
+    got = h.hexdigest()
+    if expected_size and n != expected_size:
+        raise WriteFailed(f"the image is {n:,} bytes uncompressed, not the {expected_size:,} "
+                          "the official list gives (a different or damaged file)")
+    if expected_sha256 and got != expected_sha256.lower():
+        raise WriteFailed("the image file does not match the official checksum "
+                          "(corrupt or a different release)")
+    return {"bytes": n, "sha256": got}
+
+
 def write_image(image: Path, target: BinaryIO, *, capacity: int,
                 expected_sha256: str = "",
                 on_progress: Optional[Callable[[str, int, int], None]] = None,

@@ -21,7 +21,7 @@ from council_core.pi_setup import remote  # noqa: E402
 from council_core.pi_setup import setup as su  # noqa: E402
 from council_qt.tabs.pi_setup_dialog import PiSetupDialog  # noqa: E402
 
-from tests.test_pi_disks import REAL, SD_CARD  # noqa: E402
+from tests.test_pi_disks import BLANK_CARD, REAL, SD_CARD  # noqa: E402
 from tests.test_pi_flash import CATALOG  # noqa: E402
 
 
@@ -53,8 +53,12 @@ class FakeActions:
         self.image_file = tmp_path / "2026-10-06-raspios-trixie-arm64-lite.img.xz"
         self.image_file.write_bytes(b"xz")
 
+    #: Row 2 of the list: a blank card (an old Pi card holds files and is
+    #: asked about separately - see the decision f tests).
+    disks = REAL + [BLANK_CARD]
+
     def list_disks(self):
-        return [dk.judge(d, []) for d in dk.parse(REAL + [SD_CARD])]
+        return [dk.judge(d, []) for d in dk.parse(self.disks)]
 
     def catalog(self):
         return im.parse_catalog(CATALOG)
@@ -348,23 +352,27 @@ def test_a_file_not_in_the_list_is_not_checked_against_another_images_hash(qapp,
     f = _write_with_file(d, "my-bookworm-custom.img")
     kw = d.actions.prepared
     assert kw["image"] == f and kw["extract_sha256"] == "" and kw["extract_size"] == 0
-    assert kw["init_format"] == "systemd"          # Bookworm, from its name
+    # No format assumed from its name: the helper reads it off the card
+    # (the user's decision e, 2026-10-07).
+    assert kw["init_format"] == ""
     _close(qapp, d)
 
 
-def test_a_file_whose_format_cannot_be_told_is_not_written(qapp, tmp_path):
+def test_a_file_whose_format_cannot_be_told_from_its_name_is_still_written(qapp, tmp_path):
+    # It was refused ("cannot be told"); the helper now reads the format off
+    # the written card, so a name says nothing either way.
     d = PiSetupDialog(actions=FakeActions(tmp_path))
     _write_with_file(d, "my-custom.img")
-    assert d.actions.prepared is None and "cannot be told" in d.log.toPlainText()
+    assert d.actions.prepared["init_format"] == "" and d.actions.started is not None
     _close(qapp, d)
 
 
-def test_without_the_list_a_bookworm_file_gets_bookworm_settings(qapp, tmp_path):
+def test_without_the_list_a_bookworm_file_gets_no_assumed_settings(qapp, tmp_path):
     acts = FakeActions(tmp_path)
     acts.catalog = lambda: []
     d = PiSetupDialog(actions=acts)
     _write_with_file(d, "2025-05-13-raspios-bookworm-arm64-lite.img.xz")
-    assert acts.prepared["init_format"] == "systemd" and acts.prepared["extract_sha256"] == ""
+    assert acts.prepared["init_format"] == "" and acts.prepared["extract_sha256"] == ""
     _close(qapp, d)
 
 
@@ -398,4 +406,107 @@ def test_a_listed_file_carries_its_own_entrys_hash_and_format(qapp, tmp_path):
     kw = d.actions.prepared
     assert kw["init_format"] == "systemd" and kw["extract_sha256"] == "c" * 64
     assert kw["extract_size"] == 2_000_000_000
+    _close(qapp, d)
+
+
+# ── the user's decisions of 2026-10-07 ────────────────────────────────────
+class ModelActions(FakeActions):
+    def __init__(self, tmp_path):
+        super().__init__(tmp_path)
+        self.downloads = []
+
+    def setup_existing(self, **kw):
+        self.existing_calls.append(kw)
+        return su.Outcome(True, kw["host"], kw["name"], "llama3.2:3b", "pi-a is set up",
+                          username=kw["username"], model_pending=True)
+
+    def download_model(self, **kw):
+        self.downloads.append(kw)
+        return su.Outcome(True, kw["host"], "", kw["model"], "llama3.2:3b is on the Pi",
+                          username=kw["username"])
+
+
+def test_the_model_is_downloaded_only_when_the_button_is_pressed(qapp, tmp_path):
+    acts = ModelActions(tmp_path)
+    d = PiSetupDialog(actions=acts)
+    assert d.model_row.isHidden()
+    d.ex_host.setText("192.168.1.252")
+    d.ex_user.setText("pi")
+    d.ex_pass.setText("hunter22")
+    d.on_setup_existing()
+    drive(qapp, d)
+    assert not d.model_row.isHidden() and acts.downloads == []     # named, not fetched
+    assert "llama3.2:3b (Meta, US) — about 2.0 GB to download on the Pi" in d.model_label.text()
+    d.download_btn.click()
+    drive(qapp, d)
+    assert [(k["host"], k["username"], k["model"]) for k in acts.downloads] == [
+        ("192.168.1.252", "pi", "llama3.2:3b")]
+    assert "✓ llama3.2:3b is on the Pi" in d.log.toPlainText() and d.model_row.isHidden()
+    _close(qapp, d)
+
+
+def _old_card_dialog(qapp, tmp_path, answer):
+    acts = FakeActions(tmp_path)
+    acts.disks = REAL + [SD_CARD]                   # an old Pi card: it holds files
+    asked = []
+    d = PiSetupDialog(actions=acts, ask_yes_no=lambda title, msg, **k: asked.append(msg)
+                      or answer)
+    d.on_new()
+    d.disk_list.setCurrentRow(2)
+    return d, asked
+
+
+def test_a_card_that_holds_files_is_chosen_only_after_a_second_question(qapp, tmp_path):
+    d, asked = _old_card_dialog(qapp, tmp_path, answer=False)
+    assert len(asked) == 1
+    assert "'bootfs' (FAT32" in asked[0] and "cannot read" in asked[0] and "ERASED" in asked[0]
+    assert d._current_disk() is None and not d.card_next.isEnabled()
+    _close(qapp, d)
+
+
+def test_a_card_whose_files_the_user_agreed_to_erase_is_written(qapp, tmp_path):
+    d, asked = _old_card_dialog(qapp, tmp_path, answer=True)
+    assert len(asked) == 1 and d._current_disk() is not None
+    d.confirm_edit.setText(d._current_disk().confirm_code)
+    assert d.card_next.isEnabled()
+    d.card_next.click()
+    d.s_pass.setText("correct-horse-42")
+    d.s_pass2.setText("correct-horse-42")
+    d.on_write()
+    assert d.actions.prepared["files_confirmed"] is True
+    assert len(asked) == 1                          # asked once, not on every change
+    _close(qapp, d)
+
+
+def test_offscreen_with_nobody_to_ask_a_card_with_files_is_not_chosen(qapp, tmp_path,
+                                                                      monkeypatch):
+    monkeypatch.setenv("COUNCIL_NO_DIALOGS", "1")
+    acts = FakeActions(tmp_path)
+    acts.disks = REAL + [SD_CARD]
+    d = PiSetupDialog(actions=acts)
+    d.on_new()
+    d.disk_list.setCurrentRow(2)
+    assert d._current_disk() is None
+    _close(qapp, d)
+
+
+def test_a_blank_card_is_not_asked_about(qapp, tmp_path):
+    asked = []
+    d = PiSetupDialog(actions=FakeActions(tmp_path),
+                      ask_yes_no=lambda *a, **k: asked.append(a) or True)
+    d.on_new()
+    d.disk_list.setCurrentRow(2)
+    assert asked == [] and d._current_disk() is not None
+    _close(qapp, d)
+
+
+def test_the_format_the_writer_used_is_recorded(qapp, tmp_path):
+    acts = FakeActions(tmp_path)
+    noted = []
+    acts.note_written = lambda item, fmt: noted.append((item.id, fmt)) or item
+    d = PiSetupDialog(actions=acts)
+    _write_with_file(d, "my-custom.img")
+    acts.status = {"phase": "done", "message": "The card is ready.", "format": "systemd"}
+    d._poll_writer()
+    assert noted == [("job", "systemd")]
     _close(qapp, d)

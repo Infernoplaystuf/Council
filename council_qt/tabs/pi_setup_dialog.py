@@ -7,7 +7,14 @@ card writer's status file.
 The erase step can only be reached with an ELIGIBLE card selected (disks.py
 refuses system/boot disks, non-removable buses, anything over 256 GB, and any
 disk holding Council or Windows folders) AND its confirm code typed exactly;
-the elevated helper then re-checks the same disk before touching it.
+the elevated helper then re-checks the same disk before touching it. A card
+that already holds files is chosen only after a second question that names
+what is on it (the user's decision f, 2026-10-07).
+
+No model is downloaded while a Pi is set up. When setup succeeds the dialog
+names the model, its maker and its download size, and offers "Download on the
+Pi" - the ONE model download the Council does, on that click only (the user's
+decision a).
 """
 from __future__ import annotations
 
@@ -71,6 +78,12 @@ class PiSetupActions:
     def setup_existing(self, **kw):
         return su.setup_existing(self.vault, **kw)
 
+    def download_model(self, **kw):
+        return su.download_model(**kw)
+
+    def note_written(self, item, init_format: str):
+        return su.note_written(item.id, init_format) if item is not None else None
+
     def finish(self, item, **kw):
         return su.finish_new_pi(self.vault, item, **kw)
 
@@ -88,7 +101,7 @@ class PiSetupDialog(ViewHelpers, QDialog):
     WRITER_START_TIMEOUT_S = 120
 
     def __init__(self, parent=None, actions: Optional[PiSetupActions] = None,
-                 vault_dir: Optional[Path] = None):
+                 vault_dir: Optional[Path] = None, ask_yes_no=None):
         super().__init__(parent)
         self.setWindowTitle("Set up a Raspberry Pi")
         self.resize(760, 620)
@@ -97,6 +110,16 @@ class PiSetupDialog(ViewHelpers, QDialog):
             from council_core import paths
             actions = PiSetupActions(Path(vault_dir or paths.vault_dir()))
         self.actions = actions
+        #: The second confirmation for a card that holds files. Offscreen
+        #: (COUNCIL_NO_DIALOGS) with nothing injected, the answer is NO:
+        #: nobody can click, and a card with files is never chosen silently.
+        from .. import dialogs as _dialogs
+        self.ask_yes_no = ask_yes_no or (
+            (lambda *a, **k: False) if _dialogs.disabled() else _dialogs.askyesno)
+        #: The card whose files the user agreed to erase (its identity).
+        self._files_ok: Optional[dk.DiskIdentity] = None
+        #: The Pi set up last, whose model can now be downloaded.
+        self._ready: Optional[su.Outcome] = None
         self._busy = False
         self._disks: List[dk.Disk] = []
         self._images: List[images.OsImage] = []
@@ -119,6 +142,15 @@ class PiSetupDialog(ViewHelpers, QDialog):
         outer = QVBoxLayout(self)
         self.pages = QStackedWidget()
         outer.addWidget(self.pages, 1)
+        self.model_row = QWidget()
+        mr = QHBoxLayout(self.model_row)
+        mr.setContentsMargins(0, 0, 0, 0)
+        self.model_label = QLabel("")
+        self.model_label.setWordWrap(True)
+        mr.addWidget(self.model_label, 1)
+        self.download_btn = self._button(mr, "Download on the Pi", self.on_download_model)
+        self.model_row.setVisible(False)
+        outer.addWidget(self.model_row)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumHeight(170)
@@ -253,6 +285,7 @@ class PiSetupDialog(ViewHelpers, QDialog):
             return
         self.ex_pass.clear()
         self.say(("✓ " if out.ok else "✗ ") + out.message)
+        self._offer_model(out)
 
     def on_trust_fingerprint(self) -> None:
         self._approved_fp = getattr(self, "_pending_fp", None)
@@ -336,12 +369,11 @@ class PiSetupDialog(ViewHelpers, QDialog):
         self.dl_btn.setEnabled(current is not None
                                and self.actions.cached_path(current) is None)
         if path is not None and img is None:
-            fmt = images.release_format(path.name)
             self.image_note.setText(
-                f"Ready: {path} · not in the official list, so it is checked only by "
-                "reading the card back · " + (f"first-boot format {fmt} (from its name)"
-                                              if fmt else "its first-boot format cannot "
-                                              "be told from its name"))
+                f"Ready: {path} · not in the official list, so it has no published "
+                "checksum to meet (its size is checked against the card before anything "
+                "is erased, and the card is read back) · its first-boot format is read "
+                "off the card after writing, not guessed from its name")
         elif img is None:
             self.image_note.setText("No image list yet. Get the list (the only time this "
                                     "goes online), or use a file you have.")
@@ -420,8 +452,8 @@ class PiSetupDialog(ViewHelpers, QDialog):
             self.image_box.blockSignals(False)
         self._image_path, self._image_entry = p, match
         self.say(f"Using {p}" + ("" if match else
-                                 " (not in the official list: its checksum is not known, "
-                                 "and its first-boot format is taken from its name)"))
+                                 " (not in the official list: no checksum is assumed, and "
+                                 "its first-boot format is read off the card after writing)"))
         self._show_image()
 
     def refresh_disks(self) -> None:
@@ -449,14 +481,32 @@ class PiSetupDialog(ViewHelpers, QDialog):
 
     def _disk_changed(self) -> None:
         d = self._current_disk()
+        if d is not None and d.holds_files and self._files_ok != d.identity():
+            # The second, explicit confirmation, naming what is on it.
+            if self.ask_yes_no(
+                    "This card holds files",
+                    f"Disk {d.number} ({d.friendly_name}, {d.size / 1e9:.1f} GB) already "
+                    "holds files:\n\n" + "\n".join(f"  • {c}" for c in d.contents())
+                    + "\n\nEverything on it will be ERASED. Choose this card anyway?",
+                    parent=self):
+                self._files_ok = d.identity()
+                self.say(f"You agreed to erase what is on disk {d.number}: "
+                         + "; ".join(d.contents()))
+            else:
+                self._files_ok = None
+                self.disk_list.setCurrentRow(-1)
+                return
         self.confirm_label.setText(f"Everything on it will be erased. Type:  {d.confirm_code}"
                                    if d else "Select the SD card.")
         self.confirm_edit.clear()
         self._update_card_next()
 
+    def _files_confirmed(self, d: Optional[dk.Disk]) -> bool:
+        return bool(d and (not d.holds_files or self._files_ok == d.identity()))
+
     def _update_card_next(self) -> None:
         d = self._current_disk()
-        self.card_next.setEnabled(bool(d and self._image_path
+        self.card_next.setEnabled(bool(d and self._image_path and self._files_confirmed(d)
                                        and self.confirm_edit.text().strip() == d.confirm_code))
 
     # ── page: settings ──
@@ -489,8 +539,10 @@ class PiSetupDialog(ViewHelpers, QDialog):
                            ("This Pi", self.s_ram), ("Model", self.s_model)):
             form.addRow(label, wdg)
         note = QLabel("Only a hash of the password and a key derived from the Wi-Fi "
-                      "password go on the card; neither is kept by the Council. Many Pis "
-                      "only see 2.4 GHz Wi-Fi.")
+                      "password go on the card; neither is kept by the Council, and both "
+                      "come off the card once the Pi is set up (the Pi keeps its Wi-Fi). "
+                      "SSH then takes the Council's key only. Many Pis only see 2.4 GHz "
+                      "Wi-Fi.")
         note.setWordWrap(True)
         form.addRow(note)
         row = QHBoxLayout()
@@ -524,27 +576,26 @@ class PiSetupDialog(ViewHelpers, QDialog):
             return
         disk, entry, path = self._current_disk(), self._image_entry, self._image_path
         # Checksum, size and first-boot format belong to the FILE: its own list
-        # entry, or for a file not in the list no checksum (the read-back still
-        # runs) and the format its name gives. Never the combo's entry for
-        # another file — that erased a card and then refused it, or gave a
-        # Bookworm card cloud-init files it ignores (no user, SSH or Wi-Fi).
+        # entry - checked by the helper BEFORE the card is erased - or, for a
+        # file not in the list, none at all: no checksum is assumed, and the
+        # format ('') is read off the written card by the helper (the user's
+        # decision e). Never the combo's entry for another file - that erased
+        # a card and then refused it, or gave a Bookworm card cloud-init
+        # files it ignores (no user, SSH or Wi-Fi); never a guess from a name.
         if entry is not None:
-            fmt = (entry.init_format if entry.init_format in fb.FORMATS
-                   else images.release_format(entry.filename))
+            fmt = entry.init_format if entry.init_format in fb.FORMATS else ""
             sha, size = entry.extract_sha256, entry.extract_size
         else:
-            fmt = images.release_format(path.name) if path is not None else ""
-            sha, size = "", 0
-        if fmt not in fb.FORMATS:
-            self.say("Not written: which first-boot settings this image takes cannot be "
-                     "told (it is not in the official list and its name does not say "
-                     "Trixie or Bookworm). Get the list and use an official image.")
+            fmt, sha, size = "", "", 0
+        if not self._files_confirmed(disk):
+            self.say("Not written: that card holds files - select it again and confirm.")
             return
         try:
             out = self.actions.prepare(
                 disk=disk, typed_confirm=self.confirm_edit.text(), image=path,
                 init_format=fmt, extract_sha256=sha, extract_size=size, cfg=cfg,
-                model=self.s_model.currentData())
+                model=self.s_model.currentData(),
+                files_confirmed=bool(disk is not None and disk.holds_files))
         except Exception as exc:                          # noqa: BLE001
             self.say(f"Not written: {exc}")
             return
@@ -617,6 +668,16 @@ class PiSetupDialog(ViewHelpers, QDialog):
             self._timer.stop()
             self.cancel_btn.setEnabled(False)
             ok = st.get("phase") == "done"
+            if ok and st.get("format"):
+                # The format the helper used (read off the card when the
+                # image's was not known): a legacy card has no pre-made host
+                # key to find the Pi by.
+                try:
+                    item = self.actions.note_written(self._pending, st["format"])
+                    if item is not None:
+                        self._pending = item
+                except Exception as exc:                  # noqa: BLE001
+                    self.say(f"Could not record the card's format: {exc}")
             self.say(("✓ " if ok else "✗ ") + st.get("message", ""))
             self.find_btn.setEnabled(ok)
             self._refresh_pending()
@@ -653,6 +714,39 @@ class PiSetupDialog(ViewHelpers, QDialog):
         self.say(("✓ " if out.ok else "✗ ") + out.message)
         self.find_btn.setEnabled(not out.ok)
         self._refresh_pending()
+        self._offer_model(out)
+
+    # ── the model: downloaded on the Pi only on the user's click ──
+    def _offer_model(self, out) -> None:
+        """After a successful setup: name the model, its maker and its size;
+        nothing is downloaded until "Download on the Pi" is pressed."""
+        if not (out is not None and out.ok and getattr(out, "model_pending", False)):
+            return
+        self._ready = out
+        self.model_label.setText(f"Model for {out.name or out.host}: "
+                                 f"{pi_models.describe(out.model)}. Nothing is downloaded "
+                                 "until you press the button.")
+        self.download_btn.setEnabled(True)
+        self.model_row.setVisible(True)
+
+    def on_download_model(self) -> None:
+        out = self._ready
+        if self._busy or out is None:
+            return
+        self.download_btn.setEnabled(False)
+        self.say(f"Downloading {out.model} on the Pi at {out.host}…")
+        self._work("model", lambda: self.actions.download_model(
+            host=out.host, username=out.username, model=out.model,
+            on_line=self._say_from_worker), self._model_done)
+
+    def _model_done(self, res, exc) -> None:
+        if exc is not None or res is None or not res.ok:
+            self.say(f"✗ {exc if exc is not None else (res.message if res else 'failed')}")
+            self.download_btn.setEnabled(True)
+            return
+        self.say("✓ " + res.message)
+        self.model_row.setVisible(False)
+        self._ready = None
 
     def done(self, r) -> None:                            # noqa: D401 — Qt's name
         self._cancel.set()

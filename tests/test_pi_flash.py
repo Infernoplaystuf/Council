@@ -324,3 +324,76 @@ def test_first_boot_files_must_be_known_names(tmp_path):
         with pytest.raises(ValueError):
             fb.apply(boot, {bad: "x"}, fb.CLOUDINIT)
     assert sorted(p.name for p in boot.iterdir()) == ["cmdline.txt"]
+
+
+# ── the user's decisions of 2026-10-07 ────────────────────────────────────
+def test_check_image_finds_a_wrong_file_without_writing(tmp_path):
+    src, data, sha = make_image(tmp_path)
+    assert wr.check_image(src, expected_sha256=sha, expected_size=len(data)) == {
+        "bytes": len(data), "sha256": sha}
+    with pytest.raises(wr.WriteFailed, match="official checksum"):
+        wr.check_image(src, expected_sha256="0" * 64)
+    with pytest.raises(wr.WriteFailed, match="not the"):
+        wr.check_image(src, expected_size=len(data) + 512)
+    with pytest.raises(wr.WriteFailed, match="larger than the card"):
+        wr.check_image(src, capacity=1024)
+    truncated = tmp_path / "cut.img.xz"
+    truncated.write_bytes(src.read_bytes()[:-40])
+    with pytest.raises(wr.WriteFailed, match="cannot be read"):
+        wr.check_image(truncated)
+
+
+def test_a_wrong_image_is_refused_before_the_card_is_erased(tmp_path):
+    # The official checksum was compared only while writing - after
+    # Clear-Disk had already erased the card.
+    src, _data, _sha = make_image(tmp_path)
+    job, _ = _job(tmp_path, SD, src, "0" * 64)
+    ops = FakeOps(tmp_path, [SD])
+    final = fh.run(job, ops)
+    assert not final["ok"] and final["refused"]
+    assert "official checksum" in final["message"] and "nothing was erased" in final["message"]
+    assert ops.cleared == [] and ops.card.read_bytes() == b"\xff" * SD["Size"]
+    assert not job.exists()
+
+
+def test_an_image_too_big_for_the_card_is_refused_before_erasing_even_without_a_hash(tmp_path):
+    src, _data, _sha = make_image(tmp_path, size=SD["Size"] + 4096)
+    job, _ = _job(tmp_path, SD, src, "")
+    ops = FakeOps(tmp_path, [SD])
+    final = fh.run(job, ops)
+    assert not final["ok"] and "larger than the card" in final["message"]
+    assert ops.cleared == []
+
+
+def test_a_card_with_files_is_not_erased_unless_the_user_agreed(tmp_path):
+    from tests.test_pi_disks import CAMERA_CARD
+    cam = {**CAMERA_CARD, "Size": SD["Size"], "Number": 2}
+    src, data, sha = make_image(tmp_path)
+    job, _ = _job(tmp_path, cam, src, sha)
+    ops = FakeOps(tmp_path, [cam])
+    final = fh.run(job, ops)
+    assert not final["ok"] and final["refused"] and "EOS_DIGITAL" in final["message"]
+    assert ops.cleared == []
+    # ...and with the user's agreement in the job, it is written.
+    disk = dk.parse([cam])[0]
+    files = fb.build(fb.FirstBoot(hostname="council-pi-1", username="council",
+                                  password="correct-horse-42"), fb.CLOUDINIT)
+    job = fh.write_job(tmp_path / "job2", disk=disk, image=src, init_format=fb.CLOUDINIT,
+                       firstboot_files=files, extract_sha256=sha, files_confirmed=True)
+    assert fh.run(job, FakeOps(tmp_path, [cam]))["ok"]
+
+
+@pytest.mark.parametrize("cloudinit", [True, False])
+def test_an_image_of_unknown_format_gets_the_format_the_card_shows(tmp_path, cloudinit):
+    src, _data, sha = make_image(tmp_path)
+    disk = dk.parse([SD])[0]
+    cfg = dict(hostname="council-pi-1", username="council", password="correct-horse-42")
+    by_format = {fmt: fb.build(fb.FirstBoot(**cfg), fmt) for fmt in fb.FORMATS}
+    job = fh.write_job(tmp_path / "job", disk=disk, image=src, init_format="",
+                       firstboot_files={}, firstboot_by_format=by_format)
+    ops = FakeOps(tmp_path, [SD], boot_has_cloudinit=cloudinit)
+    final = fh.run(job, ops)
+    want = fb.CLOUDINIT if cloudinit else fb.SYSTEMD
+    assert final["ok"], final
+    assert final["format"] == want
+    assert fb.verify(ops.boot, by_format[want], want) == []

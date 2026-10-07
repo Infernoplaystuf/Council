@@ -6,8 +6,10 @@ The Council is offline by design. `fetch_catalog` and `download` run only from
 an explicit click, only against https://downloads.raspberrypi.com (the host
 the official Imager uses — any URL in the list that points elsewhere is
 refused), and every download is checked twice: against the ``.sha256`` file
-published beside it, and, while it is written to a card, against the list's
-``extract_sha256`` of the uncompressed image.
+published beside it, and - before the card is erased (flash_helper) and again
+while it is written - against the list's ``extract_sha256`` and
+``extract_size`` of the uncompressed image. A file that is not in the list
+gets no assumed checksum and no first-boot format guessed from its name.
 
 Images are cached in %LOCALAPPDATA%/Council/pi_images — never the vault.
 """
@@ -186,24 +188,6 @@ def local_image(path: Path) -> Path:
     if not (p.name.endswith(".img") or p.name.endswith(".img.xz")):
         raise ValueError("choose a Raspberry Pi OS .img or .img.xz file")
     return p
-
-
-#: Debian release in an official file name -> its first-boot format: Trixie
-#: images take cloud-init; the Legacy Bookworm (and Bullseye) ones a
-#: firstrun.sh run by systemd.
-_RELEASE_FORMATS = (("trixie", "cloudinit-rpi"), ("bookworm", "systemd"),
-                    ("bullseye", "systemd"))
-
-
-def release_format(filename: str) -> str:
-    """The first-boot format an image file takes, read from the release in
-    its name ('2025-05-13-raspios-bookworm-arm64-lite.img.xz' -> systemd), or
-    '' when the name does not say. For a file that is not in the official
-    list — the Council must build the right first-boot files before
-    writing, and must never guess."""
-    low = Path(filename).name.lower()
-    found = {fmt for word, fmt in _RELEASE_FORMATS if word in low}
-    return found.pop() if len(found) == 1 else ""
 
 
 def match_local(path: Path, images: List[OsImage]) -> Optional[OsImage]:

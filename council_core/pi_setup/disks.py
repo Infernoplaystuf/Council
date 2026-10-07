@@ -19,6 +19,15 @@ elevated writer re-reads the disk and refuses unless its number, unique id and
 size still match (`DiskIdentity`) — a card swapped between the click and the
 write is not written.
 
+A DISK THAT ALREADY HOLDS FILES needs a second, explicit confirmation that
+names what is on it (the user's decision f, 2026-10-07): `Disk.contents`
+lists every partition with files on it — its letter, label, file system and
+used space — and every partition Windows cannot read (an old Pi card's Linux
+partition may hold anything). Asked for every eligible disk, an SD card in a
+built-in reader as much as a USB one: a camera card's photos are the same
+loss. A freshly formatted card (a few KB of file-system bookkeeping) is not
+asked about.
+
 Listing is read-only (PowerShell Get-Disk / Get-Partition / Get-Volume).
 """
 from __future__ import annotations
@@ -41,7 +50,7 @@ $out = foreach ($d in Get-Disk) {
     [pscustomobject]@{
       Number = $p.PartitionNumber; Size = $p.Size; DriveLetter = "$($p.DriveLetter)";
       Type = "$($p.Type)"; FileSystem = "$($v.FileSystem)"; Label = "$($v.FileSystemLabel)";
-      SizeRemaining = $v.SizeRemaining }
+      SizeRemaining = $v.SizeRemaining; VolumeSize = $v.Size }
   }
   [pscustomobject]@{
     Number = $d.Number; FriendlyName = $d.FriendlyName; SerialNumber = "$($d.SerialNumber)".Trim();
@@ -54,6 +63,12 @@ $out = foreach ($d in Get-Disk) {
 """
 
 
+#: Used space a freshly formatted volume may show without holding a file
+#: (FAT32 / exFAT bookkeeping and Windows' System Volume Information are a
+#: few KB to a few hundred KB). More than this = it holds files.
+EMPTY_USED_BYTES = 1024 * 1024
+
+
 @dataclass
 class Partition:
     number: int
@@ -62,6 +77,36 @@ class Partition:
     file_system: str = ""
     label: str = ""
     size_remaining: Optional[int] = None
+    volume_size: Optional[int] = None
+    part_type: str = ""
+
+    def used(self) -> Optional[int]:
+        if self.volume_size is None or self.size_remaining is None:
+            return None
+        return max(0, int(self.volume_size) - int(self.size_remaining))
+
+    def holding(self) -> str:
+        """What this partition holds, in words, or '' when it holds nothing
+        (empty file system, or a Microsoft Reserved partition)."""
+        where = f"{self.drive_letter}: " if self.drive_letter else ""
+        name = f"'{self.label}'" if self.label else f"partition {self.number}"
+        if self.part_type.lower() == "reserved" or self.size <= 0:
+            return ""
+        if not self.file_system:
+            return (f"{name} ({self.size / 1e9:.1f} GB): a file system Windows cannot "
+                    "read (a Linux card?) - it may hold files")
+        used = self.used()
+        if used is None:
+            return f"{where}{name} ({self.file_system}, used space unknown)"
+        if used <= EMPTY_USED_BYTES:
+            return ""
+        return (f"{where}{name} ({self.file_system}, {_size(used)} used of "
+                f"{_size(self.volume_size)})")
+
+
+def _size(n: Optional[int]) -> str:
+    n = int(n or 0)
+    return f"{n / 1e9:.1f} GB" if n >= 1e9 else f"{n / 1e6:.0f} MB" if n >= 1e6         else f"{n / 1e3:.0f} KB"
 
 
 @dataclass
@@ -86,6 +131,14 @@ class Disk:
         """What the user types to erase this disk. Plain ASCII: the middle
         dot it had needed Alt+0183 to type."""
         return f"DISK {self.number} - {self.size / 1000 ** 3:.1f} GB"
+
+    def contents(self) -> List[str]:
+        """Each partition that holds (or may hold) files, in words."""
+        return [h for h in (p.holding() for p in self.partitions) if h]
+
+    @property
+    def holds_files(self) -> bool:
+        return bool(self.contents())
 
     def identity(self) -> "DiskIdentity":
         return DiskIdentity(self.number, self.unique_id, self.serial, self.size)
@@ -136,7 +189,9 @@ def parse(raw: Any) -> List[Disk]:
                                       if c.isalpha())[:1],
                                   file_system=str(p.get("FileSystem") or ""),
                                   label=str(p.get("Label") or ""),
-                                  size_remaining=p.get("SizeRemaining"))
+                                  size_remaining=p.get("SizeRemaining"),
+                                  volume_size=p.get("VolumeSize"),
+                                  part_type=str(p.get("Type") or ""))
                         for p in parts]))
     return out
 
